@@ -14,7 +14,14 @@ use tracing_subscriber::EnvFilter;
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let config = RouterConfig::load_with_cli(&cli.config, &cli.router)?;
-    emit_effective_config(&config);
+    let log_filter_source = if cli.router.log_level.is_some() {
+        "cli"
+    } else if std::env::var_os("RUST_LOG").is_some() {
+        "env"
+    } else {
+        "config"
+    };
+    emit_effective_config(&config, log_filter_source);
     initialize_tracing(&config)?;
     if !cli.validate_and_exit && config.sql_server.trust_server_certificate {
         warn!("SQL Server routing trusts the server certificate without validation");
@@ -95,7 +102,7 @@ fn main() -> Result<()> {
     server.run_forever();
 }
 
-fn emit_effective_config(config: &RouterConfig) {
+fn emit_effective_config(config: &RouterConfig, log_filter_source: &str) {
     let effective = serde_json::json!({
         "workers": config.server.threads,
         "listener_tasks_per_fd": config.server.listener_tasks_per_fd,
@@ -115,6 +122,7 @@ fn emit_effective_config(config: &RouterConfig) {
             "acquire_timeout_ms": config.sql_server.sql_pool_acquire_timeout_ms,
         },
         "log_filter": config.telemetry.log_filter,
+        "log_filter_source": log_filter_source,
         "routing": {
             "refresh_interval_ms": config.routing.refresh_interval_ms,
             "max_snapshot_age_ms": config.routing.max_snapshot_age_ms,

@@ -1,4 +1,5 @@
 use arrowcol_tunables::ComponentRole;
+use otel_arrow_dfe_config::engine::EngineConfig;
 
 fn capability_evidence() -> Vec<Value> {
     arrowcol_tunables::capability_table()
@@ -35,12 +36,14 @@ fn role_environment(config: &OatConfig, role: ComponentRole) -> Result<std::coll
 fn validate_collector_pipeline_log_level(pipeline_yaml: &str) -> Result<()> {
     let pipeline: serde_yaml::Value = serde_yaml::from_str(pipeline_yaml)
         .context("parse rendered collector pipeline for logging precedence")?;
-    let explicit = pipeline
+    let engine = pipeline
         .get("engine")
-        .and_then(|engine| engine.get("log_level"))
-        .is_some_and(|level| !level.is_null());
-    if explicit {
-        bail!("logging.collector cannot override an explicit engine.log_level in the rendered pipeline");
+        .cloned()
+        .unwrap_or_else(|| serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+    let engine: EngineConfig = serde_yaml::from_value(engine)
+        .context("parse collector engine settings for logging precedence")?;
+    if engine.telemetry.logs.level.is_some() {
+        bail!("logging.collector cannot override engine.telemetry.logs.level in the rendered pipeline");
     }
     Ok(())
 }
@@ -178,7 +181,7 @@ mod tunable_injection_tests {
     #[test]
     fn collector_logging_rejects_an_explicit_pipeline_engine_level() -> Result<()> {
         validate_collector_pipeline_log_level("engine: {}\n")?;
-        let error = validate_collector_pipeline_log_level("engine:\n  log_level: debug\n");
+        let error = validate_collector_pipeline_log_level("engine:\n  telemetry:\n    logs:\n      level: debug\n");
         assert!(error.is_err());
         let mut config = config()?;
         config.tunables.logging = Some(arrowcol_tunables::LoggingTunables {

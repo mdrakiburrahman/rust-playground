@@ -574,32 +574,39 @@ fn verify_process_configuration(config: &OatConfig, role: ComponentRole, observe
     if matches!(role, ComponentRole::Router)
         && !role_environment(config, role)?.contains_key("RUST_LOG")
     {
+        if observed["log_filter_source"].as_str() != Some("config") {
+            bail!("router inherited logging must come from its configuration file");
+        }
         let expected = inherited_router_log_filter(config)?;
         let actual = observed["log_filter"]
             .as_str()
-            .context("router startup readback omitted the inherited YAML log filter")?;
+            .context("router startup readback omitted the inherited config log filter")?;
         if actual != expected {
-            bail!("router startup log filter does not match the inherited YAML filter");
+            bail!("router startup log filter does not match its platform config");
         }
     }
     Ok(())
 }
 
 fn inherited_router_log_filter(config: &OatConfig) -> Result<String> {
-    let default_router_yaml_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .map(|parent| parent.join("loadtest/config/router.yaml"))
-        .context("OAT manifest must have a projects directory")?;
-    let router_yaml_path = config
-        .platform
-        .compose_file
-        .as_deref()
-        .and_then(|compose_file| std::path::Path::new(compose_file).parent())
-        .map(|parent| parent.join("config/router.yaml"))
-        .filter(|path| path.is_file())
-        .unwrap_or(default_router_yaml_path);
-    let content = std::fs::read_to_string(&router_yaml_path)
-        .with_context(|| format!("read inherited router configuration {}", router_yaml_path.display()))?;
+    let content = match config.platform.kind {
+        crate::config::OatMode::Local => {
+            let compose_file = config
+                .platform
+                .compose_file
+                .as_deref()
+                .context("local router config requires platform.compose_file")?;
+            let router_yaml_path = std::path::Path::new(compose_file)
+                .parent()
+                .map(|parent| parent.join("config/router.yaml"))
+                .context("local compose file must have a parent directory")?;
+            std::fs::read_to_string(&router_yaml_path)
+                .with_context(|| format!("read rendered local router config {}", router_yaml_path.display()))?
+        }
+        crate::config::OatMode::Aks => {
+            include_str!("../../arrowcol-router-rust/config.docker.yaml").to_owned()
+        }
+    };
     let yaml: Value = serde_yaml::from_str(&content).context("parse inherited router YAML")?;
     yaml.pointer("/telemetry/log_filter")
         .and_then(Value::as_str)
@@ -1049,6 +1056,22 @@ async fn aks_process_logs_for_role(config: &OatConfig, role_filter: Option<Compo
 #[cfg(test)]
 mod startup_readback_tests {
     use super::*;
+
+    #[test]
+    fn aks_inherited_router_filter_uses_image_config() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        config.platform.kind = crate::config::OatMode::Aks;
+        config.platform.compose_file = None;
+
+        let actual = inherited_router_log_filter(&config)?;
+        let image_config: Value = serde_yaml::from_str(include_str!(
+            "../../arrowcol-router-rust/config.docker.yaml"
+        ))?;
+        assert_eq!(actual, image_config["telemetry"]["log_filter"]);
+        Ok(())
+    }
 
     #[test]
     fn maintenance_outcomes_use_separate_stream_offsets_and_omit_raw_errors() -> Result<()> {
