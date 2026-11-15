@@ -251,6 +251,14 @@ pub trait TableDiscovery: Sync {
     /// # Errors
     /// Returns missing-table, corrupt metadata or authority failures.
     fn table(&self, name: &str) -> Result<DiscoveredTable>;
+
+    /// Return allowlisted tables that are not ready for maintenance yet.
+    ///
+    /// # Errors
+    /// Returns pending-state access failures.
+    fn pending_tables(&self) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
 }
 
 type PropertyCache = BTreeMap<String, (String, BTreeMap<String, String>)>;
@@ -261,6 +269,7 @@ pub struct FilesystemDiscovery {
     root: Url,
     allowlist: Vec<String>,
     cache: Mutex<PropertyCache>,
+    pending_tables: Mutex<Vec<String>>,
     max_log_files: usize,
     max_log_file_bytes: u64,
 }
@@ -272,6 +281,7 @@ impl FilesystemDiscovery {
             root,
             allowlist,
             cache: Mutex::new(BTreeMap::new()),
+            pending_tables: Mutex::new(Vec::new()),
             max_log_files: 100_000,
             max_log_file_bytes: 64 * 1024 * 1024,
         }
@@ -306,6 +316,7 @@ impl TableDiscovery for FilesystemDiscovery {
                 return Ok(self.allowlist.clone());
             }
             let mut names = Vec::new();
+            let mut pending = Vec::new();
             for name in &self.allowlist {
                 let table = self.url(name)?;
                 let table_path = table
@@ -313,6 +324,7 @@ impl TableDiscovery for FilesystemDiscovery {
                     .map_err(|()| anyhow::anyhow!("local table URL is not a filesystem path"))?;
                 let log_path = table_path.join("_delta_log");
                 if !log_path.is_dir() {
+                    pending.push(name.clone());
                     continue;
                 }
                 let mut entries = std::fs::read_dir(log_path)?;
@@ -329,8 +341,16 @@ impl TableDiscovery for FilesystemDiscovery {
                 }
                 if has_delta_state {
                     names.push(name.clone());
+                } else {
+                    pending.push(name.clone());
                 }
             }
+            pending.sort();
+            pending.dedup();
+            *self
+                .pending_tables
+                .lock()
+                .map_err(|error| anyhow::anyhow!("pending tables mutex poisoned: {error}"))? = pending;
             return Ok(names);
         }
         let root = self
@@ -354,6 +374,13 @@ impl TableDiscovery for FilesystemDiscovery {
         }
         names.sort();
         Ok(names)
+    }
+
+    fn pending_tables(&self) -> Result<Vec<String>> {
+        self.pending_tables
+            .lock()
+            .map(|pending| pending.clone())
+            .map_err(|error| anyhow::anyhow!("pending tables mutex poisoned: {error}"))
     }
 
     fn table(&self, name: &str) -> Result<DiscoveredTable> {
@@ -865,6 +892,7 @@ struct Instruments {
     runs: opentelemetry::metrics::Counter<u64>,
     totals: opentelemetry::metrics::Counter<u64>,
     backlog: opentelemetry::metrics::Gauge<u64>,
+    pending_tables: opentelemetry::metrics::Gauge<u64>,
     cutoff: opentelemetry::metrics::Gauge<i64>,
     cycles: opentelemetry::metrics::Counter<u64>,
 }
@@ -876,6 +904,7 @@ impl Instruments {
             runs: meter.u64_counter("delta_maintenance.runs").build(),
             totals: meter.u64_counter("delta_maintenance.items").build(),
             backlog: meter.u64_gauge("delta_maintenance.backlog_files").build(),
+            pending_tables: meter.u64_gauge("delta_maintenance.pending_tables").build(),
             cutoff: meter
                 .i64_gauge("delta_maintenance.retention_cutoff")
                 .with_unit("ms")
@@ -890,6 +919,7 @@ struct Counters {
     runs: BTreeMap<(&'static str, &'static str), u64>,
     totals: BTreeMap<(&'static str, &'static str), u64>,
     gauges: BTreeMap<(&'static str, &'static str), i64>,
+    pending_tables: u64,
     heartbeat_ms: i64,
     cycles: u64,
 }
@@ -925,6 +955,12 @@ impl Metrics {
             counters.cycles += 1;
         });
         self.1.cycles.add(1, &[]);
+    }
+
+    fn pending_tables(&self, count: usize) {
+        let count = u64::try_from(count).unwrap_or(u64::MAX);
+        self.1.pending_tables.record(count, &[]);
+        self.with(|counters| counters.pending_tables = count);
     }
 
     fn record(&self, result: &OperationResult) {
@@ -1012,6 +1048,8 @@ impl Metrics {
             let _ = writeln!(text, "# TYPE delta_maintenance_{name} gauge");
             let _ = writeln!(text, "delta_maintenance_{name}{{operation=\"{operation}\"}} {value}");
         }
+        let _ = writeln!(text, "# TYPE delta_maintenance_pending_tables gauge");
+        let _ = writeln!(text, "delta_maintenance_pending_tables {}", counters.pending_tables);
         let _ = writeln!(text, "# TYPE delta_maintenance_heartbeat_timestamp_ms gauge");
         let _ = writeln!(
             text,
@@ -1506,6 +1544,7 @@ pub fn run_with_discovery(
     let schedule = Mutex::new(BTreeMap::new());
     let mut delay = settings.interval;
     let mut cycles = 0_u64;
+    let mut previous_pending = Some(Vec::new());
     loop {
         let results = match cycle_with_discovery(settings, discovery, metrics, cancel, Some(&schedule)) {
             Ok(results) => results,
@@ -1521,6 +1560,28 @@ pub fn run_with_discovery(
         };
         cycles += 1;
         healthy &= results.iter().all(|result| result.error_kind.is_none());
+        let pending_count = match discovery.pending_tables() {
+            Ok(mut pending) => {
+                pending.sort();
+                pending.dedup();
+                if previous_pending.as_ref() != Some(&pending) {
+                    let names = if pending.is_empty() {
+                        "<none>".to_owned()
+                    } else {
+                        pending.join(",")
+                    };
+                    eprintln!("delta-maintenance pending tables={names}");
+                    previous_pending = Some(pending.clone());
+                }
+                metrics.pending_tables(pending.len());
+                Some(pending.len())
+            }
+            Err(error) => {
+                healthy = false;
+                eprintln!("delta-maintenance pending-table status failed: {error:#}");
+                None
+            }
+        };
         let Some(interval) = settings.interval else { break };
         if settings.max_cycles.is_some_and(|max| cycles >= max) || cancel.load(Ordering::SeqCst) {
             break;
@@ -1529,7 +1590,8 @@ pub fn run_with_discovery(
             results.iter().all(|result| result.error_kind.is_none()) && !results.iter().any(OperationResult::did_work);
         let current = if idle { delay.unwrap_or(interval) } else { interval };
         eprintln!(
-            "delta-maintenance heartbeat cycle={cycles} idle={idle} next_in_ms={}",
+            "delta-maintenance heartbeat cycle={cycles} idle={idle} pending_tables={} next_in_ms={}",
+            pending_count.map_or_else(|| "unknown".to_owned(), |count| count.to_string()),
             current.as_millis()
         );
         delay = Some(if idle {

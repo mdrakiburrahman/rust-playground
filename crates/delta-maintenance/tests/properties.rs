@@ -7,7 +7,8 @@ use arrow_deltalake::maintenance::{
     Outcome, ProbeOperation, now_ms,
 };
 use delta_maintenance::{
-    DiscoveredTable, Metrics, Operation, Settings, TableDiscovery, run_cycle_with_discovery, run_with_discovery,
+    DiscoveredTable, FilesystemDiscovery, Metrics, Operation, Settings, TableDiscovery, run_cycle_with_discovery,
+    run_with_discovery,
 };
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -119,6 +120,26 @@ fn one_shot_rejects_missing_allowlisted_tables_before_reporting_success() -> Res
             .to_string()
             .contains("allowlisted tables were missing or ambiguous")
     );
+    Ok(())
+}
+
+#[test]
+fn scheduled_local_discovery_reports_pending_allowlisted_tables() -> Result<()> {
+    let (_root, mut settings, _) = fixture()?;
+    settings.tables = vec!["not-yet-created".into()];
+    settings.interval = Some(Duration::from_millis(1));
+    settings.max_cycles = Some(2);
+    let discovery = FilesystemDiscovery::new(settings.root.clone(), settings.tables.clone());
+    let metrics = Metrics::new();
+    assert!(run_with_discovery(
+        &settings,
+        &discovery,
+        &metrics,
+        &Arc::new(AtomicBool::new(false))
+    ));
+    assert!(discovery.tables()?.is_empty());
+    assert_eq!(discovery.pending_tables()?, vec!["not-yet-created"]);
+    assert!(metrics.render().contains("delta_maintenance_pending_tables 1"));
     Ok(())
 }
 

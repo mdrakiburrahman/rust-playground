@@ -730,7 +730,7 @@ fn scheduled_mode_serves_prometheus_metrics() -> Result<()> {
     assert!(child.wait()?.success());
     assert!(
         body.lines()
-            .all(|line| line.starts_with('#') || !line.contains("table")),
+            .all(|line| line.starts_with('#') || (!line.contains("table=") && !line.contains("table_name="))),
         "no table labels"
     );
     Ok(())
