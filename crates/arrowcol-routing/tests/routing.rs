@@ -212,6 +212,38 @@ async fn seeded_store() -> (Arc<MemoryRoutingStore>, CollectorInstanceId, Collec
 }
 
 #[tokio::test]
+async fn pinned_oat_holder_at_hard_pressure_is_a_transient_overload() {
+    let (store, _, _) = seeded_store().await;
+    let engine_store: Arc<dyn RoutingStore> = Arc::<MemoryRoutingStore>::clone(&store);
+    let engine = RoutingEngine::new(engine_store, oat_policy(OAT_RUN_CONCURRENT))
+        .unwrap_or_else(|error| panic!("create OAT routing engine: {error}"));
+    engine
+        .refresh(millis(100_000))
+        .await
+        .unwrap_or_else(|error| panic!("refresh initial routing view: {error}"));
+    let expected = [LeaseKey::new(ImplementationPool::Dataflow, table())];
+    let pins = engine
+        .initialize_run_table_pins(OAT_RUN_CONCURRENT, &expected, millis(200_000), millis(100_001))
+        .await
+        .unwrap_or_else(|error| panic!("initialize OAT holder pin: {error}"));
+    let holder = pins[0].holder_instance_id;
+    store
+        .publish_pressure(&snapshot(holder, 100_002, 9_500, 0))
+        .await
+        .unwrap_or_else(|error| panic!("publish hard-pressure snapshot: {error}"));
+    engine
+        .refresh(millis(100_002))
+        .await
+        .unwrap_or_else(|error| panic!("refresh hard-pressure view: {error}"));
+
+    let error = engine
+        .route_ingest_for_run(&metadata(), OAT_RUN_CONCURRENT, millis(200_000), millis(100_002))
+        .await
+        .expect_err("hard-pressure pin must not be assigned");
+    assert_eq!(error.kind(), RoutingErrorKind::LeaseHolderOverloaded);
+}
+
+#[tokio::test]
 async fn valid_cached_lease_avoids_per_request_store_access() {
     let (store, _, _) = seeded_store().await;
     let engine_store: Arc<dyn RoutingStore> = Arc::<MemoryRoutingStore>::clone(&store);

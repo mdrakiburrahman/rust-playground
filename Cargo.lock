@@ -956,6 +956,7 @@ dependencies = [
  "arrow-deltalake",
  "arrowcol-loadgen",
  "arrowcol-protocol",
+ "arrowcol-router-rust",
  "arrowcol-routing",
  "arrowcol-tunables",
  "async-trait",

@@ -345,26 +345,26 @@ async fn a_second_schema_message_aborts_the_admitted_stream() -> Result<()> {
 #[tokio::test]
 async fn force_stop_before_first_batch_marks_not_admitted() -> Result<()> {
     let fixture = Fixture::with_current(false).await?;
-    let gate = Arc::new(BatchGate::new());
-    let admission = MockAdmission::new_gated_at(TestCompletion::BestEffort, Some(Arc::clone(&gate)), 1);
+    let admission = MockAdmission::new(TestCompletion::BestEffort, None);
     let drain = DrainController::new();
     let service = fixture
-        .service(ImplementationPool::Dataflow, admission)?
+        .service(ImplementationPool::Dataflow, admission.clone())?
         .with_drain_controller(drain.clone());
-    let request = ingest_request(
+    let messages = encode_ingest(&fixture.v1, Vec::new()).await?;
+    let input = stream::iter(messages.into_iter().map(Ok)).chain(stream::pending());
+    let mut request = Request::new(Box::pin(input) as TestFlightStream);
+    insert_ingest_metadata(
+        request.metadata_mut(),
         &fixture.v1,
-        vec![v1_batch(&fixture.v1, 0)?],
         ImplementationPool::Dataflow,
         fixture.v1.fingerprint(),
-    )
-    .await?;
+    )?;
     let response = service.handle_do_put(request).await?;
-    let task = tokio::spawn(async move { response.into_inner().try_collect::<Vec<PutResult>>().await });
-    gate.wait_entered().await?;
     drain.force_stop();
-    let status = task
+    let status = response
+        .into_inner()
+        .try_collect::<Vec<PutResult>>()
         .await
-        .context("join force-stopped response")?
         .expect_err("force stop returned success");
     assert_eq!(
         status
@@ -373,9 +373,9 @@ async fn force_stop_before_first_batch_marks_not_admitted() -> Result<()> {
             .and_then(|value| value.to_str().ok()),
         Some("true")
     );
+    assert!(admission.batches().await.is_empty(), "no batch may have been pushed");
     Ok(())
 }
-
 #[tokio::test]
 async fn force_stop_after_pushed_batch_is_not_retryable() -> Result<()> {
     let fixture = Fixture::with_current(false).await?;

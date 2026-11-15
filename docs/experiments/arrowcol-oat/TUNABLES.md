@@ -17,6 +17,23 @@
 | `router.upstream_idle_timeout_seconds` | Accepts `0..=86400`; zero disables idle upstream pooling and is the value emitted by the main OAT runtime. |
 | Router downstream `server.h2.idle_timeout_seconds` | Deliberately constrained to `1..=86400`, whereas main accepted an unbounded value. Shipped router YAMLs use 30 or 60 seconds. |
 
+## Overload retry and admission policy
+
+| Setting or signal | Contract |
+| --- | --- |
+| `client.stream_retry_max_attempts` | Attempts per continuous stream, including the first; accepts `1..=16`, default `4`. Only the explicit pre-admission marker is retried. |
+| `client.stream_retry_base_backoff_ms` / `client.stream_retry_max_backoff_ms` | Defaults `10` / `250` ms; validation requires `1 <= base <= max <= 60000`. Retries use bounded jittered exponential backoff. |
+| `router.excluded_admission_gauges` | CLI `--excluded-admission-gauges`; env `ARROWCOL_ROUTER_EXCLUDED_ADMISSION_GAUGES` accepts CSV or a JSON array. Duplicates are rejected, and at least one admission gauge must remain enabled. Exclusion affects both hard-pressure eligibility and rendezvous weighting. |
+| Pressure gauge | `arrowcol_router_collector_pressure_gauge_bps{pool,gauge}` reports each admission gauge separately, including the gauge driving the hard-pressure maximum. |
+| Ambiguous outcomes | Continuous mode does not retry unmarked failures and keeps running. Process-cumulative and measurement-window `ambiguous_streams` / `ambiguous_rows` bound uncertain delivery; one-shot and round modes remain terminal. |
+| Attempt counters | `error_rows` and `rejected_rows` count attempts, not unique rows. A retry of the same encoded batch is another attempt. |
+
+## AKS rollout readiness
+
+| Setting | Contract |
+| --- | --- |
+| `aks_rollout_timeout_seconds` | Overall Deployment readiness deadline; defaults to 600 seconds and accepts `600..=3600`. Pods fail fast on crash-loop, image/config pull errors, or at least two restarts; failure details include previous logs and `kubectl describe` output. |
+
 ## Collector runtime compatibility
 
 | Setting | Contract |
