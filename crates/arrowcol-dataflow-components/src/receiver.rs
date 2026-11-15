@@ -192,6 +192,9 @@ impl BatchAdmission for DfeAdmission {
         context: StreamContext,
         _emitter: Arc<dyn PutResultEmitter>,
     ) -> RuntimeResult<Box<dyn StreamLifecycle>> {
+        if !self.metrics.ready() {
+            return Err(RuntimeError::draining());
+        }
         let lease = self.leases.resolve(context.metadata().table()).await?;
         if lease.holder_instance_id != self.instance_id {
             return Err(RuntimeError::new(
@@ -199,6 +202,9 @@ impl BatchAdmission for DfeAdmission {
                 tonic::Code::FailedPrecondition,
                 "collector does not own the table lease",
             ));
+        }
+        if !self.metrics.ready() {
+            return Err(RuntimeError::draining());
         }
         let permit = Arc::clone(&self.permits)
             .acquire_owned()

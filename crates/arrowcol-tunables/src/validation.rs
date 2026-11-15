@@ -70,6 +70,9 @@ const CAPABILITIES: &[Capability] = &[
     capability!("client.connections_per_worker", "1"),
     capability!("client.streams_per_worker", "0 (legacy concurrency)"),
     capability!("client.max_rows", "component default"),
+    capability!("client.stream_retry_max_attempts", "4"),
+    capability!("client.stream_retry_base_backoff_ms", "10"),
+    capability!("client.stream_retry_max_backoff_ms", "250"),
     capability!("transport.ipc_compression", "none (compatibility alias)"),
     capability!("arrow_ipc.compression", "none"),
     capability!(
@@ -128,6 +131,7 @@ const CAPABILITIES: &[Capability] = &[
     capability!("router.max_table_entries", "256"),
     capability!("router.max_oldest_buffer_age_ms", "86400000"),
     capability!("router.hard_pressure_bps", "9500"),
+    capability!("router.excluded_admission_gauges", "[] (all gauges enabled)"),
     capability!("router.warmup_ms", "60000"),
     capability!("router.minimum_warmup_bps", "1000"),
     capability!("router.lease_ttl_ms", "30000"),
@@ -439,6 +443,17 @@ impl Tunables {
                 if value.is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value)) {
                     bail!("{field} must be finite and between 0 and 1");
                 }
+            }
+            if client
+                .stream_retry_max_attempts
+                .is_some_and(|attempts| !(1..=16).contains(&attempts))
+            {
+                bail!("client.stream_retry_max_attempts must be between 1 and 16");
+            }
+            let retry_base = client.stream_retry_base_backoff_ms.unwrap_or(10);
+            let retry_max = client.stream_retry_max_backoff_ms.unwrap_or(250);
+            if !(1..=60_000).contains(&retry_base) || retry_max < retry_base || retry_max > 60_000 {
+                bail!("client stream retry backoff must satisfy 1 <= base <= max <= 60000 milliseconds");
             }
         }
         if self
@@ -801,6 +816,15 @@ fn validate_router(router: Option<&RouterTunables>) -> Result<()> {
         bail!("router.upstream_connection_window_bytes must not be less than upstream_stream_window_bytes");
     }
 
+    if let Some(gauges) = router.excluded_admission_gauges.as_ref() {
+        let unique: std::collections::BTreeSet<_> = gauges.iter().copied().collect();
+        if unique.len() != gauges.len() {
+            bail!("router.excluded_admission_gauges must not contain duplicates");
+        }
+        if unique.len() >= AdmissionPressureGauge::ALL.len() {
+            bail!("router.excluded_admission_gauges must leave at least one pressure gauge enabled");
+        }
+    }
     for (name, value, minimum, maximum) in [
         ("h2_idle_timeout_seconds", router.h2_idle_timeout_seconds, 1, 86_400),
         ("sql_connect_timeout_ms", router.sql_connect_timeout_ms, 1, 600_000),
@@ -1859,6 +1883,23 @@ mod tests {
     fn validates_memory_limits_and_cross_field_bounds() {
         let invalid = Tunables {
             client: Some(ClientTunables {
+                stream_retry_max_attempts: Some(0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(error_text(invalid.validate()).contains("stream_retry_max_attempts"));
+        let invalid = Tunables {
+            client: Some(ClientTunables {
+                stream_retry_base_backoff_ms: Some(100),
+                stream_retry_max_backoff_ms: Some(99),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(error_text(invalid.validate()).contains("retry backoff"));
+        let invalid = Tunables {
+            client: Some(ClientTunables {
                 corpus_bytes: Some(20),
                 max_memory_bytes: Some(10),
                 ..Default::default()
@@ -1967,6 +2008,43 @@ mod tests {
             "15ms"
         );
         assert_eq!(Tunables::default().durability_class(), DurabilityClass::Durable);
+        Ok(())
+    }
+
+    #[test]
+    fn router_pressure_gauges_are_typed_and_projected() -> Result<()> {
+        let config: Tunables = serde_json::from_str(
+            r#"{"router":{"excluded_admission_gauges":["cpu_utilization_bps","active_streams"]}}"#,
+        )?;
+        config.validate_for_oat()?;
+        assert_eq!(
+            config.environment_for(ComponentRole::Router)?["ARROWCOL_ROUTER_EXCLUDED_ADMISSION_GAUGES"],
+            r#"["cpu_utilization_bps","active_streams"]"#
+        );
+        assert!(
+            serde_json::from_str::<Tunables>(r#"{"router":{"excluded_admission_gauges":["unknown_gauge"]}}"#).is_err()
+        );
+        let invalid = Tunables {
+            router: Some(RouterTunables {
+                excluded_admission_gauges: Some(AdmissionPressureGauge::ALL.to_vec()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(error_text(invalid.validate()).contains("leave at least one"));
+        Ok(())
+    }
+
+    #[test]
+    fn stream_retry_tunables_project_and_validate() -> Result<()> {
+        let config: Tunables = serde_json::from_str(
+            r#"{"client":{"stream_retry_max_attempts":6,"stream_retry_base_backoff_ms":20,"stream_retry_max_backoff_ms":400}}"#,
+        )?;
+        config.validate_for_oat()?;
+        let env = config.environment_for(ComponentRole::Client)?;
+        assert_eq!(env["ARROWCOL_CLIENT_STREAM_RETRY_MAX_ATTEMPTS"], "6");
+        assert_eq!(env["ARROWCOL_CLIENT_STREAM_RETRY_BASE_BACKOFF_MS"], "20");
+        assert_eq!(env["ARROWCOL_CLIENT_STREAM_RETRY_MAX_BACKOFF_MS"], "400");
         Ok(())
     }
 

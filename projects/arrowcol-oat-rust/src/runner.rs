@@ -6028,7 +6028,7 @@ async fn rollout(config: &OatConfig, name: &str) -> Result<()> {
             &format!("deployment/{name}"),
             "--namespace",
             &config.namespace,
-            "--timeout=600s",
+            "--timeout=120s",
         ],
         None,
     )

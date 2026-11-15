@@ -3,6 +3,7 @@
 use super::*;
 use arrow_flight::encode::DictionaryHandling;
 use arrow_ipc::writer::IpcWriteOptions;
+use arrowcol_protocol::NOT_ADMITTED_METADATA_KEY;
 use clap::{Args, ValueEnum};
 use serde::Serialize;
 use std::sync::{
@@ -86,6 +87,12 @@ pub struct Options {
     /// One-shot total-row limit; duration-based runs ignore this cap and reuse the configured corpus.
     #[arg(long, env = "ARROWCOL_CLIENT_MAX_ROWS", default_value_t = 0)]
     pub max_rows: u64,
+    #[arg(long, env = "ARROWCOL_CLIENT_STREAM_RETRY_MAX_ATTEMPTS", default_value_t = 4)]
+    pub stream_retry_max_attempts: u32,
+    #[arg(long, env = "ARROWCOL_CLIENT_STREAM_RETRY_BASE_BACKOFF_MS", default_value_t = 10)]
+    pub stream_retry_base_backoff_ms: u64,
+    #[arg(long, env = "ARROWCOL_CLIENT_STREAM_RETRY_MAX_BACKOFF_MS", default_value_t = 250)]
+    pub stream_retry_max_backoff_ms: u64,
     #[arg(long, env = "ARROWCOL_CLIENT_IPC_COMPRESSION", value_enum, default_value_t = IpcCompression::None)]
     pub ipc_compression: IpcCompression,
     #[arg(long, env = "ARROWCOL_CLIENT_DICTIONARY_HANDLING", value_enum, default_value_t = Dictionaries::Hydrate)]
@@ -161,6 +168,9 @@ impl Options {
             "workers": self.workers, "runtime_threads": self.runtime_threads,
             "batch_rows": self.batch_rows, "corpus_rows": self.corpus_rows,
             "corpus_bytes": self.corpus_bytes, "streams_per_worker": self.streams_per_worker,
+            "stream_retry_max_attempts": self.stream_retry_max_attempts,
+            "stream_retry_base_backoff_ms": self.stream_retry_base_backoff_ms,
+            "stream_retry_max_backoff_ms": self.stream_retry_max_backoff_ms,
         });
         let corpus_rows_source = if self.corpus_bytes > 0 {
             "corpus_bytes_estimate_deferred_until_preparation"
@@ -251,6 +261,16 @@ impl Options {
             "timeouts must be positive; endpoint capacities must be 1..=65536; connect-retries <=100"
         );
         anyhow::ensure!(
+            (1..=16).contains(&self.stream_retry_max_attempts),
+            "stream-retry-max-attempts must be between 1 and 16"
+        );
+        anyhow::ensure!(
+            (1..=60_000).contains(&self.stream_retry_base_backoff_ms)
+                && self.stream_retry_max_backoff_ms >= self.stream_retry_base_backoff_ms
+                && self.stream_retry_max_backoff_ms <= 60_000,
+            "stream retry backoff must satisfy 1 <= base <= max <= 60000 milliseconds"
+        );
+        anyhow::ensure!(
             self.interval_us <= 86_400_000_000,
             "interval-us must not exceed one day"
         );
@@ -272,6 +292,9 @@ impl Options {
                 "workers": self.workers, "runtime_threads": self.runtime_threads,
                 "batch_rows": self.batch_rows, "corpus_rows": self.corpus_rows,
                 "corpus_bytes": self.corpus_bytes, "streams_per_worker": self.streams_per_worker,
+            "stream_retry_max_attempts": self.stream_retry_max_attempts,
+            "stream_retry_base_backoff_ms": self.stream_retry_base_backoff_ms,
+            "stream_retry_max_backoff_ms": self.stream_retry_max_backoff_ms,
             },
             "corpus_rows_source": corpus_rows_source,
         });
@@ -363,6 +386,12 @@ struct Counters {
     cancelled_bytes: AtomicU64,
     best_effort_streams: AtomicU64,
     durable_streams: AtomicU64,
+    rejected_streams: AtomicU64,
+    rejected_rows: AtomicU64,
+    retried_streams: AtomicU64,
+    retried_rows: AtomicU64,
+    given_up_streams: AtomicU64,
+    given_up_rows: AtomicU64,
     latency: Mutex<[u64; 64]>,
 }
 
@@ -379,6 +408,12 @@ impl Default for Counters {
             cancelled_bytes: AtomicU64::new(0),
             best_effort_streams: AtomicU64::new(0),
             durable_streams: AtomicU64::new(0),
+            rejected_streams: AtomicU64::new(0),
+            rejected_rows: AtomicU64::new(0),
+            retried_streams: AtomicU64::new(0),
+            retried_rows: AtomicU64::new(0),
+            given_up_streams: AtomicU64::new(0),
+            given_up_rows: AtomicU64::new(0),
             latency: Mutex::new([0; 64]),
         }
     }
@@ -416,6 +451,12 @@ impl Counters {
             "cancelled_bytes": self.cancelled_bytes.load(Ordering::Relaxed),
             "best_effort_streams": self.best_effort_streams.load(Ordering::Relaxed),
             "durable_streams": self.durable_streams.load(Ordering::Relaxed),
+            "rejected_streams": self.rejected_streams.load(Ordering::Relaxed),
+            "rejected_rows": self.rejected_rows.load(Ordering::Relaxed),
+            "retried_streams": self.retried_streams.load(Ordering::Relaxed),
+            "retried_rows": self.retried_rows.load(Ordering::Relaxed),
+            "given_up_streams": self.given_up_streams.load(Ordering::Relaxed),
+            "given_up_rows": self.given_up_rows.load(Ordering::Relaxed),
             "rows_per_second": self.completed_rows.load(Ordering::Relaxed) as f64 / elapsed.max(f64::MIN_POSITIVE),
             "send_latency_us": {"p50": percentile(50), "p95": percentile(95), "p99": percentile(99), "samples": count, "precision": "power_of_two_upper_bound"}
         })
@@ -436,6 +477,12 @@ struct Measurement {
     bytes: AtomicU64,
     worker_rows: Vec<AtomicU64>,
     pilot_rows: Vec<AtomicU64>,
+    rejected_streams: AtomicU64,
+    rejected_rows: AtomicU64,
+    retried_streams: AtomicU64,
+    retried_rows: AtomicU64,
+    given_up_streams: AtomicU64,
+    given_up_rows: AtomicU64,
 }
 
 impl Measurement {
@@ -450,6 +497,12 @@ impl Measurement {
             pilot_rows: (0..(end_unix_ms - start_unix_ms).div_ceil(30_000))
                 .map(|_| AtomicU64::new(0))
                 .collect(),
+            rejected_streams: AtomicU64::new(0),
+            rejected_rows: AtomicU64::new(0),
+            retried_streams: AtomicU64::new(0),
+            retried_rows: AtomicU64::new(0),
+            given_up_streams: AtomicU64::new(0),
+            given_up_rows: AtomicU64::new(0),
         })
     }
 
@@ -470,8 +523,35 @@ impl Measurement {
             "completed_bytes": self.bytes.load(Ordering::Relaxed),
             "worker_completed_rows": self.worker_rows.iter().map(|value| value.load(Ordering::Relaxed)).collect::<Vec<_>>(),
             "pilot_window_rows": self.pilot_rows.iter().map(|value| value.load(Ordering::Relaxed)).collect::<Vec<_>>(),
+            "rejected_streams": self.rejected_streams.load(Ordering::Relaxed),
+            "rejected_rows": self.rejected_rows.load(Ordering::Relaxed),
+            "retried_streams": self.retried_streams.load(Ordering::Relaxed),
+            "retried_rows": self.retried_rows.load(Ordering::Relaxed),
+            "given_up_streams": self.given_up_streams.load(Ordering::Relaxed),
+            "given_up_rows": self.given_up_rows.load(Ordering::Relaxed),
             "scope": "per_stream_admission_completion_observed_in_half_open_shared_unix_window",
         })
+    }
+
+    fn record_rejection(&self, rows: u64, observed_unix_ms: u64) {
+        if observed_unix_ms >= self.start_unix_ms && observed_unix_ms < self.end_unix_ms {
+            self.rejected_streams.fetch_add(1, Ordering::Relaxed);
+            self.rejected_rows.fetch_add(rows, Ordering::Relaxed);
+        }
+    }
+
+    fn record_retry(&self, rows: u64, observed_unix_ms: u64) {
+        if observed_unix_ms >= self.start_unix_ms && observed_unix_ms < self.end_unix_ms {
+            self.retried_streams.fetch_add(1, Ordering::Relaxed);
+            self.retried_rows.fetch_add(rows, Ordering::Relaxed);
+        }
+    }
+
+    fn record_given_up(&self, rows: u64, observed_unix_ms: u64) {
+        if observed_unix_ms >= self.start_unix_ms && observed_unix_ms < self.end_unix_ms {
+            self.given_up_streams.fetch_add(1, Ordering::Relaxed);
+            self.given_up_rows.fetch_add(rows, Ordering::Relaxed);
+        }
     }
 }
 
@@ -742,9 +822,8 @@ impl PreparedClient {
                 tasks.spawn(async move {
                     let channel = this.channels[worker][slot % this.channels[worker].len()].clone();
                     replenish_until(measurement.end_unix_ms, this.options.interval_us, || async {
-                        this.send_one(worker, channel.clone(), this.next_batch(worker), Some(&measurement))
+                        this.send_continuous_one(worker, channel.clone(), this.next_batch(worker), &measurement)
                             .await
-                            .map(|result| result.is_some())
                     })
                     .await
                 });
@@ -975,9 +1054,52 @@ impl PreparedClient {
             Err(error) => {
                 counters.error_rows.fetch_add(batch.rows, Ordering::Relaxed);
                 counters.error_bytes.fetch_add(batch.encoded_bytes, Ordering::Relaxed);
+                if is_not_admitted(&error) {
+                    counters.rejected_streams.fetch_add(1, Ordering::Relaxed);
+                    counters.rejected_rows.fetch_add(batch.rows, Ordering::Relaxed);
+                    if let Some(measurement) = measurement {
+                        measurement.record_rejection(batch.rows, unix_ms()?);
+                    }
+                }
                 Err(error)
             }
         }
+    }
+
+    async fn send_continuous_one(
+        &self,
+        worker: usize,
+        channel: Channel,
+        batch: &EncodedBatch,
+        measurement: &Measurement,
+    ) -> Result<bool> {
+        for attempt in 1..=self.options.stream_retry_max_attempts {
+            match self.send_one(worker, channel.clone(), batch, Some(measurement)).await {
+                Ok(Some(_)) => return Ok(true),
+                Ok(None) => return Ok(false),
+                Err(error) if is_not_admitted(&error) => {
+                    if attempt == self.options.stream_retry_max_attempts {
+                        let counters = &self.counters[worker];
+                        counters.given_up_streams.fetch_add(1, Ordering::Relaxed);
+                        counters.given_up_rows.fetch_add(batch.rows, Ordering::Relaxed);
+                        measurement.record_given_up(batch.rows, unix_ms()?);
+                        return Ok(true);
+                    }
+                    let counters = &self.counters[worker];
+                    counters.retried_streams.fetch_add(1, Ordering::Relaxed);
+                    counters.retried_rows.fetch_add(batch.rows, Ordering::Relaxed);
+                    measurement.record_retry(batch.rows, unix_ms()?);
+                    tokio::time::sleep(stream_retry_backoff(
+                        self.options.stream_retry_base_backoff_ms,
+                        self.options.stream_retry_max_backoff_ms,
+                        attempt,
+                    ))
+                    .await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("validated stream retry attempt count is positive")
     }
 
     #[must_use]
@@ -1001,6 +1123,31 @@ impl PreparedClient {
             }).collect::<Vec<_>>(),
         })
     }
+}
+
+fn is_not_admitted(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<tonic::Status>())
+        .is_some_and(|status| {
+            status
+                .metadata()
+                .get(NOT_ADMITTED_METADATA_KEY)
+                .and_then(|value| value.to_str().ok())
+                == Some("true")
+        })
+}
+
+static STREAM_RETRY_JITTER: AtomicU64 = AtomicU64::new(0x9e37_79b9_7f4a_7c15);
+
+fn stream_retry_backoff(base_ms: u64, max_ms: u64, failed_attempt: u32) -> Duration {
+    let shift = failed_attempt.saturating_sub(1).min(63);
+    let multiplier = 1_u64.checked_shl(shift).unwrap_or(u64::MAX);
+    let cap_ms = base_ms.saturating_mul(multiplier).min(max_ms);
+    let lower_ms = cap_ms / 2;
+    let range = cap_ms.saturating_sub(lower_ms).saturating_add(1);
+    let entropy = mix(STREAM_RETRY_JITTER.fetch_add(0x9e37_79b9_7f4a_7c15, Ordering::Relaxed));
+    Duration::from_millis(lower_ms.saturating_add(entropy % range))
 }
 
 fn unix_ms() -> Result<u64> {
@@ -1213,8 +1360,8 @@ fn thread_cpu_seconds() -> Result<Option<f64>> {
 mod tests {
     use super::*;
     use arrowcol_flight::{
-        BatchAdmission, PutResultEmitter, RuntimeResult, StreamAbortReason, StreamCompletion, StreamContext,
-        StreamLifecycle, StreamSummary,
+        BatchAdmission, PutResultEmitter, RuntimeError, RuntimeResult, StreamAbortReason, StreamCompletion,
+        StreamContext, StreamLifecycle, StreamSummary,
     };
     use clap::Parser;
     use std::sync::atomic::AtomicBool;
@@ -1222,6 +1369,7 @@ mod tests {
     #[derive(Default)]
     struct SmokeState {
         slow_next: AtomicBool,
+        rejections_remaining: AtomicU64,
         fast_completions: AtomicU64,
         rows: AtomicU64,
     }
@@ -1240,6 +1388,14 @@ mod tests {
             _: StreamContext,
             _: Arc<dyn PutResultEmitter>,
         ) -> RuntimeResult<Box<dyn StreamLifecycle>> {
+            if self
+                .0
+                .rejections_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| remaining.checked_sub(1))
+                .is_ok()
+            {
+                return Err(RuntimeError::draining());
+            }
             Ok(Box::new(SmokeStream {
                 state: Arc::clone(&self.0),
                 slow: self.0.slow_next.swap(false, Ordering::SeqCst),
@@ -1277,6 +1433,22 @@ mod tests {
     }
 
     #[test]
+    fn only_explicit_not_admitted_status_is_retryable() {
+        let marked = anyhow::Error::new(RuntimeError::draining().into_status());
+        let ambiguous = anyhow::Error::new(tonic::Status::unavailable("upstream failure"));
+        assert!(is_not_admitted(&marked));
+        assert!(!is_not_admitted(&ambiguous));
+    }
+
+    #[test]
+    fn stream_retry_backoff_is_jittered_within_exponential_caps() {
+        for (attempt, cap) in [(1, 10), (2, 20), (3, 40), (4, 50)] {
+            let delay = stream_retry_backoff(10, 50, attempt).as_millis() as u64;
+            assert!((cap / 2..=cap).contains(&delay));
+        }
+    }
+
+    #[test]
     fn rejects_invalid_enums_and_resource_bounds() -> Result<()> {
         for args in [
             vec!["--ipc-compression", "gzip"],
@@ -1294,6 +1466,13 @@ mod tests {
             vec!["--max-memory-bytes", "0"],
             vec!["--stream-window-bytes", "2147483648"],
             vec!["--dictionary-handling", "resend"],
+            vec!["--stream-retry-max-attempts", "0"],
+            vec![
+                "--stream-retry-base-backoff-ms",
+                "100",
+                "--stream-retry-max-backoff-ms",
+                "99",
+            ],
         ] {
             let parsed = Cli::try_parse_from(std::iter::once("test").chain(args));
             assert!(parsed.map(|cli| cli.options.resolve(10, 1).is_err()).unwrap_or(true));
@@ -1581,6 +1760,7 @@ mod tests {
         assert_eq!(state.rows.load(Ordering::Relaxed), 8);
         state.fast_completions.store(0, Ordering::Relaxed);
         state.slow_next.store(true, Ordering::SeqCst);
+        state.rejections_remaining.store(2, Ordering::SeqCst);
         let scheduled_start = unix_ms()? + 100;
         let measurement_start = scheduled_start + 50;
         let scheduled_client = Arc::clone(&client);
@@ -1602,6 +1782,20 @@ mod tests {
         );
         assert!(report.completed_rows > 8, "fast worker did not replenish its slot");
         let metrics = client.metrics("completed");
+        let retry_counts = |name: &str| {
+            metrics["workers"]
+                .as_array()
+                .expect("worker metrics")
+                .iter()
+                .map(|worker| worker[name].as_u64().expect("retry counter"))
+                .sum::<u64>()
+        };
+        assert!(retry_counts("rejected_streams") >= 2);
+        assert!(retry_counts("rejected_rows") >= 16);
+        assert!(retry_counts("retried_streams") >= 2);
+        assert!(retry_counts("retried_rows") >= 16);
+        assert_eq!(retry_counts("given_up_streams"), 0);
+        assert_eq!(retry_counts("given_up_rows"), 0);
         let total = metrics["workers"]
             .as_array()
             .context("missing workers")?

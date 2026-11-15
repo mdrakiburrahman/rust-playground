@@ -26,7 +26,7 @@ pub fn collector_is_eligible(
         && pressure.validate_at(now, &policy.pressure).is_ok()
         && pressure.accepting_deliveries
         && !pressure.subsystem_blocked()
-        && pressure.maximum_pressure_bps() < policy.hard_pressure_bps
+        && pressure.maximum_pressure_bps_excluding(&policy.excluded_admission_gauges) < policy.hard_pressure_bps
 }
 
 /// Ranks eligible collectors using weighted rendezvous hashing.
@@ -75,10 +75,9 @@ fn rendezvous_score(key: &LeaseKey, collector: &CollectorRecord, now: UnixMillis
     let hash = u64::from_be_bytes(bytes);
     let uniform = (hash as f64 + 1.0) / (u64::MAX as f64 + 1.0);
 
-    let pressure = collector
-        .pressure
-        .as_ref()
-        .map_or(BasisPoints::FULL_SCALE, |snapshot| snapshot.maximum_pressure_bps());
+    let pressure = collector.pressure.as_ref().map_or(BasisPoints::FULL_SCALE, |snapshot| {
+        snapshot.maximum_pressure_bps_excluding(&policy.excluded_admission_gauges)
+    });
     let pressure_weight =
         f64::from(BasisPoints::FULL_SCALE.saturating_sub(pressure).max(1)) / f64::from(BasisPoints::FULL_SCALE);
     let warmup_weight = warmup_bps(collector, now, policy) as f64 / f64::from(BasisPoints::FULL_SCALE);

@@ -472,6 +472,30 @@ mod property_discovery_tests {
         );
         Ok(())
     }
+
+    #[test]
+    fn stale_negative_probe_falls_back_to_full_planner() -> Result<()> {
+        let error = MaintenanceError {
+            kind: MaintenanceErrorKind::StalePlan,
+            message: "table advanced during negative probe; retry".into(),
+            report: None,
+        };
+        let (report, stale) = negative_probe_result::<()>(Err(error.into()))?;
+        assert!(report.is_none());
+        assert!(stale);
+
+        let (report, stale) = negative_probe_result(Ok(Some(7)))?;
+        assert_eq!(report, Some(7));
+        assert!(!stale);
+
+        let error = MaintenanceError {
+            kind: MaintenanceErrorKind::MetadataChanged,
+            message: "table metadata changed".into(),
+            report: None,
+        };
+        assert!(negative_probe_result::<()>(Err(error.into())).is_err());
+        Ok(())
+    }
 }
 
 fn process_defaults(settings: &Settings) -> BTreeMap<String, String> {
@@ -1214,6 +1238,16 @@ fn run_operation(
     Ok(report)
 }
 
+fn negative_probe_result<T>(result: Result<Option<T>>) -> Result<(Option<T>, bool)> {
+    match result {
+        Ok(report) => Ok((report, false)),
+        Err(error) if error_details(&error).is_some_and(|details| details.kind == MaintenanceErrorKind::StalePlan) => {
+            Ok((None, true))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn maintain_table(
     settings: &Settings,
     discovery: &dyn TableDiscovery,
@@ -1343,9 +1377,19 @@ fn maintain_table(
                         && effective.log_retention_ms.is_some_and(|retention| {
                             retention < arrow_deltalake::maintenance::MIN_VACUUM_RETENTION_MS
                         }));
-                if !full_validation && let Some(report) = probe.probe_no_work(probe_operation, &config, &control)? {
-                    negative_probe = true;
-                    return Ok(report);
+                if !full_validation {
+                    let (report, stale) =
+                        negative_probe_result(probe.probe_no_work(probe_operation, &config, &control))?;
+                    if stale {
+                        eprintln!(
+                            "delta-maintenance negative probe became stale; using full planner table={name} operation={}",
+                            operation.label()
+                        );
+                    }
+                    if let Some(report) = report {
+                        negative_probe = true;
+                        return Ok(report);
+                    }
                 }
                 if table.is_none() {
                     table = Some(DeltaTable::open_for_maintenance(&discovered.url)?);

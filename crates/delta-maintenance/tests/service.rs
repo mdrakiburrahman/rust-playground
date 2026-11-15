@@ -728,10 +728,18 @@ fn scheduled_mode_serves_prometheus_metrics() -> Result<()> {
     assert!(body.contains("delta_maintenance_heartbeat_timestamp_ms"));
     assert!(body.contains("delta_maintenance_files_removed_total{operation=\"optimize\"} 6"));
     assert!(child.wait()?.success());
-    assert!(
-        body.lines()
-            .all(|line| line.starts_with('#') || (!line.contains("table=") && !line.contains("table_name="))),
-        "no table labels"
-    );
+    let table_label_keys = body
+        .lines()
+        .filter_map(|line| {
+            let start = line.find('{')?;
+            let end = line[start..].find('}')? + start;
+            Some(&line[start + 1..end])
+        })
+        .flat_map(|labels| labels.split(','))
+        .filter_map(|label| label.split_once('='))
+        .map(|(key, _)| key.trim())
+        .filter(|key| key.contains("table"))
+        .collect::<Vec<_>>();
+    assert!(table_label_keys.is_empty(), "table labels found: {table_label_keys:?}");
     Ok(())
 }

@@ -1,8 +1,9 @@
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
-use arrowcol_routing::{PressurePolicy, RoutingPolicy};
+use arrowcol_routing::{AdmissionPressureGauge, PressurePolicy, RoutingPolicy};
 use clap::Parser;
 use serde::Deserialize;
 
@@ -54,6 +55,9 @@ pub struct RouterOverrides {
     pub max_oldest_buffer_age_ms: Option<u64>,
     #[arg(long)]
     pub hard_pressure_bps: Option<u16>,
+    /// Comma-separated admission gauges excluded from the hard-pressure maximum.
+    #[arg(long, value_delimiter = ',', value_parser = parse_admission_pressure_gauge)]
+    pub excluded_admission_gauges: Option<Vec<AdmissionPressureGauge>>,
     #[arg(long)]
     pub warmup_ms: Option<u64>,
     #[arg(long)]
@@ -392,6 +396,10 @@ fn apply_environment_overrides(
         "ARROWCOL_ROUTER_UPSTREAM_IDLE_TIMEOUT_SECONDS",
         u64
     );
+    if let Some(value) = get("ARROWCOL_ROUTER_EXCLUDED_ADMISSION_GAUGES")? {
+        config.routing.excluded_admission_gauges =
+            parse_admission_pressure_gauges(&value).context("parse ARROWCOL_ROUTER_EXCLUDED_ADMISSION_GAUGES")?;
+    }
     if let Some(value) = get("ARROWCOL_ROUTER_UPSTREAM_PING_INTERVAL_SECONDS")? {
         let seconds = value
             .parse::<u64>()
@@ -426,6 +434,9 @@ fn apply_cli_overrides(config: &mut RouterConfig, overrides: &RouterOverrides) {
     set_from_cli!(max_table_entries, config.routing.max_table_entries);
     set_from_cli!(max_oldest_buffer_age_ms, config.routing.max_oldest_buffer_age_ms);
     set_from_cli!(hard_pressure_bps, config.routing.hard_pressure_bps);
+    if let Some(gauges) = &overrides.excluded_admission_gauges {
+        config.routing.excluded_admission_gauges.clone_from(gauges);
+    }
     set_from_cli!(warmup_ms, config.routing.warmup_ms);
     set_from_cli!(minimum_warmup_bps, config.routing.minimum_warmup_bps);
     set_from_cli!(lease_ttl_ms, config.routing.lease_ttl_ms);
@@ -529,6 +540,9 @@ pub struct RoutingConfig {
     pub max_oldest_buffer_age_ms: u64,
     /// Hard pressure exclusion threshold.
     pub hard_pressure_bps: u16,
+    /// Pressure gauges omitted from hard admission; empty preserves legacy behavior.
+    #[serde(default)]
+    pub excluded_admission_gauges: Vec<AdmissionPressureGauge>,
     /// Warm-up duration.
     pub warmup_ms: u64,
     /// Minimum warm-up weight.
@@ -563,6 +577,14 @@ impl RoutingConfig {
                 max_oldest_buffer_age_ms: self.max_oldest_buffer_age_ms,
             },
             hard_pressure_bps: self.hard_pressure_bps,
+            excluded_admission_gauges: {
+                let excluded: BTreeSet<_> = self.excluded_admission_gauges.iter().copied().collect();
+                ensure!(
+                    excluded.len() == self.excluded_admission_gauges.len(),
+                    "routing.excluded_admission_gauges must not contain duplicates"
+                );
+                excluded
+            },
             warmup_ms: self.warmup_ms,
             minimum_warmup_bps: self.minimum_warmup_bps,
             lease_ttl_ms: self.lease_ttl_ms,
@@ -572,6 +594,24 @@ impl RoutingConfig {
             oat_run_id: self.oat_run_id.clone(),
         })
     }
+}
+
+fn parse_admission_pressure_gauge(value: &str) -> std::result::Result<AdmissionPressureGauge, String> {
+    value.parse()
+}
+
+fn parse_admission_pressure_gauges(value: &str) -> Result<Vec<AdmissionPressureGauge>> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(Vec::new());
+    }
+    if value.starts_with('[') {
+        return serde_json::from_str(value).context("expected a JSON array of admission pressure gauge names");
+    }
+    value
+        .split(',')
+        .map(|name| name.trim().parse().map_err(anyhow::Error::msg))
+        .collect()
 }
 
 fn default_oat_run_pin_ttl_ms() -> u64 {
@@ -645,7 +685,9 @@ pub struct TelemetryConfig {
 
 #[cfg(test)]
 mod routing_policy_tests {
-    use super::{Cli, RouterConfig, RoutingConfig, apply_cli_overrides, apply_environment_overrides};
+    use super::{
+        AdmissionPressureGauge, Cli, RouterConfig, RoutingConfig, apply_cli_overrides, apply_environment_overrides,
+    };
     use clap::Parser;
 
     #[test]
@@ -694,6 +736,10 @@ mod routing_policy_tests {
             "8",
             "--upstream-ping-interval-seconds",
             "0",
+            "--excluded-admission-gauges",
+            "cpu_utilization_bps,active_streams",
+            "--excluded-admission-gauges",
+            "cpu_utilization_bps,active_streams",
         ])
         .unwrap_or_else(|error| panic!("parse router CLI overrides: {error}"));
         let mut config = RouterConfig::from_yaml(include_bytes!("../config.yaml"))
@@ -704,6 +750,13 @@ mod routing_policy_tests {
             .unwrap_or_else(|error| panic!("validate router CLI overrides: {error}"));
         assert_eq!(config.server.threads, 8);
         assert_eq!(config.upstream.ping_interval_seconds, None);
+        assert_eq!(
+            config.routing.excluded_admission_gauges,
+            vec![
+                AdmissionPressureGauge::CpuUtilizationBps,
+                AdmissionPressureGauge::ActiveStreams
+            ]
+        );
     }
 
     #[test]
@@ -717,6 +770,10 @@ mod routing_policy_tests {
             ("ARROWCOL_ROUTER_H2_MAX_CONCURRENT_STREAMS", "512"),
             ("ARROWCOL_ROUTER_UPSTREAM_PING_INTERVAL_SECONDS", "0"),
             ("ARROWCOL_ROUTER_DISTINCT_TABLE_OWNERS", "true"),
+            (
+                "ARROWCOL_ROUTER_EXCLUDED_ADMISSION_GAUGES",
+                r#"["cpu_utilization_bps"]"#,
+            ),
         ]);
         apply_environment_overrides(&mut config, |name| {
             Ok(overrides.get(name).map(|value| (*value).to_owned()))
@@ -730,6 +787,10 @@ mod routing_policy_tests {
         assert_eq!(config.server.h2.max_concurrent_streams, 512);
         assert_eq!(config.upstream.ping_interval_seconds, None);
         assert!(config.routing.distinct_table_owners);
+        assert_eq!(
+            config.routing.excluded_admission_gauges,
+            vec![AdmissionPressureGauge::CpuUtilizationBps]
+        );
     }
 
     #[test]

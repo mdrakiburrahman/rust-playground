@@ -19,8 +19,9 @@ pub use engine::{ControlOperation, ControlRoute, RebalanceReport, RouteAssignmen
 pub use error::{RoutingError, RoutingErrorKind, RoutingResult};
 pub use memory::{MemoryOperationCounts, MemoryRoutingStore};
 pub use model::{
-    CollectorRecord, CollectorRegistration, CollectorState, LeaseKey, LeaseState, PressurePolicy, RichPressureSnapshot,
-    RoutingLease, RoutingPolicy, RoutingView, RunTablePin, SubsystemState, TablePressure,
+    AdmissionPressureGauge, CollectorRecord, CollectorRegistration, CollectorState, LeaseKey, LeaseState,
+    PressurePolicy, RichPressureSnapshot, RoutingLease, RoutingPolicy, RoutingView, RunTablePin, SubsystemState,
+    TablePressure,
 };
 pub use selection::{collector_is_eligible, rank_collectors};
 pub use sql_server::{SqlServerRoutingConfig, SqlServerRoutingStore, run_table_pin_set_digest};

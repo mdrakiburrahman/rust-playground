@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use arrowcol_routing::AdmissionPressureGauge;
 use prometheus::{
     Encoder, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder, register_int_counter_vec_with_registry,
     register_int_gauge_vec_with_registry, register_int_gauge_with_registry,
@@ -19,6 +20,7 @@ pub struct RouterMetrics {
     table_owners: IntGaugeVec,
     distinct_table_owners: IntGauge,
     maximum_pressure_bps: IntGaugeVec,
+    pressure_gauge_bps: IntGaugeVec,
 }
 
 impl RouterMetrics {
@@ -99,6 +101,14 @@ impl RouterMetrics {
             &["pool"],
             registry.as_ref()
         )?;
+        let pressure_gauge_bps = register_int_gauge_vec_with_registry!(
+            Opts::new(
+                "arrowcol_router_collector_pressure_gauge_bps",
+                "Fresh collector pressure by pool and admission gauge"
+            ),
+            &["pool", "gauge"],
+            registry.as_ref()
+        )?;
         Ok(Self {
             registry,
             decisions,
@@ -111,6 +121,7 @@ impl RouterMetrics {
             table_owners,
             distinct_table_owners,
             maximum_pressure_bps,
+            pressure_gauge_bps,
         })
     }
 
@@ -161,7 +172,13 @@ impl RouterMetrics {
     /// Updates cache and table-owner gauges.
     pub fn update_cache_gauges(&self, view: &arrowcol_routing::RoutingView) {
         self.table_owners.reset();
+        self.pressure_gauge_bps.reset();
         for pool in ["dataflow"] {
+            for gauge in AdmissionPressureGauge::ALL {
+                self.pressure_gauge_bps
+                    .with_label_values(&[pool, gauge.as_str()])
+                    .set(0);
+            }
             for state in ["active", "draining"] {
                 self.cached_leases.with_label_values(&[pool, state]).set(0);
             }
@@ -189,8 +206,12 @@ impl RouterMetrics {
         for collector in view.collectors.values() {
             if let Some(pressure) = collector.pressure.as_ref() {
                 let pool = collector.registration.implementation_pool.to_string();
-                let gauge = self.maximum_pressure_bps.with_label_values(&[&pool]);
-                gauge.set(gauge.get().max(i64::from(pressure.maximum_pressure_bps())));
+                let maximum = self.maximum_pressure_bps.with_label_values(&[&pool]);
+                maximum.set(maximum.get().max(i64::from(pressure.maximum_pressure_bps())));
+                for (name, value) in pressure.pressure_gauges_bps() {
+                    let gauge = self.pressure_gauge_bps.with_label_values(&[&pool, name.as_str()]);
+                    gauge.set(gauge.get().max(i64::from(value)));
+                }
             }
         }
     }
@@ -205,5 +226,22 @@ impl RouterMetrics {
         let mut output = Vec::new();
         TextEncoder::new().encode(&families, &mut output)?;
         Ok(output)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RouterMetrics;
+    use arrowcol_protocol::UnixMillis;
+    use arrowcol_routing::RoutingView;
+
+    #[test]
+    fn exports_fixed_pressure_gauge_labels_for_diagnosis() {
+        let metrics = RouterMetrics::new().expect("router metrics");
+        metrics.update_cache_gauges(&RoutingView::empty(UnixMillis::new(1).expect("timestamp")));
+        let output = String::from_utf8(metrics.encode().expect("metrics encoding")).expect("UTF-8 metrics");
+        assert!(output.contains("arrowcol_router_collector_pressure_gauge_bps"));
+        assert!(output.contains("gauge=\"cpu_utilization_bps\""));
+        assert!(output.contains("gauge=\"quiver_pressure_bps\""));
     }
 }

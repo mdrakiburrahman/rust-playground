@@ -20,6 +20,9 @@ mod metadata;
 mod pressure;
 mod protocol;
 
+/// gRPC metadata key set to `true` only when a delivery was rejected before admission.
+pub const NOT_ADMITTED_METADATA_KEY: &str = "arrowcol-not-admitted";
+
 pub use auth::{
     AuthContext, AuthContextError, AuthMethod, AuthenticatedPrincipal, PrincipalError, PrincipalId, PrincipalIssuer,
     PrincipalScope,

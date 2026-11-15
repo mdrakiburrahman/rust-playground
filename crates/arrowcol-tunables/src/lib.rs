@@ -6,6 +6,7 @@ pub use arrow_deltalake::writer::{
     Codec as ParquetCodec, ColumnOptions as ParquetColumnOptions, ParquetWriterConfig, SortColumn as ParquetSortColumn,
     Statistics as ParquetStatistics, ValueEncoding as ParquetValueEncoding, Version as ParquetWriterVersion,
 };
+pub use arrowcol_routing::AdmissionPressureGauge;
 
 use serde::{Deserialize, Serialize};
 
@@ -50,6 +51,9 @@ pub struct ClientTunables {
     pub connections_per_worker: Option<usize>,
     pub streams_per_worker: Option<usize>,
     pub max_rows: Option<u64>,
+    pub stream_retry_max_attempts: Option<u32>,
+    pub stream_retry_base_backoff_ms: Option<u64>,
+    pub stream_retry_max_backoff_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -107,6 +111,7 @@ pub struct RouterTunables {
     pub max_table_entries: Option<usize>,
     pub max_oldest_buffer_age_ms: Option<u64>,
     pub hard_pressure_bps: Option<u16>,
+    pub excluded_admission_gauges: Option<Vec<AdmissionPressureGauge>>,
     pub warmup_ms: Option<u64>,
     pub minimum_warmup_bps: Option<u16>,
     pub lease_ttl_ms: Option<u64>,

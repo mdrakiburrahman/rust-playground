@@ -2,6 +2,7 @@ use std::os::fd::RawFd;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use arrowcol_protocol::NOT_ADMITTED_METADATA_KEY;
 use arrowcol_protocol::{
     CATALOG_METADATA_KEY, CLAIMED_SCHEMA_FINGERPRINT_METADATA_KEY, IMPLEMENTATION_POOL_METADATA_KEY,
     ImplementationPool, IngestMetadata, PROTOCOL_VERSION_METADATA_KEY, RawGrpcMetadata, SCHEMA_METADATA_KEY,
@@ -185,7 +186,12 @@ impl ProductionRouter {
                         write_grpc_error(session, 9, &format!("pinning_violation: {}", error.message())).await?;
                     } else {
                         self.metrics.failure("doput", &pool, routing_reason(error.kind()));
-                        write_grpc_error(session, routing_grpc_status(error.kind()), error.message()).await?;
+                        if routing_error_is_preadmission(error.kind()) {
+                            write_not_admitted_grpc_error(session, routing_grpc_status(error.kind()), error.message())
+                                .await?;
+                        } else {
+                            write_grpc_error(session, routing_grpc_status(error.kind()), error.message()).await?;
+                        }
                     }
                     Ok(true)
                 }
@@ -787,13 +793,39 @@ fn sanitize_public_message(message: &str) -> String {
 }
 
 async fn write_grpc_error(session: &mut Session, grpc_status: u16, message: &str) -> pingora::Result<()> {
-    let mut response = ResponseHeader::build(200, Some(5))?;
+    write_grpc_error_with_metadata(session, grpc_status, message, false).await
+}
+
+async fn write_not_admitted_grpc_error(session: &mut Session, grpc_status: u16, message: &str) -> pingora::Result<()> {
+    write_grpc_error_with_metadata(session, grpc_status, message, true).await
+}
+
+async fn write_grpc_error_with_metadata(
+    session: &mut Session,
+    grpc_status: u16,
+    message: &str,
+    not_admitted: bool,
+) -> pingora::Result<()> {
+    let mut response = ResponseHeader::build(200, Some(6))?;
     response.insert_header("content-type", "application/grpc")?;
     response.insert_header("grpc-status", grpc_status.to_string())?;
     response.insert_header("grpc-message", grpc_message(message))?;
+    if not_admitted {
+        response.insert_header(NOT_ADMITTED_METADATA_KEY, "true")?;
+    }
     response.insert_header("cache-control", "no-store")?;
     response.insert_header("x-content-type-options", "nosniff")?;
     session.write_response_header(Box::new(response), true).await
+}
+
+fn routing_error_is_preadmission(kind: RoutingErrorKind) -> bool {
+    matches!(
+        kind,
+        RoutingErrorKind::PoolUnavailable
+            | RoutingErrorKind::LeaseDraining
+            | RoutingErrorKind::LeaseHolderUnavailable
+            | RoutingErrorKind::Database
+    )
 }
 
 async fn write_json<T: Serialize>(session: &mut Session, status: StatusCode, value: &T) -> pingora::Result<()> {
@@ -858,6 +890,21 @@ fn routing_grpc_status(kind: RoutingErrorKind) -> u16 {
         | RoutingErrorKind::Database => 14,
         RoutingErrorKind::CorruptState => 13,
         _ => 13,
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::{RoutingErrorKind, routing_error_is_preadmission};
+
+    #[test]
+    fn retry_marker_is_limited_to_pre_admission_routing_rejections() {
+        assert!(routing_error_is_preadmission(RoutingErrorKind::PoolUnavailable));
+        assert!(routing_error_is_preadmission(RoutingErrorKind::LeaseDraining));
+        assert!(routing_error_is_preadmission(RoutingErrorKind::LeaseHolderUnavailable));
+        assert!(routing_error_is_preadmission(RoutingErrorKind::Database));
+        assert!(!routing_error_is_preadmission(RoutingErrorKind::Conflict));
+        assert!(!routing_error_is_preadmission(RoutingErrorKind::InvalidConfiguration));
     }
 }
 
