@@ -208,6 +208,7 @@ const CAPABILITIES: &[Capability] = &[
     capability!("collector.pressure.buffered_batches_limit", "4096"),
     capability!("collector.pressure.pressure_interval", "2s"),
     capability!("collector.pressure.heartbeat_interval", "5s"),
+    capability!("collector.cpu_pressure", "off"),
     capability!(
         "collector.pressure.registration_ttl",
         "20s; must exceed heartbeat_interval"
@@ -753,6 +754,9 @@ impl Tunables {
                             output.insert(format!("ARROWCOL_COLLECTOR_{field}"), value.to_string());
                         }
                     }
+                }
+                if let Some(value) = collector.cpu_pressure {
+                    output.insert("ARROWCOL_COLLECTOR_CPU_PRESSURE".to_owned(), value.as_str().to_owned());
                 }
                 continue;
             }
@@ -1849,6 +1853,28 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn cpu_pressure_mode_is_strict_and_projects_to_collector_env() -> Result<()> {
+        assert_eq!(
+            serde_json::from_str::<CpuPressureMode>("\"process\"")?,
+            CpuPressureMode::Process
+        );
+        assert!(error_text(serde_json::from_str::<CpuPressureMode>("\"automatic\"")).contains("unknown variant"));
+        assert!("automatic".parse::<CpuPressureMode>().is_err());
+        let tunables = Tunables {
+            collector: Some(CollectorTunables {
+                cpu_pressure: Some(CpuPressureMode::Process),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            tunables.environment_for(ComponentRole::Collector)?["ARROWCOL_COLLECTOR_CPU_PRESSURE"],
+            "process"
+        );
+        Ok(())
+    }
 
     #[test]
     fn strict_writer_config_parsing_and_validation() -> Result<()> {

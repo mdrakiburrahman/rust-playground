@@ -444,6 +444,10 @@ fn create_receiver(
         config.registration.instance_key = format!("{}|cloud={generation}", config.registration.instance_key);
     }
     config.validate().map_err(config_error)?;
+    let metrics = global_metrics();
+    metrics
+        .configure_cpu_pressure(config.cpu_pressure)
+        .map_err(config_error)?;
     eprintln!(
         "arrowcol_effective_config {}",
         serde_json::json!({
@@ -457,7 +461,6 @@ fn create_receiver(
         "arrowcol_effective_config"
     );
     let routing = config.routing.build().map_err(config_error)?;
-    let metrics = global_metrics();
     metrics
         .configure_admission(&config.registration.instance_key, config.native_quiver)
         .map_err(config_error)?;

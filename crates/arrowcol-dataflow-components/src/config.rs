@@ -712,10 +712,23 @@ pub struct FlightReceiverConfig {
     /// When `false`, completion stays `best_effort_admission`.
     #[serde(default)]
     pub native_quiver: bool,
+    /// Process CPU sampling for admission pressure; disabled by default.
+    #[serde(default)]
+    pub cpu_pressure: arrowcol_tunables::CpuPressureMode,
 }
 
 impl FlightReceiverConfig {
     pub(crate) fn apply_environment(&mut self) -> Result<(), String> {
+        const CPU_PRESSURE_ENV: &str = "ARROWCOL_COLLECTOR_CPU_PRESSURE";
+        match std::env::var(CPU_PRESSURE_ENV) {
+            Ok(value) => {
+                self.cpu_pressure = value.parse().map_err(|error| format!("{CPU_PRESSURE_ENV}: {error}"))?;
+            }
+            Err(std::env::VarError::NotPresent) => {}
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(format!("{CPU_PRESSURE_ENV} must be UTF-8"));
+            }
+        }
         apply_json_environment(&mut self.limits, "ARROWCOL_COLLECTOR_LIMITS_CONFIG", None)?;
         apply_json_environment(
             &mut self.registration,
@@ -737,6 +750,7 @@ impl FlightReceiverConfig {
 
     pub(crate) fn effective_config_json(&self) -> serde_json::Value {
         serde_json::json!({
+            "cpu_pressure": self.cpu_pressure,
             "limits": self.limits,
             "pressure": {
                 "max_concurrent_streams": self.registration.max_concurrent_streams,

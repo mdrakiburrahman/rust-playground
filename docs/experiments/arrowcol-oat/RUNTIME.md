@@ -24,6 +24,8 @@ The pinned SQL executable requires `NET_BIND_SERVICE` in its capability set;
 only that container receives it, while remaining non-root with privilege
 escalation disabled. Other containers continue to drop all capabilities.
 
+Collector CPU pressure sampling is disabled by default and preserves the existing zero gauge. With `ARROWCOL_COLLECTOR_CPU_PRESSURE=process`, each pressure-publication tick samples process CPU-time against wall time multiplied by the effective cgroup v2 quota or available parallelism; the first tick is zero and readings clamp at 10000 basis points. OAT evidence reports `not_sampled` with a null gauge when sampling is off. CPU-gauge exclusion only affects router admission when process sampling is enabled.
+
 ## Prerequisites and authorization
 
 For AKS prerequisites, continue below. Local runs use the following independent path.

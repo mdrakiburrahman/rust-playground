@@ -9,6 +9,7 @@ pub use arrow_deltalake::writer::{
 pub use arrowcol_routing::AdmissionPressureGauge;
 
 use serde::{Deserialize, Serialize};
+use std::str::FromStr;
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -198,6 +199,7 @@ pub struct CollectorTunables {
     pub pressure: Option<PressureTunables>,
     pub routing: Option<RoutingTunables>,
     pub runtime: Option<RuntimeTunables>,
+    pub cpu_pressure: Option<CpuPressureMode>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -331,6 +333,36 @@ pub enum DictionaryHandling {
 pub enum DataMode {
     Shared,
     Independent,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum CpuPressureMode {
+    #[default]
+    Off,
+    Process,
+}
+
+impl CpuPressureMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Process => "process",
+        }
+    }
+}
+
+impl FromStr for CpuPressureMode {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "off" => Ok(Self::Off),
+            "process" => Ok(Self::Process),
+            _ => Err("expected 'off' or 'process'"),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]

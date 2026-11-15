@@ -55,6 +55,7 @@
       "max_message_bytes": 16777216
     },
     "collector": {
+      "cpu_pressure": "process",
       "batching": {
         "coalesce_publications": true,
         "max_age": "1s",

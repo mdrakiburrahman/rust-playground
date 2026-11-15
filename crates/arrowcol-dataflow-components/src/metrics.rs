@@ -2,7 +2,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use cpu_time::ProcessTime;
 
 use arrowcol_catalog::SchemaVersion;
 use arrowcol_protocol::{
@@ -10,6 +12,7 @@ use arrowcol_protocol::{
     ProtocolVersion, TableIdentity, UnixMillis,
 };
 use arrowcol_routing::{RichPressureSnapshot, RoutingStore, SubsystemState, TablePressure};
+use arrowcol_tunables::CpuPressureMode;
 use serde::Serialize;
 use tokio::sync::watch;
 
@@ -160,6 +163,75 @@ struct TableState {
     durable: DurableBacklog,
 }
 
+#[derive(Default)]
+struct ProcessCpuSampler {
+    last_cpu: Option<ProcessTime>,
+    last_wall: Option<Instant>,
+}
+
+impl ProcessCpuSampler {
+    fn sample(&mut self) -> Result<u16, String> {
+        let now_cpu = ProcessTime::try_now().map_err(|error| format!("read process CPU time: {error}"))?;
+        let now_wall = Instant::now();
+        let previous = self.last_cpu.zip(self.last_wall);
+        self.last_cpu = Some(now_cpu);
+        self.last_wall = Some(now_wall);
+        let Some((last_cpu, last_wall)) = previous else {
+            return Ok(0);
+        };
+        let cpu_delta = last_cpu
+            .try_elapsed()
+            .map_err(|error| format!("read process CPU delta: {error}"))?;
+        process_cpu_ratio_bps(
+            cpu_delta,
+            now_wall.saturating_duration_since(last_wall),
+            effective_cpu_cores()?,
+        )
+    }
+}
+
+fn process_cpu_ratio_bps(cpu_delta: Duration, wall_delta: Duration, effective_cores: f64) -> Result<u16, String> {
+    if wall_delta.is_zero() || !effective_cores.is_finite() || effective_cores <= 0.0 {
+        return Err("CPU pressure ratio requires a positive wall interval and effective core count".to_owned());
+    }
+    let ratio = cpu_delta.as_secs_f64() / (wall_delta.as_secs_f64() * effective_cores);
+    if !ratio.is_finite() || ratio < 0.0 {
+        return Err("CPU pressure ratio is not finite and non-negative".to_owned());
+    }
+    Ok((ratio * 10_000.0).round().clamp(0.0, 10_000.0) as u16)
+}
+
+fn effective_cpu_cores() -> Result<f64, String> {
+    #[cfg(target_os = "linux")]
+    match std::fs::read_to_string("/sys/fs/cgroup/cpu.max") {
+        Ok(contents) => {
+            let mut parts = contents.split_whitespace();
+            let quota = parts
+                .next()
+                .ok_or_else(|| "cgroup cpu.max is missing quota".to_owned())?;
+            let period = parts
+                .next()
+                .ok_or_else(|| "cgroup cpu.max is missing period".to_owned())?
+                .parse::<u64>()
+                .map_err(|error| format!("parse cgroup cpu.max period: {error}"))?;
+            if quota != "max" {
+                let quota = quota
+                    .parse::<u64>()
+                    .map_err(|error| format!("parse cgroup cpu.max quota: {error}"))?;
+                if quota == 0 || period == 0 {
+                    return Err("cgroup cpu.max quota and period must be positive".to_owned());
+                }
+                return Ok(quota as f64 / period as f64);
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("read cgroup cpu.max: {error}")),
+    }
+    std::thread::available_parallelism()
+        .map(|cores| cores.get() as f64)
+        .map_err(|error| format!("read available CPU parallelism: {error}"))
+}
+
 /// Atomic process-wide counters shared by receiver, exporter, admin, and registration.
 pub struct RuntimeMetrics {
     instance_id: CollectorInstanceId,
@@ -200,6 +272,9 @@ pub struct RuntimeMetrics {
     max_pending_commits: AtomicU64,
     dfe_channel_capacity: AtomicU64,
     tables: Mutex<BTreeMap<TableIdentity, TableState>>,
+    cpu_pressure_mode: OnceLock<CpuPressureMode>,
+    cpu_utilization_bps: AtomicU64,
+    process_cpu_sampler: Mutex<ProcessCpuSampler>,
     pressure_publication: tokio::sync::Mutex<Option<UnixMillis>>,
 }
 
@@ -246,6 +321,9 @@ impl RuntimeMetrics {
             max_pending_commits: AtomicU64::new(1),
             dfe_channel_capacity: AtomicU64::new(1),
             tables: Mutex::new(BTreeMap::new()),
+            cpu_pressure_mode: OnceLock::new(),
+            cpu_utilization_bps: AtomicU64::new(0),
+            process_cpu_sampler: Mutex::new(ProcessCpuSampler::default()),
             pressure_publication: tokio::sync::Mutex::new(None),
         }
     }
@@ -262,6 +340,27 @@ impl RuntimeMetrics {
         if *self.native_quiver.get_or_init(|| native_quiver) != native_quiver {
             return Err("conflicting process-wide native Quiver settings".to_owned());
         }
+        Ok(())
+    }
+
+    pub(crate) fn configure_cpu_pressure(&self, mode: CpuPressureMode) -> Result<(), String> {
+        if *self.cpu_pressure_mode.get_or_init(|| mode) != mode {
+            return Err("conflicting process-wide collector CPU pressure settings".to_owned());
+        }
+        Ok(())
+    }
+
+    fn sample_cpu_pressure(&self) -> Result<(), String> {
+        let utilization = match self.cpu_pressure_mode.get().copied().unwrap_or_default() {
+            CpuPressureMode::Off => 0,
+            CpuPressureMode::Process => self
+                .process_cpu_sampler
+                .lock()
+                .map_err(|_| "process CPU sampler lock is poisoned".to_owned())?
+                .sample(),
+        };
+        self.cpu_utilization_bps
+            .store(u64::from(utilization), Ordering::Release);
         Ok(())
     }
 
@@ -568,6 +667,7 @@ impl RuntimeMetrics {
 
     pub(crate) async fn publish_pressure(&self, store: &dyn RoutingStore) -> Result<(), String> {
         let mut previous = self.pressure_publication.lock().await;
+        self.sample_cpu_pressure()?;
         let mut snapshot = self.pressure()?;
         while let Some(last) = *previous
             && snapshot.rich.observed_at_unix_ms <= last
@@ -660,7 +760,10 @@ impl RuntimeMetrics {
         let rich = RichPressureSnapshot {
             instance_id: self.instance_id,
             observed_at_unix_ms: now,
-            cpu_utilization_bps: BasisPoints::new(0).map_err(|error| error.to_string())?,
+            cpu_utilization_bps: BasisPoints::new(
+                u16::try_from(self.cpu_utilization_bps.load(Ordering::Acquire)).map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?,
             rss_bytes: measurement(bounded_rss)?,
             rss_limit_bytes: positive(rss_limit)?,
             active_streams: gauge(active, max_streams)?,
@@ -1186,6 +1289,32 @@ mod tests {
     use arrowcol_protocol::{CatalogName, SchemaName, TableName};
 
     use super::*;
+
+    #[test]
+    fn process_cpu_pressure_ratio_uses_effective_cores_and_clamps() {
+        assert_eq!(
+            process_cpu_ratio_bps(Duration::from_millis(500), Duration::from_secs(1), 2.0).expect("valid CPU ratio"),
+            2_500
+        );
+        assert_eq!(
+            process_cpu_ratio_bps(Duration::from_secs(2), Duration::from_secs(1), 1.0).expect("clamped CPU ratio"),
+            10_000
+        );
+        assert!(process_cpu_ratio_bps(Duration::ZERO, Duration::ZERO, 1.0).is_err());
+    }
+
+    #[test]
+    fn first_process_cpu_pressure_sample_is_zero() {
+        assert_eq!(ProcessCpuSampler::default().sample().expect("first sample"), 0);
+    }
+
+    #[test]
+    fn cpu_pressure_off_keeps_the_legacy_zero_gauge() {
+        let pressure = RuntimeMetrics::new(CollectorInstanceId::new())
+            .pressure()
+            .expect("pressure snapshot");
+        assert_eq!(pressure.rich.cpu_utilization_bps.get(), 0);
+    }
 
     fn table() -> TableIdentity {
         TableIdentity::new(

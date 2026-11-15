@@ -1019,17 +1019,18 @@ async fn cancel_local_client(handle: &ClientHandle) -> Result<()> {
 }
 
 fn run_scoped_local_router_config(router_text: &str, run_id: &str, run_pin_ttl_ms: u64) -> Result<String> {
-    let router_text = router_text.replacen("lease_ttl_ms: 86400000", "lease_ttl_ms: 3600000", 1);
-    if router_text.matches("lease_ttl_ms: 3600000").count() != 1
+    let lease_ttl_ms = run_pin_ttl_ms.max(3_600_000);
+    let router_text = router_text.replacen("lease_ttl_ms: 86400000", &format!("lease_ttl_ms: {lease_ttl_ms}"), 1);
+    if router_text.matches(&format!("lease_ttl_ms: {lease_ttl_ms}")).count() != 1
         || router_text.contains("oat_run_id:")
         || router_text.contains("oat_run_pin_ttl_ms:")
     {
-        bail!("local router config did not contain its expected 1-hour lease TTL");
+        bail!("local router config did not contain its expected one-day lease TTL");
     }
     let run_id_yaml = serde_json::to_string(run_id)?;
     Ok(router_text.replacen(
-        "lease_ttl_ms: 3600000",
-        &format!("lease_ttl_ms: 3600000\n  oat_run_pin_ttl_ms: {run_pin_ttl_ms}\n  oat_run_id: {run_id_yaml}"),
+        &format!("lease_ttl_ms: {lease_ttl_ms}"),
+        &format!("lease_ttl_ms: {lease_ttl_ms}\n  oat_run_pin_ttl_ms: {run_pin_ttl_ms}\n  oat_run_id: {run_id_yaml}"),
         1,
     ))
 }
@@ -2078,6 +2079,12 @@ fn inject_router_oat_pin_ttl(resources: &mut [Value], ttl_ms: u64) -> Result<()>
         .get_mut("routing")
         .and_then(serde_yaml::Value::as_mapping_mut)
         .context("AKS router YAML has no routing mapping")?;
+    let lease_key = serde_yaml::Value::String("lease_ttl_ms".to_owned());
+    let current_lease_ttl = routing.get(&lease_key).and_then(serde_yaml::Value::as_u64).unwrap_or(0);
+    routing.insert(
+        lease_key,
+        serde_yaml::Value::Number(current_lease_ttl.max(ttl_ms).into()),
+    );
     routing.insert(
         serde_yaml::Value::String("oat_run_pin_ttl_ms".to_owned()),
         serde_yaml::Value::Number(ttl_ms.into()),
@@ -2771,6 +2778,8 @@ async fn run_clients_inner(
     let mut active_clients = vec![true; handles.len()];
     let mut router_sql_start = None;
     let mut router_sql_end = None;
+    let mut router_cpu_pressure_samples = Vec::new();
+    let mut router_cpu_pressure_parse_failures = 0_u64;
     while completed_clients.len() < handles.len() {
         let pending_indices = handles
             .iter()
@@ -2874,6 +2883,11 @@ async fn run_clients_inner(
         if let Ok(sample) = &sample {
             capture_router_sql_boundary(&mut router_sql_start, sample, measurement_start_unix_ms);
             capture_router_sql_boundary(&mut router_sql_end, sample, measurement_end_unix_ms);
+            record_router_cpu_pressure_sample(
+                &mut router_cpu_pressure_samples,
+                &mut router_cpu_pressure_parse_failures,
+                &sample.cpu_pressure,
+            );
         }
         record_owner_observation(pinning, sample.map(|sample| sample.owners), tables, false);
         if completed_clients.len() < handles.len() {
@@ -2884,8 +2898,23 @@ async fn run_clients_inner(
     if let Ok(sample) = &final_sample {
         capture_router_sql_boundary(&mut router_sql_start, sample, measurement_start_unix_ms);
         capture_router_sql_boundary(&mut router_sql_end, sample, measurement_end_unix_ms);
+        record_router_cpu_pressure_sample(
+            &mut router_cpu_pressure_samples,
+            &mut router_cpu_pressure_parse_failures,
+            &sample.cpu_pressure,
+        );
     }
     record_owner_observation(pinning, final_sample.map(|sample| sample.owners), tables, true);
+    evidence.router_cpu_pressure = Some(router_cpu_pressure_evidence(
+        config
+            .tunables
+            .collector
+            .as_ref()
+            .and_then(|collector| collector.cpu_pressure)
+            .unwrap_or_default(),
+        &router_cpu_pressure_samples,
+        router_cpu_pressure_parse_failures,
+    ));
     evidence.router_sql = Some(router_sql_evidence(
         router_sql_start.as_ref(),
         router_sql_end.as_ref(),
@@ -3056,6 +3085,86 @@ async fn cancel_active_clients(
 struct RouterMetricSample {
     owners: HashMap<String, Vec<String>>,
     sql: RouterSqlMetricObservation,
+    cpu_pressure: RouterCpuMetricObservation,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RouterCpuMetricObservation {
+    utilization_bps: Option<u16>,
+    parse_error: Option<String>,
+}
+
+fn parse_router_cpu_pressure_metrics(body: &str) -> Result<Option<u16>> {
+    let mut maximum = None;
+    for line in body.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(metric) = fields.next() else { continue };
+        if !metric.starts_with("arrowcol_router_collector_pressure_gauge_bps{")
+            || !metric.contains("gauge=\"cpu_utilization_bps\"")
+        {
+            continue;
+        }
+        let value = fields
+            .next()
+            .context("CPU pressure gauge has no value")?
+            .parse::<f64>()
+            .context("CPU pressure gauge is not numeric")?;
+        if !value.is_finite() || !(0.0..=10_000.0).contains(&value) {
+            bail!("CPU pressure gauge is outside 0..=10000 basis points");
+        }
+        let value = value.round() as u16;
+        maximum = Some(maximum.map_or(value, |current: u16| current.max(value)));
+    }
+    Ok(maximum)
+}
+
+fn record_router_cpu_pressure_sample(
+    samples: &mut Vec<u16>,
+    parse_failures: &mut u64,
+    observation: &RouterCpuMetricObservation,
+) {
+    if observation.parse_error.is_some() {
+        *parse_failures = parse_failures.saturating_add(1);
+    } else if let Some(value) = observation.utilization_bps {
+        samples.push(value);
+    }
+}
+
+fn router_cpu_pressure_evidence(
+    mode: arrowcol_tunables::CpuPressureMode,
+    samples: &[u16],
+    parse_failures: u64,
+) -> Value {
+    if mode == arrowcol_tunables::CpuPressureMode::Off {
+        return json!({
+            "status": "not_sampled",
+            "mode": mode.as_str(),
+            "cpu_utilization_bps": null,
+        });
+    }
+    if parse_failures > 0 {
+        return json!({
+            "status": "unavailable",
+            "mode": mode.as_str(),
+            "reason": "cpu_pressure_metric_malformed",
+            "parse_failures": parse_failures,
+            "cpu_utilization_bps": null,
+        });
+    }
+    let Some(maximum) = samples.iter().copied().max() else {
+        return json!({
+            "status": "unavailable",
+            "mode": mode.as_str(),
+            "reason": "cpu_pressure_metric_missing",
+            "cpu_utilization_bps": null,
+        });
+    };
+    json!({
+        "status": "observed",
+        "mode": mode.as_str(),
+        "sample_count": samples.len(),
+        "peak_cpu_utilization_bps": maximum,
+    })
 }
 
 #[derive(Clone, Debug, Default)]
@@ -3209,8 +3318,16 @@ fn parse_router_metric_sample(
         Ok(snapshot) => (Some(snapshot), None),
         Err(error) => (None, Some(format!("{error:#}"))),
     };
+    let (utilization_bps, cpu_parse_error) = match parse_router_cpu_pressure_metrics(body) {
+        Ok(value) => (value, None),
+        Err(error) => (None, Some(format!("{error:#}"))),
+    };
     Ok(RouterMetricSample {
         owners,
+        cpu_pressure: RouterCpuMetricObservation {
+            utilization_bps,
+            parse_error: cpu_parse_error,
+        },
         sql: RouterSqlMetricObservation {
             snapshot,
             parse_error,
@@ -3502,9 +3619,38 @@ fn parse_router_sql_metrics(body: &str) -> Result<RouterSqlMetricSnapshot> {
 mod router_sql_metrics_tests {
     use super::{
         RouterSqlMetricObservation, RouterSqlMetricSnapshot, parse_router_metric_sample, parse_router_sql_metrics,
-        router_sql_evidence,
+        router_cpu_pressure_evidence, router_sql_evidence,
     };
     use anyhow::{Context, Result, bail};
+
+    #[test]
+    fn cpu_pressure_gauge_parses_without_promoting_parse_errors_to_pin_failures() -> Result<()> {
+        let tables = vec!["sqlserver_active_sessions".to_owned()];
+        let body = concat!(
+            "arrowcol_router_table_owners{table=\"sqlserver_active_sessions\",collector=\"collector-a\",state=\"active\"} 1\n",
+            "arrowcol_router_collector_pressure_gauge_bps{gauge=\"cpu_utilization_bps\",collector=\"collector-a\"} 731\n",
+        );
+        let sample = parse_router_metric_sample(body, &tables, 1_000, 1_010)?;
+        assert_eq!(sample.cpu_pressure.utilization_bps, Some(731));
+        assert!(sample.cpu_pressure.parse_error.is_none());
+
+        let malformed = concat!(
+            "arrowcol_router_table_owners{table=\"sqlserver_active_sessions\",collector=\"collector-a\",state=\"active\"} 1\n",
+            "arrowcol_router_collector_pressure_gauge_bps{gauge=\"cpu_utilization_bps\",collector=\"collector-a\"} bad\n",
+        );
+        let sample = parse_router_metric_sample(malformed, &tables, 1_000, 1_010)?;
+        assert_eq!(sample.owners.values().next().map(Vec::len), Some(1));
+        assert!(sample.cpu_pressure.parse_error.is_some());
+        assert!(sample.sql.snapshot.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn cpu_pressure_off_is_labeled_not_sampled() {
+        let evidence = router_cpu_pressure_evidence(arrowcol_tunables::CpuPressureMode::Off, &[], 0);
+        assert_eq!(evidence["status"], "not_sampled");
+        assert!(evidence["cpu_utilization_bps"].is_null());
+    }
 
     #[test]
     fn owner_evidence_survives_missing_sql_counter() -> Result<()> {
@@ -9315,6 +9461,7 @@ mod tests {
         let generated: serde_yaml::Value = serde_yaml::from_str(&generated)?;
         assert_eq!(generated["auth"]["authenticator"].as_str(), Some("dev_only_allow_all"));
         assert_eq!(generated["routing"]["oat_run_id"].as_str(), Some("run-one"));
+        assert_eq!(generated["routing"]["lease_ttl_ms"].as_u64(), Some(4_080_000));
         assert_eq!(generated["routing"]["oat_run_pin_ttl_ms"].as_u64(), Some(4_080_000));
 
         let configured = run_scoped_local_router_config(
@@ -9351,6 +9498,7 @@ mod tests {
             .context("router yaml missing")?;
         let router: serde_yaml::Value = serde_yaml::from_str(yaml)?;
         assert_eq!(router["routing"]["oat_run_id"].as_str(), Some("run-one"));
+        assert_eq!(router["routing"]["lease_ttl_ms"].as_u64(), Some(4_080_000));
         assert_eq!(router["routing"]["oat_run_pin_ttl_ms"].as_u64(), Some(4_080_000));
         Ok(())
     }

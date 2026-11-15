@@ -9,6 +9,7 @@ struct CellEvidence {
     measurement_window: Option<(u64, u64)>,
     durable_commits: HashMap<String, Value>,
     router_sql: Option<Value>,
+    router_cpu_pressure: Option<Value>,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]

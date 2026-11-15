@@ -521,6 +521,7 @@ fn verify_process_configuration(config: &OatConfig, role: ComponentRole, observe
             "ARROWCOL_COLLECTOR_COMMIT_CONFIG" => "/commit".to_owned(),
             "ARROWCOL_COLLECTOR_LIMITS_CONFIG" => "/limits".to_owned(),
             "ARROWCOL_COLLECTOR_PRESSURE_CONFIG" => "/pressure".to_owned(),
+            "ARROWCOL_COLLECTOR_CPU_PRESSURE" => "/cpu_pressure".to_owned(),
             "ARROWCOL_COLLECTOR_CATALOG_CONFIG" => "/catalog".to_owned(),
             "ARROWCOL_COLLECTOR_ROUTING_CONFIG" => "/routing".to_owned(),
             "ARROWCOL_COLLECTOR_EXPORTER_CONFIG" => String::new(),
@@ -1281,6 +1282,29 @@ mod startup_readback_tests {
         assert_eq!(unavailable["status"], "unavailable");
         assert!(unavailable["error_kind_counts"].is_null());
         assert!(unavailable["comment"].as_str().is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn collector_cpu_pressure_mode_requires_effective_startup_readback() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        config.tunables.collector = Some(arrowcol_tunables::CollectorTunables {
+            cpu_pressure: Some(arrowcol_tunables::CpuPressureMode::Process),
+            ..Default::default()
+        });
+        verify_process_configuration(
+            &config,
+            ComponentRole::Collector,
+            &json!({"cpu_pressure":"process"}),
+        )?;
+        assert!(verify_process_configuration(
+            &config,
+            ComponentRole::Collector,
+            &json!({"cpu_pressure":"off"}),
+        )
+        .is_err());
         Ok(())
     }
 
