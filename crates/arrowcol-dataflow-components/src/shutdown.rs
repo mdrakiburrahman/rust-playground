@@ -55,6 +55,30 @@ impl RoutingShutdown {
         Ok(())
     }
 
+    /// Tracks a fresh identity across its downstream send, forgetting it only when the send returned it.
+    ///
+    /// The identity is tracked before sending so a fast publication outcome cannot precede it. An
+    /// explicit send error hands the message back, so that identity never reached the exporter. A
+    /// cancelled send keeps the identity: a dropped flume send can already have been delivered.
+    ///
+    /// # Errors
+    /// Reports poisoned publication accounting; an unforgettable identity stays tracked.
+    pub(crate) async fn admit_publication<E>(
+        &self,
+        publication_id: PublicationId,
+        send: impl Future<Output = Result<(), E>>,
+    ) -> Result<Result<(), E>> {
+        self.publication_finished(publication_id, false)?;
+        let result = send.await;
+        if result.is_err() {
+            self.pending
+                .lock()
+                .map_err(|_| anyhow::anyhow!("publication accounting poisoned"))?
+                .remove(&publication_id);
+        }
+        Ok(result)
+    }
+
     pub(crate) fn track_worker(&self, root: PathBuf, retired: Arc<AtomicBool>) -> Result<()> {
         self.workers
             .lock()
@@ -151,6 +175,49 @@ mod tests {
         shutdown.track_worker(root.clone(), Arc::new(AtomicBool::new(true)))?;
         assert!(shutdown.finish(true).await.is_err());
         shutdown.track_worker(root, Arc::new(AtomicBool::new(false)))?;
+        shutdown.finish(true).await
+    }
+
+    #[tokio::test]
+    async fn returned_send_is_not_unpublished_work() -> Result<()> {
+        let shutdown = RoutingShutdown::default();
+        for error in ["route closed", "route full"] {
+            let sent = shutdown
+                .admit_publication(PublicationId::new(), async { Err(error) })
+                .await?;
+            assert_eq!(sent, Err(error));
+        }
+        shutdown.finish(true).await
+    }
+
+    #[tokio::test]
+    async fn cancelled_send_after_delivery_and_nack_stays_unpublished() -> Result<()> {
+        let shutdown = RoutingShutdown::default();
+        let publication = PublicationId::new();
+        let delivered_then_nacked = async {
+            shutdown.publication_finished(publication, false)?;
+            std::future::pending::<Result<()>>().await
+        };
+        let cancelled = shutdown.admit_publication(publication, delivered_then_nacked);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(1), cancelled)
+                .await
+                .is_err()
+        );
+        assert!(shutdown.finish(true).await.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admitted_send_stays_unpublished_until_that_identity_publishes() -> Result<()> {
+        let shutdown = RoutingShutdown::default();
+        let publication = PublicationId::new();
+        shutdown
+            .admit_publication(publication, async { Ok::<_, ()>(()) })
+            .await?
+            .map_err(|()| anyhow::anyhow!("send failed"))?;
+        assert!(shutdown.finish(true).await.is_err());
+        shutdown.publication_finished(publication, true)?;
         shutdown.finish(true).await
     }
 
