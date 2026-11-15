@@ -738,8 +738,6 @@ mod routing_policy_tests {
             "0",
             "--excluded-admission-gauges",
             "cpu_utilization_bps,active_streams",
-            "--excluded-admission-gauges",
-            "cpu_utilization_bps,active_streams",
         ])
         .unwrap_or_else(|error| panic!("parse router CLI overrides: {error}"));
         let mut config = RouterConfig::from_yaml(include_bytes!("../config.yaml"))

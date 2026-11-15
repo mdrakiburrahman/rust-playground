@@ -657,6 +657,7 @@ fn test_config(listen: SocketAddr, state_directory: String) -> RouterConfig {
             max_table_entries: 256,
             max_oldest_buffer_age_ms: 86_400_000,
             hard_pressure_bps: 9_500,
+            excluded_admission_gauges: vec![],
             warmup_ms: 0,
             minimum_warmup_bps: 1_000,
             lease_ttl_ms: 300_000,
