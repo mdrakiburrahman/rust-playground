@@ -1,5 +1,7 @@
+#[derive(Clone, Debug)]
 struct ProcessLog {
     role: ComponentRole,
+    instance_id: String,
     image: Option<String>,
     image_id: Option<String>,
     source_revision: Option<String>,
@@ -637,6 +639,7 @@ async fn local_process_logs(config: &OatConfig, platform: &LocalPlatform) -> Res
         );
         logs.push(ProcessLog {
             role,
+            instance_id: id.to_owned(),
             image: container
                 .pointer("/Config/Image")
                 .and_then(Value::as_str)
@@ -707,6 +710,7 @@ async fn aks_process_logs(config: &OatConfig) -> Result<Vec<ProcessLog>> {
             .await?;
             logs.push(ProcessLog {
                 role,
+                instance_id: format!("{pod_name}/{name}"),
                 image: status["image"].as_str().map(str::to_owned),
                 image_id: status["imageID"].as_str().map(str::to_owned),
                 source_revision: None,
@@ -738,6 +742,7 @@ mod startup_readback_tests {
         verify_process_configuration(&config, ComponentRole::Collector, &readback)?;
         let mut log = ProcessLog {
             role: ComponentRole::Collector,
+            instance_id: "collector-test".to_owned(),
             image: None,
             image_id: None,
             source_revision: None,
@@ -827,7 +832,7 @@ mod startup_readback_tests {
             "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
         ))?;
         let evidence = process_evidence(&config, &[ProcessLog {
-            role: ComponentRole::Collector, image: None, image_id: None, source_revision: None, complete: true,
+            role: ComponentRole::Collector, instance_id: "collector-test".to_owned(), image: None, image_id: None, source_revision: None, complete: true,
             text: "arrowcol_effective_config {\"runtime\":{\"batch_rows\":8192},\"parquet_writer\":{\"defaults\":{\"compression\":null}}}\n".to_owned(),
         }])?;
         assert_eq!(evidence[0]["effective_config"]["runtime"]["batch_rows"], 8192);

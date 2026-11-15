@@ -58,6 +58,7 @@ fn commit_window_output(
     start: u64,
     end: u64,
     unavailable: Option<&str>,
+    cell_start_unix_ms: Option<u64>,
 ) -> Result<Value> {
     let seconds = end
         .checked_sub(start)
@@ -87,6 +88,19 @@ fn commit_window_output(
         .values()
         .filter(|event| event.table_name.as_deref() == Some(table))
     {
+        if let Some(cell_start) = cell_start_unix_ms {
+            let (Some(first), Some(last)) = (event.min_ingested_at_ms, event.max_ingested_at_ms) else {
+                result["unavailable_reason"] = json!("commit_ingress_boundary_unavailable");
+                return Ok(result);
+            };
+            if last < cell_start as i64 {
+                continue;
+            }
+            if first < cell_start as i64 || last < first {
+                result["unavailable_reason"] = json!("commit_crosses_cell_ingress_boundary");
+                return Ok(result);
+            }
+        }
         let Some(finished) = event.finished_at_unix_ms.and_then(|time| u64::try_from(time).ok()) else {
             result["unavailable_reason"] = json!("commit_finish_time_unavailable");
             return Ok(result);
@@ -138,6 +152,7 @@ fn run_cumulative_output(
     events: &std::collections::BTreeMap<(String, u64), CommitEvent>,
     table: &str,
     unavailable: Option<&str>,
+    cell_start_unix_ms: Option<u64>,
 ) -> Result<Value> {
     if let Some(reason) = unavailable {
         return Ok(json!({
@@ -149,6 +164,25 @@ fn run_cumulative_output(
     let mut rows = 0_u64;
     let mut commits = 0_u64;
     for event in events.values().filter(|event| event.table_name.as_deref() == Some(table)) {
+        if let Some(cell_start) = cell_start_unix_ms {
+            let (Some(first), Some(last)) = (event.min_ingested_at_ms, event.max_ingested_at_ms) else {
+                return Ok(json!({
+                    "scope": "all_new_ingestion_commits_from_this_cell_including_warmup",
+                    "rows": null,
+                    "unavailable_reason": "cumulative_commit_ingress_boundary_unavailable",
+                }));
+            };
+            if last < cell_start as i64 {
+                continue;
+            }
+            if first < cell_start as i64 || last < first {
+                return Ok(json!({
+                    "scope": "all_new_ingestion_commits_from_this_cell_including_warmup",
+                    "rows": null,
+                    "unavailable_reason": "commit_crosses_cell_ingress_boundary",
+                }));
+            }
+        }
         let Some(event_rows) = event.rows else {
             return Ok(json!({
                 "scope": "all_new_ingestion_commits_from_this_cell_including_warmup",
@@ -172,6 +206,54 @@ fn durable_commit_evidence(
     logs: &[ProcessLog],
     window: Option<(u64, u64)>,
 ) -> Result<HashMap<String, Value>> {
+    durable_commit_evidence_for_cell(config, logs, logs, window, None)
+}
+
+fn cell_scoped_commit_logs(current: &[ProcessLog], baseline: &[ProcessLog]) -> Result<Vec<ProcessLog>> {
+    let mut baseline_by_id = HashMap::new();
+    for log in baseline.iter().filter(|log| matches!(log.role, ComponentRole::Collector)) {
+        if baseline_by_id.insert(log.instance_id.as_str(), log).is_some() {
+            bail!("collector process identity is duplicated in the cell baseline");
+        }
+    }
+    let mut current_ids = HashSet::new();
+    let mut scoped = Vec::new();
+    for log in current.iter().filter(|log| matches!(log.role, ComponentRole::Collector)) {
+        if !current_ids.insert(log.instance_id.as_str()) {
+            bail!("collector process identity is duplicated in the current snapshot");
+        }
+        let prior = baseline_by_id.get(log.instance_id.as_str());
+        let (text, complete) = match prior {
+            Some(prior) if !prior.complete || !log.complete => (String::new(), false),
+            Some(prior) => (
+                log.text
+                    .strip_prefix(&prior.text)
+                    .with_context(|| format!("collector log for {} was truncated or rotated during the cell", log.instance_id))?
+                    .to_owned(),
+                true,
+            ),
+            None => (log.text.clone(), log.complete),
+        };
+        scoped.push(ProcessLog {
+            role: log.role,
+            instance_id: log.instance_id.clone(),
+            image: log.image.clone(),
+            image_id: log.image_id.clone(),
+            source_revision: log.source_revision.clone(),
+            complete,
+            text,
+        });
+    }
+    Ok(scoped)
+}
+
+fn durable_commit_evidence_for_cell(
+    config: &OatConfig,
+    process_logs: &[ProcessLog],
+    commit_logs: &[ProcessLog],
+    window: Option<(u64, u64)>,
+    cell_start_unix_ms: Option<u64>,
+) -> Result<HashMap<String, Value>> {
     let Some((start, end)) = window else {
         return Ok(config
             .tables
@@ -179,12 +261,17 @@ fn durable_commit_evidence(
             .map(|table| (table.clone(), unavailable_commits("measurement_window_unavailable")))
             .collect());
     };
-    let collector_logs = logs
+    let collector_logs = process_logs
         .iter()
         .filter(|log| matches!(log.role, ComponentRole::Collector))
         .collect::<Vec<_>>();
-    let mut unavailable = collector_logs.is_empty().then_some("collector_commit_log_unavailable");
-    if collector_logs.iter().any(|log| !log.complete) {
+    let cell_commit_logs = commit_logs
+        .iter()
+        .filter(|log| matches!(log.role, ComponentRole::Collector))
+        .collect::<Vec<_>>();
+    let mut unavailable = (collector_logs.is_empty() || cell_commit_logs.is_empty())
+        .then_some("collector_commit_log_unavailable");
+    if collector_logs.iter().any(|log| !log.complete) || cell_commit_logs.iter().any(|log| !log.complete) {
         unavailable = Some("collector_commit_log_incomplete");
     }
     let mut capability_observed = !collector_logs.is_empty();
@@ -196,7 +283,7 @@ fn durable_commit_evidence(
             });
     }
     let mut events = std::collections::BTreeMap::new();
-    for log in collector_logs {
+    for log in cell_commit_logs {
         for line in log
             .text
             .lines()
@@ -321,11 +408,13 @@ fn durable_commit_evidence(
             start,
             end,
             cumulative_unavailable,
+            cell_start_unix_ms,
         )?;
         evidence["run_cumulative_output"] = run_cumulative_output(
             &events,
             &canonical_table_name,
             cumulative_unavailable,
+            cell_start_unix_ms,
         )?;
     }
     Ok(result)
@@ -352,6 +441,7 @@ mod commit_evidence_tests {
     fn log(events: &[Value]) -> ProcessLog {
         ProcessLog {
             role: ComponentRole::Collector,
+            instance_id: "collector-test".to_owned(),
             image: None,
             image_id: None,
             source_revision: None,
@@ -364,6 +454,24 @@ mod commit_evidence_tests {
                     .collect::<String>()
             ),
         }
+    }
+
+    #[test]
+    fn cell_scoped_commit_logs_exclude_the_previous_cell_tail() -> Result<()> {
+        let config = config()?;
+        let previous = event(&config, 10, 20)?;
+        let mut late_previous = event(&config, 100, 150)?;
+        late_previous["delta_version"] = json!(8);
+        let mut current = event(&config, 210, 220)?;
+        current["delta_version"] = json!(9);
+        let baseline = log(&[previous]);
+        let mut full = baseline.clone();
+        full.text.push_str(&format!("arrowcol_data_commit {}\narrowcol_data_commit {}\n", late_previous, current));
+        let scoped = cell_scoped_commit_logs(&[full.clone()], &[baseline])?;
+        let evidence = durable_commit_evidence_for_cell(&config, &[full], &scoped, Some((200, 300)), Some(200))?;
+        assert_eq!(evidence[&config.tables[0]]["run_cumulative_output"]["rows"], 10);
+        assert_eq!(evidence[&config.tables[0]]["rows"], 10);
+        Ok(())
     }
 
     #[test]

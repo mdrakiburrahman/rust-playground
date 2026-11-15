@@ -2000,6 +2000,75 @@ fn rendered_router_yaml(resources: &[Value]) -> Result<String> {
         .context("rendered AKS arrowcol-config has no router.yaml")
 }
 
+async fn settle_cell_commit_evidence(
+    config: &OatConfig,
+    platform: &dyn Platform,
+    baseline_logs: &[ProcessLog],
+    evidence: &CellEvidence,
+    cell_start_unix_ms: u64,
+) -> Result<(Vec<ProcessLog>, HashMap<String, Value>)> {
+    let timeout = Duration::from_secs(config.reconciliation_settle_timeout_seconds);
+    let started = tokio::time::Instant::now();
+    let targets = config
+        .tables
+        .iter()
+        .map(|table| (table.clone(), evidence.client_cumulative_total(table, "completed_rows")))
+        .collect::<HashMap<_, _>>();
+    let can_settle = evidence.measurement_window.is_some() && targets.values().all(Option::is_some);
+    loop {
+        let logs = platform.process_logs(config).await?;
+        let cell_commit_logs = cell_scoped_commit_logs(&logs, baseline_logs)?;
+        let mut commits = durable_commit_evidence_for_cell(
+            config,
+            &logs,
+            &cell_commit_logs,
+            evidence.measurement_window,
+            Some(cell_start_unix_ms),
+        )?;
+        let elapsed = started.elapsed();
+        let evidence_unavailable = config.tables.iter().any(|table| {
+            commits
+                .get(table)
+                .and_then(|value| value.pointer("/run_cumulative_output/unavailable_reason"))
+                .is_some()
+        });
+        let settled = can_settle
+            && config.tables.iter().all(|table| {
+                targets
+                    .get(table)
+                    .copied()
+                    .flatten()
+                    .zip(
+                        commits
+                            .get(table)
+                            .and_then(|value| value.pointer("/run_cumulative_output/rows"))
+                            .and_then(Value::as_u64),
+                    )
+                    .is_some_and(|(completed, delta)| delta >= completed)
+            });
+        if settled || evidence_unavailable || !can_settle || timeout.is_zero() || elapsed >= timeout {
+            for table in &config.tables {
+                let target = targets.get(table).copied().flatten();
+                let output = commits
+                    .get_mut(table)
+                    .and_then(|value| value.get_mut("run_cumulative_output"));
+                if let Some(output) = output {
+                    let delta = output.get("rows").and_then(Value::as_u64);
+                    output["settle_seconds"] = json!(elapsed.as_secs_f64());
+                    output["settle_timeout_seconds"] = json!(timeout.as_secs());
+                    output["settled"] = json!(target.zip(delta).is_some_and(|(completed, delta)| delta >= completed));
+                    output["client_completed_rows"] = target.map_or(Value::Null, |rows| json!(rows));
+                    output["settle_gap_rows"] = target
+                        .zip(delta)
+                        .map_or(Value::Null, |(completed, delta)| json!(completed.saturating_sub(delta)));
+                }
+            }
+            return Ok((logs, commits));
+        }
+        tokio::time::sleep(Duration::from_millis(250).min(timeout.saturating_sub(elapsed))).await;
+    }
+}
+
 async fn run_matrix_cell(
     config: &OatConfig,
     orchestration_id: &str,
@@ -2024,12 +2093,21 @@ async fn run_matrix_cell(
             pin_now_unix_ms,
         )
         .await?;
-    let started_at_ms = i64::try_from(unix_time_ms()).context("run start timestamp exceeds Arrow timestamp range")?;
+    let cell_start_unix_ms = unix_time_ms_u64()?;
+    let started_at_ms =
+        i64::try_from(cell_start_unix_ms).context("run start timestamp exceeds Arrow timestamp range")?;
+    let baseline_logs = platform.process_logs(config).await?;
     let mut client_run = run_clients(config, run_id, &assigned_tables, platform).await?;
-    let logs = platform.process_logs(config).await?;
+    let (logs, durable_commits) = settle_cell_commit_evidence(
+        config,
+        platform,
+        &baseline_logs,
+        &client_run.evidence,
+        cell_start_unix_ms,
+    )
+    .await?;
     client_run.evidence.processes = Some(process_evidence(config, &logs)?);
-    client_run.evidence.durable_commits =
-        durable_commit_evidence(config, &logs, client_run.evidence.measurement_window)?;
+    client_run.evidence.durable_commits = durable_commits;
     let pinning_ok = client_run.pinning.violation.is_none()
         && client_run.pinning.verification_error.is_none()
         && client_run.failure.is_none();
@@ -6085,7 +6163,9 @@ async fn rollout(config: &OatConfig, name: &str) -> Result<()> {
         .await
         .with_context(|| format!("read ReplicaSets for Deployment {name}"))?;
         let replica_sets: Value = serde_json::from_str(&replica_sets_json).context("parse Deployment ReplicaSets")?;
-        let current_hash = rollout_replica_set_hash(&deployment, &replica_sets);
+        let current_hash = rollout_generation_observed(&deployment)
+            .then(|| rollout_replica_set_hash(&deployment, &replica_sets))
+            .flatten();
         if let Some(hash) = current_hash.as_deref() {
             let pod_selector = format!("{selector},pod-template-hash={hash}");
             let pods_json = kubectl(
@@ -6135,13 +6215,18 @@ async fn rollout(config: &OatConfig, name: &str) -> Result<()> {
     }
 }
 
+fn rollout_generation_observed(deployment: &Value) -> bool {
+    deployment
+        .pointer("/metadata/generation")
+        .and_then(Value::as_u64)
+        .zip(deployment.pointer("/status/observedGeneration").and_then(Value::as_u64))
+        .is_some_and(|(generation, observed)| observed >= generation)
+}
+
 fn rollout_generation_ready(deployment: &Value) -> bool {
-    let Some(generation) = deployment.pointer("/metadata/generation").and_then(Value::as_u64) else {
+    if !rollout_generation_observed(deployment) {
         return false;
-    };
-    let Some(observed_generation) = deployment.pointer("/status/observedGeneration").and_then(Value::as_u64) else {
-        return false;
-    };
+    }
     let Some(desired) = deployment.pointer("/spec/replicas").and_then(Value::as_u64) else {
         return false;
     };
@@ -6149,7 +6234,7 @@ fn rollout_generation_ready(deployment: &Value) -> bool {
     let updated = status["updatedReplicas"].as_u64().unwrap_or(0);
     let replicas = status["replicas"].as_u64().unwrap_or(0);
     let available = status["availableReplicas"].as_u64().unwrap_or(0);
-    observed_generation >= generation && updated == desired && replicas == updated && available >= updated
+    updated == desired && replicas == updated && available >= updated
 }
 
 fn rollout_replica_set_hash(deployment: &Value, replica_sets: &Value) -> Option<String> {
@@ -6964,6 +7049,12 @@ mod tests {
             "status":{"observedGeneration":4,"updatedReplicas":2,"replicas":2,"availableReplicas":2}
         });
         assert!(super::rollout_generation_ready(&current));
+    }
+
+    #[test]
+    fn rollout_failure_scan_waits_for_the_new_generation_to_be_observed() {
+        let deployment = serde_json::json!({"metadata":{"generation":4},"status":{"observedGeneration":3}});
+        assert!(!super::rollout_generation_observed(&deployment));
     }
 
     #[test]

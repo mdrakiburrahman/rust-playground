@@ -507,7 +507,7 @@ fn run_child() -> anyhow::Result<()> {
         memory.publish_pressure(&snapshot(instance, current)?).await?;
         anyhow::Ok(())
     })?;
-    let store: Arc<dyn RoutingStore> = memory.clone();
+    let store: Arc<dyn RoutingStore> = Arc::<MemoryRoutingStore>::clone(&memory);
     let policy = RoutingPolicy {
         warmup_ms: 0,
         lease_ttl_ms: 3_600_000,

@@ -19,6 +19,8 @@ pub struct OatConfig {
     pub client_ready_timeout_seconds: u64,
     #[serde(default = "default_aks_rollout_timeout_seconds")]
     pub aks_rollout_timeout_seconds: u64,
+    #[serde(default = "default_reconciliation_settle_timeout_seconds")]
+    pub reconciliation_settle_timeout_seconds: u64,
     #[serde(default = "default_run_pin_ttl_ms")]
     pub run_pin_ttl_ms: u64,
     pub pilot_mode: bool,
@@ -101,6 +103,10 @@ fn default_client_ready_timeout_seconds() -> u64 {
 
 fn default_aks_rollout_timeout_seconds() -> u64 {
     600
+}
+
+fn default_reconciliation_settle_timeout_seconds() -> u64 {
+    120
 }
 
 pub(crate) const SCHEDULE_DELIVERY_TIMEOUT_SECONDS: u64 = 180;
@@ -257,6 +263,9 @@ impl OatConfig {
         }
         if !(600..=3_600).contains(&self.aks_rollout_timeout_seconds) {
             bail!("aks_rollout_timeout_seconds must be between 600 and 3600");
+        }
+        if self.reconciliation_settle_timeout_seconds > 1_800 {
+            bail!("reconciliation_settle_timeout_seconds must be between 0 and 1800");
         }
         if !(1..=300).contains(&self.qap_timeout_seconds) {
             bail!("qap_timeout_seconds must be between 1 and 300");
@@ -731,6 +740,7 @@ mod tests {
             measure_seconds: 60,
             client_ready_timeout_seconds: 600,
             aks_rollout_timeout_seconds: 600,
+            reconciliation_settle_timeout_seconds: 120,
             run_pin_ttl_ms: 3_600_000,
             pilot_mode: false,
             namespace: "arrowcol".to_owned(),
@@ -817,6 +827,19 @@ mod tests {
             ..Default::default()
         });
         config.validate()
+    }
+
+    #[test]
+    fn reconciliation_settle_timeout_defaults_and_bounds_are_validated() -> Result<()> {
+        let mut config = valid();
+        assert_eq!(config.reconciliation_settle_timeout_seconds, 120);
+        config.reconciliation_settle_timeout_seconds = 0;
+        config.validate()?;
+        config.reconciliation_settle_timeout_seconds = 1_800;
+        config.validate()?;
+        config.reconciliation_settle_timeout_seconds = 1_801;
+        assert!(config.validate().is_err());
+        Ok(())
     }
 
     #[test]

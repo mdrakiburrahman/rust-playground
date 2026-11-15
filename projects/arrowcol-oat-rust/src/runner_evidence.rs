@@ -133,11 +133,25 @@ impl CellEvidence {
         };
         let lower_bound_met = completed_rows <= delta_rows;
         let upper_bound_met = delta_rows <= maximum_delta_rows;
+        let settle = delta_evidence.and_then(|value| value.get("settle_seconds")).and_then(Value::as_f64);
+        let settled = delta_evidence.and_then(|value| value.get("settled")).and_then(Value::as_bool).unwrap_or(false);
+        let status = if !upper_bound_met || (settled && !lower_bound_met) {
+            "outside_bound"
+        } else if lower_bound_met {
+            "within_bound"
+        } else {
+            "unsettled"
+        };
         json!({
-            "status": if lower_bound_met && upper_bound_met { "within_bound" } else { "outside_bound" },
+            "status": status,
+            "reason": (status == "unsettled").then_some("delta_commit_drain_timeout"),
+            "settle_seconds": settle,
+            "settle_timeout_seconds": delta_evidence.and_then(|value| value.get("settle_timeout_seconds")),
+            "settled": settled,
             "delta_rows": delta_rows,
             "completed_rows": completed_rows,
             "ambiguous_rows": ambiguous_rows,
+            "gap_rows": completed_rows.saturating_sub(delta_rows),
             "minimum_delta_rows": completed_rows,
             "maximum_delta_rows": maximum_delta_rows,
             "lower_bound_met": lower_bound_met,
@@ -339,7 +353,7 @@ mod measurement_evidence_tests {
             "phase_counters": {"process_cumulative": {"completed_rows": 10, "ambiguous_rows": 2}}
         })]);
         evidence.durable_commits.insert("table".to_owned(), json!({
-            "run_cumulative_output": {"rows": 12}
+            "run_cumulative_output": {"rows": 12, "settled": true, "settle_seconds": 1.0, "settle_timeout_seconds": 120}
         }));
         let reconciliation = evidence.for_table("table", None)["reconciliation"].clone();
         assert_eq!(reconciliation["status"], "within_bound");
@@ -351,12 +365,29 @@ mod measurement_evidence_tests {
             "phase_counters": {"process_cumulative": {"completed_rows": 10, "ambiguous_rows": 0}}
         })]);
         evidence.durable_commits.insert("table".to_owned(), json!({
-            "run_cumulative_output": {"rows": 10}
+            "run_cumulative_output": {"rows": 10, "settled": true, "settle_seconds": 1.0, "settle_timeout_seconds": 120}
         }));
         let reconciliation = evidence.for_table("table", None)["reconciliation"].clone();
         assert_eq!(reconciliation["status"], "within_bound");
         assert_eq!(reconciliation["exact_match_required"], true);
         assert_eq!(reconciliation["exact_match"], true);
+
+        evidence.client_reports.insert("table".to_owned(), vec![json!({
+            "phase_counters": {"process_cumulative": {"completed_rows": 10, "ambiguous_rows": 2}}
+        })]);
+        evidence.durable_commits.insert("table".to_owned(), json!({
+            "run_cumulative_output": {"rows": 8, "settled": false, "settle_seconds": 120.0, "settle_timeout_seconds": 120}
+        }));
+        let reconciliation = evidence.for_table("table", None)["reconciliation"].clone();
+        assert_eq!(reconciliation["status"], "unsettled");
+        assert_eq!(reconciliation["gap_rows"], 2);
+        assert_eq!(reconciliation["settle_seconds"], 120.0);
+
+        evidence.durable_commits.insert("table".to_owned(), json!({
+            "run_cumulative_output": {"rows": 8, "settled": true, "settle_seconds": 120.0, "settle_timeout_seconds": 120}
+        }));
+        let reconciliation = evidence.for_table("table", None)["reconciliation"].clone();
+        assert_eq!(reconciliation["status"], "outside_bound");
     }
 }
 
