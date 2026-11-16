@@ -7,7 +7,7 @@ import { test, type TestContext } from 'node:test';
 import { Azure, Config, TAGS, canonical_json, runtime, type HttpReceipt } from './bootstrap.js';
 import { managementRows, parseKustoQueryResult, parseQualifiedDeltaDefinition,
   assertExactConnectionStrings, validateExternalMutationReceipt,
-  cleanup_oat_qap, oat_qap_reference, parse_oat_qap_record, recover_oat_qap_record, recover_oat_workload_stop,
+  cleanup_oat_qap, delete_oat_qap_workload, oat_qap_reference, parse_oat_qap_record, recover_oat_qap_record, recover_oat_workload_stop,
   validate_oat_workload_stop, validate_experiment_database_resource, validate_oat_manifest, type RecordV1 } from './oat_qap.js';
 
 const id = '22222222-2222-4222-8222-222222222222';
@@ -104,6 +104,36 @@ test('durable QAP recovery retains the original full record and rejects changed 
   await assert.rejects(recover_oat_qap_record(f.azure, { ...f.reference, namespace_uid: run }, recordPath), /ownership reference/);
   f.shared.lease.stage = 'release-intent';
   await assert.rejects(recover_oat_qap_record(f.azure, f.reference, recordPath), /lease operation remains unresolved/);
+});
+
+test('verified namespace deletion publishes recoverable durable stop proof without repeating DELETE', async t => {
+  const f = recoveryFixture(t), recordPath = path.join(f.directory, 'qap.json'), stopPath = path.join(f.directory, 'stop.json');
+  await recover_oat_qap_record(f.azure, f.reference, recordPath);
+  const original = f.record.workload;
+  t.mock.method(f.azure, 'arm', async () => ({ tags: { ...TAGS, sandboxId: f.c.sandbox },
+    properties: { fqdn: new URL(original.server).hostname } }));
+  let deletes = 0, absent = false;
+  t.mock.method(runtime, 'run_tree', async (args: string[]) => {
+    if (args.includes('--raw')) {
+      deletes++;
+      absent = true;
+      return { returncode: 0, stdout: JSON.stringify({ kind: 'Namespace',
+        metadata: { name: original.namespace, uid: original.namespaceUid, deletionTimestamp: new Date().toISOString() } }), stderr: '' };
+    }
+    if (args.includes('--ignore-not-found')) return { returncode: 0, stdout: absent ? '' : original.namespace, stderr: '' };
+    return { returncode: 0, stdout: JSON.stringify({ metadata: { name: original.namespace, uid: original.namespaceUid,
+      labels: { 'arrowcol-oat/run-id': run, 'arrowcol-oat/owner-token': original.namespaceOwner },
+      annotations: { 'arrowcol-oat/run-id': run, 'arrowcol-oat/owner-token': original.namespaceOwner },
+    } }), stderr: '' };
+  });
+  const authority = { assertCurrent: async () => {} };
+  await delete_oat_qap_workload(f.azure, f.reference, recordPath, stopPath, authority);
+  const recoveredPath = path.join(f.directory, 'recovered-stop.json');
+  await recover_oat_workload_stop(f.azure, f.reference, recoveredPath);
+  assert.deepEqual(JSON.parse(fs.readFileSync(recoveredPath, 'utf8')), JSON.parse(fs.readFileSync(stopPath, 'utf8')));
+  await delete_oat_qap_workload(f.azure, f.reference, recordPath, stopPath, authority);
+  assert.equal(deletes, 1);
+  assert.deepEqual(f.writes, [f.reference.blob.replace('_arrowcol-oat-qap-custody.json', '_arrowcol-oat-workload-stop.json')]);
 });
 
 test('fenced recovery reuses original QAP cleanup under the held root lease and remains idempotent', async t => {
