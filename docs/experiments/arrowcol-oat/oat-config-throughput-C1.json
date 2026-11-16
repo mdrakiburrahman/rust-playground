@@ -4,11 +4,23 @@
   "mode": "local",
   "base_config": "oat-config.tuned.json",
   "registry_source": "PR125 arrowcol-tunables profile",
-  "registry_status": "pending-E1-registry",
+  "registry_status": "seed-only-not-capability-registry",
   "registry_sha256": "79cf2880012dfbd6a064d848a217083afef77c9168b3fc72e7c4e0f527ff8af9",
   "box_scope": "one box for every comparison in this cohort",
   "campaign": "single_hot_table_campaign",
   "campaign_profile": "single_hot_table",
+  "baseline_overrides": {
+    "campaign_profile": "single_hot_table",
+    "tables": [
+      "sqlserver_availability_replica_states"
+    ],
+    "replica_counts": [
+      1
+    ],
+    "rows_per_table": 65536,
+    "warmup_seconds": 10,
+    "measure_seconds": 150
+  },
   "invariants": {
     "table": "sqlserver_availability_replica_states",
     "replicas": [
@@ -25,6 +37,10 @@
         "checkpoint",
         "prune_log"
       ],
+      "interval_secs": 15,
+      "max_idle_backoff_secs": 15,
+      "granularity": "hour",
+      "purge_retention_secs": 2592000,
       "continuous": true
     },
     "compare_within_box": true,
@@ -86,8 +102,11 @@
         "prune_log"
       ],
       "apply": true,
-      "interval_secs": 60,
-      "target_file_mib": 128
+      "interval_secs": 15,
+      "target_file_mib": 128,
+      "max_idle_backoff_secs": 15,
+      "granularity": "hour",
+      "purge_retention_secs": 2592000
     }
   },
   "comparisons": [
@@ -203,21 +222,16 @@
       "candidate_limit": 8
     }
   ],
+  "runnable": false,
+  "config_validation": {
+    "status": "not-validated"
+  },
+  "runtime_qualification": "unqualified",
   "refinement": {
     "comparison": "codec",
     "factor": "parquet_writer.defaults.compression_level",
     "trigger": "zstd wins the coarse codec comparison",
     "selection": "winner plus up to three adjacent levels accepted by the E1 registry bounds",
     "max_candidates": 4
-  },
-  "config_validation": {
-    "status": "config-validated",
-    "validator": "arrowcol-oat-rust --validate-config",
-    "e1_source_sha": "52a95e06633708bc4896b1a54e868516d1068ca6",
-    "l1a_source_sha": "00e1e2bf12cc754892d24bcda6bcbe60a6723bfd",
-    "candidate_count": 8,
-    "pass_count": 8,
-    "pending_count": 0
-  },
-  "runnable": true
+  }
 }

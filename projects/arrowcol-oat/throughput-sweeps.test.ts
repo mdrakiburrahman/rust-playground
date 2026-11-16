@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { buildThroughputManifests } from './throughput-sweeps.js';
+import { buildThroughputManifests, renderThroughputConfig } from './throughput-sweeps.js';
 
 function at(value: unknown, path: string[]): unknown {
   let current = value;
@@ -18,7 +18,9 @@ test('generates bounded local single-writer manifests from the tunables registry
     assert.equal(manifest.mode, 'local');
     assert.equal(manifest.campaign, 'single_hot_table_campaign');
     assert.equal(manifest.campaign_profile, 'single_hot_table');
-    assert.equal(manifest.registry_status, 'pending-E1-registry');
+    assert.equal(manifest.registry_status, 'seed-only-not-capability-registry');
+    assert.equal(manifest.runnable, false);
+    assert.equal(manifest.runtime_qualification, 'unqualified');
     const invariants = manifest.invariants as { table: string; replicas: number[]; wal_enabled: boolean; maintenance: { enabled: boolean; apply: boolean; continuous: boolean; operations: string[] } };
     assert.equal(invariants.table, 'sqlserver_availability_replica_states');
     assert.deepEqual(invariants.replicas, [1]);
@@ -85,11 +87,52 @@ test('generates bounded local single-writer manifests from the tunables registry
       assert.deepEqual(pending.map(item => [item.id, item.status]), [['staging-overlap', 'pending-L1b']]);
       assert.equal(comparisons.some(item => item.id === 'staging-overlap'), false);
     }
+    if (manifest.cohort === 'C7') {
+      const cadence = comparisons.find(item => item.id === 'maintenance-cadence')!;
+      for (const item of cadence.candidates) {
+        assert.equal((item as { qualification?: string }).qualification, 'exploratory');
+        assert.equal(at(item.overrides, ['tunables', 'maintenance', 'interval_secs']),
+          at(item.overrides, ['tunables', 'maintenance', 'max_idle_backoff_secs']));
+      }
+    }
     const baseline = manifest.baseline_tunables as { maintenance: { enabled: boolean; apply: boolean; operations: string[] }; client: { workers: number } };
     assert.equal(baseline.client.workers, 16);
     assert.equal(baseline.maintenance.enabled, true);
     assert.equal(baseline.maintenance.apply, true);
     assert.deepEqual(baseline.maintenance.operations, ['optimize', 'purge', 'vacuum', 'checkpoint', 'prune_log']);
+    assert.equal(at(baseline, ['maintenance', 'interval_secs']), 15);
+    assert.equal(at(baseline, ['maintenance', 'max_idle_backoff_secs']), 15);
+    assert.equal(at(baseline, ['maintenance', 'granularity']), 'hour');
+    assert.equal(at(baseline, ['maintenance', 'purge_retention_secs']), 2_592_000);
   }
   assert.throws(() => buildThroughputManifests({}), /registry must contain/);
+});
+
+test('renders candidate overlays as OAT configs without changing the baseline or admission invariants', () => {
+  const base = {
+    platform: { kind: 'local' },
+    tables: ['sqlserver_active_sessions'],
+    tunables: { client: { workers: 2, streams_per_worker: 2 }, maintenance: { enabled: false } },
+  };
+  const original = structuredClone(base);
+  const manifests = buildThroughputManifests(base);
+  for (const manifest of manifests) {
+    const comparisons = manifest.comparisons as Array<{ id: string; candidates: Array<{ id: string }> }>;
+    for (const comparison of comparisons) {
+      for (const candidate of comparison.candidates) {
+        const config = renderThroughputConfig(base, manifest, comparison.id, candidate.id);
+        assert.deepEqual(config.tables, ['sqlserver_availability_replica_states']);
+        assert.deepEqual(config.replica_counts, [1]);
+        assert.equal(config.campaign_profile, 'single_hot_table');
+        assert.equal(config.measure_seconds, 150);
+        assert.equal(at(config, ['tunables', 'maintenance', 'granularity']), 'hour');
+        assert.equal(at(config, ['tunables', 'maintenance', 'purge_retention_secs']), 2_592_000);
+        assert.equal(at(config, ['tunables', 'maintenance', 'enabled']), true);
+        assert.equal(at(config, ['tunables', 'maintenance', 'apply']), true);
+      }
+    }
+  }
+  assert.deepEqual(base, original);
+  assert.throws(() => renderThroughputConfig(base, manifests[0], 'missing', 'none'), /unknown comparison/);
+  assert.throws(() => renderThroughputConfig(base, manifests[7], 'staging-overlap', 'overlap-true'), /unknown comparison/);
 });

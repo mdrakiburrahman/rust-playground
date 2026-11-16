@@ -4,13 +4,16 @@ import { resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 type JsonObject = Record<string, unknown>;
-type Candidate = { id: string; overrides: JsonObject };
+type Candidate = { id: string; overrides: JsonObject; qualification?: 'exploratory' };
 type Comparison = { id: string; factor: string; candidates: Candidate[]; candidate_limit: number };
 type PendingCandidateSet = { id: string; factor: string; status: string; candidates: Candidate[] };
 type Cohort = { id: string; comparisons: Comparison[]; refinement?: JsonObject; pendingCandidateSets?: PendingCandidateSet[] };
 
 const root = resolve(fileURLToPath(new URL('../..', import.meta.url)));
-const maintenance = { enabled: true, apply: true, operations: ['optimize', 'purge', 'vacuum', 'checkpoint', 'prune_log'] };
+const maintenance = {
+  enabled: true, apply: true, operations: ['optimize', 'purge', 'vacuum', 'checkpoint', 'prune_log'],
+  interval_secs: 15, max_idle_backoff_secs: 15, granularity: 'hour', purge_retention_secs: 2_592_000,
+};
 const candidate = (id: string, value: JsonObject, rootOverrides: JsonObject = {}): Candidate => ({
   id, overrides: { ...rootOverrides, tunables: value },
 });
@@ -88,7 +91,10 @@ const cohorts: Cohort[] = [
     compare('flush-concurrency', 'tunables.collector.batching.max_concurrent_flushes', [1, 2, 4].map(value => candidate('flush-' + value, { collector: { batching: { max_concurrent_flushes: value } } }))),
   ] },
   { id: 'C7', comparisons: [
-    compare('maintenance-cadence', 'tunables.maintenance.interval_secs', [30, 60, 120].map(value => candidate('cadence-' + value, { maintenance: { interval_secs: value } }))),
+    compare('maintenance-cadence', 'tunables.maintenance.interval_secs', [30, 60, 120].map(value => ({
+      ...candidate('cadence-' + value, { maintenance: { interval_secs: value, max_idle_backoff_secs: value } }),
+      qualification: 'exploratory' as const,
+    }))),
     compare('small-file-threshold', 'tunables.maintenance.small_file_bytes', [16777216, 33554432, 67108864].map(value => candidate('small-file-' + value, { maintenance: { small_file_bytes: value } }))),
     compare('retry-budget', 'tunables.maintenance.commit_attempts', [1, 3, 5].map(value => candidate('attempts-' + value, { maintenance: { commit_attempts: value } }))),
     compare('checkpoint-interval', 'tunables.maintenance.checkpoint_every_commits', [64, 256, 1024].map(value => candidate('checkpoint-' + value, { maintenance: { checkpoint_every_commits: value } }))),
@@ -122,11 +128,19 @@ export function buildThroughputManifests(registry: unknown): JsonObject[] {
       mode: 'local',
       base_config: 'oat-config.tuned.json',
       registry_source: 'PR125 arrowcol-tunables profile',
-      registry_status: 'pending-E1-registry',
+      registry_status: 'seed-only-not-capability-registry',
       registry_sha256: registryHash,
       box_scope: 'one box for every comparison in this cohort',
       campaign: 'single_hot_table_campaign',
       campaign_profile: 'single_hot_table',
+      baseline_overrides: {
+        campaign_profile: 'single_hot_table',
+        tables: ['sqlserver_availability_replica_states'],
+        replica_counts: [1],
+        rows_per_table: 65_536,
+        warmup_seconds: 10,
+        measure_seconds: 150,
+      },
       invariants: {
         table: 'sqlserver_availability_replica_states',
         replicas: [1],
@@ -143,29 +157,87 @@ export function buildThroughputManifests(registry: unknown): JsonObject[] {
         },
       },
       comparisons: cohort.comparisons,
+      runnable: false,
+      config_validation: { status: 'not-validated' },
+      runtime_qualification: 'unqualified',
       ...(cohort.refinement ? { refinement: cohort.refinement } : {}),
       ...(cohort.pendingCandidateSets ? { pending_candidate_sets: cohort.pendingCandidateSets } : {}),
     };
   });
 }
 
+function mergeObjects(base: JsonObject, overrides: JsonObject): JsonObject {
+  const result = { ...base };
+  for (const [key, value] of Object.entries(overrides)) {
+    result[key] = isRecord(value) && isRecord(result[key]) ? mergeObjects(result[key] as JsonObject, value) : value;
+  }
+  return result;
+}
+
+export function renderThroughputConfig(base: unknown, manifest: unknown, comparisonId: string, candidateId: string): JsonObject {
+  if (!isRecord(base) || !isRecord(manifest) || !isRecord(manifest.baseline_tunables) ||
+      !isRecord(manifest.baseline_overrides) || !Array.isArray(manifest.comparisons)) {
+    throw new Error('invalid base config or throughput manifest');
+  }
+  const comparison = manifest.comparisons.find(item => isRecord(item) && item.id === comparisonId);
+  if (!isRecord(comparison) || !Array.isArray(comparison.candidates)) throw new Error('unknown comparison: ' + comparisonId);
+  const selected = comparison.candidates.find(item => isRecord(item) && item.id === candidateId);
+  if (!isRecord(selected) || !isRecord(selected.overrides)) throw new Error('unknown candidate: ' + candidateId);
+  return mergeObjects(
+    mergeObjects(base, { ...manifest.baseline_overrides, tunables: manifest.baseline_tunables }),
+    selected.overrides,
+  );
+}
+
 async function main(args: string[]): Promise<void> {
   let registryPath = resolve(root, 'docs/experiments/arrowcol-oat/oat-config.tuned.json');
   let outputDirectory = resolve(root, 'docs/experiments/arrowcol-oat');
+  let manifestDirectory = resolve(root, 'docs/experiments/arrowcol-oat');
+  let renderAll = false;
   for (let index = 0; index < args.length; index++) {
     const option = args[index];
+    if (option === '--render-all') {
+      renderAll = true;
+      continue;
+    }
     const value = args[++index];
     if (!value || value.startsWith('--')) throw new Error('expected a value after ' + option);
     if (option === '--registry') registryPath = resolve(value);
     else if (option === '--out') outputDirectory = resolve(value);
+    else if (option === '--manifests') manifestDirectory = resolve(value);
     else throw new Error('unknown option: ' + option);
   }
   const registry: unknown = JSON.parse(await readFile(registryPath, 'utf8'));
-  const manifests = buildThroughputManifests(registry);
+  const manifests = renderAll
+    ? await Promise.all(cohorts.map(async cohort => {
+      const path = resolve(manifestDirectory, 'oat-config-throughput-' + cohort.id + '.json');
+      const manifest: unknown = JSON.parse(await readFile(path, 'utf8'));
+      if (!isRecord(manifest) || manifest.cohort !== cohort.id || !Array.isArray(manifest.comparisons)) {
+        throw new Error('invalid manifest: ' + path);
+      }
+      return manifest;
+    }))
+    : buildThroughputManifests(registry);
   await mkdir(outputDirectory, { recursive: true });
   for (const manifest of manifests) {
     const cohort = String(manifest.cohort);
-    await writeFile(resolve(outputDirectory, 'oat-config-throughput-' + cohort + '.json'), JSON.stringify(manifest, null, 2) + '\n');
+    if (!renderAll) {
+      await writeFile(resolve(outputDirectory, 'oat-config-throughput-' + cohort + '.json'), JSON.stringify(manifest, null, 2) + '\n');
+      continue;
+    }
+    for (const comparison of manifest.comparisons as Comparison[]) {
+      if (!isRecord(comparison) || typeof comparison.id !== 'string' || !/^[a-z0-9-]+$/.test(comparison.id) ||
+          !Array.isArray(comparison.candidates)) throw new Error('invalid comparison in ' + cohort);
+      const directory = resolve(outputDirectory, cohort, comparison.id);
+      await mkdir(directory, { recursive: true });
+      for (const candidate of comparison.candidates) {
+        if (!isRecord(candidate) || typeof candidate.id !== 'string' || !/^[a-z0-9-]+$/.test(candidate.id)) {
+          throw new Error('invalid candidate in ' + cohort + '/' + comparison.id);
+        }
+        const config = renderThroughputConfig(registry, manifest, comparison.id, candidate.id);
+        await writeFile(resolve(directory, candidate.id + '.json'), JSON.stringify(config, null, 2) + '\n');
+      }
+    }
   }
 }
 
