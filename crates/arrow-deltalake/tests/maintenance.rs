@@ -810,6 +810,101 @@ fn optimize_probe_defers_below_threshold_malformed_partition() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn purge_probe_defers_malformed_or_mismatched_partition() -> Result<()> {
+    for (value, granularity) in [
+        ("2026-11-16-14-35", Granularity::Hour),
+        ("not-a-time", Granularity::Minute),
+        ("2026-11-16-14-35-00", Granularity::Minute),
+        ("2026-02-30-14-35", Granularity::Minute),
+    ] {
+        let root = tempfile::tempdir()?;
+        let table = create(root.path())?;
+        append_value(&table, value, BASE, 0..3)?;
+        let maintenance = DeltaTable::open_for_maintenance(&url_of(root.path())?)?;
+        let version = maintenance.version()?;
+        let files = active_files(root.path())?;
+        let probe = NegativeProbeConfig {
+            now_ms: now_ms()?,
+            granularity,
+            purge_retention_ms: 2_592_000_000,
+            vacuum_retention_ms: 604_800_000,
+            log_retention_ms: 2_592_000_000,
+            checkpoint_interval: 100,
+            optimize_small_file_bytes: 64 * 1024 * 1024,
+            optimize_min_files: 2,
+            sealed_partitions_only: true,
+            max_listed_files: 1000,
+        };
+        assert!(
+            maintenance
+                .probe_no_work(ProbeOperation::Purge, &probe, &control())?
+                .is_none(),
+            "{value}: probe must defer instead of failing or proving zero debt"
+        );
+        let config = PurgeConfig::new(probe.purge_retention_ms, probe.now_ms, granularity);
+        let plan = maintenance.plan_purge(&config)?;
+        assert_eq!(plan.skipped_partitions, 1);
+        assert!(plan.partitions.is_empty());
+        let report = maintenance.apply_purge(&plan, &config, &control())?;
+        let evidence = report.maintenance_due_work.context("skipped partition evidence")?;
+        assert_eq!(evidence.completeness, MaintenanceDueWorkCompleteness::Incomplete);
+        assert_eq!(
+            evidence.incomplete_reason,
+            Some(MaintenanceDueWorkIncompleteReason::MalformedPartition)
+        );
+        assert_eq!(evidence.due, None);
+        assert_eq!(evidence.eligible_count, None);
+        assert_eq!(maintenance.version()?, version);
+        assert_eq!(maintenance.lookup_txn(PURGE_WATERMARK)?, None);
+        assert_eq!(active_files(root.path())?, files);
+        assert_eq!(rows(root.path())?, sorted(expected(0..3, value)));
+    }
+    Ok(())
+}
+
+#[test]
+fn purge_actual_writer_partition_retention_boundary() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let table = create(root.path())?;
+    let start = Granularity::Minute.parse_partition("2026-11-16-14-35")?;
+    for index in 0..3 {
+        let value = Granularity::Minute.format_ms(start + index * MINUTE)?;
+        append_value(&table, &value, start + index * MINUTE, index * 10..index * 10 + 3)?;
+    }
+    append_value(&table, "2026-11-16-14-35", start, 30..33)?;
+    let maintenance = DeltaTable::open_for_maintenance(&url_of(root.path())?)?;
+    let boundary = PurgeConfig::new(2 * MINUTE, start + 3 * MINUTE, Granularity::Minute);
+    let before = PurgeConfig::new(boundary.retention_ms, boundary.anchor_ms - 1, Granularity::Minute);
+    assert!(maintenance.plan_purge(&before)?.partitions.is_empty());
+    let plan = maintenance.plan_purge(&boundary)?;
+    assert_eq!(plan.skipped_partitions, 0);
+    assert_eq!(plan.cutoff_ms, start + MINUTE);
+    assert_eq!(plan.partitions.len(), 1);
+    let partition = plan.partitions.first().context("whole expired minute partition")?;
+    assert_eq!(partition.value, "2026-11-16-14-35");
+    assert_eq!(partition.end_ms, plan.cutoff_ms);
+    assert_eq!(partition.files.len(), 2);
+    let files = active_files(root.path())?;
+    let version = maintenance.version()?;
+    assert_eq!(
+        kind(maintenance.apply_purge(&plan, &before, &control())),
+        Some(MaintenanceErrorKind::StalePlan)
+    );
+    assert_eq!(active_files(root.path())?, files);
+    assert_eq!(maintenance.version()?, version);
+    assert_eq!(maintenance.lookup_txn(PURGE_WATERMARK)?, None);
+    let report = maintenance.apply_purge(&plan, &boundary, &control())?;
+    assert_eq!((report.outcome, report.files_removed), (Outcome::Committed, 2));
+    assert_eq!(maintenance.lookup_txn(PURGE_WATERMARK)?, Some(start + MINUTE));
+    let kept: BTreeSet<_> = active_files(root.path())?.into_values().collect();
+    assert_eq!(
+        kept,
+        BTreeSet::from(["2026-11-16-14-36".to_owned(), "2026-11-16-14-37".to_owned()])
+    );
+    Ok(())
+}
+
 /// Scenario: a malformed partition directory coexists with valid ingestion partitions.
 /// Guarantees: malformed values never authorize rewrite or deletion.
 #[test]
