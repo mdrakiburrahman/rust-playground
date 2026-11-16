@@ -356,7 +356,12 @@ fn batch_slices(rows: usize, concurrency: usize) -> Vec<(usize, usize)> {
         .collect()
 }
 
-fn request_metadata<T>(request: &mut Request<T>, table: &DmvTable, signer: Option<&EdgeRequestSigner>, observation: Option<&SendObservation>) -> Result<()> {
+fn request_metadata<T>(
+    request: &mut Request<T>,
+    table: &DmvTable,
+    signer: Option<&EdgeRequestSigner>,
+    observation: Option<&SendObservation>,
+) -> Result<()> {
     let metadata = IngestMetadata::new(
         ProtocolVersion::CURRENT,
         ImplementationPool::Dataflow,

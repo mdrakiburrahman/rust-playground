@@ -501,12 +501,16 @@ struct Measurement {
 fn latency_percentiles(latency: &[u64; 64]) -> serde_json::Value {
     let count = latency.iter().sum::<u64>();
     let percentile = |numerator: u64| {
-        if count == 0 { return None; }
+        if count == 0 {
+            return None;
+        }
         let target = count.saturating_mul(numerator).div_ceil(100);
         let mut observed = 0;
         for (bucket, samples) in latency.iter().enumerate() {
             observed += samples;
-            if observed >= target { return Some((1_u64 << bucket).saturating_sub(1)); }
+            if observed >= target {
+                return Some((1_u64 << bucket).saturating_sub(1));
+            }
         }
         Some(u64::MAX)
     };
@@ -525,9 +529,15 @@ impl Measurement {
             pilot_rows: (0..(end_unix_ms - start_unix_ms).div_ceil(30_000))
                 .map(|_| AtomicU64::new(0))
                 .collect(),
-            raw_window_bytes: (0..(end_unix_ms - start_unix_ms).div_ceil(30_000)).map(|_| AtomicU64::new(0)).collect(),
-            wire_window_bytes: (0..(end_unix_ms - start_unix_ms).div_ceil(30_000)).map(|_| AtomicU64::new(0)).collect(),
-            window_latency: (0..(end_unix_ms - start_unix_ms).div_ceil(30_000)).map(|_| Mutex::new([0; 64])).collect(),
+            raw_window_bytes: (0..(end_unix_ms - start_unix_ms).div_ceil(30_000))
+                .map(|_| AtomicU64::new(0))
+                .collect(),
+            wire_window_bytes: (0..(end_unix_ms - start_unix_ms).div_ceil(30_000))
+                .map(|_| AtomicU64::new(0))
+                .collect(),
+            window_latency: (0..(end_unix_ms - start_unix_ms).div_ceil(30_000))
+                .map(|_| Mutex::new([0; 64]))
+                .collect(),
             rejected_streams: AtomicU64::new(0),
             rejected_rows: AtomicU64::new(0),
             retried_streams: AtomicU64::new(0),
@@ -539,7 +549,14 @@ impl Measurement {
         })
     }
 
-    fn record_completion(&self, worker: usize, rows: u64, raw_arrow_bytes: u64, wire_bytes: u64, observed_unix_ms: u64) {
+    fn record_completion(
+        &self,
+        worker: usize,
+        rows: u64,
+        raw_arrow_bytes: u64,
+        wire_bytes: u64,
+        observed_unix_ms: u64,
+    ) {
         if observed_unix_ms >= self.start_unix_ms && observed_unix_ms < self.end_unix_ms {
             self.rows.fetch_add(rows, Ordering::Relaxed);
             self.bytes.fetch_add(wire_bytes, Ordering::Relaxed);
@@ -557,7 +574,8 @@ impl Measurement {
         if send_unix_ms >= self.start_unix_ms && send_unix_ms < self.end_unix_ms {
             let index = ((send_unix_ms - self.start_unix_ms) / 30_000) as usize;
             let bucket = (64 - micros.leading_zeros()) as usize;
-            self.window_latency[index].lock()
+            self.window_latency[index]
+                .lock()
                 .map_err(|_| anyhow::anyhow!("measurement latency histogram poisoned"))?[bucket.min(63)] += 1;
         }
         Ok(())
@@ -584,6 +602,7 @@ impl Measurement {
                     "send_latency_us": latency_percentiles(&latency),
                     "send_latency_scope": "attempts_grouped_by_fresh_send_timestamp_in_half_open_window"
                 })
+            }).collect::<Vec<_>>(),
             "rejected_streams": self.rejected_streams.load(Ordering::Relaxed),
             "rejected_rows": self.rejected_rows.load(Ordering::Relaxed),
             "retried_streams": self.retried_streams.load(Ordering::Relaxed),
@@ -1102,7 +1121,9 @@ impl PreparedClient {
         };
         attempt.finished = true;
         let micros = u64::try_from(attempt.started.elapsed().as_micros()).unwrap_or(u64::MAX);
-        if let Some(measurement) = measurement { measurement.record_send_latency(micros, observation.send_unix_ns)?; }
+        if let Some(measurement) = measurement {
+            measurement.record_send_latency(micros, observation.send_unix_ns)?;
+        }
         let bucket = (64 - micros.leading_zeros()) as usize;
         counters
             .latency
@@ -1111,7 +1132,13 @@ impl PreparedClient {
         match result {
             Ok(guarantee) => {
                 if let Some((measurement, completed_unix_ms)) = measurement.zip(completed_unix_ms) {
-                    measurement.record_completion(worker, batch.rows, batch.raw_arrow_bytes, batch.encoded_bytes, completed_unix_ms);
+                    measurement.record_completion(
+                        worker,
+                        batch.rows,
+                        batch.raw_arrow_bytes,
+                        batch.encoded_bytes,
+                        completed_unix_ms,
+                    );
                 }
                 counters.completed_rows.fetch_add(batch.rows, Ordering::Relaxed);
                 counters
