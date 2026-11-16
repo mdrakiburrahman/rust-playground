@@ -242,6 +242,9 @@ impl RunInventory {
                 bail!("custody inventory UUID must be nonzero and canonical");
             }
         }
+        if self.namespace.owner_token != self.owner_id {
+            bail!("custody namespace owner token must be the immutable producer owner");
+        }
         let suffix = format!("-{}", self.cell_run_id.replace('-', ""));
         if !self.namespace.name.ends_with(&suffix)
             || self.namespace.name.len() <= suffix.len()
@@ -254,8 +257,11 @@ impl RunInventory {
         {
             bail!("custody namespace must contain the exact cell identity");
         }
-        if self.namespace.uid.as_deref() == Some("") {
-            bail!("custody namespace UID must not be empty");
+        let valid_uid = |uid: &str| {
+            uuid::Uuid::parse_str(uid).is_ok_and(|parsed| !parsed.is_nil() && parsed.to_string() == uid)
+        };
+        if self.namespace.uid.as_deref().is_some_and(|uid| !valid_uid(uid)) {
+            bail!("custody namespace UID must be a nonzero canonical UUID");
         }
         let mut keys = BTreeSet::new();
         for resource in &self.resources {
@@ -274,7 +280,7 @@ impl RunInventory {
             {
                 bail!("invalid or duplicate custody Kubernetes resource");
             }
-            if resource.uid.as_deref() == Some("")
+            if resource.uid.as_deref().is_some_and(|uid| !valid_uid(uid))
                 || matches!(
                     resource.state,
                     InventoryResourceState::Observed | InventoryResourceState::Removed
@@ -9682,7 +9688,7 @@ mod tests {
             "orchestration_run_id":"5d4c2001-77e2-44b2-b32b-4ce79bf7dd03",
             "cell_run_id":"5d4c2001-77e2-44b2-b32b-4ce79bf7dd04",
             "namespace":{"name":"oat-5d4c200177e244b2b32b4ce79bf7dd04", "uid":null,
-                "owner_token":"5d4c2001-77e2-44b2-b32b-4ce79bf7dd05"},
+                "owner_token":"5d4c2001-77e2-44b2-b32b-4ce79bf7dd02"},
             "resources":[{"api_version":"apps/v1","kind":"Deployment",
                 "namespace":"oat-5d4c200177e244b2b32b4ce79bf7dd04","name":"arrowcol",
                 "uid":null,"role":"collector","state":"planned"}],
@@ -9691,6 +9697,12 @@ mod tests {
                 "terminal_capture":step,"handoff":step}
         }))?;
         inventory.validate()?;
+        let mut wrong_owner = inventory.clone();
+        wrong_owner.namespace.owner_token = "5d4c2001-77e2-44b2-b32b-4ce79bf7dd05".to_owned();
+        assert!(wrong_owner.validate().is_err());
+        wrong_owner = inventory.clone();
+        wrong_owner.namespace.uid = Some("not-a-uid".to_owned());
+        assert!(wrong_owner.validate().is_err());
         let persisted = json!({"ok":true,"receipt":{
             "status":"persisted","campaign_id":inventory.campaign_id,"owner_id":inventory.owner_id,
             "fencing_token":inventory.fencing_token,"orchestration_run_id":inventory.orchestration_run_id,
@@ -9770,19 +9782,19 @@ mod tests {
         let mut observed = inventory.clone();
         observed.resources[0].state = InventoryResourceState::Observed;
         assert!(observed.validate().is_err());
-        observed.namespace.uid = Some("namespace-uid".to_owned());
-        observed.resources[0].uid = Some("actual-uid".to_owned());
+        observed.namespace.uid = Some("5d4c2001-77e2-44b2-b32b-4ce79bf7dd05".to_owned());
+        observed.resources[0].uid = Some("5d4c2001-77e2-44b2-b32b-4ce79bf7dd06".to_owned());
         let ready = json!({"ok":true,"receipt":{
             "status":"ready","campaign_id":inventory.campaign_id,"owner_id":inventory.owner_id,
             "fencing_token":inventory.fencing_token,"orchestration_run_id":inventory.orchestration_run_id,
-            "cell_run_id":inventory.cell_run_id,"namespace_uid":"namespace-uid"
+            "cell_run_id":inventory.cell_run_id,"namespace_uid":"5d4c2001-77e2-44b2-b32b-4ce79bf7dd05"
         }});
         observed.validate_custody_receipt(&serde_json::to_vec(&ready)?, true)?;
         assert!(inventory.validate_custody_receipt(&serde_json::to_vec(&ready)?, true).is_err());
         inventory.validate_successor(&observed)?;
         inventory = observed;
         let mut replacement = inventory.clone();
-        replacement.resources[0].uid = Some("replacement-uid".to_owned());
+        replacement.resources[0].uid = Some("5d4c2001-77e2-44b2-b32b-4ce79bf7dd07".to_owned());
         assert!(inventory.validate_successor(&replacement).is_err());
         replacement = inventory.clone();
         replacement.resources[0].state = InventoryResourceState::Planned;
