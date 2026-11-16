@@ -747,6 +747,7 @@ impl PublicationBacklogSnapshot {
     }
 }
 
+#[derive(Clone)]
 struct PublicationBacklogEntry {
     token: PublicationBacklogToken,
     pending_admissions: u64,
