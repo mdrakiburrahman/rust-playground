@@ -460,6 +460,57 @@ pub(crate) fn export_stopped(
     sync_directory(destination.parent().context("snapshot run has no parent")?)
 }
 
+pub(crate) fn stopped_snapshot_references(destination: &Path, run_id: &str, tables: &[String]) -> Result<Value> {
+    let root = destination.join(uuid::Uuid::parse_str(run_id)?.to_string());
+    let complete: Value = serde_json::from_reader(regular_file(&root.join("complete.json"))?)?;
+    ensure!(
+        complete["run_id"] == run_id && complete["tables"] == json!(tables),
+        "stopped snapshot identity mismatch"
+    );
+    let manifests = complete["manifests"]
+        .as_array()
+        .context("snapshot manifest references missing")?;
+    ensure!(manifests.len() == tables.len(), "snapshot manifest set mismatch");
+    let mut references = serde_json::Map::new();
+    for table in tables {
+        ensure!(
+            table.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'),
+            "invalid snapshot table"
+        );
+        let relative = format!("{table}/manifest.json");
+        let receipt = manifests
+            .iter()
+            .find(|manifest| manifest["path"] == relative)
+            .context("snapshot reference missing")?;
+        let path = root.join(&relative);
+        let (size, sha256) = file_digest(&path)?;
+        ensure!(
+            receipt["size"] == size && receipt["sha256"] == sha256,
+            "stopped snapshot manifest digest mismatch"
+        );
+        let manifest: Value = serde_json::from_reader(regular_file(&path)?)?;
+        ensure!(
+            manifest["run_id"] == run_id && manifest["table"] == *table,
+            "snapshot table identity mismatch"
+        );
+        let version = manifest["latestVersion"]
+            .as_u64()
+            .context("stopped Delta version missing")?;
+        let rows = manifest["rowCount"]
+            .as_u64()
+            .context("stopped Delta row count missing")?;
+        references.insert(
+            table.clone(),
+            json!({
+                "run_id": run_id, "table": table, "manifest": format!("{run_id}/{relative}"),
+                "manifest_sha256": sha256, "table_version": version, "row_count": rows,
+                "source": "verified_stopped_snapshot_manifest",
+            }),
+        );
+    }
+    Ok(Value::Object(references))
+}
+
 pub(crate) async fn snapshot_then_cleanup<S, E, C>(stop: S, export: E, cleanup: C) -> Result<Vec<Value>>
 where
     S: std::future::Future<Output = Result<Vec<Value>>>,
@@ -545,6 +596,13 @@ mod tests {
         let manifest: Value = serde_json::from_slice(&fs::read(root.join("manifest.json"))?)?;
         assert_eq!(manifest["rowCount"], 2);
         assert_eq!(manifest["latestVersion"], 1);
+        let references = stopped_snapshot_references(&destination, &run, &tables)?;
+        assert_eq!(references[&tables[0]]["table_version"], 1);
+        assert_eq!(references[&tables[0]]["row_count"], 2);
+        assert_eq!(
+            references[&tables[0]]["manifest_sha256"],
+            file_digest(&root.join("manifest.json"))?.1
+        );
         assert_eq!(manifest["files"].as_array().context("missing inventory")?.len(), 6);
         assert!(table.join(WRITER_LOCK).exists());
         assert!(!root.join("table").join(WRITER_LOCK).exists());

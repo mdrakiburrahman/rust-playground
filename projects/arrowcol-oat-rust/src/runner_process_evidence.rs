@@ -57,6 +57,7 @@ fn is_process_evidence_line(line: &str) -> bool {
         "arrowcol_layout_",
         "arrowcol_data_commit ",
         "arrowcol_maintenance_",
+        "delta-maintenance ",
         "OAT_CLIENT_",
         "otel.controller.main::shutdown.signal_received",
         "otel.processor.durable_buffer::durable_buffer.shutdown.",
@@ -64,7 +65,7 @@ fn is_process_evidence_line(line: &str) -> bool {
     ]
     .iter()
     .any(|prefix| line.contains(prefix))
-        || (line.trim_start().starts_with('{') && line.contains("\"operation\"") && line.contains("\"applied\""))
+        || line.trim_start().starts_with('{')
 }
 
 fn append_process_evidence_line(
@@ -93,7 +94,12 @@ fn append_process_record(bytes: &[u8], output: &mut String, retained_bytes: &mut
     let without_lf = bytes.strip_suffix(b"\n").unwrap_or(bytes);
     let line = without_lf.strip_suffix(b"\r").unwrap_or(without_lf);
     let line = std::str::from_utf8(line).context("process log contains a non-UTF-8 line")?;
-    append_process_evidence_line(line, output, retained_bytes, action)
+    let before = output.len();
+    append_process_evidence_line(line, output, retained_bytes, action)?;
+    if output.len() > before && !bytes.ends_with(b"\n") {
+        output.pop();
+    }
+    Ok(())
 }
 
 async fn filtered_process_command_output(mut command: Command, action: &str) -> Result<FilteredProcessOutput> {
@@ -166,8 +172,8 @@ async fn filtered_process_command_output(mut command: Command, action: &str) -> 
 fn filter_process_evidence_text(text: &str) -> Result<String> {
     let mut filtered = String::new();
     let mut retained_bytes = 0;
-    for line in text.lines() {
-        append_process_evidence_line(line, &mut filtered, &mut retained_bytes, "process log filtering")?;
+    for line in text.split_inclusive('\n') {
+        append_process_record(line.as_bytes(), &mut filtered, &mut retained_bytes, "process log filtering")?;
     }
     Ok(filtered)
 }
@@ -830,7 +836,10 @@ fn maintenance_cell_outcome_evidence(log: &ProcessLog, baseline_logs: &[ProcessL
             "status": "unavailable",
             "cell_scope": "unavailable",
             "operation_count": null,
+            "operation_failure": null,
+            "retry_kind_counts": null,
             "error_kind_counts": null,
+            "operations": null,
             "comment": comment,
         })
     };
@@ -843,6 +852,9 @@ fn maintenance_cell_outcome_evidence(log: &ProcessLog, baseline_logs: &[ProcessL
     if !baseline.complete || !log.complete {
         return unavailable("Maintenance process logs were truncated, so cell outcomes could not be isolated.");
     }
+    if [&baseline.stdout, &baseline.stderr].iter().any(|stream| !stream.is_empty() && !stream.ends_with('\n')) {
+        return unavailable("Maintenance baseline ended in a partial record; cell outcomes are unknown.");
+    }
     let Some(stdout) = log.stdout.strip_prefix(&baseline.stdout) else {
         return unavailable("Maintenance stdout changed or rotated, so cell outcomes could not be isolated.");
     };
@@ -851,25 +863,53 @@ fn maintenance_cell_outcome_evidence(log: &ProcessLog, baseline_logs: &[ProcessL
     };
     let appended = format!("{stdout}\n{stderr}");
     let mut operation_count = 0_u64;
+    let mut retry_kind_counts = serde_json::Map::new();
     let mut error_kind_counts = serde_json::Map::new();
+    let mut operations = serde_json::Map::new();
+    if [stdout, stderr].iter().any(|stream| !stream.is_empty() && !stream.ends_with('\n')) {
+        return unavailable("Maintenance log ended in a partial record; cell outcomes are unknown.");
+    }
     for line in appended.lines() {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
+            if line.trim_start().starts_with('{') {
+                return unavailable("A maintenance JSON record was malformed; cell outcomes are unknown.");
+            }
             continue;
         };
-        if !value["operation"].is_string() || !value["applied"].is_boolean() {
+        if value.get("operation").is_none() {
             continue;
         }
+        let Some(operation) = value["operation"].as_str().filter(|operation| {
+            ["optimize", "checkpoint", "purge", "vacuum", "prune_log"].contains(operation)
+        }) else {
+            return unavailable("A maintenance operation identity was missing or invalid.");
+        };
+        let record_outcome = maintenance_record_outcome(&value);
+        if !value["applied"].is_boolean() || !value["table"].is_string() || record_outcome.is_none() {
+            return unavailable("A maintenance operation record was partial; cell outcomes are unknown.");
+        }
         operation_count = operation_count.saturating_add(1);
+        let operation_counts = operations.entry(operation.to_owned()).or_insert_with(|| json!({
+            "operation_count": 0, "retry_kind_counts": {}, "error_kind_counts": {},
+        }));
+        operation_counts["operation_count"] = json!(operation_counts["operation_count"].as_u64().unwrap_or(0) + 1);
         let error_kind = value.get("error_kind").and_then(Value::as_str);
-        let failed = error_kind.is_some() || value.get("error").is_some_and(|error| !error.is_null());
+        let failed = record_outcome != Some(MaintenanceRecordOutcome::Succeeded);
         if failed {
             let kind = sanitized_maintenance_error_kind(error_kind);
-            let count = error_kind_counts.entry(kind).or_insert_with(|| json!(0));
+            let retry = record_outcome == Some(MaintenanceRecordOutcome::Retry);
+            let counts = if retry { &mut retry_kind_counts } else { &mut error_kind_counts };
+            let count = counts.entry(kind.clone()).or_insert_with(|| json!(0));
             *count = json!(count.as_u64().unwrap_or(0).saturating_add(1));
+            let field = if retry { "retry_kind_counts" } else { "error_kind_counts" };
+            operation_counts[field][&kind] = json!(operation_counts[field][&kind].as_u64().unwrap_or(0) + 1);
         }
     }
+    if operation_count == 0 {
+        return unavailable("No complete maintenance operation records were available for this cell.");
+    }
     let comment = if error_kind_counts.is_empty() {
-        "No maintenance operation errors were observed during this cell."
+        "No operation failures in the complete cell records; optimistic-concurrency replans are counted separately."
     } else {
         "Cell-scoped maintenance errors are counted by sanitized error_kind; raw error text is omitted."
     };
@@ -877,8 +917,33 @@ fn maintenance_cell_outcome_evidence(log: &ProcessLog, baseline_logs: &[ProcessL
         "status": "observed",
         "cell_scope": "stdout_stderr_append_offsets",
         "operation_count": operation_count,
+        "operation_failure": !error_kind_counts.is_empty(),
+        "retry_kind_counts": retry_kind_counts,
         "error_kind_counts": error_kind_counts,
+        "operations": operations,
         "comment": comment,
+    })
+}
+
+fn maintenance_exit_classification(log: &ProcessLog, exit: Option<i64>) -> Value {
+    if log.text.contains("delta-maintenance stale-plan starvation ")
+        || log.text.contains("delta-maintenance pending-table status failed:")
+    {
+        return json!("unhealthy");
+    }
+    if exit == Some(1) {
+        return json!("nonzero_health_exit");
+    }
+    let mut baseline = log.clone();
+    baseline.stdout.clear();
+    baseline.stderr.clear();
+    baseline.complete = true;
+    let lifetime = maintenance_cell_outcome_evidence(log, &[baseline]);
+    let failure = lifetime["operation_failure"].as_bool();
+    json!(match (exit, failure) {
+        (_, Some(true)) => "operation_failure",
+        (Some(0 | 143), Some(false)) => "no_operation_failures",
+        _ => "unknown",
     })
 }
 
@@ -1286,11 +1351,111 @@ mod startup_readback_tests {
         );
         assert!(!evidence.to_string().contains("private"));
 
+        let retry = json!({"table":"t","operation":"vacuum","applied":true,
+            "error_kind":"stale_plan","error":"private retry error"});
+        let mut retry_log = baseline.clone();
+        retry_log.stdout.push_str(&format!("{retry}\n"));
+        let retried = maintenance_cell_outcome_evidence(&retry_log, std::slice::from_ref(&baseline));
+        assert_eq!(retried["operation_failure"], false);
+        assert_eq!(retried["error_kind_counts"], json!({}));
+        assert_eq!(retried["operations"]["vacuum"]["retry_kind_counts"], json!({"stale_plan":1}));
+        assert_eq!(maintenance_exit_classification(&retry_log, Some(0)), "operation_failure",
+            "a prior lifetime failure must not be hidden by cell-only retries");
+        let mut only_retry = retry_log.clone();
+        only_retry.stdout = format!("{retry}\n");
+        assert_eq!(maintenance_exit_classification(&only_retry, Some(1)), "nonzero_health_exit");
+        let mut unhealthy = only_retry.clone();
+        unhealthy.text.push_str("delta-maintenance stale-plan starvation table=t operation=vacuum consecutive=8 limit=8\n");
+        assert_eq!(maintenance_exit_classification(&unhealthy, Some(1)), "unhealthy");
+        unhealthy.text = "delta-maintenance pending-table status failed: private discovery error\n".to_owned();
+        assert_eq!(maintenance_exit_classification(&unhealthy, Some(1)), "unhealthy");
+        only_retry.stdout = format!("{}\n", json!({"table":"t","operation":"vacuum","applied":true}));
+        assert_eq!(maintenance_exit_classification(&only_retry, Some(0)), "unknown");
+        for suffix in ["{\"operation\":", "{\"operation\":\"vacuum\",\"applied\":true}\n"] {
+            let mut partial = baseline.clone();
+            append_process_record(suffix.as_bytes(), &mut partial.stdout, &mut 0, "partial regression")?;
+            let outcome = maintenance_cell_outcome_evidence(&partial, std::slice::from_ref(&baseline));
+            assert_eq!(outcome["status"], "unavailable");
+            assert!(outcome["operation_failure"].is_null() && outcome["error_kind_counts"].is_null());
+        }
+        assert!(maintenance_cell_outcome_evidence(&baseline, std::slice::from_ref(&baseline))["operation_count"].is_null());
+
         current.stderr = "rotated stderr\n".to_owned();
         let unavailable = maintenance_cell_outcome_evidence(&current, std::slice::from_ref(&baseline));
         assert_eq!(unavailable["status"], "unavailable");
         assert!(unavailable["error_kind_counts"].is_null());
         assert!(unavailable["comment"].as_str().is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn maintenance_semantically_incomplete_success_is_unknown() -> Result<()> {
+        let producer: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/maintenance-operation-results.json"))?;
+        let success = producer["operation_results"].as_array().context("producer operations")?
+            .iter().find(|record| record["operation"] == "vacuum").context("producer vacuum")?.clone();
+        let baseline = ProcessLog {
+            role: ComponentRole::Maintenance, instance_id: "semantic-test".to_owned(),
+            image: None, image_id: None, source_revision: None, complete: true,
+            raw_log_bytes: 0, raw_log_lines: 0, stdout: String::new(),
+            stderr: String::new(), text: String::new(),
+        };
+        let observe = |record: &Value| {
+            let mut log = baseline.clone();
+            log.stdout = format!("{record}\n");
+            maintenance_cell_outcome_evidence(&log, std::slice::from_ref(&baseline))
+        };
+        assert_eq!(observe(&success)["operation_failure"], false);
+        for field in ["report", "outcome", "interrupted", "error_kind", "error"] {
+            let mut malformed = success.clone();
+            match field {
+                "report" => { malformed.as_object_mut().context("record")?.remove(field); }
+                "outcome" | "interrupted" => {
+                    malformed["report"].as_object_mut().context("report")?.remove(field);
+                }
+                _ => malformed[field] = json!(17),
+            }
+            let evidence = observe(&malformed);
+            assert_eq!(evidence["status"], "unavailable", "{field}");
+            assert!(evidence["operation_failure"].is_null(), "{field}");
+            assert!(evidence["error_kind_counts"].is_null(), "{field}");
+        }
+        let mut omitted_optional = success.clone();
+        for field in ["error", "error_kind"] {
+            omitted_optional.as_object_mut().context("record")?.remove(field);
+        }
+        assert_eq!(observe(&omitted_optional)["operation_failure"], false);
+        omitted_optional.as_object_mut().context("record")?.remove("report");
+        omitted_optional["error_kind"] = json!("stale_plan");
+        assert_eq!(observe(&omitted_optional)["operation_failure"], false);
+        assert_eq!(observe(&omitted_optional)["retry_kind_counts"]["stale_plan"], 1);
+        Ok(())
+    }
+
+    #[test]
+    fn maintenance_nonzero_health_does_not_become_retry_success_after_recovery() -> Result<()> {
+        let producer: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/maintenance-operation-results.json"))?;
+        let operations = producer["operation_results"].as_array().context("producer operations")?;
+        let mut stale = operations[0].clone();
+        stale.as_object_mut().context("record")?.remove("report");
+        stale["error_kind"] = json!("stale_plan");
+        for limit in [1, 8] {
+            let mut log = ProcessLog {
+                role: ComponentRole::Maintenance, instance_id: "health-test".to_owned(),
+                image: None, image_id: None, source_revision: None, complete: true,
+                raw_log_bytes: 0, raw_log_lines: 0,
+                stdout: format!("{}\n{stale}\n",
+                    json!({"startup":{"max_consecutive_stale_plans":limit}})),
+                stderr: String::new(), text: String::new(),
+            };
+            for record in operations {
+                log.stdout.push_str(&format!("{record}\n"));
+            }
+            assert_eq!(maintenance_exit_classification(&log, Some(0)), "no_operation_failures");
+            assert_eq!(maintenance_exit_classification(&log, Some(1)), "nonzero_health_exit",
+                "limit {limit}: recovery or a benign retry cannot prove terminal health");
+        }
         Ok(())
     }
 
