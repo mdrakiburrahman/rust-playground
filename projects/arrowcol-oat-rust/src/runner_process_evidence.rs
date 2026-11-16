@@ -1507,6 +1507,34 @@ mod startup_readback_tests {
     }
 
     #[test]
+    fn maintenance_writer_readback_is_independent_of_collector() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+            "parquet_writer": {"defaults": {"compression": "zstd"}},
+            "maintenance": {"enabled": true, "operations": ["optimize"],
+                "parquet_writer": {"defaults": {"compression": "snappy"}}}
+        }))?;
+        let collector: Value = serde_json::from_str(
+            &role_environment(&config, ComponentRole::Collector)?["ARROWCOL_PARQUET_CONFIG"],
+        )?;
+        let maintenance: Value = serde_json::from_str(
+            &role_environment(&config, ComponentRole::Maintenance)?["ARROWCOL_PARQUET_CONFIG"],
+        )?;
+        verify_process_configuration(&config, ComponentRole::Collector, &json!({"parquet_writer": collector}))?;
+        let observed = json!({
+            "startup": {"apply": false, "operations": ["optimize"], "interval_secs": 60},
+            "parquet_writer_overrides": maintenance
+        });
+        verify_process_configuration(&config, ComponentRole::Maintenance, &observed)?;
+        let mut mismatch = observed;
+        mismatch["parquet_writer_overrides"]["defaults"]["compression"] = json!("zstd");
+        assert!(verify_process_configuration(&config, ComponentRole::Maintenance, &mismatch).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn real_router_and_collector_control_plane_shapes_preserve_public_tunables() -> Result<()> {
         let mut config: OatConfig = serde_json::from_str(include_str!(
             "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"

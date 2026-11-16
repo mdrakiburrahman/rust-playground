@@ -409,6 +409,7 @@ pub struct MaintenanceTunables {
     pub enabled: Option<bool>,
     pub operations: Option<Vec<MaintenanceOperation>>,
     pub apply: Option<bool>,
+    pub parquet_writer: Option<ParquetWriterConfig>,
     pub interval_secs: Option<u64>,
     pub max_idle_backoff_secs: Option<u64>,
     pub max_cycles: Option<u64>,
