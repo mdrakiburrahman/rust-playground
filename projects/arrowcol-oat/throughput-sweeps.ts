@@ -174,19 +174,26 @@ function mergeObjects(base: JsonObject, overrides: JsonObject): JsonObject {
   return result;
 }
 
-export function renderThroughputConfig(base: unknown, manifest: unknown, comparisonId: string, candidateId: string): JsonObject {
+export function renderThroughputBaseline(base: unknown, manifest: unknown): JsonObject {
   if (!isRecord(base) || !isRecord(manifest) || !isRecord(manifest.baseline_tunables) ||
       !isRecord(manifest.baseline_overrides) || !Array.isArray(manifest.comparisons)) {
     throw new Error('invalid base config or throughput manifest');
   }
+  if (!isRecord(base.tunables) ||
+      createHash('sha256').update(JSON.stringify(base.tunables)).digest('hex') !== manifest.registry_sha256) {
+    throw new Error('base tunables do not match manifest seed');
+  }
+  return mergeObjects(base, { ...manifest.baseline_overrides, tunables: manifest.baseline_tunables });
+}
+
+export function renderThroughputConfig(base: unknown, manifest: unknown, comparisonId: string, candidateId: string): JsonObject {
+  const baseline = renderThroughputBaseline(base, manifest);
+  if (!isRecord(manifest) || !Array.isArray(manifest.comparisons)) throw new Error('invalid throughput manifest');
   const comparison = manifest.comparisons.find(item => isRecord(item) && item.id === comparisonId);
   if (!isRecord(comparison) || !Array.isArray(comparison.candidates)) throw new Error('unknown comparison: ' + comparisonId);
   const selected = comparison.candidates.find(item => isRecord(item) && item.id === candidateId);
   if (!isRecord(selected) || !isRecord(selected.overrides)) throw new Error('unknown candidate: ' + candidateId);
-  return mergeObjects(
-    mergeObjects(base, { ...manifest.baseline_overrides, tunables: manifest.baseline_tunables }),
-    selected.overrides,
-  );
+  return mergeObjects(baseline, selected.overrides);
 }
 
 async function main(args: string[]): Promise<void> {
@@ -225,13 +232,17 @@ async function main(args: string[]): Promise<void> {
       await writeFile(resolve(outputDirectory, 'oat-config-throughput-' + cohort + '.json'), JSON.stringify(manifest, null, 2) + '\n');
       continue;
     }
+    const cohortDirectory = resolve(outputDirectory, cohort);
+    await mkdir(cohortDirectory, { recursive: true });
+    await writeFile(resolve(cohortDirectory, 'baseline.json'),
+      JSON.stringify(renderThroughputBaseline(registry, manifest), null, 2) + '\n');
     for (const comparison of manifest.comparisons as Comparison[]) {
       if (!isRecord(comparison) || typeof comparison.id !== 'string' || !/^[a-z0-9-]+$/.test(comparison.id) ||
           !Array.isArray(comparison.candidates)) throw new Error('invalid comparison in ' + cohort);
       const directory = resolve(outputDirectory, cohort, comparison.id);
       await mkdir(directory, { recursive: true });
       for (const candidate of comparison.candidates) {
-        if (!isRecord(candidate) || typeof candidate.id !== 'string' || !/^[a-z0-9-]+$/.test(candidate.id)) {
+        if (!isRecord(candidate) || typeof candidate.id !== 'string' || !/^[a-z0-9_-]+$/.test(candidate.id)) {
           throw new Error('invalid candidate in ' + cohort + '/' + comparison.id);
         }
         const config = renderThroughputConfig(registry, manifest, comparison.id, candidate.id);

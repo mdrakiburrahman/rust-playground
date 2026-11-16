@@ -135,4 +135,5 @@ test('renders candidate overlays as OAT configs without changing the baseline or
   assert.deepEqual(base, original);
   assert.throws(() => renderThroughputConfig(base, manifests[0], 'missing', 'none'), /unknown comparison/);
   assert.throws(() => renderThroughputConfig(base, manifests[7], 'staging-overlap', 'overlap-true'), /unknown comparison/);
+  assert.throws(() => renderThroughputConfig({ ...base, tunables: {} }, manifests[0], 'codec', 'snappy'), /manifest seed/);
 });

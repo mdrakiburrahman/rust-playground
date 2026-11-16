@@ -1,85 +1,84 @@
 {
   "schema_version": 1,
-  "validation_kind": "config-validated",
+  "validation_kind": "config-validation-only",
   "validator": "arrowcol-oat-rust --validate-config",
-  "validation_sources": {
-    "e1_source_sha": "52a95e06633708bc4896b1a54e868516d1068ca6",
-    "l1a_source_sha": "00e1e2bf12cc754892d24bcda6bcbe60a6723bfd"
-  },
-  "runnable_candidate_count": 82,
-  "pass_count": 82,
-  "pending_count": 0,
+  "source_sha": "a24ec92ea7a4c9b3b0397d38ebe231844714c7e8",
+  "baseline_count": 8,
+  "candidate_count": 82,
+  "pass_count": 90,
+  "fail_count": 0,
+  "runtime_qualification": "unqualified",
   "manifests": [
     {
       "cohort": "C1",
       "status": "config-validated",
-      "runnable": true,
+      "baseline_count": 1,
       "candidate_count": 8,
-      "pass_count": 8,
-      "pending_count": 0,
+      "pass_count": 9,
+      "fail_count": 0,
       "excluded_pending_candidate_sets": []
     },
     {
       "cohort": "C2",
       "status": "config-validated",
-      "runnable": true,
+      "baseline_count": 1,
       "candidate_count": 4,
-      "pass_count": 4,
-      "pending_count": 0,
+      "pass_count": 5,
+      "fail_count": 0,
       "excluded_pending_candidate_sets": []
     },
     {
       "cohort": "C3",
       "status": "config-validated",
-      "runnable": true,
+      "baseline_count": 1,
       "candidate_count": 16,
-      "pass_count": 16,
-      "pending_count": 0,
+      "pass_count": 17,
+      "fail_count": 0,
       "excluded_pending_candidate_sets": []
     },
     {
       "cohort": "C4",
       "status": "config-validated",
-      "runnable": true,
+      "baseline_count": 1,
       "candidate_count": 4,
-      "pass_count": 4,
-      "pending_count": 0,
+      "pass_count": 5,
+      "fail_count": 0,
       "excluded_pending_candidate_sets": []
     },
     {
       "cohort": "C5",
       "status": "config-validated",
-      "runnable": true,
+      "baseline_count": 1,
       "candidate_count": 19,
-      "pass_count": 19,
-      "pending_count": 0,
+      "pass_count": 20,
+      "fail_count": 0,
       "excluded_pending_candidate_sets": []
     },
     {
       "cohort": "C6",
       "status": "config-validated",
-      "runnable": true,
+      "baseline_count": 1,
       "candidate_count": 13,
-      "pass_count": 13,
-      "pending_count": 0,
+      "pass_count": 14,
+      "fail_count": 0,
       "excluded_pending_candidate_sets": []
     },
     {
       "cohort": "C7",
       "status": "config-validated",
-      "runnable": true,
+      "baseline_count": 1,
       "candidate_count": 12,
-      "pass_count": 12,
-      "pending_count": 0,
+      "pass_count": 13,
+      "fail_count": 0,
       "excluded_pending_candidate_sets": []
     },
     {
       "cohort": "C8",
       "status": "config-validated",
-      "runnable": true,
+      "baseline_count": 1,
       "candidate_count": 6,
-      "pass_count": 6,
-      "pending_count": 0,
+      "pass_count": 7,
+      "fail_count": 0,
       "excluded_pending_candidate_sets": [
         {
           "id": "staging-overlap",
@@ -91,505 +90,733 @@
   ],
   "known_gap_cells": {
     "r1_2_global_bloom_true_column_false": {
-      "status": "not-present-in-runnable-manifests",
+      "status": "not-present-in-manifests",
       "candidate_count": 0
     },
     "r1_3_offset_index_disabled_global_page": {
-      "status": "not-present-in-runnable-manifests",
+      "status": "not-present-in-manifests",
       "candidate_count": 0
     }
   },
   "cells": [
     {
       "cohort": "C1",
+      "comparison": null,
+      "candidate": "baseline",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "8f5803ca029de3df34c1c46f06a98a5e39c4a140e2732e575f55e7ce3f994a72",
+      "status": "pass"
+    },
+    {
+      "cohort": "C1",
       "comparison": "codec",
       "candidate": "uncompressed",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "90a898635c587f71275f557fa2648b2582321738a8b218151c2b8b086f03e2cd",
       "status": "pass"
     },
     {
       "cohort": "C1",
       "comparison": "codec",
       "candidate": "snappy",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "f597a5a270d33233722a9da62cd17c8535883fe0f8ff876edcaf17e8bc5897dc",
       "status": "pass"
     },
     {
       "cohort": "C1",
       "comparison": "codec",
       "candidate": "lz4-raw",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "8b874cc432ff30464585b682975857c5fb8078aa0748294fc011dd1e5ed32383",
       "status": "pass"
     },
     {
       "cohort": "C1",
       "comparison": "codec",
       "candidate": "gzip",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "66f71aaa9c96a7e57e431258bca9623750dc07318668c6d5d90ae8632d4320dc",
       "status": "pass"
     },
     {
       "cohort": "C1",
       "comparison": "codec",
       "candidate": "brotli",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "82f33f6399d07dbfffd01e7597e8f7902d42924c9c94ab25a6cfc0376fb2228c",
       "status": "pass"
     },
     {
       "cohort": "C1",
       "comparison": "codec",
       "candidate": "zstd-1",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "3259bc0a0657b57fe00b80d132deca1762ba8a6e2e600240b21df01ca69bf9cc",
       "status": "pass"
     },
     {
       "cohort": "C1",
       "comparison": "codec",
       "candidate": "zstd-3",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "8f5803ca029de3df34c1c46f06a98a5e39c4a140e2732e575f55e7ce3f994a72",
       "status": "pass"
     },
     {
       "cohort": "C1",
       "comparison": "codec",
       "candidate": "zstd-6",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "d26e773c910184db7e617ac45885bb8c2bce8a4c911e63471b503674825e243b",
+      "status": "pass"
+    },
+    {
+      "cohort": "C2",
+      "comparison": null,
+      "candidate": "baseline",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "8f5803ca029de3df34c1c46f06a98a5e39c4a140e2732e575f55e7ce3f994a72",
       "status": "pass"
     },
     {
       "cohort": "C2",
       "comparison": "dictionary-encoding",
       "candidate": "availability-group-name-dictionary-off",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "acf695a3dbf084a8f81ec3f91e0471b774d90a21f71a3a22137f205d77e1e007",
       "status": "pass"
     },
     {
       "cohort": "C2",
       "comparison": "dictionary-encoding",
       "candidate": "availability-group-name-dictionary-on",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "836abdcd5c19a93e8f53fd01bfd1f416dd62dc7de7f67310b0c92f7309c8c5b9",
       "status": "pass"
     },
     {
       "cohort": "C2",
       "comparison": "dictionary-encoding",
       "candidate": "last-connect-error-delta-binary-packed",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "5f57f6e67dbf3d993f91a0f98b5609ec0cb8ada21eef30a974dcc3fca5c94af3",
       "status": "pass"
     },
     {
       "cohort": "C2",
       "comparison": "dictionary-encoding",
       "candidate": "last-connect-error-byte-stream-split",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "5b1b43bdd2dc07dd74ff0b2925dbbba91dfa34e7263a88df591cc15761ca3143",
+      "status": "pass"
+    },
+    {
+      "cohort": "C3",
+      "comparison": null,
+      "candidate": "baseline",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "8f5803ca029de3df34c1c46f06a98a5e39c4a140e2732e575f55e7ce3f994a72",
       "status": "pass"
     },
     {
       "cohort": "C3",
       "comparison": "row-groups",
       "candidate": "row-group-16384",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "83b7ef61e043694f8860ab0b54284d705b8389320218169de9267fb35ad251ec",
       "status": "pass"
     },
     {
       "cohort": "C3",
       "comparison": "row-groups",
       "candidate": "row-group-65536",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "1f50af080e362820fafaa826f51c9169768671e9c9c4c654b6b4616ee48bc8cf",
       "status": "pass"
     },
     {
       "cohort": "C3",
       "comparison": "row-groups",
       "candidate": "row-group-131072",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "3dd9bd03c294e11164a932f40e43945bc88f15e1d70d884f7e73891db5f46682",
       "status": "pass"
     },
     {
       "cohort": "C3",
       "comparison": "row-groups",
       "candidate": "row-group-1000000",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "484ebb3dc155765830709385e9cf394e8deb4cecf5b30688bbd53c538f2301da",
       "status": "pass"
     },
     {
       "cohort": "C3",
       "comparison": "max-rows",
       "candidate": "max-rows-16384",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "c58e805cd6b58b9dca622a26def00364656b67badd4c7bfd0c5933d4e9aa41aa",
       "status": "pass"
     },
     {
       "cohort": "C3",
       "comparison": "max-rows",
       "candidate": "max-rows-65536",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "823020d1299b71d2bc67699e8d24ab55f089fb3d2e6e06854833e0712ddbcb84",
       "status": "pass"
     },
     {
       "cohort": "C3",
       "comparison": "max-rows",
       "candidate": "max-rows-131072",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "d01bad83840af33f363ad34f79d9cfc8d861950fdce8c8abad946cd161d110a6",
       "status": "pass"
     },
     {
       "cohort": "C3",
       "comparison": "max-rows",
       "candidate": "max-rows-1000000",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "61e0dce616b5b0fa0dcb33c160daff517c046bef0bfd6a4a9597017c1dcf092b",
       "status": "pass"
     },
     {
       "cohort": "C3",
       "comparison": "page-rows",
       "candidate": "page-1024",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "ec5f5ea1a687867243425509d9bb15aeb60d88ed20487514bc5c7173e857daad",
       "status": "pass"
     },
     {
       "cohort": "C3",
       "comparison": "page-rows",
       "candidate": "page-2048",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "d5083d08714c0f38a81c56c5608186426663ffe9a657ccefd45f811ecbd56794",
       "status": "pass"
     },
     {
       "cohort": "C3",
       "comparison": "page-rows",
       "candidate": "page-4096",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "91eaa7ab435e8c79bd1240fe9689546449e5738bc1c7607d2dd52b2f05a4408e",
       "status": "pass"
     },
     {
       "cohort": "C3",
       "comparison": "rollover-cap",
       "candidate": "input-134217728",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "32c9edd0defbb4802e2ebc3135619766af76363d2d124d50c3f20f5335d4c29f",
       "status": "pass"
     },
     {
       "cohort": "C3",
       "comparison": "rollover-cap",
       "candidate": "input-268435456",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "78e69cc8f4de530194a9da1138c34315321795808eebd444e2809ddb3e1e9c81",
       "status": "pass"
     },
     {
       "cohort": "C3",
       "comparison": "rollover-cap",
       "candidate": "input-536870912",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "d8e48248d1905ba74c66d873e9a9e3dea47463a3d2069ad64f0336589f3aa30c",
       "status": "pass"
     },
     {
       "cohort": "C3",
       "comparison": "coalescing",
       "candidate": "coalesce-false",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "c97b14031654e4005df39f8f0cb8674744bc35745aebd3268708d018543e2c3f",
       "status": "pass"
     },
     {
       "cohort": "C3",
       "comparison": "coalescing",
       "candidate": "coalesce-true",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "8f5803ca029de3df34c1c46f06a98a5e39c4a140e2732e575f55e7ce3f994a72",
+      "status": "pass"
+    },
+    {
+      "cohort": "C4",
+      "comparison": null,
+      "candidate": "baseline",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "8f5803ca029de3df34c1c46f06a98a5e39c4a140e2732e575f55e7ce3f994a72",
       "status": "pass"
     },
     {
       "cohort": "C4",
       "comparison": "sort-key",
       "candidate": "none",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "4e0b4f513c45fb63f2f001d8ceec83c2428e4b607fb026d5ff35a374c7d9841a",
       "status": "pass"
     },
     {
       "cohort": "C4",
       "comparison": "sort-key",
       "candidate": "sample-time",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "0759563c816c171edd91ecc91fb7b340cf7f59766e50371bc4883cd6e823431d",
       "status": "pass"
     },
     {
       "cohort": "C4",
       "comparison": "sort-key",
       "candidate": "replica-sample-time",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "f868b18add554c57a66ff4adc9fb6c4ba1a788664a1254acfcbb5fda64b0a869",
       "status": "pass"
     },
     {
       "cohort": "C4",
       "comparison": "sort-key",
       "candidate": "group-replica-sample-time",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "9721970a9385f55a9c21eb945a0681aeae28e740c46282c94ca13d02ab01f976",
+      "status": "pass"
+    },
+    {
+      "cohort": "C5",
+      "comparison": null,
+      "candidate": "baseline",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "8f5803ca029de3df34c1c46f06a98a5e39c4a140e2732e575f55e7ce3f994a72",
       "status": "pass"
     },
     {
       "cohort": "C5",
       "comparison": "workers",
       "candidate": "workers-8",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "b19b108072ccbf8da7bd06e7ebd4112d5b22d30c15ccb2d1ecad26c57431deee",
       "status": "pass"
     },
     {
       "cohort": "C5",
       "comparison": "workers",
       "candidate": "workers-16",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "5c006155d9cd14d0b740baf9e1b8349b4e74f2690b54e6a0f3491429baa3c9b7",
       "status": "pass"
     },
     {
       "cohort": "C5",
       "comparison": "workers",
       "candidate": "workers-32",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "5373dbedee375c14796f750654d5f475369d350e05dcb67283ce1c4b0f9b6486",
       "status": "pass"
     },
     {
       "cohort": "C5",
       "comparison": "workers",
       "candidate": "workers-64",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "35dcc3d3f923e8e4801b5f723e2473fa9948c2f55688c3ae4593cd72b3e38481",
       "status": "pass"
     },
     {
       "cohort": "C5",
       "comparison": "streams",
       "candidate": "streams-1",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "5c006155d9cd14d0b740baf9e1b8349b4e74f2690b54e6a0f3491429baa3c9b7",
       "status": "pass"
     },
     {
       "cohort": "C5",
       "comparison": "streams",
       "candidate": "streams-2",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "bcf3af5cf09e2f53357d4f826fe470b43a2424ecf8f92fa91e5980916e467417",
       "status": "pass"
     },
     {
       "cohort": "C5",
       "comparison": "streams",
       "candidate": "streams-4",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "2ac98ad39c1eae1a32b14349514da11f15a93a83bd68da5ab4dcdef8efaa7062",
       "status": "pass"
     },
     {
       "cohort": "C5",
       "comparison": "connections",
       "candidate": "connections-1",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "5c006155d9cd14d0b740baf9e1b8349b4e74f2690b54e6a0f3491429baa3c9b7",
       "status": "pass"
     },
     {
       "cohort": "C5",
       "comparison": "connections",
       "candidate": "connections-2",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "65fd0ae88cadb7de4c06edb77107ced1047ac59a74d3b2d3240f8178b4532320",
       "status": "pass"
     },
     {
       "cohort": "C5",
       "comparison": "connections",
       "candidate": "connections-4",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "be967f21daf54fdf375fd78d6172dfaa6b912ce99ccbd853dafc5ea42ef88875",
       "status": "pass"
     },
     {
       "cohort": "C5",
       "comparison": "corpus",
       "candidate": "corpus-16384",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "05fc752a404dc2a1ccc9d60f69722c238ff605c578714bc530a3a2eea581a690",
       "status": "pass"
     },
     {
       "cohort": "C5",
       "comparison": "corpus",
       "candidate": "corpus-65536",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "8f5803ca029de3df34c1c46f06a98a5e39c4a140e2732e575f55e7ce3f994a72",
       "status": "pass"
     },
     {
       "cohort": "C5",
       "comparison": "corpus",
       "candidate": "corpus-262144",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "256d7b529aa1d862df99bbf465c34c0b17599aefb1cd2d738f8e57a0c39c6f9b",
       "status": "pass"
     },
     {
       "cohort": "C5",
       "comparison": "interval",
       "candidate": "interval-0",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "d155bfb14ab66a0a6fa14615bd4e447d23004c6500332d20507084bc2efa6093",
       "status": "pass"
     },
     {
       "cohort": "C5",
       "comparison": "interval",
       "candidate": "interval-1000",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "0f7e09aca5cab172cd0f94e7a49f2b7146bff1c9d3e995b14ff0b181acb37556",
       "status": "pass"
     },
     {
       "cohort": "C5",
       "comparison": "interval",
       "candidate": "interval-10000",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "b9bdc6840623f9d8560db1718c6cb2dcc276d6e0459fd5fd94df2be509103b04",
       "status": "pass"
     },
     {
       "cohort": "C5",
       "comparison": "ipc-compression",
       "candidate": "ipc-none",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "9312ec7c834235738944dfb307fc499f0031ca13e6a74e83446d6af6dd8a6204",
       "status": "pass"
     },
     {
       "cohort": "C5",
       "comparison": "ipc-compression",
       "candidate": "ipc-lz4_frame",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "fb94caa68da8edecbb7e53f86e21a62716a42f6585d9cfe484eccd68f2d965ab",
       "status": "pass"
     },
     {
       "cohort": "C5",
       "comparison": "ipc-compression",
       "candidate": "ipc-zstd",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "8f5803ca029de3df34c1c46f06a98a5e39c4a140e2732e575f55e7ce3f994a72",
+      "status": "pass"
+    },
+    {
+      "cohort": "C6",
+      "comparison": null,
+      "candidate": "baseline",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "8f5803ca029de3df34c1c46f06a98a5e39c4a140e2732e575f55e7ce3f994a72",
       "status": "pass"
     },
     {
       "cohort": "C6",
       "comparison": "dfe-concurrency",
       "candidate": "dfe-1",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "6508cdc79a5f0dd11571718ec00290944ff828b1510817f6a205237de4c7edb0",
       "status": "pass"
     },
     {
       "cohort": "C6",
       "comparison": "dfe-concurrency",
       "candidate": "dfe-2",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "8f5803ca029de3df34c1c46f06a98a5e39c4a140e2732e575f55e7ce3f994a72",
       "status": "pass"
     },
     {
       "cohort": "C6",
       "comparison": "dfe-concurrency",
       "candidate": "dfe-4",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "436563e18ca4e4f56a37b4e7ad949b2756246d6e20b9c6ca51c12fce637388b6",
       "status": "pass"
     },
     {
       "cohort": "C6",
       "comparison": "dfe-concurrency",
       "candidate": "dfe-8",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "3dcb8a4e649a71cca1573d3ff4cc9e0d46d4e85bde9ba695e1fb55972d2d8c88",
       "status": "pass"
     },
     {
       "cohort": "C6",
       "comparison": "cpu-workers",
       "candidate": "cpu-1",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "b329f9862919cb1feedcef8ef60023a23bde06a601c5770dc8ecbd0fb9c0bc05",
       "status": "pass"
     },
     {
       "cohort": "C6",
       "comparison": "cpu-workers",
       "candidate": "cpu-2",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "cce79f8e0315c9ef4eccc62c0ff9c7f6d567fa0a200f8b48e469bff0ec176bc5",
       "status": "pass"
     },
     {
       "cohort": "C6",
       "comparison": "cpu-workers",
       "candidate": "cpu-4",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "8f5803ca029de3df34c1c46f06a98a5e39c4a140e2732e575f55e7ce3f994a72",
       "status": "pass"
     },
     {
       "cohort": "C6",
       "comparison": "upload-concurrency",
       "candidate": "upload-1",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "5a37b012f20d404ea38d1368c084eaf3a5795b53e1ab56ebdce109c57a4b5354",
       "status": "pass"
     },
     {
       "cohort": "C6",
       "comparison": "upload-concurrency",
       "candidate": "upload-4",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "ec3f45a463d1c00cd58e0be119a3c37990fa629710d03924dac99b087c389501",
       "status": "pass"
     },
     {
       "cohort": "C6",
       "comparison": "upload-concurrency",
       "candidate": "upload-8",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "8f5803ca029de3df34c1c46f06a98a5e39c4a140e2732e575f55e7ce3f994a72",
       "status": "pass"
     },
     {
       "cohort": "C6",
       "comparison": "flush-concurrency",
       "candidate": "flush-1",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "86e115d2b8bd7e0e4b921e39aae2434de9d9f5fb2e03a839ee2202cddab2d333",
       "status": "pass"
     },
     {
       "cohort": "C6",
       "comparison": "flush-concurrency",
       "candidate": "flush-2",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "8f5803ca029de3df34c1c46f06a98a5e39c4a140e2732e575f55e7ce3f994a72",
       "status": "pass"
     },
     {
       "cohort": "C6",
       "comparison": "flush-concurrency",
       "candidate": "flush-4",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "385bb28377af54836b6fcfafabb16c74eb4d7be33d3d8b762b4d3708d22c2123",
+      "status": "pass"
+    },
+    {
+      "cohort": "C7",
+      "comparison": null,
+      "candidate": "baseline",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "8f5803ca029de3df34c1c46f06a98a5e39c4a140e2732e575f55e7ce3f994a72",
       "status": "pass"
     },
     {
       "cohort": "C7",
       "comparison": "maintenance-cadence",
       "candidate": "cadence-30",
+      "qualification": "exploratory",
+      "config_sha256": "fa141d796d5736eeee21a2d751644e197ebd397499c31f8c88d948ca4e628063",
       "status": "pass"
     },
     {
       "cohort": "C7",
       "comparison": "maintenance-cadence",
       "candidate": "cadence-60",
+      "qualification": "exploratory",
+      "config_sha256": "1166b6b8e08f5d70c25b808a5cdae779bab9b5aecb2f8f6e5e81c4ced9ea6be2",
       "status": "pass"
     },
     {
       "cohort": "C7",
       "comparison": "maintenance-cadence",
       "candidate": "cadence-120",
+      "qualification": "exploratory",
+      "config_sha256": "1eb4f8d019ddd2fe875a45cd5b67fa2ea4eeda0da03e81cc7cce558f5fe54661",
       "status": "pass"
     },
     {
       "cohort": "C7",
       "comparison": "small-file-threshold",
       "candidate": "small-file-16777216",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "0175a27b4c973d5372816f65f7f7eb2bba4957f3c5e26d99f4e881c1c5ef68cb",
       "status": "pass"
     },
     {
       "cohort": "C7",
       "comparison": "small-file-threshold",
       "candidate": "small-file-33554432",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "b2d104951ebe1796c18142dd3581b80047f126492cdcdbddb1b32ce91f9cfd3b",
       "status": "pass"
     },
     {
       "cohort": "C7",
       "comparison": "small-file-threshold",
       "candidate": "small-file-67108864",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "74b3c129d5d398e89421e9784ce0d4428af288a9626e88a146c7250dd21e125e",
       "status": "pass"
     },
     {
       "cohort": "C7",
       "comparison": "retry-budget",
       "candidate": "attempts-1",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "40c5234a7ee253c88396ea760cd0f3d1c5eb2f35c92991de316bc9cba15586e1",
       "status": "pass"
     },
     {
       "cohort": "C7",
       "comparison": "retry-budget",
       "candidate": "attempts-3",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "48db9c4d8b15a76538c234e9cefc7ffa035187a0d0ac01aaaa4685283eb7b630",
       "status": "pass"
     },
     {
       "cohort": "C7",
       "comparison": "retry-budget",
       "candidate": "attempts-5",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "2be59779e4ac0e639cc3f210998f9e90d924746b100f75fcf48750bd390affe4",
       "status": "pass"
     },
     {
       "cohort": "C7",
       "comparison": "checkpoint-interval",
       "candidate": "checkpoint-64",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "5807a96aea63385fb8c62283885f3abe8577d12a473c324d36ff0982f0857775",
       "status": "pass"
     },
     {
       "cohort": "C7",
       "comparison": "checkpoint-interval",
       "candidate": "checkpoint-256",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "e37693a4029a474072c160b082f26d39ae96468841dd36f380a0df8ce40f0346",
       "status": "pass"
     },
     {
       "cohort": "C7",
       "comparison": "checkpoint-interval",
       "candidate": "checkpoint-1024",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "45d4ea2479d6c0c0cd15adbb1ee81c1e893fe375710d62ea6ff296f04660e187",
+      "status": "pass"
+    },
+    {
+      "cohort": "C8",
+      "comparison": null,
+      "candidate": "baseline",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "8f5803ca029de3df34c1c46f06a98a5e39c4a140e2732e575f55e7ce3f994a72",
       "status": "pass"
     },
     {
       "cohort": "C8",
       "comparison": "commit-window",
       "candidate": "window-1s",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "e4b8f487c6b38b24a31073156bd4ff9ade14feb7bdf73d2aab2157eb11b190ec",
       "status": "pass"
     },
     {
       "cohort": "C8",
       "comparison": "commit-window",
       "candidate": "window-2s",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "1349e0c7463e7bddb2614cdfa73dc5621a487835cdb422be66573c9199cc2871",
       "status": "pass"
     },
     {
       "cohort": "C8",
       "comparison": "commit-window",
       "candidate": "window-5s",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "0d4d972194e36709b6921e9aa3b505e5462641bb4525f216d2238dd9c8b6d34a",
       "status": "pass"
     },
     {
       "cohort": "C8",
       "comparison": "files-per-commit",
       "candidate": "files-16",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "b3adba370f8dae0248a7d04e2a97e484fa2dfe80b01a709bf4f6158abc047839",
       "status": "pass"
     },
     {
       "cohort": "C8",
       "comparison": "files-per-commit",
       "candidate": "files-64",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "645119962b07ac3b601a6bdb6f58cbb50cc5879a2a1e6b30f6d1f8d61f949bc6",
       "status": "pass"
     },
     {
       "cohort": "C8",
       "comparison": "files-per-commit",
       "candidate": "files-128",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "5f1ac9a49762d783fef1099108bdbbda71d72e2efa590721a7549901dac86751",
       "status": "pass"
     }
   ]
