@@ -90,6 +90,8 @@ pub struct RunInventory {
     pub resources: Vec<InventoryResource>,
     pub fic: Option<InventoryFic>,
     pub qap: Option<InventoryQap>,
+    #[serde(default)]
+    pub evidence_destination: Option<InventoryEvidenceDestination>,
     pub cleanup: InventoryCleanup,
 }
 
@@ -163,6 +165,27 @@ pub struct InventoryFic {
     pub state: InventoryResourceState,
     #[serde(default)]
     pub absence: Option<InventoryFicAbsenceReceipt>,
+    #[serde(default)]
+    pub plan: Option<InventoryFicPlan>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct InventoryFicPlan {
+    pub version: u32,
+    pub run_id: String,
+    pub namespace: String,
+    pub service_account: String,
+    pub identity_id: String,
+    pub resource_id: String,
+    pub client_id: String,
+    pub tenant_id: String,
+    pub aks_id: String,
+    pub server: String,
+    pub credential_name: String,
+    pub issuer: String,
+    pub subject: String,
+    pub audience: String,
 }
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
@@ -188,6 +211,30 @@ pub struct InventoryQap {
     pub state: InventoryResourceState,
     #[serde(default)]
     pub absence: Vec<InventoryQapAbsenceReceipt>,
+    #[serde(default)]
+    pub reference: Option<InventoryQapReference>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InventoryQapReference {
+    pub schema_version: u32,
+    pub account: String,
+    pub container: String,
+    pub blob: String,
+    pub run_id: String,
+    pub nonce: String,
+    pub manifest_sha256: String,
+    pub namespace_uid: String,
+    pub namespace_owner_token: String,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InventoryEvidenceDestination {
+    pub account: String,
+    pub container: String,
+    pub blob_prefix: String,
 }
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
@@ -226,6 +273,32 @@ pub struct InventoryCleanup {
     pub evidence_capture: InventoryStep,
     pub terminal_capture: InventoryStep,
     pub handoff: InventoryStep,
+}
+
+fn valid_storage_account(value: &str) -> bool {
+    (3..=24).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+}
+
+fn valid_storage_container(value: &str) -> bool {
+    (3..=63).contains(&value.len())
+        && !value.starts_with('-')
+        && !value.ends_with('-')
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+fn valid_blob_path(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 1_024
+        && !value.starts_with('/')
+        && !value.contains(['?', '#', '@', '\\'])
+        && value
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
 }
 
 impl RunInventory {
@@ -269,6 +342,13 @@ impl RunInventory {
         if self.namespace.uid.as_deref().is_some_and(|uid| !valid_uid(uid)) {
             bail!("custody namespace UID must be a nonzero canonical UUID");
         }
+        if let Some(destination) = &self.evidence_destination
+            && (!valid_storage_account(&destination.account)
+                || !valid_storage_container(&destination.container)
+                || !valid_blob_path(&destination.blob_prefix))
+        {
+            bail!("invalid credential-free custody evidence destination");
+        }
         let mut keys = BTreeSet::new();
         for resource in &self.resources {
             if resource.namespace != self.namespace.name
@@ -280,7 +360,12 @@ impl RunInventory {
                     .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'.')
                 || !matches!(
                     (resource.api_version.as_str(), resource.kind.as_str()),
-                    ("apps/v1", "Deployment") | ("batch/v1", "Job") | ("v1", "Pod")
+                    ("apps/v1", "Deployment" | "StatefulSet" | "DaemonSet")
+                        | ("batch/v1", "Job")
+                        | (
+                            "v1",
+                            "Pod" | "Service" | "ConfigMap" | "ServiceAccount" | "PersistentVolumeClaim" | "Secret",
+                        )
                 )
                 || !keys.insert((&resource.api_version, &resource.kind, &resource.name))
             {
@@ -314,6 +399,49 @@ impl RunInventory {
             }
         }
         if let Some(fic) = &self.fic {
+            if let Some(plan) = &fic.plan {
+                let valid_text = |value: &str, limit: usize| {
+                    !value.is_empty() && value.len() <= limit && !value.bytes().any(|byte| byte.is_ascii_control())
+                };
+                let valid_resource_id =
+                    |value: &str| value.starts_with("/subscriptions/") && !value.contains(['?', '#']);
+                let valid_uuid = |value: &str| {
+                    uuid::Uuid::parse_str(value).is_ok_and(|parsed| !parsed.is_nil() && parsed.to_string() == value)
+                };
+                let valid_service_account = |value: &str| {
+                    (1..=63).contains(&value.len())
+                        && value
+                            .bytes()
+                            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+                        && value.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric)
+                        && value.as_bytes().last().is_some_and(u8::is_ascii_alphanumeric)
+                };
+                if plan.version != 1
+                    || plan.run_id != self.cell_run_id
+                    || plan.namespace != self.namespace.name
+                    || !valid_service_account(&plan.service_account)
+                    || !valid_resource_id(&plan.identity_id)
+                    || !valid_resource_id(&plan.resource_id)
+                    || !valid_resource_id(&plan.aks_id)
+                    || !valid_uuid(&plan.client_id)
+                    || !valid_uuid(&plan.tenant_id)
+                    || !valid_text(&plan.server, 2_048)
+                    || !valid_text(&plan.issuer, 2_048)
+                    || !valid_text(&plan.subject, 512)
+                    || !valid_text(&plan.audience, 2_048)
+                    || !valid_text(&plan.credential_name, 120)
+                    || !plan
+                        .resource_id
+                        .ends_with(&format!("/federatedIdentityCredentials/{}", plan.credential_name))
+                    || plan.subject != format!("system:serviceaccount:{}:{}", plan.namespace, plan.service_account)
+                    || fic.resource_id.as_ref().is_some_and(|value| value != &plan.resource_id)
+                    || fic.name.as_ref().is_some_and(|value| value != &plan.credential_name)
+                {
+                    bail!(
+                        "FIC plan must match the exact cell, namespace, service account and recorded credential identity"
+                    );
+                }
+            }
             if fic.state == InventoryResourceState::Absent {
                 let receipt = fic
                     .absence
@@ -363,6 +491,36 @@ impl RunInventory {
                 || (qap.state == InventoryResourceState::Planned && !qap.absence.is_empty())
             {
                 bail!("QAP absence requires exact, unique not-found receipts for the planned bindings");
+            }
+            if let Some(reference) = &qap.reference {
+                let valid_nonce = |value: &str| {
+                    (1..=128).contains(&value.len())
+                        && value.bytes().all(|byte| {
+                            byte.is_ascii_lowercase()
+                                || byte.is_ascii_uppercase()
+                                || byte.is_ascii_digit()
+                                || byte == b'-'
+                        })
+                };
+                if reference.schema_version != 1
+                    || reference.run_id != self.cell_run_id
+                    || self.namespace.uid.as_deref() != Some(reference.namespace_uid.as_str())
+                    || reference.namespace_owner_token != self.namespace.owner_token
+                    || !valid_storage_account(&reference.account)
+                    || !valid_storage_container(&reference.container)
+                    || !valid_blob_path(&reference.blob)
+                    || !valid_nonce(&reference.nonce)
+                    || reference.manifest_sha256.len() != 64
+                    || !reference
+                        .manifest_sha256
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                    || !valid_uid(&reference.namespace_uid)
+                {
+                    bail!(
+                        "QAP reference must match the exact run, namespace UID, immutable owner and safe blob identity"
+                    );
+                }
             }
             let safe_identifier = |value: &str| {
                 !value.is_empty()
@@ -502,8 +660,18 @@ impl RunInventory {
                 bail!("custody update changed an established resource identity");
             }
         }
+        if self
+            .evidence_destination
+            .as_ref()
+            .is_some_and(|value| next.evidence_destination.as_ref() != Some(value))
+        {
+            bail!("custody update changed its evidence destination");
+        }
         if let Some(old) = &self.fic {
             let new = next.fic.as_ref().context("custody update dropped the FIC")?;
+            if old.plan.as_ref().is_some_and(|plan| new.plan.as_ref() != Some(plan)) {
+                bail!("custody update changed an established FIC plan");
+            }
             if old.name.as_ref().is_some_and(|value| new.name.as_ref() != Some(value))
                 || old
                     .resource_id
@@ -524,8 +692,12 @@ impl RunInventory {
                 || old.bindings.iter().any(|binding| !new.bindings.contains(binding))
                 || !old.state.can_advance_to(new.state)
                 || old.absence.iter().any(|receipt| !new.absence.contains(receipt))
+                || old
+                    .reference
+                    .as_ref()
+                    .is_some_and(|reference| new.reference.as_ref() != Some(reference))
             {
-                bail!("custody update changed an established QAP identity");
+                bail!("custody update changed an established QAP identity or reference");
             }
         }
         for (old, new) in [
@@ -542,7 +714,7 @@ impl RunInventory {
         Ok(())
     }
 
-    fn validate_custody_receipt(&self, output: &[u8], ready: bool) -> Result<()> {
+    fn validate_custody_receipt(&self, output: &[u8], ready: bool) -> Result<Option<String>> {
         let response: Value = serde_json::from_slice(output).context("invalid custody receipt JSON")?;
         if response["ok"] != true {
             let code = match response["code"].as_str() {
@@ -576,15 +748,28 @@ impl RunInventory {
         {
             bail!("custody persistence receipt is incomplete or does not match inventory");
         }
-        Ok(())
+        let etag = if ready {
+            None
+        } else {
+            Some(
+                receipt
+                    .get("etag")
+                    .and_then(Value::as_str)
+                    .context("custody persistence receipt omitted ETag")?
+                    .to_owned(),
+            )
+        };
+        Ok(etag)
     }
 
     /// Publish this inventory and require the fenced store's matching persistence receipt.
     ///
     /// # Errors
     /// Refuses unconfirmed writes and mismatched or fenced receipts without retrying.
-    pub async fn publish_to_custody(&self) -> Result<()> {
-        self.custody_command(false).await
+    pub async fn publish_to_custody(&self) -> Result<String> {
+        self.custody_command(false)
+            .await?
+            .context("custody publisher did not return an ETag")
     }
 
     /// Verify that the fenced store has armed this exact cell before load starts.
@@ -592,11 +777,11 @@ impl RunInventory {
     /// # Errors
     /// Refuses an unready or mismatched receipt.
     pub async fn assert_custody_ready(&self) -> Result<()> {
-        self.custody_command(true).await
+        self.custody_command(true).await.map(|_| ())
     }
 
     #[cfg(unix)]
-    async fn custody_command(&self, ready: bool) -> Result<()> {
+    async fn custody_command(&self, ready: bool) -> Result<Option<String>> {
         self.validate()?;
         let payload = if ready {
             None
@@ -639,7 +824,7 @@ impl RunInventory {
         .await
         .context("custody command timed out; write outcome may be unknown and must not be retried")??;
         if !output.status.success() {
-            return self.validate_custody_receipt(&output.stdout, ready).and_then(|()| {
+            return self.validate_custody_receipt(&output.stdout, ready).and_then(|_| {
                 Err(anyhow::anyhow!(
                     "custody command exited unsuccessfully despite a success-shaped receipt"
                 ))
@@ -649,7 +834,7 @@ impl RunInventory {
     }
 
     #[cfg(not(unix))]
-    async fn custody_command(&self, _ready: bool) -> Result<()> {
+    async fn custody_command(&self, _ready: bool) -> Result<Option<String>> {
         bail!("fenced custody requires Unix process-group cancellation")
     }
 }
@@ -738,10 +923,10 @@ trait Platform: Send + Sync {
         Ok((self.router_metrics_endpoint(config)?, false))
     }
     fn qap_endpoint(&self, config: &OatConfig) -> String;
-    async fn ensure_stack(&mut self, config: &OatConfig) -> Result<()>;
+    async fn ensure_stack(&mut self, config: &OatConfig, orchestration_run_id: &str) -> Result<()>;
     async fn scale_arrowcols(&mut self, config: &OatConfig, replicas: u32, concurrency: u32) -> Result<()>;
     async fn initialize_run_table_pins(
-        &self,
+        &mut self,
         config: &OatConfig,
         run_id: &str,
         expected_keys_json: &str,
@@ -752,9 +937,9 @@ trait Platform: Send + Sync {
     fn qap_database(&self, config: &OatConfig) -> Result<String>;
     async fn initialize_qap(&mut self, config: &OatConfig, run_id: &str, tables: &[String]) -> Result<Vec<String>>;
     fn mark_qap_outcome_unresolved(&mut self) {}
-    async fn prepare_client_fleet(&self, config: &OatConfig, run_id: &str) -> Result<()>;
+    async fn prepare_client_fleet(&mut self, config: &OatConfig, run_id: &str) -> Result<()>;
     async fn start_client(
-        &self,
+        &mut self,
         config: &OatConfig,
         run_id: &str,
         table: &str,
@@ -768,7 +953,7 @@ trait Platform: Send + Sync {
             .into_iter()
             .collect()
     }
-    async fn arm_clients(&self, config: &OatConfig, run_id: &str, run_start_unix_ms: u64) -> Result<()>;
+    async fn arm_clients(&mut self, config: &OatConfig, run_id: &str, run_start_unix_ms: u64) -> Result<()>;
     async fn finish_client(&self, config: &OatConfig, handle: ClientHandle) -> Result<String>;
     async fn cancel_client(&self, config: &OatConfig, handle: &ClientHandle) -> Result<()>;
     fn resource_sampler_source(&self) -> Option<ResourceSamplerSource> {
@@ -928,10 +1113,10 @@ impl Platform for AksPlatform {
         config.qap_endpoint.clone()
     }
 
-    async fn ensure_stack(&mut self, config: &OatConfig) -> Result<()> {
-        prepare_aks_platform(config, self).await?;
+    async fn ensure_stack(&mut self, config: &OatConfig, orchestration_run_id: &str) -> Result<()> {
+        prepare_aks_platform(config, self, orchestration_run_id).await?;
         if let Some(overlay) = config.platform.kustomize_overlay.as_deref() {
-            apply_aks_overlay(config, overlay).await?;
+            apply_aks_overlay(config, overlay, self).await?;
         }
         Ok(())
     }
@@ -945,7 +1130,7 @@ impl Platform for AksPlatform {
     }
 
     async fn initialize_run_table_pins(
-        &self,
+        &mut self,
         config: &OatConfig,
         run_id: &str,
         expected_keys_json: &str,
@@ -1037,8 +1222,8 @@ impl Platform for AksPlatform {
         self.qap_outcome_unresolved = true;
     }
 
-    async fn prepare_client_fleet(&self, config: &OatConfig, _run_id: &str) -> Result<()> {
-        let payload = serde_json::to_vec(&json!({
+    async fn prepare_client_fleet(&mut self, config: &OatConfig, _run_id: &str) -> Result<()> {
+        let mut configmap = json!({
             "apiVersion": "v1",
             "kind": "ConfigMap",
             "metadata": {
@@ -1053,15 +1238,17 @@ impl Platform for AksPlatform {
                 },
             },
             "data": { "schedule": "pending" },
-        }))?;
+        });
+        prepare_run_owned_resources(config, self, std::slice::from_mut(&mut configmap)).await?;
+        let payload = serde_json::to_vec(&configmap)?;
         kubectl(config, vec!["create", "-f", "-"], Some(payload))
             .await
-            .context("create unique AKS client schedule ConfigMap")
-            .map(|_| ())
+            .context("create unique AKS client schedule ConfigMap")?;
+        record_applied_resource_uids(config, self, std::slice::from_ref(&configmap)).await
     }
 
     async fn start_client(
-        &self,
+        &mut self,
         config: &OatConfig,
         run_id: &str,
         table: &str,
@@ -1079,8 +1266,8 @@ impl Platform for AksPlatform {
         poll_aks_client_fleet(config, self, handles).await
     }
 
-    async fn arm_clients(&self, config: &OatConfig, _run_id: &str, run_start_unix_ms: u64) -> Result<()> {
-        let payload = serde_json::to_vec(&json!({
+    async fn arm_clients(&mut self, config: &OatConfig, _run_id: &str, run_start_unix_ms: u64) -> Result<()> {
+        let mut configmap = json!({
             "apiVersion": "v1",
             "kind": "ConfigMap",
             "metadata": {
@@ -1095,15 +1282,17 @@ impl Platform for AksPlatform {
                 },
             },
             "data": { "schedule": run_start_unix_ms.to_string() },
-        }))?;
+        });
+        prepare_run_owned_resources(config, self, std::slice::from_mut(&mut configmap)).await?;
+        let payload = serde_json::to_vec(&configmap)?;
         kubectl(
             config,
             vec!["apply", "--namespace", &config.namespace, "-f", "-"],
             Some(payload),
         )
         .await
-        .context("arm the common AKS client measurement schedule")
-        .map(|_| ())
+        .context("arm the common AKS client measurement schedule")?;
+        record_applied_resource_uids(config, self, std::slice::from_ref(&configmap)).await
     }
 
     async fn finish_client(&self, config: &OatConfig, handle: ClientHandle) -> Result<String> {
@@ -1160,7 +1349,7 @@ impl Platform for LocalPlatform {
         self.qap_url.clone().unwrap_or_else(|| config.qap_endpoint.clone())
     }
 
-    async fn ensure_stack(&mut self, config: &OatConfig) -> Result<()> {
+    async fn ensure_stack(&mut self, config: &OatConfig, _orchestration_run_id: &str) -> Result<()> {
         self.daemon_endpoint = Some(local_docker_daemon().await?);
         prepare_local_platform(config, self).await?;
         self.router_metrics_url = Some(local_compose_endpoint(config, self, "router", "50050", "/metrics").await?);
@@ -1183,7 +1372,7 @@ impl Platform for LocalPlatform {
     }
 
     async fn initialize_run_table_pins(
-        &self,
+        &mut self,
         config: &OatConfig,
         run_id: &str,
         expected_keys_json: &str,
@@ -1238,14 +1427,14 @@ impl Platform for LocalPlatform {
         Ok(bindings.iter().map(|binding| binding.external_table.clone()).collect())
     }
 
-    async fn prepare_client_fleet(&self, _config: &OatConfig, _run_id: &str) -> Result<()> {
+    async fn prepare_client_fleet(&mut self, _config: &OatConfig, _run_id: &str) -> Result<()> {
         tokio::fs::write(self.control_dir.join("schedule"), "pending\n")
             .await
             .context("reset local OAT client schedule barrier")
     }
 
     async fn start_client(
-        &self,
+        &mut self,
         config: &OatConfig,
         run_id: &str,
         table: &str,
@@ -1263,7 +1452,7 @@ impl Platform for LocalPlatform {
         poll_local_client_fleet(handles, &self.client_progress).await
     }
 
-    async fn arm_clients(&self, _config: &OatConfig, _run_id: &str, run_start_unix_ms: u64) -> Result<()> {
+    async fn arm_clients(&mut self, _config: &OatConfig, _run_id: &str, run_start_unix_ms: u64) -> Result<()> {
         let temporary = self.control_dir.join("schedule.tmp");
         tokio::fs::write(&temporary, format!("{run_start_unix_ms}\n"))
             .await
@@ -1767,7 +1956,7 @@ fn write_private_secret(path: &Path, contents: &str) -> Result<()> {
 
 async fn start_aks_client_job(
     config: &OatConfig,
-    platform: &AksPlatform,
+    platform: &mut AksPlatform,
     run_id: &str,
     table: &str,
     client_index: usize,
@@ -1798,6 +1987,7 @@ async fn start_aks_client_job(
             .context("AKS client container is missing")?,
         &role_environment(config, ComponentRole::Client)?,
     )?;
+    prepare_run_owned_resources(config, platform, std::slice::from_mut(&mut job)).await?;
     let payload = serde_json::to_vec(&job)?;
     kubectl(
         config,
@@ -1806,6 +1996,7 @@ async fn start_aks_client_job(
     )
     .await
     .with_context(|| format!("create AKS DMV client Job {job_name}"))?;
+    record_applied_resource_uids(config, platform, std::slice::from_ref(&job)).await?;
     Ok(ClientHandle {
         client_id: format!("{run_id}:{table}:{client_index}"),
         table: table.to_owned(),
@@ -2409,7 +2600,7 @@ async fn run_isolated_cell(
     };
     let (result, cancelled) = tokio::select! {
         result = async {
-            match platform.ensure_stack(&config).await {
+            match platform.ensure_stack(&config, orchestration_id).await {
                 Ok(()) => {
                     run_matrix_cell(
                         &config,
@@ -5151,7 +5342,7 @@ async fn run_local_pin_setup(
 
 async fn run_aks_pin_setup_job(
     config: &OatConfig,
-    platform: &AksPlatform,
+    platform: &mut AksPlatform,
     run_id: &str,
     expected_keys_json: &str,
     expires_at_unix_ms: u64,
@@ -5279,9 +5470,16 @@ async fn run_aks_pin_setup_job(
             },
         }],
     }))?;
-    kubectl(config, vec!["create", "-f", "-"], Some(payload))
+    let mut manifest: Value = serde_json::from_slice(&payload).context("parse pin initialization resources")?;
+    let items = manifest["items"]
+        .as_array_mut()
+        .context("pin initialization resource list is missing")?;
+    prepare_run_owned_resources(config, platform, items).await?;
+    let planned_resources = items.clone();
+    kubectl(config, vec!["create", "-f", "-"], Some(serde_json::to_vec(&manifest)?))
         .await
         .context("create finite AKS OAT pin initialization Job")?;
+    record_applied_resource_uids(config, platform, &planned_resources).await?;
 
     wait_for_aks_pin_setup(config, &job_name, run_id).await?;
     kubectl(
@@ -6404,7 +6602,7 @@ async fn deployment(config: &OatConfig, name: &str) -> Result<Value> {
     serde_json::from_str(&output).with_context(|| format!("parse Deployment {name} JSON"))
 }
 
-async fn apply_aks_overlay(config: &OatConfig, overlay: &str) -> Result<()> {
+async fn apply_aks_overlay(config: &OatConfig, overlay: &str, platform: &mut AksPlatform) -> Result<()> {
     let rendered = kubectl(config, vec!["kustomize", overlay], None)
         .await
         .context("render configured AKS Kustomize overlay")?;
@@ -6439,14 +6637,18 @@ async fn apply_aks_overlay(config: &OatConfig, overlay: &str) -> Result<()> {
     }
     let allowed_names = config.deployment_names().into_iter().map(str::to_owned).collect();
     validate_aks_overlay_resources(&resources, &allowed_names, &config.namespace)?;
+    prepare_run_owned_resources(config, platform, &mut resources).await?;
 
     kubectl(
         config,
         vec!["apply", "--namespace", &config.namespace, "-f", "-"],
-        Some(rendered.into_bytes()),
+        Some(serde_json::to_vec(
+            &json!({"apiVersion":"v1", "kind":"List", "items":resources}),
+        )?),
     )
     .await
     .context("apply configured AKS Kustomize overlay")?;
+    record_applied_resource_uids(config, platform, &resources).await?;
     Ok(())
 }
 
@@ -6617,7 +6819,108 @@ fn namespace_uid_for_cleanup(namespace: &Value, expected_uid: Option<&str>) -> R
     Ok(uid.to_owned())
 }
 
-async fn prepare_aks_platform(config: &OatConfig, platform: &mut AksPlatform) -> Result<()> {
+async fn persist_campaign_inventory(platform: &AksPlatform, inventory: &RunInventory) -> Result<()> {
+    let runtime_dir = platform
+        .runtime_dir
+        .as_deref()
+        .context("campaign runtime directory is not available")?;
+    let etag = inventory.publish_to_custody().await?;
+    tokio::fs::write(
+        runtime_dir.join("campaign-inventory.json"),
+        serde_json::to_vec(inventory)?,
+    )
+    .await
+    .context("persist confirmed campaign inventory")?;
+    tokio::fs::write(runtime_dir.join("campaign-inventory-etag"), etag.as_bytes())
+        .await
+        .context("persist confirmed campaign inventory ETag")?;
+    Ok(())
+}
+
+async fn initialize_campaign_inventory(
+    config: &OatConfig,
+    platform: &mut AksPlatform,
+    orchestration_run_id: &str,
+) -> Result<()> {
+    let identity = CampaignIdentity::from_lookup(|name| std::env::var(name).ok())?;
+    platform.namespace_owner_token = identity.owner_id.clone();
+    let account = std::env::var("CAMPAIGN_STORAGE_ACCOUNT")
+        .context("CAMPAIGN_STORAGE_ACCOUNT is required for campaign evidence custody")?;
+    let container = std::env::var("CAMPAIGN_STATE_CONTAINER")
+        .context("CAMPAIGN_STATE_CONTAINER is required for campaign evidence custody")?;
+    let step = || InventoryStep {
+        state: InventoryStepState::NotStarted,
+        deadline_unix_ms: None,
+        reason_code: None,
+    };
+    let inventory = RunInventory {
+        schema_version: 1,
+        campaign_id: identity.campaign_id.clone(),
+        owner_id: identity.owner_id.clone(),
+        fencing_token: identity.fencing_token,
+        orchestration_run_id: orchestration_run_id.to_owned(),
+        cell_run_id: platform.run_id.clone(),
+        namespace: InventoryNamespace {
+            name: config.namespace.clone(),
+            uid: None,
+            owner_token: identity.owner_id,
+        },
+        resources: Vec::new(),
+        fic: None,
+        qap: None,
+        evidence_destination: Some(InventoryEvidenceDestination {
+            account,
+            container,
+            blob_prefix: format!("campaigns/{}/cells/{}/evidence", identity.campaign_id, platform.run_id),
+        }),
+        cleanup: InventoryCleanup {
+            stop_admission: step(),
+            bounded_drain: step(),
+            evidence_capture: step(),
+            terminal_capture: step(),
+            handoff: step(),
+        },
+    };
+    inventory.validate()?;
+    persist_campaign_inventory(platform, &inventory).await
+}
+
+async fn record_campaign_namespace_uid(config: &OatConfig, platform: &AksPlatform) -> Result<()> {
+    if config.campaign_profile != Some(crate::config::CampaignProfile::SingleHotTable) {
+        return Ok(());
+    }
+    let runtime_dir = platform
+        .runtime_dir
+        .as_deref()
+        .context("campaign runtime directory is not available")?;
+    let path = runtime_dir.join("campaign-inventory.json");
+    let current: RunInventory = serde_json::from_slice(
+        &tokio::fs::read(&path)
+            .await
+            .context("read last confirmed campaign inventory")?,
+    )
+    .context("parse last confirmed campaign inventory")?;
+    let uid = platform
+        .namespace_uid
+        .as_deref()
+        .context("created campaign namespace has no UID")?;
+    if current.namespace.name != config.namespace || current.namespace.owner_token != platform.namespace_owner_token {
+        bail!("campaign inventory does not match the created namespace ownership");
+    }
+    if current.namespace.uid.as_deref().is_some_and(|existing| existing != uid) {
+        bail!("campaign namespace UID changed after inventory publication");
+    }
+    let mut next = current.clone();
+    next.namespace.uid = Some(uid.to_owned());
+    next.validate_successor(&current)?;
+    persist_campaign_inventory(platform, &next).await
+}
+
+async fn prepare_aks_platform(
+    config: &OatConfig,
+    platform: &mut AksPlatform,
+    orchestration_run_id: &str,
+) -> Result<()> {
     let parent = std::env::temp_dir().join("arrowcol-oat");
     tokio::fs::create_dir_all(&parent)
         .await
@@ -6634,6 +6937,9 @@ async fn prepare_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
             .context("restrict run-specific AKS runtime directory permissions")?;
     }
     platform.runtime_dir = Some(runtime_dir.clone());
+    if config.campaign_profile == Some(crate::config::CampaignProfile::SingleHotTable) {
+        initialize_campaign_inventory(config, platform, orchestration_run_id).await?;
+    }
 
     let runtime_config_path = PathBuf::from(
         config
@@ -6736,6 +7042,7 @@ async fn prepare_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
         bail!("created AKS namespace is missing this run's ownership label");
     }
     platform.namespace_uid = Some(uid.to_owned());
+    record_campaign_namespace_uid(config, platform).await?;
 
     let service_accounts = identity
         .into_iter()
@@ -6751,7 +7058,7 @@ async fn prepare_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
         .context("rendered workload identity ServiceAccount has no name")?
         .to_owned();
     platform.service_account = Some(service_account.clone());
-    apply_runtime_resources(config, service_accounts).await?;
+    apply_runtime_resources(config, platform, service_accounts).await?;
     let fic_record = runtime_dir.join(format!("run-fic-{}.json", platform.run_id));
     platform.fic_record_path = Some(fic_record.clone());
     platform.fic_prepare_attempted = true;
@@ -6785,14 +7092,14 @@ async fn prepare_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
     write_private_secret(&ready_snapshot, &ready_record)
         .context("persist immutable ready run-owned workload identity snapshot")?;
     platform.fic_ready_snapshot_path = Some(ready_snapshot);
-    create_runtime_secrets(config, &secrets_dir).await?;
+    create_runtime_secrets(config, platform, &secrets_dir).await?;
 
     let foundation = render_runtime_phase(&runtime_script, &generated_config, "foundation", &runtime_dir).await?;
-    apply_runtime_resources(config, without_identity_resources(foundation)).await?;
+    apply_runtime_resources(config, platform, without_identity_resources(foundation)).await?;
     rollout(config, "arrowcol-sql").await?;
 
     let bootstrap = render_runtime_phase(&runtime_script, &generated_config, "bootstrap", &runtime_dir).await?;
-    apply_runtime_resources(config, without_identity_resources(bootstrap)).await?;
+    apply_runtime_resources(config, platform, without_identity_resources(bootstrap)).await?;
     kubectl(
         config,
         vec![
@@ -6830,9 +7137,9 @@ async fn prepare_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
         .context("validate rendered router YAML with the router config validator")?;
     platform.router_yaml = Some(router_yaml);
     let (catalog, data_plane) = partition_aks_workload_resources(without_identity_resources(workload))?;
-    apply_runtime_resources(config, catalog).await?;
+    apply_runtime_resources(config, platform, catalog).await?;
     rollout(config, "arrowcol-catalog").await?;
-    apply_runtime_resources(config, data_plane).await?;
+    apply_runtime_resources(config, platform, data_plane).await?;
     for name in ["arrowcol", "arrowcol-router"] {
         rollout(config, name).await?;
     }
@@ -7544,10 +7851,264 @@ async fn run_npx_runtime(runtime_script: &Path, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-async fn apply_runtime_resources(config: &OatConfig, resources: Vec<Value>) -> Result<()> {
+fn set_origin_markers(metadata: &mut Value, run_id: &str, owner_token: &str) -> Result<()> {
+    let metadata = metadata
+        .as_object_mut()
+        .context("run-owned Kubernetes metadata must be an object")?;
+    for key in ["labels", "annotations"] {
+        let values = metadata.entry(key).or_insert_with(|| json!({}));
+        let values = values
+            .as_object_mut()
+            .context("run-owned Kubernetes metadata labels and annotations must be objects")?;
+        values.insert("arrowcol-oat/run-id".to_owned(), json!(run_id));
+        values.insert("arrowcol-oat/owner-token".to_owned(), json!(owner_token));
+    }
+    Ok(())
+}
+
+fn stamp_run_origin_markers(
+    resource: &mut Value,
+    expected_namespace: &str,
+    run_id: &str,
+    owner_token: &str,
+) -> Result<()> {
+    let kind = resource
+        .get("kind")
+        .and_then(Value::as_str)
+        .context("run-owned Kubernetes resource has no kind")?
+        .to_owned();
+    let metadata = resource
+        .get("metadata")
+        .and_then(Value::as_object)
+        .context("run-owned Kubernetes resource has no metadata object")?
+        .clone();
+    if metadata.get("namespace").and_then(Value::as_str) != Some(expected_namespace)
+        || metadata.get("name").and_then(Value::as_str).is_none_or(str::is_empty)
+    {
+        bail!("run-owned Kubernetes resource must have its exact namespace and name before apply");
+    }
+    let mut metadata_value = Value::Object(metadata);
+    set_origin_markers(&mut metadata_value, run_id, owner_token)?;
+    resource["metadata"] = metadata_value;
+    if matches!(kind.as_str(), "Deployment" | "StatefulSet" | "DaemonSet" | "Job") {
+        let template_metadata = resource
+            .pointer_mut("/spec/template/metadata")
+            .context("pod-bearing run-owned resource has no pod template metadata")?;
+        set_origin_markers(template_metadata, run_id, owner_token)?;
+    }
+    Ok(())
+}
+
+fn planned_inventory_resource(resource: &Value, namespace: &str) -> Result<InventoryResource> {
+    let api_version = resource
+        .get("apiVersion")
+        .and_then(Value::as_str)
+        .context("resource apiVersion is missing")?;
+    let kind = resource
+        .get("kind")
+        .and_then(Value::as_str)
+        .context("resource kind is missing")?;
+    let metadata = resource.get("metadata").context("resource metadata is missing")?;
+    let resource_namespace = metadata
+        .get("namespace")
+        .and_then(Value::as_str)
+        .context("resource namespace is missing")?;
+    let name = metadata
+        .get("name")
+        .and_then(Value::as_str)
+        .context("resource name is missing")?;
+    if resource_namespace != namespace {
+        bail!("run-owned resource namespace does not match the OAT cell");
+    }
+    let app = metadata
+        .pointer("/labels/app")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let role = if kind == "Job" && app == "arrowcol-oat-client" {
+        InventoryResourceRole::Client
+    } else if name == "delta-maintenance" {
+        InventoryResourceRole::Maintenance
+    } else if name.contains("router") || app.contains("router") {
+        InventoryResourceRole::Router
+    } else {
+        InventoryResourceRole::Collector
+    };
+    Ok(InventoryResource {
+        api_version: api_version.to_owned(),
+        kind: kind.to_owned(),
+        namespace: resource_namespace.to_owned(),
+        name: name.to_owned(),
+        uid: None,
+        role,
+        state: InventoryResourceState::Planned,
+        absence: None,
+    })
+}
+
+fn has_origin_markers(metadata: &Value, run_id: &str, owner_token: &str) -> bool {
+    ["labels", "annotations"].into_iter().all(|field| {
+        metadata.get(field).and_then(Value::as_object).is_some_and(|values| {
+            values.get("arrowcol-oat/run-id").and_then(Value::as_str) == Some(run_id)
+                && values.get("arrowcol-oat/owner-token").and_then(Value::as_str) == Some(owner_token)
+        })
+    })
+}
+
+async fn record_applied_resource_uids(config: &OatConfig, platform: &AksPlatform, resources: &[Value]) -> Result<()> {
+    if config.campaign_profile != Some(crate::config::CampaignProfile::SingleHotTable) {
+        return Ok(());
+    }
+    let payload = serde_json::to_vec(&json!({"apiVersion":"v1", "kind":"List", "items":resources}))?;
+    let output = kubectl(
+        config,
+        vec!["get", "--namespace", &config.namespace, "-f", "-", "-o", "json"],
+        Some(payload),
+    )
+    .await
+    .context("read back exact run-owned Kubernetes resources after apply")?;
+    let response: Value = serde_json::from_str(&output).context("parse applied Kubernetes resource readback")?;
+    let observed = response
+        .get("items")
+        .and_then(Value::as_array)
+        .context("Kubernetes resource readback is not a List")?;
+    if observed.len() != resources.len() {
+        bail!("Kubernetes resource readback did not return every planned identity");
+    }
+    let runtime_dir = platform
+        .runtime_dir
+        .as_deref()
+        .context("campaign runtime directory is not available")?;
+    let inventory_path = runtime_dir.join("campaign-inventory.json");
+    let current: RunInventory = serde_json::from_slice(
+        &tokio::fs::read(&inventory_path)
+            .await
+            .context("read last confirmed campaign inventory")?,
+    )
+    .context("parse last confirmed campaign inventory")?;
+    if current.namespace.uid.as_deref() != platform.namespace_uid.as_deref()
+        || current.namespace.owner_token != platform.namespace_owner_token
+    {
+        bail!("campaign inventory namespace identity changed before resource UID readback");
+    }
+    let mut next = current.clone();
+    let mut seen = BTreeSet::new();
+    for rendered in resources {
+        let planned = planned_inventory_resource(rendered, &config.namespace)?;
+        let identity = (
+            planned.api_version.clone(),
+            planned.kind.clone(),
+            planned.namespace.clone(),
+            planned.name.clone(),
+        );
+        if !seen.insert(identity) {
+            bail!("duplicate run-owned Kubernetes identity in applied resource set");
+        }
+        let actual = observed
+            .iter()
+            .find(|resource| {
+                resource.get("apiVersion").and_then(Value::as_str) == Some(planned.api_version.as_str())
+                    && resource.get("kind").and_then(Value::as_str) == Some(planned.kind.as_str())
+                    && resource.pointer("/metadata/namespace").and_then(Value::as_str)
+                        == Some(planned.namespace.as_str())
+                    && resource.pointer("/metadata/name").and_then(Value::as_str) == Some(planned.name.as_str())
+            })
+            .context("Kubernetes readback identity differs from the planned resource")?;
+        let uid = actual
+            .pointer("/metadata/uid")
+            .and_then(Value::as_str)
+            .context("Kubernetes readback omitted the resource UID")?;
+        if !has_origin_markers(&actual["metadata"], &platform.run_id, &platform.namespace_owner_token) {
+            bail!("Kubernetes readback resource is missing the exact origin markers");
+        }
+        if matches!(
+            planned.kind.as_str(),
+            "Deployment" | "StatefulSet" | "DaemonSet" | "Job"
+        ) && !actual
+            .pointer("/spec/template/metadata")
+            .is_some_and(|metadata| has_origin_markers(metadata, &platform.run_id, &platform.namespace_owner_token))
+        {
+            bail!("Kubernetes readback pod template is missing the exact origin markers");
+        }
+        let stored = next
+            .resources
+            .iter_mut()
+            .find(|resource| {
+                resource.api_version == planned.api_version
+                    && resource.kind == planned.kind
+                    && resource.namespace == planned.namespace
+                    && resource.name == planned.name
+            })
+            .context("planned Kubernetes identity is missing from campaign inventory")?;
+        if stored.state == InventoryResourceState::Removed || stored.state == InventoryResourceState::Absent {
+            bail!("removed Kubernetes identity cannot be applied again");
+        }
+        stored.uid = Some(uid.to_owned());
+        stored.state = InventoryResourceState::Observed;
+    }
+    next.validate_successor(&current)?;
+    persist_campaign_inventory(platform, &next).await
+}
+
+async fn prepare_run_owned_resources(
+    config: &OatConfig,
+    platform: &mut AksPlatform,
+    resources: &mut [Value],
+) -> Result<()> {
+    for resource in resources.iter_mut() {
+        stamp_run_origin_markers(
+            resource,
+            &config.namespace,
+            &platform.run_id,
+            &platform.namespace_owner_token,
+        )?;
+    }
+    if config.campaign_profile != Some(crate::config::CampaignProfile::SingleHotTable) {
+        return Ok(());
+    }
+    let runtime_dir = platform
+        .runtime_dir
+        .as_deref()
+        .context("campaign runtime directory is not available")?;
+    let inventory_path = runtime_dir.join("campaign-inventory.json");
+    let current: RunInventory = serde_json::from_slice(
+        &tokio::fs::read(&inventory_path)
+            .await
+            .context("read last confirmed campaign inventory")?,
+    )
+    .context("parse last confirmed campaign inventory")?;
+    if current.namespace.name != config.namespace
+        || current.namespace.uid.as_deref() != platform.namespace_uid.as_deref()
+        || current.namespace.owner_token != platform.namespace_owner_token
+        || current.cell_run_id != platform.run_id
+    {
+        bail!("campaign inventory does not match the live cell namespace and owner");
+    }
+    let mut next = current.clone();
+    for resource in resources {
+        let planned = planned_inventory_resource(resource, &config.namespace)?;
+        if let Some(existing) = next.resources.iter().find(|item| {
+            item.api_version == planned.api_version && item.kind == planned.kind && item.name == planned.name
+        }) {
+            if existing.role != planned.role {
+                bail!("planned resource identity changed role within the run inventory");
+            }
+        } else {
+            next.resources.push(planned);
+        }
+    }
+    next.validate_successor(&current)?;
+    persist_campaign_inventory(platform, &next).await
+}
+
+async fn apply_runtime_resources(
+    config: &OatConfig,
+    platform: &mut AksPlatform,
+    mut resources: Vec<Value>,
+) -> Result<()> {
     if resources.is_empty() {
         bail!("refusing to apply an empty AKS runtime phase");
     }
+    prepare_run_owned_resources(config, platform, &mut resources).await?;
     let payload = serde_json::to_vec(&serde_json::json!({
         "apiVersion": "v1",
         "kind": "List",
@@ -7560,10 +8121,11 @@ async fn apply_runtime_resources(config: &OatConfig, resources: Vec<Value>) -> R
     )
     .await
     .context("apply run-scoped AKS runtime resources")?;
+    record_applied_resource_uids(config, platform, &resources).await?;
     Ok(())
 }
 
-async fn create_runtime_secrets(config: &OatConfig, secrets_dir: &Path) -> Result<()> {
+async fn create_runtime_secrets(config: &OatConfig, platform: &mut AksPlatform, secrets_dir: &Path) -> Result<()> {
     let secret_specs: [(&str, &[(&str, &str)]); 5] = [
         ("arrowcol-sql-admin", &[("password", "sa-password")]),
         ("arrowcol-sql-runtime", &[("password", "app-password")]),
@@ -7581,9 +8143,16 @@ async fn create_runtime_secrets(config: &OatConfig, secrets_dir: &Path) -> Resul
             .map(|(key, file)| format!("--from-file={key}={}", secrets_dir.join(file).display()))
             .collect::<Vec<_>>();
         arguments.extend(from_files.iter().map(String::as_str));
-        kubectl(config, arguments, None)
+        arguments.extend(["--dry-run=client", "-o", "json"]);
+        let output = kubectl(config, arguments, None)
             .await
-            .with_context(|| format!("create run-scoped Kubernetes Secret {name} from private files"))?;
+            .with_context(|| format!("render run-scoped Kubernetes Secret {name} from private files"))?;
+        let mut secret: Value = serde_json::from_str(&output).context("parse rendered OAT Kubernetes Secret")?;
+        prepare_run_owned_resources(config, platform, std::slice::from_mut(&mut secret)).await?;
+        kubectl(config, vec!["create", "-f", "-"], Some(serde_json::to_vec(&secret)?))
+            .await
+            .with_context(|| format!("create run-scoped Kubernetes Secret {name}"))?;
+        record_applied_resource_uids(config, platform, std::slice::from_ref(&secret)).await?;
     }
     Ok(())
 }
@@ -9861,6 +10430,41 @@ mod tests {
         assert!(verify_aks_collector_stop_grace(&deployment, 300).is_ok());
         assert!(verify_aks_collector_stop_grace(&deployment, 301).is_err());
         assert!(verify_aks_collector_stop_grace(&json!({}), 300).is_err());
+    }
+
+    #[test]
+    fn run_owned_job_origin_markers_cover_metadata_and_template_without_changing_selectors() -> Result<()> {
+        let mut job = json!({
+            "apiVersion": "batch/v1",
+            "kind": "Job",
+            "metadata": {
+                "name": "oat-run-client-c0",
+                "namespace": "oat-run-1",
+                "labels": {"app": "arrowcol-oat-client"},
+            },
+            "spec": {
+                "selector": {"matchLabels": {"batch.kubernetes.io/controller-uid": "selector-value"}},
+                "template": {
+                    "metadata": {"labels": {"app": "arrowcol-oat-client"}},
+                    "spec": {"containers": []},
+                },
+            },
+        });
+        let selector = job["spec"]["selector"].clone();
+        super::stamp_run_origin_markers(&mut job, "oat-run-1", "run-1", "owner-1")?;
+        for metadata in [&job["metadata"], &job["spec"]["template"]["metadata"]] {
+            for field in ["labels", "annotations"] {
+                assert_eq!(metadata[field]["arrowcol-oat/run-id"], "run-1");
+                assert_eq!(metadata[field]["arrowcol-oat/owner-token"], "owner-1");
+            }
+        }
+        assert_eq!(job["spec"]["selector"], selector);
+        let planned = super::planned_inventory_resource(&job, "oat-run-1")?;
+        assert_eq!(planned.api_version, "batch/v1");
+        assert_eq!(planned.kind, "Job");
+        assert_eq!(planned.name, "oat-run-client-c0");
+        assert_eq!(planned.namespace, "oat-run-1");
+        Ok(())
     }
 
     #[test]

@@ -1039,13 +1039,13 @@ mod downstream_runner_tests {
         fn qap_endpoint(&self, _: &OatConfig) -> String {
             self.endpoint.clone()
         }
-        async fn ensure_stack(&mut self, _: &OatConfig) -> Result<()> {
+        async fn ensure_stack(&mut self, _: &OatConfig, _: &str) -> Result<()> {
             Ok(())
         }
         async fn scale_arrowcols(&mut self, _: &OatConfig, _: u32, _: u32) -> Result<()> {
             Ok(())
         }
-        async fn initialize_run_table_pins(&self, _: &OatConfig, _: &str, _: &str, _: u64, _: u64) -> Result<()> {
+        async fn initialize_run_table_pins(&mut self, _: &OatConfig, _: &str, _: &str, _: u64, _: u64) -> Result<()> {
             Ok(())
         }
         fn qap_observation_mode(&self) -> arrowcol_loadgen::ObservationMode {
@@ -1083,11 +1083,11 @@ mod downstream_runner_tests {
         fn mark_qap_outcome_unresolved(&mut self) {
             self.unresolved = true;
         }
-        async fn prepare_client_fleet(&self, _: &OatConfig, _: &str) -> Result<()> {
+        async fn prepare_client_fleet(&mut self, _: &OatConfig, _: &str) -> Result<()> {
             Ok(())
         }
         async fn start_client(
-            &self,
+            &mut self,
             _: &OatConfig,
             _: &str,
             table: &str,
@@ -1112,7 +1112,7 @@ mod downstream_runner_tests {
                 output: String::new(),
             })
         }
-        async fn arm_clients(&self, _: &OatConfig, _: &str, start: u64) -> Result<()> {
+        async fn arm_clients(&mut self, _: &OatConfig, _: &str, start: u64) -> Result<()> {
             self.start.store(start, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
