@@ -37,7 +37,7 @@ class Store implements CampaignStore {
 function fixture(t: TestContext, evidence = true) {
   const step = { state: 'not_started' as const, deadline_unix_ms: null, reason_code: null };
   const inventory: RunInventory = { schema_version: 1, campaign_id: campaignId, owner_id: ownerId, fencing_token: 1,
-    orchestration_run_id: campaignId, cell_run_id: cellId, namespace: { name: namespace, uid: cellId, owner_token: ownerId },
+    orchestration_run_id: campaignId, cell_run_id: cellId, load_admission: 'authorized', namespace: { name: namespace, uid: cellId, owner_token: ownerId },
     resources: [{ api_version: 'apps/v1', kind: 'Deployment', namespace, name: 'maintenance', uid: campaignId,
       role: 'maintenance', state: 'observed', absence: null }],
     fic: { resource_id: '/subscriptions/' + campaignId + '/resourceGroups/perf69/providers/Microsoft.ManagedIdentity/userAssignedIdentities/fixture/federatedIdentityCredentials/arrowcol-run-' + cellId,

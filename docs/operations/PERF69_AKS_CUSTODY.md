@@ -110,11 +110,38 @@ Both CLIs return one JSON error line, nonzero: `{ok:false,code:"campaign_fenced"
 
 Only this validated expiry can pass the drain guard. Remaining evidence, maintenance stop, terminal capture, exact removals and full safe-idle verification remain mandatory and ordered. Final state is `complete_unsettled`, cleanup status `verified_with_unsettled`, and handoff stays **failed** with the expiry reason. It is not a successful drain, preservation measurement or qualified cell. Producer cleanup has no expiry shortcut; per-cell handoff cannot emit normal success for this path. The watchdog reports distinct terminal progress and exits with code 2 rather than spinning or reporting clean success.
 
+## Pre-load preservation
+
+`RunInventory.load_admission` is required: `not_authorized` -> `authorization_pending` -> `authorized`.
+The first inventory must record `not_authorized`, planned resources and no namespace UID before provisioning.
+Transitions cannot skip, regress or change after fencing. Only confirmed authorization permits client preparation,
+preflight or start; QAP absence alone never proves no rows were admitted.
+
+`aks-campaign.ts capture-cell-baseline` accepts bounded JSON stdin:
+
+```typescript
+{ schema_version: 1, campaign_id: string, orchestration_run_id: string, cell_run_id: string,
+  expected_etag: string, hot_delta_relative_path: string,
+  actor: { mode: "producer", owner_id: string, fencing_token: number } }
+```
+
+The explicit path must exactly match one persisted planned QAP binding, with a known namespace UID.
+Creating a reference requires `not_authorized`; retry reads the immutable original rather than replacing it.
+Success is `{ok:true,receipt}` with `status:"captured"`, the exact campaign/producer/run/cell/namespace/path,
+`blob`, strong baseline `etag`, `delta_state:"table"|"observed_absent"`, `table_id`, `delta_version` and `rows`.
+The baseline ETag is not the inventory ETag. Normal error codes above apply.
+
+Real tables require fresh log/checkpoint replay, exact metadata/protocol/file identities and known add-stat row coverage.
+Positive absence requires two complete successful exact-prefix listings with distinct storage request IDs.
+An absent table has null identity/version/rows, never zero; permission errors and missing history are not absence.
+Absence is not a throughput or row-delivery proof. The campaign's immutable capacity/non-run Kusto reference
+must already exist. Terminal/final preservation and concrete default-provider installation remain separate gates.
+
 ## Campaign-terminal providers
 
 | API | Safety boundary |
 | --- | --- |
-| `captureCleanupBaseline(store, azure, owner, token)` | Live producer custody, before ARM mutations; positive idle-capacity receipts, conditional immutable baseline Blob and matching write/readback ETag. Never replace a baseline with current capacity. |
+| `captureCleanupBaseline(store, azure, owner, token)` | Live producer custody, before ARM mutations/load authorization; positive idle-capacity receipts and explicit non-run Kusto table identities/counts (or positively observed empty inventory), conditional immutable baseline Blob and matching write/readback ETag. Never replace a baseline with current capacity. |
 | `createDefaultCleanupProviders(store, options)` | Concrete discovery and owned namespace/QAP/FIC actions, plus ARM restoration and full-safety composition. Requires supplied lifecycle providers; no implicit success implementation. |
 | `restoreSafeIdle` | Current controller only. Reconcile unresolved ARM receipts first; persist exact resource/target before each PUT/PATCH. One capacity dimension per invocation. An uncertain target is polled, never blindly reissued. Try two system nodes, retain the original three-node fallback after scheduling/PDB problems; preserve recognized writable configuration and reject unknown properties/SKU drift. Never stop Kusto. |
 | `observeStampHealth` | Re-resolve the exact original ARM/server identity; require positive PodList/PDB resource versions, current PDB generation and typed readiness/scheduling observations. UNKNOWN is not healthy. |

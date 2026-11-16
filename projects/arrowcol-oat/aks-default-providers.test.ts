@@ -36,7 +36,7 @@ async function fixture(t: TestContext, capture = true) {
     credentialName: 'arrowcol-run-' + cellId, issuer: 'https://fixture.oic.prod-aks.azure.com/tenant/cluster/',
     subject: `system:serviceaccount:${namespace}:oat`, audience: 'api://AzureADTokenExchange' };
   const inventory: RunInventory = { schema_version: 1, campaign_id: campaignId, owner_id: ownerId, fencing_token: 1,
-    orchestration_run_id: campaignId, cell_run_id: cellId, namespace: { name: namespace, uid: cellId, owner_token: ownerId },
+    orchestration_run_id: campaignId, cell_run_id: cellId, load_admission: 'not_authorized', namespace: { name: namespace, uid: cellId, owner_token: ownerId },
     resources: [], fic: { resource_id: plan.resourceId, name: plan.credentialName, state: 'planned', absence: null, plan },
     qap: null, evidence_destination: { account: c.account, container: c.checkpoints, blob_prefix: 'evidence/' + cellId },
     cleanup: { stop_admission: step, bounded_drain: step, evidence_capture: step, stop_maintenance: step, terminal_capture: step, handoff: step } };
@@ -57,6 +57,10 @@ async function fixture(t: TestContext, capture = true) {
   }
   const blobs = new Map<string, { bytes: Buffer; etag: string }>();
   const mutations: Array<{ method: string; resourceId: string; body: Record<string, unknown> }> = [];
+  t.mock.method(azure, 'kql', async (command: string) => {
+    assert.ok(command === '.show tables' || command === '.show external tables');
+    return { Tables: [{ Columns: [{ ColumnName: 'TableName', ColumnType: 'string' }], Rows: [] }] };
+  });
   let fault: 'none' | 'before' | 'after' = 'none';
   t.mock.method(azure, 'request', async (method: string, url: string, _resource: string, body?: string | Buffer | null,
     _headers?: unknown, _missing?: boolean, _idempotent?: boolean, receipt?: (value: HttpReceipt) => void) => {

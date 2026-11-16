@@ -25,7 +25,7 @@ class Store implements CampaignStore {
 function fixture() {
   const now = Date.now(), started = now - 300_000, step = { state: 'not_started' as const, deadline_unix_ms: null, reason_code: null };
   const inventory: RunInventory = { schema_version: 1, campaign_id: campaignId, owner_id: ownerId, fencing_token: 1,
-    orchestration_run_id: campaignId, cell_run_id: cellId, namespace: { name: namespace, uid: cellId, owner_token: ownerId },
+    orchestration_run_id: campaignId, cell_run_id: cellId, load_admission: 'authorized', namespace: { name: namespace, uid: cellId, owner_token: ownerId },
     resources: ['collector', 'maintenance'].map((name, index) => ({ api_version: 'apps/v1', kind: 'Deployment', namespace, name,
       uid: index === 0 ? campaignId : ownerId, role: index === 0 ? 'collector' : 'maintenance', state: 'observed', absence: null })),
     fic: null, qap: null, evidence_destination: { account: 'fixtureaccount', container: 'checkpoints', blob_prefix: 'evidence/' + cellId },

@@ -179,7 +179,7 @@ async function setupCustody(f: ReturnType<typeof fixture>) {
   const plan = await plan_run_fic(f.azure, runId, namespace, serviceAccount), now = Date.now();
   const step = { state: 'not_started' as const, deadline_unix_ms: null, reason_code: null };
   const inventory: RunInventory = { schema_version: 1, campaign_id: id, owner_id: runId, fencing_token: 1,
-    orchestration_run_id: id, cell_run_id: runId, namespace: { name: namespace, uid: id, owner_token: runId }, resources: [],
+    orchestration_run_id: id, cell_run_id: runId, load_admission: 'not_authorized', namespace: { name: namespace, uid: id, owner_token: runId }, resources: [],
     fic: { resource_id: plan.resourceId, name: plan.credentialName, state: 'planned', absence: null, plan }, qap: null,
     cleanup: { stop_admission: step, bounded_drain: step, evidence_capture: step, stop_maintenance: step, terminal_capture: step, handoff: step } };
   const state: CampaignState = { ...newCampaignState(id, runId, now - 240_000), mode: 'armed', status: 'cleaning',

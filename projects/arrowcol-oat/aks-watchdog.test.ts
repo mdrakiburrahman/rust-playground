@@ -27,7 +27,7 @@ const inventoryFor = (state: CampaignState): RunInventory => {
   const step = { state: 'not_started' as const, deadline_unix_ms: null, reason_code: null };
   return {
     schema_version: 1, campaign_id: campaignId, owner_id: ownerId, fencing_token: state.fencingToken,
-    orchestration_run_id: 'c0ffee00-0000-4000-8000-000000000005', cell_run_id: cellRunId,
+    orchestration_run_id: 'c0ffee00-0000-4000-8000-000000000005', cell_run_id: cellRunId, load_admission: 'authorized',
     namespace: { name: namespace, uid: 'c0ffee00-0000-4000-8000-000000000009', owner_token: ownerId },
     resources: [{ api_version: 'apps/v1', kind: 'Deployment', namespace, name: 'arrowcol',
       uid: 'c0ffee00-0000-4000-8000-000000000006', absence: null, role: 'collector', state: 'observed' }],
@@ -41,8 +41,15 @@ async function armedStore(): Promise<MemoryStore> {
   const store = new MemoryStore();
   await startCampaign(store, campaignId, ownerId, 1_000_000);
   const state = (await store.read())!.state;
-  await publishRunInventory(store, inventoryFor(state), state.startedAtMs);
+  const observed = inventoryFor(state);
+  const planned: RunInventory = { ...observed, load_admission: 'not_authorized', namespace: { ...observed.namespace, uid: null },
+    resources: observed.resources.map(resource => ({ ...resource, uid: null, state: 'planned' })),
+    fic: { ...observed.fic!, state: 'planned' }, qap: { ...observed.qap!, state: 'planned' } };
+  await publishRunInventory(store, planned, state.startedAtMs);
   await armCampaign(store, ownerId, state.fencingToken, state.startedAtMs);
+  await publishRunInventory(store, { ...planned, load_admission: 'authorization_pending' }, state.startedAtMs);
+  await publishRunInventory(store, { ...planned, load_admission: 'authorized' }, state.startedAtMs);
+  await publishRunInventory(store, observed, state.startedAtMs);
   return store;
 }
 

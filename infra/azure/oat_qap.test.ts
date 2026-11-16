@@ -102,7 +102,7 @@ function ownedActionsFor(f: ReturnType<typeof recoveryFixture>) {
   const step = { state: 'not_started' as const, deadline_unix_ms: null, reason_code: null };
   const state: CampaignState = { ...newCampaignState(id, run), status: 'cleaning', fencingToken: 2,
     runInventory: { schema_version: 1, campaign_id: id, owner_id: f.record.workload.namespaceOwner, fencing_token: 1,
-      orchestration_run_id: id, cell_run_id: run,
+      orchestration_run_id: id, cell_run_id: run, load_admission: 'authorized',
       namespace: { name: f.record.workload.namespace, uid: f.record.workload.namespaceUid, owner_token: f.record.workload.namespaceOwner },
       resources: [], fic: null, qap: { database: f.c.experimentDatabase, bindings: f.record.manifest.tables,
         state: 'observed', absence: [] },

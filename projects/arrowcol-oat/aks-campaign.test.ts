@@ -41,7 +41,7 @@ const inventoryFor = (state: CampaignState, observed = false): RunInventory => {
   const step = { state: 'not_started' as const, deadline_unix_ms: null, reason_code: null };
   return {
     schema_version: 1, campaign_id: state.campaignId, owner_id: state.ownerId, fencing_token: state.runInventory?.fencing_token ?? state.fencingToken,
-    orchestration_run_id: orchestrationRunId, cell_run_id: cellRunId,
+    orchestration_run_id: orchestrationRunId, cell_run_id: cellRunId, load_admission: state.runInventory?.load_admission ?? 'not_authorized',
     namespace: { name: namespace, uid: observed ? 'c0ffee00-0000-4000-8000-000000000009' : null, owner_token: state.ownerId },
     resources: names.map((name, index) => ({ api_version: 'apps/v1', kind: 'Deployment', namespace, name,
       uid: observed ? uids[index]! : null, absence: null, role: index === 0 ? 'collector' : index === 1 ? 'client' : 'maintenance', state: stateName })),
@@ -55,12 +55,32 @@ const armForTest = async (store: MemoryStore, now = 1_000_000, ready = true) => 
   const state = (await store.read())!.state;
   await publishRunInventory(store, inventoryFor(state), now);
   await armCampaign(store, ownerId, state.fencingToken, now);
+  const planned = (await store.read())!.state.runInventory!;
+  await publishRunInventory(store, { ...planned, load_admission: 'authorization_pending' }, now);
+  await publishRunInventory(store, { ...planned, load_admission: 'authorized' }, now);
   if (ready) await publishRunInventory(store, inventoryFor((await store.read())!.state, true), now + 1);
   return (await store.read())!.state;
 };
 
+test('load admission requires a pre-provisioning initial record and cannot skip or reopen authorization', async () => {
+  const store = await seed(), started = (await store.read())!.state, planned = inventoryFor(started);
+  const { load_admission: _legacy, ...legacy } = planned;
+  await assert.rejects(publishRunInventory(store, legacy, started.startedAtMs), /malformed/);
+  await assert.rejects(publishRunInventory(store, { ...planned, load_admission: 'invalid' }, started.startedAtMs), /malformed/);
+  await assert.rejects(publishRunInventory(store, { ...planned, load_admission: 'authorized' }, started.startedAtMs), /before external provisioning/);
+  await assert.rejects(publishRunInventory(store, inventoryFor(started, true), started.startedAtMs), /before external provisioning/);
+  await publishRunInventory(store, planned, started.startedAtMs);
+  await assert.rejects(publishRunInventory(store, { ...planned, load_admission: 'authorized' }, started.startedAtMs), /authorization_pending/);
+  await publishRunInventory(store, { ...planned, load_admission: 'authorization_pending' }, started.startedAtMs);
+  assert.equal((await store.read())!.state.runInventory!.load_admission, 'authorization_pending');
+  await publishRunInventory(store, { ...planned, load_admission: 'authorized' }, started.startedAtMs);
+  await assert.rejects(publishRunInventory(store, planned, started.startedAtMs), /monotonically/);
+  assert.equal((await store.read())!.state.runInventory!.load_admission, 'authorized');
+});
+
 test('maintenance milestone is required, bounded, monotonic and required for handoff', async () => {
   const store = await seed(), inventory = inventoryFor((await store.read())!.state);
+  await publishRunInventory(store, inventory, 1_000_000);
   const { stop_maintenance: _omitted, ...legacy } = inventory.cleanup;
   await assert.rejects(publishRunInventory(store, { ...inventory, cleanup: legacy }, 1_000_000), /malformed/);
   for (const deadline of [null, 120_000]) {
@@ -205,6 +225,8 @@ test('RunInventory fenced merge preserves heartbeat and ARM receipts and blocks 
   await publishRunInventory(store, planned, started.startedAtMs);
   await assert.rejects(assertRunInventoryReady(store, ownerId, started.fencingToken, started.startedAtMs), /blocked/);
   await armCampaign(store, ownerId, started.fencingToken, started.startedAtMs);
+  await publishRunInventory(store, { ...planned, load_admission: 'authorization_pending' }, started.startedAtMs);
+  await publishRunInventory(store, { ...planned, load_admission: 'authorized' }, started.startedAtMs);
   const observed = inventoryFor((await store.read())!.state, true);
   await publishRunInventory(store, observed, started.startedAtMs + 1);
   await assertRunInventoryReady(store, ownerId, started.fencingToken, started.startedAtMs + 2);
@@ -261,6 +283,7 @@ test('RunInventory absent state requires immutable exact not-found receipts', as
   const state = (await store.read())!.state;
   const planned = inventoryFor(state);
   const first = planned.resources[0]!;
+  await publishRunInventory(store, planned, state.startedAtMs);
   const absentResource = { ...first, state: 'absent' as const, absence: { api_version: first.api_version, kind: first.kind,
     namespace: first.namespace, name: first.name, namespace_uid: planned.namespace.uid, observed_at_unix_ms: state.startedAtMs + 1 } };
   const fic = planned.fic!;
