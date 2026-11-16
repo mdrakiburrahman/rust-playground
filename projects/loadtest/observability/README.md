@@ -8,7 +8,7 @@
 | `capture.ts` | Captures baseline, diagnosed-bottleneck and best-candidate screenshots over equal-length measurement windows |
 
 Grafana is provisioned by the `lgtm` service in `projects/loadtest/compose.yaml`, which uses the digest-pinned `grafana/otel-lgtm` image.
-The capture script needs the Playwright Chromium runtime: `npx --no-install playwright install chromium`.
+The capture runner needs Playwright Chromium and its Linux libraries: `npx --no-install playwright install --with-deps chromium` (run where system packages can be installed).
 
 ```bash
 GRAFANA_URL=http://127.0.0.1:3000 npx --no-install tsx projects/loadtest/observability/capture.ts \

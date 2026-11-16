@@ -97,7 +97,12 @@ async function captureScreenshots(plan: CapturePlan, baseUrl: string): Promise<v
   try {
     browser = await chromium.launch({ headless: true });
   } catch (error) {
-    throw new Error('Chromium is required; install it with `npx --no-install playwright install chromium`', { cause: error });
+    const detail = error instanceof Error ? `: ${error.message}` : '';
+    throw new Error(
+      `Could not launch Playwright Chromium; install its browser and OS dependencies with ` +
+      '`npx --no-install playwright install --with-deps chromium`' + detail,
+      { cause: error },
+    );
   }
   try {
     for (const capture of plan.captures) {
