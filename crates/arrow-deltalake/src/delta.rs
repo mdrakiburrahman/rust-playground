@@ -4353,7 +4353,10 @@ async fn upload_staged_output(
             use tokio::io::AsyncReadExt as _;
 
             anyhow::ensure!(buffer_capacity > 0, "multipart buffer capacity must be positive");
-            anyhow::ensure!(request_concurrency > 0, "multipart request concurrency must be positive");
+            anyhow::ensure!(
+                request_concurrency > 0,
+                "multipart request concurrency must be positive"
+            );
 
             let mut source = tokio::fs::File::open(&source_path)
                 .await
@@ -4379,8 +4382,10 @@ async fn upload_staged_output(
                             }
                             Ok(bytes_read) => filled += bytes_read,
                             Err(error) => {
-                                upload_error = Some(anyhow::Error::new(error)
-                                    .context("read completed Parquet output for multipart upload"));
+                                upload_error = Some(
+                                    anyhow::Error::new(error)
+                                        .context("read completed Parquet output for multipart upload"),
+                                );
                                 break;
                             }
                         }
@@ -4400,16 +4405,16 @@ async fn upload_staged_output(
                 }
                 if let Some(result) = pending.next().await {
                     if let Err(error) = result {
-                        upload_error = Some(anyhow::Error::new(error)
-                            .context("upload completed Parquet multipart part"));
+                        upload_error =
+                            Some(anyhow::Error::new(error).context("upload completed Parquet multipart part"));
                     }
                 }
             }
             while let Some(result) = pending.next().await {
                 if upload_error.is_none() {
                     if let Err(error) = result {
-                        upload_error = Some(anyhow::Error::new(error)
-                            .context("upload completed Parquet multipart part"));
+                        upload_error =
+                            Some(anyhow::Error::new(error).context("upload completed Parquet multipart part"));
                     }
                 }
             }
@@ -4417,9 +4422,8 @@ async fn upload_staged_output(
                 return Err(abort_multipart_after_failure(&mut upload, error).await);
             }
             if copied != expected_bytes {
-                let error = anyhow::anyhow!(
-                    "Parquet upload source changed: expected {expected_bytes} bytes, copied {copied}"
-                );
+                let error =
+                    anyhow::anyhow!("Parquet upload source changed: expected {expected_bytes} bytes, copied {copied}");
                 return Err(abort_multipart_after_failure(&mut upload, error).await);
             }
             if let Err(error) = upload.complete().await {
@@ -4437,9 +4441,7 @@ async fn abort_multipart_after_failure(
 ) -> anyhow::Error {
     match upload.abort().await {
         Ok(()) => error,
-        Err(abort_error) => anyhow::anyhow!(
-            "{error:#}; aborting multipart upload failed: {abort_error}"
-        ),
+        Err(abort_error) => anyhow::anyhow!("{error:#}; aborting multipart upload failed: {abort_error}"),
     }
 }
 
