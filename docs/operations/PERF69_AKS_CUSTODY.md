@@ -32,8 +32,8 @@ must match the start receipt. These inputs contain identities, not embedded cred
 | Action (append both configuration flags) | Requirement/result |
 | --- | --- |
 | `start <campaign-uuid> [owner-uuid]` | Starts observe-only custody; retain its producer identity environment. |
-| `publish-inventory` | Persist initial `not_authorized` inventory before provisioning. |
-| `capture-baseline <owner-uuid> <fencing-token>` | Capture verified idle ARM capacity and non-run Kusto identity/count/policy reference before provisioning/arm/load. Retry validates and reuses the original immutable proof. |
+| `publish-inventory` | Persist initial `not_authorized` inventory before provisioning. Advancing beyond initial preparation requires the matching campaign baseline, even while admission remains `not_authorized`. |
+| `capture-baseline <owner-uuid> <fencing-token>` | First capture requires observe mode, null namespace UID, planned/unobserved resources/FIC/QAP and entirely unstarted cleanup with null deadlines/reasons. Freeze verified idle ARM capacity and non-run Kusto identity/count/policy before provisioning/arm/load; any inventory/version change during capture fails closed. |
 | `arm <owner-uuid> <fencing-token>` | Requires matching durable campaign baseline; this is effect authorization, not a rehearsal/dry run. |
 | `publish-inventory` with `authorized`, `assert-ready`, `capture-cell-baseline` | Independently require the matching campaign baseline; absence, drift or incomplete non-run Kusto provenance fails closed. |
 
@@ -43,6 +43,8 @@ must match the start receipt. These inputs contain identities, not embedded cred
 `etag` versions that immutable Blob, not inventory. `CampaignBaselineReceipt` is exported by
 `aks-default-providers.ts`; errors use the existing machine-code envelope. Controller cleanup continues to
 validate the baseline's original producer origin/fence, not the controller's newer fence; it never recaptures it.
+An existing-proof retry is read-only and remains valid after provisioning, load authorization or controller
+takeover using the current actor/fence; it does not require the advanced inventory to look initial again.
 
 ## Owned helper APIs
 

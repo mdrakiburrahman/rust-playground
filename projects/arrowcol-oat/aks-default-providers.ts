@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { canonical_json, type Azure } from '../../infra/azure/bootstrap.js';
 import { observe_custody_idle_capacity } from '../../infra/azure/aks-safe-idle.js';
 import { plan_run_fic } from '../../infra/azure/run_fic.js';
-import { CampaignWriteOutcomeUnknownError, recordCleanupArmOperation, type CampaignState, type CampaignStore, type CleanupArmTarget } from './aks-campaign.js';
+import { CampaignConflictError, CampaignFencedError, CampaignWriteOutcomeUnknownError, isInitialRunInventory, recordCleanupArmOperation, type CampaignState, type CampaignStore, type CleanupArmTarget } from './aks-campaign.js';
 import { createOwnedRunCleanupActions, type CleanupMutationAuthority, type ExternalCleanupActions } from './aks-cleanup-executor.js';
 import { assertCleaningActor, assertRunCleanupActor, discoverOwnedRunInventory, observeExactKubernetes } from './aks-setup-cleanup.js';
 import { reconcilePendingArmOperations, verifySafeIdle, type SafeIdleObservation } from './aks-reconcile.js';
@@ -34,22 +34,37 @@ export interface CampaignBaselineReceipt {
   blob: string; etag: string; captured_at_unix_ms: number;
 }
 export async function captureCleanupBaseline(store: CampaignStore, azure: Azure, ownerId: string, token: number): Promise<CampaignBaselineReceipt> {
-  const state = (await store.read())?.state;
-  activeOwner(state, ownerId, token);
-  if (!state.runInventory || state.runInventory.load_admission !== 'not_authorized')
-    throw new Error('Campaign preservation baseline requires the original not_authorized inventory.');
-  const guard = async () => {
-    const current = (await store.read())?.state;
-    activeOwner(current, ownerId, token);
-    if (canonical_json(current.runInventory ?? null) !== canonical_json(state.runInventory ?? null))
-      throw new Error('Campaign baseline inventory/admission changed during observation.');
+  const original = await store.read(), state = original?.state;
+  const reader = (current: CampaignState | undefined) => {
+    const now = Date.now();
+    if (!current || current.ownerId !== ownerId || current.fencingToken !== token ||
+        !['active', 'cleaning'].includes(current.status) ||
+        current.status === 'active' && (now >= current.expiresAtMs || now < current.heartbeatAtMs ||
+          now - current.heartbeatAtMs >= 180_000))
+      throw new CampaignFencedError();
   };
+  reader(state);
+  if (!original || !state) throw new CampaignFencedError();
+  if (!original.etag || original.etag === '*' || original.etag.startsWith('W/')) throw new CampaignConflictError();
   const [prior] = await azure.blob('GET', azure.c.checkpoints, baselineBlob(state), undefined, undefined, {}, true, true);
   if (prior !== null) {
-    const receipt = await readCleanupBaseline(azure, state);
-    await guard();
+    const receipt = await readCleanupBaseline(azure, state), current = await store.read();
+    reader(current?.state);
+    if (current?.etag !== original.etag) throw new CampaignConflictError();
     return receipt;
   }
+  activeOwner(state, ownerId, token);
+  if (state.mode !== 'observe' || !isInitialRunInventory(state.runInventory))
+    throw new Error('First campaign baseline requires the original initial pre-provision inventory in observe mode.');
+  const guard = async () => {
+    const current = await store.read();
+    activeOwner(current?.state, ownerId, token);
+    if (!current || current.etag !== original.etag || current.state.mode !== 'observe' ||
+        !isInitialRunInventory(current.state.runInventory) ||
+        canonical_json(current.state.runInventory) !== canonical_json(state.runInventory))
+      throw new CampaignConflictError();
+  };
+  await guard();
   const capacity = await observe_custody_idle_capacity(azure);
   if (capacity.status !== 'capacity_idle') throw new Error('Campaign baseline must be verified idle capacity before scale/load.');
   const nonRunKusto = await captureStampKustoBaseline(azure, state, guard);
@@ -66,8 +81,10 @@ export async function captureCleanupBaseline(store: CampaignStore, azure: Azure,
       throw new CampaignWriteOutcomeUnknownError();
     etag = headers.etag;
   } catch { throw new CampaignWriteOutcomeUnknownError(); }
-  await guard();
-  return readCleanupBaseline(azure, state, etag);
+  try {
+    await guard();
+    return await readCleanupBaseline(azure, state, etag);
+  } catch { throw new CampaignWriteOutcomeUnknownError(); }
 }
 async function validatedCleanupBaseline(azure: Azure, state: CampaignState, expectedEtag?: string) {
   const [bytes, version] = await azure.blob('GET', azure.c.checkpoints, baselineBlob(state), undefined, undefined, {}, false, true);

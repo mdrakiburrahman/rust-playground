@@ -261,12 +261,17 @@ function mergeStep(before: InventoryStep, after: InventoryStep): InventoryStep {
   return { ...after, deadline_unix_ms: before.deadline_unix_ms ?? after.deadline_unix_ms,
     reason_code: after.reason_code ?? (after.state === before.state ? before.reason_code : null) };
 }
+export function isInitialRunInventory(inventory: RunInventory | undefined): boolean {
+  return Boolean(inventory && inventory.load_admission === 'not_authorized' && inventory.namespace.uid === null &&
+    inventory.resources.every(resource => resource.state === 'planned' && resource.uid === null && resource.absence === null) &&
+    (!inventory.fic || inventory.fic.state === 'planned' && inventory.fic.absence === null) &&
+    (!inventory.qap || inventory.qap.state === 'planned' && inventory.qap.absence.length === 0 && !inventory.qap.reference) &&
+    Object.values(inventory.cleanup).every(step =>
+      step.state === 'not_started' && step.deadline_unix_ms === null && step.reason_code === null));
+}
 function mergeRunInventory(before: RunInventory | undefined, after: RunInventory): RunInventory {
   const initial = () => {
-    if (after.load_admission !== 'not_authorized' || after.namespace.uid !== null ||
-        after.resources.some(resource => resource.state !== 'planned' || resource.uid !== null || resource.absence !== null) ||
-        after.fic && after.fic.state !== 'planned' || after.qap && after.qap.state !== 'planned' ||
-        Object.values(after.cleanup).some(step => step.state !== 'not_started'))
+    if (!isInitialRunInventory(after))
       throw new Error('Initial RunInventory must positively record not_authorized before external provisioning.');
     return after;
   };
@@ -792,7 +797,8 @@ export async function campaignMain(args: string[], dependencies: {
     const current = await store.read();
     if (!current) throw new Error('No active campaign state exists.');
     assertCampaignEnvironment(env, current.state);
-    if (input.load_admission === 'authorized') await requireBaseline(current);
+    const inventory = validateRunInventory(input, current.state);
+    if (!isInitialRunInventory(mergeRunInventory(current.state.runInventory, inventory))) await requireBaseline(current);
     const result = await publishRunInventory(store, input);
     console.log(JSON.stringify({ ok: true, receipt: runInventoryPublishReceipt(result) }));
   } else if (action === 'assert-ready' && args.length === 3 && /^\d+$/.test(fencingTokenText!)) {
