@@ -4,6 +4,7 @@ use arrowcol_catalog::CatalogStore;
 use arrowcol_catalog_rust::{CatalogConfig, CatalogService};
 use serde_json::Value;
 use std::process::{Command, Output};
+use std::sync::Arc;
 
 const TABLE: &str = "telemetry.sqlserver.sqlserver_availability_replica_states";
 
@@ -94,7 +95,7 @@ async fn initialized_timestamp_table_survives_catalog_startup_and_logical_regist
     let url = url::Url::from_directory_path(&location).map_err(|()| anyhow::anyhow!("invalid table directory"))?;
     let table = DeltaTable::open_catalog(url)?;
     let original = table.catalog_snapshot()?.context("initialized Delta snapshot")?;
-    CanonicalSchema::try_new(original.schema.clone())?;
+    CanonicalSchema::try_new(Arc::clone(&original.schema))?;
     assert!(original.schema.field_with_name("sample_time_utc__unix_nanos").is_ok());
     assert_eq!(original.partition_columns, ["__arrowcol_ingestion"]);
 
@@ -165,7 +166,7 @@ async fn initialized_timestamp_table_survives_catalog_startup_and_logical_regist
     let ordinary_snapshot = DeltaTable::open_catalog(ordinary_url)?
         .catalog_snapshot()?
         .context("ordinary CREATE physical schema")?;
-    CanonicalSchema::try_new(ordinary_snapshot.schema.clone())?;
+    CanonicalSchema::try_new(Arc::clone(&ordinary_snapshot.schema))?;
     assert_eq!(ordinary_snapshot.partition_columns, ["__arrowcol_ingestion"]);
     let restarted = CatalogService::open(config).await?;
     assert_eq!(
