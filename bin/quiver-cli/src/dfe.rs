@@ -127,19 +127,12 @@ struct EnvelopeSummary {
     target_schema_version: SchemaVersion,
 }
 
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum MetadataSummary {
-    Current { envelope: EnvelopeSummary },
-    Legacy(EnvelopeSummary),
-}
-
 fn decode_envelope(schema_id: &str) -> Option<EnvelopeSummary> {
     let encoded = schema_id.strip_prefix(SCHEMA_ID_PREFIX)?;
     let bytes = URL_SAFE_NO_PAD.decode(encoded).ok()?;
-    match serde_json::from_slice(&bytes).ok()? {
-        MetadataSummary::Current { envelope } | MetadataSummary::Legacy(envelope) => Some(envelope),
-    }
+    let metadata: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let envelope = metadata.get("envelope").unwrap_or(&metadata);
+    serde_json::from_value(envelope.clone()).ok()
 }
 
 pub(crate) fn schema_description(schema_id: &str) -> Option<(String, u64)> {
@@ -281,6 +274,51 @@ mod tests {
         assert_eq!(&encoded[..4], b"QPA\x01");
         assert_eq!(DfeManifest::decode(&encoded)?.tables[0].fingerprint, [7; 32]);
         assert!(DfeManifest::decode(&encoded[..encoded.len() - 1]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn summary_rejects_malformed_present_wrapper_even_with_valid_flat_fields() -> Result<()> {
+        let flat = serde_json::json!({
+            "table": {"catalog": "c", "schema": "s", "table": "legacy"},
+            "target_schema_version": 1
+        });
+        let schema_id = format!(
+            "{SCHEMA_ID_PREFIX}{}",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&flat)?)
+        );
+        assert_eq!(schema_description(&schema_id), Some(("c.s.legacy".to_owned(), 1)));
+        for wrapper in [
+            serde_json::Value::Null,
+            serde_json::json!({}),
+            serde_json::json!({"table": flat["table"], "target_schema_version": "invalid"}),
+        ] {
+            let mut mixed = flat.clone();
+            mixed["envelope"] = wrapper;
+            let schema_id = format!(
+                "{SCHEMA_ID_PREFIX}{}",
+                URL_SAFE_NO_PAD.encode(serde_json::to_vec(&mixed)?)
+            );
+            assert!(schema_description(&schema_id).is_none());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn summary_prefers_present_valid_wrapper_over_conflicting_flat_fields() -> Result<()> {
+        let metadata = serde_json::json!({
+            "table": {"catalog": "c", "schema": "s", "table": "legacy"},
+            "target_schema_version": 1,
+            "envelope": {
+                "table": {"catalog": "c", "schema": "s", "table": "current"},
+                "target_schema_version": 2
+            }
+        });
+        let schema_id = format!(
+            "{SCHEMA_ID_PREFIX}{}",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&metadata)?)
+        );
+        assert_eq!(schema_description(&schema_id), Some(("c.s.current".to_owned(), 2)));
         Ok(())
     }
 
