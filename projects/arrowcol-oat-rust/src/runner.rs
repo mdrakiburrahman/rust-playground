@@ -41,6 +41,340 @@ include!("runner_commit_evidence.rs");
 include!("runner_maintenance.rs");
 include!("runner_wal.rs");
 
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RunInventory {
+    pub schema_version: u32,
+    pub campaign_id: String,
+    pub owner_id: String,
+    pub fencing_token: u64,
+    pub orchestration_run_id: String,
+    pub cell_run_id: String,
+    pub namespace: InventoryNamespace,
+    pub resources: Vec<InventoryResource>,
+    pub fic: Option<InventoryFic>,
+    pub qap: Option<InventoryQap>,
+    pub cleanup: InventoryCleanup,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InventoryNamespace {
+    pub name: String,
+    pub uid: Option<String>,
+    pub owner_token: String,
+}
+
+#[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InventoryResourceState {
+    Planned,
+    Observed,
+    Removed,
+    Uncertain,
+}
+
+impl InventoryResourceState {
+    fn can_advance_to(self, next: Self) -> bool {
+        match self {
+            Self::Planned => true,
+            Self::Observed | Self::Uncertain => next != Self::Planned,
+            Self::Removed => next == Self::Removed,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InventoryResourceRole {
+    Collector,
+    Client,
+    Maintenance,
+    Router,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InventoryResource {
+    pub api_version: String,
+    pub kind: String,
+    pub namespace: String,
+    pub name: String,
+    pub uid: Option<String>,
+    pub role: InventoryResourceRole,
+    pub state: InventoryResourceState,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InventoryFic {
+    pub resource_id: Option<String>,
+    pub name: Option<String>,
+    pub state: InventoryResourceState,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InventoryQapBinding {
+    pub external_table: String,
+    pub relative_path: String,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InventoryQap {
+    pub database: String,
+    pub bindings: Vec<InventoryQapBinding>,
+    pub state: InventoryResourceState,
+}
+
+#[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InventoryStepState {
+    NotStarted,
+    Pending,
+    Running,
+    Complete,
+    Failed,
+    Uncertain,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InventoryStep {
+    pub state: InventoryStepState,
+    pub deadline_unix_ms: Option<u64>,
+    pub reason_code: Option<String>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InventoryCleanup {
+    pub stop_admission: InventoryStep,
+    pub bounded_drain: InventoryStep,
+    pub evidence_capture: InventoryStep,
+    pub terminal_capture: InventoryStep,
+    pub handoff: InventoryStep,
+}
+
+impl RunInventory {
+    /// Validate identities before publishing to the fenced external custody store.
+    ///
+    /// # Errors
+    /// Rejects malformed, ambiguous or success-shaped incomplete identities.
+    pub fn validate(&self) -> Result<()> {
+        if self.schema_version != 1 || self.fencing_token == 0 {
+            bail!("invalid custody inventory version or fencing token");
+        }
+        for value in [
+            &self.campaign_id,
+            &self.owner_id,
+            &self.orchestration_run_id,
+            &self.cell_run_id,
+            &self.namespace.owner_token,
+        ] {
+            let id = uuid::Uuid::parse_str(value).context("invalid custody inventory UUID")?;
+            if id.is_nil() || id.to_string() != *value {
+                bail!("custody inventory UUID must be nonzero and canonical");
+            }
+        }
+        let suffix = format!("-{}", self.cell_run_id.replace('-', ""));
+        if !self.namespace.name.ends_with(&suffix)
+            || self.namespace.name.len() <= suffix.len()
+            || self.namespace.name.len() > 63
+            || !self
+                .namespace
+                .name
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        {
+            bail!("custody namespace must contain the exact cell identity");
+        }
+        if self.namespace.uid.as_deref() == Some("") {
+            bail!("custody namespace UID must not be empty");
+        }
+        let mut keys = BTreeSet::new();
+        for resource in &self.resources {
+            if resource.namespace != self.namespace.name
+                || resource.name.is_empty()
+                || resource.name.len() > 253
+                || !resource
+                    .name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'.')
+                || !matches!(
+                    (resource.api_version.as_str(), resource.kind.as_str()),
+                    ("apps/v1", "Deployment") | ("batch/v1", "Job") | ("v1", "Pod")
+                )
+                || !keys.insert((&resource.api_version, &resource.kind, &resource.name))
+            {
+                bail!("invalid or duplicate custody Kubernetes resource");
+            }
+            if resource.uid.as_deref() == Some("")
+                || matches!(
+                    resource.state,
+                    InventoryResourceState::Observed | InventoryResourceState::Removed
+                ) && (resource.uid.is_none() || self.namespace.uid.is_none())
+            {
+                bail!("observed or removed custody resource requires exact resource and namespace UIDs");
+            }
+        }
+        if let Some(fic) = &self.fic {
+            if fic.resource_id.is_some()
+                || matches!(
+                    fic.state,
+                    InventoryResourceState::Observed | InventoryResourceState::Removed
+                )
+            {
+                let name = fic
+                    .name
+                    .as_deref()
+                    .filter(|name| !name.is_empty())
+                    .context("FIC name is unknown")?;
+                let id = fic.resource_id.as_deref().context("FIC resource ID is unknown")?;
+                if !id.starts_with("/subscriptions/")
+                    || !id.ends_with(&format!("/federatedIdentityCredentials/{name}"))
+                    || id.contains(['?', '#'])
+                {
+                    bail!("FIC resource ID does not match the exact credential name");
+                }
+            }
+        }
+        if let Some(qap) = &self.qap {
+            let safe_identifier = |value: &str| {
+                !value.is_empty()
+                    && value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            };
+            if !safe_identifier(&qap.database)
+                || qap.bindings.iter().any(|binding| {
+                    !safe_identifier(&binding.external_table)
+                        || binding.relative_path.is_empty()
+                        || binding.relative_path.contains(['?', '#', '@', '\\', ':'])
+                        || binding.relative_path.starts_with('/')
+                        || binding
+                            .relative_path
+                            .split('/')
+                            .any(|part| part.is_empty() || part == "." || part == "..")
+                })
+            {
+                bail!("invalid custody QAP binding identity");
+            }
+        }
+        for step in [
+            &self.cleanup.stop_admission,
+            &self.cleanup.bounded_drain,
+            &self.cleanup.evidence_capture,
+            &self.cleanup.terminal_capture,
+            &self.cleanup.handoff,
+        ] {
+            if step.reason_code.as_ref().is_some_and(|reason| {
+                reason.is_empty()
+                    || reason.len() > 64
+                    || !reason
+                        .bytes()
+                        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+            }) {
+                bail!("custody failure reason must be a bounded public reason code");
+            }
+            if matches!(step.state, InventoryStepState::Failed | InventoryStepState::Uncertain)
+                && step.reason_code.is_none()
+            {
+                bail!("failed or uncertain custody step requires a reason");
+            }
+        }
+        if self.cleanup.stop_admission.state == InventoryStepState::Running
+            && self.cleanup.stop_admission.deadline_unix_ms.is_none()
+        {
+            bail!("running admission stop requires a bounded deadline");
+        }
+        if self.cleanup.bounded_drain.state == InventoryStepState::Running
+            && self.cleanup.bounded_drain.deadline_unix_ms.is_none()
+        {
+            bail!("running drain requires a bounded deadline");
+        }
+        Ok(())
+    }
+
+    /// Validate that an active owner never changes or forgets established resource identity.
+    ///
+    /// # Errors
+    /// Rejects ownership, UID and binding changes or incomplete updates.
+    pub fn validate_successor(&self, next: &Self) -> Result<()> {
+        self.validate()?;
+        next.validate()?;
+        if self.campaign_id != next.campaign_id
+            || self.owner_id != next.owner_id
+            || self.fencing_token != next.fencing_token
+            || self.orchestration_run_id != next.orchestration_run_id
+            || self.cell_run_id != next.cell_run_id
+            || self.namespace.name != next.namespace.name
+            || self.namespace.owner_token != next.namespace.owner_token
+            || self
+                .namespace
+                .uid
+                .as_ref()
+                .is_some_and(|uid| next.namespace.uid.as_ref() != Some(uid))
+        {
+            bail!("custody ownership or established namespace UID changed");
+        }
+        for resource in &self.resources {
+            let updated = next
+                .resources
+                .iter()
+                .find(|candidate| {
+                    candidate.api_version == resource.api_version
+                        && candidate.kind == resource.kind
+                        && candidate.name == resource.name
+                })
+                .context("custody update dropped a recorded resource")?;
+            if updated.role != resource.role
+                || resource
+                    .uid
+                    .as_ref()
+                    .is_some_and(|uid| updated.uid.as_ref() != Some(uid))
+                || !resource.state.can_advance_to(updated.state)
+            {
+                bail!("custody update changed an established resource identity");
+            }
+        }
+        if let Some(old) = &self.fic {
+            let new = next.fic.as_ref().context("custody update dropped the FIC")?;
+            if old.name.as_ref().is_some_and(|value| new.name.as_ref() != Some(value))
+                || old
+                    .resource_id
+                    .as_ref()
+                    .is_some_and(|value| new.resource_id.as_ref() != Some(value))
+                || !old.state.can_advance_to(new.state)
+            {
+                bail!("custody update changed an established FIC identity");
+            }
+        }
+        if let Some(old) = &self.qap {
+            let new = next.qap.as_ref().context("custody update dropped QAP bindings")?;
+            if old.database != new.database
+                || old.bindings.iter().any(|binding| !new.bindings.contains(binding))
+                || !old.state.can_advance_to(new.state)
+            {
+                bail!("custody update changed an established QAP identity");
+            }
+        }
+        for (old, new) in [
+            (&self.cleanup.stop_admission, &next.cleanup.stop_admission),
+            (&self.cleanup.bounded_drain, &next.cleanup.bounded_drain),
+            (&self.cleanup.evidence_capture, &next.cleanup.evidence_capture),
+            (&self.cleanup.terminal_capture, &next.cleanup.terminal_capture),
+            (&self.cleanup.handoff, &next.cleanup.handoff),
+        ] {
+            if old.state == InventoryStepState::Complete && new.state != InventoryStepState::Complete {
+                bail!("custody update regressed a completed cleanup receipt");
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug)]
 struct OatResult {
     run_id: String,
@@ -9072,6 +9406,49 @@ mod tests {
         assert!(verify_aks_collector_stop_grace(&deployment, 300).is_ok());
         assert!(verify_aks_collector_stop_grace(&deployment, 301).is_err());
         assert!(verify_aks_collector_stop_grace(&json!({}), 300).is_err());
+    }
+
+    #[test]
+    fn custody_inventory_never_replaces_exact_ownership_or_accepts_unknown_observations() -> Result<()> {
+        let step = json!({"state":"not_started","deadline_unix_ms":null,"reason_code":null});
+        let mut inventory: RunInventory = serde_json::from_value(json!({
+            "schema_version": 1,
+            "campaign_id":"5d4c2001-77e2-44b2-b32b-4ce79bf7dd01",
+            "owner_id":"5d4c2001-77e2-44b2-b32b-4ce79bf7dd02",
+            "fencing_token":1,
+            "orchestration_run_id":"5d4c2001-77e2-44b2-b32b-4ce79bf7dd03",
+            "cell_run_id":"5d4c2001-77e2-44b2-b32b-4ce79bf7dd04",
+            "namespace":{"name":"oat-5d4c200177e244b2b32b4ce79bf7dd04", "uid":null,
+                "owner_token":"5d4c2001-77e2-44b2-b32b-4ce79bf7dd05"},
+            "resources":[{"api_version":"apps/v1","kind":"Deployment",
+                "namespace":"oat-5d4c200177e244b2b32b4ce79bf7dd04","name":"arrowcol",
+                "uid":null,"role":"collector","state":"planned"}],
+            "fic":null,"qap":null,
+            "cleanup":{"stop_admission":step,"bounded_drain":step,"evidence_capture":step,
+                "terminal_capture":step,"handoff":step}
+        }))?;
+        inventory.validate()?;
+        let mut observed = inventory.clone();
+        observed.resources[0].state = InventoryResourceState::Observed;
+        assert!(observed.validate().is_err());
+        observed.namespace.uid = Some("namespace-uid".to_owned());
+        observed.resources[0].uid = Some("actual-uid".to_owned());
+        inventory.validate_successor(&observed)?;
+        inventory = observed;
+        let mut replacement = inventory.clone();
+        replacement.resources[0].uid = Some("replacement-uid".to_owned());
+        assert!(inventory.validate_successor(&replacement).is_err());
+        replacement = inventory.clone();
+        replacement.resources[0].state = InventoryResourceState::Planned;
+        assert!(inventory.validate_successor(&replacement).is_err());
+        replacement = inventory.clone();
+        replacement.cleanup.stop_admission.state = InventoryStepState::Running;
+        assert!(replacement.validate().is_err());
+        replacement.cleanup.stop_admission.deadline_unix_ms = Some(1_000);
+        replacement.validate()?;
+        replacement.cleanup.evidence_capture.state = InventoryStepState::Uncertain;
+        assert!(replacement.validate().is_err());
+        Ok(())
     }
 
     #[tokio::test]
