@@ -208,14 +208,15 @@ function syntheticBacklog() {
     scope: 'unique_table_owner_admissions_not_confirmed_durable_commit',
     timestamp_basis: 'UTC request start/end around direct /metrics GET; each is a scrape-time snapshot',
     measurement_window: { start_unix_ms: 1_000_000, end_unix_ms: 1_150_000 },
-    sampling_interval_ms: 5_000,
-    request_timeout_ms: 1_000,
+    sampling_interval_ms: 1_000,
+    request_timeout_ms: 3_000,
     sampling_failures: 0,
     samples_dropped: 0,
     last_unavailable_reason: null as string | null,
-    samples: Array.from({ length: 30 }, (_, index) => ({
-      request_start_unix_ms: 1_000_000 + index * 5_000,
-      request_end_unix_ms: 1_000_010 + index * 5_000,
+    samples: Array.from({ length: 150 }, (_, index) => ({
+      request_start_unix_ms: 1_000_000 + index * 1_000,
+      request_end_unix_ms: 1_000_010 + index * 1_000,
+      request_timeout_ms: Math.min(3_000, 150_000 - index * 1_000),
       available: true as boolean | null,
       publications: 0 as number | null,
       rows: 0 as number | null,
@@ -273,10 +274,15 @@ test('rejects unknown, unavailable, dropped, gapped, or clock-reversed backlog c
     value => { value.samples[0]!.unavailable_reason = 'unknown gauges'; },
     value => { value.samples[0]!.request_end_unix_ms = value.samples[0]!.request_start_unix_ms - 1; },
     value => { value.samples[1]!.request_start_unix_ms = value.samples[0]!.request_start_unix_ms; },
-    value => { value.samples.splice(10, 2); },
+    value => { value.samples.splice(10, 5); },
     value => { value.samples.splice(0, 4); },
     value => { value.samples.splice(-4); },
-    value => { value.samples = value.samples.filter((_, index) => index % 6 === 0); },
+    value => { value.samples = value.samples.filter((_, index) => index % 30 === 0); },
+    value => { value.request_timeout_ms = 30_001; },
+    value => { value.samples[0]!.request_timeout_ms = 0; },
+    value => { value.samples[0]!.request_timeout_ms = 3_001; },
+    value => { value.samples[0]!.request_timeout_ms = 5; },
+    value => { value.samples[value.samples.length - 1]!.request_timeout_ms = 3_000; },
     value => { value.samples = Array.from({ length: 10_001 }, () => value.samples[0]!); },
   ];
   mutations.forEach((mutate, index) => {
@@ -285,6 +291,16 @@ test('rejects unknown, unavailable, dropped, gapped, or clock-reversed backlog c
     assert.equal(typeof publicationBacklogIssue(value, 1_000_000, 1_150_000), 'string', 'mutation ' + index);
   });
   assert.equal(typeof publicationBacklogIssue(null, 1_000_000, 1_150_000), 'string');
+});
+
+test('allows single-flight scrape timeouts longer than cadence with skipped ticks and shrinking end budgets', () => {
+  const value = syntheticBacklog();
+  value.samples = value.samples.filter((_, index) => index % 3 === 0);
+  value.samples.forEach(sample => { sample.request_end_unix_ms = sample.request_start_unix_ms + 1_500; });
+  assert.equal(publicationBacklogIssue(value, 1_000_000, 1_150_000), undefined);
+  const endBudget = syntheticBacklog();
+  assert.equal(endBudget.samples[endBudget.samples.length - 1]!.request_timeout_ms, 1_000);
+  assert.equal(publicationBacklogIssue(endBudget, 1_000_000, 1_150_000), undefined);
 });
 
 test('rejects sustained positive publication rows, bytes, publications, or age trends without zero filling', () => {

@@ -355,7 +355,7 @@ export function publicationBacklogIssue(value: unknown, start: number, end: numb
       !Array.isArray(value.samples) || value.samples.length < 2 || value.samples.length > 10_000) return unavailable;
   const interval = nonNegativeInteger(value.sampling_interval_ms);
   const timeout = nonNegativeInteger(value.request_timeout_ms);
-  if (!interval || interval > 30_000 || !timeout || timeout > interval) return unavailable;
+  if (!interval || interval > 30_000 || !timeout || timeout > 30_000) return unavailable;
 
   const samples: Array<{ start: number; end: number; gauges: number[] }> = [];
   for (const sample of value.samples) {
@@ -363,12 +363,14 @@ export function publicationBacklogIssue(value: unknown, start: number, end: numb
         sample.status !== null && typeof sample.status !== 'string') return unavailable;
     const requestStart = nonNegativeInteger(sample.request_start_unix_ms);
     const requestEnd = nonNegativeInteger(sample.request_end_unix_ms);
+    const requestBudget = nonNegativeInteger(sample.request_timeout_ms);
     const publications = nonNegativeInteger(sample.publications);
     const rows = nonNegativeInteger(sample.rows);
     const bytes = nonNegativeInteger(sample.logical_bytes);
     const age = sample.oldest_age_seconds;
-    if (requestStart === undefined || requestEnd === undefined || requestEnd < requestStart ||
-        requestEnd - requestStart > timeout || requestStart < start || requestEnd > end ||
+    if (requestStart === undefined || requestEnd === undefined || !requestBudget ||
+        requestBudget > timeout || requestBudget > end - requestStart || requestEnd < requestStart ||
+        requestEnd - requestStart > requestBudget || requestStart < start || requestEnd > end ||
         publications === undefined || rows === undefined || bytes === undefined ||
         typeof age !== 'number' || !Number.isFinite(age) || age < 0) return unavailable;
     const previous = samples[samples.length - 1];
