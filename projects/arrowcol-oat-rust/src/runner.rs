@@ -11293,16 +11293,14 @@ fn parse_cadvisor_cpu_counters(
         }
         let counter = value as u64;
         match name {
-            "container_cpu_cfs_periods_total" => {
-                if periods.replace(counter).is_some() {
-                    bail!("cAdvisor returned ambiguous CPU period counters for {pod}/{container}");
-                }
+            "container_cpu_cfs_periods_total" if periods.is_some() => {
+                bail!("cAdvisor returned ambiguous CPU period counters for {pod}/{container}");
             }
-            "container_cpu_cfs_throttled_periods_total" => {
-                if throttled_periods.replace(counter).is_some() {
-                    bail!("cAdvisor returned ambiguous throttling counters for {pod}/{container}");
-                }
+            "container_cpu_cfs_periods_total" => periods = Some(counter),
+            "container_cpu_cfs_throttled_periods_total" if throttled_periods.is_some() => {
+                bail!("cAdvisor returned ambiguous throttling counters for {pod}/{container}");
             }
+            "container_cpu_cfs_throttled_periods_total" => throttled_periods = Some(counter),
             _ => {}
         }
     }
@@ -11315,7 +11313,15 @@ fn parse_cadvisor_cpu_counters(
     }
 }
 
-fn aks_resource_pod_targets(readbacks: &[Value]) -> Result<Vec<(String, String, String, String, String)>> {
+struct AksResourcePodTarget {
+    role: String,
+    pod: String,
+    uid: String,
+    container: String,
+    node: String,
+}
+
+fn aks_resource_pod_targets(readbacks: &[Value]) -> Result<Vec<AksResourcePodTarget>> {
     let mut targets = Vec::new();
     for readback in readbacks {
         let role = readback
@@ -11339,13 +11345,13 @@ fn aks_resource_pod_targets(readbacks: &[Value]) -> Result<Vec<(String, String, 
                 .get("container")
                 .and_then(Value::as_str)
                 .context("AKS resource evidence omitted container")?;
-            targets.push((
-                role.to_owned(),
-                name.to_owned(),
-                uid.to_owned(),
-                container.to_owned(),
-                node.to_owned(),
-            ));
+            targets.push(AksResourcePodTarget {
+                role: role.to_owned(),
+                pod: name.to_owned(),
+                uid: uid.to_owned(),
+                container: container.to_owned(),
+                node: node.to_owned(),
+            });
             Ok(())
         };
         if role == "client" {
@@ -11370,7 +11376,10 @@ fn aks_resource_pod_targets(readbacks: &[Value]) -> Result<Vec<(String, String, 
 
 async fn capture_aks_cpu_throttling(config: &OatConfig, readbacks: &[Value]) -> Result<Vec<CpuThrottleSample>> {
     let targets = aks_resource_pod_targets(readbacks)?;
-    let nodes = targets.iter().map(|target| target.4.clone()).collect::<BTreeSet<_>>();
+    let nodes = targets
+        .iter()
+        .map(|target| target.node.clone())
+        .collect::<BTreeSet<_>>();
     let scrape = tokio::time::timeout(
         Duration::from_millis(AKS_RESOURCE_COUNTER_SNAPSHOT_TIMEOUT_MS),
         join_all(nodes.iter().map(|node| async move {
@@ -11394,25 +11403,27 @@ async fn capture_aks_cpu_throttling(config: &OatConfig, readbacks: &[Value]) -> 
             .collect::<HashMap<_, _>>(),
     };
     let mut samples = Vec::with_capacity(targets.len());
-    for (role, pod, uid, container, node) in targets {
-        let (counters, unavailable_reason) = match node_metrics.get(&node) {
-            Some(Ok(metrics)) => match parse_cadvisor_cpu_counters(metrics, &config.namespace, &pod, &container) {
-                Ok(Some(counters)) => (Some(counters), None),
-                Ok(None) => (None, Some("cAdvisor cgroup CPU counters are unavailable".to_owned())),
-                Err(error) => (
-                    None,
-                    Some(format!("cAdvisor counters are ambiguous or invalid: {error:#}")),
-                ),
-            },
+    for target in targets {
+        let (counters, unavailable_reason) = match node_metrics.get(&target.node) {
+            Some(Ok(metrics)) => {
+                match parse_cadvisor_cpu_counters(metrics, &config.namespace, &target.pod, &target.container) {
+                    Ok(Some(counters)) => (Some(counters), None),
+                    Ok(None) => (None, Some("cAdvisor cgroup CPU counters are unavailable".to_owned())),
+                    Err(error) => (
+                        None,
+                        Some(format!("cAdvisor counters are ambiguous or invalid: {error:#}")),
+                    ),
+                }
+            }
             Some(Err(error)) => (None, Some(format!("cAdvisor scrape failed: {error}"))),
             None => (None, Some("cAdvisor node scrape was not attempted".to_owned())),
         };
         samples.push(CpuThrottleSample {
-            role,
-            pod,
-            uid,
-            container,
-            node,
+            role: target.role,
+            pod: target.pod,
+            uid: target.uid,
+            container: target.container,
+            node: target.node,
             counters,
             unavailable_reason,
         });
@@ -15772,11 +15783,16 @@ mod aks_resource_readback_tests {
     use super::*;
 
     fn requirements() -> ResourceRequirements {
-        serde_json::from_value(json!({
-            "requests": {"cpu": "2", "memory": "4Gi"},
-            "limits": {"cpu": "2", "memory": "6Gi"}
-        }))
-        .expect("valid resource requirements")
+        ResourceRequirements {
+            requests: ResourceValues {
+                cpu: "2".to_owned(),
+                memory: "4Gi".to_owned(),
+            },
+            limits: ResourceValues {
+                cpu: "2".to_owned(),
+                memory: "6Gi".to_owned(),
+            },
+        }
     }
 
     #[test]
