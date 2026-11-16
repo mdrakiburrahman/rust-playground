@@ -389,7 +389,7 @@ impl DeltaBackend {
         let backlog_token =
             match self
                 .metrics
-                .publication_backlog_start(publication_id.clone(), rows, bytes, accepted.into_std())
+                .publication_backlog_start(publication_id, rows, bytes, accepted.into_std())
             {
                 Ok(token) => Some(token),
                 Err(error) => {
@@ -704,7 +704,7 @@ async fn run_batch_worker(
                     FlushReason::TargetParquetBytes
                 }
             })
-            .or_else(|| {
+            .or({
                 if bytes >= policy.max_arrow_memory_per_flush {
                     Some(FlushReason::MemoryCap)
                 } else if rows >= policy.max_rows_per_flush {

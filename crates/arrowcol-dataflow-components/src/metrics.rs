@@ -927,7 +927,7 @@ impl PublicationBacklog {
         };
         let token = PublicationBacklogToken(token_id);
         self.entries.insert(
-            id.clone(),
+            id,
             PublicationBacklogEntry {
                 token,
                 pending_admissions: 1,
@@ -1177,6 +1177,10 @@ impl RuntimeMetrics {
     /// Replays share a generation token; later settlement of an already committed replay is
     /// idempotent and cannot settle a newer admission generation with the same publication ID.
     /// Unknown tokens or previous accounting loss return an error and leave the cohort unknown.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the token is unknown or backlog accounting is unavailable.
     pub fn publication_backlog_commit(&self, token: PublicationBacklogToken) -> Result<(), String> {
         self.publication_backlog().commit(token)
     }
