@@ -4,17 +4,18 @@ import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { parse } from 'yaml';
 
-import { dashboardUrl, parseCaptureArgs } from './capture.js';
+import { dashboardUrl, parseCaptureArgs, queryResultState } from './capture.js';
 
 const dashboardPath = fileURLToPath(new URL('./throughput-dashboard.json', import.meta.url));
 const composePath = fileURLToPath(new URL('../compose.yaml', import.meta.url));
 const prometheusPath = fileURLToPath(new URL('./prometheus.yaml', import.meta.url));
 
-test('capture plan uses one explicit time window and fixed run variants', () => {
+test('comparison keeps equal actual windows and uses emitted variant labels in URLs', () => {
   const plan = parseCaptureArgs([
     '--baseline-run=run-001', '--baseline-from=2026-11-15T10:00:00Z', '--baseline-to=2026-11-15T10:05:00Z',
     '--bottleneck-run=run-002', '--bottleneck-from=2026-11-15T12:00:00Z', '--bottleneck-to=2026-11-15T12:05:00Z',
     '--best-run=run-003', '--best-from=2026-11-15T14:00:00Z', '--best-to=2026-11-15T14:05:00Z',
+    '--baseline-variant=default', '--bottleneck-variant=large-batch', '--best-variant=tuned-v2',
   ]);
   assert.deepEqual(plan.captures.map(({ name }) => name), [
     'baseline', 'diagnosed-bottleneck', 'best-sustained-candidate',
@@ -30,8 +31,24 @@ test('capture plan uses one explicit time window and fixed run variants', () => 
   ]);
   assert.deepEqual(urls.map(url => url.searchParams.get('var-run')), ['run-001', 'run-002', 'run-003']);
   assert.deepEqual(urls.map(url => url.searchParams.get('var-variant')), [
-    'baseline', 'diagnosed-bottleneck', 'best-sustained-candidate',
+    'default', 'large-batch', 'tuned-v2',
   ]);
+});
+
+test('a single milestone is immediately capturable but partial captures and empty plans are rejected', () => {
+  for (const key of ['baseline', 'bottleneck', 'best']) {
+    const args = [
+      `--${key}-run=run-001`, `--${key}-variant=actual-v1`,
+      `--${key}-from=2026-11-15T10:00:00Z`, `--${key}-to=2026-11-15T10:05:00Z`,
+    ];
+    const plan = parseCaptureArgs(args);
+    assert.equal(plan.captures.length, 1);
+    const url = dashboardUrl('http://localhost:3000', plan, plan.captures[0]);
+    assert.equal(url.searchParams.get('var-variant'), 'actual-v1');
+    assert.equal(url.searchParams.get('var-run'), 'run-001');
+    assert.throws(() => parseCaptureArgs(args.filter(arg => !arg.includes('-variant='))), /Missing required/u);
+  }
+  assert.throws(() => parseCaptureArgs([]), /At least one capture/u);
 });
 
 test('capture plan rejects timezone ambiguity, reversed windows, and unbounded labels', () => {
@@ -39,6 +56,7 @@ test('capture plan rejects timezone ambiguity, reversed windows, and unbounded l
     '--baseline-run=base', '--baseline-from=2026-11-15T10:00:00Z', '--baseline-to=2026-11-15T10:05:00Z',
     '--bottleneck-run=diag', '--bottleneck-from=2026-11-15T12:00:00Z', '--bottleneck-to=2026-11-15T12:05:00Z',
     '--best-run=best', '--best-from=2026-11-15T14:00:00Z', '--best-to=2026-11-15T14:05:00Z',
+    '--baseline-variant=default', '--bottleneck-variant=diagnosed', '--best-variant=tuned',
   ];
   assert.throws(() => parseCaptureArgs([
     ...fixed.filter(option => !option.startsWith('--baseline-from=')),
@@ -56,6 +74,27 @@ test('capture plan rejects timezone ambiguity, reversed windows, and unbounded l
     ...fixed.filter(option => !option.startsWith('--baseline-run=')),
     '--baseline-run=.*',
   ]), /fixed low-cardinality/u);
+  assert.throws(() => parseCaptureArgs([
+    ...fixed.filter(option => !option.startsWith('--baseline-variant=')),
+    '--baseline-variant=.*',
+  ]), /fixed low-cardinality variant/u);
+  const pair = fixed.filter(option => !option.startsWith('--best-'));
+  assert.equal(parseCaptureArgs(pair).captures.length, 2);
+  assert.throws(() => parseCaptureArgs([
+    ...pair.filter(option => !option.startsWith('--bottleneck-to=')),
+    '--bottleneck-to=2026-11-15T12:06:00Z',
+  ]), /same measurement-window duration/u);
+});
+
+test('readiness requires completed query frames, distinguishes no data, and rejects failures', () => {
+  assert.equal(queryResultState({ status: 200, frames: [{ data: { values: [[1], [42]] } }] }), 'data');
+  assert.equal(queryResultState({ status: 200, frames: [] }), 'unavailable');
+  assert.equal(queryResultState({ frames: [{ data: { values: [[], []] } }] }), 'unavailable');
+  assert.throws(() => queryResultState(undefined), /Missing Grafana query result/u);
+  assert.throws(() => queryResultState({ status: 200 }), /completed frames/u);
+  assert.throws(() => queryResultState({ frames: [{}] }), /malformed frame/u);
+  assert.throws(() => queryResultState({ status: 500, frames: [] }), /query failed/u);
+  assert.throws(() => queryResultState({ error: 'timeout', frames: [] }), /timeout/u);
 });
 
 test('throughput dashboard keeps the required panel order and bounded metric labels', async () => {
