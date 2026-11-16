@@ -43,6 +43,16 @@ test('generates bounded local single-writer manifests from the tunables registry
       ]);
       assert.equal((manifest.refinement as { max_candidates: number }).max_candidates, 4);
     }
+    if (manifest.cohort === 'C2') {
+      const columns = comparisons.find(comparison => comparison.id === 'dictionary-encoding')!;
+      assert.deepEqual(columns.candidates.map(item => item.id), [
+        'availability-group-name-dictionary-off', 'availability-group-name-dictionary-on',
+        'last-connect-error-delta-binary-packed', 'last-connect-error-byte-stream-split',
+      ]);
+      assert.deepEqual(columns.candidates.map(item => Object.keys(at(item.overrides, ['tunables', 'parquet_writer', 'columns']) as object)), [
+        ['availability_group_name'], ['availability_group_name'], ['last_connect_error_number'], ['last_connect_error_number'],
+      ]);
+    }
     if (manifest.cohort === 'C3') {
       const rows = comparisons.find(comparison => comparison.id === 'max-rows')!;
       assert.deepEqual(rows.candidates.map(item => at(item.overrides, ['tunables', 'collector', 'layout', 'max_rows'])), [16384, 65536, 131072, 1000000]);
@@ -58,9 +68,16 @@ test('generates bounded local single-writer manifests from the tunables registry
     if (manifest.cohort === 'C4') {
       const sort = comparisons.find(comparison => comparison.id === 'sort-key')!;
       assert.deepEqual(sort.candidates.map(item => item.id), ['none', 'sample-time', 'replica-sample-time', 'group-replica-sample-time']);
+      assert.equal(at(sort.candidates[0]!.overrides, ['tunables', 'collector', 'layout', 'enabled']), true);
       assert.deepEqual(sort.candidates.map(item => at(item.overrides, ['tunables', 'collector', 'layout', 'sort_columns'])), [
         [], ['sample_time_utc'], ['replica_server_name', 'sample_time_utc'],
         ['availability_group_id', 'replica_server_name', 'sample_time_utc'],
+      ]);
+      assert.deepEqual(at(sort.candidates[0]!.overrides, ['tunables', 'parquet_writer', 'sorting_columns']), []);
+      assert.deepEqual(sort.candidates.map(item => (at(item.overrides, ['tunables', 'parquet_writer', 'sorting_columns']) as Array<{ path: string; descending: boolean; nulls_first: boolean }>).map(column => [column.path, column.descending, column.nulls_first])), [
+        [], [['sample_time_utc', false, false]],
+        [['replica_server_name', false, false], ['sample_time_utc', false, false]],
+        [['availability_group_id', false, false], ['replica_server_name', false, false], ['sample_time_utc', false, false]],
       ]);
     }
     if (manifest.cohort === 'C8') {

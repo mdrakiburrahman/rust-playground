@@ -1,0 +1,596 @@
+{
+  "schema_version": 1,
+  "validation_kind": "config-validated",
+  "validator": "arrowcol-oat-rust --validate-config",
+  "validation_sources": {
+    "e1_source_sha": "52a95e06633708bc4896b1a54e868516d1068ca6",
+    "l1a_source_sha": "00e1e2bf12cc754892d24bcda6bcbe60a6723bfd"
+  },
+  "runnable_candidate_count": 82,
+  "pass_count": 82,
+  "pending_count": 0,
+  "manifests": [
+    {
+      "cohort": "C1",
+      "status": "config-validated",
+      "runnable": true,
+      "candidate_count": 8,
+      "pass_count": 8,
+      "pending_count": 0,
+      "excluded_pending_candidate_sets": []
+    },
+    {
+      "cohort": "C2",
+      "status": "config-validated",
+      "runnable": true,
+      "candidate_count": 4,
+      "pass_count": 4,
+      "pending_count": 0,
+      "excluded_pending_candidate_sets": []
+    },
+    {
+      "cohort": "C3",
+      "status": "config-validated",
+      "runnable": true,
+      "candidate_count": 16,
+      "pass_count": 16,
+      "pending_count": 0,
+      "excluded_pending_candidate_sets": []
+    },
+    {
+      "cohort": "C4",
+      "status": "config-validated",
+      "runnable": true,
+      "candidate_count": 4,
+      "pass_count": 4,
+      "pending_count": 0,
+      "excluded_pending_candidate_sets": []
+    },
+    {
+      "cohort": "C5",
+      "status": "config-validated",
+      "runnable": true,
+      "candidate_count": 19,
+      "pass_count": 19,
+      "pending_count": 0,
+      "excluded_pending_candidate_sets": []
+    },
+    {
+      "cohort": "C6",
+      "status": "config-validated",
+      "runnable": true,
+      "candidate_count": 13,
+      "pass_count": 13,
+      "pending_count": 0,
+      "excluded_pending_candidate_sets": []
+    },
+    {
+      "cohort": "C7",
+      "status": "config-validated",
+      "runnable": true,
+      "candidate_count": 12,
+      "pass_count": 12,
+      "pending_count": 0,
+      "excluded_pending_candidate_sets": []
+    },
+    {
+      "cohort": "C8",
+      "status": "config-validated",
+      "runnable": true,
+      "candidate_count": 6,
+      "pass_count": 6,
+      "pending_count": 0,
+      "excluded_pending_candidate_sets": [
+        {
+          "id": "staging-overlap",
+          "status": "pending-L1b",
+          "candidate_count": 2
+        }
+      ]
+    }
+  ],
+  "known_gap_cells": {
+    "r1_2_global_bloom_true_column_false": {
+      "status": "not-present-in-runnable-manifests",
+      "candidate_count": 0
+    },
+    "r1_3_offset_index_disabled_global_page": {
+      "status": "not-present-in-runnable-manifests",
+      "candidate_count": 0
+    }
+  },
+  "cells": [
+    {
+      "cohort": "C1",
+      "comparison": "codec",
+      "candidate": "uncompressed",
+      "status": "pass"
+    },
+    {
+      "cohort": "C1",
+      "comparison": "codec",
+      "candidate": "snappy",
+      "status": "pass"
+    },
+    {
+      "cohort": "C1",
+      "comparison": "codec",
+      "candidate": "lz4-raw",
+      "status": "pass"
+    },
+    {
+      "cohort": "C1",
+      "comparison": "codec",
+      "candidate": "gzip",
+      "status": "pass"
+    },
+    {
+      "cohort": "C1",
+      "comparison": "codec",
+      "candidate": "brotli",
+      "status": "pass"
+    },
+    {
+      "cohort": "C1",
+      "comparison": "codec",
+      "candidate": "zstd-1",
+      "status": "pass"
+    },
+    {
+      "cohort": "C1",
+      "comparison": "codec",
+      "candidate": "zstd-3",
+      "status": "pass"
+    },
+    {
+      "cohort": "C1",
+      "comparison": "codec",
+      "candidate": "zstd-6",
+      "status": "pass"
+    },
+    {
+      "cohort": "C2",
+      "comparison": "dictionary-encoding",
+      "candidate": "availability-group-name-dictionary-off",
+      "status": "pass"
+    },
+    {
+      "cohort": "C2",
+      "comparison": "dictionary-encoding",
+      "candidate": "availability-group-name-dictionary-on",
+      "status": "pass"
+    },
+    {
+      "cohort": "C2",
+      "comparison": "dictionary-encoding",
+      "candidate": "last-connect-error-delta-binary-packed",
+      "status": "pass"
+    },
+    {
+      "cohort": "C2",
+      "comparison": "dictionary-encoding",
+      "candidate": "last-connect-error-byte-stream-split",
+      "status": "pass"
+    },
+    {
+      "cohort": "C3",
+      "comparison": "row-groups",
+      "candidate": "row-group-16384",
+      "status": "pass"
+    },
+    {
+      "cohort": "C3",
+      "comparison": "row-groups",
+      "candidate": "row-group-65536",
+      "status": "pass"
+    },
+    {
+      "cohort": "C3",
+      "comparison": "row-groups",
+      "candidate": "row-group-131072",
+      "status": "pass"
+    },
+    {
+      "cohort": "C3",
+      "comparison": "row-groups",
+      "candidate": "row-group-1000000",
+      "status": "pass"
+    },
+    {
+      "cohort": "C3",
+      "comparison": "max-rows",
+      "candidate": "max-rows-16384",
+      "status": "pass"
+    },
+    {
+      "cohort": "C3",
+      "comparison": "max-rows",
+      "candidate": "max-rows-65536",
+      "status": "pass"
+    },
+    {
+      "cohort": "C3",
+      "comparison": "max-rows",
+      "candidate": "max-rows-131072",
+      "status": "pass"
+    },
+    {
+      "cohort": "C3",
+      "comparison": "max-rows",
+      "candidate": "max-rows-1000000",
+      "status": "pass"
+    },
+    {
+      "cohort": "C3",
+      "comparison": "page-rows",
+      "candidate": "page-1024",
+      "status": "pass"
+    },
+    {
+      "cohort": "C3",
+      "comparison": "page-rows",
+      "candidate": "page-2048",
+      "status": "pass"
+    },
+    {
+      "cohort": "C3",
+      "comparison": "page-rows",
+      "candidate": "page-4096",
+      "status": "pass"
+    },
+    {
+      "cohort": "C3",
+      "comparison": "rollover-cap",
+      "candidate": "input-134217728",
+      "status": "pass"
+    },
+    {
+      "cohort": "C3",
+      "comparison": "rollover-cap",
+      "candidate": "input-268435456",
+      "status": "pass"
+    },
+    {
+      "cohort": "C3",
+      "comparison": "rollover-cap",
+      "candidate": "input-536870912",
+      "status": "pass"
+    },
+    {
+      "cohort": "C3",
+      "comparison": "coalescing",
+      "candidate": "coalesce-false",
+      "status": "pass"
+    },
+    {
+      "cohort": "C3",
+      "comparison": "coalescing",
+      "candidate": "coalesce-true",
+      "status": "pass"
+    },
+    {
+      "cohort": "C4",
+      "comparison": "sort-key",
+      "candidate": "none",
+      "status": "pass"
+    },
+    {
+      "cohort": "C4",
+      "comparison": "sort-key",
+      "candidate": "sample-time",
+      "status": "pass"
+    },
+    {
+      "cohort": "C4",
+      "comparison": "sort-key",
+      "candidate": "replica-sample-time",
+      "status": "pass"
+    },
+    {
+      "cohort": "C4",
+      "comparison": "sort-key",
+      "candidate": "group-replica-sample-time",
+      "status": "pass"
+    },
+    {
+      "cohort": "C5",
+      "comparison": "workers",
+      "candidate": "workers-8",
+      "status": "pass"
+    },
+    {
+      "cohort": "C5",
+      "comparison": "workers",
+      "candidate": "workers-16",
+      "status": "pass"
+    },
+    {
+      "cohort": "C5",
+      "comparison": "workers",
+      "candidate": "workers-32",
+      "status": "pass"
+    },
+    {
+      "cohort": "C5",
+      "comparison": "workers",
+      "candidate": "workers-64",
+      "status": "pass"
+    },
+    {
+      "cohort": "C5",
+      "comparison": "streams",
+      "candidate": "streams-1",
+      "status": "pass"
+    },
+    {
+      "cohort": "C5",
+      "comparison": "streams",
+      "candidate": "streams-2",
+      "status": "pass"
+    },
+    {
+      "cohort": "C5",
+      "comparison": "streams",
+      "candidate": "streams-4",
+      "status": "pass"
+    },
+    {
+      "cohort": "C5",
+      "comparison": "connections",
+      "candidate": "connections-1",
+      "status": "pass"
+    },
+    {
+      "cohort": "C5",
+      "comparison": "connections",
+      "candidate": "connections-2",
+      "status": "pass"
+    },
+    {
+      "cohort": "C5",
+      "comparison": "connections",
+      "candidate": "connections-4",
+      "status": "pass"
+    },
+    {
+      "cohort": "C5",
+      "comparison": "corpus",
+      "candidate": "corpus-16384",
+      "status": "pass"
+    },
+    {
+      "cohort": "C5",
+      "comparison": "corpus",
+      "candidate": "corpus-65536",
+      "status": "pass"
+    },
+    {
+      "cohort": "C5",
+      "comparison": "corpus",
+      "candidate": "corpus-262144",
+      "status": "pass"
+    },
+    {
+      "cohort": "C5",
+      "comparison": "interval",
+      "candidate": "interval-0",
+      "status": "pass"
+    },
+    {
+      "cohort": "C5",
+      "comparison": "interval",
+      "candidate": "interval-1000",
+      "status": "pass"
+    },
+    {
+      "cohort": "C5",
+      "comparison": "interval",
+      "candidate": "interval-10000",
+      "status": "pass"
+    },
+    {
+      "cohort": "C5",
+      "comparison": "ipc-compression",
+      "candidate": "ipc-none",
+      "status": "pass"
+    },
+    {
+      "cohort": "C5",
+      "comparison": "ipc-compression",
+      "candidate": "ipc-lz4_frame",
+      "status": "pass"
+    },
+    {
+      "cohort": "C5",
+      "comparison": "ipc-compression",
+      "candidate": "ipc-zstd",
+      "status": "pass"
+    },
+    {
+      "cohort": "C6",
+      "comparison": "dfe-concurrency",
+      "candidate": "dfe-1",
+      "status": "pass"
+    },
+    {
+      "cohort": "C6",
+      "comparison": "dfe-concurrency",
+      "candidate": "dfe-2",
+      "status": "pass"
+    },
+    {
+      "cohort": "C6",
+      "comparison": "dfe-concurrency",
+      "candidate": "dfe-4",
+      "status": "pass"
+    },
+    {
+      "cohort": "C6",
+      "comparison": "dfe-concurrency",
+      "candidate": "dfe-8",
+      "status": "pass"
+    },
+    {
+      "cohort": "C6",
+      "comparison": "cpu-workers",
+      "candidate": "cpu-1",
+      "status": "pass"
+    },
+    {
+      "cohort": "C6",
+      "comparison": "cpu-workers",
+      "candidate": "cpu-2",
+      "status": "pass"
+    },
+    {
+      "cohort": "C6",
+      "comparison": "cpu-workers",
+      "candidate": "cpu-4",
+      "status": "pass"
+    },
+    {
+      "cohort": "C6",
+      "comparison": "upload-concurrency",
+      "candidate": "upload-1",
+      "status": "pass"
+    },
+    {
+      "cohort": "C6",
+      "comparison": "upload-concurrency",
+      "candidate": "upload-4",
+      "status": "pass"
+    },
+    {
+      "cohort": "C6",
+      "comparison": "upload-concurrency",
+      "candidate": "upload-8",
+      "status": "pass"
+    },
+    {
+      "cohort": "C6",
+      "comparison": "flush-concurrency",
+      "candidate": "flush-1",
+      "status": "pass"
+    },
+    {
+      "cohort": "C6",
+      "comparison": "flush-concurrency",
+      "candidate": "flush-2",
+      "status": "pass"
+    },
+    {
+      "cohort": "C6",
+      "comparison": "flush-concurrency",
+      "candidate": "flush-4",
+      "status": "pass"
+    },
+    {
+      "cohort": "C7",
+      "comparison": "maintenance-cadence",
+      "candidate": "cadence-30",
+      "status": "pass"
+    },
+    {
+      "cohort": "C7",
+      "comparison": "maintenance-cadence",
+      "candidate": "cadence-60",
+      "status": "pass"
+    },
+    {
+      "cohort": "C7",
+      "comparison": "maintenance-cadence",
+      "candidate": "cadence-120",
+      "status": "pass"
+    },
+    {
+      "cohort": "C7",
+      "comparison": "small-file-threshold",
+      "candidate": "small-file-16777216",
+      "status": "pass"
+    },
+    {
+      "cohort": "C7",
+      "comparison": "small-file-threshold",
+      "candidate": "small-file-33554432",
+      "status": "pass"
+    },
+    {
+      "cohort": "C7",
+      "comparison": "small-file-threshold",
+      "candidate": "small-file-67108864",
+      "status": "pass"
+    },
+    {
+      "cohort": "C7",
+      "comparison": "retry-budget",
+      "candidate": "attempts-1",
+      "status": "pass"
+    },
+    {
+      "cohort": "C7",
+      "comparison": "retry-budget",
+      "candidate": "attempts-3",
+      "status": "pass"
+    },
+    {
+      "cohort": "C7",
+      "comparison": "retry-budget",
+      "candidate": "attempts-5",
+      "status": "pass"
+    },
+    {
+      "cohort": "C7",
+      "comparison": "checkpoint-interval",
+      "candidate": "checkpoint-64",
+      "status": "pass"
+    },
+    {
+      "cohort": "C7",
+      "comparison": "checkpoint-interval",
+      "candidate": "checkpoint-256",
+      "status": "pass"
+    },
+    {
+      "cohort": "C7",
+      "comparison": "checkpoint-interval",
+      "candidate": "checkpoint-1024",
+      "status": "pass"
+    },
+    {
+      "cohort": "C8",
+      "comparison": "commit-window",
+      "candidate": "window-1s",
+      "status": "pass"
+    },
+    {
+      "cohort": "C8",
+      "comparison": "commit-window",
+      "candidate": "window-2s",
+      "status": "pass"
+    },
+    {
+      "cohort": "C8",
+      "comparison": "commit-window",
+      "candidate": "window-5s",
+      "status": "pass"
+    },
+    {
+      "cohort": "C8",
+      "comparison": "files-per-commit",
+      "candidate": "files-16",
+      "status": "pass"
+    },
+    {
+      "cohort": "C8",
+      "comparison": "files-per-commit",
+      "candidate": "files-64",
+      "status": "pass"
+    },
+    {
+      "cohort": "C8",
+      "comparison": "files-per-commit",
+      "candidate": "files-128",
+      "status": "pass"
+    }
+  ]
+}
