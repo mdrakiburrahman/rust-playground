@@ -12987,7 +12987,7 @@ mod tests {
         assert_eq!(outcomes[0]["maintenance_operation_failure"], false);
         assert_eq!(outcomes[0]["maintenance_exit_classification"], "classified_retries_only");
         assert_eq!(outcomes[0]["exit_code"], 1);
-        assert!(!outcomes.to_string().contains("private"));
+        assert!(!serde_json::to_string(&outcomes)?.contains("private"));
         fs::write(fixture.join("mode"), "stop_failure")?;
 
         config.platform.kind = crate::config::OatMode::Aks;

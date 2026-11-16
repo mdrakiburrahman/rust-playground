@@ -487,6 +487,7 @@ struct MaintenanceCompactionDebt {
 struct MaintenanceProtectedPartitionBacklog {
     files: u64,
     bytes: u64,
+    #[serde(deserialize_with = "deserialize_present_due_work_option")]
     oldest_partition_start_ms: Option<i64>,
 }
 
@@ -692,7 +693,11 @@ fn maintenance_table_evidence(config: &OatConfig, text: &str) -> Result<Value> {
             records_complete = false;
             continue;
         };
+        if value.get("operation").is_none() {
+            continue;
+        }
         if !value["operation"].is_string() || !value["applied"].is_boolean() {
+            records_complete = false;
             continue;
         }
         let table = value["table"]
@@ -966,7 +971,7 @@ mod maintenance_topology_tests {
         debt_report["report"]["compaction_debt"] = json!({
             "observed_at_ms": 1700000000000_i64, "source": "snapshot_active_files",
             "eligible_files": 4, "eligible_bytes": 1000, "backlog_files": 2, "backlog_bytes": 500,
-            "oldest_eligible_partition_start_ms": null
+            "oldest_eligible_partition_start_ms": null, "protected_partition_backlog": null
         });
         let debt = maintenance_table_evidence(&config, &format!("{text}{debt_report}\n"))?;
         assert_eq!(debt["operation_reports"][0]["compaction_debt"], debt_report["report"]["compaction_debt"]);
@@ -988,6 +993,15 @@ mod maintenance_topology_tests {
         );
         assert!(failure_evidence["operation_outcomes"]["comment"].as_str().is_some());
         assert!(!failure_evidence.to_string().contains("private operation error"));
+        let mut stale = failed.clone();
+        stale["error_kind"] = json!("stale_plan");
+        let retry = maintenance_table_evidence(&config, &format!("{text}{stale}\n"))?;
+        assert_eq!(retry["operation_outcomes"]["error_count"], 0);
+        assert_eq!(retry["operation_outcomes"]["retry_kind_counts"], json!({"stale_plan":1}));
+        assert_eq!(retry["operation_reports"][0]["operation_failed"], false);
+        assert_eq!(retry["operation_reports"][0]["retry_kind"], "stale_plan");
+        assert!(retry["operation_reports"][0]["maintenance_due_work"].is_null());
+        assert!(!retry.to_string().contains("private operation error"));
         failed = report.clone();
         failed["applied"] = json!(true);
         assert!(maintenance_table_evidence(&config, &format!("{text}{failed}\n")).is_err());
