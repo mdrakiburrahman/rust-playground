@@ -1,6 +1,8 @@
+use std::future::Future;
 use std::path::Path;
 use std::str::FromStr;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use arrowcol_protocol::{
     BasisPoints, CatalogName, CollectorInstanceId, FencingToken, ImplementationPool, LeaseId, Measurement,
@@ -18,7 +20,12 @@ use crate::{
     RoutingStore, RoutingView, RunTablePin, SubsystemState,
 };
 
-use arrowcol_sql_server::{ConnectionConfig, SqlClient, SqlConnection, SqlPool};
+use arrowcol_sql_server::{ConnectionConfig, PoolConfig, SqlClient, SqlConnection, SqlPool};
+
+pub trait SqlOperationObserver: Send + Sync {
+    fn connection_opened(&self);
+    fn operation(&self, operation: &'static str, elapsed: Duration, success: bool);
+}
 
 const LEASE_COLUMNS: &str = "\
     implementation_pool, catalog_name, schema_name, table_name, lease_id, holder_instance_id, \
@@ -102,6 +109,27 @@ impl SqlServerRoutingConfig {
         self
     }
 
+    /// Creates a bounded pool using this store's connection settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns invalid configuration if the pool settings are unsupported.
+    pub fn create_pool(&self, max_size: usize, acquire_timeout: Duration) -> RoutingResult<SqlPool> {
+        SqlPool::new(
+            self.connection_config(),
+            PoolConfig {
+                max_size,
+                acquire_timeout,
+            },
+        )
+        .map_err(|error| {
+            RoutingError::new(
+                RoutingErrorKind::InvalidConfiguration,
+                format!("create SQL Server pool: {error}"),
+            )
+        })
+    }
+
     fn connection_config(&self) -> ConnectionConfig {
         ConnectionConfig::new(
             self.host.clone(),
@@ -129,7 +157,11 @@ impl SqlServerRoutingStore {
     #[must_use]
     pub const fn new(config: SqlServerRoutingConfig) -> Self {
         Self {
-            inner: RawSqlStore { config, pool: None },
+            inner: RawSqlStore {
+                config,
+                pool: None,
+                observer: None,
+            },
         }
     }
 
@@ -151,6 +183,59 @@ impl SqlServerRoutingStore {
         }
         self.inner.pool = Some(pool);
         Ok(self)
+    }
+
+    pub fn with_operation_observer(mut self, observer: Arc<dyn SqlOperationObserver>) -> Self {
+        self.inner.observer = Some(observer);
+        self
+    }
+
+    async fn record_operation<T>(
+        &self,
+        operation: &'static str,
+        future: impl Future<Output = RoutingResult<T>>,
+    ) -> RoutingResult<T> {
+        let timer = self
+            .inner
+            .observer
+            .as_ref()
+            .map(|observer| SqlOperationTimer::new(Arc::clone(observer), operation));
+        let result = future.await;
+        if let Some(timer) = timer {
+            timer.finish(result.is_ok());
+        }
+        result
+    }
+}
+
+struct SqlOperationTimer {
+    observer: Arc<dyn SqlOperationObserver>,
+    operation: &'static str,
+    started: Instant,
+    finished: bool,
+}
+
+impl SqlOperationTimer {
+    fn new(observer: Arc<dyn SqlOperationObserver>, operation: &'static str) -> Self {
+        Self {
+            observer,
+            operation,
+            started: Instant::now(),
+            finished: false,
+        }
+    }
+
+    fn finish(mut self, success: bool) {
+        self.observer.operation(self.operation, self.started.elapsed(), success);
+        self.finished = true;
+    }
+}
+
+impl Drop for SqlOperationTimer {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.observer.operation(self.operation, self.started.elapsed(), false);
+        }
     }
 }
 
@@ -227,7 +312,11 @@ where
 #[async_trait]
 impl RoutingStore for SqlServerRoutingStore {
     async fn register_collector(&self, registration: &CollectorRegistration) -> RoutingResult<()> {
-        retry_deadlock(|| self.inner.register_collector(registration)).await
+        self.record_operation(
+            "register_collector",
+            retry_deadlock(|| self.inner.register_collector(registration)),
+        )
+        .await
     }
 
     async fn heartbeat_collector(
@@ -236,10 +325,13 @@ impl RoutingStore for SqlServerRoutingStore {
         heartbeat_at: UnixMillis,
         lease_expires_at: UnixMillis,
     ) -> RoutingResult<()> {
-        retry_deadlock(|| {
-            self.inner
-                .heartbeat_collector(instance_id, heartbeat_at, lease_expires_at)
-        })
+        self.record_operation(
+            "heartbeat_collector",
+            retry_deadlock(|| {
+                self.inner
+                    .heartbeat_collector(instance_id, heartbeat_at, lease_expires_at)
+            }),
+        )
         .await
     }
 
@@ -249,19 +341,29 @@ impl RoutingStore for SqlServerRoutingStore {
         state: CollectorState,
         changed_at: UnixMillis,
     ) -> RoutingResult<()> {
-        retry_deadlock(|| self.inner.set_collector_state(instance_id, state, changed_at)).await
+        self.record_operation(
+            "set_collector_state",
+            retry_deadlock(|| self.inner.set_collector_state(instance_id, state, changed_at)),
+        )
+        .await
     }
 
     async fn publish_pressure(&self, snapshot: &RichPressureSnapshot) -> RoutingResult<()> {
-        retry_deadlock(|| self.inner.publish_pressure(snapshot)).await
+        self.record_operation(
+            "publish_pressure",
+            retry_deadlock(|| self.inner.publish_pressure(snapshot)),
+        )
+        .await
     }
 
     async fn load_view(&self, loaded_at: UnixMillis) -> RoutingResult<RoutingView> {
-        retry_deadlock(|| self.inner.load_view(loaded_at)).await
+        self.record_operation("load_view", retry_deadlock(|| self.inner.load_view(loaded_at)))
+            .await
     }
 
     async fn claim_lease(&self, claim: &LeaseClaim) -> RoutingResult<RoutingLease> {
-        retry_deadlock(|| self.inner.claim_lease(claim)).await
+        self.record_operation("claim_lease", retry_deadlock(|| self.inner.claim_lease(claim)))
+            .await
     }
 
     async fn initialize_run_table_set(
@@ -271,7 +373,11 @@ impl RoutingStore for SqlServerRoutingStore {
         expires_at: UnixMillis,
         now: UnixMillis,
     ) -> RoutingResult<()> {
-        retry_deadlock(|| self.inner.initialize_run_table_set(run_id, expected, expires_at, now)).await
+        self.record_operation(
+            "initialize_run_table_set",
+            retry_deadlock(|| self.inner.initialize_run_table_set(run_id, expected, expires_at, now)),
+        )
+        .await
     }
 
     async fn get_run_table_pin(
@@ -280,27 +386,51 @@ impl RoutingStore for SqlServerRoutingStore {
         key: &LeaseKey,
         now: UnixMillis,
     ) -> RoutingResult<Option<RunTablePin>> {
-        retry_deadlock(|| self.inner.get_run_table_pin(run_id, key, now)).await
+        self.record_operation(
+            "get_run_table_pin",
+            retry_deadlock(|| self.inner.get_run_table_pin(run_id, key, now)),
+        )
+        .await
     }
 
     async fn bind_initial_run_table_pin(&self, pin: &RunTablePin, now: UnixMillis) -> RoutingResult<RunTablePin> {
-        retry_deadlock(|| self.inner.bind_initial_run_table_pin(pin, now)).await
+        self.record_operation(
+            "bind_initial_run_table_pin",
+            retry_deadlock(|| self.inner.bind_initial_run_table_pin(pin, now)),
+        )
+        .await
     }
 
     async fn has_active_run_table_pin(&self, key: &LeaseKey, now: UnixMillis) -> RoutingResult<bool> {
-        retry_deadlock(|| self.inner.has_active_run_table_pin(key, now)).await
+        self.record_operation(
+            "has_active_run_table_pin",
+            retry_deadlock(|| self.inner.has_active_run_table_pin(key, now)),
+        )
+        .await
     }
 
     async fn begin_lease_drain(&self, request: &LeaseCas) -> RoutingResult<RoutingLease> {
-        retry_deadlock(|| self.inner.begin_lease_drain(request)).await
+        self.record_operation(
+            "begin_lease_drain",
+            retry_deadlock(|| self.inner.begin_lease_drain(request)),
+        )
+        .await
     }
 
     async fn transfer_drained_lease(&self, request: &LeaseTransfer) -> RoutingResult<RoutingLease> {
-        retry_deadlock(|| self.inner.transfer_drained_lease(request)).await
+        self.record_operation(
+            "transfer_drained_lease",
+            retry_deadlock(|| self.inner.transfer_drained_lease(request)),
+        )
+        .await
     }
 
     async fn transfer_to_successor(&self, request: &LeaseSuccession) -> RoutingResult<RoutingLease> {
-        retry_deadlock(|| self.inner.transfer_to_successor(request)).await
+        self.record_operation(
+            "transfer_to_successor",
+            retry_deadlock(|| self.inner.transfer_to_successor(request)),
+        )
+        .await
     }
 }
 
@@ -308,15 +438,23 @@ impl RoutingStore for SqlServerRoutingStore {
 struct RawSqlStore {
     config: SqlServerRoutingConfig,
     pool: Option<SqlPool>,
+    observer: Option<Arc<dyn SqlOperationObserver>>,
 }
 
 impl RawSqlStore {
     async fn connect(&self) -> RoutingResult<SqlConnection> {
-        match &self.pool {
+        let unpooled = self.pool.is_none();
+        let result = match &self.pool {
             Some(pool) => pool.acquire().await,
             None => SqlConnection::connect(&self.config.connection_config()).await,
+        };
+        if unpooled
+            && result.is_ok()
+            && let Some(observer) = &self.observer
+        {
+            observer.connection_opened();
         }
-        .map_err(|error| database_error("acquire SQL Server connection", error))
+        result.map_err(|error| database_error("acquire SQL Server connection", error))
     }
 }
 
@@ -2200,6 +2338,38 @@ mod pooling_tests {
             store.clone().inner.pool.as_ref().map(|pool| pool.stats().max_size),
             Some(0)
         );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod sql_operation_timer_tests {
+    use super::{SqlOperationObserver, SqlOperationTimer};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    #[derive(Default)]
+    struct RecordingObserver(Mutex<Vec<(&'static str, bool)>>);
+
+    impl SqlOperationObserver for RecordingObserver {
+        fn connection_opened(&self) {}
+
+        fn operation(&self, operation: &'static str, _: Duration, success: bool) {
+            if let Ok(mut calls) = self.0.lock() {
+                calls.push((operation, success));
+            }
+        }
+    }
+
+    #[test]
+    fn dropping_an_in_flight_operation_records_failure() -> Result<(), Box<dyn std::error::Error>> {
+        let recording = Arc::new(RecordingObserver::default());
+        let observer: Arc<dyn SqlOperationObserver> = Arc::<RecordingObserver>::clone(&recording);
+        drop(SqlOperationTimer::new(observer, "get_run_table_pin"));
+        let Ok(calls) = recording.0.lock() else {
+            return Err("observer lock poisoned".into());
+        };
+        assert_eq!(calls.as_slice(), &[("get_run_table_pin", false)]);
         Ok(())
     }
 }

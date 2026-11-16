@@ -3,9 +3,25 @@ use arrowcol_loadgen::{Cli, Command, runner, validation};
 use clap::Parser;
 use std::io::Write;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let cli = Cli::parse();
+    let mut runtime = tokio::runtime::Builder::new_multi_thread();
+    runtime.enable_all();
+    if let Command::Run(arguments) = &cli.command {
+        let threads = match arguments.client_tuning.runtime_threads {
+            0 => std::thread::available_parallelism()?.get(),
+            threads => threads,
+        };
+        anyhow::ensure!(
+            (1..=1024).contains(&threads),
+            "runtime-threads must resolve to 1..=1024"
+        );
+        runtime.worker_threads(threads);
+    }
+    runtime.build()?.block_on(run(cli))
+}
+
+async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Run(arguments) => runner::run(*arguments).await,
         Command::Validate(arguments) => validation::validate(arguments).await,

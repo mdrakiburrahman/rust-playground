@@ -534,10 +534,26 @@ test('CLI help is available and unknown options fail as usage errors', async () 
     console.log = originalLog;
   }
   assert.match(messages.join('\n'), /Usage:.*arrowcol-oat/s);
+  assert.match(messages.join('\n'), /--no-viewer/);
   await assert.rejects(
     main(['--not-a-real-option', '--config', '/missing-oat-config.json']),
     (error: unknown) => error instanceof Error && error.message === 'Unknown option: --not-a-real-option' && 'exitCode' in error && error.exitCode === 2,
   );
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'arrowcol-oat-no-viewer-'));
+  const previousExitCode = process.exitCode;
+  try {
+    await assert.rejects(
+      main(['--mode', 'local', '--no-viewer', '--config', path.join(directory, 'missing.json')]),
+      (error: unknown) => error instanceof Error && 'code' in error && error.code === 'ENOENT',
+    );
+    await assert.rejects(
+      main(['--mode', 'local', '--viewer-only', '--no-viewer', '--config', path.join(directory, 'missing.json')]),
+      (error: unknown) => error instanceof Error && error.message.includes('--no-viewer requires a local benchmark run') && 'exitCode' in error && error.exitCode === 2,
+    );
+  } finally {
+    process.exitCode = previousExitCode;
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 

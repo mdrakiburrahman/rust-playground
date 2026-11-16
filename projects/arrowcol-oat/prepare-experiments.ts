@@ -24,10 +24,13 @@ export function experimentPoolPodCount(name: string, config: Record<string, unkn
     throw new Error(`${name} must have at least one ArrowCol replica count`);
   }
   const maximumReplicas = Math.max(...config.replica_counts.map((value) => integer(value, 1, 16, `${name} replica_counts`)));
+  const tunables = config.tunables;
+  const maintenance = tunables && typeof tunables === 'object' && 'maintenance' in tunables ? tunables.maintenance : undefined;
+  const maintenanceEnabled = maintenance && typeof maintenance === 'object' && 'enabled' in maintenance && maintenance.enabled === true;
   return {
     name,
     clientPods: config.tables.length * clientsPerTable,
-    arrowcolPods: FIXED_ARROWCOL_PODS + maximumReplicas + PIN_INIT_JOB_PODS,
+    arrowcolPods: FIXED_ARROWCOL_PODS + maximumReplicas + PIN_INIT_JOB_PODS + (maintenanceEnabled ? 1 : 0),
   };
 }
 

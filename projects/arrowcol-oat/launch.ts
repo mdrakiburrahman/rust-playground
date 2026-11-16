@@ -42,7 +42,7 @@ export function cliExitCode(error: unknown): number {
 }
 
 function validateArguments(args: string[]): void {
-  const flags = new Set(['--viewer-only', '--preflight-only']);
+  const flags = new Set(['--viewer-only', '--no-viewer', '--preflight-only']);
   let positionalConfig = false;
   for (let index = 0; index < args.length; index++) {
     const argument = args[index]!;
@@ -69,6 +69,7 @@ Options:
   --server <URL>       Use an existing OAT API server
   --poll-ms <number>   Set the status polling interval
   --viewer-only        Serve existing local results without running a benchmark
+  --no-viewer          Exit after a successful local run without serving results
   --preflight-only     Run the read-only AKS preflight
   --cleanup-local <id> Remove one abandoned local Compose cell by its run UUID
   -h, --help           Show this help`;
@@ -582,7 +583,11 @@ export async function main(args: string[], runner: typeof run_tree = run_tree, c
   }
   const cleanupRunId = option('--cleanup-local');
   const viewerOnly = args.includes('--viewer-only');
+  const noViewer = args.includes('--no-viewer');
   const preflightOnly = args.includes('--preflight-only');
+  if (noViewer && (requestedMode === 'aks' || viewerOnly)) {
+    throw new OatCliError('--no-viewer requires a local benchmark run and cannot be combined with --viewer-only');
+  }
   if (cleanupRunId !== undefined && (requestedMode === 'aks' || requestedServerUrl || args.includes('--poll-ms') || args.includes('--viewer-only') || args.includes('--preflight-only'))) {
     throw new OatCliError('--cleanup-local requires local mode and cannot be combined with server, poll, viewer, or preflight options');
   }
@@ -663,7 +668,7 @@ export async function main(args: string[], runner: typeof run_tree = run_tree, c
     } finally {
       interrupt?.dispose();
     }
-    if (runPassed) await maybeServeLocalViewer(configPath, mode);
+    if (runPassed && !noViewer) await maybeServeLocalViewer(configPath, mode);
     return;
   }
 
@@ -717,7 +722,7 @@ export async function main(args: string[], runner: typeof run_tree = run_tree, c
         if (markerWritten && runCleanupComplete && markerContext) await unlink(markerContext.path);
       },
       interrupt,
-      async () => { if (runPassed) await maybeServeLocalViewer(configPath, mode); },
+      async () => { if (runPassed && !noViewer) await maybeServeLocalViewer(configPath, mode); },
     );
   }
 }

@@ -17,7 +17,11 @@ arrow = { version = "58.3", default-features = false }
 arrowcol-protocol = { path = "../../crates/arrowcol-protocol" }
 arrowcol-routing = { path = "../../crates/arrowcol-routing" }
 arrow-deltalake = { path = "../../crates/arrow-deltalake" }
+arrowcol-tunables = { path = "../../crates/arrowcol-tunables" }
+arrowcol-router-rust = { path = "../arrowcol-router-rust" }
+otel-arrow-dfe-config = { path = "../../submodules/otel-arrow/rust/otap-dataflow/crates/config" }
 arrowcol-loadgen = { path = "../loadtest/loadgen" }
+otel-arrow-dfe-quiver = { path = "../../submodules/otel-arrow/rust/otap-dataflow/crates/quiver", default-features = false }
 chrono = "0.4"
 axum = "0.8"
 bytes = "1"

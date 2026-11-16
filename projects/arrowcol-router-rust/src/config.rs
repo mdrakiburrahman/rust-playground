@@ -1,9 +1,10 @@
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
-use arrowcol_routing::{PressurePolicy, RoutingPolicy};
-use clap::Parser;
+use arrowcol_routing::{AdmissionPressureGauge, PressurePolicy, RoutingPolicy};
+use clap::{Parser, ValueEnum};
 use serde::Deserialize;
 
 /// Command-line options for the router process.
@@ -16,6 +17,103 @@ pub struct Cli {
     /// Parse and validate configuration without starting listeners.
     #[arg(long)]
     pub validate_and_exit: bool,
+    /// Runtime tuning overrides; command-line values take precedence over environment and YAML.
+    #[command(flatten)]
+    pub router: RouterOverrides,
+}
+
+/// Supported startup-only router performance overrides.
+#[derive(Clone, Debug, Default, clap::Args)]
+pub struct RouterOverrides {
+    #[arg(long)]
+    pub workers: Option<usize>,
+    #[arg(long)]
+    pub listener_tasks_per_fd: Option<usize>,
+    #[arg(long)]
+    pub keepalive_pool_size: Option<usize>,
+    #[arg(long)]
+    pub h2_max_concurrent_streams: Option<u32>,
+    #[arg(long)]
+    pub h2_stream_window_bytes: Option<u32>,
+    #[arg(long)]
+    pub h2_connection_window_bytes: Option<u32>,
+    #[arg(long)]
+    pub h2_idle_timeout_seconds: Option<u64>,
+    #[arg(long)]
+    pub sql_connect_timeout_ms: Option<u64>,
+    #[arg(long)]
+    pub sql_command_timeout_ms: Option<u64>,
+    #[arg(long)]
+    pub sql_pool_max_size: Option<usize>,
+    #[arg(long)]
+    pub sql_pool_acquire_timeout_ms: Option<u64>,
+    #[arg(long, value_enum)]
+    pub log_level: Option<RouterLogLevel>,
+    #[arg(long)]
+    pub refresh_interval_ms: Option<u64>,
+    #[arg(long)]
+    pub max_snapshot_age_ms: Option<u64>,
+    #[arg(long)]
+    pub max_future_skew_ms: Option<u64>,
+    #[arg(long)]
+    pub max_table_entries: Option<usize>,
+    #[arg(long)]
+    pub max_oldest_buffer_age_ms: Option<u64>,
+    #[arg(long)]
+    pub hard_pressure_bps: Option<u16>,
+    /// Comma-separated admission gauges excluded from the hard-pressure maximum.
+    #[arg(long, value_delimiter = ',', value_parser = parse_admission_pressure_gauge)]
+    pub excluded_admission_gauges: Option<Vec<AdmissionPressureGauge>>,
+    #[arg(long)]
+    pub warmup_ms: Option<u64>,
+    #[arg(long)]
+    pub minimum_warmup_bps: Option<u16>,
+    #[arg(long)]
+    pub lease_ttl_ms: Option<u64>,
+    #[arg(long)]
+    pub oat_run_pin_ttl_ms: Option<u64>,
+    #[arg(long)]
+    pub readiness_max_staleness_ms: Option<u64>,
+    #[arg(long, action = clap::ArgAction::Set)]
+    pub distinct_table_owners: Option<bool>,
+    #[arg(long)]
+    pub edge_replay_max_nonces: Option<usize>,
+    #[arg(long)]
+    pub upstream_max_h2_streams: Option<usize>,
+    #[arg(long)]
+    pub upstream_stream_window_bytes: Option<u32>,
+    #[arg(long)]
+    pub upstream_connection_window_bytes: Option<u32>,
+    #[arg(long)]
+    pub upstream_connection_timeout_ms: Option<u64>,
+    #[arg(long)]
+    pub upstream_total_connection_timeout_ms: Option<u64>,
+    #[arg(long)]
+    pub upstream_idle_timeout_seconds: Option<u64>,
+    /// Zero disables upstream HTTP/2 keepalive pings.
+    #[arg(long)]
+    pub upstream_ping_interval_seconds: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum RouterLogLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+impl RouterLogLevel {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Warn => "warn",
+            Self::Info => "info",
+            Self::Debug => "debug",
+            Self::Trace => "trace",
+        }
+    }
 }
 
 /// Strict production router configuration.
@@ -43,9 +141,29 @@ impl RouterConfig {
     ///
     /// Returns an error for unreadable YAML, unknown fields, or invalid bounds.
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
+        Self::load_with_cli(path, &RouterOverrides::default())
+    }
+
+    /// Loads YAML, applies environment and CLI overrides, then validates the effective config.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unreadable YAML, unknown fields, invalid overrides, or invalid bounds.
+    pub fn load_with_cli(path: impl AsRef<Path>, overrides: &RouterOverrides) -> Result<Self> {
         let path = path.as_ref();
         let bytes = std::fs::read(path).with_context(|| format!("read router config {}", path.display()))?;
-        Self::from_yaml(&bytes).with_context(|| format!("parse strict YAML {}", path.display()))
+        let mut config: Self =
+            serde_yaml::from_slice(&bytes).with_context(|| format!("parse strict YAML {}", path.display()))?;
+        apply_environment_overrides(&mut config, |name| match std::env::var(name) {
+            Ok(value) => Ok(Some(value)),
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                Err(anyhow::anyhow!("environment variable {name} must be valid UTF-8"))
+            }
+        })?;
+        apply_cli_overrides(&mut config, overrides);
+        config.validate()?;
+        Ok(config)
     }
 
     /// Parses strict YAML bytes and validates every configured bound.
@@ -65,10 +183,17 @@ impl RouterConfig {
     ///
     /// Returns an error when a configured value is unsafe or inconsistent.
     pub fn validate(&self) -> Result<()> {
-        ensure!(self.server.threads > 0, "server.threads must be positive");
         ensure!(
-            self.server.listener_tasks_per_fd > 0,
-            "server.listener_tasks_per_fd must be positive"
+            (1..=256).contains(&self.server.threads),
+            "server.threads must be between 1 and 256"
+        );
+        ensure!(
+            (1..=64).contains(&self.server.listener_tasks_per_fd),
+            "server.listener_tasks_per_fd must be between 1 and 64"
+        );
+        ensure!(
+            (1..=65_536).contains(&self.server.upstream_keepalive_pool_size),
+            "server.upstream_keepalive_pool_size must be between 1 and 65536"
         );
         ensure!(
             self.server.grace_period_seconds > 0 && self.server.graceful_shutdown_timeout_seconds > 0,
@@ -109,18 +234,286 @@ impl RouterConfig {
             "edge and internal signing secrets must use different files"
         );
         ensure!(
-            self.upstream.max_h2_streams > 0
-                && self.upstream.stream_window_bytes > 0
-                && self.upstream.connection_window_bytes >= self.upstream.stream_window_bytes,
-            "upstream H2 stream/window bounds are invalid"
+            (1..=65_535).contains(&self.upstream.max_h2_streams)
+                && (1..=2_147_483_647).contains(&self.upstream.stream_window_bytes)
+                && self.upstream.connection_window_bytes >= self.upstream.stream_window_bytes
+                && self.upstream.connection_window_bytes <= 2_147_483_647,
+            "upstream H2 streams and windows are outside supported bounds"
         );
         ensure!(
-            self.server.h2.max_concurrent_streams > 0
-                && self.server.h2.stream_window_bytes > 0
-                && self.server.h2.connection_window_bytes >= self.server.h2.stream_window_bytes,
-            "downstream H2 stream/window bounds are invalid"
+            (1..=65_535).contains(&self.server.h2.max_concurrent_streams)
+                && (1..=2_147_483_647).contains(&self.server.h2.stream_window_bytes)
+                && self.server.h2.connection_window_bytes >= self.server.h2.stream_window_bytes
+                && self.server.h2.connection_window_bytes <= 2_147_483_647,
+            "downstream H2 streams and windows are outside supported bounds"
+        );
+        ensure!(
+            (1..=86_400).contains(&self.server.h2.idle_timeout_seconds)
+                && (1..=600_000).contains(&self.upstream.connection_timeout_ms)
+                && self.upstream.total_connection_timeout_ms >= self.upstream.connection_timeout_ms
+                && self.upstream.total_connection_timeout_ms <= 600_000
+                && (0..=86_400).contains(&self.upstream.idle_timeout_seconds)
+                && self
+                    .upstream
+                    .ping_interval_seconds
+                    .is_none_or(|seconds| (1..=3_600).contains(&seconds)),
+            "HTTP/2 idle, connection, and ping timeouts are outside supported bounds"
+        );
+        ensure!(
+            (1..=600_000).contains(&self.sql_server.connect_timeout_ms)
+                && (1..=600_000).contains(&self.sql_server.command_timeout_ms),
+            "SQL Server timeouts must be between 1 and 600000 milliseconds"
+        );
+        ensure!(
+            self.sql_server.sql_pool_max_size <= 1_024,
+            "sql_server.sql_pool_max_size must be between 0 and 1024"
+        );
+        ensure!(
+            (1..=600_000).contains(&self.sql_server.sql_pool_acquire_timeout_ms),
+            "sql_server.sql_pool_acquire_timeout_ms must be between 1 and 600000 milliseconds"
+        );
+        ensure!(
+            (1..=3_600_000).contains(&self.routing.refresh_interval_ms),
+            "routing.refresh_interval_ms must be between 1 and 3600000"
+        );
+        ensure!(
+            self.routing.max_snapshot_age_ms <= 86_400_000
+                && self.routing.max_future_skew_ms <= 86_400_000
+                && self.routing.max_oldest_buffer_age_ms <= 86_400_000
+                && self.routing.warmup_ms <= 86_400_000
+                && self.routing.lease_ttl_ms <= 86_400_000
+                && self.routing.readiness_max_staleness_ms <= 86_400_000,
+            "routing time bounds must not exceed 86400000 milliseconds"
         );
         Ok(())
+    }
+}
+
+fn apply_environment_overrides(
+    config: &mut RouterConfig,
+    mut get: impl FnMut(&str) -> Result<Option<String>>,
+) -> Result<()> {
+    macro_rules! set_from_env {
+        ($field:expr, $name:literal, $kind:ty) => {
+            if let Some(value) = get($name)? {
+                *$field = value
+                    .parse::<$kind>()
+                    .with_context(|| format!("parse environment variable {} as {}", $name, stringify!($kind)))?;
+            }
+        };
+    }
+
+    set_from_env!(&mut config.server.threads, "ARROWCOL_ROUTER_WORKERS", usize);
+    set_from_env!(
+        &mut config.server.listener_tasks_per_fd,
+        "ARROWCOL_ROUTER_LISTENER_TASKS_PER_FD",
+        usize
+    );
+    set_from_env!(
+        &mut config.server.upstream_keepalive_pool_size,
+        "ARROWCOL_ROUTER_KEEPALIVE_POOL_SIZE",
+        usize
+    );
+    set_from_env!(
+        &mut config.server.h2.max_concurrent_streams,
+        "ARROWCOL_ROUTER_H2_MAX_CONCURRENT_STREAMS",
+        u32
+    );
+    set_from_env!(
+        &mut config.server.h2.stream_window_bytes,
+        "ARROWCOL_ROUTER_H2_STREAM_WINDOW_BYTES",
+        u32
+    );
+    set_from_env!(
+        &mut config.server.h2.connection_window_bytes,
+        "ARROWCOL_ROUTER_H2_CONNECTION_WINDOW_BYTES",
+        u32
+    );
+    set_from_env!(
+        &mut config.server.h2.idle_timeout_seconds,
+        "ARROWCOL_ROUTER_H2_IDLE_TIMEOUT_SECONDS",
+        u64
+    );
+    set_from_env!(
+        &mut config.sql_server.connect_timeout_ms,
+        "ARROWCOL_ROUTER_SQL_CONNECT_TIMEOUT_MS",
+        u64
+    );
+    set_from_env!(
+        &mut config.sql_server.command_timeout_ms,
+        "ARROWCOL_ROUTER_SQL_COMMAND_TIMEOUT_MS",
+        u64
+    );
+    set_from_env!(
+        &mut config.sql_server.sql_pool_max_size,
+        "ARROWCOL_ROUTER_SQL_POOL_MAX_SIZE",
+        usize
+    );
+    set_from_env!(
+        &mut config.sql_server.sql_pool_acquire_timeout_ms,
+        "ARROWCOL_ROUTER_SQL_POOL_ACQUIRE_TIMEOUT_MS",
+        u64
+    );
+    if let Some(value) = get("RUST_LOG")? {
+        config.telemetry.log_filter = value;
+    }
+    set_from_env!(
+        &mut config.routing.refresh_interval_ms,
+        "ARROWCOL_ROUTER_REFRESH_INTERVAL_MS",
+        u64
+    );
+    set_from_env!(
+        &mut config.routing.max_snapshot_age_ms,
+        "ARROWCOL_ROUTER_MAX_SNAPSHOT_AGE_MS",
+        u64
+    );
+    set_from_env!(
+        &mut config.routing.max_future_skew_ms,
+        "ARROWCOL_ROUTER_MAX_FUTURE_SKEW_MS",
+        u64
+    );
+    set_from_env!(
+        &mut config.routing.max_table_entries,
+        "ARROWCOL_ROUTER_MAX_TABLE_ENTRIES",
+        usize
+    );
+    set_from_env!(
+        &mut config.routing.max_oldest_buffer_age_ms,
+        "ARROWCOL_ROUTER_MAX_OLDEST_BUFFER_AGE_MS",
+        u64
+    );
+    set_from_env!(
+        &mut config.routing.hard_pressure_bps,
+        "ARROWCOL_ROUTER_HARD_PRESSURE_BPS",
+        u16
+    );
+    set_from_env!(&mut config.routing.warmup_ms, "ARROWCOL_ROUTER_WARMUP_MS", u64);
+    set_from_env!(
+        &mut config.routing.minimum_warmup_bps,
+        "ARROWCOL_ROUTER_MINIMUM_WARMUP_BPS",
+        u16
+    );
+    set_from_env!(&mut config.routing.lease_ttl_ms, "ARROWCOL_ROUTER_LEASE_TTL_MS", u64);
+    set_from_env!(
+        &mut config.routing.oat_run_pin_ttl_ms,
+        "ARROWCOL_ROUTER_OAT_RUN_PIN_TTL_MS",
+        u64
+    );
+    set_from_env!(
+        &mut config.routing.readiness_max_staleness_ms,
+        "ARROWCOL_ROUTER_READINESS_MAX_STALENESS_MS",
+        u64
+    );
+    set_from_env!(
+        &mut config.routing.distinct_table_owners,
+        "ARROWCOL_ROUTER_DISTINCT_TABLE_OWNERS",
+        bool
+    );
+    set_from_env!(
+        &mut config.auth.edge_replay_max_nonces,
+        "ARROWCOL_ROUTER_EDGE_REPLAY_MAX_NONCES",
+        usize
+    );
+    set_from_env!(
+        &mut config.upstream.max_h2_streams,
+        "ARROWCOL_ROUTER_UPSTREAM_MAX_H2_STREAMS",
+        usize
+    );
+    set_from_env!(
+        &mut config.upstream.stream_window_bytes,
+        "ARROWCOL_ROUTER_UPSTREAM_STREAM_WINDOW_BYTES",
+        u32
+    );
+    set_from_env!(
+        &mut config.upstream.connection_window_bytes,
+        "ARROWCOL_ROUTER_UPSTREAM_CONNECTION_WINDOW_BYTES",
+        u32
+    );
+    set_from_env!(
+        &mut config.upstream.connection_timeout_ms,
+        "ARROWCOL_ROUTER_UPSTREAM_CONNECTION_TIMEOUT_MS",
+        u64
+    );
+    set_from_env!(
+        &mut config.upstream.total_connection_timeout_ms,
+        "ARROWCOL_ROUTER_UPSTREAM_TOTAL_CONNECTION_TIMEOUT_MS",
+        u64
+    );
+    set_from_env!(
+        &mut config.upstream.idle_timeout_seconds,
+        "ARROWCOL_ROUTER_UPSTREAM_IDLE_TIMEOUT_SECONDS",
+        u64
+    );
+    if let Some(value) = get("ARROWCOL_ROUTER_EXCLUDED_ADMISSION_GAUGES")? {
+        config.routing.excluded_admission_gauges =
+            parse_admission_pressure_gauges(&value).context("parse ARROWCOL_ROUTER_EXCLUDED_ADMISSION_GAUGES")?;
+    }
+    if let Some(value) = get("ARROWCOL_ROUTER_UPSTREAM_PING_INTERVAL_SECONDS")? {
+        let seconds = value
+            .parse::<u64>()
+            .context("parse environment variable ARROWCOL_ROUTER_UPSTREAM_PING_INTERVAL_SECONDS as u64")?;
+        config.upstream.ping_interval_seconds = (seconds != 0).then_some(seconds);
+    }
+
+    Ok(())
+}
+
+fn apply_cli_overrides(config: &mut RouterConfig, overrides: &RouterOverrides) {
+    macro_rules! set_from_cli {
+        ($source:ident, $target:expr) => {
+            if let Some(value) = overrides.$source {
+                $target = value;
+            }
+        };
+    }
+
+    set_from_cli!(workers, config.server.threads);
+    set_from_cli!(listener_tasks_per_fd, config.server.listener_tasks_per_fd);
+    set_from_cli!(keepalive_pool_size, config.server.upstream_keepalive_pool_size);
+    set_from_cli!(h2_max_concurrent_streams, config.server.h2.max_concurrent_streams);
+    set_from_cli!(h2_stream_window_bytes, config.server.h2.stream_window_bytes);
+    set_from_cli!(h2_connection_window_bytes, config.server.h2.connection_window_bytes);
+    set_from_cli!(h2_idle_timeout_seconds, config.server.h2.idle_timeout_seconds);
+    set_from_cli!(sql_connect_timeout_ms, config.sql_server.connect_timeout_ms);
+    set_from_cli!(sql_command_timeout_ms, config.sql_server.command_timeout_ms);
+    set_from_cli!(sql_pool_max_size, config.sql_server.sql_pool_max_size);
+    set_from_cli!(
+        sql_pool_acquire_timeout_ms,
+        config.sql_server.sql_pool_acquire_timeout_ms
+    );
+    if let Some(level) = overrides.log_level {
+        config.telemetry.log_filter = format!("{},tiberius=error", level.as_str());
+    }
+    set_from_cli!(refresh_interval_ms, config.routing.refresh_interval_ms);
+    set_from_cli!(max_snapshot_age_ms, config.routing.max_snapshot_age_ms);
+    set_from_cli!(max_future_skew_ms, config.routing.max_future_skew_ms);
+    set_from_cli!(max_table_entries, config.routing.max_table_entries);
+    set_from_cli!(max_oldest_buffer_age_ms, config.routing.max_oldest_buffer_age_ms);
+    set_from_cli!(hard_pressure_bps, config.routing.hard_pressure_bps);
+    if let Some(gauges) = &overrides.excluded_admission_gauges {
+        config.routing.excluded_admission_gauges.clone_from(gauges);
+    }
+    set_from_cli!(warmup_ms, config.routing.warmup_ms);
+    set_from_cli!(minimum_warmup_bps, config.routing.minimum_warmup_bps);
+    set_from_cli!(lease_ttl_ms, config.routing.lease_ttl_ms);
+    set_from_cli!(oat_run_pin_ttl_ms, config.routing.oat_run_pin_ttl_ms);
+    set_from_cli!(readiness_max_staleness_ms, config.routing.readiness_max_staleness_ms);
+    set_from_cli!(distinct_table_owners, config.routing.distinct_table_owners);
+    set_from_cli!(edge_replay_max_nonces, config.auth.edge_replay_max_nonces);
+    set_from_cli!(upstream_max_h2_streams, config.upstream.max_h2_streams);
+    set_from_cli!(upstream_stream_window_bytes, config.upstream.stream_window_bytes);
+    set_from_cli!(
+        upstream_connection_window_bytes,
+        config.upstream.connection_window_bytes
+    );
+    set_from_cli!(upstream_connection_timeout_ms, config.upstream.connection_timeout_ms);
+    set_from_cli!(
+        upstream_total_connection_timeout_ms,
+        config.upstream.total_connection_timeout_ms
+    );
+    set_from_cli!(upstream_idle_timeout_seconds, config.upstream.idle_timeout_seconds);
+    if let Some(seconds) = overrides.upstream_ping_interval_seconds {
+        config.upstream.ping_interval_seconds = (seconds != 0).then_some(seconds);
     }
 }
 
@@ -134,6 +527,9 @@ pub struct ServerConfig {
     pub threads: usize,
     /// Listener tasks per file descriptor.
     pub listener_tasks_per_fd: usize,
+    /// Maximum idle upstream connections retained by Pingora.
+    #[serde(default = "default_upstream_keepalive_pool_size")]
+    pub upstream_keepalive_pool_size: usize,
     /// Delay before runtime shutdown begins.
     pub grace_period_seconds: u64,
     /// Final runtime drain ceiling.
@@ -142,6 +538,10 @@ pub struct ServerConfig {
     pub state_directory: PathBuf,
     /// Downstream HTTP/2 settings.
     pub h2: H2Config,
+}
+
+fn default_upstream_keepalive_pool_size() -> usize {
+    1_024
 }
 
 /// Downstream HTTP/2 flow-control settings.
@@ -178,6 +578,16 @@ pub struct SqlServerConfig {
     pub connect_timeout_ms: u64,
     /// SQL command timeout.
     pub command_timeout_ms: u64,
+    /// Maximum pooled SQL connections; zero preserves unpooled behavior.
+    #[serde(default)]
+    pub sql_pool_max_size: usize,
+    /// Maximum time to acquire a pooled SQL connection.
+    #[serde(default = "default_sql_pool_acquire_timeout_ms")]
+    pub sql_pool_acquire_timeout_ms: u64,
+}
+
+fn default_sql_pool_acquire_timeout_ms() -> u64 {
+    10_000
 }
 
 /// Cache, pressure, selection, and lease settings.
@@ -196,6 +606,9 @@ pub struct RoutingConfig {
     pub max_oldest_buffer_age_ms: u64,
     /// Hard pressure exclusion threshold.
     pub hard_pressure_bps: u16,
+    /// Pressure gauges omitted from hard admission; empty preserves legacy behavior.
+    #[serde(default)]
+    pub excluded_admission_gauges: Vec<AdmissionPressureGauge>,
     /// Warm-up duration.
     pub warmup_ms: u64,
     /// Minimum warm-up weight.
@@ -230,6 +643,14 @@ impl RoutingConfig {
                 max_oldest_buffer_age_ms: self.max_oldest_buffer_age_ms,
             },
             hard_pressure_bps: self.hard_pressure_bps,
+            excluded_admission_gauges: {
+                let excluded: BTreeSet<_> = self.excluded_admission_gauges.iter().copied().collect();
+                ensure!(
+                    excluded.len() == self.excluded_admission_gauges.len(),
+                    "routing.excluded_admission_gauges must not contain duplicates"
+                );
+                excluded
+            },
             warmup_ms: self.warmup_ms,
             minimum_warmup_bps: self.minimum_warmup_bps,
             lease_ttl_ms: self.lease_ttl_ms,
@@ -239,6 +660,24 @@ impl RoutingConfig {
             oat_run_id: self.oat_run_id.clone(),
         })
     }
+}
+
+fn parse_admission_pressure_gauge(value: &str) -> std::result::Result<AdmissionPressureGauge, String> {
+    value.parse()
+}
+
+fn parse_admission_pressure_gauges(value: &str) -> Result<Vec<AdmissionPressureGauge>> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(Vec::new());
+    }
+    if value.starts_with('[') {
+        return serde_json::from_str(value).context("expected a JSON array of admission pressure gauge names");
+    }
+    value
+        .split(',')
+        .map(|name| name.trim().parse().map_err(anyhow::Error::msg))
+        .collect()
 }
 
 fn default_oat_run_pin_ttl_ms() -> u64 {
@@ -294,7 +733,7 @@ pub struct UpstreamConfig {
     pub connection_timeout_ms: u64,
     /// Total connection establishment timeout.
     pub total_connection_timeout_ms: u64,
-    /// Reusable connection idle timeout.
+    /// Reusable connection idle timeout; zero disables idle upstream pooling.
     pub idle_timeout_seconds: u64,
     /// Optional H2 ping interval.
     pub ping_interval_seconds: Option<u64>,
@@ -312,7 +751,35 @@ pub struct TelemetryConfig {
 
 #[cfg(test)]
 mod routing_policy_tests {
-    use super::{RouterConfig, RoutingConfig};
+    use super::{
+        AdmissionPressureGauge, Cli, RouterConfig, RoutingConfig, apply_cli_overrides, apply_environment_overrides,
+    };
+    use clap::Parser;
+
+    #[test]
+    fn every_shipped_router_configuration_validates() {
+        for (name, bytes) in [
+            ("config.yaml", &include_bytes!("../config.yaml")[..]),
+            ("config.docker.yaml", &include_bytes!("../config.docker.yaml")[..]),
+            ("config.smoke.yaml", &include_bytes!("../config.smoke.yaml")[..]),
+        ] {
+            RouterConfig::from_yaml(bytes).unwrap_or_else(|error| panic!("validate {name}: {error}"));
+        }
+    }
+
+    #[test]
+    fn accepts_main_generated_router_settings_without_idle_upstream_pooling() {
+        let mut config = RouterConfig::from_yaml(include_bytes!("../config.yaml"))
+            .unwrap_or_else(|error| panic!("parse default router configuration: {error}"));
+        config.upstream.max_h2_streams = 1;
+        config.upstream.idle_timeout_seconds = 0;
+        config
+            .validate()
+            .unwrap_or_else(|error| panic!("validate main-generated router settings: {error}"));
+
+        config.upstream.idle_timeout_seconds = 86_401;
+        assert!(config.validate().is_err());
+    }
 
     #[test]
     fn distinct_table_owners_is_opt_in_and_disabled_for_single_collector_loadtest() {
@@ -325,5 +792,109 @@ mod routing_policy_tests {
         let routing: RoutingConfig = serde_yaml::from_value(loadtest["routing"].clone())
             .unwrap_or_else(|error| panic!("parse loadtest routing policy: {error}"));
         assert!(!routing.distinct_table_owners);
+    }
+
+    #[test]
+    fn router_cli_overrides_are_typed_and_disable_zero_ping_interval() {
+        let overrides = Cli::try_parse_from([
+            "arrowcol-router-rust",
+            "--workers",
+            "8",
+            "--upstream-ping-interval-seconds",
+            "0",
+            "--sql-pool-max-size",
+            "64",
+            "--sql-pool-acquire-timeout-ms",
+            "2500",
+            "--log-level",
+            "debug",
+            "--excluded-admission-gauges",
+            "cpu_utilization_bps,active_streams",
+        ])
+        .unwrap_or_else(|error| panic!("parse router CLI overrides: {error}"));
+        let mut config = RouterConfig::from_yaml(include_bytes!("../config.yaml"))
+            .unwrap_or_else(|error| panic!("parse default router configuration: {error}"));
+        apply_cli_overrides(&mut config, &overrides.router);
+        config
+            .validate()
+            .unwrap_or_else(|error| panic!("validate router CLI overrides: {error}"));
+        assert_eq!(config.server.threads, 8);
+        assert_eq!(config.upstream.ping_interval_seconds, None);
+        assert_eq!(config.sql_server.sql_pool_max_size, 64);
+        assert_eq!(config.sql_server.sql_pool_acquire_timeout_ms, 2_500);
+        assert_eq!(config.telemetry.log_filter, "debug,tiberius=error");
+        assert_eq!(
+            config.routing.excluded_admission_gauges,
+            vec![
+                AdmissionPressureGauge::CpuUtilizationBps,
+                AdmissionPressureGauge::ActiveStreams
+            ]
+        );
+    }
+
+    #[test]
+    fn router_environment_overrides_are_typed_and_validated() {
+        use std::collections::HashMap;
+
+        let mut config = RouterConfig::from_yaml(include_bytes!("../config.yaml"))
+            .unwrap_or_else(|error| panic!("parse default router configuration: {error}"));
+        let overrides = HashMap::from([
+            ("ARROWCOL_ROUTER_WORKERS", "8"),
+            ("ARROWCOL_ROUTER_H2_MAX_CONCURRENT_STREAMS", "512"),
+            ("ARROWCOL_ROUTER_UPSTREAM_PING_INTERVAL_SECONDS", "0"),
+            ("ARROWCOL_ROUTER_DISTINCT_TABLE_OWNERS", "true"),
+            ("ARROWCOL_ROUTER_SQL_POOL_MAX_SIZE", "32"),
+            ("ARROWCOL_ROUTER_SQL_POOL_ACQUIRE_TIMEOUT_MS", "1500"),
+            ("RUST_LOG", "info,tiberius=error"),
+            (
+                "ARROWCOL_ROUTER_EXCLUDED_ADMISSION_GAUGES",
+                r#"["cpu_utilization_bps"]"#,
+            ),
+        ]);
+        apply_environment_overrides(&mut config, |name| {
+            Ok(overrides.get(name).map(|value| (*value).to_owned()))
+        })
+        .unwrap_or_else(|error| panic!("apply typed router overrides: {error}"));
+        config
+            .validate()
+            .unwrap_or_else(|error| panic!("validate router overrides: {error}"));
+
+        assert_eq!(config.server.threads, 8);
+        assert_eq!(config.server.h2.max_concurrent_streams, 512);
+        assert_eq!(config.upstream.ping_interval_seconds, None);
+        assert_eq!(config.sql_server.sql_pool_max_size, 32);
+        assert_eq!(config.sql_server.sql_pool_acquire_timeout_ms, 1_500);
+        assert_eq!(config.telemetry.log_filter, "info,tiberius=error");
+        assert!(config.routing.distinct_table_owners);
+        assert_eq!(
+            config.routing.excluded_admission_gauges,
+            vec![AdmissionPressureGauge::CpuUtilizationBps]
+        );
+    }
+
+    #[test]
+    fn router_environment_override_errors_name_the_variable_and_enforce_cross_bounds() {
+        use std::collections::HashMap;
+
+        let mut config = RouterConfig::from_yaml(include_bytes!("../config.yaml"))
+            .unwrap_or_else(|error| panic!("parse default router configuration: {error}"));
+        let malformed = HashMap::from([("ARROWCOL_ROUTER_WORKERS", "many")]);
+        let error = match apply_environment_overrides(&mut config, |name| {
+            Ok(malformed.get(name).map(|value| (*value).to_owned()))
+        }) {
+            Ok(()) => panic!("non-numeric worker count must fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("ARROWCOL_ROUTER_WORKERS"));
+
+        let incompatible = HashMap::from([
+            ("ARROWCOL_ROUTER_H2_STREAM_WINDOW_BYTES", "1048576"),
+            ("ARROWCOL_ROUTER_H2_CONNECTION_WINDOW_BYTES", "65535"),
+        ]);
+        apply_environment_overrides(&mut config, |name| {
+            Ok(incompatible.get(name).map(|value| (*value).to_owned()))
+        })
+        .unwrap_or_else(|error| panic!("parse numeric H2 overrides: {error}"));
+        assert!(config.validate().is_err());
     }
 }

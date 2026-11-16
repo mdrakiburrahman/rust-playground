@@ -117,7 +117,7 @@ function mock(registry: string, fault?: Fault) {
         else if (fault === 'timeout') { returncode = 1; stderr = 'ERROR: request timed out while contacting registry\n'; }
         else if (fault === 'throttle') { returncode = 1; stderr = 'ERROR: 429 Too Many Requests\n'; }
         else if (fault === 'server') { returncode = 1; stderr = 'ERROR: 503 Service Unavailable\n'; }
-        else stdout = JSON.stringify(['arrowcol-sqlserver', 'arrowcol-catalog-rust', 'arrowcol-router-rust', 'arrowcol-dataflow-rust', 'arrowcol-oat-client']);
+        else stdout = JSON.stringify(['arrowcol-sqlserver', 'arrowcol-catalog-rust', 'arrowcol-router-rust', 'arrowcol-dataflow-rust', 'arrowcol-oat-client', 'delta-maintenance']);
       }
       if (command[2] === 'repository' && command[3] === 'show-tags') {
         const repository = command[command.indexOf('--repository') + 1];
@@ -276,6 +276,14 @@ test('publishes the static viewer to the stamped root website through the federa
   }
   assert.ok(!m.calls.some(command => command[0] === 'docker'));
   assert.equal(fs.existsSync(m.cache()), false);
+});
+
+test('opt-in maintenance verifies a sixth immutable revision, while legacy setup still uses five', async t => {
+  const options = fixture(t);
+  const m = mock(options.registry);
+  const result = await readPublishedImages({ ...options, revision, maintenance: true }, m.runner);
+  assert.equal(result.images.maintenance, `${options.registry}.azurecr.io/delta-maintenance@${digest}`);
+  assert.equal(m.calls.filter(c => c[0] === 'docker' && c[1] === 'pull').length, 6);
 });
 
 test('reads and verifies all five revision tags without building or pushing', async t => {

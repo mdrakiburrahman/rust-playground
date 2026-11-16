@@ -1,8 +1,14 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
+use arrowcol_routing::{AdmissionPressureGauge, SqlOperationObserver};
+use arrowcol_sql_server::SqlPool;
 use prometheus::{
-    Encoder, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder, register_int_counter_vec_with_registry,
-    register_int_gauge_vec_with_registry, register_int_gauge_with_registry,
+    Encoder, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry,
+    TextEncoder, register_histogram_vec_with_registry, register_histogram_with_registry,
+    register_int_counter_vec_with_registry, register_int_counter_with_registry, register_int_gauge_vec_with_registry,
+    register_int_gauge_with_registry,
 };
 
 /// Low-cardinality router metrics.
@@ -19,6 +25,13 @@ pub struct RouterMetrics {
     table_owners: IntGaugeVec,
     distinct_table_owners: IntGauge,
     maximum_pressure_bps: IntGaugeVec,
+    pressure_gauge_bps: IntGaugeVec,
+    sql_connections_opened: IntCounter,
+    sql_operations: IntCounterVec,
+    sql_operation_seconds: HistogramVec,
+    request_seconds: Histogram,
+    sql_pool: Option<SqlPool>,
+    pool_created_seen: Arc<AtomicU64>,
 }
 
 impl RouterMetrics {
@@ -99,6 +112,50 @@ impl RouterMetrics {
             &["pool"],
             registry.as_ref()
         )?;
+        let pressure_gauge_bps = register_int_gauge_vec_with_registry!(
+            Opts::new(
+                "arrowcol_router_collector_pressure_gauge_bps",
+                "Fresh collector pressure by pool and admission gauge"
+            ),
+            &["pool", "gauge"],
+            registry.as_ref()
+        )?;
+        let sql_connections_opened = register_int_counter_with_registry!(
+            Opts::new(
+                "arrowcol_router_sql_connections_opened_total",
+                "Successful physical SQL connections opened"
+            ),
+            registry.as_ref()
+        )?;
+        let sql_operations = register_int_counter_vec_with_registry!(
+            Opts::new(
+                "arrowcol_router_sql_operations_total",
+                "SQL routing operations by kind and outcome"
+            ),
+            &["operation", "outcome"],
+            registry.as_ref()
+        )?;
+        let sql_operation_seconds = register_histogram_vec_with_registry!(
+            HistogramOpts::new(
+                "arrowcol_router_sql_operation_seconds",
+                "SQL routing operation latency by kind"
+            )
+            .buckets(vec![
+                0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0
+            ]),
+            &["operation"],
+            registry.as_ref()
+        )?;
+        let request_seconds = register_histogram_with_registry!(
+            HistogramOpts::new(
+                "arrowcol_router_request_seconds",
+                "Request-filter to upstream response-header latency"
+            )
+            .buckets(vec![
+                0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0
+            ]),
+            registry.as_ref()
+        )?;
         Ok(Self {
             registry,
             decisions,
@@ -111,7 +168,34 @@ impl RouterMetrics {
             table_owners,
             distinct_table_owners,
             maximum_pressure_bps,
+            pressure_gauge_bps,
+            sql_connections_opened,
+            sql_operations,
+            sql_operation_seconds,
+            request_seconds,
+            sql_pool: None,
+            pool_created_seen: Arc::new(AtomicU64::new(0)),
         })
+    }
+
+    pub fn observe_request_duration(&self, elapsed: Duration) {
+        self.request_seconds.observe(elapsed.as_secs_f64());
+    }
+
+    /// Tracks pool-created connections alongside direct unpooled opens.
+    pub fn with_sql_pool(mut self, pool: SqlPool) -> Self {
+        self.sql_pool = Some(pool);
+        self
+    }
+
+    fn sync_pool_connections(&self) {
+        if let Some(pool) = &self.sql_pool {
+            let created = pool.stats().created;
+            let previous = self.pool_created_seen.fetch_max(created, Ordering::Relaxed);
+            if created > previous {
+                self.sql_connections_opened.inc_by(created - previous);
+            }
+        }
     }
 
     /// Records a routing decision.
@@ -161,7 +245,13 @@ impl RouterMetrics {
     /// Updates cache and table-owner gauges.
     pub fn update_cache_gauges(&self, view: &arrowcol_routing::RoutingView) {
         self.table_owners.reset();
+        self.pressure_gauge_bps.reset();
         for pool in ["dataflow"] {
+            for gauge in AdmissionPressureGauge::ALL {
+                self.pressure_gauge_bps
+                    .with_label_values(&[pool, gauge.as_str()])
+                    .set(0);
+            }
             for state in ["active", "draining"] {
                 self.cached_leases.with_label_values(&[pool, state]).set(0);
             }
@@ -189,8 +279,12 @@ impl RouterMetrics {
         for collector in view.collectors.values() {
             if let Some(pressure) = collector.pressure.as_ref() {
                 let pool = collector.registration.implementation_pool.to_string();
-                let gauge = self.maximum_pressure_bps.with_label_values(&[&pool]);
-                gauge.set(gauge.get().max(i64::from(pressure.maximum_pressure_bps())));
+                let maximum = self.maximum_pressure_bps.with_label_values(&[&pool]);
+                maximum.set(maximum.get().max(i64::from(pressure.maximum_pressure_bps())));
+                for (name, value) in pressure.pressure_gauges_bps() {
+                    let gauge = self.pressure_gauge_bps.with_label_values(&[&pool, name.as_str()]);
+                    gauge.set(gauge.get().max(i64::from(value)));
+                }
             }
         }
     }
@@ -201,9 +295,67 @@ impl RouterMetrics {
     ///
     /// Returns an encoding error.
     pub fn encode(&self) -> Result<Vec<u8>, prometheus::Error> {
+        self.sync_pool_connections();
         let families = self.registry.gather();
         let mut output = Vec::new();
         TextEncoder::new().encode(&families, &mut output)?;
         Ok(output)
+    }
+}
+
+impl SqlOperationObserver for RouterMetrics {
+    fn connection_opened(&self) {
+        self.sql_connections_opened.inc();
+    }
+
+    fn operation(&self, operation: &'static str, elapsed: Duration, success: bool) {
+        self.sql_operations
+            .with_label_values(&[operation, if success { "success" } else { "failure" }])
+            .inc();
+        self.sql_operation_seconds
+            .with_label_values(&[operation])
+            .observe(elapsed.as_secs_f64());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RouterMetrics;
+    use arrowcol_protocol::UnixMillis;
+    use arrowcol_routing::RoutingView;
+    use arrowcol_routing::SqlOperationObserver;
+    use std::time::Duration;
+
+    #[test]
+    fn exports_sql_connection_operation_and_latency_metrics() -> Result<(), Box<dyn std::error::Error>> {
+        let metrics = RouterMetrics::new()?;
+        metrics.connection_opened();
+        metrics.operation("get_run_table_pin", Duration::from_millis(12), true);
+        metrics.observe_request_duration(Duration::from_millis(25));
+        let output = String::from_utf8(metrics.encode()?)?;
+        assert!(output.contains("arrowcol_router_sql_connections_opened_total 1"));
+        assert!(
+            output.contains(
+                "arrowcol_router_sql_operations_total{operation=\"get_run_table_pin\",outcome=\"success\"} 1"
+            )
+        );
+        assert!(
+            output.contains(
+                "arrowcol_router_sql_operation_seconds_bucket{operation=\"get_run_table_pin\",le=\"0.025\"} 1"
+            )
+        );
+        assert!(output.contains("arrowcol_router_request_seconds_bucket{le=\"0.025\"} 1"));
+        Ok(())
+    }
+
+    #[test]
+    fn exports_fixed_pressure_gauge_labels_for_diagnosis() -> Result<(), Box<dyn std::error::Error>> {
+        let metrics = RouterMetrics::new()?;
+        metrics.update_cache_gauges(&RoutingView::empty(UnixMillis::new(1)?));
+        let output = String::from_utf8(metrics.encode()?)?;
+        assert!(output.contains("arrowcol_router_collector_pressure_gauge_bps"));
+        assert!(output.contains("gauge=\"cpu_utilization_bps\""));
+        assert!(output.contains("gauge=\"quiver_pressure_bps\""));
+        Ok(())
     }
 }

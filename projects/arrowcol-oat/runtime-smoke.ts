@@ -94,7 +94,11 @@ async function main(): Promise<void> {
   ['--warehouse-root', '/onelake/dataflow', '--ingestion-layout',
     '--ddl-identity-secret-file', '/run/oat/internal-hmac']);
   startCatalog();
-  await waitReady(catalog, ['/usr/local/bin/arrowcol-catalog-rust', '--healthcheck']);
+  await waitReady(catalog, [
+    '/usr/local/bin/arrowcol-catalog-rust',
+    '--ddl-identity-secret-file', '/run/oat/internal-hmac',
+    '--healthcheck',
+  ]);
   const routerName = `${prefix}-router`;
   run(routerName, secretMount, images.router, ['--config', '/run/oat/router.yaml']);
   const tables = ['sqlserver_wait_stats', 'sqlserver_cpu_utilization'];
@@ -103,17 +107,22 @@ async function main(): Promise<void> {
   for (const replicas of [1, 2]) {
     for (const cores of [1, 2]) {
       const collectors: string[] = [];
+      const collectorIds: string[] = [];
       for (let i = 0; i < replicas; i++) {
         const name = `${prefix}-r${replicas}-c${cores}-${i}`;
         collectors.push(name);
         run(name, [...secretMount, '-v', `${volumes[2]}:/onelake`,
           '-e', `ARROWCOL_SQL_HOST=${sql}`, '-e', 'ARROWCOL_SQL_PASSWORD_FILE=/run/oat/app-password',
           '-e', `ARROWCOL_CATALOG_ENDPOINT=http://${catalog}:8817`,
+          '-e', 'ARROWCOL_CATALOG_DDL_IDENTITY_SECRET_FILE=/run/oat/internal-hmac',
           '-e', `ARROWCOL_INSTANCE_KEY=${name}`, '-e', 'ARROWCOL_DELTA_ROOT=/onelake/dataflow',
           '-e', 'ARROWCOL_PARTITION_GRANULARITY=hour',
           '--entrypoint', '/bin/sh'], images.dataflow,
         ['-ec', `export ARROWCOL_ADVERTISED_FLIGHT_ENDPOINT="$(hostname -i):32010"; exec /usr/bin/tini -- /usr/local/bin/arrowcol-dataflow-rust --config /run/oat/dataflow.yaml --num-cores ${cores}`]);
         await waitReady(name, http(32011, '/readyz'));
+        const capabilities = JSON.parse(docker(['exec', name, ...http(32011, '/v1/capabilities')])) as { instance_id: unknown };
+        if (typeof capabilities.instance_id !== 'string') throw new Error(name + ' did not expose a collector instance ID');
+        collectorIds.push(capabilities.instance_id);
         const listeners = docker(['exec', name, 'sh', '-c', 'cat /proc/net/tcp /proc/net/tcp6']);
         // 32010=7D0A, 32011=7D0B. Every worker must bind both SO_REUSEPORT listeners.
         for (const port of ['7D0A', '7D0B']) {
@@ -126,7 +135,9 @@ async function main(): Promise<void> {
       for (const table of tables.slice(0, replicas)) {
         const args = ['run', '--rm', '--network', network, ...secretMount,
           '-e', 'LOADTEST_INTERNAL_SECRET_FILE=/run/oat/internal-hmac', images.client,
-          '--endpoint', `http://${routerName}:50050`, '--table', table, '--rows', '100', '--concurrency', '4'];
+          '--endpoint', `http://${routerName}:50050`, '--table', table, '--rows', '10000',
+          '--batch-rows', '2500',
+          '--workers', '4', '--streams-per-worker', '1', '--concurrency', '4'];
         const unsigned = spawnSync('docker', args, { encoding: 'utf8' });
         assert.notEqual(unsigned.status, 0, 'router must reject unsigned requests');
         docker([...args, '--edge-secret-file', '/run/oat/edge-hmac']);
@@ -135,7 +146,7 @@ async function main(): Promise<void> {
       const assignments = docker(['exec', routerName, ...http(50050, '/metrics')]);
       assert.match(assignments, /arrowcol_router_distinct_table_owners 0/);
       const connections = Number(/^arrowcol_router_upstream_connections_total\{reused="false"\} (\d+)$/m.exec(assignments)?.[1]);
-      assert.ok(connections - upstreamConnections >= replicas * 4, 'router must preserve independent upstream connections');
+      assert.ok(connections - upstreamConnections >= replicas * 4, "router must preserve independent upstream connections (observed " + (connections - upstreamConnections) + ")");
       upstreamConnections = connections;
       const owners = tables.slice(0, replicas).map((table) => {
         const lines = assignments.split('\n').filter((line) => line.startsWith('arrowcol_router_table_owners{') &&
@@ -143,7 +154,7 @@ async function main(): Promise<void> {
         assert.equal(lines.length, 1, `${table} must have exactly one active SQL lease`);
         return /collector="([^"]+)"/.exec(lines[0])?.[1];
       });
-      assert.ok(owners.every((owner) => collectors.includes(owner ?? '')), 'every table must have one active owner');
+      assert.ok(owners.every((owner) => collectorIds.includes(owner ?? '')), 'every table must have one active owner');
       for (const name of collectors) stop(name);
       // Check physical output, not merely admission acknowledgements.
       const files = docker(['exec', catalog, 'sh', '-c', 'find /onelake/dataflow -name "*.parquet" -type f']);
@@ -156,7 +167,11 @@ async function main(): Promise<void> {
     }
   }
   stop(catalog); startCatalog();
-  await waitReady(catalog, ['/usr/local/bin/arrowcol-catalog-rust', '--healthcheck']);
+  await waitReady(catalog, [
+    '/usr/local/bin/arrowcol-catalog-rust',
+    '--ddl-identity-secret-file', '/run/oat/internal-hmac',
+    '--healthcheck',
+  ]);
   stop(catalog); stop(routerName);
   console.log('PASS catalog persistence/restart and repeated SQL migrations; no cloud benchmark evidence produced.');
 }

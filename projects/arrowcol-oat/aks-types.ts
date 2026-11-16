@@ -60,6 +60,7 @@ export interface SetupOptions {
   stamp?: string;
   skipImages?: boolean;
   skipPreflight?: boolean;
+  maintenance?: boolean;
   tag?: string;
 }
 
@@ -72,6 +73,7 @@ export interface SetupResult {
     router: string;
     dataflow: string;
     client: string;
+    maintenance?: string;
   };
   aksConfigPath: string;
   runtimeConfigPath: string;

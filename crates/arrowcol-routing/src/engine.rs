@@ -831,8 +831,13 @@ fn assignment_for_lease(
         )
     })?;
     if !collector_is_eligible(collector, now, policy, false) {
+        let kind = if crate::collector_is_overloaded(collector, now, policy) {
+            RoutingErrorKind::LeaseHolderOverloaded
+        } else {
+            RoutingErrorKind::LeaseHolderUnavailable
+        };
         return Err(RoutingError::new(
-            RoutingErrorKind::LeaseHolderUnavailable,
+            kind,
             "routing lease holder is stale, draining, or under hard pressure",
         ));
     }

@@ -33,11 +33,7 @@ use prost::Message;
 use reqwest::{Client as HttpClient, Url};
 use serde::Serialize;
 use sha2::Sha256;
-use tonic::{
-    Request,
-    metadata::MetadataValue,
-    transport::{Channel, Endpoint},
-};
+use tonic::{Request, metadata::MetadataValue, transport::Channel};
 use uuid::Uuid;
 
 use crate::sdk::GeneratedTable;
@@ -66,7 +62,11 @@ pub struct CapabilityEvidence {
 /// Shared Flight/HTTP clients and trusted-edge request signer.
 #[derive(Clone)]
 pub struct FlightTransport {
-    channel: Channel,
+    channels: Arc<Vec<Channel>>,
+    next_channel: Arc<AtomicU64>,
+    channel_offset: usize,
+    channel_count: usize,
+    tuning: crate::tuning::ClientTuning,
     catalog_channel: Channel,
     http: HttpClient,
     signer: EdgeSigner,
@@ -86,28 +86,78 @@ impl FlightTransport {
         internal_secret_file: &Path,
         timeout: Duration,
     ) -> Result<Self> {
-        let endpoint = Endpoint::from_shared(flight_endpoint.to_owned())?
-            .connect_timeout(timeout)
-            .timeout(timeout)
-            .http2_keep_alive_interval(Duration::from_secs(10))
-            .keep_alive_while_idle(true);
-        let channel = endpoint.connect().await?;
-        let catalog_channel = Endpoint::from_shared(catalog_endpoint.to_owned())?
-            .connect_timeout(timeout)
-            .timeout(timeout)
-            .connect()
-            .await?;
+        Self::connect_tuned(
+            flight_endpoint,
+            catalog_endpoint,
+            edge_secret_file,
+            internal_secret_file,
+            timeout,
+            crate::tuning::ClientTuning::default(),
+            1,
+        )
+        .await
+    }
+
+    /// Connects a bounded persistent channel pool using validated client settings.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid capacity and propagates signing or connection failures.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn connect_tuned(
+        flight_endpoint: &str,
+        catalog_endpoint: &str,
+        edge_secret_file: &Path,
+        internal_secret_file: &Path,
+        timeout: Duration,
+        tuning: crate::tuning::ClientTuning,
+        channel_count: usize,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            (1..=4096).contains(&channel_count),
+            "Flight channel count must be 1..=4096"
+        );
+        let endpoint = tuning.endpoint(flight_endpoint, timeout)?;
+        let mut channels = Vec::with_capacity(channel_count);
+        for _ in 0..channel_count {
+            channels.push(endpoint.connect().await?);
+        }
+        let catalog_channel = tuning.endpoint(catalog_endpoint, timeout)?.connect().await?;
         let http = HttpClient::builder()
             .connect_timeout(timeout)
             .timeout(timeout)
             .build()?;
         Ok(Self {
-            channel,
+            channels: Arc::new(channels),
+            next_channel: Arc::new(AtomicU64::new(0)),
+            channel_offset: 0,
+            channel_count,
+            tuning,
             catalog_channel,
             http,
             signer: EdgeSigner::from_file(edge_secret_file)?,
             internal_signer: InternalSigner::from_file(internal_secret_file)?,
         })
+    }
+
+    pub(crate) fn for_lane(&self, lane: usize) -> Result<Self> {
+        let mut transport = self.clone();
+        let count = self.tuning.connections_per_worker;
+        let offset = lane.checked_mul(count).context("lane channel offset overflow")?;
+        anyhow::ensure!(
+            offset + count <= self.channels.len(),
+            "lane exceeds prepared channel pool"
+        );
+        transport.channel_offset = offset;
+        transport.channel_count = count;
+        transport.next_channel = Arc::new(AtomicU64::new(0));
+        Ok(transport)
+    }
+
+    fn client(&self, channel: Channel) -> FlightServiceClient<Channel> {
+        FlightServiceClient::new(channel)
+            .max_encoding_message_size(self.tuning.max_message_bytes)
+            .max_decoding_message_size(self.tuning.max_message_bytes)
     }
 
     /// Registers one strict `CREATE TABLE` through Flight SQL `DoPut`.
@@ -139,7 +189,7 @@ impl FlightTransport {
         self.internal_signer
             .decorate_catalog_request(&mut request, DO_PUT_PATH, &ddl_payload)?;
         request.set_timeout(timeout);
-        let mut client = FlightServiceClient::new(self.catalog_channel.clone());
+        let mut client = self.client(self.catalog_channel.clone());
         let response = tokio::time::timeout(timeout, client.do_put(request))
             .await
             .context("Flight SQL registration timed out")??;
@@ -179,7 +229,9 @@ impl FlightTransport {
         ];
         self.decorate_request(&mut request, DO_PUT_PATH, &pairs)?;
         request.set_timeout(timeout);
-        let mut client = FlightServiceClient::new(self.channel.clone());
+        let index =
+            self.channel_offset + self.next_channel.fetch_add(1, Ordering::Relaxed) as usize % self.channel_count;
+        let mut client = self.client(self.channels[index].clone());
         let response = tokio::time::timeout(timeout, client.do_put(request))
             .await
             .context("Arrow Flight DoPut timed out before response")??;

@@ -44,14 +44,18 @@ groups:
           durable:
             type: processor:durable_buffer
             config:
-              path: "${env:ARROWCOL_QUIVER_PATH:-/var/lib/arrowcol/quiver}"
-              wal_flush_interval: 0s
-              retention_size_cap: "${env:ARROWCOL_QUIVER_CAPACITY:-256 MiB}"
-              size_cap_policy: backpressure
-              max_segment_open_duration: 1s
-              poll_interval: 100ms
-              initial_retry_interval: 250ms
-              max_retry_interval: 2s
+              path: "${env:ARROWCOL_WAL_PATH:-/var/lib/arrowcol/quiver}"
+              wal_flush_interval: "${env:ARROWCOL_WAL_FLUSH_INTERVAL:-0s}"
+              retention_size_cap: "${env:ARROWCOL_WAL_RETENTION_SIZE_CAP:-256 MiB}"
+              max_age: ${env:ARROWCOL_WAL_MAX_AGE:-null}
+              size_cap_policy: "${env:ARROWCOL_WAL_SIZE_CAP_POLICY:-backpressure}"
+              poll_interval: "${env:ARROWCOL_WAL_POLL_INTERVAL:-100ms}"
+              otlp_handling: "${env:ARROWCOL_WAL_OTLP_HANDLING:-pass_through}"
+              max_segment_open_duration: "${env:ARROWCOL_WAL_MAX_SEGMENT_OPEN_DURATION:-1s}"
+              initial_retry_interval: "${env:ARROWCOL_WAL_INITIAL_RETRY_INTERVAL:-250ms}"
+              max_retry_interval: "${env:ARROWCOL_WAL_MAX_RETRY_INTERVAL:-2s}"
+              retry_multiplier: ${env:ARROWCOL_WAL_RETRY_MULTIPLIER:-2.0}
+              max_in_flight: ${env:ARROWCOL_WAL_MAX_IN_FLIGHT:-1000}
           delta:
             type: exporter:arrow_deltalake
             config:

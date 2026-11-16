@@ -15,6 +15,7 @@ use arrow::array::{
 };
 use arrow::compute::filter_record_batch;
 use arrow::datatypes::{DataType, Int64Type, Schema, SchemaRef};
+use bytes::Bytes;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use delta_kernel::expressions::Scalar;
@@ -24,18 +25,26 @@ use delta_kernel_default_engine::executor::TaskExecutor;
 use delta_kernel_default_engine::parquet::DataFileMetadata;
 use delta_kernel_default_engine::stats::FileStatsAccumulator;
 use delta_kernel_default_engine::{DefaultEngineBuilder, build_add_file_metadata};
-use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, PutOptions, UpdateVersion};
+use futures::{FutureExt, StreamExt, TryStreamExt, future::BoxFuture};
+use object_store::{GetOptions, GetRange, ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, PutOptions, UpdateVersion};
 use parquet::arrow::ArrowWriter;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::ParquetRecordBatchStreamBuilder;
+use parquet::arrow::arrow_reader::{ArrowReaderOptions, ParquetRecordBatchReaderBuilder};
+use parquet::arrow::async_reader::AsyncFileReader;
+use parquet::errors::ParquetError;
+use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
 use parquet::file::properties::WriterProperties;
+use parquet::file::reader::ChunkReader;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::{self, Display, Formatter};
 use std::fs::{self, File};
+use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::io::AsyncWriteExt;
 use url::Url;
 
 /// Serialized plan format understood by this build.
@@ -84,8 +93,10 @@ pub enum MaintenanceErrorKind {
     ResourceLimit,
     /// Commit collisions or retries exhausted the bounded budget.
     Exhausted,
-    /// Cancellation or deadline interrupted work.
+    /// Cancellation interrupted work.
     Cancelled,
+    /// The operation's wall-clock deadline expired.
+    DeadlineExceeded,
     /// A publication outcome is unknown; staged outputs were retained.
     Uncertain,
 }
@@ -103,6 +114,7 @@ impl MaintenanceErrorKind {
             Self::ResourceLimit => "resource_limit",
             Self::Exhausted => "exhausted",
             Self::Cancelled => "cancelled",
+            Self::DeadlineExceeded => "deadline_exceeded",
             Self::Uncertain => "uncertain",
         }
     }
@@ -153,16 +165,45 @@ pub fn error_kind(error: &anyhow::Error) -> Option<MaintenanceErrorKind> {
 }
 
 /// Cooperative cancellation and deadline shared with the caller.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct MaintenanceControl {
     cancel: Arc<AtomicBool>,
     deadline: Option<Instant>,
+    commit_attempts: u32,
+    commit_budget: Duration,
+}
+
+impl Default for MaintenanceControl {
+    fn default() -> Self {
+        Self::new(Arc::new(AtomicBool::new(false)), None)
+    }
 }
 
 impl MaintenanceControl {
     #[must_use]
     pub const fn new(cancel: Arc<AtomicBool>, deadline: Option<Instant>) -> Self {
-        Self { cancel, deadline }
+        Self {
+            cancel,
+            deadline,
+            commit_attempts: MAX_COMMIT_ATTEMPTS,
+            commit_budget: COMMIT_BUDGET,
+        }
+    }
+
+    /// Set bounded publication retry limits without weakening reconciliation.
+    ///
+    /// # Errors
+    /// Rejects zero or excessive limits.
+    pub fn with_commit_retry_limits(mut self, attempts: u32, budget: Duration) -> Result<Self> {
+        if !(1..=1000).contains(&attempts) || budget.is_zero() || budget > Duration::from_secs(3600) {
+            return Err(fail(
+                MaintenanceErrorKind::InvalidPlan,
+                "commit retries require 1..=1000 attempts and a budget within (0, 3600s]",
+            ));
+        }
+        self.commit_attempts = attempts;
+        self.commit_budget = budget;
+        Ok(self)
     }
 
     /// True once cancellation was requested or the deadline passed.
@@ -171,16 +212,19 @@ impl MaintenanceControl {
         self.cancel.load(Ordering::SeqCst) || self.deadline.is_some_and(|deadline| Instant::now() >= deadline)
     }
 
-    /// Fail with [`MaintenanceErrorKind::Cancelled`] when interrupted.
+    /// Fail with a distinct error when the signal or deadline interrupts work.
     ///
     /// # Errors
-    /// Returns a cancellation error after cancellation or deadline expiry.
+    /// Returns a cancellation error after signal cancellation or a deadline error after expiry.
     pub fn check(&self) -> Result<()> {
-        if self.interrupted() {
+        if self.deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Err(fail(
-                MaintenanceErrorKind::Cancelled,
-                "maintenance cancelled or deadline exceeded",
+                MaintenanceErrorKind::DeadlineExceeded,
+                "maintenance operation deadline exceeded",
             ));
+        }
+        if self.cancel.load(Ordering::SeqCst) {
+            return Err(fail(MaintenanceErrorKind::Cancelled, "maintenance cancelled"));
         }
         Ok(())
     }
@@ -611,6 +655,14 @@ impl DeltaTable {
     /// # Errors
     /// Rejects absent local tables and storage/session authority failures.
     pub fn open_for_maintenance_probe(url: &Url) -> Result<Arc<Self>> {
+        Self::open_for_maintenance_probe_with_limit(url, 100_000)
+    }
+
+    /// Open a read-only probe with an explicit log listing bound.
+    ///
+    /// # Errors
+    /// Rejects absent tables, authority failures and bounded listing failures.
+    pub fn open_for_maintenance_probe_with_limit(url: &Url, max_log_files: usize) -> Result<Arc<Self>> {
         if url.scheme() == "file" {
             let root = url.to_file_path().map_err(|()| anyhow::anyhow!("invalid table URL"))?;
             if !root.join("_delta_log").is_dir() {
@@ -618,7 +670,7 @@ impl DeltaTable {
             }
         }
         let table = Self::open_connection(url.clone(), Vec::new(), None, None)?;
-        table.probe_log_version(100_000)?;
+        table.probe_log_version(max_log_files)?;
         Ok(table)
     }
 
@@ -648,7 +700,19 @@ impl DeltaTable {
     /// # Errors
     /// Rejects corrupt JSON, incomplete logs and concurrent metadata advancement.
     pub fn maintenance_properties(&self) -> Result<BTreeMap<String, String>> {
-        let names = self.list_log(100_000)?;
+        self.maintenance_properties_with_limits(100_000, 64 * 1024 * 1024)
+    }
+
+    /// Read table properties with explicit log listing and commit byte bounds.
+    ///
+    /// # Errors
+    /// Rejects corrupt JSON, incomplete logs and concurrent metadata advancement.
+    pub fn maintenance_properties_with_limits(
+        &self,
+        max_log_files: usize,
+        max_log_file_bytes: u64,
+    ) -> Result<BTreeMap<String, String>> {
+        let names = self.list_log(max_log_files)?;
         let version = probe_version(&names)?;
         let token = log_token(&names)?;
         for (name, _) in names.iter().rev() {
@@ -656,7 +720,7 @@ impl DeltaTable {
                 continue;
             }
             let number = name[..20].parse::<u64>()?;
-            let bytes = self.read_commit(number, 64 * 1024 * 1024)?;
+            let bytes = self.read_commit(number, max_log_file_bytes)?;
             let mut configuration = None;
             for line in bytes.split(|byte| *byte == b'\n').filter(|line| !line.is_empty()) {
                 let action: serde_json::Value = serde_json::from_slice(line)?;
@@ -670,7 +734,7 @@ impl DeltaTable {
                 }
             }
             if let Some(configuration) = configuration {
-                self.require_probe_token(&token, 100_000)?;
+                self.require_probe_token(&token, max_log_files)?;
                 return Ok(configuration);
             }
         }
@@ -682,7 +746,7 @@ impl DeltaTable {
             ));
         }
         let configuration = TableFingerprint::of(&snapshot).configuration;
-        self.require_probe_token(&token, 100_000)?;
+        self.require_probe_token(&token, max_log_files)?;
         Ok(configuration)
     }
 
@@ -1236,7 +1300,7 @@ impl DeltaTable {
         let app_id = header.app_id(&operation.to_ascii_lowercase());
         let started = Instant::now();
         let mut uncertain = false;
-        for attempt in 0..MAX_COMMIT_ATTEMPTS {
+        for attempt in 0..control.commit_attempts {
             report.attempts = attempt + 1;
             let mut in_flight = false;
             let result = (|| -> Result<Option<Published>> {
@@ -1318,7 +1382,7 @@ impl DeltaTable {
                     return self.unknown_outcome(&app_id, outputs, report, &format!("{error:#}"));
                 }
             }
-            if started.elapsed() > COMMIT_BUDGET {
+            if started.elapsed() > control.commit_budget {
                 break;
             }
             collision_backoff(attempt);
@@ -1334,8 +1398,9 @@ impl DeltaTable {
         let error = fail_with(
             MaintenanceErrorKind::Exhausted,
             format!(
-                "maintenance commit budget exhausted ({MAX_COMMIT_ATTEMPTS} attempts / {}s)",
-                COMMIT_BUDGET.as_secs()
+                "maintenance commit budget exhausted ({} attempts / {}s)",
+                control.commit_attempts,
+                control.commit_budget.as_secs()
             ),
             report,
         );
@@ -1484,6 +1549,105 @@ fn tracing_note(message: &str) {
     }
 }
 
+/// OPTIMIZE input buffering strategy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum InputReadStrategy {
+    /// Fetch each complete input into memory.
+    #[default]
+    Memory,
+    /// Stream one object response into a temporary local file.
+    Spool,
+    /// Fetch ranges with an ETag precondition on every request.
+    Range,
+}
+
+struct FencedRangeReader {
+    store: Arc<dyn ObjectStore>,
+    path: object_store::path::Path,
+    size: u64,
+    etag: String,
+}
+
+impl AsyncFileReader for FencedRangeReader {
+    fn get_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, parquet::errors::Result<Bytes>> {
+        async move {
+            let expected = range
+                .end
+                .checked_sub(range.start)
+                .ok_or_else(|| ParquetError::General("invalid OPTIMIZE range".into()))?;
+            let response = self
+                .store
+                .get_opts(
+                    &self.path,
+                    GetOptions {
+                        if_match: Some(self.etag.clone()),
+                        range: Some(GetRange::Bounded(range.clone())),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(|error| ParquetError::External(Box::new(error)))?;
+            if response.meta.e_tag.as_deref() != Some(self.etag.as_str()) || response.range != range {
+                return Err(ParquetError::General(
+                    "OPTIMIZE input changed or server returned the wrong range".into(),
+                ));
+            }
+            let bytes = response
+                .bytes()
+                .await
+                .map_err(|error| ParquetError::External(Box::new(error)))?;
+            if bytes.len() as u64 != expected {
+                return Err(ParquetError::General("short OPTIMIZE range response".into()));
+            }
+            Ok(bytes)
+        }
+        .boxed()
+    }
+
+    fn get_metadata<'a>(
+        &'a mut self,
+        options: Option<&'a ArrowReaderOptions>,
+    ) -> BoxFuture<'a, parquet::errors::Result<Arc<ParquetMetaData>>> {
+        async move {
+            let size = self.size;
+            let mut reader = ParquetMetaDataReader::new()
+                .with_metadata_options(options.map(|value| value.metadata_options().clone()));
+            if let Some(options) = options {
+                reader = reader
+                    .with_column_index_policy(options.column_index_policy())
+                    .with_offset_index_policy(options.offset_index_policy());
+            }
+            Ok(Arc::new(reader.load_and_finish(self, size).await?))
+        }
+        .boxed()
+    }
+}
+
+#[cfg(test)]
+mod range_reader_tests {
+    use super::*;
+    use object_store::memory::InMemory;
+
+    #[tokio::test]
+    async fn rejects_replaced_input_between_range_requests() -> Result<()> {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = object_store::path::Path::from("input.parquet");
+        store.put(&path, Bytes::from_static(b"abcdefgh").into()).await?;
+        let meta = store.head(&path).await?;
+        let mut reader = FencedRangeReader {
+            store: Arc::clone(&store),
+            path: path.clone(),
+            size: meta.size,
+            etag: meta.e_tag.context("missing test ETag")?,
+        };
+        assert_eq!(reader.get_bytes(0..4).await?, Bytes::from_static(b"abcd"));
+        store.put(&path, Bytes::from_static(b"ABCDEFGH").into()).await?;
+        assert!(reader.get_bytes(4..8).await.is_err());
+        Ok(())
+    }
+}
+
 /// OPTIMIZE bounds. Every limit is enforced on plan and again on apply.
 #[derive(Clone, Debug)]
 pub struct OptimizeConfig {
@@ -1513,10 +1677,16 @@ pub struct OptimizeConfig {
     /// Decoded Arrow bytes per input batch.
     pub max_batch_bytes: usize,
     pub batch_rows: usize,
+    /// Input buffering strategy; spool uses temporary local disk.
+    pub input_read_strategy: InputReadStrategy,
     pub max_output_file_bytes: u64,
     pub max_active_files: usize,
     /// Whole-output sort using the shared layout helper.
     pub layout: Option<LayoutPolicy>,
+    /// Use the publication layout when no explicit layout is configured.
+    pub use_default_layout: bool,
+    /// Unsorted output row-group row limit.
+    pub output_row_group_rows: usize,
 }
 
 impl Default for OptimizeConfig {
@@ -1536,9 +1706,12 @@ impl Default for OptimizeConfig {
             max_row_group_bytes: 128 * 1024 * 1024,
             max_batch_bytes: 64 * 1024 * 1024,
             batch_rows: 8192,
+            input_read_strategy: InputReadStrategy::Memory,
             max_output_file_bytes: 1023 * 1024 * 1024,
             max_active_files: 1_000_000,
             layout: None,
+            use_default_layout: true,
+            output_row_group_rows: 65_536,
         }
     }
 }
@@ -1570,6 +1743,9 @@ impl OptimizeConfig {
         }
         if self.latest_partitions == Some(0) {
             return invalid("latest partition count must be positive");
+        }
+        if self.output_row_group_rows == 0 {
+            return invalid("output row-group rows must be positive");
         }
         Ok(())
     }
@@ -1975,7 +2151,8 @@ impl DeltaTable {
         // customer's whole-file sort order instead of concatenating inputs.
         let layout = match &config.layout {
             Some(layout) => Some(layout.clone()),
-            None => crate::delta::configured_publication_layout(&logical)?,
+            None if config.use_default_layout => crate::delta::configured_publication_layout(&logical)?,
+            None => None,
         };
         let properties = match &layout {
             Some(layout) => {
@@ -1983,9 +2160,12 @@ impl DeltaTable {
                 layout.writer_properties(&physical)?
             }
             None => WriterProperties::builder()
-                .set_max_row_group_row_count(Some(65_536))
+                .set_max_row_group_row_count(Some(config.output_row_group_rows))
                 .build(),
         };
+        let verified_sort = crate::writer::sorting_from_properties(&physical, Some(&properties))?;
+        let properties =
+            crate::writer::process_config()?.writer_properties(&physical, Some(properties), &verified_sort)?;
         let mut writer = BinWriter {
             table: self,
             snapshot,
@@ -2037,17 +2217,117 @@ impl DeltaTable {
         let store = Arc::clone(&self.store);
         let limit = config.small_file_bytes;
         let expected = file.size;
-        let bytes = shared_executor()?.block_on(async move {
-            let object = store.get(&path).await?;
-            if object.meta.size != expected || object.meta.size >= limit {
-                return Err(fail(
-                    MaintenanceErrorKind::StalePlan,
-                    "input object size differs from the planned size",
-                ));
+        match config.input_read_strategy {
+            InputReadStrategy::Memory => {
+                let bytes = shared_executor()?.block_on(async move {
+                    let object = store.get(&path).await?;
+                    if object.meta.size != expected || object.meta.size >= limit {
+                        return Err(fail(
+                            MaintenanceErrorKind::StalePlan,
+                            "input object size differs from the planned size",
+                        ));
+                    }
+                    Ok(object.bytes().await?)
+                })?;
+                self.decode_input(bytes, file, config, decoded, logical, writer)
             }
-            Ok(object.bytes().await?)
-        })?;
-        let builder = ParquetRecordBatchReaderBuilder::try_new(bytes)?;
+            InputReadStrategy::Spool => {
+                let temp = tempfile::tempfile().context("create temporary OPTIMIZE input")?;
+                let temp = shared_executor()?.block_on(async move {
+                    let object = store.get(&path).await?;
+                    if object.meta.size != expected || object.meta.size >= limit {
+                        return Err(fail(
+                            MaintenanceErrorKind::StalePlan,
+                            "input object size differs from the planned size",
+                        ));
+                    }
+                    let mut stream = object.into_stream();
+                    let mut temp = tokio::fs::File::from_std(temp);
+                    let mut size = 0_u64;
+                    while let Some(chunk) = stream.try_next().await? {
+                        size = size.checked_add(chunk.len() as u64).context("input size overflow")?;
+                        if size > expected {
+                            return Err(fail(MaintenanceErrorKind::StalePlan, "input object grew during read"));
+                        }
+                        temp.write_all(&chunk).await.context("write temporary OPTIMIZE input")?;
+                    }
+                    if size != expected {
+                        return Err(fail(
+                            MaintenanceErrorKind::StalePlan,
+                            "input object was truncated during read",
+                        ));
+                    }
+                    temp.flush().await.context("flush temporary OPTIMIZE input")?;
+                    Ok(temp.into_std().await)
+                })?;
+                self.decode_input(temp, file, config, decoded, logical, writer)
+            }
+            InputReadStrategy::Range => {
+                let batch_rows = writer
+                    .layout
+                    .as_ref()
+                    .map_or(config.batch_rows, |layout| config.batch_rows.min(layout.max_rows));
+                let max_row_group_bytes = config.max_row_group_bytes;
+                let executor = shared_executor()?;
+                let mut stream = executor.block_on(async move {
+                    let meta = store.head(&path).await?;
+                    if meta.size != expected || meta.size >= limit {
+                        return Err(fail(
+                            MaintenanceErrorKind::StalePlan,
+                            "input object size differs from the planned size",
+                        ));
+                    }
+                    let etag = meta
+                        .e_tag
+                        .filter(|value| !value.is_empty() && value != "*" && !value.starts_with("W/"))
+                        .ok_or_else(|| {
+                            fail(
+                                MaintenanceErrorKind::Unsupported,
+                                "range strategy requires a strong object ETag",
+                            )
+                        })?;
+                    let reader = FencedRangeReader {
+                        store,
+                        path,
+                        size: meta.size,
+                        etag,
+                    };
+                    let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
+                    for group in builder.metadata().row_groups() {
+                        if u64::try_from(group.total_byte_size()).unwrap_or(u64::MAX) > max_row_group_bytes {
+                            return Err(fail(
+                                MaintenanceErrorKind::ResourceLimit,
+                                "input row group exceeds the decode bound",
+                            ));
+                        }
+                    }
+                    Ok(builder.with_batch_size(batch_rows).build()?)
+                })?;
+                let mut rows = 0_u64;
+                loop {
+                    let (next_stream, batch) = executor.block_on(async move {
+                        let batch = stream.next().await;
+                        (stream, batch)
+                    });
+                    stream = next_stream;
+                    let Some(batch) = batch else { break };
+                    rows += push_input_batch(batch?, config, decoded, logical, writer)?;
+                }
+                Ok(rows)
+            }
+        }
+    }
+
+    fn decode_input<T: ChunkReader + 'static>(
+        &self,
+        input: T,
+        file: &DataFile,
+        config: &OptimizeConfig,
+        decoded: &mut u64,
+        logical: &SchemaRef,
+        writer: &mut BinWriter<'_>,
+    ) -> Result<u64> {
+        let builder = ParquetRecordBatchReaderBuilder::try_new(input)?;
         for group in builder.metadata().row_groups() {
             if u64::try_from(group.total_byte_size()).unwrap_or(u64::MAX) > config.max_row_group_bytes {
                 return Err(fail(
@@ -2064,20 +2344,30 @@ impl DeltaTable {
         let reader = builder.with_batch_size(batch_rows).build()?;
         let mut rows = 0_u64;
         for batch in reader {
-            let batch = batch?;
-            let size = batch.get_array_memory_size();
-            *decoded = decoded.saturating_add(size as u64);
-            if size > config.max_batch_bytes || *decoded > config.max_decoded_bytes_per_bin {
-                return Err(fail(
-                    MaintenanceErrorKind::ResourceLimit,
-                    "decoded Arrow input exceeds the configured bound",
-                ));
-            }
-            rows += batch.num_rows() as u64;
-            writer.push(conform(&batch, logical)?)?;
+            rows += push_input_batch(batch?, config, decoded, logical, writer)?;
         }
         Ok(rows)
     }
+}
+
+fn push_input_batch(
+    batch: RecordBatch,
+    config: &OptimizeConfig,
+    decoded: &mut u64,
+    logical: &SchemaRef,
+    writer: &mut BinWriter<'_>,
+) -> Result<u64> {
+    let size = batch.get_array_memory_size();
+    *decoded = decoded.saturating_add(size as u64);
+    if size > config.max_batch_bytes || *decoded > config.max_decoded_bytes_per_bin {
+        return Err(fail(
+            MaintenanceErrorKind::ResourceLimit,
+            "decoded Arrow input exceeds the configured bound",
+        ));
+    }
+    let rows = batch.num_rows() as u64;
+    writer.push(conform(&batch, logical)?)?;
+    Ok(rows)
 }
 
 fn utc(zone: Option<&str>) -> bool {
@@ -5055,6 +5345,29 @@ mod durability_tests {
     use std::collections::BTreeMap;
 
     const BASE: i64 = 1_704_067_200_000;
+
+    #[test]
+    fn maintenance_control_distinguishes_deadline_from_signal_cancellation() {
+        let deadline = MaintenanceControl::new(
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Some(std::time::Instant::now() - Duration::from_secs(1)),
+        );
+        let deadline_kind = match deadline.check() {
+            Ok(()) => None,
+            Err(error) => error_kind(&error),
+        };
+        assert_eq!(deadline_kind, Some(MaintenanceErrorKind::DeadlineExceeded));
+
+        let signal = MaintenanceControl::new(
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            Some(std::time::Instant::now() + Duration::from_secs(60)),
+        );
+        let signal_kind = match signal.check() {
+            Ok(()) => None,
+            Err(error) => error_kind(&error),
+        };
+        assert_eq!(signal_kind, Some(MaintenanceErrorKind::Cancelled));
+    }
 
     /// Scenario: OPTIMIZE's JSON commit becomes visible but the log fsync fails.
     /// Guarantees: neither reconciliation nor a repeated apply acknowledges the

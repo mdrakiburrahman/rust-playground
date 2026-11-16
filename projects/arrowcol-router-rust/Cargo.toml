@@ -14,6 +14,7 @@ publish = false
 anyhow.workspace = true
 arrowcol-protocol = { path = "../../crates/arrowcol-protocol" }
 arrowcol-routing = { path = "../../crates/arrowcol-routing" }
+arrowcol-sql-server = { path = "../../crates/arrowcol-sql-server" }
 async-trait = "0.1"
 base64 = "0.22"
 bytes = "1"

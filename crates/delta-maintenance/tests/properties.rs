@@ -7,7 +7,8 @@ use arrow_deltalake::maintenance::{
     Outcome, ProbeOperation, now_ms,
 };
 use delta_maintenance::{
-    DiscoveredTable, Metrics, Operation, Settings, TableDiscovery, run_cycle_with_discovery, run_with_discovery,
+    DiscoveredTable, FilesystemDiscovery, Metrics, Operation, Settings, TableDiscovery, run_cycle_with_discovery,
+    run_with_discovery,
 };
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -58,7 +59,11 @@ fn fixture() -> Result<(tempfile::TempDir, Settings, CatalogTable)> {
         max_idle_backoff: Duration::from_secs(300),
         max_cycles: None,
         max_concurrent_tables: 1,
+        max_concurrent_decoded_bytes: None,
         operation_timeout: Duration::from_secs(30),
+        commit_attempts: 8,
+        commit_budget: Duration::from_secs(10),
+        catalog_options: Default::default(),
         granularity: Some(Granularity::Minute),
         purge_retention_ms: None,
         anchor_ms: Some(BASE + 3 * 60_000),
@@ -66,9 +71,11 @@ fn fixture() -> Result<(tempfile::TempDir, Settings, CatalogTable)> {
         allow_short_vacuum_retention: false,
         unsafe_short_vacuum_for_tests: false,
         optimize: OptimizeConfig::default(),
+        process_properties: BTreeMap::new(),
         checkpoint_every_commits: 100,
         log_retention_ms: None,
         max_prune_files: 100,
+        operation_limits: Default::default(),
     };
     let source = CatalogTable(DiscoveredTable {
         name: "events".into(),
@@ -82,6 +89,58 @@ fn fixture() -> Result<(tempfile::TempDir, Settings, CatalogTable)> {
     });
     persist_policy(&source)?;
     Ok((root, settings, source))
+}
+
+struct MissingDiscovery;
+
+impl TableDiscovery for MissingDiscovery {
+    fn tables(&self) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
+    fn table(&self, _name: &str) -> Result<DiscoveredTable> {
+        Err(anyhow!("unexpected table lookup"))
+    }
+}
+
+#[test]
+fn one_shot_rejects_missing_allowlisted_tables_before_reporting_success() -> Result<()> {
+    let (_root, settings, _) = fixture()?;
+    let error = match run_cycle_with_discovery(
+        &settings,
+        &MissingDiscovery,
+        &Metrics::new(),
+        &Arc::new(AtomicBool::new(false)),
+    ) {
+        Ok(results) => return Err(anyhow!("missing allowlisted table produced results: {results:?}")),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("allowlisted tables were missing or ambiguous")
+    );
+    Ok(())
+}
+
+#[test]
+fn scheduled_local_discovery_reports_pending_allowlisted_tables() -> Result<()> {
+    let (_root, mut settings, _) = fixture()?;
+    settings.tables = vec!["not-yet-created".into()];
+    settings.interval = Some(Duration::from_millis(1));
+    settings.max_cycles = Some(2);
+    let discovery = FilesystemDiscovery::new(settings.root.clone(), settings.tables.clone());
+    let metrics = Metrics::new();
+    assert!(run_with_discovery(
+        &settings,
+        &discovery,
+        &metrics,
+        &Arc::new(AtomicBool::new(false))
+    ));
+    assert!(discovery.tables()?.is_empty());
+    assert_eq!(discovery.pending_tables()?, vec!["not-yet-created"]);
+    assert!(metrics.render().contains("delta_maintenance_pending_tables 1"));
+    Ok(())
 }
 
 type FileInventory = BTreeMap<PathBuf, (Vec<u8>, SystemTime)>;
@@ -217,6 +276,9 @@ fn idle_catalog_policy_passes_have_no_log_checkpoint_or_progress_rewrites() -> R
 fn table_policy_overrides_process_minimum_and_only_compacts_sealed_pair() -> Result<()> {
     let (root, mut settings, mut source) = fixture()?;
     settings.operations = vec![Operation::Optimize];
+    settings
+        .process_properties
+        .insert("arrowcol.optimize.minFiles".into(), "4".into());
     source
         .0
         .properties
@@ -230,6 +292,40 @@ fn table_policy_overrides_process_minimum_and_only_compacts_sealed_pair() -> Res
         std::fs::read_dir(root.path().join("events").join("__arrowcol_ingestion=2024-01-01-00-01"))?.count(),
         2
     );
+    Ok(())
+}
+
+#[test]
+fn invalid_process_properties_are_rejected_before_a_pass() -> Result<()> {
+    let (_, mut settings, _) = fixture()?;
+    settings
+        .process_properties
+        .insert("arrowcol.optimize.minFiles".into(), "1".into());
+    assert!(settings.validate().is_err());
+    Ok(())
+}
+
+#[test]
+fn decoded_budget_rejects_table_override_without_mutating_data() -> Result<()> {
+    let (root, mut settings, mut source) = fixture()?;
+    settings.operations = vec![Operation::Optimize];
+    settings.max_concurrent_tables = 2;
+    settings.max_concurrent_decoded_bytes = Some(2 * 1024 * 1024 * 1024);
+    settings.validate()?;
+    source
+        .0
+        .properties
+        .insert("arrowcol.optimize.maxDecodedSizePerBin".into(), "2 GiB".into());
+    persist_policy(&source)?;
+    let before = inventory(root.path())?;
+    let results = run_cycle_with_discovery(&settings, &source, &Metrics::new(), &Arc::new(AtomicBool::new(false)))?;
+    assert!(
+        results[0]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("aggregate decode budget"))
+    );
+    assert_eq!(before, inventory(root.path())?);
     Ok(())
 }
 
@@ -473,10 +569,15 @@ fn real_catalog_ddl_discovery_refreshes_policy_without_idle_writes() -> Result<(
         "CREATE TABLE arrowcol.default.events (id BIGINT NOT NULL, __arrowcol_ingestion STRING NOT NULL) USING DELTA PARTITIONED BY (__arrowcol_ingestion) TBLPROPERTIES ('arrowcol.optimize.minFiles'='3', 'arrowcol.partition.granularity'='minute', 'delta.checkpointInterval'='100')".into(),
         None,
     ))?;
-    let source = CatalogDiscovery::connect_with_signer(
+    let source = CatalogDiscovery::connect_with_signer_and_options(
         &endpoint,
         Vec::new(),
         InternalRequestSigner::from_secret(b"catalog-integration-key-at-least-32-bytes".to_vec())?,
+        delta_maintenance::catalog::CatalogOptions {
+            runtime_threads: 1,
+            rpc_timeout: Duration::from_secs(5),
+            max_decoding_message_bytes: 1024 * 1024,
+        },
     )?;
     let names = source.tables()?;
     assert_eq!(names, ["arrowcol.default.events"]);

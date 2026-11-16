@@ -257,11 +257,15 @@ impl ArrowColFlightService {
             force_stop: force_stop.clone(),
         });
         let begin_deadline = admission_deadline(deadline, self.limits.admission_timeout);
-        let lifecycle = run_until(
-            begin_deadline,
+        let lifecycle = match tokio::time::timeout_at(
+            tokio::time::Instant::from_std(begin_deadline),
             self.admission.begin(context.clone(), Arc::clone(&emitter)),
         )
-        .await?;
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => return Err(RuntimeError::not_admitted_deadline_exceeded()),
+        };
         self.pressure.observe(PressureEvent::StreamStarted);
 
         let pressure = Arc::clone(&self.pressure);
@@ -410,7 +414,7 @@ impl PutResultEmitter for ChannelPutResultEmitter {
         let timeout = tokio::time::sleep_until(tokio::time::Instant::from_std(self.deadline));
         tokio::pin!(timeout);
         tokio::select! {
-            _ = self.force_stop.cancelled() => Err(RuntimeError::draining()),
+            _ = self.force_stop.cancelled() => Err(RuntimeError::shutdown_after_admission()),
             _ = &mut timeout => Err(RuntimeError::deadline_exceeded()),
             sent = &mut send => sent.map_err(|_| RuntimeError::cancelled()),
         }
@@ -470,7 +474,7 @@ async fn process_ingest(
             _ = force_stop.cancelled() => {
                 cancellation.cancel();
                 abort_lifecycle(&mut lifecycle, StreamAbortReason::Shutdown).await;
-                send_error(&result_sender, RuntimeError::draining()).await;
+                send_error(&result_sender, shutdown_error(summary)).await;
                 pressure.observe(PressureEvent::StreamFinished {
                     summary,
                     outcome: StreamOutcome::Shutdown,
@@ -545,7 +549,7 @@ async fn process_ingest(
             Err(AdmissionInterruption::Shutdown) => {
                 cancellation.cancel();
                 abort_lifecycle(&mut lifecycle, StreamAbortReason::Shutdown).await;
-                send_error(&result_sender, RuntimeError::draining()).await;
+                send_error(&result_sender, RuntimeError::shutdown_after_admission()).await;
                 pressure.observe(PressureEvent::StreamFinished {
                     summary,
                     outcome: StreamOutcome::Shutdown,
@@ -629,7 +633,7 @@ async fn process_ingest(
         }
         Err(AdmissionInterruption::Shutdown) => {
             abort_lifecycle(&mut lifecycle, StreamAbortReason::Shutdown).await;
-            send_error(&result_sender, RuntimeError::draining()).await;
+            send_error(&result_sender, RuntimeError::shutdown_after_admission()).await;
             pressure.observe(PressureEvent::StreamFinished {
                 summary,
                 outcome: StreamOutcome::Shutdown,
@@ -1061,6 +1065,14 @@ fn admission_deadline(request: Instant, timeout: Duration) -> Instant {
     Instant::now()
         .checked_add(timeout)
         .map_or(request, |admission| admission.min(request))
+}
+
+fn shutdown_error(summary: StreamSummary) -> RuntimeError {
+    if summary.batches() == 0 {
+        RuntimeError::draining()
+    } else {
+        RuntimeError::shutdown_after_admission()
+    }
 }
 
 async fn run_until<T, F>(deadline: Instant, future: F) -> RuntimeResult<T>

@@ -2,6 +2,7 @@ server:
   listen: 127.0.0.1:50050
   threads: 2
   listener_tasks_per_fd: 1
+  upstream_keepalive_pool_size: 1024
   grace_period_seconds: 5
   graceful_shutdown_timeout_seconds: 120
   state_directory: projects/arrowcol-router-rust/.state

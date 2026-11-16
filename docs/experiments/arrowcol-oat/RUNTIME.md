@@ -24,6 +24,8 @@ The pinned SQL executable requires `NET_BIND_SERVICE` in its capability set;
 only that container receives it, while remaining non-root with privilege
 escalation disabled. Other containers continue to drop all capabilities.
 
+Collector CPU pressure sampling is disabled by default and preserves the existing zero gauge. With `ARROWCOL_COLLECTOR_CPU_PRESSURE=process`, each pressure-publication tick samples process CPU-time against wall time multiplied by the effective cgroup v2 quota or available parallelism; the first tick is zero and readings clamp at 10000 basis points. OAT evidence reports `not_sampled` with a null gauge when sampling is off. CPU-gauge exclusion only affects router admission when process sampling is enabled.
+
 ## Prerequisites and authorization
 
 For AKS prerequisites, continue below. Local runs use the following independent path.
@@ -37,8 +39,28 @@ For AKS prerequisites, continue below. Local runs use the following independent 
 | Docker filesystem | Unix runner and daemon must see the **same absolute generated-state path**. A no-network, read-only nonce bind probe verifies actual bytes before SQL starts. Remote path remapping is unsupported, not silently approximated. |
 | Local inputs | New per-cell project/network/SQL and Kusto volumes, private app/migrator/HMAC files; no retained SQL volume or Azure environment file is used. Compose auto `.env` loading is disabled. Images/build cache and host resources remain shared. |
 | `platform.local.snapshot_root` | Optional absolute directory, outside generated state and not its ancestor. Opt-in export; default `null` retains automatic cleanup without exporting. Never point it at public website storage: snapshots contain real payloads. |
-| Stop/export/cleanup | Stop owned ingress, then all collectors, then catalog, then dependencies. Require definite stopped outcomes without OOM or forced writer termination (exit 0, or intentional SIGTERM/143 only for a previously running writer); copy/verify/sync snapshot and provenance **before** owned stack/volume/state deletion. Stop/export failure returns an error and preserves recoverable source state/volumes and any incomplete export. Do not retry into or remove that destination blindly. |
+| Stop/export/cleanup | Stop owned ingress first, then stop and wait for `delta-maintenance`, record its sanitized outcome, and only then SIGTERM collectors; stop catalog and dependencies afterward. `collector_stop_grace_seconds` (30..=3600, default 300) is applied to local collectors and AKS `terminationGracePeriodSeconds` and is read back before measurement. Other local stop phases retain a 300 s ceiling; the overall local deadline includes collector grace, all three other phase ceilings, and 120 s margin. Each collector records SIGTERM-to-exit seconds, committed rows/commits completed after SIGTERM, Quiver bundles drained/force-dropped, log completeness, and exit code. A zero drained count derived only from matched shutdown start/complete records is labelled `inferred`, not `observed`. A `delta-maintenance` exit 1 is recorded as `maintenance_operation_failure` with sanitized per-cell `error_kind` counts and a comment; exit 0 and intentional SIGTERM/143 for a previously running writer remain accepted. On both platforms, exit 2, 137, OOM and every other nonzero exit still fail. An AKS terminated state missed before pod deletion yields `exit_outcome.status=unavailable` and a null exit code, never an assumed success. Without snapshots, a local stop failure still attempts owned stack/volume/state destruction and retains both errors; an AKS stop failure still attempts UID-preconditioned namespace deletion, absence confirmation and authorized QAP/FIC cleanup. **Only snapshot mode** preserves source data on stop/export failure: copy/verify/sync snapshot and provenance before owned stack/volume/state deletion. |
 | Snapshot meaning | Last committed stopped data, **not** proof every admitted row was flushed. No measurement, pinning, unknown-count or QAP acceptance gate is relaxed. |
+
+Collector routing-store SQL remains unpooled; unlike the router's per-request
+authoritative OAT pin reads, its heartbeat/pressure operations are periodic.
+Collector pool tunables are a follow-up, not part of the router pooling evidence.
+Router SQL pooling can reduce login overhead, but pool acquisition and SQL
+latency can still delay requests. A larger future-skew allowance also accepts
+more genuine clock skew, while a longer background refresh interval risks
+staler cache and readiness data; neither removes per-request authority reads.
+See [router tunables](TUNABLES.md#router-sql-pooling-and-log-volume).
+
+AKS starts SQL and completes migration before applying workload ConfigMaps,
+Services, NetworkPolicies and the catalog Deployment. Catalog rollout must be
+ready before collector/router Deployments are applied; maintenance remains at
+zero replicas until table pins are established. Rollout permits startup crashes
+below four restarts, fails immediately on image-pull/container-config errors,
+and is bounded by `aks_rollout_timeout_seconds`, including stalled API calls.
+Failures capture bounded current/previous logs and descriptions for every
+workload role, namespace pods/services/endpoints and events before cleanup.
+Teardown logs per-Deployment stop, namespace deletion/absence and QAP/FIC cleanup
+durations; a failed cell's total elapsed time alone cannot identify its slow step.
 
 Functional smoke only (not E1-E5 or Kustainer performance evidence), from the
 repository root in the devcontainer. Rust, Node workspace dependencies and Docker
@@ -84,7 +106,7 @@ pinning, while preparation/client/cleanup errors can abort before Parquet exists
 | Retained output | Evidence / limits |
 | --- | --- |
 | `snapshots/<cell-run-UUID>/stopped.json` and `complete.json` | Stopped container identities/outcomes and completion manifest with per-table manifest SHA256. An absent completion marker means incomplete export, not permission to clean source data. |
-| `snapshots/<cell-run-UUID>/sqlserver_active_sessions/table/` | Unchanged genuine Delta JSON log and payload bytes; only the empty writer lock file is omitted. No symlinks/nonregular files, checkpoints, deletion vectors, external paths, history gaps or missing historical Add payloads are accepted. |
+| `snapshots/<cell-run-UUID>/sqlserver_active_sessions/table/` | Unchanged genuine Delta JSON log and payload bytes; only the empty writer lock file is omitted. Checkpoint Parquet sidecars and `_last_checkpoint` are preserved byte-for-byte; checkpoints do not bridge gaps in the required contiguous JSON history from version zero. Symlinks/nonregular files, deletion vectors, external paths, history gaps or missing historical Add payloads are rejected. |
 | Sibling `manifest.json` | Version 1 `schema_version`, `run_id`, `table`, `latestVersion`, positive `rowCount`, original `schemaString`, `files[{path,size,sha256}]`, stopped `writers` and semantics. Paths are relative to `table/`; active rows are independently decoded and checked against Parquet footer counts, never inferred from Add statistics. |
 | `results.parquet`, `site/results.parquet` | Local summary/mirror outside generated state. Not the Delta dataset and not a provider qualification receipt. |
 
@@ -226,6 +248,14 @@ collapsing independent client connections onto one DFE worker. These settings
 are fixed across the matrix and do not change the normal router defaults.
 Keep client concurrency comfortably above the worker count (the example uses
 16); SO_REUSEPORT distributes connections by kernel hashing, not round-robin.
+
+In OAT mode, the router reads the authoritative SQL run-table pin for every
+ingest request and again during revalidation; do not cache or weaken this check.
+Therefore measured OAT router latency includes those SQL round trips, while the
+production cached-lease routing path does not. `router.sql_pool_max_size` changes
+connection reuse, not pin-read semantics. Per-cell `evidence_json.router_sql`
+contains opened-connection and operation counters plus SQL operation latency
+histogram deltas for the measurement window.
 `--num-cores` is authoritative because the rendered pipeline has no resource
 policy override. Flight success is **best-effort admission**, not publication.
 QAP observations and client timing must not be presented as a durability receipt.

@@ -14,16 +14,18 @@ use arrow_flight::{
     PollInfo, PutResult, SchemaResult, Ticket,
 };
 use arrowcol_protocol::{
-    BasisPoints, CollectorInstanceId, ImplementationPool, Measurement, PositiveMeasurement, PressureGauge, UnixMillis,
+    BasisPoints, CatalogName, CollectorInstanceId, ImplementationPool, Measurement, NOT_ADMITTED_METADATA_KEY,
+    PositiveMeasurement, PressureGauge, SchemaName, TableIdentity, TableName, UnixMillis,
 };
 use arrowcol_router_rust::{
     AllowAllAuthenticator, AuthConfig, Authenticator, EdgeRequestSigner, EdgeVerifier, H2Config,
-    InternalIdentitySigner, ProductionRouter, RouterConfig, RouterControlLoop, RouterMetrics, RoutingConfig,
-    ServerConfig, SqlServerConfig, TelemetryConfig, UpstreamConfig, build_server, insert_edge_signature_headers,
+    InternalIdentitySigner, OAT_RUN_ID_HEADER, ProductionRouter, RouterConfig, RouterControlLoop, RouterMetrics,
+    RoutingConfig, ServerConfig, SqlServerConfig, TelemetryConfig, UpstreamConfig, build_server,
+    insert_edge_signature_headers,
 };
 use arrowcol_routing::{
-    CollectorRegistration, MemoryRoutingStore, RichPressureSnapshot, RoutingEngine, RoutingPolicy, RoutingStore,
-    SubsystemState,
+    CollectorRegistration, LeaseKey, MemoryRoutingStore, RichPressureSnapshot, RoutingEngine, RoutingPolicy,
+    RoutingStore, SubsystemState,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -40,6 +42,7 @@ const CHILD_ENV: &str = "ARROWCOL_ROUTER_PINGORA_CHILD";
 const LISTEN_ENV: &str = "ARROWCOL_ROUTER_PINGORA_LISTEN";
 const BACKEND_ENV: &str = "ARROWCOL_ROUTER_PINGORA_BACKEND";
 const STATE_ENV: &str = "ARROWCOL_ROUTER_PINGORA_STATE";
+const OAT_RUN_ID_ENV: &str = "ARROWCOL_ROUTER_PINGORA_OAT_RUN_ID";
 const BACKEND_HEADER: &str = "x-test-backend";
 const FAIL_AFTER_HEADER: &str = "x-test-fail-after";
 const INTERNAL_CONTEXT_HEADER: &str = "x-arrowcol-internal-auth-context";
@@ -175,6 +178,101 @@ fn pingora_child_process() {
         return;
     }
     run_child().unwrap_or_else(|error| panic!("Pingora child failed: {error}"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "multiprocess Pingora OAT admission qualification"]
+async fn oat_overload_has_retry_marker_but_missing_pin_is_a_pinning_violation() -> anyhow::Result<()> {
+    if !cfg!(target_os = "linux") {
+        return Ok(());
+    }
+    let proxy = reserve_address()?;
+    let backend = reserve_address()?;
+    let state = format!("target/pingora-oat-overload-{}-{}", std::process::id(), now()?.get());
+    let run_id = "00000000-0000-0000-0000-0000000000ab";
+    let executable = std::env::current_exe()?;
+    let child_process = Command::new(executable)
+        .args(["--ignored", "--exact", "pingora_child_process", "--nocapture"])
+        .env(CHILD_ENV, "1")
+        .env(LISTEN_ENV, proxy.to_string())
+        .env(BACKEND_ENV, backend.to_string())
+        .env(STATE_ENV, &state)
+        .env(OAT_RUN_ID_ENV, run_id)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+    let mut child = ChildGuard {
+        child: Some(child_process),
+        state,
+    };
+    wait_for_port(proxy, Duration::from_secs(15)).await?;
+    wait_for_port(backend, Duration::from_secs(15)).await?;
+    let channel = Endpoint::from_shared(format!("http://{proxy}"))?
+        .connect_timeout(Duration::from_secs(5))
+        .connect()
+        .await?;
+    let signer = EdgeRequestSigner::new(vec![1_u8; 32])?;
+    let nonce = Arc::new(AtomicU64::new(1));
+
+    let overload = oat_rejection(
+        FlightServiceClient::new(channel.clone()),
+        &signer,
+        Arc::clone(&nonce),
+        run_id,
+        "traces",
+    )
+    .await?;
+    assert_eq!(overload.code(), Code::Unavailable);
+    assert_eq!(
+        overload
+            .metadata()
+            .get(NOT_ADMITTED_METADATA_KEY)
+            .and_then(|value| value.to_str().ok()),
+        Some("true")
+    );
+
+    let absent = oat_rejection(
+        FlightServiceClient::new(channel),
+        &signer,
+        nonce,
+        run_id,
+        "missing_table",
+    )
+    .await?;
+    assert_eq!(absent.code(), Code::FailedPrecondition);
+    assert!(absent.metadata().get(NOT_ADMITTED_METADATA_KEY).is_none());
+    child.terminate()?;
+    child.wait(Duration::from_secs(20))?;
+    Ok(())
+}
+
+async fn oat_rejection(
+    mut client: FlightServiceClient<Channel>,
+    signer: &EdgeRequestSigner,
+    nonce: Arc<AtomicU64>,
+    run_id: &str,
+    table: &str,
+) -> anyhow::Result<Status> {
+    let mut request = Request::new(stream::iter([FlightData::default()]));
+    add_ingest_metadata(&mut request, signer, nonce, true, Some(run_id), Some(table))?;
+    match client.do_put(request).await {
+        Err(status) => Ok(status),
+        Ok(response) => {
+            let mut messages = response.into_inner();
+            match messages.message().await {
+                Err(status) => Ok(status),
+                Ok(_) => anyhow::bail!("router unexpectedly forwarded the OAT request"),
+            }
+        }
+    }
+}
+
+fn integration_table() -> TableIdentity {
+    TableIdentity::new(
+        CatalogName::new("telemetry").unwrap_or_else(|error| panic!("invalid integration catalog: {error}")),
+        SchemaName::new("prod").unwrap_or_else(|error| panic!("invalid integration schema: {error}")),
+        TableName::new("traces").unwrap_or_else(|error| panic!("invalid integration table: {error}")),
+    )
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -372,6 +470,7 @@ fn run_child() -> anyhow::Result<()> {
     let listen: SocketAddr = std::env::var(LISTEN_ENV)?.parse()?;
     let backend: SocketAddr = std::env::var(BACKEND_ENV)?.parse()?;
     let state = std::env::var(STATE_ENV)?;
+    let oat_run_id = std::env::var(OAT_RUN_ID_ENV).ok();
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|error| panic!("create backend runtime: {error}"));
         runtime.block_on(async move {
@@ -408,15 +507,30 @@ fn run_child() -> anyhow::Result<()> {
         memory.publish_pressure(&snapshot(instance, current)?).await?;
         anyhow::Ok(())
     })?;
-    let store: Arc<dyn RoutingStore> = memory;
+    let store: Arc<dyn RoutingStore> = Arc::<MemoryRoutingStore>::clone(&memory);
     let policy = RoutingPolicy {
         warmup_ms: 0,
-        lease_ttl_ms: 300_000,
+        lease_ttl_ms: 3_600_000,
         readiness_max_staleness_ms: 300_000,
+        oat_run_id: oat_run_id.clone(),
         ..RoutingPolicy::default()
     };
     let routing = Arc::new(RoutingEngine::new(store, policy)?);
     runtime.block_on(routing.refresh(current))?;
+    if let Some(run_id) = oat_run_id.as_deref() {
+        let expected = [LeaseKey::new(ImplementationPool::Dataflow, integration_table())];
+        let pins = runtime.block_on(routing.initialize_run_table_pins(
+            run_id,
+            &expected,
+            add(current, 3_000_000)?,
+            current,
+        ))?;
+        let pressure_at = add(current, 1)?;
+        let mut pressure = snapshot(pins[0].holder_instance_id, pressure_at)?;
+        pressure.cpu_utilization_bps = BasisPoints::new(9_600)?;
+        runtime.block_on(memory.publish_pressure(&pressure))?;
+        runtime.block_on(routing.refresh(pressure_at))?;
+    }
     drop(runtime);
 
     let metrics = RouterMetrics::new()?;
@@ -429,7 +543,11 @@ fn run_child() -> anyhow::Result<()> {
         upstream_config(),
         metrics.clone(),
     );
-    let config = test_config(listen, state);
+    let mut config = test_config(listen, state);
+    config.routing.oat_run_id = oat_run_id;
+    if config.routing.oat_run_id.is_some() {
+        config.routing.lease_ttl_ms = 3_600_000;
+    }
     let control = RouterControlLoop::new(routing, metrics, Duration::from_secs(1));
     let server = build_server(&config, router, control)?;
     server.run_forever();
@@ -451,7 +569,8 @@ async fn upload(
         ..FlightData::default()
     }));
     let mut request = Request::new(outbound);
-    add_ingest_metadata(&mut request, &signer, nonce, signed).map_err(|error| Status::internal(error.to_string()))?;
+    add_ingest_metadata(&mut request, &signer, nonce, signed, None, None)
+        .map_err(|error| Status::internal(error.to_string()))?;
     if fail {
         request
             .metadata_mut()
@@ -538,7 +657,8 @@ async fn slow_upload(
         ))
     });
     let mut request = Request::new(outbound);
-    add_ingest_metadata(&mut request, &signer, nonce, true).map_err(|error| Status::internal(error.to_string()))?;
+    add_ingest_metadata(&mut request, &signer, nonce, true, None, None)
+        .map_err(|error| Status::internal(error.to_string()))?;
     let mut response = client.do_put(request).await?.into_inner();
     while response.message().await?.is_some() {}
     Ok(())
@@ -549,6 +669,8 @@ fn add_ingest_metadata<S>(
     signer: &EdgeRequestSigner,
     nonce: Arc<AtomicU64>,
     signed: bool,
+    oat_run_id: Option<&str>,
+    table_name: Option<&str>,
 ) -> anyhow::Result<()> {
     let path = "/arrow.flight.protocol.FlightService/DoPut";
     let mut headers = HeaderMap::new();
@@ -557,11 +679,17 @@ fn add_ingest_metadata<S>(
     headers.insert("x-arrowcol-implementation-pool", HeaderValue::from_static("dataflow"));
     headers.insert("x-arrowcol-catalog", HeaderValue::from_static("telemetry"));
     headers.insert("x-arrowcol-schema", HeaderValue::from_static("prod"));
-    headers.insert("x-arrowcol-table", HeaderValue::from_static("traces"));
+    headers.insert(
+        "x-arrowcol-table",
+        HeaderValue::from_str(table_name.unwrap_or("traces"))?,
+    );
     headers.insert(
         "x-arrowcol-schema-fingerprint",
         HeaderValue::from_static("sha256:0000000000000000000000000000000000000000000000000000000000000000"),
     );
+    if let Some(run_id) = oat_run_id {
+        headers.insert(OAT_RUN_ID_HEADER, HeaderValue::from_str(run_id)?);
+    }
     if signed {
         sign_and_copy(request.metadata_mut(), signer, &Method::POST, path, headers, nonce)?;
     }
@@ -570,7 +698,7 @@ fn add_ingest_metadata<S>(
         ("x-arrowcol-implementation-pool", "dataflow"),
         ("x-arrowcol-catalog", "telemetry"),
         ("x-arrowcol-schema", "prod"),
-        ("x-arrowcol-table", "traces"),
+        ("x-arrowcol-table", table_name.unwrap_or("traces")),
         (
             "x-arrowcol-schema-fingerprint",
             "sha256:0000000000000000000000000000000000000000000000000000000000000000",
@@ -579,6 +707,12 @@ fn add_ingest_metadata<S>(
         request.metadata_mut().insert(
             key,
             MetadataValue::from_str(value).map_err(|error| anyhow::anyhow!("invalid test metadata {key}: {error}"))?,
+        );
+    }
+    if let Some(run_id) = oat_run_id {
+        request.metadata_mut().insert(
+            OAT_RUN_ID_HEADER,
+            MetadataValue::from_str(run_id).map_err(|error| anyhow::anyhow!("invalid OAT run ID: {error}"))?,
         );
     }
     Ok(())
@@ -629,6 +763,7 @@ fn test_config(listen: SocketAddr, state_directory: String) -> RouterConfig {
             listen,
             threads: 2,
             listener_tasks_per_fd: 1,
+            upstream_keepalive_pool_size: 1024,
             grace_period_seconds: 1,
             graceful_shutdown_timeout_seconds: 15,
             state_directory: state_directory.into(),
@@ -648,6 +783,8 @@ fn test_config(listen: SocketAddr, state_directory: String) -> RouterConfig {
             trust_server_certificate: true,
             connect_timeout_ms: 100,
             command_timeout_ms: 100,
+            sql_pool_max_size: 0,
+            sql_pool_acquire_timeout_ms: 10_000,
         },
         routing: RoutingConfig {
             refresh_interval_ms: 1_000,
@@ -656,6 +793,7 @@ fn test_config(listen: SocketAddr, state_directory: String) -> RouterConfig {
             max_table_entries: 256,
             max_oldest_buffer_age_ms: 86_400_000,
             hard_pressure_bps: 9_500,
+            excluded_admission_gauges: vec![],
             warmup_ms: 0,
             minimum_warmup_bps: 1_000,
             lease_ttl_ms: 300_000,

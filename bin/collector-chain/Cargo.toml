@@ -13,12 +13,13 @@ publish = false
 anyhow.workspace = true
 arrow-array = { version = "58.3", default-features = false }
 arrow-flight = { version = "58.3", default-features = false, features = ["flight-sql"] }
+arrow-ipc = { version = "58.3", default-features = false, features = ["lz4", "zstd"] }
 arrow-schema = { version = "58.3", default-features = false }
 arrowcol-catalog = { path = "../../crates/arrowcol-catalog" }
 arrowcol-flight = { path = "../../crates/arrowcol-flight" }
 arrowcol-protocol = { path = "../../crates/arrowcol-protocol" }
 arrowcol-router-rust = { path = "../../projects/arrowcol-router-rust" }
-clap.workspace = true
+clap = { workspace = true, features = ["env"] }
 futures = "0.3"
 http = "1"
 opentelemetry.workspace = true
@@ -26,9 +27,13 @@ opentelemetry-otlp.workspace = true
 opentelemetry_sdk.workspace = true
 prost = "0.14"
 serde_json = "1"
-tokio = { version = "1", features = ["fs", "macros", "rt-multi-thread", "time"] }
-tonic = "0.14"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["fs", "macros", "rt-multi-thread", "time", "sync"] }
+tonic = { version = "0.14", features = ["gzip", "zstd"] }
 uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+async-trait = "0.1"
 
 [lints]
 workspace = true

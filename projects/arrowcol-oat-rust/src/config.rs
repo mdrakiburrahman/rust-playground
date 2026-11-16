@@ -1,4 +1,6 @@
 use anyhow::{Context, Result, bail};
+use arrowcol_tunables::Tunables;
+use otel_arrow_dfe_quiver::{DiskBudget, QuiverConfig};
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::path::Path;
@@ -7,12 +9,20 @@ use url::Url;
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OatConfig {
+    #[serde(default)]
+    pub tunables: Tunables,
     pub platform: PlatformConfig,
     pub stamp: Option<String>,
     pub warmup_seconds: u64,
     pub measure_seconds: u64,
     #[serde(default = "default_client_ready_timeout_seconds")]
     pub client_ready_timeout_seconds: u64,
+    #[serde(default = "default_aks_rollout_timeout_seconds")]
+    pub aks_rollout_timeout_seconds: u64,
+    #[serde(default = "default_reconciliation_settle_timeout_seconds")]
+    pub reconciliation_settle_timeout_seconds: u64,
+    #[serde(default = "default_collector_stop_grace_seconds")]
+    pub collector_stop_grace_seconds: u64,
     #[serde(default = "default_run_pin_ttl_ms")]
     pub run_pin_ttl_ms: u64,
     pub pilot_mode: bool,
@@ -39,6 +49,8 @@ pub struct OatConfig {
     pub edge_secret_file: String,
     #[serde(default)]
     pub dmv_client_image: String,
+    #[serde(default)]
+    pub maintenance_image: Option<String>,
     #[serde(default)]
     pub edge_secret_name: String,
     pub tables: Vec<String>,
@@ -91,9 +103,22 @@ fn default_client_ready_timeout_seconds() -> u64 {
     600
 }
 
+fn default_aks_rollout_timeout_seconds() -> u64 {
+    600
+}
+
+fn default_reconciliation_settle_timeout_seconds() -> u64 {
+    120
+}
+
+fn default_collector_stop_grace_seconds() -> u64 {
+    300
+}
+
 pub(crate) const SCHEDULE_DELIVERY_TIMEOUT_SECONDS: u64 = 180;
 pub(crate) const PIN_INIT_SETUP_TIMEOUT_SECONDS: u64 = 180;
 const CLIENT_JOB_CLEANUP_GRACE_SECONDS: u64 = 300;
+const DEFAULT_WAL_RETENTION_SIZE_CAP_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RunTimingBudget {
@@ -103,6 +128,85 @@ pub(crate) struct RunTimingBudget {
 }
 
 impl OatConfig {
+    fn validate_selected_parquet_schemas(&self) -> Result<()> {
+        let Some(writer) = &self.tunables.parquet_writer else {
+            return Ok(());
+        };
+        let selected = self.tables.iter().map(String::as_str).collect::<HashSet<_>>();
+        for table in collector_chain::dmv::tables()? {
+            let name = table.identity().table().as_str();
+            if selected.contains(name) {
+                writer
+                    .writer_properties(table.schema(), None, &[])
+                    .with_context(|| format!("Parquet writer settings are invalid for selected DMV table {name}"))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_selected_layout_schemas(&self) -> Result<()> {
+        let Some(layout) = self
+            .tunables
+            .collector
+            .as_ref()
+            .and_then(|collector| collector.layout.as_ref())
+        else {
+            return Ok(());
+        };
+        if layout.enabled == Some(false) {
+            return Ok(());
+        }
+        let policy = arrow_deltalake::layout::LayoutPolicy {
+            sort_columns: layout
+                .sort_columns
+                .clone()
+                .unwrap_or_else(|| vec!["customer_id".to_owned()]),
+            bloom_columns: layout
+                .bloom_columns
+                .clone()
+                .unwrap_or_else(|| vec!["customer_id".to_owned()]),
+            max_rows: layout.max_rows.unwrap_or(262_144),
+            max_input_bytes: layout.max_input_bytes.unwrap_or(67_108_864),
+            row_group_rows: layout.row_group_rows.unwrap_or(16_384),
+            page_rows: layout.page_rows.unwrap_or(2_048),
+        };
+        let selected = self.tables.iter().map(String::as_str).collect::<HashSet<_>>();
+        for table in collector_chain::dmv::tables()? {
+            let name = table.identity().table().as_str();
+            if selected.contains(name) {
+                policy
+                    .validate(table.schema())
+                    .with_context(|| format!("collector layout is invalid for selected DMV table {name}"))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_wal_capacity_for_cores(&self) -> Result<()> {
+        let Some(wal) = self.tunables.wal.as_ref() else {
+            return Ok(());
+        };
+        let retention_cap = wal
+            .retention_size_cap_bytes
+            .unwrap_or(DEFAULT_WAL_RETENTION_SIZE_CAP_BYTES);
+        let quiver = QuiverConfig::default();
+        let segment_size = quiver.segment.target_size_bytes.get();
+        let wal_max = DiskBudget::effective_wal_size(&quiver);
+        let minimum_per_core = DiskBudget::minimum_hard_cap(segment_size, wal_max);
+
+        for &cores in &self.dfe_worker_concurrency {
+            let cores = u64::from(cores);
+            let per_core_cap = retention_cap / cores;
+            if per_core_cap < minimum_per_core {
+                let minimum_total = minimum_per_core.saturating_mul(cores);
+                bail!(
+                    "wal.retention_size_cap_bytes ({retention_cap} bytes) cannot support dfe_worker_concurrency={cores}: per-core capacity is {per_core_cap} bytes, below the pinned Quiver minimum of {minimum_per_core} bytes (WAL max {wal_max} + 2 * segment size {segment_size}); increase the cap to at least {minimum_total} bytes or reduce concurrency"
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn timing_budget(&self) -> Result<RunTimingBudget> {
         let schedule_wait_seconds = self
             .client_ready_timeout_seconds
@@ -116,7 +220,9 @@ impl OatConfig {
             .context("OAT client Job lifetime budget overflow")?;
         let minimum_pin_ttl_ms = client_job_lifetime_seconds
             .checked_add(PIN_INIT_SETUP_TIMEOUT_SECONDS)
-            .context("OAT pin initialization lifetime budget overflow")?
+            .and_then(|seconds| seconds.checked_add(self.reconciliation_settle_timeout_seconds))
+            .and_then(|seconds| seconds.checked_add(self.collector_stop_grace_seconds))
+            .context("OAT pin initialization and collector drain lifetime budget overflow")?
             .checked_mul(1_000)
             .context("OAT run pin lifetime budget overflow")?;
         Ok(RunTimingBudget {
@@ -132,11 +238,45 @@ impl OatConfig {
     ///
     /// Returns an error when a setting is invalid or a requested DMV table is unsupported.
     pub fn validate(&self) -> Result<()> {
+        self.tunables.validate_for_oat()?;
+        self.validate_selected_parquet_schemas()?;
+        self.validate_selected_layout_schemas()?;
+        if self
+            .tunables
+            .maintenance
+            .as_ref()
+            .is_some_and(|settings| settings.enabled == Some(true))
+            && self.platform.kind == OatMode::Aks
+        {
+            let image = self
+                .maintenance_image
+                .as_deref()
+                .context("AKS maintenance requires maintenance_image pinned by @sha256 digest")?;
+            let (repository, digest) = image
+                .rsplit_once("@sha256:")
+                .context("AKS maintenance_image must be pinned by @sha256 digest")?;
+            if repository.is_empty()
+                || digest.len() != 64
+                || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                || repository.contains("@sha256:")
+            {
+                bail!("AKS maintenance_image must be a nonempty image reference pinned by a 64-digit sha256 digest");
+            }
+        }
         if self.warmup_seconds > 300 || !(1..=600).contains(&self.measure_seconds) {
             bail!("warmup_seconds must be at most 300 and measure_seconds must be between 1 and 600");
         }
         if !(30..=1_800).contains(&self.client_ready_timeout_seconds) {
             bail!("client_ready_timeout_seconds must be between 30 and 1800");
+        }
+        if !(600..=3_600).contains(&self.aks_rollout_timeout_seconds) {
+            bail!("aks_rollout_timeout_seconds must be between 600 and 3600");
+        }
+        if self.reconciliation_settle_timeout_seconds > 1_800 {
+            bail!("reconciliation_settle_timeout_seconds must be between 0 and 1800");
+        }
+        if !(30..=3_600).contains(&self.collector_stop_grace_seconds) {
+            bail!("collector_stop_grace_seconds must be between 30 and 3600");
         }
         if !(1..=300).contains(&self.qap_timeout_seconds) {
             bail!("qap_timeout_seconds must be between 1 and 300");
@@ -144,7 +284,7 @@ impl OatConfig {
         let minimum_pin_ttl_ms = self.timing_budget()?.minimum_pin_ttl_ms;
         if !(60_000..=86_400_000).contains(&self.run_pin_ttl_ms) || self.run_pin_ttl_ms < minimum_pin_ttl_ms {
             bail!(
-                "run_pin_ttl_ms must cover pin setup, readiness, QAP preparation, schedule delivery, workload, and Job cleanup margin, and be between 60,000 and 86,400,000"
+                "run_pin_ttl_ms must cover pin setup, readiness, QAP preparation, schedule delivery, workload, reconciliation settling and Job cleanup margin, and be between 60,000 and 86,400,000"
             );
         }
         if self.pilot_mode
@@ -397,6 +537,7 @@ impl OatConfig {
         {
             bail!("dfe_worker_concurrency must contain 1 to 16 distinct values from 1 through 256");
         }
+        self.validate_wal_capacity_for_cores()?;
         if self.replica_counts.len() * self.dfe_worker_concurrency.len() > 25 {
             bail!("the OAT experiment matrix may contain at most 25 combinations");
         }
@@ -593,6 +734,7 @@ mod tests {
                 .unwrap_or_else(|error| panic!("write isolated OAT config fixture {}: {error}", path.display()));
         }
         let config = OatConfig {
+            tunables: Tunables::default(),
             platform: PlatformConfig {
                 kind: OatMode::Aks,
                 compose_file: None,
@@ -608,6 +750,9 @@ mod tests {
             warmup_seconds: 30,
             measure_seconds: 60,
             client_ready_timeout_seconds: 600,
+            aks_rollout_timeout_seconds: 600,
+            reconciliation_settle_timeout_seconds: 120,
+            collector_stop_grace_seconds: 300,
             run_pin_ttl_ms: 3_600_000,
             pilot_mode: false,
             namespace: "arrowcol".to_owned(),
@@ -623,6 +768,7 @@ mod tests {
             dmv_client_binary: "target/debug/arrowcol-dmv".to_owned(),
             edge_secret_file: "/run/secrets/edge-hmac".to_owned(),
             dmv_client_image: "ghcr.io/mdrakiburrahman/rust-playground/arrowcol-oat-client:dev".to_owned(),
+            maintenance_image: None,
             edge_secret_name: "arrowcol-router-auth".to_owned(),
             tables: vec![
                 "sqlserver_wait_stats".to_owned(),
@@ -643,8 +789,190 @@ mod tests {
     }
 
     #[test]
+    fn rejects_wal_capacity_below_the_pinned_quiver_minimum_before_effects() {
+        let mut config = valid();
+        config.dfe_worker_concurrency = vec![1];
+        config.tunables.wal = Some(arrowcol_tunables::WalTunables {
+            retention_size_cap_bytes: Some(1),
+            ..Default::default()
+        });
+        assert!(matches!(
+            config.validate(),
+            Err(error) if format!("{error:#}").contains("pinned Quiver minimum")
+        ));
+    }
+
+    #[test]
+    fn validates_default_wal_capacity_for_each_requested_worker_count() -> Result<()> {
+        let mut config = valid();
+        config.tunables.wal = Some(arrowcol_tunables::WalTunables::default());
+        config.dfe_worker_concurrency = vec![21];
+        config.validate()?;
+
+        config.dfe_worker_concurrency = vec![22];
+        assert!(matches!(
+            config.validate(),
+            Err(error) if format!("{error:#}").contains("dfe_worker_concurrency=22")
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn wal_capacity_validation_follows_selected_topology() -> Result<()> {
+        let mut config = valid();
+        config.dfe_worker_concurrency = vec![256];
+        config.validate()?;
+
+        config.tunables.wal = Some(arrowcol_tunables::WalTunables::default());
+        assert!(matches!(
+            config.validate(),
+            Err(error) if format!("{error:#}").contains("dfe_worker_concurrency=256")
+        ));
+
+        let quiver = QuiverConfig::default();
+        let minimum_per_core = DiskBudget::minimum_hard_cap(
+            quiver.segment.target_size_bytes.get(),
+            DiskBudget::effective_wal_size(&quiver),
+        );
+        config.tunables.wal = Some(arrowcol_tunables::WalTunables {
+            retention_size_cap_bytes: Some(minimum_per_core.saturating_mul(256)),
+            ..Default::default()
+        });
+        config.validate()
+    }
+
+    #[test]
+    fn collector_stop_grace_defaults_and_bounds_are_validated() -> Result<()> {
+        let mut config = valid();
+        assert_eq!(config.collector_stop_grace_seconds, 300);
+        config.collector_stop_grace_seconds = 30;
+        config.validate()?;
+        config.collector_stop_grace_seconds = 3_600;
+        config.run_pin_ttl_ms = 86_400_000;
+        config.validate()?;
+        config.collector_stop_grace_seconds = 29;
+        assert!(config.validate().is_err());
+        config.collector_stop_grace_seconds = 3_601;
+        assert!(config.validate().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn reconciliation_settle_timeout_defaults_and_bounds_are_validated() -> Result<()> {
+        let mut config = valid();
+        assert_eq!(config.reconciliation_settle_timeout_seconds, 120);
+        config.reconciliation_settle_timeout_seconds = 0;
+        config.validate()?;
+        config.reconciliation_settle_timeout_seconds = 1_800;
+        config.validate()?;
+        config.reconciliation_settle_timeout_seconds = 1_801;
+        assert!(config.validate().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn aks_rollout_timeout_preserves_main_deadline_and_has_a_bounded_upper_limit() -> Result<()> {
+        let mut config = valid();
+        config.aks_rollout_timeout_seconds = 599;
+        assert!(config.validate().is_err());
+        config.aks_rollout_timeout_seconds = 600;
+        config.validate()?;
+        config.aks_rollout_timeout_seconds = 3_600;
+        config.validate()?;
+        config.aks_rollout_timeout_seconds = 3_601;
+        assert!(config.validate().is_err());
+        Ok(())
+    }
+
+    #[test]
     fn accepts_the_initial_matrix_and_separate_adls_paths() -> Result<()> {
         valid().validate()
+    }
+
+    #[test]
+    fn parquet_writer_overrides_are_validated_against_selected_dmv_schemas() -> Result<()> {
+        let mut missing_column = valid();
+        missing_column.tunables.parquet_writer = Some(arrowcol_tunables::ParquetWriterConfig {
+            columns: std::collections::BTreeMap::from([(
+                "not_a_dmv_column".to_owned(),
+                arrowcol_tunables::ParquetColumnOptions::default(),
+            )]),
+            ..Default::default()
+        });
+        assert!(matches!(
+            missing_column.validate(),
+            Err(error) if format!("{error:#}").contains("unknown physical Parquet column not_a_dmv_column")
+        ));
+
+        let table = collector_chain::dmv::tables()?
+            .into_iter()
+            .next()
+            .context("DMV fixture must contain a table")?;
+        let string_column = table
+            .schema()
+            .fields()
+            .iter()
+            .find(|field| field.data_type() == &arrow::datatypes::DataType::Utf8)
+            .context("DMV fixture must contain a UTF-8 field")?
+            .name()
+            .clone();
+        let mut type_mismatch = valid();
+        type_mismatch.tables = vec![table.identity().table().as_str().to_owned()];
+        type_mismatch.tunables.parquet_writer = Some(arrowcol_tunables::ParquetWriterConfig {
+            columns: std::collections::BTreeMap::from([(
+                string_column,
+                arrowcol_tunables::ParquetColumnOptions {
+                    encoding: Some(arrowcol_tunables::ParquetValueEncoding::ByteStreamSplit),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        });
+        assert!(matches!(
+            type_mismatch.validate(),
+            Err(error) if format!("{error:#}").contains("invalid for physical type BYTE_ARRAY")
+        ));
+
+        let mut invalid_layout = valid();
+        invalid_layout.tunables.collector = Some(arrowcol_tunables::CollectorTunables {
+            layout: Some(arrowcol_tunables::LayoutTunables {
+                enabled: Some(true),
+                sort_columns: Some(vec!["not_a_dmv_column".to_owned()]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert!(matches!(
+            invalid_layout.validate(),
+            Err(error) if format!("{error:#}").contains("unknown sort column not_a_dmv_column")
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn enabled_aks_maintenance_requires_a_digest_pinned_image() -> Result<()> {
+        let mut config = valid();
+        config.tunables.maintenance = Some(arrowcol_tunables::MaintenanceTunables {
+            enabled: Some(true),
+            operations: Some(vec![arrowcol_tunables::MaintenanceOperation::Optimize]),
+            ..Default::default()
+        });
+        assert!(matches!(
+            config.validate(),
+            Err(error) if error.to_string().contains("maintenance_image")
+        ));
+
+        config.maintenance_image = Some(format!(
+            "ghcr.io/mdrakiburrahman/rust-playground/delta-maintenance@sha256:{}",
+            "a".repeat(64)
+        ));
+        config.validate()?;
+        config.maintenance_image = Some("ghcr.io/example/delta-maintenance:latest".to_owned());
+        assert!(matches!(
+            config.validate(),
+            Err(error) if error.to_string().contains("@sha256")
+        ));
+        Ok(())
     }
 
     #[test]
@@ -669,7 +997,7 @@ mod tests {
         config.qap_timeout_seconds = 300;
         config.warmup_seconds = 300;
         config.measure_seconds = 600;
-        config.run_pin_ttl_ms = 3_660_000;
+        config.run_pin_ttl_ms = 4_080_000;
         config.validate()?;
 
         config.run_pin_ttl_ms -= 1;

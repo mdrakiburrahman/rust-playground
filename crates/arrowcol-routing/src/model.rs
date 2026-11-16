@@ -59,6 +59,80 @@ pub enum SubsystemState {
     Disabled,
 }
 
+/// Pressure inputs that may participate in router admission.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdmissionPressureGauge {
+    /// CPU utilization in basis points.
+    CpuUtilizationBps,
+    /// Resident memory divided by its configured limit.
+    RssBytes,
+    /// Active streams divided by advertised stream capacity.
+    ActiveStreams,
+    /// Buffered bytes divided by their configured limit.
+    BufferedBytes,
+    /// Buffered rows divided by their configured limit.
+    BufferedRows,
+    /// Buffered batches divided by their configured limit.
+    BufferedBatches,
+    /// Exhausted stream permits.
+    AvailablePermits,
+    /// Pending commits divided by their configured limit.
+    PendingCommits,
+    /// Delta subsystem pressure.
+    DeltaPressureBps,
+    /// Quiver subsystem pressure.
+    QuiverPressureBps,
+    /// Dataflow Engine subsystem pressure.
+    DfePressureBps,
+}
+
+impl AdmissionPressureGauge {
+    /// Every recognized admission pressure gauge.
+    pub const ALL: [Self; 11] = [
+        Self::CpuUtilizationBps,
+        Self::RssBytes,
+        Self::ActiveStreams,
+        Self::BufferedBytes,
+        Self::BufferedRows,
+        Self::BufferedBatches,
+        Self::AvailablePermits,
+        Self::PendingCommits,
+        Self::DeltaPressureBps,
+        Self::QuiverPressureBps,
+        Self::DfePressureBps,
+    ];
+
+    /// Stable metric and configuration name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CpuUtilizationBps => "cpu_utilization_bps",
+            Self::RssBytes => "rss_bytes",
+            Self::ActiveStreams => "active_streams",
+            Self::BufferedBytes => "buffered_bytes",
+            Self::BufferedRows => "buffered_rows",
+            Self::BufferedBatches => "buffered_batches",
+            Self::AvailablePermits => "available_permits",
+            Self::PendingCommits => "pending_commits",
+            Self::DeltaPressureBps => "delta_pressure_bps",
+            Self::QuiverPressureBps => "quiver_pressure_bps",
+            Self::DfePressureBps => "dfe_pressure_bps",
+        }
+    }
+}
+
+impl std::str::FromStr for AdmissionPressureGauge {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|gauge| gauge.as_str() == value)
+            .ok_or_else(|| format!("unknown admission pressure gauge {value:?}"))
+    }
+}
+
 /// Registration for one collector process lifetime.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CollectorRegistration {
@@ -256,27 +330,70 @@ impl RichPressureSnapshot {
         Ok(())
     }
 
-    /// Returns the maximum admission pressure in basis points.
+    /// Returns each router admission input and its measured pressure in basis points.
+    #[must_use]
+    pub fn pressure_gauges_bps(&self) -> [(AdmissionPressureGauge, u16); 11] {
+        [
+            (
+                AdmissionPressureGauge::CpuUtilizationBps,
+                self.cpu_utilization_bps.get(),
+            ),
+            (
+                AdmissionPressureGauge::RssBytes,
+                ratio_bps(self.rss_bytes.get(), self.rss_limit_bytes.get()),
+            ),
+            (
+                AdmissionPressureGauge::ActiveStreams,
+                self.active_streams.utilization().get(),
+            ),
+            (
+                AdmissionPressureGauge::BufferedBytes,
+                self.buffered_bytes.utilization().get(),
+            ),
+            (
+                AdmissionPressureGauge::BufferedRows,
+                self.buffered_rows.utilization().get(),
+            ),
+            (
+                AdmissionPressureGauge::BufferedBatches,
+                self.buffered_batches.utilization().get(),
+            ),
+            (
+                AdmissionPressureGauge::AvailablePermits,
+                BasisPoints::FULL_SCALE.saturating_sub(self.available_permits.utilization().get()),
+            ),
+            (
+                AdmissionPressureGauge::PendingCommits,
+                self.pending_commits.utilization().get(),
+            ),
+            (AdmissionPressureGauge::DeltaPressureBps, self.delta_pressure_bps.get()),
+            (
+                AdmissionPressureGauge::QuiverPressureBps,
+                self.quiver_pressure_bps.get(),
+            ),
+            (AdmissionPressureGauge::DfePressureBps, self.dfe_pressure_bps.get()),
+        ]
+    }
+
+    /// Returns the maximum pressure across all admission inputs in basis points.
     #[must_use]
     pub fn maximum_pressure_bps(&self) -> u16 {
-        let rss = ratio_bps(self.rss_bytes.get(), self.rss_limit_bytes.get());
-        let permit_pressure = BasisPoints::FULL_SCALE.saturating_sub(self.available_permits.utilization().get());
-        [
-            self.cpu_utilization_bps.get(),
-            rss,
-            self.active_streams.utilization().get(),
-            self.buffered_bytes.utilization().get(),
-            self.buffered_rows.utilization().get(),
-            self.buffered_batches.utilization().get(),
-            permit_pressure,
-            self.pending_commits.utilization().get(),
-            self.delta_pressure_bps.get(),
-            self.quiver_pressure_bps.get(),
-            self.dfe_pressure_bps.get(),
-        ]
-        .into_iter()
-        .max()
-        .unwrap_or(0)
+        self.pressure_gauges_bps()
+            .into_iter()
+            .map(|(_, value)| value)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Returns the maximum pressure after excluding explicitly disabled admission inputs.
+    #[must_use]
+    pub fn maximum_pressure_bps_excluding(&self, excluded: &BTreeSet<AdmissionPressureGauge>) -> u16 {
+        self.pressure_gauges_bps()
+            .into_iter()
+            .filter(|(gauge, _)| !excluded.contains(gauge))
+            .map(|(_, value)| value)
+            .max()
+            .unwrap_or(0)
     }
 
     /// Returns whether a subsystem explicitly blocks new work.
@@ -515,6 +632,8 @@ pub struct RoutingPolicy {
     pub pressure: PressurePolicy,
     /// Hard exclusion threshold.
     pub hard_pressure_bps: u16,
+    /// Pressure inputs omitted from the hard-admission maximum; empty preserves legacy behavior.
+    pub excluded_admission_gauges: BTreeSet<AdmissionPressureGauge>,
     /// Collector warm-up interval.
     pub warmup_ms: u64,
     /// Minimum warm-up weight.
@@ -537,6 +656,7 @@ impl Default for RoutingPolicy {
         Self {
             pressure: PressurePolicy::default(),
             hard_pressure_bps: 9_500,
+            excluded_admission_gauges: BTreeSet::new(),
             warmup_ms: 60_000,
             minimum_warmup_bps: 1_000,
             lease_ttl_ms: 30_000,
@@ -560,6 +680,7 @@ impl RoutingPolicy {
             || self.minimum_warmup_bps == 0
             || self.minimum_warmup_bps > BasisPoints::FULL_SCALE
             || self.minimum_warmup_bps > self.hard_pressure_bps
+            || self.excluded_admission_gauges.len() >= AdmissionPressureGauge::ALL.len()
             || self.pressure.max_snapshot_age_ms == 0
             || self.pressure.max_table_entries == 0
             || self.lease_ttl_ms == 0

@@ -9,7 +9,7 @@ use arrow::compute::{concat_batches, take};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow_deltalake::delta::object_store_for_url;
 use arrowcol_protocol::ImplementationPool;
-use arrowcol_routing::{LeaseKey, PressurePolicy, RoutingPolicy, run_table_pin_set_digest};
+use arrowcol_routing::{AdmissionPressureGauge, LeaseKey, PressurePolicy, RoutingPolicy, run_table_pin_set_digest};
 use bytes::Bytes;
 use chrono::{DateTime, NaiveDateTime};
 use fs2::FileExt;
@@ -18,14 +18,14 @@ use object_store::{GetOptions, ObjectStore, PutMode, PutOptions, PutPayload, Upd
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::process::{Child, Command};
 use tokio::sync::watch;
@@ -34,6 +34,12 @@ use url::Url;
 
 #[cfg(test)]
 include!("runner_failure_tests.rs");
+include!("runner_evidence.rs");
+include!("runner_tunables.rs");
+include!("runner_process_evidence.rs");
+include!("runner_commit_evidence.rs");
+include!("runner_maintenance.rs");
+include!("runner_wal.rs");
 
 #[derive(Clone, Debug)]
 struct OatResult {
@@ -54,6 +60,7 @@ struct OatResult {
     status: String,
     git_sha: String,
     tunables_json: String,
+    evidence_json: Option<String>,
     replicas: u64,
     dfe_worker_concurrency: u64,
     table: String,
@@ -76,7 +83,7 @@ struct QapMetrics {
     lag_seconds: Option<f64>,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
 struct ResourceMetrics {
     cpu_millicores: f64,
     memory_bytes: u64,
@@ -151,7 +158,23 @@ trait Platform: Send + Sync {
     async fn arm_clients(&self, config: &OatConfig, run_id: &str, run_start_unix_ms: u64) -> Result<()>;
     async fn finish_client(&self, config: &OatConfig, handle: ClientHandle) -> Result<String>;
     async fn cancel_client(&self, config: &OatConfig, handle: &ClientHandle) -> Result<()>;
-    async fn sample_resources(&self, config: &OatConfig) -> Result<ResourceMetrics>;
+    fn resource_sampler_source(&self) -> Option<ResourceSamplerSource> {
+        None
+    }
+    async fn process_logs(&self, _config: &OatConfig) -> Result<Vec<ProcessLog>> {
+        Ok(Vec::new())
+    }
+    async fn process_logs_for_role(&self, config: &OatConfig, role: ComponentRole) -> Result<Vec<ProcessLog>> {
+        Ok(self
+            .process_logs(config)
+            .await?
+            .into_iter()
+            .filter(|log| log.role == role)
+            .collect())
+    }
+    fn shutdown_drain_evidence(&self) -> Option<Value> {
+        None
+    }
     async fn cleanup(&mut self, config: &OatConfig) -> Result<()>;
 }
 
@@ -175,6 +198,7 @@ struct AksPlatform {
     schedule_configmap_name: String,
     service_account: Option<String>,
     router_yaml: Option<String>,
+    shutdown_drain_evidence: Option<Value>,
 }
 
 struct OwnedKubectlProcess {
@@ -191,12 +215,21 @@ struct LocalPlatform {
     router_metrics_url: Option<String>,
     qap_url: Option<String>,
     daemon_endpoint: Option<String>,
+    shutdown_drain_evidence: Option<Value>,
 }
 
 #[async_trait::async_trait]
 impl Platform for AksPlatform {
     fn kind(&self) -> crate::config::OatMode {
         crate::config::OatMode::Aks
+    }
+
+    async fn process_logs(&self, config: &OatConfig) -> Result<Vec<ProcessLog>> {
+        aks_process_logs(config).await
+    }
+
+    async fn process_logs_for_role(&self, config: &OatConfig, role: ComponentRole) -> Result<Vec<ProcessLog>> {
+        aks_process_logs_for_role(config, Some(role)).await
     }
 
     fn workload_endpoint(&self, config: &OatConfig) -> String {
@@ -250,7 +283,8 @@ impl Platform for AksPlatform {
             expires_at_unix_ms,
             now_unix_ms,
         )
-        .await
+        .await?;
+        start_aks_maintenance(config).await
     }
 
     fn qap_observation_mode(&self) -> arrowcol_loadgen::ObservationMode {
@@ -403,12 +437,21 @@ impl Platform for AksPlatform {
         cancel_aks_client_job(config, handle).await
     }
 
-    async fn sample_resources(&self, config: &OatConfig) -> Result<ResourceMetrics> {
-        collect_aks_metrics(config).await
+    fn resource_sampler_source(&self) -> Option<ResourceSamplerSource> {
+        Some(ResourceSamplerSource::Aks)
     }
 
     async fn cleanup(&mut self, config: &OatConfig) -> Result<()> {
-        cleanup_aks_platform(config, self).await
+        let result = cleanup_aks_platform(config, self).await;
+        if self.shutdown_drain_evidence.is_none() {
+            self.shutdown_drain_evidence =
+                Some(json!({"status":"unavailable", "reason":"ordered_aks_shutdown_not_completed"}));
+        }
+        result
+    }
+
+    fn shutdown_drain_evidence(&self) -> Option<Value> {
+        self.shutdown_drain_evidence.clone()
     }
 }
 
@@ -416,6 +459,14 @@ impl Platform for AksPlatform {
 impl Platform for LocalPlatform {
     fn kind(&self) -> crate::config::OatMode {
         crate::config::OatMode::Local
+    }
+
+    async fn process_logs(&self, config: &OatConfig) -> Result<Vec<ProcessLog>> {
+        local_process_logs(config, self).await
+    }
+
+    async fn process_logs_for_role(&self, config: &OatConfig, role: ComponentRole) -> Result<Vec<ProcessLog>> {
+        local_process_logs_for_role(config, self, Some(role)).await
     }
 
     fn workload_endpoint(&self, _config: &OatConfig) -> String {
@@ -436,7 +487,10 @@ impl Platform for LocalPlatform {
         self.daemon_endpoint = Some(local_docker_daemon().await?);
         prepare_local_platform(config, self).await?;
         self.router_metrics_url = Some(local_compose_endpoint(config, self, "router", "50050", "/metrics").await?);
-        self.qap_url = Some(local_compose_endpoint(config, self, "kusto", "8080", "").await?);
+        match local_compose_endpoint(config, self, "kusto", "8080", "").await {
+            Ok(endpoint) => self.qap_url = Some(endpoint),
+            Err(_) => tracing::warn!("local downstream unavailable; collector-only measurement remains enabled"),
+        }
         Ok(())
     }
 
@@ -460,7 +514,8 @@ impl Platform for LocalPlatform {
             expires_at_unix_ms,
             now_unix_ms,
         )
-        .await
+        .await?;
+        start_local_maintenance(config, self).await
     }
 
     fn qap_observation_mode(&self) -> arrowcol_loadgen::ObservationMode {
@@ -487,13 +542,14 @@ impl Platform for LocalPlatform {
             .with_context(|| format!("create local QAP result directory {}", results.display()))?;
         let database = self.qap_database(config)?;
         arrowcol_loadgen::initialize_local_qap(
-            &self.qap_endpoint(config),
+            self.qap_url.as_deref().context(LocalDownstreamUnavailable)?,
             &results,
             &database,
             &local_bindings,
             Duration::from_secs(config.qap_timeout_seconds),
         )
         .await
+        .map_err(classify_local_qap_error)
         .context("initialize run-local Kusto QAP tables and policies")?;
         Ok(bindings.iter().map(|binding| binding.external_table.clone()).collect())
     }
@@ -541,12 +597,28 @@ impl Platform for LocalPlatform {
         cancel_local_client(handle).await
     }
 
-    async fn sample_resources(&self, config: &OatConfig) -> Result<ResourceMetrics> {
-        collect_local_metrics(config, self).await
+    fn resource_sampler_source(&self) -> Option<ResourceSamplerSource> {
+        Some(ResourceSamplerSource::Local {
+            run_id: self.run_id.clone(),
+            environment: self.environment.clone(),
+        })
     }
 
     async fn cleanup(&mut self, config: &OatConfig) -> Result<()> {
-        cleanup_local_platform(config, self).await
+        match cleanup_local_platform(config, self).await {
+            Ok(evidence) => {
+                self.shutdown_drain_evidence = Some(evidence);
+                Ok(())
+            }
+            Err(error) => {
+                self.shutdown_drain_evidence = Some(json!({"status":"unavailable", "reason":"local_cleanup_failed"}));
+                Err(error)
+            }
+        }
+    }
+
+    fn shutdown_drain_evidence(&self) -> Option<Value> {
+        self.shutdown_drain_evidence.clone()
     }
 }
 
@@ -596,18 +668,27 @@ impl LocalPlatform {
             router_metrics_url: None,
             qap_url: None,
             daemon_endpoint: None,
+            shutdown_drain_evidence: None,
         })
     }
 
     fn add_compose_environment(&self, command: &mut Command) {
         command.envs(&self.environment);
+        command.arg("--file").arg(self.state_dir.join("tunables.compose.json"));
     }
 }
 
 fn prepare_local_state(config: &OatConfig, state_dir: &Path, run_id: &str) -> Result<HashMap<String, String>> {
+    let mut overlay = compose_tunables(config)?;
+    local_dataflow_overlay(config, state_dir, &mut overlay)?;
+    fs::write(state_dir.join("tunables.compose.json"), serde_json::to_vec(&overlay)?)
+        .context("write typed run-owned Compose tunable overlay")?;
     for directory in ["catalog-state", "dataflow", "router-state", "control"] {
         fs::create_dir(state_dir.join(directory))
             .with_context(|| format!("create local OAT state directory {directory}"))?;
+    }
+    if config.tunables.wal.is_some() {
+        fs::create_dir(state_dir.join("quiver")).context("create run-owned per-instance WAL state")?;
     }
     fs::write(state_dir.join("control/schedule"), "pending\n")
         .context("initialize local OAT client schedule barrier")?;
@@ -624,7 +705,7 @@ fn prepare_local_state(config: &OatConfig, state_dir: &Path, run_id: &str) -> Re
         .join("config/router.yaml");
     let router_text = fs::read_to_string(&router_config)
         .with_context(|| format!("read local router config from {}", router_config.display()))?;
-    let router_text = run_scoped_local_router_config(&router_text, run_id)?;
+    let router_text = run_scoped_local_router_config(&router_text, run_id, config.run_pin_ttl_ms)?;
     fs::write(state_dir.join("router-state/config.yaml"), router_text)
         .context("write run-scoped local OAT router config")?;
 
@@ -918,9 +999,13 @@ async fn finish_local_client(handle: ClientHandle) -> Result<String> {
         );
     }
     let mut remove = Command::new("docker");
+    let provenance = local_client_image_evidence(container_id).await?;
     remove.args(["rm", container_id]);
     run_command(remove, "remove completed local OAT client container").await?;
-    Ok(progress.output)
+    Ok(format!(
+        "{}\nOAT_CLIENT_IMAGE_PROVENANCE {provenance}\n",
+        progress.output
+    ))
 }
 
 async fn cancel_local_client(handle: &ClientHandle) -> Result<()> {
@@ -933,15 +1018,19 @@ async fn cancel_local_client(handle: &ClientHandle) -> Result<()> {
     Ok(())
 }
 
-fn run_scoped_local_router_config(router_text: &str, run_id: &str) -> Result<String> {
-    let router_text = router_text.replacen("lease_ttl_ms: 86400000", "lease_ttl_ms: 3600000", 1);
-    if router_text.matches("lease_ttl_ms: 3600000").count() != 1 || router_text.contains("oat_run_id:") {
-        bail!("local router config did not contain its expected 1-hour lease TTL");
+fn run_scoped_local_router_config(router_text: &str, run_id: &str, run_pin_ttl_ms: u64) -> Result<String> {
+    let lease_ttl_ms = run_pin_ttl_ms.max(3_600_000);
+    let router_text = router_text.replacen("lease_ttl_ms: 86400000", &format!("lease_ttl_ms: {lease_ttl_ms}"), 1);
+    if router_text.matches(&format!("lease_ttl_ms: {lease_ttl_ms}")).count() != 1
+        || router_text.contains("oat_run_id:")
+        || router_text.contains("oat_run_pin_ttl_ms:")
+    {
+        bail!("local router config did not contain its expected one-day lease TTL");
     }
     let run_id_yaml = serde_json::to_string(run_id)?;
     Ok(router_text.replacen(
-        "lease_ttl_ms: 3600000",
-        &format!("lease_ttl_ms: 3600000\n  oat_run_id: {run_id_yaml}"),
+        &format!("lease_ttl_ms: {lease_ttl_ms}"),
+        &format!("lease_ttl_ms: {lease_ttl_ms}\n  oat_run_pin_ttl_ms: {run_pin_ttl_ms}\n  oat_run_id: {run_id_yaml}"),
         1,
     ))
 }
@@ -1007,7 +1096,7 @@ async fn start_aks_client_job(
     let job_name = format!("oat-{run_label}-{table_label}-c{client_index}");
     let run_seconds = i64::try_from(config.timing_budget()?.client_job_lifetime_seconds)
         .context("OAT client Job lifetime exceeds Kubernetes range")?;
-    let job = build_aks_client_job(AksClientJobSpec {
+    let mut job = build_aks_client_job(AksClientJobSpec {
         namespace: &config.namespace,
         client_image: &config.dmv_client_image,
         router_auth_secret_name: &config.edge_secret_name,
@@ -1018,6 +1107,11 @@ async fn start_aks_client_job(
         args,
         run_seconds,
     });
+    inject_container_environment(
+        job.pointer_mut("/spec/template/spec/containers/0")
+            .context("AKS client container is missing")?,
+        &role_environment(config, ComponentRole::Client)?,
+    )?;
     let payload = serde_json::to_vec(&job)?;
     kubectl(
         config,
@@ -1300,6 +1394,7 @@ async fn finish_aks_client_job(config: &OatConfig, handle: ClientHandle) -> Resu
     if !progress.completed {
         bail!("AKS DMV client Job {job_name} was not complete at finish");
     }
+    let provenance = aks_client_image_evidence(config, job_name).await?;
     kubectl(
         config,
         vec![
@@ -1316,7 +1411,10 @@ async fn finish_aks_client_job(config: &OatConfig, handle: ClientHandle) -> Resu
     )
     .await
     .context("delete completed AKS DMV client Job")?;
-    Ok(progress.output)
+    Ok(format!(
+        "{}\nOAT_CLIENT_IMAGE_PROVENANCE {provenance}\n",
+        progress.output
+    ))
 }
 
 async fn cancel_aks_client_job(config: &OatConfig, handle: &ClientHandle) -> Result<()> {
@@ -1643,6 +1741,7 @@ async fn run_isolated_cell(
         _ = wait_for_cancellation(&mut cancellation) => (Err(anyhow::anyhow!("local OAT run cancelled")), true),
     };
     let cleanup = platform.cleanup(&config).await;
+    let shutdown_drain_evidence = platform.shutdown_drain_evidence();
     if cancelled && cleanup.is_ok() {
         return MatrixOutcome {
             rows: Vec::new(),
@@ -1650,7 +1749,7 @@ async fn run_isolated_cell(
             cancelled: true,
         };
     }
-    finish_matrix_cell(
+    let mut outcome = finish_matrix_cell(
         &config,
         orchestration_id,
         &run_id,
@@ -1658,7 +1757,36 @@ async fn run_isolated_cell(
         concurrency,
         result,
         cleanup,
-    )
+    );
+    if let Some(evidence) = shutdown_drain_evidence
+        && let Err(error) = attach_shutdown_drain_evidence(&mut outcome, evidence)
+    {
+        for row in &mut outcome.rows {
+            row.status = "failed".to_owned();
+            let message = format!("serialize collector shutdown drain evidence: {error:#}");
+            row.failure = Some(match row.failure.take() {
+                Some(previous) => format!("{previous}; {message}"),
+                None => message.clone(),
+            });
+        }
+        outcome.error = Some(match outcome.error.take() {
+            Some(previous) => previous.context(format!("serialize collector shutdown drain evidence: {error:#}")),
+            None => error,
+        });
+    }
+    outcome
+}
+
+fn attach_shutdown_drain_evidence(outcome: &mut MatrixOutcome, shutdown_drain: Value) -> Result<()> {
+    for row in &mut outcome.rows {
+        let evidence_json = row.evidence_json.as_deref().context("cell evidence is missing")?;
+        let mut evidence: Value =
+            serde_json::from_str(evidence_json).context("parse cell evidence before shutdown update")?;
+        evidence["shutdown_drain"] = shutdown_drain.clone();
+        row.evidence_json =
+            Some(serde_json::to_string(&evidence).context("serialize cell evidence with shutdown drain")?);
+    }
+    Ok(())
 }
 
 async fn wait_for_cancellation(cancellation: &mut watch::Receiver<bool>) {
@@ -1705,6 +1833,7 @@ fn finish_matrix_cell(
                             pinning: PinningReport::default(),
                             qap_tables: Vec::new(),
                             failure: Some(format!("{error:#}")),
+                            evidence: CellEvidence::default(),
                         },
                         started_at_ms,
                         qap: QapMetrics::default(),
@@ -1805,6 +1934,7 @@ fn platform_for_run(config: &OatConfig, run_id: &str) -> Result<Box<dyn Platform
             ),
             service_account: None,
             router_yaml: None,
+            shutdown_drain_evidence: None,
         })),
     }
 }
@@ -1883,6 +2013,8 @@ struct RouterRoutingYaml {
     max_table_entries: usize,
     max_oldest_buffer_age_ms: u64,
     hard_pressure_bps: u16,
+    #[serde(default)]
+    excluded_admission_gauges: BTreeSet<AdmissionPressureGauge>,
     warmup_ms: u64,
     minimum_warmup_bps: u16,
     lease_ttl_ms: u64,
@@ -1910,6 +2042,7 @@ fn routing_policy_from_yaml(router_yaml: &str, run_id: &str) -> Result<RoutingPo
             max_oldest_buffer_age_ms: routing.max_oldest_buffer_age_ms,
         },
         hard_pressure_bps: routing.hard_pressure_bps,
+        excluded_admission_gauges: routing.excluded_admission_gauges,
         warmup_ms: routing.warmup_ms,
         minimum_warmup_bps: routing.minimum_warmup_bps,
         lease_ttl_ms: routing.lease_ttl_ms,
@@ -1928,6 +2061,38 @@ fn routing_policy_from_yaml(router_yaml: &str, run_id: &str) -> Result<RoutingPo
     Ok(policy)
 }
 
+fn inject_router_oat_pin_ttl(resources: &mut [Value], ttl_ms: u64) -> Result<()> {
+    let config_map = resources
+        .iter_mut()
+        .find(|resource| {
+            resource.get("kind").and_then(Value::as_str) == Some("ConfigMap")
+                && resource.pointer("/metadata/name").and_then(Value::as_str) == Some("arrowcol-config")
+        })
+        .context("rendered AKS workload has no arrowcol-config ConfigMap")?;
+    let router_yaml = config_map
+        .pointer("/data/router.yaml")
+        .and_then(Value::as_str)
+        .context("rendered AKS arrowcol-config has no router.yaml")?
+        .to_owned();
+    let mut router: serde_yaml::Value = serde_yaml::from_str(&router_yaml).context("parse AKS router YAML")?;
+    let routing = router
+        .get_mut("routing")
+        .and_then(serde_yaml::Value::as_mapping_mut)
+        .context("AKS router YAML has no routing mapping")?;
+    let lease_key = serde_yaml::Value::String("lease_ttl_ms".to_owned());
+    let current_lease_ttl = routing.get(&lease_key).and_then(serde_yaml::Value::as_u64).unwrap_or(0);
+    routing.insert(
+        lease_key,
+        serde_yaml::Value::Number(current_lease_ttl.max(ttl_ms).into()),
+    );
+    routing.insert(
+        serde_yaml::Value::String("oat_run_pin_ttl_ms".to_owned()),
+        serde_yaml::Value::Number(ttl_ms.into()),
+    );
+    config_map["data"]["router.yaml"] = json!(serde_yaml::to_string(&router)?);
+    Ok(())
+}
+
 fn rendered_router_yaml(resources: &[Value]) -> Result<String> {
     let mut matches = resources.iter().filter(|resource| {
         resource.get("kind").and_then(Value::as_str) == Some("ConfigMap")
@@ -1944,6 +2109,87 @@ fn rendered_router_yaml(resources: &[Value]) -> Result<String> {
         .and_then(Value::as_str)
         .map(str::to_owned)
         .context("rendered AKS arrowcol-config has no router.yaml")
+}
+
+async fn settle_cell_commit_evidence(
+    config: &OatConfig,
+    platform: &dyn Platform,
+    baseline_logs: &[ProcessLog],
+    evidence: &CellEvidence,
+    cell_start_unix_ms: u64,
+) -> Result<(Vec<ProcessLog>, HashMap<String, Value>)> {
+    let timeout = Duration::from_secs(config.reconciliation_settle_timeout_seconds);
+    let started = tokio::time::Instant::now();
+    let targets = config
+        .tables
+        .iter()
+        .map(|table| (table.clone(), evidence.client_cumulative_total(table, "completed_rows")))
+        .collect::<HashMap<_, _>>();
+    let can_settle = evidence.measurement_window.is_some() && targets.values().all(Option::is_some);
+    loop {
+        let logs = platform.process_logs_for_role(config, ComponentRole::Collector).await?;
+        let (cell_commit_logs, used_log_offsets) = cell_scoped_commit_logs(&logs, baseline_logs)?;
+        let cell_scope = if used_log_offsets {
+            "process_log_offset_and_ingress_time"
+        } else {
+            "ingress_time_only"
+        };
+        let mut commits = durable_commit_evidence_for_cell(
+            config,
+            &logs,
+            &cell_commit_logs,
+            evidence.measurement_window,
+            Some(cell_start_unix_ms),
+        )?;
+        let elapsed = started.elapsed();
+        let evidence_unavailable = config.tables.iter().any(|table| {
+            commits
+                .get(table)
+                .and_then(|value| value.pointer("/run_cumulative_output/unavailable_reason"))
+                .is_some()
+        });
+        let settled = can_settle
+            && config.tables.iter().all(|table| {
+                targets
+                    .get(table)
+                    .copied()
+                    .flatten()
+                    .zip(
+                        commits
+                            .get(table)
+                            .and_then(|value| value.pointer("/run_cumulative_output/rows"))
+                            .and_then(Value::as_u64),
+                    )
+                    .is_some_and(|(completed, delta)| delta >= completed)
+            });
+        if settled || evidence_unavailable || !can_settle || timeout.is_zero() || elapsed >= timeout {
+            for table in &config.tables {
+                let target = targets.get(table).copied().flatten();
+                let output = commits
+                    .get_mut(table)
+                    .and_then(|value| value.get_mut("run_cumulative_output"));
+                if let Some(output) = output {
+                    let delta = output.get("rows").and_then(Value::as_u64);
+                    output["cell_scope"] = json!(cell_scope);
+                    output["settle_seconds"] = json!(elapsed.as_secs_f64());
+                    output["settle_timeout_seconds"] = json!(timeout.as_secs());
+                    output["settled"] = json!(target.zip(delta).is_some_and(|(completed, delta)| delta >= completed));
+                    output["client_completed_rows"] = target.map_or(Value::Null, |rows| json!(rows));
+                    output["settle_gap_rows"] = target
+                        .zip(delta)
+                        .map_or(Value::Null, |(completed, delta)| json!(completed.saturating_sub(delta)));
+                }
+                if let Some(output) = commits
+                    .get_mut(table)
+                    .and_then(|value| value.get_mut("output_throughput"))
+                {
+                    output["cell_scope"] = json!(cell_scope);
+                }
+            }
+            return Ok((logs, commits));
+        }
+        tokio::time::sleep(Duration::from_millis(250).min(timeout.saturating_sub(elapsed))).await;
+    }
 }
 
 async fn run_matrix_cell(
@@ -1970,16 +2216,33 @@ async fn run_matrix_cell(
             pin_now_unix_ms,
         )
         .await?;
-    let started_at_ms = i64::try_from(unix_time_ms()).context("run start timestamp exceeds Arrow timestamp range")?;
+    let cell_start_unix_ms = unix_time_ms_u64()?;
+    let started_at_ms =
+        i64::try_from(cell_start_unix_ms).context("run start timestamp exceeds Arrow timestamp range")?;
+    let baseline_logs = platform.process_logs(config).await?;
     let mut client_run = run_clients(config, run_id, &assigned_tables, platform).await?;
+    let (_collector_logs, durable_commits) = settle_cell_commit_evidence(
+        config,
+        platform,
+        &baseline_logs,
+        &client_run.evidence,
+        cell_start_unix_ms,
+    )
+    .await?;
+    let process_logs = platform.process_logs(config).await?;
+    client_run.evidence.processes = Some(process_evidence_for_cell(config, &process_logs, &baseline_logs)?);
+    client_run.evidence.durable_commits = durable_commits;
     let pinning_ok = client_run.pinning.violation.is_none()
         && client_run.pinning.verification_error.is_none()
         && client_run.failure.is_none();
     let mut qap = QapMetrics::default();
-    let mut metrics = None;
+    let metrics = client_run.evidence.resource_summary();
     if pinning_ok {
-        local_progress(config, "clients finished; observing Kusto QAP and sampling resources");
+        local_progress(config, "clients finished; observing Kusto QAP");
         let observation = async {
+            if client_run.qap_tables.is_empty() {
+                return Err(anyhow::anyhow!(LocalDownstreamUnavailable));
+            }
             qap = observe_qap(
                 &platform.qap_endpoint(config),
                 &platform.qap_observation_mode(),
@@ -1989,12 +2252,20 @@ async fn run_matrix_cell(
                 config.qap_timeout_seconds,
             )
             .await?;
-            metrics = Some(platform.sample_resources(config).await?);
+            if qap.observation_complete != 1 {
+                bail!("QAP observation omitted required table statistics");
+            }
             Ok::<_, anyhow::Error>(())
         }
         .await;
         if let Err(error) = observation {
-            client_run.failure = Some(format!("observe completed matrix cell: {error:#}"));
+            if local_downstream_optional(platform.kind()) && error.is::<LocalDownstreamUnavailable>() {
+                client_run
+                    .evidence
+                    .downstream_unavailable("local_qap_observation_unavailable");
+            } else {
+                client_run.failure = Some(format!("observe completed matrix cell: {error:#}"));
+            }
         }
     }
     result_rows(
@@ -2057,6 +2328,9 @@ fn result_rows(
         "pinning_violation": client_run.pinning.violation.is_some(),
         "pinning_verification_error": client_run.pinning.verification_error.as_ref().map(|_| "ownership_verification_failed"),
         "delta_delivery": "not_established",
+        "requested_tunables": serde_json::from_str::<Value>(&config.tunables.canonical_json()?)?,
+        "requested_durability_class": config.tunables.wal.as_ref().map(|_| config.tunables.durability_class()),
+        "capabilities": capability_evidence(),
     });
     let details = [
         client_run.failure.clone(),
@@ -2126,6 +2400,7 @@ fn result_rows(
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or_else(|| "unknown".to_owned()),
             tunables_json: serde_json::to_string(&table_tunables)?,
+            evidence_json: Some(serde_json::to_string(&client_run.evidence.for_table(&table, client))?),
             replicas: u64::from(replicas),
             dfe_worker_concurrency: u64::from(concurrency),
             table,
@@ -2174,6 +2449,7 @@ struct ClientRun {
     pinning: PinningReport,
     qap_tables: Vec<String>,
     failure: Option<String>,
+    evidence: CellEvidence,
 }
 
 #[derive(Default)]
@@ -2205,6 +2481,7 @@ async fn run_clients(
                 pinning,
                 qap_tables: Vec::new(),
                 failure: Some(format!("{error:#}")),
+                evidence: CellEvidence::default(),
             })
         }
     }
@@ -2383,12 +2660,22 @@ async fn run_clients_inner(
     .await;
     let qap_result = match qap_result {
         Ok(result) => result,
+        Err(_) if local_downstream_optional(platform.kind()) => {
+            platform.mark_qap_outcome_unresolved();
+            Err(anyhow::anyhow!(LocalDownstreamUnavailable))
+        }
         Err(_) => Err(anyhow::anyhow!(
             "run-scoped QAP preparation exceeded qap_timeout_seconds; operation outcome may be indeterminate and is not retried"
         )),
     };
+    let mut evidence = CellEvidence::default();
     let qap_tables = match qap_result {
         Ok(qap_tables) => qap_tables,
+        Err(error) if local_downstream_optional(platform.kind()) && error.is::<LocalDownstreamUnavailable>() => {
+            platform.mark_qap_outcome_unresolved();
+            evidence.downstream_unavailable("local_qap_initialization_unavailable");
+            Vec::new()
+        }
         Err(error) => {
             platform.mark_qap_outcome_unresolved();
             let cleanup = cancel_clients(platform, config, &handles).await;
@@ -2479,9 +2766,20 @@ async fn run_clients_inner(
     let measurement_end_unix_ms = measurement_start_unix_ms
         .checked_add(config.measure_seconds.saturating_mul(1_000))
         .context("shared OAT measurement end timestamp overflow")?;
+    evidence.measurement_window = Some((measurement_start_unix_ms, measurement_end_unix_ms));
+    let sampler = ResourceSampler::start(
+        platform.resource_sampler_source(),
+        config.clone(),
+        measurement_start_unix_ms,
+        measurement_end_unix_ms,
+    );
     let mut client_metrics = HashMap::<String, Vec<ClientMeasurement>>::with_capacity(tables.len());
     let mut completed_clients = HashSet::new();
     let mut active_clients = vec![true; handles.len()];
+    let mut router_sql_start = None;
+    let mut router_sql_end = None;
+    let mut router_cpu_pressure_samples = Vec::new();
+    let mut router_cpu_pressure_parse_failures = 0_u64;
     while completed_clients.len() < handles.len() {
         let pending_indices = handles
             .iter()
@@ -2565,6 +2863,15 @@ async fn run_clients_inner(
                         };
                     }
                 };
+                if let Err(error) = evidence.record_client(config, &handle.table, &output) {
+                    let cleanup = cancel_active_clients(platform, config, &handles, &active_clients).await;
+                    return match cleanup {
+                        Ok(()) => Err(error),
+                        Err(cleanup_error) => Err(error.context(format!(
+                            "cancelling clients after invalid effective-config evidence failed: {cleanup_error:#}"
+                        ))),
+                    };
+                }
                 client_metrics
                     .entry(handle.table.clone())
                     .or_default()
@@ -2572,23 +2879,50 @@ async fn run_clients_inner(
                 completed_clients.insert(handle.client_id.clone());
             }
         }
-        record_owner_observation(
-            pinning,
-            sample_router_table_owners(platform, config, &metrics_client, tables).await,
-            tables,
-            false,
-        );
+        let sample = sample_router_metrics(platform, config, &metrics_client, tables).await;
+        if let Ok(sample) = &sample {
+            capture_router_sql_boundary(&mut router_sql_start, sample, measurement_start_unix_ms);
+            capture_router_sql_boundary(&mut router_sql_end, sample, measurement_end_unix_ms);
+            record_router_cpu_pressure_sample(
+                &mut router_cpu_pressure_samples,
+                &mut router_cpu_pressure_parse_failures,
+                &sample.cpu_pressure,
+            );
+        }
+        record_owner_observation(pinning, sample.map(|sample| sample.owners), tables, false);
         if completed_clients.len() < handles.len() {
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     }
-    record_owner_observation(
-        pinning,
-        sample_router_table_owners(platform, config, &metrics_client, tables).await,
-        tables,
-        true,
-    );
+    let final_sample = sample_router_metrics(platform, config, &metrics_client, tables).await;
+    if let Ok(sample) = &final_sample {
+        capture_router_sql_boundary(&mut router_sql_start, sample, measurement_start_unix_ms);
+        capture_router_sql_boundary(&mut router_sql_end, sample, measurement_end_unix_ms);
+        record_router_cpu_pressure_sample(
+            &mut router_cpu_pressure_samples,
+            &mut router_cpu_pressure_parse_failures,
+            &sample.cpu_pressure,
+        );
+    }
+    record_owner_observation(pinning, final_sample.map(|sample| sample.owners), tables, true);
+    evidence.router_cpu_pressure = Some(router_cpu_pressure_evidence(
+        config
+            .tunables
+            .collector
+            .as_ref()
+            .and_then(|collector| collector.cpu_pressure)
+            .unwrap_or_default(),
+        &router_cpu_pressure_samples,
+        router_cpu_pressure_parse_failures,
+    ));
+    evidence.router_sql = Some(router_sql_evidence(
+        router_sql_start.as_ref(),
+        router_sql_end.as_ref(),
+        measurement_start_unix_ms,
+        measurement_end_unix_ms,
+    ));
     let mut metrics = HashMap::with_capacity(tables.len());
+    sampler.finish(&mut evidence).await?;
     for table in tables {
         let reports = client_metrics
             .remove(table)
@@ -2659,6 +2993,7 @@ async fn run_clients_inner(
         pinning: std::mem::take(pinning),
         failure: None,
         qap_tables,
+        evidence,
     })
 }
 
@@ -2746,31 +3081,363 @@ async fn cancel_active_clients(
     Ok(())
 }
 
-async fn sample_table_owners(
-    client: &reqwest::Client,
-    endpoint: &str,
-    tables: &[String],
-) -> Result<HashMap<String, Vec<String>>> {
-    let response = client
-        .get(endpoint)
-        .send()
-        .await
-        .with_context(|| format!("GET router metrics {endpoint}"))?
-        .error_for_status()
-        .context("router metrics endpoint returned an error status")?;
-    let body = response.text().await.context("read router metrics response")?;
-    parse_owner_metrics(&body, tables)
+#[derive(Clone, Debug, Default)]
+struct RouterMetricSample {
+    owners: HashMap<String, Vec<String>>,
+    sql: RouterSqlMetricObservation,
+    cpu_pressure: RouterCpuMetricObservation,
 }
 
-async fn sample_router_table_owners(
+#[derive(Clone, Debug, Default)]
+struct RouterCpuMetricObservation {
+    utilization_bps: Option<u16>,
+    parse_error: Option<String>,
+}
+
+fn parse_router_cpu_pressure_metrics(body: &str) -> Result<Option<u16>> {
+    let mut maximum = None;
+    for line in body.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(metric) = fields.next() else { continue };
+        if !metric.starts_with("arrowcol_router_collector_pressure_gauge_bps{")
+            || !metric.contains("gauge=\"cpu_utilization_bps\"")
+        {
+            continue;
+        }
+        let value = fields
+            .next()
+            .context("CPU pressure gauge has no value")?
+            .parse::<f64>()
+            .context("CPU pressure gauge is not numeric")?;
+        if !value.is_finite() || !(0.0..=10_000.0).contains(&value) {
+            bail!("CPU pressure gauge is outside 0..=10000 basis points");
+        }
+        let value = value.round() as u16;
+        maximum = Some(maximum.map_or(value, |current: u16| current.max(value)));
+    }
+    Ok(maximum)
+}
+
+fn record_router_cpu_pressure_sample(
+    samples: &mut Vec<u16>,
+    parse_failures: &mut u64,
+    observation: &RouterCpuMetricObservation,
+) {
+    if observation.parse_error.is_some() {
+        *parse_failures = parse_failures.saturating_add(1);
+    } else if let Some(value) = observation.utilization_bps {
+        samples.push(value);
+    }
+}
+
+fn router_cpu_pressure_evidence(
+    mode: arrowcol_tunables::CpuPressureMode,
+    samples: &[u16],
+    parse_failures: u64,
+) -> Value {
+    if mode == arrowcol_tunables::CpuPressureMode::Off {
+        return json!({
+            "status": "not_sampled",
+            "mode": mode.as_str(),
+            "cpu_utilization_bps": null,
+        });
+    }
+    if parse_failures > 0 {
+        return json!({
+            "status": "unavailable",
+            "mode": mode.as_str(),
+            "reason": "cpu_pressure_metric_malformed",
+            "parse_failures": parse_failures,
+            "cpu_utilization_bps": null,
+        });
+    }
+    let Some(maximum) = samples.iter().copied().max() else {
+        return json!({
+            "status": "unavailable",
+            "mode": mode.as_str(),
+            "reason": "cpu_pressure_metric_missing",
+            "cpu_utilization_bps": null,
+        });
+    };
+    json!({
+        "status": "observed",
+        "mode": mode.as_str(),
+        "sample_count": samples.len(),
+        "peak_cpu_utilization_bps": maximum,
+    })
+}
+
+#[derive(Clone, Debug, Default)]
+struct RouterSqlMetricObservation {
+    snapshot: Option<RouterSqlMetricSnapshot>,
+    parse_error: Option<String>,
+    pre_scrape_unix_ms: u64,
+    post_scrape_unix_ms: u64,
+}
+
+impl RouterSqlMetricObservation {
+    fn midpoint_unix_ms(&self) -> u64 {
+        self.pre_scrape_unix_ms
+            .saturating_add(self.post_scrape_unix_ms.saturating_sub(self.pre_scrape_unix_ms) / 2)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct RouterSqlMetricSnapshot {
+    connections_opened: u64,
+    operations: BTreeMap<(String, String), u64>,
+    latency_buckets: BTreeMap<(String, String), u64>,
+    latency_counts: BTreeMap<String, u64>,
+    latency_sums: BTreeMap<String, f64>,
+    request_buckets: BTreeMap<String, u64>,
+    request_count: u64,
+    request_sum: f64,
+}
+
+impl RouterSqlMetricSnapshot {
+    fn delta_json(&self, before: &Self) -> Option<Value> {
+        let connections_opened = self.connections_opened.checked_sub(before.connections_opened)?;
+        let mut operations = Vec::new();
+        for (key, value) in &self.operations {
+            let count = value.checked_sub(*before.operations.get(key).unwrap_or(&0))?;
+            operations.push(json!({ "operation": key.0, "outcome": key.1, "count": count }));
+        }
+        if before.operations.keys().any(|key| !self.operations.contains_key(key)) {
+            return None;
+        }
+        let mut operation_names = self.latency_counts.keys().cloned().collect::<BTreeSet<_>>();
+        operation_names.extend(before.latency_counts.keys().cloned());
+        let mut latency = Vec::new();
+        for operation in operation_names {
+            let count = self
+                .latency_counts
+                .get(&operation)
+                .copied()
+                .unwrap_or(0)
+                .checked_sub(before.latency_counts.get(&operation).copied().unwrap_or(0))?;
+            let sum_seconds = self.latency_sums.get(&operation).copied().unwrap_or(0.0)
+                - before.latency_sums.get(&operation).copied().unwrap_or(0.0);
+            if !sum_seconds.is_finite() || sum_seconds < 0.0 {
+                return None;
+            }
+            let mut buckets = Vec::new();
+            for ((bucket_operation, le), value) in &self.latency_buckets {
+                if bucket_operation != &operation {
+                    continue;
+                }
+                let cumulative_count = value.checked_sub(
+                    *before
+                        .latency_buckets
+                        .get(&(bucket_operation.clone(), le.clone()))
+                        .unwrap_or(&0),
+                )?;
+                buckets.push(json!({ "le_seconds": le, "cumulative_count": cumulative_count }));
+            }
+            latency.push(json!({
+                "operation": operation,
+                "count": count,
+                "sum_seconds": sum_seconds,
+                "buckets": buckets,
+            }));
+        }
+        if before
+            .latency_buckets
+            .keys()
+            .any(|key| !self.latency_buckets.contains_key(key))
+        {
+            return None;
+        }
+        let request_count = self.request_count.checked_sub(before.request_count)?;
+        let request_sum = self.request_sum - before.request_sum;
+        if !request_sum.is_finite() || request_sum < 0.0 {
+            return None;
+        }
+        let mut request_buckets = Vec::new();
+        let mut request_bucket_deltas = BTreeMap::new();
+        for (le, value) in &self.request_buckets {
+            let cumulative_count = value.checked_sub(*before.request_buckets.get(le).unwrap_or(&0))?;
+            request_bucket_deltas.insert(le.clone(), cumulative_count);
+            request_buckets.push(json!({ "le_seconds": le, "cumulative_count": cumulative_count }));
+        }
+        if before
+            .request_buckets
+            .keys()
+            .any(|key| !self.request_buckets.contains_key(key))
+        {
+            return None;
+        }
+        Some(json!({
+            "connections_opened": connections_opened,
+            "operations": operations,
+            "latency_seconds": latency,
+            "request_latency": {
+                "count": request_count,
+                "sum_seconds": request_sum,
+                "p50_upper_bound_seconds": histogram_upper_bound(&request_bucket_deltas, request_count, 0.50),
+                "p99_upper_bound_seconds": histogram_upper_bound(&request_bucket_deltas, request_count, 0.99),
+                "percentile_method": "first_cumulative_bucket_upper_bound",
+                "buckets": request_buckets,
+                "scope": "request_filter_to_upstream_response_headers_or_proxy_failure",
+            },
+            "scope": "measurement_window_counter_and_histogram_deltas",
+        }))
+    }
+}
+
+fn histogram_upper_bound(buckets: &BTreeMap<String, u64>, count: u64, quantile: f64) -> Option<f64> {
+    if count == 0 {
+        return None;
+    }
+    let target = (count as f64 * quantile).ceil() as u64;
+    let mut ordered = buckets
+        .iter()
+        .map(|(bound, cumulative)| {
+            let numeric = if bound == "+Inf" {
+                f64::INFINITY
+            } else {
+                bound.parse().ok()?
+            };
+            Some((numeric, *cumulative))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    ordered.sort_by(|left, right| left.0.total_cmp(&right.0));
+    ordered
+        .into_iter()
+        .find(|(_, cumulative)| *cumulative >= target)
+        .and_then(|(bound, _)| bound.is_finite().then_some(bound))
+}
+
+fn parse_router_metric_sample(
+    body: &str,
+    tables: &[String],
+    pre_scrape_unix_ms: u64,
+    post_scrape_unix_ms: u64,
+) -> Result<RouterMetricSample> {
+    let owners = parse_owner_metrics(body, tables)?;
+    let (snapshot, parse_error) = match parse_router_sql_metrics(body) {
+        Ok(snapshot) => (Some(snapshot), None),
+        Err(error) => (None, Some(format!("{error:#}"))),
+    };
+    let (utilization_bps, cpu_parse_error) = match parse_router_cpu_pressure_metrics(body) {
+        Ok(value) => (value, None),
+        Err(error) => (None, Some(format!("{error:#}"))),
+    };
+    Ok(RouterMetricSample {
+        owners,
+        cpu_pressure: RouterCpuMetricObservation {
+            utilization_bps,
+            parse_error: cpu_parse_error,
+        },
+        sql: RouterSqlMetricObservation {
+            snapshot,
+            parse_error,
+            pre_scrape_unix_ms,
+            post_scrape_unix_ms,
+        },
+    })
+}
+
+fn capture_router_sql_boundary(
+    boundary: &mut Option<RouterSqlMetricObservation>,
+    sample: &RouterMetricSample,
+    measurement_boundary_unix_ms: u64,
+) {
+    if boundary.is_none() && sample.sql.post_scrape_unix_ms >= measurement_boundary_unix_ms {
+        *boundary = Some(sample.sql.clone());
+    }
+}
+
+fn router_sql_boundary_json(
+    observation: Option<&RouterSqlMetricObservation>,
+    measurement_boundary_unix_ms: u64,
+) -> Value {
+    let Some(observation) = observation else {
+        return json!({ "status": "missing", "measurement_boundary_unix_ms": measurement_boundary_unix_ms });
+    };
+    let midpoint_unix_ms = observation.midpoint_unix_ms();
+    json!({
+        "status": "observed",
+        "measurement_boundary_unix_ms": measurement_boundary_unix_ms,
+        "pre_scrape_unix_ms": observation.pre_scrape_unix_ms,
+        "post_scrape_unix_ms": observation.post_scrape_unix_ms,
+        "midpoint_unix_ms": midpoint_unix_ms,
+        "skew_ms": midpoint_unix_ms.abs_diff(measurement_boundary_unix_ms),
+    })
+}
+
+fn router_sql_evidence(
+    start: Option<&RouterSqlMetricObservation>,
+    end: Option<&RouterSqlMetricObservation>,
+    measurement_start_unix_ms: u64,
+    measurement_end_unix_ms: u64,
+) -> Value {
+    let start_boundary = router_sql_boundary_json(start, measurement_start_unix_ms);
+    let end_boundary = router_sql_boundary_json(end, measurement_end_unix_ms);
+    let window_ms = measurement_end_unix_ms.saturating_sub(measurement_start_unix_ms);
+    let max_skew_ms = 2_000_u64.max(window_ms / 20);
+    let boundary_evidence = json!({
+        "start": start_boundary,
+        "end": end_boundary,
+        "max_skew_ms": max_skew_ms,
+    });
+    let unavailable = |reason: &str| {
+        json!({
+            "status": "unavailable",
+            "reason": reason,
+            "boundaries": boundary_evidence,
+        })
+    };
+    let (Some(start), Some(end)) = (start, end) else {
+        return unavailable("router_sql_measurement_boundary_scrape_missing");
+    };
+    if let Some(reason) = start.parse_error.as_ref().or(end.parse_error.as_ref()) {
+        return json!({
+            "status": "unavailable",
+            "reason": "router_sql_metrics_parse_failed",
+            "detail": reason,
+            "boundaries": boundary_evidence,
+        });
+    }
+    let start_midpoint = start.midpoint_unix_ms();
+    let end_midpoint = end.midpoint_unix_ms();
+    if start_midpoint.abs_diff(measurement_start_unix_ms) > max_skew_ms
+        || end_midpoint.abs_diff(measurement_end_unix_ms) > max_skew_ms
+    {
+        return unavailable("router_sql_scrape_skew_exceeded_bound");
+    }
+    let snapshot_interval_ms = end_midpoint.saturating_sub(start_midpoint);
+    if snapshot_interval_ms == 0 {
+        return unavailable("router_sql_snapshot_interval_was_zero");
+    }
+    let (Some(start_snapshot), Some(end_snapshot)) = (start.snapshot.as_ref(), end.snapshot.as_ref()) else {
+        return unavailable("router_sql_metrics_snapshot_missing");
+    };
+    let Some(mut metrics) = end_snapshot.delta_json(start_snapshot) else {
+        return unavailable("router_sql_counters_reset_or_disappeared_during_measurement");
+    };
+    let interval_seconds = snapshot_interval_ms as f64 / 1_000.0;
+    let connections_opened = metrics["connections_opened"].as_u64().unwrap_or(0);
+    metrics["snapshot_interval_ms"] = json!(snapshot_interval_ms);
+    metrics["connections_opened_per_second"] = json!(connections_opened as f64 / interval_seconds);
+    if let Some(operations) = metrics["operations"].as_array_mut() {
+        for operation in operations {
+            let count = operation["count"].as_u64().unwrap_or(0);
+            operation["per_second"] = json!(count as f64 / interval_seconds);
+        }
+    }
+    json!({ "status": "observed", "metrics": metrics, "boundaries": boundary_evidence })
+}
+
+async fn sample_router_metrics(
     platform: &mut dyn Platform,
     config: &OatConfig,
     client: &reqwest::Client,
     tables: &[String],
-) -> Result<HashMap<String, Vec<String>>> {
+) -> Result<RouterMetricSample> {
     let (endpoint, _) = platform.ensure_router_metrics_endpoint(config).await?;
-    match sample_table_owners(client, &endpoint, tables).await {
-        Ok(sample) => Ok(sample),
+    let mut pre_scrape_unix_ms = unix_time_ms_u64()?;
+    let body = match fetch_router_metrics(client, &endpoint).await {
+        Ok(body) => body,
         Err(error) => {
             if !error.chain().any(|cause| {
                 cause
@@ -2788,10 +3455,306 @@ async fn sample_router_table_owners(
             if !restarted {
                 return Err(error);
             }
-            sample_table_owners(client, &retry_endpoint, tables)
+            pre_scrape_unix_ms = unix_time_ms_u64()?;
+            fetch_router_metrics(client, &retry_endpoint)
                 .await
-                .map_err(|retry_error| retry_error.context(format!("initial router metrics sample failed: {error:#}")))
+                .map_err(|retry_error| {
+                    retry_error.context(format!("initial router metrics sample failed: {error:#}"))
+                })?
         }
+    };
+    let post_scrape_unix_ms = unix_time_ms_u64()?;
+    parse_router_metric_sample(&body, tables, pre_scrape_unix_ms, post_scrape_unix_ms)
+}
+
+async fn fetch_router_metrics(client: &reqwest::Client, endpoint: &str) -> Result<String> {
+    let response = client
+        .get(endpoint)
+        .send()
+        .await
+        .with_context(|| format!("GET router metrics {endpoint}"))?
+        .error_for_status()
+        .context("router metrics endpoint returned an error status")?;
+    response.text().await.context("read router metrics response")
+}
+
+#[cfg(test)]
+async fn sample_table_owners(
+    client: &reqwest::Client,
+    endpoint: &str,
+    tables: &[String],
+) -> Result<HashMap<String, Vec<String>>> {
+    parse_owner_metrics(&fetch_router_metrics(client, endpoint).await?, tables)
+}
+
+async fn sample_router_table_owners(
+    platform: &mut dyn Platform,
+    config: &OatConfig,
+    client: &reqwest::Client,
+    tables: &[String],
+) -> Result<HashMap<String, Vec<String>>> {
+    Ok(sample_router_metrics(platform, config, client, tables).await?.owners)
+}
+
+fn parse_router_sql_metrics(body: &str) -> Result<RouterSqlMetricSnapshot> {
+    let mut snapshot = RouterSqlMetricSnapshot::default();
+    let mut connections_seen = false;
+    for line in body.lines() {
+        let Some((name, value)) = line.split_once(' ') else {
+            continue;
+        };
+        if name == "arrowcol_router_sql_connections_opened_total" {
+            snapshot.connections_opened = value
+                .split_whitespace()
+                .next()
+                .context("router SQL connections metric omitted value")?
+                .parse()
+                .context("invalid router SQL connections metric")?;
+            connections_seen = true;
+            continue;
+        }
+        if name == "arrowcol_router_request_seconds_count" {
+            snapshot.request_count = value
+                .split_whitespace()
+                .next()
+                .context("router request latency count omitted value")?
+                .parse()
+                .context("invalid router request latency count")?;
+            continue;
+        }
+        if name == "arrowcol_router_request_seconds_sum" {
+            let sum: f64 = value
+                .split_whitespace()
+                .next()
+                .context("router request latency sum omitted value")?
+                .parse()
+                .context("invalid router request latency sum")?;
+            if !sum.is_finite() {
+                bail!("invalid router request latency sum");
+            }
+            snapshot.request_sum = sum;
+            continue;
+        }
+        let Some(open) = name.find('{') else {
+            continue;
+        };
+        let close = name.rfind('}').context("malformed router SQL metric labels")?;
+        let labels = parse_metric_labels(&name[open + 1..close])?;
+        let metric_value = value
+            .split_whitespace()
+            .next()
+            .context("router SQL metric omitted value")?;
+        match &name[..open] {
+            "arrowcol_router_sql_operations_total" => {
+                let operation = labels
+                    .get("operation")
+                    .context("SQL operation metric omitted operation")?;
+                let outcome = labels.get("outcome").context("SQL operation metric omitted outcome")?;
+                let count = metric_value.parse().context("invalid SQL operation counter")?;
+                if snapshot
+                    .operations
+                    .insert((operation.clone(), outcome.clone()), count)
+                    .is_some()
+                {
+                    bail!("duplicate SQL operation metric series");
+                }
+            }
+            "arrowcol_router_sql_operation_seconds_bucket" => {
+                let operation = labels
+                    .get("operation")
+                    .context("SQL latency bucket omitted operation")?;
+                let le = labels.get("le").context("SQL latency bucket omitted bound")?;
+                let count = metric_value.parse().context("invalid SQL latency bucket")?;
+                if snapshot
+                    .latency_buckets
+                    .insert((operation.clone(), le.clone()), count)
+                    .is_some()
+                {
+                    bail!("duplicate SQL latency bucket series");
+                }
+            }
+            "arrowcol_router_sql_operation_seconds_count" => {
+                let operation = labels.get("operation").context("SQL latency count omitted operation")?;
+                let count = metric_value.parse().context("invalid SQL latency count")?;
+                if snapshot.latency_counts.insert(operation.clone(), count).is_some() {
+                    bail!("duplicate SQL latency count series");
+                }
+            }
+            "arrowcol_router_sql_operation_seconds_sum" => {
+                let operation = labels.get("operation").context("SQL latency sum omitted operation")?;
+                let sum: f64 = metric_value.parse().context("invalid SQL latency sum")?;
+                if !sum.is_finite() || snapshot.latency_sums.insert(operation.clone(), sum).is_some() {
+                    bail!("invalid or duplicate SQL latency sum series");
+                }
+            }
+            "arrowcol_router_request_seconds_bucket" => {
+                let le = labels
+                    .get("le")
+                    .context("router request latency bucket omitted bound")?;
+                let count = metric_value.parse().context("invalid router request latency bucket")?;
+                if snapshot.request_buckets.insert(le.clone(), count).is_some() {
+                    bail!("duplicate router request latency bucket series");
+                }
+            }
+            "arrowcol_router_request_seconds_count" => {
+                snapshot.request_count = metric_value.parse().context("invalid router request latency count")?;
+            }
+            "arrowcol_router_request_seconds_sum" => {
+                let sum: f64 = metric_value.parse().context("invalid router request latency sum")?;
+                if !sum.is_finite() {
+                    bail!("invalid router request latency sum");
+                }
+                snapshot.request_sum = sum;
+            }
+            _ => {}
+        }
+    }
+    if !connections_seen {
+        bail!("router metrics omitted SQL connection counter");
+    }
+    Ok(snapshot)
+}
+
+#[cfg(test)]
+mod router_sql_metrics_tests {
+    use super::{
+        RouterSqlMetricObservation, RouterSqlMetricSnapshot, parse_router_metric_sample, parse_router_sql_metrics,
+        router_cpu_pressure_evidence, router_sql_evidence,
+    };
+    use anyhow::{Context, Result, bail};
+
+    #[test]
+    fn cpu_pressure_gauge_parses_without_promoting_parse_errors_to_pin_failures() -> Result<()> {
+        let tables = vec!["sqlserver_active_sessions".to_owned()];
+        let body = concat!(
+            "arrowcol_router_table_owners{table=\"sqlserver_active_sessions\",collector=\"collector-a\",state=\"active\"} 1\n",
+            "arrowcol_router_collector_pressure_gauge_bps{gauge=\"cpu_utilization_bps\",collector=\"collector-a\"} 731\n",
+        );
+        let sample = parse_router_metric_sample(body, &tables, 1_000, 1_010)?;
+        assert_eq!(sample.cpu_pressure.utilization_bps, Some(731));
+        assert!(sample.cpu_pressure.parse_error.is_none());
+
+        let malformed = concat!(
+            "arrowcol_router_table_owners{table=\"sqlserver_active_sessions\",collector=\"collector-a\",state=\"active\"} 1\n",
+            "arrowcol_router_collector_pressure_gauge_bps{gauge=\"cpu_utilization_bps\",collector=\"collector-a\"} bad\n",
+        );
+        let sample = parse_router_metric_sample(malformed, &tables, 1_000, 1_010)?;
+        assert_eq!(sample.owners.values().next().map(Vec::len), Some(1));
+        assert!(sample.cpu_pressure.parse_error.is_some());
+        assert!(sample.sql.snapshot.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn cpu_pressure_off_is_labeled_not_sampled() {
+        let evidence = router_cpu_pressure_evidence(arrowcol_tunables::CpuPressureMode::Off, &[], 0);
+        assert_eq!(evidence["status"], "not_sampled");
+        assert!(evidence["cpu_utilization_bps"].is_null());
+    }
+
+    #[test]
+    fn owner_evidence_survives_missing_sql_counter() -> Result<()> {
+        let tables = vec!["sqlserver_active_sessions".to_owned()];
+        let sample = parse_router_metric_sample(
+            "arrowcol_router_table_owners{table=\"sqlserver_active_sessions\",collector=\"collector-a\",state=\"active\"} 1\n",
+            &tables,
+            1_000,
+            1_010,
+        )?;
+        assert_eq!(
+            sample.owners.values().next().map(Vec::as_slice),
+            Some(["collector-a".to_owned()].as_slice())
+        );
+        assert!(sample.sql.snapshot.is_none());
+        assert!(
+            sample
+                .sql
+                .parse_error
+                .as_deref()
+                .is_some_and(|reason| reason.contains("SQL connection counter"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn router_sql_evidence_reports_scrape_boundaries_rates_and_skew() {
+        let start = RouterSqlMetricObservation {
+            snapshot: Some(RouterSqlMetricSnapshot {
+                connections_opened: 2,
+                ..Default::default()
+            }),
+            pre_scrape_unix_ms: 9_950,
+            post_scrape_unix_ms: 10_050,
+            ..Default::default()
+        };
+        let end = RouterSqlMetricObservation {
+            snapshot: Some(RouterSqlMetricSnapshot {
+                connections_opened: 12,
+                ..Default::default()
+            }),
+            pre_scrape_unix_ms: 19_950,
+            post_scrape_unix_ms: 20_050,
+            ..Default::default()
+        };
+        let evidence = router_sql_evidence(Some(&start), Some(&end), 10_000, 20_000);
+        assert_eq!(evidence["status"], "observed");
+        assert_eq!(evidence["metrics"]["snapshot_interval_ms"], 10_000);
+        assert_eq!(evidence["metrics"]["connections_opened_per_second"], 1.0);
+        assert_eq!(evidence["boundaries"]["start"]["pre_scrape_unix_ms"], 9_950);
+        let late_start = RouterSqlMetricObservation {
+            pre_scrape_unix_ms: 7_000,
+            post_scrape_unix_ms: 7_100,
+            ..start
+        };
+        let unavailable = router_sql_evidence(Some(&late_start), Some(&end), 10_000, 20_000);
+        assert_eq!(unavailable["status"], "unavailable");
+        assert_eq!(unavailable["reason"], "router_sql_scrape_skew_exceeded_bound");
+    }
+
+    #[test]
+    fn parses_and_deltas_router_sql_operation_histograms() -> Result<()> {
+        let before = parse_router_sql_metrics(
+            "arrowcol_router_sql_connections_opened_total 3\n\
+             arrowcol_router_sql_operations_total{operation=\"get_run_table_pin\",outcome=\"success\"} 4\n\
+             arrowcol_router_sql_operation_seconds_bucket{operation=\"get_run_table_pin\",le=\"0.1\"} 3\n\
+             arrowcol_router_sql_operation_seconds_bucket{operation=\"get_run_table_pin\",le=\"+Inf\"} 4\n\
+             arrowcol_router_sql_operation_seconds_count{operation=\"get_run_table_pin\"} 4\n\
+             arrowcol_router_sql_operation_seconds_sum{operation=\"get_run_table_pin\"} 0.2\n\
+             arrowcol_router_request_seconds_bucket{le=\"0.1\"} 3\n\
+             arrowcol_router_request_seconds_bucket{le=\"+Inf\"} 4\n\
+             arrowcol_router_request_seconds_count 4\n\
+             arrowcol_router_request_seconds_sum 0.2\n",
+        )?;
+        let after = parse_router_sql_metrics(
+            "arrowcol_router_sql_connections_opened_total 7\n\
+             arrowcol_router_sql_operations_total{operation=\"get_run_table_pin\",outcome=\"success\"} 10\n\
+             arrowcol_router_sql_operation_seconds_bucket{operation=\"get_run_table_pin\",le=\"0.1\"} 8\n\
+             arrowcol_router_sql_operation_seconds_bucket{operation=\"get_run_table_pin\",le=\"+Inf\"} 10\n\
+             arrowcol_router_sql_operation_seconds_count{operation=\"get_run_table_pin\"} 10\n\
+             arrowcol_router_sql_operation_seconds_sum{operation=\"get_run_table_pin\"} 1.2\n\
+             arrowcol_router_request_seconds_bucket{le=\"0.1\"} 8\n\
+             arrowcol_router_request_seconds_bucket{le=\"+Inf\"} 10\n\
+             arrowcol_router_request_seconds_count 10\n\
+             arrowcol_router_request_seconds_sum 1.2\n",
+        )?;
+        let Some(delta) = after.delta_json(&before) else {
+            bail!("monotonic SQL metrics did not produce a delta");
+        };
+        assert_eq!(delta["connections_opened"], 4);
+        assert_eq!(delta["operations"][0]["count"], 6);
+        assert_eq!(delta["latency_seconds"][0]["count"], 6);
+        let bucket = delta["latency_seconds"][0]["buckets"]
+            .as_array()
+            .context("missing latency buckets")?
+            .iter()
+            .find(|bucket| bucket["le_seconds"] == "0.1")
+            .context("missing 0.1-second latency bucket")?;
+        assert_eq!(bucket["cumulative_count"], 5);
+        assert_eq!(delta["request_latency"]["count"], 6);
+        assert_eq!(delta["request_latency"]["p50_upper_bound_seconds"], 0.1);
+        assert!(delta["request_latency"]["p99_upper_bound_seconds"].is_null());
+        assert!(after.delta_json(&after).is_some());
+        Ok(())
     }
 }
 
@@ -3133,10 +4096,31 @@ async fn observe_qap(
                 &observer_tables,
                 timeout,
             ))
+            .map_err(|error| {
+                if matches!(mode, arrowcol_loadgen::ObservationMode::Local) {
+                    classify_local_qap_error(error)
+                } else {
+                    error
+                }
+            })
             .context("observe Kusto Query Acceleration Policy")
     })
     .await
     .context("join Kusto QAP observer")??;
+    if let Some(tables) = observation.get("tables").and_then(Value::as_object) {
+        let failures = tables
+            .values()
+            .filter(|table| table["available"] == false)
+            .collect::<Vec<_>>();
+        if !failures.is_empty() {
+            if matches!(mode, arrowcol_loadgen::ObservationMode::Local)
+                && failures.iter().all(|table| table["temporary_unavailable"] == true)
+            {
+                return Err(anyhow::anyhow!(LocalDownstreamUnavailable));
+            }
+            bail!("QAP table metadata/statistics observation failed; not a temporary service-availability failure");
+        }
+    }
     aggregate_qap(&observation, qap_tables)
 }
 
@@ -3788,6 +4772,20 @@ async fn wait_for_aks_pin_setup(config: &OatConfig, job_name: &str, run_id: &str
 }
 
 async fn prepare_local_platform(config: &OatConfig, platform: &LocalPlatform) -> Result<()> {
+    run_npx_runtime(
+        &std::env::current_dir()?.join("projects/arrowcol-oat/runtime.ts"),
+        &[
+            "render-dataflow",
+            if config.tunables.wal.is_some() {
+                "quiver"
+            } else {
+                "direct"
+            },
+            platform.state_dir.join("dataflow.yaml").to_string_lossy().as_ref(),
+        ],
+    )
+    .await
+    .context("render run-owned dataflow profile before starting local workloads")?;
     let base_project = config
         .platform
         .compose_project
@@ -3807,7 +4805,11 @@ async fn prepare_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
     );
     platform.add_compose_environment(&mut build_client);
     build_client.args(["build", "oat-client"]);
+    if maintenance_enabled(config) && config.maintenance_image.is_none() {
+        build_client.arg("delta-maintenance");
+    }
     run_streaming_command(build_client, "build OAT client container").await?;
+    pin_local_maintenance_image(config, platform).await?;
     verify_local_bind_mount(config, platform).await?;
 
     let mut up = compose_command(
@@ -3858,13 +4860,41 @@ async fn prepare_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
         "600",
         "arrowcol-catalog",
         "dataflow-1",
-        "kusto",
         "lgtm",
         "router",
     ]);
     run_streaming_command(up, "start remaining local OAT stack")
         .await
         .context("local compose stack is a per-run project; results are not touched by stack cleanup")?;
+    let mut rendered_config = compose_command(
+        compose_file,
+        config.platform.compose_override_file.as_deref(),
+        &project,
+        "benchmark",
+    );
+    platform.add_compose_environment(&mut rendered_config);
+    rendered_config.args(["config", "--format", "json"]);
+    let rendered_config: Value = serde_json::from_slice(
+        &run_command(rendered_config, "read effective local Compose configuration")
+            .await?
+            .stdout,
+    )
+    .context("parse effective local Compose configuration")?;
+    verify_local_collector_stop_grace(&rendered_config, config.collector_stop_grace_seconds)?;
+    let mut downstream = compose_command(
+        compose_file,
+        config.platform.compose_override_file.as_deref(),
+        &project,
+        "benchmark",
+    );
+    platform.add_compose_environment(&mut downstream);
+    downstream.args(["up", "--detach", "--no-deps", "--wait", "--wait-timeout", "60", "kusto"]);
+    if run_streaming_command(downstream, "start optional local Kustainer")
+        .await
+        .is_err()
+    {
+        tracing::warn!("local Kustainer did not become ready; collector-only measurements remain enabled");
+    }
     Ok(())
 }
 
@@ -4055,24 +5085,69 @@ async fn stop_local_snapshot_writers(config: &OatConfig, platform: &LocalPlatfor
     let ids = String::from_utf8(output.stdout)?;
     let ids = ids.split_whitespace().map(str::to_owned).collect::<Vec<_>>();
     if ids.is_empty() {
-        bail!("no owned containers to establish stopped snapshot custody");
+        if config.platform.local.snapshot_root.is_some() {
+            bail!("no owned containers to establish stopped snapshot custody");
+        }
+        return Ok(Vec::new());
     }
     let mut inspect = Command::new("docker");
     inspect.arg("inspect").args(&ids);
     let before: Vec<Value> =
         serde_json::from_slice(&run_command(inspect, "inspect local snapshot ownership").await?.stdout)?;
-    validate_snapshot_container_ownership(&before, &project)?;
-    for phase in snapshot_stop_phases(&before)? {
+    if config.platform.local.snapshot_root.is_some() {
+        validate_snapshot_container_ownership(&before, &project)?;
+    } else {
+        validate_owned_local_containers(&before, &project)?;
+    }
+    let has_maintenance = before.iter().any(|container| {
+        container
+            .pointer("/Config/Labels/com.docker.compose.service")
+            .and_then(Value::as_str)
+            == Some("delta-maintenance")
+    });
+    let has_collector = before.iter().any(|container| {
+        container
+            .pointer("/Config/Labels/com.docker.compose.service")
+            .and_then(Value::as_str)
+            == Some("dataflow-1")
+    });
+    let maintenance_baseline = if has_maintenance {
+        local_process_logs_for_role(config, platform, Some(ComponentRole::Maintenance)).await?
+    } else {
+        Vec::new()
+    };
+    let phases = snapshot_stop_phases(&before)?;
+    let mut maintenance_logs = None;
+    let mut collector_sigterm_at_unix_ms = None;
+    for (phase_index, phase) in phases.into_iter().enumerate() {
+        if phase_index == 2 && !phase.is_empty() {
+            collector_sigterm_at_unix_ms = u64::try_from(unix_time_ms()).ok();
+        }
         if !phase.is_empty() {
             let mut stop = Command::new("docker");
-            stop.args(["stop", "--time", "300"]).args(phase);
-            run_command(
-                stop,
-                "stop owned local ingress, then collectors, then catalog, then dependencies",
-            )
-            .await?;
+            stop.args(local_phase_stop_args(
+                phase_index,
+                config.collector_stop_grace_seconds,
+                phase,
+            ));
+            let phase_description = match phase_index {
+                0 => "stop owned local ingress before maintenance and collectors",
+                1 => "stop owned local maintenance before collectors",
+                2 => "send SIGTERM to owned local collectors and wait for drain",
+                _ => "stop owned local catalog and dependencies after collectors",
+            };
+            run_command(stop, phase_description).await?;
+        }
+        if phase_index == 1 {
+            maintenance_logs =
+                Some(local_process_logs_for_role(config, platform, Some(ComponentRole::Maintenance)).await?);
         }
     }
+    let collector_logs = if has_collector {
+        local_process_logs_for_role(config, platform, Some(ComponentRole::Collector)).await?
+    } else {
+        Vec::new()
+    };
     let mut inspect = Command::new("docker");
     inspect.arg("inspect").args(&ids);
     let after: Vec<Value> = serde_json::from_slice(
@@ -4113,12 +5188,69 @@ async fn stop_local_snapshot_writers(config: &OatConfig, platform: &LocalPlatfor
     if listed.split_whitespace().collect::<HashSet<_>>() != ids.iter().map(String::as_str).collect::<HashSet<_>>() {
         bail!("owned local container set changed while stopping; preserving state");
     }
-    snapshot_container_outcomes(&before, &after, &project)
+    let mut outcomes = snapshot_container_outcomes(&before, &after, &project)?;
+    for outcome in &mut outcomes {
+        let service = outcome["service"]
+            .as_str()
+            .context("stopped container service missing")?;
+        let id = outcome["id"].as_str().context("stopped container ID missing")?;
+        if service == "dataflow-1" {
+            let incomplete_log = ProcessLog {
+                role: ComponentRole::Collector,
+                instance_id: id.to_owned(),
+                image: None,
+                image_id: None,
+                source_revision: None,
+                complete: false,
+                raw_log_bytes: 0,
+                raw_log_lines: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+                text: String::new(),
+            };
+            let log = collector_logs
+                .iter()
+                .find(|log| log.instance_id == id)
+                .unwrap_or(&incomplete_log);
+            outcome["shutdown_drain"] = collector_shutdown_drain_evidence(
+                log,
+                outcome["was_running"]
+                    .as_bool()
+                    .unwrap_or(false)
+                    .then_some(collector_sigterm_at_unix_ms)
+                    .flatten(),
+                outcome["finished_at"].as_str(),
+                outcome["exit_code"].as_i64(),
+                config.tunables.wal.is_some(),
+            );
+        } else if service == "delta-maintenance" {
+            let incomplete_log = ProcessLog {
+                role: ComponentRole::Maintenance,
+                instance_id: id.to_owned(),
+                image: None,
+                image_id: None,
+                source_revision: None,
+                complete: false,
+                raw_log_bytes: 0,
+                raw_log_lines: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+                text: String::new(),
+            };
+            let log = maintenance_logs
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .find(|log| log.instance_id == id)
+                .unwrap_or(&incomplete_log);
+            outcome["maintenance_outcomes"] = maintenance_cell_outcome_evidence(log, &maintenance_baseline);
+        }
+    }
+    Ok(outcomes)
 }
-
 fn snapshot_container_outcomes(before: &[Value], after: &[Value], project: &str) -> Result<Vec<Value>> {
-    validate_snapshot_container_ownership(before, project)?;
-    validate_snapshot_container_ownership(after, project)?;
+    validate_owned_local_containers(before, project)?;
+    validate_owned_local_containers(after, project)?;
     let before_by_id = before
         .iter()
         .map(|container| {
@@ -4175,11 +5307,19 @@ fn snapshot_container_outcomes(before: &[Value], after: &[Value], project: &str)
             .get("ExitCode")
             .and_then(Value::as_i64)
             .context("container exit code missing")?;
-        if !(exit == 0 || (was_running && exit == 143))
-            || state.get("OOMKilled").and_then(Value::as_bool) != Some(false)
-        {
-            bail!("owned container {service} failed or was forcibly stopped ({exit}); preserving data");
-        }
+        let maintenance_operation_failure = service == "delta-maintenance" && exit == 1;
+        let role = if service == "delta-maintenance" {
+            ComponentRole::Maintenance
+        } else {
+            ComponentRole::Collector
+        };
+        shutdown_exit_outcome(
+            role,
+            was_running,
+            Some(exit),
+            state.get("OOMKilled").and_then(Value::as_bool) != Some(false),
+        )
+        .with_context(|| format!("owned container {service} failed while stopping"))?;
         let finished_at = state
             .get("FinishedAt")
             .and_then(Value::as_str)
@@ -4190,28 +5330,43 @@ fn snapshot_container_outcomes(before: &[Value], after: &[Value], project: &str)
         writers.push(json!({
             "id": id, "service": service, "was_running": was_running, "exit_code": exit,
             "finished_at": finished_at, "oom_killed": state["OOMKilled"],
+            "maintenance_operation_failure": maintenance_operation_failure,
+            "comment": maintenance_operation_failure.then_some("Maintenance operation errors are retained by error_kind in the cell evidence; raw error text is omitted."),
         }));
     }
     Ok(writers)
 }
 
-fn validate_snapshot_container_ownership(containers: &[Value], project: &str) -> Result<()> {
-    let mut services = HashSet::new();
+fn validate_owned_local_containers(containers: &[Value], project: &str) -> Result<()> {
+    if containers.is_empty() {
+        bail!("no owned local containers were found");
+    }
     for container in containers {
         if container
             .pointer("/Config/Labels/com.docker.compose.project")
             .and_then(Value::as_str)
             != Some(project)
         {
-            bail!("refusing snapshot stop outside the exact owned Compose project");
+            bail!("refusing local container operation outside the exact owned Compose project");
         }
-        services.insert(
+        container
+            .pointer("/Config/Labels/com.docker.compose.service")
+            .and_then(Value::as_str)
+            .context("missing owned Compose service")?;
+    }
+    Ok(())
+}
+
+fn validate_snapshot_container_ownership(containers: &[Value], project: &str) -> Result<()> {
+    validate_owned_local_containers(containers, project)?;
+    let services = containers
+        .iter()
+        .filter_map(|container| {
             container
                 .pointer("/Config/Labels/com.docker.compose.service")
                 .and_then(Value::as_str)
-                .context("missing owned Compose service")?,
-        );
-    }
+        })
+        .collect::<HashSet<_>>();
     if !services.contains("dataflow-1") || !services.contains("arrowcol-catalog") {
         bail!("snapshot requires the owned collector and catalog, not a partially prepared stack");
     }
@@ -4226,9 +5381,9 @@ fn snapshot_stop_phases(containers: &[Value]) -> Result<[Vec<String>; 4]> {
             .and_then(Value::as_str)
             .context("missing owned Compose service")?;
         let phase = match service {
-            "dataflow-1" => 1,
-            "arrowcol-catalog" => 2,
-            "sqlserver" | "kusto" | "lgtm" => 3,
+            "delta-maintenance" => 1,
+            "dataflow-1" => 2,
+            "arrowcol-catalog" | "sqlserver" | "kusto" | "lgtm" => 3,
             _ => 0,
         };
         phases[phase].push(
@@ -4242,14 +5397,59 @@ fn snapshot_stop_phases(containers: &[Value]) -> Result<[Vec<String>; 4]> {
     Ok(phases)
 }
 
-async fn cleanup_local_platform(config: &OatConfig, platform: &LocalPlatform) -> Result<()> {
-    if let Some(destination) = &config.platform.local.snapshot_root {
-        return crate::local::snapshot_then_cleanup(
-            async {
-                tokio::time::timeout(Duration::from_secs(1_440), stop_local_snapshot_writers(config, platform))
-                    .await
-                    .context("local stop deadline exceeded; outcome uncertain, retaining owned data")?
-            },
+fn build_shutdown_drain_evidence(containers: &[Value]) -> Value {
+    json!({
+        "schema_version": 1,
+        "cleanup_order": ["ingress", "maintenance", "collectors"],
+        "collectors": containers.iter().filter(|container| container["service"] == "dataflow-1").map(|container| json!({
+            "container_id": container["id"],
+            "drain": container["shutdown_drain"],
+        })).collect::<Vec<_>>(),
+        "maintenance": containers.iter().filter(|container| container["service"] == "delta-maintenance").map(|container| json!({
+            "container_id": container["id"],
+            "outcomes": container["maintenance_outcomes"],
+            "exit_code": container["exit_code"],
+        })).collect::<Vec<_>>(),
+    })
+}
+
+fn local_phase_stop_args(phase: usize, collector_grace: u64, containers: Vec<String>) -> Vec<String> {
+    let grace = if phase == 2 { collector_grace } else { 300 };
+    let mut args = vec!["stop".to_owned(), "--time".to_owned(), grace.to_string()];
+    args.extend(containers);
+    args
+}
+
+fn local_stop_deadline(collector_grace: u64) -> Duration {
+    Duration::from_secs(collector_grace + 3 * 300 + 120)
+}
+
+async fn stop_then_destroy<T>(
+    stop: impl std::future::Future<Output = Result<T>>,
+    destroy: impl std::future::Future<Output = Result<()>>,
+) -> Result<T> {
+    let stopped = stop.await;
+    let destroyed = destroy.await;
+    match (stopped, destroyed) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(stop), Ok(())) => Err(stop),
+        (Ok(_), Err(destroy)) => Err(destroy),
+        (Err(stop), Err(destroy)) => Err(anyhow::anyhow!("stop failed: {stop:#}; cleanup failed: {destroy:#}")),
+    }
+}
+
+async fn cleanup_local_platform(config: &OatConfig, platform: &LocalPlatform) -> Result<Value> {
+    let stop = async {
+        tokio::time::timeout(
+            local_stop_deadline(config.collector_stop_grace_seconds),
+            stop_local_snapshot_writers(config, platform),
+        )
+        .await
+        .context("local stop deadline exceeded; stopped outcome uncertain")?
+    };
+    let containers = if let Some(destination) = &config.platform.local.snapshot_root {
+        crate::local::snapshot_then_cleanup(
+            stop,
             |writers| crate::local::export_stopped(
                 &platform.state_dir, Path::new(destination), &platform.run_id, &config.tables, &writers,
             ),
@@ -4259,9 +5459,11 @@ async fn cleanup_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
         .with_context(|| format!(
             "local snapshot/cleanup failed; source recovery path: {} (stop/export failures retain it; destructive-cleanup failures may be partial)",
             platform.state_dir.display()
-        ));
-    }
-    destroy_local_platform(config, platform).await
+        ))?
+    } else {
+        stop_then_destroy(stop, destroy_local_platform(config, platform)).await?
+    };
+    Ok(build_shutdown_drain_evidence(&containers))
 }
 
 fn local_oat_client_list_args(project: &str) -> Vec<String> {
@@ -4340,7 +5542,11 @@ async fn destroy_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
     Ok(())
 }
 
-async fn collect_local_metrics(config: &OatConfig, platform: &LocalPlatform) -> Result<ResourceMetrics> {
+async fn collect_local_metrics(
+    config: &OatConfig,
+    run_id: &str,
+    environment: &HashMap<String, String>,
+) -> Result<ResourceMetrics> {
     let base_project = config
         .platform
         .compose_project
@@ -4351,14 +5557,14 @@ async fn collect_local_metrics(config: &OatConfig, platform: &LocalPlatform) -> 
         .compose_file
         .as_deref()
         .context("local compose file is missing")?;
-    let project = scoped_compose_project(base_project, &platform.run_id);
+    let project = scoped_compose_project(base_project, run_id);
     let mut list = compose_command(
         compose_file,
         config.platform.compose_override_file.as_deref(),
         &project,
         "benchmark",
     );
-    list.envs(&platform.environment);
+    list.envs(environment);
     list.args(["ps", "--quiet", "dataflow-1"]);
     let ids = String::from_utf8(run_command(list, "list local ArrowCol containers").await?.stdout)?;
     let ids = ids
@@ -4421,8 +5627,30 @@ async fn configure_deployments(config: &OatConfig, replicas: u32, concurrency: u
         }
         if name == config.dfe_deployment {
             configure_workers(&mut desired, &config.dfe_container, concurrency)?;
+            desired["spec"]["template"]["spec"]["terminationGracePeriodSeconds"] =
+                json!(config.collector_stop_grace_seconds);
+            inject_deployment_environment(
+                &mut desired,
+                &config.dfe_container,
+                &role_environment(config, ComponentRole::Collector)?,
+            )?;
         }
         apply_deployment(config, desired).await?;
+        if name == config.dfe_deployment {
+            let applied = deployment(config, name).await?;
+            verify_aks_collector_stop_grace(&applied, config.collector_stop_grace_seconds)?;
+        }
+    }
+    Ok(())
+}
+
+fn verify_aks_collector_stop_grace(deployment: &Value, expected_seconds: u64) -> Result<()> {
+    let actual = deployment
+        .pointer("/spec/template/spec/terminationGracePeriodSeconds")
+        .and_then(Value::as_u64)
+        .context("AKS collector readback omitted terminationGracePeriodSeconds")?;
+    if actual != expected_seconds {
+        bail!("AKS collector termination grace readback differs from requested value");
     }
     Ok(())
 }
@@ -4742,6 +5970,21 @@ async fn prepare_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
     runtime_config["deltaRoot"] = json!(run_data_root);
     runtime_config["namespace"] = json!(config.namespace);
     runtime_config["oatRunId"] = json!(platform.run_id);
+    runtime_config["quiver"] = json!(config.tunables.wal.is_some());
+    if let Some(maintenance) = maintenance_runtime(config)? {
+        runtime_config["maintenance"] = maintenance;
+        runtime_config["images"]["maintenance"] = json!(
+            config
+                .maintenance_image
+                .as_deref()
+                .context("enabled AKS maintenance requires its pinned image")?
+        );
+    } else {
+        runtime_config
+            .as_object_mut()
+            .context("runtime config must be an object")?
+            .remove("maintenance");
+    }
     let generated_config = runtime_dir.join("runtime-config.json");
     tokio::fs::write(&generated_config, serde_json::to_vec(&runtime_config)?)
         .await
@@ -4890,14 +6133,40 @@ async fn prepare_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
     .await
     .context("remove completed run-scoped bootstrap Job")?;
 
-    let workload = render_runtime_phase(&runtime_script, &generated_config, "workload", &runtime_dir).await?;
-    platform.router_yaml = Some(rendered_router_yaml(&workload)?);
-    apply_runtime_resources(config, without_identity_resources(workload)).await?;
-    for name in ["arrowcol-catalog", "arrowcol", "arrowcol-router"] {
+    let mut workload = render_runtime_phase(&runtime_script, &generated_config, "workload", &runtime_dir).await?;
+    inject_workload_environment(config, &mut workload)?;
+    inject_router_oat_pin_ttl(&mut workload, config.run_pin_ttl_ms)?;
+    let router_yaml = rendered_router_yaml(&workload)?;
+    arrowcol_router_rust::RouterConfig::from_yaml(router_yaml.as_bytes())
+        .context("validate rendered router YAML with the router config validator")?;
+    platform.router_yaml = Some(router_yaml);
+    let (catalog, data_plane) = partition_aks_workload_resources(without_identity_resources(workload))?;
+    apply_runtime_resources(config, catalog).await?;
+    rollout(config, "arrowcol-catalog").await?;
+    apply_runtime_resources(config, data_plane).await?;
+    for name in ["arrowcol", "arrowcol-router"] {
         rollout(config, name).await?;
     }
     start_router_metrics_tunnel(config, platform).await?;
     Ok(())
+}
+
+fn partition_aks_workload_resources(resources: Vec<Value>) -> Result<(Vec<Value>, Vec<Value>)> {
+    if resources
+        .iter()
+        .filter(|resource| {
+            resource["kind"] == "Deployment"
+                && resource.pointer("/metadata/name").and_then(Value::as_str) == Some("arrowcol-catalog")
+        })
+        .count()
+        != 1
+    {
+        bail!("AKS workload requires exactly one catalog Deployment before data-plane startup");
+    }
+    Ok(resources.into_iter().partition(|resource| {
+        resource["kind"] != "Deployment"
+            || resource.pointer("/metadata/name").and_then(Value::as_str) == Some("arrowcol-catalog")
+    }))
 }
 
 fn use_operator_cli_identity(command: &mut Command) {
@@ -5600,6 +6869,400 @@ async fn write_workload_stop_receipt(
     Ok(())
 }
 
+async fn aks_pods_by_selector(config: &OatConfig, selector: &str) -> Result<Value> {
+    let output = kubectl(
+        config,
+        vec![
+            "get",
+            "pods",
+            "--namespace",
+            &config.namespace,
+            "--selector",
+            selector,
+            "-o",
+            "json",
+        ],
+        None,
+    )
+    .await?;
+    serde_json::from_str::<Value>(&output).context("parse run-owned workload pods")
+}
+
+async fn stop_aks_deployment_for_cleanup(
+    config: &OatConfig,
+    deployment_name: &str,
+    role: ComponentRole,
+    grace_seconds: u64,
+) -> Result<Value> {
+    timed_aks_cleanup_step(
+        &format!("stop AKS Deployment {deployment_name}"),
+        stop_aks_deployment_until_stopped(config, deployment_name, role, grace_seconds),
+    )
+    .await
+}
+
+async fn timed_aks_cleanup_step<T>(
+    description: &str,
+    operation: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    let started = std::time::Instant::now();
+    eprintln!("[oat] {description}...");
+    let result = operation.await;
+    let seconds = started.elapsed().as_secs_f64();
+    eprintln!(
+        "[oat] {description}: {} ({seconds:.1}s)",
+        if result.is_ok() { "done" } else { "failed" }
+    );
+    result.with_context(|| format!("{description} after {seconds:.1}s"))
+}
+
+async fn stop_aks_deployment_until_stopped(
+    config: &OatConfig,
+    deployment_name: &str,
+    role: ComponentRole,
+    grace_seconds: u64,
+) -> Result<Value> {
+    let output = kubectl(
+        config,
+        vec![
+            "get",
+            "deployment",
+            deployment_name,
+            "--namespace",
+            &config.namespace,
+            "--ignore-not-found",
+            "-o",
+            "json",
+        ],
+        None,
+    )
+    .await?;
+    let Some(deployment) = optional_shutdown_deployment(&output)? else {
+        return Ok(json!({"deployment": deployment_name, "status": "nothing_to_stop", "processes": []}));
+    };
+    let selector_labels = deployment
+        .pointer("/spec/selector/matchLabels")
+        .and_then(Value::as_object)
+        .context("run-owned deployment has no stable pod selector")?;
+    if selector_labels.is_empty() {
+        bail!("run-owned deployment selector is empty");
+    }
+    let selector = selector_labels
+        .iter()
+        .map(|(key, value)| {
+            value
+                .as_str()
+                .map(|value| format!("{key}={value}"))
+                .context("deployment selector label is not a string")
+        })
+        .collect::<Result<Vec<_>>>()?
+        .join(",");
+    let initial_pods = aks_pods_by_selector(config, &selector).await?;
+    let mut followers = Vec::new();
+    let mut terminated = HashMap::<String, Value>::new();
+    for pod in initial_pods["items"].as_array().into_iter().flatten() {
+        let pod_name = pod
+            .pointer("/metadata/name")
+            .and_then(Value::as_str)
+            .context("run-owned pod has no name")?;
+        for status in pod
+            .pointer("/status/containerStatuses")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let container = status
+                .get("name")
+                .and_then(Value::as_str)
+                .context("run-owned pod container has no name")?;
+            let role_container = match role {
+                ComponentRole::Router => container == "router",
+                ComponentRole::Collector => container == config.dfe_container,
+                ComponentRole::Maintenance => container == "maintenance",
+                ComponentRole::Client => false,
+            };
+            if !role_container {
+                continue;
+            }
+            let pod_name = pod_name.to_owned();
+            let container = container.to_owned();
+            let instance_id = format!("{pod_name}/{container}");
+            if let Some(state) = status.pointer("/state/terminated") {
+                terminated.insert(instance_id.clone(), state.clone());
+            }
+            let namespace = config.namespace.clone();
+            let context = config.kubectl_context.clone();
+            let image = status.get("image").and_then(Value::as_str).map(str::to_owned);
+            let image_id = status.get("imageID").and_then(Value::as_str).map(str::to_owned);
+            let action = format!("stream shutdown logs for {instance_id}");
+            let task_pod_name = pod_name.clone();
+            let task_container = container.clone();
+            let task = tokio::spawn(async move {
+                let mut command = Command::new("kubectl");
+                if let Some(context) = context {
+                    command.args(["--context", &context]);
+                }
+                command.args([
+                    "logs",
+                    &task_pod_name,
+                    "--namespace",
+                    &namespace,
+                    "--container",
+                    &task_container,
+                    "--follow",
+                ]);
+                let capture = filtered_process_command_output(command, &action).await?;
+                let text = format!("{}\n{}", capture.stdout, capture.stderr);
+                let complete = process_log_complete(&role, &text);
+                Ok::<_, anyhow::Error>(ProcessLog {
+                    role,
+                    instance_id,
+                    image,
+                    image_id,
+                    source_revision: None,
+                    complete,
+                    raw_log_bytes: capture.raw_log_bytes,
+                    raw_log_lines: capture.raw_log_lines,
+                    stdout: capture.stdout,
+                    stderr: capture.stderr,
+                    text,
+                })
+            });
+            followers.push((pod_name, container, status.pointer("/state/running").is_some(), task));
+        }
+    }
+    let sigterm_at_unix_ms = (role == ComponentRole::Collector)
+        .then(|| u64::try_from(unix_time_ms()).ok())
+        .flatten();
+    kubectl(
+        config,
+        vec![
+            "scale",
+            "deployment",
+            deployment_name,
+            "--replicas=0",
+            "--namespace",
+            &config.namespace,
+        ],
+        None,
+    )
+    .await
+    .with_context(|| format!("scale run-owned deployment {deployment_name} to zero"))?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(grace_seconds.saturating_add(120));
+    loop {
+        let pods = aks_pods_by_selector(config, &selector).await?;
+        for pod in pods["items"].as_array().into_iter().flatten() {
+            let pod_name = pod
+                .pointer("/metadata/name")
+                .and_then(Value::as_str)
+                .context("run-owned pod has no name")?;
+            for status in pod
+                .pointer("/status/containerStatuses")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if let Some(state) = status.pointer("/state/terminated") {
+                    let container = status
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .context("terminated container has no name")?;
+                    terminated.insert(format!("{pod_name}/{container}"), state.clone());
+                }
+            }
+        }
+        let current: Value = serde_json::from_str(
+            &kubectl(
+                config,
+                vec![
+                    "get",
+                    "deployment",
+                    deployment_name,
+                    "--namespace",
+                    &config.namespace,
+                    "-o",
+                    "json",
+                ],
+                None,
+            )
+            .await?,
+        )?;
+        let desired = current.pointer("/spec/replicas").and_then(Value::as_u64).unwrap_or(1);
+        let replicas = current.pointer("/status/replicas").and_then(Value::as_u64).unwrap_or(0);
+        let observed = rollout_generation_observed(&current);
+        let no_pods = pods["items"].as_array().is_some_and(Vec::is_empty);
+        if desired == 0 && replicas == 0 && observed && no_pods {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!("run-owned deployment {deployment_name} did not stop within its bounded grace period");
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    let mut processes = Vec::new();
+    let mut outcome_failures = Vec::new();
+    for (pod_name, container, was_running, mut task) in followers {
+        let instance_id = format!("{pod_name}/{container}");
+        let log = match tokio::time::timeout(Duration::from_secs(30), &mut task).await {
+            Ok(Ok(Ok(log))) => Some(log),
+            _ => {
+                task.abort();
+                None
+            }
+        };
+        let terminated_state = terminated.get(&instance_id);
+        let exit_code = terminated_state
+            .and_then(|state| state.get("exitCode"))
+            .and_then(Value::as_i64);
+        let finished_at = terminated_state
+            .and_then(|state| state.get("finishedAt"))
+            .and_then(Value::as_str);
+        let outcome = shutdown_exit_outcome(
+            role,
+            was_running,
+            exit_code,
+            terminated_state
+                .and_then(|state| state.get("reason"))
+                .and_then(Value::as_str)
+                == Some("OOMKilled"),
+        );
+        let exit_evidence = match outcome {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                outcome_failures.push(format!("{instance_id}: {error:#}"));
+                json!({"status": "failed", "exit_code": exit_code})
+            }
+        };
+        let process_evidence = match (role, log.as_ref()) {
+            (ComponentRole::Collector, Some(log)) => collector_shutdown_drain_evidence(
+                log,
+                was_running.then_some(sigterm_at_unix_ms).flatten(),
+                finished_at,
+                exit_code,
+                config.tunables.wal.is_some(),
+            ),
+            (ComponentRole::Collector, None) => json!({
+                "status": "unavailable", "unavailable_reason": "collector_shutdown_log_stream_unavailable",
+                "sigterm_sent": was_running, "sigterm_to_exit_seconds": null,
+                "commits_after_sigterm": null, "committed_rows_after_sigterm": null,
+                "quiver": {"status": "unavailable", "bundles_drained": null, "force_dropped_bundles": null},
+                "exit_code": exit_code,
+            }),
+            (ComponentRole::Maintenance, Some(log)) => {
+                let baseline = ProcessLog {
+                    role: ComponentRole::Maintenance,
+                    instance_id: log.instance_id.clone(),
+                    image: None,
+                    image_id: None,
+                    source_revision: None,
+                    complete: true,
+                    raw_log_bytes: 0,
+                    raw_log_lines: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    text: String::new(),
+                };
+                maintenance_cell_outcome_evidence(log, &[baseline])
+            }
+            (ComponentRole::Maintenance, None) => {
+                json!({"status":"unavailable", "error_kind_counts": null, "comment":"Maintenance log stream was unavailable; raw error text was not retained."})
+            }
+            _ => json!({"status":"observed"}),
+        };
+        processes.push(json!({
+            "pod": pod_name,
+            "container": container,
+            "was_running": was_running,
+            "exit_code": exit_code,
+            "exit_outcome": exit_evidence,
+            "finished_at": finished_at,
+            "log_complete": log.as_ref().is_some_and(|log| log.complete),
+            "drain": (role == ComponentRole::Collector).then_some(process_evidence.clone()),
+            "operation_outcomes": (role == ComponentRole::Maintenance).then_some(process_evidence),
+        }));
+    }
+    if !outcome_failures.is_empty() {
+        bail!(
+            "run-owned deployment {deployment_name} failed during shutdown: {}",
+            outcome_failures.join("; ")
+        );
+    }
+    Ok(json!({
+        "deployment": deployment_name,
+        "role": format!("{role:?}").to_ascii_lowercase(),
+        "sigterm_at_unix_ms": sigterm_at_unix_ms,
+        "processes": processes,
+    }))
+}
+
+fn optional_shutdown_deployment(output: &str) -> Result<Option<Value>> {
+    if output.trim().is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(
+            serde_json::from_str(output).context("parse deployment during shutdown")?,
+        ))
+    }
+}
+
+fn shutdown_exit_outcome(
+    role: ComponentRole,
+    was_running: bool,
+    exit_code: Option<i64>,
+    oom_killed: bool,
+) -> Result<Value> {
+    if oom_killed {
+        bail!("container was OOMKilled during shutdown");
+    }
+    let Some(exit) = exit_code else {
+        return Ok(
+            json!({"status": "unavailable", "reason": "terminated_container_state_not_observed", "exit_code": null}),
+        );
+    };
+    let maintenance_failure = role == ComponentRole::Maintenance && exit == 1;
+    if !(exit == 0 || (was_running && exit == 143) || maintenance_failure) {
+        bail!("container failed or was forcibly stopped ({exit})");
+    }
+    Ok(json!({
+        "status": "observed", "exit_code": exit,
+        "maintenance_operation_failure": maintenance_failure,
+    }))
+}
+
+async fn stop_aks_workloads_in_order(config: &OatConfig) -> Result<Value> {
+    let mut ingress = Vec::new();
+    let mut maintenance = Vec::new();
+    let mut collectors = Vec::new();
+    if config.arrowcol_deployment != config.dfe_deployment {
+        ingress.push(
+            stop_aks_deployment_for_cleanup(config, &config.arrowcol_deployment, ComponentRole::Router, 60).await?,
+        );
+    }
+    if maintenance_enabled(config) {
+        maintenance
+            .push(stop_aks_deployment_for_cleanup(config, "delta-maintenance", ComponentRole::Maintenance, 60).await?);
+    }
+    collectors.push(
+        stop_aks_deployment_for_cleanup(
+            config,
+            &config.dfe_deployment,
+            ComponentRole::Collector,
+            config.collector_stop_grace_seconds,
+        )
+        .await?,
+    );
+    if config.arrowcol_deployment == config.dfe_deployment {
+        ingress.push(json!({"deployment": config.arrowcol_deployment, "status": "shared_with_collector", "comment": "Ingress and collector share one Deployment and cannot be stopped independently."}));
+    }
+    Ok(json!({
+        "schema_version": 1,
+        "cleanup_order": ["ingress", "maintenance", "collectors"],
+        "ingress": ingress,
+        "maintenance": maintenance,
+        "collectors": collectors,
+    }))
+}
+
 async fn cleanup_aks_platform(config: &OatConfig, platform: &mut AksPlatform) -> Result<()> {
     let mut failures = Vec::new();
     let mut namespace_removed = false;
@@ -5630,21 +7293,33 @@ async fn cleanup_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
                     NamespaceCleanupAction::Delete => {
                         let namespace_uid = namespace_uid_for_cleanup(&namespace, platform.namespace_uid.as_deref())?;
                         platform.namespace_uid = Some(namespace_uid.clone());
-                        if let Err(error) = delete_run_owned_namespace_with_uid(config, &namespace_uid).await {
-                            failures.push(format!(
-                                "delete run-owned AKS namespace with UID precondition: {error:#}"
-                            ));
-                        } else if let Err(error) = wait_for_run_owned_namespace_absence(config).await {
-                            failures.push(format!(
-                                "confirm run-owned AKS namespace absence after deletion: {error:#}"
-                            ));
-                        } else if let Err(error) = write_workload_stop_receipt(config, platform, &namespace_uid).await {
-                            failures.push(format!("write exact-run workload stop receipt: {error:#}"));
-                        } else {
+                        let cleanup = async {
+                            timed_aks_cleanup_step(
+                                "delete run-owned AKS namespace",
+                                delete_run_owned_namespace_with_uid(config, &namespace_uid),
+                            )
+                            .await
+                            .context("delete run-owned AKS namespace with UID precondition")?;
+                            timed_aks_cleanup_step(
+                                "wait for run-owned AKS namespace absence",
+                                wait_for_run_owned_namespace_absence(config),
+                            )
+                            .await
+                            .context("confirm run-owned AKS namespace absence after deletion")?;
                             namespace_removed = true;
                             platform.namespace_created = false;
                             platform.namespace_create_attempted = false;
                             platform.namespace_uid = None;
+                            timed_aks_cleanup_step(
+                                "write exact-run workload stop receipt",
+                                write_workload_stop_receipt(config, platform, &namespace_uid),
+                            )
+                            .await
+                            .context("write exact-run workload stop receipt")
+                        };
+                        match stop_then_destroy(stop_aks_workloads_in_order(config), cleanup).await {
+                            Ok(evidence) => platform.shutdown_drain_evidence = Some(evidence),
+                            Err(error) => failures.push(format!("ordered AKS shutdown/cleanup failed: {error:#}")),
                         }
                     }
                     NamespaceCleanupAction::Ignore => {
@@ -5666,14 +7341,17 @@ async fn cleanup_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
                         {
                             let cleanup_result = match configured_bootstrap_env_file(config) {
                                 Ok(bootstrap_env_file) => {
-                                    run_oat_qap_helper(
-                                        "cleanup-oat-qap",
-                                        &platform.run_id,
-                                        None,
-                                        None,
-                                        Some(stop_record_path),
-                                        record_path,
-                                        bootstrap_env_file,
+                                    timed_aks_cleanup_step(
+                                        "clean run-owned QAP bindings",
+                                        run_oat_qap_helper(
+                                            "cleanup-oat-qap",
+                                            &platform.run_id,
+                                            None,
+                                            None,
+                                            Some(stop_record_path),
+                                            record_path,
+                                            bootstrap_env_file,
+                                        ),
                                     )
                                     .await
                                 }
@@ -5694,14 +7372,17 @@ async fn cleanup_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
         if let Some(record_path) = platform.fic_record_path.as_deref() {
             let cleanup_result = match configured_bootstrap_env_file(config) {
                 Ok(bootstrap_env_file) => {
-                    run_run_fic_helper(
-                        "cleanup-run-fic",
-                        &platform.run_id,
-                        None,
-                        None,
-                        record_path,
-                        None,
-                        bootstrap_env_file,
+                    timed_aks_cleanup_step(
+                        "clean run-owned federated credential",
+                        run_run_fic_helper(
+                            "cleanup-run-fic",
+                            &platform.run_id,
+                            None,
+                            None,
+                            record_path,
+                            None,
+                            bootstrap_env_file,
+                        ),
                     )
                     .await
                 }
@@ -5843,21 +7524,350 @@ async fn apply_deployment(config: &OatConfig, mut deployment: Value) -> Result<(
 }
 
 async fn rollout(config: &OatConfig, name: &str) -> Result<()> {
-    kubectl(
-        config,
-        vec![
-            "rollout",
-            "status",
-            &format!("deployment/{name}"),
-            "--namespace",
-            &config.namespace,
-            "--timeout=600s",
-        ],
-        None,
+    let result = tokio::time::timeout(
+        Duration::from_secs(config.aks_rollout_timeout_seconds),
+        rollout_until_ready(config, name),
     )
-    .await
-    .with_context(|| format!("wait for Deployment {name} rollout"))?;
-    Ok(())
+    .await;
+    let result = match result {
+        Ok(result) => result,
+        Err(_) => Err(anyhow::anyhow!(
+            "Deployment {name} did not become ready within {} seconds",
+            config.aks_rollout_timeout_seconds
+        )),
+    };
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let diagnostics = rollout_failure_diagnostics(config).await;
+            Err(error.context(diagnostics))
+        }
+    }
+}
+
+async fn rollout_until_ready(config: &OatConfig, name: &str) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(config.aks_rollout_timeout_seconds);
+    loop {
+        let deployment_json = kubectl(
+            config,
+            vec![
+                "get",
+                "deployment",
+                name,
+                "--namespace",
+                &config.namespace,
+                "-o",
+                "json",
+            ],
+            None,
+        )
+        .await
+        .with_context(|| format!("read Deployment {name} rollout state"))?;
+        let deployment: Value = serde_json::from_str(&deployment_json).context("parse Deployment rollout state")?;
+        let labels = deployment
+            .pointer("/spec/selector/matchLabels")
+            .and_then(Value::as_object)
+            .context("Deployment selector.matchLabels is missing")?;
+        let selector = labels
+            .iter()
+            .map(|(key, value)| {
+                value
+                    .as_str()
+                    .map(|value| format!("{key}={value}"))
+                    .context("Deployment selector labels must be strings")
+            })
+            .collect::<Result<Vec<_>>>()?
+            .join(",");
+        anyhow::ensure!(!selector.is_empty(), "Deployment selector must not be empty");
+        let desired_replicas = deployment
+            .pointer("/spec/replicas")
+            .and_then(Value::as_u64)
+            .unwrap_or(1);
+        anyhow::ensure!(
+            desired_replicas > 0,
+            "Deployment {name} must request at least one replica"
+        );
+
+        let replica_sets_json = kubectl(
+            config,
+            vec![
+                "get",
+                "replicasets",
+                "--namespace",
+                &config.namespace,
+                "--selector",
+                &selector,
+                "-o",
+                "json",
+            ],
+            None,
+        )
+        .await
+        .with_context(|| format!("read ReplicaSets for Deployment {name}"))?;
+        let replica_sets: Value = serde_json::from_str(&replica_sets_json).context("parse Deployment ReplicaSets")?;
+        let current_hash = rollout_generation_observed(&deployment)
+            .then(|| rollout_replica_set_hash(&deployment, &replica_sets))
+            .flatten();
+        if let Some(hash) = current_hash.as_deref() {
+            let pod_selector = format!("{selector},pod-template-hash={hash}");
+            let pods_json = kubectl(
+                config,
+                vec![
+                    "get",
+                    "pods",
+                    "--namespace",
+                    &config.namespace,
+                    "--selector",
+                    &pod_selector,
+                    "-o",
+                    "json",
+                ],
+                None,
+            )
+            .await
+            .with_context(|| format!("read current-revision pods for Deployment {name}"))?;
+            let pods: Value = serde_json::from_str(&pods_json).context("parse Deployment pod state")?;
+            let pod_items = pods
+                .get("items")
+                .and_then(Value::as_array)
+                .context("kubectl pod response has no items array")?;
+            for pod in pod_items {
+                if let Some(reason) = rollout_pod_failure_for_hash(pod, hash) {
+                    let pod_name = pod
+                        .pointer("/metadata/name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown");
+                    bail!("Deployment {name} pod {pod_name} failed readiness: {reason}");
+                }
+            }
+        }
+
+        if current_hash.is_some() && rollout_generation_ready(&deployment) {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!(
+                "Deployment {name} did not become ready within {} seconds",
+                config.aks_rollout_timeout_seconds
+            );
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+fn rollout_generation_observed(deployment: &Value) -> bool {
+    deployment
+        .pointer("/metadata/generation")
+        .and_then(Value::as_u64)
+        .zip(deployment.pointer("/status/observedGeneration").and_then(Value::as_u64))
+        .is_some_and(|(generation, observed)| observed >= generation)
+}
+
+fn rollout_generation_ready(deployment: &Value) -> bool {
+    if !rollout_generation_observed(deployment) {
+        return false;
+    }
+    let Some(desired) = deployment.pointer("/spec/replicas").and_then(Value::as_u64) else {
+        return false;
+    };
+    let status = &deployment["status"];
+    let updated = status["updatedReplicas"].as_u64().unwrap_or(0);
+    let replicas = status["replicas"].as_u64().unwrap_or(0);
+    let available = status["availableReplicas"].as_u64().unwrap_or(0);
+    updated == desired && replicas == updated && available >= updated
+}
+
+fn rollout_replica_set_hash(deployment: &Value, replica_sets: &Value) -> Option<String> {
+    let revision = deployment
+        .pointer("/metadata/annotations/deployment.kubernetes.io~1revision")?
+        .as_str()?;
+    let deployment_name = deployment.pointer("/metadata/name")?.as_str()?;
+    let deployment_uid = deployment.pointer("/metadata/uid").and_then(Value::as_str);
+    replica_sets.get("items")?.as_array()?.iter().find_map(|replica_set| {
+        let matching_owner = replica_set
+            .pointer("/metadata/ownerReferences")
+            .and_then(Value::as_array)
+            .is_some_and(|owners| {
+                owners.iter().any(|owner| {
+                    owner["kind"].as_str() == Some("Deployment")
+                        && owner["name"].as_str() == Some(deployment_name)
+                        && deployment_uid.is_none_or(|uid| owner["uid"].as_str() == Some(uid))
+                })
+            });
+        if !matching_owner
+            || replica_set
+                .pointer("/metadata/annotations/deployment.kubernetes.io~1revision")
+                .and_then(Value::as_str)
+                != Some(revision)
+        {
+            return None;
+        }
+        replica_set
+            .pointer("/spec/selector/matchLabels/pod-template-hash")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    })
+}
+
+fn rollout_pod_failure_for_hash(pod: &Value, expected_hash: &str) -> Option<String> {
+    if pod
+        .pointer("/metadata/deletionTimestamp")
+        .and_then(Value::as_str)
+        .is_some()
+        || pod
+            .pointer("/metadata/labels/pod-template-hash")
+            .and_then(Value::as_str)
+            != Some(expected_hash)
+    {
+        return None;
+    }
+    rollout_pod_failure(pod)
+}
+
+fn rollout_pod_failure(pod: &Value) -> Option<String> {
+    const IMMEDIATE_FAILURE_REASONS: [&str; 3] = ["ImagePullBackOff", "ErrImagePull", "CreateContainerConfigError"];
+    for field in [
+        "initContainerStatuses",
+        "containerStatuses",
+        "ephemeralContainerStatuses",
+    ] {
+        let Some(statuses) = pod.pointer(&format!("/status/{field}")).and_then(Value::as_array) else {
+            continue;
+        };
+        for status in statuses {
+            let container = status.get("name").and_then(Value::as_str).unwrap_or("unknown");
+            let restarts = status.get("restartCount").and_then(Value::as_u64).unwrap_or(0);
+            for path in ["/state/waiting/reason", "/state/terminated/reason"] {
+                if let Some(reason) = status
+                    .pointer(path)
+                    .and_then(Value::as_str)
+                    .filter(|reason| IMMEDIATE_FAILURE_REASONS.contains(reason))
+                {
+                    return Some(format!("container {container} entered {reason}"));
+                }
+            }
+            if restarts >= 4 && status.get("ready").and_then(Value::as_bool) != Some(true) {
+                return Some(format!(
+                    "container {container} restarted {restarts} times without becoming ready"
+                ));
+            }
+        }
+    }
+    None
+}
+
+fn rollout_diagnostic_commands(config: &OatConfig) -> Vec<(String, Vec<String>)> {
+    let mut commands = vec![
+        (
+            "namespace pods/services/endpoints".to_owned(),
+            vec![
+                "get".to_owned(),
+                "pods,svc,endpoints".to_owned(),
+                "-o".to_owned(),
+                "wide".to_owned(),
+            ],
+        ),
+        (
+            "namespace events".to_owned(),
+            vec![
+                "get".to_owned(),
+                "events".to_owned(),
+                "-o".to_owned(),
+                "wide".to_owned(),
+            ],
+        ),
+    ];
+    let mut deployments = BTreeSet::from([
+        "arrowcol-catalog".to_owned(),
+        "arrowcol-sql".to_owned(),
+        "arrowcol-router".to_owned(),
+        "arrowcol".to_owned(),
+        config.arrowcol_deployment.clone(),
+        config.dfe_deployment.clone(),
+    ]);
+    if maintenance_enabled(config) {
+        deployments.insert("delta-maintenance".to_owned());
+    }
+    for deployment in deployments {
+        let selector = format!("app={deployment}");
+        commands.push((
+            format!("Deployment {deployment}"),
+            vec!["describe".to_owned(), "deployment".to_owned(), deployment.clone()],
+        ));
+        commands.push((
+            format!("Deployment {deployment}: all pods"),
+            vec![
+                "describe".to_owned(),
+                "pods".to_owned(),
+                "--selector".to_owned(),
+                selector.clone(),
+            ],
+        ));
+        for previous in [false, true] {
+            let mut args = vec![
+                "logs".to_owned(),
+                "--selector".to_owned(),
+                selector.clone(),
+                "--all-containers=true".to_owned(),
+                "--prefix=true".to_owned(),
+                "--tail=200".to_owned(),
+                "--limit-bytes=65536".to_owned(),
+            ];
+            if previous {
+                args.push("--previous".to_owned());
+            }
+            commands.push((
+                format!(
+                    "Deployment {deployment}: {} logs (bounded diagnostic tail)",
+                    if previous { "previous" } else { "current" }
+                ),
+                args,
+            ));
+        }
+    }
+    commands
+}
+
+async fn rollout_failure_diagnostics(config: &OatConfig) -> String {
+    let details = join_all(
+        rollout_diagnostic_commands(config)
+            .into_iter()
+            .map(|(label, args)| async move {
+                let mut command = Command::new("kubectl");
+                if let Some(context) = &config.kubectl_context {
+                    command.args(["--context", context]);
+                }
+                command
+                    .args(["--request-timeout=5s", "--namespace", &config.namespace])
+                    .args(args);
+                command.kill_on_drop(true);
+                let output = match tokio::time::timeout(Duration::from_secs(10), command.output()).await {
+                    Ok(Ok(output)) => format!(
+                        "exit={}\n{}\n{}",
+                        output.status,
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    ),
+                    Ok(Err(error)) => format!("diagnostic command unavailable: {error}"),
+                    Err(_) => "diagnostic command exceeded 10-second deadline".to_owned(),
+                };
+                let mut boundary = output.len().min(65_536);
+                while !output.is_char_boundary(boundary) {
+                    boundary -= 1;
+                }
+                format!(
+                    "{label}:\n{}{}",
+                    &output[..boundary],
+                    if boundary < output.len() {
+                        "\n[diagnostic truncated at retained-byte cap]"
+                    } else {
+                        ""
+                    }
+                )
+            }),
+    )
+    .await;
+    details.join("\n")
 }
 
 async fn collect_aks_metrics(config: &OatConfig) -> Result<ResourceMetrics> {
@@ -6294,8 +8304,11 @@ fn merge_parquet_bytes(existing_bytes: &[u8], incoming: &RecordBatch) -> Result<
         .context("read existing benchmark Parquet object")?;
     let schema = result_schema();
     let existing_schema = existing_reader.schema();
+    let existing_v3 = existing_schema.as_ref() == schema.as_ref();
     if incoming.schema().as_ref() != schema.as_ref()
-        || (existing_schema.as_ref() != schema.as_ref() && existing_schema.as_ref() != legacy_result_schema().as_ref())
+        || (existing_schema.as_ref() != schema.as_ref()
+            && existing_schema.as_ref() != v2_result_schema().as_ref()
+            && existing_schema.as_ref() != legacy_result_schema().as_ref())
     {
         bail!("existing benchmark Parquet schema changed");
     }
@@ -6307,10 +8320,17 @@ fn merge_parquet_bytes(existing_bytes: &[u8], incoming: &RecordBatch) -> Result<
                 .column_by_name("schema_version")
                 .and_then(|column| column.as_any().downcast_ref::<Int32Array>())
                 .context("result Parquet has no int32 schema_version")?;
-            if versions.iter().any(|version| version != Some(2)) {
+            if versions
+                .iter()
+                .any(|version| version != Some(2) && !(existing_v3 && version == Some(3)))
+            {
                 bail!("existing benchmark Parquet contains an unsupported schema_version");
             }
-            Ok(RecordBatch::try_new(Arc::clone(&schema), batch.columns().to_vec())?)
+            let mut columns = batch.columns().to_vec();
+            if columns.len() < schema.fields().len() {
+                columns.push(Arc::new(StringArray::from(vec![None::<&str>; batch.num_rows()])));
+            }
+            Ok(RecordBatch::try_new(Arc::clone(&schema), columns)?)
         })
         .collect::<Result<Vec<_>>>()?;
     batches.push(incoming.clone());
@@ -6352,7 +8372,7 @@ fn deduplicate_results(batch: &RecordBatch) -> Result<RecordBatch> {
 fn parquet_batch(results: &[OatResult]) -> Result<RecordBatch> {
     let schema = result_schema();
     let columns: Vec<ArrayRef> = vec![
-        Arc::new(Int32Array::from_iter_values(results.iter().map(|_| 2))),
+        Arc::new(Int32Array::from_iter_values(results.iter().map(|_| 3))),
         Arc::new(StringArray::from_iter_values(
             results.iter().map(|row| row.mode.as_str()),
         )),
@@ -6436,6 +8456,12 @@ fn parquet_batch(results: &[OatResult]) -> Result<RecordBatch> {
         Arc::new(Float64Array::from(
             results.iter().map(|row| row.qap.lag_seconds).collect::<Vec<_>>(),
         )),
+        Arc::new(StringArray::from(
+            results
+                .iter()
+                .map(|row| row.evidence_json.as_deref())
+                .collect::<Vec<_>>(),
+        )),
     ];
     Ok(RecordBatch::try_new(Arc::clone(&schema), columns)?)
 }
@@ -6477,12 +8503,17 @@ fn result_schema() -> Arc<Schema> {
         Field::new("qap_cached_bytes", DataType::UInt64, true),
         Field::new("qap_unhealthy_catalogs", DataType::UInt64, true),
         Field::new("qap_lag_seconds", DataType::Float64, true),
+        Field::new("evidence_json", DataType::Utf8, true),
     ]))
+}
+
+fn v2_result_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(result_schema().fields()[..31].to_vec()))
 }
 
 fn legacy_result_schema() -> Arc<Schema> {
     Arc::new(Schema::new(
-        result_schema()
+        v2_result_schema()
             .fields()
             .iter()
             .map(|field| {
@@ -6514,6 +8545,103 @@ fn platform_host_label(kind: crate::config::OatMode) -> &'static str {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn rollout_readiness_waits_for_current_generation_and_removal_of_old_replicas() {
+        let stale_generation = serde_json::json!({
+            "metadata":{"generation":4},"spec":{"replicas":2},
+            "status":{"observedGeneration":3,"updatedReplicas":2,"replicas":2,"availableReplicas":2}
+        });
+        assert!(!super::rollout_generation_ready(&stale_generation));
+        let old_replicas_remain = serde_json::json!({
+            "metadata":{"generation":4},"spec":{"replicas":2},
+            "status":{"observedGeneration":4,"updatedReplicas":2,"replicas":3,"availableReplicas":2}
+        });
+        assert!(!super::rollout_generation_ready(&old_replicas_remain));
+        let current = serde_json::json!({
+            "metadata":{"generation":4},"spec":{"replicas":2},
+            "status":{"observedGeneration":4,"updatedReplicas":2,"replicas":2,"availableReplicas":2}
+        });
+        assert!(super::rollout_generation_ready(&current));
+    }
+
+    #[test]
+    fn rollout_failure_scan_waits_for_the_new_generation_to_be_observed() {
+        let deployment = serde_json::json!({"metadata":{"generation":4},"status":{"observedGeneration":3}});
+        assert!(!super::rollout_generation_observed(&deployment));
+    }
+
+    #[test]
+    fn rollout_failure_scan_uses_current_replica_set_and_skips_terminating_pods() {
+        let deployment = serde_json::json!({
+            "metadata":{"name":"router","uid":"deployment-uid","annotations":{"deployment.kubernetes.io/revision":"8"}}
+        });
+        let replica_sets = serde_json::json!({"items":[
+            {"metadata":{"annotations":{"deployment.kubernetes.io/revision":"7"},"ownerReferences":[
+                {"kind":"Deployment","name":"router","uid":"deployment-uid"}]},
+             "spec":{"selector":{"matchLabels":{"pod-template-hash":"old-hash"}}}},
+            {"metadata":{"annotations":{"deployment.kubernetes.io/revision":"8"},"ownerReferences":[
+                {"kind":"Deployment","name":"router","uid":"deployment-uid"}]},
+             "spec":{"selector":{"matchLabels":{"pod-template-hash":"current-hash"}}}}
+        ]});
+        let current_hash = super::rollout_replica_set_hash(&deployment, &replica_sets);
+        assert_eq!(current_hash.as_deref(), Some("current-hash"));
+        let old_crash = serde_json::json!({
+            "metadata":{"labels":{"pod-template-hash":"old-hash"}},
+            "status":{"containerStatuses":[{"name":"router","restartCount":0,
+                "state":{"waiting":{"reason":"CrashLoopBackOff"}}}]}
+        });
+        assert!(super::rollout_pod_failure_for_hash(&old_crash, "current-hash").is_none());
+        let terminating = serde_json::json!({
+            "metadata":{"deletionTimestamp":"2026-11-15T00:00:00Z","labels":{"pod-template-hash":"current-hash"}},
+            "status":{"containerStatuses":[{"name":"router","restartCount":0,
+                "state":{"waiting":{"reason":"CrashLoopBackOff"}}}]}
+        });
+        assert!(super::rollout_pod_failure_for_hash(&terminating, "current-hash").is_none());
+        let new_crash = serde_json::json!({
+            "metadata":{"labels":{"pod-template-hash":"current-hash"}},
+            "status":{"containerStatuses":[{"name":"router","restartCount":4,
+                "state":{"waiting":{"reason":"CrashLoopBackOff"}}}]}
+        });
+        assert!(super::rollout_pod_failure_for_hash(&new_crash, "current-hash").is_some());
+    }
+
+    #[test]
+    fn rollout_pod_failure_detects_expected_states_and_restart_threshold() {
+        for reason in ["ImagePullBackOff", "ErrImagePull", "CreateContainerConfigError"] {
+            let pod = serde_json::json!({"status":{"containerStatuses":[{
+                "name":"dataflow","restartCount":0,"state":{"waiting":{"reason":reason}}
+            }]}});
+            let failure = super::rollout_pod_failure(&pod).unwrap_or_default();
+            assert!(failure.contains(reason), "unexpected failure for {reason}: {failure}");
+        }
+        let terminated = serde_json::json!({"status":{"initContainerStatuses":[{
+            "name":"setup","restartCount":0,"state":{"terminated":{"reason":"Error"}}
+        }]}});
+        assert!(super::rollout_pod_failure(&terminated).is_none());
+        let restarted = serde_json::json!({"status":{"containerStatuses":[{
+            "name":"dataflow","restartCount":2,"state":{"running":{}}
+        }]}});
+        assert!(super::rollout_pod_failure(&restarted).is_none());
+        for restarts in 0..4 {
+            let recovering = serde_json::json!({"status":{"containerStatuses":[{
+                "name":"dataflow","restartCount":restarts,"state":{"waiting":{"reason":"CrashLoopBackOff"}}
+            }]}});
+            assert!(super::rollout_pod_failure(&recovering).is_none());
+        }
+        let persistent = serde_json::json!({"status":{"containerStatuses":[{
+            "name":"router","restartCount":4,"ready":false,"state":{"waiting":{"reason":"CrashLoopBackOff"}}
+        }]}});
+        assert!(super::rollout_pod_failure(&persistent).is_some_and(|failure| failure.contains("restarted 4 times")));
+        let recovered = serde_json::json!({"status":{"containerStatuses":[{
+            "name":"router","restartCount":4,"ready":true,"state":{"running":{}}
+        }]}});
+        assert!(super::rollout_pod_failure(&recovered).is_none());
+        let healthy = serde_json::json!({"status":{"containerStatuses":[{
+            "name":"dataflow","restartCount":1,"state":{"running":{}}
+        }]}});
+        assert!(super::rollout_pod_failure(&healthy).is_none());
+    }
+
+    #[test]
     fn selected_aks_stamp_config_is_workspace_contained() -> Result<()> {
         let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
         let selected = resolve_aks_stamp_config_path(&workspace, Path::new("infra/azure/stamp.example.yaml"))?;
@@ -6523,6 +8651,86 @@ mod tests {
     }
 
     use super::*;
+
+    #[tokio::test]
+    async fn rendered_aks_workload_waits_for_catalog_before_starting_data_plane() -> Result<()> {
+        let directory = std::env::temp_dir().join(format!("oat-rollout-order-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&directory)?;
+        let result = async {
+            let images = ["sqlserver", "catalog", "router", "dataflow", "maintenance"].into_iter().map(|role| {
+                (role.to_owned(), json!(format!("arrowcollector89152.azurecr.io/{role}@sha256:{}", "a".repeat(64))))
+            }).collect::<serde_json::Map<_, _>>();
+            let input = json!({
+                "namespace": "fixture-owned", "oatRunId": "00000000-0000-0000-0000-000000000003",
+                "workloadIdentityClientId": "00000000-0000-0000-0000-000000000001",
+                "subscriptionId": "00000000-0000-0000-0000-000000000002", "stamp": "89152",
+                "deltaRoot": "abfss://onelake@arrowcollector89152.dfs.core.windows.net/dataflow", "images": images,
+                "maintenance": {"tables": ["telemetry.sqlserver.sqlserver_active_sessions"], "operations": ["optimize"], "apply": false},
+            });
+            let input_path = directory.join("runtime.json");
+            fs::write(&input_path, serde_json::to_vec(&input)?)?;
+            let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../arrowcol-oat/runtime.ts");
+            let output_path = directory.join("workload.json");
+            let mut command = Command::new("npx");
+            command.current_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."));
+            command.args(["--no-install", "tsx"]).arg(&script).arg("render")
+                .arg(&input_path).arg("workload").arg(&output_path);
+            run_command(command, "render workload from the real runtime author").await?;
+            let list: Value = serde_json::from_slice(&fs::read(output_path)?)?;
+            let rendered = list["items"].as_array().context("rendered workload items missing")?.clone();
+            let original_len = rendered.len();
+            let (first, second) = partition_aks_workload_resources(rendered)?;
+            assert_eq!(first.len() + second.len(), original_len);
+            assert_eq!(first.iter().filter(|resource| resource["kind"] == "Deployment").map(|resource| resource["metadata"]["name"].as_str()).collect::<Vec<_>>(), [Some("arrowcol-catalog")]);
+            for kind in ["ConfigMap", "Service", "NetworkPolicy"] {
+                assert!(first.iter().any(|resource| resource["kind"] == kind));
+                assert!(!second.iter().any(|resource| resource["kind"] == kind));
+            }
+            assert_eq!(second.iter().map(|resource| resource["metadata"]["name"].as_str()).collect::<BTreeSet<_>>(),
+                BTreeSet::from([Some("arrowcol"), Some("arrowcol-router"), Some("delta-maintenance")]));
+            assert!(second.iter().all(|resource| resource["kind"] == "Deployment"));
+            let worker = second.iter().find(|resource| resource["metadata"]["name"] == "delta-maintenance").context("rendered maintenance missing")?;
+            assert_eq!(worker["spec"]["replicas"], 0);
+            assert!(partition_aks_workload_resources(second).is_err());
+            Ok(())
+        }.await;
+        fs::remove_dir_all(directory)?;
+        result
+    }
+
+    #[test]
+    fn rollout_diagnostics_cover_all_workload_pods_and_namespace_network_state() -> Result<()> {
+        let config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.example.json"
+        ))?;
+        let commands = rollout_diagnostic_commands(&config);
+        assert!(
+            commands
+                .iter()
+                .any(|(_, args)| args.iter().any(|arg| arg == "pods,svc,endpoints"))
+        );
+        assert!(commands.iter().any(|(_, args)| args.iter().any(|arg| arg == "events")));
+        for deployment in ["arrowcol-sql", "arrowcol-catalog", "arrowcol-router", "arrowcol"] {
+            let selector = format!("app={deployment}");
+            assert!(
+                commands
+                    .iter()
+                    .any(|(_, args)| args.first().is_some_and(|arg| arg == "describe")
+                        && args.iter().any(|arg| arg == &selector))
+            );
+            for previous in [false, true] {
+                assert!(commands.iter().any(|(label, args)| {
+                    label.contains(deployment)
+                        && args.first().is_some_and(|arg| arg == "logs")
+                        && args.iter().any(|arg| arg == &selector)
+                        && args.iter().any(|arg| arg == "--previous") == previous
+                        && args.iter().any(|arg| arg == "--all-containers=true")
+                        && args.iter().any(|arg| arg == "--tail=200")
+                }));
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn run_fic_helper_uses_operator_cli_identity_for_every_phase() -> Result<()> {
@@ -6827,9 +9035,9 @@ mod tests {
             snapshot_stop_phases(&before)?,
             [
                 vec!["id-3".to_owned(), "id-4".to_owned()],
+                vec![],
                 vec!["id-2".to_owned()],
-                vec!["id-1".to_owned()],
-                vec!["id-0".to_owned()]
+                vec!["id-0".to_owned(), "id-1".to_owned()]
             ]
         );
         let mut after = before.clone();
@@ -6861,6 +9069,439 @@ mod tests {
         assert!(snapshot_container_outcomes(&already_failed, &after, project).is_err());
         Ok(())
     }
+    #[test]
+    fn aks_collector_stop_grace_readback_requires_exact_value() {
+        let deployment = json!({"spec":{"template":{"spec":{"terminationGracePeriodSeconds":300}}}});
+        assert!(verify_aks_collector_stop_grace(&deployment, 300).is_ok());
+        assert!(verify_aks_collector_stop_grace(&deployment, 301).is_err());
+        assert!(verify_aks_collector_stop_grace(&json!({}), 300).is_err());
+    }
+
+    #[tokio::test]
+    async fn non_snapshot_cleanup_destroys_after_stop_failure_and_keeps_both_errors() -> Result<()> {
+        let actions = std::cell::RefCell::new(Vec::new());
+        let result = stop_then_destroy(
+            async {
+                actions.borrow_mut().push("stop");
+                Err::<(), _>(anyhow::anyhow!("stop failed with exit 137"))
+            },
+            async {
+                actions.borrow_mut().push("destroy");
+                Err(anyhow::anyhow!("owned volume deletion failed"))
+            },
+        )
+        .await;
+        assert_eq!(*actions.borrow(), ["stop", "destroy"]);
+        let error = format!("{:#}", result.err().context("both operations must fail")?);
+        assert!(error.contains("exit 137"));
+        assert!(error.contains("owned volume deletion failed"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn non_snapshot_cleanup_destroys_after_stop_timeout() -> Result<()> {
+        let destroyed = std::sync::atomic::AtomicBool::new(false);
+        let result = stop_then_destroy(
+            async {
+                tokio::time::timeout(Duration::from_millis(1), std::future::pending::<Result<()>>())
+                    .await
+                    .context("stop deadline exceeded")?
+            },
+            async {
+                destroyed.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await;
+        assert!(destroyed.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(format!("{:#}", result.err().context("stop must time out")?).contains("stop deadline exceeded"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cleanup_failure_paths_destroy_owned_resources_and_gate_aks_exits() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = match std::env::var_os("OAT_CLEANUP_FIXTURE_ROOT") {
+            Some(root) => PathBuf::from(root),
+            None => {
+                let root = std::env::temp_dir().join(format!("oat-cleanup-{}", uuid::Uuid::new_v4()));
+                fs::create_dir(&root)?;
+                fs::create_dir(root.join("bin"))?;
+                let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cleanup-platform.ts");
+                for tool in ["docker", "kubectl"] {
+                    let path = root.join("bin").join(tool);
+                    fs::write(
+                        &path,
+                        format!(
+                            "#!/bin/sh\nexec node --import tsx '{}' {tool} \"$@\"\n",
+                            script.display()
+                        ),
+                    )?;
+                    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+                }
+                let mut command = Command::new(std::env::current_exe()?);
+                command.args([
+                    "--exact",
+                    "runner::tests::cleanup_failure_paths_destroy_owned_resources_and_gate_aks_exits",
+                    "--nocapture",
+                ]);
+                command.env("OAT_CLEANUP_FIXTURE_ROOT", &root);
+                let mut paths = vec![root.join("bin")];
+                paths.extend(std::env::split_paths(
+                    &std::env::var_os("PATH").context("fixture PATH")?,
+                ));
+                command.env("PATH", std::env::join_paths(paths)?);
+                let result = tokio::time::timeout(
+                    Duration::from_secs(60),
+                    run_command(command, "isolated cleanup regression fixture"),
+                )
+                .await;
+                fs::remove_dir_all(&root)?;
+                result.context("cleanup regression timed out")??;
+                return Ok(());
+            }
+        };
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.example.json"
+        ))?;
+        config.platform.local.snapshot_root = None;
+        let state = fixture.join("local-state");
+        fs::create_dir(&state)?;
+        let local = LocalPlatform {
+            run_id: "fixture-run".to_owned(),
+            state_dir: state.clone(),
+            environment: HashMap::new(),
+            control_dir: state.clone(),
+            client_progress: std::sync::Mutex::new(HashMap::new()),
+            router_metrics_url: None,
+            qap_url: None,
+            daemon_endpoint: None,
+            shutdown_drain_evidence: None,
+        };
+        fs::write(fixture.join("mode"), "stop_failure")?;
+        let error = cleanup_local_platform(&config, &local)
+            .await
+            .err()
+            .context("local stop must fail")?;
+        assert!(format!("{error:#}").contains("fixture stop listing failed"));
+        assert!(!state.exists(), "non-snapshot state leaked after stop failure");
+        assert!(fixture.join("compose-destroyed").exists(), "Compose down was skipped");
+
+        config.platform.kind = crate::config::OatMode::Aks;
+        config.namespace = "fixture-owned".to_owned();
+        config.kubectl_context = None;
+        config.arrowcol_deployment = "fixture".to_owned();
+        config.dfe_deployment = "fixture".to_owned();
+        config.dfe_container = "dataflow".to_owned();
+        config.tunables.maintenance = None;
+        let runtime = fixture.join("runtime");
+        fs::create_dir(&runtime)?;
+        let ownership = runtime.join("ready.json");
+        fs::write(
+            &ownership,
+            serde_json::to_vec(&json!({
+                "phase": "ready", "runId": "fixture-run", "namespace": config.namespace,
+                "namespaceUid": "fixture-uid", "namespaceOwner": "fixture-owner",
+                "aksId": "/fixture/aks", "server": "https://fixture.invalid",
+            }))?,
+        )?;
+        fs::write(
+            fixture.join("namespace.json"),
+            serde_json::to_vec(&json!({
+                "metadata": {"uid": "fixture-uid",
+                    "labels": {"arrowcol-oat/run-id": "fixture-run", "arrowcol-oat/owner-token": "fixture-owner"},
+                    "annotations": {"arrowcol-oat/run-id": "fixture-run", "arrowcol-oat/owner-token": "fixture-owner"},
+                },
+            }))?,
+        )?;
+        let mut platform = AksPlatform {
+            run_id: "fixture-run".to_owned(),
+            namespace_created: true,
+            namespace_create_attempted: true,
+            namespace_owner_token: "fixture-owner".to_owned(),
+            namespace_uid: Some("fixture-uid".to_owned()),
+            runtime_dir: Some(runtime.clone()),
+            qap_relative_data_root: None,
+            router_metrics_url: None,
+            router_tunnel: None,
+            fic_record_path: None,
+            fic_ready_snapshot_path: Some(ownership),
+            fic_prepare_attempted: true,
+            qap_record_path: None,
+            qap_bind_attempted: true,
+            qap_outcome_unresolved: false,
+            workload_stop_record_path: None,
+            schedule_configmap_name: String::new(),
+            service_account: None,
+            router_yaml: None,
+            shutdown_drain_evidence: None,
+        };
+        let error = cleanup_aks_platform(&config, &mut platform)
+            .await
+            .err()
+            .context("AKS stop must fail")?;
+        let error = format!("{error:#}");
+        assert!(error.contains("fixture deployment stop failed"));
+        assert!(
+            error.contains("QAP cleanup requires"),
+            "QAP cleanup was skipped: {error}"
+        );
+        assert!(
+            error.contains("workload identity cleanup has no"),
+            "FIC cleanup was skipped: {error}"
+        );
+        assert!(!platform.namespace_created);
+        assert!(!fixture.join("namespace.json").exists(), "run-owned namespace leaked");
+        let options: Value = serde_json::from_slice(&fs::read(fixture.join("delete-options.json"))?)?;
+        assert_eq!(options["preconditions"]["uid"], "fixture-uid");
+        let receipt: Value = serde_json::from_slice(&fs::read(runtime.join("workload-stop-receipt.json"))?)?;
+        assert_eq!(receipt["absence_confirmed"], true);
+
+        fs::write(fixture.join("mode"), "absent_deployment")?;
+        let missing = stop_aks_deployment_for_cleanup(&config, "fixture", ComponentRole::Collector, 30).await?;
+        assert_eq!(missing["status"], "nothing_to_stop");
+        fs::write(fixture.join("mode"), "exit_137")?;
+        let error = stop_aks_deployment_for_cleanup(&config, "fixture", ComponentRole::Collector, 30)
+            .await
+            .err()
+            .context("AKS exit 137 must fail")?;
+        assert!(format!("{error:#}").contains("forcibly stopped (137)"));
+        fs::remove_file(fixture.join("pods-read"))?;
+        fs::write(fixture.join("mode"), "missing_exit")?;
+        let evidence = stop_aks_deployment_for_cleanup(&config, "fixture", ComponentRole::Collector, 30).await?;
+        assert_eq!(evidence["processes"][0]["exit_outcome"]["status"], "unavailable");
+        assert_eq!(evidence["processes"][0]["drain"]["exit_code"], Value::Null);
+        fs::write(fixture.join("mode"), "rollout_recovers")?;
+        config.aks_rollout_timeout_seconds = 30;
+        rollout(&config, "fixture").await?;
+        fs::write(fixture.join("mode"), "rollout_persistent")?;
+        let started = std::time::Instant::now();
+        let failure = rollout(&config, "fixture")
+            .await
+            .err()
+            .context("persistent crash must fail")?;
+        let detail = format!("{failure:#}");
+        assert!(detail.contains("restarted 4 times"));
+        assert!(detail.contains("namespace pods/services/endpoints"));
+        assert!(detail.contains("namespace events"));
+        for role in ["arrowcol-catalog", "arrowcol-router", "arrowcol-sql", "arrowcol"] {
+            assert!(detail.contains(&format!("Deployment {role}: previous logs")));
+        }
+        assert!(started.elapsed() < Duration::from_secs(15));
+        fs::write(fixture.join("mode"), "rollout_hang")?;
+        config.aks_rollout_timeout_seconds = 1;
+        let started = std::time::Instant::now();
+        let failure = rollout(&config, "fixture")
+            .await
+            .err()
+            .context("hung API request must time out")?;
+        assert!(format!("{failure:#}").contains("did not become ready within 1 seconds"));
+        assert!(started.elapsed() < Duration::from_secs(15));
+        Ok(())
+    }
+
+    #[test]
+    fn local_stop_arguments_preserve_noncollector_ceilings() {
+        for (phase, grace) in [(0, 300), (1, 300), (2, 3600), (3, 300)] {
+            assert_eq!(
+                local_phase_stop_args(phase, 3600, vec!["owned-container".to_owned()]),
+                vec![
+                    "stop".to_owned(),
+                    "--time".to_owned(),
+                    grace.to_string(),
+                    "owned-container".to_owned()
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn local_stop_deadline_covers_maximum_collector_grace_and_all_other_phases() {
+        let deadline = local_stop_deadline(3600);
+        assert!(deadline > Duration::from_secs(3600 + 3 * 300));
+        assert!(deadline > Duration::from_secs(1440));
+    }
+
+    #[test]
+    fn absent_shutdown_deployment_is_nothing_to_stop_not_a_parse_failure() -> Result<()> {
+        assert!(optional_shutdown_deployment("")?.is_none());
+        assert!(optional_shutdown_deployment(" \n")?.is_none());
+        assert_eq!(
+            optional_shutdown_deployment(r#"{"spec":{"replicas":1}}"#)?.context("deployment was present")?["spec"]["replicas"],
+            1
+        );
+        assert!(optional_shutdown_deployment("invalid JSON").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn aks_shutdown_exit_gate_rejects_forced_death_and_marks_missing_state_unavailable() -> Result<()> {
+        for role in [
+            ComponentRole::Collector,
+            ComponentRole::Router,
+            ComponentRole::Maintenance,
+        ] {
+            assert!(shutdown_exit_outcome(role, true, Some(137), false).is_err());
+            assert!(shutdown_exit_outcome(role, true, Some(2), false).is_err());
+            assert!(shutdown_exit_outcome(role, true, Some(0), true).is_err());
+            assert!(shutdown_exit_outcome(role, true, None, true).is_err());
+            assert_eq!(shutdown_exit_outcome(role, true, None, false)?["status"], "unavailable");
+            assert_eq!(
+                shutdown_exit_outcome(role, true, Some(143), false)?["status"],
+                "observed"
+            );
+            assert!(shutdown_exit_outcome(role, false, Some(143), false).is_err());
+        }
+        assert!(shutdown_exit_outcome(ComponentRole::Collector, true, Some(1), false).is_err());
+        assert_eq!(
+            shutdown_exit_outcome(ComponentRole::Maintenance, true, Some(1), false)?["maintenance_operation_failure"],
+            true,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn collector_shutdown_evidence_records_commits_and_quiver_drain() -> Result<()> {
+        let signal = 1_700_000_000_000_u64;
+        let event = json!({
+            "schema_version": 1,
+            "outcome": "committed",
+            "rows": 120,
+            "finished_at_unix_ms": signal as i64 + 250,
+        });
+        let text = format!(
+            "arrowcol_data_commit {}\ndurable_buffer.shutdown.drained bundles_drained = 3\nquiver.engine.stop force_dropped_bundles = 0\n",
+            serde_json::to_string(&event)?
+        );
+        let log = ProcessLog {
+            role: ComponentRole::Collector,
+            instance_id: "pod/dataflow".to_owned(),
+            image: None,
+            image_id: None,
+            source_revision: None,
+            complete: true,
+            raw_log_bytes: text.len() as u64,
+            raw_log_lines: 3,
+            stdout: text.clone(),
+            stderr: String::new(),
+            text,
+        };
+        let evidence =
+            collector_shutdown_drain_evidence(&log, Some(signal), Some("2023-11-14T22:13:21Z"), Some(0), true);
+        assert_eq!(evidence["status"], "observed");
+        assert_eq!(evidence["sigterm_to_exit_seconds"], 1.0);
+        assert_eq!(evidence["commits_after_sigterm"], 1);
+        assert_eq!(evidence["committed_rows_after_sigterm"], 120);
+        assert_eq!(evidence["quiver"]["bundles_drained"], 3);
+        assert_eq!(evidence["quiver"]["status"], "observed");
+        assert_eq!(evidence["quiver"]["force_dropped_bundles"], 0);
+        assert_eq!(evidence["exit_code"], 0);
+        Ok(())
+    }
+
+    #[test]
+    fn collector_shutdown_evidence_records_zero_drain_after_completed_shutdown() -> Result<()> {
+        let text = concat!(
+            "otel.processor.durable_buffer::durable_buffer.shutdown.start\n",
+            "otel.processor.durable_buffer::durable_buffer.shutdown.complete\n",
+            "otel-arrow-dfe-quiver::quiver.engine.stop [force_dropped_bundles=0]\n",
+        );
+        let log = ProcessLog {
+            role: ComponentRole::Collector,
+            instance_id: "pod/dataflow".to_owned(),
+            image: None,
+            image_id: None,
+            source_revision: None,
+            complete: true,
+            raw_log_bytes: text.len() as u64,
+            raw_log_lines: 3,
+            stdout: text.to_owned(),
+            stderr: String::new(),
+            text: text.to_owned(),
+        };
+
+        let evidence = collector_shutdown_drain_evidence(
+            &log,
+            Some(1_700_000_000_000),
+            Some("2023-11-14T22:13:21Z"),
+            Some(0),
+            true,
+        );
+
+        assert_eq!(evidence["status"], "observed");
+        assert_eq!(evidence["quiver"]["bundles_drained"], 0);
+        assert_eq!(evidence["quiver"]["status"], "inferred");
+        assert_eq!(
+            evidence["quiver"]["bundles_drained_source"],
+            "matched_shutdown_start_complete"
+        );
+        assert_eq!(evidence["quiver"]["force_dropped_bundles"], 0);
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_stop_accepts_only_maintenance_exit_one() -> Result<()> {
+        let project = "owned-maintenance-run";
+        let services = [
+            "delta-maintenance",
+            "sqlserver",
+            "arrowcol-catalog",
+            "dataflow-1",
+            "router",
+            "oat-client",
+        ];
+        let before = services
+            .iter()
+            .enumerate()
+            .map(|(index, service)| {
+                json!({
+                    "Id": format!("maintenance-id-{index}"),
+                    "Config": {"Labels": {
+                        "com.docker.compose.project": project,
+                        "com.docker.compose.service": service
+                    }},
+                    "State": {"Running": true}
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            snapshot_stop_phases(&before)?,
+            [
+                vec!["maintenance-id-4".to_owned(), "maintenance-id-5".to_owned()],
+                vec!["maintenance-id-0".to_owned()],
+                vec!["maintenance-id-3".to_owned()],
+                vec!["maintenance-id-1".to_owned(), "maintenance-id-2".to_owned()],
+            ]
+        );
+        let mut after = before.clone();
+        for container in &mut after {
+            container["State"] = json!({
+                "Running": false, "Paused": false, "Dead": false, "Status": "exited",
+                "Error": "", "ExitCode": 0, "OOMKilled": false,
+                "FinishedAt": "2026-01-01T00:00:00Z"
+            });
+        }
+
+        after[0]["State"]["ExitCode"] = json!(1);
+        let outcomes = snapshot_container_outcomes(&before, &after, project)?;
+        assert_eq!(outcomes[0]["maintenance_operation_failure"], true);
+        assert!(outcomes[0]["comment"].as_str().is_some());
+
+        for exit in [2, 137] {
+            let mut invalid = after.clone();
+            invalid[0]["State"]["ExitCode"] = json!(exit);
+            assert!(snapshot_container_outcomes(&before, &invalid, project).is_err());
+        }
+        let mut invalid = after.clone();
+        invalid[0]["State"]["OOMKilled"] = json!(true);
+        assert!(snapshot_container_outcomes(&before, &invalid, project).is_err());
+        invalid = after.clone();
+        invalid[3]["State"]["ExitCode"] = json!(1);
+        assert!(snapshot_container_outcomes(&before, &invalid, project).is_err());
+        Ok(())
+    }
+
     include!("runner_publication_tests.rs");
 
     fn router_yaml_for_pin_test(run_id: &str) -> String {
@@ -6886,7 +9527,8 @@ mod tests {
         for (_, _, run_id) in &cells {
             let parsed = uuid::Uuid::parse_str(run_id)?;
             assert_eq!(parsed.to_string(), *run_id, "run IDs use canonical lowercase UUID form");
-            let local_router = run_scoped_local_router_config("routing:\n  lease_ttl_ms: 86400000\n", run_id)?;
+            let local_router =
+                run_scoped_local_router_config("routing:\n  lease_ttl_ms: 86400000\n", run_id, config.run_pin_ttl_ms)?;
             assert!(local_router.contains(&format!("oat_run_id: \"{run_id}\"")));
         }
         Ok(())
@@ -7064,8 +9706,12 @@ mod tests {
         );
         assert_eq!(
             budget.minimum_pin_ttl_ms,
-            (budget.client_job_lifetime_seconds + crate::config::PIN_INIT_SETUP_TIMEOUT_SECONDS) * 1_000,
-            "the immutable pin lifetime starts before bounded pin setup and must outlive the entire client Job"
+            (budget.client_job_lifetime_seconds
+                + crate::config::PIN_INIT_SETUP_TIMEOUT_SECONDS
+                + config.reconciliation_settle_timeout_seconds
+                + config.collector_stop_grace_seconds)
+                * 1_000,
+            "the immutable pin lifetime must cover setup, the client Job, settling, and collector drain"
         );
         Ok(())
     }
@@ -7463,21 +10109,28 @@ mod tests {
 
     #[test]
     fn local_router_configuration_authorizes_only_its_run() -> Result<()> {
-        let generated = run_scoped_local_router_config(include_str!("../../loadtest/config/router.yaml"), "run-one")?;
+        let generated =
+            run_scoped_local_router_config(include_str!("../../loadtest/config/router.yaml"), "run-one", 4_080_000)?;
         let generated: serde_yaml::Value = serde_yaml::from_str(&generated)?;
         assert_eq!(generated["auth"]["authenticator"].as_str(), Some("dev_only_allow_all"));
         assert_eq!(generated["routing"]["oat_run_id"].as_str(), Some("run-one"));
+        assert_eq!(generated["routing"]["lease_ttl_ms"].as_u64(), Some(4_080_000));
+        assert_eq!(generated["routing"]["oat_run_pin_ttl_ms"].as_u64(), Some(4_080_000));
 
         let configured = run_scoped_local_router_config(
             "routing:\n  lease_ttl_ms: 86400000\n  readiness_max_staleness_ms: 30000\n",
             "run-one",
+            3_600_000,
         )?;
-        assert!(configured.contains("  lease_ttl_ms: 3600000\n  oat_run_id: \"run-one\"\n"));
-        assert!(run_scoped_local_router_config("routing:\n  lease_ttl_ms: 30000\n", "run-two").is_err());
+        assert!(
+            configured.contains("  lease_ttl_ms: 3600000\n  oat_run_pin_ttl_ms: 3600000\n  oat_run_id: \"run-one\"\n")
+        );
+        assert!(run_scoped_local_router_config("routing:\n  lease_ttl_ms: 30000\n", "run-two", 3_600_000).is_err());
         assert!(
             run_scoped_local_router_config(
                 "routing:\n  lease_ttl_ms: 86400000\n  oat_run_id: run-existing\n",
                 "run-one",
+                3_600_000,
             )
             .is_err()
         );
@@ -7485,7 +10138,26 @@ mod tests {
     }
 
     #[test]
-    fn parquet_schema_v2_matches_the_full_frozen_column_contract() -> Result<()> {
+    fn aks_router_pin_ttl_is_injected_without_changing_run_authorization() -> Result<()> {
+        let mut resources = vec![json!({
+            "kind":"ConfigMap",
+            "metadata":{"name":"arrowcol-config"},
+            "data":{"router.yaml":"routing:\n  oat_run_id: run-one\n"}
+        })];
+        inject_router_oat_pin_ttl(&mut resources, 4_080_000)?;
+        let yaml = resources[0]
+            .pointer("/data/router.yaml")
+            .and_then(Value::as_str)
+            .context("router yaml missing")?;
+        let router: serde_yaml::Value = serde_yaml::from_str(yaml)?;
+        assert_eq!(router["routing"]["oat_run_id"].as_str(), Some("run-one"));
+        assert_eq!(router["routing"]["lease_ttl_ms"].as_u64(), Some(4_080_000));
+        assert_eq!(router["routing"]["oat_run_pin_ttl_ms"].as_u64(), Some(4_080_000));
+        Ok(())
+    }
+
+    #[test]
+    fn parquet_schema_v3_preserves_v2_and_appends_nullable_evidence() -> Result<()> {
         let expected = vec![
             ("schema_version", DataType::Int32, false),
             ("mode", DataType::Utf8, false),
@@ -7522,6 +10194,7 @@ mod tests {
             ("qap_cached_bytes", DataType::UInt64, true),
             ("qap_unhealthy_catalogs", DataType::UInt64, true),
             ("qap_lag_seconds", DataType::Float64, true),
+            ("evidence_json", DataType::Utf8, true),
         ];
         let schema = result_schema();
         let actual = schema
@@ -8054,6 +10727,7 @@ mod tests {
             status: "succeeded".to_owned(),
             git_sha: "test".to_owned(),
             tunables_json: "{}".to_owned(),
+            evidence_json: None,
             replicas: 1,
             dfe_worker_concurrency: 2,
             table: table.to_owned(),

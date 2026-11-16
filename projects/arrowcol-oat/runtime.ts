@@ -12,7 +12,9 @@ export interface RuntimeConfig {
   subscriptionId: string;
   stamp: string;
   deltaRoot: string;
-  images: { sqlserver: string; catalog: string; router: string; dataflow: string };
+  images: { sqlserver: string; catalog: string; router: string; dataflow: string; maintenance?: string };
+  maintenance?: { tables: string[]; operations: string[]; apply: boolean };
+  quiver?: boolean;
 }
 type Resource = Record<string, any>;
 export type Phase = 'identity' | 'foundation' | 'bootstrap' | 'workload';
@@ -24,9 +26,10 @@ export function validateRuntime(input: unknown, allowUnpublishedImages = false):
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('runtime config must be an object');
   const c = input as RuntimeConfig;
   const required = ['deltaRoot', 'images', 'namespace', 'oatRunId', 'workloadIdentityClientId', 'subscriptionId', 'stamp'];
-  if (required.some((key) => !Object.hasOwn(c, key)) || Object.keys(c).some((key) => ![...required, 'serviceAccount'].includes(key))) {
+  if (required.some((key) => !Object.hasOwn(c, key)) || Object.keys(c).some((key) => ![...required, 'serviceAccount', 'maintenance', 'quiver'].includes(key))) {
     throw new Error('runtime config has missing or unknown fields');
   }
+  if (Object.hasOwn(c, 'quiver') && typeof c.quiver !== 'boolean') throw new Error('quiver must be an explicit boolean');
   if (typeof c.namespace !== 'string' || !dns.test(c.namespace) || c.namespace.startsWith('kube-') || ['default', 'azure-qap'].includes(c.namespace)) {
     throw new Error('use a dedicated OAT namespace (not the QAP namespace)');
   }
@@ -44,13 +47,27 @@ export function validateRuntime(input: unknown, allowUnpublishedImages = false):
     throw new Error('deltaRoot must be the bootstrapped credential-free abfss dataflow root');
   }
   if (new URL(c.deltaRoot).hostname !== `arrowcollector${c.stamp}.dfs.core.windows.net`) throw new Error('dataflow root must match the selected stamp');
-  if (!c.images || Object.keys(c.images).sort().join() !== [...roles].sort().join()) throw new Error('all four images are required');
-  for (const role of roles) {
-    if (allowUnpublishedImages && c.images[role] === 'unpublished') continue;
-    if (typeof c.images[role] !== 'string' ||
-        !/^[a-z0-9]+\.azurecr\.io\/[a-z0-9][a-z0-9/_.-]*@sha256:[a-f0-9]{64}$/.test(c.images[role])) {
+  if (!c.images || typeof c.images !== 'object' || Array.isArray(c.images) ||
+      roles.some(role => !Object.hasOwn(c.images, role)) ||
+      Object.keys(c.images).some(role => ![...roles, 'maintenance'].includes(role))) throw new Error('all four images are required; only maintenance is optional');
+  for (const [role, image] of Object.entries(c.images)) {
+    if (allowUnpublishedImages && image === 'unpublished') continue;
+    if (typeof image !== 'string' ||
+        !/^[a-z0-9]+\.azurecr\.io\/[a-z0-9][a-z0-9/_.-]*@sha256:[a-f0-9]{64}$/.test(image)) {
       throw new Error(`${role} must be an ACR image pinned by registry manifest digest, not a local image ID or tag`);
     }
+  }
+  if (Object.hasOwn(c, 'maintenance')) {
+    const policy = c.maintenance;
+    if (!policy || typeof policy !== 'object' || Array.isArray(policy) ||
+        Object.keys(policy).sort().join() !== 'apply,operations,tables' || typeof policy.apply !== 'boolean' ||
+        !Array.isArray(policy.tables) || policy.tables.length === 0 || policy.tables.length > 256 ||
+        policy.tables.some(table => typeof table !== 'string' || !/^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$/.test(table)) ||
+        new Set(policy.tables).size !== policy.tables.length ||
+        !Array.isArray(policy.operations) || policy.operations.length === 0 ||
+        policy.operations.some(operation => !['optimize', 'checkpoint', 'purge', 'vacuum', 'prune-log'].includes(operation)) ||
+        new Set(policy.operations).size !== policy.operations.length) throw new Error('maintenance requires explicit qualified table allowlist, operations and apply boolean');
+    if (!c.images.maintenance) throw new Error('enabled maintenance requires a revision-verified digest-pinned maintenance image');
   }
   return c;
 }
@@ -59,6 +76,13 @@ const security = {
   runAsNonRoot: true, runAsUser: 10001, runAsGroup: 10001,
   allowPrivilegeEscalation: false, capabilities: { drop: ['ALL'] },
 };
+
+export async function renderDataflow(quiver: boolean): Promise<string> {
+  const profile = quiver ? 'config.quiver.yaml' : 'config.yaml';
+  const dataflow = parse(await readFile(`projects/arrowcol-dataflow-rust/${profile}`, 'utf8'));
+  delete dataflow.policies.resources;
+  return stringify(dataflow);
+}
 const env = (name: string, value: string) => ({ name, value });
 const secretEnv = (name: string, secret: string, key: string) => ({
   name, valueFrom: { secretKeyRef: { name: secret, key } },
@@ -154,9 +178,7 @@ export async function renderRuntime(input: unknown, phase: Phase): Promise<Resou
     }];
     return [object('batch/v1', 'Job', 'arrowcol-migrate-v11', { spec: { backoffLimit: 0, activeDeadlineSeconds: 600, template } })];
   }
-  const dataflow = parse(await readFile('projects/arrowcol-dataflow-rust/config.yaml', 'utf8'));
-  // --num-cores owns the effective policy; no group/pipeline override may shadow it.
-  delete dataflow.policies.resources;
+  const dataflow = await renderDataflow(c.quiver === true);
   const router = parse(await readFile('projects/arrowcol-router-rust/config.docker.yaml', 'utf8'));
   router.auth.authenticator = 'dev_only_allow_all';
   router.sql_server.host = 'arrowcol-sql';
@@ -179,8 +201,8 @@ export async function renderRuntime(input: unknown, phase: Phase): Promise<Resou
     env('AZURE_STORAGE_ACCOUNT', `arrowcollector${c.stamp}`), env('AZURE_STORAGE_CHECKPOINT_CONTAINER', 'checkpoints'),
     secretEnv('ARROWCOL_RESET_GENERATION', 'arrowcol-generation', 'generation'),
   ];
-  return [
-    object('v1', 'ConfigMap', 'arrowcol-config', { data: { 'dataflow.yaml': stringify(dataflow), 'router.yaml': stringify(router) } }),
+  const workload = [
+    object('v1', 'ConfigMap', 'arrowcol-config', { data: { 'dataflow.yaml': dataflow, 'router.yaml': stringify(router) } }),
     service('arrowcol-catalog', 8817), service('arrowcol-router', 50050),
     deployment('arrowcol-catalog', [{
       name: 'catalog', image: c.images.catalog, securityContext: security,
@@ -208,8 +230,10 @@ export async function renderRuntime(input: unknown, phase: Phase): Promise<Resou
       ports: [{ containerPort: 32010 }, { containerPort: 32011 }], resources: resources('2', '4Gi', '2', '6Gi'),
       startupProbe: { ...httpProbe('/readyz', 32011), failureThreshold: 120 },
       readinessProbe: httpProbe('/readyz', 32011), livenessProbe: httpProbe('/healthz', 32011),
-      volumeMounts: [mount('config', '/etc/oat'), mount('app', '/run/app'), mount('auth', '/run/auth')],
-    }], [{ name: 'config', configMap: { name: 'arrowcol-config' } }, secretVolume('app', 'arrowcol-sql-runtime'), secretVolume('auth', 'arrowcol-router-auth')], true),
+      volumeMounts: [mount('config', '/etc/oat'), mount('app', '/run/app'), mount('auth', '/run/auth'),
+        ...(c.quiver ? [mount('quiver', '/var/lib/arrowcol/quiver', false)] : [])],
+    }], [{ name: 'config', configMap: { name: 'arrowcol-config' } }, secretVolume('app', 'arrowcol-sql-runtime'), secretVolume('auth', 'arrowcol-router-auth'),
+      ...(c.quiver ? [{ name: 'quiver', emptyDir: {} }] : [])], true),
     deployment('arrowcol-router', [{
       name: 'router', image: c.images.router, securityContext: security,
       args: ['--config', '/etc/oat/router.yaml'],
@@ -218,11 +242,29 @@ export async function renderRuntime(input: unknown, phase: Phase): Promise<Resou
       readinessProbe: httpProbe('/readyz', 50050), livenessProbe: httpProbe('/healthz', 50050),
       volumeMounts: [mount('config', '/etc/oat'), mount('app', '/run/app'), mount('auth', '/run/auth')],
     }], [{ name: 'config', configMap: { name: 'arrowcol-config' } }, secretVolume('app', 'arrowcol-sql-runtime'), secretVolume('auth', 'arrowcol-router-auth')]),
-    network('catalog-internal', 'arrowcol-catalog', ['arrowcol', 'arrowcol-oat-client'], 8817),
+    network('catalog-internal', 'arrowcol-catalog', ['arrowcol', 'arrowcol-oat-client', ...(c.maintenance ? ['delta-maintenance'] : [])], 8817),
     network('flight-router-only', 'arrowcol', ['arrowcol-router'], 32010),
     network('router-oat-client-ingress', 'arrowcol-router', ['arrowcol-oat-client'], 50050),
     // Operator port-forward is the only ingress to the router; no LoadBalancer, Ingress or NodePort.
   ];
+  if (c.maintenance) {
+    const worker = deployment('delta-maintenance', [{
+      name: 'maintenance', image: c.images.maintenance, securityContext: security,
+      args: ['--catalog-endpoint', 'http://arrowcol-catalog:8817', '--interval-secs', '60', '--listen', '0.0.0.0:9467',
+        ...c.maintenance.tables.flatMap(table => ['--table', table]),
+        ...c.maintenance.operations.flatMap(operation => ['--operation', operation]),
+        ...(c.maintenance.apply ? ['--apply'] : [])],
+      env: [...cloudEnv, env('ARROWCOL_CATALOG_DDL_IDENTITY_SECRET_FILE', '/run/auth/internal-hmac')],
+      ports: [{ containerPort: 9467 }], resources: resources('250m', '512Mi', '1', '2Gi'),
+      startupProbe: { ...httpProbe('/metrics', 9467), failureThreshold: 120 },
+      readinessProbe: httpProbe('/metrics', 9467),
+      volumeMounts: [mount('auth', '/run/auth')],
+    }], [secretVolume('auth', 'arrowcol-router-auth')], true);
+    // Pin initialization creates the allowlisted catalog entries before the runner starts this worker.
+    worker.spec.replicas = 0;
+    workload.push(worker);
+  }
+  return workload;
 }
 
 export async function prepareSecrets(directory: string, bootstrapEnv: string): Promise<void> {
@@ -364,6 +406,7 @@ export async function generatePrivateInputs(input: PrivateInputs): Promise<{
     platform: { ...platform, runtime_config_file: runtimeConfigPath, bootstrap_env_file: bootstrapEnvPath },
     stamp: runtime.stamp, kubectl_context: `arrow-collector-${runtime.stamp}`,
     qap_endpoint: input.qapEndpoint, qap_database: qapDatabase, dmv_client_image: input.clientImage,
+    ...(runtime.images.maintenance ? { maintenance_image: runtime.images.maintenance } : {}),
     result_url: `abfss://experiments@${account}.dfs.core.windows.net/arrowcol-oat/results.parquet`,
     website_url: `abfss://$web@${account}.dfs.core.windows.net/results.parquet`,
   }, null, 2)}\n`);
@@ -371,7 +414,9 @@ export async function generatePrivateInputs(input: PrivateInputs): Promise<{
 }
 
 async function main(args: string[]): Promise<void> {
-  if (args[0] === 'prepare-secrets' && args.length === 3) {
+  if (args[0] === 'render-dataflow' && args.length === 3 && ['direct', 'quiver'].includes(args[1])) {
+    await writeFile(args[2], await renderDataflow(args[1] === 'quiver'), { flag: 'wx' });
+  } else if (args[0] === 'prepare-secrets' && args.length === 3) {
     await prepareSecrets(args[2], args[1]);
     console.log('Private runtime secret files ready; no cluster changes made.');
   } else if (args[0] === 'render' && args.length === 4) {
@@ -379,7 +424,7 @@ async function main(args: string[]): Promise<void> {
     await writeFile(args[3], JSON.stringify({ apiVersion: 'v1', kind: 'List', items }, null, 2));
     console.log(`Rendered ${items.length} resources; no cluster changes made.`);
   } else {
-    throw new Error('Usage: runtime.ts render <runtime.json> <identity|foundation|bootstrap|workload> <output.json> | prepare-secrets <supported-bootstrap.env> <private-directory>');
+    throw new Error('Usage: runtime.ts render <runtime.json> <identity|foundation|bootstrap|workload> <output.json> | render-dataflow <direct|quiver> <output.yaml> | prepare-secrets <supported-bootstrap.env> <private-directory>');
   }
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

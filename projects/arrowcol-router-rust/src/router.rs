@@ -1,7 +1,8 @@
 use std::os::fd::RawFd;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use arrowcol_protocol::NOT_ADMITTED_METADATA_KEY;
 use arrowcol_protocol::{
     CATALOG_METADATA_KEY, CLAIMED_SCHEMA_FINGERPRINT_METADATA_KEY, IMPLEMENTATION_POOL_METADATA_KEY,
     ImplementationPool, IngestMetadata, PROTOCOL_VERSION_METADATA_KEY, RawGrpcMetadata, SCHEMA_METADATA_KEY,
@@ -21,7 +22,7 @@ use pingora::server::configuration::ServerConf;
 use pingora::services::background::{BackgroundService, background_service};
 use pingora::upstreams::peer::ALPN;
 use serde::Serialize;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     AuthFailure, AuthFailureKind, Authenticator, EDGE_NONCE_HEADER, EDGE_SIGNATURE_HEADER, EDGE_TIMESTAMP_HEADER,
@@ -99,6 +100,12 @@ impl ProductionRouter {
             )
             .await?;
         self.internal_signer.sign(&context, now)
+    }
+
+    fn record_request_latency(&self, context: &mut RequestContext) {
+        if let Some(started) = context.request_started.take() {
+            self.metrics.observe_request_duration(started.elapsed());
+        }
     }
 
     async fn route_proxy_request(
@@ -181,11 +188,27 @@ impl ProductionRouter {
                 }
                 Err(error) => {
                     if is_oat {
-                        self.metrics.failure("doput", &pool, "pinning_violation");
-                        write_grpc_error(session, 9, &format!("pinning_violation: {}", error.message())).await?;
+                        let (status, not_admitted) = oat_routing_response(error.kind());
+                        let message = if not_admitted {
+                            self.metrics.failure("doput", &pool, "lease_holder_overloaded");
+                            error.message().to_owned()
+                        } else {
+                            self.metrics.failure("doput", &pool, "pinning_violation");
+                            format!("pinning_violation: {}", error.message())
+                        };
+                        if not_admitted {
+                            write_not_admitted_grpc_error(session, status, &message).await?;
+                        } else {
+                            write_grpc_error(session, status, &message).await?;
+                        }
                     } else {
                         self.metrics.failure("doput", &pool, routing_reason(error.kind()));
-                        write_grpc_error(session, routing_grpc_status(error.kind()), error.message()).await?;
+                        if routing_error_is_preadmission(error.kind()) {
+                            write_not_admitted_grpc_error(session, routing_grpc_status(error.kind()), error.message())
+                                .await?;
+                        } else {
+                            write_grpc_error(session, routing_grpc_status(error.kind()), error.message()).await?;
+                        }
                     }
                     Ok(true)
                 }
@@ -256,12 +279,21 @@ impl ProductionRouter {
                 Ok(())
             }
             Err(cause) => {
-                self.metrics.failure(
-                    "doput",
-                    context.pool.as_deref().unwrap_or("unknown"),
-                    "pinning_violation",
-                );
-                context.pinning_error = Some(format!("pinning_violation: {cause}"));
+                if cause.kind() == RoutingErrorKind::LeaseHolderOverloaded {
+                    self.metrics.failure(
+                        "doput",
+                        context.pool.as_deref().unwrap_or("unknown"),
+                        "lease_holder_overloaded",
+                    );
+                    context.overloaded_error = Some(cause.to_string());
+                } else {
+                    self.metrics.failure(
+                        "doput",
+                        context.pool.as_deref().unwrap_or("unknown"),
+                        "pinning_violation",
+                    );
+                    context.pinning_error = Some(format!("pinning_violation: {cause}"));
+                }
                 Err(Error::explain(ErrorType::InternalError, cause.to_string()))
             }
         }
@@ -274,6 +306,7 @@ impl ProductionRouter {
                 .as_ref()
                 .is_some_and(|assignment| assignment.lease.is_some())
             && context.pinning_error.is_none()
+            && context.overloaded_error.is_none()
         {
             self.metrics.failure(
                 "doput",
@@ -355,6 +388,8 @@ pub struct RequestContext {
     is_grpc: bool,
     stream_counted: bool,
     pinning_error: Option<String>,
+    overloaded_error: Option<String>,
+    request_started: Option<Instant>,
 }
 
 #[async_trait]
@@ -366,6 +401,7 @@ impl ProxyHttp for ProductionRouter {
     }
 
     async fn request_filter(&self, session: &mut Session, context: &mut Self::CTX) -> pingora::Result<bool> {
+        context.request_started = Some(Instant::now());
         let now = now_unix_millis()
             .map_err(|cause| Error::because(ErrorType::InternalError, "read current timestamp", cause))?;
         let path = session.req_header().uri.path().to_owned();
@@ -373,6 +409,16 @@ impl ProxyHttp for ProductionRouter {
             return Ok(handled);
         }
         self.route_proxy_request(session, context, now).await
+    }
+
+    async fn response_filter(
+        &self,
+        _session: &mut Session,
+        _upstream_response: &mut ResponseHeader,
+        context: &mut Self::CTX,
+    ) -> pingora::Result<()> {
+        self.record_request_latency(context);
+        Ok(())
     }
 
     async fn upstream_peer(&self, _session: &mut Session, context: &mut Self::CTX) -> pingora::Result<Box<HttpPeer>> {
@@ -496,13 +542,20 @@ impl ProxyHttp for ProductionRouter {
     }
 
     async fn fail_to_proxy(&self, session: &mut Session, error: &Error, context: &mut Self::CTX) -> FailToProxy {
+        self.record_request_latency(context);
         let code = if context.is_grpc && session.response_written().is_none() {
-            let (grpc_status, message) = context
-                .pinning_error
-                .as_deref()
-                .map_or((14, "upstream collector is unavailable"), |message| (9, message));
-            if let Err(write_error) = write_grpc_error(session, grpc_status, message).await {
-                warn!(error = %write_error, "failed to write canonical gRPC proxy error");
+            if let Some(message) = context.overloaded_error.as_deref() {
+                if let Err(write_error) = write_not_admitted_grpc_error(session, 14, message).await {
+                    debug!(error = %write_error, "failed to write retryable OAT overload response");
+                }
+            } else {
+                let (grpc_status, message) = context
+                    .pinning_error
+                    .as_deref()
+                    .map_or((14, "upstream collector is unavailable"), |message| (9, message));
+                if let Err(write_error) = write_grpc_error(session, grpc_status, message).await {
+                    debug!(error = %write_error, "failed to write canonical gRPC proxy error");
+                }
             }
             200
         } else {
@@ -543,7 +596,7 @@ impl ProxyHttp for ProductionRouter {
             context.stream_counted = false;
         }
         if let Some(error) = error {
-            warn!(
+            debug!(
                 operation = context.operation,
                 pool = context.pool.as_deref().unwrap_or("unknown"),
                 error = %error,
@@ -631,7 +684,7 @@ pub fn build_server(
         // Pingora counts the first upstream attempt in this value. One means
         // exactly one attempt; the error hooks above also force retry=false.
         max_retries: 1,
-        upstream_keepalive_pool_size: 1_024,
+        upstream_keepalive_pool_size: config.server.upstream_keepalive_pool_size,
         pid_file: config
             .server
             .state_directory
@@ -787,13 +840,48 @@ fn sanitize_public_message(message: &str) -> String {
 }
 
 async fn write_grpc_error(session: &mut Session, grpc_status: u16, message: &str) -> pingora::Result<()> {
-    let mut response = ResponseHeader::build(200, Some(5))?;
+    write_grpc_error_with_metadata(session, grpc_status, message, false).await
+}
+
+async fn write_not_admitted_grpc_error(session: &mut Session, grpc_status: u16, message: &str) -> pingora::Result<()> {
+    write_grpc_error_with_metadata(session, grpc_status, message, true).await
+}
+
+async fn write_grpc_error_with_metadata(
+    session: &mut Session,
+    grpc_status: u16,
+    message: &str,
+    not_admitted: bool,
+) -> pingora::Result<()> {
+    let mut response = ResponseHeader::build(200, Some(6))?;
     response.insert_header("content-type", "application/grpc")?;
     response.insert_header("grpc-status", grpc_status.to_string())?;
     response.insert_header("grpc-message", grpc_message(message))?;
+    if not_admitted {
+        response.insert_header(NOT_ADMITTED_METADATA_KEY, "true")?;
+    }
     response.insert_header("cache-control", "no-store")?;
     response.insert_header("x-content-type-options", "nosniff")?;
     session.write_response_header(Box::new(response), true).await
+}
+
+fn oat_routing_response(kind: RoutingErrorKind) -> (u16, bool) {
+    if kind == RoutingErrorKind::LeaseHolderOverloaded {
+        (14, true)
+    } else {
+        (9, false)
+    }
+}
+
+fn routing_error_is_preadmission(kind: RoutingErrorKind) -> bool {
+    matches!(
+        kind,
+        RoutingErrorKind::PoolUnavailable
+            | RoutingErrorKind::LeaseDraining
+            | RoutingErrorKind::LeaseHolderUnavailable
+            | RoutingErrorKind::LeaseHolderOverloaded
+            | RoutingErrorKind::Database
+    )
 }
 
 async fn write_json<T: Serialize>(session: &mut Session, status: StatusCode, value: &T) -> pingora::Result<()> {
@@ -841,6 +929,7 @@ fn routing_reason(kind: RoutingErrorKind) -> &'static str {
         RoutingErrorKind::PoolUnavailable => "pool_unavailable",
         RoutingErrorKind::LeaseDraining => "lease_draining",
         RoutingErrorKind::LeaseHolderUnavailable => "lease_holder_unavailable",
+        RoutingErrorKind::LeaseHolderOverloaded => "lease_holder_overloaded",
         RoutingErrorKind::Conflict => "conflict",
         RoutingErrorKind::CorruptState => "corrupt_state",
         RoutingErrorKind::Database => "database",
@@ -854,10 +943,36 @@ fn routing_grpc_status(kind: RoutingErrorKind) -> u16 {
         RoutingErrorKind::LeaseDraining => 8,
         RoutingErrorKind::PoolUnavailable
         | RoutingErrorKind::LeaseHolderUnavailable
+        | RoutingErrorKind::LeaseHolderOverloaded
         | RoutingErrorKind::Conflict
         | RoutingErrorKind::Database => 14,
         RoutingErrorKind::CorruptState => 13,
         _ => 13,
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::{RoutingErrorKind, oat_routing_response, routing_error_is_preadmission};
+
+    #[test]
+    fn retry_marker_is_limited_to_pre_admission_routing_rejections() {
+        assert!(routing_error_is_preadmission(RoutingErrorKind::PoolUnavailable));
+        assert!(routing_error_is_preadmission(RoutingErrorKind::LeaseDraining));
+        assert!(routing_error_is_preadmission(RoutingErrorKind::LeaseHolderUnavailable));
+        assert!(routing_error_is_preadmission(RoutingErrorKind::LeaseHolderOverloaded));
+        assert!(routing_error_is_preadmission(RoutingErrorKind::Database));
+        assert!(!routing_error_is_preadmission(RoutingErrorKind::Conflict));
+        assert!(!routing_error_is_preadmission(RoutingErrorKind::InvalidConfiguration));
+        assert_eq!(
+            oat_routing_response(RoutingErrorKind::LeaseHolderOverloaded),
+            (14, true)
+        );
+        assert_eq!(
+            oat_routing_response(RoutingErrorKind::LeaseHolderUnavailable),
+            (9, false)
+        );
+        assert_eq!(oat_routing_response(RoutingErrorKind::Conflict), (9, false));
     }
 }
 

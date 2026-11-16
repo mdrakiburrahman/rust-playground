@@ -18,7 +18,6 @@ use sha2::{Digest, Sha256};
 
 use crate::sdk::GeneratedTable;
 
-const MAX_FLIGHT_DATA_BYTES: usize = 31 * 1024 * 1024;
 /// Interleaved tenants deliberately provide an unsorted input for layout tests.
 pub const CUSTOMER_COUNT: usize = 16;
 
@@ -102,6 +101,20 @@ pub struct ScheduledTable {
 ///
 /// Rejects unsupported or nullable generated schema fields and Arrow/IPC errors.
 pub async fn build_logical_batch(table: Arc<GeneratedTable>, rows: usize, seed: u64) -> Result<LogicalBatch> {
+    build_logical_batch_with_tuning(table, rows, seed, &crate::tuning::ClientTuning::default()).await
+}
+
+/// Builds the same proof-compatible seed cycle with explicit IPC and string-size settings.
+///
+/// # Errors
+///
+/// Propagates schema, numeric, hashing, and encoding errors.
+pub async fn build_logical_batch_with_tuning(
+    table: Arc<GeneratedTable>,
+    rows: usize,
+    seed: u64,
+    tuning: &crate::tuning::ClientTuning,
+) -> Result<LogicalBatch> {
     if rows == 0 {
         bail!("batch row count must be positive");
     }
@@ -126,13 +139,14 @@ pub async fn build_logical_batch(table: Arc<GeneratedTable>, rows: usize, seed: 
             seed,
             offset,
             &mut row_hasher,
+            tuning,
         )?;
         columns.push(column);
     }
     let record_batch = RecordBatch::try_new(Arc::clone(&table.schema), columns)?;
     let row_hashes = row_hash_multiset(&record_batch)?;
     let arrow_bytes = u64::try_from(record_batch.get_array_memory_size()).context("Arrow byte count overflow")?;
-    let (encoded, payload_sha256) = encode_record_batch(&table, &record_batch).await?;
+    let (encoded, payload_sha256) = encode_record_batch_with_tuning(&table, &record_batch, tuning).await?;
     Ok(LogicalBatch {
         table,
         record_batch,
@@ -260,16 +274,35 @@ pub async fn encode_record_batch(
     table: &GeneratedTable,
     record_batch: &RecordBatch,
 ) -> Result<(Vec<FlightData>, String)> {
+    encode_record_batch_with_tuning(table, record_batch, &crate::tuning::ClientTuning::default()).await
+}
+
+async fn encode_record_batch_with_tuning(
+    table: &GeneratedTable,
+    record_batch: &RecordBatch,
+    tuning: &crate::tuning::ClientTuning,
+) -> Result<(Vec<FlightData>, String)> {
+    use crate::tuning::IpcCompression;
+    let compression = match tuning.ipc_compression {
+        IpcCompression::None => None,
+        IpcCompression::Lz4Frame => Some(arrow_ipc::CompressionType::LZ4_FRAME),
+        IpcCompression::Zstd => Some(arrow_ipc::CompressionType::ZSTD),
+    };
     let descriptor = arrow_flight::FlightDescriptor::new_path(table.descriptor_path.clone());
     let encoded = FlightDataEncoderBuilder::new()
         .with_schema(record_batch.schema())
         .with_flight_descriptor(Some(descriptor))
-        .with_max_flight_data_size(MAX_FLIGHT_DATA_BYTES)
+        .with_max_flight_data_size(tuning.max_flight_data_bytes)
+        .with_options(arrow_ipc::writer::IpcWriteOptions::default().try_with_compression(compression)?)
         .build(stream::iter(vec![Ok::<_, FlightError>(record_batch.clone())]))
         .try_collect::<Vec<_>>()
         .await?;
     let mut payload_hasher = Sha256::new();
     for message in &encoded {
+        ensure!(
+            prost::Message::encoded_len(message) <= tuning.max_message_bytes,
+            "encoded FlightData exceeds max-message-bytes"
+        );
         hash_bytes(&mut payload_hasher, &message.data_header);
         hash_bytes(&mut payload_hasher, &message.data_body);
         hash_bytes(&mut payload_hasher, &message.app_metadata);
@@ -286,6 +319,7 @@ fn deterministic_column(
     seed: i64,
     offset: i64,
     row_hasher: &mut Sha256,
+    tuning: &crate::tuning::ClientTuning,
 ) -> Result<ArrayRef> {
     row_hasher.update(name.as_bytes());
     row_hasher.update(data_type.to_string().as_bytes());
@@ -312,6 +346,17 @@ fn deterministic_column(
         DataType::Utf8 => {
             let value = if is_guid(table, name) {
                 deterministic_guid(table, name, seed)
+            } else if tuning.string_width > 0 {
+                let digest = Sha256::digest(format!("{table}:{name}:{seed}").as_bytes());
+                (0..tuning.string_width)
+                    .map(|index| {
+                        if (index as f64 / tuning.string_width as f64) < tuning.entropy {
+                            (b'a' + digest[index % digest.len()] % 26) as char
+                        } else {
+                            'a'
+                        }
+                    })
+                    .collect()
             } else {
                 format!("{table}:{name}:fallback:{seed}")
             };
@@ -507,6 +552,109 @@ mod tests {
         assert_eq!(first.row_hashes, second.row_hashes);
         let different_seed = build_logical_batch(generated_table()?, 4, 8).await?;
         assert_ne!(first.row_hashes, different_seed.row_hashes);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn precomputed_codecs_preserve_proofs_and_complete_seed_cycle() -> Result<()> {
+        use crate::{
+            corpus::PreparedCorpus,
+            tuning::{ClientTuning, DataMode, IpcCompression},
+        };
+        use arrow_flight::decode::FlightRecordBatchStream;
+
+        let mut table = generated_table()?;
+        let mut fields = table.schema.fields().to_vec();
+        fields.push(Arc::new(Field::new("workload_label", DataType::Utf8, false)));
+        Arc::get_mut(&mut table).context("unique test table")?.schema = Arc::new(Schema::new(fields));
+        for codec in [IpcCompression::None, IpcCompression::Lz4Frame, IpcCompression::Zstd] {
+            for mode in [DataMode::Shared, DataMode::Independent] {
+                let tuning = ClientTuning {
+                    precompute_batches_per_table: 16,
+                    data_mode: mode,
+                    ipc_compression: codec,
+                    string_width: 257,
+                    entropy: 0.5,
+                    max_flight_data_bytes: 1024,
+                    ..ClientTuning::default()
+                };
+                let cache = PreparedCorpus::prepare(&[Arc::clone(&table)], CUSTOMER_COUNT, 7, 2, &tuning).await?;
+                let mut hashes = BTreeSet::new();
+                for ordinal in 0..32 {
+                    let cached = cache
+                        .get(&table.identity.to_string(), 0, ordinal)
+                        .context("cached variant")?;
+                    let expected = build_logical_batch_with_tuning(
+                        Arc::clone(&table),
+                        CUSTOMER_COUNT,
+                        scheduled_batch_seed(7, ordinal)?,
+                        &tuning,
+                    )
+                    .await?;
+                    assert_eq!(cached.payload_sha256, expected.payload_sha256);
+                    assert_eq!(cached.row_hashes, expected.row_hashes);
+                    assert_eq!(cached.row_sha256, expected.row_sha256);
+                    let other_lane = cache
+                        .get(&table.identity.to_string(), 1, ordinal)
+                        .context("second lane")?;
+                    assert_eq!(other_lane.payload_sha256, expected.payload_sha256);
+                    assert_eq!(Arc::ptr_eq(&cached, &other_lane), matches!(mode, DataMode::Shared));
+                    hashes.extend(cached.row_hashes.iter().map(|(hash, _)| hash.clone()));
+                    if ordinal == 0 {
+                        let decoded = FlightRecordBatchStream::new_from_flight_data(stream::iter(
+                            cached.encoded.as_ref().clone().into_iter().map(Ok),
+                        ))
+                        .try_collect::<Vec<_>>()
+                        .await?;
+                        assert!(
+                            decoded.len() > 1,
+                            "small split target must change Flight batch encoding"
+                        );
+                        let concatenated = arrow::compute::concat_batches(&table.schema, &decoded)?;
+                        assert_eq!(concatenated, expected.record_batch);
+                        let label = concatenated
+                            .column(4)
+                            .as_any()
+                            .downcast_ref::<StringArray>()
+                            .context("label array")?;
+                        assert_eq!(label.value(0).len(), 257);
+                        let directory = tempfile::tempdir()?;
+                        let mut writer = arrow_deltalake::delta::DeltaTableWriter::open(
+                            directory.path().join(table.identity.to_string()),
+                        )?;
+                        writer.write(&concatenated).await?;
+                        writer.close().await?;
+                        let snapshot = delta_inspect::summarize(directory.path()).await?;
+                        assert_eq!(
+                            snapshot.tables[&table.identity.to_string()].row_hashes,
+                            expected.row_hashes.into_iter().collect()
+                        );
+                    }
+                }
+                assert_eq!(hashes.len(), delta_inspect::MAX_CHUNK_DISTINCT_ROWS);
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn partial_precompute_never_changes_variant_selection_and_checks_memory_first() -> Result<()> {
+        use crate::{corpus::PreparedCorpus, tuning::ClientTuning};
+        let table = generated_table()?;
+        let mut tuning = ClientTuning {
+            precompute_batches_per_table: 1,
+            ..ClientTuning::default()
+        };
+        let cache = PreparedCorpus::prepare(&[Arc::clone(&table)], CUSTOMER_COUNT, 7, 1, &tuning).await?;
+        assert!(cache.get(&table.identity.to_string(), 0, 0).is_some());
+        assert!(cache.get(&table.identity.to_string(), 0, 1).is_none());
+        assert!(cache.get(&table.identity.to_string(), 0, 16).is_some());
+        tuning.max_memory_bytes = 1;
+        let error = PreparedCorpus::prepare(&[table], CUSTOMER_COUNT, 7, 1, &tuning)
+            .await
+            .err()
+            .context("memory rejection")?;
+        assert!(error.to_string().contains("exceeding max-memory-bytes"));
         Ok(())
     }
 

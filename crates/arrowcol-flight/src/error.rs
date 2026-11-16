@@ -2,7 +2,8 @@ use std::{fmt, time::Duration};
 
 use arrowcol_catalog::{CatalogError, CatalogErrorCode};
 use arrowcol_protocol::{
-    ErrorCategory, ErrorCode, ErrorStatus, MAX_MEASUREMENT, MetadataParseError, PositiveMeasurement,
+    ErrorCategory, ErrorCode, ErrorStatus, MAX_MEASUREMENT, MetadataParseError, NOT_ADMITTED_METADATA_KEY,
+    PositiveMeasurement,
 };
 use serde::{Deserialize, Serialize};
 use tonic::{
@@ -33,6 +34,7 @@ pub struct RuntimeError {
     grpc_code: Code,
     public_message: String,
     retry_after: Option<Duration>,
+    not_admitted: bool,
 }
 
 impl RuntimeError {
@@ -47,6 +49,7 @@ impl RuntimeError {
             grpc_code,
             public_message: sanitize_public_message(public_message.as_ref()),
             retry_after: None,
+            not_admitted: false,
         }
     }
 
@@ -72,13 +75,33 @@ impl RuntimeError {
         )
     }
 
+    /// Creates a deadline failure before the collector admitted the delivery.
+    #[must_use]
+    pub fn not_admitted_deadline_exceeded() -> Self {
+        let mut error = Self::deadline_exceeded();
+        error.not_admitted = true;
+        error
+    }
+
     /// Creates a graceful-drain admission failure.
     #[must_use]
     pub fn draining() -> Self {
-        Self::new(
+        let mut error = Self::new(
             ErrorCode::PoolUnavailable,
             Code::Unavailable,
             "collector is draining and not accepting new deliveries",
+        );
+        error.not_admitted = true;
+        error
+    }
+
+    /// Creates an unmarked shutdown failure after delivery admission.
+    #[must_use]
+    pub fn shutdown_after_admission() -> Self {
+        Self::new(
+            ErrorCode::PoolUnavailable,
+            Code::Unavailable,
+            "collector stopped after delivery admission",
         )
     }
 
@@ -207,6 +230,9 @@ impl RuntimeError {
                 ERROR_RETRY_AFTER_METADATA_KEY,
                 &retry_after_millis(delay).to_string(),
             );
+        }
+        if self.not_admitted {
+            insert_ascii(&mut metadata, NOT_ADMITTED_METADATA_KEY, "true");
         }
         if let Some(status) = self.protocol_status()
             && let Ok(encoded) = serde_json::to_vec(&status)
