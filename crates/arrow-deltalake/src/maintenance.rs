@@ -47,6 +47,139 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
 use url::Url;
 
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub mod test_support {
+    use async_trait::async_trait;
+    use futures::stream::BoxStream;
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions,
+        PutOptions, PutPayload, PutResult, RenameOptions,
+    };
+    use std::fmt::{self, Display, Formatter};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Object-store operation counter for debug integration tests.
+    #[derive(Debug)]
+    pub struct CountingObjectStore {
+        inner: Arc<dyn ObjectStore>,
+        reads: AtomicUsize,
+        lists: AtomicUsize,
+        writes: AtomicUsize,
+    }
+
+    impl CountingObjectStore {
+        #[must_use]
+        pub fn new(inner: Arc<dyn ObjectStore>) -> Self {
+            Self {
+                inner,
+                reads: AtomicUsize::new(0),
+                lists: AtomicUsize::new(0),
+                writes: AtomicUsize::new(0),
+            }
+        }
+
+        pub fn reset(&self) {
+            self.reads.store(0, Ordering::SeqCst);
+            self.lists.store(0, Ordering::SeqCst);
+            self.writes.store(0, Ordering::SeqCst);
+        }
+
+        #[must_use]
+        pub fn snapshot(&self) -> (usize, usize, usize) {
+            (
+                self.reads.load(Ordering::SeqCst),
+                self.lists.load(Ordering::SeqCst),
+                self.writes.load(Ordering::SeqCst),
+            )
+        }
+    }
+
+    impl Display for CountingObjectStore {
+        fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+            write!(formatter, "counting object store")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for CountingObjectStore {
+        async fn put_opts(
+            &self,
+            path: &object_store::path::Path,
+            payload: PutPayload,
+            options: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            self.inner.put_opts(path, payload, options).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            path: &object_store::path::Path,
+            options: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            self.inner.put_multipart_opts(path, options).await
+        }
+
+        async fn get_opts(
+            &self,
+            path: &object_store::path::Path,
+            options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.inner.get_opts(path, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            paths: BoxStream<'static, object_store::Result<object_store::path::Path>>,
+        ) -> BoxStream<'static, object_store::Result<object_store::path::Path>> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            self.inner.delete_stream(paths)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.lists.fetch_add(1, Ordering::SeqCst);
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<ListResult> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.lists.fetch_add(1, Ordering::SeqCst);
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: CopyOptions,
+        ) -> object_store::Result<()> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            self.inner.copy_opts(from, to, options).await
+        }
+
+        async fn rename_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: RenameOptions,
+        ) -> object_store::Result<()> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            self.inner.rename_opts(from, to, options).await
+        }
+    }
+}
+
 /// Serialized plan format understood by this build.
 pub const PLAN_FORMAT: u32 = 2;
 /// Tolerated clock skew for explicit retention anchors.

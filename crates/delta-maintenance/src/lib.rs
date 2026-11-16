@@ -305,6 +305,14 @@ pub trait TableDiscovery: Sync {
         Ok(DeltaTable::open_for_maintenance_probe_with_limit(url, max_log_files)?)
     }
 
+    /// Open the table used by a full maintenance planner.
+    ///
+    /// # Errors
+    /// Returns table access and snapshot loading failures.
+    fn open_maintenance_table(&self, url: &Url) -> Result<Arc<DeltaTable>> {
+        Ok(DeltaTable::open_for_maintenance(url)?)
+    }
+
     /// Return allowlisted tables that are not ready for maintenance yet.
     ///
     /// # Errors
@@ -939,6 +947,8 @@ pub struct OperationResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub duration_ms: u64,
+    pub probe_duration_ms: u64,
+    pub plan_apply_duration_ms: u64,
 }
 
 /// Effective VACUUM retention and the caller's per-invocation acknowledgements.
@@ -1594,6 +1604,8 @@ fn maintain_table(
         let started = Instant::now();
         let mut optimize = None;
         let mut negative_probe = false;
+        let mut probe_duration_ms = 0;
+        let mut plan_apply_duration_ms = 0;
         let effective = match &setup {
             Ok(Some((_, effective, _, _, _, _))) => effective,
             _ => settings,
@@ -1602,50 +1614,54 @@ fn maintain_table(
             Ok(Some((discovered, effective, props, probe, _, pass_anchor))) => (|| {
                 let control = MaintenanceControl::new(Arc::clone(cancel), Some(started + effective.operation_timeout))
                     .with_commit_retry_limits(effective.commit_attempts, effective.commit_budget)?;
-                let token = probe.probe_log_token(settings.operation_limits.discovery_max_log_files)?;
-                if observed_token.as_ref().is_some_and(|previous| *previous != token)
-                    && !policy_matches(
-                        settings,
-                        &probe.maintenance_properties_with_limits(
-                            settings.operation_limits.discovery_max_log_files,
-                            settings.operation_limits.discovery_max_log_file_bytes,
-                        )?,
-                        props,
-                    )?
-                {
-                    bail!("table properties changed during the maintenance pass; retry discovery");
-                }
-                observed_token = Some(token);
-                let anchor = *pass_anchor;
-                let config = NegativeProbeConfig {
-                    now_ms: anchor,
-                    granularity: effective.granularity.context("effective partition granularity")?,
-                    purge_retention_ms: effective.purge_retention_ms.context("effective purge retention")?,
-                    vacuum_retention_ms: effective.vacuum_retention_ms,
-                    log_retention_ms: effective
-                        .log_retention_ms
-                        .unwrap_or(arrow_deltalake::maintenance::DEFAULT_LOG_RETENTION_MS),
-                    checkpoint_interval: effective.checkpoint_every_commits,
-                    optimize_small_file_bytes: effective.optimize.small_file_bytes,
-                    optimize_min_files: usize::try_from(props.unsigned("arrowcol.optimize.minFiles")?)?,
-                    sealed_partitions_only: !effective.optimize.sealed_final,
-                    max_listed_files: usize::try_from(props.unsigned("arrowcol.vacuum.maxListedFiles")?)?,
-                };
-                let probe_operation = match operation {
-                    Operation::Purge => ProbeOperation::Purge,
-                    Operation::Optimize => ProbeOperation::Optimize,
-                    Operation::Vacuum => ProbeOperation::Vacuum,
-                    Operation::Checkpoint => ProbeOperation::Checkpoint,
-                    Operation::PruneLog => ProbeOperation::PruneLog,
-                };
-                let full_validation = (operation == Operation::Optimize && effective.optimize.sealed_final)
-                    || (operation == Operation::Vacuum
-                        && effective.vacuum_retention_ms < arrow_deltalake::maintenance::MIN_VACUUM_RETENTION_MS)
-                    || (operation == Operation::PruneLog
-                        && effective.log_retention_ms.is_some_and(|retention| {
-                            retention < arrow_deltalake::maintenance::MIN_VACUUM_RETENTION_MS
-                        }));
-                if !full_validation {
+                let probe_started = Instant::now();
+                let probe_result = (|| -> Result<Option<MaintenanceReport>> {
+                    let token = probe.probe_log_token(settings.operation_limits.discovery_max_log_files)?;
+                    if observed_token.as_ref().is_some_and(|previous| *previous != token)
+                        && !policy_matches(
+                            settings,
+                            &probe.maintenance_properties_with_limits(
+                                settings.operation_limits.discovery_max_log_files,
+                                settings.operation_limits.discovery_max_log_file_bytes,
+                            )?,
+                            props,
+                        )?
+                    {
+                        bail!("table properties changed during the maintenance pass; retry discovery");
+                    }
+                    observed_token = Some(token);
+                    let anchor = *pass_anchor;
+                    let config = NegativeProbeConfig {
+                        now_ms: anchor,
+                        granularity: effective.granularity.context("effective partition granularity")?,
+                        purge_retention_ms: effective.purge_retention_ms.context("effective purge retention")?,
+                        vacuum_retention_ms: effective.vacuum_retention_ms,
+                        log_retention_ms: effective
+                            .log_retention_ms
+                            .unwrap_or(arrow_deltalake::maintenance::DEFAULT_LOG_RETENTION_MS),
+                        checkpoint_interval: effective.checkpoint_every_commits,
+                        optimize_small_file_bytes: effective.optimize.small_file_bytes,
+                        optimize_min_files: usize::try_from(props.unsigned("arrowcol.optimize.minFiles")?)?,
+                        sealed_partitions_only: !effective.optimize.sealed_final,
+                        max_listed_files: usize::try_from(props.unsigned("arrowcol.vacuum.maxListedFiles")?)?,
+                    };
+                    let probe_operation = match operation {
+                        Operation::Purge => ProbeOperation::Purge,
+                        Operation::Optimize => ProbeOperation::Optimize,
+                        Operation::Vacuum => ProbeOperation::Vacuum,
+                        Operation::Checkpoint => ProbeOperation::Checkpoint,
+                        Operation::PruneLog => ProbeOperation::PruneLog,
+                    };
+                    let full_validation = (operation == Operation::Optimize && effective.optimize.sealed_final)
+                        || (operation == Operation::Vacuum
+                            && effective.vacuum_retention_ms < arrow_deltalake::maintenance::MIN_VACUUM_RETENTION_MS)
+                        || (operation == Operation::PruneLog
+                            && effective.log_retention_ms.is_some_and(|retention| {
+                                retention < arrow_deltalake::maintenance::MIN_VACUUM_RETENTION_MS
+                            }));
+                    if full_validation {
+                        return Ok(None);
+                    }
                     let (report, stale) = negative_probe_result(probe.probe_no_work_with_inventory(
                         probe_operation,
                         &config,
@@ -1658,23 +1674,28 @@ fn maintain_table(
                             operation.label()
                         );
                     }
-                    if let Some(report) = report {
-                        negative_probe = true;
-                        return Ok(report);
-                    }
+                    Ok(report)
+                })();
+                probe_duration_ms = u64::try_from(probe_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                if let Some(report) = probe_result? {
+                    negative_probe = true;
+                    return Ok(report);
                 }
+                let planner_started = Instant::now();
                 if table.is_none() {
-                    table = Some(DeltaTable::open_for_maintenance(&discovered.url)?);
+                    table = Some(discovery.open_maintenance_table(&discovered.url)?);
                 }
                 inventory.invalidate();
-                run_operation(
+                let report = run_operation(
                     effective,
                     table.as_ref().context("maintenance table")?,
                     operation,
                     &control,
                     &mut optimize,
                     props,
-                )
+                );
+                plan_apply_duration_ms = u64::try_from(planner_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                report
             })(),
             Err(error) => Err(anyhow::anyhow!("discovery/configuration failed: {error:#}")),
             Ok(None) => unreachable!(),
@@ -1694,6 +1715,8 @@ fn maintain_table(
             error_kind: None,
             error: None,
             duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            probe_duration_ms,
+            plan_apply_duration_ms,
         };
         match outcome {
             Ok(report) => result.report = Some(report),
@@ -1769,6 +1792,8 @@ fn discovery_failure(settings: &Settings, error: anyhow::Error) -> OperationResu
         error_kind: Some("failure"),
         error: Some(format!("{error:#}")),
         duration_ms: 0,
+        probe_duration_ms: 0,
+        plan_apply_duration_ms: 0,
     }
 }
 
@@ -1950,6 +1975,8 @@ mod signal_cancellation_tests {
             error_kind,
             error: error_kind.map(|_| "operation failed".to_owned()),
             duration_ms: 0,
+            probe_duration_ms: 0,
+            plan_apply_duration_ms: 0,
         }
     }
 
