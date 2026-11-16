@@ -266,6 +266,7 @@ services:
       - ./observability/dashboards.yaml:/otel-lgtm/grafana/conf/provisioning/dashboards/arrowcol.yaml:ro
       - ./observability/arrowcol.json:/otel-lgtm/grafana/conf/provisioning/dashboards/arrowcol/arrowcol.json:ro
       - ./observability/delta-operations.json:/otel-lgtm/grafana/conf/provisioning/dashboards/arrowcol/delta-operations.json:ro
+      - ./observability/throughput-dashboard.json:/otel-lgtm/grafana/conf/provisioning/dashboards/arrowcol/throughput-dashboard.json:ro
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:3000/api/health"]
       interval: 5s
