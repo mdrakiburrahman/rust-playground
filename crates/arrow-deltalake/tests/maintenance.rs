@@ -167,8 +167,6 @@ fn compaction_debt_evidence_distinguishes_zero_from_bounded_backlog() -> Result<
 fn pass_inventory_bounds_counted_io_for_all_idle_operations() -> Result<()> {
     let root = tempfile::tempdir()?;
     let table = create(root.path())?;
-    append(&table, 0, 0..3)?;
-    append(&table, 1, 10..13)?;
     drop(table);
 
     let counts = Arc::new(StorageCounts::default());
@@ -186,11 +184,11 @@ fn pass_inventory_bounds_counted_io_for_all_idle_operations() -> Result<()> {
     counts.writes.store(0, Ordering::SeqCst);
 
     let config = NegativeProbeConfig {
-        now_ms: now_ms()?,
+        now_ms: BASE + 60 * MINUTE,
         granularity: Granularity::Minute,
-        purge_retention_ms: 10_000_000_000_000,
-        vacuum_retention_ms: 10_000_000_000_000,
-        log_retention_ms: 10_000_000_000_000,
+        purge_retention_ms: 2_592_000_000,
+        vacuum_retention_ms: 604_800_000,
+        log_retention_ms: 2_592_000_000,
         checkpoint_interval: 100,
         optimize_small_file_bytes: 64 * 1024 * 1024,
         optimize_min_files: 2,
@@ -216,19 +214,62 @@ fn pass_inventory_bounds_counted_io_for_all_idle_operations() -> Result<()> {
     assert_eq!(counts.writes.load(Ordering::SeqCst), 0);
     assert!(counts.lists.load(Ordering::SeqCst) <= 7, "bounded pass listings");
     assert!(counts.reads.load(Ordering::SeqCst) <= 12, "bounded pass reads");
+    Ok(())
+}
+
+#[test]
+fn pass_inventory_rechecks_time_based_vacuum_eligibility() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let table = create(root.path())?;
+    append(&table, 0, 0..3)?;
+    drop(table);
+
+    let counts = Arc::new(StorageCounts::default());
+    let store = Arc::new(UncertainStore {
+        inner: LocalFileSystem::new(),
+        target: "no-uncertain-commit-in-this-test".to_owned(),
+        unreadable: AtomicBool::new(false),
+        attempts: AtomicUsize::new(0),
+        read_barrier: None,
+        counts: Some(Arc::clone(&counts)),
+    });
+    let maintenance = DeltaTable::open_with_store(root.path(), Arc::clone(&store) as Arc<dyn ObjectStore>)?;
+    counts.reads.store(0, Ordering::SeqCst);
+    counts.lists.store(0, Ordering::SeqCst);
+    counts.writes.store(0, Ordering::SeqCst);
+
+    let anchor = now_ms()?;
+    let config = NegativeProbeConfig {
+        now_ms: anchor,
+        granularity: Granularity::Minute,
+        purge_retention_ms: 2_592_000_000,
+        vacuum_retention_ms: 604_800_000,
+        log_retention_ms: 2_592_000_000,
+        checkpoint_interval: 100,
+        optimize_small_file_bytes: 64 * 1024 * 1024,
+        optimize_min_files: 2,
+        sealed_partitions_only: false,
+        max_listed_files: 1000,
+    };
+    let mut inventory = PassProbeInventory::default();
+    assert!(
+        maintenance
+            .probe_no_work_with_inventory(ProbeOperation::Vacuum, &config, &control(), &mut inventory)?
+            .is_some(),
+        "recent files must be outside the retention window"
+    );
     let idle_lists = counts.lists.load(Ordering::SeqCst);
     let due_config = NegativeProbeConfig {
-        now_ms: now_ms()?
-            .checked_add(90 * 24 * 60 * 60 * 1000)
+        now_ms: anchor
+            .checked_add(8 * 24 * 60 * 60 * 1000)
             .context("due anchor overflow")?,
-        purge_retention_ms: 90 * 24 * 60 * 60 * 1000,
-        ..config.clone()
+        ..config
     };
     assert!(
         maintenance
-            .probe_no_work_with_inventory(ProbeOperation::Purge, &due_config, &control(), &mut inventory)?
+            .probe_no_work_with_inventory(ProbeOperation::Vacuum, &due_config, &control(), &mut inventory)?
             .is_none(),
-        "new pass anchor must recompute retention eligibility"
+        "new pass anchor must re-evaluate time-based retention"
     );
     assert!(
         counts.lists.load(Ordering::SeqCst) > idle_lists,
