@@ -88,6 +88,14 @@ export interface RunWorkloadStopReceipt {
   observed_at_unix_ms: number;
 }
 export interface RunCleanupAuthority { assertCurrent(): Promise<void> }
+export interface NamespaceDeletionIntent {
+  workload_record: RunFicRecord;
+  deletion: { apiVersion: 'v1'; kind: 'DeleteOptions'; preconditions: { uid: string } };
+}
+export interface NamespaceDeletionJournal {
+  load(): Promise<{ intent: NamespaceDeletionIntent; response: unknown | null; receipt?: RunWorkloadStopReceipt } | undefined>;
+  persist(intent: NamespaceDeletionIntent, response: unknown | null): Promise<void>;
+}
 
 export function assert_namespace_delete_response(value: unknown, record: RunFicRecord): void {
   const response = object(value, 'Namespace DELETE response');
@@ -104,7 +112,7 @@ export function assert_namespace_delete_response(value: unknown, record: RunFicR
 
 /** A successful exact-UID DELETE response, not listing absence, is required to mint this receipt. */
 export async function delete_run_namespace(azure: Azure, input: RunFicRecord, receiptPath: string,
-  authority: RunCleanupAuthority): Promise<RunWorkloadStopReceipt> {
+  authority: RunCleanupAuthority, journal?: NamespaceDeletionJournal): Promise<RunWorkloadStopReceipt> {
   const record = parse_run_fic_record(input, azure.c);
   return reset_lock(receiptPath, async () => {
     await authority.assertCurrent();
@@ -113,10 +121,22 @@ export async function delete_run_namespace(azure: Azure, input: RunFicRecord, re
     owned(cluster, azure.c);
     const intentPath = receiptPath + '.delete-intent';
     const responsePath = receiptPath + '.delete-response';
-    const deletion = { apiVersion: 'v1', kind: 'DeleteOptions', preconditions: { uid: record.namespaceUid } };
-    const intent = { workload_record: record, deletion };
+    const deletion = { apiVersion: 'v1' as const, kind: 'DeleteOptions' as const, preconditions: { uid: record.namespaceUid } };
+    const intent: NamespaceDeletionIntent = { workload_record: record, deletion };
+    const recovered = await journal?.load();
+    if (recovered) {
+      if (canonical_json(recovered.intent) !== canonical_json(intent)) throw new Failure('Durable namespace deletion identity differs.');
+      for (const [filename, value] of [[intentPath, recovered.intent], [responsePath, recovered.response],
+        [receiptPath, recovered.receipt ?? null]] as const) {
+        if (value === null) continue;
+        if (fs.existsSync(filename)) {
+          if (canonical_json(private_run_fic_json(filename)) !== canonical_json(value))
+            throw new Failure('Local namespace deletion proof differs from durable custody.');
+        } else publish_private(filename, value);
+      }
+    }
     if (fs.existsSync(intentPath)) {
-      if (canonical_json(JSON.parse(fs.readFileSync(intentPath, 'utf8'))) !== canonical_json(intent))
+      if (canonical_json(private_run_fic_json(intentPath)) !== canonical_json(intent))
         throw new Failure('Namespace delete intent belongs to another identity.');
       if (!fs.existsSync(responsePath)) throw new Failure('Namespace DELETE outcome is unknown; absence cannot prove deletion.');
     } else {
@@ -130,18 +150,21 @@ export async function delete_run_namespace(azure: Azure, input: RunFicRecord, re
       const requestPath = receiptPath + '.delete-options';
       publish_private(requestPath, deletion);
       publish_private(intentPath, intent);
+      await journal?.persist(intent, null);
       await authority.assertCurrent();
       const response = await kubectl(record, ['delete', '--raw', '/api/v1/namespaces/' + record.namespace, '-f', requestPath]);
       let value: unknown;
       try { value = JSON.parse(response); } catch { throw new Failure('Namespace DELETE lacks a typed response; outcome uncertain.'); }
       publish_private(responsePath, value);
     }
-    assert_namespace_delete_response(JSON.parse(fs.readFileSync(responsePath, 'utf8')) as unknown, record);
+    const response = private_run_fic_json(responsePath);
+    assert_namespace_delete_response(response, record);
+    await journal?.persist(intent, response);
     await authority.assertCurrent();
     const remaining = await kubectl(record, ['get', 'namespace', record.namespace, '--ignore-not-found', '--output', 'name']);
     if (remaining) throw new Failure('Original namespace deletion is still pending; receipt not complete.');
     if (fs.existsSync(receiptPath)) {
-      const prior: RunWorkloadStopReceipt = JSON.parse(fs.readFileSync(receiptPath, 'utf8'));
+      const prior = private_run_fic_json(receiptPath) as RunWorkloadStopReceipt;
       if (canonical_json(prior.workload_record) !== canonical_json(record) ||
           canonical_json(prior) !== canonical_json(stopReceipt(record, prior.observed_at_unix_ms)))
         throw new Failure('Existing workload stop receipt changed.');
@@ -189,6 +212,13 @@ function https_url(value: string, label: string): URL {
   if (url.protocol !== 'https:' || !url.hostname || url.username || url.password || url.search || url.hash)
     throw new Failure(`${label} must be an HTTPS URL without credentials, query, or fragment.`);
   return url;
+}
+export function private_run_fic_json(filename: string, maxBytes = 65_536): unknown {
+  const stat = fs.lstatSync(filename);
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.size > maxBytes || (stat.mode & 0o077) !== 0)
+    throw new Failure('Run helper input must be a bounded private regular file, not a symlink.');
+  try { return JSON.parse(fs.readFileSync(filename, 'utf8')) as unknown; }
+  catch { throw new Failure('Run helper input is not readable JSON.'); }
 }
 export function parse_run_fic_record(value: unknown, c: Config): RunFicRecord {
   if (c.mode !== 'stamped') throw new Failure('Run FIC helpers require stamped infrastructure.');
@@ -812,14 +842,39 @@ export async function prepare_run_fic(azure: Azure, runId: string, namespace: st
   });
   console.log('Run FIC ready with definitive creation receipt and exact identity; token probe is still required.');
 }
-export async function cleanup_run_fic(azure: Azure, runId: string, recordPath: string): Promise<void> {
+export async function recover_run_fic_record(azure: Azure, original: RunFicRecord, recordPath: string,
+  authority: RunCleanupAuthority): Promise<void> {
+  await authority.assertCurrent();
+  const expected = parse_run_fic_record(original, azure.c), snapshot = await read_ledger(azure);
+  const entry = snapshot?.value.entries[expected.runId];
+  if (!snapshot || snapshot.value.transaction?.phase !== 'complete' || !entry ||
+      !['ready', 'deleted'].includes(entry.record.phase) ||
+      canonical_json({ ...entry.record, phase: expected.phase }) !== canonical_json(expected))
+    throw new Failure('Run FIC recovery requires the original completed shared ownership record.');
+  assert_owned_entry(entry, entry.record);
+  await reset_lock(recordPath, async () => {
+    await authority.assertCurrent();
+    if (fs.existsSync(recordPath)) {
+      if (canonical_json(read_run_fic_record(recordPath, azure.c)) !== canonical_json(entry.record))
+        throw new Failure('Local FIC recovery target differs from durable custody.');
+    } else publish_private(recordPath, entry.record);
+  });
+}
+export async function cleanup_run_fic(azure: Azure, runId: string, recordPath: string,
+  authority?: RunCleanupAuthority): Promise<void> {
   uuid(runId);
   await reset_lock(recordPath, async () => {
+    await authority?.assertCurrent();
     const record = read_run_fic_record(recordPath, azure.c), snapshot = await read_ledger(azure);
     if (record.runId !== runId || snapshot?.value.transaction?.phase !== 'complete')
       throw new Failure('Run FIC custody is unresolved or belongs to a different run.');
     assert_owned_entry(snapshot.value.entries[runId], record);
-    if (record.phase === 'deleted') return;
+    if (record.phase === 'deleted') {
+      if (await azure.arm('GET', record.identityId + '/federatedIdentityCredentials/' + record.credentialName,
+        undefined, true, ARM_API) !== null)
+        throw new Failure('A credential exists after confirmed cleanup; never delete a successor or claim it absent.');
+      return;
+    }
     if (record.phase !== 'ready') throw new Failure('Run FIC cleanup never replays an interrupted mutation.');
     await verify_run_resources(azure, record);
     const namespace = await kubectl(record, ['get', 'namespace', record.namespace, '--ignore-not-found', '--output', 'name']);
@@ -832,6 +887,7 @@ export async function cleanup_run_fic(azure: Azure, runId: string, recordPath: s
       await save();
       publish_private(recordPath, entry.record, record);
       publish_private(recordPath + '.delete-intent.json', { record: entry.record, intent: entry.deleteIntent });
+      await authority?.assertCurrent();
       const receipt = await arm_mutation(azure, record, 'delete', entry.deleteIntent, recordPath);
       if (![200, 204].includes(receipt.status)) throw new Failure('Run FIC deletion is not definitive; retain custody.');
       const postcondition = await arm_postcondition(azure, record, 'delete', recordPath);
@@ -839,9 +895,11 @@ export async function cleanup_run_fic(azure: Azure, runId: string, recordPath: s
       entry.deleteReceipt = receipt;
       entry.deletePostcondition = postcondition;
       entry.record = { ...record, phase: 'deleted' };
+      await authority?.assertCurrent();
       await save();
       publish_private(recordPath, entry.record, previous);
     }, async ledger => {
+      await authority?.assertCurrent();
       const entry = ledger?.entries[runId];
       if (!entry || canonical_json(entry.record) !== canonical_json(record))
         throw new AdmissionRejected('drift', 'Cleanup authority changed before admission; no deletion.');

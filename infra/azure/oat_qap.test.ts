@@ -8,7 +8,10 @@ import { Azure, Config, TAGS, canonical_json, runtime, type HttpReceipt } from '
 import { managementRows, parseKustoQueryResult, parseQualifiedDeltaDefinition,
   assertExactConnectionStrings, validateExternalMutationReceipt,
   cleanup_oat_qap, delete_oat_qap_workload, oat_qap_reference, parse_oat_qap_record, recover_oat_qap_record, recover_oat_workload_stop,
-  validate_oat_workload_stop, validate_experiment_database_resource, validate_oat_manifest, type RecordV1 } from './oat_qap.js';
+  read_oat_qap_reference, validate_oat_workload_stop, validate_experiment_database_resource, validate_oat_manifest, type RecordV1 } from './oat_qap.js';
+import { private_run_fic_json } from './run_fic.js';
+import { createOwnedRunCleanupActions } from '../../projects/arrowcol-oat/aks-cleanup-executor.js';
+import { newCampaignState, type CampaignState, type CampaignStore } from '../../projects/arrowcol-oat/aks-campaign.js';
 
 const id = '22222222-2222-4222-8222-222222222222';
 const run = '9dcd6847-2a56-45a3-bd3c-54af839f451e';
@@ -95,6 +98,21 @@ function recoveryFixture(t: TestContext) {
   return { azure, c, record, reference, shared, blobs, writes, directory };
 }
 
+function ownedActionsFor(f: ReturnType<typeof recoveryFixture>) {
+  const step = { state: 'not_started' as const, deadline_unix_ms: null, reason_code: null };
+  const state: CampaignState = { ...newCampaignState(id, run), status: 'cleaning', fencingToken: 2,
+    runInventory: { schema_version: 1, campaign_id: id, owner_id: f.record.workload.namespaceOwner, fencing_token: 1,
+      orchestration_run_id: id, cell_run_id: run,
+      namespace: { name: f.record.workload.namespace, uid: f.record.workload.namespaceUid, owner_token: f.record.workload.namespaceOwner },
+      resources: [], fic: null, qap: { database: f.c.experimentDatabase, bindings: f.record.manifest.tables,
+        state: 'observed', absence: [] },
+      cleanup: { stop_admission: step, bounded_drain: step, evidence_capture: step, terminal_capture: step, handoff: step } } };
+  const store: CampaignStore = { read: async () => ({ state: structuredClone(state), etag: '"1"' }),
+    write: async () => { throw new Error('Unexpected campaign write by provider actions'); } };
+  const authority = { campaignId: id, ownerId: run, fencingToken: 2, assertCurrent: async () => {} };
+  return { state, authority, actions: createOwnedRunCleanupActions(store, f.azure, f.reference, f.directory) };
+}
+
 test('durable QAP recovery retains the original full record and rejects changed identity or uncertain lease', async t => {
   const f = recoveryFixture(t), recordPath = path.join(f.directory, 'recovered.json');
   await recover_oat_qap_record(f.azure, f.reference, recordPath);
@@ -126,17 +144,22 @@ test('verified namespace deletion publishes recoverable durable stop proof witho
       annotations: { 'arrowcol-oat/run-id': run, 'arrowcol-oat/owner-token': original.namespaceOwner },
     } }), stderr: '' };
   });
-  const authority = { assertCurrent: async () => {} };
-  await delete_oat_qap_workload(f.azure, f.reference, recordPath, stopPath, authority);
+  const owned = ownedActionsFor(f), authority = owned.authority;
+  await owned.actions.deleteNamespaceIfUidAndOwnerMatch(owned.state.runInventory!.namespace, 'remove-namespace', authority);
+  await recover_oat_workload_stop(f.azure, f.reference, stopPath);
   const recoveredPath = path.join(f.directory, 'recovered-stop.json');
   await recover_oat_workload_stop(f.azure, f.reference, recoveredPath);
   assert.deepEqual(JSON.parse(fs.readFileSync(recoveredPath, 'utf8')), JSON.parse(fs.readFileSync(stopPath, 'utf8')));
   await delete_oat_qap_workload(f.azure, f.reference, recordPath, stopPath, authority);
   assert.equal(deletes, 1);
-  assert.deepEqual(f.writes, [f.reference.blob.replace('_arrowcol-oat-qap-custody.json', '_arrowcol-oat-workload-stop.json')]);
+  assert.deepEqual(f.writes, Array(3).fill(f.reference.blob.replace('_arrowcol-oat-qap-custody.json', '_arrowcol-oat-workload-stop.json')));
+  owned.state.fencingToken++;
+  await assert.rejects(owned.actions.deleteNamespaceIfUidAndOwnerMatch(owned.state.runInventory!.namespace, 'remove-namespace', authority),
+    /current cleaning actor/);
+  assert.equal(deletes, 1);
 });
 
-test('fenced recovery reuses original QAP cleanup under the held root lease and remains idempotent', async t => {
+for (const restart of [false, true]) test(`fenced QAP cleanup ${restart ? 'recovers after the final confirmed drop before completion' : 'retains held lease and is idempotent'}`, async t => {
   const f = recoveryFixture(t), recordPath = path.join(f.directory, 'recovered.json'), stopPath = path.join(f.directory, 'stop.json');
   f.shared.lease.stage = 'held';
   await recover_oat_qap_record(f.azure, f.reference, recordPath);
@@ -145,6 +168,13 @@ test('fenced recovery reuses original QAP cleanup under the held root lease and 
     namespace: original.namespace, namespace_uid: original.namespaceUid, namespace_run_id: run,
     namespace_owner_token: original.namespaceOwner, aks_id: original.aksId, kubectl_server: original.server,
     delete_succeeded: true, absence_confirmed: true, observed_at_unix_ms: Date.now() }), { mode: 0o600 });
+  f.blobs.set(f.reference.blob.replace('_arrowcol-oat-qap-custody.json', '_arrowcol-oat-workload-stop.json'), {
+    schema_version: 1, phase: 'complete', reference: f.reference, receipt: JSON.parse(fs.readFileSync(stopPath, 'utf8')),
+    deletion: { intent: { workload_record: original,
+      deletion: { apiVersion: 'v1', kind: 'DeleteOptions', preconditions: { uid: original.namespaceUid } } },
+      response: { kind: 'Namespace', metadata: { name: original.namespace, uid: original.namespaceUid,
+        deletionTimestamp: new Date().toISOString() } } },
+  });
   const tags = { ...TAGS, sandboxId: f.c.sandbox };
   t.mock.method(f.azure, 'arm', async (_method: string, id: string) => {
     if (id === f.c.storage_id) return { tags, name: f.c.account, properties: { isHnsEnabled: true } };
@@ -189,9 +219,35 @@ test('fenced recovery reuses original QAP cleanup under the held root lease and 
   await assert.rejects(cleanup_oat_qap(f.azure, recordPath, stopPath, authority), /stale cleanup actor/);
   assert.equal(mutations, 0);
   fenced = false;
-  await cleanup_oat_qap(f.azure, recordPath, stopPath, authority);
-  assert.equal(JSON.parse(fs.readFileSync(recordPath, 'utf8')).state, 'cleaned');
-  await cleanup_oat_qap(f.azure, recordPath, stopPath, authority);
+  if (restart) {
+    const blob = f.azure.blob.bind(f.azure);
+    let crash = true;
+    t.mock.method(f.azure, 'blob', async (...args: Parameters<Azure['blob']>) => {
+      if (crash && args[0] === 'PUT' && args[2] === f.reference.blob &&
+          JSON.parse(String(args[4])).custody.state === 'cleaned') throw new Error('lost controller before cleaned publication');
+      return blob(...args);
+    });
+    await assert.rejects(cleanup_oat_qap(f.azure, recordPath, stopPath, authority), /Shared metadata outcome is ambiguous/);
+    const shared = f.blobs.get(f.reference.blob) as { custody: RecordV1 };
+    assert.equal(shared.custody.state, 'cleaning');
+    assert.equal(shared.custody.intent, null);
+    assert.equal(shared.custody.entries[0].state, 'dropped');
+    const resumedPath = path.join(f.directory, 'another-host.json');
+    await assert.rejects(recover_oat_qap_record(f.azure, f.reference, resumedPath), /mutation outcome is unresolved/);
+    await recover_oat_qap_record(f.azure, f.reference, resumedPath, authority);
+    const invalid = structuredClone(shared.custody);
+    invalid.receipts = invalid.receipts.filter(item => item.operation !== 'drop');
+    assert.throws(() => parse_oat_qap_record(f.azure, invalid), /original definitive mutation/);
+    crash = false;
+    await cleanup_oat_qap(f.azure, resumedPath, stopPath, authority);
+    assert.equal(JSON.parse(fs.readFileSync(resumedPath, 'utf8')).state, 'cleaned');
+    assert.equal(mutations, 1);
+    return;
+  }
+  const owned = ownedActionsFor(f), binding = f.record.manifest.tables[0];
+  await owned.actions.deleteQapBindingIfOwned(f.c.experimentDatabase, binding, id, 'remove-qap', owned.authority);
+  assert.equal((f.blobs.get(f.reference.blob) as { custody: RecordV1 }).custody.state, 'cleaned');
+  await owned.actions.deleteQapBindingIfOwned(f.c.experimentDatabase, binding, id, 'remove-qap', owned.authority);
   assert.equal(mutations, 1);
 });
 
@@ -209,7 +265,7 @@ test('durable stop recovery requires a matching UID-guarded positive deletion, n
     namespace_uid: original.namespaceUid, namespace_run_id: run, namespace_owner_token: original.namespaceOwner,
     aks_id: original.aksId, kubectl_server: original.server, delete_succeeded: true, absence_confirmed: true,
     observed_at_unix_ms: Date.now() };
-  const stop = { schema_version: 1, reference: f.reference, receipt, deletion: {
+  const stop = { schema_version: 1, phase: 'complete', reference: f.reference, receipt, deletion: {
     intent: { workload_record: original, deletion: { apiVersion: 'v1', kind: 'DeleteOptions', preconditions: { uid: original.namespaceUid } } },
     response: { kind: 'Namespace', metadata: { name: original.namespace, uid: original.namespaceUid, deletionTimestamp: new Date().toISOString() } },
   } };
@@ -221,6 +277,68 @@ test('durable stop recovery requires a matching UID-guarded positive deletion, n
   stop.deletion.response.metadata.uid = run;
   await assert.rejects(recover_oat_workload_stop(f.azure, f.reference, stopPath), /affirm the original UID/);
   assert.throws(() => validate_oat_workload_stop(f.record, { ...receipt, delete_succeeded: false }), /not affirmative/);
+});
+
+test('namespace deletion response survives controller restart before confirmed absence; intent alone never replays DELETE', async t => {
+  const f = recoveryFixture(t), recordPath = path.join(f.directory, 'qap.json'), stopPath = path.join(f.directory, 'stop.json');
+  await recover_oat_qap_record(f.azure, f.reference, recordPath);
+  const original = f.record.workload;
+  t.mock.method(f.azure, 'arm', async () => ({ tags: { ...TAGS, sandboxId: f.c.sandbox },
+    properties: { fqdn: new URL(original.server).hostname } }));
+  let deletes = 0, pending = true;
+  t.mock.method(runtime, 'run_tree', async (args: string[]) => {
+    if (args.includes('--raw')) {
+      deletes++;
+      const saved = f.blobs.get(f.reference.blob.replace('_arrowcol-oat-qap-custody.json', '_arrowcol-oat-workload-stop.json')) as { phase: string };
+      assert.equal(saved.phase, 'intent');
+      return { returncode: 0, stdout: JSON.stringify({ kind: 'Namespace',
+        metadata: { name: original.namespace, uid: original.namespaceUid, deletionTimestamp: new Date().toISOString() } }), stderr: '' };
+    }
+    if (args.includes('--ignore-not-found')) {
+      if (pending) throw new Error('lost watchdog before absence');
+      return { returncode: 0, stdout: '', stderr: '' };
+    }
+    return { returncode: 0, stdout: JSON.stringify({ metadata: { name: original.namespace, uid: original.namespaceUid,
+      labels: { 'arrowcol-oat/run-id': run, 'arrowcol-oat/owner-token': original.namespaceOwner },
+      annotations: { 'arrowcol-oat/run-id': run, 'arrowcol-oat/owner-token': original.namespaceOwner },
+    } }), stderr: '' };
+  });
+  const authority = { assertCurrent: async () => {} };
+  await assert.rejects(delete_oat_qap_workload(f.azure, f.reference, recordPath, stopPath, authority), /lost watchdog/);
+  const stopBlob = f.reference.blob.replace('_arrowcol-oat-qap-custody.json', '_arrowcol-oat-workload-stop.json');
+  const responded = structuredClone(f.blobs.get(stopBlob)) as { phase: string; receipt: unknown; deletion: { response: unknown } };
+  assert.equal(responded.phase, 'responded');
+  assert.equal(responded.receipt, null);
+  const resumedStop = path.join(f.directory, 'another-host-stop.json');
+  await assert.rejects(recover_oat_workload_stop(f.azure, f.reference, resumedStop), /absence is not confirmed/);
+  const intentOnly = { ...responded, phase: 'intent', deletion: { ...responded.deletion, response: null } };
+  f.blobs.set(stopBlob, intentOnly);
+  await assert.rejects(delete_oat_qap_workload(f.azure, f.reference, recordPath,
+    path.join(f.directory, 'unknown-delete-stop.json'), authority), /outcome is unknown/);
+  assert.equal(deletes, 1);
+  f.blobs.set(stopBlob, responded);
+  pending = false;
+  await delete_oat_qap_workload(f.azure, f.reference, recordPath, resumedStop, authority);
+  assert.equal(deletes, 1);
+  await recover_oat_workload_stop(f.azure, f.reference, path.join(f.directory, 'confirmed-stop.json'));
+});
+
+test('CLI identity-plan and QAP-reference reads reject public, oversized and symlink inputs', t => {
+  const f = recoveryFixture(t), filename = path.join(f.directory, 'input.json');
+  for (const read of [read_oat_qap_reference, private_run_fic_json]) {
+    fs.writeFileSync(filename, JSON.stringify(f.reference), { mode: 0o600 });
+    fs.chmodSync(filename, 0o600);
+    assert.deepEqual(read(filename), f.reference);
+    fs.chmodSync(filename, 0o644);
+    assert.throws(() => read(filename), /private regular file/);
+    fs.chmodSync(filename, 0o600);
+    fs.writeFileSync(filename, ' '.repeat(4 * 1024 * 1024 + 1));
+    assert.throws(() => read(filename), /bounded private/);
+    const link = filename + '.link';
+    fs.symlinkSync(filename, link);
+    assert.throws(() => read(link), /private regular file/);
+    fs.unlinkSync(link);
+  }
 });
 
 const deltaProperties = {

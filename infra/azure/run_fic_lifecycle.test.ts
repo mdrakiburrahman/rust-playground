@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, mock, test, type TestContext } from 'node:test';
 import { Azure, Config, Failure, HttpFailure, TAGS, runtime, type HttpReceipt } from './bootstrap.js';
-import { assert_run_fic_plan, cleanup_run_fic, delete_run_namespace, plan_run_fic, prepare_run_fic, read_run_fic_record, run_fic_ledger_path } from './run_fic.js';
+import { assert_run_fic_plan, cleanup_run_fic, delete_run_namespace, plan_run_fic, prepare_run_fic, read_run_fic_record, recover_run_fic_record, run_fic_ledger_path } from './run_fic.js';
 
 const id = '00000000-0000-0000-0000-000000000001';
 const runId = '9dcd6847-2a56-45a3-bd3c-54af839f451e';
@@ -258,6 +258,44 @@ test('create and cleanup keep definitive receipts and preserve unrelated/native 
   assert.ok(fs.existsSync(f.recordPath + '.create-receipt.json'));
   assert.ok(fs.existsSync(f.recordPath + '.delete-receipt.json'));
   assert.deepEqual(await f.azure.collection(f.c.identity_id + '/federatedIdentityCredentials'), [f.native, f.unrelated]);
+});
+test('controller FIC recovery retains original ledger proof, rejects stale authority and reuses a completed delete', async t => {
+  const f = fixture(t);
+  await prepare_run_fic(f.azure, runId, namespace, serviceAccount, f.recordPath);
+  const original = read_run_fic_record(f.recordPath, f.c);
+  let stale = true;
+  const authority = { assertCurrent: async () => { if (stale) throw new Error('stale cleanup token'); } };
+  const recovered = path.join(path.dirname(f.recordPath), 'recovered.json');
+  await assert.rejects(recover_run_fic_record(f.azure, original, recovered, authority), /stale cleanup token/);
+  assert.equal(fs.existsSync(recovered), false);
+  stale = false;
+  await recover_run_fic_record(f.azure, original, recovered, authority);
+  assert.deepEqual(read_run_fic_record(recovered, f.c), original);
+  f.state.absentNamespaces.add(namespace);
+  stale = true;
+  await assert.rejects(cleanup_run_fic(f.azure, runId, recovered, authority), /stale cleanup token/);
+  assert.deepEqual(f.state.mutations, ['PUT']);
+  stale = false;
+  await cleanup_run_fic(f.azure, runId, recovered, authority);
+  const anotherHost = path.join(path.dirname(f.recordPath), 'after-delete.json');
+  await recover_run_fic_record(f.azure, original, anotherHost, authority);
+  assert.equal(read_run_fic_record(anotherHost, f.c).phase, 'deleted');
+  await cleanup_run_fic(f.azure, runId, anotherHost, authority);
+  assert.deepEqual(f.state.mutations, ['PUT', 'DELETE']);
+  f.state.credentials.set(runId, { id: original.identityId + '/federatedIdentityCredentials/' + original.credentialName });
+  await assert.rejects(cleanup_run_fic(f.azure, runId, anotherHost, authority), /never delete a successor/);
+  assert.deepEqual(f.state.mutations, ['PUT', 'DELETE']);
+});
+test('controller FIC deletion rechecks authority after durable intent and before ARM DELETE', async t => {
+  const f = fixture(t);
+  await prepare_run_fic(f.azure, runId, namespace, serviceAccount, f.recordPath);
+  f.state.absentNamespaces.add(namespace);
+  const authority = { assertCurrent: async () => {
+    if (fs.existsSync(f.recordPath + '.delete-intent.json')) throw new Error('actor replaced after intent');
+  } };
+  await assert.rejects(cleanup_run_fic(f.azure, runId, f.recordPath, authority), /actor replaced after intent/);
+  assert.deepEqual(f.state.mutations, ['PUT']);
+  assert.equal(read_run_fic_record(f.recordPath, f.c).phase, 'delete-submitted');
 });
 test('an ambiguous lease acquisition reserves the ledger without admitting an ARM request', async t => {
   const f = fixture(t); f.state.ambiguousAcquire = true;

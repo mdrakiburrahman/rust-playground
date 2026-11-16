@@ -91,3 +91,25 @@ test('external executor invokes safe-idle restoration exactly once under the cle
   assert.equal(result, 'progress');
   assert.equal(restoreCalls, 1);
 });
+
+test('external executor mutation authority rereads the current cleanup token instead of trusting captured state', async () => {
+  const store = await armedStore();
+  await reconcileOnce(store, 1_000_000 + 3 * 60_000);
+  let effects = 0;
+  const complete = async () => 'complete' as const;
+  const actions: ExternalCleanupActions = {
+    discoverExactInventory: async inventory => inventory,
+    stopAdmission: async (_inventory, _deadline, _key, authority) => {
+      store.current!.state.fencingToken++;
+      await authority.assertCurrent();
+      effects++;
+      return 'complete';
+    },
+    boundedDrain: complete, preserveEvidence: complete, stopMaintenanceIfUidAndOwnerMatch: complete,
+    captureTerminalState: complete, deleteNamespaceIfUidAndOwnerMatch: complete, deleteQapBindingIfOwned: complete,
+    deleteFicIfExact: complete, restoreSafeIdle: complete, verifySafeIdle: complete,
+  };
+  await assert.rejects(reconcileCleanupOnce(store, createExternalCleanupExecutor(store, actions)), /fencing changed/);
+  assert.equal(effects, 0);
+  assert.equal(store.current!.state.runInventory!.fencing_token, 1);
+});

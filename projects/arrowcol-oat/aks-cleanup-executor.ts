@@ -1,3 +1,9 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import { canonical_json, type Azure } from '../../infra/azure/bootstrap.js';
+import { cleanup_run_fic, recover_run_fic_record } from '../../infra/azure/run_fic.js';
+import { cleanup_oat_qap, delete_oat_qap_workload, recover_oat_qap_record, recover_oat_workload_stop,
+  parse_oat_qap_reference, type OatQapReference, type RecordV1 } from '../../infra/azure/oat_qap.js';
 import { publishCleanupRunInventory, type CampaignState, type CampaignStore, type InventoryStep, type RunInventory, type RunInventoryResource } from './aks-campaign.js';
 import type { CleanupExecutor } from './aks-reconcile.js';
 
@@ -47,6 +53,70 @@ function stepField(step: string): keyof RunInventory['cleanup'] | undefined {
   }
 }
 
+export type OwnedRunCleanupActions = Pick<ExternalCleanupActions,
+  'deleteNamespaceIfUidAndOwnerMatch' | 'deleteQapBindingIfOwned' | 'deleteFicIfExact'>;
+
+export function createOwnedRunCleanupActions(store: CampaignStore, azure: Azure, inputReference: OatQapReference,
+  workDirectory: string): OwnedRunCleanupActions {
+  const reference = parse_oat_qap_reference(inputReference);
+  const fresh = async (authority: CleanupMutationAuthority): Promise<RunInventory> => {
+    await authority.assertCurrent();
+    const stored = await store.read(), state = stored?.state, inventory = state?.runInventory;
+    if (!state || state.status !== 'cleaning' || state.campaignId !== authority.campaignId ||
+        state.ownerId !== authority.ownerId || state.fencingToken !== authority.fencingToken || !inventory ||
+        inventory.campaign_id !== authority.campaignId || inventory.cell_run_id !== reference.run_id ||
+        inventory.namespace.uid !== reference.namespace_uid || inventory.namespace.owner_token !== reference.namespace_owner_token)
+      throw new Error('Owned cleanup reference does not match the current cleaning actor and immutable run origin.');
+    return inventory;
+  };
+  const run = async (authority: CleanupMutationAuthority,
+    work: (inventory: RunInventory, record: RecordV1, directory: string, guarded: CleanupMutationAuthority) => Promise<void>): Promise<'complete'> => {
+    await fresh(authority);
+    const stat = fs.lstatSync(workDirectory);
+    if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0)
+      throw new Error('Cleanup working directory must be a private directory, not a symlink.');
+    const directory = fs.mkdtempSync(path.join(workDirectory, 'owned-cleanup-'));
+    const guarded = { ...authority, assertCurrent: async () => { await fresh(authority); } };
+    const record = await recover_oat_qap_record(azure, reference, path.join(directory, 'qap.json'), guarded);
+    const inventory = await fresh(authority);
+    const bindings = inventory.qap?.bindings.map(item => item.external_table + '|' + item.relative_path).sort();
+    const expected = record.manifest.tables.map(item => item.external_table + '|' + item.relative_path).sort();
+    if (inventory.namespace.name !== record.workload.namespace || inventory.qap?.database !== record.environment.database ||
+        canonical_json(bindings) !== canonical_json(expected))
+      throw new Error('Inventory bindings differ from the original full QAP ownership snapshot.');
+    await work(inventory, record, directory, guarded);
+    await guarded.assertCurrent();
+    fs.rmSync(directory, { recursive: true });
+    return 'complete';
+  };
+  return {
+    deleteNamespaceIfUidAndOwnerMatch: (namespace, _key, authority) => run(authority, async (inventory, _record, directory, guarded) => {
+      if (canonical_json(namespace) !== canonical_json(inventory.namespace)) throw new Error('Namespace cleanup identity changed.');
+      await delete_oat_qap_workload(azure, reference, path.join(directory, 'qap.json'), path.join(directory, 'stop.json'), guarded);
+    }),
+    deleteQapBindingIfOwned: (database, binding, campaignId, _key, authority) =>
+      run(authority, async (inventory, _record, directory, guarded) => {
+        if (campaignId !== inventory.campaign_id || database !== inventory.qap?.database ||
+            !inventory.qap.bindings.some(item => canonical_json(item) === canonical_json(binding)))
+          throw new Error('QAP cleanup requested a binding outside the exact original run.');
+        const stopPath = path.join(directory, 'stop.json');
+        await recover_oat_workload_stop(azure, reference, stopPath, guarded);
+        await cleanup_oat_qap(azure, path.join(directory, 'qap.json'), stopPath, guarded);
+      }),
+    deleteFicIfExact: (fic, campaignId, _key, authority) =>
+      run(authority, async (inventory, record, directory, guarded) => {
+        const resourceId = record.workload.identityId + '/federatedIdentityCredentials/' + record.workload.credentialName;
+        if (campaignId !== inventory.campaign_id || canonical_json(fic) !== canonical_json(inventory.fic) ||
+            fic.resource_id !== resourceId || fic.name !== record.workload.credentialName)
+          throw new Error('FIC cleanup requested a different original trust identity.');
+        await recover_oat_workload_stop(azure, reference, path.join(directory, 'stop.json'), guarded);
+        const ficPath = path.join(directory, 'fic.json');
+        await recover_run_fic_record(azure, record.workload, ficPath, guarded);
+        await cleanup_run_fic(azure, reference.run_id, ficPath, guarded);
+      }),
+  };
+}
+
 export function createExternalCleanupExecutor(store: CampaignStore, actions: ExternalCleanupActions): CleanupExecutor {
   return async (step, suppliedState, idempotencyKey) => {
     if (suppliedState.status !== 'cleaning' || !suppliedState.runInventory ||
@@ -61,7 +131,10 @@ export function createExternalCleanupExecutor(store: CampaignStore, actions: Ext
       if (!current || current.state.status !== 'cleaning' || current.state.campaignId !== campaignId ||
           current.state.ownerId !== ownerId || current.state.fencingToken !== fencingToken || !current.state.runInventory ||
           current.state.runInventory.owner_id !== suppliedState.runInventory!.owner_id ||
-          current.state.runInventory.fencing_token !== suppliedState.runInventory!.fencing_token) {
+          current.state.runInventory.fencing_token !== suppliedState.runInventory!.fencing_token ||
+          current.state.runInventory.cell_run_id !== suppliedState.runInventory!.cell_run_id ||
+          current.state.runInventory.orchestration_run_id !== suppliedState.runInventory!.orchestration_run_id ||
+          !current.state.cleanupSteps.some(receipt => receipt.step === step && receipt.idempotencyKey === idempotencyKey && receipt.status === 'running')) {
         throw new Error('Cleanup controller fencing changed before the mutation gate.');
       }
     };
