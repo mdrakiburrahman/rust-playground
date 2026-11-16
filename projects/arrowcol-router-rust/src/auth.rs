@@ -31,6 +31,8 @@ pub const INTERNAL_AUTH_SIGNATURE_HEADER: &str = "x-arrowcol-internal-auth-signa
 const MAX_NONCE_BYTES: usize = 64;
 const MAX_REPLAY_NONCES: usize = 65_536;
 const MAX_SIGNATURE_BYTES: usize = 128;
+const CLIENT_SEND_OBSERVATION_ID_HEADER: &str = "x-arrowcol-client-observation-id";
+const CLIENT_SEND_UNIX_NS_HEADER: &str = "x-arrowcol-client-send-unix-ns";
 const MAX_INTERNAL_CONTEXT_BYTES: usize = 3_072;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -401,7 +403,7 @@ fn canonical_edge_request(
     timestamp: UnixMillis,
     nonce: &str,
 ) -> Result<String, AuthFailure> {
-    const SIGNED_HEADERS: [&str; 9] = [
+    const SIGNED_HEADERS: [&str; 11] = [
         "x-arrowcol-protocol-version",
         "x-arrowcol-implementation-pool",
         "x-arrowcol-catalog",
@@ -410,6 +412,8 @@ fn canonical_edge_request(
         "x-arrowcol-schema-fingerprint",
         "x-arrowcol-control-operation",
         "x-arrowcol-oat-run-id",
+        CLIENT_SEND_OBSERVATION_ID_HEADER,
+        CLIENT_SEND_UNIX_NS_HEADER,
         "content-type",
     ];
     if path.is_empty() || path.len() > 2_048 || path.chars().any(char::is_control) {
@@ -418,8 +422,20 @@ fn canonical_edge_request(
             "request path is invalid for edge signing",
         ));
     }
+    let observation_id_count = headers.get_all(CLIENT_SEND_OBSERVATION_ID_HEADER).iter().count();
+    let send_time_count = headers.get_all(CLIENT_SEND_UNIX_NS_HEADER).iter().count();
+    if observation_id_count > 1 || send_time_count > 1 || observation_id_count != send_time_count {
+        return Err(AuthFailure::new(
+            AuthFailureKind::Invalid,
+            "client send observation headers must be a single complete pair",
+        ));
+    }
+    let observation_present = observation_id_count == 1;
     let mut canonical = format!("{}\n{}\n{}\n{}\n", timestamp.get(), nonce, method, path);
     for key in SIGNED_HEADERS {
+        if !observation_present && (key == CLIENT_SEND_OBSERVATION_ID_HEADER || key == CLIENT_SEND_UNIX_NS_HEADER) {
+            continue;
+        }
         let value = match headers.get(key) {
             Some(value) => value
                 .to_str()

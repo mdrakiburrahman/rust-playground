@@ -15,12 +15,11 @@ use serde::{Deserialize, Serialize};
 
 /// Stable representation ID emitted by the Arrow Flight receiver.
 pub const ARROWCOL_FLIGHT_REPRESENTATION_ID: &str = "arrowcol.flight";
-/// Current representation contract version (`arrowcol.flight@1.1`).
+/// Current representation contract version (`arrowcol.flight@1.2`).
 ///
-/// Version 1.1 added [`ArrowcolBatchEnvelope::instance_key`], which lets a
-/// restarted collector recognize durable-buffer replays admitted by its
-/// predecessor. Other versions are rejected rather than reinterpreted.
-pub const ARROWCOL_FLIGHT_REPRESENTATION_VERSION: RepresentationVersion = RepresentationVersion::new(1, 1);
+/// Version 1.1 added the stable collector instance key. Version 1.2 adds
+/// trusted client-send correlation metadata while continuing to decode 1.1.
+pub const ARROWCOL_FLIGHT_REPRESENTATION_VERSION: RepresentationVersion = RepresentationVersion::new(1, 2);
 
 const SCHEMA_ID_PREFIX: &str = "arrowcol.flight.v1:";
 const ROOT_TABLE_ID: u32 = 0;
@@ -57,6 +56,23 @@ pub struct ArrowcolBatchEnvelope {
     pub instance_key: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ClientSendObservation {
+    id: String,
+    send_unix_ns: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    clock_uncertainty_ns: Option<u64>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ArrowcolBatchEnvelopeV1_2 {
+    envelope: ArrowcolBatchEnvelope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    client_send_observation: Option<ClientSendObservation>,
+}
+
 impl ArrowcolBatchEnvelope {
     /// Validates relationships that are independent of the routing store.
     ///
@@ -88,6 +104,21 @@ pub struct DecodedArrowBatch {
     pub envelope: ArrowcolBatchEnvelope,
     /// Owned Arrow batch.
     pub batch: RecordBatch,
+    client_send_observation: Option<ClientSendObservation>,
+}
+
+impl DecodedArrowBatch {
+    /// Returns trusted client-send data propagated by an authenticated forwarder.
+    #[must_use]
+    pub fn trusted_client_send_observation(&self) -> Option<(&str, u64, Option<u64>)> {
+        self.client_send_observation.as_ref().map(|observation| {
+            (
+                observation.id.as_str(),
+                observation.send_unix_ns,
+                observation.clock_uncertainty_ns,
+            )
+        })
+    }
 }
 
 /// Builds the fixed representation identity.
@@ -111,25 +142,27 @@ pub fn encode_record_batch(
     envelope: ArrowcolBatchEnvelope,
     batch: RecordBatch,
 ) -> Result<PdataArrowRecordSet, EnvelopeError> {
+    encode_record_batch_with_trusted_client_observation(envelope, batch, None)
+}
+
+pub(crate) fn encode_record_batch_with_trusted_client_observation(
+    envelope: ArrowcolBatchEnvelope,
+    batch: RecordBatch,
+    observation: Option<(String, u64)>,
+) -> Result<PdataArrowRecordSet, EnvelopeError> {
     envelope.validate()?;
     let rows = batch.num_rows();
     let fingerprint = fingerprint_schema(batch.schema_ref().as_ref());
+    let schema_id = encode_schema_id_v1_2(envelope, observation)?;
     let table = PdataArrowTable::new(
         ROOT_TABLE_ID,
-        encode_schema_id(&envelope)?.into(),
+        schema_id.into(),
         SchemaFingerprint::new(*fingerprint.as_bytes()),
         batch,
     )
     .map_err(|error| EnvelopeError::Pdata(error.to_string()))?;
-    PdataArrowRecordSet::new(
-        arrowcol_flight_representation(),
-        // The current DFE contract still requires an OTLP signal discriminator.
-        // The Arrowcol representation does not interpret this as an OTAP layout.
-        SignalType::Logs,
-        rows,
-        [table],
-    )
-    .map_err(|error| EnvelopeError::Pdata(error.to_string()))
+    PdataArrowRecordSet::new(arrowcol_flight_representation(), SignalType::Logs, rows, [table])
+        .map_err(|error| EnvelopeError::Pdata(error.to_string()))
 }
 
 /// Consumes and validates an Arrowcol pluggable record set.
@@ -138,11 +171,15 @@ pub fn encode_record_batch(
 ///
 /// Returns representation, envelope, or schema-fingerprint validation errors.
 pub fn decode_record_set(records: PdataArrowRecordSet) -> Result<Vec<DecodedArrowBatch>, EnvelopeError> {
-    if records.representation() != &arrowcol_flight_representation() {
-        return Err(EnvelopeError::UnsupportedRepresentation(
-            records.representation().to_string(),
-        ));
+    let representation = records.representation();
+    let previous_representation = PdataRepresentation::new(
+        PdataRepresentationId::new(ARROWCOL_FLIGHT_REPRESENTATION_ID),
+        RepresentationVersion::new(1, 1),
+    );
+    if representation != &arrowcol_flight_representation() && representation != &previous_representation {
+        return Err(EnvelopeError::UnsupportedRepresentation(representation.to_string()));
     }
+    let legacy_representation = representation == &previous_representation;
     let (_, _, _, tables) = records.into_parts();
     if tables.is_empty() {
         return Err(EnvelopeError::EmptyRecordSet);
@@ -151,7 +188,11 @@ pub fn decode_record_set(records: PdataArrowRecordSet) -> Result<Vec<DecodedArro
         .into_iter()
         .map(|table| {
             let (table_id, schema_id, expected_fingerprint, batch) = table.into_parts();
-            let envelope = decode_schema_id(&schema_id)?;
+            let (envelope, client_send_observation) = if legacy_representation {
+                (decode_schema_id(&schema_id)?, None)
+            } else {
+                decode_schema_id_v1_2(&schema_id)?
+            };
             envelope.validate()?;
             let actual = fingerprint_schema(batch.schema_ref().as_ref());
             if expected_fingerprint.as_bytes() != actual.as_bytes() {
@@ -164,15 +205,51 @@ pub fn decode_record_set(records: PdataArrowRecordSet) -> Result<Vec<DecodedArro
                 table_id,
                 envelope,
                 batch,
+                client_send_observation,
             })
         })
         .collect()
 }
 
+#[cfg(test)]
 fn encode_schema_id(envelope: &ArrowcolBatchEnvelope) -> Result<String, EnvelopeError> {
     let encoded =
         serde_json::to_vec(envelope).map_err(|error| EnvelopeError::InvalidSchemaIdentity(error.to_string()))?;
     Ok(format!("{SCHEMA_ID_PREFIX}{}", URL_SAFE_NO_PAD.encode(encoded)))
+}
+
+fn encode_schema_id_v1_2(
+    envelope: ArrowcolBatchEnvelope,
+    observation: Option<(String, u64)>,
+) -> Result<String, EnvelopeError> {
+    let client_send_observation = observation.map(|(id, send_unix_ns)| ClientSendObservation {
+        id,
+        send_unix_ns,
+        clock_uncertainty_ns: None,
+    });
+    let encoded = serde_json::to_vec(&ArrowcolBatchEnvelopeV1_2 {
+        envelope,
+        client_send_observation,
+    })
+    .map_err(|error| EnvelopeError::InvalidSchemaIdentity(error.to_string()))?;
+    Ok(format!("{SCHEMA_ID_PREFIX}{}", URL_SAFE_NO_PAD.encode(encoded)))
+}
+
+fn decode_schema_id_v1_2(
+    schema_id: &PdataSchemaId,
+) -> Result<(ArrowcolBatchEnvelope, Option<ClientSendObservation>), EnvelopeError> {
+    let encoded = schema_id
+        .as_str()
+        .strip_prefix(SCHEMA_ID_PREFIX)
+        .ok_or(EnvelopeError::InvalidSchemaIdentity(
+            "missing Arrowcol schema identity prefix".to_owned(),
+        ))?;
+    let bytes = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|error| EnvelopeError::InvalidSchemaIdentity(error.to_string()))?;
+    let decoded: ArrowcolBatchEnvelopeV1_2 =
+        serde_json::from_slice(&bytes).map_err(|error| EnvelopeError::InvalidSchemaIdentity(error.to_string()))?;
+    Ok((decoded.envelope, decoded.client_send_observation))
 }
 
 fn decode_schema_id(schema_id: &PdataSchemaId) -> Result<ArrowcolBatchEnvelope, EnvelopeError> {
@@ -259,9 +336,15 @@ mod tests {
         let batch =
             RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(UInt64Array::from(vec![1]))]).expect("batch");
         let fingerprint = fingerprint_schema(schema.as_ref());
+        let schema_id = if version == RepresentationVersion::new(1, 1) {
+            encode_schema_id(&envelope())
+        } else {
+            encode_schema_id_v1_2(envelope(), None)
+        }
+        .expect("schema id");
         let table = PdataArrowTable::new(
             ROOT_TABLE_ID,
-            encode_schema_id(&envelope()).expect("schema id").into(),
+            schema_id.into(),
             SchemaFingerprint::new(*fingerprint.as_bytes()),
             batch,
         )
@@ -276,10 +359,10 @@ mod tests {
     }
 
     /// Scenario: The receiver labels pdata with the current Arrowcol representation identity.
-    /// Guarantees: The exact wire label is `arrowcol.flight@1.1`, the version that carries the instance key.
+    /// Guarantees: The exact wire label is `arrowcol.flight@1.2`, with 1.1 retained as a readable legacy version.
     #[test]
-    fn representation_is_version_one_one() {
-        assert_eq!(arrowcol_flight_representation().to_string(), "arrowcol.flight@1.1");
+    fn representation_is_version_one_two() {
+        assert_eq!(arrowcol_flight_representation().to_string(), "arrowcol.flight@1.2");
     }
 
     /// Scenario: An arbitrary generated schema is moved into and out of Arrowcol pdata.
@@ -319,6 +402,24 @@ mod tests {
         assert_eq!(decoded_values, id_values);
     }
 
+    #[test]
+    fn trusted_send_observation_round_trip_preserves_unknown_clock_uncertainty() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::UInt64, false)]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(UInt64Array::from(vec![1]))]).expect("batch");
+        let send_unix_ns = 1_700_000_000_000_000_000;
+        let id = format!("123-7-{send_unix_ns}");
+        let records =
+            encode_record_batch_with_trusted_client_observation(envelope(), batch, Some((id.clone(), send_unix_ns)))
+                .expect("encode");
+        let decoded = decode_record_set(records).expect("decode");
+        assert_eq!(
+            decoded[0].trusted_client_send_observation(),
+            Some((id.as_str(), send_unix_ns, None))
+        );
+        let legacy = decode_record_set(records_with_version(RepresentationVersion::new(1, 1))).expect("legacy");
+        assert_eq!(legacy[0].trusted_client_send_observation(), None);
+    }
+
     /// Scenario: A batch schema changes after an adapter-supplied fingerprint is created.
     /// Guarantees: The exporter rejects the mismatch before any Delta side effect.
     #[test]
@@ -328,7 +429,7 @@ mod tests {
             RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(UInt64Array::from(vec![1]))]).expect("batch");
         let table = PdataArrowTable::new(
             ROOT_TABLE_ID,
-            encode_schema_id(&envelope()).expect("schema id").into(),
+            encode_schema_id_v1_2(envelope(), None).expect("schema id").into(),
             SchemaFingerprint::new([0xAA; 32]),
             batch,
         )
@@ -352,8 +453,14 @@ mod tests {
             EnvelopeError::UnsupportedRepresentation("arrowcol.flight@1.0".to_owned())
         );
         assert_eq!(
+            decode_record_set(records_with_version(RepresentationVersion::new(1, 1)))
+                .expect("legacy 1.1")
+                .len(),
+            1
+        );
+        assert_eq!(
             decode_record_set(records_with_version(ARROWCOL_FLIGHT_REPRESENTATION_VERSION))
-                .expect("1.1")
+                .expect("current 1.2")
                 .len(),
             1
         );

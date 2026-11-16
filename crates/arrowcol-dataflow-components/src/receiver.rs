@@ -43,7 +43,7 @@ use tonic::transport::Server;
 
 use crate::FlightReceiverConfig;
 use crate::config::{checked_add_millis, config_error, now_unix_millis, parse_config};
-use crate::envelope::{ArrowcolBatchEnvelope, encode_record_batch};
+use crate::envelope::ArrowcolBatchEnvelope;
 use crate::metrics::{DurableStream, PendingTracker, RuntimeMetrics, global_metrics, process_instance_id};
 use crate::routing::{LeaseResolver, StoreLeaseResolver};
 
@@ -210,6 +210,9 @@ impl BatchAdmission for DfeAdmission {
             .acquire_owned()
             .await
             .map_err(|_| RuntimeError::draining())?;
+        let client_send_observation = context
+            .trusted_client_send_observation()
+            .map(|(id, timestamp)| (id.to_owned(), timestamp));
         let envelope = ArrowcolBatchEnvelope {
             publication_id: None,
             ingested_at_ms: None,
@@ -227,6 +230,7 @@ impl BatchAdmission for DfeAdmission {
             pending: Arc::clone(&self.pending),
             metrics: Arc::clone(&self.metrics),
             envelope,
+            client_send_observation,
             permit: Some(permit),
             finished: false,
             durable: self.durable_timeout.map(DurableAdmission::new),
@@ -294,6 +298,7 @@ struct DfeStreamLifecycle {
     pending: Arc<PendingTracker>,
     metrics: Arc<RuntimeMetrics>,
     envelope: ArrowcolBatchEnvelope,
+    client_send_observation: Option<(String, u64)>,
     permit: Option<OwnedSemaphorePermit>,
     finished: bool,
     durable: Option<DurableAdmission>,
@@ -363,7 +368,12 @@ impl StreamLifecycle for DfeStreamLifecycle {
         let publication_id = arrowcol_protocol::PublicationId::new();
         envelope.publication_id = Some(publication_id);
         envelope.ingested_at_ms = Some(ingested_at_ms);
-        let records = encode_record_batch(envelope, batch).map_err(|_| RuntimeError::internal())?;
+        let records = crate::envelope::encode_record_batch_with_trusted_client_observation(
+            envelope,
+            batch,
+            self.client_send_observation.clone(),
+        )
+        .map_err(|_| RuntimeError::internal())?;
         let correlation_id = self
             .pending
             .insert_for_stream(
@@ -1231,6 +1241,7 @@ pub(crate) mod tests {
             pending,
             metrics: Arc::clone(&metrics),
             envelope,
+            client_send_observation: None,
             permit: Some(permit),
             finished: false,
             durable: None,
@@ -1256,6 +1267,7 @@ pub(crate) mod tests {
             pending,
             metrics,
             envelope,
+            client_send_observation: None,
             permit: Some(permit),
             finished: false,
             durable: None,
@@ -1286,6 +1298,7 @@ pub(crate) mod tests {
             pending: Arc::new(PendingTracker::new(Arc::clone(&metrics))),
             metrics: Arc::clone(&metrics),
             envelope,
+            client_send_observation: None,
             permit: Some(permit),
             finished: false,
             durable: None,
@@ -1317,6 +1330,7 @@ pub(crate) mod tests {
             pending: Arc::new(PendingTracker::new(Arc::clone(&metrics))),
             metrics: Arc::clone(&metrics),
             envelope,
+            client_send_observation: None,
             permit: Some(permit),
             finished: false,
             durable: None,
@@ -1527,6 +1541,7 @@ pub(crate) mod tests {
             pending: Arc::clone(&pending),
             metrics: Arc::clone(metrics),
             envelope,
+            client_send_observation: None,
             permit: Some(permit),
             finished: false,
             durable: timeout.map(DurableAdmission::new),
