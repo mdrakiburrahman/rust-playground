@@ -698,7 +698,7 @@ mod commit_evidence_tests {
         tail["finished_at_unix_ms"] = json!(61_000);
         let evidence = durable_commit_evidence(&config, &[log(&[first, boundary, tail])], Some((1000, 66_000)))?;
         let windows = &evidence[&config.tables[0]]["complete_30_second_commit_windows"];
-        assert_eq!(windows.as_array().unwrap().len(), 2);
+        assert_eq!(windows.as_array().context("commit windows are not an array")?.len(), 2);
         assert_eq!(windows[0]["rows"], 10);
         assert_eq!(windows[1]["rows"], 10);
         assert_eq!(evidence[&config.tables[0]]["output_throughput"]["rows"], 30);
@@ -706,7 +706,7 @@ mod commit_evidence_tests {
         missing.complete = false;
         let evidence = durable_commit_evidence(&config, &[missing], Some((1000, 66_000)))?;
         let windows = &evidence[&config.tables[0]]["complete_30_second_commit_windows"];
-        assert_eq!(windows.as_array().unwrap().len(), 2);
+        assert_eq!(windows.as_array().context("commit windows are not an array")?.len(), 2);
         assert!(windows[0]["rows"].is_null());
         assert_eq!(windows[0]["unavailable_reason"], "collector_commit_log_incomplete");
         Ok(())

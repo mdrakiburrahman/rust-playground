@@ -489,8 +489,10 @@ impl ResourceSampler {
     fn start(source: Option<ResourceSamplerSource>, config: OatConfig, start: u64, end: u64) -> Self {
         Self(source.map(|source| {
             tokio::spawn(async move {
-                let mut evidence = CellEvidence::default();
-                evidence.backlog_scrape_configured = true;
+                let mut evidence = CellEvidence {
+                    backlog_scrape_configured: true,
+                    ..Default::default()
+                };
                 let backlog_scraper = match PublicationBacklogScraper::start(&source, &config).await {
                     Ok(scraper) => Some(scraper),
                     Err(error) => {
@@ -747,7 +749,7 @@ mod measurement_evidence_tests {
     }
 
     #[test]
-    fn window_payload_and_sampled_core_rates_preserve_evidence_boundaries() {
+    fn window_payload_and_sampled_core_rates_preserve_evidence_boundaries() -> Result<()> {
         let mut evidence = CellEvidence {
             measurement_window: Some((1000, 3000)),
             ..Default::default()
@@ -771,12 +773,16 @@ mod measurement_evidence_tests {
         assert_eq!(result["rate_evidence"]["collector_input_bytes_per_second_per_observed_collector_core"], 50.0);
         assert_eq!(result["rate_evidence"]["committed_parquet_bytes_per_second_per_observed_collector_core"], 25.0);
         assert_eq!(result["rate_evidence"]["completed_flight_payload_bytes_per_second_per_observed_collector_core"], 50.0);
-        evidence.client_reports.get_mut("table").unwrap()[0]["phase_counters"]["measurement_window"]["end_unix_ms"] = json!(4000);
+        evidence
+            .client_reports
+            .get_mut("table")
+            .context("measurement client report missing")?[0]["phase_counters"]["measurement_window"]["end_unix_ms"] = json!(4000);
         assert!(evidence.for_table("table", Some(&client))["rate_evidence"]["completed_flight_payload_bytes_per_second"].is_null());
         assert!(evidence.for_table("table", Some(&client))["rate_evidence"]["completed_flight_payload_bytes_per_second_per_observed_collector_core"].is_null());
         evidence.resource_samples.clear();
         assert!(evidence.for_table("table", Some(&client))["rate_evidence"]["committed_rows_per_second_per_observed_collector_core"].is_null());
         assert!(evidence.for_table("table", Some(&client))["rate_evidence"]["collector_input_bytes_per_second_per_observed_collector_core"].is_null());
+        Ok(())
     }
 
 

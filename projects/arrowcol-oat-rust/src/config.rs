@@ -931,23 +931,46 @@ mod tests {
         config.tunables.wal = Some(arrowcol_tunables::WalTunables::default());
         assert!(config.validate_campaign_profile().is_err());
         config.tunables.wal = None;
-        let maintenance = config.tunables.maintenance.as_mut().unwrap();
-        maintenance.apply = Some(false);
-        assert!(config.validate_campaign_profile().is_err());
-        let maintenance = config.tunables.maintenance.as_mut().unwrap();
-        maintenance.apply = Some(true);
-        maintenance.operations.as_mut().unwrap().pop();
+        config
+            .tunables
+            .maintenance
+            .as_mut()
+            .context("campaign maintenance tunables missing")?
+            .apply = Some(false);
         assert!(config.validate_campaign_profile().is_err());
         config
             .tunables
             .maintenance
             .as_mut()
-            .unwrap()
+            .context("campaign maintenance tunables missing")?
+            .apply = Some(true);
+        let removed = config
+            .tunables
+            .maintenance
+            .as_mut()
+            .context("campaign maintenance tunables missing")?
             .operations
             .as_mut()
-            .unwrap()
+            .context("campaign maintenance operations missing")?
+            .pop()
+            .context("expected a configured maintenance operation")?;
+        assert_eq!(removed, arrowcol_tunables::MaintenanceOperation::PruneLog);
+        assert!(config.validate_campaign_profile().is_err());
+        config
+            .tunables
+            .maintenance
+            .as_mut()
+            .context("campaign maintenance tunables missing")?
+            .operations
+            .as_mut()
+            .context("campaign maintenance operations missing")?
             .push(arrowcol_tunables::MaintenanceOperation::PruneLog);
-        config.tunables.maintenance.as_mut().unwrap().max_cycles = Some(1);
+        config
+            .tunables
+            .maintenance
+            .as_mut()
+            .context("campaign maintenance tunables missing")?
+            .max_cycles = Some(1);
         assert!(config.validate_campaign_profile().is_err());
         assert!(serde_json::from_str::<CampaignProfile>(r#""single_hot_tables""#).is_err());
         Ok(())
@@ -969,13 +992,30 @@ mod tests {
         config.tunables = serde_json::from_value(serde_json::json!({
             "maintenance": {"enabled": true, "apply": true, "operations": ["purge"]}
         }))?;
-        let missing_granularity = config.validate().unwrap_err().to_string();
+        let missing_granularity = config
+            .validate()
+            .err()
+            .context("local PURGE accepted missing granularity")?
+            .to_string();
         assert!(missing_granularity.contains("maintenance.granularity"));
-        config.tunables.maintenance.as_mut().unwrap().granularity =
-            Some(arrowcol_tunables::MaintenanceGranularity::Hour);
-        let missing_retention = config.validate().unwrap_err().to_string();
+        config
+            .tunables
+            .maintenance
+            .as_mut()
+            .context("local maintenance tunables missing")?
+            .granularity = Some(arrowcol_tunables::MaintenanceGranularity::Hour);
+        let missing_retention = config
+            .validate()
+            .err()
+            .context("local PURGE accepted missing retention")?
+            .to_string();
         assert!(missing_retention.contains("maintenance.purge_retention_secs"));
-        config.tunables.maintenance.as_mut().unwrap().purge_retention_secs = Some(2_592_000);
+        config
+            .tunables
+            .maintenance
+            .as_mut()
+            .context("local maintenance tunables missing")?
+            .purge_retention_secs = Some(2_592_000);
         config.validate()?;
 
         config.platform.kind = OatMode::Aks;
@@ -987,8 +1027,18 @@ mod tests {
         config.platform.bootstrap_env_file = bootstrap_env_file;
         config.stamp = Some("00000".to_owned());
         config.maintenance_image = Some(format!("maintenance@sha256:{}", "a".repeat(64)));
-        config.tunables.maintenance.as_mut().unwrap().granularity = None;
-        config.tunables.maintenance.as_mut().unwrap().purge_retention_secs = None;
+        config
+            .tunables
+            .maintenance
+            .as_mut()
+            .context("AKS maintenance tunables missing")?
+            .granularity = None;
+        config
+            .tunables
+            .maintenance
+            .as_mut()
+            .context("AKS maintenance tunables missing")?
+            .purge_retention_secs = None;
         config.validate()?;
         Ok(())
     }
@@ -1211,12 +1261,18 @@ mod tests {
             .tunables
             .parquet_writer
             .as_mut()
-            .unwrap()
+            .context("sorted writer configuration missing")?
             .sorting_columns
             .as_mut()
-            .unwrap()[0]
+            .context("sorting columns missing")?
+            .first_mut()
+            .context("sorting column missing")?
             .descending = true;
-        assert!(format!("{:#}", sorted.validate().unwrap_err()).contains("sorting metadata must match"));
+        let mismatch = sorted
+            .validate()
+            .err()
+            .context("inconsistent sorting metadata was accepted")?;
+        assert!(format!("{mismatch:#}").contains("sorting metadata must match"));
         Ok(())
     }
 
