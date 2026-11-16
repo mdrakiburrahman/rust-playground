@@ -199,7 +199,16 @@ pub struct CollectorTunables {
     pub pressure: Option<PressureTunables>,
     pub routing: Option<RoutingTunables>,
     pub runtime: Option<RuntimeTunables>,
+    pub upload: Option<CollectorUploadTunables>,
     pub cpu_pressure: Option<CpuPressureMode>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CollectorUploadTunables {
+    pub mode: Option<CollectorUploadMode>,
+    pub buffer_capacity_bytes: Option<usize>,
+    pub request_concurrency: Option<usize>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -511,6 +520,35 @@ pub enum MaintenanceOperation {
 // PERF69-TUNABLES-BEGIN file-formation
 // PERF69-TUNABLES-END file-formation
 // PERF69-TUNABLES-BEGIN commit-pipeline
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum CollectorUploadMode {
+    #[default]
+    PutCreate,
+    BufferedMultipart,
+}
+
+impl CollectorUploadMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PutCreate => "put_create",
+            Self::BufferedMultipart => "buffered_multipart",
+        }
+    }
+}
+
+impl FromStr for CollectorUploadMode {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "put_create" => Ok(Self::PutCreate),
+            "buffered_multipart" => Ok(Self::BufferedMultipart),
+            _ => Err("expected 'put_create' or 'buffered_multipart'"),
+        }
+    }
+}
 // PERF69-TUNABLES-END commit-pipeline
 // PERF69-TUNABLES-BEGIN maintenance
 // PERF69-TUNABLES-END maintenance
