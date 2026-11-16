@@ -29,7 +29,7 @@ pub struct DeltaRuntimeConfig {
     pub blocking_workers: usize,
     /// Concurrent uploads: default 32 independent of CPU count; allowed 1..=256.
     pub upload_limit: usize,
-    /// Per-upload buffer and multipart chunk size: default 8 MiB; allowed 8..=64 MiB.
+    /// Per-upload buffer and multipart chunk size: default 8 MiB; allowed 1..=64 MiB.
     pub upload_buffer_capacity_bytes: usize,
     /// In-flight multipart requests per upload: default 2; allowed 1..=16.
     pub upload_request_concurrency: usize,
@@ -116,7 +116,7 @@ impl DeltaRuntimeConfig {
             (
                 "UPLOAD_BUFFER_CAPACITY_BYTES",
                 self.upload_buffer_capacity_bytes,
-                8 * 1024 * 1024,
+                1024 * 1024,
                 64 * 1024 * 1024,
             ),
             ("UPLOAD_REQUEST_CONCURRENCY", self.upload_request_concurrency, 1, 16),
@@ -585,7 +585,7 @@ mod tests {
             ("RUNTIME_WORKERS", 1, 64),
             ("BLOCKING_WORKERS", 2, 256),
             ("UPLOAD_LIMIT", 1, 256),
-            ("UPLOAD_BUFFER_CAPACITY_BYTES", 8 * 1024 * 1024, 64 * 1024 * 1024),
+            ("UPLOAD_BUFFER_CAPACITY_BYTES", 1024 * 1024, 64 * 1024 * 1024),
             ("UPLOAD_REQUEST_CONCURRENCY", 1, 16),
             ("TASK_LIMIT", 2, 1024),
             ("READ_AHEAD", 1, 128),
@@ -593,8 +593,30 @@ mod tests {
             ("CPU_WORKERS", 1, 128),
         ] {
             let knob = format!("ARROWCOL_COLLECTOR_{knob}");
+            let companion_value = |name| match (knob.as_str(), name) {
+                ("ARROWCOL_COLLECTOR_UPLOAD_LIMIT", "ARROWCOL_COLLECTOR_UPLOAD_BUFFER_CAPACITY_BYTES")
+                | (
+                    "ARROWCOL_COLLECTOR_UPLOAD_REQUEST_CONCURRENCY",
+                    "ARROWCOL_COLLECTOR_UPLOAD_BUFFER_CAPACITY_BYTES",
+                ) => Some("1048576"),
+                ("ARROWCOL_COLLECTOR_UPLOAD_LIMIT", "ARROWCOL_COLLECTOR_UPLOAD_REQUEST_CONCURRENCY")
+                | (
+                    "ARROWCOL_COLLECTOR_UPLOAD_BUFFER_CAPACITY_BYTES",
+                    "ARROWCOL_COLLECTOR_UPLOAD_REQUEST_CONCURRENCY",
+                ) => Some("1"),
+                ("ARROWCOL_COLLECTOR_UPLOAD_BUFFER_CAPACITY_BYTES", "ARROWCOL_COLLECTOR_UPLOAD_LIMIT")
+                | ("ARROWCOL_COLLECTOR_UPLOAD_REQUEST_CONCURRENCY", "ARROWCOL_COLLECTOR_UPLOAD_LIMIT") => Some("1"),
+                _ => None,
+            };
+            let read = |name: &str, value: &str| {
+                if name == knob {
+                    Some(value.to_owned())
+                } else {
+                    companion_value(name).map(str::to_owned)
+                }
+            };
             for value in [minimum, maximum] {
-                let config = DeltaRuntimeConfig::from_lookup(|name| Ok((name == knob).then(|| value.to_string())))?;
+                let config = DeltaRuntimeConfig::from_lookup(|name| Ok(read(name, &value.to_string())))?;
                 let field = knob.trim_start_matches("ARROWCOL_COLLECTOR_").to_ascii_lowercase();
                 assert_eq!(serde_json::to_value(config)?[field], value);
             }
@@ -608,7 +630,7 @@ mod tests {
                 (minimum - 1).to_string(),
                 (maximum + 1).to_string(),
             ] {
-                let error = DeltaRuntimeConfig::from_lookup(|name| Ok((name == knob).then(|| value.clone())))
+                let error = DeltaRuntimeConfig::from_lookup(|name| Ok(read(name, &value)))
                     .err()
                     .context("invalid override must fail")?;
                 assert!(format!("{error:#}").contains(&knob));
