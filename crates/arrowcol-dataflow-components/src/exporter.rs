@@ -28,7 +28,7 @@ use tokio::time::Instant;
 use crate::DeltaExporterConfig;
 use crate::config::{BatchCapacity, FileBatchConfig, config_error, parse_config, table_path};
 use crate::envelope::{ArrowcolBatchEnvelope, DecodedArrowBatch, EnvelopeError, decode_record_set};
-use crate::metrics::{RuntimeMetrics, global_metrics};
+use crate::metrics::{PipelineStage, RuntimeMetrics, StageMetrics, global_metrics};
 use crate::routing::{
     AuthorityClient, ExportingProcess, LEASE_VIEW_TTL, LeaseBinder, LeaseBinding, LeaseEvidence,
     RoutingPublicationFence,
@@ -562,23 +562,27 @@ async fn run_batch_worker(
     let mut rows = 0;
     let mut bytes = 0;
     let mut closing = false;
+    let stage_metrics = StageMetrics::default();
     let mut publisher = GroupPublisher {
         table: &mut table,
         retired: &retired,
         flush_slots: &flush_slots,
         metrics: &metrics,
         identity: &identity,
+        stage_metrics: &stage_metrics,
         max_pending_files,
         coalesce_publications: policy.coalesce_publications,
         adaptive_defaults: policy.adaptive_file.build(),
     };
     loop {
+        let collect_started = Instant::now();
         let next = if closing {
             receiver.recv().await
         } else if let Some(first) = group.first() {
             tokio::select! {
                 next = receiver.recv() => next,
                 _ = tokio::time::sleep_until(first.accepted + policy.max_age) => {
+                    stage_metrics.record(PipelineStage::Collect, collect_started.elapsed());
                     publisher.publish(&mut group, &mut estimator).await;
                     rows = 0;
                     bytes = 0;
@@ -588,6 +592,7 @@ async fn run_batch_worker(
                     continue;
                 }
                 _ = drain.changed() => {
+                    stage_metrics.record(PipelineStage::Collect, collect_started.elapsed());
                     receiver.close();
                     closing = true;
                     continue;
@@ -597,12 +602,14 @@ async fn run_batch_worker(
             tokio::select! {
                 next = receiver.recv() => next,
                 _ = drain.changed() => {
+                    stage_metrics.record(PipelineStage::Collect, collect_started.elapsed());
                     receiver.close();
                     closing = true;
                     continue;
                 }
             }
         };
+        stage_metrics.record(PipelineStage::Collect, collect_started.elapsed());
         let Some(next) = next else {
             publisher.publish(&mut group, &mut estimator).await;
             if let Some(table) = publisher.table.as_ref() {
@@ -688,6 +695,7 @@ struct GroupPublisher<'a> {
     flush_slots: &'a Arc<Semaphore>,
     metrics: &'a RuntimeMetrics,
     identity: &'a arrowcol_protocol::TableIdentity,
+    stage_metrics: &'a StageMetrics,
     max_pending_files: usize,
     coalesce_publications: bool,
     adaptive_defaults: arrow_deltalake::sizing::AdaptiveFileSizeConfig,
@@ -744,6 +752,7 @@ impl GroupPublisher<'_> {
             let mut updated_estimator = estimator.clone();
             let mut publications = HashMap::with_capacity(group.len());
             if self.coalesce_publications {
+                let build_started = Instant::now();
                 let mut inputs = Vec::with_capacity(group.len());
                 for entry in group.iter() {
                     if let Some(stamp) = publications.insert(entry.publication_id, entry.ingested_at_ms) {
@@ -763,6 +772,7 @@ impl GroupPublisher<'_> {
                             .map_err(|error| ExportFailure::Transient(error.to_string()))?,
                     ));
                 }
+                self.stage_metrics.record(PipelineStage::Build, build_started.elapsed());
                 let mut pending_groups = VecDeque::from([inputs]);
                 let mut version = 0;
                 while let Some(mut inputs) = pending_groups.pop_front() {
@@ -797,19 +807,21 @@ impl GroupPublisher<'_> {
                             ExportFailure::Permanent(format!("file sizing observation failed: {error}"))
                         })?;
                     }
-                    let committed = table
-                        .submit_prepared_group(prepared, true)
-                        .await
-                        .map_err(|error| {
-                            worker_failed = true;
-                            ExportFailure::Transient(format!("atomic group submission failed: {error:#}"))
-                        })?
-                        .wait()
-                        .await
-                        .map_err(|error| {
+                    let commit_started = Instant::now();
+                    let commit_result = match table.submit_prepared_group(prepared, true).await {
+                        Ok(receipt) => receipt.wait().await.map_err(|error| {
                             worker_failed = true;
                             ExportFailure::Transient(format!("atomic group commit failed: {error:#}"))
-                        })?;
+                        }),
+                        Err(error) => {
+                            worker_failed = true;
+                            Err(ExportFailure::Transient(format!(
+                                "atomic group submission failed: {error:#}"
+                            )))
+                        }
+                    };
+                    self.stage_metrics.record(PipelineStage::Commit, commit_started.elapsed());
+                    let committed = commit_result?;
                     version = version.max(committed.version);
                 }
                 *estimator = updated_estimator;
@@ -827,27 +839,29 @@ impl GroupPublisher<'_> {
                 }
                 let stamp = i64::try_from(entry.ingested_at_ms.get())
                     .map_err(|error| ExportFailure::Transient(error.to_string()))?;
-                let files = table
+                let build_started = Instant::now();
+                let files_result = table
                     .new_partitioned_publication_files(
                         entry.batch.clone(),
                         format!("arrowcol.publication.{}", entry.publication_id),
                         0,
                         stamp,
                     )
-                    .await
-                    .map_err(|error| {
-                        worker_failed = true;
-                        ExportFailure::Transient(format!("{error:#}"))
-                    })?;
+                    .await;
+                self.stage_metrics.record(PipelineStage::Build, build_started.elapsed());
+                let files = files_result.map_err(|error| {
+                    worker_failed = true;
+                    ExportFailure::Transient(format!("{error:#}"))
+                })?;
                 for (mut writer, partition_batch) in files {
-                    writer
-                        .write(&partition_batch)
-                        .await
-                        .map_err(|error| ExportFailure::Permanent(format!("{error:#}")))?;
-                    let append = writer
-                        .stage()
-                        .await
-                        .map_err(|error| ExportFailure::Transient(format!("{error:#}")))?;
+                    let encode_started = Instant::now();
+                    let write_result = writer.write(&partition_batch).await;
+                    self.stage_metrics.record(PipelineStage::Encode, encode_started.elapsed());
+                    write_result.map_err(|error| ExportFailure::Permanent(format!("{error:#}")))?;
+                    let upload_started = Instant::now();
+                    let stage_result = writer.stage().await;
+                    self.stage_metrics.record(PipelineStage::Upload, upload_started.elapsed());
+                    let append = stage_result.map_err(|error| ExportFailure::Transient(format!("{error:#}")))?;
                     updated_estimator.observe(append.observation()).map_err(|error| {
                         ExportFailure::Permanent(format!("file sizing observation failed: {error}"))
                     })?;
@@ -869,7 +883,10 @@ impl GroupPublisher<'_> {
             }
             let mut version = 0;
             for receipt in receipts {
-                let committed = receipt.wait_typed().await.map_err(|error| {
+                let commit_started = Instant::now();
+                let commit_result = receipt.wait_typed().await;
+                self.stage_metrics.record(PipelineStage::Commit, commit_started.elapsed());
+                let committed = commit_result.map_err(|error| {
                     worker_failed = true;
                     map_receipt_error(error)
                 })?;
