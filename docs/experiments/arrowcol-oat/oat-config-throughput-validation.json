@@ -2,10 +2,10 @@
   "schema_version": 1,
   "validation_kind": "config-validation-only",
   "validator": "arrowcol-oat-rust --validate-config",
-  "source_sha": "a24ec92ea7a4c9b3b0397d38ebe231844714c7e8",
+  "source_sha": "51a641b97fe30ef783e0eac352777a0c371f2191",
   "baseline_count": 8,
-  "candidate_count": 82,
-  "pass_count": 90,
+  "candidate_count": 87,
+  "pass_count": 95,
   "fail_count": 0,
   "runtime_qualification": "unqualified",
   "manifests": [
@@ -67,8 +67,8 @@
       "cohort": "C7",
       "status": "config-validated",
       "baseline_count": 1,
-      "candidate_count": 12,
-      "pass_count": 13,
+      "candidate_count": 17,
+      "pass_count": 18,
       "fail_count": 0,
       "excluded_pending_candidate_sets": []
     },
@@ -689,6 +689,46 @@
       "candidate": "cadence-120",
       "qualification": "exploratory",
       "config_sha256": "1eb4f8d019ddd2fe875a45cd5b67fa2ea4eeda0da03e81cc7cce558f5fe54661",
+      "status": "pass"
+    },
+    {
+      "cohort": "C7",
+      "comparison": "max-consecutive-stale-plans",
+      "candidate": "stale-plans-1",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "85ba57cecd0fca203da1708fd08d89f5baacf80c8c3e12ccd516255003ebce49",
+      "status": "pass"
+    },
+    {
+      "cohort": "C7",
+      "comparison": "max-consecutive-stale-plans",
+      "candidate": "stale-plans-8",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "48b406872b8d99f2bb25db60b4abaf7b5b9a0c3d2b1c1b37c318f68e2b676428",
+      "status": "pass"
+    },
+    {
+      "cohort": "C7",
+      "comparison": "max-consecutive-stale-plans",
+      "candidate": "stale-plans-1024",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "9c9d16822258dfea6c580a2529ec145fd724aa2d4c733dd780e8de4d73b36e11",
+      "status": "pass"
+    },
+    {
+      "cohort": "C7",
+      "comparison": "sealed-partitions-only",
+      "candidate": "sealed-partitions-true",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "01731b97255aba0332bf2af133c98e46f3c3a3fbfc560bccc16da7b6eb50d304",
+      "status": "pass"
+    },
+    {
+      "cohort": "C7",
+      "comparison": "sealed-partitions-only",
+      "candidate": "sealed-partitions-false",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "e88a9d2210537ed83030fb43153bd0c40d266bb07fe09f486878c8dbf578b9ed",
       "status": "pass"
     },
     {
