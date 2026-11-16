@@ -1661,17 +1661,38 @@ mod optimize_upload_tests {
         fs::write(local.path(), &bytes)?;
         let path = object_store::path::Path::from("optimized.parquet");
 
-        stream_staged_output(
+        upload_staged_output(
             Arc::clone(&store),
             path.clone(),
             local.path().to_path_buf(),
             bytes.len() as u64,
-            32 * 1024,
+            Some(32 * 1024),
         )
         .await?;
 
         let uploaded = store.get(&path).await?.bytes().await?;
         assert_eq!(uploaded.as_ref(), bytes.as_slice());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn default_create_only_upload_rejects_existing_output() -> Result<()> {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = object_store::path::Path::from("existing.parquet");
+        store.put_opts(&path, vec![1_u8, 2, 3].into(), PutMode::Create.into()).await?;
+        let local = tempfile::NamedTempFile::new()?;
+        let replacement = vec![4_u8, 5, 6];
+        fs::write(local.path(), &replacement)?;
+
+        let error = upload_staged_output(Arc::clone(&store), path.clone(), local.path().to_path_buf(), 3, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<object_store::Error>(),
+            Some(object_store::Error::AlreadyExists { .. })
+        ));
+        let stored = store.get(&path).await?.bytes().await?;
+        assert_eq!(stored.as_ref(), &[1, 2, 3]);
         Ok(())
     }
 }
@@ -2020,7 +2041,7 @@ impl DeltaTable {
         config: &OptimizeConfig,
         control: &MaintenanceControl,
     ) -> Result<MaintenanceReport> {
-        self.apply_optimize_reusing(plan, config, control, None, DEFAULT_OPTIMIZE_UPLOAD_BUFFER_BYTES)
+        self.apply_optimize_reusing(plan, config, control, None, None)
     }
 
     /// Apply a same-pass plan without rescanning an unchanged log version.
@@ -2033,7 +2054,13 @@ impl DeltaTable {
         config: &OptimizeConfig,
         control: &MaintenanceControl,
     ) -> Result<MaintenanceReport> {
-        self.apply_prepared_optimize_with_upload_buffer(prepared, config, control, DEFAULT_OPTIMIZE_UPLOAD_BUFFER_BYTES)
+        self.apply_optimize_reusing(
+            &prepared.plan,
+            config,
+            control,
+            Some(&prepared.state),
+            None,
+        )
     }
 
     /// Apply OPTIMIZE with a bounded object-store streaming upload buffer.
@@ -2058,7 +2085,7 @@ impl DeltaTable {
             config,
             control,
             Some(&prepared.state),
-            upload_buffer_bytes,
+            Some(upload_buffer_bytes),
         )
     }
 
@@ -2068,7 +2095,7 @@ impl DeltaTable {
         config: &OptimizeConfig,
         control: &MaintenanceControl,
         prepared: Option<&ActiveState>,
-        upload_buffer_bytes: usize,
+        upload_buffer_bytes: Option<usize>,
     ) -> Result<MaintenanceReport> {
         config.validate()?;
         self.check_optimize_plan(plan, config)?;
@@ -2202,7 +2229,7 @@ impl DeltaTable {
         bin: &OptimizeBin,
         config: &OptimizeConfig,
         control: &MaintenanceControl,
-        upload_buffer_bytes: usize,
+        upload_buffer_bytes: Option<usize>,
     ) -> Result<Vec<StagedOutput>> {
         let probe = self.write_context(snapshot, &bin.partition_values)?;
         let logical: SchemaRef = Arc::new(probe.logical_data_schema().as_ref().try_into_arrow()?);
@@ -2506,7 +2533,7 @@ struct BinWriter<'a> {
     logical: SchemaRef,
     properties: WriterProperties,
     config: &'a OptimizeConfig,
-    upload_buffer_bytes: usize,
+    upload_buffer_bytes: Option<usize>,
     layout: Option<LayoutPolicy>,
     buffer: Option<FileSortBuffer>,
     current: Option<OpenOutput>,
@@ -2695,13 +2722,13 @@ impl BinWriter<'_> {
 
 impl DeltaTable {
     /// Upload a staged cloud output to its UUID-named path; local outputs are already in place.
-    fn upload_output(&self, output: &mut StagedOutput, buffer_bytes: usize) -> Result<()> {
+    fn upload_output(&self, output: &mut StagedOutput, buffer_bytes: Option<usize>) -> Result<()> {
         if self.url.scheme() == "file" {
             return Ok(());
         }
         self.check_publication()?;
         let path = object_store::path::Path::from_url_path(output.url.path())?;
-        shared_executor()?.block_on(stream_staged_output(
+        shared_executor()?.block_on(upload_staged_output(
             Arc::clone(&self.store),
             path,
             output.local.clone(),
@@ -2713,6 +2740,26 @@ impl DeltaTable {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(anyhow::Error::new(error).context("remove uploaded staging file")),
+        }
+    }
+}
+
+async fn upload_staged_output(
+    store: Arc<dyn ObjectStore>,
+    path: object_store::path::Path,
+    local: PathBuf,
+    expected_bytes: u64,
+    buffer_bytes: Option<usize>,
+) -> Result<()> {
+    match buffer_bytes {
+        Some(buffer_bytes) => stream_staged_output(store, path, local, expected_bytes, buffer_bytes).await,
+        None => {
+            let bytes = tokio::fs::read(local).await?;
+            if bytes.len() as u64 != expected_bytes {
+                return Err(fail(MaintenanceErrorKind::Uncertain, "staged output changed before upload"));
+            }
+            store.put_opts(&path, bytes.into(), PutMode::Create.into()).await?;
+            Ok(())
         }
     }
 }

@@ -7,7 +7,7 @@ use arrow_deltalake::maintenance::{
     Outcome, ProbeOperation, now_ms,
 };
 use delta_maintenance::{
-    DiscoveredTable, FilesystemDiscovery, Metrics, Operation, Settings, TableDiscovery, run_cycle_with_discovery,
+    DiscoveredTable, FilesystemDiscovery, Metrics, Operation, OptimizeUploadMode, Settings, TableDiscovery, run_cycle_with_discovery,
     run_with_discovery,
 };
 use std::collections::BTreeMap;
@@ -663,14 +663,22 @@ fn empty_vacuum_plan_cannot_report_noop_after_a_concurrent_append() -> Result<()
 }
 
 #[test]
-fn optimize_upload_buffer_requires_supported_bounds() -> Result<()> {
+fn optimize_upload_mode_is_strict_and_buffer_is_opt_in() -> Result<()> {
+    assert_eq!("put_create".parse::<OptimizeUploadMode>()?, OptimizeUploadMode::PutCreate);
+    assert_eq!("buffered_multipart".parse::<OptimizeUploadMode>()?, OptimizeUploadMode::BufferedMultipart);
+    assert!("stream".parse::<OptimizeUploadMode>().is_err());
     let (_root, mut settings, _) = fixture()?;
+    settings.operation_limits.optimize_upload_buffer_bytes = Some(8 * 1024 * 1024);
+    assert!(settings.validate().is_err());
+    settings.operation_limits.optimize_upload_mode = OptimizeUploadMode::BufferedMultipart;
     for value in [4 * 1024 * 1024, 8 * 1024 * 1024, 64 * 1024 * 1024] {
-        settings.operation_limits.optimize_upload_buffer_bytes = value;
+        settings.operation_limits.optimize_upload_buffer_bytes = Some(value);
         settings.validate()?;
     }
+    settings.operation_limits.optimize_upload_buffer_bytes = None;
+    settings.validate()?;
     for value in [0, 4 * 1024 * 1024 - 1, 64 * 1024 * 1024 + 1] {
-        settings.operation_limits.optimize_upload_buffer_bytes = value;
+        settings.operation_limits.optimize_upload_buffer_bytes = Some(value);
         assert!(settings.validate().is_err());
     }
     Ok(())

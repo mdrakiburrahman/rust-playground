@@ -62,12 +62,36 @@ impl Operation {
     }
 }
 
+/// OPTIMIZE's upload path. Buffered multipart cannot provide atomic create-only writes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OptimizeUploadMode {
+    /// Preserve the original single-object conditional create.
+    #[default]
+    PutCreate,
+    /// Opt in to bounded multipart upload to UUID-named outputs.
+    BufferedMultipart,
+}
+
+impl std::str::FromStr for OptimizeUploadMode {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "put_create" => Ok(Self::PutCreate),
+            "buffered_multipart" => Ok(Self::BufferedMultipart),
+            _ => bail!("invalid OPTIMIZE upload mode {value:?}; expected put_create or buffered_multipart"),
+        }
+    }
+}
+
 /// Process-level bounds for existing non-OPTIMIZE operations.
 #[derive(Clone, Debug, Serialize)]
 pub struct OperationLimits {
     pub purge_max_files_per_commit: usize,
     pub purge_max_plan_bytes: usize,
-    pub optimize_upload_buffer_bytes: usize,
+    pub optimize_upload_mode: OptimizeUploadMode,
+    pub optimize_upload_buffer_bytes: Option<usize>,
     pub vacuum_delete_chunk: usize,
     pub vacuum_max_plan_bytes: usize,
     pub replay_max_log_files: usize,
@@ -83,7 +107,8 @@ impl Default for OperationLimits {
         Self {
             purge_max_files_per_commit: 10_000,
             purge_max_plan_bytes: 4 * 1024 * 1024,
-            optimize_upload_buffer_bytes: DEFAULT_OPTIMIZE_UPLOAD_BUFFER_BYTES,
+            optimize_upload_mode: OptimizeUploadMode::PutCreate,
+            optimize_upload_buffer_bytes: None,
             vacuum_delete_chunk: 256,
             vacuum_max_plan_bytes: 8 * 1024 * 1024,
             replay_max_log_files: 100_000,
@@ -169,11 +194,24 @@ impl Settings {
             bail!("--max-prune-files must be nonzero");
         }
         let limits = &self.operation_limits;
+        if limits.optimize_upload_mode == OptimizeUploadMode::PutCreate
+            && limits.optimize_upload_buffer_bytes.is_some()
+        {
+            bail!("OPTIMIZE upload buffer applies only to buffered_multipart mode");
+        }
+        if limits.optimize_upload_mode == OptimizeUploadMode::BufferedMultipart {
+            let buffer_bytes = limits
+                .optimize_upload_buffer_bytes
+                .unwrap_or(DEFAULT_OPTIMIZE_UPLOAD_BUFFER_BYTES);
+            if !(arrow_deltalake::maintenance::MIN_OPTIMIZE_UPLOAD_BUFFER_BYTES
+                ..=arrow_deltalake::maintenance::MAX_OPTIMIZE_UPLOAD_BUFFER_BYTES)
+                .contains(&buffer_bytes)
+            {
+                bail!("OPTIMIZE upload buffer must be within 4..=64 MiB");
+            }
+        }
         if limits.purge_max_files_per_commit == 0
             || limits.purge_max_plan_bytes < 1024
-            || !(arrow_deltalake::maintenance::MIN_OPTIMIZE_UPLOAD_BUFFER_BYTES
-                ..=arrow_deltalake::maintenance::MAX_OPTIMIZE_UPLOAD_BUFFER_BYTES)
-                .contains(&limits.optimize_upload_buffer_bytes)
             || limits.vacuum_delete_chunk == 0
             || limits.vacuum_max_plan_bytes < 1024
             || limits.replay_max_log_files == 0
@@ -1236,11 +1274,17 @@ fn run_operation(
             prepared.plan.bins.retain(|bin| bin.files.len() >= minimum);
             *optimize = Some(OptimizeEvidence::new(&config, prepared.plan.clone()));
             if settings.apply && (!prepared.plan.bins.is_empty() || config.sealed_final) {
+                if settings.operation_limits.optimize_upload_mode == OptimizeUploadMode::PutCreate {
+                    return table.apply_prepared_optimize(&prepared, &config, control);
+                }
                 return table.apply_prepared_optimize_with_upload_buffer(
                     &prepared,
                     &config,
                     control,
-                    settings.operation_limits.optimize_upload_buffer_bytes,
+                    settings
+                        .operation_limits
+                        .optimize_upload_buffer_bytes
+                        .unwrap_or(DEFAULT_OPTIMIZE_UPLOAD_BUFFER_BYTES),
                 );
             }
             MaintenancePlan::Optimize(prepared.plan)

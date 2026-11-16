@@ -394,6 +394,20 @@ pub static REGISTRY: &[PropKey] = &[
     // PERF69-PROPS-BEGIN commit-pipeline
     // PERF69-PROPS-END commit-pipeline
     // PERF69-PROPS-BEGIN maintenance
+    key!(
+        "arrowcol.maintenance.optimizeUploadMode",
+        Enum,
+        "put_create",
+        Validator::OneOf(&["put_create", "buffered_multipart"]),
+        "OPTIMIZE upload mode; buffered multipart is unqualified and not for scored cells."
+    ),
+    key!(
+        "arrowcol.maintenance.optimizeUploadBufferBytes",
+        Integer,
+        "8388608",
+        Validator::Range(4_194_304.0, 67_108_864.0),
+        "Buffered multipart upload buffer bytes; effective only in buffered_multipart mode."
+    ),
     // PERF69-PROPS-END maintenance
     // PERF69-PROPS-BEGIN loadgen
     // PERF69-PROPS-END loadgen

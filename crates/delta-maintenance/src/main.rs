@@ -1,12 +1,10 @@
 //! `delta-maintenance` command line: dry-run plans by default, `--apply` to mutate.
 
 use anyhow::{Context, Result, anyhow};
-use arrow_deltalake::maintenance::{
-    DEFAULT_OPTIMIZE_UPLOAD_BUFFER_BYTES, Granularity, InputReadStrategy, OptimizeConfig,
-};
+use arrow_deltalake::maintenance::{Granularity, InputReadStrategy, OptimizeConfig};
 use clap::Parser;
 use delta_kernel::metrics::WithMetricsReporterLayer;
-use delta_maintenance::{Metrics, Operation, OperationLimits, Settings, run, serve_metrics, startup_configuration};
+use delta_maintenance::{Metrics, Operation, OperationLimits, OptimizeUploadMode, Settings, run, serve_metrics, startup_configuration};
 use delta_maintenance::{
     catalog::{CatalogDiscovery, CatalogOptions},
     run_with_discovery,
@@ -145,9 +143,12 @@ struct Cli {
     output_row_group_rows: usize,
     #[arg(long, env = "ARROWCOL_MAINT_MAX_OUTPUT_FILE_BYTES", default_value_t = 1023 * 1024 * 1024)]
     max_output_file_bytes: u64,
-    /// Object-store upload buffer for OPTIMIZE outputs (4..=64 MiB).
-    #[arg(long, env = "ARROWCOL_MAINT_OPTIMIZE_UPLOAD_BUFFER_BYTES", default_value_t = DEFAULT_OPTIMIZE_UPLOAD_BUFFER_BYTES)]
-    optimize_upload_buffer_bytes: usize,
+    /// OPTIMIZE output upload mode: put_create (default) or buffered_multipart (unqualified).
+    #[arg(long, env = "ARROWCOL_MAINT_OPTIMIZE_UPLOAD_MODE", default_value = "put_create")]
+    optimize_upload_mode: String,
+    /// Buffered upload size for buffered_multipart only (4..=64 MiB).
+    #[arg(long, env = "ARROWCOL_MAINT_OPTIMIZE_UPLOAD_BUFFER_BYTES")]
+    optimize_upload_buffer_bytes: Option<usize>,
     #[arg(long, env = "ARROWCOL_MAINT_MAX_ACTIVE_FILES", default_value_t = 1_000_000)]
     max_active_files: usize,
     #[arg(long, env = "ARROWCOL_MAINT_LATEST_PARTITIONS")]
@@ -277,6 +278,7 @@ fn settings(cli: Cli) -> Result<Settings> {
         operation_limits: OperationLimits {
             purge_max_files_per_commit: cli.purge_max_files_per_commit,
             purge_max_plan_bytes: cli.purge_max_plan_bytes,
+            optimize_upload_mode: cli.optimize_upload_mode.parse::<OptimizeUploadMode>()?,
             optimize_upload_buffer_bytes: cli.optimize_upload_buffer_bytes,
             vacuum_delete_chunk: cli.vacuum_delete_chunk,
             vacuum_max_plan_bytes: cli.vacuum_max_plan_bytes,
