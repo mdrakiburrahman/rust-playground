@@ -1,6 +1,8 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { evaluateDataFlow } from './dataflow-verdict.js';
+import type { OatRunStatus } from './launch.js';
 
 export interface CampaignMeasurement {
   cohort: string;
@@ -11,20 +13,89 @@ export interface CampaignMeasurement {
   valueY: string;
   repeat: number;
   committedRowsPerSecond: number | null;
+  expectedRepeats: number | null;
+  factorConfigPaths?: [string, string];
+  officialWindows?: OfficialWindowRun[];
   diedFirst?: string | null;
   comment?: string | null;
+  downstreamStatus?: 'unavailable' | 'observed_or_not_attempted';
+  qapCompletionPercent: number | null;
+  qapPendingArtifacts: number | null;
+  qapUnhealthyCatalogs: number | null;
+  collectorOnly: boolean;
 }
 
-type Cell = { x: string; y: string; rates: number[] };
-type Summary = { candidate: string; rates: number[]; mean: number; min: number; max: number };
+interface OfficialWindowRun {
+  status: OatRunStatus;
+  rows: RecordValue[];
+  expectedSha: string;
+  mode: 'local' | 'aks';
+  config: RecordValue;
+}
 
-function isRecord(value: unknown): value is Record<string, unknown> {
+type RecordValue = Record<string, unknown>;
+type Cell = { x: string; y: string; rates: number[] };
+type Summary = {
+  candidate: string;
+  rates: number[];
+  mean: number;
+  min: number;
+  max: number;
+  completedRepeats: number;
+  expectedRepeats: number | null;
+  status: 'qualified' | 'collector-only' | 'failed' | 'unqualified';
+};
+type OfficialWindow = {
+  start: number;
+  end: number;
+  rate: number;
+  pendingRows: number;
+  pendingBytes: number;
+  oldestAgeMs: number;
+  retryDebtRows: number;
+};
+type RepeatAssessment = { qualified: boolean; rates: number[]; reason: string };
+
+function isRecord(value: unknown): value is RecordValue {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
 function requiredText(value: unknown, field: string): string {
   if (typeof value !== 'string' || value.trim() === '') throw new Error(field + ' must be a non-empty string');
   return value;
+}
+
+function nullableMetric(value: unknown, field: string, maximum = Number.POSITIVE_INFINITY): number | null {
+  if (value == null) return null;
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > maximum) {
+    throw new Error(field + ' must be a non-negative finite number or null');
+  }
+  return value;
+}
+
+function parseOfficialRun(value: unknown, field: string): OfficialWindowRun {
+  if (!isRecord(value) || !isRecord(value.status) || !Array.isArray(value.rows) || !isRecord(value.config)) {
+    throw new Error(field + ' must contain an official run status, rows, and config');
+  }
+  const status = value.status;
+  const state = status.state;
+  if (typeof status.id !== 'string' || (state !== 'queued' && state !== 'running' && state !== 'succeeded' && state !== 'failed' && state !== 'cancelled') ||
+      typeof status.progress !== 'string' || !Number.isSafeInteger(status.result_count) ||
+      typeof status.error !== 'string' && status.error !== null) {
+    throw new Error(field + ' has an invalid official run status');
+  }
+  const runRows = value.rows.map(row => {
+    if (!isRecord(row)) throw new Error(field + ' rows must be official result objects');
+    return row;
+  });
+  if (value.mode !== 'local' && value.mode !== 'aks') throw new Error(field + ' mode must be local or aks');
+  return {
+    status: { id: status.id, state, progress: status.progress, result_count: Number(status.result_count), error: status.error },
+    rows: runRows,
+    expectedSha: requiredText(value.expectedSha, field + ' expectedSha'),
+    mode: value.mode,
+    config: value.config,
+  };
 }
 
 function escapeXml(value: string): string {
@@ -38,29 +109,69 @@ function numberLabel(value: number): string {
 
 export function validateCampaignMeasurements(value: unknown): CampaignMeasurement[] {
   if (!Array.isArray(value) || value.length === 0) throw new Error('results must be a non-empty array');
+  const identities = new Set<string>();
+  const candidates = new Map<string, { factorX: string; valueX: string; factorY: string; valueY: string; expectedRepeats: number | null }>();
   return value.map((raw, index) => {
     if (!isRecord(raw)) throw new Error('result ' + index + ' must be an object');
     const rate = raw.committedRowsPerSecond;
     if (rate !== null && (typeof rate !== 'number' || !Number.isFinite(rate) || rate < 0)) {
       throw new Error('result ' + index + ' committedRowsPerSecond must be a non-negative number or null');
     }
+    const cohort = requiredText(raw.cohort, 'result ' + index + ' cohort');
+    const candidate = requiredText(raw.candidate, 'result ' + index + ' candidate');
+    const factorX = requiredText(raw.factorX, 'result ' + index + ' factorX');
+    const valueX = requiredText(raw.valueX, 'result ' + index + ' valueX');
+    const factorY = requiredText(raw.factorY, 'result ' + index + ' factorY');
+    const valueY = requiredText(raw.valueY, 'result ' + index + ' valueY');
+    if (!Number.isSafeInteger(raw.repeat) || Number(raw.repeat) < 1) throw new Error('result ' + index + ' repeat must be a positive integer');
+    const repeat = Number(raw.repeat);
+    const expectedRepeats = raw.expectedRepeats === undefined ? null : Number(raw.expectedRepeats);
+    if (expectedRepeats !== null && (!Number.isSafeInteger(expectedRepeats) || expectedRepeats < 1 || repeat > expectedRepeats)) {
+      throw new Error('result ' + index + ' expectedRepeats must include its positive repeat number');
+    }
+    const identity = JSON.stringify([cohort, candidate, repeat]);
+    if (identities.has(identity)) throw new Error('duplicate candidate/repeat identity: ' + cohort + '/' + candidate + '/' + repeat);
+    identities.add(identity);
+    const candidateKey = JSON.stringify([cohort, candidate]);
+    const candidateInfo = candidates.get(candidateKey);
+    if (candidateInfo && (candidateInfo.factorX !== factorX || candidateInfo.valueX !== valueX || candidateInfo.factorY !== factorY ||
+        candidateInfo.valueY !== valueY || candidateInfo.expectedRepeats !== expectedRepeats)) {
+      throw new Error('candidate repeats have incompatible factors or expected repeat counts: ' + cohort + '/' + candidate);
+    }
+    candidates.set(candidateKey, { factorX, valueX, factorY, valueY, expectedRepeats });
     const diedFirst = raw.diedFirst == null ? null : requiredText(raw.diedFirst, 'result ' + index + ' diedFirst');
     const comment = raw.comment == null ? null : requiredText(raw.comment, 'result ' + index + ' comment');
-    if (diedFirst?.toLowerCase() === 'kustainer' && (rate !== null || !comment)) {
-      throw new Error('a dead Kustainer must have a null committed rate and a comment');
+    const kustainerDied = diedFirst?.toLowerCase() === 'kustainer';
+    if (kustainerDied && !comment) throw new Error('a dead Kustainer requires a concrete comment');
+    const qapCompletionPercent = nullableMetric(raw.qapCompletionPercent, 'result ' + index + ' qapCompletionPercent', 100);
+    const qapPendingArtifacts = nullableMetric(raw.qapPendingArtifacts, 'result ' + index + ' qapPendingArtifacts');
+    const qapUnhealthyCatalogs = nullableMetric(raw.qapUnhealthyCatalogs, 'result ' + index + ' qapUnhealthyCatalogs');
+    if (kustainerDied && [qapCompletionPercent, qapPendingArtifacts, qapUnhealthyCatalogs].some(metric => metric !== null)) {
+      throw new Error('a dead Kustainer requires unavailable downstream metrics to be null');
     }
-    if (!Number.isSafeInteger(raw.repeat) || Number(raw.repeat) < 1) throw new Error('result ' + index + ' repeat must be a positive integer');
+    const downstreamStatus = raw.downstreamStatus;
+    if (downstreamStatus !== undefined && downstreamStatus !== 'unavailable' && downstreamStatus !== 'observed_or_not_attempted') {
+      throw new Error('result ' + index + ' downstreamStatus is invalid');
+    }
+    const factorConfigPaths = raw.factorConfigPaths;
+    if (factorConfigPaths !== undefined && (!Array.isArray(factorConfigPaths) || factorConfigPaths.length !== 2 ||
+        factorConfigPaths.some(path => typeof path !== 'string' || path.trim() === ''))) {
+      throw new Error('result ' + index + ' factorConfigPaths must contain two config paths');
+    }
+    const officialWindows = raw.officialWindows;
+    if (officialWindows !== undefined && !Array.isArray(officialWindows)) throw new Error('result ' + index + ' officialWindows must be an array');
     return {
-      cohort: requiredText(raw.cohort, 'result ' + index + ' cohort'),
-      candidate: requiredText(raw.candidate, 'result ' + index + ' candidate'),
-      factorX: requiredText(raw.factorX, 'result ' + index + ' factorX'),
-      valueX: requiredText(raw.valueX, 'result ' + index + ' valueX'),
-      factorY: requiredText(raw.factorY, 'result ' + index + ' factorY'),
-      valueY: requiredText(raw.valueY, 'result ' + index + ' valueY'),
-      repeat: Number(raw.repeat),
-      committedRowsPerSecond: rate as number | null,
-      diedFirst,
-      comment,
+      cohort, candidate, factorX, valueX, factorY, valueY, repeat,
+      committedRowsPerSecond: rate,
+      expectedRepeats,
+      factorConfigPaths: factorConfigPaths === undefined ? undefined : [String(factorConfigPaths[0]), String(factorConfigPaths[1])],
+      officialWindows: officialWindows?.map((run, runIndex) => parseOfficialRun(run, 'result ' + index + ' officialWindows[' + runIndex + ']')),
+      diedFirst, comment,
+      downstreamStatus: kustainerDied ? 'unavailable' : downstreamStatus as CampaignMeasurement['downstreamStatus'],
+      qapCompletionPercent: kustainerDied ? null : qapCompletionPercent,
+      qapPendingArtifacts: kustainerDied ? null : qapPendingArtifacts,
+      qapUnhealthyCatalogs: kustainerDied ? null : qapUnhealthyCatalogs,
+      collectorOnly: kustainerDied || downstreamStatus === 'unavailable',
     };
   });
 }
@@ -81,6 +192,179 @@ function average(values: number[]): number {
   return values.reduce((sum, value) => sum + value, 0) / values.length;
 }
 
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return '[' + value.map(stableJson).join(',') + ']';
+  if (isRecord(value)) return '{' + Object.keys(value).sort().map(key => JSON.stringify(key) + ':' + stableJson(value[key])).join(',') + '}';
+  return JSON.stringify(value);
+}
+
+function removeFactorPath(config: RecordValue, path: string): boolean {
+  let parts = path.split('.');
+  let root = config;
+  if (parts[0] === 'tunables') {
+    parts = parts.slice(1);
+    if (!isRecord(config.tunables)) return false;
+    root = config.tunables;
+  }
+  else if (!Object.hasOwn(config, parts[0]!) && isRecord(config.tunables)) root = config.tunables;
+  if (!parts.length) return false;
+  let parent: RecordValue = root;
+  for (const part of parts.slice(0, -1)) {
+    if (!isRecord(parent[part])) return false;
+    parent = parent[part] as RecordValue;
+  }
+  const leaf = parts[parts.length - 1]!;
+  if (!Object.hasOwn(parent, leaf)) return false;
+  delete parent[leaf];
+  return true;
+}
+
+function officialImageIds(run: OfficialWindowRun): string[] | null {
+  const images: string[] = [];
+  for (const row of run.rows) {
+    if (typeof row.evidence_json !== 'string') continue;
+    try {
+      const evidence: unknown = JSON.parse(row.evidence_json);
+      if (!isRecord(evidence) || !Array.isArray(evidence.processes)) continue;
+      for (const process of evidence.processes) {
+        if (isRecord(process) && process.component === 'collector' && typeof process.image_id === 'string') images.push(process.image_id);
+      }
+    } catch { /* invalid official evidence remains unqualified */ }
+  }
+  return images.length ? images.sort() : null;
+}
+
+function assertCompatibleBaselines(rows: CampaignMeasurement[], cohort: string): void {
+  let source: string | undefined;
+  let configFingerprint: string | undefined;
+  let mode: string | undefined;
+  for (const row of rows) {
+    if (!row.officialWindows?.length) continue;
+    if (!row.factorConfigPaths) throw new Error('official evidence requires factorConfigPaths to compare frozen baselines');
+    for (const run of row.officialWindows) {
+      const config = structuredClone(run.config);
+      if (!removeFactorPath(config, row.factorConfigPaths[0]) || !removeFactorPath(config, row.factorConfigPaths[1])) {
+        throw new Error('cohort ' + cohort + ' has factorConfigPaths that do not resolve in official config');
+      }
+      const fingerprint = stableJson({ config, collectorImages: officialImageIds(run) });
+      if (source !== undefined && (source !== run.expectedSha || configFingerprint !== fingerprint || mode !== run.mode)) {
+        throw new Error('cohort ' + cohort + ' has incompatible frozen source/resource/load baselines');
+      }
+      source = run.expectedSha;
+      configFingerprint = fingerprint;
+      mode = run.mode;
+    }
+  }
+}
+
+function nonNegativeInteger(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
+function positiveTrend(values: number[]): boolean {
+  const meanX = (values.length - 1) / 2;
+  const meanY = average(values);
+  let covariance = 0;
+  let variance = 0;
+  values.forEach((value, index) => {
+    covariance += (index - meanX) * (value - meanY);
+    variance += (index - meanX) ** 2;
+  });
+  return variance > 0 && covariance / variance > 1e-9;
+}
+
+function inspectOfficialWindow(run: OfficialWindowRun): { window?: OfficialWindow; reason?: string } {
+  const verdict = evaluateDataFlow(run.status, run.rows, run.expectedSha, run.mode, run.config, 'single_hot_table_campaign');
+  if (verdict.ingestPass !== true || verdict.rows.length !== 1) return { reason: 'official campaign ingest evidence did not pass' };
+  const row = verdict.rows[0]!;
+  if (typeof row.evidence_json !== 'string') return { reason: 'official evidence_json is missing' };
+  let evidence: unknown;
+  try { evidence = JSON.parse(row.evidence_json); } catch { return { reason: 'official evidence_json is invalid' }; }
+  if (!isRecord(evidence) || evidence.version !== 1 || !isRecord(evidence.commit_window_output_throughput)) {
+    return { reason: 'official commit-window evidence is missing' };
+  }
+  const output = evidence.commit_window_output_throughput;
+  const start = nonNegativeInteger(output.measurement_start_unix_ms);
+  const end = nonNegativeInteger(output.measurement_end_unix_ms);
+  const rate = output.rows_per_second;
+  if (output.window_seconds !== 30 || start === undefined || end === undefined || end - start !== 30_000 ||
+      typeof rate !== 'number' || !Number.isFinite(rate) || rate <= 0) return { reason: 'a complete official 30-second commit window is required' };
+  const reconciliation = evidence.reconciliation;
+  if (!isRecord(reconciliation) || reconciliation.status !== 'within_bound' || reconciliation.lower_bound_met !== true ||
+      reconciliation.upper_bound_met !== true || reconciliation.exact_match !== true || reconciliation.ambiguous_rows !== 0) {
+    return { reason: 'official source/new-commit reconciliation is incomplete or inexact' };
+  }
+  const backlog = evidence.backlog;
+  if (!isRecord(backlog)) return { reason: 'official pending/debt evidence is unavailable' };
+  const pendingRows = nonNegativeInteger(backlog.pending_rows);
+  const pendingBytes = nonNegativeInteger(backlog.pending_bytes);
+  const oldestAgeMs = nonNegativeInteger(backlog.oldest_age_ms);
+  const retryDebtRows = nonNegativeInteger(backlog.retry_debt_rows);
+  if ([pendingRows, pendingBytes, oldestAgeMs, retryDebtRows].some(value => value === undefined)) {
+    return { reason: 'official pending/debt evidence is incomplete' };
+  }
+  return { window: { start, end, rate, pendingRows: pendingRows!, pendingBytes: pendingBytes!, oldestAgeMs: oldestAgeMs!, retryDebtRows: retryDebtRows! } };
+}
+
+function assessRepeat(row: CampaignMeasurement): RepeatAssessment {
+  if (row.diedFirst) return { qualified: false, rates: [], reason: row.collectorOnly ? 'collector-only downstream failure' : 'a component died during the run' };
+  if (!row.expectedRepeats || !row.factorConfigPaths || !row.officialWindows || row.officialWindows.length < 5) {
+    return { qualified: false, rates: [], reason: 'complete official protocol evidence is missing' };
+  }
+  const windows: OfficialWindow[] = [];
+  for (const run of row.officialWindows) {
+    const result = inspectOfficialWindow(run);
+    if (!result.window) return { qualified: false, rates: [], reason: result.reason ?? 'invalid official window' };
+    windows.push(result.window);
+  }
+  windows.sort((a, b) => a.start - b.start);
+  for (let index = 1; index < windows.length; index++) {
+    if (windows[index]!.start < windows[index - 1]!.end) return { qualified: false, rates: [], reason: 'official commit windows overlap' };
+  }
+  const rates = windows.map(window => window.rate);
+  const mean = average(rates);
+  if ((Math.max(...rates) - Math.min(...rates)) / mean > 0.05) {
+    return { qualified: false, rates, reason: 'official window range exceeds 5% of the mean' };
+  }
+  if ([
+    windows.map(window => window.pendingRows),
+    windows.map(window => window.pendingBytes),
+    windows.map(window => window.oldestAgeMs),
+    windows.map(window => window.retryDebtRows),
+  ].some(positiveTrend)) return { qualified: false, rates, reason: 'official pending/debt trend is growing' };
+  return { qualified: true, rates, reason: 'protocol evidence complete' };
+}
+
+function summarizeCandidates(rows: CampaignMeasurement[]): Summary[] {
+  const groups = new Map<string, CampaignMeasurement[]>();
+  for (const row of rows) {
+    const group = groups.get(row.candidate) ?? [];
+    group.push(row);
+    groups.set(row.candidate, group);
+  }
+  return [...groups].map(([candidate, group]) => {
+    const expectedRepeats = group[0]!.expectedRepeats ?? null;
+    const assessments = group.map(row => ({ row, evidence: assessRepeat(row) }));
+    const completed = assessments.filter(item => item.evidence.qualified);
+    const repeatIds = new Set(group.map(row => row.repeat));
+    const completeSet = expectedRepeats !== null && repeatIds.size === expectedRepeats &&
+      Array.from({ length: expectedRepeats }, (_, index) => repeatIds.has(index + 1)).every(Boolean);
+    const qualified = expectedRepeats !== null && expectedRepeats >= 3 && completeSet && completed.length === expectedRepeats;
+    const officialRepeatRates = completed.map(item => average(item.evidence.rates));
+    const observedRates = group.flatMap(row => row.committedRowsPerSecond === null ? [] : [row.committedRowsPerSecond]);
+    const rates = qualified ? officialRepeatRates : observedRates;
+    const deaths = group.map(row => row.diedFirst).filter((value): value is string => value !== null && value !== undefined);
+    const status = qualified ? 'qualified' : deaths.some(value => value.toLowerCase() !== 'kustainer') ? 'failed' :
+      deaths.length || group.some(row => row.collectorOnly) ? 'collector-only' : 'unqualified';
+    return {
+      candidate, rates, mean: rates.length ? average(rates) : 0,
+      min: rates.length ? Math.min(...rates) : 0,
+      max: rates.length ? Math.max(...rates) : 0,
+      completedRepeats: completed.length, expectedRepeats, status,
+    };
+  });
+}
+
 export function renderCampaignResults(input: unknown, cohort: string): string {
   const allRows = validateCampaignMeasurements(input);
   const rows = allRows.filter(row => row.cohort === cohort);
@@ -90,6 +374,7 @@ export function renderCampaignResults(input: unknown, cohort: string): string {
   if (rows.some(row => row.factorX !== factorX || row.factorY !== factorY)) {
     throw new Error('a cohort picture must use exactly one pair of factors');
   }
+  assertCompatibleBaselines(rows, cohort);
   const xValues = [...new Set(rows.map(row => row.valueX))].sort();
   const yValues = [...new Set(rows.map(row => row.valueY))].sort();
   const cells = new Map<string, Cell>();
@@ -102,33 +387,29 @@ export function renderCampaignResults(input: unknown, cohort: string): string {
   const rates = rows.flatMap(row => row.committedRowsPerSecond === null ? [] : [row.committedRowsPerSecond]);
   const minimum = rates.length ? Math.min(...rates) : 0;
   const maximum = rates.length ? Math.max(...rates) : 0;
-  const groups = new Map<string, number[]>();
-  for (const row of rows) {
-    if (row.committedRowsPerSecond === null) continue;
-    const values = groups.get(row.candidate) ?? [];
-    values.push(row.committedRowsPerSecond);
-    groups.set(row.candidate, values);
-  }
-  const leaderboard: Summary[] = [...groups].map(([candidate, values]) => ({
-    candidate, rates: values, mean: average(values), min: Math.min(...values), max: Math.max(...values),
-  })).sort((a, b) => b.mean - a.mean || a.candidate.localeCompare(b.candidate));
+  const summaries = summarizeCandidates(rows);
+  const leaderboard = summaries.filter(item => item.status === 'qualified');
+  const exploratory = summaries.filter(item => item.status !== 'qualified');
   const maxMean = Math.max(1, ...leaderboard.map(item => item.mean));
+  const deaths = rows.filter(row => row.diedFirst);
   const width = 1220;
   const heatX = 45;
   const heatY = 130;
   const cellWidth = Math.max(76, Math.min(150, 500 / Math.max(1, xValues.length)));
   const cellHeight = 42;
   const leaderboardX = 610;
-  const height = Math.max(540, 230 + yValues.length * 38 + 55 + leaderboard.length * 38 + Math.min(rows.length, 8) * 25);
+  const noteY = Math.max(heatY + yValues.length * cellHeight + 70, 145 + leaderboard.length * 38);
+  const exploratoryY = noteY + 45 + Math.min(deaths.length, 8) * 23;
+  const height = Math.max(540, 145 + leaderboard.length * 38, exploratoryY + 45 + exploratory.length * 24);
   const parts: string[] = [
     '<svg xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc" width="' + width + '" height="' + height + '" viewBox="0 0 ' + width + ' ' + height + '">',
-    '<title id="title">' + escapeXml(cohort + ' throughput heatmap and repeat leaderboard') + '</title>',
-    '<desc id="desc">Committed new rows per second; repeat ranges show observed error bars. Null rates are not plotted as zero.</desc>',
+    '<title id="title">' + escapeXml(cohort + ' throughput heatmap and sustainable leaderboard') + '</title>',
+    '<desc id="desc">Committed new rows per second; repeat ranges are ranked only with complete official campaign evidence. Unqualified rates remain exploratory and null rates are not plotted as zero.</desc>',
     '<rect width="100%" height="100%" fill="#ffffff"/>',
     '<g fill="#1f2328" font-family="Segoe UI, Arial, sans-serif">',
     svgText(40, 42, cohort + ' | committed new rows/s', 22, 'bold'),
     svgText(40, 76, factorX + ' × ' + factorY + ' heatmap', 16, 'bold'),
-    svgText(leaderboardX, 76, 'Leaderboard | mean and repeat range', 16, 'bold'),
+    svgText(leaderboardX, 76, 'Sustainable leaderboard | official evidence only', 16, 'bold'),
     svgText(heatX, heatY - 18, factorX + ' →', 12, 'bold'),
   ];
   xValues.forEach((value, index) => parts.push(svgText(heatX + 126 + index * cellWidth, heatY - 18, value, 11)));
@@ -148,12 +429,13 @@ export function renderCampaignResults(input: unknown, cohort: string): string {
       }
     });
   });
-  parts.push(svgText(heatX, heatY + yValues.length * cellHeight + 20, factorY + ' ↓ | repeat means; null = unavailable', 11));
+  parts.push(svgText(heatX, heatY + yValues.length * cellHeight + 20, factorY + ' ↓ | observed repeat means; null = unavailable', 11));
   const barStart = leaderboardX + 190;
   const barWidth = 300;
+  if (!leaderboard.length) parts.push(svgText(leaderboardX, 112, 'No qualified winner: complete official evidence is missing or invalid.', 12, 'bold'));
   leaderboard.forEach((item, index) => {
     const y = 112 + index * 38;
-    parts.push(svgText(leaderboardX, y + 13, item.candidate, 12));
+    parts.push(svgText(leaderboardX, y + 13, item.candidate + ' (' + item.completedRepeats + '/' + item.expectedRepeats + ')', 12));
     const meanWidth = item.mean / maxMean * barWidth;
     const minX = barStart + item.min / maxMean * barWidth;
     const maxX = barStart + item.max / maxMean * barWidth;
@@ -163,14 +445,21 @@ export function renderCampaignResults(input: unknown, cohort: string): string {
     parts.push('<line x1="' + maxX + '" y1="' + (y + 4) + '" x2="' + maxX + '" y2="' + (y + 14) + '" stroke="#1f2328"/>');
     parts.push(svgText(barStart + barWidth + 12, y + 13, numberLabel(item.mean) + ' (' + numberLabel(item.min) + '–' + numberLabel(item.max) + ')', 11));
   });
-  const deaths = rows.filter(row => row.diedFirst);
-  const noteY = Math.max(heatY + yValues.length * cellHeight + 70, 145 + leaderboard.length * 38);
   parts.push(svgText(40, noteY, 'What died first', 16, 'bold'));
   if (!deaths.length) parts.push(svgText(40, noteY + 25, 'No failure recorded in these rows.', 12));
   deaths.slice(0, 8).forEach((row, index) => {
     const rate = row.committedRowsPerSecond === null ? 'committed rows/s: null' : 'committed rows/s: ' + numberLabel(row.committedRowsPerSecond);
+    const status = row.collectorOnly ? 'collector-only; downstream metrics: null; ' : '';
     const comment = row.comment ? ' — ' + row.comment : '';
-    parts.push(svgText(40, noteY + 25 + index * 23, row.candidate + ' repeat ' + row.repeat + ': ' + row.diedFirst + ' (' + rate + ')' + comment, 11));
+    parts.push(svgText(40, noteY + 25 + index * 23, row.candidate + ' repeat ' + row.repeat + ': ' + row.diedFirst + ' (' + status + rate + ')' + comment, 11));
+  });
+  parts.push(svgText(40, exploratoryY, 'Exploratory / failed observations (not ranked)', 16, 'bold'));
+  if (!exploratory.length) parts.push(svgText(40, exploratoryY + 25, 'All observed candidates have complete sustainable evidence.', 12));
+  exploratory.forEach((item, index) => {
+    const expected = item.expectedRepeats === null ? '?' : String(item.expectedRepeats);
+    const observed = item.rates.length ? 'observed mean ' + numberLabel(item.mean) + ' rows/s' : 'no committed-rate observation';
+    parts.push(svgText(40, exploratoryY + 25 + index * 24,
+      item.candidate + ': ' + item.status + ', ' + item.completedRepeats + '/' + expected + ' protocol-complete repeats; ' + observed, 11));
   });
   parts.push('</g></svg>');
   return parts.join('\n');

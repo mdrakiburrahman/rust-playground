@@ -209,5 +209,15 @@
     "trigger": "zstd wins the coarse codec comparison",
     "selection": "winner plus up to three adjacent levels accepted by the E1 registry bounds",
     "max_candidates": 4
-  }
+  },
+  "config_validation": {
+    "status": "config-validated",
+    "validator": "arrowcol-oat-rust --validate-config",
+    "e1_source_sha": "52a95e06633708bc4896b1a54e868516d1068ca6",
+    "l1a_source_sha": "00e1e2bf12cc754892d24bcda6bcbe60a6723bfd",
+    "candidate_count": 8,
+    "pass_count": 8,
+    "pending_count": 0
+  },
+  "runnable": true
 }

@@ -96,12 +96,12 @@
       "factor": "parquet_writer.columns",
       "candidates": [
         {
-          "id": "database-name-dictionary-off",
+          "id": "availability-group-name-dictionary-off",
           "overrides": {
             "tunables": {
               "parquet_writer": {
                 "columns": {
-                  "database_name": {
+                  "availability_group_name": {
                     "dictionary_enabled": false
                   }
                 }
@@ -110,12 +110,12 @@
           }
         },
         {
-          "id": "database-name-dictionary-on",
+          "id": "availability-group-name-dictionary-on",
           "overrides": {
             "tunables": {
               "parquet_writer": {
                 "columns": {
-                  "database_name": {
+                  "availability_group_name": {
                     "dictionary_enabled": true
                   }
                 }
@@ -124,12 +124,12 @@
           }
         },
         {
-          "id": "session-id-delta",
+          "id": "last-connect-error-delta-binary-packed",
           "overrides": {
             "tunables": {
               "parquet_writer": {
                 "columns": {
-                  "session_id": {
+                  "last_connect_error_number": {
                     "dictionary_enabled": false,
                     "encoding": "delta_binary_packed"
                   }
@@ -139,12 +139,12 @@
           }
         },
         {
-          "id": "session-id-byte-stream-split",
+          "id": "last-connect-error-byte-stream-split",
           "overrides": {
             "tunables": {
               "parquet_writer": {
                 "columns": {
-                  "session_id": {
+                  "last_connect_error_number": {
                     "dictionary_enabled": false,
                     "encoding": "byte_stream_split"
                   }
@@ -156,5 +156,15 @@
       ],
       "candidate_limit": 4
     }
-  ]
+  ],
+  "config_validation": {
+    "status": "config-validated",
+    "validator": "arrowcol-oat-rust --validate-config",
+    "e1_source_sha": "52a95e06633708bc4896b1a54e868516d1068ca6",
+    "l1a_source_sha": "00e1e2bf12cc754892d24bcda6bcbe60a6723bfd",
+    "candidate_count": 4,
+    "pass_count": 4,
+    "pending_count": 0
+  },
+  "runnable": true
 }

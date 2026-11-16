@@ -37,10 +37,10 @@ const cohorts: Cohort[] = [
     max_candidates: 4,
   } },
   { id: 'C2', comparisons: [compare('dictionary-encoding', 'parquet_writer.columns', [
-    candidate('database-name-dictionary-off', { parquet_writer: { columns: { database_name: { dictionary_enabled: false } } } }),
-    candidate('database-name-dictionary-on', { parquet_writer: { columns: { database_name: { dictionary_enabled: true } } } }),
-    candidate('session-id-delta', { parquet_writer: { columns: { session_id: { dictionary_enabled: false, encoding: 'delta_binary_packed' } } } }),
-    candidate('session-id-byte-stream-split', { parquet_writer: { columns: { session_id: { dictionary_enabled: false, encoding: 'byte_stream_split' } } } }),
+    candidate('availability-group-name-dictionary-off', { parquet_writer: { columns: { availability_group_name: { dictionary_enabled: false } } } }),
+    candidate('availability-group-name-dictionary-on', { parquet_writer: { columns: { availability_group_name: { dictionary_enabled: true } } } }),
+    candidate('last-connect-error-delta-binary-packed', { parquet_writer: { columns: { last_connect_error_number: { dictionary_enabled: false, encoding: 'delta_binary_packed' } } } }),
+    candidate('last-connect-error-byte-stream-split', { parquet_writer: { columns: { last_connect_error_number: { dictionary_enabled: false, encoding: 'byte_stream_split' } } } }),
   ])] },
   { id: 'C3', comparisons: [
     compare('row-groups', 'parquet_writer.max_row_group_rows', [16384, 65536, 131072, 1000000].map(value => candidate('row-group-' + value, {
@@ -62,7 +62,7 @@ const cohorts: Cohort[] = [
     }))),
   ] },
   { id: 'C4', comparisons: [compare('sort-key', 'collector.layout.sort_columns', [
-    candidate('none', { collector: { layout: { enabled: false, sort_columns: [] } }, parquet_writer: { sorting_columns: [] } }),
+    candidate('none', { collector: { layout: { enabled: true, sort_columns: [] } }, parquet_writer: { sorting_columns: [] } }),
     candidate('sample-time', { collector: { layout: { enabled: true, sort_columns: ['sample_time_utc'] } }, parquet_writer: { sorting_columns: [{ path: 'sample_time_utc', descending: false, nulls_first: false }] } }),
     candidate('replica-sample-time', { collector: { layout: { enabled: true, sort_columns: ['replica_server_name', 'sample_time_utc'] } }, parquet_writer: { sorting_columns: [{ path: 'replica_server_name', descending: false, nulls_first: false }, { path: 'sample_time_utc', descending: false, nulls_first: false }] } }),
     candidate('group-replica-sample-time', { collector: { layout: { enabled: true, sort_columns: ['availability_group_id', 'replica_server_name', 'sample_time_utc'] } }, parquet_writer: { sorting_columns: [{ path: 'availability_group_id', descending: false, nulls_first: false }, { path: 'replica_server_name', descending: false, nulls_first: false }, { path: 'sample_time_utc', descending: false, nulls_first: false }] } }),
