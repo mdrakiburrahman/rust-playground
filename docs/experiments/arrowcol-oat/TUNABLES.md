@@ -54,7 +54,9 @@ For the planned zero-interval comparison, keep Profile A unpooled (`sql_pool_max
 
 | Measurement | Interpretation |
 | --- | --- |
-| Supplied local/AKS quick profiles | 10-second warm-up, 30-second measurement, unchanged load, explicit 300-second post-client reconciliation budget. Shipped OAT YAML uses `batching.max_age: 5s` and `commit.batch_window: 2s`; injected settings may change these timings. |
+| Supplied local/AKS quick windows | 10-second warm-up, 30-second measurement, unchanged load. Shipped OAT YAML uses `batching.max_age: 5s` and `commit.batch_window: 2s`; injected settings may change these timings. |
+| Local quick observation budgets | 300-second post-client reconciliation and 60-second QAP timeout. |
+| AKS quick observation budgets | 600-second post-client reconciliation and 180-second QAP timeout. The QAP timeout bounds preparation and post-measurement observation; required verdict gates are unchanged. |
 | Admission rows/s | Client completions within the exact shared measurement window divided by its duration; not durable output. |
 | Commit-window rows/s | Rows in new ingestion commits finished within that exact window; not a client cohort and not post-window settling. |
 | Zero commit-window output | A short run may admit rows before commits finish. Known zero remains zero in the summary/table/result with an explanation; a dash means unavailable evidence. Size-triggered flushes and warm-up backlog can still produce commits in short windows. |
