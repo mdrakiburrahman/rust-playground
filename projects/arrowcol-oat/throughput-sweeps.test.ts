@@ -11,6 +11,36 @@ function at(value: unknown, path: string[]): unknown {
   return current;
 }
 
+test('screens applicable BYTE_ARRAY encodings with an explicit matched plain control', () => {
+  const base = { platform: { kind: 'local' }, tunables: { parquet_writer: { columns: {} } } };
+  const manifest = buildThroughputManifests(base).find(item => item.cohort === 'C2')!;
+  const comparison = (manifest.comparisons as Array<{ id: string; factor: string; candidates: Array<{ id: string }> }>)
+    .find(item => item.id === 'string-encoding');
+  assert.ok(comparison);
+  assert.equal(comparison.factor, 'parquet_writer.columns.availability_group_name.encoding');
+  assert.deepEqual(comparison.candidates.map(item => item.id), ['plain', 'delta-length-byte-array', 'delta-byte-array']);
+  const configs = comparison.candidates.map(item => renderThroughputConfig(base, manifest, comparison.id, item.id));
+  const columns = configs.map(config => at(config, ['tunables', 'parquet_writer', 'columns', 'availability_group_name']));
+  assert.deepEqual(columns, ['plain', 'delta_length_byte_array', 'delta_byte_array'].map(encoding => ({
+    dictionary_enabled: false, encoding,
+  })));
+  const withoutEncoding = configs.map(config => {
+    const copy = structuredClone(config);
+    const column = at(copy, ['tunables', 'parquet_writer', 'columns', 'availability_group_name']) as Record<string, unknown>;
+    delete column.encoding;
+    return copy;
+  });
+  assert.deepEqual(withoutEncoding[0], withoutEncoding[1]);
+  assert.deepEqual(withoutEncoding[1], withoutEncoding[2]);
+  assert.deepEqual(manifest.parquet_enum_coverage, {
+    kind: 'value_encoding',
+    accepted: ['plain', 'rle', 'delta_binary_packed', 'delta_length_byte_array', 'delta_byte_array', 'byte_stream_split'],
+    configured: ['plain', 'delta_binary_packed', 'delta_length_byte_array', 'delta_byte_array', 'byte_stream_split'],
+    excluded: { rle: 'BOOLEAN-only; frozen table has no Boolean column' },
+    status: 'configured-not-runtime-screened',
+  });
+});
+
 test('generates bounded local single-writer manifests from the tunables registry', () => {
   const manifests = buildThroughputManifests({ tunables: { client: { workers: 16 }, maintenance: { enabled: true } } });
   assert.deepEqual(manifests.map(manifest => manifest.cohort), ['C1', 'C2', 'C3', 'C4', 'C5', 'C6', 'C7', 'C8']);

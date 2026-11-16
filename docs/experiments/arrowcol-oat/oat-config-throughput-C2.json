@@ -198,17 +198,85 @@
         }
       ],
       "candidate_limit": 4
+    },
+    {
+      "id": "string-encoding",
+      "factor": "parquet_writer.columns.availability_group_name.encoding",
+      "candidates": [
+        {
+          "id": "plain",
+          "overrides": {
+            "tunables": {
+              "parquet_writer": {
+                "columns": {
+                  "availability_group_name": {
+                    "dictionary_enabled": false,
+                    "encoding": "plain"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "delta-length-byte-array",
+          "overrides": {
+            "tunables": {
+              "parquet_writer": {
+                "columns": {
+                  "availability_group_name": {
+                    "dictionary_enabled": false,
+                    "encoding": "delta_length_byte_array"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "delta-byte-array",
+          "overrides": {
+            "tunables": {
+              "parquet_writer": {
+                "columns": {
+                  "availability_group_name": {
+                    "dictionary_enabled": false,
+                    "encoding": "delta_byte_array"
+                  }
+                }
+              }
+            }
+          }
+        }
+      ],
+      "candidate_limit": 4
     }
   ],
+  "parquet_enum_coverage": {
+    "kind": "value_encoding",
+    "accepted": [
+      "plain",
+      "rle",
+      "delta_binary_packed",
+      "delta_length_byte_array",
+      "delta_byte_array",
+      "byte_stream_split"
+    ],
+    "configured": [
+      "plain",
+      "delta_binary_packed",
+      "delta_length_byte_array",
+      "delta_byte_array",
+      "byte_stream_split"
+    ],
+    "excluded": {
+      "rle": "BOOLEAN-only; frozen table has no Boolean column"
+    },
+    "status": "configured-not-runtime-screened"
+  },
   "runnable": false,
   "config_validation": {
-    "status": "config-validated",
-    "validator": "arrowcol-oat-rust --validate-config",
-    "source_sha": "02703b71d3c6a2ac92c690f70f1d967b8ac4c7c7",
-    "baseline_count": 1,
-    "candidate_count": 4,
-    "pass_count": 5,
-    "fail_count": 0
+    "status": "not-validated"
   },
   "runtime_qualification": "unqualified"
 }
