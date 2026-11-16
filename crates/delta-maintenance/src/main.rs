@@ -411,8 +411,13 @@ fn main_inner() -> Result<bool> {
     let handler_force = Arc::clone(&force_abort);
     ctrlc::set_handler(move || request_shutdown(&handler_stop, &handler_force))?;
     let metrics = Metrics::new();
+    let stop_metrics_listener = Arc::new(AtomicBool::new(false));
     let listener = if settings.interval.is_some() && !no_listener {
-        Some(serve_metrics(listen, metrics.clone(), Arc::clone(&stop_admission))?)
+        Some(serve_metrics(
+            listen,
+            metrics.clone(),
+            Arc::clone(&stop_metrics_listener),
+        )?)
     } else {
         None
     };
@@ -426,7 +431,7 @@ fn main_inner() -> Result<bool> {
     } else {
         run_with_shutdown(&settings, &metrics, &stop_admission, &force_abort)
     };
-    stop_admission.store(true, Ordering::SeqCst);
+    stop_metrics_listener.store(true, Ordering::SeqCst);
     if let Some(listener) = listener {
         listener.join().map_err(|_| anyhow!("metrics listener panicked"))?;
     }
@@ -454,6 +459,35 @@ mod tests {
         request_shutdown(&stop_admission, &force_abort);
         assert!(stop_admission.load(Ordering::SeqCst));
         assert!(force_abort.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn metrics_listener_remains_available_during_graceful_drain() -> Result<()> {
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+
+        let reservation = TcpListener::bind("127.0.0.1:0")?;
+        let listen = reservation.local_addr()?;
+        drop(reservation);
+        let stop_metrics_listener = Arc::new(AtomicBool::new(false));
+        let listener = serve_metrics(listen, Metrics::new(), Arc::clone(&stop_metrics_listener))?;
+        let stop_admission = AtomicBool::new(false);
+        let force_abort = AtomicBool::new(false);
+        request_shutdown(&stop_admission, &force_abort);
+        assert!(stop_admission.load(Ordering::SeqCst));
+        assert!(!force_abort.load(Ordering::SeqCst));
+        assert!(!stop_metrics_listener.load(Ordering::SeqCst));
+
+        let mut stream = TcpStream::connect_timeout(&listen, Duration::from_secs(2))?;
+        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+        stream.write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n")?;
+        let mut response = String::new();
+        stream.read_to_string(&mut response)?;
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+
+        stop_metrics_listener.store(true, Ordering::SeqCst);
+        listener.join().map_err(|_| anyhow!("metrics listener panicked"))?;
+        Ok(())
     }
 
     #[test]

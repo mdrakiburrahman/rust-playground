@@ -1868,6 +1868,95 @@ fn optimize_default_layout_preserves_whole_file_customer_order() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn optimize_does_not_rewrite_budget_full_layout_outputs_again() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let table = DeltaTable::open_url(
+        url_of(root.path())?,
+        customer_schema(),
+        vec![INGESTION_PARTITION.into()],
+    )?;
+    for (index, customer) in ["c4", "c1", "c3", "c0"].into_iter().enumerate() {
+        append_customers(&table, 0, &[customer], index as i64)?;
+    }
+    append_customers(&table, 1, &["frontier"], 10)?;
+    let maintenance = DeltaTable::open_for_maintenance(&url_of(root.path())?)?;
+    let layout = LayoutPolicy {
+        sort_columns: vec!["customer_id".into()],
+        max_rows: 2,
+        max_input_bytes: 1024 * 1024,
+        row_group_rows: 2,
+        page_rows: 1,
+        bloom_columns: vec!["customer_id".into()],
+    };
+    let config = OptimizeConfig {
+        layout: Some(layout.clone()),
+        sealed_final: true,
+        ..optimize_config()
+    };
+
+    let first = maintenance.plan_optimize(&config)?;
+    assert_eq!(first.bins.iter().map(|bin| bin.files.len()).sum::<usize>(), 4);
+    let first_report = maintenance.apply_optimize(&first, &config, &control())?;
+    assert_eq!(
+        (
+            first_report.outcome,
+            first_report.files_removed,
+            first_report.files_added,
+            first_report.rows_removed,
+            first_report.rows_added,
+        ),
+        (Outcome::Committed, 4, 2, 4, 4)
+    );
+
+    let second = maintenance.plan_optimize(&config)?;
+    assert!(
+        second.bins.is_empty(),
+        "budget-full outputs under the same policy must not be reselected"
+    );
+    let second_report = maintenance.apply_optimize(&second, &config, &control())?;
+    assert_eq!(second_report.outcome, Outcome::Noop);
+
+    let changed_policy = OptimizeConfig {
+        layout: Some(LayoutPolicy { max_rows: 3, ..layout }),
+        ..config
+    };
+    assert!(
+        !maintenance.plan_optimize(&changed_policy)?.bins.is_empty(),
+        "a changed layout policy must make prior outputs eligible for re-layout"
+    );
+    let mut actual_rows = Vec::new();
+    for (path, _) in active_files(root.path())? {
+        let reader =
+            ParquetRecordBatchReaderBuilder::try_new(fs::File::open(data_path(root.path(), &path)?)?)?.build()?;
+        for batch in reader {
+            let batch = batch?;
+            let customers = arrow::compute::cast(
+                batch.column_by_name("customer_id").context("customer")?,
+                &DataType::Utf8,
+            )?;
+            let customers = customers.as_any().downcast_ref::<StringArray>().context("customers")?;
+            let ids = arrow::compute::cast(batch.column_by_name("id").context("id")?, &DataType::Int64)?;
+            let ids = ids.as_any().downcast_ref::<Int64Array>().context("ids")?;
+            for row in 0..batch.num_rows() {
+                actual_rows.push((customers.value(row).to_owned(), ids.value(row)));
+            }
+        }
+    }
+    actual_rows.sort();
+    assert_eq!(
+        actual_rows,
+        [
+            ("c0".into(), 3),
+            ("c1".into(), 1),
+            ("c3".into(), 2),
+            ("c4".into(), 0),
+            ("frontier".into(), 10)
+        ]
+    );
+    Ok(())
+}
+
 /// Commit-log fault injection for maintenance publication.
 #[derive(Debug)]
 struct UncertainStore {

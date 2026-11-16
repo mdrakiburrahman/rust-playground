@@ -13,6 +13,7 @@ use parquet::basic::Compression;
 use parquet::file::metadata::SortingColumn;
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use parquet::schema::types::ColumnPath;
+use sha2::Digest;
 use std::sync::Arc;
 
 /// Configurable controls applied at the actual Parquet file boundary.
@@ -85,6 +86,15 @@ impl LayoutPolicy {
             "row_group_rows": self.row_group_rows,
             "page_rows": self.page_rows,
         })
+    }
+
+    #[cfg(feature = "delta")]
+    pub(crate) fn fingerprint(&self) -> Result<String> {
+        let bytes = serde_json::to_vec(&self.config_json(None))?;
+        Ok(sha2::Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect())
     }
 
     /// Validate names and nonzero resource limits against the supplied schema.
@@ -220,6 +230,19 @@ impl FileSortBuffer {
             self.input_bytes = input_bytes;
         }
         Ok(true)
+    }
+
+    pub(crate) fn at_budget(&self) -> bool {
+        self.rows >= self.policy.max_rows || self.input_bytes >= self.policy.max_input_bytes
+    }
+
+    pub(crate) fn full_for_next(&self, batch: &RecordBatch) -> bool {
+        let rows_full =
+            self.rows.saturating_add(batch.num_rows()) > self.policy.max_rows && self.rows >= batch.num_rows();
+        let batch_bytes = batch.get_array_memory_size();
+        let bytes_full = self.input_bytes.saturating_add(batch_bytes) > self.policy.max_input_bytes
+            && self.input_bytes >= batch_bytes;
+        self.at_budget() || rows_full || bytes_full
     }
 
     #[must_use]

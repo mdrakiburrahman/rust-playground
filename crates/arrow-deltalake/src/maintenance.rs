@@ -2327,6 +2327,10 @@ pub struct OptimizeConfig {
     pub layout: Option<LayoutPolicy>,
     /// Use the publication layout when no explicit layout is configured.
     pub use_default_layout: bool,
+    /// Resolved policy used by the maintenance service's automatic layout mode.
+    pub automatic_layout: Option<LayoutPolicy>,
+    /// Whether automatic layout was activated by an explicit sort-column property.
+    pub automatic_layout_sort_columns_explicit: bool,
     /// Unsorted output row-group row limit.
     pub output_row_group_rows: usize,
 }
@@ -2354,6 +2358,8 @@ impl Default for OptimizeConfig {
             max_active_files: 1_000_000,
             layout: None,
             use_default_layout: true,
+            automatic_layout: None,
+            automatic_layout_sort_columns_explicit: false,
             output_row_group_rows: 65_536,
         }
     }
@@ -2410,6 +2416,8 @@ pub struct OptimizeBin {
 pub struct OptimizePlan {
     pub header: PlanHeader,
     pub target_file_bytes: u64,
+    #[serde(default)]
+    pub layout_fingerprint: Option<String>,
     pub bins: Vec<OptimizeBin>,
     pub compaction_debt: CompactionDebtEvidence,
     pub backlog_files: u64,
@@ -2470,6 +2478,25 @@ impl OptimizePlan {
     }
 }
 
+fn resolve_optimize_layout(config: &OptimizeConfig, schema: &SchemaRef) -> Result<Option<LayoutPolicy>> {
+    if let Some(layout) = &config.layout {
+        layout.validate(schema)?;
+        return Ok(Some(layout.clone()));
+    }
+    if let Some(layout) = &config.automatic_layout {
+        if !config.automatic_layout_sort_columns_explicit && schema.field_with_name("customer_id").is_err() {
+            return Ok(None);
+        }
+        layout.validate(schema)?;
+        return Ok(Some(layout.clone()));
+    }
+    if config.use_default_layout {
+        crate::delta::configured_publication_layout(schema)
+    } else {
+        Ok(None)
+    }
+}
+
 fn output_estimate(bytes: u64, target: u64) -> usize {
     usize::try_from(bytes.div_ceil(target).max(1)).unwrap_or(usize::MAX)
 }
@@ -2512,6 +2539,14 @@ impl DeltaTable {
         };
         let state = self.active_state(config.max_active_files)?;
         state.fingerprint.validate_supported(false)?;
+        let schema: SchemaRef = Arc::new(state.snapshot.schema().as_ref().try_into_arrow()?);
+        let layout_fingerprint = resolve_optimize_layout(config, &schema)?
+            .as_ref()
+            .map(LayoutPolicy::fingerprint)
+            .transpose()?;
+        let full_output_prefix = layout_fingerprint
+            .as_ref()
+            .map(|value| format!("part-arrowcol-layout-v1-{value}-full-"));
         let columns = state.fingerprint.partition_columns.clone();
         partition_columns_are_strings(&state.snapshot, &columns)?;
         let ingestion = columns == [INGESTION_PARTITION];
@@ -2588,7 +2623,15 @@ impl DeltaTable {
         let mut oldest_eligible_partition_start_ms = None;
         let mut actions = 0_usize;
         for (key, mut files) in ordered {
-            files.retain(|file| file.size < config.small_file_bytes);
+            files.retain(|file| {
+                file.size < config.small_file_bytes
+                    && !full_output_prefix.as_ref().is_some_and(|prefix| {
+                        file.path
+                            .rsplit('/')
+                            .next()
+                            .is_some_and(|name| name.starts_with(prefix))
+                    })
+            });
             files.sort_by(|left, right| left.path.cmp(&right.path));
             let values: BTreeMap<String, Option<String>> = columns.iter().cloned().zip(key).collect();
             let mut current: Vec<DataFile> = Vec::new();
@@ -2646,6 +2689,7 @@ impl DeltaTable {
         let mut plan = OptimizePlan {
             header: PlanHeader::new(self, &state)?,
             target_file_bytes: config.target_file_bytes,
+            layout_fingerprint: layout_fingerprint.clone(),
             bins,
             compaction_debt: CompactionDebtEvidence {
                 observed_at_ms,
@@ -2684,9 +2728,17 @@ impl DeltaTable {
         Ok(PreparedOptimize { plan, state })
     }
 
-    fn check_optimize_plan(&self, plan: &OptimizePlan, config: &OptimizeConfig) -> Result<()> {
+    fn check_optimize_plan(&self, plan: &OptimizePlan, config: &OptimizeConfig, state: &ActiveState) -> Result<()> {
         plan.header.validate(self)?;
         let invalid = |message: &str| Err(fail(MaintenanceErrorKind::InvalidPlan, message.to_owned()));
+        let schema: SchemaRef = Arc::new(state.snapshot.schema().as_ref().try_into_arrow()?);
+        let layout_fingerprint = resolve_optimize_layout(config, &schema)?
+            .as_ref()
+            .map(LayoutPolicy::fingerprint)
+            .transpose()?;
+        if plan.layout_fingerprint != layout_fingerprint {
+            return invalid("plan layout policy differs from the apply configuration");
+        }
         if plan.target_file_bytes != config.target_file_bytes {
             return invalid("plan target differs from the apply configuration");
         }
@@ -2813,9 +2865,9 @@ impl DeltaTable {
         writer_config: Option<&crate::writer::ParquetWriterConfig>,
     ) -> Result<MaintenanceReport> {
         config.validate()?;
-        self.check_optimize_plan(plan, config)?;
-        let mut report = plan.report(Outcome::Noop);
         let state = self.validated_active_state(prepared, config.max_active_files)?;
+        self.check_optimize_plan(plan, config, &state)?;
+        let mut report = plan.report(Outcome::Noop);
         plan.header.fingerprint.require_same(&state.fingerprint)?;
         report.version = state.snapshot.version();
         if state
@@ -2957,13 +3009,8 @@ impl DeltaTable {
         let probe = self.write_context(snapshot, &bin.partition_values)?;
         let logical: SchemaRef = Arc::new(probe.logical_data_schema().as_ref().try_into_arrow()?);
         let physical: SchemaRef = Arc::new(probe.physical_data_schema().as_ref().try_into_arrow()?);
-        // Default to the shared publication layout so compaction preserves the
-        // customer's whole-file sort order instead of concatenating inputs.
-        let layout = match &config.layout {
-            Some(layout) => Some(layout.clone()),
-            None if config.use_default_layout => crate::delta::configured_publication_layout(&logical)?,
-            None => None,
-        };
+        let layout = resolve_optimize_layout(config, &logical)?;
+        let layout_fingerprint = layout.as_ref().map(LayoutPolicy::fingerprint).transpose()?;
         let properties = match &layout {
             Some(layout) => {
                 layout.validate(&logical)?;
@@ -2988,6 +3035,7 @@ impl DeltaTable {
             config,
             upload_buffer_bytes,
             layout,
+            layout_fingerprint,
             buffer: None,
             current: None,
             outputs: Vec::new(),
@@ -3273,6 +3321,7 @@ struct BinWriter<'a> {
     config: &'a OptimizeConfig,
     upload_buffer_bytes: Option<usize>,
     layout: Option<LayoutPolicy>,
+    layout_fingerprint: Option<String>,
     buffer: Option<FileSortBuffer>,
     current: Option<OpenOutput>,
     outputs: Vec<StagedOutput>,
@@ -3289,7 +3338,8 @@ impl BinWriter<'_> {
             }
             let buffer = self.buffer.as_mut().context("missing sort buffer")?;
             if !buffer.try_push(&batch)? {
-                self.flush_sorted()?;
+                let budget_full = buffer.full_for_next(&batch);
+                self.flush_sorted(budget_full)?;
                 let mut buffer = FileSortBuffer::new(Arc::clone(&self.logical), layout)?;
                 if !buffer.try_push(&batch)? {
                     return Err(fail(
@@ -3301,7 +3351,7 @@ impl BinWriter<'_> {
             }
             return Ok(());
         }
-        self.write(&batch)?;
+        self.write(&batch, false)?;
         let full = self.current.as_ref().is_some_and(|output| {
             (output.writer.bytes_written() + output.writer.in_progress_size()) as u64 >= self.config.target_file_bytes
         });
@@ -3311,22 +3361,22 @@ impl BinWriter<'_> {
         Ok(())
     }
 
-    fn flush_sorted(&mut self) -> Result<()> {
+    fn flush_sorted(&mut self, budget_full: bool) -> Result<()> {
         if let Some(buffer) = self.buffer.take()
             && buffer.rows() > 0
         {
             let sorted = buffer.finish()?;
-            self.write(&sorted)?;
+            self.write(&sorted, budget_full)?;
             self.close_current()?;
         }
         Ok(())
     }
 
-    fn write(&mut self, batch: &RecordBatch) -> Result<()> {
+    fn write(&mut self, batch: &RecordBatch, budget_full: bool) -> Result<()> {
         let output = match self.current.as_mut() {
             Some(output) => output,
             None => {
-                let output = self.open()?;
+                let output = self.open(budget_full)?;
                 self.current.insert(output)
             }
         };
@@ -3351,7 +3401,7 @@ impl BinWriter<'_> {
         Ok(())
     }
 
-    fn open(&self) -> Result<OpenOutput> {
+    fn open(&self, budget_full: bool) -> Result<OpenOutput> {
         let context = self.table.write_context(self.snapshot, self.values)?;
         let physical: SchemaRef = Arc::new(context.physical_data_schema().as_ref().try_into_arrow()?);
         let mut relative = String::new();
@@ -3365,7 +3415,16 @@ impl BinWriter<'_> {
             }
             relative.push_str(&format!("{name}={value}/"));
         }
-        relative.push_str(&format!("part-{}.parquet", uuid::Uuid::new_v4()));
+        let name = match (budget_full, self.layout_fingerprint.as_deref()) {
+            (true, Some(fingerprint)) => {
+                format!(
+                    "part-arrowcol-layout-v1-{fingerprint}-full-{}.parquet",
+                    uuid::Uuid::new_v4()
+                )
+            }
+            _ => format!("part-{}.parquet", uuid::Uuid::new_v4()),
+        };
+        relative.push_str(&name);
         let local = self.table.root.join(&relative);
         let directory = local.parent().context("missing output directory")?;
         fs::create_dir_all(directory)?;
@@ -3434,7 +3493,8 @@ impl BinWriter<'_> {
     }
 
     fn finish(&mut self) -> Result<()> {
-        self.flush_sorted()?;
+        let budget_full = self.buffer.as_ref().is_some_and(FileSortBuffer::at_budget);
+        self.flush_sorted(budget_full)?;
         self.close_current()
     }
 
