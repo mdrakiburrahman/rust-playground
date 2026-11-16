@@ -468,6 +468,13 @@ export function assertCampaignEnvironment(env: NodeJS.ProcessEnv, state: Campaig
 export class CampaignConflictError extends Error {
   constructor() { super('Campaign state changed concurrently; retry using a fresh read.'); this.name = 'CampaignConflictError'; }
 }
+export function cleanupFailureCode(error: unknown): 'stale_version' | 'write_outcome_unknown' | 'campaign_fenced' | 'invalid_or_storage_error' {
+  if (error instanceof CampaignWriteOutcomeUnknownError) return 'write_outcome_unknown';
+  if (error instanceof CampaignConflictError) return 'stale_version';
+  if (error instanceof CampaignFencedError || error instanceof Error && /fenced|stale|heartbeat is expired/i.test(error.message))
+    return 'campaign_fenced';
+  return 'invalid_or_storage_error';
+}
 export interface CampaignStoreConfig { account: string; container: string; subscriptionId: string }
 
 export async function managedIdentityToken(resource: string, env: NodeJS.ProcessEnv = process.env, fetcher: Fetcher = fetch): Promise<string> {
@@ -808,8 +815,7 @@ if (process.argv[1] && ['aks-campaign.ts', 'aks-campaign.js'].includes(path.base
     const action = process.argv[2];
     if (action === 'publish-inventory' || action === 'assert-ready' || action === 'cleanup-step' || action === 'read-inventory') {
       const message = error instanceof Error ? error.message : 'Campaign custody failed.';
-      const code = error instanceof CampaignWriteOutcomeUnknownError ? 'write_outcome_unknown' :
-        error instanceof CampaignFencedError || /fenced|stale|heartbeat is expired/i.test(message) ? 'campaign_fenced' : 'invalid_or_storage_error';
+      const code = cleanupFailureCode(error);
       console.log(JSON.stringify({ ok: false, code, message }));
     } else console.error(error instanceof Error ? error.message : 'Campaign custody failed');
     process.exitCode = 1;

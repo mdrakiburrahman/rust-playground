@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { test, type TestContext } from 'node:test';
 import { Azure, Config } from '../../infra/azure/bootstrap.js';
-import { CampaignConflictError, CampaignWriteOutcomeUnknownError, CUSTODY_CLEANUP_STEPS, newCampaignState,
+import { CampaignConflictError, CampaignWriteOutcomeUnknownError, cleanupFailureCode, CUSTODY_CLEANUP_STEPS, newCampaignState,
   type CampaignState, type CampaignStore, type RunInventory, type StoredCampaign } from './aks-campaign.js';
 import { CELL_CLEANUP_SELECTORS, createBlobCellStepJournal, createCellCleanupProviders, executeCellCleanupStep,
   readCellRunInventory, type CellCleanupEnvelope, type CellCleanupSelector, type CellStepProviders, type ReadInventoryEnvelope } from './aks-cell-cleanup.js';
@@ -128,6 +128,23 @@ test('capture without a durable destination is refused before a journal claim or
   assert.deepEqual(f.calls, ['admission', 'drain']);
   assert.equal(f.store.revision, revision);
   assert.equal(f.blobs.size, journals);
+});
+
+test('only pre-effect version refusals are stale_version; a conflict after effect dispatch is UNKNOWN', async t => {
+  const f = fixture(t), stale = await f.envelope();
+  stale.expected_etag = '"old"';
+  await assert.rejects(f.invoke('stop_admission', undefined, stale), error => {
+    assert.equal(cleanupFailureCode(error), 'stale_version'); return true;
+  });
+  assert.deepEqual(f.calls, []);
+  await assert.rejects(f.invoke('stop_admission', { stop_admission: { execute: async () => {
+    f.calls.push('attempted'); throw new CampaignConflictError();
+  } } }), error => {
+    assert.equal(cleanupFailureCode(error), 'write_outcome_unknown'); return true;
+  });
+  assert.deepEqual(f.calls, ['attempted']);
+  await assert.rejects(f.invoke('stop_admission'), /UNKNOWN/);
+  assert.deepEqual(f.calls, ['attempted']);
 });
 
 for (const fault of ['before', 'after'] as const) test(`positive effect survives ${fault}-commit write loss without executing twice`, async t => {

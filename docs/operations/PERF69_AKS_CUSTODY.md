@@ -102,7 +102,7 @@ Refresh using `aks-campaign.ts read-inventory`, not `status`. Strict stdin is:
 
 Success is exactly `{ok:true,inventory,etag}` from one validated durable read. The configured campaign environment, live producer/current cleaning controller, immutable origin and exact requested run/cell must match. No writes or provider effects occur. Replace the runner cache after confirmed step success or a pre-effect stale-version refusal; do not reconstruct TypeScript deadlines. This read does not resolve UNKNOWN effects or authorize replay.
 
-Both CLIs return one JSON error line, nonzero: `{ok:false,code:"campaign_fenced"|"write_outcome_unknown"|"invalid_or_storage_error",message}`.
+Both CLIs return one JSON error line, nonzero: `{ok:false,code:"campaign_fenced"|"stale_version"|"write_outcome_unknown"|"invalid_or_storage_error",message}`. Only a provably pre-effect version/CAS refusal is `stale_version`, permitting bounded refresh and reevaluation. Conflicts after journal/effect dispatch remain UNKNOWN, never refresh-and-replay.
 
 **Controller-only terminal expiry:** `recordUnsettledDrain` admits only the current armed cleaning controller, positive admission stop, the immutable run/namespace UID and an already-expired, non-extendable drain deadline. It first durably retains a failed/uncertain drain with reason `drain_deadline_expired_unsettled`, then confirms a distinct `unsettled` outer receipt binding the original producer, current actor, deadline and actual observation time. Unknown Delta/Kusto row counts remain null. Restart reuses that receipt; unrelated failures, stale actors and unexpired deadlines cannot advance.
 

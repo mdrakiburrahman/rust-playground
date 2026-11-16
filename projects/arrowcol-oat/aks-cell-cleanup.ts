@@ -174,6 +174,16 @@ export function createBlobCellStepJournal(azure: Azure, envelope: CellCleanupEnv
 
 export async function executeCellCleanupStep(store: CampaignStore, input: unknown, selector: CellCleanupSelector,
   providers: CellStepProviders, journalFactory: (assertCurrent: () => Promise<void>) => CellStepJournal): Promise<CellCleanupReceipt> {
+  const phase = { effectAttempted: false };
+  try { return await executeCellCleanupStepGuarded(store, input, selector, providers, journalFactory, phase); }
+  catch (error) {
+    if (phase.effectAttempted && error instanceof CampaignConflictError) throw new CampaignWriteOutcomeUnknownError();
+    throw error;
+  }
+}
+async function executeCellCleanupStepGuarded(store: CampaignStore, input: unknown, selector: CellCleanupSelector,
+  providers: CellStepProviders, journalFactory: (assertCurrent: () => Promise<void>) => CellStepJournal,
+  phase: { effectAttempted: boolean }): Promise<CellCleanupReceipt> {
   if (!Object.hasOwn(CELL_CLEANUP_SELECTORS, selector)) throw new Error('Unknown cleanup-step selector.');
   const envelope = parseCellCleanupEnvelope(input);
   let current = await store.read();
@@ -211,6 +221,7 @@ export async function executeCellCleanupStep(store: CampaignStore, input: unknow
   }
   let saved = await journal.read(selector), result: RunInventory;
   if (saved) {
+    phase.effectAttempted = true;
     assertRecord(saved.value, envelope, selector);
     if (saved.value.inventory) validateCampaignState({ ...current.state, runInventory: saved.value.inventory });
     if (saved.value.phase === 'running') {
@@ -226,6 +237,7 @@ export async function executeCellCleanupStep(store: CampaignStore, input: unknow
     current = await compareAndSwapRunInventory(store, current, mark(current.state.runInventory!, selector, 'running'), assertCurrent);
     effectEtag = current.etag;
     const value: CellStepRecord = { schema_version: 1, selector, origin: origin(envelope.inventory), phase: 'running', inventory: null, receipt: null };
+    phase.effectAttempted = true;
     saved = { value, etag: await journal.write(value) };
     await assertCurrent();
     result = selector === 'handoff' ? current.state.runInventory! :
