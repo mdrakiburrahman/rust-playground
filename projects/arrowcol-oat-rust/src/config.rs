@@ -157,6 +157,9 @@ impl OatConfig {
         if maintenance.enabled != Some(true) || maintenance.apply != Some(true) {
             bail!("single_hot_table campaign requires enabled, applying maintenance");
         }
+        if maintenance.max_cycles.is_some() {
+            bail!("single_hot_table campaign requires continuous maintenance without max_cycles");
+        }
         let operations = maintenance
             .operations
             .as_ref()
@@ -839,6 +842,7 @@ mod tests {
         config.campaign_profile = Some(CampaignProfile::SingleHotTable);
         config.tables = vec!["sqlserver_wait_stats".to_owned()];
         config.replica_counts = vec![1];
+        config.maintenance_image = Some(format!("maintenance@sha256:{}", "a".repeat(64)));
         config.tunables = serde_json::from_value(serde_json::json!({
             "maintenance": {
                 "enabled": true, "apply": true,
@@ -846,8 +850,9 @@ mod tests {
             }
         }))?;
         config.validate_campaign_profile()?;
+        config.validate()?;
         config.tables.push("sqlserver_cpu_utilization".to_owned());
-        assert!(config.validate_campaign_profile().is_err());
+        assert!(config.validate().is_err());
         config.tables.pop();
         config.replica_counts = vec![1, 2];
         assert!(config.validate_campaign_profile().is_err());
@@ -862,7 +867,37 @@ mod tests {
         maintenance.apply = Some(true);
         maintenance.operations.as_mut().unwrap().pop();
         assert!(config.validate_campaign_profile().is_err());
+        config
+            .tunables
+            .maintenance
+            .as_mut()
+            .unwrap()
+            .operations
+            .as_mut()
+            .unwrap()
+            .push(arrowcol_tunables::MaintenanceOperation::PruneLog);
+        config.tunables.maintenance.as_mut().unwrap().max_cycles = Some(1);
+        assert!(config.validate_campaign_profile().is_err());
         assert!(serde_json::from_str::<CampaignProfile>(r#""single_hot_tables""#).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn oat_json_rejects_invalid_injectable_enums() -> Result<()> {
+        let base: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        for tunables in [
+            serde_json::json!({"parquet_writer":{"defaults":{"compression":"zstandard"}}}),
+            serde_json::json!({"parquet_writer":{"defaults":{"encoding":"invalid"}}}),
+            serde_json::json!({"parquet_writer":{"defaults":{"statistics":"invalid"}}}),
+            serde_json::json!({"arrow_ipc":{"compression":"invalid"}}),
+            serde_json::json!({"maintenance":{"operations":["invalid"]}}),
+        ] {
+            let mut input = base.clone();
+            input["tunables"] = tunables;
+            assert!(serde_json::from_value::<OatConfig>(input).is_err());
+        }
         Ok(())
     }
 

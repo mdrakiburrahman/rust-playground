@@ -9183,7 +9183,10 @@ mod tests {
             .context("local stop must fail")?;
         assert!(format!("{error:#}").contains("fixture stop listing failed"));
         assert!(state.exists(), "local state must be retained after stop failure");
-        assert!(!fixture.join("compose-destroyed").exists(), "Compose down must be skipped");
+        assert!(
+            !fixture.join("compose-destroyed").exists(),
+            "Compose down must be skipped"
+        );
 
         config.platform.kind = crate::config::OatMode::Aks;
         config.namespace = "fixture-owned".to_owned();
