@@ -550,13 +550,32 @@ mod overload_guard_tests {
                     "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
                 ))?;
                 config.platform.local.collector_memory_limit_bytes = capped.then_some(cap);
+                config.tunables = Default::default();
                 let project = scoped_compose_project(config.platform.compose_project.as_deref().context("project missing")?, &run_id);
                 let compose_path = root.join(format!("{run_id}.compose.json"));
                 let override_path = root.join(format!("{run_id}.override.json"));
-                fs::write(&compose_path, json!({"services":{"dataflow-1":{"image":image}}}).to_string())?;
+                fs::write(&compose_path, json!({"services":{"dataflow-1":{"image":image},
+                    "router":{"image":image},"oat-client":{"image":image}}}).to_string())?;
                 fs::write(&override_path, "{\"services\":{}}")?;
                 config.platform.compose_file = Some(compose_path.to_string_lossy().into_owned());
                 config.platform.compose_override_file = Some(override_path.to_string_lossy().into_owned());
+                let mut overlay = compose_tunables(&config)?;
+                local_dataflow_overlay(&config, &root, &mut overlay)?;
+                fs::write(root.join("tunables.compose.json"), overlay.to_string())?;
+                let mut render = compose_command(compose_path.to_str().context("compose path not UTF-8")?,
+                    config.platform.compose_override_file.as_deref(), &project, "oat");
+                render.arg("--file").arg(root.join("tunables.compose.json")).args(["config", "--format", "json"]);
+                let rendered: Value = serde_json::from_slice(&run_command(render, "verify actual Compose memory projection").await?.stdout)?;
+                if capped {
+                    let value = &rendered["services"]["dataflow-1"]["mem_limit"];
+                    let rendered_cap = match value.as_u64() {
+                        Some(bytes) => bytes,
+                        None => value.as_str().context("Compose memory limit missing")?.parse::<u64>()
+                            .with_context(|| format!("Compose memory limit is not integer bytes: {value}"))?,
+                    };
+                    anyhow::ensure!(rendered_cap == cap, "Compose cap {rendered_cap} did not match requested {cap}");
+                    println!("guard_compose_cap {}", json!({"requested_bytes":cap,"rendered_bytes":rendered_cap}));
+                }
                 let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
                 let admin_port = listener.local_addr()?.port();
                 let flight_listener = std::net::TcpListener::bind("127.0.0.1:0")?;

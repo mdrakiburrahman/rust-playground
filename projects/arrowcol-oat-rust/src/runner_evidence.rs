@@ -470,6 +470,7 @@ impl CellEvidence {
     }
 }
 
+#[derive(Clone)]
 enum ResourceSamplerSource {
     Aks,
     Local {
@@ -487,6 +488,21 @@ struct ResourceSampler {
 
 const PUBLICATION_BACKLOG_SAMPLING_INTERVAL: Duration = Duration::from_secs(1);
 const PUBLICATION_BACKLOG_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
+
+async fn sample_resources(source: &ResourceSamplerSource, config: &OatConfig) -> Result<ResourceMetrics> {
+    match source {
+        ResourceSamplerSource::Aks => collect_aks_metrics(config).await,
+        ResourceSamplerSource::Local { run_id, environment, .. } => collect_local_metrics(config, run_id, environment).await,
+    }
+}
+
+fn retain_resource_sample(evidence: &mut CellEvidence, sample: ResourceSample) {
+    if evidence.resource_samples.len() == 4096 {
+        evidence.resource_samples.remove(0);
+        evidence.resource_samples_dropped += 1;
+    }
+    evidence.resource_samples.push(sample);
+}
 
 impl Drop for ResourceSampler {
     fn drop(&mut self) {
@@ -524,6 +540,7 @@ impl ResourceSampler {
                 };
                 let mut interval = tokio::time::interval(PUBLICATION_BACKLOG_SAMPLING_INTERVAL);
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                let mut resource_tasks = tokio::task::JoinSet::<Result<ResourceSample>>::new();
                 loop {
                     tokio::select! {
                         _ = interval.tick() => {}
@@ -536,15 +553,33 @@ impl ResourceSampler {
                     if now < start && guard.is_none() {
                         continue;
                     }
+                    while let Some(sample) = resource_tasks.try_join_next() {
+                        match sample {
+                            Ok(Ok(sample)) if sample.sampled_at_unix_ms >= start && sample.sampled_at_unix_ms < end => {
+                                retain_resource_sample(&mut evidence, sample);
+                            }
+                            _ => {
+                                evidence.resource_sampling_failures += 1;
+                                tracing::warn!("asynchronous resource sample unavailable or outside measurement window");
+                            }
+                        }
+                    }
+                    let asynchronous_resources = guard.is_some();
+                    if asynchronous_resources && resource_tasks.is_empty() && now >= start && now < end {
+                        let source = source.clone();
+                        let config = config.clone();
+                        resource_tasks.spawn(async move {
+                            let metrics = tokio::time::timeout(PUBLICATION_BACKLOG_REQUEST_TIMEOUT, sample_resources(&source, &config))
+                                .await.context("resource sample deadline exceeded")??;
+                            Ok::<_, anyhow::Error>(ResourceSample { sampled_at_unix_ms:unix_time_ms_u64()?, metrics })
+                        });
+                    }
                     let request_start_unix_ms = unix_time_ms_u64()?;
                     let sample = async {
-                        match &source {
-                            ResourceSamplerSource::Aks => collect_aks_metrics(&config).await,
-                            ResourceSamplerSource::Local {
-                                run_id, environment, ..
-                            } => {
-                                collect_local_metrics(&config, run_id, environment).await
-                            }
+                        if asynchronous_resources {
+                            Ok(None)
+                        } else {
+                            sample_resources(&source, &config).await.map(Some)
                         }
                     };
                     let timeout_ms = if guard.is_some() {
@@ -571,14 +606,10 @@ impl ResourceSampler {
                         tokio::time::timeout(Duration::from_millis(timeout_ms), guard_reading),
                     );
                     match resource_result {
-                        Ok(Ok(metrics)) => {
+                        Ok(Ok(Some(metrics))) => {
                             let sampled_at_unix_ms = unix_time_ms_u64()?;
                             if sampled_at_unix_ms >= start && sampled_at_unix_ms < end {
-                                if evidence.resource_samples.len() == 4096 {
-                                    evidence.resource_samples.remove(0);
-                                    evidence.resource_samples_dropped += 1;
-                                }
-                                evidence.resource_samples.push(ResourceSample {
+                                retain_resource_sample(&mut evidence, ResourceSample {
                                     sampled_at_unix_ms,
                                     metrics,
                                 });
@@ -586,6 +617,7 @@ impl ResourceSampler {
                                 evidence.resource_sampling_failures += 1;
                             }
                         }
+                        Ok(Ok(None)) => {}
                         _ => {
                             evidence.resource_sampling_failures += 1;
                             tracing::warn!("resource sample unavailable or exceeded its bounded deadline");
@@ -642,6 +674,7 @@ impl ResourceSampler {
                         evidence.backlog_sampling_failures += 1;
                     }
                 }
+                evidence.resource_sampling_failures += resource_tasks.len() as u64;
                 if let Some((_, engine)) = guard {
                     evidence.overload_guard = Some(engine.proof);
                     evidence.overload_stop = engine.stop;

@@ -61,6 +61,9 @@ need WAL or Quiver; disk protection is explicitly not applicable.
 
 The collector RSS limit comes from its registration configuration, **not** from
 the cgroup cap. The guard checks both independently against actual readback.
+Slow CPU/resource statistics run as a separate single-flight task; they do not
+serialize cap/backlog/commit observations. Incomplete resource samples remain
+unavailable rather than delaying the safety loop.
 
 The ignored integration check below requires separate authorization. It creates
 only test-owned no-load collectors with memory catalog/routing and local storage,
