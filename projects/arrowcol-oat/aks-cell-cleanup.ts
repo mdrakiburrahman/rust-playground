@@ -35,7 +35,7 @@ export interface CellStepProvider {
   execute(inventory: RunInventory, key: string, authority: CleanupMutationAuthority): Promise<RunInventory>;
   recover?(inventory: RunInventory, key: string, authority: CleanupMutationAuthority): Promise<RunInventory>;
 }
-export type CellStepProviders = Partial<Record<Exclude<CellCleanupSelector, 'handoff'>, CellStepProvider>>;
+export type CellStepProviders = Partial<Record<CellCleanupSelector, CellStepProvider>>;
 const object = (value: unknown): value is Record<string, unknown> => !!value && typeof value === 'object' && !Array.isArray(value);
 const exact = (value: unknown, keys: string[]): value is Record<string, unknown> =>
   object(value) && Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key));
@@ -102,7 +102,7 @@ function mark(inventory: RunInventory, selector: CellCleanupSelector, state: 'ru
   if (name) next.cleanup[name] = { ...next.cleanup[name], state, reason_code: null,
     deadline_unix_ms: next.cleanup[name].deadline_unix_ms ??
       (selector === 'stop_admission' ? Date.now() + 60_000 :
-        selector === 'bounded_drain' || selector === 'stop_maintenance' ? Date.now() + 120_000 : null) };
+        selector === 'bounded_drain' || selector === 'stop_maintenance' || selector === 'terminal_capture' ? Date.now() + 120_000 : null) };
   return next;
 }
 function terminal(inventory: RunInventory) {
@@ -226,17 +226,16 @@ async function executeCellCleanupStepGuarded(store: CampaignStore, input: unknow
     assertRecord(saved.value, envelope, selector);
     if (saved.value.inventory) validateCampaignState({ ...current.state, runInventory: saved.value.inventory });
     if (saved.value.phase === 'running') {
-      const recover = providers[selector as Exclude<CellCleanupSelector, 'handoff'>]?.recover;
-      if (selector !== 'handoff' && !recover) throw new Error('Cleanup effect outcome UNKNOWN; no recovery provider, never replay.');
+      const recover = providers[selector]?.recover;
+      if (!recover) throw new Error('Cleanup effect outcome UNKNOWN; no recovery provider, never replay.');
       current = await compareAndSwapRunInventory(store, current, current.state.runInventory!, assertCurrent);
       effectEtag = current.etag;
       await assertCurrent();
-      result = selector === 'handoff' ? current.state.runInventory! :
-        await recover!(current.state.runInventory!, `${envelope.inventory.cell_run_id}:${selector}`, authority);
+      result = await recover(current.state.runInventory!, `${envelope.inventory.cell_run_id}:${selector}`, authority);
     } else result = saved.value.phase === 'complete' ? current.state.runInventory! : saved.value.inventory!;
   } else {
-    const provider = providers[selector as Exclude<CellCleanupSelector, 'handoff'>];
-    if (selector !== 'handoff' && !provider) throw new Error('No concrete cleanup provider is installed.');
+    const provider = providers[selector];
+    if (!provider) throw new Error('No concrete cleanup provider is installed.');
     if (selector === 'handoff') terminal(current.state.runInventory!);
     current = await compareAndSwapRunInventory(store, current, mark(current.state.runInventory!, selector, 'running'), assertCurrent);
     effectEtag = current.etag;
@@ -244,8 +243,7 @@ async function executeCellCleanupStepGuarded(store: CampaignStore, input: unknow
     phase.effectAttempted = true;
     saved = { value, etag: await journal.write(value) };
     await assertCurrent();
-    result = selector === 'handoff' ? current.state.runInventory! :
-      await provider!.execute(current.state.runInventory!, `${envelope.inventory.cell_run_id}:${selector}`, authority);
+    result = await provider.execute(current.state.runInventory!, `${envelope.inventory.cell_run_id}:${selector}`, authority);
   }
   effectEtag = undefined;
   await assertCurrent();
@@ -313,6 +311,12 @@ export function createCellCleanupProviders(actions: ExternalCleanupActions, reco
       return inventory;
     },
   });
-  return Object.fromEntries(selectors.filter((selector): selector is Exclude<CellCleanupSelector, 'handoff'> => selector !== 'handoff')
-    .map(selector => [selector, run(selector)]));
+  const handoff = async (inventory: RunInventory, _key: string, authority: CleanupMutationAuthority) => {
+    terminal(inventory);
+    if (!actions.verifyCellPreservation || await actions.verifyCellPreservation(inventory, authority) !== 'complete')
+      throw new Error('Cell preservation is UNKNOWN; no positive independent final data observation.');
+    return inventory;
+  };
+  return { ...Object.fromEntries(selectors.filter((selector): selector is Exclude<CellCleanupSelector, 'handoff'> => selector !== 'handoff')
+    .map(selector => [selector, run(selector)])), handoff: { execute: handoff, recover: handoff } };
 }

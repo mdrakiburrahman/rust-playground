@@ -12,7 +12,7 @@ Custody therefore runs as a watchdog on a dedicated, separately leased devbox, n
 | ARM operations | Poll and reconcile operation URLs only on `management.azure.com` and the selected subscription; uncertain operations remain unsettled |
 | Safe idle | Fixed system pool (autoscale explicitly off) 2×D8ds_v6, falling back to baseline 3×D8ds_v6 if any pod is unschedulable or a PDB blocks drain; bench pools 0 nodes with autoscale 0..1; Kusto at least Standard_E4ads_v5 ×2, autoscale 2..4, auto-stop on, never stopped |
 | Cleanup state machine | Fencing persists ordered, stable idempotency receipts; retries resume the same step, and completion requires every step to verify |
-| Cleanup adapter | Source/mocked only. Exact discovery, namespace/QAP/FIC custody and ARM rollback providers exist; runner lifecycle, full data observations and external rehearsal remain required. The watchdog still fails closed without an installed executor; keep custody unarmed. |
+| Cleanup adapter | Source/mocked only. Default CLI/watchdog providers install exact discovery, bounded lifecycle/journal recovery, namespace/QAP/FIC custody, ARM rollback and independent Delta/non-run Kusto preservation. External rehearsal remains mandatory; keep custody unarmed. |
 
 The helper APIs below expose the original QAP Blob custody without replacing its full ownership snapshot or positive workload-stop checks. E1 must persist the credential-free reference before load. `createDefaultCleanupProviders` composes the independent providers with explicitly supplied runner lifecycle actions; it is not a qualified, unattended default watchdog. Concrete lifecycle/recovery providers, positive full-data observations, adapter rehearsal and independent watchdog lease renewal remain gates. Keep the campaign unarmed.
 
@@ -91,7 +91,7 @@ The exact `CELL_CLEANUP_SELECTORS`, `CellCleanupEnvelope`, `CellCleanupReceipt`,
 
 Receipt top-level owner/fence identify the immutable producer; nested `actor` identifies the invocation. Before effects, authority, exact durable inventory and expected ETag must match. Controllers additionally require the matching current outer running step/key (`handoff` is guarded by outer `verify-safe-idle`, not a call to campaign-terminal restoration). Normal producer cleanup changes only per-cell inventory and never transitions active to cleaning.
 
-Conditional per-selector journals under `_arrowcol-custody/campaigns/<campaign>/cells/<cell>/` progress from `running` to `effect-confirmed` to `complete`. A provider's positive response is persisted before the confirmed post-effect inventory CAS. Losing the write/confirmation resumes that proof without executing again. An effect whose response is unknown requires an explicit positive recovery provider; an empty journal read, listing absence or refreshed inventory is not proof of completion. Lifecycle and unknown-outcome recovery providers are **not installed by the default CLI**; those selectors fail nonzero rather than return positive stubs.
+Conditional per-selector journals under `_arrowcol-custody/campaigns/<campaign>/cells/<cell>/` progress from `running` to `effect-confirmed` to `complete`. A provider's positive response is persisted before the confirmed post-effect inventory CAS. Losing the write/confirmation resumes that proof without executing again. An effect whose response is unknown requires an explicit positive recovery provider; an empty journal read, listing absence or refreshed inventory is not proof of completion. Default providers are installed, but missing identity, journal, physical-stop or preservation proof still fails nonzero. Handoff independently verifies data preservation after removals; it never restores capacity or ends the active campaign.
 
 Saved-running recovery also requires a confirmed CAS against the supplied full inventory/version and pins that version through provider authority checks. Maintenance stop admits each workload only within the original absolute deadline; its authority carries the remaining allowance and rejects use after expiry. A slow/late first stop never authorizes a second stop, renews the deadline or produces a normal completion receipt. Confirmed partial provider evidence remains recoverable rather than being replayed.
 
@@ -135,16 +135,38 @@ Real tables require fresh log/checkpoint replay, exact metadata/protocol/file id
 Positive absence requires two complete successful exact-prefix listings with distinct storage request IDs.
 An absent table has null identity/version/rows, never zero; permission errors and missing history are not absence.
 Absence is not a throughput or row-delivery proof. The campaign's immutable capacity/non-run Kusto reference
-must already exist. Terminal/final preservation and concrete default-provider installation remain separate gates.
+must already exist. After physical writer stop, terminal capture freezes a new immutable reference before removal.
+Final replay independently protects both that reference and the original baseline, rechecks prior-cell reference chains,
+and observes preserved non-run Kusto identities/counts and healthy, non-growing QAP backlog. Run-QAP pre-DROP
+observations remain historical; their post-removal count is null with reason `run_owned_qap_removed_by_design`.
+Missing stats/history and PURGE without a separately trusted frozen retention policy remain UNKNOWN.
+
+## Concrete lifecycle and terminal recovery
+
+Exact Deployment/Job stops bind the original namespace/workload UID and current resourceVersion. Deployments
+must have zero replicas, an observed generation and no live selected pods, with no matching HPA; Jobs must be
+suspended with positive terminal/suspension state and no live owned pods. Selector/controller ownership is checked;
+no broad workload discovery or deletion is used. Blocking Kubernetes commands consume the remaining persisted budget.
+Sanitized log receipts retain exact pod/container identities, hashes, byte counts and allowlisted numerical samples;
+unstructured text and unapproved fields are redacted. Actual observed container exits/OOM status are retained.
+A missing terminal observation is explicit evidence loss, never a successful drain.
+
+Only a current controller with durable unsettled-drain proof and completed admission/maintenance stops can stop
+residual collectors inside `terminal_capture`. This has its own persisted 120-second deadline, never resets or
+extends the expired drain deadline, and never deletes resources. All residual workload plans are journaled before
+effects; every PATCH uses UID/resourceVersion tests and a version-pinned authority check. An uncertain terminal
+PATCH can recover only from positive exact physically stopped state, labelled as state recovery rather than an API
+response; it is never blindly reissued. Late responses remain evidence, not successful budget completion.
+Terminal Delta is frozen only after collector and maintenance writers are physically stopped with recreation disabled.
 
 ## Campaign-terminal providers
 
 | API | Safety boundary |
 | --- | --- |
 | `captureCleanupBaseline(store, azure, owner, token)` | Live producer custody, before ARM mutations/load authorization; positive idle-capacity receipts and explicit non-run Kusto table identities/counts (or positively observed empty inventory), conditional immutable baseline Blob and matching write/readback ETag. Never replace a baseline with current capacity. |
-| `createDefaultCleanupProviders(store, options)` | Concrete discovery and owned namespace/QAP/FIC actions, plus ARM restoration and full-safety composition. Requires supplied lifecycle providers; no implicit success implementation. |
+| `createDefaultCleanupProviders(store, options)` | Installs concrete lifecycle, discovery, owned namespace/QAP/FIC actions, ARM restoration and independent full-data observation. Injection is optional for tests; no implicit success implementation. |
 | `restoreSafeIdle` | Current controller only. Reconcile unresolved ARM receipts first; persist exact resource/target before each PUT/PATCH. One capacity dimension per invocation. An uncertain target is polled, never blindly reissued. Try two system nodes, retain the original three-node fallback after scheduling/PDB problems; preserve recognized writable configuration and reject unknown properties/SKU drift. Never stop Kusto. |
 | `observeStampHealth` | Re-resolve the exact original ARM/server identity; require positive PodList/PDB resource versions, current PDB generation and typed readiness/scheduling observations. UNKNOWN is not healthy. |
-| `verifySafeIdle` | Fresh capacity and pod observations **plus** an explicit timely run-bound `FullDataSafetyReceipt` with evidence ETag, QAP health/backlog and preserved Delta/Kusto row counts. Capacity alone always leaves full safety UNKNOWN. |
+| `verifySafeIdle` | Fresh capacity and pod observations **plus** timely run-bound independent preservation evidence and strong evidence ETag. Null run-QAP post-DROP counts are not converted to zero. A setup-only no-load disposition requires fenced `not_authorized`, no planned QAP and original exact namespace/FIC removal proofs. Capacity alone always leaves full safety UNKNOWN. |
 
-The default watchdog remains unarmed until concrete lifecycle/full-data implementations and external-adapter rehearsal pass. This source/mocked work performs no live cloud reads/mutations, load or scaling.
+The default watchdog remains unarmed until paired source review and external-adapter rehearsal pass. This source/mocked work performs no live cloud reads/mutations, load or scaling.

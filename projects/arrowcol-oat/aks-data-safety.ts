@@ -1,10 +1,12 @@
 import { createHash } from 'node:crypto';
-import { canonical_json, type Azure } from '../../infra/azure/bootstrap.js';
+import { canonical_json, parse_xml, type Azure } from '../../infra/azure/bootstrap.js';
 import { assertExactConnectionStrings, managementRows, parseKustoQueryResult, parseQualifiedDeltaDefinition } from '../../infra/azure/oat_qap.js';
 import { CampaignConflictError, CampaignFencedError, CampaignWriteOutcomeUnknownError, hasVerifiedUnsettledDrain, validateCampaignState,
   type CampaignState, type CampaignStore, type RunInventory } from './aks-campaign.js';
 import { readDeltaReference, parseDeltaReplayReference, verifyDeltaPreservation, type DeltaReplayReference } from './aks-delta-preservation.js';
 import type { CleanupMutationAuthority } from './aks-cleanup-executor.js';
+import { create_namespace_deletion_journal } from '../../infra/azure/aks-namespace-custody.js';
+import { find_run_fic_record, plan_run_fic } from '../../infra/azure/run_fic.js';
 
 const digest = (value: unknown) => createHash('sha256').update(canonical_json(value)).digest('hex');
 function object(value: unknown): Record<string, unknown> {
@@ -58,7 +60,10 @@ export interface CellBaselineReceipt {
 export interface DataPreservationReceipt {
   schema_version: 1; scope: 'delta_and_non_run_kusto_preservation'; campaign_id: string; cell_run_id: string;
   status: 'preserved' | 'unknown' | 'failed'; reason: string | null; observed_at_unix_ms: number; evidence_etag: string;
-  delta: Awaited<ReturnType<typeof verifyDeltaPreservation>>;
+  delta: Awaited<ReturnType<typeof verifyDeltaPreservation>> | {
+    status: 'preserved'; reason: 'setup_not_load_authorized'; disposition: 'setup_not_load_authorized';
+    current: null; purge_explained_rows: null;
+  };
   non_run_kusto: Array<{ identity: StampKustoTable; after: KustoCountReceipt; qap_after: QapStateReceipt | null }>;
   run_owned_qap_after: { rows: null; reason: 'run_owned_qap_removed_by_design' };
 }
@@ -79,6 +84,56 @@ function validateCampaignBaseline(value: Record<string, unknown>, state: Campaig
       value.producer_fencing_token !== state.runInventory?.fencing_token || value.started_at_unix_ms !== state.startedAtMs ||
       integer(value.captured_at_unix_ms) < state.startedAtMs || integer(value.captured_at_unix_ms) > (state.fencedAtMs ?? Date.now()))
     throw new Error('Original immutable campaign baseline belongs to another campaign/origin/time.');
+}
+async function verifyPriorCells(azure: Azure, state: CampaignState, authority: CleanupMutationAuthority) {
+  const prefix = `_arrowcol-custody/campaigns/${state.campaignId}/runs/`;
+  const beforeNames: string[] = [], markers = new Set<string>();
+  let marker = '';
+  do {
+    await authority.assertCurrent();
+    let status: number | undefined;
+    const [bytes, headers] = await azure.blob('GET', azure.c.checkpoints, '', { restype: 'container', comp: 'list',
+      prefix, marker, maxresults: '1000' }, undefined, { 'Cache-Control': 'no-cache' }, false, true, receipt => { status = receipt.status; });
+    if (status !== 200 || !bytes || bytes.length > 4_194_304 || !headers['x-ms-request-id'])
+      throw new Error('Prior-cell preservation inventory is UNKNOWN.');
+    const root = parse_xml(bytes.toString()), text = (name: string) => root.children.find(child => child.name === name)?.text;
+    const blobs = root.children.find(child => child.name === 'Blobs');
+    if (root.name !== 'EnumerationResults' || text('Prefix') !== prefix || !blobs || text('NextMarker') === undefined)
+      throw new Error('Prior-cell preservation listing is incomplete or targets another prefix.');
+    for (const item of blobs.children) {
+      if (item.name !== 'Blob') throw new Error('Unsupported prior-cell custody listing record.');
+      const name = item.children.find(child => child.name === 'Name')?.text;
+      if (!name || !name.startsWith(prefix)) throw new Error('Prior-cell reference escaped campaign scope.');
+      if (name.endsWith('/delta-before.json')) beforeNames.push(name);
+    }
+    if (beforeNames.length > 256 || markers.size > 64) throw new Error('Prior-cell custody scope exceeds its bound.');
+    marker = text('NextMarker')!;
+    if (marker && markers.has(marker)) throw new Error('Prior-cell listing continuation repeated.');
+    markers.add(marker);
+  } while (marker);
+  if (state.runInventory?.qap && !beforeNames.includes(cellBlob(state.runInventory, 'delta-before')))
+    throw new Error('Fresh custody listing omitted the positively required current cell baseline.');
+  for (const name of beforeNames.filter(name => name !== cellBlob(state.runInventory!, 'delta-before'))) {
+    const before = await readBlob(azure, name, authority.assertCurrent), terminalName = name.replace(/delta-before\.json$/, 'delta-terminal.json');
+    const finalName = name.replace(/delta-before\.json$/, 'data-final.json');
+    const terminal = await readBlob(azure, terminalName, authority.assertCurrent), final = await readBlob(azure, finalName, authority.assertCurrent);
+    if (!before || !terminal || !final || terminal.value.baseline_etag !== before.etag || final.value.status !== 'preserved' ||
+        canonical_json(before.value.origin) !== canonical_json(terminal.value.origin) ||
+        canonical_json(before.value.origin) !== canonical_json(final.value.origin) ||
+        before.value.observed_phase !== 'pre_load' || before.value.load_admission !== 'not_authorized' ||
+        terminal.value.observed_phase !== 'terminal_after_writers_stopped')
+      throw new Error('Prior cell lacks its complete original baseline/terminal/final chain.');
+    const producer = object(before.value.origin), references = object(final.value.references), hot = before.value.hot_delta_relative_path;
+    if (producer.campaign_id !== state.campaignId || producer.owner_id !== state.ownerId || !strong(before.value.inventory_etag) ||
+        typeof producer.orchestration_run_id !== 'string' || typeof producer.cell_run_id !== 'string' ||
+        name !== prefix + producer.orchestration_run_id + '/cells/' + producer.cell_run_id + '/delta-before.json' ||
+        references.before_etag !== before.etag || references.terminal_etag !== terminal.etag ||
+        typeof hot !== 'string' || terminal.value.hot_delta_relative_path !== hot)
+      throw new Error('Prior cell preservation origin/versions differ.');
+    const verified = await verifyDeltaPreservation(azure, parseDeltaReplayReference(before.value.delta, azure, hot),
+      parseDeltaReplayReference(terminal.value.delta, azure, hot), authority.assertCurrent);
+    if (verified.status !== 'preserved') throw new Error('Prior-cell fresh preservation is ' + verified.status + ': ' + verified.reason);
+  }
 }
 async function readBlob(azure: Azure, blob: string, guard: () => Promise<void>) {
   await guard();
@@ -257,7 +312,10 @@ export async function captureTerminalData(store: CampaignStore, azure: Azure, au
   if (!before) throw new Error('The exact original pre-load Delta reference is absent.');
   const initial = baselineDelta(before.value, inventory, azure), blob = cellBlob(inventory, 'delta-terminal');
   const existing = await readBlob(azure, blob, authority.assertCurrent);
-  if (existing) { baselineDelta(existing.value, inventory, azure, 'terminal_after_writers_stopped'); return; }
+  if (existing) {
+    if (existing.value.baseline_etag !== before.etag) throw new Error('Terminal reference is not paired with the immutable original baseline.');
+    baselineDelta(existing.value, inventory, azure, 'terminal_after_writers_stopped'); return;
+  }
   const delta = await readDeltaReference(azure, initial.table_root, authority.assertCurrent);
   if (initial.observation === 'table' && (delta.observation !== 'table' || delta.table_id !== initial.table_id ||
       delta.version < initial.version) || delta.observation === 'table' && delta.row_count === null)
@@ -285,7 +343,13 @@ export async function captureTerminalData(store: CampaignStore, azure: Azure, au
       if (error instanceof CampaignFencedError || error instanceof CampaignConflictError || error instanceof CampaignWriteOutcomeUnknownError) throw error;
       console.error(JSON.stringify({ event: 'custody_pre_remove_qap_unknown', cell_run_id: inventory.cell_run_id }));
       observations.push({ database: qap.database, table: binding.external_table, relative_path: binding.relative_path,
-        observed_phase: 'pre_remove_qap', observed_at_unix_ms: Date.now(), rows: null, reason: 'qap_observation_unavailable' });
+        observed_phase: 'pre_remove_qap', observed_at_unix_ms: Date.now(),
+        query_sha256: digest([`external_table('${binding.external_table}') | summarize Count=count()`,
+          `.show external table ['${binding.external_table}'] policy query_acceleration`,
+          `.show external table ['${binding.external_table}'] details`,
+          `.show external tables operations query_acceleration statistics | where ExternalTableName == '${binding.external_table}'` +
+            ' | project ExternalTableName, AccelerationPendingDataFilesCount']),
+        rows: null, results: null, reason: 'qap_observation_unavailable' });
     }
     await assertWritersStopped();
   }
@@ -297,18 +361,44 @@ export async function captureTerminalData(store: CampaignStore, azure: Azure, au
 export async function observeDataPreservation(store: CampaignStore, azure: Azure, state: CampaignState,
   authority: CleanupMutationAuthority): Promise<DataPreservationReceipt> {
   const inventory = state.runInventory;
+  const durable = await store.read();
+  if (!durable || canonical_json(durable.state.runInventory) !== canonical_json(inventory) ||
+      durable.state.campaignId !== state.campaignId || durable.state.fencingToken !== authority.fencingToken)
+    throw new CampaignFencedError('Independent data observation requires the actual durable inventory and current actor.');
   if (!inventory || inventory.resources.some(resource => !['removed', 'absent'].includes(resource.state)) ||
       inventory.qap && !['removed', 'absent'].includes(inventory.qap.state) || inventory.fic && !['removed', 'absent'].includes(inventory.fic.state))
     throw new Error('Final independent preservation observation requires positively completed exact removals.');
   await authority.assertCurrent();
-  const before = await readBlob(azure, cellBlob(inventory, 'delta-before'), authority.assertCurrent);
-  const terminal = await readBlob(azure, cellBlob(inventory, 'delta-terminal'), authority.assertCurrent);
   const campaign = await readBlob(azure, campaignBlob(state), authority.assertCurrent);
-  if (!before || !terminal || !campaign || terminal.value.baseline_etag !== before.etag)
-    throw new Error('Original pre-load/terminal/stamp preservation references are absent or unversioned.');
+  if (!campaign) throw new Error('Original stamp preservation reference is absent.');
   validateCampaignBaseline(campaign.value, state);
-  const delta = await verifyDeltaPreservation(azure, baselineDelta(before.value, inventory, azure),
-    baselineDelta(terminal.value, inventory, azure, 'terminal_after_writers_stopped'), authority.assertCurrent);
+  let delta: DataPreservationReceipt['delta'];
+  let references: { before_etag: string; terminal_etag: string } | null = null;
+  if (inventory.qap === null) {
+    const plan = inventory.fic?.plan;
+    if (authority.mode !== 'controller' || state.status !== 'cleaning' || inventory.fencing_token >= authority.fencingToken ||
+        inventory.load_admission !== 'not_authorized' || !inventory.namespace.uid || !plan ||
+        canonical_json(plan) !== canonical_json(await plan_run_fic(azure, plan.runId, plan.namespace, plan.serviceAccount)) ||
+        plan.runId !== inventory.cell_run_id || plan.namespace !== inventory.namespace.name)
+      throw new Error('Missing QAP is not no-load evidence; exact fenced not_authorized setup is required.');
+    await create_namespace_deletion_journal(azure, { version: 1, runId: inventory.cell_run_id, namespace: inventory.namespace.name,
+      namespaceUid: inventory.namespace.uid, namespaceOwner: inventory.namespace.owner_token, aksId: plan.aksId, server: plan.server }, authority).stopped();
+    const fic = await find_run_fic_record(azure, plan, authority);
+    if (inventory.fic?.state === 'removed' ? !fic || fic.phase !== 'deleted' || fic.namespaceUid !== inventory.namespace.uid ||
+        fic.namespaceOwner !== inventory.namespace.owner_token : inventory.fic?.state !== 'absent' || !inventory.fic.absence)
+      throw new Error('No-load final preservation requires the original exact FIC removal/absence proof.');
+    delta = { status: 'preserved', reason: 'setup_not_load_authorized', disposition: 'setup_not_load_authorized',
+      current: null, purge_explained_rows: null };
+  } else {
+    const before = await readBlob(azure, cellBlob(inventory, 'delta-before'), authority.assertCurrent);
+    const terminal = await readBlob(azure, cellBlob(inventory, 'delta-terminal'), authority.assertCurrent);
+    if (!before || !terminal || terminal.value.baseline_etag !== before.etag)
+      throw new Error('Original pre-load/terminal preservation references are absent or unversioned.');
+    delta = await verifyDeltaPreservation(azure, baselineDelta(before.value, inventory, azure),
+      baselineDelta(terminal.value, inventory, azure, 'terminal_after_writers_stopped'), authority.assertCurrent);
+    references = { before_etag: before.etag, terminal_etag: terminal.etag };
+  }
+  await verifyPriorCells(azure, state, authority);
   const kusto = object(campaign.value.non_run_kusto);
   if (kusto.schema_version !== 1 || kusto.scope !== 'configured_stamp_databases_non_current_run_tables' ||
       !Array.isArray(kusto.tables) || kusto.tables.length > 512 ||
@@ -355,8 +445,15 @@ export async function observeDataPreservation(store: CampaignStore, azure: Azure
   }
   await authority.assertCurrent();
   const result = { schema_version: 1 as const, scope: 'delta_and_non_run_kusto_preservation' as const, campaign_id: state.campaignId,
-    cell_run_id: inventory.cell_run_id, status, reason, observed_at_unix_ms: Date.now(),
-    delta, non_run_kusto: nonRun, run_owned_qap_after: { rows: null, reason: 'run_owned_qap_removed_by_design' } };
+    cell_run_id: inventory.cell_run_id, origin: origin(inventory), status, reason, observed_at_unix_ms: Date.now(),
+    delta, references, non_run_kusto: nonRun, run_owned_qap_after: { rows: null, reason: 'run_owned_qap_removed_by_design' } };
   const etag = await immutableBlob(azure, cellBlob(inventory, 'data-final/' + digest(result)), result, authority.assertCurrent);
+  if (status === 'preserved') {
+    const originalFinal = await readBlob(azure, cellBlob(inventory, 'data-final'), authority.assertCurrent);
+    if (!originalFinal) await immutableBlob(azure, cellBlob(inventory, 'data-final'), result, authority.assertCurrent);
+    else if (originalFinal.value.status !== 'preserved' || canonical_json(originalFinal.value.origin) !== canonical_json(origin(inventory)) ||
+        canonical_json(originalFinal.value.references) !== canonical_json(references))
+      throw new Error('Original final cell preservation proof differs; never overwrite it.');
+  }
   return { ...result, run_owned_qap_after: { rows: null, reason: 'run_owned_qap_removed_by_design' }, evidence_etag: etag };
 }

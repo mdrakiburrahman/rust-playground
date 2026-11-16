@@ -2,6 +2,12 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { pathToFileURL } from "node:url";
 import { createBlobCampaignStore, readArmOperationStatus, type CleanupStepName, type CampaignState, type CampaignStore } from './aks-campaign.js';
 import { reconcileCleanupOnce, reconcileOnce, reconcilePendingArmOperations, type CleanupProgress } from './aks-reconcile.js';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { Azure, Config } from '../../infra/azure/bootstrap.js';
+import { createDefaultCleanupProviders } from './aks-default-providers.js';
+import { createExternalCleanupExecutor } from './aks-cleanup-executor.js';
 
 export const WATCHDOG_INTERVAL_MS = 60_000;
 
@@ -20,8 +26,18 @@ export async function watchdogOnce(env: NodeJS.ProcessEnv = process.env, execute
   if (current?.state.status === 'complete_unsettled') cleanupProgress = 'complete_unsettled';
   else if (current?.state.status === 'complete') cleanupProgress = 'complete';
   if (current && (current.state.status === 'fenced' || current.state.status === 'cleaning')) {
-    if (!executeCleanup) throw new Error('Fenced campaign requires an external cleanup executor; refusing to claim safe idle.');
-    cleanupProgress = await reconcileCleanupOnce(store, executeCleanup);
+    if (!executeCleanup && storeOverride) throw new Error('Fenced campaign requires an external cleanup executor; refusing to claim safe idle.');
+    if (executeCleanup) cleanupProgress = await reconcileCleanupOnce(store, executeCleanup);
+    else {
+      const azure = new Azure(new Config({ AZURE_SUBSCRIPTION_ID: subscriptionId }));
+      if (env.CAMPAIGN_STORAGE_ACCOUNT !== azure.c.account || env.CAMPAIGN_STATE_CONTAINER !== azure.c.checkpoints)
+        throw new Error('Watchdog custody must match the exact configured stamp checkpoints account/container.');
+      const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'oat-watchdog-cleanup-'));
+      try {
+        const actions = createDefaultCleanupProviders(store, { azure, workDirectory: directory });
+        cleanupProgress = await reconcileCleanupOnce(store, createExternalCleanupExecutor(store, actions));
+      } finally { fs.rmSync(directory, { recursive: true }); }
+    }
   }
   const latest = await store.read();
   return { event: 'campaign_custody_evaluation', ...result, ...(cleanupProgress ? { cleanupProgress } : {}),

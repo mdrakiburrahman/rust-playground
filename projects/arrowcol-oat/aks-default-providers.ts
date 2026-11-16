@@ -6,7 +6,9 @@ import { recordCleanupArmOperation, type CampaignState, type CampaignStore, type
 import { createOwnedRunCleanupActions, type CleanupMutationAuthority, type ExternalCleanupActions } from './aks-cleanup-executor.js';
 import { assertCleaningActor, assertRunCleanupActor, discoverOwnedRunInventory, observeExactKubernetes } from './aks-setup-cleanup.js';
 import { reconcilePendingArmOperations, verifySafeIdle, type SafeIdleObservation } from './aks-reconcile.js';
-import { captureStampKustoBaseline } from './aks-data-safety.js';
+import { captureStampKustoBaseline, observeDataPreservation, type DataPreservationReceipt } from './aks-data-safety.js';
+import { createDefaultLifecycleActions } from './aks-lifecycle.js';
+import { createCellCleanupProviders, type CellStepProviders } from './aks-cell-cleanup.js';
 
 function object(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Provider observation is UNKNOWN.');
@@ -186,12 +188,15 @@ type IndependentProviders = 'discoverExactInventory' | 'deleteNamespaceIfUidAndO
 export interface DefaultCleanupProviderOptions {
   azure: Azure;
   workDirectory: string;
-  lifecycle: Omit<ExternalCleanupActions, IndependentProviders>;
-  readDataSafety?: (state: CampaignState, authority: CleanupMutationAuthority) => Promise<FullDataSafetyReceipt>;
+  lifecycle?: Omit<ExternalCleanupActions, IndependentProviders>;
+  readDataSafety?: (state: CampaignState, authority: CleanupMutationAuthority) => Promise<FullDataSafetyReceipt | DataPreservationReceipt>;
   readHealth?: typeof observeStampHealth;
 }
 export function createDefaultCleanupProviders(store: CampaignStore, options: DefaultCleanupProviderOptions): ExternalCleanupActions {
   const { azure } = options, readHealth = options.readHealth ?? observeStampHealth;
+  const lifecycle = options.lifecycle ?? createDefaultLifecycleActions(store, azure);
+  const readDataSafety = options.readDataSafety ?? ((state: CampaignState, authority: CleanupMutationAuthority) =>
+    observeDataPreservation(store, azure, state, authority));
   const authorityFor = (state: CampaignState): CleanupMutationAuthority => ({
     mode: state.status === 'active' ? 'producer' : 'controller',
     campaignId: state.campaignId, ownerId: state.ownerId, fencingToken: state.fencingToken,
@@ -212,7 +217,15 @@ export function createDefaultCleanupProviders(store: CampaignStore, options: Def
       inventory.fic?.plan ?? undefined);
   };
   return {
-    ...options.lifecycle,
+    ...lifecycle,
+    verifyCellPreservation: async (inventory, authority) => {
+      await authority.assertCurrent();
+      const state = (await store.read())?.state;
+      if (!state || canonical_json(state.runInventory) !== canonical_json(inventory)) throw new Error('Final cell data inventory changed.');
+      const result = await observeDataPreservation(store, azure, state, authority);
+      if (result.status !== 'preserved') throw new Error('Final cell data preservation is ' + result.status + ': ' + result.reason);
+      return 'complete';
+    },
     discoverExactInventory: async inventory => {
       const state = (await store.read())?.state;
       if (!state || canonical_json(state.runInventory) !== canonical_json(inventory)) throw new Error('Discovery inventory/version changed.');
@@ -270,13 +283,19 @@ export function createDefaultCleanupProviders(store: CampaignStore, options: Def
       const authority = authorityFor(state);
       await assertCleaningActor(store, authority);
       await authority.assertCurrent();
-      if (!options.readDataSafety) throw new Error('Full stamp safety is UNKNOWN: no positive QAP/Delta/Kusto data observer is installed.');
       const capacity = await observe_custody_idle_capacity(azure), health = await readHealth(azure, state, authority);
       if (capacity.status !== 'capacity_idle') return 'pending';
-      const data = await options.readDataSafety(state, authority);
+      const data = await readDataSafety(state, authority);
       if (data.campaign_id !== state.campaignId || data.cell_run_id !== state.runInventory?.cell_run_id ||
           !Number.isSafeInteger(data.observed_at_unix_ms) || data.observed_at_unix_ms < state.fencedAtMs! ||
           data.observed_at_unix_ms > Date.now() || !data.evidence_etag) throw new Error('Full data safety receipt is stale, incomplete or belongs to another run.');
+      if ('scope' in data) {
+        if (data.scope !== 'delta_and_non_run_kusto_preservation' || data.status !== 'preserved')
+          throw new Error('Full stamp data preservation is ' + data.status + ': ' + data.reason);
+        if (health.pdb_blocked || health.pods.some(pod => !pod.ready || !pod.scheduled)) return 'pending';
+        await authority.assertCurrent();
+        return 'complete';
+      }
       const observation: SafeIdleObservation = { ...data.measurements,
         aksProvisioningState: capacity.aks_provisioning_state, kustoProvisioningState: capacity.kusto.provisioning_state,
         systemPoolCount: capacity.system_pool.count,
@@ -289,4 +308,19 @@ export function createDefaultCleanupProviders(store: CampaignStore, options: Def
       return 'complete';
     },
   };
+}
+
+export function createDefaultCellCleanupProviders(actions: ExternalCleanupActions): CellStepProviders {
+  const providers = createCellCleanupProviders(actions);
+  for (const selector of ['stop_admission', 'bounded_drain', 'evidence_capture', 'stop_maintenance', 'terminal_capture'] as const) {
+    providers[selector]!.recover = async (inventory, key, authority) => {
+      if (!actions.recoverLifecycle || await actions.recoverLifecycle(selector, inventory,
+        inventory.cleanup[selector].deadline_unix_ms, key, authority) !== 'complete')
+        throw new Error('Lifecycle recovery remains pending or UNKNOWN; never execute as fallback.');
+      return inventory;
+    };
+  }
+  for (const selector of ['remove_namespace', 'remove_qap', 'remove_fic'] as const)
+    providers[selector]!.recover = providers[selector]!.execute;
+  return providers;
 }

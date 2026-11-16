@@ -6,7 +6,9 @@ export function withCleanupDeadline(authority: CleanupMutationAuthority, deadlin
   const remainingMs = deadline === null ? 0 : deadline - Date.now();
   if (deadline === null || !Number.isSafeInteger(deadline) || remainingMs <= 0)
     throw new Error('Cleanup stop deadline expired; preserve partial evidence, never admit another effect.');
-  return { ...authority, budget: { deadlineUnixMs: deadline, remainingMs }, assertCurrent: async () => {
+  return { ...authority, budget: { deadlineUnixMs: deadline, remainingMs },
+    assertEvidenceCurrent: () => authority.assertEvidenceCurrent ? authority.assertEvidenceCurrent() : authority.assertCurrent(),
+    assertCurrent: async () => {
     await authority.assertCurrent();
     if (Date.now() >= deadline) throw new Error('Cleanup stop deadline expired; an unfinished effect remains UNKNOWN.');
   } };

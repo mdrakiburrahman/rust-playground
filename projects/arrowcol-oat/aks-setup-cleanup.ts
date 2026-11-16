@@ -6,6 +6,7 @@ import { cleanup_run_fic, delete_owned_namespace, find_run_fic_record, plan_run_
   type RunFicPlan, type RunNamespaceIdentity } from '../../infra/azure/run_fic.js';
 import type { CampaignStore, RunInventory, RunInventoryResource } from './aks-campaign.js';
 import type { CleanupMutationAuthority, OwnedRunCleanupActions } from './aks-cleanup-executor.js';
+import { cleanupBudget } from './aks-cleanup-budget.js';
 
 function object(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Exact workload observation is UNKNOWN.');
@@ -33,8 +34,11 @@ export async function assertRunCleanupActor(store: CampaignStore, authority: Cle
 }
 export async function observeExactKubernetes(server: string, args: string[], authority: CleanupMutationAuthority): Promise<Record<string, unknown> | undefined> {
   await authority.assertCurrent();
+  const budget = cleanupBudget(authority), remaining = budget ? budget.deadlineUnixMs - Date.now() : 20_000;
+  if (remaining <= 0) throw new Error('Exact Kubernetes observation budget expired before admission.');
   const response = await runtime.run_tree(['kubectl', '--server', server, '--insecure-skip-tls-verify=false',
-    '--request-timeout', '15s', 'get', ...args, '--ignore-not-found', '--output', 'json'], 20);
+    '--request-timeout', `${Math.max(1, Math.floor(Math.min(15_000, remaining)))}ms`,
+    'get', ...args, '--ignore-not-found', '--output', 'json'], Math.min(20, remaining / 1000));
   if (response.returncode !== 0 || response.stdout.length > 4_194_304)
     throw new Error('Exact Kubernetes observation failed; permission/API errors are not absence.');
   if (!response.stdout.trim()) return undefined;

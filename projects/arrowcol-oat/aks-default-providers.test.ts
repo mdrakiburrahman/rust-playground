@@ -118,7 +118,7 @@ test('default restoration is a true no-op at supported safe capacity and capacit
   assert.equal(await f.providers.restoreSafeIdle(f.store.state, 'restore', f.authority), 'complete');
   assert.equal(await f.providers.restoreSafeIdle(f.store.state, 'restore', f.authority), 'complete');
   assert.deepEqual(f.mutations, []);
-  await assert.rejects(f.providers.verifySafeIdle(f.store.state, 'verify'), /Full stamp safety is UNKNOWN/);
+  await assert.rejects(f.providers.verifySafeIdle(f.store.state, 'verify'), /positively completed exact removals/);
 });
 
 test('default restoration changes only one dimension at a time and reconciles exact ARM targets before continuing', async t => {

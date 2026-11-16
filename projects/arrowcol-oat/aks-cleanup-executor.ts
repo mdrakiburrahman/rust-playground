@@ -8,6 +8,7 @@ import { DRAIN_UNSETTLED_REASON, hasVerifiedUnsettledDrain, publishCleanupRunInv
   type CampaignState, type CampaignStore, type InventoryStep, type RunInventory, type RunInventoryResource } from './aks-campaign.js';
 import type { CleanupExecutor } from './aks-reconcile.js';
 import { assertRunCleanupActor, createSetupRunCleanupActions } from './aks-setup-cleanup.js';
+import { withCleanupDeadline } from './aks-cleanup-budget.js';
 
 export type CleanupActionResult = 'pending' | 'complete' | 'uncertain';
 export interface CleanupMutationAuthority {
@@ -16,8 +17,12 @@ export interface CleanupMutationAuthority {
   ownerId: string;
   fencingToken: number;
   assertCurrent(): Promise<void>;
+  assertEvidenceCurrent?(): Promise<void>;
 }
 export interface ExternalCleanupActions {
+  verifyCellPreservation?(inventory: RunInventory, authority: CleanupMutationAuthority): Promise<CleanupActionResult>;
+  recoverLifecycle?(field: Exclude<keyof RunInventory['cleanup'], 'handoff'>, inventory: RunInventory, deadlineUnixMs: number | null,
+    idempotencyKey: string, authority: CleanupMutationAuthority): Promise<CleanupActionResult>;
   discoverExactInventory(inventory: RunInventory): Promise<RunInventory>;
   stopAdmission(inventory: RunInventory, deadlineUnixMs: number, idempotencyKey: string, authority: CleanupMutationAuthority): Promise<CleanupActionResult>;
   boundedDrain(inventory: RunInventory, deadlineUnixMs: number, idempotencyKey: string, authority: CleanupMutationAuthority): Promise<CleanupActionResult>;
@@ -38,6 +43,7 @@ export interface ExternalCleanupActions {
 const ADMISSION_STOP_BUDGET_MS = 60_000;
 const DRAIN_BUDGET_MS = 120_000;
 const MAINTENANCE_STOP_BUDGET_MS = 120_000;
+const TERMINAL_CAPTURE_BUDGET_MS = 120_000;
 
 function hasUnresolvedIdentity(inventory: RunInventory): boolean {
   return inventory.resources.some(resource => resource.state === 'planned' || resource.state === 'uncertain') ||
@@ -134,10 +140,12 @@ export function createExternalCleanupExecutor(store: CampaignStore, actions: Ext
     const ownerId = suppliedState.ownerId;
     const campaignId = suppliedState.campaignId;
     const fencingToken = suppliedState.fencingToken;
+    let effectEtag: string | undefined;
     const assertCurrent = async () => {
       const current = await store.read();
       if (!current || current.state.status !== 'cleaning' || current.state.campaignId !== campaignId ||
           current.state.ownerId !== ownerId || current.state.fencingToken !== fencingToken || !current.state.runInventory ||
+          effectEtag !== undefined && current.etag !== effectEtag ||
           current.state.runInventory.owner_id !== suppliedState.runInventory!.owner_id ||
           current.state.runInventory.fencing_token !== suppliedState.runInventory!.fencing_token ||
           current.state.runInventory.cell_run_id !== suppliedState.runInventory!.cell_run_id ||
@@ -146,7 +154,7 @@ export function createExternalCleanupExecutor(store: CampaignStore, actions: Ext
         throw new Error('Cleanup controller fencing changed before the mutation gate.');
       }
     };
-    const authority: CleanupMutationAuthority = { campaignId, ownerId, fencingToken, assertCurrent };
+    const authority: CleanupMutationAuthority = { mode: 'controller', campaignId, ownerId, fencingToken, assertCurrent };
     const writeInventory = async (update: (value: RunInventory) => RunInventory) => {
       await assertCurrent();
       const current = (await store.read())!;
@@ -160,12 +168,23 @@ export function createExternalCleanupExecutor(store: CampaignStore, actions: Ext
     const runAction = async (field: keyof RunInventory['cleanup'], action: (deadline: number | null) => Promise<CleanupActionResult>, budgetMs = 0): Promise<'pending' | 'complete'> => {
       const prior = inventory.cleanup[field];
       if (prior.state === 'complete') return 'complete';
-      if (['running', 'failed', 'uncertain'].includes(prior.state)) return 'pending';
-      const running = setStep(prior, 'running', budgetMs);
-      inventory = (await writeInventory(value => ({ ...value, cleanup: { ...value.cleanup, [field]: running } }))).state.runInventory!;
+      if (prior.state === 'failed' || field === 'handoff') return 'pending';
+      const recovering = ['running', 'uncertain'].includes(prior.state);
+      if (recovering && !actions.recoverLifecycle) return 'pending';
+      const running = recovering ? prior : setStep(prior, 'running', budgetMs);
+      if (!recovering) inventory = (await writeInventory(value => ({ ...value, cleanup: { ...value.cleanup, [field]: running } }))).state.runInventory!;
       await authority.assertCurrent();
-      const result = await action(running.deadline_unix_ms);
+      const admitted = (await store.read())!;
+      if (canonical_json(admitted.state.runInventory) !== canonical_json(inventory)) throw new Error('Cleanup inventory changed before effect admission.');
+      effectEtag = admitted.etag;
+      let result: CleanupActionResult;
+      try {
+        await authority.assertCurrent();
+        result = recovering ? await actions.recoverLifecycle!(field, inventory, running.deadline_unix_ms, idempotencyKey, authority) :
+          await action(running.deadline_unix_ms);
+      } finally { effectEtag = undefined; }
       if (result === 'pending') {
+        if (recovering) return 'pending';
         inventory = (await writeInventory(value => ({ ...value, cleanup: { ...value.cleanup, [field]: setStep(value.cleanup[field], 'pending', budgetMs) } }))).state.runInventory!;
         return 'pending';
       }
@@ -187,9 +206,10 @@ export function createExternalCleanupExecutor(store: CampaignStore, actions: Ext
           for (const resource of inventory.resources.filter(item => item.role === 'maintenance')) {
             if (resource.state === 'observed' && resource.uid) {
               if (Date.now() >= deadline!) return 'uncertain';
-              await authority.assertCurrent();
+              const bounded = withCleanupDeadline(authority, deadline);
+              await bounded.assertCurrent();
               const result = await actions.stopMaintenanceIfUidAndOwnerMatch(resource, inventory.namespace.owner_token,
-                keyed(idempotencyKey, resource.name), authority);
+                keyed(idempotencyKey, resource.name), bounded);
               if (result !== 'complete') {
                 if (result === 'uncertain') inventory = (await writeInventory(value => ({ ...value, resources: value.resources.map(item =>
                   item.name === resource.name && item.kind === resource.kind ? { ...item, state: 'uncertain' } : item) }))).state.runInventory!;
@@ -201,7 +221,7 @@ export function createExternalCleanupExecutor(store: CampaignStore, actions: Ext
         }, MAINTENANCE_STOP_BUDGET_MS);
       }
       case 'record-terminal-state':
-        return runAction('terminal_capture', () => actions.captureTerminalState(inventory, idempotencyKey, authority));
+        return runAction('terminal_capture', () => actions.captureTerminalState(inventory, idempotencyKey, authority), TERMINAL_CAPTURE_BUDGET_MS);
       case 'remove-run-namespace': {
         if (hasUnresolvedIdentity(inventory)) return 'pending';
         if (inventory.namespace.uid) {

@@ -76,6 +76,7 @@ function fixture(t: TestContext, evidence = true) {
     stopAdmission: effect('admission'), boundedDrain: effect('drain'), preserveEvidence: effect('evidence'),
     stopMaintenanceIfUidAndOwnerMatch: effect('maintenance'), captureTerminalState: effect('terminal'),
     deleteNamespaceIfUidAndOwnerMatch: effect('namespace'), deleteQapBindingIfOwned: effect('qap'), deleteFicIfExact: effect('fic'),
+    verifyCellPreservation: effect('preservation'),
     restoreSafeIdle: async () => { throw new Error('Per-cell path must never restore stamp capacity.'); },
     verifySafeIdle: async () => { throw new Error('Per-cell path must never claim campaign-terminal full safety.'); } };
   const envelope = async (mode: 'producer' | 'controller' = 'producer'): Promise<CellCleanupEnvelope> => ({
@@ -101,7 +102,7 @@ test('per-cell selectors execute each provider once, retain active origin, and h
     assert.equal(receipt.fencing_token, 1);
     assert.equal(f.store.state.status, 'active');
   }
-  assert.deepEqual(f.calls, ['admission', 'drain', 'evidence', 'maintenance', 'terminal', 'namespace', 'qap', 'fic']);
+  assert.deepEqual(f.calls, ['admission', 'drain', 'evidence', 'maintenance', 'terminal', 'namespace', 'qap', 'fic', 'preservation']);
   const revision = f.store.revision;
   await f.invoke('stop_admission');
   assert.equal(f.store.revision, revision + 1);
@@ -122,6 +123,20 @@ test('stale input, missing provider, skipped order and changed actor fail before
   f.afterJournal(() => { f.store.state.status = 'fenced'; f.store.state.fencingToken = 2; });
   await assert.rejects(f.invoke('stop_admission'), /fenced/);
   assert.deepEqual(f.calls, []);
+});
+
+test('handoff requires a positive final independent data observation and recovers UNKNOWN without skipping verification', async t => {
+  const f = fixture(t);
+  for (const selector of (Object.keys(CELL_CLEANUP_SELECTORS) as CellCleanupSelector[]).filter(value => value !== 'handoff'))
+    await f.invoke(selector);
+  f.actions.verifyCellPreservation = undefined;
+  await assert.rejects(f.invoke('handoff'), /preservation is UNKNOWN/);
+  assert.notEqual(f.store.state.runInventory!.cleanup.handoff.state, 'complete');
+  let finalReads = 0;
+  f.actions.verifyCellPreservation = async (_inventory, authority) => { await authority.assertCurrent(); finalReads++; return 'complete'; };
+  await f.invoke('handoff');
+  assert.equal(finalReads, 1);
+  assert.equal(f.store.state.runInventory!.cleanup.handoff.state, 'complete');
 });
 
 test('capture without a durable destination is refused before a journal claim or effect', async t => {

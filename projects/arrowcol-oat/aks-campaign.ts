@@ -814,28 +814,24 @@ async function main(args: string[]): Promise<void> {
     await cell.readCellRunInventory(store, { schema_version: 1, campaign_id: input.inventory.campaign_id,
       orchestration_run_id: input.inventory.orchestration_run_id, cell_run_id: input.inventory.cell_run_id, actor: input.actor }, process.env);
     const { Azure, Config } = await import('../../infra/azure/bootstrap.js');
-    const { createDefaultCleanupProviders } = await import('./aks-default-providers.js');
+    const { createDefaultCleanupProviders, createDefaultCellCleanupProviders } = await import('./aks-default-providers.js');
     const fs = await import('node:fs'), os = await import('node:os');
     const azure = new Azure(new Config({ AZURE_SUBSCRIPTION_ID: subscriptionId }));
     if (process.env.CAMPAIGN_STORAGE_ACCOUNT !== azure.c.account || process.env.CAMPAIGN_STATE_CONTAINER !== azure.c.checkpoints)
       throw new Error('Cleanup custody must use the exact selected stamp checkpoints account/container.');
     const workDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'oat-cell-cleanup-'));
-    const unavailable = async (): Promise<never> => { throw new Error('Concrete runner lifecycle provider is not installed; outcome UNKNOWN.'); };
-    const actions = createDefaultCleanupProviders(store, { azure, workDirectory, lifecycle: {
-      stopAdmission: unavailable, boundedDrain: unavailable, preserveEvidence: unavailable,
-      stopMaintenanceIfUidAndOwnerMatch: unavailable, captureTerminalState: unavailable,
-    } });
-    const providers = cell.createCellCleanupProviders(actions);
-    for (const selector of ['stop_admission', 'bounded_drain', 'evidence_capture', 'stop_maintenance', 'terminal_capture'] as const)
-      delete providers[selector];
+    const actions = createDefaultCleanupProviders(store, { azure, workDirectory });
+    const providers = createDefaultCellCleanupProviders(actions);
     const log = console.log;
     let receipt: import('./aks-cell-cleanup.js').CellCleanupReceipt;
     try {
       console.log = (...values: unknown[]) => console.error(...values);
       receipt = await cell.executeCellCleanupStep(store, input, args[1] as import('./aks-cell-cleanup.js').CellCleanupSelector,
         providers, assertCurrent => cell.createBlobCellStepJournal(azure, input, assertCurrent));
-    } finally { console.log = log; }
-    fs.rmSync(workDirectory, { recursive: true });
+    } finally {
+      console.log = log;
+      fs.rmSync(workDirectory, { recursive: true });
+    }
     console.log(JSON.stringify({ ok: true, receipt }));
   } else {
     throw new Error('Usage: aks-campaign.ts start <campaign-uuid> [owner-uuid] | heartbeat <owner-uuid> <fencing-token> | arm <owner-uuid> <fencing-token> | publish-inventory (JSON stdin) | assert-ready <owner-uuid> <fencing-token> | read-inventory (JSON envelope stdin) | cleanup-step <selector> (JSON envelope stdin) | status');
