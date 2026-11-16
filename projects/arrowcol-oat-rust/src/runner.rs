@@ -125,6 +125,16 @@ pub struct InventoryFic {
     pub resource_id: Option<String>,
     pub name: Option<String>,
     pub state: InventoryResourceState,
+    #[serde(default)]
+    pub absence: Option<InventoryFicAbsenceReceipt>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InventoryFicAbsenceReceipt {
+    pub resource_id: String,
+    pub name: String,
+    pub observed_at_unix_ms: u64,
 }
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
@@ -140,6 +150,17 @@ pub struct InventoryQap {
     pub database: String,
     pub bindings: Vec<InventoryQapBinding>,
     pub state: InventoryResourceState,
+    #[serde(default)]
+    pub absence: Vec<InventoryQapAbsenceReceipt>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InventoryQapAbsenceReceipt {
+    pub database: String,
+    pub external_table: String,
+    pub relative_path: String,
+    pub observed_at_unix_ms: u64,
 }
 
 #[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
@@ -250,7 +271,15 @@ impl RunInventory {
         }
         if let Some(fic) = &self.fic {
             if fic.state == InventoryResourceState::Absent {
-                bail!("FIC absence requires an explicit identity receipt");
+                let receipt = fic.absence.as_ref().context("absent FIC requires a not-found receipt")?;
+                if fic.resource_id.as_deref() != Some(receipt.resource_id.as_str())
+                    || fic.name.as_deref() != Some(receipt.name.as_str())
+                    || receipt.observed_at_unix_ms == 0
+                {
+                    bail!("FIC absence receipt must match its exact identity and observation time");
+                }
+            } else if fic.absence.is_some() {
+                bail!("FIC not-found receipt requires absent state");
             }
             if fic.resource_id.is_some()
                 || matches!(
@@ -274,7 +303,22 @@ impl RunInventory {
         }
         if let Some(qap) = &self.qap {
             if qap.state == InventoryResourceState::Absent {
-                bail!("QAP absence requires an explicit identity receipt");
+                let mut seen = BTreeSet::new();
+                if qap.bindings.is_empty() || qap.absence.len() != qap.bindings.len()
+                    || qap.absence.iter().any(|receipt| {
+                        receipt.database != qap.database
+                            || receipt.observed_at_unix_ms == 0
+                            || !qap.bindings.iter().any(|binding| {
+                                binding.external_table == receipt.external_table
+                                    && binding.relative_path == receipt.relative_path
+                            })
+                            || !seen.insert((&receipt.external_table, &receipt.relative_path))
+                    })
+                {
+                    bail!("QAP absence requires one exact not-found receipt per binding");
+                }
+            } else if !qap.absence.is_empty() {
+                bail!("QAP not-found receipts require absent state");
             }
             let safe_identifier = |value: &str| {
                 !value.is_empty()
@@ -383,6 +427,7 @@ impl RunInventory {
                     .as_ref()
                     .is_some_and(|value| new.resource_id.as_ref() != Some(value))
                 || !old.state.can_advance_to(new.state)
+                || old.absence.as_ref().is_some_and(|receipt| new.absence.as_ref() != Some(receipt))
             {
                 bail!("custody update changed an established FIC identity");
             }
@@ -392,6 +437,7 @@ impl RunInventory {
             if old.database != new.database
                 || old.bindings.iter().any(|binding| !new.bindings.contains(binding))
                 || !old.state.can_advance_to(new.state)
+                || !old.absence.is_empty() && old.absence != new.absence
             {
                 bail!("custody update changed an established QAP identity");
             }
@@ -9489,6 +9535,33 @@ mod tests {
         invalid_absence.resources[0].state = InventoryResourceState::Planned;
         invalid_absence.resources[0].absence = None;
         assert!(absent.validate_successor(&invalid_absence).is_err());
+        let mut external = inventory.clone();
+        external.fic = Some(serde_json::from_value(json!({
+            "resource_id":"/subscriptions/a/federatedIdentityCredentials/fic",
+            "name":"fic","state":"absent",
+            "absence":{"resource_id":"/subscriptions/a/federatedIdentityCredentials/fic",
+                "name":"fic","observed_at_unix_ms":1}
+        }))?);
+        external.qap = Some(serde_json::from_value(json!({
+            "database":"db","bindings":[
+                {"external_table":"table_a","relative_path":"run/a"},
+                {"external_table":"table_b","relative_path":"run/b"}
+            ],"state":"absent","absence":[
+                {"database":"db","external_table":"table_a","relative_path":"run/a","observed_at_unix_ms":1},
+                {"database":"db","external_table":"table_b","relative_path":"run/b","observed_at_unix_ms":2}
+            ]
+        }))?);
+        external.validate()?;
+        let mut invalid_external = external.clone();
+        invalid_external.fic.as_mut().unwrap().absence.as_mut().unwrap().name = "other".to_owned();
+        assert!(invalid_external.validate().is_err());
+        invalid_external = external.clone();
+        let qap = invalid_external.qap.as_mut().unwrap();
+        qap.absence[1] = qap.absence[0].clone();
+        assert!(invalid_external.validate().is_err());
+        invalid_external = external.clone();
+        invalid_external.qap.as_mut().unwrap().absence[0].observed_at_unix_ms = 9;
+        assert!(external.validate_successor(&invalid_external).is_err());
         let mut observed = inventory.clone();
         observed.resources[0].state = InventoryResourceState::Observed;
         assert!(observed.validate().is_err());
