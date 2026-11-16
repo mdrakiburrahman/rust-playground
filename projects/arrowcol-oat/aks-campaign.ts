@@ -9,12 +9,19 @@ export const MAX_CAMPAIGN_LIFETIME_MS = 6 * 60 * 60 * 1000;
 const MAX_ARM_OPERATIONS = 128;
 export const CUSTODY_CLEANUP_STEPS = ["stop-admission", "bounded-drain", "preserve-evidence", "stop-maintenance", "record-terminal-state", "remove-run-namespace", "remove-run-qap", "remove-run-fic", "restore-safe-idle", "verify-safe-idle"] as const;
 export type CleanupStepName = typeof CUSTODY_CLEANUP_STEPS[number];
-export interface CleanupReceipt { step: CleanupStepName; idempotencyKey: string; status: "pending" | "running" | "complete"; }
+export const DRAIN_UNSETTLED_REASON = 'drain_deadline_expired_unsettled';
+export interface DrainExpiryReceipt {
+  schemaVersion: 1; campaignId: string; producerOwnerId: string; producerFencingToken: number;
+  actorOwnerId: string; actorFencingToken: number; orchestrationRunId: string; cellRunId: string; namespaceName: string; namespaceUid: string;
+  deadlineUnixMs: number; observedAtUnixMs: number; reason: typeof DRAIN_UNSETTLED_REASON; deltaRows: null; kustoRows: null;
+}
+export interface CleanupReceipt { step: CleanupStepName; idempotencyKey: string; status: "pending" | "running" | "complete" | "unsettled";
+  unsettled?: DrainExpiryReceipt; }
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const storageName = /^[a-z0-9]{3,24}$/;
 const containerName = /^[a-z0-9](?:[a-z0-9-]{1,61}[a-z0-9])?$/;
 export type CampaignMode = 'observe' | 'armed';
-export type CampaignStatus = 'active' | 'fenced' | 'cleaning' | 'complete';
+export type CampaignStatus = 'active' | 'fenced' | 'cleaning' | 'complete' | 'complete_unsettled';
 export type ArmOperationStatus = 'pending' | 'succeeded' | 'failed' | 'indeterminate';
 export type CleanupArmTarget =
   { kind: 'aks-pool'; count: number; autoscale: boolean; minimum: number | null; maximum: number | null } |
@@ -34,7 +41,7 @@ export interface CampaignState {
   schemaVersion: 1; campaignId: string; ownerId: string; fencingToken: number; mode: CampaignMode; status: CampaignStatus;
   startedAtMs: number; heartbeatAtMs: number; heartbeatSequence: number; expiresAtMs: number; lastEvaluatedAtMs?: number;
   lastMissedHeartbeatCount?: number; fenceReason?: 'heartbeat-expired' | 'max-lifetime'; fencedAtMs?: number;
-  cleanupStatus: 'not-started' | 'pending' | 'running' | 'verified'; cleanupSteps: CleanupReceipt[];
+  cleanupStatus: 'not-started' | 'pending' | 'running' | 'verified' | 'verified_with_unsettled'; cleanupSteps: CleanupReceipt[];
   runInventory?: RunInventory; operations: ArmOperationReceipt[];
 }
 export interface StoredCampaign { state: CampaignState; etag: string; }
@@ -318,6 +325,32 @@ function httpsManagementUrl(value: string, subscriptionId: string): string {
   return parsed.toString();
 }
 
+export function hasVerifiedUnsettledDrain(state: CampaignState): boolean {
+  const receipt = state.cleanupSteps.find(step => step.status === 'unsettled');
+  if (!receipt) return false;
+  const proof = receipt.unsettled, inventory = state.runInventory, drain = inventory?.cleanup.bounded_drain;
+  if (receipt.step !== 'bounded-drain' || !proof || !inventory || !drain ||
+      !exactRecord(proof, ['schemaVersion', 'campaignId', 'producerOwnerId', 'producerFencingToken', 'actorOwnerId',
+        'actorFencingToken', 'orchestrationRunId', 'cellRunId', 'namespaceName', 'namespaceUid', 'deadlineUnixMs', 'observedAtUnixMs', 'reason', 'deltaRows', 'kustoRows']) ||
+      !['cleaning', 'complete_unsettled'].includes(state.status) || state.mode !== 'armed' || proof.schemaVersion !== 1 ||
+      proof.campaignId !== state.campaignId || proof.producerOwnerId !== inventory.owner_id ||
+      proof.producerFencingToken !== inventory.fencing_token || proof.actorOwnerId !== state.ownerId ||
+      proof.actorFencingToken !== state.fencingToken || inventory.fencing_token >= state.fencingToken ||
+      proof.orchestrationRunId !== inventory.orchestration_run_id || proof.cellRunId !== inventory.cell_run_id ||
+      proof.namespaceName !== inventory.namespace.name || !inventory.namespace.uid || proof.namespaceUid !== inventory.namespace.uid ||
+      proof.deadlineUnixMs !== drain.deadline_unix_ms || !nonnegative(proof.deadlineUnixMs) ||
+      proof.deadlineUnixMs <= state.startedAtMs || !nonnegative(proof.observedAtUnixMs) ||
+      proof.observedAtUnixMs < proof.deadlineUnixMs || proof.observedAtUnixMs > Date.now() ||
+      proof.observedAtUnixMs < (state.fencedAtMs ?? Infinity) ||
+      !['failed', 'uncertain'].includes(drain.state) || drain.reason_code !== DRAIN_UNSETTLED_REASON ||
+      proof.reason !== DRAIN_UNSETTLED_REASON || proof.deltaRows !== null || proof.kustoRows !== null ||
+      inventory.cleanup.stop_admission.state !== 'complete' ||
+      state.cleanupSteps[0]?.step !== 'stop-admission' || state.cleanupSteps[0].status !== 'complete' ||
+      state.cleanupSteps.filter(step => step.status === 'unsettled').length !== 1)
+    throw new Error('Terminal unsettled drain lacks exact current controller, immutable origin or expired-deadline proof.');
+  return true;
+}
+
 export function validateCampaignState(value: unknown): CampaignState {
   if (!record(value) || Object.keys(value).some(key => ![
     'schemaVersion', 'campaignId', 'ownerId', 'fencingToken', 'mode', 'status', 'startedAtMs', 'heartbeatAtMs',
@@ -327,11 +360,11 @@ export function validateCampaignState(value: unknown): CampaignState {
   const state = value as unknown as CampaignState;
   if (state.schemaVersion !== 1 || !uuid.test(state.campaignId) || !uuid.test(state.ownerId) ||
       !Number.isSafeInteger(state.fencingToken) || state.fencingToken < 1 ||
-      !['observe', 'armed'].includes(state.mode) || !['active', 'fenced', 'cleaning', 'complete'].includes(state.status) ||
+      !['observe', 'armed'].includes(state.mode) || !['active', 'fenced', 'cleaning', 'complete', 'complete_unsettled'].includes(state.status) ||
       !nonnegative(state.startedAtMs) || !nonnegative(state.heartbeatAtMs) || state.heartbeatAtMs < state.startedAtMs ||
       !Number.isSafeInteger(state.heartbeatSequence) || state.heartbeatSequence < 0 ||
       state.expiresAtMs !== state.startedAtMs + MAX_CAMPAIGN_LIFETIME_MS ||
-      !['not-started', 'pending', 'running', 'verified'].includes(state.cleanupStatus) ||
+      !['not-started', 'pending', 'running', 'verified', 'verified_with_unsettled'].includes(state.cleanupStatus) ||
       !Array.isArray(state.operations) || state.operations.length > MAX_ARM_OPERATIONS || !Array.isArray(state.cleanupSteps))  {
     throw new Error('Campaign state is malformed or violates the fixed custody limits.');
   }
@@ -344,7 +377,9 @@ export function validateCampaignState(value: unknown): CampaignState {
   const expectedCleanupSteps = state.status === "active" ? [] : [...CUSTODY_CLEANUP_STEPS];
   if (state.cleanupSteps.length !== expectedCleanupSteps.length || state.cleanupSteps.some((receipt, index) => !record(receipt) ||
       receipt.step !== expectedCleanupSteps[index] || receipt.idempotencyKey !== state.campaignId + ":" + state.fencingToken + ":" + receipt.step ||
-      !["pending", "running", "complete"].includes(receipt.status))) throw new Error("Campaign cleanup receipts are malformed.");
+      !["pending", "running", "complete", "unsettled"].includes(receipt.status) ||
+      !exactRecord(receipt, receipt.status === 'unsettled' ? ['step', 'idempotencyKey', 'status', 'unsettled'] :
+        ['step', 'idempotencyKey', 'status']))) throw new Error("Campaign cleanup receipts are malformed.");
   if (state.status === "active" && state.cleanupStatus !== "not-started" || state.status === "fenced" && state.cleanupStatus !== "pending" ||
       state.status === "cleaning" && state.cleanupStatus !== "running" || state.status === "complete" &&
       (state.cleanupStatus !== "verified" || state.cleanupSteps.some(receipt => receipt.status !== "complete"))) {
@@ -353,21 +388,21 @@ export function validateCampaignState(value: unknown): CampaignState {
   let unfinishedCleanup = false;
   let runningCleanup = false;
   for (const receipt of state.cleanupSteps) {
-    if (receipt.status === 'complete' && unfinishedCleanup) throw new Error('Campaign cleanup receipts are out of order.');
+    if (['complete', 'unsettled'].includes(receipt.status) && unfinishedCleanup) throw new Error('Campaign cleanup receipts are out of order.');
     if (receipt.status === 'running') {
       if (runningCleanup) throw new Error('Campaign has multiple running cleanup receipts.');
       runningCleanup = true;
     }
-    if (receipt.status !== 'complete') unfinishedCleanup = true;
+    if (!['complete', 'unsettled'].includes(receipt.status)) unfinishedCleanup = true;
   }
   if (state.runInventory !== undefined) {
     validateRunInventory(state.runInventory, state);
     if (state.status === 'active' && state.runInventory.fencing_token !== state.fencingToken ||
-        ['fenced', 'cleaning', 'complete'].includes(state.status) && state.runInventory.fencing_token >= state.fencingToken) {
+        state.status !== 'active' && state.runInventory.fencing_token >= state.fencingToken) {
       throw new Error('RunInventory producer fencing identity does not match the campaign lifecycle.');
     }
   }
-  if (state.mode === 'armed' && !state.runInventory || ['fenced', 'cleaning', 'complete'].includes(state.status) && !state.runInventory) {
+  if (state.mode === 'armed' && !state.runInventory || state.status !== 'active' && !state.runInventory) {
     throw new Error('Campaign cannot be armed or fenced without a persisted RunInventory.');
   }
   const ids = new Set<string>();
@@ -386,10 +421,25 @@ export function validateCampaignState(value: unknown): CampaignState {
     ids.add(operation.id);
   }
   if (state.status === 'active' && state.fenceReason !== undefined ||
-      ['fenced', 'cleaning', 'complete'].includes(state.status) && (!state.fenceReason || state.fencedAtMs === undefined || state.fencingToken < 2)) {
+      state.status !== 'active' && (!state.fenceReason || state.fencedAtMs === undefined || state.fencingToken < 2)) {
     throw new Error('Campaign terminal state is missing its fencing receipt.');
   }
   if (state.status === 'complete' && state.cleanupStatus !== 'verified') throw new Error('Campaign cannot complete before cleanup verification.');
+  const unsettled = hasVerifiedUnsettledDrain(state);
+  if (state.status === 'complete_unsettled') {
+    const inventory = state.runInventory!;
+    if (!unsettled || state.cleanupStatus !== 'verified_with_unsettled' ||
+        state.cleanupSteps.some(step => !['complete', 'unsettled'].includes(step.status)) ||
+        inventory.cleanup.handoff.state !== 'failed' || inventory.cleanup.handoff.reason_code !== DRAIN_UNSETTLED_REASON ||
+        Object.entries(inventory.cleanup).some(([name, step]) => !['bounded_drain', 'handoff'].includes(name) && step.state !== 'complete') ||
+        inventory.resources.some(resource => !['removed', 'absent'].includes(resource.state)) ||
+        inventory.fic && !['removed', 'absent'].includes(inventory.fic.state) ||
+        inventory.qap && !['removed', 'absent'].includes(inventory.qap.state))
+      throw new Error('Unsettled campaign cannot finalize without failed-cell evidence and every other cleanup/safe-idle proof.');
+  } else if (state.cleanupStatus === 'verified_with_unsettled') throw new Error('Unsettled verification requires its distinct terminal campaign state.');
+  if (['complete', 'complete_unsettled'].includes(state.status) &&
+      state.operations.some(operation => ['pending', 'indeterminate'].includes(operation.status)))
+    throw new Error('Campaign cannot finalize while ARM operations remain unresolved.');
   return state;
 }
 
@@ -502,7 +552,7 @@ function requireOwner(state: CampaignState | undefined, ownerId: string, fencing
 }
 export async function startCampaign(store: CampaignStore, campaignId: string, ownerId = campaignId, now = Date.now()): Promise<StoredCampaign> {
   return mutateCampaign(store, current => {
-    if (current && current.status !== 'complete') throw new Error('An unfinished campaign still owns the stamp.');
+    if (current && !['complete', 'complete_unsettled'].includes(current.status)) throw new Error('An unfinished campaign still owns the stamp.');
     return newCampaignState(campaignId, ownerId, now);
   });
 }
@@ -628,8 +678,11 @@ export async function armCampaign(store: CampaignStore, ownerId: string, fencing
 export async function setCleanupVerified(store: CampaignStore, ownerId: string, fencingToken: number): Promise<StoredCampaign> {
   return mutateCampaign(store, current => {
     if (!current || current.status !== 'cleaning' || current.ownerId !== ownerId || current.fencingToken !== fencingToken ||
-        current.cleanupStatus !== 'running' || current.cleanupSteps.some(step => step.status !== 'complete')) throw new Error('Cleanup verification requires the fenced owner and a running cleanup.');
-    return { ...current, status: 'complete', cleanupStatus: 'verified' };
+        current.cleanupStatus !== 'running' || current.cleanupSteps.some(step => !['complete', 'unsettled'].includes(step.status)))
+      throw new Error('Cleanup verification requires the fenced owner and a running cleanup.');
+    const unsettled = hasVerifiedUnsettledDrain(current);
+    return { ...current, status: unsettled ? 'complete_unsettled' : 'complete',
+      cleanupStatus: unsettled ? 'verified_with_unsettled' : 'verified' };
   });
 }
 export async function recordArmOperation(store: CampaignStore, ownerId: string, fencingToken: number,

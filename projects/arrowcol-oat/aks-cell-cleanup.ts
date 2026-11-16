@@ -1,5 +1,5 @@
 import { canonical_json, type Azure } from '../../infra/azure/bootstrap.js';
-import { assertCampaignEnvironment, CampaignConflictError, CampaignFencedError, CampaignWriteOutcomeUnknownError, compareAndSwapRunInventory,
+import { assertCampaignEnvironment, CampaignConflictError, CampaignFencedError, CampaignWriteOutcomeUnknownError, compareAndSwapRunInventory, hasVerifiedUnsettledDrain,
   CUSTODY_CLEANUP_STEPS, validateCampaignState, type CampaignState, type CampaignStore, type RunInventory, type StoredCampaign } from './aks-campaign.js';
 import type { CleanupMutationAuthority, ExternalCleanupActions } from './aks-cleanup-executor.js';
 
@@ -184,6 +184,8 @@ export async function executeCellCleanupStep(store: CampaignStore, input: unknow
     throw new CampaignConflictError();
   if ((selector === 'evidence_capture' || selector === 'terminal_capture') && !current.state.runInventory!.evidence_destination)
     throw new Error('Persist the exact evidence destination before any capture effect.');
+  if (selector === 'handoff' && hasVerifiedUnsettledDrain(current.state))
+    throw new Error('An unsettled cell cannot produce a complete per-cell handoff; use controller terminal verification.');
   let effectEtag: string | undefined;
   const assertCurrent = async () => {
     const observed = await store.read();
@@ -195,6 +197,7 @@ export async function executeCellCleanupStep(store: CampaignStore, input: unknow
     ownerId: envelope.actor.owner_id, fencingToken: envelope.actor.fencing_token, assertCurrent };
   const journal = journalFactory(assertCurrent), priorSelectors = selectors.slice(0, selectors.indexOf(selector));
   for (const prior of priorSelectors) {
+    if (prior === 'bounded_drain' && envelope.actor.mode === 'controller' && hasVerifiedUnsettledDrain(current.state)) continue;
     const saved = await journal.read(prior);
     if (saved) {
       assertRecord(saved.value, envelope, prior);

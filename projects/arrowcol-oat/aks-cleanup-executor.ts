@@ -4,7 +4,8 @@ import { canonical_json, type Azure } from '../../infra/azure/bootstrap.js';
 import { cleanup_run_fic, recover_run_fic_record, type RunFicPlan } from '../../infra/azure/run_fic.js';
 import { cleanup_oat_qap, delete_oat_qap_workload, recover_oat_qap_record, recover_oat_workload_stop,
   parse_oat_qap_reference, type OatQapReference, type RecordV1 } from '../../infra/azure/oat_qap.js';
-import { publishCleanupRunInventory, type CampaignState, type CampaignStore, type InventoryStep, type RunInventory, type RunInventoryResource } from './aks-campaign.js';
+import { DRAIN_UNSETTLED_REASON, hasVerifiedUnsettledDrain, publishCleanupRunInventory,
+  type CampaignState, type CampaignStore, type InventoryStep, type RunInventory, type RunInventoryResource } from './aks-campaign.js';
 import type { CleanupExecutor } from './aks-reconcile.js';
 import { assertRunCleanupActor, createSetupRunCleanupActions } from './aks-setup-cleanup.js';
 
@@ -158,6 +159,7 @@ export function createExternalCleanupExecutor(store: CampaignStore, actions: Ext
     const currentState = (await store.read())!.state;
     const runAction = async (field: keyof RunInventory['cleanup'], action: (deadline: number | null) => Promise<CleanupActionResult>, budgetMs = 0): Promise<'pending' | 'complete'> => {
       const prior = inventory.cleanup[field];
+      if (prior.state === 'complete') return 'complete';
       if (['running', 'failed', 'uncertain'].includes(prior.state)) return 'pending';
       const running = setStep(prior, 'running', budgetMs);
       inventory = (await writeInventory(value => ({ ...value, cleanup: { ...value.cleanup, [field]: running } }))).state.runInventory!;
@@ -253,7 +255,11 @@ export function createExternalCleanupExecutor(store: CampaignStore, actions: Ext
       case 'verify-safe-idle': {
         const result = await actions.verifySafeIdle(currentState, idempotencyKey);
         if (result !== 'complete') return 'pending';
-        const handoff = setStep(inventory.cleanup.handoff, 'complete');
+        const unsettled = hasVerifiedUnsettledDrain(currentState);
+        if (inventory.cleanup.handoff.state === 'failed' && inventory.cleanup.handoff.reason_code !== DRAIN_UNSETTLED_REASON)
+          throw new Error('Unrelated failed cell handoff cannot be replaced with clean or expiry verification.');
+        const handoff = setStep(inventory.cleanup.handoff, unsettled ? 'failed' : 'complete', 0,
+          unsettled ? DRAIN_UNSETTLED_REASON : null);
         await writeInventory(value => ({ ...value, cleanup: { ...value.cleanup, handoff } }));
         return 'complete';
       }

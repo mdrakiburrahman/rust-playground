@@ -1,5 +1,7 @@
 import { pathToFileURL } from 'node:url';
-import { CUSTODY_CLEANUP_STEPS, createBlobCampaignStore, mutateCampaign, type ArmOperationReceipt, type CampaignState, type CampaignStore, type CleanupStepName, readArmOperationStatus, setCleanupVerified } from './aks-campaign.js';
+import { CUSTODY_CLEANUP_STEPS, createBlobCampaignStore, DRAIN_UNSETTLED_REASON, hasVerifiedUnsettledDrain, mutateCampaign,
+  publishCleanupRunInventory, type DrainExpiryReceipt, type StoredCampaign, type ArmOperationReceipt, type CampaignState,
+  type CampaignStore, type CleanupStepName, readArmOperationStatus, setCleanupVerified, validateCampaignState } from './aks-campaign.js';
 
 import { setTimeout as delay } from "node:timers/promises";
 export type FenceReason = 'heartbeat-expired' | 'max-lifetime';
@@ -182,17 +184,78 @@ export async function ensureSafeIdle(read: () => Promise<SafeIdleObservation>, r
 }
 
 export type CleanupExecutor = (step: CleanupStepName, state: CampaignState, idempotencyKey: string) => Promise<'pending' | 'complete'>;
-export type CleanupProgress = 'idle' | 'fenced' | 'pending' | 'progress' | 'complete';
+export type CleanupProgress = 'idle' | 'fenced' | 'pending' | 'progress' | 'complete' | 'complete_unsettled';
+
+export async function recordUnsettledDrain(store: CampaignStore, ownerId: string, fencingToken: number,
+  observedAt = Date.now()): Promise<StoredCampaign> {
+  let stored = await store.read();
+  const admissible = (current: CampaignState | undefined) => {
+    if (!current || current.status !== 'cleaning' || current.mode !== 'armed' ||
+        current.ownerId !== ownerId || current.fencingToken !== fencingToken || !current.runInventory ||
+        current.runInventory.fencing_token >= fencingToken) throw new Error('Unsettled expiry requires current cleaning controller authority.');
+    validateCampaignState(current);
+    if (hasVerifiedUnsettledDrain(current)) return current;
+    const inventory = current.runInventory, drain = inventory.cleanup.bounded_drain;
+    const receipt = current.cleanupSteps.find(step => step.step === 'bounded-drain');
+    if (!Number.isSafeInteger(observedAt) || observedAt > Date.now() || observedAt < (current.fencedAtMs ?? Infinity) ||
+        drain.deadline_unix_ms === null || drain.deadline_unix_ms <= current.startedAtMs ||
+        observedAt < drain.deadline_unix_ms || !inventory.namespace.uid ||
+        inventory.cleanup.stop_admission.state !== 'complete' || current.cleanupSteps[0]?.status !== 'complete' ||
+        !receipt || !['pending', 'running'].includes(receipt.status) ||
+        receipt.idempotencyKey !== `${current.campaignId}:${fencingToken}:bounded-drain` ||
+        !(['pending', 'running'].includes(drain.state) ||
+          ['failed', 'uncertain'].includes(drain.state) && drain.reason_code === DRAIN_UNSETTLED_REASON))
+      throw new Error('Drain deadline is not expired, admission is not stopped, or an unrelated failure cannot become terminal expiry.');
+    return current;
+  };
+  let state = admissible(stored?.state);
+  if (hasVerifiedUnsettledDrain(state)) return stored!;
+  const original = state.runInventory!;
+  if (!['failed', 'uncertain'].includes(original.cleanup.bounded_drain.state)) {
+    await publishCleanupRunInventory(store, { ...original, cleanup: { ...original.cleanup, bounded_drain: {
+      ...original.cleanup.bounded_drain, state: 'uncertain', reason_code: DRAIN_UNSETTLED_REASON,
+    } } }, ownerId, fencingToken);
+  }
+  stored = await store.read();
+  state = admissible(stored?.state);
+  if (hasVerifiedUnsettledDrain(state)) return stored!;
+  const inventory = state.runInventory!, drain = inventory.cleanup.bounded_drain;
+  if (!['failed', 'uncertain'].includes(drain.state) || drain.reason_code !== DRAIN_UNSETTLED_REASON ||
+      inventory.cell_run_id !== original.cell_run_id || inventory.orchestration_run_id !== original.orchestration_run_id ||
+      inventory.owner_id !== original.owner_id || inventory.fencing_token !== original.fencing_token ||
+      inventory.namespace.uid !== original.namespace.uid || drain.deadline_unix_ms !== original.cleanup.bounded_drain.deadline_unix_ms)
+    throw new Error('Durable failed-drain evidence changed before terminal-expiry recording.');
+  const proof: DrainExpiryReceipt = { schemaVersion: 1, campaignId: state.campaignId,
+    producerOwnerId: inventory.owner_id, producerFencingToken: inventory.fencing_token,
+    actorOwnerId: ownerId, actorFencingToken: fencingToken, orchestrationRunId: inventory.orchestration_run_id,
+    cellRunId: inventory.cell_run_id, namespaceName: inventory.namespace.name, namespaceUid: inventory.namespace.uid!,
+    deadlineUnixMs: drain.deadline_unix_ms!, observedAtUnixMs: observedAt, reason: DRAIN_UNSETTLED_REASON, deltaRows: null, kustoRows: null };
+  const written = await mutateCampaign(store, current => {
+    admissible(current);
+    if (hasVerifiedUnsettledDrain(current!)) return current!;
+    if (JSON.stringify(current!.runInventory) !== JSON.stringify(inventory)) throw new Error('Expiry inventory/version changed.');
+    return { ...current!, cleanupSteps: current!.cleanupSteps.map(step => step.step === 'bounded-drain' ?
+      { ...step, status: 'unsettled' as const, unsettled: proof } : step) };
+  }, 1);
+  const confirmed = await store.read();
+  if (!confirmed || confirmed.etag !== written.etag || JSON.stringify(confirmed.state) !== JSON.stringify(written.state))
+    throw new Error('Terminal-expiry receipt write outcome is UNKNOWN.');
+  validateCampaignState(confirmed.state);
+  if (!hasVerifiedUnsettledDrain(confirmed.state)) throw new Error('Durable terminal-expiry evidence did not verify.');
+  return confirmed;
+}
 
 /** Persist a stable step key before side effects so interrupted cleanup can safely retry. */
-export async function reconcileCleanupOnce(store: CampaignStore, execute: CleanupExecutor): Promise<CleanupProgress> {
+export async function reconcileCleanupOnce(store: CampaignStore, execute: CleanupExecutor, now = Date.now()): Promise<CleanupProgress> {
   let stored = await store.read();
   if (!stored) return 'idle';
+  validateCampaignState(stored.state);
   if (stored.state.status === 'complete') return 'complete';
+  if (stored.state.status === 'complete_unsettled') return 'complete_unsettled';
   if (stored.state.status === 'active') return 'idle';
   if (stored.state.status === 'fenced') {
     stored = await mutateCampaign(store, current => {
-      if (!current || current.campaignId !== stored!.state.campaignId || current.status === 'complete') {
+      if (!current || current.campaignId !== stored!.state.campaignId || ['complete', 'complete_unsettled'].includes(current.status)) {
         throw new Error('Campaign changed before cleanup could start.');
       }
       if (current.status === 'cleaning') return current;
@@ -201,21 +264,32 @@ export async function reconcileCleanupOnce(store: CampaignStore, execute: Cleanu
     });
   }
   if (stored.state.status !== 'cleaning') throw new Error('Cleanup requires a fenced campaign.');
-  const next = stored.state.cleanupSteps.find(receipt => receipt.status !== 'complete');
-  if (!next) {
-    await setCleanupVerified(store, stored.state.ownerId, stored.state.fencingToken);
-    return 'complete';
+  validateCampaignState(stored.state);
+  let next = stored.state.cleanupSteps.find(receipt => !['complete', 'unsettled'].includes(receipt.status));
+  if (next?.step === 'bounded-drain') {
+    const drain = stored.state.runInventory!.cleanup.bounded_drain;
+    if (drain.deadline_unix_ms !== null && now >= drain.deadline_unix_ms &&
+        (['pending', 'running'].includes(drain.state) ||
+          ['failed', 'uncertain'].includes(drain.state) && drain.reason_code === DRAIN_UNSETTLED_REASON)) {
+      stored = await recordUnsettledDrain(store, stored.state.ownerId, stored.state.fencingToken, now);
+      next = stored.state.cleanupSteps.find(receipt => !['complete', 'unsettled'].includes(receipt.status));
+    } else if (['failed', 'uncertain'].includes(drain.state)) return 'pending';
   }
+  if (!next) {
+    const finished = await setCleanupVerified(store, stored.state.ownerId, stored.state.fencingToken);
+    return finished.state.status === 'complete_unsettled' ? 'complete_unsettled' : 'complete';
+  }
+  const nextReceipt = next;
   const prepared = await mutateCampaign(store, current => {
     if (!current || current.campaignId !== stored!.state.campaignId || current.status !== 'cleaning' ||
         current.fencingToken !== stored!.state.fencingToken) throw new Error('Campaign changed during cleanup preparation.');
-    const receipt = current.cleanupSteps.find(item => item.step === next.step);
-    if (!receipt || receipt.idempotencyKey !== next.idempotencyKey) throw new Error('Cleanup receipt changed unexpectedly.');
-    if (receipt.status === 'complete') return current;
-    return { ...current, cleanupSteps: current.cleanupSteps.map(item => item.step === next.step ? { ...item, status: 'running' } : item) };
+    const receipt = current.cleanupSteps.find(item => item.step === nextReceipt.step);
+    if (!receipt || receipt.idempotencyKey !== nextReceipt.idempotencyKey) throw new Error('Cleanup receipt changed unexpectedly.');
+    if (['complete', 'unsettled'].includes(receipt.status)) return current;
+    return { ...current, cleanupSteps: current.cleanupSteps.map(item => item.step === nextReceipt.step ? { ...item, status: 'running' } : item) };
   });
-  const receipt = prepared.state.cleanupSteps.find(item => item.step === next.step)!;
-  if (receipt.status === 'complete') return 'progress';
+  const receipt = prepared.state.cleanupSteps.find(item => item.step === nextReceipt.step)!;
+  if (['complete', 'unsettled'].includes(receipt.status)) return 'progress';
   const result = await execute(receipt.step, prepared.state, receipt.idempotencyKey);
   if (result === 'pending') return 'pending';
   if (result !== 'complete') throw new Error('Cleanup adapter returned an unsupported result.');
@@ -224,10 +298,15 @@ export async function reconcileCleanupOnce(store: CampaignStore, execute: Cleanu
         current.fencingToken !== prepared.state.fencingToken) throw new Error('Campaign changed while cleanup was executing.');
     const step = current.cleanupSteps.find(item => item.step === receipt.step);
     if (!step || step.idempotencyKey !== receipt.idempotencyKey) throw new Error('Cleanup receipt changed while executing.');
-    if (step.status === 'complete') return current;
+    if (['complete', 'unsettled'].includes(step.status)) return current;
+    if (step.step === 'bounded-drain' && ['failed', 'uncertain'].includes(current.runInventory!.cleanup.bounded_drain.state))
+      throw new Error('A failed or uncertain drain cannot become a clean complete receipt.');
     const cleanupSteps = current.cleanupSteps.map(item => item.step === receipt.step ? { ...item, status: 'complete' as const } : item);
-    if (cleanupSteps.every(item => item.status === 'complete')) return { ...current, status: 'complete', cleanupStatus: 'verified', cleanupSteps };
     return { ...current, cleanupSteps };
   });
-  return completed.state.status === 'complete' ? 'complete' : 'progress';
+  if (completed.state.cleanupSteps.every(step => ['complete', 'unsettled'].includes(step.status))) {
+    const finished = await setCleanupVerified(store, completed.state.ownerId, completed.state.fencingToken);
+    return finished.state.status === 'complete_unsettled' ? 'complete_unsettled' : 'complete';
+  }
+  return 'progress';
 }

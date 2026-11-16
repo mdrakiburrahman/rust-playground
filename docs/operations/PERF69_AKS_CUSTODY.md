@@ -104,7 +104,9 @@ Success is exactly `{ok:true,inventory,etag}` from one validated durable read. T
 
 Both CLIs return one JSON error line, nonzero: `{ok:false,code:"campaign_fenced"|"write_outcome_unknown"|"invalid_or_storage_error",message}`.
 
-**Unresolved expiry gate:** the current outer executor cannot advance past a running, failed or uncertain lifecycle milestone while retaining that UNSETTLED evidence. It leaves the step pending for explicit recovery and does not replay unknown effects, clear reasons, treat drain timeout as success or qualify a failed cell. A separate bounded-expiry continuation/disposition contract is still required before unattended cleanup qualification.
+**Controller-only terminal expiry:** `recordUnsettledDrain` admits only the current armed cleaning controller, positive admission stop, the immutable run/namespace UID and an already-expired, non-extendable drain deadline. It first durably retains a failed/uncertain drain with reason `drain_deadline_expired_unsettled`, then confirms a distinct `unsettled` outer receipt binding the original producer, current actor, deadline and actual observation time. Unknown Delta/Kusto row counts remain null. Restart reuses that receipt; unrelated failures, stale actors and unexpired deadlines cannot advance.
+
+Only this validated expiry can pass the drain guard. Remaining evidence, maintenance stop, terminal capture, exact removals and full safe-idle verification remain mandatory and ordered. Final state is `complete_unsettled`, cleanup status `verified_with_unsettled`, and handoff stays **failed** with the expiry reason. It is not a successful drain, preservation measurement or qualified cell. Producer cleanup has no expiry shortcut; per-cell handoff cannot emit normal success for this path. The watchdog reports distinct terminal progress and exits with code 2 rather than spinning or reporting clean success.
 
 ## Campaign-terminal providers
 
