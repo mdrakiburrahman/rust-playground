@@ -1875,18 +1875,20 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         'occupancy-id': { type: 'string', default: '' }, 'reset-generation': { type: 'string', default: '' },
         'wait-seconds': { type: 'string', default: '0' }, help: { type: 'boolean', short: 'h' },
         'run-id': { type: 'string' }, namespace: { type: 'string' },
-        'service-account': { type: 'string' }, record: { type: 'string' },
+        'service-account': { type: 'string' }, record: { type: 'string' }, 'identity-plan': { type: 'string' },
         manifest: { type: 'string' }, 'workload-record': { type: 'string' }, 'workload-stop-record': { type: 'string' },
+        reference: { type: 'string' },
         'preview-before-create': { type: 'boolean', default: false },
       } });
-    if (args.help) { console.log('Usage: bootstrap.ts <config|preflight|what-if|provision|reconcile|reset|recover|status|stop|occupy|release|prepare-run-fic|probe-run-fic|cleanup-run-fic|bind-oat-qap|verify-oat-qap|cleanup-oat-qap> [--mode stamped|schema-evolution] [--env-file PATH] [--stamp-config YAML] [--output PATH] [--tables PATH] [--infra-only] [--read-only] [--preview-before-create] [--execute] [--resume] [--occupancy-id UUID] [--reset-generation UUID] [--wait-seconds 0..600] [--run-id UUID --namespace NAME --service-account NAME --record PATH] [--manifest PATH --workload-record PATH --workload-stop-record PATH] [--stop-command COMMAND ...]'); return 0; }
+    if (args.help) { console.log('Usage: bootstrap.ts <config|preflight|what-if|provision|reconcile|reset|recover|status|stop|occupy|release|plan-run-fic|prepare-run-fic|probe-run-fic|cleanup-run-fic|bind-oat-qap|verify-oat-qap|cleanup-oat-qap|oat-qap-reference|recover-oat-qap|recover-oat-qap-stop|observe-custody-capacity> [--mode stamped|schema-evolution] [--env-file PATH] [--stamp-config YAML] [--output PATH] [--tables PATH] [--infra-only] [--read-only] [--preview-before-create] [--execute] [--resume] [--occupancy-id UUID] [--reset-generation UUID] [--wait-seconds 0..600] [--run-id UUID --namespace NAME --service-account NAME --record PATH --identity-plan PATH] [--manifest PATH --workload-record PATH --workload-stop-record PATH --reference PATH] [--stop-command COMMAND ...]'); return 0; }
     const command = positionals[0];
     if (positionals.length !== 1 || !['config', 'preflight', 'what-if', 'provision', 'reconcile', 'reset', 'recover', 'status', 'stop', 'occupy', 'release',
-      'prepare-run-fic', 'probe-run-fic', 'cleanup-run-fic', 'bind-oat-qap', 'verify-oat-qap', 'cleanup-oat-qap'].includes(command))
+      'plan-run-fic', 'prepare-run-fic', 'probe-run-fic', 'cleanup-run-fic', 'bind-oat-qap', 'verify-oat-qap', 'cleanup-oat-qap',
+      'oat-qap-reference', 'recover-oat-qap', 'recover-oat-qap-stop', 'observe-custody-capacity'].includes(command))
       throw new Failure('A valid Azure bootstrap command is required.');
     const mode = azure_mode(args.mode!);
-    if (args['read-only'] && command !== 'preflight' && command !== 'what-if')
-      throw new Failure('--read-only is only supported for preflight and what-if.');
+    if (args['read-only'] && !['preflight', 'what-if', 'plan-run-fic', 'oat-qap-reference', 'recover-oat-qap', 'recover-oat-qap-stop', 'observe-custody-capacity'].includes(command))
+      throw new Failure('--read-only is only supported for preflight, what-if, FIC planning, QAP reference/recovery and custody capacity observation.');
     if (args['preview-before-create'] && command !== 'provision')
       throw new Failure('--preview-before-create is only supported for provision.');
     if (mode === 'schema-evolution' && args['stamp-config'])
@@ -1900,6 +1902,34 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       throw new Failure('--wait-seconds must be in the range 0..600.');
     const azure = new Azure(c), generation = args['reset-generation'] || values.ARROWCOL_RESET_GENERATION;
     switch (command) {
+      case 'oat-qap-reference': {
+        if (!args.record) throw new Failure('QAP reference requires --record.');
+        const { oat_qap_reference } = await import('./oat_qap.js');
+        console.log(canonical_json(await oat_qap_reference(azure, args.record)));
+        break;
+      }
+      case 'recover-oat-qap': case 'recover-oat-qap-stop': {
+        if (!args.reference || (command === 'recover-oat-qap' ? !args.record : !args['workload-stop-record']))
+          throw new Failure('QAP recovery requires --reference and --record or --workload-stop-record.');
+        const { read_oat_qap_reference, recover_oat_qap_record, recover_oat_workload_stop } = await import('./oat_qap.js');
+        const reference = read_oat_qap_reference(args.reference);
+        if (command === 'recover-oat-qap') await recover_oat_qap_record(azure, reference, args.record!);
+        else await recover_oat_workload_stop(azure, reference, args['workload-stop-record']!);
+        console.log(canonical_json({ status: 'recovered', run_id: reference.run_id }));
+        break;
+      }
+      case 'observe-custody-capacity': {
+        const { observe_custody_idle_capacity } = await import('./aks-safe-idle.js');
+        console.log(canonical_json(await observe_custody_idle_capacity(azure)));
+        break;
+      }
+      case 'plan-run-fic': {
+        if (!args['run-id'] || !args.namespace || !args['service-account'])
+          throw new Failure('Run FIC planning requires --run-id, --namespace and --service-account.');
+        const { plan_run_fic } = await import('./run_fic.js');
+        console.log(canonical_json(await plan_run_fic(azure, args['run-id'], args.namespace, args['service-account'])));
+        break;
+      }
       case 'bind-oat-qap': {
         if (!args['run-id'] || !args.manifest || !args.record || !args['workload-record'])
           throw new Failure('QAP binding requires --run-id, --manifest, --record and --workload-record.');
@@ -1927,10 +1957,11 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         if (!args['run-id'] || !args.record ||
             (command !== 'cleanup-run-fic' && (!args.namespace || !args['service-account'])))
           throw new Failure('Run FIC helpers require --run-id and --record, plus --namespace and --service-account for prepare/probe.');
-        const { prepare_run_fic, probe_run_fic, cleanup_run_fic } = await import('./run_fic.js');
+        const { prepare_run_fic, probe_run_fic, cleanup_run_fic, private_run_fic_json } = await import('./run_fic.js');
         if (command === 'cleanup-run-fic') await cleanup_run_fic(azure, args['run-id'], args.record);
         else if (command === 'prepare-run-fic')
-          await prepare_run_fic(azure, args['run-id'], args.namespace!, args['service-account']!, args.record);
+          await prepare_run_fic(azure, args['run-id'], args.namespace!, args['service-account']!, args.record,
+            args['identity-plan'] ? private_run_fic_json(args['identity-plan']) : undefined);
         else await probe_run_fic(azure, args['run-id'], args.namespace!, args['service-account']!, args.record, wait);
         break;
       }
