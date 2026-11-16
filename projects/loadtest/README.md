@@ -63,6 +63,23 @@ schema registration. Use a fresh run-owned root with no existing selected table
 directories; existing tables are refused, never rewritten. Without the flag,
 initialization remains unchanged.
 
+For OAT's local preparation without starting a load, use the setup-only command
+after building the binary:
+
+```bash
+cargo build -p arrowcol-loadgen --bin arrowcol-loadgen
+target/debug/arrowcol-loadgen initialize-local \
+  --partition-by-ingestion-date \
+  --table telemetry.sqlserver.sqlserver_availability_replica_states \
+  --dataflow-root /absolute/run-owned/state/dataflow
+```
+
+The command requires the opt-in flag and an existing absolute local root, creates
+only the selected fresh table, then exits without Flight/catalog connections or
+row sends. In the Compose OAT lifecycle the root must be the same run-owned
+directory mounted read-write by `dataflow-1` at `/delta/dataflow`; this command
+does not support ADLS or AKS.
+
 | Controls | Behavior |
 | --- | --- |
 | `--lanes 0`, `--runtime-threads 0` | Use all available cores; lanes otherwise retain default `4`. Independent lanes continuously replenish one logical batch each, without a round barrier. |

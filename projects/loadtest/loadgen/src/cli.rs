@@ -33,6 +33,8 @@ pub enum Command {
     InitializeAzure(InitializeAzureArgs),
     /// Write the canonical Azure table manifest without accessing or mutating storage.
     AzureManifest(InitializeAzureArgs),
+    /// Create one fresh local ingestion-partitioned table without connecting to Flight or sending rows.
+    InitializeLocal(InitializeLocalArgs),
     /// Print the exact public Flight SQL schema fixture.
     PrintSchemas,
 }
@@ -117,6 +119,20 @@ pub struct InitializeAzureArgs {
     /// Output manifest used by infrastructure reconciliation.
     #[arg(long, env = "ARROWCOL_AZURE_TABLE_MANIFEST")]
     pub manifest: PathBuf,
+}
+
+/// Setup-only local Delta table initialization inputs.
+#[derive(Clone, Debug, Args)]
+pub struct InitializeLocalArgs {
+    /// Explicitly opt into the supported ingestion-date partition.
+    #[arg(long)]
+    pub partition_by_ingestion_date: bool,
+    /// One fully qualified table from the canonical public schema fixture.
+    #[arg(long = "table")]
+    pub table: String,
+    /// Absolute, existing, writable run-owned local Dataflow root.
+    #[arg(long, required = true)]
+    pub dataflow_root: PathBuf,
 }
 
 /// Benchmark scenario.

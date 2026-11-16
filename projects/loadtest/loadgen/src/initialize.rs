@@ -10,7 +10,7 @@ use serde::Serialize;
 use url::Url;
 
 use crate::{
-    cli::InitializeAzureArgs,
+    cli::{InitializeAzureArgs, InitializeLocalArgs},
     schema::{SchemaStatement, schema_statements},
 };
 
@@ -137,6 +137,22 @@ pub(crate) fn initialize_fresh_local(root: &Path, selected: &[String], statement
             .with_context(|| format!("initialize fresh local table {}", path.display()))?;
     }
     Ok(())
+}
+
+/// Initialize exactly one fresh local table without Flight, catalog registration, or load generation.
+///
+/// # Errors
+///
+/// Requires the explicit partition flag, an absolute existing local root, and one known table whose
+/// destination does not already exist.
+pub fn initialize_local(args: InitializeLocalArgs) -> Result<()> {
+    if !args.partition_by_ingestion_date {
+        bail!("setup-only local initialization requires --partition-by-ingestion-date");
+    }
+    if !args.dataflow_root.is_absolute() {
+        bail!("setup-only local initialization requires an absolute --dataflow-root");
+    }
+    initialize_fresh_local(&args.dataflow_root, &[args.table], &schema_statements()?)
 }
 
 /// Initializes existing-or-empty roots and publishes a manifest only after every table succeeds.
