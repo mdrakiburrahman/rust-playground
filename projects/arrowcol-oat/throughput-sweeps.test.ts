@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { buildThroughputManifests, renderThroughputConfig } from './throughput-sweeps.js';
+import { buildThroughputManifests, renderThroughputBaseline, renderThroughputConfig } from './throughput-sweeps.js';
 
 function at(value: unknown, path: string[]): unknown {
   let current = value;
@@ -94,6 +94,30 @@ test('generates bounded local single-writer manifests from the tunables registry
         assert.equal(at(item.overrides, ['tunables', 'maintenance', 'interval_secs']),
           at(item.overrides, ['tunables', 'maintenance', 'max_idle_backoff_secs']));
       }
+      const stalePlans = comparisons.find(item => item.id === 'max-consecutive-stale-plans')!;
+      assert.deepEqual(stalePlans.candidates.map(item =>
+        at(item.overrides, ['tunables', 'maintenance', 'max_consecutive_stale_plans'])), [1, 8, 1024]);
+      const sealedPartitions = comparisons.find(item => item.id === 'sealed-partitions-only')!;
+      assert.deepEqual(sealedPartitions.candidates.map(item =>
+        at(item.overrides, ['tunables', 'maintenance', 'sealed_partitions_only'])), [true, false]);
+      assert.ok(sealedPartitions.candidates.every(item =>
+        at(item.overrides, ['tunables', 'maintenance', 'operations']) === undefined &&
+        at(item.overrides, ['tunables', 'maintenance', 'sealed_final']) === undefined));
+      assert.deepEqual(sealedPartitions.candidates.map(item => item.id),
+        ['sealed-partitions-true', 'sealed-partitions-false']);
+      const semantics = manifest.maintenance_setting_semantics as {
+        max_consecutive_stale_plans: { omitted_requested: null; default_effective: number; min: number; max: number };
+        sealed_partitions_only: { omitted_requested: null; default_effective_without_table_override: boolean;
+          effective_table_property: string; table_policy_overrides_startup_request: boolean };
+      };
+      assert.deepEqual(semantics.max_consecutive_stale_plans,
+        { omitted_requested: null, default_effective: 8, min: 1, max: 1024 });
+      assert.deepEqual(semantics.sealed_partitions_only, {
+        omitted_requested: null,
+        default_effective_without_table_override: true,
+        effective_table_property: 'arrowcol.optimize.sealedPartitionsOnly',
+        table_policy_overrides_startup_request: true,
+      });
     }
     const baseline = manifest.baseline_tunables as { maintenance: { enabled: boolean; apply: boolean; operations: string[] }; client: { workers: number } };
     assert.equal(baseline.client.workers, 16);
@@ -104,6 +128,8 @@ test('generates bounded local single-writer manifests from the tunables registry
     assert.equal(at(baseline, ['maintenance', 'max_idle_backoff_secs']), 15);
     assert.equal(at(baseline, ['maintenance', 'granularity']), 'hour');
     assert.equal(at(baseline, ['maintenance', 'purge_retention_secs']), 2_592_000);
+    assert.equal(at(baseline, ['maintenance', 'max_consecutive_stale_plans']), undefined);
+    assert.equal(at(baseline, ['maintenance', 'sealed_partitions_only']), undefined);
   }
   assert.throws(() => buildThroughputManifests({}), /registry must contain/);
 });
@@ -117,6 +143,9 @@ test('renders candidate overlays as OAT configs without changing the baseline or
   const original = structuredClone(base);
   const manifests = buildThroughputManifests(base);
   for (const manifest of manifests) {
+    const baseline = renderThroughputBaseline(base, manifest);
+    assert.deepEqual(baseline.overload_guard, { enabled: true, cap_fraction: 0.90, zero_progress_windows: 2 });
+    assert.equal(at(baseline, ['platform', 'local', 'collector_memory_limit_bytes']), 4_294_967_296);
     const comparisons = manifest.comparisons as Array<{ id: string; candidates: Array<{ id: string }> }>;
     for (const comparison of comparisons) {
       for (const candidate of comparison.candidates) {
@@ -124,11 +153,28 @@ test('renders candidate overlays as OAT configs without changing the baseline or
         assert.deepEqual(config.tables, ['sqlserver_availability_replica_states']);
         assert.deepEqual(config.replica_counts, [1]);
         assert.equal(config.campaign_profile, 'single_hot_table');
+        assert.deepEqual(config.overload_guard, baseline.overload_guard);
+        assert.equal(at(config, ['platform', 'local', 'collector_memory_limit_bytes']), 4_294_967_296);
         assert.equal(config.measure_seconds, 150);
         assert.equal(at(config, ['tunables', 'maintenance', 'granularity']), 'hour');
         assert.equal(at(config, ['tunables', 'maintenance', 'purge_retention_secs']), 2_592_000);
         assert.equal(at(config, ['tunables', 'maintenance', 'enabled']), true);
         assert.equal(at(config, ['tunables', 'maintenance', 'apply']), true);
+      }
+    }
+    if (manifest.cohort === 'C7') {
+      const stale = (manifest.comparisons as Array<{ id: string; candidates: Array<{ id: string }> }>)
+        .find(item => item.id === 'max-consecutive-stale-plans')!;
+      for (const item of stale.candidates) {
+        const config = renderThroughputConfig(base, manifest, 'max-consecutive-stale-plans', item.id);
+        assert.equal(at(config, ['tunables', 'maintenance', 'max_consecutive_stale_plans']),
+          Number(item.id.slice('stale-plans-'.length)));
+      }
+      for (const [id, requested] of [['sealed-partitions-true', true], ['sealed-partitions-false', false]] as const) {
+        const config = renderThroughputConfig(base, manifest, 'sealed-partitions-only', id);
+        assert.equal(at(config, ['tunables', 'maintenance', 'sealed_partitions_only']), requested);
+        assert.equal(at(config, ['tunables', 'maintenance', 'sealed_final']), undefined);
+        assert.ok((at(config, ['tunables', 'maintenance', 'operations']) as string[]).includes('optimize'));
       }
     }
   }

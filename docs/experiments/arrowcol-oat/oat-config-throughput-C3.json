@@ -11,6 +11,16 @@
   "campaign_profile": "single_hot_table",
   "baseline_overrides": {
     "campaign_profile": "single_hot_table",
+    "overload_guard": {
+      "enabled": true,
+      "cap_fraction": 0.9,
+      "zero_progress_windows": 2
+    },
+    "platform": {
+      "local": {
+        "collector_memory_limit_bytes": 4294967296
+      }
+    },
     "tables": [
       "sqlserver_availability_replica_states"
     ],
@@ -45,6 +55,20 @@
     },
     "compare_within_box": true,
     "one_variable_at_a_time": true
+  },
+  "maintenance_setting_semantics": {
+    "max_consecutive_stale_plans": {
+      "omitted_requested": null,
+      "default_effective": 8,
+      "min": 1,
+      "max": 1024
+    },
+    "sealed_partitions_only": {
+      "omitted_requested": null,
+      "default_effective_without_table_override": true,
+      "effective_table_property": "arrowcol.optimize.sealedPartitionsOnly",
+      "table_policy_overrides_startup_request": true
+    }
   },
   "baseline_tunables": {
     "client": {
@@ -398,7 +422,7 @@
   "config_validation": {
     "status": "config-validated",
     "validator": "arrowcol-oat-rust --validate-config",
-    "source_sha": "a24ec92ea7a4c9b3b0397d38ebe231844714c7e8",
+    "source_sha": "02703b71d3c6a2ac92c690f70f1d967b8ac4c7c7",
     "baseline_count": 1,
     "candidate_count": 16,
     "pass_count": 17,
