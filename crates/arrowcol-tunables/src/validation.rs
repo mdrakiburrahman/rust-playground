@@ -315,6 +315,7 @@ const CAPABILITIES: &[Capability] = &[
     capability!("maintenance.enabled", "false"),
     capability!("maintenance.operations", "unset"),
     capability!("maintenance.apply", "false"),
+    capability!("maintenance.parquet_writer", "inherit shared parquet_writer"),
     capability!("maintenance.interval_secs", "one-shot"),
     capability!("maintenance.max_idle_backoff_secs", "3600"),
     capability!("maintenance.max_cycles", "unlimited"),
@@ -622,6 +623,18 @@ impl Tunables {
                 }
             })
             .collect();
+        if matches!(role, ComponentRole::Maintenance)
+            && let Some(writer) = self
+                .maintenance
+                .as_ref()
+                .filter(|settings| settings.enabled == Some(true))
+                .and_then(|settings| settings.parquet_writer.as_ref())
+        {
+            selected.insert(
+                "ARROWCOL_PARQUET_CONFIG".to_owned(),
+                canonicalize(serde_json::to_value(writer)?).to_string(),
+            );
+        }
         if matches!(role, ComponentRole::Router) {
             let level = self
                 .logging
@@ -776,6 +789,7 @@ impl Tunables {
                     object.remove("enabled");
                     object.remove("apply");
                     object.remove("operations");
+                    object.remove("parquet_writer");
                 }
                 flatten_environment(&value, "ARROWCOL_MAINT", &mut output);
                 continue;
@@ -1381,6 +1395,12 @@ fn validate_maintenance(maintenance: &MaintenanceTunables) -> Result<()> {
         bail!("maintenance.apply=true requires maintenance.enabled=true");
     }
     let has_optimize = has_operation(MaintenanceOperation::Optimize);
+    if let Some(writer) = &maintenance.parquet_writer {
+        if !has_optimize {
+            bail!("maintenance.parquet_writer requires optimize");
+        }
+        writer.validate().context("maintenance.parquet_writer")?;
+    }
     let has_purge = has_operation(MaintenanceOperation::Purge);
     let has_vacuum = has_operation(MaintenanceOperation::Vacuum);
     let has_checkpoint = has_operation(MaintenanceOperation::Checkpoint);
@@ -1977,6 +1997,44 @@ mod tests {
             ..Default::default()
         };
         assert!(disabled.environment_for(ComponentRole::Maintenance)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn maintenance_writer_override_is_strict_and_role_isolated() -> Result<()> {
+        let value = serde_json::json!({
+            "parquet_writer": {"defaults": {"compression": "zstd"}},
+            "maintenance": {"enabled": true, "operations": ["optimize"],
+                "parquet_writer": {"defaults": {"compression": "snappy"}}}
+        });
+        let tunables = Tunables::parse_oat_json(value.clone())?;
+        let collector = tunables.environment_for(ComponentRole::Collector)?;
+        let maintenance = tunables.environment_for(ComponentRole::Maintenance)?;
+        let collector_writer: Value = serde_json::from_str(&collector["ARROWCOL_PARQUET_CONFIG"])?;
+        let maintenance_writer: Value = serde_json::from_str(&maintenance["ARROWCOL_PARQUET_CONFIG"])?;
+        assert_eq!(collector_writer["defaults"]["compression"], "zstd");
+        assert_eq!(maintenance_writer["defaults"]["compression"], "snappy");
+        assert!(
+            !maintenance
+                .keys()
+                .any(|key| key.starts_with("ARROWCOL_MAINT_PARQUET_WRITER"))
+        );
+        let mut inherited = value.clone();
+        inherited["maintenance"]
+            .as_object_mut()
+            .unwrap()
+            .remove("parquet_writer");
+        let inherited = Tunables::parse_oat_json(inherited)?;
+        assert_eq!(
+            inherited.environment_for(ComponentRole::Maintenance)?["ARROWCOL_PARQUET_CONFIG"],
+            collector["ARROWCOL_PARQUET_CONFIG"]
+        );
+        let mut invalid = value.clone();
+        invalid["maintenance"]["parquet_writer"]["defaults"]["compression"] = serde_json::json!("invalid");
+        assert!(Tunables::parse_oat_json(invalid).is_err());
+        let mut no_optimize = value;
+        no_optimize["maintenance"]["operations"] = serde_json::json!(["vacuum"]);
+        assert!(Tunables::parse_oat_json(no_optimize).is_err());
         Ok(())
     }
 

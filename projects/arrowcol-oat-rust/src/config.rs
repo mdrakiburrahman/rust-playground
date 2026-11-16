@@ -183,16 +183,57 @@ impl OatConfig {
     }
 
     fn validate_selected_parquet_schemas(&self) -> Result<()> {
-        let Some(writer) = &self.tunables.parquet_writer else {
+        let maintenance = self.tunables.maintenance.as_ref();
+        if self.tunables.parquet_writer.is_none()
+            && maintenance
+                .and_then(|settings| settings.parquet_writer.as_ref())
+                .is_none()
+        {
             return Ok(());
-        };
+        }
         let selected = self.tables.iter().map(String::as_str).collect::<HashSet<_>>();
         for table in collector_chain::dmv::tables()? {
             let name = table.identity().table().as_str();
             if selected.contains(name) {
-                writer
-                    .writer_properties(table.schema(), None, &[])
-                    .with_context(|| format!("Parquet writer settings are invalid for selected DMV table {name}"))?;
+                let collector_layout = self
+                    .tunables
+                    .collector
+                    .as_ref()
+                    .and_then(|collector| collector.layout.as_ref());
+                for (writer, enabled, columns) in [
+                    (
+                        self.tunables.parquet_writer.as_ref(),
+                        collector_layout.and_then(|layout| layout.enabled),
+                        collector_layout.and_then(|layout| layout.sort_columns.as_ref()),
+                    ),
+                    (
+                        maintenance.and_then(|settings| settings.parquet_writer.as_ref()),
+                        maintenance.and_then(|settings| settings.layout_enabled),
+                        maintenance.and_then(|settings| settings.layout_sort_columns.as_ref()),
+                    ),
+                ] {
+                    if let Some(writer) = writer {
+                        let enabled = enabled.unwrap_or_else(|| table.schema().field_with_name("customer_id").is_ok());
+                        let sort = if enabled {
+                            columns.cloned().unwrap_or_else(|| vec!["customer_id".to_owned()])
+                        } else {
+                            Vec::new()
+                        };
+                        let verified_sort = sort
+                            .into_iter()
+                            .map(|path| arrowcol_tunables::ParquetSortColumn {
+                                path,
+                                descending: false,
+                                nulls_first: false,
+                            })
+                            .collect::<Vec<_>>();
+                        writer
+                            .writer_properties(table.schema(), None, &verified_sort)
+                            .with_context(|| {
+                                format!("Parquet writer settings are invalid for selected DMV table {name}")
+                            })?;
+                    }
+                }
             }
         }
         Ok(())
@@ -1025,6 +1066,24 @@ mod tests {
             Err(error) if format!("{error:#}").contains("unknown physical Parquet column not_a_dmv_column")
         ));
 
+        let mut missing_maintenance_column = valid();
+        missing_maintenance_column.tunables.maintenance = Some(arrowcol_tunables::MaintenanceTunables {
+            enabled: Some(true),
+            operations: Some(vec![arrowcol_tunables::MaintenanceOperation::Optimize]),
+            parquet_writer: Some(arrowcol_tunables::ParquetWriterConfig {
+                columns: std::collections::BTreeMap::from([(
+                    "not_a_dmv_column".to_owned(),
+                    arrowcol_tunables::ParquetColumnOptions::default(),
+                )]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert!(matches!(
+            missing_maintenance_column.validate(),
+            Err(error) if format!("{error:#}").contains("unknown physical Parquet column not_a_dmv_column")
+        ));
+
         let table = collector_chain::dmv::tables()?
             .into_iter()
             .next()
@@ -1067,6 +1126,35 @@ mod tests {
             invalid_layout.validate(),
             Err(error) if format!("{error:#}").contains("unknown sort column not_a_dmv_column")
         ));
+        let mut sorted = valid();
+        sorted.tables = vec![table.identity().table().as_str().to_owned()];
+        sorted.tunables.collector = Some(arrowcol_tunables::CollectorTunables {
+            layout: Some(arrowcol_tunables::LayoutTunables {
+                enabled: Some(true),
+                sort_columns: Some(vec!["customer_id".to_owned()]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        sorted.tunables.parquet_writer = Some(arrowcol_tunables::ParquetWriterConfig {
+            sorting_columns: Some(vec![arrowcol_tunables::ParquetSortColumn {
+                path: "customer_id".to_owned(),
+                descending: false,
+                nulls_first: false,
+            }]),
+            ..Default::default()
+        });
+        sorted.validate()?;
+        sorted
+            .tunables
+            .parquet_writer
+            .as_mut()
+            .unwrap()
+            .sorting_columns
+            .as_mut()
+            .unwrap()[0]
+            .descending = true;
+        assert!(format!("{:#}", sorted.validate().unwrap_err()).contains("sorting metadata must match"));
         Ok(())
     }
 
