@@ -869,6 +869,46 @@ mod overload_guard_tests {
             }
         }
         fs::write(&receipt_path, serde_json::to_vec_pretty(&receipt)?)?;
+        let project = scoped_compose_project(config.platform.compose_project.as_deref().context("project")?, &run_id);
+        let mut list = Command::new("docker");
+        list.args([
+            "ps",
+            "-aq",
+            "--filter",
+            &format!("label=com.docker.compose.project={project}"),
+        ]);
+        let ids = String::from_utf8(
+            run_command(list, "verify run-owned workloads stopped after normal cleanup")
+                .await?
+                .stdout,
+        )?
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        if !ids.is_empty() {
+            let mut inspect = Command::new("docker");
+            inspect.arg("inspect").args(&ids);
+            let remaining: Vec<Value> = serde_json::from_slice(
+                &run_command(inspect, "verify stopped test-owned cleanup residue")
+                    .await?
+                    .stdout,
+            )?;
+            anyhow::ensure!(
+                remaining.len() == ids.len()
+                    && remaining
+                        .iter()
+                        .all(|container| container.pointer("/State/Running") == Some(&json!(false))
+                            && container.pointer("/Config/Labels/com.docker.compose.project") == Some(&json!(project))),
+                "normal cleanup left running or unowned resources; retain custody"
+            );
+            receipt["normal_cleanup_stopped_container_residue"] = json!(ids);
+            fs::write(&receipt_path, serde_json::to_vec_pretty(&receipt)?)?;
+            let mut remove = Command::new("docker");
+            remove.arg("rm").args(&ids);
+            run_command(remove, "remove only verified stopped test-owned container residue").await?;
+        }
+        receipt["test_owned_containers_removed"] = json!(true);
+        fs::write(&receipt_path, serde_json::to_vec_pretty(&receipt)?)?;
         println!("endpoint_lifecycle_receipt {}", receipt_path.display());
         result
     }

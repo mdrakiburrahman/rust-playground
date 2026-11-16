@@ -90,6 +90,9 @@ pins and maintenance, then prepares guard/policy admission without creating
 workload clients or arming a schedule. It retains an unscored receipt (old/new
 container IDs and endpoints, HTTP status, cgroup and policy readbacks, cleanup)
 under `out/arrowcol-oat/endpoint-lifecycle-<run-id>/`. This is not a load diagnostic.
+The test uses the normal non-snapshot stop/destroy path because no committed rows
+exist; it does not claim an empty successful snapshot. Any remaining test-owned
+containers must be verified stopped before the harness removes them.
 
 ```bash
 OAT_ENDPOINT_LIFECYCLE_CONFIG=/absolute/path/to/authorized-local-config.json \
