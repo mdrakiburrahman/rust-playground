@@ -1,7 +1,7 @@
 //! Local, append-only Delta tables backed exclusively by Delta Kernel.
 
 pub use crate::delta_io::spawn_shared_io;
-use crate::delta_io::{SharedExecutor, runtime_config, shared_executor};
+use crate::delta_io::{SharedExecutor, UploadMode, runtime_config, shared_executor};
 use crate::publisher::{PublisherSession, SessionMode};
 use crate::{
     CompletedFile, CompletedFileObservation, ParquetFileWriter, normalize, record_batch_logical_bytes, sync_ancestors,
@@ -539,12 +539,63 @@ mod io_tests {
         finished: std::sync::atomic::AtomicUsize,
     }
 
+    #[derive(Debug)]
+    struct FaultingMultipart {
+        inner: Box<dyn object_store::MultipartUpload>,
+        part_count: usize,
+        fail_part_at: Option<usize>,
+        fail_complete: bool,
+        fail_abort: bool,
+        abort_calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::MultipartUpload for FaultingMultipart {
+        fn put_part(&mut self, data: object_store::PutPayload) -> object_store::UploadPart {
+            self.part_count += 1;
+            if self.fail_part_at == Some(self.part_count) {
+                return Box::pin(futures::future::ready(Err(object_store::Error::PermissionDenied {
+                    path: "staged/output.parquet".into(),
+                    source: "injected final part failure".into(),
+                })));
+            }
+            self.inner.put_part(data)
+        }
+
+        async fn complete(&mut self) -> object_store::Result<object_store::PutResult> {
+            if self.fail_complete {
+                return Err(object_store::Error::Generic {
+                    store: "injected complete failure",
+                    source: Box::new(std::io::Error::other("injected completion error")),
+                });
+            }
+            self.inner.complete().await
+        }
+
+        async fn abort(&mut self) -> object_store::Result<()> {
+            self.abort_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail_abort {
+                return Err(object_store::Error::Generic {
+                    store: "injected abort failure",
+                    source: Box::new(std::io::Error::other("injected abort error")),
+                });
+            }
+            self.inner.abort().await
+        }
+    }
+
     #[derive(Debug, Default)]
     struct PausedStagePut {
         inner: object_store::memory::InMemory,
         entered: tokio::sync::Notify,
         release: tokio::sync::Notify,
         nested: Option<Arc<NestedStagePut>>,
+        multipart_calls: std::sync::atomic::AtomicUsize,
+        fail_multipart: bool,
+        fail_part_at: Option<usize>,
+        fail_complete: bool,
+        fail_abort: bool,
+        abort_calls: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl std::fmt::Display for PausedStagePut {
@@ -599,7 +650,26 @@ mod io_tests {
             path: &object_store::path::Path,
             options: object_store::PutMultipartOptions,
         ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
-            self.inner.put_multipart_opts(path, options).await
+            self.multipart_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail_multipart {
+                return Err(object_store::Error::Generic {
+                    store: "injected multipart failure",
+                    source: Box::new(std::io::Error::other("multipart unavailable")),
+                });
+            }
+            let upload = self.inner.put_multipart_opts(path, options).await?;
+            if self.fail_part_at.is_some() || self.fail_complete || self.fail_abort {
+                Ok(Box::new(FaultingMultipart {
+                    inner: upload,
+                    part_count: 0,
+                    fail_part_at: self.fail_part_at,
+                    fail_complete: self.fail_complete,
+                    fail_abort: self.fail_abort,
+                    abort_calls: Arc::clone(&self.abort_calls),
+                }))
+            } else {
+                Ok(upload)
+            }
         }
 
         async fn get_opts(
@@ -648,6 +718,145 @@ mod io_tests {
         ) -> object_store::Result<()> {
             self.inner.rename_opts(from, to, options).await
         }
+    }
+
+    #[tokio::test]
+    async fn default_staged_output_upload_rejects_an_existing_path() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let source = directory.path().join("completed.parquet");
+        let bytes = b"complete parquet";
+        fs::write(&source, bytes)?;
+        let store = Arc::new(PausedStagePut::default());
+        let destination = object_store::path::Path::from("staged/existing.parquet");
+        store.inner.put(&destination, bytes.to_vec().into()).await?;
+
+        let error = upload_staged_output(
+            Arc::<PausedStagePut>::clone(&store),
+            destination,
+            source,
+            bytes.len() as u64,
+            UploadMode::PutCreate,
+            8 * 1024 * 1024,
+            2,
+        )
+        .await
+        .expect_err("create-only mode must reject an existing object");
+
+        assert!(format!("{error:#}").contains("create completed Parquet object"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn staged_output_upload_streams_multipart_and_finishes_before_return() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let source = directory.path().join("completed.parquet");
+        let bytes = vec![0x5a; 32 * 1024];
+        fs::write(&source, &bytes)?;
+        let store = Arc::new(PausedStagePut::default());
+        let destination = object_store::path::Path::from("staged/output.parquet");
+
+        upload_staged_output(
+            Arc::<PausedStagePut>::clone(&store),
+            destination.clone(),
+            source,
+            bytes.len() as u64,
+            UploadMode::BufferedMultipart,
+            4 * 1024,
+            2,
+        )
+        .await?;
+
+        assert_eq!(store.multipart_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            store.inner.get(&destination).await?.bytes().await?.as_ref(),
+            bytes.as_slice()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn staged_output_upload_aborts_a_final_part_failure() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let source = directory.path().join("completed.parquet");
+        fs::write(&source, vec![0x5a; 32 * 1024])?;
+        let store = Arc::new(PausedStagePut {
+            fail_part_at: Some(8),
+            ..PausedStagePut::default()
+        });
+        let destination = object_store::path::Path::from("staged/final-part-failure.parquet");
+
+        let error = upload_staged_output(
+            Arc::<PausedStagePut>::clone(&store),
+            destination.clone(),
+            source,
+            32 * 1024,
+            UploadMode::BufferedMultipart,
+            4 * 1024,
+            2,
+        )
+        .await
+        .expect_err("a failed final part must prevent publication");
+
+        assert!(format!("{error:#}").contains("injected final part failure"));
+        assert_eq!(store.abort_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(store.inner.get(&destination).await.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn staged_output_upload_aborts_completion_failure_and_preserves_abort_error() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let source = directory.path().join("completed.parquet");
+        fs::write(&source, vec![0x5a; 32 * 1024])?;
+        let store = Arc::new(PausedStagePut {
+            fail_complete: true,
+            fail_abort: true,
+            ..PausedStagePut::default()
+        });
+
+        let error = upload_staged_output(
+            Arc::<PausedStagePut>::clone(&store),
+            object_store::path::Path::from("staged/complete-failure.parquet"),
+            source,
+            32 * 1024,
+            UploadMode::BufferedMultipart,
+            4 * 1024,
+            2,
+        )
+        .await
+        .expect_err("completion and abort failures must be returned");
+
+        let message = format!("{error:#}");
+        assert!(message.contains("injected completion error"), "{message}");
+        assert!(message.contains("injected abort error"), "{message}");
+        assert_eq!(store.abort_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn staged_output_upload_propagates_multipart_errors() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let source = directory.path().join("completed.parquet");
+        fs::write(&source, vec![0x5a; 32 * 1024])?;
+        let store = Arc::new(PausedStagePut {
+            fail_multipart: true,
+            ..PausedStagePut::default()
+        });
+        let error = upload_staged_output(
+            Arc::<PausedStagePut>::clone(&store),
+            object_store::path::Path::from("staged/failure.parquet"),
+            source,
+            32 * 1024,
+            UploadMode::BufferedMultipart,
+            4 * 1024,
+            2,
+        )
+        .await
+        .expect_err("multipart failure must reach the staging caller");
+
+        assert!(format!("{error:#}").contains("start completed Parquet multipart upload"));
+        assert_eq!(store.multipart_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        Ok(())
     }
 
     /// Scenario: staging awaits a real, paused object-store put from a current-thread runtime.
@@ -888,6 +1097,21 @@ mod io_tests {
         let committed = table.commit_files(&[staged])?;
         assert_eq!(committed, version + 1);
         let hint = root.join("_delta_log").join("_last_checkpoint");
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let control = crate::maintenance::MaintenanceControl::new(cancelled, None);
+        let error = table
+            .checkpoint_with_control(&control)
+            .expect_err("cancelled checkpoint must not start");
+        assert_eq!(
+            crate::maintenance::error_kind(&error),
+            Some(crate::maintenance::MaintenanceErrorKind::Cancelled)
+        );
+        assert!(
+            !root
+                .join("_delta_log")
+                .join(format!("{committed:020}.checkpoint.parquet"))
+                .exists()
+        );
         sync_hook::fail_on(&hint);
         assert!(table.checkpoint().is_err(), "hint fsync failure must propagate");
         sync_hook::reset(&base_path);
@@ -2420,9 +2644,22 @@ impl DeltaTable {
     /// # Errors
     /// Returns authority, checkpoint replay, write or synchronization failures.
     pub fn checkpoint(&self) -> Result<u64> {
+        self.checkpoint_with_control(&crate::maintenance::MaintenanceControl::default())
+    }
+
+    /// Write a classic V1 checkpoint while honoring cooperative maintenance cancellation.
+    ///
+    /// Cancellation is checked before checkpoint preparation and before the output and hint
+    /// mutations. Once output writing starts, the operation finishes publication atomically.
+    ///
+    /// # Errors
+    /// Returns cancellation, authority, replay, write or synchronization failures.
+    pub fn checkpoint_with_control(&self, control: &crate::maintenance::MaintenanceControl) -> Result<u64> {
+        control.check()?;
         self.check_publication()?;
         let snapshot = self.snapshot()?;
         Self::validate_retention(&snapshot)?;
+        control.check()?;
         let writer = Arc::clone(&snapshot).create_checkpoint_writer(&self.engine)?;
         let data = writer.checkpoint_data(&self.engine)?;
         let state = data.state();
@@ -2430,6 +2667,7 @@ impl DeltaTable {
             .map(|batch| batch.and_then(|batch| batch.apply_selection_vector()))
             .collect::<DeltaResult<Vec<_>>>()?;
         let location = writer.checkpoint_path()?;
+        control.check()?;
         self.check_publication()?;
         self.engine
             .parquet_handler()
@@ -2444,6 +2682,7 @@ impl DeltaTable {
         }
         let state = Arc::into_inner(state).context("checkpoint state remains shared")?;
         let statistics = delta_kernel::checkpoint::LastCheckpointHintStats::from_reconciliation_state(state, size, 0)?;
+        control.check()?;
         self.check_publication()?;
         writer.finalize(&self.engine, &statistics)?;
         if self.url.scheme() == "file" {
@@ -2511,10 +2750,7 @@ impl DeltaTable {
         Ok(url)
     }
 
-    fn prepare_upload(
-        &self,
-        file: &CompletedFile,
-    ) -> Result<Option<(object_store::path::Path, object_store::PutPayload)>> {
+    fn prepare_upload(&self, file: &CompletedFile) -> Result<Option<object_store::path::Path>> {
         if self.url.scheme() == "file" {
             self.sync_local_output(&file.path)?;
             return Ok(None);
@@ -2522,14 +2758,19 @@ impl DeltaTable {
         if file.bytes > 512 * 1024 * 1024 {
             bail!("staged file exceeds bounded upload size");
         }
+        let actual_bytes = fs::metadata(&file.path)?.len();
+        anyhow::ensure!(
+            actual_bytes == file.bytes,
+            "staged file size changed before upload: expected {}, found {actual_bytes}",
+            file.bytes
+        );
         let relative = file
             .path
             .strip_prefix(&self.root)?
             .to_str()
             .context("invalid staged path")?;
         let path = object_store::path::Path::from_url_path(self.staged_url(relative)?.path())?;
-        let bytes = fs::read(&file.path)?;
-        Ok(Some((path, bytes.into())))
+        Ok(Some(path))
     }
 
     /// Acquire exclusive local writer ownership, creating the directory if needed.
@@ -3545,6 +3786,7 @@ impl DeltaTable {
                 .iter()
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect(),
+            stage_timings: FileStageTimings::default(),
         })
     }
 
@@ -3580,22 +3822,30 @@ impl DeltaTable {
         sync_directory(&self.root)
     }
 
+    #[cfg(test)]
     pub(crate) fn commit_files(&self, files: &[StagedAppend]) -> Result<u64> {
+        self.commit_files_timed(files).map(|(version, _, _)| version)
+    }
+
+    pub(crate) fn commit_files_timed(
+        &self,
+        files: &[StagedAppend],
+    ) -> Result<(u64, Option<Duration>, Vec<(usize, crate::CompletedFileObservation)>)> {
         if files.is_empty() {
             bail!("cannot publish an empty Delta data commit");
         }
-        self.commit_files_inner(files, None, &[])
+        self.commit_files_inner_timed(files, None, &[])
     }
 
-    pub(crate) fn commit_files_with_groups(
+    pub(crate) fn commit_files_with_groups_timed(
         &self,
         files: &[StagedAppend],
         groups: &[CoalescedCommitGroup],
-    ) -> Result<u64> {
+    ) -> Result<(u64, Option<Duration>, Vec<(usize, crate::CompletedFileObservation)>)> {
         if groups.is_empty() {
             bail!("coalesced Delta commit requires logical identities");
         }
-        self.commit_files_inner(files, None, groups)
+        self.commit_files_inner_timed(files, None, groups)
     }
 
     /// Publish a batch under one stable application transaction, including empty progress batches.
@@ -3613,9 +3863,19 @@ impl DeltaTable {
         identity: Option<(&str, i64)>,
         groups: &[CoalescedCommitGroup],
     ) -> Result<u64> {
-        let version = self.publish_files(files, identity, groups)?;
+        self.commit_files_inner_timed(files, identity, groups)
+            .map(|(version, _, _)| version)
+    }
+
+    fn commit_files_inner_timed(
+        &self,
+        files: &[StagedAppend],
+        identity: Option<(&str, i64)>,
+        groups: &[CoalescedCommitGroup],
+    ) -> Result<(u64, Option<Duration>, Vec<(usize, crate::CompletedFileObservation)>)> {
+        let (version, commit_duration, file_observations) = self.publish_files(files, identity, groups)?;
         self.reclaim_unsubmitted(files);
-        Ok(version)
+        Ok((version, commit_duration, file_observations))
     }
 
     /// After a successful publication call, delete staged files that no commit attempt
@@ -3674,7 +3934,7 @@ impl DeltaTable {
         files: &[StagedAppend],
         identity: Option<(&str, i64)>,
         groups: &[CoalescedCommitGroup],
-    ) -> Result<u64> {
+    ) -> Result<(u64, Option<Duration>, Vec<(usize, crate::CompletedFileObservation)>)> {
         let mut observation = crate::telemetry::PublicationObservation::start();
         let _guard = self
             .commit_lock
@@ -3695,7 +3955,7 @@ impl DeltaTable {
                 if previous == version {
                     self.sync_replayed_local_state(snapshot.version())?;
                     observation.finish("deduplicated");
-                    return Ok(snapshot.version());
+                    return Ok((snapshot.version(), None, Vec::new()));
                 }
             }
             let mut pending = Vec::new();
@@ -3784,7 +4044,7 @@ impl DeltaTable {
             if pending.is_empty() && group_transaction_ids.is_empty() && identity.is_none() {
                 self.sync_replayed_local_state(snapshot.version())?;
                 observation.finish("deduplicated");
-                return Ok(snapshot.version());
+                return Ok((snapshot.version(), None, Vec::new()));
             }
             // Claim before touching the file or any check that can stall, so a concurrent
             // reclaim of the same borrowed stage either already won (refused here) or
@@ -3935,6 +4195,11 @@ impl DeltaTable {
                 crate::telemetry::ambiguous_commit_reconciled(&table_id, table_name.as_deref(), started.elapsed());
                 Ok(Some(latest.version()))
             };
+            let committed_file_observations = pending
+                .iter()
+                .zip(&pending_indices)
+                .map(|(append, index)| (*index, append.observation()))
+                .collect();
             match transaction.commit(&self.engine) {
                 Ok(CommitResult::Committed(commit)) => {
                     sync_directory(&self.root)?;
@@ -3951,7 +4216,11 @@ impl DeltaTable {
                         table_name.as_deref(),
                     );
                     observation.finish("committed");
-                    return Ok(commit.commit_version());
+                    return Ok((
+                        commit.commit_version(),
+                        Some(started.elapsed()),
+                        committed_file_observations,
+                    ));
                 }
                 Ok(CommitResult::Conflicted(_)) => observation.event("conflict"),
                 Ok(CommitResult::Retryable(retry)) => {
@@ -3963,7 +4232,7 @@ impl DeltaTable {
                     }
                     if let Some(version) = reconcile()? {
                         observation.finish("reconciled");
-                        return Ok(version);
+                        return Ok((version, Some(started.elapsed()), committed_file_observations));
                     }
                 }
                 Err(error) => {
@@ -3971,7 +4240,7 @@ impl DeltaTable {
                     // A proven transaction is success; an unreadable outcome stays an error.
                     if identifiable && let Some(version) = reconcile()? {
                         observation.finish("reconciled");
-                        return Ok(version);
+                        return Ok((version, Some(started.elapsed()), committed_file_observations));
                     }
                     return Err(error.into());
                 }
@@ -4003,6 +4272,7 @@ pub struct DeltaFileWriter {
     /// Batches are already canonical: validate instead of normalizing again.
     canonical_input: bool,
     table_properties: BTreeMap<String, String>,
+    stage_timings: FileStageTimings,
 }
 
 /// Fixed, non-identifying class of a staged-file cleanup failure.
@@ -4036,6 +4306,17 @@ fn cleanup_failure_class(error: &anyhow::Error) -> &'static str {
 pub struct AppendResult {
     pub version: u64,
     pub file: CompletedFile,
+    pub commit_duration: Option<Duration>,
+    pub file_observations: Vec<crate::CompletedFileObservation>,
+}
+
+/// Timings for the lower-level stages of one physical Parquet file.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FileStageTimings {
+    pub build: Duration,
+    pub sort: Option<Duration>,
+    pub encode: Duration,
+    pub upload: Option<Duration>,
 }
 
 /// A durable Parquet file that is not yet visible in a Delta snapshot.
@@ -4047,6 +4328,7 @@ pub struct StagedAppend {
     pub(crate) stats: StructArray,
     pub(crate) publication: Option<(String, i64)>,
     pub(crate) ingested_at_ms: Option<i64>,
+    stage_timings: FileStageTimings,
     /// `STAGE_FRESH`, then exactly one irreversible claim: `STAGE_SUBMITTED` before the
     /// file is offered to any commit attempt, or `STAGE_RECLAIMED` before it is deleted.
     /// A fresh file cannot be named by a published or uncertain Delta action: its path
@@ -4061,6 +4343,11 @@ const STAGE_SUBMITTED: u8 = 1;
 const STAGE_RECLAIMED: u8 = 2;
 
 impl StagedAppend {
+    #[must_use]
+    pub const fn stage_timings(&self) -> FileStageTimings {
+        self.stage_timings
+    }
+
     /// Claim this file for a commit attempt. Refuses a file already reclaimed.
     fn claim_submission(&self) -> Result<()> {
         match self.stage_state.compare_exchange(
@@ -4110,6 +4397,131 @@ impl StagedAppend {
     #[must_use]
     pub const fn observation(&self) -> CompletedFileObservation {
         self.file.observation()
+    }
+}
+
+async fn upload_staged_output(
+    store: Arc<dyn ObjectStore>,
+    destination: object_store::path::Path,
+    source_path: PathBuf,
+    expected_bytes: u64,
+    mode: UploadMode,
+    buffer_capacity: usize,
+    request_concurrency: usize,
+) -> Result<Duration> {
+    let upload_duration = match mode {
+        UploadMode::PutCreate => {
+            let upload_started = Instant::now();
+            let payload = tokio::fs::read(source_path)
+                .await
+                .context("read completed Parquet output for create-only upload")?;
+            anyhow::ensure!(
+                payload.len() as u64 == expected_bytes,
+                "Parquet upload source changed: expected {expected_bytes} bytes, found {}",
+                payload.len()
+            );
+            store
+                .put_opts(&destination, payload.into(), PutMode::Create.into())
+                .await
+                .context("create completed Parquet object")?;
+            upload_started.elapsed()
+        }
+        UploadMode::BufferedMultipart => {
+            let upload_started = Instant::now();
+            use futures::StreamExt as _;
+            use tokio::io::AsyncReadExt as _;
+
+            anyhow::ensure!(buffer_capacity > 0, "multipart buffer capacity must be positive");
+            anyhow::ensure!(
+                request_concurrency > 0,
+                "multipart request concurrency must be positive"
+            );
+
+            let mut source = tokio::fs::File::open(&source_path)
+                .await
+                .context("open completed Parquet output for upload")?;
+            let mut upload = store
+                .put_multipart_opts(&destination, object_store::PutMultipartOptions::default())
+                .await
+                .context("start completed Parquet multipart upload")?;
+            let mut pending = futures::stream::FuturesUnordered::new();
+            let mut copied = 0_u64;
+            let mut eof = false;
+            let mut upload_error = None;
+
+            while !eof && upload_error.is_none() {
+                while pending.len() < request_concurrency && !eof && upload_error.is_none() {
+                    let mut buffer = vec![0; buffer_capacity];
+                    let mut filled = 0;
+                    while filled < buffer.len() {
+                        match source.read(&mut buffer[filled..]).await {
+                            Ok(0) => {
+                                eof = true;
+                                break;
+                            }
+                            Ok(bytes_read) => filled += bytes_read,
+                            Err(error) => {
+                                upload_error = Some(
+                                    anyhow::Error::new(error)
+                                        .context("read completed Parquet output for multipart upload"),
+                                );
+                                break;
+                            }
+                        }
+                    }
+                    if filled == 0 {
+                        break;
+                    }
+                    copied = match copied.checked_add(filled as u64) {
+                        Some(bytes) => bytes,
+                        None => {
+                            upload_error = Some(anyhow::anyhow!("multipart source length overflow"));
+                            break;
+                        }
+                    };
+                    buffer.truncate(filled);
+                    pending.push(upload.put_part(buffer.into()));
+                }
+                if let Some(result) = pending.next().await {
+                    if let Err(error) = result {
+                        upload_error =
+                            Some(anyhow::Error::new(error).context("upload completed Parquet multipart part"));
+                    }
+                }
+            }
+            while let Some(result) = pending.next().await {
+                if upload_error.is_none() {
+                    if let Err(error) = result {
+                        upload_error =
+                            Some(anyhow::Error::new(error).context("upload completed Parquet multipart part"));
+                    }
+                }
+            }
+            if let Some(error) = upload_error {
+                return Err(abort_multipart_after_failure(&mut upload, error).await);
+            }
+            if copied != expected_bytes {
+                let error =
+                    anyhow::anyhow!("Parquet upload source changed: expected {expected_bytes} bytes, copied {copied}");
+                return Err(abort_multipart_after_failure(&mut upload, error).await);
+            }
+            if let Err(error) = upload.complete().await {
+                let error = anyhow::Error::new(error).context("complete completed Parquet multipart upload");
+                return Err(abort_multipart_after_failure(&mut upload, error).await);
+            }
+            upload_started.elapsed()
+        }
+    };
+    Ok(upload_duration)
+}
+
+async fn abort_multipart_after_failure(
+    upload: &mut Box<dyn object_store::MultipartUpload>,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    match upload.abort().await {
+        Ok(()) => error,
+        Err(abort_error) => anyhow::anyhow!("{error:#}; aborting multipart upload failed: {abort_error}"),
     }
 }
 
@@ -4188,6 +4600,7 @@ impl DeltaFileWriter {
     }
 
     async fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        let build_started = Instant::now();
         let input_bytes = record_batch_logical_bytes(batch)?;
         let mut batch = if self.canonical_input {
             normalize::canonical_batch(batch)?
@@ -4261,6 +4674,7 @@ impl DeltaFileWriter {
             .checked_add(input_bytes)
             .context("file input byte count overflow")?;
         self.stats.merge(&physical)?;
+        self.stage_timings.build += build_started.elapsed();
         if let Some(sorter) = &mut self.sorter {
             let physical = owned_for_sort(physical)?;
             if !sorter.try_push(&physical)? {
@@ -4269,9 +4683,13 @@ impl DeltaFileWriter {
                 );
             }
         } else {
-            self.parquet
+            let encode_started = Instant::now();
+            let result = self
+                .parquet
                 .write_accounted(&physical, batch.num_rows(), input_bytes)
-                .await?;
+                .await;
+            self.stage_timings.encode += encode_started.elapsed();
+            result?;
         }
         self.accepted_rows = rows;
         self.accepted_input_bytes = bytes;
@@ -4287,12 +4705,22 @@ impl DeltaFileWriter {
             bail!("Delta file previously failed; refusing to commit its partial data");
         }
         if let Some(sorter) = self.sorter.take() {
-            let sorted = sorter.finish()?;
-            self.parquet
+            let sort_started = Instant::now();
+            let sorted = sorter.finish();
+            self.stage_timings.sort = Some(sort_started.elapsed());
+            let sorted = sorted?;
+            let encode_started = Instant::now();
+            let result = self
+                .parquet
                 .write_accounted(&sorted, self.accepted_rows, self.accepted_input_bytes)
-                .await?;
+                .await;
+            self.stage_timings.encode += encode_started.elapsed();
+            result?;
         }
-        let file = self.parquet.finish().await?;
+        let encode_started = Instant::now();
+        let file_result = self.parquet.finish().await;
+        self.stage_timings.encode += encode_started.elapsed();
+        let file = file_result?;
         let stats = self.stats.finish()?.context("cannot commit an empty Delta file")?;
         let executor = shared_executor()?;
         self.table.check_publication_async().await?;
@@ -4309,17 +4737,35 @@ impl DeltaFileWriter {
             })
             .await
             .context("stage upload preparation worker failed")?;
-        if let Some((path, payload)) = prepared? {
+        if let Some(path) = prepared? {
             self.table.check_publication_async().await?;
+            let config = runtime_config()?;
+            let upload_mode = config.upload_mode;
+            let upload_buffer_capacity = config.upload_buffer_capacity_bytes;
+            let upload_request_concurrency = config.upload_request_concurrency;
             let table = Arc::clone(&self.table);
-            spawn_shared_io(async move {
-                let _upload_slot = upload_slot;
-                table.store.put_opts(&path, payload, PutMode::Create.into()).await
+            let store = Arc::clone(&table.store);
+            let source_path = file.path.clone();
+            let expected_bytes = file.bytes;
+            let upload_duration = spawn_shared_io(async move {
+                let _table = table;
+                let _upload_slot = upload_slot.context("remote staging has no upload admission slot")?;
+                upload_staged_output(
+                    store,
+                    path,
+                    source_path,
+                    expected_bytes,
+                    upload_mode,
+                    upload_buffer_capacity,
+                    upload_request_concurrency,
+                )
+                .await
             })
             .context("start stage upload task")?
             .await
             .context("stage upload task failed")?
             .context("stage upload failed")?;
+            self.stage_timings.upload = Some(upload_duration);
         }
         self.table.check_publication_async().await?;
         Ok(StagedAppend {
@@ -4330,6 +4776,7 @@ impl DeltaFileWriter {
             stats,
             publication: self.publication,
             ingested_at_ms: self.ingested_at_ms,
+            stage_timings: self.stage_timings,
             stage_state: std::sync::atomic::AtomicU8::new(STAGE_FRESH),
         })
     }
@@ -4343,10 +4790,16 @@ impl DeltaFileWriter {
         // Kernel is synchronous. This offload is bounded by the caller's open files;
         // the collector uses the dedicated, bounded coordinator instead.
         tokio::task::spawn_blocking(move || {
-            let version = append.table.commit_files(std::slice::from_ref(&append))?;
+            let (version, commit_duration, file_observations) =
+                append.table.commit_files_timed(std::slice::from_ref(&append))?;
             Ok(AppendResult {
                 version,
                 file: append.file,
+                commit_duration,
+                file_observations: file_observations
+                    .into_iter()
+                    .map(|(_, observation)| observation)
+                    .collect(),
             })
         })
         .await?

@@ -544,26 +544,31 @@ impl Drop for Permit {
 
 /// `None` only for a definite outcome of a single-attempt mutation.
 fn classify<T>(result: &object_store::Result<T>, retries: MutationRetries) -> Option<String> {
+    match result {
+        Ok(_) if retries != MutationRetries::Opaque => None,
+        Ok(_) => Some("mutation used opaque transport retries; earlier attempts may be outstanding".into()),
+        Err(error) => classify_error(error, retries),
+    }
+}
+
+fn classify_error(error: &object_store::Error, retries: MutationRetries) -> Option<String> {
     use object_store::Error as E;
     if retries == MutationRetries::Opaque {
         return Some("mutation used opaque transport retries; earlier attempts may be outstanding".into());
     }
-    match result {
-        Ok(_)
-        | Err(
-            E::AlreadyExists { .. }
-            | E::Precondition { .. }
-            | E::NotModified { .. }
-            | E::NotFound { .. }
-            | E::PermissionDenied { .. }
-            | E::Unauthenticated { .. }
-            | E::InvalidPath { .. }
-            | E::NotSupported { .. }
-            | E::NotImplemented { .. }
-            | E::UnknownConfigurationKey { .. },
-        ) => None,
-        Err(error) if never_sent(error) => None,
-        Err(error) => Some(format!("ambiguous mutation failure: {error}")),
+    match error {
+        E::AlreadyExists { .. }
+        | E::Precondition { .. }
+        | E::NotModified { .. }
+        | E::NotFound { .. }
+        | E::PermissionDenied { .. }
+        | E::Unauthenticated { .. }
+        | E::InvalidPath { .. }
+        | E::NotSupported { .. }
+        | E::NotImplemented { .. }
+        | E::UnknownConfigurationKey { .. } => None,
+        error if never_sent(error) => None,
+        error => Some(format!("ambiguous mutation failure: {error}")),
     }
 }
 
@@ -1550,6 +1555,7 @@ impl ObjectStore for GuardedStore {
                 shared: Arc::clone(&self.shared),
                 retries: self.retries,
                 permit: Some(permit),
+                completion_failure: None,
             })),
             Err(error) => {
                 let result: object_store::Result<Box<dyn MultipartUpload>> = Err(error);
@@ -1651,6 +1657,50 @@ struct GuardedUpload {
     retries: MutationRetries,
     /// Held until complete or abort has a definite outcome.
     permit: Option<Permit>,
+    completion_failure: Option<CompletionFailure>,
+}
+
+#[derive(Debug)]
+struct CompletionFailure {
+    error: Arc<object_store::Error>,
+    uncertainty: Option<String>,
+}
+
+#[derive(Debug)]
+struct SharedUploadError(Arc<object_store::Error>);
+
+impl std::fmt::Display for SharedUploadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> fmt::Result {
+        std::fmt::Display::fmt(self.0.as_ref(), formatter)
+    }
+}
+
+impl std::error::Error for SharedUploadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+
+#[derive(Debug)]
+struct MultipartSettlementError {
+    completion: Arc<object_store::Error>,
+    abort: object_store::Error,
+}
+
+impl std::fmt::Display for MultipartSettlementError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "multipart completion failed: {}; abort also failed: {}",
+            self.completion, self.abort
+        )
+    }
+}
+
+impl std::error::Error for MultipartSettlementError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.completion.as_ref())
+    }
 }
 
 fn finished() -> object_store::Error {
@@ -1678,10 +1728,27 @@ impl MultipartUpload for GuardedUpload {
 
     async fn complete(&mut self) -> object_store::Result<PutResult> {
         self.shared.admitting()?;
-        let permit = self.permit.take().ok_or_else(finished)?;
-        let result = self.inner.complete().await;
-        permit.finish(&result, self.retries);
-        result
+        if self.permit.is_none() {
+            return Err(finished());
+        }
+        match self.inner.complete().await {
+            Ok(result) => {
+                let result = Ok(result);
+                self.permit.take().ok_or_else(finished)?.finish(&result, self.retries);
+                result
+            }
+            Err(error) => {
+                self.completion_failure = Some(CompletionFailure {
+                    uncertainty: classify_error(&error, self.retries),
+                    error: Arc::new(error),
+                });
+                let failure = self.completion_failure.as_ref().expect("completion failure was set");
+                Err(object_store::Error::Generic {
+                    store: "PublisherSession",
+                    source: Box::new(SharedUploadError(Arc::clone(&failure.error))),
+                })
+            }
+        }
     }
 
     /// Allowed while closing or fenced to settle the upload, never once revoked.
@@ -1689,10 +1756,35 @@ impl MultipartUpload for GuardedUpload {
         if let Some(reason) = self.shared.revoked() {
             return Err(refused(format!("publisher session revoked: {reason}")));
         }
-        let permit = self.permit.take().ok_or_else(finished)?;
+        if self.permit.is_none() {
+            return Err(finished());
+        }
         let result = self.inner.abort().await;
-        permit.finish(&result, self.retries);
-        result
+        let permit = self.permit.take().ok_or_else(finished)?;
+        if let Some(completion) = self.completion_failure.take() {
+            match result {
+                Ok(()) => {
+                    permit.settle(completion.uncertainty);
+                    Ok(())
+                }
+                Err(abort) => {
+                    permit.settle(Some(format!(
+                        "multipart completion failed ({}); abort failed ({abort})",
+                        completion.error
+                    )));
+                    Err(object_store::Error::Generic {
+                        store: "PublisherSession",
+                        source: Box::new(MultipartSettlementError {
+                            completion: completion.error,
+                            abort,
+                        }),
+                    })
+                }
+            }
+        } else {
+            permit.finish(&result, self.retries);
+            result
+        }
     }
 }
 
@@ -1705,6 +1797,128 @@ mod classify_tests {
             store: "MicrosoftAzure",
             source,
         }
+    }
+
+    #[derive(Debug)]
+    struct SettlementUpload {
+        complete_error: Option<object_store::Error>,
+        abort_error: Option<object_store::Error>,
+        abort_calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl MultipartUpload for SettlementUpload {
+        fn put_part(&mut self, _data: PutPayload) -> UploadPart {
+            Box::pin(futures::future::ready(Ok(())))
+        }
+
+        async fn complete(&mut self) -> object_store::Result<PutResult> {
+            Err(self.complete_error.take().expect("completion error configured"))
+        }
+
+        async fn abort(&mut self) -> object_store::Result<()> {
+            self.abort_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.abort_error.take().map_or(Ok(()), Err)
+        }
+    }
+
+    fn guarded_upload(
+        shared: Arc<Shared>,
+        complete_error: object_store::Error,
+        abort_error: Option<object_store::Error>,
+        abort_calls: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> object_store::Result<GuardedUpload> {
+        Ok(GuardedUpload {
+            inner: Box::new(SettlementUpload {
+                complete_error: Some(complete_error),
+                abort_error,
+                abort_calls,
+            }),
+            permit: Some(shared.admit()?),
+            shared,
+            retries: MutationRetries::Disabled,
+            completion_failure: None,
+        })
+    }
+
+    fn injected_error(message: &'static str) -> object_store::Error {
+        object_store::Error::Generic {
+            store: "injected multipart failure",
+            source: Box::new(std::io::Error::other(message)),
+        }
+    }
+
+    #[tokio::test]
+    async fn multipart_completion_failure_retains_permit_until_abort() -> Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let shared = Shared::new();
+        let abort_calls = Arc::new(AtomicUsize::new(0));
+        let mut upload = guarded_upload(
+            Arc::clone(&shared),
+            injected_error("completion response lost"),
+            None,
+            Arc::clone(&abort_calls),
+        )?;
+
+        let complete_error = upload.complete().await.expect_err("complete must fail");
+        assert!(format!("{complete_error:#}").contains("completion response lost"));
+        assert_eq!(shared.lock().inflight, 1);
+        assert_eq!(abort_calls.load(Ordering::SeqCst), 0);
+
+        upload.abort().await?;
+        assert_eq!(abort_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(shared.lock().inflight, 0);
+        assert!(shared.lock().uncertain.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn multipart_abort_failure_preserves_completion_and_abort_errors() -> Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let shared = Shared::new();
+        let abort_calls = Arc::new(AtomicUsize::new(0));
+        let mut upload = guarded_upload(
+            Arc::clone(&shared),
+            injected_error("original completion failure"),
+            Some(injected_error("separate abort failure")),
+            Arc::clone(&abort_calls),
+        )?;
+
+        upload.complete().await.expect_err("complete must fail");
+        let error = upload.abort().await.expect_err("abort must fail");
+        let message = format!("{error:#}");
+        assert!(message.contains("original completion failure"), "{message}");
+        assert!(message.contains("separate abort failure"), "{message}");
+        assert_eq!(abort_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(shared.lock().inflight, 0);
+        assert!(shared.lock().uncertain.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn definite_completion_failure_aborts_without_poisoning_session() -> Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let shared = Shared::new();
+        let abort_calls = Arc::new(AtomicUsize::new(0));
+        let mut upload = guarded_upload(
+            Arc::clone(&shared),
+            object_store::Error::PermissionDenied {
+                path: "staged/object.parquet".into(),
+                source: "denied before publication".into(),
+            },
+            None,
+            Arc::clone(&abort_calls),
+        )?;
+
+        upload.complete().await.expect_err("complete must fail");
+        upload.abort().await?;
+        assert_eq!(abort_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(shared.lock().inflight, 0);
+        assert!(shared.lock().uncertain.is_none());
+        Ok(())
     }
 
     #[tokio::test]
