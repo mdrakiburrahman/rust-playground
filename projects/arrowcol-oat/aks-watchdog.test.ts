@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { CampaignConflictError, CUSTODY_CLEANUP_STEPS, armCampaign, publishRunInventory, startCampaign, type CampaignState, type CampaignStore, type RunInventory, type StoredCampaign } from './aks-campaign.js';
 import { watchdogOnce } from './aks-watchdog.js';
+import { runRehearsalWatchdogOnce, type RehearsalEvidenceRecord } from './aks-rehearsal.js';
 import { createExternalCleanupExecutor, type ExternalCleanupActions } from './aks-cleanup-executor.js';
 import { reconcileCleanupOnce, reconcileOnce } from './aks-reconcile.js';
 
@@ -152,4 +153,21 @@ test('maintenance stop persists a deadline and retains uncertainty without repla
   assert.deepEqual(store.current!.state.runInventory!.cleanup.stop_maintenance, uncertain);
   assert.equal(stops, 1);
   assert.equal(terminal, 0);
+});
+
+
+test('isolated D40 watchdog uses its injected no-op executor and read-only status adapter', async () => {
+  const realStore = new MemoryStore(), store = await armedStore();
+  const evidence: RehearsalEvidenceRecord[] = [], armReads: string[] = [];
+  const result = await runRehearsalWatchdogOnce({ env: { ARM_SUBSCRIPTION_ID: subscriptionId }, rehearsalId: campaignId,
+    ownerId, realStore, isolatedStore: store,
+    readOnlyAzure: { readArmStatus: async url => { armReads.push(url); return { status: 200, body: { status: 'InProgress' } }; } },
+    evidence: event => evidence.push(event) });
+  const current = (await store.read())!;
+  assert.equal(current.state.status, 'cleaning');
+  assert.equal(current.state.cleanupSteps[0]!.status, 'complete');
+  assert.equal(result.cleanupProgress, 'progress');
+  assert.deepEqual(armReads, []);
+  assert.equal(evidence.some(event => event.event === 'recording_cleanup_noop'), true);
+  assert.equal(evidence.some(event => event.event === 'campaign_transition' && event.fencing_token === 2), true);
 });

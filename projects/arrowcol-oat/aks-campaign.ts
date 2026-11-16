@@ -496,7 +496,7 @@ export function cleanupFailureCode(error: unknown): 'stale_version' | 'write_out
     return 'campaign_fenced';
   return 'invalid_or_storage_error';
 }
-export interface CampaignStoreConfig { account: string; container: string; subscriptionId: string }
+export interface CampaignStoreConfig { account: string; container: string; subscriptionId: string; recordPath?: string }
 
 export async function managedIdentityToken(resource: string, env: NodeJS.ProcessEnv = process.env, fetcher: Fetcher = fetch): Promise<string> {
   const endpoint = env.IDENTITY_ENDPOINT;
@@ -525,10 +525,15 @@ async function localToken(resource: string, subscriptionId: string): Promise<str
 
 export function createBlobCampaignStore(config: CampaignStoreConfig, fetcher: Fetcher = fetch,
   token: TokenProvider = resource => getAccessToken(resource, config.subscriptionId, process.env, fetcher)): CampaignStore {
+  const recordPath = config.recordPath ?? 'active.json';
+  const segments = recordPath.split('/');
   if (!storageName.test(config.account) || !containerName.test(config.container) || !uuid.test(config.subscriptionId)) {
     throw new Error('Campaign store requires a storage account, container and subscription ID.');
   }
-  const endpoint = `https://${config.account}.blob.core.windows.net/${config.container}/active.json`;
+  if (recordPath.length > 1024 || segments.some(segment => !/^[A-Za-z0-9._-]+$/.test(segment) || segment === '.' || segment === '..'))
+    throw new Error('Campaign store record path is invalid.');
+  const endpoint = `https://${config.account}.blob.core.windows.net/${config.container}/` +
+    segments.map(segment => encodeURIComponent(segment)).join('/');
   const headers = async () => ({ authorization: `Bearer ${await token('https://storage.azure.com/')}`,
     'x-ms-date': new Date().toUTCString(), 'x-ms-version': '2023-11-03' });
   return {

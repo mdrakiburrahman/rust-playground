@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { CampaignConflictError, CUSTODY_CLEANUP_STEPS, MAX_CAMPAIGN_LIFETIME_MS, MISSED_HEARTBEAT_LIMIT, HEARTBEAT_INTERVAL_MS,
+  createBlobCampaignStore,
   armCampaign, assertCampaignEnvironment, assertRunInventoryReady, campaignStartReceipt, heartbeatCampaign, mutateCampaign, newCampaignState, publishCleanupRunInventory, publishRunInventory, runInventoryPublishReceipt, startCampaign,
   validateCampaignState, type CampaignState, type CampaignStore, type RunInventory, type StoredCampaign,
   CampaignWriteOutcomeUnknownError, recordArmOperation } from './aks-campaign.js';
@@ -329,4 +330,21 @@ test('strict state schema rejects additional persisted fields', async () => {
   const store = new MemoryStore();
   await mutateCampaign(store, () => state);
   assert.equal((await store.read())!.state.campaignId, campaignId);
+});
+
+
+test('campaign Blob store keeps the default record path and supports isolated paths', async () => {
+  const paths: string[] = [];
+  const fetcher: typeof fetch = async input => {
+    paths.push(new URL(String(input)).pathname);
+    return new Response(null, { status: 404 });
+  };
+  const config = { account: 'arrowcollector12345', container: 'checkpoints', subscriptionId };
+  await createBlobCampaignStore(config, fetcher, async () => 'fixture-token').read();
+  await createBlobCampaignStore({ ...config, recordPath: '_arrowcol-custody-rehearsal/rehearsal-1/active.json' },
+    fetcher, async () => 'fixture-token').read();
+  assert.deepEqual(paths, ['/checkpoints/active.json',
+    '/checkpoints/_arrowcol-custody-rehearsal/rehearsal-1/active.json']);
+  assert.throws(() => createBlobCampaignStore({ ...config, recordPath: '../active.json' }, fetcher,
+    async () => 'fixture-token'), /Campaign store record path is invalid/);
 });
