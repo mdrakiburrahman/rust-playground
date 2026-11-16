@@ -1988,7 +1988,7 @@ mod tests {
         exposition
             .lines()
             .filter(|line| line.starts_with(prefix) && line.contains(label))
-            .filter_map(|line| line.split_whitespace().last()?.parse().ok())
+            .filter_map(|line| line.split_whitespace().last()?.parse::<u64>().ok())
             .sum()
     }
 
