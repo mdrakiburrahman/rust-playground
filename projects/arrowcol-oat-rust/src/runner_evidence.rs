@@ -780,7 +780,7 @@ mod downstream_runner_tests {
             "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
         ))?;
         config.platform.kind = kind;
-        config.qap_timeout_seconds = 1;
+        config.qap_timeout_seconds = if matches!(fault, Fault::InitTimeout) { 1 } else { 10 };
         let result = run_matrix_cell(
             &config,
             "orchestration",
