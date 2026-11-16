@@ -333,6 +333,14 @@ export function maintenanceDueWorkIssue(
       !isRecord(policy.tables[maintenanceTable]) || policy.tables[maintenanceTable].active !== true) return unavailable;
   const outcomes = policy.operation_outcomes;
   if (!isRecord(outcomes) || outcomes.scope !== 'process_lifetime' || outcomes.error_count !== 0) return unavailable;
+  const retryCount = outcomes.retry_count;
+  if (retryCount !== undefined && (nonNegativeInteger(retryCount) === undefined ||
+      !isRecord(outcomes.retry_kind_counts) ||
+      Object.entries(outcomes.retry_kind_counts).some(([kind, count]) => kind !== 'stale_plan' ||
+        nonNegativeInteger(count) === undefined) ||
+      Object.values(outcomes.retry_kind_counts).reduce<number>((sum, count) => sum + Number(count), 0) !== retryCount)) {
+    return unavailable;
+  }
 
   const windowCount = Math.floor((end - start) / 30_000);
   if (windowCount < 5) return unavailable;
@@ -348,6 +356,14 @@ export function maintenanceDueWorkIssue(
     if (report.operation_failed === true || report.interrupted === true || report.report_outcome === 'partial') {
       return 'maintenance operation failed or its due-work observation is incomplete';
     }
+    if (report.operation_retry === true) {
+      if (report.retry_kind !== 'stale_plan' || report.operation_failed !== false ||
+          report.error_kind !== null || report.maintenance_due_work !== null || report.compaction_debt !== null ||
+          !Number.isSafeInteger(retryCount) || Number(retryCount) < 1) return unavailable;
+      continue;
+    }
+    if (report.operation_retry !== undefined && report.operation_retry !== false ||
+        report.retry_kind !== undefined && report.retry_kind !== null) return unavailable;
     if (report.operation_failed !== false ||
         report.interrupted !== undefined && typeof report.interrupted !== 'boolean' ||
         !['noop', 'planned', 'committed', 'already_applied', 'deleted', 'checkpointed', 'pruned'].includes(String(report.report_outcome))) {
@@ -400,25 +416,48 @@ export function maintenanceDueWorkIssue(
     }
     const window = observations.get(operation)![index]!;
     if (window.some(sample => sample.observed_at_ms === observedAt)) return unavailable;
+    let protectedFiles: number | null = null;
+    let protectedBytes: number | null = null;
+    if (operation === 'optimize' && isRecord(report.compaction_debt)) {
+      const debt = report.compaction_debt;
+      const protectedBacklog = debt.protected_partition_backlog;
+      if (protectedBacklog !== null && protectedBacklog !== undefined) {
+        if (!isRecord(protectedBacklog) || debt.observed_at_ms !== observedAt || debt.source !== dueWork.source ||
+            nonNegativeInteger(protectedBacklog.files) === undefined ||
+            nonNegativeInteger(protectedBacklog.bytes) === undefined ||
+            protectedBacklog.oldest_partition_start_ms !== null &&
+              (nonNegativeInteger(protectedBacklog.oldest_partition_start_ms) === undefined ||
+                Number(protectedBacklog.oldest_partition_start_ms) > observedAt) ||
+            protectedBacklog.files === 0 && (protectedBacklog.bytes !== 0 ||
+              protectedBacklog.oldest_partition_start_ms !== null)) return unavailable;
+        protectedFiles = Number(protectedBacklog.files);
+        protectedBytes = Number(protectedBacklog.bytes);
+      }
+    }
     window.push({
       ...dueWork,
       _eligible_count: eligibleCount,
       _eligible_bytes: eligibleBytes,
       _backlog_count: backlogCount,
       _backlog_bytes: backlogBytes,
+      _protected_files: protectedFiles,
+      _protected_bytes: protectedBytes,
     });
   }
 
   for (const [operation, windows] of observations) {
+    if (windows.some(samples => samples.length === 0)) return 'maintenance due-work is missing from one or more complete 30-second windows';
     const means = new Map<string, number[]>();
     const coverage = new Map<string, boolean>();
-    const metrics = ['_eligible_count', '_backlog_count', '_eligible_bytes', '_backlog_bytes'] as const;
+    const metrics = ['_eligible_count', '_backlog_count', '_eligible_bytes', '_backlog_bytes',
+      ...(operation === 'optimize' ? ['_protected_files', '_protected_bytes'] : [])];
     for (const samples of windows) {
       if (samples.length === 0) return 'maintenance due-work is missing from one or more complete 30-second windows';
       for (const metric of metrics) {
         const values = samples.map(sample => sample[metric]);
         const hasNull = values.some(value => value === null);
         const measured = !hasNull;
+        if (metric.startsWith('_protected_') && hasNull) return unavailable;
         if (hasNull && values.some(value => value !== null) ||
             coverage.has(metric) && coverage.get(metric) !== measured) {
           return 'maintenance due-work measurement coverage is inconsistent across the measured windows';
@@ -440,6 +479,38 @@ export function maintenanceDueWorkIssue(
     if (metrics.some(metric => coverage.get(metric) && isGrowing(means.get(metric)!))) {
       return operation + ' maintenance due-work grows across the measured windows';
     }
+  }
+  const cellIssue = maintenanceCellOutcomeIssue(process.maintenance_operation_outcomes);
+  if (cellIssue) return cellIssue;
+  return undefined;
+}
+
+function maintenanceCellOutcomeIssue(value: unknown): string | undefined {
+  const unavailable = 'cell-scoped maintenance retry/error records are unavailable or invalid';
+  if (!isRecord(value) || value.status !== 'observed' || value.cell_scope !== 'stdout_stderr_append_offsets' ||
+      !nonNegativeInteger(value.operation_count) || typeof value.operation_failure !== 'boolean' ||
+      !isRecord(value.error_kind_counts) || !isRecord(value.retry_kind_counts) || !isRecord(value.operations)) return unavailable;
+  const maps = [value.error_kind_counts, value.retry_kind_counts];
+  if (maps.some(counts => Object.values(counts).some(count => nonNegativeInteger(count) === undefined)) ||
+      Object.keys(value.retry_kind_counts).some(kind => kind !== 'stale_plan')) return unavailable;
+  const failures = Object.values(value.error_kind_counts).reduce<number>((sum, count) => sum + Number(count), 0);
+  if (value.operation_failure !== (failures > 0)) return unavailable;
+  if (failures > 0) return 'cell-scoped maintenance operation failure';
+  return undefined;
+}
+
+function maintenanceShutdownIssue(value: unknown): string | undefined {
+  if (!isRecord(value) || !Array.isArray(value.maintenance) || value.maintenance.length !== 1) {
+    return 'maintenance shutdown outcome is unknown';
+  }
+  const process = value.maintenance[0];
+  if (!isRecord(process)) return 'maintenance shutdown outcome is unknown';
+  const issue = maintenanceCellOutcomeIssue(process.outcomes);
+  if (issue) return issue;
+  if (!['no_operation_failures', 'classified_retries_only'].includes(String(process.exit_classification)) ||
+      ![0, 1, 143].includes(Number(process.exit_code)) ||
+      process.exit_code === 1 && process.exit_classification !== 'classified_retries_only') {
+    return 'maintenance shutdown exit has no proved classified cause';
   }
   return undefined;
 }
@@ -578,11 +649,13 @@ function inspectOfficialRun(run: OfficialRun): { windows?: OfficialWindow[]; rea
   const tunables = run.config.tunables;
   const maintenanceConfig = isRecord(tunables) ? tunables.maintenance : undefined;
   const maintenanceIssue = maintenanceDueWorkIssue(evidence.processes, maintenanceConfig, start, end);
+  const shutdownIssue = maintenanceShutdownIssue(evidence.shutdown_drain);
   const backlogIssue = publicationBacklogIssue(evidence.backlog, start, end);
   return {
     windows,
     reason: [
       ...(maintenanceIssue ? [maintenanceIssue] : []),
+      ...(shutdownIssue ? [shutdownIssue] : []),
       ...(backlogIssue ? [backlogIssue] : []),
     ].join('; '),
   };
