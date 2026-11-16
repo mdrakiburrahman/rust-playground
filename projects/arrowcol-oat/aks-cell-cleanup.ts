@@ -97,12 +97,14 @@ function field(selector: CellCleanupSelector): keyof RunInventory['cleanup'] | u
   return selector === 'stop_admission' || selector === 'bounded_drain' || selector === 'evidence_capture' || selector === 'stop_maintenance' ||
     selector === 'terminal_capture' || selector === 'handoff' ? selector : undefined;
 }
+const MAINTENANCE_STOP_BUDGET_MS = 5_100_000;
 function mark(inventory: RunInventory, selector: CellCleanupSelector, state: 'running' | 'complete'): RunInventory {
   const next = structuredClone(inventory), name = field(selector);
   if (name) next.cleanup[name] = { ...next.cleanup[name], state, reason_code: null,
     deadline_unix_ms: next.cleanup[name].deadline_unix_ms ??
       (selector === 'stop_admission' ? Date.now() + 60_000 :
-        selector === 'bounded_drain' || selector === 'stop_maintenance' || selector === 'terminal_capture' ? Date.now() + 120_000 : null) };
+        selector === 'stop_maintenance' ? Date.now() + MAINTENANCE_STOP_BUDGET_MS :
+          selector === 'bounded_drain' || selector === 'terminal_capture' ? Date.now() + 120_000 : null) };
   return next;
 }
 function terminal(inventory: RunInventory) {

@@ -53,6 +53,7 @@ test('maintenance requires a pinned sixth image and explicit allowlist/operation
   const objects = await renderRuntime(c, 'workload');
   const worker = objects.find(o => o.kind === 'Deployment' && o.metadata.name === 'delta-maintenance')!;
   assert.equal(worker.spec.replicas, 0);
+  assert.equal(worker.spec.template.spec.terminationGracePeriodSeconds, 4_800);
   const process = worker.spec.template.spec.containers[0];
   assert.equal(process.image, c.images.maintenance);
   assert.ok(process.args.includes(c.maintenance.tables[0]));

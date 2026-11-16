@@ -261,6 +261,7 @@ export async function renderRuntime(input: unknown, phase: Phase): Promise<Resou
       volumeMounts: [mount('auth', '/run/auth')],
     }], [secretVolume('auth', 'arrowcol-router-auth')], true);
     // Pin initialization creates the allowlisted catalog entries before the runner starts this worker.
+    worker.spec.template.spec.terminationGracePeriodSeconds = 4_800;
     worker.spec.replicas = 0;
     workload.push(worker);
   }

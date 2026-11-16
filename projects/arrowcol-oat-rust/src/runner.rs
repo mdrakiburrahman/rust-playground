@@ -8059,6 +8059,8 @@ fn campaign_cleanup_action_needs_execution(action: &CampaignCleanupAction, inven
 }
 
 const CAMPAIGN_CLEANUP_DEFAULT_TIMEOUT_MS: u64 = 60_000;
+const MAINTENANCE_STOP_GRACE_SECONDS: u64 = 4_800;
+const MAINTENANCE_STOP_TIMEOUT_MS: u64 = 5_100_000;
 
 fn campaign_cleanup_operation_deadline_ms(
     action: &CampaignCleanupAction,
@@ -8068,7 +8070,8 @@ fn campaign_cleanup_operation_deadline_ms(
     // These start-state budgets match the deadlines assigned by mark() in aks-cell-cleanup.ts.
     let default_timeout_ms = match action {
         CampaignCleanupAction::StopAdmission => 60_000,
-        CampaignCleanupAction::BoundedDrain | CampaignCleanupAction::StopMaintenance => 120_000,
+        CampaignCleanupAction::BoundedDrain => 120_000,
+        CampaignCleanupAction::StopMaintenance => MAINTENANCE_STOP_TIMEOUT_MS,
         _ => CAMPAIGN_CLEANUP_DEFAULT_TIMEOUT_MS,
     };
     let deadline = campaign_cleanup_step(action, inventory)
@@ -10361,8 +10364,15 @@ async fn stop_aks_workloads_in_order(config: &OatConfig) -> Result<Value> {
         );
     }
     if maintenance_enabled(config) {
-        maintenance
-            .push(stop_aks_deployment_for_cleanup(config, "delta-maintenance", ComponentRole::Maintenance, 60).await?);
+        maintenance.push(
+            stop_aks_deployment_for_cleanup(
+                config,
+                "delta-maintenance",
+                ComponentRole::Maintenance,
+                MAINTENANCE_STOP_GRACE_SECONDS,
+            )
+            .await?,
+        );
     }
     collectors.push(
         stop_aks_deployment_for_cleanup(
@@ -12747,6 +12757,10 @@ mod tests {
         assert_eq!(
             campaign_cleanup_operation_deadline_ms(&CampaignCleanupAction::BoundedDrain, &declared_deadline, 1_000)?,
             5_000
+        );
+        assert_eq!(
+            campaign_cleanup_operation_deadline_ms(&CampaignCleanupAction::StopMaintenance, &inventory, 1_000)?,
+            MAINTENANCE_STOP_TIMEOUT_MS + 1_000
         );
         let mut expired_deadline = inventory.clone();
         expired_deadline.cleanup.stop_admission.deadline_unix_ms = Some(61_000);
