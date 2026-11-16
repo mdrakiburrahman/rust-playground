@@ -1814,7 +1814,12 @@ mod classify_tests {
         }
 
         async fn complete(&mut self) -> object_store::Result<PutResult> {
-            Err(self.complete_error.take().expect("completion error configured"))
+            let Some(error) = self.complete_error.take() else {
+                return Err(generic(Box::new(std::io::Error::other(
+                    "completion error not configured",
+                ))));
+            };
+            Err(error)
         }
 
         async fn abort(&mut self) -> object_store::Result<()> {
@@ -1862,7 +1867,9 @@ mod classify_tests {
             Arc::clone(&abort_calls),
         )?;
 
-        let complete_error = upload.complete().await.expect_err("complete must fail");
+        let Err(complete_error) = upload.complete().await else {
+            anyhow::bail!("complete must fail");
+        };
         assert!(format!("{complete_error:#}").contains("completion response lost"));
         assert_eq!(shared.lock().inflight, 1);
         assert_eq!(abort_calls.load(Ordering::SeqCst), 0);
@@ -1887,8 +1894,12 @@ mod classify_tests {
             Arc::clone(&abort_calls),
         )?;
 
-        upload.complete().await.expect_err("complete must fail");
-        let error = upload.abort().await.expect_err("abort must fail");
+        let Err(_) = upload.complete().await else {
+            anyhow::bail!("complete must fail");
+        };
+        let Err(error) = upload.abort().await else {
+            anyhow::bail!("abort must fail");
+        };
         let message = format!("{error:#}");
         assert!(message.contains("original completion failure"), "{message}");
         assert!(message.contains("separate abort failure"), "{message}");
@@ -1914,7 +1925,9 @@ mod classify_tests {
             Arc::clone(&abort_calls),
         )?;
 
-        upload.complete().await.expect_err("complete must fail");
+        let Err(_) = upload.complete().await else {
+            anyhow::bail!("complete must fail");
+        };
         upload.abort().await?;
         assert_eq!(abort_calls.load(Ordering::SeqCst), 1);
         assert_eq!(shared.lock().inflight, 0);

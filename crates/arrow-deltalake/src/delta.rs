@@ -732,7 +732,7 @@ mod io_tests {
         let destination = object_store::path::Path::from("staged/existing.parquet");
         store.inner.put(&destination, bytes.to_vec().into()).await?;
 
-        let error = upload_staged_output(
+        let Err(error) = upload_staged_output(
             Arc::<PausedStagePut>::clone(&store),
             destination,
             source,
@@ -742,7 +742,9 @@ mod io_tests {
             2,
         )
         .await
-        .expect_err("create-only mode must reject an existing object");
+        else {
+            anyhow::bail!("create-only mode must reject an existing object");
+        };
 
         assert!(format!("{error:#}").contains("create completed Parquet object"));
         Ok(())
@@ -787,7 +789,7 @@ mod io_tests {
         });
         let destination = object_store::path::Path::from("staged/final-part-failure.parquet");
 
-        let error = upload_staged_output(
+        let Err(error) = upload_staged_output(
             Arc::<PausedStagePut>::clone(&store),
             destination.clone(),
             source,
@@ -797,7 +799,9 @@ mod io_tests {
             2,
         )
         .await
-        .expect_err("a failed final part must prevent publication");
+        else {
+            anyhow::bail!("a failed final part must prevent publication");
+        };
 
         assert!(format!("{error:#}").contains("injected final part failure"));
         assert_eq!(store.abort_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -816,7 +820,7 @@ mod io_tests {
             ..PausedStagePut::default()
         });
 
-        let error = upload_staged_output(
+        let Err(error) = upload_staged_output(
             Arc::<PausedStagePut>::clone(&store),
             object_store::path::Path::from("staged/complete-failure.parquet"),
             source,
@@ -826,7 +830,9 @@ mod io_tests {
             2,
         )
         .await
-        .expect_err("completion and abort failures must be returned");
+        else {
+            anyhow::bail!("completion and abort failures must be returned");
+        };
 
         let message = format!("{error:#}");
         assert!(message.contains("injected completion error"), "{message}");
@@ -852,7 +858,7 @@ mod io_tests {
             fail_multipart: true,
             ..PausedStagePut::default()
         });
-        let error = upload_staged_output(
+        let Err(error) = upload_staged_output(
             Arc::<PausedStagePut>::clone(&store),
             object_store::path::Path::from("staged/failure.parquet"),
             source,
@@ -862,7 +868,9 @@ mod io_tests {
             2,
         )
         .await
-        .expect_err("multipart failure must reach the staging caller");
+        else {
+            anyhow::bail!("multipart failure must reach the staging caller");
+        };
 
         assert!(format!("{error:#}").contains("start completed Parquet multipart upload"));
         assert_eq!(store.multipart_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -1109,9 +1117,9 @@ mod io_tests {
         let hint = root.join("_delta_log").join("_last_checkpoint");
         let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let control = crate::maintenance::MaintenanceControl::new(cancelled, None);
-        let error = table
-            .checkpoint_with_control(&control)
-            .expect_err("cancelled checkpoint must not start");
+        let Err(error) = table.checkpoint_with_control(&control) else {
+            anyhow::bail!("cancelled checkpoint must not start");
+        };
         assert_eq!(
             crate::maintenance::error_kind(&error),
             Some(crate::maintenance::MaintenanceErrorKind::Cancelled)
