@@ -151,6 +151,9 @@ impl OatConfig {
         if self.tables.len() != 1 {
             bail!("single_hot_table campaign requires exactly one public DMV table");
         }
+        if self.tables[0] != "sqlserver_availability_replica_states" {
+            bail!("single_hot_table campaign requires telemetry.sqlserver.sqlserver_availability_replica_states");
+        }
         if self.replica_counts != [1] {
             bail!("single_hot_table campaign requires replica_counts [1]");
         }
@@ -911,7 +914,7 @@ mod tests {
     fn single_hot_table_profile_rejects_unsafe_settings() -> Result<()> {
         let mut config = valid();
         config.campaign_profile = Some(CampaignProfile::SingleHotTable);
-        config.tables = vec!["sqlserver_wait_stats".to_owned()];
+        config.tables = vec!["sqlserver_availability_replica_states".to_owned()];
         config.replica_counts = vec![1];
         config.maintenance_image = Some(format!("maintenance@sha256:{}", "a".repeat(64)));
         config.tunables = serde_json::from_value(serde_json::json!({
@@ -922,6 +925,9 @@ mod tests {
         }))?;
         config.validate_campaign_profile()?;
         config.validate()?;
+        config.tables[0] = "sqlserver_wait_stats".to_owned();
+        assert!(config.validate_campaign_profile().is_err());
+        config.tables[0] = "sqlserver_availability_replica_states".to_owned();
         config.tables.push("sqlserver_cpu_utilization".to_owned());
         assert!(config.validate().is_err());
         config.tables.pop();

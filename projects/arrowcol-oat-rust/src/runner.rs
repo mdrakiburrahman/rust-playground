@@ -5892,6 +5892,57 @@ async fn wait_for_aks_pin_setup(config: &OatConfig, job_name: &str, run_id: &str
     Ok(())
 }
 
+fn local_partition_initializer_args(table: &str, dataflow_root: &Path) -> Result<Vec<String>> {
+    if !dataflow_root.is_absolute() || !dataflow_root.is_dir() {
+        bail!("local partition initialization requires an existing absolute run-owned Dataflow directory");
+    }
+    let canonical_table = canonical_dmv_table_name(table)?;
+    if canonical_table != "telemetry.sqlserver.sqlserver_availability_replica_states" {
+        bail!("local partition initialization only supports the campaign hot table");
+    }
+    let dataflow_root = dataflow_root
+        .to_str()
+        .context("local run-owned Dataflow directory is not valid UTF-8")?;
+    Ok(vec![
+        "initialize-local".to_owned(),
+        "--partition-by-ingestion-date".to_owned(),
+        "--table".to_owned(),
+        canonical_table,
+        "--dataflow-root".to_owned(),
+        dataflow_root.to_owned(),
+    ])
+}
+
+async fn initialize_local_partitioned_campaign_table(config: &OatConfig, platform: &LocalPlatform) -> Result<()> {
+    if config.campaign_profile != Some(crate::config::CampaignProfile::SingleHotTable) {
+        return Ok(());
+    }
+    let [table] = config.tables.as_slice() else {
+        bail!("local partition initialization requires exactly one campaign table");
+    };
+    let dataflow_root = platform.state_dir.join("dataflow");
+    let arguments = local_partition_initializer_args(table, &dataflow_root)?;
+    let workspace = std::env::current_dir()?;
+    let mut build = Command::new("cargo");
+    build.args([
+        "build",
+        "--locked",
+        "--package",
+        "arrowcol-loadgen",
+        "--bin",
+        "arrowcol-loadgen",
+    ]);
+    build.current_dir(&workspace);
+    run_streaming_command(build, "build setup-only local partition initializer").await?;
+
+    let mut initialize = Command::new(workspace.join("target/debug/arrowcol-loadgen"));
+    initialize.args(arguments);
+    initialize.current_dir(workspace);
+    run_streaming_command(initialize, "initialize the fresh local campaign Delta table")
+        .await
+        .context("setup local partitioned table before starting Dataflow or any DMV client")
+}
+
 async fn prepare_local_platform(config: &OatConfig, platform: &LocalPlatform) -> Result<()> {
     run_npx_runtime(
         &std::env::current_dir()?.join("projects/arrowcol-oat/runtime.ts"),
@@ -5907,6 +5958,7 @@ async fn prepare_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
     )
     .await
     .context("render run-owned dataflow profile before starting local workloads")?;
+    initialize_local_partitioned_campaign_table(config, platform).await?;
     let base_project = config
         .platform
         .compose_project
@@ -11084,6 +11136,34 @@ fn platform_host_label(kind: crate::config::OatMode) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn local_partition_initializer_uses_campaign_table_and_shared_run_root() -> anyhow::Result<()> {
+        let root = std::env::temp_dir().join(format!("oat-partition-root-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root)?;
+        let args = super::local_partition_initializer_args("sqlserver_availability_replica_states", &root)?;
+        assert_eq!(
+            args,
+            [
+                "initialize-local",
+                "--partition-by-ingestion-date",
+                "--table",
+                "telemetry.sqlserver.sqlserver_availability_replica_states",
+                "--dataflow-root",
+                root.to_str().context("temp root is not valid UTF-8")?,
+            ]
+        );
+        assert!(super::local_partition_initializer_args("sqlserver_wait_stats", &root).is_err());
+        assert!(
+            super::local_partition_initializer_args(
+                "sqlserver_availability_replica_states",
+                Path::new("relative/dataflow")
+            )
+            .is_err()
+        );
+        std::fs::remove_dir(&root)?;
+        Ok(())
+    }
+
     #[test]
     fn rollout_readiness_waits_for_current_generation_and_removal_of_old_replicas() {
         let stale_generation = serde_json::json!({
