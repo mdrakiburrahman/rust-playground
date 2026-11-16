@@ -385,18 +385,21 @@ impl StreamLifecycle for DfeStreamLifecycle {
                 pending_send.disarm();
                 Ok(())
             }
-            Err(error) => Err(match error {
-                PdataSendError::Closed => RuntimeError::new(
-                    ErrorCode::PoolUnavailable,
-                    tonic::Code::Unavailable,
-                    "DFE downstream route closed after admission",
-                ),
-                PdataSendError::Unavailable => RuntimeError::new(
-                    ErrorCode::CapacityExhausted,
-                    tonic::Code::Unavailable,
-                    "DFE downstream admission is unavailable",
-                ),
-            }),
+            Err(error) => {
+                self.metrics.enqueue_failed();
+                Err(match error {
+                    PdataSendError::Closed => RuntimeError::new(
+                        ErrorCode::PoolUnavailable,
+                        tonic::Code::Unavailable,
+                        "DFE downstream route closed after admission",
+                    ),
+                    PdataSendError::Unavailable => RuntimeError::new(
+                        ErrorCode::CapacityExhausted,
+                        tonic::Code::Unavailable,
+                        "DFE downstream admission is unavailable",
+                    ),
+                })
+            }
         }
     }
 

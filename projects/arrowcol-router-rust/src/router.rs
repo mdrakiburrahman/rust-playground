@@ -408,7 +408,10 @@ impl ProxyHttp for ProductionRouter {
         if let Some(handled) = self.handle_http_api(session, &path, now).await? {
             return Ok(handled);
         }
-        self.route_proxy_request(session, context, now).await
+        let decision_started = Instant::now();
+        let result = self.route_proxy_request(session, context, now).await;
+        self.metrics.observe_decision_duration(decision_started.elapsed());
+        result
     }
 
     async fn response_filter(

@@ -13,6 +13,8 @@ publish = false
 [dependencies]
 anyhow.workspace = true
 arrowcol-protocol = { path = "../../crates/arrowcol-protocol" }
+arrowcol-buffer = { path = "../../crates/arrowcol-buffer" }
+opentelemetry.workspace = true
 arrowcol-routing = { path = "../../crates/arrowcol-routing" }
 arrowcol-sql-server = { path = "../../crates/arrowcol-sql-server" }
 async-trait = "0.1"

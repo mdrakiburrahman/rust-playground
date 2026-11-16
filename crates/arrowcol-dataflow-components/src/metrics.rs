@@ -5,6 +5,8 @@ use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use cpu_time::ProcessTime;
+use opentelemetry::metrics::{Counter, Gauge, Histogram};
+use opentelemetry::{KeyValue, global};
 
 use arrowcol_catalog::SchemaVersion;
 use arrowcol_protocol::{
@@ -33,16 +35,131 @@ pub enum PipelineStage {
     Commit,
 }
 
-/// Temporary stage-recorder stub; L4 supplies the OTel handles.
-#[derive(Clone, Debug, Default)]
-pub struct StageMetrics;
+/// OpenTelemetry recorder for the fixed pipeline stages.
+#[derive(Clone, Debug)]
+pub struct StageMetrics {
+    duration: Histogram<f64>,
+    run: String,
+    variant: String,
+}
+
+impl Default for StageMetrics {
+    fn default() -> Self {
+        let meter = global::meter("arrowcol-dataflow-components");
+        Self {
+            duration: meter
+                .f64_histogram("arrowcol.pipeline.stage.duration")
+                .with_unit("s")
+                .build(),
+            run: std::env::var("ARROWCOL_OAT_RUN_ID").unwrap_or_else(|_| "unknown".to_owned()),
+            variant: std::env::var("ARROWCOL_OAT_VARIANT").unwrap_or_else(|_| "unknown".to_owned()),
+        }
+    }
+}
 
 impl StageMetrics {
     /// Records a duration for one fixed pipeline stage.
-    pub fn record(&self, _stage: PipelineStage, _duration: Duration) {}
+    pub fn record(&self, stage: PipelineStage, duration: Duration) {
+        self.duration.record(
+            duration.as_secs_f64(),
+            &[
+                KeyValue::new("run", self.run.as_str()),
+                KeyValue::new("variant", self.variant.as_str()),
+                KeyValue::new("component", "arrowcol-dataflow-rust"),
+                KeyValue::new("stage", stage.as_str()),
+            ],
+        );
+    }
 }
 
-/// Durable-backlog utilization at which `quiver_state` reports `degraded`.
+impl PipelineStage {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Collect => "collect",
+            Self::Build => "build",
+            Self::Sort => "sort",
+            Self::Encode => "encode",
+            Self::Upload => "upload",
+            Self::Commit => "commit",
+        }
+    }
+}
+
+struct CollectorOtelMetrics {
+    attributes: Vec<KeyValue>,
+    received_rows: Counter<u64>,
+    enqueue_failures: Counter<u64>,
+    downstream_acks: Counter<u64>,
+    downstream_nacks: Counter<u64>,
+    refused_batches: Counter<u64>,
+    delta_rows: Counter<u64>,
+    delta_failures: Counter<u64>,
+    buffered_rows: Gauge<u64>,
+    buffered_batches: Gauge<u64>,
+    oldest_pending_age: Gauge<f64>,
+    pending_commits: Gauge<u64>,
+}
+
+impl CollectorOtelMetrics {
+    fn new() -> Self {
+        let meter = global::meter("arrowcol-dataflow-components");
+        let attributes = vec![
+            KeyValue::new(
+                "run",
+                std::env::var("ARROWCOL_OAT_RUN_ID").unwrap_or_else(|_| "unknown".to_owned()),
+            ),
+            KeyValue::new(
+                "variant",
+                std::env::var("ARROWCOL_OAT_VARIANT").unwrap_or_else(|_| "unknown".to_owned()),
+            ),
+            KeyValue::new("component", "arrowcol-dataflow-rust"),
+        ];
+        Self {
+            attributes,
+            received_rows: meter.u64_counter("arrowcol.receiver.rows").with_unit("1").build(),
+            enqueue_failures: meter
+                .u64_counter("arrowcol.dfe.enqueue.failures")
+                .with_unit("1")
+                .build(),
+            downstream_acks: meter.u64_counter("arrowcol.dfe.downstream.acks").with_unit("1").build(),
+            downstream_nacks: meter
+                .u64_counter("arrowcol.dfe.downstream.nacks")
+                .with_unit("1")
+                .build(),
+            refused_batches: meter.u64_counter("arrowcol.dfe.refused.batches").with_unit("1").build(),
+            delta_rows: meter
+                .u64_counter("arrowcol.delta.committed.rows")
+                .with_unit("1")
+                .build(),
+            delta_failures: meter
+                .u64_counter("arrowcol.delta.commit.failures")
+                .with_unit("1")
+                .build(),
+            buffered_rows: meter.u64_gauge("arrowcol.dfe.buffered.rows").with_unit("1").build(),
+            buffered_batches: meter.u64_gauge("arrowcol.dfe.buffered.batches").with_unit("1").build(),
+            oldest_pending_age: meter
+                .f64_gauge("arrowcol.dfe.oldest.pending.age")
+                .with_unit("s")
+                .build(),
+            pending_commits: meter.u64_gauge("arrowcol.delta.pending.commits").with_unit("1").build(),
+        }
+    }
+
+    fn record_pressure(
+        &self,
+        buffered_rows: u64,
+        buffered_batches: u64,
+        oldest_age_seconds: f64,
+        pending_commits: u64,
+    ) {
+        self.buffered_rows.record(buffered_rows, &self.attributes);
+        self.buffered_batches.record(buffered_batches, &self.attributes);
+        self.oldest_pending_age.record(oldest_age_seconds, &self.attributes);
+        self.pending_commits.record(pending_commits, &self.attributes);
+    }
+}
+
+/// Durable-backlog utilization at which quiver_state reports degraded.
 const QUIVER_DEGRADED_BPS: u16 = 8_000;
 
 /// Returns the process-lifetime collector identifier shared by every DFE core.
@@ -295,6 +412,8 @@ pub struct RuntimeMetrics {
     cpu_pressure_mode: OnceLock<CpuPressureMode>,
     cpu_utilization_bps: AtomicU64,
     process_cpu_sampler: Mutex<ProcessCpuSampler>,
+    enqueue_failures: AtomicU64,
+    otel: CollectorOtelMetrics,
     pressure_publication: tokio::sync::Mutex<Option<UnixMillis>>,
 }
 
@@ -344,6 +463,8 @@ impl RuntimeMetrics {
             cpu_pressure_mode: OnceLock::new(),
             cpu_utilization_bps: AtomicU64::new(0),
             process_cpu_sampler: Mutex::new(ProcessCpuSampler::default()),
+            enqueue_failures: AtomicU64::new(0),
+            otel: CollectorOtelMetrics::new(),
             pressure_publication: tokio::sync::Mutex::new(None),
         }
     }
@@ -489,7 +610,13 @@ impl RuntimeMetrics {
     pub(crate) fn batch_received(&self, rows: u64, bytes: u64) {
         self.received_batches.fetch_add(1, Ordering::Relaxed);
         self.received_rows.fetch_add(rows, Ordering::Relaxed);
+        self.otel.received_rows.add(rows, &self.otel.attributes);
         self.received_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub(crate) fn enqueue_failed(&self) {
+        self.enqueue_failures.fetch_add(1, Ordering::Relaxed);
+        self.otel.enqueue_failures.add(1, &self.otel.attributes);
     }
 
     pub(crate) fn batch_buffered(
@@ -531,8 +658,11 @@ impl RuntimeMetrics {
         saturating_sub_atomic(&self.buffered_bytes, bytes);
         if downstream_ack {
             self.downstream_acks.fetch_add(1, Ordering::Relaxed);
+            self.otel.downstream_acks.add(1, &self.otel.attributes);
         } else {
             self.downstream_nacks.fetch_add(1, Ordering::Relaxed);
+            self.otel.downstream_nacks.add(1, &self.otel.attributes);
+            self.otel.refused_batches.add(1, &self.otel.attributes);
         }
         self.update_table(table, |state| {
             state.buffered_batches = state.buffered_batches.saturating_sub(1);
@@ -576,9 +706,11 @@ impl RuntimeMetrics {
         if delta_version.is_some() {
             self.delta_files.fetch_add(files, Ordering::Relaxed);
             self.delta_rows.fetch_add(rows, Ordering::Relaxed);
+            self.otel.delta_rows.add(rows, &self.otel.attributes);
             self.delta_bytes.fetch_add(bytes, Ordering::Relaxed);
         } else {
             self.delta_failures.fetch_add(1, Ordering::Relaxed);
+            self.otel.delta_failures.add(1, &self.otel.attributes);
         }
     }
 
@@ -909,6 +1041,12 @@ impl RuntimeMetrics {
     #[must_use]
     pub fn prometheus(&self) -> String {
         let mut output = String::new();
+        self.otel.record_pressure(
+            self.buffered_rows.load(Ordering::Acquire),
+            self.buffered_batches.load(Ordering::Acquire),
+            self.oldest_buffer_age() as f64 / 1_000.0,
+            self.pending_commits.load(Ordering::Acquire),
+        );
         for (name, value) in [
             (
                 "arrowcol_flight_active_streams",
@@ -957,6 +1095,16 @@ impl RuntimeMetrics {
             let _ = writeln!(output, "# TYPE {name} gauge");
             let _ = writeln!(output, "{name} {value}");
         }
+        let _ = writeln!(
+            output,
+            "# HELP arrowcol_dfe_enqueue_failures_total Batches rejected before DFE queue admission."
+        );
+        output.push_str("# TYPE arrowcol_dfe_enqueue_failures_total counter\n");
+        let _ = writeln!(
+            output,
+            "arrowcol_dfe_enqueue_failures_total {}",
+            self.enqueue_failures.load(Ordering::Acquire)
+        );
         let _ = writeln!(
             output,
             "# HELP arrowcol_dfe_buffered_rows Rows awaiting DFE acknowledgement."
