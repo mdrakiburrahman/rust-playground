@@ -1,20 +1,28 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { canonical_json, type Azure } from '../../infra/azure/bootstrap.js';
-import { cleanup_run_fic, recover_run_fic_record } from '../../infra/azure/run_fic.js';
+import { cleanup_run_fic, recover_run_fic_record, type RunFicPlan } from '../../infra/azure/run_fic.js';
 import { cleanup_oat_qap, delete_oat_qap_workload, recover_oat_qap_record, recover_oat_workload_stop,
   parse_oat_qap_reference, type OatQapReference, type RecordV1 } from '../../infra/azure/oat_qap.js';
-import { publishCleanupRunInventory, type CampaignState, type CampaignStore, type InventoryStep, type RunInventory, type RunInventoryResource } from './aks-campaign.js';
+import { DRAIN_UNSETTLED_REASON, hasVerifiedUnsettledDrain, publishCleanupRunInventory,
+  type CampaignState, type CampaignStore, type InventoryStep, type RunInventory, type RunInventoryResource } from './aks-campaign.js';
 import type { CleanupExecutor } from './aks-reconcile.js';
+import { assertRunCleanupActor, createSetupRunCleanupActions } from './aks-setup-cleanup.js';
+import { withCleanupDeadline } from './aks-cleanup-budget.js';
 
 export type CleanupActionResult = 'pending' | 'complete' | 'uncertain';
 export interface CleanupMutationAuthority {
+  mode?: 'producer' | 'controller';
   campaignId: string;
   ownerId: string;
   fencingToken: number;
   assertCurrent(): Promise<void>;
+  assertEvidenceCurrent?(): Promise<void>;
 }
 export interface ExternalCleanupActions {
+  verifyCellPreservation?(inventory: RunInventory, authority: CleanupMutationAuthority): Promise<CleanupActionResult>;
+  recoverLifecycle?(field: Exclude<keyof RunInventory['cleanup'], 'handoff'>, inventory: RunInventory, deadlineUnixMs: number | null,
+    idempotencyKey: string, authority: CleanupMutationAuthority): Promise<CleanupActionResult>;
   discoverExactInventory(inventory: RunInventory): Promise<RunInventory>;
   stopAdmission(inventory: RunInventory, deadlineUnixMs: number, idempotencyKey: string, authority: CleanupMutationAuthority): Promise<CleanupActionResult>;
   boundedDrain(inventory: RunInventory, deadlineUnixMs: number, idempotencyKey: string, authority: CleanupMutationAuthority): Promise<CleanupActionResult>;
@@ -34,6 +42,8 @@ export interface ExternalCleanupActions {
 
 const ADMISSION_STOP_BUDGET_MS = 60_000;
 const DRAIN_BUDGET_MS = 120_000;
+const MAINTENANCE_STOP_BUDGET_MS = 120_000;
+const TERMINAL_CAPTURE_BUDGET_MS = 120_000;
 
 function hasUnresolvedIdentity(inventory: RunInventory): boolean {
   return inventory.resources.some(resource => resource.state === 'planned' || resource.state === 'uncertain') ||
@@ -48,6 +58,7 @@ function stepField(step: string): keyof RunInventory['cleanup'] | undefined {
     case 'stop-admission': return 'stop_admission';
     case 'bounded-drain': return 'bounded_drain';
     case 'preserve-evidence': return 'evidence_capture';
+    case 'stop-maintenance': return 'stop_maintenance';
     case 'record-terminal-state': return 'terminal_capture';
     default: return undefined;
   }
@@ -56,14 +67,17 @@ function stepField(step: string): keyof RunInventory['cleanup'] | undefined {
 export type OwnedRunCleanupActions = Pick<ExternalCleanupActions,
   'deleteNamespaceIfUidAndOwnerMatch' | 'deleteQapBindingIfOwned' | 'deleteFicIfExact'>;
 
-export function createOwnedRunCleanupActions(store: CampaignStore, azure: Azure, inputReference: OatQapReference,
-  workDirectory: string): OwnedRunCleanupActions {
+export function createOwnedRunCleanupActions(store: CampaignStore, azure: Azure, inputReference: OatQapReference | null,
+  workDirectory: string, setupPlan?: RunFicPlan): OwnedRunCleanupActions {
+  if (inputReference === null) {
+    if (!setupPlan) throw new Error('Cleanup without QAP requires the original durable FIC plan.');
+    return createSetupRunCleanupActions(store, azure, setupPlan, workDirectory);
+  }
   const reference = parse_oat_qap_reference(inputReference);
   const fresh = async (authority: CleanupMutationAuthority): Promise<RunInventory> => {
     await authority.assertCurrent();
-    const stored = await store.read(), state = stored?.state, inventory = state?.runInventory;
-    if (!state || state.status !== 'cleaning' || state.campaignId !== authority.campaignId ||
-        state.ownerId !== authority.ownerId || state.fencingToken !== authority.fencingToken || !inventory ||
+    const inventory = await assertRunCleanupActor(store, authority);
+    if (
         inventory.campaign_id !== authority.campaignId || inventory.cell_run_id !== reference.run_id ||
         inventory.namespace.uid !== reference.namespace_uid || inventory.namespace.owner_token !== reference.namespace_owner_token)
       throw new Error('Owned cleanup reference does not match the current cleaning actor and immutable run origin.');
@@ -126,10 +140,12 @@ export function createExternalCleanupExecutor(store: CampaignStore, actions: Ext
     const ownerId = suppliedState.ownerId;
     const campaignId = suppliedState.campaignId;
     const fencingToken = suppliedState.fencingToken;
+    let effectEtag: string | undefined;
     const assertCurrent = async () => {
       const current = await store.read();
       if (!current || current.state.status !== 'cleaning' || current.state.campaignId !== campaignId ||
           current.state.ownerId !== ownerId || current.state.fencingToken !== fencingToken || !current.state.runInventory ||
+          effectEtag !== undefined && current.etag !== effectEtag ||
           current.state.runInventory.owner_id !== suppliedState.runInventory!.owner_id ||
           current.state.runInventory.fencing_token !== suppliedState.runInventory!.fencing_token ||
           current.state.runInventory.cell_run_id !== suppliedState.runInventory!.cell_run_id ||
@@ -138,7 +154,7 @@ export function createExternalCleanupExecutor(store: CampaignStore, actions: Ext
         throw new Error('Cleanup controller fencing changed before the mutation gate.');
       }
     };
-    const authority: CleanupMutationAuthority = { campaignId, ownerId, fencingToken, assertCurrent };
+    const authority: CleanupMutationAuthority = { mode: 'controller', campaignId, ownerId, fencingToken, assertCurrent };
     const writeInventory = async (update: (value: RunInventory) => RunInventory) => {
       await assertCurrent();
       const current = (await store.read())!;
@@ -151,11 +167,24 @@ export function createExternalCleanupExecutor(store: CampaignStore, actions: Ext
     const currentState = (await store.read())!.state;
     const runAction = async (field: keyof RunInventory['cleanup'], action: (deadline: number | null) => Promise<CleanupActionResult>, budgetMs = 0): Promise<'pending' | 'complete'> => {
       const prior = inventory.cleanup[field];
-      const running = setStep(prior, 'running', budgetMs);
-      inventory = (await writeInventory(value => ({ ...value, cleanup: { ...value.cleanup, [field]: running } }))).state.runInventory!;
+      if (prior.state === 'complete') return 'complete';
+      if (prior.state === 'failed' || field === 'handoff') return 'pending';
+      const recovering = ['running', 'uncertain'].includes(prior.state);
+      if (recovering && !actions.recoverLifecycle) return 'pending';
+      const running = recovering ? prior : setStep(prior, 'running', budgetMs);
+      if (!recovering) inventory = (await writeInventory(value => ({ ...value, cleanup: { ...value.cleanup, [field]: running } }))).state.runInventory!;
       await authority.assertCurrent();
-      const result = await action(running.deadline_unix_ms);
+      const admitted = (await store.read())!;
+      if (canonical_json(admitted.state.runInventory) !== canonical_json(inventory)) throw new Error('Cleanup inventory changed before effect admission.');
+      effectEtag = admitted.etag;
+      let result: CleanupActionResult;
+      try {
+        await authority.assertCurrent();
+        result = recovering ? await actions.recoverLifecycle!(field, inventory, running.deadline_unix_ms, idempotencyKey, authority) :
+          await action(running.deadline_unix_ms);
+      } finally { effectEtag = undefined; }
       if (result === 'pending') {
+        if (recovering) return 'pending';
         inventory = (await writeInventory(value => ({ ...value, cleanup: { ...value.cleanup, [field]: setStep(value.cleanup[field], 'pending', budgetMs) } }))).state.runInventory!;
         return 'pending';
       }
@@ -172,23 +201,27 @@ export function createExternalCleanupExecutor(store: CampaignStore, actions: Ext
       case 'preserve-evidence':
         return runAction('evidence_capture', () => actions.preserveEvidence(inventory, idempotencyKey, authority));
       case 'stop-maintenance': {
-        if (hasUnresolvedIdentity(inventory)) return 'pending';
-        for (const resource of inventory.resources.filter(item => item.role === 'maintenance')) {
-          if (resource.state === 'observed' && resource.uid) {
-            await authority.assertCurrent();
-            const result = await actions.stopMaintenanceIfUidAndOwnerMatch(resource, inventory.namespace.owner_token,
-              keyed(idempotencyKey, resource.name), authority);
-            if (result !== 'complete') {
-              if (result === 'uncertain') inventory = (await writeInventory(value => ({ ...value, resources: value.resources.map(item =>
-                item.name === resource.name && item.kind === resource.kind ? { ...item, state: 'uncertain' } : item) }))).state.runInventory!;
-              return 'pending';
+        return runAction('stop_maintenance', async deadline => {
+          if (hasUnresolvedIdentity(inventory)) return 'pending';
+          for (const resource of inventory.resources.filter(item => item.role === 'maintenance')) {
+            if (resource.state === 'observed' && resource.uid) {
+              if (Date.now() >= deadline!) return 'uncertain';
+              const bounded = withCleanupDeadline(authority, deadline);
+              await bounded.assertCurrent();
+              const result = await actions.stopMaintenanceIfUidAndOwnerMatch(resource, inventory.namespace.owner_token,
+                keyed(idempotencyKey, resource.name), bounded);
+              if (result !== 'complete') {
+                if (result === 'uncertain') inventory = (await writeInventory(value => ({ ...value, resources: value.resources.map(item =>
+                  item.name === resource.name && item.kind === resource.kind ? { ...item, state: 'uncertain' } : item) }))).state.runInventory!;
+                return result;
+              }
             }
           }
-        }
-        return 'complete';
+          return 'complete';
+        }, MAINTENANCE_STOP_BUDGET_MS);
       }
       case 'record-terminal-state':
-        return runAction('terminal_capture', () => actions.captureTerminalState(inventory, idempotencyKey, authority));
+        return runAction('terminal_capture', () => actions.captureTerminalState(inventory, idempotencyKey, authority), TERMINAL_CAPTURE_BUDGET_MS);
       case 'remove-run-namespace': {
         if (hasUnresolvedIdentity(inventory)) return 'pending';
         if (inventory.namespace.uid) {
@@ -242,7 +275,11 @@ export function createExternalCleanupExecutor(store: CampaignStore, actions: Ext
       case 'verify-safe-idle': {
         const result = await actions.verifySafeIdle(currentState, idempotencyKey);
         if (result !== 'complete') return 'pending';
-        const handoff = setStep(inventory.cleanup.handoff, 'complete');
+        const unsettled = hasVerifiedUnsettledDrain(currentState);
+        if (inventory.cleanup.handoff.state === 'failed' && inventory.cleanup.handoff.reason_code !== DRAIN_UNSETTLED_REASON)
+          throw new Error('Unrelated failed cell handoff cannot be replaced with clean or expiry verification.');
+        const handoff = setStep(inventory.cleanup.handoff, unsettled ? 'failed' : 'complete', 0,
+          unsettled ? DRAIN_UNSETTLED_REASON : null);
         await writeInventory(value => ({ ...value, cleanup: { ...value.cleanup, handoff } }));
         return 'complete';
       }

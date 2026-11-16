@@ -102,11 +102,11 @@ function ownedActionsFor(f: ReturnType<typeof recoveryFixture>) {
   const step = { state: 'not_started' as const, deadline_unix_ms: null, reason_code: null };
   const state: CampaignState = { ...newCampaignState(id, run), status: 'cleaning', fencingToken: 2,
     runInventory: { schema_version: 1, campaign_id: id, owner_id: f.record.workload.namespaceOwner, fencing_token: 1,
-      orchestration_run_id: id, cell_run_id: run,
+      orchestration_run_id: id, cell_run_id: run, load_admission: 'authorized',
       namespace: { name: f.record.workload.namespace, uid: f.record.workload.namespaceUid, owner_token: f.record.workload.namespaceOwner },
       resources: [], fic: null, qap: { database: f.c.experimentDatabase, bindings: f.record.manifest.tables,
         state: 'observed', absence: [] },
-      cleanup: { stop_admission: step, bounded_drain: step, evidence_capture: step, terminal_capture: step, handoff: step } } };
+      cleanup: { stop_admission: step, bounded_drain: step, evidence_capture: step, stop_maintenance: step, terminal_capture: step, handoff: step } } };
   const store: CampaignStore = { read: async () => ({ state: structuredClone(state), etag: '"1"' }),
     write: async () => { throw new Error('Unexpected campaign write by provider actions'); } };
   const authority = { campaignId: id, ownerId: run, fencingToken: 2, assertCurrent: async () => {} };
@@ -219,6 +219,10 @@ for (const restart of [false, true]) test(`fenced QAP cleanup ${restart ? 'recov
   await assert.rejects(cleanup_oat_qap(f.azure, recordPath, stopPath, authority), /stale cleanup actor/);
   assert.equal(mutations, 0);
   fenced = false;
+  await assert.rejects(recover_oat_qap_record(f.azure, f.reference, path.join(f.directory, 'producer.json'),
+    { ...authority, mode: 'producer' }), /requires current controller authority/);
+  assert.equal(fs.existsSync(path.join(f.directory, 'producer.json')), false);
+  assert.equal(mutations, 0);
   if (restart) {
     const blob = f.azure.blob.bind(f.azure);
     let crash = true;
@@ -233,6 +237,8 @@ for (const restart of [false, true]) test(`fenced QAP cleanup ${restart ? 'recov
     assert.equal(shared.custody.intent, null);
     assert.equal(shared.custody.entries[0].state, 'dropped');
     const resumedPath = path.join(f.directory, 'another-host.json');
+    await assert.rejects(recover_oat_qap_record(f.azure, f.reference, resumedPath,
+      { ...authority, mode: 'producer' }), /mutation outcome is unresolved/);
     await assert.rejects(recover_oat_qap_record(f.azure, f.reference, resumedPath), /mutation outcome is unresolved/);
     await recover_oat_qap_record(f.azure, f.reference, resumedPath, authority);
     const invalid = structuredClone(shared.custody);

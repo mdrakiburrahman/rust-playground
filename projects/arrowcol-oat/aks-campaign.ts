@@ -1,25 +1,47 @@
 import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import type { RunFicPlan } from '../../infra/azure/run_fic.js';
+import type { OatQapReference } from '../../infra/azure/oat_qap.js';
 export const HEARTBEAT_INTERVAL_MS = 60_000;
 export const MISSED_HEARTBEAT_LIMIT = 3;
 export const MAX_CAMPAIGN_LIFETIME_MS = 6 * 60 * 60 * 1000;
 const MAX_ARM_OPERATIONS = 128;
 export const CUSTODY_CLEANUP_STEPS = ["stop-admission", "bounded-drain", "preserve-evidence", "stop-maintenance", "record-terminal-state", "remove-run-namespace", "remove-run-qap", "remove-run-fic", "restore-safe-idle", "verify-safe-idle"] as const;
 export type CleanupStepName = typeof CUSTODY_CLEANUP_STEPS[number];
-export interface CleanupReceipt { step: CleanupStepName; idempotencyKey: string; status: "pending" | "running" | "complete"; }
+export const DRAIN_UNSETTLED_REASON = 'drain_deadline_expired_unsettled';
+export interface DrainExpiryReceipt {
+  schemaVersion: 1; campaignId: string; producerOwnerId: string; producerFencingToken: number;
+  actorOwnerId: string; actorFencingToken: number; orchestrationRunId: string; cellRunId: string; namespaceName: string; namespaceUid: string;
+  deadlineUnixMs: number; observedAtUnixMs: number; reason: typeof DRAIN_UNSETTLED_REASON; deltaRows: null; kustoRows: null;
+}
+export interface CleanupReceipt { step: CleanupStepName; idempotencyKey: string; status: "pending" | "running" | "complete" | "unsettled";
+  unsettled?: DrainExpiryReceipt; }
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const storageName = /^[a-z0-9]{3,24}$/;
 const containerName = /^[a-z0-9](?:[a-z0-9-]{1,61}[a-z0-9])?$/;
 export type CampaignMode = 'observe' | 'armed';
-export type CampaignStatus = 'active' | 'fenced' | 'cleaning' | 'complete';
+export type CampaignStatus = 'active' | 'fenced' | 'cleaning' | 'complete' | 'complete_unsettled';
 export type ArmOperationStatus = 'pending' | 'succeeded' | 'failed' | 'indeterminate';
-export interface ArmOperationReceipt { id: string; resourceId: string; operationUrl: string; submittedAtMs: number; status: ArmOperationStatus; lastCheckedAtMs?: number; }
+export type CleanupArmTarget =
+  { kind: 'aks-pool'; count: number; autoscale: boolean; minimum: number | null; maximum: number | null } |
+  { kind: 'kusto'; sku: 'Standard_E4ads_v5'; capacity: 2; minimum: 2; maximum: 4; autoStop: true };
+export interface ArmOperationReceipt { id: string; resourceId: string; operationUrl: string; submittedAtMs: number;
+  status: ArmOperationStatus; lastCheckedAtMs?: number; cleanupTarget?: CleanupArmTarget; }
+export function validCleanupArmTarget(value: unknown): value is CleanupArmTarget {
+  if (!record(value)) return false;
+  if (value.kind === 'aks-pool') return exactRecord(value, ['kind', 'count', 'autoscale', 'minimum', 'maximum']) &&
+    nonnegative(value.count) && typeof value.autoscale === 'boolean' &&
+    (value.autoscale ? value.count === 0 && value.minimum === 0 && value.maximum === 1 :
+      [2, 3].includes(Number(value.count)) && value.minimum === null && value.maximum === null);
+  return exactRecord(value, ['kind', 'sku', 'capacity', 'minimum', 'maximum', 'autoStop']) && value.kind === 'kusto' &&
+    value.sku === 'Standard_E4ads_v5' && value.capacity === 2 && value.minimum === 2 && value.maximum === 4 && value.autoStop === true;
+}
 export interface CampaignState {
   schemaVersion: 1; campaignId: string; ownerId: string; fencingToken: number; mode: CampaignMode; status: CampaignStatus;
   startedAtMs: number; heartbeatAtMs: number; heartbeatSequence: number; expiresAtMs: number; lastEvaluatedAtMs?: number;
   lastMissedHeartbeatCount?: number; fenceReason?: 'heartbeat-expired' | 'max-lifetime'; fencedAtMs?: number;
-  cleanupStatus: 'not-started' | 'pending' | 'running' | 'verified'; cleanupSteps: CleanupReceipt[];
+  cleanupStatus: 'not-started' | 'pending' | 'running' | 'verified' | 'verified_with_unsettled'; cleanupSteps: CleanupReceipt[];
   runInventory?: RunInventory; operations: ArmOperationReceipt[];
 }
 export interface StoredCampaign { state: CampaignState; etag: string; }
@@ -34,6 +56,14 @@ function nonempty(value: unknown): value is string { return typeof value === 'st
 function k8sName(value: unknown): value is string { return typeof value === 'string' && value.length <= 63 && /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(value); }
 function exactRecord(value: unknown, keys: string[]): value is Record<string, unknown> {
   return record(value) && Object.keys(value).length === keys.length && Object.keys(value).every(key => keys.includes(key));
+}
+function optionalRecord(value: unknown, required: string[], optional: string[]): value is Record<string, unknown> {
+  return record(value) && required.every(key => Object.hasOwn(value, key)) &&
+    Object.keys(value).every(key => required.includes(key) || optional.includes(key));
+}
+function sameFlatRecord(before: unknown, after: unknown): boolean {
+  return record(before) && record(after) && Object.keys(before).length === Object.keys(after).length &&
+    Object.entries(before).every(([key, value]) => after[key] === value);
 }
 export type RunInventoryResourceState = 'planned' | 'observed' | 'removed' | 'absent' | 'uncertain';
 export type InventoryResourceRole = 'collector' | 'client' | 'maintenance' | 'router';
@@ -59,11 +89,13 @@ export interface RunInventory {
   fencing_token: number;
   orchestration_run_id: string;
   cell_run_id: string;
+  load_admission: 'not_authorized' | 'authorization_pending' | 'authorized';
   namespace: { name: string; uid: string | null; owner_token: string };
   resources: RunInventoryResource[];
-  fic: { resource_id: string | null; name: string | null; state: RunInventoryResourceState; absence: InventoryFicAbsenceReceipt | null } | null;
-  qap: { database: string; bindings: Array<{ external_table: string; relative_path: string }>; state: RunInventoryResourceState; absence: InventoryQapAbsenceReceipt[] } | null;
-  cleanup: { stop_admission: InventoryStep; bounded_drain: InventoryStep; evidence_capture: InventoryStep;
+  fic: { resource_id: string | null; name: string | null; state: RunInventoryResourceState; absence: InventoryFicAbsenceReceipt | null; plan?: RunFicPlan | null } | null;
+  qap: { database: string; bindings: Array<{ external_table: string; relative_path: string }>; state: RunInventoryResourceState; absence: InventoryQapAbsenceReceipt[]; reference?: OatQapReference | null } | null;
+  evidence_destination?: { account: string; container: string; blob_prefix: string } | null;
+  cleanup: { stop_admission: InventoryStep; bounded_drain: InventoryStep; evidence_capture: InventoryStep; stop_maintenance: InventoryStep;
     terminal_capture: InventoryStep; handoff: InventoryStep };
 }
 function stateValue(value: unknown): value is RunInventoryResourceState { return ['planned', 'observed', 'removed', 'absent', 'uncertain'].includes(String(value)); }
@@ -78,24 +110,55 @@ function validStep(value: unknown): value is InventoryStep {
     (!['failed', 'uncertain'].includes(String(value.state)) || value.reason_code !== null);
 }
 function validateRunInventory(value: unknown, state: CampaignState): RunInventory {
-  const fields = ['schema_version', 'campaign_id', 'owner_id', 'fencing_token', 'orchestration_run_id', 'cell_run_id',
+  const fields = ['schema_version', 'campaign_id', 'owner_id', 'fencing_token', 'orchestration_run_id', 'cell_run_id', 'load_admission',
     'namespace', 'resources', 'fic', 'qap', 'cleanup'];
-  if (!exactRecord(value, fields) || value.schema_version !== 1 || value.campaign_id !== state.campaignId ||
+  if (!optionalRecord(value, fields, ['evidence_destination']) || value.schema_version !== 1 || value.campaign_id !== state.campaignId ||
       value.owner_id !== state.ownerId || value.fencing_token !== (state.status === 'active' ? state.fencingToken : state.runInventory?.fencing_token) || !nonnegative(value.fencing_token) || value.fencing_token === 0 ||
       !canonicalUuid(value.campaign_id) || !canonicalUuid(value.owner_id) || !canonicalUuid(value.orchestration_run_id) || !canonicalUuid(value.cell_run_id) ||
+      !['not_authorized', 'authorization_pending', 'authorized'].includes(String(value.load_admission)) ||
       !exactRecord(value.namespace, ['name', 'uid', 'owner_token']) || !k8sName(value.namespace.name) ||
       !String(value.namespace.name).endsWith('-' + value.cell_run_id.replace(/-/g, '')) ||
       !(value.namespace.uid === null || canonicalUuid(value.namespace.uid)) || !canonicalUuid(value.namespace.owner_token) ||
       value.namespace.owner_token !== state.ownerId || !Array.isArray(value.resources) || value.resources.length > 256 ||
-      !(value.fic === null || exactRecord(value.fic, ['resource_id', 'name', 'state', 'absence']) && ['planned', 'observed', 'removed', 'absent', 'uncertain'].includes(String(value.fic.state))) ||
-      !(value.qap === null || exactRecord(value.qap, ['database', 'bindings', 'state', 'absence']) && nonempty(value.qap.database) && Array.isArray(value.qap.bindings) && ['planned', 'observed', 'removed', 'absent', 'uncertain'].includes(String(value.qap.state)) && Array.isArray(value.qap.absence)) ||
-      !exactRecord(value.cleanup, ['stop_admission', 'bounded_drain', 'evidence_capture', 'terminal_capture', 'handoff']) ||
+      !(value.fic === null || optionalRecord(value.fic, ['resource_id', 'name', 'state', 'absence'], ['plan']) && ['planned', 'observed', 'removed', 'absent', 'uncertain'].includes(String(value.fic.state))) ||
+      !(value.qap === null || optionalRecord(value.qap, ['database', 'bindings', 'state', 'absence'], ['reference']) && nonempty(value.qap.database) && Array.isArray(value.qap.bindings) && ['planned', 'observed', 'removed', 'absent', 'uncertain'].includes(String(value.qap.state)) && Array.isArray(value.qap.absence)) ||
+      !exactRecord(value.cleanup, ['stop_admission', 'bounded_drain', 'evidence_capture', 'stop_maintenance', 'terminal_capture', 'handoff']) ||
       Object.values(value.cleanup).some(item => !validStep(item))) {
     throw new Error('RunInventory is malformed or fenced to another owner.');
   }
   const inventory = value as unknown as RunInventory;
+  if (state.status !== 'active' && state.runInventory && inventory.load_admission !== state.runInventory.load_admission)
+    throw new Error('Fenced cleanup cannot change the producer load-admission disposition.');
+  const safePath = (path: unknown): path is string => typeof path === 'string' && path.length > 0 && path.length <= 2048 &&
+    path.split('/').every(part => /^[A-Za-z0-9_.-]+$/.test(part) && part !== '.' && part !== '..');
+  if (inventory.evidence_destination) {
+    const destination = inventory.evidence_destination;
+    if (!exactRecord(destination, ['account', 'container', 'blob_prefix']) || !storageName.test(destination.account) ||
+        !containerName.test(destination.container) || !safePath(destination.blob_prefix))
+      throw new Error('RunInventory evidence destination must be an exact credential-free Blob prefix.');
+  } else if (inventory.evidence_destination !== undefined && inventory.evidence_destination !== null)
+    throw new Error('RunInventory evidence destination is malformed.');
   if (inventory.fic !== null) {
     const fic = inventory.fic;
+    if (fic.plan) {
+      const plan = fic.plan;
+      const safeHttps = (input: unknown, originOnly = false) => {
+        if (typeof input !== 'string') return false;
+        try { const url = new URL(input); return url.protocol === 'https:' && !url.username && !url.password &&
+          !url.search && !url.hash && (!originOnly || url.pathname === '/'); } catch { return false; }
+      };
+      if (!exactRecord(plan, ['version', 'runId', 'namespace', 'serviceAccount', 'identityId', 'resourceId', 'clientId',
+        'tenantId', 'aksId', 'server', 'credentialName', 'issuer', 'subject', 'audience']) || plan.version !== 1 ||
+          plan.runId !== inventory.cell_run_id || plan.namespace !== inventory.namespace.name || !k8sName(plan.serviceAccount) ||
+          plan.resourceId !== fic.resource_id || plan.credentialName !== fic.name ||
+          plan.credentialName !== 'arrowcol-run-' + inventory.cell_run_id ||
+          plan.resourceId !== plan.identityId + '/federatedIdentityCredentials/' + plan.credentialName ||
+          !canonicalUuid(plan.clientId) || !canonicalUuid(plan.tenantId) || !safeHttps(plan.server, true) || !safeHttps(plan.issuer) ||
+          !/^\/subscriptions\/[a-f0-9-]{36}\/resourceGroups\/[^/?#]+\/providers\/Microsoft\.ManagedIdentity\/userAssignedIdentities\/[^/?#]+$/i.test(plan.identityId) ||
+          !/^\/subscriptions\/[a-f0-9-]{36}\/resourceGroups\/[^/?#]+\/providers\/Microsoft\.ContainerService\/managedClusters\/[^/?#]+$/i.test(plan.aksId) ||
+          plan.subject !== `system:serviceaccount:${plan.namespace}:${plan.serviceAccount}` || plan.audience !== 'api://AzureADTokenExchange')
+        throw new Error('RunInventory FIC plan differs from its exact immutable run identity.');
+    } else if (fic.plan !== undefined && fic.plan !== null) throw new Error('RunInventory FIC plan is malformed.');
     if (!(fic.resource_id === null || nonempty(fic.resource_id)) || !(fic.name === null || k8sName(fic.name)) ||
         (fic.resource_id !== null || fic.state === 'observed' || fic.state === 'removed' || fic.state === 'absent') && (!fic.resource_id || !fic.name ||
           !fic.resource_id.toLowerCase().startsWith('/subscriptions/') ||
@@ -112,6 +175,16 @@ function validateRunInventory(value: unknown, state: CampaignState): RunInventor
   }
   if (inventory.qap !== null) {
     const qap = inventory.qap;
+    if (qap.reference) {
+      const reference = qap.reference;
+      if (!exactRecord(reference, ['schema_version', 'account', 'container', 'blob', 'run_id', 'nonce', 'manifest_sha256',
+        'namespace_uid', 'namespace_owner_token']) || reference.schema_version !== 1 ||
+          !storageName.test(reference.account) || !containerName.test(reference.container) || !safePath(reference.blob) ||
+          reference.run_id !== inventory.cell_run_id || !canonicalUuid(reference.nonce) ||
+          !/^[a-f0-9]{64}$/.test(reference.manifest_sha256) || reference.namespace_uid !== inventory.namespace.uid ||
+          reference.namespace_owner_token !== inventory.namespace.owner_token)
+        throw new Error('RunInventory QAP reference differs from its original namespace/run.');
+    } else if (qap.reference !== undefined && qap.reference !== null) throw new Error('RunInventory QAP reference is malformed.');
     const safeIdentifier = (item: string) => /^[a-zA-Z0-9_-]+$/.test(item);
     if (!safeIdentifier(qap.database)) throw new Error('RunInventory QAP database is malformed.');
     const bindingKeys = new Set<string>();
@@ -163,9 +236,11 @@ function validateRunInventory(value: unknown, state: CampaignState): RunInventor
     if (resourceKeys.has(key)) throw new Error('RunInventory contains duplicate resource identities.');
     resourceKeys.add(key);
   }
-  for (const name of ['stop_admission', 'bounded_drain'] as const) {
+  for (const name of ['stop_admission', 'bounded_drain', 'stop_maintenance'] as const) {
     const step = inventory.cleanup[name];
-    if (step.state === 'running' && step.deadline_unix_ms === null) throw new Error('Running RunInventory admission and drain steps require a deadline.');
+    if (step.state === 'running' && (step.deadline_unix_ms === null ||
+        name === 'stop_maintenance' && step.deadline_unix_ms <= state.startedAtMs))
+      throw new Error('Running RunInventory admission, drain and maintenance steps require an absolute deadline.');
   }
   if (inventory.cleanup.handoff.state === 'complete' &&
       (Object.entries(inventory.cleanup).some(([key, item]) => key !== 'handoff' && item.state !== 'complete') ||
@@ -186,18 +261,31 @@ function mergeStep(before: InventoryStep, after: InventoryStep): InventoryStep {
     reason_code: after.reason_code ?? (after.state === before.state ? before.reason_code : null) };
 }
 function mergeRunInventory(before: RunInventory | undefined, after: RunInventory): RunInventory {
-  if (!before) return after;
+  const initial = () => {
+    if (after.load_admission !== 'not_authorized' || after.namespace.uid !== null ||
+        after.resources.some(resource => resource.state !== 'planned' || resource.uid !== null || resource.absence !== null) ||
+        after.fic && after.fic.state !== 'planned' || after.qap && after.qap.state !== 'planned' ||
+        Object.values(after.cleanup).some(step => step.state !== 'not_started'))
+      throw new Error('Initial RunInventory must positively record not_authorized before external provisioning.');
+    return after;
+  };
+  if (!before) return initial();
   const sameCell = before.campaign_id === after.campaign_id && before.owner_id === after.owner_id &&
     before.fencing_token === after.fencing_token && before.orchestration_run_id === after.orchestration_run_id &&
     before.cell_run_id === after.cell_run_id;
   if (!sameCell) {
     if (before.cleanup.handoff.state !== 'complete') throw new Error('An unresolved RunInventory already owns the campaign.');
-    return after;
+    return initial();
   }
+  const admission = ['not_authorized', 'authorization_pending', 'authorized'];
+  const from = admission.indexOf(before.load_admission), to = admission.indexOf(after.load_admission);
+  if (to < from || to > from + 1) throw new Error('RunInventory load admission must advance monotonically through authorization_pending.');
   if (before.namespace.name !== after.namespace.name || before.namespace.owner_token !== after.namespace.owner_token ||
       before.namespace.uid && after.namespace.uid && before.namespace.uid !== after.namespace.uid) {
     throw new Error('RunInventory immutable ownership fields changed.');
   }
+  if (before.evidence_destination && !sameFlatRecord(before.evidence_destination, after.evidence_destination))
+    throw new Error('RunInventory evidence destination is immutable.');
   const resources = new Map(before.resources.map(resource => [[resource.api_version, resource.kind, resource.name].join('|'), resource]));
   for (const next of after.resources) {
     const key = [next.api_version, next.kind, next.name].join('|');
@@ -212,6 +300,7 @@ function mergeRunInventory(before: RunInventory | undefined, after: RunInventory
     if (!before.fic) return after.fic;
     if (!after.fic || before.fic.name && after.fic.name !== before.fic.name ||
         before.fic.resource_id && after.fic.resource_id !== before.fic.resource_id ||
+        before.fic.plan && !sameFlatRecord(before.fic.plan, after.fic.plan) ||
         before.fic.absence && JSON.stringify(before.fic.absence) !== JSON.stringify(after.fic.absence)) throw new Error('RunInventory FIC identity changed.');
     return { ...before.fic, ...after.fic, name: before.fic.name ?? after.fic.name,
       resource_id: before.fic.resource_id ?? after.fic.resource_id, absence: before.fic.absence ?? after.fic.absence,
@@ -223,6 +312,9 @@ function mergeRunInventory(before: RunInventory | undefined, after: RunInventory
       !after.qap!.bindings.some(next => next.external_table === old.external_table && next.relative_path === old.relative_path))) {
       throw new Error('RunInventory QAP identity changed.');
     }
+    if (before.qap.reference && (!sameFlatRecord(before.qap.reference, after.qap.reference) ||
+        before.qap.bindings.length !== after.qap.bindings.length))
+      throw new Error('RunInventory QAP reference is immutable with its exact planned bindings.');
     const absence = new Map(after.qap.absence.map(receipt => [receipt.external_table + '|' + receipt.relative_path, receipt]));
     for (const receipt of before.qap.absence) {
       const next = absence.get(receipt.external_table + '|' + receipt.relative_path);
@@ -248,6 +340,32 @@ function httpsManagementUrl(value: string, subscriptionId: string): string {
   return parsed.toString();
 }
 
+export function hasVerifiedUnsettledDrain(state: CampaignState): boolean {
+  const receipt = state.cleanupSteps.find(step => step.status === 'unsettled');
+  if (!receipt) return false;
+  const proof = receipt.unsettled, inventory = state.runInventory, drain = inventory?.cleanup.bounded_drain;
+  if (receipt.step !== 'bounded-drain' || !proof || !inventory || !drain ||
+      !exactRecord(proof, ['schemaVersion', 'campaignId', 'producerOwnerId', 'producerFencingToken', 'actorOwnerId',
+        'actorFencingToken', 'orchestrationRunId', 'cellRunId', 'namespaceName', 'namespaceUid', 'deadlineUnixMs', 'observedAtUnixMs', 'reason', 'deltaRows', 'kustoRows']) ||
+      !['cleaning', 'complete_unsettled'].includes(state.status) || state.mode !== 'armed' || proof.schemaVersion !== 1 ||
+      proof.campaignId !== state.campaignId || proof.producerOwnerId !== inventory.owner_id ||
+      proof.producerFencingToken !== inventory.fencing_token || proof.actorOwnerId !== state.ownerId ||
+      proof.actorFencingToken !== state.fencingToken || inventory.fencing_token >= state.fencingToken ||
+      proof.orchestrationRunId !== inventory.orchestration_run_id || proof.cellRunId !== inventory.cell_run_id ||
+      proof.namespaceName !== inventory.namespace.name || !inventory.namespace.uid || proof.namespaceUid !== inventory.namespace.uid ||
+      proof.deadlineUnixMs !== drain.deadline_unix_ms || !nonnegative(proof.deadlineUnixMs) ||
+      proof.deadlineUnixMs <= state.startedAtMs || !nonnegative(proof.observedAtUnixMs) ||
+      proof.observedAtUnixMs < proof.deadlineUnixMs || proof.observedAtUnixMs > Date.now() ||
+      proof.observedAtUnixMs < (state.fencedAtMs ?? Infinity) ||
+      !['failed', 'uncertain'].includes(drain.state) || drain.reason_code !== DRAIN_UNSETTLED_REASON ||
+      proof.reason !== DRAIN_UNSETTLED_REASON || proof.deltaRows !== null || proof.kustoRows !== null ||
+      inventory.cleanup.stop_admission.state !== 'complete' ||
+      state.cleanupSteps[0]?.step !== 'stop-admission' || state.cleanupSteps[0].status !== 'complete' ||
+      state.cleanupSteps.filter(step => step.status === 'unsettled').length !== 1)
+    throw new Error('Terminal unsettled drain lacks exact current controller, immutable origin or expired-deadline proof.');
+  return true;
+}
+
 export function validateCampaignState(value: unknown): CampaignState {
   if (!record(value) || Object.keys(value).some(key => ![
     'schemaVersion', 'campaignId', 'ownerId', 'fencingToken', 'mode', 'status', 'startedAtMs', 'heartbeatAtMs',
@@ -257,11 +375,11 @@ export function validateCampaignState(value: unknown): CampaignState {
   const state = value as unknown as CampaignState;
   if (state.schemaVersion !== 1 || !uuid.test(state.campaignId) || !uuid.test(state.ownerId) ||
       !Number.isSafeInteger(state.fencingToken) || state.fencingToken < 1 ||
-      !['observe', 'armed'].includes(state.mode) || !['active', 'fenced', 'cleaning', 'complete'].includes(state.status) ||
+      !['observe', 'armed'].includes(state.mode) || !['active', 'fenced', 'cleaning', 'complete', 'complete_unsettled'].includes(state.status) ||
       !nonnegative(state.startedAtMs) || !nonnegative(state.heartbeatAtMs) || state.heartbeatAtMs < state.startedAtMs ||
       !Number.isSafeInteger(state.heartbeatSequence) || state.heartbeatSequence < 0 ||
       state.expiresAtMs !== state.startedAtMs + MAX_CAMPAIGN_LIFETIME_MS ||
-      !['not-started', 'pending', 'running', 'verified'].includes(state.cleanupStatus) ||
+      !['not-started', 'pending', 'running', 'verified', 'verified_with_unsettled'].includes(state.cleanupStatus) ||
       !Array.isArray(state.operations) || state.operations.length > MAX_ARM_OPERATIONS || !Array.isArray(state.cleanupSteps))  {
     throw new Error('Campaign state is malformed or violates the fixed custody limits.');
   }
@@ -274,7 +392,9 @@ export function validateCampaignState(value: unknown): CampaignState {
   const expectedCleanupSteps = state.status === "active" ? [] : [...CUSTODY_CLEANUP_STEPS];
   if (state.cleanupSteps.length !== expectedCleanupSteps.length || state.cleanupSteps.some((receipt, index) => !record(receipt) ||
       receipt.step !== expectedCleanupSteps[index] || receipt.idempotencyKey !== state.campaignId + ":" + state.fencingToken + ":" + receipt.step ||
-      !["pending", "running", "complete"].includes(receipt.status))) throw new Error("Campaign cleanup receipts are malformed.");
+      !["pending", "running", "complete", "unsettled"].includes(receipt.status) ||
+      !exactRecord(receipt, receipt.status === 'unsettled' ? ['step', 'idempotencyKey', 'status', 'unsettled'] :
+        ['step', 'idempotencyKey', 'status']))) throw new Error("Campaign cleanup receipts are malformed.");
   if (state.status === "active" && state.cleanupStatus !== "not-started" || state.status === "fenced" && state.cleanupStatus !== "pending" ||
       state.status === "cleaning" && state.cleanupStatus !== "running" || state.status === "complete" &&
       (state.cleanupStatus !== "verified" || state.cleanupSteps.some(receipt => receipt.status !== "complete"))) {
@@ -283,21 +403,21 @@ export function validateCampaignState(value: unknown): CampaignState {
   let unfinishedCleanup = false;
   let runningCleanup = false;
   for (const receipt of state.cleanupSteps) {
-    if (receipt.status === 'complete' && unfinishedCleanup) throw new Error('Campaign cleanup receipts are out of order.');
+    if (['complete', 'unsettled'].includes(receipt.status) && unfinishedCleanup) throw new Error('Campaign cleanup receipts are out of order.');
     if (receipt.status === 'running') {
       if (runningCleanup) throw new Error('Campaign has multiple running cleanup receipts.');
       runningCleanup = true;
     }
-    if (receipt.status !== 'complete') unfinishedCleanup = true;
+    if (!['complete', 'unsettled'].includes(receipt.status)) unfinishedCleanup = true;
   }
   if (state.runInventory !== undefined) {
     validateRunInventory(state.runInventory, state);
     if (state.status === 'active' && state.runInventory.fencing_token !== state.fencingToken ||
-        ['fenced', 'cleaning', 'complete'].includes(state.status) && state.runInventory.fencing_token >= state.fencingToken) {
+        state.status !== 'active' && state.runInventory.fencing_token >= state.fencingToken) {
       throw new Error('RunInventory producer fencing identity does not match the campaign lifecycle.');
     }
   }
-  if (state.mode === 'armed' && !state.runInventory || ['fenced', 'cleaning', 'complete'].includes(state.status) && !state.runInventory) {
+  if (state.mode === 'armed' && !state.runInventory || state.status !== 'active' && !state.runInventory) {
     throw new Error('Campaign cannot be armed or fenced without a persisted RunInventory.');
   }
   const ids = new Set<string>();
@@ -306,7 +426,8 @@ export function validateCampaignState(value: unknown): CampaignState {
         typeof operation.resourceId !== 'string' || !operation.resourceId.startsWith(`/subscriptions/`) ||
         typeof operation.operationUrl !== 'string' || !nonnegative(operation.submittedAtMs) ||
         !['pending', 'succeeded', 'failed', 'indeterminate'].includes(operation.status) ||
-        operation.lastCheckedAtMs !== undefined && !nonnegative(operation.lastCheckedAtMs)) {
+        operation.lastCheckedAtMs !== undefined && !nonnegative(operation.lastCheckedAtMs) ||
+        operation.cleanupTarget !== undefined && !validCleanupArmTarget(operation.cleanupTarget)) {
       throw new Error('ARM operation receipt is malformed.');
     }
     const operationSubscription = /^\/subscriptions\/([0-9a-f-]{36})\//i.exec(operation.resourceId)?.[1];
@@ -315,10 +436,25 @@ export function validateCampaignState(value: unknown): CampaignState {
     ids.add(operation.id);
   }
   if (state.status === 'active' && state.fenceReason !== undefined ||
-      ['fenced', 'cleaning', 'complete'].includes(state.status) && (!state.fenceReason || state.fencedAtMs === undefined || state.fencingToken < 2)) {
+      state.status !== 'active' && (!state.fenceReason || state.fencedAtMs === undefined || state.fencingToken < 2)) {
     throw new Error('Campaign terminal state is missing its fencing receipt.');
   }
   if (state.status === 'complete' && state.cleanupStatus !== 'verified') throw new Error('Campaign cannot complete before cleanup verification.');
+  const unsettled = hasVerifiedUnsettledDrain(state);
+  if (state.status === 'complete_unsettled') {
+    const inventory = state.runInventory!;
+    if (!unsettled || state.cleanupStatus !== 'verified_with_unsettled' ||
+        state.cleanupSteps.some(step => !['complete', 'unsettled'].includes(step.status)) ||
+        inventory.cleanup.handoff.state !== 'failed' || inventory.cleanup.handoff.reason_code !== DRAIN_UNSETTLED_REASON ||
+        Object.entries(inventory.cleanup).some(([name, step]) => !['bounded_drain', 'handoff'].includes(name) && step.state !== 'complete') ||
+        inventory.resources.some(resource => !['removed', 'absent'].includes(resource.state)) ||
+        inventory.fic && !['removed', 'absent'].includes(inventory.fic.state) ||
+        inventory.qap && !['removed', 'absent'].includes(inventory.qap.state))
+      throw new Error('Unsettled campaign cannot finalize without failed-cell evidence and every other cleanup/safe-idle proof.');
+  } else if (state.cleanupStatus === 'verified_with_unsettled') throw new Error('Unsettled verification requires its distinct terminal campaign state.');
+  if (['complete', 'complete_unsettled'].includes(state.status) &&
+      state.operations.some(operation => ['pending', 'indeterminate'].includes(operation.status)))
+    throw new Error('Campaign cannot finalize while ARM operations remain unresolved.');
   return state;
 }
 
@@ -346,6 +482,13 @@ export function assertCampaignEnvironment(env: NodeJS.ProcessEnv, state: Campaig
 }
 export class CampaignConflictError extends Error {
   constructor() { super('Campaign state changed concurrently; retry using a fresh read.'); this.name = 'CampaignConflictError'; }
+}
+export function cleanupFailureCode(error: unknown): 'stale_version' | 'write_outcome_unknown' | 'campaign_fenced' | 'invalid_or_storage_error' {
+  if (error instanceof CampaignWriteOutcomeUnknownError) return 'write_outcome_unknown';
+  if (error instanceof CampaignConflictError) return 'stale_version';
+  if (error instanceof CampaignFencedError || error instanceof Error && /fenced|stale|heartbeat is expired/i.test(error.message))
+    return 'campaign_fenced';
+  return 'invalid_or_storage_error';
 }
 export interface CampaignStoreConfig { account: string; container: string; subscriptionId: string }
 
@@ -431,7 +574,7 @@ function requireOwner(state: CampaignState | undefined, ownerId: string, fencing
 }
 export async function startCampaign(store: CampaignStore, campaignId: string, ownerId = campaignId, now = Date.now()): Promise<StoredCampaign> {
   return mutateCampaign(store, current => {
-    if (current && current.status !== 'complete') throw new Error('An unfinished campaign still owns the stamp.');
+    if (current && !['complete', 'complete_unsettled'].includes(current.status)) throw new Error('An unfinished campaign still owns the stamp.');
     return newCampaignState(campaignId, ownerId, now);
   });
 }
@@ -440,6 +583,27 @@ export class CampaignFencedError extends Error {
 }
 export class CampaignWriteOutcomeUnknownError extends Error {
   constructor() { super('RunInventory write outcome could not be confirmed by a strong readback.'); this.name = 'CampaignWriteOutcomeUnknownError'; }
+}
+export async function compareAndSwapRunInventory(store: CampaignStore, expected: StoredCampaign,
+  value: RunInventory, assertCurrent: () => Promise<void>): Promise<StoredCampaign> {
+  await assertCurrent();
+  const current = await store.read();
+  if (!current || current.etag !== expected.etag || JSON.stringify(current.state.runInventory) !== JSON.stringify(expected.state.runInventory))
+    throw new CampaignConflictError();
+  const merged = mergeRunInventory(current.state.runInventory, validateRunInventory(value, current.state));
+  const next = validateCampaignState({ ...current.state, runInventory: merged });
+  let etag: string;
+  try { etag = await store.write(next, current.etag); }
+  catch (error) {
+    if (error instanceof CampaignConflictError) throw error;
+    throw new CampaignWriteOutcomeUnknownError();
+  }
+  let confirmed: StoredCampaign | undefined;
+  try { confirmed = await store.read(); } catch { throw new CampaignWriteOutcomeUnknownError(); }
+  if (!etag || !confirmed || confirmed.etag !== etag || JSON.stringify(confirmed.state) !== JSON.stringify(next))
+    throw new CampaignWriteOutcomeUnknownError();
+  await assertCurrent();
+  return confirmed;
 }
 
 async function writeInventoryWithReadback(store: CampaignStore, current: StoredCampaign, nextState: CampaignState,
@@ -456,7 +620,7 @@ async function writeInventoryWithReadback(store: CampaignStore, current: StoredC
   }
 }
 function runInventoryReady(inventory: RunInventory | undefined): inventory is RunInventory {
-  return Boolean(inventory && inventory.namespace.uid && inventory.resources.length > 0 &&
+  return Boolean(inventory && inventory.load_admission === 'authorized' && inventory.namespace.uid && inventory.resources.length > 0 &&
     inventory.resources.every(resource => resource.state === 'observed' && resource.uid) &&
     inventory.fic !== null && inventory.fic.state === 'observed' && inventory.qap !== null && inventory.qap.state === 'observed' && inventory.qap.bindings.length > 0 &&
     inventory.cleanup.handoff.state !== 'complete');
@@ -536,8 +700,11 @@ export async function armCampaign(store: CampaignStore, ownerId: string, fencing
 export async function setCleanupVerified(store: CampaignStore, ownerId: string, fencingToken: number): Promise<StoredCampaign> {
   return mutateCampaign(store, current => {
     if (!current || current.status !== 'cleaning' || current.ownerId !== ownerId || current.fencingToken !== fencingToken ||
-        current.cleanupStatus !== 'running' || current.cleanupSteps.some(step => step.status !== 'complete')) throw new Error('Cleanup verification requires the fenced owner and a running cleanup.');
-    return { ...current, status: 'complete', cleanupStatus: 'verified' };
+        current.cleanupStatus !== 'running' || current.cleanupSteps.some(step => !['complete', 'unsettled'].includes(step.status)))
+      throw new Error('Cleanup verification requires the fenced owner and a running cleanup.');
+    const unsettled = hasVerifiedUnsettledDrain(current);
+    return { ...current, status: unsettled ? 'complete_unsettled' : 'complete',
+      cleanupStatus: unsettled ? 'verified_with_unsettled' : 'verified' };
   });
 }
 export async function recordArmOperation(store: CampaignStore, ownerId: string, fencingToken: number,
@@ -553,6 +720,20 @@ export async function recordArmOperation(store: CampaignStore, ownerId: string, 
       throw new Error('ARM operation receipt is invalid, duplicate, out of scope or exceeds the receipt bound.');
     }
     return { ...state, operations: [...state.operations, { ...operation, operationUrl, status: 'pending' }] };
+  });
+}
+
+export async function recordCleanupArmOperation(store: CampaignStore, ownerId: string, fencingToken: number,
+  operation: Omit<ArmOperationReceipt, 'status'> & { cleanupTarget: CleanupArmTarget }, subscriptionId: string): Promise<StoredCampaign> {
+  const operationUrl = httpsManagementUrl(operation.operationUrl, subscriptionId);
+  return mutateCampaign(store, current => {
+    if (!current || current.status !== 'cleaning' || current.ownerId !== ownerId || current.fencingToken !== fencingToken ||
+        !validCleanupArmTarget(operation.cleanupTarget) || current.operations.some(existing => existing.id === operation.id) ||
+        current.operations.length >= MAX_ARM_OPERATIONS ||
+        !operation.resourceId.toLowerCase().startsWith(`/subscriptions/${subscriptionId.toLowerCase()}/`) ||
+        new URL(operationUrl).pathname.toLowerCase() !== operation.resourceId.toLowerCase())
+      throw new CampaignFencedError('Cleanup ARM intent requires current cleaning authority and an exact resource URL.');
+    return { ...current, operations: [...current.operations, { ...operation, operationUrl, status: 'pending' }] };
   });
 }
 
@@ -607,17 +788,61 @@ async function main(args: string[]): Promise<void> {
       cell_run_id: state.runInventory!.cell_run_id, namespace_uid: state.runInventory!.namespace.uid } }));
   } else if (action === 'status' && args.length === 1) {
     console.log(JSON.stringify((await store.read())?.state ?? { status: 'idle' }));
+  } else if (action === 'read-inventory' && args.length === 1) {
+    const { readCellRunInventory } = await import('./aks-cell-cleanup.js');
+    console.log(JSON.stringify(await readCellRunInventory(store, await readRunInventoryStdin(), process.env)));
+  } else if (action === 'capture-cell-baseline' && args.length === 1) {
+    const current = await store.read();
+    if (!current) throw new CampaignFencedError();
+    assertCampaignEnvironment(process.env, current.state);
+    const { Azure, Config } = await import('../../infra/azure/bootstrap.js');
+    const { captureCellBaseline } = await import('./aks-data-safety.js');
+    const azure = new Azure(new Config({ AZURE_SUBSCRIPTION_ID: subscriptionId }));
+    if (process.env.CAMPAIGN_STORAGE_ACCOUNT !== azure.c.account || process.env.CAMPAIGN_STATE_CONTAINER !== azure.c.checkpoints)
+      throw new Error('Baseline custody must use the exact selected stamp checkpoints account/container.');
+    const input = await readRunInventoryStdin(), log = console.log;
+    let receipt: import('./aks-data-safety.js').CellBaselineReceipt;
+    try {
+      console.log = (...values: unknown[]) => console.error(...values);
+      receipt = await captureCellBaseline(store, azure, input);
+    } finally { console.log = log; }
+    console.log(JSON.stringify({ ok: true, receipt }));
+  } else if (action === 'cleanup-step' && args.length === 2) {
+    const cell = await import('./aks-cell-cleanup.js');
+    if (!Object.hasOwn(cell.CELL_CLEANUP_SELECTORS, args[1]!)) throw new Error('Unknown cleanup-step selector.');
+    const input = cell.parseCellCleanupEnvelope(await readRunInventoryStdin());
+    await cell.readCellRunInventory(store, { schema_version: 1, campaign_id: input.inventory.campaign_id,
+      orchestration_run_id: input.inventory.orchestration_run_id, cell_run_id: input.inventory.cell_run_id, actor: input.actor }, process.env);
+    const { Azure, Config } = await import('../../infra/azure/bootstrap.js');
+    const { createDefaultCleanupProviders, createDefaultCellCleanupProviders } = await import('./aks-default-providers.js');
+    const fs = await import('node:fs'), os = await import('node:os');
+    const azure = new Azure(new Config({ AZURE_SUBSCRIPTION_ID: subscriptionId }));
+    if (process.env.CAMPAIGN_STORAGE_ACCOUNT !== azure.c.account || process.env.CAMPAIGN_STATE_CONTAINER !== azure.c.checkpoints)
+      throw new Error('Cleanup custody must use the exact selected stamp checkpoints account/container.');
+    const workDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'oat-cell-cleanup-'));
+    const actions = createDefaultCleanupProviders(store, { azure, workDirectory });
+    const providers = createDefaultCellCleanupProviders(actions);
+    const log = console.log;
+    let receipt: import('./aks-cell-cleanup.js').CellCleanupReceipt;
+    try {
+      console.log = (...values: unknown[]) => console.error(...values);
+      receipt = await cell.executeCellCleanupStep(store, input, args[1] as import('./aks-cell-cleanup.js').CellCleanupSelector,
+        providers, assertCurrent => cell.createBlobCellStepJournal(azure, input, assertCurrent));
+    } finally {
+      console.log = log;
+      fs.rmSync(workDirectory, { recursive: true });
+    }
+    console.log(JSON.stringify({ ok: true, receipt }));
   } else {
-    throw new Error('Usage: aks-campaign.ts start <campaign-uuid> [owner-uuid] | heartbeat <owner-uuid> <fencing-token> | arm <owner-uuid> <fencing-token> | publish-inventory (JSON stdin) | assert-ready <owner-uuid> <fencing-token> | status');
+    throw new Error('Usage: aks-campaign.ts start <campaign-uuid> [owner-uuid] | heartbeat <owner-uuid> <fencing-token> | arm <owner-uuid> <fencing-token> | publish-inventory (JSON stdin) | assert-ready <owner-uuid> <fencing-token> | read-inventory (JSON envelope stdin) | cleanup-step <selector> (JSON envelope stdin) | status');
   }
 }
 if (process.argv[1] && ['aks-campaign.ts', 'aks-campaign.js'].includes(path.basename(process.argv[1])) && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main(process.argv.slice(2)).catch((error: unknown) => {
     const action = process.argv[2];
-    if (action === 'publish-inventory' || action === 'assert-ready') {
+    if (action === 'publish-inventory' || action === 'assert-ready' || action === 'cleanup-step' || action === 'read-inventory' || action === 'capture-cell-baseline') {
       const message = error instanceof Error ? error.message : 'Campaign custody failed.';
-      const code = error instanceof CampaignWriteOutcomeUnknownError ? 'write_outcome_unknown' :
-        error instanceof CampaignFencedError || /fenced|stale|heartbeat is expired/i.test(message) ? 'campaign_fenced' : 'invalid_or_storage_error';
+      const code = cleanupFailureCode(error);
       console.log(JSON.stringify({ ok: false, code, message }));
     } else console.error(error instanceof Error ? error.message : 'Campaign custody failed');
     process.exitCode = 1;

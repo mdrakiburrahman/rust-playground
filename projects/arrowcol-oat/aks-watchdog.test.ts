@@ -27,22 +27,29 @@ const inventoryFor = (state: CampaignState): RunInventory => {
   const step = { state: 'not_started' as const, deadline_unix_ms: null, reason_code: null };
   return {
     schema_version: 1, campaign_id: campaignId, owner_id: ownerId, fencing_token: state.fencingToken,
-    orchestration_run_id: 'c0ffee00-0000-4000-8000-000000000005', cell_run_id: cellRunId,
+    orchestration_run_id: 'c0ffee00-0000-4000-8000-000000000005', cell_run_id: cellRunId, load_admission: 'authorized',
     namespace: { name: namespace, uid: 'c0ffee00-0000-4000-8000-000000000009', owner_token: ownerId },
     resources: [{ api_version: 'apps/v1', kind: 'Deployment', namespace, name: 'arrowcol',
       uid: 'c0ffee00-0000-4000-8000-000000000006', absence: null, role: 'collector', state: 'observed' }],
     fic: { resource_id: '/subscriptions/' + subscriptionId + '/resourceGroups/perf69/providers/Microsoft.ManagedIdentity/userAssignedIdentities/arrow-collector/federatedIdentityCredentials/arrowcol-run-' + cellRunId,
       name: 'arrowcol-run-' + cellRunId, state: 'observed', absence: null },
     qap: { database: 'perf69-qap', bindings: [{ external_table: 'arrowcol_data', relative_path: 'perf69/' + cellRunId }], state: 'observed', absence: [] },
-    cleanup: { stop_admission: { ...step }, bounded_drain: { ...step }, evidence_capture: { ...step }, terminal_capture: { ...step }, handoff: { ...step } },
+    cleanup: { stop_admission: { ...step }, bounded_drain: { ...step }, evidence_capture: { ...step }, stop_maintenance: { ...step }, terminal_capture: { ...step }, handoff: { ...step } },
   };
 };
 async function armedStore(): Promise<MemoryStore> {
   const store = new MemoryStore();
   await startCampaign(store, campaignId, ownerId, 1_000_000);
   const state = (await store.read())!.state;
-  await publishRunInventory(store, inventoryFor(state), state.startedAtMs);
+  const observed = inventoryFor(state);
+  const planned: RunInventory = { ...observed, load_admission: 'not_authorized', namespace: { ...observed.namespace, uid: null },
+    resources: observed.resources.map(resource => ({ ...resource, uid: null, state: 'planned' })),
+    fic: { ...observed.fic!, state: 'planned' }, qap: { ...observed.qap!, state: 'planned' } };
+  await publishRunInventory(store, planned, state.startedAtMs);
   await armCampaign(store, ownerId, state.fencingToken, state.startedAtMs);
+  await publishRunInventory(store, { ...planned, load_admission: 'authorization_pending' }, state.startedAtMs);
+  await publishRunInventory(store, { ...planned, load_admission: 'authorized' }, state.startedAtMs);
+  await publishRunInventory(store, observed, state.startedAtMs);
   return store;
 }
 
@@ -112,4 +119,37 @@ test('external executor mutation authority rereads the current cleanup token ins
   await assert.rejects(reconcileCleanupOnce(store, createExternalCleanupExecutor(store, actions)), /fencing changed/);
   assert.equal(effects, 0);
   assert.equal(store.current!.state.runInventory!.fencing_token, 1);
+});
+
+test('maintenance stop persists a deadline and retains uncertainty without replaying or advancing to terminal capture', async () => {
+  const store = await armedStore(), inventory = (await store.read())!.state.runInventory!;
+  inventory.resources.push({ ...inventory.resources[0], name: 'delta-maintenance', role: 'maintenance',
+    uid: 'c0ffee00-0000-4000-8000-000000000008' });
+  await publishRunInventory(store, inventory, 1_000_000);
+  await reconcileOnce(store, 1_180_000);
+  for (let index = 0; index < 3; index++) await reconcileCleanupOnce(store, async () => 'complete');
+  let stops = 0, terminal = 0;
+  const complete = async () => 'complete' as const;
+  const actions: ExternalCleanupActions = { discoverExactInventory: async value => value,
+    stopAdmission: complete, boundedDrain: complete, preserveEvidence: complete,
+    stopMaintenanceIfUidAndOwnerMatch: async (_resource, _owner, _key, authority) => {
+      await authority.assertCurrent();
+      const step = store.current!.state.runInventory!.cleanup.stop_maintenance;
+      assert.equal(step.state, 'running');
+      assert.ok(step.deadline_unix_ms! > Date.now());
+      stops++;
+      return 'uncertain';
+    },
+    captureTerminalState: async () => { terminal++; return 'complete'; },
+    deleteNamespaceIfUidAndOwnerMatch: complete, deleteQapBindingIfOwned: complete, deleteFicIfExact: complete,
+    restoreSafeIdle: complete, verifySafeIdle: complete };
+  const executor = createExternalCleanupExecutor(store, actions);
+  assert.equal(await reconcileCleanupOnce(store, executor), 'pending');
+  const uncertain = structuredClone(store.current!.state.runInventory!.cleanup.stop_maintenance);
+  assert.equal(uncertain.state, 'uncertain');
+  assert.equal(uncertain.reason_code, 'action_outcome_uncertain');
+  assert.equal(await reconcileCleanupOnce(store, executor), 'pending');
+  assert.deepEqual(store.current!.state.runInventory!.cleanup.stop_maintenance, uncertain);
+  assert.equal(stops, 1);
+  assert.equal(terminal, 0);
 });
