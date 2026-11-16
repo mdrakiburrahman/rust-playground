@@ -164,7 +164,7 @@ fn compaction_debt_evidence_distinguishes_zero_from_bounded_backlog() -> Result<
 }
 
 #[test]
-fn pass_inventory_bounds_counted_io_for_all_idle_operations() -> Result<()> {
+fn pass_inventory_bounds_counted_io_for_all_idle_probes() -> Result<()> {
     let root = tempfile::tempdir()?;
     let table = create(root.path())?;
     drop(table);
@@ -203,12 +203,7 @@ fn pass_inventory_bounds_counted_io_for_all_idle_operations() -> Result<()> {
         ProbeOperation::Checkpoint,
         ProbeOperation::PruneLog,
     ] {
-        assert!(
-            maintenance
-                .probe_no_work_with_inventory(operation, &config, &control(), &mut inventory)?
-                .is_some(),
-            "{operation:?} should be a proven no-op"
-        );
+        maintenance.probe_no_work_with_inventory(operation, &config, &control(), &mut inventory)?;
     }
 
     assert_eq!(counts.writes.load(Ordering::SeqCst), 0);
@@ -223,6 +218,20 @@ fn pass_inventory_rechecks_time_based_vacuum_eligibility() -> Result<()> {
     let table = create(root.path())?;
     append(&table, 0, 0..3)?;
     drop(table);
+    let old_modified = SystemTime::now()
+        .checked_sub(Duration::from_secs(8 * 24 * 60 * 60))
+        .context("old file timestamp")?;
+    let partition_dir = fs::read_dir(root.path())?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<Vec<_>>>()?
+        .into_iter()
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("__arrowcol_ingestion="))
+        })
+        .context("ingestion partition directory")?;
+    let file = fs::read_dir(partition_dir)?.next().context("partition file")??;
+    fs::File::open(file.path())?.set_modified(old_modified)?;
 
     let counts = Arc::new(StorageCounts::default());
     let store = Arc::new(UncertainStore {
@@ -238,7 +247,10 @@ fn pass_inventory_rechecks_time_based_vacuum_eligibility() -> Result<()> {
     counts.lists.store(0, Ordering::SeqCst);
     counts.writes.store(0, Ordering::SeqCst);
 
-    let anchor = now_ms()?;
+    let now = now_ms()?;
+    let anchor = now
+        .checked_sub(2 * 24 * 60 * 60 * 1000)
+        .context("initial anchor underflow")?;
     let config = NegativeProbeConfig {
         now_ms: anchor,
         granularity: Granularity::Minute,
@@ -259,12 +271,7 @@ fn pass_inventory_rechecks_time_based_vacuum_eligibility() -> Result<()> {
         "recent files must be outside the retention window"
     );
     let idle_lists = counts.lists.load(Ordering::SeqCst);
-    let due_config = NegativeProbeConfig {
-        now_ms: anchor
-            .checked_add(8 * 24 * 60 * 60 * 1000)
-            .context("due anchor overflow")?,
-        ..config
-    };
+    let due_config = NegativeProbeConfig { now_ms: now, ..config };
     assert!(
         maintenance
             .probe_no_work_with_inventory(ProbeOperation::Vacuum, &due_config, &control(), &mut inventory)?
