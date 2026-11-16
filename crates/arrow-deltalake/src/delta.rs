@@ -3756,6 +3756,7 @@ impl DeltaTable {
                 .iter()
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect(),
+            stage_timings: FileStageTimings::default(),
         })
     }
 
@@ -3792,10 +3793,17 @@ impl DeltaTable {
     }
 
     pub(crate) fn commit_files(&self, files: &[StagedAppend]) -> Result<u64> {
+        self.commit_files_timed(files).map(|(version, _, _)| version)
+    }
+
+    pub(crate) fn commit_files_timed(
+        &self,
+        files: &[StagedAppend],
+    ) -> Result<(u64, Option<Duration>, Vec<(usize, crate::CompletedFileObservation)>)> {
         if files.is_empty() {
             bail!("cannot publish an empty Delta data commit");
         }
-        self.commit_files_inner(files, None, &[])
+        self.commit_files_inner_timed(files, None, &[])
     }
 
     pub(crate) fn commit_files_with_groups(
@@ -3803,10 +3811,19 @@ impl DeltaTable {
         files: &[StagedAppend],
         groups: &[CoalescedCommitGroup],
     ) -> Result<u64> {
+        self.commit_files_with_groups_timed(files, groups)
+            .map(|(version, _, _)| version)
+    }
+
+    pub(crate) fn commit_files_with_groups_timed(
+        &self,
+        files: &[StagedAppend],
+        groups: &[CoalescedCommitGroup],
+    ) -> Result<(u64, Option<Duration>, Vec<(usize, crate::CompletedFileObservation)>)> {
         if groups.is_empty() {
             bail!("coalesced Delta commit requires logical identities");
         }
-        self.commit_files_inner(files, None, groups)
+        self.commit_files_inner_timed(files, None, groups)
     }
 
     /// Publish a batch under one stable application transaction, including empty progress batches.
@@ -3824,9 +3841,19 @@ impl DeltaTable {
         identity: Option<(&str, i64)>,
         groups: &[CoalescedCommitGroup],
     ) -> Result<u64> {
-        let version = self.publish_files(files, identity, groups)?;
+        self.commit_files_inner_timed(files, identity, groups)
+            .map(|(version, _, _)| version)
+    }
+
+    fn commit_files_inner_timed(
+        &self,
+        files: &[StagedAppend],
+        identity: Option<(&str, i64)>,
+        groups: &[CoalescedCommitGroup],
+    ) -> Result<(u64, Option<Duration>, Vec<(usize, crate::CompletedFileObservation)>)> {
+        let (version, commit_duration, file_observations) = self.publish_files(files, identity, groups)?;
         self.reclaim_unsubmitted(files);
-        Ok(version)
+        Ok((version, commit_duration, file_observations))
     }
 
     /// After a successful publication call, delete staged files that no commit attempt
@@ -3885,7 +3912,7 @@ impl DeltaTable {
         files: &[StagedAppend],
         identity: Option<(&str, i64)>,
         groups: &[CoalescedCommitGroup],
-    ) -> Result<u64> {
+    ) -> Result<(u64, Option<Duration>, Vec<(usize, crate::CompletedFileObservation)>)> {
         let mut observation = crate::telemetry::PublicationObservation::start();
         let _guard = self
             .commit_lock
@@ -3906,7 +3933,7 @@ impl DeltaTable {
                 if previous == version {
                     self.sync_replayed_local_state(snapshot.version())?;
                     observation.finish("deduplicated");
-                    return Ok(snapshot.version());
+                    return Ok((snapshot.version(), None, Vec::new()));
                 }
             }
             let mut pending = Vec::new();
@@ -3995,7 +4022,7 @@ impl DeltaTable {
             if pending.is_empty() && group_transaction_ids.is_empty() && identity.is_none() {
                 self.sync_replayed_local_state(snapshot.version())?;
                 observation.finish("deduplicated");
-                return Ok(snapshot.version());
+                return Ok((snapshot.version(), None, Vec::new()));
             }
             // Claim before touching the file or any check that can stall, so a concurrent
             // reclaim of the same borrowed stage either already won (refused here) or
@@ -4146,6 +4173,11 @@ impl DeltaTable {
                 crate::telemetry::ambiguous_commit_reconciled(&table_id, table_name.as_deref(), started.elapsed());
                 Ok(Some(latest.version()))
             };
+            let committed_file_observations = pending
+                .iter()
+                .zip(&pending_indices)
+                .map(|(append, index)| (*index, append.observation()))
+                .collect();
             match transaction.commit(&self.engine) {
                 Ok(CommitResult::Committed(commit)) => {
                     sync_directory(&self.root)?;
@@ -4162,7 +4194,11 @@ impl DeltaTable {
                         table_name.as_deref(),
                     );
                     observation.finish("committed");
-                    return Ok(commit.commit_version());
+                    return Ok((
+                        commit.commit_version(),
+                        Some(started.elapsed()),
+                        committed_file_observations,
+                    ));
                 }
                 Ok(CommitResult::Conflicted(_)) => observation.event("conflict"),
                 Ok(CommitResult::Retryable(retry)) => {
@@ -4174,7 +4210,7 @@ impl DeltaTable {
                     }
                     if let Some(version) = reconcile()? {
                         observation.finish("reconciled");
-                        return Ok(version);
+                        return Ok((version, Some(started.elapsed()), committed_file_observations));
                     }
                 }
                 Err(error) => {
@@ -4182,7 +4218,7 @@ impl DeltaTable {
                     // A proven transaction is success; an unreadable outcome stays an error.
                     if identifiable && let Some(version) = reconcile()? {
                         observation.finish("reconciled");
-                        return Ok(version);
+                        return Ok((version, Some(started.elapsed()), committed_file_observations));
                     }
                     return Err(error.into());
                 }
@@ -4214,6 +4250,7 @@ pub struct DeltaFileWriter {
     /// Batches are already canonical: validate instead of normalizing again.
     canonical_input: bool,
     table_properties: BTreeMap<String, String>,
+    stage_timings: FileStageTimings,
 }
 
 /// Fixed, non-identifying class of a staged-file cleanup failure.
@@ -4247,6 +4284,17 @@ fn cleanup_failure_class(error: &anyhow::Error) -> &'static str {
 pub struct AppendResult {
     pub version: u64,
     pub file: CompletedFile,
+    pub commit_duration: Option<Duration>,
+    pub file_observations: Vec<crate::CompletedFileObservation>,
+}
+
+/// Timings for the lower-level stages of one physical Parquet file.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FileStageTimings {
+    pub build: Duration,
+    pub sort: Option<Duration>,
+    pub encode: Duration,
+    pub upload: Option<Duration>,
 }
 
 /// A durable Parquet file that is not yet visible in a Delta snapshot.
@@ -4258,6 +4306,7 @@ pub struct StagedAppend {
     pub(crate) stats: StructArray,
     pub(crate) publication: Option<(String, i64)>,
     pub(crate) ingested_at_ms: Option<i64>,
+    stage_timings: FileStageTimings,
     /// `STAGE_FRESH`, then exactly one irreversible claim: `STAGE_SUBMITTED` before the
     /// file is offered to any commit attempt, or `STAGE_RECLAIMED` before it is deleted.
     /// A fresh file cannot be named by a published or uncertain Delta action: its path
@@ -4272,6 +4321,11 @@ const STAGE_SUBMITTED: u8 = 1;
 const STAGE_RECLAIMED: u8 = 2;
 
 impl StagedAppend {
+    #[must_use]
+    pub const fn stage_timings(&self) -> FileStageTimings {
+        self.stage_timings
+    }
+
     /// Claim this file for a commit attempt. Refuses a file already reclaimed.
     fn claim_submission(&self) -> Result<()> {
         match self.stage_state.compare_exchange(
@@ -4332,8 +4386,8 @@ async fn upload_staged_output(
     mode: UploadMode,
     buffer_capacity: usize,
     request_concurrency: usize,
-) -> Result<()> {
-    match mode {
+) -> Result<Duration> {
+    let upload_duration = match mode {
         UploadMode::PutCreate => {
             let payload = tokio::fs::read(source_path)
                 .await
@@ -4343,12 +4397,15 @@ async fn upload_staged_output(
                 "Parquet upload source changed: expected {expected_bytes} bytes, found {}",
                 payload.len()
             );
+            let upload_started = Instant::now();
             store
                 .put_opts(&destination, payload.into(), PutMode::Create.into())
                 .await
                 .context("create completed Parquet object")?;
+            upload_started.elapsed()
         }
         UploadMode::BufferedMultipart => {
+            let upload_started = Instant::now();
             use futures::StreamExt as _;
             use tokio::io::AsyncReadExt as _;
 
@@ -4430,9 +4487,10 @@ async fn upload_staged_output(
                 let error = anyhow::Error::new(error).context("complete completed Parquet multipart upload");
                 return Err(abort_multipart_after_failure(&mut upload, error).await);
             }
+            upload_started.elapsed()
         }
-    }
-    Ok(())
+    };
+    Ok(upload_duration)
 }
 
 async fn abort_multipart_after_failure(
@@ -4520,6 +4578,7 @@ impl DeltaFileWriter {
     }
 
     async fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        let build_started = Instant::now();
         let input_bytes = record_batch_logical_bytes(batch)?;
         let mut batch = if self.canonical_input {
             normalize::canonical_batch(batch)?
@@ -4593,6 +4652,7 @@ impl DeltaFileWriter {
             .checked_add(input_bytes)
             .context("file input byte count overflow")?;
         self.stats.merge(&physical)?;
+        self.stage_timings.build += build_started.elapsed();
         if let Some(sorter) = &mut self.sorter {
             let physical = owned_for_sort(physical)?;
             if !sorter.try_push(&physical)? {
@@ -4601,9 +4661,13 @@ impl DeltaFileWriter {
                 );
             }
         } else {
-            self.parquet
+            let encode_started = Instant::now();
+            let result = self
+                .parquet
                 .write_accounted(&physical, batch.num_rows(), input_bytes)
-                .await?;
+                .await;
+            self.stage_timings.encode += encode_started.elapsed();
+            result?;
         }
         self.accepted_rows = rows;
         self.accepted_input_bytes = bytes;
@@ -4619,12 +4683,22 @@ impl DeltaFileWriter {
             bail!("Delta file previously failed; refusing to commit its partial data");
         }
         if let Some(sorter) = self.sorter.take() {
-            let sorted = sorter.finish()?;
-            self.parquet
+            let sort_started = Instant::now();
+            let sorted = sorter.finish();
+            self.stage_timings.sort = Some(sort_started.elapsed());
+            let sorted = sorted?;
+            let encode_started = Instant::now();
+            let result = self
+                .parquet
                 .write_accounted(&sorted, self.accepted_rows, self.accepted_input_bytes)
-                .await?;
+                .await;
+            self.stage_timings.encode += encode_started.elapsed();
+            result?;
         }
-        let file = self.parquet.finish().await?;
+        let encode_started = Instant::now();
+        let file_result = self.parquet.finish().await;
+        self.stage_timings.encode += encode_started.elapsed();
+        let file = file_result?;
         let stats = self.stats.finish()?.context("cannot commit an empty Delta file")?;
         let executor = shared_executor()?;
         self.table.check_publication_async().await?;
@@ -4651,7 +4725,7 @@ impl DeltaFileWriter {
             let store = Arc::clone(&table.store);
             let source_path = file.path.clone();
             let expected_bytes = file.bytes;
-            spawn_shared_io(async move {
+            let upload_duration = spawn_shared_io(async move {
                 let _table = table;
                 let _upload_slot = upload_slot.context("remote staging has no upload admission slot")?;
                 upload_staged_output(
@@ -4669,6 +4743,7 @@ impl DeltaFileWriter {
             .await
             .context("stage upload task failed")?
             .context("stage upload failed")?;
+            self.stage_timings.upload = Some(upload_duration);
         }
         self.table.check_publication_async().await?;
         Ok(StagedAppend {
@@ -4679,6 +4754,7 @@ impl DeltaFileWriter {
             stats,
             publication: self.publication,
             ingested_at_ms: self.ingested_at_ms,
+            stage_timings: self.stage_timings,
             stage_state: std::sync::atomic::AtomicU8::new(STAGE_FRESH),
         })
     }
@@ -4692,10 +4768,16 @@ impl DeltaFileWriter {
         // Kernel is synchronous. This offload is bounded by the caller's open files;
         // the collector uses the dedicated, bounded coordinator instead.
         tokio::task::spawn_blocking(move || {
-            let version = append.table.commit_files(std::slice::from_ref(&append))?;
+            let (version, commit_duration, file_observations) =
+                append.table.commit_files_timed(std::slice::from_ref(&append))?;
             Ok(AppendResult {
                 version,
                 file: append.file,
+                commit_duration,
+                file_observations: file_observations
+                    .into_iter()
+                    .map(|(_, observation)| observation)
+                    .collect(),
             })
         })
         .await?

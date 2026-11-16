@@ -126,6 +126,8 @@ pub struct GroupCommitReceipt(oneshot::Receiver<std::result::Result<GroupAppendR
 pub struct GroupAppendResult {
     pub version: u64,
     pub files: Vec<crate::CompletedFile>,
+    pub commit_duration: Option<Duration>,
+    pub file_observations: Vec<crate::CompletedFileObservation>,
 }
 
 /// Staged physical outputs and every constituent logical identity for one commit.
@@ -243,6 +245,8 @@ impl CommitReceipt {
         Ok(AppendResult {
             version: result.version,
             file,
+            commit_duration: result.commit_duration,
+            file_observations: result.file_observations,
         })
     }
 }
@@ -862,9 +866,11 @@ fn publish_batch(
         replies.push((start, end, publication.reply, publication._slot));
     }
     let result = match (table, failure.as_ref()) {
-        (Ok(table), None) if groups.is_empty() => table.commit_files(&appends).map_err(CommitReceiptError::from_anyhow),
+        (Ok(table), None) if groups.is_empty() => table
+            .commit_files_timed(&appends)
+            .map_err(CommitReceiptError::from_anyhow),
         (Ok(table), None) => table
-            .commit_files_with_groups(&appends, &groups)
+            .commit_files_with_groups_timed(&appends, &groups)
             .map_err(CommitReceiptError::from_anyhow),
         _ => Err(failure
             .clone()
@@ -876,22 +882,31 @@ fn publish_batch(
         *failure = Some(error.clone());
     }
     let mut files = appends.into_iter().map(|append| Some(append.file)).collect::<Vec<_>>();
+    let mut commit_duration = result.as_ref().ok().and_then(|(_, duration, _)| *duration);
     for (start, end, reply, _slot) in replies {
-        let result = match result.as_ref() {
-            Ok(version) => files[start..end]
+        let delivered = match result.as_ref() {
+            Ok((version, _, observations)) => files[start..end]
                 .iter_mut()
                 .map(|file| file.take().context("Delta worker lost staged output file"))
                 .collect::<Result<Vec<_>>>()
                 .map(|files| GroupAppendResult {
                     version: *version,
                     files,
+                    commit_duration: commit_duration.take(),
+                    file_observations: observations
+                        .iter()
+                        .filter(|(index, _)| (start..end).contains(index))
+                        .map(|(_, observation)| *observation)
+                        .collect(),
                 })
                 .map_err(CommitReceiptError::from_anyhow),
             Err(error) => Err(error.clone()),
         };
         // Cancellation never replays a possibly committed file. A live waiter
         // receives the result; an abandoned file stays visible only if committed.
-        let _ = reply.send(result);
+        if let Err(Ok(abandoned)) = reply.send(delivered) {
+            commit_duration = abandoned.commit_duration;
+        }
     }
 }
 

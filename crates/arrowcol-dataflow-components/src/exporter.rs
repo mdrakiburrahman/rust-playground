@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 
 use arrow_deltalake::commit::{BatchedTable, CommitReceiptError};
-use arrow_deltalake::sizing::AdaptiveFileSizeEstimator;
+use arrow_deltalake::sizing::{AdaptiveFileSizeEstimator, FlushTrigger};
 use async_trait::async_trait;
 use futures::future::{FutureExt, LocalBoxFuture};
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -28,7 +28,7 @@ use tokio::time::Instant;
 use crate::DeltaExporterConfig;
 use crate::config::{BatchCapacity, FileBatchConfig, config_error, parse_config, table_path};
 use crate::envelope::{ArrowcolBatchEnvelope, DecodedArrowBatch, EnvelopeError, decode_record_set};
-use crate::metrics::{PipelineStage, RuntimeMetrics, StageMetrics, global_metrics};
+use crate::metrics::{FlushReason, PipelineStage, RuntimeMetrics, StageMetrics, global_metrics};
 use crate::routing::{
     AuthorityClient, ExportingProcess, LEASE_VIEW_TTL, LeaseBinder, LeaseBinding, LeaseEvidence,
     RoutingPublicationFence,
@@ -583,6 +583,7 @@ async fn run_batch_worker(
                 next = receiver.recv() => next,
                 _ = tokio::time::sleep_until(first.accepted + policy.max_age) => {
                     stage_metrics.record(PipelineStage::Collect, collect_started.elapsed());
+                    stage_metrics.record_flush(FlushReason::Age);
                     publisher.publish(&mut group, &mut estimator).await;
                     rows = 0;
                     bytes = 0;
@@ -611,6 +612,9 @@ async fn run_batch_worker(
         };
         stage_metrics.record(PipelineStage::Collect, collect_started.elapsed());
         let Some(next) = next else {
+            if !group.is_empty() {
+                stage_metrics.record_flush(FlushReason::ShutdownDrain);
+            }
             publisher.publish(&mut group, &mut estimator).await;
             if let Some(table) = publisher.table.as_ref() {
                 table.start_draining();
@@ -620,6 +624,9 @@ async fn run_batch_worker(
         let next = match next {
             WorkerCommand::Batch(batch) => batch,
             WorkerCommand::Flush(reply) => {
+                if !group.is_empty() {
+                    stage_metrics.record_flush(FlushReason::Explicit);
+                }
                 publisher.publish(&mut group, &mut estimator).await;
                 rows = 0;
                 bytes = 0;
@@ -634,6 +641,7 @@ async fn run_batch_worker(
             first.target_schema_version != next.target_schema_version
                 || first.batch.schema_ref() != next.batch.schema_ref()
         }) {
+            stage_metrics.record_flush(FlushReason::SchemaChange);
             publisher.publish(&mut group, &mut estimator).await;
             rows = 0;
             bytes = 0;
@@ -650,11 +658,26 @@ async fn run_batch_worker(
         rows += next.rows;
         bytes += next.bytes;
         group.push(next);
-        if estimator.should_flush(bytes)
-            || bytes >= policy.max_arrow_memory_per_flush
-            || rows >= policy.max_rows_per_flush
-            || group.len() as u64 >= policy.max_batches_per_flush
-        {
+        let flush_reason = estimator
+            .flush_trigger(bytes)
+            .map(|trigger| match trigger {
+                FlushTrigger::TargetParquetBytes => FlushReason::TargetParquetBytes,
+                FlushTrigger::MinInputBytes => FlushReason::MinInputBytes,
+                FlushTrigger::MaxInputBytes => FlushReason::MaxInputBytes,
+            })
+            .or_else(|| {
+                if bytes >= policy.max_arrow_memory_per_flush {
+                    Some(FlushReason::MemoryCap)
+                } else if rows >= policy.max_rows_per_flush {
+                    Some(FlushReason::RowCap)
+                } else if group.len() as u64 >= policy.max_batches_per_flush {
+                    Some(FlushReason::BatchCap)
+                } else {
+                    None
+                }
+            });
+        if let Some(reason) = flush_reason {
+            stage_metrics.record_flush(reason);
             publisher.publish(&mut group, &mut estimator).await;
             rows = 0;
             bytes = 0;
@@ -717,6 +740,34 @@ impl GroupPublisher<'_> {
                 .map_err(|error| ExportFailure::Permanent(format!("invalid writer policy: {error}")))?;
         }
         Ok(())
+    }
+
+    fn record_staging_metrics(&self, append: &arrow_deltalake::StagedAppend) {
+        let timings = append.stage_timings();
+        self.stage_metrics.record(PipelineStage::Build, timings.build);
+        if let Some(duration) = timings.sort {
+            self.stage_metrics.record(PipelineStage::Sort, duration);
+        }
+        self.stage_metrics.record(PipelineStage::Encode, timings.encode);
+        if let Some(duration) = timings.upload {
+            self.stage_metrics.record(PipelineStage::Upload, duration);
+        }
+    }
+
+    fn record_published_files(
+        &self,
+        observations: impl IntoIterator<Item = arrow_deltalake::CompletedFileObservation>,
+    ) {
+        for observation in observations {
+            match u64::try_from(observation.rows) {
+                Ok(rows) => self.stage_metrics.record_file(observation.parquet_bytes, rows),
+                Err(error) => tracing::error!(
+                    row_count = observation.rows,
+                    error = %error,
+                    "cannot record published file metrics"
+                ),
+            }
+        }
     }
 
     async fn publish(&mut self, group: &mut Vec<QueuedBatch>, estimator: &mut AdaptiveFileSizeEstimator) {
@@ -803,11 +854,11 @@ impl GroupPublisher<'_> {
                     };
                     published_files += prepared.appends.len() as u64;
                     for append in &prepared.appends {
+                        self.record_staging_metrics(append);
                         updated_estimator.observe(append.observation()).map_err(|error| {
                             ExportFailure::Permanent(format!("file sizing observation failed: {error}"))
                         })?;
                     }
-                    let commit_started = Instant::now();
                     let commit_result = match table.submit_prepared_group(prepared, true).await {
                         Ok(receipt) => receipt.wait().await.map_err(|error| {
                             worker_failed = true;
@@ -820,8 +871,11 @@ impl GroupPublisher<'_> {
                             )))
                         }
                     };
-                    self.stage_metrics.record(PipelineStage::Commit, commit_started.elapsed());
                     let committed = commit_result?;
+                    if let Some(duration) = committed.commit_duration {
+                        self.stage_metrics.record(PipelineStage::Commit, duration);
+                    }
+                    self.record_published_files(committed.file_observations);
                     version = version.max(committed.version);
                 }
                 *estimator = updated_estimator;
@@ -854,14 +908,15 @@ impl GroupPublisher<'_> {
                     ExportFailure::Transient(format!("{error:#}"))
                 })?;
                 for (mut writer, partition_batch) in files {
-                    let encode_started = Instant::now();
-                    let write_result = writer.write(&partition_batch).await;
-                    self.stage_metrics.record(PipelineStage::Encode, encode_started.elapsed());
-                    write_result.map_err(|error| ExportFailure::Permanent(format!("{error:#}")))?;
-                    let upload_started = Instant::now();
-                    let stage_result = writer.stage().await;
-                    self.stage_metrics.record(PipelineStage::Upload, upload_started.elapsed());
-                    let append = stage_result.map_err(|error| ExportFailure::Transient(format!("{error:#}")))?;
+                    writer
+                        .write(&partition_batch)
+                        .await
+                        .map_err(|error| ExportFailure::Permanent(format!("{error:#}")))?;
+                    let append = writer
+                        .stage()
+                        .await
+                        .map_err(|error| ExportFailure::Transient(format!("{error:#}")))?;
+                    self.record_staging_metrics(&append);
                     updated_estimator.observe(append.observation()).map_err(|error| {
                         ExportFailure::Permanent(format!("file sizing observation failed: {error}"))
                     })?;
@@ -883,13 +938,14 @@ impl GroupPublisher<'_> {
             }
             let mut version = 0;
             for receipt in receipts {
-                let commit_started = Instant::now();
-                let commit_result = receipt.wait_typed().await;
-                self.stage_metrics.record(PipelineStage::Commit, commit_started.elapsed());
-                let committed = commit_result.map_err(|error| {
+                let committed = receipt.wait_typed().await.map_err(|error| {
                     worker_failed = true;
                     map_receipt_error(error)
                 })?;
+                if let Some(duration) = committed.commit_duration {
+                    self.stage_metrics.record(PipelineStage::Commit, duration);
+                }
+                self.record_published_files(committed.file_observations);
                 version = version.max(committed.version);
             }
             *estimator = updated_estimator;
