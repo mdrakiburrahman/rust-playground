@@ -351,6 +351,7 @@ impl Drop for DfeStreamLifecycle {
 #[async_trait]
 impl StreamLifecycle for DfeStreamLifecycle {
     async fn push_batch(&mut self, batch: RecordBatch) -> RuntimeResult<()> {
+        let ingested_at_ms = now_unix_millis().map_err(|_| RuntimeError::internal())?;
         if let Some(durable) = &self.durable {
             // A rejected batch already fails the stream; stop accepting more of it.
             durable.ensure_not_rejected()?;
@@ -361,7 +362,7 @@ impl StreamLifecycle for DfeStreamLifecycle {
         let mut envelope = self.envelope.clone();
         let publication_id = arrowcol_protocol::PublicationId::new();
         envelope.publication_id = Some(publication_id);
-        envelope.ingested_at_ms = Some(now_unix_millis().map_err(|_| RuntimeError::internal())?);
+        envelope.ingested_at_ms = Some(ingested_at_ms);
         let records = encode_record_batch(envelope, batch).map_err(|_| RuntimeError::internal())?;
         let correlation_id = self
             .pending
@@ -384,18 +385,21 @@ impl StreamLifecycle for DfeStreamLifecycle {
                 pending_send.disarm();
                 Ok(())
             }
-            Err(error) => Err(match error {
-                PdataSendError::Closed => RuntimeError::new(
-                    ErrorCode::PoolUnavailable,
-                    tonic::Code::Unavailable,
-                    "DFE downstream route closed after admission",
-                ),
-                PdataSendError::Unavailable => RuntimeError::new(
-                    ErrorCode::CapacityExhausted,
-                    tonic::Code::Unavailable,
-                    "DFE downstream admission is unavailable",
-                ),
-            }),
+            Err(error) => {
+                self.metrics.enqueue_failed();
+                Err(match error {
+                    PdataSendError::Closed => RuntimeError::new(
+                        ErrorCode::PoolUnavailable,
+                        tonic::Code::Unavailable,
+                        "DFE downstream route closed after admission",
+                    ),
+                    PdataSendError::Unavailable => RuntimeError::new(
+                        ErrorCode::CapacityExhausted,
+                        tonic::Code::Unavailable,
+                        "DFE downstream admission is unavailable",
+                    ),
+                })
+            }
         }
     }
 

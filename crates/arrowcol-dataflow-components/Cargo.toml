@@ -29,6 +29,7 @@ cpu-time = "1.0"
 futures = "0.3"
 humantime-serde = "1"
 linkme = "0.3"
+opentelemetry.workspace = true
 otel-arrow-dfe-config = { path = "../../submodules/otel-arrow/rust/otap-dataflow/crates/config" }
 otel-arrow-dfe-channel = { path = "../../submodules/otel-arrow/rust/otap-dataflow/crates/channel" }
 otel-arrow-dfe-engine = { path = "../../submodules/otel-arrow/rust/otap-dataflow/crates/engine" }

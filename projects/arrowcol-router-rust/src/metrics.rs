@@ -4,6 +4,8 @@ use std::time::Duration;
 
 use arrowcol_routing::{AdmissionPressureGauge, SqlOperationObserver};
 use arrowcol_sql_server::SqlPool;
+use opentelemetry::metrics::{Counter, Histogram as OtelHistogram};
+use opentelemetry::{KeyValue, global};
 use prometheus::{
     Encoder, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry,
     TextEncoder, register_histogram_vec_with_registry, register_histogram_with_registry,
@@ -30,6 +32,11 @@ pub struct RouterMetrics {
     sql_operations: IntCounterVec,
     sql_operation_seconds: HistogramVec,
     request_seconds: Histogram,
+    decision_seconds: Histogram,
+    otel_attributes: Vec<KeyValue>,
+    otel_decisions: Counter<u64>,
+    otel_request_seconds: OtelHistogram<f64>,
+    otel_decision_seconds: OtelHistogram<f64>,
     sql_pool: Option<SqlPool>,
     pool_created_seen: Arc<AtomicU64>,
 }
@@ -156,6 +163,37 @@ impl RouterMetrics {
             ]),
             registry.as_ref()
         )?;
+        let decision_seconds = register_histogram_with_registry!(
+            HistogramOpts::new(
+                "arrowcol_router_decision_seconds",
+                "Request-filter time spent selecting and validating a route"
+            )
+            .buckets(vec![
+                0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0
+            ]),
+            registry.as_ref()
+        )?;
+        let meter = global::meter("arrowcol-router-rust");
+        let otel_attributes = vec![
+            KeyValue::new(
+                "run",
+                std::env::var("ARROWCOL_OAT_RUN_ID").unwrap_or_else(|_| "unknown".to_owned()),
+            ),
+            KeyValue::new(
+                "variant",
+                std::env::var("ARROWCOL_OAT_VARIANT").unwrap_or_else(|_| "unknown".to_owned()),
+            ),
+            KeyValue::new("component", "arrowcol-router-rust"),
+        ];
+        let otel_decisions = meter.u64_counter("arrowcol.router.decisions").with_unit("1").build();
+        let otel_request_seconds = meter
+            .f64_histogram("arrowcol.router.request.duration")
+            .with_unit("s")
+            .build();
+        let otel_decision_seconds = meter
+            .f64_histogram("arrowcol.router.decision.duration")
+            .with_unit("s")
+            .build();
         Ok(Self {
             registry,
             decisions,
@@ -173,13 +211,26 @@ impl RouterMetrics {
             sql_operations,
             sql_operation_seconds,
             request_seconds,
+            decision_seconds,
+            otel_attributes,
+            otel_decisions,
+            otel_request_seconds,
+            otel_decision_seconds,
             sql_pool: None,
             pool_created_seen: Arc::new(AtomicU64::new(0)),
         })
     }
 
     pub fn observe_request_duration(&self, elapsed: Duration) {
-        self.request_seconds.observe(elapsed.as_secs_f64());
+        let seconds = elapsed.as_secs_f64();
+        self.request_seconds.observe(seconds);
+        self.otel_request_seconds.record(seconds, &self.otel_attributes);
+    }
+
+    pub fn observe_decision_duration(&self, elapsed: Duration) {
+        let seconds = elapsed.as_secs_f64();
+        self.decision_seconds.observe(seconds);
+        self.otel_decision_seconds.record(seconds, &self.otel_attributes);
     }
 
     /// Tracks pool-created connections alongside direct unpooled opens.
@@ -201,6 +252,7 @@ impl RouterMetrics {
     /// Records a routing decision.
     pub fn decision(&self, operation: &str, pool: &str, source: &str) {
         self.decisions.with_label_values(&[operation, pool, source]).inc();
+        self.otel_decisions.add(1, &self.otel_attributes);
     }
 
     /// Records a structured routing failure.
@@ -332,6 +384,7 @@ mod tests {
         metrics.connection_opened();
         metrics.operation("get_run_table_pin", Duration::from_millis(12), true);
         metrics.observe_request_duration(Duration::from_millis(25));
+        metrics.observe_decision_duration(Duration::from_millis(5));
         let output = String::from_utf8(metrics.encode()?)?;
         assert!(output.contains("arrowcol_router_sql_connections_opened_total 1"));
         assert!(
@@ -345,6 +398,7 @@ mod tests {
             )
         );
         assert!(output.contains("arrowcol_router_request_seconds_bucket{le=\"0.025\"} 1"));
+        assert!(output.contains("arrowcol_router_decision_seconds_bucket{le=\"0.005\"} 1"));
         Ok(())
     }
 
