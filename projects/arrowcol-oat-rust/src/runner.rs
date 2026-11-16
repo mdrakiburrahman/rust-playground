@@ -71,6 +71,7 @@ pub enum InventoryResourceState {
     Planned,
     Observed,
     Removed,
+    Absent,
     Uncertain,
 }
 
@@ -79,7 +80,7 @@ impl InventoryResourceState {
         match self {
             Self::Planned => true,
             Self::Observed | Self::Uncertain => next != Self::Planned,
-            Self::Removed => next == Self::Removed,
+            Self::Removed | Self::Absent => next == self,
         }
     }
 }
@@ -103,6 +104,19 @@ pub struct InventoryResource {
     pub uid: Option<String>,
     pub role: InventoryResourceRole,
     pub state: InventoryResourceState,
+    #[serde(default)]
+    pub absence: Option<InventoryAbsenceReceipt>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InventoryAbsenceReceipt {
+    pub api_version: String,
+    pub kind: String,
+    pub namespace: String,
+    pub namespace_uid: Option<String>,
+    pub name: String,
+    pub observed_at_unix_ms: u64,
 }
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
@@ -218,8 +232,26 @@ impl RunInventory {
             {
                 bail!("observed or removed custody resource requires exact resource and namespace UIDs");
             }
+            if resource.state == InventoryResourceState::Absent {
+                let receipt = resource.absence.as_ref().context("absent resource requires a not-found receipt")?;
+                if resource.uid.is_some()
+                    || receipt.api_version != resource.api_version
+                    || receipt.kind != resource.kind
+                    || receipt.namespace != resource.namespace
+                    || receipt.namespace_uid != self.namespace.uid
+                    || receipt.name != resource.name
+                    || receipt.observed_at_unix_ms == 0
+                {
+                    bail!("absent resource receipt must match its exact identity and observation time");
+                }
+            } else if resource.absence.is_some() {
+                bail!("not-found receipt requires absent resource state");
+            }
         }
         if let Some(fic) = &self.fic {
+            if fic.state == InventoryResourceState::Absent {
+                bail!("FIC absence requires an explicit identity receipt");
+            }
             if fic.resource_id.is_some()
                 || matches!(
                     fic.state,
@@ -241,6 +273,9 @@ impl RunInventory {
             }
         }
         if let Some(qap) = &self.qap {
+            if qap.state == InventoryResourceState::Absent {
+                bail!("QAP absence requires an explicit identity receipt");
+            }
             let safe_identifier = |value: &str| {
                 !value.is_empty()
                     && value
@@ -335,6 +370,7 @@ impl RunInventory {
                     .as_ref()
                     .is_some_and(|uid| updated.uid.as_ref() != Some(uid))
                 || !resource.state.can_advance_to(updated.state)
+                || resource.absence.as_ref().is_some_and(|receipt| updated.absence.as_ref() != Some(receipt))
             {
                 bail!("custody update changed an established resource identity");
             }
@@ -9428,6 +9464,31 @@ mod tests {
                 "terminal_capture":step,"handoff":step}
         }))?;
         inventory.validate()?;
+        let mut absent = inventory.clone();
+        absent.resources[0].state = InventoryResourceState::Absent;
+        assert!(absent.validate().is_err());
+        absent.resources[0].absence = Some(InventoryAbsenceReceipt {
+            api_version: "apps/v1".to_owned(),
+            kind: "Deployment".to_owned(),
+            namespace: inventory.namespace.name.clone(),
+            namespace_uid: None,
+            name: "arrowcol".to_owned(),
+            observed_at_unix_ms: 123,
+        });
+        inventory.validate_successor(&absent)?;
+        let mut invalid_absence = absent.clone();
+        invalid_absence.resources[0].absence.as_mut().unwrap().name = "other".to_owned();
+        assert!(invalid_absence.validate().is_err());
+        invalid_absence = absent.clone();
+        invalid_absence.resources[0].uid = Some("unexpected".to_owned());
+        assert!(invalid_absence.validate().is_err());
+        invalid_absence = absent.clone();
+        invalid_absence.resources[0].absence.as_mut().unwrap().observed_at_unix_ms = 124;
+        assert!(absent.validate_successor(&invalid_absence).is_err());
+        invalid_absence = absent.clone();
+        invalid_absence.resources[0].state = InventoryResourceState::Planned;
+        invalid_absence.resources[0].absence = None;
+        assert!(absent.validate_successor(&invalid_absence).is_err());
         let mut observed = inventory.clone();
         observed.resources[0].state = InventoryResourceState::Observed;
         assert!(observed.validate().is_err());
