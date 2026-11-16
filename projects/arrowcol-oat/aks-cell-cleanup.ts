@@ -2,6 +2,7 @@ import { canonical_json, type Azure } from '../../infra/azure/bootstrap.js';
 import { assertCampaignEnvironment, CampaignConflictError, CampaignFencedError, CampaignWriteOutcomeUnknownError, compareAndSwapRunInventory, hasVerifiedUnsettledDrain,
   CUSTODY_CLEANUP_STEPS, validateCampaignState, type CampaignState, type CampaignStore, type RunInventory, type StoredCampaign } from './aks-campaign.js';
 import type { CleanupMutationAuthority, ExternalCleanupActions } from './aks-cleanup-executor.js';
+import { withCleanupDeadline } from './aks-cleanup-budget.js';
 
 export const CELL_CLEANUP_SELECTORS = {
   stop_admission: 'stop-admission', bounded_drain: 'bounded-drain', evidence_capture: 'preserve-evidence',
@@ -227,6 +228,9 @@ async function executeCellCleanupStepGuarded(store: CampaignStore, input: unknow
     if (saved.value.phase === 'running') {
       const recover = providers[selector as Exclude<CellCleanupSelector, 'handoff'>]?.recover;
       if (selector !== 'handoff' && !recover) throw new Error('Cleanup effect outcome UNKNOWN; no recovery provider, never replay.');
+      current = await compareAndSwapRunInventory(store, current, current.state.runInventory!, assertCurrent);
+      effectEtag = current.etag;
+      await assertCurrent();
       result = selector === 'handoff' ? current.state.runInventory! :
         await recover!(current.state.runInventory!, `${envelope.inventory.cell_run_id}:${selector}`, authority);
     } else result = saved.value.phase === 'complete' ? current.state.runInventory! : saved.value.inventory!;
@@ -279,8 +283,11 @@ export function createCellCleanupProviders(actions: ExternalCleanupActions, reco
             throw new Error('Exact maintenance workload stop identity is UNKNOWN.');
           for (const resource of inventory.resources.filter(value => value.role === 'maintenance' && value.state === 'observed')) {
             if (!resource.uid) throw new Error('Maintenance UID is UNKNOWN.');
-            complete(await actions.stopMaintenanceIfUidAndOwnerMatch(resource, inventory.namespace.owner_token, key + ':' + resource.name, authority));
+            const bounded = withCleanupDeadline(authority, inventory.cleanup.stop_maintenance.deadline_unix_ms);
+            await bounded.assertCurrent();
+            complete(await actions.stopMaintenanceIfUidAndOwnerMatch(resource, inventory.namespace.owner_token, key + ':' + resource.name, bounded));
           }
+          withCleanupDeadline(authority, inventory.cleanup.stop_maintenance.deadline_unix_ms);
           break;
         case 'remove_namespace':
           if (!inventory.namespace.uid || inventory.resources.some(value => ['planned', 'uncertain'].includes(value.state)))

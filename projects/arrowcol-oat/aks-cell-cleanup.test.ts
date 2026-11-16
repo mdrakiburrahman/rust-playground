@@ -7,6 +7,7 @@ import { CampaignConflictError, CampaignWriteOutcomeUnknownError, cleanupFailure
 import { CELL_CLEANUP_SELECTORS, createBlobCellStepJournal, createCellCleanupProviders, executeCellCleanupStep,
   readCellRunInventory, type CellCleanupEnvelope, type CellCleanupSelector, type CellStepProviders, type ReadInventoryEnvelope } from './aks-cell-cleanup.js';
 import type { CleanupMutationAuthority, ExternalCleanupActions } from './aks-cleanup-executor.js';
+import { cleanupBudget } from './aks-cleanup-budget.js';
 
 const campaignId = 'c0ffee00-0000-4000-8000-000000000001', ownerId = 'c0ffee00-0000-4000-8000-000000000002';
 const cellId = 'c0ffee00-0000-4000-8000-000000000003', namespace = 'oat-' + cellId.replaceAll('-', '');
@@ -47,11 +48,14 @@ function fixture(t: TestContext, evidence = true) {
   const store = new Store({ ...newCampaignState(campaignId, ownerId), mode: 'armed', runInventory: inventory });
   const calls: string[] = [], blobs = new Map<string, { bytes: Buffer; etag: string }>();
   const azure = new Azure(new Config({ AZURE_SUBSCRIPTION_ID: campaignId }));
-  let version = 0, afterJournal: (() => void) | undefined;
+  let version = 0, afterJournal: (() => void) | undefined, beforeJournalRead: (() => void) | undefined;
   t.mock.method(azure, 'blob', async (method: string, _container: string, name: string, _query: unknown,
     body: string | Buffer | null, headers: Record<string, string>) => {
     const prior = blobs.get(name);
-    if (method === 'GET') return [prior?.bytes ?? null, prior ? { etag: prior.etag } : {}];
+    if (method === 'GET') {
+      beforeJournalRead?.();
+      return [prior?.bytes ?? null, prior ? { etag: prior.etag } : {}];
+    }
     if (headers[prior ? 'If-Match' : 'If-None-Match'] !== (prior?.etag ?? '*')) throw new CampaignConflictError();
     const etag = `"journal-${++version}"`;
     blobs.set(name, { bytes: Buffer.from(String(body)), etag });
@@ -83,7 +87,8 @@ function fixture(t: TestContext, evidence = true) {
     return executeCellCleanupStep(store, value, selector, providers,
       assertCurrent => createBlobCellStepJournal(azure, value, assertCurrent));
   };
-  return { store, actions, calls, blobs, envelope, invoke, afterJournal: (value: () => void) => { afterJournal = value; } };
+  return { store, actions, calls, blobs, envelope, invoke, afterJournal: (value: () => void) => { afterJournal = value; },
+    beforeJournalRead: (value?: () => void) => { beforeJournalRead = value; } };
 }
 
 test('per-cell selectors execute each provider once, retain active origin, and hand off without stamp cleanup', async t => {
@@ -146,6 +151,68 @@ test('only pre-effect version refusals are stale_version; a conflict after effec
   await assert.rejects(f.invoke('stop_admission'), /UNKNOWN/);
   assert.deepEqual(f.calls, ['attempted']);
 });
+
+test('saved-running recovery cannot pass a same-actor inventory/version change during journal reads', async t => {
+    const f = fixture(t);
+    let executions = 0, recoveries = 0;
+    const providers: CellStepProviders = { stop_admission: {
+      execute: async () => { executions++; throw new Error('lost effect response'); },
+      recover: async inventory => { recoveries++; return inventory; },
+    } };
+    await assert.rejects(f.invoke('stop_admission', providers), /lost effect response/);
+    const input = await f.envelope();
+    f.beforeJournalRead(() => {
+      f.beforeJournalRead();
+      f.store.state.runInventory!.evidence_destination!.blob_prefix += '/changed';
+      f.store.revision++;
+    });
+    await assert.rejects(f.invoke('stop_admission', providers, input), CampaignWriteOutcomeUnknownError);
+    assert.equal(executions, 1);
+    assert.equal(recoveries, 0);
+  });
+
+test('recovery pins its confirmed current inventory version through provider authority checks', async t => {
+    const f = fixture(t);
+    const providers: CellStepProviders = { stop_admission: {
+      execute: async () => { throw new Error('lost effect response'); },
+      recover: async (_inventory, _key, authority) => {
+        f.store.revision++;
+        await authority.assertCurrent();
+        assert.fail('Changed recovery version must be refused before a mutation.');
+      },
+    } };
+    await assert.rejects(f.invoke('stop_admission', providers), /lost effect response/);
+    await assert.rejects(f.invoke('stop_admission', providers), CampaignWriteOutcomeUnknownError);
+  });
+
+test('maintenance retains its original budget and refuses a second stop after the first exhausts it', async t => {
+    const f = fixture(t), original = f.store.state.runInventory!.resources[0];
+    f.store.state.runInventory!.resources.push({ ...original, name: 'maintenance-two', uid: ownerId });
+    await f.invoke('stop_admission');
+    await f.invoke('bounded_drain');
+    await f.invoke('evidence_capture');
+    let now = Date.now();
+    t.mock.method(Date, 'now', () => now);
+    const confirmed: string[] = [];
+    const providers = createCellCleanupProviders({ ...f.actions,
+      stopMaintenanceIfUidAndOwnerMatch: async (resource, _owner, _key, authority) => {
+        const budget = cleanupBudget(authority)!;
+        assert.equal(budget.deadlineUnixMs, f.store.state.runInventory!.cleanup.stop_maintenance.deadline_unix_ms);
+        assert.equal(budget.remainingMs, 120_000);
+        await authority.assertCurrent();
+        confirmed.push(resource.uid!);
+        now += budget.remainingMs + 1;
+        return 'complete';
+      } });
+    await assert.rejects(f.invoke('stop_maintenance', providers), /deadline expired/);
+    assert.deepEqual(confirmed, [original.uid]);
+    const deadline = f.store.state.runInventory!.cleanup.stop_maintenance.deadline_unix_ms;
+    assert.equal(deadline, now - 1);
+    assert.equal(f.store.state.runInventory!.cleanup.stop_maintenance.state, 'running');
+    await assert.rejects(f.invoke('stop_maintenance', providers), /UNKNOWN/);
+    assert.deepEqual(confirmed, [original.uid]);
+    assert.equal(f.store.state.runInventory!.cleanup.stop_maintenance.deadline_unix_ms, deadline);
+  });
 
 for (const fault of ['before', 'after'] as const) test(`positive effect survives ${fault}-commit write loss without executing twice`, async t => {
   const f = fixture(t);

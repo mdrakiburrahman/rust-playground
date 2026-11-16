@@ -93,6 +93,8 @@ Receipt top-level owner/fence identify the immutable producer; nested `actor` id
 
 Conditional per-selector journals under `_arrowcol-custody/campaigns/<campaign>/cells/<cell>/` progress from `running` to `effect-confirmed` to `complete`. A provider's positive response is persisted before the confirmed post-effect inventory CAS. Losing the write/confirmation resumes that proof without executing again. An effect whose response is unknown requires an explicit positive recovery provider; an empty journal read, listing absence or refreshed inventory is not proof of completion. Lifecycle and unknown-outcome recovery providers are **not installed by the default CLI**; those selectors fail nonzero rather than return positive stubs.
 
+Saved-running recovery also requires a confirmed CAS against the supplied full inventory/version and pins that version through provider authority checks. Maintenance stop admits each workload only within the original absolute deadline; its authority carries the remaining allowance and rejects use after expiry. A slow/late first stop never authorizes a second stop, renews the deadline or produces a normal completion receipt. Confirmed partial provider evidence remains recoverable rather than being replayed.
+
 Refresh using `aks-campaign.ts read-inventory`, not `status`. Strict stdin is:
 
 ```typescript
