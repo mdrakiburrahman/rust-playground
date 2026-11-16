@@ -159,6 +159,7 @@ test('terminal and independent final replay preserve explicit absence without ma
       FileExtension: null, Format: 'Parquet', IncludeHeaders: 'None', NamePrefix: null, Shortcut: false }) };
   const digest = (value: unknown) => createHash('sha256').update(canonical_json(value)).digest('hex');
   const snapshot = JSON.parse(originalBaseline.toString());
+  snapshot.non_run_kusto.empty_reason = null;
   snapshot.non_run_kusto.tables = [{ database, name: table, kind: 'external',
     schema_sha256: digest(schema), definition_sha256: digest(definition),
     before: { database, table, kind: 'external', rows: 7, query_sha256: '1'.repeat(64),

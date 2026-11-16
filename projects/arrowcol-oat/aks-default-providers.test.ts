@@ -3,11 +3,15 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { test, type TestContext } from 'node:test';
+import { stringify } from 'yaml';
 import { Azure, Config, TAGS, type HttpReceipt } from '../../infra/azure/bootstrap.js';
-import { CUSTODY_CLEANUP_STEPS, newCampaignState, publishRunInventory, type CampaignState, type CampaignStore,
+import { defaultStampConfig } from '../../infra/azure/stamp.js';
+import { CUSTODY_CLEANUP_STEPS, campaignMain, newCampaignState, publishRunInventory, type CampaignState, type CampaignStore,
   type RunInventory, type StoredCampaign } from './aks-campaign.js';
-import { captureCleanupBaseline, createDefaultCleanupProviders, type StampHealthReceipt } from './aks-default-providers.js';
+import { captureCleanupBaseline, createDefaultCleanupProviders, readCleanupBaseline, type StampHealthReceipt } from './aks-default-providers.js';
 import type { CleanupMutationAuthority } from './aks-cleanup-executor.js';
+import { loadCustodyConfig } from './aks-custody-config.js';
+import { watchdogOnce } from './aks-watchdog.js';
 
 const campaignId = '11111111-1111-4111-8111-111111111111';
 const ownerId = '22222222-2222-4222-8222-222222222222';
@@ -25,8 +29,8 @@ class Store implements CampaignStore {
     return `"${this.revision}"`;
   }
 }
-async function fixture(t: TestContext, capture = true) {
-  const c = new Config({ AZURE_SUBSCRIPTION_ID: campaignId }), azure = new Azure(c);
+async function fixture(t: TestContext, capture = true, c = new Config({ AZURE_SUBSCRIPTION_ID: campaignId })) {
+  const azure = new Azure(c);
   const aksId = c.base + '/providers/Microsoft.ContainerService/managedClusters/' + c.cluster;
   const namespace = 'oat-' + cellId.replaceAll('-', ''), identityId = c.identity_id;
   const step = { state: 'not_started' as const, deadline_unix_ms: null, reason_code: null };
@@ -112,6 +116,90 @@ async function fixture(t: TestContext, capture = true) {
     fault: (value: typeof fault) => { fault = value; }, health: (value: typeof health) => { health = value; } };
 }
 const properties = (value: Record<string, unknown>) => value.properties as Record<string, unknown>;
+
+function selectedConfig(t: TestContext) {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'custody-config-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const envFile = path.join(directory, 'private.env'), stampFile = path.join(directory, 'stamp.yaml');
+  fs.writeFileSync(stampFile, stringify(defaultStampConfig({ AZURE_SUBSCRIPTION_ID: campaignId, AZURE_STAMP: '12345',
+    AZURE_LOCATION: 'canadacentral' })));
+  fs.writeFileSync(envFile, [`AZURE_SUBSCRIPTION_ID=${campaignId}`, `ARM_SUBSCRIPTION_ID=${campaignId}`,
+    'CAMPAIGN_STORAGE_ACCOUNT=arrowcollector12345', 'CAMPAIGN_STATE_CONTAINER=checkpoints',
+    `CAMPAIGN_ID=${campaignId}`, `CAMPAIGN_OWNER_ID=${ownerId}`, 'CAMPAIGN_FENCING_TOKEN=1'].join('\n'));
+  const args = ['--env-file', envFile, '--stamp-config', stampFile];
+  return { args, ...loadCustodyConfig(args, false, {}) };
+}
+test('stock custody selection loads explicit nondefault stamp and refuses missing or mismatched selection before access', async t => {
+  const selected = selectedConfig(t);
+  assert.equal(selected.config.stamp, '12345');
+  assert.equal(selected.config.location, 'canadacentral');
+  assert.equal(selected.config.account, 'arrowcollector12345');
+  assert.equal(loadCustodyConfig(['--once', ...selected.args], true, {}).config.cluster, 'arrow-collector-12345');
+  assert.throws(() => loadCustodyConfig([], false, selected.env), /explicit --env-file/);
+  for (const mismatch of [{ ARM_SUBSCRIPTION_ID: ownerId }, { AZURE_SUBSCRIPTION_ID: ownerId },
+    { CAMPAIGN_STORAGE_ACCOUNT: 'arrowcollector1' }, { CAMPAIGN_STATE_CONTAINER: 'other' }, { AZURE_STAMP: '1' }])
+    assert.throws(() => loadCustodyConfig(selected.args, false, mismatch), /match/);
+  assert.throws(() => loadCustodyConfig(['--once', '--watch', ...selected.args], true, {}), /exactly one/);
+  await assert.rejects(watchdogOnce(selected.env), /explicit validated stamp/);
+});
+test('stock campaign capture freezes selected-stamp baseline, reuses its receipt, and gates arm on its full identity', async t => {
+  const selected = selectedConfig(t), f = await fixture(t, false, selected.config);
+  f.store.state = { ...newCampaignState(campaignId, ownerId, f.store.state.startedAtMs), runInventory: f.inventory };
+  const deps = { store: f.store, azure: f.azure, env: {} }, lines: string[] = [];
+  t.mock.method(console, 'log', (line: string) => { lines.push(line); });
+  const arm = () => campaignMain(['arm', ownerId, '1', ...selected.args], deps);
+  await assert.rejects(arm(), /baseline is UNKNOWN/);
+  assert.equal(f.store.state.mode, 'observe');
+  await campaignMain(['capture-baseline', ownerId, '1', ...selected.args], deps);
+  const receipt = JSON.parse(lines.at(-1)!).receipt;
+  assert.equal(receipt.status, 'captured');
+  assert.equal(receipt.campaign_id, campaignId);
+  assert.equal(receipt.owner_id, ownerId);
+  assert.equal(receipt.fencing_token, 1);
+  const saved = f.blobs.get(receipt.blob)!;
+  assert.equal(receipt.etag, saved.etag);
+  assert.equal(receipt.captured_at_unix_ms, JSON.parse(saved.bytes.toString()).captured_at_unix_ms);
+  await campaignMain(['capture-baseline', ownerId, '1', ...selected.args], deps);
+  assert.deepEqual(JSON.parse(lines.at(-1)!).receipt, receipt);
+  assert.equal(f.blobs.size, 1, 'retry never replaces or creates another baseline');
+  const original = saved.bytes;
+  type BaselineFixture = { campaign_id: string; capacity: { receipts: Array<{ resource_id: string }> };
+    non_run_kusto?: { databases: string[] } };
+  for (const mutate of [
+    (value: BaselineFixture) => { value.campaign_id = ownerId; },
+    (value: BaselineFixture) => { value.capacity.receipts[0]!.resource_id = value.capacity.receipts[0]!.resource_id.replace('12345', '1'); },
+    (value: BaselineFixture) => { value.non_run_kusto!.databases = ['other']; },
+    (value: BaselineFixture) => { delete value.non_run_kusto; },
+  ]) {
+    const changed = JSON.parse(original.toString());
+    mutate(changed); saved.bytes = Buffer.from(JSON.stringify(changed));
+    await assert.rejects(arm(), /baseline|Kusto|UNKNOWN/);
+    assert.equal(f.store.state.mode, 'observe');
+  }
+  saved.bytes = original;
+  await arm();
+  assert.equal(f.store.state.mode, 'armed');
+  f.store.state = { ...f.store.state, status: 'cleaning', fencingToken: 2, fencedAtMs: Date.now(),
+    fenceReason: 'heartbeat-expired', cleanupStatus: 'running' };
+  assert.deepEqual(await readCleanupBaseline(f.azure, f.store.state), receipt,
+    'controller takeover must retain the immutable producer fence, not recapture with the cleanup fence');
+  const rewritten = JSON.parse(original.toString());
+  rewritten.producer_fencing_token = 2; saved.bytes = Buffer.from(JSON.stringify(rewritten));
+  await assert.rejects(readCleanupBaseline(f.azure, f.store.state), /baseline/);
+  assert.deepEqual(f.mutations, [], 'source qualification must never mutate ARM');
+});
+test('stock authorization and ready boundaries refuse missing baseline without advancing admission', async t => {
+  const selected = selectedConfig(t), f = await fixture(t, false, selected.config);
+  f.inventory.load_admission = 'authorization_pending';
+  f.store.state = { ...newCampaignState(campaignId, ownerId, f.store.state.startedAtMs), mode: 'armed', runInventory: f.inventory };
+  const deps = { store: f.store, azure: f.azure, env: {} };
+  const authorized = { ...f.inventory, load_admission: 'authorized' };
+  t.mock.method(process.stdin, Symbol.asyncIterator, async function* () { yield JSON.stringify(authorized); });
+  await assert.rejects(campaignMain(['publish-inventory', ...selected.args], deps), /baseline is UNKNOWN/);
+  assert.equal(f.store.state.runInventory!.load_admission, 'authorization_pending');
+  await assert.rejects(campaignMain(['assert-ready', ownerId, '1', ...selected.args], deps), /baseline is UNKNOWN/);
+  assert.deepEqual(f.mutations, []);
+});
 
 test('default restoration is a true no-op at supported safe capacity and capacity alone cannot complete full safety', async t => {
   const f = await fixture(t);

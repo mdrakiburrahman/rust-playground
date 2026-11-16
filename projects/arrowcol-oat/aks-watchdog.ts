@@ -5,7 +5,8 @@ import { reconcileCleanupOnce, reconcileOnce, reconcilePendingArmOperations, typ
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { Azure, Config } from '../../infra/azure/bootstrap.js';
+import { Azure } from '../../infra/azure/bootstrap.js';
+import { loadCustodyConfig } from './aks-custody-config.js';
 import { createDefaultCleanupProviders } from './aks-default-providers.js';
 import { createExternalCleanupExecutor } from './aks-cleanup-executor.js';
 
@@ -14,7 +15,10 @@ export const WATCHDOG_INTERVAL_MS = 60_000;
 export type CleanupExecutor = (step: CleanupStepName, state: CampaignState, idempotencyKey: string) => Promise<'pending' | 'complete'>;
 
 export async function watchdogOnce(env: NodeJS.ProcessEnv = process.env, executeCleanup?: CleanupExecutor,
-  storeOverride?: CampaignStore): Promise<Record<string, unknown>> {
+  storeOverride?: CampaignStore, selectedAzure?: Azure): Promise<Record<string, unknown>> {
+  if (!storeOverride && (!selectedAzure || env.ARM_SUBSCRIPTION_ID !== selectedAzure.c.subscription ||
+      env.CAMPAIGN_STORAGE_ACCOUNT !== selectedAzure.c.account || env.CAMPAIGN_STATE_CONTAINER !== selectedAzure.c.checkpoints))
+    throw new Error('Watchdog requires explicit validated stamp configuration and matching custody subscription/account/container.');
   const subscriptionId = env.ARM_SUBSCRIPTION_ID ?? '';
   const store = storeOverride ?? createBlobCampaignStore({ account: env.CAMPAIGN_STORAGE_ACCOUNT ?? '',
     container: env.CAMPAIGN_STATE_CONTAINER ?? '', subscriptionId });
@@ -29,9 +33,7 @@ export async function watchdogOnce(env: NodeJS.ProcessEnv = process.env, execute
     if (!executeCleanup && storeOverride) throw new Error('Fenced campaign requires an external cleanup executor; refusing to claim safe idle.');
     if (executeCleanup) cleanupProgress = await reconcileCleanupOnce(store, executeCleanup);
     else {
-      const azure = new Azure(new Config({ AZURE_SUBSCRIPTION_ID: subscriptionId }));
-      if (env.CAMPAIGN_STORAGE_ACCOUNT !== azure.c.account || env.CAMPAIGN_STATE_CONTAINER !== azure.c.checkpoints)
-        throw new Error('Watchdog custody must match the exact configured stamp checkpoints account/container.');
+      const azure = selectedAzure!;
       const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'oat-watchdog-cleanup-'));
       try {
         const actions = createDefaultCleanupProviders(store, { azure, workDirectory: directory });
@@ -71,18 +73,19 @@ export async function runWatchdog(signal: AbortSignal, evaluate: () => Promise<R
 }
 
 async function main(args: string[]): Promise<void> {
-  if (args.length === 1 && args[0] === '--once') {
-    const result = await watchdogOnce();
+  const selected = loadCustodyConfig(args, true), azure = new Azure(selected.config);
+  const evaluate = () => watchdogOnce(selected.env, undefined, undefined, azure);
+  if (selected.once) {
+    const result = await evaluate();
     console.log(JSON.stringify(result));
     if (result.cleanupProgress === 'complete_unsettled') process.exitCode = 2;
     return;
   }
-  if (args.length !== 1 || args[0] !== '--watch') throw new Error('Usage: aks-watchdog.ts --once | --watch');
   const controller = new AbortController();
   const stop = () => controller.abort();
   process.once('SIGINT', stop);
   process.once('SIGTERM', stop);
-  if (await runWatchdog(controller.signal) === 'complete_unsettled') process.exitCode = 2;
+  if (await runWatchdog(controller.signal, evaluate) === 'complete_unsettled') process.exitCode = 2;
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main(process.argv.slice(2)).catch((error: unknown) => {
