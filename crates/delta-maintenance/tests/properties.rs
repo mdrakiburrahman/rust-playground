@@ -14,7 +14,7 @@ use delta_maintenance::{
 };
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use url::Url;
@@ -283,7 +283,8 @@ fn idle_catalog_policy_passes_have_no_log_checkpoint_or_progress_rewrites() -> R
     settings.purge_retention_ms = Some(30 * 24 * 60 * 60 * 1000);
     let store = Arc::new(CountingObjectStore::new(Arc::new(LocalFileSystem::new())));
     let table_path = source.0.url.to_file_path().map_err(|()| anyhow!("table path"))?;
-    let counted_store: Arc<dyn delta_kernel::object_store::ObjectStore> = store.clone();
+    let counted_store = Arc::clone(&store);
+    let counted_store: Arc<dyn delta_kernel::object_store::ObjectStore> = counted_store;
     source.1 = Some(DeltaTable::open_with_store(table_path, counted_store)?);
     let before = inventory(root.path())?;
     let metrics = Metrics::new();
@@ -311,6 +312,105 @@ fn idle_catalog_policy_passes_have_no_log_checkpoint_or_progress_rewrites() -> R
         assert_eq!(writes, 0, "idle pass must not write objects");
     }
     assert!(metrics.render().contains("delta_maintenance_negative_probes_total"));
+    Ok(())
+}
+
+#[test]
+fn later_vacuum_probe_uses_fresh_due_time_after_earlier_operation() -> Result<()> {
+    struct AdvancingClock {
+        source: CatalogTable,
+        anchors: [i64; 2],
+        calls: AtomicUsize,
+    }
+
+    impl TableDiscovery for AdvancingClock {
+        fn tables(&self) -> Result<Vec<String>> {
+            self.source.tables()
+        }
+
+        fn table(&self, name: &str) -> Result<DiscoveredTable> {
+            self.source.table(name)
+        }
+
+        fn maintenance_now_ms(&self) -> Result<i64> {
+            let index = self.calls.fetch_add(1, Ordering::SeqCst).min(1);
+            Ok(self.anchors[index])
+        }
+    }
+
+    let (root, mut settings, mut source) = fixture()?;
+    settings.operations = vec![Operation::Purge, Operation::Vacuum];
+    source.0.properties.insert(
+        "arrowcol.purge.retention".into(),
+        (100_i64 * 365 * 24 * 60 * 60 * 1000).to_string(),
+    );
+    persist_policy(&source)?;
+    settings.anchor_ms = None;
+    let first_anchor = now_ms()?;
+    let second_anchor = first_anchor + 2_000;
+    let retention = settings.vacuum_retention_ms;
+    let physical_mtime = first_anchor - retention + 1_000;
+    let data_dir = root.path().join("events");
+    let parquet_path = std::fs::read_dir(&data_dir)?
+        .flat_map(|entry| {
+            let path = entry.ok()?.path();
+            (path.is_dir()).then(|| std::fs::read_dir(path).ok()).flatten()
+        })
+        .flatten()
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.extension().is_some_and(|extension| extension == "parquet"))
+        .ok_or_else(|| anyhow!("active Parquet file"))?;
+    let modified = std::time::UNIX_EPOCH + Duration::from_millis(u64::try_from(physical_mtime)?);
+    std::fs::File::open(&parquet_path)?.set_times(std::fs::FileTimes::new().set_modified(modified))?;
+    let discovery = AdvancingClock {
+        source,
+        anchors: [first_anchor, second_anchor],
+        calls: AtomicUsize::new(0),
+    };
+    let before = inventory(root.path())?;
+    let results = run_cycle_with_discovery(
+        &settings,
+        &discovery,
+        &Metrics::new(),
+        &Arc::new(AtomicBool::new(false)),
+    )?;
+    assert_eq!(discovery.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].operation, Operation::Purge);
+    assert!(results[0].negative_probe, "purge remains not due");
+    assert_eq!(results[1].operation, Operation::Vacuum);
+    assert!(
+        !results[1].negative_probe,
+        "vacuum crossed its physical-retention boundary"
+    );
+    assert!(results[1].error.is_none(), "{:?}", results[1].error);
+    assert_eq!(
+        results[1].report.as_ref().map(|report| report.outcome),
+        Some(Outcome::Noop)
+    );
+    let after = inventory(root.path())?;
+    let durable_objects = |objects: &FileInventory| {
+        objects
+            .keys()
+            .filter(|path| {
+                path.extension().is_some_and(|extension| extension == "parquet")
+                    || path.to_string_lossy().contains("/_delta_log/")
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        durable_objects(&before),
+        durable_objects(&after),
+        "due vacuum must not delete data or write Delta log actions when no tombstones exist"
+    );
+    let report = results[1]
+        .report
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("vacuum report"))?;
+    assert_eq!(report.version, report.read_version, "no Delta commit");
+    assert_eq!(report.files_deleted, 0);
     Ok(())
 }
 

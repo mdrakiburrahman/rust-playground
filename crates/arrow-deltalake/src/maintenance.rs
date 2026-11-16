@@ -323,6 +323,13 @@ impl MaintenanceControl {
         }
     }
 
+    /// Add a hard deadline without extending an existing operation deadline.
+    #[must_use]
+    pub fn with_deadline(mut self, deadline: Instant) -> Self {
+        self.deadline = Some(self.deadline.map_or(deadline, |current| current.min(deadline)));
+        self
+    }
+
     /// Set bounded publication retry limits without weakening reconciliation.
     ///
     /// # Errors
@@ -1460,6 +1467,8 @@ pub struct MaintenanceReport {
     pub attempts: u32,
     pub collisions: u32,
     pub retries: u32,
+    /// PURGE plan rebuilds after expired partition membership changed.
+    pub replans: u32,
     pub cutoff_ms: Option<i64>,
     pub watermark_ms: Option<i64>,
     pub files_deleted: u64,
@@ -1602,7 +1611,13 @@ impl DeltaTable {
                 Ok(None) => {}
                 Err(error) => {
                     if !uncertain {
-                        return Err(self.discard_after(outputs, error, report));
+                        let error = self.discard_after(outputs, error, report);
+                        if let Some(details) =
+                            error_details(&error).filter(|details| details.kind == MaintenanceErrorKind::StalePlan)
+                        {
+                            return Err(fail_with(details.kind, details.message.clone(), report));
+                        }
+                        return Err(error);
                     }
                     // A raw commit error can follow actual publication: reconcile
                     // by plan id and never clean up outputs blindly.
@@ -1913,9 +1928,11 @@ mod optimize_upload_tests {
         let replacement = vec![4_u8, 5, 6];
         fs::write(local.path(), &replacement)?;
 
-        let error = upload_staged_output(Arc::clone(&store), path.clone(), local.path().to_path_buf(), 3, None)
-            .await
-            .unwrap_err();
+        let error =
+            match upload_staged_output(Arc::clone(&store), path.clone(), local.path().to_path_buf(), 3, None).await {
+                Err(error) => error,
+                Ok(()) => anyhow::bail!("create-only upload replaced an existing object"),
+            };
         assert!(matches!(
             error.downcast_ref::<object_store::Error>(),
             Some(object_store::Error::AlreadyExists { .. })
@@ -2256,24 +2273,26 @@ impl DeltaTable {
             protected_partitions: protected,
             skipped_partitions: skipped,
         };
-        while serde_json::to_vec(&plan)?.len() > config.max_plan_bytes {
-            let Some(bin) = plan.bins.pop() else {
+        loop {
+            let planned_files: u64 = plan.bins.iter().map(|bin| bin.files.len() as u64).sum();
+            let planned_bytes: u64 = plan.bins.iter().flat_map(|bin| &bin.files).map(|file| file.size).sum();
+            plan.backlog_files = eligible_files
+                .checked_sub(planned_files)
+                .context("planned files exceed eligible compaction debt")?;
+            plan.compaction_debt.backlog_files = plan.backlog_files;
+            plan.compaction_debt.backlog_bytes = eligible_bytes
+                .checked_sub(planned_bytes)
+                .context("planned bytes exceed eligible compaction debt")?;
+            if serde_json::to_vec(&plan)?.len() <= config.max_plan_bytes {
+                break;
+            }
+            if plan.bins.pop().is_none() {
                 return Err(fail(
                     MaintenanceErrorKind::ResourceLimit,
                     "empty plan exceeds the payload bound",
                 ));
-            };
-            plan.backlog_files += bin.files.len() as u64;
+            }
         }
-        let planned_files: u64 = plan.bins.iter().map(|bin| bin.files.len() as u64).sum();
-        let planned_bytes: u64 = plan.bins.iter().flat_map(|bin| &bin.files).map(|file| file.size).sum();
-        plan.backlog_files = eligible_files
-            .checked_sub(planned_files)
-            .context("planned files exceed eligible compaction debt")?;
-        plan.compaction_debt.backlog_files = plan.backlog_files;
-        plan.compaction_debt.backlog_bytes = eligible_bytes
-            .checked_sub(planned_bytes)
-            .context("planned bytes exceed eligible compaction debt")?;
         Ok(PreparedOptimize { plan, state })
     }
 

@@ -164,6 +164,60 @@ fn compaction_debt_evidence_distinguishes_zero_from_bounded_backlog() -> Result<
 }
 
 #[test]
+fn optimize_final_debt_fields_are_included_in_plan_size_bound() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let table = create(root.path())?;
+    for batch in 0..4 {
+        append(&table, 0, batch * 10..batch * 10 + 3)?;
+    }
+    append(&table, 1, 100..103)?;
+    append(&table, 1, 110..113)?;
+    let maintenance = DeltaTable::open_for_maintenance(&url_of(root.path())?)?;
+    let anchor = BASE + 60 * MINUTE;
+    let base_config = OptimizeConfig {
+        max_files_per_bin: 2,
+        max_bins_per_commit: 1,
+        now_ms: Some(anchor),
+        ..optimize_config()
+    };
+    let unbounded = maintenance.prepare_optimize(&base_config)?;
+    assert_eq!(unbounded.plan.bins.len(), 1);
+    assert!(unbounded.plan.compaction_debt.backlog_files > 0);
+    assert!(unbounded.plan.compaction_debt.backlog_bytes > 0);
+
+    let mut preliminary = unbounded.plan.clone();
+    preliminary.backlog_files = 0;
+    preliminary.compaction_debt.backlog_files = 0;
+    preliminary.compaction_debt.backlog_bytes = 0;
+    let max_plan_bytes = serde_json::to_vec(&preliminary)?.len();
+    let config = OptimizeConfig {
+        max_plan_bytes,
+        ..base_config
+    };
+    let prepared = maintenance.prepare_optimize(&config)?;
+    let encoded = serde_json::to_vec(&prepared.plan)?;
+    assert!(encoded.len() <= max_plan_bytes);
+    assert_eq!(
+        prepared.plan.bins.len(),
+        0,
+        "final backlog fields require trimming the bin"
+    );
+    assert_eq!(
+        prepared.plan.backlog_files,
+        prepared.plan.compaction_debt.eligible_files
+    );
+    assert_eq!(
+        prepared.plan.compaction_debt.backlog_bytes,
+        prepared.plan.compaction_debt.eligible_bytes
+    );
+    let version = maintenance.version()?;
+    let report = maintenance.apply_prepared_optimize(&prepared, &config, &control())?;
+    assert_eq!(report.outcome, Outcome::Noop);
+    assert_eq!(maintenance.version()?, version, "empty bounded plan must not commit");
+    Ok(())
+}
+
+#[test]
 fn pass_inventory_bounds_counted_io_for_all_idle_probes() -> Result<()> {
     let root = tempfile::tempdir()?;
     let table = create(root.path())?;
