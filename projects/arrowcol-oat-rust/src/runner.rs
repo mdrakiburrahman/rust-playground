@@ -340,10 +340,7 @@ impl RunInventory {
         }
         if let Some(duration_ms) = self.planned_cell_duration_ms {
             let no_row_rehearsal = duration_ms == 0
-                && self.load_admission == InventoryLoadAdmission::NotAuthorized
-                && self.resources.is_empty()
-                && self.fic.is_none()
-                && self.qap.is_none();
+                && self.load_admission == InventoryLoadAdmission::NotAuthorized;
             if duration_ms > 9_007_199_254_740_991 || (duration_ms == 0 && !no_row_rehearsal) {
                 bail!("planned_cell_duration_ms must be a positive JSON-safe integer except for not-authorized no-row rehearsal inventories");
             }
@@ -2925,18 +2922,29 @@ async fn run_isolated_cell(
             );
         }
     };
-    let planned_cell_duration_ms = match config.timing_budget() {
-        Ok(budget) => budget.planned_cell_duration_ms,
+    let timing_budget = match config.timing_budget() {
+        Ok(budget) => budget,
         Err(error) => {
             return finish_matrix_cell(&config, orchestration_id, &run_id, replicas, concurrency, Err(error), Ok(()));
         }
     };
-    let lifecycle_deadline = tokio::time::Instant::now() + Duration::from_millis(planned_cell_duration_ms);
+    let lifecycle_started_at = tokio::time::Instant::now();
+    let lifecycle_deadline = lifecycle_started_at + Duration::from_millis(timing_budget.planned_cell_duration_ms);
+    let setup_deadline = lifecycle_started_at + Duration::from_millis(timing_budget.pre_cell_setup_timeout_ms);
     let (result, cancelled) = tokio::select! {
         result = async {
+            match tokio::time::timeout_at(setup_deadline, platform.ensure_stack(&config, orchestration_id)).await {
+                Ok(result) => result.context("prepare isolated OAT matrix-cell platform")?,
+                Err(_) => bail!("planned pre-cell setup deadline expired; normal platform cleanup follows"),
+            }
+            let timing = config.timing_budget()?;
+            require_lifecycle_remaining_at(
+                tokio::time::Instant::now(),
+                lifecycle_deadline,
+                Duration::from_millis(timing.after_setup_budget_ms),
+                "ArrowCol scale",
+            )?;
             match tokio::time::timeout_at(lifecycle_deadline, async {
-                platform.ensure_stack(&config, orchestration_id).await
-                    .context("prepare isolated OAT matrix-cell platform")?;
                 run_matrix_cell(
                     &config,
                     orchestration_id,
@@ -3460,15 +3468,46 @@ async fn settle_cell_commit_evidence(
     }
 }
 
-fn require_lifecycle_remaining(
+#[cfg(test)]
+#[test]
+fn local_lifecycle_budget_allows_positive_setup_elapsed_and_rejects_exhaustion() -> Result<()> {
+    let mut config: OatConfig = serde_json::from_str(include_str!(
+        "../docs/experiments/arrowcol-oat/oat-config.quick.json"
+    ))?;
+    config.platform.kind = crate::config::OatMode::Local;
+    let budget = config.timing_budget()?;
+    assert_eq!(budget.after_setup_budget_ms, budget.minimum_pin_ttl_ms);
+    assert_eq!(budget.planned_cell_duration_ms, budget.pre_cell_setup_timeout_ms + budget.after_setup_budget_ms);
+
+    let started = tokio::time::Instant::now();
+    let setup_elapsed = Duration::from_secs(30);
+    let deadline = started + Duration::from_millis(budget.planned_cell_duration_ms);
+    let post_setup_now = started + setup_elapsed;
+    assert!(require_lifecycle_remaining_at(
+        post_setup_now, deadline, Duration::from_millis(budget.after_setup_budget_ms), "Local admission"
+    ).is_ok());
+
+    let exhausted_now = deadline - Duration::from_millis(budget.after_setup_budget_ms) + Duration::from_millis(1);
+    assert!(require_lifecycle_remaining_at(
+        exhausted_now, deadline, Duration::from_millis(budget.after_setup_budget_ms), "Local admission"
+    ).is_err());
+    Ok(())
+}
+
+fn require_lifecycle_remaining_at(
+    now: tokio::time::Instant,
     deadline: tokio::time::Instant,
     required: Duration,
     next_stage: &str,
 ) -> Result<()> {
-    if deadline.saturating_duration_since(tokio::time::Instant::now()) < required {
+    if deadline.saturating_duration_since(now) < required {
         bail!("planned cell lifecycle deadline would expire before {next_stage}");
     }
     Ok(())
+}
+
+fn require_lifecycle_remaining(deadline: tokio::time::Instant, required: Duration, next_stage: &str) -> Result<()> {
+    require_lifecycle_remaining_at(tokio::time::Instant::now(), deadline, required, next_stage)
 }
 
 async fn run_matrix_cell(
@@ -3486,15 +3525,20 @@ async fn run_matrix_cell(
     } else {
         0
     };
-    let stack_rollout_ms = rollout_ms;
-    let pre_scale_budget = timing_budget.planned_cell_duration_ms.saturating_sub(stack_rollout_ms);
-    require_lifecycle_remaining(lifecycle_deadline, Duration::from_millis(pre_scale_budget), "ArrowCol scale")?;
-    platform.scale_arrowcols(config, replicas, concurrency).await?;
+    let scale_rollout_ms = rollout_ms
+        .checked_mul(u64::try_from(config.deployment_names().len())?)
+        .context("AKS scale rollout deadline overflow")?;
     let maintenance_rollout_ms = if config.platform.kind == crate::config::OatMode::Aks && maintenance_enabled(config) {
         rollout_ms
     } else {
         0
     };
+    let pre_scale_budget = timing_budget.minimum_pin_ttl_ms
+        .checked_add(scale_rollout_ms)
+        .and_then(|value| value.checked_add(maintenance_rollout_ms))
+        .context("post-setup lifecycle budget overflow")?;
+    require_lifecycle_remaining(lifecycle_deadline, Duration::from_millis(pre_scale_budget), "ArrowCol scale")?;
+    platform.scale_arrowcols(config, replicas, concurrency).await?;
     require_lifecycle_remaining(
         lifecycle_deadline,
         Duration::from_millis(timing_budget.minimum_pin_ttl_ms.saturating_add(maintenance_rollout_ms)),
@@ -12482,6 +12526,8 @@ mod tests {
             "arrow-collector-00000000000000000000000000000004",
             "campaignstorage",
             "checkpoints",
+            EffectiveStopBudgets { maintenance_grace_seconds: 1_200, maintenance_stop_timeout_ms: 1_500_000 },
+            1_000,
         )?;
         super::validate_campaign_baseline_capture_inventory(&inventory, &identity)?;
         let value = serde_json::to_value(&inventory)?;
@@ -12490,6 +12536,18 @@ mod tests {
         assert_eq!(value["resources"], serde_json::json!([]));
         assert_eq!(value["fic"], serde_json::Value::Null);
         assert_eq!(value["qap"], serde_json::Value::Null);
+        assert_eq!(value["effective_stop_budgets"]["maintenance_grace_seconds"], 1_200);
+        assert_eq!(value["effective_stop_budgets"]["maintenance_stop_timeout_ms"], 1_500_000);
+        assert_eq!(value["planned_cell_duration_ms"], 1_000);
+        let mut no_row_rehearsal = inventory.clone();
+        no_row_rehearsal.planned_cell_duration_ms = Some(0);
+        no_row_rehearsal.resources.push(InventoryResource {
+            api_version: "apps/v1".to_owned(), kind: "Deployment".to_owned(),
+            namespace: no_row_rehearsal.namespace.name.clone(), name: "arrowcol".to_owned(),
+            uid: None, role: InventoryResourceRole::Collector, state: InventoryResourceState::Planned,
+            absence: None,
+        });
+        no_row_rehearsal.validate()?;
         println!("E1_RUST_INITIAL_INVENTORY={}", serde_json::to_string(&inventory)?);
         Ok(())
     }
@@ -12618,6 +12676,8 @@ mod tests {
             namespace,
             "campaignstorage",
             "checkpoints",
+            EffectiveStopBudgets { maintenance_grace_seconds: 1_200, maintenance_stop_timeout_ms: 1_500_000 },
+            1_000,
         )?;
         inventory.namespace.uid = Some("00000000-0000-0000-0000-000000000005".to_owned());
         inventory.resources.push(InventoryResource {
@@ -13844,9 +13904,10 @@ mod tests {
             (budget.client_job_lifetime_seconds
                 + crate::config::PIN_INIT_SETUP_TIMEOUT_SECONDS
                 + config.reconciliation_settle_timeout_seconds
-                + config.collector_stop_grace_seconds)
+                + config.collector_stop_grace_seconds
+                + config.qap_timeout_seconds)
                 * 1_000,
-            "the immutable pin lifetime must cover setup, the client Job, settling, and collector drain"
+            "the immutable pin lifetime must cover setup, the client Job, settling, collector drain, and final QAP observation"
         );
         Ok(())
     }

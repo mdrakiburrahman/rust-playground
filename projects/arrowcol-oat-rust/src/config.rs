@@ -336,14 +336,16 @@ pub(crate) struct RunTimingBudget {
     pub(crate) schedule_wait_seconds: u64,
     pub(crate) client_job_lifetime_seconds: u64,
     pub(crate) minimum_pin_ttl_ms: u64,
+    pub(crate) pre_cell_setup_timeout_ms: u64,
+    pub(crate) after_setup_budget_ms: u64,
     pub(crate) planned_cell_duration_ms: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct EffectiveStopBudgets {
-    pub(crate) maintenance_grace_seconds: u64,
-    pub(crate) maintenance_stop_timeout_ms: u64,
+pub struct EffectiveStopBudgets {
+    pub maintenance_grace_seconds: u64,
+    pub maintenance_stop_timeout_ms: u64,
 }
 
 impl EffectiveStopBudgets {
@@ -623,30 +625,41 @@ impl OatConfig {
             .context("OAT pin initialization and collector drain lifetime budget overflow")?
             .checked_mul(1_000)
             .context("OAT run pin lifetime budget overflow")?;
-        let rollout_count = if self.platform.kind == OatMode::Aks {
-            u64::try_from(self.deployment_names().len())?
-                .checked_add(1)
-                .and_then(|count| {
-                    count.checked_add(u64::from(
-                        self.tunables
-                            .maintenance
-                            .as_ref()
-                            .is_some_and(|settings| settings.enabled == Some(true)),
-                    ))
-                })
-                .context("OAT AKS rollout count overflow")?
+        let rollout_timeout_ms = if self.platform.kind == OatMode::Aks {
+            self.aks_rollout_timeout_seconds.checked_mul(1_000).context("OAT AKS rollout timeout overflow")?
         } else {
             0
         };
-        let planned_cell_duration_ms = rollout_count
-            .checked_mul(self.aks_rollout_timeout_seconds)
-            .and_then(|seconds| seconds.checked_mul(1_000))
-            .and_then(|rollouts_ms| minimum_pin_ttl_ms.checked_add(rollouts_ms))
+        let maintenance_rollouts = u64::from(
+            self.tunables.maintenance.as_ref().is_some_and(|settings| settings.enabled == Some(true)),
+        );
+        let setup_rollout_count = if self.platform.kind == OatMode::Aks {
+            u64::try_from(self.deployment_names().len())?.checked_add(1).context("OAT AKS setup rollout count overflow")?
+        } else {
+            0
+        };
+        let scale_rollout_count = if self.platform.kind == OatMode::Aks {
+            u64::try_from(self.deployment_names().len())?.checked_add(maintenance_rollouts).context("OAT AKS scale rollout count overflow")?
+        } else {
+            0
+        };
+        let pre_cell_setup_timeout_ms = if self.platform.kind == OatMode::Aks {
+            setup_rollout_count.checked_mul(rollout_timeout_ms).context("OAT AKS setup timeout overflow")?
+        } else {
+            1_260_000
+        };
+        let after_setup_budget_ms = minimum_pin_ttl_ms
+            .checked_add(scale_rollout_count.checked_mul(rollout_timeout_ms).context("OAT scale rollout budget overflow")?)
+            .context("OAT post-setup cell budget overflow")?;
+        let planned_cell_duration_ms = pre_cell_setup_timeout_ms
+            .checked_add(after_setup_budget_ms)
             .context("OAT planned cell lifecycle duration overflow")?;
         Ok(RunTimingBudget {
             schedule_wait_seconds,
             client_job_lifetime_seconds,
             minimum_pin_ttl_ms,
+            pre_cell_setup_timeout_ms,
+            after_setup_budget_ms,
             planned_cell_duration_ms,
         })
     }
