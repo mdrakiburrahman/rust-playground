@@ -628,6 +628,12 @@ function overloadGuardIssue(evidence: RecordValue, config: RecordValue, runId: u
   const guard = evidence.overload_guard;
   if (!isRecord(guard)) return invalid;
   const caps = guard.last_caps;
+  const platform = isRecord(config.platform) ? config.platform : undefined;
+  const local = platform && isRecord(platform.local) ? platform.local : undefined;
+  const requestedCap = local?.collector_memory_limit_bytes;
+  if (requestedCap !== undefined && requestedCap !== null &&
+      (nonNegativeInteger(requestedCap) === undefined || Number(requestedCap) < 8388608 || Number(requestedCap) > 1099511627776)) return invalid;
+  if (guard.requested_container_memory_limit_bytes !== (requestedCap ?? null)) return invalid;
   const expectedStart = start - warmup * 1000;
   if (guard.status !== 'complete' || guard.run_id !== runId ||
       guard.run_start_ms !== expectedStart || guard.measurement_end_ms !== end ||
@@ -640,6 +646,7 @@ function overloadGuardIssue(evidence: RecordValue, config: RecordValue, runId: u
       typeof guard.peak_cap_fraction !== 'number' || !Number.isFinite(guard.peak_cap_fraction) ||
       guard.peak_cap_fraction < 0 || guard.peak_cap_fraction >= fraction ||
       !Array.isArray(caps) || caps.length !== guardCapMetrics.length ||
+      requestedCap != null && !caps.some(cap => isRecord(cap) && cap.metric === 'container_memory_bytes' && cap.cap === requestedCap) ||
       !guardCapMetrics.every(metric =>
         caps.filter(cap => isRecord(cap) && cap.metric === metric && cap.confirmed === true &&
           nonNegativeInteger(cap.observed_value) !== undefined && nonNegativeInteger(cap.cap) !== undefined &&

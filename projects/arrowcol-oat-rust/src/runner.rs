@@ -3814,6 +3814,7 @@ async fn run_clients_inner(
                 evidence.overload_guard = Some(json!({
                     "status":"unavailable","settings":config.overload_guard,
                     "unavailable_reason":"pre_admission_cap_backlog_or_commit_readback_unavailable",
+                    "requested_container_memory_limit_bytes":config.platform.local.collector_memory_limit_bytes,
                     "error":error,
                 }));
                 return Ok(ClientRun {
@@ -4074,6 +4075,7 @@ async fn run_clients_inner(
     if let Some(prepared) = &mut prepared_guard {
         prepared.engine.arm(run_start_unix_ms, measurement_end_unix_ms);
         prepared.engine.proof["run_id"] = json!(project_run_id);
+        prepared.probe.since_ms = unix_time_ms_u64()?.saturating_sub(GUARD_MAX_GAP_MS);
     }
     let mut sampler = ResourceSampler::start(
         platform.resource_sampler_source(),
@@ -13138,6 +13140,63 @@ mod tests {
         assert_eq!(outcomes[0]["maintenance_exit_classification"], "nonzero_health_exit");
         assert_eq!(outcomes[0]["exit_code"], 1);
         assert!(!serde_json::to_string(&outcomes)?.contains("private"));
+        fs::write(fixture.join("mode"), "overload_success")?;
+        local.run_id = "guard-lifecycle".to_owned();
+        local.state_dir = fixture.join("guard-state");
+        local.control_dir = local.state_dir.clone();
+        fs::create_dir(&local.state_dir)?;
+        fs::write(
+            fixture.join("project"),
+            scoped_compose_project(
+                config.platform.compose_project.as_deref().context("fixture project")?,
+                &local.run_id,
+            ),
+        )?;
+        let baseline = local.process_logs(&config).await?;
+        local.retain_cell_process_baseline(&baseline);
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let mut row = sample_result(&run_id, "sqlserver_wait_stats", 0);
+        row.status = "failed".to_owned();
+        row.failure = Some("above_ceiling: overload_stop hard_cap_fraction".to_owned());
+        let stop = json!({"classification":"above_ceiling","reason":"hard_cap_fraction","metric":"container_memory_bytes",
+            "observed_value":900,"cap":1000,"fraction":0.9,"window_index":0,"timestamp_ms":1});
+        row.evidence_json = Some(json!({"version":1,"overload_stop":stop}).to_string());
+        local.cleanup(&config).await.context("guard-triggered normal cleanup")?;
+        let receipt = local
+            .shutdown_drain_evidence()
+            .context("normal lifecycle receipt missing")?;
+        let mut outcome = finish_matrix_cell(&config, "orchestration", &run_id, 1, 1, Ok(vec![row]), Ok(()));
+        attach_shutdown_drain_evidence(&mut outcome, receipt)?;
+        assert!(outcome.error.is_some());
+        assert_eq!(outcome.rows[0].status, "failed");
+        let retained: Value = serde_json::from_str(
+            outcome.rows[0]
+                .evidence_json
+                .as_deref()
+                .context("guard evidence missing")?,
+        )?;
+        assert_eq!(retained["overload_stop"], stop);
+        assert_eq!(
+            retained["shutdown_drain"]["collectors"][0]["drain"]["status"],
+            "observed"
+        );
+        assert_eq!(
+            retained["shutdown_drain"]["maintenance"][0]["outcomes"]["operation_count"],
+            5
+        );
+        assert_eq!(retained["shutdown_drain"]["maintenance"][0]["exit_code"], 0);
+        assert!(fixture.join("compose-destroyed").exists());
+        let commands = fs::read_to_string(fixture.join("commands"))?;
+        let ingress = commands
+            .find("stop --time 300 guard-client")
+            .context("ingress was not stopped")?;
+        let maintenance = commands
+            .find("stop --time 300 guard-maintenance")
+            .context("maintenance was not stopped")?;
+        let collector = commands
+            .find("stop --time 300 guard-collector")
+            .context("collector was not stopped")?;
+        assert!(ingress < maintenance && maintenance < collector);
         fs::write(fixture.join("mode"), "stop_failure")?;
 
         config.platform.kind = crate::config::OatMode::Aks;

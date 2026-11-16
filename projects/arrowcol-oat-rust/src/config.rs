@@ -109,6 +109,7 @@ pub struct PlatformConfig {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LocalOptions {
+    pub collector_memory_limit_bytes: Option<u64>,
     pub bind_host: Option<std::net::IpAddr>,
     pub endpoint_host: Option<String>,
     pub snapshot_root: Option<String>,
@@ -377,6 +378,14 @@ impl OatConfig {
     ///
     /// Returns an error when a setting is invalid or a requested DMV table is unsupported.
     pub fn validate(&self) -> Result<()> {
+        if self
+            .platform
+            .local
+            .collector_memory_limit_bytes
+            .is_some_and(|bytes| !(8 * 1024 * 1024..=1024_u64.pow(4)).contains(&bytes))
+        {
+            bail!("platform.local.collector_memory_limit_bytes must be integer bytes in 8388608..=1099511627776");
+        }
         if !self.overload_guard.cap_fraction.is_finite()
             || self.overload_guard.cap_fraction <= 0.0
             || self.overload_guard.cap_fraction > 0.90
@@ -534,7 +543,8 @@ impl OatConfig {
                     || self.platform.compose_state_root.is_some()
                     || self.platform.local.bind_host.is_some()
                     || self.platform.local.endpoint_host.is_some()
-                    || self.platform.local.snapshot_root.is_some() =>
+                    || self.platform.local.snapshot_root.is_some()
+                    || self.platform.local.collector_memory_limit_bytes.is_some() =>
             {
                 bail!("compose settings are only valid for the local platform");
             }

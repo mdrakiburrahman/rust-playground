@@ -121,6 +121,7 @@ function sourceShapedRun(sequence: number, rates: number[], start: number, gapAt
     version: 1,
     overload_guard: {
       status: 'complete', run_id: cell, run_start_ms: start - 30_000, measurement_end_ms: end,
+      requested_container_memory_limit_bytes: null,
       settings: { enabled: true, cap_fraction: 0.9, zero_progress_windows: 2 },
       coverage_start_ms: start - 30_000, coverage_end_ms: end, max_sampling_gap_ms: 1000,
       sample_count: seconds + 31, peak_cap_fraction: 0.1,
@@ -696,6 +697,7 @@ test('requires live guard coverage and confirmed caps and renders actual overloa
     (evidence: typeof original) => { evidence.overload_guard = null; },
     (evidence: typeof original) => { evidence.overload_guard.status = 'unavailable'; },
     (evidence: typeof original) => { evidence.overload_guard.last_caps[0].confirmed = false; },
+    (evidence: typeof original) => { evidence.overload_guard.requested_container_memory_limit_bytes = 8388608; },
     (evidence: typeof original) => { evidence.overload_guard.max_sampling_gap_ms = 5001; },
     (evidence: typeof original) => { evidence.overload_guard.coverage_start_ms = 1_000_001; },
   ]) {
