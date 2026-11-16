@@ -2443,8 +2443,8 @@ mod tests {
     #[test]
     fn publication_backlog_replay_preserves_first_age_until_durable_success() {
         let metrics = RuntimeMetrics::new(CollectorInstanceId::new());
-        metrics.configure_publication_backlog(2).expect("bound");
-        metrics.configure_publication_backlog(2).expect("same bound");
+        metrics.configure_publication_backlog(3).expect("bound");
+        metrics.configure_publication_backlog(3).expect("same bound");
         let first = PublicationId::new();
         let second = PublicationId::new();
         let now = Instant::now();
