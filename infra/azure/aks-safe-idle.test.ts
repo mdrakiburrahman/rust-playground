@@ -19,7 +19,7 @@ function fixture(t: TestContext, change: (id: string, value: Record<string, unkn
         id === c.cluster_id ? 'Microsoft.Kusto/clusters' : 'Microsoft.ContainerService/managedClusters',
       tags: { ...TAGS, sandboxId: c.sandbox },
       properties: pool ? { provisioningState: 'Succeeded', vmSize: 'Standard_D8ds_v6',
-        count: pool === 'systempool' ? 2 : 0, enableAutoScaling: true, minCount: 0, maxCount: 1 } :
+        count: pool === 'systempool' ? 2 : 0, enableAutoScaling: pool !== 'systempool', minCount: 0, maxCount: 1 } :
         id === c.cluster_id ? { provisioningState: 'Succeeded', state: 'Running', enableAutoStop: true,
           optimizedAutoscale: { isEnabled: true, minimum: 2, maximum: 4 } } : { provisioningState: 'Succeeded',
           agentPoolProfiles: ['systempool', 'benchd64', 'benche64'].map(name => ({ name })) },
@@ -44,6 +44,7 @@ test('safe-idle capacity observation uses only exact-resource GETs with positive
     /^[a-f0-9]{64}$/.test(receipt.body_sha256)));
   assert.deepEqual(result.user_pools.map(pool => [pool.name, pool.count, pool.autoscale_min, pool.autoscale_max]),
     [['benchd64', 0, 0, 1], ['benche64', 0, 0, 1]]);
+  assert.equal(result.system_pool.autoscale_enabled, false);
 });
 
 test('scaled, stopped or provisioning capacity is not idle; incomplete and mismatched observations fail UNKNOWN', async t => {
@@ -75,4 +76,12 @@ test('scaled, stopped or provisioning capacity is not idle; incomplete and misma
       Object.assign(value.properties as object, { agentPoolProfiles: [{ name: 'another-pool' }] });
   });
   await assert.rejects(observe_custody_idle_capacity(extraPool.azure), /UNKNOWN.*pool inventory/);
+  const expandingSystem = fixture(t, (id, value) => {
+    if (id.endsWith('/agentPools/systempool')) Object.assign(value.properties as object, { enableAutoScaling: true, minCount: 2, maxCount: 10 });
+  });
+  assert.equal((await observe_custody_idle_capacity(expandingSystem.azure)).status, 'capacity_not_idle');
+  const unknownSystem = fixture(t, (id, value) => {
+    if (id.endsWith('/agentPools/systempool')) delete (value.properties as Record<string, unknown>).enableAutoScaling;
+  });
+  await assert.rejects(observe_custody_idle_capacity(unknownSystem.azure), /UNKNOWN.*system autoscaler/);
 });

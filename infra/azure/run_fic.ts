@@ -88,16 +88,24 @@ export interface RunWorkloadStopReceipt {
   observed_at_unix_ms: number;
 }
 export interface RunCleanupAuthority { assertCurrent(): Promise<void> }
-export interface NamespaceDeletionIntent {
-  workload_record: RunFicRecord;
+export type RunNamespaceIdentity = Pick<RunFicRecord, 'version' | 'runId' | 'namespace' | 'namespaceUid' | 'namespaceOwner' | 'aksId' | 'server'>;
+export interface NamespaceStopReceipt {
+  schema_version: 1;
+  namespace_record: RunNamespaceIdentity;
+  delete_succeeded: true;
+  absence_confirmed: true;
+  observed_at_unix_ms: number;
+}
+export interface NamespaceDeletionIntent<T extends RunNamespaceIdentity = RunFicRecord> {
+  workload_record: T;
   deletion: { apiVersion: 'v1'; kind: 'DeleteOptions'; preconditions: { uid: string } };
 }
-export interface NamespaceDeletionJournal {
-  load(): Promise<{ intent: NamespaceDeletionIntent; response: unknown | null; receipt?: RunWorkloadStopReceipt } | undefined>;
-  persist(intent: NamespaceDeletionIntent, response: unknown | null): Promise<void>;
+export interface NamespaceDeletionJournal<T extends RunNamespaceIdentity = RunFicRecord, R = RunWorkloadStopReceipt> {
+  load(): Promise<{ intent: NamespaceDeletionIntent<T>; response: unknown | null; receipt?: R } | undefined>;
+  persist(intent: NamespaceDeletionIntent<T>, response: unknown | null): Promise<void>;
 }
 
-export function assert_namespace_delete_response(value: unknown, record: RunFicRecord): void {
+export function assert_namespace_delete_response(value: unknown, record: Pick<RunNamespaceIdentity, 'namespace' | 'namespaceUid'>): void {
   const response = object(value, 'Namespace DELETE response');
   const metadata = response.kind === 'Namespace' ? object(response.metadata, 'Deleted namespace metadata') : undefined;
   const details = response.kind === 'Status' ? object(response.details, 'Namespace delete status') : undefined;
@@ -114,6 +122,18 @@ export function assert_namespace_delete_response(value: unknown, record: RunFicR
 export async function delete_run_namespace(azure: Azure, input: RunFicRecord, receiptPath: string,
   authority: RunCleanupAuthority, journal?: NamespaceDeletionJournal): Promise<RunWorkloadStopReceipt> {
   const record = parse_run_fic_record(input, azure.c);
+  return deleteNamespace(azure, record, receiptPath, authority, stopReceipt, journal);
+}
+export async function delete_owned_namespace(azure: Azure, input: RunNamespaceIdentity, receiptPath: string,
+  authority: RunCleanupAuthority, journal: NamespaceDeletionJournal<RunNamespaceIdentity, NamespaceStopReceipt>): Promise<NamespaceStopReceipt> {
+  const record = parse_run_namespace_identity(input, azure.c);
+  return deleteNamespace(azure, record, receiptPath, authority, (identity, observedAt) => ({
+    schema_version: 1, namespace_record: identity, delete_succeeded: true, absence_confirmed: true, observed_at_unix_ms: observedAt,
+  }), journal);
+}
+async function deleteNamespace<T extends RunNamespaceIdentity, R extends { observed_at_unix_ms: number }>(azure: Azure,
+  record: T, receiptPath: string, authority: RunCleanupAuthority, receiptFor: (record: T, observedAt: number) => R,
+  journal?: NamespaceDeletionJournal<T, R>): Promise<R> {
   return reset_lock(receiptPath, async () => {
     await authority.assertCurrent();
     const cluster = await azure.arm('GET', record.aksId, undefined, false, AKS_API);
@@ -122,7 +142,7 @@ export async function delete_run_namespace(azure: Azure, input: RunFicRecord, re
     const intentPath = receiptPath + '.delete-intent';
     const responsePath = receiptPath + '.delete-response';
     const deletion = { apiVersion: 'v1' as const, kind: 'DeleteOptions' as const, preconditions: { uid: record.namespaceUid } };
-    const intent: NamespaceDeletionIntent = { workload_record: record, deletion };
+    const intent: NamespaceDeletionIntent<T> = { workload_record: record, deletion };
     const recovered = await journal?.load();
     if (recovered) {
       if (canonical_json(recovered.intent) !== canonical_json(intent)) throw new Failure('Durable namespace deletion identity differs.');
@@ -164,16 +184,28 @@ export async function delete_run_namespace(azure: Azure, input: RunFicRecord, re
     const remaining = await kubectl(record, ['get', 'namespace', record.namespace, '--ignore-not-found', '--output', 'name']);
     if (remaining) throw new Failure('Original namespace deletion is still pending; receipt not complete.');
     if (fs.existsSync(receiptPath)) {
-      const prior = private_run_fic_json(receiptPath) as RunWorkloadStopReceipt;
-      if (canonical_json(prior.workload_record) !== canonical_json(record) ||
-          canonical_json(prior) !== canonical_json(stopReceipt(record, prior.observed_at_unix_ms)))
+      const prior = object(private_run_fic_json(receiptPath), 'Workload stop receipt'), observedAt = prior.observed_at_unix_ms;
+      if (typeof observedAt !== 'number' || !Number.isSafeInteger(observedAt) || observedAt < 1 ||
+          observedAt > Date.now() || canonical_json(prior) !== canonical_json(receiptFor(record, observedAt)))
         throw new Failure('Existing workload stop receipt changed.');
-      return prior;
+      return receiptFor(record, observedAt);
     }
-    const receipt = stopReceipt(record, Date.now());
+    const receipt = receiptFor(record, Date.now());
     publish_private(receiptPath, receipt);
     return receipt;
   });
+}
+export function parse_run_namespace_identity(input: unknown, c: Config): RunNamespaceIdentity {
+  const value = object(input, 'Namespace custody');
+  if (Object.keys(value).sort().join(',') !== ['version', 'runId', 'namespace', 'namespaceUid', 'namespaceOwner', 'aksId', 'server'].sort().join(',') ||
+      value.version !== 1 || c.mode !== 'stamped') throw new Failure('Invalid namespace custody fields or stamp.');
+  const runId = uuid(string(value, 'runId')), namespace = string(value, 'namespace'), namespaceOwner = string(value, 'namespaceOwner');
+  validate_run_identity(runId, namespace, 'custody');
+  const aksId = string(value, 'aksId'), server = string(value, 'server'), url = https_url(server, 'AKS server');
+  if (!/^[A-Za-z0-9_-]{16,128}$/.test(namespaceOwner) ||
+      aksId.toLowerCase() !== (c.base + '/providers/Microsoft.ContainerService/managedClusters/' + c.cluster).toLowerCase() ||
+      url.pathname !== '/' || (url.port && url.port !== '443')) throw new Failure('Namespace custody is outside its original stamp or owner.');
+  return { version: 1, runId, namespace, namespaceUid: uuid(string(value, 'namespaceUid')), namespaceOwner, aksId, server };
 }
 function stopReceipt(record: RunFicRecord, observedAt: number): RunWorkloadStopReceipt {
   if (!Number.isSafeInteger(observedAt) || observedAt < 1 || observedAt > Date.now())
@@ -859,6 +891,26 @@ export async function recover_run_fic_record(azure: Azure, original: RunFicRecor
         throw new Failure('Local FIC recovery target differs from durable custody.');
     } else publish_private(recordPath, entry.record);
   });
+}
+export async function find_run_fic_record(azure: Azure, plan: RunFicPlan, authority: RunCleanupAuthority): Promise<RunFicRecord | undefined> {
+  await authority.assertCurrent();
+  const actual = await plan_run_fic(azure, plan.runId, plan.namespace, plan.serviceAccount);
+  if (canonical_json(actual) !== canonical_json(plan)) throw new Failure('Original FIC plan identity changed.');
+  const snapshot = await read_ledger(azure);
+  if (snapshot && snapshot.value.transaction?.phase !== 'complete') throw new Failure('FIC coordination outcome is unresolved.');
+  const entry = snapshot?.value.entries[plan.runId];
+  if (!entry) {
+    if (await azure.arm('GET', plan.resourceId, undefined, true, ARM_API) !== null)
+      throw new Failure('Exact FIC exists without original durable creation proof.');
+    return undefined;
+  }
+  assert_run_fic_plan(plan, entry.record);
+  if (!['ready', 'deleted'].includes(entry.record.phase)) throw new Failure('FIC creation or deletion outcome is unresolved.');
+  assert_owned_entry(entry, entry.record);
+  if (entry.record.phase === 'ready') await verify_run_resources(azure, entry.record);
+  else if (await azure.arm('GET', plan.resourceId, undefined, true, ARM_API) !== null)
+    throw new Failure('A successor FIC exists after recorded deletion; never adopt it.');
+  return entry.record;
 }
 export async function cleanup_run_fic(azure: Azure, runId: string, recordPath: string,
   authority?: RunCleanupAuthority): Promise<void> {

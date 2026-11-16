@@ -30,7 +30,8 @@ export interface SafeIdleCapacityObservation {
   status: 'capacity_idle' | 'capacity_not_idle';
   workload_and_data_verification: 'unknown';
   aks_provisioning_state: string;
-  system_pool: { name: string; count: number; vm_size: string; provisioning_state: string };
+  system_pool: { name: string; count: number; vm_size: string; provisioning_state: string;
+    autoscale_enabled: boolean; autoscale_min: number | null; autoscale_max: number | null };
   user_pools: Array<{ name: string; count: number; autoscale_min: number; autoscale_max: number;
     autoscale_enabled: boolean; provisioning_state: string }>;
   kusto: { sku: string; capacity: number; autoscale_min: number; autoscale_max: number;
@@ -72,8 +73,12 @@ export async function observe_custody_idle_capacity(azure: Azure): Promise<SafeI
     throw new Failure('Safe-idle ARM observation is UNKNOWN: incomplete or unexpected pool inventory.');
   const systemProperties = object(system.properties), kustoProperties = object(cluster.properties);
   const autoscale = object(kustoProperties.optimizedAutoscale), sku = object(cluster.sku);
+  if (typeof systemProperties.enableAutoScaling !== 'boolean')
+    throw new Failure('Safe-idle ARM observation is UNKNOWN: missing system autoscaler flag.');
   const systemPool = { name: 'systempool', count: count(systemProperties.count), vm_size: text(systemProperties.vmSize),
-    provisioning_state: text(systemProperties.provisioningState) };
+    provisioning_state: text(systemProperties.provisioningState), autoscale_enabled: systemProperties.enableAutoScaling,
+    autoscale_min: systemProperties.enableAutoScaling ? count(systemProperties.minCount) : null,
+    autoscale_max: systemProperties.enableAutoScaling ? count(systemProperties.maxCount) : null };
   const userPools = [client, collector].map((resource, index) => {
     const properties = object(resource.properties);
     if (typeof properties.enableAutoScaling !== 'boolean') throw new Failure('Safe-idle ARM observation is UNKNOWN: missing autoscaler flag.');
@@ -91,7 +96,8 @@ export async function observe_custody_idle_capacity(azure: Azure): Promise<SafeI
   if (aksProvisioningState !== 'Succeeded' || systemPool.provisioning_state !== 'Succeeded' ||
       userPools.some(pool => pool.provisioning_state !== 'Succeeded') || kusto.provisioning_state !== 'Succeeded')
     failures.push('arm_provisioning_not_succeeded');
-  if (![2, 3].includes(systemPool.count) || systemPool.vm_size !== 'Standard_D8ds_v6') failures.push('system_pool_outside_safe_idle');
+  if (![2, 3].includes(systemPool.count) || systemPool.vm_size !== 'Standard_D8ds_v6' || systemPool.autoscale_enabled)
+    failures.push('system_pool_outside_safe_idle');
   if (userPools.some(pool => pool.count !== 0 || !pool.autoscale_enabled || pool.autoscale_min !== 0 || pool.autoscale_max !== 1))
     failures.push('benchmark_pool_outside_safe_idle');
   if (kusto.sku !== 'Standard_E4ads_v5' || kusto.capacity !== 2 || !kusto.autoscale_enabled ||

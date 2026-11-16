@@ -10,11 +10,11 @@ Custody therefore runs as a watchdog on a dedicated, separately leased devbox, n
 | Lifetime | Six-hour hard maximum; heartbeats never extend expiry |
 | Ownership | Compare-and-swap ETags plus monotonic fencing tokens reject stale owners |
 | ARM operations | Poll and reconcile operation URLs only on `management.azure.com` and the selected subscription; uncertain operations remain unsettled |
-| Safe idle | System pool 2×D8ds_v6, falling back to baseline 3×D8ds_v6 if any pod is unschedulable or a PDB blocks drain; bench pools 0 nodes with autoscale 0..1; Kusto at least Standard_E4ads_v5 ×2, autoscale 2..4, auto-stop on, never stopped |
+| Safe idle | Fixed system pool (autoscale explicitly off) 2×D8ds_v6, falling back to baseline 3×D8ds_v6 if any pod is unschedulable or a PDB blocks drain; bench pools 0 nodes with autoscale 0..1; Kusto at least Standard_E4ads_v5 ×2, autoscale 2..4, auto-stop on, never stopped |
 | Cleanup state machine | Fencing persists ordered, stable idempotency receipts; retries resume the same step, and completion requires every step to verify |
-| Cleanup adapter | Not yet qualified. The CLI fails closed on a fenced campaign without an injected executor; keep custody unarmed and do not start scale/load until the external stop/drain/evidence/QAP/FIC/ARM adapter is wired and exercised |
+| Cleanup adapter | Source/mocked only. Exact discovery, namespace/QAP/FIC custody and ARM rollback providers exist; runner lifecycle, full data observations and external rehearsal remain required. The watchdog still fails closed without an installed executor; keep custody unarmed. |
 
-The helper APIs below expose the original QAP Blob custody without replacing its full ownership snapshot or positive workload-stop checks. E1 must persist the returned credential-free reference before load. Concrete namespace/QAP/FIC actions exist, but no complete default external action adapter is wired yet: runner stop/drain/evidence contracts, full workload/data verification, adapter rehearsal and independent watchdog lease renewal remain gates. Keep the campaign unarmed.
+The helper APIs below expose the original QAP Blob custody without replacing its full ownership snapshot or positive workload-stop checks. E1 must persist the credential-free reference before load. `createDefaultCleanupProviders` composes the independent providers with explicitly supplied runner lifecycle actions; it is not a qualified, unattended default watchdog. Concrete lifecycle/recovery providers, positive full-data observations, adapter rehearsal and independent watchdog lease renewal remain gates. Keep the campaign unarmed.
 
 Before campaign load, exercise heartbeat expiry, stale-owner rejection, repeated cleanup, and a safe-idle no-op on the watchdog box. Confirm the final ARM state and preserve the evidence before handing the lease back. A cleanup operation that is pending or uncertain is never reported as complete.
 
@@ -37,4 +37,77 @@ The watchdog imports `recover_oat_qap_record`, `delete_oat_qap_workload`, `recov
 
 `cleanup_oat_qap(azure, recordPath, stopPath, authority)` reuses all existing full-snapshot, connection, schema, policy, environment and positive workload-stop checks. It can resume an affirmatively held original root lease only with controller authority; ordinary producer calls still require released custody. A controller can recover `cleaning` only when intent is null and every entry is fully evidenced `ready` or `dropped`; confirmed drops are not replayed. Recovery validates the original create/policy/drop receipts, including process loss after the final drop before `cleaned`. Acquisition/release ambiguity, incomplete bindings, unresolved mutation intents and drift remain explicit blockers; there is no lease break, inferred success, broad deletion or Delta-data deletion.
 
-`createOwnedRunCleanupActions(store, azure, reference, privateWorkDirectory)` in `aks-cleanup-executor.ts` binds the three exact namespace/QAP/FIC actions to these helpers. It rereads current cleaning campaign/actor/fence and immutable run origin at every helper gate, compares the full binding set, and retains private local evidence on errors. QAP cleanup always uses the complete original record, never individual loose inventory bindings. FIC recovery additionally requires the original completed shared ledger and creation proof; uncertain transactions remain blocked. Completed FIC cleanup rechecks exact-resource absence and never deletes a successor. Compose these actions with positive runner lifecycle and safe-idle providers; they do not supply those missing providers or authorize arming.
+`createOwnedRunCleanupActions(store, azure, reference, privateWorkDirectory, setupPlan?)` in `aks-cleanup-executor.ts` binds the three exact namespace/QAP/FIC actions to these helpers. It rereads the current invocation actor/fence and immutable run origin at every helper gate, compares the full binding set, and retains private local evidence on errors. Producer cleanup stays active and requires a live heartbeat; controller cleanup requires the current cleaning fence. QAP cleanup always uses the complete original record, never loose inventory bindings. FIC recovery additionally requires the original completed shared ledger and creation proof; uncertain transactions remain blocked. Completed FIC cleanup rechecks exact-resource absence and never deletes a successor.
+
+## Setup loss and exact discovery
+
+Persist `fic.plan` before prepare, each exact workload intent before apply, `qap.reference` once available, and credential-free `evidence_destination` before capture. Attached plans/references/destinations are immutable. Namespace `owner_token` always remains the producer owner, never the controller's newer fencing token.
+
+| State | Required proof |
+| --- | --- |
+| QAP not planned (`qap=null`) | Supply the original `RunFicPlan` as `setupPlan`; namespace/FIC cleanup does not require or fabricate a ready QAP/ServiceAccount record. |
+| Namespace deletion before QAP | Exact original UID, namespace labels and annotations, and the conditional namespace-only journal `_arrowcol-custody/namespaces/<run-id>/<namespace-uid>.json`; `intent`/`responded`/`complete` retain the same no-uncertain-DELETE-replay rules. Invalid completion receipts are rejected before writing. |
+| FIC created before runner loss | Recover its original affirmative shared-ledger creation proof and completed transaction; require the positive namespace-stop journal before deleting that exact credential. |
+| Planned FIC never created | Exact authoritative credential GET plus no unresolved shared-ledger intent; persist the original exact absence receipt, not fabricated creation/removal success. |
+| Workload UID known | Exact API/kind/name/namespace and persisted UID inside the exact owned namespace. |
+| Workload UID unknown | Additionally require both labels **and** annotations `arrowcol-oat/run-id` and `arrowcol-oat/owner-token` to match the immutable run/origin before adoption. |
+| QAP planned but no recoverable reference | UNKNOWN; no prefix discovery, inferred ownership, loose cleanup or success fallback. The original full custody reference/recovery boundary must be resolved. |
+
+`discoverOwnedRunInventory` supports the explicitly inventoried Deployment (`apps/v1`), Job (`batch/v1`) and Pod (`v1`) objects only. It never lists broadly for adoption/deletion. Permission/API failure is not absence; terminal absence receipts retain their original identity/time.
+
+## Per-cell effect CLI and refresh
+
+Use `npx --no-install tsx projects/arrowcol-oat/aks-campaign.ts cleanup-step <selector>`. This **executes** the selected provider effect; a custody-enabled runner must not also perform the matching direct Rust cleanup. Legacy noncampaign cleanup is unchanged. An unavailable provider, nonzero exit or UNKNOWN never permits fallback direct cleanup.
+
+| Exported `CellCleanupSelector` | Provider action |
+| --- | --- |
+| `stop_admission` | `stop-admission` |
+| `bounded_drain` | `bounded-drain` |
+| `evidence_capture` | `preserve-evidence` |
+| `stop_maintenance` | `stop-maintenance` |
+| `terminal_capture` | `record-terminal-state` |
+| `remove_namespace` | `remove-run-namespace` |
+| `remove_qap` | `remove-run-qap` |
+| `remove_fic` | `remove-run-fic` |
+| `handoff` | `cell-handoff`: verify prior per-cell receipts and all lifecycle/resource terminal proofs, then confirm the final cell CAS. No hidden deletion, capacity restore or campaign completion. |
+
+The exact `CELL_CLEANUP_SELECTORS`, `CellCleanupEnvelope`, `CellCleanupReceipt`, `ReadInventoryEnvelope` and `ReadInventoryResult` are exported by `aks-cell-cleanup.ts`. All stdin is bounded to 1 MiB.
+
+```typescript
+// cleanup-step input
+{ schema_version: 1, inventory: RunInventory, expected_etag: string,
+  actor: { mode: "producer" | "controller", owner_id: string, fencing_token: number } }
+// cleanup-step success
+{ ok: true, receipt: { status: "complete", step: CellCleanupSelector,
+  campaign_id: string, owner_id: string, fencing_token: number,
+  orchestration_run_id: string, cell_run_id: string, namespace_uid: string | null,
+  actor: { mode: "producer" | "controller", owner_id: string, fencing_token: number },
+  completed_at_unix_ms: number, etag: string } }
+```
+
+Receipt top-level owner/fence identify the immutable producer; nested `actor` identifies the invocation. Before effects, authority, exact durable inventory and expected ETag must match. Controllers additionally require the matching current outer running step/key (`handoff` is guarded by outer `verify-safe-idle`, not a call to campaign-terminal restoration). Normal producer cleanup changes only per-cell inventory and never transitions active to cleaning.
+
+Conditional per-selector journals under `_arrowcol-custody/campaigns/<campaign>/cells/<cell>/` progress from `running` to `effect-confirmed` to `complete`. A provider's positive response is persisted before the confirmed post-effect inventory CAS. Losing the write/confirmation resumes that proof without executing again. An effect whose response is unknown requires an explicit positive recovery provider; an empty journal read, listing absence or refreshed inventory is not proof of completion. Lifecycle and unknown-outcome recovery providers are **not installed by the default CLI**; those selectors fail nonzero rather than return positive stubs.
+
+Refresh using `aks-campaign.ts read-inventory`, not `status`. Strict stdin is:
+
+```typescript
+{ schema_version: 1, campaign_id: string, orchestration_run_id: string, cell_run_id: string,
+  actor: { mode: "producer" | "controller", owner_id: string, fencing_token: number } }
+```
+
+Success is exactly `{ok:true,inventory,etag}` from one validated durable read. The configured campaign environment, live producer/current cleaning controller, immutable origin and exact requested run/cell must match. No writes or provider effects occur. Replace the runner cache after confirmed step success or a pre-effect stale-version refusal; do not reconstruct TypeScript deadlines. This read does not resolve UNKNOWN effects or authorize replay.
+
+Both CLIs return one JSON error line, nonzero: `{ok:false,code:"campaign_fenced"|"write_outcome_unknown"|"invalid_or_storage_error",message}`.
+
+## Campaign-terminal providers
+
+| API | Safety boundary |
+| --- | --- |
+| `captureCleanupBaseline(store, azure, owner, token)` | Live producer custody, before ARM mutations; positive idle-capacity receipts, conditional immutable baseline Blob and matching write/readback ETag. Never replace a baseline with current capacity. |
+| `createDefaultCleanupProviders(store, options)` | Concrete discovery and owned namespace/QAP/FIC actions, plus ARM restoration and full-safety composition. Requires supplied lifecycle providers; no implicit success implementation. |
+| `restoreSafeIdle` | Current controller only. Reconcile unresolved ARM receipts first; persist exact resource/target before each PUT/PATCH. One capacity dimension per invocation. An uncertain target is polled, never blindly reissued. Try two system nodes, retain the original three-node fallback after scheduling/PDB problems; preserve recognized writable configuration and reject unknown properties/SKU drift. Never stop Kusto. |
+| `observeStampHealth` | Re-resolve the exact original ARM/server identity; require positive PodList/PDB resource versions, current PDB generation and typed readiness/scheduling observations. UNKNOWN is not healthy. |
+| `verifySafeIdle` | Fresh capacity and pod observations **plus** an explicit timely run-bound `FullDataSafetyReceipt` with evidence ETag, QAP health/backlog and preserved Delta/Kusto row counts. Capacity alone always leaves full safety UNKNOWN. |
+
+The default watchdog remains unarmed until concrete lifecycle/full-data implementations and external-adapter rehearsal pass. This source/mocked work performs no live cloud reads/mutations, load or scaling.

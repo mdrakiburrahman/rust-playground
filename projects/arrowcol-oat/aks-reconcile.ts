@@ -35,6 +35,21 @@ export async function reconcileArmOperation(operation: ArmOperationReceipt, read
   if ([202, 408, 429, 500, 502, 503, 504].includes(response.status)) return { ...operation, status: 'pending', lastCheckedAtMs: now };
   if (response.status < 200 || response.status >= 300) return { ...operation, status: 'indeterminate', lastCheckedAtMs: now };
   const body = object(response.body);
+  if (operation.cleanupTarget) {
+    const properties = object(body?.properties), target = operation.cleanupTarget;
+    if (typeof body?.id !== 'string' || body.id.toLowerCase() !== operation.resourceId.toLowerCase() || !properties)
+      return { ...operation, status: 'indeterminate', lastCheckedAtMs: now };
+    const state = properties.provisioningState;
+    if (state === 'Failed' || state === 'Canceled') return { ...operation, status: 'failed', lastCheckedAtMs: now };
+    if (state !== 'Succeeded') return { ...operation, status: 'pending', lastCheckedAtMs: now };
+    const sku = object(body.sku), autoscale = object(properties.optimizedAutoscale);
+    const matches = target.kind === 'aks-pool' ?
+      properties.count === target.count && properties.enableAutoScaling === target.autoscale &&
+        (!target.autoscale || properties.minCount === target.minimum && properties.maxCount === target.maximum) :
+      sku?.name === target.sku && sku.capacity === target.capacity && properties.enableAutoStop === target.autoStop &&
+        autoscale?.isEnabled === true && autoscale.minimum === target.minimum && autoscale.maximum === target.maximum;
+    return { ...operation, status: matches ? 'succeeded' : 'indeterminate', lastCheckedAtMs: now };
+  }
   const status = body?.status;
   if (status === 'Succeeded') return { ...operation, status: 'succeeded', lastCheckedAtMs: now };
   if (status === 'Failed' || status === 'Canceled') return { ...operation, status: 'failed', lastCheckedAtMs: now };
@@ -81,9 +96,12 @@ export async function reconcilePendingArmOperations(store: CampaignStore, read: 
   if (!stored.state.operations.some(operation => operation.status === 'pending' || operation.status === 'indeterminate')) return stored.state;
   const updates = await Promise.all(stored.state.operations.map(operation => reconcileArmOperation(operation, read, subscriptionId, now)));
   return (await mutateCampaign(store, current => {
-    if (!current || current.campaignId !== stored.state.campaignId) throw new Error('Campaign changed during ARM operation reconciliation.');
+    if (!current || current.campaignId !== stored.state.campaignId || current.ownerId !== stored.state.ownerId ||
+        current.fencingToken !== stored.state.fencingToken || current.status !== stored.state.status)
+      throw new Error('Campaign authority changed during ARM operation reconciliation.');
     const updated = new Map(updates.map(operation => [operation.id, operation]));
-    return { ...current, operations: current.operations.map(operation => updated.get(operation.id) ?? operation) };
+    return { ...current, operations: current.operations.map(operation =>
+      ['succeeded', 'failed'].includes(operation.status) ? operation : updated.get(operation.id) ?? operation) };
   })).state;
 }
 

@@ -1,6 +1,8 @@
 import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import type { RunFicPlan } from '../../infra/azure/run_fic.js';
+import type { OatQapReference } from '../../infra/azure/oat_qap.js';
 export const HEARTBEAT_INTERVAL_MS = 60_000;
 export const MISSED_HEARTBEAT_LIMIT = 3;
 export const MAX_CAMPAIGN_LIFETIME_MS = 6 * 60 * 60 * 1000;
@@ -14,7 +16,20 @@ const containerName = /^[a-z0-9](?:[a-z0-9-]{1,61}[a-z0-9])?$/;
 export type CampaignMode = 'observe' | 'armed';
 export type CampaignStatus = 'active' | 'fenced' | 'cleaning' | 'complete';
 export type ArmOperationStatus = 'pending' | 'succeeded' | 'failed' | 'indeterminate';
-export interface ArmOperationReceipt { id: string; resourceId: string; operationUrl: string; submittedAtMs: number; status: ArmOperationStatus; lastCheckedAtMs?: number; }
+export type CleanupArmTarget =
+  { kind: 'aks-pool'; count: number; autoscale: boolean; minimum: number | null; maximum: number | null } |
+  { kind: 'kusto'; sku: 'Standard_E4ads_v5'; capacity: 2; minimum: 2; maximum: 4; autoStop: true };
+export interface ArmOperationReceipt { id: string; resourceId: string; operationUrl: string; submittedAtMs: number;
+  status: ArmOperationStatus; lastCheckedAtMs?: number; cleanupTarget?: CleanupArmTarget; }
+export function validCleanupArmTarget(value: unknown): value is CleanupArmTarget {
+  if (!record(value)) return false;
+  if (value.kind === 'aks-pool') return exactRecord(value, ['kind', 'count', 'autoscale', 'minimum', 'maximum']) &&
+    nonnegative(value.count) && typeof value.autoscale === 'boolean' &&
+    (value.autoscale ? value.count === 0 && value.minimum === 0 && value.maximum === 1 :
+      [2, 3].includes(Number(value.count)) && value.minimum === null && value.maximum === null);
+  return exactRecord(value, ['kind', 'sku', 'capacity', 'minimum', 'maximum', 'autoStop']) && value.kind === 'kusto' &&
+    value.sku === 'Standard_E4ads_v5' && value.capacity === 2 && value.minimum === 2 && value.maximum === 4 && value.autoStop === true;
+}
 export interface CampaignState {
   schemaVersion: 1; campaignId: string; ownerId: string; fencingToken: number; mode: CampaignMode; status: CampaignStatus;
   startedAtMs: number; heartbeatAtMs: number; heartbeatSequence: number; expiresAtMs: number; lastEvaluatedAtMs?: number;
@@ -34,6 +49,14 @@ function nonempty(value: unknown): value is string { return typeof value === 'st
 function k8sName(value: unknown): value is string { return typeof value === 'string' && value.length <= 63 && /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(value); }
 function exactRecord(value: unknown, keys: string[]): value is Record<string, unknown> {
   return record(value) && Object.keys(value).length === keys.length && Object.keys(value).every(key => keys.includes(key));
+}
+function optionalRecord(value: unknown, required: string[], optional: string[]): value is Record<string, unknown> {
+  return record(value) && required.every(key => Object.hasOwn(value, key)) &&
+    Object.keys(value).every(key => required.includes(key) || optional.includes(key));
+}
+function sameFlatRecord(before: unknown, after: unknown): boolean {
+  return record(before) && record(after) && Object.keys(before).length === Object.keys(after).length &&
+    Object.entries(before).every(([key, value]) => after[key] === value);
 }
 export type RunInventoryResourceState = 'planned' | 'observed' | 'removed' | 'absent' | 'uncertain';
 export type InventoryResourceRole = 'collector' | 'client' | 'maintenance' | 'router';
@@ -61,8 +84,9 @@ export interface RunInventory {
   cell_run_id: string;
   namespace: { name: string; uid: string | null; owner_token: string };
   resources: RunInventoryResource[];
-  fic: { resource_id: string | null; name: string | null; state: RunInventoryResourceState; absence: InventoryFicAbsenceReceipt | null } | null;
-  qap: { database: string; bindings: Array<{ external_table: string; relative_path: string }>; state: RunInventoryResourceState; absence: InventoryQapAbsenceReceipt[] } | null;
+  fic: { resource_id: string | null; name: string | null; state: RunInventoryResourceState; absence: InventoryFicAbsenceReceipt | null; plan?: RunFicPlan | null } | null;
+  qap: { database: string; bindings: Array<{ external_table: string; relative_path: string }>; state: RunInventoryResourceState; absence: InventoryQapAbsenceReceipt[]; reference?: OatQapReference | null } | null;
+  evidence_destination?: { account: string; container: string; blob_prefix: string } | null;
   cleanup: { stop_admission: InventoryStep; bounded_drain: InventoryStep; evidence_capture: InventoryStep;
     terminal_capture: InventoryStep; handoff: InventoryStep };
 }
@@ -80,22 +104,50 @@ function validStep(value: unknown): value is InventoryStep {
 function validateRunInventory(value: unknown, state: CampaignState): RunInventory {
   const fields = ['schema_version', 'campaign_id', 'owner_id', 'fencing_token', 'orchestration_run_id', 'cell_run_id',
     'namespace', 'resources', 'fic', 'qap', 'cleanup'];
-  if (!exactRecord(value, fields) || value.schema_version !== 1 || value.campaign_id !== state.campaignId ||
+  if (!optionalRecord(value, fields, ['evidence_destination']) || value.schema_version !== 1 || value.campaign_id !== state.campaignId ||
       value.owner_id !== state.ownerId || value.fencing_token !== (state.status === 'active' ? state.fencingToken : state.runInventory?.fencing_token) || !nonnegative(value.fencing_token) || value.fencing_token === 0 ||
       !canonicalUuid(value.campaign_id) || !canonicalUuid(value.owner_id) || !canonicalUuid(value.orchestration_run_id) || !canonicalUuid(value.cell_run_id) ||
       !exactRecord(value.namespace, ['name', 'uid', 'owner_token']) || !k8sName(value.namespace.name) ||
       !String(value.namespace.name).endsWith('-' + value.cell_run_id.replace(/-/g, '')) ||
       !(value.namespace.uid === null || canonicalUuid(value.namespace.uid)) || !canonicalUuid(value.namespace.owner_token) ||
       value.namespace.owner_token !== state.ownerId || !Array.isArray(value.resources) || value.resources.length > 256 ||
-      !(value.fic === null || exactRecord(value.fic, ['resource_id', 'name', 'state', 'absence']) && ['planned', 'observed', 'removed', 'absent', 'uncertain'].includes(String(value.fic.state))) ||
-      !(value.qap === null || exactRecord(value.qap, ['database', 'bindings', 'state', 'absence']) && nonempty(value.qap.database) && Array.isArray(value.qap.bindings) && ['planned', 'observed', 'removed', 'absent', 'uncertain'].includes(String(value.qap.state)) && Array.isArray(value.qap.absence)) ||
+      !(value.fic === null || optionalRecord(value.fic, ['resource_id', 'name', 'state', 'absence'], ['plan']) && ['planned', 'observed', 'removed', 'absent', 'uncertain'].includes(String(value.fic.state))) ||
+      !(value.qap === null || optionalRecord(value.qap, ['database', 'bindings', 'state', 'absence'], ['reference']) && nonempty(value.qap.database) && Array.isArray(value.qap.bindings) && ['planned', 'observed', 'removed', 'absent', 'uncertain'].includes(String(value.qap.state)) && Array.isArray(value.qap.absence)) ||
       !exactRecord(value.cleanup, ['stop_admission', 'bounded_drain', 'evidence_capture', 'terminal_capture', 'handoff']) ||
       Object.values(value.cleanup).some(item => !validStep(item))) {
     throw new Error('RunInventory is malformed or fenced to another owner.');
   }
   const inventory = value as unknown as RunInventory;
+  const safePath = (path: unknown): path is string => typeof path === 'string' && path.length > 0 && path.length <= 2048 &&
+    path.split('/').every(part => /^[A-Za-z0-9_.-]+$/.test(part) && part !== '.' && part !== '..');
+  if (inventory.evidence_destination) {
+    const destination = inventory.evidence_destination;
+    if (!exactRecord(destination, ['account', 'container', 'blob_prefix']) || !storageName.test(destination.account) ||
+        !containerName.test(destination.container) || !safePath(destination.blob_prefix))
+      throw new Error('RunInventory evidence destination must be an exact credential-free Blob prefix.');
+  } else if (inventory.evidence_destination !== undefined && inventory.evidence_destination !== null)
+    throw new Error('RunInventory evidence destination is malformed.');
   if (inventory.fic !== null) {
     const fic = inventory.fic;
+    if (fic.plan) {
+      const plan = fic.plan;
+      const safeHttps = (input: unknown, originOnly = false) => {
+        if (typeof input !== 'string') return false;
+        try { const url = new URL(input); return url.protocol === 'https:' && !url.username && !url.password &&
+          !url.search && !url.hash && (!originOnly || url.pathname === '/'); } catch { return false; }
+      };
+      if (!exactRecord(plan, ['version', 'runId', 'namespace', 'serviceAccount', 'identityId', 'resourceId', 'clientId',
+        'tenantId', 'aksId', 'server', 'credentialName', 'issuer', 'subject', 'audience']) || plan.version !== 1 ||
+          plan.runId !== inventory.cell_run_id || plan.namespace !== inventory.namespace.name || !k8sName(plan.serviceAccount) ||
+          plan.resourceId !== fic.resource_id || plan.credentialName !== fic.name ||
+          plan.credentialName !== 'arrowcol-run-' + inventory.cell_run_id ||
+          plan.resourceId !== plan.identityId + '/federatedIdentityCredentials/' + plan.credentialName ||
+          !canonicalUuid(plan.clientId) || !canonicalUuid(plan.tenantId) || !safeHttps(plan.server, true) || !safeHttps(plan.issuer) ||
+          !/^\/subscriptions\/[a-f0-9-]{36}\/resourceGroups\/[^/?#]+\/providers\/Microsoft\.ManagedIdentity\/userAssignedIdentities\/[^/?#]+$/i.test(plan.identityId) ||
+          !/^\/subscriptions\/[a-f0-9-]{36}\/resourceGroups\/[^/?#]+\/providers\/Microsoft\.ContainerService\/managedClusters\/[^/?#]+$/i.test(plan.aksId) ||
+          plan.subject !== `system:serviceaccount:${plan.namespace}:${plan.serviceAccount}` || plan.audience !== 'api://AzureADTokenExchange')
+        throw new Error('RunInventory FIC plan differs from its exact immutable run identity.');
+    } else if (fic.plan !== undefined && fic.plan !== null) throw new Error('RunInventory FIC plan is malformed.');
     if (!(fic.resource_id === null || nonempty(fic.resource_id)) || !(fic.name === null || k8sName(fic.name)) ||
         (fic.resource_id !== null || fic.state === 'observed' || fic.state === 'removed' || fic.state === 'absent') && (!fic.resource_id || !fic.name ||
           !fic.resource_id.toLowerCase().startsWith('/subscriptions/') ||
@@ -112,6 +164,16 @@ function validateRunInventory(value: unknown, state: CampaignState): RunInventor
   }
   if (inventory.qap !== null) {
     const qap = inventory.qap;
+    if (qap.reference) {
+      const reference = qap.reference;
+      if (!exactRecord(reference, ['schema_version', 'account', 'container', 'blob', 'run_id', 'nonce', 'manifest_sha256',
+        'namespace_uid', 'namespace_owner_token']) || reference.schema_version !== 1 ||
+          !storageName.test(reference.account) || !containerName.test(reference.container) || !safePath(reference.blob) ||
+          reference.run_id !== inventory.cell_run_id || !canonicalUuid(reference.nonce) ||
+          !/^[a-f0-9]{64}$/.test(reference.manifest_sha256) || reference.namespace_uid !== inventory.namespace.uid ||
+          reference.namespace_owner_token !== inventory.namespace.owner_token)
+        throw new Error('RunInventory QAP reference differs from its original namespace/run.');
+    } else if (qap.reference !== undefined && qap.reference !== null) throw new Error('RunInventory QAP reference is malformed.');
     const safeIdentifier = (item: string) => /^[a-zA-Z0-9_-]+$/.test(item);
     if (!safeIdentifier(qap.database)) throw new Error('RunInventory QAP database is malformed.');
     const bindingKeys = new Set<string>();
@@ -198,6 +260,8 @@ function mergeRunInventory(before: RunInventory | undefined, after: RunInventory
       before.namespace.uid && after.namespace.uid && before.namespace.uid !== after.namespace.uid) {
     throw new Error('RunInventory immutable ownership fields changed.');
   }
+  if (before.evidence_destination && !sameFlatRecord(before.evidence_destination, after.evidence_destination))
+    throw new Error('RunInventory evidence destination is immutable.');
   const resources = new Map(before.resources.map(resource => [[resource.api_version, resource.kind, resource.name].join('|'), resource]));
   for (const next of after.resources) {
     const key = [next.api_version, next.kind, next.name].join('|');
@@ -212,6 +276,7 @@ function mergeRunInventory(before: RunInventory | undefined, after: RunInventory
     if (!before.fic) return after.fic;
     if (!after.fic || before.fic.name && after.fic.name !== before.fic.name ||
         before.fic.resource_id && after.fic.resource_id !== before.fic.resource_id ||
+        before.fic.plan && !sameFlatRecord(before.fic.plan, after.fic.plan) ||
         before.fic.absence && JSON.stringify(before.fic.absence) !== JSON.stringify(after.fic.absence)) throw new Error('RunInventory FIC identity changed.');
     return { ...before.fic, ...after.fic, name: before.fic.name ?? after.fic.name,
       resource_id: before.fic.resource_id ?? after.fic.resource_id, absence: before.fic.absence ?? after.fic.absence,
@@ -223,6 +288,9 @@ function mergeRunInventory(before: RunInventory | undefined, after: RunInventory
       !after.qap!.bindings.some(next => next.external_table === old.external_table && next.relative_path === old.relative_path))) {
       throw new Error('RunInventory QAP identity changed.');
     }
+    if (before.qap.reference && (!sameFlatRecord(before.qap.reference, after.qap.reference) ||
+        before.qap.bindings.length !== after.qap.bindings.length))
+      throw new Error('RunInventory QAP reference is immutable with its exact planned bindings.');
     const absence = new Map(after.qap.absence.map(receipt => [receipt.external_table + '|' + receipt.relative_path, receipt]));
     for (const receipt of before.qap.absence) {
       const next = absence.get(receipt.external_table + '|' + receipt.relative_path);
@@ -306,7 +374,8 @@ export function validateCampaignState(value: unknown): CampaignState {
         typeof operation.resourceId !== 'string' || !operation.resourceId.startsWith(`/subscriptions/`) ||
         typeof operation.operationUrl !== 'string' || !nonnegative(operation.submittedAtMs) ||
         !['pending', 'succeeded', 'failed', 'indeterminate'].includes(operation.status) ||
-        operation.lastCheckedAtMs !== undefined && !nonnegative(operation.lastCheckedAtMs)) {
+        operation.lastCheckedAtMs !== undefined && !nonnegative(operation.lastCheckedAtMs) ||
+        operation.cleanupTarget !== undefined && !validCleanupArmTarget(operation.cleanupTarget)) {
       throw new Error('ARM operation receipt is malformed.');
     }
     const operationSubscription = /^\/subscriptions\/([0-9a-f-]{36})\//i.exec(operation.resourceId)?.[1];
@@ -441,6 +510,27 @@ export class CampaignFencedError extends Error {
 export class CampaignWriteOutcomeUnknownError extends Error {
   constructor() { super('RunInventory write outcome could not be confirmed by a strong readback.'); this.name = 'CampaignWriteOutcomeUnknownError'; }
 }
+export async function compareAndSwapRunInventory(store: CampaignStore, expected: StoredCampaign,
+  value: RunInventory, assertCurrent: () => Promise<void>): Promise<StoredCampaign> {
+  await assertCurrent();
+  const current = await store.read();
+  if (!current || current.etag !== expected.etag || JSON.stringify(current.state.runInventory) !== JSON.stringify(expected.state.runInventory))
+    throw new CampaignConflictError();
+  const merged = mergeRunInventory(current.state.runInventory, validateRunInventory(value, current.state));
+  const next = validateCampaignState({ ...current.state, runInventory: merged });
+  let etag: string;
+  try { etag = await store.write(next, current.etag); }
+  catch (error) {
+    if (error instanceof CampaignConflictError) throw error;
+    throw new CampaignWriteOutcomeUnknownError();
+  }
+  let confirmed: StoredCampaign | undefined;
+  try { confirmed = await store.read(); } catch { throw new CampaignWriteOutcomeUnknownError(); }
+  if (!etag || !confirmed || confirmed.etag !== etag || JSON.stringify(confirmed.state) !== JSON.stringify(next))
+    throw new CampaignWriteOutcomeUnknownError();
+  await assertCurrent();
+  return confirmed;
+}
 
 async function writeInventoryWithReadback(store: CampaignStore, current: StoredCampaign, nextState: CampaignState,
   merged: RunInventory, expectedStatus: CampaignStatus, expectedFencingToken: number): Promise<StoredCampaign | undefined> {
@@ -556,6 +646,20 @@ export async function recordArmOperation(store: CampaignStore, ownerId: string, 
   });
 }
 
+export async function recordCleanupArmOperation(store: CampaignStore, ownerId: string, fencingToken: number,
+  operation: Omit<ArmOperationReceipt, 'status'> & { cleanupTarget: CleanupArmTarget }, subscriptionId: string): Promise<StoredCampaign> {
+  const operationUrl = httpsManagementUrl(operation.operationUrl, subscriptionId);
+  return mutateCampaign(store, current => {
+    if (!current || current.status !== 'cleaning' || current.ownerId !== ownerId || current.fencingToken !== fencingToken ||
+        !validCleanupArmTarget(operation.cleanupTarget) || current.operations.some(existing => existing.id === operation.id) ||
+        current.operations.length >= MAX_ARM_OPERATIONS ||
+        !operation.resourceId.toLowerCase().startsWith(`/subscriptions/${subscriptionId.toLowerCase()}/`) ||
+        new URL(operationUrl).pathname.toLowerCase() !== operation.resourceId.toLowerCase())
+      throw new CampaignFencedError('Cleanup ARM intent requires current cleaning authority and an exact resource URL.');
+    return { ...current, operations: [...current.operations, { ...operation, operationUrl, status: 'pending' }] };
+  });
+}
+
 async function readRunInventoryStdin(): Promise<unknown> {
   let input = '';
   for await (const chunk of process.stdin) {
@@ -607,14 +711,47 @@ async function main(args: string[]): Promise<void> {
       cell_run_id: state.runInventory!.cell_run_id, namespace_uid: state.runInventory!.namespace.uid } }));
   } else if (action === 'status' && args.length === 1) {
     console.log(JSON.stringify((await store.read())?.state ?? { status: 'idle' }));
+  } else if (action === 'read-inventory' && args.length === 1) {
+    const { readCellRunInventory } = await import('./aks-cell-cleanup.js');
+    console.log(JSON.stringify(await readCellRunInventory(store, await readRunInventoryStdin(), process.env)));
+  } else if (action === 'cleanup-step' && args.length === 2) {
+    const cell = await import('./aks-cell-cleanup.js');
+    if (!Object.hasOwn(cell.CELL_CLEANUP_SELECTORS, args[1]!)) throw new Error('Unknown cleanup-step selector.');
+    const input = cell.parseCellCleanupEnvelope(await readRunInventoryStdin());
+    await cell.readCellRunInventory(store, { schema_version: 1, campaign_id: input.inventory.campaign_id,
+      orchestration_run_id: input.inventory.orchestration_run_id, cell_run_id: input.inventory.cell_run_id, actor: input.actor }, process.env);
+    const { Azure, Config } = await import('../../infra/azure/bootstrap.js');
+    const { createDefaultCleanupProviders } = await import('./aks-default-providers.js');
+    const fs = await import('node:fs'), os = await import('node:os');
+    const azure = new Azure(new Config({ AZURE_SUBSCRIPTION_ID: subscriptionId }));
+    if (process.env.CAMPAIGN_STORAGE_ACCOUNT !== azure.c.account || process.env.CAMPAIGN_STATE_CONTAINER !== azure.c.checkpoints)
+      throw new Error('Cleanup custody must use the exact selected stamp checkpoints account/container.');
+    const workDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'oat-cell-cleanup-'));
+    const unavailable = async (): Promise<never> => { throw new Error('Concrete runner lifecycle provider is not installed; outcome UNKNOWN.'); };
+    const actions = createDefaultCleanupProviders(store, { azure, workDirectory, lifecycle: {
+      stopAdmission: unavailable, boundedDrain: unavailable, preserveEvidence: unavailable,
+      stopMaintenanceIfUidAndOwnerMatch: unavailable, captureTerminalState: unavailable,
+    } });
+    const providers = cell.createCellCleanupProviders(actions);
+    for (const selector of ['stop_admission', 'bounded_drain', 'evidence_capture', 'stop_maintenance', 'terminal_capture'] as const)
+      delete providers[selector];
+    const log = console.log;
+    let receipt: import('./aks-cell-cleanup.js').CellCleanupReceipt;
+    try {
+      console.log = (...values: unknown[]) => console.error(...values);
+      receipt = await cell.executeCellCleanupStep(store, input, args[1] as import('./aks-cell-cleanup.js').CellCleanupSelector,
+        providers, assertCurrent => cell.createBlobCellStepJournal(azure, input, assertCurrent));
+    } finally { console.log = log; }
+    fs.rmSync(workDirectory, { recursive: true });
+    console.log(JSON.stringify({ ok: true, receipt }));
   } else {
-    throw new Error('Usage: aks-campaign.ts start <campaign-uuid> [owner-uuid] | heartbeat <owner-uuid> <fencing-token> | arm <owner-uuid> <fencing-token> | publish-inventory (JSON stdin) | assert-ready <owner-uuid> <fencing-token> | status');
+    throw new Error('Usage: aks-campaign.ts start <campaign-uuid> [owner-uuid] | heartbeat <owner-uuid> <fencing-token> | arm <owner-uuid> <fencing-token> | publish-inventory (JSON stdin) | assert-ready <owner-uuid> <fencing-token> | read-inventory (JSON envelope stdin) | cleanup-step <selector> (JSON envelope stdin) | status');
   }
 }
 if (process.argv[1] && ['aks-campaign.ts', 'aks-campaign.js'].includes(path.basename(process.argv[1])) && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main(process.argv.slice(2)).catch((error: unknown) => {
     const action = process.argv[2];
-    if (action === 'publish-inventory' || action === 'assert-ready') {
+    if (action === 'publish-inventory' || action === 'assert-ready' || action === 'cleanup-step' || action === 'read-inventory') {
       const message = error instanceof Error ? error.message : 'Campaign custody failed.';
       const code = error instanceof CampaignWriteOutcomeUnknownError ? 'write_outcome_unknown' :
         error instanceof CampaignFencedError || /fenced|stale|heartbeat is expired/i.test(message) ? 'campaign_fenced' : 'invalid_or_storage_error';

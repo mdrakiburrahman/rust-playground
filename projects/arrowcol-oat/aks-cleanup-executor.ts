@@ -1,14 +1,16 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { canonical_json, type Azure } from '../../infra/azure/bootstrap.js';
-import { cleanup_run_fic, recover_run_fic_record } from '../../infra/azure/run_fic.js';
+import { cleanup_run_fic, recover_run_fic_record, type RunFicPlan } from '../../infra/azure/run_fic.js';
 import { cleanup_oat_qap, delete_oat_qap_workload, recover_oat_qap_record, recover_oat_workload_stop,
   parse_oat_qap_reference, type OatQapReference, type RecordV1 } from '../../infra/azure/oat_qap.js';
 import { publishCleanupRunInventory, type CampaignState, type CampaignStore, type InventoryStep, type RunInventory, type RunInventoryResource } from './aks-campaign.js';
 import type { CleanupExecutor } from './aks-reconcile.js';
+import { assertRunCleanupActor, createSetupRunCleanupActions } from './aks-setup-cleanup.js';
 
 export type CleanupActionResult = 'pending' | 'complete' | 'uncertain';
 export interface CleanupMutationAuthority {
+  mode?: 'producer' | 'controller';
   campaignId: string;
   ownerId: string;
   fencingToken: number;
@@ -56,14 +58,17 @@ function stepField(step: string): keyof RunInventory['cleanup'] | undefined {
 export type OwnedRunCleanupActions = Pick<ExternalCleanupActions,
   'deleteNamespaceIfUidAndOwnerMatch' | 'deleteQapBindingIfOwned' | 'deleteFicIfExact'>;
 
-export function createOwnedRunCleanupActions(store: CampaignStore, azure: Azure, inputReference: OatQapReference,
-  workDirectory: string): OwnedRunCleanupActions {
+export function createOwnedRunCleanupActions(store: CampaignStore, azure: Azure, inputReference: OatQapReference | null,
+  workDirectory: string, setupPlan?: RunFicPlan): OwnedRunCleanupActions {
+  if (inputReference === null) {
+    if (!setupPlan) throw new Error('Cleanup without QAP requires the original durable FIC plan.');
+    return createSetupRunCleanupActions(store, azure, setupPlan, workDirectory);
+  }
   const reference = parse_oat_qap_reference(inputReference);
   const fresh = async (authority: CleanupMutationAuthority): Promise<RunInventory> => {
     await authority.assertCurrent();
-    const stored = await store.read(), state = stored?.state, inventory = state?.runInventory;
-    if (!state || state.status !== 'cleaning' || state.campaignId !== authority.campaignId ||
-        state.ownerId !== authority.ownerId || state.fencingToken !== authority.fencingToken || !inventory ||
+    const inventory = await assertRunCleanupActor(store, authority);
+    if (
         inventory.campaign_id !== authority.campaignId || inventory.cell_run_id !== reference.run_id ||
         inventory.namespace.uid !== reference.namespace_uid || inventory.namespace.owner_token !== reference.namespace_owner_token)
       throw new Error('Owned cleanup reference does not match the current cleaning actor and immutable run origin.');
