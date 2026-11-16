@@ -632,4 +632,33 @@ mod maintenance_topology_tests {
         assert!(verify_process_configuration(&config, ComponentRole::Maintenance, &observed).is_err());
         Ok(())
     }
+
+    #[tokio::test]
+    #[ignore = "requires L2 delta-maintenance binary"]
+    async fn maintenance_upload_json_reaches_real_consumer_readback() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+            "parquet_writer": {"defaults": {"compression": "zstd"}},
+            "maintenance": {"enabled": true, "operations": ["optimize"],
+                "optimize_upload_mode": "buffered_multipart", "optimize_upload_buffer_bytes": 4194304,
+                "parquet_writer": {"defaults": {"compression": "snappy"}}}
+        }))?;
+        let binary = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/delta-maintenance");
+        let mut command = Command::new(binary);
+        command.env_clear().envs(role_environment(&config, ComponentRole::Maintenance)?)
+            .args(["--root", "file:///tmp/oat-e1-nonexistent-table-root", "--table", "fixture",
+                "--operation", "optimize", "--interval-secs", "60", "--max-cycles", "1",
+                "--no-metrics-listener"])
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(Duration::from_secs(30), command.output()).await??;
+        let stderr = String::from_utf8(output.stderr)?;
+        let observed = process_configurations(&stderr)?;
+        verify_process_configuration(&config, ComponentRole::Maintenance, &observed)?;
+        assert_eq!(observed["parquet_writer_overrides"]["defaults"]["compression"], "snappy");
+        assert_eq!(observed["startup"]["operation_limits"]["optimize_upload_mode"], "buffered_multipart");
+        assert_eq!(observed["startup"]["operation_limits"]["optimize_upload_buffer_bytes"], 4194304);
+        Ok(())
+    }
 }
