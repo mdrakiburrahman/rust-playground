@@ -9828,8 +9828,8 @@ mod tests {
     #[test]
     fn campaign_identity_requires_complete_canonical_fenced_context() -> Result<()> {
         let mut values = HashMap::from([
-            ("CAMPAIGN_ID", "5d4c2001-77e2-44b2-b32b-4ce79bf7dd01"),
-            ("CAMPAIGN_OWNER_ID", "5d4c2001-77e2-44b2-b32b-4ce79bf7dd02"),
+            ("CAMPAIGN_ID", "00000000-0000-0000-0000-000000000001"),
+            ("CAMPAIGN_OWNER_ID", "00000000-0000-0000-0000-000000000002"),
             ("CAMPAIGN_FENCING_TOKEN", "1"),
         ]);
         let parse = |values: &HashMap<&str, &str>| {
@@ -9853,15 +9853,15 @@ mod tests {
         let step = json!({"state":"not_started","deadline_unix_ms":null,"reason_code":null});
         let mut inventory: RunInventory = serde_json::from_value(json!({
             "schema_version": 1,
-            "campaign_id":"5d4c2001-77e2-44b2-b32b-4ce79bf7dd01",
-            "owner_id":"5d4c2001-77e2-44b2-b32b-4ce79bf7dd02",
+            "campaign_id":"00000000-0000-0000-0000-000000000001",
+            "owner_id":"00000000-0000-0000-0000-000000000002",
             "fencing_token":1,
-            "orchestration_run_id":"5d4c2001-77e2-44b2-b32b-4ce79bf7dd03",
-            "cell_run_id":"5d4c2001-77e2-44b2-b32b-4ce79bf7dd04",
-            "namespace":{"name":"oat-5d4c200177e244b2b32b4ce79bf7dd04", "uid":null,
-                "owner_token":"5d4c2001-77e2-44b2-b32b-4ce79bf7dd02"},
+            "orchestration_run_id":"00000000-0000-0000-0000-000000000003",
+            "cell_run_id":"00000000-0000-0000-0000-000000000004",
+            "namespace":{"name":"oat-00000000000000000000000000000004", "uid":null,
+                "owner_token":"00000000-0000-0000-0000-000000000002"},
             "resources":[{"api_version":"apps/v1","kind":"Deployment",
-                "namespace":"oat-5d4c200177e244b2b32b4ce79bf7dd04","name":"arrowcol",
+                "namespace":"oat-00000000000000000000000000000004","name":"arrowcol",
                 "uid":null,"role":"collector","state":"planned"}],
             "fic":null,"qap":null,
             "cleanup":{"stop_admission":step,"bounded_drain":step,"evidence_capture":step,
@@ -9869,7 +9869,7 @@ mod tests {
         }))?;
         inventory.validate()?;
         let mut wrong_owner = inventory.clone();
-        wrong_owner.namespace.owner_token = "5d4c2001-77e2-44b2-b32b-4ce79bf7dd05".to_owned();
+        wrong_owner.namespace.owner_token = "00000000-0000-0000-0000-000000000005".to_owned();
         assert!(wrong_owner.validate().is_err());
         wrong_owner = inventory.clone();
         wrong_owner.namespace.uid = Some("not-a-uid".to_owned());
@@ -9959,19 +9959,19 @@ mod tests {
         let mut observed = inventory.clone();
         observed.resources[0].state = InventoryResourceState::Observed;
         assert!(observed.validate().is_err());
-        observed.namespace.uid = Some("5d4c2001-77e2-44b2-b32b-4ce79bf7dd05".to_owned());
-        observed.resources[0].uid = Some("5d4c2001-77e2-44b2-b32b-4ce79bf7dd06".to_owned());
+        observed.namespace.uid = Some("00000000-0000-0000-0000-000000000005".to_owned());
+        observed.resources[0].uid = Some("00000000-0000-0000-0000-000000000006".to_owned());
         let ready = json!({"ok":true,"receipt":{
             "status":"ready","campaign_id":inventory.campaign_id,"owner_id":inventory.owner_id,
             "fencing_token":inventory.fencing_token,"orchestration_run_id":inventory.orchestration_run_id,
-            "cell_run_id":inventory.cell_run_id,"namespace_uid":"5d4c2001-77e2-44b2-b32b-4ce79bf7dd05"
+            "cell_run_id":inventory.cell_run_id,"namespace_uid":"00000000-0000-0000-0000-000000000005"
         }});
         observed.validate_custody_receipt(&serde_json::to_vec(&ready)?, true)?;
         assert!(inventory.validate_custody_receipt(&serde_json::to_vec(&ready)?, true).is_err());
         inventory.validate_successor(&observed)?;
         inventory = observed;
         let mut replacement = inventory.clone();
-        replacement.resources[0].uid = Some("5d4c2001-77e2-44b2-b32b-4ce79bf7dd07".to_owned());
+        replacement.resources[0].uid = Some("00000000-0000-0000-0000-000000000007".to_owned());
         assert!(inventory.validate_successor(&replacement).is_err());
         replacement = inventory.clone();
         replacement.resources[0].state = InventoryResourceState::Planned;
