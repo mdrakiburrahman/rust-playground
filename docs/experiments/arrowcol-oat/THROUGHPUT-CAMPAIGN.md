@@ -8,7 +8,7 @@
 | Maintenance | Continuous, enabled, and applying in every cell. Idle work must be a no-op; due work stays enabled. |
 | Verdict | Set `dataflow_verdict_policy` to `single_hot_table_campaign` to make QAP lag a separate finding. Missing QAP observations remain UNKNOWN/non-PASS; default legacy semantics are unchanged. |
 | Files | `oat-config-throughput-C1.json` through `C8.json` are provisional bounded manifests, not launch configs; all are marked `pending-E1-registry` and are not runnable until checked against the E1 registry. |
-| Pictures | Winner-picture generation is held until the result qualifier accepts E1's complete 30-second commit windows without gaps or cold starts. |
+| Pictures | Result pictures may show exploratory observations; no sustainable winner is shown until contiguous 30-second buckets, reconciliation, and validated timestamped pressure/maintenance-debt evidence qualify. The current runner's `backlog: null` keeps results unqualified. |
 
 ## Qualification
 
