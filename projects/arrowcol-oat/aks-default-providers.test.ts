@@ -11,6 +11,7 @@ import { CUSTODY_CLEANUP_STEPS, CampaignConflictError, CampaignWriteOutcomeUnkno
 import { captureCleanupBaseline, createDefaultCleanupProviders, readCleanupBaseline, type StampHealthReceipt } from './aks-default-providers.js';
 import type { CleanupMutationAuthority } from './aks-cleanup-executor.js';
 import { loadCustodyConfig } from './aks-custody-config.js';
+import { observeExactKubernetes, type CustodyCommandRunner } from './aks-setup-cleanup.js';
 import { watchdogOnce } from './aks-watchdog.js';
 
 const campaignId = '11111111-1111-4111-8111-111111111111';
@@ -41,6 +42,7 @@ async function fixture(t: TestContext, capture = true, c = new Config({ AZURE_SU
     subject: `system:serviceaccount:${namespace}:oat`, audience: 'api://AzureADTokenExchange' };
   const inventory: RunInventory = { schema_version: 1, campaign_id: campaignId, owner_id: ownerId, fencing_token: 1,
     orchestration_run_id: campaignId, cell_run_id: cellId, load_admission: 'not_authorized', namespace: { name: namespace, uid: null, owner_token: ownerId },
+    planned_cell_duration_ms: 60_000, effective_stop_budgets: { maintenance_grace_seconds: 900, maintenance_stop_timeout_ms: 1_200_000 },
     resources: [], fic: { resource_id: plan.resourceId, name: plan.credentialName, state: 'planned', absence: null, plan },
     qap: null, evidence_destination: { account: c.account, container: c.checkpoints, blob_prefix: 'evidence/' + cellId },
     cleanup: { stop_admission: step, bounded_drain: step, evidence_capture: step, stop_maintenance: step, terminal_capture: step, handoff: step } };
@@ -117,6 +119,19 @@ async function fixture(t: TestContext, capture = true, c = new Config({ AZURE_SU
     fault: (value: typeof fault) => { fault = value; }, health: (value: typeof health) => { health = value; } };
 }
 const properties = (value: Record<string, unknown>) => value.properties as Record<string, unknown>;
+
+test('exact Kubernetes observations use the injected command boundary', async () => {
+  const command: string[] = [], authority: CleanupMutationAuthority = {
+    campaignId, ownerId, fencingToken: 1, assertCurrent: async () => {},
+  };
+  const runCommand: CustodyCommandRunner = async args => {
+    command.push(...args);
+    return { returncode: 0, stdout: JSON.stringify({ apiVersion: 'v1', kind: 'Namespace' }), stderr: '' };
+  };
+  const result = await observeExactKubernetes('https://fixture.azmk8s.io', ['namespace', 'oat-fixture'], authority, runCommand);
+  assert.equal(result?.kind, 'Namespace');
+  assert.deepEqual(command.slice(-5), ['namespace', 'oat-fixture', '--ignore-not-found', '--output', 'json']);
+});
 
 function selectedConfig(t: TestContext) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'custody-config-'));
@@ -326,6 +341,31 @@ test('advancement after baseline write remains UNKNOWN and retry reads the origi
   assert.equal(receipt.blob, key);
   assert.equal(receipt.etag, saved.etag);
   assert.deepEqual(saved.bytes, original);
+  assert.equal(writes, 1);
+});
+
+test('simulated lost immutable baseline PUT acknowledgement retries the original proof without recapture or rewrite', async t => {
+  const f = await fixture(t, false);
+  f.inventory.namespace.uid = null;
+  f.store.state = { ...newCampaignState(campaignId, ownerId, f.store.state.startedAtMs), runInventory: f.inventory };
+  const blob = f.azure.blob.bind(f.azure);
+  let writes = 0, loseAck = true;
+  t.mock.method(f.azure, 'blob', async (...args: Parameters<Azure['blob']>) => {
+    const result = await blob(...args);
+    if (args[0] === 'PUT') {
+      writes++;
+      if (loseAck) { loseAck = false; throw new Error('Simulated lost baseline PUT acknowledgement.'); }
+    }
+    return result;
+  });
+  await assert.rejects(captureCleanupBaseline(f.store, f.azure, ownerId, 1), CampaignWriteOutcomeUnknownError);
+  const [key, saved] = [...f.blobs][0]!, original = Buffer.from(saved.bytes), etag = saved.etag;
+  t.mock.method(f.azure, 'kql', async () => { throw new Error('Baseline retry must not recapture Kusto.'); });
+  t.mock.method(f.azure, 'request', async () => { throw new Error('Baseline retry must not reobserve capacity.'); });
+  const receipt = await captureCleanupBaseline(f.store, f.azure, ownerId, 1);
+  assert.equal(receipt.blob, key);
+  assert.equal(receipt.etag, etag);
+  assert.deepEqual(f.blobs.get(key)!.bytes, original);
   assert.equal(writes, 1);
 });
 

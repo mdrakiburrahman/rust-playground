@@ -7,11 +7,19 @@ import os from 'node:os';
 import path from 'node:path';
 import { Azure } from '../../infra/azure/bootstrap.js';
 import { loadCustodyConfig } from './aks-custody-config.js';
-
-export const WATCHDOG_INTERVAL_MS = 60_000;
+import { WATCHDOG_INTERVAL_MS } from './aks-cleanup-budget.js';
+export { WATCHDOG_INTERVAL_MS };
 
 export type CleanupExecutor = (step: CleanupStepName, state: CampaignState, idempotencyKey: string) => Promise<'pending' | 'complete'>;
 export interface WatchdogReadOnlyAzure { readArmStatus(url: string): Promise<{ status: number; body?: unknown }> }
+
+function stopBudgetsForInventory(inventory: NonNullable<CampaignState['runInventory']>):
+  { maintenanceGraceSeconds: number; maintenanceStopTimeoutMs: number; budget_source: 'effective_stop_budgets' | 'legacy_ceiling' } {
+  const persisted = inventory.effective_stop_budgets;
+  if (!persisted) return { maintenanceGraceSeconds: 4_800, maintenanceStopTimeoutMs: 5_100_000, budget_source: 'legacy_ceiling' };
+  return { maintenanceGraceSeconds: persisted.maintenance_grace_seconds,
+    maintenanceStopTimeoutMs: persisted.maintenance_stop_timeout_ms, budget_source: 'effective_stop_budgets' };
+}
 
 export async function watchdogOnce(env: NodeJS.ProcessEnv = process.env, executeCleanup?: CleanupExecutor,
   storeOverride?: CampaignStore, selectedAzure?: Azure | WatchdogReadOnlyAzure): Promise<Record<string, unknown>> {
@@ -41,13 +49,18 @@ export async function watchdogOnce(env: NodeJS.ProcessEnv = process.env, execute
       const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'oat-watchdog-cleanup-'));
       try {
         const actions = createDefaultCleanupProviders(store, { azure, workDirectory: directory });
-        cleanupProgress = await reconcileCleanupOnce(store, createExternalCleanupExecutor(store, actions));
+        if (!current.state.runInventory) throw new Error('Cleanup requires a persisted RunInventory.');
+        cleanupProgress = await reconcileCleanupOnce(store, createExternalCleanupExecutor(store, actions,
+          stopBudgetsForInventory(current.state.runInventory)));
       } finally { fs.rmSync(directory, { recursive: true }); }
     }
   }
   const latest = await store.read();
   return { event: 'campaign_custody_evaluation', ...result, ...(cleanupProgress ? { cleanupProgress } : {}),
     ...(latest ? { campaignStatus: latest.state.status, cleanupStatus: latest.state.cleanupStatus } : {}),
+    ...(latest?.state.runInventory ? { maintenanceStopBudget: {
+      maintenance_stop_timeout_ms: stopBudgetsForInventory(latest.state.runInventory).maintenanceStopTimeoutMs,
+      budget_source: stopBudgetsForInventory(latest.state.runInventory).budget_source } } : {}),
     pendingArmOperations: operations?.operations.filter(operation => operation.status === 'pending' || operation.status === 'indeterminate').length ?? 0,
     observedAtMs: Date.now() };
 }

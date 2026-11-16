@@ -4,11 +4,15 @@ import { pathToFileURL } from "node:url";
 import type { RunFicPlan } from '../../infra/azure/run_fic.js';
 import type { OatQapReference } from '../../infra/azure/oat_qap.js';
 import { loadCustodyConfig } from './aks-custody-config.js';
+import { ADMISSION_STOP_BUDGET_MS, DRAIN_BUDGET_MS, TERMINAL_CAPTURE_BUDGET_MS, WATCHDOG_INTERVAL_MS } from './aks-cleanup-budget.js';
 export const HEARTBEAT_INTERVAL_MS = 60_000;
 export const MISSED_HEARTBEAT_LIMIT = 3;
 export const MAX_CAMPAIGN_LIFETIME_MS = 6 * 60 * 60 * 1000;
+const MAX_MAINTENANCE_STOP_TIMEOUT_MS = 5_100_000;
 const MAX_ARM_OPERATIONS = 128;
 export const CUSTODY_CLEANUP_STEPS = ["stop-admission", "bounded-drain", "preserve-evidence", "stop-maintenance", "record-terminal-state", "remove-run-namespace", "remove-run-qap", "remove-run-fic", "restore-safe-idle", "verify-safe-idle"] as const;
+export const OTHER_CLEANUP_HANDOFF_RESERVE_MS = ADMISSION_STOP_BUDGET_MS + DRAIN_BUDGET_MS + TERMINAL_CAPTURE_BUDGET_MS +
+  MISSED_HEARTBEAT_LIMIT * HEARTBEAT_INTERVAL_MS + CUSTODY_CLEANUP_STEPS.length * WATCHDOG_INTERVAL_MS;
 export type CleanupStepName = typeof CUSTODY_CLEANUP_STEPS[number];
 export const DRAIN_UNSETTLED_REASON = 'drain_deadline_expired_unsettled';
 export interface DrainExpiryReceipt {
@@ -96,6 +100,8 @@ export interface RunInventory {
   fic: { resource_id: string | null; name: string | null; state: RunInventoryResourceState; absence: InventoryFicAbsenceReceipt | null; plan?: RunFicPlan | null } | null;
   qap: { database: string; bindings: Array<{ external_table: string; relative_path: string }>; state: RunInventoryResourceState; absence: InventoryQapAbsenceReceipt[]; reference?: OatQapReference | null } | null;
   evidence_destination?: { account: string; container: string; blob_prefix: string } | null;
+  planned_cell_duration_ms?: number;
+  effective_stop_budgets?: { maintenance_grace_seconds: number; maintenance_stop_timeout_ms: number };
   cleanup: { stop_admission: InventoryStep; bounded_drain: InventoryStep; evidence_capture: InventoryStep; stop_maintenance: InventoryStep;
     terminal_capture: InventoryStep; handoff: InventoryStep };
 }
@@ -110,13 +116,23 @@ function validStep(value: unknown): value is InventoryStep {
     (value.reason_code === null || typeof value.reason_code === 'string' && value.reason_code.length > 0 && value.reason_code.length <= 64 && /^[a-z0-9_]+$/.test(value.reason_code)) &&
     (!['failed', 'uncertain'].includes(String(value.state)) || value.reason_code !== null);
 }
+function validEffectiveStopBudgets(value: unknown): value is NonNullable<RunInventory['effective_stop_budgets']> {
+  if (!exactRecord(value, ['maintenance_grace_seconds', 'maintenance_stop_timeout_ms'])) return false;
+  const grace = value.maintenance_grace_seconds, timeout = value.maintenance_stop_timeout_ms;
+  return nonnegative(grace) && grace > 0 && nonnegative(timeout) && timeout > 0 &&
+    Number.isSafeInteger(grace * 1_000) && timeout >= grace * 1_000 && timeout <= MAX_MAINTENANCE_STOP_TIMEOUT_MS;
+}
 function validateRunInventory(value: unknown, state: CampaignState): RunInventory {
   const fields = ['schema_version', 'campaign_id', 'owner_id', 'fencing_token', 'orchestration_run_id', 'cell_run_id', 'load_admission',
     'namespace', 'resources', 'fic', 'qap', 'cleanup'];
-  if (!optionalRecord(value, fields, ['evidence_destination']) || value.schema_version !== 1 || value.campaign_id !== state.campaignId ||
+  if (!optionalRecord(value, fields, ['evidence_destination', 'planned_cell_duration_ms', 'effective_stop_budgets']) || value.schema_version !== 1 || value.campaign_id !== state.campaignId ||
       value.owner_id !== state.ownerId || value.fencing_token !== (state.status === 'active' ? state.fencingToken : state.runInventory?.fencing_token) || !nonnegative(value.fencing_token) || value.fencing_token === 0 ||
       !canonicalUuid(value.campaign_id) || !canonicalUuid(value.owner_id) || !canonicalUuid(value.orchestration_run_id) || !canonicalUuid(value.cell_run_id) ||
       !['not_authorized', 'authorization_pending', 'authorized'].includes(String(value.load_admission)) ||
+      (value.planned_cell_duration_ms === undefined) !== (value.effective_stop_budgets === undefined) ||
+      value.planned_cell_duration_ms !== undefined && (!nonnegative(value.planned_cell_duration_ms) ||
+        value.planned_cell_duration_ms === 0 && value.load_admission !== 'not_authorized') ||
+      value.effective_stop_budgets !== undefined && !validEffectiveStopBudgets(value.effective_stop_budgets) ||
       !exactRecord(value.namespace, ['name', 'uid', 'owner_token']) || !k8sName(value.namespace.name) ||
       !String(value.namespace.name).endsWith('-' + value.cell_run_id.replace(/-/g, '')) ||
       !(value.namespace.uid === null || canonicalUuid(value.namespace.uid)) || !canonicalUuid(value.namespace.owner_token) ||
@@ -263,6 +279,7 @@ function mergeStep(before: InventoryStep, after: InventoryStep): InventoryStep {
 }
 export function isInitialRunInventory(inventory: RunInventory | undefined): boolean {
   return Boolean(inventory && inventory.load_admission === 'not_authorized' && inventory.namespace.uid === null &&
+    nonnegative(inventory.planned_cell_duration_ms) && inventory.effective_stop_budgets !== undefined &&
     inventory.resources.every(resource => resource.state === 'planned' && resource.uid === null && resource.absence === null) &&
     (!inventory.fic || inventory.fic.state === 'planned' && inventory.fic.absence === null) &&
     (!inventory.qap || inventory.qap.state === 'planned' && inventory.qap.absence.length === 0 && !inventory.qap.reference) &&
@@ -286,6 +303,11 @@ function mergeRunInventory(before: RunInventory | undefined, after: RunInventory
   const admission = ['not_authorized', 'authorization_pending', 'authorized'];
   const from = admission.indexOf(before.load_admission), to = admission.indexOf(after.load_admission);
   if (to < from || to > from + 1) throw new Error('RunInventory load admission must advance monotonically through authorization_pending.');
+  if (before.planned_cell_duration_ms !== after.planned_cell_duration_ms ||
+      (before.effective_stop_budgets === undefined) !== (after.effective_stop_budgets === undefined) ||
+      before.effective_stop_budgets && after.effective_stop_budgets &&
+        !sameFlatRecord(before.effective_stop_budgets, after.effective_stop_budgets))
+    throw new Error('RunInventory cell duration and maintenance stop budget are immutable.');
   if (before.namespace.name !== after.namespace.name || before.namespace.owner_token !== after.namespace.owner_token ||
       before.namespace.uid && after.namespace.uid && before.namespace.uid !== after.namespace.uid) {
     throw new Error('RunInventory immutable ownership fields changed.');
@@ -465,7 +487,8 @@ export function validateCampaignState(value: unknown): CampaignState {
 }
 
 export function newCampaignState(campaignId: string, ownerId: string, now = Date.now()): CampaignState {
-  if (!uuid.test(campaignId) || !uuid.test(ownerId) || !nonnegative(now)) throw new Error('Campaign and owner IDs must be UUIDs and the clock must be valid.');
+  if (!uuid.test(campaignId) || !uuid.test(ownerId) || !nonnegative(now) || !Number.isSafeInteger(now + MAX_CAMPAIGN_LIFETIME_MS))
+    throw new Error('Campaign and owner IDs must be UUIDs and the clock must be valid.');
   return { schemaVersion: 1, campaignId, ownerId, fencingToken: 1, mode: 'observe', status: 'active',
     startedAtMs: now, heartbeatAtMs: now, heartbeatSequence: 0, expiresAtMs: now + MAX_CAMPAIGN_LIFETIME_MS,
     cleanupStatus: 'not-started', cleanupSteps: [], operations: [] };
@@ -631,7 +654,8 @@ async function writeInventoryWithReadback(store: CampaignStore, current: StoredC
   }
 }
 function runInventoryReady(inventory: RunInventory | undefined): inventory is RunInventory {
-  return Boolean(inventory && inventory.load_admission === 'authorized' && inventory.namespace.uid && inventory.resources.length > 0 &&
+  return Boolean(inventory && inventory.load_admission === 'authorized' && nonnegative(inventory.planned_cell_duration_ms) &&
+    inventory.planned_cell_duration_ms > 0 && inventory.effective_stop_budgets && inventory.namespace.uid && inventory.resources.length > 0 &&
     inventory.resources.every(resource => resource.state === 'observed' && resource.uid) &&
     inventory.fic !== null && inventory.fic.state === 'observed' && inventory.qap !== null && inventory.qap.state === 'observed' && inventory.qap.bindings.length > 0 &&
     inventory.cleanup.handoff.state !== 'complete');
@@ -644,9 +668,24 @@ export async function publishRunInventory(store: CampaignStore, value: unknown, 
     const inventory = validateRunInventory(value, current.state);
     requireOwner(current.state, inventory.owner_id, inventory.fencing_token, now);
     const merged = mergeRunInventory(current.state.runInventory, inventory);
+    const previous = current.state.runInventory;
+    const newCell = !previous || previous.campaign_id !== inventory.campaign_id || previous.owner_id !== inventory.owner_id ||
+      previous.orchestration_run_id !== inventory.orchestration_run_id || previous.cell_run_id !== inventory.cell_run_id;
+    const authorizingClients = inventory.load_admission === 'authorized' && previous?.load_admission !== 'authorized';
+    if (newCell || authorizingClients) assertCellLifetimeBudget(current.state, merged, now);
     const next = validateCampaignState({ ...current.state, runInventory: merged });
     const written = await writeInventoryWithReadback(store, current, next, merged, 'active', current.state.fencingToken);
     if (written) return written;
+  }
+  function assertCellLifetimeBudget(state: CampaignState, inventory: RunInventory, now: number): void {
+    const duration = inventory.planned_cell_duration_ms;
+    const stopTimeout = inventory.effective_stop_budgets?.maintenance_stop_timeout_ms;
+    if (!nonnegative(now) || now < state.startedAtMs || !nonnegative(duration) || !nonnegative(stopTimeout))
+      throw new Error('Cell admission requires explicit planned duration and persisted maintenance stop budget.');
+    const required = duration + stopTimeout + OTHER_CLEANUP_HANDOFF_RESERVE_MS;
+    const remaining = state.expiresAtMs - now;
+    if (!Number.isSafeInteger(required) || !Number.isSafeInteger(remaining) || remaining < required)
+      throw new Error('Campaign lifetime cannot cover the planned cell, maintenance stop, and cleanup/handoff reserves.');
   }
   throw new CampaignConflictError();
 }
@@ -705,6 +744,8 @@ export async function armCampaign(store: CampaignStore, ownerId: string, fencing
     const state = requireOwner(current, ownerId, fencingToken, now);
     if (state.mode !== 'observe') throw new Error('Campaign is already armed.');
     if (!state.runInventory) throw new Error('RunInventory must be persisted before arming.');
+    if (!nonnegative(state.runInventory.planned_cell_duration_ms) || !state.runInventory.effective_stop_budgets)
+      throw new Error('Campaign cannot be armed without a new-cell duration and maintenance stop budget.');
     return { ...state, mode: 'armed' };
   });
 }

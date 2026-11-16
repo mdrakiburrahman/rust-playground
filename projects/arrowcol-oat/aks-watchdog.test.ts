@@ -29,6 +29,7 @@ const inventoryFor = (state: CampaignState): RunInventory => {
   return {
     schema_version: 1, campaign_id: campaignId, owner_id: ownerId, fencing_token: state.fencingToken,
     orchestration_run_id: 'c0ffee00-0000-4000-8000-000000000005', cell_run_id: cellRunId, load_admission: 'authorized',
+    planned_cell_duration_ms: 60_000, effective_stop_budgets: { maintenance_grace_seconds: 900, maintenance_stop_timeout_ms: 1_200_000 },
     namespace: { name: namespace, uid: 'c0ffee00-0000-4000-8000-000000000009', owner_token: ownerId },
     resources: [{ api_version: 'apps/v1', kind: 'Deployment', namespace, name: 'arrowcol',
       uid: 'c0ffee00-0000-4000-8000-000000000006', absence: null, role: 'collector', state: 'observed' }],
@@ -95,7 +96,8 @@ test('external executor invokes safe-idle restoration exactly once under the cle
     restoreSafeIdle: async (_state, _key, authority) => { await authority.assertCurrent(); restoreCalls++; return 'complete'; },
     verifySafeIdle: complete,
   };
-  const result = await reconcileCleanupOnce(store, createExternalCleanupExecutor(store, actions));
+  const result = await reconcileCleanupOnce(store, createExternalCleanupExecutor(store, actions,
+    { maintenanceGraceSeconds: 900, maintenanceStopTimeoutMs: 1_200_000, budget_source: 'effective_stop_budgets' }));
   assert.equal(result, 'progress');
   assert.equal(restoreCalls, 1);
 });
@@ -117,7 +119,8 @@ test('external executor mutation authority rereads the current cleanup token ins
     captureTerminalState: complete, deleteNamespaceIfUidAndOwnerMatch: complete, deleteQapBindingIfOwned: complete,
     deleteFicIfExact: complete, restoreSafeIdle: complete, verifySafeIdle: complete,
   };
-  await assert.rejects(reconcileCleanupOnce(store, createExternalCleanupExecutor(store, actions)), /fencing changed/);
+  await assert.rejects(reconcileCleanupOnce(store, createExternalCleanupExecutor(store, actions,
+    { maintenanceGraceSeconds: 900, maintenanceStopTimeoutMs: 1_200_000, budget_source: 'effective_stop_budgets' })), /fencing changed/);
   assert.equal(effects, 0);
   assert.equal(store.current!.state.runInventory!.fencing_token, 1);
 });
@@ -144,7 +147,8 @@ test('maintenance stop persists a deadline and retains uncertainty without repla
     captureTerminalState: async () => { terminal++; return 'complete'; },
     deleteNamespaceIfUidAndOwnerMatch: complete, deleteQapBindingIfOwned: complete, deleteFicIfExact: complete,
     restoreSafeIdle: complete, verifySafeIdle: complete };
-  const executor = createExternalCleanupExecutor(store, actions);
+  const executor = createExternalCleanupExecutor(store, actions,
+    { maintenanceGraceSeconds: 900, maintenanceStopTimeoutMs: 1_200_000, budget_source: 'effective_stop_budgets' });
   assert.equal(await reconcileCleanupOnce(store, executor), 'pending');
   const uncertain = structuredClone(store.current!.state.runInventory!.cleanup.stop_maintenance);
   assert.equal(uncertain.state, 'uncertain');

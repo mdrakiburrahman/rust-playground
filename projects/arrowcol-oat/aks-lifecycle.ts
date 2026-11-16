@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { canonical_json, runtime, type Azure } from '../../infra/azure/bootstrap.js';
 import { plan_run_fic } from '../../infra/azure/run_fic.js';
 import { hasVerifiedUnsettledDrain, validateCampaignState, type CampaignStore, type RunInventory, type RunInventoryResource } from './aks-campaign.js';
-import { assertRunCleanupActor, observeExactKubernetes } from './aks-setup-cleanup.js';
+import { assertRunCleanupActor, observeExactKubernetes, type CustodyCommandRunner } from './aks-setup-cleanup.js';
 import type { CleanupActionResult, CleanupMutationAuthority, ExternalCleanupActions } from './aks-cleanup-executor.js';
 import { cleanupBudget, withCleanupDeadline } from './aks-cleanup-budget.js';
 import { captureTerminalData } from './aks-data-safety.js';
@@ -149,7 +149,8 @@ function parseStop(value: unknown, inventory: RunInventory, field: LifecycleFiel
   return record as unknown as StopRecord;
 }
 
-export function createDefaultLifecycleActions(store: CampaignStore, azure: Azure): LifecycleActions {
+export function createDefaultLifecycleActions(store: CampaignStore, azure: Azure,
+  runCommand: CustodyCommandRunner = runtime.run_tree): LifecycleActions {
   const captureLogs = async (server: string, inventory: RunInventory, pods: PodProof[], phase: LogProof['phase'],
     authority: CleanupMutationAuthority): Promise<LogProof[]> => {
     const proofs: LogProof[] = [];
@@ -157,7 +158,7 @@ export function createDefaultLifecycleActions(store: CampaignStore, azure: Azure
       await authority.assertCurrent();
       const budget = cleanupBudget(authority), remaining = budget ? budget.deadlineUnixMs - Date.now() : 20_000;
       if (remaining <= 0) throw new Error('Log capture deadline expired before command admission.');
-      const response = await runtime.run_tree(['kubectl', '--server', server, '--insecure-skip-tls-verify=false',
+      const response = await runCommand(['kubectl', '--server', server, '--insecure-skip-tls-verify=false',
         '--request-timeout', `${Math.max(1, Math.floor(Math.min(15_000, remaining)))}ms`, 'logs', pod.name,
         '--namespace', inventory.namespace.name, '--container', container.name, '--timestamps=true', '--tail=500', '--limit-bytes=262144'],
         Math.min(20, remaining / 1000));
@@ -188,7 +189,7 @@ export function createDefaultLifecycleActions(store: CampaignStore, azure: Azure
     const plan = inventory.fic?.plan;
     if (!plan || canonical_json(plan) !== canonical_json(await plan_run_fic(azure, plan.runId, plan.namespace, plan.serviceAccount)))
       throw new Error('Lifecycle requires the original authoritative FIC plan/server.');
-    const namespace = await observeExactKubernetes(plan.server, ['namespace', inventory.namespace.name], authority);
+    const namespace = await observeExactKubernetes(plan.server, ['namespace', inventory.namespace.name], authority, runCommand);
     if (!namespace || namespace.kind !== 'Namespace' || namespace.apiVersion !== 'v1' ||
         object(namespace.metadata).uid !== inventory.namespace.uid) throw new Error('Lifecycle exact namespace UID is UNKNOWN.');
     marker(object(namespace.metadata), inventory);
@@ -216,7 +217,7 @@ export function createDefaultLifecycleActions(store: CampaignStore, azure: Azure
     const job = resource.api_version === 'batch/v1' && resource.kind === 'Job';
     if ((!deployment && !job) || !resource.uid)
       throw new Error('Lifecycle stop requires an exact UID-bound Deployment or Job; other kinds remain UNKNOWN.');
-    const value = await observeExactKubernetes(plan.server, [deployment ? 'deployment.apps' : 'job.batch', resource.name, '--namespace', resource.namespace], authority);
+    const value = await observeExactKubernetes(plan.server, [deployment ? 'deployment.apps' : 'job.batch', resource.name, '--namespace', resource.namespace], authority, runCommand);
     if (!value || value.apiVersion !== resource.api_version || value.kind !== resource.kind ||
         object(value.metadata).uid !== resource.uid || object(value.metadata).namespace !== resource.namespace ||
         object(value.metadata).name !== resource.name) throw new Error('Original lifecycle Deployment UID/type/name differs.');
@@ -229,7 +230,7 @@ export function createDefaultLifecycleActions(store: CampaignStore, azure: Azure
     const replicaUids = new Set<string>();
     if (deployment) {
       const replicas = await observeExactKubernetes(plan.server,
-        ['replicaset.apps', '--namespace', resource.namespace, '--selector', selected], authority);
+        ['replicaset.apps', '--namespace', resource.namespace, '--selector', selected], authority, runCommand);
       if (!replicas || replicas.kind !== 'ReplicaSetList' || !Array.isArray(replicas.items)) throw new Error('Exact ReplicaSet list is UNKNOWN.');
       text(object(replicas.metadata).resourceVersion);
       for (const item of replicas.items) {
@@ -240,7 +241,7 @@ export function createDefaultLifecycleActions(store: CampaignStore, azure: Azure
         replicaUids.add(text(metadata.uid));
       }
     } else replicaUids.add(resource.uid);
-    const list = await observeExactKubernetes(plan.server, ['pods', '--namespace', resource.namespace, '--selector', selected], authority);
+    const list = await observeExactKubernetes(plan.server, ['pods', '--namespace', resource.namespace, '--selector', selected], authority, runCommand);
     if (!list || list.kind !== 'PodList' || !Array.isArray(list.items)) throw new Error('Exact owned PodList is UNKNOWN.');
     text(object(list.metadata).resourceVersion);
     const pods = list.items.map(item => {
@@ -251,7 +252,7 @@ export function createDefaultLifecycleActions(store: CampaignStore, azure: Azure
       return podProof(item, inventory);
     });
     if (deployment) {
-      const autoscalers = await observeExactKubernetes(plan.server, ['horizontalpodautoscalers.autoscaling', '--namespace', resource.namespace], authority);
+      const autoscalers = await observeExactKubernetes(plan.server, ['horizontalpodautoscalers.autoscaling', '--namespace', resource.namespace], authority, runCommand);
       if (!autoscalers || autoscalers.kind !== 'HorizontalPodAutoscalerList' || !Array.isArray(autoscalers.items))
         throw new Error('Lifecycle recreation policy observation is UNKNOWN.');
       text(object(autoscalers.metadata).resourceVersion);
@@ -297,7 +298,7 @@ export function createDefaultLifecycleActions(store: CampaignStore, azure: Azure
       const patch = [{ op: 'test', path: '/metadata/uid', value: resource.uid },
         { op: 'test', path: '/metadata/resourceVersion', value: text(metadata.resourceVersion) },
         { op: 'add', path: observation.deployment ? '/spec/replicas' : '/spec/suspend', value: observation.deployment ? 0 : true }];
-      const response = await runtime.run_tree(['kubectl', '--server', observation.plan.server, '--insecure-skip-tls-verify=false',
+      const response = await runCommand(['kubectl', '--server', observation.plan.server, '--insecure-skip-tls-verify=false',
         '--request-timeout', `${Math.max(1, Math.floor(Math.min(15_000, remaining)))}ms`,
         'patch', observation.deployment ? 'deployment.apps' : 'job.batch', resource.name, '--namespace', resource.namespace,
         '--type=json', '--patch', canonical_json(patch), '--output=json'], Math.min(20, remaining / 1000));

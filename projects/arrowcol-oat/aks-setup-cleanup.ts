@@ -8,6 +8,8 @@ import type { CampaignStore, RunInventory, RunInventoryResource } from './aks-ca
 import type { CleanupMutationAuthority, OwnedRunCleanupActions } from './aks-cleanup-executor.js';
 import { cleanupBudget } from './aks-cleanup-budget.js';
 
+export type CustodyCommandRunner = typeof runtime.run_tree;
+
 function object(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Exact workload observation is UNKNOWN.');
   return value as Record<string, unknown>;
@@ -32,11 +34,12 @@ export async function assertRunCleanupActor(store: CampaignStore, authority: Cle
     throw new Error(`The current ${producer ? 'producer' : 'cleaning'} actor is fenced.`);
   return state.runInventory;
 }
-export async function observeExactKubernetes(server: string, args: string[], authority: CleanupMutationAuthority): Promise<Record<string, unknown> | undefined> {
+export async function observeExactKubernetes(server: string, args: string[], authority: CleanupMutationAuthority,
+  runCommand: CustodyCommandRunner = runtime.run_tree): Promise<Record<string, unknown> | undefined> {
   await authority.assertCurrent();
   const budget = cleanupBudget(authority), remaining = budget ? budget.deadlineUnixMs - Date.now() : 20_000;
   if (remaining <= 0) throw new Error('Exact Kubernetes observation budget expired before admission.');
-  const response = await runtime.run_tree(['kubectl', '--server', server, '--insecure-skip-tls-verify=false',
+  const response = await runCommand(['kubectl', '--server', server, '--insecure-skip-tls-verify=false',
     '--request-timeout', `${Math.max(1, Math.floor(Math.min(15_000, remaining)))}ms`,
     'get', ...args, '--ignore-not-found', '--output', 'json'], Math.min(20, remaining / 1000));
   if (response.returncode !== 0 || response.stdout.length > 4_194_304)
@@ -61,7 +64,8 @@ async function validatePlan(azure: Azure, inventory: RunInventory): Promise<RunF
     throw new Error('Cleanup requires the exact persisted authoritative FIC plan, not a guessed identity.');
   return plan;
 }
-export async function discoverOwnedRunInventory(azure: Azure, supplied: RunInventory, authority: CleanupMutationAuthority): Promise<RunInventory> {
+export async function discoverOwnedRunInventory(azure: Azure, supplied: RunInventory, authority: CleanupMutationAuthority,
+  runCommand: CustodyCommandRunner = runtime.run_tree): Promise<RunInventory> {
   const inventory = structuredClone(supplied), plan = await validatePlan(azure, inventory);
   const originalFic = inventory.fic ? await find_run_fic_record(azure, plan, authority) : undefined;
   if (originalFic) {
@@ -70,7 +74,7 @@ export async function discoverOwnedRunInventory(azure: Azure, supplied: RunInven
       throw new Error('Original FIC creation proof belongs to another namespace UID/owner.');
     inventory.namespace.uid ??= originalFic.namespaceUid;
   }
-  const namespace = await observeExactKubernetes(plan.server, ['namespace', inventory.namespace.name], authority);
+  const namespace = await observeExactKubernetes(plan.server, ['namespace', inventory.namespace.name], authority, runCommand);
   if (namespace) {
     if (namespace.apiVersion !== 'v1' || namespace.kind !== 'Namespace') throw new Error('Exact namespace type differs.');
     const observedUid = uid(ownedMetadata(namespace, inventory, inventory.namespace.name).uid);
@@ -82,7 +86,7 @@ export async function discoverOwnedRunInventory(azure: Azure, supplied: RunInven
     const type = resource.api_version + ':' + resource.kind;
     const names: Record<string, string> = { 'apps/v1:Deployment': 'deployment.apps', 'batch/v1:Job': 'job.batch', 'v1:Pod': 'pod' };
     if (!names[type]) throw new Error('Unsupported exact workload API/kind.');
-    const value = await observeExactKubernetes(plan.server, [names[type], resource.name, '--namespace', resource.namespace], authority);
+    const value = await observeExactKubernetes(plan.server, [names[type], resource.name, '--namespace', resource.namespace], authority, runCommand);
     if (!value) {
       if (resource.uid === null) {
         resource.state = 'absent';
@@ -99,7 +103,7 @@ export async function discoverOwnedRunInventory(azure: Azure, supplied: RunInven
     const observedUid = uid(metadata.uid);
     if (resource.uid !== null && resource.uid !== observedUid) throw new Error('Original workload UID changed.');
     if (resource.uid === null) ownedMetadata(value, inventory, resource.name, resource.namespace);
-    const currentNamespace = await observeExactKubernetes(plan.server, ['namespace', inventory.namespace.name], authority);
+    const currentNamespace = await observeExactKubernetes(plan.server, ['namespace', inventory.namespace.name], authority, runCommand);
     if (!currentNamespace || uid(ownedMetadata(currentNamespace, inventory, inventory.namespace.name).uid) !== originalNamespaceUid)
       throw new Error('Namespace identity changed during exact workload discovery.');
     resource.uid = observedUid;

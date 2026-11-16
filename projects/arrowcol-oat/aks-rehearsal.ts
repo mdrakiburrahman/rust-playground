@@ -158,6 +158,8 @@ export function createSyntheticArmedCampaignState(rehearsalId: string, ownerId: 
     orchestration_run_id: randomUUID(),
     cell_run_id: cellRunId,
     load_admission: 'not_authorized',
+    planned_cell_duration_ms: 0,
+    effective_stop_budgets: { maintenance_grace_seconds: 4_800, maintenance_stop_timeout_ms: 5_100_000 },
     namespace: { name: namespace, uid: null, owner_token: ownerId },
     resources: [{ api_version: 'apps/v1', kind: 'Deployment', namespace, name: 'synthetic-collector', uid: null,
       absence: null, role: 'collector', state: 'planned' }],

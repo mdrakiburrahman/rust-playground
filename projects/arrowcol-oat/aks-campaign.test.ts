@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { CampaignConflictError, CUSTODY_CLEANUP_STEPS, MAX_CAMPAIGN_LIFETIME_MS, MISSED_HEARTBEAT_LIMIT, HEARTBEAT_INTERVAL_MS,
+import { CampaignConflictError, CUSTODY_CLEANUP_STEPS, MAX_CAMPAIGN_LIFETIME_MS, OTHER_CLEANUP_HANDOFF_RESERVE_MS,
+  MISSED_HEARTBEAT_LIMIT, HEARTBEAT_INTERVAL_MS,
   createBlobCampaignStore,
   armCampaign, assertCampaignEnvironment, assertRunInventoryReady, campaignStartReceipt, heartbeatCampaign, mutateCampaign, newCampaignState, publishCleanupRunInventory, publishRunInventory, runInventoryPublishReceipt, startCampaign,
   validateCampaignState, type CampaignState, type CampaignStore, type RunInventory, type StoredCampaign,
@@ -43,6 +44,7 @@ const inventoryFor = (state: CampaignState, observed = false): RunInventory => {
   return {
     schema_version: 1, campaign_id: state.campaignId, owner_id: state.ownerId, fencing_token: state.runInventory?.fencing_token ?? state.fencingToken,
     orchestration_run_id: orchestrationRunId, cell_run_id: cellRunId, load_admission: state.runInventory?.load_admission ?? 'not_authorized',
+    planned_cell_duration_ms: 60_000, effective_stop_budgets: { maintenance_grace_seconds: 900, maintenance_stop_timeout_ms: 1_200_000 },
     namespace: { name: namespace, uid: observed ? 'c0ffee00-0000-4000-8000-000000000009' : null, owner_token: state.ownerId },
     resources: names.map((name, index) => ({ api_version: 'apps/v1', kind: 'Deployment', namespace, name,
       uid: observed ? uids[index]! : null, absence: null, role: index === 0 ? 'collector' : index === 1 ? 'client' : 'maintenance', state: stateName })),
@@ -77,6 +79,35 @@ test('load admission requires a pre-provisioning initial record and cannot skip 
   await publishRunInventory(store, { ...planned, load_admission: 'authorized' }, started.startedAtMs);
   await assert.rejects(publishRunInventory(store, planned, started.startedAtMs), /monotonically/);
   assert.equal((await store.read())!.state.runInventory!.load_admission, 'authorized');
+});
+
+test('cell admission requires exact remaining lifetime and rejects the one-millisecond-short boundary', async () => {
+  const required = MAX_CAMPAIGN_LIFETIME_MS;
+  const duration = required - 1_200_000 - OTHER_CLEANUP_HANDOFF_RESERVE_MS;
+  const exactState = newCampaignState(campaignId, ownerId, 100);
+  const exactNow = exactState.expiresAtMs - required;
+  exactState.heartbeatAtMs = exactNow;
+  const exact = new MemoryStore();
+  exact.current = { state: exactState, etag: 'etag-1' };
+  await publishRunInventory(exact, { ...inventoryFor(exactState), planned_cell_duration_ms: duration }, exactNow);
+
+  const shortState = newCampaignState(campaignId, ownerId, 100);
+  const shortNow = shortState.expiresAtMs - required + 1;
+  shortState.heartbeatAtMs = shortNow;
+  const short = new MemoryStore();
+  short.current = { state: shortState, etag: 'etag-1' };
+  await assert.rejects(publishRunInventory(short, { ...inventoryFor(shortState), planned_cell_duration_ms: duration }, shortNow),
+    /cannot cover the planned cell/);
+});
+
+test('zero-duration rehearsal stays not-authorized and cell duration/stop budgets cannot change', async () => {
+  const store = await seed(), started = (await store.read())!.state;
+  const rowFree = { ...inventoryFor(started), planned_cell_duration_ms: 0 };
+  await publishRunInventory(store, rowFree, started.startedAtMs);
+  await assert.rejects(publishRunInventory(store, { ...rowFree, load_admission: 'authorization_pending' }, started.startedAtMs), /malformed/);
+  await assert.rejects(publishRunInventory(store, { ...rowFree, planned_cell_duration_ms: 1 }, started.startedAtMs), /immutable/);
+  await assert.rejects(publishRunInventory(store, { ...rowFree,
+    effective_stop_budgets: { maintenance_grace_seconds: 900, maintenance_stop_timeout_ms: 1_200_001 } }, started.startedAtMs), /immutable/);
 });
 
 test('maintenance milestone is required, bounded, monotonic and required for handoff', async () => {

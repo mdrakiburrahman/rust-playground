@@ -30,6 +30,7 @@ async function fixture(t: TestContext, deployment = false) {
   const step = { state: 'not_started' as const, deadline_unix_ms: null, reason_code: null };
   const inventory: RunInventory = { schema_version: 1, campaign_id: campaignId, owner_id: ownerId, fencing_token: 1,
     orchestration_run_id: campaignId, cell_run_id: cellId, load_admission: 'authorized',
+    planned_cell_duration_ms: 60_000, effective_stop_budgets: { maintenance_grace_seconds: 900, maintenance_stop_timeout_ms: 1_200_000 },
     namespace: { name: namespace, uid: cellId, owner_token: ownerId },
     resources: [{ api_version: deployment ? 'apps/v1' : 'batch/v1', kind: deployment ? 'Deployment' : 'Job', namespace, name: 'maintenance', uid: workloadUid,
       role: 'maintenance', state: 'observed', absence: null }],
@@ -189,12 +190,15 @@ test('controller terminal capture stops a residual collector after drain expiry 
 });
 test('unknown residual PATCH is recovered only by positive exact stopped state, never by repeating PATCH', async t => {
   const f = await fixture(t), current = await f.controller(); f.setFault('patch_unknown');
+  const deadline = current.inventory.cleanup.terminal_capture.deadline_unix_ms;
   await assert.rejects(f.actions.captureTerminalState(current.inventory, 'terminal', current.authority), /Lost PATCH/);
   f.setFault('none');
-  assert.equal(await f.actions.recoverLifecycle!('terminal_capture', current.inventory, null, 'terminal', current.authority), 'complete');
+  const restartedActions = createDefaultLifecycleActions(f.store, f.azure);
+  assert.equal(await restartedActions.recoverLifecycle!('terminal_capture', current.inventory, deadline, 'terminal', current.authority), 'complete');
   assert.equal(f.patchCount, 1);
   const stops = [...f.blobs.values()].map(value => JSON.parse(value.bytes.toString())).filter(value => value.phase === 'complete');
   assert.equal(stops[0].response.source, 'exact_state_recovery');
+  assert.equal(stops[0].deadline_unix_ms, deadline);
 });
 for (const shape of ['init_sidecar', 'missing', 'ephemeral'] as const) {
   test(`terminal recovery and freeze refuse incomplete physical stop: ${shape}`, async t => {
@@ -272,7 +276,8 @@ test('controller executor pins inventory ETag across residual stop intent even w
   const actions: ExternalCleanupActions = { ...f.actions, discoverExactInventory: async inventory => inventory,
     deleteNamespaceIfUidAndOwnerMatch: forbidden, deleteQapBindingIfOwned: forbidden, deleteFicIfExact: forbidden,
     restoreSafeIdle: forbidden, verifySafeIdle: forbidden };
-  const execute = createExternalCleanupExecutor(f.store, actions);
+  const execute = createExternalCleanupExecutor(f.store, actions,
+    { maintenanceGraceSeconds: 900, maintenanceStopTimeoutMs: 1_200_000, budget_source: 'effective_stop_budgets' });
   await assert.rejects(execute('record-terminal-state', f.state, `${campaignId}:2:record-terminal-state`), /fencing changed/);
   assert.equal(f.patchCount, 0);
 });
