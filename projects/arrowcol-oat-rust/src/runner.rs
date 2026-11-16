@@ -8101,8 +8101,10 @@ async fn prepare_aks_platform(
         Some(&config.namespace),
         Some(&service_account),
         &fic_record,
-        None,
-        Some(&fic_plan_path),
+        FicHelperOptions {
+            wait_seconds: None,
+            identity_plan_path: Some(&fic_plan_path),
+        },
         bootstrap_env_file,
     )
     .await
@@ -8114,8 +8116,10 @@ async fn prepare_aks_platform(
         Some(&config.namespace),
         Some(&service_account),
         &fic_record,
-        Some("300"),
-        None,
+        FicHelperOptions {
+            wait_seconds: Some("300"),
+            identity_plan_path: None,
+        },
         bootstrap_env_file,
     )
     .await
@@ -8263,6 +8267,12 @@ struct AksHelperConfigPaths<'a> {
     bootstrap_env_file: &'a Path,
 }
 
+#[derive(Clone, Copy)]
+struct FicHelperOptions<'a> {
+    wait_seconds: Option<&'a str>,
+    identity_plan_path: Option<&'a Path>,
+}
+
 async fn run_run_fic_plan(
     run_id: &str,
     namespace: &str,
@@ -8304,8 +8314,7 @@ fn run_fic_helper_command(
     namespace: Option<&str>,
     service_account: Option<&str>,
     record_path: &Path,
-    wait_seconds: Option<&str>,
-    identity_plan_path: Option<&Path>,
+    options: FicHelperOptions<'_>,
     config_paths: AksHelperConfigPaths<'_>,
 ) -> Result<Command> {
     let workspace = std::env::current_dir()?;
@@ -8328,10 +8337,10 @@ fn run_fic_helper_command(
     }
     command.arg("--record");
     command.arg(record_path);
-    if let Some(wait_seconds) = wait_seconds {
+    if let Some(wait_seconds) = options.wait_seconds {
         command.args(["--wait-seconds", wait_seconds]);
     }
-    match (operation, identity_plan_path) {
+    match (operation, options.identity_plan_path) {
         ("prepare-run-fic", Some(path)) => {
             command.arg("--identity-plan").arg(path);
         }
@@ -8348,8 +8357,7 @@ async fn run_run_fic_helper(
     namespace: Option<&str>,
     service_account: Option<&str>,
     record_path: &Path,
-    wait_seconds: Option<&str>,
-    identity_plan_path: Option<&Path>,
+    options: FicHelperOptions<'_>,
     bootstrap_env_file: &Path,
 ) -> Result<()> {
     let workspace = std::env::current_dir()?;
@@ -8360,8 +8368,7 @@ async fn run_run_fic_helper(
         namespace,
         service_account,
         record_path,
-        wait_seconds,
-        identity_plan_path,
+        options,
         AksHelperConfigPaths {
             stamp_config_path: &stamp_config_path,
             bootstrap_env_file,
@@ -9892,8 +9899,10 @@ async fn cleanup_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
                             None,
                             None,
                             record_path,
-                            None,
-                            None,
+                            FicHelperOptions {
+                                wait_seconds: None,
+                                identity_plan_path: None,
+                            },
                             bootstrap_env_file,
                         ),
                     )
@@ -11254,8 +11263,10 @@ mod tests {
                 Some("arrow-collector-00000000000000000000000000000001"),
                 Some("arrowcol-oat"),
                 Path::new("/tmp/run-fic.json"),
-                None,
-                (operation == "prepare-run-fic").then_some(Path::new("/tmp/run-fic-plan.json")),
+                FicHelperOptions {
+                    wait_seconds: None,
+                    identity_plan_path: (operation == "prepare-run-fic").then_some(Path::new("/tmp/run-fic-plan.json")),
+                },
                 AksHelperConfigPaths {
                     stamp_config_path: Path::new("/tmp/stamp-87513.yaml"),
                     bootstrap_env_file: Path::new("/tmp/oat-private-bootstrap.env"),
@@ -11297,8 +11308,10 @@ mod tests {
                 Some("oat-test"),
                 Some("arrowcol-oat"),
                 Path::new("/tmp/run-fic.json"),
-                None,
-                None,
+                FicHelperOptions {
+                    wait_seconds: None,
+                    identity_plan_path: None,
+                },
                 AksHelperConfigPaths {
                     stamp_config_path: Path::new("/tmp/stamp-87513.yaml"),
                     bootstrap_env_file: Path::new("/tmp/oat-private-bootstrap.env"),
@@ -11678,10 +11691,8 @@ mod tests {
         assert!(stale_read.downcast_ref::<StaleCampaignVersionError>().is_none());
         for code in ["campaign_fenced", "write_outcome_unknown", "invalid_or_storage_error"] {
             let response = json!({"ok":false,"code":code});
-            let error = campaign_custody_helper_failure(
-                "cleanup-step",
-                &serde_json::to_vec(&response).expect("serialize failure"),
-            );
+            let response_bytes = serde_json::to_vec(&response)?;
+            let error = campaign_custody_helper_failure("cleanup-step", &response_bytes);
             assert!(error.downcast_ref::<StaleCampaignVersionError>().is_none());
             assert!(error.to_string().contains(code));
         }
