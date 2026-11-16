@@ -59,13 +59,13 @@ State the latency boundary, sample size, uncertainty/censoring and evidence limi
 
 ## Frozen table
 
-**PROVISIONAL; final at the scored baseline:** `sqlserver_availability_replica_states`, selected from the public-schema/generator estimate. `sqlserver_active_sessions` is retained for quick smoke runs only.
+**FINAL (shared brief D6):** `sqlserver_availability_replica_states`, selected from the public-schema/generator estimate. `sqlserver_active_sessions` is retained for quick smoke runs only.
 
 The 22-column estimate is 17 strings plus 36 fixed bytes (one INT32 and four timestamps), approximately 521 B/row of raw Arrow; this is a schema/generator estimate, not a measurement. `customer_id` is constant per client. The other 16 strings and keyed numeric/timestamp fields are nonconstant, with cardinalities capped at 1,024 under defaults; the schema has no booleans.
 
 Reproducibility: generator default seed `20260923` (`ARROWCOL_CLIENT_SEED`). Schema DDL SHA-256 `932d58482285afd5bbf8e2f48b5deec0cb95dd717a62ad9ff53ffebe7275517c` covers the exact checked-in DDL block at lines 32-55 of `projects/loadtest/schemas/sqlserver.sql`; it is not an encoded-schema measurement.
 
-Before any scored run, L3 measures actual IPC and Parquet bytes/row for the top three tables. If another is more than 10% wider encoded, the coordinator directs a swap. The candidate becomes final at the scored baseline; record the measured comparison and frozen schema/profile there.
+L3's measured top-three Parquet comparison put the selected table within 5.1% of the widest candidate, below the 10% swap threshold; the coordinator has frozen it. Keep the 521 B figure labeled as a schema/generator estimate. Record exact IPC and Parquet bytes/row plus the frozen schema/profile with scored evidence when available.
 
 ## Ownership and merge protocol
 

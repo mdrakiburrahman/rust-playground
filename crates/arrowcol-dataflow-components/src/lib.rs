@@ -38,8 +38,8 @@ pub use flight_exporter::{
     ARROW_FLIGHT_EXPORTER, ARROW_FLIGHT_EXPORTER_URN, ArrowFlightExporter, FlightExporterConfig,
 };
 pub use metrics::{
-    DashboardCapabilities, DashboardPressure, NativeQuiverCapability, PipelineStage, RuntimeMetrics, StageMetrics,
-    TableVersionStatus, global_metrics, process_instance_id, process_instance_key,
+    DashboardCapabilities, DashboardPressure, FlushReason, NativeQuiverCapability, PipelineStage, RuntimeMetrics,
+    StageMetrics, TableVersionStatus, global_metrics, process_instance_id, process_instance_key,
 };
 pub use receiver::{ARROW_FLIGHT_RECEIVER, ARROW_FLIGHT_RECEIVER_URN, DfeAdmission, PdataSendError, PdataSender};
 pub use routing::{LeaseResolver, StoreLeaseResolver};

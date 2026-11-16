@@ -303,7 +303,6 @@ mod tunable_injection_tests {
     }
 
     #[test]
-    #[ignore = "needs L1a no-sort layout"]
     fn empty_layout_json_reaches_resolved_policy() -> Result<()> {
         if std::env::var_os("OAT_R1_CHILD").is_some() {
             let config = arrow_deltalake::delta::effective_layout_startup_config()?;
@@ -328,7 +327,6 @@ mod tunable_injection_tests {
             .args([
                 "--exact",
                 "runner::tunable_injection_tests::empty_layout_json_reaches_resolved_policy",
-                "--ignored",
                 "--nocapture",
             ])
             .status()?;
