@@ -34,7 +34,7 @@ impl SendObservation {
             .context("client send timestamp exceeds u64 nanoseconds")?;
         let sequence = CLIENT_SEND_OBSERVATION_SEQUENCE
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| value.checked_add(1))
-            .context("client send observation sequence exhausted")?;
+            .map_err(|_| anyhow::anyhow!("client send observation sequence exhausted"))?;
         Ok(Self {
             id: format!("{}-{sequence}-{send_unix_ns}", std::process::id()),
             send_unix_ns,
