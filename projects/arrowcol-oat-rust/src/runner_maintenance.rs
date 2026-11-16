@@ -182,6 +182,17 @@ fn local_partition_policy_evidence(
     })))
 }
 
+fn validate_local_table_partition_property<'a>(
+    properties: &'a std::collections::BTreeMap<String, String>,
+    requested: &str,
+) -> Result<Option<&'a str>> {
+    let table_value = properties.get("arrowcol.partition.granularity").map(String::as_str);
+    if table_value.is_some_and(|value| value != requested) {
+        bail!("authoritative table partition granularity conflicts with the campaign request");
+    }
+    Ok(table_value)
+}
+
 async fn verify_local_partition_policy_before_admission(
     config: &OatConfig,
     platform: &LocalPlatform,
@@ -229,13 +240,10 @@ async fn verify_local_partition_policy_before_admission(
                 arrow_deltalake::delta::DeltaTable::open_for_maintenance_probe(&url)?
                     .maintenance_properties()
             }).await.context("join local partition metadata read")??;
-            let table_value = properties.get("arrowcol.partition.granularity");
-            if table_value.is_some_and(|value| value != requested) {
-                bail!("authoritative table partition granularity conflicts with the campaign request");
-            }
+            let table_value = validate_local_table_partition_property(&properties, requested)?;
             evidence["table_property"] = json!(table_value);
             evidence["table_property_source"] = json!("fresh_checkpoint_aware_delta_metadata_read");
-            tracing::info!(partition_policy = %evidence, "local campaign pre-admission partition policy");
+            local_progress(config, &format!("pre-admission partition policy: {evidence}"));
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {

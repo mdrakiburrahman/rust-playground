@@ -217,6 +217,12 @@ mod tunable_injection_tests {
             .context("missing evidence")?;
         assert_eq!(evidence["maintenance_table_effective"], "hour");
         assert!(local_partition_policy_evidence("hour", &table, &collector, &event("minute")).is_err());
+        let mut properties = std::collections::BTreeMap::new();
+        assert_eq!(validate_local_table_partition_property(&properties, "hour")?, None);
+        properties.insert("arrowcol.partition.granularity".to_owned(), "hour".to_owned());
+        assert_eq!(validate_local_table_partition_property(&properties, "hour")?, Some("hour"));
+        properties.insert("arrowcol.partition.granularity".to_owned(), "minute".to_owned());
+        assert!(validate_local_table_partition_property(&properties, "hour").is_err());
         assert!(local_partition_policy_evidence(
             "hour", &table, &json!({"Config":{"Env":["ARROWCOL_PARTITION_GRANULARITY=minute"]}}), &event("hour")
         ).is_err());
@@ -269,10 +275,12 @@ mod tunable_injection_tests {
         let binary = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/delta-maintenance");
         let output = std::process::Command::new(binary).env_clear()
             .envs(role_environment(&config, ComponentRole::Maintenance)?)
-            .args(["--root", url.as_str(), "--table", table, "--operation", "purge", "--no-metrics-listener"])
+            .args(["--root", url.as_str(), "--table", table, "--operation", "purge",
+                "--interval-secs", "60", "--max-cycles", "1", "--no-metrics-listener"])
             .output()?;
         let stderr = String::from_utf8(output.stderr)?;
         if !output.status.success() { bail!("maintenance fixture failed: {stderr}"); }
+        verify_process_configuration(&config, ComponentRole::Maintenance, &process_configurations(&stderr)?)?;
         let evidence = local_partition_policy_evidence("hour", table, &collector, &stderr)?
             .context("real maintenance consumer omitted effective table policy")?;
         assert_eq!(evidence["maintenance_table_effective"], "hour");
