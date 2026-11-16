@@ -171,7 +171,9 @@ function attachMaintenanceDueWork(
     log_complete: true,
     maintenance_operation_outcomes: {
       status: 'observed', cell_scope: 'stdout_stderr_append_offsets', operation_count: 25,
-      operation_failure: false, error_kind_counts: {}, retry_kind_counts: {}, operations: {},
+      operation_failure: false, error_kind_counts: {}, retry_kind_counts: {},
+      operations: Object.fromEntries(maintenanceOperations.map(operation => [operation,
+        { operation_count: 5, retry_kind_counts: {}, error_kind_counts: {} }])),
     },
     maintenance_table_policies: {
       source: 'validated_consumer_per_table_policy',
@@ -219,7 +221,9 @@ function attachMaintenanceDueWork(
     exit_code: 0, exit_classification: 'no_operation_failures',
     outcomes: {
       status: 'observed', cell_scope: 'stdout_stderr_append_offsets', operation_count: 25,
-      operation_failure: false, error_kind_counts: {}, retry_kind_counts: {}, operations: {},
+      operation_failure: false, error_kind_counts: {}, retry_kind_counts: {},
+      operations: Object.fromEntries(maintenanceOperations.map(operation => [operation,
+        { operation_count: 5, retry_kind_counts: {}, error_kind_counts: {} }])),
     },
   }] };
   row.evidence_json = JSON.stringify(evidence);
@@ -291,6 +295,7 @@ test('parses synthetic backlog and producer-shaped maintenance evidence without 
   mutateMaintenanceReport(run, 'optimize', 0, 1_000_000, (report, dueWork) => {
     report.negative_probe = true;
     dueWork.source = 'bounded_physical_inventory';
+    (report.compaction_debt as Record<string, unknown>).source = dueWork.source;
   });
   assert.equal(maintenanceDueWorkIssue(
     JSON.parse(String(run.rows[0]!.evidence_json)).processes,
@@ -592,6 +597,32 @@ test('requires complete, contiguous five-window due-work for all operations and 
   const eligibleEvidence = JSON.parse(String(eligibleGrowing.rows[0]!.evidence_json));
   assert.match(maintenanceDueWorkIssue(eligibleEvidence.processes, maintenanceConfig(eligibleGrowing), 1_000_000, 1_150_000)!,
     /optimize maintenance due-work grows/);
+});
+
+test('preserves retries without failures but refuses missing records or growing protected debt', () => {
+  const run = sourceShapedRun(91, [1, 1, 1, 1, 1], 1_000_000);
+  attachMaintenanceDueWork(run, 1_000_000, 1_150_000);
+  const evidence = JSON.parse(String(run.rows[0]!.evidence_json));
+  const process = evidence.processes.find((item: Record<string, unknown>) => item.component === 'maintenance');
+  const policy = process.maintenance_table_policies;
+  policy.operation_outcomes.retry_count = 1;
+  policy.operation_outcomes.retry_kind_counts = { stale_plan: 1 };
+  policy.operation_reports.push({
+    table: 'telemetry.sqlserver.sqlserver_availability_replica_states', operation: 'vacuum',
+    operation_failed: false, error_kind: null, operation_retry: true, retry_kind: 'stale_plan',
+    maintenance_due_work: null, compaction_debt: null, report_outcome: null,
+  });
+  assert.equal(maintenanceDueWorkIssue(evidence.processes, maintenanceConfig(run), 1_000_000, 1_150_000), undefined);
+  process.maintenance_operation_outcomes.operation_failure = null;
+  assert.match(maintenanceDueWorkIssue(evidence.processes, maintenanceConfig(run), 1_000_000, 1_150_000)!, /records are unavailable/);
+  process.maintenance_operation_outcomes.operation_failure = false;
+  for (const [index, report] of policy.operation_reports.filter((item: Record<string, unknown>) => item.operation === 'optimize').entries()) {
+    report.compaction_debt.protected_partition_backlog = { files: index + 1, bytes: 100 * (index + 1),
+      oldest_partition_start_ms: 999_000 };
+  }
+  assert.match(maintenanceDueWorkIssue(evidence.processes, maintenanceConfig(run), 1_000_000, 1_150_000)!, /optimize maintenance due-work grows/);
+  policy.operation_reports.find((item: Record<string, unknown>) => item.operation === 'optimize').compaction_debt = null;
+  assert.match(maintenanceDueWorkIssue(evidence.processes, maintenanceConfig(run), 1_000_000, 1_150_000)!, /unavailable or invalid/);
 });
 
 test('requires measured OPTIMIZE and PURGE debt vectors while preserving legitimate nulls', () => {

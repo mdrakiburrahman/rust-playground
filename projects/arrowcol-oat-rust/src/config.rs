@@ -1151,6 +1151,24 @@ mod tests {
     }
 
     #[test]
+    fn qap_catch_up_uses_the_existing_strict_observation_budget() -> Result<()> {
+        use serde_json::{Value, json};
+        let quick = include_str!("../../../docs/experiments/arrowcol-oat/oat-config.quick.json");
+        let mut config: OatConfig = serde_json::from_str(quick)?;
+        assert_eq!(config.qap_timeout_seconds, 60);
+        for seconds in [0, 301] {
+            config.qap_timeout_seconds = seconds;
+            assert!(config.validate().is_err());
+        }
+        for invalid in [json!("60"), json!(1.5), json!(-1), Value::Null] {
+            let mut input: Value = serde_json::from_str(quick)?;
+            input["qap_timeout_seconds"] = invalid;
+            assert!(serde_json::from_value::<OatConfig>(input).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn aks_rollout_timeout_preserves_main_deadline_and_has_a_bounded_upper_limit() -> Result<()> {
         let mut config = valid();
         config.aks_rollout_timeout_seconds = 599;

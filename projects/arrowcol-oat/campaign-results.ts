@@ -345,6 +345,7 @@ export function maintenanceDueWorkIssue(
   const windowCount = Math.floor((end - start) / 30_000);
   if (windowCount < 5) return unavailable;
   const observations = new Map<MaintenanceOperation, Array<Array<RecordValue>>>();
+  let observedRetries = 0;
   for (const operation of Object.keys(maintenanceOperationContracts) as MaintenanceOperation[]) {
     observations.set(operation, Array.from({ length: windowCount }, () => []));
   }
@@ -360,6 +361,7 @@ export function maintenanceDueWorkIssue(
       if (report.retry_kind !== 'stale_plan' || report.operation_failed !== false ||
           report.error_kind !== null || report.maintenance_due_work !== null || report.compaction_debt !== null ||
           !Number.isSafeInteger(retryCount) || Number(retryCount) < 1) return unavailable;
+      observedRetries++;
       continue;
     }
     if (report.operation_retry !== undefined && report.operation_retry !== false ||
@@ -444,6 +446,7 @@ export function maintenanceDueWorkIssue(
       _protected_bytes: protectedBytes,
     });
   }
+  if (retryCount !== undefined && observedRetries !== retryCount) return unavailable;
 
   for (const [operation, windows] of observations) {
     if (windows.some(samples => samples.length === 0)) return 'maintenance due-work is missing from one or more complete 30-second windows';
@@ -494,6 +497,27 @@ function maintenanceCellOutcomeIssue(value: unknown): string | undefined {
   if (maps.some(counts => Object.values(counts).some(count => nonNegativeInteger(count) === undefined)) ||
       Object.keys(value.retry_kind_counts).some(kind => kind !== 'stale_plan')) return unavailable;
   const failures = Object.values(value.error_kind_counts).reduce<number>((sum, count) => sum + Number(count), 0);
+  let operations = 0;
+  const retriesByKind: Record<string, number> = {};
+  const errorsByKind: Record<string, number> = {};
+  for (const [operation, counts] of Object.entries(value.operations)) {
+    if (!Object.hasOwn(maintenanceOperationContracts, operation) || !isRecord(counts) ||
+        !nonNegativeInteger(counts.operation_count) ||
+        !isRecord(counts.retry_kind_counts) || !isRecord(counts.error_kind_counts)) return unavailable;
+    operations += Number(counts.operation_count);
+    for (const [source, target] of [
+      [counts.retry_kind_counts, retriesByKind], [counts.error_kind_counts, errorsByKind],
+    ] as const) {
+      for (const [kind, count] of Object.entries(source)) {
+        if (nonNegativeInteger(count) === undefined) return unavailable;
+        target[kind] = (target[kind] ?? 0) + Number(count);
+      }
+    }
+  }
+  if (operations !== value.operation_count || stableJson(retriesByKind) !== stableJson(value.retry_kind_counts) ||
+      stableJson(errorsByKind) !== stableJson(value.error_kind_counts)) return unavailable;
+  const retries = Object.values(retriesByKind).reduce((sum, count) => sum + count, 0);
+  if (failures + retries > operations) return unavailable;
   if (value.operation_failure !== (failures > 0)) return unavailable;
   if (failures > 0) return 'cell-scoped maintenance operation failure';
   return undefined;
@@ -508,7 +532,7 @@ function maintenanceShutdownIssue(value: unknown): string | undefined {
   const issue = maintenanceCellOutcomeIssue(process.outcomes);
   if (issue) return issue;
   if (!['no_operation_failures', 'classified_retries_only'].includes(String(process.exit_classification)) ||
-      ![0, 1, 143].includes(Number(process.exit_code)) ||
+      nonNegativeInteger(process.exit_code) === undefined || ![0, 1, 143].includes(Number(process.exit_code)) ||
       process.exit_code === 1 && process.exit_classification !== 'classified_retries_only') {
     return 'maintenance shutdown exit has no proved classified cause';
   }

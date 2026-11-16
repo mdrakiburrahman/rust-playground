@@ -64,7 +64,7 @@ fn is_process_evidence_line(line: &str) -> bool {
     ]
     .iter()
     .any(|prefix| line.contains(prefix))
-        || (line.trim_start().starts_with('{') && line.contains("\"operation\"") && line.contains("\"applied\""))
+        || line.trim_start().starts_with('{')
 }
 
 fn append_process_evidence_line(
@@ -93,7 +93,12 @@ fn append_process_record(bytes: &[u8], output: &mut String, retained_bytes: &mut
     let without_lf = bytes.strip_suffix(b"\n").unwrap_or(bytes);
     let line = without_lf.strip_suffix(b"\r").unwrap_or(without_lf);
     let line = std::str::from_utf8(line).context("process log contains a non-UTF-8 line")?;
-    append_process_evidence_line(line, output, retained_bytes, action)
+    let before = output.len();
+    append_process_evidence_line(line, output, retained_bytes, action)?;
+    if output.len() > before && !bytes.ends_with(b"\n") {
+        output.pop();
+    }
+    Ok(())
 }
 
 async fn filtered_process_command_output(mut command: Command, action: &str) -> Result<FilteredProcessOutput> {
@@ -166,8 +171,8 @@ async fn filtered_process_command_output(mut command: Command, action: &str) -> 
 fn filter_process_evidence_text(text: &str) -> Result<String> {
     let mut filtered = String::new();
     let mut retained_bytes = 0;
-    for line in text.lines() {
-        append_process_evidence_line(line, &mut filtered, &mut retained_bytes, "process log filtering")?;
+    for line in text.split_inclusive('\n') {
+        append_process_record(line.as_bytes(), &mut filtered, &mut retained_bytes, "process log filtering")?;
     }
     Ok(filtered)
 }
@@ -846,6 +851,9 @@ fn maintenance_cell_outcome_evidence(log: &ProcessLog, baseline_logs: &[ProcessL
     if !baseline.complete || !log.complete {
         return unavailable("Maintenance process logs were truncated, so cell outcomes could not be isolated.");
     }
+    if [&baseline.stdout, &baseline.stderr].iter().any(|stream| !stream.is_empty() && !stream.ends_with('\n')) {
+        return unavailable("Maintenance baseline ended in a partial record; cell outcomes are unknown.");
+    }
     let Some(stdout) = log.stdout.strip_prefix(&baseline.stdout) else {
         return unavailable("Maintenance stdout changed or rotated, so cell outcomes could not be isolated.");
     };
@@ -1356,7 +1364,7 @@ mod startup_readback_tests {
         assert_eq!(maintenance_exit_classification(&only_retry, Some(1)), "unknown");
         for suffix in ["{\"operation\":", "{\"operation\":\"vacuum\",\"applied\":true}\n"] {
             let mut partial = baseline.clone();
-            partial.stdout.push_str(suffix);
+            append_process_record(suffix.as_bytes(), &mut partial.stdout, &mut 0, "partial regression")?;
             let outcome = maintenance_cell_outcome_evidence(&partial, std::slice::from_ref(&baseline));
             assert_eq!(outcome["status"], "unavailable");
             assert!(outcome["operation_failure"].is_null() && outcome["error_kind_counts"].is_null());
