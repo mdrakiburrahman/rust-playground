@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -17,6 +18,31 @@ use arrowcol_catalog::{DdlCommand, DdlParser};
 use arrowcol_flight::{DeliveryGuarantee, PutResultMetadata, decode_ddl_completion_metadata};
 const OAT_RUN_ID_ENV: &str = "ARROWCOL_OAT_RUN_ID";
 const OAT_RUN_ID_HEADER: &str = "x-arrowcol-oat-run-id";
+static CLIENT_SEND_OBSERVATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+struct SendObservation {
+    id: String,
+    send_unix_ns: u64,
+}
+
+impl SendObservation {
+    fn fresh() -> Result<Self> {
+        let send_unix_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_nanos()
+            .try_into()
+            .context("client send timestamp exceeds u64 nanoseconds")?;
+        let sequence = CLIENT_SEND_OBSERVATION_SEQUENCE
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| value.checked_add(1))
+            .context("client send observation sequence exhausted")?;
+        Ok(Self {
+            id: format!("{}-{sequence}-{send_unix_ns}", std::process::id()),
+            send_unix_ns,
+        })
+    }
+}
+const CLIENT_SEND_OBSERVATION_ID_HEADER: &str = "x-arrowcol-client-observation-id";
+const CLIENT_SEND_UNIX_NS_HEADER: &str = "x-arrowcol-client-send-unix-ns";
 use arrowcol_protocol::{
     ClaimedSchemaFingerprint, ImplementationPool, IngestMetadata, ProtocolVersion, SchemaFingerprint, TableIdentity,
     UnixMillis, fingerprint_schema,
@@ -330,7 +356,7 @@ fn batch_slices(rows: usize, concurrency: usize) -> Vec<(usize, usize)> {
         .collect()
 }
 
-fn request_metadata<T>(request: &mut Request<T>, table: &DmvTable, signer: Option<&EdgeRequestSigner>) -> Result<()> {
+fn request_metadata<T>(request: &mut Request<T>, table: &DmvTable, signer: Option<&EdgeRequestSigner>, observation: Option<&SendObservation>) -> Result<()> {
     let metadata = IngestMetadata::new(
         ProtocolVersion::CURRENT,
         ImplementationPool::Dataflow,
@@ -350,6 +376,16 @@ fn request_metadata<T>(request: &mut Request<T>, table: &DmvTable, signer: Optio
         headers.insert(
             http::header::HeaderName::from_static(OAT_RUN_ID_HEADER),
             http::HeaderValue::try_from(run_id)?,
+        );
+    }
+    if let Some(observation) = observation {
+        headers.insert(
+            http::header::HeaderName::from_static(CLIENT_SEND_OBSERVATION_ID_HEADER),
+            http::HeaderValue::try_from(observation.id.as_str())?,
+        );
+        headers.insert(
+            http::header::HeaderName::from_static(CLIENT_SEND_UNIX_NS_HEADER),
+            http::HeaderValue::try_from(observation.send_unix_ns.to_string())?,
         );
     }
     // Tonic sets this exact content type on the wire, after constructing the request.
@@ -403,7 +439,7 @@ async fn register(
         flight_descriptor: Some(descriptor),
         ..FlightData::default()
     }]));
-    request_metadata(&mut request, table, signer)?;
+    request_metadata(&mut request, table, signer, None)?;
     let response = client.do_put(request).await?;
     let completion = decode_ddl_completion_metadata(response.metadata())?;
     let mut results = response.into_inner();
@@ -436,7 +472,7 @@ async fn put(
         .try_collect::<Vec<_>>()
         .await?;
     let mut request = Request::new(stream::iter(encoded));
-    request_metadata(&mut request, table, signer)?;
+    request_metadata(&mut request, table, signer, None)?;
     completed_admission(client.do_put(request).await?.into_inner()).await
 }
 
@@ -510,7 +546,7 @@ mod tests {
         let verifier = arrowcol_router_rust::EdgeVerifier::new(key, 30_000)?;
         for _ in 0..2 {
             let mut request = Request::new(());
-            request_metadata(&mut request, &table, Some(&signer))?;
+            request_metadata(&mut request, &table, Some(&signer), None)?;
             let headers = request.metadata().clone().into_headers();
             let now = UnixMillis::new(u64::try_from(
                 SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
@@ -542,7 +578,7 @@ mod tests {
         std::fs::remove_dir_all(&directory)?;
         let verifier = arrowcol_router_rust::EdgeVerifier::new(router_key?, 30_000)?;
         let mut request = Request::new(());
-        request_metadata(&mut request, &table, Some(&signer?))?;
+        request_metadata(&mut request, &table, Some(&signer?), None)?;
         let now = UnixMillis::new(u64::try_from(
             SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
         )?)?;

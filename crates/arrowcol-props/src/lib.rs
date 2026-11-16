@@ -396,6 +396,22 @@ pub static REGISTRY: &[PropKey] = &[
     // PERF69-PROPS-BEGIN maintenance
     // PERF69-PROPS-END maintenance
     // PERF69-PROPS-BEGIN loadgen
+    PropKey { name: "arrowcol.client.corpusRows", prop_type: PropType::Integer, default: "0", validator: Validator::Any, scope: Scope::Process, doc: "Prepared synthetic corpus row target; zero preserves the legacy rows-derived default and cannot be combined with corpusBytes.", since: "0.1" },
+    PropKey { name: "arrowcol.client.corpusBytes", prop_type: PropType::Bytes, default: "0", validator: Validator::Any, scope: Scope::Process, doc: "Prepared synthetic corpus byte target; zero uses row-based sizing and cannot be combined with corpusRows.", since: "0.1" },
+    PropKey { name: "arrowcol.client.batchRows", prop_type: PropType::Integer, default: "0", validator: Validator::Range(0.0, 2147483647.0), scope: Scope::Process, doc: "Rows encoded per prepared batch; zero inherits the legacy rows option.", since: "0.1" },
+    PropKey { name: "arrowcol.client.workers", prop_type: PropType::Integer, default: "0", validator: Validator::Range(0.0, 1024.0), scope: Scope::Process, doc: "Concurrent client workers; zero resolves to available parallelism.", since: "0.1" },
+    PropKey { name: "arrowcol.client.runtimeThreads", prop_type: PropType::Integer, default: "0", validator: Validator::Range(0.0, 1024.0), scope: Scope::Process, doc: "Tokio runtime worker threads; zero resolves to available parallelism.", since: "0.1" },
+    PropKey { name: "arrowcol.client.dataMode", prop_type: PropType::Enum, default: "shared", validator: Validator::OneOf(&["shared", "independent"]), scope: Scope::Process, doc: "Whether workers reuse one prepared corpus or each own an independent prepared corpus.", since: "0.1" },
+    PropKey { name: "arrowcol.client.stringWidth", prop_type: PropType::Integer, default: "0", validator: Validator::Range(0.0, 65536.0), scope: Scope::Process, doc: "Synthetic UTF-8 string width in bytes; zero uses each fixture field's canonical width.", since: "0.1" },
+    PropKey { name: "arrowcol.client.cardinality", prop_type: PropType::Integer, default: "1024", validator: Validator::Positive, scope: Scope::Process, doc: "Maximum generated key cardinality for non-identity synthetic fields.", since: "0.1" },
+    PropKey { name: "arrowcol.client.skew", prop_type: PropType::Float, default: "0", validator: Validator::Range(0.0, 1.0), scope: Scope::Process, doc: "Synthetic key skew fraction; zero is uniform and one is maximally skewed.", since: "0.1" },
+    PropKey { name: "arrowcol.client.entropy", prop_type: PropType::Float, default: "1", validator: Validator::Range(0.0, 1.0), scope: Scope::Process, doc: "Fraction of synthetic string positions varied by the deterministic generator.", since: "0.1" },
+    PropKey { name: "arrowcol.client.seed", prop_type: PropType::Integer, default: "20260923", validator: Validator::Any, scope: Scope::Process, doc: "Deterministic synthetic corpus seed.", since: "0.1" },
+    PropKey { name: "arrowcol.client.maxMemoryBytes", prop_type: PropType::Bytes, default: "536870912", validator: Validator::Positive, scope: Scope::Process, doc: "Maximum memory reservation for prepared corpus and encoding scratch; must fit the process address space.", since: "0.1" },
+    PropKey { name: "arrowcol.client.intervalUs", prop_type: PropType::Integer, default: "0", validator: Validator::Range(0.0, 86400000000.0), scope: Scope::Process, doc: "Delay between continuous send attempts in microseconds; zero continuously blasts the prepared corpus.", since: "0.1" },
+    PropKey { name: "arrowcol.client.connectionsPerWorker", prop_type: PropType::Integer, default: "1", validator: Validator::Range(1.0, 256.0), scope: Scope::Process, doc: "Persistent Flight connections per worker; total connections are capped at 4096.", since: "0.1" },
+    PropKey { name: "arrowcol.client.streamsPerWorker", prop_type: PropType::Integer, default: "0", validator: Validator::Range(0.0, 1024.0), scope: Scope::Process, doc: "Concurrent continuous send streams per worker; zero inherits legacy concurrency and total streams are capped at 65536.", since: "0.1" },
+    PropKey { name: "arrowcol.client.ipcCompression", prop_type: PropType::Enum, default: "none", validator: Validator::OneOf(&["none", "lz4_frame", "zstd"]), scope: Scope::Process, doc: "Arrow IPC payload compression; invalid codec names are rejected.", since: "0.1" },
     // PERF69-PROPS-END loadgen
     // PERF69-PROPS-BEGIN telemetry
     // PERF69-PROPS-END telemetry
