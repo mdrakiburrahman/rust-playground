@@ -479,6 +479,15 @@ struct MaintenanceCompactionDebt {
     backlog_files: u64,
     backlog_bytes: u64,
     oldest_eligible_partition_start_ms: Option<i64>,
+    protected_partition_backlog: Option<MaintenanceProtectedPartitionBacklog>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct MaintenanceProtectedPartitionBacklog {
+    files: u64,
+    bytes: u64,
+    oldest_partition_start_ms: Option<i64>,
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -501,6 +510,10 @@ fn maintenance_compaction_debt(value: &Value, failed: bool) -> Result<Option<Mai
         || debt.backlog_files > debt.eligible_files
         || debt.backlog_bytes > debt.eligible_bytes
         || debt.oldest_eligible_partition_start_ms.is_some_and(|time| time > debt.observed_at_ms)
+        || debt.protected_partition_backlog.as_ref().is_some_and(|backlog| {
+            backlog.oldest_partition_start_ms.is_some_and(|time| time > debt.observed_at_ms)
+                || (backlog.files == 0 && (backlog.bytes != 0 || backlog.oldest_partition_start_ms.is_some()))
+        })
     {
         bail!("invalid maintenance compaction debt values");
     }
@@ -670,9 +683,13 @@ fn maintenance_table_evidence(config: &OatConfig, text: &str) -> Result<Value> {
     let mut dropped = 0_u64;
     let mut operation_count = 0_u64;
     let mut operation_error_count = 0_u64;
+    let mut operation_retry_count = 0_u64;
+    let mut retry_kind_counts = serde_json::Map::new();
     let mut error_kind_counts = serde_json::Map::new();
+    let mut records_complete = text.is_empty() || text.ends_with('\n');
     for line in text.lines().filter(|line| line.starts_with('{')) {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
+            records_complete = false;
             continue;
         };
         if !value["operation"].is_string() || !value["applied"].is_boolean() {
@@ -699,8 +716,13 @@ fn maintenance_table_evidence(config: &OatConfig, text: &str) -> Result<Value> {
         }
         operation_count = operation_count.saturating_add(1);
         let raw_error_kind = value.get("error_kind").and_then(Value::as_str);
-        let operation_failed = value.get("error").is_some_and(|error| !error.is_null())
-            || value.get("error_kind").is_some_and(|error| !error.is_null());
+        let operation_retry = raw_error_kind == Some("stale_plan");
+        let operation_failed = !operation_retry && (value.get("error").is_some_and(|error| !error.is_null())
+            || value.get("error_kind").is_some_and(|error| !error.is_null()));
+        if operation_retry {
+            operation_retry_count = operation_retry_count.saturating_add(1);
+            retry_kind_counts.insert("stale_plan".to_owned(), json!(operation_retry_count));
+        }
         let error_kind = operation_failed.then(|| sanitized_maintenance_error_kind(raw_error_kind));
         if let Some(kind) = &error_kind {
             operation_error_count = operation_error_count.saturating_add(1);
@@ -740,7 +762,8 @@ fn maintenance_table_evidence(config: &OatConfig, text: &str) -> Result<Value> {
             "maintenance_due_work": due_work,
             "mutation_mode": if value["applied"] == true { "apply_authorized_not_proof_of_mutation" } else { "dry_run_predicted_not_applied" },
             "operation_failed": operation_failed, "error_kind": error_kind,
-            "compaction_debt": maintenance_compaction_debt(&value, operation_failed)?,
+            "operation_retry": operation_retry, "retry_kind": operation_retry.then_some("stale_plan"),
+            "compaction_debt": maintenance_compaction_debt(&value, operation_failed || operation_retry)?,
             "consumer_reported_counts": counts, "duration_ms": value["duration_ms"].as_u64(),
             "report_outcome": value.pointer("/report/outcome").and_then(Value::as_str),
         }));
@@ -751,8 +774,11 @@ fn maintenance_table_evidence(config: &OatConfig, text: &str) -> Result<Value> {
         "operation_outcomes": {
             "scope": "process_lifetime",
             "operation_count": operation_count,
-            "error_count": operation_error_count,
-            "error_kind_counts": error_kind_counts,
+            "status": if records_complete && operation_count > 0 { "observed" } else { "unavailable" },
+            "error_count": (records_complete && operation_count > 0).then_some(operation_error_count),
+            "error_kind_counts": (records_complete && operation_count > 0).then_some(error_kind_counts),
+            "retry_count": (records_complete && operation_count > 0).then_some(operation_retry_count),
+            "retry_kind_counts": (records_complete && operation_count > 0).then_some(retry_kind_counts),
             "comment": if operation_error_count == 0 {
                 "No maintenance operation errors were observed in the process log."
             } else {

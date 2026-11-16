@@ -169,6 +169,10 @@ function attachMaintenanceDueWork(
   evidence.processes = [...evidence.processes, {
     component: 'maintenance',
     log_complete: true,
+    maintenance_operation_outcomes: {
+      status: 'observed', cell_scope: 'stdout_stderr_append_offsets', operation_count: 25,
+      operation_failure: false, error_kind_counts: {}, retry_kind_counts: {}, operations: {},
+    },
     maintenance_table_policies: {
       source: 'validated_consumer_per_table_policy',
       tables: { 'telemetry.sqlserver.sqlserver_availability_replica_states': { active: true, table_policy: {} } },
@@ -189,6 +193,10 @@ function attachMaintenanceDueWork(
             operation_failed: false,
             interrupted: false,
             report_outcome: 'noop',
+            compaction_debt: operation === 'optimize' ? {
+              observed_at_ms: start + window * 30_000 + 1_000, source,
+              protected_partition_backlog: { files: 0, bytes: 0, oldest_partition_start_ms: null },
+            } : null,
             maintenance_due_work: {
               observed_at_ms: start + window * 30_000 + 1_000,
               source,
@@ -207,6 +215,13 @@ function attachMaintenanceDueWork(
         })).flat(),
     },
   }];
+  evidence.shutdown_drain = { maintenance: [{
+    exit_code: 0, exit_classification: 'no_operation_failures',
+    outcomes: {
+      status: 'observed', cell_scope: 'stdout_stderr_append_offsets', operation_count: 25,
+      operation_failure: false, error_kind_counts: {}, retry_kind_counts: {}, operations: {},
+    },
+  }] };
   row.evidence_json = JSON.stringify(evidence);
 }
 
