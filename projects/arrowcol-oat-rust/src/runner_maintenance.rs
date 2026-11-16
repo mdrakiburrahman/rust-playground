@@ -984,7 +984,7 @@ mod maintenance_topology_tests {
         }))?;
         let table = canonical_dmv_table_name(&config.tables[0])?;
         let mut text = format!("arrowcol_maintenance_table_config {}\n", json!({
-            "table": table, "config": {"active":true, "table_policy":{},
+            "table": table, "config": {"active":true, "table_policy":{"arrowcol.maintenance.operationTimeout":300_000},
                 "startup":{"apply":true,"operations":["optimize","purge","vacuum","checkpoint","prune_log"],"interval_secs":60}}
         }));
         for result in operation_results {
@@ -1043,7 +1043,8 @@ mod maintenance_topology_tests {
             json!({"maintenance":{"enabled":true,"operations":["optimize"],"target_file_mib":17}}),
         )?;
         let startup = json!({"startup":{"apply":false,"operations":["optimize"],"interval_secs":60},
-            "table_policy":{"arrowcol.optimize.targetFileSize":17_u64*1024*1024},"active":true});
+            "table_policy":{"arrowcol.optimize.targetFileSize":17_u64*1024*1024,
+                "arrowcol.maintenance.operationTimeout":300_000},"active":true});
         verify_process_configuration(&config, ComponentRole::Maintenance, &startup)?;
         let (actual, expected) = maintenance_readback_value(&startup, "ARROWCOL_MAINT_TARGET_FILE_MIB", json!(17))?;
         assert_eq!(actual, expected);
@@ -1245,7 +1246,9 @@ mod maintenance_topology_tests {
         config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
             "maintenance":{"enabled":true,"apply":true,"operations":["optimize"],"operation_timeout_secs":900}
         }))?;
-        let shorter_override = format!("arrowcol_maintenance_table_config {}\n", event(600_000));
+        let safe_override = event(600_000);
+        verify_process_configuration(&config, ComponentRole::Maintenance, &safe_override["config"])?;
+        let shorter_override = format!("arrowcol_maintenance_table_config {}\n", safe_override);
         assert!(maintenance_table_evidence(&config, &shorter_override).is_ok(),
             "a safe table override may differ from the requested process default");
         Ok(())

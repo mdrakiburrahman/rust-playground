@@ -3,6 +3,7 @@ import { chmod, lstat, mkdir, readFile, rename, rm, stat, writeFile } from 'node
 import { dirname, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { parse, stringify } from 'yaml';
+import { parseEffectiveStopBudgets } from './stop-budgets.js';
 
 export type RuntimeResourceRole = 'collector' | 'client' | 'maintenance' | 'router' | 'catalog';
 export interface ResourceValues { cpu: string; memory: string }
@@ -17,8 +18,9 @@ export interface RuntimeConfig {
   subscriptionId: string;
   stamp: string;
   deltaRoot: string;
+  effective_stop_budgets: { maintenance_grace_seconds: number; maintenance_stop_timeout_ms: number };
   images: { sqlserver: string; catalog: string; router: string; dataflow: string; maintenance?: string };
-  maintenance?: { tables: string[]; operations: string[]; apply: boolean; granularity?: 'minute' | 'hour' | 'day'; stopGraceSeconds?: number };
+  maintenance?: { tables: string[]; operations: string[]; apply: boolean; granularity?: 'minute' | 'hour' | 'day' };
   quiver?: boolean;
   resources?: RuntimeResources;
   collectorWorkers?: number;
@@ -78,10 +80,11 @@ function validateResources(value: unknown): asserts value is RuntimeResources {
 export function validateRuntime(input: unknown, allowUnpublishedImages = false): RuntimeConfig {
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('runtime config must be an object');
   const c = input as RuntimeConfig;
-  const required = ['deltaRoot', 'images', 'namespace', 'oatRunId', 'workloadIdentityClientId', 'subscriptionId', 'stamp'];
+  const required = ['deltaRoot', 'effective_stop_budgets', 'images', 'namespace', 'oatRunId', 'workloadIdentityClientId', 'subscriptionId', 'stamp'];
   if (required.some((key) => !Object.hasOwn(c, key)) || Object.keys(c).some((key) => ![...required, 'serviceAccount', 'maintenance', 'quiver', 'resources', 'collectorWorkers'].includes(key))) {
     throw new Error('runtime config has missing or unknown fields');
   }
+  parseEffectiveStopBudgets(c.effective_stop_budgets);
   if (Object.hasOwn(c, 'quiver') && typeof c.quiver !== 'boolean') throw new Error('quiver must be an explicit boolean');
   if (Object.hasOwn(c, 'resources')) validateResources(c.resources);
   if (Object.hasOwn(c, 'collectorWorkers') && (!Number.isSafeInteger(c.collectorWorkers) || c.collectorWorkers! < 1 || c.collectorWorkers! > 256))
@@ -116,7 +119,7 @@ export function validateRuntime(input: unknown, allowUnpublishedImages = false):
   if (Object.hasOwn(c, 'maintenance')) {
     const policy = c.maintenance;
     if (!policy || typeof policy !== 'object' || Array.isArray(policy) ||
-        Object.keys(policy).some(key => !['apply', 'operations', 'tables', 'granularity', 'stopGraceSeconds'].includes(key)) ||
+        Object.keys(policy).some(key => !['apply', 'operations', 'tables', 'granularity'].includes(key)) ||
         !['apply', 'operations', 'tables'].every(key => Object.hasOwn(policy, key)) || typeof policy.apply !== 'boolean' ||
         !Array.isArray(policy.tables) || policy.tables.length === 0 || policy.tables.length > 256 ||
         policy.tables.some(table => typeof table !== 'string' || !/^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$/.test(table)) ||
@@ -124,8 +127,7 @@ export function validateRuntime(input: unknown, allowUnpublishedImages = false):
         !Array.isArray(policy.operations) || policy.operations.length === 0 ||
         policy.operations.some(operation => !['optimize', 'checkpoint', 'purge', 'vacuum', 'prune-log'].includes(operation)) ||
         new Set(policy.operations).size !== policy.operations.length ||
-        (policy.granularity !== undefined && !['minute', 'hour', 'day'].includes(policy.granularity)) ||
-        (policy.stopGraceSeconds !== undefined && (!Number.isSafeInteger(policy.stopGraceSeconds) || policy.stopGraceSeconds < 30 || policy.stopGraceSeconds > 4_800)))
+        (policy.granularity !== undefined && !['minute', 'hour', 'day'].includes(policy.granularity)))
       throw new Error('maintenance requires explicit qualified table allowlist, operations and apply boolean');
     if (!c.images.maintenance) throw new Error('enabled maintenance requires a revision-verified digest-pinned maintenance image');
   }
@@ -327,7 +329,7 @@ export async function renderRuntime(input: unknown, phase: Phase): Promise<Resou
       volumeMounts: [mount('auth', '/run/auth')],
     }], [secretVolume('auth', 'arrowcol-router-auth')], true);
     // Pin initialization creates the allowlisted catalog entries before the runner starts this worker.
-    worker.spec.template.spec.terminationGracePeriodSeconds = c.maintenance.stopGraceSeconds ?? 4_800;
+    worker.spec.template.spec.terminationGracePeriodSeconds = parseEffectiveStopBudgets(c.effective_stop_budgets).maintenanceGraceSeconds;
     worker.spec.replicas = 0;
     workload.push(worker);
   }

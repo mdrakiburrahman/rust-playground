@@ -339,10 +339,11 @@ impl RunInventory {
             budgets.validate()?;
         }
         if let Some(duration_ms) = self.planned_cell_duration_ms {
-            let no_row_rehearsal = duration_ms == 0
-                && self.load_admission == InventoryLoadAdmission::NotAuthorized;
+            let no_row_rehearsal = duration_ms == 0 && self.load_admission == InventoryLoadAdmission::NotAuthorized;
             if duration_ms > 9_007_199_254_740_991 || (duration_ms == 0 && !no_row_rehearsal) {
-                bail!("planned_cell_duration_ms must be a positive JSON-safe integer except for not-authorized no-row rehearsal inventories");
+                bail!(
+                    "planned_cell_duration_ms must be a positive JSON-safe integer except for not-authorized no-row rehearsal inventories"
+                );
             }
         }
         for value in [
@@ -2925,7 +2926,15 @@ async fn run_isolated_cell(
     let timing_budget = match config.timing_budget() {
         Ok(budget) => budget,
         Err(error) => {
-            return finish_matrix_cell(&config, orchestration_id, &run_id, replicas, concurrency, Err(error), Ok(()));
+            return finish_matrix_cell(
+                &config,
+                orchestration_id,
+                &run_id,
+                replicas,
+                concurrency,
+                Err(error),
+                Ok(()),
+            );
         }
     };
     let lifecycle_started_at = tokio::time::Instant::now();
@@ -3477,20 +3486,35 @@ fn local_lifecycle_budget_allows_positive_setup_elapsed_and_rejects_exhaustion()
     config.platform.kind = crate::config::OatMode::Local;
     let budget = config.timing_budget()?;
     assert_eq!(budget.after_setup_budget_ms, budget.minimum_pin_ttl_ms);
-    assert_eq!(budget.planned_cell_duration_ms, budget.pre_cell_setup_timeout_ms + budget.after_setup_budget_ms);
+    assert_eq!(
+        budget.planned_cell_duration_ms,
+        budget.pre_cell_setup_timeout_ms + budget.after_setup_budget_ms
+    );
 
     let started = tokio::time::Instant::now();
     let setup_elapsed = Duration::from_secs(30);
     let deadline = started + Duration::from_millis(budget.planned_cell_duration_ms);
     let post_setup_now = started + setup_elapsed;
-    assert!(require_lifecycle_remaining_at(
-        post_setup_now, deadline, Duration::from_millis(budget.after_setup_budget_ms), "Local admission"
-    ).is_ok());
+    assert!(
+        require_lifecycle_remaining_at(
+            post_setup_now,
+            deadline,
+            Duration::from_millis(budget.after_setup_budget_ms),
+            "Local admission"
+        )
+        .is_ok()
+    );
 
     let exhausted_now = deadline - Duration::from_millis(budget.after_setup_budget_ms) + Duration::from_millis(1);
-    assert!(require_lifecycle_remaining_at(
-        exhausted_now, deadline, Duration::from_millis(budget.after_setup_budget_ms), "Local admission"
-    ).is_err());
+    assert!(
+        require_lifecycle_remaining_at(
+            exhausted_now,
+            deadline,
+            Duration::from_millis(budget.after_setup_budget_ms),
+            "Local admission"
+        )
+        .is_err()
+    );
     Ok(())
 }
 
@@ -3521,7 +3545,10 @@ async fn run_matrix_cell(
 ) -> Result<Vec<OatResult>> {
     let timing_budget = config.timing_budget()?;
     let rollout_ms = if config.platform.kind == crate::config::OatMode::Aks {
-        config.aks_rollout_timeout_seconds.checked_mul(1_000).context("AKS rollout deadline overflow")?
+        config
+            .aks_rollout_timeout_seconds
+            .checked_mul(1_000)
+            .context("AKS rollout deadline overflow")?
     } else {
         0
     };
@@ -3533,11 +3560,16 @@ async fn run_matrix_cell(
     } else {
         0
     };
-    let pre_scale_budget = timing_budget.minimum_pin_ttl_ms
+    let pre_scale_budget = timing_budget
+        .minimum_pin_ttl_ms
         .checked_add(scale_rollout_ms)
         .and_then(|value| value.checked_add(maintenance_rollout_ms))
         .context("post-setup lifecycle budget overflow")?;
-    require_lifecycle_remaining(lifecycle_deadline, Duration::from_millis(pre_scale_budget), "ArrowCol scale")?;
+    require_lifecycle_remaining(
+        lifecycle_deadline,
+        Duration::from_millis(pre_scale_budget),
+        "ArrowCol scale",
+    )?;
     platform.scale_arrowcols(config, replicas, concurrency).await?;
     require_lifecycle_remaining(
         lifecycle_deadline,
@@ -3559,9 +3591,14 @@ async fn run_matrix_cell(
             pin_now_unix_ms,
         )
         .await?;
-    let before_clients_ms = timing_budget.minimum_pin_ttl_ms
+    let before_clients_ms = timing_budget
+        .minimum_pin_ttl_ms
         .saturating_sub(crate::config::PIN_INIT_SETUP_TIMEOUT_SECONDS.saturating_mul(1_000));
-    require_lifecycle_remaining(lifecycle_deadline, Duration::from_millis(before_clients_ms), "client admission")?;
+    require_lifecycle_remaining(
+        lifecycle_deadline,
+        Duration::from_millis(before_clients_ms),
+        "client admission",
+    )?;
     let cell_start_unix_ms = unix_time_ms_u64()?;
     let started_at_ms =
         i64::try_from(cell_start_unix_ms).context("run start timestamp exceeds Arrow timestamp range")?;
@@ -3580,7 +3617,11 @@ async fn run_matrix_cell(
             .checked_add(config.qap_timeout_seconds)
             .and_then(|seconds| seconds.checked_mul(1_000))
             .context("post-client lifecycle deadline overflow")?;
-        require_lifecycle_remaining(lifecycle_deadline, Duration::from_millis(post_client_ms), "commit reconciliation")?;
+        require_lifecycle_remaining(
+            lifecycle_deadline,
+            Duration::from_millis(post_client_ms),
+            "commit reconciliation",
+        )?;
         let (_collector_logs, durable_commits) = settle_cell_commit_evidence(
             config,
             platform,
@@ -7010,8 +7051,7 @@ fn local_phase_stop_args(
 }
 
 fn local_stop_deadline(collector_grace: u64, maintenance_timeout_ms: u64) -> Duration {
-    Duration::from_millis(maintenance_timeout_ms)
-        + Duration::from_secs(collector_grace + 2 * 300 + 120)
+    Duration::from_millis(maintenance_timeout_ms) + Duration::from_secs(collector_grace + 2 * 300 + 120)
 }
 
 async fn stop_then_destroy<T>(
@@ -7029,7 +7069,10 @@ async fn cleanup_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
     let stop_budgets = config.maintenance_stop_budget()?;
     let stop = async {
         tokio::time::timeout(
-            local_stop_deadline(config.collector_stop_grace_seconds, stop_budgets.maintenance_stop_timeout_ms),
+            local_stop_deadline(
+                config.collector_stop_grace_seconds,
+                stop_budgets.maintenance_stop_timeout_ms,
+            ),
             stop_local_snapshot_writers(config, platform),
         )
         .await
@@ -8193,24 +8236,32 @@ fn campaign_cleanup_action_needs_execution(action: &CampaignCleanupAction, inven
 }
 
 const CAMPAIGN_CLEANUP_DEFAULT_TIMEOUT_MS: u64 = 60_000;
-const MAINTENANCE_STOP_GRACE_SECONDS: u64 = 4_800;
-const MAINTENANCE_STOP_TIMEOUT_MS: u64 = 5_100_000;
 
 fn campaign_cleanup_operation_deadline_ms(
     action: &CampaignCleanupAction,
     inventory: &RunInventory,
     now_unix_ms: u64,
 ) -> Result<u64> {
-    // These start-state budgets match the deadlines assigned by mark() in aks-cell-cleanup.ts.
-    let default_timeout_ms = match action {
-        CampaignCleanupAction::StopAdmission => 60_000,
-        CampaignCleanupAction::BoundedDrain => 120_000,
-        CampaignCleanupAction::StopMaintenance => MAINTENANCE_STOP_TIMEOUT_MS,
-        _ => CAMPAIGN_CLEANUP_DEFAULT_TIMEOUT_MS,
-    };
-    let deadline = campaign_cleanup_step(action, inventory)
-        .and_then(|step| step.deadline_unix_ms)
-        .unwrap_or_else(|| now_unix_ms.saturating_add(default_timeout_ms));
+    let deadline =
+        if let Some(deadline) = campaign_cleanup_step(action, inventory).and_then(|step| step.deadline_unix_ms) {
+            deadline
+        } else {
+            let timeout_ms = match action {
+                CampaignCleanupAction::StopAdmission => 60_000,
+                CampaignCleanupAction::BoundedDrain => 120_000,
+                CampaignCleanupAction::StopMaintenance => {
+                    inventory
+                        .effective_stop_budgets
+                        .context("new campaign inventory omitted effective maintenance stop budgets")?
+                        .validate()?
+                        .maintenance_stop_timeout_ms
+                }
+                _ => CAMPAIGN_CLEANUP_DEFAULT_TIMEOUT_MS,
+            };
+            now_unix_ms
+                .checked_add(timeout_ms)
+                .context("campaign cleanup deadline overflow")?
+        };
     if deadline <= now_unix_ms {
         bail!("campaign cleanup {} operation deadline has expired", action.selector());
     }
@@ -10517,14 +10568,10 @@ async fn stop_aks_workloads_in_order(config: &OatConfig) -> Result<Value> {
         );
     }
     if maintenance_enabled(config) {
+        let grace_seconds = config.maintenance_stop_budget()?.maintenance_grace_seconds;
         maintenance.push(
-            stop_aks_deployment_for_cleanup(
-                config,
-                "delta-maintenance",
-                ComponentRole::Maintenance,
-                MAINTENANCE_STOP_GRACE_SECONDS,
-            )
-            .await?,
+            stop_aks_deployment_for_cleanup(config, "delta-maintenance", ComponentRole::Maintenance, grace_seconds)
+                .await?,
         );
     }
     collectors.push(
@@ -12526,7 +12573,10 @@ mod tests {
             "arrow-collector-00000000000000000000000000000004",
             "campaignstorage",
             "checkpoints",
-            EffectiveStopBudgets { maintenance_grace_seconds: 1_200, maintenance_stop_timeout_ms: 1_500_000 },
+            EffectiveStopBudgets {
+                maintenance_grace_seconds: 1_200,
+                maintenance_stop_timeout_ms: 1_500_000,
+            },
             1_000,
         )?;
         super::validate_campaign_baseline_capture_inventory(&inventory, &identity)?;
@@ -12537,14 +12587,21 @@ mod tests {
         assert_eq!(value["fic"], serde_json::Value::Null);
         assert_eq!(value["qap"], serde_json::Value::Null);
         assert_eq!(value["effective_stop_budgets"]["maintenance_grace_seconds"], 1_200);
-        assert_eq!(value["effective_stop_budgets"]["maintenance_stop_timeout_ms"], 1_500_000);
+        assert_eq!(
+            value["effective_stop_budgets"]["maintenance_stop_timeout_ms"],
+            1_500_000
+        );
         assert_eq!(value["planned_cell_duration_ms"], 1_000);
         let mut no_row_rehearsal = inventory.clone();
         no_row_rehearsal.planned_cell_duration_ms = Some(0);
         no_row_rehearsal.resources.push(InventoryResource {
-            api_version: "apps/v1".to_owned(), kind: "Deployment".to_owned(),
-            namespace: no_row_rehearsal.namespace.name.clone(), name: "arrowcol".to_owned(),
-            uid: None, role: InventoryResourceRole::Collector, state: InventoryResourceState::Planned,
+            api_version: "apps/v1".to_owned(),
+            kind: "Deployment".to_owned(),
+            namespace: no_row_rehearsal.namespace.name.clone(),
+            name: "arrowcol".to_owned(),
+            uid: None,
+            role: InventoryResourceRole::Collector,
+            state: InventoryResourceState::Planned,
             absence: None,
         });
         no_row_rehearsal.validate()?;
@@ -12676,7 +12733,10 @@ mod tests {
             namespace,
             "campaignstorage",
             "checkpoints",
-            EffectiveStopBudgets { maintenance_grace_seconds: 1_200, maintenance_stop_timeout_ms: 1_500_000 },
+            EffectiveStopBudgets {
+                maintenance_grace_seconds: 1_200,
+                maintenance_stop_timeout_ms: 1_500_000,
+            },
             1_000,
         )?;
         inventory.namespace.uid = Some("00000000-0000-0000-0000-000000000005".to_owned());
@@ -12929,7 +12989,11 @@ mod tests {
         );
         assert_eq!(
             campaign_cleanup_operation_deadline_ms(&CampaignCleanupAction::StopMaintenance, &inventory, 1_000)?,
-            MAINTENANCE_STOP_TIMEOUT_MS + 1_000
+            inventory
+                .effective_stop_budgets
+                .context("inventory stop budgets")?
+                .maintenance_stop_timeout_ms
+                + 1_000
         );
         let mut expired_deadline = inventory.clone();
         expired_deadline.cleanup.stop_admission.deadline_unix_ms = Some(61_000);
@@ -13382,9 +13446,11 @@ mod tests {
         let ingress = commands
             .find("stop --time 300 guard-client")
             .context("ingress was not stopped")?;
+        let maintenance_grace = config.maintenance_stop_budget()?.maintenance_grace_seconds;
+        let maintenance_command = format!("stop --time {maintenance_grace} guard-maintenance");
         let maintenance = commands
-            .find("stop --time 300 guard-maintenance")
-            .context("maintenance was not stopped")?;
+            .find(&maintenance_command)
+            .context("maintenance was not stopped with its derived grace")?;
         let collector = commands
             .find("stop --time 300 guard-collector")
             .context("collector was not stopped")?;
@@ -13514,7 +13580,10 @@ mod tests {
     #[test]
     fn local_stop_deadline_covers_derived_maintenance_budget_and_other_phases() {
         let deadline = local_stop_deadline(3600, 900_000);
-        assert_eq!(deadline, Duration::from_millis(900_000) + Duration::from_secs(3600 + 2 * 300 + 120));
+        assert_eq!(
+            deadline,
+            Duration::from_millis(900_000) + Duration::from_secs(3600 + 2 * 300 + 120)
+        );
         assert!(deadline > Duration::from_secs(3600 + 3 * 300));
     }
 

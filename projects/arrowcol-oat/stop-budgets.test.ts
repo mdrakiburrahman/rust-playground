@@ -1,6 +1,20 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import { DEFAULT_EFFECTIVE_STOP_BUDGETS, MAINTENANCE_STOP_TIMEOUT_CEILING_MS, parseEffectiveStopBudgets } from './stop-budgets.js';
+
+const parityFixtures = JSON.parse(readFileSync(new URL('./stop-budget-fixtures.json', import.meta.url), 'utf8')) as
+  Array<{ name: string; expected: unknown; rejected?: boolean }>;
+
+test('Rust and TypeScript share derived stop-budget fixtures', () => {
+  for (const fixture of parityFixtures) {
+    if (fixture.rejected) assert.throws(() => parseEffectiveStopBudgets(fixture.expected), fixture.name);
+    else assert.deepEqual(parseEffectiveStopBudgets(fixture.expected), {
+      maintenanceGraceSeconds: (fixture.expected as { maintenance_grace_seconds: number }).maintenance_grace_seconds,
+      maintenanceStopTimeoutMs: (fixture.expected as { maintenance_stop_timeout_ms: number }).maintenance_stop_timeout_ms,
+    }, fixture.name);
+  }
+});
 
 test('parses Rust-produced default and reduced maintenance budgets', () => {
   assert.deepEqual(parseEffectiveStopBudgets({ maintenance_grace_seconds: 4_800, maintenance_stop_timeout_ms: 5_100_000 }),

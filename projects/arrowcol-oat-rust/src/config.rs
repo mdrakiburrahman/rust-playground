@@ -626,30 +626,45 @@ impl OatConfig {
             .checked_mul(1_000)
             .context("OAT run pin lifetime budget overflow")?;
         let rollout_timeout_ms = if self.platform.kind == OatMode::Aks {
-            self.aks_rollout_timeout_seconds.checked_mul(1_000).context("OAT AKS rollout timeout overflow")?
+            self.aks_rollout_timeout_seconds
+                .checked_mul(1_000)
+                .context("OAT AKS rollout timeout overflow")?
         } else {
             0
         };
         let maintenance_rollouts = u64::from(
-            self.tunables.maintenance.as_ref().is_some_and(|settings| settings.enabled == Some(true)),
+            self.tunables
+                .maintenance
+                .as_ref()
+                .is_some_and(|settings| settings.enabled == Some(true)),
         );
         let setup_rollout_count = if self.platform.kind == OatMode::Aks {
-            u64::try_from(self.deployment_names().len())?.checked_add(1).context("OAT AKS setup rollout count overflow")?
+            u64::try_from(self.deployment_names().len())?
+                .checked_add(1)
+                .context("OAT AKS setup rollout count overflow")?
         } else {
             0
         };
         let scale_rollout_count = if self.platform.kind == OatMode::Aks {
-            u64::try_from(self.deployment_names().len())?.checked_add(maintenance_rollouts).context("OAT AKS scale rollout count overflow")?
+            u64::try_from(self.deployment_names().len())?
+                .checked_add(maintenance_rollouts)
+                .context("OAT AKS scale rollout count overflow")?
         } else {
             0
         };
         let pre_cell_setup_timeout_ms = if self.platform.kind == OatMode::Aks {
-            setup_rollout_count.checked_mul(rollout_timeout_ms).context("OAT AKS setup timeout overflow")?
+            setup_rollout_count
+                .checked_mul(rollout_timeout_ms)
+                .context("OAT AKS setup timeout overflow")?
         } else {
             1_260_000
         };
         let after_setup_budget_ms = minimum_pin_ttl_ms
-            .checked_add(scale_rollout_count.checked_mul(rollout_timeout_ms).context("OAT scale rollout budget overflow")?)
+            .checked_add(
+                scale_rollout_count
+                    .checked_mul(rollout_timeout_ms)
+                    .context("OAT scale rollout budget overflow")?,
+            )
             .context("OAT post-setup cell budget overflow")?;
         let planned_cell_duration_ms = pre_cell_setup_timeout_ms
             .checked_add(after_setup_budget_ms)
@@ -1738,13 +1753,42 @@ mod tests {
     }
 
     #[test]
+    fn rust_and_typescript_stop_budgets_share_the_same_fixtures() -> Result<()> {
+        let fixtures: Vec<Value> = serde_json::from_str(include_str!("../../arrowcol-oat/stop-budget-fixtures.json"))?;
+        for fixture in fixtures {
+            let mut config = valid();
+            let mut maintenance = json!({
+                "enabled": true,
+                "apply": true,
+                "operations": fixture["operations"].clone(),
+            });
+            if let Some(timeout) = fixture["operation_timeout_secs"].as_u64() {
+                maintenance["operation_timeout_secs"] = json!(timeout);
+            }
+            config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({"maintenance": maintenance}))?;
+            let result = config.maintenance_stop_budget();
+            if fixture["rejected"] == true {
+                assert!(result.is_err(), "{} must be rejected by Rust", fixture["name"]);
+            } else {
+                assert_eq!(
+                    serde_json::to_value(result?)?,
+                    fixture["expected"],
+                    "{}",
+                    fixture["name"]
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn pin_ttl_covers_the_full_startup_and_client_lifetime_envelope() -> Result<()> {
         let mut config = valid();
         config.client_ready_timeout_seconds = 1_800;
         config.qap_timeout_seconds = 300;
         config.warmup_seconds = 300;
         config.measure_seconds = 600;
-        config.run_pin_ttl_ms = 4_080_000;
+        config.run_pin_ttl_ms = config.timing_budget()?.minimum_pin_ttl_ms;
         config.validate()?;
 
         config.run_pin_ttl_ms -= 1;

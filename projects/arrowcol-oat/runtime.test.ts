@@ -11,6 +11,7 @@ const config = (): RuntimeConfig => ({
   workloadIdentityClientId: '00000000-0000-0000-0000-000000000001',
   subscriptionId: '00000000-0000-0000-0000-000000000002', stamp: '89152',
   deltaRoot: 'abfss://onelake@arrowcollector89152.dfs.core.windows.net/dataflow',
+  effective_stop_budgets: { maintenance_grace_seconds: 4_800, maintenance_stop_timeout_ms: 5_100_000 },
   images: Object.fromEntries(['sqlserver', 'catalog', 'router', 'dataflow'].map((role) =>
     [role, `arrowcollector89152.azurecr.io/${role}@sha256:${'a'.repeat(64)}`])) as RuntimeConfig['images'],
 });
@@ -32,7 +33,8 @@ test('AKS resource overrides are strict and project through to role manifests', 
   c.resources = { collector: { requests: { cpu: '3', memory: '8Gi' }, limits: { cpu: '4', memory: '10Gi' } },
     client: { requests: { cpu: '500m', memory: '512Mi' }, limits: { cpu: '2', memory: '3Gi' } } };
   c.maintenance = { tables: ['telemetry.sqlserver.sqlserver_cpu_utilization'], operations: ['optimize'], apply: false,
-    granularity: 'day', stopGraceSeconds: 1200 };
+    granularity: 'day' };
+  c.effective_stop_budgets = { maintenance_grace_seconds: 1200, maintenance_stop_timeout_ms: 1_500_000 };
   c.images.maintenance = 'arrowcollector89152.azurecr.io/delta-maintenance@sha256:' + 'b'.repeat(64);
   const objects = await renderRuntime(c, 'workload');
   const get = (name: string) => objects.find(o => o.kind === 'Deployment' && o.metadata.name === name)!;

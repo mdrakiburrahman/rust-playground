@@ -1,0 +1,48 @@
+[
+  {
+    "name": "default-five-operations",
+    "operation_timeout_secs": null,
+    "operations": [
+      "optimize",
+      "purge",
+      "vacuum",
+      "checkpoint",
+      "prune_log"
+    ],
+    "expected": {
+      "maintenance_grace_seconds": 4800,
+      "maintenance_stop_timeout_ms": 5100000
+    }
+  },
+  {
+    "name": "reduced-timeout",
+    "operation_timeout_secs": 60,
+    "operations": [
+      "optimize",
+      "purge",
+      "vacuum",
+      "checkpoint",
+      "prune_log"
+    ],
+    "expected": {
+      "maintenance_grace_seconds": 600,
+      "maintenance_stop_timeout_ms": 900000
+    }
+  },
+  {
+    "name": "ceiling-exceeded",
+    "operation_timeout_secs": 901,
+    "operations": [
+      "optimize",
+      "purge",
+      "vacuum",
+      "checkpoint",
+      "prune_log"
+    ],
+    "rejected": true,
+    "expected": {
+      "maintenance_grace_seconds": 4805,
+      "maintenance_stop_timeout_ms": 5105000
+    }
+  }
+]
