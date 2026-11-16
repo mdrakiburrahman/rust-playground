@@ -93,14 +93,15 @@ function assertActor(state: CampaignState, envelope: CellCleanupEnvelope, select
   }
 }
 function field(selector: CellCleanupSelector): keyof RunInventory['cleanup'] | undefined {
-  return selector === 'stop_admission' || selector === 'bounded_drain' || selector === 'evidence_capture' ||
+  return selector === 'stop_admission' || selector === 'bounded_drain' || selector === 'evidence_capture' || selector === 'stop_maintenance' ||
     selector === 'terminal_capture' || selector === 'handoff' ? selector : undefined;
 }
 function mark(inventory: RunInventory, selector: CellCleanupSelector, state: 'running' | 'complete'): RunInventory {
   const next = structuredClone(inventory), name = field(selector);
   if (name) next.cleanup[name] = { ...next.cleanup[name], state, reason_code: null,
     deadline_unix_ms: next.cleanup[name].deadline_unix_ms ??
-      (selector === 'stop_admission' ? Date.now() + 60_000 : selector === 'bounded_drain' ? Date.now() + 120_000 : null) };
+      (selector === 'stop_admission' ? Date.now() + 60_000 :
+        selector === 'bounded_drain' || selector === 'stop_maintenance' ? Date.now() + 120_000 : null) };
   return next;
 }
 function terminal(inventory: RunInventory) {
@@ -181,6 +182,8 @@ export async function executeCellCleanupStep(store: CampaignStore, input: unknow
   assertActor(current.state, envelope, selector);
   if (current.etag !== envelope.expected_etag || canonical_json(current.state.runInventory) !== canonical_json(envelope.inventory))
     throw new CampaignConflictError();
+  if ((selector === 'evidence_capture' || selector === 'terminal_capture') && !current.state.runInventory!.evidence_destination)
+    throw new Error('Persist the exact evidence destination before any capture effect.');
   let effectEtag: string | undefined;
   const assertCurrent = async () => {
     const observed = await store.read();
@@ -256,6 +259,9 @@ export function createCellCleanupProviders(actions: ExternalCleanupActions, reco
         case 'evidence_capture': complete(await actions.preserveEvidence(inventory, key, authority)); break;
         case 'terminal_capture': complete(await actions.captureTerminalState(inventory, key, authority)); break;
         case 'stop_maintenance':
+          if (inventory.resources.some(value => value.role === 'maintenance' &&
+              (['planned', 'uncertain'].includes(value.state) || value.state === 'observed' && !value.uid)))
+            throw new Error('Exact maintenance workload stop identity is UNKNOWN.');
           for (const resource of inventory.resources.filter(value => value.role === 'maintenance' && value.state === 'observed')) {
             if (!resource.uid) throw new Error('Maintenance UID is UNKNOWN.');
             complete(await actions.stopMaintenanceIfUidAndOwnerMatch(resource, inventory.namespace.owner_token, key + ':' + resource.name, authority));

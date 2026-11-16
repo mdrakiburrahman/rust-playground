@@ -181,7 +181,7 @@ async function setupCustody(f: ReturnType<typeof fixture>) {
   const inventory: RunInventory = { schema_version: 1, campaign_id: id, owner_id: runId, fencing_token: 1,
     orchestration_run_id: id, cell_run_id: runId, namespace: { name: namespace, uid: id, owner_token: runId }, resources: [],
     fic: { resource_id: plan.resourceId, name: plan.credentialName, state: 'planned', absence: null, plan }, qap: null,
-    cleanup: { stop_admission: step, bounded_drain: step, evidence_capture: step, terminal_capture: step, handoff: step } };
+    cleanup: { stop_admission: step, bounded_drain: step, evidence_capture: step, stop_maintenance: step, terminal_capture: step, handoff: step } };
   const state: CampaignState = { ...newCampaignState(id, runId, now - 240_000), mode: 'armed', status: 'cleaning',
     fencingToken: 2, fenceReason: 'heartbeat-expired', fencedAtMs: now - 60_000, cleanupStatus: 'running', runInventory: inventory,
     cleanupSteps: CUSTODY_CLEANUP_STEPS.map((step, index) => ({ step, idempotencyKey: `${id}:2:${step}`,

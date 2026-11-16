@@ -39,7 +39,7 @@ async function fixture(t: TestContext, capture = true) {
     orchestration_run_id: campaignId, cell_run_id: cellId, namespace: { name: namespace, uid: cellId, owner_token: ownerId },
     resources: [], fic: { resource_id: plan.resourceId, name: plan.credentialName, state: 'planned', absence: null, plan },
     qap: null, evidence_destination: { account: c.account, container: c.checkpoints, blob_prefix: 'evidence/' + cellId },
-    cleanup: { stop_admission: step, bounded_drain: step, evidence_capture: step, terminal_capture: step, handoff: step } };
+    cleanup: { stop_admission: step, bounded_drain: step, evidence_capture: step, stop_maintenance: step, terminal_capture: step, handoff: step } };
   const store = new Store({ ...newCampaignState(campaignId, ownerId, Date.now() - 10_000), heartbeatAtMs: Date.now(), runInventory: inventory });
   const resources = new Map<string, Record<string, unknown>>([
     [aksId, { id: aksId, type: 'Microsoft.ContainerService/managedClusters', tags: { ...TAGS, sandboxId: c.sandbox },

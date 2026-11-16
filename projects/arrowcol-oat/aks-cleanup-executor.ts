@@ -36,6 +36,7 @@ export interface ExternalCleanupActions {
 
 const ADMISSION_STOP_BUDGET_MS = 60_000;
 const DRAIN_BUDGET_MS = 120_000;
+const MAINTENANCE_STOP_BUDGET_MS = 120_000;
 
 function hasUnresolvedIdentity(inventory: RunInventory): boolean {
   return inventory.resources.some(resource => resource.state === 'planned' || resource.state === 'uncertain') ||
@@ -50,6 +51,7 @@ function stepField(step: string): keyof RunInventory['cleanup'] | undefined {
     case 'stop-admission': return 'stop_admission';
     case 'bounded-drain': return 'bounded_drain';
     case 'preserve-evidence': return 'evidence_capture';
+    case 'stop-maintenance': return 'stop_maintenance';
     case 'record-terminal-state': return 'terminal_capture';
     default: return undefined;
   }
@@ -156,6 +158,7 @@ export function createExternalCleanupExecutor(store: CampaignStore, actions: Ext
     const currentState = (await store.read())!.state;
     const runAction = async (field: keyof RunInventory['cleanup'], action: (deadline: number | null) => Promise<CleanupActionResult>, budgetMs = 0): Promise<'pending' | 'complete'> => {
       const prior = inventory.cleanup[field];
+      if (['running', 'failed', 'uncertain'].includes(prior.state)) return 'pending';
       const running = setStep(prior, 'running', budgetMs);
       inventory = (await writeInventory(value => ({ ...value, cleanup: { ...value.cleanup, [field]: running } }))).state.runInventory!;
       await authority.assertCurrent();
@@ -177,20 +180,23 @@ export function createExternalCleanupExecutor(store: CampaignStore, actions: Ext
       case 'preserve-evidence':
         return runAction('evidence_capture', () => actions.preserveEvidence(inventory, idempotencyKey, authority));
       case 'stop-maintenance': {
-        if (hasUnresolvedIdentity(inventory)) return 'pending';
-        for (const resource of inventory.resources.filter(item => item.role === 'maintenance')) {
-          if (resource.state === 'observed' && resource.uid) {
-            await authority.assertCurrent();
-            const result = await actions.stopMaintenanceIfUidAndOwnerMatch(resource, inventory.namespace.owner_token,
-              keyed(idempotencyKey, resource.name), authority);
-            if (result !== 'complete') {
-              if (result === 'uncertain') inventory = (await writeInventory(value => ({ ...value, resources: value.resources.map(item =>
-                item.name === resource.name && item.kind === resource.kind ? { ...item, state: 'uncertain' } : item) }))).state.runInventory!;
-              return 'pending';
+        return runAction('stop_maintenance', async deadline => {
+          if (hasUnresolvedIdentity(inventory)) return 'pending';
+          for (const resource of inventory.resources.filter(item => item.role === 'maintenance')) {
+            if (resource.state === 'observed' && resource.uid) {
+              if (Date.now() >= deadline!) return 'uncertain';
+              await authority.assertCurrent();
+              const result = await actions.stopMaintenanceIfUidAndOwnerMatch(resource, inventory.namespace.owner_token,
+                keyed(idempotencyKey, resource.name), authority);
+              if (result !== 'complete') {
+                if (result === 'uncertain') inventory = (await writeInventory(value => ({ ...value, resources: value.resources.map(item =>
+                  item.name === resource.name && item.kind === resource.kind ? { ...item, state: 'uncertain' } : item) }))).state.runInventory!;
+                return result;
+              }
             }
           }
-        }
-        return 'complete';
+          return 'complete';
+        }, MAINTENANCE_STOP_BUDGET_MS);
       }
       case 'record-terminal-state':
         return runAction('terminal_capture', () => actions.captureTerminalState(inventory, idempotencyKey, authority));

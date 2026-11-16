@@ -106,7 +106,7 @@ function ownedActionsFor(f: ReturnType<typeof recoveryFixture>) {
       namespace: { name: f.record.workload.namespace, uid: f.record.workload.namespaceUid, owner_token: f.record.workload.namespaceOwner },
       resources: [], fic: null, qap: { database: f.c.experimentDatabase, bindings: f.record.manifest.tables,
         state: 'observed', absence: [] },
-      cleanup: { stop_admission: step, bounded_drain: step, evidence_capture: step, terminal_capture: step, handoff: step } } };
+      cleanup: { stop_admission: step, bounded_drain: step, evidence_capture: step, stop_maintenance: step, terminal_capture: step, handoff: step } } };
   const store: CampaignStore = { read: async () => ({ state: structuredClone(state), etag: '"1"' }),
     write: async () => { throw new Error('Unexpected campaign write by provider actions'); } };
   const authority = { campaignId: id, ownerId: run, fencingToken: 2, assertCurrent: async () => {} };

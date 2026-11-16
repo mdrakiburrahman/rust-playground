@@ -48,7 +48,7 @@ const inventoryFor = (state: CampaignState, observed = false): RunInventory => {
     fic: { resource_id: '/subscriptions/' + subscriptionId + '/resourceGroups/perf69/providers/Microsoft.ManagedIdentity/userAssignedIdentities/arrow-collector/federatedIdentityCredentials/arrowcol-run-' + cellRunId,
       name: 'arrowcol-run-' + cellRunId, state: stateName, absence: null },
     qap: { database: 'perf69-qap', bindings: [{ external_table: 'arrowcol_data', relative_path: 'perf69/' + cellRunId }], state: stateName, absence: [] },
-    cleanup: { stop_admission: { ...step }, bounded_drain: { ...step }, evidence_capture: { ...step }, terminal_capture: { ...step }, handoff: { ...step } },
+    cleanup: { stop_admission: { ...step }, bounded_drain: { ...step }, evidence_capture: { ...step }, stop_maintenance: { ...step }, terminal_capture: { ...step }, handoff: { ...step } },
   };
 };
 const armForTest = async (store: MemoryStore, now = 1_000_000, ready = true) => {
@@ -58,6 +58,28 @@ const armForTest = async (store: MemoryStore, now = 1_000_000, ready = true) => 
   if (ready) await publishRunInventory(store, inventoryFor((await store.read())!.state, true), now + 1);
   return (await store.read())!.state;
 };
+
+test('maintenance milestone is required, bounded, monotonic and required for handoff', async () => {
+  const store = await seed(), inventory = inventoryFor((await store.read())!.state);
+  const { stop_maintenance: _omitted, ...legacy } = inventory.cleanup;
+  await assert.rejects(publishRunInventory(store, { ...inventory, cleanup: legacy }, 1_000_000), /malformed/);
+  for (const deadline of [null, 120_000]) {
+    const invalid = structuredClone(inventory);
+    invalid.cleanup.stop_maintenance = { state: 'running', deadline_unix_ms: deadline, reason_code: null };
+    await assert.rejects(publishRunInventory(store, invalid, 1_000_000), /absolute deadline/);
+  }
+  const running = structuredClone(inventory);
+  running.cleanup.stop_maintenance = { state: 'running', deadline_unix_ms: 1_120_000, reason_code: null };
+  await publishRunInventory(store, running, 1_000_000);
+  const complete = structuredClone(running);
+  complete.cleanup.stop_maintenance.state = 'complete';
+  await publishRunInventory(store, complete, 1_000_000);
+  await assert.rejects(publishRunInventory(store, running, 1_000_000), /Completed cleanup state/);
+  const unresolved = inventoryFor((await store.read())!.state);
+  unresolved.resources = []; unresolved.fic = null; unresolved.qap = null;
+  for (const [name, step] of Object.entries(unresolved.cleanup)) if (name !== 'stop_maintenance') step.state = 'complete';
+  await assert.rejects(publishRunInventory(store, unresolved, 1_000_000), /handoff cannot complete/);
+});
 
 test('new campaign is observe-only with fixed heartbeat and lifetime bounds', () => {
   const state = newCampaignState(campaignId, ownerId, 100);

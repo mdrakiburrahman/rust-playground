@@ -71,6 +71,10 @@ Use `npx --no-install tsx projects/arrowcol-oat/aks-campaign.ts cleanup-step <se
 | `remove_fic` | `remove-run-fic` |
 | `handoff` | `cell-handoff`: verify prior per-cell receipts and all lifecycle/resource terminal proofs, then confirm the final cell CAS. No hidden deletion, capacity restore or campaign completion. |
 
+`cleanup.stop_maintenance` is a required `InventoryStep`, initially `not_started` with null deadline/reason. Legacy inventories missing it fail closed. Running maintenance stop requires an absolute Unix-millisecond deadline; both executors persist its progress under the current actor/ETag. A completed milestone is monotonic and is required for handoff.
+
+The table order is mandatory: maintenance stays on throughout load/drain; capture pre-stop evidence, then stop maintenance, then capture final logs/actual terminal receipts before namespace removal. A maintenance provider may report completion only after verifying the exact workload stopped **and** recreation is disabled, not merely after API acceptance. The default CLI does not install this missing concrete lifecycle provider.
+
 The exact `CELL_CLEANUP_SELECTORS`, `CellCleanupEnvelope`, `CellCleanupReceipt`, `ReadInventoryEnvelope` and `ReadInventoryResult` are exported by `aks-cell-cleanup.ts`. All stdin is bounded to 1 MiB.
 
 ```typescript
@@ -99,6 +103,8 @@ Refresh using `aks-campaign.ts read-inventory`, not `status`. Strict stdin is:
 Success is exactly `{ok:true,inventory,etag}` from one validated durable read. The configured campaign environment, live producer/current cleaning controller, immutable origin and exact requested run/cell must match. No writes or provider effects occur. Replace the runner cache after confirmed step success or a pre-effect stale-version refusal; do not reconstruct TypeScript deadlines. This read does not resolve UNKNOWN effects or authorize replay.
 
 Both CLIs return one JSON error line, nonzero: `{ok:false,code:"campaign_fenced"|"write_outcome_unknown"|"invalid_or_storage_error",message}`.
+
+**Unresolved expiry gate:** the current outer executor cannot advance past a running, failed or uncertain lifecycle milestone while retaining that UNSETTLED evidence. It leaves the step pending for explicit recovery and does not replay unknown effects, clear reasons, treat drain timeout as success or qualify a failed cell. A separate bounded-expiry continuation/disposition contract is still required before unattended cleanup qualification.
 
 ## Campaign-terminal providers
 

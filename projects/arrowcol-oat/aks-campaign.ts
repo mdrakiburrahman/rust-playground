@@ -87,7 +87,7 @@ export interface RunInventory {
   fic: { resource_id: string | null; name: string | null; state: RunInventoryResourceState; absence: InventoryFicAbsenceReceipt | null; plan?: RunFicPlan | null } | null;
   qap: { database: string; bindings: Array<{ external_table: string; relative_path: string }>; state: RunInventoryResourceState; absence: InventoryQapAbsenceReceipt[]; reference?: OatQapReference | null } | null;
   evidence_destination?: { account: string; container: string; blob_prefix: string } | null;
-  cleanup: { stop_admission: InventoryStep; bounded_drain: InventoryStep; evidence_capture: InventoryStep;
+  cleanup: { stop_admission: InventoryStep; bounded_drain: InventoryStep; evidence_capture: InventoryStep; stop_maintenance: InventoryStep;
     terminal_capture: InventoryStep; handoff: InventoryStep };
 }
 function stateValue(value: unknown): value is RunInventoryResourceState { return ['planned', 'observed', 'removed', 'absent', 'uncertain'].includes(String(value)); }
@@ -113,7 +113,7 @@ function validateRunInventory(value: unknown, state: CampaignState): RunInventor
       value.namespace.owner_token !== state.ownerId || !Array.isArray(value.resources) || value.resources.length > 256 ||
       !(value.fic === null || optionalRecord(value.fic, ['resource_id', 'name', 'state', 'absence'], ['plan']) && ['planned', 'observed', 'removed', 'absent', 'uncertain'].includes(String(value.fic.state))) ||
       !(value.qap === null || optionalRecord(value.qap, ['database', 'bindings', 'state', 'absence'], ['reference']) && nonempty(value.qap.database) && Array.isArray(value.qap.bindings) && ['planned', 'observed', 'removed', 'absent', 'uncertain'].includes(String(value.qap.state)) && Array.isArray(value.qap.absence)) ||
-      !exactRecord(value.cleanup, ['stop_admission', 'bounded_drain', 'evidence_capture', 'terminal_capture', 'handoff']) ||
+      !exactRecord(value.cleanup, ['stop_admission', 'bounded_drain', 'evidence_capture', 'stop_maintenance', 'terminal_capture', 'handoff']) ||
       Object.values(value.cleanup).some(item => !validStep(item))) {
     throw new Error('RunInventory is malformed or fenced to another owner.');
   }
@@ -225,9 +225,11 @@ function validateRunInventory(value: unknown, state: CampaignState): RunInventor
     if (resourceKeys.has(key)) throw new Error('RunInventory contains duplicate resource identities.');
     resourceKeys.add(key);
   }
-  for (const name of ['stop_admission', 'bounded_drain'] as const) {
+  for (const name of ['stop_admission', 'bounded_drain', 'stop_maintenance'] as const) {
     const step = inventory.cleanup[name];
-    if (step.state === 'running' && step.deadline_unix_ms === null) throw new Error('Running RunInventory admission and drain steps require a deadline.');
+    if (step.state === 'running' && (step.deadline_unix_ms === null ||
+        name === 'stop_maintenance' && step.deadline_unix_ms <= state.startedAtMs))
+      throw new Error('Running RunInventory admission, drain and maintenance steps require an absolute deadline.');
   }
   if (inventory.cleanup.handoff.state === 'complete' &&
       (Object.entries(inventory.cleanup).some(([key, item]) => key !== 'handoff' && item.state !== 'complete') ||

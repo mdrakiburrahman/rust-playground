@@ -33,7 +33,7 @@ class Store implements CampaignStore {
     return `"${this.revision}"`;
   }
 }
-function fixture(t: TestContext) {
+function fixture(t: TestContext, evidence = true) {
   const step = { state: 'not_started' as const, deadline_unix_ms: null, reason_code: null };
   const inventory: RunInventory = { schema_version: 1, campaign_id: campaignId, owner_id: ownerId, fencing_token: 1,
     orchestration_run_id: campaignId, cell_run_id: cellId, namespace: { name: namespace, uid: cellId, owner_token: ownerId },
@@ -42,7 +42,8 @@ function fixture(t: TestContext) {
     fic: { resource_id: '/subscriptions/' + campaignId + '/resourceGroups/perf69/providers/Microsoft.ManagedIdentity/userAssignedIdentities/fixture/federatedIdentityCredentials/arrowcol-run-' + cellId,
       name: 'arrowcol-run-' + cellId, state: 'observed', absence: null },
     qap: { database: 'qap', bindings: [{ external_table: 'collector', relative_path: 'runs/' + cellId }], state: 'observed', absence: [] },
-    cleanup: { stop_admission: { ...step }, bounded_drain: { ...step }, evidence_capture: { ...step }, terminal_capture: { ...step }, handoff: { ...step } } };
+    evidence_destination: evidence ? { account: 'fixtureaccount', container: 'checkpoints', blob_prefix: 'evidence/' + cellId } : null,
+    cleanup: { stop_admission: { ...step }, bounded_drain: { ...step }, evidence_capture: { ...step }, stop_maintenance: { ...step }, terminal_capture: { ...step }, handoff: { ...step } } };
   const store = new Store({ ...newCampaignState(campaignId, ownerId), mode: 'armed', runInventory: inventory });
   const calls: string[] = [], blobs = new Map<string, { bytes: Buffer; etag: string }>();
   const azure = new Azure(new Config({ AZURE_SUBSCRIPTION_ID: campaignId }));
@@ -60,6 +61,10 @@ function fixture(t: TestContext) {
   const effect = (name: string) => async (...args: unknown[]) => {
     const authority = args.at(-1) as CleanupMutationAuthority;
     await authority.assertCurrent();
+    if (name === 'maintenance') {
+      assert.equal(store.state.runInventory!.cleanup.stop_maintenance.state, 'running');
+      assert.ok(store.state.runInventory!.cleanup.stop_maintenance.deadline_unix_ms! > Date.now());
+    }
     calls.push(name);
     return 'complete' as const;
   };
@@ -112,6 +117,17 @@ test('stale input, missing provider, skipped order and changed actor fail before
   f.afterJournal(() => { f.store.state.status = 'fenced'; f.store.state.fencingToken = 2; });
   await assert.rejects(f.invoke('stop_admission'), /fenced/);
   assert.deepEqual(f.calls, []);
+});
+
+test('capture without a durable destination is refused before a journal claim or effect', async t => {
+  const f = fixture(t, false);
+  await f.invoke('stop_admission');
+  await f.invoke('bounded_drain');
+  const revision = f.store.revision, journals = f.blobs.size;
+  await assert.rejects(f.invoke('evidence_capture'), /Persist the exact evidence destination/);
+  assert.deepEqual(f.calls, ['admission', 'drain']);
+  assert.equal(f.store.revision, revision);
+  assert.equal(f.blobs.size, journals);
 });
 
 for (const fault of ['before', 'after'] as const) test(`positive effect survives ${fault}-commit write loss without executing twice`, async t => {
