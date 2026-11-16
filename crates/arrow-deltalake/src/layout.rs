@@ -236,13 +236,9 @@ impl FileSortBuffer {
         self.rows >= self.policy.max_rows || self.input_bytes >= self.policy.max_input_bytes
     }
 
-    pub(crate) fn full_for_next(&self, batch: &RecordBatch) -> bool {
-        let rows_full =
-            self.rows.saturating_add(batch.num_rows()) > self.policy.max_rows && self.rows >= batch.num_rows();
-        let batch_bytes = batch.get_array_memory_size();
-        let bytes_full = self.input_bytes.saturating_add(batch_bytes) > self.policy.max_input_bytes
-            && self.input_bytes >= batch_bytes;
-        self.at_budget() || rows_full || bytes_full
+    /// A rejected batch cannot make this buffer reusable as full.
+    pub(crate) fn full_for_next(&self, _batch: &RecordBatch) -> bool {
+        self.at_budget()
     }
 
     #[must_use]
@@ -396,6 +392,47 @@ mod tests {
             },
         )?;
         assert!(buffer.try_push(&a).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn rejected_batches_do_not_prove_reusable_saturation() -> Result<()> {
+        let rows_before_rejection = batch(vec!["x"; 6], (0..6).collect())?;
+        let row_rejection = batch(vec!["y"; 5], (0..5).collect())?;
+        let mut row_buffer = FileSortBuffer::new(
+            rows_before_rejection.schema(),
+            LayoutPolicy {
+                max_rows: 10,
+                max_input_bytes: 1024 * 1024,
+                ..LayoutPolicy::default()
+            },
+        )?;
+        assert!(row_buffer.try_push(&rows_before_rejection)?);
+        assert!(!row_buffer.try_push(&row_rejection)?);
+        let row_marked_full = row_buffer.full_for_next(&row_rejection);
+
+        let large_value = "x".repeat(128);
+        let bytes_before_rejection = batch(vec![large_value.as_str(); 2], vec![0, 1])?;
+        let byte_rejection = batch(vec!["y"; 2], vec![2, 3])?;
+        let large_bytes = bytes_before_rejection.get_array_memory_size();
+        let next_bytes = byte_rejection.get_array_memory_size();
+        assert!(large_bytes > next_bytes);
+        let max_input_bytes = large_bytes + next_bytes - 1;
+        let mut byte_buffer = FileSortBuffer::new(
+            bytes_before_rejection.schema(),
+            LayoutPolicy {
+                max_rows: 100,
+                max_input_bytes,
+                ..LayoutPolicy::default()
+            },
+        )?;
+        assert!(byte_buffer.try_push(&bytes_before_rejection)?);
+        assert!(!byte_buffer.try_push(&byte_rejection)?);
+        let byte_marked_full = byte_buffer.full_for_next(&byte_rejection);
+        assert!(
+            !row_marked_full && !byte_marked_full,
+            "row_marked_full={row_marked_full}, byte_marked_full={byte_marked_full}"
+        );
         Ok(())
     }
 

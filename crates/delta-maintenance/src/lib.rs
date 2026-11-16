@@ -1051,6 +1051,7 @@ impl OptimizeEvidence {
                 "layout_mode": layout_mode,
                 "layout_applied": plan.layout_fingerprint.is_some(),
                 "layout_fingerprint": plan.layout_fingerprint,
+                "output_policy_fingerprint": plan.output_policy_fingerprint,
                 "layout_sources": layout_sources,
                 "layout": plan.layout_fingerprint.as_ref().and_then(|_| resolved_layout.map(|layout| serde_json::json!({
                     "sort_columns": layout.sort_columns,
@@ -1387,7 +1388,8 @@ fn run_operation(
                 min_files_per_bin: usize::try_from(props.unsigned("arrowcol.optimize.minFiles")?)?,
                 ..settings.optimize.clone()
             };
-            let prepared = table.prepare_optimize(&config)?;
+            let writer_config = arrow_deltalake::writer::process_config()?;
+            let prepared = table.prepare_optimize_with_writer_config(&config, writer_config)?;
             *optimize = Some(OptimizeEvidence::new(
                 &config,
                 prepared.plan.clone(),
@@ -1410,7 +1412,7 @@ fn run_operation(
                     &config,
                     control,
                     upload_buffer_bytes,
-                    arrow_deltalake::writer::process_config()?,
+                    writer_config,
                 );
             }
             MaintenancePlan::Optimize(prepared.plan)

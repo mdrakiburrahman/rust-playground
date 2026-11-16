@@ -733,7 +733,7 @@ fn unsorted_optimize_respects_output_row_group_limit() -> Result<()> {
         ..optimize_config()
     };
     let before = rows(root.path())?;
-    let prepared = maintenance.prepare_optimize(&config)?;
+    let prepared = maintenance.prepare_optimize_with_writer_config(&config, &writer_override)?;
     let report = maintenance.apply_prepared_optimize_with_writer_config(
         &prepared,
         &config,
@@ -1909,6 +1909,8 @@ fn optimize_does_not_rewrite_budget_full_layout_outputs_again() -> Result<()> {
         (Outcome::Committed, 4, 2, 4, 4)
     );
 
+    drop(maintenance);
+    let maintenance = DeltaTable::open_for_maintenance(&url_of(root.path())?)?;
     let second = maintenance.plan_optimize(&config)?;
     assert!(
         second.bins.is_empty(),
@@ -1954,6 +1956,285 @@ fn optimize_does_not_rewrite_budget_full_layout_outputs_again() -> Result<()> {
             ("frontier".into(), 10)
         ]
     );
+    Ok(())
+}
+
+#[test]
+fn optimize_reconsiders_partial_outputs_after_reopen_and_new_arrival() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let table = DeltaTable::open_url(
+        url_of(root.path())?,
+        customer_schema(),
+        vec![INGESTION_PARTITION.into()],
+    )?;
+    append_customers(&table, 0, &["c0", "c1", "c2"], 0)?;
+    append_customers(&table, 0, &["c3", "c4", "c5"], 3)?;
+    append_customers(&table, 0, &["c6", "c7", "c8"], 6)?;
+    append_customers(&table, 0, &["c9", "c10", "c11", "c12", "c13"], 9)?;
+    let layout = LayoutPolicy {
+        max_rows: 10,
+        max_input_bytes: 1024 * 1024,
+        row_group_rows: 10,
+        page_rows: 2,
+        ..LayoutPolicy::default()
+    };
+    let config = OptimizeConfig {
+        layout: Some(layout),
+        sealed_final: true,
+        ..optimize_config()
+    };
+    let maintenance = DeltaTable::open_for_maintenance(&url_of(root.path())?)?;
+    let first = maintenance.plan_optimize(&config)?;
+    assert_eq!(first.bins.iter().flat_map(|bin| &bin.files).count(), 4);
+    let first_report = maintenance.apply_optimize(&first, &config, &control())?;
+    assert_eq!(
+        (
+            first_report.files_removed,
+            first_report.files_added,
+            first_report.rows_removed,
+            first_report.rows_added,
+        ),
+        (4, 2, 14, 14)
+    );
+    let first_outputs = active_files(root.path())?;
+    assert_eq!(first_outputs.len(), 2);
+    assert!(
+        first_outputs.keys().all(|path| !path.contains("full-")),
+        "partial outputs must not carry a reusable full-capacity marker"
+    );
+
+    drop(maintenance);
+    drop(table);
+    let reopened = DeltaTable::open_url(
+        url_of(root.path())?,
+        customer_schema(),
+        vec![INGESTION_PARTITION.into()],
+    )?;
+    append_customers(&reopened, 0, &["c14", "c15"], 14)?;
+    drop(reopened);
+    let maintenance = DeltaTable::open_for_maintenance(&url_of(root.path())?)?;
+    let second = maintenance.plan_optimize(&config)?;
+    assert_eq!(
+        second.bins.iter().flat_map(|bin| &bin.files).count(),
+        3,
+        "reopened planning must reconsider both partial outputs with the later arrival"
+    );
+    let second_report = maintenance.apply_optimize(&second, &config, &control())?;
+    assert_eq!(
+        (
+            second_report.outcome,
+            second_report.files_removed,
+            second_report.files_added,
+            second_report.rows_removed,
+            second_report.rows_added,
+        ),
+        (Outcome::Committed, 3, 2, 16, 16)
+    );
+
+    let mut actual_rows = Vec::new();
+    for path in active_files(root.path())?.keys() {
+        let reader =
+            ParquetRecordBatchReaderBuilder::try_new(fs::File::open(data_path(root.path(), path)?)?)?.build()?;
+        let mut file_customers = Vec::new();
+        for batch in reader {
+            let batch = batch?;
+            let customers = batch
+                .column_by_name("customer_id")
+                .context("customer_id")?
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .context("customers")?;
+            let ids = batch
+                .column_by_name("id")
+                .context("id")?
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .context("ids")?;
+            for row in 0..batch.num_rows() {
+                file_customers.push(customers.value(row).to_owned());
+                actual_rows.push((customers.value(row).to_owned(), ids.value(row)));
+            }
+        }
+        assert!(file_customers.windows(2).all(|pair| pair[0] <= pair[1]));
+    }
+    actual_rows.sort();
+    let mut expected_rows: Vec<_> = (0..16).map(|id| (format!("c{id}"), id)).collect();
+    expected_rows.sort();
+    assert_eq!(actual_rows, expected_rows);
+    Ok(())
+}
+
+#[test]
+fn optimize_rejects_writer_config_drift_before_effects() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let table = DeltaTable::open_url(
+        url_of(root.path())?,
+        customer_schema(),
+        vec![INGESTION_PARTITION.into()],
+    )?;
+    append_customers(&table, 0, &["c2", "c1", "c0"], 0)?;
+    append_customers(&table, 0, &["c5", "c4", "c3"], 3)?;
+    let maintenance = DeltaTable::open_for_maintenance(&url_of(root.path())?)?;
+    let config = OptimizeConfig {
+        layout: Some(LayoutPolicy {
+            max_rows: 10,
+            max_input_bytes: 1024 * 1024,
+            row_group_rows: 10,
+            page_rows: 2,
+            ..LayoutPolicy::default()
+        }),
+        sealed_final: true,
+        ..optimize_config()
+    };
+    let prepared = maintenance.prepare_optimize(&config)?;
+    let version = maintenance.version()?;
+    let original_writer = arrow_deltalake::writer::process_config()?.clone();
+    let mut changed_writer = original_writer.clone();
+    changed_writer.max_row_group_rows = Some(if original_writer.max_row_group_rows == Some(1) {
+        2
+    } else {
+        1
+    });
+    let error = match maintenance.apply_prepared_optimize_with_writer_config(
+        &prepared,
+        &config,
+        &control(),
+        None,
+        &changed_writer,
+    ) {
+        Err(error) => error,
+        Ok(_) => bail!("writer policy drift must be rejected before writing outputs"),
+    };
+    assert_eq!(error_kind(&error), Some(MaintenanceErrorKind::InvalidPlan));
+    assert_eq!(maintenance.version()?, version);
+    assert_eq!(active_files(root.path())?.len(), 2);
+    Ok(())
+}
+
+#[test]
+fn optimize_relayouts_marked_files_when_writer_policy_changes_after_reopen() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let table = DeltaTable::open_url(
+        url_of(root.path())?,
+        customer_schema(),
+        vec![INGESTION_PARTITION.into()],
+    )?;
+    append_customers(&table, 0, &["c0", "c1", "c2", "c3", "c4"], 0)?;
+    append_customers(&table, 0, &["c5", "c6", "c7", "c8", "c9"], 5)?;
+    let config = OptimizeConfig {
+        layout: Some(LayoutPolicy {
+            max_rows: 10,
+            max_input_bytes: 1024 * 1024,
+            row_group_rows: 10,
+            page_rows: 2,
+            ..LayoutPolicy::default()
+        }),
+        sealed_final: true,
+        ..optimize_config()
+    };
+    let original_writer = arrow_deltalake::writer::ParquetWriterConfig::default();
+    let maintenance = DeltaTable::open_for_maintenance(&url_of(root.path())?)?;
+    let first = maintenance.prepare_optimize_with_writer_config(&config, &original_writer)?;
+    let first_report =
+        maintenance.apply_prepared_optimize_with_writer_config(&first, &config, &control(), None, &original_writer)?;
+    assert_eq!(
+        (
+            first_report.files_removed,
+            first_report.files_added,
+            first_report.rows_removed,
+            first_report.rows_added,
+        ),
+        (2, 1, 10, 10)
+    );
+    let first_output = active_files(root.path())?;
+    assert_eq!(first_output.len(), 1);
+    assert!(
+        first_output
+            .keys()
+            .any(|path| path.contains("output-v2-") && path.contains("full-"))
+    );
+
+    drop(maintenance);
+    drop(table);
+    let reopened = DeltaTable::open_url(
+        url_of(root.path())?,
+        customer_schema(),
+        vec![INGESTION_PARTITION.into()],
+    )?;
+    append_customers(&reopened, 0, &["c10", "c11", "c12"], 10)?;
+    append_customers(&reopened, 0, &["c13", "c14", "c15"], 13)?;
+    append_customers(&reopened, 0, &["c16", "c17", "c18"], 16)?;
+    append_customers(&reopened, 0, &["c19", "c20", "c21"], 19)?;
+    drop(reopened);
+
+    let maintenance = DeltaTable::open_for_maintenance(&url_of(root.path())?)?;
+    let changed_writer: arrow_deltalake::writer::ParquetWriterConfig = serde_json::from_value(serde_json::json!({
+        "defaults": {"compression": "snappy"}
+    }))?;
+    let stale = maintenance.prepare_optimize_with_writer_config(&config, &original_writer)?;
+    let version = maintenance.version()?;
+    let error = match maintenance.apply_prepared_optimize_with_writer_config(
+        &stale,
+        &config,
+        &control(),
+        None,
+        &changed_writer,
+    ) {
+        Err(error) => error,
+        Ok(_) => bail!("writer policy drift must be rejected before writing outputs"),
+    };
+    assert_eq!(error_kind(&error), Some(MaintenanceErrorKind::InvalidPlan));
+    assert_eq!(maintenance.version()?, version);
+    assert_eq!(active_files(root.path())?.len(), 5);
+
+    let changed = maintenance.prepare_optimize_with_writer_config(&config, &changed_writer)?;
+    assert_eq!(changed.plan.bins.iter().flat_map(|bin| &bin.files).count(), 5);
+    let report =
+        maintenance.apply_prepared_optimize_with_writer_config(&changed, &config, &control(), None, &changed_writer)?;
+    assert_eq!(
+        (
+            report.outcome,
+            report.files_removed,
+            report.files_added,
+            report.rows_removed,
+            report.rows_added,
+        ),
+        (Outcome::Committed, 5, 3, 22, 22),
+        "unexpected OPTIMIZE report: {report:#?}"
+    );
+    let active = active_files(root.path())?;
+    assert_eq!(active.len(), 3);
+    let mut actual_rows = Vec::new();
+    for path in active.keys() {
+        let file_path = data_path(root.path(), path)?;
+        assert_eq!(parquet_compression(&file_path)?, parquet::basic::Compression::SNAPPY);
+        let reader = ParquetRecordBatchReaderBuilder::try_new(fs::File::open(file_path)?)?.build()?;
+        let mut file_customers = Vec::new();
+        for batch in reader {
+            let batch = batch?;
+            let customers = batch
+                .column_by_name("customer_id")
+                .context("customer_id")?
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .context("customers")?;
+            let ids = batch
+                .column_by_name("id")
+                .context("id")?
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .context("ids")?;
+            for row in 0..batch.num_rows() {
+                file_customers.push(customers.value(row).to_owned());
+                actual_rows.push((customers.value(row).to_owned(), ids.value(row)));
+            }
+        }
+        assert!(file_customers.windows(2).all(|pair| pair[0] <= pair[1]));
+    }
+    actual_rows.sort();
+    let mut expected_rows: Vec<_> = (0..22).map(|id| (format!("c{id}"), id)).collect();
+    expected_rows.sort();
+    assert_eq!(actual_rows, expected_rows);
     Ok(())
 }
 

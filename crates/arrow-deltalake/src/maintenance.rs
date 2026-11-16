@@ -36,6 +36,7 @@ use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
 use parquet::file::properties::WriterProperties;
 use parquet::file::reader::ChunkReader;
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::{self, Display, Formatter};
 use std::fs::{self, File};
@@ -2418,6 +2419,8 @@ pub struct OptimizePlan {
     pub target_file_bytes: u64,
     #[serde(default)]
     pub layout_fingerprint: Option<String>,
+    #[serde(default)]
+    pub output_policy_fingerprint: Option<String>,
     pub bins: Vec<OptimizeBin>,
     pub compaction_debt: CompactionDebtEvidence,
     pub backlog_files: u64,
@@ -2497,6 +2500,21 @@ fn resolve_optimize_layout(config: &OptimizeConfig, schema: &SchemaRef) -> Resul
     }
 }
 
+fn optimize_output_policy_fingerprint(
+    config: &OptimizeConfig,
+    layout: Option<&LayoutPolicy>,
+    writer_config: &crate::writer::ParquetWriterConfig,
+) -> Result<String> {
+    writer_config.validate()?;
+    let value = serde_json::json!({
+        "layout": layout.map(|layout| layout.config_json(None)),
+        "output_row_group_rows": layout.is_none().then_some(config.output_row_group_rows),
+        "parquet_writer": writer_config,
+    });
+    let digest = sha2::Sha256::digest(serde_json::to_vec(&value)?);
+    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
 fn output_estimate(bytes: u64, target: u64) -> usize {
     usize::try_from(bytes.div_ceil(target).max(1)).unwrap_or(usize::MAX)
 }
@@ -2529,6 +2547,18 @@ impl DeltaTable {
     /// # Errors
     /// Returns the same validation and resource errors as `plan_optimize`.
     pub fn prepare_optimize(&self, config: &OptimizeConfig) -> Result<PreparedOptimize> {
+        self.prepare_optimize_with_writer_config(config, crate::writer::process_config()?)
+    }
+
+    /// Plan OPTIMIZE against the exact Parquet writer policy used for application.
+    ///
+    /// # Errors
+    /// Returns the same validation and resource errors as `prepare_optimize`.
+    pub fn prepare_optimize_with_writer_config(
+        &self,
+        config: &OptimizeConfig,
+        writer_config: &crate::writer::ParquetWriterConfig,
+    ) -> Result<PreparedOptimize> {
         config.validate()?;
         let observed_at_ms = match config.now_ms {
             Some(anchor) => {
@@ -2540,13 +2570,12 @@ impl DeltaTable {
         let state = self.active_state(config.max_active_files)?;
         state.fingerprint.validate_supported(false)?;
         let schema: SchemaRef = Arc::new(state.snapshot.schema().as_ref().try_into_arrow()?);
-        let layout_fingerprint = resolve_optimize_layout(config, &schema)?
+        let layout = resolve_optimize_layout(config, &schema)?;
+        let layout_fingerprint = layout.as_ref().map(LayoutPolicy::fingerprint).transpose()?;
+        let output_policy_fingerprint = optimize_output_policy_fingerprint(config, layout.as_ref(), writer_config)?;
+        let full_output_prefix = layout
             .as_ref()
-            .map(LayoutPolicy::fingerprint)
-            .transpose()?;
-        let full_output_prefix = layout_fingerprint
-            .as_ref()
-            .map(|value| format!("part-arrowcol-layout-v1-{value}-full-"));
+            .map(|_| format!("part-arrowcol-output-v2-{output_policy_fingerprint}-full-"));
         let columns = state.fingerprint.partition_columns.clone();
         partition_columns_are_strings(&state.snapshot, &columns)?;
         let ingestion = columns == [INGESTION_PARTITION];
@@ -2690,6 +2719,7 @@ impl DeltaTable {
             header: PlanHeader::new(self, &state)?,
             target_file_bytes: config.target_file_bytes,
             layout_fingerprint: layout_fingerprint.clone(),
+            output_policy_fingerprint: Some(output_policy_fingerprint.clone()),
             bins,
             compaction_debt: CompactionDebtEvidence {
                 observed_at_ms,
@@ -2728,16 +2758,24 @@ impl DeltaTable {
         Ok(PreparedOptimize { plan, state })
     }
 
-    fn check_optimize_plan(&self, plan: &OptimizePlan, config: &OptimizeConfig, state: &ActiveState) -> Result<()> {
+    fn check_optimize_plan(
+        &self,
+        plan: &OptimizePlan,
+        config: &OptimizeConfig,
+        state: &ActiveState,
+        writer_config: &crate::writer::ParquetWriterConfig,
+    ) -> Result<()> {
         plan.header.validate(self)?;
         let invalid = |message: &str| Err(fail(MaintenanceErrorKind::InvalidPlan, message.to_owned()));
         let schema: SchemaRef = Arc::new(state.snapshot.schema().as_ref().try_into_arrow()?);
-        let layout_fingerprint = resolve_optimize_layout(config, &schema)?
-            .as_ref()
-            .map(LayoutPolicy::fingerprint)
-            .transpose()?;
+        let layout = resolve_optimize_layout(config, &schema)?;
+        let layout_fingerprint = layout.as_ref().map(LayoutPolicy::fingerprint).transpose()?;
         if plan.layout_fingerprint != layout_fingerprint {
             return invalid("plan layout policy differs from the apply configuration");
+        }
+        let output_policy_fingerprint = optimize_output_policy_fingerprint(config, layout.as_ref(), writer_config)?;
+        if plan.output_policy_fingerprint.as_deref() != Some(output_policy_fingerprint.as_str()) {
+            return invalid("plan output policy differs from the apply configuration");
         }
         if plan.target_file_bytes != config.target_file_bytes {
             return invalid("plan target differs from the apply configuration");
@@ -2866,7 +2904,11 @@ impl DeltaTable {
     ) -> Result<MaintenanceReport> {
         config.validate()?;
         let state = self.validated_active_state(prepared, config.max_active_files)?;
-        self.check_optimize_plan(plan, config, &state)?;
+        let writer_config = match writer_config {
+            Some(config) => config,
+            None => crate::writer::process_config()?,
+        };
+        self.check_optimize_plan(plan, config, &state, writer_config)?;
         let mut report = plan.report(Outcome::Noop);
         plan.header.fingerprint.require_same(&state.fingerprint)?;
         report.version = state.snapshot.version();
@@ -2910,7 +2952,7 @@ impl DeltaTable {
                 config,
                 control,
                 upload_buffer_bytes,
-                writer_config,
+                Some(writer_config),
             ) {
                 Ok(written) => written,
                 Err(error) => return Err(self.discard_after(&outputs, error, &mut report)),
@@ -3009,8 +3051,14 @@ impl DeltaTable {
         let probe = self.write_context(snapshot, &bin.partition_values)?;
         let logical: SchemaRef = Arc::new(probe.logical_data_schema().as_ref().try_into_arrow()?);
         let physical: SchemaRef = Arc::new(probe.physical_data_schema().as_ref().try_into_arrow()?);
+        let parquet_writer_config = match parquet_writer_config {
+            Some(config) => config,
+            None => crate::writer::process_config()?,
+        };
         let layout = resolve_optimize_layout(config, &logical)?;
-        let layout_fingerprint = layout.as_ref().map(LayoutPolicy::fingerprint).transpose()?;
+        let output_policy_fingerprint =
+            optimize_output_policy_fingerprint(config, layout.as_ref(), parquet_writer_config)?;
+        let output_policy_fingerprint = layout.as_ref().map(|_| output_policy_fingerprint);
         let properties = match &layout {
             Some(layout) => {
                 layout.validate(&logical)?;
@@ -3021,10 +3069,6 @@ impl DeltaTable {
                 .build(),
         };
         let verified_sort = crate::writer::sorting_from_properties(&physical, Some(&properties))?;
-        let parquet_writer_config = match parquet_writer_config {
-            Some(config) => config,
-            None => crate::writer::process_config()?,
-        };
         let properties = parquet_writer_config.writer_properties(&physical, Some(properties), &verified_sort)?;
         let mut writer = BinWriter {
             table: self,
@@ -3035,7 +3079,7 @@ impl DeltaTable {
             config,
             upload_buffer_bytes,
             layout,
-            layout_fingerprint,
+            output_policy_fingerprint,
             buffer: None,
             current: None,
             outputs: Vec::new(),
@@ -3321,7 +3365,7 @@ struct BinWriter<'a> {
     config: &'a OptimizeConfig,
     upload_buffer_bytes: Option<usize>,
     layout: Option<LayoutPolicy>,
-    layout_fingerprint: Option<String>,
+    output_policy_fingerprint: Option<String>,
     buffer: Option<FileSortBuffer>,
     current: Option<OpenOutput>,
     outputs: Vec<StagedOutput>,
@@ -3415,10 +3459,10 @@ impl BinWriter<'_> {
             }
             relative.push_str(&format!("{name}={value}/"));
         }
-        let name = match (budget_full, self.layout_fingerprint.as_deref()) {
+        let name = match (budget_full, self.output_policy_fingerprint.as_deref()) {
             (true, Some(fingerprint)) => {
                 format!(
-                    "part-arrowcol-layout-v1-{fingerprint}-full-{}.parquet",
+                    "part-arrowcol-output-v2-{fingerprint}-full-{}.parquet",
                     uuid::Uuid::new_v4()
                 )
             }

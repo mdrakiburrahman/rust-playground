@@ -148,7 +148,7 @@ OPTIMIZE uses `dataChange=false` and preserves exact rows, schema, partition val
 
 ## Sorted OPTIMIZE convergence
 
-A sorted output that reaches the applied `LayoutPolicy` row or input-memory budget is marked in its durable Parquet filename with that policy's fingerprint. Later plans exclude only marked outputs with the same fingerprint; a changed layout policy makes them eligible for re-layout. Partial outputs remain eligible. The automatic default path resolves `arrowcol.layout.*` with table > process > registry precedence, and each OPTIMIZE evidence record includes the policy actually applied, its fingerprint and per-property source.
+A sorted output that reaches the applied `LayoutPolicy` row or input-memory budget is marked in its durable Parquet filename with a fingerprint of the applied layout and effective Parquet writer policy. Planning and application validate the same identity; a change to layout or writer settings makes marked files eligible for re-layout. Partial outputs remain eligible. The automatic default path resolves `arrowcol.layout.*` with table > process > registry precedence, and each OPTIMIZE evidence record includes the applied layout, output-policy fingerprint and per-property source.
 
 ## Commands and expected results
 
