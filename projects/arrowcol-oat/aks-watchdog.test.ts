@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { CampaignConflictError, CUSTODY_CLEANUP_STEPS, armCampaign, publishRunInventory, startCampaign, type CampaignState, type CampaignStore, type RunInventory, type StoredCampaign } from './aks-campaign.js';
 import { watchdogOnce } from './aks-watchdog.js';
+import { createExternalCleanupExecutor, type ExternalCleanupActions } from './aks-cleanup-executor.js';
+import { reconcileOnce } from './aks-reconcile.js';
 
 const campaignId = 'c0ffee00-0000-4000-8000-000000000001';
 const ownerId = 'c0ffee00-0000-4000-8000-000000000002';
@@ -30,8 +32,8 @@ const inventoryFor = (state: CampaignState): RunInventory => {
     resources: [{ api_version: 'apps/v1', kind: 'Deployment', namespace, name: 'arrowcol',
       uid: 'c0ffee00-0000-4000-8000-000000000006', absence: null, role: 'collector', state: 'observed' }],
     fic: { resource_id: '/subscriptions/' + subscriptionId + '/resourceGroups/perf69/providers/Microsoft.ManagedIdentity/userAssignedIdentities/arrow-collector/federatedIdentityCredentials/arrowcol-run-' + cellRunId,
-      name: 'arrowcol-run-' + cellRunId, state: 'observed' },
-    qap: { database: 'perf69-qap', bindings: [{ external_table: 'arrowcol_data', relative_path: 'perf69/' + cellRunId }], state: 'observed' },
+      name: 'arrowcol-run-' + cellRunId, state: 'observed', absence: null },
+    qap: { database: 'perf69-qap', bindings: [{ external_table: 'arrowcol_data', relative_path: 'perf69/' + cellRunId }], state: 'observed', absence: [] },
     cleanup: { stop_admission: { ...step }, bounded_drain: { ...step }, evidence_capture: { ...step }, terminal_capture: { ...step }, handoff: { ...step } },
   };
 };
@@ -61,4 +63,31 @@ test('watchdog expiry fences first, refuses missing cleanup, and resumes idempot
   assert.equal(evaluation.cleanupProgress, 'complete');
   assert.deepEqual(executed, CUSTODY_CLEANUP_STEPS);
   assert.equal((await store.read())!.state.cleanupStatus, 'verified');
+});
+
+
+test('external executor invokes safe-idle restoration exactly once under the cleanup fence', async () => {
+  const store = await armedStore();
+  await reconcileOnce(store, 1_000_000 + 3 * 60_000);
+  for (const _step of CUSTODY_CLEANUP_STEPS.slice(0, CUSTODY_CLEANUP_STEPS.indexOf('restore-safe-idle'))) {
+    await reconcileCleanupOnce(store, async () => 'complete');
+  }
+  let restoreCalls = 0;
+  const complete = async () => 'complete' as const;
+  const actions: ExternalCleanupActions = {
+    discoverExactInventory: async inventory => inventory,
+    stopAdmission: complete,
+    boundedDrain: complete,
+    preserveEvidence: complete,
+    stopMaintenanceIfUidAndOwnerMatch: complete,
+    captureTerminalState: complete,
+    deleteNamespaceIfUidAndOwnerMatch: complete,
+    deleteQapBindingIfOwned: complete,
+    deleteFicIfExact: complete,
+    restoreSafeIdle: async (_state, _key, authority) => { await authority.assertCurrent(); restoreCalls++; return 'complete'; },
+    verifySafeIdle: complete,
+  };
+  const result = await reconcileCleanupOnce(store, createExternalCleanupExecutor(store, actions));
+  assert.equal(result, 'progress');
+  assert.equal(restoreCalls, 1);
 });

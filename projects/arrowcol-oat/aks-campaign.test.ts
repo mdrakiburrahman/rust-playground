@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { CampaignConflictError, CUSTODY_CLEANUP_STEPS, MAX_CAMPAIGN_LIFETIME_MS, MISSED_HEARTBEAT_LIMIT, HEARTBEAT_INTERVAL_MS,
-  armCampaign, assertRunInventoryReady, heartbeatCampaign, mutateCampaign, newCampaignState, publishRunInventory, startCampaign,
+  armCampaign, assertCampaignEnvironment, assertRunInventoryReady, campaignStartReceipt, heartbeatCampaign, mutateCampaign, newCampaignState, publishCleanupRunInventory, publishRunInventory, runInventoryPublishReceipt, startCampaign,
   validateCampaignState, type CampaignState, type CampaignStore, type RunInventory, type StoredCampaign,
   CampaignWriteOutcomeUnknownError, recordArmOperation } from './aks-campaign.js';
 import { evaluateCustody, reconcileArmOperation, reconcileCleanupOnce, reconcileOnce, reconcilePendingArmOperations } from './aks-reconcile.js';
@@ -46,8 +46,8 @@ const inventoryFor = (state: CampaignState, observed = false): RunInventory => {
     resources: names.map((name, index) => ({ api_version: 'apps/v1', kind: 'Deployment', namespace, name,
       uid: observed ? uids[index]! : null, absence: null, role: index === 0 ? 'collector' : index === 1 ? 'client' : 'maintenance', state: stateName })),
     fic: { resource_id: '/subscriptions/' + subscriptionId + '/resourceGroups/perf69/providers/Microsoft.ManagedIdentity/userAssignedIdentities/arrow-collector/federatedIdentityCredentials/arrowcol-run-' + cellRunId,
-      name: 'arrowcol-run-' + cellRunId, state: stateName },
-    qap: { database: 'perf69-qap', bindings: [{ external_table: 'arrowcol_data', relative_path: 'perf69/' + cellRunId }], state: stateName },
+      name: 'arrowcol-run-' + cellRunId, state: stateName, absence: null },
+    qap: { database: 'perf69-qap', bindings: [{ external_table: 'arrowcol_data', relative_path: 'perf69/' + cellRunId }], state: stateName, absence: [] },
     cleanup: { stop_admission: { ...step }, bounded_drain: { ...step }, evidence_capture: { ...step }, terminal_capture: { ...step }, handoff: { ...step } },
   };
 };
@@ -65,6 +65,15 @@ test('new campaign is observe-only with fixed heartbeat and lifetime bounds', ()
   assert.equal(state.expiresAtMs, 100 + MAX_CAMPAIGN_LIFETIME_MS);
   assert.equal(HEARTBEAT_INTERVAL_MS, 60_000);
   assert.equal(MISSED_HEARTBEAT_LIMIT, 3);
+});
+
+test('campaign start receipt provides strict runner environment identities', () => {
+  const state = newCampaignState(campaignId, ownerId, 100);
+  const receipt = campaignStartReceipt(state);
+  assert.deepEqual(receipt.environment, { CAMPAIGN_ID: campaignId, CAMPAIGN_OWNER_ID: ownerId, CAMPAIGN_FENCING_TOKEN: '1' });
+  assert.equal(receipt.status, 'started');
+  assert.doesNotThrow(() => assertCampaignEnvironment(receipt.environment, state));
+  assert.throws(() => assertCampaignEnvironment({ CAMPAIGN_ID: campaignId }, state), /does not match the durable fence/);
 });
 
 test('heartbeat cannot revive expired custody and stale fencing tokens are rejected', async () => {
@@ -162,7 +171,7 @@ test('ARM operation receipts reject out-of-scope URLs and reconcile terminal pub
   }, subscriptionId, state.startedAtMs + 3);
   assert.equal(completed.status, 'succeeded');
   const reconciled = await reconcilePendingArmOperations(store, async () => ({ status: 202 }), subscriptionId, state.startedAtMs + 3);
-  assert.equal(reconciled!.operations[0]!.status, 'succeeded');
+  assert.equal(reconciled!.operations[0]!.status, 'pending');
   const hostile = { ...pending, operationUrl: 'https://127.0.0.1/latest/meta-data' };
   await assert.rejects(reconcileArmOperation(hostile, async () => ({ status: 200 }), subscriptionId, state.startedAtMs + 3), /outside the configured subscription/);
 });
@@ -186,8 +195,12 @@ test('RunInventory fenced merge preserves heartbeat and ARM receipts and blocks 
   const merged = (await store.read())!.state;
   assert.equal(merged.heartbeatSequence, 1);
   assert.equal(merged.operations.length, 1);
-  assert.equal(merged.runInventory!.cleanup.stop_admission, 'complete');
-  await assert.rejects(publishRunInventory(store, { ...changed, cell_run_id: 'c0ffee00-0000-4000-8000-00000000000d' }, started.startedAtMs + 6), /unresolved previous/);
+  assert.equal(merged.runInventory!.cleanup.stop_admission.state, 'complete');
+  const nextCellId = 'c0ffee00-0000-4000-8000-00000000000d';
+  const nextNamespace = 'arrowcol-' + nextCellId.replace(/-/g, '');
+  const nextCell = { ...changed, cell_run_id: nextCellId, namespace: { ...changed.namespace, name: nextNamespace },
+    resources: changed.resources.map(resource => ({ ...resource, namespace: nextNamespace })) };
+  await assert.rejects(publishRunInventory(store, nextCell, started.startedAtMs + 6), /unresolved RunInventory/);
 });
 
 test('RunInventory rejects unknown identities and reports an unconfirmed Blob write', async () => {
@@ -196,11 +209,73 @@ test('RunInventory rejects unknown identities and reports an unconfirmed Blob wr
   const planned = inventoryFor(state);
   await assert.rejects(publishRunInventory(store, { ...planned, extra: true }, state.startedAtMs), /malformed/);
   class FailsBeforeWrite extends MemoryStore {
-    override async write(_state: CampaignState, _etag?: string): Promise<string> { throw new Error('connection reset'); }
+    failNext = false;
+    override async write(next: CampaignState, etag?: string): Promise<string> {
+      if (this.failNext) { this.failNext = false; throw new Error('connection reset'); }
+      return super.write(next, etag);
+    }
   }
   const failing = new FailsBeforeWrite();
   await startCampaign(failing, campaignId, ownerId, state.startedAtMs);
+  failing.failNext = true;
   await assert.rejects(publishRunInventory(failing, planned, state.startedAtMs), CampaignWriteOutcomeUnknownError);
+});
+
+test('successful inventory CAS receipt supports unknown FIC and QAP', async () => {
+  const store = await seed();
+  const state = (await store.read())!.state;
+  const inventory = { ...inventoryFor(state), fic: null, qap: null };
+  const written = await publishRunInventory(store, inventory, state.startedAtMs);
+  const receipt = runInventoryPublishReceipt(written);
+  assert.equal(receipt.status, 'persisted');
+  assert.equal(receipt.fic_state, null);
+  assert.equal(receipt.qap_state, null);
+  assert.equal(receipt.resource_count, inventory.resources.length);
+  await assert.rejects(assertRunInventoryReady(store, ownerId, state.fencingToken, state.startedAtMs), /blocked/);
+});
+
+test('RunInventory absent state requires immutable exact not-found receipts', async () => {
+  const store = await seed();
+  const state = (await store.read())!.state;
+  const planned = inventoryFor(state);
+  const first = planned.resources[0]!;
+  const absentResource = { ...first, state: 'absent' as const, absence: { api_version: first.api_version, kind: first.kind,
+    namespace: first.namespace, name: first.name, namespace_uid: planned.namespace.uid, observed_at_unix_ms: state.startedAtMs + 1 } };
+  const fic = planned.fic!;
+  const qap = planned.qap!;
+  const absent = { ...planned, resources: [absentResource, ...planned.resources.slice(1)],
+    fic: { ...fic, state: 'absent' as const, absence: { resource_id: fic.resource_id!, name: fic.name!, observed_at_unix_ms: state.startedAtMs + 2 } },
+    qap: { ...qap, state: 'absent' as const, absence: qap.bindings.map(binding => ({ database: qap.database,
+      external_table: binding.external_table, relative_path: binding.relative_path, observed_at_unix_ms: state.startedAtMs + 3 })) } };
+  await publishRunInventory(store, absent, state.startedAtMs + 4);
+  const malformedResource = { ...absent, resources: [{ ...absentResource, absence: { ...absentResource.absence, name: 'other' } }, ...absent.resources.slice(1)] };
+  await assert.rejects(publishRunInventory(await seed(), malformedResource, state.startedAtMs + 4), /malformed|FIC|QAP/);
+  const missingQapReceipt = { ...absent, qap: { ...absent.qap!, absence: [] } };
+  await assert.rejects(publishRunInventory(await seed(), missingQapReceipt, state.startedAtMs + 4), /not-found receipt/);
+  const duplicateQapReceipt = { ...absent, qap: { ...absent.qap!, absence: [...absent.qap!.absence, absent.qap!.absence[0]!] } };
+  await assert.rejects(publishRunInventory(await seed(), duplicateQapReceipt, state.startedAtMs + 4), /duplicate absence/);
+});
+
+test('watchdog cleanup CAS retains producer token and rejects stale producer writes', async () => {
+  const store = await seed();
+  const armed = await armForTest(store);
+  const expiredAt = armed.heartbeatAtMs + MISSED_HEARTBEAT_LIMIT * HEARTBEAT_INTERVAL_MS;
+  await reconcileOnce(store, expiredAt);
+  const fenced = (await store.read())!.state;
+  assert.equal(fenced.fencingToken, armed.fencingToken + 1);
+  assert.equal(fenced.runInventory!.fencing_token, armed.fencingToken);
+  await assert.rejects(publishRunInventory(store, fenced.runInventory, expiredAt + 1), /blocked after campaign fencing/);
+  await reconcileCleanupOnce(store, async () => 'pending');
+  const cleaning = (await store.read())!.state;
+  const inventory = cleaning.runInventory!;
+  const updated = { ...inventory, cleanup: { ...inventory.cleanup,
+    stop_admission: { state: 'pending' as const, deadline_unix_ms: expiredAt + 60_000, reason_code: null } } };
+  await publishCleanupRunInventory(store, updated, ownerId, cleaning.fencingToken);
+  const merged = (await store.read())!.state;
+  assert.equal(merged.runInventory!.fencing_token, armed.fencingToken);
+  assert.equal(merged.fencingToken, cleaning.fencingToken);
+  assert.equal(merged.runInventory!.cleanup.stop_admission.state, 'pending');
+  await assert.rejects(publishCleanupRunInventory(store, updated, ownerId, armed.fencingToken), /fenced|cleaning token/);
 });
 
 test('strict state schema rejects additional persisted fields', async () => {

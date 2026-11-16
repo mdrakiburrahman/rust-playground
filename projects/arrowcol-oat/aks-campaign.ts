@@ -8,11 +8,40 @@ const MAX_ARM_OPERATIONS = 128;
 export const CUSTODY_CLEANUP_STEPS = ["stop-admission", "bounded-drain", "preserve-evidence", "stop-maintenance", "record-terminal-state", "remove-run-namespace", "remove-run-qap", "remove-run-fic", "restore-safe-idle", "verify-safe-idle"] as const;
 export type CleanupStepName = typeof CUSTODY_CLEANUP_STEPS[number];
 export interface CleanupReceipt { step: CleanupStepName; idempotencyKey: string; status: "pending" | "running" | "complete"; }
+const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const storageName = /^[a-z0-9]{3,24}$/;
+const containerName = /^[a-z0-9](?:[a-z0-9-]{1,61}[a-z0-9])?$/;
+export type CampaignMode = 'observe' | 'armed';
+export type CampaignStatus = 'active' | 'fenced' | 'cleaning' | 'complete';
+export type ArmOperationStatus = 'pending' | 'succeeded' | 'failed' | 'indeterminate';
+export interface ArmOperationReceipt { id: string; resourceId: string; operationUrl: string; submittedAtMs: number; status: ArmOperationStatus; lastCheckedAtMs?: number; }
+export interface CampaignState {
+  schemaVersion: 1; campaignId: string; ownerId: string; fencingToken: number; mode: CampaignMode; status: CampaignStatus;
+  startedAtMs: number; heartbeatAtMs: number; heartbeatSequence: number; expiresAtMs: number; lastEvaluatedAtMs?: number;
+  lastMissedHeartbeatCount?: number; fenceReason?: 'heartbeat-expired' | 'max-lifetime'; fencedAtMs?: number;
+  cleanupStatus: 'not-started' | 'pending' | 'running' | 'verified'; cleanupSteps: CleanupReceipt[];
+  runInventory?: RunInventory; operations: ArmOperationReceipt[];
+}
+export interface StoredCampaign { state: CampaignState; etag: string; }
+export interface CampaignStore { read(): Promise<StoredCampaign | undefined>; write(state: CampaignState, expectedEtag?: string): Promise<string>; }
+export type TokenProvider = (resource: string) => Promise<string>;
+export type Fetcher = typeof fetch;
+function record(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+function nonnegative(value: unknown): value is number { return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0; }
+function nonempty(value: unknown): value is string { return typeof value === 'string' && value.length > 0 && value.length <= 2048 && !/[\u0000-\u001f]/.test(value); }
+function k8sName(value: unknown): value is string { return typeof value === 'string' && value.length <= 63 && /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(value); }
+function exactRecord(value: unknown, keys: string[]): value is Record<string, unknown> {
+  return record(value) && Object.keys(value).length === keys.length && Object.keys(value).every(key => keys.includes(key));
+}
 export type RunInventoryResourceState = 'planned' | 'observed' | 'removed' | 'absent' | 'uncertain';
 export type InventoryResourceRole = 'collector' | 'client' | 'maintenance' | 'router';
 export type InventoryStepState = 'not_started' | 'pending' | 'running' | 'complete' | 'failed' | 'uncertain';
 export interface InventoryStep { state: InventoryStepState; deadline_unix_ms: number | null; reason_code: string | null; }
 export interface InventoryAbsenceReceipt { api_version: string; kind: string; namespace: string; name: string; namespace_uid: string | null; observed_at_unix_ms: number; }
+export interface InventoryFicAbsenceReceipt { resource_id: string; name: string; observed_at_unix_ms: number; }
+export interface InventoryQapAbsenceReceipt { database: string; external_table: string; relative_path: string; observed_at_unix_ms: number; }
 export interface RunInventoryResource {
   api_version: string;
   kind: string;
@@ -32,8 +61,8 @@ export interface RunInventory {
   cell_run_id: string;
   namespace: { name: string; uid: string | null; owner_token: string };
   resources: RunInventoryResource[];
-  fic: { resource_id: string | null; name: string | null; state: RunInventoryResourceState } | null;
-  qap: { database: string; bindings: Array<{ external_table: string; relative_path: string }>; state: RunInventoryResourceState } | null;
+  fic: { resource_id: string | null; name: string | null; state: RunInventoryResourceState; absence: InventoryFicAbsenceReceipt | null } | null;
+  qap: { database: string; bindings: Array<{ external_table: string; relative_path: string }>; state: RunInventoryResourceState; absence: InventoryQapAbsenceReceipt[] } | null;
   cleanup: { stop_admission: InventoryStep; bounded_drain: InventoryStep; evidence_capture: InventoryStep;
     terminal_capture: InventoryStep; handoff: InventoryStep };
 }
@@ -58,48 +87,75 @@ function validateRunInventory(value: unknown, state: CampaignState): RunInventor
       !String(value.namespace.name).endsWith('-' + value.cell_run_id.replace(/-/g, '')) ||
       !(value.namespace.uid === null || canonicalUuid(value.namespace.uid)) || !canonicalUuid(value.namespace.owner_token) ||
       value.namespace.owner_token !== state.ownerId || !Array.isArray(value.resources) || value.resources.length > 256 ||
-      !(value.fic === null || exactRecord(value.fic, ['resource_id', 'name', 'state']) && ['planned', 'observed', 'removed', 'uncertain'].includes(String(value.fic.state))) ||
-      !(value.qap === null || exactRecord(value.qap, ['database', 'bindings', 'state']) && nonempty(value.qap.database) && Array.isArray(value.qap.bindings) && ['planned', 'observed', 'removed', 'uncertain'].includes(String(value.qap.state))) ||
+      !(value.fic === null || exactRecord(value.fic, ['resource_id', 'name', 'state', 'absence']) && ['planned', 'observed', 'removed', 'absent', 'uncertain'].includes(String(value.fic.state))) ||
+      !(value.qap === null || exactRecord(value.qap, ['database', 'bindings', 'state', 'absence']) && nonempty(value.qap.database) && Array.isArray(value.qap.bindings) && ['planned', 'observed', 'removed', 'absent', 'uncertain'].includes(String(value.qap.state)) && Array.isArray(value.qap.absence)) ||
       !exactRecord(value.cleanup, ['stop_admission', 'bounded_drain', 'evidence_capture', 'terminal_capture', 'handoff']) ||
       Object.values(value.cleanup).some(item => !validStep(item))) {
     throw new Error('RunInventory is malformed or fenced to another owner.');
   }
-  if (value.fic !== null) {
-    const fic = value.fic;
+  const inventory = value as unknown as RunInventory;
+  if (inventory.fic !== null) {
+    const fic = inventory.fic;
     if (!(fic.resource_id === null || nonempty(fic.resource_id)) || !(fic.name === null || k8sName(fic.name)) ||
-        (fic.resource_id !== null || fic.state === 'observed' || fic.state === 'removed') && (!fic.resource_id || !fic.name ||
+        (fic.resource_id !== null || fic.state === 'observed' || fic.state === 'removed' || fic.state === 'absent') && (!fic.resource_id || !fic.name ||
           !fic.resource_id.toLowerCase().startsWith('/subscriptions/') ||
           !fic.resource_id.toLowerCase().endsWith('/federatedidentitycredentials/' + fic.name.toLowerCase()) || /[?#]/.test(fic.resource_id)) ||
         ['observed', 'removed'].includes(fic.state) && (!fic.resource_id || !fic.name)) {
       throw new Error('RunInventory FIC identity is malformed.');
     }
+    if (fic.state === 'absent') {
+      if (!exactRecord(fic.absence, ['resource_id', 'name', 'observed_at_unix_ms']) || fic.absence.resource_id !== fic.resource_id ||
+          fic.absence.name !== fic.name || !nonnegative(fic.absence.observed_at_unix_ms) || fic.absence.observed_at_unix_ms === 0) {
+        throw new Error('Absent RunInventory FIC requires an exact not-found receipt.');
+      }
+    } else if (fic.absence !== null) throw new Error('RunInventory FIC absence receipt requires absent state.');
   }
-  if (value.qap !== null) {
+  if (inventory.qap !== null) {
+    const qap = inventory.qap;
     const safeIdentifier = (item: string) => /^[a-zA-Z0-9_-]+$/.test(item);
-    if (!safeIdentifier(value.qap.database)) throw new Error('RunInventory QAP database is malformed.');
-    for (const binding of value.qap.bindings) {
+    if (!safeIdentifier(qap.database)) throw new Error('RunInventory QAP database is malformed.');
+    const bindingKeys = new Set<string>();
+    for (const binding of qap.bindings) {
       if (!exactRecord(binding, ['external_table', 'relative_path']) || !nonempty(binding.external_table) ||
           !safeIdentifier(binding.external_table) || !nonempty(binding.relative_path) ||
           /[?#@\\:]/.test(binding.relative_path) || binding.relative_path.startsWith('/') ||
           binding.relative_path.split('/').some(part => part === '' || part === '.' || part === '..')) {
         throw new Error('RunInventory QAP binding is malformed.');
       }
+      const key = binding.external_table + '|' + binding.relative_path;
+      if (bindingKeys.has(key)) throw new Error('RunInventory QAP contains duplicate bindings.');
+      bindingKeys.add(key);
     }
-    if (['observed', 'removed'].includes(value.qap.state) && !value.qap.bindings.length) throw new Error('Observed RunInventory QAP requires an exact binding.');
+    const absentKeys = new Set<string>();
+    for (const receipt of qap.absence) {
+      if (!exactRecord(receipt, ['database', 'external_table', 'relative_path', 'observed_at_unix_ms']) ||
+          receipt.database !== qap.database || !bindingKeys.has(receipt.external_table + '|' + receipt.relative_path) ||
+          !nonnegative(receipt.observed_at_unix_ms) || receipt.observed_at_unix_ms === 0) {
+        throw new Error('RunInventory QAP absence receipt does not match an exact binding.');
+      }
+      const key = receipt.external_table + '|' + receipt.relative_path;
+      if (absentKeys.has(key)) throw new Error('RunInventory QAP contains duplicate absence receipts.');
+      absentKeys.add(key);
+    }
+    if (qap.state === 'absent' && (qap.bindings.length === 0 || absentKeys.size !== bindingKeys.size) ||
+        qap.state === 'planned' && qap.absence.length > 0) {
+      throw new Error('Absent RunInventory QAP requires exactly one not-found receipt per planned binding.');
+    }
+    if (['observed', 'removed'].includes(qap.state) && !qap.bindings.length) throw new Error('Observed RunInventory QAP requires an exact binding.');
   }
   const resourceKeys = new Set<string>();
-  for (const resource of value.resources) {
+  for (const resource of inventory.resources) {
     if (!exactRecord(resource, ['api_version', 'kind', 'namespace', 'name', 'uid', 'absence', 'role', 'state']) ||
-        !nonempty(resource.api_version) || !nonempty(resource.kind) || resource.namespace !== value.namespace.name ||
+        !nonempty(resource.api_version) || !nonempty(resource.kind) || resource.namespace !== inventory.namespace.name ||
         typeof resource.name !== 'string' || resource.name.length === 0 || resource.name.length > 253 ||
         !/^[a-z0-9.-]+$/.test(resource.name) || !['apps/v1:Deployment', 'batch/v1:Job', 'v1:Pod'].includes(resource.api_version + ':' + resource.kind) ||
         !['collector', 'client', 'maintenance', 'router'].includes(String(resource.role)) || !stateValue(resource.state) ||
         !(resource.uid === null || canonicalUuid(resource.uid)) ||
-        ['observed', 'removed'].includes(resource.state) && (resource.uid === null || value.namespace.uid === null) ||
+        ['observed', 'removed'].includes(resource.state) && (resource.uid === null || inventory.namespace.uid === null) ||
         resource.state === 'absent' && (resource.uid !== null || !exactRecord(resource.absence, ['api_version', 'kind', 'namespace', 'name', 'namespace_uid', 'observed_at_unix_ms']) ||
           resource.absence.api_version !== resource.api_version || resource.absence.kind !== resource.kind ||
           resource.absence.namespace !== resource.namespace || resource.absence.name !== resource.name ||
-          resource.absence.namespace_uid !== value.namespace.uid || !nonnegative(resource.absence.observed_at_unix_ms) || resource.absence.observed_at_unix_ms === 0) ||
+          resource.absence.namespace_uid !== inventory.namespace.uid || !nonnegative(resource.absence.observed_at_unix_ms) || resource.absence.observed_at_unix_ms === 0) ||
         resource.state !== 'absent' && resource.absence !== null) {
       throw new Error('RunInventory resource identity is malformed.');
     }
@@ -108,16 +164,16 @@ function validateRunInventory(value: unknown, state: CampaignState): RunInventor
     resourceKeys.add(key);
   }
   for (const name of ['stop_admission', 'bounded_drain'] as const) {
-    const step = value.cleanup[name];
+    const step = inventory.cleanup[name];
     if (step.state === 'running' && step.deadline_unix_ms === null) throw new Error('Running RunInventory admission and drain steps require a deadline.');
   }
-  if (value.cleanup.handoff.state === 'complete' &&
-      (Object.entries(value.cleanup).some(([key, item]) => key !== 'handoff' && item.state !== 'complete') ||
-       value.resources.some(resource => resource.state !== 'removed' && resource.state !== 'absent') || value.fic !== null && value.fic.state !== 'removed' ||
-       value.qap !== null && value.qap.state !== 'removed')) {
+  if (inventory.cleanup.handoff.state === 'complete' &&
+      (Object.entries(inventory.cleanup).some(([key, item]) => key !== 'handoff' && item.state !== 'complete') ||
+       inventory.resources.some(resource => resource.state !== 'removed' && resource.state !== 'absent') || inventory.fic !== null && inventory.fic.state !== 'removed' && inventory.fic.state !== 'absent' ||
+       inventory.qap !== null && inventory.qap.state !== 'removed' && inventory.qap.state !== 'absent')) {
     throw new Error('RunInventory handoff cannot complete while owned resources or cleanup actions remain unresolved.');
   }
-  return value as unknown as RunInventory;
+  return inventory;
 }
 function mergeResourceState(before: RunInventoryResourceState, after: RunInventoryResourceState): RunInventoryResourceState {
   if (before === 'removed' && after !== 'removed' || before === 'absent' && after !== 'absent') throw new Error('Terminal resource state cannot be reopened.');
@@ -155,9 +211,11 @@ function mergeRunInventory(before: RunInventory | undefined, after: RunInventory
   const mergeFic = () => {
     if (!before.fic) return after.fic;
     if (!after.fic || before.fic.name && after.fic.name !== before.fic.name ||
-        before.fic.resource_id && after.fic.resource_id !== before.fic.resource_id) throw new Error('RunInventory FIC identity changed.');
+        before.fic.resource_id && after.fic.resource_id !== before.fic.resource_id ||
+        before.fic.absence && JSON.stringify(before.fic.absence) !== JSON.stringify(after.fic.absence)) throw new Error('RunInventory FIC identity changed.');
     return { ...before.fic, ...after.fic, name: before.fic.name ?? after.fic.name,
-      resource_id: before.fic.resource_id ?? after.fic.resource_id, state: mergeResourceState(before.fic.state, after.fic.state) };
+      resource_id: before.fic.resource_id ?? after.fic.resource_id, absence: before.fic.absence ?? after.fic.absence,
+      state: mergeResourceState(before.fic.state, after.fic.state) };
   };
   const mergeQap = () => {
     if (!before.qap) return after.qap;
@@ -165,8 +223,14 @@ function mergeRunInventory(before: RunInventory | undefined, after: RunInventory
       !after.qap!.bindings.some(next => next.external_table === old.external_table && next.relative_path === old.relative_path))) {
       throw new Error('RunInventory QAP identity changed.');
     }
+    const absence = new Map(after.qap.absence.map(receipt => [receipt.external_table + '|' + receipt.relative_path, receipt]));
+    for (const receipt of before.qap.absence) {
+      const next = absence.get(receipt.external_table + '|' + receipt.relative_path);
+      if (!next || JSON.stringify(next) !== JSON.stringify(receipt)) throw new Error('RunInventory QAP absence receipt changed.');
+    }
+    for (const receipt of after.qap.absence) absence.set(receipt.external_table + '|' + receipt.relative_path, receipt);
     return { ...after.qap, bindings: [...new Map([...before.qap.bindings, ...after.qap.bindings].map(binding =>
-      [binding.external_table + '|' + binding.relative_path, binding])).values()],
+      [binding.external_table + '|' + binding.relative_path, binding])).values()], absence: [...absence.values()],
       state: mergeResourceState(before.qap.state, after.qap.state) };
   };
   const cleanup = Object.fromEntries(Object.keys(before.cleanup).map(key => [key,
@@ -265,6 +329,21 @@ export function newCampaignState(campaignId: string, ownerId: string, now = Date
     cleanupStatus: 'not-started', cleanupSteps: [], operations: [] };
 }
 
+export interface CampaignStartReceipt {
+  status: 'started'; campaign_id: string; owner_id: string; fencing_token: number; expires_at_ms: number;
+  environment: { CAMPAIGN_ID: string; CAMPAIGN_OWNER_ID: string; CAMPAIGN_FENCING_TOKEN: string };
+}
+export function campaignStartReceipt(state: CampaignState): CampaignStartReceipt {
+  return { status: 'started', campaign_id: state.campaignId, owner_id: state.ownerId, fencing_token: state.fencingToken,
+    expires_at_ms: state.expiresAtMs, environment: { CAMPAIGN_ID: state.campaignId, CAMPAIGN_OWNER_ID: state.ownerId,
+      CAMPAIGN_FENCING_TOKEN: String(state.fencingToken) } };
+}
+export function assertCampaignEnvironment(env: NodeJS.ProcessEnv, state: CampaignState): void {
+  if (env.CAMPAIGN_ID !== state.campaignId || env.CAMPAIGN_OWNER_ID !== state.ownerId ||
+      env.CAMPAIGN_FENCING_TOKEN !== String(state.fencingToken)) {
+    throw new CampaignFencedError('Campaign environment identity is missing or does not match the durable fence.');
+  }
+}
 export class CampaignConflictError extends Error {
   constructor() { super('Campaign state changed concurrently; retry using a fresh read.'); this.name = 'CampaignConflictError'; }
 }
@@ -362,12 +441,7 @@ export class CampaignFencedError extends Error {
 export class CampaignWriteOutcomeUnknownError extends Error {
   constructor() { super('RunInventory write outcome could not be confirmed by a strong readback.'); this.name = 'CampaignWriteOutcomeUnknownError'; }
 }
-function runInventoryReady(inventory: RunInventory | undefined): inventory is RunInventory {
-  return Boolean(inventory && inventory.namespace.uid && inventory.resources.length > 0 &&
-    inventory.resources.every(resource => resource.state === 'observed' && resource.uid) &&
-    inventory.fic?.state === 'observed' && inventory.qap?.state === 'observed' && inventory.qap.bindings.length > 0 &&
-    inventory.cleanup.handoff.state !== 'complete');
-}
+
 async function writeInventoryWithReadback(store: CampaignStore, current: StoredCampaign, nextState: CampaignState,
   merged: RunInventory, expectedStatus: CampaignStatus, expectedFencingToken: number): Promise<StoredCampaign | undefined> {
   try { return { state: nextState, etag: await store.write(nextState, current.etag) }; }
@@ -384,7 +458,7 @@ async function writeInventoryWithReadback(store: CampaignStore, current: StoredC
 function runInventoryReady(inventory: RunInventory | undefined): inventory is RunInventory {
   return Boolean(inventory && inventory.namespace.uid && inventory.resources.length > 0 &&
     inventory.resources.every(resource => resource.state === 'observed' && resource.uid) &&
-    inventory.fic?.state === 'observed' && inventory.qap?.state === 'observed' && inventory.qap.bindings.length > 0 &&
+    inventory.fic !== null && inventory.fic.state === 'observed' && inventory.qap !== null && inventory.qap.state === 'observed' && inventory.qap.bindings.length > 0 &&
     inventory.cleanup.handoff.state !== 'complete');
 }
 export async function publishRunInventory(store: CampaignStore, value: unknown, now = Date.now()): Promise<StoredCampaign> {
@@ -417,6 +491,20 @@ export async function publishCleanupRunInventory(store: CampaignStore, value: un
     if (written) return written;
   }
   throw new CampaignConflictError();
+}
+export interface RunInventoryPublishReceipt {
+  status: 'persisted'; campaign_id: string; owner_id: string; fencing_token: number; orchestration_run_id: string;
+  cell_run_id: string; namespace_uid: string | null; resource_count: number;
+  fic_state: RunInventoryResourceState | null; qap_state: RunInventoryResourceState | null; etag: string;
+}
+export function runInventoryPublishReceipt(stored: StoredCampaign): RunInventoryPublishReceipt {
+  const inventory = stored.state.runInventory;
+  if (!inventory) throw new Error('Persisted campaign has no RunInventory.');
+  return { status: 'persisted', campaign_id: inventory.campaign_id, owner_id: inventory.owner_id,
+    fencing_token: inventory.fencing_token, orchestration_run_id: inventory.orchestration_run_id,
+    cell_run_id: inventory.cell_run_id, namespace_uid: inventory.namespace.uid,
+    resource_count: inventory.resources.length, fic_state: inventory.fic?.state ?? null,
+    qap_state: inventory.qap?.state ?? null, etag: stored.etag };
 }
 export async function assertRunInventoryReady(store: CampaignStore, ownerId: string, fencingToken: number,
   now = Date.now()): Promise<CampaignState> {
@@ -482,35 +570,45 @@ async function main(args: string[]): Promise<void> {
   const subscriptionId = process.env.ARM_SUBSCRIPTION_ID ?? '';
   const store = createBlobCampaignStore({ account: process.env.CAMPAIGN_STORAGE_ACCOUNT ?? '',
     container: process.env.CAMPAIGN_STATE_CONTAINER ?? '', subscriptionId });
-  if (action === 'start' && args.length === 2) {
-    const result = await startCampaign(store, campaignId!);
-    console.log(JSON.stringify({ campaignId: result.state.campaignId, ownerId: result.state.ownerId,
-      fencingToken: result.state.fencingToken, expiresAtMs: result.state.expiresAtMs, mode: result.state.mode }));
+  if (action === 'start' && (args.length === 2 || args.length === 3)) {
+    const result = await startCampaign(store, campaignId!, args[2] ?? campaignId!);
+    console.log(JSON.stringify({ ok: true, receipt: campaignStartReceipt(result.state) }));
   } else if (action === 'heartbeat' && args.length === 3 && /^\d+$/.test(fencingTokenText!)) {
     const state = await store.read();
     if (!state) throw new Error('No active campaign state exists.');
-    const result = await heartbeatCampaign(store, campaignId!, Number(fencingTokenText), Date.now());
+    if (campaignId !== state.state.ownerId) throw new CampaignFencedError();
+    assertCampaignEnvironment(process.env, state.state);
+    const result = await heartbeatCampaign(store, state.state.ownerId, Number(fencingTokenText), Date.now());
     console.log(JSON.stringify({ campaignId: result.state.campaignId, fencingToken: result.state.fencingToken,
       heartbeatSequence: result.state.heartbeatSequence, heartbeatAtMs: result.state.heartbeatAtMs }));
   } else if (action === 'arm' && args.length === 3 && /^\d+$/.test(fencingTokenText!)) {
-    const result = await armCampaign(store, campaignId!, Number(fencingTokenText));
+    const current = await store.read();
+    if (!current) throw new Error('No active campaign state exists.');
+    if (campaignId !== current.state.ownerId) throw new CampaignFencedError();
+    assertCampaignEnvironment(process.env, current.state);
+    const result = await armCampaign(store, current.state.ownerId, Number(fencingTokenText));
     console.log(JSON.stringify({ campaignId: result.state.campaignId, mode: result.state.mode }));
   } else if (action === 'publish-inventory' && args.length === 1) {
-    const result = await publishRunInventory(store, await readRunInventoryStdin());
-    const inventory = result.state.runInventory!;
-    console.log(JSON.stringify({ ok: true, receipt: { status: 'persisted', campaign_id: inventory.campaign_id,
-      owner_id: inventory.owner_id, fencing_token: inventory.fencing_token, orchestration_run_id: inventory.orchestration_run_id,
-      cell_run_id: inventory.cell_run_id, namespace_uid: inventory.namespace.uid,
-      resource_count: inventory.resources.length, fic_state: inventory.fic.state, qap_state: inventory.qap.state, etag: result.etag } }));
+    const input = await readRunInventoryStdin();
+    if (!record(input)) throw new Error('RunInventory stdin must be an object.');
+    const current = await store.read();
+    if (!current) throw new Error('No active campaign state exists.');
+    assertCampaignEnvironment(process.env, current.state);
+    const result = await publishRunInventory(store, input);
+    console.log(JSON.stringify({ ok: true, receipt: runInventoryPublishReceipt(result) }));
   } else if (action === 'assert-ready' && args.length === 3 && /^\d+$/.test(fencingTokenText!)) {
-    const state = await assertRunInventoryReady(store, campaignId!, Number(fencingTokenText));
+    const current = await store.read();
+    if (!current) throw new Error('No active campaign state exists.');
+    if (campaignId !== current.state.ownerId) throw new CampaignFencedError();
+    assertCampaignEnvironment(process.env, current.state);
+    const state = await assertRunInventoryReady(store, current.state.ownerId, Number(fencingTokenText));
     console.log(JSON.stringify({ ok: true, receipt: { status: 'ready', campaign_id: state.campaignId,
       owner_id: state.ownerId, fencing_token: state.fencingToken, orchestration_run_id: state.runInventory!.orchestration_run_id,
       cell_run_id: state.runInventory!.cell_run_id, namespace_uid: state.runInventory!.namespace.uid } }));
   } else if (action === 'status' && args.length === 1) {
     console.log(JSON.stringify((await store.read())?.state ?? { status: 'idle' }));
   } else {
-    throw new Error('Usage: aks-campaign.ts start <campaign-uuid> | heartbeat <owner-uuid> <fencing-token> | arm <owner-uuid> <fencing-token> | publish-inventory (JSON stdin) | assert-ready <owner-uuid> <fencing-token> | status');
+    throw new Error('Usage: aks-campaign.ts start <campaign-uuid> [owner-uuid] | heartbeat <owner-uuid> <fencing-token> | arm <owner-uuid> <fencing-token> | publish-inventory (JSON stdin) | assert-ready <owner-uuid> <fencing-token> | status');
   }
 }
 if (process.argv[1] && ['aks-campaign.ts', 'aks-campaign.js'].includes(path.basename(process.argv[1])) && import.meta.url === pathToFileURL(process.argv[1]).href) {

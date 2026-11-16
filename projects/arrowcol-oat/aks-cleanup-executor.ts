@@ -128,10 +128,11 @@ export function createExternalCleanupExecutor(store: CampaignStore, actions: Ext
         return 'complete';
       }
       case 'remove-run-qap': {
-        if (!inventory.qap) return 'complete';
+        if (!inventory.qap || inventory.qap.state === 'absent' || inventory.qap.state === 'removed') return 'complete';
         if (inventory.qap.state === 'uncertain' || inventory.qap.state === 'planned') return 'pending';
         if (inventory.qap.state === 'observed') {
-          for (const binding of inventory.qap.bindings) {
+          const absentBindings = new Set(inventory.qap.absence.map(item => item.external_table + '|' + item.relative_path));
+          for (const binding of inventory.qap.bindings.filter(item => !absentBindings.has(item.external_table + '|' + item.relative_path))) {
             await authority.assertCurrent();
             const result = await actions.deleteQapBindingIfOwned(inventory.qap.database, binding, inventory.campaign_id,
               keyed(idempotencyKey, binding.external_table + ':' + binding.relative_path), authority);
@@ -146,7 +147,7 @@ export function createExternalCleanupExecutor(store: CampaignStore, actions: Ext
         return 'complete';
       }
       case 'remove-run-fic': {
-        if (!inventory.fic) return 'complete';
+        if (!inventory.fic || inventory.fic.state === 'absent' || inventory.fic.state === 'removed') return 'complete';
         if (inventory.fic.state === 'uncertain' || inventory.fic.state === 'planned') return 'pending';
         if (inventory.fic.state === 'observed') {
           await authority.assertCurrent();
