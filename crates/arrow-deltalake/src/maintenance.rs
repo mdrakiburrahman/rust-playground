@@ -1661,7 +1661,14 @@ mod optimize_upload_tests {
         fs::write(local.path(), &bytes)?;
         let path = object_store::path::Path::from("optimized.parquet");
 
-        stream_staged_output(Arc::clone(&store), path.clone(), local.path().to_path_buf(), bytes.len() as u64, 32 * 1024).await?;
+        stream_staged_output(
+            Arc::clone(&store),
+            path.clone(),
+            local.path().to_path_buf(),
+            bytes.len() as u64,
+            32 * 1024,
+        )
+        .await?;
 
         let uploaded = store.get(&path).await?.bytes().await?;
         assert_eq!(uploaded.as_ref(), bytes.as_slice());
@@ -2026,12 +2033,7 @@ impl DeltaTable {
         config: &OptimizeConfig,
         control: &MaintenanceControl,
     ) -> Result<MaintenanceReport> {
-        self.apply_prepared_optimize_with_upload_buffer(
-            prepared,
-            config,
-            control,
-            DEFAULT_OPTIMIZE_UPLOAD_BUFFER_BYTES,
-        )
+        self.apply_prepared_optimize_with_upload_buffer(prepared, config, control, DEFAULT_OPTIMIZE_UPLOAD_BUFFER_BYTES)
     }
 
     /// Apply OPTIMIZE with a bounded object-store streaming upload buffer.
@@ -2046,9 +2048,18 @@ impl DeltaTable {
         upload_buffer_bytes: usize,
     ) -> Result<MaintenanceReport> {
         if !(MIN_OPTIMIZE_UPLOAD_BUFFER_BYTES..=MAX_OPTIMIZE_UPLOAD_BUFFER_BYTES).contains(&upload_buffer_bytes) {
-            return Err(fail(MaintenanceErrorKind::InvalidPlan, "OPTIMIZE upload buffer must be within 4..=64 MiB"));
+            return Err(fail(
+                MaintenanceErrorKind::InvalidPlan,
+                "OPTIMIZE upload buffer must be within 4..=64 MiB",
+            ));
         }
-        self.apply_optimize_reusing(&prepared.plan, config, control, Some(&prepared.state), upload_buffer_bytes)
+        self.apply_optimize_reusing(
+            &prepared.plan,
+            config,
+            control,
+            Some(&prepared.state),
+            upload_buffer_bytes,
+        )
     }
 
     fn apply_optimize_reusing(
@@ -2652,7 +2663,8 @@ impl BinWriter<'_> {
         };
         self.outputs.push(staged);
         let index = self.outputs.len() - 1;
-        self.table.upload_output(&mut self.outputs[index], self.upload_buffer_bytes)?;
+        self.table
+            .upload_output(&mut self.outputs[index], self.upload_buffer_bytes)?;
         Ok(())
     }
 
@@ -2682,7 +2694,7 @@ impl BinWriter<'_> {
 }
 
 impl DeltaTable {
-    /// Upload a staged cloud output with create-only semantics; local outputs are already in place.
+    /// Upload a staged cloud output to its UUID-named path; local outputs are already in place.
     fn upload_output(&self, output: &mut StagedOutput, buffer_bytes: usize) -> Result<()> {
         if self.url.scheme() == "file" {
             return Ok(());
@@ -2714,10 +2726,13 @@ async fn stream_staged_output(
 ) -> Result<()> {
     let mut reader = tokio::fs::File::from_std(File::open(local)?);
     if reader.metadata().await?.len() != expected_bytes {
-        return Err(fail(MaintenanceErrorKind::Uncertain, "staged output changed before upload"));
+        return Err(fail(
+            MaintenanceErrorKind::Uncertain,
+            "staged output changed before upload",
+        ));
     }
-    let mut writer = object_store::buffered::BufWriter::with_capacity(store, path, buffer_bytes)
-        .with_max_concurrency(1);
+    let mut writer =
+        object_store::buffered::BufWriter::with_capacity(store, path, buffer_bytes).with_max_concurrency(1);
     let copied = match tokio::io::copy(&mut reader, &mut writer).await {
         Ok(copied) => copied,
         Err(error) => {

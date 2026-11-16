@@ -661,3 +661,17 @@ fn empty_vacuum_plan_cannot_report_noop_after_a_concurrent_append() -> Result<()
     assert_eq!(before, inventory(root.path())?);
     Ok(())
 }
+
+#[test]
+fn optimize_upload_buffer_requires_supported_bounds() -> Result<()> {
+    let (_root, mut settings, _) = fixture()?;
+    for value in [4 * 1024 * 1024, 8 * 1024 * 1024, 64 * 1024 * 1024] {
+        settings.operation_limits.optimize_upload_buffer_bytes = value;
+        settings.validate()?;
+    }
+    for value in [0, 4 * 1024 * 1024 - 1, 64 * 1024 * 1024 + 1] {
+        settings.operation_limits.optimize_upload_buffer_bytes = value;
+        assert!(settings.validate().is_err());
+    }
+    Ok(())
+}

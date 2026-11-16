@@ -1,7 +1,9 @@
 //! `delta-maintenance` command line: dry-run plans by default, `--apply` to mutate.
 
 use anyhow::{Context, Result, anyhow};
-use arrow_deltalake::maintenance::{Granularity, InputReadStrategy, OptimizeConfig};
+use arrow_deltalake::maintenance::{
+    DEFAULT_OPTIMIZE_UPLOAD_BUFFER_BYTES, Granularity, InputReadStrategy, OptimizeConfig,
+};
 use clap::Parser;
 use delta_kernel::metrics::WithMetricsReporterLayer;
 use delta_maintenance::{Metrics, Operation, OperationLimits, Settings, run, serve_metrics, startup_configuration};
@@ -144,7 +146,7 @@ struct Cli {
     #[arg(long, env = "ARROWCOL_MAINT_MAX_OUTPUT_FILE_BYTES", default_value_t = 1023 * 1024 * 1024)]
     max_output_file_bytes: u64,
     /// Object-store upload buffer for OPTIMIZE outputs (4..=64 MiB).
-    #[arg(long, env = "ARROWCOL_MAINT_OPTIMIZE_UPLOAD_BUFFER_BYTES", default_value_t = 8 * 1024 * 1024)]
+    #[arg(long, env = "ARROWCOL_MAINT_OPTIMIZE_UPLOAD_BUFFER_BYTES", default_value_t = DEFAULT_OPTIMIZE_UPLOAD_BUFFER_BYTES)]
     optimize_upload_buffer_bytes: usize,
     #[arg(long, env = "ARROWCOL_MAINT_MAX_ACTIVE_FILES", default_value_t = 1_000_000)]
     max_active_files: usize,

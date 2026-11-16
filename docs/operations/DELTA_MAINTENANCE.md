@@ -7,7 +7,7 @@
 | Ordering | PURGE -> OPTIMIZE -> VACUUM -> checkpoint -> PRUNE-LOG, serially for each table; bounded parallelism across tables. |
 | Coordination | Process-wide striped mutexes serialize passes for the same table URL, including overlapping service invocations. Delta commits and guarded storage still coordinate independent processes. |
 | Schedule | `arrowcol.maintenance.interval` applies independently to each table. An error is not an idle success and does not trigger idle exponential backoff. |
-| OPTIMIZE upload | `--optimize-upload-buffer-bytes` / `ARROWCOL_MAINT_OPTIMIZE_UPLOAD_BUFFER_BYTES`, unsigned bytes, default 8 MiB, bounds 4..=64 MiB. The consumer streams finalized compacted files through `object_store::buffered::BufWriter` with one in-flight request; upload shutdown completes before Delta Add actions publish. |
+| OPTIMIZE upload | `--optimize-upload-buffer-bytes` / `ARROWCOL_MAINT_OPTIMIZE_UPLOAD_BUFFER_BYTES`, unsigned bytes, default 8 MiB, bounds 4..=64 MiB. The consumer streams finalized compacted files through `object_store::buffered::BufWriter` with one in-flight request to a UUID-named path; upload shutdown completes before Delta Add actions publish. |
 | Observability | JSON results identify `negative_probe`; Prometheus `delta_maintenance_negative_probes_total` and outcome-labelled runs distinguish cheap noops from plans, work and errors. Equivalent counters are exported through OpenTelemetry. |
 
 ## Negative admission, before replay
