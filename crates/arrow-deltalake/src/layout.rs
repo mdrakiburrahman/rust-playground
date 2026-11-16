@@ -327,7 +327,7 @@ mod tests {
         writer.write(&output)?;
         writer.close()?;
         let reader = ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(path)?)?;
-        assert!(reader.metadata().file_metadata().sorting_columns().is_none());
+        assert!(reader.metadata().row_group(0).sorting_columns().is_none());
         let batches = reader.build()?.collect::<std::result::Result<Vec<_>, _>>()?;
         let readback = concat_batches(&input.schema(), &batches)?;
         assert_eq!(readback.column(0).as_ref(), input.column(0).as_ref());
