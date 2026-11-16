@@ -831,9 +831,13 @@ impl PublicationBacklogScraper {
         {
             bail!("collector admin metrics exceeded the evidence size limit");
         }
-        let body = response.bytes().await.context("read collector admin metrics")?;
-        if body.len() as u64 > MAX_METRICS_BYTES {
-            bail!("collector admin metrics exceeded the evidence size limit");
+        let mut response = response;
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.context("read collector admin metrics")? {
+            if body.len().saturating_add(chunk.len()) > MAX_METRICS_BYTES as usize {
+                bail!("collector admin metrics exceeded the evidence size limit");
+            }
+            body.extend_from_slice(&chunk);
         }
         let text = std::str::from_utf8(&body).context("collector admin metrics are not UTF-8")?;
         parse_publication_backlog_metrics(text)

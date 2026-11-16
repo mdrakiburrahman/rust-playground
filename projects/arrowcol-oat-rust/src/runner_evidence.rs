@@ -52,11 +52,14 @@ fn parse_publication_backlog_metrics(text: &str) -> Result<PublicationBacklogMet
     for line in text.lines().map(str::trim).filter(|line| !line.is_empty() && !line.starts_with('#')) {
         let mut fields = line.split_whitespace();
         let sample = fields.next().context("publication backlog metric sample is empty")?;
+        let metric = sample.split('{').next().unwrap_or(sample);
+        if !metric.starts_with("arrowcol_publication_backlog_") {
+            continue;
+        }
         let value = fields.next().context("publication backlog metric has no value")?;
         if fields.next().is_some() {
             bail!("publication backlog metric has an unsupported timestamp or extra field");
         }
-        let metric = sample.split('{').next().unwrap_or(sample);
         match metric {
             "arrowcol_publication_backlog_available"
             | "arrowcol_publication_backlog_publications"
@@ -376,7 +379,7 @@ impl CellEvidence {
         let backlog = json!({
             "schema_version": 1,
             "source": "arrowcol_publication_backlog_*",
-            "scope": "unique_table_owner_admissions_after_queue_admission_not_confirmed_durable_commit",
+            "scope": "unique_table_owner_admissions_not_confirmed_durable_commit",
             "timestamp_basis": "UTC request start/end around direct /metrics GET; each is a scrape-time snapshot",
             "sampling_interval_ms": PUBLICATION_BACKLOG_SAMPLING_INTERVAL.as_millis(),
             "request_timeout_ms": PUBLICATION_BACKLOG_REQUEST_TIMEOUT.as_millis(),
@@ -625,7 +628,11 @@ mod measurement_evidence_tests {
 
     #[test]
     fn publication_backlog_parser_preserves_unavailable_and_rejects_bad_gauges() -> Result<()> {
-        let available = parse_publication_backlog_metrics(&publication_backlog_exposition(1, "2", "7", "256", "1.25", "available"))?;
+        let exposition = format!(
+            "unrelated_metric 123 1700000000\n{}",
+            publication_backlog_exposition(1, "2", "7", "256", "1.25", "available")
+        );
+        let available = parse_publication_backlog_metrics(&exposition)?;
         assert_eq!(
             available,
             PublicationBacklogMetrics {
@@ -700,7 +707,7 @@ mod measurement_evidence_tests {
         assert_eq!(evidence["measurement_window"]["end_unix_ms"], end);
         assert_eq!(evidence["sampling_interval_ms"], 1_000);
         assert_eq!(evidence["request_timeout_ms"], 3_000);
-        assert_eq!(evidence["scope"], "unique_table_owner_admissions_after_queue_admission_not_confirmed_durable_commit");
+        assert_eq!(evidence["scope"], "unique_table_owner_admissions_not_confirmed_durable_commit");
         assert_eq!(evidence["samples"].as_array().context("backlog samples")?.len(), 150);
         let mut bucket_counts = [0_u64; 5];
         for sample in evidence["samples"].as_array().context("backlog samples")? {
@@ -719,6 +726,9 @@ mod measurement_evidence_tests {
         assert!(!valid_backlog_request_interval(start + 2, start + 1, start, end));
         assert_eq!(evidence["sampling_failures"], 0);
         assert_eq!(evidence["samples_dropped"], 0);
+        if let Some(path) = std::env::var_os("OAT_BACKLOG_FIXTURE_OUT") {
+            std::fs::write(path, serde_json::to_vec_pretty(&evidence)?)?;
+        }
         Ok(())
     }
 
