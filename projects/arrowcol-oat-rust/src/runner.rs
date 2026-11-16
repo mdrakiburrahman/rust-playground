@@ -86,11 +86,32 @@ pub struct RunInventory {
     pub fencing_token: u64,
     pub orchestration_run_id: String,
     pub cell_run_id: String,
+    pub load_admission: InventoryLoadAdmission,
     pub namespace: InventoryNamespace,
     pub resources: Vec<InventoryResource>,
     pub fic: Option<InventoryFic>,
     pub qap: Option<InventoryQap>,
+    #[serde(default)]
+    pub evidence_destination: Option<InventoryEvidenceDestination>,
     pub cleanup: InventoryCleanup,
+}
+
+#[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InventoryLoadAdmission {
+    NotAuthorized,
+    AuthorizationPending,
+    Authorized,
+}
+
+impl InventoryLoadAdmission {
+    fn can_advance_to(self, next: Self) -> bool {
+        self == next
+            || matches!(
+                (self, next),
+                (Self::NotAuthorized, Self::AuthorizationPending) | (Self::AuthorizationPending, Self::Authorized)
+            )
+    }
 }
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
@@ -163,6 +184,27 @@ pub struct InventoryFic {
     pub state: InventoryResourceState,
     #[serde(default)]
     pub absence: Option<InventoryFicAbsenceReceipt>,
+    #[serde(default)]
+    pub plan: Option<InventoryFicPlan>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct InventoryFicPlan {
+    pub version: u32,
+    pub run_id: String,
+    pub namespace: String,
+    pub service_account: String,
+    pub identity_id: String,
+    pub resource_id: String,
+    pub client_id: String,
+    pub tenant_id: String,
+    pub aks_id: String,
+    pub server: String,
+    pub credential_name: String,
+    pub issuer: String,
+    pub subject: String,
+    pub audience: String,
 }
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
@@ -188,6 +230,30 @@ pub struct InventoryQap {
     pub state: InventoryResourceState,
     #[serde(default)]
     pub absence: Vec<InventoryQapAbsenceReceipt>,
+    #[serde(default)]
+    pub reference: Option<InventoryQapReference>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InventoryQapReference {
+    pub schema_version: u32,
+    pub account: String,
+    pub container: String,
+    pub blob: String,
+    pub run_id: String,
+    pub nonce: String,
+    pub manifest_sha256: String,
+    pub namespace_uid: String,
+    pub namespace_owner_token: String,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InventoryEvidenceDestination {
+    pub account: String,
+    pub container: String,
+    pub blob_prefix: String,
 }
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
@@ -224,8 +290,35 @@ pub struct InventoryCleanup {
     pub stop_admission: InventoryStep,
     pub bounded_drain: InventoryStep,
     pub evidence_capture: InventoryStep,
+    pub stop_maintenance: InventoryStep,
     pub terminal_capture: InventoryStep,
     pub handoff: InventoryStep,
+}
+
+fn valid_storage_account(value: &str) -> bool {
+    (3..=24).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+}
+
+fn valid_storage_container(value: &str) -> bool {
+    (3..=63).contains(&value.len())
+        && !value.starts_with('-')
+        && !value.ends_with('-')
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+fn valid_blob_path(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 1_024
+        && !value.starts_with('/')
+        && !value.contains(['?', '#', '@', '\\'])
+        && value
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
 }
 
 impl RunInventory {
@@ -269,6 +362,13 @@ impl RunInventory {
         if self.namespace.uid.as_deref().is_some_and(|uid| !valid_uid(uid)) {
             bail!("custody namespace UID must be a nonzero canonical UUID");
         }
+        if let Some(destination) = &self.evidence_destination
+            && (!valid_storage_account(&destination.account)
+                || !valid_storage_container(&destination.container)
+                || !valid_blob_path(&destination.blob_prefix))
+        {
+            bail!("invalid credential-free custody evidence destination");
+        }
         let mut keys = BTreeSet::new();
         for resource in &self.resources {
             if resource.namespace != self.namespace.name
@@ -280,7 +380,12 @@ impl RunInventory {
                     .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'.')
                 || !matches!(
                     (resource.api_version.as_str(), resource.kind.as_str()),
-                    ("apps/v1", "Deployment") | ("batch/v1", "Job") | ("v1", "Pod")
+                    ("apps/v1", "Deployment" | "StatefulSet" | "DaemonSet")
+                        | ("batch/v1", "Job")
+                        | (
+                            "v1",
+                            "Pod" | "Service" | "ConfigMap" | "ServiceAccount" | "PersistentVolumeClaim" | "Secret",
+                        )
                 )
                 || !keys.insert((&resource.api_version, &resource.kind, &resource.name))
             {
@@ -314,6 +419,49 @@ impl RunInventory {
             }
         }
         if let Some(fic) = &self.fic {
+            if let Some(plan) = &fic.plan {
+                let valid_text = |value: &str, limit: usize| {
+                    !value.is_empty() && value.len() <= limit && !value.bytes().any(|byte| byte.is_ascii_control())
+                };
+                let valid_resource_id =
+                    |value: &str| value.starts_with("/subscriptions/") && !value.contains(['?', '#']);
+                let valid_uuid = |value: &str| {
+                    uuid::Uuid::parse_str(value).is_ok_and(|parsed| !parsed.is_nil() && parsed.to_string() == value)
+                };
+                let valid_service_account = |value: &str| {
+                    (1..=63).contains(&value.len())
+                        && value
+                            .bytes()
+                            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+                        && value.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric)
+                        && value.as_bytes().last().is_some_and(u8::is_ascii_alphanumeric)
+                };
+                if plan.version != 1
+                    || plan.run_id != self.cell_run_id
+                    || plan.namespace != self.namespace.name
+                    || !valid_service_account(&plan.service_account)
+                    || !valid_resource_id(&plan.identity_id)
+                    || !valid_resource_id(&plan.resource_id)
+                    || !valid_resource_id(&plan.aks_id)
+                    || !valid_uuid(&plan.client_id)
+                    || !valid_uuid(&plan.tenant_id)
+                    || !valid_text(&plan.server, 2_048)
+                    || !valid_text(&plan.issuer, 2_048)
+                    || !valid_text(&plan.subject, 512)
+                    || !valid_text(&plan.audience, 2_048)
+                    || !valid_text(&plan.credential_name, 120)
+                    || !plan
+                        .resource_id
+                        .ends_with(&format!("/federatedIdentityCredentials/{}", plan.credential_name))
+                    || plan.subject != format!("system:serviceaccount:{}:{}", plan.namespace, plan.service_account)
+                    || fic.resource_id.as_ref().is_some_and(|value| value != &plan.resource_id)
+                    || fic.name.as_ref().is_some_and(|value| value != &plan.credential_name)
+                {
+                    bail!(
+                        "FIC plan must match the exact cell, namespace, service account and recorded credential identity"
+                    );
+                }
+            }
             if fic.state == InventoryResourceState::Absent {
                 let receipt = fic
                     .absence
@@ -364,6 +512,36 @@ impl RunInventory {
             {
                 bail!("QAP absence requires exact, unique not-found receipts for the planned bindings");
             }
+            if let Some(reference) = &qap.reference {
+                let valid_nonce = |value: &str| {
+                    (1..=128).contains(&value.len())
+                        && value.bytes().all(|byte| {
+                            byte.is_ascii_lowercase()
+                                || byte.is_ascii_uppercase()
+                                || byte.is_ascii_digit()
+                                || byte == b'-'
+                        })
+                };
+                if reference.schema_version != 1
+                    || reference.run_id != self.cell_run_id
+                    || self.namespace.uid.as_deref() != Some(reference.namespace_uid.as_str())
+                    || reference.namespace_owner_token != self.namespace.owner_token
+                    || !valid_storage_account(&reference.account)
+                    || !valid_storage_container(&reference.container)
+                    || !valid_blob_path(&reference.blob)
+                    || !valid_nonce(&reference.nonce)
+                    || reference.manifest_sha256.len() != 64
+                    || !reference
+                        .manifest_sha256
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                    || !valid_uid(&reference.namespace_uid)
+                {
+                    bail!(
+                        "QAP reference must match the exact run, namespace UID, immutable owner and safe blob identity"
+                    );
+                }
+            }
             let safe_identifier = |value: &str| {
                 !value.is_empty()
                     && value
@@ -395,6 +573,7 @@ impl RunInventory {
             &self.cleanup.stop_admission,
             &self.cleanup.bounded_drain,
             &self.cleanup.evidence_capture,
+            &self.cleanup.stop_maintenance,
             &self.cleanup.terminal_capture,
             &self.cleanup.handoff,
         ] {
@@ -414,20 +593,38 @@ impl RunInventory {
             }
         }
         if self.cleanup.stop_admission.state == InventoryStepState::Running
-            && self.cleanup.stop_admission.deadline_unix_ms.is_none()
+            && self
+                .cleanup
+                .stop_admission
+                .deadline_unix_ms
+                .is_none_or(|deadline| deadline == 0)
         {
             bail!("running admission stop requires a bounded deadline");
         }
         if self.cleanup.bounded_drain.state == InventoryStepState::Running
-            && self.cleanup.bounded_drain.deadline_unix_ms.is_none()
+            && self
+                .cleanup
+                .bounded_drain
+                .deadline_unix_ms
+                .is_none_or(|deadline| deadline == 0)
         {
             bail!("running drain requires a bounded deadline");
+        }
+        if self.cleanup.stop_maintenance.state == InventoryStepState::Running
+            && self
+                .cleanup
+                .stop_maintenance
+                .deadline_unix_ms
+                .is_none_or(|deadline| deadline == 0)
+        {
+            bail!("running maintenance stop requires a bounded deadline");
         }
         if self.cleanup.handoff.state == InventoryStepState::Complete
             && ([
                 &self.cleanup.stop_admission,
                 &self.cleanup.bounded_drain,
                 &self.cleanup.evidence_capture,
+                &self.cleanup.stop_maintenance,
                 &self.cleanup.terminal_capture,
             ]
             .iter()
@@ -468,6 +665,7 @@ impl RunInventory {
             || self.fencing_token != next.fencing_token
             || self.orchestration_run_id != next.orchestration_run_id
             || self.cell_run_id != next.cell_run_id
+            || !self.load_admission.can_advance_to(next.load_admission)
             || self.namespace.name != next.namespace.name
             || self.namespace.owner_token != next.namespace.owner_token
             || self
@@ -502,8 +700,18 @@ impl RunInventory {
                 bail!("custody update changed an established resource identity");
             }
         }
+        if self
+            .evidence_destination
+            .as_ref()
+            .is_some_and(|value| next.evidence_destination.as_ref() != Some(value))
+        {
+            bail!("custody update changed its evidence destination");
+        }
         if let Some(old) = &self.fic {
             let new = next.fic.as_ref().context("custody update dropped the FIC")?;
+            if old.plan.as_ref().is_some_and(|plan| new.plan.as_ref() != Some(plan)) {
+                bail!("custody update changed an established FIC plan");
+            }
             if old.name.as_ref().is_some_and(|value| new.name.as_ref() != Some(value))
                 || old
                     .resource_id
@@ -524,14 +732,19 @@ impl RunInventory {
                 || old.bindings.iter().any(|binding| !new.bindings.contains(binding))
                 || !old.state.can_advance_to(new.state)
                 || old.absence.iter().any(|receipt| !new.absence.contains(receipt))
+                || old
+                    .reference
+                    .as_ref()
+                    .is_some_and(|reference| new.reference.as_ref() != Some(reference))
             {
-                bail!("custody update changed an established QAP identity");
+                bail!("custody update changed an established QAP identity or reference");
             }
         }
         for (old, new) in [
             (&self.cleanup.stop_admission, &next.cleanup.stop_admission),
             (&self.cleanup.bounded_drain, &next.cleanup.bounded_drain),
             (&self.cleanup.evidence_capture, &next.cleanup.evidence_capture),
+            (&self.cleanup.stop_maintenance, &next.cleanup.stop_maintenance),
             (&self.cleanup.terminal_capture, &next.cleanup.terminal_capture),
             (&self.cleanup.handoff, &next.cleanup.handoff),
         ] {
@@ -542,7 +755,7 @@ impl RunInventory {
         Ok(())
     }
 
-    fn validate_custody_receipt(&self, output: &[u8], ready: bool) -> Result<()> {
+    fn validate_custody_receipt(&self, output: &[u8], ready: bool) -> Result<Option<String>> {
         let response: Value = serde_json::from_slice(output).context("invalid custody receipt JSON")?;
         if response["ok"] != true {
             let code = match response["code"].as_str() {
@@ -576,15 +789,28 @@ impl RunInventory {
         {
             bail!("custody persistence receipt is incomplete or does not match inventory");
         }
-        Ok(())
+        let etag = if ready {
+            None
+        } else {
+            Some(
+                receipt
+                    .get("etag")
+                    .and_then(Value::as_str)
+                    .context("custody persistence receipt omitted ETag")?
+                    .to_owned(),
+            )
+        };
+        Ok(etag)
     }
 
     /// Publish this inventory and require the fenced store's matching persistence receipt.
     ///
     /// # Errors
     /// Refuses unconfirmed writes and mismatched or fenced receipts without retrying.
-    pub async fn publish_to_custody(&self) -> Result<()> {
-        self.custody_command(false).await
+    pub async fn publish_to_custody(&self) -> Result<String> {
+        self.custody_command(false)
+            .await?
+            .context("custody publisher did not return an ETag")
     }
 
     /// Verify that the fenced store has armed this exact cell before load starts.
@@ -592,11 +818,11 @@ impl RunInventory {
     /// # Errors
     /// Refuses an unready or mismatched receipt.
     pub async fn assert_custody_ready(&self) -> Result<()> {
-        self.custody_command(true).await
+        self.custody_command(true).await.map(|_| ())
     }
 
     #[cfg(unix)]
-    async fn custody_command(&self, ready: bool) -> Result<()> {
+    async fn custody_command(&self, ready: bool) -> Result<Option<String>> {
         self.validate()?;
         let payload = if ready {
             None
@@ -639,7 +865,7 @@ impl RunInventory {
         .await
         .context("custody command timed out; write outcome may be unknown and must not be retried")??;
         if !output.status.success() {
-            return self.validate_custody_receipt(&output.stdout, ready).and_then(|()| {
+            return self.validate_custody_receipt(&output.stdout, ready).and_then(|_| {
                 Err(anyhow::anyhow!(
                     "custody command exited unsuccessfully despite a success-shaped receipt"
                 ))
@@ -649,7 +875,7 @@ impl RunInventory {
     }
 
     #[cfg(not(unix))]
-    async fn custody_command(&self, _ready: bool) -> Result<()> {
+    async fn custody_command(&self, _ready: bool) -> Result<Option<String>> {
         bail!("fenced custody requires Unix process-group cancellation")
     }
 }
@@ -738,10 +964,10 @@ trait Platform: Send + Sync {
         Ok((self.router_metrics_endpoint(config)?, false))
     }
     fn qap_endpoint(&self, config: &OatConfig) -> String;
-    async fn ensure_stack(&mut self, config: &OatConfig) -> Result<()>;
+    async fn ensure_stack(&mut self, config: &OatConfig, orchestration_run_id: &str) -> Result<()>;
     async fn scale_arrowcols(&mut self, config: &OatConfig, replicas: u32, concurrency: u32) -> Result<()>;
     async fn initialize_run_table_pins(
-        &self,
+        &mut self,
         config: &OatConfig,
         run_id: &str,
         expected_keys_json: &str,
@@ -751,10 +977,18 @@ trait Platform: Send + Sync {
     fn qap_observation_mode(&self) -> arrowcol_loadgen::ObservationMode;
     fn qap_database(&self, config: &OatConfig) -> Result<String>;
     async fn initialize_qap(&mut self, config: &OatConfig, run_id: &str, tables: &[String]) -> Result<Vec<String>>;
+    async fn prepare_campaign_load_admission(
+        &mut self,
+        _config: &OatConfig,
+        _run_id: &str,
+        _tables: &[String],
+    ) -> Result<()> {
+        Ok(())
+    }
     fn mark_qap_outcome_unresolved(&mut self) {}
-    async fn prepare_client_fleet(&self, config: &OatConfig, run_id: &str) -> Result<()>;
+    async fn prepare_client_fleet(&mut self, config: &OatConfig, run_id: &str) -> Result<()>;
     async fn start_client(
-        &self,
+        &mut self,
         config: &OatConfig,
         run_id: &str,
         table: &str,
@@ -768,7 +1002,7 @@ trait Platform: Send + Sync {
             .into_iter()
             .collect()
     }
-    async fn arm_clients(&self, config: &OatConfig, run_id: &str, run_start_unix_ms: u64) -> Result<()>;
+    async fn arm_clients(&mut self, config: &OatConfig, run_id: &str, run_start_unix_ms: u64) -> Result<()>;
     async fn finish_client(&self, config: &OatConfig, handle: ClientHandle) -> Result<String>;
     async fn cancel_client(&self, config: &OatConfig, handle: &ClientHandle) -> Result<()>;
     fn resource_sampler_source(&self) -> Option<ResourceSamplerSource> {
@@ -928,10 +1162,10 @@ impl Platform for AksPlatform {
         config.qap_endpoint.clone()
     }
 
-    async fn ensure_stack(&mut self, config: &OatConfig) -> Result<()> {
-        prepare_aks_platform(config, self).await?;
+    async fn ensure_stack(&mut self, config: &OatConfig, orchestration_run_id: &str) -> Result<()> {
+        prepare_aks_platform(config, self, orchestration_run_id).await?;
         if let Some(overlay) = config.platform.kustomize_overlay.as_deref() {
-            apply_aks_overlay(config, overlay).await?;
+            apply_aks_overlay(config, overlay, self).await?;
         }
         Ok(())
     }
@@ -945,7 +1179,7 @@ impl Platform for AksPlatform {
     }
 
     async fn initialize_run_table_pins(
-        &self,
+        &mut self,
         config: &OatConfig,
         run_id: &str,
         expected_keys_json: &str,
@@ -977,32 +1211,51 @@ impl Platform for AksPlatform {
     }
 
     async fn initialize_qap(&mut self, config: &OatConfig, run_id: &str, tables: &[String]) -> Result<Vec<String>> {
-        let bindings = qap_bindings(run_id, tables)?;
         let database = self.qap_database(config)?;
-        let bootstrap_env_file = configured_bootstrap_env_file(config)?;
+        let relative_root = self
+            .qap_relative_data_root
+            .as_deref()
+            .context("AKS run-scoped data root is missing")?;
+        let (manifest, inventory_bindings) = campaign_qap_manifest(run_id, &database, relative_root, tables)?;
         let runtime_dir = self
             .runtime_dir
             .as_deref()
             .context("AKS runtime directory is not available")?;
         let manifest_path = runtime_dir.join("oat-qap-manifest.json");
         let record_path = runtime_dir.join("oat-qap-record.json");
-        let manifest = json!({
-            "schema_version": 1,
-            "run_id": run_id,
-            "database": database,
-            "tables": bindings.iter().map(|binding| Ok(json!({
-                "external_table": binding.external_table,
-                "relative_path": aks_qap_relative_path(
-                    self.qap_relative_data_root.as_deref().context("AKS run-scoped data root is missing")?,
-                    &binding.logical_table,
-                )?,
-            }))).collect::<Result<Vec<_>>>()?,
-        });
-        tokio::fs::write(&manifest_path, serde_json::to_vec(&manifest)?)
-            .await
-            .with_context(|| format!("write run-owned AKS QAP manifest {}", manifest_path.display()))?;
+        if config.campaign_profile == Some(crate::config::CampaignProfile::SingleHotTable) {
+            let saved_manifest: Value = serde_json::from_slice(
+                &tokio::fs::read(&manifest_path)
+                    .await
+                    .context("read pre-admission QAP manifest")?,
+            )
+            .context("parse pre-admission QAP manifest")?;
+            if saved_manifest != manifest {
+                bail!("QAP manifest changed after its exact planned bindings were persisted");
+            }
+            let inventory = campaign_inventory_for_setup(self).await?;
+            let qap = inventory
+                .qap
+                .as_ref()
+                .context("campaign QAP bindings were not planned before admission")?;
+            if qap.database != database
+                || qap.bindings != inventory_bindings
+                || qap.state != InventoryResourceState::Planned
+                || qap.reference.is_some()
+            {
+                bail!("campaign inventory does not contain the exact planned QAP manifest");
+            }
+            let mut uncertain = qap.clone();
+            uncertain.state = InventoryResourceState::Uncertain;
+            update_campaign_qap_inventory(self, uncertain).await?;
+        } else {
+            tokio::fs::write(&manifest_path, serde_json::to_vec(&manifest)?)
+                .await
+                .with_context(|| format!("write run-owned AKS QAP manifest {}", manifest_path.display()))?;
+        }
         self.qap_record_path = Some(record_path.clone());
         self.qap_bind_attempted = true;
+        let bootstrap_env_file = configured_bootstrap_env_file(config)?;
         let workload_record = self
             .fic_ready_snapshot_path
             .as_deref()
@@ -1030,15 +1283,175 @@ impl Platform for AksPlatform {
         )
         .await
         .context("verify run-owned AKS QAP bindings")?;
-        Ok(bindings.iter().map(|binding| binding.external_table.clone()).collect())
+        if config.campaign_profile == Some(crate::config::CampaignProfile::SingleHotTable) {
+            let reference = run_oat_qap_reference(&record_path, bootstrap_env_file).await?;
+            let mut observed = campaign_inventory_for_setup(self)
+                .await?
+                .qap
+                .context("campaign QAP bindings disappeared after verification")?;
+            observed.state = InventoryResourceState::Observed;
+            observed.reference = Some(reference);
+            update_campaign_qap_inventory(self, observed).await?;
+        }
+        Ok(inventory_bindings
+            .into_iter()
+            .map(|binding| binding.external_table)
+            .collect())
+    }
+
+    async fn prepare_campaign_load_admission(
+        &mut self,
+        config: &OatConfig,
+        run_id: &str,
+        tables: &[String],
+    ) -> Result<()> {
+        if config.campaign_profile != Some(crate::config::CampaignProfile::SingleHotTable) {
+            return Ok(());
+        }
+        let [hot_table] = tables else {
+            bail!("campaign load admission requires exactly one frozen hot table");
+        };
+        let database = self.qap_database(config)?;
+        let relative_root = self
+            .qap_relative_data_root
+            .as_deref()
+            .context("AKS run-scoped data root is missing")?;
+        let (manifest, bindings) = campaign_qap_manifest(run_id, &database, relative_root, tables)?;
+        let hot_path = aks_qap_relative_path(relative_root, hot_table)?;
+        let matching_bindings = bindings
+            .iter()
+            .filter(|binding| binding.relative_path == hot_path)
+            .count();
+        if matching_bindings != 1 {
+            bail!("campaign hot Delta path must match exactly one persisted QAP binding");
+        }
+        let runtime_dir = self
+            .runtime_dir
+            .as_deref()
+            .context("campaign runtime directory is not available")?;
+        let manifest_path = runtime_dir.join("oat-qap-manifest.json");
+        tokio::fs::write(&manifest_path, serde_json::to_vec(&manifest)?)
+            .await
+            .with_context(|| format!("write pre-admission AKS QAP manifest {}", manifest_path.display()))?;
+        let mut inventory = campaign_inventory_for_setup(self).await?;
+        if inventory.load_admission != InventoryLoadAdmission::NotAuthorized
+            || inventory.namespace.uid.is_none()
+            || inventory.qap.is_some()
+        {
+            bail!("campaign load admission is not in its initial pre-provisioned state");
+        }
+        update_campaign_qap_inventory(
+            self,
+            InventoryQap {
+                database,
+                bindings: bindings.clone(),
+                state: InventoryResourceState::Planned,
+                absence: Vec::new(),
+                reference: None,
+            },
+        )
+        .await?;
+        inventory = campaign_inventory_for_setup(self).await?;
+        if inventory.load_admission != InventoryLoadAdmission::NotAuthorized {
+            bail!("campaign baseline can only be captured before load authorization");
+        }
+        let expected_etag = tokio::fs::read_to_string(runtime_dir.join("campaign-inventory-etag"))
+            .await
+            .context("read current campaign inventory ETag before baseline capture")?;
+        validate_campaign_etag(expected_etag.trim())?;
+        let identity = CampaignIdentity::from_lookup(|name| std::env::var(name).ok())?;
+        let actor = CampaignCleanupActor {
+            mode: CampaignActorMode::Producer,
+            owner_id: identity.owner_id.clone(),
+            fencing_token: identity.fencing_token,
+        };
+        let request = CampaignCellBaselineRequest {
+            schema_version: 1,
+            campaign_id: &identity.campaign_id,
+            orchestration_run_id: &inventory.orchestration_run_id,
+            cell_run_id: run_id,
+            expected_etag: expected_etag.trim(),
+            hot_delta_relative_path: &hot_path,
+            actor: &actor,
+        };
+        let output =
+            run_campaign_custody_json("capture-cell-baseline", None, &request, Duration::from_secs(90)).await?;
+        let response: CampaignCellBaselineResponse =
+            serde_json::from_slice(&output).context("parse immutable cell baseline receipt")?;
+        if !response.ok {
+            let code = response
+                .code
+                .as_deref()
+                .filter(|code| {
+                    matches!(
+                        *code,
+                        "campaign_fenced" | "stale_version" | "write_outcome_unknown" | "invalid_or_storage_error"
+                    )
+                })
+                .context("cell baseline failure returned no recognized error code")?;
+            if response.message.is_none() {
+                bail!("cell baseline failure omitted its required diagnostic message");
+            }
+            bail!("cell baseline capture failed: {code}");
+        }
+        if response.code.is_some() || response.message.is_some() {
+            bail!("successful cell baseline response included error fields");
+        }
+        let receipt = response.receipt.context("cell baseline capture returned no receipt")?;
+        validate_campaign_cell_baseline(&receipt, &inventory, &identity, run_id, &hot_path)?;
+        tokio::fs::write(
+            runtime_dir.join("campaign-cell-baseline.json"),
+            serde_json::to_vec(&receipt)?,
+        )
+        .await
+        .context("persist immutable cell baseline receipt")?;
+
+        let mut pending = inventory.clone();
+        pending.load_admission = InventoryLoadAdmission::AuthorizationPending;
+        inventory.validate_successor(&pending)?;
+        persist_campaign_inventory(self, &pending).await?;
+        let (confirmed, etag) = read_authoritative_campaign_inventory(
+            self,
+            &identity,
+            &inventory.orchestration_run_id,
+            Duration::from_secs(60),
+        )
+        .await?;
+        if confirmed.load_admission != InventoryLoadAdmission::AuthorizationPending
+            || confirmed
+                .qap
+                .as_ref()
+                .is_none_or(|qap| qap.state != InventoryResourceState::Planned || qap.bindings != bindings)
+        {
+            bail!("authoritative campaign inventory did not confirm the pending load authorization");
+        }
+        pending.validate_successor(&confirmed)?;
+        persist_campaign_inventory_snapshot(self, &confirmed, &etag).await?;
+        let mut authorized = confirmed.clone();
+        authorized.load_admission = InventoryLoadAdmission::Authorized;
+        confirmed.validate_successor(&authorized)?;
+        persist_campaign_inventory(self, &authorized).await?;
+        let (final_inventory, final_etag) = read_authoritative_campaign_inventory(
+            self,
+            &identity,
+            &inventory.orchestration_run_id,
+            Duration::from_secs(60),
+        )
+        .await?;
+        if final_inventory.load_admission != InventoryLoadAdmission::Authorized {
+            bail!("authoritative campaign inventory did not positively confirm load authorization");
+        }
+        authorized.validate_successor(&final_inventory)?;
+        persist_campaign_inventory_snapshot(self, &final_inventory, &final_etag).await?;
+        Ok(())
     }
 
     fn mark_qap_outcome_unresolved(&mut self) {
         self.qap_outcome_unresolved = true;
     }
 
-    async fn prepare_client_fleet(&self, config: &OatConfig, _run_id: &str) -> Result<()> {
-        let payload = serde_json::to_vec(&json!({
+    async fn prepare_client_fleet(&mut self, config: &OatConfig, _run_id: &str) -> Result<()> {
+        let mut configmap = json!({
             "apiVersion": "v1",
             "kind": "ConfigMap",
             "metadata": {
@@ -1053,15 +1466,17 @@ impl Platform for AksPlatform {
                 },
             },
             "data": { "schedule": "pending" },
-        }))?;
+        });
+        prepare_run_owned_resources(config, self, std::slice::from_mut(&mut configmap)).await?;
+        let payload = serde_json::to_vec(&configmap)?;
         kubectl(config, vec!["create", "-f", "-"], Some(payload))
             .await
-            .context("create unique AKS client schedule ConfigMap")
-            .map(|_| ())
+            .context("create unique AKS client schedule ConfigMap")?;
+        record_applied_resource_uids(config, self, std::slice::from_ref(&configmap)).await
     }
 
     async fn start_client(
-        &self,
+        &mut self,
         config: &OatConfig,
         run_id: &str,
         table: &str,
@@ -1079,8 +1494,8 @@ impl Platform for AksPlatform {
         poll_aks_client_fleet(config, self, handles).await
     }
 
-    async fn arm_clients(&self, config: &OatConfig, _run_id: &str, run_start_unix_ms: u64) -> Result<()> {
-        let payload = serde_json::to_vec(&json!({
+    async fn arm_clients(&mut self, config: &OatConfig, _run_id: &str, run_start_unix_ms: u64) -> Result<()> {
+        let mut configmap = json!({
             "apiVersion": "v1",
             "kind": "ConfigMap",
             "metadata": {
@@ -1095,15 +1510,17 @@ impl Platform for AksPlatform {
                 },
             },
             "data": { "schedule": run_start_unix_ms.to_string() },
-        }))?;
+        });
+        prepare_run_owned_resources(config, self, std::slice::from_mut(&mut configmap)).await?;
+        let payload = serde_json::to_vec(&configmap)?;
         kubectl(
             config,
             vec!["apply", "--namespace", &config.namespace, "-f", "-"],
             Some(payload),
         )
         .await
-        .context("arm the common AKS client measurement schedule")
-        .map(|_| ())
+        .context("arm the common AKS client measurement schedule")?;
+        record_applied_resource_uids(config, self, std::slice::from_ref(&configmap)).await
     }
 
     async fn finish_client(&self, config: &OatConfig, handle: ClientHandle) -> Result<String> {
@@ -1160,7 +1577,7 @@ impl Platform for LocalPlatform {
         self.qap_url.clone().unwrap_or_else(|| config.qap_endpoint.clone())
     }
 
-    async fn ensure_stack(&mut self, config: &OatConfig) -> Result<()> {
+    async fn ensure_stack(&mut self, config: &OatConfig, _orchestration_run_id: &str) -> Result<()> {
         self.daemon_endpoint = Some(local_docker_daemon().await?);
         prepare_local_platform(config, self).await?;
         self.router_metrics_url = Some(local_compose_endpoint(config, self, "router", "50050", "/metrics").await?);
@@ -1183,7 +1600,7 @@ impl Platform for LocalPlatform {
     }
 
     async fn initialize_run_table_pins(
-        &self,
+        &mut self,
         config: &OatConfig,
         run_id: &str,
         expected_keys_json: &str,
@@ -1238,14 +1655,14 @@ impl Platform for LocalPlatform {
         Ok(bindings.iter().map(|binding| binding.external_table.clone()).collect())
     }
 
-    async fn prepare_client_fleet(&self, _config: &OatConfig, _run_id: &str) -> Result<()> {
+    async fn prepare_client_fleet(&mut self, _config: &OatConfig, _run_id: &str) -> Result<()> {
         tokio::fs::write(self.control_dir.join("schedule"), "pending\n")
             .await
             .context("reset local OAT client schedule barrier")
     }
 
     async fn start_client(
-        &self,
+        &mut self,
         config: &OatConfig,
         run_id: &str,
         table: &str,
@@ -1263,7 +1680,7 @@ impl Platform for LocalPlatform {
         poll_local_client_fleet(handles, &self.client_progress).await
     }
 
-    async fn arm_clients(&self, _config: &OatConfig, _run_id: &str, run_start_unix_ms: u64) -> Result<()> {
+    async fn arm_clients(&mut self, _config: &OatConfig, _run_id: &str, run_start_unix_ms: u64) -> Result<()> {
         let temporary = self.control_dir.join("schedule.tmp");
         tokio::fs::write(&temporary, format!("{run_start_unix_ms}\n"))
             .await
@@ -1767,7 +2184,7 @@ fn write_private_secret(path: &Path, contents: &str) -> Result<()> {
 
 async fn start_aks_client_job(
     config: &OatConfig,
-    platform: &AksPlatform,
+    platform: &mut AksPlatform,
     run_id: &str,
     table: &str,
     client_index: usize,
@@ -1798,6 +2215,7 @@ async fn start_aks_client_job(
             .context("AKS client container is missing")?,
         &role_environment(config, ComponentRole::Client)?,
     )?;
+    prepare_run_owned_resources(config, platform, std::slice::from_mut(&mut job)).await?;
     let payload = serde_json::to_vec(&job)?;
     kubectl(
         config,
@@ -1806,6 +2224,7 @@ async fn start_aks_client_job(
     )
     .await
     .with_context(|| format!("create AKS DMV client Job {job_name}"))?;
+    record_applied_resource_uids(config, platform, std::slice::from_ref(&job)).await?;
     Ok(ClientHandle {
         client_id: format!("{run_id}:{table}:{client_index}"),
         table: table.to_owned(),
@@ -2409,7 +2828,7 @@ async fn run_isolated_cell(
     };
     let (result, cancelled) = tokio::select! {
         result = async {
-            match platform.ensure_stack(&config).await {
+            match platform.ensure_stack(&config, orchestration_id).await {
                 Ok(()) => {
                     run_matrix_cell(
                         &config,
@@ -3235,6 +3654,9 @@ async fn run_clients_inner(
     platform: &mut dyn Platform,
     pinning: &mut PinningReport,
 ) -> Result<ClientRun> {
+    platform
+        .prepare_campaign_load_admission(config, project_run_id, tables)
+        .await?;
     let timing_budget = config.timing_budget()?;
     local_progress(
         config,
@@ -5151,7 +5573,7 @@ async fn run_local_pin_setup(
 
 async fn run_aks_pin_setup_job(
     config: &OatConfig,
-    platform: &AksPlatform,
+    platform: &mut AksPlatform,
     run_id: &str,
     expected_keys_json: &str,
     expires_at_unix_ms: u64,
@@ -5279,9 +5701,16 @@ async fn run_aks_pin_setup_job(
             },
         }],
     }))?;
-    kubectl(config, vec!["create", "-f", "-"], Some(payload))
+    let mut manifest: Value = serde_json::from_slice(&payload).context("parse pin initialization resources")?;
+    let items = manifest["items"]
+        .as_array_mut()
+        .context("pin initialization resource list is missing")?;
+    prepare_run_owned_resources(config, platform, items).await?;
+    let planned_resources = items.clone();
+    kubectl(config, vec!["create", "-f", "-"], Some(serde_json::to_vec(&manifest)?))
         .await
         .context("create finite AKS OAT pin initialization Job")?;
+    record_applied_resource_uids(config, platform, &planned_resources).await?;
 
     wait_for_aks_pin_setup(config, &job_name, run_id).await?;
     kubectl(
@@ -5463,6 +5892,57 @@ async fn wait_for_aks_pin_setup(config: &OatConfig, job_name: &str, run_id: &str
     Ok(())
 }
 
+fn local_partition_initializer_args(table: &str, dataflow_root: &Path) -> Result<Vec<String>> {
+    if !dataflow_root.is_absolute() || !dataflow_root.is_dir() {
+        bail!("local partition initialization requires an existing absolute run-owned Dataflow directory");
+    }
+    let canonical_table = canonical_dmv_table_name(table)?;
+    if canonical_table != "telemetry.sqlserver.sqlserver_availability_replica_states" {
+        bail!("local partition initialization only supports the campaign hot table");
+    }
+    let dataflow_root = dataflow_root
+        .to_str()
+        .context("local run-owned Dataflow directory is not valid UTF-8")?;
+    Ok(vec![
+        "initialize-local".to_owned(),
+        "--partition-by-ingestion-date".to_owned(),
+        "--table".to_owned(),
+        canonical_table,
+        "--dataflow-root".to_owned(),
+        dataflow_root.to_owned(),
+    ])
+}
+
+async fn initialize_local_partitioned_campaign_table(config: &OatConfig, platform: &LocalPlatform) -> Result<()> {
+    if config.campaign_profile != Some(crate::config::CampaignProfile::SingleHotTable) {
+        return Ok(());
+    }
+    let [table] = config.tables.as_slice() else {
+        bail!("local partition initialization requires exactly one campaign table");
+    };
+    let dataflow_root = platform.state_dir.join("dataflow");
+    let arguments = local_partition_initializer_args(table, &dataflow_root)?;
+    let workspace = std::env::current_dir()?;
+    let mut build = Command::new("cargo");
+    build.args([
+        "build",
+        "--locked",
+        "--package",
+        "arrowcol-loadgen",
+        "--bin",
+        "arrowcol-loadgen",
+    ]);
+    build.current_dir(&workspace);
+    run_streaming_command(build, "build setup-only local partition initializer").await?;
+
+    let mut initialize = Command::new(workspace.join("target/debug/arrowcol-loadgen"));
+    initialize.args(arguments);
+    initialize.current_dir(workspace);
+    run_streaming_command(initialize, "initialize the fresh local campaign Delta table")
+        .await
+        .context("setup local partitioned table before starting Dataflow or any DMV client")
+}
+
 async fn prepare_local_platform(config: &OatConfig, platform: &LocalPlatform) -> Result<()> {
     run_npx_runtime(
         &std::env::current_dir()?.join("projects/arrowcol-oat/runtime.ts"),
@@ -5478,6 +5958,7 @@ async fn prepare_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
     )
     .await
     .context("render run-owned dataflow profile before starting local workloads")?;
+    initialize_local_partitioned_campaign_table(config, platform).await?;
     let base_project = config
         .platform
         .compose_project
@@ -6404,7 +6885,7 @@ async fn deployment(config: &OatConfig, name: &str) -> Result<Value> {
     serde_json::from_str(&output).with_context(|| format!("parse Deployment {name} JSON"))
 }
 
-async fn apply_aks_overlay(config: &OatConfig, overlay: &str) -> Result<()> {
+async fn apply_aks_overlay(config: &OatConfig, overlay: &str, platform: &mut AksPlatform) -> Result<()> {
     let rendered = kubectl(config, vec!["kustomize", overlay], None)
         .await
         .context("render configured AKS Kustomize overlay")?;
@@ -6439,14 +6920,18 @@ async fn apply_aks_overlay(config: &OatConfig, overlay: &str) -> Result<()> {
     }
     let allowed_names = config.deployment_names().into_iter().map(str::to_owned).collect();
     validate_aks_overlay_resources(&resources, &allowed_names, &config.namespace)?;
+    prepare_run_owned_resources(config, platform, &mut resources).await?;
 
     kubectl(
         config,
         vec!["apply", "--namespace", &config.namespace, "-f", "-"],
-        Some(rendered.into_bytes()),
+        Some(serde_json::to_vec(
+            &json!({"apiVersion":"v1", "kind":"List", "items":resources}),
+        )?),
     )
     .await
     .context("apply configured AKS Kustomize overlay")?;
+    record_applied_resource_uids(config, platform, &resources).await?;
     Ok(())
 }
 
@@ -6560,6 +7045,31 @@ fn qap_bindings(run_id: &str, tables: &[String]) -> Result<Vec<QapBinding>> {
         .collect()
 }
 
+fn campaign_qap_manifest(
+    run_id: &str,
+    database: &str,
+    run_root: &str,
+    tables: &[String],
+) -> Result<(Value, Vec<InventoryQapBinding>)> {
+    let bindings = qap_bindings(run_id, tables)?;
+    let inventory_bindings = bindings
+        .iter()
+        .map(|binding| {
+            Ok(InventoryQapBinding {
+                external_table: binding.external_table.clone(),
+                relative_path: aks_qap_relative_path(run_root, &binding.logical_table)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let manifest = json!({
+        "schema_version": 1,
+        "run_id": run_id,
+        "database": database,
+        "tables": inventory_bindings,
+    });
+    Ok((manifest, inventory_bindings))
+}
+
 fn aks_qap_relative_path(run_root: &str, table: &str) -> Result<String> {
     if !table.starts_with("sqlserver_") || !table.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_') {
         bail!("OAT QAP table path has an invalid table identity");
@@ -6617,7 +7127,869 @@ fn namespace_uid_for_cleanup(namespace: &Value, expected_uid: Option<&str>) -> R
     Ok(uid.to_owned())
 }
 
-async fn prepare_aks_platform(config: &OatConfig, platform: &mut AksPlatform) -> Result<()> {
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum CampaignCleanupAction {
+    StopAdmission,
+    BoundedDrain,
+    EvidenceCapture,
+    StopMaintenance,
+    TerminalCapture,
+    RemoveNamespace,
+    RemoveQap,
+    RemoveFic,
+    Handoff,
+}
+
+impl CampaignCleanupAction {
+    fn selector(&self) -> &'static str {
+        match self {
+            Self::StopAdmission => "stop_admission",
+            Self::BoundedDrain => "bounded_drain",
+            Self::EvidenceCapture => "evidence_capture",
+            Self::StopMaintenance => "stop_maintenance",
+            Self::TerminalCapture => "terminal_capture",
+            Self::RemoveNamespace => "remove_namespace",
+            Self::RemoveQap => "remove_qap",
+            Self::RemoveFic => "remove_fic",
+            Self::Handoff => "handoff",
+        }
+    }
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum CampaignActorMode {
+    Producer,
+    Controller,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct CampaignCleanupActor {
+    mode: CampaignActorMode,
+    owner_id: String,
+    fencing_token: u64,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct CampaignInventoryReadRequest<'a> {
+    schema_version: u8,
+    campaign_id: &'a str,
+    orchestration_run_id: &'a str,
+    cell_run_id: &'a str,
+    actor: &'a CampaignCleanupActor,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct CampaignCleanupRequest<'a> {
+    schema_version: u8,
+    inventory: &'a RunInventory,
+    expected_etag: &'a str,
+    actor: &'a CampaignCleanupActor,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct CampaignCellBaselineRequest<'a> {
+    schema_version: u8,
+    campaign_id: &'a str,
+    orchestration_run_id: &'a str,
+    cell_run_id: &'a str,
+    expected_etag: &'a str,
+    hot_delta_relative_path: &'a str,
+    actor: &'a CampaignCleanupActor,
+}
+
+#[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum CampaignDeltaState {
+    Table,
+    ObservedAbsent,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct CampaignCellBaselineReceipt {
+    status: String,
+    campaign_id: String,
+    owner_id: String,
+    fencing_token: u64,
+    orchestration_run_id: String,
+    cell_run_id: String,
+    namespace_uid: String,
+    hot_delta_relative_path: String,
+    blob: String,
+    etag: String,
+    delta_state: CampaignDeltaState,
+    table_id: Option<String>,
+    delta_version: Option<u64>,
+    rows: Option<u64>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CampaignCellBaselineResponse {
+    ok: bool,
+    receipt: Option<CampaignCellBaselineReceipt>,
+    code: Option<String>,
+    message: Option<String>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CampaignInventoryReadResponse {
+    ok: bool,
+    inventory: RunInventory,
+    etag: String,
+}
+
+fn deserialize_present_campaign_option<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    <Option<T> as serde::Deserialize>::deserialize(deserializer)
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct CampaignCleanupReceipt {
+    status: String,
+    step: String,
+    campaign_id: String,
+    owner_id: String,
+    fencing_token: u64,
+    orchestration_run_id: String,
+    cell_run_id: String,
+    #[serde(deserialize_with = "deserialize_present_campaign_option")]
+    namespace_uid: Option<String>,
+    actor: CampaignCleanupActor,
+    completed_at_unix_ms: u64,
+    etag: String,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CampaignCleanupResponse {
+    ok: bool,
+    receipt: CampaignCleanupReceipt,
+}
+
+fn validate_campaign_etag(etag: &str) -> Result<()> {
+    if etag.is_empty()
+        || etag.len() > 512
+        || etag == "*"
+        || etag.starts_with("W/")
+        || etag.bytes().any(|byte| byte.is_ascii_control())
+    {
+        bail!("campaign inventory requires a strong nonempty ETag");
+    }
+    Ok(())
+}
+
+const MAX_CAMPAIGN_CLEANUP_ATTEMPTS: usize = 3;
+
+#[derive(Debug)]
+struct StaleCampaignVersionError {
+    action: String,
+}
+
+impl std::fmt::Display for StaleCampaignVersionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "campaign cleanup {} rejected a stale version before effects",
+            self.action
+        )
+    }
+}
+
+impl std::error::Error for StaleCampaignVersionError {}
+
+fn campaign_custody_helper_failure(action: &str, stdout: &[u8]) -> anyhow::Error {
+    let code = serde_json::from_slice::<Value>(stdout)
+        .ok()
+        .and_then(|response| response.get("code").and_then(Value::as_str).map(str::to_owned))
+        .filter(|code| {
+            matches!(
+                code.as_str(),
+                "campaign_fenced" | "stale_version" | "write_outcome_unknown" | "invalid_or_storage_error"
+            )
+        })
+        .unwrap_or_else(|| "invalid_response".to_owned());
+    if action == "cleanup-step" && code == "stale_version" {
+        anyhow::Error::new(StaleCampaignVersionError {
+            action: action.to_owned(),
+        })
+    } else {
+        anyhow::anyhow!("campaign custody helper {action} failed: {code}")
+    }
+}
+
+#[cfg(unix)]
+async fn run_campaign_custody_json<T: serde::Serialize>(
+    action: &str,
+    selector: Option<&str>,
+    request: &T,
+    timeout: Duration,
+) -> Result<Vec<u8>> {
+    let payload = serde_json::to_vec(request)?;
+    if payload.len() > 1024 * 1024 {
+        bail!("campaign custody request exceeds the helper input limit");
+    }
+    let workspace = std::env::current_dir().context("resolve repository root for campaign custody helper")?;
+    let mut command = Command::new("npx");
+    command
+        .current_dir(workspace)
+        .args(["--no-install", "tsx", "projects/arrowcol-oat/aks-campaign.ts", action])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .kill_on_drop(true);
+    if let Some(selector) = selector {
+        command.arg(selector);
+    }
+    let output = match tokio::time::timeout(timeout, async {
+        let mut child = command.spawn().context("start campaign custody helper")?;
+        let pid = i32::try_from(child.id().context("campaign custody helper PID unavailable")?)
+            .context("campaign custody helper PID invalid")?;
+        let _group =
+            OwnedQapHelperGroup(rustix::process::Pid::from_raw(pid).context("campaign custody helper PID invalid")?);
+        let mut stdin = child.stdin.take().context("open campaign custody helper input")?;
+        stdin
+            .write_all(&payload)
+            .await
+            .context("write campaign custody request")?;
+        drop(stdin);
+        child
+            .wait_with_output()
+            .await
+            .context("wait for campaign custody helper")
+    })
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) if matches!(action, "cleanup-step" | "capture-cell-baseline") => {
+            bail!("campaign {action} helper timed out; effect outcome is UNKNOWN and must not be replayed")
+        }
+        Err(_) => bail!("campaign inventory helper timed out; no authoritative readback was obtained"),
+    };
+    if !output.status.success() {
+        return Err(campaign_custody_helper_failure(action, &output.stdout));
+    }
+    Ok(output.stdout)
+}
+
+#[cfg(not(unix))]
+async fn run_campaign_custody_json<T: serde::Serialize>(
+    _action: &str,
+    _selector: Option<&str>,
+    _request: &T,
+    _timeout: Duration,
+) -> Result<Vec<u8>> {
+    bail!("campaign custody requires Unix process-group cancellation")
+}
+
+fn validate_campaign_cell_baseline(
+    receipt: &CampaignCellBaselineReceipt,
+    inventory: &RunInventory,
+    identity: &CampaignIdentity,
+    run_id: &str,
+    hot_delta_relative_path: &str,
+) -> Result<()> {
+    validate_campaign_etag(&receipt.etag)?;
+    let expected_blob = format!(
+        "_arrowcol-custody/campaigns/{}/runs/{}/cells/{}/delta-before.json",
+        inventory.campaign_id, inventory.orchestration_run_id, run_id
+    );
+    let planned_binding_count = inventory
+        .qap
+        .as_ref()
+        .filter(|qap| qap.state == InventoryResourceState::Planned)
+        .map(|qap| {
+            qap.bindings
+                .iter()
+                .filter(|binding| binding.relative_path == hot_delta_relative_path)
+                .count()
+        })
+        .unwrap_or(0);
+    if inventory.load_admission != InventoryLoadAdmission::NotAuthorized
+        || planned_binding_count != 1
+        || receipt.status != "captured"
+        || receipt.campaign_id != identity.campaign_id
+        || receipt.owner_id != identity.owner_id
+        || receipt.fencing_token != identity.fencing_token
+        || receipt.orchestration_run_id != inventory.orchestration_run_id
+        || receipt.cell_run_id != run_id
+        || receipt.namespace_uid != inventory.namespace.uid.as_deref().unwrap_or_default()
+        || receipt.hot_delta_relative_path != hot_delta_relative_path
+        || receipt.blob != expected_blob
+        || !valid_blob_path(&receipt.blob)
+    {
+        bail!("cell baseline receipt does not match the exact campaign, cell, namespace and hot Delta path");
+    }
+    match receipt.delta_state {
+        CampaignDeltaState::Table => {
+            if receipt.table_id.as_deref().is_none_or(str::is_empty)
+                || receipt.delta_version.is_none()
+                || receipt.rows.is_none()
+            {
+                bail!("existing-table baseline requires its exact Delta table ID, version and row count");
+            }
+        }
+        CampaignDeltaState::ObservedAbsent => {
+            if receipt.table_id.is_some() || receipt.delta_version.is_some() || receipt.rows.is_some() {
+                bail!("observed-absent baseline must not invent table identity, version or row count");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_campaign_inventory_identity(
+    inventory: &RunInventory,
+    campaign_id: &str,
+    owner_id: &str,
+    fencing_token: u64,
+    orchestration_run_id: &str,
+    cell_run_id: &str,
+) -> Result<()> {
+    inventory.validate()?;
+    if inventory.campaign_id != campaign_id
+        || inventory.owner_id != owner_id
+        || inventory.fencing_token != fencing_token
+        || inventory.orchestration_run_id != orchestration_run_id
+        || inventory.cell_run_id != cell_run_id
+    {
+        bail!("authoritative campaign inventory identity does not match this OAT cell");
+    }
+    Ok(())
+}
+
+async fn read_authoritative_campaign_inventory(
+    platform: &AksPlatform,
+    identity: &CampaignIdentity,
+    orchestration_run_id: &str,
+    timeout: Duration,
+) -> Result<(RunInventory, String)> {
+    let actor = CampaignCleanupActor {
+        mode: CampaignActorMode::Producer,
+        owner_id: identity.owner_id.clone(),
+        fencing_token: identity.fencing_token,
+    };
+    let request = CampaignInventoryReadRequest {
+        schema_version: 1,
+        campaign_id: &identity.campaign_id,
+        orchestration_run_id,
+        cell_run_id: &platform.run_id,
+        actor: &actor,
+    };
+    let output = run_campaign_custody_json("read-inventory", None, &request, timeout).await?;
+    let response: CampaignInventoryReadResponse =
+        serde_json::from_slice(&output).context("parse authoritative campaign inventory")?;
+    if !response.ok {
+        bail!("campaign inventory read was not positively confirmed");
+    }
+    validate_campaign_etag(&response.etag)?;
+    validate_campaign_inventory_identity(
+        &response.inventory,
+        &identity.campaign_id,
+        &identity.owner_id,
+        identity.fencing_token,
+        orchestration_run_id,
+        &platform.run_id,
+    )?;
+    Ok((response.inventory, response.etag))
+}
+
+fn campaign_cleanup_step<'a>(action: &CampaignCleanupAction, inventory: &'a RunInventory) -> Option<&'a InventoryStep> {
+    match action {
+        CampaignCleanupAction::StopAdmission => Some(&inventory.cleanup.stop_admission),
+        CampaignCleanupAction::BoundedDrain => Some(&inventory.cleanup.bounded_drain),
+        CampaignCleanupAction::EvidenceCapture => Some(&inventory.cleanup.evidence_capture),
+        CampaignCleanupAction::StopMaintenance => Some(&inventory.cleanup.stop_maintenance),
+        CampaignCleanupAction::TerminalCapture => Some(&inventory.cleanup.terminal_capture),
+        CampaignCleanupAction::Handoff => Some(&inventory.cleanup.handoff),
+        CampaignCleanupAction::RemoveNamespace
+        | CampaignCleanupAction::RemoveQap
+        | CampaignCleanupAction::RemoveFic => None,
+    }
+}
+
+fn campaign_cleanup_step_complete(action: &CampaignCleanupAction, inventory: &RunInventory) -> Result<()> {
+    let complete = match action {
+        CampaignCleanupAction::StopAdmission => inventory.cleanup.stop_admission.state == InventoryStepState::Complete,
+        CampaignCleanupAction::BoundedDrain => inventory.cleanup.bounded_drain.state == InventoryStepState::Complete,
+        CampaignCleanupAction::EvidenceCapture => {
+            inventory.cleanup.evidence_capture.state == InventoryStepState::Complete
+        }
+        CampaignCleanupAction::StopMaintenance => {
+            inventory.cleanup.stop_maintenance.state == InventoryStepState::Complete
+        }
+        CampaignCleanupAction::TerminalCapture => {
+            inventory.cleanup.terminal_capture.state == InventoryStepState::Complete
+        }
+        CampaignCleanupAction::RemoveNamespace => inventory.resources.iter().all(|resource| {
+            matches!(
+                resource.state,
+                InventoryResourceState::Removed | InventoryResourceState::Absent
+            )
+        }),
+        CampaignCleanupAction::RemoveQap => inventory.qap.as_ref().is_none_or(|qap| {
+            matches!(
+                qap.state,
+                InventoryResourceState::Removed | InventoryResourceState::Absent
+            )
+        }),
+        CampaignCleanupAction::RemoveFic => inventory.fic.as_ref().is_none_or(|fic| {
+            matches!(
+                fic.state,
+                InventoryResourceState::Removed | InventoryResourceState::Absent
+            )
+        }),
+        CampaignCleanupAction::Handoff => inventory.cleanup.handoff.state == InventoryStepState::Complete,
+    };
+    if !complete {
+        bail!(
+            "campaign cleanup {} lacks authoritative durable completion",
+            action.selector()
+        );
+    }
+    Ok(())
+}
+
+fn campaign_cleanup_action_needs_execution(action: &CampaignCleanupAction, inventory: &RunInventory) -> Result<bool> {
+    if campaign_cleanup_step_complete(action, inventory).is_ok() {
+        return Ok(false);
+    }
+    if let Some(step) = campaign_cleanup_step(action, inventory) {
+        match step.state {
+            InventoryStepState::NotStarted => {}
+            InventoryStepState::Complete => {
+                bail!(
+                    "campaign cleanup {} has incomplete completion evidence",
+                    action.selector()
+                );
+            }
+            InventoryStepState::Pending
+            | InventoryStepState::Running
+            | InventoryStepState::Failed
+            | InventoryStepState::Uncertain => {
+                bail!(
+                    "campaign cleanup {} is already running or unresolved; refusing replay",
+                    action.selector()
+                );
+            }
+        }
+    }
+    let uncertain_resource = match action {
+        CampaignCleanupAction::RemoveNamespace => inventory
+            .resources
+            .iter()
+            .any(|resource| resource.state == InventoryResourceState::Uncertain),
+        CampaignCleanupAction::RemoveQap => inventory
+            .qap
+            .as_ref()
+            .is_some_and(|qap| qap.state == InventoryResourceState::Uncertain),
+        CampaignCleanupAction::RemoveFic => inventory
+            .fic
+            .as_ref()
+            .is_some_and(|fic| fic.state == InventoryResourceState::Uncertain),
+        _ => false,
+    };
+    if uncertain_resource {
+        bail!(
+            "campaign cleanup {} has uncertain resource state; refusing replay",
+            action.selector()
+        );
+    }
+    Ok(true)
+}
+
+const CAMPAIGN_CLEANUP_DEFAULT_TIMEOUT_MS: u64 = 60_000;
+
+fn campaign_cleanup_operation_deadline_ms(
+    action: &CampaignCleanupAction,
+    inventory: &RunInventory,
+    now_unix_ms: u64,
+) -> Result<u64> {
+    // These start-state budgets match the deadlines assigned by mark() in aks-cell-cleanup.ts.
+    let default_timeout_ms = match action {
+        CampaignCleanupAction::StopAdmission => 60_000,
+        CampaignCleanupAction::BoundedDrain | CampaignCleanupAction::StopMaintenance => 120_000,
+        _ => CAMPAIGN_CLEANUP_DEFAULT_TIMEOUT_MS,
+    };
+    let deadline = campaign_cleanup_step(action, inventory)
+        .and_then(|step| step.deadline_unix_ms)
+        .unwrap_or_else(|| now_unix_ms.saturating_add(default_timeout_ms));
+    if deadline <= now_unix_ms {
+        bail!("campaign cleanup {} operation deadline has expired", action.selector());
+    }
+    Ok(deadline)
+}
+
+fn campaign_cleanup_remaining_budget(
+    deadline: tokio::time::Instant,
+    action: &CampaignCleanupAction,
+) -> Result<Duration> {
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        bail!("campaign cleanup {} operation deadline has expired", action.selector());
+    }
+    Ok(remaining)
+}
+
+async fn execute_campaign_cleanup_action(
+    platform: &AksPlatform,
+    identity: &CampaignIdentity,
+    orchestration_run_id: &str,
+    action: &CampaignCleanupAction,
+    inventory: &RunInventory,
+    etag: &str,
+) -> Result<(RunInventory, String, Option<CampaignCleanupReceipt>)> {
+    let mut current_inventory = inventory.clone();
+    let mut current_etag = etag.to_owned();
+    let now_unix_ms = unix_time_ms_u64()?;
+    let deadline_unix_ms = campaign_cleanup_operation_deadline_ms(action, &current_inventory, now_unix_ms)?;
+    let operation_deadline = tokio::time::Instant::now() + Duration::from_millis(deadline_unix_ms - now_unix_ms);
+    let actor = CampaignCleanupActor {
+        mode: CampaignActorMode::Producer,
+        owner_id: identity.owner_id.clone(),
+        fencing_token: identity.fencing_token,
+    };
+    for attempt in 0..MAX_CAMPAIGN_CLEANUP_ATTEMPTS {
+        if !campaign_cleanup_action_needs_execution(action, &current_inventory)? {
+            return Ok((current_inventory, current_etag, None));
+        }
+        validate_campaign_etag(&current_etag)?;
+        let output = {
+            let request = CampaignCleanupRequest {
+                schema_version: 1,
+                inventory: &current_inventory,
+                expected_etag: &current_etag,
+                actor: &actor,
+            };
+            let timeout = campaign_cleanup_remaining_budget(operation_deadline, action)?;
+            run_campaign_custody_json("cleanup-step", Some(action.selector()), &request, timeout).await
+        };
+        let output = match output {
+            Ok(output) => output,
+            Err(error) if error.downcast_ref::<StaleCampaignVersionError>().is_some() => {
+                let timeout = campaign_cleanup_remaining_budget(operation_deadline, action)?;
+                let (refreshed_inventory, refreshed_etag) =
+                    read_authoritative_campaign_inventory(platform, identity, orchestration_run_id, timeout).await?;
+                current_inventory.validate_successor(&refreshed_inventory)?;
+                if refreshed_etag == current_etag {
+                    bail!(
+                        "campaign cleanup {} stale-version refresh returned the unchanged ETag; refusing retry",
+                        action.selector()
+                    );
+                }
+                persist_campaign_inventory_snapshot(platform, &refreshed_inventory, &refreshed_etag).await?;
+                current_inventory = refreshed_inventory;
+                current_etag = refreshed_etag;
+                if !campaign_cleanup_action_needs_execution(action, &current_inventory)? {
+                    return Ok((current_inventory, current_etag, None));
+                }
+                if attempt + 1 == MAX_CAMPAIGN_CLEANUP_ATTEMPTS {
+                    bail!(
+                        "campaign cleanup {} exhausted {} attempts after stale inventory versions",
+                        action.selector(),
+                        MAX_CAMPAIGN_CLEANUP_ATTEMPTS
+                    );
+                }
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let response: CampaignCleanupResponse =
+            serde_json::from_slice(&output).context("parse campaign cleanup receipt")?;
+        if !response.ok {
+            bail!("campaign cleanup {} was not positively confirmed", action.selector());
+        }
+        let receipt = response.receipt;
+        validate_campaign_etag(&receipt.etag)?;
+        if receipt.status != "complete"
+            || receipt.step != action.selector()
+            || receipt.campaign_id != current_inventory.campaign_id
+            || receipt.owner_id != current_inventory.owner_id
+            || receipt.fencing_token != current_inventory.fencing_token
+            || receipt.orchestration_run_id != current_inventory.orchestration_run_id
+            || receipt.cell_run_id != current_inventory.cell_run_id
+            || receipt.namespace_uid != current_inventory.namespace.uid
+            || receipt.actor != actor
+            || receipt.completed_at_unix_ms == 0
+        {
+            bail!(
+                "campaign cleanup {} returned a mismatched or incomplete receipt",
+                action.selector()
+            );
+        }
+        let timeout = campaign_cleanup_remaining_budget(operation_deadline, action)?;
+        let (next_inventory, next_etag) =
+            read_authoritative_campaign_inventory(platform, identity, orchestration_run_id, timeout).await?;
+        if next_etag != receipt.etag {
+            bail!("campaign cleanup receipt ETag does not match authoritative inventory readback");
+        }
+        current_inventory.validate_successor(&next_inventory)?;
+        campaign_cleanup_step_complete(action, &next_inventory)?;
+        persist_campaign_inventory_snapshot(platform, &next_inventory, &next_etag).await?;
+        return Ok((next_inventory, next_etag, Some(receipt)));
+    }
+    bail!(
+        "campaign cleanup {} exhausted {} attempts",
+        action.selector(),
+        MAX_CAMPAIGN_CLEANUP_ATTEMPTS
+    )
+}
+
+async fn persist_campaign_inventory_snapshot(
+    platform: &AksPlatform,
+    inventory: &RunInventory,
+    etag: &str,
+) -> Result<()> {
+    let runtime_dir = platform
+        .runtime_dir
+        .as_deref()
+        .context("campaign runtime directory is not available")?;
+    validate_campaign_etag(etag)?;
+    tokio::fs::write(
+        runtime_dir.join("campaign-inventory.json"),
+        serde_json::to_vec(inventory)?,
+    )
+    .await
+    .context("persist authoritative campaign inventory snapshot")?;
+    tokio::fs::write(runtime_dir.join("campaign-inventory-etag"), etag.as_bytes())
+        .await
+        .context("persist authoritative campaign inventory ETag")?;
+    Ok(())
+}
+
+async fn cleanup_campaign_aks_platform(config: &OatConfig, platform: &AksPlatform) -> Result<Value> {
+    let identity = CampaignIdentity::from_lookup(|name| std::env::var(name).ok())?;
+    let runtime_dir = platform
+        .runtime_dir
+        .as_deref()
+        .context("campaign runtime directory is not available")?;
+    let cached: RunInventory = serde_json::from_slice(
+        &tokio::fs::read(runtime_dir.join("campaign-inventory.json"))
+            .await
+            .context("read persisted campaign inventory")?,
+    )
+    .context("parse persisted campaign inventory")?;
+    let cached_etag = tokio::fs::read_to_string(runtime_dir.join("campaign-inventory-etag"))
+        .await
+        .context("read persisted campaign inventory ETag")?;
+    validate_campaign_etag(cached_etag.trim())?;
+    let orchestration_run_id = cached.orchestration_run_id.clone();
+    validate_campaign_inventory_identity(
+        &cached,
+        &identity.campaign_id,
+        &identity.owner_id,
+        identity.fencing_token,
+        &orchestration_run_id,
+        &platform.run_id,
+    )?;
+    if cached.namespace.name != config.namespace || cached.namespace.owner_token != platform.namespace_owner_token {
+        bail!("persisted campaign inventory does not match the OAT namespace origin");
+    }
+    let (mut inventory, mut etag) =
+        read_authoritative_campaign_inventory(platform, &identity, &orchestration_run_id, Duration::from_secs(60))
+            .await?;
+    cached.validate_successor(&inventory)?;
+    persist_campaign_inventory_snapshot(platform, &inventory, &etag).await?;
+    let actions = [
+        CampaignCleanupAction::StopAdmission,
+        CampaignCleanupAction::BoundedDrain,
+        CampaignCleanupAction::EvidenceCapture,
+        CampaignCleanupAction::StopMaintenance,
+        CampaignCleanupAction::TerminalCapture,
+        CampaignCleanupAction::RemoveNamespace,
+        CampaignCleanupAction::RemoveQap,
+        CampaignCleanupAction::RemoveFic,
+        CampaignCleanupAction::Handoff,
+    ];
+    let mut receipts = Vec::with_capacity(actions.len());
+    for action in actions {
+        if !campaign_cleanup_action_needs_execution(&action, &inventory)? {
+            receipts.push(
+                json!({"step": action.selector(), "status": "already_complete", "source": "authoritative_inventory"}),
+            );
+            continue;
+        }
+        let (next_inventory, next_etag, receipt) =
+            execute_campaign_cleanup_action(platform, &identity, &orchestration_run_id, &action, &inventory, &etag)
+                .await
+                .with_context(|| format!("execute custody cleanup {}", action.selector()))?;
+        inventory = next_inventory;
+        etag = next_etag;
+        if let Some(receipt) = receipt {
+            receipts.push(serde_json::to_value(receipt)?);
+        } else {
+            receipts.push(
+                json!({"step": action.selector(), "status": "already_complete", "source": "authoritative_inventory"}),
+            );
+        }
+    }
+    Ok(json!({"status":"observed", "cleanup_receipts":receipts}))
+}
+
+async fn campaign_inventory_for_setup(platform: &AksPlatform) -> Result<RunInventory> {
+    let runtime_dir = platform
+        .runtime_dir
+        .as_deref()
+        .context("campaign runtime directory is not available")?;
+    let inventory: RunInventory = serde_json::from_slice(
+        &tokio::fs::read(runtime_dir.join("campaign-inventory.json"))
+            .await
+            .context("read persisted campaign inventory for setup")?,
+    )
+    .context("parse persisted campaign inventory for setup")?;
+    let etag = tokio::fs::read_to_string(runtime_dir.join("campaign-inventory-etag"))
+        .await
+        .context("read persisted campaign inventory ETag for setup")?;
+    validate_campaign_etag(etag.trim())?;
+    let identity = CampaignIdentity::from_lookup(|name| std::env::var(name).ok())?;
+    validate_campaign_inventory_identity(
+        &inventory,
+        &identity.campaign_id,
+        &identity.owner_id,
+        identity.fencing_token,
+        &inventory.orchestration_run_id,
+        &platform.run_id,
+    )?;
+    if inventory.namespace.owner_token != platform.namespace_owner_token
+        || inventory.namespace.uid != platform.namespace_uid
+    {
+        bail!("campaign setup inventory does not match the exact namespace owner and UID");
+    }
+    Ok(inventory)
+}
+
+async fn update_campaign_fic_inventory(platform: &AksPlatform, fic: InventoryFic) -> Result<()> {
+    let current = campaign_inventory_for_setup(platform).await?;
+    let mut next = current.clone();
+    next.fic = Some(fic);
+    current.validate_successor(&next)?;
+    persist_campaign_inventory(platform, &next).await
+}
+
+async fn update_campaign_qap_inventory(platform: &AksPlatform, qap: InventoryQap) -> Result<()> {
+    let current = campaign_inventory_for_setup(platform).await?;
+    let mut next = current.clone();
+    next.qap = Some(qap);
+    current.validate_successor(&next)?;
+    persist_campaign_inventory(platform, &next).await
+}
+
+async fn persist_campaign_inventory(platform: &AksPlatform, inventory: &RunInventory) -> Result<()> {
+    let runtime_dir = platform
+        .runtime_dir
+        .as_deref()
+        .context("campaign runtime directory is not available")?;
+    let etag = inventory.publish_to_custody().await?;
+    tokio::fs::write(
+        runtime_dir.join("campaign-inventory.json"),
+        serde_json::to_vec(inventory)?,
+    )
+    .await
+    .context("persist confirmed campaign inventory")?;
+    tokio::fs::write(runtime_dir.join("campaign-inventory-etag"), etag.as_bytes())
+        .await
+        .context("persist confirmed campaign inventory ETag")?;
+    Ok(())
+}
+
+async fn initialize_campaign_inventory(
+    config: &OatConfig,
+    platform: &mut AksPlatform,
+    orchestration_run_id: &str,
+) -> Result<()> {
+    let identity = CampaignIdentity::from_lookup(|name| std::env::var(name).ok())?;
+    platform.namespace_owner_token = identity.owner_id.clone();
+    let account = std::env::var("CAMPAIGN_STORAGE_ACCOUNT")
+        .context("CAMPAIGN_STORAGE_ACCOUNT is required for campaign evidence custody")?;
+    let container = std::env::var("CAMPAIGN_STATE_CONTAINER")
+        .context("CAMPAIGN_STATE_CONTAINER is required for campaign evidence custody")?;
+    let step = || InventoryStep {
+        state: InventoryStepState::NotStarted,
+        deadline_unix_ms: None,
+        reason_code: None,
+    };
+    let inventory = RunInventory {
+        schema_version: 1,
+        campaign_id: identity.campaign_id.clone(),
+        owner_id: identity.owner_id.clone(),
+        fencing_token: identity.fencing_token,
+        orchestration_run_id: orchestration_run_id.to_owned(),
+        cell_run_id: platform.run_id.clone(),
+        load_admission: InventoryLoadAdmission::NotAuthorized,
+        namespace: InventoryNamespace {
+            name: config.namespace.clone(),
+            uid: None,
+            owner_token: identity.owner_id,
+        },
+        resources: Vec::new(),
+        fic: None,
+        qap: None,
+        evidence_destination: Some(InventoryEvidenceDestination {
+            account,
+            container,
+            blob_prefix: format!("campaigns/{}/cells/{}/evidence", identity.campaign_id, platform.run_id),
+        }),
+        cleanup: InventoryCleanup {
+            stop_admission: step(),
+            bounded_drain: step(),
+            evidence_capture: step(),
+            stop_maintenance: step(),
+            terminal_capture: step(),
+            handoff: step(),
+        },
+    };
+    inventory.validate()?;
+    persist_campaign_inventory(platform, &inventory).await
+}
+
+async fn record_campaign_namespace_uid(config: &OatConfig, platform: &AksPlatform) -> Result<()> {
+    if config.campaign_profile != Some(crate::config::CampaignProfile::SingleHotTable) {
+        return Ok(());
+    }
+    let runtime_dir = platform
+        .runtime_dir
+        .as_deref()
+        .context("campaign runtime directory is not available")?;
+    let path = runtime_dir.join("campaign-inventory.json");
+    let current: RunInventory = serde_json::from_slice(
+        &tokio::fs::read(&path)
+            .await
+            .context("read last confirmed campaign inventory")?,
+    )
+    .context("parse last confirmed campaign inventory")?;
+    let uid = platform
+        .namespace_uid
+        .as_deref()
+        .context("created campaign namespace has no UID")?;
+    if current.namespace.name != config.namespace || current.namespace.owner_token != platform.namespace_owner_token {
+        bail!("campaign inventory does not match the created namespace ownership");
+    }
+    if current.namespace.uid.as_deref().is_some_and(|existing| existing != uid) {
+        bail!("campaign namespace UID changed after inventory publication");
+    }
+    let mut next = current.clone();
+    next.namespace.uid = Some(uid.to_owned());
+    current.validate_successor(&next)?;
+    persist_campaign_inventory(platform, &next).await
+}
+
+async fn prepare_aks_platform(
+    config: &OatConfig,
+    platform: &mut AksPlatform,
+    orchestration_run_id: &str,
+) -> Result<()> {
     let parent = std::env::temp_dir().join("arrowcol-oat");
     tokio::fs::create_dir_all(&parent)
         .await
@@ -6634,6 +8006,9 @@ async fn prepare_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
             .context("restrict run-specific AKS runtime directory permissions")?;
     }
     platform.runtime_dir = Some(runtime_dir.clone());
+    if config.campaign_profile == Some(crate::config::CampaignProfile::SingleHotTable) {
+        initialize_campaign_inventory(config, platform, orchestration_run_id).await?;
+    }
 
     let runtime_config_path = PathBuf::from(
         config
@@ -6736,6 +8111,7 @@ async fn prepare_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
         bail!("created AKS namespace is missing this run's ownership label");
     }
     platform.namespace_uid = Some(uid.to_owned());
+    record_campaign_namespace_uid(config, platform).await?;
 
     let service_accounts = identity
         .into_iter()
@@ -6751,7 +8127,41 @@ async fn prepare_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
         .context("rendered workload identity ServiceAccount has no name")?
         .to_owned();
     platform.service_account = Some(service_account.clone());
-    apply_runtime_resources(config, service_accounts).await?;
+    apply_runtime_resources(config, platform, service_accounts).await?;
+    let fic_plan = run_run_fic_plan(
+        &platform.run_id,
+        &config.namespace,
+        &service_account,
+        bootstrap_env_file,
+    )
+    .await?;
+    let fic_plan_path = runtime_dir.join(format!("run-fic-{}-identity-plan.json", platform.run_id));
+    write_private_secret(&fic_plan_path, &serde_json::to_string(&fic_plan)?)
+        .context("persist immutable run-owned workload identity plan")?;
+    if config.campaign_profile == Some(crate::config::CampaignProfile::SingleHotTable) {
+        update_campaign_fic_inventory(
+            platform,
+            InventoryFic {
+                resource_id: Some(fic_plan.resource_id.clone()),
+                name: Some(fic_plan.credential_name.clone()),
+                state: InventoryResourceState::Planned,
+                absence: None,
+                plan: Some(fic_plan.clone()),
+            },
+        )
+        .await?;
+        update_campaign_fic_inventory(
+            platform,
+            InventoryFic {
+                resource_id: Some(fic_plan.resource_id.clone()),
+                name: Some(fic_plan.credential_name.clone()),
+                state: InventoryResourceState::Uncertain,
+                absence: None,
+                plan: Some(fic_plan.clone()),
+            },
+        )
+        .await?;
+    }
     let fic_record = runtime_dir.join(format!("run-fic-{}.json", platform.run_id));
     platform.fic_record_path = Some(fic_record.clone());
     platform.fic_prepare_attempted = true;
@@ -6761,7 +8171,10 @@ async fn prepare_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
         Some(&config.namespace),
         Some(&service_account),
         &fic_record,
-        None,
+        FicHelperOptions {
+            wait_seconds: None,
+            identity_plan_path: Some(&fic_plan_path),
+        },
         bootstrap_env_file,
     )
     .await
@@ -6773,7 +8186,10 @@ async fn prepare_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
         Some(&config.namespace),
         Some(&service_account),
         &fic_record,
-        Some("300"),
+        FicHelperOptions {
+            wait_seconds: Some("300"),
+            identity_plan_path: None,
+        },
         bootstrap_env_file,
     )
     .await
@@ -6785,14 +8201,27 @@ async fn prepare_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
     write_private_secret(&ready_snapshot, &ready_record)
         .context("persist immutable ready run-owned workload identity snapshot")?;
     platform.fic_ready_snapshot_path = Some(ready_snapshot);
-    create_runtime_secrets(config, &secrets_dir).await?;
+    if config.campaign_profile == Some(crate::config::CampaignProfile::SingleHotTable) {
+        update_campaign_fic_inventory(
+            platform,
+            InventoryFic {
+                resource_id: Some(fic_plan.resource_id.clone()),
+                name: Some(fic_plan.credential_name.clone()),
+                state: InventoryResourceState::Observed,
+                absence: None,
+                plan: Some(fic_plan),
+            },
+        )
+        .await?;
+    }
+    create_runtime_secrets(config, platform, &secrets_dir).await?;
 
     let foundation = render_runtime_phase(&runtime_script, &generated_config, "foundation", &runtime_dir).await?;
-    apply_runtime_resources(config, without_identity_resources(foundation)).await?;
+    apply_runtime_resources(config, platform, without_identity_resources(foundation)).await?;
     rollout(config, "arrowcol-sql").await?;
 
     let bootstrap = render_runtime_phase(&runtime_script, &generated_config, "bootstrap", &runtime_dir).await?;
-    apply_runtime_resources(config, without_identity_resources(bootstrap)).await?;
+    apply_runtime_resources(config, platform, without_identity_resources(bootstrap)).await?;
     kubectl(
         config,
         vec![
@@ -6830,9 +8259,9 @@ async fn prepare_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
         .context("validate rendered router YAML with the router config validator")?;
     platform.router_yaml = Some(router_yaml);
     let (catalog, data_plane) = partition_aks_workload_resources(without_identity_resources(workload))?;
-    apply_runtime_resources(config, catalog).await?;
+    apply_runtime_resources(config, platform, catalog).await?;
     rollout(config, "arrowcol-catalog").await?;
-    apply_runtime_resources(config, data_plane).await?;
+    apply_runtime_resources(config, platform, data_plane).await?;
     for name in ["arrowcol", "arrowcol-router"] {
         rollout(config, name).await?;
     }
@@ -6908,13 +8337,54 @@ struct AksHelperConfigPaths<'a> {
     bootstrap_env_file: &'a Path,
 }
 
+#[derive(Clone, Copy)]
+struct FicHelperOptions<'a> {
+    wait_seconds: Option<&'a str>,
+    identity_plan_path: Option<&'a Path>,
+}
+
+async fn run_run_fic_plan(
+    run_id: &str,
+    namespace: &str,
+    service_account: &str,
+    bootstrap_env_file: &Path,
+) -> Result<InventoryFicPlan> {
+    let workspace = std::env::current_dir()?;
+    let script = workspace.join("infra/azure/bootstrap.ts");
+    let stamp_config_path = selected_aks_stamp_config_path(&workspace)?;
+    let mut command = oat_qap_helper_launcher(&script)?;
+    command.args([
+        "plan-run-fic",
+        "--read-only",
+        "--run-id",
+        run_id,
+        "--namespace",
+        namespace,
+        "--service-account",
+        service_account,
+    ]);
+    command.arg("--env-file").arg(bootstrap_env_file);
+    command.arg("--stamp-config").arg(&stamp_config_path);
+    let output = tokio::time::timeout(Duration::from_secs(60), run_oat_qap_helper_output(command))
+        .await
+        .context("run FIC planning exceeded its read-only deadline")??;
+    if !output.status.success() {
+        bail!(
+            "plan-run-fic helper failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    serde_json::from_slice(&output.stdout).context("parse authoritative run FIC plan")
+}
+
 fn run_fic_helper_command(
     operation: &str,
     run_id: &str,
     namespace: Option<&str>,
     service_account: Option<&str>,
     record_path: &Path,
-    wait_seconds: Option<&str>,
+    options: FicHelperOptions<'_>,
     config_paths: AksHelperConfigPaths<'_>,
 ) -> Result<Command> {
     let workspace = std::env::current_dir()?;
@@ -6937,8 +8407,16 @@ fn run_fic_helper_command(
     }
     command.arg("--record");
     command.arg(record_path);
-    if let Some(wait_seconds) = wait_seconds {
+    if let Some(wait_seconds) = options.wait_seconds {
         command.args(["--wait-seconds", wait_seconds]);
+    }
+    match (operation, options.identity_plan_path) {
+        ("prepare-run-fic", Some(path)) => {
+            command.arg("--identity-plan").arg(path);
+        }
+        ("prepare-run-fic", None) => bail!("run FIC preparation requires its persisted identity plan"),
+        (_, Some(_)) => bail!("identity plans are only accepted when preparing a run FIC"),
+        (_, None) => {}
     }
     Ok(command)
 }
@@ -6949,7 +8427,7 @@ async fn run_run_fic_helper(
     namespace: Option<&str>,
     service_account: Option<&str>,
     record_path: &Path,
-    wait_seconds: Option<&str>,
+    options: FicHelperOptions<'_>,
     bootstrap_env_file: &Path,
 ) -> Result<()> {
     let workspace = std::env::current_dir()?;
@@ -6960,7 +8438,7 @@ async fn run_run_fic_helper(
         namespace,
         service_account,
         record_path,
-        wait_seconds,
+        options,
         AksHelperConfigPaths {
             stamp_config_path: &stamp_config_path,
             bootstrap_env_file,
@@ -7086,6 +8564,34 @@ async fn run_oat_qap_helper(
     }
     Ok(())
 }
+async fn run_oat_qap_reference(record_path: &Path, bootstrap_env_file: &Path) -> Result<InventoryQapReference> {
+    let workspace = std::env::current_dir()?;
+    let stamp_config_path = selected_aks_stamp_config_path(&workspace)?;
+    let command = run_oat_qap_helper_command(
+        "oat-qap-reference",
+        "",
+        None,
+        None,
+        None,
+        record_path,
+        AksHelperConfigPaths {
+            stamp_config_path: &stamp_config_path,
+            bootstrap_env_file,
+        },
+    )?;
+    let output = tokio::time::timeout(Duration::from_secs(60), run_oat_qap_helper_output(command))
+        .await
+        .context("QAP reference capture exceeded its deadline")??;
+    if !output.status.success() {
+        bail!(
+            "oat-qap-reference helper failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    serde_json::from_slice(&output.stdout).context("parse immutable QAP reference")
+}
+
 async fn require_nonempty_record(record_path: &Path) -> Result<()> {
     let metadata = tokio::fs::metadata(record_path)
         .await
@@ -7544,10 +9050,264 @@ async fn run_npx_runtime(runtime_script: &Path, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-async fn apply_runtime_resources(config: &OatConfig, resources: Vec<Value>) -> Result<()> {
+fn set_origin_markers(metadata: &mut Value, run_id: &str, owner_token: &str) -> Result<()> {
+    let metadata = metadata
+        .as_object_mut()
+        .context("run-owned Kubernetes metadata must be an object")?;
+    for key in ["labels", "annotations"] {
+        let values = metadata.entry(key).or_insert_with(|| json!({}));
+        let values = values
+            .as_object_mut()
+            .context("run-owned Kubernetes metadata labels and annotations must be objects")?;
+        values.insert("arrowcol-oat/run-id".to_owned(), json!(run_id));
+        values.insert("arrowcol-oat/owner-token".to_owned(), json!(owner_token));
+    }
+    Ok(())
+}
+
+fn stamp_run_origin_markers(
+    resource: &mut Value,
+    expected_namespace: &str,
+    run_id: &str,
+    owner_token: &str,
+) -> Result<()> {
+    let kind = resource
+        .get("kind")
+        .and_then(Value::as_str)
+        .context("run-owned Kubernetes resource has no kind")?
+        .to_owned();
+    let metadata = resource
+        .get("metadata")
+        .and_then(Value::as_object)
+        .context("run-owned Kubernetes resource has no metadata object")?
+        .clone();
+    if metadata.get("namespace").and_then(Value::as_str) != Some(expected_namespace)
+        || metadata.get("name").and_then(Value::as_str).is_none_or(str::is_empty)
+    {
+        bail!("run-owned Kubernetes resource must have its exact namespace and name before apply");
+    }
+    let mut metadata_value = Value::Object(metadata);
+    set_origin_markers(&mut metadata_value, run_id, owner_token)?;
+    resource["metadata"] = metadata_value;
+    if matches!(kind.as_str(), "Deployment" | "StatefulSet" | "DaemonSet" | "Job") {
+        let template_metadata = resource
+            .pointer_mut("/spec/template/metadata")
+            .context("pod-bearing run-owned resource has no pod template metadata")?;
+        set_origin_markers(template_metadata, run_id, owner_token)?;
+    }
+    Ok(())
+}
+
+fn planned_inventory_resource(resource: &Value, namespace: &str) -> Result<InventoryResource> {
+    let api_version = resource
+        .get("apiVersion")
+        .and_then(Value::as_str)
+        .context("resource apiVersion is missing")?;
+    let kind = resource
+        .get("kind")
+        .and_then(Value::as_str)
+        .context("resource kind is missing")?;
+    let metadata = resource.get("metadata").context("resource metadata is missing")?;
+    let resource_namespace = metadata
+        .get("namespace")
+        .and_then(Value::as_str)
+        .context("resource namespace is missing")?;
+    let name = metadata
+        .get("name")
+        .and_then(Value::as_str)
+        .context("resource name is missing")?;
+    if resource_namespace != namespace {
+        bail!("run-owned resource namespace does not match the OAT cell");
+    }
+    let app = metadata
+        .pointer("/labels/app")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let role = if kind == "Job" && app == "arrowcol-oat-client" {
+        InventoryResourceRole::Client
+    } else if name == "delta-maintenance" {
+        InventoryResourceRole::Maintenance
+    } else if name.contains("router") || app.contains("router") {
+        InventoryResourceRole::Router
+    } else {
+        InventoryResourceRole::Collector
+    };
+    Ok(InventoryResource {
+        api_version: api_version.to_owned(),
+        kind: kind.to_owned(),
+        namespace: resource_namespace.to_owned(),
+        name: name.to_owned(),
+        uid: None,
+        role,
+        state: InventoryResourceState::Planned,
+        absence: None,
+    })
+}
+
+fn has_origin_markers(metadata: &Value, run_id: &str, owner_token: &str) -> bool {
+    ["labels", "annotations"].into_iter().all(|field| {
+        metadata.get(field).and_then(Value::as_object).is_some_and(|values| {
+            values.get("arrowcol-oat/run-id").and_then(Value::as_str) == Some(run_id)
+                && values.get("arrowcol-oat/owner-token").and_then(Value::as_str) == Some(owner_token)
+        })
+    })
+}
+
+async fn record_applied_resource_uids(config: &OatConfig, platform: &AksPlatform, resources: &[Value]) -> Result<()> {
+    if config.campaign_profile != Some(crate::config::CampaignProfile::SingleHotTable) {
+        return Ok(());
+    }
+    let payload = serde_json::to_vec(&json!({"apiVersion":"v1", "kind":"List", "items":resources}))?;
+    let output = kubectl(
+        config,
+        vec!["get", "--namespace", &config.namespace, "-f", "-", "-o", "json"],
+        Some(payload),
+    )
+    .await
+    .context("read back exact run-owned Kubernetes resources after apply")?;
+    let response: Value = serde_json::from_str(&output).context("parse applied Kubernetes resource readback")?;
+    let observed = response
+        .get("items")
+        .and_then(Value::as_array)
+        .context("Kubernetes resource readback is not a List")?;
+    if observed.len() != resources.len() {
+        bail!("Kubernetes resource readback did not return every planned identity");
+    }
+    let runtime_dir = platform
+        .runtime_dir
+        .as_deref()
+        .context("campaign runtime directory is not available")?;
+    let inventory_path = runtime_dir.join("campaign-inventory.json");
+    let current: RunInventory = serde_json::from_slice(
+        &tokio::fs::read(&inventory_path)
+            .await
+            .context("read last confirmed campaign inventory")?,
+    )
+    .context("parse last confirmed campaign inventory")?;
+    if current.namespace.uid.as_deref() != platform.namespace_uid.as_deref()
+        || current.namespace.owner_token != platform.namespace_owner_token
+    {
+        bail!("campaign inventory namespace identity changed before resource UID readback");
+    }
+    let mut next = current.clone();
+    let mut seen = BTreeSet::new();
+    for rendered in resources {
+        let planned = planned_inventory_resource(rendered, &config.namespace)?;
+        let identity = (
+            planned.api_version.clone(),
+            planned.kind.clone(),
+            planned.namespace.clone(),
+            planned.name.clone(),
+        );
+        if !seen.insert(identity) {
+            bail!("duplicate run-owned Kubernetes identity in applied resource set");
+        }
+        let actual = observed
+            .iter()
+            .find(|resource| {
+                resource.get("apiVersion").and_then(Value::as_str) == Some(planned.api_version.as_str())
+                    && resource.get("kind").and_then(Value::as_str) == Some(planned.kind.as_str())
+                    && resource.pointer("/metadata/namespace").and_then(Value::as_str)
+                        == Some(planned.namespace.as_str())
+                    && resource.pointer("/metadata/name").and_then(Value::as_str) == Some(planned.name.as_str())
+            })
+            .context("Kubernetes readback identity differs from the planned resource")?;
+        let uid = actual
+            .pointer("/metadata/uid")
+            .and_then(Value::as_str)
+            .context("Kubernetes readback omitted the resource UID")?;
+        if !has_origin_markers(&actual["metadata"], &platform.run_id, &platform.namespace_owner_token) {
+            bail!("Kubernetes readback resource is missing the exact origin markers");
+        }
+        if matches!(
+            planned.kind.as_str(),
+            "Deployment" | "StatefulSet" | "DaemonSet" | "Job"
+        ) && !actual
+            .pointer("/spec/template/metadata")
+            .is_some_and(|metadata| has_origin_markers(metadata, &platform.run_id, &platform.namespace_owner_token))
+        {
+            bail!("Kubernetes readback pod template is missing the exact origin markers");
+        }
+        let stored = next
+            .resources
+            .iter_mut()
+            .find(|resource| {
+                resource.api_version == planned.api_version
+                    && resource.kind == planned.kind
+                    && resource.namespace == planned.namespace
+                    && resource.name == planned.name
+            })
+            .context("planned Kubernetes identity is missing from campaign inventory")?;
+        if stored.state == InventoryResourceState::Removed || stored.state == InventoryResourceState::Absent {
+            bail!("removed Kubernetes identity cannot be applied again");
+        }
+        stored.uid = Some(uid.to_owned());
+        stored.state = InventoryResourceState::Observed;
+    }
+    current.validate_successor(&next)?;
+    persist_campaign_inventory(platform, &next).await
+}
+
+async fn prepare_run_owned_resources(
+    config: &OatConfig,
+    platform: &mut AksPlatform,
+    resources: &mut [Value],
+) -> Result<()> {
+    for resource in resources.iter_mut() {
+        stamp_run_origin_markers(
+            resource,
+            &config.namespace,
+            &platform.run_id,
+            &platform.namespace_owner_token,
+        )?;
+    }
+    if config.campaign_profile != Some(crate::config::CampaignProfile::SingleHotTable) {
+        return Ok(());
+    }
+    let runtime_dir = platform
+        .runtime_dir
+        .as_deref()
+        .context("campaign runtime directory is not available")?;
+    let inventory_path = runtime_dir.join("campaign-inventory.json");
+    let current: RunInventory = serde_json::from_slice(
+        &tokio::fs::read(&inventory_path)
+            .await
+            .context("read last confirmed campaign inventory")?,
+    )
+    .context("parse last confirmed campaign inventory")?;
+    if current.namespace.name != config.namespace
+        || current.namespace.uid.as_deref() != platform.namespace_uid.as_deref()
+        || current.namespace.owner_token != platform.namespace_owner_token
+        || current.cell_run_id != platform.run_id
+    {
+        bail!("campaign inventory does not match the live cell namespace and owner");
+    }
+    let mut next = current.clone();
+    for resource in resources {
+        let planned = planned_inventory_resource(resource, &config.namespace)?;
+        if let Some(existing) = next.resources.iter().find(|item| {
+            item.api_version == planned.api_version && item.kind == planned.kind && item.name == planned.name
+        }) {
+            if existing.role != planned.role {
+                bail!("planned resource identity changed role within the run inventory");
+            }
+        } else {
+            next.resources.push(planned);
+        }
+    }
+    current.validate_successor(&next)?;
+    persist_campaign_inventory(platform, &next).await
+}
+
+async fn apply_runtime_resources(
+    config: &OatConfig,
+    platform: &mut AksPlatform,
+    mut resources: Vec<Value>,
+) -> Result<()> {
     if resources.is_empty() {
         bail!("refusing to apply an empty AKS runtime phase");
     }
+    prepare_run_owned_resources(config, platform, &mut resources).await?;
     let payload = serde_json::to_vec(&serde_json::json!({
         "apiVersion": "v1",
         "kind": "List",
@@ -7560,10 +9320,11 @@ async fn apply_runtime_resources(config: &OatConfig, resources: Vec<Value>) -> R
     )
     .await
     .context("apply run-scoped AKS runtime resources")?;
+    record_applied_resource_uids(config, platform, &resources).await?;
     Ok(())
 }
 
-async fn create_runtime_secrets(config: &OatConfig, secrets_dir: &Path) -> Result<()> {
+async fn create_runtime_secrets(config: &OatConfig, platform: &mut AksPlatform, secrets_dir: &Path) -> Result<()> {
     let secret_specs: [(&str, &[(&str, &str)]); 5] = [
         ("arrowcol-sql-admin", &[("password", "sa-password")]),
         ("arrowcol-sql-runtime", &[("password", "app-password")]),
@@ -7581,9 +9342,16 @@ async fn create_runtime_secrets(config: &OatConfig, secrets_dir: &Path) -> Resul
             .map(|(key, file)| format!("--from-file={key}={}", secrets_dir.join(file).display()))
             .collect::<Vec<_>>();
         arguments.extend(from_files.iter().map(String::as_str));
-        kubectl(config, arguments, None)
+        arguments.extend(["--dry-run=client", "-o", "json"]);
+        let output = kubectl(config, arguments, None)
             .await
-            .with_context(|| format!("create run-scoped Kubernetes Secret {name} from private files"))?;
+            .with_context(|| format!("render run-scoped Kubernetes Secret {name} from private files"))?;
+        let mut secret: Value = serde_json::from_str(&output).context("parse rendered OAT Kubernetes Secret")?;
+        prepare_run_owned_resources(config, platform, std::slice::from_mut(&mut secret)).await?;
+        kubectl(config, vec!["create", "-f", "-"], Some(serde_json::to_vec(&secret)?))
+            .await
+            .with_context(|| format!("create run-scoped Kubernetes Secret {name}"))?;
+        record_applied_resource_uids(config, platform, std::slice::from_ref(&secret)).await?;
     }
     Ok(())
 }
@@ -8065,6 +9833,41 @@ async fn cleanup_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
         }
         platform.router_metrics_url = None;
     }
+    if config.campaign_profile == Some(crate::config::CampaignProfile::SingleHotTable) {
+        match cleanup_campaign_aks_platform(config, platform).await {
+            Ok(evidence) => platform.shutdown_drain_evidence = Some(evidence),
+            Err(error) => {
+                let detail = format!("{error:#}");
+                platform.shutdown_drain_evidence = Some(json!({
+                    "status": "unavailable",
+                    "reason": "custody_cleanup_failed_or_uncertain",
+                    "failure": detail,
+                }));
+                failures.push(format!("custody-managed AKS cleanup failed: {detail}"));
+            }
+        }
+        if let Some(runtime_dir) = platform.runtime_dir.take() {
+            let retention = runtime_evidence_retention(
+                platform.fic_prepare_attempted,
+                platform.fic_record_path.as_deref(),
+                platform.fic_ready_snapshot_path.as_deref(),
+                platform.qap_bind_attempted,
+                platform.qap_record_path.as_deref(),
+                platform.workload_stop_record_path.as_deref(),
+                platform.qap_outcome_unresolved || !failures.is_empty(),
+            );
+            if let Err(error) = apply_runtime_evidence_retention(&runtime_dir, retention).await {
+                failures.push(format!(
+                    "remove private AKS runtime files {}: {error:#}",
+                    runtime_dir.display()
+                ));
+            }
+        }
+        if failures.is_empty() {
+            return Ok(());
+        }
+        return Err(anyhow::anyhow!("AKS cleanup was incomplete: {}", failures.join("; ")));
+    }
     if platform.namespace_created || platform.namespace_create_attempted {
         match kubectl(config, vec!["get", "namespace", &config.namespace, "-o", "json"], None).await {
             Ok(output) => {
@@ -8166,7 +9969,10 @@ async fn cleanup_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
                             None,
                             None,
                             record_path,
-                            None,
+                            FicHelperOptions {
+                                wait_seconds: None,
+                                identity_plan_path: None,
+                            },
                             bootstrap_env_file,
                         ),
                     )
@@ -9331,6 +11137,34 @@ fn platform_host_label(kind: crate::config::OatMode) -> &'static str {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn local_partition_initializer_uses_campaign_table_and_shared_run_root() -> anyhow::Result<()> {
+        let root = std::env::temp_dir().join(format!("oat-partition-root-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root)?;
+        let args = super::local_partition_initializer_args("sqlserver_availability_replica_states", &root)?;
+        assert_eq!(
+            args,
+            [
+                "initialize-local",
+                "--partition-by-ingestion-date",
+                "--table",
+                "telemetry.sqlserver.sqlserver_availability_replica_states",
+                "--dataflow-root",
+                root.to_str().context("temp root is not valid UTF-8")?,
+            ]
+        );
+        assert!(super::local_partition_initializer_args("sqlserver_wait_stats", &root).is_err());
+        assert!(
+            super::local_partition_initializer_args(
+                "sqlserver_availability_replica_states",
+                Path::new("relative/dataflow")
+            )
+            .is_err()
+        );
+        std::fs::remove_dir(&root)?;
+        Ok(())
+    }
+
+    #[test]
     fn rollout_readiness_waits_for_current_generation_and_removal_of_old_replicas() {
         let stale_generation = serde_json::json!({
             "metadata":{"generation":4},"spec":{"replicas":2},
@@ -9527,7 +11361,10 @@ mod tests {
                 Some("arrow-collector-00000000000000000000000000000001"),
                 Some("arrowcol-oat"),
                 Path::new("/tmp/run-fic.json"),
-                None,
+                FicHelperOptions {
+                    wait_seconds: None,
+                    identity_plan_path: (operation == "prepare-run-fic").then_some(Path::new("/tmp/run-fic-plan.json")),
+                },
                 AksHelperConfigPaths {
                     stamp_config_path: Path::new("/tmp/stamp-87513.yaml"),
                     bootstrap_env_file: Path::new("/tmp/oat-private-bootstrap.env"),
@@ -9557,7 +11394,29 @@ mod tests {
                     "{operation} must clear inherited {variable}"
                 );
             }
+            assert_eq!(
+                command.as_std().get_args().any(|arg| arg == "--identity-plan"),
+                operation == "prepare-run-fic"
+            );
         }
+        assert!(
+            run_fic_helper_command(
+                "prepare-run-fic",
+                "00000000-0000-0000-0000-000000000001",
+                Some("oat-test"),
+                Some("arrowcol-oat"),
+                Path::new("/tmp/run-fic.json"),
+                FicHelperOptions {
+                    wait_seconds: None,
+                    identity_plan_path: None,
+                },
+                AksHelperConfigPaths {
+                    stamp_config_path: Path::new("/tmp/stamp-87513.yaml"),
+                    bootstrap_env_file: Path::new("/tmp/oat-private-bootstrap.env"),
+                },
+            )
+            .is_err()
+        );
         Ok(())
     }
 
@@ -9572,6 +11431,7 @@ mod tests {
         for (operation, manifest_path, workload_record_path, workload_stop_record_path) in [
             ("bind-oat-qap", Some(manifest), Some(workload), None),
             ("verify-oat-qap", None, None, None),
+            ("oat-qap-reference", None, None, None),
             ("cleanup-oat-qap", None, None, Some(stop)),
         ] {
             let command = run_oat_qap_helper_command(
@@ -9864,6 +11724,41 @@ mod tests {
     }
 
     #[test]
+    fn run_owned_job_origin_markers_cover_metadata_and_template_without_changing_selectors() -> Result<()> {
+        let mut job = json!({
+            "apiVersion": "batch/v1",
+            "kind": "Job",
+            "metadata": {
+                "name": "oat-run-client-c0",
+                "namespace": "oat-run-1",
+                "labels": {"app": "arrowcol-oat-client"},
+            },
+            "spec": {
+                "selector": {"matchLabels": {"batch.kubernetes.io/controller-uid": "selector-value"}},
+                "template": {
+                    "metadata": {"labels": {"app": "arrowcol-oat-client"}},
+                    "spec": {"containers": []},
+                },
+            },
+        });
+        let selector = job["spec"]["selector"].clone();
+        super::stamp_run_origin_markers(&mut job, "oat-run-1", "run-1", "owner-1")?;
+        for metadata in [&job["metadata"], &job["spec"]["template"]["metadata"]] {
+            for field in ["labels", "annotations"] {
+                assert_eq!(metadata[field]["arrowcol-oat/run-id"], "run-1");
+                assert_eq!(metadata[field]["arrowcol-oat/owner-token"], "owner-1");
+            }
+        }
+        assert_eq!(job["spec"]["selector"], selector);
+        let planned = super::planned_inventory_resource(&job, "oat-run-1")?;
+        assert_eq!(planned.api_version, "batch/v1");
+        assert_eq!(planned.kind, "Job");
+        assert_eq!(planned.name, "oat-run-client-c0");
+        assert_eq!(planned.namespace, "oat-run-1");
+        Ok(())
+    }
+
+    #[test]
     fn campaign_identity_requires_complete_canonical_fenced_context() -> Result<()> {
         let mut values = HashMap::from([
             ("CAMPAIGN_ID", "00000000-0000-0000-0000-000000000001"),
@@ -9887,6 +11782,126 @@ mod tests {
     }
 
     #[test]
+    fn campaign_custody_helper_classifies_pre_effect_staleness_only_for_cleanup() -> Result<()> {
+        let stale = campaign_custody_helper_failure("cleanup-step", br#"{"ok":false,"code":"stale_version"}"#);
+        assert!(stale.downcast_ref::<StaleCampaignVersionError>().is_some());
+        let stale_read = campaign_custody_helper_failure("read-inventory", br#"{"ok":false,"code":"stale_version"}"#);
+        assert!(stale_read.downcast_ref::<StaleCampaignVersionError>().is_none());
+        for code in ["campaign_fenced", "write_outcome_unknown", "invalid_or_storage_error"] {
+            let response = json!({"ok":false,"code":code});
+            let response_bytes = serde_json::to_vec(&response)?;
+            let error = campaign_custody_helper_failure("cleanup-step", &response_bytes);
+            assert!(error.downcast_ref::<StaleCampaignVersionError>().is_none());
+            assert!(error.to_string().contains(code));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn campaign_cell_baseline_matches_the_frozen_envelope_and_absence_contract() -> Result<()> {
+        let step = json!({"state":"not_started","deadline_unix_ms":null,"reason_code":null});
+        let hot_path = "oat-prefix/runs/00000000-0000-0000-0000-000000000004/dataflow/telemetry/sqlserver/sqlserver_availability_replica_states";
+        let inventory: RunInventory = serde_json::from_value(json!({
+            "schema_version":1,
+            "campaign_id":"00000000-0000-0000-0000-000000000001",
+            "owner_id":"00000000-0000-0000-0000-000000000002",
+            "fencing_token":1,
+            "orchestration_run_id":"00000000-0000-0000-0000-000000000003",
+            "cell_run_id":"00000000-0000-0000-0000-000000000004",
+            "load_admission":"not_authorized",
+            "namespace":{"name":"oat-00000000000000000000000000000004","uid":"00000000-0000-0000-0000-000000000005",
+                "owner_token":"00000000-0000-0000-0000-000000000002"},
+            "resources":[{"api_version":"apps/v1","kind":"Deployment","namespace":"oat-00000000000000000000000000000004",
+                "name":"arrowcol","uid":null,"role":"collector","state":"planned"}],
+            "fic":null,
+            "qap":{"database":"OatDatabase","bindings":[{"external_table":"oat_00000000000000000000000000000004_sqlserver_availability_replica_states",
+                "relative_path":hot_path}],"state":"planned","absence":[],"reference":null},
+            "cleanup":{"stop_admission":step,"bounded_drain":step,"evidence_capture":step,
+                "stop_maintenance":step,"terminal_capture":step,"handoff":step}
+        }))?;
+        inventory.validate()?;
+        let identity = CampaignIdentity {
+            campaign_id: inventory.campaign_id.clone(),
+            owner_id: inventory.owner_id.clone(),
+            fencing_token: inventory.fencing_token,
+        };
+        let actor = CampaignCleanupActor {
+            mode: CampaignActorMode::Producer,
+            owner_id: identity.owner_id.clone(),
+            fencing_token: identity.fencing_token,
+        };
+        let request = CampaignCellBaselineRequest {
+            schema_version: 1,
+            campaign_id: &identity.campaign_id,
+            orchestration_run_id: &inventory.orchestration_run_id,
+            cell_run_id: &inventory.cell_run_id,
+            expected_etag: "\"inventory-etag\"",
+            hot_delta_relative_path: hot_path,
+            actor: &actor,
+        };
+        assert_eq!(
+            serde_json::to_value(&request)?,
+            json!({
+                "schema_version":1,
+                "campaign_id":"00000000-0000-0000-0000-000000000001",
+                "orchestration_run_id":"00000000-0000-0000-0000-000000000003",
+                "cell_run_id":"00000000-0000-0000-0000-000000000004",
+                "expected_etag":"\"inventory-etag\"",
+                "hot_delta_relative_path":hot_path,
+                "actor":{"mode":"producer","owner_id":"00000000-0000-0000-0000-000000000002","fencing_token":1}
+            })
+        );
+        let output = json!({"ok":true,"receipt":{
+            "status":"captured","campaign_id":identity.campaign_id,"owner_id":identity.owner_id,
+            "fencing_token":identity.fencing_token,"orchestration_run_id":inventory.orchestration_run_id,
+            "cell_run_id":inventory.cell_run_id,"namespace_uid":"00000000-0000-0000-0000-000000000005",
+            "hot_delta_relative_path":hot_path,"blob":"_arrowcol-custody/campaigns/00000000-0000-0000-0000-000000000001/runs/00000000-0000-0000-0000-000000000003/cells/00000000-0000-0000-0000-000000000004/delta-before.json",
+            "etag":"\"baseline-etag\"","delta_state":"observed_absent","table_id":null,"delta_version":null,"rows":null
+        }});
+        let response: CampaignCellBaselineResponse = serde_json::from_value(output.clone())?;
+        let receipt = response.receipt.context("baseline receipt missing")?;
+        assert!(response.ok);
+        validate_campaign_cell_baseline(&receipt, &inventory, &identity, &inventory.cell_run_id, hot_path)?;
+        let mut loss_shaped_absence = output;
+        loss_shaped_absence["receipt"]["rows"] = json!(0);
+        let response: CampaignCellBaselineResponse = serde_json::from_value(loss_shaped_absence)?;
+        let receipt = response.receipt.context("baseline receipt missing")?;
+        assert!(
+            validate_campaign_cell_baseline(&receipt, &inventory, &identity, &inventory.cell_run_id, hot_path).is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn campaign_cleanup_preserves_the_approved_maintenance_and_evidence_order() {
+        let actions = [
+            CampaignCleanupAction::StopAdmission,
+            CampaignCleanupAction::BoundedDrain,
+            CampaignCleanupAction::EvidenceCapture,
+            CampaignCleanupAction::StopMaintenance,
+            CampaignCleanupAction::TerminalCapture,
+            CampaignCleanupAction::RemoveNamespace,
+            CampaignCleanupAction::RemoveQap,
+            CampaignCleanupAction::RemoveFic,
+            CampaignCleanupAction::Handoff,
+        ];
+        assert_eq!(
+            actions.map(|action| action.selector()),
+            [
+                "stop_admission",
+                "bounded_drain",
+                "evidence_capture",
+                "stop_maintenance",
+                "terminal_capture",
+                "remove_namespace",
+                "remove_qap",
+                "remove_fic",
+                "handoff",
+            ]
+        );
+    }
+
+    #[test]
     fn custody_inventory_never_replaces_exact_ownership_or_accepts_unknown_observations() -> Result<()> {
         let step = json!({"state":"not_started","deadline_unix_ms":null,"reason_code":null});
         let mut inventory: RunInventory = serde_json::from_value(json!({
@@ -9896,6 +11911,7 @@ mod tests {
             "fencing_token":1,
             "orchestration_run_id":"00000000-0000-0000-0000-000000000003",
             "cell_run_id":"00000000-0000-0000-0000-000000000004",
+            "load_admission":"not_authorized",
             "namespace":{"name":"oat-00000000000000000000000000000004", "uid":null,
                 "owner_token":"00000000-0000-0000-0000-000000000002"},
             "resources":[{"api_version":"apps/v1","kind":"Deployment",
@@ -9903,9 +11919,151 @@ mod tests {
                 "uid":null,"role":"collector","state":"planned"}],
             "fic":null,"qap":null,
             "cleanup":{"stop_admission":step,"bounded_drain":step,"evidence_capture":step,
-                "terminal_capture":step,"handoff":step}
+                "stop_maintenance":step,"terminal_capture":step,"handoff":step}
         }))?;
+        let mut legacy_schema = serde_json::to_value(&inventory)?;
+        legacy_schema["cleanup"]
+            .as_object_mut()
+            .context("serialized cleanup object missing")?
+            .remove("stop_maintenance");
+        assert!(serde_json::from_value::<RunInventory>(legacy_schema).is_err());
+        let mut legacy_admission = serde_json::to_value(&inventory)?;
+        legacy_admission
+            .as_object_mut()
+            .context("serialized inventory object missing")?
+            .remove("load_admission");
+        assert!(serde_json::from_value::<RunInventory>(legacy_admission).is_err());
         inventory.validate()?;
+        let mut authorization_pending = inventory.clone();
+        authorization_pending.load_admission = InventoryLoadAdmission::AuthorizationPending;
+        inventory.validate_successor(&authorization_pending)?;
+        let mut authorized = authorization_pending.clone();
+        authorized.load_admission = InventoryLoadAdmission::Authorized;
+        authorization_pending.validate_successor(&authorized)?;
+        assert!(inventory.validate_successor(&authorized).is_err());
+        assert!(authorized.validate_successor(&authorization_pending).is_err());
+        assert!(campaign_cleanup_action_needs_execution(
+            &CampaignCleanupAction::StopAdmission,
+            &inventory
+        )?);
+        assert_eq!(
+            campaign_cleanup_operation_deadline_ms(&CampaignCleanupAction::StopAdmission, &inventory, 1_000)?,
+            61_000
+        );
+        let mut declared_deadline = inventory.clone();
+        declared_deadline.cleanup.bounded_drain.deadline_unix_ms = Some(5_000);
+        assert_eq!(
+            campaign_cleanup_operation_deadline_ms(&CampaignCleanupAction::BoundedDrain, &declared_deadline, 1_000)?,
+            5_000
+        );
+        let mut expired_deadline = inventory.clone();
+        expired_deadline.cleanup.stop_admission.deadline_unix_ms = Some(61_000);
+        assert!(
+            campaign_cleanup_operation_deadline_ms(&CampaignCleanupAction::StopAdmission, &expired_deadline, 61_000)
+                .is_err()
+        );
+        for state in [
+            InventoryStepState::Pending,
+            InventoryStepState::Running,
+            InventoryStepState::Failed,
+            InventoryStepState::Uncertain,
+        ] {
+            let mut unresolved = inventory.clone();
+            unresolved.cleanup.stop_admission.state = state;
+            assert!(
+                campaign_cleanup_action_needs_execution(&CampaignCleanupAction::StopAdmission, &unresolved).is_err()
+            );
+        }
+        let mut complete_step = inventory.clone();
+        complete_step.cleanup.stop_admission.state = InventoryStepState::Complete;
+        assert!(!campaign_cleanup_action_needs_execution(
+            &CampaignCleanupAction::StopAdmission,
+            &complete_step
+        )?);
+        let mut uncertain_resource = inventory.clone();
+        uncertain_resource.resources[0].state = InventoryResourceState::Uncertain;
+        assert!(
+            campaign_cleanup_action_needs_execution(&CampaignCleanupAction::RemoveNamespace, &uncertain_resource)
+                .is_err()
+        );
+        validate_campaign_etag("\\\"strong-etag\\\"")?;
+        assert!(validate_campaign_etag("W/\"weak-etag\"").is_err());
+        assert!(validate_campaign_etag("*").is_err());
+        let actor = CampaignCleanupActor {
+            mode: CampaignActorMode::Producer,
+            owner_id: inventory.owner_id.clone(),
+            fencing_token: inventory.fencing_token,
+        };
+        let read_request = serde_json::to_value(CampaignInventoryReadRequest {
+            schema_version: 1,
+            campaign_id: &inventory.campaign_id,
+            orchestration_run_id: &inventory.orchestration_run_id,
+            cell_run_id: &inventory.cell_run_id,
+            actor: &actor,
+        })?;
+        let read_fields = read_request
+            .as_object()
+            .context("read request is not an object")?
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            read_fields,
+            BTreeSet::from([
+                "schema_version",
+                "campaign_id",
+                "orchestration_run_id",
+                "cell_run_id",
+                "actor",
+            ])
+        );
+        assert_eq!(read_request["actor"]["mode"], "producer");
+        let cleanup_request = serde_json::to_value(CampaignCleanupRequest {
+            schema_version: 1,
+            inventory: &inventory,
+            expected_etag: "\"versioned-etag\"",
+            actor: &actor,
+        })?;
+        let cleanup_fields = cleanup_request
+            .as_object()
+            .context("cleanup request is not an object")?
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            cleanup_fields,
+            BTreeSet::from(["schema_version", "inventory", "expected_etag", "actor"])
+        );
+        assert_eq!(
+            cleanup_request["inventory"]["cleanup"]["stop_maintenance"]["state"],
+            "not_started"
+        );
+        let receipt = CampaignCleanupReceipt {
+            status: "complete".to_owned(),
+            step: "stop_maintenance".to_owned(),
+            campaign_id: inventory.campaign_id.clone(),
+            owner_id: inventory.owner_id.clone(),
+            fencing_token: inventory.fencing_token,
+            orchestration_run_id: inventory.orchestration_run_id.clone(),
+            cell_run_id: inventory.cell_run_id.clone(),
+            namespace_uid: None,
+            actor: actor.clone(),
+            completed_at_unix_ms: 1_000,
+            etag: "\"receipt-etag\"".to_owned(),
+        };
+        let mut receipt_without_namespace_uid = serde_json::to_value(receipt)?;
+        receipt_without_namespace_uid
+            .as_object_mut()
+            .context("receipt is not an object")?
+            .remove("namespace_uid");
+        assert!(serde_json::from_value::<CampaignCleanupReceipt>(receipt_without_namespace_uid).is_err());
+        let mut missing_stop_deadline = inventory.clone();
+        missing_stop_deadline.cleanup.stop_maintenance.state = InventoryStepState::Running;
+        assert!(missing_stop_deadline.validate().is_err());
+        missing_stop_deadline.cleanup.stop_maintenance.deadline_unix_ms = Some(0);
+        assert!(missing_stop_deadline.validate().is_err());
+        missing_stop_deadline.cleanup.stop_maintenance.deadline_unix_ms = Some(1_000);
+        missing_stop_deadline.validate()?;
         let mut wrong_owner = inventory.clone();
         wrong_owner.namespace.owner_token = "00000000-0000-0000-0000-000000000005".to_owned();
         assert!(wrong_owner.validate().is_err());
@@ -10000,9 +12158,14 @@ mod tests {
         complete.cleanup.stop_admission.state = InventoryStepState::Complete;
         complete.cleanup.bounded_drain.state = InventoryStepState::Complete;
         complete.cleanup.evidence_capture.state = InventoryStepState::Complete;
+        complete.cleanup.stop_maintenance.state = InventoryStepState::Complete;
         complete.cleanup.terminal_capture.state = InventoryStepState::Complete;
         assert!(complete.validate().is_err());
         complete.resources = absent.resources.clone();
+        complete.validate()?;
+        complete.cleanup.stop_maintenance.state = InventoryStepState::NotStarted;
+        assert!(complete.validate().is_err());
+        complete.cleanup.stop_maintenance.state = InventoryStepState::Complete;
         complete.validate()?;
         let mut invalid_external = external.clone();
         invalid_external

@@ -389,6 +389,128 @@ fn maintenance_compaction_debt(value: &Value, failed: bool) -> Result<Option<Mai
     Ok(Some(debt))
 }
 
+fn deserialize_present_due_work_option<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    <Option<T> as serde::Deserialize>::deserialize(deserializer)
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct MaintenanceDueWorkEvidence {
+    observed_at_ms: i64,
+    source: MaintenanceDueWorkSource,
+    completeness: MaintenanceDueWorkCompleteness,
+    unit: MaintenanceDueWorkUnit,
+#[serde(deserialize_with = "deserialize_present_due_work_option")]
+    due: Option<bool>,
+#[serde(deserialize_with = "deserialize_present_due_work_option")]
+    eligible_count: Option<u64>,
+#[serde(deserialize_with = "deserialize_present_due_work_option")]
+    eligible_bytes: Option<u64>,
+#[serde(deserialize_with = "deserialize_present_due_work_option")]
+    backlog_count: Option<u64>,
+#[serde(deserialize_with = "deserialize_present_due_work_option")]
+    backlog_bytes: Option<u64>,
+#[serde(deserialize_with = "deserialize_present_due_work_option")]
+    oldest_eligible_timestamp_ms: Option<i64>,
+#[serde(deserialize_with = "deserialize_present_due_work_option")]
+    oldest_timestamp_basis: Option<MaintenanceOldestTimestampBasis>,
+#[serde(deserialize_with = "deserialize_present_due_work_option")]
+    incomplete_reason: Option<MaintenanceDueWorkIncompleteReason>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum MaintenanceDueWorkSource {
+    SnapshotActiveFiles,
+    BoundedPhysicalInventory,
+    BoundedTombstoneReplay,
+    CheckpointLogInventory,
+    BoundedLogInventory,
+    VerifiedPruneProof,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum MaintenanceDueWorkCompleteness {
+    Complete,
+    Incomplete,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum MaintenanceDueWorkUnit {
+    ParquetFiles,
+    Tombstones,
+    Commits,
+    LogObjects,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum MaintenanceOldestTimestampBasis {
+    IngestionPartitionStart,
+    DeltaRemoveTimestamp,
+    LogObjectLastModified,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum MaintenanceDueWorkIncompleteReason {
+    ActiveFileLimit,
+    PhysicalListingLimit,
+    LogListingLimit,
+    MalformedPartition,
+    UnsupportedLayout,
+    MissingCheckpointProof,
+    UndatedTombstones,
+    StaleIdentity,
+    OperationFailed,
+    Cancelled,
+}
+
+fn maintenance_due_work(value: &Value) -> Result<Option<MaintenanceDueWorkEvidence>> {
+    let Some(report) = value.get("report") else {
+        return Ok(None);
+    };
+    if value.get("error").is_some_and(|error| !error.is_null())
+        || value.get("error_kind").is_some_and(|error| !error.is_null())
+        || report.get("interrupted") == Some(&Value::Bool(true))
+        || report.get("outcome").and_then(Value::as_str) == Some("partial")
+    {
+        return Ok(None);
+    }
+    let Some(raw) = report.get("maintenance_due_work") else {
+        return Ok(None);
+    };
+    if raw.is_null() {
+        return Ok(None);
+    }
+    let evidence: MaintenanceDueWorkEvidence =
+        serde_json::from_value(raw.clone()).context("invalid maintenance due-work evidence")?;
+    let incomplete = evidence.completeness == MaintenanceDueWorkCompleteness::Incomplete;
+    if evidence.observed_at_ms <= 0
+        || incomplete != evidence.incomplete_reason.is_some()
+        || (incomplete
+            && (evidence.due.is_some()
+                || evidence.eligible_count.is_some()
+                || evidence.eligible_bytes.is_some()
+                || evidence.backlog_count.is_some()
+                || evidence.backlog_bytes.is_some()))
+        || (evidence.eligible_count == Some(0) && evidence.due != Some(false))
+        || evidence.backlog_count.zip(evidence.eligible_count).is_some_and(|(backlog, eligible)| backlog > eligible)
+        || evidence.backlog_bytes.zip(evidence.eligible_bytes).is_some_and(|(backlog, eligible)| backlog > eligible)
+        || evidence.oldest_eligible_timestamp_ms.is_some() != evidence.oldest_timestamp_basis.is_some()
+        || evidence.oldest_eligible_timestamp_ms.is_some_and(|time| time > evidence.observed_at_ms)
+    {
+        bail!("maintenance due-work completeness, counts, or timestamp provenance is inconsistent");
+    }
+    Ok(Some(evidence))
+}
+
 fn maintenance_table_evidence(config: &OatConfig, text: &str) -> Result<Value> {
     let mut tables = serde_json::Map::new();
     for line in text
@@ -494,8 +616,10 @@ fn maintenance_table_evidence(config: &OatConfig, text: &str) -> Result<Value> {
             reports.remove(0);
             dropped += 1;
         }
+        let due_work = maintenance_due_work(&value)?;
         reports.push(json!({
             "table": table, "operation": value["operation"], "negative_probe": value["negative_probe"].as_bool(),
+            "maintenance_due_work": due_work,
             "mutation_mode": if value["applied"] == true { "apply_authorized_not_proof_of_mutation" } else { "dry_run_predicted_not_applied" },
             "operation_failed": operation_failed, "error_kind": error_kind,
             "compaction_debt": maintenance_compaction_debt(&value, operation_failed)?,
@@ -563,6 +687,39 @@ mod maintenance_topology_tests {
     }
 
     #[test]
+    fn maintenance_due_work_requires_a_complete_operation_result() -> Result<()> {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/maintenance-operation-results.json"
+        ))?;
+        let operation_results = fixture["operation_results"]
+            .as_array()
+            .context("serde fixture omitted operation_results")?;
+        assert_eq!(operation_results.len(), 5);
+        for result in operation_results {
+            let evidence = maintenance_due_work(result)?
+                .context("complete serialized operation result lost due-work evidence")?;
+            assert_eq!(evidence.completeness, MaintenanceDueWorkCompleteness::Complete);
+            assert_eq!(evidence.due, Some(false));
+        }
+
+        let cases = fixture["qualification_cases"]
+            .as_array()
+            .context("serde fixture omitted qualification_cases")?;
+        assert_eq!(cases.len(), 5);
+        for case in cases {
+            let result = case.get("result").context("qualification case omitted result")?;
+            match case["expected_eligibility"].as_str() {
+                Some("complete") => {
+                    assert!(maintenance_due_work(result)?.is_some());
+                }
+                Some("unknown") => assert!(maintenance_due_work(result)?.is_none()),
+                other => bail!("unexpected fixture eligibility: {other:?}"),
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn maintenance_readback_converts_units_without_truncation_and_preserves_table_overrides() -> Result<()> {
         let mut config: OatConfig = serde_json::from_str(include_str!(
             "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
@@ -607,6 +764,7 @@ mod maintenance_topology_tests {
             "report":{"files_added":2,"rows_added":257,"outputs":["private-object-path"]},"duration_ms":12});
         let reports = maintenance_table_evidence(&config, &format!("{text}{report}\n"))?;
         assert!(reports["operation_reports"][0]["compaction_debt"].is_null());
+        assert!(reports["operation_reports"][0]["maintenance_due_work"].is_null());
         assert_eq!(
             reports["operation_reports"][0]["consumer_reported_counts"]["rows_added"],
             257
@@ -616,6 +774,50 @@ mod maintenance_topology_tests {
             "dry_run_predicted_not_applied"
         );
         assert!(!reports.to_string().contains("private-object-path"));
+        let due_work = json!({
+            "observed_at_ms": 1700000000000_i64,
+            "source": "snapshot_active_files",
+            "completeness": "complete",
+            "unit": "parquet_files",
+            "due": false,
+            "eligible_count": 0,
+            "eligible_bytes": 0,
+            "backlog_count": 0,
+            "backlog_bytes": 0,
+            "oldest_eligible_timestamp_ms": null,
+            "oldest_timestamp_basis": null,
+            "incomplete_reason": null
+        });
+        let mut due_report = report.clone();
+        due_report["report"]["maintenance_due_work"] = due_work.clone();
+        let due = maintenance_table_evidence(&config, &format!("{text}{due_report}\n"))?;
+        assert_eq!(due["operation_reports"][0]["maintenance_due_work"], due_work);
+        let mut incomplete = due_work.clone();
+        incomplete["completeness"] = json!("incomplete");
+        incomplete["due"] = Value::Null;
+        incomplete["eligible_count"] = Value::Null;
+        incomplete["eligible_bytes"] = Value::Null;
+        incomplete["backlog_count"] = Value::Null;
+        incomplete["backlog_bytes"] = Value::Null;
+        incomplete["incomplete_reason"] = json!("active_file_limit");
+        incomplete["oldest_eligible_timestamp_ms"] = json!(1699999999000_i64);
+        incomplete["oldest_timestamp_basis"] = json!("ingestion_partition_start");
+        due_report["report"]["maintenance_due_work"] = incomplete.clone();
+        let due = maintenance_table_evidence(&config, &format!("{text}{due_report}\n"))?;
+        assert_eq!(due["operation_reports"][0]["maintenance_due_work"]["eligible_count"], Value::Null);
+        assert_eq!(due["operation_reports"][0]["maintenance_due_work"]["oldest_eligible_timestamp_ms"], 1699999999000_i64);
+        due_report["report"]["maintenance_due_work"]["incomplete_reason"] = Value::Null;
+        assert!(maintenance_table_evidence(&config, &format!("{text}{due_report}\n")).is_err());
+        due_report["report"]["maintenance_due_work"] = due_work.clone();
+        due_report["report"]["maintenance_due_work"]["due"] = json!(true);
+        assert!(maintenance_table_evidence(&config, &format!("{text}{due_report}\n")).is_err());
+        due_report["report"]["maintenance_due_work"] = due_work.clone();
+        due_report["report"]["maintenance_due_work"]["source"] = json!("unknown_source");
+        assert!(maintenance_table_evidence(&config, &format!("{text}{due_report}\n")).is_err());
+        due_report["report"]["maintenance_due_work"] = due_work.clone();
+        due_report["report"]["maintenance_due_work"].as_object_mut().context("due-work fixture is not an object")?
+            .remove("eligible_bytes");
+        assert!(maintenance_table_evidence(&config, &format!("{text}{due_report}\n")).is_err());
         let mut debt_report = report.clone();
         debt_report["report"]["compaction_debt"] = json!({
             "observed_at_ms": 1700000000000_i64, "source": "snapshot_active_files",
@@ -635,6 +837,7 @@ mod maintenance_topology_tests {
         failed["error"] = json!("private operation error");
         let failure_evidence = maintenance_table_evidence(&config, &format!("{text}{failed}\n"))?;
         assert_eq!(failure_evidence["operation_outcomes"]["error_count"], 1);
+        assert!(failure_evidence["operation_reports"][0]["maintenance_due_work"].is_null());
         assert_eq!(
             failure_evidence["operation_outcomes"]["error_kind_counts"]["commit_budget_exhausted"],
             1
