@@ -16,6 +16,19 @@ mod override_tests {
     use super::*;
 
     #[test]
+    fn file_batch_and_layout_caps_align_with_adaptive_file_target() {
+        let batching = FileBatchConfig::default();
+        let layout = arrow_deltalake::layout::LayoutPolicy::default();
+        assert_eq!(batching.max_rows_per_flush, u64::try_from(layout.max_rows).unwrap());
+        assert_eq!(
+            batching.max_arrow_memory_per_flush,
+            u64::try_from(layout.max_input_bytes).unwrap()
+        );
+        assert_eq!(batching.adaptive_file.target_parquet_bytes, 128 * 1024 * 1024);
+        assert_eq!(batching.adaptive_file.max_input_bytes, 512 * 1024 * 1024);
+    }
+
+    #[test]
     fn nested_override_preserves_yaml_values_and_validates_final_budget() -> Result<(), String> {
         let config = FileBatchConfig {
             max_age: Duration::from_secs(5),
@@ -896,7 +909,7 @@ pub struct FileBatchConfig {
     pub global_capacity: BatchCapacity,
     /// Per-table queued and in-flight capacity.
     pub per_table_capacity: BatchCapacity,
-    /// Maximum logical Arrow bytes in a file.
+    /// Maximum logical Arrow bytes retained per file before flush; not compressed Parquet bytes.
     pub max_arrow_memory_per_flush: u64,
     /// Maximum rows in a file.
     pub max_rows_per_flush: u64,

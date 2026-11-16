@@ -29,12 +29,12 @@ pub struct LayoutPolicy {
 impl Default for LayoutPolicy {
     fn default() -> Self {
         Self {
-            sort_columns: vec!["customer_id".into()],
-            max_rows: 262_144,
-            max_input_bytes: 64 * 1024 * 1024,
+            sort_columns: Vec::new(),
+            max_rows: 1_000_000,
+            max_input_bytes: 512 * 1024 * 1024,
             row_group_rows: 16_384,
             page_rows: 2_048,
-            bloom_columns: vec!["customer_id".into()],
+            bloom_columns: Vec::new(),
         }
     }
 }
@@ -102,7 +102,6 @@ impl LayoutPolicy {
             self.row_group_rows > 0 && self.page_rows > 0,
             "row group and page limits must be positive"
         );
-        ensure!(!self.sort_columns.is_empty(), "at least one sort column is required");
         Ok(())
     }
 
@@ -120,23 +119,28 @@ impl LayoutPolicy {
             .set_statistics_enabled(EnabledStatistics::Page)
             .set_offset_index_disabled(false);
         let descriptor = parquet::arrow::ArrowSchemaConverter::new().convert(schema)?;
-        let sorting = self
-            .sort_columns
-            .iter()
-            .map(|name| {
-                let index = descriptor
-                    .columns()
+        let sorting = if self.sort_columns.is_empty() {
+            None
+        } else {
+            Some(
+                self.sort_columns
                     .iter()
-                    .position(|column| column.path().parts() == [name.as_str()])
-                    .with_context(|| format!("sort column {name} must be a physical scalar column"))?;
-                Ok(SortingColumn {
-                    column_idx: i32::try_from(index)?,
-                    descending: false,
-                    nulls_first: false,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        builder = builder.set_sorting_columns(Some(sorting));
+                    .map(|name| {
+                        let index = descriptor
+                            .columns()
+                            .iter()
+                            .position(|column| column.path().parts() == [name.as_str()])
+                            .with_context(|| format!("sort column {name} must be a physical scalar column"))?;
+                        Ok(SortingColumn {
+                            column_idx: i32::try_from(index)?,
+                            descending: false,
+                            nulls_first: false,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            )
+        };
+        builder = builder.set_sorting_columns(sorting);
         for column in &self.bloom_columns {
             builder = builder
                 .set_column_bloom_filter_enabled(ColumnPath::from(column.as_str()), true)
@@ -216,6 +220,9 @@ impl FileSortBuffer {
         if batch.num_rows() == 0 {
             return Ok(batch);
         }
+        if self.policy.sort_columns.is_empty() {
+            return Ok(batch);
+        }
         let columns = self
             .policy
             .sort_columns
@@ -281,6 +288,22 @@ mod tests {
     }
 
     #[test]
+    fn default_layout_keeps_input_order_without_sorting_metadata() -> Result<()> {
+        let input = batch(vec!["z", "a"], vec![2, 1])?;
+        let policy = LayoutPolicy::default();
+        assert!(policy.sort_columns.is_empty());
+        let properties = policy.writer_properties(&input.schema())?;
+        assert!(properties.sorting_columns().is_none());
+
+        let mut buffer = FileSortBuffer::new(input.schema(), policy)?;
+        assert!(buffer.try_push(&input)?);
+        let output = buffer.finish()?;
+        assert_eq!(output.column(0).as_ref(), input.column(0).as_ref());
+        assert_eq!(output.column(1).as_ref(), input.column(1).as_ref());
+        Ok(())
+    }
+
+    #[test]
     fn budget_backpressures_without_losing_or_retaining_rejected_rows() -> Result<()> {
         let a = batch(vec!["z", "a"], vec![2, 1])?;
         let policy = LayoutPolicy {
@@ -309,6 +332,7 @@ mod tests {
         let policy = LayoutPolicy {
             row_group_rows: 2,
             page_rows: 1,
+            bloom_columns: vec!["customer_id".into()],
             ..LayoutPolicy::default()
         };
         let properties = policy.writer_properties(&a.schema())?;

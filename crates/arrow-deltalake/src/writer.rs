@@ -22,8 +22,6 @@ pub enum Codec {
     Gzip,
     Brotli,
     Zstd,
-    Lz4Raw,
-    Lz4,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -120,13 +118,11 @@ impl ColumnOptions {
         };
         let level = self.compression_level;
         Ok(Some(match codec {
-            Codec::Uncompressed | Codec::Snappy | Codec::Lz4Raw | Codec::Lz4 => {
+            Codec::Uncompressed | Codec::Snappy => {
                 ensure!(level.is_none(), "{codec:?} does not accept a compression level");
                 match codec {
                     Codec::Uncompressed => Compression::UNCOMPRESSED,
                     Codec::Snappy => Compression::SNAPPY,
-                    Codec::Lz4Raw => Compression::LZ4_RAW,
-                    Codec::Lz4 => Compression::LZ4,
                     _ => unreachable!(),
                 }
             }
@@ -583,6 +579,12 @@ mod tests {
         }
         assert!(serde_json::from_str::<ParquetWriterConfig>(r#"{"unknown":1}"#).is_err());
         assert!(serde_json::from_str::<ParquetWriterConfig>(r#"{"defaults":{"encoding":"rle_dictionary"}}"#).is_err());
+        for codec in ["lz4", "lz4_raw"] {
+            assert!(serde_json::from_value::<ParquetWriterConfig>(serde_json::json!({
+                "defaults": {"compression": codec}
+            }))
+            .is_err());
+        }
         let config: ParquetWriterConfig =
             serde_json::from_str(r#"{"columns":{"value":{"encoding":"delta_binary_packed"}}}"#)?;
         assert!(config.writer_properties(&schema(), None, &[]).is_err());
@@ -601,7 +603,7 @@ mod tests {
                 Arc::new(StringArray::from(vec!["repeat"; 4])),
             ],
         )?;
-        for codec in ["uncompressed", "snappy", "gzip", "brotli", "zstd", "lz4_raw", "lz4"] {
+        for codec in ["uncompressed", "snappy", "gzip", "brotli", "zstd"] {
             let config: ParquetWriterConfig = serde_json::from_value(serde_json::json!({
                 "defaults": {"compression": codec},
                 "columns": {"id": {"encoding": "delta_binary_packed", "dictionary_enabled": false}},
