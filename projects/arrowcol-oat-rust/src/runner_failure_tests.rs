@@ -173,6 +173,7 @@ mod failure_evidence_tests {
                 started_at_ms: 1_794_173_400_000,
                 qap: QapMetrics::default(),
                 resources: None,
+                resource_evidence: None,
             },
         )
     }
@@ -277,6 +278,7 @@ mod failure_evidence_tests {
                 started_at_ms: 0,
                 qap: QapMetrics::default(),
                 resources: None,
+                resource_evidence: None,
             },
         )?;
         assert_eq!(rows[0].status, "failed");
@@ -556,6 +558,9 @@ http.createServer((request, response) => {
         config.kubectl_context = None;
         let mut platform = AksPlatform {
             run_id: "00000000-0000-0000-0000-000000000001".to_owned(),
+            resource_readback: Vec::new(),
+            cpu_throttling_start: None,
+            cpu_throttling_evidence: None,
             namespace_created: false,
             namespace_create_attempted: false,
             namespace_owner_token: "test-owner".to_owned(),

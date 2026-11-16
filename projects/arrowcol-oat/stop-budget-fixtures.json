@@ -44,5 +44,13 @@
       "maintenance_grace_seconds": 4805,
       "maintenance_stop_timeout_ms": 5105000
     }
+  },
+  {
+    "name": "under-cleanup-headroom",
+    "validation": {
+      "maintenance_grace_seconds": 4801,
+      "maintenance_stop_timeout_ms": 5100000
+    },
+    "rejected": true
   }
 ]

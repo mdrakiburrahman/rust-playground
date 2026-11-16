@@ -287,7 +287,7 @@ export async function renderRuntime(input: unknown, phase: Phase): Promise<Resou
     ], true),
     deployment('arrowcol', [{
       name: 'dataflow', image: c.images.dataflow, securityContext: security,
-      args: ['--config', '/etc/oat/dataflow.yaml', '--num-cores', '1'],
+      args: ['--config', '/etc/oat/dataflow.yaml', '--num-cores', String(c.collectorWorkers ?? 1)],
       env: [...cloudEnv, env('ARROWCOL_SQL_HOST', 'arrowcol-sql'), env('ARROWCOL_SQL_PASSWORD_FILE', '/run/app/password'),
         env('ARROWCOL_PARTITION_GRANULARITY', c.maintenance?.granularity ?? 'hour'),
         env('ARROWCOL_SQL_TRUST_CERT', 'true'), env('ARROWCOL_CATALOG_ENDPOINT', 'http://arrowcol-catalog:8817'),

@@ -206,7 +206,7 @@ impl AksResourceConfig {
     }
 }
 
-fn parse_cpu_millicores(value: &str) -> Result<u64> {
+pub(crate) fn parse_cpu_millicores(value: &str) -> Result<u64> {
     let parsed = if let Some(milli) = value.strip_suffix('m') {
         if milli.is_empty() || !milli.bytes().all(|byte| byte.is_ascii_digit()) {
             bail!("invalid Kubernetes CPU quantity {value:?}");
@@ -246,7 +246,7 @@ fn parse_cpu_millicores(value: &str) -> Result<u64> {
     Ok(parsed)
 }
 
-fn parse_memory_bytes(value: &str) -> Result<u64> {
+pub(crate) fn parse_memory_bytes(value: &str) -> Result<u64> {
     const UNITS: [(&str, u64); 13] = [
         ("Ei", 1_u64 << 60),
         ("Pi", 1_u64 << 50),
@@ -327,6 +327,7 @@ fn default_collector_stop_grace_seconds() -> u64 {
 }
 
 pub(crate) const SCHEDULE_DELIVERY_TIMEOUT_SECONDS: u64 = 180;
+pub(crate) const AKS_RESOURCE_COUNTER_SNAPSHOT_TIMEOUT_MS: u64 = 5_000;
 pub(crate) const PIN_INIT_SETUP_TIMEOUT_SECONDS: u64 = 180;
 const CLIENT_JOB_CLEANUP_GRACE_SECONDS: u64 = 300;
 const DEFAULT_WAL_RETENTION_SIZE_CAP_BYTES: u64 = 4 * 1024 * 1024 * 1024;
@@ -350,11 +351,18 @@ pub struct EffectiveStopBudgets {
 
 impl EffectiveStopBudgets {
     pub(crate) fn validate(self) -> Result<Self> {
+        let minimum_timeout_ms = self
+            .maintenance_grace_seconds
+            .checked_add(300)
+            .and_then(|seconds| seconds.checked_mul(1_000))
+            .context("effective maintenance cleanup headroom calculation overflow")?;
         if self.maintenance_grace_seconds == 0
-            || self.maintenance_stop_timeout_ms < self.maintenance_grace_seconds.saturating_mul(1_000)
+            || self.maintenance_stop_timeout_ms < minimum_timeout_ms
             || self.maintenance_stop_timeout_ms > 5_100_000
         {
-            bail!("effective maintenance stop budgets are inconsistent or exceed the fixed timeout ceiling");
+            bail!(
+                "effective maintenance stop timeout must cover grace plus 300 seconds and not exceed the fixed timeout ceiling"
+            );
         }
         Ok(self)
     }
@@ -659,12 +667,20 @@ impl OatConfig {
         } else {
             1_260_000
         };
+        let resource_counter_snapshot_budget_ms = if self.platform.kind == OatMode::Aks {
+            AKS_RESOURCE_COUNTER_SNAPSHOT_TIMEOUT_MS
+                .checked_mul(2)
+                .context("OAT AKS resource-counter snapshot budget overflow")?
+        } else {
+            0
+        };
         let after_setup_budget_ms = minimum_pin_ttl_ms
             .checked_add(
                 scale_rollout_count
                     .checked_mul(rollout_timeout_ms)
                     .context("OAT scale rollout budget overflow")?,
             )
+            .and_then(|budget| budget.checked_add(resource_counter_snapshot_budget_ms))
             .context("OAT post-setup cell budget overflow")?;
         let planned_cell_duration_ms = pre_cell_setup_timeout_ms
             .checked_add(after_setup_budget_ms)
@@ -1757,6 +1773,15 @@ mod tests {
         let fixtures: Vec<serde_json::Value> =
             serde_json::from_str(include_str!("../../arrowcol-oat/stop-budget-fixtures.json"))?;
         for fixture in fixtures {
+            if fixture.get("validation").is_some() {
+                let budget: EffectiveStopBudgets = serde_json::from_value(fixture["validation"].clone())?;
+                assert!(
+                    budget.validate().is_err(),
+                    "{} must be rejected by Rust",
+                    fixture["name"]
+                );
+                continue;
+            }
             let mut config = valid();
             let mut maintenance = serde_json::json!({
                 "enabled": true,

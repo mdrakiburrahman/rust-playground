@@ -195,7 +195,8 @@ test('offline CLI selects matching stamp capacity inputs and rejects mismatches 
       namespace: 'arrowcol-oat', oatRunId: '00000000-0000-0000-0000-000000000003',
       workloadIdentityClientId: '00000000-0000-0000-0000-000000000001',
       subscriptionId: '00000000-0000-0000-0000-000000000002', stamp: '89152',
-      deltaRoot: 'abfss://onelake@arrowcollector89152.dfs.core.windows.net/dataflow', images,
+      deltaRoot: 'abfss://onelake@arrowcollector89152.dfs.core.windows.net/dataflow',
+      effective_stop_budgets: { maintenance_grace_seconds: 4_800, maintenance_stop_timeout_ms: 5_100_000 }, images,
     };
     const platform = {
       kind: 'aks', runtime_config_file: resolve(root, 'runtime.json'),

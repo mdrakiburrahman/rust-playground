@@ -8,6 +8,10 @@ const parityFixtures = JSON.parse(readFileSync(new URL('./stop-budget-fixtures.j
 
 test('Rust and TypeScript share derived stop-budget fixtures', () => {
   for (const fixture of parityFixtures) {
+    if ('validation' in fixture) {
+      assert.throws(() => parseEffectiveStopBudgets(fixture.validation), fixture.name);
+      continue;
+    }
     if (fixture.rejected) assert.throws(() => parseEffectiveStopBudgets(fixture.expected), fixture.name);
     else assert.deepEqual(parseEffectiveStopBudgets(fixture.expected), {
       maintenanceGraceSeconds: (fixture.expected as { maintenance_grace_seconds: number }).maintenance_grace_seconds,

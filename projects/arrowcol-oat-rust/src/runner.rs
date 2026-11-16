@@ -1,4 +1,7 @@
-use crate::config::{EffectiveStopBudgets, OatConfig};
+use crate::config::{
+    AKS_RESOURCE_COUNTER_SNAPSHOT_TIMEOUT_MS, EffectiveStopBudgets, OatConfig, ResourceRequirements, ResourceValues,
+    parse_cpu_millicores as parse_resource_cpu_millicores, parse_memory_bytes as parse_resource_memory_bytes,
+};
 use crate::model::{AppState, RunState, unix_time_ms};
 use anyhow::{Context, Result, bail};
 use arrow::array::{
@@ -1049,11 +1052,20 @@ trait Platform: Send + Sync {
     fn shutdown_drain_evidence(&self) -> Option<Value> {
         None
     }
+    fn resource_evidence(&self) -> Option<Value> {
+        None
+    }
+    async fn finish_resource_measurement(&mut self, _config: &OatConfig) -> Result<()> {
+        Ok(())
+    }
     async fn cleanup(&mut self, config: &OatConfig) -> Result<()>;
 }
 
 struct AksPlatform {
     run_id: String,
+    resource_readback: Vec<Value>,
+    cpu_throttling_start: Option<Vec<CpuThrottleSample>>,
+    cpu_throttling_evidence: Option<Value>,
     namespace_created: bool,
     namespace_create_attempted: bool,
     namespace_owner_token: String,
@@ -1163,6 +1175,22 @@ struct LocalPlatform {
 
 #[async_trait::async_trait]
 impl Platform for AksPlatform {
+    fn resource_evidence(&self) -> Option<Value> {
+        Some(json!({
+            "readbacks": self.resource_readback,
+            "cpu_throttling": self.cpu_throttling_evidence,
+        }))
+    }
+
+    async fn finish_resource_measurement(&mut self, config: &OatConfig) -> Result<()> {
+        let end = capture_aks_cpu_throttling(config, &self.resource_readback).await?;
+        self.cpu_throttling_evidence = Some(compare_cpu_throttling(
+            self.cpu_throttling_start.take().as_deref().unwrap_or_default(),
+            &end,
+        ));
+        Ok(())
+    }
+
     fn kind(&self) -> crate::config::OatMode {
         crate::config::OatMode::Aks
     }
@@ -1207,6 +1235,7 @@ impl Platform for AksPlatform {
         for name in config.deployment_names() {
             rollout(config, name).await?;
         }
+        self.resource_readback = aks_deployment_resource_evidence(config).await?;
         Ok(())
     }
 
@@ -1228,6 +1257,19 @@ impl Platform for AksPlatform {
         )
         .await?;
         start_aks_maintenance(config).await?;
+        if maintenance_enabled(config) {
+            let resources = config.effective_aks_resources();
+            self.resource_readback.push(
+                aks_deployment_resource_readback(
+                    config,
+                    "maintenance",
+                    "delta-maintenance",
+                    "maintenance",
+                    &resources.maintenance,
+                )
+                .await?,
+            );
+        }
         verify_maintenance_stop_budget_before_admission(config, self).await
     }
 
@@ -1564,6 +1606,7 @@ impl Platform for AksPlatform {
     }
 
     async fn arm_clients(&mut self, config: &OatConfig, _run_id: &str, run_start_unix_ms: u64) -> Result<()> {
+        self.cpu_throttling_start = Some(capture_aks_cpu_throttling(config, &self.resource_readback).await?);
         let mut configmap = json!({
             "apiVersion": "v1",
             "kind": "ConfigMap",
@@ -2307,6 +2350,8 @@ async fn start_aks_client_job(
         args,
         run_seconds,
     });
+    let client_resources = config.effective_aks_resources().client;
+    configure_client_job_resources(&mut job, &client_resources)?;
     inject_container_environment(
         job.pointer_mut("/spec/template/spec/containers/0")
             .context("AKS client container is missing")?,
@@ -2322,6 +2367,27 @@ async fn start_aks_client_job(
     .await
     .with_context(|| format!("create AKS DMV client Job {job_name}"))?;
     record_applied_resource_uids(config, platform, std::slice::from_ref(&job)).await?;
+    let applied_job_json = kubectl(
+        config,
+        vec!["get", "job", &job_name, "--namespace", &config.namespace, "-o", "json"],
+        None,
+    )
+    .await
+    .context("read applied AKS client Job resource spec")?;
+    let applied_job: Value = serde_json::from_str(&applied_job_json).context("parse applied AKS client Job")?;
+    let job_containers = applied_job
+        .pointer("/spec/template/spec/containers")
+        .and_then(Value::as_array)
+        .context("applied AKS client Job has no containers")?;
+    let job_resources = verify_container_resources(job_containers, "client", "client", &client_resources)?;
+    let pod = wait_for_aks_client_pod_resource_readback(config, &job_name, &client_resources).await?;
+    platform.resource_readback.push(json!({
+        "role": "client",
+        "job": job_name,
+        "requested": client_resources,
+        "effective": {"job_template": job_resources["effective"], "pod": pod["resources"]},
+        "scheduled_pod": {"name": pod["name"], "uid": pod["uid"], "node": pod["node"], "container": "client"},
+    }));
     Ok(ClientHandle {
         client_id: format!("{run_id}:{table}:{client_index}"),
         table: table.to_owned(),
@@ -2439,6 +2505,66 @@ fn build_aks_client_job(spec: AksClientJobSpec<'_>) -> Value {
             },
         },
     })
+}
+
+async fn wait_for_aks_client_pod_resource_readback(
+    config: &OatConfig,
+    job_name: &str,
+    expected: &ResourceRequirements,
+) -> Result<Value> {
+    tokio::time::timeout(Duration::from_secs(config.client_ready_timeout_seconds), async {
+        loop {
+            let pod_json = kubectl(
+                config,
+                vec![
+                    "get",
+                    "pods",
+                    "--namespace",
+                    &config.namespace,
+                    "--selector",
+                    &format!("job-name={job_name}"),
+                    "-o",
+                    "json",
+                ],
+                None,
+            )
+            .await
+            .context("read AKS client pod placement and resource spec")?;
+            let pod_list: Value = serde_json::from_str(&pod_json).context("parse AKS client pod list")?;
+            let pods = pod_list
+                .get("items")
+                .and_then(Value::as_array)
+                .context("AKS client pod list omitted items")?;
+            for pod in pods {
+                let phase = pod.pointer("/status/phase").and_then(Value::as_str);
+                if phase == Some("Failed") {
+                    bail!("AKS client Job pod failed before load authorization");
+                }
+                let Some(node) = pod
+                    .pointer("/spec/nodeName")
+                    .and_then(Value::as_str)
+                    .filter(|node| !node.is_empty())
+                else {
+                    continue;
+                };
+                let metadata = pod.get("metadata").context("AKS client pod metadata is missing")?;
+                let containers = pod
+                    .pointer("/spec/containers")
+                    .and_then(Value::as_array)
+                    .context("AKS client pod has no containers")?;
+                let resources = verify_container_resources(containers, "client", "client", expected)?;
+                return Ok(json!({
+                    "name": metadata.get("name"),
+                    "uid": metadata.get("uid"),
+                    "node": node,
+                    "resources": resources["effective"],
+                }));
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    })
+    .await
+    .context("AKS client pod did not schedule before the configured readiness deadline")?
 }
 
 async fn poll_aks_client_job(config: &OatConfig, handle: &ClientHandle) -> Result<ClientProgress> {
@@ -3114,6 +3240,7 @@ fn finish_matrix_cell(
                         started_at_ms,
                         qap: QapMetrics::default(),
                         resources: None,
+                        resource_evidence: None,
                     },
                 )
             })();
@@ -3193,6 +3320,9 @@ fn platform_for_run(config: &OatConfig, run_id: &str) -> Result<Box<dyn Platform
         crate::config::OatMode::Local => Ok(Box::new(LocalPlatform::new(config, run_id)?)),
         crate::config::OatMode::Aks => Ok(Box::new(AksPlatform {
             run_id: run_id.to_owned(),
+            resource_readback: Vec::new(),
+            cpu_throttling_start: None,
+            cpu_throttling_evidence: None,
             namespace_created: false,
             namespace_create_attempted: false,
             namespace_owner_token: uuid::Uuid::new_v4().to_string(),
@@ -3605,6 +3735,7 @@ async fn run_matrix_cell(
     let baseline_logs = platform.process_logs(config).await?;
     platform.retain_cell_process_baseline(&baseline_logs);
     let mut client_run = run_clients(config, run_id, &assigned_tables, platform).await?;
+    platform.finish_resource_measurement(config).await?;
     let guard_stopped = client_run.evidence.overload_stop.is_some()
         || client_run
             .evidence
@@ -3705,6 +3836,7 @@ async fn run_matrix_cell(
             started_at_ms,
             qap,
             resources: metrics,
+            resource_evidence: platform.resource_evidence(),
         },
     )
 }
@@ -3714,6 +3846,7 @@ struct CellMeasurements {
     started_at_ms: i64,
     qap: QapMetrics,
     resources: Option<ResourceMetrics>,
+    resource_evidence: Option<Value>,
 }
 
 fn result_rows(
@@ -3729,6 +3862,7 @@ fn result_rows(
         started_at_ms,
         qap,
         resources: metrics,
+        resource_evidence,
     } = measurements;
     let assigned_tables = config.tables.clone();
     let client_count = config
@@ -3736,6 +3870,28 @@ fn result_rows(
         .checked_mul(assigned_tables.len())
         .context("OAT client count overflow")?;
     let observed_owners = client_run.pinning.owners.values().collect::<HashSet<_>>().len();
+    let cpu_quota_evidence = if config.platform.kind == crate::config::OatMode::Aks {
+        let requested = config.effective_aks_resources();
+        let collector_limit_millicores = parse_resource_cpu_millicores(&requested.collector.limits.cpu)?;
+        let client_limit_millicores = parse_resource_cpu_millicores(&requested.client.limits.cpu)?;
+        Some(json!({
+            "collector": {
+                "requested_workers": concurrency,
+                "limit_cpu": requested.collector.limits.cpu,
+                "limit_millicores": collector_limit_millicores,
+                "workers_per_cpu_core": f64::from(concurrency) * 1_000.0 / collector_limit_millicores as f64,
+            },
+            "client": {
+                "requested_concurrency_per_process": config.dmv_concurrency,
+                "limit_cpu": requested.client.limits.cpu,
+                "limit_millicores": client_limit_millicores,
+                "concurrency_per_cpu_core": config.dmv_concurrency as f64 * 1_000.0 / client_limit_millicores as f64,
+            },
+            "throttling": {"status": "not_sampled", "reason": "OAT resource sampling does not expose cgroup throttling counters"},
+        }))
+    } else {
+        None
+    };
     let tunables = json!({
         "arrowcols": replicas,
         "clients": client_count,
@@ -3757,6 +3913,8 @@ fn result_rows(
         "effective_stop_budgets": config.maintenance_stop_budget()?,
         "planned_cell_duration_ms": config.timing_budget()?.planned_cell_duration_ms,
         "requested_tunables": serde_json::from_str::<Value>(&config.tunables.canonical_json()?)?,
+        "requested_aks_resources": if config.platform.kind == crate::config::OatMode::Aks { Some(config.effective_aks_resources()) } else { None },
+        "cpu_quota": cpu_quota_evidence,
         "requested_durability_class": config.tunables.wal.as_ref().map(|_| config.tunables.durability_class()),
         "capabilities": capability_evidence(),
     });
@@ -3828,7 +3986,13 @@ fn result_rows(
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or_else(|| "unknown".to_owned()),
             tunables_json: serde_json::to_string(&table_tunables)?,
-            evidence_json: Some(serde_json::to_string(&client_run.evidence.for_table(&table, client))?),
+            evidence_json: {
+                let mut evidence = client_run.evidence.for_table(&table, client);
+                if let Some(resource_evidence) = &resource_evidence {
+                    evidence["aks_resources"] = resource_evidence.clone();
+                }
+                Some(serde_json::to_string(&evidence)?)
+            },
             replicas: u64::from(replicas),
             dfe_worker_concurrency: u64::from(concurrency),
             table,
@@ -7263,6 +7427,11 @@ async fn configure_deployments(config: &OatConfig, replicas: u32, concurrency: u
         }
         if name == config.dfe_deployment {
             configure_workers(&mut desired, &config.dfe_container, concurrency)?;
+            configure_deployment_container_resources(
+                &mut desired,
+                &config.dfe_container,
+                &config.effective_aks_resources().collector,
+            )?;
             desired["spec"]["template"]["spec"]["terminationGracePeriodSeconds"] =
                 json!(config.collector_stop_grace_seconds);
             inject_deployment_environment(
@@ -7275,6 +7444,16 @@ async fn configure_deployments(config: &OatConfig, replicas: u32, concurrency: u
         if name == config.dfe_deployment {
             let applied = deployment(config, name).await?;
             verify_aks_collector_stop_grace(&applied, config.collector_stop_grace_seconds)?;
+            let containers = applied
+                .pointer("/spec/template/spec/containers")
+                .and_then(Value::as_array)
+                .context("applied collector Deployment has no containers")?;
+            verify_container_resources(
+                containers,
+                &config.dfe_container,
+                "collector",
+                &config.effective_aks_resources().collector,
+            )?;
         }
     }
     Ok(())
@@ -10871,6 +11050,455 @@ async fn remove_runtime_dir_except(directory: &Path, preserve: &[PathBuf]) -> Re
     Ok(())
 }
 
+fn configure_client_job_resources(job: &mut Value, requirements: &ResourceRequirements) -> Result<()> {
+    let container = job
+        .pointer_mut("/spec/template/spec/containers/0")
+        .context("AKS client container is missing")?;
+    container["resources"] = serde_json::to_value(requirements)?;
+    Ok(())
+}
+
+fn configure_deployment_container_resources(
+    deployment: &mut Value,
+    container_name: &str,
+    requirements: &ResourceRequirements,
+) -> Result<()> {
+    let containers = deployment
+        .pointer_mut("/spec/template/spec/containers")
+        .and_then(Value::as_array_mut)
+        .context("Deployment has no container list")?;
+    let mut selected = containers
+        .iter_mut()
+        .filter(|container| container.get("name").and_then(Value::as_str) == Some(container_name));
+    let container = selected
+        .next()
+        .with_context(|| format!("container {container_name:?} was not found"))?;
+    if selected.next().is_some() {
+        bail!("container {container_name:?} is ambiguous in Deployment");
+    }
+    container["resources"] = serde_json::to_value(requirements)?;
+    Ok(())
+}
+
+fn verify_container_resources(
+    containers: &[Value],
+    container_name: &str,
+    role: &str,
+    expected: &ResourceRequirements,
+) -> Result<Value> {
+    let mut selected = containers
+        .iter()
+        .filter(|container| container.get("name").and_then(Value::as_str) == Some(container_name));
+    let container = selected
+        .next()
+        .with_context(|| format!("{role} container {container_name:?} is missing"))?;
+    if selected.next().is_some() {
+        bail!("{role} container {container_name:?} is ambiguous");
+    }
+    let resources = container
+        .get("resources")
+        .context("container resource readback is missing")?;
+    let quantity = |side: &str, name: &str| -> Result<String> {
+        resources
+            .pointer(&format!("/{side}/{name}"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .with_context(|| format!("{role} resource readback omitted {side}.{name}"))
+    };
+    let actual = ResourceRequirements {
+        requests: ResourceValues {
+            cpu: quantity("requests", "cpu")?,
+            memory: quantity("requests", "memory")?,
+        },
+        limits: ResourceValues {
+            cpu: quantity("limits", "cpu")?,
+            memory: quantity("limits", "memory")?,
+        },
+    };
+    let quantities_match = parse_resource_cpu_millicores(&actual.requests.cpu)?
+        == parse_resource_cpu_millicores(&expected.requests.cpu)?
+        && parse_cpu_millicores(&actual.limits.cpu)? == parse_cpu_millicores(&expected.limits.cpu)?
+        && parse_resource_memory_bytes(&actual.requests.memory)?
+            == parse_resource_memory_bytes(&expected.requests.memory)?
+        && parse_memory_bytes(&actual.limits.memory)? == parse_memory_bytes(&expected.limits.memory)?;
+    if !quantities_match {
+        bail!("{role} effective pod resource readback differs from requested values");
+    }
+    Ok(json!({"requested": expected, "effective": actual}))
+}
+
+fn deployment_selector(deployment: &Value) -> Result<String> {
+    let labels = deployment
+        .pointer("/spec/selector/matchLabels")
+        .and_then(Value::as_object)
+        .context("Deployment selector.matchLabels is missing")?;
+    let selector = labels
+        .iter()
+        .map(|(key, value)| {
+            value
+                .as_str()
+                .map(|value| format!("{key}={value}"))
+                .context("Deployment selector labels must be strings")
+        })
+        .collect::<Result<Vec<_>>>()?
+        .join(",");
+    anyhow::ensure!(!selector.is_empty(), "Deployment selector must not be empty");
+    Ok(selector)
+}
+
+async fn aks_deployment_resource_readback(
+    config: &OatConfig,
+    role: &str,
+    deployment_name: &str,
+    container_name: &str,
+    expected: &ResourceRequirements,
+) -> Result<Value> {
+    let deployment = deployment(config, deployment_name).await?;
+    let template_containers = deployment
+        .pointer("/spec/template/spec/containers")
+        .and_then(Value::as_array)
+        .context("Deployment pod template has no containers")?;
+    let template = verify_container_resources(template_containers, container_name, role, expected)?;
+    let selector = deployment_selector(&deployment)?;
+    let pod_json = kubectl(
+        config,
+        vec![
+            "get",
+            "pods",
+            "--namespace",
+            &config.namespace,
+            "--selector",
+            &selector,
+            "-o",
+            "json",
+        ],
+        None,
+    )
+    .await
+    .with_context(|| format!("read {role} pod resource and placement readbacks"))?;
+    let pod_list: Value = serde_json::from_str(&pod_json).context("parse resource-readback pod list")?;
+    let pods = pod_list
+        .get("items")
+        .and_then(Value::as_array)
+        .context("resource-readback pod list omitted items")?;
+    let mut scheduled = Vec::new();
+    for pod in pods
+        .iter()
+        .filter(|pod| pod.pointer("/metadata/deletionTimestamp").is_none())
+    {
+        let metadata = pod.get("metadata").context("pod metadata is missing")?;
+        let pod_name = metadata
+            .get("name")
+            .and_then(Value::as_str)
+            .context("pod name is missing")?;
+        let node_name = pod
+            .pointer("/spec/nodeName")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .with_context(|| format!("{role} pod {pod_name} has no scheduled node"))?;
+        let containers = pod
+            .pointer("/spec/containers")
+            .and_then(Value::as_array)
+            .context("pod spec has no containers")?;
+        let resources = verify_container_resources(containers, container_name, role, expected)?;
+        scheduled.push(json!({
+            "pod": pod_name,
+            "uid": metadata.get("uid"),
+            "container": container_name,
+            "node": node_name,
+            "resources": resources["effective"],
+        }));
+    }
+    anyhow::ensure!(
+        !scheduled.is_empty(),
+        "{role} has no active pod with resource and scheduled-node readback"
+    );
+    Ok(json!({
+        "role": role,
+        "deployment": deployment_name,
+        "requested": expected,
+        "effective": {"template": template["effective"], "pods": scheduled},
+    }))
+}
+
+async fn aks_deployment_resource_evidence(config: &OatConfig) -> Result<Vec<Value>> {
+    let resources = config.effective_aks_resources();
+    let evidence = vec![
+        aks_deployment_resource_readback(
+            config,
+            "collector",
+            &config.dfe_deployment,
+            &config.dfe_container,
+            &resources.collector,
+        )
+        .await?,
+        aks_deployment_resource_readback(config, "router", "arrowcol-router", "router", &resources.router).await?,
+        aks_deployment_resource_readback(config, "catalog", "arrowcol-catalog", "catalog", &resources.catalog).await?,
+    ];
+    Ok(evidence)
+}
+
+#[derive(Clone, Debug)]
+struct CpuThrottleCounters {
+    periods: u64,
+    throttled_periods: u64,
+}
+
+#[derive(Clone, Debug)]
+struct CpuThrottleSample {
+    role: String,
+    pod: String,
+    uid: String,
+    container: String,
+    node: String,
+    counters: Option<CpuThrottleCounters>,
+    unavailable_reason: Option<String>,
+}
+
+fn parse_cadvisor_cpu_counters(
+    metrics: &str,
+    namespace: &str,
+    pod: &str,
+    container: &str,
+) -> Result<Option<CpuThrottleCounters>> {
+    let mut periods = None;
+    let mut throttled_periods = None;
+    for line in metrics.lines().filter(|line| !line.starts_with('#')) {
+        let Some((name, remainder)) = line.split_once('{') else {
+            continue;
+        };
+        let Some((labels_text, value_text)) = remainder.split_once('}') else {
+            continue;
+        };
+        let mut labels = HashMap::new();
+        for label in labels_text.split(',') {
+            let Some((key, value)) = label.split_once('=') else {
+                continue;
+            };
+            labels.insert(key.trim(), value.trim().trim_matches('"'));
+        }
+        if labels.get("namespace").copied() != Some(namespace)
+            || labels.get("pod").or_else(|| labels.get("pod_name")).copied() != Some(pod)
+            || labels.get("container").copied() != Some(container)
+        {
+            continue;
+        }
+        let value_text = value_text
+            .split_whitespace()
+            .next()
+            .context("cAdvisor metric value is missing")?;
+        let value = value_text.parse::<f64>().context("cAdvisor counter is not numeric")?;
+        if !value.is_finite() || value < 0.0 || value.fract() != 0.0 || value > u64::MAX as f64 {
+            bail!("cAdvisor throttling counters must be nonnegative integers");
+        }
+        let counter = value as u64;
+        match name {
+            "container_cpu_cfs_periods_total" => {
+                if periods.replace(counter).is_some() {
+                    bail!("cAdvisor returned ambiguous CPU period counters for {pod}/{container}");
+                }
+            }
+            "container_cpu_cfs_throttled_periods_total" => {
+                if throttled_periods.replace(counter).is_some() {
+                    bail!("cAdvisor returned ambiguous throttling counters for {pod}/{container}");
+                }
+            }
+            _ => {}
+        }
+    }
+    match (periods, throttled_periods) {
+        (Some(periods), Some(throttled_periods)) => Ok(Some(CpuThrottleCounters {
+            periods,
+            throttled_periods,
+        })),
+        _ => Ok(None),
+    }
+}
+
+fn aks_resource_pod_targets(readbacks: &[Value]) -> Result<Vec<(String, String, String, String, String)>> {
+    let mut targets = Vec::new();
+    for readback in readbacks {
+        let role = readback
+            .get("role")
+            .and_then(Value::as_str)
+            .context("AKS resource evidence omitted role")?;
+        let mut add_pod = |pod: &Value, pod_field: &str| -> Result<()> {
+            let name = pod
+                .get(pod_field)
+                .and_then(Value::as_str)
+                .context("AKS resource evidence omitted pod name")?;
+            let uid = pod
+                .get("uid")
+                .and_then(Value::as_str)
+                .context("AKS resource evidence omitted pod UID")?;
+            let node = pod
+                .get("node")
+                .and_then(Value::as_str)
+                .context("AKS resource evidence omitted node")?;
+            let container = pod
+                .get("container")
+                .and_then(Value::as_str)
+                .context("AKS resource evidence omitted container")?;
+            targets.push((
+                role.to_owned(),
+                name.to_owned(),
+                uid.to_owned(),
+                container.to_owned(),
+                node.to_owned(),
+            ));
+            Ok(())
+        };
+        if role == "client" {
+            add_pod(
+                readback
+                    .get("scheduled_pod")
+                    .context("client resource evidence omitted scheduled pod")?,
+                "name",
+            )?;
+        } else {
+            for pod in readback
+                .pointer("/effective/pods")
+                .and_then(Value::as_array)
+                .context("AKS resource evidence omitted deployment pods")?
+            {
+                add_pod(pod, "pod")?;
+            }
+        }
+    }
+    Ok(targets)
+}
+
+async fn capture_aks_cpu_throttling(config: &OatConfig, readbacks: &[Value]) -> Result<Vec<CpuThrottleSample>> {
+    let targets = aks_resource_pod_targets(readbacks)?;
+    let nodes = targets.iter().map(|target| target.4.clone()).collect::<BTreeSet<_>>();
+    let scrape = tokio::time::timeout(
+        Duration::from_millis(AKS_RESOURCE_COUNTER_SNAPSHOT_TIMEOUT_MS),
+        join_all(nodes.iter().map(|node| async move {
+            let path = format!("/api/v1/nodes/{node}/proxy/metrics/cadvisor");
+            let result = kubectl(config, vec!["get", "--raw", &path, "--request-timeout=5s"], None).await;
+            (node.clone(), result.map_err(|error| format!("{error:#}")))
+        })),
+    )
+    .await;
+    let node_metrics = match scrape {
+        Ok(results) => results.into_iter().collect::<HashMap<_, _>>(),
+        Err(_) => nodes
+            .iter()
+            .cloned()
+            .map(|node| {
+                (
+                    node,
+                    Err("cAdvisor snapshot exceeded its five-second budget".to_owned()),
+                )
+            })
+            .collect::<HashMap<_, _>>(),
+    };
+    let mut samples = Vec::with_capacity(targets.len());
+    for (role, pod, uid, container, node) in targets {
+        let (counters, unavailable_reason) = match node_metrics.get(&node) {
+            Some(Ok(metrics)) => match parse_cadvisor_cpu_counters(metrics, &config.namespace, &pod, &container) {
+                Ok(Some(counters)) => (Some(counters), None),
+                Ok(None) => (None, Some("cAdvisor cgroup CPU counters are unavailable".to_owned())),
+                Err(error) => (
+                    None,
+                    Some(format!("cAdvisor counters are ambiguous or invalid: {error:#}")),
+                ),
+            },
+            Some(Err(error)) => (None, Some(format!("cAdvisor scrape failed: {error}"))),
+            None => (None, Some("cAdvisor node scrape was not attempted".to_owned())),
+        };
+        samples.push(CpuThrottleSample {
+            role,
+            pod,
+            uid,
+            container,
+            node,
+            counters,
+            unavailable_reason,
+        });
+    }
+    Ok(samples)
+}
+
+fn compare_cpu_throttling(start: &[CpuThrottleSample], end: &[CpuThrottleSample]) -> Value {
+    let start_by_identity = start
+        .iter()
+        .map(|sample| {
+            (
+                (
+                    sample.role.as_str(),
+                    sample.pod.as_str(),
+                    sample.uid.as_str(),
+                    sample.container.as_str(),
+                ),
+                sample,
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let mut measured = 0;
+    let mut pod_evidence = Vec::with_capacity(end.len());
+    for sample in end {
+        let key = (
+            sample.role.as_str(),
+            sample.pod.as_str(),
+            sample.uid.as_str(),
+            sample.container.as_str(),
+        );
+        let result = start_by_identity.get(&key).and_then(|before| {
+            let before = before.counters.as_ref()?;
+            let after = sample.counters.as_ref()?;
+            Some((
+                after.periods.checked_sub(before.periods)?,
+                after.throttled_periods.checked_sub(before.throttled_periods)?,
+            ))
+        });
+        match result {
+            Some((periods, throttled_periods)) if periods > 0 => {
+                measured += 1;
+                pod_evidence.push(json!({
+                    "role": sample.role,
+                    "pod": sample.pod,
+                    "uid": sample.uid,
+                    "container": sample.container,
+                    "node": sample.node,
+                    "status": "measured",
+                    "periods": periods,
+                    "throttled_periods": throttled_periods,
+                    "throttled_period_fraction": throttled_periods as f64 / periods as f64,
+                }));
+            }
+            _ => {
+                let reason = sample
+                    .unavailable_reason
+                    .as_deref()
+                    .unwrap_or("counter reset, identity changed, or no CPU periods elapsed");
+                pod_evidence.push(json!({
+                    "role": sample.role,
+                    "pod": sample.pod,
+                    "uid": sample.uid,
+                    "container": sample.container,
+                    "node": sample.node,
+                    "status": "unavailable",
+                    "reason": reason,
+                }));
+            }
+        }
+    }
+    let status = if measured == end.len() && measured > 0 {
+        "measured"
+    } else if measured > 0 {
+        "partial"
+    } else {
+        "unavailable"
+    };
+    json!({
+        "status": status,
+        "scope": "scheduled_load_to_client_completion",
+        "source": "kubelet cAdvisor container CPU CFS counters",
+        "pods": pod_evidence,
+    })
+}
+
 async fn apply_deployment(config: &OatConfig, mut deployment: Value) -> Result<()> {
     let metadata = deployment
         .get_mut("metadata")
@@ -13509,6 +14137,9 @@ mod tests {
         )?;
         let mut platform = AksPlatform {
             run_id: "fixture-run".to_owned(),
+            resource_readback: Vec::new(),
+            cpu_throttling_start: None,
+            cpu_throttling_evidence: None,
             namespace_created: true,
             namespace_create_attempted: true,
             namespace_owner_token: "fixture-owner".to_owned(),
@@ -14878,6 +15509,7 @@ mod tests {
                 started_at_ms: 1,
                 qap,
                 resources: None,
+                resource_evidence: None,
             },
         )?;
         assert_eq!(rows[0].status, "succeeded");
@@ -15132,5 +15764,129 @@ mod tests {
             memory_bytes: Some(1024),
             qap: QapMetrics::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod aks_resource_readback_tests {
+    use super::*;
+
+    fn requirements() -> ResourceRequirements {
+        serde_json::from_value(json!({
+            "requests": {"cpu": "2", "memory": "4Gi"},
+            "limits": {"cpu": "2", "memory": "6Gi"}
+        }))
+        .expect("valid resource requirements")
+    }
+
+    #[test]
+    fn resource_readback_accepts_equivalent_kubernetes_quantity_spellings() -> Result<()> {
+        let containers = vec![json!({
+            "name": "dataflow",
+            "resources": {
+                "requests": {"cpu": "2000m", "memory": "4096Mi"},
+                "limits": {"cpu": "2", "memory": "6Gi"}
+            }
+        })];
+        let evidence = verify_container_resources(&containers, "dataflow", "collector", &requirements())?;
+        assert_eq!(evidence["requested"]["requests"]["cpu"], "2");
+        assert_eq!(evidence["effective"]["requests"]["cpu"], "2000m");
+        Ok(())
+    }
+
+    #[test]
+    fn resource_readback_rejects_mismatch_and_missing_limit() {
+        let expected = requirements();
+        let mismatch = vec![json!({
+            "name": "dataflow",
+            "resources": {
+                "requests": {"cpu": "2", "memory": "4Gi"},
+                "limits": {"cpu": "1", "memory": "6Gi"}
+            }
+        })];
+        assert!(verify_container_resources(&mismatch, "dataflow", "collector", &expected).is_err());
+
+        let missing = vec![json!({"name": "dataflow", "resources": {"requests": {"cpu": "2", "memory": "4Gi"}}})];
+        assert!(verify_container_resources(&missing, "dataflow", "collector", &expected).is_err());
+    }
+
+    #[test]
+    fn client_job_configuration_projects_resource_requirements() -> Result<()> {
+        let mut job = json!({"spec": {"template": {"spec": {"containers": [{"name": "client"}]}}}});
+        let expected: ResourceRequirements = serde_json::from_value(json!({
+            "requests": {"cpu": "1", "memory": "512Mi"},
+            "limits": {"cpu": "3", "memory": "3Gi"}
+        }))?;
+        configure_client_job_resources(&mut job, &expected)?;
+        assert_eq!(
+            job.pointer("/spec/template/spec/containers/0/resources"),
+            Some(&serde_json::to_value(expected)?)
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod aks_cpu_throttling_tests {
+    use super::*;
+
+    #[test]
+    fn parses_cadvisor_cfs_counters_for_exact_pod_identity() -> Result<()> {
+        let metrics = concat!(
+            "container_cpu_cfs_periods_total{namespace=\"oat-test\",pod=\"worker-a\",container=\"dataflow\"} 500\n",
+            "container_cpu_cfs_throttled_periods_total{namespace=\"oat-test\",pod=\"worker-a\",container=\"dataflow\"} 75\n",
+            "container_cpu_cfs_periods_total{namespace=\"other\",pod=\"worker-a\",container=\"dataflow\"} 999\n",
+        );
+        let counters = parse_cadvisor_cpu_counters(metrics, "oat-test", "worker-a", "dataflow")?
+            .context("matching cAdvisor counters missing")?;
+        assert_eq!(counters.periods, 500);
+        assert_eq!(counters.throttled_periods, 75);
+        Ok(())
+    }
+
+    #[test]
+    fn reports_measured_throttling_delta_without_inferring_from_worker_count() {
+        let sample = |periods, throttled_periods| CpuThrottleSample {
+            role: "collector".to_owned(),
+            pod: "worker-a".to_owned(),
+            uid: "uid-a".to_owned(),
+            container: "dataflow".to_owned(),
+            node: "node-a".to_owned(),
+            counters: Some(CpuThrottleCounters {
+                periods,
+                throttled_periods,
+            }),
+            unavailable_reason: None,
+        };
+        let evidence = compare_cpu_throttling(&[sample(100, 10)], &[sample(300, 70)]);
+        assert_eq!(evidence["status"], "measured");
+        assert_eq!(evidence["pods"][0]["periods"], 200);
+        assert_eq!(evidence["pods"][0]["throttled_periods"], 60);
+        assert_eq!(evidence["pods"][0]["throttled_period_fraction"], 0.3);
+    }
+}
+
+#[cfg(test)]
+mod aks_resource_budget_tests {
+    use super::*;
+
+    #[test]
+    fn aks_lifecycle_budget_includes_both_bounded_throttling_snapshots() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        config.platform.kind = crate::config::OatMode::Aks;
+        let budget = config.timing_budget()?;
+        let maintenance_rollouts = u64::from(maintenance_enabled(&config));
+        let scale_rollouts = u64::try_from(config.deployment_names().len())? + maintenance_rollouts;
+        let expected = budget.minimum_pin_ttl_ms
+            + scale_rollouts * config.aks_rollout_timeout_seconds * 1_000
+            + AKS_RESOURCE_COUNTER_SNAPSHOT_TIMEOUT_MS * 2;
+        assert_eq!(budget.after_setup_budget_ms, expected);
+        assert_eq!(
+            budget.planned_cell_duration_ms,
+            budget.pre_cell_setup_timeout_ms + budget.after_setup_budget_ms
+        );
+        Ok(())
     }
 }

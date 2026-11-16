@@ -20,8 +20,10 @@ export function parseEffectiveStopBudgets(value: unknown): EffectiveStopBudgets 
   if (!Number.isSafeInteger(maintenanceGraceSeconds) || (maintenanceGraceSeconds as number) <= 0 ||
       !Number.isSafeInteger(maintenanceStopTimeoutMs) || (maintenanceStopTimeoutMs as number) <= 0)
     throw new Error('effective stop budget values must be positive safe integers');
-  if ((maintenanceStopTimeoutMs as number) > MAINTENANCE_STOP_TIMEOUT_CEILING_MS ||
-      (maintenanceStopTimeoutMs as number) < (maintenanceGraceSeconds as number) * 1_000)
-    throw new Error('effective maintenance stop timeout must cover grace and not exceed the fixed ceiling');
+  const minimumTimeoutMs = ((maintenanceGraceSeconds as number) + 300) * 1_000;
+  if (!Number.isSafeInteger(minimumTimeoutMs) ||
+      (maintenanceStopTimeoutMs as number) > MAINTENANCE_STOP_TIMEOUT_CEILING_MS ||
+      (maintenanceStopTimeoutMs as number) < minimumTimeoutMs)
+    throw new Error('effective maintenance stop timeout must cover grace plus 300 seconds and not exceed the fixed ceiling');
   return { maintenanceGraceSeconds: maintenanceGraceSeconds as number, maintenanceStopTimeoutMs: maintenanceStopTimeoutMs as number };
 }

@@ -40,7 +40,7 @@ test('AKS resource overrides are strict and project through to role manifests', 
   const get = (name: string) => objects.find(o => o.kind === 'Deployment' && o.metadata.name === name)!;
   const collector = get('arrowcol').spec.template.spec.containers[0];
   assert.deepEqual(collector.resources, { requests: { cpu: '3', memory: '8Gi' }, limits: { cpu: '4', memory: '10Gi' } });
-  assert.deepEqual(collector.args.slice(-2), ['--num-cores', '1']);
+  assert.deepEqual(collector.args.slice(-2), ['--num-cores', '7']);
   assert.equal(collector.env.find((e: any) => e.name === 'ARROWCOL_PARTITION_GRANULARITY').value, 'day');
   assert.equal(parse(objects.find(o => o.kind === 'ConfigMap')!.data['dataflow.yaml']).policies.resources.core_allocation.count, 7);
   assert.equal(get('arrowcol-catalog').spec.template.spec.containers[0].resources.requests.memory, '1Gi');

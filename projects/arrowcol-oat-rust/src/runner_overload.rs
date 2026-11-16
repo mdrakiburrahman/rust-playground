@@ -1207,6 +1207,7 @@ mod overload_guard_tests {
                 started_at_ms: 0,
                 qap: QapMetrics::default(),
                 resources: None,
+                resource_evidence: None,
             },
         )?;
         let mut outcome = finish_matrix_cell(
