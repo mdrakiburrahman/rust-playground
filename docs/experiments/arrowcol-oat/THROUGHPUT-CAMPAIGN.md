@@ -7,8 +7,8 @@
 | Profile | Every manifest sets `campaign_profile: "single_hot_table"`: one DMV table, replicas `[1]`, WAL disabled, and continuous maintenance applying optimize, purge, vacuum, checkpoint, and prune-log. |
 | Maintenance | Continuous, enabled, and applying in every cell. Idle work must be a no-op; due work stays enabled. |
 | Verdict | Set `dataflow_verdict_policy` to `single_hot_table_campaign` to make QAP lag a separate finding. Missing QAP observations remain UNKNOWN/non-PASS; default legacy semantics are unchanged. |
-| Files | `oat-config-throughput-C1.json` through `C8.json` are provisional bounded manifests, not launch configs; all are marked `pending-E1-registry` and are not runnable until checked against the E1 registry. |
-| Pictures | Result pictures may show exploratory observations; no sustainable winner is shown until contiguous 30-second buckets, reconciliation, and validated timestamped pressure/maintenance-debt evidence qualify. The current runner's `backlog: null` keeps results unqualified. |
+| Files | `oat-config-throughput-C1.json` through `C8.json` are bounded manifests, not launch configs. Their eight baselines and 82 existing candidates were config-validated at integration source `a24ec92ea7a4c9b3b0397d38ebe231844714c7e8`; this does not establish runtime readiness. |
+| Pictures | Result pictures may show exploratory observations; no sustainable winner is shown until contiguous 30-second buckets, reconciliation, and validated timestamped pressure/maintenance-debt evidence qualify. Missing or unavailable evidence remains UNKNOWN. |
 
 ## Qualification
 
@@ -29,7 +29,7 @@ Compare candidates within the same box. Change one variable at a time; only test
 
 ## Cohorts
 
-Each runnable comparison contains at most four candidates, except the C1 coarse codec sweep (eight); sequential comparisons in a cohort stay on the same box. Candidate changes are overlays on the baseline, not additional writers or tables. The C8 staging-overlap comparison is outside the runnable cohort in `pending_candidate_sets` with status `pending-L1b`; it depends on L1b and must not enter E1 registry validation until that tunable ships.
+Each comparison contains at most four candidates, except the C1 coarse codec sweep (eight); sequential comparisons in a cohort stay on the same box. Candidate changes are overlays on the baseline, not additional writers or tables. The C8 staging-overlap comparison remains outside executable candidates in `pending_candidate_sets` with status `pending-L1b`; it is not config-validated.
 
 | Cohort | Comparisons |
 | --- | --- |
@@ -39,8 +39,8 @@ Each runnable comparison contains at most four candidates, except the C1 coarse 
 | C4 | Low-to-high cardinality sort candidates for the final availability-replica table: none; `sample_time_utc`; `replica_server_name, sample_time_utc`; `availability_group_id, replica_server_name, sample_time_utc`. `customer_id` is constant per client and excluded. |
 | C5 | Workers, streams, connections, corpus rows, send interval (including zero), and IPC compression as separate comparisons. |
 | C6 | DFE cores, CPU workers, upload concurrency, flush concurrency, then router pooling if supported by the registry. |
-| C7 | Maintenance cadence, small-file threshold, bounded retry budget, and checkpoint interval; every operation remains enabled and applying. |
-| C8 | Runnable comparisons cover commit window and files-per-commit. Staging-overlap remains a separate `pending-L1b` candidate set until the L1b tunable ships. |
+| C7 | Maintenance cadence, small-file threshold, bounded retry budget, and checkpoint interval; every operation remains enabled and applying. Cadence 30/60/120 seconds is explicitly exploratory: it cannot reliably provide an observation in every 30-second window. Idle-backoff is coupled to the cadence to satisfy the configuration constraint. |
+| C8 | Comparisons cover commit window and files-per-commit. Staging-overlap remains a separate `pending-L1b` candidate set until its consumer and safety clearance are integrated. |
 
 Generate or refresh manifests with:
 
@@ -50,7 +50,20 @@ npx --no-install tsx projects/arrowcol-oat/throughput-sweeps.ts \
   --out docs/experiments/arrowcol-oat
 ```
 
-The generator hashes the PR #125 tunables profile as a seed; E1 capability metadata is not yet wired as a complete typed registry. Each runnable candidate must therefore be rendered and passed through `--validate-config` against a recorded E1 source SHA. Record the result as `config-validated`; do not label it registry-generated or registry-complete. Keep the registry metadata status pending until it is authoritative. The C8 staging-overlap set remains outside runnable comparisons as `pending-L1b`. The current per-manifest outcomes and machine-readable 82-cell matrix are in `oat-config-throughput-validation.json`; they record config validation only, not registry completeness.
+Render CLI-consumable baselines and candidate overlays from the checked-in manifests:
+
+```bash
+npx --no-install tsx projects/arrowcol-oat/throughput-sweeps.ts --render-all \
+  --out out/arrowcol-oat/sweep-configs
+cargo run --locked --package arrowcol-oat-rust -- --validate-config \
+  out/arrowcol-oat/sweep-configs/C1/codec/snappy.json
+```
+
+The generator hashes the PR #125 tunables profile as a seed, not a complete capability registry. Rendering rejects a different seed. `oat-config-throughput-validation.json` records SHA-256 per rendered config and the exact source of the validator: 8 baselines and 82 candidates passed `--validate-config` at `a24ec92ea7a4c9b3b0397d38ebe231844714c7e8`; no staging-overlap candidates were included. This is config validation only, not an admission, effective-setting, runtime, or sustainable qualification. `runnable: false` retains the runtime hold. Regeneration resets each manifest's validation status; revalidate after source, seed, manifest, or rendered config changes rather than relying on the old matrix.
+
+The baseline mirrors the unscored diagnostic's 150-second measurement, 15-second maintenance interval and idle-backoff, hour granularity, 30-day purge retention, one table, and one writer. A 15-second cadence does not guarantee per-window observations. Hour granularity with closed-only compaction can accumulate protected current-partition backlog; zero eligible work alone does not establish bounded debt. New maintenance knobs are not executable candidates until their consumer and OAT projection are integrated and validated.
+
+**Before any authorized run**, replace the shared template's Compose project/state paths and output destinations with isolated run-owned paths, set the correct local endpoint/bind settings, and revalidate the modified config; rendered files reuse template paths and must not be run concurrently as-is. Record requested and effective values separately.
 
 ## Picture input
 
