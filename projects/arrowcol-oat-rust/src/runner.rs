@@ -5428,14 +5428,11 @@ async fn stop_then_destroy<T>(
     stop: impl std::future::Future<Output = Result<T>>,
     destroy: impl std::future::Future<Output = Result<()>>,
 ) -> Result<T> {
-    let stopped = stop.await;
-    let destroyed = destroy.await;
-    match (stopped, destroyed) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Err(stop), Ok(())) => Err(stop),
-        (Ok(_), Err(destroy)) => Err(destroy),
-        (Err(stop), Err(destroy)) => Err(anyhow::anyhow!("stop failed: {stop:#}; cleanup failed: {destroy:#}")),
-    }
+    let stopped = stop.await.context(
+        "stop failed or drain is uncertain; retaining owned resources for recovery, operator intervention required",
+    )?;
+    destroy.await?;
+    Ok(stopped)
 }
 
 async fn cleanup_local_platform(config: &OatConfig, platform: &LocalPlatform) -> Result<Value> {
@@ -9078,7 +9075,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_snapshot_cleanup_destroys_after_stop_failure_and_keeps_both_errors() -> Result<()> {
+    async fn non_snapshot_cleanup_retains_resources_after_stop_failure() -> Result<()> {
         let actions = std::cell::RefCell::new(Vec::new());
         let result = stop_then_destroy(
             async {
@@ -9091,15 +9088,15 @@ mod tests {
             },
         )
         .await;
-        assert_eq!(*actions.borrow(), ["stop", "destroy"]);
-        let error = format!("{:#}", result.err().context("both operations must fail")?);
+        assert_eq!(*actions.borrow(), ["stop"]);
+        let error = format!("{:#}", result.err().context("stop must fail")?);
         assert!(error.contains("exit 137"));
-        assert!(error.contains("owned volume deletion failed"));
+        assert!(error.contains("retaining owned resources"));
         Ok(())
     }
 
     #[tokio::test]
-    async fn non_snapshot_cleanup_destroys_after_stop_timeout() -> Result<()> {
+    async fn non_snapshot_cleanup_retains_resources_after_stop_timeout() -> Result<()> {
         let destroyed = std::sync::atomic::AtomicBool::new(false);
         let result = stop_then_destroy(
             async {
@@ -9113,14 +9110,14 @@ mod tests {
             },
         )
         .await;
-        assert!(destroyed.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!destroyed.load(std::sync::atomic::Ordering::SeqCst));
         assert!(format!("{:#}", result.err().context("stop must time out")?).contains("stop deadline exceeded"));
         Ok(())
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn cleanup_failure_paths_destroy_owned_resources_and_gate_aks_exits() -> Result<()> {
+    async fn cleanup_failure_paths_retain_owned_resources_and_gate_aks_exits() -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         let fixture = match std::env::var_os("OAT_CLEANUP_FIXTURE_ROOT") {
             Some(root) => PathBuf::from(root),
@@ -9143,7 +9140,7 @@ mod tests {
                 let mut command = Command::new(std::env::current_exe()?);
                 command.args([
                     "--exact",
-                    "runner::tests::cleanup_failure_paths_destroy_owned_resources_and_gate_aks_exits",
+                    "runner::tests::cleanup_failure_paths_retain_owned_resources_and_gate_aks_exits",
                     "--nocapture",
                 ]);
                 command.env("OAT_CLEANUP_FIXTURE_ROOT", &root);
@@ -9185,8 +9182,8 @@ mod tests {
             .err()
             .context("local stop must fail")?;
         assert!(format!("{error:#}").contains("fixture stop listing failed"));
-        assert!(!state.exists(), "non-snapshot state leaked after stop failure");
-        assert!(fixture.join("compose-destroyed").exists(), "Compose down was skipped");
+        assert!(state.exists(), "local state must be retained after stop failure");
+        assert!(!fixture.join("compose-destroyed").exists(), "Compose down must be skipped");
 
         config.platform.kind = crate::config::OatMode::Aks;
         config.namespace = "fixture-owned".to_owned();
@@ -9243,20 +9240,11 @@ mod tests {
             .context("AKS stop must fail")?;
         let error = format!("{error:#}");
         assert!(error.contains("fixture deployment stop failed"));
-        assert!(
-            error.contains("QAP cleanup requires"),
-            "QAP cleanup was skipped: {error}"
-        );
-        assert!(
-            error.contains("workload identity cleanup has no"),
-            "FIC cleanup was skipped: {error}"
-        );
-        assert!(!platform.namespace_created);
-        assert!(!fixture.join("namespace.json").exists(), "run-owned namespace leaked");
-        let options: Value = serde_json::from_slice(&fs::read(fixture.join("delete-options.json"))?)?;
-        assert_eq!(options["preconditions"]["uid"], "fixture-uid");
-        let receipt: Value = serde_json::from_slice(&fs::read(runtime.join("workload-stop-receipt.json"))?)?;
-        assert_eq!(receipt["absence_confirmed"], true);
+        assert!(error.contains("retaining owned resources"));
+        assert!(platform.namespace_created);
+        assert!(fixture.join("namespace.json").exists(), "namespace must be retained");
+        assert!(!fixture.join("delete-options.json").exists());
+        assert!(!runtime.join("workload-stop-receipt.json").exists());
 
         fs::write(fixture.join("mode"), "absent_deployment")?;
         let missing = stop_aks_deployment_for_cleanup(&config, "fixture", ComponentRole::Collector, 30).await?;
