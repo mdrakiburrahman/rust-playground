@@ -451,8 +451,6 @@ pub struct MaintenanceTunables {
     pub batch_rows: Option<usize>,
     pub output_row_group_rows: Option<usize>,
     pub max_output_file_bytes: Option<u64>,
-    pub optimize_upload_mode: Option<MaintenanceOptimizeUploadMode>,
-    pub optimize_upload_buffer_bytes: Option<usize>,
     pub max_active_files: Option<usize>,
     pub latest_partitions: Option<usize>,
     pub sealed_final: Option<bool>,
@@ -515,16 +513,6 @@ pub enum MaintenanceOperation {
 // PERF69-TUNABLES-BEGIN commit-pipeline
 // PERF69-TUNABLES-END commit-pipeline
 // PERF69-TUNABLES-BEGIN maintenance
-/// OPTIMIZE output upload mode. Multipart is unqualified and not for scored cells.
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum MaintenanceOptimizeUploadMode {
-    /// Preserve conditional create-only publication.
-    PutCreate,
-    /// Opt in to UUID-named buffered multipart outputs; not create-only.
-    BufferedMultipart,
-}
-
 // PERF69-TUNABLES-END maintenance
 // PERF69-TUNABLES-BEGIN loadgen
 // PERF69-TUNABLES-END loadgen
