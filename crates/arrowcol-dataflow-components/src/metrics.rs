@@ -316,8 +316,8 @@ impl StageMetrics {
         self.duration.record(
             duration.as_secs_f64(),
             &[
-                KeyValue::new("run", self.run.as_str()),
-                KeyValue::new("variant", self.variant.as_str()),
+                KeyValue::new("run", self.run.clone()),
+                KeyValue::new("variant", self.variant.clone()),
                 KeyValue::new("component", "arrowcol-dataflow-rust"),
                 KeyValue::new("stage", stage.as_str()),
             ],
@@ -332,8 +332,8 @@ impl StageMetrics {
     pub fn record_file(&self, physical_bytes: u64, rows: u64) {
         PIPELINE_METRICS.record_file(physical_bytes, rows);
         let attributes = [
-            KeyValue::new("run", self.run.as_str()),
-            KeyValue::new("variant", self.variant.as_str()),
+            KeyValue::new("run", self.run.clone()),
+            KeyValue::new("variant", self.variant.clone()),
             KeyValue::new("component", "arrowcol-dataflow-rust"),
         ];
         self.physical_bytes.record(physical_bytes, &attributes);
@@ -342,6 +342,17 @@ impl StageMetrics {
 }
 
 impl PipelineStage {
+    const fn index(self) -> usize {
+        match self {
+            Self::Collect => 0,
+            Self::Build => 1,
+            Self::Sort => 2,
+            Self::Encode => 3,
+            Self::Upload => 4,
+            Self::Commit => 5,
+        }
+    }
+
     const fn as_str(self) -> &'static str {
         match self {
             Self::Collect => "collect",
@@ -1802,34 +1813,36 @@ mod tests {
         assert_eq!(after.rich.buffered_batches.current().get(), 0);
     }
 
+    #[test]
+    fn prometheus_exposes_pending_rows_and_monotonic_oldest_age() {
+        let metrics = Arc::new(RuntimeMetrics::new(CollectorInstanceId::new()));
+        let tracker = PendingTracker::new(Arc::clone(&metrics));
+        let id = tracker
+            .insert(table(), 3, 128, SchemaVersion::FIRST, SchemaVersion::FIRST)
+            .expect("insert");
+        std::thread::sleep(Duration::from_millis(2));
+
+        let exposition = metrics.prometheus();
+        assert!(exposition.contains("arrowcol_dfe_buffered_rows 3\n"));
+        let age = exposition
+            .lines()
+            .find(|line| line.starts_with("arrowcol_dfe_oldest_pending_age_seconds "))
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|value| value.parse::<f64>().ok())
+            .expect("oldest pending age metric");
+        assert!(age > 0.0);
+
+        tracker.resolve(id, true);
+        let exposition = metrics.prometheus();
+        assert!(exposition.contains("arrowcol_dfe_buffered_rows 0\n"));
+        assert!(exposition.contains("arrowcol_dfe_oldest_pending_age_seconds 0\n"));
+    }
+
     /// Scenario: Operators inspect DFE delivery claims while native Quiver is disabled.
     /// Guarantees: Capability metadata stays best-effort without receipt polling or an at-least-once
     /// claim, reports native Quiver as supported but disabled, and keeps the legacy info metric.
     #[test]
     fn capabilities_label_best_effort() {
-        fn prometheus_exposes_pending_rows_and_monotonic_oldest_age() {
-            let metrics = Arc::new(RuntimeMetrics::new(CollectorInstanceId::new()));
-            let tracker = PendingTracker::new(Arc::clone(&metrics));
-            let id = tracker
-                .insert(table(), 3, 128, SchemaVersion::FIRST, SchemaVersion::FIRST)
-                .expect("insert");
-            std::thread::sleep(Duration::from_millis(2));
-
-            let exposition = metrics.prometheus();
-            assert!(exposition.contains("arrowcol_dfe_buffered_rows 3\n"));
-            let age = exposition
-                .lines()
-                .find(|line| line.starts_with("arrowcol_dfe_oldest_pending_age_seconds "))
-                .and_then(|line| line.split_whitespace().nth(1))
-                .and_then(|value| value.parse::<f64>().ok())
-                .expect("oldest pending age metric");
-            assert!(age > 0.0);
-
-            tracker.resolve(id, true);
-            let exposition = metrics.prometheus();
-            assert!(exposition.contains("arrowcol_dfe_buffered_rows 0\n"));
-            assert!(exposition.contains("arrowcol_dfe_oldest_pending_age_seconds 0\n"));
-        }
         let metrics = RuntimeMetrics::new(CollectorInstanceId::new());
         metrics.configure_admission("dfe", false).expect("admission mode");
         let encoded = serde_json::to_value(metrics.capabilities(1024)).expect("capabilities JSON");
