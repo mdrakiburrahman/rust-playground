@@ -551,6 +551,12 @@ mod overload_guard_tests {
                 ))?;
                 config.platform.local.collector_memory_limit_bytes = capped.then_some(cap);
                 let project = scoped_compose_project(config.platform.compose_project.as_deref().context("project missing")?, &run_id);
+                let compose_path = root.join(format!("{run_id}.compose.json"));
+                let override_path = root.join(format!("{run_id}.override.json"));
+                fs::write(&compose_path, json!({"services":{"dataflow-1":{"image":image}}}).to_string())?;
+                fs::write(&override_path, "{\"services\":{}}")?;
+                config.platform.compose_file = Some(compose_path.to_string_lossy().into_owned());
+                config.platform.compose_override_file = Some(override_path.to_string_lossy().into_owned());
                 let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
                 let admin_port = listener.local_addr()?.port();
                 let flight_listener = std::net::TcpListener::bind("127.0.0.1:0")?;
@@ -569,6 +575,8 @@ mod overload_guard_tests {
                 let network = format!("container:{runner}");
                 let mut args = vec!["create", "--network", &network, "--cpus=1",
                     "--label", &project_label, "--label", "com.docker.compose.service=dataflow-1",
+                    "--label", "com.docker.compose.config-hash=oat-no-load-guard",
+                    "--label", "com.docker.compose.oneoff=False",
                     "--entrypoint", "/tmp/oat-guard-dataflow"];
                 let memory = cap.to_string();
                 if capped { args.extend(["--memory", &memory, "--memory-swap", &memory]); }
