@@ -310,7 +310,7 @@ fn idle_catalog_policy_passes_have_no_log_checkpoint_or_progress_rewrites() -> R
         let results = run_cycle_with_discovery(&settings, &source, &metrics, &Arc::new(AtomicBool::new(false)))?;
         assert_eq!(results.len(), 5);
         assert!(results.iter().all(|r| r.error.is_none()));
-        assert_eq!(results.iter().filter(|r| r.negative_probe).count(), 3);
+        assert_eq!(results.iter().filter(|r| r.negative_probe).count(), 2);
         assert_eq!(results[0].operation, Operation::Purge);
         assert!(results.iter().all(|result| {
             result.probe_duration_ms.saturating_add(result.plan_apply_duration_ms)
@@ -338,11 +338,15 @@ fn idle_catalog_policy_passes_have_no_log_checkpoint_or_progress_rewrites() -> R
         assert_eq!(serde_fixture["operation"], "optimize");
         assert_eq!(serde_fixture["report"]["interrupted"], false);
         assert_eq!(serde_fixture["report"]["outcome"], "noop");
+        let protected = &serde_fixture["report"]["compaction_debt"]["protected_partition_backlog"];
+        assert_eq!(protected["files"], 2);
+        assert!(protected["bytes"].as_u64().is_some_and(|bytes| bytes > 0));
+        assert_eq!(protected["oldest_partition_start_ms"], BASE + 60_000);
         assert_eq!(
             serde_fixture["report"]["maintenance_due_work"],
             serde_json::json!({
                 "observed_at_ms": anchor,
-                "source": "bounded_physical_inventory",
+                "source": "snapshot_active_files",
                 "completeness": "complete",
                 "unit": "parquet_files",
                 "due": false,
@@ -387,7 +391,10 @@ fn idle_catalog_policy_passes_have_no_log_checkpoint_or_progress_rewrites() -> R
             lists > 0 && lists <= 24,
             "bounded idle pass made {lists} object listings"
         );
-        assert!(reads <= 72, "bounded idle pass made {reads} object reads/listings");
+        assert!(
+            reads <= 80,
+            "bounded idle pass with active protected-debt scan made {reads} object reads/listings"
+        );
         assert_eq!(writes, 0, "idle pass must not write objects");
     }
     assert!(metrics.render().contains("delta_maintenance_negative_probes_total"));
