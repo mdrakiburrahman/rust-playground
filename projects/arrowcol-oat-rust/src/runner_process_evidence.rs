@@ -57,6 +57,7 @@ fn is_process_evidence_line(line: &str) -> bool {
         "arrowcol_layout_",
         "arrowcol_data_commit ",
         "arrowcol_maintenance_",
+        "delta-maintenance ",
         "OAT_CLIENT_",
         "otel.controller.main::shutdown.signal_received",
         "otel.processor.durable_buffer::durable_buffer.shutdown.",
@@ -927,6 +928,11 @@ fn maintenance_cell_outcome_evidence(log: &ProcessLog, baseline_logs: &[ProcessL
 }
 
 fn maintenance_exit_classification(log: &ProcessLog, exit: Option<i64>) -> Value {
+    if log.text.contains("delta-maintenance stale-plan starvation ")
+        || log.text.contains("delta-maintenance pending-table status failed:")
+    {
+        return json!("unhealthy");
+    }
     let mut baseline = log.clone();
     baseline.stdout.clear();
     baseline.stderr.clear();
