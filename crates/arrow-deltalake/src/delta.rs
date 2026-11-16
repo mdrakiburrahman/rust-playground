@@ -4652,6 +4652,7 @@ impl DeltaFileWriter {
             let source_path = file.path.clone();
             let expected_bytes = file.bytes;
             spawn_shared_io(async move {
+                let _table = table;
                 let _upload_slot = upload_slot.context("remote staging has no upload admission slot")?;
                 upload_staged_output(
                     store,
