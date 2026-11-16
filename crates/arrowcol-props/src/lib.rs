@@ -382,7 +382,6 @@ pub static REGISTRY: &[PropKey] = &[
         Validator::Positive,
         "Upper compression-ratio clamp."
     ),
-
     // PERF69-PROPS-BEGIN oat-evidence
     // PERF69-PROPS-END oat-evidence
     // PERF69-PROPS-BEGIN oat-campaign

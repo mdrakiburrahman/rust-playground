@@ -7,8 +7,8 @@ use arrow_deltalake::maintenance::{
     Outcome, ProbeOperation, now_ms,
 };
 use delta_maintenance::{
-    DiscoveredTable, FilesystemDiscovery, Metrics, Operation, OptimizeUploadMode, Settings, TableDiscovery, run_cycle_with_discovery,
-    run_with_discovery,
+    DiscoveredTable, FilesystemDiscovery, Metrics, Operation, OptimizeUploadMode, Settings, TableDiscovery,
+    run_cycle_with_discovery, run_with_discovery, startup_configuration,
 };
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -664,8 +664,14 @@ fn empty_vacuum_plan_cannot_report_noop_after_a_concurrent_append() -> Result<()
 
 #[test]
 fn optimize_upload_mode_is_strict_and_buffer_is_opt_in() -> Result<()> {
-    assert_eq!("put_create".parse::<OptimizeUploadMode>()?, OptimizeUploadMode::PutCreate);
-    assert_eq!("buffered_multipart".parse::<OptimizeUploadMode>()?, OptimizeUploadMode::BufferedMultipart);
+    assert_eq!(
+        "put_create".parse::<OptimizeUploadMode>()?,
+        OptimizeUploadMode::PutCreate
+    );
+    assert_eq!(
+        "buffered_multipart".parse::<OptimizeUploadMode>()?,
+        OptimizeUploadMode::BufferedMultipart
+    );
     assert!("stream".parse::<OptimizeUploadMode>().is_err());
     let (_root, mut settings, _) = fixture()?;
     settings.operation_limits.optimize_upload_buffer_bytes = Some(8 * 1024 * 1024);
@@ -681,5 +687,35 @@ fn optimize_upload_mode_is_strict_and_buffer_is_opt_in() -> Result<()> {
         settings.operation_limits.optimize_upload_buffer_bytes = Some(value);
         assert!(settings.validate().is_err());
     }
+    Ok(())
+}
+
+#[test]
+fn startup_readback_reports_effective_optimize_upload_settings() -> Result<()> {
+    let (_root, mut settings, _) = fixture()?;
+    let readback = startup_configuration(&settings)?;
+    assert_eq!(readback["optimize_upload"]["mode"], "put_create");
+    assert!(readback["optimize_upload"]["buffer_bytes_requested"].is_null());
+    assert!(readback["optimize_upload"]["buffer_bytes_effective"].is_null());
+
+    settings.operation_limits.optimize_upload_mode = OptimizeUploadMode::BufferedMultipart;
+    let readback = startup_configuration(&settings)?;
+    assert_eq!(readback["optimize_upload"]["mode"], "buffered_multipart");
+    assert!(readback["optimize_upload"]["buffer_bytes_requested"].is_null());
+    assert_eq!(
+        readback["optimize_upload"]["buffer_bytes_effective"].as_u64(),
+        Some(8 * 1024 * 1024)
+    );
+
+    settings.operation_limits.optimize_upload_buffer_bytes = Some(16 * 1024 * 1024);
+    let readback = startup_configuration(&settings)?;
+    assert_eq!(
+        readback["optimize_upload"]["buffer_bytes_requested"].as_u64(),
+        Some(16 * 1024 * 1024)
+    );
+    assert_eq!(
+        readback["optimize_upload"]["buffer_bytes_effective"].as_u64(),
+        Some(16 * 1024 * 1024)
+    );
     Ok(())
 }

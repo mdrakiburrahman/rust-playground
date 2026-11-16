@@ -1679,7 +1679,9 @@ mod optimize_upload_tests {
     async fn default_create_only_upload_rejects_existing_output() -> Result<()> {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let path = object_store::path::Path::from("existing.parquet");
-        store.put_opts(&path, vec![1_u8, 2, 3].into(), PutMode::Create.into()).await?;
+        store
+            .put_opts(&path, vec![1_u8, 2, 3].into(), PutMode::Create.into())
+            .await?;
         let local = tempfile::NamedTempFile::new()?;
         let replacement = vec![4_u8, 5, 6];
         fs::write(local.path(), &replacement)?;
@@ -2054,13 +2056,7 @@ impl DeltaTable {
         config: &OptimizeConfig,
         control: &MaintenanceControl,
     ) -> Result<MaintenanceReport> {
-        self.apply_optimize_reusing(
-            &prepared.plan,
-            config,
-            control,
-            Some(&prepared.state),
-            None,
-        )
+        self.apply_optimize_reusing(&prepared.plan, config, control, Some(&prepared.state), None)
     }
 
     /// Apply OPTIMIZE with a bounded object-store streaming upload buffer.
@@ -2756,7 +2752,10 @@ async fn upload_staged_output(
         None => {
             let bytes = tokio::fs::read(local).await?;
             if bytes.len() as u64 != expected_bytes {
-                return Err(fail(MaintenanceErrorKind::Uncertain, "staged output changed before upload"));
+                return Err(fail(
+                    MaintenanceErrorKind::Uncertain,
+                    "staged output changed before upload",
+                ));
             }
             store.put_opts(&path, bytes.into(), PutMode::Create.into()).await?;
             Ok(())

@@ -194,8 +194,7 @@ impl Settings {
             bail!("--max-prune-files must be nonzero");
         }
         let limits = &self.operation_limits;
-        if limits.optimize_upload_mode == OptimizeUploadMode::PutCreate
-            && limits.optimize_upload_buffer_bytes.is_some()
+        if limits.optimize_upload_mode == OptimizeUploadMode::PutCreate && limits.optimize_upload_buffer_bytes.is_some()
         {
             bail!("OPTIMIZE upload buffer applies only to buffered_multipart mode");
         }
@@ -824,6 +823,15 @@ fn configuration_evidence(startup: &Settings, settings: &Settings, props: &Resol
     } else {
         "disabled"
     };
+    let optimize_upload_buffer_bytes_effective = match startup.operation_limits.optimize_upload_mode {
+        OptimizeUploadMode::PutCreate => None,
+        OptimizeUploadMode::BufferedMultipart => Some(
+            startup
+                .operation_limits
+                .optimize_upload_buffer_bytes
+                .unwrap_or(DEFAULT_OPTIMIZE_UPLOAD_BUFFER_BYTES),
+        ),
+    };
     Ok(serde_json::json!({
         "startup": {
             "apply": startup.apply,
@@ -846,6 +854,11 @@ fn configuration_evidence(startup: &Settings, settings: &Settings, props: &Resol
         },
         "table_policy": policy,
         "parquet_writer_overrides": arrow_deltalake::writer::process_config()?,
+        "optimize_upload": {
+            "mode": startup.operation_limits.optimize_upload_mode,
+            "buffer_bytes_requested": startup.operation_limits.optimize_upload_buffer_bytes,
+            "buffer_bytes_effective": optimize_upload_buffer_bytes_effective,
+        },
         "active": enabled,
         "operation_settings": enabled.then(|| serde_json::json!({
             "layout_mode": layout_mode,

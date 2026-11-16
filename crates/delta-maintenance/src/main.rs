@@ -4,7 +4,9 @@ use anyhow::{Context, Result, anyhow};
 use arrow_deltalake::maintenance::{Granularity, InputReadStrategy, OptimizeConfig};
 use clap::Parser;
 use delta_kernel::metrics::WithMetricsReporterLayer;
-use delta_maintenance::{Metrics, Operation, OperationLimits, OptimizeUploadMode, Settings, run, serve_metrics, startup_configuration};
+use delta_maintenance::{
+    Metrics, Operation, OperationLimits, OptimizeUploadMode, Settings, run, serve_metrics, startup_configuration,
+};
 use delta_maintenance::{
     catalog::{CatalogDiscovery, CatalogOptions},
     run_with_discovery,
