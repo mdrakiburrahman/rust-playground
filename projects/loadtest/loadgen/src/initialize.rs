@@ -50,19 +50,24 @@ fn checked_root(raw: &str, account: &str, container: &str) -> Result<Url> {
     Ok(url)
 }
 
-fn entries() -> Result<Vec<(ManifestEntry, Arc<Schema>)>> {
+fn partitioned_schema(statement: &SchemaStatement) -> Result<Arc<Schema>> {
     let parser = DdlParser::default();
+    let DdlCommand::CreateTable(create) = parser.parse(&statement.ddl)? else {
+        bail!("canonical fixture contains a non-CREATE statement");
+    };
+    let mut fields = create
+        .fields()
+        .iter()
+        .map(arrowcol_catalog::CatalogField::to_arrow)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    fields.push(Field::new(INGESTION, DataType::Utf8, false));
+    Ok(Arc::new(Schema::new(fields)))
+}
+
+fn entries() -> Result<Vec<(ManifestEntry, Arc<Schema>)>> {
     let mut entries = Vec::new();
     for statement in schema_statements()? {
-        let DdlCommand::CreateTable(create) = parser.parse(&statement.ddl)? else {
-            bail!("canonical fixture contains a non-CREATE statement");
-        };
-        let mut fields = create
-            .fields()
-            .iter()
-            .map(arrowcol_catalog::CatalogField::to_arrow)
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        fields.push(Field::new(INGESTION, DataType::Utf8, false));
+        let schema = partitioned_schema(&statement)?;
         let identity = statement.identity;
         entries.push((
             ManifestEntry {
@@ -74,7 +79,7 @@ fn entries() -> Result<Vec<(ManifestEntry, Arc<Schema>)>> {
                     identity.table()
                 ),
             },
-            Arc::new(Schema::new(fields)),
+            schema,
         ));
     }
     Ok(entries)
@@ -98,18 +103,9 @@ pub(crate) fn initialize_fresh_local(root: &Path, selected: &[String], statement
         bail!("partitioned local Dataflow root must be a real directory");
     }
     let root = fs::canonicalize(root)?;
-    let parser = DdlParser::default();
     let mut prepared = Vec::new();
     for statement in targets {
-        let DdlCommand::CreateTable(create) = parser.parse(&statement.ddl)? else {
-            bail!("canonical fixture contains a non-CREATE statement");
-        };
-        let mut fields = create
-            .fields()
-            .iter()
-            .map(arrowcol_catalog::CatalogField::to_arrow)
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        fields.push(Field::new(INGESTION, DataType::Utf8, false));
+        let schema = partitioned_schema(statement)?;
         let mut parent = root.clone();
         for component in [
             statement.identity.catalog().as_str(),
@@ -132,7 +128,7 @@ pub(crate) fn initialize_fresh_local(root: &Path, selected: &[String], statement
             Ok(_) => bail!("refusing to initialize existing local table: {}", path.display()),
             Err(error) => return Err(error.into()),
         }
-        prepared.push((path, Arc::new(Schema::new(fields))));
+        prepared.push((path, schema));
     }
     for (path, schema) in prepared {
         fs::create_dir(&path).with_context(|| format!("claim fresh local table {}", path.display()))?;

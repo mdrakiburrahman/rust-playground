@@ -497,6 +497,7 @@ mod tests {
         assert_eq!(arguments.measure.get(), Duration::from_secs(30));
         assert_eq!(arguments.lanes, 8);
         assert_eq!(arguments.batch_rows, 1024);
+        assert!(!arguments.partition_by_ingestion_date);
         assert_eq!(arguments.effective_scenarios(), vec![Scenario::Dataflow]);
         Ok(())
     }
@@ -514,6 +515,7 @@ mod tests {
             keep_stack: false,
             scenarios: vec![Scenario::Dataflow],
             tables: Vec::new(),
+            partition_by_ingestion_date: false,
             lanes: 1,
             batch_rows: 1,
             seed: 1,
