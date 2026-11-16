@@ -11783,8 +11783,11 @@ mod tests {
             campaign_cleanup_operation_deadline_ms(&CampaignCleanupAction::BoundedDrain, &declared_deadline, 1_000)?,
             5_000
         );
+        let mut expired_deadline = inventory.clone();
+        expired_deadline.cleanup.stop_admission.deadline_unix_ms = Some(61_000);
         assert!(
-            campaign_cleanup_operation_deadline_ms(&CampaignCleanupAction::StopAdmission, &inventory, 61_000).is_err()
+            campaign_cleanup_operation_deadline_ms(&CampaignCleanupAction::StopAdmission, &expired_deadline, 61_000)
+                .is_err()
         );
         for state in [
             InventoryStepState::Pending,
