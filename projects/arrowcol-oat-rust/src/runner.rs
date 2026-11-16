@@ -11684,7 +11684,7 @@ mod tests {
     }
 
     #[test]
-    fn campaign_custody_helper_classifies_pre_effect_staleness_only_for_cleanup() {
+    fn campaign_custody_helper_classifies_pre_effect_staleness_only_for_cleanup() -> Result<()> {
         let stale = campaign_custody_helper_failure("cleanup-step", br#"{"ok":false,"code":"stale_version"}"#);
         assert!(stale.downcast_ref::<StaleCampaignVersionError>().is_some());
         let stale_read = campaign_custody_helper_failure("read-inventory", br#"{"ok":false,"code":"stale_version"}"#);
@@ -11696,6 +11696,7 @@ mod tests {
             assert!(error.downcast_ref::<StaleCampaignVersionError>().is_none());
             assert!(error.to_string().contains(code));
         }
+        Ok(())
     }
 
     #[test]
