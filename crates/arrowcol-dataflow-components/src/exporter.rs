@@ -2153,7 +2153,7 @@ mod tests {
                     &exposition,
                     "arrowcol_pipeline_stage_duration_seconds_count{",
                     "stage=\"commit\""
-                ) >= before_commits + 1,
+                ) > before_commits,
                 "one durable commit duration must be emitted per physical commit"
             );
             assert!(
