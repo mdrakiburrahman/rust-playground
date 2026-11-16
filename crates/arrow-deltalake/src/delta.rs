@@ -4389,6 +4389,7 @@ async fn upload_staged_output(
 ) -> Result<Duration> {
     let upload_duration = match mode {
         UploadMode::PutCreate => {
+            let upload_started = Instant::now();
             let payload = tokio::fs::read(source_path)
                 .await
                 .context("read completed Parquet output for create-only upload")?;
@@ -4397,7 +4398,6 @@ async fn upload_staged_output(
                 "Parquet upload source changed: expected {expected_bytes} bytes, found {}",
                 payload.len()
             );
-            let upload_started = Instant::now();
             store
                 .put_opts(&destination, payload.into(), PutMode::Create.into())
                 .await

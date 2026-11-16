@@ -664,6 +664,10 @@ async fn run_batch_worker(
                 FlushTrigger::TargetParquetBytes => FlushReason::TargetParquetBytes,
                 FlushTrigger::MinInputBytes => FlushReason::MinInputBytes,
                 FlushTrigger::MaxInputBytes => FlushReason::MaxInputBytes,
+                _ => {
+                    tracing::error!(trigger = ?trigger, "unrecognized adaptive flush trigger; using target metric");
+                    FlushReason::TargetParquetBytes
+                }
             })
             .or_else(|| {
                 if bytes >= policy.max_arrow_memory_per_flush {
@@ -742,14 +746,19 @@ impl GroupPublisher<'_> {
         Ok(())
     }
 
-    fn record_staging_metrics(&self, append: &arrow_deltalake::StagedAppend) {
-        let timings = append.stage_timings();
-        self.stage_metrics.record(PipelineStage::Build, timings.build);
-        if let Some(duration) = timings.sort {
+    fn record_staging_metrics(
+        &self,
+        build: std::time::Duration,
+        sort: Option<std::time::Duration>,
+        encode: std::time::Duration,
+        upload: Option<std::time::Duration>,
+    ) {
+        self.stage_metrics.record(PipelineStage::Build, build);
+        if let Some(duration) = sort {
             self.stage_metrics.record(PipelineStage::Sort, duration);
         }
-        self.stage_metrics.record(PipelineStage::Encode, timings.encode);
-        if let Some(duration) = timings.upload {
+        self.stage_metrics.record(PipelineStage::Encode, encode);
+        if let Some(duration) = upload {
             self.stage_metrics.record(PipelineStage::Upload, duration);
         }
     }
@@ -854,7 +863,8 @@ impl GroupPublisher<'_> {
                     };
                     published_files += prepared.appends.len() as u64;
                     for append in &prepared.appends {
-                        self.record_staging_metrics(append);
+                        let timings = append.stage_timings();
+                        self.record_staging_metrics(timings.build, timings.sort, timings.encode, timings.upload);
                         updated_estimator.observe(append.observation()).map_err(|error| {
                             ExportFailure::Permanent(format!("file sizing observation failed: {error}"))
                         })?;
@@ -916,7 +926,8 @@ impl GroupPublisher<'_> {
                         .stage()
                         .await
                         .map_err(|error| ExportFailure::Transient(format!("{error:#}")))?;
-                    self.record_staging_metrics(&append);
+                    let timings = append.stage_timings();
+                    self.record_staging_metrics(timings.build, timings.sort, timings.encode, timings.upload);
                     updated_estimator.observe(append.observation()).map_err(|error| {
                         ExportFailure::Permanent(format!("file sizing observation failed: {error}"))
                     })?;
