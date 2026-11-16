@@ -147,7 +147,7 @@ test('single-hot-table campaign separates QAP lag from ingest validity and rejec
     assert.match(unknown.reasons.join('; '), /QAP observation incomplete or metrics missing/);
   }
 
-  const unavailable = evaluateDataFlow(status, [row({ ...valid, evidence_json: JSON.stringify({ ...outputEvidence(), downstream_status: 'unavailable' }) })], sha, 'local', config, 'single_hot_table_campaign');
+  const unavailable = evaluateDataFlow(status, [row({ ...valid, mode: 'local', evidence_json: JSON.stringify({ ...outputEvidence(), downstream_status: 'unavailable' }) })], sha, 'local', config, 'single_hot_table_campaign');
   assert.equal(unavailable.pass, false);
   assert.equal(unavailable.ingestPass, true);
   assert.equal(unavailable.downstreamStatus, 'unknown');
