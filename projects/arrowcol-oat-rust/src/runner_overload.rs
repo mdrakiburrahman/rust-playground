@@ -677,13 +677,17 @@ mod overload_guard_tests {
             config.platform.local.collector_memory_limit_bytes == Some(4 * 1024 * 1024 * 1024),
             "this lifecycle proof requires an explicit 4 GiB cap"
         );
+        anyhow::ensure!(
+            config.platform.local.bind_host.is_some() && config.platform.local.endpoint_host.is_some(),
+            "explicit reachable Docker-host binding and endpoint required for the lifecycle proof"
+        );
         let run_id = uuid::Uuid::new_v4().to_string();
         let root = workspace
             .join("out/arrowcol-oat")
             .join(format!("endpoint-lifecycle-{run_id}"));
         fs::create_dir(&root)?;
         config.platform.compose_state_root = Some(root.join("state").to_str().context("state path")?.to_owned());
-        config.platform.local.snapshot_root = Some(root.join("evidence").to_str().context("evidence path")?.to_owned());
+        config.platform.local.snapshot_root = None;
         config.platform.compose_project = Some("oat-endpoint-lifecycle".to_owned());
         config.maintenance_image = Some("arrowcol-oat/maintenance:local".to_owned());
         let mut overlay: serde_yaml::Value = serde_yaml::from_str(&fs::read_to_string(
@@ -812,6 +816,24 @@ mod overload_guard_tests {
                 bail!("maintenance identity ambiguous");
             };
             receipt["maintenance_configuration"] = process_configurations(&maintenance.text)?;
+            let policy = maintenance
+                .text
+                .lines()
+                .filter_map(|line| line.strip_prefix("arrowcol_maintenance_table_config "))
+                .map(serde_json::from_str::<Value>)
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            anyhow::ensure!(!policy.is_empty(), "effective maintenance table readback missing");
+            for event in &policy {
+                anyhow::ensure!(
+                    event.pointer("/config/table_policy/arrowcol.partition.granularity") == Some(&json!("hour")),
+                    "effective hour granularity not proved"
+                );
+                anyhow::ensure!(
+                    event.pointer("/config/table_policy/arrowcol.optimize.sealedPartitionsOnly") == Some(&json!(false)),
+                    "effective sealed=false not proved"
+                );
+            }
+            receipt["maintenance_table_readback"] = json!(policy);
             fs::write(root.join("maintenance.log"), &maintenance.text)?;
             fs::write(root.join("collector.log"), &after.text)?;
             anyhow::ensure!(

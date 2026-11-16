@@ -57,6 +57,7 @@ need WAL or Quiver; disk protection is explicitly not applicable.
 | Coverage and progress | Pre-admission readback, then 1-second sampling through warm-up and measurement (3-second request deadlines). Startup capability is read once; live Docker/Kubernetes logs use an incremental timestamp cursor with a 5-second overlap, not full-log replay. Ingestion-only durable commit telemetry is deduplicated by table/version and assigned by commit finish time; rewrites and replayed retries cannot create progress. |
 | Stop and custody | `evidence_json.overload_stop` carries `classification: above_ceiling`, reason, metric, value, cap/fraction (null for no-progress), zero-based window index and Unix-ms timestamp. Cancel active clients and retain the normal drain, maintenance and ownership-safe cleanup path; never destroy on failed stop. |
 | Unknown protection | Admission fails closed before clients are created if required readback is unavailable. Mid-cell unavailability stops clients and records guard status `unavailable`, with null current caps; it is not mislabelled as an actual threshold trigger. |
+| Local endpoint lifecycle | Rediscover published router, collector and downstream bindings after setup and each scale/recreate, before pins, maintenance and admission. Failed discovery clears the old URL: required router failure aborts setup/scaling; missing collector protection refuses guarded admission; optional downstream remains unavailable. Samplers use the refreshed collector binding and the guard independently discovers the current container identity. |
 | Qualification | `overload_guard` retains settings, run/schedule identity, coverage, sampling gaps, peak cap fraction and complete progress windows. Missing/disabled/unavailable/incomplete protection and actual stops cannot qualify; a stop is rendered `above_ceiling` even for a failed official row. Existing debt, backlog, reconciliation and 30-second rate gates remain unchanged. |
 
 The collector RSS limit comes from its registration configuration, **not** from
@@ -79,6 +80,21 @@ OAT_GUARD_COLLECTOR_BINARY="$PWD/target/debug/arrowcol-dataflow-rust" \
 OAT_GUARD_DOCKER_RUNNER="$HOSTNAME" \
 cargo test --locked --package arrowcol-oat-rust --lib \
   overload_actual_docker_admission_and_idle_sampling -- --ignored --nocapture
+```
+
+The separately authorized lifecycle check below uses existing cached component
+images without rebuilding or relabelling them. Its local single-hot-table config
+must request a 4 GiB collector cap, hour granularity and `sealed_partitions_only:
+false`. It creates an isolated stack, scales/recreates the collector, initializes
+pins and maintenance, then prepares guard/policy admission without creating
+workload clients or arming a schedule. It retains an unscored receipt (old/new
+container IDs and endpoints, HTTP status, cgroup and policy readbacks, cleanup)
+under `out/arrowcol-oat/endpoint-lifecycle-<run-id>/`. This is not a load diagnostic.
+
+```bash
+OAT_ENDPOINT_LIFECYCLE_CONFIG=/absolute/path/to/authorized-local-config.json \
+cargo test --locked --package arrowcol-oat-rust --lib \
+  local_endpoint_actual_docker_lifecycle_without_clients -- --ignored --nocapture
 ```
 
 ## AKS rollout readiness
