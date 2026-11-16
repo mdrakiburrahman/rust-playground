@@ -8,8 +8,8 @@ use anyhow::{Context, Result, bail};
 use arrow_deltalake::delta::DeltaTable;
 use arrow_deltalake::maintenance::{
     DEFAULT_OPTIMIZE_UPLOAD_BUFFER_BYTES, Granularity, MaintenanceControl, MaintenanceError, MaintenanceErrorKind,
-    MaintenancePlan, MaintenanceReport, NegativeProbeConfig, OptimizeConfig, OptimizePlan, Outcome, ProbeOperation,
-    PruneConfig, PurgeConfig, VacuumConfig, error_details, now_ms,
+    MaintenancePlan, MaintenanceReport, NegativeProbeConfig, OptimizeConfig, OptimizePlan, Outcome, PassProbeInventory,
+    ProbeOperation, PruneConfig, PurgeConfig, VacuumConfig, error_details, now_ms,
 };
 use arrowcol_props::{PropValue, ResolvedProps, resolve};
 use serde::Serialize;
@@ -1424,18 +1424,20 @@ fn maintain_table(
             "arrowcol_maintenance_table_config {}",
             serde_json::json!({ "table": name, "config": config })
         );
-        Ok(Some((discovered, effective, props, probe, gate)))
+        let anchor = effective.anchor_ms.map_or_else(now_ms, Ok)?;
+        Ok(Some((discovered, effective, props, probe, gate, anchor)))
     })();
     if matches!(&setup, Ok(None)) {
         return results;
     }
     let operations = match &setup {
-        Ok(Some((_, effective, _, _, _))) => &effective.operations,
+        Ok(Some((_, effective, _, _, _, _))) => &effective.operations,
         _ => &settings.operations,
     };
     let mut table = None;
+    let mut inventory = PassProbeInventory::default();
     let mut observed_token = match &setup {
-        Ok(Some((discovered, _, _, _, _))) => discovered.log_token.clone(),
+        Ok(Some((discovered, _, _, _, _, _))) => discovered.log_token.clone(),
         _ => None,
     };
     for operation in Operation::ALL
@@ -1449,11 +1451,11 @@ fn maintain_table(
         let mut optimize = None;
         let mut negative_probe = false;
         let effective = match &setup {
-            Ok(Some((_, effective, _, _, _))) => effective,
+            Ok(Some((_, effective, _, _, _, _))) => effective,
             _ => settings,
         };
         let outcome = match &setup {
-            Ok(Some((discovered, effective, props, probe, _))) => (|| {
+            Ok(Some((discovered, effective, props, probe, _, pass_anchor))) => (|| {
                 let control = MaintenanceControl::new(Arc::clone(cancel), Some(started + effective.operation_timeout))
                     .with_commit_retry_limits(effective.commit_attempts, effective.commit_budget)?;
                 let token = probe.probe_log_token(settings.operation_limits.discovery_max_log_files)?;
@@ -1470,7 +1472,7 @@ fn maintain_table(
                     bail!("table properties changed during the maintenance pass; retry discovery");
                 }
                 observed_token = Some(token);
-                let anchor = effective.anchor_ms.map_or_else(now_ms, Ok)?;
+                let anchor = *pass_anchor;
                 let config = NegativeProbeConfig {
                     now_ms: anchor,
                     granularity: effective.granularity.context("effective partition granularity")?,
@@ -1500,8 +1502,12 @@ fn maintain_table(
                             retention < arrow_deltalake::maintenance::MIN_VACUUM_RETENTION_MS
                         }));
                 if !full_validation {
-                    let (report, stale) =
-                        negative_probe_result(probe.probe_no_work(probe_operation, &config, &control))?;
+                    let (report, stale) = negative_probe_result(probe.probe_no_work_with_inventory(
+                        probe_operation,
+                        &config,
+                        &control,
+                        &mut inventory,
+                    ))?;
                     if stale {
                         eprintln!(
                             "delta-maintenance negative probe became stale; using full planner table={name} operation={}",
@@ -1516,6 +1522,7 @@ fn maintain_table(
                 if table.is_none() {
                     table = Some(DeltaTable::open_for_maintenance(&discovered.url)?);
                 }
+                inventory.invalidate();
                 run_operation(
                     effective,
                     table.as_ref().context("maintenance table")?,

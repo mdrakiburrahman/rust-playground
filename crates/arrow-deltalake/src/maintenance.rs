@@ -772,6 +772,23 @@ impl DeltaTable {
         config: &NegativeProbeConfig,
         control: &MaintenanceControl,
     ) -> Result<Option<MaintenanceReport>> {
+        self.probe_no_work_with_inventory(operation, config, control, &mut PassProbeInventory::default())
+    }
+
+    /// Reuse bounded inventories inside a single table pass.
+    ///
+    /// The caller must invalidate after any operation that may mutate the table.
+    /// A reported noop is fenced against fresh log object identities before return.
+    ///
+    /// # Errors
+    /// Returns inventory, retention, malformed checkpoint, cancellation or stale-probe errors.
+    pub fn probe_no_work_with_inventory(
+        &self,
+        operation: ProbeOperation,
+        config: &NegativeProbeConfig,
+        control: &MaintenanceControl,
+        inventory: &mut PassProbeInventory,
+    ) -> Result<Option<MaintenanceReport>> {
         control.check()?;
         validate_anchor("probe", config.now_ms)?;
         if (operation == ProbeOperation::Vacuum && config.vacuum_retention_ms < MIN_VACUUM_RETENTION_MS)
@@ -785,9 +802,27 @@ impl DeltaTable {
         if config.max_listed_files == 0 || config.checkpoint_interval == 0 || config.optimize_min_files < 2 {
             return Err(fail(MaintenanceErrorKind::InvalidPlan, "invalid negative-probe bounds"));
         }
-        let logs = self.list_log(config.max_listed_files)?;
+        if inventory
+            .property_fingerprint
+            .as_ref()
+            .is_some_and(|fingerprint| fingerprint != config)
+        {
+            inventory.invalidate();
+        }
+        inventory.property_fingerprint = Some(config.clone());
+        if inventory.logs.is_none() {
+            inventory.logs = Some(Arc::new(self.list_log(config.max_listed_files)?));
+        }
+        let logs = Arc::clone(inventory.logs.as_ref().context("missing pass log inventory")?);
         let version = probe_version(&logs)?;
-        let checkpoint = self.hinted_checkpoint_version(true)?;
+        let checkpoint = match inventory.checkpoint_version {
+            Some(checkpoint) => checkpoint,
+            None => {
+                let checkpoint = self.hinted_checkpoint_version(true)?;
+                inventory.checkpoint_version = Some(checkpoint);
+                checkpoint
+            }
+        };
         if checkpoint.is_some_and(|checkpoint| checkpoint > version) {
             return Err(fail(
                 MaintenanceErrorKind::Unsupported,
@@ -841,11 +876,14 @@ impl DeltaTable {
             ProbeOperation::Checkpoint => debt < config.checkpoint_interval,
             ProbeOperation::PruneLog => checkpoint.is_none() || !old_logs,
             ProbeOperation::Optimize | ProbeOperation::Purge | ProbeOperation::Vacuum => {
-                let physical = self.probe_physical_files(config.max_listed_files, control)?;
+                if inventory.physical.is_none() {
+                    inventory.physical = Some(Arc::new(self.probe_physical_files(config.max_listed_files, control)?));
+                }
+                let physical = Arc::clone(inventory.physical.as_ref().context("missing pass physical inventory")?);
                 match operation {
                     ProbeOperation::Optimize => {
                         let mut groups: BTreeMap<String, usize> = BTreeMap::new();
-                        for (relative, meta) in physical {
+                        for (relative, meta) in physical.iter() {
                             let partition = relative.rsplit_once('/').map_or("", |(parent, _)| parent).to_owned();
                             let count = groups.entry(partition).or_default();
                             if meta.size < config.optimize_small_file_bytes {
@@ -864,7 +902,7 @@ impl DeltaTable {
                     ProbeOperation::Purge => {
                         let cutoff = purge_cutoff(config.granularity, config.now_ms, config.purge_retention_ms)?;
                         let mut eligible = false;
-                        for (relative, _) in physical {
+                        for (relative, _) in physical.iter() {
                             let part = relative
                                 .split('/')
                                 .find_map(|segment| segment.strip_prefix("__arrowcol_ingestion="));
@@ -911,6 +949,7 @@ impl DeltaTable {
                 .collect::<Vec<_>>()
         };
         if signature(&fresh_logs) != signature(&logs) {
+            inventory.invalidate();
             return Err(fail(
                 MaintenanceErrorKind::StalePlan,
                 "log changed during negative probe; retry",
@@ -1088,7 +1127,7 @@ impl ProbeOperation {
 }
 
 /// Validated table policy required by the read-only probes.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NegativeProbeConfig {
     pub now_ms: i64,
     pub granularity: Granularity,
@@ -1100,6 +1139,24 @@ pub struct NegativeProbeConfig {
     pub optimize_min_files: usize,
     pub sealed_partitions_only: bool,
     pub max_listed_files: usize,
+}
+
+/// Bounded read-only inventory reused only within one table's maintenance pass.
+/// The full probe policy is its property fingerprint; changed policy invalidates
+/// all cached objects, and a negative result is still fenced by fresh log identity.
+#[derive(Default)]
+pub struct PassProbeInventory {
+    property_fingerprint: Option<NegativeProbeConfig>,
+    logs: Option<Arc<BTreeMap<String, ObjectMeta>>>,
+    physical: Option<Arc<Vec<(String, ObjectMeta)>>>,
+    checkpoint_version: Option<Option<u64>>,
+}
+
+impl PassProbeInventory {
+    /// Discard every pass-scoped observation after a mutation or stale identity.
+    pub fn invalidate(&mut self) {
+        *self = Self::default();
+    }
 }
 
 impl DeltaTable {

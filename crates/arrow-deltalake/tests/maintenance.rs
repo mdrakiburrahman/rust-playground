@@ -10,8 +10,8 @@ use arrow_deltalake::delta::{
 use arrow_deltalake::layout::LayoutPolicy;
 use arrow_deltalake::maintenance::{
     CompactionDebtSource, DISPOSABLE_TEST_MARKER, Granularity, LogFloor, MaintenanceControl, MaintenanceErrorKind,
-    MaintenancePlan, NegativeProbeConfig, OptimizeConfig, Outcome, ProbeOperation, PruneConfig, PurgeConfig,
-    VacuumConfig, error_kind, now_ms,
+    MaintenancePlan, NegativeProbeConfig, OptimizeConfig, Outcome, PassProbeInventory, ProbeOperation, PruneConfig,
+    PurgeConfig, VacuumConfig, error_kind, now_ms,
 };
 use async_trait::async_trait;
 use delta_kernel::object_store::{
@@ -163,6 +163,80 @@ fn compaction_debt_evidence_distinguishes_zero_from_bounded_backlog() -> Result<
     Ok(())
 }
 
+#[test]
+fn pass_inventory_bounds_counted_io_for_all_idle_operations() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let table = create(root.path())?;
+    append(&table, 0, 0..3)?;
+    append(&table, 1, 10..13)?;
+    drop(table);
+
+    let counts = Arc::new(StorageCounts::default());
+    let store = Arc::new(UncertainStore {
+        inner: LocalFileSystem::new(),
+        target: "no-uncertain-commit-in-this-test".to_owned(),
+        unreadable: AtomicBool::new(false),
+        attempts: AtomicUsize::new(0),
+        read_barrier: None,
+        counts: Some(Arc::clone(&counts)),
+    });
+    let maintenance = DeltaTable::open_with_store(root.path(), Arc::clone(&store) as Arc<dyn ObjectStore>)?;
+    counts.reads.store(0, Ordering::SeqCst);
+    counts.lists.store(0, Ordering::SeqCst);
+    counts.writes.store(0, Ordering::SeqCst);
+
+    let config = NegativeProbeConfig {
+        now_ms: now_ms()?,
+        granularity: Granularity::Minute,
+        purge_retention_ms: 10_000_000_000_000,
+        vacuum_retention_ms: 10_000_000_000_000,
+        log_retention_ms: 10_000_000_000_000,
+        checkpoint_interval: 100,
+        optimize_small_file_bytes: 64 * 1024 * 1024,
+        optimize_min_files: 2,
+        sealed_partitions_only: false,
+        max_listed_files: 1000,
+    };
+    let mut inventory = PassProbeInventory::default();
+    for operation in [
+        ProbeOperation::Purge,
+        ProbeOperation::Optimize,
+        ProbeOperation::Vacuum,
+        ProbeOperation::Checkpoint,
+        ProbeOperation::PruneLog,
+    ] {
+        assert!(
+            maintenance
+                .probe_no_work_with_inventory(operation, &config, &control(), &mut inventory)?
+                .is_some(),
+            "{operation:?} should be a proven no-op"
+        );
+    }
+
+    assert_eq!(counts.writes.load(Ordering::SeqCst), 0);
+    assert!(counts.lists.load(Ordering::SeqCst) <= 7, "bounded pass listings");
+    assert!(counts.reads.load(Ordering::SeqCst) <= 12, "bounded pass reads");
+    let idle_lists = counts.lists.load(Ordering::SeqCst);
+    let due_config = NegativeProbeConfig {
+        now_ms: now_ms()?
+            .checked_add(90 * 24 * 60 * 60 * 1000)
+            .context("due anchor overflow")?,
+        purge_retention_ms: 90 * 24 * 60 * 60 * 1000,
+        ..config.clone()
+    };
+    assert!(
+        maintenance
+            .probe_no_work_with_inventory(ProbeOperation::Purge, &due_config, &control(), &mut inventory)?
+            .is_none(),
+        "new pass anchor must recompute retention eligibility"
+    );
+    assert!(
+        counts.lists.load(Ordering::SeqCst) > idle_lists,
+        "changed anchor invalidates inventory"
+    );
+    assert_eq!(counts.writes.load(Ordering::SeqCst), 0);
+    Ok(())
+}
 fn purge_config() -> PurgeConfig {
     // cutoff = floor(00:03:30 - 90s) = 00:02, so minutes 00 and 01 expire.
     PurgeConfig::new(90_000, BASE + 3 * MINUTE + 30_000, Granularity::Minute)
@@ -710,6 +784,7 @@ fn sealed_final_optimize_revalidates_inputs_after_concurrent_append() -> Result<
         unreadable: AtomicBool::new(false),
         attempts: AtomicUsize::new(0),
         read_barrier: Some(barrier),
+        counts: None,
     });
     let table = DeltaTable::open_with_store(root.path(), store)?;
     let config = OptimizeConfig {
@@ -1390,6 +1465,24 @@ struct UncertainStore {
     unreadable: AtomicBool,
     attempts: AtomicUsize,
     read_barrier: Option<Arc<BarrierFence>>,
+    counts: Option<Arc<StorageCounts>>,
+}
+
+#[derive(Debug, Default)]
+struct StorageCounts {
+    reads: AtomicUsize,
+    lists: AtomicUsize,
+    writes: AtomicUsize,
+}
+
+impl StorageCounts {
+    fn read(&self) {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn write(&self) {
+        self.writes.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 impl std::fmt::Display for UncertainStore {
@@ -1406,6 +1499,9 @@ impl ObjectStore for UncertainStore {
         payload: PutPayload,
         options: PutOptions,
     ) -> object_store::Result<PutResult> {
+        if let Some(counts) = &self.counts {
+            counts.write();
+        }
         if path.as_ref().ends_with(&self.target) {
             self.attempts.fetch_add(1, Ordering::SeqCst);
             self.inner.put_opts(path, payload, options).await?;
@@ -1422,10 +1518,16 @@ impl ObjectStore for UncertainStore {
         path: &object_store::path::Path,
         options: PutMultipartOptions,
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        if let Some(counts) = &self.counts {
+            counts.write();
+        }
         self.inner.put_multipart_opts(path, options).await
     }
 
     async fn get_opts(&self, path: &object_store::path::Path, options: GetOptions) -> object_store::Result<GetResult> {
+        if let Some(counts) = &self.counts {
+            counts.read();
+        }
         if path.as_ref().ends_with(".parquet")
             && let Some(barrier) = &self.read_barrier
         {
@@ -1450,14 +1552,25 @@ impl ObjectStore for UncertainStore {
         &self,
         paths: BoxStream<'static, object_store::Result<object_store::path::Path>>,
     ) -> BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        if let Some(counts) = &self.counts {
+            counts.write();
+        }
         self.inner.delete_stream(paths)
     }
 
     fn list(&self, prefix: Option<&object_store::path::Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        if let Some(counts) = &self.counts {
+            counts.read();
+            counts.lists.fetch_add(1, Ordering::SeqCst);
+        }
         self.inner.list(prefix)
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&object_store::path::Path>) -> object_store::Result<ListResult> {
+        if let Some(counts) = &self.counts {
+            counts.read();
+            counts.lists.fetch_add(1, Ordering::SeqCst);
+        }
         self.inner.list_with_delimiter(prefix).await
     }
 
@@ -1467,6 +1580,9 @@ impl ObjectStore for UncertainStore {
         to: &object_store::path::Path,
         options: CopyOptions,
     ) -> object_store::Result<()> {
+        if let Some(counts) = &self.counts {
+            counts.write();
+        }
         self.inner.copy_opts(from, to, options).await
     }
 
@@ -1476,6 +1592,9 @@ impl ObjectStore for UncertainStore {
         to: &object_store::path::Path,
         options: RenameOptions,
     ) -> object_store::Result<()> {
+        if let Some(counts) = &self.counts {
+            counts.write();
+        }
         self.inner.rename_opts(from, to, options).await
     }
 }
@@ -1503,6 +1622,7 @@ fn optimize_uncertain_commit_never_discards_outputs() -> Result<()> {
             unreadable: AtomicBool::new(unreadable),
             attempts: AtomicUsize::new(0),
             read_barrier: None,
+            counts: None,
         });
         let maintenance = DeltaTable::open_with_store(root.path(), Arc::clone(&store) as Arc<dyn ObjectStore>)?;
         let plan = maintenance.plan_optimize(&optimize_config())?;
