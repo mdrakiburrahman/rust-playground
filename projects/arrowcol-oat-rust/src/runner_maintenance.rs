@@ -36,6 +36,8 @@ fn maintenance_runtime(config: &OatConfig) -> Result<Option<Value>> {
         "tables": config.tables.iter().map(|table| canonical_dmv_table_name(table)).collect::<Result<Vec<_>>>()?,
         "operations": operations,
         "apply": settings.apply.unwrap_or(false),
+        "granularity": settings.granularity.unwrap_or(arrowcol_tunables::MaintenanceGranularity::Hour),
+        "stopGraceSeconds": config.maintenance_stop_budget()?.0,
     })))
 }
 
@@ -1159,6 +1161,36 @@ mod maintenance_topology_tests {
                 maintenance_readback_value(&observed, &format!("ARROWCOL_MAINT_{variable}"), expected)?;
             assert_eq!(actual, requested);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn effective_table_timeout_is_budgeted_before_admission() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+            "maintenance":{"enabled":true,"apply":true,"operations":["optimize"]}
+        }))?;
+        let table = canonical_dmv_table_name(&config.tables[0])?;
+        let event = |timeout_ms| json!({
+            "table": table,
+            "config": {"active":true,"table_policy":{"arrowcol.maintenance.operationTimeout":timeout_ms},
+                "startup":{"apply":true,"operations":["optimize"],"interval_secs":60}}
+        });
+        let default_timeout = format!("arrowcol_maintenance_table_config {}\n", event(300_000));
+        assert!(maintenance_table_evidence(&config, &default_timeout).is_ok(),
+            "the resolved registry default must remain eligible when it fits the persisted deadline");
+        let oversized_timeout = format!("arrowcol_maintenance_table_config {}\n", event(1_200_000));
+        assert!(maintenance_table_evidence(&config, &oversized_timeout).is_err(),
+            "a 1,200-second table override must not outlive the 900-second requested/default budget");
+
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+            "maintenance":{"enabled":true,"apply":true,"operations":["optimize"],"operation_timeout_secs":900}
+        }))?;
+        let shorter_override = format!("arrowcol_maintenance_table_config {}\n", event(600_000));
+        assert!(maintenance_table_evidence(&config, &shorter_override).is_ok(),
+            "a safe table override may differ from the requested process default");
         Ok(())
     }
 

@@ -336,6 +336,26 @@ pub(crate) struct RunTimingBudget {
     pub(crate) schedule_wait_seconds: u64,
     pub(crate) client_job_lifetime_seconds: u64,
     pub(crate) minimum_pin_ttl_ms: u64,
+    pub(crate) planned_cell_duration_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct EffectiveStopBudgets {
+    pub(crate) maintenance_grace_seconds: u64,
+    pub(crate) maintenance_stop_timeout_ms: u64,
+}
+
+impl EffectiveStopBudgets {
+    pub(crate) fn validate(self) -> Result<Self> {
+        if self.maintenance_grace_seconds == 0
+            || self.maintenance_stop_timeout_ms < self.maintenance_grace_seconds.saturating_mul(1_000)
+            || self.maintenance_stop_timeout_ms > 5_100_000
+        {
+            bail!("effective maintenance stop budgets are inconsistent or exceed the fixed timeout ceiling");
+        }
+        Ok(self)
+    }
 }
 
 impl OatConfig {
@@ -398,7 +418,7 @@ impl OatConfig {
             .unwrap_or_default()
     }
 
-    pub(crate) fn maintenance_stop_budget(&self) -> Result<(u64, u64)> {
+    pub(crate) fn maintenance_stop_budget(&self) -> Result<EffectiveStopBudgets> {
         const DEFAULT_GRACE_SECONDS: u64 = 4_800;
         const DEFAULT_TIMEOUT_MS: u64 = 5_100_000;
         const OPERATION_HEADROOM_SECONDS: u64 = 300;
@@ -409,7 +429,11 @@ impl OatConfig {
             .as_ref()
             .filter(|settings| settings.enabled == Some(true))
         else {
-            return Ok((DEFAULT_GRACE_SECONDS, DEFAULT_TIMEOUT_MS));
+            return EffectiveStopBudgets {
+                maintenance_grace_seconds: DEFAULT_GRACE_SECONDS,
+                maintenance_stop_timeout_ms: DEFAULT_TIMEOUT_MS,
+            }
+            .validate();
         };
         let operation_count = u64::try_from(
             settings
@@ -432,7 +456,11 @@ impl OatConfig {
                 "maintenance.operation_timeout_secs and enabled operation count exceed the fixed 5100-second cleanup budget"
             );
         }
-        Ok((grace, timeout_ms))
+        EffectiveStopBudgets {
+            maintenance_grace_seconds: grace,
+            maintenance_stop_timeout_ms: timeout_ms,
+        }
+        .validate()
     }
 
     fn validate_local_purge_inputs(&self) -> Result<()> {
@@ -591,13 +619,35 @@ impl OatConfig {
             .checked_add(PIN_INIT_SETUP_TIMEOUT_SECONDS)
             .and_then(|seconds| seconds.checked_add(self.reconciliation_settle_timeout_seconds))
             .and_then(|seconds| seconds.checked_add(self.collector_stop_grace_seconds))
+            .and_then(|seconds| seconds.checked_add(self.qap_timeout_seconds))
             .context("OAT pin initialization and collector drain lifetime budget overflow")?
             .checked_mul(1_000)
             .context("OAT run pin lifetime budget overflow")?;
+        let rollout_count = if self.platform.kind == OatMode::Aks {
+            u64::try_from(self.deployment_names().len())?
+                .checked_add(1)
+                .and_then(|count| {
+                    count.checked_add(u64::from(
+                        self.tunables
+                            .maintenance
+                            .as_ref()
+                            .is_some_and(|settings| settings.enabled == Some(true)),
+                    ))
+                })
+                .context("OAT AKS rollout count overflow")?
+        } else {
+            0
+        };
+        let planned_cell_duration_ms = rollout_count
+            .checked_mul(self.aks_rollout_timeout_seconds)
+            .and_then(|seconds| seconds.checked_mul(1_000))
+            .and_then(|rollouts_ms| minimum_pin_ttl_ms.checked_add(rollouts_ms))
+            .context("OAT planned cell lifecycle duration overflow")?;
         Ok(RunTimingBudget {
             schedule_wait_seconds,
             client_job_lifetime_seconds,
             minimum_pin_ttl_ms,
+            planned_cell_duration_ms,
         })
     }
 

@@ -8545,6 +8545,15 @@ async fn prepare_aks_platform(
     runtime_config["namespace"] = json!(config.namespace);
     runtime_config["oatRunId"] = json!(platform.run_id);
     runtime_config["quiver"] = json!(config.tunables.wal.is_some());
+    runtime_config["resources"] = serde_json::to_value(config.effective_aks_resources())?;
+    runtime_config["collectorWorkers"] = json!(
+        config
+            .dfe_worker_concurrency
+            .iter()
+            .copied()
+            .max()
+            .context("empty worker concurrency sweep")?
+    );
     if let Some(maintenance) = maintenance_runtime(config)? {
         runtime_config["maintenance"] = maintenance;
         runtime_config["images"]["maintenance"] = json!(

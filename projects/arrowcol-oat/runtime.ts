@@ -4,6 +4,11 @@ import { dirname, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { parse, stringify } from 'yaml';
 
+export type RuntimeResourceRole = 'collector' | 'client' | 'maintenance' | 'router' | 'catalog';
+export interface ResourceValues { cpu: string; memory: string }
+export interface ResourceRequirements { requests: ResourceValues; limits: ResourceValues }
+export type RuntimeResources = Partial<Record<RuntimeResourceRole, ResourceRequirements>>;
+
 export interface RuntimeConfig {
   namespace: string;
   oatRunId: string;
@@ -13,23 +18,74 @@ export interface RuntimeConfig {
   stamp: string;
   deltaRoot: string;
   images: { sqlserver: string; catalog: string; router: string; dataflow: string; maintenance?: string };
-  maintenance?: { tables: string[]; operations: string[]; apply: boolean };
+  maintenance?: { tables: string[]; operations: string[]; apply: boolean; granularity?: 'minute' | 'hour' | 'day'; stopGraceSeconds?: number };
   quiver?: boolean;
+  resources?: RuntimeResources;
+  collectorWorkers?: number;
 }
 type Resource = Record<string, any>;
 export type Phase = 'identity' | 'foundation' | 'bootstrap' | 'workload';
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const dns = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 const roles = ['sqlserver', 'catalog', 'router', 'dataflow'] as const;
+const resourceRoles: RuntimeResourceRole[] = ['collector', 'client', 'maintenance', 'router', 'catalog'];
+const defaultResources: Record<RuntimeResourceRole, ResourceRequirements> = {
+  collector: { requests: { cpu: '2', memory: '4Gi' }, limits: { cpu: '2', memory: '6Gi' } },
+  client: { requests: { cpu: '250m', memory: '256Mi' }, limits: { cpu: '2', memory: '2Gi' } },
+  maintenance: { requests: { cpu: '250m', memory: '512Mi' }, limits: { cpu: '1', memory: '2Gi' } },
+  router: { requests: { cpu: '500m', memory: '512Mi' }, limits: { cpu: '2', memory: '1Gi' } },
+  catalog: { requests: { cpu: '500m', memory: '1Gi' }, limits: { cpu: '2', memory: '4Gi' } },
+};
+
+function cpuMilli(value: unknown): bigint {
+  if (typeof value !== 'string') throw new Error('resource cpu quantities must be strings');
+  const match = /^(?:([0-9]+)m|([0-9]+)(?:[.]([0-9]{1,3}))?)$/.exec(value);
+  if (!match) throw new Error('resource cpu must be a positive Kubernetes CPU quantity');
+  const milli = match[1] ? BigInt(match[1]) : BigInt(match[2]) * 1000n + BigInt((match[3] ?? '').padEnd(3, '0') || '0');
+  if (milli <= 0n) throw new Error('resource cpu quantities must be positive');
+  return milli;
+}
+
+function memoryBytes(value: unknown): bigint {
+  if (typeof value !== 'string') throw new Error('resource memory quantities must be strings');
+  const match = /^([0-9]+)(Ei|Pi|Ti|Gi|Mi|Ki|E|P|T|G|M|k)?$/.exec(value);
+  if (!match) throw new Error('resource memory must be an integer Kubernetes byte quantity');
+  const powers: Record<string, bigint> = { k: 1000n, M: 1000000n, G: 1000000000n, T: 1000000000000n,
+    P: 1000000000000000n, E: 1000000000000000000n, Ki: 1024n, Mi: 1048576n, Gi: 1073741824n,
+    Ti: 1099511627776n, Pi: 1125899906842624n, Ei: 1152921504606846976n };
+  const bytes = BigInt(match[1]) * (powers[match[2] ?? ''] ?? 1n);
+  if (bytes <= 0n) throw new Error('resource memory quantities must be positive');
+  return bytes;
+}
+
+function validateResources(value: unknown): asserts value is RuntimeResources {
+  if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).some(role => !resourceRoles.includes(role as RuntimeResourceRole)))
+    throw new Error('resources must contain only known per-role settings');
+  for (const [role, requirements] of Object.entries(value)) {
+    if (!requirements || typeof requirements !== 'object' || Array.isArray(requirements) ||
+        Object.keys(requirements).sort().join() !== 'limits,requests') throw new Error(role + ' resources require requests and limits');
+    for (const side of ['requests', 'limits'] as const) {
+      const amounts = requirements[side];
+      if (!amounts || typeof amounts !== 'object' || Array.isArray(amounts) || Object.keys(amounts).sort().join() !== 'cpu,memory')
+        throw new Error(role + ' ' + side + ' requires cpu and memory quantities');
+    }
+    const request = requirements.requests, limit = requirements.limits;
+    if (cpuMilli(request.cpu) > cpuMilli(limit.cpu) || memoryBytes(request.memory) > memoryBytes(limit.memory))
+      throw new Error(role + ' resource requests must not exceed limits');
+  }
+}
 
 export function validateRuntime(input: unknown, allowUnpublishedImages = false): RuntimeConfig {
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('runtime config must be an object');
   const c = input as RuntimeConfig;
   const required = ['deltaRoot', 'images', 'namespace', 'oatRunId', 'workloadIdentityClientId', 'subscriptionId', 'stamp'];
-  if (required.some((key) => !Object.hasOwn(c, key)) || Object.keys(c).some((key) => ![...required, 'serviceAccount', 'maintenance', 'quiver'].includes(key))) {
+  if (required.some((key) => !Object.hasOwn(c, key)) || Object.keys(c).some((key) => ![...required, 'serviceAccount', 'maintenance', 'quiver', 'resources', 'collectorWorkers'].includes(key))) {
     throw new Error('runtime config has missing or unknown fields');
   }
   if (Object.hasOwn(c, 'quiver') && typeof c.quiver !== 'boolean') throw new Error('quiver must be an explicit boolean');
+  if (Object.hasOwn(c, 'resources')) validateResources(c.resources);
+  if (Object.hasOwn(c, 'collectorWorkers') && (!Number.isSafeInteger(c.collectorWorkers) || c.collectorWorkers! < 1 || c.collectorWorkers! > 256))
+    throw new Error('collectorWorkers must be an integer from 1 to 256');
   if (typeof c.namespace !== 'string' || !dns.test(c.namespace) || c.namespace.startsWith('kube-') || ['default', 'azure-qap'].includes(c.namespace)) {
     throw new Error('use a dedicated OAT namespace (not the QAP namespace)');
   }
@@ -60,13 +116,17 @@ export function validateRuntime(input: unknown, allowUnpublishedImages = false):
   if (Object.hasOwn(c, 'maintenance')) {
     const policy = c.maintenance;
     if (!policy || typeof policy !== 'object' || Array.isArray(policy) ||
-        Object.keys(policy).sort().join() !== 'apply,operations,tables' || typeof policy.apply !== 'boolean' ||
+        Object.keys(policy).some(key => !['apply', 'operations', 'tables', 'granularity', 'stopGraceSeconds'].includes(key)) ||
+        !['apply', 'operations', 'tables'].every(key => Object.hasOwn(policy, key)) || typeof policy.apply !== 'boolean' ||
         !Array.isArray(policy.tables) || policy.tables.length === 0 || policy.tables.length > 256 ||
         policy.tables.some(table => typeof table !== 'string' || !/^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$/.test(table)) ||
         new Set(policy.tables).size !== policy.tables.length ||
         !Array.isArray(policy.operations) || policy.operations.length === 0 ||
         policy.operations.some(operation => !['optimize', 'checkpoint', 'purge', 'vacuum', 'prune-log'].includes(operation)) ||
-        new Set(policy.operations).size !== policy.operations.length) throw new Error('maintenance requires explicit qualified table allowlist, operations and apply boolean');
+        new Set(policy.operations).size !== policy.operations.length ||
+        (policy.granularity !== undefined && !['minute', 'hour', 'day'].includes(policy.granularity)) ||
+        (policy.stopGraceSeconds !== undefined && (!Number.isSafeInteger(policy.stopGraceSeconds) || policy.stopGraceSeconds < 30 || policy.stopGraceSeconds > 4_800)))
+      throw new Error('maintenance requires explicit qualified table allowlist, operations and apply boolean');
     if (!c.images.maintenance) throw new Error('enabled maintenance requires a revision-verified digest-pinned maintenance image');
   }
   return c;
@@ -77,10 +137,11 @@ const security = {
   allowPrivilegeEscalation: false, capabilities: { drop: ['ALL'] },
 };
 
-export async function renderDataflow(quiver: boolean): Promise<string> {
+export async function renderDataflow(quiver: boolean, collectorWorkers = 1): Promise<string> {
   const profile = quiver ? 'config.quiver.yaml' : 'config.yaml';
   const dataflow = parse(await readFile(`projects/arrowcol-dataflow-rust/${profile}`, 'utf8'));
-  delete dataflow.policies.resources;
+  if (!Number.isSafeInteger(collectorWorkers) || collectorWorkers < 1 || collectorWorkers > 256) throw new Error('collectorWorkers must be an integer from 1 to 256');
+  dataflow.policies.resources.core_allocation.count = collectorWorkers;
   return stringify(dataflow);
 }
 const env = (name: string, value: string) => ({ name, value });
@@ -91,9 +152,14 @@ const secretVolume = (name: string, secretName: string) => ({
   name, secret: { secretName, defaultMode: 0o440 },
 });
 const mount = (name: string, mountPath: string, readOnly = true) => ({ name, mountPath, readOnly });
+const resourceSpec = (requirements: ResourceRequirements) => ({
+  requests: { cpu: requirements.requests.cpu, memory: requirements.requests.memory },
+  limits: { cpu: requirements.limits.cpu, memory: requirements.limits.memory },
+});
 const resources = (cpu: string, memory: string, limitCpu = cpu, limitMemory = memory) => ({
   requests: { cpu, memory }, limits: { cpu: limitCpu, memory: limitMemory },
 });
+const resourceFor = (c: RuntimeConfig, role: RuntimeResourceRole) => c.resources?.[role] ?? defaultResources[role];
 const httpProbe = (path: string, port: number) => ({ httpGet: { path, port }, timeoutSeconds: 3, periodSeconds: 5, failureThreshold: 6 });
 const execProbe = (command: string[]) => ({ exec: { command }, timeoutSeconds: 8, periodSeconds: 10, failureThreshold: 6 });
 
@@ -178,7 +244,7 @@ export async function renderRuntime(input: unknown, phase: Phase): Promise<Resou
     }];
     return [object('batch/v1', 'Job', 'arrowcol-migrate-v11', { spec: { backoffLimit: 0, activeDeadlineSeconds: 600, template } })];
   }
-  const dataflow = await renderDataflow(c.quiver === true);
+  const dataflow = await renderDataflow(c.quiver === true, c.collectorWorkers ?? 1);
   const router = parse(await readFile('projects/arrowcol-router-rust/config.docker.yaml', 'utf8'));
   router.auth.authenticator = 'dev_only_allow_all';
   router.sql_server.host = 'arrowcol-sql';
@@ -209,7 +275,7 @@ export async function renderRuntime(input: unknown, phase: Phase): Promise<Resou
       args: ['--warehouse-root', c.deltaRoot, '--state-dir', '/data/catalog', '--ingestion-layout',
         '--ddl-identity-secret-file', '/run/auth/internal-hmac'],
       env: [...cloudEnv, env('ARROWCOL_CATALOG_DDL_IDENTITY_SECRET_FILE', '/run/auth/internal-hmac')],
-      ports: [{ containerPort: 8817 }], resources: resources('500m', '1Gi', '2', '4Gi'),
+      ports: [{ containerPort: 8817 }], resources: resourceSpec(resourceFor(c, 'catalog')),
       startupProbe: { ...execProbe(['/usr/local/bin/arrowcol-catalog-rust', '--healthcheck']), failureThreshold: 60 },
       readinessProbe: execProbe(['/usr/local/bin/arrowcol-catalog-rust', '--healthcheck']),
       volumeMounts: [mount('state', '/data', false), mount('auth', '/run/auth')],
@@ -221,13 +287,13 @@ export async function renderRuntime(input: unknown, phase: Phase): Promise<Resou
       name: 'dataflow', image: c.images.dataflow, securityContext: security,
       args: ['--config', '/etc/oat/dataflow.yaml', '--num-cores', '1'],
       env: [...cloudEnv, env('ARROWCOL_SQL_HOST', 'arrowcol-sql'), env('ARROWCOL_SQL_PASSWORD_FILE', '/run/app/password'),
-        env('ARROWCOL_PARTITION_GRANULARITY', 'hour'),
+        env('ARROWCOL_PARTITION_GRANULARITY', c.maintenance?.granularity ?? 'hour'),
         env('ARROWCOL_SQL_TRUST_CERT', 'true'), env('ARROWCOL_CATALOG_ENDPOINT', 'http://arrowcol-catalog:8817'),
         env('ARROWCOL_CATALOG_DDL_IDENTITY_SECRET_FILE', '/run/auth/internal-hmac'),
         { name: 'ARROWCOL_INSTANCE_KEY', valueFrom: { fieldRef: { fieldPath: 'metadata.uid' } } },
         { name: 'POD_IP', valueFrom: { fieldRef: { fieldPath: 'status.podIP' } } },
         env('ARROWCOL_ADVERTISED_FLIGHT_ENDPOINT', '$(POD_IP):32010')],
-      ports: [{ containerPort: 32010 }, { containerPort: 32011 }], resources: resources('2', '4Gi', '2', '6Gi'),
+      ports: [{ containerPort: 32010 }, { containerPort: 32011 }], resources: resourceSpec(resourceFor(c, 'collector')),
       startupProbe: { ...httpProbe('/readyz', 32011), failureThreshold: 120 },
       readinessProbe: httpProbe('/readyz', 32011), livenessProbe: httpProbe('/healthz', 32011),
       volumeMounts: [mount('config', '/etc/oat'), mount('app', '/run/app'), mount('auth', '/run/auth'),
@@ -237,7 +303,7 @@ export async function renderRuntime(input: unknown, phase: Phase): Promise<Resou
     deployment('arrowcol-router', [{
       name: 'router', image: c.images.router, securityContext: security,
       args: ['--config', '/etc/oat/router.yaml'],
-      ports: [{ containerPort: 50050 }], resources: resources('500m', '512Mi', '2', '1Gi'),
+      ports: [{ containerPort: 50050 }], resources: resourceSpec(resourceFor(c, 'router')),
       startupProbe: { ...httpProbe('/readyz', 50050), failureThreshold: 120 },
       readinessProbe: httpProbe('/readyz', 50050), livenessProbe: httpProbe('/healthz', 50050),
       volumeMounts: [mount('config', '/etc/oat'), mount('app', '/run/app'), mount('auth', '/run/auth')],
@@ -255,13 +321,13 @@ export async function renderRuntime(input: unknown, phase: Phase): Promise<Resou
         ...c.maintenance.operations.flatMap(operation => ['--operation', operation]),
         ...(c.maintenance.apply ? ['--apply'] : [])],
       env: [...cloudEnv, env('ARROWCOL_CATALOG_DDL_IDENTITY_SECRET_FILE', '/run/auth/internal-hmac')],
-      ports: [{ containerPort: 9467 }], resources: resources('250m', '512Mi', '1', '2Gi'),
+      ports: [{ containerPort: 9467 }], resources: resourceSpec(resourceFor(c, 'maintenance')),
       startupProbe: { ...httpProbe('/metrics', 9467), failureThreshold: 120 },
       readinessProbe: httpProbe('/metrics', 9467),
       volumeMounts: [mount('auth', '/run/auth')],
     }], [secretVolume('auth', 'arrowcol-router-auth')], true);
     // Pin initialization creates the allowlisted catalog entries before the runner starts this worker.
-    worker.spec.template.spec.terminationGracePeriodSeconds = 4_800;
+    worker.spec.template.spec.terminationGracePeriodSeconds = c.maintenance.stopGraceSeconds ?? 4_800;
     worker.spec.replicas = 0;
     workload.push(worker);
   }
