@@ -1108,16 +1108,11 @@ impl DeltaTable {
                                 let Ok(value) = percent_decode(value) else {
                                     return Ok(None);
                                 };
-                                let Ok(start) = config.granularity.parse_partition(&value) else {
+                                if config.granularity.parse_partition(&value).is_err() {
                                     return Ok(None);
-                                };
-                                if config.sealed_partitions_only
-                                    && ingestion
-                                    && *sub_target
-                                    && (Some(partition) == newest
-                                        || start.saturating_add(config.granularity.width_ms()) > config.now_ms)
-                                {
-                                    // Physical files may already be inactive; measure protected debt from the snapshot.
+                                }
+                                if config.sealed_partitions_only && *sub_target {
+                                    // Orphans cannot establish the newest active partition.
                                     return Ok(None);
                                 }
                             }

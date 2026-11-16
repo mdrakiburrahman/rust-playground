@@ -277,6 +277,55 @@ fn optimize_protected_partition_backlog_tracks_subtarget_active_inputs() -> Resu
 }
 
 #[test]
+fn optimize_probe_does_not_infer_active_frontier_from_newer_orphan() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let table = create(root.path())?;
+    append(&table, 0, 0..3)?;
+    let active = active_files(root.path())?;
+    let path = active.keys().next().context("active input")?;
+    let bytes = fs::metadata(root.path().join(path))?.len();
+    let target = bytes + 1;
+    let orphan_dir = root.path().join(format!("{INGESTION_PARTITION}={}", minute(1)));
+    fs::create_dir(&orphan_dir)?;
+    fs::File::create(orphan_dir.join("orphan.parquet"))?.set_len(target)?;
+    let maintenance = DeltaTable::open_for_maintenance(&url_of(root.path())?)?;
+    let probe = NegativeProbeConfig {
+        now_ms: BASE + 60 * MINUTE,
+        granularity: Granularity::Minute,
+        purge_retention_ms: 2_592_000_000,
+        vacuum_retention_ms: 604_800_000,
+        log_retention_ms: 2_592_000_000,
+        checkpoint_interval: 100,
+        optimize_small_file_bytes: 1,
+        optimize_target_file_bytes: target,
+        optimize_min_files: 3,
+        sealed_partitions_only: true,
+        max_listed_files: 1000,
+    };
+    assert!(
+        maintenance
+            .probe_no_work(ProbeOperation::Optimize, &probe, &control())?
+            .is_none()
+    );
+    let plan = maintenance.plan_optimize(&OptimizeConfig {
+        now_ms: Some(probe.now_ms),
+        target_file_bytes: target,
+        small_file_bytes: probe.optimize_small_file_bytes,
+        min_files_per_bin: probe.optimize_min_files,
+        ..optimize_config()
+    })?;
+    assert!(plan.bins.is_empty());
+    let protected = plan
+        .compaction_debt
+        .protected_partition_backlog
+        .context("active protected frontier")?;
+    assert_eq!((protected.files, protected.bytes), (1, bytes));
+    assert_eq!(protected.oldest_partition_start_ms, Some(BASE));
+    assert_eq!(active_files(root.path())?, active);
+    Ok(())
+}
+
+#[test]
 fn optimize_final_debt_fields_are_included_in_plan_size_bound() -> Result<()> {
     let root = tempfile::tempdir()?;
     let table = create(root.path())?;
