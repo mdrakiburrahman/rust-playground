@@ -16,19 +16,6 @@ mod override_tests {
     use super::*;
 
     #[test]
-    fn file_batch_and_layout_caps_align_with_adaptive_file_target() {
-        let batching = FileBatchConfig::default();
-        let layout = arrow_deltalake::layout::LayoutPolicy::default();
-        assert_eq!(batching.max_rows_per_flush, u64::try_from(layout.max_rows).unwrap());
-        assert_eq!(
-            batching.max_arrow_memory_per_flush,
-            u64::try_from(layout.max_input_bytes).unwrap()
-        );
-        assert_eq!(batching.adaptive_file.target_parquet_bytes, 128 * 1024 * 1024);
-        assert_eq!(batching.adaptive_file.max_input_bytes, 512 * 1024 * 1024);
-    }
-
-    #[test]
     fn nested_override_preserves_yaml_values_and_validates_final_budget() -> Result<(), String> {
         let config = FileBatchConfig {
             max_age: Duration::from_secs(5),

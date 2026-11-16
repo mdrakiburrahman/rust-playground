@@ -295,8 +295,8 @@ pub static REGISTRY: &[PropKey] = &[
         "arrowcol.layout.sortColumns",
         StringList,
         "customer_id",
-        Validator::Positive,
-        "Comma-separated sort columns; names must exist in the table schema."
+        Validator::Any,
+        "Comma-separated sort columns; empty disables sorting and names must exist in the table schema."
     ),
     key!(
         "arrowcol.layout.bloomColumns",

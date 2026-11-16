@@ -37,7 +37,7 @@ impl Default for AdaptiveFileSizeConfig {
         Self {
             target_parquet_bytes: DEFAULT_TARGET_PARQUET_BYTES,
             min_input_bytes: 16 * 1024 * 1024,
-            max_input_bytes: 512 * 1024 * 1024,
+            max_input_bytes: 1024 * 1024 * 1024,
             cold_start_parquet_ratio: 0.25,
             ewma_weight: 0.2,
             min_parquet_ratio: 1.0 / 64.0,

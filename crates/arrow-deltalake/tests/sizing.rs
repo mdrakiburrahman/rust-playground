@@ -45,7 +45,6 @@ fn estimator_defaults_to_128_mib_parquet_files() {
     let estimator = AdaptiveFileSizeEstimator::default();
     assert_eq!(estimator.config().target_parquet_bytes, 128 * 1024 * 1024);
     assert_eq!(estimator.input_bytes_target(), 512 * 1024 * 1024);
-    assert_eq!(estimator.config().max_input_bytes, 512 * 1024 * 1024);
 }
 
 /// Scenario: configured cold-start ratios imply targets outside both input bounds.

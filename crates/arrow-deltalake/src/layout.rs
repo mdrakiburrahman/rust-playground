@@ -29,12 +29,12 @@ pub struct LayoutPolicy {
 impl Default for LayoutPolicy {
     fn default() -> Self {
         Self {
-            sort_columns: Vec::new(),
-            max_rows: 1_000_000,
-            max_input_bytes: 512 * 1024 * 1024,
+            sort_columns: vec!["customer_id".into()],
+            max_rows: 262_144,
+            max_input_bytes: 64 * 1024 * 1024,
             row_group_rows: 16_384,
             page_rows: 2_048,
-            bloom_columns: Vec::new(),
+            bloom_columns: vec!["customer_id".into()],
         }
     }
 }
@@ -46,9 +46,25 @@ impl LayoutPolicy {
     /// # Errors
     /// Returns property type or platform-size conversion errors.
     pub fn from_properties(props: &arrowcol_props::ResolvedProps) -> Result<Self> {
+        let mut sort_columns = props.string_list("arrowcol.layout.sortColumns")?.to_vec();
+        if sort_columns.len() == 1 && sort_columns[0].is_empty() {
+            sort_columns.clear();
+        }
+        ensure!(
+            sort_columns.iter().all(|column| !column.is_empty()),
+            "arrowcol.layout.sortColumns cannot contain empty items"
+        );
+        let mut bloom_columns = props.string_list("arrowcol.layout.bloomColumns")?.to_vec();
+        if bloom_columns.len() == 1 && bloom_columns[0].is_empty() {
+            bloom_columns.clear();
+        }
+        ensure!(
+            bloom_columns.iter().all(|column| !column.is_empty()),
+            "arrowcol.layout.bloomColumns cannot contain empty items"
+        );
         let policy = Self {
-            sort_columns: props.string_list("arrowcol.layout.sortColumns")?.to_vec(),
-            bloom_columns: props.string_list("arrowcol.layout.bloomColumns")?.to_vec(),
+            sort_columns,
+            bloom_columns,
             max_rows: usize::try_from(props.unsigned("arrowcol.layout.maxRows")?)?,
             max_input_bytes: usize::try_from(props.unsigned("arrowcol.layout.maxInputSize")?)?,
             row_group_rows: usize::try_from(props.unsigned("arrowcol.layout.rowGroupRows")?)?,
@@ -288,10 +304,13 @@ mod tests {
     }
 
     #[test]
-    fn default_layout_keeps_input_order_without_sorting_metadata() -> Result<()> {
+    fn empty_sort_policy_keeps_input_order_without_sorting_metadata() -> Result<()> {
         let input = batch(vec!["z", "a"], vec![2, 1])?;
-        let policy = LayoutPolicy::default();
-        assert!(policy.sort_columns.is_empty());
+        let policy = LayoutPolicy {
+            sort_columns: Vec::new(),
+            bloom_columns: Vec::new(),
+            ..LayoutPolicy::default()
+        };
         let properties = policy.writer_properties(&input.schema())?;
         assert!(properties.sorting_columns().is_none());
 
@@ -300,6 +319,24 @@ mod tests {
         let output = buffer.finish()?;
         assert_eq!(output.column(0).as_ref(), input.column(0).as_ref());
         assert_eq!(output.column(1).as_ref(), input.column(1).as_ref());
+        Ok(())
+    }
+
+    #[test]
+    fn accepts_campaign_caps_and_empty_layout_lists_from_properties() -> Result<()> {
+        let process = std::collections::BTreeMap::from([
+            ("arrowcol.layout.sortColumns".to_owned(), String::new()),
+            ("arrowcol.layout.bloomColumns".to_owned(), String::new()),
+            ("arrowcol.layout.maxRows".to_owned(), "1000000".to_owned()),
+            ("arrowcol.layout.maxInputSize".to_owned(), "1 GiB".to_owned()),
+        ]);
+        let properties = arrowcol_props::resolve(&std::collections::BTreeMap::new(), &process)?;
+        let policy = LayoutPolicy::from_properties(&properties)?;
+        assert!(policy.sort_columns.is_empty());
+        assert!(policy.bloom_columns.is_empty());
+        assert_eq!(policy.max_rows, 1_000_000);
+        assert_eq!(policy.max_input_bytes, 1024 * 1024 * 1024);
+        policy.validate(&batch(vec!["a"], vec![1])?.schema())?;
         Ok(())
     }
 
