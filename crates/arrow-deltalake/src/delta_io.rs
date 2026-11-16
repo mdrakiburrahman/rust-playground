@@ -12,6 +12,26 @@ use tokio::runtime::{EnterGuard, Runtime};
 
 const UPLOAD_BUFFER_MEMORY_BUDGET_BYTES: usize = 1024 * 1024 * 1024;
 const UPLOAD_COPY_BUFFER_BYTES: usize = 64 * 1024;
+const DEFAULT_UPLOAD_BUFFER_CAPACITY_BYTES: usize = 8 * 1024 * 1024;
+const DEFAULT_UPLOAD_REQUEST_CONCURRENCY: usize = 2;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UploadMode {
+    #[default]
+    PutCreate,
+    BufferedMultipart,
+}
+
+impl UploadMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PutCreate => "put_create",
+            Self::BufferedMultipart => "buffered_multipart",
+        }
+    }
+}
 
 /// Process-wide collector runtime settings, resolved once before starting workers.
 ///
@@ -29,7 +49,9 @@ pub struct DeltaRuntimeConfig {
     pub blocking_workers: usize,
     /// Concurrent uploads: default 32 independent of CPU count; allowed 1..=256.
     pub upload_limit: usize,
-    /// Per-upload buffer and multipart chunk size: default 8 MiB; allowed 1..=64 MiB.
+    /// Upload strategy: default `put_create`; `buffered_multipart` is opt-in and uses UUID paths only.
+    pub upload_mode: UploadMode,
+    /// Per-upload buffer and multipart chunk size: default 8 MiB; allowed 1..=64 MiB when multipart is enabled.
     pub upload_buffer_capacity_bytes: usize,
     /// In-flight multipart requests per upload: default 2; allowed 1..=16.
     pub upload_request_concurrency: usize,
@@ -57,8 +79,9 @@ impl DeltaRuntimeConfig {
             runtime_workers: (cores / 4).clamp(2, 16),
             blocking_workers: cores.saturating_mul(2).clamp(32, 128),
             upload_limit: 32,
-            upload_buffer_capacity_bytes: 8 * 1024 * 1024,
-            upload_request_concurrency: 2,
+            upload_mode: UploadMode::PutCreate,
+            upload_buffer_capacity_bytes: DEFAULT_UPLOAD_BUFFER_CAPACITY_BYTES,
+            upload_request_concurrency: DEFAULT_UPLOAD_REQUEST_CONCURRENCY,
             task_limit: cores.saturating_mul(4).clamp(64, 256),
             read_ahead: cores.clamp(8, 16),
             batch_rows: cores.saturating_mul(1024).clamp(4096, 32768),
@@ -80,6 +103,8 @@ impl DeltaRuntimeConfig {
 
     fn from_lookup(mut lookup: impl FnMut(&str) -> Result<Option<String>>) -> Result<Self> {
         let mut config = Self::default();
+        let mut upload_buffer_overridden = false;
+        let mut upload_request_concurrency_overridden = false;
         for (name, value) in [
             ("RUNTIME_WORKERS", &mut config.runtime_workers),
             ("BLOCKING_WORKERS", &mut config.blocking_workers),
@@ -97,8 +122,28 @@ impl DeltaRuntimeConfig {
                     !raw.is_empty() && raw.bytes().all(|byte| byte.is_ascii_digit()),
                     "{name} must be an unsigned decimal integer"
                 );
+                if name.ends_with("UPLOAD_BUFFER_CAPACITY_BYTES") {
+                    upload_buffer_overridden = true;
+                }
+                if name.ends_with("UPLOAD_REQUEST_CONCURRENCY") {
+                    upload_request_concurrency_overridden = true;
+                }
                 *value = raw.parse().with_context(|| format!("parse {name}"))?;
             }
+        }
+        let mode_name = "ARROWCOL_COLLECTOR_UPLOAD_MODE";
+        if let Some(raw) = lookup(mode_name)? {
+            config.upload_mode = match raw.as_str() {
+                "put_create" => UploadMode::PutCreate,
+                "buffered_multipart" => UploadMode::BufferedMultipart,
+                _ => anyhow::bail!("{mode_name} must be 'put_create' or 'buffered_multipart', got {raw:?}"),
+            };
+        }
+        if config.upload_mode == UploadMode::PutCreate {
+            anyhow::ensure!(
+                !upload_buffer_overridden && !upload_request_concurrency_overridden,
+                "ARROWCOL_COLLECTOR_UPLOAD_BUFFER_CAPACITY_BYTES and ARROWCOL_COLLECTOR_UPLOAD_REQUEST_CONCURRENCY require ARROWCOL_COLLECTOR_UPLOAD_MODE=buffered_multipart"
+            );
         }
         config.validate()?;
         Ok(config)
@@ -113,13 +158,6 @@ impl DeltaRuntimeConfig {
             ("RUNTIME_WORKERS", self.runtime_workers, 1, 64),
             ("BLOCKING_WORKERS", self.blocking_workers, 2, 256),
             ("UPLOAD_LIMIT", self.upload_limit, 1, 256),
-            (
-                "UPLOAD_BUFFER_CAPACITY_BYTES",
-                self.upload_buffer_capacity_bytes,
-                1024 * 1024,
-                64 * 1024 * 1024,
-            ),
-            ("UPLOAD_REQUEST_CONCURRENCY", self.upload_request_concurrency, 1, 16),
             ("TASK_LIMIT", self.task_limit, 2, 1024),
             ("READ_AHEAD", self.read_ahead, 1, 128),
             ("BATCH_ROWS", self.batch_rows, 1, 262_144),
@@ -130,24 +168,42 @@ impl DeltaRuntimeConfig {
                 "ARROWCOL_COLLECTOR_{name} must be in {min}..={max}, got {value}"
             );
         }
-        let in_flight = self
-            .upload_buffer_capacity_bytes
-            .checked_mul(
+        if self.upload_mode == UploadMode::BufferedMultipart {
+            anyhow::ensure!(
+                (1024 * 1024..=64 * 1024 * 1024).contains(&self.upload_buffer_capacity_bytes),
+                "ARROWCOL_COLLECTOR_UPLOAD_BUFFER_CAPACITY_BYTES must be in 1048576..=67108864, got {}",
+                self.upload_buffer_capacity_bytes
+            );
+            anyhow::ensure!(
+                (1..=16).contains(&self.upload_request_concurrency),
+                "ARROWCOL_COLLECTOR_UPLOAD_REQUEST_CONCURRENCY must be in 1..=16, got {}",
                 self.upload_request_concurrency
-                    .checked_add(1)
-                    .context("upload request concurrency overflow")?,
-            )
-            .and_then(|bytes| bytes.checked_add(UPLOAD_COPY_BUFFER_BYTES))
-            .context("upload buffering size overflow")?;
-        let total = self
-            .upload_limit
-            .checked_mul(in_flight)
-            .context("aggregate upload buffering size overflow")?;
-        anyhow::ensure!(
-            total <= UPLOAD_BUFFER_MEMORY_BUDGET_BYTES,
-            "aggregate upload buffering must not exceed {} bytes, got {total}",
-            UPLOAD_BUFFER_MEMORY_BUDGET_BYTES
-        );
+            );
+            let in_flight = self
+                .upload_buffer_capacity_bytes
+                .checked_mul(
+                    self.upload_request_concurrency
+                        .checked_add(1)
+                        .context("upload request concurrency overflow")?,
+                )
+                .and_then(|bytes| bytes.checked_add(UPLOAD_COPY_BUFFER_BYTES))
+                .context("upload buffering size overflow")?;
+            let total = self
+                .upload_limit
+                .checked_mul(in_flight)
+                .context("aggregate upload buffering size overflow")?;
+            anyhow::ensure!(
+                total <= UPLOAD_BUFFER_MEMORY_BUDGET_BYTES,
+                "aggregate upload buffering must not exceed {} bytes, got {total}",
+                UPLOAD_BUFFER_MEMORY_BUDGET_BYTES
+            );
+        } else {
+            anyhow::ensure!(
+                self.upload_buffer_capacity_bytes == DEFAULT_UPLOAD_BUFFER_CAPACITY_BYTES
+                    && self.upload_request_concurrency == DEFAULT_UPLOAD_REQUEST_CONCURRENCY,
+                "buffer capacity and request concurrency are only valid with buffered_multipart mode"
+            );
+        }
         Ok(())
     }
 }
@@ -610,9 +666,17 @@ mod tests {
                     _ => None,
                 }
             };
+            let upload_knob = matches!(
+                knob.as_str(),
+                "ARROWCOL_COLLECTOR_UPLOAD_LIMIT"
+                    | "ARROWCOL_COLLECTOR_UPLOAD_BUFFER_CAPACITY_BYTES"
+                    | "ARROWCOL_COLLECTOR_UPLOAD_REQUEST_CONCURRENCY"
+            );
             let read = |name: &str, value: &str| {
                 if name == knob {
                     Some(value.to_owned())
+                } else if name == "ARROWCOL_COLLECTOR_UPLOAD_MODE" && upload_knob {
+                    Some("buffered_multipart".to_owned())
                 } else {
                     companion_value(name).map(str::to_owned)
                 }
@@ -642,8 +706,35 @@ mod tests {
     }
 
     #[test]
+    fn upload_mode_is_strict_and_buffer_settings_require_multipart() -> Result<()> {
+        let default = DeltaRuntimeConfig::for_cores(1);
+        assert_eq!(default.upload_mode, UploadMode::PutCreate);
+
+        let multipart = DeltaRuntimeConfig::from_lookup(|name| {
+            Ok((name == "ARROWCOL_COLLECTOR_UPLOAD_MODE").then(|| "buffered_multipart".to_owned()))
+        })?;
+        assert_eq!(multipart.upload_mode, UploadMode::BufferedMultipart);
+
+        for raw in ["", "multipart", "Buffered_Multipart", "put_create "] {
+            let error = DeltaRuntimeConfig::from_lookup(|name| {
+                Ok((name == "ARROWCOL_COLLECTOR_UPLOAD_MODE").then(|| raw.to_owned()))
+            })
+            .expect_err("invalid upload mode must fail");
+            assert!(format!("{error:#}").contains("ARROWCOL_COLLECTOR_UPLOAD_MODE"));
+        }
+
+        let error = DeltaRuntimeConfig::from_lookup(|name| {
+            Ok((name == "ARROWCOL_COLLECTOR_UPLOAD_BUFFER_CAPACITY_BYTES").then(|| "8388608".to_owned()))
+        })
+        .expect_err("buffer settings require explicit multipart mode");
+        assert!(format!("{error:#}").contains("UPLOAD_MODE=buffered_multipart"));
+        Ok(())
+    }
+
+    #[test]
     fn aggregate_upload_buffering_is_bounded() -> Result<()> {
         let mut config = DeltaRuntimeConfig::for_cores(1);
+        config.upload_mode = UploadMode::BufferedMultipart;
         config.upload_request_concurrency = 16;
         config.upload_limit = 256;
         let error = config

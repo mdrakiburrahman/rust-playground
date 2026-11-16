@@ -391,6 +391,33 @@ pub static REGISTRY: &[PropKey] = &[
     // PERF69-PROPS-BEGIN file-formation
     // PERF69-PROPS-END file-formation
     // PERF69-PROPS-BEGIN commit-pipeline
+    PropKey {
+        name: "arrowcol.collector.upload.mode",
+        prop_type: PropType::Enum,
+        default: "put_create",
+        validator: Validator::OneOf(&["put_create", "buffered_multipart"]),
+        scope: Scope::Process,
+        doc: "Upload strategy; buffered multipart is opt-in and relies on UUID object names rather than conditional create.",
+        since: "0.1",
+    },
+    PropKey {
+        name: "arrowcol.collector.upload.bufferCapacityBytes",
+        prop_type: PropType::Bytes,
+        default: "8 MiB",
+        validator: Validator::Range(1_048_576.0, 67_108_864.0),
+        scope: Scope::Process,
+        doc: "Per-upload multipart part buffer, active only with buffered_multipart mode.",
+        since: "0.1",
+    },
+    PropKey {
+        name: "arrowcol.collector.upload.requestConcurrency",
+        prop_type: PropType::Integer,
+        default: "2",
+        validator: Validator::Range(1.0, 16.0),
+        scope: Scope::Process,
+        doc: "In-flight multipart part requests per upload, active only with buffered_multipart mode.",
+        since: "0.1",
+    },
     // PERF69-PROPS-END commit-pipeline
     // PERF69-PROPS-BEGIN maintenance
     // PERF69-PROPS-END maintenance
