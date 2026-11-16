@@ -580,10 +580,12 @@ mod tests {
         assert!(serde_json::from_str::<ParquetWriterConfig>(r#"{"unknown":1}"#).is_err());
         assert!(serde_json::from_str::<ParquetWriterConfig>(r#"{"defaults":{"encoding":"rle_dictionary"}}"#).is_err());
         for codec in ["lz4", "lz4_raw"] {
-            assert!(serde_json::from_value::<ParquetWriterConfig>(serde_json::json!({
-                "defaults": {"compression": codec}
-            }))
-            .is_err());
+            assert!(
+                serde_json::from_value::<ParquetWriterConfig>(serde_json::json!({
+                    "defaults": {"compression": codec}
+                }))
+                .is_err()
+            );
         }
         let config: ParquetWriterConfig =
             serde_json::from_str(r#"{"columns":{"value":{"encoding":"delta_binary_packed"}}}"#)?;
