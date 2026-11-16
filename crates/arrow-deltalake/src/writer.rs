@@ -13,6 +13,7 @@ use std::sync::OnceLock;
 
 pub const PARQUET_CONFIG_ENV: &str = "ARROWCOL_PARQUET_CONFIG";
 static PROCESS_CONFIG: OnceLock<Result<ParquetWriterConfig, String>> = OnceLock::new();
+static LEGACY_LZ4_WARNING: OnceLock<()> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -21,6 +22,8 @@ pub enum Codec {
     Snappy,
     Gzip,
     Brotli,
+    Lz4,
+    Lz4Raw,
     Zstd,
 }
 
@@ -125,6 +128,17 @@ impl ColumnOptions {
                     Codec::Snappy => Compression::SNAPPY,
                     _ => unreachable!(),
                 }
+            }
+            Codec::Lz4 => {
+                ensure!(level.is_none(), "{codec:?} does not accept a compression level");
+                LEGACY_LZ4_WARNING.get_or_init(|| {
+                    tracing::warn!("Parquet codec lz4 uses deprecated Hadoop framing; prefer lz4_raw");
+                });
+                Compression::LZ4
+            }
+            Codec::Lz4Raw => {
+                ensure!(level.is_none(), "{codec:?} does not accept a compression level");
+                Compression::LZ4_RAW
             }
             Codec::Gzip => {
                 let level = level.unwrap_or(6);
@@ -577,16 +591,9 @@ mod tests {
                 "{json}"
             );
         }
+        assert!(serde_json::from_str::<ParquetWriterConfig>(r#"{"defaults":{"compression":"unknown"}}"#).is_err());
         assert!(serde_json::from_str::<ParquetWriterConfig>(r#"{"unknown":1}"#).is_err());
         assert!(serde_json::from_str::<ParquetWriterConfig>(r#"{"defaults":{"encoding":"rle_dictionary"}}"#).is_err());
-        for codec in ["lz4", "lz4_raw"] {
-            assert!(
-                serde_json::from_value::<ParquetWriterConfig>(serde_json::json!({
-                    "defaults": {"compression": codec}
-                }))
-                .is_err()
-            );
-        }
         let config: ParquetWriterConfig =
             serde_json::from_str(r#"{"columns":{"value":{"encoding":"delta_binary_packed"}}}"#)?;
         assert!(config.writer_properties(&schema(), None, &[]).is_err());
@@ -605,7 +612,7 @@ mod tests {
                 Arc::new(StringArray::from(vec!["repeat"; 4])),
             ],
         )?;
-        for codec in ["uncompressed", "snappy", "gzip", "brotli", "zstd"] {
+        for codec in ["uncompressed", "snappy", "gzip", "brotli", "lz4", "lz4_raw", "zstd"] {
             let config: ParquetWriterConfig = serde_json::from_value(serde_json::json!({
                 "defaults": {"compression": codec},
                 "columns": {"id": {"encoding": "delta_binary_packed", "dictionary_enabled": false}},
