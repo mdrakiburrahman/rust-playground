@@ -158,6 +158,8 @@ fn compaction_debt_evidence_distinguishes_zero_from_bounded_backlog() -> Result<
     assert_eq!(plan.compaction_debt.backlog_files, 2);
     assert!(plan.compaction_debt.backlog_bytes > 0);
     assert_eq!(plan.compaction_debt.oldest_eligible_partition_start_ms, Some(BASE));
+    let report = maintenance.apply_optimize(&plan, &config, &control())?;
+    assert_eq!(report.compaction_debt.as_ref(), Some(&plan.compaction_debt));
     Ok(())
 }
 
