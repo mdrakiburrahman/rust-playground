@@ -586,10 +586,11 @@ mod overload_guard_tests {
         let config: OatConfig = serde_json::from_str(include_str!(
             "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
         ))?;
+        let run_id = uuid::Uuid::new_v4().to_string();
         let rows = result_rows(
             &config,
             "orchestration",
-            &uuid::Uuid::new_v4().to_string(),
+            &run_id,
             1,
             1,
             CellMeasurements {
@@ -605,11 +606,16 @@ mod overload_guard_tests {
                 resources: None,
             },
         )?;
-        let mut outcome = MatrixOutcome {
-            rows,
-            error: None,
-            cancelled: false,
-        };
+        let mut outcome = finish_matrix_cell(
+            &config,
+            "orchestration",
+            &run_id,
+            1,
+            1,
+            Ok(rows),
+            Err(anyhow::anyhow!("stop_failed")),
+        );
+        assert!(outcome.error.is_some());
         attach_shutdown_drain_evidence(&mut outcome, json!({"status":"drained"}))?;
         for row in outcome.rows {
             assert_eq!(row.status, "failed");

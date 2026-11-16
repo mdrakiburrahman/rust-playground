@@ -3451,17 +3451,43 @@ async fn run_matrix_cell(
     let baseline_logs = platform.process_logs(config).await?;
     platform.retain_cell_process_baseline(&baseline_logs);
     let mut client_run = run_clients(config, run_id, &assigned_tables, platform).await?;
-    let (_collector_logs, durable_commits) = settle_cell_commit_evidence(
-        config,
-        platform,
-        &baseline_logs,
-        &client_run.evidence,
-        cell_start_unix_ms,
-    )
-    .await?;
-    let process_logs = platform.process_logs(config).await?;
-    client_run.evidence.processes = Some(process_evidence_for_cell(config, &process_logs, &baseline_logs)?);
-    client_run.evidence.durable_commits = durable_commits;
+    let guard_stopped = client_run.evidence.overload_stop.is_some()
+        || client_run
+            .evidence
+            .overload_guard
+            .as_ref()
+            .is_some_and(|guard| guard["status"] == "unavailable");
+    let capture = async {
+        let (_collector_logs, durable_commits) = settle_cell_commit_evidence(
+            config,
+            platform,
+            &baseline_logs,
+            &client_run.evidence,
+            cell_start_unix_ms,
+        )
+        .await?;
+        client_run.evidence.durable_commits = durable_commits;
+        let process_logs = platform.process_logs(config).await?;
+        client_run.evidence.processes = Some(process_evidence_for_cell(config, &process_logs, &baseline_logs)?);
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    if let Err(error) = capture {
+        if !guard_stopped {
+            return Err(error);
+        }
+        tracing::error!(%error, "post-overload output/process capture failed; retaining stop evidence for cleanup");
+        client_run.failure = Some(format!(
+            "{}; post_overload_stop_capture_unavailable",
+            client_run
+                .failure
+                .as_deref()
+                .unwrap_or("overload_guard stopped the cell")
+        ));
+        if let Some(guard) = &mut client_run.evidence.overload_guard {
+            guard["post_stop_capture"] = json!("unavailable");
+        }
+    }
     let pinning_ok = client_run.pinning.violation.is_none()
         && client_run.pinning.verification_error.is_none()
         && client_run.failure.is_none();

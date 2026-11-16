@@ -656,16 +656,22 @@ function overloadGuardIssue(evidence: RecordValue, config: RecordValue, runId: u
   return undefined;
 }
 
-function inspectOfficialRun(run: OfficialRun): { windows?: OfficialWindow[]; reason?: string } {
+function officialOverloadStop(run: OfficialRun): string | undefined {
   for (const row of run.rows) {
     if (typeof row.evidence_json !== 'string') continue;
     let evidence: unknown;
     try { evidence = JSON.parse(row.evidence_json); } catch { continue; }
     if (isRecord(evidence)) {
       const reason = overloadStopIssue(evidence);
-      if (reason) return { reason };
+      if (reason) return reason;
     }
   }
+  return undefined;
+}
+
+function inspectOfficialRun(run: OfficialRun): { windows?: OfficialWindow[]; reason?: string } {
+  const stop = officialOverloadStop(run);
+  if (stop) return { reason: stop };
   const verdict = evaluateDataFlow(run.status, run.rows, run.expectedSha, run.mode, run.config, 'single_hot_table_campaign');
   if (verdict.ingestPass !== true || verdict.rows.length !== 1) return { reason: 'official campaign ingest evidence did not pass: ' + verdict.reasons.join('; ') };
   const row = verdict.rows[0]!;
@@ -755,6 +761,8 @@ function inspectOfficialRun(run: OfficialRun): { windows?: OfficialWindow[]; rea
 }
 
 function assessRepeat(row: CampaignMeasurement): RepeatAssessment {
+  const overloadStop = row.officialRuns?.map(officialOverloadStop).find(reason => reason !== undefined);
+  if (overloadStop) return { qualified: false, rates: [], reason: overloadStop };
   if (row.diedFirst) return { qualified: false, rates: [], reason: row.collectorOnly ? 'collector-only downstream failure' : 'a component died during the run' };
   if (!row.expectedRepeats || !row.factorConfigPaths || !row.officialRuns || row.officialRuns.length !== 1) {
     return { qualified: false, rates: [], reason: 'each repeat must contain exactly one official sustained run' };
