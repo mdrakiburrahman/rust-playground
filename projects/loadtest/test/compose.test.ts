@@ -94,6 +94,8 @@ test('lint and tests finish before static helper installation for every loadtest
 });
 
 test('real publisher services use init and DFE source layout overrides', () => {
+  assert.ok(compose.services['arrowcol-catalog'].command?.includes('--ingestion-layout'),
+    'DFE catalog must adopt initialized physical schemas through ingestion-layout validation');
   for (const service of ['dataflow-1', 'arrowcol-catalog', 'tenant-stream', 'delta-maintenance']) {
     assert.equal(compose.services[service].init, true, `${service} must reap Azure CLI descendants`);
   }
