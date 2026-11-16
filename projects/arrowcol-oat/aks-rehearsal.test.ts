@@ -60,7 +60,7 @@ function ageOwner(store: MemoryStore): void {
 
 function assertSyntheticEvidence(evidence: RehearsalEvidenceRecord[]): void {
   assert.ok(evidence.length > 0);
-  assert.ok(evidence.every(event => event.rehearsal_fixture === 'synthetic custody fixture' && event.external_effects === 'simulated'));
+  assert.ok(evidence.every(event => event.rehearsal_fixture === 'synthetic custody fixture' && event.cleanup_effects === 'simulated'));
 }
 
 test('rehearsal record path is fixed to a disjoint prefix', () => {

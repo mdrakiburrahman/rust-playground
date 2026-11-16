@@ -176,5 +176,5 @@ test('isolated D40 watchdog uses its injected no-op executor and read-only statu
   assert.deepEqual(armReads, []);
   assert.equal(evidence.some(event => event.event === 'recording_cleanup_noop'), true);
   assert.equal(evidence.some(event => event.event === 'campaign_transition' && event.fencing_token === 2), true);
-  assert.ok(evidence.every(event => event.rehearsal_fixture === 'synthetic custody fixture' && event.external_effects === 'simulated'));
+  assert.ok(evidence.every(event => event.rehearsal_fixture === 'synthetic custody fixture' && event.cleanup_effects === 'simulated'));
 });

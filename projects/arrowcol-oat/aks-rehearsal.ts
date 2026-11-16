@@ -19,7 +19,7 @@ export type RehearsalEvidenceSink = (record: RehearsalEvidenceRecord) => void;
 
 function recordEvidence(sink: RehearsalEvidenceSink, event: string, values: Record<string, unknown> = {}): void {
   sink({ ...values, observed_at: new Date().toISOString(), event, rehearsal_fixture: 'synthetic custody fixture',
-    external_effects: 'simulated' });
+    cleanup_effects: 'simulated' });
 }
 
 export function createJsonLinesEvidenceSink(filename: string): RehearsalEvidenceSink {
@@ -223,7 +223,7 @@ export async function runRehearsalWatchdogOnce(options: {
   assertSyntheticRehearsalState(current.state, options.rehearsalId, options.ownerId);
   const result = await watchdogOnce(options.env, recordingCleanupExecutor(options.evidence), store, options.readOnlyAzure);
   recordEvidence(options.evidence, 'watchdog_result', { campaign_id: options.rehearsalId, ...result });
-  return { ...result, rehearsal_fixture: 'synthetic custody fixture', external_effects: 'simulated' };
+  return { ...result, rehearsal_fixture: 'synthetic custody fixture', cleanup_effects: 'simulated' };
 }
 
 export async function runRehearsalOwner(options: {
@@ -304,7 +304,7 @@ export async function runRehearsalStaleOwnerProbe(options: {
     status: state.status, producer_fencing_token: producerToken, current_fencing_token: state.fencingToken, error: message });
   return { status: 'owner_write_rejected', phase: options.phase, campaign_id: options.rehearsalId,
     producer_fencing_token: producerToken, current_fencing_token: state.fencingToken,
-    rehearsal_fixture: 'synthetic custody fixture', external_effects: 'simulated' };
+    rehearsal_fixture: 'synthetic custody fixture', cleanup_effects: 'simulated' };
 }
 
 async function main(args: string[]): Promise<void> {
