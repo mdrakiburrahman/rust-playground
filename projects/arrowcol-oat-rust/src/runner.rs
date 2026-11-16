@@ -1664,6 +1664,15 @@ impl Platform for LocalPlatform {
         start_local_maintenance(config, self).await
     }
 
+    async fn prepare_campaign_load_admission(
+        &mut self,
+        config: &OatConfig,
+        _run_id: &str,
+        tables: &[String],
+    ) -> Result<()> {
+        verify_local_partition_policy_before_admission(config, self, tables).await
+    }
+
     fn qap_observation_mode(&self) -> arrowcol_loadgen::ObservationMode {
         arrowcol_loadgen::ObservationMode::Local
     }

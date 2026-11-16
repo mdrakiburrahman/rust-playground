@@ -135,6 +135,116 @@ async fn pin_local_maintenance_image(config: &OatConfig, platform: &LocalPlatfor
     Ok(())
 }
 
+fn local_partition_policy_evidence(
+    requested: &str,
+    table: &str,
+    collector: &Value,
+    maintenance_log: &str,
+) -> Result<Option<Value>> {
+    let environment = collector
+        .pointer("/Config/Env")
+        .and_then(Value::as_array)
+        .context("collector container environment is missing")?;
+    let values = environment
+        .iter()
+        .filter_map(Value::as_str)
+        .filter_map(|entry| entry.strip_prefix("ARROWCOL_PARTITION_GRANULARITY="))
+        .collect::<Vec<_>>();
+    if values.as_slice() != [requested] {
+        bail!("collector partition granularity does not match the campaign request");
+    }
+    let mut observed = false;
+    for line in maintenance_log.lines().filter_map(|line| line.strip_prefix("arrowcol_maintenance_table_config ")) {
+        let event: Value = serde_json::from_str(line).context("invalid maintenance table policy readback")?;
+        if event["table"].as_str() != Some(table) {
+            continue;
+        }
+        if event.pointer("/config/active") != Some(&json!(true)) {
+            bail!("maintenance table policy is not active");
+        }
+        let actual = event.pointer("/config/table_policy/arrowcol.partition.granularity")
+            .and_then(Value::as_str)
+            .context("maintenance table policy omitted partition granularity")?;
+        if actual != requested {
+            bail!("effective table partition granularity conflicts with the campaign request");
+        }
+        observed = true;
+    }
+    Ok(observed.then(|| json!({
+        "table": table,
+        "requested": requested,
+        "collector_process": requested,
+        "maintenance_table_effective": requested,
+        "collector_source": "docker_container_environment",
+        "maintenance_source": "consumer_table_policy_readback",
+        "writer_resolution": "table_properties_over_process_over_registry",
+        "scope": "before_client_admission",
+    })))
+}
+
+async fn verify_local_partition_policy_before_admission(
+    config: &OatConfig,
+    platform: &LocalPlatform,
+    tables: &[String],
+) -> Result<()> {
+    if config.campaign_profile != Some(crate::config::CampaignProfile::SingleHotTable) {
+        return Ok(());
+    }
+    let [table] = tables else {
+        bail!("local campaign partition policy requires exactly one table");
+    };
+    let table = canonical_dmv_table_name(table)?;
+    let granularity = config.tunables.maintenance.as_ref()
+        .and_then(|settings| settings.granularity)
+        .context("local campaign requires explicit maintenance.granularity")?;
+    let granularity = serde_json::to_value(granularity)?;
+    let requested = granularity.as_str().context("invalid typed partition granularity")?;
+    let collectors = local_process_logs_for_role(config, platform, Some(ComponentRole::Collector)).await?;
+    let [collector] = collectors.as_slice() else {
+        bail!("local campaign requires exactly one collector process");
+    };
+    let mut inspect = Command::new("docker");
+    inspect.args(["inspect", &collector.instance_id]);
+    let containers: Vec<Value> = serde_json::from_slice(
+        &run_command(inspect, "read actual collector partition configuration").await?.stdout,
+    )?;
+    let [collector] = containers.as_slice() else {
+        bail!("collector process identity is ambiguous");
+    };
+    if collector.pointer("/State/Running") != Some(&json!(true)) {
+        bail!("collector is not running before campaign admission");
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let logs = local_process_logs_for_role(config, platform, Some(ComponentRole::Maintenance)).await?;
+        let [log] = logs.as_slice() else {
+            bail!("local campaign requires exactly one maintenance process");
+        };
+        if let Some(mut evidence) = local_partition_policy_evidence(requested, &table, collector, &log.text)? {
+            verify_process_configuration(config, ComponentRole::Maintenance, &process_configurations(&log.text)?)?;
+            let root = platform.state_dir.join("dataflow/telemetry/sqlserver/sqlserver_availability_replica_states");
+            let properties = tokio::task::spawn_blocking(move || -> Result<_> {
+                let url = url::Url::from_directory_path(root)
+                    .map_err(|()| anyhow::anyhow!("invalid local campaign table path"))?;
+                arrow_deltalake::delta::DeltaTable::open_for_maintenance_probe(&url)?
+                    .maintenance_properties()
+            }).await.context("join local partition metadata read")??;
+            let table_value = properties.get("arrowcol.partition.granularity");
+            if table_value.is_some_and(|value| value != requested) {
+                bail!("authoritative table partition granularity conflicts with the campaign request");
+            }
+            evidence["table_property"] = json!(table_value);
+            evidence["table_property_source"] = json!("fresh_checkpoint_aware_delta_metadata_read");
+            tracing::info!(partition_policy = %evidence, "local campaign pre-admission partition policy");
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!("maintenance did not emit effective table partition policy before admission");
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
 async fn start_local_maintenance(config: &OatConfig, platform: &LocalPlatform) -> Result<()> {
     if !maintenance_enabled(config) {
         return Ok(());
