@@ -432,8 +432,12 @@ export async function observeDataPreservation(store: CampaignStore, azure: Azure
     if (typedKind === 'external') {
       const first = await qapState(azure, database, name, authority.assertCurrent);
       qapAfter = await qapState(azure, database, name, authority.assertCurrent);
-      if ((target.qap_before === null) !== (qapAfter === null)) throw new Error('Preserved QAP enabled policy changed.');
-      if (first && qapAfter && (!qapAfter.is_healthy || qapAfter.not_healthy_reason_present || qapAfter.pending_files > first.pending_files)) {
+      if (qapAfter && (!qapAfter.is_healthy || qapAfter.not_healthy_reason_present)) {
+        status = 'failed'; reason = 'non_run_qap_unhealthy_or_backlog_growing';
+      }
+      if ((target.qap_before === null) !== (first === null) || (target.qap_before === null) !== (qapAfter === null))
+        throw new Error('Preserved QAP enabled policy changed or comparable samples are missing; safety is UNKNOWN.');
+      if (first && qapAfter && qapAfter.pending_files > first.pending_files) {
         status = 'failed'; reason = 'non_run_qap_unhealthy_or_backlog_growing';
       }
     }

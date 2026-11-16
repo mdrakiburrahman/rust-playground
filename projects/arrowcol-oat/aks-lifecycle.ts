@@ -57,20 +57,39 @@ function marker(metadata: Record<string, unknown>, inventory: RunInventory) {
   }
 }
 function podProof(value: unknown, inventory: RunInventory): PodProof {
-  const pod = object(value), metadata = object(pod.metadata), status = object(pod.status);
+  const pod = object(value), metadata = object(pod.metadata), spec = object(pod.spec), status = object(pod.status);
   if (pod.apiVersion !== 'v1' || pod.kind !== 'Pod' || metadata.namespace !== inventory.namespace.name)
     throw new Error('Lifecycle pod type/namespace differs.');
   marker(metadata, inventory);
-  if (!Array.isArray(status.containerStatuses) || status.containerStatuses.length === 0)
-    throw new Error('Lifecycle container status is UNKNOWN.');
-  return { name: text(metadata.name), uid: text(metadata.uid), resource_version: text(metadata.resourceVersion),
-    containers: status.containerStatuses.map(value => {
-      const container = object(value), state = object(container.state), terminal = state.terminated === undefined ? undefined : object(state.terminated);
+  const names = new Set<string>(), containers: PodProof['containers'] = [];
+  for (const [specField, statusField] of [['containers', 'containerStatuses'],
+    ['initContainers', 'initContainerStatuses'], ['ephemeralContainers', 'ephemeralContainerStatuses']] as const) {
+    const expected = spec[specField] === undefined ? [] : spec[specField], observed = status[statusField] === undefined ? [] : status[statusField];
+    if (!Array.isArray(expected) || !Array.isArray(observed) || expected.length !== observed.length ||
+        specField === 'containers' && expected.length === 0)
+      throw new Error('Lifecycle expected container coverage is UNKNOWN.');
+    const statuses = new Map<string, Record<string, unknown>>();
+    for (const value of observed) {
+      const container = object(value), name = text(container.name);
+      if (statuses.has(name)) throw new Error('Lifecycle container status identity is ambiguous.');
+      statuses.set(name, container);
+    }
+    for (const value of expected) {
+      const name = text(object(value).name), container = statuses.get(name);
+      if (names.has(name) || !container) throw new Error('Lifecycle expected container status is UNKNOWN.');
+      names.add(name);
+      const state = object(container.state), terminal = state.terminated === undefined ? undefined : object(state.terminated);
+      if (Object.keys(state).length !== 1 || !['running', 'waiting', 'terminated'].includes(Object.keys(state)[0]!))
+        throw new Error('Lifecycle container state is UNKNOWN.');
       if (terminal && (typeof terminal.exitCode !== 'number' || !Number.isSafeInteger(terminal.exitCode) || typeof terminal.finishedAt !== 'string' ||
           !Number.isFinite(Date.parse(terminal.finishedAt)))) throw new Error('Actual container termination receipt is UNKNOWN.');
-      return { name: text(container.name), exit_code: terminal ? Number(terminal.exitCode) : null,
-        finished_at: terminal ? String(terminal.finishedAt) : null, oom_killed: terminal?.reason === 'OOMKilled' };
-    }) };
+      containers.push({ name, exit_code: terminal ? Number(terminal.exitCode) : null,
+        finished_at: terminal ? String(terminal.finishedAt) : null, oom_killed: terminal?.reason === 'OOMKilled' });
+    }
+  }
+  if (containers.length > 32) throw new Error('Lifecycle container observation is unbounded.');
+  return { name: text(metadata.name), uid: text(metadata.uid), resource_version: text(metadata.resourceVersion),
+    containers };
 }
 function validatePods(value: unknown): asserts value is PodProof[] {
   if (!Array.isArray(value) || value.length > 256) throw new Error('Lifecycle pod journal is unbounded.');
@@ -413,10 +432,8 @@ export function createDefaultLifecycleActions(store: CampaignStore, azure: Azure
   const assertWritersStopped = async (inventory: RunInventory, authority: CleanupMutationAuthority) => {
     for (const resource of inventory.resources.filter(value => ['collector', 'maintenance'].includes(value.role))) {
       if (resource.state === 'absent') continue;
-      const observed = await observe(inventory, resource, authority), status = object(observed.value.status);
-      if (observed.pods.some(pod => pod.containers.some(container => container.exit_code === null)) ||
-          (observed.deployment ? observed.spec.replicas !== 0 || integer(status.observedGeneration) < integer(object(observed.value.metadata).generation) :
-            observed.spec.suspend !== true))
+      const observed = await observe(inventory, resource, authority);
+      if (!physicallyStopped(observed))
         throw new Error('Terminal Delta freeze requires positive physical writer stop with recreation disabled.');
     }
   };

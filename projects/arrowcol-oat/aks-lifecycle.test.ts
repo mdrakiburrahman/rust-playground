@@ -49,6 +49,7 @@ async function fixture(t: TestContext, deployment = false) {
   const blobs = new Map<string, { bytes: Buffer; etag: string }>();
   let fault: 'none' | 'patch_unknown' | 'completion_unknown' = 'none', patched = false, patchCount = 0, wrongUid = false;
   let onPatch: (() => void) | undefined, onIntent: (() => void) | undefined;
+  let podShape: 'regular' | 'init_sidecar' | 'missing' | 'ephemeral' | 'terminal_auxiliary' = 'regular';
   const timeouts: number[] = [];
   t.mock.method(azure, 'blob', async (method: string, container: string, name: string, _query?: unknown,
     body?: string | Buffer | null, headers?: Record<string, string>) => {
@@ -97,7 +98,16 @@ async function fixture(t: TestContext, deployment = false) {
     else if (kind === 'pods') response = { kind: 'PodList', metadata: { resourceVersion: '1' }, items: [{
       apiVersion: 'v1', kind: 'Pod', metadata: { ...metadata('maintenance-pod', ownerId),
         ownerReferences: [{ uid: deployment ? campaignId : workloadUid, kind: deployment ? 'ReplicaSet' : 'Job', controller: true }] },
-      status: { containerStatuses: [{ name: 'main', state: patched ? { terminated: { exitCode: 0, finishedAt: new Date().toISOString() } } : { running: {} } }] },
+      spec: { containers: [{ name: 'main' }, ...(podShape === 'missing' ? [{ name: 'unobserved-writer' }] : [])],
+        ...(['init_sidecar', 'terminal_auxiliary'].includes(podShape) ? { initContainers: [{ name: 'sidecar', restartPolicy: 'Always' }] } : {}),
+        ...(['ephemeral', 'terminal_auxiliary'].includes(podShape) ? { ephemeralContainers: [{ name: 'debug-writer' }] } : {}) },
+      status: { containerStatuses: [{ name: 'main', state: patched ? { terminated: { exitCode: 0, finishedAt: new Date().toISOString() } } : { running: {} } }],
+        ...(podShape === 'init_sidecar' ? { initContainerStatuses: [{ name: 'sidecar', state: { running: {} } }] } : {}),
+        ...(podShape === 'ephemeral' ? { ephemeralContainerStatuses: [{ name: 'debug-writer', state: { running: {} } }] } : {}),
+        ...(podShape === 'terminal_auxiliary' ? {
+          initContainerStatuses: [{ name: 'sidecar', state: { terminated: { exitCode: 0, finishedAt: new Date().toISOString() } } }],
+          ephemeralContainerStatuses: [{ name: 'debug-writer', state: { terminated: { exitCode: 0, finishedAt: new Date().toISOString() } } }],
+        } : {}) },
     }] };
     else throw new Error('Unexpected mock kubectl command: ' + args.join(' '));
     return { returncode: 0, stdout: JSON.stringify(response), stderr: '' };
@@ -125,6 +135,7 @@ async function fixture(t: TestContext, deployment = false) {
   return { azure, store, inventory, authority, blobs, timeouts, actions: createDefaultLifecycleActions(store, azure), controller,
     onPatch: (value: () => void) => { onPatch = value; }, onIntent: (value: () => void) => { onIntent = value; },
     alreadyStopped: () => { patched = true; }, touchVersion: () => { revision++; },
+    setPodShape: (value: typeof podShape) => { podShape = value; },
     fence: () => { state.fencingToken++; }, get state() { return state; },
     get patchCount() { return patchCount; }, setFault: (value: typeof fault) => { fault = value; }, wrongUid: () => { wrongUid = true; } };
 }
@@ -184,6 +195,41 @@ test('unknown residual PATCH is recovered only by positive exact stopped state, 
   assert.equal(f.patchCount, 1);
   const stops = [...f.blobs.values()].map(value => JSON.parse(value.bytes.toString())).filter(value => value.phase === 'complete');
   assert.equal(stops[0].response.source, 'exact_state_recovery');
+});
+for (const shape of ['init_sidecar', 'missing', 'ephemeral'] as const) {
+  test(`terminal recovery and freeze refuse incomplete physical stop: ${shape}`, async t => {
+    const f = await fixture(t, true), current = await f.controller();
+    f.setFault('patch_unknown');
+    await assert.rejects(f.actions.captureTerminalState(current.inventory, 'terminal', current.authority), /Lost PATCH/);
+    f.setFault('none'); f.setPodShape(shape);
+    await assert.rejects(f.actions.recoverLifecycle!('terminal_capture', current.inventory, null, 'terminal', current.authority),
+      shape === 'missing' ? /container coverage is UNKNOWN/ : /no positive exact stopped state/);
+    assert.equal(f.patchCount, 1, 'incomplete observations must not authorize UNKNOWN PATCH replay');
+    assert.ok(![...f.blobs.keys()].some(blob => blob.endsWith('/terminal_capture.json')));
+    f.setPodShape('regular');
+    assert.equal(await f.actions.recoverLifecycle!('terminal_capture', current.inventory, null, 'terminal', current.authority), 'complete');
+    f.setPodShape(shape);
+    await assert.rejects(f.actions.recoverLifecycle!('terminal_capture', current.inventory, null, 'terminal', current.authority),
+      shape === 'missing' ? /container coverage is UNKNOWN/ : /no longer physically stopped/);
+    assert.equal(f.patchCount, 1);
+  });
+}
+test('terminal freeze shares complete container proof for maintenance writers', async t => {
+  const f = await fixture(t, true), current = await f.controller();
+  assert.equal(await f.actions.captureTerminalState(current.inventory, 'terminal', current.authority), 'complete');
+  f.state.runInventory!.resources[0]!.role = 'maintenance';
+  f.setPodShape('ephemeral');
+  await assert.rejects(f.actions.captureTerminalState(current.inventory, 'terminal', current.authority),
+    /physical writer stop/);
+  assert.equal(f.patchCount, 1);
+});
+test('positive terminal proof retains observed regular, init-sidecar and ephemeral container receipts', async t => {
+  const f = await fixture(t, true), current = await f.controller();
+  f.alreadyStopped(); f.setPodShape('terminal_auxiliary');
+  assert.equal(await f.actions.captureTerminalState(current.inventory, 'terminal', current.authority), 'complete');
+  const stop = [...f.blobs.values()].map(value => JSON.parse(value.bytes.toString())).find(value => value.phase === 'complete');
+  assert.deepEqual(stop.terminal_pods[0].containers.map((value: { name: string }) => value.name), ['main', 'sidecar', 'debug-writer']);
+  assert.equal(f.patchCount, 0);
 });
 test('expired terminal budget cannot admit a residual collector stop or reset its persisted deadline', async t => {
   const f = await fixture(t), current = await f.controller(), deadline = current.inventory.cleanup.terminal_capture.deadline_unix_ms!;

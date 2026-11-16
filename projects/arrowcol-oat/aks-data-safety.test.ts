@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { test, type TestContext } from 'node:test';
-import { Azure, Config, TAGS, type HttpReceipt } from '../../infra/azure/bootstrap.js';
+import { Azure, Config, TAGS, canonical_json, type HttpReceipt } from '../../infra/azure/bootstrap.js';
 import { CampaignConflictError, CampaignWriteOutcomeUnknownError, CUSTODY_CLEANUP_STEPS, newCampaignState, type CampaignState, type CampaignStore, type RunInventory } from './aks-campaign.js';
 import { captureCellBaseline, captureTerminalData, observeDataPreservation } from './aks-data-safety.js';
 import type { CleanupMutationAuthority } from './aks-cleanup-executor.js';
@@ -124,8 +125,10 @@ test('terminal and independent final replay preserve explicit absence without ma
   assert.deepEqual(proof.run_owned_qap_after, { rows: null, reason: 'run_owned_qap_removed_by_design' });
   assert.ok([...f.blobs.keys()].some(name => name.endsWith('/data-final.json')));
   const c = f.azure.c, aksId = c.base + '/providers/Microsoft.ContainerService/managedClusters/' + c.cluster;
+  let countResponse: Buffer | undefined;
   t.mock.method(f.azure, 'request', async (_method: string, url: string, _resource: string, _body?: string | Buffer | null,
     _headers?: unknown, _missing?: boolean, _idempotent?: boolean, receipt?: (value: HttpReceipt) => void) => {
+    if (url.endsWith('/v1/rest/query') && countResponse) return [countResponse, { ':status': '200' }];
     const id = new URL(url).pathname, tags = { ...TAGS, sandboxId: c.sandbox };
     const resource = id === aksId ? { id, type: 'Microsoft.ContainerService/managedClusters', tags, properties: { provisioningState: 'Succeeded',
       agentPoolProfiles: ['systempool', 'benchd64', 'benche64'].map(name => ({ name })) } } :
@@ -146,6 +149,65 @@ test('terminal and independent final replay preserve explicit absence without ma
     readHealth: async () => ({ observed_at_unix_ms: Date.now(), pods: [{ name: 'stamp/healthy', ready: true, scheduled: true }],
       pdb_blocked: false, versions: [] }) });
   assert.equal(await defaults.verifySafeIdle(f.state, 'verify'), 'complete', 'installed real data provider must compose with independent capacity, not numeric zero stand-ins');
+  const baselineBlob = `_arrowcol-custody/campaigns/${campaignId}/baseline.json`, baseline = f.blobs.get(baselineBlob)!;
+  const originalBaseline = baseline.bytes;
+  const table = 'preserved_external', database = c.database;
+  const schema = { OrderedColumns: [{ Name: 'value', Type: 'long' }] };
+  const definition = { TableName: table, TableType: 'Delta', DocString: 'preserved-stamp-table',
+    ConnectionStrings: [`abfss://${c.data}@${c.account}.dfs.core.windows.net/preserved/table;managed_identity=${ownerId}`],
+    Properties: JSON.stringify({ AutoUpdateSchema: false, Compressed: false, CompressionType: null, Encoding: null,
+      FileExtension: null, Format: 'Parquet', IncludeHeaders: 'None', NamePrefix: null, Shortcut: false }) };
+  const digest = (value: unknown) => createHash('sha256').update(canonical_json(value)).digest('hex');
+  const snapshot = JSON.parse(originalBaseline.toString());
+  snapshot.non_run_kusto.tables = [{ database, name: table, kind: 'external',
+    schema_sha256: digest(schema), definition_sha256: digest(definition),
+    before: { database, table, kind: 'external', rows: 7, query_sha256: '1'.repeat(64),
+      result_sha256: '2'.repeat(64), observed_at_unix_ms: snapshot.captured_at_unix_ms },
+    qap_before: { observed_at_unix_ms: snapshot.captured_at_unix_ms, query_sha256: '3'.repeat(64),
+      is_healthy: true, not_healthy_reason_present: false, pending_files: 0, row_count: 7, accelerated_row_count: 7, table_version: 1 } }];
+  baseline.bytes = Buffer.from(JSON.stringify(snapshot));
+  const result = (row: Record<string, unknown>) => ({ Tables: [{
+    Columns: Object.keys(row).map(ColumnName => ({ ColumnName, ColumnType: 'string' })), Rows: [Object.values(row)],
+  }] });
+  countResponse = Buffer.from(JSON.stringify({ Tables: [
+    { TableName: 'Table_0', Columns: [{ ColumnName: 'Count', ColumnType: 'long' }], Rows: [[7]] },
+    { TableName: 'Table_1', Columns: ['Severity', 'SeverityName', 'StatusCode'].map(ColumnName =>
+      ({ ColumnName, ColumnType: ColumnName === 'SeverityName' ? 'string' : 'long' })), Rows: [[4, 'Info', 0]] },
+    { TableName: 'Table_2', Columns: [{ ColumnName: 'Value', ColumnType: 'string' }], Rows: [] },
+    { TableName: 'Table_3', Columns: ['Ordinal', 'Kind', 'Name', 'Id', 'PrettyName'].map(ColumnName =>
+      ({ ColumnName, ColumnType: ColumnName === 'Ordinal' ? 'long' : 'string' })),
+      Rows: [[0, 'QueryResult', 'PrimaryResult', 'result', ''], [1, 'QueryStatus', 'QueryStatus', 'status', ''],
+        [2, 'QueryProperties', '@ExtendedProperties', 'properties', '']] },
+  ] }));
+  for (const [label, enabled, healthy, pending] of [
+    ['missing first sample and unhealthy final', [false, true], false, [0, 0]],
+    ['missing first sample and healthy final', [false, true], true, [0, 0]],
+    ['missing final sample', [true, false], true, [0, 0]],
+    ['unhealthy final with both samples', [true, true], false, [0, 0]],
+    ['growing backlog with both samples', [true, true], true, [0, 1]],
+  ] as const) {
+    await t.test(`default safe idle rejects ${label}`, async () => {
+      let sample = -1;
+      t.mock.method(f.azure, 'kql', async (command: string) => {
+        if (command.endsWith('schema as json')) return result({ TableName: table, DatabaseName: database, Schema: JSON.stringify(schema) });
+        if (command === '.show external tables') return result(definition);
+        if (command.endsWith('policy query_acceleration')) {
+          sample++;
+          return result({ EntityName: `[${database}].[${table}]`, EntityType: 'ExternalTable',
+            Policy: enabled[sample] ? JSON.stringify({ IsEnabled: true }) : null });
+        }
+        if (command.endsWith(' details')) return result({ QueryAccelerationState: { IsHealthy: healthy,
+          NotHealthyReason: healthy ? null : 'not healthy', RowCount: 7, AcceleratedRowCount: 7, TableVersion: 1 } });
+        if (command.includes('query_acceleration statistics')) return result({ ExternalTableName: table,
+          AccelerationPendingDataFilesCount: pending[sample] });
+        throw new Error('Unexpected mocked Kusto command: ' + command);
+      });
+      await assert.rejects(defaults.verifySafeIdle(f.state, 'verify'),
+        /enabled policy changed|non_run_qap_unhealthy_or_backlog_growing/);
+      assert.equal(sample, 1, 'both exact QAP samples must be observed');
+    });
+  }
+  baseline.bytes = originalBaseline;
   f.blobs.delete([...f.blobs.keys()].find(name => name.endsWith('/delta-terminal.json'))!);
   await assert.rejects(defaults.verifySafeIdle(f.state, 'verify'), /absent or unversioned/);
 });

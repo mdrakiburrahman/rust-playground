@@ -137,7 +137,9 @@ An absent table has null identity/version/rows, never zero; permission errors an
 Absence is not a throughput or row-delivery proof. The campaign's immutable capacity/non-run Kusto reference
 must already exist. After physical writer stop, terminal capture freezes a new immutable reference before removal.
 Final replay independently protects both that reference and the original baseline, rechecks prior-cell reference chains,
-and observes preserved non-run Kusto identities/counts and healthy, non-growing QAP backlog. Run-QAP pre-DROP
+and observes preserved non-run Kusto identities/counts and healthy, non-growing QAP backlog. Both QAP samples
+must match baseline enabledness; an enabled policy needs both comparable samples and a healthy final sample.
+Missing comparison evidence is UNKNOWN, never safe idle. Run-QAP pre-DROP
 observations remain historical; their post-removal count is null with reason `run_owned_qap_removed_by_design`.
 Missing stats/history and PURGE without a separately trusted frozen retention policy remain UNKNOWN.
 
@@ -150,6 +152,9 @@ no broad workload discovery or deletion is used. Blocking Kubernetes commands co
 Sanitized log receipts retain exact pod/container identities, hashes, byte counts and allowlisted numerical samples;
 unstructured text and unapproved fields are redacted. Actual observed container exits/OOM status are retained.
 A missing terminal observation is explicit evidence loss, never a successful drain.
+Physical-stop proof requires exact spec/status coverage for regular, init (including native sidecar) and ephemeral
+containers, with every container terminal. Missing, duplicate or unrecognized coverage fails closed. Stop,
+exact-state recovery and terminal Delta freeze share this proof.
 
 Only a current controller with durable unsettled-drain proof and completed admission/maintenance stops can stop
 residual collectors inside `terminal_capture`. This has its own persisted 120-second deadline, never resets or
