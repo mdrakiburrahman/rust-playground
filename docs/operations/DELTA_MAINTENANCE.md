@@ -9,6 +9,8 @@
 | Schedule | `arrowcol.maintenance.interval` applies independently to each table. An error is not an idle success and does not trigger idle exponential backoff. |
 | OPTIMIZE upload | `--optimize-upload-mode` / `ARROWCOL_MAINT_OPTIMIZE_UPLOAD_MODE` is strictly `put_create` (default, atomic create-only) or `buffered_multipart` (opt-in, UUID-collision-only and unqualified; do not use in scored cells). `--optimize-upload-buffer-bytes` / `ARROWCOL_MAINT_OPTIMIZE_UPLOAD_BUFFER_BYTES` applies only to buffered mode, defaults to 8 MiB, and accepts 4..=64 MiB. Successful upload shutdown precedes Add publication; a failed/uncertain multipart completion may leave an orphan. `BufWriter` concurrency 1 does not cap final-part overlap. |
 | Observability | JSON results identify `negative_probe`; Prometheus `delta_maintenance_negative_probes_total` and outcome-labelled runs distinguish cheap noops from plans, work and errors. Equivalent counters are exported through OpenTelemetry. |
+| Startup readback | `arrowcol_maintenance_effective_config.optimize_upload` reports mode, requested buffer, and effective buffer; `null` means inactive for `put_create`, while `buffered_multipart` defaults to 8 MiB. `startup.operation_limits` retains the exact parsed consumer values. |
+| Parquet writer | Optional OAT `maintenance.parquet_writer` is role-scoped: absent inherits the global writer; present replaces the maintenance writer only. Startup `parquet_writer_overrides` reports the maintenance process settings, and an omitted writer row-group limit preserves `output_row_group_rows`. |
 
 ## Negative admission, before replay
 
