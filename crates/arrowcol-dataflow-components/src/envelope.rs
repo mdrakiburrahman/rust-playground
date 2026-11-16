@@ -211,6 +211,7 @@ pub fn decode_record_set(records: PdataArrowRecordSet) -> Result<Vec<DecodedArro
         .collect()
 }
 
+#[cfg(test)]
 fn encode_schema_id(envelope: &ArrowcolBatchEnvelope) -> Result<String, EnvelopeError> {
     let encoded =
         serde_json::to_vec(envelope).map_err(|error| EnvelopeError::InvalidSchemaIdentity(error.to_string()))?;
@@ -401,6 +402,24 @@ mod tests {
         assert_eq!(decoded_values, id_values);
     }
 
+    #[test]
+    fn trusted_send_observation_round_trip_preserves_unknown_clock_uncertainty() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::UInt64, false)]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(UInt64Array::from(vec![1]))]).expect("batch");
+        let send_unix_ns = 1_700_000_000_000_000_000;
+        let id = format!("123-7-{send_unix_ns}");
+        let records =
+            encode_record_batch_with_trusted_client_observation(envelope(), batch, Some((id.clone(), send_unix_ns)))
+                .expect("encode");
+        let decoded = decode_record_set(records).expect("decode");
+        assert_eq!(
+            decoded[0].trusted_client_send_observation(),
+            Some((id.as_str(), send_unix_ns, None))
+        );
+        let legacy = decode_record_set(records_with_version(RepresentationVersion::new(1, 1))).expect("legacy");
+        assert_eq!(legacy[0].trusted_client_send_observation(), None);
+    }
+
     /// Scenario: A batch schema changes after an adapter-supplied fingerprint is created.
     /// Guarantees: The exporter rejects the mismatch before any Delta side effect.
     #[test]
@@ -410,7 +429,7 @@ mod tests {
             RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(UInt64Array::from(vec![1]))]).expect("batch");
         let table = PdataArrowTable::new(
             ROOT_TABLE_ID,
-            encode_schema_id(&envelope()).expect("schema id").into(),
+            encode_schema_id_v1_2(envelope(), None).expect("schema id").into(),
             SchemaFingerprint::new([0xAA; 32]),
             batch,
         )
