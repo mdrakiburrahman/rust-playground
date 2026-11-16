@@ -7,7 +7,7 @@ import { extname, isAbsolute, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { formatPreflightReport, loadAksEnvironment, runAksPreflight } from './aks-preflight.js';
 import { run_tree } from '../../infra/azure/bootstrap.js';
-import { record, reportDataFlowRun, type NetworkObservation } from './dataflow-verdict.js';
+import { parseDataFlowVerdictPolicy, record, reportDataFlowRun, type NetworkObservation } from './dataflow-verdict.js';
 
 export interface OatRunStatus {
   id: string;
@@ -407,6 +407,7 @@ export async function readOatConfigForMode(
 ): Promise<Record<string, unknown>> {
   const parsed: unknown = JSON.parse(await readFile(configPath, 'utf8'));
   if (!isRecord(parsed)) throw new Error('OAT config must be a JSON object');
+  parseDataFlowVerdictPolicy(parsed.dataflow_verdict_policy);
   const platform: Record<string, unknown> = isRecord(parsed.platform) ? { ...parsed.platform, kind: mode } : { kind: mode };
   if (mode === 'local' && isRecord(platform.local)) {
     const local = { ...platform.local };

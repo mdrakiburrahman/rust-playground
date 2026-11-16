@@ -9,7 +9,7 @@ import { Table as WasmTable, writeParquet } from 'parquet-wasm';
 import type { run_tree } from '../../infra/azure/bootstrap.js';
 import {
   CLEANUP_TIMEOUT_MS, MAX_RESULT_BYTES, RESULT_TIMEOUT_MS, collectDataFlow, dataFlowExitCode,
-  decodeResultRows, evaluateDataFlow, fetchResultBytes, formatDataFlow, readResultBytes, reportDataFlowRun, verifyRunCleanup,
+  decodeResultRows, evaluateDataFlow, fetchResultBytes, formatDataFlow, parseDataFlowVerdictPolicy, readResultBytes, reportDataFlowRun, verifyRunCleanup,
 } from './dataflow-verdict.js';
 import type { OatRunStatus } from './launch.js';
 
@@ -125,6 +125,39 @@ test('AKS QAP requires every observation health condition; local omits it', () =
     assert.match(invalid.reasons.join('; '), /QAP observation incomplete/);
   }
   assert.equal(evaluateDataFlow(status, [row({ mode: 'local', qap_completion_percent: null })], sha, 'local', config).pass, true);
+});
+
+test('single-hot-table campaign separates QAP lag from ingest validity and rejects unknown evidence', () => {
+  const valid = row({ schema_version: 3, measure_seconds: 1, evidence_json: JSON.stringify(outputEvidence()) });
+  const lagging = evaluateDataFlow(status, [row({ ...valid, qap_completion_percent: 75, qap_pending_artifacts: 5n, qap_unhealthy_catalogs: 1n })], sha, 'aks', config, 'single_hot_table_campaign');
+  assert.equal(lagging.pass, true);
+  assert.equal(lagging.ingestPass, true);
+  assert.equal(lagging.downstreamStatus, 'lagging');
+  assert.match(formatDataFlow(lagging), /DATA FLOW: PASS/);
+  assert.match(formatDataFlow(lagging), /FINDING: .*QAP acceleration is 75%/);
+
+  for (const override of [
+    { qap_completion_percent: null },
+    { qap_observation_complete: 0n },
+  ]) {
+    const unknown = evaluateDataFlow(status, [row({ ...valid, ...override })], sha, 'aks', config, 'single_hot_table_campaign');
+    assert.equal(unknown.pass, false);
+    assert.equal(unknown.ingestPass, true);
+    assert.equal(unknown.downstreamStatus, 'unknown');
+    assert.match(unknown.reasons.join('; '), /QAP observation incomplete or metrics missing/);
+  }
+
+  const unavailable = evaluateDataFlow(status, [row({ ...valid, mode: 'local', evidence_json: JSON.stringify({ ...outputEvidence(), downstream_status: 'unavailable' }) })], sha, 'local', config, 'single_hot_table_campaign');
+  assert.equal(unavailable.pass, false);
+  assert.equal(unavailable.ingestPass, true);
+  assert.equal(unavailable.downstreamStatus, 'unknown');
+  assert.match(formatDataFlow(unavailable), /downstream metrics are null/);
+
+  const unbalanced = evaluateDataFlow(status, [valid], sha, 'aks', { ...config, dfe_worker_concurrency: [8, 16] }, 'single_hot_table_campaign');
+  assert.equal(unbalanced.pass, false);
+  assert.equal(unbalanced.ingestPass, false);
+  assert.match(unbalanced.reasons.join('; '), /does not cover the expected experiment matrix/);
+  assert.throws(() => parseDataFlowVerdictPolicy('campaign'), /Unsupported dataflow_verdict_policy/);
 });
 
 test('network summary retains the explicit accepted-risk warning and preflight warnings', () => {
