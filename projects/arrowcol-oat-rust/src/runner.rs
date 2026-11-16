@@ -795,8 +795,7 @@ impl PublicationBacklogScraper {
                 (endpoint, Some(tunnel))
             }
             ResourceSamplerSource::Local {
-                collector_metrics_url,
-                ..
+                collector_metrics_url, ..
             } => (
                 collector_metrics_url
                     .clone()
@@ -817,11 +816,19 @@ impl PublicationBacklogScraper {
 
     async fn scrape(&self) -> Result<PublicationBacklogMetrics> {
         const MAX_METRICS_BYTES: u64 = 1_048_576;
-        let response = self.client.get(&self.endpoint).send().await.context("request collector admin metrics")?;
+        let response = self
+            .client
+            .get(&self.endpoint)
+            .send()
+            .await
+            .context("request collector admin metrics")?;
         if !response.status().is_success() {
             bail!("collector admin metrics returned HTTP {}", response.status());
         }
-        if response.content_length().is_some_and(|length| length > MAX_METRICS_BYTES) {
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_METRICS_BYTES)
+        {
             bail!("collector admin metrics exceeded the evidence size limit");
         }
         let body = response.bytes().await.context("read collector admin metrics")?;
@@ -7150,7 +7157,10 @@ async fn start_aks_collector_metrics_tunnel(config: &OatConfig) -> Result<(Strin
     if pods.len() != 1 {
         bail!("publication backlog scrape requires exactly one active ArrowCol collector");
     }
-    let pod = pods.into_iter().next().context("active ArrowCol collector pod is missing")?;
+    let pod = pods
+        .into_iter()
+        .next()
+        .context("active ArrowCol collector pod is missing")?;
     let target = format!("pod/{pod}");
     let reservation = TcpListener::bind("127.0.0.1:0")
         .await
