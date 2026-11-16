@@ -985,6 +985,14 @@ trait Platform: Send + Sync {
     ) -> Result<()> {
         Ok(())
     }
+    async fn finalize_campaign_load_admission(
+        &mut self,
+        _config: &OatConfig,
+        _run_id: &str,
+        _tables: &[String],
+    ) -> Result<()> {
+        Ok(())
+    }
     fn mark_qap_outcome_unresolved(&mut self) {}
     async fn prepare_client_fleet(&mut self, config: &OatConfig, run_id: &str) -> Result<()>;
     async fn start_client(
@@ -1428,20 +1436,55 @@ impl Platform for AksPlatform {
         }
         pending.validate_successor(&confirmed)?;
         persist_campaign_inventory_snapshot(self, &confirmed, &etag).await?;
-        let mut authorized = confirmed.clone();
+        Ok(())
+    }
+
+    async fn finalize_campaign_load_admission(
+        &mut self,
+        config: &OatConfig,
+        run_id: &str,
+        tables: &[String],
+    ) -> Result<()> {
+        if config.campaign_profile != Some(crate::config::CampaignProfile::SingleHotTable) {
+            return Ok(());
+        }
+        let [_hot_table] = tables else {
+            bail!("campaign load admission requires exactly one frozen hot table");
+        };
+        let database = self.qap_database(config)?;
+        let relative_root = self
+            .qap_relative_data_root
+            .as_deref()
+            .context("AKS run-scoped data root is missing")?;
+        let (_, expected_bindings) = campaign_qap_manifest(run_id, &database, relative_root, tables)?;
+        let identity = CampaignIdentity::from_lookup(|name| std::env::var(name).ok())?;
+        let cached = campaign_inventory_for_setup(self).await?;
+        let orchestration_run_id = cached.orchestration_run_id.clone();
+        let (pending, _) =
+            read_authoritative_campaign_inventory(self, &identity, &orchestration_run_id, Duration::from_secs(60))
+                .await?;
+        validate_campaign_inventory_load_admission(
+            &pending,
+            InventoryLoadAdmission::AuthorizationPending,
+            &database,
+            &expected_bindings,
+        )?;
+        let mut authorized = pending.clone();
         authorized.load_admission = InventoryLoadAdmission::Authorized;
-        confirmed.validate_successor(&authorized)?;
+        pending.validate_successor(&authorized)?;
         persist_campaign_inventory(self, &authorized).await?;
-        let (final_inventory, final_etag) = read_authoritative_campaign_inventory(
-            self,
-            &identity,
-            &inventory.orchestration_run_id,
-            Duration::from_secs(60),
-        )
-        .await?;
+        let (final_inventory, final_etag) =
+            read_authoritative_campaign_inventory(self, &identity, &orchestration_run_id, Duration::from_secs(60))
+                .await?;
         if final_inventory.load_admission != InventoryLoadAdmission::Authorized {
             bail!("authoritative campaign inventory did not positively confirm load authorization");
         }
+        validate_campaign_inventory_load_admission(
+            &final_inventory,
+            InventoryLoadAdmission::Authorized,
+            &database,
+            &expected_bindings,
+        )?;
         authorized.validate_successor(&final_inventory)?;
         persist_campaign_inventory_snapshot(self, &final_inventory, &final_etag).await?;
         final_inventory.assert_custody_ready(self.campaign_cli_paths()?).await?;
@@ -3806,6 +3849,9 @@ async fn run_clients_inner(
             };
         }
     };
+    platform
+        .finalize_campaign_load_admission(config, project_run_id, tables)
+        .await?;
     let schedule_deadline =
         tokio::time::Instant::now() + Duration::from_secs(crate::config::SCHEDULE_DELIVERY_TIMEOUT_SECONDS);
     let run_start_unix_ms = unix_time_ms_u64()?
@@ -8035,6 +8081,41 @@ async fn campaign_inventory_for_setup(platform: &AksPlatform) -> Result<RunInven
     Ok(inventory)
 }
 
+fn validate_campaign_inventory_load_admission(
+    inventory: &RunInventory,
+    expected_admission: InventoryLoadAdmission,
+    expected_database: &str,
+    expected_bindings: &[InventoryQapBinding],
+) -> Result<()> {
+    let qap_is_observed = inventory.qap.as_ref().is_some_and(|qap| {
+        qap.database == expected_database
+            && qap.bindings.as_slice() == expected_bindings
+            && !qap.bindings.is_empty()
+            && qap.state == InventoryResourceState::Observed
+            && qap.absence.is_empty()
+            && qap.reference.is_some()
+    });
+    let resources_are_observed = !inventory.resources.is_empty()
+        && inventory
+            .resources
+            .iter()
+            .all(|resource| resource.state == InventoryResourceState::Observed && resource.uid.is_some());
+    let fic_is_observed = inventory
+        .fic
+        .as_ref()
+        .is_some_and(|fic| fic.state == InventoryResourceState::Observed);
+    if inventory.load_admission != expected_admission
+        || inventory.namespace.uid.is_none()
+        || !resources_are_observed
+        || !fic_is_observed
+        || !qap_is_observed
+        || inventory.cleanup.handoff.state == InventoryStepState::Complete
+    {
+        bail!("campaign load admission requires complete observed namespace, resources, FIC and exact QAP proof");
+    }
+    inventory.validate()
+}
+
 async fn update_campaign_fic_inventory(platform: &AksPlatform, fic: InventoryFic) -> Result<()> {
     let current = campaign_inventory_for_setup(platform).await?;
     let mut next = current.clone();
@@ -12160,6 +12241,106 @@ mod tests {
             assert!(error.downcast_ref::<StaleCampaignVersionError>().is_none());
             assert!(error.to_string().contains(code));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn campaign_load_admission_waits_for_observed_qap_and_serializes_each_stage() -> Result<()> {
+        let identity = CampaignIdentity {
+            campaign_id: "00000000-0000-0000-0000-000000000001".to_owned(),
+            owner_id: "00000000-0000-0000-0000-000000000002".to_owned(),
+            fencing_token: 7,
+        };
+        let cell_run_id = "00000000-0000-0000-0000-000000000004";
+        let namespace = "arrow-collector-00000000000000000000000000000004";
+        let mut inventory = initial_campaign_inventory(
+            &identity,
+            "00000000-0000-0000-0000-000000000003",
+            cell_run_id,
+            namespace,
+            "campaignstorage",
+            "checkpoints",
+        )?;
+        inventory.namespace.uid = Some("00000000-0000-0000-0000-000000000005".to_owned());
+        inventory.resources.push(InventoryResource {
+            api_version: "apps/v1".to_owned(),
+            kind: "Deployment".to_owned(),
+            namespace: namespace.to_owned(),
+            name: "arrowcol".to_owned(),
+            uid: Some("00000000-0000-0000-0000-000000000006".to_owned()),
+            role: InventoryResourceRole::Collector,
+            state: InventoryResourceState::Observed,
+            absence: None,
+        });
+        inventory.fic = Some(InventoryFic {
+            resource_id: Some("/subscriptions/00000000-0000-0000-0000-000000000007/resourceGroups/perf69/providers/Microsoft.ManagedIdentity/userAssignedIdentities/arrow-collector/federatedIdentityCredentials/oat-run".to_owned()),
+            name: Some("oat-run".to_owned()),
+            state: InventoryResourceState::Observed,
+            absence: None,
+            plan: None,
+        });
+        let binding = InventoryQapBinding {
+            external_table: "arrowcol_data".to_owned(),
+            relative_path: format!(
+                "oat-prefix/runs/{cell_run_id}/dataflow/telemetry/sqlserver/sqlserver_availability_replica_states"
+            ),
+        };
+        inventory.qap = Some(InventoryQap {
+            database: "perf69_qap".to_owned(),
+            bindings: vec![binding.clone()],
+            state: InventoryResourceState::Planned,
+            absence: Vec::new(),
+            reference: None,
+        });
+        inventory.load_admission = InventoryLoadAdmission::AuthorizationPending;
+        inventory.validate()?;
+        assert!(
+            validate_campaign_inventory_load_admission(
+                &inventory,
+                InventoryLoadAdmission::AuthorizationPending,
+                "perf69_qap",
+                std::slice::from_ref(&binding),
+            )
+            .is_err()
+        );
+        let preflight = inventory.clone();
+        let qap = inventory.qap.as_mut().context("planned QAP inventory is missing")?;
+        qap.state = InventoryResourceState::Observed;
+        qap.reference = Some(InventoryQapReference {
+            schema_version: 1,
+            account: "campaignstorage".to_owned(),
+            container: "checkpoints".to_owned(),
+            blob: "campaigns/00000000-0000-0000-0000-000000000001/qap.json".to_owned(),
+            run_id: cell_run_id.to_owned(),
+            nonce: "00000000-0000-0000-0000-000000000008".to_owned(),
+            manifest_sha256: "a".repeat(64),
+            namespace_uid: "00000000-0000-0000-0000-000000000005".to_owned(),
+            namespace_owner_token: identity.owner_id.clone(),
+        });
+        inventory.validate()?;
+        validate_campaign_inventory_load_admission(
+            &inventory,
+            InventoryLoadAdmission::AuthorizationPending,
+            "perf69_qap",
+            std::slice::from_ref(&binding),
+        )?;
+        let qap_observed_pending = inventory.clone();
+        inventory.load_admission = InventoryLoadAdmission::Authorized;
+        qap_observed_pending.validate_successor(&inventory)?;
+        validate_campaign_inventory_load_admission(
+            &inventory,
+            InventoryLoadAdmission::Authorized,
+            "perf69_qap",
+            std::slice::from_ref(&binding),
+        )?;
+        println!(
+            "E1_RUST_LOAD_SEQUENCE={}",
+            serde_json::to_string(&serde_json::json!({
+                "preflight": preflight,
+                "qap_observed_pending": qap_observed_pending,
+                "authorized": inventory,
+            }))?
+        );
         Ok(())
     }
 
