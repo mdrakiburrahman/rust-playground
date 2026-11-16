@@ -505,6 +505,108 @@ impl RunInventory {
         }
         Ok(())
     }
+
+    fn validate_custody_receipt(&self, output: &[u8], ready: bool) -> Result<()> {
+        let response: Value = serde_json::from_slice(output).context("invalid custody receipt JSON")?;
+        if response["ok"] != true {
+            let code = match response["code"].as_str() {
+                Some("campaign_fenced") => "campaign_fenced",
+                Some("write_outcome_unknown") => "write_outcome_unknown",
+                Some("invalid_or_storage_error") => "invalid_or_storage_error",
+                _ => "invalid_response",
+            };
+            bail!("custody command failed: {code}");
+        }
+        let receipt = response["receipt"].as_object().context("missing custody receipt")?;
+        let status = if ready { "ready" } else { "persisted" };
+        if receipt.get("status").and_then(Value::as_str) != Some(status)
+            || receipt.get("campaign_id").and_then(Value::as_str) != Some(self.campaign_id.as_str())
+            || receipt.get("owner_id").and_then(Value::as_str) != Some(self.owner_id.as_str())
+            || receipt.get("fencing_token").and_then(Value::as_u64) != Some(self.fencing_token)
+            || receipt.get("orchestration_run_id").and_then(Value::as_str) != Some(self.orchestration_run_id.as_str())
+            || receipt.get("cell_run_id").and_then(Value::as_str) != Some(self.cell_run_id.as_str())
+            || receipt.get("namespace_uid") != Some(&json!(self.namespace.uid))
+        {
+            bail!("custody receipt does not match exact campaign, cell, fence and namespace identity");
+        }
+        if ready && self.namespace.uid.is_none() {
+            bail!("custody readiness requires an observed namespace UID");
+        }
+        if !ready {
+            if receipt.get("resource_count").and_then(Value::as_u64) != Some(self.resources.len() as u64)
+                || receipt.get("fic_state") != Some(&json!(self.fic.as_ref().map(|fic| fic.state)))
+                || receipt.get("qap_state") != Some(&json!(self.qap.as_ref().map(|qap| qap.state)))
+                || receipt.get("etag").and_then(Value::as_str).is_none_or(str::is_empty)
+            {
+                bail!("custody persistence receipt is incomplete or does not match inventory");
+            }
+        }
+        Ok(())
+    }
+
+    /// Publish this inventory and require the fenced store's matching persistence receipt.
+    ///
+    /// # Errors
+    /// Refuses unconfirmed writes and mismatched or fenced receipts without retrying.
+    pub async fn publish_to_custody(&self) -> Result<()> {
+        self.custody_command(false).await
+    }
+
+    /// Verify that the fenced store has armed this exact cell before load starts.
+    ///
+    /// # Errors
+    /// Refuses an unready or mismatched receipt.
+    pub async fn assert_custody_ready(&self) -> Result<()> {
+        self.custody_command(true).await
+    }
+
+    #[cfg(unix)]
+    async fn custody_command(&self, ready: bool) -> Result<()> {
+        self.validate()?;
+        let payload = if ready { None } else {
+            let bytes = serde_json::to_vec(self).context("serialize custody inventory")?;
+            if bytes.len() > 1024 * 1024 {
+                bail!("custody inventory exceeds publisher input limit");
+            }
+            Some(bytes)
+        };
+        let mut command = Command::new("npx");
+        command.args(["--no-install", "tsx", "projects/arrowcol-oat/aks-campaign.ts"]);
+        if ready {
+            command.args(["assert-ready", &self.owner_id, &self.fencing_token.to_string()]);
+        } else {
+            command.arg("publish-inventory");
+        }
+        command.stdin(if ready { Stdio::null() } else { Stdio::piped() })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(Duration::from_secs(60), async {
+            let mut child = command.spawn().context("start fenced custody command")?;
+            let pid = i32::try_from(child.id().context("custody command PID unavailable")?)
+                .context("custody command PID invalid")?;
+            let _group = OwnedQapHelperGroup(rustix::process::Pid::from_raw(pid).context("custody command PID invalid")?);
+            if let Some(payload) = payload {
+                let mut stdin = child.stdin.take().context("custody publisher stdin unavailable")?;
+                stdin.write_all(&payload).await.context("write custody inventory")?;
+                drop(stdin);
+            }
+            child.wait_with_output().await.context("wait for fenced custody command")
+        })
+        .await
+        .context("custody command timed out; write outcome may be unknown and must not be retried")??;
+        if !output.status.success() {
+            return self.validate_custody_receipt(&output.stdout, ready)
+                .and_then(|()| Err(anyhow::anyhow!("custody command exited unsuccessfully despite a success-shaped receipt")));
+        }
+        self.validate_custody_receipt(&output.stdout, ready)
+    }
+
+    #[cfg(not(unix))]
+    async fn custody_command(&self, _ready: bool) -> Result<()> {
+        bail!("fenced custody requires Unix process-group cancellation")
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -9589,6 +9691,20 @@ mod tests {
                 "terminal_capture":step,"handoff":step}
         }))?;
         inventory.validate()?;
+        let persisted = json!({"ok":true,"receipt":{
+            "status":"persisted","campaign_id":inventory.campaign_id,"owner_id":inventory.owner_id,
+            "fencing_token":inventory.fencing_token,"orchestration_run_id":inventory.orchestration_run_id,
+            "cell_run_id":inventory.cell_run_id,"namespace_uid":null,"resource_count":1,
+            "fic_state":null,"qap_state":null,"etag":"\"etag\""
+        }});
+        inventory.validate_custody_receipt(&serde_json::to_vec(&persisted)?, false)?;
+        let mut bad_receipt = persisted.clone();
+        bad_receipt["receipt"]["fencing_token"] = json!(2);
+        assert!(inventory.validate_custody_receipt(&serde_json::to_vec(&bad_receipt)?, false).is_err());
+        bad_receipt = persisted.clone();
+        bad_receipt["receipt"]["resource_count"] = json!(0);
+        assert!(inventory.validate_custody_receipt(&serde_json::to_vec(&bad_receipt)?, false).is_err());
+        assert!(inventory.validate_custody_receipt(br#"{"ok":false,"code":"write_outcome_unknown"}"#, false).is_err());
         let mut absent = inventory.clone();
         absent.resources[0].state = InventoryResourceState::Absent;
         assert!(absent.validate().is_err());
@@ -9656,6 +9772,13 @@ mod tests {
         assert!(observed.validate().is_err());
         observed.namespace.uid = Some("namespace-uid".to_owned());
         observed.resources[0].uid = Some("actual-uid".to_owned());
+        let ready = json!({"ok":true,"receipt":{
+            "status":"ready","campaign_id":inventory.campaign_id,"owner_id":inventory.owner_id,
+            "fencing_token":inventory.fencing_token,"orchestration_run_id":inventory.orchestration_run_id,
+            "cell_run_id":inventory.cell_run_id,"namespace_uid":"namespace-uid"
+        }});
+        observed.validate_custody_receipt(&serde_json::to_vec(&ready)?, true)?;
+        assert!(inventory.validate_custody_receipt(&serde_json::to_vec(&ready)?, true).is_err());
         inventory.validate_successor(&observed)?;
         inventory = observed;
         let mut replacement = inventory.clone();
