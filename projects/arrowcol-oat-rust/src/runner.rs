@@ -1639,23 +1639,12 @@ impl Platform for LocalPlatform {
     async fn ensure_stack(&mut self, config: &OatConfig, _orchestration_run_id: &str) -> Result<()> {
         self.daemon_endpoint = Some(local_docker_daemon().await?);
         prepare_local_platform(config, self).await?;
-        self.router_metrics_url = Some(local_compose_endpoint(config, self, "router", "50050", "/metrics").await?);
-        match local_compose_endpoint(config, self, "dataflow-1", "32011", "/metrics").await {
-            Ok(endpoint) => self.collector_metrics_url = Some(endpoint),
-            Err(error) => {
-                self.collector_metrics_url = None;
-                tracing::warn!(%error, "local collector metrics endpoint unavailable; publication backlog evidence remains unknown");
-            }
-        }
-        match local_compose_endpoint(config, self, "kusto", "8080", "").await {
-            Ok(endpoint) => self.qap_url = Some(endpoint),
-            Err(_) => tracing::warn!("local downstream unavailable; collector-only measurement remains enabled"),
-        }
-        Ok(())
+        self.refresh_endpoints(config).await
     }
 
     async fn scale_arrowcols(&mut self, config: &OatConfig, replicas: u32, concurrency: u32) -> Result<()> {
-        scale_local_arrowcols(config, self, replicas, concurrency).await
+        scale_local_arrowcols(config, self, replicas, concurrency).await?;
+        self.refresh_endpoints(config).await
     }
 
     async fn initialize_run_table_pins(
@@ -1793,6 +1782,26 @@ impl Platform for LocalPlatform {
 }
 
 impl LocalPlatform {
+    async fn refresh_endpoints(&mut self, config: &OatConfig) -> Result<()> {
+        self.router_metrics_url = None;
+        self.collector_metrics_url = None;
+        self.qap_url = None;
+        self.router_metrics_url = Some(local_compose_endpoint(config, self, "router", "50050", "/metrics").await?);
+        match local_compose_endpoint(config, self, "dataflow-1", "32011", "/metrics").await {
+            Ok(endpoint) => self.collector_metrics_url = Some(endpoint),
+            Err(error) => {
+                tracing::warn!(%error, "local collector metrics endpoint unavailable; publication backlog evidence remains unknown");
+            }
+        }
+        match local_compose_endpoint(config, self, "kusto", "8080", "").await {
+            Ok(endpoint) => self.qap_url = Some(endpoint),
+            Err(error) => {
+                tracing::warn!(%error, "local downstream unavailable; collector-only measurement remains enabled")
+            }
+        }
+        Ok(())
+    }
+
     fn new(config: &OatConfig, run_id: &str) -> Result<Self> {
         let state_root = config
             .platform
