@@ -11,6 +11,8 @@ use url::Url;
 pub struct OatConfig {
     #[serde(default)]
     pub tunables: Tunables,
+    #[serde(default)]
+    pub campaign_profile: Option<CampaignProfile>,
     pub platform: PlatformConfig,
     pub stamp: Option<String>,
     pub warmup_seconds: u64,
@@ -99,6 +101,12 @@ pub enum OatMode {
     Aks,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum CampaignProfile {
+    SingleHotTable,
+}
+
 fn default_client_ready_timeout_seconds() -> u64 {
     600
 }
@@ -128,6 +136,41 @@ pub(crate) struct RunTimingBudget {
 }
 
 impl OatConfig {
+    fn validate_campaign_profile(&self) -> Result<()> {
+        if self.campaign_profile != Some(CampaignProfile::SingleHotTable) {
+            return Ok(());
+        }
+        if self.tables.len() != 1 {
+            bail!("single_hot_table campaign requires exactly one public DMV table");
+        }
+        if self.replica_counts != [1] {
+            bail!("single_hot_table campaign requires replica_counts [1]");
+        }
+        if self.tunables.wal.is_some() {
+            bail!("single_hot_table campaign requires WAL to be absent");
+        }
+        let maintenance = self
+            .tunables
+            .maintenance
+            .as_ref()
+            .context("single_hot_table campaign requires enabled, applying maintenance")?;
+        if maintenance.enabled != Some(true) || maintenance.apply != Some(true) {
+            bail!("single_hot_table campaign requires enabled, applying maintenance");
+        }
+        let operations = maintenance
+            .operations
+            .as_ref()
+            .context("single_hot_table campaign requires all maintenance operations")?;
+        use arrowcol_tunables::MaintenanceOperation::{Checkpoint, Optimize, PruneLog, Purge, Vacuum};
+        if [Purge, Optimize, Vacuum, Checkpoint, PruneLog]
+            .iter()
+            .any(|operation| !operations.contains(operation))
+        {
+            bail!("single_hot_table campaign requires purge, optimize, vacuum, checkpoint and prune_log");
+        }
+        Ok(())
+    }
+
     fn validate_selected_parquet_schemas(&self) -> Result<()> {
         let Some(writer) = &self.tunables.parquet_writer else {
             return Ok(());
@@ -238,6 +281,7 @@ impl OatConfig {
     ///
     /// Returns an error when a setting is invalid or a requested DMV table is unsupported.
     pub fn validate(&self) -> Result<()> {
+        self.validate_campaign_profile()?;
         self.tunables.validate_for_oat()?;
         self.validate_selected_parquet_schemas()?;
         self.validate_selected_layout_schemas()?;
@@ -735,6 +779,7 @@ mod tests {
         }
         let config = OatConfig {
             tunables: Tunables::default(),
+            campaign_profile: None,
             platform: PlatformConfig {
                 kind: OatMode::Aks,
                 compose_file: None,
@@ -786,6 +831,39 @@ mod tests {
             website_url: "abfss://$web@account.dfs.core.windows.net/results.parquet".to_owned(),
         };
         TestConfig { config, directory }
+    }
+
+    #[test]
+    fn single_hot_table_profile_rejects_unsafe_settings() -> Result<()> {
+        let mut config = valid();
+        config.campaign_profile = Some(CampaignProfile::SingleHotTable);
+        config.tables = vec!["sqlserver_wait_stats".to_owned()];
+        config.replica_counts = vec![1];
+        config.tunables = serde_json::from_value(serde_json::json!({
+            "maintenance": {
+                "enabled": true, "apply": true,
+                "operations": ["purge", "optimize", "vacuum", "checkpoint", "prune_log"]
+            }
+        }))?;
+        config.validate_campaign_profile()?;
+        config.tables.push("sqlserver_cpu_utilization".to_owned());
+        assert!(config.validate_campaign_profile().is_err());
+        config.tables.pop();
+        config.replica_counts = vec![1, 2];
+        assert!(config.validate_campaign_profile().is_err());
+        config.replica_counts = vec![1];
+        config.tunables.wal = Some(arrowcol_tunables::WalTunables::default());
+        assert!(config.validate_campaign_profile().is_err());
+        config.tunables.wal = None;
+        let maintenance = config.tunables.maintenance.as_mut().unwrap();
+        maintenance.apply = Some(false);
+        assert!(config.validate_campaign_profile().is_err());
+        let maintenance = config.tunables.maintenance.as_mut().unwrap();
+        maintenance.apply = Some(true);
+        maintenance.operations.as_mut().unwrap().pop();
+        assert!(config.validate_campaign_profile().is_err());
+        assert!(serde_json::from_str::<CampaignProfile>(r#""single_hot_tables""#).is_err());
+        Ok(())
     }
 
     #[test]
