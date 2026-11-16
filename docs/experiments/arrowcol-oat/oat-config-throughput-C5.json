@@ -389,7 +389,13 @@
   ],
   "runnable": false,
   "config_validation": {
-    "status": "not-validated"
+    "status": "config-validated",
+    "validator": "arrowcol-oat-rust --validate-config",
+    "source_sha": "02703b71d3c6a2ac92c690f70f1d967b8ac4c7c7",
+    "baseline_count": 1,
+    "candidate_count": 19,
+    "pass_count": 20,
+    "fail_count": 0
   },
   "runtime_qualification": "unqualified"
 }
