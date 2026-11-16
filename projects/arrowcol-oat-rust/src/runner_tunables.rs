@@ -303,6 +303,40 @@ mod tunable_injection_tests {
     }
 
     #[test]
+    #[ignore = "needs L1a no-sort layout"]
+    fn empty_layout_json_reaches_resolved_policy() -> Result<()> {
+        if std::env::var_os("OAT_R1_CHILD").is_some() {
+            let config = arrow_deltalake::delta::effective_layout_startup_config()?;
+            assert_eq!(config["process_policy"]["enabled"], true);
+            assert_eq!(config["process_policy"]["sort_columns"], json!([]));
+            assert_eq!(config["process_policy"]["bloom_columns"], json!([]));
+            return Ok(());
+        }
+        let tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+            "collector": {"layout": {"enabled": true, "sort_columns": [], "bloom_columns": []}}
+        }))?;
+        let environment = tunables.environment_for(ComponentRole::Collector)?;
+        assert_eq!(environment["ARROWCOL_COLLECTOR_SORT_COLUMNS"], "");
+        assert_eq!(environment["ARROWCOL_COLLECTOR_BLOOM_COLUMNS"], "");
+        let mut command = std::process::Command::new(std::env::current_exe()?);
+        for (legacy, canonical, _) in arrow_deltalake::delta::PROCESS_WRITER_PROPERTY_ENVIRONMENT_ALIASES {
+            command.env_remove(legacy).env_remove(canonical);
+        }
+        let status = command
+            .envs(environment)
+            .env("OAT_R1_CHILD", "1")
+            .args([
+                "--exact",
+                "runner::tunable_injection_tests::empty_layout_json_reaches_resolved_policy",
+                "--ignored",
+                "--nocapture",
+            ])
+            .status()?;
+        assert!(status.success());
+        Ok(())
+    }
+
+    #[test]
     fn local_quiver_storage_is_run_owned_and_partitioned_by_process_instance() -> Result<()> {
         let mut config = config()?;
         let state = Path::new("/owned/run");

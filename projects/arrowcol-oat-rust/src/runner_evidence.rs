@@ -113,6 +113,26 @@ impl CellEvidence {
         })
     }
 
+    fn client_window_payload_bytes(&self, table: &str, client: Option<&ClientMetrics>) -> Option<u64> {
+        let client = client?;
+        let window = self.measurement_window?;
+        let reports = self.client_reports.get(table)?;
+        if reports.is_empty() {
+            return None;
+        }
+        let (rows, bytes) = reports.iter().try_fold((0_u64, 0_u64), |(rows, bytes), report| {
+            let measurement = report.pointer("/phase_counters/measurement_window")?;
+            if measurement["start_unix_ms"].as_u64().zip(measurement["end_unix_ms"].as_u64()) != Some(window) {
+                return None;
+            }
+            Some((
+                rows.checked_add(measurement["completed_rows"].as_u64()?)?,
+                bytes.checked_add(measurement["completed_bytes"].as_u64()?)?,
+            ))
+        })?;
+        (rows == client.rows).then_some(bytes)
+    }
+
     fn reconciliation(&self, table: &str, durable: Option<&Value>) -> Value {
         let delta_evidence = durable.and_then(|value| value.get("run_cumulative_output"));
         let Some(delta_rows) = delta_evidence.and_then(|value| value.get("rows")).and_then(Value::as_u64) else {
@@ -168,6 +188,14 @@ impl CellEvidence {
     fn for_table(&self, table: &str, client: Option<&ClientMetrics>) -> Value {
         let durable = self.durable_commits.get(table);
         let output = durable.and_then(|value| value.get("output_throughput"));
+        let observed_cores = self.resource_summary().map(|metrics| metrics.cpu_millicores / 1000.0)
+            .filter(|cores| cores.is_finite() && *cores > 0.0);
+        let committed_rate = output.and_then(|value| value["rows_per_second"].as_f64());
+        let payload_bytes = self.client_window_payload_bytes(table, client);
+        let window_seconds = self.measurement_window
+            .and_then(|(start, end)| end.checked_sub(start))
+            .filter(|duration| *duration > 0)
+            .map(|duration| duration as f64 / 1000.0);
         json!({
             "version": 1,
             "processes": self.processes,
@@ -206,6 +234,16 @@ impl CellEvidence {
                 "retry_semantics": "upload_completion_does_not_establish_exactly_once_delivery",
             },
             "durable_rows_per_second": output.and_then(|value| value["rows_per_second"].as_f64()),
+            "rate_evidence": {
+                "collector_input_bytes_per_second": output.and_then(|value| value["input_bytes_per_second"].as_f64()),
+                "committed_parquet_bytes_per_second": output.and_then(|value| value["parquet_bytes_per_second"].as_f64()),
+                "completed_flight_payload_bytes_per_second": payload_bytes.zip(window_seconds).map(|(bytes, seconds)| bytes as f64 / seconds),
+                "payload_scope": "protobuf_flight_data_encoded_lengths_for_admission_completions_excludes_grpc_and_http2_overhead",
+                "observed_collector_cores": observed_cores,
+                "committed_rows_per_second_per_observed_collector_core": committed_rate.zip(observed_cores).map(|(rate, cores)| rate / cores),
+                "core_scope": "arithmetic_mean_of_observed_collector_fleet_cpu_samples_not_time_weighted",
+                "allocated_collector_cores": null,
+            },
             "durable_files": output.and_then(|value| value["files"].as_u64()),
             "durable_bytes": output.and_then(|value| value["parquet_bytes"].as_u64()),
             "durable_bytes_per_row": output.and_then(|value| value["bytes_per_row"].as_f64()),
@@ -315,6 +353,34 @@ mod measurement_evidence_tests {
         assert_eq!(public["reconciliation"]["status"], "unavailable");
         assert_eq!(public["reconciliation"]["reason"], "cumulative_delta_rows_unavailable");
         assert!(public["compression_ratio"].is_null());
+    }
+
+    #[test]
+    fn window_payload_and_sampled_core_rates_preserve_evidence_boundaries() {
+        let mut evidence = CellEvidence {
+            measurement_window: Some((1000, 3000)),
+            ..Default::default()
+        };
+        evidence.client_reports.insert("table".to_owned(), vec![json!({
+            "phase_counters": {"measurement_window": {
+                "start_unix_ms": 1000, "end_unix_ms": 3000, "completed_rows": 10, "completed_bytes": 200
+            }}
+        })]);
+        evidence.durable_commits.insert("table".to_owned(), json!({
+            "output_throughput": {"rows_per_second": 8.0, "input_bytes_per_second": 100.0, "parquet_bytes_per_second": 50.0}
+        }));
+        evidence.resource_samples.push(ResourceSample {
+            sampled_at_unix_ms: 2000,
+            metrics: ResourceMetrics { cpu_millicores: 2000.0, memory_bytes: 100 },
+        });
+        let client = ClientMetrics { rows: 10, duration_ms: 2000, rows_per_second: 5.0, completions: Vec::new() };
+        let result = evidence.for_table("table", Some(&client));
+        assert_eq!(result["rate_evidence"]["completed_flight_payload_bytes_per_second"], 100.0);
+        assert_eq!(result["rate_evidence"]["committed_rows_per_second_per_observed_collector_core"], 4.0);
+        evidence.client_reports.get_mut("table").unwrap()[0]["phase_counters"]["measurement_window"]["end_unix_ms"] = json!(4000);
+        assert!(evidence.for_table("table", Some(&client))["rate_evidence"]["completed_flight_payload_bytes_per_second"].is_null());
+        evidence.resource_samples.clear();
+        assert!(evidence.for_table("table", Some(&client))["rate_evidence"]["committed_rows_per_second_per_observed_collector_core"].is_null());
     }
 
 

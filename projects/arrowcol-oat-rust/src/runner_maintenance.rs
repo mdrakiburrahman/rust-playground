@@ -227,6 +227,8 @@ fn maintenance_readback_value(observed: &Value, variable: &str, expected: Value)
         | "CATALOG_MAX_DECODING_MESSAGE_BYTES" => (format!("/startup/{}", field.to_ascii_lowercase()), 1, false),
         "PURGE_MAX_FILES_PER_COMMIT"
         | "PURGE_MAX_PLAN_BYTES"
+        | "OPTIMIZE_UPLOAD_MODE"
+        | "OPTIMIZE_UPLOAD_BUFFER_BYTES"
         | "VACUUM_DELETE_CHUNK"
         | "VACUUM_MAX_PLAN_BYTES"
         | "REPLAY_MAX_LOG_FILES"
@@ -609,6 +611,25 @@ mod maintenance_topology_tests {
                 maintenance_readback_value(&observed, &format!("ARROWCOL_MAINT_{variable}"), expected)?;
             assert_eq!(actual, requested);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn maintenance_upload_readback_requires_actual_configured_values() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+            "maintenance": {"enabled": true, "operations": ["optimize"],
+                "optimize_upload_mode": "buffered_multipart", "optimize_upload_buffer_bytes": 4194304}
+        }))?;
+        let mut observed = json!({"startup": {
+            "apply": false, "operations": ["optimize"], "interval_secs": 60,
+            "operation_limits": {"optimize_upload_mode": "buffered_multipart", "optimize_upload_buffer_bytes": 4194304}
+        }});
+        verify_process_configuration(&config, ComponentRole::Maintenance, &observed)?;
+        observed["startup"]["operation_limits"]["optimize_upload_buffer_bytes"] = Value::Null;
+        assert!(verify_process_configuration(&config, ComponentRole::Maintenance, &observed).is_err());
         Ok(())
     }
 }

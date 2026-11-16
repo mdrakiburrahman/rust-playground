@@ -9,8 +9,10 @@ use url::Url;
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OatConfig {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_oat_tunables")]
     pub tunables: Tunables,
+    #[serde(default)]
+    pub campaign_profile: Option<CampaignProfile>,
     pub platform: PlatformConfig,
     pub stamp: Option<String>,
     pub warmup_seconds: u64,
@@ -99,6 +101,20 @@ pub enum OatMode {
     Aks,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum CampaignProfile {
+    SingleHotTable,
+}
+
+fn deserialize_oat_tunables<'de, D>(deserializer: D) -> std::result::Result<Tunables, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Tunables::parse_oat_json(value).map_err(serde::de::Error::custom)
+}
+
 fn default_client_ready_timeout_seconds() -> u64 {
     600
 }
@@ -128,17 +144,96 @@ pub(crate) struct RunTimingBudget {
 }
 
 impl OatConfig {
-    fn validate_selected_parquet_schemas(&self) -> Result<()> {
-        let Some(writer) = &self.tunables.parquet_writer else {
+    fn validate_campaign_profile(&self) -> Result<()> {
+        if self.campaign_profile != Some(CampaignProfile::SingleHotTable) {
             return Ok(());
-        };
+        }
+        if self.tables.len() != 1 {
+            bail!("single_hot_table campaign requires exactly one public DMV table");
+        }
+        if self.replica_counts != [1] {
+            bail!("single_hot_table campaign requires replica_counts [1]");
+        }
+        if self.tunables.wal.is_some() {
+            bail!("single_hot_table campaign requires WAL to be absent");
+        }
+        let maintenance = self
+            .tunables
+            .maintenance
+            .as_ref()
+            .context("single_hot_table campaign requires enabled, applying maintenance")?;
+        if maintenance.enabled != Some(true) || maintenance.apply != Some(true) {
+            bail!("single_hot_table campaign requires enabled, applying maintenance");
+        }
+        if maintenance.max_cycles.is_some() {
+            bail!("single_hot_table campaign requires continuous maintenance without max_cycles");
+        }
+        let operations = maintenance
+            .operations
+            .as_ref()
+            .context("single_hot_table campaign requires all maintenance operations")?;
+        use arrowcol_tunables::MaintenanceOperation::{Checkpoint, Optimize, PruneLog, Purge, Vacuum};
+        if [Purge, Optimize, Vacuum, Checkpoint, PruneLog]
+            .iter()
+            .any(|operation| !operations.contains(operation))
+        {
+            bail!("single_hot_table campaign requires purge, optimize, vacuum, checkpoint and prune_log");
+        }
+        Ok(())
+    }
+
+    fn validate_selected_parquet_schemas(&self) -> Result<()> {
+        let maintenance = self.tunables.maintenance.as_ref();
+        if self.tunables.parquet_writer.is_none()
+            && maintenance
+                .and_then(|settings| settings.parquet_writer.as_ref())
+                .is_none()
+        {
+            return Ok(());
+        }
         let selected = self.tables.iter().map(String::as_str).collect::<HashSet<_>>();
         for table in collector_chain::dmv::tables()? {
             let name = table.identity().table().as_str();
             if selected.contains(name) {
-                writer
-                    .writer_properties(table.schema(), None, &[])
-                    .with_context(|| format!("Parquet writer settings are invalid for selected DMV table {name}"))?;
+                let collector_layout = self
+                    .tunables
+                    .collector
+                    .as_ref()
+                    .and_then(|collector| collector.layout.as_ref());
+                for (writer, enabled, columns) in [
+                    (
+                        self.tunables.parquet_writer.as_ref(),
+                        collector_layout.and_then(|layout| layout.enabled),
+                        collector_layout.and_then(|layout| layout.sort_columns.as_ref()),
+                    ),
+                    (
+                        maintenance.and_then(|settings| settings.parquet_writer.as_ref()),
+                        maintenance.and_then(|settings| settings.layout_enabled),
+                        maintenance.and_then(|settings| settings.layout_sort_columns.as_ref()),
+                    ),
+                ] {
+                    if let Some(writer) = writer {
+                        let enabled = enabled.unwrap_or_else(|| table.schema().field_with_name("customer_id").is_ok());
+                        let sort = if enabled {
+                            columns.cloned().unwrap_or_else(|| vec!["customer_id".to_owned()])
+                        } else {
+                            Vec::new()
+                        };
+                        let verified_sort = sort
+                            .into_iter()
+                            .map(|path| arrowcol_tunables::ParquetSortColumn {
+                                path,
+                                descending: false,
+                                nulls_first: false,
+                            })
+                            .collect::<Vec<_>>();
+                        writer
+                            .writer_properties(table.schema(), None, &verified_sort)
+                            .with_context(|| {
+                                format!("Parquet writer settings are invalid for selected DMV table {name}")
+                            })?;
+                    }
+                }
             }
         }
         Ok(())
@@ -238,6 +333,7 @@ impl OatConfig {
     ///
     /// Returns an error when a setting is invalid or a requested DMV table is unsupported.
     pub fn validate(&self) -> Result<()> {
+        self.validate_campaign_profile()?;
         self.tunables.validate_for_oat()?;
         self.validate_selected_parquet_schemas()?;
         self.validate_selected_layout_schemas()?;
@@ -735,6 +831,7 @@ mod tests {
         }
         let config = OatConfig {
             tunables: Tunables::default(),
+            campaign_profile: None,
             platform: PlatformConfig {
                 kind: OatMode::Aks,
                 compose_file: None,
@@ -786,6 +883,71 @@ mod tests {
             website_url: "abfss://$web@account.dfs.core.windows.net/results.parquet".to_owned(),
         };
         TestConfig { config, directory }
+    }
+
+    #[test]
+    fn single_hot_table_profile_rejects_unsafe_settings() -> Result<()> {
+        let mut config = valid();
+        config.campaign_profile = Some(CampaignProfile::SingleHotTable);
+        config.tables = vec!["sqlserver_wait_stats".to_owned()];
+        config.replica_counts = vec![1];
+        config.maintenance_image = Some(format!("maintenance@sha256:{}", "a".repeat(64)));
+        config.tunables = serde_json::from_value(serde_json::json!({
+            "maintenance": {
+                "enabled": true, "apply": true,
+                "operations": ["purge", "optimize", "vacuum", "checkpoint", "prune_log"]
+            }
+        }))?;
+        config.validate_campaign_profile()?;
+        config.validate()?;
+        config.tables.push("sqlserver_cpu_utilization".to_owned());
+        assert!(config.validate().is_err());
+        config.tables.pop();
+        config.replica_counts = vec![1, 2];
+        assert!(config.validate_campaign_profile().is_err());
+        config.replica_counts = vec![1];
+        config.tunables.wal = Some(arrowcol_tunables::WalTunables::default());
+        assert!(config.validate_campaign_profile().is_err());
+        config.tunables.wal = None;
+        let maintenance = config.tunables.maintenance.as_mut().unwrap();
+        maintenance.apply = Some(false);
+        assert!(config.validate_campaign_profile().is_err());
+        let maintenance = config.tunables.maintenance.as_mut().unwrap();
+        maintenance.apply = Some(true);
+        maintenance.operations.as_mut().unwrap().pop();
+        assert!(config.validate_campaign_profile().is_err());
+        config
+            .tunables
+            .maintenance
+            .as_mut()
+            .unwrap()
+            .operations
+            .as_mut()
+            .unwrap()
+            .push(arrowcol_tunables::MaintenanceOperation::PruneLog);
+        config.tunables.maintenance.as_mut().unwrap().max_cycles = Some(1);
+        assert!(config.validate_campaign_profile().is_err());
+        assert!(serde_json::from_str::<CampaignProfile>(r#""single_hot_tables""#).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn oat_json_rejects_invalid_injectable_enums() -> Result<()> {
+        let base: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        for tunables in [
+            serde_json::json!({"parquet_writer":{"defaults":{"compression":"zstandard"}}}),
+            serde_json::json!({"parquet_writer":{"defaults":{"encoding":"invalid"}}}),
+            serde_json::json!({"parquet_writer":{"defaults":{"statistics":"invalid"}}}),
+            serde_json::json!({"arrow_ipc":{"compression":"invalid"}}),
+            serde_json::json!({"maintenance":{"operations":["invalid"]}}),
+        ] {
+            let mut input = base.clone();
+            input["tunables"] = tunables;
+            assert!(serde_json::from_value::<OatConfig>(input).is_err());
+        }
+        Ok(())
     }
 
     #[test]
@@ -904,6 +1066,24 @@ mod tests {
             Err(error) if format!("{error:#}").contains("unknown physical Parquet column not_a_dmv_column")
         ));
 
+        let mut missing_maintenance_column = valid();
+        missing_maintenance_column.tunables.maintenance = Some(arrowcol_tunables::MaintenanceTunables {
+            enabled: Some(true),
+            operations: Some(vec![arrowcol_tunables::MaintenanceOperation::Optimize]),
+            parquet_writer: Some(arrowcol_tunables::ParquetWriterConfig {
+                columns: std::collections::BTreeMap::from([(
+                    "not_a_dmv_column".to_owned(),
+                    arrowcol_tunables::ParquetColumnOptions::default(),
+                )]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert!(matches!(
+            missing_maintenance_column.validate(),
+            Err(error) if format!("{error:#}").contains("unknown physical Parquet column not_a_dmv_column")
+        ));
+
         let table = collector_chain::dmv::tables()?
             .into_iter()
             .next()
@@ -946,6 +1126,35 @@ mod tests {
             invalid_layout.validate(),
             Err(error) if format!("{error:#}").contains("unknown sort column not_a_dmv_column")
         ));
+        let mut sorted = valid();
+        sorted.tables = vec![table.identity().table().as_str().to_owned()];
+        sorted.tunables.collector = Some(arrowcol_tunables::CollectorTunables {
+            layout: Some(arrowcol_tunables::LayoutTunables {
+                enabled: Some(true),
+                sort_columns: Some(vec!["customer_id".to_owned()]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        sorted.tunables.parquet_writer = Some(arrowcol_tunables::ParquetWriterConfig {
+            sorting_columns: Some(vec![arrowcol_tunables::ParquetSortColumn {
+                path: "customer_id".to_owned(),
+                descending: false,
+                nulls_first: false,
+            }]),
+            ..Default::default()
+        });
+        sorted.validate()?;
+        sorted
+            .tunables
+            .parquet_writer
+            .as_mut()
+            .unwrap()
+            .sorting_columns
+            .as_mut()
+            .unwrap()[0]
+            .descending = true;
+        assert!(format!("{:#}", sorted.validate().unwrap_err()).contains("sorting metadata must match"));
         Ok(())
     }
 
