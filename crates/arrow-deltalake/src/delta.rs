@@ -38,6 +38,8 @@ use std::time::{Duration, Instant};
 use url::Url;
 
 type LocalEngine = DefaultEngine<SharedExecutor>;
+type FileCommitObservations = Vec<(usize, CompletedFileObservation)>;
+type TimedCommitResult = Result<(u64, Option<Duration>, FileCommitObservations)>;
 
 fn process_writer_properties(schema: &SchemaRef) -> Result<BTreeMap<String, String>> {
     read_process_writer_properties(Some(schema))
@@ -3854,10 +3856,7 @@ impl DeltaTable {
         self.commit_files_timed(files).map(|(version, _, _)| version)
     }
 
-    pub(crate) fn commit_files_timed(
-        &self,
-        files: &[StagedAppend],
-    ) -> Result<(u64, Option<Duration>, Vec<(usize, crate::CompletedFileObservation)>)> {
+    pub(crate) fn commit_files_timed(&self, files: &[StagedAppend]) -> TimedCommitResult {
         if files.is_empty() {
             bail!("cannot publish an empty Delta data commit");
         }
@@ -3868,7 +3867,7 @@ impl DeltaTable {
         &self,
         files: &[StagedAppend],
         groups: &[CoalescedCommitGroup],
-    ) -> Result<(u64, Option<Duration>, Vec<(usize, crate::CompletedFileObservation)>)> {
+    ) -> TimedCommitResult {
         if groups.is_empty() {
             bail!("coalesced Delta commit requires logical identities");
         }
@@ -3899,7 +3898,7 @@ impl DeltaTable {
         files: &[StagedAppend],
         identity: Option<(&str, i64)>,
         groups: &[CoalescedCommitGroup],
-    ) -> Result<(u64, Option<Duration>, Vec<(usize, crate::CompletedFileObservation)>)> {
+    ) -> TimedCommitResult {
         let (version, commit_duration, file_observations) = self.publish_files(files, identity, groups)?;
         self.reclaim_unsubmitted(files);
         Ok((version, commit_duration, file_observations))
@@ -3961,7 +3960,7 @@ impl DeltaTable {
         files: &[StagedAppend],
         identity: Option<(&str, i64)>,
         groups: &[CoalescedCommitGroup],
-    ) -> Result<(u64, Option<Duration>, Vec<(usize, crate::CompletedFileObservation)>)> {
+    ) -> TimedCommitResult {
         let mut observation = crate::telemetry::PublicationObservation::start();
         let _guard = self
             .commit_lock
@@ -4509,19 +4508,15 @@ async fn upload_staged_output(
                     buffer.truncate(filled);
                     pending.push(upload.put_part(buffer.into()));
                 }
-                if let Some(result) = pending.next().await {
-                    if let Err(error) = result {
-                        upload_error =
-                            Some(anyhow::Error::new(error).context("upload completed Parquet multipart part"));
-                    }
+                if let Some(Err(error)) = pending.next().await {
+                    upload_error = Some(anyhow::Error::new(error).context("upload completed Parquet multipart part"));
                 }
             }
             while let Some(result) = pending.next().await {
-                if upload_error.is_none() {
-                    if let Err(error) = result {
-                        upload_error =
-                            Some(anyhow::Error::new(error).context("upload completed Parquet multipart part"));
-                    }
+                if upload_error.is_none()
+                    && let Err(error) = result
+                {
+                    upload_error = Some(anyhow::Error::new(error).context("upload completed Parquet multipart part"));
                 }
             }
             if let Some(error) = upload_error {
