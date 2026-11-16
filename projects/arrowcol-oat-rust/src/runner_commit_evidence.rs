@@ -207,6 +207,25 @@ fn run_cumulative_output(
     }))
 }
 
+fn complete_commit_windows(
+    events: &std::collections::BTreeMap<(String, u64), CommitEvent>,
+    table: &str,
+    start: u64,
+    end: u64,
+    unavailable: Option<&str>,
+    cell_start_unix_ms: Option<u64>,
+) -> Result<Vec<Value>> {
+    let mut windows = Vec::new();
+    let mut window_start = start;
+    while let Some(window_end) = window_start.checked_add(30_000).filter(|window_end| *window_end <= end) {
+        windows.push(commit_window_output(
+            events, table, window_start, window_end, unavailable, cell_start_unix_ms,
+        )?);
+        window_start = window_end;
+    }
+    Ok(windows)
+}
+
 #[cfg(test)]
 fn durable_commit_evidence(
     config: &OatConfig,
@@ -348,7 +367,14 @@ fn durable_commit_evidence_for_cell(
     for table in &config.tables {
         let canonical_table_name = canonical_dmv_table_name(table)?;
         if let Some(reason) = unavailable {
-            result.insert(table.clone(), unavailable_commits(reason));
+            let mut evidence = unavailable_commits(reason);
+            evidence["output_throughput"] = commit_window_output(
+                &events, &canonical_table_name, start, end, Some(reason), cell_start_unix_ms,
+            )?;
+            evidence["complete_30_second_commit_windows"] = json!(complete_commit_windows(
+                &events, &canonical_table_name, start, end, Some(reason), cell_start_unix_ms,
+            )?);
+            result.insert(table.clone(), evidence);
             continue;
         }
         let mut selected = Vec::new();
@@ -440,20 +466,9 @@ fn durable_commit_evidence_for_cell(
             cumulative_unavailable,
             cell_start_unix_ms,
         )?;
-        let mut complete_windows = Vec::new();
-        let mut window_start = start;
-        while let Some(window_end) = window_start.checked_add(30_000).filter(|window_end| *window_end <= end) {
-            complete_windows.push(commit_window_output(
-                &events,
-                &canonical_table_name,
-                window_start,
-                window_end,
-                cumulative_unavailable,
-                cell_start_unix_ms,
-            )?);
-            window_start = window_end;
-        }
-        evidence["complete_30_second_commit_windows"] = json!(complete_windows);
+        evidence["complete_30_second_commit_windows"] = json!(complete_commit_windows(
+            &events, &canonical_table_name, start, end, cumulative_unavailable, cell_start_unix_ms,
+        )?);
         evidence["run_cumulative_output"] = run_cumulative_output(
             &events,
             &canonical_table_name,
@@ -690,7 +705,10 @@ mod commit_evidence_tests {
         let mut missing = log(&[]);
         missing.complete = false;
         let evidence = durable_commit_evidence(&config, &[missing], Some((1000, 66_000)))?;
-        assert!(evidence[&config.tables[0]]["complete_30_second_commit_windows"][0]["rows"].is_null());
+        let windows = &evidence[&config.tables[0]]["complete_30_second_commit_windows"];
+        assert_eq!(windows.as_array().unwrap().len(), 2);
+        assert!(windows[0]["rows"].is_null());
+        assert_eq!(windows[0]["unavailable_reason"], "collector_commit_log_incomplete");
         Ok(())
     }
 }
