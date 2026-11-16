@@ -285,10 +285,74 @@ fn fail_with(kind: MaintenanceErrorKind, message: impl Into<String>, report: &Ma
     })
 }
 
+#[derive(Debug)]
+struct MaintenanceErrorContext {
+    details: Option<MaintenanceError>,
+    report: Option<Box<MaintenanceReport>>,
+    source: anyhow::Error,
+}
+
+impl Display for MaintenanceErrorContext {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        if let Some(details) = &self.details {
+            Display::fmt(details, f)
+        } else {
+            f.write_str("maintenance operation has partial progress")
+        }
+    }
+}
+
+impl std::error::Error for MaintenanceErrorContext {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.chain().next()
+    }
+}
+
 /// Find the classified failure anywhere in an error chain.
 #[must_use]
 pub fn error_details(error: &anyhow::Error) -> Option<&MaintenanceError> {
-    error.chain().find_map(|cause| cause.downcast_ref::<MaintenanceError>())
+    error
+        .downcast_ref::<MaintenanceErrorContext>()
+        .and_then(|context| context.details.as_ref())
+        .or_else(|| error.chain().find_map(|cause| cause.downcast_ref::<MaintenanceError>()))
+}
+
+/// Find partial operation progress attached to an error chain.
+#[must_use]
+pub fn error_report(error: &anyhow::Error) -> Option<&MaintenanceReport> {
+    error
+        .downcast_ref::<MaintenanceErrorContext>()
+        .and_then(|context| context.report.as_deref())
+        .or_else(|| {
+            error.chain().find_map(|cause| {
+                cause
+                    .downcast_ref::<MaintenanceError>()
+                    .and_then(|details| details.report.as_deref())
+            })
+        })
+}
+
+fn with_maintenance_error(
+    error: anyhow::Error,
+    details: Option<MaintenanceError>,
+    report: Option<&MaintenanceReport>,
+) -> anyhow::Error {
+    anyhow::Error::new(MaintenanceErrorContext {
+        details,
+        report: report.cloned().map(Box::new),
+        source: error,
+    })
+}
+
+/// Attach partial progress while preserving the original error and its source chain.
+#[must_use]
+pub fn attach_error_report(error: anyhow::Error, report: &MaintenanceReport) -> anyhow::Error {
+    let details = error_details(&error).map(|details| MaintenanceError {
+        kind: details.kind,
+        message: details.message.clone(),
+        report: Some(Box::new(report.clone())),
+    });
+    with_maintenance_error(error, details, Some(report))
 }
 
 /// Classified failure kind, if any.
@@ -1612,12 +1676,7 @@ impl DeltaTable {
                 Err(error) => {
                     if !uncertain {
                         let error = self.discard_after(outputs, error, report);
-                        if let Some(details) =
-                            error_details(&error).filter(|details| details.kind == MaintenanceErrorKind::StalePlan)
-                        {
-                            return Err(fail_with(details.kind, details.message.clone(), report));
-                        }
-                        return Err(error);
+                        return Err(attach_error_report(error, report));
                     }
                     // A raw commit error can follow actual publication: reconcile
                     // by plan id and never clean up outputs blindly.
@@ -1646,7 +1705,7 @@ impl DeltaTable {
             ),
             report,
         );
-        Err(self.discard_after(outputs, error, report))
+        Err(attach_error_report(self.discard_after(outputs, error, report), report))
     }
 
     /// Acknowledge a visible plan identity only after local replay is durable; a
@@ -1752,11 +1811,14 @@ impl DeltaTable {
             Ok(()) => error,
             Err(cleanup) => {
                 report.outputs = outputs.iter().map(|output| output.relative.clone()).collect();
-                fail_with(
-                    error_kind(&error).unwrap_or(MaintenanceErrorKind::Uncertain),
-                    format!("{error:#}; cleanup of unpublished outputs failed (retained): {cleanup}"),
-                    report,
-                )
+                let kind = error_kind(&error).unwrap_or(MaintenanceErrorKind::Uncertain);
+                let message = format!("{error:#}; cleanup of unpublished outputs failed (retained): {cleanup}");
+                let details = MaintenanceError {
+                    kind,
+                    message,
+                    report: None,
+                };
+                with_maintenance_error(error, Some(details), None)
             }
         }
     }
