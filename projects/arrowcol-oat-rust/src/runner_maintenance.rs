@@ -473,7 +473,17 @@ enum MaintenanceDueWorkIncompleteReason {
 }
 
 fn maintenance_due_work(value: &Value) -> Result<Option<MaintenanceDueWorkEvidence>> {
-    let Some(raw) = value.pointer("/report/maintenance_due_work") else {
+    let Some(report) = value.get("report") else {
+        return Ok(None);
+    };
+    if value.get("error").is_some_and(|error| !error.is_null())
+        || value.get("error_kind").is_some_and(|error| !error.is_null())
+        || report.get("interrupted") == Some(&Value::Bool(true))
+        || report.get("outcome").and_then(Value::as_str) == Some("partial")
+    {
+        return Ok(None);
+    }
+    let Some(raw) = report.get("maintenance_due_work") else {
         return Ok(None);
     };
     if raw.is_null() {
@@ -673,6 +683,39 @@ mod maintenance_topology_tests {
         let aks_args = maintenance_arguments(&config, "http://arrowcol-catalog:8817")?;
         assert!(aks_args.windows(2).any(|pair| pair == ["--catalog-endpoint", "http://arrowcol-catalog:8817"]));
         assert!(!aks_args.iter().any(|arg| arg == "--root"));
+        Ok(())
+    }
+
+    #[test]
+    fn maintenance_due_work_requires_a_complete_operation_result() -> Result<()> {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/maintenance-operation-results.json"
+        ))?;
+        let operation_results = fixture["operation_results"]
+            .as_array()
+            .context("serde fixture omitted operation_results")?;
+        assert_eq!(operation_results.len(), 5);
+        for result in operation_results {
+            let evidence = maintenance_due_work(result)?
+                .context("complete serialized operation result lost due-work evidence")?;
+            assert_eq!(evidence.completeness, MaintenanceDueWorkCompleteness::Complete);
+            assert_eq!(evidence.due, Some(false));
+        }
+
+        let cases = fixture["qualification_cases"]
+            .as_array()
+            .context("serde fixture omitted qualification_cases")?;
+        assert_eq!(cases.len(), 5);
+        for case in cases {
+            let result = case.get("result").context("qualification case omitted result")?;
+            match case["expected_eligibility"].as_str() {
+                Some("complete") => {
+                    assert!(maintenance_due_work(result)?.is_some());
+                }
+                Some("unknown") => assert!(maintenance_due_work(result)?.is_none()),
+                other => bail!("unexpected fixture eligibility: {other:?}"),
+            }
+        }
         Ok(())
     }
 
