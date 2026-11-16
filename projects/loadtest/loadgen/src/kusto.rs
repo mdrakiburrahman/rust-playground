@@ -2136,6 +2136,27 @@ pub async fn observe_qap_until_ready(
     tables: &[String],
     budget: Duration,
 ) -> Result<Value> {
+    observe_qap_until_ready_with_poll_interval(
+        endpoint,
+        results,
+        mode,
+        database,
+        tables,
+        budget,
+        Duration::from_secs(1),
+    )
+    .await
+}
+
+async fn observe_qap_until_ready_with_poll_interval(
+    endpoint: &str,
+    results: &Path,
+    mode: ObservationMode,
+    database: &str,
+    tables: &[String],
+    budget: Duration,
+    poll_interval: Duration,
+) -> Result<Value> {
     ensure!(!tables.is_empty(), "QAP catch-up requires expected tables");
     let started = Instant::now();
     let mut last = None;
@@ -2185,7 +2206,7 @@ pub async fn observe_qap_until_ready(
                 });
             }
         }
-        tokio::time::sleep(Duration::from_secs(1).min(budget.saturating_sub(started.elapsed()))).await;
+        tokio::time::sleep(poll_interval.min(budget.saturating_sub(started.elapsed()))).await;
     };
     write_json(
         &results.join("catch-up-diagnostic.json"),
@@ -3651,9 +3672,12 @@ mod tests {
         Ok(())
     }
 
-    fn catch_up_server(slow_second_sample: bool) -> Result<(Server, Arc<AtomicUsize>)> {
+    fn catch_up_server(
+        blocked_second_sample: Option<(tokio::sync::oneshot::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+    ) -> Result<(Server, Arc<AtomicUsize>)> {
         let samples = Arc::new(AtomicUsize::new(0));
         let seen = Arc::clone(&samples);
+        let mut blocked_second_sample = blocked_second_sample;
         let server = Server::start(move |request| {
             let command = request["csl"].as_str().context("command missing")?;
             if command.ends_with("policy query_acceleration") {
@@ -3670,8 +3694,14 @@ mod tests {
             }
             if command.contains("query_acceleration statistics") {
                 let sample = seen.fetch_add(1, Ordering::SeqCst);
-                if sample > 0 && slow_second_sample {
-                    std::thread::sleep(Duration::from_secs(1));
+                if sample > 0
+                    && let Some((started, release)) = blocked_second_sample.take()
+                {
+                    started
+                        .send(())
+                        .map_err(|_| anyhow::anyhow!("second-sample observer was dropped"))?;
+                    release.recv().context("second-sample release signal was dropped")?;
+                    return Ok(None);
                 }
                 return Ok(Some(response(
                     &[
@@ -3707,7 +3737,7 @@ mod tests {
     #[tokio::test]
     async fn catch_up_waits_for_every_table_and_retains_each_observation() -> Result<()> {
         let directory = Directory::new()?;
-        let (server, samples) = catch_up_server(false)?;
+        let (server, samples) = catch_up_server(None)?;
         let observed = observe_qap_until_ready(
             &server.endpoint,
             &directory.0,
@@ -3738,16 +3768,34 @@ mod tests {
     #[tokio::test]
     async fn catch_up_uses_one_deadline_and_retains_the_last_pending_snapshot() -> Result<()> {
         let directory = Directory::new()?;
-        let (server, samples) = catch_up_server(true)?;
-        let observed = observe_qap_until_ready(
-            &server.endpoint,
-            &directory.0,
+        let (second_sample_started_tx, second_sample_started_rx) = tokio::sync::oneshot::channel();
+        let (release_second_sample_tx, release_second_sample_rx) = std::sync::mpsc::channel();
+        let (server, samples) = catch_up_server(Some((second_sample_started_tx, release_second_sample_rx)))?;
+        let endpoint = server.endpoint.clone();
+        let results = directory.0.clone();
+        let tables = ["dataflow_a".to_owned(), "dataflow_b".to_owned()];
+        let observation = observe_qap_until_ready_with_poll_interval(
+            &endpoint,
+            &results,
             Mode::Local,
             DATABASE,
-            &["dataflow_a".to_owned(), "dataflow_b".to_owned()],
+            &tables,
             Duration::from_millis(1500),
-        )
-        .await?;
+            Duration::ZERO,
+        );
+        tokio::pin!(observation);
+        let (second_sample_started, result) = tokio::select! {
+            started = second_sample_started_rx => (started.is_ok(), observation.await),
+            result = &mut observation => (false, result),
+        };
+        release_second_sample_tx
+            .send(())
+            .context("second-sample release receiver was dropped")?;
+        ensure!(
+            second_sample_started,
+            "second QAP sample did not start before the deadline"
+        );
+        let observed = result?;
         assert_eq!(samples.load(Ordering::SeqCst), 2);
         assert_eq!(observed["catch_up_status"], "deadline_incomplete");
         assert_eq!(
