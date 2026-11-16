@@ -9,6 +9,8 @@ use url::Url;
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OatConfig {
+    #[serde(default)]
+    pub overload_guard: OverloadGuardConfig,
     #[serde(default, deserialize_with = "deserialize_oat_tunables")]
     pub tunables: Tunables,
     #[serde(default)]
@@ -71,6 +73,24 @@ pub struct OatConfig {
     pub website_url: String,
 }
 
+#[derive(Clone, Debug, Deserialize, serde::Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OverloadGuardConfig {
+    pub enabled: bool,
+    pub cap_fraction: f64,
+    pub zero_progress_windows: u32,
+}
+
+impl Default for OverloadGuardConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            cap_fraction: 0.90,
+            zero_progress_windows: 2,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlatformConfig {
@@ -89,6 +109,7 @@ pub struct PlatformConfig {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LocalOptions {
+    pub collector_memory_limit_bytes: Option<u64>,
     pub bind_host: Option<std::net::IpAddr>,
     pub endpoint_host: Option<String>,
     pub snapshot_root: Option<String>,
@@ -357,6 +378,21 @@ impl OatConfig {
     ///
     /// Returns an error when a setting is invalid or a requested DMV table is unsupported.
     pub fn validate(&self) -> Result<()> {
+        if self
+            .platform
+            .local
+            .collector_memory_limit_bytes
+            .is_some_and(|bytes| !(8 * 1024 * 1024..=1024_u64.pow(4)).contains(&bytes))
+        {
+            bail!("platform.local.collector_memory_limit_bytes must be integer bytes in 8388608..=1099511627776");
+        }
+        if !self.overload_guard.cap_fraction.is_finite()
+            || self.overload_guard.cap_fraction <= 0.0
+            || self.overload_guard.cap_fraction > 0.90
+            || !(1..=2).contains(&self.overload_guard.zero_progress_windows)
+        {
+            bail!("overload_guard requires cap_fraction in (0, 0.90] and zero_progress_windows in 1..=2");
+        }
         self.validate_campaign_profile()?;
         self.validate_local_purge_inputs()?;
         self.tunables.validate_for_oat()?;
@@ -507,7 +543,8 @@ impl OatConfig {
                     || self.platform.compose_state_root.is_some()
                     || self.platform.local.bind_host.is_some()
                     || self.platform.local.endpoint_host.is_some()
-                    || self.platform.local.snapshot_root.is_some() =>
+                    || self.platform.local.snapshot_root.is_some()
+                    || self.platform.local.collector_memory_limit_bytes.is_some() =>
             {
                 bail!("compose settings are only valid for the local platform");
             }
@@ -813,6 +850,30 @@ fn validate_storage_url(value: &str, field: &str, expected_container: &str, allo
 mod tests {
     use super::*;
 
+    #[test]
+    fn overload_guard_rejects_malformed_or_protocol_weakening_settings() -> Result<()> {
+        use serde_json::json;
+
+        for value in [
+            json!({"enabled":"true"}),
+            json!({"cap_fraction":"0.9"}),
+            json!({"zero_progress_windows":1.5}),
+            json!({"zero_progress_windows":-1}),
+            json!({"unknown":true}),
+        ] {
+            assert!(serde_json::from_value::<OverloadGuardConfig>(value).is_err());
+        }
+        let mut config = valid();
+        for (cap_fraction, windows) in [(0.0, 2), (0.91, 2), (f64::NAN, 2), (0.9, 0), (0.9, 3)] {
+            config.overload_guard.cap_fraction = cap_fraction;
+            config.overload_guard.zero_progress_windows = windows;
+            assert!(config.validate().is_err());
+        }
+        config.overload_guard = serde_json::from_value(json!({"cap_fraction":0.8,"zero_progress_windows":1}))?;
+        config.validate()?;
+        Ok(())
+    }
+
     struct TestConfig {
         config: OatConfig,
         directory: std::path::PathBuf,
@@ -855,6 +916,7 @@ mod tests {
                 .unwrap_or_else(|error| panic!("write isolated OAT config fixture {}: {error}", path.display()));
         }
         let config = OatConfig {
+            overload_guard: OverloadGuardConfig::default(),
             tunables: Tunables::default(),
             campaign_profile: None,
             platform: PlatformConfig {

@@ -597,7 +597,88 @@ export function publicationBacklogIssue(value: unknown, start: number, end: numb
   return undefined;
 }
 
+const guardCapMetrics = ['container_memory_bytes', 'collector_rss_bytes', 'collector_buffered_bytes'];
+
+function overloadStopIssue(evidence: RecordValue): string | undefined {
+  const stop = evidence.overload_stop;
+  if (stop === undefined || stop === null) return undefined;
+  if (!isRecord(stop) || nonNegativeInteger(stop.timestamp_ms) === undefined ||
+      nonNegativeInteger(stop.window_index) === undefined) return 'overload_stop evidence is invalid';
+  const hardCap = stop.reason === 'hard_cap_fraction' && guardCapMetrics.includes(String(stop.metric)) &&
+    nonNegativeInteger(stop.observed_value) !== undefined && nonNegativeInteger(stop.cap) !== undefined &&
+    Number(stop.cap) > 0 && typeof stop.fraction === 'number' && Number.isFinite(stop.fraction) &&
+    stop.fraction === Number(stop.observed_value) / Number(stop.cap);
+  const stalled = stop.reason === 'zero_ingestion_commit_progress' && stop.metric === 'new_ingestion_commits' &&
+    stop.observed_value === 0 && stop.cap === null && stop.fraction === null;
+  if (!hardCap && !stalled) return 'overload_stop evidence is invalid';
+  return `above_ceiling: overload_stop ${String(stop.reason)} (${String(stop.metric)})`;
+}
+
+function overloadGuardIssue(evidence: RecordValue, config: RecordValue, runId: unknown, start: number, end: number): string | undefined {
+  const invalid = 'overload_guard protection unavailable or invalid';
+  if (config.overload_guard !== undefined && !isRecord(config.overload_guard)) return invalid;
+  const requested = isRecord(config.overload_guard) ? config.overload_guard : {};
+  const enabled = requested.enabled === undefined ? true : requested.enabled;
+  const fraction = requested.cap_fraction === undefined ? 0.9 : requested.cap_fraction;
+  const zeroWindows = requested.zero_progress_windows === undefined ? 2 : requested.zero_progress_windows;
+  const warmup = nonNegativeInteger(config.warmup_seconds);
+  if (enabled !== true || typeof fraction !== 'number' || !Number.isFinite(fraction) || fraction <= 0 || fraction > 0.9 ||
+      nonNegativeInteger(zeroWindows) === undefined || Number(zeroWindows) < 1 || Number(zeroWindows) > 2 ||
+      warmup === undefined || start < warmup * 1000) return invalid;
+  const guard = evidence.overload_guard;
+  if (!isRecord(guard)) return invalid;
+  const caps = guard.last_caps;
+  const platform = isRecord(config.platform) ? config.platform : undefined;
+  const local = platform && isRecord(platform.local) ? platform.local : undefined;
+  const requestedCap = local?.collector_memory_limit_bytes;
+  if (requestedCap !== undefined && requestedCap !== null &&
+      (nonNegativeInteger(requestedCap) === undefined || Number(requestedCap) < 8388608 || Number(requestedCap) > 1099511627776)) return invalid;
+  if (guard.requested_container_memory_limit_bytes !== (requestedCap ?? null)) return invalid;
+  const expectedStart = start - warmup * 1000;
+  if (guard.status !== 'complete' || guard.run_id !== runId ||
+      guard.run_start_ms !== expectedStart || guard.measurement_end_ms !== end ||
+      !isRecord(guard.settings) || guard.settings.enabled !== true || guard.settings.cap_fraction !== fraction ||
+      guard.settings.zero_progress_windows !== zeroWindows ||
+      nonNegativeInteger(guard.coverage_start_ms) === undefined || Number(guard.coverage_start_ms) > expectedStart ||
+      nonNegativeInteger(guard.coverage_end_ms) === undefined || Number(guard.coverage_end_ms) < end ||
+      nonNegativeInteger(guard.max_sampling_gap_ms) === undefined || Number(guard.max_sampling_gap_ms) > 5000 ||
+      nonNegativeInteger(guard.sample_count) === undefined || Number(guard.sample_count) < Math.ceil((end - expectedStart) / 5000) + 1 ||
+      typeof guard.peak_cap_fraction !== 'number' || !Number.isFinite(guard.peak_cap_fraction) ||
+      guard.peak_cap_fraction < 0 || guard.peak_cap_fraction >= fraction ||
+      !Array.isArray(caps) || caps.length !== guardCapMetrics.length ||
+      requestedCap != null && !caps.some(cap => isRecord(cap) && cap.metric === 'container_memory_bytes' && cap.cap === requestedCap) ||
+      !guardCapMetrics.every(metric =>
+        caps.filter(cap => isRecord(cap) && cap.metric === metric && cap.confirmed === true &&
+          nonNegativeInteger(cap.observed_value) !== undefined && nonNegativeInteger(cap.cap) !== undefined &&
+          Number(cap.cap) > 0 && Number(cap.observed_value) / Number(cap.cap) < fraction).length === 1) ||
+      !Array.isArray(guard.complete_windows) || guard.complete_windows.length !== Math.floor((end - expectedStart) / 30_000)) return invalid;
+  let zeroStreak = 0;
+  for (const [index, window] of guard.complete_windows.entries()) {
+    if (!isRecord(window) || window.index !== index || window.start_ms !== expectedStart + index * 30_000 ||
+        window.end_ms !== expectedStart + (index + 1) * 30_000 || window.covered !== true ||
+        typeof window.outstanding !== 'boolean' || nonNegativeInteger(window.ingestion_commits) === undefined) return invalid;
+    zeroStreak = window.outstanding && window.ingestion_commits === 0 ? zeroStreak + 1 : 0;
+    if (zeroStreak >= Number(zeroWindows)) return invalid;
+  }
+  return undefined;
+}
+
+function officialOverloadStop(run: OfficialRun): string | undefined {
+  for (const row of run.rows) {
+    if (typeof row.evidence_json !== 'string') continue;
+    let evidence: unknown;
+    try { evidence = JSON.parse(row.evidence_json); } catch { continue; }
+    if (isRecord(evidence)) {
+      const reason = overloadStopIssue(evidence);
+      if (reason) return reason;
+    }
+  }
+  return undefined;
+}
+
 function inspectOfficialRun(run: OfficialRun): { windows?: OfficialWindow[]; reason?: string } {
+  const stop = officialOverloadStop(run);
+  if (stop) return { reason: stop };
   const verdict = evaluateDataFlow(run.status, run.rows, run.expectedSha, run.mode, run.config, 'single_hot_table_campaign');
   if (verdict.ingestPass !== true || verdict.rows.length !== 1) return { reason: 'official campaign ingest evidence did not pass: ' + verdict.reasons.join('; ') };
   const row = verdict.rows[0]!;
@@ -623,6 +704,8 @@ function inspectOfficialRun(run: OfficialRun): { windows?: OfficialWindow[]; rea
     return { reason: 'official run must contain a valid sustained measurement interval of at least 150 seconds' };
   }
   const publishedOutput = evidence.commit_window_output_throughput;
+  const guardIssue = overloadGuardIssue(evidence, run.config, row.run_id, start, end);
+  if (guardIssue) return { reason: guardIssue };
   if (!isRecord(publishedOutput) || stableJson(publishedOutput) !== stableJson(output)) {
     return { reason: 'top-level and durable commit-window evidence disagree' };
   }
@@ -685,6 +768,8 @@ function inspectOfficialRun(run: OfficialRun): { windows?: OfficialWindow[]; rea
 }
 
 function assessRepeat(row: CampaignMeasurement): RepeatAssessment {
+  const overloadStop = row.officialRuns?.map(officialOverloadStop).find(reason => reason !== undefined);
+  if (overloadStop) return { qualified: false, rates: [], reason: overloadStop };
   if (row.diedFirst) return { qualified: false, rates: [], reason: row.collectorOnly ? 'collector-only downstream failure' : 'a component died during the run' };
   if (!row.expectedRepeats || !row.factorConfigPaths || !row.officialRuns || row.officialRuns.length !== 1) {
     return { qualified: false, rates: [], reason: 'each repeat must contain exactly one official sustained run' };

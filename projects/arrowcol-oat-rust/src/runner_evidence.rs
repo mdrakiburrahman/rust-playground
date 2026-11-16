@@ -1,5 +1,7 @@
 #[derive(Clone, Debug, Default, serde::Serialize)]
 struct CellEvidence {
+    overload_guard: Option<Value>,
+    overload_stop: Option<Value>,
     downstream_comment: Option<String>,
     qap_observation: Option<Value>,
     resource_samples: Vec<ResourceSample>,
@@ -405,6 +407,8 @@ impl CellEvidence {
         });
         json!({
             "version": 1,
+            "overload_guard": self.overload_guard,
+            "overload_stop": self.overload_stop,
             "processes": self.processes,
             "router_sql": self.router_sql,
             "router_cpu_pressure": self.router_cpu_pressure,
@@ -466,6 +470,7 @@ impl CellEvidence {
     }
 }
 
+#[derive(Clone)]
 enum ResourceSamplerSource {
     Aks,
     Local {
@@ -475,57 +480,113 @@ enum ResourceSamplerSource {
     },
 }
 
-struct ResourceSampler(Option<JoinHandle<Result<CellEvidence>>>);
+struct ResourceSampler {
+    task: Option<JoinHandle<Result<CellEvidence>>>,
+    signal: watch::Receiver<GuardSignal>,
+    stop: watch::Sender<bool>,
+}
 
 const PUBLICATION_BACKLOG_SAMPLING_INTERVAL: Duration = Duration::from_secs(1);
 const PUBLICATION_BACKLOG_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 
+async fn sample_resources(source: &ResourceSamplerSource, config: &OatConfig) -> Result<ResourceMetrics> {
+    match source {
+        ResourceSamplerSource::Aks => collect_aks_metrics(config).await,
+        ResourceSamplerSource::Local { run_id, environment, .. } => collect_local_metrics(config, run_id, environment).await,
+    }
+}
+
+fn retain_resource_sample(evidence: &mut CellEvidence, sample: ResourceSample) {
+    if evidence.resource_samples.len() == 4096 {
+        evidence.resource_samples.remove(0);
+        evidence.resource_samples_dropped += 1;
+    }
+    evidence.resource_samples.push(sample);
+}
+
 impl Drop for ResourceSampler {
     fn drop(&mut self) {
-        if let Some(task) = &self.0 {
+        if let Some(task) = &self.task {
             task.abort();
         }
     }
 }
 
 impl ResourceSampler {
-    fn start(source: Option<ResourceSamplerSource>, config: OatConfig, start: u64, end: u64) -> Self {
-        Self(source.map(|source| {
+    fn start(source: Option<ResourceSamplerSource>, config: OatConfig, start: u64, end: u64,
+        prepared: Option<PreparedGuard>) -> Self {
+        let (signal, receiver) = watch::channel(if prepared.is_some() {
+            GuardSignal::Monitoring
+        } else {
+            GuardSignal::Disabled
+        });
+        let (stop, mut stop_receiver) = watch::channel(false);
+        let task = source.map(|source| {
             tokio::spawn(async move {
                 let mut evidence = CellEvidence {
                     backlog_scrape_configured: true,
                     ..Default::default()
                 };
-                let backlog_scraper = match PublicationBacklogScraper::start(&source, &config).await {
-                    Ok(scraper) => Some(scraper),
-                    Err(error) => {
-                        tracing::warn!(%error, "publication backlog metrics endpoint unavailable");
-                        None
-                    }
+                let (backlog_scraper, mut guard) = if let Some(prepared) = prepared {
+                    (Some(prepared.scraper), Some((prepared.probe, prepared.engine)))
+                } else {
+                    (match PublicationBacklogScraper::start(&source, &config).await {
+                        Ok(scraper) => Some(scraper),
+                        Err(error) => {
+                            tracing::warn!(%error, "publication backlog metrics endpoint unavailable");
+                            None
+                        }
+                    }, None)
                 };
                 let mut interval = tokio::time::interval(PUBLICATION_BACKLOG_SAMPLING_INTERVAL);
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                let mut resource_tasks = tokio::task::JoinSet::<Result<ResourceSample>>::new();
                 loop {
-                    interval.tick().await;
+                    tokio::select! {
+                        _ = interval.tick() => {}
+                        _ = stop_receiver.changed() => break,
+                    }
                     let now = unix_time_ms_u64()?;
-                    if now >= end {
+                    if now >= end && guard.is_none() {
                         break;
                     }
-                    if now < start {
+                    if now < start && guard.is_none() {
                         continue;
+                    }
+                    while let Some(sample) = resource_tasks.try_join_next() {
+                        match sample {
+                            Ok(Ok(sample)) if sample.sampled_at_unix_ms >= start && sample.sampled_at_unix_ms < end => {
+                                retain_resource_sample(&mut evidence, sample);
+                            }
+                            _ => {
+                                evidence.resource_sampling_failures += 1;
+                                tracing::warn!("asynchronous resource sample unavailable or outside measurement window");
+                            }
+                        }
+                    }
+                    let asynchronous_resources = guard.is_some();
+                    if asynchronous_resources && resource_tasks.is_empty() && now >= start && now < end {
+                        let source = source.clone();
+                        let config = config.clone();
+                        resource_tasks.spawn(async move {
+                            let metrics = tokio::time::timeout(PUBLICATION_BACKLOG_REQUEST_TIMEOUT, sample_resources(&source, &config))
+                                .await.context("resource sample deadline exceeded")??;
+                            Ok::<_, anyhow::Error>(ResourceSample { sampled_at_unix_ms:unix_time_ms_u64()?, metrics })
+                        });
                     }
                     let request_start_unix_ms = unix_time_ms_u64()?;
                     let sample = async {
-                        match &source {
-                            ResourceSamplerSource::Aks => collect_aks_metrics(&config).await,
-                            ResourceSamplerSource::Local {
-                                run_id, environment, ..
-                            } => {
-                                collect_local_metrics(&config, run_id, environment).await
-                            }
+                        if asynchronous_resources {
+                            Ok(None)
+                        } else {
+                            sample_resources(&source, &config).await.map(Some)
                         }
                     };
-                    let timeout_ms = (PUBLICATION_BACKLOG_REQUEST_TIMEOUT.as_millis() as u64).min(end - now);
+                    let timeout_ms = if guard.is_some() {
+                        PUBLICATION_BACKLOG_REQUEST_TIMEOUT.as_millis() as u64
+                    } else {
+                        (PUBLICATION_BACKLOG_REQUEST_TIMEOUT.as_millis() as u64).min(end - now)
+                    };
                     let backlog_sample = async {
                         let result = match &backlog_scraper {
                             Some(scraper) => scraper.scrape().await,
@@ -533,26 +594,30 @@ impl ResourceSampler {
                         };
                         Ok::<_, anyhow::Error>((unix_time_ms_u64()?, result))
                     };
-                    let (resource_result, backlog_result) = tokio::join!(
+                    let guard_reading = async {
+                        match (&mut guard, &backlog_scraper) {
+                            (Some((probe, _)), Some(scraper)) => probe.read(&config, scraper).await.map(Some),
+                            _ => Ok(None),
+                        }
+                    };
+                    let (resource_result, backlog_result, guard_result) = tokio::join!(
                         tokio::time::timeout(Duration::from_millis(timeout_ms), sample),
                         tokio::time::timeout(Duration::from_millis(timeout_ms), backlog_sample),
+                        tokio::time::timeout(Duration::from_millis(timeout_ms), guard_reading),
                     );
                     match resource_result {
-                        Ok(Ok(metrics)) => {
+                        Ok(Ok(Some(metrics))) => {
                             let sampled_at_unix_ms = unix_time_ms_u64()?;
-                            if sampled_at_unix_ms < end {
-                                if evidence.resource_samples.len() == 4096 {
-                                    evidence.resource_samples.remove(0);
-                                    evidence.resource_samples_dropped += 1;
-                                }
-                                evidence.resource_samples.push(ResourceSample {
+                            if sampled_at_unix_ms >= start && sampled_at_unix_ms < end {
+                                retain_resource_sample(&mut evidence, ResourceSample {
                                     sampled_at_unix_ms,
                                     metrics,
                                 });
-                            } else {
+                            } else if guard.is_none() {
                                 evidence.resource_sampling_failures += 1;
                             }
                         }
+                        Ok(Ok(None)) => {}
                         _ => {
                             evidence.resource_sampling_failures += 1;
                             tracing::warn!("resource sample unavailable or exceeded its bounded deadline");
@@ -583,25 +648,70 @@ impl ResourceSampler {
                             )
                         }
                     };
+                    if let Some((_, engine)) = &mut guard {
+                        let observation = match guard_result {
+                            Ok(Ok(Some(reading))) => Ok(reading),
+                            _ => Err(anyhow::anyhow!("live cap or ingestion commit readback unavailable")),
+                        };
+                        engine.record(observation, &backlog_sample);
+                        if let Some(reason) = engine.failure() {
+                            signal.send_replace(GuardSignal::Stop(reason));
+                            break;
+                        }
+                        if now >= end {
+                            engine.proof["status"] = json!("complete");
+                            signal.send_replace(GuardSignal::Complete);
+                            break;
+                        }
+                    }
                     if valid_backlog_request_interval(request_start_unix_ms, request_end_unix_ms, start, end) {
                         if evidence.backlog_samples.len() == 4096 {
                             evidence.backlog_samples.remove(0);
                             evidence.backlog_samples_dropped += 1;
                         }
                         evidence.backlog_samples.push(backlog_sample);
-                    } else {
+                    } else if guard.is_none() || now >= start && now < end {
                         evidence.backlog_sampling_failures += 1;
                     }
                 }
+                evidence.resource_sampling_failures += resource_tasks.len() as u64;
+                if let Some((_, engine)) = guard {
+                    evidence.overload_guard = Some(engine.proof);
+                    evidence.overload_stop = engine.stop;
+                }
                 Ok(evidence)
             })
-        }))
+        });
+        Self { task, signal: receiver, stop }
+    }
+
+    async fn wait_for_overload_stop(&mut self) -> String {
+        loop {
+            let signal = self.signal.borrow().clone();
+            match signal {
+                GuardSignal::Stop(reason) => return reason,
+                GuardSignal::Complete | GuardSignal::Disabled => return std::future::pending().await,
+                GuardSignal::Monitoring => {}
+            }
+            if self.signal.changed().await.is_err() {
+                return "overload_guard monitor ended without complete protection evidence".to_owned();
+            }
+        }
+    }
+
+    async fn finish_early(self, evidence: &mut CellEvidence) -> Result<()> {
+        self.stop.send_replace(true);
+        self.finish(evidence).await
     }
 
     async fn finish(mut self, evidence: &mut CellEvidence) -> Result<()> {
-        if let Some(task) = self.0.as_mut() {
+        if let Some(task) = self.task.as_mut() {
             let sampled = task.await.context("resource sampler task failed")??;
-            self.0.take();
+            self.task.take();
+            if sampled.overload_guard.is_some() {
+                evidence.overload_guard = sampled.overload_guard;
+                evidence.overload_stop = sampled.overload_stop;
+            }
             evidence.resource_samples = sampled.resource_samples;
             evidence.resource_sampling_failures = sampled.resource_sampling_failures;
             evidence.resource_samples_dropped = sampled.resource_samples_dropped;
@@ -1025,6 +1135,7 @@ mod downstream_runner_tests {
         fault: Fault,
         endpoint: String,
         start: std::sync::atomic::AtomicU64,
+        clients_started: usize,
         unresolved: bool,
     }
 
@@ -1097,6 +1208,7 @@ mod downstream_runner_tests {
             _: usize,
             _: &[String],
         ) -> Result<ClientHandle> {
+            self.clients_started += 1;
             Ok(ClientHandle {
                 client_id: "client".to_owned(),
                 table: table.to_owned(),
@@ -1179,12 +1291,14 @@ mod downstream_runner_tests {
             fault,
             endpoint,
             start: std::sync::atomic::AtomicU64::new(0),
+            clients_started: 0,
             unresolved: false,
         };
         let mut config: OatConfig = serde_json::from_str(include_str!(
             "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
         ))?;
         config.platform.kind = kind;
+        config.overload_guard.enabled = false;
         config.qap_timeout_seconds = if matches!(fault, Fault::InitTimeout) { 1 } else { 10 };
         let run_id = uuid::Uuid::new_v4().to_string();
         let result = run_matrix_cell(
@@ -1203,6 +1317,25 @@ mod downstream_runner_tests {
         }
         Ok((result?, platform))
     }
+
+    #[tokio::test]
+    async fn overload_unavailable_pre_admission_readback_never_creates_clients() -> Result<()> {
+        let config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        let mut platform = FaultPlatform {
+            kind: crate::config::OatMode::Local, fault: Fault::InitUnavailable,
+            endpoint: "http://127.0.0.1:1".to_owned(),
+            start: std::sync::atomic::AtomicU64::new(0), clients_started: 0, unresolved: false,
+        };
+        let report = run_clients(&config, &uuid::Uuid::new_v4().to_string(), &config.tables, &mut platform).await?;
+        assert_eq!(platform.clients_started, 0);
+        assert!(report.failure.as_deref().is_some_and(|reason| reason.contains("protection unavailable")));
+        assert_eq!(report.evidence.overload_guard.as_ref().map(|guard| &guard["status"]), Some(&json!("unavailable")));
+        assert!(report.evidence.overload_stop.is_none());
+        Ok(())
+    }
+
     #[tokio::test]
     async fn unavailable_initialization_and_observation_preserve_local_measurements_only() -> Result<()> {
         for fault in [
