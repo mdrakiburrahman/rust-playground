@@ -295,7 +295,7 @@ function hasCommitWindowProvenance(value: RecordValue): boolean {
     value.unique_delivered_rows === null && value.complete_delivery_established === false;
 }
 
-function hasBoundedMaintenanceDebt(processes: unknown, start: number, end: number): boolean {
+function hasInWindowCompactionObservation(processes: unknown, start: number, end: number): boolean {
   if (!Array.isArray(processes)) return false;
   const maintenanceProcesses = processes.filter((process): process is RecordValue =>
     isRecord(process) && process.component === 'maintenance');
@@ -321,7 +321,7 @@ function hasBoundedMaintenanceDebt(processes: unknown, start: number, end: numbe
       const observedAt = debt.observed_at_ms;
       if (typeof observedAt !== 'number' || !Number.isSafeInteger(observedAt) || observedAt <= 0) return false;
       if (observedAt < start || observedAt >= end) continue;
-      if (report.operation_failed !== false || report.negative_probe !== false ||
+      if (report.operation_failed !== false || typeof report.negative_probe !== 'boolean' ||
           report.mutation_mode !== 'apply_authorized_not_proof_of_mutation' ||
           (debt.source !== 'snapshot_active_files' && debt.source !== 'bounded_physical_inventory') ||
           !Number.isSafeInteger(debt.eligible_files) || Number(debt.eligible_files) < 0 ||
@@ -333,11 +333,71 @@ function hasBoundedMaintenanceDebt(processes: unknown, start: number, end: numbe
           debt.oldest_eligible_partition_start_ms !== null &&
             (!Number.isSafeInteger(debt.oldest_eligible_partition_start_ms) ||
               Number(debt.oldest_eligible_partition_start_ms) > observedAt)) return false;
+      if (report.negative_probe && (debt.source !== 'bounded_physical_inventory' ||
+          debt.eligible_files !== 0 || debt.eligible_bytes !== 0 || debt.backlog_files !== 0 ||
+          debt.backlog_bytes !== 0 || debt.oldest_eligible_partition_start_ms !== null)) return false;
       samples++;
     }
     if (samples === 0) return false;
   }
   return true;
+}
+
+export function publicationBacklogIssue(value: unknown, start: number, end: number): string | undefined {
+  const unavailable = 'publication backlog contract evidence is unavailable or invalid';
+  if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end - start < 150_000 ||
+      !isRecord(value) || value.schema_version !== 1 || value.source !== 'arrowcol_publication_backlog_*' ||
+      value.scope !== 'unique_table_owner_admissions_not_confirmed_durable_commit' ||
+      value.timestamp_basis !== 'UTC request start/end around direct /metrics GET; each is a scrape-time snapshot' ||
+      !isRecord(value.measurement_window) || value.measurement_window.start_unix_ms !== start ||
+      value.measurement_window.end_unix_ms !== end || value.sampling_failures !== 0 ||
+      value.samples_dropped !== 0 || value.last_unavailable_reason !== null ||
+      !Array.isArray(value.samples) || value.samples.length < 2 || value.samples.length > 10_000) return unavailable;
+  const interval = nonNegativeInteger(value.sampling_interval_ms);
+  const timeout = nonNegativeInteger(value.request_timeout_ms);
+  if (!interval || interval > 30_000 || !timeout || timeout > interval) return unavailable;
+
+  const samples: Array<{ start: number; end: number; gauges: number[] }> = [];
+  for (const sample of value.samples) {
+    if (!isRecord(sample) || sample.available !== true || sample.unavailable_reason !== null ||
+        sample.status !== null && typeof sample.status !== 'string') return unavailable;
+    const requestStart = nonNegativeInteger(sample.request_start_unix_ms);
+    const requestEnd = nonNegativeInteger(sample.request_end_unix_ms);
+    const publications = nonNegativeInteger(sample.publications);
+    const rows = nonNegativeInteger(sample.rows);
+    const bytes = nonNegativeInteger(sample.logical_bytes);
+    const age = sample.oldest_age_seconds;
+    if (requestStart === undefined || requestEnd === undefined || requestEnd < requestStart ||
+        requestEnd - requestStart > timeout || requestStart < start || requestEnd > end ||
+        publications === undefined || rows === undefined || bytes === undefined ||
+        typeof age !== 'number' || !Number.isFinite(age) || age < 0) return unavailable;
+    const previous = samples[samples.length - 1];
+    if (previous && (requestStart <= previous.start || requestStart < previous.end ||
+        requestStart - previous.start > interval + timeout)) return 'publication backlog samples are gapped or clock-reversed';
+    samples.push({ start: requestStart, end: requestEnd, gauges: [publications, rows, bytes, age] });
+  }
+  if (samples[0]!.end > start + interval + timeout || samples[samples.length - 1]!.start < end - interval - timeout) {
+    return 'publication backlog samples do not cover the measurement interval';
+  }
+  const means: number[][] = [];
+  if (Math.floor((end - start) / 30_000) > samples.length / 2) {
+    return 'publication backlog samples do not cover each complete commit window';
+  }
+  for (let bucketStart = start; bucketStart + 30_000 <= end; bucketStart += 30_000) {
+    const bucket = samples.filter(sample => sample.start >= bucketStart && sample.end < bucketStart + 30_000);
+    if (bucket.length < 2) return 'publication backlog samples do not cover each complete commit window';
+    means.push([0, 1, 2, 3].map(index => average(bucket.map(sample => sample.gauges[index]!))));
+  }
+  for (let gauge = 0; gauge < 4; gauge++) {
+    const values = means.map(mean => mean[gauge]!);
+    const center = (values.length - 1) / 2;
+    const mean = average(values);
+    const slopeNumerator = values.reduce((sum, value, index) => sum + (index - center) * (value - mean), 0);
+    if (slopeNumerator > 0 || values[values.length - 1]! > values[0]!) {
+      return 'publication backlog has a positive pending publications/rows/bytes/age trend';
+    }
+  }
+  return undefined;
 }
 
 function inspectOfficialRun(run: OfficialRun): { windows?: OfficialWindow[]; reason?: string } {
@@ -412,12 +472,15 @@ function inspectOfficialRun(run: OfficialRun): { windows?: OfficialWindow[]; rea
       reconciliation.exact_match !== (deltaRows === completedRows)) {
     return { reason: 'official source/new-commit reconciliation bounds are inconsistent' };
   }
-  const boundedMaintenanceDebt = hasBoundedMaintenanceDebt(evidence.processes, start, end);
+  const compactionObserved = hasInWindowCompactionObservation(evidence.processes, start, end);
+  const backlogIssue = publicationBacklogIssue(evidence.backlog, start, end);
   return {
     windows,
-    reason: !boundedMaintenanceDebt
-      ? 'timestamped in-window bounded compaction-debt evidence is unavailable or invalid'
-      : 'timestamped pressure evidence is unavailable; other maintenance due-work vectors remain unknown',
+    reason: [
+      ...(!compactionObserved ? ['timestamped in-window compaction-debt observation is unavailable or invalid'] : []),
+      ...(backlogIssue ? [backlogIssue] : []),
+      'backlog cross-language fixture check pending; sustained compaction debt and other maintenance due-work vectors remain unknown',
+    ].join('; '),
   };
 }
 

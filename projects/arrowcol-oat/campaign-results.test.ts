@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
-import { renderCampaignResults, sortCampaignLeaderboard, validateCampaignMeasurements } from './campaign-results.js';
+import { publicationBacklogIssue, renderCampaignResults, sortCampaignLeaderboard, validateCampaignMeasurements } from './campaign-results.js';
+import { buildThroughputManifests } from './throughput-sweeps.js';
 
 const rows = [
   { cohort: 'C1', candidate: 'snappy', factorX: 'codec', valueX: 'snappy', factorY: 'level', valueY: 'default', repeat: 1, expectedRepeats: 3, committedRowsPerSecond: 100 },
@@ -199,6 +200,101 @@ function mutateMaintenanceReport(run: ReturnType<typeof sourceShapedRun>, mutate
   row.evidence_json = JSON.stringify(evidence);
 }
 
+// Synthetic agreed-contract data, not a serialized producer fixture or benchmark.
+function syntheticBacklog() {
+  return {
+    schema_version: 1,
+    source: 'arrowcol_publication_backlog_*',
+    scope: 'unique_table_owner_admissions_not_confirmed_durable_commit',
+    timestamp_basis: 'UTC request start/end around direct /metrics GET; each is a scrape-time snapshot',
+    measurement_window: { start_unix_ms: 1_000_000, end_unix_ms: 1_150_000 },
+    sampling_interval_ms: 5_000,
+    request_timeout_ms: 1_000,
+    sampling_failures: 0,
+    samples_dropped: 0,
+    last_unavailable_reason: null as string | null,
+    samples: Array.from({ length: 30 }, (_, index) => ({
+      request_start_unix_ms: 1_000_000 + index * 5_000,
+      request_end_unix_ms: 1_000_010 + index * 5_000,
+      available: true as boolean | null,
+      publications: 0 as number | null,
+      rows: 0 as number | null,
+      logical_bytes: 0 as number | null,
+      oldest_age_seconds: 0 as number | null,
+      status: null as string | null,
+      unavailable_reason: null as string | null,
+    })),
+  };
+}
+
+test('parses synthetic agreed backlog contract without treating it as qualification', () => {
+  assert.equal(publicationBacklogIssue(syntheticBacklog(), 1_000_000, 1_150_000), undefined);
+  const run = sourceShapedRun(40, [1, 1, 1, 1, 1], 1_000_000);
+  attachMaintenanceDebt(run, 1_060_000);
+  mutateMaintenanceReport(run, report => {
+    report.negative_probe = true;
+    report.compaction_debt = { observed_at_ms: 1_060_000, source: 'bounded_physical_inventory',
+      eligible_files: 0, eligible_bytes: 0, backlog_files: 0, backlog_bytes: 0,
+      oldest_eligible_partition_start_ms: null };
+  });
+  const row = run.rows[0]!;
+  const evidence = JSON.parse(String(row.evidence_json)) as Record<string, unknown>;
+  evidence.backlog = syntheticBacklog();
+  row.evidence_json = JSON.stringify(evidence);
+  const result = {
+    cohort: 'C1', candidate: 'synthetic-only', factorX: 'codec', valueX: 'snappy', factorY: 'level', valueY: '3',
+    repeat: 1, expectedRepeats: 3, committedRowsPerSecond: 1,
+    factorConfigPaths: ['tunables.parquet_writer.defaults.compression', 'tunables.parquet_writer.defaults.compression_level'],
+    officialRuns: [run],
+  };
+  const svg = renderCampaignResults([result], 'C1');
+  assert.match(svg, /backlog cross-language fixture check pending; sustained compaction debt and other maintenance due-work vectors remain unknown/);
+  assert.match(svg, /No qualified winner/);
+  mutateMaintenanceReport(run, report => {
+    const debt = report.compaction_debt as Record<string, unknown>;
+    debt.source = 'snapshot_active_files';
+  });
+  assert.match(renderCampaignResults([result], 'C1'), /compaction-debt observation is unavailable or invalid/);
+});
+
+test('rejects unknown, unavailable, dropped, gapped, or clock-reversed backlog contract samples', () => {
+  const mutations: Array<(value: ReturnType<typeof syntheticBacklog>) => void> = [
+    value => { value.scope = 'entire_client_backlog'; },
+    value => { value.measurement_window.start_unix_ms++; },
+    value => { value.sampling_failures = 1; },
+    value => { value.samples_dropped = 1; },
+    value => { value.last_unavailable_reason = 'scrape failed'; },
+    value => { value.samples[0]!.available = false; },
+    value => { value.samples[0]!.available = null; },
+    value => { value.samples[0]!.rows = null; },
+    value => { value.samples[0]!.rows = Number.NaN; },
+    value => { value.samples[0]!.rows = Number.MAX_SAFE_INTEGER + 1; },
+    value => { value.samples[0]!.oldest_age_seconds = Number.POSITIVE_INFINITY; },
+    value => { value.samples[0]!.unavailable_reason = 'unknown gauges'; },
+    value => { value.samples[0]!.request_end_unix_ms = value.samples[0]!.request_start_unix_ms - 1; },
+    value => { value.samples[1]!.request_start_unix_ms = value.samples[0]!.request_start_unix_ms; },
+    value => { value.samples.splice(10, 2); },
+    value => { value.samples.splice(0, 4); },
+    value => { value.samples.splice(-4); },
+    value => { value.samples = value.samples.filter((_, index) => index % 6 === 0); },
+    value => { value.samples = Array.from({ length: 10_001 }, () => value.samples[0]!); },
+  ];
+  mutations.forEach((mutate, index) => {
+    const value = syntheticBacklog();
+    mutate(value);
+    assert.equal(typeof publicationBacklogIssue(value, 1_000_000, 1_150_000), 'string', 'mutation ' + index);
+  });
+  assert.equal(typeof publicationBacklogIssue(null, 1_000_000, 1_150_000), 'string');
+});
+
+test('rejects sustained positive publication rows, bytes, publications, or age trends without zero filling', () => {
+  for (const field of ['publications', 'rows', 'logical_bytes', 'oldest_age_seconds'] as const) {
+    const value = syntheticBacklog();
+    value.samples.forEach((sample, index) => { sample[field] = index; });
+    assert.match(publicationBacklogIssue(value, 1_000_000, 1_150_000)!, /positive pending/);
+  }
+});
+
 test('uses only successful in-window E1 compaction-debt samples and keeps missing pressure unranked', () => {
   const run = sourceShapedRun(30, [1, 1, 1, 1, 1], 1_000_000);
   attachMaintenanceDebt(run, 1_060_000);
@@ -209,18 +305,18 @@ test('uses only successful in-window E1 compaction-debt samples and keeps missin
     officialRuns: [run],
   };
   const svg = renderCampaignResults([result], 'C1');
-  assert.match(svg, /timestamped pressure evidence is unavailable; other maintenance due-work vectors remain unknown/);
+  assert.match(svg, /publication backlog contract evidence is unavailable or invalid/);
   assert.doesNotMatch(svg, /snappy \(0\/3\)/);
 
   const dropped = sourceShapedRun(31, [1, 1, 1, 1, 1], 1_000_000);
   attachMaintenanceDebt(dropped, 1_060_000, 1);
   const droppedSvg = renderCampaignResults([{ ...result, officialRuns: [dropped] }], 'C1');
-  assert.match(droppedSvg, /timestamped in-window bounded compaction-debt evidence is unavailable or invalid/);
+  assert.match(droppedSvg, /timestamped in-window compaction-debt observation is unavailable or invalid/);
 
   const stale = sourceShapedRun(32, [1, 1, 1, 1, 1], 1_000_000);
   attachMaintenanceDebt(stale, 999_999);
   const staleSvg = renderCampaignResults([{ ...result, officialRuns: [stale] }], 'C1');
-  assert.match(staleSvg, /timestamped in-window bounded compaction-debt evidence is unavailable or invalid/);
+  assert.match(staleSvg, /timestamped in-window compaction-debt observation is unavailable or invalid/);
 
   for (const [sequence, mutate] of [
     [35, (report: Record<string, unknown>) => { report.compaction_debt = null; }],
@@ -231,7 +327,7 @@ test('uses only successful in-window E1 compaction-debt samples and keeps missin
     attachMaintenanceDebt(unavailable, 1_060_000);
     mutateMaintenanceReport(unavailable, mutate);
     const svgUnavailable = renderCampaignResults([{ ...result, officialRuns: [unavailable] }], 'C1');
-    assert.match(svgUnavailable, /timestamped in-window bounded compaction-debt evidence is unavailable or invalid/);
+    assert.match(svgUnavailable, /timestamped in-window compaction-debt observation is unavailable or invalid/);
   }
 });
 
@@ -264,7 +360,7 @@ test('reads one sustained run of contiguous emitter buckets but keeps missing de
   };
   const svg = renderCampaignResults([result], 'C1');
   assert.match(svg, /snappy: unqualified, 0\/3 protocol-complete repeats; observed mean 1 rows\/s/);
-  assert.match(svg, /timestamped in-window bounded compaction-debt evidence is unavailable or invalid/);
+  assert.match(svg, /timestamped in-window compaction-debt observation is unavailable or invalid/);
   assert.doesNotMatch(svg, /snappy \(0\/3\)/);
 });
 
@@ -293,14 +389,30 @@ test('requires actual distinct factor leaves and preserves frozen config paths',
   assert.throws(() => renderCampaignResults([result], 'C1'), /distinct scalar or array config leaves/);
 });
 
-test('requires factor leaves to exist in the real tuned config fixture', () => {
+test('requires factor leaves to exist in generated C1 cohort configs', () => {
   type TunedConfig = {
     tables: string[];
     tunables: { parquet_writer: { defaults: Record<string, unknown> }; [key: string]: unknown };
     [key: string]: unknown;
   };
-  const config = JSON.parse(readFileSync(new URL('../../docs/experiments/arrowcol-oat/oat-config.tuned.json', import.meta.url), 'utf8')) as TunedConfig;
-  config.tables = ['sqlserver_availability_replica_states'];
+  const base = JSON.parse(readFileSync(new URL('../../docs/experiments/arrowcol-oat/oat-config.tuned.json', import.meta.url), 'utf8')) as TunedConfig;
+  const manifest = buildThroughputManifests(base)[0] as {
+    campaign_profile: string;
+    baseline_tunables: TunedConfig['tunables'];
+    invariants: { table: string; replicas: number[] };
+    comparisons: Array<{ candidates: Array<{ overrides: { tunables: { parquet_writer: { defaults: Record<string, unknown> } } } }> }>;
+  };
+  const configs = manifest.comparisons[0]!.candidates.map(candidate => ({
+    ...base,
+    campaign_profile: manifest.campaign_profile,
+    tables: [manifest.invariants.table],
+    replica_counts: manifest.invariants.replicas,
+    tunables: { ...manifest.baseline_tunables, parquet_writer: {
+      ...manifest.baseline_tunables.parquet_writer,
+      defaults: { ...manifest.baseline_tunables.parquet_writer.defaults, ...candidate.overrides.tunables.parquet_writer.defaults },
+    } },
+  }));
+  const config = configs[0]!;
   const run = sourceShapedRun(34, [1, 1, 1, 1, 1], 1_000_000);
   const official = { ...run, config };
   const result = {
@@ -310,6 +422,9 @@ test('requires factor leaves to exist in the real tuned config fixture', () => {
     officialRuns: [official],
   };
   assert.doesNotThrow(() => renderCampaignResults([result], 'C1'));
+  for (const generated of configs) {
+    assert.doesNotThrow(() => renderCampaignResults([{ ...result, officialRuns: [{ ...run, config: generated }] }], 'C1'));
+  }
   const missing = structuredClone(config);
   delete missing.tunables.parquet_writer.defaults.compression_level;
   assert.throws(() => renderCampaignResults([{ ...result, officialRuns: [{ ...run, config: missing }] }], 'C1'),
