@@ -262,8 +262,16 @@ impl ArrowColFlightService {
         }
         match ingest_metadata {
             Some(ingest_metadata) => {
-                self.start_ingest(ingest_metadata, authentication, first, stream, deadline, permit)
-                    .await
+                self.start_ingest(
+                    ingest_metadata,
+                    authentication,
+                    first,
+                    stream,
+                    deadline,
+                    permit,
+                    trusted_client_send_observation,
+                )
+                .await
             }
             None => self.execute_ddl(first, stream, deadline, permit, None).await,
         }
@@ -278,6 +286,7 @@ impl ArrowColFlightService {
         stream: InboundFlightStream,
         deadline: Instant,
         permit: DrainPermit,
+        trusted_client_send_observation: Option<(String, u64)>,
     ) -> RuntimeResult<Response<FlightResponseStream<PutResult>>> {
         let descriptor_version = validate_ingest_descriptor(first.flight_descriptor.as_ref(), &metadata)?;
         let received_schema = decode_first_schema(&first, self.limits.max_schema_bytes)?;
