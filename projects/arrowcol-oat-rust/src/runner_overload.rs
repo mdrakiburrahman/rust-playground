@@ -778,6 +778,8 @@ mod overload_guard_tests {
                     now,
                 )
                 .await?;
+            let baseline = platform.process_logs(&config).await?;
+            platform.retain_cell_process_baseline(&baseline);
             let prepared = tokio::time::timeout(Duration::from_secs(5), PreparedGuard::prepare(&config, &platform))
                 .await
                 .context("guard preparation deadline")??;
