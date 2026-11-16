@@ -1104,21 +1104,12 @@ fn validate_collector_layout(layout: Option<&LayoutTunables>) -> Result<()> {
     ] {
         positive(name, Some(value))?;
     }
-    for (name, columns, required) in [
-        ("collector.layout.sort_columns", layout.sort_columns.as_deref(), true),
-        ("collector.layout.bloom_columns", layout.bloom_columns.as_deref(), false),
+    for (name, columns) in [
+        ("collector.layout.sort_columns", layout.sort_columns.as_deref()),
+        ("collector.layout.bloom_columns", layout.bloom_columns.as_deref()),
     ] {
         if let Some(columns) = columns {
-            if required && columns.is_empty() {
-                bail!("{name} must not be empty");
-            }
-            let mut seen = std::collections::BTreeSet::new();
-            if columns
-                .iter()
-                .any(|column| column.trim().is_empty() || column.contains(',') || !seen.insert(column))
-            {
-                bail!("{name} must contain unique nonempty column names without commas");
-            }
+            validate_column_list(name, columns, false)?;
         }
     }
     Ok(())
@@ -1926,6 +1917,25 @@ mod tests {
             serde_json::json!({"client":{"workers":"16"}}),
         ] {
             assert!(Tunables::parse_oat_json(value).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn empty_layout_column_lists_project_without_defaulting() -> Result<()> {
+        let value = serde_json::json!({"collector":{"layout":{
+            "enabled":true, "sort_columns":[], "bloom_columns":[]
+        }}});
+        let tunables = Tunables::parse_oat_json(value)?;
+        let env = tunables.environment_for(ComponentRole::Collector)?;
+        assert_eq!(env["ARROWCOL_COLLECTOR_SORT_COLUMNS"], "");
+        assert_eq!(env["ARROWCOL_COLLECTOR_BLOOM_COLUMNS"], "");
+        for field in ["sort_columns", "bloom_columns"] {
+            for columns in [vec![""], vec!["a", "a"], vec!["a,b"], vec![" a"]] {
+                let mut value = serde_json::json!({"collector":{"layout":{"enabled":true}}});
+                value["collector"]["layout"][field] = serde_json::json!(columns);
+                assert!(Tunables::parse_oat_json(value).is_err());
+            }
         }
         Ok(())
     }
