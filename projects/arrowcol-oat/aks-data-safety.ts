@@ -48,6 +48,38 @@ export interface StampKustoBaseline {
   tables: StampKustoTable[]; source: '.show tables and .show external tables with exact current run ownership exclusion';
   empty_reason: 'positive_inventory_contains_no_non_run_tables' | null; observed_at_unix_ms: number;
 }
+export function validateStampKustoBaseline(value: unknown, azure: Azure, state: CampaignState, capturedAt: number): StampKustoBaseline {
+  const baseline = object(value);
+  if (baseline.schema_version !== 1 || baseline.scope !== 'configured_stamp_databases_non_current_run_tables' ||
+      !Array.isArray(baseline.tables) || baseline.tables.length > 512 ||
+      canonical_json(baseline.databases) !== canonical_json([...new Set([azure.c.database, azure.c.experimentDatabase])]) ||
+      baseline.source !== '.show tables and .show external tables with exact current run ownership exclusion' ||
+      integer(baseline.observed_at_unix_ms) < state.startedAtMs || integer(baseline.observed_at_unix_ms) > capturedAt ||
+      baseline.empty_reason !== (baseline.tables.length === 0 ? 'positive_inventory_contains_no_non_run_tables' : null))
+    throw new Error('Non-run stamp Kusto baseline is incomplete or belongs to another configuration.');
+  const seen = new Set<string>();
+  for (const raw of baseline.tables) {
+    const table = object(raw), before = object(table.before), database = identifier(table.database), name = identifier(table.name);
+    const key = canonical_json([database, table.kind, name]);
+    if (![azure.c.database, azure.c.experimentDatabase].includes(database) || !['regular', 'external'].includes(String(table.kind)) ||
+        seen.has(key) || !/^[a-f0-9]{64}$/.test(String(table.schema_sha256)) ||
+        (table.kind === 'external' ? !/^[a-f0-9]{64}$/.test(String(table.definition_sha256)) : table.definition_sha256 !== null) ||
+        before.database !== database || before.table !== name || before.kind !== table.kind ||
+        !/^[a-f0-9]{64}$/.test(String(before.query_sha256)) || !/^[a-f0-9]{64}$/.test(String(before.result_sha256)) ||
+        integer(before.observed_at_unix_ms) < state.startedAtMs ||
+        integer(before.observed_at_unix_ms) > integer(baseline.observed_at_unix_ms))
+      throw new Error('Non-run stamp Kusto baseline table identity/provenance is incomplete.');
+    integer(before.rows);
+    if (table.qap_before !== null) {
+      const qap = validateQapState(table.qap_before);
+      if (table.kind !== 'external' || qap.observed_at_unix_ms < state.startedAtMs ||
+          qap.observed_at_unix_ms > integer(baseline.observed_at_unix_ms))
+        throw new Error('Non-run stamp QAP baseline identity/time differs.');
+    }
+    seen.add(key);
+  }
+  return baseline as unknown as StampKustoBaseline;
+}
 export interface CaptureCellBaselineEnvelope {
   schema_version: 1; campaign_id: string; orchestration_run_id: string; cell_run_id: string;
   expected_etag: string; hot_delta_relative_path: string; actor: { mode: 'producer'; owner_id: string; fencing_token: number };
@@ -399,14 +431,7 @@ export async function observeDataPreservation(store: CampaignStore, azure: Azure
     references = { before_etag: before.etag, terminal_etag: terminal.etag };
   }
   await verifyPriorCells(azure, state, authority);
-  const kusto = object(campaign.value.non_run_kusto);
-  if (kusto.schema_version !== 1 || kusto.scope !== 'configured_stamp_databases_non_current_run_tables' ||
-      !Array.isArray(kusto.tables) || kusto.tables.length > 512 ||
-      canonical_json(kusto.databases) !== canonical_json([...new Set([azure.c.database, azure.c.experimentDatabase])]) ||
-      kusto.source !== '.show tables and .show external tables with exact current run ownership exclusion' ||
-      integer(kusto.observed_at_unix_ms) < state.startedAtMs || integer(kusto.observed_at_unix_ms) > Number(campaign.value.captured_at_unix_ms) ||
-      (kusto.tables.length === 0 && kusto.empty_reason !== 'positive_inventory_contains_no_non_run_tables'))
-    throw new Error('Non-run stamp Kusto baseline is incomplete; absence cannot become an inferred empty set.');
+  const kusto = validateStampKustoBaseline(campaign.value.non_run_kusto, azure, state, integer(campaign.value.captured_at_unix_ms));
   const nonRun: DataPreservationReceipt['non_run_kusto'] = [];
   let status = delta.status, reason = delta.reason;
   for (const raw of kusto.tables) {

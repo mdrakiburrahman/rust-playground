@@ -3,11 +3,15 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { test, type TestContext } from 'node:test';
+import { stringify } from 'yaml';
 import { Azure, Config, TAGS, type HttpReceipt } from '../../infra/azure/bootstrap.js';
-import { CUSTODY_CLEANUP_STEPS, newCampaignState, publishRunInventory, type CampaignState, type CampaignStore,
+import { defaultStampConfig } from '../../infra/azure/stamp.js';
+import { CUSTODY_CLEANUP_STEPS, CampaignConflictError, CampaignWriteOutcomeUnknownError, campaignMain, newCampaignState, publishRunInventory, type CampaignState, type CampaignStore,
   type RunInventory, type StoredCampaign } from './aks-campaign.js';
-import { captureCleanupBaseline, createDefaultCleanupProviders, type StampHealthReceipt } from './aks-default-providers.js';
+import { captureCleanupBaseline, createDefaultCleanupProviders, readCleanupBaseline, type StampHealthReceipt } from './aks-default-providers.js';
 import type { CleanupMutationAuthority } from './aks-cleanup-executor.js';
+import { loadCustodyConfig } from './aks-custody-config.js';
+import { watchdogOnce } from './aks-watchdog.js';
 
 const campaignId = '11111111-1111-4111-8111-111111111111';
 const ownerId = '22222222-2222-4222-8222-222222222222';
@@ -25,8 +29,8 @@ class Store implements CampaignStore {
     return `"${this.revision}"`;
   }
 }
-async function fixture(t: TestContext, capture = true) {
-  const c = new Config({ AZURE_SUBSCRIPTION_ID: campaignId }), azure = new Azure(c);
+async function fixture(t: TestContext, capture = true, c = new Config({ AZURE_SUBSCRIPTION_ID: campaignId })) {
+  const azure = new Azure(c);
   const aksId = c.base + '/providers/Microsoft.ContainerService/managedClusters/' + c.cluster;
   const namespace = 'oat-' + cellId.replaceAll('-', ''), identityId = c.identity_id;
   const step = { state: 'not_started' as const, deadline_unix_ms: null, reason_code: null };
@@ -36,7 +40,7 @@ async function fixture(t: TestContext, capture = true) {
     credentialName: 'arrowcol-run-' + cellId, issuer: 'https://fixture.oic.prod-aks.azure.com/tenant/cluster/',
     subject: `system:serviceaccount:${namespace}:oat`, audience: 'api://AzureADTokenExchange' };
   const inventory: RunInventory = { schema_version: 1, campaign_id: campaignId, owner_id: ownerId, fencing_token: 1,
-    orchestration_run_id: campaignId, cell_run_id: cellId, load_admission: 'not_authorized', namespace: { name: namespace, uid: cellId, owner_token: ownerId },
+    orchestration_run_id: campaignId, cell_run_id: cellId, load_admission: 'not_authorized', namespace: { name: namespace, uid: null, owner_token: ownerId },
     resources: [], fic: { resource_id: plan.resourceId, name: plan.credentialName, state: 'planned', absence: null, plan },
     qap: null, evidence_destination: { account: c.account, container: c.checkpoints, blob_prefix: 'evidence/' + cellId },
     cleanup: { stop_admission: step, bounded_drain: step, evidence_capture: step, stop_maintenance: step, terminal_capture: step, handoff: step } };
@@ -92,6 +96,7 @@ async function fixture(t: TestContext, capture = true) {
     return [null, { ':status': '201', etag }];
   });
   if (capture) await captureCleanupBaseline(store, azure, ownerId, 1);
+  inventory.namespace.uid = cellId;
   store.state = { ...store.state, status: 'cleaning', mode: 'armed', fencingToken: 2, fenceReason: 'heartbeat-expired',
     fencedAtMs: Date.now(), cleanupStatus: 'running', cleanupSteps: CUSTODY_CLEANUP_STEPS.map((step, index) => ({
       step, idempotencyKey: `${campaignId}:2:${step}`, status: index < 8 ? 'complete' : index === 8 ? 'running' : 'pending',
@@ -112,6 +117,217 @@ async function fixture(t: TestContext, capture = true) {
     fault: (value: typeof fault) => { fault = value; }, health: (value: typeof health) => { health = value; } };
 }
 const properties = (value: Record<string, unknown>) => value.properties as Record<string, unknown>;
+
+function selectedConfig(t: TestContext) {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'custody-config-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const envFile = path.join(directory, 'private.env'), stampFile = path.join(directory, 'stamp.yaml');
+  fs.writeFileSync(stampFile, stringify(defaultStampConfig({ AZURE_SUBSCRIPTION_ID: campaignId, AZURE_STAMP: '12345',
+    AZURE_LOCATION: 'canadacentral' })));
+  fs.writeFileSync(envFile, [`AZURE_SUBSCRIPTION_ID=${campaignId}`, `ARM_SUBSCRIPTION_ID=${campaignId}`,
+    'CAMPAIGN_STORAGE_ACCOUNT=arrowcollector12345', 'CAMPAIGN_STATE_CONTAINER=checkpoints',
+    `CAMPAIGN_ID=${campaignId}`, `CAMPAIGN_OWNER_ID=${ownerId}`, 'CAMPAIGN_FENCING_TOKEN=1'].join('\n'));
+  const args = ['--env-file', envFile, '--stamp-config', stampFile];
+  return { args, ...loadCustodyConfig(args, false, {}) };
+}
+test('stock custody selection loads explicit nondefault stamp and refuses missing or mismatched selection before access', async t => {
+  const selected = selectedConfig(t);
+  assert.equal(selected.config.stamp, '12345');
+  assert.equal(selected.config.location, 'canadacentral');
+  assert.equal(selected.config.account, 'arrowcollector12345');
+  assert.equal(loadCustodyConfig(['--once', ...selected.args], true, {}).config.cluster, 'arrow-collector-12345');
+  assert.throws(() => loadCustodyConfig([], false, selected.env), /explicit --env-file/);
+  for (const mismatch of [{ ARM_SUBSCRIPTION_ID: ownerId }, { AZURE_SUBSCRIPTION_ID: ownerId },
+    { CAMPAIGN_STORAGE_ACCOUNT: 'arrowcollector1' }, { CAMPAIGN_STATE_CONTAINER: 'other' }, { AZURE_STAMP: '1' }])
+    assert.throws(() => loadCustodyConfig(selected.args, false, mismatch), /match/);
+  assert.throws(() => loadCustodyConfig(['--once', '--watch', ...selected.args], true, {}), /exactly one/);
+  await assert.rejects(watchdogOnce(selected.env), /explicit validated stamp/);
+});
+test('stock campaign capture freezes selected-stamp baseline, reuses its receipt, and gates arm on its full identity', async t => {
+  const selected = selectedConfig(t), f = await fixture(t, false, selected.config);
+  f.inventory.namespace.uid = null;
+  f.inventory.resources.push({ api_version: 'apps/v1', kind: 'Deployment', namespace: f.inventory.namespace.name,
+    name: 'collector', uid: null, absence: null, role: 'collector', state: 'planned' });
+  f.store.state = { ...newCampaignState(campaignId, ownerId, f.store.state.startedAtMs), runInventory: f.inventory };
+  const deps = { store: f.store, azure: f.azure, env: {} }, lines: string[] = [];
+  t.mock.method(console, 'log', (line: string) => { lines.push(line); });
+  const arm = () => campaignMain(['arm', ownerId, '1', ...selected.args], deps);
+  await assert.rejects(arm(), /baseline is UNKNOWN/);
+  assert.equal(f.store.state.mode, 'observe');
+  await campaignMain(['capture-baseline', ownerId, '1', ...selected.args], deps);
+  const receipt = JSON.parse(lines.at(-1)!).receipt;
+  assert.equal(receipt.status, 'captured');
+  assert.equal(receipt.campaign_id, campaignId);
+  assert.equal(receipt.owner_id, ownerId);
+  assert.equal(receipt.fencing_token, 1);
+  const saved = f.blobs.get(receipt.blob)!;
+  assert.equal(receipt.etag, saved.etag);
+  assert.equal(receipt.captured_at_unix_ms, JSON.parse(saved.bytes.toString()).captured_at_unix_ms);
+  await campaignMain(['capture-baseline', ownerId, '1', ...selected.args], deps);
+  assert.deepEqual(JSON.parse(lines.at(-1)!).receipt, receipt);
+  assert.equal(f.blobs.size, 1, 'retry never replaces or creates another baseline');
+  const original = saved.bytes;
+  type BaselineFixture = { campaign_id: string; capacity: { receipts: Array<{ resource_id: string }> };
+    non_run_kusto?: { databases: string[] } };
+  for (const mutate of [
+    (value: BaselineFixture) => { value.campaign_id = ownerId; },
+    (value: BaselineFixture) => { value.capacity.receipts[0]!.resource_id = value.capacity.receipts[0]!.resource_id.replace('12345', '1'); },
+    (value: BaselineFixture) => { value.non_run_kusto!.databases = ['other']; },
+    (value: BaselineFixture) => { delete value.non_run_kusto; },
+  ]) {
+    const changed = JSON.parse(original.toString());
+    mutate(changed); saved.bytes = Buffer.from(JSON.stringify(changed));
+    await assert.rejects(arm(), /baseline|Kusto|UNKNOWN/);
+    assert.equal(f.store.state.mode, 'observe');
+  }
+  saved.bytes = original;
+  await arm();
+  assert.equal(f.store.state.mode, 'armed');
+  const observed = structuredClone(f.inventory);
+  observed.namespace.uid = cellId;
+  await publishRunInventory(f.store, observed);
+  const blob = f.azure.blob.bind(f.azure);
+  t.mock.method(f.azure, 'blob', async (...args: Parameters<Azure['blob']>) => {
+    assert.equal(args[0], 'GET', 'original proof retries must be read-only');
+    return blob(...args);
+  });
+  t.mock.method(f.azure, 'request', async () => { throw new Error('Retry must not recapture ARM capacity.'); });
+  t.mock.method(f.azure, 'kql', async () => { throw new Error('Retry must not recapture Kusto contents.'); });
+  await campaignMain(['capture-baseline', ownerId, '1', ...selected.args], deps);
+  assert.deepEqual(JSON.parse(lines.at(-1)!).receipt, receipt);
+  f.store.state = { ...f.store.state, status: 'cleaning', fencingToken: 2, fencedAtMs: Date.now(),
+    fenceReason: 'heartbeat-expired', cleanupStatus: 'running' };
+  assert.deepEqual(await readCleanupBaseline(f.azure, f.store.state), receipt,
+    'controller takeover must retain the immutable producer fence, not recapture with the cleanup fence');
+  assert.deepEqual(await captureCleanupBaseline(f.store, f.azure, ownerId, 2), receipt,
+    'existing proof lookup remains read-only under the current controller fence after provisioning');
+  const rewritten = JSON.parse(original.toString());
+  rewritten.producer_fencing_token = 2; saved.bytes = Buffer.from(JSON.stringify(rewritten));
+  await assert.rejects(readCleanupBaseline(f.azure, f.store.state), /baseline/);
+  assert.deepEqual(f.mutations, [], 'source qualification must never mutate ARM');
+});
+test('stock authorization and ready boundaries refuse missing baseline without advancing admission', async t => {
+  const selected = selectedConfig(t), f = await fixture(t, false, selected.config);
+  f.inventory.load_admission = 'authorization_pending';
+  f.store.state = { ...newCampaignState(campaignId, ownerId, f.store.state.startedAtMs), mode: 'armed', runInventory: f.inventory };
+  const deps = { store: f.store, azure: f.azure, env: {} };
+  const authorized = { ...f.inventory, load_admission: 'authorized' };
+  t.mock.method(process.stdin, Symbol.asyncIterator, async function* () { yield JSON.stringify(authorized); });
+  await assert.rejects(campaignMain(['publish-inventory', ...selected.args], deps), /baseline is UNKNOWN/);
+  assert.equal(f.store.state.runInventory!.load_admission, 'authorization_pending');
+  await assert.rejects(campaignMain(['assert-ready', ownerId, '1', ...selected.args], deps), /baseline is UNKNOWN/);
+  assert.deepEqual(f.mutations, []);
+});
+
+test('first campaign baseline rejects late namespace/resource identity and noninitial milestones before observation', async t => {
+  const changes: Record<string, (state: CampaignState) => void> = {
+    namespace: state => { state.runInventory!.namespace.uid = cellId; },
+    resource_uid: state => { state.runInventory!.resources[0].uid = cellId; },
+    observed_resource: state => { state.runInventory!.resources[0].state = 'observed'; },
+    observed_fic: state => { state.runInventory!.fic!.state = 'observed'; },
+    observed_qap: state => { state.runInventory!.qap = { database: 'qap', bindings: [
+      { external_table: 'collector', relative_path: 'runs/' + cellId }], state: 'observed', absence: [] }; },
+    cleanup: state => { state.runInventory!.cleanup.evidence_capture.state = 'complete'; },
+    cleanup_deadline: state => { state.runInventory!.cleanup.terminal_capture.deadline_unix_ms = Date.now() + 120_000; },
+    armed: state => { state.mode = 'armed'; },
+  };
+  for (const [name, change] of Object.entries(changes)) await t.test(name, async t => {
+    const f = await fixture(t, false);
+    f.inventory.namespace.uid = null;
+    f.inventory.resources.push({ api_version: 'apps/v1', kind: 'Deployment', namespace: f.inventory.namespace.name,
+      name: 'collector', uid: null, absence: null, role: 'collector', state: 'planned' });
+    f.store.state = { ...newCampaignState(campaignId, ownerId, f.store.state.startedAtMs), runInventory: f.inventory };
+    change(f.store.state);
+    const request = f.azure.request.bind(f.azure), kql = f.azure.kql.bind(f.azure);
+    let observations = 0;
+    t.mock.method(f.azure, 'request', async (...args: Parameters<Azure['request']>) => { observations++; return request(...args); });
+    t.mock.method(f.azure, 'kql', async (...args: Parameters<Azure['kql']>) => { observations++; return kql(...args); });
+    await assert.rejects(captureCleanupBaseline(f.store, f.azure, ownerId, 1), /initial.*pre-provision/);
+    assert.equal(observations, 0);
+    assert.equal(f.blobs.size, 0);
+    assert.deepEqual(f.mutations, []);
+  });
+});
+test('first campaign baseline pins the current inventory version throughout observation', async t => {
+  for (const changeInventory of [true, false]) await t.test(changeInventory ? 'same actor advances inventory' : 'same actor changes only version', async t => {
+    const f = await fixture(t, false);
+    f.inventory.namespace.uid = null;
+    f.store.state = { ...newCampaignState(campaignId, ownerId, f.store.state.startedAtMs), runInventory: f.inventory };
+    const kql = f.azure.kql.bind(f.azure);
+    let raced = false;
+    t.mock.method(f.azure, 'kql', async (...args: Parameters<Azure['kql']>) => {
+      const result = await kql(...args);
+      if (!raced) {
+        raced = true;
+        if (changeInventory) f.store.state.runInventory!.namespace.uid = cellId;
+        f.store.revision++;
+      }
+      return result;
+    });
+    await assert.rejects(captureCleanupBaseline(f.store, f.azure, ownerId, 1), CampaignConflictError);
+    assert.equal(f.blobs.size, 0);
+    assert.deepEqual(f.mutations, []);
+  });
+});
+test('stock publication cannot advance initial preparation before the immutable campaign baseline exists', async t => {
+  const selected = selectedConfig(t), f = await fixture(t, false, selected.config);
+  f.inventory.namespace.uid = null;
+  f.store.state = newCampaignState(campaignId, ownerId, f.store.state.startedAtMs);
+  const deps = { store: f.store, azure: f.azure, env: {} }, lines: string[] = [];
+  t.mock.method(console, 'log', (line: string) => { lines.push(line); });
+  let input = structuredClone(f.inventory);
+  t.mock.method(process.stdin, Symbol.asyncIterator, async function* () { yield JSON.stringify(input); });
+  const publish = () => campaignMain(['publish-inventory', ...selected.args], deps);
+  await publish();
+  assert.equal(f.blobs.size, 0);
+  input.namespace.uid = cellId;
+  await assert.rejects(publish(), /baseline is UNKNOWN/);
+  assert.equal(f.store.state.runInventory!.namespace.uid, null);
+  const kql = f.azure.kql.bind(f.azure);
+  let raced = false;
+  t.mock.method(f.azure, 'kql', async (...args: Parameters<Azure['kql']>) => {
+    if (!raced) {
+      raced = true;
+      await assert.rejects(publish(), /baseline is UNKNOWN/);
+      assert.equal(f.store.state.runInventory!.namespace.uid, null);
+    }
+    return kql(...args);
+  });
+  await campaignMain(['capture-baseline', ownerId, '1', ...selected.args], deps);
+  const receipt = JSON.parse(lines.at(-1)!).receipt, original = f.blobs.get(receipt.blob)!.bytes;
+  await publish();
+  assert.equal(f.store.state.runInventory!.namespace.uid, cellId);
+  await campaignMain(['capture-baseline', ownerId, '1', ...selected.args], deps);
+  assert.deepEqual(JSON.parse(lines.at(-1)!).receipt, receipt);
+  assert.deepEqual(f.blobs.get(receipt.blob)!.bytes, original);
+  assert.deepEqual(f.mutations, []);
+});
+test('advancement after baseline write remains UNKNOWN and retry reads the original proof without another write', async t => {
+  const f = await fixture(t, false);
+  f.inventory.namespace.uid = null;
+  f.store.state = { ...newCampaignState(campaignId, ownerId, f.store.state.startedAtMs), runInventory: f.inventory };
+  const blob = f.azure.blob.bind(f.azure);
+  let writes = 0;
+  t.mock.method(f.azure, 'blob', async (...args: Parameters<Azure['blob']>) => {
+    const result = await blob(...args);
+    if (args[0] === 'PUT') {
+      writes++;
+      f.store.state.runInventory!.namespace.uid = cellId;
+      f.store.revision++;
+    }
+    return result;
+  });
+  await assert.rejects(captureCleanupBaseline(f.store, f.azure, ownerId, 1), CampaignWriteOutcomeUnknownError);
+  assert.equal(f.blobs.size, 1);
+  const [key, saved] = [...f.blobs][0], original = saved.bytes;
+  t.mock.method(f.azure, 'request', async () => { throw new Error('Uncertain capture cannot reobserve ARM.'); });
+  t.mock.method(f.azure, 'kql', async () => { throw new Error('Uncertain capture cannot reobserve Kusto.'); });
+  const receipt = await captureCleanupBaseline(f.store, f.azure, ownerId, 1);
+  assert.equal(receipt.blob, key);
+  assert.equal(receipt.etag, saved.etag);
+  assert.deepEqual(saved.bytes, original);
+  assert.equal(writes, 1);
+});
 
 test('default restoration is a true no-op at supported safe capacity and capacity alone cannot complete full safety', async t => {
   const f = await fixture(t);

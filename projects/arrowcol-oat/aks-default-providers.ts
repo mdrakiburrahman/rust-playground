@@ -2,11 +2,11 @@ import { randomUUID } from 'node:crypto';
 import { canonical_json, type Azure } from '../../infra/azure/bootstrap.js';
 import { observe_custody_idle_capacity } from '../../infra/azure/aks-safe-idle.js';
 import { plan_run_fic } from '../../infra/azure/run_fic.js';
-import { recordCleanupArmOperation, type CampaignState, type CampaignStore, type CleanupArmTarget } from './aks-campaign.js';
+import { CampaignConflictError, CampaignFencedError, CampaignWriteOutcomeUnknownError, isInitialRunInventory, recordCleanupArmOperation, type CampaignState, type CampaignStore, type CleanupArmTarget } from './aks-campaign.js';
 import { createOwnedRunCleanupActions, type CleanupMutationAuthority, type ExternalCleanupActions } from './aks-cleanup-executor.js';
 import { assertCleaningActor, assertRunCleanupActor, discoverOwnedRunInventory, observeExactKubernetes } from './aks-setup-cleanup.js';
 import { reconcilePendingArmOperations, verifySafeIdle, type SafeIdleObservation } from './aks-reconcile.js';
-import { captureStampKustoBaseline, observeDataPreservation, type DataPreservationReceipt } from './aks-data-safety.js';
+import { captureStampKustoBaseline, observeDataPreservation, validateStampKustoBaseline, type DataPreservationReceipt } from './aks-data-safety.js';
 import { createDefaultLifecycleActions } from './aks-lifecycle.js';
 import { createCellCleanupProviders, type CellStepProviders } from './aks-cell-cleanup.js';
 
@@ -29,33 +29,64 @@ function activeOwner(state: CampaignState | undefined, ownerId: string, token: n
       now >= state.expiresAtMs || now < state.heartbeatAtMs || now - state.heartbeatAtMs >= 180_000 ||
       state.operations.length > 0) throw new Error('Baseline capture requires live producer custody before ARM mutations.');
 }
-export async function captureCleanupBaseline(store: CampaignStore, azure: Azure, ownerId: string, token: number): Promise<void> {
-  const state = (await store.read())?.state;
+export interface CampaignBaselineReceipt {
+  status: 'captured'; campaign_id: string; owner_id: string; fencing_token: number;
+  blob: string; etag: string; captured_at_unix_ms: number;
+}
+export async function captureCleanupBaseline(store: CampaignStore, azure: Azure, ownerId: string, token: number): Promise<CampaignBaselineReceipt> {
+  const original = await store.read(), state = original?.state;
+  const reader = (current: CampaignState | undefined) => {
+    const now = Date.now();
+    if (!current || current.ownerId !== ownerId || current.fencingToken !== token ||
+        !['active', 'cleaning'].includes(current.status) ||
+        current.status === 'active' && (now >= current.expiresAtMs || now < current.heartbeatAtMs ||
+          now - current.heartbeatAtMs >= 180_000))
+      throw new CampaignFencedError();
+  };
+  reader(state);
+  if (!original || !state) throw new CampaignFencedError();
+  if (!original.etag || original.etag === '*' || original.etag.startsWith('W/')) throw new CampaignConflictError();
+  const [prior] = await azure.blob('GET', azure.c.checkpoints, baselineBlob(state), undefined, undefined, {}, true, true);
+  if (prior !== null) {
+    const receipt = await readCleanupBaseline(azure, state), current = await store.read();
+    reader(current?.state);
+    if (current?.etag !== original.etag) throw new CampaignConflictError();
+    return receipt;
+  }
   activeOwner(state, ownerId, token);
+  if (state.mode !== 'observe' || !isInitialRunInventory(state.runInventory))
+    throw new Error('First campaign baseline requires the original initial pre-provision inventory in observe mode.');
+  const guard = async () => {
+    const current = await store.read();
+    activeOwner(current?.state, ownerId, token);
+    if (!current || current.etag !== original.etag || current.state.mode !== 'observe' ||
+        !isInitialRunInventory(current.state.runInventory) ||
+        canonical_json(current.state.runInventory) !== canonical_json(state.runInventory))
+      throw new CampaignConflictError();
+  };
+  await guard();
   const capacity = await observe_custody_idle_capacity(azure);
   if (capacity.status !== 'capacity_idle') throw new Error('Campaign baseline must be verified idle capacity before scale/load.');
-  if (state.runInventory && state.runInventory.load_admission !== 'not_authorized')
-    throw new Error('Campaign preservation baseline must precede every cell load authorization.');
-  const guard = async () => {
-    const current = (await store.read())?.state;
-    activeOwner(current, ownerId, token);
-    if (canonical_json(current.runInventory ?? null) !== canonical_json(state.runInventory ?? null))
-      throw new Error('Campaign baseline inventory/admission changed during observation.');
-  };
   const nonRunKusto = await captureStampKustoBaseline(azure, state, guard);
   const value = { schema_version: 1, campaign_id: state.campaignId, owner_id: ownerId, producer_fencing_token: token,
     started_at_unix_ms: state.startedAtMs, captured_at_unix_ms: Date.now(), capacity, non_run_kusto: nonRunKusto };
-  const [prior] = await azure.blob('GET', azure.c.checkpoints, baselineBlob(state), undefined, undefined, {}, true, true);
-  if (prior !== null) throw new Error('A pre-campaign baseline already exists; never replace it with current capacity.');
   await guard();
-  const [, headers] = await azure.blob('PUT', azure.c.checkpoints, baselineBlob(state), undefined, canonical_json(value),
-    { 'x-ms-blob-type': 'BlockBlob', 'If-None-Match': '*' });
-  const [confirmed, version] = await azure.blob('GET', azure.c.checkpoints, baselineBlob(state), undefined, undefined, {}, false, true);
-  if (headers[':status'] !== '201' || !headers.etag || version.etag !== headers.etag ||
-      confirmed === null || canonical_json(JSON.parse(confirmed.toString()) as unknown) !== canonical_json(value))
-    throw new Error('Pre-campaign baseline write outcome is UNKNOWN.');
+  let etag: string;
+  try {
+    const [, headers] = await azure.blob('PUT', azure.c.checkpoints, baselineBlob(state), undefined, canonical_json(value),
+      { 'x-ms-blob-type': 'BlockBlob', 'If-None-Match': '*' });
+    const [confirmed, version] = await azure.blob('GET', azure.c.checkpoints, baselineBlob(state), undefined, undefined, {}, false, true);
+    if (headers[':status'] !== '201' || !headers.etag || version.etag !== headers.etag ||
+        confirmed === null || canonical_json(JSON.parse(confirmed.toString()) as unknown) !== canonical_json(value))
+      throw new CampaignWriteOutcomeUnknownError();
+    etag = headers.etag;
+  } catch { throw new CampaignWriteOutcomeUnknownError(); }
+  try {
+    await guard();
+    return await readCleanupBaseline(azure, state, etag);
+  } catch { throw new CampaignWriteOutcomeUnknownError(); }
 }
-export async function baselineSystemCount(azure: Azure, state: CampaignState, expectedEtag?: string): Promise<number> {
+async function validatedCleanupBaseline(azure: Azure, state: CampaignState, expectedEtag?: string) {
   const [bytes, version] = await azure.blob('GET', azure.c.checkpoints, baselineBlob(state), undefined, undefined, {}, false, true);
   if (!bytes || bytes.length > 16_777_216 || !version.etag || version.etag.startsWith('W/') ||
       version.etag === '*' || expectedEtag !== undefined && version.etag !== expectedEtag)
@@ -83,7 +114,17 @@ export async function baselineSystemCount(azure: Azure, state: CampaignState, ex
     return text(receipt.resource_id);
   }).sort();
   if (canonical_json(ids) !== canonical_json(expectedIds)) throw new Error('Original baseline targets another stamp or has incomplete ARM receipts.');
-  return integer(system.count);
+  validateStampKustoBaseline(value.non_run_kusto, azure, state, value.captured_at_unix_ms);
+  return { systemCount: integer(system.count), value, etag: version.etag };
+}
+export async function baselineSystemCount(azure: Azure, state: CampaignState, expectedEtag?: string): Promise<number> {
+  return (await validatedCleanupBaseline(azure, state, expectedEtag)).systemCount;
+}
+export async function readCleanupBaseline(azure: Azure, state: CampaignState, expectedEtag?: string): Promise<CampaignBaselineReceipt> {
+  const { value, etag } = await validatedCleanupBaseline(azure, state, expectedEtag);
+  return { status: 'captured', campaign_id: state.campaignId, owner_id: state.ownerId,
+    fencing_token: integer(value.producer_fencing_token), blob: baselineBlob(state), etag,
+    captured_at_unix_ms: integer(value.captured_at_unix_ms) };
 }
 
 export interface StampHealthReceipt {

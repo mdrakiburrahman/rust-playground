@@ -3,6 +3,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import type { RunFicPlan } from '../../infra/azure/run_fic.js';
 import type { OatQapReference } from '../../infra/azure/oat_qap.js';
+import { loadCustodyConfig } from './aks-custody-config.js';
 export const HEARTBEAT_INTERVAL_MS = 60_000;
 export const MISSED_HEARTBEAT_LIMIT = 3;
 export const MAX_CAMPAIGN_LIFETIME_MS = 6 * 60 * 60 * 1000;
@@ -260,12 +261,17 @@ function mergeStep(before: InventoryStep, after: InventoryStep): InventoryStep {
   return { ...after, deadline_unix_ms: before.deadline_unix_ms ?? after.deadline_unix_ms,
     reason_code: after.reason_code ?? (after.state === before.state ? before.reason_code : null) };
 }
+export function isInitialRunInventory(inventory: RunInventory | undefined): boolean {
+  return Boolean(inventory && inventory.load_admission === 'not_authorized' && inventory.namespace.uid === null &&
+    inventory.resources.every(resource => resource.state === 'planned' && resource.uid === null && resource.absence === null) &&
+    (!inventory.fic || inventory.fic.state === 'planned' && inventory.fic.absence === null) &&
+    (!inventory.qap || inventory.qap.state === 'planned' && inventory.qap.absence.length === 0 && !inventory.qap.reference) &&
+    Object.values(inventory.cleanup).every(step =>
+      step.state === 'not_started' && step.deadline_unix_ms === null && step.reason_code === null));
+}
 function mergeRunInventory(before: RunInventory | undefined, after: RunInventory): RunInventory {
   const initial = () => {
-    if (after.load_admission !== 'not_authorized' || after.namespace.uid !== null ||
-        after.resources.some(resource => resource.state !== 'planned' || resource.uid !== null || resource.absence !== null) ||
-        after.fic && after.fic.state !== 'planned' || after.qap && after.qap.state !== 'planned' ||
-        Object.values(after.cleanup).some(step => step.state !== 'not_started'))
+    if (!isInitialRunInventory(after))
       throw new Error('Initial RunInventory must positively record not_authorized before external provisioning.');
     return after;
   };
@@ -746,11 +752,26 @@ async function readRunInventoryStdin(): Promise<unknown> {
   try { return JSON.parse(input) as unknown; } catch { throw new Error('RunInventory stdin is not valid JSON.'); }
 }
 
-async function main(args: string[]): Promise<void> {
+export async function campaignMain(args: string[], dependencies: {
+  store?: CampaignStore; azure?: import('../../infra/azure/bootstrap.js').Azure; env?: NodeJS.ProcessEnv;
+} = {}): Promise<void> {
+  if (args[0] === 'cleanup-step') {
+    const cell = await import('./aks-cell-cleanup.js');
+    if (args[1] && !Object.hasOwn(cell.CELL_CLEANUP_SELECTORS, args[1])) throw new Error('Unknown cleanup-step selector.');
+  }
+  const selected = loadCustodyConfig(args, false, dependencies.env);
+  args = selected.positionals;
   const [action, campaignId, fencingTokenText] = args;
-  const subscriptionId = process.env.ARM_SUBSCRIPTION_ID ?? '';
-  const store = createBlobCampaignStore({ account: process.env.CAMPAIGN_STORAGE_ACCOUNT ?? '',
-    container: process.env.CAMPAIGN_STATE_CONTAINER ?? '', subscriptionId });
+  const subscriptionId = selected.config.subscription, env = selected.env;
+  const store = dependencies.store ?? createBlobCampaignStore({ account: selected.config.account,
+    container: selected.config.checkpoints, subscriptionId });
+  const { Azure } = await import('../../infra/azure/bootstrap.js');
+  const azure = dependencies.azure ?? new Azure(selected.config);
+  const requireBaseline = async (current: StoredCampaign) => {
+    const { readCleanupBaseline } = await import('./aks-default-providers.js');
+    await readCleanupBaseline(azure, current.state);
+    if ((await store.read())?.etag !== current.etag) throw new CampaignConflictError();
+  };
   if (action === 'start' && (args.length === 2 || args.length === 3)) {
     const result = await startCampaign(store, campaignId!, args[2] ?? campaignId!);
     console.log(JSON.stringify({ ok: true, receipt: campaignStartReceipt(result.state) }));
@@ -758,7 +779,7 @@ async function main(args: string[]): Promise<void> {
     const state = await store.read();
     if (!state) throw new Error('No active campaign state exists.');
     if (campaignId !== state.state.ownerId) throw new CampaignFencedError();
-    assertCampaignEnvironment(process.env, state.state);
+    assertCampaignEnvironment(env, state.state);
     const result = await heartbeatCampaign(store, state.state.ownerId, Number(fencingTokenText), Date.now());
     console.log(JSON.stringify({ campaignId: result.state.campaignId, fencingToken: result.state.fencingToken,
       heartbeatSequence: result.state.heartbeatSequence, heartbeatAtMs: result.state.heartbeatAtMs }));
@@ -766,7 +787,8 @@ async function main(args: string[]): Promise<void> {
     const current = await store.read();
     if (!current) throw new Error('No active campaign state exists.');
     if (campaignId !== current.state.ownerId) throw new CampaignFencedError();
-    assertCampaignEnvironment(process.env, current.state);
+    assertCampaignEnvironment(env, current.state);
+    await requireBaseline(current);
     const result = await armCampaign(store, current.state.ownerId, Number(fencingTokenText));
     console.log(JSON.stringify({ campaignId: result.state.campaignId, mode: result.state.mode }));
   } else if (action === 'publish-inventory' && args.length === 1) {
@@ -774,14 +796,17 @@ async function main(args: string[]): Promise<void> {
     if (!record(input)) throw new Error('RunInventory stdin must be an object.');
     const current = await store.read();
     if (!current) throw new Error('No active campaign state exists.');
-    assertCampaignEnvironment(process.env, current.state);
+    assertCampaignEnvironment(env, current.state);
+    const inventory = validateRunInventory(input, current.state);
+    if (!isInitialRunInventory(mergeRunInventory(current.state.runInventory, inventory))) await requireBaseline(current);
     const result = await publishRunInventory(store, input);
     console.log(JSON.stringify({ ok: true, receipt: runInventoryPublishReceipt(result) }));
   } else if (action === 'assert-ready' && args.length === 3 && /^\d+$/.test(fencingTokenText!)) {
     const current = await store.read();
     if (!current) throw new Error('No active campaign state exists.');
     if (campaignId !== current.state.ownerId) throw new CampaignFencedError();
-    assertCampaignEnvironment(process.env, current.state);
+    assertCampaignEnvironment(env, current.state);
+    await requireBaseline(current);
     const state = await assertRunInventoryReady(store, current.state.ownerId, Number(fencingTokenText));
     console.log(JSON.stringify({ ok: true, receipt: { status: 'ready', campaign_id: state.campaignId,
       owner_id: state.ownerId, fencing_token: state.fencingToken, orchestration_run_id: state.runInventory!.orchestration_run_id,
@@ -790,16 +815,25 @@ async function main(args: string[]): Promise<void> {
     console.log(JSON.stringify((await store.read())?.state ?? { status: 'idle' }));
   } else if (action === 'read-inventory' && args.length === 1) {
     const { readCellRunInventory } = await import('./aks-cell-cleanup.js');
-    console.log(JSON.stringify(await readCellRunInventory(store, await readRunInventoryStdin(), process.env)));
+    console.log(JSON.stringify(await readCellRunInventory(store, await readRunInventoryStdin(), env)));
+  } else if (action === 'capture-baseline' && args.length === 3 && /^\d+$/.test(fencingTokenText!)) {
+    const current = await store.read();
+    if (!current || campaignId !== current.state.ownerId) throw new CampaignFencedError();
+    assertCampaignEnvironment(env, current.state);
+    const { captureCleanupBaseline } = await import('./aks-default-providers.js');
+    const log = console.log;
+    let receipt: import('./aks-default-providers.js').CampaignBaselineReceipt;
+    try {
+      console.log = (...values: unknown[]) => console.error(...values);
+      receipt = await captureCleanupBaseline(store, azure, campaignId!, Number(fencingTokenText));
+    } finally { console.log = log; }
+    console.log(JSON.stringify({ ok: true, receipt }));
   } else if (action === 'capture-cell-baseline' && args.length === 1) {
     const current = await store.read();
     if (!current) throw new CampaignFencedError();
-    assertCampaignEnvironment(process.env, current.state);
-    const { Azure, Config } = await import('../../infra/azure/bootstrap.js');
+    assertCampaignEnvironment(env, current.state);
+    await requireBaseline(current);
     const { captureCellBaseline } = await import('./aks-data-safety.js');
-    const azure = new Azure(new Config({ AZURE_SUBSCRIPTION_ID: subscriptionId }));
-    if (process.env.CAMPAIGN_STORAGE_ACCOUNT !== azure.c.account || process.env.CAMPAIGN_STATE_CONTAINER !== azure.c.checkpoints)
-      throw new Error('Baseline custody must use the exact selected stamp checkpoints account/container.');
     const input = await readRunInventoryStdin(), log = console.log;
     let receipt: import('./aks-data-safety.js').CellBaselineReceipt;
     try {
@@ -812,13 +846,9 @@ async function main(args: string[]): Promise<void> {
     if (!Object.hasOwn(cell.CELL_CLEANUP_SELECTORS, args[1]!)) throw new Error('Unknown cleanup-step selector.');
     const input = cell.parseCellCleanupEnvelope(await readRunInventoryStdin());
     await cell.readCellRunInventory(store, { schema_version: 1, campaign_id: input.inventory.campaign_id,
-      orchestration_run_id: input.inventory.orchestration_run_id, cell_run_id: input.inventory.cell_run_id, actor: input.actor }, process.env);
-    const { Azure, Config } = await import('../../infra/azure/bootstrap.js');
+      orchestration_run_id: input.inventory.orchestration_run_id, cell_run_id: input.inventory.cell_run_id, actor: input.actor }, env);
     const { createDefaultCleanupProviders, createDefaultCellCleanupProviders } = await import('./aks-default-providers.js');
     const fs = await import('node:fs'), os = await import('node:os');
-    const azure = new Azure(new Config({ AZURE_SUBSCRIPTION_ID: subscriptionId }));
-    if (process.env.CAMPAIGN_STORAGE_ACCOUNT !== azure.c.account || process.env.CAMPAIGN_STATE_CONTAINER !== azure.c.checkpoints)
-      throw new Error('Cleanup custody must use the exact selected stamp checkpoints account/container.');
     const workDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'oat-cell-cleanup-'));
     const actions = createDefaultCleanupProviders(store, { azure, workDirectory });
     const providers = createDefaultCellCleanupProviders(actions);
@@ -834,13 +864,13 @@ async function main(args: string[]): Promise<void> {
     }
     console.log(JSON.stringify({ ok: true, receipt }));
   } else {
-    throw new Error('Usage: aks-campaign.ts start <campaign-uuid> [owner-uuid] | heartbeat <owner-uuid> <fencing-token> | arm <owner-uuid> <fencing-token> | publish-inventory (JSON stdin) | assert-ready <owner-uuid> <fencing-token> | read-inventory (JSON envelope stdin) | cleanup-step <selector> (JSON envelope stdin) | status');
+    throw new Error('Usage: aks-campaign.ts <start|heartbeat|capture-baseline|arm|publish-inventory|assert-ready|read-inventory|capture-cell-baseline|cleanup-step|status> [arguments] --env-file PATH --stamp-config YAML');
   }
 }
 if (process.argv[1] && ['aks-campaign.ts', 'aks-campaign.js'].includes(path.basename(process.argv[1])) && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  main(process.argv.slice(2)).catch((error: unknown) => {
-    const action = process.argv[2];
-    if (action === 'publish-inventory' || action === 'assert-ready' || action === 'cleanup-step' || action === 'read-inventory' || action === 'capture-cell-baseline') {
+  campaignMain(process.argv.slice(2)).catch((error: unknown) => {
+    const jsonActions = ['publish-inventory', 'assert-ready', 'cleanup-step', 'read-inventory', 'capture-cell-baseline', 'capture-baseline'];
+    if (process.argv.slice(2).some(action => jsonActions.includes(action))) {
       const message = error instanceof Error ? error.message : 'Campaign custody failed.';
       const code = cleanupFailureCode(error);
       console.log(JSON.stringify({ ok: false, code, message }));

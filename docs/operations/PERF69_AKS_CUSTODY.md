@@ -14,9 +14,37 @@ Custody therefore runs as a watchdog on a dedicated, separately leased devbox, n
 | Cleanup state machine | Fencing persists ordered, stable idempotency receipts; retries resume the same step, and completion requires every step to verify |
 | Cleanup adapter | Source/mocked only. Default CLI/watchdog providers install exact discovery, bounded lifecycle/journal recovery, namespace/QAP/FIC custody, ARM rollback and independent Delta/non-run Kusto preservation. External rehearsal remains mandatory; keep custody unarmed. |
 
-The helper APIs below expose the original QAP Blob custody without replacing its full ownership snapshot or positive workload-stop checks. E1 must persist the credential-free reference before load. `createDefaultCleanupProviders` composes the independent providers with explicitly supplied runner lifecycle actions; it is not a qualified, unattended default watchdog. Concrete lifecycle/recovery providers, positive full-data observations, adapter rehearsal and independent watchdog lease renewal remain gates. Keep the campaign unarmed.
+The helper APIs below expose the original QAP Blob custody without replacing its full ownership snapshot or positive workload-stop checks. E1 must persist the credential-free reference before load. `createDefaultCleanupProviders` installs concrete lifecycle/recovery and full-data observation by default; injection is optional for tests. External adapter rehearsal and independent watchdog lease renewal remain gates. Keep the campaign unarmed.
 
 Before campaign load, exercise heartbeat expiry, stale-owner rejection, repeated cleanup, and a safe-idle no-op on the watchdog box. Confirm the final ARM state and preserve the evidence before handing the lease back. A cleanup operation that is pending or uncertain is never reported as complete.
+
+## Selected configuration and campaign baseline
+
+Every `aks-campaign.ts` invocation requires `--env-file <private-env> --stamp-config <stamp.yaml>`.
+The separate watchdog requires the same flags:
+`npx --no-install tsx projects/arrowcol-oat/aks-watchdog.ts --watch --env-file <private-env> --stamp-config <stamp.yaml>`
+(or `--once`). Neither CLI guesses a stamp or accepts a missing selection.
+The existing validated env/YAML loaders are shared with bootstrap; ambient variables retain bootstrap precedence.
+`ARM_SUBSCRIPTION_ID` must equal the selected subscription; `CAMPAIGN_STORAGE_ACCOUNT` and
+`CAMPAIGN_STATE_CONTAINER` must equal the selected account/checkpoints container. Producer identity environment
+must match the start receipt. These inputs contain identities, not embedded credentials.
+
+| Action (append both configuration flags) | Requirement/result |
+| --- | --- |
+| `start <campaign-uuid> [owner-uuid]` | Starts observe-only custody; retain its producer identity environment. |
+| `publish-inventory` | Persist initial `not_authorized` inventory before provisioning. Advancing beyond initial preparation requires the matching campaign baseline, even while admission remains `not_authorized`. |
+| `capture-baseline <owner-uuid> <fencing-token>` | First capture requires observe mode, null namespace UID, planned/unobserved resources/FIC/QAP and entirely unstarted cleanup with null deadlines/reasons. Freeze verified idle ARM capacity and non-run Kusto identity/count/policy before provisioning/arm/load; any inventory/version change during capture fails closed. |
+| `arm <owner-uuid> <fencing-token>` | Requires matching durable campaign baseline; this is effect authorization, not a rehearsal/dry run. |
+| `publish-inventory` with `authorized`, `assert-ready`, `capture-cell-baseline` | Independently require the matching campaign baseline; absence, drift or incomplete non-run Kusto provenance fails closed. |
+
+`capture-baseline` returns one JSON line:
+`{ok:true,receipt:{status:"captured",campaign_id,owner_id,fencing_token,blob,etag,captured_at_unix_ms}}`.
+`blob` is the raw key `_arrowcol-custody/campaigns/<campaign-uuid>/baseline.json`, not a URL.
+`etag` versions that immutable Blob, not inventory. `CampaignBaselineReceipt` is exported by
+`aks-default-providers.ts`; errors use the existing machine-code envelope. Controller cleanup continues to
+validate the baseline's original producer origin/fence, not the controller's newer fence; it never recaptures it.
+An existing-proof retry is read-only and remains valid after provisioning, load authorization or controller
+takeover using the current actor/fence; it does not require the advanced inventory to look initial again.
 
 ## Owned helper APIs
 
@@ -57,7 +85,7 @@ Persist `fic.plan` before prepare, each exact workload intent before apply, `qap
 
 ## Per-cell effect CLI and refresh
 
-Use `npx --no-install tsx projects/arrowcol-oat/aks-campaign.ts cleanup-step <selector>`. This **executes** the selected provider effect; a custody-enabled runner must not also perform the matching direct Rust cleanup. Legacy noncampaign cleanup is unchanged. An unavailable provider, nonzero exit or UNKNOWN never permits fallback direct cleanup.
+Use `npx --no-install tsx projects/arrowcol-oat/aks-campaign.ts cleanup-step <selector> --env-file <private-env> --stamp-config <stamp.yaml>`. This **executes** the selected provider effect; a custody-enabled runner must not also perform the matching direct Rust cleanup. Legacy noncampaign cleanup is unchanged. An unavailable provider, nonzero exit or UNKNOWN never permits fallback direct cleanup.
 
 | Exported `CellCleanupSelector` | Provider action |
 | --- | --- |
@@ -73,7 +101,7 @@ Use `npx --no-install tsx projects/arrowcol-oat/aks-campaign.ts cleanup-step <se
 
 `cleanup.stop_maintenance` is a required `InventoryStep`, initially `not_started` with null deadline/reason. Legacy inventories missing it fail closed. Running maintenance stop requires an absolute Unix-millisecond deadline; both executors persist its progress under the current actor/ETag. A completed milestone is monotonic and is required for handoff.
 
-The table order is mandatory: maintenance stays on throughout load/drain; capture pre-stop evidence, then stop maintenance, then capture final logs/actual terminal receipts before namespace removal. A maintenance provider may report completion only after verifying the exact workload stopped **and** recreation is disabled, not merely after API acceptance. The default CLI does not install this missing concrete lifecycle provider.
+The table order is mandatory: maintenance stays on throughout load/drain; capture pre-stop evidence, then stop maintenance, then capture final logs/actual terminal receipts before namespace removal. The installed default maintenance provider reports completion only after verifying the exact workload stopped **and** recreation is disabled, not merely after API acceptance.
 
 The exact `CELL_CLEANUP_SELECTORS`, `CellCleanupEnvelope`, `CellCleanupReceipt`, `ReadInventoryEnvelope` and `ReadInventoryResult` are exported by `aks-cell-cleanup.ts`. All stdin is bounded to 1 MiB.
 
@@ -95,7 +123,7 @@ Conditional per-selector journals under `_arrowcol-custody/campaigns/<campaign>/
 
 Saved-running recovery also requires a confirmed CAS against the supplied full inventory/version and pins that version through provider authority checks. Maintenance stop admits each workload only within the original absolute deadline; its authority carries the remaining allowance and rejects use after expiry. A slow/late first stop never authorizes a second stop, renews the deadline or produces a normal completion receipt. Confirmed partial provider evidence remains recoverable rather than being replayed.
 
-Refresh using `aks-campaign.ts read-inventory`, not `status`. Strict stdin is:
+Refresh using `aks-campaign.ts read-inventory --env-file <private-env> --stamp-config <stamp.yaml>`, not `status`. Strict stdin is:
 
 ```typescript
 { schema_version: 1, campaign_id: string, orchestration_run_id: string, cell_run_id: string,
@@ -117,7 +145,7 @@ The first inventory must record `not_authorized`, planned resources and no names
 Transitions cannot skip, regress or change after fencing. Only confirmed authorization permits client preparation,
 preflight or start; QAP absence alone never proves no rows were admitted.
 
-`aks-campaign.ts capture-cell-baseline` accepts bounded JSON stdin:
+`aks-campaign.ts capture-cell-baseline --env-file <private-env> --stamp-config <stamp.yaml>` accepts bounded JSON stdin:
 
 ```typescript
 { schema_version: 1, campaign_id: string, orchestration_run_id: string, cell_run_id: string,
