@@ -2,24 +2,26 @@ use anyhow::{Result, anyhow};
 use arrow::array::{Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow_deltalake::delta::{DeltaTable, INGESTION_PARTITION};
+use arrow_deltalake::maintenance::test_support::CountingObjectStore;
 use arrow_deltalake::maintenance::{
     Granularity, MaintenanceControl, MaintenanceError, MaintenanceErrorKind, NegativeProbeConfig, OptimizeConfig,
     Outcome, ProbeOperation, now_ms,
 };
+use delta_kernel::object_store::local::LocalFileSystem;
 use delta_maintenance::{
-    DiscoveredTable, FilesystemDiscovery, Metrics, Operation, Settings, TableDiscovery, run_cycle_with_discovery,
-    run_with_discovery,
+    DiscoveredTable, FilesystemDiscovery, Metrics, Operation, OptimizeUploadMode, Settings, TableDiscovery,
+    run_cycle_with_discovery, run_with_discovery, startup_configuration,
 };
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use url::Url;
 
 const BASE: i64 = 1_704_067_200_000;
 
-struct CatalogTable(DiscoveredTable);
+struct CatalogTable(DiscoveredTable, Option<Arc<DeltaTable>>);
 
 impl TableDiscovery for CatalogTable {
     fn tables(&self) -> Result<Vec<String>> {
@@ -31,6 +33,20 @@ impl TableDiscovery for CatalogTable {
             return Err(anyhow!("unknown table"));
         }
         Ok(self.0.clone())
+    }
+
+    fn open_probe_table(&self, url: &Url, max_log_files: usize) -> Result<Arc<DeltaTable>> {
+        self.1.as_ref().map(Arc::clone).map_or_else(
+            || DeltaTable::open_for_maintenance_probe_with_limit(url, max_log_files),
+            Ok,
+        )
+    }
+
+    fn open_maintenance_table(&self, url: &Url) -> Result<Arc<DeltaTable>> {
+        self.1
+            .as_ref()
+            .map(Arc::clone)
+            .map_or_else(|| DeltaTable::open_for_maintenance(url), Ok)
     }
 }
 
@@ -77,16 +93,24 @@ fn fixture() -> Result<(tempfile::TempDir, Settings, CatalogTable)> {
         max_prune_files: 100,
         operation_limits: Default::default(),
     };
-    let source = CatalogTable(DiscoveredTable {
-        name: "events".into(),
-        url,
-        log_token: None,
-        properties: BTreeMap::from([
-            ("arrowcol.optimize.minFiles".into(), "3".into()),
-            ("arrowcol.partition.granularity".into(), "minute".into()),
-            ("delta.checkpointInterval".into(), "100".into()),
-        ]),
-    });
+    let source = CatalogTable(
+        DiscoveredTable {
+            name: "events".into(),
+            url,
+            log_token: None,
+            properties: BTreeMap::from([
+                ("arrowcol.optimize.minFiles".into(), "3".into()),
+                ("arrowcol.purge.enabled".into(), "true".into()),
+                (
+                    "arrowcol.purge.retention".into(),
+                    (30 * 24 * 60 * 60 * 1000_i64).to_string(),
+                ),
+                ("arrowcol.partition.granularity".into(), "minute".into()),
+                ("delta.checkpointInterval".into(), "100".into()),
+            ]),
+        },
+        None,
+    );
     persist_policy(&source)?;
     Ok((root, settings, source))
 }
@@ -254,21 +278,139 @@ fn inventory(root: &Path) -> Result<FileInventory> {
 
 #[test]
 fn idle_catalog_policy_passes_have_no_log_checkpoint_or_progress_rewrites() -> Result<()> {
-    let (root, settings, source) = fixture()?;
+    let (root, mut settings, mut source) = fixture()?;
+    settings.operations.insert(0, Operation::Purge);
+    settings.purge_retention_ms = Some(30 * 24 * 60 * 60 * 1000);
+    let store = Arc::new(CountingObjectStore::new(Arc::new(LocalFileSystem::new())));
+    let table_path = source.0.url.to_file_path().map_err(|()| anyhow!("table path"))?;
+    let counted_store = Arc::clone(&store);
+    let counted_store: Arc<dyn delta_kernel::object_store::ObjectStore> = counted_store;
+    source.1 = Some(DeltaTable::open_with_store(table_path, counted_store)?);
     let before = inventory(root.path())?;
     let metrics = Metrics::new();
     for _ in 0..2 {
+        store.reset();
         let results = run_cycle_with_discovery(&settings, &source, &metrics, &Arc::new(AtomicBool::new(false)))?;
-        assert_eq!(results.len(), 4);
-        assert!(results.iter().all(|r| r.error.is_none() && r.negative_probe));
+        assert_eq!(results.len(), 5);
+        assert!(results.iter().all(|r| r.error.is_none()));
+        assert_eq!(results.iter().filter(|r| r.negative_probe).count(), 4);
+        assert_eq!(results[0].operation, Operation::Purge);
+        assert!(results.iter().all(|result| {
+            result.probe_duration_ms.saturating_add(result.plan_apply_duration_ms)
+                <= result.duration_ms.saturating_add(1)
+        }));
         assert!(
             results
                 .iter()
                 .all(|r| r.report.as_ref().is_some_and(|r| r.outcome == Outcome::Noop))
         );
         assert_eq!(before, inventory(root.path())?);
+        let (reads, lists, writes) = store.snapshot();
+        assert!(reads > 0);
+        assert!(lists > 0 && lists <= 18, "idle pass made {lists} object listings");
+        assert!(reads <= 48, "idle pass made {reads} object reads/listings");
+        assert_eq!(writes, 0, "idle pass must not write objects");
     }
     assert!(metrics.render().contains("delta_maintenance_negative_probes_total"));
+    Ok(())
+}
+
+#[test]
+fn later_vacuum_probe_uses_fresh_due_time_after_earlier_operation() -> Result<()> {
+    struct AdvancingClock {
+        source: CatalogTable,
+        anchors: [i64; 2],
+        calls: AtomicUsize,
+    }
+
+    impl TableDiscovery for AdvancingClock {
+        fn tables(&self) -> Result<Vec<String>> {
+            self.source.tables()
+        }
+
+        fn table(&self, name: &str) -> Result<DiscoveredTable> {
+            self.source.table(name)
+        }
+
+        fn maintenance_now_ms(&self) -> Result<i64> {
+            let index = self.calls.fetch_add(1, Ordering::SeqCst).min(1);
+            Ok(self.anchors[index])
+        }
+    }
+
+    let (root, mut settings, mut source) = fixture()?;
+    settings.operations = vec![Operation::Purge, Operation::Vacuum];
+    source.0.properties.insert(
+        "arrowcol.purge.retention".into(),
+        (100_i64 * 365 * 24 * 60 * 60 * 1000).to_string(),
+    );
+    persist_policy(&source)?;
+    settings.anchor_ms = None;
+    let first_anchor = now_ms()?;
+    let second_anchor = first_anchor + 2_000;
+    let retention = settings.vacuum_retention_ms;
+    let physical_mtime = first_anchor - retention + 1_000;
+    let data_dir = root.path().join("events");
+    let parquet_path = std::fs::read_dir(&data_dir)?
+        .flat_map(|entry| {
+            let path = entry.ok()?.path();
+            (path.is_dir()).then(|| std::fs::read_dir(path).ok()).flatten()
+        })
+        .flatten()
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.extension().is_some_and(|extension| extension == "parquet"))
+        .ok_or_else(|| anyhow!("active Parquet file"))?;
+    let modified = std::time::UNIX_EPOCH + Duration::from_millis(u64::try_from(physical_mtime)?);
+    std::fs::File::open(&parquet_path)?.set_times(std::fs::FileTimes::new().set_modified(modified))?;
+    let discovery = AdvancingClock {
+        source,
+        anchors: [first_anchor, second_anchor],
+        calls: AtomicUsize::new(0),
+    };
+    let before = inventory(root.path())?;
+    let results = run_cycle_with_discovery(
+        &settings,
+        &discovery,
+        &Metrics::new(),
+        &Arc::new(AtomicBool::new(false)),
+    )?;
+    assert_eq!(discovery.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].operation, Operation::Purge);
+    assert!(results[0].negative_probe, "purge remains not due");
+    assert_eq!(results[1].operation, Operation::Vacuum);
+    assert!(
+        !results[1].negative_probe,
+        "vacuum crossed its physical-retention boundary"
+    );
+    assert!(results[1].error.is_none(), "{:?}", results[1].error);
+    assert_eq!(
+        results[1].report.as_ref().map(|report| report.outcome),
+        Some(Outcome::Noop)
+    );
+    let after = inventory(root.path())?;
+    let durable_objects = |objects: &FileInventory| {
+        objects
+            .keys()
+            .filter(|path| {
+                path.extension().is_some_and(|extension| extension == "parquet")
+                    || path.to_string_lossy().contains("/_delta_log/")
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        durable_objects(&before),
+        durable_objects(&after),
+        "due vacuum must not delete data or write Delta log actions when no tombstones exist"
+    );
+    let report = results[1]
+        .report
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("vacuum report"))?;
+    assert_eq!(report.version, report.read_version, "no Delta commit");
+    assert_eq!(report.files_deleted, 0);
     Ok(())
 }
 
@@ -609,7 +751,7 @@ fn real_catalog_ddl_discovery_refreshes_policy_without_idle_writes() -> Result<(
         "ALTER TABLE arrowcol.default.events SET TBLPROPERTIES ('arrowcol.optimize.minFiles'='2')".into(),
         None,
     ))?;
-    let stale = CatalogTable(source.table(&names[0])?);
+    let stale = CatalogTable(source.table(&names[0])?, None);
     let after_ddl = inventory(root.path())?;
     let rejected = run_cycle_with_discovery(&settings, &stale, &metrics, &cancel)?;
     assert!(rejected.iter().all(|r| r.error.is_some() && !r.negative_probe));
@@ -659,5 +801,63 @@ fn empty_vacuum_plan_cannot_report_noop_after_a_concurrent_append() -> Result<()
         Some(arrow_deltalake::maintenance::MaintenanceErrorKind::StalePlan)
     );
     assert_eq!(before, inventory(root.path())?);
+    Ok(())
+}
+
+#[test]
+fn optimize_upload_mode_is_strict_and_buffer_is_opt_in() -> Result<()> {
+    assert_eq!(
+        "put_create".parse::<OptimizeUploadMode>()?,
+        OptimizeUploadMode::PutCreate
+    );
+    assert_eq!(
+        "buffered_multipart".parse::<OptimizeUploadMode>()?,
+        OptimizeUploadMode::BufferedMultipart
+    );
+    assert!("stream".parse::<OptimizeUploadMode>().is_err());
+    let (_root, mut settings, _) = fixture()?;
+    settings.operation_limits.optimize_upload_buffer_bytes = Some(8 * 1024 * 1024);
+    assert!(settings.validate().is_err());
+    settings.operation_limits.optimize_upload_mode = OptimizeUploadMode::BufferedMultipart;
+    for value in [4 * 1024 * 1024, 8 * 1024 * 1024, 64 * 1024 * 1024] {
+        settings.operation_limits.optimize_upload_buffer_bytes = Some(value);
+        settings.validate()?;
+    }
+    settings.operation_limits.optimize_upload_buffer_bytes = None;
+    settings.validate()?;
+    for value in [0, 4 * 1024 * 1024 - 1, 64 * 1024 * 1024 + 1] {
+        settings.operation_limits.optimize_upload_buffer_bytes = Some(value);
+        assert!(settings.validate().is_err());
+    }
+    Ok(())
+}
+
+#[test]
+fn startup_readback_reports_effective_optimize_upload_settings() -> Result<()> {
+    let (_root, mut settings, _) = fixture()?;
+    let readback = startup_configuration(&settings)?;
+    assert_eq!(readback["optimize_upload"]["mode"], "put_create");
+    assert!(readback["optimize_upload"]["buffer_bytes_requested"].is_null());
+    assert!(readback["optimize_upload"]["buffer_bytes_effective"].is_null());
+
+    settings.operation_limits.optimize_upload_mode = OptimizeUploadMode::BufferedMultipart;
+    let readback = startup_configuration(&settings)?;
+    assert_eq!(readback["optimize_upload"]["mode"], "buffered_multipart");
+    assert!(readback["optimize_upload"]["buffer_bytes_requested"].is_null());
+    assert_eq!(
+        readback["optimize_upload"]["buffer_bytes_effective"].as_u64(),
+        Some(8 * 1024 * 1024)
+    );
+
+    settings.operation_limits.optimize_upload_buffer_bytes = Some(16 * 1024 * 1024);
+    let readback = startup_configuration(&settings)?;
+    assert_eq!(
+        readback["optimize_upload"]["buffer_bytes_requested"].as_u64(),
+        Some(16 * 1024 * 1024)
+    );
+    assert_eq!(
+        readback["optimize_upload"]["buffer_bytes_effective"].as_u64(),
+        Some(16 * 1024 * 1024)
+    );
     Ok(())
 }

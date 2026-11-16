@@ -7,9 +7,9 @@ pub mod catalog;
 use anyhow::{Context, Result, bail};
 use arrow_deltalake::delta::DeltaTable;
 use arrow_deltalake::maintenance::{
-    Granularity, MaintenanceControl, MaintenanceError, MaintenanceErrorKind, MaintenancePlan, MaintenanceReport,
-    NegativeProbeConfig, OptimizeConfig, OptimizePlan, Outcome, ProbeOperation, PruneConfig, PurgeConfig, VacuumConfig,
-    error_details, now_ms,
+    DEFAULT_OPTIMIZE_UPLOAD_BUFFER_BYTES, Granularity, MaintenanceControl, MaintenanceError, MaintenanceErrorKind,
+    MaintenancePlan, MaintenanceReport, NegativeProbeConfig, OptimizeConfig, OptimizePlan, Outcome, PassProbeInventory,
+    ProbeOperation, PruneConfig, PurgeConfig, TableFingerprint, VacuumConfig, error_details, now_ms,
 };
 use arrowcol_props::{PropValue, ResolvedProps, resolve};
 use serde::Serialize;
@@ -62,11 +62,36 @@ impl Operation {
     }
 }
 
+/// OPTIMIZE's upload path. Buffered multipart cannot provide atomic create-only writes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OptimizeUploadMode {
+    /// Preserve the original single-object conditional create.
+    #[default]
+    PutCreate,
+    /// Opt in to bounded multipart upload to UUID-named outputs.
+    BufferedMultipart,
+}
+
+impl std::str::FromStr for OptimizeUploadMode {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "put_create" => Ok(Self::PutCreate),
+            "buffered_multipart" => Ok(Self::BufferedMultipart),
+            _ => bail!("invalid OPTIMIZE upload mode {value:?}; expected put_create or buffered_multipart"),
+        }
+    }
+}
+
 /// Process-level bounds for existing non-OPTIMIZE operations.
 #[derive(Clone, Debug, Serialize)]
 pub struct OperationLimits {
     pub purge_max_files_per_commit: usize,
     pub purge_max_plan_bytes: usize,
+    pub optimize_upload_mode: OptimizeUploadMode,
+    pub optimize_upload_buffer_bytes: Option<usize>,
     pub vacuum_delete_chunk: usize,
     pub vacuum_max_plan_bytes: usize,
     pub replay_max_log_files: usize,
@@ -82,6 +107,8 @@ impl Default for OperationLimits {
         Self {
             purge_max_files_per_commit: 10_000,
             purge_max_plan_bytes: 4 * 1024 * 1024,
+            optimize_upload_mode: OptimizeUploadMode::PutCreate,
+            optimize_upload_buffer_bytes: None,
             vacuum_delete_chunk: 256,
             vacuum_max_plan_bytes: 8 * 1024 * 1024,
             replay_max_log_files: 100_000,
@@ -167,6 +194,21 @@ impl Settings {
             bail!("--max-prune-files must be nonzero");
         }
         let limits = &self.operation_limits;
+        if limits.optimize_upload_mode == OptimizeUploadMode::PutCreate && limits.optimize_upload_buffer_bytes.is_some()
+        {
+            bail!("OPTIMIZE upload buffer applies only to buffered_multipart mode");
+        }
+        if limits.optimize_upload_mode == OptimizeUploadMode::BufferedMultipart {
+            let buffer_bytes = limits
+                .optimize_upload_buffer_bytes
+                .unwrap_or(DEFAULT_OPTIMIZE_UPLOAD_BUFFER_BYTES);
+            if !(arrow_deltalake::maintenance::MIN_OPTIMIZE_UPLOAD_BUFFER_BYTES
+                ..=arrow_deltalake::maintenance::MAX_OPTIMIZE_UPLOAD_BUFFER_BYTES)
+                .contains(&buffer_bytes)
+            {
+                bail!("OPTIMIZE upload buffer must be within 4..=64 MiB");
+            }
+        }
         if limits.purge_max_files_per_commit == 0
             || limits.purge_max_plan_bytes < 1024
             || limits.vacuum_delete_chunk == 0
@@ -252,6 +294,34 @@ pub trait TableDiscovery: Sync {
     /// # Errors
     /// Returns missing-table, corrupt metadata or authority failures.
     fn table(&self, name: &str) -> Result<DiscoveredTable>;
+
+    /// Return the wall-clock anchor for the current operation.
+    ///
+    /// Tests and custom discovery implementations may provide a deterministic clock.
+    ///
+    /// # Errors
+    /// Returns clock acquisition failures.
+    fn maintenance_now_ms(&self) -> Result<i64> {
+        now_ms()
+    }
+
+    /// Open the read-only table transport used by maintenance probes.
+    ///
+    /// Implementations may override this to provide an instrumented store.
+    ///
+    /// # Errors
+    /// Returns table access and bounded probe setup failures.
+    fn open_probe_table(&self, url: &Url, max_log_files: usize) -> Result<Arc<DeltaTable>> {
+        DeltaTable::open_for_maintenance_probe_with_limit(url, max_log_files)
+    }
+
+    /// Open the table used by a full maintenance planner.
+    ///
+    /// # Errors
+    /// Returns table access and snapshot loading failures.
+    fn open_maintenance_table(&self, url: &Url) -> Result<Arc<DeltaTable>> {
+        DeltaTable::open_for_maintenance(url)
+    }
 
     /// Return allowlisted tables that are not ready for maintenance yet.
     ///
@@ -781,6 +851,15 @@ fn configuration_evidence(startup: &Settings, settings: &Settings, props: &Resol
     } else {
         "disabled"
     };
+    let optimize_upload_buffer_bytes_effective = match startup.operation_limits.optimize_upload_mode {
+        OptimizeUploadMode::PutCreate => None,
+        OptimizeUploadMode::BufferedMultipart => Some(
+            startup
+                .operation_limits
+                .optimize_upload_buffer_bytes
+                .unwrap_or(DEFAULT_OPTIMIZE_UPLOAD_BUFFER_BYTES),
+        ),
+    };
     Ok(serde_json::json!({
         "startup": {
             "apply": startup.apply,
@@ -803,6 +882,11 @@ fn configuration_evidence(startup: &Settings, settings: &Settings, props: &Resol
         },
         "table_policy": policy,
         "parquet_writer_overrides": arrow_deltalake::writer::process_config()?,
+        "optimize_upload": {
+            "mode": startup.operation_limits.optimize_upload_mode,
+            "buffer_bytes_requested": startup.operation_limits.optimize_upload_buffer_bytes,
+            "buffer_bytes_effective": optimize_upload_buffer_bytes_effective,
+        },
         "active": enabled,
         "operation_settings": enabled.then(|| serde_json::json!({
             "layout_mode": layout_mode,
@@ -873,6 +957,8 @@ pub struct OperationResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub duration_ms: u64,
+    pub probe_duration_ms: u64,
+    pub plan_apply_duration_ms: u64,
 }
 
 /// Effective VACUUM retention and the caller's per-invocation acknowledgements.
@@ -901,6 +987,7 @@ impl OptimizeEvidence {
                 "target_file_bytes": config.target_file_bytes,
                 "small_file_bytes": config.small_file_bytes,
                 "max_files_per_bin": config.max_files_per_bin,
+                "min_files_per_bin": config.min_files_per_bin,
                 "max_bins_per_commit": config.max_bins_per_commit,
                 "max_actions_per_commit": config.max_actions_per_commit,
                 "max_plan_bytes": config.max_plan_bytes,
@@ -1191,14 +1278,11 @@ fn run_operation(
     settings: &Settings,
     table: &DeltaTable,
     operation: Operation,
+    anchor: i64,
     control: &MaintenanceControl,
     optimize: &mut Option<OptimizeEvidence>,
     props: &ResolvedProps,
 ) -> Result<MaintenanceReport> {
-    let anchor = match settings.anchor_ms {
-        Some(anchor) => anchor,
-        None => now_ms()?,
-    };
     let plan = match operation {
         Operation::Checkpoint => {
             return table.checkpoint_if_due(settings.checkpoint_every_commits, settings.apply);
@@ -1224,14 +1308,30 @@ fn run_operation(
             let config = OptimizeConfig {
                 granularity: settings.granularity,
                 now_ms: Some(anchor),
+                min_files_per_bin: usize::try_from(props.unsigned("arrowcol.optimize.minFiles")?)?,
                 ..settings.optimize.clone()
             };
-            let mut prepared = table.prepare_optimize(&config)?;
-            let minimum = usize::try_from(props.unsigned("arrowcol.optimize.minFiles")?)?;
-            prepared.plan.bins.retain(|bin| bin.files.len() >= minimum);
+            let prepared = table.prepare_optimize(&config)?;
             *optimize = Some(OptimizeEvidence::new(&config, prepared.plan.clone()));
             if settings.apply && (!prepared.plan.bins.is_empty() || config.sealed_final) {
-                return table.apply_prepared_optimize(&prepared, &config, control);
+                let upload_buffer_bytes =
+                    if settings.operation_limits.optimize_upload_mode == OptimizeUploadMode::BufferedMultipart {
+                        Some(
+                            settings
+                                .operation_limits
+                                .optimize_upload_buffer_bytes
+                                .unwrap_or(DEFAULT_OPTIMIZE_UPLOAD_BUFFER_BYTES),
+                        )
+                    } else {
+                        None
+                    };
+                return table.apply_prepared_optimize_with_writer_config(
+                    &prepared,
+                    &config,
+                    control,
+                    upload_buffer_bytes,
+                    arrow_deltalake::writer::process_config()?,
+                );
             }
             MaintenancePlan::Optimize(prepared.plan)
         }
@@ -1244,10 +1344,22 @@ fn run_operation(
                 max_active_files: settings.operation_limits.operation_max_active_files,
                 ..PurgeConfig::new(retention, anchor, granularity)
             };
-            let prepared = table.prepare_purge(&config)?;
             if settings.apply {
-                return table.apply_prepared_purge(&prepared, &config, control);
+                let mut expected_fingerprint = None;
+                return retry_stale_purge(
+                    settings.commit_attempts,
+                    settings.commit_budget,
+                    control,
+                    |attempt_control| {
+                        attempt_control.check()?;
+                        let prepared = table.prepare_purge(&config)?;
+                        require_purge_fingerprint(&mut expected_fingerprint, &prepared.plan.header.fingerprint)?;
+                        attempt_control.check()?;
+                        table.apply_prepared_purge(&prepared, &config, attempt_control)
+                    },
+                );
             }
+            let prepared = table.prepare_purge(&config)?;
             MaintenancePlan::Purge(prepared.plan)
         }
         Operation::Vacuum => {
@@ -1282,6 +1394,349 @@ fn negative_probe_result<T>(result: Result<Option<T>>) -> Result<(Option<T>, boo
 
 fn is_stale_plan(error: &anyhow::Error) -> bool {
     error_details(error).is_some_and(|details| details.kind == MaintenanceErrorKind::StalePlan)
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PurgeRetryCounters {
+    attempts: u32,
+    collisions: u32,
+    retries: u32,
+    replans: u32,
+}
+
+impl PurgeRetryCounters {
+    fn include(&mut self, report: &MaintenanceReport) {
+        self.attempts = self.attempts.saturating_add(report.attempts);
+        self.collisions = self.collisions.saturating_add(report.collisions);
+        self.retries = self.retries.saturating_add(report.retries);
+        self.replans = self.replans.saturating_add(report.replans);
+    }
+
+    fn write_to(self, report: &mut MaintenanceReport) {
+        report.attempts = report.attempts.saturating_add(self.attempts);
+        report.collisions = report.collisions.saturating_add(self.collisions);
+        report.retries = report.retries.saturating_add(self.retries);
+        report.replans = report.replans.saturating_add(self.replans);
+    }
+}
+
+fn require_purge_fingerprint(expected: &mut Option<TableFingerprint>, current: &TableFingerprint) -> Result<()> {
+    if expected.as_ref().is_some_and(|fingerprint| fingerprint != current) {
+        return Err(anyhow::Error::new(MaintenanceError {
+            kind: MaintenanceErrorKind::MetadataChanged,
+            message: "table metadata changed while replanning PURGE".to_owned(),
+            report: None,
+        }));
+    }
+    expected.get_or_insert_with(|| current.clone());
+    Ok(())
+}
+
+fn retry_stale_purge(
+    max_attempts: u32,
+    budget: Duration,
+    control: &MaintenanceControl,
+    mut apply: impl FnMut(&MaintenanceControl) -> Result<MaintenanceReport>,
+) -> Result<MaintenanceReport> {
+    let started = Instant::now();
+    let max_attempts = max_attempts.max(1);
+    let mut retries = 0;
+    let mut counters = PurgeRetryCounters::default();
+    loop {
+        control
+            .check()
+            .map_err(|error| with_purge_retry_counts(error, counters))?;
+        let remaining_budget = budget.saturating_sub(started.elapsed());
+        let remaining_attempts = max_attempts.saturating_sub(counters.attempts);
+        if remaining_attempts == 0 {
+            return Err(purge_retry_budget_error(
+                counters,
+                MaintenanceErrorKind::Exhausted,
+                "PURGE commit-attempt budget exhausted while replanning",
+            ));
+        }
+        if remaining_budget.is_zero() {
+            return Err(purge_retry_budget_error(
+                counters,
+                MaintenanceErrorKind::DeadlineExceeded,
+                "PURGE end-to-end retry budget expired",
+            ));
+        }
+        let attempt_control = control
+            .clone()
+            .with_deadline(started + budget)
+            .with_commit_retry_limits(remaining_attempts, remaining_budget)?;
+        match apply(&attempt_control) {
+            Ok(mut report) => {
+                counters.write_to(&mut report);
+                return Ok(report);
+            }
+            Err(error) => {
+                if let Some(report) = error_details(&error).and_then(|details| details.report.as_deref()) {
+                    counters.include(report);
+                }
+                if !is_purge_membership_stale(&error) {
+                    return Err(with_purge_retry_counts(error, counters));
+                }
+                counters.replans = counters.replans.saturating_add(1);
+                let backoff = Duration::from_millis(5_u64 << retries.min(5));
+                if counters.attempts >= max_attempts {
+                    return Err(with_purge_retry_counts(error, counters));
+                }
+                if started.elapsed().saturating_add(backoff) >= budget {
+                    return Err(purge_retry_budget_error(
+                        counters,
+                        MaintenanceErrorKind::DeadlineExceeded,
+                        "PURGE end-to-end retry budget expired during membership replan",
+                    ));
+                }
+                retries += 1;
+                std::thread::sleep(backoff);
+            }
+        }
+    }
+}
+
+fn is_purge_membership_stale(error: &anyhow::Error) -> bool {
+    error_details(error).is_some_and(|details| {
+        details.kind == MaintenanceErrorKind::StalePlan
+            && matches!(
+                details.message.as_str(),
+                "planned partition is now the newest partition" | "expired partitions changed since planning; replan"
+            )
+    })
+}
+
+fn with_purge_retry_counts(error: anyhow::Error, counters: PurgeRetryCounters) -> anyhow::Error {
+    let Some(details) = error_details(&error) else {
+        return error.context(format!(
+            "PURGE retries: attempts={}, collisions={}, commit_retries={}, replans={}",
+            counters.attempts, counters.collisions, counters.retries, counters.replans
+        ));
+    };
+    let mut report = details
+        .report
+        .as_deref()
+        .map_or_else(MaintenanceReport::default, |report| report.clone());
+    report.operation = "purge".to_owned();
+    report.attempts = counters.attempts;
+    report.collisions = counters.collisions;
+    report.retries = counters.retries;
+    report.replans = counters.replans;
+    anyhow::Error::new(MaintenanceError {
+        kind: details.kind,
+        message: details.message.clone(),
+        report: Some(Box::new(report)),
+    })
+}
+
+fn purge_retry_budget_error(counters: PurgeRetryCounters, kind: MaintenanceErrorKind, message: &str) -> anyhow::Error {
+    let mut report = MaintenanceReport {
+        operation: "purge".to_owned(),
+        ..MaintenanceReport::default()
+    };
+    report.attempts = counters.attempts;
+    report.collisions = counters.collisions;
+    report.retries = counters.retries;
+    report.replans = counters.replans;
+    anyhow::Error::new(MaintenanceError {
+        kind,
+        message: message.to_owned(),
+        report: Some(Box::new(report)),
+    })
+}
+
+#[cfg(test)]
+mod purge_replan_tests {
+    use super::*;
+
+    fn membership_stale(report: MaintenanceReport) -> anyhow::Error {
+        anyhow::Error::new(MaintenanceError {
+            kind: MaintenanceErrorKind::StalePlan,
+            message: "expired partitions changed since planning; replan".to_owned(),
+            report: Some(Box::new(report)),
+        })
+    }
+
+    fn fingerprint(policy: &str) -> TableFingerprint {
+        TableFingerprint {
+            table_id: "table-id".to_owned(),
+            schema_string: "{}".to_owned(),
+            partition_columns: vec!["ingestion".to_owned()],
+            configuration: BTreeMap::from([("maintenance.policy".to_owned(), policy.to_owned())]),
+            min_reader_version: 1,
+            min_writer_version: 2,
+            reader_features: None,
+            writer_features: None,
+        }
+    }
+
+    fn report(attempts: u32) -> MaintenanceReport {
+        MaintenanceReport {
+            operation: "purge".to_owned(),
+            attempts,
+            ..MaintenanceReport::default()
+        }
+    }
+
+    fn require_error<T>(result: Result<T>, message: &str) -> Result<anyhow::Error> {
+        match result {
+            Err(error) => Ok(error),
+            Ok(_) => Err(anyhow::anyhow!("{message}")),
+        }
+    }
+
+    #[test]
+    fn purge_replans_after_collision_and_keeps_replan_count_separate() -> Result<()> {
+        let calls = std::cell::Cell::new(0);
+        let mut collided = report(2);
+        collided.collisions = 1;
+        collided.retries = 1;
+        let result = retry_stale_purge(4, Duration::from_secs(1), &MaintenanceControl::default(), |_| {
+            let call = calls.get() + 1;
+            calls.set(call);
+            if call == 1 {
+                return Err(membership_stale(collided.clone()));
+            }
+            Ok(report(1))
+        })?;
+
+        assert_eq!(calls.get(), 2);
+        assert_eq!(result.attempts, 3);
+        assert_eq!(result.collisions, 1);
+        assert_eq!(result.retries, 1);
+        assert_eq!(result.replans, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn purge_replanning_is_bounded_by_total_publish_attempts() -> Result<()> {
+        let calls = std::cell::Cell::new(0);
+        let error = require_error(
+            retry_stale_purge(2, Duration::from_secs(1), &MaintenanceControl::default(), |_| {
+                calls.set(calls.get() + 1);
+                Err(membership_stale(report(1)))
+            }),
+            "persistent membership churn must exhaust its attempt budget",
+        )?;
+
+        assert_eq!(calls.get(), 2);
+        let details = error_details(&error).ok_or_else(|| anyhow::anyhow!("classified maintenance error"))?;
+        assert_eq!(details.kind, MaintenanceErrorKind::StalePlan);
+        let report = details
+            .report
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("aggregated counters"))?;
+        assert_eq!(report.attempts, 2);
+        assert_eq!(report.replans, 2);
+        assert_eq!(report.retries, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn purge_policy_change_after_membership_stale_is_a_hard_failure() -> Result<()> {
+        let calls = std::cell::Cell::new(0);
+        let applies = std::cell::Cell::new(0);
+        let mut expected = None;
+        let error = require_error(
+            retry_stale_purge(4, Duration::from_secs(1), &MaintenanceControl::default(), |_| {
+                let call = calls.get() + 1;
+                calls.set(call);
+                let current = if call == 1 {
+                    fingerprint("retention=30d")
+                } else {
+                    fingerprint("retention=90d")
+                };
+                require_purge_fingerprint(&mut expected, &current)?;
+                applies.set(applies.get() + 1);
+                if call == 1 {
+                    Err(membership_stale(report(1)))
+                } else {
+                    Ok(report(1))
+                }
+            }),
+            "changed policy must not be adopted by a replan",
+        )?;
+
+        assert_eq!(calls.get(), 2);
+        assert_eq!(applies.get(), 1, "the changed-policy plan must not be applied");
+        let details = error_details(&error).ok_or_else(|| anyhow::anyhow!("classified metadata error"))?;
+        assert_eq!(details.kind, MaintenanceErrorKind::MetadataChanged);
+        let report = details
+            .report
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("first attempt counters"))?;
+        assert_eq!(report.attempts, 1);
+        assert_eq!(report.replans, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn purge_deadline_includes_membership_backoff() -> Result<()> {
+        let calls = std::cell::Cell::new(0);
+        let error = require_error(
+            retry_stale_purge(4, Duration::from_millis(1), &MaintenanceControl::default(), |_| {
+                calls.set(calls.get() + 1);
+                Err(membership_stale(report(1)))
+            }),
+            "the shared budget cannot fit another replan",
+        )?;
+
+        assert_eq!(calls.get(), 1);
+        let details = error_details(&error).ok_or_else(|| anyhow::anyhow!("classified deadline error"))?;
+        assert_eq!(details.kind, MaintenanceErrorKind::DeadlineExceeded);
+        let report = details
+            .report
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("attempt counters"))?;
+        assert_eq!(report.attempts, 1);
+        assert_eq!(report.replans, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn purge_preparation_consumes_the_shared_retry_deadline() -> Result<()> {
+        let calls = std::cell::Cell::new(0);
+        let error = require_error(
+            retry_stale_purge(
+                4,
+                Duration::from_millis(1),
+                &MaintenanceControl::default(),
+                |attempt_control| {
+                    calls.set(calls.get() + 1);
+                    std::thread::sleep(Duration::from_millis(2));
+                    attempt_control.check()?;
+                    Ok(report(1))
+                },
+            ),
+            "slow preparation must consume the shared deadline",
+        )?;
+
+        assert_eq!(calls.get(), 1);
+        let details = error_details(&error).ok_or_else(|| anyhow::anyhow!("classified deadline error"))?;
+        assert_eq!(details.kind, MaintenanceErrorKind::DeadlineExceeded);
+        Ok(())
+    }
+
+    #[test]
+    fn purge_does_not_replan_for_other_stale_reasons() -> Result<()> {
+        let calls = std::cell::Cell::new(0);
+        let error = require_error(
+            retry_stale_purge(4, Duration::from_secs(1), &MaintenanceControl::default(), |_| {
+                calls.set(calls.get() + 1);
+                Err(anyhow::Error::new(MaintenanceError {
+                    kind: MaintenanceErrorKind::StalePlan,
+                    message: "plan cutoff is later than the apply configuration allows".to_owned(),
+                    report: None,
+                }))
+            }),
+            "retention changes must remain a hard stale-plan failure",
+        )?;
+
+        assert_eq!(calls.get(), 1);
+        assert!(is_stale_plan(&error));
+        Ok(())
+    }
 }
 
 fn retry_stale_table_discovery<T>(table: &str, mut discover: impl FnMut() -> Result<T>) -> Result<T> {
@@ -1331,7 +1786,7 @@ fn maintain_table(
             schedule.insert(name.into(), (now, policy));
         }
         let limits = &settings.operation_limits;
-        let probe = DeltaTable::open_for_maintenance_probe_with_limit(&discovered.url, limits.discovery_max_log_files)?;
+        let probe = discovery.open_probe_table(&discovered.url, limits.discovery_max_log_files)?;
         let token = probe.probe_log_token(limits.discovery_max_log_files)?;
         if discovered.log_token.as_ref().is_none_or(|previous| *previous != token)
             && !policy_matches(
@@ -1361,6 +1816,7 @@ fn maintain_table(
         _ => &settings.operations,
     };
     let mut table = None;
+    let mut inventory = PassProbeInventory::default();
     let mut observed_token = match &setup {
         Ok(Some((discovered, _, _, _, _))) => discovered.log_token.clone(),
         _ => None,
@@ -1375,82 +1831,102 @@ fn maintain_table(
         let started = Instant::now();
         let mut optimize = None;
         let mut negative_probe = false;
+        let mut probe_duration_ms = 0;
+        let mut plan_apply_duration_ms = 0;
         let effective = match &setup {
             Ok(Some((_, effective, _, _, _))) => effective,
             _ => settings,
         };
         let outcome = match &setup {
             Ok(Some((discovered, effective, props, probe, _))) => (|| {
+                let anchor = match effective.anchor_ms {
+                    Some(anchor) => anchor,
+                    None => discovery.maintenance_now_ms()?,
+                };
                 let control = MaintenanceControl::new(Arc::clone(cancel), Some(started + effective.operation_timeout))
                     .with_commit_retry_limits(effective.commit_attempts, effective.commit_budget)?;
-                let token = probe.probe_log_token(settings.operation_limits.discovery_max_log_files)?;
-                if observed_token.as_ref().is_some_and(|previous| *previous != token)
-                    && !policy_matches(
-                        settings,
-                        &probe.maintenance_properties_with_limits(
-                            settings.operation_limits.discovery_max_log_files,
-                            settings.operation_limits.discovery_max_log_file_bytes,
-                        )?,
-                        props,
-                    )?
-                {
-                    bail!("table properties changed during the maintenance pass; retry discovery");
-                }
-                observed_token = Some(token);
-                let anchor = effective.anchor_ms.map_or_else(now_ms, Ok)?;
-                let config = NegativeProbeConfig {
-                    now_ms: anchor,
-                    granularity: effective.granularity.context("effective partition granularity")?,
-                    purge_retention_ms: effective.purge_retention_ms.context("effective purge retention")?,
-                    vacuum_retention_ms: effective.vacuum_retention_ms,
-                    log_retention_ms: effective
-                        .log_retention_ms
-                        .unwrap_or(arrow_deltalake::maintenance::DEFAULT_LOG_RETENTION_MS),
-                    checkpoint_interval: effective.checkpoint_every_commits,
-                    optimize_small_file_bytes: effective.optimize.small_file_bytes,
-                    optimize_min_files: usize::try_from(props.unsigned("arrowcol.optimize.minFiles")?)?,
-                    sealed_partitions_only: !effective.optimize.sealed_final,
-                    max_listed_files: usize::try_from(props.unsigned("arrowcol.vacuum.maxListedFiles")?)?,
-                };
-                let probe_operation = match operation {
-                    Operation::Purge => ProbeOperation::Purge,
-                    Operation::Optimize => ProbeOperation::Optimize,
-                    Operation::Vacuum => ProbeOperation::Vacuum,
-                    Operation::Checkpoint => ProbeOperation::Checkpoint,
-                    Operation::PruneLog => ProbeOperation::PruneLog,
-                };
-                let full_validation = (operation == Operation::Optimize && effective.optimize.sealed_final)
-                    || (operation == Operation::Vacuum
-                        && effective.vacuum_retention_ms < arrow_deltalake::maintenance::MIN_VACUUM_RETENTION_MS)
-                    || (operation == Operation::PruneLog
-                        && effective.log_retention_ms.is_some_and(|retention| {
-                            retention < arrow_deltalake::maintenance::MIN_VACUUM_RETENTION_MS
-                        }));
-                if !full_validation {
-                    let (report, stale) =
-                        negative_probe_result(probe.probe_no_work(probe_operation, &config, &control))?;
+                let probe_started = Instant::now();
+                let probe_result = (|| -> Result<Option<MaintenanceReport>> {
+                    let token = probe.probe_log_token(settings.operation_limits.discovery_max_log_files)?;
+                    if observed_token.as_ref().is_some_and(|previous| *previous != token)
+                        && !policy_matches(
+                            settings,
+                            &probe.maintenance_properties_with_limits(
+                                settings.operation_limits.discovery_max_log_files,
+                                settings.operation_limits.discovery_max_log_file_bytes,
+                            )?,
+                            props,
+                        )?
+                    {
+                        bail!("table properties changed during the maintenance pass; retry discovery");
+                    }
+                    observed_token = Some(token);
+                    let config = NegativeProbeConfig {
+                        now_ms: anchor,
+                        granularity: effective.granularity.context("effective partition granularity")?,
+                        purge_retention_ms: effective.purge_retention_ms.context("effective purge retention")?,
+                        vacuum_retention_ms: effective.vacuum_retention_ms,
+                        log_retention_ms: effective
+                            .log_retention_ms
+                            .unwrap_or(arrow_deltalake::maintenance::DEFAULT_LOG_RETENTION_MS),
+                        checkpoint_interval: effective.checkpoint_every_commits,
+                        optimize_small_file_bytes: effective.optimize.small_file_bytes,
+                        optimize_min_files: usize::try_from(props.unsigned("arrowcol.optimize.minFiles")?)?,
+                        sealed_partitions_only: !effective.optimize.sealed_final,
+                        max_listed_files: usize::try_from(props.unsigned("arrowcol.vacuum.maxListedFiles")?)?,
+                    };
+                    let probe_operation = match operation {
+                        Operation::Purge => ProbeOperation::Purge,
+                        Operation::Optimize => ProbeOperation::Optimize,
+                        Operation::Vacuum => ProbeOperation::Vacuum,
+                        Operation::Checkpoint => ProbeOperation::Checkpoint,
+                        Operation::PruneLog => ProbeOperation::PruneLog,
+                    };
+                    let full_validation = (operation == Operation::Optimize && effective.optimize.sealed_final)
+                        || (operation == Operation::Vacuum
+                            && effective.vacuum_retention_ms < arrow_deltalake::maintenance::MIN_VACUUM_RETENTION_MS)
+                        || (operation == Operation::PruneLog
+                            && effective.log_retention_ms.is_some_and(|retention| {
+                                retention < arrow_deltalake::maintenance::MIN_VACUUM_RETENTION_MS
+                            }));
+                    if full_validation {
+                        return Ok(None);
+                    }
+                    let (report, stale) = negative_probe_result(probe.probe_no_work_with_inventory(
+                        probe_operation,
+                        &config,
+                        &control,
+                        &mut inventory,
+                    ))?;
                     if stale {
                         eprintln!(
                             "delta-maintenance negative probe became stale; using full planner table={name} operation={}",
                             operation.label()
                         );
                     }
-                    if let Some(report) = report {
-                        negative_probe = true;
-                        return Ok(report);
-                    }
+                    Ok(report)
+                })();
+                probe_duration_ms = u64::try_from(probe_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                if let Some(report) = probe_result? {
+                    negative_probe = true;
+                    return Ok(report);
                 }
+                let planner_started = Instant::now();
                 if table.is_none() {
-                    table = Some(DeltaTable::open_for_maintenance(&discovered.url)?);
+                    table = Some(discovery.open_maintenance_table(&discovered.url)?);
                 }
-                run_operation(
+                inventory.invalidate();
+                let report = run_operation(
                     effective,
                     table.as_ref().context("maintenance table")?,
                     operation,
+                    anchor,
                     &control,
                     &mut optimize,
                     props,
-                )
+                );
+                plan_apply_duration_ms = u64::try_from(planner_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                report
             })(),
             Err(error) => Err(anyhow::anyhow!("discovery/configuration failed: {error:#}")),
             Ok(None) => unreachable!(),
@@ -1470,6 +1946,8 @@ fn maintain_table(
             error_kind: None,
             error: None,
             duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            probe_duration_ms,
+            plan_apply_duration_ms,
         };
         match outcome {
             Ok(report) => result.report = Some(report),
@@ -1545,6 +2023,8 @@ fn discovery_failure(settings: &Settings, error: anyhow::Error) -> OperationResu
         error_kind: Some("failure"),
         error: Some(format!("{error:#}")),
         duration_ms: 0,
+        probe_duration_ms: 0,
+        plan_apply_duration_ms: 0,
     }
 }
 
@@ -1726,6 +2206,8 @@ mod signal_cancellation_tests {
             error_kind,
             error: error_kind.map(|_| "operation failed".to_owned()),
             duration_ms: 0,
+            probe_duration_ms: 0,
+            plan_apply_duration_ms: 0,
         }
     }
 

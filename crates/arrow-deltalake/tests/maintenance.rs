@@ -9,8 +9,9 @@ use arrow_deltalake::delta::{
 };
 use arrow_deltalake::layout::LayoutPolicy;
 use arrow_deltalake::maintenance::{
-    DISPOSABLE_TEST_MARKER, Granularity, LogFloor, MaintenanceControl, MaintenanceErrorKind, MaintenancePlan,
-    OptimizeConfig, Outcome, PruneConfig, PurgeConfig, VacuumConfig, error_kind, now_ms,
+    CompactionDebtSource, DISPOSABLE_TEST_MARKER, Granularity, LogFloor, MaintenanceControl, MaintenanceErrorKind,
+    MaintenancePlan, NegativeProbeConfig, OptimizeConfig, Outcome, PassProbeInventory, ProbeOperation, PruneConfig,
+    PurgeConfig, VacuumConfig, error_kind, now_ms,
 };
 use async_trait::async_trait;
 use delta_kernel::object_store::{
@@ -26,7 +27,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use url::Url;
 
 const BASE: i64 = 1_704_067_200_000;
@@ -111,6 +112,233 @@ fn optimize_config() -> OptimizeConfig {
     }
 }
 
+#[test]
+fn compaction_debt_evidence_distinguishes_zero_from_bounded_backlog() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let table = create(root.path())?;
+    append(&table, 0, 0..3)?;
+    append(&table, 1, 100..103)?;
+    let maintenance = DeltaTable::open_for_maintenance(&url_of(root.path())?)?;
+    let anchor = BASE + 60 * MINUTE;
+    let probe = NegativeProbeConfig {
+        now_ms: anchor,
+        granularity: Granularity::Minute,
+        purge_retention_ms: 2_592_000_000,
+        vacuum_retention_ms: 604_800_000,
+        log_retention_ms: 2_592_000_000,
+        checkpoint_interval: 100,
+        optimize_small_file_bytes: 64 * 1024 * 1024,
+        optimize_min_files: 2,
+        sealed_partitions_only: true,
+        max_listed_files: 1000,
+    };
+    let zero = maintenance
+        .probe_no_work(ProbeOperation::Optimize, &probe, &control())?
+        .context("complete bounded inventory proves no eligible compaction")?;
+    let zero_debt = zero.compaction_debt.context("available zero-debt evidence")?;
+    assert_eq!(zero_debt.source, CompactionDebtSource::BoundedPhysicalInventory);
+    assert_eq!(zero_debt.observed_at_ms, anchor);
+    assert_eq!((zero_debt.eligible_files, zero_debt.eligible_bytes), (0, 0));
+
+    for batch in 1..4 {
+        append(&table, 0, batch * 10..batch * 10 + 3)?;
+    }
+    let config = OptimizeConfig {
+        max_files_per_bin: 2,
+        max_bins_per_commit: 1,
+        now_ms: Some(anchor),
+        ..optimize_config()
+    };
+    let plan = maintenance.plan_optimize(&config)?;
+    assert_eq!(plan.bins.len(), 1);
+    assert_eq!(plan.compaction_debt.source, CompactionDebtSource::SnapshotActiveFiles);
+    assert_eq!(plan.compaction_debt.observed_at_ms, anchor);
+    assert_eq!(plan.compaction_debt.eligible_files, 4);
+    assert!(plan.compaction_debt.eligible_bytes > 0);
+    assert_eq!(plan.compaction_debt.backlog_files, 2);
+    assert!(plan.compaction_debt.backlog_bytes > 0);
+    assert_eq!(plan.compaction_debt.oldest_eligible_partition_start_ms, Some(BASE));
+    let report = maintenance.apply_optimize(&plan, &config, &control())?;
+    assert_eq!(report.compaction_debt.as_ref(), Some(&plan.compaction_debt));
+    Ok(())
+}
+
+#[test]
+fn optimize_final_debt_fields_are_included_in_plan_size_bound() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let table = create(root.path())?;
+    for batch in 0..4 {
+        append(&table, 0, batch * 10..batch * 10 + 3)?;
+    }
+    append(&table, 1, 100..103)?;
+    append(&table, 1, 110..113)?;
+    let maintenance = DeltaTable::open_for_maintenance(&url_of(root.path())?)?;
+    let anchor = BASE + 60 * MINUTE;
+    let base_config = OptimizeConfig {
+        max_files_per_bin: 2,
+        max_bins_per_commit: 1,
+        now_ms: Some(anchor),
+        ..optimize_config()
+    };
+    let unbounded = maintenance.prepare_optimize(&base_config)?;
+    assert_eq!(unbounded.plan.bins.len(), 1);
+    assert!(unbounded.plan.compaction_debt.backlog_files > 0);
+    assert!(unbounded.plan.compaction_debt.backlog_bytes > 0);
+
+    let mut preliminary = unbounded.plan.clone();
+    preliminary.backlog_files = 0;
+    preliminary.compaction_debt.backlog_files = 0;
+    preliminary.compaction_debt.backlog_bytes = 0;
+    let max_plan_bytes = serde_json::to_vec(&preliminary)?.len();
+    let config = OptimizeConfig {
+        max_plan_bytes,
+        ..base_config
+    };
+    let prepared = maintenance.prepare_optimize(&config)?;
+    let encoded = serde_json::to_vec(&prepared.plan)?;
+    assert!(encoded.len() <= max_plan_bytes);
+    assert_eq!(
+        prepared.plan.bins.len(),
+        0,
+        "final backlog fields require trimming the bin"
+    );
+    assert_eq!(
+        prepared.plan.backlog_files,
+        prepared.plan.compaction_debt.eligible_files
+    );
+    assert_eq!(
+        prepared.plan.compaction_debt.backlog_bytes,
+        prepared.plan.compaction_debt.eligible_bytes
+    );
+    let version = maintenance.version()?;
+    let report = maintenance.apply_prepared_optimize(&prepared, &config, &control())?;
+    assert_eq!(report.outcome, Outcome::Noop);
+    assert_eq!(maintenance.version()?, version, "empty bounded plan must not commit");
+    Ok(())
+}
+
+#[test]
+fn pass_inventory_bounds_counted_io_for_all_idle_probes() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let table = create(root.path())?;
+    drop(table);
+
+    let counts = Arc::new(StorageCounts::default());
+    let store = Arc::new(UncertainStore {
+        inner: LocalFileSystem::new(),
+        target: "no-uncertain-commit-in-this-test".to_owned(),
+        unreadable: AtomicBool::new(false),
+        attempts: AtomicUsize::new(0),
+        read_barrier: None,
+        counts: Some(Arc::clone(&counts)),
+    });
+    let maintenance = DeltaTable::open_with_store(root.path(), Arc::clone(&store) as Arc<dyn ObjectStore>)?;
+    counts.reads.store(0, Ordering::SeqCst);
+    counts.lists.store(0, Ordering::SeqCst);
+    counts.writes.store(0, Ordering::SeqCst);
+
+    let config = NegativeProbeConfig {
+        now_ms: BASE + 60 * MINUTE,
+        granularity: Granularity::Minute,
+        purge_retention_ms: 2_592_000_000,
+        vacuum_retention_ms: 604_800_000,
+        log_retention_ms: 2_592_000_000,
+        checkpoint_interval: 100,
+        optimize_small_file_bytes: 64 * 1024 * 1024,
+        optimize_min_files: 2,
+        sealed_partitions_only: false,
+        max_listed_files: 1000,
+    };
+    let mut inventory = PassProbeInventory::default();
+    for operation in [
+        ProbeOperation::Purge,
+        ProbeOperation::Optimize,
+        ProbeOperation::Vacuum,
+        ProbeOperation::Checkpoint,
+        ProbeOperation::PruneLog,
+    ] {
+        maintenance.probe_no_work_with_inventory(operation, &config, &control(), &mut inventory)?;
+    }
+
+    assert_eq!(counts.writes.load(Ordering::SeqCst), 0);
+    assert!(counts.lists.load(Ordering::SeqCst) <= 7, "bounded pass listings");
+    assert!(counts.reads.load(Ordering::SeqCst) <= 12, "bounded pass reads");
+    Ok(())
+}
+
+#[test]
+fn pass_inventory_rechecks_time_based_vacuum_eligibility() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let table = create(root.path())?;
+    append(&table, 0, 0..3)?;
+    drop(table);
+    let old_modified = SystemTime::now()
+        .checked_sub(Duration::from_secs(8 * 24 * 60 * 60))
+        .context("old file timestamp")?;
+    let partition_dir = fs::read_dir(root.path())?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<Vec<_>>>()?
+        .into_iter()
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("__arrowcol_ingestion="))
+        })
+        .context("ingestion partition directory")?;
+    let file = fs::read_dir(partition_dir)?.next().context("partition file")??;
+    fs::File::open(file.path())?.set_modified(old_modified)?;
+
+    let counts = Arc::new(StorageCounts::default());
+    let store = Arc::new(UncertainStore {
+        inner: LocalFileSystem::new(),
+        target: "no-uncertain-commit-in-this-test".to_owned(),
+        unreadable: AtomicBool::new(false),
+        attempts: AtomicUsize::new(0),
+        read_barrier: None,
+        counts: Some(Arc::clone(&counts)),
+    });
+    let maintenance = DeltaTable::open_with_store(root.path(), Arc::clone(&store) as Arc<dyn ObjectStore>)?;
+    counts.reads.store(0, Ordering::SeqCst);
+    counts.lists.store(0, Ordering::SeqCst);
+    counts.writes.store(0, Ordering::SeqCst);
+
+    let now = now_ms()?;
+    let anchor = now
+        .checked_sub(2 * 24 * 60 * 60 * 1000)
+        .context("initial anchor underflow")?;
+    let config = NegativeProbeConfig {
+        now_ms: anchor,
+        granularity: Granularity::Minute,
+        purge_retention_ms: 2_592_000_000,
+        vacuum_retention_ms: 604_800_000,
+        log_retention_ms: 2_592_000_000,
+        checkpoint_interval: 100,
+        optimize_small_file_bytes: 64 * 1024 * 1024,
+        optimize_min_files: 2,
+        sealed_partitions_only: false,
+        max_listed_files: 1000,
+    };
+    let mut inventory = PassProbeInventory::default();
+    assert!(
+        maintenance
+            .probe_no_work_with_inventory(ProbeOperation::Vacuum, &config, &control(), &mut inventory)?
+            .is_some(),
+        "recent files must be outside the retention window"
+    );
+    let idle_lists = counts.lists.load(Ordering::SeqCst);
+    let due_config = NegativeProbeConfig { now_ms: now, ..config };
+    assert!(
+        maintenance
+            .probe_no_work_with_inventory(ProbeOperation::Vacuum, &due_config, &control(), &mut inventory)?
+            .is_none(),
+        "new pass anchor must re-evaluate time-based retention"
+    );
+    assert!(
+        counts.lists.load(Ordering::SeqCst) > idle_lists,
+        "changed anchor invalidates inventory"
+    );
+    assert_eq!(counts.writes.load(Ordering::SeqCst), 0);
+    Ok(())
+}
 fn purge_config() -> PurgeConfig {
     // cutoff = floor(00:03:30 - 90s) = 00:02, so minutes 00 and 01 expire.
     PurgeConfig::new(90_000, BASE + 3 * MINUTE + 30_000, Granularity::Minute)
@@ -155,6 +383,13 @@ fn data_path(root: &Path, relative: &str) -> Result<PathBuf> {
         .join(relative)?
         .to_file_path()
         .map_err(|()| anyhow!("path"))
+}
+
+fn parquet_compression(path: &Path) -> Result<parquet::basic::Compression> {
+    let reader = ParquetRecordBatchReaderBuilder::try_new(fs::File::open(path)?)?;
+    let group = reader.metadata().row_groups().first().context("Parquet row group")?;
+    let column = group.columns().first().context("Parquet column")?;
+    Ok(column.compression())
 }
 
 /// Sorted row multiset read from the actual active Parquet files.
@@ -308,14 +543,39 @@ fn unsorted_optimize_respects_output_row_group_limit() -> Result<()> {
     append(&table, 0, 7..14)?;
     append(&table, 1, 14..15)?;
     let maintenance = DeltaTable::open_for_maintenance(&url_of(root.path())?)?;
+    let input_files = active_files(root.path())?;
+    let input_compressions = input_files
+        .keys()
+        .map(|relative| parquet_compression(&data_path(root.path(), relative)?))
+        .collect::<Result<Vec<_>>>()?;
+    let input_compression = *input_compressions.first().context("input Parquet file")?;
+    assert!(
+        input_compressions
+            .iter()
+            .all(|compression| *compression == input_compression)
+    );
+    let override_codec = if matches!(input_compression, parquet::basic::Compression::ZSTD(_)) {
+        "snappy"
+    } else {
+        "zstd"
+    };
+    let writer_override: arrow_deltalake::writer::ParquetWriterConfig = serde_json::from_value(serde_json::json!({
+        "defaults": {"compression": override_codec}
+    }))?;
     let config = OptimizeConfig {
         use_default_layout: false,
         output_row_group_rows: 3,
         ..optimize_config()
     };
     let before = rows(root.path())?;
-    let plan = maintenance.plan_optimize(&config)?;
-    let report = maintenance.apply_optimize(&plan, &config, &control())?;
+    let prepared = maintenance.prepare_optimize(&config)?;
+    let report = maintenance.apply_prepared_optimize_with_writer_config(
+        &prepared,
+        &config,
+        &control(),
+        None,
+        &writer_override,
+    )?;
     assert_eq!(report.outcome, Outcome::Committed);
     assert_eq!(rows(root.path())?, before);
     let reader =
@@ -323,6 +583,23 @@ fn unsorted_optimize_respects_output_row_group_limit() -> Result<()> {
     let groups = reader.metadata().row_groups();
     assert_eq!(groups.len(), 5);
     assert!(groups.iter().all(|group| group.num_rows() <= 3));
+    let output_compression = parquet_compression(&data_path(root.path(), &report.outputs[0])?)?;
+    if matches!(input_compression, parquet::basic::Compression::ZSTD(_)) {
+        assert_eq!(output_compression, parquet::basic::Compression::SNAPPY);
+    } else {
+        assert!(matches!(output_compression, parquet::basic::Compression::ZSTD(_)));
+    }
+
+    let active_after_optimize: BTreeSet<_> = active_files(root.path())?.into_keys().collect();
+    append(&table, 2, 15..18)?;
+    let new_ingestion_file = active_files(root.path())?
+        .into_keys()
+        .find(|path| !active_after_optimize.contains(path))
+        .context("new ingestion file")?;
+    assert_eq!(
+        parquet_compression(&data_path(root.path(), &new_ingestion_file)?)?,
+        input_compression
+    );
     Ok(())
 }
 
@@ -609,6 +886,7 @@ fn sealed_final_optimize_revalidates_inputs_after_concurrent_append() -> Result<
         unreadable: AtomicBool::new(false),
         attempts: AtomicUsize::new(0),
         read_barrier: Some(barrier),
+        counts: None,
     });
     let table = DeltaTable::open_with_store(root.path(), store)?;
     let config = OptimizeConfig {
@@ -1289,6 +1567,24 @@ struct UncertainStore {
     unreadable: AtomicBool,
     attempts: AtomicUsize,
     read_barrier: Option<Arc<BarrierFence>>,
+    counts: Option<Arc<StorageCounts>>,
+}
+
+#[derive(Debug, Default)]
+struct StorageCounts {
+    reads: AtomicUsize,
+    lists: AtomicUsize,
+    writes: AtomicUsize,
+}
+
+impl StorageCounts {
+    fn read(&self) {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn write(&self) {
+        self.writes.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 impl std::fmt::Display for UncertainStore {
@@ -1305,6 +1601,9 @@ impl ObjectStore for UncertainStore {
         payload: PutPayload,
         options: PutOptions,
     ) -> object_store::Result<PutResult> {
+        if let Some(counts) = &self.counts {
+            counts.write();
+        }
         if path.as_ref().ends_with(&self.target) {
             self.attempts.fetch_add(1, Ordering::SeqCst);
             self.inner.put_opts(path, payload, options).await?;
@@ -1321,10 +1620,16 @@ impl ObjectStore for UncertainStore {
         path: &object_store::path::Path,
         options: PutMultipartOptions,
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        if let Some(counts) = &self.counts {
+            counts.write();
+        }
         self.inner.put_multipart_opts(path, options).await
     }
 
     async fn get_opts(&self, path: &object_store::path::Path, options: GetOptions) -> object_store::Result<GetResult> {
+        if let Some(counts) = &self.counts {
+            counts.read();
+        }
         if path.as_ref().ends_with(".parquet")
             && let Some(barrier) = &self.read_barrier
         {
@@ -1349,14 +1654,25 @@ impl ObjectStore for UncertainStore {
         &self,
         paths: BoxStream<'static, object_store::Result<object_store::path::Path>>,
     ) -> BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        if let Some(counts) = &self.counts {
+            counts.write();
+        }
         self.inner.delete_stream(paths)
     }
 
     fn list(&self, prefix: Option<&object_store::path::Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        if let Some(counts) = &self.counts {
+            counts.read();
+            counts.lists.fetch_add(1, Ordering::SeqCst);
+        }
         self.inner.list(prefix)
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&object_store::path::Path>) -> object_store::Result<ListResult> {
+        if let Some(counts) = &self.counts {
+            counts.read();
+            counts.lists.fetch_add(1, Ordering::SeqCst);
+        }
         self.inner.list_with_delimiter(prefix).await
     }
 
@@ -1366,6 +1682,9 @@ impl ObjectStore for UncertainStore {
         to: &object_store::path::Path,
         options: CopyOptions,
     ) -> object_store::Result<()> {
+        if let Some(counts) = &self.counts {
+            counts.write();
+        }
         self.inner.copy_opts(from, to, options).await
     }
 
@@ -1375,6 +1694,9 @@ impl ObjectStore for UncertainStore {
         to: &object_store::path::Path,
         options: RenameOptions,
     ) -> object_store::Result<()> {
+        if let Some(counts) = &self.counts {
+            counts.write();
+        }
         self.inner.rename_opts(from, to, options).await
     }
 }
@@ -1402,6 +1724,7 @@ fn optimize_uncertain_commit_never_discards_outputs() -> Result<()> {
             unreadable: AtomicBool::new(unreadable),
             attempts: AtomicUsize::new(0),
             read_barrier: None,
+            counts: None,
         });
         let maintenance = DeltaTable::open_with_store(root.path(), Arc::clone(&store) as Arc<dyn ObjectStore>)?;
         let plan = maintenance.plan_optimize(&optimize_config())?;

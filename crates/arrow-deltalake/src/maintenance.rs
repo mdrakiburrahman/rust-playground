@@ -47,6 +47,139 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
 use url::Url;
 
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub mod test_support {
+    use async_trait::async_trait;
+    use futures::stream::BoxStream;
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions,
+        PutOptions, PutPayload, PutResult, RenameOptions,
+    };
+    use std::fmt::{self, Display, Formatter};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Object-store operation counter for debug integration tests.
+    #[derive(Debug)]
+    pub struct CountingObjectStore {
+        inner: Arc<dyn ObjectStore>,
+        reads: AtomicUsize,
+        lists: AtomicUsize,
+        writes: AtomicUsize,
+    }
+
+    impl CountingObjectStore {
+        #[must_use]
+        pub fn new(inner: Arc<dyn ObjectStore>) -> Self {
+            Self {
+                inner,
+                reads: AtomicUsize::new(0),
+                lists: AtomicUsize::new(0),
+                writes: AtomicUsize::new(0),
+            }
+        }
+
+        pub fn reset(&self) {
+            self.reads.store(0, Ordering::SeqCst);
+            self.lists.store(0, Ordering::SeqCst);
+            self.writes.store(0, Ordering::SeqCst);
+        }
+
+        #[must_use]
+        pub fn snapshot(&self) -> (usize, usize, usize) {
+            (
+                self.reads.load(Ordering::SeqCst),
+                self.lists.load(Ordering::SeqCst),
+                self.writes.load(Ordering::SeqCst),
+            )
+        }
+    }
+
+    impl Display for CountingObjectStore {
+        fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+            write!(formatter, "counting object store")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for CountingObjectStore {
+        async fn put_opts(
+            &self,
+            path: &object_store::path::Path,
+            payload: PutPayload,
+            options: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            self.inner.put_opts(path, payload, options).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            path: &object_store::path::Path,
+            options: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            self.inner.put_multipart_opts(path, options).await
+        }
+
+        async fn get_opts(
+            &self,
+            path: &object_store::path::Path,
+            options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.inner.get_opts(path, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            paths: BoxStream<'static, object_store::Result<object_store::path::Path>>,
+        ) -> BoxStream<'static, object_store::Result<object_store::path::Path>> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            self.inner.delete_stream(paths)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.lists.fetch_add(1, Ordering::SeqCst);
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<ListResult> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.lists.fetch_add(1, Ordering::SeqCst);
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: CopyOptions,
+        ) -> object_store::Result<()> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            self.inner.copy_opts(from, to, options).await
+        }
+
+        async fn rename_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: RenameOptions,
+        ) -> object_store::Result<()> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            self.inner.rename_opts(from, to, options).await
+        }
+    }
+}
+
 /// Serialized plan format understood by this build.
 pub const PLAN_FORMAT: u32 = 2;
 /// Tolerated clock skew for explicit retention anchors.
@@ -188,6 +321,13 @@ impl MaintenanceControl {
             commit_attempts: MAX_COMMIT_ATTEMPTS,
             commit_budget: COMMIT_BUDGET,
         }
+    }
+
+    /// Add a hard deadline without extending an existing operation deadline.
+    #[must_use]
+    pub fn with_deadline(mut self, deadline: Instant) -> Self {
+        self.deadline = Some(self.deadline.map_or(deadline, |current| current.min(deadline)));
+        self
     }
 
     /// Set bounded publication retry limits without weakening reconciliation.
@@ -772,6 +912,23 @@ impl DeltaTable {
         config: &NegativeProbeConfig,
         control: &MaintenanceControl,
     ) -> Result<Option<MaintenanceReport>> {
+        self.probe_no_work_with_inventory(operation, config, control, &mut PassProbeInventory::default())
+    }
+
+    /// Reuse bounded inventories inside a single table pass.
+    ///
+    /// The caller must invalidate after any operation that may mutate the table.
+    /// A reported noop is fenced against fresh log object identities before return.
+    ///
+    /// # Errors
+    /// Returns inventory, retention, malformed checkpoint, cancellation or stale-probe errors.
+    pub fn probe_no_work_with_inventory(
+        &self,
+        operation: ProbeOperation,
+        config: &NegativeProbeConfig,
+        control: &MaintenanceControl,
+        inventory: &mut PassProbeInventory,
+    ) -> Result<Option<MaintenanceReport>> {
         control.check()?;
         validate_anchor("probe", config.now_ms)?;
         if (operation == ProbeOperation::Vacuum && config.vacuum_retention_ms < MIN_VACUUM_RETENTION_MS)
@@ -785,9 +942,27 @@ impl DeltaTable {
         if config.max_listed_files == 0 || config.checkpoint_interval == 0 || config.optimize_min_files < 2 {
             return Err(fail(MaintenanceErrorKind::InvalidPlan, "invalid negative-probe bounds"));
         }
-        let logs = self.list_log(config.max_listed_files)?;
+        if inventory
+            .property_fingerprint
+            .as_ref()
+            .is_some_and(|fingerprint| fingerprint != config)
+        {
+            inventory.invalidate();
+        }
+        inventory.property_fingerprint = Some(config.clone());
+        if inventory.logs.is_none() {
+            inventory.logs = Some(Arc::new(self.list_log(config.max_listed_files)?));
+        }
+        let logs = Arc::clone(inventory.logs.as_ref().context("missing pass log inventory")?);
         let version = probe_version(&logs)?;
-        let checkpoint = self.hinted_checkpoint_version(true)?;
+        let checkpoint = match inventory.checkpoint_version {
+            Some(checkpoint) => checkpoint,
+            None => {
+                let checkpoint = self.hinted_checkpoint_version(true)?;
+                inventory.checkpoint_version = Some(checkpoint);
+                checkpoint
+            }
+        };
         if checkpoint.is_some_and(|checkpoint| checkpoint > version) {
             return Err(fail(
                 MaintenanceErrorKind::Unsupported,
@@ -841,11 +1016,14 @@ impl DeltaTable {
             ProbeOperation::Checkpoint => debt < config.checkpoint_interval,
             ProbeOperation::PruneLog => checkpoint.is_none() || !old_logs,
             ProbeOperation::Optimize | ProbeOperation::Purge | ProbeOperation::Vacuum => {
-                let physical = self.probe_physical_files(config.max_listed_files, control)?;
+                if inventory.physical.is_none() {
+                    inventory.physical = Some(Arc::new(self.probe_physical_files(config.max_listed_files, control)?));
+                }
+                let physical = Arc::clone(inventory.physical.as_ref().context("missing pass physical inventory")?);
                 match operation {
                     ProbeOperation::Optimize => {
                         let mut groups: BTreeMap<String, usize> = BTreeMap::new();
-                        for (relative, meta) in physical {
+                        for (relative, meta) in physical.iter() {
                             let partition = relative.rsplit_once('/').map_or("", |(parent, _)| parent).to_owned();
                             let count = groups.entry(partition).or_default();
                             if meta.size < config.optimize_small_file_bytes {
@@ -864,7 +1042,7 @@ impl DeltaTable {
                     ProbeOperation::Purge => {
                         let cutoff = purge_cutoff(config.granularity, config.now_ms, config.purge_retention_ms)?;
                         let mut eligible = false;
-                        for (relative, _) in physical {
+                        for (relative, _) in physical.iter() {
                             let part = relative
                                 .split('/')
                                 .find_map(|segment| segment.strip_prefix("__arrowcol_ingestion="));
@@ -911,6 +1089,7 @@ impl DeltaTable {
                 .collect::<Vec<_>>()
         };
         if signature(&fresh_logs) != signature(&logs) {
+            inventory.invalidate();
             return Err(fail(
                 MaintenanceErrorKind::StalePlan,
                 "log changed during negative probe; retry",
@@ -920,6 +1099,15 @@ impl DeltaTable {
             operation: operation.label().into(),
             read_version: version,
             version,
+            compaction_debt: (operation == ProbeOperation::Optimize).then_some(CompactionDebtEvidence {
+                observed_at_ms: config.now_ms,
+                source: CompactionDebtSource::BoundedPhysicalInventory,
+                eligible_files: 0,
+                eligible_bytes: 0,
+                backlog_files: 0,
+                backlog_bytes: 0,
+                oldest_eligible_partition_start_ms: None,
+            }),
             ..MaintenanceReport::default()
         }))
     }
@@ -1079,7 +1267,7 @@ impl ProbeOperation {
 }
 
 /// Validated table policy required by the read-only probes.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NegativeProbeConfig {
     pub now_ms: i64,
     pub granularity: Granularity,
@@ -1091,6 +1279,24 @@ pub struct NegativeProbeConfig {
     pub optimize_min_files: usize,
     pub sealed_partitions_only: bool,
     pub max_listed_files: usize,
+}
+
+/// Bounded read-only inventory reused only within one table's maintenance pass.
+/// The full probe policy is its property fingerprint; changed policy invalidates
+/// all cached objects, and a negative result is still fenced by fresh log identity.
+#[derive(Default)]
+pub struct PassProbeInventory {
+    property_fingerprint: Option<NegativeProbeConfig>,
+    logs: Option<Arc<BTreeMap<String, ObjectMeta>>>,
+    physical: Option<Arc<Vec<(String, ObjectMeta)>>>,
+    checkpoint_version: Option<Option<u64>>,
+}
+
+impl PassProbeInventory {
+    /// Discard every pass-scoped observation after a mutation or stale identity.
+    pub fn invalidate(&mut self) {
+        *self = Self::default();
+    }
 }
 
 impl DeltaTable {
@@ -1218,6 +1424,32 @@ impl Outcome {
     }
 }
 
+/// Source of pass-scoped compaction-debt evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionDebtSource {
+    /// Derived from the complete, bounded active-file snapshot used by OPTIMIZE.
+    SnapshotActiveFiles,
+    /// A complete bounded physical listing proved no eligible work exists.
+    BoundedPhysicalInventory,
+}
+
+/// Current eligible OPTIMIZE work, or an observed zero only when this value exists.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactionDebtEvidence {
+    /// The maintenance pass anchor, in UTC milliseconds since the Unix epoch.
+    pub observed_at_ms: i64,
+    pub source: CompactionDebtSource,
+    /// Inputs in actionable bins before per-commit and plan-size bounds.
+    pub eligible_files: u64,
+    pub eligible_bytes: u64,
+    /// Eligible inputs omitted from the bounded plan.
+    pub backlog_files: u64,
+    pub backlog_bytes: u64,
+    /// Oldest eligible ingestion-partition start; unavailable for other layouts.
+    pub oldest_eligible_partition_start_ms: Option<i64>,
+}
+
 /// Counters for plan/apply, including partial progress.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MaintenanceReport {
@@ -1235,6 +1467,8 @@ pub struct MaintenanceReport {
     pub attempts: u32,
     pub collisions: u32,
     pub retries: u32,
+    /// PURGE plan rebuilds after expired partition membership changed.
+    pub replans: u32,
     pub cutoff_ms: Option<i64>,
     pub watermark_ms: Option<i64>,
     pub files_deleted: u64,
@@ -1243,6 +1477,8 @@ pub struct MaintenanceReport {
     pub skipped_partitions: u64,
     /// OPTIMIZE bins whose actual rewrite would not reduce the file count.
     pub nonbeneficial_bins: u64,
+    /// `null` means no complete compaction-debt inventory was available.
+    pub compaction_debt: Option<CompactionDebtEvidence>,
     pub interrupted: bool,
     pub outputs: Vec<String>,
 }
@@ -1375,7 +1611,13 @@ impl DeltaTable {
                 Ok(None) => {}
                 Err(error) => {
                     if !uncertain {
-                        return Err(self.discard_after(outputs, error, report));
+                        let error = self.discard_after(outputs, error, report);
+                        if let Some(details) =
+                            error_details(&error).filter(|details| details.kind == MaintenanceErrorKind::StalePlan)
+                        {
+                            return Err(fail_with(details.kind, details.message.clone(), report));
+                        }
+                        return Err(error);
                     }
                     // A raw commit error can follow actual publication: reconcile
                     // by plan id and never clean up outputs blindly.
@@ -1648,6 +1890,63 @@ mod range_reader_tests {
     }
 }
 
+#[cfg(test)]
+mod optimize_upload_tests {
+    use super::*;
+    use object_store::memory::InMemory;
+
+    #[tokio::test]
+    async fn staged_file_is_complete_when_streaming_upload_returns() -> Result<()> {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let local = tempfile::NamedTempFile::new()?;
+        let bytes = vec![0x5a; 512 * 1024];
+        fs::write(local.path(), &bytes)?;
+        let path = object_store::path::Path::from("optimized.parquet");
+
+        upload_staged_output(
+            Arc::clone(&store),
+            path.clone(),
+            local.path().to_path_buf(),
+            bytes.len() as u64,
+            Some(32 * 1024),
+        )
+        .await?;
+
+        let uploaded = store.get(&path).await?.bytes().await?;
+        assert_eq!(uploaded.as_ref(), bytes.as_slice());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn default_create_only_upload_rejects_existing_output() -> Result<()> {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = object_store::path::Path::from("existing.parquet");
+        store
+            .put_opts(&path, vec![1_u8, 2, 3].into(), PutMode::Create.into())
+            .await?;
+        let local = tempfile::NamedTempFile::new()?;
+        let replacement = vec![4_u8, 5, 6];
+        fs::write(local.path(), &replacement)?;
+
+        let error =
+            match upload_staged_output(Arc::clone(&store), path.clone(), local.path().to_path_buf(), 3, None).await {
+                Err(error) => error,
+                Ok(()) => anyhow::bail!("create-only upload replaced an existing object"),
+            };
+        assert!(matches!(
+            error.downcast_ref::<object_store::Error>(),
+            Some(object_store::Error::AlreadyExists { .. })
+        ));
+        let stored = store.get(&path).await?.bytes().await?;
+        assert_eq!(stored.as_ref(), &[1, 2, 3]);
+        Ok(())
+    }
+}
+
+pub const MIN_OPTIMIZE_UPLOAD_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+pub const DEFAULT_OPTIMIZE_UPLOAD_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_OPTIMIZE_UPLOAD_BUFFER_BYTES: usize = 64 * 1024 * 1024;
+
 /// OPTIMIZE bounds. Every limit is enforced on plan and again on apply.
 #[derive(Clone, Debug)]
 pub struct OptimizeConfig {
@@ -1656,6 +1955,8 @@ pub struct OptimizeConfig {
     /// Only files strictly smaller than this are eligible and read (bounded input buffer).
     pub small_file_bytes: u64,
     pub max_files_per_bin: usize,
+    /// Minimum input files for a bin to be eligible for compaction.
+    pub min_files_per_bin: usize,
     pub max_bins_per_commit: usize,
     /// Removes plus estimated adds per commit.
     pub max_actions_per_commit: usize,
@@ -1695,6 +1996,7 @@ impl Default for OptimizeConfig {
             target_file_bytes: 128 * 1024 * 1024,
             small_file_bytes: 64 * 1024 * 1024,
             max_files_per_bin: 64,
+            min_files_per_bin: 2,
             max_bins_per_commit: 16,
             max_actions_per_commit: 2048,
             max_plan_bytes: 1024 * 1024,
@@ -1732,8 +2034,12 @@ impl OptimizeConfig {
         if self.small_file_bytes == 0 || self.small_file_bytes > self.target_file_bytes {
             return invalid("small-file threshold must be positive and at most the target");
         }
-        if self.max_files_per_bin < 2 || self.max_bins_per_commit == 0 || self.max_actions_per_commit < 3 {
-            return invalid("bins need at least two files and commits at least three actions");
+        if self.max_files_per_bin < 2
+            || self.min_files_per_bin < 2
+            || self.max_bins_per_commit == 0
+            || self.max_actions_per_commit < 3
+        {
+            return invalid("bins need at least two files and the minimum must be at least two");
         }
         if self.max_plan_bytes < 1024 || self.max_decoded_bytes_per_bin == 0 || self.max_row_group_bytes == 0 {
             return invalid("plan and decode bounds must be positive");
@@ -1764,6 +2070,7 @@ pub struct OptimizePlan {
     pub header: PlanHeader,
     pub target_file_bytes: u64,
     pub bins: Vec<OptimizeBin>,
+    pub compaction_debt: CompactionDebtEvidence,
     pub backlog_files: u64,
     pub protected_partitions: u64,
     pub skipped_partitions: u64,
@@ -1780,6 +2087,7 @@ impl OptimizePlan {
         let mut report = MaintenanceReport::new("optimize", &self.header);
         report.outcome = outcome;
         report.backlog_files = self.backlog_files;
+        report.compaction_debt = Some(self.compaction_debt.clone());
         report.skipped_partitions = self.skipped_partitions;
         report.files_removed = self.bins.iter().map(|bin| bin.files.len() as u64).sum();
         report.bytes_removed = self.bins.iter().flat_map(|bin| &bin.files).map(|file| file.size).sum();
@@ -1826,6 +2134,13 @@ impl DeltaTable {
     /// Returns the same validation and resource errors as `plan_optimize`.
     pub fn prepare_optimize(&self, config: &OptimizeConfig) -> Result<PreparedOptimize> {
         config.validate()?;
+        let observed_at_ms = match config.now_ms {
+            Some(anchor) => {
+                validate_anchor("optimize", anchor)?;
+                anchor
+            }
+            None => now_ms()?,
+        };
         let state = self.active_state(config.max_active_files)?;
         state.fingerprint.validate_supported(false)?;
         let columns = state.fingerprint.partition_columns.clone();
@@ -1852,10 +2167,7 @@ impl DeltaTable {
         let mut protected = 0_u64;
         let mut ordered: Vec<(Vec<Option<String>>, Vec<&DataFile>)> = Vec::new();
         if let (true, Some(granularity)) = (ingestion, granularity) {
-            let now = match config.now_ms {
-                Some(now) => now,
-                None => now_ms()?,
-            };
+            let now = observed_at_ms;
             let mut valid = Vec::new();
             for (key, files) in groups {
                 match key
@@ -1884,6 +2196,9 @@ impl DeltaTable {
         }
         let mut bins = Vec::new();
         let mut backlog = 0_u64;
+        let mut eligible_files = 0_u64;
+        let mut eligible_bytes = 0_u64;
+        let mut oldest_eligible_partition_start_ms = None;
         let mut actions = 0_usize;
         for (key, mut files) in ordered {
             files.retain(|file| file.size < config.small_file_bytes);
@@ -1905,8 +2220,25 @@ impl DeltaTable {
             }
             candidates.push((current, bytes));
             for (files, bytes) in candidates {
-                if files.len() < 2 {
+                if files.len() < config.min_files_per_bin {
                     continue;
+                }
+                eligible_files = eligible_files
+                    .checked_add(files.len() as u64)
+                    .ok_or_else(|| fail(MaintenanceErrorKind::ResourceLimit, "eligible file count overflow"))?;
+                eligible_bytes = eligible_bytes
+                    .checked_add(bytes)
+                    .ok_or_else(|| fail(MaintenanceErrorKind::ResourceLimit, "eligible byte count overflow"))?;
+                if ingestion {
+                    let value = values
+                        .get(INGESTION_PARTITION)
+                        .and_then(Option::as_deref)
+                        .context("eligible ingestion partition has no value")?;
+                    let start = granularity
+                        .context("eligible ingestion partition has no granularity")?
+                        .parse_partition(value)?;
+                    oldest_eligible_partition_start_ms =
+                        Some(oldest_eligible_partition_start_ms.map_or(start, |oldest: i64| oldest.min(start)));
                 }
                 let cost = files
                     .len()
@@ -1928,18 +2260,38 @@ impl DeltaTable {
             header: PlanHeader::new(self, &state)?,
             target_file_bytes: config.target_file_bytes,
             bins,
+            compaction_debt: CompactionDebtEvidence {
+                observed_at_ms,
+                source: CompactionDebtSource::SnapshotActiveFiles,
+                eligible_files,
+                eligible_bytes,
+                backlog_files: 0,
+                backlog_bytes: 0,
+                oldest_eligible_partition_start_ms,
+            },
             backlog_files: backlog,
             protected_partitions: protected,
             skipped_partitions: skipped,
         };
-        while serde_json::to_vec(&plan)?.len() > config.max_plan_bytes {
-            let Some(bin) = plan.bins.pop() else {
+        loop {
+            let planned_files: u64 = plan.bins.iter().map(|bin| bin.files.len() as u64).sum();
+            let planned_bytes: u64 = plan.bins.iter().flat_map(|bin| &bin.files).map(|file| file.size).sum();
+            plan.backlog_files = eligible_files
+                .checked_sub(planned_files)
+                .context("planned files exceed eligible compaction debt")?;
+            plan.compaction_debt.backlog_files = plan.backlog_files;
+            plan.compaction_debt.backlog_bytes = eligible_bytes
+                .checked_sub(planned_bytes)
+                .context("planned bytes exceed eligible compaction debt")?;
+            if serde_json::to_vec(&plan)?.len() <= config.max_plan_bytes {
+                break;
+            }
+            if plan.bins.pop().is_none() {
                 return Err(fail(
                     MaintenanceErrorKind::ResourceLimit,
                     "empty plan exceeds the payload bound",
                 ));
-            };
-            plan.backlog_files += bin.files.len() as u64;
+            }
         }
         Ok(PreparedOptimize { plan, state })
     }
@@ -1956,7 +2308,7 @@ impl DeltaTable {
         let mut paths = BTreeSet::new();
         let mut actions = 0_usize;
         for bin in &plan.bins {
-            if bin.files.len() < 2 || bin.files.len() > config.max_files_per_bin {
+            if bin.files.len() < config.min_files_per_bin || bin.files.len() > config.max_files_per_bin {
                 return invalid("plan bin violates file-count bounds");
             }
             let bytes: u64 = bin.files.iter().map(|file| file.size).sum();
@@ -1988,7 +2340,7 @@ impl DeltaTable {
         config: &OptimizeConfig,
         control: &MaintenanceControl,
     ) -> Result<MaintenanceReport> {
-        self.apply_optimize_reusing(plan, config, control, None)
+        self.apply_optimize_reusing(plan, config, control, None, None, None)
     }
 
     /// Apply a same-pass plan without rescanning an unchanged log version.
@@ -2001,7 +2353,66 @@ impl DeltaTable {
         config: &OptimizeConfig,
         control: &MaintenanceControl,
     ) -> Result<MaintenanceReport> {
-        self.apply_optimize_reusing(&prepared.plan, config, control, Some(&prepared.state))
+        self.apply_optimize_reusing(&prepared.plan, config, control, Some(&prepared.state), None, None)
+    }
+
+    /// Apply OPTIMIZE with a bounded object-store streaming upload buffer.
+    ///
+    /// # Errors
+    /// Rejects upload buffers outside 4..=64 MiB and returns the same safety and publication errors as `apply_optimize`.
+    pub fn apply_prepared_optimize_with_upload_buffer(
+        &self,
+        prepared: &PreparedOptimize,
+        config: &OptimizeConfig,
+        control: &MaintenanceControl,
+        upload_buffer_bytes: usize,
+    ) -> Result<MaintenanceReport> {
+        if !(MIN_OPTIMIZE_UPLOAD_BUFFER_BYTES..=MAX_OPTIMIZE_UPLOAD_BUFFER_BYTES).contains(&upload_buffer_bytes) {
+            return Err(fail(
+                MaintenanceErrorKind::InvalidPlan,
+                "OPTIMIZE upload buffer must be within 4..=64 MiB",
+            ));
+        }
+        self.apply_optimize_reusing(
+            &prepared.plan,
+            config,
+            control,
+            Some(&prepared.state),
+            Some(upload_buffer_bytes),
+            None,
+        )
+    }
+
+    /// Apply a prepared OPTIMIZE with an explicit Parquet writer policy.
+    ///
+    /// `upload_buffer_bytes` is `None` for the create-only writer path.
+    ///
+    /// # Errors
+    /// Rejects upload buffers outside 4..=64 MiB and returns the same safety and publication errors as `apply_optimize`.
+    pub fn apply_prepared_optimize_with_writer_config(
+        &self,
+        prepared: &PreparedOptimize,
+        config: &OptimizeConfig,
+        control: &MaintenanceControl,
+        upload_buffer_bytes: Option<usize>,
+        writer_config: &crate::writer::ParquetWriterConfig,
+    ) -> Result<MaintenanceReport> {
+        if let Some(bytes) = upload_buffer_bytes
+            && !(MIN_OPTIMIZE_UPLOAD_BUFFER_BYTES..=MAX_OPTIMIZE_UPLOAD_BUFFER_BYTES).contains(&bytes)
+        {
+            return Err(fail(
+                MaintenanceErrorKind::InvalidPlan,
+                "OPTIMIZE upload buffer must be within 4..=64 MiB",
+            ));
+        }
+        self.apply_optimize_reusing(
+            &prepared.plan,
+            config,
+            control,
+            Some(&prepared.state),
+            upload_buffer_bytes,
+            Some(writer_config),
+        )
     }
 
     fn apply_optimize_reusing(
@@ -2010,6 +2421,8 @@ impl DeltaTable {
         config: &OptimizeConfig,
         control: &MaintenanceControl,
         prepared: Option<&ActiveState>,
+        upload_buffer_bytes: Option<usize>,
+        writer_config: Option<&crate::writer::ParquetWriterConfig>,
     ) -> Result<MaintenanceReport> {
         config.validate()?;
         self.check_optimize_plan(plan, config)?;
@@ -2051,7 +2464,14 @@ impl DeltaTable {
         let mut kept: Vec<&OptimizeBin> = Vec::new();
         let mut actions = 0_usize;
         for bin in &plan.bins {
-            let written = match self.rewrite_bin(&state.snapshot, bin, config, control) {
+            let written = match self.rewrite_bin(
+                &state.snapshot,
+                bin,
+                config,
+                control,
+                upload_buffer_bytes,
+                writer_config,
+            ) {
                 Ok(written) => written,
                 Err(error) => return Err(self.discard_after(&outputs, error, &mut report)),
             };
@@ -2143,6 +2563,8 @@ impl DeltaTable {
         bin: &OptimizeBin,
         config: &OptimizeConfig,
         control: &MaintenanceControl,
+        upload_buffer_bytes: Option<usize>,
+        parquet_writer_config: Option<&crate::writer::ParquetWriterConfig>,
     ) -> Result<Vec<StagedOutput>> {
         let probe = self.write_context(snapshot, &bin.partition_values)?;
         let logical: SchemaRef = Arc::new(probe.logical_data_schema().as_ref().try_into_arrow()?);
@@ -2164,8 +2586,11 @@ impl DeltaTable {
                 .build(),
         };
         let verified_sort = crate::writer::sorting_from_properties(&physical, Some(&properties))?;
-        let properties =
-            crate::writer::process_config()?.writer_properties(&physical, Some(properties), &verified_sort)?;
+        let parquet_writer_config = match parquet_writer_config {
+            Some(config) => config,
+            None => crate::writer::process_config()?,
+        };
+        let properties = parquet_writer_config.writer_properties(&physical, Some(properties), &verified_sort)?;
         let mut writer = BinWriter {
             table: self,
             snapshot,
@@ -2173,6 +2598,7 @@ impl DeltaTable {
             logical: Arc::clone(&logical),
             properties,
             config,
+            upload_buffer_bytes,
             layout,
             buffer: None,
             current: None,
@@ -2445,6 +2871,7 @@ struct BinWriter<'a> {
     logical: SchemaRef,
     properties: WriterProperties,
     config: &'a OptimizeConfig,
+    upload_buffer_bytes: Option<usize>,
     layout: Option<LayoutPolicy>,
     buffer: Option<FileSortBuffer>,
     current: Option<OpenOutput>,
@@ -2601,7 +3028,8 @@ impl BinWriter<'_> {
         };
         self.outputs.push(staged);
         let index = self.outputs.len() - 1;
-        self.table.upload_output(&mut self.outputs[index])?;
+        self.table
+            .upload_output(&mut self.outputs[index], self.upload_buffer_bytes)?;
         Ok(())
     }
 
@@ -2631,23 +3059,20 @@ impl BinWriter<'_> {
 }
 
 impl DeltaTable {
-    /// Upload a staged cloud output with create-only semantics; local outputs are already in place.
-    fn upload_output(&self, output: &mut StagedOutput) -> Result<()> {
+    /// Upload a staged cloud output to its UUID-named path; local outputs are already in place.
+    fn upload_output(&self, output: &mut StagedOutput, buffer_bytes: Option<usize>) -> Result<()> {
         if self.url.scheme() == "file" {
             return Ok(());
         }
         self.check_publication()?;
-        let bytes = fs::read(&output.local)?;
-        if bytes.len() as u64 != output.bytes {
-            return Err(fail(
-                MaintenanceErrorKind::Uncertain,
-                "staged output changed before upload",
-            ));
-        }
         let path = object_store::path::Path::from_url_path(output.url.path())?;
-        let store = Arc::clone(&self.store);
-        shared_executor()?
-            .block_on(async move { store.put_opts(&path, bytes.into(), PutMode::Create.into()).await })?;
+        shared_executor()?.block_on(upload_staged_output(
+            Arc::clone(&self.store),
+            path,
+            output.local.clone(),
+            output.bytes,
+            buffer_bytes,
+        ))?;
         output.uploaded = true;
         match fs::remove_file(&output.local) {
             Ok(()) => Ok(()),
@@ -2655,6 +3080,71 @@ impl DeltaTable {
             Err(error) => Err(anyhow::Error::new(error).context("remove uploaded staging file")),
         }
     }
+}
+
+async fn upload_staged_output(
+    store: Arc<dyn ObjectStore>,
+    path: object_store::path::Path,
+    local: PathBuf,
+    expected_bytes: u64,
+    buffer_bytes: Option<usize>,
+) -> Result<()> {
+    match buffer_bytes {
+        Some(buffer_bytes) => stream_staged_output(store, path, local, expected_bytes, buffer_bytes).await,
+        None => {
+            let bytes = tokio::fs::read(local).await?;
+            if bytes.len() as u64 != expected_bytes {
+                return Err(fail(
+                    MaintenanceErrorKind::Uncertain,
+                    "staged output changed before upload",
+                ));
+            }
+            store.put_opts(&path, bytes.into(), PutMode::Create.into()).await?;
+            Ok(())
+        }
+    }
+}
+
+async fn stream_staged_output(
+    store: Arc<dyn ObjectStore>,
+    path: object_store::path::Path,
+    local: PathBuf,
+    expected_bytes: u64,
+    buffer_bytes: usize,
+) -> Result<()> {
+    let mut reader = tokio::fs::File::from_std(File::open(local)?);
+    if reader.metadata().await?.len() != expected_bytes {
+        return Err(fail(
+            MaintenanceErrorKind::Uncertain,
+            "staged output changed before upload",
+        ));
+    }
+    let mut writer =
+        object_store::buffered::BufWriter::with_capacity(store, path, buffer_bytes).with_max_concurrency(1);
+    let copied = match tokio::io::copy(&mut reader, &mut writer).await {
+        Ok(copied) => copied,
+        Err(error) => {
+            let error = anyhow::Error::new(error).context("stream staged OPTIMIZE output");
+            return match writer.abort().await {
+                Ok(()) => Err(error),
+                Err(abort) => Err(error.context(format!("abort staged OPTIMIZE upload failed: {abort}"))),
+            };
+        }
+    };
+    if copied != expected_bytes {
+        let error = fail(MaintenanceErrorKind::Uncertain, "staged output changed during upload");
+        return match writer.abort().await {
+            Ok(()) => Err(error),
+            Err(abort) => Err(error.context(format!("abort staged OPTIMIZE upload failed: {abort}"))),
+        };
+    }
+    tokio::io::AsyncWriteExt::flush(&mut writer)
+        .await
+        .context("flush staged OPTIMIZE upload")?;
+    tokio::io::AsyncWriteExt::shutdown(&mut writer)
+        .await
+        .context("complete staged OPTIMIZE upload")?;
+    Ok(())
 }
 
 /// PURGE bounds and its explicit UTC retention anchor.
