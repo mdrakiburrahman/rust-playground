@@ -35,10 +35,256 @@ pub enum PipelineStage {
     Commit,
 }
 
+const STAGE_DURATION_BUCKETS: &[f64] = &[
+    0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
+];
+const FILE_SIZE_BUCKETS: &[f64] = &[
+    1_048_576.0,
+    8_388_608.0,
+    16_777_216.0,
+    33_554_432.0,
+    67_108_864.0,
+    100_663_296.0,
+    134_217_728.0,
+    167_772_160.0,
+    268_435_456.0,
+    536_870_912.0,
+];
+const FILE_ROW_BUCKETS: &[f64] = &[
+    1.0,
+    1_024.0,
+    4_096.0,
+    16_384.0,
+    65_536.0,
+    131_072.0,
+    262_144.0,
+    524_288.0,
+    1_048_576.0,
+];
+
+/// A bounded reason for a staged Parquet flush.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FlushReason {
+    TargetParquetBytes,
+    MinInputBytes,
+    MaxInputBytes,
+    RowCap,
+    BatchCap,
+    MemoryCap,
+    Age,
+    SchemaChange,
+    Explicit,
+    ShutdownDrain,
+}
+
+impl FlushReason {
+    const ALL: [Self; 10] = [
+        Self::TargetParquetBytes,
+        Self::MinInputBytes,
+        Self::MaxInputBytes,
+        Self::RowCap,
+        Self::BatchCap,
+        Self::MemoryCap,
+        Self::Age,
+        Self::SchemaChange,
+        Self::Explicit,
+        Self::ShutdownDrain,
+    ];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::TargetParquetBytes => 0,
+            Self::MinInputBytes => 1,
+            Self::MaxInputBytes => 2,
+            Self::RowCap => 3,
+            Self::BatchCap => 4,
+            Self::MemoryCap => 5,
+            Self::Age => 6,
+            Self::SchemaChange => 7,
+            Self::Explicit => 8,
+            Self::ShutdownDrain => 9,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::TargetParquetBytes => "target_parquet_bytes",
+            Self::MinInputBytes => "min_input_bytes",
+            Self::MaxInputBytes => "max_input_bytes",
+            Self::RowCap => "row_cap",
+            Self::BatchCap => "batch_cap",
+            Self::MemoryCap => "memory_cap",
+            Self::Age => "age",
+            Self::SchemaChange => "schema_change",
+            Self::Explicit => "explicit",
+            Self::ShutdownDrain => "shutdown_drain",
+        }
+    }
+}
+
+struct FixedHistogram {
+    bounds: &'static [f64],
+    buckets: Vec<AtomicU64>,
+    count: AtomicU64,
+    sum: AtomicU64,
+}
+
+impl FixedHistogram {
+    fn new(bounds: &'static [f64]) -> Self {
+        Self {
+            bounds,
+            buckets: (0..=bounds.len()).map(|_| AtomicU64::new(0)).collect(),
+            count: AtomicU64::new(0),
+            sum: AtomicU64::new(0),
+        }
+    }
+
+    fn record(&self, value: f64, sum_units: u64) {
+        let bucket = self
+            .bounds
+            .iter()
+            .position(|bound| value <= *bound)
+            .unwrap_or(self.bounds.len());
+        self.buckets[bucket].fetch_add(1, Ordering::Relaxed);
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.sum.fetch_add(sum_units, Ordering::Relaxed);
+    }
+
+    fn write(&self, output: &mut String, name: &str, labels: &str, sum_divisor: f64) {
+        let mut cumulative = 0_u64;
+        for (index, bound) in self.bounds.iter().enumerate() {
+            cumulative = cumulative.saturating_add(self.buckets[index].load(Ordering::Acquire));
+            let le = if bound.fract() == 0.0 {
+                format!("{bound:.0}")
+            } else {
+                bound.to_string()
+            };
+            let _ = writeln!(output, "{name}_bucket{{{labels},le=\"{le}\"}} {cumulative}");
+        }
+        cumulative = cumulative.saturating_add(self.buckets[self.bounds.len()].load(Ordering::Acquire));
+        let _ = writeln!(output, "{name}_bucket{{{labels},le=\"+Inf\"}} {cumulative}");
+        let _ = writeln!(
+            output,
+            "{name}_sum{{{labels}}} {}",
+            self.sum.load(Ordering::Acquire) as f64 / sum_divisor
+        );
+        let _ = writeln!(
+            output,
+            "{name}_count{{{labels}}} {}",
+            self.count.load(Ordering::Acquire)
+        );
+    }
+}
+
+struct PipelineMetrics {
+    run: String,
+    variant: String,
+    stages: Vec<FixedHistogram>,
+    flushes: [AtomicU64; 10],
+    file_bytes: FixedHistogram,
+    file_rows: FixedHistogram,
+}
+
+impl PipelineMetrics {
+    fn new() -> Self {
+        Self {
+            run: std::env::var("ARROWCOL_OAT_RUN_ID").unwrap_or_else(|_| "unknown".to_owned()),
+            variant: std::env::var("ARROWCOL_OAT_VARIANT").unwrap_or_else(|_| "unknown".to_owned()),
+            stages: (0..6).map(|_| FixedHistogram::new(STAGE_DURATION_BUCKETS)).collect(),
+            flushes: std::array::from_fn(|_| AtomicU64::new(0)),
+            file_bytes: FixedHistogram::new(FILE_SIZE_BUCKETS),
+            file_rows: FixedHistogram::new(FILE_ROW_BUCKETS),
+        }
+    }
+
+    fn record_stage(&self, stage: PipelineStage, duration: Duration) {
+        self.stages[stage.index()].record(
+            duration.as_secs_f64(),
+            duration.as_nanos().min(u128::from(u64::MAX)) as u64,
+        );
+    }
+
+    fn record_flush(&self, reason: FlushReason) {
+        self.flushes[reason.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_file(&self, physical_bytes: u64, rows: u64) {
+        self.file_bytes.record(physical_bytes as f64, physical_bytes);
+        self.file_rows.record(rows as f64, rows);
+    }
+
+    fn write(&self, output: &mut String) {
+        let run = escape_prometheus_label(&self.run);
+        let variant = escape_prometheus_label(&self.variant);
+        let component = "arrowcol-dataflow-rust";
+        let _ = writeln!(
+            output,
+            "# HELP arrowcol_pipeline_stage_duration_seconds Pipeline stage duration."
+        );
+        output.push_str("# TYPE arrowcol_pipeline_stage_duration_seconds histogram\n");
+        for stage in [
+            PipelineStage::Collect,
+            PipelineStage::Build,
+            PipelineStage::Sort,
+            PipelineStage::Encode,
+            PipelineStage::Upload,
+            PipelineStage::Commit,
+        ] {
+            let labels = format!(
+                "run=\"{run}\",variant=\"{variant}\",component=\"{component}\",stage=\"{}\"",
+                stage.as_str()
+            );
+            self.stages[stage.index()].write(
+                output,
+                "arrowcol_pipeline_stage_duration_seconds",
+                &labels,
+                1_000_000_000.0,
+            );
+        }
+        let _ = writeln!(
+            output,
+            "# HELP arrowcol_pipeline_flushes_total Pipeline flushes by bounded reason."
+        );
+        output.push_str("# TYPE arrowcol_pipeline_flushes_total counter\n");
+        for reason in FlushReason::ALL {
+            let _ = writeln!(
+                output,
+                "arrowcol_pipeline_flushes_total{{reason=\"{}\"}} {}",
+                reason.as_str(),
+                self.flushes[reason.index()].load(Ordering::Acquire)
+            );
+        }
+        let file_labels = format!("run=\"{run}\",variant=\"{variant}\",component=\"{component}\"");
+        let _ = writeln!(
+            output,
+            "# HELP arrowcol_parquet_file_physical_bytes Physical Parquet file size including the footer."
+        );
+        output.push_str("# TYPE arrowcol_parquet_file_physical_bytes histogram\n");
+        self.file_bytes
+            .write(output, "arrowcol_parquet_file_physical_bytes", &file_labels, 1.0);
+        let _ = writeln!(
+            output,
+            "# HELP arrowcol_parquet_file_rows Rows in each physical Parquet file."
+        );
+        output.push_str("# TYPE arrowcol_parquet_file_rows histogram\n");
+        self.file_rows
+            .write(output, "arrowcol_parquet_file_rows", &file_labels, 1.0);
+    }
+}
+
+fn escape_prometheus_label(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
+}
+
+static PIPELINE_METRICS: LazyLock<PipelineMetrics> = LazyLock::new(PipelineMetrics::new);
+
 /// OpenTelemetry recorder for the fixed pipeline stages.
 #[derive(Clone, Debug)]
 pub struct StageMetrics {
     duration: Histogram<f64>,
+    flushes: Counter<u64>,
+    physical_bytes: Histogram<u64>,
+    file_rows: Histogram<u64>,
     run: String,
     variant: String,
 }
@@ -51,6 +297,12 @@ impl Default for StageMetrics {
                 .f64_histogram("arrowcol.pipeline.stage.duration")
                 .with_unit("s")
                 .build(),
+            flushes: meter.u64_counter("arrowcol.pipeline.flushes").with_unit("1").build(),
+            physical_bytes: meter
+                .u64_histogram("arrowcol.parquet.file.physical_bytes")
+                .with_unit("By")
+                .build(),
+            file_rows: meter.u64_histogram("arrowcol.parquet.file.rows").with_unit("1").build(),
             run: std::env::var("ARROWCOL_OAT_RUN_ID").unwrap_or_else(|_| "unknown".to_owned()),
             variant: std::env::var("ARROWCOL_OAT_VARIANT").unwrap_or_else(|_| "unknown".to_owned()),
         }
@@ -60,6 +312,7 @@ impl Default for StageMetrics {
 impl StageMetrics {
     /// Records a duration for one fixed pipeline stage.
     pub fn record(&self, stage: PipelineStage, duration: Duration) {
+        PIPELINE_METRICS.record_stage(stage, duration);
         self.duration.record(
             duration.as_secs_f64(),
             &[
@@ -69,6 +322,22 @@ impl StageMetrics {
                 KeyValue::new("stage", stage.as_str()),
             ],
         );
+    }
+
+    pub fn record_flush(&self, reason: FlushReason) {
+        PIPELINE_METRICS.record_flush(reason);
+        self.flushes.add(1, &[KeyValue::new("reason", reason.as_str())]);
+    }
+
+    pub fn record_file(&self, physical_bytes: u64, rows: u64) {
+        PIPELINE_METRICS.record_file(physical_bytes, rows);
+        let attributes = [
+            KeyValue::new("run", self.run.as_str()),
+            KeyValue::new("variant", self.variant.as_str()),
+            KeyValue::new("component", "arrowcol-dataflow-rust"),
+        ];
+        self.physical_bytes.record(physical_bytes, &attributes);
+        self.file_rows.record(rows, &attributes);
     }
 }
 
@@ -1188,6 +1457,7 @@ impl RuntimeMetrics {
             "arrowcol_delivery_guarantee_info{{delivery_guarantee=\"{}\",completion_mode=\"{}\",receipt_polling=\"false\",at_least_once=\"{}\"}} 1",
             contract.delivery_guarantee, contract.completion_mode, contract.at_least_once,
         );
+        PIPELINE_METRICS.write(&mut output);
         output
     }
 }
@@ -1537,7 +1807,6 @@ mod tests {
     /// claim, reports native Quiver as supported but disabled, and keeps the legacy info metric.
     #[test]
     fn capabilities_label_best_effort() {
-        #[test]
         fn prometheus_exposes_pending_rows_and_monotonic_oldest_age() {
             let metrics = Arc::new(RuntimeMetrics::new(CollectorInstanceId::new()));
             let tracker = PendingTracker::new(Arc::clone(&metrics));
@@ -1713,5 +1982,21 @@ mod tests {
         let _permits = first.try_acquire_many(2).expect("capacity");
         assert!(second.try_acquire().is_err());
         assert!(metrics.stream_permits(3).is_err());
+    }
+    #[test]
+    fn prometheus_exports_bounded_pipeline_flush_and_file_histograms() {
+        let stage = StageMetrics::default();
+        stage.record(PipelineStage::Build, Duration::from_millis(12));
+        stage.record_flush(FlushReason::TargetParquetBytes);
+        stage.record_file(134_217_728, 250_000);
+
+        let exposition = RuntimeMetrics::new(CollectorInstanceId::new()).prometheus();
+        assert!(exposition.contains("arrowcol_pipeline_stage_duration_seconds_bucket{run=\""));
+        assert!(exposition.contains("component=\"arrowcol-dataflow-rust\",stage=\"build\",le=\"0.025\"}"));
+        assert!(exposition.contains("arrowcol_pipeline_flushes_total{reason=\"target_parquet_bytes\"}"));
+        assert!(exposition.contains("arrowcol_parquet_file_physical_bytes_bucket{run=\""));
+        assert!(exposition.contains("le=\"134217728\"}"));
+        assert!(exposition.contains("arrowcol_parquet_file_rows_bucket{run=\""));
+        assert!(!exposition.contains("publication_id="));
     }
 }
