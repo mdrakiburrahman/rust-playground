@@ -2953,7 +2953,9 @@ fn attach_shutdown_drain_evidence(outcome: &mut MatrixOutcome, shutdown_drain: V
         let mut evidence: Value =
             serde_json::from_str(evidence_json).context("parse cell evidence before shutdown update")?;
         evidence["kusto_snapshot_coverage"] = kusto_snapshot_coverage(
-            &row.run_id, &row.table, &evidence["qap_observation"],
+            &row.run_id,
+            &row.table,
+            &evidence["qap_observation"],
             &shutdown_drain["stopped_delta_snapshots"],
         )?;
         evidence["shutdown_drain"] = shutdown_drain.clone();
@@ -2969,18 +2971,27 @@ fn kusto_snapshot_coverage(run_id: &str, table: &str, observation: &Value, snaps
     let observed = &observation["tables"][&binding.external_table];
     let identity_matches = observation["run_id"] == run_id
         && observation["observed_unix_ms"].as_u64().is_some_and(|time| time > 0)
-        && observation["expected_tables"].as_array().is_some_and(|tables| tables.contains(&json!(binding.external_table)))
-        && snapshot["run_id"] == run_id && snapshot["table"] == table
+        && observation["expected_tables"]
+            .as_array()
+            .is_some_and(|tables| tables.contains(&json!(binding.external_table)))
+        && snapshot["run_id"] == run_id
+        && snapshot["table"] == table
         && snapshot["source"] == "verified_stopped_snapshot_manifest"
         && snapshot["manifest"] == format!("{run_id}/{table}/manifest.json")
-        && snapshot["manifest_sha256"].as_str().is_some_and(|hash| {
-            hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
-        });
-    let counts = snapshot["row_count"].as_u64().zip(snapshot["table_version"].as_u64())
+        && snapshot["manifest_sha256"]
+            .as_str()
+            .is_some_and(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    let counts = snapshot["row_count"]
+        .as_u64()
+        .zip(snapshot["table_version"].as_u64())
         .zip(observed["row_count"].as_u64().zip(observed["table_version"].as_u64()));
     let status = match counts {
         Some((delta, kusto)) if identity_matches && observed["available"] == true => {
-            if delta == kusto { "matched" } else { "mismatch" }
+            if delta == kusto {
+                "matched"
+            } else {
+                "mismatch"
+            }
         }
         _ => "unknown",
     };
@@ -3467,7 +3478,7 @@ async fn run_matrix_cell(
                 config.qap_timeout_seconds,
             )
             .await?;
-            qap = apply_qap_observation(platform.kind(), metrics, observation, &mut client_run.evidence)?;
+            qap = apply_qap_observation(platform.kind(), metrics, observation, &mut client_run.evidence);
             if qap.observation_complete != 1 && client_run.evidence.downstream_comment.is_none() {
                 bail!("QAP observation omitted required table statistics");
             }
@@ -5344,18 +5355,29 @@ async fn observe_qap(
         }
     }
     let metrics = aggregate_qap(&observation, qap_tables)?;
-    let tables = qap_tables.iter().map(|name| (name.clone(), json!({
-        "available": observation["tables"][name]["available"],
-        "row_count": observation["tables"][name]["state"]["RowCount"],
-        "table_version": observation["tables"][name]["state"]["TableVersion"],
-        "completion_percent": observation["tables"][name]["statistics"]["AccelerationCompletePercentage"],
-        "pending_files": observation["tables"][name]["statistics"]["AccelerationPendingDataFilesCount"],
-    }))).collect::<serde_json::Map<_, _>>();
-    Ok((metrics, json!({
-        "run_id": run_id, "expected_tables": qap_tables,
-        "observed_unix_ms": observation["observed_unix_ms"],
-        "catch_up_status": observation["catch_up_status"], "tables": tables,
-    })))
+    let tables = qap_tables
+        .iter()
+        .map(|name| {
+            (
+                name.clone(),
+                json!({
+                    "available": observation["tables"][name]["available"],
+                    "row_count": observation["tables"][name]["state"]["RowCount"],
+                    "table_version": observation["tables"][name]["state"]["TableVersion"],
+                    "completion_percent": observation["tables"][name]["statistics"]["AccelerationCompletePercentage"],
+                    "pending_files": observation["tables"][name]["statistics"]["AccelerationPendingDataFilesCount"],
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    Ok((
+        metrics,
+        json!({
+            "run_id": run_id, "expected_tables": qap_tables,
+            "observed_unix_ms": observation["observed_unix_ms"],
+            "catch_up_status": observation["catch_up_status"], "tables": tables,
+        }),
+    ))
 }
 
 fn apply_qap_observation(
@@ -5363,19 +5385,23 @@ fn apply_qap_observation(
     metrics: QapMetrics,
     observation: Value,
     evidence: &mut CellEvidence,
-) -> Result<QapMetrics> {
+) -> QapMetrics {
     if local_downstream_optional(mode) && observation["catch_up_status"] == "deadline_incomplete" {
         evidence.downstream_unavailable(format!(
             "Local QAP catch-up deadline expired: observed completion {}%, pending files {}. \
              Derived Kusto/QAP metrics are null; Delta commit measurements are unchanged.",
-            metrics.completion_percent.map_or_else(|| "unknown".to_owned(), |value| value.to_string()),
-            metrics.pending_artifacts.map_or_else(|| "unknown".to_owned(), |value| value.to_string()),
+            metrics
+                .completion_percent
+                .map_or_else(|| "unknown".to_owned(), |value| value.to_string()),
+            metrics
+                .pending_artifacts
+                .map_or_else(|| "unknown".to_owned(), |value| value.to_string()),
         ));
         evidence.qap_observation = Some(observation);
-        return Ok(QapMetrics::default());
+        return QapMetrics::default();
     }
     evidence.qap_observation = Some(observation);
-    Ok(metrics)
+    metrics
 }
 
 fn parse_qap_timestamp(value: &str) -> Option<i64> {
@@ -6636,6 +6662,9 @@ fn snapshot_container_outcomes(before: &[Value], after: &[Value], project: &str)
             "id": id, "service": service, "was_running": was_running, "exit_code": exit,
             "finished_at": finished_at, "oom_killed": state["OOMKilled"],
             "maintenance_operation_failure": null,
+            "comment": (service == "delta-maintenance" && exit == 1).then_some(
+                "Cumulative maintenance health exit retained; cell records and health diagnostics determine failure, retry-only, or UNKNOWN.",
+            ),
         }));
     }
     Ok(writers)
@@ -12974,18 +13003,30 @@ mod tests {
             "Compose down must be skipped"
         );
         fs::write(fixture.join("mode"), "maintenance_cell")?;
-        fs::write(fixture.join("project"), scoped_compose_project(
-            config.platform.compose_project.as_deref().context("fixture project")?, &local.run_id,
-        ))?;
+        fs::write(
+            fixture.join("project"),
+            scoped_compose_project(
+                config.platform.compose_project.as_deref().context("fixture project")?,
+                &local.run_id,
+            ),
+        )?;
         let baseline = local.process_logs(&config).await?;
         local.retain_cell_process_baseline(&baseline);
         fs::write(fixture.join("measurement-finished"), "")?;
         let outcomes = stop_local_snapshot_writers(&config, &local).await?;
-        assert_eq!(outcomes[0]["maintenance_outcomes"]["operation_count"], 155,
-            "cell scope must include warm-up/measurement and the final drain cycle");
-        assert_eq!(outcomes[0]["maintenance_outcomes"]["retry_kind_counts"]["stale_plan"], 25);
+        assert_eq!(
+            outcomes[0]["maintenance_outcomes"]["operation_count"], 155,
+            "cell scope must include warm-up/measurement and the final drain cycle"
+        );
+        assert_eq!(
+            outcomes[0]["maintenance_outcomes"]["retry_kind_counts"]["stale_plan"],
+            25
+        );
         assert_eq!(outcomes[0]["maintenance_operation_failure"], false);
-        assert_eq!(outcomes[0]["maintenance_exit_classification"], "classified_retries_only");
+        assert_eq!(
+            outcomes[0]["maintenance_exit_classification"],
+            "classified_retries_only"
+        );
         assert_eq!(outcomes[0]["exit_code"], 1);
         assert!(!serde_json::to_string(&outcomes)?.contains("private"));
         fs::write(fixture.join("mode"), "stop_failure")?;
@@ -14294,7 +14335,9 @@ mod tests {
         ))?;
         let run = "fdba69d6-ae99-49e6-9c7a-f1a1044b8241";
         let table = config.tables[0].clone();
-        let external = qap_bindings(run, std::slice::from_ref(&table))?.remove(0).external_table;
+        let external = qap_bindings(run, std::slice::from_ref(&table))?
+            .remove(0)
+            .external_table;
         let observation = json!({
             "run_id": run, "observed_unix_ms": 1_794_842_000_000_u64,
             "expected_tables": [external], "catch_up_status": "deadline_incomplete",
@@ -14302,19 +14345,35 @@ mod tests {
                 "completion_percent": 84.81, "pending_files": 89}},
         });
         let mut evidence = CellEvidence::default();
-        evidence.durable_commits.insert(table.clone(), json!({"output_throughput":{"rows_per_second":123.0}}));
+        evidence
+            .durable_commits
+            .insert(table.clone(), json!({"output_throughput":{"rows_per_second":123.0}}));
         let measured = QapMetrics {
-            observation_complete: 1, observed_tables: 1, completion_percent: Some(84.81),
-            pending_artifacts: Some(89), cached_bytes: Some(1_121_271_383),
-            unhealthy_catalogs: Some(0), lag_seconds: Some(1.0),
+            observation_complete: 1,
+            observed_tables: 1,
+            completion_percent: Some(84.81),
+            pending_artifacts: Some(89),
+            cached_bytes: Some(1_121_271_383),
+            unhealthy_catalogs: Some(0),
+            lag_seconds: Some(1.0),
         };
-        let qap = apply_qap_observation(crate::config::OatMode::Local, measured, observation.clone(), &mut evidence)?;
+        let qap = apply_qap_observation(
+            crate::config::OatMode::Local,
+            measured,
+            observation.clone(),
+            &mut evidence,
+        );
         assert!(qap.completion_percent.is_none() && qap.pending_artifacts.is_none() && qap.cached_bytes.is_none());
         assert!(qap.unhealthy_catalogs.is_none() && qap.lag_seconds.is_none());
         let comment = evidence.downstream_comment.as_deref().context("deadline explanation")?;
         assert!(comment.contains("84.81%") && comment.contains("89"));
         assert_eq!(evidence.qap_observation.as_ref(), Some(&observation));
-        let aks = apply_qap_observation(crate::config::OatMode::Aks, measured, observation.clone(), &mut CellEvidence::default())?;
+        let aks = apply_qap_observation(
+            crate::config::OatMode::Aks,
+            measured,
+            observation.clone(),
+            &mut CellEvidence::default(),
+        );
         assert_eq!(aks.completion_percent, Some(84.81), "AKS verdict remains strict");
         let mut snapshots = json!({&table: {
             "source": "verified_stopped_snapshot_manifest", "run_id": run, "table": table,
@@ -14327,20 +14386,47 @@ mod tests {
         assert_eq!(coverage["queryable_delivery"], "unknown");
         assert!(coverage["delivery_latency"].is_null());
         snapshots[&table]["table_version"] = json!(586);
-        assert_eq!(kusto_snapshot_coverage(run, &table, &observation, &snapshots)?["status"], "mismatch");
+        assert_eq!(
+            kusto_snapshot_coverage(run, &table, &observation, &snapshots)?["status"],
+            "mismatch"
+        );
         snapshots[&table]["run_id"] = json!(uuid::Uuid::new_v4().to_string());
-        assert_eq!(kusto_snapshot_coverage(run, &table, &observation, &snapshots)?["status"], "unknown");
+        assert_eq!(
+            kusto_snapshot_coverage(run, &table, &observation, &snapshots)?["status"],
+            "unknown"
+        );
         let mut pinning = PinningReport::default();
-        pinning.owners.insert(canonical_table_key(&table), "collector".to_owned());
+        pinning
+            .owners
+            .insert(canonical_table_key(&table), "collector".to_owned());
         let clients = ClientRun {
-            metrics: HashMap::from([(table.clone(), ClientMetrics {
-                rows: 100, duration_ms: 1000, rows_per_second: 100.0, completions: Vec::new(),
-            })]),
-            pinning, qap_tables: vec![external], failure: None, evidence,
+            metrics: HashMap::from([(
+                table.clone(),
+                ClientMetrics {
+                    rows: 100,
+                    duration_ms: 1000,
+                    rows_per_second: 100.0,
+                    completions: Vec::new(),
+                },
+            )]),
+            pinning,
+            qap_tables: vec![external],
+            failure: None,
+            evidence,
         };
-        let rows = result_rows(&config, "orchestration", run, 1, 1, CellMeasurements {
-            clients, started_at_ms: 1, qap, resources: None,
-        })?;
+        let rows = result_rows(
+            &config,
+            "orchestration",
+            run,
+            1,
+            1,
+            CellMeasurements {
+                clients,
+                started_at_ms: 1,
+                qap,
+                resources: None,
+            },
+        )?;
         assert_eq!(rows[0].status, "succeeded");
         let result: Value = serde_json::from_str(rows[0].evidence_json.as_deref().context("evidence")?)?;
         assert_eq!(result["durable_commits"]["output_throughput"]["rows_per_second"], 123.0);

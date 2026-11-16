@@ -327,6 +327,7 @@ const CAPABILITIES: &[Capability] = &[
     capability!("maintenance.interval_secs", "one-shot"),
     capability!("maintenance.max_idle_backoff_secs", "3600"),
     capability!("maintenance.max_cycles", "unlimited"),
+    capability!("maintenance.max_consecutive_stale_plans", "8; inclusive 1..=1024"),
     capability!("maintenance.max_concurrent_tables", "1"),
     capability!("maintenance.max_concurrent_decoded_bytes", "unset"),
     capability!("maintenance.operation_timeout_secs", "900"),
@@ -366,6 +367,10 @@ const CAPABILITIES: &[Capability] = &[
     capability!("maintenance.max_active_files", "1000000"),
     capability!("maintenance.latest_partitions", "all"),
     capability!("maintenance.sealed_final", "false"),
+    capability!(
+        "maintenance.sealed_partitions_only",
+        "true; table property overrides process preference"
+    ),
     capability!("maintenance.checkpoint_every_commits", "100"),
     capability!("maintenance.log_retention_secs", "table policy or 2592000"),
     capability!("maintenance.max_prune_files", "10000"),
@@ -1592,6 +1597,11 @@ fn validate_maintenance(maintenance: &MaintenanceTunables) -> Result<()> {
             has_optimize,
         ),
         ("sealed_final", maintenance.sealed_final.is_some(), has_optimize),
+        (
+            "sealed_partitions_only",
+            maintenance.sealed_partitions_only.is_some(),
+            has_optimize,
+        ),
     ] {
         if present && !operation {
             bail!("maintenance.{name} requires its corresponding operation");
@@ -1603,6 +1613,15 @@ fn validate_maintenance(maintenance: &MaintenanceTunables) -> Result<()> {
         maintenance.max_idle_backoff_secs.or(Some(3_600)),
     )?;
     positive("maintenance.max_cycles", maintenance.max_cycles)?;
+    if maintenance
+        .max_consecutive_stale_plans
+        .is_some_and(|limit| !(1..=1024).contains(&limit))
+    {
+        bail!("maintenance.max_consecutive_stale_plans must be between 1 and 1024");
+    }
+    if maintenance.sealed_final.is_some() && maintenance.sealed_partitions_only.is_some() {
+        bail!("maintenance.sealed_final and sealed_partitions_only cannot be combined");
+    }
     let concurrent_tables = maintenance.max_concurrent_tables.unwrap_or(1);
     positive("maintenance.max_concurrent_tables", Some(concurrent_tables))?;
     if concurrent_tables > 16 {
@@ -2556,6 +2575,8 @@ mod tests {
                 max_concurrent_decoded_bytes: Some(200),
                 commit_attempts: Some(12),
                 commit_budget_secs: Some(15),
+                max_consecutive_stale_plans: Some(4),
+                sealed_partitions_only: Some(false),
                 input_read_strategy: Some(MaintenanceInputReadStrategy::Spool),
                 catalog_runtime_threads: Some(4),
                 catalog_rpc_timeout_secs: Some(45),
@@ -2569,6 +2590,33 @@ mod tests {
         assert_eq!(env["ARROWCOL_MAINT_MAX_CONCURRENT_DECODED_BYTES"], "200");
         assert_eq!(env["ARROWCOL_MAINT_COMMIT_ATTEMPTS"], "12");
         assert_eq!(env["ARROWCOL_MAINT_COMMIT_BUDGET_SECS"], "15");
+        assert_eq!(env["ARROWCOL_MAINT_MAX_CONSECUTIVE_STALE_PLANS"], "4");
+        assert_eq!(env["ARROWCOL_MAINT_SEALED_PARTITIONS_ONLY"], "false");
+        for value in [
+            serde_json::json!(0),
+            serde_json::json!(1025),
+            serde_json::json!("8"),
+            serde_json::json!(1.5),
+        ] {
+            assert!(
+                Tunables::parse_oat_json(serde_json::json!({"maintenance":{
+                    "enabled":true, "operations":["optimize"], "max_consecutive_stale_plans": value
+                }}))
+                .is_err()
+            );
+        }
+        for value in [1, 1024] {
+            Tunables::parse_oat_json(serde_json::json!({"maintenance":{
+                "enabled":true, "operations":["optimize"], "max_consecutive_stale_plans": value
+            }}))?;
+        }
+        for settings in [
+            serde_json::json!({"enabled":true,"operations":["optimize"],"sealed_partitions_only":"false"}),
+            serde_json::json!({"enabled":true,"operations":["vacuum"],"sealed_partitions_only":false}),
+            serde_json::json!({"enabled":true,"operations":["optimize"],"sealed_partitions_only":false,"sealed_final":true}),
+        ] {
+            assert!(Tunables::parse_oat_json(serde_json::json!({"maintenance":settings})).is_err());
+        }
         assert_eq!(env["ARROWCOL_MAINT_INPUT_READ_STRATEGY"], "spool");
         let range = Tunables {
             maintenance: Some(MaintenanceTunables {
