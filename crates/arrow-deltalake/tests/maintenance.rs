@@ -775,6 +775,41 @@ fn optimize_rejects_stale_and_metadata_changed_plans() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn optimize_probe_defers_below_threshold_malformed_partition() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let table = create(root.path())?;
+    append_value(&table, "not-a-time", BASE, 0..3)?;
+    let maintenance = DeltaTable::open_for_maintenance(&url_of(root.path())?)?;
+    let config = NegativeProbeConfig {
+        now_ms: BASE + 60 * MINUTE,
+        granularity: Granularity::Minute,
+        purge_retention_ms: 2_592_000_000,
+        vacuum_retention_ms: 604_800_000,
+        log_retention_ms: 2_592_000_000,
+        checkpoint_interval: 100,
+        optimize_small_file_bytes: 64 * 1024 * 1024,
+        optimize_min_files: 2,
+        sealed_partitions_only: true,
+        max_listed_files: 1000,
+    };
+    assert!(
+        maintenance
+            .probe_no_work(ProbeOperation::Optimize, &config, &control())?
+            .is_none()
+    );
+    let report = MaintenancePlan::Optimize(maintenance.plan_optimize(&optimize_config())?).report();
+    let evidence = report.maintenance_due_work.context("malformed partition evidence")?;
+    assert_eq!(evidence.completeness, MaintenanceDueWorkCompleteness::Incomplete);
+    assert_eq!(
+        evidence.incomplete_reason,
+        Some(MaintenanceDueWorkIncompleteReason::MalformedPartition)
+    );
+    assert_eq!(evidence.due, None);
+    assert_eq!(evidence.eligible_count, None);
+    Ok(())
+}
+
 /// Scenario: a malformed partition directory coexists with valid ingestion partitions.
 /// Guarantees: malformed values never authorize rewrite or deletion.
 #[test]
@@ -1998,6 +2033,11 @@ fn prune_log_deletes_proven_history_and_keeps_table_state() -> Result<()> {
     assert_eq!(maintenance.log_floor()?, None, "dry run writes no floor");
 
     let report = maintenance.apply_prune_log(&plan, &config, &control())?;
+    assert_eq!(report.maintenance_due_work, dry.maintenance_due_work);
+    let evidence = report.maintenance_due_work.as_ref().context("applied prune evidence")?;
+    assert_eq!(evidence.completeness, MaintenanceDueWorkCompleteness::Complete);
+    assert_eq!(evidence.due, Some(true));
+    assert_eq!(evidence.eligible_count, Some(checkpoint));
     assert_eq!(
         (report.outcome, report.files_deleted, report.version),
         (Outcome::Pruned, checkpoint, checkpoint)
@@ -2082,10 +2122,9 @@ fn prune_log_waits_for_vacuum_progress() -> Result<()> {
     );
     assert_eq!(evidence.due, None);
     assert_eq!(evidence.eligible_count, None);
-    assert_eq!(
-        maintenance.apply_prune_log(&plan, &config, &control())?.outcome,
-        Outcome::Noop
-    );
+    let applied = maintenance.apply_prune_log(&plan, &config, &control())?;
+    assert_eq!(applied.outcome, Outcome::Noop);
+    assert_eq!(applied.maintenance_due_work, plan.report().maintenance_due_work);
     assert_eq!(log_files(no_progress.path())?, before);
 
     let stale = tempfile::tempdir()?;

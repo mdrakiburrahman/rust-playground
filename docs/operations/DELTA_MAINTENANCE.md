@@ -34,6 +34,8 @@
 
 A complete observation has exact `due` and `eligible_count`; optional byte/backlog/oldest fields remain null unless authoritatively measured. An incomplete observation has null `due`, eligible/backlog counts and bytes, and oldest timestamp, plus an `incomplete_reason`. A missing `maintenance_due_work` value or a top-level operation error without a report is UNKNOWN, never zero. A scan bound, malformed layout, stale identity, or missing proof cannot be relabeled as action-cap backlog.
 
+The wire path is `OperationResult.report.maintenance_due_work`. Successful wrappers omit `error` and `error_kind`; failures can retain pre-action evidence. An error, `report.interrupted=true`, or `report.outcome=partial` makes eligibility UNKNOWN even when retained evidence says `complete`. The idle service test emits `maintenance_due_work_serde_fixtures=` with all five real operation wrappers and explicitly constructed error/interrupted/partial/missing-report qualification cases for reader compatibility checks.
+
 | Operation | Authoritative source and unit |
 | --- | --- |
 | PURGE | Active-file plan or bounded physical inventory; `parquet_files`. |
@@ -49,10 +51,10 @@ Probes open the guarded storage transport only: no schema initialization, Delta 
 | Phase | Cheap negative proof |
 | --- | --- |
 | PURGE | No physical ingestion partition ends at or before the retention cutoff. Malformed or non-ingestion partition layouts require the normal planner or return an error. |
-| OPTIMIZE | No eligible physical partition contains the configured minimum small files (at least two). The newest ingestion partition is excluded when `sealedPartitionsOnly` is true; categorical/multi-column Hive partitions conservatively use the full planner. Inactive physical files can force a full plan, but cannot authorize compaction. |
-| VACUUM | Every physical data object is at or newer than the retention cutoff, no old log objects exist, and checkpoint debt is below the configured interval. This is a negative proof only; physical timestamps never authorize deletion. |
+| OPTIMIZE | No eligible physical partition contains the configured minimum small files (at least two). Ingestion partition names must decode and parse at the configured granularity; malformed names defer to the full planner and remain incomplete, even below the file-count threshold. The newest ingestion partition is excluded when `sealedPartitionsOnly` is true; categorical/multi-column Hive partitions conservatively use the full planner. Inactive physical files can force a full plan, but cannot authorize compaction. |
+| VACUUM | Always defers to bounded tombstone replay. Physical object timestamps cannot establish tombstone eligibility or prove zero debt. |
 | Checkpoint | Latest log version minus checkpoint version is below `delta.checkpointInterval`. Unsupported multipart/v2 layouts go through the full path. |
-| PRUNE-LOG | No checkpoint exists or no retained log object is older than log retention. Otherwise the existing checkpoint/history equivalence proof remains mandatory. |
+| PRUNE-LOG | No retained log object is older than log retention. Otherwise the existing checkpoint/history equivalence proof remains mandatory; missing proof is incomplete. Full apply preserves the plan's due-work evidence, including no-work exits. |
 
 Metadata-only filesystem property caches are fenced by log-object identity tokens, including checkpoint changes and same-version replacements. Retention probes are recomputed against the current clock every pass; they are never cached solely by version.
 

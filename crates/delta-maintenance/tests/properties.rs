@@ -331,17 +331,14 @@ fn idle_catalog_policy_passes_have_no_log_checkpoint_or_progress_rewrites() -> R
             assert_eq!(evidence.due, Some(false));
             assert_eq!(evidence.eligible_count, Some(0));
         }
-        let serde_fixture = serde_json::to_value(
-            results[1]
-                .report
-                .as_ref()
-                .context("OPTIMIZE report")?
-                .maintenance_due_work
-                .as_ref()
-                .context("OPTIMIZE evidence")?,
-        )?;
+        let serde_fixture = serde_json::to_value(&results[1])?;
+        assert!(serde_fixture.get("error").is_none());
+        assert!(serde_fixture.get("error_kind").is_none());
+        assert_eq!(serde_fixture["operation"], "optimize");
+        assert_eq!(serde_fixture["report"]["interrupted"], false);
+        assert_eq!(serde_fixture["report"]["outcome"], "noop");
         assert_eq!(
-            serde_fixture,
+            serde_fixture["report"]["maintenance_due_work"],
             serde_json::json!({
                 "observed_at_ms": anchor,
                 "source": "bounded_physical_inventory",
@@ -357,6 +354,31 @@ fn idle_catalog_policy_passes_have_no_log_checkpoint_or_progress_rewrites() -> R
                 "incomplete_reason": null
             })
         );
+        let mut failed = results[1].clone();
+        failed.error_kind = Some("resource_limit");
+        failed.error = Some("fixture failure after planning".into());
+        let mut interrupted = results[1].clone();
+        interrupted.report.as_mut().context("fixture report")?.interrupted = true;
+        let mut partial = results[1].clone();
+        partial.report.as_mut().context("fixture report")?.outcome = Outcome::Partial;
+        let mut missing = results[1].clone();
+        missing.report = None;
+        let wrapper_fixtures = serde_json::json!([
+            {"case":"complete", "expected_eligibility":"complete", "result":serde_fixture},
+            {"case":"error", "expected_eligibility":"unknown", "result":failed},
+            {"case":"interrupted", "expected_eligibility":"unknown", "result":interrupted},
+            {"case":"partial", "expected_eligibility":"unknown", "result":partial},
+            {"case":"missing_report", "expected_eligibility":"unknown", "result":missing}
+        ]);
+        assert_eq!(wrapper_fixtures[1]["result"]["error_kind"], "resource_limit");
+        assert_eq!(wrapper_fixtures[2]["result"]["report"]["interrupted"], true);
+        assert_eq!(wrapper_fixtures[3]["result"]["report"]["outcome"], "partial");
+        assert!(wrapper_fixtures[4]["result"].get("report").is_none());
+        let fixtures = serde_json::json!({
+            "operation_results": results,
+            "qualification_cases": wrapper_fixtures
+        });
+        println!("maintenance_due_work_serde_fixtures={fixtures}");
         assert_eq!(before, inventory(root.path())?);
         let (reads, lists, writes) = store.snapshot();
         assert!(reads > 0);
@@ -661,15 +683,16 @@ fn invalid_catalog_properties_and_inventory_errors_fail_without_mutation() -> Re
         source.0.properties.remove(key);
     }
     persist_policy(&source)?;
+    let maintenance = DeltaTable::open_for_maintenance(&source.0.url)?;
+    maintenance.vacuum_once(
+        &VacuumConfig::new(settings.vacuum_retention_ms, anchor),
+        true,
+        &MaintenanceControl::default(),
+    )?;
     let hint = root.path().join("events/_delta_log/_last_checkpoint");
     for content in ["not-json", "{\"version\":99999}"] {
         std::fs::write(&hint, content)?;
         let malformed = inventory(root.path())?;
-        let malformed_logs = malformed
-            .iter()
-            .filter(|(path, _)| path.starts_with(Path::new("events/_delta_log")))
-            .map(|(path, value)| (path.clone(), value.clone()))
-            .collect::<BTreeMap<_, _>>();
         let results = run_cycle_with_discovery(&settings, &source, &Metrics::new(), &Arc::new(AtomicBool::new(false)))?;
         assert!(
             results
@@ -691,12 +714,7 @@ fn invalid_catalog_properties_and_inventory_errors_fail_without_mutation() -> Re
             );
         }
         let after = inventory(root.path())?;
-        let after_logs = after
-            .iter()
-            .filter(|(path, _)| path.starts_with(Path::new("events/_delta_log")))
-            .map(|(path, value)| (path.clone(), value.clone()))
-            .collect::<BTreeMap<_, _>>();
-        assert_eq!(malformed_logs, after_logs);
+        assert_eq!(malformed, after);
     }
     std::fs::remove_file(hint)?;
     std::fs::remove_file(root.path().join("events/_delta_log/00000000000000000001.json"))?;

@@ -1102,6 +1102,16 @@ impl DeltaTable {
                         let ingestion = groups.keys().all(|partition| {
                             partition.starts_with("__arrowcol_ingestion=") && !partition.contains('/')
                         });
+                        for partition in groups.keys() {
+                            if let Some(value) = partition.strip_prefix("__arrowcol_ingestion=") {
+                                let Ok(value) = percent_decode(value) else {
+                                    return Ok(None);
+                                };
+                                if config.granularity.parse_partition(&value).is_err() {
+                                    return Ok(None);
+                                }
+                            }
+                        }
                         !groups.iter().any(|(partition, count)| {
                             *count >= config.optimize_min_files
                                 && (!config.sealed_partitions_only || !ingestion || Some(partition) != newest)
@@ -6132,6 +6142,7 @@ impl DeltaTable {
         let mut report = MaintenanceReport::new("prune_log", &plan.header);
         report.cutoff_ms = Some(plan.log_cutoff_ms);
         report.backlog_files = plan.backlog_files;
+        report.maintenance_due_work = Some(plan.due_work());
         let Some(checkpoint) = plan.checkpoint_version else {
             return Ok(report);
         };
