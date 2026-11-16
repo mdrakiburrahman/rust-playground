@@ -57,6 +57,16 @@ fn compose_tunables(config: &OatConfig) -> Result<Value> {
     ] {
         let mut environment = role_environment(config, role)?;
         if matches!(role, ComponentRole::Collector) {
+            if config.platform.kind == crate::config::OatMode::Local
+                && config.campaign_profile == Some(crate::config::CampaignProfile::SingleHotTable)
+                && let Some(granularity) = config.tunables.maintenance.as_ref().and_then(|settings| settings.granularity)
+            {
+                let value = serde_json::to_value(granularity)?;
+                environment.insert(
+                    "ARROWCOL_PARTITION_GRANULARITY".to_owned(),
+                    value.as_str().context("invalid typed partition granularity")?.to_owned(),
+                );
+            }
             for &(legacy, canonical, _) in arrow_deltalake::delta::PROCESS_WRITER_PROPERTY_ENVIRONMENT_ALIASES {
                 if let Some(value) = environment.get(canonical).cloned() {
                     environment.insert(legacy.to_owned(), value);
@@ -178,6 +188,110 @@ fn inject_workload_environment(config: &OatConfig, resources: &mut [Value]) -> R
 #[cfg(test)]
 mod tunable_injection_tests {
     use super::*;
+
+    #[test]
+    fn local_campaign_granularity_reaches_both_consumers_and_gates_admission() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        config.campaign_profile = Some(crate::config::CampaignProfile::SingleHotTable);
+        config.tunables = serde_json::from_value(json!({
+            "maintenance":{"enabled":true,"operations":["purge"],"granularity":"hour"}
+        }))?;
+        let overlay = compose_tunables(&config)?;
+        let collector_env = overlay.pointer("/services/dataflow-1/environment")
+            .and_then(Value::as_object).context("collector environment missing")?
+            .iter().map(|(key, value)| Ok((key.clone(), value.as_str().context("not a string")?.to_owned())))
+            .collect::<Result<std::collections::BTreeMap<_, _>>>()?;
+        let writer = arrow_deltalake::delta::resolve_process_writer_properties_from_environment(&collector_env)?;
+        assert_eq!(writer.get("arrowcol.partition.granularity").map(String::as_str), Some("hour"));
+        assert_eq!(overlay.pointer("/services/delta-maintenance/environment/ARROWCOL_MAINT_GRANULARITY"), Some(&json!("hour")));
+        let table = canonical_dmv_table_name(&config.tables[0])?;
+        let collector = json!({"Config":{"Env":["ARROWCOL_PARTITION_GRANULARITY=hour"]}});
+        let event = |granularity: &str| format!("arrowcol_maintenance_table_config {}\n", json!({
+            "table": table,
+            "config": {"active":true,"table_policy":{"arrowcol.partition.granularity":granularity}}
+        }));
+        assert!(local_partition_policy_evidence("hour", &table, &collector, "")?.is_none());
+        let evidence = local_partition_policy_evidence("hour", &table, &collector, &event("hour"))?
+            .context("missing evidence")?;
+        assert_eq!(evidence["maintenance_table_effective"], "hour");
+        assert!(local_partition_policy_evidence("hour", &table, &collector, &event("minute")).is_err());
+        let mut properties = std::collections::BTreeMap::new();
+        assert_eq!(validate_local_table_partition_property(&properties, "hour")?, None);
+        properties.insert("arrowcol.partition.granularity".to_owned(), "hour".to_owned());
+        assert_eq!(validate_local_table_partition_property(&properties, "hour")?, Some("hour"));
+        properties.insert("arrowcol.partition.granularity".to_owned(), "minute".to_owned());
+        assert!(validate_local_table_partition_property(&properties, "hour").is_err());
+        assert!(local_partition_policy_evidence(
+            "hour", &table, &json!({"Config":{"Env":["ARROWCOL_PARTITION_GRANULARITY=minute"]}}), &event("hour")
+        ).is_err());
+        assert!(serde_json::from_value::<arrowcol_tunables::Tunables>(
+            json!({"maintenance":{"granularity":"hours"}})
+        ).is_err());
+        config.campaign_profile = None;
+        let noncampaign = compose_tunables(&config)?;
+        assert!(noncampaign.pointer("/services/dataflow-1/environment/ARROWCOL_PARTITION_GRANULARITY").is_none());
+        config.campaign_profile = Some(crate::config::CampaignProfile::SingleHotTable);
+        config.tunables.maintenance.as_mut().context("maintenance missing")?.granularity = None;
+        let unset = compose_tunables(&config)?;
+        assert!(unset.pointer("/services/dataflow-1/environment/ARROWCOL_PARTITION_GRANULARITY").is_none());
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires built delta-maintenance binary"]
+    fn local_campaign_granularity_reaches_real_maintenance_consumer() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("oat-partition-policy-{}", uuid::Uuid::new_v4()));
+        struct TempRoot(PathBuf);
+        impl Drop for TempRoot {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        std::fs::create_dir(&root)?;
+        let root = TempRoot(root);
+        let table = "telemetry.sqlserver.sqlserver_availability_replica_states";
+        arrowcol_loadgen::initialize::initialize_local(arrowcol_loadgen::cli::InitializeLocalArgs {
+            partition_by_ingestion_date: true, table: table.to_owned(), dataflow_root: root.0.clone(),
+        })?;
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        config.campaign_profile = Some(crate::config::CampaignProfile::SingleHotTable);
+        config.tables = vec!["sqlserver_availability_replica_states".to_owned()];
+        config.tunables = serde_json::from_value(json!({
+            "maintenance":{"enabled":true,"operations":["purge"],"granularity":"hour",
+                "purge_retention_secs":2592000}
+        }))?;
+        let overlay = compose_tunables(&config)?;
+        let environment = overlay.pointer("/services/dataflow-1/environment")
+            .and_then(Value::as_object).context("collector environment missing")?;
+        let env = environment.iter().map(|(key, value)|
+            Ok(format!("{key}={}", value.as_str().context("environment value is not a string")?)))
+            .collect::<Result<Vec<_>>>()?;
+        let collector = json!({"Config":{"Env": env}});
+        let url = url::Url::from_directory_path(&root.0).map_err(|()| anyhow::anyhow!("invalid root"))?;
+        let binary = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/delta-maintenance");
+        let output = std::process::Command::new(binary).env_clear()
+            .envs(role_environment(&config, ComponentRole::Maintenance)?)
+            .args(["--root", url.as_str(), "--table", table, "--operation", "purge",
+                "--interval-secs", "60", "--max-cycles", "1", "--no-metrics-listener"])
+            .output()?;
+        let stderr = String::from_utf8(output.stderr)?;
+        if !output.status.success() { bail!("maintenance fixture failed: {stderr}"); }
+        verify_process_configuration(&config, ComponentRole::Maintenance, &process_configurations(&stderr)?)?;
+        let evidence = local_partition_policy_evidence("hour", table, &collector, &stderr)?
+            .context("real maintenance consumer omitted effective table policy")?;
+        assert_eq!(evidence["maintenance_table_effective"], "hour");
+        let metadata_url = url::Url::from_directory_path(root.0.join(
+            "telemetry/sqlserver/sqlserver_availability_replica_states"
+        )).map_err(|()| anyhow::anyhow!("invalid table"))?;
+        let properties = arrow_deltalake::delta::DeltaTable::open_for_maintenance_probe(&metadata_url)?
+            .maintenance_properties()?;
+        assert!(!properties.contains_key("arrowcol.partition.granularity"));
+        Ok(())
+    }
 
     #[test]
     fn collector_upload_json_reaches_runtime() -> Result<()> {
