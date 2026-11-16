@@ -14,4 +14,6 @@ Custody therefore runs as a watchdog on a dedicated, separately leased devbox, n
 | Cleanup state machine | Fencing persists ordered, stable idempotency receipts; retries resume the same step, and completion requires every step to verify |
 | Cleanup adapter | Not yet qualified. The CLI fails closed on a fenced campaign without an injected executor; keep custody unarmed and do not start scale/load until the external stop/drain/evidence/QAP/FIC/ARM adapter is wired and exercised |
 
+The current `RunInventory.qap` records the database and exact external-table/path bindings, but not the original `oat-qap-record.json` snapshot or positive workload-stop receipt required by `cleanup_oat_qap`. No default external action adapter is wired; QAP cleanup must remain pending until its ownership proof is durably available to the watchdog.
+
 Before campaign load, exercise heartbeat expiry, stale-owner rejection, repeated cleanup, and a safe-idle no-op on the watchdog box. Confirm the final ARM state and preserve the evidence before handing the lease back. A cleanup operation that is pending or uncertain is never reported as complete.
