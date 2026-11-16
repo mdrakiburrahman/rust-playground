@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { CampaignConflictError, CUSTODY_CLEANUP_STEPS, armCampaign, publishRunInventory, startCampaign, type CampaignState, type CampaignStore, type RunInventory, type StoredCampaign } from './aks-campaign.js';
+import { CampaignConflictError, CUSTODY_CLEANUP_STEPS, HEARTBEAT_INTERVAL_MS, MAX_CAMPAIGN_LIFETIME_MS, armCampaign, publishRunInventory, startCampaign, validateCampaignState, type CampaignState, type CampaignStore, type RunInventory, type StoredCampaign } from './aks-campaign.js';
 import { watchdogOnce } from './aks-watchdog.js';
-import { runRehearsalWatchdogOnce, type RehearsalEvidenceRecord } from './aks-rehearsal.js';
+import { createSyntheticArmedCampaignState, ReadOnlyAzureAdapter, runRehearsalWatchdogOnce, type RehearsalEvidenceRecord } from './aks-rehearsal.js';
 import { createExternalCleanupExecutor, type ExternalCleanupActions } from './aks-cleanup-executor.js';
 import { reconcileCleanupOnce, reconcileOnce } from './aks-reconcile.js';
 
@@ -157,12 +157,18 @@ test('maintenance stop persists a deadline and retains uncertainty without repla
 
 
 test('isolated D40 watchdog uses its injected no-op executor and read-only status adapter', async () => {
-  const realStore = new MemoryStore(), store = await armedStore();
+  const realStore = new MemoryStore(), store = new MemoryStore();
+  const fixture = createSyntheticArmedCampaignState(campaignId, ownerId);
+  const startedAtMs = Date.now() - 4 * HEARTBEAT_INTERVAL_MS;
+  store.current = { state: validateCampaignState({ ...fixture, startedAtMs, heartbeatAtMs: startedAtMs,
+    expiresAtMs: startedAtMs + MAX_CAMPAIGN_LIFETIME_MS }), etag: 'etag-seed' };
   const evidence: RehearsalEvidenceRecord[] = [], armReads: string[] = [];
+  const adapter = new ReadOnlyAzureAdapter(async (method, url) => {
+    armReads.push(method + ' ' + url);
+    return { status: 200, body: Buffer.from('{"status":"InProgress"}') };
+  }, event => evidence.push(event));
   const result = await runRehearsalWatchdogOnce({ env: { ARM_SUBSCRIPTION_ID: subscriptionId }, rehearsalId: campaignId,
-    ownerId, realStore, isolatedStore: store,
-    readOnlyAzure: { readArmStatus: async url => { armReads.push(url); return { status: 200, body: { status: 'InProgress' } }; } },
-    evidence: event => evidence.push(event) });
+    ownerId, realStore, isolatedStore: store, readOnlyAzure: adapter, evidence: event => evidence.push(event) });
   const current = (await store.read())!;
   assert.equal(current.state.status, 'cleaning');
   assert.equal(current.state.cleanupSteps[0]!.status, 'complete');
@@ -170,4 +176,5 @@ test('isolated D40 watchdog uses its injected no-op executor and read-only statu
   assert.deepEqual(armReads, []);
   assert.equal(evidence.some(event => event.event === 'recording_cleanup_noop'), true);
   assert.equal(evidence.some(event => event.event === 'campaign_transition' && event.fencing_token === 2), true);
+  assert.ok(evidence.every(event => event.rehearsal_fixture === 'synthetic custody fixture' && event.external_effects === 'simulated'));
 });

@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -6,9 +6,10 @@ import { parseArgs } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
 import { Azure } from '../../infra/azure/bootstrap.js';
 import { loadCustodyConfig } from './aks-custody-config.js';
-import { createBlobCampaignStore, heartbeatCampaign, startCampaign, type CampaignState, type CampaignStore,
-  type CleanupStepName, type StoredCampaign } from './aks-campaign.js';
-import { runWatchdog, watchdogOnce, type WatchdogReadOnlyAzure } from './aks-watchdog.js';
+import { CampaignConflictError, createBlobCampaignStore, heartbeatCampaign, newCampaignState, validateCampaignState,
+  type CampaignState, type CampaignStore, type CleanupStepName, type RunInventory, type StoredCampaign,
+  HEARTBEAT_INTERVAL_MS, MISSED_HEARTBEAT_LIMIT, isInitialRunInventory } from './aks-campaign.js';
+import { watchdogOnce, type WatchdogReadOnlyAzure } from './aks-watchdog.js';
 
 export const REHEARSAL_BLOB_ROOT = '_arrowcol-custody-rehearsal';
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -17,7 +18,8 @@ export interface RehearsalEvidenceRecord { observed_at: string; event: string; [
 export type RehearsalEvidenceSink = (record: RehearsalEvidenceRecord) => void;
 
 function recordEvidence(sink: RehearsalEvidenceSink, event: string, values: Record<string, unknown> = {}): void {
-  sink({ observed_at: new Date().toISOString(), event, ...values });
+  sink({ ...values, observed_at: new Date().toISOString(), event, rehearsal_fixture: 'synthetic custody fixture',
+    external_effects: 'simulated' });
 }
 
 export function createJsonLinesEvidenceSink(filename: string): RehearsalEvidenceSink {
@@ -44,8 +46,23 @@ export function assertRehearsalPathIsolated(recordPath: string, realRecordPath =
   }
 }
 
-export function createEvidenceCampaignStore(store: CampaignStore, recordPath: string,
-  evidence: RehearsalEvidenceSink): CampaignStore {
+export type ReadOnlyCampaignStore = Pick<CampaignStore, 'read'>;
+
+function createReadOnlyEvidenceCampaignStore(store: CampaignStore, evidence: RehearsalEvidenceSink): ReadOnlyCampaignStore {
+  return {
+    async read() {
+      const current = await store.read();
+      recordEvidence(evidence, 'blob_read', { path: 'active.json', etag: current?.etag ?? null,
+        campaign_id: current?.state.campaignId ?? null, status: current?.state.status ?? null,
+        fencing_token: current?.state.fencingToken ?? null, record_scope: 'real-read-only' });
+      return current;
+    },
+  };
+}
+
+function createEvidenceCampaignStore(store: CampaignStore, recordPath: string, evidence: RehearsalEvidenceSink,
+  realStore: ReadOnlyCampaignStore): CampaignStore {
+  assertRehearsalPathIsolated(recordPath);
   let previous: StoredCampaign | undefined;
   return {
     async read() {
@@ -57,6 +74,7 @@ export function createEvidenceCampaignStore(store: CampaignStore, recordPath: st
       return current;
     },
     async write(state, expectedEtag) {
+      await assertRealCampaignTerminal(realStore, evidence);
       const before = previous;
       try {
         const etag = await store.write(state, expectedEtag);
@@ -66,19 +84,21 @@ export function createEvidenceCampaignStore(store: CampaignStore, recordPath: st
           from_fencing_token: before?.state.fencingToken ?? null, fencing_token: state.fencingToken });
         return etag;
       } catch (error) {
-        recordEvidence(evidence, 'blob_write_unconfirmed', { path: recordPath, previous_etag: expectedEtag ?? null,
-          campaign_id: state.campaignId, status: state.status, fencing_token: state.fencingToken });
+        recordEvidence(evidence, error instanceof CampaignConflictError ? 'blob_write_cas_conflict' : 'blob_write_outcome_unknown',
+          { path: recordPath, previous_etag: expectedEtag ?? null, campaign_id: state.campaignId,
+            status: state.status, fencing_token: state.fencingToken,
+            error_name: error instanceof Error ? error.name : 'unknown' });
         throw error;
       }
     },
   };
 }
 
-export async function assertRealCampaignTerminal(store: CampaignStore, evidence: RehearsalEvidenceSink): Promise<void> {
+export async function assertRealCampaignTerminal(store: ReadOnlyCampaignStore, evidence: RehearsalEvidenceSink): Promise<void> {
   const stored = await store.read();
   recordEvidence(evidence, 'real_campaign_read', { path: 'active.json', etag: stored?.etag ?? null,
     campaign_id: stored?.state.campaignId ?? null, status: stored?.state.status ?? null,
-    fencing_token: stored?.state.fencingToken ?? null });
+    fencing_token: stored?.state.fencingToken ?? null, record_scope: 'real-read-only' });
   if (stored && !['complete', 'complete_unsettled'].includes(stored.state.status))
     throw new Error('Real campaign record is non-terminal; refusing rehearsal startup.');
 }
@@ -122,6 +142,66 @@ export function createReadOnlyAzureAdapter(azure: Azure, evidence: RehearsalEvid
   }, evidence);
 }
 
+const SYNTHETIC_SUBSCRIPTION_ID = '00000000-0000-4000-8000-000000000001';
+
+export function createSyntheticArmedCampaignState(rehearsalId: string, ownerId: string): CampaignState {
+  const state = newCampaignState(rehearsalId, ownerId);
+  const cellRunId = randomUUID();
+  const namespace = 'd40a-synthetic-' + cellRunId.replace(/-/g, '');
+  const ficName = 'arrowcol-run-' + cellRunId;
+  const notStarted = () => ({ state: 'not_started' as const, deadline_unix_ms: null, reason_code: null });
+  const inventory: RunInventory = {
+    schema_version: 1,
+    campaign_id: rehearsalId,
+    owner_id: ownerId,
+    fencing_token: state.fencingToken,
+    orchestration_run_id: randomUUID(),
+    cell_run_id: cellRunId,
+    load_admission: 'not_authorized',
+    namespace: { name: namespace, uid: null, owner_token: ownerId },
+    resources: [{ api_version: 'apps/v1', kind: 'Deployment', namespace, name: 'synthetic-collector', uid: null,
+      absence: null, role: 'collector', state: 'planned' }],
+    fic: { resource_id: '/subscriptions/' + SYNTHETIC_SUBSCRIPTION_ID + '/resourceGroups/d40a-synthetic/providers/Microsoft.ManagedIdentity/userAssignedIdentities/d40a-synthetic/federatedIdentityCredentials/' + ficName,
+      name: ficName, state: 'planned', absence: null },
+    qap: { database: 'd40a_synthetic', bindings: [], state: 'planned', absence: [] },
+    cleanup: { stop_admission: notStarted(), bounded_drain: notStarted(), evidence_capture: notStarted(),
+      stop_maintenance: notStarted(), terminal_capture: notStarted(), handoff: notStarted() },
+  };
+  if (!isInitialRunInventory(inventory)) throw new Error('Synthetic custody inventory must remain unprovisioned and not authorized.');
+  return validateCampaignState({ ...state, mode: 'armed', runInventory: inventory });
+}
+
+function assertSyntheticRehearsalState(state: CampaignState, rehearsalId: string, ownerId: string): void {
+  const inventory = state.runInventory;
+  if (state.campaignId !== rehearsalId || state.ownerId !== ownerId || state.mode !== 'armed' || !inventory ||
+      inventory.campaign_id !== rehearsalId || inventory.owner_id !== ownerId || inventory.load_admission !== 'not_authorized' ||
+      inventory.fencing_token !== 1 || inventory.namespace.uid !== null ||
+      inventory.namespace.name !== 'd40a-synthetic-' + inventory.cell_run_id.replace(/-/g, '') || state.operations.length !== 0 ||
+      inventory.resources.length !== 1 || inventory.resources.some(resource => resource.api_version !== 'apps/v1' ||
+        resource.kind !== 'Deployment' || resource.namespace !== inventory.namespace.name || resource.name !== 'synthetic-collector' ||
+        resource.role !== 'collector' || resource.state !== 'planned' || resource.uid !== null) ||
+      !inventory.fic || inventory.fic.state !== 'planned' || inventory.fic.name !== 'arrowcol-run-' + inventory.cell_run_id ||
+      inventory.fic.resource_id !== '/subscriptions/' + SYNTHETIC_SUBSCRIPTION_ID +
+        '/resourceGroups/d40a-synthetic/providers/Microsoft.ManagedIdentity/userAssignedIdentities/d40a-synthetic/federatedIdentityCredentials/' + inventory.fic.name ||
+      !inventory.qap || inventory.qap.database !== 'd40a_synthetic' || inventory.qap.state !== 'planned' ||
+      inventory.qap.bindings.length !== 0 || !isInitialRunInventory(inventory)) {
+    throw new Error('Isolated record is not the exact unprovisioned synthetic armed fixture.');
+  }
+}
+
+async function seedSyntheticRehearsalCampaign(store: CampaignStore, rehearsalId: string, ownerId: string,
+  evidence: RehearsalEvidenceSink): Promise<StoredCampaign> {
+  if (await store.read()) throw new Error('Isolated rehearsal record already exists; refusing to overwrite it.');
+  const state = createSyntheticArmedCampaignState(rehearsalId, ownerId);
+  const etag = await store.write(state, undefined);
+  const confirmed = await store.read();
+  if (!confirmed || confirmed.etag !== etag || JSON.stringify(confirmed.state) !== JSON.stringify(state))
+    throw new Error('Synthetic fixture write could not be proven by exact ETag and state readback; refusing replay.');
+  recordEvidence(evidence, 'synthetic_fixture_seeded', { campaign_id: rehearsalId, owner_id: ownerId,
+    fencing_token: state.fencingToken, etag });
+  return confirmed;
+}
+
 export function recordingCleanupExecutor(evidence: RehearsalEvidenceSink) {
   return async (step: CleanupStepName, state: CampaignState, idempotencyKey: string): Promise<'complete'> => {
     recordEvidence(evidence, 'recording_cleanup_noop', { campaign_id: state.campaignId,
@@ -131,66 +211,124 @@ export function recordingCleanupExecutor(evidence: RehearsalEvidenceSink) {
 }
 
 export async function runRehearsalWatchdogOnce(options: {
-  env: NodeJS.ProcessEnv; rehearsalId: string; ownerId: string; realStore: CampaignStore;
-  isolatedStore: CampaignStore; readOnlyAzure: WatchdogReadOnlyAzure; evidence: RehearsalEvidenceSink;
+  env: NodeJS.ProcessEnv; rehearsalId: string; ownerId: string; realStore: ReadOnlyCampaignStore;
+  isolatedStore: CampaignStore; readOnlyAzure: ReadOnlyAzureAdapter; evidence: RehearsalEvidenceSink;
 }): Promise<Record<string, unknown>> {
   const recordPath = rehearsalCampaignRecordPath(options.rehearsalId);
   assertRehearsalPathIsolated(recordPath);
   await assertRealCampaignTerminal(options.realStore, options.evidence);
-  const store = createEvidenceCampaignStore(options.isolatedStore, recordPath, options.evidence);
+  const store = createEvidenceCampaignStore(options.isolatedStore, recordPath, options.evidence, options.realStore);
   const current = await store.read();
-  if (!current || current.state.campaignId !== options.rehearsalId || current.state.ownerId !== options.ownerId)
-    throw new Error('Isolated rehearsal campaign identity does not match the requested run.');
+  if (!current) throw new Error('Isolated rehearsal campaign record does not exist.');
+  assertSyntheticRehearsalState(current.state, options.rehearsalId, options.ownerId);
   const result = await watchdogOnce(options.env, recordingCleanupExecutor(options.evidence), store, options.readOnlyAzure);
   recordEvidence(options.evidence, 'watchdog_result', { campaign_id: options.rehearsalId, ...result });
-  return result;
+  return { ...result, rehearsal_fixture: 'synthetic custody fixture', external_effects: 'simulated' };
 }
 
 export async function runRehearsalOwner(options: {
-  rehearsalId: string; ownerId: string; realStore: CampaignStore; isolatedStore: CampaignStore;
+  rehearsalId: string; ownerId: string; realStore: ReadOnlyCampaignStore; isolatedStore: CampaignStore;
   evidence: RehearsalEvidenceSink; signal: AbortSignal;
 }): Promise<void> {
   const recordPath = rehearsalCampaignRecordPath(options.rehearsalId);
-  assertRehearsalPathIsolated(recordPath);
+  const store = createEvidenceCampaignStore(options.isolatedStore, recordPath, options.evidence, options.realStore);
   await assertRealCampaignTerminal(options.realStore, options.evidence);
-  const store = createEvidenceCampaignStore(options.isolatedStore, recordPath, options.evidence);
-  if (await store.read()) throw new Error('Isolated rehearsal record already exists; refusing to overwrite it.');
-  const started = await startCampaign(store, options.rehearsalId, options.ownerId);
+  const started = await seedSyntheticRehearsalCampaign(store, options.rehearsalId, options.ownerId, options.evidence);
   recordEvidence(options.evidence, 'owner_started', { campaign_id: started.state.campaignId,
     owner_id: started.state.ownerId, fencing_token: started.state.fencingToken, etag: started.etag });
+  if (options.signal.aborted) {
+    recordEvidence(options.evidence, 'owner_stopped', { campaign_id: options.rehearsalId, reason: 'abort-signal' });
+    return;
+  }
   while (!options.signal.aborted) {
     try { await delay(60_000, undefined, { signal: options.signal }); }
     catch (error) {
-      if (options.signal.aborted && error instanceof Error && error.name === 'AbortError') return;
+      if (options.signal.aborted && error instanceof Error && error.name === 'AbortError') {
+        recordEvidence(options.evidence, 'owner_stopped', { campaign_id: options.rehearsalId, reason: 'abort-signal' });
+        return;
+      }
       throw error;
     }
-    if (options.signal.aborted) return;
-    const heartbeat = await heartbeatCampaign(store, options.ownerId, started.state.fencingToken);
-    recordEvidence(options.evidence, 'owner_heartbeat', { campaign_id: heartbeat.state.campaignId,
-      fencing_token: heartbeat.state.fencingToken, heartbeat_sequence: heartbeat.state.heartbeatSequence,
-      heartbeat_at_unix_ms: heartbeat.state.heartbeatAtMs, etag: heartbeat.etag });
+    if (options.signal.aborted) {
+      recordEvidence(options.evidence, 'owner_stopped', { campaign_id: options.rehearsalId, reason: 'abort-signal' });
+      return;
+    }
+    await runRehearsalOwnerHeartbeatOnce(options);
   }
+}
+
+export async function runRehearsalOwnerHeartbeatOnce(options: {
+  rehearsalId: string; ownerId: string; realStore: ReadOnlyCampaignStore; isolatedStore: CampaignStore;
+  evidence: RehearsalEvidenceSink;
+}): Promise<StoredCampaign> {
+  const recordPath = rehearsalCampaignRecordPath(options.rehearsalId);
+  const store = createEvidenceCampaignStore(options.isolatedStore, recordPath, options.evidence, options.realStore);
+  const current = await store.read();
+  if (!current) throw new Error('Isolated rehearsal campaign record does not exist.');
+  assertSyntheticRehearsalState(current.state, options.rehearsalId, options.ownerId);
+  if (current.state.status !== 'active' || current.state.fencingToken !== current.state.runInventory!.fencing_token)
+    throw new Error('Owner heartbeat requires the active synthetic producer authority.');
+  const heartbeat = await heartbeatCampaign(store, options.ownerId, current.state.runInventory!.fencing_token);
+  recordEvidence(options.evidence, 'owner_heartbeat', { campaign_id: heartbeat.state.campaignId,
+    fencing_token: heartbeat.state.fencingToken, heartbeat_sequence: heartbeat.state.heartbeatSequence,
+    heartbeat_at_unix_ms: heartbeat.state.heartbeatAtMs, etag: heartbeat.etag });
+  return heartbeat;
+}
+
+export async function runRehearsalStaleOwnerProbe(options: {
+  rehearsalId: string; ownerId: string; phase: 'pre-fence' | 'post-fence'; realStore: ReadOnlyCampaignStore;
+  isolatedStore: CampaignStore; evidence: RehearsalEvidenceSink;
+}): Promise<Record<string, unknown>> {
+  const recordPath = rehearsalCampaignRecordPath(options.rehearsalId);
+  const store = createEvidenceCampaignStore(options.isolatedStore, recordPath, options.evidence, options.realStore);
+  await assertRealCampaignTerminal(options.realStore, options.evidence);
+  const current = await store.read();
+  if (!current) throw new Error('Isolated rehearsal campaign record does not exist.');
+  assertSyntheticRehearsalState(current.state, options.rehearsalId, options.ownerId);
+  const state = current.state, producerToken = state.runInventory!.fencing_token, now = Date.now();
+  if (options.phase === 'pre-fence' && (state.status !== 'active' ||
+      now < state.expiresAtMs && Math.floor((now - state.heartbeatAtMs) / HEARTBEAT_INTERVAL_MS) < MISSED_HEARTBEAT_LIMIT))
+    throw new Error('Pre-fence stale-owner probe requires an expired active synthetic owner.');
+  if (options.phase === 'post-fence' && (state.status === 'active' || state.fencingToken <= producerToken))
+    throw new Error('Post-fence stale-owner probe requires a controller-issued fencing token.');
+  let failure: unknown;
+  try { await heartbeatCampaign(store, options.ownerId, producerToken, now); }
+  catch (error) { failure = error; }
+  if (!failure) throw new Error('Stale synthetic owner heartbeat unexpectedly succeeded.');
+  const message = failure instanceof Error ? failure.message : 'Unexpected owner heartbeat rejection.';
+  const expected = options.phase === 'pre-fence'
+    ? /Campaign owner heartbeat is expired; mutation rejected\.|Campaign maximum lifetime has expired; heartbeat rejected\./.test(message)
+    : /Campaign owner is fenced, stale or does not match the active run\./.test(message);
+  if (!expected) throw failure;
+  recordEvidence(options.evidence, 'stale_owner_write_rejected', { campaign_id: options.rehearsalId, phase: options.phase,
+    status: state.status, producer_fencing_token: producerToken, current_fencing_token: state.fencingToken, error: message });
+  return { status: 'owner_write_rejected', phase: options.phase, campaign_id: options.rehearsalId,
+    producer_fencing_token: producerToken, current_fencing_token: state.fencingToken,
+    rehearsal_fixture: 'synthetic custody fixture', external_effects: 'simulated' };
 }
 
 async function main(args: string[]): Promise<void> {
   const parsed = parseArgs({ args, allowPositionals: false, options: {
     mode: { type: 'string' }, 'rehearsal-id': { type: 'string' }, 'owner-id': { type: 'string' },
     'env-file': { type: 'string' }, 'stamp-config': { type: 'string' }, 'evidence-file': { type: 'string' },
-    once: { type: 'boolean' }, watch: { type: 'boolean' },
+    once: { type: 'boolean' }, phase: { type: 'string' },
   } });
   const { mode, 'rehearsal-id': rehearsalId, 'owner-id': ownerId, 'env-file': envFile,
     'stamp-config': stampConfig, 'evidence-file': evidenceFile } = parsed.values;
-  if (!['owner', 'watchdog'].includes(mode ?? '') || !rehearsalId || !uuid.test(rehearsalId) || !envFile || !stampConfig || !evidenceFile)
-    throw new Error('Usage: aks-rehearsal.ts --mode owner|watchdog --rehearsal-id UUID --env-file PATH --stamp-config YAML --evidence-file PATH [--owner-id UUID] [--once|--watch].');
-  if (mode === 'owner' && (!ownerId || !uuid.test(ownerId) || parsed.values.once || parsed.values.watch))
+  if (!['owner', 'watchdog', 'stale-owner'].includes(mode ?? '') || !rehearsalId || !uuid.test(rehearsalId) || !envFile || !stampConfig || !evidenceFile)
+    throw new Error('Usage: aks-rehearsal.ts --mode owner|watchdog|stale-owner --rehearsal-id UUID --env-file PATH --stamp-config YAML --evidence-file PATH --owner-id UUID [--once] [--phase pre-fence|post-fence].');
+  if (mode === 'owner' && (!ownerId || !uuid.test(ownerId) || parsed.values.once || parsed.values.phase))
     throw new Error('Owner mode requires --owner-id UUID and does not accept watchdog mode flags.');
-  if (mode === 'watchdog' && Boolean(parsed.values.once) === Boolean(parsed.values.watch))
-    throw new Error('Watchdog mode requires exactly one of --once or --watch.');
+  if (mode === 'watchdog' && (!ownerId || !uuid.test(ownerId) || !parsed.values.once || parsed.values.phase))
+    throw new Error('Watchdog mode requires --owner-id UUID and --once.');
+  if (mode === 'stale-owner' && (!ownerId || !uuid.test(ownerId) || !['pre-fence', 'post-fence'].includes(parsed.values.phase ?? '') ||
+      parsed.values.once))
+    throw new Error('Stale-owner mode requires --owner-id UUID and exactly one --phase pre-fence|post-fence.');
   const selected = loadCustodyConfig(['--env-file', envFile, '--stamp-config', stampConfig]);
   const evidence = createJsonLinesEvidenceSink(evidenceFile);
   const config = { account: selected.config.account, container: selected.config.checkpoints,
     subscriptionId: selected.config.subscription };
-  const realStore = createEvidenceCampaignStore(createBlobCampaignStore(config), 'active.json', evidence);
+  const realStore = createReadOnlyEvidenceCampaignStore(createBlobCampaignStore(config), evidence);
   const recordPath = rehearsalCampaignRecordPath(rehearsalId);
   assertRehearsalPathIsolated(recordPath);
   const isolatedStore = createBlobCampaignStore({ ...config, recordPath });
@@ -202,19 +340,14 @@ async function main(args: string[]): Promise<void> {
     await runRehearsalOwner({ rehearsalId, ownerId: ownerId!, realStore, isolatedStore, evidence, signal: controller.signal });
     return;
   }
-  if (mode !== 'watchdog' || !ownerId || !uuid.test(ownerId))
-    throw new Error('Watchdog mode requires an explicit --owner-id UUID.');
-  const azure = new Azure(selected.config), readOnlyAzure = createReadOnlyAzureAdapter(azure, evidence);
-  const evaluate = () => runRehearsalWatchdogOnce({ env: selected.env, rehearsalId, ownerId, realStore, isolatedStore, readOnlyAzure, evidence });
-  if (parsed.values.once) {
-    console.log(JSON.stringify(await evaluate()));
+  if (mode === 'stale-owner') {
+    console.log(JSON.stringify(await runRehearsalStaleOwnerProbe({ rehearsalId, ownerId: ownerId!,
+      phase: parsed.values.phase as 'pre-fence' | 'post-fence', realStore, isolatedStore, evidence })));
     return;
   }
-  const controller = new AbortController();
-  const stop = () => controller.abort();
-  process.once('SIGINT', stop);
-  process.once('SIGTERM', stop);
-  await runWatchdog(controller.signal, evaluate);
+  const azure = new Azure(selected.config), readOnlyAzure = createReadOnlyAzureAdapter(azure, evidence);
+  const evaluate = () => runRehearsalWatchdogOnce({ env: selected.env, rehearsalId, ownerId: ownerId!, realStore, isolatedStore, readOnlyAzure, evidence });
+  console.log(JSON.stringify(await evaluate()));
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
