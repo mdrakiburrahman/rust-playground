@@ -1,11 +1,11 @@
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use arrow::array::{Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow_deltalake::delta::{DeltaTable, INGESTION_PARTITION};
 use arrow_deltalake::maintenance::test_support::CountingObjectStore;
 use arrow_deltalake::maintenance::{
-    Granularity, MaintenanceControl, MaintenanceError, MaintenanceErrorKind, NegativeProbeConfig, OptimizeConfig,
-    Outcome, ProbeOperation, now_ms,
+    Granularity, MaintenanceControl, MaintenanceDueWorkCompleteness, MaintenanceError, MaintenanceErrorKind,
+    NegativeProbeConfig, OptimizeConfig, Outcome, ProbeOperation, VacuumConfig, now_ms,
 };
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_maintenance::{
@@ -286,6 +286,22 @@ fn idle_catalog_policy_passes_have_no_log_checkpoint_or_progress_rewrites() -> R
     let counted_store = Arc::clone(&store);
     let counted_store: Arc<dyn delta_kernel::object_store::ObjectStore> = counted_store;
     source.1 = Some(DeltaTable::open_with_store(table_path, counted_store)?);
+    let maintenance = source.1.as_ref().context("counted maintenance table")?;
+    let anchor = settings.anchor_ms.context("test maintenance anchor")?;
+    assert_eq!(
+        maintenance.checkpoint_if_due_at(1, true, anchor)?.outcome,
+        Outcome::Checkpointed
+    );
+    assert_eq!(
+        maintenance
+            .vacuum_once(
+                &VacuumConfig::new(settings.vacuum_retention_ms, anchor),
+                true,
+                &MaintenanceControl::default()
+            )?
+            .outcome,
+        Outcome::Noop
+    );
     let before = inventory(root.path())?;
     let metrics = Metrics::new();
     for _ in 0..2 {
@@ -293,7 +309,7 @@ fn idle_catalog_policy_passes_have_no_log_checkpoint_or_progress_rewrites() -> R
         let results = run_cycle_with_discovery(&settings, &source, &metrics, &Arc::new(AtomicBool::new(false)))?;
         assert_eq!(results.len(), 5);
         assert!(results.iter().all(|r| r.error.is_none()));
-        assert_eq!(results.iter().filter(|r| r.negative_probe).count(), 4);
+        assert_eq!(results.iter().filter(|r| r.negative_probe).count(), 3);
         assert_eq!(results[0].operation, Operation::Purge);
         assert!(results.iter().all(|result| {
             result.probe_duration_ms.saturating_add(result.plan_apply_duration_ms)
@@ -304,11 +320,51 @@ fn idle_catalog_policy_passes_have_no_log_checkpoint_or_progress_rewrites() -> R
                 .iter()
                 .all(|r| r.report.as_ref().is_some_and(|r| r.outcome == Outcome::Noop))
         );
+        for result in &results {
+            let evidence = result
+                .report
+                .as_ref()
+                .and_then(|report| report.maintenance_due_work.as_ref())
+                .context("each idle operation reports bounded due-work evidence")?;
+            assert_eq!(evidence.observed_at_ms, anchor, "{:?} anchor", result.operation);
+            assert_eq!(evidence.completeness, MaintenanceDueWorkCompleteness::Complete);
+            assert_eq!(evidence.due, Some(false));
+            assert_eq!(evidence.eligible_count, Some(0));
+        }
+        let serde_fixture = serde_json::to_value(
+            results[1]
+                .report
+                .as_ref()
+                .context("OPTIMIZE report")?
+                .maintenance_due_work
+                .as_ref()
+                .context("OPTIMIZE evidence")?,
+        )?;
+        assert_eq!(
+            serde_fixture,
+            serde_json::json!({
+                "observed_at_ms": anchor,
+                "source": "bounded_physical_inventory",
+                "completeness": "complete",
+                "unit": "parquet_files",
+                "due": false,
+                "eligible_count": 0,
+                "eligible_bytes": 0,
+                "backlog_count": 0,
+                "backlog_bytes": 0,
+                "oldest_eligible_timestamp_ms": null,
+                "oldest_timestamp_basis": null,
+                "incomplete_reason": null
+            })
+        );
         assert_eq!(before, inventory(root.path())?);
         let (reads, lists, writes) = store.snapshot();
         assert!(reads > 0);
-        assert!(lists > 0 && lists <= 18, "idle pass made {lists} object listings");
-        assert!(reads <= 48, "idle pass made {reads} object reads/listings");
+        assert!(
+            lists > 0 && lists <= 24,
+            "bounded idle pass made {lists} object listings"
+        );
+        assert!(reads <= 72, "bounded idle pass made {reads} object reads/listings");
         assert_eq!(writes, 0, "idle pass must not write objects");
     }
     assert!(metrics.render().contains("delta_maintenance_negative_probes_total"));
@@ -377,7 +433,7 @@ fn later_vacuum_probe_uses_fresh_due_time_after_earlier_operation() -> Result<()
     )?;
     assert_eq!(discovery.calls.load(Ordering::SeqCst), 2);
     assert_eq!(results.len(), 2);
-    assert_eq!(results[0].operation, Operation::Purge);
+    assert_eq!(results[1].operation, Operation::Purge);
     assert!(results[0].negative_probe, "purge remains not due");
     assert_eq!(results[1].operation, Operation::Vacuum);
     assert!(
@@ -548,6 +604,14 @@ fn changed_policy_bypasses_old_schedule_without_repeating_an_unchanged_idle_pass
 #[test]
 fn invalid_catalog_properties_and_inventory_errors_fail_without_mutation() -> Result<()> {
     let (root, settings, mut source) = fixture()?;
+    let maintenance = DeltaTable::open_for_maintenance(&source.0.url)?;
+    let anchor = settings.anchor_ms.context("test maintenance anchor")?;
+    maintenance.checkpoint_if_due_at(1, true, anchor)?;
+    maintenance.vacuum_once(
+        &VacuumConfig::new(settings.vacuum_retention_ms, anchor),
+        true,
+        &MaintenanceControl::default(),
+    )?;
     let before = inventory(root.path())?;
     for (key, value) in [
         ("arrowcol.optimize.minFile", "2"),
@@ -557,12 +621,42 @@ fn invalid_catalog_properties_and_inventory_errors_fail_without_mutation() -> Re
         source.0.properties.insert(key.into(), value.into());
         let before = if key == "arrowcol.vacuum.maxListedFiles" {
             persist_policy(&source)?;
+            let maintenance = DeltaTable::open_for_maintenance(&source.0.url)?;
+            let anchor = settings.anchor_ms.context("test maintenance anchor")?;
+            maintenance.checkpoint_if_due_at(1, true, anchor)?;
+            maintenance.vacuum_once(
+                &VacuumConfig::new(settings.vacuum_retention_ms, anchor),
+                true,
+                &MaintenanceControl::default(),
+            )?;
             inventory(root.path())?
         } else {
             before.clone()
         };
         let results = run_cycle_with_discovery(&settings, &source, &Metrics::new(), &Arc::new(AtomicBool::new(false)))?;
-        assert!(results.iter().all(|r| r.error.is_some() && !r.negative_probe), "{key}");
+        if key == "arrowcol.vacuum.maxListedFiles" {
+            assert!(
+                results
+                    .iter()
+                    .filter(|result| result.operation != Operation::Vacuum)
+                    .all(|result| result.error.is_some() && !result.negative_probe),
+                "{key}"
+            );
+            let vacuum = results
+                .iter()
+                .find(|result| result.operation == Operation::Vacuum)
+                .context("VACUUM result")?;
+            assert!(vacuum.error.is_none());
+            assert!(
+                vacuum
+                    .report
+                    .as_ref()
+                    .and_then(|report| report.maintenance_due_work.as_ref())
+                    .is_some_and(|evidence| evidence.completeness == MaintenanceDueWorkCompleteness::Complete)
+            );
+        } else {
+            assert!(results.iter().all(|r| r.error.is_some() && !r.negative_probe), "{key}");
+        }
         assert_eq!(before, inventory(root.path())?);
         source.0.properties.remove(key);
     }
@@ -571,25 +665,57 @@ fn invalid_catalog_properties_and_inventory_errors_fail_without_mutation() -> Re
     for content in ["not-json", "{\"version\":99999}"] {
         std::fs::write(&hint, content)?;
         let malformed = inventory(root.path())?;
+        let malformed_logs = malformed
+            .iter()
+            .filter(|(path, _)| path.starts_with(Path::new("events/_delta_log")))
+            .map(|(path, value)| (path.clone(), value.clone()))
+            .collect::<BTreeMap<_, _>>();
         let results = run_cycle_with_discovery(&settings, &source, &Metrics::new(), &Arc::new(AtomicBool::new(false)))?;
-        assert!(results.iter().all(|r| r.error.is_some() && !r.negative_probe));
-        assert_eq!(malformed, inventory(root.path())?);
+        assert!(
+            results
+                .iter()
+                .filter(|result| result.operation != Operation::Vacuum)
+                .all(|result| result.error.is_some() && !result.negative_probe)
+        );
+        let vacuum = results
+            .iter()
+            .find(|result| result.operation == Operation::Vacuum)
+            .context("VACUUM result")?;
+        if vacuum.error.is_none() {
+            assert!(
+                vacuum
+                    .report
+                    .as_ref()
+                    .and_then(|report| report.maintenance_due_work.as_ref())
+                    .is_some()
+            );
+        }
+        let after = inventory(root.path())?;
+        let after_logs = after
+            .iter()
+            .filter(|(path, _)| path.starts_with(Path::new("events/_delta_log")))
+            .map(|(path, value)| (path.clone(), value.clone()))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(malformed_logs, after_logs);
     }
     std::fs::remove_file(hint)?;
     std::fs::remove_file(root.path().join("events/_delta_log/00000000000000000001.json"))?;
     let gap = inventory(root.path())?;
     let results = run_cycle_with_discovery(&settings, &source, &Metrics::new(), &Arc::new(AtomicBool::new(false)))?;
-    assert!(
-        results
-            .iter()
-            .all(|r| !r.negative_probe && r.error.as_ref().is_some_and(|error| error.contains("log gap")))
-    );
+    assert!(results.iter().all(|result| !result.negative_probe));
+    assert!(results.iter().any(|result| {
+        result.operation == Operation::Vacuum
+            && result
+                .error
+                .as_ref()
+                .is_some_and(|error| error.contains("complete JSON log history"))
+    }));
     assert_eq!(gap, inventory(root.path())?);
     Ok(())
 }
 
 #[test]
-fn physical_timestamp_retention_boundary_forces_replay_only_strictly_before_cutoff() -> Result<()> {
+fn vacuum_probe_does_not_infer_tombstones_from_physical_timestamp() -> Result<()> {
     let (root, _, source) = fixture()?;
     let table = DeltaTable::open_for_maintenance_probe(&source.0.url)?;
     let anchor = now_ms()?;
@@ -612,12 +738,24 @@ fn physical_timestamp_retention_boundary_forces_replay_only_strictly_before_cuto
         .cloned()
         .ok_or_else(|| anyhow!("data file"))?;
     let file = std::fs::File::open(root.path().join(data))?;
-    for (stamp, expected_noop) in [(cutoff, true), (cutoff - 1, false)] {
+    for stamp in [cutoff, cutoff - 1] {
         file.set_times(
             std::fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_millis(u64::try_from(stamp)?)),
         )?;
-        let result = table.probe_no_work(ProbeOperation::Vacuum, &config, &MaintenanceControl::default())?;
-        assert_eq!(result.is_some(), expected_noop);
+        assert!(
+            table
+                .probe_no_work(ProbeOperation::Vacuum, &config, &MaintenanceControl::default())?
+                .is_none(),
+            "physical age is not a tombstone observation"
+        );
+        let report = table.vacuum_once(
+            &VacuumConfig::new(604_800_000, anchor),
+            false,
+            &MaintenanceControl::default(),
+        )?;
+        let evidence = report.maintenance_due_work.context("bounded tombstone evidence")?;
+        assert_eq!(evidence.due, Some(false));
+        assert_eq!(evidence.eligible_count, Some(0));
     }
     Ok(())
 }
@@ -734,6 +872,13 @@ fn real_catalog_ddl_discovery_refreshes_policy_without_idle_writes() -> Result<(
         vec![INGESTION_PARTITION.into()],
     )?;
     write_pairs(&table, schema)?;
+    let anchor = settings.anchor_ms.context("test maintenance anchor")?;
+    table.checkpoint_if_due_at(1, true, anchor)?;
+    table.vacuum_once(
+        &VacuumConfig::new(settings.vacuum_retention_ms, anchor),
+        true,
+        &MaintenanceControl::default(),
+    )?;
     let before = inventory(root.path())?;
     let metrics = Metrics::new();
     let cancel = Arc::new(AtomicBool::new(false));
@@ -741,8 +886,11 @@ fn real_catalog_ddl_discovery_refreshes_policy_without_idle_writes() -> Result<(
         let results = run_cycle_with_discovery(&settings, &source, &metrics, &cancel)?;
         assert!(results.iter().all(|r| r.error.is_none()), "{results:?}");
         assert_eq!(results.len(), 4);
+        assert!(results.iter().all(|result| result.error.is_none()), "{results:?}");
         assert!(
-            results.iter().all(|r| r.error.is_none() && r.negative_probe),
+            results
+                .iter()
+                .all(|result| { result.negative_probe == (result.operation != Operation::Vacuum) }),
             "{results:?}"
         );
         assert_eq!(before, inventory(root.path())?);

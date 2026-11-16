@@ -9,9 +9,10 @@ use arrow_deltalake::delta::{
 };
 use arrow_deltalake::layout::LayoutPolicy;
 use arrow_deltalake::maintenance::{
-    CompactionDebtSource, DISPOSABLE_TEST_MARKER, Granularity, LogFloor, MaintenanceControl, MaintenanceErrorKind,
-    MaintenancePlan, NegativeProbeConfig, OptimizeConfig, Outcome, PassProbeInventory, ProbeOperation, PruneConfig,
-    PurgeConfig, VacuumConfig, error_kind, now_ms,
+    CompactionDebtSource, DISPOSABLE_TEST_MARKER, Granularity, LogFloor, MaintenanceControl,
+    MaintenanceDueWorkCompleteness, MaintenanceDueWorkIncompleteReason, MaintenanceErrorKind, MaintenancePlan,
+    NegativeProbeConfig, OptimizeConfig, Outcome, PassProbeInventory, ProbeOperation, PruneConfig, PurgeConfig,
+    VacuumConfig, error_kind, now_ms,
 };
 use async_trait::async_trait;
 use delta_kernel::object_store::{
@@ -160,6 +161,13 @@ fn compaction_debt_evidence_distinguishes_zero_from_bounded_backlog() -> Result<
     assert_eq!(plan.compaction_debt.oldest_eligible_partition_start_ms, Some(BASE));
     let report = maintenance.apply_optimize(&plan, &config, &control())?;
     assert_eq!(report.compaction_debt.as_ref(), Some(&plan.compaction_debt));
+    let evidence = report
+        .maintenance_due_work
+        .as_ref()
+        .context("OPTIMIZE due-work evidence")?;
+    assert_eq!(evidence.due, Some(true));
+    assert_eq!(evidence.eligible_count, Some(4));
+    assert_eq!(evidence.backlog_count, Some(2));
     Ok(())
 }
 
@@ -267,7 +275,7 @@ fn pass_inventory_bounds_counted_io_for_all_idle_probes() -> Result<()> {
 }
 
 #[test]
-fn pass_inventory_rechecks_time_based_vacuum_eligibility() -> Result<()> {
+fn vacuum_probe_defers_to_bounded_tombstone_replay() -> Result<()> {
     let root = tempfile::tempdir()?;
     let table = create(root.path())?;
     append(&table, 0, 0..3)?;
@@ -321,21 +329,22 @@ fn pass_inventory_rechecks_time_based_vacuum_eligibility() -> Result<()> {
     assert!(
         maintenance
             .probe_no_work_with_inventory(ProbeOperation::Vacuum, &config, &control(), &mut inventory)?
-            .is_some(),
-        "recent files must be outside the retention window"
+            .is_none(),
+        "physical timestamps cannot establish VACUUM LITE tombstone eligibility"
     );
-    let idle_lists = counts.lists.load(Ordering::SeqCst);
     let due_config = NegativeProbeConfig { now_ms: now, ..config };
     assert!(
         maintenance
             .probe_no_work_with_inventory(ProbeOperation::Vacuum, &due_config, &control(), &mut inventory)?
             .is_none(),
-        "new pass anchor must re-evaluate time-based retention"
+        "each anchor must reach the bounded tombstone planner"
     );
-    assert!(
-        counts.lists.load(Ordering::SeqCst) > idle_lists,
-        "changed anchor invalidates inventory"
-    );
+    let report = maintenance.vacuum_once(&VacuumConfig::new(604_800_000, now), false, &control())?;
+    let evidence = report.maintenance_due_work.context("bounded tombstone evidence")?;
+    assert_eq!(evidence.observed_at_ms, now);
+    assert_eq!(evidence.completeness, MaintenanceDueWorkCompleteness::Complete);
+    assert_eq!(evidence.due, Some(false));
+    assert_eq!(evidence.eligible_count, Some(0));
     assert_eq!(counts.writes.load(Ordering::SeqCst), 0);
     Ok(())
 }
@@ -775,6 +784,12 @@ fn purge_removes_expired_partitions_and_fences_replay() -> Result<()> {
     assert_eq!(plan.cutoff_ms, BASE + 2 * MINUTE);
     assert_eq!(plan.watermark_ms, Some(BASE + 2 * MINUTE));
     let report = maintenance.apply_purge(&plan, &purge_config(), &control())?;
+    let evidence = report
+        .maintenance_due_work
+        .as_ref()
+        .context("PURGE due-work evidence")?;
+    assert_eq!(evidence.due, Some(true));
+    assert_eq!(evidence.eligible_count, Some(2));
     assert_eq!(
         (report.outcome, report.files_removed, report.rows_removed),
         (Outcome::Committed, 2, 8)
@@ -1131,6 +1146,12 @@ fn vacuum_lite_deletes_only_expired_tombstones() -> Result<()> {
         Some(MaintenanceErrorKind::UnsafeRequest)
     );
     let plan = maintenance.plan_vacuum(&short)?;
+    let due_evidence = MaintenancePlan::Vacuum(plan.clone())
+        .report()
+        .maintenance_due_work
+        .context("VACUUM due-work evidence")?;
+    assert_eq!(due_evidence.due, Some(true));
+    assert_eq!(due_evidence.eligible_count, Some(6));
     let unacknowledged = VacuumConfig::new(0, now);
     assert_eq!(
         kind(maintenance.apply_vacuum(&plan, &unacknowledged, &control())),
@@ -2013,6 +2034,14 @@ fn prune_log_waits_for_vacuum_progress() -> Result<()> {
     let config = short_prune(now_ms()? + 1_000);
     let plan = maintenance.plan_prune_log(&config)?;
     assert_eq!((plan.checkpoint_version, plan.report().outcome), (None, Outcome::Noop));
+    let evidence = plan.report().maintenance_due_work.context("PRUNE_LOG evidence")?;
+    assert_eq!(evidence.completeness, MaintenanceDueWorkCompleteness::Incomplete);
+    assert_eq!(
+        evidence.incomplete_reason,
+        Some(MaintenanceDueWorkIncompleteReason::MissingCheckpointProof)
+    );
+    assert_eq!(evidence.due, None);
+    assert_eq!(evidence.eligible_count, None);
     assert_eq!(
         maintenance.apply_prune_log(&plan, &config, &control())?.outcome,
         Outcome::Noop
