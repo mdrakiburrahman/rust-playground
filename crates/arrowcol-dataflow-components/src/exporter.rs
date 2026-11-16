@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 
@@ -67,8 +67,8 @@ impl GenericDeltaExporter {
         let store = config.routing.build()?;
         let options = config.commit.build()?;
         metrics.configure_exporter(options.max_pending_files);
-        metrics
-            .configure_publication_backlog(config.batching.global_capacity.batches)
+        let backlog_capacity = metrics
+            .register_publication_backlog_capacity(config.batching.global_capacity.batches)
             .map_err(|error| format!("configure durable publication backlog: {error}"))?;
         let authority =
             AuthorityClient::start(Arc::clone(&store), config.authority_timeout, options.max_pending_files)?;
@@ -80,6 +80,7 @@ impl GenericDeltaExporter {
             capacity: Capacity::new(config.batching.global_capacity),
             flush_slots: Arc::new(Semaphore::new(config.batching.max_concurrent_flushes)),
             draining: std::sync::atomic::AtomicBool::new(false),
+            backlog_capacity,
             authority,
             leases: LeaseBinder::new(store, LEASE_VIEW_TTL),
             metrics,
@@ -118,8 +119,8 @@ impl GenericDeltaExporter {
     ) -> Result<Self, String> {
         batching.validate()?;
         metrics.configure_exporter(options.max_pending_files);
-        metrics
-            .configure_publication_backlog(batching.global_capacity.batches)
+        let backlog_capacity = metrics
+            .register_publication_backlog_capacity(batching.global_capacity.batches)
             .map_err(|error| format!("configure durable publication backlog: {error}"))?;
         Ok(Self {
             backend: Arc::new(DeltaBackend {
@@ -135,6 +136,7 @@ impl GenericDeltaExporter {
                 capacity: Capacity::new(batching.global_capacity),
                 flush_slots: Arc::new(Semaphore::new(batching.max_concurrent_flushes)),
                 batching,
+                backlog_capacity,
                 draining: std::sync::atomic::AtomicBool::new(false),
                 metrics,
                 tables: tokio::sync::Mutex::new(HashMap::new()),
@@ -219,6 +221,7 @@ struct DeltaBackend {
     draining: std::sync::atomic::AtomicBool,
     authority: AuthorityClient,
     leases: LeaseBinder,
+    backlog_capacity: Arc<crate::metrics::PublicationBacklogCapacityGuard>,
     metrics: Arc<RuntimeMetrics>,
     tables: tokio::sync::Mutex<HashMap<arrowcol_protocol::TableIdentity, Arc<TableOwner>>>,
 }
@@ -383,19 +386,24 @@ impl DeltaBackend {
             .try_reserve()
             .map_err(|error| ExportFailure::Transient(format!("Delta file queue admission failed: {error}")))?;
         let accepted = Instant::now();
-        if let Err(error) =
-            self.metrics
+        let backlog_token =
+            match self
+                .metrics
                 .publication_backlog_start(publication_id.clone(), rows, bytes, accepted.into_std())
-        {
-            self.metrics.publication_backlog_mark_unknown();
-            tracing::error!(
-                publication_id = %publication_id,
-                rows,
-                logical_bytes = bytes,
-                error = %error,
-                "could not track accepted publication in durable backlog"
-            );
-        }
+            {
+                Ok(token) => Some(token),
+                Err(error) => {
+                    self.metrics.publication_backlog_mark_unknown();
+                    tracing::error!(
+                        publication_id = %publication_id,
+                        rows,
+                        logical_bytes = bytes,
+                        error = %error,
+                        "could not track accepted publication in durable backlog"
+                    );
+                    None
+                }
+            };
         let (reply, receipt) = oneshot::channel();
         queue_permit.send(WorkerCommand::Batch(QueuedBatch {
             publication_id,
@@ -405,9 +413,11 @@ impl DeltaBackend {
             rows,
             bytes,
             accepted,
+            backlog_token,
             reply: Some(reply),
             _pending_owner: pending_owner,
             _capacity: capacity,
+            _backlog_capacity: Arc::clone(&self.backlog_capacity),
         }));
         Ok(PendingDelta { receipt, release: None })
     }
@@ -534,9 +544,11 @@ struct QueuedBatch {
     rows: u64,
     bytes: u64,
     accepted: Instant,
+    backlog_token: Option<crate::metrics::PublicationBacklogToken>,
     reply: Option<oneshot::Sender<Result<(), ExportFailure>>>,
     _pending_owner: PendingOwner,
     _capacity: Vec<OwnedSemaphorePermit>,
+    _backlog_capacity: Arc<crate::metrics::PublicationBacklogCapacityGuard>,
 }
 
 impl QueuedBatch {
@@ -999,10 +1011,9 @@ impl GroupPublisher<'_> {
         .await;
         match &result {
             Ok(_) => {
-                let mut committed_publications = HashSet::with_capacity(group.len());
                 for entry in group.iter() {
-                    if committed_publications.insert(entry.publication_id.clone())
-                        && let Err(error) = self.metrics.publication_backlog_commit(entry.publication_id.clone())
+                    if let Some(token) = entry.backlog_token
+                        && let Err(error) = self.metrics.publication_backlog_commit(token)
                     {
                         self.metrics.publication_backlog_mark_unknown();
                         tracing::error!(
