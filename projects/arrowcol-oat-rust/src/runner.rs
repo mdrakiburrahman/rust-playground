@@ -40,6 +40,7 @@ include!("runner_process_evidence.rs");
 include!("runner_commit_evidence.rs");
 include!("runner_maintenance.rs");
 include!("runner_wal.rs");
+include!("runner_overload.rs");
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CampaignIdentity {
@@ -1097,10 +1098,14 @@ impl PublicationBacklogScraper {
     }
 
     async fn scrape(&self) -> Result<PublicationBacklogMetrics> {
+        parse_publication_backlog_metrics(&self.read_endpoint(&self.endpoint).await?)
+    }
+
+    async fn read_endpoint(&self, endpoint: &str) -> Result<String> {
         const MAX_METRICS_BYTES: u64 = 1_048_576;
         let response = self
             .client
-            .get(&self.endpoint)
+            .get(endpoint)
             .send()
             .await
             .context("request collector admin metrics")?;
@@ -1121,8 +1126,7 @@ impl PublicationBacklogScraper {
             }
             body.extend_from_slice(&chunk);
         }
-        let text = std::str::from_utf8(&body).context("collector admin metrics are not UTF-8")?;
-        parse_publication_backlog_metrics(text)
+        String::from_utf8(body).context("collector admin metrics are not UTF-8")
     }
 }
 
@@ -3447,17 +3451,43 @@ async fn run_matrix_cell(
     let baseline_logs = platform.process_logs(config).await?;
     platform.retain_cell_process_baseline(&baseline_logs);
     let mut client_run = run_clients(config, run_id, &assigned_tables, platform).await?;
-    let (_collector_logs, durable_commits) = settle_cell_commit_evidence(
-        config,
-        platform,
-        &baseline_logs,
-        &client_run.evidence,
-        cell_start_unix_ms,
-    )
-    .await?;
-    let process_logs = platform.process_logs(config).await?;
-    client_run.evidence.processes = Some(process_evidence_for_cell(config, &process_logs, &baseline_logs)?);
-    client_run.evidence.durable_commits = durable_commits;
+    let guard_stopped = client_run.evidence.overload_stop.is_some()
+        || client_run
+            .evidence
+            .overload_guard
+            .as_ref()
+            .is_some_and(|guard| guard["status"] == "unavailable");
+    let capture = async {
+        let (_collector_logs, durable_commits) = settle_cell_commit_evidence(
+            config,
+            platform,
+            &baseline_logs,
+            &client_run.evidence,
+            cell_start_unix_ms,
+        )
+        .await?;
+        client_run.evidence.durable_commits = durable_commits;
+        let process_logs = platform.process_logs(config).await?;
+        client_run.evidence.processes = Some(process_evidence_for_cell(config, &process_logs, &baseline_logs)?);
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    if let Err(error) = capture {
+        if !guard_stopped {
+            return Err(error);
+        }
+        tracing::error!(%error, "post-overload output/process capture failed; retaining stop evidence for cleanup");
+        client_run.failure = Some(format!(
+            "{}; post_overload_stop_capture_unavailable",
+            client_run
+                .failure
+                .as_deref()
+                .unwrap_or("overload_guard stopped the cell")
+        ));
+        if let Some(guard) = &mut client_run.evidence.overload_guard {
+            guard["post_stop_capture"] = json!("unavailable");
+        }
+    }
     let pinning_ok = client_run.pinning.violation.is_none()
         && client_run.pinning.verification_error.is_none()
         && client_run.failure.is_none();
@@ -3770,6 +3800,49 @@ async fn run_clients_inner(
     platform: &mut dyn Platform,
     pinning: &mut PinningReport,
 ) -> Result<ClientRun> {
+    let mut evidence = CellEvidence::default();
+    let mut prepared_guard = if config.overload_guard.enabled {
+        match tokio::time::timeout(Duration::from_secs(5), PreparedGuard::prepare(config, platform)).await {
+            Ok(Ok(prepared)) => Some(prepared),
+            result => {
+                let error = match result {
+                    Ok(Err(error)) => format!("{error:#}"),
+                    Err(error) => error.to_string(),
+                    Ok(Ok(_)) => unreachable!("successful guard preparation returned above"),
+                };
+                tracing::error!(%error, "overload hard-cap/readback protection unavailable before admission");
+                evidence.overload_guard = Some(json!({
+                    "status":"unavailable","settings":config.overload_guard,
+                    "unavailable_reason":"pre_admission_cap_backlog_or_commit_readback_unavailable",
+                    "requested_container_memory_limit_bytes":config.platform.local.collector_memory_limit_bytes,
+                    "error":error,
+                }));
+                return Ok(ClientRun {
+                    metrics: HashMap::new(),
+                    pinning: std::mem::take(pinning),
+                    qap_tables: Vec::new(),
+                    failure: Some("overload_guard required protection unavailable before admission".to_owned()),
+                    evidence,
+                });
+            }
+        }
+    } else {
+        evidence.overload_guard = Some(json!({"status":"disabled","settings":config.overload_guard}));
+        None
+    };
+    if let Some(prepared) = &prepared_guard {
+        evidence.overload_guard = Some(prepared.engine.proof.clone());
+        evidence.overload_stop = prepared.engine.stop.clone();
+        if let Some(reason) = prepared.engine.failure() {
+            return Ok(ClientRun {
+                metrics: HashMap::new(),
+                pinning: std::mem::take(pinning),
+                qap_tables: Vec::new(),
+                failure: Some(reason),
+                evidence,
+            });
+        }
+    }
     platform
         .prepare_campaign_load_admission(config, project_run_id, tables)
         .await?;
@@ -3898,7 +3971,6 @@ async fn run_clients_inner(
             "run-scoped QAP preparation exceeded qap_timeout_seconds; operation outcome may be indeterminate and is not retried"
         )),
     };
-    let mut evidence = CellEvidence::default();
     let qap_tables = match qap_result {
         Ok(qap_tables) => qap_tables,
         Err(error) if local_downstream_optional(platform.kind()) && error.is::<LocalDownstreamUnavailable>() => {
@@ -4000,11 +4072,17 @@ async fn run_clients_inner(
         .checked_add(config.measure_seconds.saturating_mul(1_000))
         .context("shared OAT measurement end timestamp overflow")?;
     evidence.measurement_window = Some((measurement_start_unix_ms, measurement_end_unix_ms));
-    let sampler = ResourceSampler::start(
+    if let Some(prepared) = &mut prepared_guard {
+        prepared.engine.arm(run_start_unix_ms, measurement_end_unix_ms);
+        prepared.engine.proof["run_id"] = json!(project_run_id);
+        prepared.probe.since_ms = unix_time_ms_u64()?.saturating_sub(GUARD_MAX_GAP_MS);
+    }
+    let mut sampler = ResourceSampler::start(
         platform.resource_sampler_source(),
         config.clone(),
         measurement_start_unix_ms,
         measurement_end_unix_ms,
+        prepared_guard,
     );
     let mut client_metrics = HashMap::<String, Vec<ClientMeasurement>>::with_capacity(tables.len());
     let mut completed_clients = HashSet::new();
@@ -4023,7 +4101,29 @@ async fn run_clients_inner(
             .iter()
             .map(|index| handles[*index].clone())
             .collect::<Vec<_>>();
-        let progress = match poll_clients(platform, config, &pending_handles).await {
+        let progress = tokio::select! {
+            biased;
+            reason = sampler.wait_for_overload_stop() => {
+                let cancellation = cancel_active_clients(platform, config, &handles, &active_clients).await;
+                let capture = sampler.finish_early(&mut evidence).await;
+                let mut failure = reason;
+                if let Err(error) = cancellation {
+                    failure.push_str(&format!("; client cancellation failed: {error:#}"));
+                }
+                if let Err(error) = capture {
+                    tracing::error!(%error, "overload stop sampler evidence unavailable");
+                    evidence.overload_guard = Some(json!({"status":"unavailable",
+                        "unavailable_reason":"monitor_terminal_capture_failed","settings":config.overload_guard}));
+                    failure.push_str("; terminal guard capture failed");
+                }
+                return Ok(ClientRun {
+                    metrics: HashMap::new(), pinning: std::mem::take(pinning), qap_tables,
+                    failure: Some(failure), evidence,
+                });
+            }
+            progress = poll_clients(platform, config, &pending_handles) => progress,
+        };
+        let progress = match progress {
             Ok(progress) => progress,
             Err(error) => {
                 let cleanup = cancel_active_clients(platform, config, &handles, &active_clients).await;
@@ -4156,6 +4256,20 @@ async fn run_clients_inner(
     ));
     let mut metrics = HashMap::with_capacity(tables.len());
     sampler.finish(&mut evidence).await?;
+    if evidence.overload_stop.is_some()
+        || evidence
+            .overload_guard
+            .as_ref()
+            .is_some_and(|guard| guard["status"] == "unavailable")
+    {
+        return Ok(ClientRun {
+            metrics: HashMap::new(),
+            pinning: std::mem::take(pinning),
+            qap_tables,
+            failure: Some("above_ceiling or overload_guard protection unavailable at terminal observation".to_owned()),
+            evidence,
+        });
+    }
     for table in tables {
         let reports = client_metrics
             .remove(table)
@@ -13026,6 +13140,63 @@ mod tests {
         assert_eq!(outcomes[0]["maintenance_exit_classification"], "nonzero_health_exit");
         assert_eq!(outcomes[0]["exit_code"], 1);
         assert!(!serde_json::to_string(&outcomes)?.contains("private"));
+        fs::write(fixture.join("mode"), "overload_success")?;
+        local.run_id = "guard-lifecycle".to_owned();
+        local.state_dir = fixture.join("guard-state");
+        local.control_dir = local.state_dir.clone();
+        fs::create_dir(&local.state_dir)?;
+        fs::write(
+            fixture.join("project"),
+            scoped_compose_project(
+                config.platform.compose_project.as_deref().context("fixture project")?,
+                &local.run_id,
+            ),
+        )?;
+        let baseline = local.process_logs(&config).await?;
+        local.retain_cell_process_baseline(&baseline);
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let mut row = sample_result(&run_id, "sqlserver_wait_stats", 0);
+        row.status = "failed".to_owned();
+        row.failure = Some("above_ceiling: overload_stop hard_cap_fraction".to_owned());
+        let stop = json!({"classification":"above_ceiling","reason":"hard_cap_fraction","metric":"container_memory_bytes",
+            "observed_value":900,"cap":1000,"fraction":0.9,"window_index":0,"timestamp_ms":1});
+        row.evidence_json = Some(json!({"version":1,"overload_stop":stop}).to_string());
+        local.cleanup(&config).await.context("guard-triggered normal cleanup")?;
+        let receipt = local
+            .shutdown_drain_evidence()
+            .context("normal lifecycle receipt missing")?;
+        let mut outcome = finish_matrix_cell(&config, "orchestration", &run_id, 1, 1, Ok(vec![row]), Ok(()));
+        attach_shutdown_drain_evidence(&mut outcome, receipt)?;
+        assert!(outcome.error.is_some());
+        assert_eq!(outcome.rows[0].status, "failed");
+        let retained: Value = serde_json::from_str(
+            outcome.rows[0]
+                .evidence_json
+                .as_deref()
+                .context("guard evidence missing")?,
+        )?;
+        assert_eq!(retained["overload_stop"], stop);
+        assert_eq!(
+            retained["shutdown_drain"]["collectors"][0]["drain"]["status"],
+            "observed"
+        );
+        assert_eq!(
+            retained["shutdown_drain"]["maintenance"][0]["outcomes"]["operation_count"],
+            5
+        );
+        assert_eq!(retained["shutdown_drain"]["maintenance"][0]["exit_code"], 0);
+        assert!(fixture.join("compose-destroyed").exists());
+        let commands = fs::read_to_string(fixture.join("commands"))?;
+        let ingress = commands
+            .find("stop --time 300 guard-client")
+            .context("ingress was not stopped")?;
+        let maintenance = commands
+            .find("stop --time 300 guard-maintenance")
+            .context("maintenance was not stopped")?;
+        let collector = commands
+            .find("stop --time 300 guard-collector")
+            .context("collector was not stopped")?;
+        assert!(ingress < maintenance && maintenance < collector);
         fs::write(fixture.join("mode"), "stop_failure")?;
 
         config.platform.kind = crate::config::OatMode::Aks;

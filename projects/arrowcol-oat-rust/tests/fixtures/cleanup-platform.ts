@@ -12,6 +12,37 @@ const fail = (message: string): never => {
 };
 
 if (tool === 'docker') {
+  if (mode === 'overload_success') {
+    const services = { 'guard-client': 'oat-client', 'guard-maintenance': 'delta-maintenance', 'guard-collector': 'dataflow-1' };
+    if (args[0] === 'compose' && args.includes('down')) {
+      writeFileSync(join(root, 'compose-destroyed'), '');
+    } else if (args[0] === 'ps' || args[0] === 'compose' && args.includes('ps')) {
+      console.log(args.some(arg => arg.includes('service=oat-client'))
+        ? existsSync(join(root, 'guard-client-removed')) ? '' : 'guard-client'
+        : Object.keys(services).join('\n'));
+    } else if (args[0] === 'inspect') {
+      console.log(JSON.stringify(Object.entries(services).filter(([id]) => args.includes(id)).map(([id, service]) => {
+        const stopped = existsSync(join(root, `${id}-stopped`));
+        return { Id: id, RestartCount: 0,
+          Config: { Labels: { 'com.docker.compose.project': readFileSync(join(root, 'project'), 'utf8'), 'com.docker.compose.service': service } },
+          State: { Running: !stopped, Paused: false, Dead: false, Status: stopped ? 'exited' : 'running',
+            Error: '', ExitCode: 0, OOMKilled: false, FinishedAt: new Date().toISOString() } };
+      })));
+    } else if (args[0] === 'stop') {
+      for (const id of Object.keys(services).filter(id => args.includes(id))) writeFileSync(join(root, `${id}-stopped`), '');
+    } else if (args[0] === 'logs') {
+      if (args.includes('guard-collector')) console.log('arrowcol_effective_config {"component":"receiver"}');
+      if (args.includes('guard-maintenance')) {
+        console.log('arrowcol_maintenance_effective_config {}');
+        if (existsSync(join(root, 'guard-maintenance-stopped'))) {
+          for (const operation of ['optimize', 'purge', 'vacuum', 'checkpoint', 'prune_log'])
+            console.log(JSON.stringify({ table: 't', operation, applied: true, report: { outcome: 'noop', interrupted: false } }));
+        }
+      }
+    } else if (args[0] === 'rm') writeFileSync(join(root, 'guard-client-removed'), '');
+    else fail('unexpected overload lifecycle command');
+    process.exit(0);
+  }
   if (mode === 'maintenance_cell') {
     const project = readFileSync(join(root, 'project'), 'utf8');
     const stopped = existsSync(join(root, 'maintenance-stopped'));

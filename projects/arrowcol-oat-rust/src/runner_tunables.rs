@@ -86,6 +86,9 @@ fn local_dataflow_overlay(config: &OatConfig, state_dir: &Path, overlay: &mut Va
         .as_object_mut()
         .context("Compose tunable services missing")?;
     let collector = services.entry("dataflow-1").or_insert_with(|| json!({}));
+    if let Some(bytes) = config.platform.local.collector_memory_limit_bytes {
+        collector["mem_limit"] = json!(bytes);
+    }
     collector["stop_grace_period"] = json!(format!("{}s", config.collector_stop_grace_seconds));
     collector["ports"] = json!([{
         "host_ip": "127.0.0.1",
@@ -188,6 +191,30 @@ fn inject_workload_environment(config: &OatConfig, resources: &mut [Value]) -> R
 #[cfg(test)]
 mod tunable_injection_tests {
     use super::*;
+
+    #[test]
+    fn overload_local_memory_cap_is_explicit_and_scoped_to_the_collector() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        let mut overlay = compose_tunables(&config)?;
+        local_dataflow_overlay(&config, Path::new("/owned/run"), &mut overlay)?;
+        assert!(overlay["services"]["dataflow-1"].get("mem_limit").is_none());
+        config.platform.local.collector_memory_limit_bytes = Some(4 * 1024_u64.pow(3));
+        config.validate()?;
+        local_dataflow_overlay(&config, Path::new("/owned/run"), &mut overlay)?;
+        assert_eq!(overlay["services"]["dataflow-1"]["mem_limit"], 4 * 1024_u64.pow(3));
+        for (service, value) in overlay["services"].as_object().context("services missing")? {
+            if service != "dataflow-1" { assert!(value.get("mem_limit").is_none()); }
+        }
+        for invalid in [json!("4GiB"), json!("4096Mi"), json!(-1), json!(1.5)] {
+            assert!(serde_json::from_value::<crate::config::LocalOptions>(
+                json!({"collector_memory_limit_bytes":invalid})).is_err());
+        }
+        config.platform.local.collector_memory_limit_bytes = Some(1);
+        assert!(config.validate().is_err());
+        Ok(())
+    }
 
     #[test]
     fn local_campaign_granularity_reaches_both_consumers_and_gates_admission() -> Result<()> {
