@@ -191,11 +191,14 @@ impl CellEvidence {
         let observed_cores = self.resource_summary().map(|metrics| metrics.cpu_millicores / 1000.0)
             .filter(|cores| cores.is_finite() && *cores > 0.0);
         let committed_rate = output.and_then(|value| value["rows_per_second"].as_f64());
+        let input_rate = output.and_then(|value| value["input_bytes_per_second"].as_f64());
+        let parquet_rate = output.and_then(|value| value["parquet_bytes_per_second"].as_f64());
         let payload_bytes = self.client_window_payload_bytes(table, client);
         let window_seconds = self.measurement_window
             .and_then(|(start, end)| end.checked_sub(start))
             .filter(|duration| *duration > 0)
             .map(|duration| duration as f64 / 1000.0);
+        let payload_rate = payload_bytes.zip(window_seconds).map(|(bytes, seconds)| bytes as f64 / seconds);
         json!({
             "version": 1,
             "processes": self.processes,
@@ -235,12 +238,15 @@ impl CellEvidence {
             },
             "durable_rows_per_second": output.and_then(|value| value["rows_per_second"].as_f64()),
             "rate_evidence": {
-                "collector_input_bytes_per_second": output.and_then(|value| value["input_bytes_per_second"].as_f64()),
-                "committed_parquet_bytes_per_second": output.and_then(|value| value["parquet_bytes_per_second"].as_f64()),
-                "completed_flight_payload_bytes_per_second": payload_bytes.zip(window_seconds).map(|(bytes, seconds)| bytes as f64 / seconds),
+                "collector_input_bytes_per_second": input_rate,
+                "committed_parquet_bytes_per_second": parquet_rate,
+                "completed_flight_payload_bytes_per_second": payload_rate,
                 "payload_scope": "protobuf_flight_data_encoded_lengths_for_admission_completions_excludes_grpc_and_http2_overhead",
                 "observed_collector_cores": observed_cores,
                 "committed_rows_per_second_per_observed_collector_core": committed_rate.zip(observed_cores).map(|(rate, cores)| rate / cores),
+                "collector_input_bytes_per_second_per_observed_collector_core": input_rate.zip(observed_cores).map(|(rate, cores)| rate / cores),
+                "committed_parquet_bytes_per_second_per_observed_collector_core": parquet_rate.zip(observed_cores).map(|(rate, cores)| rate / cores),
+                "completed_flight_payload_bytes_per_second_per_observed_collector_core": payload_rate.zip(observed_cores).map(|(rate, cores)| rate / cores),
                 "core_scope": "arithmetic_mean_of_observed_collector_fleet_cpu_samples_not_time_weighted",
                 "allocated_collector_cores": null,
             },
@@ -377,10 +383,15 @@ mod measurement_evidence_tests {
         let result = evidence.for_table("table", Some(&client));
         assert_eq!(result["rate_evidence"]["completed_flight_payload_bytes_per_second"], 100.0);
         assert_eq!(result["rate_evidence"]["committed_rows_per_second_per_observed_collector_core"], 4.0);
+        assert_eq!(result["rate_evidence"]["collector_input_bytes_per_second_per_observed_collector_core"], 50.0);
+        assert_eq!(result["rate_evidence"]["committed_parquet_bytes_per_second_per_observed_collector_core"], 25.0);
+        assert_eq!(result["rate_evidence"]["completed_flight_payload_bytes_per_second_per_observed_collector_core"], 50.0);
         evidence.client_reports.get_mut("table").unwrap()[0]["phase_counters"]["measurement_window"]["end_unix_ms"] = json!(4000);
         assert!(evidence.for_table("table", Some(&client))["rate_evidence"]["completed_flight_payload_bytes_per_second"].is_null());
+        assert!(evidence.for_table("table", Some(&client))["rate_evidence"]["completed_flight_payload_bytes_per_second_per_observed_collector_core"].is_null());
         evidence.resource_samples.clear();
         assert!(evidence.for_table("table", Some(&client))["rate_evidence"]["committed_rows_per_second_per_observed_collector_core"].is_null());
+        assert!(evidence.for_table("table", Some(&client))["rate_evidence"]["collector_input_bytes_per_second_per_observed_collector_core"].is_null());
     }
 
 
@@ -780,7 +791,7 @@ mod downstream_runner_tests {
             "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
         ))?;
         config.platform.kind = kind;
-        config.qap_timeout_seconds = 1;
+        config.qap_timeout_seconds = if matches!(fault, Fault::InitTimeout) { 1 } else { 10 };
         let result = run_matrix_cell(
             &config,
             "orchestration",

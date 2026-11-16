@@ -173,6 +173,45 @@ fn inject_workload_environment(config: &OatConfig, resources: &mut [Value]) -> R
 mod tunable_injection_tests {
     use super::*;
 
+    #[test]
+    #[ignore = "needs L1b collector upload runtime"]
+    fn collector_upload_json_reaches_runtime() -> Result<()> {
+        if std::env::var_os("OAT_UPLOAD_RUNTIME_CHILD").is_some() {
+            let actual = serde_json::to_value(arrow_deltalake::DeltaRuntimeConfig::from_env()?)?;
+            let expected: Value = serde_json::from_str(&std::env::var("OAT_UPLOAD_RUNTIME_EXPECTED")?)?;
+            for key in ["upload_mode", "upload_buffer_capacity_bytes", "upload_request_concurrency", "upload_limit"] {
+                assert_eq!(actual[key], expected[key], "{key}");
+            }
+            return Ok(());
+        }
+        for (tunables, expected) in [
+            (json!({"collector":{"runtime":{"upload_limit":1},"upload":{"mode":"buffered_multipart","buffer_capacity_bytes":1048576,"request_concurrency":16}}}),
+             json!({"upload_mode":"buffered_multipart","upload_buffer_capacity_bytes":1048576,"upload_request_concurrency":16,"upload_limit":1})),
+            (json!({"collector":{"runtime":{"upload_limit":256},"upload":{"mode":"put_create"}}}),
+             json!({"upload_mode":"put_create","upload_buffer_capacity_bytes":8388608,"upload_request_concurrency":2,"upload_limit":256})),
+        ] {
+            let settings = arrowcol_tunables::Tunables::parse_oat_json(tunables)?;
+            let environment = settings.environment_for(ComponentRole::Collector)?;
+            let output = std::process::Command::new(std::env::current_exe()?)
+                .arg("--ignored")
+                .arg("--exact")
+                .arg("runner::tunable_injection_tests::collector_upload_json_reaches_runtime")
+                .arg("--nocapture")
+                .env_clear()
+                .env("OAT_UPLOAD_RUNTIME_CHILD", "1")
+                .env("OAT_UPLOAD_RUNTIME_EXPECTED", expected.to_string())
+                .envs(environment)
+                .output()?;
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            anyhow::ensure!(
+                output.status.success() && stdout.contains("1 passed;"),
+                "collector upload runtime rehearsal failed: {stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Ok(())
+    }
+
     fn config() -> Result<OatConfig> {
         Ok(serde_json::from_str(include_str!(
             "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"

@@ -220,6 +220,9 @@ const CAPABILITIES: &[Capability] = &[
     capability!("collector.runtime.read_ahead", "clamp(c,8,16)"),
     capability!("collector.runtime.batch_rows", "clamp(1024c,4096,32768)"),
     capability!("collector.runtime.cpu_workers", "clamp(c-1,1,32)"),
+    capability!("collector.upload.mode", "put_create"),
+    capability!("collector.upload.buffer_capacity_bytes", "8388608"),
+    capability!("collector.upload.request_concurrency", "2"),
     capability!("parquet_writer.defaults.compression", "inherit component default"),
     capability!("parquet_writer.defaults.compression_level", "codec default"),
     capability!("parquet_writer.defaults.encoding", "inherit component default"),
@@ -316,6 +319,11 @@ const CAPABILITIES: &[Capability] = &[
     capability!("maintenance.operations", "unset"),
     capability!("maintenance.apply", "false"),
     capability!("maintenance.parquet_writer", "inherit shared parquet_writer"),
+    capability!("maintenance.optimize_upload_mode", "put_create"),
+    capability!(
+        "maintenance.optimize_upload_buffer_bytes",
+        "8388608; buffered_multipart only"
+    ),
     capability!("maintenance.interval_secs", "one-shot"),
     capability!("maintenance.max_idle_backoff_secs", "3600"),
     capability!("maintenance.max_cycles", "unlimited"),
@@ -564,6 +572,7 @@ impl Tunables {
             validate_limits(collector.limits.as_ref())?;
             validate_pressure(collector.pressure.as_ref())?;
             validate_runtime(collector.runtime.as_ref())?;
+            validate_collector_upload(collector)?;
         }
         if let Some(writer) = &self.parquet_writer {
             writer.validate()?;
@@ -775,6 +784,19 @@ impl Tunables {
                     ] {
                         if let Some(value) = value {
                             output.insert(format!("ARROWCOL_COLLECTOR_{field}"), value.to_string());
+                        }
+                        if let Some(upload) = &collector.upload {
+                            if let Some(mode) = upload.mode {
+                                output.insert("ARROWCOL_COLLECTOR_UPLOAD_MODE".to_owned(), mode.as_str().to_owned());
+                            }
+                            for (field, value) in [
+                                ("UPLOAD_BUFFER_CAPACITY_BYTES", upload.buffer_capacity_bytes),
+                                ("UPLOAD_REQUEST_CONCURRENCY", upload.request_concurrency),
+                            ] {
+                                if let Some(value) = value {
+                                    output.insert(format!("ARROWCOL_COLLECTOR_{field}"), value.to_string());
+                                }
+                            }
                         }
                     }
                 }
@@ -1345,6 +1367,35 @@ fn validate_pressure(pressure: Option<&PressureTunables>) -> Result<()> {
     Ok(())
 }
 
+fn validate_collector_upload(collector: &CollectorTunables) -> Result<()> {
+    let Some(upload) = &collector.upload else {
+        return Ok(());
+    };
+    if upload.mode.unwrap_or_default() == CollectorUploadMode::PutCreate {
+        if upload.buffer_capacity_bytes.is_some() || upload.request_concurrency.is_some() {
+            bail!("collector.upload buffer_capacity_bytes and request_concurrency require buffered_multipart mode");
+        }
+        return Ok(());
+    }
+    let capacity = upload.buffer_capacity_bytes.unwrap_or(8_388_608);
+    let concurrency = upload.request_concurrency.unwrap_or(2);
+    if !(1_048_576..=67_108_864).contains(&capacity) {
+        bail!("collector.upload.buffer_capacity_bytes must be between 1048576 and 67108864");
+    }
+    if !(1..=16).contains(&concurrency) {
+        bail!("collector.upload.request_concurrency must be between 1 and 16");
+    }
+    let limit = collector.runtime.as_ref().and_then(|runtime| runtime.upload_limit).unwrap_or(32);
+    let bytes = capacity.checked_mul(concurrency + 1)
+        .and_then(|bytes| bytes.checked_add(65_536))
+        .and_then(|bytes| bytes.checked_mul(limit))
+        .context("aggregate collector upload buffering size overflow")?;
+    if bytes > 1_073_741_824 {
+        bail!("aggregate collector upload buffering must not exceed 1073741824 bytes, got {bytes}");
+    }
+    Ok(())
+}
+
 fn validate_runtime(runtime: Option<&RuntimeTunables>) -> Result<()> {
     let Some(runtime) = runtime else {
         return Ok(());
@@ -1395,6 +1446,19 @@ fn validate_maintenance(maintenance: &MaintenanceTunables) -> Result<()> {
         bail!("maintenance.apply=true requires maintenance.enabled=true");
     }
     let has_optimize = has_operation(MaintenanceOperation::Optimize);
+    if maintenance.optimize_upload_mode.is_some() || maintenance.optimize_upload_buffer_bytes.is_some() {
+        if !has_optimize {
+            bail!("maintenance optimize upload settings require optimize");
+        }
+        if let Some(bytes) = maintenance.optimize_upload_buffer_bytes {
+            if maintenance.optimize_upload_mode != Some(MaintenanceUploadMode::BufferedMultipart) {
+                bail!("maintenance.optimize_upload_buffer_bytes requires buffered_multipart mode");
+            }
+            if !(4_194_304..=67_108_864).contains(&bytes) {
+                bail!("maintenance.optimize_upload_buffer_bytes must be between 4194304 and 67108864");
+            }
+        }
+    }
     if let Some(writer) = &maintenance.parquet_writer {
         if !has_optimize {
             bail!("maintenance.parquet_writer requires optimize");
@@ -1876,6 +1940,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn collector_upload_validation_and_projection() -> Result<()> {
+        let valid = serde_json::json!({"collector": {
+            "runtime": {"upload_limit": 1},
+            "upload": {"mode": "buffered_multipart", "buffer_capacity_bytes": 1048576, "request_concurrency": 16}
+        }});
+        let env = Tunables::parse_oat_json(valid.clone())?.environment_for(ComponentRole::Collector)?;
+        assert_eq!(env["ARROWCOL_COLLECTOR_UPLOAD_MODE"], "buffered_multipart");
+        assert_eq!(env["ARROWCOL_COLLECTOR_UPLOAD_BUFFER_CAPACITY_BYTES"], "1048576");
+        assert_eq!(env["ARROWCOL_COLLECTOR_UPLOAD_REQUEST_CONCURRENCY"], "16");
+
+        for (field, value) in [
+            ("mode", serde_json::json!("stream")),
+            ("buffer_capacity_bytes", serde_json::json!(1048575)),
+            ("buffer_capacity_bytes", serde_json::json!(67108865)),
+            ("request_concurrency", serde_json::json!(0)),
+            ("request_concurrency", serde_json::json!(17)),
+        ] {
+            let mut candidate = valid.clone();
+            candidate["collector"]["upload"][field] = value;
+            assert!(Tunables::parse_oat_json(candidate).is_err(), "{field}");
+        }
+        let mut create = valid.clone();
+        create["collector"]["upload"]["mode"] = serde_json::json!("put_create");
+        assert!(Tunables::parse_oat_json(create).is_err());
+        assert!(Tunables::parse_oat_json(serde_json::json!({"collector": {
+            "runtime": {"upload_limit": 256}, "upload": {"mode": "put_create"}
+        }})).is_ok());
+        assert!(Tunables::parse_oat_json(serde_json::json!({"collector": {
+            "runtime": {"upload_limit": 256}, "upload": {"mode": "buffered_multipart"}
+        }})).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn cpu_pressure_mode_is_strict_and_projects_to_collector_env() -> Result<()> {
         assert_eq!(
             serde_json::from_str::<CpuPressureMode>("\"process\"")?,
@@ -2035,6 +2133,45 @@ mod tests {
         let mut no_optimize = value;
         no_optimize["maintenance"]["operations"] = serde_json::json!(["vacuum"]);
         assert!(Tunables::parse_oat_json(no_optimize).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn maintenance_upload_controls_reject_invalid_or_inactive_settings() -> Result<()> {
+        let value = serde_json::json!({"maintenance": {
+            "enabled": true, "operations": ["optimize"],
+            "optimize_upload_mode": "buffered_multipart", "optimize_upload_buffer_bytes": 4_194_304
+        }});
+        for bytes in [4_194_304_u64, 67_108_864] {
+            let mut candidate = value.clone();
+            candidate["maintenance"]["optimize_upload_buffer_bytes"] = serde_json::json!(bytes);
+            let settings = Tunables::parse_oat_json(candidate)?;
+            let env = settings.environment_for(ComponentRole::Maintenance)?;
+            assert_eq!(env["ARROWCOL_MAINT_OPTIMIZE_UPLOAD_MODE"], "buffered_multipart");
+            assert_eq!(env["ARROWCOL_MAINT_OPTIMIZE_UPLOAD_BUFFER_BYTES"], bytes.to_string());
+        }
+        for bytes in [
+            serde_json::json!(4_194_303),
+            serde_json::json!(67_108_865),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+        ] {
+            let mut candidate = value.clone();
+            candidate["maintenance"]["optimize_upload_buffer_bytes"] = bytes;
+            assert!(Tunables::parse_oat_json(candidate).is_err());
+        }
+        for mode in ["stream", "unknown", "put_create"] {
+            let mut candidate = value.clone();
+            candidate["maintenance"]["optimize_upload_mode"] = serde_json::json!(mode);
+            assert!(Tunables::parse_oat_json(candidate).is_err());
+        }
+        let mut create = value;
+        create["maintenance"]["optimize_upload_mode"] = serde_json::json!("put_create");
+        create["maintenance"]
+            .as_object_mut()
+            .unwrap()
+            .remove("optimize_upload_buffer_bytes");
+        assert!(Tunables::parse_oat_json(create).is_ok());
         Ok(())
     }
 

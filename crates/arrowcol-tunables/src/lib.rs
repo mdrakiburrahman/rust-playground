@@ -199,7 +199,16 @@ pub struct CollectorTunables {
     pub pressure: Option<PressureTunables>,
     pub routing: Option<RoutingTunables>,
     pub runtime: Option<RuntimeTunables>,
+    pub upload: Option<CollectorUploadTunables>,
     pub cpu_pressure: Option<CpuPressureMode>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CollectorUploadTunables {
+    pub mode: Option<CollectorUploadMode>,
+    pub buffer_capacity_bytes: Option<usize>,
+    pub request_concurrency: Option<usize>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -410,6 +419,8 @@ pub struct MaintenanceTunables {
     pub operations: Option<Vec<MaintenanceOperation>>,
     pub apply: Option<bool>,
     pub parquet_writer: Option<ParquetWriterConfig>,
+    pub optimize_upload_mode: Option<MaintenanceUploadMode>,
+    pub optimize_upload_buffer_bytes: Option<usize>,
     pub interval_secs: Option<u64>,
     pub max_idle_backoff_secs: Option<u64>,
     pub max_cycles: Option<u64>,
@@ -473,6 +484,13 @@ pub enum MaintenanceInputReadStrategy {
     Memory,
     Spool,
     Range,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum MaintenanceUploadMode {
+    PutCreate,
+    BufferedMultipart,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]

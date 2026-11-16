@@ -227,6 +227,8 @@ fn maintenance_readback_value(observed: &Value, variable: &str, expected: Value)
         | "CATALOG_MAX_DECODING_MESSAGE_BYTES" => (format!("/startup/{}", field.to_ascii_lowercase()), 1, false),
         "PURGE_MAX_FILES_PER_COMMIT"
         | "PURGE_MAX_PLAN_BYTES"
+        | "OPTIMIZE_UPLOAD_MODE"
+        | "OPTIMIZE_UPLOAD_BUFFER_BYTES"
         | "VACUUM_DELETE_CHUNK"
         | "VACUUM_MAX_PLAN_BYTES"
         | "REPLAY_MAX_LOG_FILES"
@@ -350,6 +352,43 @@ fn sanitized_maintenance_error_kind(kind: Option<&str>) -> String {
     .to_owned()
 }
 
+#[derive(serde::Deserialize, serde::Serialize)]
+struct MaintenanceCompactionDebt {
+    observed_at_ms: i64,
+    source: MaintenanceCompactionDebtSource,
+    eligible_files: u64,
+    eligible_bytes: u64,
+    backlog_files: u64,
+    backlog_bytes: u64,
+    oldest_eligible_partition_start_ms: Option<i64>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum MaintenanceCompactionDebtSource {
+    SnapshotActiveFiles,
+    BoundedPhysicalInventory,
+}
+
+fn maintenance_compaction_debt(value: &Value, failed: bool) -> Result<Option<MaintenanceCompactionDebt>> {
+    if failed || value["operation"] != "optimize" {
+        return Ok(None);
+    }
+    let Some(debt) = value.pointer("/report/compaction_debt").filter(|debt| !debt.is_null()) else {
+        return Ok(None);
+    };
+    let debt: MaintenanceCompactionDebt =
+        serde_json::from_value(debt.clone()).context("invalid maintenance compaction debt receipt")?;
+    if debt.observed_at_ms <= 0
+        || debt.backlog_files > debt.eligible_files
+        || debt.backlog_bytes > debt.eligible_bytes
+        || debt.oldest_eligible_partition_start_ms.is_some_and(|time| time > debt.observed_at_ms)
+    {
+        bail!("invalid maintenance compaction debt values");
+    }
+    Ok(Some(debt))
+}
+
 fn maintenance_table_evidence(config: &OatConfig, text: &str) -> Result<Value> {
     let mut tables = serde_json::Map::new();
     for line in text
@@ -459,6 +498,7 @@ fn maintenance_table_evidence(config: &OatConfig, text: &str) -> Result<Value> {
             "table": table, "operation": value["operation"], "negative_probe": value["negative_probe"].as_bool(),
             "mutation_mode": if value["applied"] == true { "apply_authorized_not_proof_of_mutation" } else { "dry_run_predicted_not_applied" },
             "operation_failed": operation_failed, "error_kind": error_kind,
+            "compaction_debt": maintenance_compaction_debt(&value, operation_failed)?,
             "consumer_reported_counts": counts, "duration_ms": value["duration_ms"].as_u64(),
             "report_outcome": value.pointer("/report/outcome").and_then(Value::as_str),
         }));
@@ -566,6 +606,7 @@ mod maintenance_topology_tests {
         let report = json!({"table":table,"operation":"optimize","applied":false,"negative_probe":false,
             "report":{"files_added":2,"rows_added":257,"outputs":["private-object-path"]},"duration_ms":12});
         let reports = maintenance_table_evidence(&config, &format!("{text}{report}\n"))?;
+        assert!(reports["operation_reports"][0]["compaction_debt"].is_null());
         assert_eq!(
             reports["operation_reports"][0]["consumer_reported_counts"]["rows_added"],
             257
@@ -575,6 +616,20 @@ mod maintenance_topology_tests {
             "dry_run_predicted_not_applied"
         );
         assert!(!reports.to_string().contains("private-object-path"));
+        let mut debt_report = report.clone();
+        debt_report["report"]["compaction_debt"] = json!({
+            "observed_at_ms": 1700000000000_i64, "source": "snapshot_active_files",
+            "eligible_files": 4, "eligible_bytes": 1000, "backlog_files": 2, "backlog_bytes": 500,
+            "oldest_eligible_partition_start_ms": null
+        });
+        let debt = maintenance_table_evidence(&config, &format!("{text}{debt_report}\n"))?;
+        assert_eq!(debt["operation_reports"][0]["compaction_debt"], debt_report["report"]["compaction_debt"]);
+        debt_report["error_kind"] = json!("commit_budget_exhausted");
+        let debt = maintenance_table_evidence(&config, &format!("{text}{debt_report}\n"))?;
+        assert!(debt["operation_reports"][0]["compaction_debt"].is_null());
+        debt_report["error_kind"] = Value::Null;
+        debt_report["report"]["compaction_debt"]["backlog_files"] = json!(5);
+        assert!(maintenance_table_evidence(&config, &format!("{text}{debt_report}\n")).is_err());
         let mut failed = report.clone();
         failed["error_kind"] = json!("commit_budget_exhausted");
         failed["error"] = json!("private operation error");
@@ -609,6 +664,54 @@ mod maintenance_topology_tests {
                 maintenance_readback_value(&observed, &format!("ARROWCOL_MAINT_{variable}"), expected)?;
             assert_eq!(actual, requested);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn maintenance_upload_readback_requires_actual_configured_values() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+            "maintenance": {"enabled": true, "operations": ["optimize"],
+                "optimize_upload_mode": "buffered_multipart", "optimize_upload_buffer_bytes": 4194304}
+        }))?;
+        let mut observed = json!({"startup": {
+            "apply": false, "operations": ["optimize"], "interval_secs": 60,
+            "operation_limits": {"optimize_upload_mode": "buffered_multipart", "optimize_upload_buffer_bytes": 4194304}
+        }});
+        verify_process_configuration(&config, ComponentRole::Maintenance, &observed)?;
+        observed["startup"]["operation_limits"]["optimize_upload_buffer_bytes"] = Value::Null;
+        assert!(verify_process_configuration(&config, ComponentRole::Maintenance, &observed).is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires L2 delta-maintenance binary"]
+    async fn maintenance_upload_json_reaches_real_consumer_readback() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+            "parquet_writer": {"defaults": {"compression": "zstd"}},
+            "maintenance": {"enabled": true, "operations": ["optimize"],
+                "optimize_upload_mode": "buffered_multipart", "optimize_upload_buffer_bytes": 4194304,
+                "parquet_writer": {"defaults": {"compression": "snappy"}}}
+        }))?;
+        let binary = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/delta-maintenance");
+        let mut command = Command::new(binary);
+        command.env_clear().envs(role_environment(&config, ComponentRole::Maintenance)?)
+            .args(["--root", "file:///tmp/oat-e1-nonexistent-table-root", "--table", "fixture",
+                "--operation", "optimize", "--interval-secs", "60", "--max-cycles", "1",
+                "--no-metrics-listener"])
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(Duration::from_secs(30), command.output()).await??;
+        let stderr = String::from_utf8(output.stderr)?;
+        let observed = process_configurations(&stderr)?;
+        verify_process_configuration(&config, ComponentRole::Maintenance, &observed)?;
+        assert_eq!(observed["parquet_writer_overrides"]["defaults"]["compression"], "snappy");
+        assert_eq!(observed["startup"]["operation_limits"]["optimize_upload_mode"], "buffered_multipart");
+        assert_eq!(observed["startup"]["operation_limits"]["optimize_upload_buffer_bytes"], 4194304);
         Ok(())
     }
 }
