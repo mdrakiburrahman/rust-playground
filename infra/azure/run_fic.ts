@@ -33,6 +33,134 @@ export interface RunFicRecord {
   phase: 'create-submitted' | 'ready' | 'delete-submitted' | 'deleted';
 }
 
+export type RunFicPlan = Pick<RunFicRecord, 'version' | 'runId' | 'namespace' | 'serviceAccount' |
+  'identityId' | 'clientId' | 'tenantId' | 'aksId' | 'server' | 'credentialName' | 'issuer' | 'subject' | 'audience'> & {
+  resourceId: string;
+};
+
+function planFromRecord(record: RunFicRecord): RunFicPlan {
+  const { version, runId, namespace, serviceAccount, identityId, clientId, tenantId, aksId, server,
+    credentialName, issuer, subject, audience } = record;
+  return { version, runId, namespace, serviceAccount, identityId, clientId, tenantId, aksId, server,
+    credentialName, issuer, subject, audience, resourceId: identityId + '/federatedIdentityCredentials/' + credentialName };
+}
+
+/** Resolves the shared UAMI and cluster without requiring or creating the run namespace. */
+export async function plan_run_fic(azure: Azure, runId: string, namespace: string, serviceAccount: string): Promise<RunFicPlan> {
+  validate_run_identity(runId, namespace, serviceAccount);
+  if (azure.c.mode !== 'stamped') throw new Failure('Run FIC planning requires stamped infrastructure.');
+  const aksId = azure.c.base + '/providers/Microsoft.ContainerService/managedClusters/' + azure.c.cluster;
+  const cluster = await azure.arm('GET', aksId, undefined, false, AKS_API);
+  const identity = await azure.arm('GET', azure.c.identity_id, undefined, false, ARM_API);
+  await verify_aks_native_credential(azure, cluster, identity);
+  const fqdn = cluster?.properties?.fqdn;
+  if (typeof fqdn !== 'string' || !/^[a-zA-Z0-9.-]+$/.test(fqdn)) throw new Failure('AKS public FQDN is unavailable.');
+  const credentialName = 'arrowcol-run-' + runId;
+  const issuer = textIssuer(cluster?.properties?.oidcIssuerProfile?.issuerURL);
+  return { version: 1, runId, namespace, serviceAccount, identityId: azure.c.identity_id,
+    resourceId: azure.c.identity_id + '/federatedIdentityCredentials/' + credentialName,
+    clientId: uuid(identity?.properties?.clientId ?? ''), tenantId: uuid(identity?.properties?.tenantId ?? ''),
+    aksId, server: `https://${fqdn}`, credentialName, issuer,
+    subject: `system:serviceaccount:${namespace}:${serviceAccount}`, audience: AUDIENCE };
+}
+function textIssuer(value: unknown): string {
+  if (typeof value !== 'string') throw new Failure('AKS issuer is unavailable.');
+  https_url(value, 'AKS issuer');
+  return value;
+}
+export function assert_run_fic_plan(plan: unknown, record: RunFicRecord): void {
+  if (canonical_json(plan) !== canonical_json(planFromRecord(record)))
+    throw new Failure('Prepared run FIC identity differs from its pre-side-effect plan.');
+}
+
+export interface RunWorkloadStopReceipt {
+  schema_version: 1;
+  workload_record: RunFicRecord;
+  run_id: string;
+  namespace: string;
+  namespace_uid: string;
+  namespace_run_id: string;
+  namespace_owner_token: string;
+  aks_id: string;
+  kubectl_server: string;
+  delete_succeeded: true;
+  absence_confirmed: true;
+  observed_at_unix_ms: number;
+}
+export interface RunCleanupAuthority { assertCurrent(): Promise<void> }
+
+export function assert_namespace_delete_response(value: unknown, record: RunFicRecord): void {
+  const response = object(value, 'Namespace DELETE response');
+  const metadata = response.kind === 'Namespace' ? object(response.metadata, 'Deleted namespace metadata') : undefined;
+  const details = response.kind === 'Status' ? object(response.details, 'Namespace delete status') : undefined;
+  const timestamp = metadata?.deletionTimestamp;
+  const namespaceResponse = metadata?.name === record.namespace && metadata.uid === record.namespaceUid &&
+    typeof timestamp === 'string' && Number.isFinite(Date.parse(timestamp));
+  const statusResponse = response.kind === 'Status' && response.status === 'Success' &&
+    (response.code === 200 || response.code === 202) && details?.name === record.namespace && details.uid === record.namespaceUid;
+  if (!namespaceResponse && !statusResponse)
+    throw new Failure('Namespace DELETE response does not affirm the original UID deletion.');
+}
+
+/** A successful exact-UID DELETE response, not listing absence, is required to mint this receipt. */
+export async function delete_run_namespace(azure: Azure, input: RunFicRecord, receiptPath: string,
+  authority: RunCleanupAuthority): Promise<RunWorkloadStopReceipt> {
+  const record = parse_run_fic_record(input, azure.c);
+  return reset_lock(receiptPath, async () => {
+    await authority.assertCurrent();
+    const cluster = await azure.arm('GET', record.aksId, undefined, false, AKS_API);
+    if (`https://${cluster?.properties?.fqdn}` !== record.server) throw new Failure('Original AKS server changed.');
+    owned(cluster, azure.c);
+    const intentPath = receiptPath + '.delete-intent';
+    const responsePath = receiptPath + '.delete-response';
+    const deletion = { apiVersion: 'v1', kind: 'DeleteOptions', preconditions: { uid: record.namespaceUid } };
+    const intent = { workload_record: record, deletion };
+    if (fs.existsSync(intentPath)) {
+      if (canonical_json(JSON.parse(fs.readFileSync(intentPath, 'utf8'))) !== canonical_json(intent))
+        throw new Failure('Namespace delete intent belongs to another identity.');
+      if (!fs.existsSync(responsePath)) throw new Failure('Namespace DELETE outcome is unknown; absence cannot prove deletion.');
+    } else {
+      const namespace = await kubernetes_object(record, ['get', 'namespace', record.namespace]);
+      const metadata = object(namespace.metadata, 'Namespace metadata');
+      const labels = object(metadata.labels, 'Namespace labels'), annotations = object(metadata.annotations, 'Namespace annotations');
+      if (metadata.name !== record.namespace || metadata.uid !== record.namespaceUid || metadata.deletionTimestamp ||
+          labels[RUN_LABEL] !== record.runId || annotations[RUN_LABEL] !== record.runId ||
+          labels[OWNER_LABEL] !== record.namespaceOwner || annotations[OWNER_LABEL] !== record.namespaceOwner)
+        throw new Failure('Namespace UID or original ownership changed; refusing deletion.');
+      const requestPath = receiptPath + '.delete-options';
+      publish_private(requestPath, deletion);
+      publish_private(intentPath, intent);
+      await authority.assertCurrent();
+      const response = await kubectl(record, ['delete', '--raw', '/api/v1/namespaces/' + record.namespace, '-f', requestPath]);
+      let value: unknown;
+      try { value = JSON.parse(response); } catch { throw new Failure('Namespace DELETE lacks a typed response; outcome uncertain.'); }
+      publish_private(responsePath, value);
+    }
+    assert_namespace_delete_response(JSON.parse(fs.readFileSync(responsePath, 'utf8')) as unknown, record);
+    await authority.assertCurrent();
+    const remaining = await kubectl(record, ['get', 'namespace', record.namespace, '--ignore-not-found', '--output', 'name']);
+    if (remaining) throw new Failure('Original namespace deletion is still pending; receipt not complete.');
+    if (fs.existsSync(receiptPath)) {
+      const prior: RunWorkloadStopReceipt = JSON.parse(fs.readFileSync(receiptPath, 'utf8'));
+      if (canonical_json(prior.workload_record) !== canonical_json(record) ||
+          canonical_json(prior) !== canonical_json(stopReceipt(record, prior.observed_at_unix_ms)))
+        throw new Failure('Existing workload stop receipt changed.');
+      return prior;
+    }
+    const receipt = stopReceipt(record, Date.now());
+    publish_private(receiptPath, receipt);
+    return receipt;
+  });
+}
+function stopReceipt(record: RunFicRecord, observedAt: number): RunWorkloadStopReceipt {
+  if (!Number.isSafeInteger(observedAt) || observedAt < 1 || observedAt > Date.now())
+    throw new Failure('Workload stop observation time is invalid.');
+  return { schema_version: 1, workload_record: record, run_id: record.runId, namespace: record.namespace,
+    namespace_uid: record.namespaceUid, namespace_run_id: record.runId, namespace_owner_token: record.namespaceOwner,
+    aks_id: record.aksId, kubectl_server: record.server, delete_succeeded: true, absence_confirmed: true,
+    observed_at_unix_ms: observedAt };
+}
+
 function object(value: unknown, label: string): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Failure(`${label} must be an object.`);
   return value as Record<string, unknown>;
@@ -627,15 +755,8 @@ async function arm_postcondition(azure: Azure, record: RunFicRecord, operation: 
   return captured.receipt;
 }
 async function new_record(azure: Azure, runId: string, namespace: string, serviceAccount: string): Promise<RunFicRecord> {
-  validate_run_identity(runId, namespace, serviceAccount);
-  if (azure.c.mode !== 'stamped') throw new Failure('Run FIC preparation requires stamped infrastructure.');
-  const aksId = azure.c.base + '/providers/Microsoft.ContainerService/managedClusters/' + azure.c.cluster;
-  const cluster = await azure.arm('GET', aksId, undefined, false, AKS_API);
-  const identity = await azure.arm('GET', azure.c.identity_id, undefined, false, ARM_API);
-  await verify_aks_native_credential(azure, cluster, identity);
-  const fqdn = cluster?.properties?.fqdn;
-  if (typeof fqdn !== 'string' || !/^[a-zA-Z0-9.-]+$/.test(fqdn)) throw new Failure('AKS public FQDN is unavailable.');
-  const server = `https://${fqdn}`;
+  const { resourceId: _resourceId, ...plan } = await plan_run_fic(azure, runId, namespace, serviceAccount);
+  const { server } = plan;
   const ns = object((await kubernetes_object({ server }, ['get', 'namespace', namespace])).metadata, 'Namespace metadata');
   const labels = object(ns.labels, 'Namespace labels'), annotations = object(ns.annotations, 'Namespace annotations');
   const owner = string(labels, OWNER_LABEL);
@@ -645,20 +766,18 @@ async function new_record(azure: Azure, runId: string, namespace: string, servic
   const sa = object((await kubernetes_object({ server }, ['get', 'serviceaccount', serviceAccount,
     '--namespace', namespace])).metadata, 'ServiceAccount metadata');
   if (sa.name !== serviceAccount || sa.namespace !== namespace || sa.deletionTimestamp ||
-      object(sa.annotations, 'ServiceAccount annotations')['azure.workload.identity/client-id'] !== identity.properties.clientId)
+      object(sa.annotations, 'ServiceAccount annotations')['azure.workload.identity/client-id'] !== plan.clientId)
     throw new Failure('Run ServiceAccount does not reference the exact shared UAMI.');
-  return parse_run_fic_record({ version: 1, runId, ownershipNonce: randomUUID(), namespace, namespaceUid: ns.uid,
-    namespaceOwner: owner, serviceAccount, serviceAccountUid: sa.uid, identityId: azure.c.identity_id,
-    clientId: identity.properties.clientId, tenantId: identity.properties.tenantId, aksId, server,
-    credentialName: 'arrowcol-run-' + runId, issuer: cluster.properties.oidcIssuerProfile.issuerURL,
-    subject: `system:serviceaccount:${namespace}:${serviceAccount}`, audience: AUDIENCE, phase: 'create-submitted' }, azure.c);
+  return parse_run_fic_record({ ...plan, ownershipNonce: randomUUID(), namespaceUid: ns.uid,
+    namespaceOwner: owner, serviceAccountUid: sa.uid, phase: 'create-submitted' }, azure.c);
 }
 export async function prepare_run_fic(azure: Azure, runId: string, namespace: string, serviceAccount: string,
-  recordPath: string): Promise<void> {
+  recordPath: string, plannedIdentity?: unknown): Promise<void> {
   validate_run_identity(runId, namespace, serviceAccount);
   await reset_lock(recordPath, async () => {
     if (fs.existsSync(recordPath)) {
       const record = read_run_fic_record(recordPath, azure.c), snapshot = await read_ledger(azure);
+      if (plannedIdentity !== undefined) assert_run_fic_plan(plannedIdentity, record);
       if (record.runId !== runId || record.namespace !== namespace || record.serviceAccount !== serviceAccount ||
           record.phase !== 'ready' || snapshot?.value.transaction?.phase !== 'complete')
         throw new Failure('Existing run FIC attempt is not definitively complete; no replay.');
@@ -667,6 +786,7 @@ export async function prepare_run_fic(azure: Azure, runId: string, namespace: st
       return;
     }
     const record = await new_record(azure, runId, namespace, serviceAccount);
+    if (plannedIdentity !== undefined) assert_run_fic_plan(plannedIdentity, record);
     publish_private(recordPath, record);
     await with_coordinator(azure, record, recordPath, 'prepare', async (ledger, save) => {
       const createIntent = intent();

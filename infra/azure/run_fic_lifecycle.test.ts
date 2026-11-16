@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, mock, test, type TestContext } from 'node:test';
 import { Azure, Config, Failure, HttpFailure, TAGS, runtime, type HttpReceipt } from './bootstrap.js';
-import { cleanup_run_fic, prepare_run_fic, read_run_fic_record, run_fic_ledger_path } from './run_fic.js';
+import { assert_run_fic_plan, cleanup_run_fic, delete_run_namespace, plan_run_fic, prepare_run_fic, read_run_fic_record, run_fic_ledger_path } from './run_fic.js';
 
 const id = '00000000-0000-0000-0000-000000000001';
 const runId = '9dcd6847-2a56-45a3-bd3c-54af839f451e';
@@ -169,6 +169,75 @@ function fixture(t: TestContext) {
   });
   return { azure, c, state, recordPath, unrelated, native };
 }
+
+test('FIC plan is read-only and prepare rejects drift before any mutation', async t => {
+  const { azure, c, state, recordPath } = fixture(t);
+  const kubernetes = mock.method(runtime, 'run_tree', async () => { throw new Error('planning must not query Kubernetes'); });
+  const plan = await plan_run_fic(azure, runId, namespace, serviceAccount);
+  assert.equal(plan.identityId, c.identity_id);
+  assert.equal(plan.resourceId, c.identity_id + '/federatedIdentityCredentials/' + plan.credentialName);
+  assert.equal(plan.clientId, id);
+  assert.equal(kubernetes.mock.callCount(), 0);
+  assert.deepEqual(state.mutations, []);
+  kubernetes.mock.restore();
+  await assert.rejects(prepare_run_fic(azure, runId, namespace, serviceAccount, recordPath,
+    { ...plan, clientId: nextRunId }), /pre-side-effect plan/);
+  assert.deepEqual(state.mutations, []);
+  assert.equal(fs.existsSync(recordPath), false);
+  await prepare_run_fic(azure, runId, namespace, serviceAccount, recordPath, plan);
+  assert_run_fic_plan(plan, read_run_fic_record(recordPath, c));
+});
+
+test('namespace deletion checks original UID, enforces cleanup fence, and never mints a receipt from absence alone', async t => {
+  const { azure, c, state, recordPath } = fixture(t);
+  await prepare_run_fic(azure, runId, namespace, serviceAccount, recordPath);
+  const record = read_run_fic_record(recordPath, c), stopPath = recordPath + '.stop';
+  const base = runtime.run_tree;
+  let deletes = 0, fenced = true;
+  mock.method(runtime, 'run_tree', async (args: string[], timeout?: number) => {
+    if (args.includes('get') && args.includes('namespace') && state.absentNamespaces.has(namespace) &&
+        !args.includes('--ignore-not-found')) return { returncode: 1, stdout: '', stderr: 'not found' };
+    if (!args.includes('--raw')) return base(args, timeout ?? 15);
+    deletes++;
+    assert.deepEqual(JSON.parse(fs.readFileSync(args[args.indexOf('-f') + 1], 'utf8')),
+      { apiVersion: 'v1', kind: 'DeleteOptions', preconditions: { uid: record.namespaceUid } });
+    state.absentNamespaces.add(namespace);
+    return { returncode: 0, stdout: JSON.stringify({ kind: 'Namespace',
+      metadata: { name: namespace, uid: record.namespaceUid, deletionTimestamp: new Date().toISOString() } }), stderr: '' };
+  });
+  const authority = { assertCurrent: async () => { if (fenced) throw new Error('stale cleanup actor'); } };
+  await assert.rejects(delete_run_namespace(azure, record, stopPath, authority), /stale cleanup actor/);
+  assert.equal(deletes, 0);
+  fenced = false;
+  const receipt = await delete_run_namespace(azure, record, stopPath, authority);
+  assert.equal(receipt.namespace_uid, record.namespaceUid);
+  assert.equal(receipt.delete_succeeded, true);
+  assert.deepEqual(await delete_run_namespace(azure, record, stopPath, authority), receipt);
+  assert.equal(deletes, 1);
+  const otherStopPath = recordPath + '.unproven-stop';
+  await assert.rejects(delete_run_namespace(azure, record, otherStopPath, authority));
+  assert.equal(fs.existsSync(otherStopPath), false);
+  assert.equal(deletes, 1);
+});
+
+test('unknown namespace DELETE cannot be replayed or inferred successful from later absence', async t => {
+  const { azure, c, state, recordPath } = fixture(t);
+  await prepare_run_fic(azure, runId, namespace, serviceAccount, recordPath);
+  const record = read_run_fic_record(recordPath, c), stopPath = recordPath + '.stop';
+  const base = runtime.run_tree;
+  let deletes = 0;
+  mock.method(runtime, 'run_tree', async (args: string[], timeout?: number) => {
+    if (!args.includes('--raw')) return base(args, timeout ?? 15);
+    deletes++;
+    state.absentNamespaces.add(namespace);
+    throw new Error('lost response');
+  });
+  const authority = { assertCurrent: async () => {} };
+  await assert.rejects(delete_run_namespace(azure, record, stopPath, authority), /lost response/);
+  await assert.rejects(delete_run_namespace(azure, record, stopPath, authority), /outcome is unknown/);
+  assert.equal(deletes, 1);
+  assert.equal(fs.existsSync(stopPath), false);
+});
 
 test('create and cleanup keep definitive receipts and preserve unrelated/native trusts', async t => {
   const f = fixture(t);
