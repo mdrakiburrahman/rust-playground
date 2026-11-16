@@ -49,6 +49,7 @@ url = "2"
 uuid = { version = "1", features = ["serde", "v4"] }
 
 [dev-dependencies]
+arrowcol-catalog-rust = { path = "../../arrowcol-catalog-rust" }
 # Dev-only: enables the offline bootstrap control seam for tests/initialize_control.rs.
 arrow-deltalake = { path = "../../../crates/arrow-deltalake", features = ["test-control"] }
 assert_cmd.workspace = true
