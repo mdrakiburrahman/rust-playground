@@ -41,6 +41,35 @@ include!("runner_commit_evidence.rs");
 include!("runner_maintenance.rs");
 include!("runner_wal.rs");
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CampaignIdentity {
+    campaign_id: String,
+    owner_id: String,
+    fencing_token: u64,
+}
+
+impl CampaignIdentity {
+    fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Result<Self> {
+        let campaign_id = lookup("CAMPAIGN_ID").context("CAMPAIGN_ID is required for AKS campaign custody")?;
+        let owner_id = lookup("CAMPAIGN_OWNER_ID").context("CAMPAIGN_OWNER_ID is required for AKS campaign custody")?;
+        let raw_token = lookup("CAMPAIGN_FENCING_TOKEN").context("CAMPAIGN_FENCING_TOKEN is required for AKS campaign custody")?;
+        for value in [&campaign_id, &owner_id] {
+            let id = uuid::Uuid::parse_str(value).context("campaign custody identity must be a canonical UUID")?;
+            if id.is_nil() || id.to_string() != *value {
+                bail!("campaign custody identity must be a nonzero canonical UUID");
+            }
+        }
+        if raw_token.is_empty() || !raw_token.bytes().all(|byte| byte.is_ascii_digit()) {
+            bail!("CAMPAIGN_FENCING_TOKEN must be a positive decimal integer");
+        }
+        let fencing_token = raw_token.parse::<u64>().context("CAMPAIGN_FENCING_TOKEN is out of range")?;
+        if fencing_token == 0 || fencing_token > 9_007_199_254_740_991 {
+            bail!("CAMPAIGN_FENCING_TOKEN must be a positive JSON-safe integer");
+        }
+        Ok(Self { campaign_id, owner_id, fencing_token })
+    }
+}
+
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RunInventory {
@@ -2342,6 +2371,12 @@ fn matrix_cell_specs(config: &OatConfig) -> Vec<(u32, u32, String)> {
 }
 
 fn platform_for_run(config: &OatConfig, run_id: &str) -> Result<Box<dyn Platform>> {
+    if config.platform.kind == crate::config::OatMode::Aks
+        && config.campaign_profile == Some(crate::config::CampaignProfile::SingleHotTable)
+    {
+        CampaignIdentity::from_lookup(|name| std::env::var(name).ok())?;
+        bail!("AKS campaign is blocked until fenced inventory publication and lifecycle hooks are integrated");
+    }
     match config.platform.kind {
         crate::config::OatMode::Local => Ok(Box::new(LocalPlatform::new(config, run_id)?)),
         crate::config::OatMode::Aks => Ok(Box::new(AksPlatform {
@@ -9509,6 +9544,29 @@ mod tests {
         assert!(verify_aks_collector_stop_grace(&deployment, 300).is_ok());
         assert!(verify_aks_collector_stop_grace(&deployment, 301).is_err());
         assert!(verify_aks_collector_stop_grace(&json!({}), 300).is_err());
+    }
+
+    #[test]
+    fn campaign_identity_requires_complete_canonical_fenced_context() -> Result<()> {
+        let mut values = HashMap::from([
+            ("CAMPAIGN_ID", "5d4c2001-77e2-44b2-b32b-4ce79bf7dd01"),
+            ("CAMPAIGN_OWNER_ID", "5d4c2001-77e2-44b2-b32b-4ce79bf7dd02"),
+            ("CAMPAIGN_FENCING_TOKEN", "1"),
+        ]);
+        let parse = |values: &HashMap<&str, &str>| {
+            CampaignIdentity::from_lookup(|name| values.get(name).map(|value| (*value).to_owned()))
+        };
+        assert_eq!(parse(&values)?.fencing_token, 1);
+        for token in ["0", "-1", "1x", "9007199254740992"] {
+            values.insert("CAMPAIGN_FENCING_TOKEN", token);
+            assert!(parse(&values).is_err());
+        }
+        values.insert("CAMPAIGN_FENCING_TOKEN", "1");
+        values.insert("CAMPAIGN_OWNER_ID", "00000000-0000-0000-0000-000000000000");
+        assert!(parse(&values).is_err());
+        values.remove("CAMPAIGN_ID");
+        assert!(parse(&values).is_err());
+        Ok(())
     }
 
     #[test]
