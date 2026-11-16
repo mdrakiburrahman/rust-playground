@@ -433,7 +433,7 @@ fn later_vacuum_probe_uses_fresh_due_time_after_earlier_operation() -> Result<()
     )?;
     assert_eq!(discovery.calls.load(Ordering::SeqCst), 2);
     assert_eq!(results.len(), 2);
-    assert_eq!(results[1].operation, Operation::Purge);
+    assert_eq!(results[0].operation, Operation::Purge);
     assert!(results[0].negative_probe, "purge remains not due");
     assert_eq!(results[1].operation, Operation::Vacuum);
     assert!(
