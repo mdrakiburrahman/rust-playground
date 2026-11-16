@@ -42,6 +42,22 @@ For the planned zero-interval comparison, keep Profile A unpooled (`sql_pool_max
 | Attempt counters | `error_rows` and `rejected_rows` count attempts, not unique rows. A retry of the same encoded batch is another attempt. |
 | Counter readback | Rejected, retried, given-up and ambiguous stream/row counters are retained per worker for the measurement-start delta and, where available, the shared measurement window. Older clients default missing counters to zero. |
 
+## In-flight overload guard
+
+These are root OAT settings, not component `tunables`. Memory-only runs do not
+need WAL or Quiver; disk protection is explicitly not applicable.
+
+| Setting or evidence | Contract |
+| --- | --- |
+| `overload_guard.enabled` | Strict bool, default `true`. Disabled runs cannot qualify for the throughput campaign. |
+| `overload_guard.cap_fraction` | Finite number in `(0, 0.90]`, default `0.90`; lower values stop earlier, never weaken the approved ceiling. |
+| `overload_guard.zero_progress_windows` | Strict integer `1..=2`, default `2`; complete 30-second windows with outstanding publications, rows or logical bytes and no new ingestion commit. Idle windows do not trigger. |
+| Hard-cap accounting | Exactly one run-owned collector: read its actual cgroup-v2 `memory.current`/finite `memory.max` in its private cgroup namespace, and its pressure endpoint's actual RSS and buffered bytes against startup-confirmed limits. Never compare aggregate pod/Docker working-set memory or publication logical bytes with a different cap. Unlimited/unsupported cgroups, mismatched identities/accounting, missing readback or a sampling gap over 5 seconds are unavailable, not healthy under-cap observations. |
+| Coverage and progress | Pre-admission readback, then 1-second sampling through warm-up and measurement (3-second request deadlines). Ingestion-only durable commit telemetry is deduplicated by table/version and assigned by commit finish time; rewrites and replayed retries cannot create progress. |
+| Stop and custody | `evidence_json.overload_stop` carries `classification: above_ceiling`, reason, metric, value, cap/fraction (null for no-progress), zero-based window index and Unix-ms timestamp. Cancel active clients and retain the normal drain, maintenance and ownership-safe cleanup path; never destroy on failed stop. |
+| Unknown protection | Admission fails closed before clients are created if required readback is unavailable. Mid-cell unavailability stops clients and records guard status `unavailable`, with null current caps; it is not mislabelled as an actual threshold trigger. |
+| Qualification | `overload_guard` retains settings, run/schedule identity, coverage, sampling gaps, peak cap fraction and complete progress windows. Missing/disabled/unavailable/incomplete protection and actual stops cannot qualify; a stop is rendered `above_ceiling` even for a failed official row. Existing debt, backlog, reconciliation and 30-second rate gates remain unchanged. |
+
 ## AKS rollout readiness
 
 | Setting | Contract |

@@ -40,6 +40,7 @@ include!("runner_process_evidence.rs");
 include!("runner_commit_evidence.rs");
 include!("runner_maintenance.rs");
 include!("runner_wal.rs");
+include!("runner_overload.rs");
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CampaignIdentity {
@@ -1097,10 +1098,14 @@ impl PublicationBacklogScraper {
     }
 
     async fn scrape(&self) -> Result<PublicationBacklogMetrics> {
+        parse_publication_backlog_metrics(&self.read_endpoint(&self.endpoint).await?)
+    }
+
+    async fn read_endpoint(&self, endpoint: &str) -> Result<String> {
         const MAX_METRICS_BYTES: u64 = 1_048_576;
         let response = self
             .client
-            .get(&self.endpoint)
+            .get(endpoint)
             .send()
             .await
             .context("request collector admin metrics")?;
@@ -1121,8 +1126,7 @@ impl PublicationBacklogScraper {
             }
             body.extend_from_slice(&chunk);
         }
-        let text = std::str::from_utf8(&body).context("collector admin metrics are not UTF-8")?;
-        parse_publication_backlog_metrics(text)
+        String::from_utf8(body).context("collector admin metrics are not UTF-8")
     }
 }
 
@@ -3770,6 +3774,48 @@ async fn run_clients_inner(
     platform: &mut dyn Platform,
     pinning: &mut PinningReport,
 ) -> Result<ClientRun> {
+    let mut evidence = CellEvidence::default();
+    let mut prepared_guard = if config.overload_guard.enabled {
+        match tokio::time::timeout(Duration::from_secs(5), PreparedGuard::prepare(config, platform)).await {
+            Ok(Ok(prepared)) => Some(prepared),
+            result => {
+                let error = match result {
+                    Ok(Err(error)) => format!("{error:#}"),
+                    Err(error) => error.to_string(),
+                    Ok(Ok(_)) => unreachable!("successful guard preparation returned above"),
+                };
+                tracing::error!(%error, "overload hard-cap/readback protection unavailable before admission");
+                evidence.overload_guard = Some(json!({
+                    "status":"unavailable","settings":config.overload_guard,
+                    "unavailable_reason":"pre_admission_cap_backlog_or_commit_readback_unavailable",
+                    "error":error,
+                }));
+                return Ok(ClientRun {
+                    metrics: HashMap::new(),
+                    pinning: std::mem::take(pinning),
+                    qap_tables: Vec::new(),
+                    failure: Some("overload_guard required protection unavailable before admission".to_owned()),
+                    evidence,
+                });
+            }
+        }
+    } else {
+        evidence.overload_guard = Some(json!({"status":"disabled","settings":config.overload_guard}));
+        None
+    };
+    if let Some(prepared) = &prepared_guard {
+        evidence.overload_guard = Some(prepared.engine.proof.clone());
+        evidence.overload_stop = prepared.engine.stop.clone();
+        if let Some(reason) = prepared.engine.failure() {
+            return Ok(ClientRun {
+                metrics: HashMap::new(),
+                pinning: std::mem::take(pinning),
+                qap_tables: Vec::new(),
+                failure: Some(reason),
+                evidence,
+            });
+        }
+    }
     platform
         .prepare_campaign_load_admission(config, project_run_id, tables)
         .await?;
@@ -3898,7 +3944,6 @@ async fn run_clients_inner(
             "run-scoped QAP preparation exceeded qap_timeout_seconds; operation outcome may be indeterminate and is not retried"
         )),
     };
-    let mut evidence = CellEvidence::default();
     let qap_tables = match qap_result {
         Ok(qap_tables) => qap_tables,
         Err(error) if local_downstream_optional(platform.kind()) && error.is::<LocalDownstreamUnavailable>() => {
@@ -4000,11 +4045,16 @@ async fn run_clients_inner(
         .checked_add(config.measure_seconds.saturating_mul(1_000))
         .context("shared OAT measurement end timestamp overflow")?;
     evidence.measurement_window = Some((measurement_start_unix_ms, measurement_end_unix_ms));
-    let sampler = ResourceSampler::start(
+    if let Some(prepared) = &mut prepared_guard {
+        prepared.engine.arm(run_start_unix_ms, measurement_end_unix_ms);
+        prepared.engine.proof["run_id"] = json!(project_run_id);
+    }
+    let mut sampler = ResourceSampler::start(
         platform.resource_sampler_source(),
         config.clone(),
         measurement_start_unix_ms,
         measurement_end_unix_ms,
+        prepared_guard,
     );
     let mut client_metrics = HashMap::<String, Vec<ClientMeasurement>>::with_capacity(tables.len());
     let mut completed_clients = HashSet::new();
@@ -4023,7 +4073,29 @@ async fn run_clients_inner(
             .iter()
             .map(|index| handles[*index].clone())
             .collect::<Vec<_>>();
-        let progress = match poll_clients(platform, config, &pending_handles).await {
+        let progress = tokio::select! {
+            biased;
+            reason = sampler.wait_for_overload_stop() => {
+                let cancellation = cancel_active_clients(platform, config, &handles, &active_clients).await;
+                let capture = sampler.finish_early(&mut evidence).await;
+                let mut failure = reason;
+                if let Err(error) = cancellation {
+                    failure.push_str(&format!("; client cancellation failed: {error:#}"));
+                }
+                if let Err(error) = capture {
+                    tracing::error!(%error, "overload stop sampler evidence unavailable");
+                    evidence.overload_guard = Some(json!({"status":"unavailable",
+                        "unavailable_reason":"monitor_terminal_capture_failed","settings":config.overload_guard}));
+                    failure.push_str("; terminal guard capture failed");
+                }
+                return Ok(ClientRun {
+                    metrics: HashMap::new(), pinning: std::mem::take(pinning), qap_tables,
+                    failure: Some(failure), evidence,
+                });
+            }
+            progress = poll_clients(platform, config, &pending_handles) => progress,
+        };
+        let progress = match progress {
             Ok(progress) => progress,
             Err(error) => {
                 let cleanup = cancel_active_clients(platform, config, &handles, &active_clients).await;
@@ -4156,6 +4228,20 @@ async fn run_clients_inner(
     ));
     let mut metrics = HashMap::with_capacity(tables.len());
     sampler.finish(&mut evidence).await?;
+    if evidence.overload_stop.is_some()
+        || evidence
+            .overload_guard
+            .as_ref()
+            .is_some_and(|guard| guard["status"] == "unavailable")
+    {
+        return Ok(ClientRun {
+            metrics: HashMap::new(),
+            pinning: std::mem::take(pinning),
+            qap_tables,
+            failure: Some("above_ceiling or overload_guard protection unavailable at terminal observation".to_owned()),
+            evidence,
+        });
+    }
     for table in tables {
         let reports = client_metrics
             .remove(table)

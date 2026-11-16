@@ -119,6 +119,19 @@ function sourceShapedRun(sequence: number, rates: number[], start: number, gapAt
   };
   const evidence = {
     version: 1,
+    overload_guard: {
+      status: 'complete', run_id: cell, run_start_ms: start - 30_000, measurement_end_ms: end,
+      settings: { enabled: true, cap_fraction: 0.9, zero_progress_windows: 2 },
+      coverage_start_ms: start - 30_000, coverage_end_ms: end, max_sampling_gap_ms: 1000,
+      sample_count: seconds + 31, peak_cap_fraction: 0.1,
+      last_caps: ['container_memory_bytes', 'collector_rss_bytes', 'collector_buffered_bytes']
+        .map(metric => ({ metric, observed_value: 100, cap: 1000, confirmed: true })),
+      complete_windows: Array.from({ length: Math.floor((end - start + 30_000) / 30_000) }, (_, index) => ({
+        index, start_ms: start - 30_000 + index * 30_000, end_ms: start + index * 30_000,
+        ingestion_commits: index === 0 ? 0 : 1, outstanding: index !== 0, covered: true,
+      })),
+    },
+    overload_stop: null,
     processes: [{ component: 'collector', image: 'dataflow:source-pinned', image_id: 'sha256:' + 'b'.repeat(64),
       source_revision: expectedSha, log_complete: true, effective_config_source: 'consumer_startup_readback',
       effective_config: { commit_telemetry: { schema_version: 1, scope: 'new_ingestion_addfiles_after_sync', clock: 'system_unix_ms' } } }],
@@ -149,7 +162,7 @@ function sourceShapedRun(sequence: number, rates: number[], start: number, gapAt
       qap_observed_tables: 1n, qap_completion_percent: 100, qap_pending_artifacts: 0n,
       qap_unhealthy_catalogs: 0n, measure_seconds: seconds, evidence_json: JSON.stringify(evidence) }],
     expectedSha, mode: 'local' as const,
-    config: { tables: ['sqlserver_availability_replica_states'], replica_counts: [1], dfe_worker_concurrency: [8],
+    config: { warmup_seconds: 30, tables: ['sqlserver_availability_replica_states'], replica_counts: [1], dfe_worker_concurrency: [8],
       tunables: { parquet_writer: { defaults: { compression: 'snappy', compression_level: 3 } },
         maintenance: { enabled: true, apply: true, operations: ['optimize', 'purge', 'vacuum', 'checkpoint', 'prune_log'] } } },
   };
@@ -664,6 +677,44 @@ test('preserves retries without failures but refuses missing records or growing 
   assert.match(maintenanceDueWorkIssue(evidence.processes, maintenanceConfig(run), 1_000_000, 1_150_000)!, /optimize maintenance due-work grows/);
   policy.operation_reports.find((item: Record<string, unknown>) => item.operation === 'optimize').compaction_debt = null;
   assert.match(maintenanceDueWorkIssue(evidence.processes, maintenanceConfig(run), 1_000_000, 1_150_000)!, /unavailable or invalid/);
+});
+
+test('requires live guard coverage and confirmed caps and renders actual overload stops above the ceiling', () => {
+  const run = sourceShapedRun(92, [1, 1, 1, 1, 1], 1_000_000);
+  attachMaintenanceDueWork(run, 1_000_000, 1_150_000);
+  const original = JSON.parse(String(run.rows[0]!.evidence_json));
+  original.backlog = syntheticBacklog();
+  const result = () => ({
+    cohort: 'C1', candidate: 'guard', factorX: 'codec', valueX: 'snappy', factorY: 'level', valueY: '3',
+    repeat: 1, expectedRepeats: 3, committedRowsPerSecond: 1,
+    factorConfigPaths: ['tunables.parquet_writer.defaults.compression', 'tunables.parquet_writer.defaults.compression_level'],
+    officialRuns: [run],
+  });
+  run.rows[0]!.evidence_json = JSON.stringify(original);
+  assert.match(renderCampaignResults([result()], 'C1'), /1\/3 protocol-complete repeats/);
+  for (const change of [
+    (evidence: typeof original) => { evidence.overload_guard = null; },
+    (evidence: typeof original) => { evidence.overload_guard.status = 'unavailable'; },
+    (evidence: typeof original) => { evidence.overload_guard.last_caps[0].confirmed = false; },
+    (evidence: typeof original) => { evidence.overload_guard.max_sampling_gap_ms = 5001; },
+    (evidence: typeof original) => { evidence.overload_guard.coverage_start_ms = 1_000_001; },
+  ]) {
+    const changed = structuredClone(original);
+    change(changed);
+    run.rows[0]!.evidence_json = JSON.stringify(changed);
+    assert.match(renderCampaignResults([result()], 'C1'), /overload_guard protection unavailable or invalid/);
+  }
+  run.rows[0]!.status = 'failed';
+  for (const reason of ['hard_cap_fraction', 'zero_ingestion_commit_progress']) {
+    const stopped = structuredClone(original);
+    stopped.overload_stop = { reason, metric: reason === 'hard_cap_fraction' ? 'container_memory_bytes' : 'new_ingestion_commits',
+      observed_value: reason === 'hard_cap_fraction' ? 900 : 0,
+      cap: reason === 'hard_cap_fraction' ? 1000 : null, fraction: reason === 'hard_cap_fraction' ? 0.9 : null,
+      window_index: 1, timestamp_ms: 1_060_000 };
+    run.rows[0]!.evidence_json = JSON.stringify(stopped);
+    assert.match(renderCampaignResults([result()], 'C1'), new RegExp('above_ceiling: overload_stop ' + reason));
+    assert.doesNotMatch(renderCampaignResults([result()], 'C1'), /1\/3 protocol-complete repeats/);
+  }
 });
 
 test('requires measured OPTIMIZE and PURGE debt vectors while preserving legitimate nulls', () => {
