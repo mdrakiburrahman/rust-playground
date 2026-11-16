@@ -739,17 +739,19 @@ mod tests {
         assert_eq!(multipart.upload_mode, UploadMode::BufferedMultipart);
 
         for raw in ["", "multipart", "Buffered_Multipart", "put_create "] {
-            let error = DeltaRuntimeConfig::from_lookup(|name| {
+            let Err(error) = DeltaRuntimeConfig::from_lookup(|name| {
                 Ok((name == "ARROWCOL_COLLECTOR_UPLOAD_MODE").then(|| raw.to_owned()))
-            })
-            .expect_err("invalid upload mode must fail");
+            }) else {
+                anyhow::bail!("invalid upload mode must fail");
+            };
             assert!(format!("{error:#}").contains("ARROWCOL_COLLECTOR_UPLOAD_MODE"));
         }
 
-        let error = DeltaRuntimeConfig::from_lookup(|name| {
+        let Err(error) = DeltaRuntimeConfig::from_lookup(|name| {
             Ok((name == "ARROWCOL_COLLECTOR_UPLOAD_BUFFER_CAPACITY_BYTES").then(|| "8388608".to_owned()))
-        })
-        .expect_err("buffer settings require explicit multipart mode");
+        }) else {
+            anyhow::bail!("buffer settings require explicit multipart mode");
+        };
         assert!(format!("{error:#}").contains("UPLOAD_MODE=buffered_multipart"));
         Ok(())
     }
