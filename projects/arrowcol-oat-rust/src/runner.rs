@@ -337,23 +337,20 @@ impl RunInventory {
             }
         }
         if let Some(qap) = &self.qap {
-            if qap.state == InventoryResourceState::Absent {
-                let mut seen = BTreeSet::new();
-                if qap.bindings.is_empty() || qap.absence.len() != qap.bindings.len()
-                    || qap.absence.iter().any(|receipt| {
-                        receipt.database != qap.database
-                            || receipt.observed_at_unix_ms == 0
-                            || !qap.bindings.iter().any(|binding| {
-                                binding.external_table == receipt.external_table
-                                    && binding.relative_path == receipt.relative_path
-                            })
-                            || !seen.insert((&receipt.external_table, &receipt.relative_path))
+            let mut seen = BTreeSet::new();
+            if qap.absence.iter().any(|receipt| {
+                receipt.database != qap.database
+                    || receipt.observed_at_unix_ms == 0
+                    || !qap.bindings.iter().any(|binding| {
+                        binding.external_table == receipt.external_table
+                            && binding.relative_path == receipt.relative_path
                     })
-                {
-                    bail!("QAP absence requires one exact not-found receipt per binding");
-                }
-            } else if !qap.absence.is_empty() {
-                bail!("QAP not-found receipts require absent state");
+                    || !seen.insert((&receipt.external_table, &receipt.relative_path))
+            }) || (qap.state == InventoryResourceState::Absent
+                && (qap.bindings.is_empty() || qap.absence.len() != qap.bindings.len()))
+                || (qap.state == InventoryResourceState::Planned && !qap.absence.is_empty())
+            {
+                bail!("QAP absence requires exact, unique not-found receipts for the planned bindings");
             }
             let safe_identifier = |value: &str| {
                 !value.is_empty()
@@ -361,9 +358,13 @@ impl RunInventory {
                         .bytes()
                         .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
             };
+            let mut binding_keys = BTreeSet::new();
             if !safe_identifier(&qap.database)
+                || matches!(qap.state, InventoryResourceState::Observed | InventoryResourceState::Removed)
+                    && qap.bindings.is_empty()
                 || qap.bindings.iter().any(|binding| {
                     !safe_identifier(&binding.external_table)
+                        || !binding_keys.insert((&binding.external_table, &binding.relative_path))
                         || binding.relative_path.is_empty()
                         || binding.relative_path.contains(['?', '#', '@', '\\', ':'])
                         || binding.relative_path.starts_with('/')
@@ -493,7 +494,7 @@ impl RunInventory {
             if old.database != new.database
                 || old.bindings.iter().any(|binding| !new.bindings.contains(binding))
                 || !old.state.can_advance_to(new.state)
-                || !old.absence.is_empty() && old.absence != new.absence
+                || old.absence.iter().any(|receipt| !new.absence.contains(receipt))
             {
                 bail!("custody update changed an established QAP identity");
             }
@@ -9759,6 +9760,12 @@ mod tests {
             ]
         }))?);
         external.validate()?;
+        let mut partial = external.clone();
+        partial.qap.as_mut().unwrap().state = InventoryResourceState::Uncertain;
+        partial.qap.as_mut().unwrap().absence.pop();
+        partial.validate()?;
+        partial.validate_successor(&external)?;
+        assert!(external.validate_successor(&partial).is_err());
         let mut complete = external.clone();
         complete.cleanup.handoff.state = InventoryStepState::Complete;
         assert!(complete.validate().is_err());
