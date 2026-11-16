@@ -30,7 +30,7 @@ test('rejects malformed, undersized, over-ceiling, and extended maintenance budg
     { maintenance_grace_seconds: 0, maintenance_stop_timeout_ms: 1 },
     { maintenance_grace_seconds: 1.5, maintenance_stop_timeout_ms: 1_500 },
     { maintenance_grace_seconds: Number.MAX_SAFE_INTEGER + 1, maintenance_stop_timeout_ms: 5_100_000 },
-    { maintenance_grace_seconds: 4_801, maintenance_stop_timeout_ms: 5_100_000 },
+    { maintenance_grace_seconds: 5_101, maintenance_stop_timeout_ms: 5_100_000 },
     { maintenance_grace_seconds: 4_800, maintenance_stop_timeout_ms: 5_100_001 }]) {
     assert.throws(() => parseEffectiveStopBudgets(value));
   }

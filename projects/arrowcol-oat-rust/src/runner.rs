@@ -12070,6 +12070,7 @@ mod tests {
                 "workloadIdentityClientId": "00000000-0000-0000-0000-000000000001",
                 "subscriptionId": "00000000-0000-0000-0000-000000000002", "stamp": "89152",
                 "deltaRoot": "abfss://onelake@arrowcollector89152.dfs.core.windows.net/dataflow", "images": images,
+                "effective_stop_budgets": {"maintenance_grace_seconds": 4_800, "maintenance_stop_timeout_ms": 5_100_000},
                 "maintenance": {"tables": ["telemetry.sqlserver.sqlserver_active_sessions"], "operations": ["optimize"], "apply": false},
             });
             let input_path = directory.join("runtime.json");
@@ -12954,6 +12955,8 @@ mod tests {
             "orchestration_run_id":"00000000-0000-0000-0000-000000000003",
             "cell_run_id":"00000000-0000-0000-0000-000000000004",
             "load_admission":"not_authorized",
+            "effective_stop_budgets":{"maintenance_grace_seconds":1200,"maintenance_stop_timeout_ms":1500000},
+            "planned_cell_duration_ms":1000,
             "namespace":{"name":"oat-00000000000000000000000000000004", "uid":null,
                 "owner_token":"00000000-0000-0000-0000-000000000002"},
             "resources":[{"api_version":"apps/v1","kind":"Deployment",
@@ -13005,6 +13008,15 @@ mod tests {
                 .context("inventory stop budgets")?
                 .maintenance_stop_timeout_ms
                 + 1_000
+        );
+        let mut legacy_cleanup = inventory.clone();
+        legacy_cleanup.effective_stop_budgets = None;
+        legacy_cleanup.planned_cell_duration_ms = None;
+        legacy_cleanup.cleanup.stop_maintenance.deadline_unix_ms = Some(5_000);
+        assert_eq!(
+            campaign_cleanup_operation_deadline_ms(&CampaignCleanupAction::StopMaintenance, &legacy_cleanup, 1_000)?,
+            5_000,
+            "legacy cleanup must retain its originally persisted deadline without extending it"
         );
         let mut expired_deadline = inventory.clone();
         expired_deadline.cleanup.stop_admission.deadline_unix_ms = Some(61_000);
