@@ -295,6 +295,16 @@ pub trait TableDiscovery: Sync {
     /// Returns missing-table, corrupt metadata or authority failures.
     fn table(&self, name: &str) -> Result<DiscoveredTable>;
 
+    /// Open the read-only table transport used by maintenance probes.
+    ///
+    /// Implementations may override this to provide an instrumented store.
+    ///
+    /// # Errors
+    /// Returns table access and bounded probe setup failures.
+    fn open_probe_table(&self, url: &Url, max_log_files: usize) -> Result<Arc<DeltaTable>> {
+        Ok(DeltaTable::open_for_maintenance_probe_with_limit(url, max_log_files)?)
+    }
+
     /// Return allowlisted tables that are not ready for maintenance yet.
     ///
     /// # Errors
@@ -1538,7 +1548,7 @@ fn maintain_table(
             schedule.insert(name.into(), (now, policy));
         }
         let limits = &settings.operation_limits;
-        let probe = DeltaTable::open_for_maintenance_probe_with_limit(&discovered.url, limits.discovery_max_log_files)?;
+        let probe = discovery.open_probe_table(&discovered.url, limits.discovery_max_log_files)?;
         let token = probe.probe_log_token(limits.discovery_max_log_files)?;
         if discovered.log_token.as_ref().is_none_or(|previous| *previous != token)
             && !policy_matches(

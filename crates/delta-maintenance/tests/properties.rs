@@ -6,20 +6,26 @@ use arrow_deltalake::maintenance::{
     Granularity, MaintenanceControl, MaintenanceError, MaintenanceErrorKind, NegativeProbeConfig, OptimizeConfig,
     Outcome, ProbeOperation, now_ms,
 };
+use async_trait::async_trait;
+use delta_kernel::object_store::{
+    self, CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions, local::LocalFileSystem,
+};
 use delta_maintenance::{
     DiscoveredTable, FilesystemDiscovery, Metrics, Operation, OptimizeUploadMode, Settings, TableDiscovery,
     run_cycle_with_discovery, run_with_discovery, startup_configuration,
 };
+use futures::stream::BoxStream;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use url::Url;
 
 const BASE: i64 = 1_704_067_200_000;
 
-struct CatalogTable(DiscoveredTable);
+struct CatalogTable(DiscoveredTable, Option<Arc<DeltaTable>>);
 
 impl TableDiscovery for CatalogTable {
     fn tables(&self) -> Result<Vec<String>> {
@@ -31,6 +37,115 @@ impl TableDiscovery for CatalogTable {
             return Err(anyhow!("unknown table"));
         }
         Ok(self.0.clone())
+    }
+
+    fn open_probe_table(&self, url: &Url, max_log_files: usize) -> Result<Arc<DeltaTable>> {
+        self.1.as_ref().map(Arc::clone).map_or_else(
+            || DeltaTable::open_for_maintenance_probe_with_limit(url, max_log_files),
+            Ok,
+        )
+    }
+}
+
+#[derive(Debug, Default)]
+struct StorageCounts {
+    reads: AtomicUsize,
+    lists: AtomicUsize,
+    writes: AtomicUsize,
+}
+
+impl StorageCounts {
+    fn reset(&self) {
+        self.reads.store(0, Ordering::SeqCst);
+        self.lists.store(0, Ordering::SeqCst);
+        self.writes.store(0, Ordering::SeqCst);
+    }
+
+    fn snapshot(&self) -> (usize, usize, usize) {
+        (
+            self.reads.load(Ordering::SeqCst),
+            self.lists.load(Ordering::SeqCst),
+            self.writes.load(Ordering::SeqCst),
+        )
+    }
+}
+
+#[derive(Debug)]
+struct CountingStore {
+    inner: LocalFileSystem,
+    counts: Arc<StorageCounts>,
+}
+
+impl std::fmt::Display for CountingStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "counting local store")
+    }
+}
+
+#[async_trait]
+impl ObjectStore for CountingStore {
+    async fn put_opts(
+        &self,
+        path: &object_store::path::Path,
+        payload: PutPayload,
+        options: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        self.counts.writes.fetch_add(1, Ordering::SeqCst);
+        self.inner.put_opts(path, payload, options).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        path: &object_store::path::Path,
+        options: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.counts.writes.fetch_add(1, Ordering::SeqCst);
+        self.inner.put_multipart_opts(path, options).await
+    }
+
+    async fn get_opts(&self, path: &object_store::path::Path, options: GetOptions) -> object_store::Result<GetResult> {
+        self.counts.reads.fetch_add(1, Ordering::SeqCst);
+        self.inner.get_opts(path, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        paths: BoxStream<'static, object_store::Result<object_store::path::Path>>,
+    ) -> BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        self.counts.writes.fetch_add(1, Ordering::SeqCst);
+        self.inner.delete_stream(paths)
+    }
+
+    fn list(&self, prefix: Option<&object_store::path::Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.counts.reads.fetch_add(1, Ordering::SeqCst);
+        self.counts.lists.fetch_add(1, Ordering::SeqCst);
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&object_store::path::Path>) -> object_store::Result<ListResult> {
+        self.counts.reads.fetch_add(1, Ordering::SeqCst);
+        self.counts.lists.fetch_add(1, Ordering::SeqCst);
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        options: CopyOptions,
+    ) -> object_store::Result<()> {
+        self.counts.writes.fetch_add(1, Ordering::SeqCst);
+        self.inner.copy_opts(from, to, options).await
+    }
+
+    async fn rename_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        options: RenameOptions,
+    ) -> object_store::Result<()> {
+        self.counts.writes.fetch_add(1, Ordering::SeqCst);
+        self.inner.rename_opts(from, to, options).await
     }
 }
 
@@ -77,16 +192,24 @@ fn fixture() -> Result<(tempfile::TempDir, Settings, CatalogTable)> {
         max_prune_files: 100,
         operation_limits: Default::default(),
     };
-    let source = CatalogTable(DiscoveredTable {
-        name: "events".into(),
-        url,
-        log_token: None,
-        properties: BTreeMap::from([
-            ("arrowcol.optimize.minFiles".into(), "3".into()),
-            ("arrowcol.partition.granularity".into(), "minute".into()),
-            ("delta.checkpointInterval".into(), "100".into()),
-        ]),
-    });
+    let source = CatalogTable(
+        DiscoveredTable {
+            name: "events".into(),
+            url,
+            log_token: None,
+            properties: BTreeMap::from([
+                ("arrowcol.optimize.minFiles".into(), "3".into()),
+                ("arrowcol.purge.enabled".into(), "true".into()),
+                (
+                    "arrowcol.purge.retention".into(),
+                    (30 * 24 * 60 * 60 * 1000_i64).to_string(),
+                ),
+                ("arrowcol.partition.granularity".into(), "minute".into()),
+                ("delta.checkpointInterval".into(), "100".into()),
+            ]),
+        },
+        None,
+    );
     persist_policy(&source)?;
     Ok((root, settings, source))
 }
@@ -254,12 +377,22 @@ fn inventory(root: &Path) -> Result<FileInventory> {
 
 #[test]
 fn idle_catalog_policy_passes_have_no_log_checkpoint_or_progress_rewrites() -> Result<()> {
-    let (root, settings, source) = fixture()?;
+    let (root, mut settings, mut source) = fixture()?;
+    settings.operations.insert(0, Operation::Purge);
+    settings.purge_retention_ms = Some(30 * 24 * 60 * 60 * 1000);
+    let counts = Arc::new(StorageCounts::default());
+    let store = Arc::new(CountingStore {
+        inner: LocalFileSystem::new(),
+        counts: Arc::clone(&counts),
+    });
+    let table_path = source.0.url.to_file_path().map_err(|()| anyhow!("table path"))?;
+    source.1 = Some(DeltaTable::open_with_store(table_path, store)?);
     let before = inventory(root.path())?;
     let metrics = Metrics::new();
     for _ in 0..2 {
+        counts.reset();
         let results = run_cycle_with_discovery(&settings, &source, &metrics, &Arc::new(AtomicBool::new(false)))?;
-        assert_eq!(results.len(), 4);
+        assert_eq!(results.len(), 5);
         assert!(results.iter().all(|r| r.error.is_none() && r.negative_probe));
         assert!(
             results
@@ -267,6 +400,11 @@ fn idle_catalog_policy_passes_have_no_log_checkpoint_or_progress_rewrites() -> R
                 .all(|r| r.report.as_ref().is_some_and(|r| r.outcome == Outcome::Noop))
         );
         assert_eq!(before, inventory(root.path())?);
+        let (reads, lists, writes) = counts.snapshot();
+        assert!(reads > 0);
+        assert!(lists > 0 && lists <= 16, "idle pass made {lists} object listings");
+        assert!(reads <= 32, "idle pass made {reads} object reads/listings");
+        assert_eq!(writes, 0, "idle pass must not write objects");
     }
     assert!(metrics.render().contains("delta_maintenance_negative_probes_total"));
     Ok(())
