@@ -169,8 +169,9 @@ fn compaction_debt_evidence_distinguishes_zero_from_bounded_backlog() -> Result<
         log_retention_ms: 2_592_000_000,
         checkpoint_interval: 100,
         optimize_small_file_bytes: 64 * 1024 * 1024,
+        optimize_target_file_bytes: 128 * 1024 * 1024,
         optimize_min_files: 2,
-        sealed_partitions_only: true,
+        sealed_partitions_only: false,
         max_listed_files: 1000,
     };
     let zero = maintenance
@@ -208,6 +209,119 @@ fn compaction_debt_evidence_distinguishes_zero_from_bounded_backlog() -> Result<
     assert_eq!(evidence.due, Some(true));
     assert_eq!(evidence.eligible_count, Some(4));
     assert_eq!(evidence.backlog_count, Some(2));
+    Ok(())
+}
+
+#[test]
+fn optimize_protected_partition_backlog_tracks_subtarget_active_inputs() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let table = create(root.path())?;
+    append(&table, 0, 0..3)?;
+    append(&table, 0, 3..6)?;
+    let active = active_files(root.path())?;
+    let bytes = active.keys().try_fold(0_u64, |total, path| {
+        Ok::<_, anyhow::Error>(total + fs::metadata(root.path().join(path))?.len())
+    })?;
+    let path = active.keys().next().context("active input")?;
+    fs::copy(
+        root.path().join(path),
+        root.path()
+            .join(format!("{INGESTION_PARTITION}={}/orphan.parquet", minute(0))),
+    )?;
+    let maintenance = DeltaTable::open_for_maintenance(&url_of(root.path())?)?;
+    let anchor = BASE + MINUTE / 2;
+    let probe = NegativeProbeConfig {
+        now_ms: anchor,
+        granularity: Granularity::Minute,
+        purge_retention_ms: 2_592_000_000,
+        vacuum_retention_ms: 604_800_000,
+        log_retention_ms: 2_592_000_000,
+        checkpoint_interval: 100,
+        optimize_small_file_bytes: 1,
+        optimize_target_file_bytes: 128 * 1024 * 1024,
+        optimize_min_files: 3,
+        sealed_partitions_only: true,
+        max_listed_files: 1000,
+    };
+    assert!(
+        maintenance
+            .probe_no_work(ProbeOperation::Optimize, &probe, &control())?
+            .is_none()
+    );
+    let config = OptimizeConfig {
+        small_file_bytes: probe.optimize_small_file_bytes,
+        min_files_per_bin: probe.optimize_min_files,
+        now_ms: Some(anchor),
+        ..optimize_config()
+    };
+    let plan = maintenance.plan_optimize(&config)?;
+    assert!(plan.bins.is_empty());
+    let version = maintenance.version()?;
+    let report = maintenance.apply_optimize(&plan, &config, &control())?;
+    let evidence = report.maintenance_due_work.context("complete eligibility evidence")?;
+    assert_eq!(evidence.completeness, MaintenanceDueWorkCompleteness::Complete);
+    assert_eq!(evidence.due, Some(false));
+    assert_eq!(evidence.eligible_count, Some(0));
+    let debt = report.compaction_debt.context("protected compaction backlog")?;
+    assert_eq!(debt.observed_at_ms, anchor);
+    assert_eq!(debt.source, CompactionDebtSource::SnapshotActiveFiles);
+    let protected = debt
+        .protected_partition_backlog
+        .context("authoritative protected inputs")?;
+    assert_eq!((protected.files, protected.bytes), (2, bytes));
+    assert_eq!(protected.oldest_partition_start_ms, Some(BASE));
+    assert_eq!(maintenance.version()?, version);
+    assert_eq!(active_files(root.path())?, active);
+    assert_eq!(rows(root.path())?, sorted(expected(0..6, &minute(0))));
+    Ok(())
+}
+
+#[test]
+fn optimize_probe_does_not_infer_active_frontier_from_newer_orphan() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let table = create(root.path())?;
+    append(&table, 0, 0..3)?;
+    let active = active_files(root.path())?;
+    let path = active.keys().next().context("active input")?;
+    let bytes = fs::metadata(root.path().join(path))?.len();
+    let target = bytes + 1;
+    let orphan_dir = root.path().join(format!("{INGESTION_PARTITION}={}", minute(1)));
+    fs::create_dir(&orphan_dir)?;
+    fs::File::create(orphan_dir.join("orphan.parquet"))?.set_len(target)?;
+    let maintenance = DeltaTable::open_for_maintenance(&url_of(root.path())?)?;
+    let probe = NegativeProbeConfig {
+        now_ms: BASE + 60 * MINUTE,
+        granularity: Granularity::Minute,
+        purge_retention_ms: 2_592_000_000,
+        vacuum_retention_ms: 604_800_000,
+        log_retention_ms: 2_592_000_000,
+        checkpoint_interval: 100,
+        optimize_small_file_bytes: 1,
+        optimize_target_file_bytes: target,
+        optimize_min_files: 3,
+        sealed_partitions_only: true,
+        max_listed_files: 1000,
+    };
+    assert!(
+        maintenance
+            .probe_no_work(ProbeOperation::Optimize, &probe, &control())?
+            .is_none()
+    );
+    let plan = maintenance.plan_optimize(&OptimizeConfig {
+        now_ms: Some(probe.now_ms),
+        target_file_bytes: target,
+        small_file_bytes: probe.optimize_small_file_bytes,
+        min_files_per_bin: probe.optimize_min_files,
+        ..optimize_config()
+    })?;
+    assert!(plan.bins.is_empty());
+    let protected = plan
+        .compaction_debt
+        .protected_partition_backlog
+        .context("active protected frontier")?;
+    assert_eq!((protected.files, protected.bytes), (1, bytes));
+    assert_eq!(protected.oldest_partition_start_ms, Some(BASE));
+    assert_eq!(active_files(root.path())?, active);
     Ok(())
 }
 
@@ -293,6 +407,7 @@ fn pass_inventory_bounds_counted_io_for_all_idle_probes() -> Result<()> {
         log_retention_ms: 2_592_000_000,
         checkpoint_interval: 100,
         optimize_small_file_bytes: 64 * 1024 * 1024,
+        optimize_target_file_bytes: 128 * 1024 * 1024,
         optimize_min_files: 2,
         sealed_partitions_only: false,
         max_listed_files: 1000,
@@ -361,6 +476,7 @@ fn vacuum_probe_defers_to_bounded_tombstone_replay() -> Result<()> {
         log_retention_ms: 2_592_000_000,
         checkpoint_interval: 100,
         optimize_small_file_bytes: 64 * 1024 * 1024,
+        optimize_target_file_bytes: 128 * 1024 * 1024,
         optimize_min_files: 2,
         sealed_partitions_only: false,
         max_listed_files: 1000,
@@ -789,6 +905,7 @@ fn optimize_probe_defers_below_threshold_malformed_partition() -> Result<()> {
         log_retention_ms: 2_592_000_000,
         checkpoint_interval: 100,
         optimize_small_file_bytes: 64 * 1024 * 1024,
+        optimize_target_file_bytes: 128 * 1024 * 1024,
         optimize_min_files: 2,
         sealed_partitions_only: true,
         max_listed_files: 1000,
@@ -832,6 +949,7 @@ fn purge_probe_defers_malformed_or_mismatched_partition() -> Result<()> {
             log_retention_ms: 2_592_000_000,
             checkpoint_interval: 100,
             optimize_small_file_bytes: 64 * 1024 * 1024,
+            optimize_target_file_bytes: 128 * 1024 * 1024,
             optimize_min_files: 2,
             sealed_partitions_only: true,
             max_listed_files: 1000,

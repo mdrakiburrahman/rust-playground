@@ -74,6 +74,7 @@ fn fixture() -> Result<(tempfile::TempDir, Settings, CatalogTable)> {
         interval: None,
         max_idle_backoff: Duration::from_secs(300),
         max_cycles: None,
+        max_consecutive_stale_plans: 8,
         max_concurrent_tables: 1,
         max_concurrent_decoded_bytes: None,
         operation_timeout: Duration::from_secs(30),
@@ -746,6 +747,7 @@ fn vacuum_probe_does_not_infer_tombstones_from_physical_timestamp() -> Result<()
         log_retention_ms: 2_592_000_000,
         checkpoint_interval: 100,
         optimize_small_file_bytes: 64 * 1024 * 1024,
+        optimize_target_file_bytes: 128 * 1024 * 1024,
         optimize_min_files: 2,
         sealed_partitions_only: true,
         max_listed_files: 1000,
@@ -906,9 +908,9 @@ fn real_catalog_ddl_discovery_refreshes_policy_without_idle_writes() -> Result<(
         assert_eq!(results.len(), 4);
         assert!(results.iter().all(|result| result.error.is_none()), "{results:?}");
         assert!(
-            results
-                .iter()
-                .all(|result| { result.negative_probe == (result.operation != Operation::Vacuum) }),
+            results.iter().all(|result| {
+                result.negative_probe != matches!(result.operation, Operation::Vacuum | Operation::Optimize)
+            }),
             "{results:?}"
         );
         assert_eq!(before, inventory(root.path())?);

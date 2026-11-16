@@ -67,6 +67,9 @@ struct Cli {
     /// Stop a scheduled service after this many cycles.
     #[arg(long, env = "ARROWCOL_MAINT_MAX_CYCLES")]
     max_cycles: Option<u64>,
+    /// Consecutive stale plans per table/operation before scheduled health fails.
+    #[arg(long, env = "ARROWCOL_MAINT_MAX_CONSECUTIVE_STALE_PLANS", default_value_t = 8)]
+    max_consecutive_stale_plans: u32,
     #[arg(long, env = "ARROWCOL_MAINT_MAX_CONCURRENT_TABLES", default_value_t = 1)]
     max_concurrent_tables: usize,
     /// Bound concurrent per-bin decoded limits; this is not a process RSS limit.
@@ -249,6 +252,7 @@ fn settings(cli: Cli) -> Result<Settings> {
         interval: cli.interval_secs.map(Duration::from_secs),
         max_idle_backoff: Duration::from_secs(cli.max_idle_backoff_secs),
         max_cycles: cli.max_cycles,
+        max_consecutive_stale_plans: cli.max_consecutive_stale_plans,
         max_concurrent_tables: cli.max_concurrent_tables,
         max_concurrent_decoded_bytes: cli.max_concurrent_decoded_bytes,
         operation_timeout: Duration::from_secs(cli.operation_timeout_secs),
@@ -437,11 +441,31 @@ mod tests {
             "7",
             "--min-files",
             "3",
+            "--max-consecutive-stale-plans",
+            "4",
             "--output-row-group-rows",
             "1024",
         ];
         let config = settings(Cli::try_parse_from(args)?)?;
         assert_eq!(config.optimize.max_files_per_bin, 7);
+        assert_eq!(config.max_consecutive_stale_plans, 4);
+        let evidence = startup_configuration(&config)?;
+        assert_eq!(evidence["startup"]["max_consecutive_stale_plans"], 4);
+        assert_eq!(evidence["operation_settings"]["max_consecutive_stale_plans"], 4);
+        for value in ["0", "1025"] {
+            assert!(
+                settings(Cli::try_parse_from([
+                    "delta-maintenance",
+                    "--root",
+                    "file:///tmp/",
+                    "--operation",
+                    "optimize",
+                    "--max-consecutive-stale-plans",
+                    value,
+                ])?)
+                .is_err()
+            );
+        }
         assert_eq!(config.optimize.output_row_group_rows, 1024);
         assert_eq!(
             config
