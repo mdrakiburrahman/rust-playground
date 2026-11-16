@@ -1,5 +1,5 @@
 import { fork } from 'node:child_process';
-import { existsSync, writeFileSync } from 'node:fs';
+import { existsSync, renameSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 const [mode, ready, release, receipt] = process.argv.slice(2);
@@ -34,7 +34,9 @@ if (mode === 'worker') {
   });
   child.once('message', () => {
     if (!child.pid) throw new Error('Fixture descendant PID unavailable.');
-    writeFileSync(ready, JSON.stringify({ helperPid: process.pid, workerPid: child.pid }), { flag: 'wx' });
+    const pendingReady = `${ready}.pending`;
+    writeFileSync(pendingReady, JSON.stringify({ helperPid: process.pid, workerPid: child.pid }), { flag: 'wx' });
+    renameSync(pendingReady, ready);
   });
   child.once('exit', (code, signal) => {
     clearTimeout(expiry);

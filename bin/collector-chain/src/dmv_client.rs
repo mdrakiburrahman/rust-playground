@@ -1554,11 +1554,11 @@ impl ResourceSample {
         Ok(Self {
             sampled_unix_ms: unix_ms()?,
             process_cpu_ns,
-            network_rx_bytes: network.0,
-            network_tx_bytes: network.1,
-            network_counters_unavailable_reason: network.2,
-            network_advertised_link_speed_bps: network.3,
-            network_interface_speed_unavailable_reasons: network.4,
+            network_rx_bytes: network.rx_bytes,
+            network_tx_bytes: network.tx_bytes,
+            network_counters_unavailable_reason: network.counters_unavailable_reason,
+            network_advertised_link_speed_bps: network.advertised_link_speed_bps,
+            network_interface_speed_unavailable_reasons: network.interface_speed_unavailable_reasons,
             available_parallelism: std::thread::available_parallelism().ok().map(|value| value.get()),
         })
     }
@@ -1666,7 +1666,15 @@ fn read_advertised_link_speed(contents: std::io::Result<String>) -> Result<(Opti
     Ok((Some(speed_bps), None))
 }
 
-fn network_snapshot() -> Result<(Option<u64>, Option<u64>, Option<String>, Option<u64>, Vec<String>)> {
+struct NetworkSnapshot {
+    rx_bytes: Option<u64>,
+    tx_bytes: Option<u64>,
+    counters_unavailable_reason: Option<String>,
+    advertised_link_speed_bps: Option<u64>,
+    interface_speed_unavailable_reasons: Vec<String>,
+}
+
+fn network_snapshot() -> Result<NetworkSnapshot> {
     let contents = match std::fs::read_to_string("/proc/net/dev") {
         Ok(contents) => contents,
         Err(error)
@@ -1675,13 +1683,13 @@ fn network_snapshot() -> Result<(Option<u64>, Option<u64>, Option<String>, Optio
                 std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
             ) =>
         {
-            return Ok((
-                None,
-                None,
-                Some("network_counters_unavailable".to_owned()),
-                None,
-                Vec::new(),
-            ));
+            return Ok(NetworkSnapshot {
+                rx_bytes: None,
+                tx_bytes: None,
+                counters_unavailable_reason: Some("network_counters_unavailable".to_owned()),
+                advertised_link_speed_bps: None,
+                interface_speed_unavailable_reasons: Vec::new(),
+            });
         }
         Err(error) => return Err(error).context("read client network counters"),
     };
@@ -1729,21 +1737,21 @@ fn network_snapshot() -> Result<(Option<u64>, Option<u64>, Option<String>, Optio
         interfaces += 1;
     }
     if interfaces == 0 {
-        return Ok((
-            None,
-            None,
-            Some("no_non_loopback_interfaces".to_owned()),
-            None,
-            Vec::new(),
-        ));
+        return Ok(NetworkSnapshot {
+            rx_bytes: None,
+            tx_bytes: None,
+            counters_unavailable_reason: Some("no_non_loopback_interfaces".to_owned()),
+            advertised_link_speed_bps: None,
+            interface_speed_unavailable_reasons: Vec::new(),
+        });
     }
-    Ok((
-        Some(rx_bytes),
-        Some(tx_bytes),
-        None,
-        all_speeds_known.then_some(advertised_speed_bps),
-        speed_unavailable_reasons,
-    ))
+    Ok(NetworkSnapshot {
+        rx_bytes: Some(rx_bytes),
+        tx_bytes: Some(tx_bytes),
+        counters_unavailable_reason: None,
+        advertised_link_speed_bps: all_speeds_known.then_some(advertised_speed_bps),
+        interface_speed_unavailable_reasons: speed_unavailable_reasons,
+    })
 }
 
 fn resource_report(start: Option<ResourceSample>, end: Option<ResourceSample>) -> serde_json::Value {
@@ -2204,9 +2212,7 @@ mod tests {
             read_advertised_link_speed(Ok("1000\n".to_owned()))?,
             (Some(1_000_000_000), None)
         );
-        assert!(
-            read_advertised_link_speed(Err(std::io::Error::new(std::io::ErrorKind::Other, "unexpected",))).is_err()
-        );
+        assert!(read_advertised_link_speed(Err(std::io::Error::other("unexpected"))).is_err());
         Ok(())
     }
 

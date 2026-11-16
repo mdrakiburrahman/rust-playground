@@ -2022,7 +2022,7 @@ mod tests {
         let mut inherited = value.clone();
         inherited["maintenance"]
             .as_object_mut()
-            .unwrap()
+            .context("maintenance fixture must be an object")?
             .remove("parquet_writer");
         let inherited = Tunables::parse_oat_json(inherited)?;
         assert_eq!(
