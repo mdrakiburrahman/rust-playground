@@ -355,7 +355,11 @@ test('consumes actual Rust results through the E1 projection and keeps single-wi
       assert.equal(issue, 'complete five-operation maintenance due-work evidence is unavailable or invalid');
     } else {
       assert.equal(reports[0]!.maintenance_due_work, null);
-      assert.match(issue!, /operation failed|missing from one or more/);
+      if (scenario.case === 'interrupted' || scenario.case === 'missing_report') {
+        assert.equal(issue, 'complete five-operation maintenance due-work evidence is unavailable or invalid');
+      } else {
+        assert.equal(issue, 'maintenance operation failed or its due-work observation is incomplete');
+      }
     }
   }
 });
@@ -408,6 +412,43 @@ test('accepts actual Rust due/backlog samples but keeps the campaign unqualified
     fixture.incomplete_processes, config, start, end,
   );
   assert.equal(incompleteIssue, 'maintenance operation failed or its due-work observation is incomplete');
+});
+
+test('rejects actual projected interrupted and missing-report records mixed with complete windows', () => {
+  const projection = JSON.parse(readFileSync(
+    new URL('./campaign-results-maintenance-e1-projection.json', import.meta.url), 'utf8',
+  )) as {
+    qualification_cases: Array<{ case: string; processes: Array<Record<string, unknown>> }>;
+  };
+  const start = 1_000_000;
+  const end = start + 150_000;
+  for (const caseName of ['interrupted', 'missing_report']) {
+    const scenario = projection.qualification_cases.find(candidate => candidate.case === caseName)!;
+    const projectedPolicy = scenario.processes[0]!.maintenance_table_policies as Record<string, unknown>;
+    const projectedReports = projectedPolicy.operation_reports as Array<Record<string, unknown>>;
+    const projectedReport = projectedReports[0]!;
+    assert.equal(projectedReport.operation_failed, false);
+    assert.equal(projectedReport.maintenance_due_work, null);
+
+    const run = sourceShapedRun(60 + (caseName === 'interrupted' ? 0 : 1), [1, 1, 1, 1, 1], start);
+    attachMaintenanceDueWork(run, start, end);
+    const evidence = JSON.parse(String(run.rows[0]!.evidence_json)) as {
+      processes: Array<{ component: string; maintenance_table_policies: Record<string, unknown> }>;
+    };
+    const maintenance = evidence.processes.find(process => process.component === 'maintenance')!;
+    const policy = maintenance.maintenance_table_policies;
+    const operationReports = policy.operation_reports as Array<Record<string, unknown>>;
+    operationReports.push(projectedReport);
+    const outcomes = policy.operation_outcomes as Record<string, unknown>;
+    outcomes.operation_count = Number(outcomes.operation_count) + 1;
+    run.rows[0]!.evidence_json = JSON.stringify(evidence);
+
+    assert.equal(
+      maintenanceDueWorkIssue(evidence.processes, maintenanceConfig(run), start, end),
+      'complete five-operation maintenance due-work evidence is unavailable or invalid',
+      caseName + ' must not be skipped beside otherwise complete five-window evidence',
+    );
+  }
 });
 
 test('rejects unknown, unavailable, dropped, gapped, or clock-reversed backlog contract samples', () => {
@@ -536,6 +577,41 @@ test('requires complete, contiguous five-window due-work for all operations and 
   const eligibleEvidence = JSON.parse(String(eligibleGrowing.rows[0]!.evidence_json));
   assert.match(maintenanceDueWorkIssue(eligibleEvidence.processes, maintenanceConfig(eligibleGrowing), 1_000_000, 1_150_000)!,
     /optimize maintenance due-work grows/);
+});
+
+test('requires measured OPTIMIZE and PURGE debt vectors while preserving legitimate nulls', () => {
+  const start = 1_000_000;
+  const end = start + 150_000;
+  const configFor = (run: ReturnType<typeof sourceShapedRun>) => maintenanceConfig(run);
+  const evidenceFor = (run: ReturnType<typeof sourceShapedRun>) =>
+    JSON.parse(String(run.rows[0]!.evidence_json)).processes;
+
+  const checkpointNulls = sourceShapedRun(70, [1, 1, 1, 1, 1], start);
+  attachMaintenanceDueWork(checkpointNulls, start, end);
+  for (let window = 0; window < 5; window++) {
+    mutateMaintenanceReport(checkpointNulls, 'checkpoint', window, start, (_report, dueWork) => {
+      dueWork.backlog_count = null;
+    });
+  }
+  assert.equal(maintenanceDueWorkIssue(
+    evidenceFor(checkpointNulls), configFor(checkpointNulls), start, end,
+  ), undefined);
+
+  const mutations: Array<[string, (dueWork: Record<string, unknown>) => void]> = [
+    ['optimize', dueWork => { dueWork.backlog_count = null; }],
+    ['purge', dueWork => { dueWork.backlog_count = null; }],
+    ['optimize', dueWork => { dueWork.eligible_bytes = null; dueWork.backlog_bytes = null; }],
+    ['purge', dueWork => { dueWork.eligible_bytes = null; dueWork.backlog_bytes = null; }],
+  ];
+  mutations.forEach(([operation, mutate], index) => {
+    const run = sourceShapedRun(71 + index, [1, 1, 1, 1, 1], start);
+    attachMaintenanceDueWork(run, start, end);
+    mutateMaintenanceReport(run, operation, 2, start, (_report, dueWork) => mutate(dueWork));
+    assert.equal(maintenanceDueWorkIssue(
+      evidenceFor(run), configFor(run), start, end,
+    ), 'complete five-operation maintenance due-work evidence is unavailable or invalid',
+      operation + ' must not qualify with a missing measurable debt vector');
+  });
 });
 
 test('rejects exact-window commit buckets that do not sum to the run output', () => {
