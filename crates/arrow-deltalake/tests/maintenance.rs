@@ -117,6 +117,7 @@ fn compaction_debt_evidence_distinguishes_zero_from_bounded_backlog() -> Result<
     let root = tempfile::tempdir()?;
     let table = create(root.path())?;
     append(&table, 0, 0..3)?;
+    append(&table, 1, 100..103)?;
     let maintenance = DeltaTable::open_for_maintenance(&url_of(root.path())?)?;
     let anchor = BASE + 60 * MINUTE;
     let probe = NegativeProbeConfig {
