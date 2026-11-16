@@ -229,6 +229,10 @@ pub struct RunArgs {
     #[arg(long = "table", env = "LOADTEST_TABLES", value_delimiter = ',')]
     pub tables: Vec<String>,
 
+    /// Initialize selected fresh local tables with the ingestion partition before registration.
+    #[arg(long)]
+    pub partition_by_ingestion_date: bool,
+
     /// Concurrent scheduling lanes; zero uses all available cores. Each lane has one logical batch in flight.
     #[arg(long, env = "LOADTEST_LANES", default_value_t = 4)]
     pub lanes: usize,
@@ -493,6 +497,7 @@ mod tests {
         assert_eq!(arguments.measure.get(), Duration::from_secs(30));
         assert_eq!(arguments.lanes, 8);
         assert_eq!(arguments.batch_rows, 1024);
+        assert!(!arguments.partition_by_ingestion_date);
         assert_eq!(arguments.effective_scenarios(), vec![Scenario::Dataflow]);
         Ok(())
     }
@@ -510,6 +515,7 @@ mod tests {
             keep_stack: false,
             scenarios: vec![Scenario::Dataflow],
             tables: Vec::new(),
+            partition_by_ingestion_date: false,
             lanes: 1,
             batch_rows: 1,
             seed: 1,

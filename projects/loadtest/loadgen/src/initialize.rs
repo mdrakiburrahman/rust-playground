@@ -1,17 +1,20 @@
 //! Fenced Azure table bootstrap using the same registry as the Flight fixtures.
 
-use std::{env, sync::Arc};
+use std::{collections::BTreeSet, env, fs, path::Path, sync::Arc};
 
 use anyhow::{Context, Result, bail};
 use arrow::datatypes::{DataType, Field, Schema};
-use arrow_deltalake::delta::DeltaTable;
+use arrow_deltalake::delta::{DeltaTable, INGESTION_PARTITION};
 use arrowcol_catalog::{DdlCommand, DdlParser};
 use serde::Serialize;
 use url::Url;
 
-use crate::{cli::InitializeAzureArgs, schema::schema_statements};
+use crate::{
+    cli::InitializeAzureArgs,
+    schema::{SchemaStatement, schema_statements},
+};
 
-const INGESTION: &str = "__arrowcol_ingestion";
+const INGESTION: &str = INGESTION_PARTITION;
 
 #[derive(Debug, Serialize)]
 struct ManifestEntry {
@@ -47,19 +50,24 @@ fn checked_root(raw: &str, account: &str, container: &str) -> Result<Url> {
     Ok(url)
 }
 
-fn entries() -> Result<Vec<(ManifestEntry, Arc<Schema>)>> {
+fn partitioned_schema(statement: &SchemaStatement) -> Result<Arc<Schema>> {
     let parser = DdlParser::default();
+    let DdlCommand::CreateTable(create) = parser.parse(&statement.ddl)? else {
+        bail!("canonical fixture contains a non-CREATE statement");
+    };
+    let mut fields = create
+        .fields()
+        .iter()
+        .map(arrowcol_catalog::CatalogField::to_arrow)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    fields.push(Field::new(INGESTION, DataType::Utf8, false));
+    Ok(Arc::new(Schema::new(fields)))
+}
+
+fn entries() -> Result<Vec<(ManifestEntry, Arc<Schema>)>> {
     let mut entries = Vec::new();
     for statement in schema_statements()? {
-        let DdlCommand::CreateTable(create) = parser.parse(&statement.ddl)? else {
-            bail!("canonical fixture contains a non-CREATE statement");
-        };
-        let mut fields = create
-            .fields()
-            .iter()
-            .map(arrowcol_catalog::CatalogField::to_arrow)
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        fields.push(Field::new(INGESTION, DataType::Utf8, false));
+        let schema = partitioned_schema(&statement)?;
         let identity = statement.identity;
         entries.push((
             ManifestEntry {
@@ -71,10 +79,64 @@ fn entries() -> Result<Vec<(ManifestEntry, Arc<Schema>)>> {
                     identity.table()
                 ),
             },
-            Arc::new(Schema::new(fields)),
+            schema,
         ));
     }
     Ok(entries)
+}
+
+/// Initialize only selected, fresh local table directories; existing tables are never opened.
+pub(crate) fn initialize_fresh_local(root: &Path, selected: &[String], statements: &[SchemaStatement]) -> Result<()> {
+    let requested = selected.iter().cloned().collect::<BTreeSet<_>>();
+    if requested.is_empty() || requested.len() != selected.len() {
+        bail!("partitioned local initialization requires explicit, unique --table selections");
+    }
+    let targets = statements
+        .iter()
+        .filter(|statement| requested.contains(&statement.identity.to_string()))
+        .collect::<Vec<_>>();
+    if targets.len() != requested.len() {
+        bail!("partitioned local initialization contains an unknown table");
+    }
+    let root_metadata = fs::symlink_metadata(root).context("partitioned local Dataflow root must already exist")?;
+    if !root_metadata.is_dir() || root_metadata.file_type().is_symlink() {
+        bail!("partitioned local Dataflow root must be a real directory");
+    }
+    let root = fs::canonicalize(root)?;
+    let mut prepared = Vec::new();
+    for statement in targets {
+        let schema = partitioned_schema(statement)?;
+        let mut parent = root.clone();
+        for component in [
+            statement.identity.catalog().as_str(),
+            statement.identity.schema().as_str(),
+        ] {
+            parent.push(component);
+            match fs::create_dir(&parent) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
+            let metadata = fs::symlink_metadata(&parent)?;
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                bail!("local table parent must be a real directory: {}", parent.display());
+            }
+        }
+        let path = parent.join(statement.identity.table().as_str());
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => bail!("refusing to initialize existing local table: {}", path.display()),
+            Err(error) => return Err(error.into()),
+        }
+        prepared.push((path, schema));
+    }
+    for (path, schema) in prepared {
+        fs::create_dir(&path).with_context(|| format!("claim fresh local table {}", path.display()))?;
+        let url = Url::from_directory_path(&path).map_err(|()| anyhow::anyhow!("invalid local table directory"))?;
+        DeltaTable::initialize_url_for_bootstrap(url, schema, vec![INGESTION.to_owned()])
+            .with_context(|| format!("initialize fresh local table {}", path.display()))?;
+    }
+    Ok(())
 }
 
 /// Initializes existing-or-empty roots and publishes a manifest only after every table succeeds.
@@ -175,6 +237,55 @@ pub async fn write_manifest(args: InitializeAzureArgs) -> Result<()> {
 mod tests {
     use super::*;
     use crate::schema::TABLE_COUNT;
+    use arrow_deltalake::maintenance::{Granularity, MaintenanceControl, Outcome, PurgeConfig, now_ms};
+
+    #[test]
+    fn fresh_local_partition_is_purgeable_and_existing_table_is_untouched() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let fixture = schema_statements()?;
+        let table = "telemetry.sqlserver.sqlserver_availability_replica_states".to_owned();
+        initialize_fresh_local(root.path(), std::slice::from_ref(&table), &fixture)?;
+        let path = root
+            .path()
+            .join("telemetry/sqlserver/sqlserver_availability_replica_states");
+        let log = path.join("_delta_log/00000000000000000000.json");
+        let original = fs::read(&log)?;
+        let actions = std::str::from_utf8(&original)?
+            .lines()
+            .map(serde_json::from_str::<serde_json::Value>)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let metadata = actions
+            .iter()
+            .find_map(|action| action.get("metaData"))
+            .context("missing metadata")?;
+        assert_eq!(metadata["partitionColumns"], serde_json::json!([INGESTION]));
+        let url = Url::from_directory_path(&path).map_err(|()| anyhow::anyhow!("invalid test directory"))?;
+        let maintenance = DeltaTable::open_for_maintenance(&url)?;
+        let version = maintenance.version()?;
+        let config = PurgeConfig::new(86_400_000, now_ms()?, Granularity::Hour);
+        let plan = maintenance.plan_purge(&config)?;
+        assert!(plan.partitions.is_empty() && plan.watermark_ms.is_none());
+        assert_eq!(
+            maintenance
+                .apply_purge(&plan, &config, &MaintenanceControl::default())?
+                .outcome,
+            Outcome::Noop
+        );
+        assert_eq!(maintenance.version()?, version);
+        assert!(initialize_fresh_local(root.path(), &[table], &fixture).is_err());
+        assert_eq!(fs::read(log)?, original);
+        Ok(())
+    }
+
+    #[test]
+    fn local_partition_requires_known_explicit_tables() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let fixture = schema_statements()?;
+        assert!(initialize_fresh_local(root.path(), &[], &fixture).is_err());
+        assert!(initialize_fresh_local(root.path(), &["unknown".to_owned()], &fixture).is_err());
+        assert_eq!(fs::read_dir(root.path())?.count(), 0);
+        Ok(())
+    }
 
     #[test]
     fn actual_bootstrap_preserves_existing_logs_and_normalizes_timestamp_companions_once() -> Result<()> {
