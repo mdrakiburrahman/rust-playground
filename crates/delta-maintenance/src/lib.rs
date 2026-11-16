@@ -1287,17 +1287,23 @@ fn run_operation(
             prepared.plan.bins.retain(|bin| bin.files.len() >= minimum);
             *optimize = Some(OptimizeEvidence::new(&config, prepared.plan.clone()));
             if settings.apply && (!prepared.plan.bins.is_empty() || config.sealed_final) {
-                if settings.operation_limits.optimize_upload_mode == OptimizeUploadMode::PutCreate {
-                    return table.apply_prepared_optimize(&prepared, &config, control);
-                }
-                return table.apply_prepared_optimize_with_upload_buffer(
+                let upload_buffer_bytes =
+                    if settings.operation_limits.optimize_upload_mode == OptimizeUploadMode::BufferedMultipart {
+                        Some(
+                            settings
+                                .operation_limits
+                                .optimize_upload_buffer_bytes
+                                .unwrap_or(DEFAULT_OPTIMIZE_UPLOAD_BUFFER_BYTES),
+                        )
+                    } else {
+                        None
+                    };
+                return table.apply_prepared_optimize_with_writer_config(
                     &prepared,
                     &config,
                     control,
-                    settings
-                        .operation_limits
-                        .optimize_upload_buffer_bytes
-                        .unwrap_or(DEFAULT_OPTIMIZE_UPLOAD_BUFFER_BYTES),
+                    upload_buffer_bytes,
+                    arrow_deltalake::writer::process_config()?,
                 );
             }
             MaintenancePlan::Optimize(prepared.plan)

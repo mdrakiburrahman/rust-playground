@@ -157,6 +157,13 @@ fn data_path(root: &Path, relative: &str) -> Result<PathBuf> {
         .map_err(|()| anyhow!("path"))
 }
 
+fn parquet_compression(path: &Path) -> Result<parquet::basic::Compression> {
+    let reader = ParquetRecordBatchReaderBuilder::try_new(fs::File::open(path)?)?;
+    let group = reader.metadata().row_groups().first().context("Parquet row group")?;
+    let column = group.columns().first().context("Parquet column")?;
+    Ok(column.compression())
+}
+
 /// Sorted row multiset read from the actual active Parquet files.
 fn rows(root: &Path) -> Result<Vec<Row>> {
     rows_of(root, active_files(root)?)
@@ -308,14 +315,39 @@ fn unsorted_optimize_respects_output_row_group_limit() -> Result<()> {
     append(&table, 0, 7..14)?;
     append(&table, 1, 14..15)?;
     let maintenance = DeltaTable::open_for_maintenance(&url_of(root.path())?)?;
+    let input_files = active_files(root.path())?;
+    let input_compressions = input_files
+        .keys()
+        .map(|relative| parquet_compression(&data_path(root.path(), relative)?))
+        .collect::<Result<Vec<_>>>()?;
+    let input_compression = *input_compressions.first().context("input Parquet file")?;
+    assert!(
+        input_compressions
+            .iter()
+            .all(|compression| *compression == input_compression)
+    );
+    let override_codec = if matches!(input_compression, parquet::basic::Compression::ZSTD(_)) {
+        "snappy"
+    } else {
+        "zstd"
+    };
+    let writer_override: arrow_deltalake::writer::ParquetWriterConfig = serde_json::from_value(serde_json::json!({
+        "defaults": {"compression": override_codec}
+    }))?;
     let config = OptimizeConfig {
         use_default_layout: false,
         output_row_group_rows: 3,
         ..optimize_config()
     };
     let before = rows(root.path())?;
-    let plan = maintenance.plan_optimize(&config)?;
-    let report = maintenance.apply_optimize(&plan, &config, &control())?;
+    let prepared = maintenance.prepare_optimize(&config)?;
+    let report = maintenance.apply_prepared_optimize_with_writer_config(
+        &prepared,
+        &config,
+        &control(),
+        None,
+        &writer_override,
+    )?;
     assert_eq!(report.outcome, Outcome::Committed);
     assert_eq!(rows(root.path())?, before);
     let reader =
@@ -323,6 +355,23 @@ fn unsorted_optimize_respects_output_row_group_limit() -> Result<()> {
     let groups = reader.metadata().row_groups();
     assert_eq!(groups.len(), 5);
     assert!(groups.iter().all(|group| group.num_rows() <= 3));
+    let output_compression = parquet_compression(&data_path(root.path(), &report.outputs[0])?)?;
+    if matches!(input_compression, parquet::basic::Compression::ZSTD(_)) {
+        assert_eq!(output_compression, parquet::basic::Compression::SNAPPY);
+    } else {
+        assert!(matches!(output_compression, parquet::basic::Compression::ZSTD(_)));
+    }
+
+    let active_after_optimize: BTreeSet<_> = active_files(root.path())?.into_keys().collect();
+    append(&table, 2, 15..18)?;
+    let new_ingestion_file = active_files(root.path())?
+        .into_keys()
+        .find(|path| !active_after_optimize.contains(path))
+        .context("new ingestion file")?;
+    assert_eq!(
+        parquet_compression(&data_path(root.path(), &new_ingestion_file)?)?,
+        input_compression
+    );
     Ok(())
 }
 

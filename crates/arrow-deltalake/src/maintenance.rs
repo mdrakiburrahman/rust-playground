@@ -2043,7 +2043,7 @@ impl DeltaTable {
         config: &OptimizeConfig,
         control: &MaintenanceControl,
     ) -> Result<MaintenanceReport> {
-        self.apply_optimize_reusing(plan, config, control, None, None)
+        self.apply_optimize_reusing(plan, config, control, None, None, None)
     }
 
     /// Apply a same-pass plan without rescanning an unchanged log version.
@@ -2056,7 +2056,7 @@ impl DeltaTable {
         config: &OptimizeConfig,
         control: &MaintenanceControl,
     ) -> Result<MaintenanceReport> {
-        self.apply_optimize_reusing(&prepared.plan, config, control, Some(&prepared.state), None)
+        self.apply_optimize_reusing(&prepared.plan, config, control, Some(&prepared.state), None, None)
     }
 
     /// Apply OPTIMIZE with a bounded object-store streaming upload buffer.
@@ -2082,6 +2082,39 @@ impl DeltaTable {
             control,
             Some(&prepared.state),
             Some(upload_buffer_bytes),
+            None,
+        )
+    }
+
+    /// Apply a prepared OPTIMIZE with an explicit Parquet writer policy.
+    ///
+    /// `upload_buffer_bytes` is `None` for the create-only writer path.
+    ///
+    /// # Errors
+    /// Rejects upload buffers outside 4..=64 MiB and returns the same safety and publication errors as `apply_optimize`.
+    pub fn apply_prepared_optimize_with_writer_config(
+        &self,
+        prepared: &PreparedOptimize,
+        config: &OptimizeConfig,
+        control: &MaintenanceControl,
+        upload_buffer_bytes: Option<usize>,
+        writer_config: &crate::writer::ParquetWriterConfig,
+    ) -> Result<MaintenanceReport> {
+        if let Some(bytes) = upload_buffer_bytes
+            && !(MIN_OPTIMIZE_UPLOAD_BUFFER_BYTES..=MAX_OPTIMIZE_UPLOAD_BUFFER_BYTES).contains(&bytes)
+        {
+            return Err(fail(
+                MaintenanceErrorKind::InvalidPlan,
+                "OPTIMIZE upload buffer must be within 4..=64 MiB",
+            ));
+        }
+        self.apply_optimize_reusing(
+            &prepared.plan,
+            config,
+            control,
+            Some(&prepared.state),
+            upload_buffer_bytes,
+            Some(writer_config),
         )
     }
 
@@ -2092,6 +2125,7 @@ impl DeltaTable {
         control: &MaintenanceControl,
         prepared: Option<&ActiveState>,
         upload_buffer_bytes: Option<usize>,
+        writer_config: Option<&crate::writer::ParquetWriterConfig>,
     ) -> Result<MaintenanceReport> {
         config.validate()?;
         self.check_optimize_plan(plan, config)?;
@@ -2133,7 +2167,14 @@ impl DeltaTable {
         let mut kept: Vec<&OptimizeBin> = Vec::new();
         let mut actions = 0_usize;
         for bin in &plan.bins {
-            let written = match self.rewrite_bin(&state.snapshot, bin, config, control, upload_buffer_bytes) {
+            let written = match self.rewrite_bin(
+                &state.snapshot,
+                bin,
+                config,
+                control,
+                upload_buffer_bytes,
+                writer_config,
+            ) {
                 Ok(written) => written,
                 Err(error) => return Err(self.discard_after(&outputs, error, &mut report)),
             };
@@ -2226,6 +2267,7 @@ impl DeltaTable {
         config: &OptimizeConfig,
         control: &MaintenanceControl,
         upload_buffer_bytes: Option<usize>,
+        parquet_writer_config: Option<&crate::writer::ParquetWriterConfig>,
     ) -> Result<Vec<StagedOutput>> {
         let probe = self.write_context(snapshot, &bin.partition_values)?;
         let logical: SchemaRef = Arc::new(probe.logical_data_schema().as_ref().try_into_arrow()?);
@@ -2247,8 +2289,11 @@ impl DeltaTable {
                 .build(),
         };
         let verified_sort = crate::writer::sorting_from_properties(&physical, Some(&properties))?;
-        let properties =
-            crate::writer::process_config()?.writer_properties(&physical, Some(properties), &verified_sort)?;
+        let parquet_writer_config = match parquet_writer_config {
+            Some(config) => config,
+            None => crate::writer::process_config()?,
+        };
+        let properties = parquet_writer_config.writer_properties(&physical, Some(properties), &verified_sort)?;
         let mut writer = BinWriter {
             table: self,
             snapshot,
