@@ -2122,7 +2122,7 @@ mod tests {
             assert_eq!(settled.publications, Some(0));
             assert_eq!(settled.rows, Some(0));
             assert_eq!(settled.logical_bytes, Some(0));
-            assert!(settled.oldest_age.is_none());
+            assert_eq!(settled.oldest_age, Some(std::time::Duration::ZERO));
             let replay = exporter.stage(envelope_pdata(original)).await.expect("replay");
             let replaying = runtime_metrics.publication_backlog_snapshot();
             assert_eq!(replaying.publications, Some(1));
@@ -2188,7 +2188,7 @@ mod tests {
             assert_eq!(settled.publications, Some(0));
             assert_eq!(settled.rows, Some(0));
             assert_eq!(settled.logical_bytes, Some(0));
-            assert!(settled.oldest_age.is_none());
+            assert_eq!(settled.oldest_age, Some(std::time::Duration::ZERO));
         }
     }
 
