@@ -410,6 +410,8 @@ pub struct MaintenanceTunables {
     pub operations: Option<Vec<MaintenanceOperation>>,
     pub apply: Option<bool>,
     pub parquet_writer: Option<ParquetWriterConfig>,
+    pub optimize_upload_mode: Option<MaintenanceUploadMode>,
+    pub optimize_upload_buffer_bytes: Option<usize>,
     pub interval_secs: Option<u64>,
     pub max_idle_backoff_secs: Option<u64>,
     pub max_cycles: Option<u64>,
@@ -473,6 +475,13 @@ pub enum MaintenanceInputReadStrategy {
     Memory,
     Spool,
     Range,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum MaintenanceUploadMode {
+    PutCreate,
+    BufferedMultipart,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]

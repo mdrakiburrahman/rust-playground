@@ -316,6 +316,11 @@ const CAPABILITIES: &[Capability] = &[
     capability!("maintenance.operations", "unset"),
     capability!("maintenance.apply", "false"),
     capability!("maintenance.parquet_writer", "inherit shared parquet_writer"),
+    capability!("maintenance.optimize_upload_mode", "put_create"),
+    capability!(
+        "maintenance.optimize_upload_buffer_bytes",
+        "8388608; buffered_multipart only"
+    ),
     capability!("maintenance.interval_secs", "one-shot"),
     capability!("maintenance.max_idle_backoff_secs", "3600"),
     capability!("maintenance.max_cycles", "unlimited"),
@@ -1395,6 +1400,19 @@ fn validate_maintenance(maintenance: &MaintenanceTunables) -> Result<()> {
         bail!("maintenance.apply=true requires maintenance.enabled=true");
     }
     let has_optimize = has_operation(MaintenanceOperation::Optimize);
+    if maintenance.optimize_upload_mode.is_some() || maintenance.optimize_upload_buffer_bytes.is_some() {
+        if !has_optimize {
+            bail!("maintenance optimize upload settings require optimize");
+        }
+        if let Some(bytes) = maintenance.optimize_upload_buffer_bytes {
+            if maintenance.optimize_upload_mode != Some(MaintenanceUploadMode::BufferedMultipart) {
+                bail!("maintenance.optimize_upload_buffer_bytes requires buffered_multipart mode");
+            }
+            if !(4_194_304..=67_108_864).contains(&bytes) {
+                bail!("maintenance.optimize_upload_buffer_bytes must be between 4194304 and 67108864");
+            }
+        }
+    }
     if let Some(writer) = &maintenance.parquet_writer {
         if !has_optimize {
             bail!("maintenance.parquet_writer requires optimize");
@@ -2035,6 +2053,45 @@ mod tests {
         let mut no_optimize = value;
         no_optimize["maintenance"]["operations"] = serde_json::json!(["vacuum"]);
         assert!(Tunables::parse_oat_json(no_optimize).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn maintenance_upload_controls_reject_invalid_or_inactive_settings() -> Result<()> {
+        let value = serde_json::json!({"maintenance": {
+            "enabled": true, "operations": ["optimize"],
+            "optimize_upload_mode": "buffered_multipart", "optimize_upload_buffer_bytes": 4_194_304
+        }});
+        for bytes in [4_194_304_u64, 67_108_864] {
+            let mut candidate = value.clone();
+            candidate["maintenance"]["optimize_upload_buffer_bytes"] = serde_json::json!(bytes);
+            let settings = Tunables::parse_oat_json(candidate)?;
+            let env = settings.environment_for(ComponentRole::Maintenance)?;
+            assert_eq!(env["ARROWCOL_MAINT_OPTIMIZE_UPLOAD_MODE"], "buffered_multipart");
+            assert_eq!(env["ARROWCOL_MAINT_OPTIMIZE_UPLOAD_BUFFER_BYTES"], bytes.to_string());
+        }
+        for bytes in [
+            serde_json::json!(4_194_303),
+            serde_json::json!(67_108_865),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+        ] {
+            let mut candidate = value.clone();
+            candidate["maintenance"]["optimize_upload_buffer_bytes"] = bytes;
+            assert!(Tunables::parse_oat_json(candidate).is_err());
+        }
+        for mode in ["stream", "unknown", "put_create"] {
+            let mut candidate = value.clone();
+            candidate["maintenance"]["optimize_upload_mode"] = serde_json::json!(mode);
+            assert!(Tunables::parse_oat_json(candidate).is_err());
+        }
+        let mut create = value;
+        create["maintenance"]["optimize_upload_mode"] = serde_json::json!("put_create");
+        create["maintenance"]
+            .as_object_mut()
+            .unwrap()
+            .remove("optimize_upload_buffer_bytes");
+        assert!(Tunables::parse_oat_json(create).is_ok());
         Ok(())
     }
 
