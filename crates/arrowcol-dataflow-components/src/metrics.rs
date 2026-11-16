@@ -180,6 +180,7 @@ struct PipelineMetrics {
     run: String,
     variant: String,
     stages: Vec<FixedHistogram>,
+    submission_wait: FixedHistogram,
     flushes: [AtomicU64; 10],
     file_bytes: FixedHistogram,
     file_rows: FixedHistogram,
@@ -191,6 +192,7 @@ impl PipelineMetrics {
             run: std::env::var("ARROWCOL_OAT_RUN_ID").unwrap_or_else(|_| "unknown".to_owned()),
             variant: std::env::var("ARROWCOL_OAT_VARIANT").unwrap_or_else(|_| "unknown".to_owned()),
             stages: (0..6).map(|_| FixedHistogram::new(STAGE_DURATION_BUCKETS)).collect(),
+            submission_wait: FixedHistogram::new(STAGE_DURATION_BUCKETS),
             flushes: std::array::from_fn(|_| AtomicU64::new(0)),
             file_bytes: FixedHistogram::new(FILE_SIZE_BUCKETS),
             file_rows: FixedHistogram::new(FILE_ROW_BUCKETS),
@@ -255,6 +257,16 @@ impl PipelineMetrics {
             );
         }
         let file_labels = format!("run=\"{run}\",variant=\"{variant}\",component=\"{component}\"");
+        output.push_str(
+            "# HELP arrowcol_pipeline_submission_wait_seconds Time waiting to submit work to the commit worker, excluding durable commit execution.\n\
+             # TYPE arrowcol_pipeline_submission_wait_seconds histogram\n",
+        );
+        self.submission_wait.write(
+            output,
+            "arrowcol_pipeline_submission_wait_seconds",
+            &file_labels,
+            1_000_000_000.0,
+        );
         let _ = writeln!(
             output,
             "# HELP arrowcol_parquet_file_physical_bytes Physical Parquet file size including the footer."
@@ -282,6 +294,7 @@ static PIPELINE_METRICS: LazyLock<PipelineMetrics> = LazyLock::new(PipelineMetri
 #[derive(Clone, Debug)]
 pub struct StageMetrics {
     duration: Histogram<f64>,
+    submission_wait: Histogram<f64>,
     flushes: Counter<u64>,
     physical_bytes: Histogram<u64>,
     file_rows: Histogram<u64>,
@@ -296,6 +309,11 @@ impl Default for StageMetrics {
             duration: meter
                 .f64_histogram("arrowcol.pipeline.stage.duration")
                 .with_unit("s")
+                .build(),
+            submission_wait: meter
+                .f64_histogram("arrowcol.pipeline.submission.wait")
+                .with_unit("s")
+                .with_boundaries(STAGE_DURATION_BUCKETS.to_vec())
                 .build(),
             flushes: meter.u64_counter("arrowcol.pipeline.flushes").with_unit("1").build(),
             physical_bytes: meter
@@ -320,6 +338,22 @@ impl StageMetrics {
                 KeyValue::new("variant", self.variant.clone()),
                 KeyValue::new("component", "arrowcol-dataflow-rust"),
                 KeyValue::new("stage", stage.as_str()),
+            ],
+        );
+    }
+
+    /// Records commit-worker submission backpressure, not durable commit execution.
+    pub fn record_submission_wait(&self, duration: Duration) {
+        PIPELINE_METRICS.submission_wait.record(
+            duration.as_secs_f64(),
+            duration.as_nanos().min(u128::from(u64::MAX)) as u64,
+        );
+        self.submission_wait.record(
+            duration.as_secs_f64(),
+            &[
+                KeyValue::new("run", self.run.clone()),
+                KeyValue::new("variant", self.variant.clone()),
+                KeyValue::new("component", "arrowcol-dataflow-rust"),
             ],
         );
     }
@@ -1997,14 +2031,41 @@ mod tests {
         assert!(metrics.stream_permits(3).is_err());
     }
     #[test]
+    fn submission_wait_does_not_record_pipeline_execution() {
+        let metrics = PipelineMetrics::new();
+        metrics.submission_wait.record(0.012, 12_000_000);
+        assert!(
+            metrics
+                .stages
+                .iter()
+                .all(|stage| stage.count.load(Ordering::Relaxed) == 0)
+        );
+        let mut exposition = String::new();
+        metrics.write(&mut exposition);
+        let bucket = exposition
+            .lines()
+            .find(|line| {
+                line.starts_with("arrowcol_pipeline_submission_wait_seconds_bucket{") && line.contains("le=\"0.025\"")
+            })
+            .expect("submission wait bucket");
+        assert!(bucket.ends_with(" 1"));
+        assert!(!bucket.contains("stage="));
+        assert!(exposition.lines().any(|line| {
+            line.starts_with("arrowcol_pipeline_submission_wait_seconds_sum{") && line.ends_with(" 0.012")
+        }));
+    }
+
+    #[test]
     fn prometheus_exports_bounded_pipeline_flush_and_file_histograms() {
         let stage = StageMetrics::default();
         stage.record(PipelineStage::Build, Duration::from_millis(12));
+        stage.record_submission_wait(Duration::from_millis(12));
         stage.record_flush(FlushReason::TargetParquetBytes);
         stage.record_file(134_217_728, 250_000);
 
         let exposition = RuntimeMetrics::new(CollectorInstanceId::new()).prometheus();
         assert!(exposition.contains("arrowcol_pipeline_stage_duration_seconds_bucket{run=\""));
+        assert!(exposition.contains("arrowcol_pipeline_submission_wait_seconds_bucket{run=\""));
         assert!(exposition.contains("component=\"arrowcol-dataflow-rust\",stage=\"build\",le=\"0.025\"}"));
         assert!(exposition.contains("arrowcol_pipeline_flushes_total{reason=\"target_parquet_bytes\"}"));
         assert!(exposition.contains("arrowcol_parquet_file_physical_bytes_bucket{run=\""));
