@@ -1,6 +1,7 @@
 #[derive(Clone, Debug, Default, serde::Serialize)]
 struct CellEvidence {
-    downstream_comment: Option<&'static str>,
+    downstream_comment: Option<String>,
+    qap_observation: Option<Value>,
     resource_samples: Vec<ResourceSample>,
     resource_sampling_failures: u64,
     resource_samples_dropped: u64,
@@ -219,12 +220,13 @@ fn classify_local_qap_error(error: anyhow::Error) -> anyhow::Error {
 }
 
 impl CellEvidence {
-    fn downstream_unavailable(&mut self, reason: &'static str) {
-        self.downstream_comment.get_or_insert(reason);
+    fn downstream_unavailable(&mut self, reason: impl Into<String>) {
+        let reason = reason.into();
         tracing::warn!(
-            reason,
+            reason = %reason,
             "downstream observation unavailable; preserving local collector evidence"
         );
+        self.downstream_comment.get_or_insert(reason);
     }
 
     fn resource_summary(&self) -> Option<ResourceMetrics> {
@@ -412,6 +414,7 @@ impl CellEvidence {
             "client_phase_reports": self.client_reports.get(table),
             "downstream_status": if self.downstream_comment.is_some() { "unavailable" } else { "observed_or_not_attempted" },
             "downstream_comment": self.downstream_comment,
+            "qap_observation": self.qap_observation,
             "resources": {
                 "scope": "collector_fleet_measurement_window_only",
                 "cpu_summary": "arithmetic_mean_of_observed_samples",

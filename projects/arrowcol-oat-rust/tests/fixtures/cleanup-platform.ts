@@ -12,6 +12,41 @@ const fail = (message: string): never => {
 };
 
 if (tool === 'docker') {
+  if (mode === 'maintenance_cell') {
+    const project = readFileSync(join(root, 'project'), 'utf8');
+    const stopped = existsSync(join(root, 'maintenance-stopped'));
+    if (args[0] === 'ps' || args[0] === 'compose' && args.includes('ps')) {
+      console.log('maintenance-fixture');
+      process.exit(0);
+    }
+    if (args[0] === 'inspect') {
+      console.log(JSON.stringify([{
+        Id: 'maintenance-fixture', RestartCount: 0,
+        Config: { Labels: { 'com.docker.compose.project': project, 'com.docker.compose.service': 'delta-maintenance' } },
+        State: { Running: !stopped, Paused: false, Dead: false, Status: stopped ? 'exited' : 'running',
+          Error: '', ExitCode: stopped ? 1 : 0, OOMKilled: false, FinishedAt: '2026-11-16T15:54:00Z' },
+      }]));
+      process.exit(0);
+    }
+    if (args[0] === 'stop') {
+      writeFileSync(join(root, 'maintenance-stopped'), '');
+      process.exit(0);
+    }
+    if (args[0] === 'logs') {
+      console.log('arrowcol_maintenance_effective_config {}');
+      const cycles = stopped ? 31 : existsSync(join(root, 'measurement-finished')) ? 30 : 0;
+      for (let cycle = 0; cycle < cycles; cycle++) {
+        for (const operation of ['optimize', 'purge', 'vacuum', 'checkpoint', 'prune_log']) {
+          const retry = cycle >= 1 && cycle <= 5;
+          console.log(JSON.stringify({ table: 't', operation, applied: true,
+            error_kind: retry ? 'stale_plan' : null, error: retry ? 'private replan message' : null,
+            report: retry ? null : { outcome: 'noop', interrupted: false } }));
+        }
+      }
+      process.exit(0);
+    }
+    fail('unexpected maintenance lifecycle fixture command');
+  }
   if (args[0] === 'ps') {
     if (args.includes('--all')) fail('fixture stop listing failed');
     process.exit(0);

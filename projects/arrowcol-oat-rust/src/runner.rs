@@ -1019,6 +1019,7 @@ trait Platform: Send + Sync {
     async fn process_logs(&self, _config: &OatConfig) -> Result<Vec<ProcessLog>> {
         Ok(Vec::new())
     }
+    fn retain_cell_process_baseline(&mut self, _logs: &[ProcessLog]) {}
     async fn process_logs_for_role(&self, config: &OatConfig, role: ComponentRole) -> Result<Vec<ProcessLog>> {
         Ok(self
             .process_logs(config)
@@ -1136,6 +1137,7 @@ struct LocalPlatform {
     qap_url: Option<String>,
     daemon_endpoint: Option<String>,
     shutdown_drain_evidence: Option<Value>,
+    maintenance_cell_baseline: Vec<ProcessLog>,
 }
 
 #[async_trait::async_trait]
@@ -1596,6 +1598,14 @@ impl Platform for AksPlatform {
 
 #[async_trait::async_trait]
 impl Platform for LocalPlatform {
+    fn retain_cell_process_baseline(&mut self, logs: &[ProcessLog]) {
+        self.maintenance_cell_baseline = logs
+            .iter()
+            .filter(|log| log.role == ComponentRole::Maintenance)
+            .cloned()
+            .collect();
+    }
+
     fn kind(&self) -> crate::config::OatMode {
         crate::config::OatMode::Local
     }
@@ -1826,6 +1836,7 @@ impl LocalPlatform {
             qap_url: None,
             daemon_endpoint: None,
             shutdown_drain_evidence: None,
+            maintenance_cell_baseline: Vec::new(),
         })
     }
 
@@ -2941,11 +2952,57 @@ fn attach_shutdown_drain_evidence(outcome: &mut MatrixOutcome, shutdown_drain: V
         let evidence_json = row.evidence_json.as_deref().context("cell evidence is missing")?;
         let mut evidence: Value =
             serde_json::from_str(evidence_json).context("parse cell evidence before shutdown update")?;
+        evidence["kusto_snapshot_coverage"] = kusto_snapshot_coverage(
+            &row.run_id,
+            &row.table,
+            &evidence["qap_observation"],
+            &shutdown_drain["stopped_delta_snapshots"],
+        )?;
         evidence["shutdown_drain"] = shutdown_drain.clone();
         row.evidence_json =
             Some(serde_json::to_string(&evidence).context("serialize cell evidence with shutdown drain")?);
     }
     Ok(())
+}
+
+fn kusto_snapshot_coverage(run_id: &str, table: &str, observation: &Value, snapshots: &Value) -> Result<Value> {
+    let binding = qap_bindings(run_id, &[table.to_owned()])?.remove(0);
+    let snapshot = &snapshots[table];
+    let observed = &observation["tables"][&binding.external_table];
+    let identity_matches = observation["run_id"] == run_id
+        && observation["observed_unix_ms"].as_u64().is_some_and(|time| time > 0)
+        && observation["expected_tables"]
+            .as_array()
+            .is_some_and(|tables| tables.contains(&json!(binding.external_table)))
+        && snapshot["run_id"] == run_id
+        && snapshot["table"] == table
+        && snapshot["source"] == "verified_stopped_snapshot_manifest"
+        && snapshot["manifest"] == format!("{run_id}/{table}/manifest.json")
+        && snapshot["manifest_sha256"]
+            .as_str()
+            .is_some_and(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    let counts = snapshot["row_count"]
+        .as_u64()
+        .zip(snapshot["table_version"].as_u64())
+        .zip(observed["row_count"].as_u64().zip(observed["table_version"].as_u64()));
+    let status = match counts {
+        Some((delta, kusto)) if identity_matches && observed["available"] == true => {
+            if delta == kusto {
+                "matched"
+            } else {
+                "mismatch"
+            }
+        }
+        _ => "unknown",
+    };
+    Ok(json!({
+        "status": status, "run_id": run_id, "table": table, "external_table": binding.external_table,
+        "delta_snapshot": snapshot, "observed_row_count": observed["row_count"],
+        "observed_table_version": observed["table_version"], "observed_unix_ms": observation["observed_unix_ms"],
+        "scope": "exact_stopped_snapshot_count_and_version_coverage_only",
+        "unique_payload_delivery": "unknown", "queryable_delivery": "unknown", "delivery_latency": null,
+        "comment": "Matching counts/version establish snapshot coverage, not unique payload delivery or per-row queryability/latency.",
+    }))
 }
 
 async fn wait_for_cancellation(cancellation: &mut watch::Receiver<bool>) {
@@ -3388,6 +3445,7 @@ async fn run_matrix_cell(
     let started_at_ms =
         i64::try_from(cell_start_unix_ms).context("run start timestamp exceeds Arrow timestamp range")?;
     let baseline_logs = platform.process_logs(config).await?;
+    platform.retain_cell_process_baseline(&baseline_logs);
     let mut client_run = run_clients(config, run_id, &assigned_tables, platform).await?;
     let (_collector_logs, durable_commits) = settle_cell_commit_evidence(
         config,
@@ -3411,7 +3469,7 @@ async fn run_matrix_cell(
             if client_run.qap_tables.is_empty() {
                 return Err(anyhow::anyhow!(LocalDownstreamUnavailable));
             }
-            qap = observe_qap(
+            let (metrics, observation) = observe_qap(
                 &platform.qap_endpoint(config),
                 &platform.qap_observation_mode(),
                 &platform.qap_database(config)?,
@@ -3420,7 +3478,8 @@ async fn run_matrix_cell(
                 config.qap_timeout_seconds,
             )
             .await?;
-            if qap.observation_complete != 1 {
+            qap = apply_qap_observation(platform.kind(), metrics, observation, &mut client_run.evidence);
+            if qap.observation_complete != 1 && client_run.evidence.downstream_comment.is_none() {
                 bail!("QAP observation omitted required table statistics");
             }
             Ok::<_, anyhow::Error>(())
@@ -5250,7 +5309,7 @@ async fn observe_qap(
     run_id: &str,
     qap_tables: &[String],
     timeout_seconds: u64,
-) -> Result<QapMetrics> {
+) -> Result<(QapMetrics, Value)> {
     let results = std::path::PathBuf::from("out/arrowcol-oat/qap").join(run_id);
     let endpoint = endpoint.to_owned();
     let database = database.to_owned();
@@ -5295,7 +5354,54 @@ async fn observe_qap(
             bail!("QAP table metadata/statistics observation failed; not a temporary service-availability failure");
         }
     }
-    aggregate_qap(&observation, qap_tables)
+    let metrics = aggregate_qap(&observation, qap_tables)?;
+    let tables = qap_tables
+        .iter()
+        .map(|name| {
+            (
+                name.clone(),
+                json!({
+                    "available": observation["tables"][name]["available"],
+                    "row_count": observation["tables"][name]["state"]["RowCount"],
+                    "table_version": observation["tables"][name]["state"]["TableVersion"],
+                    "completion_percent": observation["tables"][name]["statistics"]["AccelerationCompletePercentage"],
+                    "pending_files": observation["tables"][name]["statistics"]["AccelerationPendingDataFilesCount"],
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    Ok((
+        metrics,
+        json!({
+            "run_id": run_id, "expected_tables": qap_tables,
+            "observed_unix_ms": observation["observed_unix_ms"],
+            "catch_up_status": observation["catch_up_status"], "tables": tables,
+        }),
+    ))
+}
+
+fn apply_qap_observation(
+    mode: crate::config::OatMode,
+    metrics: QapMetrics,
+    observation: Value,
+    evidence: &mut CellEvidence,
+) -> QapMetrics {
+    if local_downstream_optional(mode) && observation["catch_up_status"] == "deadline_incomplete" {
+        evidence.downstream_unavailable(format!(
+            "Local QAP catch-up deadline expired: observed completion {}%, pending files {}. \
+             Derived Kusto/QAP metrics are null; Delta commit measurements are unchanged.",
+            metrics
+                .completion_percent
+                .map_or_else(|| "unknown".to_owned(), |value| value.to_string()),
+            metrics
+                .pending_artifacts
+                .map_or_else(|| "unknown".to_owned(), |value| value.to_string()),
+        ));
+        evidence.qap_observation = Some(observation);
+        return QapMetrics::default();
+    }
+    evidence.qap_observation = Some(observation);
+    metrics
 }
 
 fn parse_qap_timestamp(value: &str) -> Option<i64> {
@@ -6332,23 +6438,12 @@ async fn stop_local_snapshot_writers(config: &OatConfig, platform: &LocalPlatfor
     } else {
         validate_owned_local_containers(&before, &project)?;
     }
-    let has_maintenance = before.iter().any(|container| {
-        container
-            .pointer("/Config/Labels/com.docker.compose.service")
-            .and_then(Value::as_str)
-            == Some("delta-maintenance")
-    });
     let has_collector = before.iter().any(|container| {
         container
             .pointer("/Config/Labels/com.docker.compose.service")
             .and_then(Value::as_str)
             == Some("dataflow-1")
     });
-    let maintenance_baseline = if has_maintenance {
-        local_process_logs_for_role(config, platform, Some(ComponentRole::Maintenance)).await?
-    } else {
-        Vec::new()
-    };
     let phases = snapshot_stop_phases(&before)?;
     let mut maintenance_logs = None;
     let mut collector_sigterm_at_unix_ms = None;
@@ -6476,7 +6571,11 @@ async fn stop_local_snapshot_writers(config: &OatConfig, platform: &LocalPlatfor
                 .iter()
                 .find(|log| log.instance_id == id)
                 .unwrap_or(&incomplete_log);
-            outcome["maintenance_outcomes"] = maintenance_cell_outcome_evidence(log, &maintenance_baseline);
+            let evidence = maintenance_cell_outcome_evidence(log, &platform.maintenance_cell_baseline);
+            outcome["maintenance_operation_failure"] = evidence["operation_failure"].clone();
+            outcome["maintenance_exit_classification"] =
+                maintenance_exit_classification(log, outcome["exit_code"].as_i64());
+            outcome["maintenance_outcomes"] = evidence;
         }
     }
     Ok(outcomes)
@@ -6540,7 +6639,6 @@ fn snapshot_container_outcomes(before: &[Value], after: &[Value], project: &str)
             .get("ExitCode")
             .and_then(Value::as_i64)
             .context("container exit code missing")?;
-        let maintenance_operation_failure = service == "delta-maintenance" && exit == 1;
         let role = if service == "delta-maintenance" {
             ComponentRole::Maintenance
         } else {
@@ -6563,8 +6661,10 @@ fn snapshot_container_outcomes(before: &[Value], after: &[Value], project: &str)
         writers.push(json!({
             "id": id, "service": service, "was_running": was_running, "exit_code": exit,
             "finished_at": finished_at, "oom_killed": state["OOMKilled"],
-            "maintenance_operation_failure": maintenance_operation_failure,
-            "comment": maintenance_operation_failure.then_some("Maintenance operation errors are retained by error_kind in the cell evidence; raw error text is omitted."),
+            "maintenance_operation_failure": null,
+            "comment": (service == "delta-maintenance" && exit == 1).then_some(
+                "Cumulative maintenance health exit retained; cell records and health diagnostics determine failure, retry-only, or UNKNOWN.",
+            ),
         }));
     }
     Ok(writers)
@@ -6642,6 +6742,7 @@ fn build_shutdown_drain_evidence(containers: &[Value]) -> Value {
             "container_id": container["id"],
             "outcomes": container["maintenance_outcomes"],
             "exit_code": container["exit_code"],
+            "exit_classification": container["maintenance_exit_classification"],
         })).collect::<Vec<_>>(),
     })
 }
@@ -6693,7 +6794,12 @@ async fn cleanup_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
     } else {
         stop_then_destroy(stop, destroy_local_platform(config, platform)).await?
     };
-    Ok(build_shutdown_drain_evidence(&containers))
+    let mut evidence = build_shutdown_drain_evidence(&containers);
+    if let Some(destination) = &config.platform.local.snapshot_root {
+        evidence["stopped_delta_snapshots"] =
+            crate::local::stopped_snapshot_references(Path::new(destination), &platform.run_id, &config.tables)?;
+    }
+    Ok(evidence)
 }
 
 fn local_oat_client_list_args(project: &str) -> Vec<String> {
@@ -10111,13 +10217,14 @@ fn shutdown_exit_outcome(
             json!({"status": "unavailable", "reason": "terminated_container_state_not_observed", "exit_code": null}),
         );
     };
-    let maintenance_failure = role == ComponentRole::Maintenance && exit == 1;
-    if !(exit == 0 || (was_running && exit == 143) || maintenance_failure) {
+    let maintenance_health_exit = role == ComponentRole::Maintenance && exit == 1;
+    if !(exit == 0 || (was_running && exit == 143) || maintenance_health_exit) {
         bail!("container failed or was forcibly stopped ({exit})");
     }
     Ok(json!({
         "status": "observed", "exit_code": exit,
-        "maintenance_operation_failure": maintenance_failure,
+        "maintenance_operation_failure": null,
+        "classification": if maintenance_health_exit { "requires_operation_records" } else { "clean_shutdown" },
     }))
 }
 
@@ -12871,7 +12978,7 @@ mod tests {
         config.platform.local.snapshot_root = None;
         let state = fixture.join("local-state");
         fs::create_dir(&state)?;
-        let local = LocalPlatform {
+        let mut local = LocalPlatform {
             run_id: "fixture-run".to_owned(),
             state_dir: state.clone(),
             environment: HashMap::new(),
@@ -12882,6 +12989,7 @@ mod tests {
             qap_url: None,
             daemon_endpoint: None,
             shutdown_drain_evidence: None,
+            maintenance_cell_baseline: Vec::new(),
         };
         fs::write(fixture.join("mode"), "stop_failure")?;
         let error = cleanup_local_platform(&config, &local)
@@ -12894,6 +13002,31 @@ mod tests {
             !fixture.join("compose-destroyed").exists(),
             "Compose down must be skipped"
         );
+        fs::write(fixture.join("mode"), "maintenance_cell")?;
+        fs::write(
+            fixture.join("project"),
+            scoped_compose_project(
+                config.platform.compose_project.as_deref().context("fixture project")?,
+                &local.run_id,
+            ),
+        )?;
+        let baseline = local.process_logs(&config).await?;
+        local.retain_cell_process_baseline(&baseline);
+        fs::write(fixture.join("measurement-finished"), "")?;
+        let outcomes = stop_local_snapshot_writers(&config, &local).await?;
+        assert_eq!(
+            outcomes[0]["maintenance_outcomes"]["operation_count"], 155,
+            "cell scope must include warm-up/measurement and the final drain cycle"
+        );
+        assert_eq!(
+            outcomes[0]["maintenance_outcomes"]["retry_kind_counts"]["stale_plan"],
+            25
+        );
+        assert_eq!(outcomes[0]["maintenance_operation_failure"], false);
+        assert_eq!(outcomes[0]["maintenance_exit_classification"], "nonzero_health_exit");
+        assert_eq!(outcomes[0]["exit_code"], 1);
+        assert!(!serde_json::to_string(&outcomes)?.contains("private"));
+        fs::write(fixture.join("mode"), "stop_failure")?;
 
         config.platform.kind = crate::config::OatMode::Aks;
         config.namespace = "fixture-owned".to_owned();
@@ -13054,8 +13187,8 @@ mod tests {
         }
         assert!(shutdown_exit_outcome(ComponentRole::Collector, true, Some(1), false).is_err());
         assert_eq!(
-            shutdown_exit_outcome(ComponentRole::Maintenance, true, Some(1), false)?["maintenance_operation_failure"],
-            true,
+            shutdown_exit_outcome(ComponentRole::Maintenance, true, Some(1), false)?["classification"],
+            "requires_operation_records",
         );
         Ok(())
     }
@@ -13184,7 +13317,7 @@ mod tests {
 
         after[0]["State"]["ExitCode"] = json!(1);
         let outcomes = snapshot_container_outcomes(&before, &after, project)?;
-        assert_eq!(outcomes[0]["maintenance_operation_failure"], true);
+        assert!(outcomes[0]["maintenance_operation_failure"].is_null());
         assert!(outcomes[0]["comment"].as_str().is_some());
 
         for exit in [2, 137] {
@@ -14189,6 +14322,112 @@ mod tests {
         assert_eq!(metrics.observation_complete, 0);
         assert_eq!(metrics.observed_tables, 0);
         assert_eq!(metrics.completion_percent, None);
+        Ok(())
+    }
+
+    #[test]
+    fn local_qap_deadline_keeps_progress_and_exact_snapshot_coverage_without_changing_delta_results() -> Result<()> {
+        let config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        let run = "fdba69d6-ae99-49e6-9c7a-f1a1044b8241";
+        let table = config.tables[0].clone();
+        let external = qap_bindings(run, std::slice::from_ref(&table))?
+            .remove(0)
+            .external_table;
+        let observation = json!({
+            "run_id": run, "observed_unix_ms": 1_794_842_000_000_u64,
+            "expected_tables": [external], "catch_up_status": "deadline_incomplete",
+            "tables": {&external: {"available": true, "row_count": 3_915_776, "table_version": 585,
+                "completion_percent": 84.81, "pending_files": 89}},
+        });
+        let mut evidence = CellEvidence::default();
+        evidence
+            .durable_commits
+            .insert(table.clone(), json!({"output_throughput":{"rows_per_second":123.0}}));
+        let measured = QapMetrics {
+            observation_complete: 1,
+            observed_tables: 1,
+            completion_percent: Some(84.81),
+            pending_artifacts: Some(89),
+            cached_bytes: Some(1_121_271_383),
+            unhealthy_catalogs: Some(0),
+            lag_seconds: Some(1.0),
+        };
+        let qap = apply_qap_observation(
+            crate::config::OatMode::Local,
+            measured,
+            observation.clone(),
+            &mut evidence,
+        );
+        assert!(qap.completion_percent.is_none() && qap.pending_artifacts.is_none() && qap.cached_bytes.is_none());
+        assert!(qap.unhealthy_catalogs.is_none() && qap.lag_seconds.is_none());
+        let comment = evidence.downstream_comment.as_deref().context("deadline explanation")?;
+        assert!(comment.contains("84.81%") && comment.contains("89"));
+        assert_eq!(evidence.qap_observation.as_ref(), Some(&observation));
+        let aks = apply_qap_observation(
+            crate::config::OatMode::Aks,
+            measured,
+            observation.clone(),
+            &mut CellEvidence::default(),
+        );
+        assert_eq!(aks.completion_percent, Some(84.81), "AKS verdict remains strict");
+        let mut snapshots = json!({&table: {
+            "source": "verified_stopped_snapshot_manifest", "run_id": run, "table": table,
+            "manifest": format!("{run}/{table}/manifest.json"), "manifest_sha256": "a".repeat(64),
+            "table_version": 585, "row_count": 3_915_776,
+        }});
+        let coverage = kusto_snapshot_coverage(run, &table, &observation, &snapshots)?;
+        assert_eq!(coverage["status"], "matched");
+        assert_eq!(coverage["unique_payload_delivery"], "unknown");
+        assert_eq!(coverage["queryable_delivery"], "unknown");
+        assert!(coverage["delivery_latency"].is_null());
+        snapshots[&table]["table_version"] = json!(586);
+        assert_eq!(
+            kusto_snapshot_coverage(run, &table, &observation, &snapshots)?["status"],
+            "mismatch"
+        );
+        snapshots[&table]["run_id"] = json!(uuid::Uuid::new_v4().to_string());
+        assert_eq!(
+            kusto_snapshot_coverage(run, &table, &observation, &snapshots)?["status"],
+            "unknown"
+        );
+        let mut pinning = PinningReport::default();
+        pinning
+            .owners
+            .insert(canonical_table_key(&table), "collector".to_owned());
+        let clients = ClientRun {
+            metrics: HashMap::from([(
+                table.clone(),
+                ClientMetrics {
+                    rows: 100,
+                    duration_ms: 1000,
+                    rows_per_second: 100.0,
+                    completions: Vec::new(),
+                },
+            )]),
+            pinning,
+            qap_tables: vec![external],
+            failure: None,
+            evidence,
+        };
+        let rows = result_rows(
+            &config,
+            "orchestration",
+            run,
+            1,
+            1,
+            CellMeasurements {
+                clients,
+                started_at_ms: 1,
+                qap,
+                resources: None,
+            },
+        )?;
+        assert_eq!(rows[0].status, "succeeded");
+        let result: Value = serde_json::from_str(rows[0].evidence_json.as_deref().context("evidence")?)?;
+        assert_eq!(result["durable_commits"]["output_throughput"]["rows_per_second"], 123.0);
+        assert_eq!(result["downstream_status"], "unavailable");
         Ok(())
     }
 

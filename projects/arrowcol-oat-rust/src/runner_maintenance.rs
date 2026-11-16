@@ -332,6 +332,8 @@ fn maintenance_readback_value(observed: &Value, variable: &str, expected: Value)
         "INTERVAL_SECS"
         | "MAX_IDLE_BACKOFF_SECS"
         | "MAX_CYCLES"
+        | "MAX_CONSECUTIVE_STALE_PLANS"
+        | "SEALED_PARTITIONS_ONLY"
         | "MAX_CONCURRENT_TABLES"
         | "MAX_CONCURRENT_DECODED_BYTES"
         | "COMMIT_ATTEMPTS"
@@ -455,6 +457,22 @@ fn verify_maintenance_controls(config: &OatConfig, observed: &Value) -> Result<(
     {
         bail!("maintenance process did not confirm explicit operation/apply/schedule controls");
     }
+    if let Some(expected) = settings.max_consecutive_stale_plans
+        && (observed.pointer("/startup/max_consecutive_stale_plans") != Some(&json!(expected))
+            || observed.pointer("/operation_settings/max_consecutive_stale_plans") != Some(&json!(expected)))
+    {
+        bail!("maintenance did not confirm its effective stale-plan health limit");
+    }
+    if let Some(requested) = settings.sealed_partitions_only {
+        if observed.pointer("/startup/sealed_partitions_only") != Some(&json!(requested)) {
+            bail!("maintenance did not confirm its requested sealed-partition preference");
+        }
+        let effective = observed.pointer("/operation_settings/sealed_partitions_only")
+            .filter(|value| value.is_boolean()).context("maintenance effective sealed-partition policy missing")?;
+        if observed.pointer("/table_policy/arrowcol.optimize.sealedPartitionsOnly") != Some(effective) {
+            bail!("maintenance effective sealed-partition policy disagrees with table policy");
+        }
+    }
     Ok(())
 }
 
@@ -470,6 +488,46 @@ fn sanitized_maintenance_error_kind(kind: Option<&str>) -> String {
     .to_owned()
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MaintenanceRecordOutcome {
+    Succeeded,
+    Retry,
+    Failed,
+}
+
+fn maintenance_record_outcome(value: &Value) -> Option<MaintenanceRecordOutcome> {
+    let kind = match value.get("error_kind") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(kind)) if !kind.is_empty() => Some(kind.as_str()),
+        _ => return None,
+    };
+    let error = match value.get("error") {
+        None | Some(Value::Null) => false,
+        Some(Value::String(_)) => true,
+        _ => return None,
+    };
+    let failed = kind.is_some() || error;
+    match value.get("report") {
+        None | Some(Value::Null) if failed => {}
+        Some(Value::Object(report)) => {
+            if report.get("interrupted")?.as_bool()?
+                || !["noop", "planned", "committed", "already_applied", "deleted", "checkpointed", "pruned"]
+                    .contains(&report.get("outcome")?.as_str()?)
+            {
+                return None;
+            }
+        }
+        _ => return None,
+    }
+    Some(if kind == Some("stale_plan") {
+        MaintenanceRecordOutcome::Retry
+    } else if failed {
+        MaintenanceRecordOutcome::Failed
+    } else {
+        MaintenanceRecordOutcome::Succeeded
+    })
+}
+
 #[derive(serde::Deserialize, serde::Serialize)]
 struct MaintenanceCompactionDebt {
     observed_at_ms: i64,
@@ -479,6 +537,16 @@ struct MaintenanceCompactionDebt {
     backlog_files: u64,
     backlog_bytes: u64,
     oldest_eligible_partition_start_ms: Option<i64>,
+    protected_partition_backlog: Option<MaintenanceProtectedPartitionBacklog>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct MaintenanceProtectedPartitionBacklog {
+    files: u64,
+    bytes: u64,
+    #[serde(deserialize_with = "deserialize_present_due_work_option")]
+    oldest_partition_start_ms: Option<i64>,
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -489,7 +557,9 @@ enum MaintenanceCompactionDebtSource {
 }
 
 fn maintenance_compaction_debt(value: &Value, failed: bool) -> Result<Option<MaintenanceCompactionDebt>> {
-    if failed || value["operation"] != "optimize" {
+    if failed || value["operation"] != "optimize"
+        || maintenance_record_outcome(value) != Some(MaintenanceRecordOutcome::Succeeded)
+    {
         return Ok(None);
     }
     let Some(debt) = value.pointer("/report/compaction_debt").filter(|debt| !debt.is_null()) else {
@@ -501,6 +571,10 @@ fn maintenance_compaction_debt(value: &Value, failed: bool) -> Result<Option<Mai
         || debt.backlog_files > debt.eligible_files
         || debt.backlog_bytes > debt.eligible_bytes
         || debt.oldest_eligible_partition_start_ms.is_some_and(|time| time > debt.observed_at_ms)
+        || debt.protected_partition_backlog.as_ref().is_some_and(|backlog| {
+            backlog.oldest_partition_start_ms.is_some_and(|time| time > debt.observed_at_ms)
+                || (backlog.files == 0 && (backlog.bytes != 0 || backlog.oldest_partition_start_ms.is_some()))
+        })
     {
         bail!("invalid maintenance compaction debt values");
     }
@@ -594,11 +668,7 @@ fn maintenance_due_work(value: &Value) -> Result<Option<MaintenanceDueWorkEviden
     let Some(report) = value.get("report") else {
         return Ok(None);
     };
-    if value.get("error").is_some_and(|error| !error.is_null())
-        || value.get("error_kind").is_some_and(|error| !error.is_null())
-        || report.get("interrupted") == Some(&Value::Bool(true))
-        || report.get("outcome").and_then(Value::as_str) == Some("partial")
-    {
+    if maintenance_record_outcome(value) != Some(MaintenanceRecordOutcome::Succeeded) {
         return Ok(None);
     }
     let Some(raw) = report.get("maintenance_due_work") else {
@@ -670,12 +740,20 @@ fn maintenance_table_evidence(config: &OatConfig, text: &str) -> Result<Value> {
     let mut dropped = 0_u64;
     let mut operation_count = 0_u64;
     let mut operation_error_count = 0_u64;
+    let mut operation_retry_count = 0_u64;
+    let mut retry_kind_counts = serde_json::Map::new();
     let mut error_kind_counts = serde_json::Map::new();
+    let mut records_complete = text.is_empty() || text.ends_with('\n');
     for line in text.lines().filter(|line| line.starts_with('{')) {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
+            records_complete = false;
             continue;
         };
+        if value.get("operation").is_none() {
+            continue;
+        }
         if !value["operation"].is_string() || !value["applied"].is_boolean() {
+            records_complete = false;
             continue;
         }
         let table = value["table"]
@@ -698,9 +776,17 @@ fn maintenance_table_evidence(config: &OatConfig, text: &str) -> Result<Value> {
             bail!("maintenance operation receipt disagrees with explicit operation/apply authorization");
         }
         operation_count = operation_count.saturating_add(1);
+        let record_outcome = maintenance_record_outcome(&value);
+        if record_outcome.is_none() {
+            records_complete = false;
+        }
         let raw_error_kind = value.get("error_kind").and_then(Value::as_str);
-        let operation_failed = value.get("error").is_some_and(|error| !error.is_null())
-            || value.get("error_kind").is_some_and(|error| !error.is_null());
+        let operation_retry = record_outcome == Some(MaintenanceRecordOutcome::Retry);
+        let operation_failed = record_outcome == Some(MaintenanceRecordOutcome::Failed);
+        if operation_retry {
+            operation_retry_count = operation_retry_count.saturating_add(1);
+            retry_kind_counts.insert("stale_plan".to_owned(), json!(operation_retry_count));
+        }
         let error_kind = operation_failed.then(|| sanitized_maintenance_error_kind(raw_error_kind));
         if let Some(kind) = &error_kind {
             operation_error_count = operation_error_count.saturating_add(1);
@@ -739,8 +825,9 @@ fn maintenance_table_evidence(config: &OatConfig, text: &str) -> Result<Value> {
             "table": table, "operation": value["operation"], "negative_probe": value["negative_probe"].as_bool(),
             "maintenance_due_work": due_work,
             "mutation_mode": if value["applied"] == true { "apply_authorized_not_proof_of_mutation" } else { "dry_run_predicted_not_applied" },
-            "operation_failed": operation_failed, "error_kind": error_kind,
-            "compaction_debt": maintenance_compaction_debt(&value, operation_failed)?,
+            "operation_failed": record_outcome.map(|_| operation_failed), "error_kind": error_kind,
+            "operation_retry": record_outcome.map(|_| operation_retry), "retry_kind": operation_retry.then_some("stale_plan"),
+            "compaction_debt": maintenance_compaction_debt(&value, operation_failed || operation_retry)?,
             "consumer_reported_counts": counts, "duration_ms": value["duration_ms"].as_u64(),
             "report_outcome": value.pointer("/report/outcome").and_then(Value::as_str),
         }));
@@ -751,8 +838,11 @@ fn maintenance_table_evidence(config: &OatConfig, text: &str) -> Result<Value> {
         "operation_outcomes": {
             "scope": "process_lifetime",
             "operation_count": operation_count,
-            "error_count": operation_error_count,
-            "error_kind_counts": error_kind_counts,
+            "status": if records_complete && operation_count > 0 { "observed" } else { "unavailable" },
+            "error_count": (records_complete && operation_count > 0).then_some(operation_error_count),
+            "error_kind_counts": (records_complete && operation_count > 0).then_some(error_kind_counts),
+            "retry_count": (records_complete && operation_count > 0).then_some(operation_retry_count),
+            "retry_kind_counts": (records_complete && operation_count > 0).then_some(retry_kind_counts),
             "comment": if operation_error_count == 0 {
                 "No maintenance operation errors were observed in the process log."
             } else {
@@ -819,6 +909,54 @@ mod maintenance_topology_tests {
             assert_eq!(evidence.completeness, MaintenanceDueWorkCompleteness::Complete);
             assert_eq!(evidence.due, Some(false));
         }
+        let optimize = operation_results.iter().find(|result| result["operation"] == "optimize")
+            .context("producer fixture omitted OPTIMIZE")?;
+        let debt = maintenance_compaction_debt(optimize, false)?.context("producer omitted compaction debt")?;
+        assert_eq!(serde_json::to_value(debt)?["protected_partition_backlog"],
+            optimize["report"]["compaction_debt"]["protected_partition_backlog"]);
+
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        config.tables = vec!["sqlserver_availability_replica_states".to_owned()];
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+            "maintenance": {"enabled":true, "apply":true,
+                "operations":["optimize","purge","vacuum","checkpoint","prune_log"]}
+        }))?;
+        let table = canonical_dmv_table_name(&config.tables[0])?;
+        let mut text = format!("arrowcol_maintenance_table_config {}\n", json!({
+            "table": table, "config": {"active":true, "table_policy":{},
+                "startup":{"apply":true,"operations":["optimize","purge","vacuum","checkpoint","prune_log"],"interval_secs":60}}
+        }));
+        for result in operation_results {
+            let mut bound = result.clone();
+            bound["table"] = json!(table);
+            text.push_str(&format!("{bound}\n"));
+        }
+        let current = ProcessLog {
+            role: ComponentRole::Maintenance, instance_id:"producer-fixture".to_owned(),
+            image:None, image_id:None, source_revision:None, complete:true, raw_log_bytes:0, raw_log_lines:0,
+            stdout:text.clone(), stderr:String::new(), text:text.clone(),
+        };
+        let mut baseline = current.clone();
+        baseline.stdout.clear();
+        let projection = json!({
+            "producer_commit":"dbdfbf2b3c0dcaae2db19104b0796933d7fea520",
+            "producer_sha256":"b2717115ca191b392f0e5cf7cfb570b0a27b1a8619f3a65aa426832bedcfbee2",
+            "binding":"events fixture table renamed to benchmark allowlist; operation/report payloads unchanged",
+            "processes":[{"component":"maintenance","log_complete":true,
+                "maintenance_table_policies":maintenance_table_evidence(&config, &text)?,
+                "maintenance_operation_outcomes":maintenance_cell_outcome_evidence(&current, &[baseline])}],
+        });
+        let expected_projection: Value = serde_json::from_str(include_str!(
+            "../../arrowcol-oat/campaign-results-maintenance-health-e1-projection.json"
+        ))?;
+        assert_eq!(projection, expected_projection);
+        assert_eq!(crate::local::file_digest(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/maintenance-operation-results.json"),
+        )?.1, projection["producer_sha256"].as_str().context("producer hash")?);
+        let protected = optimize["report"]["compaction_debt"]["protected_partition_backlog"].clone();
+        assert!(!protected.is_null(), "fixture must contain measured protected debt, not an invented zero");
 
         let cases = fixture["qualification_cases"]
             .as_array()
@@ -869,6 +1007,32 @@ mod maintenance_topology_tests {
             32_u64 * 1024 * 1024
         );
         assert!(maintenance_table_evidence(&config, "").is_err());
+        let actual: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/maintenance-open-partition-results.json"
+        ))?;
+        assert_eq!(crate::local::file_digest(&Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/maintenance-open-partition-results.json"))?.1,
+            "873a51a750f374a1c2d73aaf6cc0601591cb1f88e3140b720e41f52eea3eaa90");
+        assert!(actual["default_configuration"]["startup"]["sealed_partitions_only"].is_null());
+        assert_eq!(actual["default_configuration"]["operation_settings"]["sealed_partitions_only"], true);
+        assert_eq!(actual["default_configuration"]["table_policy"]["arrowcol.optimize.sealedPartitionsOnly"], true);
+        assert!(!role_environment(&config, ComponentRole::Maintenance)?
+            .contains_key("ARROWCOL_MAINT_SEALED_PARTITIONS_ONLY"));
+        let mut bounded_config = config.clone();
+        bounded_config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+            "maintenance":{"enabled":true,"apply":true,"operations":["optimize"],"interval_secs":1,
+                "max_consecutive_stale_plans":4,"sealed_partitions_only":false}
+        }))?;
+        let mut overridden = actual["opt_in_configuration"].clone();
+        verify_process_configuration(&bounded_config, ComponentRole::Maintenance, &overridden)?;
+        assert_eq!(overridden["startup"]["sealed_partitions_only"], false);
+        assert_eq!(overridden["operation_settings"]["sealed_partitions_only"], false);
+        overridden["operation_settings"]["sealed_partitions_only"] = json!(true);
+        overridden["table_policy"]["arrowcol.optimize.sealedPartitionsOnly"] = json!(true);
+        verify_process_configuration(&bounded_config, ComponentRole::Maintenance, &overridden)?;
+        overridden["startup"]["sealed_partitions_only"] = Value::Null;
+        assert!(verify_process_configuration(&bounded_config, ComponentRole::Maintenance, &overridden).is_err(),
+            "omitted/null is not an observed requested false");
         assert!(
             maintenance_table_evidence(
                 &config,
@@ -879,7 +1043,8 @@ mod maintenance_topology_tests {
             .is_err()
         );
         let report = json!({"table":table,"operation":"optimize","applied":false,"negative_probe":false,
-            "report":{"files_added":2,"rows_added":257,"outputs":["private-object-path"]},"duration_ms":12});
+            "report":{"outcome":"noop","interrupted":false,
+                "files_added":2,"rows_added":257,"outputs":["private-object-path"]},"duration_ms":12});
         let reports = maintenance_table_evidence(&config, &format!("{text}{report}\n"))?;
         assert!(reports["operation_reports"][0]["compaction_debt"].is_null());
         assert!(reports["operation_reports"][0]["maintenance_due_work"].is_null());
@@ -940,7 +1105,7 @@ mod maintenance_topology_tests {
         debt_report["report"]["compaction_debt"] = json!({
             "observed_at_ms": 1700000000000_i64, "source": "snapshot_active_files",
             "eligible_files": 4, "eligible_bytes": 1000, "backlog_files": 2, "backlog_bytes": 500,
-            "oldest_eligible_partition_start_ms": null
+            "oldest_eligible_partition_start_ms": null, "protected_partition_backlog": null
         });
         let debt = maintenance_table_evidence(&config, &format!("{text}{debt_report}\n"))?;
         assert_eq!(debt["operation_reports"][0]["compaction_debt"], debt_report["report"]["compaction_debt"]);
@@ -962,6 +1127,15 @@ mod maintenance_topology_tests {
         );
         assert!(failure_evidence["operation_outcomes"]["comment"].as_str().is_some());
         assert!(!failure_evidence.to_string().contains("private operation error"));
+        let mut stale = failed.clone();
+        stale["error_kind"] = json!("stale_plan");
+        let retry = maintenance_table_evidence(&config, &format!("{text}{stale}\n"))?;
+        assert_eq!(retry["operation_outcomes"]["error_count"], 0);
+        assert_eq!(retry["operation_outcomes"]["retry_kind_counts"], json!({"stale_plan":1}));
+        assert_eq!(retry["operation_reports"][0]["operation_failed"], false);
+        assert_eq!(retry["operation_reports"][0]["retry_kind"], "stale_plan");
+        assert!(retry["operation_reports"][0]["maintenance_due_work"].is_null());
+        assert!(!retry.to_string().contains("private operation error"));
         failed = report.clone();
         failed["applied"] = json!(true);
         assert!(maintenance_table_evidence(&config, &format!("{text}{failed}\n")).is_err());
@@ -1017,6 +1191,7 @@ mod maintenance_topology_tests {
             "parquet_writer": {"defaults": {"compression": "zstd"}},
             "maintenance": {"enabled": true, "operations": ["optimize"],
                 "optimize_upload_mode": "buffered_multipart", "optimize_upload_buffer_bytes": 4194304,
+                "max_consecutive_stale_plans": 4, "sealed_partitions_only": false,
                 "parquet_writer": {"defaults": {"compression": "snappy"}}}
         }))?;
         let binary = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/delta-maintenance");
@@ -1033,6 +1208,11 @@ mod maintenance_topology_tests {
         assert_eq!(observed["parquet_writer_overrides"]["defaults"]["compression"], "snappy");
         assert_eq!(observed["startup"]["operation_limits"]["optimize_upload_mode"], "buffered_multipart");
         assert_eq!(observed["startup"]["operation_limits"]["optimize_upload_buffer_bytes"], 4194304);
+        assert_eq!(observed["startup"]["max_consecutive_stale_plans"], 4);
+        assert_eq!(observed["operation_settings"]["max_consecutive_stale_plans"], 4);
+        assert_eq!(observed["startup"]["sealed_partitions_only"], false);
+        assert_eq!(observed["operation_settings"]["sealed_partitions_only"], false);
+        assert_eq!(observed["table_policy"]["arrowcol.optimize.sealedPartitionsOnly"], false);
         Ok(())
     }
 }
