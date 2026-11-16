@@ -1,0 +1,234 @@
+{
+  "schema_version": 1,
+  "cohort": "C7",
+  "mode": "local",
+  "base_config": "oat-config.tuned.json",
+  "registry_source": "PR125 arrowcol-tunables profile",
+  "registry_sha256": "79cf2880012dfbd6a064d848a217083afef77c9168b3fc72e7c4e0f527ff8af9",
+  "box_scope": "one box for every comparison in this cohort",
+  "candidate_limit_per_comparison": 4,
+  "campaign": "single_hot_table_campaign",
+  "invariants": {
+    "table": "sqlserver_active_sessions",
+    "writer_replicas": 1,
+    "maintenance": {
+      "enabled": true,
+      "apply": true,
+      "operations": [
+        "optimize",
+        "purge",
+        "vacuum",
+        "checkpoint",
+        "prune_log"
+      ]
+    },
+    "compare_within_box": true,
+    "one_variable_at_a_time": true
+  },
+  "baseline_tunables": {
+    "client": {
+      "corpus_rows": 65536,
+      "batch_rows": 4096,
+      "workers": 2,
+      "string_width": 32,
+      "cardinality": 1024,
+      "null_fraction": 0.05,
+      "max_memory_bytes": 536870912,
+      "connections_per_worker": 1,
+      "streams_per_worker": 2
+    },
+    "router": {
+      "sql_pool_max_size": 64,
+      "sql_pool_acquire_timeout_ms": 10000
+    },
+    "transport": {
+      "ipc_compression": "zstd",
+      "grpc_send_compression": "none",
+      "max_flight_data_bytes": 2097152,
+      "max_message_bytes": 16777216
+    },
+    "collector": {
+      "cpu_pressure": "process",
+      "batching": {
+        "coalesce_publications": true,
+        "max_age": "1s",
+        "max_concurrent_flushes": 2
+      },
+      "runtime": {
+        "workers": 4,
+        "blocking_workers": 64,
+        "upload_limit": 8,
+        "task_limit": 128,
+        "read_ahead": 8,
+        "batch_rows": 16384,
+        "cpu_workers": 4
+      }
+    },
+    "parquet_writer": {
+      "defaults": {
+        "compression": "zstd",
+        "compression_level": 3
+      },
+      "max_row_group_rows": 16384
+    },
+    "maintenance": {
+      "enabled": true,
+      "operations": [
+        "optimize",
+        "purge",
+        "vacuum",
+        "checkpoint",
+        "prune_log"
+      ],
+      "apply": true,
+      "interval_secs": 60,
+      "target_file_mib": 128
+    }
+  },
+  "comparisons": [
+    {
+      "id": "maintenance-cadence",
+      "factor": "tunables.maintenance.interval_secs",
+      "candidates": [
+        {
+          "id": "cadence-30",
+          "overrides": {
+            "tunables": {
+              "maintenance": {
+                "interval_secs": 30
+              }
+            }
+          }
+        },
+        {
+          "id": "cadence-60",
+          "overrides": {
+            "tunables": {
+              "maintenance": {
+                "interval_secs": 60
+              }
+            }
+          }
+        },
+        {
+          "id": "cadence-120",
+          "overrides": {
+            "tunables": {
+              "maintenance": {
+                "interval_secs": 120
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "small-file-threshold",
+      "factor": "tunables.maintenance.small_file_bytes",
+      "candidates": [
+        {
+          "id": "small-file-16777216",
+          "overrides": {
+            "tunables": {
+              "maintenance": {
+                "small_file_bytes": 16777216
+              }
+            }
+          }
+        },
+        {
+          "id": "small-file-33554432",
+          "overrides": {
+            "tunables": {
+              "maintenance": {
+                "small_file_bytes": 33554432
+              }
+            }
+          }
+        },
+        {
+          "id": "small-file-67108864",
+          "overrides": {
+            "tunables": {
+              "maintenance": {
+                "small_file_bytes": 67108864
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "retry-budget",
+      "factor": "tunables.maintenance.commit_attempts",
+      "candidates": [
+        {
+          "id": "attempts-1",
+          "overrides": {
+            "tunables": {
+              "maintenance": {
+                "commit_attempts": 1
+              }
+            }
+          }
+        },
+        {
+          "id": "attempts-3",
+          "overrides": {
+            "tunables": {
+              "maintenance": {
+                "commit_attempts": 3
+              }
+            }
+          }
+        },
+        {
+          "id": "attempts-5",
+          "overrides": {
+            "tunables": {
+              "maintenance": {
+                "commit_attempts": 5
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "checkpoint-interval",
+      "factor": "tunables.maintenance.checkpoint_every_commits",
+      "candidates": [
+        {
+          "id": "checkpoint-64",
+          "overrides": {
+            "tunables": {
+              "maintenance": {
+                "checkpoint_every_commits": 64
+              }
+            }
+          }
+        },
+        {
+          "id": "checkpoint-256",
+          "overrides": {
+            "tunables": {
+              "maintenance": {
+                "checkpoint_every_commits": 256
+              }
+            }
+          }
+        },
+        {
+          "id": "checkpoint-1024",
+          "overrides": {
+            "tunables": {
+              "maintenance": {
+                "checkpoint_every_commits": 1024
+              }
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

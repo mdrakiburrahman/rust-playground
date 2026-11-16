@@ -1,0 +1,205 @@
+{
+  "schema_version": 1,
+  "cohort": "C8",
+  "mode": "local",
+  "base_config": "oat-config.tuned.json",
+  "registry_source": "PR125 arrowcol-tunables profile",
+  "registry_sha256": "79cf2880012dfbd6a064d848a217083afef77c9168b3fc72e7c4e0f527ff8af9",
+  "box_scope": "one box for every comparison in this cohort",
+  "candidate_limit_per_comparison": 4,
+  "campaign": "single_hot_table_campaign",
+  "invariants": {
+    "table": "sqlserver_active_sessions",
+    "writer_replicas": 1,
+    "maintenance": {
+      "enabled": true,
+      "apply": true,
+      "operations": [
+        "optimize",
+        "purge",
+        "vacuum",
+        "checkpoint",
+        "prune_log"
+      ]
+    },
+    "compare_within_box": true,
+    "one_variable_at_a_time": true
+  },
+  "baseline_tunables": {
+    "client": {
+      "corpus_rows": 65536,
+      "batch_rows": 4096,
+      "workers": 2,
+      "string_width": 32,
+      "cardinality": 1024,
+      "null_fraction": 0.05,
+      "max_memory_bytes": 536870912,
+      "connections_per_worker": 1,
+      "streams_per_worker": 2
+    },
+    "router": {
+      "sql_pool_max_size": 64,
+      "sql_pool_acquire_timeout_ms": 10000
+    },
+    "transport": {
+      "ipc_compression": "zstd",
+      "grpc_send_compression": "none",
+      "max_flight_data_bytes": 2097152,
+      "max_message_bytes": 16777216
+    },
+    "collector": {
+      "cpu_pressure": "process",
+      "batching": {
+        "coalesce_publications": true,
+        "max_age": "1s",
+        "max_concurrent_flushes": 2
+      },
+      "runtime": {
+        "workers": 4,
+        "blocking_workers": 64,
+        "upload_limit": 8,
+        "task_limit": 128,
+        "read_ahead": 8,
+        "batch_rows": 16384,
+        "cpu_workers": 4
+      }
+    },
+    "parquet_writer": {
+      "defaults": {
+        "compression": "zstd",
+        "compression_level": 3
+      },
+      "max_row_group_rows": 16384
+    },
+    "maintenance": {
+      "enabled": true,
+      "operations": [
+        "optimize",
+        "purge",
+        "vacuum",
+        "checkpoint",
+        "prune_log"
+      ],
+      "apply": true,
+      "interval_secs": 60,
+      "target_file_mib": 128
+    }
+  },
+  "comparisons": [
+    {
+      "id": "commit-window",
+      "factor": "tunables.collector.commit.batch_window",
+      "candidates": [
+        {
+          "id": "window-1s",
+          "overrides": {
+            "tunables": {
+              "collector": {
+                "commit": {
+                  "batch_window": "1s"
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "window-2s",
+          "overrides": {
+            "tunables": {
+              "collector": {
+                "commit": {
+                  "batch_window": "2s"
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "window-5s",
+          "overrides": {
+            "tunables": {
+              "collector": {
+                "commit": {
+                  "batch_window": "5s"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files-per-commit",
+      "factor": "tunables.collector.commit.max_files_per_commit",
+      "candidates": [
+        {
+          "id": "files-16",
+          "overrides": {
+            "tunables": {
+              "collector": {
+                "commit": {
+                  "max_files_per_commit": 16
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "files-64",
+          "overrides": {
+            "tunables": {
+              "collector": {
+                "commit": {
+                  "max_files_per_commit": 64
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "files-128",
+          "overrides": {
+            "tunables": {
+              "collector": {
+                "commit": {
+                  "max_files_per_commit": 128
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "staging-overlap",
+      "factor": "tunables.collector.commit.staging_overlap",
+      "candidates": [
+        {
+          "id": "overlap-false",
+          "overrides": {
+            "tunables": {
+              "collector": {
+                "commit": {
+                  "staging_overlap": false
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "overlap-true",
+          "overrides": {
+            "tunables": {
+              "collector": {
+                "commit": {
+                  "staging_overlap": true
+                }
+              }
+            }
+          }
+        }
+      ],
+      "registryStatus": "pending-E1-registry"
+    }
+  ]
+}

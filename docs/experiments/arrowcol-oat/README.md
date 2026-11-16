@@ -10,8 +10,13 @@
 | `throughput-pipeline.drawio` / `.png`           | Single-writer throughput campaign dataflow and observability pipeline. |
 | [Runtime setup](RUNTIME.md)                       | Isolated internal-only Kubernetes stack, image digests, workload identity, SQL bootstrap, secret files and local rehearsal.              |
 | [E1-E5 input preparation](EXPERIMENTS.md)         | Offline binding of private AKS settings and reviewed pilot windows into five comparable 32-table runs.                                   |
+| [Single-table throughput campaign](THROUGHPUT-CAMPAIGN.md) | C1-C8 manifests, stability and stop gates, campaign verdict policy, and SVG result pictures. |
 
 The viewer's six numbered stack parts match the diagram badges. Their numbers appear beside every OAT JSON field and Parquet result column that they affect. Preserve these IDs and titles when updating the diagram, configuration reference, or heatmap.
+
+## Capacity qualification
+
+PR #125's final qualification supports only **16 workers x 1 stream**. It does not qualify 8x16 or extreme 16x16; treat both as unproven sweep candidates, not capacity recommendations.
 
 ## Parquet contract
 
