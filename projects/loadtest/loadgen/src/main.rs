@@ -59,6 +59,7 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::InitializeAzure(arguments) => arrowcol_loadgen::initialize::initialize(arguments).await,
         Command::AzureManifest(arguments) => arrowcol_loadgen::initialize::write_manifest(arguments).await,
+        Command::InitializeLocal(arguments) => arrowcol_loadgen::initialize::initialize_local(arguments),
         Command::PrintSchemas => {
             print!("{}", arrowcol_loadgen::schema::schema_ddl());
             Ok(())
