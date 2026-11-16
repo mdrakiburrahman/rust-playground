@@ -132,6 +132,8 @@ pub struct Settings {
     pub interval: Option<Duration>,
     pub max_idle_backoff: Duration,
     pub max_cycles: Option<u64>,
+    /// Consecutive typed stale plans per table/operation before scheduled health fails.
+    pub max_consecutive_stale_plans: u32,
     pub max_concurrent_tables: usize,
     /// Optional aggregate budget for per-bin decoded-byte limits, not an RSS cap.
     pub max_concurrent_decoded_bytes: Option<u64>,
@@ -190,6 +192,9 @@ impl Settings {
         }
         if self.checkpoint_every_commits == 0 {
             bail!("--checkpoint-every-commits must be nonzero");
+        }
+        if !(1..=1024).contains(&self.max_consecutive_stale_plans) {
+            bail!("--max-consecutive-stale-plans must be within 1..=1024");
         }
         if self.max_prune_files == 0 {
             bail!("--max-prune-files must be nonzero");
@@ -869,6 +874,7 @@ fn configuration_evidence(startup: &Settings, settings: &Settings, props: &Resol
             "interval_secs": startup.interval.map(|value| value.as_secs()),
             "max_idle_backoff_secs": startup.max_idle_backoff.as_secs(),
             "max_cycles": startup.max_cycles,
+            "max_consecutive_stale_plans": startup.max_consecutive_stale_plans,
             "max_concurrent_tables": startup.max_concurrent_tables,
             "max_concurrent_decoded_bytes": startup.max_concurrent_decoded_bytes,
             "commit_attempts": startup.commit_attempts,
@@ -890,6 +896,7 @@ fn configuration_evidence(startup: &Settings, settings: &Settings, props: &Resol
         },
         "active": enabled,
         "operation_settings": enabled.then(|| serde_json::json!({
+            "max_consecutive_stale_plans": settings.max_consecutive_stale_plans,
             "layout_mode": layout_mode,
             "vacuum_retention_ms": settings.vacuum_retention_ms,
             "log_retention_ms": settings.log_retention_ms,
@@ -1116,6 +1123,12 @@ impl Metrics {
         self.1
             .runs
             .add(1, &[op.clone(), opentelemetry::KeyValue::new("outcome", outcome)]);
+        let stale_plan = result.error_kind == Some(MaintenanceErrorKind::StalePlan.label());
+        if stale_plan {
+            self.1
+                .totals
+                .add(1, &[op.clone(), opentelemetry::KeyValue::new("outcome", "stale_plans")]);
+        }
         if result.negative_probe {
             self.1.totals.add(
                 1,
@@ -1141,6 +1154,9 @@ impl Metrics {
         }
         self.with(|counters| {
             *counters.runs.entry((operation, outcome)).or_default() += 1;
+            if stale_plan {
+                *counters.totals.entry((operation, "stale_plans")).or_default() += 1;
+            }
             if result.negative_probe {
                 *counters.totals.entry((operation, "negative_probes")).or_default() += 1;
             }
@@ -1894,6 +1910,7 @@ fn maintain_table(
                             .unwrap_or(arrow_deltalake::maintenance::DEFAULT_LOG_RETENTION_MS),
                         checkpoint_interval: effective.checkpoint_every_commits,
                         optimize_small_file_bytes: effective.optimize.small_file_bytes,
+                        optimize_target_file_bytes: effective.optimize.target_file_bytes,
                         optimize_min_files: usize::try_from(props.unsigned("arrowcol.optimize.minFiles")?)?,
                         sealed_partitions_only: !effective.optimize.sealed_final,
                         max_listed_files: usize::try_from(props.unsigned("arrowcol.vacuum.maxListedFiles")?)?,
@@ -2118,7 +2135,7 @@ fn cycle_with_discovery(
 }
 
 /// Run once or on a schedule with idle exponential backoff until cancelled.
-/// Returns `false` if any operation failed.
+/// Returns `false` for non-retryable failures or bounded stale-plan starvation.
 #[must_use]
 pub fn run(settings: &Settings, metrics: &Metrics, cancel: &Arc<AtomicBool>) -> bool {
     let source = FilesystemDiscovery::new(settings.root.clone(), settings.tables.clone()).with_log_limits(
@@ -2128,11 +2145,35 @@ pub fn run(settings: &Settings, metrics: &Metrics, cancel: &Arc<AtomicBool>) -> 
     run_with_discovery(settings, &source, metrics, cancel)
 }
 
-fn cycle_results_are_healthy(results: &[OperationResult], signal_cancellation_requested: bool) -> bool {
-    results.iter().all(|result| {
-        result.error_kind.is_none()
-            || (signal_cancellation_requested && result.error_kind == Some(MaintenanceErrorKind::Cancelled.label()))
-    })
+fn cycle_results_are_healthy(
+    results: &[OperationResult],
+    signal_cancellation_requested: bool,
+    stale_plans: &mut BTreeMap<(String, &'static str), u32>,
+    stale_plan_limit: u32,
+) -> bool {
+    let mut healthy = true;
+    for result in results {
+        let key = (result.table.clone(), result.operation.label());
+        if result.error_kind.is_none() {
+            stale_plans.remove(&key);
+        } else if result.error_kind == Some(MaintenanceErrorKind::StalePlan.label()) {
+            let consecutive = stale_plans.entry(key).or_default();
+            *consecutive = consecutive.saturating_add(1);
+            if *consecutive >= stale_plan_limit {
+                healthy = false;
+                eprintln!(
+                    "delta-maintenance stale-plan starvation table={} operation={} consecutive={} limit={stale_plan_limit}",
+                    result.table,
+                    result.operation.label(),
+                    consecutive,
+                );
+            }
+        } else if !(signal_cancellation_requested && result.error_kind == Some(MaintenanceErrorKind::Cancelled.label()))
+        {
+            healthy = false;
+        }
+    }
+    healthy
 }
 
 /// Run the same bounded scheduler over catalog-client discovery.
@@ -2144,6 +2185,7 @@ pub fn run_with_discovery(
     cancel: &Arc<AtomicBool>,
 ) -> bool {
     let mut healthy = true;
+    let mut stale_plans = BTreeMap::new();
     let schedule = Mutex::new(BTreeMap::new());
     let mut delay = settings.interval;
     let mut cycles = 0_u64;
@@ -2162,7 +2204,16 @@ pub fn run_with_discovery(
             }
         };
         cycles += 1;
-        healthy &= cycle_results_are_healthy(&results, cancel.load(Ordering::SeqCst));
+        healthy &= cycle_results_are_healthy(
+            &results,
+            cancel.load(Ordering::SeqCst),
+            &mut stale_plans,
+            if settings.interval.is_some() {
+                settings.max_consecutive_stale_plans
+            } else {
+                1
+            },
+        );
         let pending_count = match discovery.pending_tables() {
             Ok(mut pending) => {
                 pending.sort();
@@ -2237,10 +2288,60 @@ mod signal_cancellation_tests {
     #[test]
     fn signal_cancellation_is_healthy_without_masking_operation_failures() {
         let cancelled = result_with_error_kind(Some(MaintenanceErrorKind::Cancelled.label()));
-        assert!(cycle_results_are_healthy(std::slice::from_ref(&cancelled), true));
-        assert!(!cycle_results_are_healthy(std::slice::from_ref(&cancelled), false));
+        let mut stale_plans = BTreeMap::new();
+        assert!(cycle_results_are_healthy(
+            std::slice::from_ref(&cancelled),
+            true,
+            &mut stale_plans,
+            8
+        ));
+        assert!(!cycle_results_are_healthy(
+            std::slice::from_ref(&cancelled),
+            false,
+            &mut stale_plans,
+            8
+        ));
 
         let failed = result_with_error_kind(Some("commit_budget_exhausted"));
-        assert!(!cycle_results_are_healthy(std::slice::from_ref(&failed), true));
+        assert!(!cycle_results_are_healthy(
+            std::slice::from_ref(&failed),
+            true,
+            &mut stale_plans,
+            8
+        ));
+    }
+
+    #[test]
+    fn typed_stale_plans_retry_without_hiding_per_operation_starvation() {
+        let stale = result_with_error_kind(Some(MaintenanceErrorKind::StalePlan.label()));
+        let success = result_with_error_kind(None);
+        let mut counts = BTreeMap::new();
+        let observe = |results: &[OperationResult], counts: &mut BTreeMap<_, _>| {
+            cycle_results_are_healthy(results, false, counts, 3)
+        };
+        assert!(observe(std::slice::from_ref(&stale), &mut counts));
+        assert!(observe(std::slice::from_ref(&success), &mut counts));
+        assert!(observe(std::slice::from_ref(&stale), &mut counts));
+        let mut other = success.clone();
+        other.operation = Operation::Vacuum;
+        assert!(observe(&[stale.clone(), other.clone()], &mut counts));
+        assert!(observe(&[], &mut counts));
+        assert!(!observe(&[stale.clone(), other], &mut counts));
+        assert!(!cycle_results_are_healthy(
+            std::slice::from_ref(&stale),
+            false,
+            &mut BTreeMap::new(),
+            1
+        ));
+        let mut untyped = result_with_error_kind(Some(MaintenanceErrorKind::ResourceLimit.label()));
+        untyped.error = Some("stale_plan: plain text is not a typed retry".into());
+        assert!(!observe(&[untyped], &mut counts));
+        let metrics = Metrics::new();
+        metrics.record(&stale);
+        assert!(
+            metrics
+                .render()
+                .contains("delta_maintenance_stale_plans_total{operation=\"optimize\"} 1")
+        );
     }
 }

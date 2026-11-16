@@ -1090,10 +1090,11 @@ impl DeltaTable {
                 let physical = Arc::clone(inventory.physical.as_ref().context("missing pass physical inventory")?);
                 match operation {
                     ProbeOperation::Optimize => {
-                        let mut groups: BTreeMap<String, usize> = BTreeMap::new();
+                        let mut groups: BTreeMap<String, (usize, bool)> = BTreeMap::new();
                         for (relative, meta) in physical.iter() {
                             let partition = relative.rsplit_once('/').map_or("", |(parent, _)| parent).to_owned();
-                            let count = groups.entry(partition).or_default();
+                            let (count, sub_target) = groups.entry(partition).or_default();
+                            *sub_target |= meta.size < config.optimize_target_file_bytes;
                             if meta.size < config.optimize_small_file_bytes {
                                 *count += 1;
                             }
@@ -1102,17 +1103,26 @@ impl DeltaTable {
                         let ingestion = groups.keys().all(|partition| {
                             partition.starts_with("__arrowcol_ingestion=") && !partition.contains('/')
                         });
-                        for partition in groups.keys() {
+                        for (partition, (_, sub_target)) in &groups {
                             if let Some(value) = partition.strip_prefix("__arrowcol_ingestion=") {
                                 let Ok(value) = percent_decode(value) else {
                                     return Ok(None);
                                 };
-                                if config.granularity.parse_partition(&value).is_err() {
+                                let Ok(start) = config.granularity.parse_partition(&value) else {
+                                    return Ok(None);
+                                };
+                                if config.sealed_partitions_only
+                                    && ingestion
+                                    && *sub_target
+                                    && (Some(partition) == newest
+                                        || start.saturating_add(config.granularity.width_ms()) > config.now_ms)
+                                {
+                                    // Physical files may already be inactive; measure protected debt from the snapshot.
                                     return Ok(None);
                                 }
                             }
                         }
-                        !groups.iter().any(|(partition, count)| {
+                        !groups.iter().any(|(partition, (count, _))| {
                             *count >= config.optimize_min_files
                                 && (!config.sealed_partitions_only || !ingestion || Some(partition) != newest)
                         })
@@ -1234,6 +1244,7 @@ impl DeltaTable {
                 backlog_files: 0,
                 backlog_bytes: 0,
                 oldest_eligible_partition_start_ms: None,
+                protected_partition_backlog: Some(ProtectedPartitionBacklog::default()),
             }),
             maintenance_due_work,
             ..MaintenanceReport::default()
@@ -1404,6 +1415,7 @@ pub struct NegativeProbeConfig {
     pub log_retention_ms: i64,
     pub checkpoint_interval: u64,
     pub optimize_small_file_bytes: u64,
+    pub optimize_target_file_bytes: u64,
     pub optimize_min_files: usize,
     pub sealed_partitions_only: bool,
     pub max_listed_files: usize,
@@ -1576,6 +1588,18 @@ pub struct CompactionDebtEvidence {
     pub backlog_bytes: u64,
     /// Oldest eligible ingestion-partition start; unavailable for other layouts.
     pub oldest_eligible_partition_start_ms: Option<i64>,
+    /// Sub-target inputs excluded by newest/open ingestion-partition churn protection.
+    /// Missing on older producers; never infer a measured zero from absence.
+    pub protected_partition_backlog: Option<ProtectedPartitionBacklog>,
+}
+
+/// Bounded active-file observation, separate from actionable OPTIMIZE debt.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProtectedPartitionBacklog {
+    pub files: u64,
+    pub bytes: u64,
+    /// UTC Unix milliseconds; absent only when no protected sub-target files exist.
+    pub oldest_partition_start_ms: Option<i64>,
 }
 
 /// Source of a bounded maintenance due-work observation.
@@ -2515,6 +2539,7 @@ impl DeltaTable {
         }
         let mut skipped = 0_u64;
         let mut protected = 0_u64;
+        let mut protected_partition_backlog = ProtectedPartitionBacklog::default();
         let mut ordered: Vec<(Vec<Option<String>>, Vec<&DataFile>)> = Vec::new();
         if let (true, Some(granularity)) = (ingestion, granularity) {
             let now = observed_at_ms;
@@ -2534,6 +2559,23 @@ impl DeltaTable {
             for (index, (start, key, files)) in valid.into_iter().enumerate() {
                 if !config.sealed_final && (index == 0 || start.saturating_add(granularity.width_ms()) > now) {
                     protected += 1;
+                    for file in files.iter().filter(|file| file.size < config.target_file_bytes) {
+                        protected_partition_backlog.files =
+                            protected_partition_backlog.files.checked_add(1).ok_or_else(|| {
+                                fail(MaintenanceErrorKind::ResourceLimit, "protected file count overflow")
+                            })?;
+                        protected_partition_backlog.bytes = protected_partition_backlog
+                            .bytes
+                            .checked_add(file.size)
+                            .ok_or_else(|| {
+                                fail(MaintenanceErrorKind::ResourceLimit, "protected byte count overflow")
+                            })?;
+                        protected_partition_backlog.oldest_partition_start_ms = Some(
+                            protected_partition_backlog
+                                .oldest_partition_start_ms
+                                .map_or(start, |oldest| oldest.min(start)),
+                        );
+                    }
                 } else {
                     ordered.push((key, files));
                 }
@@ -2618,6 +2660,7 @@ impl DeltaTable {
                 backlog_files: 0,
                 backlog_bytes: 0,
                 oldest_eligible_partition_start_ms,
+                protected_partition_backlog: Some(protected_partition_backlog),
             },
             backlog_files: backlog,
             protected_partitions: protected,

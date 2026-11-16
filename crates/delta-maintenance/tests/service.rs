@@ -89,7 +89,7 @@ fn service(root: &Path) -> Result<Command> {
 }
 
 #[test]
-fn effective_configuration_is_reported_for_a_negative_probe() -> Result<()> {
+fn effective_configuration_is_reported_with_protected_partition_debt() -> Result<()> {
     let root = tempfile::tempdir()?;
     table(&root.path().join("events"))?;
     let output = service(root.path())?
@@ -99,7 +99,12 @@ fn effective_configuration_is_reported_for_a_negative_probe() -> Result<()> {
         .args(["--operation", "optimize", "--min-files", "3"])
         .output()?;
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-    assert_eq!(lines(&output.stdout)?[0]["negative_probe"], true);
+    let results = lines(&output.stdout)?;
+    assert_eq!(results[0]["negative_probe"], false);
+    assert_eq!(
+        results[0]["report"]["compaction_debt"]["protected_partition_backlog"]["files"],
+        2
+    );
     let stderr = std::str::from_utf8(&output.stderr)?;
     let event = |prefix: &str| -> Result<serde_json::Value> {
         let json = stderr
