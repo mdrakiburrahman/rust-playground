@@ -13025,7 +13025,7 @@ mod tests {
         assert_eq!(outcomes[0]["maintenance_operation_failure"], false);
         assert_eq!(
             outcomes[0]["maintenance_exit_classification"],
-            "classified_retries_only"
+            "nonzero_health_exit"
         );
         assert_eq!(outcomes[0]["exit_code"], 1);
         assert!(!serde_json::to_string(&outcomes)?.contains("private"));

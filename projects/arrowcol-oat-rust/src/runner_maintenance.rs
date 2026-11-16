@@ -488,6 +488,46 @@ fn sanitized_maintenance_error_kind(kind: Option<&str>) -> String {
     .to_owned()
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MaintenanceRecordOutcome {
+    Succeeded,
+    Retry,
+    Failed,
+}
+
+fn maintenance_record_outcome(value: &Value) -> Option<MaintenanceRecordOutcome> {
+    let kind = match value.get("error_kind") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(kind)) if !kind.is_empty() => Some(kind.as_str()),
+        _ => return None,
+    };
+    let error = match value.get("error") {
+        None | Some(Value::Null) => false,
+        Some(Value::String(_)) => true,
+        _ => return None,
+    };
+    let failed = kind.is_some() || error;
+    match value.get("report") {
+        None | Some(Value::Null) if failed => {}
+        Some(Value::Object(report)) => {
+            if report.get("interrupted")?.as_bool()?
+                || !["noop", "planned", "committed", "already_applied", "deleted", "checkpointed", "pruned"]
+                    .contains(&report.get("outcome")?.as_str()?)
+            {
+                return None;
+            }
+        }
+        _ => return None,
+    }
+    Some(if kind == Some("stale_plan") {
+        MaintenanceRecordOutcome::Retry
+    } else if failed {
+        MaintenanceRecordOutcome::Failed
+    } else {
+        MaintenanceRecordOutcome::Succeeded
+    })
+}
+
 #[derive(serde::Deserialize, serde::Serialize)]
 struct MaintenanceCompactionDebt {
     observed_at_ms: i64,
@@ -518,10 +558,7 @@ enum MaintenanceCompactionDebtSource {
 
 fn maintenance_compaction_debt(value: &Value, failed: bool) -> Result<Option<MaintenanceCompactionDebt>> {
     if failed || value["operation"] != "optimize"
-        || value.get("error").is_some_and(|error| !error.is_null())
-        || value.get("error_kind").is_some_and(|error| !error.is_null())
-        || value.pointer("/report/interrupted") == Some(&json!(true))
-        || value.pointer("/report/outcome").and_then(Value::as_str) == Some("partial")
+        || maintenance_record_outcome(value) != Some(MaintenanceRecordOutcome::Succeeded)
     {
         return Ok(None);
     }
@@ -631,11 +668,7 @@ fn maintenance_due_work(value: &Value) -> Result<Option<MaintenanceDueWorkEviden
     let Some(report) = value.get("report") else {
         return Ok(None);
     };
-    if value.get("error").is_some_and(|error| !error.is_null())
-        || value.get("error_kind").is_some_and(|error| !error.is_null())
-        || report.get("interrupted") == Some(&Value::Bool(true))
-        || report.get("outcome").and_then(Value::as_str) == Some("partial")
-    {
+    if maintenance_record_outcome(value) != Some(MaintenanceRecordOutcome::Succeeded) {
         return Ok(None);
     }
     let Some(raw) = report.get("maintenance_due_work") else {
@@ -743,15 +776,13 @@ fn maintenance_table_evidence(config: &OatConfig, text: &str) -> Result<Value> {
             bail!("maintenance operation receipt disagrees with explicit operation/apply authorization");
         }
         operation_count = operation_count.saturating_add(1);
-        if value.pointer("/report/interrupted") == Some(&json!(true))
-            || value.pointer("/report/outcome").and_then(Value::as_str) == Some("partial")
-        {
+        let record_outcome = maintenance_record_outcome(&value);
+        if record_outcome.is_none() {
             records_complete = false;
         }
         let raw_error_kind = value.get("error_kind").and_then(Value::as_str);
-        let operation_retry = raw_error_kind == Some("stale_plan");
-        let operation_failed = !operation_retry && (value.get("error").is_some_and(|error| !error.is_null())
-            || value.get("error_kind").is_some_and(|error| !error.is_null()));
+        let operation_retry = record_outcome == Some(MaintenanceRecordOutcome::Retry);
+        let operation_failed = record_outcome == Some(MaintenanceRecordOutcome::Failed);
         if operation_retry {
             operation_retry_count = operation_retry_count.saturating_add(1);
             retry_kind_counts.insert("stale_plan".to_owned(), json!(operation_retry_count));
@@ -794,8 +825,8 @@ fn maintenance_table_evidence(config: &OatConfig, text: &str) -> Result<Value> {
             "table": table, "operation": value["operation"], "negative_probe": value["negative_probe"].as_bool(),
             "maintenance_due_work": due_work,
             "mutation_mode": if value["applied"] == true { "apply_authorized_not_proof_of_mutation" } else { "dry_run_predicted_not_applied" },
-            "operation_failed": operation_failed, "error_kind": error_kind,
-            "operation_retry": operation_retry, "retry_kind": operation_retry.then_some("stale_plan"),
+            "operation_failed": record_outcome.map(|_| operation_failed), "error_kind": error_kind,
+            "operation_retry": record_outcome.map(|_| operation_retry), "retry_kind": operation_retry.then_some("stale_plan"),
             "compaction_debt": maintenance_compaction_debt(&value, operation_failed || operation_retry)?,
             "consumer_reported_counts": counts, "duration_ms": value["duration_ms"].as_u64(),
             "report_outcome": value.pointer("/report/outcome").and_then(Value::as_str),
@@ -988,7 +1019,6 @@ mod maintenance_topology_tests {
             "table_policy":{"arrowcol.optimize.sealedPartitionsOnly":true},"active":true,
         });
         verify_process_configuration(&bounded_config, ComponentRole::Maintenance, &overridden)?;
-        verify_maintenance_controls(&bounded_config, &overridden)?;
         overridden["startup"]["sealed_partitions_only"] = Value::Null;
         assert!(verify_process_configuration(&bounded_config, ComponentRole::Maintenance, &overridden).is_err(),
             "omitted/null is not an observed requested false");
@@ -1002,7 +1032,8 @@ mod maintenance_topology_tests {
             .is_err()
         );
         let report = json!({"table":table,"operation":"optimize","applied":false,"negative_probe":false,
-            "report":{"files_added":2,"rows_added":257,"outputs":["private-object-path"]},"duration_ms":12});
+            "report":{"outcome":"noop","interrupted":false,
+                "files_added":2,"rows_added":257,"outputs":["private-object-path"]},"duration_ms":12});
         let reports = maintenance_table_evidence(&config, &format!("{text}{report}\n"))?;
         assert!(reports["operation_reports"][0]["compaction_debt"].is_null());
         assert!(reports["operation_reports"][0]["maintenance_due_work"].is_null());

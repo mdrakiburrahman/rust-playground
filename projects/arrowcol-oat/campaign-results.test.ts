@@ -638,7 +638,7 @@ test('preserves retries without failures but refuses missing records or growing 
   assert.equal(maintenanceDueWorkIssue(evidence.processes, maintenanceConfig(run), 1_000_000, 1_150_000), undefined);
   evidence.backlog = syntheticBacklog();
   evidence.shutdown_drain.maintenance[0] = {
-    exit_code: 1, exit_classification: 'classified_retries_only', outcomes: process.maintenance_operation_outcomes,
+    exit_code: 0, exit_classification: 'no_operation_failures', outcomes: process.maintenance_operation_outcomes,
   };
   const result = () => ({
     cohort: 'C1', candidate: 'snappy', factorX: 'codec', valueX: 'snappy', factorY: 'level', valueY: '3',
@@ -647,8 +647,11 @@ test('preserves retries without failures but refuses missing records or growing 
     officialRuns: [{ ...run, rows: [{ ...run.rows[0]!, evidence_json: JSON.stringify(evidence) }] }],
   });
   assert.match(renderCampaignResults([result()], 'C1'), /1\/3 protocol-complete repeats/);
-  evidence.shutdown_drain.maintenance[0].exit_classification = 'unknown';
-  assert.match(renderCampaignResults([result()], 'C1'), /maintenance shutdown exit has no proved classified cause/);
+  for (const classification of ['classified_retries_only', 'nonzero_health_exit', 'unhealthy', 'no_operation_failures']) {
+    evidence.shutdown_drain.maintenance[0].exit_code = 1;
+    evidence.shutdown_drain.maintenance[0].exit_classification = classification;
+    assert.match(renderCampaignResults([result()], 'C1'), /maintenance shutdown exit has no proved classified cause/);
+  }
   process.maintenance_operation_outcomes.operation_failure = null;
   assert.match(maintenanceDueWorkIssue(evidence.processes, maintenanceConfig(run), 1_000_000, 1_150_000)!, /records are unavailable/);
   process.maintenance_operation_outcomes.operation_failure = false;

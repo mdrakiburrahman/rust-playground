@@ -531,9 +531,8 @@ function maintenanceShutdownIssue(value: unknown): string | undefined {
   if (!isRecord(process)) return 'maintenance shutdown outcome is unknown';
   const issue = maintenanceCellOutcomeIssue(process.outcomes);
   if (issue) return issue;
-  if (!['no_operation_failures', 'classified_retries_only'].includes(String(process.exit_classification)) ||
-      nonNegativeInteger(process.exit_code) === undefined || ![0, 1, 143].includes(Number(process.exit_code)) ||
-      process.exit_code === 1 && process.exit_classification !== 'classified_retries_only') {
+  if (process.exit_classification !== 'no_operation_failures' ||
+      nonNegativeInteger(process.exit_code) === undefined || ![0, 143].includes(Number(process.exit_code))) {
     return 'maintenance shutdown exit has no proved classified cause';
   }
   return undefined;

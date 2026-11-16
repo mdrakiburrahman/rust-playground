@@ -40,7 +40,7 @@ if (tool === 'docker') {
           const retry = cycle >= 1 && cycle <= 5;
           console.log(JSON.stringify({ table: 't', operation, applied: true,
             error_kind: retry ? 'stale_plan' : null, error: retry ? 'private replan message' : null,
-            report: retry ? null : { outcome: 'noop' } }));
+            report: retry ? null : { outcome: 'noop', interrupted: false } }));
         }
       }
       process.exit(0);
