@@ -219,6 +219,10 @@ for (const restart of [false, true]) test(`fenced QAP cleanup ${restart ? 'recov
   await assert.rejects(cleanup_oat_qap(f.azure, recordPath, stopPath, authority), /stale cleanup actor/);
   assert.equal(mutations, 0);
   fenced = false;
+  await assert.rejects(recover_oat_qap_record(f.azure, f.reference, path.join(f.directory, 'producer.json'),
+    { ...authority, mode: 'producer' }), /requires current controller authority/);
+  assert.equal(fs.existsSync(path.join(f.directory, 'producer.json')), false);
+  assert.equal(mutations, 0);
   if (restart) {
     const blob = f.azure.blob.bind(f.azure);
     let crash = true;
@@ -233,6 +237,8 @@ for (const restart of [false, true]) test(`fenced QAP cleanup ${restart ? 'recov
     assert.equal(shared.custody.intent, null);
     assert.equal(shared.custody.entries[0].state, 'dropped');
     const resumedPath = path.join(f.directory, 'another-host.json');
+    await assert.rejects(recover_oat_qap_record(f.azure, f.reference, resumedPath,
+      { ...authority, mode: 'producer' }), /mutation outcome is unresolved/);
     await assert.rejects(recover_oat_qap_record(f.azure, f.reference, resumedPath), /mutation outcome is unresolved/);
     await recover_oat_qap_record(f.azure, f.reference, resumedPath, authority);
     const invalid = structuredClone(shared.custody);

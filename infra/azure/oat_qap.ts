@@ -239,6 +239,7 @@ function privateJson(filename: string): unknown {
   return parse(fs.readFileSync(filename), 'QAP private input');
 }
 export interface OatCleanupAuthority {
+  mode?: 'producer' | 'controller';
   assertCurrent(): Promise<void>;
 }
 function operations(azure: Azure, filename: string, stopPath?: string, authority?: OatCleanupAuthority): OatQapOperations {
@@ -327,14 +328,14 @@ function operations(azure: Azure, filename: string, stopPath?: string, authority
         const priorLease = object(prior.lease, 'Shared lease state');
         const acquire = object(priorLease.acquireReceipt, 'Prior acquisition receipt');
         const originalAcquire = object(priorLease.originalAcquire, 'Original acquisition response');
-        const heldRecovery = authority !== undefined && priorLease.stage === 'held';
+        const heldRecovery = authority !== undefined && authority.mode !== 'producer' && priorLease.stage === 'held';
         if (prior.schema_version !== 1 || canonical_json(prior.owner) !== canonical_json(record.rootMarker.value) ||
             (!heldRecovery && priorLease.stage !== 'released') || priorLease.run_id !== runId ||
             acquire[':status'] !== '201' || acquire['x-ms-lease-id'] !== priorLease.id ||
             originalAcquire.status !== 201 || typeof originalAcquire.bodyBase64 !== 'string' ||
             object(originalAcquire.headers, 'Original acquisition headers')['x-ms-lease-id'] !== priorLease.id ||
             !sharedHeaders.etag || record.intent !== null ||
-            !(['ready', 'cleaned'].includes(record.state) || (authority && resumableCleaning(record))) ||
+            !(['ready', 'cleaned'].includes(record.state) || (authority && authority.mode !== 'producer' && resumableCleaning(record))) ||
             canonical_json(prior.custody) !== canonical_json(record)) throw new Failure('Prior shared custody/history unresolved; no reservation overwrite.');
         canonicalRun(text(priorLease.id, 'Prior lease ID'));
         if (heldRecovery) {
@@ -804,9 +805,11 @@ async function sharedRecord(azure: Azure, reference: OatQapReference, authority?
   const record = parse_oat_qap_record(azure, shared.custody);
   if (shared.schema_version !== 1 || canonical_json(reference) !== canonical_json(referenceFor(azure, record)) ||
       canonical_json(shared.owner) !== canonical_json(record.rootMarker.value) || record.intent !== null ||
-      !(['ready', 'cleaned'].includes(record.state) || (authority && resumableCleaning(record))))
+      !(['ready', 'cleaned'].includes(record.state) || (authority && authority.mode !== 'producer' && resumableCleaning(record))))
     throw new Failure('QAP original ownership reference or mutation outcome is unresolved.');
   const lease = object(shared.lease, 'Shared QAP lease');
+  if (lease.stage === 'held' && authority?.mode === 'producer')
+    throw new Failure('Held QAP custody recovery requires current controller authority.');
   if (!['held', 'released'].includes(String(lease.stage)) || lease.run_id !== record.run_id)
     throw new Failure('QAP root lease operation remains unresolved.');
   canonicalRun(text(lease.id, 'QAP root lease ID'));
@@ -1018,7 +1021,7 @@ async function withRecord<T>(azure: Azure, filename: string, stopPath: string | 
   const guard = operations(azure, filename, stopPath, authority);
   return reset_lock(filename, async () => {
     const record = readRecord(azure, filename);
-    if (record.state === 'cleaning' && (!authority || !resumableCleaning(record)))
+    if (record.state === 'cleaning' && (!authority || authority.mode === 'producer' || !resumableCleaning(record)))
       throw new Failure('Cleaning continuation requires current controller authority and fully evidenced entries.');
     if (record.intent !== null) throw new Failure('Prior OAT mutation intent is unresolved; no automatic replay.');
     return guard.exclusive(record.run_id, async () => {
