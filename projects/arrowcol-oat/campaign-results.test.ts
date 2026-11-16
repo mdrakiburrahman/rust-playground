@@ -249,7 +249,7 @@ test('parses synthetic agreed backlog contract without treating it as qualificat
     officialRuns: [run],
   };
   const svg = renderCampaignResults([result], 'C1');
-  assert.match(svg, /backlog cross-language fixture check pending; sustained compaction debt and other maintenance due-work vectors remain unknown/);
+  assert.match(svg, /sustained compaction debt and other maintenance due-work vectors remain unknown/);
   assert.match(svg, /No qualified winner/);
   mutateMaintenanceReport(run, report => {
     const debt = report.compaction_debt as Record<string, unknown>;

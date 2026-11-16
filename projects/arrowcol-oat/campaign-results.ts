@@ -481,7 +481,7 @@ function inspectOfficialRun(run: OfficialRun): { windows?: OfficialWindow[]; rea
     reason: [
       ...(!compactionObserved ? ['timestamped in-window compaction-debt observation is unavailable or invalid'] : []),
       ...(backlogIssue ? [backlogIssue] : []),
-      'backlog cross-language fixture check pending; sustained compaction debt and other maintenance due-work vectors remain unknown',
+      'sustained compaction debt and other maintenance due-work vectors remain unknown',
     ].join('; '),
   };
 }
