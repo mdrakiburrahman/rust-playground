@@ -11,7 +11,7 @@ use opentelemetry::{KeyValue, global};
 use arrowcol_catalog::SchemaVersion;
 use arrowcol_protocol::{
     BasisPoints, Capability, CollectorInstanceId, ImplementationPool, Measurement, PositiveMeasurement, PressureGauge,
-    ProtocolVersion, TableIdentity, UnixMillis,
+    ProtocolVersion, PublicationId, TableIdentity, UnixMillis,
 };
 use arrowcol_routing::{RichPressureSnapshot, RoutingStore, SubsystemState, TablePressure};
 use arrowcol_tunables::CpuPressureMode;
@@ -683,6 +683,180 @@ fn effective_cpu_cores() -> Result<f64, String> {
         .map_err(|error| format!("read available CPU parallelism: {error}"))
 }
 
+/// Queue-admitted publications that have not yet confirmed a durable commit.
+///
+/// Unknown accounting is sticky for this process lifetime. Missing values are
+/// never interchangeable with an empty, fully observed publication cohort.
+#[derive(Clone, Debug)]
+pub struct PublicationBacklogSnapshot {
+    pub available: bool,
+    pub publications: Option<u64>,
+    pub rows: Option<u64>,
+    pub logical_bytes: Option<u64>,
+    pub oldest_age: Option<Duration>,
+    pub unknown_reason: Option<&'static str>,
+}
+
+impl PublicationBacklogSnapshot {
+    fn write(&self, output: &mut String) {
+        output.push_str(
+            "# HELP arrowcol_publication_backlog_available Complete queue-admission-to-durable-commit accounting is available.\n\
+             # TYPE arrowcol_publication_backlog_available gauge\n",
+        );
+        let _ = writeln!(
+            output,
+            "arrowcol_publication_backlog_available {}",
+            u8::from(self.available)
+        );
+        for (name, help, value) in [
+            (
+                "publications",
+                "Distinct admitted publications without confirmed durable success.",
+                self.publications.map(|value| value.to_string()),
+            ),
+            (
+                "rows",
+                "Rows in the publication backlog.",
+                self.rows.map(|value| value.to_string()),
+            ),
+            (
+                "bytes",
+                "Logical input Arrow bytes in the publication backlog, not physical Parquet bytes.",
+                self.logical_bytes.map(|value| value.to_string()),
+            ),
+            (
+                "oldest_age_seconds",
+                "Monotonic age since the oldest publication first entered its TableOwner queue.",
+                self.oldest_age.map(|value| value.as_secs_f64().to_string()),
+            ),
+        ] {
+            let _ = writeln!(output, "# HELP arrowcol_publication_backlog_{name} {help}");
+            let _ = writeln!(output, "# TYPE arrowcol_publication_backlog_{name} gauge");
+            let _ = writeln!(
+                output,
+                "arrowcol_publication_backlog_{name} {}",
+                value.as_deref().unwrap_or("NaN")
+            );
+        }
+        output.push_str("# TYPE arrowcol_publication_backlog_status gauge\n");
+        let _ = writeln!(
+            output,
+            "arrowcol_publication_backlog_status{{status=\"{}\"}} 1",
+            self.unknown_reason.unwrap_or("available")
+        );
+    }
+}
+
+struct PublicationBacklogEntry {
+    rows: u64,
+    logical_bytes: u64,
+    accepted_at: Instant,
+}
+
+#[derive(Default)]
+struct PublicationBacklog {
+    max_publications: Option<u32>,
+    entries: HashMap<PublicationId, PublicationBacklogEntry>,
+    rows: u64,
+    logical_bytes: u64,
+    unknown_reason: Option<&'static str>,
+}
+
+impl PublicationBacklog {
+    fn fail(&mut self, reason: &'static str) -> String {
+        let reason = *self.unknown_reason.get_or_insert(reason);
+        format!("publication backlog accounting unavailable: {reason}")
+    }
+
+    fn configure(&mut self, max_publications: u32) -> Result<(), String> {
+        if max_publications == 0 {
+            return Err(self.fail("invalid_bound"));
+        }
+        if self
+            .max_publications
+            .is_some_and(|existing| existing != max_publications)
+        {
+            return Err(self.fail("conflicting_bound"));
+        }
+        if let Some(reason) = self.unknown_reason {
+            return Err(self.fail(reason));
+        }
+        self.max_publications = Some(max_publications);
+        Ok(())
+    }
+
+    fn start(&mut self, id: PublicationId, rows: u64, logical_bytes: u64, accepted_at: Instant) -> Result<(), String> {
+        if let Some(reason) = self.unknown_reason {
+            return Err(self.fail(reason));
+        }
+        let Some(max_publications) = self.max_publications else {
+            return Err(self.fail("unconfigured"));
+        };
+        if accepted_at > Instant::now() {
+            return Err(self.fail("invalid_clock"));
+        }
+        if let Some(entry) = self.entries.get(&id) {
+            return if entry.rows == rows && entry.logical_bytes == logical_bytes {
+                Ok(())
+            } else {
+                Err(self.fail("replay_mismatch"))
+            };
+        }
+        if self.entries.len() >= max_publications as usize {
+            return Err(self.fail("capacity_exceeded"));
+        }
+        let Some(total_rows) = self.rows.checked_add(rows) else {
+            return Err(self.fail("overflow"));
+        };
+        let Some(total_bytes) = self.logical_bytes.checked_add(logical_bytes) else {
+            return Err(self.fail("overflow"));
+        };
+        self.entries.insert(
+            id,
+            PublicationBacklogEntry {
+                rows,
+                logical_bytes,
+                accepted_at,
+            },
+        );
+        self.rows = total_rows;
+        self.logical_bytes = total_bytes;
+        Ok(())
+    }
+
+    fn commit(&mut self, id: PublicationId) -> Result<(), String> {
+        let Some(entry) = self.entries.remove(&id) else {
+            return Err(self.fail("unknown_commit"));
+        };
+        self.rows -= entry.rows;
+        self.logical_bytes -= entry.logical_bytes;
+        if let Some(reason) = self.unknown_reason {
+            return Err(self.fail(reason));
+        }
+        Ok(())
+    }
+
+    fn snapshot(&mut self, now: Instant) -> PublicationBacklogSnapshot {
+        let oldest = self.entries.values().map(|entry| entry.accepted_at).min();
+        let age = oldest.map_or(Some(Duration::ZERO), |accepted| now.checked_duration_since(accepted));
+        if age.is_none() {
+            self.fail("invalid_clock");
+        }
+        let unknown_reason = self
+            .unknown_reason
+            .or_else(|| self.max_publications.is_none().then_some("unconfigured"));
+        let available = unknown_reason.is_none();
+        PublicationBacklogSnapshot {
+            available,
+            publications: available.then_some(self.entries.len() as u64),
+            rows: available.then_some(self.rows),
+            logical_bytes: available.then_some(self.logical_bytes),
+            oldest_age: if available { age } else { None },
+            unknown_reason,
+        }
+    }
+}
+
 /// Atomic process-wide counters shared by receiver, exporter, admin, and registration.
 pub struct RuntimeMetrics {
     instance_id: CollectorInstanceId,
@@ -700,6 +874,7 @@ pub struct RuntimeMetrics {
     buffered_rows: AtomicU64,
     buffered_batches: AtomicU64,
     pending_commits: AtomicU64,
+    publication_backlog: Mutex<PublicationBacklog>,
     admitted_streams: AtomicU64,
     aborted_streams: AtomicU64,
     downstream_acks: AtomicU64,
@@ -751,6 +926,7 @@ impl RuntimeMetrics {
             buffered_rows: AtomicU64::new(0),
             buffered_batches: AtomicU64::new(0),
             pending_commits: AtomicU64::new(0),
+            publication_backlog: Mutex::new(PublicationBacklog::default()),
             admitted_streams: AtomicU64::new(0),
             aborted_streams: AtomicU64::new(0),
             downstream_acks: AtomicU64::new(0),
@@ -781,6 +957,67 @@ impl RuntimeMetrics {
             otel: CollectorOtelMetrics::new(),
             pressure_publication: tokio::sync::Mutex::new(None),
         }
+    }
+
+    fn publication_backlog(&self) -> std::sync::MutexGuard<'_, PublicationBacklog> {
+        self.publication_backlog.lock().unwrap_or_else(|poisoned| {
+            let mut tracker = poisoned.into_inner();
+            tracker.fail("tracker_poisoned");
+            tracker
+        })
+    }
+
+    /// Reuses the existing global admission batch capacity as the tracking bound.
+    ///
+    /// Call once during exporter setup; identical calls from other cores are
+    /// accepted. A zero or conflicting bound makes accounting explicitly unknown.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the bound is invalid, conflicts, or accounting was lost.
+    pub fn configure_publication_backlog(&self, max_publications: u32) -> Result<(), String> {
+        self.publication_backlog().configure(max_publications)
+    }
+
+    /// Records successful TableOwner queue admission, deduplicating active replays.
+    ///
+    /// Reserve the queue slot first, then call this and synchronously send using
+    /// that permit, without an intervening await. This prevents a worker from
+    /// committing before registration. Replays retain the first accepted Instant.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed for unconfigured, overflowing, mismatched, or out-of-bound
+    /// accounting. This does not reject data admission; report the error explicitly.
+    pub fn publication_started(
+        &self,
+        id: PublicationId,
+        rows: u64,
+        logical_bytes: u64,
+        accepted_at: Instant,
+    ) -> Result<(), String> {
+        self.publication_backlog().start(id, rows, logical_bytes, accepted_at)
+    }
+
+    /// Removes a publication only after confirmed durable success.
+    ///
+    /// # Errors
+    ///
+    /// An untracked ID, duplicate completion, or previous accounting loss returns
+    /// an error and leaves availability unknown. Errors never clear the cohort.
+    pub fn publication_committed(&self, id: PublicationId) -> Result<(), String> {
+        self.publication_backlog().commit(id)
+    }
+
+    /// Marks uncertain or lost publication outcomes unavailable until restart.
+    pub fn publication_mark_unknown(&self) {
+        self.publication_backlog().fail("unknown_outcome");
+    }
+
+    /// Samples publication counts and oldest monotonic age at the time of this call.
+    #[must_use]
+    pub fn publication_backlog_snapshot(&self) -> PublicationBacklogSnapshot {
+        self.publication_backlog().snapshot(Instant::now())
     }
 
     /// Records the receiver's stable instance key and delivery mode once per process.
@@ -1355,6 +1592,7 @@ impl RuntimeMetrics {
     #[must_use]
     pub fn prometheus(&self) -> String {
         let mut output = String::new();
+        self.publication_backlog_snapshot().write(&mut output);
         self.otel.record_pressure(
             self.buffered_rows.load(Ordering::Acquire),
             self.buffered_batches.load(Ordering::Acquire),
@@ -2030,6 +2268,164 @@ mod tests {
         assert!(second.try_acquire().is_err());
         assert!(metrics.stream_permits(3).is_err());
     }
+    #[test]
+    fn publication_backlog_replay_preserves_first_age_until_durable_success() {
+        let metrics = RuntimeMetrics::new(CollectorInstanceId::new());
+        metrics.configure_publication_backlog(2).expect("bound");
+        metrics.configure_publication_backlog(2).expect("same bound");
+        let first = PublicationId::new();
+        let second = PublicationId::new();
+        let now = Instant::now();
+        let accepted = now - Duration::from_secs(5);
+        metrics.publication_started(first, 3, 128, accepted).expect("first");
+        metrics.publication_started(first, 3, 128, now).expect("replay");
+        metrics.publication_started(second, 2, 64, now).expect("second");
+        let snapshot = metrics.publication_backlog().snapshot(now);
+        assert!(snapshot.available);
+        assert_eq!(
+            (snapshot.publications, snapshot.rows, snapshot.logical_bytes),
+            (Some(2), Some(5), Some(192))
+        );
+        assert_eq!(snapshot.oldest_age, Some(Duration::from_secs(5)));
+        assert_eq!(
+            metrics
+                .publication_backlog()
+                .snapshot(now + Duration::from_secs(4))
+                .oldest_age,
+            Some(Duration::from_secs(9))
+        );
+        metrics.publication_committed(first).expect("durable first");
+        assert_eq!(metrics.publication_backlog_snapshot().rows, Some(2));
+        metrics.publication_committed(second).expect("durable second");
+        let snapshot = metrics.publication_backlog_snapshot();
+        assert_eq!(
+            (snapshot.publications, snapshot.rows, snapshot.logical_bytes),
+            (Some(0), Some(0), Some(0))
+        );
+        assert_eq!(snapshot.oldest_age, Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn publication_backlog_unknown_is_sticky_and_never_scrapes_as_zero() {
+        let metrics = RuntimeMetrics::new(CollectorInstanceId::new());
+        assert!(!metrics.publication_backlog_snapshot().available);
+        let initial = metrics.prometheus();
+        assert!(initial.contains("arrowcol_publication_backlog_rows NaN\n"));
+        metrics.configure_publication_backlog(1).expect("bound");
+        let id = PublicationId::new();
+        metrics
+            .publication_started(id, 4, 256, Instant::now())
+            .expect("admitted");
+        metrics.publication_mark_unknown();
+        assert!(metrics.publication_committed(id).is_err());
+        assert!(metrics.configure_publication_backlog(1).is_err());
+        let snapshot = metrics.publication_backlog_snapshot();
+        assert!(!snapshot.available);
+        assert_eq!(
+            (
+                snapshot.publications,
+                snapshot.rows,
+                snapshot.logical_bytes,
+                snapshot.oldest_age
+            ),
+            (None, None, None, None)
+        );
+        let exposition = metrics.prometheus();
+        for suffix in ["publications", "rows", "bytes", "oldest_age_seconds"] {
+            assert!(exposition.contains(&format!("arrowcol_publication_backlog_{suffix} NaN\n")));
+        }
+        assert!(exposition.contains("arrowcol_publication_backlog_available 0\n"));
+        assert!(exposition.contains("arrowcol_publication_backlog_status{status=\"unknown_outcome\"} 1\n"));
+        assert!(!exposition.contains(&id.to_string()));
+    }
+
+    #[test]
+    fn publication_backlog_rejects_mismatches_overflow_and_unknown_commits() {
+        for (first_rows, first_bytes, next_rows, next_bytes, replay, reason) in [
+            (1, 8, 2, 8, true, "replay_mismatch"),
+            (1, 8, 1, 9, true, "replay_mismatch"),
+            (u64::MAX, 8, 1, 8, false, "overflow"),
+            (1, u64::MAX, 1, 1, false, "overflow"),
+        ] {
+            let metrics = RuntimeMetrics::new(CollectorInstanceId::new());
+            metrics.configure_publication_backlog(2).expect("bound");
+            let first = PublicationId::new();
+            metrics
+                .publication_started(first, first_rows, first_bytes, Instant::now())
+                .expect("first");
+            let next = if replay { first } else { PublicationId::new() };
+            assert!(
+                metrics
+                    .publication_started(next, next_rows, next_bytes, Instant::now())
+                    .is_err()
+            );
+            assert_eq!(metrics.publication_backlog_snapshot().unknown_reason, Some(reason));
+            assert_eq!(metrics.publication_backlog().entries.len(), 1);
+        }
+        let metrics = RuntimeMetrics::new(CollectorInstanceId::new());
+        metrics.configure_publication_backlog(1).expect("bound");
+        assert!(metrics.publication_committed(PublicationId::new()).is_err());
+        assert_eq!(
+            metrics.publication_backlog_snapshot().unknown_reason,
+            Some("unknown_commit")
+        );
+    }
+
+    #[test]
+    fn publication_backlog_enforces_existing_admission_bound_without_eviction() {
+        let metrics = RuntimeMetrics::new(CollectorInstanceId::new());
+        metrics.configure_publication_backlog(1).expect("bound");
+        metrics
+            .publication_started(PublicationId::new(), 2, 16, Instant::now())
+            .expect("first");
+        assert!(
+            metrics
+                .publication_started(PublicationId::new(), 3, 24, Instant::now())
+                .is_err()
+        );
+        let tracker = metrics.publication_backlog();
+        assert_eq!(tracker.entries.len(), 1);
+        assert_eq!((tracker.rows, tracker.logical_bytes), (2, 16));
+        drop(tracker);
+        assert_eq!(
+            metrics.publication_backlog_snapshot().unknown_reason,
+            Some("capacity_exceeded")
+        );
+
+        let metrics = RuntimeMetrics::new(CollectorInstanceId::new());
+        metrics.configure_publication_backlog(1).expect("bound");
+        assert!(metrics.configure_publication_backlog(2).is_err());
+        assert_eq!(
+            metrics.publication_backlog_snapshot().unknown_reason,
+            Some("conflicting_bound")
+        );
+    }
+
+    #[test]
+    fn publication_backlog_scrape_reports_admitted_cohort_not_dfe_ack_pressure() {
+        let metrics = RuntimeMetrics::new(CollectorInstanceId::new());
+        metrics.configure_publication_backlog(1).expect("bound");
+        let id = PublicationId::new();
+        metrics
+            .publication_started(id, 3, 128, Instant::now() - Duration::from_secs(2))
+            .expect("admitted");
+        let exposition = metrics.prometheus();
+        assert!(exposition.contains("arrowcol_publication_backlog_available 1\n"));
+        assert!(exposition.contains("arrowcol_publication_backlog_rows 3\n"));
+        assert!(exposition.contains("arrowcol_publication_backlog_bytes 128\n"));
+        assert!(exposition.contains("arrowcol_dfe_buffered_rows 0\n"));
+        let age = exposition
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("arrowcol_publication_backlog_oldest_age_seconds ")
+                    .map(|value| value.parse::<f64>().expect("age"))
+            })
+            .expect("age sample");
+        assert!(age >= 2.0);
+        metrics.publication_committed(id).expect("durable success");
+        assert!(metrics.prometheus().contains("arrowcol_publication_backlog_rows 0\n"));
+    }
+
     #[test]
     fn submission_wait_does_not_record_pipeline_execution() {
         let metrics = PipelineMetrics::new();
