@@ -545,6 +545,8 @@ mod io_tests {
         entered: tokio::sync::Notify,
         release: tokio::sync::Notify,
         nested: Option<Arc<NestedStagePut>>,
+        multipart_calls: std::sync::atomic::AtomicUsize,
+        fail_multipart: bool,
     }
 
     impl std::fmt::Display for PausedStagePut {
@@ -599,6 +601,13 @@ mod io_tests {
             path: &object_store::path::Path,
             options: object_store::PutMultipartOptions,
         ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.multipart_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail_multipart {
+                return Err(object_store::Error::Generic {
+                    store: "injected multipart failure",
+                    source: Box::new(std::io::Error::other("multipart unavailable")),
+                });
+            }
             self.inner.put_multipart_opts(path, options).await
         }
 
@@ -648,6 +657,58 @@ mod io_tests {
         ) -> object_store::Result<()> {
             self.inner.rename_opts(from, to, options).await
         }
+    }
+
+    #[tokio::test]
+    async fn staged_output_upload_streams_multipart_and_finishes_before_return() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let source = directory.path().join("completed.parquet");
+        let bytes = vec![0x5a; 32 * 1024];
+        fs::write(&source, &bytes)?;
+        let store = Arc::new(PausedStagePut::default());
+        let destination = object_store::path::Path::from("staged/output.parquet");
+
+        upload_staged_output(
+            Arc::<PausedStagePut>::clone(&store),
+            destination.clone(),
+            source,
+            bytes.len() as u64,
+            4 * 1024,
+            2,
+        )
+        .await?;
+
+        assert_eq!(store.multipart_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            store.inner.get(&destination).await?.bytes().await?.as_ref(),
+            bytes.as_slice()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn staged_output_upload_propagates_multipart_errors() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let source = directory.path().join("completed.parquet");
+        fs::write(&source, vec![0x5a; 32 * 1024])?;
+        let store = Arc::new(PausedStagePut {
+            fail_multipart: true,
+            ..PausedStagePut::default()
+        });
+        let error = upload_staged_output(
+            Arc::<PausedStagePut>::clone(&store),
+            object_store::path::Path::from("staged/failure.parquet"),
+            source,
+            32 * 1024,
+            4 * 1024,
+            2,
+        )
+        .await
+        .expect_err("multipart failure must reach the staging caller");
+
+        assert!(format!("{error:#}").contains("stream completed Parquet output to object store"));
+        assert_eq!(store.multipart_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        Ok(())
     }
 
     /// Scenario: staging awaits a real, paused object-store put from a current-thread runtime.
@@ -2511,10 +2572,7 @@ impl DeltaTable {
         Ok(url)
     }
 
-    fn prepare_upload(
-        &self,
-        file: &CompletedFile,
-    ) -> Result<Option<(object_store::path::Path, object_store::PutPayload)>> {
+    fn prepare_upload(&self, file: &CompletedFile) -> Result<Option<object_store::path::Path>> {
         if self.url.scheme() == "file" {
             self.sync_local_output(&file.path)?;
             return Ok(None);
@@ -2522,14 +2580,19 @@ impl DeltaTable {
         if file.bytes > 512 * 1024 * 1024 {
             bail!("staged file exceeds bounded upload size");
         }
+        let actual_bytes = fs::metadata(&file.path)?.len();
+        anyhow::ensure!(
+            actual_bytes == file.bytes,
+            "staged file size changed before upload: expected {}, found {actual_bytes}",
+            file.bytes
+        );
         let relative = file
             .path
             .strip_prefix(&self.root)?
             .to_str()
             .context("invalid staged path")?;
         let path = object_store::path::Path::from_url_path(self.staged_url(relative)?.path())?;
-        let bytes = fs::read(&file.path)?;
-        Ok(Some((path, bytes.into())))
+        Ok(Some(path))
     }
 
     /// Acquire exclusive local writer ownership, creating the directory if needed.
@@ -4113,6 +4176,45 @@ impl StagedAppend {
     }
 }
 
+async fn upload_staged_output(
+    store: Arc<dyn ObjectStore>,
+    destination: object_store::path::Path,
+    source_path: PathBuf,
+    expected_bytes: u64,
+    buffer_capacity: usize,
+    request_concurrency: usize,
+) -> Result<()> {
+    use tokio::io::AsyncWriteExt as _;
+
+    let mut source = tokio::fs::File::open(source_path)
+        .await
+        .context("open completed Parquet output for upload")?;
+    let mut writer = object_store::buffered::BufWriter::with_capacity(store, destination, buffer_capacity)
+        .with_max_concurrency(request_concurrency);
+    let copied = match tokio::io::copy(&mut source, &mut writer).await {
+        Ok(copied) => copied,
+        Err(error) => {
+            if let Err(abort_error) = writer.abort().await {
+                return Err(anyhow::anyhow!(
+                    "streaming Parquet upload failed: {error}; aborting multipart upload failed: {abort_error}"
+                ));
+            }
+            return Err(error).context("stream completed Parquet output to object store");
+        }
+    };
+    if copied != expected_bytes {
+        let error = anyhow::anyhow!("Parquet upload source changed: expected {expected_bytes} bytes, copied {copied}");
+        if let Err(abort_error) = writer.abort().await {
+            return Err(anyhow::anyhow!(
+                "{error:#}; aborting multipart upload failed: {abort_error}"
+            ));
+        }
+        return Err(error);
+    }
+    writer.shutdown().await.context("finish Parquet object-store upload")?;
+    Ok(())
+}
+
 impl DeltaFileWriter {
     /// Remove an unpublished, empty file after policy admission fails.
     ///
@@ -4309,12 +4411,25 @@ impl DeltaFileWriter {
             })
             .await
             .context("stage upload preparation worker failed")?;
-        if let Some((path, payload)) = prepared? {
+        if let Some(path) = prepared? {
             self.table.check_publication_async().await?;
+            let upload_buffer_capacity = runtime_config()?.upload_buffer_capacity_bytes;
+            let upload_request_concurrency = runtime_config()?.upload_request_concurrency;
             let table = Arc::clone(&self.table);
+            let store = Arc::clone(&table.store);
+            let source_path = file.path.clone();
+            let expected_bytes = file.bytes;
             spawn_shared_io(async move {
-                let _upload_slot = upload_slot;
-                table.store.put_opts(&path, payload, PutMode::Create.into()).await
+                let _upload_slot = upload_slot.context("remote staging has no upload admission slot")?;
+                upload_staged_output(
+                    store,
+                    path,
+                    source_path,
+                    expected_bytes,
+                    upload_buffer_capacity,
+                    upload_request_concurrency,
+                )
+                .await
             })
             .context("start stage upload task")?
             .await

@@ -10,6 +10,9 @@ use std::pin::Pin;
 use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
 use tokio::runtime::{EnterGuard, Runtime};
 
+const UPLOAD_BUFFER_MEMORY_BUDGET_BYTES: usize = 1024 * 1024 * 1024;
+const UPLOAD_COPY_BUFFER_BYTES: usize = 64 * 1024;
+
 /// Process-wide collector runtime settings, resolved once before starting workers.
 ///
 /// Each field is overridden by `ARROWCOL_COLLECTOR_<UPPERCASE_FIELD_NAME>`.
@@ -26,6 +29,10 @@ pub struct DeltaRuntimeConfig {
     pub blocking_workers: usize,
     /// Concurrent uploads: default 32 independent of CPU count; allowed 1..=256.
     pub upload_limit: usize,
+    /// Per-upload buffer and multipart chunk size: default 8 MiB; allowed 8..=64 MiB.
+    pub upload_buffer_capacity_bytes: usize,
+    /// In-flight multipart requests per upload: default 2; allowed 1..=16.
+    pub upload_request_concurrency: usize,
     /// Admitted Kernel tasks: default cores * 4, clamped to 64..=256; allowed 2..=1024.
     pub task_limit: usize,
     /// Kernel read-ahead batches: default cores, clamped to 8..=16; allowed 1..=128.
@@ -50,6 +57,8 @@ impl DeltaRuntimeConfig {
             runtime_workers: (cores / 4).clamp(2, 16),
             blocking_workers: cores.saturating_mul(2).clamp(32, 128),
             upload_limit: 32,
+            upload_buffer_capacity_bytes: 8 * 1024 * 1024,
+            upload_request_concurrency: 2,
             task_limit: cores.saturating_mul(4).clamp(64, 256),
             read_ahead: cores.clamp(8, 16),
             batch_rows: cores.saturating_mul(1024).clamp(4096, 32768),
@@ -75,6 +84,8 @@ impl DeltaRuntimeConfig {
             ("RUNTIME_WORKERS", &mut config.runtime_workers),
             ("BLOCKING_WORKERS", &mut config.blocking_workers),
             ("UPLOAD_LIMIT", &mut config.upload_limit),
+            ("UPLOAD_BUFFER_CAPACITY_BYTES", &mut config.upload_buffer_capacity_bytes),
+            ("UPLOAD_REQUEST_CONCURRENCY", &mut config.upload_request_concurrency),
             ("TASK_LIMIT", &mut config.task_limit),
             ("READ_AHEAD", &mut config.read_ahead),
             ("BATCH_ROWS", &mut config.batch_rows),
@@ -102,6 +113,13 @@ impl DeltaRuntimeConfig {
             ("RUNTIME_WORKERS", self.runtime_workers, 1, 64),
             ("BLOCKING_WORKERS", self.blocking_workers, 2, 256),
             ("UPLOAD_LIMIT", self.upload_limit, 1, 256),
+            (
+                "UPLOAD_BUFFER_CAPACITY_BYTES",
+                self.upload_buffer_capacity_bytes,
+                8 * 1024 * 1024,
+                64 * 1024 * 1024,
+            ),
+            ("UPLOAD_REQUEST_CONCURRENCY", self.upload_request_concurrency, 1, 16),
             ("TASK_LIMIT", self.task_limit, 2, 1024),
             ("READ_AHEAD", self.read_ahead, 1, 128),
             ("BATCH_ROWS", self.batch_rows, 1, 262_144),
@@ -112,6 +130,24 @@ impl DeltaRuntimeConfig {
                 "ARROWCOL_COLLECTOR_{name} must be in {min}..={max}, got {value}"
             );
         }
+        let in_flight = self
+            .upload_buffer_capacity_bytes
+            .checked_mul(
+                self.upload_request_concurrency
+                    .checked_add(1)
+                    .context("upload request concurrency overflow")?,
+            )
+            .and_then(|bytes| bytes.checked_add(UPLOAD_COPY_BUFFER_BYTES))
+            .context("upload buffering size overflow")?;
+        let total = self
+            .upload_limit
+            .checked_mul(in_flight)
+            .context("aggregate upload buffering size overflow")?;
+        anyhow::ensure!(
+            total <= UPLOAD_BUFFER_MEMORY_BUDGET_BYTES,
+            "aggregate upload buffering must not exceed {} bytes, got {total}",
+            UPLOAD_BUFFER_MEMORY_BUDGET_BYTES
+        );
         Ok(())
     }
 }
@@ -511,12 +547,14 @@ mod tests {
                 small.runtime_workers,
                 small.blocking_workers,
                 small.upload_limit,
+                small.upload_buffer_capacity_bytes,
+                small.upload_request_concurrency,
                 small.task_limit,
                 small.read_ahead,
                 small.cpu_workers,
                 small.batch_rows
             ),
-            (2, 32, 32, 64, 8, 1, 4096)
+            (2, 32, 32, 8 * 1024 * 1024, 2, 64, 8, 1, 4096)
         );
         let large = DeltaRuntimeConfig::for_cores(usize::MAX);
         assert_eq!(
@@ -524,12 +562,14 @@ mod tests {
                 large.runtime_workers,
                 large.blocking_workers,
                 large.upload_limit,
+                large.upload_buffer_capacity_bytes,
+                large.upload_request_concurrency,
                 large.task_limit,
                 large.read_ahead,
                 large.cpu_workers,
                 large.batch_rows
             ),
-            (16, 128, 32, 256, 16, 32, 32768)
+            (16, 128, 32, 8 * 1024 * 1024, 2, 256, 16, 32, 32768)
         );
         small.validate()?;
         large.validate()?;
@@ -545,6 +585,8 @@ mod tests {
             ("RUNTIME_WORKERS", 1, 64),
             ("BLOCKING_WORKERS", 2, 256),
             ("UPLOAD_LIMIT", 1, 256),
+            ("UPLOAD_BUFFER_CAPACITY_BYTES", 8 * 1024 * 1024, 64 * 1024 * 1024),
+            ("UPLOAD_REQUEST_CONCURRENCY", 1, 16),
             ("TASK_LIMIT", 2, 1024),
             ("READ_AHEAD", 1, 128),
             ("BATCH_ROWS", 1, 262_144),
@@ -572,6 +614,23 @@ mod tests {
                 assert!(format!("{error:#}").contains(&knob));
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn aggregate_upload_buffering_is_bounded() -> Result<()> {
+        let mut config = DeltaRuntimeConfig::for_cores(1);
+        config.upload_request_concurrency = 16;
+        config.upload_limit = 256;
+        let error = config
+            .validate()
+            .err()
+            .context("excessive aggregate upload buffering must fail")?;
+        assert!(format!("{error:#}").contains("aggregate upload buffering"));
+
+        config.upload_request_concurrency = 2;
+        config.upload_limit = 32;
+        config.validate()?;
         Ok(())
     }
 
