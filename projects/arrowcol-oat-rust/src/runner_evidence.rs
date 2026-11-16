@@ -1183,16 +1183,21 @@ mod downstream_runner_tests {
         ))?;
         config.platform.kind = kind;
         config.qap_timeout_seconds = if matches!(fault, Fault::InitTimeout) { 1 } else { 10 };
+        let run_id = uuid::Uuid::new_v4().to_string();
         let result = run_matrix_cell(
             &config,
             "orchestration",
-            "11111111-1111-4111-8111-111111111111",
+            &run_id,
             1,
             1,
             &mut platform,
         )
         .await;
         server.abort();
+        let results = Path::new("out/arrowcol-oat/qap").join(&run_id);
+        if results.exists() {
+            fs::remove_dir_all(&results)?;
+        }
         Ok((result?, platform))
     }
     #[tokio::test]
@@ -1203,7 +1208,7 @@ mod downstream_runner_tests {
             Fault::ObservationUnavailable,
         ] {
             let (rows, platform) = run_fault(fault, crate::config::OatMode::Local).await?;
-            assert_eq!(rows[0].status, "succeeded");
+            assert_eq!(rows[0].status, "succeeded", "failure: {:?}", rows[0].failure);
             assert_eq!(rows[0].rows, Some(100));
             assert!(rows[0].qap.completion_percent.is_none());
             let evidence: Value = serde_json::from_str(rows[0].evidence_json.as_deref().context("evidence")?)?;
@@ -1214,6 +1219,20 @@ mod downstream_runner_tests {
             let (rows, _) = run_fault(fault, crate::config::OatMode::Aks).await?;
             assert_eq!(rows[0].status, "failed");
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrent_downstream_fault_runs_keep_qap_artifacts_isolated() -> Result<()> {
+        let (unavailable, rejected) = tokio::join!(
+            run_fault(Fault::ObservationUnavailable, crate::config::OatMode::Local),
+            run_fault(Fault::ObservationBindingRejected, crate::config::OatMode::Local),
+        );
+        let (unavailable, _) = unavailable?;
+        let (rejected, _) = rejected?;
+        assert_ne!(unavailable[0].run_id, rejected[0].run_id);
+        assert_eq!(unavailable[0].status, "succeeded", "{:?}", unavailable[0].failure);
+        assert_eq!(rejected[0].status, "failed");
         Ok(())
     }
 
