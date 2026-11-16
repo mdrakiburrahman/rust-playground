@@ -141,6 +141,18 @@ impl Display for FileSizeEstimatorError {
 
 impl Error for FileSizeEstimatorError {}
 
+/// Reason the adaptive input target is reached.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum FlushTrigger {
+    /// The estimated input target for the configured Parquet output size.
+    TargetParquetBytes,
+    /// The estimated input target was clamped by the configured minimum.
+    MinInputBytes,
+    /// The estimated input target was clamped by the configured maximum.
+    MaxInputBytes,
+}
+
 /// A bounded EWMA of completed-file Parquet/input compression ratios.
 ///
 /// This type never retains a [`arrow::array::RecordBatch`]. The caller tracks
@@ -216,6 +228,22 @@ impl AdaptiveFileSizeEstimator {
     #[must_use]
     pub fn should_flush(&self, current_input_bytes: u64) -> bool {
         current_input_bytes >= self.input_bytes_target()
+    }
+
+    /// Identify which adaptive input threshold caused the caller to flush.
+    #[must_use]
+    pub fn flush_trigger(&self, current_input_bytes: u64) -> Option<FlushTrigger> {
+        if !self.should_flush(current_input_bytes) {
+            return None;
+        }
+        let desired = self.config.target_parquet_bytes as f64 / self.parquet_ratio;
+        Some(if desired >= self.config.max_input_bytes as f64 {
+            FlushTrigger::MaxInputBytes
+        } else if desired <= self.config.min_input_bytes as f64 {
+            FlushTrigger::MinInputBytes
+        } else {
+            FlushTrigger::TargetParquetBytes
+        })
     }
 
     /// Learn from one completed durable file and return the next input target.

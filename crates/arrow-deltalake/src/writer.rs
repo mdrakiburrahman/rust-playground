@@ -402,7 +402,45 @@ impl ParquetWriterConfig {
         } else {
             builder = builder.set_sorting_columns(None);
         }
-        let properties = builder.build();
+        let mut properties = builder.build();
+        if self
+            .columns
+            .values()
+            .any(|options| options.bloom_filter_enabled == Some(false))
+        {
+            let bloom_filters = leaves
+                .iter()
+                .map(|leaf| {
+                    let explicitly_disabled = self
+                        .columns
+                        .get(&leaf.path().string())
+                        .is_some_and(|options| options.bloom_filter_enabled == Some(false));
+                    if explicitly_disabled {
+                        None
+                    } else {
+                        properties.bloom_filter_properties(leaf.path()).cloned()
+                    }
+                })
+                .collect::<Vec<_>>();
+            let mut builder: WriterPropertiesBuilder = properties.into();
+            builder = builder.set_bloom_filter_enabled(false);
+            for (leaf, bloom) in leaves.iter().zip(bloom_filters) {
+                let path = leaf.path().clone();
+                builder = if let Some(bloom) = bloom {
+                    builder
+                        .set_column_bloom_filter_enabled(path.clone(), true)
+                        .set_column_bloom_filter_fpp(path.clone(), bloom.fpp)
+                        .set_column_bloom_filter_ndv(path, bloom.ndv)
+                } else {
+                    builder.set_column_bloom_filter_enabled(path, false)
+                };
+            }
+            properties = builder.build();
+        }
+        ensure!(
+            self.offset_index_enabled != Some(false) || properties.offset_index_disabled(),
+            "offset_index_enabled=false was overridden by global page statistics"
+        );
         ensure!(
             self.offset_index_enabled != Some(false)
                 || leaves
@@ -527,6 +565,13 @@ mod tests {
             r#"{"offset_index_enabled":false,"defaults":{"statistics":"chunk"},"columns":{"value":{"statistics":"page"}}}"#,
         )?;
         assert!(config.writer_properties(&schema(), None, &[]).is_err());
+        let base = WriterProperties::builder()
+            .set_statistics_enabled(EnabledStatistics::Page)
+            .build();
+        let config: ParquetWriterConfig = serde_json::from_str(
+            r#"{"offset_index_enabled":false,"columns":{"id":{"statistics":"chunk"},"value":{"statistics":"chunk"}}}"#,
+        )?;
+        assert!(config.writer_properties(&schema(), Some(base), &[]).is_err());
         let config: ParquetWriterConfig =
             serde_json::from_str(r#"{"offset_index_enabled":false,"defaults":{"statistics":"chunk"}}"#)?;
         let schema = schema();
@@ -547,6 +592,37 @@ mod tests {
         for column in reader.metadata().row_group(0).columns() {
             assert!(column.offset_index_offset().is_none());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn per_column_bloom_false_overrides_global_true_in_written_file() -> Result<()> {
+        let schema = schema();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4])),
+                Arc::new(StringArray::from(vec!["a", "b", "a", "b"])),
+            ],
+        )?;
+        let config: ParquetWriterConfig = serde_json::from_str(
+            r#"{"defaults":{"bloom_filter_enabled":true},"columns":{"id":{"bloom_filter_enabled":false}}}"#,
+        )?;
+        let properties = config.writer_properties(&schema, None, &[])?;
+        let id = ColumnPath::from(vec!["id".to_owned()]);
+        let value = ColumnPath::from(vec!["value".to_owned()]);
+        assert!(properties.bloom_filter_properties(&id).is_none());
+        assert!(properties.bloom_filter_properties(&value).is_some());
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("column-bloom-override.parquet");
+        let mut writer = ArrowWriter::try_new(std::fs::File::create(&path)?, Arc::clone(&schema), Some(properties))?;
+        writer.write(&batch)?;
+        writer.close()?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(path)?)?;
+        let group = reader.metadata().row_group(0);
+        assert!(group.column(0).bloom_filter_offset().is_none());
+        assert!(group.column(1).bloom_filter_offset().is_some());
         Ok(())
     }
 

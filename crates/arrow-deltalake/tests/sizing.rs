@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use arrow_deltalake::CompletedFileObservation;
-use arrow_deltalake::sizing::{AdaptiveFileSizeConfig, AdaptiveFileSizeEstimator, FileSizeEstimatorError};
+use arrow_deltalake::sizing::{
+    AdaptiveFileSizeConfig, AdaptiveFileSizeEstimator, FileSizeEstimatorError, FlushTrigger,
+};
 
 fn config() -> AdaptiveFileSizeConfig {
     AdaptiveFileSizeConfig {
@@ -64,6 +66,28 @@ fn estimator_clamps_input_targets() -> Result<()> {
     low_ratio.cold_start_parquet_ratio = 0.1;
     let low_ratio = AdaptiveFileSizeEstimator::new(low_ratio)?;
     assert_eq!(low_ratio.input_bytes_target(), 5_000);
+    Ok(())
+}
+
+/// Scenario: the adaptive target is reached normally or clamped by input bounds.
+/// Guarantees: each flush reports the threshold that caused it, without changing `should_flush`.
+#[test]
+fn estimator_reports_target_and_clamp_flush_triggers() -> Result<()> {
+    let normal = AdaptiveFileSizeEstimator::new(config())?;
+    assert_eq!(normal.flush_trigger(1_999), None);
+    assert_eq!(normal.flush_trigger(2_000), Some(FlushTrigger::TargetParquetBytes));
+
+    let mut minimum = config();
+    minimum.min_input_bytes = 2_500;
+    let minimum = AdaptiveFileSizeEstimator::new(minimum)?;
+    assert_eq!(minimum.flush_trigger(2_499), None);
+    assert_eq!(minimum.flush_trigger(2_500), Some(FlushTrigger::MinInputBytes));
+
+    let mut maximum = config();
+    maximum.max_input_bytes = 1_500;
+    let maximum = AdaptiveFileSizeEstimator::new(maximum)?;
+    assert_eq!(maximum.flush_trigger(1_499), None);
+    assert_eq!(maximum.flush_trigger(1_500), Some(FlushTrigger::MaxInputBytes));
     Ok(())
 }
 

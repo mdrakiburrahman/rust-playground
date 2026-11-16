@@ -269,6 +269,7 @@ mod tests {
     use arrow::array::{Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use parquet::arrow::ArrowWriter;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use parquet::file::reader::{FileReader, SerializedFileReader};
     use std::sync::Arc;
 
@@ -319,6 +320,18 @@ mod tests {
         let output = buffer.finish()?;
         assert_eq!(output.column(0).as_ref(), input.column(0).as_ref());
         assert_eq!(output.column(1).as_ref(), input.column(1).as_ref());
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("empty-sort.parquet");
+        let mut writer = ArrowWriter::try_new(std::fs::File::create(&path)?, input.schema(), Some(properties))?;
+        writer.write(&output)?;
+        writer.close()?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(path)?)?;
+        assert!(reader.metadata().row_group(0).sorting_columns().is_none());
+        let batches = reader.build()?.collect::<std::result::Result<Vec<_>, _>>()?;
+        let readback = concat_batches(&input.schema(), &batches)?;
+        assert_eq!(readback.column(0).as_ref(), input.column(0).as_ref());
+        assert_eq!(readback.column(1).as_ref(), input.column(1).as_ref());
         Ok(())
     }
 
