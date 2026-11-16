@@ -32,6 +32,8 @@ async fn publication_scope_sorting_preserves_rows_and_qualifies_source_statistic
     let root = tempfile::tempdir()?;
     let batch = input(8192)?;
     let policy = LayoutPolicy {
+        sort_columns: vec!["customer_id".into()],
+        bloom_columns: vec!["customer_id".into()],
         row_group_rows: 512,
         page_rows: 128,
         ..LayoutPolicy::default()

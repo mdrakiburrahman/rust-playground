@@ -13,6 +13,7 @@ use std::sync::OnceLock;
 
 pub const PARQUET_CONFIG_ENV: &str = "ARROWCOL_PARQUET_CONFIG";
 static PROCESS_CONFIG: OnceLock<Result<ParquetWriterConfig, String>> = OnceLock::new();
+static LEGACY_LZ4_WARNING: OnceLock<()> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -21,9 +22,9 @@ pub enum Codec {
     Snappy,
     Gzip,
     Brotli,
-    Zstd,
-    Lz4Raw,
     Lz4,
+    Lz4Raw,
+    Zstd,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -120,15 +121,24 @@ impl ColumnOptions {
         };
         let level = self.compression_level;
         Ok(Some(match codec {
-            Codec::Uncompressed | Codec::Snappy | Codec::Lz4Raw | Codec::Lz4 => {
+            Codec::Uncompressed | Codec::Snappy => {
                 ensure!(level.is_none(), "{codec:?} does not accept a compression level");
                 match codec {
                     Codec::Uncompressed => Compression::UNCOMPRESSED,
                     Codec::Snappy => Compression::SNAPPY,
-                    Codec::Lz4Raw => Compression::LZ4_RAW,
-                    Codec::Lz4 => Compression::LZ4,
                     _ => unreachable!(),
                 }
+            }
+            Codec::Lz4 => {
+                ensure!(level.is_none(), "{codec:?} does not accept a compression level");
+                LEGACY_LZ4_WARNING.get_or_init(|| {
+                    tracing::warn!("Parquet codec lz4 uses deprecated Hadoop framing; prefer lz4_raw");
+                });
+                Compression::LZ4
+            }
+            Codec::Lz4Raw => {
+                ensure!(level.is_none(), "{codec:?} does not accept a compression level");
+                Compression::LZ4_RAW
             }
             Codec::Gzip => {
                 let level = level.unwrap_or(6);
@@ -581,6 +591,7 @@ mod tests {
                 "{json}"
             );
         }
+        assert!(serde_json::from_str::<ParquetWriterConfig>(r#"{"defaults":{"compression":"unknown"}}"#).is_err());
         assert!(serde_json::from_str::<ParquetWriterConfig>(r#"{"unknown":1}"#).is_err());
         assert!(serde_json::from_str::<ParquetWriterConfig>(r#"{"defaults":{"encoding":"rle_dictionary"}}"#).is_err());
         let config: ParquetWriterConfig =
@@ -601,7 +612,7 @@ mod tests {
                 Arc::new(StringArray::from(vec!["repeat"; 4])),
             ],
         )?;
-        for codec in ["uncompressed", "snappy", "gzip", "brotli", "zstd", "lz4_raw", "lz4"] {
+        for codec in ["uncompressed", "snappy", "gzip", "brotli", "lz4", "lz4_raw", "zstd"] {
             let config: ParquetWriterConfig = serde_json::from_value(serde_json::json!({
                 "defaults": {"compression": codec},
                 "columns": {"id": {"encoding": "delta_binary_packed", "dictionary_enabled": false}},

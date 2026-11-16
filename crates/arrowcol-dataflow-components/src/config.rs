@@ -896,7 +896,7 @@ pub struct FileBatchConfig {
     pub global_capacity: BatchCapacity,
     /// Per-table queued and in-flight capacity.
     pub per_table_capacity: BatchCapacity,
-    /// Maximum logical Arrow bytes in a file.
+    /// Maximum logical Arrow bytes retained per file before flush; not compressed Parquet bytes.
     pub max_arrow_memory_per_flush: u64,
     /// Maximum rows in a file.
     pub max_rows_per_flush: u64,

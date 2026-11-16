@@ -4517,7 +4517,7 @@ mod layout_readback_tests {
             ("ARROWCOL_COLLECTOR_LAYOUT_MAX_INPUT_BYTES", "0"),
             ("ARROWCOL_COLLECTOR_LAYOUT_ROW_GROUP_ROWS", "0"),
             ("ARROWCOL_COLLECTOR_LAYOUT_PAGE_ROWS", "0"),
-            ("ARROWCOL_COLLECTOR_SORT_COLUMNS", ""),
+            ("ARROWCOL_COLLECTOR_SORT_COLUMNS", ",id"),
             ("ARROWCOL_COLLECTOR_SORT_COLUMNS", "x,x"),
             ("ARROWCOL_COLLECTOR_SORT_COLUMNS", "x,,y"),
             ("ARROWCOL_COLLECTOR_BLOOM_COLUMNS", "x,x"),

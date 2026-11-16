@@ -46,9 +46,25 @@ impl LayoutPolicy {
     /// # Errors
     /// Returns property type or platform-size conversion errors.
     pub fn from_properties(props: &arrowcol_props::ResolvedProps) -> Result<Self> {
+        let mut sort_columns = props.string_list("arrowcol.layout.sortColumns")?.to_vec();
+        if sort_columns.len() == 1 && sort_columns[0].is_empty() {
+            sort_columns.clear();
+        }
+        ensure!(
+            sort_columns.iter().all(|column| !column.is_empty()),
+            "arrowcol.layout.sortColumns cannot contain empty items"
+        );
+        let mut bloom_columns = props.string_list("arrowcol.layout.bloomColumns")?.to_vec();
+        if bloom_columns.len() == 1 && bloom_columns[0].is_empty() {
+            bloom_columns.clear();
+        }
+        ensure!(
+            bloom_columns.iter().all(|column| !column.is_empty()),
+            "arrowcol.layout.bloomColumns cannot contain empty items"
+        );
         let policy = Self {
-            sort_columns: props.string_list("arrowcol.layout.sortColumns")?.to_vec(),
-            bloom_columns: props.string_list("arrowcol.layout.bloomColumns")?.to_vec(),
+            sort_columns,
+            bloom_columns,
             max_rows: usize::try_from(props.unsigned("arrowcol.layout.maxRows")?)?,
             max_input_bytes: usize::try_from(props.unsigned("arrowcol.layout.maxInputSize")?)?,
             row_group_rows: usize::try_from(props.unsigned("arrowcol.layout.rowGroupRows")?)?,
@@ -102,7 +118,6 @@ impl LayoutPolicy {
             self.row_group_rows > 0 && self.page_rows > 0,
             "row group and page limits must be positive"
         );
-        ensure!(!self.sort_columns.is_empty(), "at least one sort column is required");
         Ok(())
     }
 
@@ -120,23 +135,28 @@ impl LayoutPolicy {
             .set_statistics_enabled(EnabledStatistics::Page)
             .set_offset_index_disabled(false);
         let descriptor = parquet::arrow::ArrowSchemaConverter::new().convert(schema)?;
-        let sorting = self
-            .sort_columns
-            .iter()
-            .map(|name| {
-                let index = descriptor
-                    .columns()
+        let sorting = if self.sort_columns.is_empty() {
+            None
+        } else {
+            Some(
+                self.sort_columns
                     .iter()
-                    .position(|column| column.path().parts() == [name.as_str()])
-                    .with_context(|| format!("sort column {name} must be a physical scalar column"))?;
-                Ok(SortingColumn {
-                    column_idx: i32::try_from(index)?,
-                    descending: false,
-                    nulls_first: false,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        builder = builder.set_sorting_columns(Some(sorting));
+                    .map(|name| {
+                        let index = descriptor
+                            .columns()
+                            .iter()
+                            .position(|column| column.path().parts() == [name.as_str()])
+                            .with_context(|| format!("sort column {name} must be a physical scalar column"))?;
+                        Ok(SortingColumn {
+                            column_idx: i32::try_from(index)?,
+                            descending: false,
+                            nulls_first: false,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            )
+        };
+        builder = builder.set_sorting_columns(sorting);
         for column in &self.bloom_columns {
             builder = builder
                 .set_column_bloom_filter_enabled(ColumnPath::from(column.as_str()), true)
@@ -216,6 +236,9 @@ impl FileSortBuffer {
         if batch.num_rows() == 0 {
             return Ok(batch);
         }
+        if self.policy.sort_columns.is_empty() {
+            return Ok(batch);
+        }
         let columns = self
             .policy
             .sort_columns
@@ -281,6 +304,43 @@ mod tests {
     }
 
     #[test]
+    fn empty_sort_policy_keeps_input_order_without_sorting_metadata() -> Result<()> {
+        let input = batch(vec!["z", "a"], vec![2, 1])?;
+        let policy = LayoutPolicy {
+            sort_columns: Vec::new(),
+            bloom_columns: Vec::new(),
+            ..LayoutPolicy::default()
+        };
+        let properties = policy.writer_properties(&input.schema())?;
+        assert!(properties.sorting_columns().is_none());
+
+        let mut buffer = FileSortBuffer::new(input.schema(), policy)?;
+        assert!(buffer.try_push(&input)?);
+        let output = buffer.finish()?;
+        assert_eq!(output.column(0).as_ref(), input.column(0).as_ref());
+        assert_eq!(output.column(1).as_ref(), input.column(1).as_ref());
+        Ok(())
+    }
+
+    #[test]
+    fn accepts_campaign_caps_and_empty_layout_lists_from_properties() -> Result<()> {
+        let process = std::collections::BTreeMap::from([
+            ("arrowcol.layout.sortColumns".to_owned(), String::new()),
+            ("arrowcol.layout.bloomColumns".to_owned(), String::new()),
+            ("arrowcol.layout.maxRows".to_owned(), "1000000".to_owned()),
+            ("arrowcol.layout.maxInputSize".to_owned(), "1 GiB".to_owned()),
+        ]);
+        let properties = arrowcol_props::resolve(&std::collections::BTreeMap::new(), &process)?;
+        let policy = LayoutPolicy::from_properties(&properties)?;
+        assert!(policy.sort_columns.is_empty());
+        assert!(policy.bloom_columns.is_empty());
+        assert_eq!(policy.max_rows, 1_000_000);
+        assert_eq!(policy.max_input_bytes, 1024 * 1024 * 1024);
+        policy.validate(&batch(vec!["a"], vec![1])?.schema())?;
+        Ok(())
+    }
+
+    #[test]
     fn budget_backpressures_without_losing_or_retaining_rejected_rows() -> Result<()> {
         let a = batch(vec!["z", "a"], vec![2, 1])?;
         let policy = LayoutPolicy {
@@ -309,6 +369,7 @@ mod tests {
         let policy = LayoutPolicy {
             row_group_rows: 2,
             page_rows: 1,
+            bloom_columns: vec!["customer_id".into()],
             ..LayoutPolicy::default()
         };
         let properties = policy.writer_properties(&a.schema())?;
