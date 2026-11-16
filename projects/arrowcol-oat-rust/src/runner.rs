@@ -13023,10 +13023,7 @@ mod tests {
             25
         );
         assert_eq!(outcomes[0]["maintenance_operation_failure"], false);
-        assert_eq!(
-            outcomes[0]["maintenance_exit_classification"],
-            "nonzero_health_exit"
-        );
+        assert_eq!(outcomes[0]["maintenance_exit_classification"], "nonzero_health_exit");
         assert_eq!(outcomes[0]["exit_code"], 1);
         assert!(!serde_json::to_string(&outcomes)?.contains("private"));
         fs::write(fixture.join("mode"), "stop_failure")?;
