@@ -182,6 +182,27 @@ impl OatConfig {
         Ok(())
     }
 
+    fn validate_local_purge_inputs(&self) -> Result<()> {
+        if self.platform.kind != OatMode::Local {
+            return Ok(());
+        }
+        let Some(maintenance) = self.tunables.maintenance.as_ref() else {
+            return Ok(());
+        };
+        let purge_requested = maintenance.enabled == Some(true)
+            && maintenance
+                .operations
+                .as_ref()
+                .is_some_and(|operations| operations.contains(&arrowcol_tunables::MaintenanceOperation::Purge));
+        if purge_requested && maintenance.granularity.is_none() {
+            bail!("local PURGE requires explicit maintenance.granularity");
+        }
+        if purge_requested && maintenance.purge_retention_secs.is_none() {
+            bail!("local PURGE requires explicit maintenance.purge_retention_secs");
+        }
+        Ok(())
+    }
+
     fn validate_selected_parquet_schemas(&self) -> Result<()> {
         let maintenance = self.tunables.maintenance.as_ref();
         if self.tunables.parquet_writer.is_none()
@@ -334,6 +355,7 @@ impl OatConfig {
     /// Returns an error when a setting is invalid or a requested DMV table is unsupported.
     pub fn validate(&self) -> Result<()> {
         self.validate_campaign_profile()?;
+        self.validate_local_purge_inputs()?;
         self.tunables.validate_for_oat()?;
         self.validate_selected_parquet_schemas()?;
         self.validate_selected_layout_schemas()?;
@@ -928,6 +950,46 @@ mod tests {
         config.tunables.maintenance.as_mut().unwrap().max_cycles = Some(1);
         assert!(config.validate_campaign_profile().is_err());
         assert!(serde_json::from_str::<CampaignProfile>(r#""single_hot_tables""#).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn local_purge_requires_explicit_granularity_and_retention_but_aks_inherits_catalog() -> Result<()> {
+        let mut config = valid();
+        let runtime_config_file = config.platform.runtime_config_file.clone();
+        let bootstrap_env_file = config.platform.bootstrap_env_file.clone();
+        config.platform.kind = OatMode::Local;
+        config.platform.runtime_config_file = None;
+        config.platform.bootstrap_env_file = None;
+        config.platform.compose_file = Some("projects/loadtest/compose.yaml".to_owned());
+        config.platform.compose_override_file = Some("projects/loadtest/compose.override.yaml".to_owned());
+        config.platform.compose_project = Some("oat-test".to_owned());
+        config.platform.compose_state_root = Some(config.directory.to_string_lossy().into_owned());
+        config.qap_database = Some("loadtest".to_owned());
+        config.tunables = serde_json::from_value(serde_json::json!({
+            "maintenance": {"enabled": true, "apply": true, "operations": ["purge"]}
+        }))?;
+        let missing_granularity = config.validate().unwrap_err().to_string();
+        assert!(missing_granularity.contains("maintenance.granularity"));
+        config.tunables.maintenance.as_mut().unwrap().granularity =
+            Some(arrowcol_tunables::MaintenanceGranularity::Hour);
+        let missing_retention = config.validate().unwrap_err().to_string();
+        assert!(missing_retention.contains("maintenance.purge_retention_secs"));
+        config.tunables.maintenance.as_mut().unwrap().purge_retention_secs = Some(2_592_000);
+        config.validate()?;
+
+        config.platform.kind = OatMode::Aks;
+        config.platform.compose_file = None;
+        config.platform.compose_override_file = None;
+        config.platform.compose_project = None;
+        config.platform.compose_state_root = None;
+        config.platform.runtime_config_file = runtime_config_file;
+        config.platform.bootstrap_env_file = bootstrap_env_file;
+        config.stamp = Some("00000".to_owned());
+        config.maintenance_image = Some(format!("maintenance@sha256:{}", "a".repeat(64)));
+        config.tunables.maintenance.as_mut().unwrap().granularity = None;
+        config.tunables.maintenance.as_mut().unwrap().purge_retention_secs = None;
+        config.validate()?;
         Ok(())
     }
 
