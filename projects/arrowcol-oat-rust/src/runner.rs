@@ -109,8 +109,7 @@ impl InventoryLoadAdmission {
         self == next
             || matches!(
                 (self, next),
-                (Self::NotAuthorized, Self::AuthorizationPending)
-                    | (Self::AuthorizationPending, Self::Authorized)
+                (Self::NotAuthorized, Self::AuthorizationPending) | (Self::AuthorizationPending, Self::Authorized)
             )
     }
 }
@@ -1235,7 +1234,10 @@ impl Platform for AksPlatform {
                 bail!("QAP manifest changed after its exact planned bindings were persisted");
             }
             let inventory = campaign_inventory_for_setup(self).await?;
-            let qap = inventory.qap.as_ref().context("campaign QAP bindings were not planned before admission")?;
+            let qap = inventory
+                .qap
+                .as_ref()
+                .context("campaign QAP bindings were not planned before admission")?;
             if qap.database != database
                 || qap.bindings != inventory_bindings
                 || qap.state != InventoryResourceState::Planned
@@ -1372,13 +1374,8 @@ impl Platform for AksPlatform {
             hot_delta_relative_path: &hot_path,
             actor: &actor,
         };
-        let output = run_campaign_custody_json(
-            "capture-cell-baseline",
-            None,
-            &request,
-            Duration::from_secs(90),
-        )
-        .await?;
+        let output =
+            run_campaign_custody_json("capture-cell-baseline", None, &request, Duration::from_secs(90)).await?;
         let response: CampaignCellBaselineResponse =
             serde_json::from_slice(&output).context("parse immutable cell baseline receipt")?;
         if !response.ok {
@@ -1402,9 +1399,12 @@ impl Platform for AksPlatform {
         }
         let receipt = response.receipt.context("cell baseline capture returned no receipt")?;
         validate_campaign_cell_baseline(&receipt, &inventory, &identity, run_id, &hot_path)?;
-        tokio::fs::write(runtime_dir.join("campaign-cell-baseline.json"), serde_json::to_vec(&receipt)?)
-            .await
-            .context("persist immutable cell baseline receipt")?;
+        tokio::fs::write(
+            runtime_dir.join("campaign-cell-baseline.json"),
+            serde_json::to_vec(&receipt)?,
+        )
+        .await
+        .context("persist immutable cell baseline receipt")?;
 
         let mut pending = inventory.clone();
         pending.load_admission = InventoryLoadAdmission::AuthorizationPending;
@@ -1418,9 +1418,10 @@ impl Platform for AksPlatform {
         )
         .await?;
         if confirmed.load_admission != InventoryLoadAdmission::AuthorizationPending
-            || confirmed.qap.as_ref().is_none_or(|qap| {
-                qap.state != InventoryResourceState::Planned || qap.bindings != bindings
-            })
+            || confirmed
+                .qap
+                .as_ref()
+                .is_none_or(|qap| qap.state != InventoryResourceState::Planned || qap.bindings != bindings)
         {
             bail!("authoritative campaign inventory did not confirm the pending load authorization");
         }
@@ -7246,7 +7247,11 @@ struct StaleCampaignVersionError {
 
 impl std::fmt::Display for StaleCampaignVersionError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "campaign cleanup {} rejected a stale version before effects", self.action)
+        write!(
+            formatter,
+            "campaign cleanup {} rejected a stale version before effects",
+            self.action
+        )
     }
 }
 
@@ -7300,7 +7305,8 @@ async fn run_campaign_custody_json<T: serde::Serialize>(
         let mut child = command.spawn().context("start campaign custody helper")?;
         let pid = i32::try_from(child.id().context("campaign custody helper PID unavailable")?)
             .context("campaign custody helper PID invalid")?;
-        let _group = OwnedQapHelperGroup(rustix::process::Pid::from_raw(pid).context("campaign custody helper PID invalid")?);
+        let _group =
+            OwnedQapHelperGroup(rustix::process::Pid::from_raw(pid).context("campaign custody helper PID invalid")?);
         let mut stdin = child.stdin.take().context("open campaign custody helper input")?;
         stdin
             .write_all(&payload)
@@ -7494,7 +7500,10 @@ fn campaign_cleanup_action_needs_execution(action: &CampaignCleanupAction, inven
         match step.state {
             InventoryStepState::NotStarted => {}
             InventoryStepState::Complete => {
-                bail!("campaign cleanup {} has incomplete completion evidence", action.selector());
+                bail!(
+                    "campaign cleanup {} has incomplete completion evidence",
+                    action.selector()
+                );
             }
             InventoryStepState::Pending
             | InventoryStepState::Running
@@ -7718,13 +7727,9 @@ async fn cleanup_campaign_aks_platform(config: &OatConfig, platform: &AksPlatfor
     if cached.namespace.name != config.namespace || cached.namespace.owner_token != platform.namespace_owner_token {
         bail!("persisted campaign inventory does not match the OAT namespace origin");
     }
-    let (mut inventory, mut etag) = read_authoritative_campaign_inventory(
-        platform,
-        &identity,
-        &orchestration_run_id,
-        Duration::from_secs(60),
-    )
-    .await?;
+    let (mut inventory, mut etag) =
+        read_authoritative_campaign_inventory(platform, &identity, &orchestration_run_id, Duration::from_secs(60))
+            .await?;
     cached.validate_successor(&inventory)?;
     persist_campaign_inventory_snapshot(platform, &inventory, &etag).await?;
     let actions = [
@@ -7741,7 +7746,9 @@ async fn cleanup_campaign_aks_platform(config: &OatConfig, platform: &AksPlatfor
     let mut receipts = Vec::with_capacity(actions.len());
     for action in actions {
         if !campaign_cleanup_action_needs_execution(&action, &inventory)? {
-            receipts.push(json!({"step": action.selector(), "status": "already_complete", "source": "authoritative_inventory"}));
+            receipts.push(
+                json!({"step": action.selector(), "status": "already_complete", "source": "authoritative_inventory"}),
+            );
             continue;
         }
         let (next_inventory, next_etag, receipt) =
@@ -7753,7 +7760,9 @@ async fn cleanup_campaign_aks_platform(config: &OatConfig, platform: &AksPlatfor
         if let Some(receipt) = receipt {
             receipts.push(serde_json::to_value(receipt)?);
         } else {
-            receipts.push(json!({"step": action.selector(), "status": "already_complete", "source": "authoritative_inventory"}));
+            receipts.push(
+                json!({"step": action.selector(), "status": "already_complete", "source": "authoritative_inventory"}),
+            );
         }
     }
     Ok(json!({"status":"observed", "cleanup_receipts":receipts}))
@@ -8049,7 +8058,13 @@ async fn prepare_aks_platform(
         .to_owned();
     platform.service_account = Some(service_account.clone());
     apply_runtime_resources(config, platform, service_accounts).await?;
-    let fic_plan = run_run_fic_plan(&platform.run_id, &config.namespace, &service_account, bootstrap_env_file).await?;
+    let fic_plan = run_run_fic_plan(
+        &platform.run_id,
+        &config.namespace,
+        &service_account,
+        bootstrap_env_file,
+    )
+    .await?;
     let fic_plan_path = runtime_dir.join(format!("run-fic-{}-identity-plan.json", platform.run_id));
     write_private_secret(&fic_plan_path, &serde_json::to_string(&fic_plan)?)
         .context("persist immutable run-owned workload identity plan")?;
@@ -8472,10 +8487,7 @@ async fn run_oat_qap_helper(
     }
     Ok(())
 }
-async fn run_oat_qap_reference(
-    record_path: &Path,
-    bootstrap_env_file: &Path,
-) -> Result<InventoryQapReference> {
+async fn run_oat_qap_reference(record_path: &Path, bootstrap_env_file: &Path) -> Result<InventoryQapReference> {
     let workspace = std::env::current_dir()?;
     let stamp_config_path = selected_aks_stamp_config_path(&workspace)?;
     let command = run_oat_qap_helper_command(
@@ -11278,20 +11290,22 @@ mod tests {
                 operation == "prepare-run-fic"
             );
         }
-        assert!(run_fic_helper_command(
-            "prepare-run-fic",
-            "00000000-0000-0000-0000-000000000001",
-            Some("oat-test"),
-            Some("arrowcol-oat"),
-            Path::new("/tmp/run-fic.json"),
-            None,
-            None,
-            AksHelperConfigPaths {
-                stamp_config_path: Path::new("/tmp/stamp-87513.yaml"),
-                bootstrap_env_file: Path::new("/tmp/oat-private-bootstrap.env"),
-            },
-        )
-        .is_err());
+        assert!(
+            run_fic_helper_command(
+                "prepare-run-fic",
+                "00000000-0000-0000-0000-000000000001",
+                Some("oat-test"),
+                Some("arrowcol-oat"),
+                Path::new("/tmp/run-fic.json"),
+                None,
+                None,
+                AksHelperConfigPaths {
+                    stamp_config_path: Path::new("/tmp/stamp-87513.yaml"),
+                    bootstrap_env_file: Path::new("/tmp/oat-private-bootstrap.env"),
+                },
+            )
+            .is_err()
+        );
         Ok(())
     }
 
@@ -11664,7 +11678,10 @@ mod tests {
         assert!(stale_read.downcast_ref::<StaleCampaignVersionError>().is_none());
         for code in ["campaign_fenced", "write_outcome_unknown", "invalid_or_storage_error"] {
             let response = json!({"ok":false,"code":code});
-            let error = campaign_custody_helper_failure("cleanup-step", &serde_json::to_vec(&response).expect("serialize failure"));
+            let error = campaign_custody_helper_failure(
+                "cleanup-step",
+                &serde_json::to_vec(&response).expect("serialize failure"),
+            );
             assert!(error.downcast_ref::<StaleCampaignVersionError>().is_none());
             assert!(error.to_string().contains(code));
         }
@@ -11740,7 +11757,10 @@ mod tests {
         authorization_pending.validate_successor(&authorized)?;
         assert!(inventory.validate_successor(&authorized).is_err());
         assert!(authorized.validate_successor(&authorization_pending).is_err());
-        assert!(campaign_cleanup_action_needs_execution(&CampaignCleanupAction::StopAdmission, &inventory)?);
+        assert!(campaign_cleanup_action_needs_execution(
+            &CampaignCleanupAction::StopAdmission,
+            &inventory
+        )?);
         assert_eq!(
             campaign_cleanup_operation_deadline_ms(&CampaignCleanupAction::StopAdmission, &inventory, 1_000)?,
             61_000
@@ -11751,7 +11771,9 @@ mod tests {
             campaign_cleanup_operation_deadline_ms(&CampaignCleanupAction::BoundedDrain, &declared_deadline, 1_000)?,
             5_000
         );
-        assert!(campaign_cleanup_operation_deadline_ms(&CampaignCleanupAction::StopAdmission, &inventory, 61_000).is_err());
+        assert!(
+            campaign_cleanup_operation_deadline_ms(&CampaignCleanupAction::StopAdmission, &inventory, 61_000).is_err()
+        );
         for state in [
             InventoryStepState::Pending,
             InventoryStepState::Running,
@@ -11760,14 +11782,22 @@ mod tests {
         ] {
             let mut unresolved = inventory.clone();
             unresolved.cleanup.stop_admission.state = state;
-            assert!(campaign_cleanup_action_needs_execution(&CampaignCleanupAction::StopAdmission, &unresolved).is_err());
+            assert!(
+                campaign_cleanup_action_needs_execution(&CampaignCleanupAction::StopAdmission, &unresolved).is_err()
+            );
         }
         let mut complete_step = inventory.clone();
         complete_step.cleanup.stop_admission.state = InventoryStepState::Complete;
-        assert!(!campaign_cleanup_action_needs_execution(&CampaignCleanupAction::StopAdmission, &complete_step)?);
+        assert!(!campaign_cleanup_action_needs_execution(
+            &CampaignCleanupAction::StopAdmission,
+            &complete_step
+        )?);
         let mut uncertain_resource = inventory.clone();
         uncertain_resource.resources[0].state = InventoryResourceState::Uncertain;
-        assert!(campaign_cleanup_action_needs_execution(&CampaignCleanupAction::RemoveNamespace, &uncertain_resource).is_err());
+        assert!(
+            campaign_cleanup_action_needs_execution(&CampaignCleanupAction::RemoveNamespace, &uncertain_resource)
+                .is_err()
+        );
         validate_campaign_etag("\\\"strong-etag\\\"")?;
         assert!(validate_campaign_etag("W/\"weak-etag\"").is_err());
         assert!(validate_campaign_etag("*").is_err());
