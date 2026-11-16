@@ -7,7 +7,8 @@ pub mod catalog;
 use anyhow::{Context, Result, bail};
 use arrow_deltalake::delta::DeltaTable;
 use arrow_deltalake::maintenance::{
-    Granularity, MaintenanceControl, MaintenanceError, MaintenanceErrorKind, MaintenancePlan, MaintenanceReport,
+    DEFAULT_OPTIMIZE_UPLOAD_BUFFER_BYTES, Granularity, MaintenanceControl, MaintenanceError, MaintenanceErrorKind,
+    MaintenancePlan, MaintenanceReport,
     NegativeProbeConfig, OptimizeConfig, OptimizePlan, Outcome, ProbeOperation, PruneConfig, PurgeConfig, VacuumConfig,
     error_details, now_ms,
 };
@@ -67,6 +68,7 @@ impl Operation {
 pub struct OperationLimits {
     pub purge_max_files_per_commit: usize,
     pub purge_max_plan_bytes: usize,
+    pub optimize_upload_buffer_bytes: usize,
     pub vacuum_delete_chunk: usize,
     pub vacuum_max_plan_bytes: usize,
     pub replay_max_log_files: usize,
@@ -82,6 +84,7 @@ impl Default for OperationLimits {
         Self {
             purge_max_files_per_commit: 10_000,
             purge_max_plan_bytes: 4 * 1024 * 1024,
+            optimize_upload_buffer_bytes: DEFAULT_OPTIMIZE_UPLOAD_BUFFER_BYTES,
             vacuum_delete_chunk: 256,
             vacuum_max_plan_bytes: 8 * 1024 * 1024,
             replay_max_log_files: 100_000,
@@ -169,6 +172,9 @@ impl Settings {
         let limits = &self.operation_limits;
         if limits.purge_max_files_per_commit == 0
             || limits.purge_max_plan_bytes < 1024
+            || !(arrow_deltalake::maintenance::MIN_OPTIMIZE_UPLOAD_BUFFER_BYTES
+                ..=arrow_deltalake::maintenance::MAX_OPTIMIZE_UPLOAD_BUFFER_BYTES)
+                .contains(&limits.optimize_upload_buffer_bytes)
             || limits.vacuum_delete_chunk == 0
             || limits.vacuum_max_plan_bytes < 1024
             || limits.replay_max_log_files == 0
@@ -1231,7 +1237,12 @@ fn run_operation(
             prepared.plan.bins.retain(|bin| bin.files.len() >= minimum);
             *optimize = Some(OptimizeEvidence::new(&config, prepared.plan.clone()));
             if settings.apply && (!prepared.plan.bins.is_empty() || config.sealed_final) {
-                return table.apply_prepared_optimize(&prepared, &config, control);
+                return table.apply_prepared_optimize_with_upload_buffer(
+                    &prepared,
+                    &config,
+                    control,
+                    settings.operation_limits.optimize_upload_buffer_bytes,
+                );
             }
             MaintenancePlan::Optimize(prepared.plan)
         }

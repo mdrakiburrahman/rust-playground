@@ -143,6 +143,9 @@ struct Cli {
     output_row_group_rows: usize,
     #[arg(long, env = "ARROWCOL_MAINT_MAX_OUTPUT_FILE_BYTES", default_value_t = 1023 * 1024 * 1024)]
     max_output_file_bytes: u64,
+    /// Object-store upload buffer for OPTIMIZE outputs (4..=64 MiB).
+    #[arg(long, env = "ARROWCOL_MAINT_OPTIMIZE_UPLOAD_BUFFER_BYTES", default_value_t = 8 * 1024 * 1024)]
+    optimize_upload_buffer_bytes: usize,
     #[arg(long, env = "ARROWCOL_MAINT_MAX_ACTIVE_FILES", default_value_t = 1_000_000)]
     max_active_files: usize,
     #[arg(long, env = "ARROWCOL_MAINT_LATEST_PARTITIONS")]
@@ -272,6 +275,7 @@ fn settings(cli: Cli) -> Result<Settings> {
         operation_limits: OperationLimits {
             purge_max_files_per_commit: cli.purge_max_files_per_commit,
             purge_max_plan_bytes: cli.purge_max_plan_bytes,
+            optimize_upload_buffer_bytes: cli.optimize_upload_buffer_bytes,
             vacuum_delete_chunk: cli.vacuum_delete_chunk,
             vacuum_max_plan_bytes: cli.vacuum_max_plan_bytes,
             replay_max_log_files: cli.replay_max_log_files,
