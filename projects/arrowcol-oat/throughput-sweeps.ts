@@ -95,6 +95,14 @@ const cohorts: Cohort[] = [
       ...candidate('cadence-' + value, { maintenance: { interval_secs: value, max_idle_backoff_secs: value } }),
       qualification: 'exploratory' as const,
     }))),
+    compare('max-consecutive-stale-plans', 'tunables.maintenance.max_consecutive_stale_plans',
+      [1, 8, 1024].map(value => candidate('stale-plans-' + value, {
+        maintenance: { max_consecutive_stale_plans: value },
+      }))),
+    compare('sealed-partitions-only', 'tunables.maintenance.sealed_partitions_only',
+      [true, false].map(value => candidate('sealed-partitions-' + value, {
+        maintenance: { sealed_partitions_only: value },
+      }))),
     compare('small-file-threshold', 'tunables.maintenance.small_file_bytes', [16777216, 33554432, 67108864].map(value => candidate('small-file-' + value, { maintenance: { small_file_bytes: value } }))),
     compare('retry-budget', 'tunables.maintenance.commit_attempts', [1, 3, 5].map(value => candidate('attempts-' + value, { maintenance: { commit_attempts: value } }))),
     compare('checkpoint-interval', 'tunables.maintenance.checkpoint_every_commits', [64, 256, 1024].map(value => candidate('checkpoint-' + value, { maintenance: { checkpoint_every_commits: value } }))),
@@ -148,6 +156,15 @@ export function buildThroughputManifests(registry: unknown): JsonObject[] {
         maintenance: { ...maintenance, continuous: true },
         compare_within_box: true,
         one_variable_at_a_time: true,
+      },
+      maintenance_setting_semantics: {
+        max_consecutive_stale_plans: { omitted_requested: null, default_effective: 8, min: 1, max: 1024 },
+        sealed_partitions_only: {
+          omitted_requested: null,
+          default_effective_without_table_override: true,
+          effective_table_property: 'arrowcol.optimize.sealedPartitionsOnly',
+          table_policy_overrides_startup_request: true,
+        },
       },
       baseline_tunables: {
         ...tunables,

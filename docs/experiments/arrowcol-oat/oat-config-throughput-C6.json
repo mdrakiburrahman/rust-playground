@@ -46,6 +46,20 @@
     "compare_within_box": true,
     "one_variable_at_a_time": true
   },
+  "maintenance_setting_semantics": {
+    "max_consecutive_stale_plans": {
+      "omitted_requested": null,
+      "default_effective": 8,
+      "min": 1,
+      "max": 1024
+    },
+    "sealed_partitions_only": {
+      "omitted_requested": null,
+      "default_effective_without_table_override": true,
+      "effective_table_property": "arrowcol.optimize.sealedPartitionsOnly",
+      "table_policy_overrides_startup_request": true
+    }
+  },
   "baseline_tunables": {
     "client": {
       "corpus_rows": 65536,
@@ -285,13 +299,7 @@
   ],
   "runnable": false,
   "config_validation": {
-    "status": "config-validated",
-    "validator": "arrowcol-oat-rust --validate-config",
-    "source_sha": "a24ec92ea7a4c9b3b0397d38ebe231844714c7e8",
-    "baseline_count": 1,
-    "candidate_count": 13,
-    "pass_count": 14,
-    "fail_count": 0
+    "status": "not-validated"
   },
   "runtime_qualification": "unqualified"
 }

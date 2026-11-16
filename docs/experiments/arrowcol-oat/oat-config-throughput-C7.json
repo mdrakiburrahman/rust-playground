@@ -46,6 +46,20 @@
     "compare_within_box": true,
     "one_variable_at_a_time": true
   },
+  "maintenance_setting_semantics": {
+    "max_consecutive_stale_plans": {
+      "omitted_requested": null,
+      "default_effective": 8,
+      "min": 1,
+      "max": 1024
+    },
+    "sealed_partitions_only": {
+      "omitted_requested": null,
+      "default_effective_without_table_override": true,
+      "effective_table_property": "arrowcol.optimize.sealedPartitionsOnly",
+      "table_policy_overrides_startup_request": true
+    }
+  },
   "baseline_tunables": {
     "client": {
       "corpus_rows": 65536,
@@ -149,6 +163,70 @@
             }
           },
           "qualification": "exploratory"
+        }
+      ],
+      "candidate_limit": 4
+    },
+    {
+      "id": "max-consecutive-stale-plans",
+      "factor": "tunables.maintenance.max_consecutive_stale_plans",
+      "candidates": [
+        {
+          "id": "stale-plans-1",
+          "overrides": {
+            "tunables": {
+              "maintenance": {
+                "max_consecutive_stale_plans": 1
+              }
+            }
+          }
+        },
+        {
+          "id": "stale-plans-8",
+          "overrides": {
+            "tunables": {
+              "maintenance": {
+                "max_consecutive_stale_plans": 8
+              }
+            }
+          }
+        },
+        {
+          "id": "stale-plans-1024",
+          "overrides": {
+            "tunables": {
+              "maintenance": {
+                "max_consecutive_stale_plans": 1024
+              }
+            }
+          }
+        }
+      ],
+      "candidate_limit": 4
+    },
+    {
+      "id": "sealed-partitions-only",
+      "factor": "tunables.maintenance.sealed_partitions_only",
+      "candidates": [
+        {
+          "id": "sealed-partitions-true",
+          "overrides": {
+            "tunables": {
+              "maintenance": {
+                "sealed_partitions_only": true
+              }
+            }
+          }
+        },
+        {
+          "id": "sealed-partitions-false",
+          "overrides": {
+            "tunables": {
+              "maintenance": {
+                "sealed_partitions_only": false
+              }
+            }
+          }
         }
       ],
       "candidate_limit": 4
@@ -267,13 +345,7 @@
   ],
   "runnable": false,
   "config_validation": {
-    "status": "config-validated",
-    "validator": "arrowcol-oat-rust --validate-config",
-    "source_sha": "a24ec92ea7a4c9b3b0397d38ebe231844714c7e8",
-    "baseline_count": 1,
-    "candidate_count": 12,
-    "pass_count": 13,
-    "fail_count": 0
+    "status": "not-validated"
   },
   "runtime_qualification": "unqualified"
 }
