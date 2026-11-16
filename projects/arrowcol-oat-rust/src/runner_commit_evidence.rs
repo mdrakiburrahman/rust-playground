@@ -673,7 +673,7 @@ mod commit_evidence_tests {
     #[test]
     fn complete_commit_windows_preserve_half_open_boundaries_and_unknowns() -> Result<()> {
         let config = config()?;
-        let mut first = event(&config, 1000, 1001)?;
+        let mut first = event(&config, 900, 999)?;
         first["finished_at_unix_ms"] = json!(1000);
         let mut boundary = event(&config, 1000, 1001)?;
         boundary["delta_version"] = json!(8);
