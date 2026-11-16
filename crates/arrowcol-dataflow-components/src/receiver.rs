@@ -43,7 +43,7 @@ use tonic::transport::Server;
 
 use crate::FlightReceiverConfig;
 use crate::config::{checked_add_millis, config_error, now_unix_millis, parse_config};
-use crate::envelope::{ArrowcolBatchEnvelope, encode_record_batch};
+use crate::envelope::ArrowcolBatchEnvelope;
 use crate::metrics::{DurableStream, PendingTracker, RuntimeMetrics, global_metrics, process_instance_id};
 use crate::routing::{LeaseResolver, StoreLeaseResolver};
 

@@ -179,11 +179,11 @@ pub fn decode_record_set(records: PdataArrowRecordSet) -> Result<Vec<DecodedArro
     if representation != &arrowcol_flight_representation() && representation != &previous_representation {
         return Err(EnvelopeError::UnsupportedRepresentation(representation.to_string()));
     }
+    let legacy_representation = representation == &previous_representation;
     let (_, _, _, tables) = records.into_parts();
     if tables.is_empty() {
         return Err(EnvelopeError::EmptyRecordSet);
     }
-    let legacy_representation = representation == &previous_representation;
     tables
         .into_iter()
         .map(|table| {
