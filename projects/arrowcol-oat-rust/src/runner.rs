@@ -11700,6 +11700,81 @@ mod tests {
     }
 
     #[test]
+    fn campaign_cell_baseline_matches_the_frozen_envelope_and_absence_contract() -> Result<()> {
+        let step = json!({"state":"not_started","deadline_unix_ms":null,"reason_code":null});
+        let hot_path = "oat-prefix/runs/00000000-0000-0000-0000-000000000004/dataflow/telemetry/sqlserver/sqlserver_availability_replica_states";
+        let inventory: RunInventory = serde_json::from_value(json!({
+            "schema_version":1,
+            "campaign_id":"00000000-0000-0000-0000-000000000001",
+            "owner_id":"00000000-0000-0000-0000-000000000002",
+            "fencing_token":1,
+            "orchestration_run_id":"00000000-0000-0000-0000-000000000003",
+            "cell_run_id":"00000000-0000-0000-0000-000000000004",
+            "load_admission":"not_authorized",
+            "namespace":{"name":"oat-00000000000000000000000000000004","uid":"00000000-0000-0000-0000-000000000005",
+                "owner_token":"00000000-0000-0000-0000-000000000002"},
+            "resources":[{"api_version":"apps/v1","kind":"Deployment","namespace":"oat-00000000000000000000000000000004",
+                "name":"arrowcol","uid":null,"role":"collector","state":"planned"}],
+            "fic":null,
+            "qap":{"database":"OatDatabase","bindings":[{"external_table":"oat_00000000000000000000000000000004_sqlserver_availability_replica_states",
+                "relative_path":hot_path}],"state":"planned","absence":[],"reference":null},
+            "cleanup":{"stop_admission":step,"bounded_drain":step,"evidence_capture":step,
+                "stop_maintenance":step,"terminal_capture":step,"handoff":step}
+        }))?;
+        inventory.validate()?;
+        let identity = CampaignIdentity {
+            campaign_id: inventory.campaign_id.clone(),
+            owner_id: inventory.owner_id.clone(),
+            fencing_token: inventory.fencing_token,
+        };
+        let actor = CampaignCleanupActor {
+            mode: CampaignActorMode::Producer,
+            owner_id: identity.owner_id.clone(),
+            fencing_token: identity.fencing_token,
+        };
+        let request = CampaignCellBaselineRequest {
+            schema_version: 1,
+            campaign_id: &identity.campaign_id,
+            orchestration_run_id: &inventory.orchestration_run_id,
+            cell_run_id: &inventory.cell_run_id,
+            expected_etag: "\"inventory-etag\"",
+            hot_delta_relative_path: hot_path,
+            actor: &actor,
+        };
+        assert_eq!(
+            serde_json::to_value(&request)?,
+            json!({
+                "schema_version":1,
+                "campaign_id":"00000000-0000-0000-0000-000000000001",
+                "orchestration_run_id":"00000000-0000-0000-0000-000000000003",
+                "cell_run_id":"00000000-0000-0000-0000-000000000004",
+                "expected_etag":"\"inventory-etag\"",
+                "hot_delta_relative_path":hot_path,
+                "actor":{"mode":"producer","owner_id":"00000000-0000-0000-0000-000000000002","fencing_token":1}
+            })
+        );
+        let output = json!({"ok":true,"receipt":{
+            "status":"captured","campaign_id":identity.campaign_id,"owner_id":identity.owner_id,
+            "fencing_token":identity.fencing_token,"orchestration_run_id":inventory.orchestration_run_id,
+            "cell_run_id":inventory.cell_run_id,"namespace_uid":"00000000-0000-0000-0000-000000000005",
+            "hot_delta_relative_path":hot_path,"blob":"campaigns/00000000-0000-0000-0000-000000000001/cells/00000000-0000-0000-0000-000000000004/delta-before.json",
+            "etag":"\"baseline-etag\"","delta_state":"observed_absent","table_id":null,"delta_version":null,"rows":null
+        }});
+        let response: CampaignCellBaselineResponse = serde_json::from_value(output.clone())?;
+        let receipt = response.receipt.context("baseline receipt missing")?;
+        assert!(response.ok);
+        validate_campaign_cell_baseline(&receipt, &inventory, &identity, &inventory.cell_run_id, hot_path)?;
+        let mut loss_shaped_absence = output;
+        loss_shaped_absence["receipt"]["rows"] = json!(0);
+        let response: CampaignCellBaselineResponse = serde_json::from_value(loss_shaped_absence)?;
+        let receipt = response.receipt.context("baseline receipt missing")?;
+        assert!(
+            validate_campaign_cell_baseline(&receipt, &inventory, &identity, &inventory.cell_run_id, hot_path).is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn campaign_cleanup_preserves_the_approved_maintenance_and_evidence_order() {
         let actions = [
             CampaignCleanupAction::StopAdmission,
