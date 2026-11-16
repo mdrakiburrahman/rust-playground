@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import { renderCampaignResults, sortCampaignLeaderboard, validateCampaignMeasurements } from './campaign-results.js';
 
@@ -152,7 +153,109 @@ function sourceShapedRun(sequence: number, rates: number[], start: number, gapAt
   };
 }
 
-test('reads one sustained run of contiguous emitter buckets but keeps missing pressure/debt proof unranked', () => {
+function attachMaintenanceDebt(run: ReturnType<typeof sourceShapedRun>, observedAt: number, dropped = 0): void {
+  const row = run.rows[0]!;
+  const evidence = JSON.parse(String(row.evidence_json)) as Record<string, unknown>;
+  if (!Array.isArray(evidence.processes)) throw new Error('source fixture has no process evidence');
+  evidence.processes = [...evidence.processes, {
+    component: 'maintenance',
+    log_complete: true,
+    maintenance_table_policies: {
+      source: 'validated_consumer_per_table_policy',
+      tables: { sqlserver_availability_replica_states: { active: true, table_policy: {} } },
+      operation_reports_dropped: dropped,
+      operation_report_timing_scope: 'process_lifetime_including_warmup_and_drain_not_shared_measurement_window',
+      operation_outcomes: { scope: 'process_lifetime', operation_count: 1, error_count: 0 },
+      operation_reports: [{
+        table: 'sqlserver_availability_replica_states',
+        operation: 'optimize',
+        negative_probe: false,
+        mutation_mode: 'apply_authorized_not_proof_of_mutation',
+        operation_failed: false,
+        compaction_debt: {
+          observed_at_ms: observedAt,
+          source: 'snapshot_active_files',
+          eligible_files: 10,
+          eligible_bytes: 1000,
+          backlog_files: 2,
+          backlog_bytes: 200,
+          oldest_eligible_partition_start_ms: null,
+        },
+      }],
+    },
+  }];
+  row.evidence_json = JSON.stringify(evidence);
+}
+
+function mutateMaintenanceReport(run: ReturnType<typeof sourceShapedRun>, mutate: (report: Record<string, unknown>) => void): void {
+  const row = run.rows[0]!;
+  const evidence = JSON.parse(String(row.evidence_json)) as {
+    processes: Array<{ component: string; maintenance_table_policies?: { operation_reports: Array<Record<string, unknown>> } }>;
+  };
+  const maintenance = evidence.processes.find(process => process.component === 'maintenance');
+  const report = maintenance?.maintenance_table_policies?.operation_reports[0];
+  if (!report) throw new Error('source fixture has no maintenance operation report');
+  mutate(report);
+  row.evidence_json = JSON.stringify(evidence);
+}
+
+test('uses only successful in-window E1 compaction-debt samples and keeps missing pressure unranked', () => {
+  const run = sourceShapedRun(30, [1, 1, 1, 1, 1], 1_000_000);
+  attachMaintenanceDebt(run, 1_060_000);
+  const result = {
+    cohort: 'C1', candidate: 'snappy', factorX: 'codec', valueX: 'snappy', factorY: 'level', valueY: '3',
+    repeat: 1, expectedRepeats: 3, committedRowsPerSecond: 1,
+    factorConfigPaths: ['tunables.parquet_writer.defaults.compression', 'tunables.parquet_writer.defaults.compression_level'],
+    officialRuns: [run],
+  };
+  const svg = renderCampaignResults([result], 'C1');
+  assert.match(svg, /timestamped pressure evidence is unavailable; other maintenance due-work vectors remain unknown/);
+  assert.doesNotMatch(svg, /snappy \(0\/3\)/);
+
+  const dropped = sourceShapedRun(31, [1, 1, 1, 1, 1], 1_000_000);
+  attachMaintenanceDebt(dropped, 1_060_000, 1);
+  const droppedSvg = renderCampaignResults([{ ...result, officialRuns: [dropped] }], 'C1');
+  assert.match(droppedSvg, /timestamped in-window bounded compaction-debt evidence is unavailable or invalid/);
+
+  const stale = sourceShapedRun(32, [1, 1, 1, 1, 1], 1_000_000);
+  attachMaintenanceDebt(stale, 999_999);
+  const staleSvg = renderCampaignResults([{ ...result, officialRuns: [stale] }], 'C1');
+  assert.match(staleSvg, /timestamped in-window bounded compaction-debt evidence is unavailable or invalid/);
+
+  for (const [sequence, mutate] of [
+    [35, (report: Record<string, unknown>) => { report.compaction_debt = null; }],
+    [36, (report: Record<string, unknown>) => { report.operation = 'checkpoint'; }],
+    [37, (report: Record<string, unknown>) => { report.operation_failed = true; }],
+  ] as Array<[number, (report: Record<string, unknown>) => void]>) {
+    const unavailable = sourceShapedRun(sequence, [1, 1, 1, 1, 1], 1_000_000);
+    attachMaintenanceDebt(unavailable, 1_060_000);
+    mutateMaintenanceReport(unavailable, mutate);
+    const svgUnavailable = renderCampaignResults([{ ...result, officialRuns: [unavailable] }], 'C1');
+    assert.match(svgUnavailable, /timestamped in-window bounded compaction-debt evidence is unavailable or invalid/);
+  }
+});
+
+test('rejects exact-window commit buckets that do not sum to the run output', () => {
+  const run = sourceShapedRun(33, [1, 1, 1, 1, 1], 1_000_000);
+  const row = run.rows[0]!;
+  const evidence = JSON.parse(String(row.evidence_json)) as {
+    durable_commits: { complete_30_second_commit_windows: Array<{ rows: number; rows_per_second: number }> };
+  };
+  const first = evidence.durable_commits.complete_30_second_commit_windows[0]!;
+  first.rows--;
+  first.rows_per_second = first.rows / 30;
+  row.evidence_json = JSON.stringify(evidence);
+  const result = {
+    cohort: 'C1', candidate: 'snappy', factorX: 'codec', valueX: 'snappy', factorY: 'level', valueY: '3',
+    repeat: 1, expectedRepeats: 3, committedRowsPerSecond: 1,
+    factorConfigPaths: ['tunables.parquet_writer.defaults.compression', 'tunables.parquet_writer.defaults.compression_level'],
+    officialRuns: [run],
+  };
+  const svg = renderCampaignResults([result], 'C1');
+  assert.match(svg, /complete commit buckets do not reconcile to the exact-window run output total/);
+});
+
+test('reads one sustained run of contiguous emitter buckets but keeps missing debt proof unranked', () => {
   const result = {
     cohort: 'C1', candidate: 'snappy', factorX: 'codec', valueX: 'snappy', factorY: 'level', valueY: '3',
     repeat: 1, expectedRepeats: 3, committedRowsPerSecond: 1,
@@ -161,7 +264,7 @@ test('reads one sustained run of contiguous emitter buckets but keeps missing pr
   };
   const svg = renderCampaignResults([result], 'C1');
   assert.match(svg, /snappy: unqualified, 0\/3 protocol-complete repeats; observed mean 1 rows\/s/);
-  assert.match(svg, /timestamped pressure and bounded maintenance-debt evidence is unavailable from the current producer/);
+  assert.match(svg, /timestamped in-window bounded compaction-debt evidence is unavailable or invalid/);
   assert.doesNotMatch(svg, /snappy \(0\/3\)/);
 });
 
@@ -188,6 +291,29 @@ test('requires actual distinct factor leaves and preserves frozen config paths',
       parquet_writer: { defaults: { compression: 'snappy', compression_level: 3 } } } } }],
   };
   assert.throws(() => renderCampaignResults([result], 'C1'), /distinct scalar or array config leaves/);
+});
+
+test('requires factor leaves to exist in the real tuned config fixture', () => {
+  type TunedConfig = {
+    tables: string[];
+    tunables: { parquet_writer: { defaults: Record<string, unknown> }; [key: string]: unknown };
+    [key: string]: unknown;
+  };
+  const config = JSON.parse(readFileSync(new URL('../../docs/experiments/arrowcol-oat/oat-config.tuned.json', import.meta.url), 'utf8')) as TunedConfig;
+  config.tables = ['sqlserver_availability_replica_states'];
+  const run = sourceShapedRun(34, [1, 1, 1, 1, 1], 1_000_000);
+  const official = { ...run, config };
+  const result = {
+    cohort: 'C1', candidate: 'snappy', factorX: 'codec', valueX: 'snappy', factorY: 'level', valueY: '3',
+    repeat: 1, expectedRepeats: 3, committedRowsPerSecond: 1,
+    factorConfigPaths: ['tunables.parquet_writer.defaults.compression', 'tunables.parquet_writer.defaults.compression_level'],
+    officialRuns: [official],
+  };
+  assert.doesNotThrow(() => renderCampaignResults([result], 'C1'));
+  const missing = structuredClone(config);
+  delete missing.tunables.parquet_writer.defaults.compression_level;
+  assert.throws(() => renderCampaignResults([{ ...result, officialRuns: [{ ...run, config: missing }] }], 'C1'),
+    /factorConfigPaths must identify distinct scalar or array config leaves/);
 });
 
 test('sorts qualified leaderboard metrics by descending mean then candidate name', () => {

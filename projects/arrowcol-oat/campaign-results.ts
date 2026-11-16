@@ -295,6 +295,51 @@ function hasCommitWindowProvenance(value: RecordValue): boolean {
     value.unique_delivered_rows === null && value.complete_delivery_established === false;
 }
 
+function hasBoundedMaintenanceDebt(processes: unknown, start: number, end: number): boolean {
+  if (!Array.isArray(processes)) return false;
+  const maintenanceProcesses = processes.filter((process): process is RecordValue =>
+    isRecord(process) && process.component === 'maintenance');
+  if (maintenanceProcesses.length === 0) return false;
+
+  for (const process of maintenanceProcesses) {
+    const policy = process.maintenance_table_policies;
+    if (process.log_complete !== true || !isRecord(policy) ||
+        policy.source !== 'validated_consumer_per_table_policy' ||
+        policy.operation_report_timing_scope !== 'process_lifetime_including_warmup_and_drain_not_shared_measurement_window' ||
+        policy.operation_reports_dropped !== 0 || !Array.isArray(policy.operation_reports) ||
+        !isRecord(policy.tables) || !isRecord(policy.tables.sqlserver_availability_replica_states) ||
+        policy.tables.sqlserver_availability_replica_states.active !== true) return false;
+
+    const outcomes = policy.operation_outcomes;
+    if (!isRecord(outcomes) || outcomes.scope !== 'process_lifetime' || outcomes.error_count !== 0) return false;
+    let samples = 0;
+    for (const report of policy.operation_reports) {
+      if (!isRecord(report)) return false;
+      if (report.table !== 'sqlserver_availability_replica_states' || report.operation !== 'optimize') continue;
+      const debt = report.compaction_debt;
+      if (!isRecord(debt)) return false;
+      const observedAt = debt.observed_at_ms;
+      if (typeof observedAt !== 'number' || !Number.isSafeInteger(observedAt) || observedAt <= 0) return false;
+      if (observedAt < start || observedAt >= end) continue;
+      if (report.operation_failed !== false || report.negative_probe !== false ||
+          report.mutation_mode !== 'apply_authorized_not_proof_of_mutation' ||
+          (debt.source !== 'snapshot_active_files' && debt.source !== 'bounded_physical_inventory') ||
+          !Number.isSafeInteger(debt.eligible_files) || Number(debt.eligible_files) < 0 ||
+          !Number.isSafeInteger(debt.eligible_bytes) || Number(debt.eligible_bytes) < 0 ||
+          !Number.isSafeInteger(debt.backlog_files) || Number(debt.backlog_files) < 0 ||
+          !Number.isSafeInteger(debt.backlog_bytes) || Number(debt.backlog_bytes) < 0 ||
+          Number(debt.backlog_files) > Number(debt.eligible_files) ||
+          Number(debt.backlog_bytes) > Number(debt.eligible_bytes) ||
+          debt.oldest_eligible_partition_start_ms !== null &&
+            (!Number.isSafeInteger(debt.oldest_eligible_partition_start_ms) ||
+              Number(debt.oldest_eligible_partition_start_ms) > observedAt)) return false;
+      samples++;
+    }
+    if (samples === 0) return false;
+  }
+  return true;
+}
+
 function inspectOfficialRun(run: OfficialRun): { windows?: OfficialWindow[]; reason?: string } {
   const verdict = evaluateDataFlow(run.status, run.rows, run.expectedSha, run.mode, run.config, 'single_hot_table_campaign');
   if (verdict.ingestPass !== true || verdict.rows.length !== 1) return { reason: 'official campaign ingest evidence did not pass: ' + verdict.reasons.join('; ') };
@@ -345,7 +390,9 @@ function inspectOfficialRun(run: OfficialRun): { windows?: OfficialWindow[]; rea
     bucketRowsTotal += bucketRows;
     windows.push({ rate: bucketRate });
   }
-  if (bucketRowsTotal > outputRows) return { reason: 'complete commit buckets exceed the run output total' };
+  if (bucketRowsTotal > outputRows || (durationMs % 30_000 === 0 && bucketRowsTotal !== outputRows)) {
+    return { reason: 'complete commit buckets do not reconcile to the exact-window run output total' };
+  }
   const reconciliation = evidence.reconciliation;
   if (!isRecord(reconciliation) || reconciliation.status !== 'within_bound' || reconciliation.settled !== true ||
       reconciliation.lower_bound_met !== true || reconciliation.upper_bound_met !== true ||
@@ -365,11 +412,12 @@ function inspectOfficialRun(run: OfficialRun): { windows?: OfficialWindow[]; rea
       reconciliation.exact_match !== (deltaRows === completedRows)) {
     return { reason: 'official source/new-commit reconciliation bounds are inconsistent' };
   }
+  const boundedMaintenanceDebt = hasBoundedMaintenanceDebt(evidence.processes, start, end);
   return {
     windows,
-    reason: evidence.backlog == null
-      ? 'timestamped pressure and bounded maintenance-debt evidence is unavailable from the current producer'
-      : 'timestamped pressure and bounded maintenance-debt evidence schema is not validated',
+    reason: !boundedMaintenanceDebt
+      ? 'timestamped in-window bounded compaction-debt evidence is unavailable or invalid'
+      : 'timestamped pressure evidence is unavailable; other maintenance due-work vectors remain unknown',
   };
 }
 
