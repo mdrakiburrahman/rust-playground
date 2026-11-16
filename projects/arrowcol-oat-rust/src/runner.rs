@@ -8579,6 +8579,12 @@ async fn persist_campaign_inventory(platform: &AksPlatform, inventory: &RunInven
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct CampaignCellBudget {
+    effective_stop_budgets: EffectiveStopBudgets,
+    planned_cell_duration_ms: u64,
+}
+
 fn initial_campaign_inventory(
     identity: &CampaignIdentity,
     orchestration_run_id: &str,
@@ -8586,8 +8592,7 @@ fn initial_campaign_inventory(
     namespace: &str,
     account: &str,
     container: &str,
-    effective_stop_budgets: EffectiveStopBudgets,
-    planned_cell_duration_ms: u64,
+    budget: CampaignCellBudget,
 ) -> Result<RunInventory> {
     let step = || InventoryStep {
         state: InventoryStepState::NotStarted,
@@ -8615,8 +8620,8 @@ fn initial_campaign_inventory(
             container: container.to_owned(),
             blob_prefix: format!("campaigns/{}/cells/{}/evidence", identity.campaign_id, cell_run_id),
         }),
-        effective_stop_budgets: Some(effective_stop_budgets.validate()?),
-        planned_cell_duration_ms: Some(planned_cell_duration_ms),
+        effective_stop_budgets: Some(budget.effective_stop_budgets.validate()?),
+        planned_cell_duration_ms: Some(budget.planned_cell_duration_ms),
         cleanup: InventoryCleanup {
             stop_admission: step(),
             bounded_drain: step(),
@@ -8648,8 +8653,10 @@ async fn initialize_campaign_inventory(
         &config.namespace,
         &account,
         &container,
-        config.maintenance_stop_budget()?,
-        config.timing_budget()?.planned_cell_duration_ms,
+        CampaignCellBudget {
+            effective_stop_budgets: config.maintenance_stop_budget()?,
+            planned_cell_duration_ms: config.timing_budget()?.planned_cell_duration_ms,
+        },
     )?;
     persist_campaign_inventory(platform, &inventory).await?;
     validate_campaign_baseline_capture_inventory(&inventory, &identity)?;
@@ -12573,11 +12580,13 @@ mod tests {
             "arrow-collector-00000000000000000000000000000004",
             "campaignstorage",
             "checkpoints",
-            EffectiveStopBudgets {
-                maintenance_grace_seconds: 1_200,
-                maintenance_stop_timeout_ms: 1_500_000,
+            CampaignCellBudget {
+                effective_stop_budgets: EffectiveStopBudgets {
+                    maintenance_grace_seconds: 1_200,
+                    maintenance_stop_timeout_ms: 1_500_000,
+                },
+                planned_cell_duration_ms: 1_000,
             },
-            1_000,
         )?;
         super::validate_campaign_baseline_capture_inventory(&inventory, &identity)?;
         let value = serde_json::to_value(&inventory)?;
@@ -12733,11 +12742,13 @@ mod tests {
             namespace,
             "campaignstorage",
             "checkpoints",
-            EffectiveStopBudgets {
-                maintenance_grace_seconds: 1_200,
-                maintenance_stop_timeout_ms: 1_500_000,
+            CampaignCellBudget {
+                effective_stop_budgets: EffectiveStopBudgets {
+                    maintenance_grace_seconds: 1_200,
+                    maintenance_stop_timeout_ms: 1_500_000,
+                },
+                planned_cell_duration_ms: 1_000,
             },
-            1_000,
         )?;
         inventory.namespace.uid = Some("00000000-0000-0000-0000-000000000005".to_owned());
         inventory.resources.push(InventoryResource {

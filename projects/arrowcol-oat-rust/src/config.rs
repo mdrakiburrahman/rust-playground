@@ -1754,18 +1754,20 @@ mod tests {
 
     #[test]
     fn rust_and_typescript_stop_budgets_share_the_same_fixtures() -> Result<()> {
-        let fixtures: Vec<Value> = serde_json::from_str(include_str!("../../arrowcol-oat/stop-budget-fixtures.json"))?;
+        let fixtures: Vec<serde_json::Value> =
+            serde_json::from_str(include_str!("../../arrowcol-oat/stop-budget-fixtures.json"))?;
         for fixture in fixtures {
             let mut config = valid();
-            let mut maintenance = json!({
+            let mut maintenance = serde_json::json!({
                 "enabled": true,
                 "apply": true,
                 "operations": fixture["operations"].clone(),
             });
             if let Some(timeout) = fixture["operation_timeout_secs"].as_u64() {
-                maintenance["operation_timeout_secs"] = json!(timeout);
+                maintenance["operation_timeout_secs"] = serde_json::json!(timeout);
             }
-            config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({"maintenance": maintenance}))?;
+            config.tunables =
+                arrowcol_tunables::Tunables::parse_oat_json(serde_json::json!({"maintenance": maintenance}))?;
             let result = config.maintenance_stop_budget();
             if fixture["rejected"] == true {
                 assert!(result.is_err(), "{} must be rejected by Rust", fixture["name"]);
