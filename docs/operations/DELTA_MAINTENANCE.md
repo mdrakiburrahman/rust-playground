@@ -50,13 +50,15 @@ Probes open the guarded storage transport only: no schema initialization, Delta 
 
 | Phase | Cheap negative proof |
 | --- | --- |
-| PURGE | No physical ingestion partition ends at or before the retention cutoff. Malformed or non-ingestion partition layouts require the normal planner or return an error. |
+| PURGE | No physical ingestion partition ends at or before the retention cutoff. Names that cannot decode or strictly parse at the configured granularity defer to the normal planner, which skips them and reports incomplete `malformed_partition` evidence (UNKNOWN, not zero debt). Non-ingestion layouts require the normal planner. |
 | OPTIMIZE | No eligible physical partition contains the configured minimum small files (at least two). Ingestion partition names must decode and parse at the configured granularity; malformed names defer to the full planner and remain incomplete, even below the file-count threshold. The newest ingestion partition is excluded when `sealedPartitionsOnly` is true; categorical/multi-column Hive partitions conservatively use the full planner. Inactive physical files can force a full plan, but cannot authorize compaction. |
 | VACUUM | Always defers to bounded tombstone replay. Physical object timestamps cannot establish tombstone eligibility or prove zero debt. |
 | Checkpoint | Latest log version minus checkpoint version is below `delta.checkpointInterval`. Unsupported multipart/v2 layouts go through the full path. |
 | PRUNE-LOG | No retained log object is older than log retention. Otherwise the existing checkpoint/history equivalence proof remains mandatory; missing proof is incomplete. Full apply preserves the plan's due-work evidence, including no-work exits. |
 
 Metadata-only filesystem property caches are fenced by log-object identity tokens, including checkpoint changes and same-version replacements. Retention probes are recomputed against the current clock every pass; they are never cached solely by version.
+
+Writer and maintenance must resolve the same `arrowcol.partition.granularity` policy. A partition column alone does not persist that policy: when metadata has no value, separate writer and maintenance process defaults can disagree. Minute (`YYYY-MM-DD-HH-MM`), hour (`YYYY-MM-DD-HH`) and day (`YYYY-MM-DD`) values are parsed only at the resolved granularity; maintenance never guesses another format or truncates a timestamp to make a mismatched policy pass. Align the producer and maintenance policy rather than treating skipped partitions as healthy idle work.
 
 ## Destructive safety
 

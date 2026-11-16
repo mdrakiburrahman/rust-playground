@@ -1125,7 +1125,12 @@ impl DeltaTable {
                                 .split('/')
                                 .find_map(|segment| segment.strip_prefix("__arrowcol_ingestion="));
                             let Some(part) = part else { return Ok(None) };
-                            let start = config.granularity.parse_partition(&percent_decode(part)?)?;
+                            let Ok(part) = percent_decode(part) else {
+                                return Ok(None);
+                            };
+                            let Ok(start) = config.granularity.parse_partition(&part) else {
+                                return Ok(None);
+                            };
                             eligible |= start.saturating_add(config.granularity.width_ms()) <= cutoff;
                         }
                         !eligible
