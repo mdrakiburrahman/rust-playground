@@ -86,6 +86,7 @@ pub struct RunInventory {
     pub fencing_token: u64,
     pub orchestration_run_id: String,
     pub cell_run_id: String,
+    pub load_admission: InventoryLoadAdmission,
     pub namespace: InventoryNamespace,
     pub resources: Vec<InventoryResource>,
     pub fic: Option<InventoryFic>,
@@ -93,6 +94,25 @@ pub struct RunInventory {
     #[serde(default)]
     pub evidence_destination: Option<InventoryEvidenceDestination>,
     pub cleanup: InventoryCleanup,
+}
+
+#[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InventoryLoadAdmission {
+    NotAuthorized,
+    AuthorizationPending,
+    Authorized,
+}
+
+impl InventoryLoadAdmission {
+    fn can_advance_to(self, next: Self) -> bool {
+        self == next
+            || matches!(
+                (self, next),
+                (Self::NotAuthorized, Self::AuthorizationPending)
+                    | (Self::AuthorizationPending, Self::Authorized)
+            )
+    }
 }
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
@@ -646,6 +666,7 @@ impl RunInventory {
             || self.fencing_token != next.fencing_token
             || self.orchestration_run_id != next.orchestration_run_id
             || self.cell_run_id != next.cell_run_id
+            || !self.load_admission.can_advance_to(next.load_admission)
             || self.namespace.name != next.namespace.name
             || self.namespace.owner_token != next.namespace.owner_token
             || self
@@ -957,6 +978,14 @@ trait Platform: Send + Sync {
     fn qap_observation_mode(&self) -> arrowcol_loadgen::ObservationMode;
     fn qap_database(&self, config: &OatConfig) -> Result<String>;
     async fn initialize_qap(&mut self, config: &OatConfig, run_id: &str, tables: &[String]) -> Result<Vec<String>>;
+    async fn prepare_campaign_load_admission(
+        &mut self,
+        _config: &OatConfig,
+        _run_id: &str,
+        _tables: &[String],
+    ) -> Result<()> {
+        Ok(())
+    }
     fn mark_qap_outcome_unresolved(&mut self) {}
     async fn prepare_client_fleet(&mut self, config: &OatConfig, run_id: &str) -> Result<()>;
     async fn start_client(
@@ -1183,32 +1212,48 @@ impl Platform for AksPlatform {
     }
 
     async fn initialize_qap(&mut self, config: &OatConfig, run_id: &str, tables: &[String]) -> Result<Vec<String>> {
-        let bindings = qap_bindings(run_id, tables)?;
         let database = self.qap_database(config)?;
-        let bootstrap_env_file = configured_bootstrap_env_file(config)?;
+        let relative_root = self
+            .qap_relative_data_root
+            .as_deref()
+            .context("AKS run-scoped data root is missing")?;
+        let (manifest, inventory_bindings) = campaign_qap_manifest(run_id, &database, relative_root, tables)?;
         let runtime_dir = self
             .runtime_dir
             .as_deref()
             .context("AKS runtime directory is not available")?;
         let manifest_path = runtime_dir.join("oat-qap-manifest.json");
         let record_path = runtime_dir.join("oat-qap-record.json");
-        let manifest = json!({
-            "schema_version": 1,
-            "run_id": run_id,
-            "database": database,
-            "tables": bindings.iter().map(|binding| Ok(json!({
-                "external_table": binding.external_table,
-                "relative_path": aks_qap_relative_path(
-                    self.qap_relative_data_root.as_deref().context("AKS run-scoped data root is missing")?,
-                    &binding.logical_table,
-                )?,
-            }))).collect::<Result<Vec<_>>>()?,
-        });
-        tokio::fs::write(&manifest_path, serde_json::to_vec(&manifest)?)
-            .await
-            .with_context(|| format!("write run-owned AKS QAP manifest {}", manifest_path.display()))?;
+        if config.campaign_profile == Some(crate::config::CampaignProfile::SingleHotTable) {
+            let saved_manifest: Value = serde_json::from_slice(
+                &tokio::fs::read(&manifest_path)
+                    .await
+                    .context("read pre-admission QAP manifest")?,
+            )
+            .context("parse pre-admission QAP manifest")?;
+            if saved_manifest != manifest {
+                bail!("QAP manifest changed after its exact planned bindings were persisted");
+            }
+            let inventory = campaign_inventory_for_setup(self).await?;
+            let qap = inventory.qap.as_ref().context("campaign QAP bindings were not planned before admission")?;
+            if qap.database != database
+                || qap.bindings != inventory_bindings
+                || qap.state != InventoryResourceState::Planned
+                || qap.reference.is_some()
+            {
+                bail!("campaign inventory does not contain the exact planned QAP manifest");
+            }
+            let mut uncertain = qap.clone();
+            uncertain.state = InventoryResourceState::Uncertain;
+            update_campaign_qap_inventory(self, uncertain).await?;
+        } else {
+            tokio::fs::write(&manifest_path, serde_json::to_vec(&manifest)?)
+                .await
+                .with_context(|| format!("write run-owned AKS QAP manifest {}", manifest_path.display()))?;
+        }
         self.qap_record_path = Some(record_path.clone());
         self.qap_bind_attempted = true;
+        let bootstrap_env_file = configured_bootstrap_env_file(config)?;
         let workload_record = self
             .fic_ready_snapshot_path
             .as_deref()
@@ -1236,7 +1281,168 @@ impl Platform for AksPlatform {
         )
         .await
         .context("verify run-owned AKS QAP bindings")?;
-        Ok(bindings.iter().map(|binding| binding.external_table.clone()).collect())
+        if config.campaign_profile == Some(crate::config::CampaignProfile::SingleHotTable) {
+            let reference = run_oat_qap_reference(&record_path, bootstrap_env_file).await?;
+            let mut observed = campaign_inventory_for_setup(self)
+                .await?
+                .qap
+                .context("campaign QAP bindings disappeared after verification")?;
+            observed.state = InventoryResourceState::Observed;
+            observed.reference = Some(reference);
+            update_campaign_qap_inventory(self, observed).await?;
+        }
+        Ok(inventory_bindings
+            .into_iter()
+            .map(|binding| binding.external_table)
+            .collect())
+    }
+
+    async fn prepare_campaign_load_admission(
+        &mut self,
+        config: &OatConfig,
+        run_id: &str,
+        tables: &[String],
+    ) -> Result<()> {
+        if config.campaign_profile != Some(crate::config::CampaignProfile::SingleHotTable) {
+            return Ok(());
+        }
+        let [hot_table] = tables else {
+            bail!("campaign load admission requires exactly one frozen hot table");
+        };
+        let database = self.qap_database(config)?;
+        let relative_root = self
+            .qap_relative_data_root
+            .as_deref()
+            .context("AKS run-scoped data root is missing")?;
+        let (manifest, bindings) = campaign_qap_manifest(run_id, &database, relative_root, tables)?;
+        let hot_path = aks_qap_relative_path(relative_root, hot_table)?;
+        let matching_bindings = bindings
+            .iter()
+            .filter(|binding| binding.relative_path == hot_path)
+            .count();
+        if matching_bindings != 1 {
+            bail!("campaign hot Delta path must match exactly one persisted QAP binding");
+        }
+        let runtime_dir = self
+            .runtime_dir
+            .as_deref()
+            .context("campaign runtime directory is not available")?;
+        let manifest_path = runtime_dir.join("oat-qap-manifest.json");
+        tokio::fs::write(&manifest_path, serde_json::to_vec(&manifest)?)
+            .await
+            .with_context(|| format!("write pre-admission AKS QAP manifest {}", manifest_path.display()))?;
+        let mut inventory = campaign_inventory_for_setup(self).await?;
+        if inventory.load_admission != InventoryLoadAdmission::NotAuthorized
+            || inventory.namespace.uid.is_none()
+            || inventory.qap.is_some()
+        {
+            bail!("campaign load admission is not in its initial pre-provisioned state");
+        }
+        update_campaign_qap_inventory(
+            self,
+            InventoryQap {
+                database,
+                bindings: bindings.clone(),
+                state: InventoryResourceState::Planned,
+                absence: Vec::new(),
+                reference: None,
+            },
+        )
+        .await?;
+        inventory = campaign_inventory_for_setup(self).await?;
+        if inventory.load_admission != InventoryLoadAdmission::NotAuthorized {
+            bail!("campaign baseline can only be captured before load authorization");
+        }
+        let expected_etag = tokio::fs::read_to_string(runtime_dir.join("campaign-inventory-etag"))
+            .await
+            .context("read current campaign inventory ETag before baseline capture")?;
+        validate_campaign_etag(expected_etag.trim())?;
+        let identity = CampaignIdentity::from_lookup(|name| std::env::var(name).ok())?;
+        let actor = CampaignCleanupActor {
+            mode: CampaignActorMode::Producer,
+            owner_id: identity.owner_id.clone(),
+            fencing_token: identity.fencing_token,
+        };
+        let request = CampaignCellBaselineRequest {
+            schema_version: 1,
+            campaign_id: &identity.campaign_id,
+            orchestration_run_id: &inventory.orchestration_run_id,
+            cell_run_id: run_id,
+            expected_etag: expected_etag.trim(),
+            hot_delta_relative_path: &hot_path,
+            actor: &actor,
+        };
+        let output = run_campaign_custody_json(
+            "capture-cell-baseline",
+            None,
+            &request,
+            Duration::from_secs(90),
+        )
+        .await?;
+        let response: CampaignCellBaselineResponse =
+            serde_json::from_slice(&output).context("parse immutable cell baseline receipt")?;
+        if !response.ok {
+            let code = response
+                .code
+                .as_deref()
+                .filter(|code| {
+                    matches!(
+                        *code,
+                        "campaign_fenced" | "stale_version" | "write_outcome_unknown" | "invalid_or_storage_error"
+                    )
+                })
+                .context("cell baseline failure returned no recognized error code")?;
+            if response.message.is_none() {
+                bail!("cell baseline failure omitted its required diagnostic message");
+            }
+            bail!("cell baseline capture failed: {code}");
+        }
+        if response.code.is_some() || response.message.is_some() {
+            bail!("successful cell baseline response included error fields");
+        }
+        let receipt = response.receipt.context("cell baseline capture returned no receipt")?;
+        validate_campaign_cell_baseline(&receipt, &inventory, &identity, run_id, &hot_path)?;
+        tokio::fs::write(runtime_dir.join("campaign-cell-baseline.json"), serde_json::to_vec(&receipt)?)
+            .await
+            .context("persist immutable cell baseline receipt")?;
+
+        let mut pending = inventory.clone();
+        pending.load_admission = InventoryLoadAdmission::AuthorizationPending;
+        inventory.validate_successor(&pending)?;
+        persist_campaign_inventory(self, &pending).await?;
+        let (confirmed, etag) = read_authoritative_campaign_inventory(
+            self,
+            &identity,
+            &inventory.orchestration_run_id,
+            Duration::from_secs(60),
+        )
+        .await?;
+        if confirmed.load_admission != InventoryLoadAdmission::AuthorizationPending
+            || confirmed.qap.as_ref().is_none_or(|qap| {
+                qap.state != InventoryResourceState::Planned || qap.bindings != bindings
+            })
+        {
+            bail!("authoritative campaign inventory did not confirm the pending load authorization");
+        }
+        pending.validate_successor(&confirmed)?;
+        persist_campaign_inventory_snapshot(self, &confirmed, &etag).await?;
+        let mut authorized = confirmed.clone();
+        authorized.load_admission = InventoryLoadAdmission::Authorized;
+        confirmed.validate_successor(&authorized)?;
+        persist_campaign_inventory(self, &authorized).await?;
+        let (final_inventory, final_etag) = read_authoritative_campaign_inventory(
+            self,
+            &identity,
+            &inventory.orchestration_run_id,
+            Duration::from_secs(60),
+        )
+        .await?;
+        if final_inventory.load_admission != InventoryLoadAdmission::Authorized {
+            bail!("authoritative campaign inventory did not positively confirm load authorization");
+        }
+        authorized.validate_successor(&final_inventory)?;
+        persist_campaign_inventory_snapshot(self, &final_inventory, &final_etag).await?;
+        Ok(())
     }
 
     fn mark_qap_outcome_unresolved(&mut self) {
@@ -3447,6 +3653,9 @@ async fn run_clients_inner(
     platform: &mut dyn Platform,
     pinning: &mut PinningReport,
 ) -> Result<ClientRun> {
+    platform
+        .prepare_campaign_load_admission(config, project_run_id, tables)
+        .await?;
     let timing_budget = config.timing_budget()?;
     local_progress(
         config,
@@ -6783,6 +6992,31 @@ fn qap_bindings(run_id: &str, tables: &[String]) -> Result<Vec<QapBinding>> {
         .collect()
 }
 
+fn campaign_qap_manifest(
+    run_id: &str,
+    database: &str,
+    run_root: &str,
+    tables: &[String],
+) -> Result<(Value, Vec<InventoryQapBinding>)> {
+    let bindings = qap_bindings(run_id, tables)?;
+    let inventory_bindings = bindings
+        .iter()
+        .map(|binding| {
+            Ok(InventoryQapBinding {
+                external_table: binding.external_table.clone(),
+                relative_path: aks_qap_relative_path(run_root, &binding.logical_table)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let manifest = json!({
+        "schema_version": 1,
+        "run_id": run_id,
+        "database": database,
+        "tables": inventory_bindings,
+    });
+    Ok((manifest, inventory_bindings))
+}
+
 fn aks_qap_relative_path(run_root: &str, table: &str) -> Result<String> {
     if !table.starts_with("sqlserver_") || !table.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_') {
         bail!("OAT QAP table path has an invalid table identity");
@@ -6904,6 +7138,53 @@ struct CampaignCleanupRequest<'a> {
     actor: &'a CampaignCleanupActor,
 }
 
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct CampaignCellBaselineRequest<'a> {
+    schema_version: u8,
+    campaign_id: &'a str,
+    orchestration_run_id: &'a str,
+    cell_run_id: &'a str,
+    expected_etag: &'a str,
+    hot_delta_relative_path: &'a str,
+    actor: &'a CampaignCleanupActor,
+}
+
+#[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum CampaignDeltaState {
+    Table,
+    ObservedAbsent,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct CampaignCellBaselineReceipt {
+    status: String,
+    campaign_id: String,
+    owner_id: String,
+    fencing_token: u64,
+    orchestration_run_id: String,
+    cell_run_id: String,
+    namespace_uid: String,
+    hot_delta_relative_path: String,
+    blob: String,
+    etag: String,
+    delta_state: CampaignDeltaState,
+    table_id: Option<String>,
+    delta_version: Option<u64>,
+    rows: Option<u64>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CampaignCellBaselineResponse {
+    ok: bool,
+    receipt: Option<CampaignCellBaselineReceipt>,
+    code: Option<String>,
+    message: Option<String>,
+}
+
 #[derive(Clone, Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CampaignInventoryReadResponse {
@@ -6956,12 +7237,52 @@ fn validate_campaign_etag(etag: &str) -> Result<()> {
     Ok(())
 }
 
+const MAX_CAMPAIGN_CLEANUP_ATTEMPTS: usize = 3;
+
+#[derive(Debug)]
+struct StaleCampaignVersionError {
+    action: String,
+}
+
+impl std::fmt::Display for StaleCampaignVersionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "campaign cleanup {} rejected a stale version before effects", self.action)
+    }
+}
+
+impl std::error::Error for StaleCampaignVersionError {}
+
+fn campaign_custody_helper_failure(action: &str, stdout: &[u8]) -> anyhow::Error {
+    let code = serde_json::from_slice::<Value>(stdout)
+        .ok()
+        .and_then(|response| response.get("code").and_then(Value::as_str).map(str::to_owned))
+        .filter(|code| {
+            matches!(
+                code.as_str(),
+                "campaign_fenced" | "stale_version" | "write_outcome_unknown" | "invalid_or_storage_error"
+            )
+        })
+        .unwrap_or_else(|| "invalid_response".to_owned());
+    if action == "cleanup-step" && code == "stale_version" {
+        anyhow::Error::new(StaleCampaignVersionError {
+            action: action.to_owned(),
+        })
+    } else {
+        anyhow::anyhow!("campaign custody helper {action} failed: {code}")
+    }
+}
+
+#[cfg(unix)]
 async fn run_campaign_custody_json<T: serde::Serialize>(
     action: &str,
     selector: Option<&str>,
     request: &T,
+    timeout: Duration,
 ) -> Result<Vec<u8>> {
     let payload = serde_json::to_vec(request)?;
+    if payload.len() > 1024 * 1024 {
+        bail!("campaign custody request exceeds the helper input limit");
+    }
     let workspace = std::env::current_dir().context("resolve repository root for campaign custody helper")?;
     let mut command = Command::new("npx");
     command
@@ -6970,35 +7291,87 @@ async fn run_campaign_custody_json<T: serde::Serialize>(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .process_group(0)
         .kill_on_drop(true);
     if let Some(selector) = selector {
         command.arg(selector);
     }
-    let mut child = command.spawn().context("start campaign custody helper")?;
-    let mut stdin = child.stdin.take().context("open campaign custody helper input")?;
-    stdin
-        .write_all(&payload)
-        .await
-        .context("write campaign custody request")?;
-    drop(stdin);
-    let output = child
-        .wait_with_output()
-        .await
-        .context("wait for campaign custody helper")?;
+    let output = match tokio::time::timeout(timeout, async {
+        let mut child = command.spawn().context("start campaign custody helper")?;
+        let pid = i32::try_from(child.id().context("campaign custody helper PID unavailable")?)
+            .context("campaign custody helper PID invalid")?;
+        let _group = OwnedQapHelperGroup(rustix::process::Pid::from_raw(pid).context("campaign custody helper PID invalid")?);
+        let mut stdin = child.stdin.take().context("open campaign custody helper input")?;
+        stdin
+            .write_all(&payload)
+            .await
+            .context("write campaign custody request")?;
+        drop(stdin);
+        child
+            .wait_with_output()
+            .await
+            .context("wait for campaign custody helper")
+    })
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) if matches!(action, "cleanup-step" | "capture-cell-baseline") => {
+            bail!("campaign {action} helper timed out; effect outcome is UNKNOWN and must not be replayed")
+        }
+        Err(_) => bail!("campaign inventory helper timed out; no authoritative readback was obtained"),
+    };
     if !output.status.success() {
-        let code = serde_json::from_slice::<Value>(&output.stdout)
-            .ok()
-            .and_then(|response| response.get("code").and_then(Value::as_str).map(str::to_owned))
-            .filter(|code| {
-                matches!(
-                    code.as_str(),
-                    "campaign_fenced" | "write_outcome_unknown" | "invalid_or_storage_error"
-                )
-            })
-            .unwrap_or_else(|| "invalid_response".to_owned());
-        bail!("campaign custody helper {action} failed: {code}");
+        return Err(campaign_custody_helper_failure(action, &output.stdout));
     }
     Ok(output.stdout)
+}
+
+#[cfg(not(unix))]
+async fn run_campaign_custody_json<T: serde::Serialize>(
+    _action: &str,
+    _selector: Option<&str>,
+    _request: &T,
+    _timeout: Duration,
+) -> Result<Vec<u8>> {
+    bail!("campaign custody requires Unix process-group cancellation")
+}
+
+fn validate_campaign_cell_baseline(
+    receipt: &CampaignCellBaselineReceipt,
+    inventory: &RunInventory,
+    identity: &CampaignIdentity,
+    run_id: &str,
+    hot_delta_relative_path: &str,
+) -> Result<()> {
+    validate_campaign_etag(&receipt.etag)?;
+    if receipt.status != "captured"
+        || receipt.campaign_id != identity.campaign_id
+        || receipt.owner_id != identity.owner_id
+        || receipt.fencing_token != identity.fencing_token
+        || receipt.orchestration_run_id != inventory.orchestration_run_id
+        || receipt.cell_run_id != run_id
+        || receipt.namespace_uid != inventory.namespace.uid.as_deref().unwrap_or_default()
+        || receipt.hot_delta_relative_path != hot_delta_relative_path
+        || !valid_blob_path(&receipt.blob)
+    {
+        bail!("cell baseline receipt does not match the exact campaign, cell, namespace and hot Delta path");
+    }
+    match receipt.delta_state {
+        CampaignDeltaState::Table => {
+            if receipt.table_id.as_deref().is_none_or(str::is_empty)
+                || receipt.delta_version.is_none()
+                || receipt.rows.is_none()
+            {
+                bail!("existing-table baseline requires its exact Delta table ID, version and row count");
+            }
+        }
+        CampaignDeltaState::ObservedAbsent => {
+            if receipt.table_id.is_some() || receipt.delta_version.is_some() || receipt.rows.is_some() {
+                bail!("observed-absent baseline must not invent table identity, version or row count");
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_campaign_inventory_identity(
@@ -7025,6 +7398,7 @@ async fn read_authoritative_campaign_inventory(
     platform: &AksPlatform,
     identity: &CampaignIdentity,
     orchestration_run_id: &str,
+    timeout: Duration,
 ) -> Result<(RunInventory, String)> {
     let actor = CampaignCleanupActor {
         mode: CampaignActorMode::Producer,
@@ -7038,7 +7412,7 @@ async fn read_authoritative_campaign_inventory(
         cell_run_id: &platform.run_id,
         actor: &actor,
     };
-    let output = run_campaign_custody_json("read-inventory", None, &request).await?;
+    let output = run_campaign_custody_json("read-inventory", None, &request, timeout).await?;
     let response: CampaignInventoryReadResponse =
         serde_json::from_slice(&output).context("parse authoritative campaign inventory")?;
     if !response.ok {
@@ -7112,6 +7486,84 @@ fn campaign_cleanup_step_complete(action: &CampaignCleanupAction, inventory: &Ru
     Ok(())
 }
 
+fn campaign_cleanup_action_needs_execution(action: &CampaignCleanupAction, inventory: &RunInventory) -> Result<bool> {
+    if campaign_cleanup_step_complete(action, inventory).is_ok() {
+        return Ok(false);
+    }
+    if let Some(step) = campaign_cleanup_step(action, inventory) {
+        match step.state {
+            InventoryStepState::NotStarted => {}
+            InventoryStepState::Complete => {
+                bail!("campaign cleanup {} has incomplete completion evidence", action.selector());
+            }
+            InventoryStepState::Pending
+            | InventoryStepState::Running
+            | InventoryStepState::Failed
+            | InventoryStepState::Uncertain => {
+                bail!(
+                    "campaign cleanup {} is already running or unresolved; refusing replay",
+                    action.selector()
+                );
+            }
+        }
+    }
+    let uncertain_resource = match action {
+        CampaignCleanupAction::RemoveNamespace => inventory
+            .resources
+            .iter()
+            .any(|resource| resource.state == InventoryResourceState::Uncertain),
+        CampaignCleanupAction::RemoveQap => inventory
+            .qap
+            .as_ref()
+            .is_some_and(|qap| qap.state == InventoryResourceState::Uncertain),
+        CampaignCleanupAction::RemoveFic => inventory
+            .fic
+            .as_ref()
+            .is_some_and(|fic| fic.state == InventoryResourceState::Uncertain),
+        _ => false,
+    };
+    if uncertain_resource {
+        bail!(
+            "campaign cleanup {} has uncertain resource state; refusing replay",
+            action.selector()
+        );
+    }
+    Ok(true)
+}
+
+const CAMPAIGN_CLEANUP_DEFAULT_TIMEOUT_MS: u64 = 60_000;
+
+fn campaign_cleanup_operation_deadline_ms(
+    action: &CampaignCleanupAction,
+    inventory: &RunInventory,
+    now_unix_ms: u64,
+) -> Result<u64> {
+    // These start-state budgets match the deadlines assigned by mark() in aks-cell-cleanup.ts.
+    let default_timeout_ms = match action {
+        CampaignCleanupAction::StopAdmission => 60_000,
+        CampaignCleanupAction::BoundedDrain | CampaignCleanupAction::StopMaintenance => 120_000,
+        _ => CAMPAIGN_CLEANUP_DEFAULT_TIMEOUT_MS,
+    };
+    let deadline = campaign_cleanup_step(action, inventory)
+        .and_then(|step| step.deadline_unix_ms)
+        .unwrap_or_else(|| now_unix_ms.saturating_add(default_timeout_ms));
+    if deadline <= now_unix_ms {
+        bail!("campaign cleanup {} operation deadline has expired", action.selector());
+    }
+    Ok(deadline)
+}
+
+fn campaign_cleanup_remaining_budget(
+    deadline: tokio::time::Instant,
+    action: &CampaignCleanupAction,
+) -> Result<Duration> {
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        bail!("campaign cleanup {} operation deadline has expired", action.selector());
+    }
+    Ok(remaining)
+}
+
 async fn execute_campaign_cleanup_action(
     platform: &AksPlatform,
     identity: &CampaignIdentity,
@@ -7119,52 +7571,101 @@ async fn execute_campaign_cleanup_action(
     action: &CampaignCleanupAction,
     inventory: &RunInventory,
     etag: &str,
-) -> Result<(RunInventory, String, CampaignCleanupReceipt)> {
-    validate_campaign_etag(etag)?;
+) -> Result<(RunInventory, String, Option<CampaignCleanupReceipt>)> {
+    let mut current_inventory = inventory.clone();
+    let mut current_etag = etag.to_owned();
+    let now_unix_ms = unix_time_ms_u64()?;
+    let deadline_unix_ms = campaign_cleanup_operation_deadline_ms(action, &current_inventory, now_unix_ms)?;
+    let operation_deadline = tokio::time::Instant::now() + Duration::from_millis(deadline_unix_ms - now_unix_ms);
     let actor = CampaignCleanupActor {
         mode: CampaignActorMode::Producer,
         owner_id: identity.owner_id.clone(),
         fencing_token: identity.fencing_token,
     };
-    let request = CampaignCleanupRequest {
-        schema_version: 1,
-        inventory,
-        expected_etag: etag,
-        actor: &actor,
-    };
-    let output = run_campaign_custody_json("cleanup-step", Some(action.selector()), &request).await?;
-    let response: CampaignCleanupResponse =
-        serde_json::from_slice(&output).context("parse campaign cleanup receipt")?;
-    if !response.ok {
-        bail!("campaign cleanup {} was not positively confirmed", action.selector());
+    for attempt in 0..MAX_CAMPAIGN_CLEANUP_ATTEMPTS {
+        if !campaign_cleanup_action_needs_execution(action, &current_inventory)? {
+            return Ok((current_inventory, current_etag, None));
+        }
+        validate_campaign_etag(&current_etag)?;
+        let output = {
+            let request = CampaignCleanupRequest {
+                schema_version: 1,
+                inventory: &current_inventory,
+                expected_etag: &current_etag,
+                actor: &actor,
+            };
+            let timeout = campaign_cleanup_remaining_budget(operation_deadline, action)?;
+            run_campaign_custody_json("cleanup-step", Some(action.selector()), &request, timeout).await
+        };
+        let output = match output {
+            Ok(output) => output,
+            Err(error) if error.downcast_ref::<StaleCampaignVersionError>().is_some() => {
+                let timeout = campaign_cleanup_remaining_budget(operation_deadline, action)?;
+                let (refreshed_inventory, refreshed_etag) =
+                    read_authoritative_campaign_inventory(platform, identity, orchestration_run_id, timeout).await?;
+                current_inventory.validate_successor(&refreshed_inventory)?;
+                if refreshed_etag == current_etag {
+                    bail!(
+                        "campaign cleanup {} stale-version refresh returned the unchanged ETag; refusing retry",
+                        action.selector()
+                    );
+                }
+                persist_campaign_inventory_snapshot(platform, &refreshed_inventory, &refreshed_etag).await?;
+                current_inventory = refreshed_inventory;
+                current_etag = refreshed_etag;
+                if !campaign_cleanup_action_needs_execution(action, &current_inventory)? {
+                    return Ok((current_inventory, current_etag, None));
+                }
+                if attempt + 1 == MAX_CAMPAIGN_CLEANUP_ATTEMPTS {
+                    bail!(
+                        "campaign cleanup {} exhausted {} attempts after stale inventory versions",
+                        action.selector(),
+                        MAX_CAMPAIGN_CLEANUP_ATTEMPTS
+                    );
+                }
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let response: CampaignCleanupResponse =
+            serde_json::from_slice(&output).context("parse campaign cleanup receipt")?;
+        if !response.ok {
+            bail!("campaign cleanup {} was not positively confirmed", action.selector());
+        }
+        let receipt = response.receipt;
+        validate_campaign_etag(&receipt.etag)?;
+        if receipt.status != "complete"
+            || receipt.step != action.selector()
+            || receipt.campaign_id != current_inventory.campaign_id
+            || receipt.owner_id != current_inventory.owner_id
+            || receipt.fencing_token != current_inventory.fencing_token
+            || receipt.orchestration_run_id != current_inventory.orchestration_run_id
+            || receipt.cell_run_id != current_inventory.cell_run_id
+            || receipt.namespace_uid != current_inventory.namespace.uid
+            || receipt.actor != actor
+            || receipt.completed_at_unix_ms == 0
+        {
+            bail!(
+                "campaign cleanup {} returned a mismatched or incomplete receipt",
+                action.selector()
+            );
+        }
+        let timeout = campaign_cleanup_remaining_budget(operation_deadline, action)?;
+        let (next_inventory, next_etag) =
+            read_authoritative_campaign_inventory(platform, identity, orchestration_run_id, timeout).await?;
+        if next_etag != receipt.etag {
+            bail!("campaign cleanup receipt ETag does not match authoritative inventory readback");
+        }
+        current_inventory.validate_successor(&next_inventory)?;
+        campaign_cleanup_step_complete(action, &next_inventory)?;
+        persist_campaign_inventory_snapshot(platform, &next_inventory, &next_etag).await?;
+        return Ok((next_inventory, next_etag, Some(receipt)));
     }
-    let receipt = response.receipt;
-    validate_campaign_etag(&receipt.etag)?;
-    if receipt.status != "complete"
-        || receipt.step != action.selector()
-        || receipt.campaign_id != inventory.campaign_id
-        || receipt.owner_id != inventory.owner_id
-        || receipt.fencing_token != inventory.fencing_token
-        || receipt.orchestration_run_id != inventory.orchestration_run_id
-        || receipt.cell_run_id != inventory.cell_run_id
-        || receipt.namespace_uid != inventory.namespace.uid
-        || receipt.actor != actor
-        || receipt.completed_at_unix_ms == 0
-    {
-        bail!(
-            "campaign cleanup {} returned a mismatched or incomplete receipt",
-            action.selector()
-        );
-    }
-    let (next_inventory, next_etag) =
-        read_authoritative_campaign_inventory(platform, identity, orchestration_run_id).await?;
-    if next_etag != receipt.etag {
-        bail!("campaign cleanup receipt ETag does not match authoritative inventory readback");
-    }
-    inventory.validate_successor(&next_inventory)?;
-    campaign_cleanup_step_complete(action, &next_inventory)?;
-    persist_campaign_inventory_snapshot(platform, &next_inventory, &next_etag).await?;
-    Ok((next_inventory, next_etag, receipt))
+    bail!(
+        "campaign cleanup {} exhausted {} attempts",
+        action.selector(),
+        MAX_CAMPAIGN_CLEANUP_ATTEMPTS
+    )
 }
 
 async fn persist_campaign_inventory_snapshot(
@@ -7217,8 +7718,13 @@ async fn cleanup_campaign_aks_platform(config: &OatConfig, platform: &AksPlatfor
     if cached.namespace.name != config.namespace || cached.namespace.owner_token != platform.namespace_owner_token {
         bail!("persisted campaign inventory does not match the OAT namespace origin");
     }
-    let (mut inventory, mut etag) =
-        read_authoritative_campaign_inventory(platform, &identity, &orchestration_run_id).await?;
+    let (mut inventory, mut etag) = read_authoritative_campaign_inventory(
+        platform,
+        &identity,
+        &orchestration_run_id,
+        Duration::from_secs(60),
+    )
+    .await?;
     cached.validate_successor(&inventory)?;
     persist_campaign_inventory_snapshot(platform, &inventory, &etag).await?;
     let actions = [
@@ -7234,23 +7740,9 @@ async fn cleanup_campaign_aks_platform(config: &OatConfig, platform: &AksPlatfor
     ];
     let mut receipts = Vec::with_capacity(actions.len());
     for action in actions {
-        if let Some(step) = campaign_cleanup_step(&action, &inventory) {
-            match step.state {
-                InventoryStepState::Complete => {
-                    receipts.push(json!({"step": action.selector(), "status": "already_complete", "source": "authoritative_inventory"}));
-                    continue;
-                }
-                InventoryStepState::NotStarted => {}
-                InventoryStepState::Pending
-                | InventoryStepState::Running
-                | InventoryStepState::Failed
-                | InventoryStepState::Uncertain => {
-                    bail!(
-                        "campaign cleanup {} is already running or unresolved; refusing replay",
-                        action.selector()
-                    );
-                }
-            }
+        if !campaign_cleanup_action_needs_execution(&action, &inventory)? {
+            receipts.push(json!({"step": action.selector(), "status": "already_complete", "source": "authoritative_inventory"}));
+            continue;
         }
         let (next_inventory, next_etag, receipt) =
             execute_campaign_cleanup_action(platform, &identity, &orchestration_run_id, &action, &inventory, &etag)
@@ -7258,9 +7750,61 @@ async fn cleanup_campaign_aks_platform(config: &OatConfig, platform: &AksPlatfor
                 .with_context(|| format!("execute custody cleanup {}", action.selector()))?;
         inventory = next_inventory;
         etag = next_etag;
-        receipts.push(serde_json::to_value(receipt)?);
+        if let Some(receipt) = receipt {
+            receipts.push(serde_json::to_value(receipt)?);
+        } else {
+            receipts.push(json!({"step": action.selector(), "status": "already_complete", "source": "authoritative_inventory"}));
+        }
     }
     Ok(json!({"status":"observed", "cleanup_receipts":receipts}))
+}
+
+async fn campaign_inventory_for_setup(platform: &AksPlatform) -> Result<RunInventory> {
+    let runtime_dir = platform
+        .runtime_dir
+        .as_deref()
+        .context("campaign runtime directory is not available")?;
+    let inventory: RunInventory = serde_json::from_slice(
+        &tokio::fs::read(runtime_dir.join("campaign-inventory.json"))
+            .await
+            .context("read persisted campaign inventory for setup")?,
+    )
+    .context("parse persisted campaign inventory for setup")?;
+    let etag = tokio::fs::read_to_string(runtime_dir.join("campaign-inventory-etag"))
+        .await
+        .context("read persisted campaign inventory ETag for setup")?;
+    validate_campaign_etag(etag.trim())?;
+    let identity = CampaignIdentity::from_lookup(|name| std::env::var(name).ok())?;
+    validate_campaign_inventory_identity(
+        &inventory,
+        &identity.campaign_id,
+        &identity.owner_id,
+        identity.fencing_token,
+        &inventory.orchestration_run_id,
+        &platform.run_id,
+    )?;
+    if inventory.namespace.owner_token != platform.namespace_owner_token
+        || inventory.namespace.uid != platform.namespace_uid
+    {
+        bail!("campaign setup inventory does not match the exact namespace owner and UID");
+    }
+    Ok(inventory)
+}
+
+async fn update_campaign_fic_inventory(platform: &AksPlatform, fic: InventoryFic) -> Result<()> {
+    let current = campaign_inventory_for_setup(platform).await?;
+    let mut next = current.clone();
+    next.fic = Some(fic);
+    current.validate_successor(&next)?;
+    persist_campaign_inventory(platform, &next).await
+}
+
+async fn update_campaign_qap_inventory(platform: &AksPlatform, qap: InventoryQap) -> Result<()> {
+    let current = campaign_inventory_for_setup(platform).await?;
+    let mut next = current.clone();
+    next.qap = Some(qap);
+    current.validate_successor(&next)?;
+    persist_campaign_inventory(platform, &next).await
 }
 
 async fn persist_campaign_inventory(platform: &AksPlatform, inventory: &RunInventory) -> Result<()> {
@@ -7304,6 +7848,7 @@ async fn initialize_campaign_inventory(
         fencing_token: identity.fencing_token,
         orchestration_run_id: orchestration_run_id.to_owned(),
         cell_run_id: platform.run_id.clone(),
+        load_admission: InventoryLoadAdmission::NotAuthorized,
         namespace: InventoryNamespace {
             name: config.namespace.clone(),
             uid: None,
@@ -7357,7 +7902,7 @@ async fn record_campaign_namespace_uid(config: &OatConfig, platform: &AksPlatfor
     }
     let mut next = current.clone();
     next.namespace.uid = Some(uid.to_owned());
-    next.validate_successor(&current)?;
+    current.validate_successor(&next)?;
     persist_campaign_inventory(platform, &next).await
 }
 
@@ -7504,6 +8049,34 @@ async fn prepare_aks_platform(
         .to_owned();
     platform.service_account = Some(service_account.clone());
     apply_runtime_resources(config, platform, service_accounts).await?;
+    let fic_plan = run_run_fic_plan(&platform.run_id, &config.namespace, &service_account, bootstrap_env_file).await?;
+    let fic_plan_path = runtime_dir.join(format!("run-fic-{}-identity-plan.json", platform.run_id));
+    write_private_secret(&fic_plan_path, &serde_json::to_string(&fic_plan)?)
+        .context("persist immutable run-owned workload identity plan")?;
+    if config.campaign_profile == Some(crate::config::CampaignProfile::SingleHotTable) {
+        update_campaign_fic_inventory(
+            platform,
+            InventoryFic {
+                resource_id: Some(fic_plan.resource_id.clone()),
+                name: Some(fic_plan.credential_name.clone()),
+                state: InventoryResourceState::Planned,
+                absence: None,
+                plan: Some(fic_plan.clone()),
+            },
+        )
+        .await?;
+        update_campaign_fic_inventory(
+            platform,
+            InventoryFic {
+                resource_id: Some(fic_plan.resource_id.clone()),
+                name: Some(fic_plan.credential_name.clone()),
+                state: InventoryResourceState::Uncertain,
+                absence: None,
+                plan: Some(fic_plan.clone()),
+            },
+        )
+        .await?;
+    }
     let fic_record = runtime_dir.join(format!("run-fic-{}.json", platform.run_id));
     platform.fic_record_path = Some(fic_record.clone());
     platform.fic_prepare_attempted = true;
@@ -7514,6 +8087,7 @@ async fn prepare_aks_platform(
         Some(&service_account),
         &fic_record,
         None,
+        Some(&fic_plan_path),
         bootstrap_env_file,
     )
     .await
@@ -7526,6 +8100,7 @@ async fn prepare_aks_platform(
         Some(&service_account),
         &fic_record,
         Some("300"),
+        None,
         bootstrap_env_file,
     )
     .await
@@ -7537,6 +8112,19 @@ async fn prepare_aks_platform(
     write_private_secret(&ready_snapshot, &ready_record)
         .context("persist immutable ready run-owned workload identity snapshot")?;
     platform.fic_ready_snapshot_path = Some(ready_snapshot);
+    if config.campaign_profile == Some(crate::config::CampaignProfile::SingleHotTable) {
+        update_campaign_fic_inventory(
+            platform,
+            InventoryFic {
+                resource_id: Some(fic_plan.resource_id.clone()),
+                name: Some(fic_plan.credential_name.clone()),
+                state: InventoryResourceState::Observed,
+                absence: None,
+                plan: Some(fic_plan),
+            },
+        )
+        .await?;
+    }
     create_runtime_secrets(config, platform, &secrets_dir).await?;
 
     let foundation = render_runtime_phase(&runtime_script, &generated_config, "foundation", &runtime_dir).await?;
@@ -7660,6 +8248,41 @@ struct AksHelperConfigPaths<'a> {
     bootstrap_env_file: &'a Path,
 }
 
+async fn run_run_fic_plan(
+    run_id: &str,
+    namespace: &str,
+    service_account: &str,
+    bootstrap_env_file: &Path,
+) -> Result<InventoryFicPlan> {
+    let workspace = std::env::current_dir()?;
+    let script = workspace.join("infra/azure/bootstrap.ts");
+    let stamp_config_path = selected_aks_stamp_config_path(&workspace)?;
+    let mut command = oat_qap_helper_launcher(&script)?;
+    command.args([
+        "plan-run-fic",
+        "--read-only",
+        "--run-id",
+        run_id,
+        "--namespace",
+        namespace,
+        "--service-account",
+        service_account,
+    ]);
+    command.arg("--env-file").arg(bootstrap_env_file);
+    command.arg("--stamp-config").arg(&stamp_config_path);
+    let output = tokio::time::timeout(Duration::from_secs(60), run_oat_qap_helper_output(command))
+        .await
+        .context("run FIC planning exceeded its read-only deadline")??;
+    if !output.status.success() {
+        bail!(
+            "plan-run-fic helper failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    serde_json::from_slice(&output.stdout).context("parse authoritative run FIC plan")
+}
+
 fn run_fic_helper_command(
     operation: &str,
     run_id: &str,
@@ -7667,6 +8290,7 @@ fn run_fic_helper_command(
     service_account: Option<&str>,
     record_path: &Path,
     wait_seconds: Option<&str>,
+    identity_plan_path: Option<&Path>,
     config_paths: AksHelperConfigPaths<'_>,
 ) -> Result<Command> {
     let workspace = std::env::current_dir()?;
@@ -7692,6 +8316,14 @@ fn run_fic_helper_command(
     if let Some(wait_seconds) = wait_seconds {
         command.args(["--wait-seconds", wait_seconds]);
     }
+    match (operation, identity_plan_path) {
+        ("prepare-run-fic", Some(path)) => {
+            command.arg("--identity-plan").arg(path);
+        }
+        ("prepare-run-fic", None) => bail!("run FIC preparation requires its persisted identity plan"),
+        (_, Some(_)) => bail!("identity plans are only accepted when preparing a run FIC"),
+        (_, None) => {}
+    }
     Ok(command)
 }
 
@@ -7702,6 +8334,7 @@ async fn run_run_fic_helper(
     service_account: Option<&str>,
     record_path: &Path,
     wait_seconds: Option<&str>,
+    identity_plan_path: Option<&Path>,
     bootstrap_env_file: &Path,
 ) -> Result<()> {
     let workspace = std::env::current_dir()?;
@@ -7713,6 +8346,7 @@ async fn run_run_fic_helper(
         service_account,
         record_path,
         wait_seconds,
+        identity_plan_path,
         AksHelperConfigPaths {
             stamp_config_path: &stamp_config_path,
             bootstrap_env_file,
@@ -7838,6 +8472,37 @@ async fn run_oat_qap_helper(
     }
     Ok(())
 }
+async fn run_oat_qap_reference(
+    record_path: &Path,
+    bootstrap_env_file: &Path,
+) -> Result<InventoryQapReference> {
+    let workspace = std::env::current_dir()?;
+    let stamp_config_path = selected_aks_stamp_config_path(&workspace)?;
+    let command = run_oat_qap_helper_command(
+        "oat-qap-reference",
+        "",
+        None,
+        None,
+        None,
+        record_path,
+        AksHelperConfigPaths {
+            stamp_config_path: &stamp_config_path,
+            bootstrap_env_file,
+        },
+    )?;
+    let output = tokio::time::timeout(Duration::from_secs(60), run_oat_qap_helper_output(command))
+        .await
+        .context("QAP reference capture exceeded its deadline")??;
+    if !output.status.success() {
+        bail!(
+            "oat-qap-reference helper failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    serde_json::from_slice(&output.stdout).context("parse immutable QAP reference")
+}
+
 async fn require_nonempty_record(record_path: &Path) -> Result<()> {
     let metadata = tokio::fs::metadata(record_path)
         .await
@@ -8490,7 +9155,7 @@ async fn record_applied_resource_uids(config: &OatConfig, platform: &AksPlatform
         stored.uid = Some(uid.to_owned());
         stored.state = InventoryResourceState::Observed;
     }
-    next.validate_successor(&current)?;
+    current.validate_successor(&next)?;
     persist_campaign_inventory(platform, &next).await
 }
 
@@ -8541,7 +9206,7 @@ async fn prepare_run_owned_resources(
             next.resources.push(planned);
         }
     }
-    next.validate_successor(&current)?;
+    current.validate_successor(&next)?;
     persist_campaign_inventory(platform, &next).await
 }
 
@@ -9215,6 +9880,7 @@ async fn cleanup_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
                             None,
                             None,
                             record_path,
+                            None,
                             None,
                             bootstrap_env_file,
                         ),
@@ -10577,6 +11243,7 @@ mod tests {
                 Some("arrowcol-oat"),
                 Path::new("/tmp/run-fic.json"),
                 None,
+                (operation == "prepare-run-fic").then_some(Path::new("/tmp/run-fic-plan.json")),
                 AksHelperConfigPaths {
                     stamp_config_path: Path::new("/tmp/stamp-87513.yaml"),
                     bootstrap_env_file: Path::new("/tmp/oat-private-bootstrap.env"),
@@ -10606,7 +11273,25 @@ mod tests {
                     "{operation} must clear inherited {variable}"
                 );
             }
+            assert_eq!(
+                command.as_std().get_args().any(|arg| arg == "--identity-plan"),
+                operation == "prepare-run-fic"
+            );
         }
+        assert!(run_fic_helper_command(
+            "prepare-run-fic",
+            "00000000-0000-0000-0000-000000000001",
+            Some("oat-test"),
+            Some("arrowcol-oat"),
+            Path::new("/tmp/run-fic.json"),
+            None,
+            None,
+            AksHelperConfigPaths {
+                stamp_config_path: Path::new("/tmp/stamp-87513.yaml"),
+                bootstrap_env_file: Path::new("/tmp/oat-private-bootstrap.env"),
+            },
+        )
+        .is_err());
         Ok(())
     }
 
@@ -10621,6 +11306,7 @@ mod tests {
         for (operation, manifest_path, workload_record_path, workload_stop_record_path) in [
             ("bind-oat-qap", Some(manifest), Some(workload), None),
             ("verify-oat-qap", None, None, None),
+            ("oat-qap-reference", None, None, None),
             ("cleanup-oat-qap", None, None, Some(stop)),
         ] {
             let command = run_oat_qap_helper_command(
@@ -10971,6 +11657,20 @@ mod tests {
     }
 
     #[test]
+    fn campaign_custody_helper_classifies_pre_effect_staleness_only_for_cleanup() {
+        let stale = campaign_custody_helper_failure("cleanup-step", br#"{"ok":false,"code":"stale_version"}"#);
+        assert!(stale.downcast_ref::<StaleCampaignVersionError>().is_some());
+        let stale_read = campaign_custody_helper_failure("read-inventory", br#"{"ok":false,"code":"stale_version"}"#);
+        assert!(stale_read.downcast_ref::<StaleCampaignVersionError>().is_none());
+        for code in ["campaign_fenced", "write_outcome_unknown", "invalid_or_storage_error"] {
+            let response = json!({"ok":false,"code":code});
+            let error = campaign_custody_helper_failure("cleanup-step", &serde_json::to_vec(&response).expect("serialize failure"));
+            assert!(error.downcast_ref::<StaleCampaignVersionError>().is_none());
+            assert!(error.to_string().contains(code));
+        }
+    }
+
+    #[test]
     fn campaign_cleanup_preserves_the_approved_maintenance_and_evidence_order() {
         let actions = [
             CampaignCleanupAction::StopAdmission,
@@ -11009,6 +11709,7 @@ mod tests {
             "fencing_token":1,
             "orchestration_run_id":"00000000-0000-0000-0000-000000000003",
             "cell_run_id":"00000000-0000-0000-0000-000000000004",
+            "load_admission":"not_authorized",
             "namespace":{"name":"oat-00000000000000000000000000000004", "uid":null,
                 "owner_token":"00000000-0000-0000-0000-000000000002"},
             "resources":[{"api_version":"apps/v1","kind":"Deployment",
@@ -11024,8 +11725,50 @@ mod tests {
             .context("serialized cleanup object missing")?
             .remove("stop_maintenance");
         assert!(serde_json::from_value::<RunInventory>(legacy_schema).is_err());
+        let mut legacy_admission = serde_json::to_value(&inventory)?;
+        legacy_admission
+            .as_object_mut()
+            .context("serialized inventory object missing")?
+            .remove("load_admission");
+        assert!(serde_json::from_value::<RunInventory>(legacy_admission).is_err());
         inventory.validate()?;
-        validate_campaign_etag("\"strong-etag\"")?;
+        let mut authorization_pending = inventory.clone();
+        authorization_pending.load_admission = InventoryLoadAdmission::AuthorizationPending;
+        inventory.validate_successor(&authorization_pending)?;
+        let mut authorized = authorization_pending.clone();
+        authorized.load_admission = InventoryLoadAdmission::Authorized;
+        authorization_pending.validate_successor(&authorized)?;
+        assert!(inventory.validate_successor(&authorized).is_err());
+        assert!(authorized.validate_successor(&authorization_pending).is_err());
+        assert!(campaign_cleanup_action_needs_execution(&CampaignCleanupAction::StopAdmission, &inventory)?);
+        assert_eq!(
+            campaign_cleanup_operation_deadline_ms(&CampaignCleanupAction::StopAdmission, &inventory, 1_000)?,
+            61_000
+        );
+        let mut declared_deadline = inventory.clone();
+        declared_deadline.cleanup.bounded_drain.deadline_unix_ms = Some(5_000);
+        assert_eq!(
+            campaign_cleanup_operation_deadline_ms(&CampaignCleanupAction::BoundedDrain, &declared_deadline, 1_000)?,
+            5_000
+        );
+        assert!(campaign_cleanup_operation_deadline_ms(&CampaignCleanupAction::StopAdmission, &inventory, 61_000).is_err());
+        for state in [
+            InventoryStepState::Pending,
+            InventoryStepState::Running,
+            InventoryStepState::Failed,
+            InventoryStepState::Uncertain,
+        ] {
+            let mut unresolved = inventory.clone();
+            unresolved.cleanup.stop_admission.state = state;
+            assert!(campaign_cleanup_action_needs_execution(&CampaignCleanupAction::StopAdmission, &unresolved).is_err());
+        }
+        let mut complete_step = inventory.clone();
+        complete_step.cleanup.stop_admission.state = InventoryStepState::Complete;
+        assert!(!campaign_cleanup_action_needs_execution(&CampaignCleanupAction::StopAdmission, &complete_step)?);
+        let mut uncertain_resource = inventory.clone();
+        uncertain_resource.resources[0].state = InventoryResourceState::Uncertain;
+        assert!(campaign_cleanup_action_needs_execution(&CampaignCleanupAction::RemoveNamespace, &uncertain_resource).is_err());
+        validate_campaign_etag("\\\"strong-etag\\\"")?;
         assert!(validate_campaign_etag("W/\"weak-etag\"").is_err());
         assert!(validate_campaign_etag("*").is_err());
         let actor = CampaignCleanupActor {
