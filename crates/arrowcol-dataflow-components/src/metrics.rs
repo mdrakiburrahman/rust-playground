@@ -175,7 +175,7 @@ struct TableState {
     buffered_rows: u64,
     buffered_batches: u64,
     pending_commits: u64,
-    oldest_buffered_at_ms: Option<u64>,
+    oldest_buffered_at: Option<Instant>,
     source_schema_version: Option<u64>,
     target_schema_version: Option<u64>,
     last_delta_version: Option<u64>,
@@ -499,7 +499,7 @@ impl RuntimeMetrics {
         bytes: u64,
         source: SchemaVersion,
         target: SchemaVersion,
-        enqueued_at_ms: u64,
+        enqueued_at: Instant,
     ) {
         self.buffered_batches.fetch_add(1, Ordering::Relaxed);
         self.buffered_rows.fetch_add(rows, Ordering::Relaxed);
@@ -508,10 +508,10 @@ impl RuntimeMetrics {
             state.buffered_batches = state.buffered_batches.saturating_add(1);
             state.buffered_rows = state.buffered_rows.saturating_add(rows);
             state.buffered_bytes = state.buffered_bytes.saturating_add(bytes);
-            state.oldest_buffered_at_ms = Some(
+            state.oldest_buffered_at = Some(
                 state
-                    .oldest_buffered_at_ms
-                    .map_or(enqueued_at_ms, |oldest| oldest.min(enqueued_at_ms)),
+                    .oldest_buffered_at
+                    .map_or(enqueued_at, |oldest| oldest.min(enqueued_at)),
             );
             state.source_schema_version = Some(source.get());
             state.target_schema_version = Some(target.get());
@@ -524,7 +524,7 @@ impl RuntimeMetrics {
         rows: u64,
         bytes: u64,
         downstream_ack: bool,
-        remaining_oldest: Option<u64>,
+        remaining_oldest: Option<Instant>,
     ) {
         saturating_sub_atomic(&self.buffered_batches, 1);
         saturating_sub_atomic(&self.buffered_rows, rows);
@@ -538,7 +538,7 @@ impl RuntimeMetrics {
             state.buffered_batches = state.buffered_batches.saturating_sub(1);
             state.buffered_rows = state.buffered_rows.saturating_sub(rows);
             state.buffered_bytes = state.buffered_bytes.saturating_sub(bytes);
-            state.oldest_buffered_at_ms = remaining_oldest;
+            state.oldest_buffered_at = remaining_oldest;
         });
     }
 
@@ -740,7 +740,7 @@ impl RuntimeMetrics {
         let batches_limit = self.buffered_batches_limit.load(Ordering::Acquire).max(1);
         let commit_limit = self.max_pending_commits.load(Ordering::Acquire).max(1);
         let available = max_streams.saturating_sub(active.min(max_streams));
-        let oldest_age = self.oldest_buffer_age(now.get());
+        let oldest_age = self.oldest_buffer_age();
         let dfe_accepting = self.accepting.load(Ordering::Acquire)
             && actual_rss <= rss_limit
             && dfe_bytes <= bytes_limit
@@ -751,7 +751,7 @@ impl RuntimeMetrics {
             && buffered_bytes <= bytes_limit
             && buffered_rows <= rows_limit
             && buffered_batches <= batches_limit;
-        let tables = self.table_pressure(now.get(), native_quiver);
+        let tables = self.table_pressure(native_quiver);
         let dfe_pressure = ratio_bps(dfe_batches.min(batches_limit), batches_limit)?;
         let delta_pressure = ratio_bps(pending_commits.min(commit_limit), commit_limit)?;
         let (quiver_pressure, quiver_state) = if native_quiver {
@@ -839,15 +839,17 @@ impl RuntimeMetrics {
         })
     }
 
-    fn oldest_buffer_age(&self, now_ms: u64) -> u64 {
+    fn oldest_buffer_age(&self) -> u64 {
         self.tables
             .lock()
             .ok()
-            .and_then(|tables| tables.values().filter_map(|state| state.oldest_buffered_at_ms).min())
-            .map_or(0, |oldest| now_ms.saturating_sub(oldest))
+            .and_then(|tables| tables.values().filter_map(|state| state.oldest_buffered_at).min())
+            .map_or(0, |oldest| {
+                duration_millis(Instant::now().saturating_duration_since(oldest))
+            })
     }
 
-    fn table_pressure(&self, now_ms: u64, native_quiver: bool) -> Vec<TablePressure> {
+    fn table_pressure(&self, native_quiver: bool) -> Vec<TablePressure> {
         self.tables.lock().map_or_else(
             |_| Vec::new(),
             |tables| {
@@ -872,11 +874,9 @@ impl RuntimeMetrics {
                                 .ok()?,
                             buffered_rows: Measurement::new(state.buffered_rows.saturating_add(backlog.rows)).ok()?,
                             buffered_batches: Measurement::new(buffered_batches).ok()?,
-                            oldest_buffer_age_ms: Measurement::new(
-                                state
-                                    .oldest_buffered_at_ms
-                                    .map_or(0, |oldest| now_ms.saturating_sub(oldest)),
-                            )
+                            oldest_buffer_age_ms: Measurement::new(state.oldest_buffered_at.map_or(0, |oldest| {
+                                duration_millis(Instant::now().saturating_duration_since(oldest))
+                            }))
                             .ok()?,
                             pending_commits: Measurement::new(state.pending_commits).ok()?,
                         })
@@ -957,6 +957,23 @@ impl RuntimeMetrics {
             let _ = writeln!(output, "# TYPE {name} gauge");
             let _ = writeln!(output, "{name} {value}");
         }
+        let _ = writeln!(
+            output,
+            "# HELP arrowcol_dfe_buffered_rows Rows awaiting DFE acknowledgement."
+        );
+        output.push_str("# TYPE arrowcol_dfe_buffered_rows gauge\n");
+        let _ = writeln!(
+            output,
+            "arrowcol_dfe_buffered_rows {}",
+            self.buffered_rows.load(Ordering::Acquire)
+        );
+        let _ = writeln!(
+            output,
+            "# HELP arrowcol_dfe_oldest_pending_age_seconds Age of the oldest batch awaiting DFE acknowledgement."
+        );
+        output.push_str("# TYPE arrowcol_dfe_oldest_pending_age_seconds gauge\n");
+        let age_seconds = self.oldest_buffer_age() as f64 / 1_000.0;
+        let _ = writeln!(output, "arrowcol_dfe_oldest_pending_age_seconds {age_seconds}");
         let backlog = self.durable_totals();
         for (name, help, value) in [
             (
@@ -1097,7 +1114,7 @@ struct PendingBatch {
     table: TableIdentity,
     rows: u64,
     bytes: u64,
-    enqueued_at_ms: u64,
+    enqueued_at: Instant,
     durable: Option<Arc<DurableStream>>,
 }
 
@@ -1212,8 +1229,9 @@ impl PendingTracker {
         if id == u64::MAX {
             return Err("DFE message correlation ID exhausted".to_owned());
         }
-        let now = now_unix_millis()?.get();
-        self.metrics.batch_buffered(&table, rows, bytes, source, target, now);
+        let enqueued_at = Instant::now();
+        self.metrics
+            .batch_buffered(&table, rows, bytes, source, target, enqueued_at);
         if let Some(stream) = &durable {
             stream.register();
         }
@@ -1226,7 +1244,7 @@ impl PendingTracker {
                     table,
                     rows,
                     bytes,
-                    enqueued_at_ms: now,
+                    enqueued_at,
                     durable,
                 },
             );
@@ -1243,7 +1261,7 @@ impl PendingTracker {
         let remaining_oldest = pending
             .values()
             .filter(|other| other.table == batch.table)
-            .map(|other| other.enqueued_at_ms)
+            .map(|other| other.enqueued_at)
             .min();
         drop(pending);
         // Count the durable backlog before releasing in-memory pressure so a
@@ -1278,6 +1296,10 @@ fn positive(value: u64) -> Result<PositiveMeasurement, String> {
 
 fn gauge(current: u64, limit: u64) -> Result<PressureGauge, String> {
     PressureGauge::new(measurement(current.min(limit))?, positive(limit)?).map_err(|error| error.to_string())
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn ratio_bps(current: u64, limit: u64) -> Result<BasisPoints, String> {
@@ -1367,6 +1389,30 @@ mod tests {
     /// claim, reports native Quiver as supported but disabled, and keeps the legacy info metric.
     #[test]
     fn capabilities_label_best_effort() {
+        #[test]
+        fn prometheus_exposes_pending_rows_and_monotonic_oldest_age() {
+            let metrics = Arc::new(RuntimeMetrics::new(CollectorInstanceId::new()));
+            let tracker = PendingTracker::new(Arc::clone(&metrics));
+            let id = tracker
+                .insert(table(), 3, 128, SchemaVersion::FIRST, SchemaVersion::FIRST)
+                .expect("insert");
+            std::thread::sleep(Duration::from_millis(2));
+
+            let exposition = metrics.prometheus();
+            assert!(exposition.contains("arrowcol_dfe_buffered_rows 3\n"));
+            let age = exposition
+                .lines()
+                .find(|line| line.starts_with("arrowcol_dfe_oldest_pending_age_seconds "))
+                .and_then(|line| line.split_whitespace().nth(1))
+                .and_then(|value| value.parse::<f64>().ok())
+                .expect("oldest pending age metric");
+            assert!(age > 0.0);
+
+            tracker.resolve(id, true);
+            let exposition = metrics.prometheus();
+            assert!(exposition.contains("arrowcol_dfe_buffered_rows 0\n"));
+            assert!(exposition.contains("arrowcol_dfe_oldest_pending_age_seconds 0\n"));
+        }
         let metrics = RuntimeMetrics::new(CollectorInstanceId::new());
         metrics.configure_admission("dfe", false).expect("admission mode");
         let encoded = serde_json::to_value(metrics.capabilities(1024)).expect("capabilities JSON");

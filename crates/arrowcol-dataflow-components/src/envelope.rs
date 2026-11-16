@@ -33,7 +33,8 @@ pub struct ArrowcolBatchEnvelope {
     /// Stable server-generated publication identity; absent on legacy durable pdata.
     #[serde(default)]
     pub publication_id: Option<PublicationId>,
-    /// Original admission UTC milliseconds, preserved in durable pdata.
+    /// Collector UTC time captured at `push_batch` entry, after Flight lease and permit admission but before batch
+    /// processing or DFE enqueue. Earlier admission waits are intentionally excluded.
     #[serde(default)]
     pub ingested_at_ms: Option<UnixMillis>,
     /// Logical catalog table.
