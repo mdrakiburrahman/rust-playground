@@ -7350,7 +7350,24 @@ fn validate_campaign_cell_baseline(
     hot_delta_relative_path: &str,
 ) -> Result<()> {
     validate_campaign_etag(&receipt.etag)?;
-    if receipt.status != "captured"
+    let expected_blob = format!(
+        "_arrowcol-custody/campaigns/{}/runs/{}/cells/{}/delta-before.json",
+        inventory.campaign_id, inventory.orchestration_run_id, run_id
+    );
+    let planned_binding_count = inventory
+        .qap
+        .as_ref()
+        .filter(|qap| qap.state == InventoryResourceState::Planned)
+        .map(|qap| {
+            qap.bindings
+                .iter()
+                .filter(|binding| binding.relative_path == hot_delta_relative_path)
+                .count()
+        })
+        .unwrap_or(0);
+    if inventory.load_admission != InventoryLoadAdmission::NotAuthorized
+        || planned_binding_count != 1
+        || receipt.status != "captured"
         || receipt.campaign_id != identity.campaign_id
         || receipt.owner_id != identity.owner_id
         || receipt.fencing_token != identity.fencing_token
@@ -7358,6 +7375,7 @@ fn validate_campaign_cell_baseline(
         || receipt.cell_run_id != run_id
         || receipt.namespace_uid != inventory.namespace.uid.as_deref().unwrap_or_default()
         || receipt.hot_delta_relative_path != hot_delta_relative_path
+        || receipt.blob != expected_blob
         || !valid_blob_path(&receipt.blob)
     {
         bail!("cell baseline receipt does not match the exact campaign, cell, namespace and hot Delta path");
@@ -11757,7 +11775,7 @@ mod tests {
             "status":"captured","campaign_id":identity.campaign_id,"owner_id":identity.owner_id,
             "fencing_token":identity.fencing_token,"orchestration_run_id":inventory.orchestration_run_id,
             "cell_run_id":inventory.cell_run_id,"namespace_uid":"00000000-0000-0000-0000-000000000005",
-            "hot_delta_relative_path":hot_path,"blob":"campaigns/00000000-0000-0000-0000-000000000001/cells/00000000-0000-0000-0000-000000000004/delta-before.json",
+            "hot_delta_relative_path":hot_path,"blob":"_arrowcol-custody/campaigns/00000000-0000-0000-0000-000000000001/runs/00000000-0000-0000-0000-000000000003/cells/00000000-0000-0000-0000-000000000004/delta-before.json",
             "etag":"\"baseline-etag\"","delta_state":"observed_absent","table_id":null,"delta_version":null,"rows":null
         }});
         let response: CampaignCellBaselineResponse = serde_json::from_value(output.clone())?;
