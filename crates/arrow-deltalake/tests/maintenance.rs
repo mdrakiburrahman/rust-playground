@@ -135,7 +135,8 @@ fn optimize_decode_limit_diagnostic_identifies_failed_bound() -> Result<()> {
         assert!(!plan.bins.is_empty());
         let error = maintenance
             .apply_optimize(&plan, &config, &control())
-            .expect_err("decoded input must exceed the selected one-byte bound");
+            .err()
+            .context("decoded input must exceed the selected one-byte bound")?;
         assert_eq!(error_kind(&error), Some(MaintenanceErrorKind::ResourceLimit));
         let diagnostic = format!("{error:#}");
         let prefix = format!("decoded Arrow input exceeds {bound}: measured_bytes=");
