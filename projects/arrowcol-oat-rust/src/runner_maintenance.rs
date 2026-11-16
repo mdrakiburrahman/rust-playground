@@ -941,8 +941,8 @@ mod maintenance_topology_tests {
         let mut baseline = current.clone();
         baseline.stdout.clear();
         let projection = json!({
-            "producer_commit":"2def059cb24ddfb924b8cbd15a8387404063a69d",
-            "producer_sha256":"397fc0b49e03bea77028b2744040518ef023481c6107fbf9153b6dda2346f3f9",
+            "producer_commit":"dbdfbf2b3c0dcaae2db19104b0796933d7fea520",
+            "producer_sha256":"b2717115ca191b392f0e5cf7cfb570b0a27b1a8619f3a65aa426832bedcfbee2",
             "binding":"events fixture table renamed to benchmark allowlist; operation/report payloads unchanged",
             "processes":[{"component":"maintenance","log_complete":true,
                 "maintenance_table_policies":maintenance_table_evidence(&config, &text)?,
@@ -1007,17 +1007,28 @@ mod maintenance_topology_tests {
             32_u64 * 1024 * 1024
         );
         assert!(maintenance_table_evidence(&config, "").is_err());
+        let actual: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/maintenance-open-partition-results.json"
+        ))?;
+        assert_eq!(crate::local::file_digest(&Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/maintenance-open-partition-results.json"))?.1,
+            "873a51a750f374a1c2d73aaf6cc0601591cb1f88e3140b720e41f52eea3eaa90");
+        assert!(actual["default_configuration"]["startup"]["sealed_partitions_only"].is_null());
+        assert_eq!(actual["default_configuration"]["operation_settings"]["sealed_partitions_only"], true);
+        assert_eq!(actual["default_configuration"]["table_policy"]["arrowcol.optimize.sealedPartitionsOnly"], true);
+        assert!(!role_environment(&config, ComponentRole::Maintenance)?
+            .contains_key("ARROWCOL_MAINT_SEALED_PARTITIONS_ONLY"));
         let mut bounded_config = config.clone();
         bounded_config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
-            "maintenance":{"enabled":true,"operations":["optimize"],
+            "maintenance":{"enabled":true,"apply":true,"operations":["optimize"],"interval_secs":1,
                 "max_consecutive_stale_plans":4,"sealed_partitions_only":false}
         }))?;
-        let mut overridden = json!({
-            "startup":{"apply":false,"operations":["optimize"],"interval_secs":60,
-                "max_consecutive_stale_plans":4,"sealed_partitions_only":false},
-            "operation_settings":{"max_consecutive_stale_plans":4,"sealed_partitions_only":true},
-            "table_policy":{"arrowcol.optimize.sealedPartitionsOnly":true},"active":true,
-        });
+        let mut overridden = actual["opt_in_configuration"].clone();
+        verify_process_configuration(&bounded_config, ComponentRole::Maintenance, &overridden)?;
+        assert_eq!(overridden["startup"]["sealed_partitions_only"], false);
+        assert_eq!(overridden["operation_settings"]["sealed_partitions_only"], false);
+        overridden["operation_settings"]["sealed_partitions_only"] = json!(true);
+        overridden["table_policy"]["arrowcol.optimize.sealedPartitionsOnly"] = json!(true);
         verify_process_configuration(&bounded_config, ComponentRole::Maintenance, &overridden)?;
         overridden["startup"]["sealed_partitions_only"] = Value::Null;
         assert!(verify_process_configuration(&bounded_config, ComponentRole::Maintenance, &overridden).is_err(),

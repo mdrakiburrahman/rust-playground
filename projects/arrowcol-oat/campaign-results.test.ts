@@ -339,10 +339,12 @@ test('consumes actual Rust results through the E1 projection and keeps single-wi
   const healthProducer = JSON.parse(readFileSync(
     new URL('../arrowcol-oat-rust/tests/fixtures/maintenance-operation-results.json', import.meta.url), 'utf8',
   )) as { operation_results: Array<{ operation: string; report: { compaction_debt: Record<string, unknown> | null } }> };
-  assert.equal(healthProjection.producer_commit, '2def059cb24ddfb924b8cbd15a8387404063a69d');
+  assert.equal(healthProjection.producer_commit, 'dbdfbf2b3c0dcaae2db19104b0796933d7fea520');
   const producerDebt = healthProducer.operation_results.find(result => result.operation === 'optimize')!.report.compaction_debt!;
   const projectedDebt = healthProjection.processes[0]!.maintenance_table_policies.operation_reports
     .find(result => result.operation === 'optimize')!.compaction_debt!;
+  assert.deepEqual(projectedDebt.protected_partition_backlog,
+    { files: 2, bytes: 932, oldest_partition_start_ms: 1_704_067_260_000 });
   assert.deepEqual(projectedDebt.protected_partition_backlog, producerDebt.protected_partition_backlog);
   assert.equal(maintenanceDueWorkIssue(healthProjection.processes, {
     enabled: true, apply: true, operations: ['optimize', 'purge', 'vacuum', 'checkpoint', 'prune_log'],
