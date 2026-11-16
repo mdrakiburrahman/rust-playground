@@ -2180,7 +2180,7 @@ mod tests {
         create["maintenance"]["optimize_upload_mode"] = serde_json::json!("put_create");
         create["maintenance"]
             .as_object_mut()
-            .unwrap()
+            .context("maintenance fixture must be an object")?
             .remove("optimize_upload_buffer_bytes");
         assert!(Tunables::parse_oat_json(create).is_ok());
         Ok(())
