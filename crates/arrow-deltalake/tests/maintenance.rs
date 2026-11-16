@@ -114,6 +114,45 @@ fn optimize_config() -> OptimizeConfig {
 }
 
 #[test]
+fn optimize_decode_limit_diagnostic_identifies_failed_bound() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let table = create(root.path())?;
+    append(&table, 0, 0..3)?;
+    append(&table, 0, 3..6)?;
+    append(&table, 1, 6..9)?;
+    let maintenance = DeltaTable::open_for_maintenance(&url_of(root.path())?)?;
+    for bound in ["max_batch_bytes", "max_decoded_bytes_per_bin"] {
+        let config = OptimizeConfig {
+            max_batch_bytes: if bound == "max_batch_bytes" { 1 } else { usize::MAX },
+            max_decoded_bytes_per_bin: if bound == "max_decoded_bytes_per_bin" {
+                1
+            } else {
+                u64::MAX
+            },
+            ..optimize_config()
+        };
+        let plan = maintenance.plan_optimize(&config)?;
+        assert!(!plan.bins.is_empty());
+        let error = maintenance
+            .apply_optimize(&plan, &config, &control())
+            .expect_err("decoded input must exceed the selected one-byte bound");
+        assert_eq!(error_kind(&error), Some(MaintenanceErrorKind::ResourceLimit));
+        let diagnostic = format!("{error:#}");
+        let prefix = format!("decoded Arrow input exceeds {bound}: measured_bytes=");
+        let measured = diagnostic
+            .split_once(&prefix)
+            .context("diagnostic identifies the failed bound")?
+            .1
+            .split_once(", allowed_bytes=1")
+            .context("diagnostic identifies allowed bytes")?
+            .0
+            .parse::<u64>()?;
+        assert!(measured > 1, "diagnostic reports actual decoded bytes");
+    }
+    Ok(())
+}
+
+#[test]
 fn compaction_debt_evidence_distinguishes_zero_from_bounded_backlog() -> Result<()> {
     let root = tempfile::tempdir()?;
     let table = create(root.path())?;

@@ -3120,10 +3120,22 @@ fn push_input_batch(
 ) -> Result<u64> {
     let size = batch.get_array_memory_size();
     *decoded = decoded.saturating_add(size as u64);
-    if size > config.max_batch_bytes || *decoded > config.max_decoded_bytes_per_bin {
+    if size > config.max_batch_bytes {
         return Err(fail(
             MaintenanceErrorKind::ResourceLimit,
-            "decoded Arrow input exceeds the configured bound",
+            format!(
+                "decoded Arrow input exceeds max_batch_bytes: measured_bytes={size}, allowed_bytes={}",
+                config.max_batch_bytes
+            ),
+        ));
+    }
+    if *decoded > config.max_decoded_bytes_per_bin {
+        return Err(fail(
+            MaintenanceErrorKind::ResourceLimit,
+            format!(
+                "decoded Arrow input exceeds max_decoded_bytes_per_bin: measured_bytes={}, allowed_bytes={}",
+                *decoded, config.max_decoded_bytes_per_bin
+            ),
         ));
     }
     let rows = batch.num_rows() as u64;

@@ -58,6 +58,8 @@ Metadata-only filesystem property caches are fenced by log-object identity token
 
 ## Destructive safety
 
+OPTIMIZE decoded-input `resource_limit` diagnostics name `max_batch_bytes` (one decoded batch) or `max_decoded_bytes_per_bin` (cumulative decoded input for the bin), with `measured_bytes` and `allowed_bytes`. If both are exceeded, the batch bound is reported first. These diagnostics do not change either cap.
+
 **PURGE removes logical data; VACUUM physically deletes files.** Keep readers within the retained history window. Table properties cannot bypass the seven-day VACUUM floor, retained-tombstone constraints or the storage publication/reset fence. CLI-only disposable-test acknowledgements remain invocation controls and are never persisted into catalog policy.
 
 VACUUM plans and applies in one pass, reusing the independently validated history and active set only while the fresh Kernel snapshot version and metadata still match. Each deletion chunk rechecks current metadata, active references, cancellation and publication authority. Historical replay is repeated only when concurrent advancement requires it. Progress is written after durable deletions; an idle pass does not rewrite an existing same-version progress record. PRUNE-LOG retains its complete history/checkpoint proof before deleting any log.
