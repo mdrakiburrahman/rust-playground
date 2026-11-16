@@ -3874,6 +3874,16 @@ fn result_rows(
         let requested = config.effective_aks_resources();
         let collector_limit_millicores = parse_resource_cpu_millicores(&requested.collector.limits.cpu)?;
         let client_limit_millicores = parse_resource_cpu_millicores(&requested.client.limits.cpu)?;
+        let throttling = resource_evidence
+            .as_ref()
+            .and_then(|evidence| evidence.get("cpu_throttling"))
+            .cloned()
+            .unwrap_or_else(|| {
+                json!({
+                    "status": "unavailable",
+                    "reason": "AKS cAdvisor throttling evidence is unavailable"
+                })
+            });
         Some(json!({
             "collector": {
                 "requested_workers": concurrency,
@@ -3887,7 +3897,7 @@ fn result_rows(
                 "limit_millicores": client_limit_millicores,
                 "concurrency_per_cpu_core": config.dmv_concurrency as f64 * 1_000.0 / client_limit_millicores as f64,
             },
-            "throttling": {"status": "not_sampled", "reason": "OAT resource sampling does not expose cgroup throttling counters"},
+            "throttling": throttling,
         }))
     } else {
         None
@@ -11267,6 +11277,12 @@ fn parse_cadvisor_cpu_counters(
         let Some((name, remainder)) = line.split_once('{') else {
             continue;
         };
+        if !matches!(
+            name,
+            "container_cpu_cfs_periods_total" | "container_cpu_cfs_throttled_periods_total"
+        ) {
+            continue;
+        }
         let Some((labels_text, value_text)) = remainder.split_once('}') else {
             continue;
         };
@@ -11479,10 +11495,17 @@ fn compare_cpu_throttling(start: &[CpuThrottleSample], end: &[CpuThrottleSample]
                 }));
             }
             _ => {
-                let reason = sample
-                    .unavailable_reason
-                    .as_deref()
-                    .unwrap_or("counter reset, identity changed, or no CPU periods elapsed");
+                let start_sample = start_by_identity.get(&key).copied();
+                let initial_unavailable_reason = start_sample
+                    .filter(|before| before.counters.is_none())
+                    .and_then(|before| before.unavailable_reason.as_deref());
+                let reason = initial_unavailable_reason
+                    .or(sample.unavailable_reason.as_deref())
+                    .unwrap_or(if start_sample.is_some() {
+                        "counter reset, identity changed, or no CPU periods elapsed"
+                    } else {
+                        "initial cAdvisor snapshot omitted this pod identity"
+                    });
                 pod_evidence.push(json!({
                     "role": sample.role,
                     "pod": sample.pod,
@@ -15858,6 +15881,46 @@ mod aks_cpu_throttling_tests {
         assert_eq!(counters.periods, 500);
         assert_eq!(counters.throttled_periods, 75);
         Ok(())
+    }
+
+    #[test]
+    fn ignores_unrelated_fractional_and_nan_metrics_when_reading_cfs_counters() -> Result<()> {
+        let metrics = concat!(
+            "container_cpu_usage_seconds_total{namespace=\"oat-test\",pod=\"worker-a\",container=\"dataflow\"} 3.14159\n",
+            "container_cpu_cfs_throttled_seconds_total{namespace=\"oat-test\",pod=\"worker-a\",container=\"dataflow\"} 0.125\n",
+            "container_memory_usage_bytes{namespace=\"oat-test\",pod=\"worker-a\",container=\"dataflow\"} NaN\n",
+            "container_cpu_cfs_periods_total{namespace=\"oat-test\",pod=\"worker-a\",container=\"dataflow\"} 500\n",
+            "container_cpu_cfs_throttled_periods_total{namespace=\"oat-test\",pod=\"worker-a\",container=\"dataflow\"} 75\n",
+        );
+        let counters = parse_cadvisor_cpu_counters(metrics, "oat-test", "worker-a", "dataflow")?
+            .context("matching cAdvisor counters missing")?;
+        assert_eq!(counters.periods, 500);
+        assert_eq!(counters.throttled_periods, 75);
+        Ok(())
+    }
+
+    #[test]
+    fn preserves_initial_scrape_reason_when_end_counters_are_available() {
+        let start = CpuThrottleSample {
+            role: "collector".to_owned(),
+            pod: "worker-a".to_owned(),
+            uid: "uid-a".to_owned(),
+            container: "dataflow".to_owned(),
+            node: "node-a".to_owned(),
+            counters: None,
+            unavailable_reason: Some("start cAdvisor scrape failed: forbidden".to_owned()),
+        };
+        let end = CpuThrottleSample {
+            counters: Some(CpuThrottleCounters {
+                periods: 200,
+                throttled_periods: 20,
+            }),
+            unavailable_reason: None,
+            ..start.clone()
+        };
+        let evidence = compare_cpu_throttling(&[start], &[end]);
+        assert_eq!(evidence["status"], "unavailable");
+        assert_eq!(evidence["pods"][0]["reason"], "start cAdvisor scrape failed: forbidden");
     }
 
     #[test]
