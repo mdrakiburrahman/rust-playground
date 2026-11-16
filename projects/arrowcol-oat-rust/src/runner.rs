@@ -271,6 +271,7 @@ pub struct InventoryCleanup {
     pub stop_admission: InventoryStep,
     pub bounded_drain: InventoryStep,
     pub evidence_capture: InventoryStep,
+    pub stop_maintenance: InventoryStep,
     pub terminal_capture: InventoryStep,
     pub handoff: InventoryStep,
 }
@@ -553,6 +554,7 @@ impl RunInventory {
             &self.cleanup.stop_admission,
             &self.cleanup.bounded_drain,
             &self.cleanup.evidence_capture,
+            &self.cleanup.stop_maintenance,
             &self.cleanup.terminal_capture,
             &self.cleanup.handoff,
         ] {
@@ -572,20 +574,38 @@ impl RunInventory {
             }
         }
         if self.cleanup.stop_admission.state == InventoryStepState::Running
-            && self.cleanup.stop_admission.deadline_unix_ms.is_none()
+            && self
+                .cleanup
+                .stop_admission
+                .deadline_unix_ms
+                .is_none_or(|deadline| deadline == 0)
         {
             bail!("running admission stop requires a bounded deadline");
         }
         if self.cleanup.bounded_drain.state == InventoryStepState::Running
-            && self.cleanup.bounded_drain.deadline_unix_ms.is_none()
+            && self
+                .cleanup
+                .bounded_drain
+                .deadline_unix_ms
+                .is_none_or(|deadline| deadline == 0)
         {
             bail!("running drain requires a bounded deadline");
+        }
+        if self.cleanup.stop_maintenance.state == InventoryStepState::Running
+            && self
+                .cleanup
+                .stop_maintenance
+                .deadline_unix_ms
+                .is_none_or(|deadline| deadline == 0)
+        {
+            bail!("running maintenance stop requires a bounded deadline");
         }
         if self.cleanup.handoff.state == InventoryStepState::Complete
             && ([
                 &self.cleanup.stop_admission,
                 &self.cleanup.bounded_drain,
                 &self.cleanup.evidence_capture,
+                &self.cleanup.stop_maintenance,
                 &self.cleanup.terminal_capture,
             ]
             .iter()
@@ -704,6 +724,7 @@ impl RunInventory {
             (&self.cleanup.stop_admission, &next.cleanup.stop_admission),
             (&self.cleanup.bounded_drain, &next.cleanup.bounded_drain),
             (&self.cleanup.evidence_capture, &next.cleanup.evidence_capture),
+            (&self.cleanup.stop_maintenance, &next.cleanup.stop_maintenance),
             (&self.cleanup.terminal_capture, &next.cleanup.terminal_capture),
             (&self.cleanup.handoff, &next.cleanup.handoff),
         ] {
@@ -6819,6 +6840,429 @@ fn namespace_uid_for_cleanup(namespace: &Value, expected_uid: Option<&str>) -> R
     Ok(uid.to_owned())
 }
 
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum CampaignCleanupAction {
+    StopAdmission,
+    BoundedDrain,
+    EvidenceCapture,
+    StopMaintenance,
+    TerminalCapture,
+    RemoveNamespace,
+    RemoveQap,
+    RemoveFic,
+    Handoff,
+}
+
+impl CampaignCleanupAction {
+    fn selector(&self) -> &'static str {
+        match self {
+            Self::StopAdmission => "stop_admission",
+            Self::BoundedDrain => "bounded_drain",
+            Self::EvidenceCapture => "evidence_capture",
+            Self::StopMaintenance => "stop_maintenance",
+            Self::TerminalCapture => "terminal_capture",
+            Self::RemoveNamespace => "remove_namespace",
+            Self::RemoveQap => "remove_qap",
+            Self::RemoveFic => "remove_fic",
+            Self::Handoff => "handoff",
+        }
+    }
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum CampaignActorMode {
+    Producer,
+    Controller,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct CampaignCleanupActor {
+    mode: CampaignActorMode,
+    owner_id: String,
+    fencing_token: u64,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct CampaignInventoryReadRequest<'a> {
+    schema_version: u8,
+    campaign_id: &'a str,
+    orchestration_run_id: &'a str,
+    cell_run_id: &'a str,
+    actor: &'a CampaignCleanupActor,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct CampaignCleanupRequest<'a> {
+    schema_version: u8,
+    inventory: &'a RunInventory,
+    expected_etag: &'a str,
+    actor: &'a CampaignCleanupActor,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CampaignInventoryReadResponse {
+    ok: bool,
+    inventory: RunInventory,
+    etag: String,
+}
+
+fn deserialize_present_campaign_option<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    <Option<T> as serde::Deserialize>::deserialize(deserializer)
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct CampaignCleanupReceipt {
+    status: String,
+    step: String,
+    campaign_id: String,
+    owner_id: String,
+    fencing_token: u64,
+    orchestration_run_id: String,
+    cell_run_id: String,
+    #[serde(deserialize_with = "deserialize_present_campaign_option")]
+    namespace_uid: Option<String>,
+    actor: CampaignCleanupActor,
+    completed_at_unix_ms: u64,
+    etag: String,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CampaignCleanupResponse {
+    ok: bool,
+    receipt: CampaignCleanupReceipt,
+}
+
+fn validate_campaign_etag(etag: &str) -> Result<()> {
+    if etag.is_empty()
+        || etag.len() > 512
+        || etag == "*"
+        || etag.starts_with("W/")
+        || etag.bytes().any(|byte| byte.is_ascii_control())
+    {
+        bail!("campaign inventory requires a strong nonempty ETag");
+    }
+    Ok(())
+}
+
+async fn run_campaign_custody_json<T: serde::Serialize>(
+    action: &str,
+    selector: Option<&str>,
+    request: &T,
+) -> Result<Vec<u8>> {
+    let payload = serde_json::to_vec(request)?;
+    let workspace = std::env::current_dir().context("resolve repository root for campaign custody helper")?;
+    let mut command = Command::new("npx");
+    command
+        .current_dir(workspace)
+        .args(["--no-install", "tsx", "projects/arrowcol-oat/aks-campaign.ts", action])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    if let Some(selector) = selector {
+        command.arg(selector);
+    }
+    let mut child = command.spawn().context("start campaign custody helper")?;
+    let mut stdin = child.stdin.take().context("open campaign custody helper input")?;
+    stdin
+        .write_all(&payload)
+        .await
+        .context("write campaign custody request")?;
+    drop(stdin);
+    let output = child
+        .wait_with_output()
+        .await
+        .context("wait for campaign custody helper")?;
+    if !output.status.success() {
+        let code = serde_json::from_slice::<Value>(&output.stdout)
+            .ok()
+            .and_then(|response| response.get("code").and_then(Value::as_str).map(str::to_owned))
+            .filter(|code| {
+                matches!(
+                    code.as_str(),
+                    "campaign_fenced" | "write_outcome_unknown" | "invalid_or_storage_error"
+                )
+            })
+            .unwrap_or_else(|| "invalid_response".to_owned());
+        bail!("campaign custody helper {action} failed: {code}");
+    }
+    Ok(output.stdout)
+}
+
+fn validate_campaign_inventory_identity(
+    inventory: &RunInventory,
+    campaign_id: &str,
+    owner_id: &str,
+    fencing_token: u64,
+    orchestration_run_id: &str,
+    cell_run_id: &str,
+) -> Result<()> {
+    inventory.validate()?;
+    if inventory.campaign_id != campaign_id
+        || inventory.owner_id != owner_id
+        || inventory.fencing_token != fencing_token
+        || inventory.orchestration_run_id != orchestration_run_id
+        || inventory.cell_run_id != cell_run_id
+    {
+        bail!("authoritative campaign inventory identity does not match this OAT cell");
+    }
+    Ok(())
+}
+
+async fn read_authoritative_campaign_inventory(
+    platform: &AksPlatform,
+    identity: &CampaignIdentity,
+    orchestration_run_id: &str,
+) -> Result<(RunInventory, String)> {
+    let actor = CampaignCleanupActor {
+        mode: CampaignActorMode::Producer,
+        owner_id: identity.owner_id.clone(),
+        fencing_token: identity.fencing_token,
+    };
+    let request = CampaignInventoryReadRequest {
+        schema_version: 1,
+        campaign_id: &identity.campaign_id,
+        orchestration_run_id,
+        cell_run_id: &platform.run_id,
+        actor: &actor,
+    };
+    let output = run_campaign_custody_json("read-inventory", None, &request).await?;
+    let response: CampaignInventoryReadResponse =
+        serde_json::from_slice(&output).context("parse authoritative campaign inventory")?;
+    if !response.ok {
+        bail!("campaign inventory read was not positively confirmed");
+    }
+    validate_campaign_etag(&response.etag)?;
+    validate_campaign_inventory_identity(
+        &response.inventory,
+        &identity.campaign_id,
+        &identity.owner_id,
+        identity.fencing_token,
+        orchestration_run_id,
+        &platform.run_id,
+    )?;
+    Ok((response.inventory, response.etag))
+}
+
+fn campaign_cleanup_step<'a>(action: &CampaignCleanupAction, inventory: &'a RunInventory) -> Option<&'a InventoryStep> {
+    match action {
+        CampaignCleanupAction::StopAdmission => Some(&inventory.cleanup.stop_admission),
+        CampaignCleanupAction::BoundedDrain => Some(&inventory.cleanup.bounded_drain),
+        CampaignCleanupAction::EvidenceCapture => Some(&inventory.cleanup.evidence_capture),
+        CampaignCleanupAction::StopMaintenance => Some(&inventory.cleanup.stop_maintenance),
+        CampaignCleanupAction::TerminalCapture => Some(&inventory.cleanup.terminal_capture),
+        CampaignCleanupAction::Handoff => Some(&inventory.cleanup.handoff),
+        CampaignCleanupAction::RemoveNamespace
+        | CampaignCleanupAction::RemoveQap
+        | CampaignCleanupAction::RemoveFic => None,
+    }
+}
+
+fn campaign_cleanup_step_complete(action: &CampaignCleanupAction, inventory: &RunInventory) -> Result<()> {
+    let complete = match action {
+        CampaignCleanupAction::StopAdmission => inventory.cleanup.stop_admission.state == InventoryStepState::Complete,
+        CampaignCleanupAction::BoundedDrain => inventory.cleanup.bounded_drain.state == InventoryStepState::Complete,
+        CampaignCleanupAction::EvidenceCapture => {
+            inventory.cleanup.evidence_capture.state == InventoryStepState::Complete
+        }
+        CampaignCleanupAction::StopMaintenance => {
+            inventory.cleanup.stop_maintenance.state == InventoryStepState::Complete
+        }
+        CampaignCleanupAction::TerminalCapture => {
+            inventory.cleanup.terminal_capture.state == InventoryStepState::Complete
+        }
+        CampaignCleanupAction::RemoveNamespace => inventory.resources.iter().all(|resource| {
+            matches!(
+                resource.state,
+                InventoryResourceState::Removed | InventoryResourceState::Absent
+            )
+        }),
+        CampaignCleanupAction::RemoveQap => inventory.qap.as_ref().is_none_or(|qap| {
+            matches!(
+                qap.state,
+                InventoryResourceState::Removed | InventoryResourceState::Absent
+            )
+        }),
+        CampaignCleanupAction::RemoveFic => inventory.fic.as_ref().is_none_or(|fic| {
+            matches!(
+                fic.state,
+                InventoryResourceState::Removed | InventoryResourceState::Absent
+            )
+        }),
+        CampaignCleanupAction::Handoff => inventory.cleanup.handoff.state == InventoryStepState::Complete,
+    };
+    if !complete {
+        bail!(
+            "campaign cleanup {} lacks authoritative durable completion",
+            action.selector()
+        );
+    }
+    Ok(())
+}
+
+async fn execute_campaign_cleanup_action(
+    platform: &AksPlatform,
+    identity: &CampaignIdentity,
+    orchestration_run_id: &str,
+    action: &CampaignCleanupAction,
+    inventory: &RunInventory,
+    etag: &str,
+) -> Result<(RunInventory, String, CampaignCleanupReceipt)> {
+    validate_campaign_etag(etag)?;
+    let actor = CampaignCleanupActor {
+        mode: CampaignActorMode::Producer,
+        owner_id: identity.owner_id.clone(),
+        fencing_token: identity.fencing_token,
+    };
+    let request = CampaignCleanupRequest {
+        schema_version: 1,
+        inventory,
+        expected_etag: etag,
+        actor: &actor,
+    };
+    let output = run_campaign_custody_json("cleanup-step", Some(action.selector()), &request).await?;
+    let response: CampaignCleanupResponse =
+        serde_json::from_slice(&output).context("parse campaign cleanup receipt")?;
+    if !response.ok {
+        bail!("campaign cleanup {} was not positively confirmed", action.selector());
+    }
+    let receipt = response.receipt;
+    validate_campaign_etag(&receipt.etag)?;
+    if receipt.status != "complete"
+        || receipt.step != action.selector()
+        || receipt.campaign_id != inventory.campaign_id
+        || receipt.owner_id != inventory.owner_id
+        || receipt.fencing_token != inventory.fencing_token
+        || receipt.orchestration_run_id != inventory.orchestration_run_id
+        || receipt.cell_run_id != inventory.cell_run_id
+        || receipt.namespace_uid != inventory.namespace.uid
+        || receipt.actor != actor
+        || receipt.completed_at_unix_ms == 0
+    {
+        bail!(
+            "campaign cleanup {} returned a mismatched or incomplete receipt",
+            action.selector()
+        );
+    }
+    let (next_inventory, next_etag) =
+        read_authoritative_campaign_inventory(platform, identity, orchestration_run_id).await?;
+    if next_etag != receipt.etag {
+        bail!("campaign cleanup receipt ETag does not match authoritative inventory readback");
+    }
+    inventory.validate_successor(&next_inventory)?;
+    campaign_cleanup_step_complete(action, &next_inventory)?;
+    persist_campaign_inventory_snapshot(platform, &next_inventory, &next_etag).await?;
+    Ok((next_inventory, next_etag, receipt))
+}
+
+async fn persist_campaign_inventory_snapshot(
+    platform: &AksPlatform,
+    inventory: &RunInventory,
+    etag: &str,
+) -> Result<()> {
+    let runtime_dir = platform
+        .runtime_dir
+        .as_deref()
+        .context("campaign runtime directory is not available")?;
+    validate_campaign_etag(etag)?;
+    tokio::fs::write(
+        runtime_dir.join("campaign-inventory.json"),
+        serde_json::to_vec(inventory)?,
+    )
+    .await
+    .context("persist authoritative campaign inventory snapshot")?;
+    tokio::fs::write(runtime_dir.join("campaign-inventory-etag"), etag.as_bytes())
+        .await
+        .context("persist authoritative campaign inventory ETag")?;
+    Ok(())
+}
+
+async fn cleanup_campaign_aks_platform(config: &OatConfig, platform: &AksPlatform) -> Result<Value> {
+    let identity = CampaignIdentity::from_lookup(|name| std::env::var(name).ok())?;
+    let runtime_dir = platform
+        .runtime_dir
+        .as_deref()
+        .context("campaign runtime directory is not available")?;
+    let cached: RunInventory = serde_json::from_slice(
+        &tokio::fs::read(runtime_dir.join("campaign-inventory.json"))
+            .await
+            .context("read persisted campaign inventory")?,
+    )
+    .context("parse persisted campaign inventory")?;
+    let cached_etag = tokio::fs::read_to_string(runtime_dir.join("campaign-inventory-etag"))
+        .await
+        .context("read persisted campaign inventory ETag")?;
+    validate_campaign_etag(cached_etag.trim())?;
+    let orchestration_run_id = cached.orchestration_run_id.clone();
+    validate_campaign_inventory_identity(
+        &cached,
+        &identity.campaign_id,
+        &identity.owner_id,
+        identity.fencing_token,
+        &orchestration_run_id,
+        &platform.run_id,
+    )?;
+    if cached.namespace.name != config.namespace || cached.namespace.owner_token != platform.namespace_owner_token {
+        bail!("persisted campaign inventory does not match the OAT namespace origin");
+    }
+    let (mut inventory, mut etag) =
+        read_authoritative_campaign_inventory(platform, &identity, &orchestration_run_id).await?;
+    cached.validate_successor(&inventory)?;
+    persist_campaign_inventory_snapshot(platform, &inventory, &etag).await?;
+    let actions = [
+        CampaignCleanupAction::StopAdmission,
+        CampaignCleanupAction::BoundedDrain,
+        CampaignCleanupAction::EvidenceCapture,
+        CampaignCleanupAction::StopMaintenance,
+        CampaignCleanupAction::TerminalCapture,
+        CampaignCleanupAction::RemoveNamespace,
+        CampaignCleanupAction::RemoveQap,
+        CampaignCleanupAction::RemoveFic,
+        CampaignCleanupAction::Handoff,
+    ];
+    let mut receipts = Vec::with_capacity(actions.len());
+    for action in actions {
+        if let Some(step) = campaign_cleanup_step(&action, &inventory) {
+            match step.state {
+                InventoryStepState::Complete => {
+                    receipts.push(json!({"step": action.selector(), "status": "already_complete", "source": "authoritative_inventory"}));
+                    continue;
+                }
+                InventoryStepState::NotStarted => {}
+                InventoryStepState::Pending
+                | InventoryStepState::Running
+                | InventoryStepState::Failed
+                | InventoryStepState::Uncertain => {
+                    bail!(
+                        "campaign cleanup {} is already running or unresolved; refusing replay",
+                        action.selector()
+                    );
+                }
+            }
+        }
+        let (next_inventory, next_etag, receipt) =
+            execute_campaign_cleanup_action(platform, &identity, &orchestration_run_id, &action, &inventory, &etag)
+                .await
+                .with_context(|| format!("execute custody cleanup {}", action.selector()))?;
+        inventory = next_inventory;
+        etag = next_etag;
+        receipts.push(serde_json::to_value(receipt)?);
+    }
+    Ok(json!({"status":"observed", "cleanup_receipts":receipts}))
+}
+
 async fn persist_campaign_inventory(platform: &AksPlatform, inventory: &RunInventory) -> Result<()> {
     let runtime_dir = platform
         .runtime_dir
@@ -6877,6 +7321,7 @@ async fn initialize_campaign_inventory(
             stop_admission: step(),
             bounded_drain: step(),
             evidence_capture: step(),
+            stop_maintenance: step(),
             terminal_capture: step(),
             handoff: step(),
         },
@@ -8633,6 +9078,41 @@ async fn cleanup_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
             Err(error) => failures.push(format!("stop owned AKS router metrics tunnel: {error:#}")),
         }
         platform.router_metrics_url = None;
+    }
+    if config.campaign_profile == Some(crate::config::CampaignProfile::SingleHotTable) {
+        match cleanup_campaign_aks_platform(config, platform).await {
+            Ok(evidence) => platform.shutdown_drain_evidence = Some(evidence),
+            Err(error) => {
+                let detail = format!("{error:#}");
+                platform.shutdown_drain_evidence = Some(json!({
+                    "status": "unavailable",
+                    "reason": "custody_cleanup_failed_or_uncertain",
+                    "failure": detail,
+                }));
+                failures.push(format!("custody-managed AKS cleanup failed: {detail}"));
+            }
+        }
+        if let Some(runtime_dir) = platform.runtime_dir.take() {
+            let retention = runtime_evidence_retention(
+                platform.fic_prepare_attempted,
+                platform.fic_record_path.as_deref(),
+                platform.fic_ready_snapshot_path.as_deref(),
+                platform.qap_bind_attempted,
+                platform.qap_record_path.as_deref(),
+                platform.workload_stop_record_path.as_deref(),
+                platform.qap_outcome_unresolved || !failures.is_empty(),
+            );
+            if let Err(error) = apply_runtime_evidence_retention(&runtime_dir, retention).await {
+                failures.push(format!(
+                    "remove private AKS runtime files {}: {error:#}",
+                    runtime_dir.display()
+                ));
+            }
+        }
+        if failures.is_empty() {
+            return Ok(());
+        }
+        return Err(anyhow::anyhow!("AKS cleanup was incomplete: {}", failures.join("; ")));
     }
     if platform.namespace_created || platform.namespace_create_attempted {
         match kubectl(config, vec!["get", "namespace", &config.namespace, "-o", "json"], None).await {
@@ -10491,6 +10971,35 @@ mod tests {
     }
 
     #[test]
+    fn campaign_cleanup_preserves_the_approved_maintenance_and_evidence_order() {
+        let actions = [
+            CampaignCleanupAction::StopAdmission,
+            CampaignCleanupAction::BoundedDrain,
+            CampaignCleanupAction::EvidenceCapture,
+            CampaignCleanupAction::StopMaintenance,
+            CampaignCleanupAction::TerminalCapture,
+            CampaignCleanupAction::RemoveNamespace,
+            CampaignCleanupAction::RemoveQap,
+            CampaignCleanupAction::RemoveFic,
+            CampaignCleanupAction::Handoff,
+        ];
+        assert_eq!(
+            actions.map(|action| action.selector()),
+            [
+                "stop_admission",
+                "bounded_drain",
+                "evidence_capture",
+                "stop_maintenance",
+                "terminal_capture",
+                "remove_namespace",
+                "remove_qap",
+                "remove_fic",
+                "handoff",
+            ]
+        );
+    }
+
+    #[test]
     fn custody_inventory_never_replaces_exact_ownership_or_accepts_unknown_observations() -> Result<()> {
         let step = json!({"state":"not_started","deadline_unix_ms":null,"reason_code":null});
         let mut inventory: RunInventory = serde_json::from_value(json!({
@@ -10507,9 +11016,93 @@ mod tests {
                 "uid":null,"role":"collector","state":"planned"}],
             "fic":null,"qap":null,
             "cleanup":{"stop_admission":step,"bounded_drain":step,"evidence_capture":step,
-                "terminal_capture":step,"handoff":step}
+                "stop_maintenance":step,"terminal_capture":step,"handoff":step}
         }))?;
+        let mut legacy_schema = serde_json::to_value(&inventory)?;
+        legacy_schema["cleanup"]
+            .as_object_mut()
+            .context("serialized cleanup object missing")?
+            .remove("stop_maintenance");
+        assert!(serde_json::from_value::<RunInventory>(legacy_schema).is_err());
         inventory.validate()?;
+        validate_campaign_etag("\"strong-etag\"")?;
+        assert!(validate_campaign_etag("W/\"weak-etag\"").is_err());
+        assert!(validate_campaign_etag("*").is_err());
+        let actor = CampaignCleanupActor {
+            mode: CampaignActorMode::Producer,
+            owner_id: inventory.owner_id.clone(),
+            fencing_token: inventory.fencing_token,
+        };
+        let read_request = serde_json::to_value(CampaignInventoryReadRequest {
+            schema_version: 1,
+            campaign_id: &inventory.campaign_id,
+            orchestration_run_id: &inventory.orchestration_run_id,
+            cell_run_id: &inventory.cell_run_id,
+            actor: &actor,
+        })?;
+        let read_fields = read_request
+            .as_object()
+            .context("read request is not an object")?
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            read_fields,
+            BTreeSet::from([
+                "schema_version",
+                "campaign_id",
+                "orchestration_run_id",
+                "cell_run_id",
+                "actor",
+            ])
+        );
+        assert_eq!(read_request["actor"]["mode"], "producer");
+        let cleanup_request = serde_json::to_value(CampaignCleanupRequest {
+            schema_version: 1,
+            inventory: &inventory,
+            expected_etag: "\"versioned-etag\"",
+            actor: &actor,
+        })?;
+        let cleanup_fields = cleanup_request
+            .as_object()
+            .context("cleanup request is not an object")?
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            cleanup_fields,
+            BTreeSet::from(["schema_version", "inventory", "expected_etag", "actor"])
+        );
+        assert_eq!(
+            cleanup_request["inventory"]["cleanup"]["stop_maintenance"]["state"],
+            "not_started"
+        );
+        let receipt = CampaignCleanupReceipt {
+            status: "complete".to_owned(),
+            step: "stop_maintenance".to_owned(),
+            campaign_id: inventory.campaign_id.clone(),
+            owner_id: inventory.owner_id.clone(),
+            fencing_token: inventory.fencing_token,
+            orchestration_run_id: inventory.orchestration_run_id.clone(),
+            cell_run_id: inventory.cell_run_id.clone(),
+            namespace_uid: None,
+            actor: actor.clone(),
+            completed_at_unix_ms: 1_000,
+            etag: "\"receipt-etag\"".to_owned(),
+        };
+        let mut receipt_without_namespace_uid = serde_json::to_value(receipt)?;
+        receipt_without_namespace_uid
+            .as_object_mut()
+            .context("receipt is not an object")?
+            .remove("namespace_uid");
+        assert!(serde_json::from_value::<CampaignCleanupReceipt>(receipt_without_namespace_uid).is_err());
+        let mut missing_stop_deadline = inventory.clone();
+        missing_stop_deadline.cleanup.stop_maintenance.state = InventoryStepState::Running;
+        assert!(missing_stop_deadline.validate().is_err());
+        missing_stop_deadline.cleanup.stop_maintenance.deadline_unix_ms = Some(0);
+        assert!(missing_stop_deadline.validate().is_err());
+        missing_stop_deadline.cleanup.stop_maintenance.deadline_unix_ms = Some(1_000);
+        missing_stop_deadline.validate()?;
         let mut wrong_owner = inventory.clone();
         wrong_owner.namespace.owner_token = "00000000-0000-0000-0000-000000000005".to_owned();
         assert!(wrong_owner.validate().is_err());
@@ -10604,9 +11197,14 @@ mod tests {
         complete.cleanup.stop_admission.state = InventoryStepState::Complete;
         complete.cleanup.bounded_drain.state = InventoryStepState::Complete;
         complete.cleanup.evidence_capture.state = InventoryStepState::Complete;
+        complete.cleanup.stop_maintenance.state = InventoryStepState::Complete;
         complete.cleanup.terminal_capture.state = InventoryStepState::Complete;
         assert!(complete.validate().is_err());
         complete.resources = absent.resources.clone();
+        complete.validate()?;
+        complete.cleanup.stop_maintenance.state = InventoryStepState::NotStarted;
+        assert!(complete.validate().is_err());
+        complete.cleanup.stop_maintenance.state = InventoryStepState::Complete;
         complete.validate()?;
         let mut invalid_external = external.clone();
         invalid_external
