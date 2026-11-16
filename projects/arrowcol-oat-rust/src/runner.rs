@@ -3472,7 +3472,7 @@ async fn settle_cell_commit_evidence(
 #[test]
 fn local_lifecycle_budget_allows_positive_setup_elapsed_and_rejects_exhaustion() -> Result<()> {
     let mut config: OatConfig = serde_json::from_str(include_str!(
-        "../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
     ))?;
     config.platform.kind = crate::config::OatMode::Local;
     let budget = config.timing_budget()?;
