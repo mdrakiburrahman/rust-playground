@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { buildThroughputManifests, renderThroughputConfig } from './throughput-sweeps.js';
+import { buildThroughputManifests, renderThroughputBaseline, renderThroughputConfig } from './throughput-sweeps.js';
 
 function at(value: unknown, path: string[]): unknown {
   let current = value;
@@ -143,6 +143,9 @@ test('renders candidate overlays as OAT configs without changing the baseline or
   const original = structuredClone(base);
   const manifests = buildThroughputManifests(base);
   for (const manifest of manifests) {
+    const baseline = renderThroughputBaseline(base, manifest);
+    assert.deepEqual(baseline.overload_guard, { enabled: true, cap_fraction: 0.90, zero_progress_windows: 2 });
+    assert.equal(at(baseline, ['platform', 'local', 'collector_memory_limit_bytes']), 4_294_967_296);
     const comparisons = manifest.comparisons as Array<{ id: string; candidates: Array<{ id: string }> }>;
     for (const comparison of comparisons) {
       for (const candidate of comparison.candidates) {
@@ -150,6 +153,8 @@ test('renders candidate overlays as OAT configs without changing the baseline or
         assert.deepEqual(config.tables, ['sqlserver_availability_replica_states']);
         assert.deepEqual(config.replica_counts, [1]);
         assert.equal(config.campaign_profile, 'single_hot_table');
+        assert.deepEqual(config.overload_guard, baseline.overload_guard);
+        assert.equal(at(config, ['platform', 'local', 'collector_memory_limit_bytes']), 4_294_967_296);
         assert.equal(config.measure_seconds, 150);
         assert.equal(at(config, ['tunables', 'maintenance', 'granularity']), 'hour');
         assert.equal(at(config, ['tunables', 'maintenance', 'purge_retention_secs']), 2_592_000);

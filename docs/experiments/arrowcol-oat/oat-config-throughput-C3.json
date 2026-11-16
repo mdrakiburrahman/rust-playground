@@ -11,6 +11,16 @@
   "campaign_profile": "single_hot_table",
   "baseline_overrides": {
     "campaign_profile": "single_hot_table",
+    "overload_guard": {
+      "enabled": true,
+      "cap_fraction": 0.9,
+      "zero_progress_windows": 2
+    },
+    "platform": {
+      "local": {
+        "collector_memory_limit_bytes": 4294967296
+      }
+    },
     "tables": [
       "sqlserver_availability_replica_states"
     ],
@@ -410,13 +420,7 @@
   ],
   "runnable": false,
   "config_validation": {
-    "status": "config-validated",
-    "validator": "arrowcol-oat-rust --validate-config",
-    "source_sha": "51a641b97fe30ef783e0eac352777a0c371f2191",
-    "baseline_count": 1,
-    "candidate_count": 16,
-    "pass_count": 17,
-    "fail_count": 0
+    "status": "not-validated"
   },
   "runtime_qualification": "unqualified"
 }

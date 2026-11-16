@@ -143,6 +143,8 @@ export function buildThroughputManifests(registry: unknown): JsonObject[] {
       campaign_profile: 'single_hot_table',
       baseline_overrides: {
         campaign_profile: 'single_hot_table',
+        overload_guard: { enabled: true, cap_fraction: 0.90, zero_progress_windows: 2 },
+        platform: { local: { collector_memory_limit_bytes: 4_294_967_296 } },
         tables: ['sqlserver_availability_replica_states'],
         replica_counts: [1],
         rows_per_table: 65_536,
