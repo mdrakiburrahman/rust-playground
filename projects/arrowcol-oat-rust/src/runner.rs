@@ -807,8 +807,8 @@ impl RunInventory {
     ///
     /// # Errors
     /// Refuses unconfirmed writes and mismatched or fenced receipts without retrying.
-    pub async fn publish_to_custody(&self) -> Result<String> {
-        self.custody_command(false)
+    pub(crate) async fn publish_to_custody(&self, config_paths: AksHelperConfigPaths<'_>) -> Result<String> {
+        self.custody_command(false, config_paths)
             .await?
             .context("custody publisher did not return an ETag")
     }
@@ -817,12 +817,12 @@ impl RunInventory {
     ///
     /// # Errors
     /// Refuses an unready or mismatched receipt.
-    pub async fn assert_custody_ready(&self) -> Result<()> {
-        self.custody_command(true).await.map(|_| ())
+    pub(crate) async fn assert_custody_ready(&self, config_paths: AksHelperConfigPaths<'_>) -> Result<()> {
+        self.custody_command(true, config_paths).await.map(|_| ())
     }
 
     #[cfg(unix)]
-    async fn custody_command(&self, ready: bool) -> Result<Option<String>> {
+    async fn custody_command(&self, ready: bool, config_paths: AksHelperConfigPaths<'_>) -> Result<Option<String>> {
         self.validate()?;
         let payload = if ready {
             None
@@ -833,13 +833,13 @@ impl RunInventory {
             }
             Some(bytes)
         };
-        let mut command = Command::new("npx");
-        command.args(["--no-install", "tsx", "projects/arrowcol-oat/aks-campaign.ts"]);
-        if ready {
-            command.args(["assert-ready", &self.owner_id, &self.fencing_token.to_string()]);
+        let action = if ready { "assert-ready" } else { "publish-inventory" };
+        let action_args = if ready {
+            vec![self.owner_id.clone(), self.fencing_token.to_string()]
         } else {
-            command.arg("publish-inventory");
-        }
+            Vec::new()
+        };
+        let mut command = aks_campaign_cli_command(config_paths, action, &action_args)?;
         command
             .stdin(if ready { Stdio::null() } else { Stdio::piped() })
             .stdout(Stdio::piped())
@@ -875,7 +875,7 @@ impl RunInventory {
     }
 
     #[cfg(not(unix))]
-    async fn custody_command(&self, _ready: bool) -> Result<Option<String>> {
+    async fn custody_command(&self, _ready: bool, _config_paths: AksHelperConfigPaths<'_>) -> Result<Option<String>> {
         bail!("fenced custody requires Unix process-group cancellation")
     }
 }
@@ -1046,6 +1046,7 @@ struct AksPlatform {
     service_account: Option<String>,
     router_yaml: Option<String>,
     shutdown_drain_evidence: Option<Value>,
+    campaign_cli_paths: Option<OwnedAksCampaignConfigPaths>,
 }
 
 struct OwnedKubectlProcess {
@@ -1375,7 +1376,7 @@ impl Platform for AksPlatform {
             actor: &actor,
         };
         let output =
-            run_campaign_custody_json("capture-cell-baseline", None, &request, Duration::from_secs(90)).await?;
+            run_campaign_custody_json(self, "capture-cell-baseline", None, &request, Duration::from_secs(90)).await?;
         let response: CampaignCellBaselineResponse =
             serde_json::from_slice(&output).context("parse immutable cell baseline receipt")?;
         if !response.ok {
@@ -1443,6 +1444,7 @@ impl Platform for AksPlatform {
         }
         authorized.validate_successor(&final_inventory)?;
         persist_campaign_inventory_snapshot(self, &final_inventory, &final_etag).await?;
+        final_inventory.assert_custody_ready(self.campaign_cli_paths()?).await?;
         Ok(())
     }
 
@@ -3014,7 +3016,9 @@ fn platform_for_run(config: &OatConfig, run_id: &str) -> Result<Box<dyn Platform
         && config.campaign_profile == Some(crate::config::CampaignProfile::SingleHotTable)
     {
         CampaignIdentity::from_lookup(|name| std::env::var(name).ok())?;
-        bail!("AKS campaign is blocked until fenced inventory publication and lifecycle hooks are integrated");
+        bail!(
+            "AKS campaign is blocked pending end-to-end runtime qualification, including custody lifecycle and collector-visible shared storage"
+        );
     }
     match config.platform.kind {
         crate::config::OatMode::Local => Ok(Box::new(LocalPlatform::new(config, run_id)?)),
@@ -3046,6 +3050,7 @@ fn platform_for_run(config: &OatConfig, run_id: &str) -> Result<Box<dyn Platform
             service_account: None,
             router_yaml: None,
             shutdown_drain_evidence: None,
+            campaign_cli_paths: None,
         })),
     }
 }
@@ -7238,6 +7243,27 @@ struct CampaignCellBaselineResponse {
     message: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct CampaignBaselineReceipt {
+    status: String,
+    campaign_id: String,
+    owner_id: String,
+    fencing_token: u64,
+    blob: String,
+    etag: String,
+    captured_at_unix_ms: u64,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CampaignBaselineResponse {
+    ok: bool,
+    receipt: Option<CampaignBaselineReceipt>,
+    code: Option<String>,
+    message: Option<String>,
+}
+
 #[derive(Clone, Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CampaignInventoryReadResponse {
@@ -7331,6 +7357,7 @@ fn campaign_custody_helper_failure(action: &str, stdout: &[u8]) -> anyhow::Error
 
 #[cfg(unix)]
 async fn run_campaign_custody_json<T: serde::Serialize>(
+    platform: &AksPlatform,
     action: &str,
     selector: Option<&str>,
     request: &T,
@@ -7340,19 +7367,14 @@ async fn run_campaign_custody_json<T: serde::Serialize>(
     if payload.len() > 1024 * 1024 {
         bail!("campaign custody request exceeds the helper input limit");
     }
-    let workspace = std::env::current_dir().context("resolve repository root for campaign custody helper")?;
-    let mut command = Command::new("npx");
+    let action_args = selector.map(|value| vec![value.to_owned()]).unwrap_or_default();
+    let mut command = aks_campaign_cli_command(platform.campaign_cli_paths()?, action, &action_args)?;
     command
-        .current_dir(workspace)
-        .args(["--no-install", "tsx", "projects/arrowcol-oat/aks-campaign.ts", action])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0)
         .kill_on_drop(true);
-    if let Some(selector) = selector {
-        command.arg(selector);
-    }
     let output = match tokio::time::timeout(timeout, async {
         let mut child = command.spawn().context("start campaign custody helper")?;
         let pid = i32::try_from(child.id().context("campaign custody helper PID unavailable")?)
@@ -7373,7 +7395,7 @@ async fn run_campaign_custody_json<T: serde::Serialize>(
     .await
     {
         Ok(result) => result?,
-        Err(_) if matches!(action, "cleanup-step" | "capture-cell-baseline") => {
+        Err(_) if matches!(action, "cleanup-step" | "capture-cell-baseline" | "capture-baseline") => {
             bail!("campaign {action} helper timed out; effect outcome is UNKNOWN and must not be replayed")
         }
         Err(_) => bail!("campaign inventory helper timed out; no authoritative readback was obtained"),
@@ -7386,11 +7408,113 @@ async fn run_campaign_custody_json<T: serde::Serialize>(
 
 #[cfg(not(unix))]
 async fn run_campaign_custody_json<T: serde::Serialize>(
+    _platform: &AksPlatform,
     _action: &str,
     _selector: Option<&str>,
     _request: &T,
     _timeout: Duration,
 ) -> Result<Vec<u8>> {
+    bail!("campaign custody requires Unix process-group cancellation")
+}
+
+fn parse_campaign_baseline_response(output: &[u8], identity: &CampaignIdentity) -> Result<CampaignBaselineReceipt> {
+    let response: CampaignBaselineResponse =
+        serde_json::from_slice(output).context("parse immutable campaign baseline receipt")?;
+    if !response.ok {
+        let code = response
+            .code
+            .as_deref()
+            .filter(|code| !code.is_empty())
+            .context("campaign baseline failure returned no error code")?;
+        bail!("campaign baseline capture failed: {code}");
+    }
+    if response.code.is_some() || response.message.is_some() {
+        bail!("successful campaign baseline response included error fields");
+    }
+    let receipt = response
+        .receipt
+        .context("campaign baseline response omitted its receipt")?;
+    validate_campaign_baseline_receipt(&receipt, identity)?;
+    Ok(receipt)
+}
+
+async fn load_campaign_baseline_receipt(
+    platform: &AksPlatform,
+    identity: &CampaignIdentity,
+) -> Result<Option<CampaignBaselineReceipt>> {
+    let runtime_dir = platform
+        .runtime_dir
+        .as_deref()
+        .context("campaign runtime directory is not available")?;
+    let path = runtime_dir.join("campaign-baseline.json");
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("read campaign baseline receipt {}", path.display())),
+    };
+    let receipt: CampaignBaselineReceipt =
+        serde_json::from_slice(&bytes).context("parse persisted immutable campaign baseline receipt")?;
+    validate_campaign_baseline_receipt(&receipt, identity)?;
+    Ok(Some(receipt))
+}
+
+#[cfg(unix)]
+async fn capture_campaign_baseline(
+    platform: &AksPlatform,
+    identity: &CampaignIdentity,
+) -> Result<CampaignBaselineReceipt> {
+    if let Some(receipt) = load_campaign_baseline_receipt(platform, identity).await? {
+        return Ok(receipt);
+    }
+    let action_args = vec![identity.owner_id.clone(), identity.fencing_token.to_string()];
+    let mut command = aks_campaign_cli_command(platform.campaign_cli_paths()?, "capture-baseline", &action_args)?;
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(Duration::from_secs(90), async {
+        let child = command.spawn().context("start campaign baseline capture")?;
+        let pid = i32::try_from(child.id().context("campaign baseline helper PID unavailable")?)
+            .context("campaign baseline helper PID invalid")?;
+        let _group =
+            OwnedQapHelperGroup(rustix::process::Pid::from_raw(pid).context("campaign baseline helper PID invalid")?);
+        child
+            .wait_with_output()
+            .await
+            .context("wait for campaign baseline helper")
+    })
+    .await
+    .context("campaign baseline capture timed out; outcome is UNKNOWN and must not be replayed")??;
+    if !output.status.success() {
+        return Err(campaign_custody_helper_failure("capture-baseline", &output.stdout));
+    }
+    let receipt = parse_campaign_baseline_response(&output.stdout, identity)?;
+    if let Some(existing) = load_campaign_baseline_receipt(platform, identity).await? {
+        if existing != receipt {
+            bail!("persisted campaign baseline proof changed; refusing to replace the original receipt");
+        }
+        return Ok(existing);
+    }
+    let runtime_dir = platform
+        .runtime_dir
+        .as_deref()
+        .context("campaign runtime directory is not available")?;
+    tokio::fs::write(
+        runtime_dir.join("campaign-baseline.json"),
+        serde_json::to_vec(&receipt)?,
+    )
+    .await
+    .context("persist immutable campaign baseline receipt")?;
+    Ok(receipt)
+}
+
+#[cfg(not(unix))]
+async fn capture_campaign_baseline(
+    _platform: &AksPlatform,
+    _identity: &CampaignIdentity,
+) -> Result<CampaignBaselineReceipt> {
     bail!("campaign custody requires Unix process-group cancellation")
 }
 
@@ -7470,6 +7594,46 @@ fn validate_campaign_inventory_identity(
     Ok(())
 }
 
+fn campaign_baseline_blob(campaign_id: &str) -> String {
+    format!("_arrowcol-custody/campaigns/{campaign_id}/baseline.json")
+}
+
+fn validate_campaign_baseline_receipt(receipt: &CampaignBaselineReceipt, identity: &CampaignIdentity) -> Result<()> {
+    validate_campaign_etag(&receipt.etag)?;
+    let expected_blob = campaign_baseline_blob(&identity.campaign_id);
+    if receipt.status != "captured"
+        || receipt.campaign_id != identity.campaign_id
+        || receipt.owner_id != identity.owner_id
+        || receipt.fencing_token != identity.fencing_token
+        || receipt.blob != expected_blob
+        || !valid_blob_path(&receipt.blob)
+        || receipt.captured_at_unix_ms == 0
+    {
+        bail!("campaign baseline receipt does not match the exact campaign, producer fence, and immutable blob");
+    }
+    Ok(())
+}
+
+fn validate_campaign_baseline_capture_inventory(inventory: &RunInventory, identity: &CampaignIdentity) -> Result<()> {
+    validate_campaign_inventory_identity(
+        inventory,
+        &identity.campaign_id,
+        &identity.owner_id,
+        identity.fencing_token,
+        &inventory.orchestration_run_id,
+        &inventory.cell_run_id,
+    )?;
+    if inventory.load_admission != InventoryLoadAdmission::NotAuthorized
+        || inventory.namespace.uid.is_some()
+        || !inventory.resources.is_empty()
+        || inventory.fic.is_some()
+        || inventory.qap.is_some()
+    {
+        bail!("campaign baseline capture requires the initial not_authorized inventory");
+    }
+    Ok(())
+}
+
 async fn read_authoritative_campaign_inventory(
     platform: &AksPlatform,
     identity: &CampaignIdentity,
@@ -7488,7 +7652,7 @@ async fn read_authoritative_campaign_inventory(
         cell_run_id: &platform.run_id,
         actor: &actor,
     };
-    let output = run_campaign_custody_json("read-inventory", None, &request, timeout).await?;
+    let output = run_campaign_custody_json(platform, "read-inventory", None, &request, timeout).await?;
     let response: CampaignInventoryReadResponse =
         serde_json::from_slice(&output).context("parse authoritative campaign inventory")?;
     if !response.ok {
@@ -7674,7 +7838,7 @@ async fn execute_campaign_cleanup_action(
                 actor: &actor,
             };
             let timeout = campaign_cleanup_remaining_budget(operation_deadline, action)?;
-            run_campaign_custody_json("cleanup-step", Some(action.selector()), &request, timeout).await
+            run_campaign_custody_json(platform, "cleanup-step", Some(action.selector()), &request, timeout).await
         };
         let output = match output {
             Ok(output) => output,
@@ -7771,6 +7935,7 @@ async fn persist_campaign_inventory_snapshot(
 
 async fn cleanup_campaign_aks_platform(config: &OatConfig, platform: &AksPlatform) -> Result<Value> {
     let identity = CampaignIdentity::from_lookup(|name| std::env::var(name).ok())?;
+    let campaign_baseline = load_campaign_baseline_receipt(platform, &identity).await?;
     let runtime_dir = platform
         .runtime_dir
         .as_deref()
@@ -7835,7 +8000,7 @@ async fn cleanup_campaign_aks_platform(config: &OatConfig, platform: &AksPlatfor
             );
         }
     }
-    Ok(json!({"status":"observed", "cleanup_receipts":receipts}))
+    Ok(json!({"status":"observed", "campaign_baseline":campaign_baseline, "cleanup_receipts":receipts}))
 }
 
 async fn campaign_inventory_for_setup(platform: &AksPlatform) -> Result<RunInventory> {
@@ -7891,7 +8056,7 @@ async fn persist_campaign_inventory(platform: &AksPlatform, inventory: &RunInven
         .runtime_dir
         .as_deref()
         .context("campaign runtime directory is not available")?;
-    let etag = inventory.publish_to_custody().await?;
+    let etag = inventory.publish_to_custody(platform.campaign_cli_paths()?).await?;
     tokio::fs::write(
         runtime_dir.join("campaign-inventory.json"),
         serde_json::to_vec(inventory)?,
@@ -7902,6 +8067,53 @@ async fn persist_campaign_inventory(platform: &AksPlatform, inventory: &RunInven
         .await
         .context("persist confirmed campaign inventory ETag")?;
     Ok(())
+}
+
+fn initial_campaign_inventory(
+    identity: &CampaignIdentity,
+    orchestration_run_id: &str,
+    cell_run_id: &str,
+    namespace: &str,
+    account: &str,
+    container: &str,
+) -> Result<RunInventory> {
+    let step = || InventoryStep {
+        state: InventoryStepState::NotStarted,
+        deadline_unix_ms: None,
+        reason_code: None,
+    };
+    let inventory = RunInventory {
+        schema_version: 1,
+        campaign_id: identity.campaign_id.clone(),
+        owner_id: identity.owner_id.clone(),
+        fencing_token: identity.fencing_token,
+        orchestration_run_id: orchestration_run_id.to_owned(),
+        cell_run_id: cell_run_id.to_owned(),
+        load_admission: InventoryLoadAdmission::NotAuthorized,
+        namespace: InventoryNamespace {
+            name: namespace.to_owned(),
+            uid: None,
+            owner_token: identity.owner_id.clone(),
+        },
+        resources: Vec::new(),
+        fic: None,
+        qap: None,
+        evidence_destination: Some(InventoryEvidenceDestination {
+            account: account.to_owned(),
+            container: container.to_owned(),
+            blob_prefix: format!("campaigns/{}/cells/{}/evidence", identity.campaign_id, cell_run_id),
+        }),
+        cleanup: InventoryCleanup {
+            stop_admission: step(),
+            bounded_drain: step(),
+            evidence_capture: step(),
+            stop_maintenance: step(),
+            terminal_capture: step(),
+            handoff: step(),
+        },
+    };
+    inventory.validate()?;
+    Ok(inventory)
 }
 
 async fn initialize_campaign_inventory(
@@ -7915,43 +8127,18 @@ async fn initialize_campaign_inventory(
         .context("CAMPAIGN_STORAGE_ACCOUNT is required for campaign evidence custody")?;
     let container = std::env::var("CAMPAIGN_STATE_CONTAINER")
         .context("CAMPAIGN_STATE_CONTAINER is required for campaign evidence custody")?;
-    let step = || InventoryStep {
-        state: InventoryStepState::NotStarted,
-        deadline_unix_ms: None,
-        reason_code: None,
-    };
-    let inventory = RunInventory {
-        schema_version: 1,
-        campaign_id: identity.campaign_id.clone(),
-        owner_id: identity.owner_id.clone(),
-        fencing_token: identity.fencing_token,
-        orchestration_run_id: orchestration_run_id.to_owned(),
-        cell_run_id: platform.run_id.clone(),
-        load_admission: InventoryLoadAdmission::NotAuthorized,
-        namespace: InventoryNamespace {
-            name: config.namespace.clone(),
-            uid: None,
-            owner_token: identity.owner_id,
-        },
-        resources: Vec::new(),
-        fic: None,
-        qap: None,
-        evidence_destination: Some(InventoryEvidenceDestination {
-            account,
-            container,
-            blob_prefix: format!("campaigns/{}/cells/{}/evidence", identity.campaign_id, platform.run_id),
-        }),
-        cleanup: InventoryCleanup {
-            stop_admission: step(),
-            bounded_drain: step(),
-            evidence_capture: step(),
-            stop_maintenance: step(),
-            terminal_capture: step(),
-            handoff: step(),
-        },
-    };
-    inventory.validate()?;
-    persist_campaign_inventory(platform, &inventory).await
+    let inventory = initial_campaign_inventory(
+        &identity,
+        orchestration_run_id,
+        &platform.run_id,
+        &config.namespace,
+        &account,
+        &container,
+    )?;
+    persist_campaign_inventory(platform, &inventory).await?;
+    validate_campaign_baseline_capture_inventory(&inventory, &identity)?;
+    capture_campaign_baseline(platform, &identity).await?;
+    Ok(())
 }
 
 async fn record_campaign_namespace_uid(config: &OatConfig, platform: &AksPlatform) -> Result<()> {
@@ -8007,6 +8194,7 @@ async fn prepare_aks_platform(
     }
     platform.runtime_dir = Some(runtime_dir.clone());
     if config.campaign_profile == Some(crate::config::CampaignProfile::SingleHotTable) {
+        platform.campaign_cli_paths = Some(OwnedAksCampaignConfigPaths::from_config(config)?);
         initialize_campaign_inventory(config, platform, orchestration_run_id).await?;
     }
 
@@ -8332,9 +8520,69 @@ fn configured_bootstrap_env_file(config: &OatConfig) -> Result<&Path> {
 }
 
 #[derive(Clone, Copy)]
-struct AksHelperConfigPaths<'a> {
+pub(crate) struct AksHelperConfigPaths<'a> {
     stamp_config_path: &'a Path,
     bootstrap_env_file: &'a Path,
+}
+
+#[derive(Clone, Debug)]
+struct OwnedAksCampaignConfigPaths {
+    stamp_config_path: PathBuf,
+    bootstrap_env_file: PathBuf,
+}
+
+impl OwnedAksCampaignConfigPaths {
+    fn from_config(config: &OatConfig) -> Result<Self> {
+        let workspace = std::env::current_dir().context("resolve workspace for campaign custody config")?;
+        let stamp_config_path = selected_aks_stamp_config_path(&workspace)?;
+        let env_path = configured_bootstrap_env_file(config)?;
+        let bootstrap_env_file = if env_path.is_absolute() {
+            env_path.to_path_buf()
+        } else {
+            workspace.join(env_path)
+        }
+        .canonicalize()
+        .context("resolve selected private campaign environment file")?;
+        Ok(Self {
+            stamp_config_path,
+            bootstrap_env_file,
+        })
+    }
+
+    fn as_borrowed(&self) -> AksHelperConfigPaths<'_> {
+        AksHelperConfigPaths {
+            stamp_config_path: &self.stamp_config_path,
+            bootstrap_env_file: &self.bootstrap_env_file,
+        }
+    }
+}
+
+impl AksPlatform {
+    fn campaign_cli_paths(&self) -> Result<AksHelperConfigPaths<'_>> {
+        self.campaign_cli_paths
+            .as_ref()
+            .map(OwnedAksCampaignConfigPaths::as_borrowed)
+            .context("campaign custody CLI paths were not initialized before use")
+    }
+}
+
+fn aks_campaign_cli_command(
+    config_paths: AksHelperConfigPaths<'_>,
+    action: &str,
+    action_args: &[String],
+) -> Result<Command> {
+    let workspace = std::env::current_dir().context("resolve repository root for campaign custody helper")?;
+    let mut command = Command::new("npx");
+    command
+        .current_dir(workspace)
+        .args(["--no-install", "tsx", "projects/arrowcol-oat/aks-campaign.ts", action])
+        .args(action_args)
+        .arg("--env-file")
+        .arg(config_paths.bootstrap_env_file)
+        .arg("--stamp-config")
+        .arg(config_paths.stamp_config_path)
+        .kill_on_drop(true);
+    Ok(command)
 }
 
 #[derive(Clone, Copy)]
@@ -11782,6 +12030,124 @@ mod tests {
     }
 
     #[test]
+    fn rust_initial_campaign_inventory_serializes_for_the_final_ts_predicate() -> anyhow::Result<()> {
+        let identity = super::CampaignIdentity {
+            campaign_id: "00000000-0000-0000-0000-000000000001".to_owned(),
+            owner_id: "00000000-0000-0000-0000-000000000002".to_owned(),
+            fencing_token: 7,
+        };
+        let inventory = super::initial_campaign_inventory(
+            &identity,
+            "00000000-0000-0000-0000-000000000003",
+            "00000000-0000-0000-0000-000000000004",
+            "arrow-collector-00000000000000000000000000000004",
+            "campaignstorage",
+            "checkpoints",
+        )?;
+        super::validate_campaign_baseline_capture_inventory(&inventory, &identity)?;
+        let value = serde_json::to_value(&inventory)?;
+        assert_eq!(value["load_admission"], "not_authorized");
+        assert_eq!(value["namespace"]["uid"], serde_json::Value::Null);
+        assert_eq!(value["resources"], serde_json::json!([]));
+        assert_eq!(value["fic"], serde_json::Value::Null);
+        assert_eq!(value["qap"], serde_json::Value::Null);
+        println!("E1_RUST_INITIAL_INVENTORY={}", serde_json::to_string(&inventory)?);
+        Ok(())
+    }
+
+    #[test]
+    fn campaign_cli_actions_always_receive_the_selected_private_env_and_stamp_paths() -> Result<()> {
+        let paths = AksHelperConfigPaths {
+            stamp_config_path: Path::new("/workspace/selected-stamp.yaml"),
+            bootstrap_env_file: Path::new("/private/campaign.env"),
+        };
+        let actions = [
+            "publish-inventory",
+            "assert-ready",
+            "read-inventory",
+            "capture-cell-baseline",
+            "cleanup-step",
+            "capture-baseline",
+        ];
+        for action in actions {
+            let action_args = if action == "capture-baseline" {
+                vec!["00000000-0000-0000-0000-000000000002".to_owned(), "7".to_owned()]
+            } else {
+                Vec::new()
+            };
+            let command = aks_campaign_cli_command(paths, action, &action_args)?;
+            let args = command
+                .as_std()
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(args[0], "--no-install");
+            assert_eq!(args[1], "tsx");
+            assert_eq!(args[2], "projects/arrowcol-oat/aks-campaign.ts");
+            assert_eq!(args[3], action);
+            assert_eq!(
+                &args[args.len() - 4..],
+                [
+                    "--env-file",
+                    "/private/campaign.env",
+                    "--stamp-config",
+                    "/workspace/selected-stamp.yaml"
+                ]
+            );
+            if action == "capture-baseline" {
+                assert_eq!(args[4], "00000000-0000-0000-0000-000000000002");
+                assert_eq!(args[5], "7");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn campaign_baseline_response_requires_exact_producer_and_blob_proof() -> Result<()> {
+        let identity = CampaignIdentity {
+            campaign_id: "00000000-0000-0000-0000-000000000001".to_owned(),
+            owner_id: "00000000-0000-0000-0000-000000000002".to_owned(),
+            fencing_token: 7,
+        };
+        let success = json!({"ok":true,"receipt":{
+            "status":"captured",
+            "campaign_id":identity.campaign_id,
+            "owner_id":identity.owner_id,
+            "fencing_token":identity.fencing_token,
+            "blob":"_arrowcol-custody/campaigns/00000000-0000-0000-0000-000000000001/baseline.json",
+            "etag":"\"baseline-etag\"",
+            "captured_at_unix_ms":1731600000000u64
+        }});
+        let bytes = serde_json::to_vec(&success)?;
+        let receipt = parse_campaign_baseline_response(&bytes, &identity)?;
+        assert_eq!(receipt.blob, campaign_baseline_blob(&identity.campaign_id));
+        for (field, value) in [
+            ("campaign_id", json!("00000000-0000-0000-0000-000000000009")),
+            ("owner_id", json!("00000000-0000-0000-0000-000000000009")),
+            ("fencing_token", json!(8)),
+            ("blob", json!("https://storage.example/baseline.json")),
+            ("captured_at_unix_ms", json!(0)),
+        ] {
+            let mut changed = success.clone();
+            changed["receipt"][field] = value;
+            assert!(parse_campaign_baseline_response(&serde_json::to_vec(&changed)?, &identity).is_err());
+        }
+        let mut missing = success.clone();
+        missing["receipt"]
+            .as_object_mut()
+            .context("baseline receipt is not an object")?
+            .remove("etag");
+        assert!(parse_campaign_baseline_response(&serde_json::to_vec(&missing)?, &identity).is_err());
+        let failure = json!({"ok":false,"code":"write_outcome_unknown","message":"not confirmed"});
+        let error = match parse_campaign_baseline_response(&serde_json::to_vec(&failure)?, &identity) {
+            Err(error) => error,
+            Ok(_) => anyhow::anyhow!("failed baseline response was accepted"),
+        };
+        assert!(error.to_string().contains("write_outcome_unknown"));
+        Ok(())
+    }
+
+    #[test]
     fn campaign_custody_helper_classifies_pre_effect_staleness_only_for_cleanup() -> Result<()> {
         let stale = campaign_custody_helper_failure("cleanup-step", br#"{"ok":false,"code":"stale_version"}"#);
         assert!(stale.downcast_ref::<StaleCampaignVersionError>().is_some());
@@ -11825,6 +12191,12 @@ mod tests {
             owner_id: inventory.owner_id.clone(),
             fencing_token: inventory.fencing_token,
         };
+        let mut initial_inventory = inventory.clone();
+        initial_inventory.resources.clear();
+        initial_inventory.namespace.uid = None;
+        initial_inventory.qap = None;
+        validate_campaign_baseline_capture_inventory(&initial_inventory, &identity)?;
+        assert!(validate_campaign_baseline_capture_inventory(&inventory, &identity).is_err());
         let actor = CampaignCleanupActor {
             mode: CampaignActorMode::Producer,
             owner_id: identity.owner_id.clone(),
@@ -12381,6 +12753,7 @@ mod tests {
             service_account: None,
             router_yaml: None,
             shutdown_drain_evidence: None,
+            campaign_cli_paths: None,
         };
         let error = cleanup_aks_platform(&config, &mut platform)
             .await

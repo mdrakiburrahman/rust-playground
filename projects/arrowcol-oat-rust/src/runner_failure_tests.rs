@@ -575,6 +575,7 @@ http.createServer((request, response) => {
             service_account: None,
             router_yaml: None,
             shutdown_drain_evidence: None,
+            campaign_cli_paths: None,
         };
         let script = script_path.clone();
         let mut command = || {
