@@ -989,7 +989,7 @@ impl RuntimeMetrics {
     ///
     /// Fails closed for unconfigured, overflowing, mismatched, or out-of-bound
     /// accounting. This does not reject data admission; report the error explicitly.
-    pub fn publication_started(
+    pub fn publication_backlog_start(
         &self,
         id: PublicationId,
         rows: u64,
@@ -1005,12 +1005,12 @@ impl RuntimeMetrics {
     ///
     /// An untracked ID, duplicate completion, or previous accounting loss returns
     /// an error and leaves availability unknown. Errors never clear the cohort.
-    pub fn publication_committed(&self, id: PublicationId) -> Result<(), String> {
+    pub fn publication_backlog_commit(&self, id: PublicationId) -> Result<(), String> {
         self.publication_backlog().commit(id)
     }
 
     /// Marks uncertain or lost publication outcomes unavailable until restart.
-    pub fn publication_mark_unknown(&self) {
+    pub fn publication_backlog_mark_unknown(&self) {
         self.publication_backlog().fail("unknown_outcome");
     }
 
@@ -2277,9 +2277,11 @@ mod tests {
         let second = PublicationId::new();
         let now = Instant::now();
         let accepted = now - Duration::from_secs(5);
-        metrics.publication_started(first, 3, 128, accepted).expect("first");
-        metrics.publication_started(first, 3, 128, now).expect("replay");
-        metrics.publication_started(second, 2, 64, now).expect("second");
+        metrics
+            .publication_backlog_start(first, 3, 128, accepted)
+            .expect("first");
+        metrics.publication_backlog_start(first, 3, 128, now).expect("replay");
+        metrics.publication_backlog_start(second, 2, 64, now).expect("second");
         let snapshot = metrics.publication_backlog().snapshot(now);
         assert!(snapshot.available);
         assert_eq!(
@@ -2294,9 +2296,9 @@ mod tests {
                 .oldest_age,
             Some(Duration::from_secs(9))
         );
-        metrics.publication_committed(first).expect("durable first");
+        metrics.publication_backlog_commit(first).expect("durable first");
         assert_eq!(metrics.publication_backlog_snapshot().rows, Some(2));
-        metrics.publication_committed(second).expect("durable second");
+        metrics.publication_backlog_commit(second).expect("durable second");
         let snapshot = metrics.publication_backlog_snapshot();
         assert_eq!(
             (snapshot.publications, snapshot.rows, snapshot.logical_bytes),
@@ -2314,10 +2316,10 @@ mod tests {
         metrics.configure_publication_backlog(1).expect("bound");
         let id = PublicationId::new();
         metrics
-            .publication_started(id, 4, 256, Instant::now())
+            .publication_backlog_start(id, 4, 256, Instant::now())
             .expect("admitted");
-        metrics.publication_mark_unknown();
-        assert!(metrics.publication_committed(id).is_err());
+        metrics.publication_backlog_mark_unknown();
+        assert!(metrics.publication_backlog_commit(id).is_err());
         assert!(metrics.configure_publication_backlog(1).is_err());
         let snapshot = metrics.publication_backlog_snapshot();
         assert!(!snapshot.available);
@@ -2351,12 +2353,12 @@ mod tests {
             metrics.configure_publication_backlog(2).expect("bound");
             let first = PublicationId::new();
             metrics
-                .publication_started(first, first_rows, first_bytes, Instant::now())
+                .publication_backlog_start(first, first_rows, first_bytes, Instant::now())
                 .expect("first");
             let next = if replay { first } else { PublicationId::new() };
             assert!(
                 metrics
-                    .publication_started(next, next_rows, next_bytes, Instant::now())
+                    .publication_backlog_start(next, next_rows, next_bytes, Instant::now())
                     .is_err()
             );
             assert_eq!(metrics.publication_backlog_snapshot().unknown_reason, Some(reason));
@@ -2364,7 +2366,7 @@ mod tests {
         }
         let metrics = RuntimeMetrics::new(CollectorInstanceId::new());
         metrics.configure_publication_backlog(1).expect("bound");
-        assert!(metrics.publication_committed(PublicationId::new()).is_err());
+        assert!(metrics.publication_backlog_commit(PublicationId::new()).is_err());
         assert_eq!(
             metrics.publication_backlog_snapshot().unknown_reason,
             Some("unknown_commit")
@@ -2376,11 +2378,11 @@ mod tests {
         let metrics = RuntimeMetrics::new(CollectorInstanceId::new());
         metrics.configure_publication_backlog(1).expect("bound");
         metrics
-            .publication_started(PublicationId::new(), 2, 16, Instant::now())
+            .publication_backlog_start(PublicationId::new(), 2, 16, Instant::now())
             .expect("first");
         assert!(
             metrics
-                .publication_started(PublicationId::new(), 3, 24, Instant::now())
+                .publication_backlog_start(PublicationId::new(), 3, 24, Instant::now())
                 .is_err()
         );
         let tracker = metrics.publication_backlog();
@@ -2407,7 +2409,7 @@ mod tests {
         metrics.configure_publication_backlog(1).expect("bound");
         let id = PublicationId::new();
         metrics
-            .publication_started(id, 3, 128, Instant::now() - Duration::from_secs(2))
+            .publication_backlog_start(id, 3, 128, Instant::now() - Duration::from_secs(2))
             .expect("admitted");
         let exposition = metrics.prometheus();
         assert!(exposition.contains("arrowcol_publication_backlog_available 1\n"));
@@ -2422,7 +2424,7 @@ mod tests {
             })
             .expect("age sample");
         assert!(age >= 2.0);
-        metrics.publication_committed(id).expect("durable success");
+        metrics.publication_backlog_commit(id).expect("durable success");
         assert!(metrics.prometheus().contains("arrowcol_publication_backlog_rows 0\n"));
     }
 
