@@ -7,6 +7,7 @@
 | `results.parquet`                                 | Sanitized, compact benchmark summary published by the OAT server.                                                                        |
 | `oat-config.example.json`                         | Validated configuration template with no credentials.                                                                                    |
 | `architecture.drawio` / `architecture.drawio.png` | Editable source and rendered companion for the same layered architecture.                                                                |
+| `throughput-pipeline.drawio` / `.png`           | Single-writer throughput campaign dataflow and observability pipeline. |
 | [Runtime setup](RUNTIME.md)                       | Isolated internal-only Kubernetes stack, image digests, workload identity, SQL bootstrap, secret files and local rehearsal.              |
 | [E1-E5 input preparation](EXPERIMENTS.md)         | Offline binding of private AKS settings and reviewed pilot windows into five comparable 32-table runs.                                   |
 
