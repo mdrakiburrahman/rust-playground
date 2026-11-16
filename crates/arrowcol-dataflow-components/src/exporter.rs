@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 
@@ -67,6 +67,9 @@ impl GenericDeltaExporter {
         let store = config.routing.build()?;
         let options = config.commit.build()?;
         metrics.configure_exporter(options.max_pending_files);
+        metrics
+            .configure_publication_backlog(config.batching.global_capacity.batches)
+            .map_err(|error| format!("configure durable publication backlog: {error}"))?;
         let authority =
             AuthorityClient::start(Arc::clone(&store), config.authority_timeout, options.max_pending_files)?;
         let backend = Arc::new(DeltaBackend {
@@ -115,6 +118,9 @@ impl GenericDeltaExporter {
     ) -> Result<Self, String> {
         batching.validate()?;
         metrics.configure_exporter(options.max_pending_files);
+        metrics
+            .configure_publication_backlog(batching.global_capacity.batches)
+            .map_err(|error| format!("configure durable publication backlog: {error}"))?;
         Ok(Self {
             backend: Arc::new(DeltaBackend {
                 configuration: None,
@@ -357,6 +363,14 @@ impl DeltaBackend {
         let owner = self.owner(&decoded).await?;
         let evidence = LeaseEvidence::from_envelope(&decoded.envelope);
         let pending_owner = owner.begin(evidence)?;
+        let publication_id = decoded
+            .envelope
+            .publication_id
+            .ok_or_else(|| ExportFailure::Transient("publication identity missing".to_owned()))?;
+        let ingested_at_ms = decoded
+            .envelope
+            .ingested_at_ms
+            .ok_or_else(|| ExportFailure::Transient("ingestion timestamp missing".to_owned()))?;
         self.metrics.observe_schema_versions(
             &decoded.envelope.table,
             decoded.envelope.source_schema_version,
@@ -364,28 +378,37 @@ impl DeltaBackend {
         );
         let mut capacity = self.capacity.acquire(rows, bytes).await?;
         capacity.extend(owner.capacity.acquire(rows, bytes).await?);
-        let (reply, receipt) = oneshot::channel();
-        owner
+        let queue_permit = owner
             .sender
-            .try_send(WorkerCommand::Batch(QueuedBatch {
-                publication_id: decoded
-                    .envelope
-                    .publication_id
-                    .ok_or_else(|| ExportFailure::Transient("publication identity missing".to_owned()))?,
-                ingested_at_ms: decoded
-                    .envelope
-                    .ingested_at_ms
-                    .ok_or_else(|| ExportFailure::Transient("ingestion timestamp missing".to_owned()))?,
-                batch: decoded.batch,
-                target_schema_version: decoded.envelope.target_schema_version.get(),
-                rows,
-                bytes,
-                accepted: Instant::now(),
-                reply: Some(reply),
-                _pending_owner: pending_owner,
-                _capacity: capacity,
-            }))
+            .try_reserve()
             .map_err(|error| ExportFailure::Transient(format!("Delta file queue admission failed: {error}")))?;
+        let accepted = Instant::now();
+        if let Err(error) =
+            self.metrics
+                .publication_backlog_start(publication_id.clone(), rows, bytes, accepted.into_std())
+        {
+            self.metrics.publication_backlog_mark_unknown();
+            tracing::error!(
+                publication_id = %publication_id,
+                rows,
+                logical_bytes = bytes,
+                error = %error,
+                "could not track accepted publication in durable backlog"
+            );
+        }
+        let (reply, receipt) = oneshot::channel();
+        queue_permit.send(WorkerCommand::Batch(QueuedBatch {
+            publication_id,
+            ingested_at_ms,
+            batch: decoded.batch,
+            target_schema_version: decoded.envelope.target_schema_version.get(),
+            rows,
+            bytes,
+            accepted,
+            reply: Some(reply),
+            _pending_owner: pending_owner,
+            _capacity: capacity,
+        }));
         Ok(PendingDelta { receipt, release: None })
     }
 
@@ -784,6 +807,7 @@ impl GroupPublisher<'_> {
             return;
         }
         let Some(table) = self.table.as_ref() else {
+            self.metrics.publication_backlog_mark_unknown();
             for entry in group.drain(..) {
                 entry.complete(&Err(retired_owner_failure()));
             }
@@ -861,6 +885,10 @@ impl GroupPublisher<'_> {
                             return Err(ExportFailure::Transient(format!("coalesced staging failed: {error:#}")));
                         }
                     };
+                    self.stage_metrics.record(PipelineStage::Build, prepared.preparation_build);
+                    if !prepared.preparation_sort.is_zero() {
+                        self.stage_metrics.record(PipelineStage::Sort, prepared.preparation_sort);
+                    }
                     published_files += prepared.appends.len() as u64;
                     for append in &prepared.appends {
                         let timings = append.stage_timings();
@@ -869,7 +897,10 @@ impl GroupPublisher<'_> {
                             ExportFailure::Permanent(format!("file sizing observation failed: {error}"))
                         })?;
                     }
-                    let commit_result = match table.submit_prepared_group(prepared, true).await {
+                    let submission_started = Instant::now();
+                    let submission = table.submit_prepared_group(prepared, true).await;
+                    self.stage_metrics.record_submission_wait(submission_started.elapsed());
+                    let commit_result = match submission {
                         Ok(receipt) => receipt.wait().await.map_err(|error| {
                             worker_failed = true;
                             ExportFailure::Transient(format!("atomic group commit failed: {error:#}"))
@@ -942,7 +973,10 @@ impl GroupPublisher<'_> {
                 // file defeats commit batching; never fill all worker permits
                 // with an unforced partial batch while awaiting another slot.
                 let force = index + 1 == total || (index + 1) % self.max_pending_files == 0;
-                receipts.push(table.submit(append, force).await.map_err(|error| {
+                let submission_started = Instant::now();
+                let submission = table.submit(append, force).await;
+                self.stage_metrics.record_submission_wait(submission_started.elapsed());
+                receipts.push(submission.map_err(|error| {
                     worker_failed = true;
                     ExportFailure::Transient(format!("{error:#}"))
                 })?);
@@ -963,6 +997,31 @@ impl GroupPublisher<'_> {
             Ok::<_, ExportFailure>(version)
         }
         .await;
+        match &result {
+            Ok(_) => {
+                let mut committed_publications = HashSet::with_capacity(group.len());
+                for entry in group.iter() {
+                    if committed_publications.insert(entry.publication_id.clone())
+                        && let Err(error) = self.metrics.publication_backlog_commit(entry.publication_id.clone())
+                    {
+                        self.metrics.publication_backlog_mark_unknown();
+                        tracing::error!(
+                            publication_id = %entry.publication_id,
+                            error = %error,
+                            "could not settle durable publication backlog entry"
+                        );
+                    }
+                }
+            }
+            Err(error) => {
+                self.metrics.publication_backlog_mark_unknown();
+                tracing::error!(
+                    table = %self.identity,
+                    error = %error.safe_message(),
+                    "durable publication backlog outcome is unknown"
+                );
+            }
+        }
         self.metrics.publication_finished(
             self.identity,
             rows,
@@ -1005,6 +1064,7 @@ struct PublicationAccounting<'a> {
 impl Drop for PublicationAccounting<'_> {
     fn drop(&mut self) {
         if !self.finished {
+            self.metrics.publication_backlog_mark_unknown();
             self.metrics
                 .publication_finished(self.identity, self.rows, self.bytes, None, 0);
             self.metrics.set_healthy(false);
@@ -2013,6 +2073,11 @@ mod tests {
                 "arrowcol_pipeline_stage_duration_seconds_count{",
                 "stage=\"commit\"",
             );
+            let before_submission_waits = metric_total(
+                &before,
+                "arrowcol_pipeline_submission_wait_seconds_count{",
+                "component=\"arrowcol-dataflow-rust\"",
+            );
             let before_files = metric_total(
                 &before,
                 "arrowcol_parquet_file_rows_count{",
@@ -2042,15 +2107,29 @@ mod tests {
                 .stage(envelope_pdata(original.clone()))
                 .await
                 .expect("same-group replay");
+            let pending = runtime_metrics.publication_backlog_snapshot();
+            assert!(pending.available);
+            assert_eq!(pending.publications, Some(2));
+            assert_eq!(pending.rows, Some(2));
+            assert!(pending.logical_bytes.is_some_and(|bytes| bytes > 0));
+            assert!(pending.oldest_age.is_some());
             exporter.backend.flush_pending().await.expect("group flush");
             first.wait().await.expect("first published");
             second.wait().await.expect("independent published");
             same_group_replay.wait().await.expect("same-group replay deduplicated");
+            let settled = runtime_metrics.publication_backlog_snapshot();
+            assert!(settled.available);
+            assert_eq!(settled.publications, Some(0));
+            assert_eq!(settled.rows, Some(0));
+            assert_eq!(settled.logical_bytes, Some(0));
+            assert!(settled.oldest_age.is_none());
             let replay = exporter.stage(envelope_pdata(original)).await.expect("replay");
+            assert_eq!(runtime_metrics.publication_backlog_snapshot().publications, Some(1));
             exporter.backend.flush_pending().await.expect("replay flush");
             replay.wait().await.expect("idempotent replay");
             let exposition = runtime_metrics.prometheus();
             let expected_files = if coalesce_publications { 1 } else { 2 };
+            let expected_submissions = if coalesce_publications { 2 } else { 3 };
             assert!(
                 metric_total(&exposition, "arrowcol_pipeline_flushes_total{", "reason=\"explicit\"")
                     >= before_explicit_flushes + 2,
@@ -2063,6 +2142,14 @@ mod tests {
                     "stage=\"commit\""
                 ) >= before_commits + 1,
                 "one durable commit duration must be emitted per physical commit"
+            );
+            assert!(
+                metric_total(
+                    &exposition,
+                    "arrowcol_pipeline_submission_wait_seconds_count{",
+                    "component=\"arrowcol-dataflow-rust\""
+                ) >= before_submission_waits + expected_submissions,
+                "commit-worker submission wait must be measured separately from durable commit"
             );
             assert!(
                 metric_total(
@@ -2094,6 +2181,12 @@ mod tests {
                 if coalesce_publications { 1 } else { 2 },
                 "replay must not duplicate physical output"
             );
+            let settled = runtime_metrics.publication_backlog_snapshot();
+            assert!(settled.available);
+            assert_eq!(settled.publications, Some(0));
+            assert_eq!(settled.rows, Some(0));
+            assert_eq!(settled.logical_bytes, Some(0));
+            assert!(settled.oldest_age.is_none());
         }
     }
 

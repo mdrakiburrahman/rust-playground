@@ -133,6 +133,10 @@ pub struct GroupAppendResult {
 /// Staged physical outputs and every constituent logical identity for one commit.
 pub struct PreparedPublicationGroup {
     pub appends: Vec<StagedAppend>,
+    /// Time spent preparing the coalesced inputs and partition/file plan.
+    pub preparation_build: Duration,
+    /// Time spent sizing sorted chunks during coalesced preparation.
+    pub preparation_sort: Duration,
     /// Identities still pending after the preparation-time Delta replay filter.
     pub identities: Vec<(String, i64, i64)>,
     /// Identities already committed before any group encoding or staging.
@@ -765,11 +769,21 @@ fn run_worker(
                             (Ok(table), None) => table
                                 .stage_coalesced_publications(entries, options.max_files_per_commit)
                                 .await
-                                .map(|(appends, identities, committed_identities)| PreparedPublicationGroup {
-                                    appends,
-                                    identities,
-                                    committed_identities,
-                                })
+                                .map(
+                                    |(
+                                        appends,
+                                        identities,
+                                        committed_identities,
+                                        preparation_build,
+                                        preparation_sort,
+                                    )| PreparedPublicationGroup {
+                                        appends,
+                                        identities,
+                                        committed_identities,
+                                        preparation_build,
+                                        preparation_sort,
+                                    },
+                                )
                                 .map_err(CommitReceiptError::from_anyhow),
                             _ => Err(failure.clone().unwrap_or_else(|| {
                                 CommitReceiptError::commit_failed("Delta table initialization failed")
@@ -1122,6 +1136,7 @@ mod tests {
         assert_eq!(group.identities.len(), 2);
         assert_eq!(group.identities[0].2, 10);
         assert_eq!(group.identities[1].2, 20);
+        assert!(!group.preparation_build.is_zero());
         let result = table.submit_prepared_group(group, true).await?.wait().await?;
         assert_eq!(result.version, 1);
         assert_eq!(result.files.len(), 1);
