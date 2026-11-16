@@ -52,7 +52,8 @@ impl CampaignIdentity {
     fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Result<Self> {
         let campaign_id = lookup("CAMPAIGN_ID").context("CAMPAIGN_ID is required for AKS campaign custody")?;
         let owner_id = lookup("CAMPAIGN_OWNER_ID").context("CAMPAIGN_OWNER_ID is required for AKS campaign custody")?;
-        let raw_token = lookup("CAMPAIGN_FENCING_TOKEN").context("CAMPAIGN_FENCING_TOKEN is required for AKS campaign custody")?;
+        let raw_token =
+            lookup("CAMPAIGN_FENCING_TOKEN").context("CAMPAIGN_FENCING_TOKEN is required for AKS campaign custody")?;
         for value in [&campaign_id, &owner_id] {
             let id = uuid::Uuid::parse_str(value).context("campaign custody identity must be a canonical UUID")?;
             if id.is_nil() || id.to_string() != *value {
@@ -62,11 +63,17 @@ impl CampaignIdentity {
         if raw_token.is_empty() || !raw_token.bytes().all(|byte| byte.is_ascii_digit()) {
             bail!("CAMPAIGN_FENCING_TOKEN must be a positive decimal integer");
         }
-        let fencing_token = raw_token.parse::<u64>().context("CAMPAIGN_FENCING_TOKEN is out of range")?;
+        let fencing_token = raw_token
+            .parse::<u64>()
+            .context("CAMPAIGN_FENCING_TOKEN is out of range")?;
         if fencing_token == 0 || fencing_token > 9_007_199_254_740_991 {
             bail!("CAMPAIGN_FENCING_TOKEN must be a positive JSON-safe integer");
         }
-        Ok(Self { campaign_id, owner_id, fencing_token })
+        Ok(Self {
+            campaign_id,
+            owner_id,
+            fencing_token,
+        })
     }
 }
 
@@ -257,9 +264,8 @@ impl RunInventory {
         {
             bail!("custody namespace must contain the exact cell identity");
         }
-        let valid_uid = |uid: &str| {
-            uuid::Uuid::parse_str(uid).is_ok_and(|parsed| !parsed.is_nil() && parsed.to_string() == uid)
-        };
+        let valid_uid =
+            |uid: &str| uuid::Uuid::parse_str(uid).is_ok_and(|parsed| !parsed.is_nil() && parsed.to_string() == uid);
         if self.namespace.uid.as_deref().is_some_and(|uid| !valid_uid(uid)) {
             bail!("custody namespace UID must be a nonzero canonical UUID");
         }
@@ -289,7 +295,10 @@ impl RunInventory {
                 bail!("observed or removed custody resource requires exact resource and namespace UIDs");
             }
             if resource.state == InventoryResourceState::Absent {
-                let receipt = resource.absence.as_ref().context("absent resource requires a not-found receipt")?;
+                let receipt = resource
+                    .absence
+                    .as_ref()
+                    .context("absent resource requires a not-found receipt")?;
                 if resource.uid.is_some()
                     || receipt.api_version != resource.api_version
                     || receipt.kind != resource.kind
@@ -306,7 +315,10 @@ impl RunInventory {
         }
         if let Some(fic) = &self.fic {
             if fic.state == InventoryResourceState::Absent {
-                let receipt = fic.absence.as_ref().context("absent FIC requires a not-found receipt")?;
+                let receipt = fic
+                    .absence
+                    .as_ref()
+                    .context("absent FIC requires a not-found receipt")?;
                 if fic.resource_id.as_deref() != Some(receipt.resource_id.as_str())
                     || fic.name.as_deref() != Some(receipt.name.as_str())
                     || receipt.observed_at_unix_ms == 0
@@ -360,8 +372,10 @@ impl RunInventory {
             };
             let mut binding_keys = BTreeSet::new();
             if !safe_identifier(&qap.database)
-                || matches!(qap.state, InventoryResourceState::Observed | InventoryResourceState::Removed)
-                    && qap.bindings.is_empty()
+                || matches!(
+                    qap.state,
+                    InventoryResourceState::Observed | InventoryResourceState::Removed
+                ) && qap.bindings.is_empty()
                 || qap.bindings.iter().any(|binding| {
                     !safe_identifier(&binding.external_table)
                         || !binding_keys.insert((&binding.external_table, &binding.relative_path))
@@ -418,15 +432,24 @@ impl RunInventory {
             ]
             .iter()
             .any(|step| step.state != InventoryStepState::Complete)
-                || self.resources.iter().any(|resource| !matches!(
-                    resource.state, InventoryResourceState::Removed | InventoryResourceState::Absent
-                ))
-                || self.fic.as_ref().is_some_and(|fic| !matches!(
-                    fic.state, InventoryResourceState::Removed | InventoryResourceState::Absent
-                ))
-                || self.qap.as_ref().is_some_and(|qap| !matches!(
-                    qap.state, InventoryResourceState::Removed | InventoryResourceState::Absent
-                )))
+                || self.resources.iter().any(|resource| {
+                    !matches!(
+                        resource.state,
+                        InventoryResourceState::Removed | InventoryResourceState::Absent
+                    )
+                })
+                || self.fic.as_ref().is_some_and(|fic| {
+                    !matches!(
+                        fic.state,
+                        InventoryResourceState::Removed | InventoryResourceState::Absent
+                    )
+                })
+                || self.qap.as_ref().is_some_and(|qap| {
+                    !matches!(
+                        qap.state,
+                        InventoryResourceState::Removed | InventoryResourceState::Absent
+                    )
+                }))
         {
             bail!("custody handoff cannot complete with unresolved steps or resources");
         }
@@ -471,7 +494,10 @@ impl RunInventory {
                     .as_ref()
                     .is_some_and(|uid| updated.uid.as_ref() != Some(uid))
                 || !resource.state.can_advance_to(updated.state)
-                || resource.absence.as_ref().is_some_and(|receipt| updated.absence.as_ref() != Some(receipt))
+                || resource
+                    .absence
+                    .as_ref()
+                    .is_some_and(|receipt| updated.absence.as_ref() != Some(receipt))
             {
                 bail!("custody update changed an established resource identity");
             }
@@ -484,7 +510,10 @@ impl RunInventory {
                     .as_ref()
                     .is_some_and(|value| new.resource_id.as_ref() != Some(value))
                 || !old.state.can_advance_to(new.state)
-                || old.absence.as_ref().is_some_and(|receipt| new.absence.as_ref() != Some(receipt))
+                || old
+                    .absence
+                    .as_ref()
+                    .is_some_and(|receipt| new.absence.as_ref() != Some(receipt))
             {
                 bail!("custody update changed an established FIC identity");
             }
@@ -570,7 +599,9 @@ impl RunInventory {
     #[cfg(unix)]
     async fn custody_command(&self, ready: bool) -> Result<()> {
         self.validate()?;
-        let payload = if ready { None } else {
+        let payload = if ready {
+            None
+        } else {
             let bytes = serde_json::to_vec(self).context("serialize custody inventory")?;
             if bytes.len() > 1024 * 1024 {
                 bail!("custody inventory exceeds publisher input limit");
@@ -584,7 +615,8 @@ impl RunInventory {
         } else {
             command.arg("publish-inventory");
         }
-        command.stdin(if ready { Stdio::null() } else { Stdio::piped() })
+        command
+            .stdin(if ready { Stdio::null() } else { Stdio::piped() })
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .process_group(0)
@@ -593,19 +625,26 @@ impl RunInventory {
             let mut child = command.spawn().context("start fenced custody command")?;
             let pid = i32::try_from(child.id().context("custody command PID unavailable")?)
                 .context("custody command PID invalid")?;
-            let _group = OwnedQapHelperGroup(rustix::process::Pid::from_raw(pid).context("custody command PID invalid")?);
+            let _group =
+                OwnedQapHelperGroup(rustix::process::Pid::from_raw(pid).context("custody command PID invalid")?);
             if let Some(payload) = payload {
                 let mut stdin = child.stdin.take().context("custody publisher stdin unavailable")?;
                 stdin.write_all(&payload).await.context("write custody inventory")?;
                 drop(stdin);
             }
-            child.wait_with_output().await.context("wait for fenced custody command")
+            child
+                .wait_with_output()
+                .await
+                .context("wait for fenced custody command")
         })
         .await
         .context("custody command timed out; write outcome may be unknown and must not be retried")??;
         if !output.status.success() {
-            return self.validate_custody_receipt(&output.stdout, ready)
-                .and_then(|()| Err(anyhow::anyhow!("custody command exited unsuccessfully despite a success-shaped receipt")));
+            return self.validate_custody_receipt(&output.stdout, ready).and_then(|()| {
+                Err(anyhow::anyhow!(
+                    "custody command exited unsuccessfully despite a success-shaped receipt"
+                ))
+            });
         }
         self.validate_custody_receipt(&output.stdout, ready)
     }
@@ -9713,11 +9752,23 @@ mod tests {
         inventory.validate_custody_receipt(&serde_json::to_vec(&persisted)?, false)?;
         let mut bad_receipt = persisted.clone();
         bad_receipt["receipt"]["fencing_token"] = json!(2);
-        assert!(inventory.validate_custody_receipt(&serde_json::to_vec(&bad_receipt)?, false).is_err());
+        assert!(
+            inventory
+                .validate_custody_receipt(&serde_json::to_vec(&bad_receipt)?, false)
+                .is_err()
+        );
         bad_receipt = persisted.clone();
         bad_receipt["receipt"]["resource_count"] = json!(0);
-        assert!(inventory.validate_custody_receipt(&serde_json::to_vec(&bad_receipt)?, false).is_err());
-        assert!(inventory.validate_custody_receipt(br#"{"ok":false,"code":"write_outcome_unknown"}"#, false).is_err());
+        assert!(
+            inventory
+                .validate_custody_receipt(&serde_json::to_vec(&bad_receipt)?, false)
+                .is_err()
+        );
+        assert!(
+            inventory
+                .validate_custody_receipt(br#"{"ok":false,"code":"write_outcome_unknown"}"#, false)
+                .is_err()
+        );
         let mut absent = inventory.clone();
         absent.resources[0].state = InventoryResourceState::Absent;
         assert!(absent.validate().is_err());
@@ -9737,7 +9788,11 @@ mod tests {
         invalid_absence.resources[0].uid = Some("unexpected".to_owned());
         assert!(invalid_absence.validate().is_err());
         invalid_absence = absent.clone();
-        invalid_absence.resources[0].absence.as_mut().unwrap().observed_at_unix_ms = 124;
+        invalid_absence.resources[0]
+            .absence
+            .as_mut()
+            .unwrap()
+            .observed_at_unix_ms = 124;
         assert!(absent.validate_successor(&invalid_absence).is_err());
         invalid_absence = absent.clone();
         invalid_absence.resources[0].state = InventoryResourceState::Planned;
@@ -9797,7 +9852,11 @@ mod tests {
             "cell_run_id":inventory.cell_run_id,"namespace_uid":"5d4c2001-77e2-44b2-b32b-4ce79bf7dd05"
         }});
         observed.validate_custody_receipt(&serde_json::to_vec(&ready)?, true)?;
-        assert!(inventory.validate_custody_receipt(&serde_json::to_vec(&ready)?, true).is_err());
+        assert!(
+            inventory
+                .validate_custody_receipt(&serde_json::to_vec(&ready)?, true)
+                .is_err()
+        );
         inventory.validate_successor(&observed)?;
         inventory = observed;
         let mut replacement = inventory.clone();

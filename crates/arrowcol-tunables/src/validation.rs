@@ -1385,8 +1385,13 @@ fn validate_collector_upload(collector: &CollectorTunables) -> Result<()> {
     if !(1..=16).contains(&concurrency) {
         bail!("collector.upload.request_concurrency must be between 1 and 16");
     }
-    let limit = collector.runtime.as_ref().and_then(|runtime| runtime.upload_limit).unwrap_or(32);
-    let bytes = capacity.checked_mul(concurrency + 1)
+    let limit = collector
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.upload_limit)
+        .unwrap_or(32);
+    let bytes = capacity
+        .checked_mul(concurrency + 1)
         .and_then(|bytes| bytes.checked_add(65_536))
         .and_then(|bytes| bytes.checked_mul(limit))
         .context("aggregate collector upload buffering size overflow")?;
@@ -1964,12 +1969,18 @@ mod tests {
         let mut create = valid.clone();
         create["collector"]["upload"]["mode"] = serde_json::json!("put_create");
         assert!(Tunables::parse_oat_json(create).is_err());
-        assert!(Tunables::parse_oat_json(serde_json::json!({"collector": {
-            "runtime": {"upload_limit": 256}, "upload": {"mode": "put_create"}
-        }})).is_ok());
-        assert!(Tunables::parse_oat_json(serde_json::json!({"collector": {
-            "runtime": {"upload_limit": 256}, "upload": {"mode": "buffered_multipart"}
-        }})).is_err());
+        assert!(
+            Tunables::parse_oat_json(serde_json::json!({"collector": {
+                "runtime": {"upload_limit": 256}, "upload": {"mode": "put_create"}
+            }}))
+            .is_ok()
+        );
+        assert!(
+            Tunables::parse_oat_json(serde_json::json!({"collector": {
+                "runtime": {"upload_limit": 256}, "upload": {"mode": "buffered_multipart"}
+            }}))
+            .is_err()
+        );
         Ok(())
     }
 

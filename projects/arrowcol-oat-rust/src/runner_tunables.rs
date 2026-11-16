@@ -174,7 +174,6 @@ mod tunable_injection_tests {
     use super::*;
 
     #[test]
-    #[ignore = "needs L1b collector upload runtime"]
     fn collector_upload_json_reaches_runtime() -> Result<()> {
         if std::env::var_os("OAT_UPLOAD_RUNTIME_CHILD").is_some() {
             let actual = serde_json::to_value(arrow_deltalake::DeltaRuntimeConfig::from_env()?)?;
@@ -193,7 +192,6 @@ mod tunable_injection_tests {
             let settings = arrowcol_tunables::Tunables::parse_oat_json(tunables)?;
             let environment = settings.environment_for(ComponentRole::Collector)?;
             let output = std::process::Command::new(std::env::current_exe()?)
-                .arg("--ignored")
                 .arg("--exact")
                 .arg("runner::tunable_injection_tests::collector_upload_json_reaches_runtime")
                 .arg("--nocapture")
