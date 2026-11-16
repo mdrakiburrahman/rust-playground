@@ -488,8 +488,6 @@ struct Measurement {
     raw_window_bytes: Vec<AtomicU64>,
     wire_window_bytes: Vec<AtomicU64>,
     window_latency: Vec<Mutex<[u64; 64]>>,
-    resource_start: Mutex<Option<ResourceSample>>,
-    resource_end: Mutex<Option<ResourceSample>>,
     rejected_streams: AtomicU64,
     rejected_rows: AtomicU64,
     retried_streams: AtomicU64,
@@ -540,8 +538,6 @@ impl Measurement {
             window_latency: (0..(end_unix_ms - start_unix_ms).div_ceil(30_000))
                 .map(|_| Mutex::new([0; 64]))
                 .collect(),
-            resource_start: Mutex::new(None),
-            resource_end: Mutex::new(None),
             rejected_streams: AtomicU64::new(0),
             rejected_rows: AtomicU64::new(0),
             retried_streams: AtomicU64::new(0),
@@ -585,34 +581,6 @@ impl Measurement {
         Ok(())
     }
 
-    fn record_resource_sample(&self, sample: ResourceSample, is_start: bool) -> Result<()> {
-        let target = if is_start {
-            &self.resource_start
-        } else {
-            &self.resource_end
-        };
-        let mut target = target
-            .lock()
-            .map_err(|_| anyhow::anyhow!("resource sample state poisoned"))?;
-        anyhow::ensure!(target.is_none(), "resource sample already recorded");
-        *target = Some(sample);
-        Ok(())
-    }
-
-    fn resource_metrics(&self) -> serde_json::Value {
-        let start = self
-            .resource_start
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .clone();
-        let end = self
-            .resource_end
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .clone();
-        resource_report(start, end)
-    }
-
     fn snapshot(&self) -> serde_json::Value {
         serde_json::json!({
             "start_unix_ms": self.start_unix_ms, "end_unix_ms": self.end_unix_ms,
@@ -644,7 +612,6 @@ impl Measurement {
             "ambiguous_streams": self.ambiguous_streams.load(Ordering::Relaxed),
             "ambiguous_rows": self.ambiguous_rows.load(Ordering::Relaxed),
             "scope": "per_stream_admission_completion_observed_in_half_open_shared_unix_window",
-            "client_resources": self.resource_metrics(),
         })
     }
 
@@ -964,38 +931,16 @@ impl PreparedClient {
                 observed.abs_diff(measurement_start_unix_ms) <= 250,
                 "client did not start within 250ms of the shared measurement interval"
             );
-            measurement.record_resource_sample(ResourceSample::capture()?, true)?;
             println!("OAT_CLIENT_METRICS {}", self.metrics("measurement_start"));
             Ok::<u64, anyhow::Error>(observed)
         };
         tokio::pin!(phase);
         let mut measurement_started = None;
-        let resource_end = async {
-            while unix_ms()? < measurement_end_unix_ms {
-                tokio::time::sleep(Duration::from_millis(
-                    measurement_end_unix_ms.saturating_sub(unix_ms()?).min(10),
-                ))
-                .await;
-            }
-            measurement.record_resource_sample(ResourceSample::capture()?, false)
-        };
-        tokio::pin!(resource_end);
-        let mut resource_end_recorded = false;
         loop {
             tokio::select! {
                 result = &mut phase, if measurement_started.is_none() => {
                     match result {
                         Ok(started) => measurement_started = Some(started),
-                        Err(error) => {
-                            tasks.abort_all();
-                            while tasks.join_next().await.is_some() {}
-                            return Err(error);
-                        }
-                    }
-                }
-                result = &mut resource_end, if !resource_end_recorded => {
-                    match result {
-                        Ok(()) => resource_end_recorded = true,
                         Err(error) => {
                             tasks.abort_all();
                             while tasks.join_next().await.is_some() {}
@@ -1020,6 +965,12 @@ impl PreparedClient {
                 }
                 else => break,
             }
+        }
+        while unix_ms()? < measurement_end_unix_ms {
+            tokio::time::sleep(Duration::from_millis(
+                measurement_end_unix_ms.saturating_sub(unix_ms()?).min(10),
+            ))
+            .await;
         }
         Ok(ContinuousReport {
             completed_rows: measurement.rows.load(Ordering::Relaxed),
@@ -1536,207 +1487,6 @@ fn thread_cpu_seconds() -> Result<Option<f64>> {
     }
 }
 
-#[derive(Clone, Debug)]
-struct ResourceSample {
-    sampled_unix_ms: u64,
-    process_cpu_ns: Option<u64>,
-    network_rx_bytes: Option<u64>,
-    network_tx_bytes: Option<u64>,
-    network_tx_capacity_bps: Option<u64>,
-    available_parallelism: Option<usize>,
-}
-impl ResourceSample {
-    fn capture() -> Result<Self> {
-        let (network_rx_bytes, network_tx_bytes, network_tx_capacity_bps) = network_snapshot()?;
-        Ok(Self {
-            sampled_unix_ms: unix_ms()?,
-            process_cpu_ns: process_cpu_ns()?,
-            network_rx_bytes,
-            network_tx_bytes,
-            network_tx_capacity_bps,
-            available_parallelism: std::thread::available_parallelism().ok().map(|value| value.get()),
-        })
-    }
-}
-
-fn process_cpu_ns() -> Result<Option<u64>> {
-    let tasks = match std::fs::read_dir("/proc/self/task") {
-        Ok(tasks) => tasks,
-        Err(error)
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
-            ) =>
-        {
-            return Ok(None);
-        }
-        Err(error) => return Err(error).context("read client thread list"),
-    };
-    let mut total = 0_u64;
-    let mut count = 0_usize;
-    for task in tasks {
-        let path = task?.path().join("schedstat");
-        let contents = match std::fs::read_to_string(&path) {
-            Ok(contents) => contents,
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
-                ) =>
-            {
-                return Ok(None);
-            }
-            Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
-        };
-        let runtime: u64 = contents
-            .split_whitespace()
-            .next()
-            .context("missing scheduler CPU accounting")?
-            .parse()?;
-        total = total.checked_add(runtime).context("process CPU accounting overflow")?;
-        count += 1;
-    }
-    Ok((count > 0).then_some(total))
-}
-
-fn network_snapshot() -> Result<(Option<u64>, Option<u64>, Option<u64>)> {
-    let contents = match std::fs::read_to_string("/proc/net/dev") {
-        Ok(contents) => contents,
-        Err(error)
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
-            ) =>
-        {
-            return Ok((None, None, None));
-        }
-        Err(error) => return Err(error).context("read client network counters"),
-    };
-    let mut rx_bytes = 0_u64;
-    let mut tx_bytes = 0_u64;
-    let mut tx_capacity_bps = 0_u64;
-    let mut capacity_known = true;
-    let mut interfaces = 0_usize;
-    for line in contents.lines().skip(2) {
-        let Some((name, values)) = line.split_once(':') else {
-            continue;
-        };
-        let name = name.trim();
-        if name == "lo" {
-            continue;
-        }
-        let values = values
-            .split_whitespace()
-            .map(str::parse::<u64>)
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        anyhow::ensure!(
-            values.len() >= 9,
-            "network counters for {name} have fewer than nine fields"
-        );
-        rx_bytes = rx_bytes
-            .checked_add(values[0])
-            .context("network receive counter overflow")?;
-        tx_bytes = tx_bytes
-            .checked_add(values[8])
-            .context("network transmit counter overflow")?;
-        let speed_path = std::path::Path::new("/sys/class/net").join(name).join("speed");
-        let speed_mbps = match std::fs::read_to_string(&speed_path) {
-            Ok(value) => value.trim().parse::<i64>().ok().filter(|value| *value > 0),
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
-                ) =>
-            {
-                None
-            }
-            Err(error) => return Err(error).with_context(|| format!("read {}", speed_path.display())),
-        };
-        if let Some(speed_mbps) = speed_mbps {
-            tx_capacity_bps = tx_capacity_bps
-                .checked_add(
-                    (speed_mbps as u64)
-                        .checked_mul(1_000_000)
-                        .context("network link speed overflow")?,
-                )
-                .context("network capacity overflow")?;
-        } else {
-            capacity_known = false;
-        }
-        interfaces += 1;
-    }
-    if interfaces == 0 {
-        return Ok((None, None, None));
-    }
-    Ok((
-        Some(rx_bytes),
-        Some(tx_bytes),
-        capacity_known.then_some(tx_capacity_bps),
-    ))
-}
-
-fn resource_report(start: Option<ResourceSample>, end: Option<ResourceSample>) -> serde_json::Value {
-    let elapsed_ns = start
-        .as_ref()
-        .zip(end.as_ref())
-        .and_then(|(start, end)| end.sampled_unix_ms.checked_sub(start.sampled_unix_ms))
-        .and_then(|millis| millis.checked_mul(1_000_000));
-    let cpu_ns = start
-        .as_ref()
-        .zip(end.as_ref())
-        .and_then(|(start, end)| start.process_cpu_ns.zip(end.process_cpu_ns))
-        .and_then(|(start, end)| end.checked_sub(start));
-    let cpu_seconds = cpu_ns.map(|nanos| nanos as f64 / 1e9);
-    let elapsed_seconds = elapsed_ns
-        .map(|nanos| nanos as f64 / 1e9)
-        .filter(|seconds| *seconds > 0.0);
-    let available_cores = start
-        .as_ref()
-        .zip(end.as_ref())
-        .and_then(|(start, end)| start.available_parallelism.zip(end.available_parallelism))
-        .map(|(start, end)| start.min(end));
-    let cpu_core_equivalents = cpu_seconds.zip(elapsed_seconds).map(|(cpu, elapsed)| cpu / elapsed);
-    let cpu_utilization_fraction = cpu_core_equivalents
-        .zip(available_cores)
-        .map(|(used, total)| used / total as f64);
-    let rx_bytes = start
-        .as_ref()
-        .zip(end.as_ref())
-        .and_then(|(start, end)| start.network_rx_bytes.zip(end.network_rx_bytes))
-        .and_then(|(start, end)| end.checked_sub(start));
-    let tx_bytes = start
-        .as_ref()
-        .zip(end.as_ref())
-        .and_then(|(start, end)| start.network_tx_bytes.zip(end.network_tx_bytes))
-        .and_then(|(start, end)| end.checked_sub(start));
-    let tx_bytes_per_second = tx_bytes
-        .map(|bytes| bytes as f64)
-        .zip(elapsed_seconds)
-        .map(|(bytes, elapsed)| bytes / elapsed);
-    let tx_capacity_bps = start
-        .as_ref()
-        .zip(end.as_ref())
-        .and_then(|(start, end)| start.network_tx_capacity_bps.zip(end.network_tx_capacity_bps))
-        .map(|(start, end)| start.min(end));
-    let tx_capacity_fraction = tx_bytes_per_second
-        .zip(tx_capacity_bps)
-        .map(|(rate, capacity)| rate * 8.0 / capacity as f64);
-    serde_json::json!({
-        "status": if elapsed_ns.is_some() { "sampled" } else { "incomplete" },
-        "start_sample_unix_ms": start.as_ref().map(|sample| sample.sampled_unix_ms),
-        "end_sample_unix_ms": end.as_ref().map(|sample| sample.sampled_unix_ms),
-        "sample_interval_ns": elapsed_ns,
-        "process_cpu_ns": cpu_ns, "process_cpu_seconds": cpu_seconds,
-        "available_parallelism": available_cores, "cpu_core_equivalents": cpu_core_equivalents,
-        "cpu_utilization_fraction": cpu_utilization_fraction,
-        "network_rx_bytes": rx_bytes, "network_tx_bytes": tx_bytes,
-        "network_tx_bytes_per_second": tx_bytes_per_second,
-        "network_tx_capacity_bps": tx_capacity_bps, "network_tx_capacity_fraction": tx_capacity_fraction,
-        "cpu_scope": "sum_of_client_thread_schedstat_runtime",
-        "network_scope": "container_non_loopback_interfaces_all_traffic_not_per_flight_attribution",
-        "clock_uncertainty_ns": null
-    })
-}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2075,32 +1825,6 @@ mod tests {
         .context("fast worker was blocked behind the slow worker")??;
         assert_eq!(sends.load(Ordering::SeqCst), 12);
         Ok(())
-    }
-
-    #[test]
-    fn unavailable_resource_readings_remain_unknown() {
-        let start = ResourceSample {
-            sampled_unix_ms: 1_000,
-            process_cpu_ns: None,
-            network_rx_bytes: None,
-            network_tx_bytes: None,
-            network_tx_capacity_bps: None,
-            available_parallelism: None,
-        };
-        let end = ResourceSample {
-            sampled_unix_ms: 2_000,
-            ..start.clone()
-        };
-        let report = resource_report(Some(start), Some(end));
-        for field in [
-            "process_cpu_ns",
-            "network_rx_bytes",
-            "network_tx_bytes",
-            "network_tx_capacity_bps",
-            "available_parallelism",
-        ] {
-            assert!(report[field].is_null(), "{field} must remain unknown");
-        }
     }
 
     #[test]
