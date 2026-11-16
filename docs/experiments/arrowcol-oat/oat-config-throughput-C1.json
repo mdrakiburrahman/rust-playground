@@ -4,6 +4,7 @@
   "mode": "local",
   "base_config": "oat-config.tuned.json",
   "registry_source": "PR125 arrowcol-tunables profile",
+  "registry_status": "pending-E1-registry",
   "registry_sha256": "79cf2880012dfbd6a064d848a217083afef77c9168b3fc72e7c4e0f527ff8af9",
   "box_scope": "one box for every comparison in this cohort",
   "candidate_limit_per_comparison": 4,

@@ -8,6 +8,7 @@ test('generates bounded local single-writer manifests from the tunables registry
   for (const manifest of manifests) {
     assert.equal(manifest.mode, 'local');
     assert.equal(manifest.campaign, 'single_hot_table_campaign');
+    assert.equal(manifest.registry_status, 'pending-E1-registry');
     const invariants = manifest.invariants as { writer_replicas: number; maintenance: { enabled: boolean; apply: boolean; operations: string[] } };
     assert.equal(invariants.writer_replicas, 1);
     assert.equal(invariants.maintenance.enabled, true);

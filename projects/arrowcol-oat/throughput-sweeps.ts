@@ -106,6 +106,7 @@ export function buildThroughputManifests(registry: unknown): JsonObject[] {
       mode: 'local',
       base_config: 'oat-config.tuned.json',
       registry_source: 'PR125 arrowcol-tunables profile',
+      registry_status: 'pending-E1-registry',
       registry_sha256: registryHash,
       box_scope: 'one box for every comparison in this cohort',
       candidate_limit_per_comparison: 4,

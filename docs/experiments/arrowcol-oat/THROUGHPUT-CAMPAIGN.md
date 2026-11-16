@@ -6,7 +6,7 @@
 | Scope | Local mode, one public DMV table (`sqlserver_active_sessions` quick profile), one writer replica, one leased box per cohort. |
 | Maintenance | Enabled and applying in every cell: optimize, purge, vacuum, checkpoint, and prune-log. Idle work must be a no-op; due work stays enabled. |
 | Verdict | Set `dataflow_verdict_policy` to `single_hot_table_campaign` to make QAP lag a separate finding. Missing QAP observations remain UNKNOWN/non-PASS; default legacy semantics are unchanged. |
-| Files | `oat-config-throughput-C1.json` through `C8.json` are bounded sweep manifests, not launch configs. Resolve one candidate against the referenced base OAT config before each run. |
+| Files | `oat-config-throughput-C1.json` through `C8.json` are provisional bounded manifests, not launch configs; all are marked `pending-E1-registry` and are not runnable until checked against the E1 registry. |
 | Pictures | `npx --no-install tsx projects/arrowcol-oat/campaign-results.ts --input <results.json> --out <picture-dir>` writes one SVG per cohort. |
 
 ## Qualification
@@ -49,7 +49,7 @@ npx --no-install tsx projects/arrowcol-oat/throughput-sweeps.ts \
   --out docs/experiments/arrowcol-oat
 ```
 
-The generator hashes the tunables profile used to seed the manifests. When the contract lands, point it at the E1 registry source and regenerate; do not hand-copy registry names or bounds into the manifests. A `registryStatus` of `pending-E1-registry` is not runnable and must not be silently treated as a supported tunable.
+The generator currently hashes the PR #125 tunables profile only as a seed. Every generated manifest is marked `pending-E1-registry` and is not runnable: names, types, defaults, and bounds have not yet been validated against the E1 contract. When that contract lands, validate the candidate overlays against it, point the generator at its source, and regenerate; do not hand-copy registry names or bounds into the manifests. C8 staging-overlap is additionally pending until E1 actually exposes that control.
 
 ## Picture input
 
