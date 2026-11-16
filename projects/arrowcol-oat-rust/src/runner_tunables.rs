@@ -77,6 +77,12 @@ fn local_dataflow_overlay(config: &OatConfig, state_dir: &Path, overlay: &mut Va
         .context("Compose tunable services missing")?;
     let collector = services.entry("dataflow-1").or_insert_with(|| json!({}));
     collector["stop_grace_period"] = json!(format!("{}s", config.collector_stop_grace_seconds));
+    collector["ports"] = json!([{
+        "host_ip": "127.0.0.1",
+        "target": 32011,
+        "published": "0",
+        "protocol": "tcp"
+    }]);
     collector["entrypoint"] = json!(["/bin/sh", "-ec"]);
     collector["command"] = json!([concat!(
         "export ARROWCOL_INSTANCE_KEY=\"oat-$(hostname)\"; ",
@@ -287,6 +293,10 @@ mod tunable_injection_tests {
         }))?;
         let mut overlay = compose_tunables(&config)?;
         local_dataflow_overlay(&config, Path::new("/owned/run"), &mut overlay)?;
+        assert_eq!(
+            overlay["services"]["dataflow-1"]["ports"],
+            json!([{"host_ip":"127.0.0.1","target":32011,"published":"0","protocol":"tcp"}])
+        );
         let environment = overlay["services"]["dataflow-1"]["environment"]
             .as_object()
             .context("local collector environment must be an object")?

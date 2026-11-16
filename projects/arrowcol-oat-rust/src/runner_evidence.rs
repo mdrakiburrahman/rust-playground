@@ -4,6 +4,10 @@ struct CellEvidence {
     resource_samples: Vec<ResourceSample>,
     resource_sampling_failures: u64,
     resource_samples_dropped: u64,
+    backlog_scrape_configured: bool,
+    backlog_samples: Vec<PublicationBacklogSample>,
+    backlog_sampling_failures: u64,
+    backlog_samples_dropped: u64,
     client_reports: HashMap<String, Vec<Value>>,
     processes: Option<Value>,
     measurement_window: Option<(u64, u64)>,
@@ -16,6 +20,176 @@ struct CellEvidence {
 struct ResourceSample {
     sampled_at_unix_ms: u64,
     metrics: ResourceMetrics,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct PublicationBacklogSample {
+    request_start_unix_ms: u64,
+    request_end_unix_ms: u64,
+    request_timeout_ms: u64,
+    available: Option<bool>,
+    publications: Option<u64>,
+    rows: Option<u64>,
+    logical_bytes: Option<u64>,
+    oldest_age_seconds: Option<f64>,
+    status: Option<String>,
+    unavailable_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct PublicationBacklogMetrics {
+    available: bool,
+    publications: Option<u64>,
+    rows: Option<u64>,
+    logical_bytes: Option<u64>,
+    oldest_age_seconds: Option<f64>,
+    status: String,
+}
+
+fn parse_publication_backlog_metrics(text: &str) -> Result<PublicationBacklogMetrics> {
+    let mut samples = BTreeMap::new();
+    let mut status = None;
+    for line in text.lines().map(str::trim).filter(|line| !line.is_empty() && !line.starts_with('#')) {
+        let mut fields = line.split_whitespace();
+        let sample = fields.next().context("publication backlog metric sample is empty")?;
+        let value = fields.next().context("publication backlog metric has no value")?;
+        if fields.next().is_some() {
+            bail!("publication backlog metric has an unsupported timestamp or extra field");
+        }
+        let metric = sample.split('{').next().unwrap_or(sample);
+        match metric {
+            "arrowcol_publication_backlog_available"
+            | "arrowcol_publication_backlog_publications"
+            | "arrowcol_publication_backlog_rows"
+            | "arrowcol_publication_backlog_bytes"
+            | "arrowcol_publication_backlog_oldest_age_seconds" => {
+                if sample != metric {
+                    bail!("publication backlog gauge has unexpected labels");
+                }
+                if samples.insert(metric, value).is_some() {
+                    bail!("publication backlog exposition contains a duplicate gauge");
+                }
+            }
+            "arrowcol_publication_backlog_status" => {
+                let label = sample
+                    .strip_prefix("arrowcol_publication_backlog_status{status=\"")
+                    .and_then(|value| value.strip_suffix("\"}"))
+                    .context("publication backlog status has unexpected labels")?;
+                if label.is_empty()
+                    || label.len() > 64
+                    || !label.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+                    || value != "1"
+                {
+                    bail!("publication backlog status sample is invalid");
+                }
+                if status.replace(label).is_some() {
+                    bail!("publication backlog exposition contains duplicate status samples");
+                }
+            }
+            _ if metric.starts_with("arrowcol_publication_backlog_") => {
+                bail!("publication backlog exposition contains an unsupported metric");
+            }
+            _ => {}
+        }
+    }
+
+    let get = |name| {
+        samples
+            .get(name)
+            .copied()
+            .with_context(|| format!("publication backlog exposition omitted {name}"))
+    };
+    let available = match get("arrowcol_publication_backlog_available")? {
+        "0" => false,
+        "1" => true,
+        _ => bail!("publication backlog availability must be 0 or 1"),
+    };
+    let raw_publications = get("arrowcol_publication_backlog_publications")?;
+    let raw_rows = get("arrowcol_publication_backlog_rows")?;
+    let raw_bytes = get("arrowcol_publication_backlog_bytes")?;
+    let raw_age = get("arrowcol_publication_backlog_oldest_age_seconds")?;
+    let status = status.context("publication backlog exposition omitted status")?.to_owned();
+
+    if available {
+        if status != "available" {
+            bail!("available publication backlog must have available status");
+        }
+        let publications = raw_publications.parse::<u64>().context("invalid publication backlog count")?;
+        let rows = raw_rows.parse::<u64>().context("invalid publication backlog row count")?;
+        let logical_bytes = raw_bytes.parse::<u64>().context("invalid publication backlog byte count")?;
+        let oldest_age_seconds = raw_age.parse::<f64>().context("invalid publication backlog age")?;
+        if !oldest_age_seconds.is_finite() || oldest_age_seconds < 0.0 {
+            bail!("available publication backlog age must be finite and non-negative");
+        }
+        Ok(PublicationBacklogMetrics {
+            available,
+            publications: Some(publications),
+            rows: Some(rows),
+            logical_bytes: Some(logical_bytes),
+            oldest_age_seconds: Some(oldest_age_seconds),
+            status,
+        })
+    } else {
+        if status == "available"
+            || [raw_publications, raw_rows, raw_bytes, raw_age]
+                .iter()
+                .any(|value| !value.eq_ignore_ascii_case("nan"))
+        {
+            bail!("unavailable publication backlog must use NaN gauges and an unavailable status");
+        }
+        Ok(PublicationBacklogMetrics {
+            available,
+            publications: None,
+            rows: None,
+            logical_bytes: None,
+            oldest_age_seconds: None,
+            status,
+        })
+    }
+}
+
+fn failed_publication_backlog_sample(
+    start: u64,
+    end: u64,
+    request_timeout_ms: u64,
+    reason: &str,
+) -> PublicationBacklogSample {
+    PublicationBacklogSample {
+        request_start_unix_ms: start,
+        request_end_unix_ms: end,
+        request_timeout_ms,
+        available: None,
+        publications: None,
+        rows: None,
+        logical_bytes: None,
+        oldest_age_seconds: None,
+        status: None,
+        unavailable_reason: Some(reason.to_owned()),
+    }
+}
+
+fn publication_backlog_sample(
+    metrics: PublicationBacklogMetrics,
+    request_start_unix_ms: u64,
+    request_end_unix_ms: u64,
+    request_timeout_ms: u64,
+) -> PublicationBacklogSample {
+    PublicationBacklogSample {
+        request_start_unix_ms,
+        request_end_unix_ms,
+        request_timeout_ms,
+        available: Some(metrics.available),
+        publications: metrics.publications,
+        rows: metrics.rows,
+        logical_bytes: metrics.logical_bytes,
+        oldest_age_seconds: metrics.oldest_age_seconds,
+        unavailable_reason: (!metrics.available).then(|| metrics.status.clone()),
+        status: Some(metrics.status),
+    }
+}
+
+fn valid_backlog_request_interval(start: u64, end: u64, window_start: u64, window_end: u64) -> bool {
+    start >= window_start && end <= window_end && end >= start
 }
 
 fn local_downstream_optional(kind: crate::config::OatMode) -> bool {
@@ -199,6 +373,31 @@ impl CellEvidence {
             .filter(|duration| *duration > 0)
             .map(|duration| duration as f64 / 1000.0);
         let payload_rate = payload_bytes.zip(window_seconds).map(|(bytes, seconds)| bytes as f64 / seconds);
+        let backlog = json!({
+            "schema_version": 1,
+            "source": "arrowcol_publication_backlog_*",
+            "scope": "unique_table_owner_admissions_after_queue_admission_not_confirmed_durable_commit",
+            "timestamp_basis": "UTC request start/end around direct /metrics GET; each is a scrape-time snapshot",
+            "sampling_interval_ms": PUBLICATION_BACKLOG_SAMPLING_INTERVAL.as_millis(),
+            "request_timeout_ms": PUBLICATION_BACKLOG_REQUEST_TIMEOUT.as_millis(),
+            "measurement_window": self.measurement_window.map(|(start_unix_ms, end_unix_ms)| json!({
+                "start_unix_ms": start_unix_ms, "end_unix_ms": end_unix_ms,
+            })),
+            "scraper_configured": self.backlog_scrape_configured,
+            "samples": self.backlog_samples,
+            "sampling_failures": self.backlog_sampling_failures,
+            "samples_dropped": self.backlog_samples_dropped,
+            "retention": "most_recent_4096_samples",
+            "cadence_seconds": 1,
+            "last_unavailable_reason": self.backlog_samples.last().and_then(|sample| sample.unavailable_reason.as_deref()),
+            "unavailable_reason": if !self.backlog_scrape_configured {
+                Some("scraper_not_configured")
+            } else if self.backlog_samples.is_empty() {
+                Some("no_successful_scrape_samples")
+            } else {
+                None
+            },
+        });
         json!({
             "version": 1,
             "processes": self.processes,
@@ -256,7 +455,7 @@ impl CellEvidence {
             "compression_ratio": output.and_then(|value| value["compression_ratio"].as_f64()),
             "compression_ratio_denominator": "committed_parquet_file_bytes_including_metadata",
             "stage_latency_percentiles": { "commit_seconds": output.and_then(|value| value.get("commit_latency_seconds")) },
-            "backlog": null,
+            "backlog": backlog,
         })
     }
 }
@@ -266,10 +465,14 @@ enum ResourceSamplerSource {
     Local {
         run_id: String,
         environment: HashMap<String, String>,
+        collector_metrics_url: Option<String>,
     },
 }
 
 struct ResourceSampler(Option<JoinHandle<Result<CellEvidence>>>);
+
+const PUBLICATION_BACKLOG_SAMPLING_INTERVAL: Duration = Duration::from_secs(1);
+const PUBLICATION_BACKLOG_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 
 impl Drop for ResourceSampler {
     fn drop(&mut self) {
@@ -284,7 +487,15 @@ impl ResourceSampler {
         Self(source.map(|source| {
             tokio::spawn(async move {
                 let mut evidence = CellEvidence::default();
-                let mut interval = tokio::time::interval(Duration::from_secs(1));
+                evidence.backlog_scrape_configured = true;
+                let backlog_scraper = match PublicationBacklogScraper::start(&source, &config).await {
+                    Ok(scraper) => Some(scraper),
+                    Err(error) => {
+                        tracing::warn!(%error, "publication backlog metrics endpoint unavailable");
+                        None
+                    }
+                };
+                let mut interval = tokio::time::interval(PUBLICATION_BACKLOG_SAMPLING_INTERVAL);
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
                     interval.tick().await;
@@ -295,16 +506,30 @@ impl ResourceSampler {
                     if now < start {
                         continue;
                     }
+                    let request_start_unix_ms = unix_time_ms_u64()?;
                     let sample = async {
                         match &source {
                             ResourceSamplerSource::Aks => collect_aks_metrics(&config).await,
-                            ResourceSamplerSource::Local { run_id, environment } => {
+                            ResourceSamplerSource::Local {
+                                run_id, environment, ..
+                            } => {
                                 collect_local_metrics(&config, run_id, environment).await
                             }
                         }
                     };
-                    let timeout_ms = 3_000.min(end - now);
-                    match tokio::time::timeout(Duration::from_millis(timeout_ms), sample).await {
+                    let timeout_ms = (PUBLICATION_BACKLOG_REQUEST_TIMEOUT.as_millis() as u64).min(end - now);
+                    let backlog_sample = async {
+                        let result = match &backlog_scraper {
+                            Some(scraper) => scraper.scrape().await,
+                            None => Err(anyhow::anyhow!("publication backlog metrics endpoint unavailable")),
+                        };
+                        Ok::<_, anyhow::Error>((unix_time_ms_u64()?, result))
+                    };
+                    let (resource_result, backlog_result) = tokio::join!(
+                        tokio::time::timeout(Duration::from_millis(timeout_ms), sample),
+                        tokio::time::timeout(Duration::from_millis(timeout_ms), backlog_sample),
+                    );
+                    match resource_result {
                         Ok(Ok(metrics)) => {
                             let sampled_at_unix_ms = unix_time_ms_u64()?;
                             if sampled_at_unix_ms < end {
@@ -325,6 +550,40 @@ impl ResourceSampler {
                             tracing::warn!("resource sample unavailable or exceeded its bounded deadline");
                         }
                     }
+                    let (request_end_unix_ms, backlog_result) = match backlog_result {
+                        Ok(Ok((request_end, result))) => (request_end, result),
+                        _ => (unix_time_ms_u64()?, Err(anyhow::anyhow!("publication backlog scrape exceeded its bounded deadline"))),
+                    };
+                    let backlog_sample = match backlog_result {
+                        Ok(metrics) => publication_backlog_sample(
+                            metrics,
+                            request_start_unix_ms,
+                            request_end_unix_ms,
+                            timeout_ms,
+                        ),
+                        _ => {
+                            evidence.backlog_sampling_failures += 1;
+                            failed_publication_backlog_sample(
+                                request_start_unix_ms,
+                                request_end_unix_ms,
+                                timeout_ms,
+                                if backlog_scraper.is_some() {
+                                    "scrape_failed"
+                                } else {
+                                    "endpoint_unavailable"
+                                },
+                            )
+                        }
+                    };
+                    if valid_backlog_request_interval(request_start_unix_ms, request_end_unix_ms, start, end) {
+                        if evidence.backlog_samples.len() == 4096 {
+                            evidence.backlog_samples.remove(0);
+                            evidence.backlog_samples_dropped += 1;
+                        }
+                        evidence.backlog_samples.push(backlog_sample);
+                    } else {
+                        evidence.backlog_sampling_failures += 1;
+                    }
                 }
                 Ok(evidence)
             })
@@ -338,6 +597,10 @@ impl ResourceSampler {
             evidence.resource_samples = sampled.resource_samples;
             evidence.resource_sampling_failures = sampled.resource_sampling_failures;
             evidence.resource_samples_dropped = sampled.resource_samples_dropped;
+            evidence.backlog_scrape_configured = sampled.backlog_scrape_configured;
+            evidence.backlog_samples = sampled.backlog_samples;
+            evidence.backlog_sampling_failures = sampled.backlog_sampling_failures;
+            evidence.backlog_samples_dropped = sampled.backlog_samples_dropped;
         }
         Ok(())
     }
@@ -346,6 +609,118 @@ impl ResourceSampler {
 #[cfg(test)]
 mod measurement_evidence_tests {
     use super::*;
+
+    fn publication_backlog_exposition(available: u8, publications: &str, rows: &str, bytes: &str, age: &str, status: &str) -> String {
+        format!(
+            "# HELP arrowcol_publication_backlog_available availability\n\
+             # TYPE arrowcol_publication_backlog_available gauge\n\
+             arrowcol_publication_backlog_available {available}\n\
+             arrowcol_publication_backlog_publications {publications}\n\
+             arrowcol_publication_backlog_rows {rows}\n\
+             arrowcol_publication_backlog_bytes {bytes}\n\
+             arrowcol_publication_backlog_oldest_age_seconds {age}\n\
+             arrowcol_publication_backlog_status{{status=\"{status}\"}} 1\n"
+        )
+    }
+
+    #[test]
+    fn publication_backlog_parser_preserves_unavailable_and_rejects_bad_gauges() -> Result<()> {
+        let available = parse_publication_backlog_metrics(&publication_backlog_exposition(1, "2", "7", "256", "1.25", "available"))?;
+        assert_eq!(
+            available,
+            PublicationBacklogMetrics {
+                available: true,
+                publications: Some(2),
+                rows: Some(7),
+                logical_bytes: Some(256),
+                oldest_age_seconds: Some(1.25),
+                status: "available".to_owned(),
+            }
+        );
+        let unavailable = parse_publication_backlog_metrics(&publication_backlog_exposition(
+            0, "NaN", "NaN", "NaN", "NaN", "unknown_outcome",
+        ))?;
+        assert_eq!(unavailable.publications, None);
+        assert_eq!(unavailable.rows, None);
+        assert_eq!(unavailable.logical_bytes, None);
+        assert_eq!(unavailable.oldest_age_seconds, None);
+        assert_eq!(unavailable.status, "unknown_outcome");
+        assert!(
+            parse_publication_backlog_metrics(&publication_backlog_exposition(
+                0, "0", "0", "0", "0", "unconfigured",
+            ))
+            .is_err()
+        );
+        assert!(
+            parse_publication_backlog_metrics(&publication_backlog_exposition(
+                1, "NaN", "7", "256", "1.25", "available",
+            ))
+            .is_err()
+        );
+        assert!(
+            parse_publication_backlog_metrics(&publication_backlog_exposition(
+                1, "2", "7", "256", "-0.1", "available",
+            ))
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn publication_backlog_fixture_covers_one_timestamped_150_second_cell() -> Result<()> {
+        let start = 1_700_000_000_000_u64;
+        let end = start + 150_000;
+        let mut evidence = CellEvidence {
+            measurement_window: Some((start, end)),
+            backlog_scrape_configured: true,
+            ..Default::default()
+        };
+        for second in 0..150_u64 {
+            let offset = second * 1_000;
+            let request_start = start + offset;
+            let exposition = publication_backlog_exposition(
+                1,
+                "3",
+                &(120 - (second % 30)).to_string(),
+                "8192",
+                "2.5",
+                "available",
+            );
+            let metrics = parse_publication_backlog_metrics(&exposition)?;
+            evidence.backlog_samples.push(publication_backlog_sample(
+                metrics,
+                request_start,
+                request_start + 20,
+                3_000.min(end - request_start),
+            ));
+        }
+        let evidence = evidence.for_table("table", None)["backlog"].clone();
+        assert_eq!(evidence["schema_version"], 1);
+        assert_eq!(evidence["measurement_window"]["start_unix_ms"], start);
+        assert_eq!(evidence["measurement_window"]["end_unix_ms"], end);
+        assert_eq!(evidence["sampling_interval_ms"], 1_000);
+        assert_eq!(evidence["request_timeout_ms"], 3_000);
+        assert_eq!(evidence["scope"], "unique_table_owner_admissions_after_queue_admission_not_confirmed_durable_commit");
+        assert_eq!(evidence["samples"].as_array().context("backlog samples")?.len(), 150);
+        let mut bucket_counts = [0_u64; 5];
+        for sample in evidence["samples"].as_array().context("backlog samples")? {
+            let sample_start = sample["request_start_unix_ms"].as_u64().context("sample start")?;
+            let sample_end = sample["request_end_unix_ms"].as_u64().context("sample end")?;
+            assert!(sample_start >= start && sample_end <= end && sample_end >= sample_start);
+            assert_eq!(sample["request_timeout_ms"], 3_000.min(end - sample_start));
+            assert_eq!(sample["available"], true);
+            let bucket_index = ((sample_start - start) / 30_000).min(4);
+            let bucket_start = start + bucket_index * 30_000;
+            let bucket_end = bucket_start + 30_000;
+            assert!(sample_start >= bucket_start && sample_end <= bucket_end);
+            bucket_counts[bucket_index as usize] += 1;
+        }
+        assert_eq!(bucket_counts, [30, 30, 30, 30, 30]);
+        assert!(!valid_backlog_request_interval(start + 2, start + 1, start, end));
+        assert_eq!(evidence["sampling_failures"], 0);
+        assert_eq!(evidence["samples_dropped"], 0);
+        Ok(())
+    }
 
     #[test]
     fn downstream_degradation_is_local_only() {

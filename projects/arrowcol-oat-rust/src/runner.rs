@@ -781,6 +781,58 @@ struct OwnedKubectlProcess {
     stderr: JoinHandle<std::io::Result<Vec<u8>>>,
 }
 
+struct PublicationBacklogScraper {
+    endpoint: String,
+    _tunnel: Option<OwnedKubectlProcess>,
+    client: reqwest::Client,
+}
+
+impl PublicationBacklogScraper {
+    async fn start(source: &ResourceSamplerSource, config: &OatConfig) -> Result<Self> {
+        let (endpoint, tunnel) = match source {
+            ResourceSamplerSource::Aks => {
+                let (endpoint, tunnel) = start_aks_collector_metrics_tunnel(config).await?;
+                (endpoint, Some(tunnel))
+            }
+            ResourceSamplerSource::Local {
+                collector_metrics_url,
+                ..
+            } => (
+                collector_metrics_url
+                    .clone()
+                    .context("local collector metrics endpoint is unavailable")?,
+                None,
+            ),
+        };
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .context("build publication backlog metrics client")?;
+        Ok(Self {
+            endpoint,
+            _tunnel: tunnel,
+            client,
+        })
+    }
+
+    async fn scrape(&self) -> Result<PublicationBacklogMetrics> {
+        const MAX_METRICS_BYTES: u64 = 1_048_576;
+        let response = self.client.get(&self.endpoint).send().await.context("request collector admin metrics")?;
+        if !response.status().is_success() {
+            bail!("collector admin metrics returned HTTP {}", response.status());
+        }
+        if response.content_length().is_some_and(|length| length > MAX_METRICS_BYTES) {
+            bail!("collector admin metrics exceeded the evidence size limit");
+        }
+        let body = response.bytes().await.context("read collector admin metrics")?;
+        if body.len() as u64 > MAX_METRICS_BYTES {
+            bail!("collector admin metrics exceeded the evidence size limit");
+        }
+        let text = std::str::from_utf8(&body).context("collector admin metrics are not UTF-8")?;
+        parse_publication_backlog_metrics(text)
+    }
+}
+
 struct LocalPlatform {
     run_id: String,
     state_dir: PathBuf,
@@ -788,6 +840,7 @@ struct LocalPlatform {
     control_dir: PathBuf,
     client_progress: std::sync::Mutex<HashMap<String, ClientProgress>>,
     router_metrics_url: Option<String>,
+    collector_metrics_url: Option<String>,
     qap_url: Option<String>,
     daemon_endpoint: Option<String>,
     shutdown_drain_evidence: Option<Value>,
@@ -1062,6 +1115,13 @@ impl Platform for LocalPlatform {
         self.daemon_endpoint = Some(local_docker_daemon().await?);
         prepare_local_platform(config, self).await?;
         self.router_metrics_url = Some(local_compose_endpoint(config, self, "router", "50050", "/metrics").await?);
+        match local_compose_endpoint(config, self, "dataflow-1", "32011", "/metrics").await {
+            Ok(endpoint) => self.collector_metrics_url = Some(endpoint),
+            Err(error) => {
+                self.collector_metrics_url = None;
+                tracing::warn!(%error, "local collector metrics endpoint unavailable; publication backlog evidence remains unknown");
+            }
+        }
         match local_compose_endpoint(config, self, "kusto", "8080", "").await {
             Ok(endpoint) => self.qap_url = Some(endpoint),
             Err(_) => tracing::warn!("local downstream unavailable; collector-only measurement remains enabled"),
@@ -1176,6 +1236,7 @@ impl Platform for LocalPlatform {
         Some(ResourceSamplerSource::Local {
             run_id: self.run_id.clone(),
             environment: self.environment.clone(),
+            collector_metrics_url: self.collector_metrics_url.clone(),
         })
     }
 
@@ -1241,6 +1302,7 @@ impl LocalPlatform {
             control_dir,
             client_progress: std::sync::Mutex::new(HashMap::new()),
             router_metrics_url: None,
+            collector_metrics_url: None,
             qap_url: None,
             daemon_endpoint: None,
             shutdown_drain_evidence: None,
@@ -7068,6 +7130,100 @@ async fn start_router_metrics_tunnel_with(
     }
 }
 
+async fn start_aks_collector_metrics_tunnel(config: &OatConfig) -> Result<(String, OwnedKubectlProcess)> {
+    let snapshot = kubectl(
+        config,
+        vec![
+            "get",
+            "pods",
+            "--namespace",
+            &config.namespace,
+            "--selector",
+            &config.arrowcol_pod_selector,
+            "-o",
+            "json",
+        ],
+        None,
+    )
+    .await?;
+    let pods = active_pod_names(&serde_json::from_str(&snapshot)?)?;
+    if pods.len() != 1 {
+        bail!("publication backlog scrape requires exactly one active ArrowCol collector");
+    }
+    let pod = pods.into_iter().next().context("active ArrowCol collector pod is missing")?;
+    let target = format!("pod/{pod}");
+    let reservation = TcpListener::bind("127.0.0.1:0")
+        .await
+        .context("reserve a loopback port for the collector metrics tunnel")?;
+    let port = reservation.local_addr()?.port();
+    drop(reservation);
+    let port_mapping = format!("{port}:32011");
+    let mut command = Command::new("kubectl");
+    if let Some(context) = &config.kubectl_context {
+        command.args(["--context", context]);
+    }
+    command
+        .args([
+            "port-forward",
+            "--address",
+            "127.0.0.1",
+            "--namespace",
+            &config.namespace,
+            &target,
+            &port_mapping,
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command.spawn().context("start owned collector metrics port-forward")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("capture collector metrics port-forward diagnostics")?;
+    let stderr = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        let mut stderr = stderr;
+        stderr.read_to_end(&mut bytes).await.map(|_| bytes)
+    });
+    let mut forward = OwnedKubectlProcess { child, stderr };
+    let metrics_url = format!("http://127.0.0.1:{port}/metrics");
+    let ready_url = format!("http://127.0.0.1:{port}/readyz");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .context("build collector metrics tunnel readiness client")?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = forward
+            .child
+            .try_wait()
+            .context("check collector metrics port-forward process")?
+        {
+            let stderr = collect_kubectl_stderr(forward.stderr).await?;
+            bail!(
+                "collector metrics port-forward exited before readiness with {status}: {}",
+                String::from_utf8_lossy(&stderr).trim()
+            );
+        }
+        if client
+            .get(&ready_url)
+            .send()
+            .await
+            .is_ok_and(|response| response.status().is_success())
+        {
+            return Ok((metrics_url, forward));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let stderr = collect_kubectl_stderr(stop_kubectl_process(forward).await?).await?;
+            bail!(
+                "collector metrics tunnel did not become ready within 10 seconds: {}",
+                String::from_utf8_lossy(&stderr).trim()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 async fn ensure_router_metrics_tunnel(config: &OatConfig, platform: &mut AksPlatform) -> Result<bool> {
     ensure_router_metrics_tunnel_with(config, platform, || Command::new("kubectl")).await
 }
@@ -9914,6 +10070,7 @@ mod tests {
             control_dir: state.clone(),
             client_progress: std::sync::Mutex::new(HashMap::new()),
             router_metrics_url: None,
+            collector_metrics_url: None,
             qap_url: None,
             daemon_endpoint: None,
             shutdown_drain_evidence: None,
