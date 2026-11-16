@@ -917,7 +917,13 @@ mod maintenance_topology_tests {
                 "maintenance_table_policies":maintenance_table_evidence(&config, &text)?,
                 "maintenance_operation_outcomes":maintenance_cell_outcome_evidence(&current, &[baseline])}],
         });
-        println!("OAT_MAINTENANCE_HEALTH_PROJECTION {projection}");
+        let expected_projection: Value = serde_json::from_str(include_str!(
+            "../../arrowcol-oat/campaign-results-maintenance-health-e1-projection.json"
+        ))?;
+        assert_eq!(projection, expected_projection);
+        assert_eq!(crate::local::file_digest(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/maintenance-operation-results.json"),
+        )?.1, projection["producer_sha256"].as_str().context("producer hash")?);
         let protected = optimize["report"]["compaction_debt"]["protected_partition_backlog"].clone();
         assert!(!protected.is_null(), "fixture must contain measured protected debt, not an invented zero");
 
@@ -970,6 +976,22 @@ mod maintenance_topology_tests {
             32_u64 * 1024 * 1024
         );
         assert!(maintenance_table_evidence(&config, "").is_err());
+        let mut bounded_config = config.clone();
+        bounded_config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+            "maintenance":{"enabled":true,"operations":["optimize"],
+                "max_consecutive_stale_plans":4,"sealed_partitions_only":false}
+        }))?;
+        let mut overridden = json!({
+            "startup":{"apply":false,"operations":["optimize"],"interval_secs":60,
+                "max_consecutive_stale_plans":4,"sealed_partitions_only":false},
+            "operation_settings":{"max_consecutive_stale_plans":4,"sealed_partitions_only":true},
+            "table_policy":{"arrowcol.optimize.sealedPartitionsOnly":true},"active":true,
+        });
+        verify_process_configuration(&bounded_config, ComponentRole::Maintenance, &overridden)?;
+        verify_maintenance_controls(&bounded_config, &overridden)?;
+        overridden["startup"]["sealed_partitions_only"] = Value::Null;
+        assert!(verify_process_configuration(&bounded_config, ComponentRole::Maintenance, &overridden).is_err(),
+            "omitted/null is not an observed requested false");
         assert!(
             maintenance_table_evidence(
                 &config,

@@ -329,6 +329,24 @@ test('parses synthetic backlog and producer-shaped maintenance evidence without 
 });
 
 test('consumes actual Rust results through the E1 projection and keeps single-window or failed wrappers UNKNOWN', () => {
+  const healthProjection = JSON.parse(readFileSync(
+    new URL('./campaign-results-maintenance-health-e1-projection.json', import.meta.url), 'utf8',
+  )) as { producer_commit: string; producer_sha256: string; processes: Array<{
+    maintenance_table_policies: { operation_reports: Array<{
+      operation: string; compaction_debt: Record<string, unknown> | null;
+    }> };
+  }> };
+  const healthProducer = JSON.parse(readFileSync(
+    new URL('../arrowcol-oat-rust/tests/fixtures/maintenance-operation-results.json', import.meta.url), 'utf8',
+  )) as { operation_results: Array<{ operation: string; report: { compaction_debt: Record<string, unknown> | null } }> };
+  assert.equal(healthProjection.producer_commit, '2def059cb24ddfb924b8cbd15a8387404063a69d');
+  const producerDebt = healthProducer.operation_results.find(result => result.operation === 'optimize')!.report.compaction_debt!;
+  const projectedDebt = healthProjection.processes[0]!.maintenance_table_policies.operation_reports
+    .find(result => result.operation === 'optimize')!.compaction_debt!;
+  assert.deepEqual(projectedDebt.protected_partition_backlog, producerDebt.protected_partition_backlog);
+  assert.equal(maintenanceDueWorkIssue(healthProjection.processes, {
+    enabled: true, apply: true, operations: ['optimize', 'purge', 'vacuum', 'checkpoint', 'prune_log'],
+  }, 1_704_067_380_000, 1_704_067_530_000), 'maintenance due-work is missing from one or more complete 30-second windows');
   const producer = JSON.parse(readFileSync(
     new URL('./campaign-results-maintenance-rust.json', import.meta.url), 'utf8',
   )) as {
@@ -605,6 +623,7 @@ test('preserves retries without failures but refuses missing records or growing 
   const evidence = JSON.parse(String(run.rows[0]!.evidence_json));
   const process = evidence.processes.find((item: Record<string, unknown>) => item.component === 'maintenance');
   const policy = process.maintenance_table_policies;
+  policy.operation_outcomes.operation_count = 26;
   policy.operation_outcomes.retry_count = 1;
   policy.operation_outcomes.retry_kind_counts = { stale_plan: 1 };
   policy.operation_reports.push({
@@ -612,7 +631,24 @@ test('preserves retries without failures but refuses missing records or growing 
     operation_failed: false, error_kind: null, operation_retry: true, retry_kind: 'stale_plan',
     maintenance_due_work: null, compaction_debt: null, report_outcome: null,
   });
+  process.maintenance_operation_outcomes.operation_count = 26;
+  process.maintenance_operation_outcomes.retry_kind_counts = { stale_plan: 1 };
+  process.maintenance_operation_outcomes.operations.vacuum.operation_count = 6;
+  process.maintenance_operation_outcomes.operations.vacuum.retry_kind_counts = { stale_plan: 1 };
   assert.equal(maintenanceDueWorkIssue(evidence.processes, maintenanceConfig(run), 1_000_000, 1_150_000), undefined);
+  evidence.backlog = syntheticBacklog();
+  evidence.shutdown_drain.maintenance[0] = {
+    exit_code: 1, exit_classification: 'classified_retries_only', outcomes: process.maintenance_operation_outcomes,
+  };
+  const result = () => ({
+    cohort: 'C1', candidate: 'snappy', factorX: 'codec', valueX: 'snappy', factorY: 'level', valueY: '3',
+    repeat: 1, expectedRepeats: 3, committedRowsPerSecond: 1,
+    factorConfigPaths: ['tunables.parquet_writer.defaults.compression', 'tunables.parquet_writer.defaults.compression_level'],
+    officialRuns: [{ ...run, rows: [{ ...run.rows[0]!, evidence_json: JSON.stringify(evidence) }] }],
+  });
+  assert.match(renderCampaignResults([result()], 'C1'), /1\/3 protocol-complete repeats/);
+  evidence.shutdown_drain.maintenance[0].exit_classification = 'unknown';
+  assert.match(renderCampaignResults([result()], 'C1'), /maintenance shutdown exit has no proved classified cause/);
   process.maintenance_operation_outcomes.operation_failure = null;
   assert.match(maintenanceDueWorkIssue(evidence.processes, maintenanceConfig(run), 1_000_000, 1_150_000)!, /records are unavailable/);
   process.maintenance_operation_outcomes.operation_failure = false;
