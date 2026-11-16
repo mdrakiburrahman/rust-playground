@@ -488,6 +488,8 @@ struct Measurement {
     raw_window_bytes: Vec<AtomicU64>,
     wire_window_bytes: Vec<AtomicU64>,
     window_latency: Vec<Mutex<[u64; 64]>>,
+    resource_start: Mutex<Option<ResourceSample>>,
+    resource_end: Mutex<Option<ResourceSample>>,
     rejected_streams: AtomicU64,
     rejected_rows: AtomicU64,
     retried_streams: AtomicU64,
@@ -538,6 +540,8 @@ impl Measurement {
             window_latency: (0..(end_unix_ms - start_unix_ms).div_ceil(30_000))
                 .map(|_| Mutex::new([0; 64]))
                 .collect(),
+            resource_start: Mutex::new(None),
+            resource_end: Mutex::new(None),
             rejected_streams: AtomicU64::new(0),
             rejected_rows: AtomicU64::new(0),
             retried_streams: AtomicU64::new(0),
@@ -581,6 +585,34 @@ impl Measurement {
         Ok(())
     }
 
+    fn record_resource_sample(&self, sample: ResourceSample, is_start: bool) -> Result<()> {
+        let target = if is_start {
+            &self.resource_start
+        } else {
+            &self.resource_end
+        };
+        let mut target = target
+            .lock()
+            .map_err(|_| anyhow::anyhow!("resource sample state poisoned"))?;
+        anyhow::ensure!(target.is_none(), "resource sample already recorded");
+        *target = Some(sample);
+        Ok(())
+    }
+
+    fn resource_metrics(&self) -> serde_json::Value {
+        let start = self
+            .resource_start
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        let end = self
+            .resource_end
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        resource_report(start, end)
+    }
+
     fn snapshot(&self) -> serde_json::Value {
         serde_json::json!({
             "start_unix_ms": self.start_unix_ms, "end_unix_ms": self.end_unix_ms,
@@ -612,6 +644,7 @@ impl Measurement {
             "ambiguous_streams": self.ambiguous_streams.load(Ordering::Relaxed),
             "ambiguous_rows": self.ambiguous_rows.load(Ordering::Relaxed),
             "scope": "per_stream_admission_completion_observed_in_half_open_shared_unix_window",
+            "client_resources": self.resource_metrics(),
         })
     }
 
@@ -931,16 +964,38 @@ impl PreparedClient {
                 observed.abs_diff(measurement_start_unix_ms) <= 250,
                 "client did not start within 250ms of the shared measurement interval"
             );
+            measurement.record_resource_sample(ResourceSample::capture()?, true)?;
             println!("OAT_CLIENT_METRICS {}", self.metrics("measurement_start"));
             Ok::<u64, anyhow::Error>(observed)
         };
         tokio::pin!(phase);
         let mut measurement_started = None;
+        let resource_end = async {
+            while unix_ms()? < measurement_end_unix_ms {
+                tokio::time::sleep(Duration::from_millis(
+                    measurement_end_unix_ms.saturating_sub(unix_ms()?).min(10),
+                ))
+                .await;
+            }
+            measurement.record_resource_sample(ResourceSample::capture()?, false)
+        };
+        tokio::pin!(resource_end);
+        let mut resource_end_recorded = false;
         loop {
             tokio::select! {
                 result = &mut phase, if measurement_started.is_none() => {
                     match result {
                         Ok(started) => measurement_started = Some(started),
+                        Err(error) => {
+                            tasks.abort_all();
+                            while tasks.join_next().await.is_some() {}
+                            return Err(error);
+                        }
+                    }
+                }
+                result = &mut resource_end, if !resource_end_recorded => {
+                    match result {
+                        Ok(()) => resource_end_recorded = true,
                         Err(error) => {
                             tasks.abort_all();
                             while tasks.join_next().await.is_some() {}
@@ -965,12 +1020,6 @@ impl PreparedClient {
                 }
                 else => break,
             }
-        }
-        while unix_ms()? < measurement_end_unix_ms {
-            tokio::time::sleep(Duration::from_millis(
-                measurement_end_unix_ms.saturating_sub(unix_ms()?).min(10),
-            ))
-            .await;
         }
         Ok(ContinuousReport {
             completed_rows: measurement.rows.load(Ordering::Relaxed),
@@ -1487,6 +1536,282 @@ fn thread_cpu_seconds() -> Result<Option<f64>> {
     }
 }
 
+#[derive(Clone, Debug)]
+struct ResourceSample {
+    sampled_unix_ms: u64,
+    process_cpu_ns: Option<u64>,
+    network_rx_bytes: Option<u64>,
+    network_tx_bytes: Option<u64>,
+    network_counters_unavailable_reason: Option<String>,
+    network_advertised_link_speed_bps: Option<u64>,
+    network_interface_speed_unavailable_reasons: Vec<String>,
+    available_parallelism: Option<usize>,
+}
+impl ResourceSample {
+    fn capture() -> Result<Self> {
+        let process_cpu_ns = process_cpu_ns()?;
+        let network = network_snapshot()?;
+        Ok(Self {
+            sampled_unix_ms: unix_ms()?,
+            process_cpu_ns,
+            network_rx_bytes: network.0,
+            network_tx_bytes: network.1,
+            network_counters_unavailable_reason: network.2,
+            network_advertised_link_speed_bps: network.3,
+            network_interface_speed_unavailable_reasons: network.4,
+            available_parallelism: std::thread::available_parallelism().ok().map(|value| value.get()),
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn process_cpu_ns() -> Result<Option<u64>> {
+    let contents = match std::fs::read_to_string("/proc/self/stat") {
+        Ok(contents) => contents,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error).context("read process CPU accounting"),
+    };
+    let command_end = contents
+        .rfind(')')
+        .context("process stat is missing its command terminator")?;
+    let fields = contents[command_end + 1..].split_whitespace().collect::<Vec<_>>();
+    let user_ticks: u64 = fields
+        .get(11)
+        .context("process stat is missing user CPU accounting")?
+        .parse()?;
+    let system_ticks: u64 = fields
+        .get(12)
+        .context("process stat is missing system CPU accounting")?
+        .parse()?;
+    let Some(ticks_per_second) = clock_ticks_per_second()? else {
+        return Ok(None);
+    };
+    let total_ticks = user_ticks
+        .checked_add(system_ticks)
+        .context("process CPU tick counter overflow")?;
+    let total_ns = total_ticks
+        .checked_mul(1_000_000_000)
+        .context("process CPU nanosecond conversion overflow")?
+        / ticks_per_second;
+    Ok(Some(total_ns))
+}
+
+#[cfg(target_os = "linux")]
+fn clock_ticks_per_second() -> Result<Option<u64>> {
+    const AT_CLKTCK: usize = 17;
+    let contents = match std::fs::read("/proc/self/auxv") {
+        Ok(contents) => contents,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error).context("read process clock tick rate"),
+    };
+    let word_size = std::mem::size_of::<usize>();
+    let entry_size = word_size * 2;
+    anyhow::ensure!(
+        contents.len() % entry_size == 0,
+        "process auxiliary vector has an incomplete entry"
+    );
+    for entry in contents.chunks_exact(entry_size) {
+        let kind = usize::from_ne_bytes(entry[..word_size].try_into()?);
+        let value = usize::from_ne_bytes(entry[word_size..].try_into()?);
+        if kind == AT_CLKTCK {
+            return Ok(u64::try_from(value).ok().filter(|value| *value > 0));
+        }
+        if kind == 0 {
+            break;
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_cpu_ns() -> Result<Option<u64>> {
+    Ok(None)
+}
+
+fn read_advertised_link_speed(contents: std::io::Result<String>) -> Result<(Option<u64>, Option<String>)> {
+    let contents = match contents {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
+            return Ok((None, Some("unsupported_interface".to_owned())));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((None, Some("interface_disappeared".to_owned())));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            return Ok((None, Some("permission_denied".to_owned())));
+        }
+        Err(error) => return Err(error).context("read interface link speed"),
+    };
+    let speed_mbps = contents.trim().parse::<i64>().ok().filter(|speed| *speed > 0);
+    let Some(speed_mbps) = speed_mbps else {
+        return Ok((None, Some("speed_not_reported".to_owned())));
+    };
+    let speed_bps = (speed_mbps as u64)
+        .checked_mul(1_000_000)
+        .context("advertised link speed overflow")?;
+    Ok((Some(speed_bps), None))
+}
+
+fn network_snapshot() -> Result<(Option<u64>, Option<u64>, Option<String>, Option<u64>, Vec<String>)> {
+    let contents = match std::fs::read_to_string("/proc/net/dev") {
+        Ok(contents) => contents,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            return Ok((
+                None,
+                None,
+                Some("network_counters_unavailable".to_owned()),
+                None,
+                Vec::new(),
+            ));
+        }
+        Err(error) => return Err(error).context("read client network counters"),
+    };
+    let mut rx_bytes = 0_u64;
+    let mut tx_bytes = 0_u64;
+    let mut advertised_speed_bps = 0_u64;
+    let mut all_speeds_known = true;
+    let mut speed_unavailable_reasons = Vec::new();
+    let mut interfaces = 0_usize;
+    for line in contents.lines().skip(2) {
+        let Some((name, values)) = line.split_once(':') else {
+            continue;
+        };
+        let name = name.trim();
+        if name == "lo" {
+            continue;
+        }
+        let values = values
+            .split_whitespace()
+            .map(str::parse::<u64>)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        anyhow::ensure!(
+            values.len() >= 9,
+            "network counters for {name} have fewer than nine fields"
+        );
+        rx_bytes = rx_bytes
+            .checked_add(values[0])
+            .context("network receive counter overflow")?;
+        tx_bytes = tx_bytes
+            .checked_add(values[8])
+            .context("network transmit counter overflow")?;
+        let speed_path = std::path::Path::new("/sys/class/net").join(name).join("speed");
+        let (speed_bps, unavailable_reason) = read_advertised_link_speed(std::fs::read_to_string(&speed_path))
+            .with_context(|| format!("read {}", speed_path.display()))?;
+        if let Some(speed_bps) = speed_bps {
+            advertised_speed_bps = advertised_speed_bps
+                .checked_add(speed_bps)
+                .context("advertised link speed total overflow")?;
+        } else {
+            all_speeds_known = false;
+            if let Some(reason) = unavailable_reason {
+                speed_unavailable_reasons.push(reason);
+            }
+        }
+        interfaces += 1;
+    }
+    if interfaces == 0 {
+        return Ok((
+            None,
+            None,
+            Some("no_non_loopback_interfaces".to_owned()),
+            None,
+            Vec::new(),
+        ));
+    }
+    Ok((
+        Some(rx_bytes),
+        Some(tx_bytes),
+        None,
+        all_speeds_known.then_some(advertised_speed_bps),
+        speed_unavailable_reasons,
+    ))
+}
+
+fn resource_report(start: Option<ResourceSample>, end: Option<ResourceSample>) -> serde_json::Value {
+    let elapsed_ns = start
+        .as_ref()
+        .zip(end.as_ref())
+        .and_then(|(start, end)| end.sampled_unix_ms.checked_sub(start.sampled_unix_ms))
+        .and_then(|millis| millis.checked_mul(1_000_000));
+    let cpu_ns = start
+        .as_ref()
+        .zip(end.as_ref())
+        .and_then(|(start, end)| start.process_cpu_ns.zip(end.process_cpu_ns))
+        .and_then(|(start, end)| end.checked_sub(start));
+    let cpu_seconds = cpu_ns.map(|nanos| nanos as f64 / 1e9);
+    let elapsed_seconds = elapsed_ns
+        .map(|nanos| nanos as f64 / 1e9)
+        .filter(|seconds| *seconds > 0.0);
+    let available_cores = start
+        .as_ref()
+        .zip(end.as_ref())
+        .and_then(|(start, end)| start.available_parallelism.zip(end.available_parallelism))
+        .map(|(start, end)| start.min(end));
+    let cpu_core_equivalents = cpu_seconds.zip(elapsed_seconds).map(|(cpu, elapsed)| cpu / elapsed);
+    let cpu_utilization_fraction = cpu_core_equivalents
+        .zip(available_cores)
+        .map(|(used, total)| used / total as f64);
+    let rx_bytes = start
+        .as_ref()
+        .zip(end.as_ref())
+        .and_then(|(start, end)| start.network_rx_bytes.zip(end.network_rx_bytes))
+        .and_then(|(start, end)| end.checked_sub(start));
+    let tx_bytes = start
+        .as_ref()
+        .zip(end.as_ref())
+        .and_then(|(start, end)| start.network_tx_bytes.zip(end.network_tx_bytes))
+        .and_then(|(start, end)| end.checked_sub(start));
+    let tx_bytes_per_second = tx_bytes
+        .map(|bytes| bytes as f64)
+        .zip(elapsed_seconds)
+        .map(|(bytes, elapsed)| bytes / elapsed);
+    serde_json::json!({
+        "status": if elapsed_ns.is_some() { "sampled" } else { "incomplete" },
+        "start_sample_unix_ms": start.as_ref().map(|sample| sample.sampled_unix_ms),
+        "end_sample_unix_ms": end.as_ref().map(|sample| sample.sampled_unix_ms),
+        "sample_interval_ns": elapsed_ns,
+        "process_cpu_ns": cpu_ns,
+        "process_cpu_seconds": cpu_seconds,
+        "available_parallelism": available_cores,
+        "cpu_core_equivalents": cpu_core_equivalents,
+        "cpu_utilization_fraction": cpu_utilization_fraction,
+        "network_rx_bytes": rx_bytes,
+        "network_tx_bytes": tx_bytes,
+        "network_tx_bytes_per_second": tx_bytes_per_second,
+        "network_counters_start_unavailable_reason": start.as_ref().and_then(|sample| sample.network_counters_unavailable_reason.as_deref()),
+        "network_counters_end_unavailable_reason": end.as_ref().and_then(|sample| sample.network_counters_unavailable_reason.as_deref()),
+        "network_advertised_link_speed_start_bps": start.as_ref().and_then(|sample| sample.network_advertised_link_speed_bps),
+        "network_advertised_link_speed_end_bps": end.as_ref().and_then(|sample| sample.network_advertised_link_speed_bps),
+        "network_interface_speed_start_unavailable_reasons": start.as_ref().map(|sample| &sample.network_interface_speed_unavailable_reasons),
+        "network_interface_speed_end_unavailable_reasons": end.as_ref().map(|sample| &sample.network_interface_speed_unavailable_reasons),
+        "network_tx_capacity_bps": null,
+        "network_tx_capacity_fraction": null,
+        "network_tx_capacity_unavailable_reason": "verified_container_or_node_capacity_not_measured",
+        "cpu_scope": "linux_process_stat_user_system_ticks",
+        "network_scope": "container_non_loopback_interfaces_all_traffic_not_per_flight_attribution",
+        "clock_uncertainty_ns": null
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1824,6 +2149,92 @@ mod tests {
         .await
         .context("fast worker was blocked behind the slow worker")??;
         assert_eq!(sends.load(Ordering::SeqCst), 12);
+        Ok(())
+    }
+
+    #[test]
+    fn unavailable_resource_readings_remain_unknown() {
+        let start = ResourceSample {
+            sampled_unix_ms: 1_000,
+            process_cpu_ns: None,
+            network_rx_bytes: None,
+            network_tx_bytes: None,
+            network_counters_unavailable_reason: Some("not_sampled".to_owned()),
+            network_advertised_link_speed_bps: None,
+            network_interface_speed_unavailable_reasons: vec!["unsupported_interface".to_owned()],
+            available_parallelism: None,
+        };
+        let end = ResourceSample {
+            sampled_unix_ms: 2_000,
+            ..start.clone()
+        };
+        let report = resource_report(Some(start), Some(end));
+        for field in [
+            "process_cpu_ns",
+            "network_rx_bytes",
+            "network_tx_bytes",
+            "network_advertised_link_speed_start_bps",
+            "network_tx_capacity_bps",
+            "network_tx_capacity_fraction",
+            "available_parallelism",
+        ] {
+            assert!(report[field].is_null(), "{field} must remain unknown");
+        }
+        assert_eq!(
+            report["network_tx_capacity_unavailable_reason"],
+            "verified_container_or_node_capacity_not_measured"
+        );
+        assert_eq!(
+            report["network_interface_speed_start_unavailable_reasons"],
+            serde_json::json!(["unsupported_interface"])
+        );
+    }
+
+    #[test]
+    fn unsupported_and_disappeared_link_speeds_are_unknown_with_reasons() -> Result<()> {
+        assert_eq!(
+            read_advertised_link_speed(Err(std::io::Error::from(std::io::ErrorKind::InvalidInput)))?,
+            (None, Some("unsupported_interface".to_owned()))
+        );
+        assert_eq!(
+            read_advertised_link_speed(Err(std::io::Error::from(std::io::ErrorKind::NotFound)))?,
+            (None, Some("interface_disappeared".to_owned()))
+        );
+        assert_eq!(
+            read_advertised_link_speed(Ok("1000\n".to_owned()))?,
+            (Some(1_000_000_000), None)
+        );
+        assert!(
+            read_advertised_link_speed(Err(std::io::Error::new(std::io::ErrorKind::Other, "unexpected",))).is_err()
+        );
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_cpu_includes_a_worker_thread_joined_between_samples() -> Result<()> {
+        let process_start = process_cpu_ns()?.context("process CPU clock unavailable")?;
+        let worker_cpu_ns = std::thread::spawn(|| -> Result<u64> {
+            let thread_start = thread_cpu_seconds()?.context("thread CPU clock unavailable")?;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+            let mut work = 0_u64;
+            while std::time::Instant::now() < deadline {
+                work = work.wrapping_add(1);
+                std::hint::black_box(work);
+            }
+            let thread_end = thread_cpu_seconds()?.context("thread CPU clock unavailable")?;
+            Ok(((thread_end - thread_start) * 1e9) as u64)
+        })
+        .join()
+        .map_err(|_| anyhow::anyhow!("CPU sampling worker panicked"))??;
+        let process_end = process_cpu_ns()?.context("process CPU clock unavailable")?;
+        let process_delta = process_end
+            .checked_sub(process_start)
+            .context("process CPU clock moved backwards")?;
+        assert!(
+            process_delta >= worker_cpu_ns.saturating_mul(3) / 4,
+            "process CPU delta {process_delta} did not include joined worker CPU {worker_cpu_ns}"
+        );
         Ok(())
     }
 
