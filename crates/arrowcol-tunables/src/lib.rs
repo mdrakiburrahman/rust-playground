@@ -491,3 +491,22 @@ pub enum MaintenanceOperation {
     Checkpoint,
     PruneLog,
 }
+
+// PERF69-TUNABLES-BEGIN oat-evidence
+// PERF69-TUNABLES-END oat-evidence
+// PERF69-TUNABLES-BEGIN oat-campaign
+// PERF69-TUNABLES-END oat-campaign
+// PERF69-TUNABLES-BEGIN aks-custody
+// PERF69-TUNABLES-END aks-custody
+// PERF69-TUNABLES-BEGIN file-formation
+// PERF69-TUNABLES-END file-formation
+// PERF69-TUNABLES-BEGIN commit-pipeline
+// PERF69-TUNABLES-END commit-pipeline
+// PERF69-TUNABLES-BEGIN maintenance
+// PERF69-TUNABLES-END maintenance
+// PERF69-TUNABLES-BEGIN loadgen
+// PERF69-TUNABLES-END loadgen
+// PERF69-TUNABLES-BEGIN telemetry
+// PERF69-TUNABLES-END telemetry
+// PERF69-TUNABLES-BEGIN grafana
+// PERF69-TUNABLES-END grafana

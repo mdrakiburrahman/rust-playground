@@ -22,6 +22,26 @@ static PROCESS_INSTANCE_ID: LazyLock<CollectorInstanceId> = LazyLock::new(Collec
 static GLOBAL_METRICS: LazyLock<Arc<RuntimeMetrics>> =
     LazyLock::new(|| Arc::new(RuntimeMetrics::new(*PROCESS_INSTANCE_ID)));
 const MAX_TABLE_PRESSURE_ENTRIES: usize = 256;
+/// A fixed ArrowCol pipeline stage used by the throughput campaign.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PipelineStage {
+    Collect,
+    Build,
+    Sort,
+    Encode,
+    Upload,
+    Commit,
+}
+
+/// Temporary stage-recorder stub; L4 supplies the OTel handles.
+#[derive(Clone, Debug, Default)]
+pub struct StageMetrics;
+
+impl StageMetrics {
+    /// Records a duration for one fixed pipeline stage.
+    pub fn record(&self, _stage: PipelineStage, _duration: Duration) {}
+}
+
 /// Durable-backlog utilization at which `quiver_state` reports `degraded`.
 const QUIVER_DEGRADED_BPS: u16 = 8_000;
 

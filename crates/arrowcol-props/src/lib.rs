@@ -382,6 +382,25 @@ pub static REGISTRY: &[PropKey] = &[
         Validator::Positive,
         "Upper compression-ratio clamp."
     ),
+
+    // PERF69-PROPS-BEGIN oat-evidence
+    // PERF69-PROPS-END oat-evidence
+    // PERF69-PROPS-BEGIN oat-campaign
+    // PERF69-PROPS-END oat-campaign
+    // PERF69-PROPS-BEGIN aks-custody
+    // PERF69-PROPS-END aks-custody
+    // PERF69-PROPS-BEGIN file-formation
+    // PERF69-PROPS-END file-formation
+    // PERF69-PROPS-BEGIN commit-pipeline
+    // PERF69-PROPS-END commit-pipeline
+    // PERF69-PROPS-BEGIN maintenance
+    // PERF69-PROPS-END maintenance
+    // PERF69-PROPS-BEGIN loadgen
+    // PERF69-PROPS-END loadgen
+    // PERF69-PROPS-BEGIN telemetry
+    // PERF69-PROPS-END telemetry
+    // PERF69-PROPS-BEGIN grafana
+    // PERF69-PROPS-END grafana
 ];
 
 /// A parsed value; sizes are bytes and durations are milliseconds.
