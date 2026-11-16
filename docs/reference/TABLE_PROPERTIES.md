@@ -57,6 +57,8 @@ Table TBLPROPERTIES override process defaults, which override the defaults below
 | `arrowcol.collector.upload.mode` | Enum | `put_create` | `OneOf(["put_create", "buffered_multipart"])` | Process | 0.1 | Upload strategy; buffered multipart is opt-in and relies on UUID object names rather than conditional create. |
 | `arrowcol.collector.upload.bufferCapacityBytes` | Bytes | `8 MiB` | `Range(1048576.0, 67108864.0)` | Process | 0.1 | Per-upload multipart part buffer, active only with buffered_multipart mode. |
 | `arrowcol.collector.upload.requestConcurrency` | Integer | `2` | `Range(1.0, 16.0)` | Process | 0.1 | In-flight multipart part requests per upload, active only with buffered_multipart mode. |
+| `arrowcol.maintenance.optimizeUploadMode` | Enum | `put_create` | `OneOf(["put_create", "buffered_multipart"])` | Table | 0.1 | OPTIMIZE upload mode; buffered multipart is unqualified and not for scored cells. |
+| `arrowcol.maintenance.optimizeUploadBufferBytes` | Integer | `8388608` | `Range(4194304.0, 67108864.0)` | Table | 0.1 | Buffered multipart upload buffer bytes; effective only in buffered_multipart mode. |
 | `arrowcol.client.corpusRows` | Integer | `0` | `Any` | Process | 0.1 | Prepared synthetic corpus row target; zero preserves the legacy rows-derived default and cannot be combined with corpusBytes. |
 | `arrowcol.client.corpusBytes` | Bytes | `0` | `Any` | Process | 0.1 | Prepared synthetic corpus byte target; zero uses row-based sizing and cannot be combined with corpusRows. |
 | `arrowcol.client.batchRows` | Integer | `0` | `Range(0.0, 2147483647.0)` | Process | 0.1 | Rows encoded per prepared batch; zero inherits the legacy rows option. |
