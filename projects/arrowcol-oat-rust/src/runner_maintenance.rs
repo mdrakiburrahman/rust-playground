@@ -37,7 +37,6 @@ fn maintenance_runtime(config: &OatConfig) -> Result<Option<Value>> {
         "operations": operations,
         "apply": settings.apply.unwrap_or(false),
         "granularity": settings.granularity.unwrap_or(arrowcol_tunables::MaintenanceGranularity::Hour),
-        "stopGraceSeconds": config.maintenance_stop_budget()?.0,
     })))
 }
 
@@ -701,6 +700,63 @@ fn maintenance_due_work(value: &Value) -> Result<Option<MaintenanceDueWorkEviden
     Ok(Some(evidence))
 }
 
+fn verify_effective_maintenance_stop_budget(config: &OatConfig, table_policy: &Value) -> Result<()> {
+    let settings = config.tunables.maintenance.as_ref().context("maintenance settings missing")?;
+    let operation_count = u64::try_from(settings.operations.as_ref().context("maintenance operations missing")?.len())?;
+    if operation_count == 0 {
+        bail!("maintenance stop budget requires at least one enabled operation");
+    }
+    let operation_timeout_ms = table_policy
+        .get("arrowcol.maintenance.operationTimeout")
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0)
+        .context("effective per-table maintenance operationTimeout is missing or invalid")?;
+    let required_grace_ms = operation_timeout_ms
+        .checked_mul(operation_count)
+        .and_then(|value| value.checked_add(300_000))
+        .context("effective per-table maintenance grace calculation overflow")?;
+    let required_stop_timeout_ms = required_grace_ms
+        .checked_add(300_000)
+        .context("effective per-table maintenance stop timeout calculation overflow")?;
+    let budget = config.maintenance_stop_budget()?.validate()?;
+    if required_grace_ms > budget.maintenance_grace_seconds.saturating_mul(1_000)
+        || required_stop_timeout_ms > budget.maintenance_stop_timeout_ms
+    {
+        bail!("effective per-table maintenance operationTimeout exceeds the persisted stop budget");
+    }
+    Ok(())
+}
+
+async fn verify_maintenance_stop_budget_before_admission(config: &OatConfig, platform: &dyn Platform) -> Result<()> {
+    if !maintenance_enabled(config) {
+        return Ok(());
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let logs = platform.process_logs_for_role(config, ComponentRole::Maintenance).await?;
+        let [log] = logs.as_slice() else {
+            bail!("maintenance stop-budget readback requires exactly one maintenance process");
+        };
+        if !log.complete {
+            bail!("maintenance stop-budget readback log is incomplete");
+        }
+        let policy_count = log
+            .text
+            .lines()
+            .filter(|line| line.starts_with("arrowcol_maintenance_table_config "))
+            .count();
+        if policy_count >= config.tables.len() {
+            let evidence = maintenance_table_evidence(config, &log.text)?;
+            local_progress(config, &format!("pre-admission maintenance stop-budget readback: {}", evidence["tables"]));
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!("maintenance omitted effective per-table operationTimeout before load admission");
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
 fn maintenance_table_evidence(config: &OatConfig, text: &str) -> Result<Value> {
     let mut tables = serde_json::Map::new();
     for line in text
@@ -727,6 +783,7 @@ fn maintenance_table_evidence(config: &OatConfig, text: &str) -> Result<Value> {
             bail!("maintenance table readback omitted resolved table policy");
         }
         verify_maintenance_controls(config, &policy)?;
+        verify_effective_maintenance_stop_budget(config, &policy["table_policy"])?;
         if let Some(previous) = tables.insert(table.to_owned(), policy.clone())
             && previous != policy
         {

@@ -1,4 +1,4 @@
-use crate::config::OatConfig;
+use crate::config::{EffectiveStopBudgets, OatConfig};
 use crate::model::{AppState, RunState, unix_time_ms};
 use anyhow::{Context, Result, bail};
 use arrow::array::{
@@ -94,6 +94,10 @@ pub struct RunInventory {
     pub qap: Option<InventoryQap>,
     #[serde(default)]
     pub evidence_destination: Option<InventoryEvidenceDestination>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_stop_budgets: Option<EffectiveStopBudgets>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planned_cell_duration_ms: Option<u64>,
     pub cleanup: InventoryCleanup,
 }
 
@@ -330,6 +334,19 @@ impl RunInventory {
     pub fn validate(&self) -> Result<()> {
         if self.schema_version != 1 || self.fencing_token == 0 {
             bail!("invalid custody inventory version or fencing token");
+        }
+        if let Some(budgets) = self.effective_stop_budgets {
+            budgets.validate()?;
+        }
+        if let Some(duration_ms) = self.planned_cell_duration_ms {
+            let no_row_rehearsal = duration_ms == 0
+                && self.load_admission == InventoryLoadAdmission::NotAuthorized
+                && self.resources.is_empty()
+                && self.fic.is_none()
+                && self.qap.is_none();
+            if duration_ms > 9_007_199_254_740_991 || (duration_ms == 0 && !no_row_rehearsal) {
+                bail!("planned_cell_duration_ms must be a positive JSON-safe integer except for not-authorized no-row rehearsal inventories");
+            }
         }
         for value in [
             &self.campaign_id,
@@ -667,6 +684,8 @@ impl RunInventory {
             || self.orchestration_run_id != next.orchestration_run_id
             || self.cell_run_id != next.cell_run_id
             || !self.load_admission.can_advance_to(next.load_admission)
+            || self.effective_stop_budgets != next.effective_stop_budgets
+            || self.planned_cell_duration_ms != next.planned_cell_duration_ms
             || self.namespace.name != next.namespace.name
             || self.namespace.owner_token != next.namespace.owner_token
             || self
@@ -1210,7 +1229,8 @@ impl Platform for AksPlatform {
             now_unix_ms,
         )
         .await?;
-        start_aks_maintenance(config).await
+        start_aks_maintenance(config).await?;
+        verify_maintenance_stop_budget_before_admission(config, self).await
     }
 
     fn qap_observation_mode(&self) -> arrowcol_loadgen::ObservationMode {
@@ -1673,6 +1693,7 @@ impl Platform for LocalPlatform {
         _run_id: &str,
         tables: &[String],
     ) -> Result<()> {
+        verify_maintenance_stop_budget_before_admission(config, self).await?;
         verify_local_partition_policy_before_admission(config, self, tables).await
     }
 
@@ -2904,21 +2925,30 @@ async fn run_isolated_cell(
             );
         }
     };
+    let planned_cell_duration_ms = match config.timing_budget() {
+        Ok(budget) => budget.planned_cell_duration_ms,
+        Err(error) => {
+            return finish_matrix_cell(&config, orchestration_id, &run_id, replicas, concurrency, Err(error), Ok(()));
+        }
+    };
+    let lifecycle_deadline = tokio::time::Instant::now() + Duration::from_millis(planned_cell_duration_ms);
     let (result, cancelled) = tokio::select! {
         result = async {
-            match platform.ensure_stack(&config, orchestration_id).await {
-                Ok(()) => {
-                    run_matrix_cell(
-                        &config,
-                        orchestration_id,
-                        &run_id,
-                        replicas,
-                        concurrency,
-                        platform.as_mut(),
-                    )
-                    .await
-                }
-                Err(error) => Err(error).context("prepare isolated OAT matrix-cell platform"),
+            match tokio::time::timeout_at(lifecycle_deadline, async {
+                platform.ensure_stack(&config, orchestration_id).await
+                    .context("prepare isolated OAT matrix-cell platform")?;
+                run_matrix_cell(
+                    &config,
+                    orchestration_id,
+                    &run_id,
+                    replicas,
+                    concurrency,
+                    platform.as_mut(),
+                    lifecycle_deadline,
+                ).await
+            }).await {
+                Ok(result) => result,
+                Err(_) => Err(anyhow::anyhow!("planned cell lifecycle duration expired; normal platform cleanup follows")),
             }
         } => (result, false),
         _ = wait_for_cancellation(&mut cancellation) => (Err(anyhow::anyhow!("local OAT run cancelled")), true),
@@ -3430,6 +3460,17 @@ async fn settle_cell_commit_evidence(
     }
 }
 
+fn require_lifecycle_remaining(
+    deadline: tokio::time::Instant,
+    required: Duration,
+    next_stage: &str,
+) -> Result<()> {
+    if deadline.saturating_duration_since(tokio::time::Instant::now()) < required {
+        bail!("planned cell lifecycle deadline would expire before {next_stage}");
+    }
+    Ok(())
+}
+
 async fn run_matrix_cell(
     config: &OatConfig,
     orchestration_id: &str,
@@ -3437,8 +3478,28 @@ async fn run_matrix_cell(
     replicas: u32,
     concurrency: u32,
     platform: &mut dyn Platform,
+    lifecycle_deadline: tokio::time::Instant,
 ) -> Result<Vec<OatResult>> {
+    let timing_budget = config.timing_budget()?;
+    let rollout_ms = if config.platform.kind == crate::config::OatMode::Aks {
+        config.aks_rollout_timeout_seconds.checked_mul(1_000).context("AKS rollout deadline overflow")?
+    } else {
+        0
+    };
+    let stack_rollout_ms = rollout_ms;
+    let pre_scale_budget = timing_budget.planned_cell_duration_ms.saturating_sub(stack_rollout_ms);
+    require_lifecycle_remaining(lifecycle_deadline, Duration::from_millis(pre_scale_budget), "ArrowCol scale")?;
     platform.scale_arrowcols(config, replicas, concurrency).await?;
+    let maintenance_rollout_ms = if config.platform.kind == crate::config::OatMode::Aks && maintenance_enabled(config) {
+        rollout_ms
+    } else {
+        0
+    };
+    require_lifecycle_remaining(
+        lifecycle_deadline,
+        Duration::from_millis(timing_budget.minimum_pin_ttl_ms.saturating_add(maintenance_rollout_ms)),
+        "run table-pin and maintenance initialization",
+    )?;
     let assigned_tables = config.tables.clone();
     let expected_keys_json = expected_pin_keys_json(&assigned_tables)?;
     let pin_now_unix_ms = unix_time_ms_u64()?;
@@ -3454,6 +3515,9 @@ async fn run_matrix_cell(
             pin_now_unix_ms,
         )
         .await?;
+    let before_clients_ms = timing_budget.minimum_pin_ttl_ms
+        .saturating_sub(crate::config::PIN_INIT_SETUP_TIMEOUT_SECONDS.saturating_mul(1_000));
+    require_lifecycle_remaining(lifecycle_deadline, Duration::from_millis(before_clients_ms), "client admission")?;
     let cell_start_unix_ms = unix_time_ms_u64()?;
     let started_at_ms =
         i64::try_from(cell_start_unix_ms).context("run start timestamp exceeds Arrow timestamp range")?;
@@ -3467,6 +3531,12 @@ async fn run_matrix_cell(
             .as_ref()
             .is_some_and(|guard| guard["status"] == "unavailable");
     let capture = async {
+        let post_client_ms = config
+            .reconciliation_settle_timeout_seconds
+            .checked_add(config.qap_timeout_seconds)
+            .and_then(|seconds| seconds.checked_mul(1_000))
+            .context("post-client lifecycle deadline overflow")?;
+        require_lifecycle_remaining(lifecycle_deadline, Duration::from_millis(post_client_ms), "commit reconciliation")?;
         let (_collector_logs, durable_commits) = settle_cell_commit_evidence(
             config,
             platform,
@@ -3508,6 +3578,11 @@ async fn run_matrix_cell(
             if client_run.qap_tables.is_empty() {
                 return Err(anyhow::anyhow!(LocalDownstreamUnavailable));
             }
+            require_lifecycle_remaining(
+                lifecycle_deadline,
+                Duration::from_secs(config.qap_timeout_seconds),
+                "final QAP observation",
+            )?;
             let (metrics, observation) = observe_qap(
                 &platform.qap_endpoint(config),
                 &platform.qap_observation_mode(),
@@ -3594,6 +3669,8 @@ fn result_rows(
         "pinning_violation": client_run.pinning.violation.is_some(),
         "pinning_verification_error": client_run.pinning.verification_error.as_ref().map(|_| "ownership_verification_failed"),
         "delta_delivery": "not_established",
+        "effective_stop_budgets": config.maintenance_stop_budget()?,
+        "planned_cell_duration_ms": config.timing_budget()?.planned_cell_duration_ms,
         "requested_tunables": serde_json::from_str::<Value>(&config.tunables.canonical_json()?)?,
         "requested_durability_class": config.tunables.wal.as_ref().map(|_| config.tunables.durability_class()),
         "capabilities": capability_evidence(),
@@ -6576,8 +6653,10 @@ async fn stop_local_snapshot_writers(config: &OatConfig, platform: &LocalPlatfor
         }
         if !phase.is_empty() {
             let mut stop = Command::new("docker");
+            let stop_budgets = config.maintenance_stop_budget()?;
             stop.args(local_phase_stop_args(
                 phase_index,
+                stop_budgets.maintenance_grace_seconds,
                 config.collector_stop_grace_seconds,
                 phase,
             ));
@@ -6870,15 +6949,25 @@ fn build_shutdown_drain_evidence(containers: &[Value]) -> Value {
     })
 }
 
-fn local_phase_stop_args(phase: usize, collector_grace: u64, containers: Vec<String>) -> Vec<String> {
-    let grace = if phase == 2 { collector_grace } else { 300 };
+fn local_phase_stop_args(
+    phase: usize,
+    maintenance_grace: u64,
+    collector_grace: u64,
+    containers: Vec<String>,
+) -> Vec<String> {
+    let grace = match phase {
+        1 => maintenance_grace,
+        2 => collector_grace,
+        _ => 300,
+    };
     let mut args = vec!["stop".to_owned(), "--time".to_owned(), grace.to_string()];
     args.extend(containers);
     args
 }
 
-fn local_stop_deadline(collector_grace: u64) -> Duration {
-    Duration::from_secs(collector_grace + 3 * 300 + 120)
+fn local_stop_deadline(collector_grace: u64, maintenance_timeout_ms: u64) -> Duration {
+    Duration::from_millis(maintenance_timeout_ms)
+        + Duration::from_secs(collector_grace + 2 * 300 + 120)
 }
 
 async fn stop_then_destroy<T>(
@@ -6893,9 +6982,10 @@ async fn stop_then_destroy<T>(
 }
 
 async fn cleanup_local_platform(config: &OatConfig, platform: &LocalPlatform) -> Result<Value> {
+    let stop_budgets = config.maintenance_stop_budget()?;
     let stop = async {
         tokio::time::timeout(
-            local_stop_deadline(config.collector_stop_grace_seconds),
+            local_stop_deadline(config.collector_stop_grace_seconds, stop_budgets.maintenance_stop_timeout_ms),
             stop_local_snapshot_writers(config, platform),
         )
         .await
@@ -8346,6 +8436,9 @@ fn validate_campaign_inventory_load_admission(
         .as_ref()
         .is_some_and(|fic| fic.state == InventoryResourceState::Observed);
     if inventory.load_admission != expected_admission
+        || (expected_admission != InventoryLoadAdmission::NotAuthorized
+            && (inventory.planned_cell_duration_ms.is_none_or(|duration| duration == 0)
+                || inventory.effective_stop_budgets.is_none()))
         || inventory.namespace.uid.is_none()
         || !resources_are_observed
         || !fic_is_observed
@@ -8398,6 +8491,8 @@ fn initial_campaign_inventory(
     namespace: &str,
     account: &str,
     container: &str,
+    effective_stop_budgets: EffectiveStopBudgets,
+    planned_cell_duration_ms: u64,
 ) -> Result<RunInventory> {
     let step = || InventoryStep {
         state: InventoryStepState::NotStarted,
@@ -8425,6 +8520,8 @@ fn initial_campaign_inventory(
             container: container.to_owned(),
             blob_prefix: format!("campaigns/{}/cells/{}/evidence", identity.campaign_id, cell_run_id),
         }),
+        effective_stop_budgets: Some(effective_stop_budgets.validate()?),
+        planned_cell_duration_ms: Some(planned_cell_duration_ms),
         cleanup: InventoryCleanup {
             stop_admission: step(),
             bounded_drain: step(),
@@ -8456,6 +8553,8 @@ async fn initialize_campaign_inventory(
         &config.namespace,
         &account,
         &container,
+        config.maintenance_stop_budget()?,
+        config.timing_budget()?.planned_cell_duration_ms,
     )?;
     persist_campaign_inventory(platform, &inventory).await?;
     validate_campaign_baseline_capture_inventory(&inventory, &identity)?;
@@ -8545,6 +8644,7 @@ async fn prepare_aks_platform(
     runtime_config["namespace"] = json!(config.namespace);
     runtime_config["oatRunId"] = json!(platform.run_id);
     runtime_config["quiver"] = json!(config.tunables.wal.is_some());
+    runtime_config["effective_stop_budgets"] = serde_json::to_value(config.maintenance_stop_budget()?)?;
     runtime_config["resources"] = serde_json::to_value(config.effective_aks_resources())?;
     runtime_config["collectorWorkers"] = json!(
         config
@@ -13337,10 +13437,10 @@ mod tests {
     }
 
     #[test]
-    fn local_stop_arguments_preserve_noncollector_ceilings() {
-        for (phase, grace) in [(0, 300), (1, 300), (2, 3600), (3, 300)] {
+    fn local_stop_arguments_use_the_shared_maintenance_and_collector_graces() {
+        for (phase, grace) in [(0, 300), (1, 1200), (2, 3600), (3, 300)] {
             assert_eq!(
-                local_phase_stop_args(phase, 3600, vec!["owned-container".to_owned()]),
+                local_phase_stop_args(phase, 1200, 3600, vec!["owned-container".to_owned()]),
                 vec![
                     "stop".to_owned(),
                     "--time".to_owned(),
@@ -13352,10 +13452,10 @@ mod tests {
     }
 
     #[test]
-    fn local_stop_deadline_covers_maximum_collector_grace_and_all_other_phases() {
-        let deadline = local_stop_deadline(3600);
+    fn local_stop_deadline_covers_derived_maintenance_budget_and_other_phases() {
+        let deadline = local_stop_deadline(3600, 900_000);
+        assert_eq!(deadline, Duration::from_millis(900_000) + Duration::from_secs(3600 + 2 * 300 + 120));
         assert!(deadline > Duration::from_secs(3600 + 3 * 300));
-        assert!(deadline > Duration::from_secs(1440));
     }
 
     #[test]
