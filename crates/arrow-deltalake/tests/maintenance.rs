@@ -9,8 +9,9 @@ use arrow_deltalake::delta::{
 };
 use arrow_deltalake::layout::LayoutPolicy;
 use arrow_deltalake::maintenance::{
-    DISPOSABLE_TEST_MARKER, Granularity, LogFloor, MaintenanceControl, MaintenanceErrorKind, MaintenancePlan,
-    OptimizeConfig, Outcome, PruneConfig, PurgeConfig, VacuumConfig, error_kind, now_ms,
+    CompactionDebtSource, DISPOSABLE_TEST_MARKER, Granularity, LogFloor, MaintenanceControl, MaintenanceErrorKind,
+    MaintenancePlan, NegativeProbeConfig, OptimizeConfig, Outcome, ProbeOperation, PruneConfig, PurgeConfig,
+    VacuumConfig, error_kind, now_ms,
 };
 use async_trait::async_trait;
 use delta_kernel::object_store::{
@@ -109,6 +110,54 @@ fn optimize_config() -> OptimizeConfig {
         now_ms: Some(BASE + 60 * MINUTE),
         ..OptimizeConfig::default()
     }
+}
+
+#[test]
+fn compaction_debt_evidence_distinguishes_zero_from_bounded_backlog() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let table = create(root.path())?;
+    append(&table, 0, 0..3)?;
+    let maintenance = DeltaTable::open_for_maintenance(&url_of(root.path())?)?;
+    let anchor = BASE + 60 * MINUTE;
+    let probe = NegativeProbeConfig {
+        now_ms: anchor,
+        granularity: Granularity::Minute,
+        purge_retention_ms: 2_592_000_000,
+        vacuum_retention_ms: 604_800_000,
+        log_retention_ms: 2_592_000_000,
+        checkpoint_interval: 100,
+        optimize_small_file_bytes: 64 * 1024 * 1024,
+        optimize_min_files: 2,
+        sealed_partitions_only: true,
+        max_listed_files: 1000,
+    };
+    let zero = maintenance
+        .probe_no_work(ProbeOperation::Optimize, &probe, &control())?
+        .context("complete bounded inventory proves no eligible compaction")?;
+    let zero_debt = zero.compaction_debt.context("available zero-debt evidence")?;
+    assert_eq!(zero_debt.source, CompactionDebtSource::BoundedPhysicalInventory);
+    assert_eq!(zero_debt.observed_at_ms, anchor);
+    assert_eq!((zero_debt.eligible_files, zero_debt.eligible_bytes), (0, 0));
+
+    for batch in 1..4 {
+        append(&table, 0, batch * 10..batch * 10 + 3)?;
+    }
+    let config = OptimizeConfig {
+        max_files_per_bin: 2,
+        max_bins_per_commit: 1,
+        now_ms: Some(anchor),
+        ..optimize_config()
+    };
+    let plan = maintenance.plan_optimize(&config)?;
+    assert_eq!(plan.bins.len(), 1);
+    assert_eq!(plan.compaction_debt.source, CompactionDebtSource::SnapshotActiveFiles);
+    assert_eq!(plan.compaction_debt.observed_at_ms, anchor);
+    assert_eq!(plan.compaction_debt.eligible_files, 4);
+    assert!(plan.compaction_debt.eligible_bytes > 0);
+    assert_eq!(plan.compaction_debt.backlog_files, 2);
+    assert!(plan.compaction_debt.backlog_bytes > 0);
+    assert_eq!(plan.compaction_debt.oldest_eligible_partition_start_ms, Some(BASE));
+    Ok(())
 }
 
 fn purge_config() -> PurgeConfig {

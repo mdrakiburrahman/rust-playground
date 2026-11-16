@@ -920,6 +920,15 @@ impl DeltaTable {
             operation: operation.label().into(),
             read_version: version,
             version,
+            compaction_debt: (operation == ProbeOperation::Optimize).then_some(CompactionDebtEvidence {
+                observed_at_ms: config.now_ms,
+                source: CompactionDebtSource::BoundedPhysicalInventory,
+                eligible_files: 0,
+                eligible_bytes: 0,
+                backlog_files: 0,
+                backlog_bytes: 0,
+                oldest_eligible_partition_start_ms: None,
+            }),
             ..MaintenanceReport::default()
         }))
     }
@@ -1218,6 +1227,32 @@ impl Outcome {
     }
 }
 
+/// Source of pass-scoped compaction-debt evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionDebtSource {
+    /// Derived from the complete, bounded active-file snapshot used by OPTIMIZE.
+    SnapshotActiveFiles,
+    /// A complete bounded physical listing proved no eligible work exists.
+    BoundedPhysicalInventory,
+}
+
+/// Current eligible OPTIMIZE work, or an observed zero only when this value exists.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactionDebtEvidence {
+    /// The maintenance pass anchor, in UTC milliseconds since the Unix epoch.
+    pub observed_at_ms: i64,
+    pub source: CompactionDebtSource,
+    /// Inputs in actionable bins before per-commit and plan-size bounds.
+    pub eligible_files: u64,
+    pub eligible_bytes: u64,
+    /// Eligible inputs omitted from the bounded plan.
+    pub backlog_files: u64,
+    pub backlog_bytes: u64,
+    /// Oldest eligible ingestion-partition start; unavailable for other layouts.
+    pub oldest_eligible_partition_start_ms: Option<i64>,
+}
+
 /// Counters for plan/apply, including partial progress.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MaintenanceReport {
@@ -1243,6 +1278,8 @@ pub struct MaintenanceReport {
     pub skipped_partitions: u64,
     /// OPTIMIZE bins whose actual rewrite would not reduce the file count.
     pub nonbeneficial_bins: u64,
+    /// `null` means no complete compaction-debt inventory was available.
+    pub compaction_debt: Option<CompactionDebtEvidence>,
     pub interrupted: bool,
     pub outputs: Vec<String>,
 }
@@ -1711,6 +1748,8 @@ pub struct OptimizeConfig {
     /// Only files strictly smaller than this are eligible and read (bounded input buffer).
     pub small_file_bytes: u64,
     pub max_files_per_bin: usize,
+    /// Minimum input files for a bin to be eligible for compaction.
+    pub min_files_per_bin: usize,
     pub max_bins_per_commit: usize,
     /// Removes plus estimated adds per commit.
     pub max_actions_per_commit: usize,
@@ -1750,6 +1789,7 @@ impl Default for OptimizeConfig {
             target_file_bytes: 128 * 1024 * 1024,
             small_file_bytes: 64 * 1024 * 1024,
             max_files_per_bin: 64,
+            min_files_per_bin: 2,
             max_bins_per_commit: 16,
             max_actions_per_commit: 2048,
             max_plan_bytes: 1024 * 1024,
@@ -1787,8 +1827,12 @@ impl OptimizeConfig {
         if self.small_file_bytes == 0 || self.small_file_bytes > self.target_file_bytes {
             return invalid("small-file threshold must be positive and at most the target");
         }
-        if self.max_files_per_bin < 2 || self.max_bins_per_commit == 0 || self.max_actions_per_commit < 3 {
-            return invalid("bins need at least two files and commits at least three actions");
+        if self.max_files_per_bin < 2
+            || self.min_files_per_bin < 2
+            || self.max_bins_per_commit == 0
+            || self.max_actions_per_commit < 3
+        {
+            return invalid("bins need at least two files and the minimum must be at least two");
         }
         if self.max_plan_bytes < 1024 || self.max_decoded_bytes_per_bin == 0 || self.max_row_group_bytes == 0 {
             return invalid("plan and decode bounds must be positive");
@@ -1819,6 +1863,7 @@ pub struct OptimizePlan {
     pub header: PlanHeader,
     pub target_file_bytes: u64,
     pub bins: Vec<OptimizeBin>,
+    pub compaction_debt: CompactionDebtEvidence,
     pub backlog_files: u64,
     pub protected_partitions: u64,
     pub skipped_partitions: u64,
@@ -1835,6 +1880,7 @@ impl OptimizePlan {
         let mut report = MaintenanceReport::new("optimize", &self.header);
         report.outcome = outcome;
         report.backlog_files = self.backlog_files;
+        report.compaction_debt = Some(self.compaction_debt.clone());
         report.skipped_partitions = self.skipped_partitions;
         report.files_removed = self.bins.iter().map(|bin| bin.files.len() as u64).sum();
         report.bytes_removed = self.bins.iter().flat_map(|bin| &bin.files).map(|file| file.size).sum();
@@ -1881,6 +1927,13 @@ impl DeltaTable {
     /// Returns the same validation and resource errors as `plan_optimize`.
     pub fn prepare_optimize(&self, config: &OptimizeConfig) -> Result<PreparedOptimize> {
         config.validate()?;
+        let observed_at_ms = match config.now_ms {
+            Some(anchor) => {
+                validate_anchor("optimize", anchor)?;
+                anchor
+            }
+            None => now_ms()?,
+        };
         let state = self.active_state(config.max_active_files)?;
         state.fingerprint.validate_supported(false)?;
         let columns = state.fingerprint.partition_columns.clone();
@@ -1907,10 +1960,7 @@ impl DeltaTable {
         let mut protected = 0_u64;
         let mut ordered: Vec<(Vec<Option<String>>, Vec<&DataFile>)> = Vec::new();
         if let (true, Some(granularity)) = (ingestion, granularity) {
-            let now = match config.now_ms {
-                Some(now) => now,
-                None => now_ms()?,
-            };
+            let now = observed_at_ms;
             let mut valid = Vec::new();
             for (key, files) in groups {
                 match key
@@ -1939,6 +1989,9 @@ impl DeltaTable {
         }
         let mut bins = Vec::new();
         let mut backlog = 0_u64;
+        let mut eligible_files = 0_u64;
+        let mut eligible_bytes = 0_u64;
+        let mut oldest_eligible_partition_start_ms = None;
         let mut actions = 0_usize;
         for (key, mut files) in ordered {
             files.retain(|file| file.size < config.small_file_bytes);
@@ -1960,8 +2013,25 @@ impl DeltaTable {
             }
             candidates.push((current, bytes));
             for (files, bytes) in candidates {
-                if files.len() < 2 {
+                if files.len() < config.min_files_per_bin {
                     continue;
+                }
+                eligible_files = eligible_files
+                    .checked_add(files.len() as u64)
+                    .ok_or_else(|| fail(MaintenanceErrorKind::ResourceLimit, "eligible file count overflow"))?;
+                eligible_bytes = eligible_bytes
+                    .checked_add(bytes)
+                    .ok_or_else(|| fail(MaintenanceErrorKind::ResourceLimit, "eligible byte count overflow"))?;
+                if ingestion {
+                    let value = values
+                        .get(INGESTION_PARTITION)
+                        .and_then(Option::as_deref)
+                        .context("eligible ingestion partition has no value")?;
+                    let start = granularity
+                        .context("eligible ingestion partition has no granularity")?
+                        .parse_partition(value)?;
+                    oldest_eligible_partition_start_ms =
+                        Some(oldest_eligible_partition_start_ms.map_or(start, |oldest: i64| oldest.min(start)));
                 }
                 let cost = files
                     .len()
@@ -1983,6 +2053,15 @@ impl DeltaTable {
             header: PlanHeader::new(self, &state)?,
             target_file_bytes: config.target_file_bytes,
             bins,
+            compaction_debt: CompactionDebtEvidence {
+                observed_at_ms,
+                source: CompactionDebtSource::SnapshotActiveFiles,
+                eligible_files,
+                eligible_bytes,
+                backlog_files: 0,
+                backlog_bytes: 0,
+                oldest_eligible_partition_start_ms,
+            },
             backlog_files: backlog,
             protected_partitions: protected,
             skipped_partitions: skipped,
@@ -1996,6 +2075,15 @@ impl DeltaTable {
             };
             plan.backlog_files += bin.files.len() as u64;
         }
+        let planned_files: u64 = plan.bins.iter().map(|bin| bin.files.len() as u64).sum();
+        let planned_bytes: u64 = plan.bins.iter().flat_map(|bin| &bin.files).map(|file| file.size).sum();
+        plan.backlog_files = eligible_files
+            .checked_sub(planned_files)
+            .context("planned files exceed eligible compaction debt")?;
+        plan.compaction_debt.backlog_files = plan.backlog_files;
+        plan.compaction_debt.backlog_bytes = eligible_bytes
+            .checked_sub(planned_bytes)
+            .context("planned bytes exceed eligible compaction debt")?;
         Ok(PreparedOptimize { plan, state })
     }
 
@@ -2011,7 +2099,7 @@ impl DeltaTable {
         let mut paths = BTreeSet::new();
         let mut actions = 0_usize;
         for bin in &plan.bins {
-            if bin.files.len() < 2 || bin.files.len() > config.max_files_per_bin {
+            if bin.files.len() < config.min_files_per_bin || bin.files.len() > config.max_files_per_bin {
                 return invalid("plan bin violates file-count bounds");
             }
             let bytes: u64 = bin.files.iter().map(|file| file.size).sum();

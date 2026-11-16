@@ -957,6 +957,7 @@ impl OptimizeEvidence {
                 "target_file_bytes": config.target_file_bytes,
                 "small_file_bytes": config.small_file_bytes,
                 "max_files_per_bin": config.max_files_per_bin,
+                "min_files_per_bin": config.min_files_per_bin,
                 "max_bins_per_commit": config.max_bins_per_commit,
                 "max_actions_per_commit": config.max_actions_per_commit,
                 "max_plan_bytes": config.max_plan_bytes,
@@ -1280,11 +1281,10 @@ fn run_operation(
             let config = OptimizeConfig {
                 granularity: settings.granularity,
                 now_ms: Some(anchor),
+                min_files_per_bin: usize::try_from(props.unsigned("arrowcol.optimize.minFiles")?)?,
                 ..settings.optimize.clone()
             };
-            let mut prepared = table.prepare_optimize(&config)?;
-            let minimum = usize::try_from(props.unsigned("arrowcol.optimize.minFiles")?)?;
-            prepared.plan.bins.retain(|bin| bin.files.len() >= minimum);
+            let prepared = table.prepare_optimize(&config)?;
             *optimize = Some(OptimizeEvidence::new(&config, prepared.plan.clone()));
             if settings.apply && (!prepared.plan.bins.is_empty() || config.sealed_final) {
                 let upload_buffer_bytes =
