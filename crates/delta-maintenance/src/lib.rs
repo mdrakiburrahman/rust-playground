@@ -1317,10 +1317,13 @@ fn run_operation(
                 max_active_files: settings.operation_limits.operation_max_active_files,
                 ..PurgeConfig::new(retention, anchor, granularity)
             };
-            let prepared = table.prepare_purge(&config)?;
             if settings.apply {
-                return table.apply_prepared_purge(&prepared, &config, control);
+                return retry_stale_purge(settings.commit_attempts, settings.commit_budget, control, || {
+                    let prepared = table.prepare_purge(&config)?;
+                    table.apply_prepared_purge(&prepared, &config, control)
+                });
             }
+            let prepared = table.prepare_purge(&config)?;
             MaintenancePlan::Purge(prepared.plan)
         }
         Operation::Vacuum => {
@@ -1355,6 +1358,137 @@ fn negative_probe_result<T>(result: Result<Option<T>>) -> Result<(Option<T>, boo
 
 fn is_stale_plan(error: &anyhow::Error) -> bool {
     error_details(error).is_some_and(|details| details.kind == MaintenanceErrorKind::StalePlan)
+}
+
+fn retry_stale_purge(
+    max_attempts: u32,
+    budget: Duration,
+    control: &MaintenanceControl,
+    mut apply: impl FnMut() -> Result<MaintenanceReport>,
+) -> Result<MaintenanceReport> {
+    let started = Instant::now();
+    let max_attempts = max_attempts.max(1);
+    let mut retries = 0;
+    loop {
+        control.check()?;
+        match apply() {
+            Ok(mut report) => {
+                report.attempts = report.attempts.saturating_add(retries);
+                report.retries = report.retries.saturating_add(retries);
+                return Ok(report);
+            }
+            Err(error) if is_purge_membership_stale(&error) => {
+                let backoff = Duration::from_millis(5_u64 << retries.min(5));
+                if retries + 1 >= max_attempts || started.elapsed().saturating_add(backoff) >= budget {
+                    return Err(with_purge_retry_counts(error, retries + 1));
+                }
+                retries += 1;
+                std::thread::sleep(backoff);
+            }
+            Err(error) => return Err(with_purge_retry_counts(error, retries)),
+        }
+    }
+}
+
+fn is_purge_membership_stale(error: &anyhow::Error) -> bool {
+    error_details(error).is_some_and(|details| {
+        details.kind == MaintenanceErrorKind::StalePlan
+            && matches!(
+                details.message.as_str(),
+                "planned partition is now the newest partition" | "expired partitions changed since planning; replan"
+            )
+    })
+}
+
+fn with_purge_retry_counts(error: anyhow::Error, retries: u32) -> anyhow::Error {
+    if retries == 0 {
+        return error;
+    }
+    let Some(details) = error_details(&error) else {
+        return error.context(format!(
+            "PURGE replanned {retries} time(s) after partition membership changed"
+        ));
+    };
+    let mut report = details
+        .report
+        .as_deref()
+        .map_or_else(MaintenanceReport::default, |report| report.clone());
+    report.operation = "purge".to_owned();
+    report.attempts = report.attempts.saturating_add(retries);
+    report.retries = report.retries.saturating_add(retries);
+    anyhow::Error::new(MaintenanceError {
+        kind: details.kind,
+        message: details.message.clone(),
+        report: Some(Box::new(report)),
+    })
+}
+
+#[cfg(test)]
+mod purge_replan_tests {
+    use super::*;
+
+    fn membership_stale() -> anyhow::Error {
+        anyhow::Error::new(MaintenanceError {
+            kind: MaintenanceErrorKind::StalePlan,
+            message: "expired partitions changed since planning; replan".to_owned(),
+            report: None,
+        })
+    }
+
+    #[test]
+    fn purge_replans_changed_membership_and_reports_attempts() {
+        let calls = std::cell::Cell::new(0);
+        let report = retry_stale_purge(4, Duration::from_secs(1), &MaintenanceControl::default(), || {
+            let call = calls.get() + 1;
+            calls.set(call);
+            if call < 3 {
+                return Err(membership_stale());
+            }
+            Ok(MaintenanceReport {
+                attempts: 1,
+                ..MaintenanceReport::default()
+            })
+        })
+        .expect("the fresh plan should apply");
+
+        assert_eq!(calls.get(), 3);
+        assert_eq!(report.attempts, 3);
+        assert_eq!(report.retries, 2);
+    }
+
+    #[test]
+    fn purge_replanning_is_bounded_by_attempts() {
+        let calls = std::cell::Cell::new(0);
+        let error = retry_stale_purge(2, Duration::from_secs(1), &MaintenanceControl::default(), || {
+            calls.set(calls.get() + 1);
+            Err(membership_stale())
+        })
+        .expect_err("persistent membership churn must exhaust its retry budget");
+
+        assert_eq!(calls.get(), 2);
+        let details = error_details(&error).expect("classified maintenance error");
+        assert_eq!(details.kind, MaintenanceErrorKind::StalePlan);
+        let report = details.report.as_deref().expect("retry counters");
+        assert_eq!(report.attempts, 2);
+        assert_eq!(report.retries, 2);
+    }
+
+    #[test]
+    fn purge_does_not_replan_for_other_stale_reasons() {
+        let calls = std::cell::Cell::new(0);
+        let error = retry_stale_purge(4, Duration::from_secs(1), &MaintenanceControl::default(), || {
+            calls.set(calls.get() + 1);
+            Err(anyhow::Error::new(MaintenanceError {
+                kind: MaintenanceErrorKind::StalePlan,
+                message: "plan cutoff is later than the apply configuration allows".to_owned(),
+                report: None,
+            }))
+        })
+        .expect_err("retention changes must remain a hard stale-plan failure");
+
+        assert_eq!(calls.get(), 1);
+        assert!(is_stale_plan(&error));
+    }
 }
 
 fn retry_stale_table_discovery<T>(table: &str, mut discover: impl FnMut() -> Result<T>) -> Result<T> {
