@@ -123,6 +123,13 @@ cargo run --locked --package arrowcol-oat-rust -- --validate-config <config.json
 | Local worker count | Both profiles are rendered into run-owned configuration without resource-policy overrides that could shadow `--num-cores`; source profiles are not edited. |
 | Client automatic values | Explicit zero workers/runtime threads require the consumer's matching available-parallelism observation. Zero batch/corpus rows and streams use verified legacy rows/concurrency; byte-target corpus sizing remains deferred until preparation. Arbitrary positive values are not accepted as automatic-resolution proof. |
 
+## Campaign verdict policy
+
+| Config field | Behavior |
+| --- | --- |
+| Omitted or `dataflow_verdict_policy: "legacy"` | Preserves the existing quick/legacy QAP verdict, including its 100% acceleration, zero-pending, and healthy-catalog gates. |
+| `dataflow_verdict_policy: "single_hot_table_campaign"` | Keeps ingest validity separate from downstream state. Observed QAP lag is a `FINDING`, not an ingest failure; incomplete/timeout/missing QAP evidence is UNKNOWN and cannot PASS. Missing commit telemetry, zero committed output, and unbalanced matrices also cannot PASS. |
+
 ## Result evidence (schema v3)
 
 | Evidence | Attribution and limitations |

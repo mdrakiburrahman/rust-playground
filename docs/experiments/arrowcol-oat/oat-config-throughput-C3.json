@@ -1,0 +1,378 @@
+{
+  "schema_version": 1,
+  "cohort": "C3",
+  "mode": "local",
+  "base_config": "oat-config.tuned.json",
+  "registry_source": "PR125 arrowcol-tunables profile",
+  "registry_status": "pending-E1-registry",
+  "registry_sha256": "79cf2880012dfbd6a064d848a217083afef77c9168b3fc72e7c4e0f527ff8af9",
+  "box_scope": "one box for every comparison in this cohort",
+  "campaign": "single_hot_table_campaign",
+  "campaign_profile": "single_hot_table",
+  "invariants": {
+    "table": "sqlserver_availability_replica_states",
+    "replicas": [
+      1
+    ],
+    "wal_enabled": false,
+    "maintenance": {
+      "enabled": true,
+      "apply": true,
+      "operations": [
+        "optimize",
+        "purge",
+        "vacuum",
+        "checkpoint",
+        "prune_log"
+      ],
+      "continuous": true
+    },
+    "compare_within_box": true,
+    "one_variable_at_a_time": true
+  },
+  "baseline_tunables": {
+    "client": {
+      "corpus_rows": 65536,
+      "batch_rows": 4096,
+      "workers": 2,
+      "string_width": 32,
+      "cardinality": 1024,
+      "null_fraction": 0.05,
+      "max_memory_bytes": 536870912,
+      "connections_per_worker": 1,
+      "streams_per_worker": 2
+    },
+    "router": {
+      "sql_pool_max_size": 64,
+      "sql_pool_acquire_timeout_ms": 10000
+    },
+    "transport": {
+      "ipc_compression": "zstd",
+      "grpc_send_compression": "none",
+      "max_flight_data_bytes": 2097152,
+      "max_message_bytes": 16777216
+    },
+    "collector": {
+      "cpu_pressure": "process",
+      "batching": {
+        "coalesce_publications": true,
+        "max_age": "1s",
+        "max_concurrent_flushes": 2
+      },
+      "runtime": {
+        "workers": 4,
+        "blocking_workers": 64,
+        "upload_limit": 8,
+        "task_limit": 128,
+        "read_ahead": 8,
+        "batch_rows": 16384,
+        "cpu_workers": 4
+      }
+    },
+    "parquet_writer": {
+      "defaults": {
+        "compression": "zstd",
+        "compression_level": 3
+      },
+      "max_row_group_rows": 16384
+    },
+    "maintenance": {
+      "enabled": true,
+      "operations": [
+        "optimize",
+        "purge",
+        "vacuum",
+        "checkpoint",
+        "prune_log"
+      ],
+      "apply": true,
+      "interval_secs": 60,
+      "target_file_mib": 128
+    }
+  },
+  "comparisons": [
+    {
+      "id": "row-groups",
+      "factor": "parquet_writer.max_row_group_rows",
+      "candidates": [
+        {
+          "id": "row-group-16384",
+          "overrides": {
+            "tunables": {
+              "parquet_writer": {
+                "max_row_group_rows": 16384
+              },
+              "collector": {
+                "layout": {
+                  "enabled": true,
+                  "row_group_rows": 16384
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "row-group-65536",
+          "overrides": {
+            "tunables": {
+              "parquet_writer": {
+                "max_row_group_rows": 65536
+              },
+              "collector": {
+                "layout": {
+                  "enabled": true,
+                  "row_group_rows": 65536
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "row-group-131072",
+          "overrides": {
+            "tunables": {
+              "parquet_writer": {
+                "max_row_group_rows": 131072
+              },
+              "collector": {
+                "layout": {
+                  "enabled": true,
+                  "row_group_rows": 131072
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "row-group-1000000",
+          "overrides": {
+            "tunables": {
+              "parquet_writer": {
+                "max_row_group_rows": 1000000
+              },
+              "collector": {
+                "layout": {
+                  "enabled": true,
+                  "row_group_rows": 1000000
+                }
+              }
+            }
+          }
+        }
+      ],
+      "candidate_limit": 4
+    },
+    {
+      "id": "max-rows",
+      "factor": "collector.layout.max_rows",
+      "candidates": [
+        {
+          "id": "max-rows-16384",
+          "overrides": {
+            "tunables": {
+              "collector": {
+                "layout": {
+                  "enabled": true,
+                  "max_rows": 16384
+                },
+                "batching": {
+                  "max_rows_per_flush": 16384
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "max-rows-65536",
+          "overrides": {
+            "tunables": {
+              "collector": {
+                "layout": {
+                  "enabled": true,
+                  "max_rows": 65536
+                },
+                "batching": {
+                  "max_rows_per_flush": 65536
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "max-rows-131072",
+          "overrides": {
+            "tunables": {
+              "collector": {
+                "layout": {
+                  "enabled": true,
+                  "max_rows": 131072
+                },
+                "batching": {
+                  "max_rows_per_flush": 131072
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "max-rows-1000000",
+          "overrides": {
+            "tunables": {
+              "collector": {
+                "layout": {
+                  "enabled": true,
+                  "max_rows": 1000000
+                },
+                "batching": {
+                  "max_rows_per_flush": 1000000
+                }
+              }
+            }
+          }
+        }
+      ],
+      "candidate_limit": 4
+    },
+    {
+      "id": "page-rows",
+      "factor": "collector.layout.page_rows",
+      "candidates": [
+        {
+          "id": "page-1024",
+          "overrides": {
+            "tunables": {
+              "collector": {
+                "layout": {
+                  "enabled": true,
+                  "page_rows": 1024
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "page-2048",
+          "overrides": {
+            "tunables": {
+              "collector": {
+                "layout": {
+                  "enabled": true,
+                  "page_rows": 2048
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "page-4096",
+          "overrides": {
+            "tunables": {
+              "collector": {
+                "layout": {
+                  "enabled": true,
+                  "page_rows": 4096
+                }
+              }
+            }
+          }
+        }
+      ],
+      "candidate_limit": 4
+    },
+    {
+      "id": "rollover-cap",
+      "factor": "collector.layout.max_input_bytes",
+      "candidates": [
+        {
+          "id": "input-134217728",
+          "overrides": {
+            "tunables": {
+              "collector": {
+                "layout": {
+                  "enabled": true,
+                  "max_input_bytes": 134217728
+                },
+                "batching": {
+                  "max_arrow_memory_per_flush": 134217728,
+                  "adaptive_file": {
+                    "max_input_bytes": 134217728
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "input-268435456",
+          "overrides": {
+            "tunables": {
+              "collector": {
+                "layout": {
+                  "enabled": true,
+                  "max_input_bytes": 268435456
+                },
+                "batching": {
+                  "max_arrow_memory_per_flush": 268435456,
+                  "adaptive_file": {
+                    "max_input_bytes": 268435456
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "input-536870912",
+          "overrides": {
+            "tunables": {
+              "collector": {
+                "layout": {
+                  "enabled": true,
+                  "max_input_bytes": 536870912
+                },
+                "batching": {
+                  "max_arrow_memory_per_flush": 536870912,
+                  "adaptive_file": {
+                    "max_input_bytes": 536870912
+                  }
+                }
+              }
+            }
+          }
+        }
+      ],
+      "candidate_limit": 4
+    },
+    {
+      "id": "coalescing",
+      "factor": "collector.batching.coalesce_publications",
+      "candidates": [
+        {
+          "id": "coalesce-false",
+          "overrides": {
+            "tunables": {
+              "collector": {
+                "batching": {
+                  "coalesce_publications": false
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "coalesce-true",
+          "overrides": {
+            "tunables": {
+              "collector": {
+                "batching": {
+                  "coalesce_publications": true
+                }
+              }
+            }
+          }
+        }
+      ],
+      "candidate_limit": 4
+    }
+  ]
+}
