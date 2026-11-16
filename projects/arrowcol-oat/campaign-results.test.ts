@@ -1,0 +1,458 @@
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import test from 'node:test';
+import { publicationBacklogIssue, renderCampaignResults, sortCampaignLeaderboard, validateCampaignMeasurements } from './campaign-results.js';
+import { buildThroughputManifests } from './throughput-sweeps.js';
+
+const rows = [
+  { cohort: 'C1', candidate: 'snappy', factorX: 'codec', valueX: 'snappy', factorY: 'level', valueY: 'default', repeat: 1, expectedRepeats: 3, committedRowsPerSecond: 100 },
+  { cohort: 'C1', candidate: 'snappy', factorX: 'codec', valueX: 'snappy', factorY: 'level', valueY: 'default', repeat: 2, expectedRepeats: 3, committedRowsPerSecond: 120 },
+  { cohort: 'C1', candidate: 'zstd', factorX: 'codec', valueX: 'zstd', factorY: 'level', valueY: '3', repeat: 1, expectedRepeats: 3, committedRowsPerSecond: 90 },
+];
+
+test('keeps observations exploratory until official sustainable evidence is complete', () => {
+  const svg = renderCampaignResults(rows, 'C1');
+  assert.match(svg, /<svg[^>]+role="img"/);
+  assert.match(svg, /codec × level heatmap/);
+  assert.match(svg, /Sustainable leaderboard \| official evidence only/);
+  assert.match(svg, /No qualified winner: complete official evidence is missing or invalid/);
+  assert.match(svg, /Exploratory \/ failed observations \(not ranked\)/);
+  assert.match(svg, /snappy: unqualified, 0\/3 protocol-complete repeats; observed mean 110 rows\/s/);
+  assert.doesNotMatch(svg, /snappy \(0\/3\)/);
+});
+
+test('preserves Delta rate after Kustainer death and nulls only unavailable downstream metrics', () => {
+  const result = {
+    cohort: 'C1', candidate: 'kustainer-cap', factorX: 'codec', valueX: 'zstd', factorY: 'level', valueY: '6',
+    repeat: 1, committedRowsPerSecond: 50, diedFirst: 'Kustainer', comment: 'emulator exited before the window completed',
+  };
+  const [validated] = validateCampaignMeasurements([result]);
+  assert.equal(validated!.committedRowsPerSecond, 50);
+  assert.equal(validated!.qapCompletionPercent, null);
+  assert.equal(validated!.qapPendingArtifacts, null);
+  assert.equal(validated!.qapUnhealthyCatalogs, null);
+  assert.equal(validated!.collectorOnly, true);
+  const svg = renderCampaignResults([...rows, result], 'C1');
+  assert.match(svg, /Kustainer \(collector-only; downstream metrics: null; committed rows\/s: 50\).*emulator exited/);
+  assert.throws(() => validateCampaignMeasurements([{ ...result, qapCompletionPercent: 100 }]), /unavailable downstream metrics to be null/);
+  assert.throws(() => validateCampaignMeasurements([{ ...result, comment: null }]), /dead Kustainer requires a concrete comment/);
+});
+
+test('rejects duplicate candidate-repeat identities', () => {
+  assert.throws(() => renderCampaignResults([...rows, rows[0]!], 'C1'), /duplicate candidate\/repeat identity/);
+});
+
+test('rejects incompatible frozen source, resource, or load baselines', () => {
+  const official = (id: string, baseline: number) => ({
+    status: { id, state: 'failed', progress: 'failed', result_count: 0, error: null },
+    rows: [], expectedSha: 'same-source', mode: 'local',
+    config: { tunables: { codec: id, level: 'default', frozen: baseline } },
+  });
+  const results = [
+    { cohort: 'C1', candidate: 'one', factorX: 'codec', valueX: 'one', factorY: 'level', valueY: 'default', repeat: 1,
+      factorConfigPaths: ['codec', 'level'], officialRuns: [official('one', 1)], committedRowsPerSecond: 10 },
+    { cohort: 'C1', candidate: 'two', factorX: 'codec', valueX: 'two', factorY: 'level', valueY: 'default', repeat: 1,
+      factorConfigPaths: ['codec', 'level'], officialRuns: [official('two', 2)], committedRowsPerSecond: 20 },
+  ];
+  assert.throws(() => renderCampaignResults(results, 'C1'), /incompatible frozen source\/resource\/load baselines/);
+});
+
+
+function sourceShapedRun(sequence: number, rates: number[], start: number, gapAt?: number) {
+  const expectedSha = 'a'.repeat(40);
+  const orchestration = '11111111-1111-4111-8111-' + String(sequence).padStart(12, '0');
+  const cell = '22222222-2222-4222-8222-' + String(sequence).padStart(12, '0');
+  const windows = rates.map((rate, index) => {
+    const windowStart = start + index * 30_000 + (gapAt !== undefined && index >= gapAt ? 1_000 : 0);
+    const committedRows = Math.round(rate * 30);
+    return {
+      scope: 'new_ingestion_commits_finished_in_half_open_shared_window_not_client_cohort',
+      clock: 'collector_system_unix_ms_shared_schedule_clock_skew_not_measured',
+      warmup_backlog: 'included_when_commit_finishes_in_window',
+      rewrite_commits: 'excluded_by_ingestion_only_producer_capability',
+      unique_delivered_rows: null,
+      complete_delivery_established: false,
+      measurement_start_unix_ms: windowStart,
+      measurement_end_unix_ms: windowStart + 30_000,
+      window_seconds: 30,
+      rows: committedRows,
+      files: 1,
+      input_bytes: committedRows * 10,
+      parquet_bytes: committedRows * 5,
+      commits: 1,
+      rows_per_second: committedRows / 30,
+      input_bytes_per_second: committedRows * 10 / 30,
+      parquet_bytes_per_second: committedRows * 5 / 30,
+      bytes_per_row: 5,
+      compression_ratio: 2,
+      compression_ratio_numerator: 'collector_reported_input_bytes',
+      compression_ratio_denominator: 'committed_parquet_file_bytes_including_metadata',
+      commit_latency_seconds: { p50: 0.1, p95: 0.2, p99: 0.3, samples: 1, scope: 'commit_retry_and_sync_not_encoding_or_admission' },
+    };
+  });
+  const outputRows = windows.reduce((sum, window) => sum + window.rows, 0);
+  const end = windows[windows.length - 1]!.measurement_end_unix_ms;
+  const seconds = (end - start) / 1_000;
+  const output = {
+    scope: 'new_ingestion_commits_finished_in_half_open_shared_window_not_client_cohort',
+    clock: 'collector_system_unix_ms_shared_schedule_clock_skew_not_measured',
+    measurement_start_unix_ms: start,
+    measurement_end_unix_ms: end,
+    window_seconds: seconds,
+    rows: outputRows,
+    files: windows.length,
+    input_bytes: outputRows * 10,
+    parquet_bytes: outputRows * 5,
+    rows_per_second: outputRows / seconds,
+    input_bytes_per_second: outputRows * 10 / seconds,
+    parquet_bytes_per_second: outputRows * 5 / seconds,
+    bytes_per_row: 5,
+    compression_ratio: 2,
+    compression_ratio_numerator: 'collector_reported_input_bytes',
+    compression_ratio_denominator: 'committed_parquet_file_bytes_including_metadata',
+    commits: windows.length,
+    commit_latency_seconds: { p50: 0.1, p95: 0.2, p99: 0.3, samples: windows.length, scope: 'commit_retry_and_sync_not_encoding_or_admission' },
+    unique_delivered_rows: null,
+    complete_delivery_established: false,
+    warmup_backlog: 'included_when_commit_finishes_in_window',
+    rewrite_commits: 'excluded_by_ingestion_only_producer_capability',
+  };
+  const evidence = {
+    version: 1,
+    processes: [{ component: 'collector', image: 'dataflow:source-pinned', image_id: 'sha256:' + 'b'.repeat(64),
+      source_revision: expectedSha, log_complete: true, effective_config_source: 'consumer_startup_readback',
+      effective_config: { commit_telemetry: { schema_version: 1, scope: 'new_ingestion_addfiles_after_sync', clock: 'system_unix_ms' } } }],
+    durable_commits: {
+      output_throughput: output,
+      complete_30_second_commit_windows: windows,
+      run_cumulative_output: { scope: 'all_new_ingestion_commits_from_this_cell_including_warmup', rows: outputRows,
+        commits: windows.length, complete_delivery_established: false },
+    },
+    reconciliation: {
+      status: 'within_bound', settled: true, settle_seconds: 120, settle_timeout_seconds: 120,
+      cell_scope: 'source-shaped OAT evidence', delta_rows: outputRows, completed_rows: outputRows - 1, ambiguous_rows: 1,
+      gap_rows: 0, minimum_delta_rows: outputRows - 1, maximum_delta_rows: outputRows,
+      lower_bound_met: true, upper_bound_met: true, exact_match_required: false, exact_match: false,
+      scope: 'process_cumulative_client_rows_vs_this_cells_new_ingestion_commits_including_warmup',
+    },
+    commit_window_output_throughput: output,
+    downstream_status: 'observed_or_not_attempted',
+    backlog: null,
+  };
+  const status = { id: orchestration, state: 'succeeded' as const, progress: 'published', result_count: 1, error: null };
+  return {
+    status,
+    rows: [{ schema_version: 3, run_id: cell, mode: 'local', tunables_json: JSON.stringify({ orchestration_run_id: orchestration }),
+      git_sha: expectedSha, status: 'succeeded', pinning_ok: true, table_owner: 'owner-a', rows: BigInt(outputRows),
+      duration_ms: BigInt(seconds * 1_000), rows_per_second: output.rows_per_second, replicas: 1n, dfe_worker_concurrency: 8n,
+      table: 'sqlserver_availability_replica_states', tables: 1, qap_observation_complete: 1n,
+      qap_observed_tables: 1n, qap_completion_percent: 100, qap_pending_artifacts: 0n,
+      qap_unhealthy_catalogs: 0n, measure_seconds: seconds, evidence_json: JSON.stringify(evidence) }],
+    expectedSha, mode: 'local' as const,
+    config: { tables: ['sqlserver_availability_replica_states'], replica_counts: [1], dfe_worker_concurrency: [8],
+      tunables: { parquet_writer: { defaults: { compression: 'snappy', compression_level: 3 } } } },
+  };
+}
+
+function attachMaintenanceDebt(run: ReturnType<typeof sourceShapedRun>, observedAt: number, dropped = 0): void {
+  const row = run.rows[0]!;
+  const evidence = JSON.parse(String(row.evidence_json)) as Record<string, unknown>;
+  if (!Array.isArray(evidence.processes)) throw new Error('source fixture has no process evidence');
+  evidence.processes = [...evidence.processes, {
+    component: 'maintenance',
+    log_complete: true,
+    maintenance_table_policies: {
+      source: 'validated_consumer_per_table_policy',
+      tables: { sqlserver_availability_replica_states: { active: true, table_policy: {} } },
+      operation_reports_dropped: dropped,
+      operation_report_timing_scope: 'process_lifetime_including_warmup_and_drain_not_shared_measurement_window',
+      operation_outcomes: { scope: 'process_lifetime', operation_count: 1, error_count: 0 },
+      operation_reports: [{
+        table: 'sqlserver_availability_replica_states',
+        operation: 'optimize',
+        negative_probe: false,
+        mutation_mode: 'apply_authorized_not_proof_of_mutation',
+        operation_failed: false,
+        compaction_debt: {
+          observed_at_ms: observedAt,
+          source: 'snapshot_active_files',
+          eligible_files: 10,
+          eligible_bytes: 1000,
+          backlog_files: 2,
+          backlog_bytes: 200,
+          oldest_eligible_partition_start_ms: null,
+        },
+      }],
+    },
+  }];
+  row.evidence_json = JSON.stringify(evidence);
+}
+
+function mutateMaintenanceReport(run: ReturnType<typeof sourceShapedRun>, mutate: (report: Record<string, unknown>) => void): void {
+  const row = run.rows[0]!;
+  const evidence = JSON.parse(String(row.evidence_json)) as {
+    processes: Array<{ component: string; maintenance_table_policies?: { operation_reports: Array<Record<string, unknown>> } }>;
+  };
+  const maintenance = evidence.processes.find(process => process.component === 'maintenance');
+  const report = maintenance?.maintenance_table_policies?.operation_reports[0];
+  if (!report) throw new Error('source fixture has no maintenance operation report');
+  mutate(report);
+  row.evidence_json = JSON.stringify(evidence);
+}
+
+// Synthetic agreed-contract data, not a serialized producer fixture or benchmark.
+function syntheticBacklog() {
+  return {
+    schema_version: 1,
+    source: 'arrowcol_publication_backlog_*',
+    scope: 'unique_table_owner_admissions_not_confirmed_durable_commit',
+    timestamp_basis: 'UTC request start/end around direct /metrics GET; each is a scrape-time snapshot',
+    measurement_window: { start_unix_ms: 1_000_000, end_unix_ms: 1_150_000 },
+    sampling_interval_ms: 1_000,
+    request_timeout_ms: 3_000,
+    sampling_failures: 0,
+    samples_dropped: 0,
+    last_unavailable_reason: null as string | null,
+    samples: Array.from({ length: 150 }, (_, index) => ({
+      request_start_unix_ms: 1_000_000 + index * 1_000,
+      request_end_unix_ms: 1_000_010 + index * 1_000,
+      request_timeout_ms: Math.min(3_000, 150_000 - index * 1_000),
+      available: true as boolean | null,
+      publications: 0 as number | null,
+      rows: 0 as number | null,
+      logical_bytes: 0 as number | null,
+      oldest_age_seconds: 0 as number | null,
+      status: null as string | null,
+      unavailable_reason: null as string | null,
+    })),
+  };
+}
+
+test('parses synthetic agreed backlog contract without treating it as qualification', () => {
+  assert.equal(publicationBacklogIssue(syntheticBacklog(), 1_000_000, 1_150_000), undefined);
+  const run = sourceShapedRun(40, [1, 1, 1, 1, 1], 1_000_000);
+  attachMaintenanceDebt(run, 1_060_000);
+  mutateMaintenanceReport(run, report => {
+    report.negative_probe = true;
+    report.compaction_debt = { observed_at_ms: 1_060_000, source: 'bounded_physical_inventory',
+      eligible_files: 0, eligible_bytes: 0, backlog_files: 0, backlog_bytes: 0,
+      oldest_eligible_partition_start_ms: null };
+  });
+  const row = run.rows[0]!;
+  const evidence = JSON.parse(String(row.evidence_json)) as Record<string, unknown>;
+  evidence.backlog = syntheticBacklog();
+  row.evidence_json = JSON.stringify(evidence);
+  const result = {
+    cohort: 'C1', candidate: 'synthetic-only', factorX: 'codec', valueX: 'snappy', factorY: 'level', valueY: '3',
+    repeat: 1, expectedRepeats: 3, committedRowsPerSecond: 1,
+    factorConfigPaths: ['tunables.parquet_writer.defaults.compression', 'tunables.parquet_writer.defaults.compression_level'],
+    officialRuns: [run],
+  };
+  const svg = renderCampaignResults([result], 'C1');
+  assert.match(svg, /backlog cross-language fixture check pending; sustained compaction debt and other maintenance due-work vectors remain unknown/);
+  assert.match(svg, /No qualified winner/);
+  mutateMaintenanceReport(run, report => {
+    const debt = report.compaction_debt as Record<string, unknown>;
+    debt.source = 'snapshot_active_files';
+  });
+  assert.match(renderCampaignResults([result], 'C1'), /compaction-debt observation is unavailable or invalid/);
+});
+
+test('rejects unknown, unavailable, dropped, gapped, or clock-reversed backlog contract samples', () => {
+  const mutations: Array<(value: ReturnType<typeof syntheticBacklog>) => void> = [
+    value => { value.scope = 'entire_client_backlog'; },
+    value => { value.measurement_window.start_unix_ms++; },
+    value => { value.sampling_failures = 1; },
+    value => { value.samples_dropped = 1; },
+    value => { value.last_unavailable_reason = 'scrape failed'; },
+    value => { value.samples[0]!.available = false; },
+    value => { value.samples[0]!.available = null; },
+    value => { value.samples[0]!.rows = null; },
+    value => { value.samples[0]!.rows = Number.NaN; },
+    value => { value.samples[0]!.rows = Number.MAX_SAFE_INTEGER + 1; },
+    value => { value.samples[0]!.oldest_age_seconds = Number.POSITIVE_INFINITY; },
+    value => { value.samples[0]!.unavailable_reason = 'unknown gauges'; },
+    value => { value.samples[0]!.request_end_unix_ms = value.samples[0]!.request_start_unix_ms - 1; },
+    value => { value.samples[1]!.request_start_unix_ms = value.samples[0]!.request_start_unix_ms; },
+    value => { value.samples.splice(10, 5); },
+    value => { value.samples.splice(0, 4); },
+    value => { value.samples.splice(-4); },
+    value => { value.samples = value.samples.filter((_, index) => index % 30 === 0); },
+    value => { value.request_timeout_ms = 30_001; },
+    value => { value.samples[0]!.request_timeout_ms = 0; },
+    value => { value.samples[0]!.request_timeout_ms = 3_001; },
+    value => { value.samples[0]!.request_timeout_ms = 5; },
+    value => { value.samples[value.samples.length - 1]!.request_timeout_ms = 3_000; },
+    value => { value.samples = Array.from({ length: 10_001 }, () => value.samples[0]!); },
+  ];
+  mutations.forEach((mutate, index) => {
+    const value = syntheticBacklog();
+    mutate(value);
+    assert.equal(typeof publicationBacklogIssue(value, 1_000_000, 1_150_000), 'string', 'mutation ' + index);
+  });
+  assert.equal(typeof publicationBacklogIssue(null, 1_000_000, 1_150_000), 'string');
+});
+
+test('allows single-flight scrape timeouts longer than cadence with skipped ticks and shrinking end budgets', () => {
+  const value = syntheticBacklog();
+  value.samples = value.samples.filter((_, index) => index % 3 === 0);
+  value.samples.forEach(sample => { sample.request_end_unix_ms = sample.request_start_unix_ms + 1_500; });
+  assert.equal(publicationBacklogIssue(value, 1_000_000, 1_150_000), undefined);
+  const endBudget = syntheticBacklog();
+  assert.equal(endBudget.samples[endBudget.samples.length - 1]!.request_timeout_ms, 1_000);
+  assert.equal(publicationBacklogIssue(endBudget, 1_000_000, 1_150_000), undefined);
+});
+
+test('rejects sustained positive publication rows, bytes, publications, or age trends without zero filling', () => {
+  for (const field of ['publications', 'rows', 'logical_bytes', 'oldest_age_seconds'] as const) {
+    const value = syntheticBacklog();
+    value.samples.forEach((sample, index) => { sample[field] = index; });
+    assert.match(publicationBacklogIssue(value, 1_000_000, 1_150_000)!, /positive pending/);
+  }
+});
+
+test('uses only successful in-window E1 compaction-debt samples and keeps missing pressure unranked', () => {
+  const run = sourceShapedRun(30, [1, 1, 1, 1, 1], 1_000_000);
+  attachMaintenanceDebt(run, 1_060_000);
+  const result = {
+    cohort: 'C1', candidate: 'snappy', factorX: 'codec', valueX: 'snappy', factorY: 'level', valueY: '3',
+    repeat: 1, expectedRepeats: 3, committedRowsPerSecond: 1,
+    factorConfigPaths: ['tunables.parquet_writer.defaults.compression', 'tunables.parquet_writer.defaults.compression_level'],
+    officialRuns: [run],
+  };
+  const svg = renderCampaignResults([result], 'C1');
+  assert.match(svg, /publication backlog contract evidence is unavailable or invalid/);
+  assert.doesNotMatch(svg, /snappy \(0\/3\)/);
+
+  const dropped = sourceShapedRun(31, [1, 1, 1, 1, 1], 1_000_000);
+  attachMaintenanceDebt(dropped, 1_060_000, 1);
+  const droppedSvg = renderCampaignResults([{ ...result, officialRuns: [dropped] }], 'C1');
+  assert.match(droppedSvg, /timestamped in-window compaction-debt observation is unavailable or invalid/);
+
+  const stale = sourceShapedRun(32, [1, 1, 1, 1, 1], 1_000_000);
+  attachMaintenanceDebt(stale, 999_999);
+  const staleSvg = renderCampaignResults([{ ...result, officialRuns: [stale] }], 'C1');
+  assert.match(staleSvg, /timestamped in-window compaction-debt observation is unavailable or invalid/);
+
+  for (const [sequence, mutate] of [
+    [35, (report: Record<string, unknown>) => { report.compaction_debt = null; }],
+    [36, (report: Record<string, unknown>) => { report.operation = 'checkpoint'; }],
+    [37, (report: Record<string, unknown>) => { report.operation_failed = true; }],
+  ] as Array<[number, (report: Record<string, unknown>) => void]>) {
+    const unavailable = sourceShapedRun(sequence, [1, 1, 1, 1, 1], 1_000_000);
+    attachMaintenanceDebt(unavailable, 1_060_000);
+    mutateMaintenanceReport(unavailable, mutate);
+    const svgUnavailable = renderCampaignResults([{ ...result, officialRuns: [unavailable] }], 'C1');
+    assert.match(svgUnavailable, /timestamped in-window compaction-debt observation is unavailable or invalid/);
+  }
+});
+
+test('rejects exact-window commit buckets that do not sum to the run output', () => {
+  const run = sourceShapedRun(33, [1, 1, 1, 1, 1], 1_000_000);
+  const row = run.rows[0]!;
+  const evidence = JSON.parse(String(row.evidence_json)) as {
+    durable_commits: { complete_30_second_commit_windows: Array<{ rows: number; rows_per_second: number }> };
+  };
+  const first = evidence.durable_commits.complete_30_second_commit_windows[0]!;
+  first.rows--;
+  first.rows_per_second = first.rows / 30;
+  row.evidence_json = JSON.stringify(evidence);
+  const result = {
+    cohort: 'C1', candidate: 'snappy', factorX: 'codec', valueX: 'snappy', factorY: 'level', valueY: '3',
+    repeat: 1, expectedRepeats: 3, committedRowsPerSecond: 1,
+    factorConfigPaths: ['tunables.parquet_writer.defaults.compression', 'tunables.parquet_writer.defaults.compression_level'],
+    officialRuns: [run],
+  };
+  const svg = renderCampaignResults([result], 'C1');
+  assert.match(svg, /complete commit buckets do not reconcile to the exact-window run output total/);
+});
+
+test('reads one sustained run of contiguous emitter buckets but keeps missing debt proof unranked', () => {
+  const result = {
+    cohort: 'C1', candidate: 'snappy', factorX: 'codec', valueX: 'snappy', factorY: 'level', valueY: '3',
+    repeat: 1, expectedRepeats: 3, committedRowsPerSecond: 1,
+    factorConfigPaths: ['tunables.parquet_writer.defaults.compression', 'tunables.parquet_writer.defaults.compression_level'],
+    officialRuns: [sourceShapedRun(1, [1, 1, 1, 1, 1], 1_000_000)],
+  };
+  const svg = renderCampaignResults([result], 'C1');
+  assert.match(svg, /snappy: unqualified, 0\/3 protocol-complete repeats; observed mean 1 rows\/s/);
+  assert.match(svg, /timestamped in-window compaction-debt observation is unavailable or invalid/);
+  assert.doesNotMatch(svg, /snappy \(0\/3\)/);
+});
+
+test('does not combine separate cold runs or accept gapped buckets as a sustained repeat', () => {
+  const common = {
+    cohort: 'C1', candidate: 'snappy', factorX: 'codec', valueX: 'snappy', factorY: 'level', valueY: '3',
+    repeat: 1, expectedRepeats: 3, committedRowsPerSecond: 1,
+    factorConfigPaths: ['tunables.parquet_writer.defaults.compression', 'tunables.parquet_writer.defaults.compression_level'],
+  };
+  const coldRuns = Array.from({ length: 5 }, (_, index) => sourceShapedRun(index + 1, [1], 1_000_000 + index * 60_000));
+  const coldSvg = renderCampaignResults([{ ...common, officialRuns: coldRuns }], 'C1');
+  assert.match(coldSvg, /each repeat must contain exactly one official sustained run/);
+  const gapSvg = renderCampaignResults([{ ...common, officialRuns: [sourceShapedRun(10, [1, 1, 1, 1, 1], 1_000_000, 2)] }], 'C1');
+  assert.match(gapSvg, /official commit buckets must be positive, complete, contiguous 30-second windows/);
+});
+
+test('requires actual distinct factor leaves and preserves frozen config paths', () => {
+  const run = sourceShapedRun(20, [1, 1, 1, 1, 1], 1_000_000);
+  const result = {
+    cohort: 'C1', candidate: 'snappy', factorX: 'codec', valueX: 'snappy', factorY: 'level', valueY: '3',
+    repeat: 1, expectedRepeats: 3, committedRowsPerSecond: 1,
+    factorConfigPaths: ['tunables.parquet_writer.defaults', 'tunables.parquet_writer.defaults.compression_level'],
+    officialRuns: [{ ...run, config: { ...run.config, tunables: { ...run.config.tunables,
+      parquet_writer: { defaults: { compression: 'snappy', compression_level: 3 } } } } }],
+  };
+  assert.throws(() => renderCampaignResults([result], 'C1'), /distinct scalar or array config leaves/);
+});
+
+test('requires factor leaves to exist in generated C1 cohort configs', () => {
+  type TunedConfig = {
+    tables: string[];
+    tunables: { parquet_writer: { defaults: Record<string, unknown> }; [key: string]: unknown };
+    [key: string]: unknown;
+  };
+  const base = JSON.parse(readFileSync(new URL('../../docs/experiments/arrowcol-oat/oat-config.tuned.json', import.meta.url), 'utf8')) as TunedConfig;
+  const manifest = buildThroughputManifests(base)[0] as {
+    campaign_profile: string;
+    baseline_tunables: TunedConfig['tunables'];
+    invariants: { table: string; replicas: number[] };
+    comparisons: Array<{ candidates: Array<{ overrides: { tunables: { parquet_writer: { defaults: Record<string, unknown> } } } }> }>;
+  };
+  const configs = manifest.comparisons[0]!.candidates.map(candidate => ({
+    ...base,
+    campaign_profile: manifest.campaign_profile,
+    tables: [manifest.invariants.table],
+    replica_counts: manifest.invariants.replicas,
+    tunables: { ...manifest.baseline_tunables, parquet_writer: {
+      ...manifest.baseline_tunables.parquet_writer,
+      defaults: { ...manifest.baseline_tunables.parquet_writer.defaults, ...candidate.overrides.tunables.parquet_writer.defaults },
+    } },
+  }));
+  const config = configs[0]!;
+  const run = sourceShapedRun(34, [1, 1, 1, 1, 1], 1_000_000);
+  const official = { ...run, config };
+  const result = {
+    cohort: 'C1', candidate: 'snappy', factorX: 'codec', valueX: 'snappy', factorY: 'level', valueY: '3',
+    repeat: 1, expectedRepeats: 3, committedRowsPerSecond: 1,
+    factorConfigPaths: ['tunables.parquet_writer.defaults.compression', 'tunables.parquet_writer.defaults.compression_level'],
+    officialRuns: [official],
+  };
+  assert.doesNotThrow(() => renderCampaignResults([result], 'C1'));
+  for (const generated of configs) {
+    assert.doesNotThrow(() => renderCampaignResults([{ ...result, officialRuns: [{ ...run, config: generated }] }], 'C1'));
+  }
+  const missing = structuredClone(config);
+  delete missing.tunables.parquet_writer.defaults.compression_level;
+  assert.throws(() => renderCampaignResults([{ ...result, officialRuns: [{ ...run, config: missing }] }], 'C1'),
+    /factorConfigPaths must identify distinct scalar or array config leaves/);
+});
+
+test('sorts qualified leaderboard metrics by descending mean then candidate name', () => {
+  const items = [
+    { candidate: 'zeta', mean: 120 },
+    { candidate: 'tie-z', mean: 100 },
+    { candidate: 'alpha', mean: 100 },
+    { candidate: 'beta', mean: 140 },
+  ];
+  assert.deepEqual(sortCampaignLeaderboard(items).map(item => item.candidate), ['beta', 'zeta', 'alpha', 'tie-z']);
+});
