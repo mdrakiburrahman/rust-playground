@@ -854,7 +854,7 @@ mod io_tests {
         .await
         .expect_err("multipart failure must reach the staging caller");
 
-        assert!(format!("{error:#}").contains("stream completed Parquet output to object store"));
+        assert!(format!("{error:#}").contains("start completed Parquet multipart upload"));
         assert_eq!(store.multipart_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         Ok(())
     }
