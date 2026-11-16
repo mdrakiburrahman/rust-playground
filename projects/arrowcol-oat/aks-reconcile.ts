@@ -66,7 +66,8 @@ export async function reconcileOnce(store: CampaignStore, now = Date.now()): Pro
     const currentEvaluation = evaluateCustody(current, now);
     if (!currentEvaluation.fenceReason) return { ...current, lastEvaluatedAtMs: now, lastMissedHeartbeatCount: currentEvaluation.missedHeartbeats };
     return { ...current, status: 'fenced', fencingToken: current.fencingToken + 1, fenceReason: currentEvaluation.fenceReason,
-      fencedAtMs: now, lastEvaluatedAtMs: now, lastMissedHeartbeatCount: currentEvaluation.missedHeartbeats, cleanupStatus: "pending", cleanupSteps: CUSTODY_CLEANUP_STEPS.map(step => ({ step, idempotencyKey: current.campaignId + ":" + (current.fencingToken + 1) + ":" + step, status: "pending" })) };
+      fencedAtMs: now, lastEvaluatedAtMs: now, lastMissedHeartbeatCount: currentEvaluation.missedHeartbeats, cleanupStatus: "pending",
+      cleanupSteps: CUSTODY_CLEANUP_STEPS.map(step => ({ step, idempotencyKey: current.campaignId + ":" + (current.fencingToken + 1) + ":" + step, status: "pending" })) };
   });
   return result.state.status === 'fenced'
     ? { status: 'fenced', campaignId: result.state.campaignId, missedHeartbeats: result.state.lastMissedHeartbeatCount,

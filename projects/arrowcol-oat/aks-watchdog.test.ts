@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { CampaignConflictError, CUSTODY_CLEANUP_STEPS, armCampaign, startCampaign, type CampaignState, type CampaignStore, type StoredCampaign } from './aks-campaign.js';
+import { CampaignConflictError, CUSTODY_CLEANUP_STEPS, armCampaign, publishRunInventory, startCampaign, type CampaignState, type CampaignStore, type RunInventory, type StoredCampaign } from './aks-campaign.js';
 import { watchdogOnce } from './aks-watchdog.js';
 
 const campaignId = 'c0ffee00-0000-4000-8000-000000000001';
@@ -19,10 +19,28 @@ class MemoryStore implements CampaignStore {
   }
 }
 
+const inventoryFor = (state: CampaignState): RunInventory => {
+  const cellRunId = 'c0ffee00-0000-4000-8000-000000000004';
+  const namespace = 'arrowcol-' + cellRunId.replace(/-/g, '');
+  const step = { state: 'not_started' as const, deadline_unix_ms: null, reason_code: null };
+  return {
+    schema_version: 1, campaign_id: campaignId, owner_id: ownerId, fencing_token: state.fencingToken,
+    orchestration_run_id: 'c0ffee00-0000-4000-8000-000000000005', cell_run_id: cellRunId,
+    namespace: { name: namespace, uid: 'c0ffee00-0000-4000-8000-000000000009', owner_token: ownerId },
+    resources: [{ api_version: 'apps/v1', kind: 'Deployment', namespace, name: 'arrowcol',
+      uid: 'c0ffee00-0000-4000-8000-000000000006', absence: null, role: 'collector', state: 'observed' }],
+    fic: { resource_id: '/subscriptions/' + subscriptionId + '/resourceGroups/perf69/providers/Microsoft.ManagedIdentity/userAssignedIdentities/arrow-collector/federatedIdentityCredentials/arrowcol-run-' + cellRunId,
+      name: 'arrowcol-run-' + cellRunId, state: 'observed' },
+    qap: { database: 'perf69-qap', bindings: [{ external_table: 'arrowcol_data', relative_path: 'perf69/' + cellRunId }], state: 'observed' },
+    cleanup: { stop_admission: { ...step }, bounded_drain: { ...step }, evidence_capture: { ...step }, terminal_capture: { ...step }, handoff: { ...step } },
+  };
+};
 async function armedStore(): Promise<MemoryStore> {
   const store = new MemoryStore();
   await startCampaign(store, campaignId, ownerId, 1_000_000);
-  await armCampaign(store, ownerId, 1, 1_000_000);
+  const state = (await store.read())!.state;
+  await publishRunInventory(store, inventoryFor(state), state.startedAtMs);
+  await armCampaign(store, ownerId, state.fencingToken, state.startedAtMs);
   return store;
 }
 

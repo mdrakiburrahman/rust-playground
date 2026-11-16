@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { CampaignConflictError, CUSTODY_CLEANUP_STEPS, MAX_CAMPAIGN_LIFETIME_MS, MISSED_HEARTBEAT_LIMIT, HEARTBEAT_INTERVAL_MS,
-  armCampaign, heartbeatCampaign, mutateCampaign, newCampaignState, startCampaign, validateCampaignState,
-  type CampaignState, type CampaignStore, type StoredCampaign, recordArmOperation } from './aks-campaign.js';
+  armCampaign, assertRunInventoryReady, heartbeatCampaign, mutateCampaign, newCampaignState, publishRunInventory, startCampaign,
+  validateCampaignState, type CampaignState, type CampaignStore, type RunInventory, type StoredCampaign,
+  CampaignWriteOutcomeUnknownError, recordArmOperation } from './aks-campaign.js';
 import { evaluateCustody, reconcileArmOperation, reconcileCleanupOnce, reconcileOnce, reconcilePendingArmOperations } from './aks-reconcile.js';
 
 const campaignId = 'c0ffee00-0000-4000-8000-000000000001';
@@ -29,6 +30,35 @@ const seed = async (now = 1_000_000) => {
   return store;
 };
 
+const inventoryFor = (state: CampaignState, observed = false): RunInventory => {
+  const cellRunId = 'c0ffee00-0000-4000-8000-000000000004';
+  const orchestrationRunId = 'c0ffee00-0000-4000-8000-000000000005';
+  const namespace = 'arrowcol-' + cellRunId.replace(/-/g, '');
+  const names = ['arrowcol', 'arrowcol-client', 'delta-maintenance'];
+  const uids = ['c0ffee00-0000-4000-8000-000000000006', 'c0ffee00-0000-4000-8000-000000000007',
+    'c0ffee00-0000-4000-8000-000000000008'];
+  const stateName = observed ? 'observed' : 'planned';
+  const step = { state: 'not_started' as const, deadline_unix_ms: null, reason_code: null };
+  return {
+    schema_version: 1, campaign_id: state.campaignId, owner_id: state.ownerId, fencing_token: state.runInventory?.fencing_token ?? state.fencingToken,
+    orchestration_run_id: orchestrationRunId, cell_run_id: cellRunId,
+    namespace: { name: namespace, uid: observed ? 'c0ffee00-0000-4000-8000-000000000009' : null, owner_token: state.ownerId },
+    resources: names.map((name, index) => ({ api_version: 'apps/v1', kind: 'Deployment', namespace, name,
+      uid: observed ? uids[index]! : null, absence: null, role: index === 0 ? 'collector' : index === 1 ? 'client' : 'maintenance', state: stateName })),
+    fic: { resource_id: '/subscriptions/' + subscriptionId + '/resourceGroups/perf69/providers/Microsoft.ManagedIdentity/userAssignedIdentities/arrow-collector/federatedIdentityCredentials/arrowcol-run-' + cellRunId,
+      name: 'arrowcol-run-' + cellRunId, state: stateName },
+    qap: { database: 'perf69-qap', bindings: [{ external_table: 'arrowcol_data', relative_path: 'perf69/' + cellRunId }], state: stateName },
+    cleanup: { stop_admission: { ...step }, bounded_drain: { ...step }, evidence_capture: { ...step }, terminal_capture: { ...step }, handoff: { ...step } },
+  };
+};
+const armForTest = async (store: MemoryStore, now = 1_000_000, ready = true) => {
+  const state = (await store.read())!.state;
+  await publishRunInventory(store, inventoryFor(state), now);
+  await armCampaign(store, ownerId, state.fencingToken, now);
+  if (ready) await publishRunInventory(store, inventoryFor((await store.read())!.state, true), now + 1);
+  return (await store.read())!.state;
+};
+
 test('new campaign is observe-only with fixed heartbeat and lifetime bounds', () => {
   const state = newCampaignState(campaignId, ownerId, 100);
   assert.equal(state.mode, 'observe');
@@ -46,29 +76,31 @@ test('heartbeat cannot revive expired custody and stale fencing tokens are rejec
   await assert.rejects(heartbeatCampaign(store, ownerId, started.fencingToken, started.expiresAtMs), /expired/);
 });
 
-test('observer records a would-fence event without fencing; armed controller fences once at three missed beats', async () => {
-  const store = await seed();
-  const started = (await store.read())!.state;
-  const expiredAt = started.heartbeatAtMs + 3 * HEARTBEAT_INTERVAL_MS;
-  assert.equal(evaluateCustody(started, expiredAt).wouldFence, true);
-  const observed = await reconcileOnce(store, expiredAt);
-  assert.equal(observed.status, 'observed');
-  assert.equal((await store.read())!.state.status, 'active');
-  await armCampaign(store, ownerId, started.fencingToken, started.heartbeatAtMs);
-  const fenced = await reconcileOnce(store, expiredAt);
+test('observer does not fence; armed controller fences once at three missed beats', async () => {
+  const observedStore = await seed();
+  const observedStart = (await observedStore.read())!.state;
+  await publishRunInventory(observedStore, inventoryFor(observedStart), observedStart.startedAtMs);
+  const expiredAt = observedStart.heartbeatAtMs + 3 * HEARTBEAT_INTERVAL_MS;
+  assert.equal(evaluateCustody(observedStart, expiredAt).wouldFence, true);
+  assert.equal((await reconcileOnce(observedStore, expiredAt)).status, 'observed');
+  assert.equal((await observedStore.read())!.state.status, 'active');
+
+  const armedStore = await seed();
+  const started = await armForTest(armedStore);
+  const fenced = await reconcileOnce(armedStore, expiredAt);
   assert.equal(fenced.status, 'fenced');
-  const state = (await store.read())!.state;
+  const state = (await armedStore.read())!.state;
   assert.equal(state.status, 'fenced');
   assert.equal(state.fencingToken, started.fencingToken + 1);
+  assert.equal(state.runInventory!.fencing_token, started.fencingToken);
   assert.equal(state.cleanupStatus, 'pending');
-  assert.equal((await reconcileOnce(store, expiredAt + HEARTBEAT_INTERVAL_MS)).status, 'terminal');
-  assert.equal((await store.read())!.state.fencingToken, started.fencingToken + 1);
+  assert.equal((await reconcileOnce(armedStore, expiredAt + HEARTBEAT_INTERVAL_MS)).status, 'terminal');
+  assert.equal((await armedStore.read())!.state.fencingToken, started.fencingToken + 1);
 });
 
 test('max lifetime fences even when heartbeat is current', async () => {
   const store = await seed();
-  const started = (await store.read())!.state;
-  await armCampaign(store, ownerId, started.fencingToken, started.heartbeatAtMs);
+  const started = await armForTest(store);
   await heartbeatCampaign(store, ownerId, started.fencingToken, started.heartbeatAtMs + 10);
   const expired = (await store.read())!.state;
   const result = await reconcileOnce(store, expired.expiresAtMs);
@@ -90,8 +122,8 @@ test('campaign ownership cannot be replaced until cleanup is verified', async ()
 
 test('fenced cleanup retries the same idempotency key and completes ordered steps once', async () => {
   const store = await seed();
+  await armForTest(store);
   const started = (await store.read())!.state;
-  await armCampaign(store, ownerId, started.fencingToken, started.heartbeatAtMs);
   const expiredAt = started.heartbeatAtMs + MISSED_HEARTBEAT_LIMIT * HEARTBEAT_INTERVAL_MS;
   await reconcileOnce(store, expiredAt);
   await assert.rejects(heartbeatCampaign(store, ownerId, started.fencingToken, expiredAt + 1), /fenced, stale/);
@@ -117,22 +149,58 @@ test('fenced cleanup retries the same idempotency key and completes ordered step
 
 test('ARM operation receipts reject out-of-scope URLs and reconcile terminal public status values', async () => {
   const store = await seed();
-  const state = (await store.read())!.state;
+  const state = await armForTest(store);
   await assert.rejects(recordArmOperation(store, ownerId, state.fencingToken,
-    { id: 'c0ffee00-0000-4000-8000-000000000005', resourceId,
-      operationUrl: 'https://example.com/operation', submittedAtMs: state.startedAtMs }, subscriptionId, state.startedAtMs), /management.azure.com/);
+    { id: 'c0ffee00-0000-4000-8000-00000000000a', resourceId,
+      operationUrl: 'https://example.com/operation', submittedAtMs: state.startedAtMs }, subscriptionId, state.startedAtMs + 2), /management.azure.com/);
   await recordArmOperation(store, ownerId, state.fencingToken,
-    { id: 'c0ffee00-0000-4000-8000-000000000006', resourceId, operationUrl, submittedAtMs: state.startedAtMs }, subscriptionId, state.startedAtMs);
+    { id: 'c0ffee00-0000-4000-8000-00000000000b', resourceId, operationUrl, submittedAtMs: state.startedAtMs }, subscriptionId, state.startedAtMs + 2);
   const pending = (await store.read())!.state.operations[0]!;
   const completed = await reconcileArmOperation(pending, async url => {
     assert.equal(url, operationUrl);
     return { status: 200, body: { status: 'Succeeded' } };
-  }, subscriptionId, state.startedAtMs + 1);
+  }, subscriptionId, state.startedAtMs + 3);
   assert.equal(completed.status, 'succeeded');
-  const reconciled = await reconcilePendingArmOperations(store, async () => ({ status: 202 }), subscriptionId, state.startedAtMs + 1);
-  assert.equal(reconciled!.operations[0]!.status, 'pending');
+  const reconciled = await reconcilePendingArmOperations(store, async () => ({ status: 202 }), subscriptionId, state.startedAtMs + 3);
+  assert.equal(reconciled!.operations[0]!.status, 'succeeded');
   const hostile = { ...pending, operationUrl: 'https://127.0.0.1/latest/meta-data' };
-  await assert.rejects(reconcileArmOperation(hostile, async () => ({ status: 200 }), subscriptionId, state.startedAtMs + 1), /outside the configured subscription/);
+  await assert.rejects(reconcileArmOperation(hostile, async () => ({ status: 200 }), subscriptionId, state.startedAtMs + 3), /outside the configured subscription/);
+});
+
+test('RunInventory fenced merge preserves heartbeat and ARM receipts and blocks load until observed', async () => {
+  const store = await seed();
+  const started = (await store.read())!.state;
+  const planned = inventoryFor(started);
+  await publishRunInventory(store, planned, started.startedAtMs);
+  await assert.rejects(assertRunInventoryReady(store, ownerId, started.fencingToken, started.startedAtMs), /blocked/);
+  await armCampaign(store, ownerId, started.fencingToken, started.startedAtMs);
+  const observed = inventoryFor((await store.read())!.state, true);
+  await publishRunInventory(store, observed, started.startedAtMs + 1);
+  await assertRunInventoryReady(store, ownerId, started.fencingToken, started.startedAtMs + 2);
+  await heartbeatCampaign(store, ownerId, started.fencingToken, started.startedAtMs + 3);
+  await recordArmOperation(store, ownerId, started.fencingToken,
+    { id: 'c0ffee00-0000-4000-8000-00000000000c', resourceId, operationUrl, submittedAtMs: started.startedAtMs },
+    subscriptionId, started.startedAtMs + 4);
+  const changed = { ...observed, cleanup: { ...observed.cleanup, stop_admission: { state: 'complete' as const, deadline_unix_ms: null, reason_code: null } } };
+  await publishRunInventory(store, changed, started.startedAtMs + 5);
+  const merged = (await store.read())!.state;
+  assert.equal(merged.heartbeatSequence, 1);
+  assert.equal(merged.operations.length, 1);
+  assert.equal(merged.runInventory!.cleanup.stop_admission, 'complete');
+  await assert.rejects(publishRunInventory(store, { ...changed, cell_run_id: 'c0ffee00-0000-4000-8000-00000000000d' }, started.startedAtMs + 6), /unresolved previous/);
+});
+
+test('RunInventory rejects unknown identities and reports an unconfirmed Blob write', async () => {
+  const store = await seed();
+  const state = (await store.read())!.state;
+  const planned = inventoryFor(state);
+  await assert.rejects(publishRunInventory(store, { ...planned, extra: true }, state.startedAtMs), /malformed/);
+  class FailsBeforeWrite extends MemoryStore {
+    override async write(_state: CampaignState, _etag?: string): Promise<string> { throw new Error('connection reset'); }
+  }
+  const failing = new FailsBeforeWrite();
+  await startCampaign(failing, campaignId, ownerId, state.startedAtMs);
+  await assert.rejects(publishRunInventory(failing, planned, state.startedAtMs), CampaignWriteOutcomeUnknownError);
 });
 
 test('strict state schema rejects additional persisted fields', async () => {
