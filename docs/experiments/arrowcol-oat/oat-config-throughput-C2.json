@@ -7,11 +7,14 @@
   "registry_status": "pending-E1-registry",
   "registry_sha256": "79cf2880012dfbd6a064d848a217083afef77c9168b3fc72e7c4e0f527ff8af9",
   "box_scope": "one box for every comparison in this cohort",
-  "candidate_limit_per_comparison": 4,
   "campaign": "single_hot_table_campaign",
+  "campaign_profile": "single_hot_table",
   "invariants": {
-    "table": "sqlserver_active_sessions",
-    "writer_replicas": 1,
+    "table": "sqlserver_availability_replica_states",
+    "replicas": [
+      1
+    ],
+    "wal_enabled": false,
     "maintenance": {
       "enabled": true,
       "apply": true,
@@ -21,7 +24,8 @@
         "vacuum",
         "checkpoint",
         "prune_log"
-      ]
+      ],
+      "continuous": true
     },
     "compare_within_box": true,
     "one_variable_at_a_time": true
@@ -149,7 +153,8 @@
             }
           }
         }
-      ]
+      ],
+      "candidate_limit": 4
     }
   ]
 }

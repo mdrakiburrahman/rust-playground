@@ -5,30 +5,37 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 type JsonObject = Record<string, unknown>;
 type Candidate = { id: string; overrides: JsonObject };
-type Comparison = { id: string; factor: string; candidates: Candidate[]; registryStatus?: string };
-type Cohort = { id: string; comparisons: Comparison[] };
+type Comparison = { id: string; factor: string; candidates: Candidate[]; candidate_limit: number };
+type PendingCandidateSet = { id: string; factor: string; status: string; candidates: Candidate[] };
+type Cohort = { id: string; comparisons: Comparison[]; refinement?: JsonObject; pendingCandidateSets?: PendingCandidateSet[] };
 
 const root = resolve(fileURLToPath(new URL('../..', import.meta.url)));
 const maintenance = { enabled: true, apply: true, operations: ['optimize', 'purge', 'vacuum', 'checkpoint', 'prune_log'] };
 const candidate = (id: string, value: JsonObject, rootOverrides: JsonObject = {}): Candidate => ({
   id, overrides: { ...rootOverrides, tunables: value },
 });
-const compare = (id: string, factor: string, candidates: Candidate[], registryStatus?: string): Comparison => ({
-  id, factor, candidates, ...(registryStatus ? { registryStatus } : {}),
+const compare = (id: string, factor: string, candidates: Candidate[], candidateLimit = 4): Comparison => ({
+  id, factor, candidates, candidate_limit: candidateLimit,
 });
 const cohorts: Cohort[] = [
   { id: 'C1', comparisons: [
     compare('codec', 'parquet_writer.defaults.compression', [
       candidate('uncompressed', { parquet_writer: { defaults: { compression: 'uncompressed', compression_level: null } } }),
       candidate('snappy', { parquet_writer: { defaults: { compression: 'snappy', compression_level: null } } }),
+      candidate('lz4-raw', { parquet_writer: { defaults: { compression: 'lz4_raw', compression_level: null } } }),
+      candidate('gzip', { parquet_writer: { defaults: { compression: 'gzip', compression_level: null } } }),
+      candidate('brotli', { parquet_writer: { defaults: { compression: 'brotli', compression_level: null } } }),
       candidate('zstd-1', { parquet_writer: { defaults: { compression: 'zstd', compression_level: 1 } } }),
       candidate('zstd-3', { parquet_writer: { defaults: { compression: 'zstd', compression_level: 3 } } }),
-    ]),
-    compare('zstd-refinement', 'parquet_writer.defaults.compression_level', [
-      candidate('zstd-3', { parquet_writer: { defaults: { compression: 'zstd', compression_level: 3 } } }),
       candidate('zstd-6', { parquet_writer: { defaults: { compression: 'zstd', compression_level: 6 } } }),
-    ]),
-  ] },
+    ], 8),
+  ], refinement: {
+    comparison: 'codec',
+    factor: 'parquet_writer.defaults.compression_level',
+    trigger: 'zstd wins the coarse codec comparison',
+    selection: 'winner plus up to three adjacent levels accepted by the E1 registry bounds',
+    max_candidates: 4,
+  } },
   { id: 'C2', comparisons: [compare('dictionary-encoding', 'parquet_writer.columns', [
     candidate('database-name-dictionary-off', { parquet_writer: { columns: { database_name: { dictionary_enabled: false } } } }),
     candidate('database-name-dictionary-on', { parquet_writer: { columns: { database_name: { dictionary_enabled: true } } } }),
@@ -36,14 +43,19 @@ const cohorts: Cohort[] = [
     candidate('session-id-byte-stream-split', { parquet_writer: { columns: { session_id: { dictionary_enabled: false, encoding: 'byte_stream_split' } } } }),
   ])] },
   { id: 'C3', comparisons: [
-    compare('row-groups', 'parquet_writer.max_row_group_rows', [16384, 65536, 131072].map(value => candidate('rows-' + value, {
-      parquet_writer: { max_row_group_rows: value }, collector: { layout: { enabled: true, row_group_rows: value, max_input_bytes: 134217728 } },
+    compare('row-groups', 'parquet_writer.max_row_group_rows', [16384, 65536, 131072, 1000000].map(value => candidate('row-group-' + value, {
+      parquet_writer: { max_row_group_rows: value }, collector: { layout: { enabled: true, row_group_rows: value } },
+    }))),
+    compare('max-rows', 'collector.layout.max_rows', [16384, 65536, 131072, 1000000].map(value => candidate('max-rows-' + value, {
+      collector: { layout: { enabled: true, max_rows: value }, batching: { max_rows_per_flush: value } },
     }))),
     compare('page-rows', 'collector.layout.page_rows', [1024, 2048, 4096].map(value => candidate('page-' + value, {
       collector: { layout: { enabled: true, page_rows: value } },
     }))),
-    compare('rollover-cap', 'collector.layout.max_input_bytes', [67108864, 134217728, 268435456].map(value => candidate('input-' + value, {
-      collector: { layout: { enabled: true, max_input_bytes: value } },
+    compare('rollover-cap', 'collector.layout.max_input_bytes', [134217728, 268435456, 536870912].map(value => candidate('input-' + value, {
+      collector: { layout: { enabled: true, max_input_bytes: value }, batching: {
+        max_arrow_memory_per_flush: value, adaptive_file: { max_input_bytes: value },
+      } },
     }))),
     compare('coalescing', 'collector.batching.coalesce_publications', [false, true].map(value => candidate('coalesce-' + value, {
       collector: { batching: { coalesce_publications: value } },
@@ -51,9 +63,9 @@ const cohorts: Cohort[] = [
   ] },
   { id: 'C4', comparisons: [compare('sort-key', 'collector.layout.sort_columns', [
     candidate('none', { collector: { layout: { enabled: false, sort_columns: [] } }, parquet_writer: { sorting_columns: [] } }),
-    candidate('session-id', { collector: { layout: { enabled: true, sort_columns: ['session_id'] } }, parquet_writer: { sorting_columns: [{ path: 'session_id', descending: false, nulls_first: false }] } }),
-    candidate('database-name', { collector: { layout: { enabled: true, sort_columns: ['database_name'] } }, parquet_writer: { sorting_columns: [{ path: 'database_name', descending: false, nulls_first: false }] } }),
     candidate('sample-time', { collector: { layout: { enabled: true, sort_columns: ['sample_time_utc'] } }, parquet_writer: { sorting_columns: [{ path: 'sample_time_utc', descending: false, nulls_first: false }] } }),
+    candidate('replica-sample-time', { collector: { layout: { enabled: true, sort_columns: ['replica_server_name', 'sample_time_utc'] } }, parquet_writer: { sorting_columns: [{ path: 'replica_server_name', descending: false, nulls_first: false }, { path: 'sample_time_utc', descending: false, nulls_first: false }] } }),
+    candidate('group-replica-sample-time', { collector: { layout: { enabled: true, sort_columns: ['availability_group_id', 'replica_server_name', 'sample_time_utc'] } }, parquet_writer: { sorting_columns: [{ path: 'availability_group_id', descending: false, nulls_first: false }, { path: 'replica_server_name', descending: false, nulls_first: false }, { path: 'sample_time_utc', descending: false, nulls_first: false }] } }),
   ])] },
   { id: 'C5', comparisons: [
     compare('workers', 'tunables.client.workers', [8, 16, 32, 64].map(value => candidate('workers-' + value, {
@@ -84,8 +96,12 @@ const cohorts: Cohort[] = [
   { id: 'C8', comparisons: [
     compare('commit-window', 'tunables.collector.commit.batch_window', ['1s', '2s', '5s'].map(value => candidate('window-' + value, { collector: { commit: { batch_window: value } } }))),
     compare('files-per-commit', 'tunables.collector.commit.max_files_per_commit', [16, 64, 128].map(value => candidate('files-' + value, { collector: { commit: { max_files_per_commit: value } } }))),
-    compare('staging-overlap', 'tunables.collector.commit.staging_overlap', [false, true].map(value => candidate('overlap-' + value, { collector: { commit: { staging_overlap: value } } })), 'pending-E1-registry'),
-  ] },
+  ], pendingCandidateSets: [{
+    id: 'staging-overlap',
+    factor: 'tunables.collector.commit.staging_overlap',
+    status: 'pending-L1b',
+    candidates: [false, true].map(value => candidate('overlap-' + value, { collector: { commit: { staging_overlap: value } } })),
+  }] },
 ];
 
 function isRecord(value: unknown): value is JsonObject {
@@ -98,7 +114,7 @@ export function buildThroughputManifests(registry: unknown): JsonObject[] {
   const registryHash = createHash('sha256').update(JSON.stringify(tunables)).digest('hex');
   return cohorts.map(cohort => {
     for (const comparison of cohort.comparisons) {
-      if (comparison.candidates.length > 4) throw new Error(cohort.id + '/' + comparison.id + ' exceeds four candidates');
+      if (comparison.candidates.length > comparison.candidate_limit) throw new Error(cohort.id + '/' + comparison.id + ' exceeds its candidate limit');
     }
     return {
       schema_version: 1,
@@ -109,12 +125,13 @@ export function buildThroughputManifests(registry: unknown): JsonObject[] {
       registry_status: 'pending-E1-registry',
       registry_sha256: registryHash,
       box_scope: 'one box for every comparison in this cohort',
-      candidate_limit_per_comparison: 4,
       campaign: 'single_hot_table_campaign',
+      campaign_profile: 'single_hot_table',
       invariants: {
-        table: 'sqlserver_active_sessions',
-        writer_replicas: 1,
-        maintenance,
+        table: 'sqlserver_availability_replica_states',
+        replicas: [1],
+        wal_enabled: false,
+        maintenance: { ...maintenance, continuous: true },
         compare_within_box: true,
         one_variable_at_a_time: true,
       },
@@ -126,6 +143,8 @@ export function buildThroughputManifests(registry: unknown): JsonObject[] {
         },
       },
       comparisons: cohort.comparisons,
+      ...(cohort.refinement ? { refinement: cohort.refinement } : {}),
+      ...(cohort.pendingCandidateSets ? { pending_candidate_sets: cohort.pendingCandidateSets } : {}),
     };
   });
 }

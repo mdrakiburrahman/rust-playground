@@ -7,11 +7,14 @@
   "registry_status": "pending-E1-registry",
   "registry_sha256": "79cf2880012dfbd6a064d848a217083afef77c9168b3fc72e7c4e0f527ff8af9",
   "box_scope": "one box for every comparison in this cohort",
-  "candidate_limit_per_comparison": 4,
   "campaign": "single_hot_table_campaign",
+  "campaign_profile": "single_hot_table",
   "invariants": {
-    "table": "sqlserver_active_sessions",
-    "writer_replicas": 1,
+    "table": "sqlserver_availability_replica_states",
+    "replicas": [
+      1
+    ],
+    "wal_enabled": false,
     "maintenance": {
       "enabled": true,
       "apply": true,
@@ -21,7 +24,8 @@
         "vacuum",
         "checkpoint",
         "prune_log"
-      ]
+      ],
+      "continuous": true
     },
     "compare_within_box": true,
     "one_variable_at_a_time": true
@@ -92,7 +96,7 @@
       "factor": "parquet_writer.max_row_group_rows",
       "candidates": [
         {
-          "id": "rows-16384",
+          "id": "row-group-16384",
           "overrides": {
             "tunables": {
               "parquet_writer": {
@@ -101,15 +105,14 @@
               "collector": {
                 "layout": {
                   "enabled": true,
-                  "row_group_rows": 16384,
-                  "max_input_bytes": 134217728
+                  "row_group_rows": 16384
                 }
               }
             }
           }
         },
         {
-          "id": "rows-65536",
+          "id": "row-group-65536",
           "overrides": {
             "tunables": {
               "parquet_writer": {
@@ -118,15 +121,14 @@
               "collector": {
                 "layout": {
                   "enabled": true,
-                  "row_group_rows": 65536,
-                  "max_input_bytes": 134217728
+                  "row_group_rows": 65536
                 }
               }
             }
           }
         },
         {
-          "id": "rows-131072",
+          "id": "row-group-131072",
           "overrides": {
             "tunables": {
               "parquet_writer": {
@@ -135,14 +137,101 @@
               "collector": {
                 "layout": {
                   "enabled": true,
-                  "row_group_rows": 131072,
-                  "max_input_bytes": 134217728
+                  "row_group_rows": 131072
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "row-group-1000000",
+          "overrides": {
+            "tunables": {
+              "parquet_writer": {
+                "max_row_group_rows": 1000000
+              },
+              "collector": {
+                "layout": {
+                  "enabled": true,
+                  "row_group_rows": 1000000
                 }
               }
             }
           }
         }
-      ]
+      ],
+      "candidate_limit": 4
+    },
+    {
+      "id": "max-rows",
+      "factor": "collector.layout.max_rows",
+      "candidates": [
+        {
+          "id": "max-rows-16384",
+          "overrides": {
+            "tunables": {
+              "collector": {
+                "layout": {
+                  "enabled": true,
+                  "max_rows": 16384
+                },
+                "batching": {
+                  "max_rows_per_flush": 16384
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "max-rows-65536",
+          "overrides": {
+            "tunables": {
+              "collector": {
+                "layout": {
+                  "enabled": true,
+                  "max_rows": 65536
+                },
+                "batching": {
+                  "max_rows_per_flush": 65536
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "max-rows-131072",
+          "overrides": {
+            "tunables": {
+              "collector": {
+                "layout": {
+                  "enabled": true,
+                  "max_rows": 131072
+                },
+                "batching": {
+                  "max_rows_per_flush": 131072
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "max-rows-1000000",
+          "overrides": {
+            "tunables": {
+              "collector": {
+                "layout": {
+                  "enabled": true,
+                  "max_rows": 1000000
+                },
+                "batching": {
+                  "max_rows_per_flush": 1000000
+                }
+              }
+            }
+          }
+        }
+      ],
+      "candidate_limit": 4
     },
     {
       "id": "page-rows",
@@ -187,25 +276,13 @@
             }
           }
         }
-      ]
+      ],
+      "candidate_limit": 4
     },
     {
       "id": "rollover-cap",
       "factor": "collector.layout.max_input_bytes",
       "candidates": [
-        {
-          "id": "input-67108864",
-          "overrides": {
-            "tunables": {
-              "collector": {
-                "layout": {
-                  "enabled": true,
-                  "max_input_bytes": 67108864
-                }
-              }
-            }
-          }
-        },
         {
           "id": "input-134217728",
           "overrides": {
@@ -214,6 +291,12 @@
                 "layout": {
                   "enabled": true,
                   "max_input_bytes": 134217728
+                },
+                "batching": {
+                  "max_arrow_memory_per_flush": 134217728,
+                  "adaptive_file": {
+                    "max_input_bytes": 134217728
+                  }
                 }
               }
             }
@@ -227,12 +310,38 @@
                 "layout": {
                   "enabled": true,
                   "max_input_bytes": 268435456
+                },
+                "batching": {
+                  "max_arrow_memory_per_flush": 268435456,
+                  "adaptive_file": {
+                    "max_input_bytes": 268435456
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "input-536870912",
+          "overrides": {
+            "tunables": {
+              "collector": {
+                "layout": {
+                  "enabled": true,
+                  "max_input_bytes": 536870912
+                },
+                "batching": {
+                  "max_arrow_memory_per_flush": 536870912,
+                  "adaptive_file": {
+                    "max_input_bytes": 536870912
+                  }
                 }
               }
             }
           }
         }
-      ]
+      ],
+      "candidate_limit": 4
     },
     {
       "id": "coalescing",
@@ -262,7 +371,8 @@
             }
           }
         }
-      ]
+      ],
+      "candidate_limit": 4
     }
   ]
 }

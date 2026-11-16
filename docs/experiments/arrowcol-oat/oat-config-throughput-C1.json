@@ -7,11 +7,14 @@
   "registry_status": "pending-E1-registry",
   "registry_sha256": "79cf2880012dfbd6a064d848a217083afef77c9168b3fc72e7c4e0f527ff8af9",
   "box_scope": "one box for every comparison in this cohort",
-  "candidate_limit_per_comparison": 4,
   "campaign": "single_hot_table_campaign",
+  "campaign_profile": "single_hot_table",
   "invariants": {
-    "table": "sqlserver_active_sessions",
-    "writer_replicas": 1,
+    "table": "sqlserver_availability_replica_states",
+    "replicas": [
+      1
+    ],
+    "wal_enabled": false,
     "maintenance": {
       "enabled": true,
       "apply": true,
@@ -21,7 +24,8 @@
         "vacuum",
         "checkpoint",
         "prune_log"
-      ]
+      ],
+      "continuous": true
     },
     "compare_within_box": true,
     "one_variable_at_a_time": true
@@ -118,6 +122,45 @@
           }
         },
         {
+          "id": "lz4-raw",
+          "overrides": {
+            "tunables": {
+              "parquet_writer": {
+                "defaults": {
+                  "compression": "lz4_raw",
+                  "compression_level": null
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "gzip",
+          "overrides": {
+            "tunables": {
+              "parquet_writer": {
+                "defaults": {
+                  "compression": "gzip",
+                  "compression_level": null
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "brotli",
+          "overrides": {
+            "tunables": {
+              "parquet_writer": {
+                "defaults": {
+                  "compression": "brotli",
+                  "compression_level": null
+                }
+              }
+            }
+          }
+        },
+        {
           "id": "zstd-1",
           "overrides": {
             "tunables": {
@@ -130,25 +173,6 @@
             }
           }
         },
-        {
-          "id": "zstd-3",
-          "overrides": {
-            "tunables": {
-              "parquet_writer": {
-                "defaults": {
-                  "compression": "zstd",
-                  "compression_level": 3
-                }
-              }
-            }
-          }
-        }
-      ]
-    },
-    {
-      "id": "zstd-refinement",
-      "factor": "parquet_writer.defaults.compression_level",
-      "candidates": [
         {
           "id": "zstd-3",
           "overrides": {
@@ -175,7 +199,15 @@
             }
           }
         }
-      ]
+      ],
+      "candidate_limit": 8
     }
-  ]
+  ],
+  "refinement": {
+    "comparison": "codec",
+    "factor": "parquet_writer.defaults.compression_level",
+    "trigger": "zstd wins the coarse codec comparison",
+    "selection": "winner plus up to three adjacent levels accepted by the E1 registry bounds",
+    "max_candidates": 4
+  }
 }
