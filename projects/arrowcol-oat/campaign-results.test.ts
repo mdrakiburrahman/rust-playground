@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
-import { publicationBacklogIssue, renderCampaignResults, sortCampaignLeaderboard, validateCampaignMeasurements } from './campaign-results.js';
+import { maintenanceDueWorkIssue, publicationBacklogIssue, renderCampaignResults, sortCampaignLeaderboard, validateCampaignMeasurements } from './campaign-results.js';
 import { buildThroughputManifests } from './throughput-sweeps.js';
 
 const rows = [
@@ -150,11 +150,19 @@ function sourceShapedRun(sequence: number, rates: number[], start: number, gapAt
       qap_unhealthy_catalogs: 0n, measure_seconds: seconds, evidence_json: JSON.stringify(evidence) }],
     expectedSha, mode: 'local' as const,
     config: { tables: ['sqlserver_availability_replica_states'], replica_counts: [1], dfe_worker_concurrency: [8],
-      tunables: { parquet_writer: { defaults: { compression: 'snappy', compression_level: 3 } } } },
+      tunables: { parquet_writer: { defaults: { compression: 'snappy', compression_level: 3 } },
+        maintenance: { enabled: true, apply: true, operations: ['optimize', 'purge', 'vacuum', 'checkpoint', 'prune_log'] } } },
   };
 }
 
-function attachMaintenanceDebt(run: ReturnType<typeof sourceShapedRun>, observedAt: number, dropped = 0): void {
+const maintenanceOperations = ['optimize', 'purge', 'vacuum', 'checkpoint', 'prune_log'] as const;
+
+function attachMaintenanceDueWork(
+  run: ReturnType<typeof sourceShapedRun>,
+  start: number,
+  end: number,
+  dropped = 0,
+): void {
   const row = run.rows[0]!;
   const evidence = JSON.parse(String(row.evidence_json)) as Record<string, unknown>;
   if (!Array.isArray(evidence.processes)) throw new Error('source fixture has no process evidence');
@@ -163,41 +171,74 @@ function attachMaintenanceDebt(run: ReturnType<typeof sourceShapedRun>, observed
     log_complete: true,
     maintenance_table_policies: {
       source: 'validated_consumer_per_table_policy',
-      tables: { sqlserver_availability_replica_states: { active: true, table_policy: {} } },
+      tables: { 'telemetry.sqlserver.sqlserver_availability_replica_states': { active: true, table_policy: {} } },
       operation_reports_dropped: dropped,
       operation_report_timing_scope: 'process_lifetime_including_warmup_and_drain_not_shared_measurement_window',
-      operation_outcomes: { scope: 'process_lifetime', operation_count: 1, error_count: 0 },
-      operation_reports: [{
-        table: 'sqlserver_availability_replica_states',
-        operation: 'optimize',
-        negative_probe: false,
-        mutation_mode: 'apply_authorized_not_proof_of_mutation',
-        operation_failed: false,
-        compaction_debt: {
-          observed_at_ms: observedAt,
-          source: 'snapshot_active_files',
-          eligible_files: 10,
-          eligible_bytes: 1000,
-          backlog_files: 2,
-          backlog_bytes: 200,
-          oldest_eligible_partition_start_ms: null,
-        },
-      }],
+      operation_outcomes: { scope: 'process_lifetime', operation_count: 25, error_count: 0 },
+      operation_reports: Array.from({ length: Math.floor((end - start) / 30_000) }, (_, window) =>
+        maintenanceOperations.map(operation => {
+          const unit = operation === 'optimize' || operation === 'purge' ? 'parquet_files' :
+            operation === 'vacuum' ? 'tombstones' : operation === 'checkpoint' ? 'commits' : 'log_objects';
+          const source = operation === 'optimize' || operation === 'purge' ? 'snapshot_active_files' :
+            operation === 'vacuum' ? 'bounded_tombstone_replay' :
+              operation === 'checkpoint' ? 'checkpoint_log_inventory' : 'verified_prune_proof';
+          const hasBytes = operation === 'optimize' || operation === 'purge';
+          return {
+            table: 'telemetry.sqlserver.sqlserver_availability_replica_states',
+            operation,
+            operation_failed: false,
+            interrupted: false,
+            report_outcome: 'noop',
+            maintenance_due_work: {
+              observed_at_ms: start + window * 30_000 + 1_000,
+              source,
+              completeness: 'complete',
+              unit,
+              due: false,
+              eligible_count: 0,
+              eligible_bytes: hasBytes ? 0 : null,
+              backlog_count: 0,
+              backlog_bytes: hasBytes ? 0 : null,
+              oldest_eligible_timestamp_ms: null,
+              oldest_timestamp_basis: null,
+              incomplete_reason: null,
+            },
+          };
+        })).flat(),
     },
   }];
   row.evidence_json = JSON.stringify(evidence);
 }
 
-function mutateMaintenanceReport(run: ReturnType<typeof sourceShapedRun>, mutate: (report: Record<string, unknown>) => void): void {
+function mutateMaintenanceReport(
+  run: ReturnType<typeof sourceShapedRun>,
+  operation: string,
+  window: number,
+  start: number,
+  mutate: (report: Record<string, unknown>, dueWork: Record<string, unknown>) => void,
+): void {
   const row = run.rows[0]!;
   const evidence = JSON.parse(String(row.evidence_json)) as {
     processes: Array<{ component: string; maintenance_table_policies?: { operation_reports: Array<Record<string, unknown>> } }>;
   };
   const maintenance = evidence.processes.find(process => process.component === 'maintenance');
-  const report = maintenance?.maintenance_table_policies?.operation_reports[0];
+  const report = maintenance?.maintenance_table_policies?.operation_reports.find(candidate =>
+    candidate.operation === operation && isMaintenanceWindow(candidate, window, start));
   if (!report) throw new Error('source fixture has no maintenance operation report');
-  mutate(report);
+  const dueWork = report.maintenance_due_work;
+  if (!dueWork || typeof dueWork !== 'object' || Array.isArray(dueWork)) throw new Error('source fixture has no due-work evidence');
+  mutate(report, dueWork as Record<string, unknown>);
   row.evidence_json = JSON.stringify(evidence);
+}
+
+function isMaintenanceWindow(report: Record<string, unknown>, window: number, start: number): boolean {
+  const dueWork = report.maintenance_due_work;
+  return dueWork !== null && typeof dueWork === 'object' && !Array.isArray(dueWork) &&
+    (dueWork as Record<string, unknown>).observed_at_ms === start + window * 30_000 + 1_000;
+}
+
+function maintenanceConfig(run: ReturnType<typeof sourceShapedRun>): Record<string, unknown> {
+  return (run.config.tunables as Record<string, unknown>).maintenance as Record<string, unknown>;
 }
 
 // Synthetic agreed-contract data, not a serialized producer fixture or benchmark.
@@ -228,16 +269,30 @@ function syntheticBacklog() {
   };
 }
 
-test('parses synthetic agreed backlog contract without treating it as qualification', () => {
+test('parses synthetic backlog and producer-shaped maintenance evidence without claiming measured results', () => {
   assert.equal(publicationBacklogIssue(syntheticBacklog(), 1_000_000, 1_150_000), undefined);
   const run = sourceShapedRun(40, [1, 1, 1, 1, 1], 1_000_000);
-  attachMaintenanceDebt(run, 1_060_000);
-  mutateMaintenanceReport(run, report => {
+  attachMaintenanceDueWork(run, 1_000_000, 1_150_000);
+  mutateMaintenanceReport(run, 'optimize', 0, 1_000_000, (report, dueWork) => {
     report.negative_probe = true;
-    report.compaction_debt = { observed_at_ms: 1_060_000, source: 'bounded_physical_inventory',
-      eligible_files: 0, eligible_bytes: 0, backlog_files: 0, backlog_bytes: 0,
-      oldest_eligible_partition_start_ms: null };
+    dueWork.source = 'bounded_physical_inventory';
   });
+  assert.equal(maintenanceDueWorkIssue(
+    JSON.parse(String(run.rows[0]!.evidence_json)).processes,
+    maintenanceConfig(run),
+    1_000_000,
+    1_150_000,
+  ), undefined);
+  mutateMaintenanceReport(run, 'optimize', 0, 1_000_000, (_report, dueWork) => {
+    dueWork.source = 'checkpoint_log_inventory';
+  });
+  assert.match(maintenanceDueWorkIssue(
+    JSON.parse(String(run.rows[0]!.evidence_json)).processes,
+    maintenanceConfig(run),
+    1_000_000,
+    1_150_000,
+  )!, /unavailable or invalid/);
+
   const row = run.rows[0]!;
   const evidence = JSON.parse(String(row.evidence_json)) as Record<string, unknown>;
   evidence.backlog = syntheticBacklog();
@@ -249,13 +304,151 @@ test('parses synthetic agreed backlog contract without treating it as qualificat
     officialRuns: [run],
   };
   const svg = renderCampaignResults([result], 'C1');
-  assert.match(svg, /sustained compaction debt and other maintenance due-work vectors remain unknown/);
   assert.match(svg, /No qualified winner/);
-  mutateMaintenanceReport(run, report => {
-    const debt = report.compaction_debt as Record<string, unknown>;
-    debt.source = 'snapshot_active_files';
-  });
-  assert.match(renderCampaignResults([result], 'C1'), /compaction-debt observation is unavailable or invalid/);
+  assert.match(svg, /five-operation maintenance due-work evidence is unavailable or invalid/);
+});
+
+test('consumes actual Rust results through the E1 projection and keeps single-window or failed wrappers UNKNOWN', () => {
+  const producer = JSON.parse(readFileSync(
+    new URL('./campaign-results-maintenance-rust.json', import.meta.url), 'utf8',
+  )) as {
+    operation_results: Record<string, unknown>[];
+  };
+  const projection = JSON.parse(readFileSync(
+    new URL('./campaign-results-maintenance-e1-projection.json', import.meta.url), 'utf8',
+  )) as {
+    idle_processes: Array<Record<string, unknown>>;
+    qualification_cases: Array<{ case: string; processes: Array<Record<string, unknown>> }>;
+  };
+  assert.deepEqual(producer.operation_results.map(result => result.operation),
+    ['purge', 'optimize', 'vacuum', 'checkpoint', 'prune_log']);
+  const idlePolicy = projection.idle_processes[0]!.maintenance_table_policies as Record<string, unknown>;
+  const idleReports = idlePolicy.operation_reports as Array<Record<string, unknown>>;
+  assert.deepEqual(idleReports.map(report => report.operation), producer.operation_results.map(result => result.operation));
+  assert.deepEqual(Object.keys(idlePolicy.tables as Record<string, unknown>),
+    ['telemetry.sqlserver.sqlserver_availability_replica_states']);
+  const start = 1_704_067_380_000;
+  const config = {
+    enabled: true,
+    apply: true,
+    operations: ['optimize', 'purge', 'vacuum', 'checkpoint', 'prune_log'],
+  };
+  const idleIssue = maintenanceDueWorkIssue(
+    projection.idle_processes,
+    config,
+    start,
+    start + 150_000,
+  );
+  assert.equal(idleIssue, 'maintenance due-work is missing from one or more complete 30-second windows');
+
+  for (const scenario of projection.qualification_cases) {
+    const policy = scenario.processes[0]!.maintenance_table_policies as Record<string, unknown>;
+    const reports = policy.operation_reports as Array<Record<string, unknown>>;
+    const issue = maintenanceDueWorkIssue(scenario.processes, config, start, start + 150_000);
+    assert.equal(typeof issue, 'string', scenario.case + ' must not qualify with retained single-pass evidence: ' + issue);
+    if (scenario.case === 'complete') {
+      assert.notEqual(reports[0]!.maintenance_due_work, null);
+      assert.equal(issue, 'maintenance due-work is missing from one or more complete 30-second windows');
+    } else if (scenario.case === 'error') {
+      assert.equal(policy.operation_outcomes && (policy.operation_outcomes as Record<string, unknown>).error_count, 1);
+      assert.equal(reports[0]!.maintenance_due_work, null);
+      assert.equal(issue, 'complete five-operation maintenance due-work evidence is unavailable or invalid');
+    } else {
+      assert.equal(reports[0]!.maintenance_due_work, null);
+      if (scenario.case === 'interrupted' || scenario.case === 'missing_report') {
+        assert.equal(issue, 'complete five-operation maintenance due-work evidence is unavailable or invalid');
+      } else {
+        assert.equal(issue, 'maintenance operation failed or its due-work observation is incomplete');
+      }
+    }
+  }
+});
+
+test('accepts actual Rust due/backlog samples but keeps the campaign unqualified and incomplete coverage UNKNOWN', () => {
+  const fixture = JSON.parse(readFileSync(
+    new URL('./campaign-results-maintenance-e1-projection.json', import.meta.url), 'utf8',
+  )) as {
+    due_backlog_processes: Array<Record<string, unknown>>;
+    incomplete_processes: Array<Record<string, unknown>>;
+  };
+  const producer = JSON.parse(readFileSync(
+    new URL('./campaign-results-maintenance-rust-debt.json', import.meta.url), 'utf8',
+  )) as {
+    due_backlog_results: Array<Record<string, unknown>>;
+    incomplete_results: Array<Record<string, unknown>>;
+  };
+  const start = 1_704_067_380_000;
+  const end = start + 150_000;
+  const config = {
+    enabled: true,
+    apply: true,
+    operations: ['optimize', 'purge', 'vacuum', 'checkpoint', 'prune_log'],
+  };
+  const duePolicy = fixture.due_backlog_processes[0]!.maintenance_table_policies as Record<string, unknown>;
+  const dueReports = duePolicy.operation_reports as Array<Record<string, unknown>>;
+  const dueWork = dueReports[0]!.maintenance_due_work as Record<string, unknown>;
+  const producerDueReport = producer.due_backlog_results[0]!.report as Record<string, unknown>;
+  const producerDueWork = producerDueReport.maintenance_due_work as Record<string, unknown>;
+  assert.equal(dueReports[0]!.operation, 'purge');
+  assert.equal(dueWork.observed_at_ms, producerDueWork.observed_at_ms);
+  assert.equal(dueWork.completeness, 'complete');
+  assert.equal(dueWork.due, true);
+  assert.equal(dueWork.eligible_count, 4);
+  assert.equal(dueWork.backlog_count, 2);
+  assert.equal(maintenanceDueWorkIssue(
+    fixture.due_backlog_processes, config, start, end,
+  ), 'maintenance due-work is missing from one or more complete 30-second windows');
+
+  const incompletePolicy = fixture.incomplete_processes[0]!.maintenance_table_policies as Record<string, unknown>;
+  const incompleteReports = incompletePolicy.operation_reports as Array<Record<string, unknown>>;
+  const incompleteWork = incompleteReports[0]!.maintenance_due_work as Record<string, unknown>;
+  const producerIncompleteReport = producer.incomplete_results[0]!.report as Record<string, unknown>;
+  const producerIncompleteWork = producerIncompleteReport.maintenance_due_work as Record<string, unknown>;
+  assert.equal(incompleteWork.completeness, 'incomplete');
+  assert.equal(incompleteWork.incomplete_reason, 'malformed_partition');
+  assert.equal(incompleteWork.eligible_count, null);
+  assert.equal(incompleteWork.observed_at_ms, producerIncompleteWork.observed_at_ms);
+  const incompleteIssue = maintenanceDueWorkIssue(
+    fixture.incomplete_processes, config, start, end,
+  );
+  assert.equal(incompleteIssue, 'maintenance operation failed or its due-work observation is incomplete');
+});
+
+test('rejects actual projected interrupted and missing-report records mixed with complete windows', () => {
+  const projection = JSON.parse(readFileSync(
+    new URL('./campaign-results-maintenance-e1-projection.json', import.meta.url), 'utf8',
+  )) as {
+    qualification_cases: Array<{ case: string; processes: Array<Record<string, unknown>> }>;
+  };
+  const start = 1_000_000;
+  const end = start + 150_000;
+  for (const caseName of ['interrupted', 'missing_report']) {
+    const scenario = projection.qualification_cases.find(candidate => candidate.case === caseName)!;
+    const projectedPolicy = scenario.processes[0]!.maintenance_table_policies as Record<string, unknown>;
+    const projectedReports = projectedPolicy.operation_reports as Array<Record<string, unknown>>;
+    const projectedReport = projectedReports[0]!;
+    assert.equal(projectedReport.operation_failed, false);
+    assert.equal(projectedReport.maintenance_due_work, null);
+
+    const run = sourceShapedRun(60 + (caseName === 'interrupted' ? 0 : 1), [1, 1, 1, 1, 1], start);
+    attachMaintenanceDueWork(run, start, end);
+    const evidence = JSON.parse(String(run.rows[0]!.evidence_json)) as {
+      processes: Array<{ component: string; maintenance_table_policies: Record<string, unknown> }>;
+    };
+    const maintenance = evidence.processes.find(process => process.component === 'maintenance')!;
+    const policy = maintenance.maintenance_table_policies;
+    const operationReports = policy.operation_reports as Array<Record<string, unknown>>;
+    operationReports.push(projectedReport);
+    const outcomes = policy.operation_outcomes as Record<string, unknown>;
+    outcomes.operation_count = Number(outcomes.operation_count) + 1;
+    run.rows[0]!.evidence_json = JSON.stringify(evidence);
+
+    assert.equal(
+      maintenanceDueWorkIssue(evidence.processes, maintenanceConfig(run), start, end),
+      'complete five-operation maintenance due-work evidence is unavailable or invalid',
+      caseName + ' must not be skipped beside otherwise complete five-window evidence',
+    );
+  }
 });
 
 test('rejects unknown, unavailable, dropped, gapped, or clock-reversed backlog contract samples', () => {
@@ -311,40 +504,114 @@ test('rejects sustained positive publication rows, bytes, publications, or age t
   }
 });
 
-test('uses only successful in-window E1 compaction-debt samples and keeps missing pressure unranked', () => {
-  const run = sourceShapedRun(30, [1, 1, 1, 1, 1], 1_000_000);
-  attachMaintenanceDebt(run, 1_060_000);
-  const result = {
-    cohort: 'C1', candidate: 'snappy', factorX: 'codec', valueX: 'snappy', factorY: 'level', valueY: '3',
-    repeat: 1, expectedRepeats: 3, committedRowsPerSecond: 1,
-    factorConfigPaths: ['tunables.parquet_writer.defaults.compression', 'tunables.parquet_writer.defaults.compression_level'],
-    officialRuns: [run],
-  };
-  const svg = renderCampaignResults([result], 'C1');
-  assert.match(svg, /publication backlog contract evidence is unavailable or invalid/);
-  assert.doesNotMatch(svg, /snappy \(0\/3\)/);
+test('requires complete, contiguous five-window due-work for all operations and rejects growth or unknowns', () => {
+  const valid = sourceShapedRun(30, [1, 1, 1, 1, 1], 1_000_000);
+  attachMaintenanceDueWork(valid, 1_000_000, 1_150_000);
+  const validEvidence = JSON.parse(String(valid.rows[0]!.evidence_json));
+  assert.equal(maintenanceDueWorkIssue(validEvidence.processes, maintenanceConfig(valid), 1_000_000, 1_150_000), undefined);
 
-  const dropped = sourceShapedRun(31, [1, 1, 1, 1, 1], 1_000_000);
-  attachMaintenanceDebt(dropped, 1_060_000, 1);
-  const droppedSvg = renderCampaignResults([{ ...result, officialRuns: [dropped] }], 'C1');
-  assert.match(droppedSvg, /timestamped in-window compaction-debt observation is unavailable or invalid/);
+  const mutations: Array<(run: ReturnType<typeof sourceShapedRun>) => void> = [
+    run => { attachMaintenanceDueWork(run, 1_000_000, 1_150_000, 1); },
+    run => { attachMaintenanceDueWork(run, 1_000_000, 1_150_000); mutateMaintenanceReport(run, 'purge', 2, 1_000_000,
+      (_report, dueWork) => { dueWork.completeness = 'incomplete'; dueWork.incomplete_reason = 'active_file_limit'; }); },
+    run => { attachMaintenanceDueWork(run, 1_000_000, 1_150_000); mutateMaintenanceReport(run, 'vacuum', 1, 1_000_000,
+      (_report, dueWork) => { dueWork.observed_at_ms = 1_150_000; }); },
+    run => { attachMaintenanceDueWork(run, 1_000_000, 1_150_000); mutateMaintenanceReport(run, 'checkpoint', 3, 1_000_000,
+      (_report, dueWork) => { dueWork.backlog_count = 1; dueWork.eligible_count = 0; }); },
+    run => { attachMaintenanceDueWork(run, 1_000_000, 1_150_000); mutateMaintenanceReport(run, 'optimize', 0, 1_000_000,
+      (_report, dueWork) => { dueWork.backlog_count = 0; dueWork.eligible_count = 0; dueWork.due = true; }); },
+    run => { attachMaintenanceDueWork(run, 1_000_000, 1_150_000); mutateMaintenanceReport(run, 'prune_log', 4, 1_000_000,
+      (report, dueWork) => { report.operation_failed = true; dueWork.due = false; }); },
+    run => { attachMaintenanceDueWork(run, 1_000_000, 1_150_000); mutateMaintenanceReport(run, 'purge', 0, 1_000_000,
+      (_report, dueWork) => { dueWork.unit = 'log_objects'; }); },
+    run => {
+      attachMaintenanceDueWork(run, 1_000_000, 1_150_000);
+      const evidence = JSON.parse(String(run.rows[0]!.evidence_json));
+      const maintenance = evidence.processes.find((process: Record<string, unknown>) => process.component === 'maintenance');
+      maintenance.maintenance_table_policies.operation_outcomes.error_count = 1;
+      run.rows[0]!.evidence_json = JSON.stringify(evidence);
+    },
+    run => {
+      attachMaintenanceDueWork(run, 1_000_000, 1_150_000);
+      const evidence = JSON.parse(String(run.rows[0]!.evidence_json));
+      const maintenance = evidence.processes.find((process: Record<string, unknown>) => process.component === 'maintenance');
+      maintenance.maintenance_table_policies.operation_reports =
+        maintenance.maintenance_table_policies.operation_reports.filter((report: Record<string, unknown>) => report.operation !== 'purge');
+      run.rows[0]!.evidence_json = JSON.stringify(evidence);
+    },
+  ];
+  mutations.forEach((mutate, index) => {
+    const run = sourceShapedRun(31 + index, [1, 1, 1, 1, 1], 1_000_000);
+    mutate(run);
+    const evidence = JSON.parse(String(run.rows[0]!.evidence_json));
+    assert.equal(typeof maintenanceDueWorkIssue(evidence.processes, maintenanceConfig(run), 1_000_000, 1_150_000), 'string',
+      'invalid evidence mutation ' + index);
+  });
 
-  const stale = sourceShapedRun(32, [1, 1, 1, 1, 1], 1_000_000);
-  attachMaintenanceDebt(stale, 999_999);
-  const staleSvg = renderCampaignResults([{ ...result, officialRuns: [stale] }], 'C1');
-  assert.match(staleSvg, /timestamped in-window compaction-debt observation is unavailable or invalid/);
-
-  for (const [sequence, mutate] of [
-    [35, (report: Record<string, unknown>) => { report.compaction_debt = null; }],
-    [36, (report: Record<string, unknown>) => { report.operation = 'checkpoint'; }],
-    [37, (report: Record<string, unknown>) => { report.operation_failed = true; }],
-  ] as Array<[number, (report: Record<string, unknown>) => void]>) {
-    const unavailable = sourceShapedRun(sequence, [1, 1, 1, 1, 1], 1_000_000);
-    attachMaintenanceDebt(unavailable, 1_060_000);
-    mutateMaintenanceReport(unavailable, mutate);
-    const svgUnavailable = renderCampaignResults([{ ...result, officialRuns: [unavailable] }], 'C1');
-    assert.match(svgUnavailable, /timestamped in-window compaction-debt observation is unavailable or invalid/);
+  const growing = sourceShapedRun(50, [1, 1, 1, 1, 1], 1_000_000);
+  attachMaintenanceDueWork(growing, 1_000_000, 1_150_000);
+  for (let window = 0; window < 5; window++) {
+    mutateMaintenanceReport(growing, 'optimize', window, 1_000_000, (_report, dueWork) => {
+      dueWork.eligible_count = 10;
+      dueWork.backlog_count = window + 1;
+      dueWork.eligible_bytes = 1_000;
+      dueWork.backlog_bytes = (window + 1) * 100;
+      dueWork.due = true;
+    });
   }
+  const growingEvidence = JSON.parse(String(growing.rows[0]!.evidence_json));
+  assert.match(maintenanceDueWorkIssue(growingEvidence.processes, maintenanceConfig(growing), 1_000_000, 1_150_000)!,
+    /optimize maintenance due-work grows/);
+
+  const eligibleGrowing = sourceShapedRun(51, [1, 1, 1, 1, 1], 1_000_000);
+  attachMaintenanceDueWork(eligibleGrowing, 1_000_000, 1_150_000);
+  for (let window = 0; window < 5; window++) {
+    mutateMaintenanceReport(eligibleGrowing, 'optimize', window, 1_000_000, (_report, dueWork) => {
+      dueWork.eligible_count = window + 1;
+      dueWork.backlog_count = 0;
+      dueWork.eligible_bytes = (window + 1) * 100;
+      dueWork.backlog_bytes = 0;
+      dueWork.due = true;
+    });
+  }
+  const eligibleEvidence = JSON.parse(String(eligibleGrowing.rows[0]!.evidence_json));
+  assert.match(maintenanceDueWorkIssue(eligibleEvidence.processes, maintenanceConfig(eligibleGrowing), 1_000_000, 1_150_000)!,
+    /optimize maintenance due-work grows/);
+});
+
+test('requires measured OPTIMIZE and PURGE debt vectors while preserving legitimate nulls', () => {
+  const start = 1_000_000;
+  const end = start + 150_000;
+  const configFor = (run: ReturnType<typeof sourceShapedRun>) => maintenanceConfig(run);
+  const evidenceFor = (run: ReturnType<typeof sourceShapedRun>) =>
+    JSON.parse(String(run.rows[0]!.evidence_json)).processes;
+
+  const checkpointNulls = sourceShapedRun(70, [1, 1, 1, 1, 1], start);
+  attachMaintenanceDueWork(checkpointNulls, start, end);
+  for (let window = 0; window < 5; window++) {
+    mutateMaintenanceReport(checkpointNulls, 'checkpoint', window, start, (_report, dueWork) => {
+      dueWork.backlog_count = null;
+    });
+  }
+  assert.equal(maintenanceDueWorkIssue(
+    evidenceFor(checkpointNulls), configFor(checkpointNulls), start, end,
+  ), undefined);
+
+  const mutations: Array<[string, (dueWork: Record<string, unknown>) => void]> = [
+    ['optimize', dueWork => { dueWork.backlog_count = null; }],
+    ['purge', dueWork => { dueWork.backlog_count = null; }],
+    ['optimize', dueWork => { dueWork.eligible_bytes = null; dueWork.backlog_bytes = null; }],
+    ['purge', dueWork => { dueWork.eligible_bytes = null; dueWork.backlog_bytes = null; }],
+  ];
+  mutations.forEach(([operation, mutate], index) => {
+    const run = sourceShapedRun(71 + index, [1, 1, 1, 1, 1], start);
+    attachMaintenanceDueWork(run, start, end);
+    mutateMaintenanceReport(run, operation, 2, start, (_report, dueWork) => mutate(dueWork));
+    assert.equal(maintenanceDueWorkIssue(
+      evidenceFor(run), configFor(run), start, end,
+    ), 'complete five-operation maintenance due-work evidence is unavailable or invalid',
+      operation + ' must not qualify with a missing measurable debt vector');
+  });
 });
 
 test('rejects exact-window commit buckets that do not sum to the run output', () => {
@@ -376,7 +643,7 @@ test('reads one sustained run of contiguous emitter buckets but keeps missing de
   };
   const svg = renderCampaignResults([result], 'C1');
   assert.match(svg, /snappy: unqualified, 0\/3 protocol-complete repeats; observed mean 1 rows\/s/);
-  assert.match(svg, /timestamped in-window compaction-debt observation is unavailable or invalid/);
+  assert.match(svg, /complete five-operation maintenance due-work evidence is unavailable or invalid/);
   assert.doesNotMatch(svg, /snappy \(0\/3\)/);
 });
 

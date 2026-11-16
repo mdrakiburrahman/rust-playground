@@ -295,52 +295,153 @@ function hasCommitWindowProvenance(value: RecordValue): boolean {
     value.unique_delivered_rows === null && value.complete_delivery_established === false;
 }
 
-function hasInWindowCompactionObservation(processes: unknown, start: number, end: number): boolean {
-  if (!Array.isArray(processes)) return false;
+const maintenanceOperationContracts = {
+  optimize: { sources: ['snapshot_active_files', 'bounded_physical_inventory'], unit: 'parquet_files' },
+  purge: { sources: ['snapshot_active_files', 'bounded_physical_inventory'], unit: 'parquet_files' },
+  vacuum: { sources: ['bounded_tombstone_replay'], unit: 'tombstones' },
+  checkpoint: { sources: ['checkpoint_log_inventory'], unit: 'commits' },
+  prune_log: { sources: ['bounded_log_inventory', 'verified_prune_proof'], unit: 'log_objects' },
+} as const;
+const maintenanceTable = 'telemetry.sqlserver.sqlserver_availability_replica_states';
+type MaintenanceOperation = keyof typeof maintenanceOperationContracts;
+
+export function maintenanceDueWorkIssue(
+  processes: unknown,
+  maintenanceConfig: unknown,
+  start: number,
+  end: number,
+): string | undefined {
+  const unavailable = 'complete five-operation maintenance due-work evidence is unavailable or invalid';
+  if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end <= start) return unavailable;
+  const operations = isRecord(maintenanceConfig) ? maintenanceConfig.operations : undefined;
+  if (!isRecord(maintenanceConfig) || maintenanceConfig.enabled !== true || maintenanceConfig.apply !== true ||
+      !Array.isArray(operations) ||
+      operations.some(operation => typeof operation !== 'string' || !Object.hasOwn(maintenanceOperationContracts, operation)) ||
+      new Set(operations).size !== operations.length ||
+      Object.keys(maintenanceOperationContracts).some(operation => !operations.includes(operation))) return unavailable;
+  if (!Array.isArray(processes)) return unavailable;
   const maintenanceProcesses = processes.filter((process): process is RecordValue =>
     isRecord(process) && process.component === 'maintenance');
-  if (maintenanceProcesses.length === 0) return false;
+  if (maintenanceProcesses.length !== 1) return unavailable;
+  const process = maintenanceProcesses[0]!;
+  const policy = process.maintenance_table_policies;
+  if (process.log_complete !== true || !isRecord(policy) ||
+      policy.source !== 'validated_consumer_per_table_policy' ||
+      policy.operation_report_timing_scope !== 'process_lifetime_including_warmup_and_drain_not_shared_measurement_window' ||
+      policy.operation_reports_dropped !== 0 || !Array.isArray(policy.operation_reports) ||
+      !isRecord(policy.tables) || Object.keys(policy.tables).length !== 1 ||
+      !isRecord(policy.tables[maintenanceTable]) || policy.tables[maintenanceTable].active !== true) return unavailable;
+  const outcomes = policy.operation_outcomes;
+  if (!isRecord(outcomes) || outcomes.scope !== 'process_lifetime' || outcomes.error_count !== 0) return unavailable;
 
-  for (const process of maintenanceProcesses) {
-    const policy = process.maintenance_table_policies;
-    if (process.log_complete !== true || !isRecord(policy) ||
-        policy.source !== 'validated_consumer_per_table_policy' ||
-        policy.operation_report_timing_scope !== 'process_lifetime_including_warmup_and_drain_not_shared_measurement_window' ||
-        policy.operation_reports_dropped !== 0 || !Array.isArray(policy.operation_reports) ||
-        !isRecord(policy.tables) || !isRecord(policy.tables.sqlserver_availability_replica_states) ||
-        policy.tables.sqlserver_availability_replica_states.active !== true) return false;
-
-    const outcomes = policy.operation_outcomes;
-    if (!isRecord(outcomes) || outcomes.scope !== 'process_lifetime' || outcomes.error_count !== 0) return false;
-    let samples = 0;
-    for (const report of policy.operation_reports) {
-      if (!isRecord(report)) return false;
-      if (report.table !== 'sqlserver_availability_replica_states' || report.operation !== 'optimize') continue;
-      const debt = report.compaction_debt;
-      if (!isRecord(debt)) return false;
-      const observedAt = debt.observed_at_ms;
-      if (typeof observedAt !== 'number' || !Number.isSafeInteger(observedAt) || observedAt <= 0) return false;
-      if (observedAt < start || observedAt >= end) continue;
-      if (report.operation_failed !== false || typeof report.negative_probe !== 'boolean' ||
-          report.mutation_mode !== 'apply_authorized_not_proof_of_mutation' ||
-          (debt.source !== 'snapshot_active_files' && debt.source !== 'bounded_physical_inventory') ||
-          !Number.isSafeInteger(debt.eligible_files) || Number(debt.eligible_files) < 0 ||
-          !Number.isSafeInteger(debt.eligible_bytes) || Number(debt.eligible_bytes) < 0 ||
-          !Number.isSafeInteger(debt.backlog_files) || Number(debt.backlog_files) < 0 ||
-          !Number.isSafeInteger(debt.backlog_bytes) || Number(debt.backlog_bytes) < 0 ||
-          Number(debt.backlog_files) > Number(debt.eligible_files) ||
-          Number(debt.backlog_bytes) > Number(debt.eligible_bytes) ||
-          debt.oldest_eligible_partition_start_ms !== null &&
-            (!Number.isSafeInteger(debt.oldest_eligible_partition_start_ms) ||
-              Number(debt.oldest_eligible_partition_start_ms) > observedAt)) return false;
-      if (report.negative_probe && (debt.source !== 'bounded_physical_inventory' ||
-          debt.eligible_files !== 0 || debt.eligible_bytes !== 0 || debt.backlog_files !== 0 ||
-          debt.backlog_bytes !== 0 || debt.oldest_eligible_partition_start_ms !== null)) return false;
-      samples++;
-    }
-    if (samples === 0) return false;
+  const windowCount = Math.floor((end - start) / 30_000);
+  if (windowCount < 5) return unavailable;
+  const observations = new Map<MaintenanceOperation, Array<Array<RecordValue>>>();
+  for (const operation of Object.keys(maintenanceOperationContracts) as MaintenanceOperation[]) {
+    observations.set(operation, Array.from({ length: windowCount }, () => []));
   }
-  return true;
+  for (const report of policy.operation_reports) {
+    if (!isRecord(report)) return unavailable;
+    if (report.table !== maintenanceTable || typeof report.operation !== 'string' ||
+        !Object.hasOwn(maintenanceOperationContracts, report.operation)) return unavailable;
+    const operation = report.operation as MaintenanceOperation;
+    if (report.operation_failed === true || report.interrupted === true || report.report_outcome === 'partial') {
+      return 'maintenance operation failed or its due-work observation is incomplete';
+    }
+    if (report.operation_failed !== false ||
+        report.interrupted !== undefined && typeof report.interrupted !== 'boolean' ||
+        !['noop', 'planned', 'committed', 'already_applied', 'deleted', 'checkpointed', 'pruned'].includes(String(report.report_outcome))) {
+      return unavailable;
+    }
+    const dueWork = report.maintenance_due_work;
+    if (!isRecord(dueWork)) return unavailable;
+    if (!Number.isSafeInteger(dueWork.observed_at_ms) || Number(dueWork.observed_at_ms) <= 0) {
+      return unavailable;
+    }
+    if (dueWork.completeness !== 'complete' || dueWork.incomplete_reason !== null) {
+      return 'maintenance operation failed or its due-work observation is incomplete';
+    }
+    const observedAt = Number(dueWork.observed_at_ms);
+    if (observedAt < start || observedAt >= end) continue;
+    const index = Math.floor((observedAt - start) / 30_000);
+    if (index >= windowCount) continue;
+    const contract = maintenanceOperationContracts[operation];
+    const eligibleCount = nonNegativeInteger(dueWork.eligible_count);
+    const backlogCount = dueWork.backlog_count === null ? null : nonNegativeInteger(dueWork.backlog_count);
+    const eligibleBytes = dueWork.eligible_bytes === null ? null : nonNegativeInteger(dueWork.eligible_bytes);
+    const backlogBytes = dueWork.backlog_bytes === null ? null : nonNegativeInteger(dueWork.backlog_bytes);
+    const requiresBacklogCount = operation !== 'checkpoint';
+    const requiresByteCounts = operation === 'optimize' || operation === 'purge';
+    if (!contract.sources.some(source => source === dueWork.source) || dueWork.unit !== contract.unit ||
+        typeof dueWork.due !== 'boolean' ||
+        eligibleCount === undefined || dueWork.backlog_count !== null && backlogCount === undefined ||
+        requiresBacklogCount && backlogCount === null ||
+        backlogCount !== null && backlogCount !== undefined && eligibleCount !== undefined && backlogCount > eligibleCount ||
+        eligibleCount === 0 && dueWork.due !== false ||
+        dueWork.eligible_bytes !== null && eligibleBytes === undefined ||
+        dueWork.backlog_bytes !== null && backlogBytes === undefined ||
+        requiresByteCounts && (eligibleBytes === null || backlogBytes === null) ||
+        backlogBytes !== null && backlogBytes !== undefined && eligibleBytes !== null && eligibleBytes !== undefined &&
+          backlogBytes > eligibleBytes ||
+        (eligibleBytes === null) !== (backlogBytes === null) ||
+        eligibleCount === 0 && (eligibleBytes !== null && eligibleBytes !== 0 ||
+          backlogCount !== null && backlogCount !== 0 || backlogBytes !== null && backlogBytes !== 0)) return unavailable;
+    const oldest = dueWork.oldest_eligible_timestamp_ms;
+    const basis = dueWork.oldest_timestamp_basis;
+    if (oldest === undefined || basis === undefined ||
+        oldest !== null && (!Number.isSafeInteger(oldest) || Number(oldest) < 0 || Number(oldest) > observedAt) ||
+        basis !== null && !['ingestion_partition_start', 'delta_remove_timestamp', 'log_object_last_modified'].includes(String(basis)) ||
+        (oldest === null) !== (basis === null) ||
+        eligibleCount === 0 && oldest !== null) return unavailable;
+    if (oldest !== null) {
+      const expectedBasis = contract.unit === 'parquet_files' ? 'ingestion_partition_start' :
+        contract.unit === 'tombstones' ? 'delta_remove_timestamp' : 'log_object_last_modified';
+      if (basis !== expectedBasis) return unavailable;
+    }
+    const window = observations.get(operation)![index]!;
+    if (window.some(sample => sample.observed_at_ms === observedAt)) return unavailable;
+    window.push({
+      ...dueWork,
+      _eligible_count: eligibleCount,
+      _eligible_bytes: eligibleBytes,
+      _backlog_count: backlogCount,
+      _backlog_bytes: backlogBytes,
+    });
+  }
+
+  for (const [operation, windows] of observations) {
+    const means = new Map<string, number[]>();
+    const coverage = new Map<string, boolean>();
+    const metrics = ['_eligible_count', '_backlog_count', '_eligible_bytes', '_backlog_bytes'] as const;
+    for (const samples of windows) {
+      if (samples.length === 0) return 'maintenance due-work is missing from one or more complete 30-second windows';
+      for (const metric of metrics) {
+        const values = samples.map(sample => sample[metric]);
+        const hasNull = values.some(value => value === null);
+        const measured = !hasNull;
+        if (hasNull && values.some(value => value !== null) ||
+            coverage.has(metric) && coverage.get(metric) !== measured) {
+          return 'maintenance due-work measurement coverage is inconsistent across the measured windows';
+        }
+        coverage.set(metric, measured);
+        if (measured) {
+          const metricMeans = means.get(metric) ?? [];
+          metricMeans.push(average(values.map(Number)));
+          means.set(metric, metricMeans);
+        }
+      }
+    }
+    const isGrowing = (values: number[]): boolean => {
+      const center = (values.length - 1) / 2;
+      const mean = average(values);
+      const slope = values.reduce((sum, value, index) => sum + (index - center) * (value - mean), 0);
+      return slope > 0 || values[values.length - 1]! > values[0]!;
+    };
+    if (metrics.some(metric => coverage.get(metric) && isGrowing(means.get(metric)!))) {
+      return operation + ' maintenance due-work grows across the measured windows';
+    }
+  }
+  return undefined;
 }
 
 export function publicationBacklogIssue(value: unknown, start: number, end: number): string | undefined {
@@ -474,14 +575,15 @@ function inspectOfficialRun(run: OfficialRun): { windows?: OfficialWindow[]; rea
       reconciliation.exact_match !== (deltaRows === completedRows)) {
     return { reason: 'official source/new-commit reconciliation bounds are inconsistent' };
   }
-  const compactionObserved = hasInWindowCompactionObservation(evidence.processes, start, end);
+  const tunables = run.config.tunables;
+  const maintenanceConfig = isRecord(tunables) ? tunables.maintenance : undefined;
+  const maintenanceIssue = maintenanceDueWorkIssue(evidence.processes, maintenanceConfig, start, end);
   const backlogIssue = publicationBacklogIssue(evidence.backlog, start, end);
   return {
     windows,
     reason: [
-      ...(!compactionObserved ? ['timestamped in-window compaction-debt observation is unavailable or invalid'] : []),
+      ...(maintenanceIssue ? [maintenanceIssue] : []),
       ...(backlogIssue ? [backlogIssue] : []),
-      'sustained compaction debt and other maintenance due-work vectors remain unknown',
     ].join('; '),
   };
 }
