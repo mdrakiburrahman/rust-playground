@@ -373,6 +373,27 @@ impl RunInventory {
         {
             bail!("running drain requires a bounded deadline");
         }
+        if self.cleanup.handoff.state == InventoryStepState::Complete
+            && ([
+                &self.cleanup.stop_admission,
+                &self.cleanup.bounded_drain,
+                &self.cleanup.evidence_capture,
+                &self.cleanup.terminal_capture,
+            ]
+            .iter()
+            .any(|step| step.state != InventoryStepState::Complete)
+                || self.resources.iter().any(|resource| !matches!(
+                    resource.state, InventoryResourceState::Removed | InventoryResourceState::Absent
+                ))
+                || self.fic.as_ref().is_some_and(|fic| !matches!(
+                    fic.state, InventoryResourceState::Removed | InventoryResourceState::Absent
+                ))
+                || self.qap.as_ref().is_some_and(|qap| !matches!(
+                    qap.state, InventoryResourceState::Removed | InventoryResourceState::Absent
+                )))
+        {
+            bail!("custody handoff cannot complete with unresolved steps or resources");
+        }
         Ok(())
     }
 
@@ -9552,6 +9573,16 @@ mod tests {
             ]
         }))?);
         external.validate()?;
+        let mut complete = external.clone();
+        complete.cleanup.handoff.state = InventoryStepState::Complete;
+        assert!(complete.validate().is_err());
+        complete.cleanup.stop_admission.state = InventoryStepState::Complete;
+        complete.cleanup.bounded_drain.state = InventoryStepState::Complete;
+        complete.cleanup.evidence_capture.state = InventoryStepState::Complete;
+        complete.cleanup.terminal_capture.state = InventoryStepState::Complete;
+        assert!(complete.validate().is_err());
+        complete.resources = absent.resources.clone();
+        complete.validate()?;
         let mut invalid_external = external.clone();
         invalid_external.fic.as_mut().unwrap().absence.as_mut().unwrap().name = "other".to_owned();
         assert!(invalid_external.validate().is_err());
