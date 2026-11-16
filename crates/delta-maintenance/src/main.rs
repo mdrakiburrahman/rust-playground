@@ -158,6 +158,9 @@ struct Cli {
     max_active_files: usize,
     #[arg(long, env = "ARROWCOL_MAINT_LATEST_PARTITIONS")]
     latest_partitions: Option<usize>,
+    /// Keep newest/open ingestion partitions protected (default true); false opts into live compaction.
+    #[arg(long, env = "ARROWCOL_MAINT_SEALED_PARTITIONS_ONLY", conflicts_with = "sealed_final")]
+    sealed_partitions_only: Option<bool>,
     /// Include newest/open OPTIMIZE partitions; caller supplies lifecycle proof.
     /// One-shot optimize only, in either dry-run or apply mode.
     #[arg(long, env = "ARROWCOL_MAINT_SEALED_FINAL")]
@@ -214,6 +217,10 @@ fn settings(cli: Cli) -> Result<Settings> {
             cli.small_file_bytes.map(|v| v.to_string()),
         ),
         ("arrowcol.optimize.minFiles", cli.min_files.map(|v| v.to_string())),
+        (
+            "arrowcol.optimize.sealedPartitionsOnly",
+            cli.sealed_partitions_only.map(|value| value.to_string()),
+        ),
         (
             "arrowcol.vacuum.maxDeletes",
             cli.vacuum_max_deletes.map(|v| v.to_string()),

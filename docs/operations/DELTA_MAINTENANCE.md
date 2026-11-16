@@ -124,6 +124,16 @@ Malformed checkpoint hints, record/checkpoint disagreement, unsupported history 
 
 **Log-size limitation:** pruning bounds historical JSON/checkpoint object count, not total log bytes. Checkpoints retain publication and maintenance application transactions forever; transaction retention is deliberately disallowed. The newest checkpoint can therefore grow with publication count. Only classic single-file checkpoints support pruning.
 
+## Live open-partition compaction (opt-in)
+
+| Setting | Type/default | Consumer and readback |
+| --- | --- | --- |
+| `--sealed-partitions-only <true\|false>` / `ARROWCOL_MAINT_SEALED_PARTITIONS_ONLY` | Optional strict bool; absent preserves `arrowcol.optimize.sealedPartitionsOnly=true` | Validated process default for the existing property; table metadata overrides it. Startup `startup.sealed_partitions_only` is the nullable request; `operation_settings.sealed_partitions_only` and `table_policy.arrowcol.optimize.sealedPartitionsOnly` are effective. |
+
+Explicit `false` permits scheduled compaction of newest/open ingestion partitions using the existing append-safe OPTIMIZE conflict model: publication revalidates every planned input and the metadata fingerprint, permits unrelated appends (including the same partition), and atomically publishes `dataChange=false` adds/removes of only those inputs. Concurrent removal or metadata change invalidates the plan. All byte/action/decoded-memory/output limits and retained-history checks remain unchanged. This may repeatedly rewrite fresh small files and require QAP re-acceleration; it is not an age-qualified policy or a throughput claim. No per-file ingestion-age guarantee is available from the current `DataFile` contract, so no guessed modification-time age filter is offered.
+
+The default remains closed partitions only. Invalid bools fail configuration; this setting cannot be combined with the distinct one-shot `--sealed-final` lifecycle flag.
+
 ## Final-compaction evidence and lifecycle
 
 The explicit one-shot `--sealed-final --operation optimize` policy bypasses only newest/open partition churn protection, not schema, retention, publication or byte/action/decoding limits. It is not a verified publisher-release receipt or reader lease. The CLI still rejects scheduled, mixed-operation or other-operation uses of this flag. A table's `arrowcol.optimize.sealedPartitionsOnly=false` is likewise an explicit churn policy, never a storage authority override.

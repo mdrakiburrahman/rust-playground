@@ -866,6 +866,11 @@ fn configuration_evidence(startup: &Settings, settings: &Settings, props: &Resol
                 .unwrap_or(DEFAULT_OPTIMIZE_UPLOAD_BUFFER_BYTES),
         ),
     };
+    let sealed_partitions_only_requested = startup
+        .process_properties
+        .get("arrowcol.optimize.sealedPartitionsOnly")
+        .map(|value| value.parse::<bool>())
+        .transpose()?;
     Ok(serde_json::json!({
         "startup": {
             "apply": startup.apply,
@@ -875,6 +880,7 @@ fn configuration_evidence(startup: &Settings, settings: &Settings, props: &Resol
             "max_idle_backoff_secs": startup.max_idle_backoff.as_secs(),
             "max_cycles": startup.max_cycles,
             "max_consecutive_stale_plans": startup.max_consecutive_stale_plans,
+            "sealed_partitions_only": sealed_partitions_only_requested,
             "max_concurrent_tables": startup.max_concurrent_tables,
             "max_concurrent_decoded_bytes": startup.max_concurrent_decoded_bytes,
             "commit_attempts": startup.commit_attempts,
@@ -897,6 +903,7 @@ fn configuration_evidence(startup: &Settings, settings: &Settings, props: &Resol
         "active": enabled,
         "operation_settings": enabled.then(|| serde_json::json!({
             "max_consecutive_stale_plans": settings.max_consecutive_stale_plans,
+            "sealed_partitions_only": !settings.optimize.sealed_final,
             "layout_mode": layout_mode,
             "vacuum_retention_ms": settings.vacuum_retention_ms,
             "log_retention_ms": settings.log_retention_ms,
