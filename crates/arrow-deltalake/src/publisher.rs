@@ -1669,14 +1669,14 @@ struct CompletionFailure {
 #[derive(Debug)]
 struct SharedUploadError(Arc<object_store::Error>);
 
-impl Display for SharedUploadError {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
-        Display::fmt(self.0.as_ref(), formatter)
+impl std::fmt::Display for SharedUploadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> fmt::Result {
+        std::fmt::Display::fmt(self.0.as_ref(), formatter)
     }
 }
 
-impl Error for SharedUploadError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
+impl std::error::Error for SharedUploadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(self.0.as_ref())
     }
 }
@@ -1687,8 +1687,8 @@ struct MultipartSettlementError {
     abort: object_store::Error,
 }
 
-impl Display for MultipartSettlementError {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+impl std::fmt::Display for MultipartSettlementError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
             "multipart completion failed: {}; abort also failed: {}",
@@ -1697,8 +1697,8 @@ impl Display for MultipartSettlementError {
     }
 }
 
-impl Error for MultipartSettlementError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
+impl std::error::Error for MultipartSettlementError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(self.completion.as_ref())
     }
 }
