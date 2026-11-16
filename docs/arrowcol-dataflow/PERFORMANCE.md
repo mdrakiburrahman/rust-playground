@@ -37,8 +37,9 @@ cargo run --locked --package arrowcol-dataflow-rust -- --config projects/arrowco
 Parquet compression accepts uncompressed, snappy, gzip (0..9), brotli (0..11),
 zstd (1..22), lz4_raw and legacy lz4. `lz4` uses deprecated Hadoop framing and
 is retained only for compatibility; prefer `lz4_raw`, which uses the Parquet
-spec framing. Selecting `lz4` emits a process-once warning. Levels are forbidden
-on codecs without a level. `defaults` and `columns` accept the same `ColumnOptions`; column selectors
+spec framing, only when every downstream reader supports it. Selecting `lz4`
+emits a process-once warning. Levels are forbidden on codecs without a level.
+`defaults` and `columns` accept the same `ColumnOptions`; column selectors
 must uniquely resolve to an actual physical Parquet leaf, after normalization
 and partition projection. Dictionary encoding is controlled separately from
 fallback encoding. FPP must be finite and strictly between zero and one.
