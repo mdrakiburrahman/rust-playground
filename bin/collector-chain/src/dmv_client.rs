@@ -372,6 +372,7 @@ struct EncodedBatch {
     table: Arc<DmvTable>,
     data: Arc<Vec<FlightData>>,
     rows: u64,
+    raw_arrow_bytes: u64,
     encoded_bytes: u64,
 }
 
@@ -480,9 +481,15 @@ struct Measurement {
     start_unix_ms: u64,
     end_unix_ms: u64,
     rows: AtomicU64,
+    raw_arrow_bytes: AtomicU64,
     bytes: AtomicU64,
     worker_rows: Vec<AtomicU64>,
     pilot_rows: Vec<AtomicU64>,
+    raw_window_bytes: Vec<AtomicU64>,
+    wire_window_bytes: Vec<AtomicU64>,
+    window_latency: Vec<Mutex<[u64; 64]>>,
+    resource_start: Mutex<Option<ResourceSample>>,
+    resource_end: Mutex<Option<ResourceSample>>,
     rejected_streams: AtomicU64,
     rejected_rows: AtomicU64,
     retried_streams: AtomicU64,
@@ -493,6 +500,24 @@ struct Measurement {
     ambiguous_rows: AtomicU64,
 }
 
+fn latency_percentiles(latency: &[u64; 64]) -> serde_json::Value {
+    let count = latency.iter().sum::<u64>();
+    let percentile = |numerator: u64| {
+        if count == 0 {
+            return None;
+        }
+        let target = count.saturating_mul(numerator).div_ceil(100);
+        let mut observed = 0;
+        for (bucket, samples) in latency.iter().enumerate() {
+            observed += samples;
+            if observed >= target {
+                return Some((1_u64 << bucket).saturating_sub(1));
+            }
+        }
+        Some(u64::MAX)
+    };
+    serde_json::json!({ "p50": percentile(50), "p95": percentile(95), "p99": percentile(99), "samples": count, "precision": "power_of_two_upper_bound" })
+}
 impl Measurement {
     fn new(start_unix_ms: u64, end_unix_ms: u64, workers: usize) -> Result<Self> {
         anyhow::ensure!(end_unix_ms > start_unix_ms, "measurement window must be positive");
@@ -501,10 +526,22 @@ impl Measurement {
             end_unix_ms,
             rows: AtomicU64::new(0),
             bytes: AtomicU64::new(0),
+            raw_arrow_bytes: AtomicU64::new(0),
             worker_rows: (0..workers).map(|_| AtomicU64::new(0)).collect(),
             pilot_rows: (0..(end_unix_ms - start_unix_ms).div_ceil(30_000))
                 .map(|_| AtomicU64::new(0))
                 .collect(),
+            raw_window_bytes: (0..(end_unix_ms - start_unix_ms).div_ceil(30_000))
+                .map(|_| AtomicU64::new(0))
+                .collect(),
+            wire_window_bytes: (0..(end_unix_ms - start_unix_ms).div_ceil(30_000))
+                .map(|_| AtomicU64::new(0))
+                .collect(),
+            window_latency: (0..(end_unix_ms - start_unix_ms).div_ceil(30_000))
+                .map(|_| Mutex::new([0; 64]))
+                .collect(),
+            resource_start: Mutex::new(None),
+            resource_end: Mutex::new(None),
             rejected_streams: AtomicU64::new(0),
             rejected_rows: AtomicU64::new(0),
             retried_streams: AtomicU64::new(0),
@@ -516,14 +553,64 @@ impl Measurement {
         })
     }
 
-    fn record_completion(&self, worker: usize, rows: u64, bytes: u64, observed_unix_ms: u64) {
+    fn record_completion(
+        &self,
+        worker: usize,
+        rows: u64,
+        raw_arrow_bytes: u64,
+        wire_bytes: u64,
+        observed_unix_ms: u64,
+    ) {
         if observed_unix_ms >= self.start_unix_ms && observed_unix_ms < self.end_unix_ms {
             self.rows.fetch_add(rows, Ordering::Relaxed);
-            self.bytes.fetch_add(bytes, Ordering::Relaxed);
+            self.bytes.fetch_add(wire_bytes, Ordering::Relaxed);
+            self.raw_arrow_bytes.fetch_add(raw_arrow_bytes, Ordering::Relaxed);
             self.worker_rows[worker].fetch_add(rows, Ordering::Relaxed);
-            self.pilot_rows[((observed_unix_ms - self.start_unix_ms) / 30_000) as usize]
-                .fetch_add(rows, Ordering::Relaxed);
+            let index = ((observed_unix_ms - self.start_unix_ms) / 30_000) as usize;
+            self.pilot_rows[index].fetch_add(rows, Ordering::Relaxed);
+            self.raw_window_bytes[index].fetch_add(raw_arrow_bytes, Ordering::Relaxed);
+            self.wire_window_bytes[index].fetch_add(wire_bytes, Ordering::Relaxed);
         }
+    }
+
+    fn record_send_latency(&self, micros: u64, send_unix_ns: u64) -> Result<()> {
+        let send_unix_ms = send_unix_ns / 1_000_000;
+        if send_unix_ms >= self.start_unix_ms && send_unix_ms < self.end_unix_ms {
+            let index = ((send_unix_ms - self.start_unix_ms) / 30_000) as usize;
+            let bucket = (64 - micros.leading_zeros()) as usize;
+            self.window_latency[index]
+                .lock()
+                .map_err(|_| anyhow::anyhow!("measurement latency histogram poisoned"))?[bucket.min(63)] += 1;
+        }
+        Ok(())
+    }
+
+    fn record_resource_sample(&self, sample: ResourceSample, is_start: bool) -> Result<()> {
+        let target = if is_start {
+            &self.resource_start
+        } else {
+            &self.resource_end
+        };
+        let mut target = target
+            .lock()
+            .map_err(|_| anyhow::anyhow!("resource sample state poisoned"))?;
+        anyhow::ensure!(target.is_none(), "resource sample already recorded");
+        *target = Some(sample);
+        Ok(())
+    }
+
+    fn resource_metrics(&self) -> serde_json::Value {
+        let start = self
+            .resource_start
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        let end = self
+            .resource_end
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        resource_report(start, end)
     }
 
     fn snapshot(&self) -> serde_json::Value {
@@ -531,8 +618,23 @@ impl Measurement {
             "start_unix_ms": self.start_unix_ms, "end_unix_ms": self.end_unix_ms,
             "completed_rows": self.rows.load(Ordering::Relaxed),
             "completed_bytes": self.bytes.load(Ordering::Relaxed),
+            "completed_wire_bytes": self.bytes.load(Ordering::Relaxed),
+            "completed_raw_arrow_bytes": self.raw_arrow_bytes.load(Ordering::Relaxed),
             "worker_completed_rows": self.worker_rows.iter().map(|value| value.load(Ordering::Relaxed)).collect::<Vec<_>>(),
             "pilot_window_rows": self.pilot_rows.iter().map(|value| value.load(Ordering::Relaxed)).collect::<Vec<_>>(),
+            "windows": (0..self.pilot_rows.len()).map(|index| {
+                let start_unix_ms = self.start_unix_ms + index as u64 * 30_000;
+                let end_unix_ms = self.end_unix_ms.min(start_unix_ms.saturating_add(30_000));
+                let latency = self.window_latency[index].lock().unwrap_or_else(|error| error.into_inner());
+                serde_json::json!({
+                    "start_unix_ms": start_unix_ms, "end_unix_ms": end_unix_ms,
+                    "completed_rows": self.pilot_rows[index].load(Ordering::Relaxed),
+                    "completed_raw_arrow_bytes": self.raw_window_bytes[index].load(Ordering::Relaxed),
+                    "completed_wire_bytes": self.wire_window_bytes[index].load(Ordering::Relaxed),
+                    "send_latency_us": latency_percentiles(&latency),
+                    "send_latency_scope": "attempts_grouped_by_fresh_send_timestamp_in_half_open_window"
+                })
+            }).collect::<Vec<_>>(),
             "rejected_streams": self.rejected_streams.load(Ordering::Relaxed),
             "rejected_rows": self.rejected_rows.load(Ordering::Relaxed),
             "retried_streams": self.retried_streams.load(Ordering::Relaxed),
@@ -542,6 +644,7 @@ impl Measurement {
             "ambiguous_streams": self.ambiguous_streams.load(Ordering::Relaxed),
             "ambiguous_rows": self.ambiguous_rows.load(Ordering::Relaxed),
             "scope": "per_stream_admission_completion_observed_in_half_open_shared_unix_window",
+            "client_resources": self.resource_metrics(),
         })
     }
 
@@ -741,6 +844,7 @@ impl PreparedClient {
                         table: Arc::clone(table),
                         data: Arc::new(data),
                         rows: length as u64,
+                        raw_arrow_bytes: bytes,
                         encoded_bytes: wire_bytes,
                     });
                 }
@@ -860,16 +964,38 @@ impl PreparedClient {
                 observed.abs_diff(measurement_start_unix_ms) <= 250,
                 "client did not start within 250ms of the shared measurement interval"
             );
+            measurement.record_resource_sample(ResourceSample::capture()?, true)?;
             println!("OAT_CLIENT_METRICS {}", self.metrics("measurement_start"));
             Ok::<u64, anyhow::Error>(observed)
         };
         tokio::pin!(phase);
         let mut measurement_started = None;
+        let resource_end = async {
+            while unix_ms()? < measurement_end_unix_ms {
+                tokio::time::sleep(Duration::from_millis(
+                    measurement_end_unix_ms.saturating_sub(unix_ms()?).min(10),
+                ))
+                .await;
+            }
+            measurement.record_resource_sample(ResourceSample::capture()?, false)
+        };
+        tokio::pin!(resource_end);
+        let mut resource_end_recorded = false;
         loop {
             tokio::select! {
                 result = &mut phase, if measurement_started.is_none() => {
                     match result {
                         Ok(started) => measurement_started = Some(started),
+                        Err(error) => {
+                            tasks.abort_all();
+                            while tasks.join_next().await.is_some() {}
+                            return Err(error);
+                        }
+                    }
+                }
+                result = &mut resource_end, if !resource_end_recorded => {
+                    match result {
+                        Ok(()) => resource_end_recorded = true,
                         Err(error) => {
                             tasks.abort_all();
                             while tasks.join_next().await.is_some() {}
@@ -894,12 +1020,6 @@ impl PreparedClient {
                 }
                 else => break,
             }
-        }
-        while unix_ms()? < measurement_end_unix_ms {
-            tokio::time::sleep(Duration::from_millis(
-                measurement_end_unix_ms.saturating_sub(unix_ms()?).min(10),
-            ))
-            .await;
         }
         Ok(ContinuousReport {
             completed_rows: measurement.rows.load(Ordering::Relaxed),
@@ -1032,10 +1152,11 @@ impl PreparedClient {
             started: Instant::now(),
             finished: false,
         };
+        let observation = SendObservation::fresh()?;
         let mut request = Request::new(stream::iter(batch.data.as_ref().clone()));
         let timeout = Duration::from_millis(self.options.request_timeout_ms);
         let result = tokio::time::timeout(timeout, async {
-            request_metadata(&mut request, &batch.table, self.signer.as_ref())?;
+            request_metadata(&mut request, &batch.table, self.signer.as_ref(), Some(&observation))?;
             request.set_timeout(timeout);
             completed_admission(self.options.client(channel).do_put(request).await?.into_inner()).await
         })
@@ -1049,6 +1170,9 @@ impl PreparedClient {
         };
         attempt.finished = true;
         let micros = u64::try_from(attempt.started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        if let Some(measurement) = measurement {
+            measurement.record_send_latency(micros, observation.send_unix_ns)?;
+        }
         let bucket = (64 - micros.leading_zeros()) as usize;
         counters
             .latency
@@ -1057,7 +1181,13 @@ impl PreparedClient {
         match result {
             Ok(guarantee) => {
                 if let Some((measurement, completed_unix_ms)) = measurement.zip(completed_unix_ms) {
-                    measurement.record_completion(worker, batch.rows, batch.encoded_bytes, completed_unix_ms);
+                    measurement.record_completion(
+                        worker,
+                        batch.rows,
+                        batch.raw_arrow_bytes,
+                        batch.encoded_bytes,
+                        completed_unix_ms,
+                    );
                 }
                 counters.completed_rows.fetch_add(batch.rows, Ordering::Relaxed);
                 counters
@@ -1139,6 +1269,13 @@ impl PreparedClient {
             "completion_semantics": "validated_admission_response_not_delta_commit",
             "send_latency_scope": "request_metadata_protobuf_grpc_compression_network_and_acknowledgement_excluding_interval",
             "bytes_semantics": "sum_of_protobuf_flight_data_encoded_lengths_excluding_grpc_http2",
+            "send_observation": {
+                "id_header": CLIENT_SEND_OBSERVATION_ID_HEADER,
+                "timestamp_header": CLIENT_SEND_UNIX_NS_HEADER,
+                "timestamp_unit": "unix_nanoseconds",
+                "identity_scope": "unique_per_do_put_attempt_including_retries",
+                "clock_uncertainty_ns": null
+            },
             "elapsed_seconds": self.started.elapsed().as_secs_f64(),
             "preparation": self.preparation,
             "measurement_window": measurement.as_ref().map(|value| value.snapshot()),
@@ -1399,6 +1536,207 @@ fn thread_cpu_seconds() -> Result<Option<f64>> {
     }
 }
 
+#[derive(Clone, Debug)]
+struct ResourceSample {
+    sampled_unix_ms: u64,
+    process_cpu_ns: Option<u64>,
+    network_rx_bytes: Option<u64>,
+    network_tx_bytes: Option<u64>,
+    network_tx_capacity_bps: Option<u64>,
+    available_parallelism: Option<usize>,
+}
+impl ResourceSample {
+    fn capture() -> Result<Self> {
+        let (network_rx_bytes, network_tx_bytes, network_tx_capacity_bps) = network_snapshot()?;
+        Ok(Self {
+            sampled_unix_ms: unix_ms()?,
+            process_cpu_ns: process_cpu_ns()?,
+            network_rx_bytes,
+            network_tx_bytes,
+            network_tx_capacity_bps,
+            available_parallelism: std::thread::available_parallelism().ok().map(|value| value.get()),
+        })
+    }
+}
+
+fn process_cpu_ns() -> Result<Option<u64>> {
+    let tasks = match std::fs::read_dir("/proc/self/task") {
+        Ok(tasks) => tasks,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error).context("read client thread list"),
+    };
+    let mut total = 0_u64;
+    let mut count = 0_usize;
+    for task in tasks {
+        let path = task?.path().join("schedstat");
+        let contents = match std::fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
+        };
+        let runtime: u64 = contents
+            .split_whitespace()
+            .next()
+            .context("missing scheduler CPU accounting")?
+            .parse()?;
+        total = total.checked_add(runtime).context("process CPU accounting overflow")?;
+        count += 1;
+    }
+    Ok((count > 0).then_some(total))
+}
+
+fn network_snapshot() -> Result<(Option<u64>, Option<u64>, Option<u64>)> {
+    let contents = match std::fs::read_to_string("/proc/net/dev") {
+        Ok(contents) => contents,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            return Ok((None, None, None));
+        }
+        Err(error) => return Err(error).context("read client network counters"),
+    };
+    let mut rx_bytes = 0_u64;
+    let mut tx_bytes = 0_u64;
+    let mut tx_capacity_bps = 0_u64;
+    let mut capacity_known = true;
+    let mut interfaces = 0_usize;
+    for line in contents.lines().skip(2) {
+        let Some((name, values)) = line.split_once(':') else {
+            continue;
+        };
+        let name = name.trim();
+        if name == "lo" {
+            continue;
+        }
+        let values = values
+            .split_whitespace()
+            .map(str::parse::<u64>)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        anyhow::ensure!(
+            values.len() >= 9,
+            "network counters for {name} have fewer than nine fields"
+        );
+        rx_bytes = rx_bytes
+            .checked_add(values[0])
+            .context("network receive counter overflow")?;
+        tx_bytes = tx_bytes
+            .checked_add(values[8])
+            .context("network transmit counter overflow")?;
+        let speed_path = std::path::Path::new("/sys/class/net").join(name).join("speed");
+        let speed_mbps = match std::fs::read_to_string(&speed_path) {
+            Ok(value) => value.trim().parse::<i64>().ok().filter(|value| *value > 0),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                None
+            }
+            Err(error) => return Err(error).with_context(|| format!("read {}", speed_path.display())),
+        };
+        if let Some(speed_mbps) = speed_mbps {
+            tx_capacity_bps = tx_capacity_bps
+                .checked_add(
+                    (speed_mbps as u64)
+                        .checked_mul(1_000_000)
+                        .context("network link speed overflow")?,
+                )
+                .context("network capacity overflow")?;
+        } else {
+            capacity_known = false;
+        }
+        interfaces += 1;
+    }
+    if interfaces == 0 {
+        return Ok((None, None, None));
+    }
+    Ok((
+        Some(rx_bytes),
+        Some(tx_bytes),
+        capacity_known.then_some(tx_capacity_bps),
+    ))
+}
+
+fn resource_report(start: Option<ResourceSample>, end: Option<ResourceSample>) -> serde_json::Value {
+    let elapsed_ns = start
+        .as_ref()
+        .zip(end.as_ref())
+        .and_then(|(start, end)| end.sampled_unix_ms.checked_sub(start.sampled_unix_ms))
+        .and_then(|millis| millis.checked_mul(1_000_000));
+    let cpu_ns = start
+        .as_ref()
+        .zip(end.as_ref())
+        .and_then(|(start, end)| start.process_cpu_ns.zip(end.process_cpu_ns))
+        .and_then(|(start, end)| end.checked_sub(start));
+    let cpu_seconds = cpu_ns.map(|nanos| nanos as f64 / 1e9);
+    let elapsed_seconds = elapsed_ns
+        .map(|nanos| nanos as f64 / 1e9)
+        .filter(|seconds| *seconds > 0.0);
+    let available_cores = start
+        .as_ref()
+        .zip(end.as_ref())
+        .and_then(|(start, end)| start.available_parallelism.zip(end.available_parallelism))
+        .map(|(start, end)| start.min(end));
+    let cpu_core_equivalents = cpu_seconds.zip(elapsed_seconds).map(|(cpu, elapsed)| cpu / elapsed);
+    let cpu_utilization_fraction = cpu_core_equivalents
+        .zip(available_cores)
+        .map(|(used, total)| used / total as f64);
+    let rx_bytes = start
+        .as_ref()
+        .zip(end.as_ref())
+        .and_then(|(start, end)| start.network_rx_bytes.zip(end.network_rx_bytes))
+        .and_then(|(start, end)| end.checked_sub(start));
+    let tx_bytes = start
+        .as_ref()
+        .zip(end.as_ref())
+        .and_then(|(start, end)| start.network_tx_bytes.zip(end.network_tx_bytes))
+        .and_then(|(start, end)| end.checked_sub(start));
+    let tx_bytes_per_second = tx_bytes
+        .map(|bytes| bytes as f64)
+        .zip(elapsed_seconds)
+        .map(|(bytes, elapsed)| bytes / elapsed);
+    let tx_capacity_bps = start
+        .as_ref()
+        .zip(end.as_ref())
+        .and_then(|(start, end)| start.network_tx_capacity_bps.zip(end.network_tx_capacity_bps))
+        .map(|(start, end)| start.min(end));
+    let tx_capacity_fraction = tx_bytes_per_second
+        .zip(tx_capacity_bps)
+        .map(|(rate, capacity)| rate * 8.0 / capacity as f64);
+    serde_json::json!({
+        "status": if elapsed_ns.is_some() { "sampled" } else { "incomplete" },
+        "start_sample_unix_ms": start.as_ref().map(|sample| sample.sampled_unix_ms),
+        "end_sample_unix_ms": end.as_ref().map(|sample| sample.sampled_unix_ms),
+        "sample_interval_ns": elapsed_ns,
+        "process_cpu_ns": cpu_ns, "process_cpu_seconds": cpu_seconds,
+        "available_parallelism": available_cores, "cpu_core_equivalents": cpu_core_equivalents,
+        "cpu_utilization_fraction": cpu_utilization_fraction,
+        "network_rx_bytes": rx_bytes, "network_tx_bytes": tx_bytes,
+        "network_tx_bytes_per_second": tx_bytes_per_second,
+        "network_tx_capacity_bps": tx_capacity_bps, "network_tx_capacity_fraction": tx_capacity_fraction,
+        "cpu_scope": "sum_of_client_thread_schedstat_runtime",
+        "network_scope": "container_non_loopback_interfaces_all_traffic_not_per_flight_attribution",
+        "clock_uncertainty_ns": null
+    })
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1678,6 +2016,7 @@ mod tests {
         options.request_timeout_ms = 100;
         let table = Arc::new(table_named("sqlserver_wait_stats")?);
         let record = synthetic_batch(&table, "client", 8, 0, 0, &options)?;
+        let raw_arrow_bytes = record.get_array_memory_size() as u64;
         let data = encode(&table, "v1", record, &options).await?;
         let encoded_bytes = data.iter().map(|message| message.encoded_len() as u64).sum();
         let channel = options.endpoint("http://127.0.0.1:0")?.connect_lazy();
@@ -1686,6 +2025,7 @@ mod tests {
                 table,
                 data: Arc::new(data),
                 rows: 8,
+                raw_arrow_bytes,
                 encoded_bytes,
             }])],
             channels: vec![vec![channel]],
@@ -1738,17 +2078,53 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_resource_readings_remain_unknown() {
+        let start = ResourceSample {
+            sampled_unix_ms: 1_000,
+            process_cpu_ns: None,
+            network_rx_bytes: None,
+            network_tx_bytes: None,
+            network_tx_capacity_bps: None,
+            available_parallelism: None,
+        };
+        let end = ResourceSample {
+            sampled_unix_ms: 2_000,
+            ..start.clone()
+        };
+        let report = resource_report(Some(start), Some(end));
+        for field in [
+            "process_cpu_ns",
+            "network_rx_bytes",
+            "network_tx_bytes",
+            "network_tx_capacity_bps",
+            "available_parallelism",
+        ] {
+            assert!(report[field].is_null(), "{field} must remain unknown");
+        }
+    }
+
+    #[test]
     fn individual_stream_completions_are_attributed_even_when_a_peer_spans_the_window() -> Result<()> {
         let measurement = Measurement::new(10_000, 70_000, 2)?;
-        measurement.record_completion(0, 100, 1000, 9_999);
-        measurement.record_completion(0, 200, 2000, 10_000);
-        measurement.record_completion(0, 300, 3000, 69_999);
-        measurement.record_completion(1, 400, 4000, 70_000);
+        measurement.record_send_latency(10, 9_999_000_000)?;
+        measurement.record_send_latency(50, 10_000_000_000)?;
+        measurement.record_send_latency(100, 39_999_000_000)?;
+        measurement.record_send_latency(200, 40_000_000_000)?;
+        measurement.record_send_latency(300, 69_999_000_000)?;
+        measurement.record_send_latency(400, 70_000_000_000)?;
+        measurement.record_completion(0, 100, 900, 1000, 9_999);
+        measurement.record_completion(0, 200, 1800, 2000, 10_000);
+        measurement.record_completion(0, 300, 2700, 3000, 69_999);
+        measurement.record_completion(1, 400, 3600, 4000, 70_000);
         let snapshot = measurement.snapshot();
         assert_eq!(snapshot["completed_rows"], 500);
         assert_eq!(snapshot["completed_bytes"], 5000);
+        assert_eq!(snapshot["completed_raw_arrow_bytes"], 4500);
         assert_eq!(snapshot["worker_completed_rows"], serde_json::json!([500, 0]));
         assert_eq!(snapshot["pilot_window_rows"], serde_json::json!([200, 300]));
+        assert_eq!(snapshot["windows"][0]["completed_raw_arrow_bytes"], 1800);
+        assert_eq!(snapshot["windows"][0]["send_latency_us"]["samples"], 2);
+        assert_eq!(snapshot["windows"][1]["send_latency_us"]["samples"], 2);
         Ok(())
     }
 
@@ -1764,6 +2140,7 @@ mod tests {
                         table: Arc::clone(&table),
                         data: Arc::new(Vec::new()),
                         rows,
+                        raw_arrow_bytes: 0,
                         encoded_bytes: 0,
                     })
                     .collect::<Vec<_>>(),
