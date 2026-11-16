@@ -70,6 +70,7 @@ fn commit_window_output(
         "measurement_start_unix_ms": start, "measurement_end_unix_ms": end, "window_seconds": seconds,
         "clock": "collector_system_unix_ms_shared_schedule_clock_skew_not_measured",
         "rows": null, "files": null, "input_bytes": null, "parquet_bytes": null, "rows_per_second": null,
+        "input_bytes_per_second": null, "parquet_bytes_per_second": null,
         "bytes_per_row": null, "compression_ratio": null, "commit_latency_seconds": null,
         "unique_delivered_rows": null, "complete_delivery_established": false,
         "warmup_backlog": "included_when_commit_finishes_in_window",
@@ -136,6 +137,8 @@ fn commit_window_output(
     result["input_bytes"] = json!(input_bytes);
     result["parquet_bytes"] = json!(parquet_bytes);
     result["rows_per_second"] = json!(rows as f64 / seconds);
+    result["input_bytes_per_second"] = json!(input_bytes as f64 / seconds);
+    result["parquet_bytes_per_second"] = json!(parquet_bytes as f64 / seconds);
     result["commits"] = json!(latencies.len());
     result["bytes_per_row"] = json!((rows > 0).then(|| parquet_bytes as f64 / rows as f64));
     result["compression_ratio"] = json!((parquet_bytes > 0).then(|| input_bytes as f64 / parquet_bytes as f64));
@@ -437,6 +440,20 @@ fn durable_commit_evidence_for_cell(
             cumulative_unavailable,
             cell_start_unix_ms,
         )?;
+        let mut complete_windows = Vec::new();
+        let mut window_start = start;
+        while let Some(window_end) = window_start.checked_add(30_000).filter(|window_end| *window_end <= end) {
+            complete_windows.push(commit_window_output(
+                &events,
+                &canonical_table_name,
+                window_start,
+                window_end,
+                cumulative_unavailable,
+                cell_start_unix_ms,
+            )?);
+            window_start = window_end;
+        }
+        evidence["complete_30_second_commit_windows"] = json!(complete_windows);
         evidence["run_cumulative_output"] = run_cumulative_output(
             &events,
             &canonical_table_name,
@@ -640,6 +657,8 @@ mod commit_evidence_tests {
         assert!(table["rows"].is_null());
         assert_eq!(table["output_throughput"]["rows"], 20);
         assert_eq!(table["output_throughput"]["rows_per_second"], 200.0);
+        assert_eq!(table["output_throughput"]["input_bytes_per_second"], 2000.0);
+        assert_eq!(table["output_throughput"]["parquet_bytes_per_second"], 1000.0);
         assert_eq!(table["run_cumulative_output"]["rows"], 40);
         assert!(table["output_throughput"]["unique_delivered_rows"].is_null());
         let zero = durable_commit_evidence(&config, &[log(&[])], Some((100, 200)))?;
@@ -648,6 +667,30 @@ mod commit_evidence_tests {
         absent.text.clear();
         let absent = durable_commit_evidence(&config, &[absent], Some((100, 200)))?;
         assert!(absent[&config.tables[0]]["output_throughput"]["rows"].is_null());
+        Ok(())
+    }
+
+    #[test]
+    fn complete_commit_windows_preserve_half_open_boundaries_and_unknowns() -> Result<()> {
+        let config = config()?;
+        let mut first = event(&config, 1000, 1001)?;
+        first["finished_at_unix_ms"] = json!(1000);
+        let mut boundary = event(&config, 1000, 1001)?;
+        boundary["delta_version"] = json!(8);
+        boundary["finished_at_unix_ms"] = json!(31_000);
+        let mut tail = event(&config, 1000, 1001)?;
+        tail["delta_version"] = json!(9);
+        tail["finished_at_unix_ms"] = json!(61_000);
+        let evidence = durable_commit_evidence(&config, &[log(&[first, boundary, tail])], Some((1000, 66_000)))?;
+        let windows = &evidence[&config.tables[0]]["complete_30_second_commit_windows"];
+        assert_eq!(windows.as_array().unwrap().len(), 2);
+        assert_eq!(windows[0]["rows"], 10);
+        assert_eq!(windows[1]["rows"], 10);
+        assert_eq!(evidence[&config.tables[0]]["output_throughput"]["rows"], 30);
+        let mut missing = log(&[]);
+        missing.complete = false;
+        let evidence = durable_commit_evidence(&config, &[missing], Some((1000, 66_000)))?;
+        assert!(evidence[&config.tables[0]]["complete_30_second_commit_windows"][0]["rows"].is_null());
         Ok(())
     }
 }
