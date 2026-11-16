@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { CampaignConflictError, MAX_CAMPAIGN_LIFETIME_MS, MISSED_HEARTBEAT_LIMIT, HEARTBEAT_INTERVAL_MS,
+import { CampaignConflictError, CUSTODY_CLEANUP_STEPS, MAX_CAMPAIGN_LIFETIME_MS, MISSED_HEARTBEAT_LIMIT, HEARTBEAT_INTERVAL_MS,
   armCampaign, heartbeatCampaign, mutateCampaign, newCampaignState, startCampaign, validateCampaignState,
   type CampaignState, type CampaignStore, type StoredCampaign, recordArmOperation } from './aks-campaign.js';
-import { evaluateCustody, reconcileArmOperation, reconcileOnce, reconcilePendingArmOperations } from './aks-reconcile.js';
+import { evaluateCustody, reconcileArmOperation, reconcileCleanupOnce, reconcileOnce, reconcilePendingArmOperations } from './aks-reconcile.js';
 
 const campaignId = 'c0ffee00-0000-4000-8000-000000000001';
 const ownerId = 'c0ffee00-0000-4000-8000-000000000002';
@@ -43,7 +43,7 @@ test('heartbeat cannot revive expired custody and stale fencing tokens are rejec
   const beat = await heartbeatCampaign(store, ownerId, started.fencingToken, started.heartbeatAtMs + 1);
   assert.equal(beat.state.heartbeatSequence, 1);
   assert.equal(beat.state.expiresAtMs, started.expiresAtMs);
-  await assert.rejects(heartbeatCampaign(store, ownerId, started.fencingToken, started.expiresAtMs), /maximum lifetime/);
+  await assert.rejects(heartbeatCampaign(store, ownerId, started.fencingToken, started.expiresAtMs), /expired/);
 });
 
 test('observer records a would-fence event without fencing; armed controller fences once at three missed beats', async () => {
@@ -54,7 +54,7 @@ test('observer records a would-fence event without fencing; armed controller fen
   const observed = await reconcileOnce(store, expiredAt);
   assert.equal(observed.status, 'observed');
   assert.equal((await store.read())!.state.status, 'active');
-  await armCampaign(store, ownerId, started.fencingToken);
+  await armCampaign(store, ownerId, started.fencingToken, started.heartbeatAtMs);
   const fenced = await reconcileOnce(store, expiredAt);
   assert.equal(fenced.status, 'fenced');
   const state = (await store.read())!.state;
@@ -68,11 +68,19 @@ test('observer records a would-fence event without fencing; armed controller fen
 test('max lifetime fences even when heartbeat is current', async () => {
   const store = await seed();
   const started = (await store.read())!.state;
-  await armCampaign(store, ownerId, started.fencingToken);
+  await armCampaign(store, ownerId, started.fencingToken, started.heartbeatAtMs);
   await heartbeatCampaign(store, ownerId, started.fencingToken, started.heartbeatAtMs + 10);
   const expired = (await store.read())!.state;
   const result = await reconcileOnce(store, expired.expiresAtMs);
   assert.equal(result.fenceReason, 'max-lifetime');
+});
+
+test('expired heartbeat blocks owner mutations before the watchdog fences', async () => {
+  const store = await seed();
+  const state = (await store.read())!.state;
+  const expiredAt = state.heartbeatAtMs + MISSED_HEARTBEAT_LIMIT * HEARTBEAT_INTERVAL_MS;
+  await assert.rejects(heartbeatCampaign(store, ownerId, state.fencingToken, expiredAt), /heartbeat is expired/);
+  await assert.rejects(armCampaign(store, ownerId, state.fencingToken, expiredAt), /heartbeat is expired/);
 });
 
 test('campaign ownership cannot be replaced until cleanup is verified', async () => {
@@ -80,14 +88,41 @@ test('campaign ownership cannot be replaced until cleanup is verified', async ()
   await assert.rejects(startCampaign(store, 'c0ffee00-0000-4000-8000-000000000004', ownerId, 1_000_100), /unfinished campaign/);
 });
 
+test('fenced cleanup retries the same idempotency key and completes ordered steps once', async () => {
+  const store = await seed();
+  const started = (await store.read())!.state;
+  await armCampaign(store, ownerId, started.fencingToken, started.heartbeatAtMs);
+  const expiredAt = started.heartbeatAtMs + MISSED_HEARTBEAT_LIMIT * HEARTBEAT_INTERVAL_MS;
+  await reconcileOnce(store, expiredAt);
+  await assert.rejects(heartbeatCampaign(store, ownerId, started.fencingToken, expiredAt + 1), /fenced, stale/);
+  const seen: Array<{ step: string; key: string }> = [];
+  let firstCall = true;
+  const execute = async (step: typeof CUSTODY_CLEANUP_STEPS[number], _state: CampaignState, key: string) => {
+    seen.push({ step, key });
+    if (step === 'stop-admission' && firstCall) { firstCall = false; return 'pending' as const; }
+    return 'complete' as const;
+  };
+  assert.equal(await reconcileCleanupOnce(store, execute), 'pending');
+  assert.equal((await store.read())!.state.cleanupSteps[0]!.status, 'running');
+  let progress = await reconcileCleanupOnce(store, execute);
+  while (progress !== 'complete') progress = await reconcileCleanupOnce(store, execute);
+  const completed = (await store.read())!.state;
+  assert.equal(completed.status, 'complete');
+  assert.deepEqual(completed.cleanupSteps.map(receipt => receipt.step), CUSTODY_CLEANUP_STEPS);
+  assert.ok(completed.cleanupSteps.every(receipt => receipt.status === 'complete'));
+  assert.equal(seen[0]!.key, seen[1]!.key);
+  assert.equal(seen[0]!.key, completed.campaignId + ':' + completed.fencingToken + ':stop-admission');
+  assert.deepEqual(seen.filter((item, index) => index === 0 || item.step !== seen[index - 1]!.step).map(item => item.step), CUSTODY_CLEANUP_STEPS);
+});
+
 test('ARM operation receipts reject out-of-scope URLs and reconcile terminal public status values', async () => {
   const store = await seed();
   const state = (await store.read())!.state;
   await assert.rejects(recordArmOperation(store, ownerId, state.fencingToken,
     { id: 'c0ffee00-0000-4000-8000-000000000005', resourceId,
-      operationUrl: 'https://example.com/operation', submittedAtMs: state.startedAtMs }, subscriptionId), /management.azure.com/);
+      operationUrl: 'https://example.com/operation', submittedAtMs: state.startedAtMs }, subscriptionId, state.startedAtMs), /management.azure.com/);
   await recordArmOperation(store, ownerId, state.fencingToken,
-    { id: 'c0ffee00-0000-4000-8000-000000000006', resourceId, operationUrl, submittedAtMs: state.startedAtMs }, subscriptionId);
+    { id: 'c0ffee00-0000-4000-8000-000000000006', resourceId, operationUrl, submittedAtMs: state.startedAtMs }, subscriptionId, state.startedAtMs);
   const pending = (await store.read())!.state.operations[0]!;
   const completed = await reconcileArmOperation(pending, async url => {
     assert.equal(url, operationUrl);

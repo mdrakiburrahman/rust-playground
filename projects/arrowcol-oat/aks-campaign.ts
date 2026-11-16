@@ -1,10 +1,13 @@
-import { pathToFileURL } from 'node:url';
-import { ROOT, run_tree } from '../../infra/azure/bootstrap.js';
-
+import { spawnSync } from "node:child_process";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
 export const HEARTBEAT_INTERVAL_MS = 60_000;
 export const MISSED_HEARTBEAT_LIMIT = 3;
 export const MAX_CAMPAIGN_LIFETIME_MS = 6 * 60 * 60 * 1000;
 const MAX_ARM_OPERATIONS = 128;
+export const CUSTODY_CLEANUP_STEPS = ["stop-admission", "bounded-drain", "preserve-evidence", "stop-maintenance", "record-terminal-state", "remove-run-namespace", "remove-run-fic", "restore-safe-idle", "verify-safe-idle"] as const;
+export type CleanupStepName = typeof CUSTODY_CLEANUP_STEPS[number];
+export interface CleanupReceipt { step: CleanupStepName; idempotencyKey: string; status: "pending" | "running" | "complete"; }
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const storageName = /^[a-z0-9]{3,24}$/;
 const containerName = /^[a-z0-9](?:[a-z0-9-]{1,61}[a-z0-9])?$/;
@@ -36,6 +39,7 @@ export interface CampaignState {
   fenceReason?: 'heartbeat-expired' | 'max-lifetime';
   fencedAtMs?: number;
   cleanupStatus: 'not-started' | 'pending' | 'running' | 'verified';
+  cleanupSteps: CleanupReceipt[];
   operations: ArmOperationReceipt[];
 }
 export interface StoredCampaign {
@@ -69,7 +73,7 @@ export function validateCampaignState(value: unknown): CampaignState {
   if (!record(value) || Object.keys(value).some(key => ![
     'schemaVersion', 'campaignId', 'ownerId', 'fencingToken', 'mode', 'status', 'startedAtMs', 'heartbeatAtMs',
     'heartbeatSequence', 'expiresAtMs', 'lastEvaluatedAtMs', 'lastMissedHeartbeatCount', 'fenceReason', 'fencedAtMs',
-    'cleanupStatus', 'operations',
+    'cleanupStatus', 'cleanupSteps', 'operations',
   ].includes(key))) throw new Error('Campaign state has unknown fields or is not an object.');
   const state = value as unknown as CampaignState;
   if (state.schemaVersion !== 1 || !uuid.test(state.campaignId) || !uuid.test(state.ownerId) ||
@@ -79,7 +83,7 @@ export function validateCampaignState(value: unknown): CampaignState {
       !Number.isSafeInteger(state.heartbeatSequence) || state.heartbeatSequence < 0 ||
       state.expiresAtMs !== state.startedAtMs + MAX_CAMPAIGN_LIFETIME_MS ||
       !['not-started', 'pending', 'running', 'verified'].includes(state.cleanupStatus) ||
-      !Array.isArray(state.operations) || state.operations.length > MAX_ARM_OPERATIONS) {
+      !Array.isArray(state.operations) || state.operations.length > MAX_ARM_OPERATIONS || !Array.isArray(state.cleanupSteps))  {
     throw new Error('Campaign state is malformed or violates the fixed custody limits.');
   }
   if (state.lastEvaluatedAtMs !== undefined && !nonnegative(state.lastEvaluatedAtMs) ||
@@ -87,6 +91,25 @@ export function validateCampaignState(value: unknown): CampaignState {
       state.fencedAtMs !== undefined && !nonnegative(state.fencedAtMs) ||
       state.fenceReason !== undefined && !['heartbeat-expired', 'max-lifetime'].includes(state.fenceReason)) {
     throw new Error('Campaign evaluation receipt is malformed.');
+  }
+  const expectedCleanupSteps = state.status === "active" ? [] : [...CUSTODY_CLEANUP_STEPS];
+  if (state.cleanupSteps.length !== expectedCleanupSteps.length || state.cleanupSteps.some((receipt, index) => !record(receipt) ||
+      receipt.step !== expectedCleanupSteps[index] || receipt.idempotencyKey !== state.campaignId + ":" + state.fencingToken + ":" + receipt.step ||
+      !["pending", "running", "complete"].includes(receipt.status))) throw new Error("Campaign cleanup receipts are malformed.");
+  if (state.status === "active" && state.cleanupStatus !== "not-started" || state.status === "fenced" && state.cleanupStatus !== "pending" ||
+      state.status === "cleaning" && state.cleanupStatus !== "running" || state.status === "complete" &&
+      (state.cleanupStatus !== "verified" || state.cleanupSteps.some(receipt => receipt.status !== "complete"))) {
+    throw new Error("Campaign cleanup state does not match its durable receipts.");
+  }
+  let unfinishedCleanup = false;
+  let runningCleanup = false;
+  for (const receipt of state.cleanupSteps) {
+    if (receipt.status === 'complete' && unfinishedCleanup) throw new Error('Campaign cleanup receipts are out of order.');
+    if (receipt.status === 'running') {
+      if (runningCleanup) throw new Error('Campaign has multiple running cleanup receipts.');
+      runningCleanup = true;
+    }
+    if (receipt.status !== 'complete') unfinishedCleanup = true;
   }
   const ids = new Set<string>();
   for (const operation of state.operations) {
@@ -114,7 +137,7 @@ export function newCampaignState(campaignId: string, ownerId: string, now = Date
   if (!uuid.test(campaignId) || !uuid.test(ownerId) || !nonnegative(now)) throw new Error('Campaign and owner IDs must be UUIDs and the clock must be valid.');
   return { schemaVersion: 1, campaignId, ownerId, fencingToken: 1, mode: 'observe', status: 'active',
     startedAtMs: now, heartbeatAtMs: now, heartbeatSequence: 0, expiresAtMs: now + MAX_CAMPAIGN_LIFETIME_MS,
-    cleanupStatus: 'not-started', operations: [] };
+    cleanupStatus: 'not-started', cleanupSteps: [], operations: [] };
 }
 
 export class CampaignConflictError extends Error {
@@ -138,15 +161,17 @@ export async function managedIdentityToken(resource: string, env: NodeJS.Process
 }
 
 async function localToken(resource: string, subscriptionId: string): Promise<string> {
-  const result = await run_tree(['az', 'account', 'get-access-token', '--subscription', subscriptionId,
-    '--resource', resource, '--query', 'accessToken', '--output', 'tsv', '--only-show-errors'], 30, ROOT);
-  const token = result.stdout.trim();
-  if (result.returncode || !token || /\s/.test(token)) throw new Error('Azure CLI could not provide a token for the campaign store.');
+  const result = spawnSync("az", ["account", "get-access-token", "--subscription", subscriptionId,
+    "--resource", resource, "--query", "accessToken", "--output", "tsv", "--only-show-errors"],
+    { encoding: "utf8", timeout: 30_000, windowsHide: true });
+  const token = typeof result.stdout === "string" ? result.stdout.trim() : "";
+  if (result.error || result.status !== 0 || !token || /[[:space:]]/.test(token))
+    throw new Error("Azure CLI could not provide a token for the campaign store.");
   return token;
 }
 
 export function createBlobCampaignStore(config: CampaignStoreConfig, fetcher: Fetcher = fetch,
-  token: TokenProvider = resource => process.env.IDENTITY_ENDPOINT ? managedIdentityToken(resource, process.env, fetcher) : localToken(resource, config.subscriptionId)): CampaignStore {
+  token: TokenProvider = resource => getAccessToken(resource, config.subscriptionId, process.env, fetcher)): CampaignStore {
   if (!storageName.test(config.account) || !containerName.test(config.container) || !uuid.test(config.subscriptionId)) {
     throw new Error('Campaign store requires a storage account, container and subscription ID.');
   }
@@ -190,9 +215,13 @@ export async function mutateCampaign(store: CampaignStore, change: (state: Campa
   throw new Error('Campaign state update exhausted its bounded CAS retries.');
 }
 
-function requireOwner(state: CampaignState | undefined, ownerId: string, fencingToken: number): CampaignState {
+function requireOwner(state: CampaignState | undefined, ownerId: string, fencingToken: number, now: number): CampaignState {
   if (!state || state.status !== 'active' || state.ownerId !== ownerId || state.fencingToken !== fencingToken) {
     throw new Error('Campaign owner is fenced, stale or does not match the active run.');
+  }
+  if (!nonnegative(now) || now < state.heartbeatAtMs || now >= state.expiresAtMs ||
+      Math.floor((now - state.heartbeatAtMs) / HEARTBEAT_INTERVAL_MS) >= MISSED_HEARTBEAT_LIMIT) {
+    throw new Error('Campaign owner heartbeat is expired; mutation rejected.');
   }
   return state;
 }
@@ -204,15 +233,15 @@ export async function startCampaign(store: CampaignStore, campaignId: string, ow
 }
 export async function heartbeatCampaign(store: CampaignStore, ownerId: string, fencingToken: number, now = Date.now()): Promise<StoredCampaign> {
   return mutateCampaign(store, current => {
-    const state = requireOwner(current, ownerId, fencingToken);
+    const state = requireOwner(current, ownerId, fencingToken, now);
     if (!nonnegative(now) || now >= state.expiresAtMs) throw new Error('Campaign maximum lifetime has expired; heartbeat rejected.');
     if (now < state.heartbeatAtMs) throw new Error('Campaign heartbeat clock moved backwards.');
     return { ...state, heartbeatAtMs: now, heartbeatSequence: state.heartbeatSequence + 1 };
   });
 }
-export async function armCampaign(store: CampaignStore, ownerId: string, fencingToken: number): Promise<StoredCampaign> {
+export async function armCampaign(store: CampaignStore, ownerId: string, fencingToken: number, now = Date.now()): Promise<StoredCampaign> {
   return mutateCampaign(store, current => {
-    const state = requireOwner(current, ownerId, fencingToken);
+    const state = requireOwner(current, ownerId, fencingToken, now);
     if (state.mode !== 'observe') throw new Error('Campaign is already armed.');
     return { ...state, mode: 'armed' };
   });
@@ -220,15 +249,15 @@ export async function armCampaign(store: CampaignStore, ownerId: string, fencing
 export async function setCleanupVerified(store: CampaignStore, ownerId: string, fencingToken: number): Promise<StoredCampaign> {
   return mutateCampaign(store, current => {
     if (!current || current.status !== 'cleaning' || current.ownerId !== ownerId || current.fencingToken !== fencingToken ||
-        current.cleanupStatus !== 'running') throw new Error('Cleanup verification requires the fenced owner and a running cleanup.');
+        current.cleanupStatus !== 'running' || current.cleanupSteps.some(step => step.status !== 'complete')) throw new Error('Cleanup verification requires the fenced owner and a running cleanup.');
     return { ...current, status: 'complete', cleanupStatus: 'verified' };
   });
 }
 export async function recordArmOperation(store: CampaignStore, ownerId: string, fencingToken: number,
-  operation: Omit<ArmOperationReceipt, 'status'>, subscriptionId: string): Promise<StoredCampaign> {
+  operation: Omit<ArmOperationReceipt, 'status'>, subscriptionId: string, now = Date.now()): Promise<StoredCampaign> {
   const operationUrl = httpsManagementUrl(operation.operationUrl, subscriptionId);
   return mutateCampaign(store, current => {
-    const state = requireOwner(current, ownerId, fencingToken);
+    const state = requireOwner(current, ownerId, fencingToken, now);
     if (!uuid.test(operation.id) || state.operations.some(existing => existing.id === operation.id) ||
         !operation.resourceId.toLowerCase().startsWith(`/subscriptions/${subscriptionId.toLowerCase()}/`) ||
         !nonnegative(operation.submittedAtMs) || state.operations.length >= MAX_ARM_OPERATIONS) {
@@ -262,6 +291,23 @@ async function main(args: string[]): Promise<void> {
     throw new Error('Usage: aks-campaign.ts start <campaign-uuid> | heartbeat <owner-uuid> <fencing-token> | arm <owner-uuid> <fencing-token> | status');
   }
 }
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (process.argv[1] && ['aks-campaign.ts', 'aks-campaign.js'].includes(path.basename(process.argv[1])) && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main(process.argv.slice(2)).catch((error: unknown) => { console.error(error instanceof Error ? error.message : 'Campaign custody failed'); process.exitCode = 1; });
+}
+
+export async function readArmOperationStatus(operationUrl: string, subscriptionId: string, fetcher: Fetcher = fetch): Promise<{ status: number; body?: unknown }> {
+  const url = httpsManagementUrl(operationUrl, subscriptionId);
+  const accessToken = await getAccessToken('https://management.azure.com/', subscriptionId, process.env, fetcher);
+  const response = await fetcher(url, { headers: { authorization: `Bearer ${accessToken}` }, signal: AbortSignal.timeout(10_000) });
+  if (response.status === 202) return { status: 202 };
+  const text = await response.text();
+  if (!text) return { status: response.status };
+  let body: unknown;
+  try { body = JSON.parse(text) as unknown; } catch { throw new Error('ARM operation status response is not valid JSON.'); }
+  return { status: response.status, body };
+}
+
+export async function getAccessToken(resource: string, subscriptionId: string, env: NodeJS.ProcessEnv = process.env,
+  fetcher: Fetcher = fetch): Promise<string> {
+  return env.IDENTITY_ENDPOINT ? managedIdentityToken(resource, env, fetcher) : localToken(resource, subscriptionId);
 }

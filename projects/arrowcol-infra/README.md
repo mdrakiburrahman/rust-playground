@@ -71,3 +71,11 @@ SQL Server pins the amd64 manifest:
 Registry retention and host architecture/emulation remain external constraints.
 
 See [DFE collector setup](../arrowcol-dataflow-rust/README.md) and [Azure custody/reset details](../../docs/operations/AZURE_SANDBOX.md).
+
+| Campaign infrastructure | Purpose |
+| --- | --- |
+| Perf69 AKS custody | Observe-only external heartbeat/reconciliation controller for the existing AKS/Kusto stamp; see [custody operations](../../docs/operations/PERF69_AKS_CUSTODY.md) |
+
+## Perf69 custody
+
+The ACA deployment path is denied by the subscription Network_Injection policy. The stamp VNet has only an occupied AKS system subnet and an AKS-delegated API-server subnet; do not bypass the policy or add an out-of-band subnet that drifts from `infra/azure/aks.bicep`. Custody runs as a watchdog on a separate leased devbox instead. See [custody operations](../../docs/operations/PERF69_AKS_CUSTODY.md).
