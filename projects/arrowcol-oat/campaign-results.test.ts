@@ -171,7 +171,7 @@ function attachMaintenanceDueWork(
     log_complete: true,
     maintenance_table_policies: {
       source: 'validated_consumer_per_table_policy',
-      tables: { sqlserver_availability_replica_states: { active: true, table_policy: {} } },
+      tables: { 'telemetry.sqlserver.sqlserver_availability_replica_states': { active: true, table_policy: {} } },
       operation_reports_dropped: dropped,
       operation_report_timing_scope: 'process_lifetime_including_warmup_and_drain_not_shared_measurement_window',
       operation_outcomes: { scope: 'process_lifetime', operation_count: 25, error_count: 0 },
@@ -184,9 +184,11 @@ function attachMaintenanceDueWork(
               operation === 'checkpoint' ? 'checkpoint_log_inventory' : 'verified_prune_proof';
           const hasBytes = operation === 'optimize' || operation === 'purge';
           return {
-            table: 'sqlserver_availability_replica_states',
+            table: 'telemetry.sqlserver.sqlserver_availability_replica_states',
             operation,
             operation_failed: false,
+            interrupted: false,
+            report_outcome: 'noop',
             maintenance_due_work: {
               observed_at_ms: start + window * 30_000 + 1_000,
               source,
@@ -304,6 +306,108 @@ test('parses synthetic backlog and producer-shaped maintenance evidence without 
   const svg = renderCampaignResults([result], 'C1');
   assert.match(svg, /No qualified winner/);
   assert.match(svg, /five-operation maintenance due-work evidence is unavailable or invalid/);
+});
+
+test('consumes actual Rust results through the E1 projection and keeps single-window or failed wrappers UNKNOWN', () => {
+  const producer = JSON.parse(readFileSync(
+    new URL('./campaign-results-maintenance-rust.json', import.meta.url), 'utf8',
+  )) as {
+    operation_results: Record<string, unknown>[];
+  };
+  const projection = JSON.parse(readFileSync(
+    new URL('./campaign-results-maintenance-e1-projection.json', import.meta.url), 'utf8',
+  )) as {
+    idle_processes: Array<Record<string, unknown>>;
+    qualification_cases: Array<{ case: string; processes: Array<Record<string, unknown>> }>;
+  };
+  assert.deepEqual(producer.operation_results.map(result => result.operation),
+    ['purge', 'optimize', 'vacuum', 'checkpoint', 'prune_log']);
+  const idlePolicy = projection.idle_processes[0]!.maintenance_table_policies as Record<string, unknown>;
+  const idleReports = idlePolicy.operation_reports as Array<Record<string, unknown>>;
+  assert.deepEqual(idleReports.map(report => report.operation), producer.operation_results.map(result => result.operation));
+  assert.deepEqual(Object.keys(idlePolicy.tables as Record<string, unknown>),
+    ['telemetry.sqlserver.sqlserver_availability_replica_states']);
+  const start = 1_704_067_380_000;
+  const config = {
+    enabled: true,
+    apply: true,
+    operations: ['optimize', 'purge', 'vacuum', 'checkpoint', 'prune_log'],
+  };
+  const idleIssue = maintenanceDueWorkIssue(
+    projection.idle_processes,
+    config,
+    start,
+    start + 150_000,
+  );
+  assert.equal(idleIssue, 'maintenance due-work is missing from one or more complete 30-second windows');
+
+  for (const scenario of projection.qualification_cases) {
+    const policy = scenario.processes[0]!.maintenance_table_policies as Record<string, unknown>;
+    const reports = policy.operation_reports as Array<Record<string, unknown>>;
+    const issue = maintenanceDueWorkIssue(scenario.processes, config, start, start + 150_000);
+    assert.equal(typeof issue, 'string', scenario.case + ' must not qualify with retained single-pass evidence: ' + issue);
+    if (scenario.case === 'complete') {
+      assert.notEqual(reports[0]!.maintenance_due_work, null);
+      assert.equal(issue, 'maintenance due-work is missing from one or more complete 30-second windows');
+    } else if (scenario.case === 'error') {
+      assert.equal(policy.operation_outcomes && (policy.operation_outcomes as Record<string, unknown>).error_count, 1);
+      assert.equal(reports[0]!.maintenance_due_work, null);
+      assert.equal(issue, 'complete five-operation maintenance due-work evidence is unavailable or invalid');
+    } else {
+      assert.equal(reports[0]!.maintenance_due_work, null);
+      assert.match(issue!, /operation failed|missing from one or more/);
+    }
+  }
+});
+
+test('accepts actual Rust due/backlog samples but keeps the campaign unqualified and incomplete coverage UNKNOWN', () => {
+  const fixture = JSON.parse(readFileSync(
+    new URL('./campaign-results-maintenance-e1-projection.json', import.meta.url), 'utf8',
+  )) as {
+    due_backlog_processes: Array<Record<string, unknown>>;
+    incomplete_processes: Array<Record<string, unknown>>;
+  };
+  const producer = JSON.parse(readFileSync(
+    new URL('./campaign-results-maintenance-rust-debt.json', import.meta.url), 'utf8',
+  )) as {
+    due_backlog_results: Array<Record<string, unknown>>;
+    incomplete_results: Array<Record<string, unknown>>;
+  };
+  const start = 1_704_067_380_000;
+  const end = start + 150_000;
+  const config = {
+    enabled: true,
+    apply: true,
+    operations: ['optimize', 'purge', 'vacuum', 'checkpoint', 'prune_log'],
+  };
+  const duePolicy = fixture.due_backlog_processes[0]!.maintenance_table_policies as Record<string, unknown>;
+  const dueReports = duePolicy.operation_reports as Array<Record<string, unknown>>;
+  const dueWork = dueReports[0]!.maintenance_due_work as Record<string, unknown>;
+  const producerDueReport = producer.due_backlog_results[0]!.report as Record<string, unknown>;
+  const producerDueWork = producerDueReport.maintenance_due_work as Record<string, unknown>;
+  assert.equal(dueReports[0]!.operation, 'purge');
+  assert.equal(dueWork.observed_at_ms, producerDueWork.observed_at_ms);
+  assert.equal(dueWork.completeness, 'complete');
+  assert.equal(dueWork.due, true);
+  assert.equal(dueWork.eligible_count, 4);
+  assert.equal(dueWork.backlog_count, 2);
+  assert.equal(maintenanceDueWorkIssue(
+    fixture.due_backlog_processes, config, start, end,
+  ), 'maintenance due-work is missing from one or more complete 30-second windows');
+
+  const incompletePolicy = fixture.incomplete_processes[0]!.maintenance_table_policies as Record<string, unknown>;
+  const incompleteReports = incompletePolicy.operation_reports as Array<Record<string, unknown>>;
+  const incompleteWork = incompleteReports[0]!.maintenance_due_work as Record<string, unknown>;
+  const producerIncompleteReport = producer.incomplete_results[0]!.report as Record<string, unknown>;
+  const producerIncompleteWork = producerIncompleteReport.maintenance_due_work as Record<string, unknown>;
+  assert.equal(incompleteWork.completeness, 'incomplete');
+  assert.equal(incompleteWork.incomplete_reason, 'malformed_partition');
+  assert.equal(incompleteWork.eligible_count, null);
+  assert.equal(incompleteWork.observed_at_ms, producerIncompleteWork.observed_at_ms);
+  const incompleteIssue = maintenanceDueWorkIssue(
+    fixture.incomplete_processes, config, start, end,
+  );
+  assert.equal(incompleteIssue, 'maintenance operation failed or its due-work observation is incomplete');
 });
 
 test('rejects unknown, unavailable, dropped, gapped, or clock-reversed backlog contract samples', () => {

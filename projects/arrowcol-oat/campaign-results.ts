@@ -302,6 +302,7 @@ const maintenanceOperationContracts = {
   checkpoint: { sources: ['checkpoint_log_inventory'], unit: 'commits' },
   prune_log: { sources: ['bounded_log_inventory', 'verified_prune_proof'], unit: 'log_objects' },
 } as const;
+const maintenanceTable = 'telemetry.sqlserver.sqlserver_availability_replica_states';
 type MaintenanceOperation = keyof typeof maintenanceOperationContracts;
 
 export function maintenanceDueWorkIssue(
@@ -327,8 +328,8 @@ export function maintenanceDueWorkIssue(
       policy.source !== 'validated_consumer_per_table_policy' ||
       policy.operation_report_timing_scope !== 'process_lifetime_including_warmup_and_drain_not_shared_measurement_window' ||
       policy.operation_reports_dropped !== 0 || !Array.isArray(policy.operation_reports) ||
-      !isRecord(policy.tables) || !isRecord(policy.tables.sqlserver_availability_replica_states) ||
-      policy.tables.sqlserver_availability_replica_states.active !== true) return unavailable;
+      !isRecord(policy.tables) || Object.keys(policy.tables).length !== 1 ||
+      !isRecord(policy.tables[maintenanceTable]) || policy.tables[maintenanceTable].active !== true) return unavailable;
   const outcomes = policy.operation_outcomes;
   if (!isRecord(outcomes) || outcomes.scope !== 'process_lifetime' || outcomes.error_count !== 0) return unavailable;
 
@@ -340,10 +341,12 @@ export function maintenanceDueWorkIssue(
   }
   for (const report of policy.operation_reports) {
     if (!isRecord(report)) return unavailable;
-    if (report.table !== 'sqlserver_availability_replica_states' ||
-        typeof report.operation !== 'string' ||
-        !Object.hasOwn(maintenanceOperationContracts, report.operation)) continue;
+    if (report.table !== maintenanceTable || typeof report.operation !== 'string' ||
+        !Object.hasOwn(maintenanceOperationContracts, report.operation)) return unavailable;
     const operation = report.operation as MaintenanceOperation;
+    if (report.operation_failed === true || report.interrupted === true || report.report_outcome === 'partial') {
+      return 'maintenance operation failed or its due-work observation is incomplete';
+    }
     const dueWork = report.maintenance_due_work;
     if (dueWork == null) continue;
     if (!isRecord(dueWork) || !Number.isSafeInteger(dueWork.observed_at_ms) || Number(dueWork.observed_at_ms) <= 0) {
@@ -351,28 +354,30 @@ export function maintenanceDueWorkIssue(
     }
     const observedAt = Number(dueWork.observed_at_ms);
     if (observedAt < start || observedAt >= end) continue;
-    if (report.operation_failed !== false || dueWork.completeness !== 'complete' || dueWork.incomplete_reason !== null) {
+    const index = Math.floor((observedAt - start) / 30_000);
+    if (index >= windowCount) continue;
+    if (report.operation_failed !== false || report.interrupted === true ||
+        !['noop', 'planned', 'committed', 'already_applied', 'deleted', 'checkpointed', 'pruned'].includes(String(report.report_outcome)) ||
+        dueWork.completeness !== 'complete' || dueWork.incomplete_reason !== null) {
       return 'maintenance operation failed or its due-work observation is incomplete';
     }
     const contract = maintenanceOperationContracts[operation];
     const eligibleCount = nonNegativeInteger(dueWork.eligible_count);
-    const backlogCount = nonNegativeInteger(dueWork.backlog_count);
+    const backlogCount = dueWork.backlog_count === null ? null : nonNegativeInteger(dueWork.backlog_count);
     const eligibleBytes = dueWork.eligible_bytes === null ? null : nonNegativeInteger(dueWork.eligible_bytes);
     const backlogBytes = dueWork.backlog_bytes === null ? null : nonNegativeInteger(dueWork.backlog_bytes);
     if (!contract.sources.some(source => source === dueWork.source) || dueWork.unit !== contract.unit ||
         typeof dueWork.due !== 'boolean' ||
-        eligibleCount === undefined || backlogCount === undefined ||
-        eligibleCount !== undefined && backlogCount !== undefined && backlogCount > eligibleCount ||
+        eligibleCount === undefined || dueWork.backlog_count !== null && backlogCount === undefined ||
+        backlogCount !== null && eligibleCount !== undefined && backlogCount > eligibleCount ||
         eligibleCount === 0 && dueWork.due !== false ||
         dueWork.eligible_bytes !== null && eligibleBytes === undefined ||
         dueWork.backlog_bytes !== null && backlogBytes === undefined ||
         dueWork.backlog_bytes !== null && dueWork.eligible_bytes !== null &&
           eligibleBytes !== undefined && backlogBytes !== undefined && backlogBytes > eligibleBytes ||
-        (dueWork.backlog_bytes === null) !== (dueWork.eligible_bytes === null) ||
-        (operation === 'optimize' || operation === 'purge') &&
-          (eligibleBytes === undefined || backlogBytes === undefined) ||
+        backlogBytes !== null && eligibleBytes === null ||
         eligibleCount === 0 && (eligibleBytes !== null && eligibleBytes !== 0 ||
-          backlogBytes !== null && backlogBytes !== 0)) return unavailable;
+          backlogCount !== null && backlogCount !== 0 || backlogBytes !== null && backlogBytes !== 0)) return unavailable;
     const oldest = dueWork.oldest_eligible_timestamp_ms;
     const basis = dueWork.oldest_timestamp_basis;
     if (oldest !== null && (!Number.isSafeInteger(oldest) || Number(oldest) < 0 || Number(oldest) > observedAt) ||
@@ -384,7 +389,6 @@ export function maintenanceDueWorkIssue(
         contract.unit === 'tombstones' ? 'delta_remove_timestamp' : 'log_object_last_modified';
       if (basis !== expectedBasis) return unavailable;
     }
-    const index = Math.floor((observedAt - start) / 30_000);
     const window = observations.get(operation)![index]!;
     if (window.some(sample => sample.observed_at_ms === observedAt)) return unavailable;
     window.push({
@@ -397,24 +401,25 @@ export function maintenanceDueWorkIssue(
   }
 
   for (const [operation, windows] of observations) {
-    const eligibleCountMeans: number[] = [];
-    const backlogCountMeans: number[] = [];
-    const eligibleByteMeans: number[] = [];
-    const backlogByteMeans: number[] = [];
-    let byteCoverage: boolean | undefined;
+    const means = new Map<string, number[]>();
+    const coverage = new Map<string, boolean>();
+    const metrics = ['_eligible_count', '_backlog_count', '_eligible_bytes', '_backlog_bytes'] as const;
     for (const samples of windows) {
       if (samples.length === 0) return 'maintenance due-work is missing from one or more complete 30-second windows';
-      eligibleCountMeans.push(average(samples.map(sample => Number(sample._eligible_count))));
-      backlogCountMeans.push(average(samples.map(sample => Number(sample._backlog_count))));
-      const currentByteCoverage = samples.every(sample => sample._eligible_bytes !== null && sample._backlog_bytes !== null);
-      if (samples.some(sample => (sample._eligible_bytes === null) !== (sample._backlog_bytes === null)) ||
-          byteCoverage !== undefined && byteCoverage !== currentByteCoverage) {
-        return 'maintenance byte-measurement coverage is inconsistent across the measured windows';
-      }
-      byteCoverage = currentByteCoverage;
-      if (currentByteCoverage) {
-        eligibleByteMeans.push(average(samples.map(sample => Number(sample._eligible_bytes))));
-        backlogByteMeans.push(average(samples.map(sample => Number(sample._backlog_bytes))));
+      for (const metric of metrics) {
+        const values = samples.map(sample => sample[metric]);
+        const hasNull = values.some(value => value === null);
+        const measured = !hasNull;
+        if (hasNull && values.some(value => value !== null) ||
+            coverage.has(metric) && coverage.get(metric) !== measured) {
+          return 'maintenance due-work measurement coverage is inconsistent across the measured windows';
+        }
+        coverage.set(metric, measured);
+        if (measured) {
+          const metricMeans = means.get(metric) ?? [];
+          metricMeans.push(average(values.map(Number)));
+          means.set(metric, metricMeans);
+        }
       }
     }
     const isGrowing = (values: number[]): boolean => {
@@ -423,8 +428,7 @@ export function maintenanceDueWorkIssue(
       const slope = values.reduce((sum, value, index) => sum + (index - center) * (value - mean), 0);
       return slope > 0 || values[values.length - 1]! > values[0]!;
     };
-    if (isGrowing(eligibleCountMeans) || isGrowing(backlogCountMeans) ||
-        byteCoverage && (isGrowing(eligibleByteMeans) || isGrowing(backlogByteMeans))) {
+    if (metrics.some(metric => coverage.get(metric) && isGrowing(means.get(metric)!))) {
       return operation + ' maintenance due-work grows across the measured windows';
     }
   }
