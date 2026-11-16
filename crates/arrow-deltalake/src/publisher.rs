@@ -1738,14 +1738,15 @@ impl MultipartUpload for GuardedUpload {
                 result
             }
             Err(error) => {
-                self.completion_failure = Some(CompletionFailure {
+                let failure = CompletionFailure {
                     uncertainty: classify_error(&error, self.retries),
                     error: Arc::new(error),
-                });
-                let failure = self.completion_failure.as_ref().expect("completion failure was set");
+                };
+                let shared_error = Arc::clone(&failure.error);
+                self.completion_failure = Some(failure);
                 Err(object_store::Error::Generic {
                     store: "PublisherSession",
-                    source: Box::new(SharedUploadError(Arc::clone(&failure.error))),
+                    source: Box::new(SharedUploadError(shared_error)),
                 })
             }
         }

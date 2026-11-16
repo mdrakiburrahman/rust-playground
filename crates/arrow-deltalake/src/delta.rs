@@ -38,6 +38,8 @@ use std::time::{Duration, Instant};
 use url::Url;
 
 type LocalEngine = DefaultEngine<SharedExecutor>;
+type FileCommitObservations = Vec<(usize, CompletedFileObservation)>;
+type TimedCommitResult = Result<(u64, Option<Duration>, FileCommitObservations)>;
 
 fn process_writer_properties(schema: &SchemaRef) -> Result<BTreeMap<String, String>> {
     read_process_writer_properties(Some(schema))
@@ -829,6 +831,14 @@ mod io_tests {
         let message = format!("{error:#}");
         assert!(message.contains("injected completion error"), "{message}");
         assert!(message.contains("injected abort error"), "{message}");
+        assert!(
+            error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|source| source.to_string().contains("injected completion error"))
+            }),
+            "typed completion cause must remain in the error chain"
+        );
         assert_eq!(store.abort_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         Ok(())
     }
@@ -2649,8 +2659,9 @@ impl DeltaTable {
 
     /// Write a classic V1 checkpoint while honoring cooperative maintenance cancellation.
     ///
-    /// Cancellation is checked before checkpoint preparation and before the output and hint
-    /// mutations. Once output writing starts, the operation finishes publication atomically.
+    /// Cancellation is checked before preparation, before output writing, and before publishing
+    /// the hint. Cancellation after output writing but before hint publication can leave an
+    /// unadvertised checkpoint file; the prior hint remains authoritative.
     ///
     /// # Errors
     /// Returns cancellation, authority, replay, write or synchronization failures.
@@ -3370,7 +3381,15 @@ impl DeltaTable {
         self: &Arc<Self>,
         entries: Vec<(RecordBatch, String, i64, i64)>,
         max_files: usize,
-    ) -> Result<(Vec<StagedAppend>, Vec<(String, i64, i64)>, Vec<(String, i64, i64)>)> {
+    ) -> Result<(
+        Vec<StagedAppend>,
+        Vec<(String, i64, i64)>,
+        Vec<(String, i64, i64)>,
+        Duration,
+        Duration,
+    )> {
+        let preparation_started = Instant::now();
+        let mut preparation_sort = Duration::ZERO;
         let Some((first_batch, _, _, _)) = entries.first() else {
             bail!("coalesced publication group requires at least one entry");
         };
@@ -3568,7 +3587,10 @@ impl DeltaTable {
                     let file = partition.files.len() - 1;
                     let row_capacity = policy.max_rows.saturating_sub(partition.file_rows[file]);
                     let byte_capacity = policy.max_input_bytes.saturating_sub(partition.file_bytes[file]);
-                    let chunk = fitting_sort_chunk(&batch, start, row_capacity, byte_capacity)?;
+                    let sort_started = Instant::now();
+                    let chunk = fitting_sort_chunk(&batch, start, row_capacity, byte_capacity);
+                    preparation_sort += sort_started.elapsed();
+                    let chunk = chunk?;
                     let Some(chunk) = chunk else {
                         if partition.file_rows[file] == 0 {
                             bail!("one coalesced row exceeds the sorted-file resource budget");
@@ -3627,6 +3649,7 @@ impl DeltaTable {
         if identities.is_empty() && committed_identities.is_empty() {
             bail!("coalesced publications produced no replay identities");
         }
+        let preparation_build = preparation_started.elapsed().saturating_sub(preparation_sort);
         let mut staged = Vec::with_capacity(planned_files);
         for partition in output.into_values() {
             for batches in partition.files {
@@ -3668,7 +3691,13 @@ impl DeltaTable {
                 }
             }
         }
-        Ok((staged, identities, committed_identities))
+        Ok((
+            staged,
+            identities,
+            committed_identities,
+            preparation_build,
+            preparation_sort,
+        ))
     }
 
     /// Bind one file to explicit string-valued Hive partitions.
@@ -3827,10 +3856,7 @@ impl DeltaTable {
         self.commit_files_timed(files).map(|(version, _, _)| version)
     }
 
-    pub(crate) fn commit_files_timed(
-        &self,
-        files: &[StagedAppend],
-    ) -> Result<(u64, Option<Duration>, Vec<(usize, crate::CompletedFileObservation)>)> {
+    pub(crate) fn commit_files_timed(&self, files: &[StagedAppend]) -> TimedCommitResult {
         if files.is_empty() {
             bail!("cannot publish an empty Delta data commit");
         }
@@ -3841,7 +3867,7 @@ impl DeltaTable {
         &self,
         files: &[StagedAppend],
         groups: &[CoalescedCommitGroup],
-    ) -> Result<(u64, Option<Duration>, Vec<(usize, crate::CompletedFileObservation)>)> {
+    ) -> TimedCommitResult {
         if groups.is_empty() {
             bail!("coalesced Delta commit requires logical identities");
         }
@@ -3872,7 +3898,7 @@ impl DeltaTable {
         files: &[StagedAppend],
         identity: Option<(&str, i64)>,
         groups: &[CoalescedCommitGroup],
-    ) -> Result<(u64, Option<Duration>, Vec<(usize, crate::CompletedFileObservation)>)> {
+    ) -> TimedCommitResult {
         let (version, commit_duration, file_observations) = self.publish_files(files, identity, groups)?;
         self.reclaim_unsubmitted(files);
         Ok((version, commit_duration, file_observations))
@@ -3934,7 +3960,7 @@ impl DeltaTable {
         files: &[StagedAppend],
         identity: Option<(&str, i64)>,
         groups: &[CoalescedCommitGroup],
-    ) -> Result<(u64, Option<Duration>, Vec<(usize, crate::CompletedFileObservation)>)> {
+    ) -> TimedCommitResult {
         let mut observation = crate::telemetry::PublicationObservation::start();
         let _guard = self
             .commit_lock
@@ -4482,19 +4508,15 @@ async fn upload_staged_output(
                     buffer.truncate(filled);
                     pending.push(upload.put_part(buffer.into()));
                 }
-                if let Some(result) = pending.next().await {
-                    if let Err(error) = result {
-                        upload_error =
-                            Some(anyhow::Error::new(error).context("upload completed Parquet multipart part"));
-                    }
+                if let Some(Err(error)) = pending.next().await {
+                    upload_error = Some(anyhow::Error::new(error).context("upload completed Parquet multipart part"));
                 }
             }
             while let Some(result) = pending.next().await {
-                if upload_error.is_none() {
-                    if let Err(error) = result {
-                        upload_error =
-                            Some(anyhow::Error::new(error).context("upload completed Parquet multipart part"));
-                    }
+                if upload_error.is_none()
+                    && let Err(error) = result
+                {
+                    upload_error = Some(anyhow::Error::new(error).context("upload completed Parquet multipart part"));
                 }
             }
             if let Some(error) = upload_error {
@@ -4521,7 +4543,7 @@ async fn abort_multipart_after_failure(
 ) -> anyhow::Error {
     match upload.abort().await {
         Ok(()) => error,
-        Err(abort_error) => anyhow::anyhow!("{error:#}; aborting multipart upload failed: {abort_error}"),
+        Err(abort_error) => error.context(format!("aborting multipart upload also failed: {abort_error}")),
     }
 }
 
@@ -4676,7 +4698,9 @@ impl DeltaFileWriter {
         self.stats.merge(&physical)?;
         self.stage_timings.build += build_started.elapsed();
         if let Some(sorter) = &mut self.sorter {
+            let sort_started = Instant::now();
             let physical = owned_for_sort(physical)?;
+            self.stage_timings.sort = Some(self.stage_timings.sort.unwrap_or_default() + sort_started.elapsed());
             if !sorter.try_push(&physical)? {
                 bail!(
                     "publication exceeds sorted-file budget; split upstream into independently identified publications"
@@ -4707,7 +4731,7 @@ impl DeltaFileWriter {
         if let Some(sorter) = self.sorter.take() {
             let sort_started = Instant::now();
             let sorted = sorter.finish();
-            self.stage_timings.sort = Some(sort_started.elapsed());
+            self.stage_timings.sort = Some(self.stage_timings.sort.unwrap_or_default() + sort_started.elapsed());
             let sorted = sorted?;
             let encode_started = Instant::now();
             let result = self

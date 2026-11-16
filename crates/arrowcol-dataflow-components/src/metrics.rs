@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use cpu_time::ProcessTime;
@@ -747,16 +747,43 @@ impl PublicationBacklogSnapshot {
     }
 }
 
+#[derive(Clone)]
 struct PublicationBacklogEntry {
+    token: PublicationBacklogToken,
+    pending_admissions: u64,
     rows: u64,
     logical_bytes: u64,
     accepted_at: Instant,
 }
 
+/// Opaque generation token returned for one queue-admitted publication cohort.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct PublicationBacklogToken(u64);
+
+/// Keeps one backend's contribution to the shared publication backlog bound registered.
+#[must_use = "keep the capacity registration alive while its publications can be in flight"]
+pub struct PublicationBacklogCapacityGuard {
+    metrics: Weak<RuntimeMetrics>,
+    registration_id: u64,
+}
+
+impl Drop for PublicationBacklogCapacityGuard {
+    fn drop(&mut self) {
+        if let Some(metrics) = self.metrics.upgrade() {
+            metrics.publication_backlog().unregister_capacity(self.registration_id);
+        }
+    }
+}
+
 #[derive(Default)]
 struct PublicationBacklog {
-    max_publications: Option<u32>,
+    capacities: HashMap<u64, u32>,
+    next_capacity_id: u64,
+    next_token: u64,
+    outstanding_admissions: u64,
     entries: HashMap<PublicationId, PublicationBacklogEntry>,
+    active_tokens: HashMap<u64, PublicationId>,
+    settled_tokens: HashMap<u64, u64>,
     rows: u64,
     logical_bytes: u64,
     unknown_reason: Option<&'static str>,
@@ -768,41 +795,125 @@ impl PublicationBacklog {
         format!("publication backlog accounting unavailable: {reason}")
     }
 
+    fn capacity_limit(&mut self) -> Result<u64, String> {
+        let Some(total) = self
+            .capacities
+            .values()
+            .try_fold(0_u64, |total, capacity| total.checked_add(u64::from(*capacity)))
+        else {
+            return Err(self.fail("capacity_overflow"));
+        };
+        if total == 0 {
+            return Err(self.fail("unconfigured"));
+        }
+        Ok(total)
+    }
+
     fn configure(&mut self, max_publications: u32) -> Result<(), String> {
         if max_publications == 0 {
             return Err(self.fail("invalid_bound"));
         }
-        if self
-            .max_publications
-            .is_some_and(|existing| existing != max_publications)
-        {
-            return Err(self.fail("conflicting_bound"));
-        }
         if let Some(reason) = self.unknown_reason {
             return Err(self.fail(reason));
         }
-        self.max_publications = Some(max_publications);
+        if let Some(existing) = self.capacities.get(&0) {
+            return if *existing == max_publications {
+                Ok(())
+            } else {
+                Err(self.fail("conflicting_bound"))
+            };
+        }
+        if self
+            .capacities
+            .values()
+            .try_fold(u64::from(max_publications), |total, capacity| {
+                total.checked_add(u64::from(*capacity))
+            })
+            .is_none()
+        {
+            return Err(self.fail("capacity_overflow"));
+        }
+        self.capacities.insert(0, max_publications);
         Ok(())
     }
 
-    fn start(&mut self, id: PublicationId, rows: u64, logical_bytes: u64, accepted_at: Instant) -> Result<(), String> {
+    fn register_capacity(&mut self, max_publications: u32) -> Result<u64, String> {
+        if max_publications == 0 {
+            return Err(self.fail("invalid_bound"));
+        }
         if let Some(reason) = self.unknown_reason {
             return Err(self.fail(reason));
         }
-        let Some(max_publications) = self.max_publications else {
-            return Err(self.fail("unconfigured"));
+        if self
+            .capacities
+            .values()
+            .try_fold(u64::from(max_publications), |total, capacity| {
+                total.checked_add(u64::from(*capacity))
+            })
+            .is_none()
+        {
+            return Err(self.fail("capacity_overflow"));
+        }
+        let Some(registration_id) = self.next_capacity_id.checked_add(1) else {
+            return Err(self.fail("capacity_registration_overflow"));
         };
+        self.capacities.insert(registration_id, max_publications);
+        self.next_capacity_id = registration_id;
+        Ok(registration_id)
+    }
+
+    fn unregister_capacity(&mut self, registration_id: u64) {
+        if self.capacities.remove(&registration_id).is_none() {
+            self.fail("capacity_registration_missing");
+            return;
+        }
+        if !self.capacities.is_empty()
+            && self
+                .capacity_limit()
+                .is_ok_and(|limit| self.outstanding_admissions > limit)
+        {
+            self.fail("capacity_registration_removed_with_outstanding");
+        }
+    }
+
+    fn start(
+        &mut self,
+        id: PublicationId,
+        rows: u64,
+        logical_bytes: u64,
+        accepted_at: Instant,
+    ) -> Result<PublicationBacklogToken, String> {
+        if let Some(reason) = self.unknown_reason {
+            return Err(self.fail(reason));
+        }
+        let max_publications = self.capacity_limit()?;
         if accepted_at > Instant::now() {
             return Err(self.fail("invalid_clock"));
         }
-        if let Some(entry) = self.entries.get(&id) {
-            return if entry.rows == rows && entry.logical_bytes == logical_bytes {
-                Ok(())
-            } else {
-                Err(self.fail("replay_mismatch"))
+        if let Some(entry) = self.entries.get(&id).cloned() {
+            if entry.rows != rows || entry.logical_bytes != logical_bytes {
+                return Err(self.fail("replay_mismatch"));
+            }
+            let Some(outstanding_admissions) = self.outstanding_admissions.checked_add(1) else {
+                return Err(self.fail("overflow"));
             };
+            if outstanding_admissions > max_publications {
+                return Err(self.fail("capacity_exceeded"));
+            }
+            let Some(entry) = self.entries.get_mut(&id) else {
+                return Err(self.fail("tracker_inconsistent"));
+            };
+            let Some(pending_admissions) = entry.pending_admissions.checked_add(1) else {
+                return Err(self.fail("overflow"));
+            };
+            entry.pending_admissions = pending_admissions;
+            self.outstanding_admissions = outstanding_admissions;
+            return Ok(entry.token);
         }
-        if self.entries.len() >= max_publications as usize {
+        let Some(outstanding_admissions) = self.outstanding_admissions.checked_add(1) else {
+            return Err(self.fail("overflow"));
+        };
+        if outstanding_admissions > max_publications {
             return Err(self.fail("capacity_exceeded"));
         }
         let Some(total_rows) = self.rows.checked_add(rows) else {
@@ -811,29 +922,71 @@ impl PublicationBacklog {
         let Some(total_bytes) = self.logical_bytes.checked_add(logical_bytes) else {
             return Err(self.fail("overflow"));
         };
+        let Some(token_id) = self.next_token.checked_add(1) else {
+            return Err(self.fail("token_overflow"));
+        };
+        let token = PublicationBacklogToken(token_id);
         self.entries.insert(
             id,
             PublicationBacklogEntry {
+                token,
+                pending_admissions: 1,
                 rows,
                 logical_bytes,
                 accepted_at,
             },
         );
+        self.active_tokens.insert(token_id, id);
+        self.next_token = token_id;
+        self.outstanding_admissions = outstanding_admissions;
         self.rows = total_rows;
         self.logical_bytes = total_bytes;
-        Ok(())
+        Ok(token)
     }
 
-    fn commit(&mut self, id: PublicationId) -> Result<(), String> {
-        let Some(entry) = self.entries.remove(&id) else {
-            return Err(self.fail("unknown_commit"));
-        };
-        self.rows -= entry.rows;
-        self.logical_bytes -= entry.logical_bytes;
+    fn commit(&mut self, token: PublicationBacklogToken) -> Result<(), String> {
         if let Some(reason) = self.unknown_reason {
             return Err(self.fail(reason));
         }
-        Ok(())
+        if let Some(id) = self.active_tokens.get(&token.0).cloned() {
+            let Some(entry) = self.entries.get(&id).cloned() else {
+                return Err(self.fail("tracker_inconsistent"));
+            };
+            let Some(pending_admissions) = entry.pending_admissions.checked_sub(1) else {
+                return Err(self.fail("tracker_inconsistent"));
+            };
+            let Some(outstanding_admissions) = self.outstanding_admissions.checked_sub(1) else {
+                return Err(self.fail("tracker_inconsistent"));
+            };
+            let Some(rows) = self.rows.checked_sub(entry.rows) else {
+                return Err(self.fail("tracker_inconsistent"));
+            };
+            let Some(logical_bytes) = self.logical_bytes.checked_sub(entry.logical_bytes) else {
+                return Err(self.fail("tracker_inconsistent"));
+            };
+            self.entries.remove(&id);
+            self.active_tokens.remove(&token.0);
+            self.rows = rows;
+            self.logical_bytes = logical_bytes;
+            self.outstanding_admissions = outstanding_admissions;
+            if pending_admissions > 0 {
+                self.settled_tokens.insert(token.0, pending_admissions);
+            }
+            return Ok(());
+        }
+        if let Some(pending_admissions) = self.settled_tokens.get(&token.0).copied() {
+            let Some(outstanding_admissions) = self.outstanding_admissions.checked_sub(1) else {
+                return Err(self.fail("tracker_inconsistent"));
+            };
+            if pending_admissions <= 1 {
+                self.settled_tokens.remove(&token.0);
+            } else {
+                self.settled_tokens.insert(token.0, pending_admissions - 1);
+            }
+            self.outstanding_admissions = outstanding_admissions;
+            return Ok(());
+        }
+        Err(self.fail("unknown_commit"))
     }
 
     fn snapshot(&mut self, now: Instant) -> PublicationBacklogSnapshot {
@@ -844,7 +997,7 @@ impl PublicationBacklog {
         }
         let unknown_reason = self
             .unknown_reason
-            .or_else(|| self.max_publications.is_none().then_some("unconfigured"));
+            .or_else(|| self.capacities.is_empty().then_some("unconfigured"));
         let available = unknown_reason.is_none();
         PublicationBacklogSnapshot {
             available,
@@ -967,10 +1120,30 @@ impl RuntimeMetrics {
         })
     }
 
-    /// Reuses the existing global admission batch capacity as the tracking bound.
+    /// Registers one backend's admission capacity in the process-wide tracking bound.
     ///
-    /// Call once during exporter setup; identical calls from other cores are
-    /// accepted. A zero or conflicting bound makes accounting explicitly unknown.
+    /// Retain the returned guard for the backend and its in-flight publications. Multiple
+    /// roots sharing these metrics contribute the sum of their independent capacities.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the capacity is invalid, overflows the aggregate, or accounting was lost.
+    pub fn register_publication_backlog_capacity(
+        self: &Arc<Self>,
+        max_publications: u32,
+    ) -> Result<Arc<PublicationBacklogCapacityGuard>, String> {
+        let registration_id = self.publication_backlog().register_capacity(max_publications)?;
+        Ok(Arc::new(PublicationBacklogCapacityGuard {
+            metrics: Arc::downgrade(self),
+            registration_id,
+        }))
+    }
+
+    /// Configures a fixed capacity for direct metrics users and tests.
+    ///
+    /// Identical calls are accepted; a zero or conflicting bound marks accounting unknown.
+    /// Production exporters should use `register_publication_backlog_capacity` so multiple roots
+    /// contribute their capacities and are removed when their lifecycle ends.
     ///
     /// # Errors
     ///
@@ -979,11 +1152,11 @@ impl RuntimeMetrics {
         self.publication_backlog().configure(max_publications)
     }
 
-    /// Records successful TableOwner queue admission, deduplicating active replays.
+    /// Records successful TableOwner queue admission and returns its settlement token.
     ///
     /// Reserve the queue slot first, then call this and synchronously send using
     /// that permit, without an intervening await. This prevents a worker from
-    /// committing before registration. Replays retain the first accepted Instant.
+    /// committing before registration. Active replays share a token and retain the first Instant.
     ///
     /// # Errors
     ///
@@ -995,18 +1168,21 @@ impl RuntimeMetrics {
         rows: u64,
         logical_bytes: u64,
         accepted_at: Instant,
-    ) -> Result<(), String> {
+    ) -> Result<PublicationBacklogToken, String> {
         self.publication_backlog().start(id, rows, logical_bytes, accepted_at)
     }
 
-    /// Removes a publication only after confirmed durable success.
+    /// Completes one queue admission only after confirmed durable success.
+    ///
+    /// Replays share a generation token; later settlement of an already committed replay is
+    /// idempotent and cannot settle a newer admission generation with the same publication ID.
+    /// Unknown tokens or previous accounting loss return an error and leave the cohort unknown.
     ///
     /// # Errors
     ///
-    /// An untracked ID, duplicate completion, or previous accounting loss returns
-    /// an error and leaves availability unknown. Errors never clear the cohort.
-    pub fn publication_backlog_commit(&self, id: PublicationId) -> Result<(), String> {
-        self.publication_backlog().commit(id)
+    /// Returns an error when the token is unknown or backlog accounting is unavailable.
+    pub fn publication_backlog_commit(&self, token: PublicationBacklogToken) -> Result<(), String> {
+        self.publication_backlog().commit(token)
     }
 
     /// Marks uncertain or lost publication outcomes unavailable until restart.
@@ -2271,17 +2447,18 @@ mod tests {
     #[test]
     fn publication_backlog_replay_preserves_first_age_until_durable_success() {
         let metrics = RuntimeMetrics::new(CollectorInstanceId::new());
-        metrics.configure_publication_backlog(2).expect("bound");
-        metrics.configure_publication_backlog(2).expect("same bound");
+        metrics.configure_publication_backlog(3).expect("bound");
+        metrics.configure_publication_backlog(3).expect("same bound");
         let first = PublicationId::new();
         let second = PublicationId::new();
         let now = Instant::now();
         let accepted = now - Duration::from_secs(5);
-        metrics
+        let first_token = metrics
             .publication_backlog_start(first, 3, 128, accepted)
             .expect("first");
-        metrics.publication_backlog_start(first, 3, 128, now).expect("replay");
-        metrics.publication_backlog_start(second, 2, 64, now).expect("second");
+        let replay_token = metrics.publication_backlog_start(first, 3, 128, now).expect("replay");
+        let second_token = metrics.publication_backlog_start(second, 2, 64, now).expect("second");
+        assert_eq!(first_token, replay_token);
         let snapshot = metrics.publication_backlog().snapshot(now);
         assert!(snapshot.available);
         assert_eq!(
@@ -2296,15 +2473,80 @@ mod tests {
                 .oldest_age,
             Some(Duration::from_secs(9))
         );
-        metrics.publication_backlog_commit(first).expect("durable first");
+        metrics.publication_backlog_commit(first_token).expect("durable first");
         assert_eq!(metrics.publication_backlog_snapshot().rows, Some(2));
-        metrics.publication_backlog_commit(second).expect("durable second");
+        metrics
+            .publication_backlog_commit(replay_token)
+            .expect("queued replay settled");
+        assert_eq!(metrics.publication_backlog_snapshot().rows, Some(2));
+        metrics
+            .publication_backlog_commit(second_token)
+            .expect("durable second");
         let snapshot = metrics.publication_backlog_snapshot();
         assert_eq!(
             (snapshot.publications, snapshot.rows, snapshot.logical_bytes),
             (Some(0), Some(0), Some(0))
         );
         assert_eq!(snapshot.oldest_age, Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn publication_backlog_queued_replay_cannot_settle_a_new_generation() {
+        let metrics = RuntimeMetrics::new(CollectorInstanceId::new());
+        metrics.configure_publication_backlog(3).expect("bound");
+        let id = PublicationId::new();
+        let now = Instant::now();
+        let original = metrics
+            .publication_backlog_start(id, 3, 128, now - Duration::from_secs(5))
+            .expect("original admitted");
+        let queued_replay = metrics
+            .publication_backlog_start(id, 3, 128, now)
+            .expect("replay queued while original is pending");
+        assert_eq!(original, queued_replay);
+        assert_eq!(
+            metrics.publication_backlog().snapshot(now).oldest_age,
+            Some(Duration::from_secs(5))
+        );
+
+        metrics
+            .publication_backlog_commit(original)
+            .expect("original durable commit");
+        let newer = metrics
+            .publication_backlog_start(id, 3, 128, Instant::now())
+            .expect("new generation admitted");
+        assert_ne!(original, newer);
+        metrics
+            .publication_backlog_commit(queued_replay)
+            .expect("late replay durable dedup");
+        let snapshot = metrics.publication_backlog_snapshot();
+        assert!(snapshot.available);
+        assert_eq!(
+            (snapshot.publications, snapshot.rows, snapshot.logical_bytes),
+            (Some(1), Some(3), Some(128))
+        );
+        metrics
+            .publication_backlog_commit(newer)
+            .expect("new generation durable commit");
+        assert_eq!(metrics.publication_backlog_snapshot().rows, Some(0));
+    }
+
+    #[test]
+    fn publication_backlog_sums_capacities_for_shared_metrics() {
+        let metrics = Arc::new(RuntimeMetrics::new(CollectorInstanceId::new()));
+        let first_backend = metrics.register_publication_backlog_capacity(2).expect("first backend");
+        let second_backend = metrics
+            .register_publication_backlog_capacity(2)
+            .expect("second backend");
+        for _ in 0..4 {
+            metrics
+                .publication_backlog_start(PublicationId::new(), 1, 8, Instant::now())
+                .expect("admission within aggregate capacity");
+        }
+        let snapshot = metrics.publication_backlog_snapshot();
+        assert!(snapshot.available);
+        assert_eq!((snapshot.publications, snapshot.rows), (Some(4), Some(4)));
+        drop(first_backend);
+        drop(second_backend);
     }
 
     #[test]
@@ -2315,11 +2557,12 @@ mod tests {
         assert!(initial.contains("arrowcol_publication_backlog_rows NaN\n"));
         metrics.configure_publication_backlog(1).expect("bound");
         let id = PublicationId::new();
-        metrics
+        let token = metrics
             .publication_backlog_start(id, 4, 256, Instant::now())
             .expect("admitted");
         metrics.publication_backlog_mark_unknown();
-        assert!(metrics.publication_backlog_commit(id).is_err());
+        assert!(metrics.publication_backlog_commit(token).is_err());
+        assert_eq!(metrics.publication_backlog().entries.len(), 1);
         assert!(metrics.configure_publication_backlog(1).is_err());
         let snapshot = metrics.publication_backlog_snapshot();
         assert!(!snapshot.available);
@@ -2366,7 +2609,11 @@ mod tests {
         }
         let metrics = RuntimeMetrics::new(CollectorInstanceId::new());
         metrics.configure_publication_backlog(1).expect("bound");
-        assert!(metrics.publication_backlog_commit(PublicationId::new()).is_err());
+        assert!(
+            metrics
+                .publication_backlog_commit(PublicationBacklogToken(u64::MAX))
+                .is_err()
+        );
         assert_eq!(
             metrics.publication_backlog_snapshot().unknown_reason,
             Some("unknown_commit")
@@ -2408,7 +2655,7 @@ mod tests {
         let metrics = RuntimeMetrics::new(CollectorInstanceId::new());
         metrics.configure_publication_backlog(1).expect("bound");
         let id = PublicationId::new();
-        metrics
+        let token = metrics
             .publication_backlog_start(id, 3, 128, Instant::now() - Duration::from_secs(2))
             .expect("admitted");
         let exposition = metrics.prometheus();
@@ -2424,7 +2671,7 @@ mod tests {
             })
             .expect("age sample");
         assert!(age >= 2.0);
-        metrics.publication_backlog_commit(id).expect("durable success");
+        metrics.publication_backlog_commit(token).expect("durable success");
         assert!(metrics.prometheus().contains("arrowcol_publication_backlog_rows 0\n"));
     }
 
