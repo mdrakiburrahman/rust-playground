@@ -1816,9 +1816,9 @@ impl DeltaTable {
                 let details = MaintenanceError {
                     kind,
                     message,
-                    report: None,
+                    report: Some(Box::new(report.clone())),
                 };
-                with_maintenance_error(error, Some(details), None)
+                with_maintenance_error(error, Some(details), Some(report))
             }
         }
     }
@@ -2001,6 +2001,74 @@ mod optimize_upload_tests {
         ));
         let stored = store.get(&path).await?.bytes().await?;
         assert_eq!(stored.as_ref(), &[1, 2, 3]);
+        Ok(())
+    }
+
+    #[test]
+    fn direct_optimize_cleanup_failure_retains_report_and_paths() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = fs::canonicalize(directory.path())?;
+        let url = Url::from_directory_path(&root).map_err(|()| anyhow::anyhow!("URL"))?;
+        let schema = Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
+            "id",
+            DataType::Int64,
+            false,
+        )]));
+        let table = DeltaTable::open_url(url.clone(), schema, Vec::new())?;
+        let engine = DefaultEngineBuilder::new(object_store_for_url(&url)?)
+            .with_task_executor(shared_executor()?)
+            .build();
+        let snapshot = Snapshot::builder_for(url.as_str()).build(&engine)?;
+        let context = table.write_context(&snapshot, &BTreeMap::new())?;
+        let local = root.join("retained-output.parquet");
+        fs::create_dir(&local)?;
+        let output = StagedOutput {
+            relative: "retained-output.parquet".to_owned(),
+            local,
+            url: table.data_url("retained-output.parquet")?,
+            modified_ms: 0,
+            bytes: 42,
+            rows: 3,
+            stats: arrow::array::StructArray::new_empty_fields(0, None),
+            context,
+            uploaded: false,
+        };
+        let mut report = MaintenanceReport {
+            operation: "optimize".to_owned(),
+            files_added: 1,
+            bytes_added: 42,
+            ..MaintenanceReport::default()
+        };
+        let error = table.discard_after(
+            &[output],
+            fail(
+                MaintenanceErrorKind::StalePlan,
+                "rewritten row count differs from input statistics",
+            ),
+            &mut report,
+        );
+
+        let details = error_details(&error).context("classified cleanup error")?;
+        assert_eq!(details.kind, MaintenanceErrorKind::StalePlan);
+        assert!(
+            details
+                .message
+                .contains("cleanup of unpublished outputs failed (retained)")
+        );
+        assert!(details.message.contains("retained-output.parquet"));
+        assert!(error.chain().any(|cause| {
+            cause
+                .to_string()
+                .contains("rewritten row count differs from input statistics")
+        }));
+        let details_report = details.report.as_deref().context("typed partial report")?;
+        assert_eq!(details_report.files_added, 1);
+        assert_eq!(details_report.bytes_added, 42);
+        assert_eq!(details_report.outputs, ["retained-output.parquet"]);
+        let attached_report = error_report(&error).context("attached partial report")?;
+        assert_eq!(attached_report.files_added, 1);
+        assert_eq!(attached_report.bytes_added, 42);
+        assert_eq!(attached_report.outputs, ["retained-output.parquet"]);
         Ok(())
     }
 }
