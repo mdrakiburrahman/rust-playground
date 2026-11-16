@@ -1984,6 +1984,14 @@ mod tests {
         assert!(validate_exporter_config(&relative).is_err());
     }
 
+    fn metric_total(exposition: &str, prefix: &str, label: &str) -> u64 {
+        exposition
+            .lines()
+            .filter(|line| line.starts_with(prefix) && line.contains(label))
+            .filter_map(|line| line.split_whitespace().last()?.parse().ok())
+            .sum()
+    }
+
     /// Scenario: Durable replay regroups a publication after equal independent
     /// payloads have already committed.
     /// Guarantees: Only the original publication UUID is deduplicated; each
@@ -1996,6 +2004,20 @@ mod tests {
             let store = Arc::new(MemoryRoutingStore::default());
             let holder = CollectorInstanceId::new();
             let lease = lease(&store, holder).await;
+            let runtime_metrics = Arc::new(RuntimeMetrics::new(holder));
+            let before = runtime_metrics.prometheus();
+            let before_explicit_flushes =
+                metric_total(&before, "arrowcol_pipeline_flushes_total{", "reason=\"explicit\"");
+            let before_commits = metric_total(
+                &before,
+                "arrowcol_pipeline_stage_duration_seconds_count{",
+                "stage=\"commit\"",
+            );
+            let before_files = metric_total(
+                &before,
+                "arrowcol_parquet_file_rows_count{",
+                "component=\"arrowcol-dataflow-rust\"",
+            );
             let exporter = GenericDeltaExporter::with_batching(
                 directory.path().to_path_buf(),
                 store as Arc<dyn RoutingStore>,
@@ -2008,7 +2030,7 @@ mod tests {
                     max_age: std::time::Duration::from_secs(60),
                     ..Default::default()
                 },
-                Arc::new(RuntimeMetrics::new(holder)),
+                Arc::clone(&runtime_metrics),
             )
             .expect("exporter");
             let original = envelope_for(&lease);
@@ -2027,6 +2049,29 @@ mod tests {
             let replay = exporter.stage(envelope_pdata(original)).await.expect("replay");
             exporter.backend.flush_pending().await.expect("replay flush");
             replay.wait().await.expect("idempotent replay");
+            let exposition = runtime_metrics.prometheus();
+            let expected_files = if coalesce_publications { 1 } else { 2 };
+            assert!(
+                metric_total(&exposition, "arrowcol_pipeline_flushes_total{", "reason=\"explicit\"")
+                    >= before_explicit_flushes + 2,
+                "explicit flush reason must be emitted for both grouping modes"
+            );
+            assert!(
+                metric_total(
+                    &exposition,
+                    "arrowcol_pipeline_stage_duration_seconds_count{",
+                    "stage=\"commit\""
+                ) >= before_commits + 1,
+                "one durable commit duration must be emitted per physical commit"
+            );
+            assert!(
+                metric_total(
+                    &exposition,
+                    "arrowcol_parquet_file_rows_count{",
+                    "component=\"arrowcol-dataflow-rust\""
+                ) >= before_files + expected_files,
+                "only newly committed physical files must be recorded"
+            );
             let adds = std::fs::read_dir(directory.path().join("demo/generated/events/_delta_log"))
                 .expect("log")
                 .map(|entry| entry.expect("log entry").path())

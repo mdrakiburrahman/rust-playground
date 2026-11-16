@@ -3792,10 +3792,6 @@ impl DeltaTable {
         sync_directory(&self.root)
     }
 
-    pub(crate) fn commit_files(&self, files: &[StagedAppend]) -> Result<u64> {
-        self.commit_files_timed(files).map(|(version, _, _)| version)
-    }
-
     pub(crate) fn commit_files_timed(
         &self,
         files: &[StagedAppend],
@@ -3804,15 +3800,6 @@ impl DeltaTable {
             bail!("cannot publish an empty Delta data commit");
         }
         self.commit_files_inner_timed(files, None, &[])
-    }
-
-    pub(crate) fn commit_files_with_groups(
-        &self,
-        files: &[StagedAppend],
-        groups: &[CoalescedCommitGroup],
-    ) -> Result<u64> {
-        self.commit_files_with_groups_timed(files, groups)
-            .map(|(version, _, _)| version)
     }
 
     pub(crate) fn commit_files_with_groups_timed(
