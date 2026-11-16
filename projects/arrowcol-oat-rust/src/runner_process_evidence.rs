@@ -1366,6 +1366,11 @@ mod startup_readback_tests {
         let mut only_retry = retry_log.clone();
         only_retry.stdout = format!("{retry}\n");
         assert_eq!(maintenance_exit_classification(&only_retry, Some(1)), "classified_retries_only");
+        let mut unhealthy = only_retry.clone();
+        unhealthy.text.push_str("delta-maintenance stale-plan starvation table=t operation=vacuum consecutive=8 limit=8\n");
+        assert_eq!(maintenance_exit_classification(&unhealthy, Some(1)), "unhealthy");
+        unhealthy.text = "delta-maintenance pending-table status failed: private discovery error\n".to_owned();
+        assert_eq!(maintenance_exit_classification(&unhealthy, Some(1)), "unhealthy");
         only_retry.stdout = format!("{}\n", json!({"table":"t","operation":"vacuum","applied":true}));
         assert_eq!(maintenance_exit_classification(&only_retry, Some(1)), "unknown");
         for suffix in ["{\"operation\":", "{\"operation\":\"vacuum\",\"applied\":true}\n"] {
