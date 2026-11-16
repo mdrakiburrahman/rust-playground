@@ -9,7 +9,7 @@ use url::Url;
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OatConfig {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_oat_tunables")]
     pub tunables: Tunables,
     #[serde(default)]
     pub campaign_profile: Option<CampaignProfile>,
@@ -105,6 +105,14 @@ pub enum OatMode {
 #[serde(rename_all = "snake_case")]
 pub enum CampaignProfile {
     SingleHotTable,
+}
+
+fn deserialize_oat_tunables<'de, D>(deserializer: D) -> std::result::Result<Tunables, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Tunables::parse_oat_json(value).map_err(serde::de::Error::custom)
 }
 
 fn default_client_ready_timeout_seconds() -> u64 {

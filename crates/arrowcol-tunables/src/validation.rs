@@ -378,6 +378,16 @@ pub fn capability_table() -> &'static [Capability] {
 }
 
 impl Tunables {
+    /// Parses and validates a complete OAT tunables object using the typed registry.
+    ///
+    /// # Errors
+    /// Returns an error for unknown names, invalid types or enums, and invalid combinations.
+    pub fn parse_oat_json(value: Value) -> Result<Self> {
+        let tunables: Self = serde_json::from_value(value).context("parse OAT tunables")?;
+        tunables.validate_for_oat()?;
+        Ok(tunables)
+    }
+
     /// Validates values and verifies every configured section can be projected to process environments.
     ///
     /// # Errors
@@ -1896,6 +1906,26 @@ mod tests {
             let mut invalid = ParquetWriterConfig::default();
             invalid.defaults.bloom_filter_fpp = Some(probability);
             assert!(invalid.validate().is_err());
+        }
+
+        #[test]
+        fn oat_registry_parses_every_existing_codec_and_rejects_bad_candidates() -> Result<()> {
+            for codec in ["uncompressed", "snappy", "gzip", "brotli", "zstd", "lz4_raw", "lz4"] {
+                let value = serde_json::json!({"parquet_writer":{"defaults":{"compression":codec}}});
+                let tunables = Tunables::parse_oat_json(value)?;
+                let env = tunables.environment_for(ComponentRole::Collector)?;
+                let projected: Value = serde_json::from_str(&env["ARROWCOL_PARQUET_CONFIG"])?;
+                assert_eq!(projected["defaults"]["compression"], codec);
+            }
+            for value in [
+                serde_json::json!({"parquet_writer":{"defaults":{"compression":"invalid"}}}),
+                serde_json::json!({"collector":{"commit":{"staging_overlap":true}}}),
+                serde_json::json!({"client":{"workers":1025}}),
+                serde_json::json!({"client":{"workers":"16"}}),
+            ] {
+                assert!(Tunables::parse_oat_json(value).is_err());
+            }
+            Ok(())
         }
         Ok(())
     }
