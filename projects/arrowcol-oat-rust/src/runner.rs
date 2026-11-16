@@ -568,14 +568,13 @@ impl RunInventory {
         if ready && self.namespace.uid.is_none() {
             bail!("custody readiness requires an observed namespace UID");
         }
-        if !ready {
-            if receipt.get("resource_count").and_then(Value::as_u64) != Some(self.resources.len() as u64)
+        if !ready
+            && (receipt.get("resource_count").and_then(Value::as_u64) != Some(self.resources.len() as u64)
                 || receipt.get("fic_state") != Some(&json!(self.fic.as_ref().map(|fic| fic.state)))
                 || receipt.get("qap_state") != Some(&json!(self.qap.as_ref().map(|qap| qap.state)))
-                || receipt.get("etag").and_then(Value::as_str).is_none_or(str::is_empty)
-            {
-                bail!("custody persistence receipt is incomplete or does not match inventory");
-            }
+                || receipt.get("etag").and_then(Value::as_str).is_none_or(str::is_empty))
+        {
+            bail!("custody persistence receipt is incomplete or does not match inventory");
         }
         Ok(())
     }
@@ -9952,7 +9951,11 @@ mod tests {
         });
         inventory.validate_successor(&absent)?;
         let mut invalid_absence = absent.clone();
-        invalid_absence.resources[0].absence.as_mut().unwrap().name = "other".to_owned();
+        invalid_absence.resources[0]
+            .absence
+            .as_mut()
+            .context("missing absence receipt")?
+            .name = "other".to_owned();
         assert!(invalid_absence.validate().is_err());
         invalid_absence = absent.clone();
         invalid_absence.resources[0].uid = Some("unexpected".to_owned());
@@ -9961,7 +9964,7 @@ mod tests {
         invalid_absence.resources[0]
             .absence
             .as_mut()
-            .unwrap()
+            .context("missing absence receipt")?
             .observed_at_unix_ms = 124;
         assert!(absent.validate_successor(&invalid_absence).is_err());
         invalid_absence = absent.clone();
@@ -9986,8 +9989,8 @@ mod tests {
         }))?);
         external.validate()?;
         let mut partial = external.clone();
-        partial.qap.as_mut().unwrap().state = InventoryResourceState::Uncertain;
-        partial.qap.as_mut().unwrap().absence.pop();
+        partial.qap.as_mut().context("missing QAP inventory")?.state = InventoryResourceState::Uncertain;
+        partial.qap.as_mut().context("missing QAP inventory")?.absence.pop();
         partial.validate()?;
         partial.validate_successor(&external)?;
         assert!(external.validate_successor(&partial).is_err());
@@ -10002,14 +10005,21 @@ mod tests {
         complete.resources = absent.resources.clone();
         complete.validate()?;
         let mut invalid_external = external.clone();
-        invalid_external.fic.as_mut().unwrap().absence.as_mut().unwrap().name = "other".to_owned();
+        invalid_external
+            .fic
+            .as_mut()
+            .context("missing FIC inventory")?
+            .absence
+            .as_mut()
+            .context("missing FIC absence")?
+            .name = "other".to_owned();
         assert!(invalid_external.validate().is_err());
         invalid_external = external.clone();
-        let qap = invalid_external.qap.as_mut().unwrap();
+        let qap = invalid_external.qap.as_mut().context("missing QAP inventory")?;
         qap.absence[1] = qap.absence[0].clone();
         assert!(invalid_external.validate().is_err());
         invalid_external = external.clone();
-        invalid_external.qap.as_mut().unwrap().absence[0].observed_at_unix_ms = 9;
+        invalid_external.qap.as_mut().context("missing QAP inventory")?.absence[0].observed_at_unix_ms = 9;
         assert!(external.validate_successor(&invalid_external).is_err());
         let mut observed = inventory.clone();
         observed.resources[0].state = InventoryResourceState::Observed;
