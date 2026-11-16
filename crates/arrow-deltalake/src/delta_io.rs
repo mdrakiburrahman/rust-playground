@@ -593,20 +593,22 @@ mod tests {
             ("CPU_WORKERS", 1, 128),
         ] {
             let knob = format!("ARROWCOL_COLLECTOR_{knob}");
-            let companion_value = |name| match (knob.as_str(), name) {
-                ("ARROWCOL_COLLECTOR_UPLOAD_LIMIT", "ARROWCOL_COLLECTOR_UPLOAD_BUFFER_CAPACITY_BYTES")
-                | (
-                    "ARROWCOL_COLLECTOR_UPLOAD_REQUEST_CONCURRENCY",
-                    "ARROWCOL_COLLECTOR_UPLOAD_BUFFER_CAPACITY_BYTES",
-                ) => Some("1048576"),
-                ("ARROWCOL_COLLECTOR_UPLOAD_LIMIT", "ARROWCOL_COLLECTOR_UPLOAD_REQUEST_CONCURRENCY")
-                | (
-                    "ARROWCOL_COLLECTOR_UPLOAD_BUFFER_CAPACITY_BYTES",
-                    "ARROWCOL_COLLECTOR_UPLOAD_REQUEST_CONCURRENCY",
-                ) => Some("1"),
-                ("ARROWCOL_COLLECTOR_UPLOAD_BUFFER_CAPACITY_BYTES", "ARROWCOL_COLLECTOR_UPLOAD_LIMIT")
-                | ("ARROWCOL_COLLECTOR_UPLOAD_REQUEST_CONCURRENCY", "ARROWCOL_COLLECTOR_UPLOAD_LIMIT") => Some("1"),
-                _ => None,
+            let companion_value = |name: &str| -> Option<&'static str> {
+                match (knob.as_str(), name) {
+                    ("ARROWCOL_COLLECTOR_UPLOAD_LIMIT", "ARROWCOL_COLLECTOR_UPLOAD_BUFFER_CAPACITY_BYTES")
+                    | (
+                        "ARROWCOL_COLLECTOR_UPLOAD_REQUEST_CONCURRENCY",
+                        "ARROWCOL_COLLECTOR_UPLOAD_BUFFER_CAPACITY_BYTES",
+                    ) => Some("1048576"),
+                    ("ARROWCOL_COLLECTOR_UPLOAD_LIMIT", "ARROWCOL_COLLECTOR_UPLOAD_REQUEST_CONCURRENCY")
+                    | (
+                        "ARROWCOL_COLLECTOR_UPLOAD_BUFFER_CAPACITY_BYTES",
+                        "ARROWCOL_COLLECTOR_UPLOAD_REQUEST_CONCURRENCY",
+                    ) => Some("1"),
+                    ("ARROWCOL_COLLECTOR_UPLOAD_BUFFER_CAPACITY_BYTES", "ARROWCOL_COLLECTOR_UPLOAD_LIMIT")
+                    | ("ARROWCOL_COLLECTOR_UPLOAD_REQUEST_CONCURRENCY", "ARROWCOL_COLLECTOR_UPLOAD_LIMIT") => Some("1"),
+                    _ => None,
+                }
             };
             let read = |name: &str, value: &str| {
                 if name == knob {
