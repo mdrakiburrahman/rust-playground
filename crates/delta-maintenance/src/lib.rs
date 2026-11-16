@@ -9,7 +9,8 @@ use arrow_deltalake::delta::DeltaTable;
 use arrow_deltalake::maintenance::{
     DEFAULT_OPTIMIZE_UPLOAD_BUFFER_BYTES, Granularity, MaintenanceControl, MaintenanceError, MaintenanceErrorKind,
     MaintenancePlan, MaintenanceReport, NegativeProbeConfig, OptimizeConfig, OptimizePlan, Outcome, PassProbeInventory,
-    ProbeOperation, PruneConfig, PurgeConfig, TableFingerprint, VacuumConfig, error_details, now_ms,
+    ProbeOperation, PruneConfig, PurgeConfig, TableFingerprint, VacuumConfig, attach_error_report, error_details,
+    error_report, now_ms,
 };
 use arrowcol_props::{PropValue, ResolvedProps, resolve};
 use serde::Serialize;
@@ -1441,6 +1442,7 @@ fn retry_stale_purge(
     let started = Instant::now();
     let max_attempts = max_attempts.max(1);
     let mut retries = 0;
+    let mut replan_pending = false;
     let mut counters = PurgeRetryCounters::default();
     loop {
         control
@@ -1466,19 +1468,24 @@ fn retry_stale_purge(
             .clone()
             .with_deadline(started + budget)
             .with_commit_retry_limits(remaining_attempts, remaining_budget)?;
+        attempt_control
+            .check()
+            .map_err(|error| with_purge_retry_counts(error, counters))?;
+        if replan_pending {
+            counters.replans = counters.replans.saturating_add(1);
+        }
         match apply(&attempt_control) {
             Ok(mut report) => {
                 counters.write_to(&mut report);
                 return Ok(report);
             }
             Err(error) => {
-                if let Some(report) = error_details(&error).and_then(|details| details.report.as_deref()) {
+                if let Some(report) = error_report(&error) {
                     counters.include(report);
                 }
                 if !is_purge_membership_stale(&error) {
                     return Err(with_purge_retry_counts(error, counters));
                 }
-                counters.replans = counters.replans.saturating_add(1);
                 let backoff = Duration::from_millis(5_u64 << retries.min(5));
                 if counters.attempts >= max_attempts {
                     return Err(with_purge_retry_counts(error, counters));
@@ -1492,6 +1499,7 @@ fn retry_stale_purge(
                 }
                 retries += 1;
                 std::thread::sleep(backoff);
+                replan_pending = true;
             }
         }
     }
@@ -1508,26 +1516,13 @@ fn is_purge_membership_stale(error: &anyhow::Error) -> bool {
 }
 
 fn with_purge_retry_counts(error: anyhow::Error, counters: PurgeRetryCounters) -> anyhow::Error {
-    let Some(details) = error_details(&error) else {
-        return error.context(format!(
-            "PURGE retries: attempts={}, collisions={}, commit_retries={}, replans={}",
-            counters.attempts, counters.collisions, counters.retries, counters.replans
-        ));
-    };
-    let mut report = details
-        .report
-        .as_deref()
-        .map_or_else(MaintenanceReport::default, |report| report.clone());
+    let mut report = error_report(&error).cloned().unwrap_or_default();
     report.operation = "purge".to_owned();
     report.attempts = counters.attempts;
     report.collisions = counters.collisions;
     report.retries = counters.retries;
     report.replans = counters.replans;
-    anyhow::Error::new(MaintenanceError {
-        kind: details.kind,
-        message: details.message.clone(),
-        report: Some(Box::new(report)),
-    })
+    attach_error_report(error, &report)
 }
 
 fn purge_retry_budget_error(counters: PurgeRetryCounters, kind: MaintenanceErrorKind, message: &str) -> anyhow::Error {
@@ -1623,12 +1618,9 @@ mod purge_replan_tests {
         assert_eq!(calls.get(), 2);
         let details = error_details(&error).ok_or_else(|| anyhow::anyhow!("classified maintenance error"))?;
         assert_eq!(details.kind, MaintenanceErrorKind::StalePlan);
-        let report = details
-            .report
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("aggregated counters"))?;
+        let report = error_report(&error).ok_or_else(|| anyhow::anyhow!("aggregated counters"))?;
         assert_eq!(report.attempts, 2);
-        assert_eq!(report.replans, 2);
+        assert_eq!(report.replans, 1);
         assert_eq!(report.retries, 0);
         Ok(())
     }
@@ -1662,10 +1654,7 @@ mod purge_replan_tests {
         assert_eq!(applies.get(), 1, "the changed-policy plan must not be applied");
         let details = error_details(&error).ok_or_else(|| anyhow::anyhow!("classified metadata error"))?;
         assert_eq!(details.kind, MaintenanceErrorKind::MetadataChanged);
-        let report = details
-            .report
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("first attempt counters"))?;
+        let report = error_report(&error).ok_or_else(|| anyhow::anyhow!("first attempt counters"))?;
         assert_eq!(report.attempts, 1);
         assert_eq!(report.replans, 1);
         Ok(())
@@ -1690,7 +1679,41 @@ mod purge_replan_tests {
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("attempt counters"))?;
         assert_eq!(report.attempts, 1);
-        assert_eq!(report.replans, 1);
+        assert_eq!(report.replans, 0, "budget rejection did not admit another rebuild");
+        Ok(())
+    }
+
+    #[test]
+    fn purge_conflict_then_cancel_preserves_partial_report_and_source() -> Result<()> {
+        let mut partial = report(2);
+        partial.collisions = 1;
+        let calls = std::cell::Cell::new(0);
+        let error = require_error(
+            retry_stale_purge(4, Duration::from_secs(1), &MaintenanceControl::default(), |_| {
+                calls.set(calls.get() + 1);
+                let source = anyhow::Error::new(MaintenanceError {
+                    kind: MaintenanceErrorKind::Cancelled,
+                    message: "maintenance cancelled".to_owned(),
+                    report: None,
+                })
+                .context(std::io::Error::other("injected cancellation source"));
+                Err(attach_error_report(source, &partial))
+            }),
+            "terminal cancellation should retain the completed conflict attempt",
+        )?;
+
+        assert_eq!(calls.get(), 1);
+        let details = error_details(&error).ok_or_else(|| anyhow::anyhow!("classified cancellation"))?;
+        assert_eq!(details.kind, MaintenanceErrorKind::Cancelled);
+        let report = error_report(&error).ok_or_else(|| anyhow::anyhow!("partial publish report"))?;
+        assert_eq!(report.attempts, 2);
+        assert_eq!(report.collisions, 1);
+        assert_eq!(report.replans, 0);
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.to_string() == "injected cancellation source")
+        );
         Ok(())
     }
 
@@ -1957,7 +1980,7 @@ fn maintain_table(
                     _ => error_details(&error),
                 };
                 result.error_kind = Some(details.map_or("failure", |details| details.kind.label()));
-                result.report = details.and_then(|details| details.report.as_deref().cloned());
+                result.report = error_report(&error).cloned();
                 result.error = Some(format!("{error:#}"));
             }
         }

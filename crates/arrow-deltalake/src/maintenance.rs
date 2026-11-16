@@ -285,10 +285,74 @@ fn fail_with(kind: MaintenanceErrorKind, message: impl Into<String>, report: &Ma
     })
 }
 
+#[derive(Debug)]
+struct MaintenanceErrorContext {
+    details: Option<MaintenanceError>,
+    report: Option<Box<MaintenanceReport>>,
+    source: anyhow::Error,
+}
+
+impl Display for MaintenanceErrorContext {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        if let Some(details) = &self.details {
+            Display::fmt(details, f)
+        } else {
+            f.write_str("maintenance operation has partial progress")
+        }
+    }
+}
+
+impl std::error::Error for MaintenanceErrorContext {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.chain().next()
+    }
+}
+
 /// Find the classified failure anywhere in an error chain.
 #[must_use]
 pub fn error_details(error: &anyhow::Error) -> Option<&MaintenanceError> {
-    error.chain().find_map(|cause| cause.downcast_ref::<MaintenanceError>())
+    error
+        .downcast_ref::<MaintenanceErrorContext>()
+        .and_then(|context| context.details.as_ref())
+        .or_else(|| error.chain().find_map(|cause| cause.downcast_ref::<MaintenanceError>()))
+}
+
+/// Find partial operation progress attached to an error chain.
+#[must_use]
+pub fn error_report(error: &anyhow::Error) -> Option<&MaintenanceReport> {
+    error
+        .downcast_ref::<MaintenanceErrorContext>()
+        .and_then(|context| context.report.as_deref())
+        .or_else(|| {
+            error.chain().find_map(|cause| {
+                cause
+                    .downcast_ref::<MaintenanceError>()
+                    .and_then(|details| details.report.as_deref())
+            })
+        })
+}
+
+fn with_maintenance_error(
+    error: anyhow::Error,
+    details: Option<MaintenanceError>,
+    report: Option<&MaintenanceReport>,
+) -> anyhow::Error {
+    anyhow::Error::new(MaintenanceErrorContext {
+        details,
+        report: report.cloned().map(Box::new),
+        source: error,
+    })
+}
+
+/// Attach partial progress while preserving the original error and its source chain.
+#[must_use]
+pub fn attach_error_report(error: anyhow::Error, report: &MaintenanceReport) -> anyhow::Error {
+    let details = error_details(&error).map(|details| MaintenanceError {
+        kind: details.kind,
+        message: details.message.clone(),
+        report: Some(Box::new(report.clone())),
+    });
+    with_maintenance_error(error, details, Some(report))
 }
 
 /// Classified failure kind, if any.
@@ -1612,12 +1676,7 @@ impl DeltaTable {
                 Err(error) => {
                     if !uncertain {
                         let error = self.discard_after(outputs, error, report);
-                        if let Some(details) =
-                            error_details(&error).filter(|details| details.kind == MaintenanceErrorKind::StalePlan)
-                        {
-                            return Err(fail_with(details.kind, details.message.clone(), report));
-                        }
-                        return Err(error);
+                        return Err(attach_error_report(error, report));
                     }
                     // A raw commit error can follow actual publication: reconcile
                     // by plan id and never clean up outputs blindly.
@@ -1646,7 +1705,7 @@ impl DeltaTable {
             ),
             report,
         );
-        Err(self.discard_after(outputs, error, report))
+        Err(attach_error_report(self.discard_after(outputs, error, report), report))
     }
 
     /// Acknowledge a visible plan identity only after local replay is durable; a
@@ -1752,11 +1811,14 @@ impl DeltaTable {
             Ok(()) => error,
             Err(cleanup) => {
                 report.outputs = outputs.iter().map(|output| output.relative.clone()).collect();
-                fail_with(
-                    error_kind(&error).unwrap_or(MaintenanceErrorKind::Uncertain),
-                    format!("{error:#}; cleanup of unpublished outputs failed (retained): {cleanup}"),
-                    report,
-                )
+                let kind = error_kind(&error).unwrap_or(MaintenanceErrorKind::Uncertain);
+                let message = format!("{error:#}; cleanup of unpublished outputs failed (retained): {cleanup}");
+                let details = MaintenanceError {
+                    kind,
+                    message,
+                    report: Some(Box::new(report.clone())),
+                };
+                with_maintenance_error(error, Some(details), Some(report))
             }
         }
     }
@@ -1939,6 +2001,74 @@ mod optimize_upload_tests {
         ));
         let stored = store.get(&path).await?.bytes().await?;
         assert_eq!(stored.as_ref(), &[1, 2, 3]);
+        Ok(())
+    }
+
+    #[test]
+    fn direct_optimize_cleanup_failure_retains_report_and_paths() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = fs::canonicalize(directory.path())?;
+        let url = Url::from_directory_path(&root).map_err(|()| anyhow::anyhow!("URL"))?;
+        let schema = Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
+            "id",
+            DataType::Int64,
+            false,
+        )]));
+        let table = DeltaTable::open_url(url.clone(), schema, Vec::new())?;
+        let engine = DefaultEngineBuilder::new(object_store_for_url(&url)?)
+            .with_task_executor(shared_executor()?)
+            .build();
+        let snapshot = Snapshot::builder_for(url.as_str()).build(&engine)?;
+        let context = table.write_context(&snapshot, &BTreeMap::new())?;
+        let local = root.join("retained-output.parquet");
+        fs::create_dir(&local)?;
+        let output = StagedOutput {
+            relative: "retained-output.parquet".to_owned(),
+            local,
+            url: table.data_url("retained-output.parquet")?,
+            modified_ms: 0,
+            bytes: 42,
+            rows: 3,
+            stats: arrow::array::StructArray::new_empty_fields(0, None),
+            context,
+            uploaded: false,
+        };
+        let mut report = MaintenanceReport {
+            operation: "optimize".to_owned(),
+            files_added: 1,
+            bytes_added: 42,
+            ..MaintenanceReport::default()
+        };
+        let error = table.discard_after(
+            &[output],
+            fail(
+                MaintenanceErrorKind::StalePlan,
+                "rewritten row count differs from input statistics",
+            ),
+            &mut report,
+        );
+
+        let details = error_details(&error).context("classified cleanup error")?;
+        assert_eq!(details.kind, MaintenanceErrorKind::StalePlan);
+        assert!(
+            details
+                .message
+                .contains("cleanup of unpublished outputs failed (retained)")
+        );
+        assert!(details.message.contains("retained-output.parquet"));
+        assert!(error.chain().any(|cause| {
+            cause
+                .to_string()
+                .contains("rewritten row count differs from input statistics")
+        }));
+        let details_report = details.report.as_deref().context("typed partial report")?;
+        assert_eq!(details_report.files_added, 1);
+        assert_eq!(details_report.bytes_added, 42);
+        assert_eq!(details_report.outputs, ["retained-output.parquet"]);
+        let attached_report = error_report(&error).context("attached partial report")?;
+        assert_eq!(attached_report.files_added, 1);
+        assert_eq!(attached_report.bytes_added, 42);
+        assert_eq!(attached_report.outputs, ["retained-output.parquet"]);
         Ok(())
     }
 }
