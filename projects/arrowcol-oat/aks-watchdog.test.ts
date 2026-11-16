@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import { CampaignConflictError, CUSTODY_CLEANUP_STEPS, armCampaign, publishRunInventory, startCampaign, type CampaignState, type CampaignStore, type RunInventory, type StoredCampaign } from './aks-campaign.js';
 import { watchdogOnce } from './aks-watchdog.js';
 import { createExternalCleanupExecutor, type ExternalCleanupActions } from './aks-cleanup-executor.js';
-import { reconcileOnce } from './aks-reconcile.js';
+import { reconcileCleanupOnce, reconcileOnce } from './aks-reconcile.js';
 
 const campaignId = 'c0ffee00-0000-4000-8000-000000000001';
 const ownerId = 'c0ffee00-0000-4000-8000-000000000002';
