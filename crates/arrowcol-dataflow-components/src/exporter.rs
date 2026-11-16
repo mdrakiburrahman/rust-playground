@@ -2110,7 +2110,7 @@ mod tests {
             let pending = runtime_metrics.publication_backlog_snapshot();
             assert!(pending.available);
             assert_eq!(pending.publications, Some(2));
-            assert_eq!(pending.rows, Some(2));
+            assert_eq!(pending.rows, Some(4));
             assert!(pending.logical_bytes.is_some_and(|bytes| bytes > 0));
             assert!(pending.oldest_age.is_some());
             exporter.backend.flush_pending().await.expect("group flush");
@@ -2124,7 +2124,9 @@ mod tests {
             assert_eq!(settled.logical_bytes, Some(0));
             assert!(settled.oldest_age.is_none());
             let replay = exporter.stage(envelope_pdata(original)).await.expect("replay");
-            assert_eq!(runtime_metrics.publication_backlog_snapshot().publications, Some(1));
+            let replaying = runtime_metrics.publication_backlog_snapshot();
+            assert_eq!(replaying.publications, Some(1));
+            assert_eq!(replaying.rows, Some(2));
             exporter.backend.flush_pending().await.expect("replay flush");
             replay.wait().await.expect("idempotent replay");
             let exposition = runtime_metrics.prometheus();
