@@ -480,15 +480,26 @@ impl TaskExecutor for SharedExecutor {
 }
 
 #[cfg(all(test, target_os = "linux"))]
+fn is_vanished_task_error(error: &std::io::Error) -> bool {
+    // Linux ESRCH is not mapped to a dedicated std::io::ErrorKind.
+    const ESRCH: i32 = 3;
+    error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(ESRCH)
+}
+
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn assert_worker_bound() -> Result<()> {
     let mut threads = 0;
     for entry in std::fs::read_dir("/proc/self/task")? {
-        let entry = entry?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) if is_vanished_task_error(&error) => continue,
+            Err(error) => return Err(error.into()),
+        };
         // A completed, unrelated test thread may exit during enumeration.
         match std::fs::read_to_string(entry.path().join("comm")) {
             Ok(name) if name.trim() == "delta-io" => threads += 1,
             Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) if is_vanished_task_error(&error) => {}
             Err(error) => return Err(error.into()),
         }
     }
@@ -502,6 +513,18 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_task_observation_ignores_only_vanished_tasks() {
+        assert!(is_vanished_task_error(&std::io::Error::from_raw_os_error(3)));
+        assert!(is_vanished_task_error(&std::io::Error::from(
+            std::io::ErrorKind::NotFound
+        )));
+        assert!(!is_vanished_task_error(&std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied
+        )));
+    }
 
     #[test]
     fn runtime_defaults_scale_with_cpu_bounds() -> Result<()> {
