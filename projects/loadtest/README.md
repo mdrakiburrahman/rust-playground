@@ -57,6 +57,12 @@ publication and row correctness.
 `--precompute-batches-per-table` / `ARROWCOL_CLIENT_PRECOMPUTE_BATCHES_PER_TABLE`).
 All are startup settings; CLI values override environment values.
 
+`--partition-by-ingestion-date` is opt-in and local-only: it initializes explicitly
+selected `--table` paths under the existing writable `--dataflow-root` before
+schema registration. Use a fresh run-owned root with no existing selected table
+directories; existing tables are refused, never rewritten. Without the flag,
+initialization remains unchanged.
+
 | Controls | Behavior |
 | --- | --- |
 | `--lanes 0`, `--runtime-threads 0` | Use all available cores; lanes otherwise retain default `4`. Independent lanes continuously replenish one logical batch each, without a round barrier. |

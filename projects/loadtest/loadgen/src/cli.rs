@@ -229,6 +229,10 @@ pub struct RunArgs {
     #[arg(long = "table", env = "LOADTEST_TABLES", value_delimiter = ',')]
     pub tables: Vec<String>,
 
+    /// Initialize selected fresh local tables with the ingestion partition before registration.
+    #[arg(long)]
+    pub partition_by_ingestion_date: bool,
+
     /// Concurrent scheduling lanes; zero uses all available cores. Each lane has one logical batch in flight.
     #[arg(long, env = "LOADTEST_LANES", default_value_t = 4)]
     pub lanes: usize,
