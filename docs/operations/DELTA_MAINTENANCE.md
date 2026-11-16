@@ -12,8 +12,37 @@
 | OPTIMIZE upload | `--optimize-upload-mode` / `ARROWCOL_MAINT_OPTIMIZE_UPLOAD_MODE` is strictly `put_create` (default, atomic create-only) or `buffered_multipart` (opt-in, UUID-collision-only and unqualified; do not use in scored cells). `--optimize-upload-buffer-bytes` / `ARROWCOL_MAINT_OPTIMIZE_UPLOAD_BUFFER_BYTES` applies only to buffered mode, defaults to 8 MiB, and accepts 4..=64 MiB. Successful upload shutdown precedes Add publication; a failed/uncertain multipart completion may leave an orphan. `BufWriter` concurrency 1 does not cap final-part overlap. |
 | Observability | JSON results identify `negative_probe` and report total `duration_ms` plus scoped `probe_duration_ms` (log/property validation and negative probe) and `plan_apply_duration_ms` (full table open, planning and apply). Prometheus `delta_maintenance_negative_probes_total` and outcome-labelled runs distinguish cheap noops from plans, work and errors. Equivalent counters are exported through OpenTelemetry. |
 | Compaction debt | OPTIMIZE reports `compaction_debt` with the pass anchor (`observed_at_ms`), inventory source, eligible file/byte totals, bounded backlog totals and, for ingestion partitions, the oldest eligible partition start. Present evidence with zero counts is a measured zero; `null` or a missing report is unavailable, never zero. Incomplete bounded inventories fail instead of emitting a zero. |
+| Due work | `MaintenanceReport.maintenance_due_work` is a per-operation, bounded observation. Missing/null is UNKNOWN; only complete evidence may report exact zero. Scan limits and incomplete plans never become zero or backlog. |
 | Startup readback | `arrowcol_maintenance_effective_config.optimize_upload` reports mode, requested buffer, and effective buffer; `null` means inactive for `put_create`, while `buffered_multipart` defaults to 8 MiB. `startup.operation_limits` retains the exact parsed consumer values. |
 | Parquet writer | Optional OAT `maintenance.parquet_writer` is role-scoped: absent inherits the global writer; present replaces the maintenance writer only. Startup `parquet_writer_overrides` reports the maintenance process settings, and an omitted writer row-group limit preserves `output_row_group_rows`. |
+
+## Due-work evidence
+
+`maintenance_due_work` uses snake_case JSON and is attached to each operation report. It is one observation, not a sustained-window verdict. Campaign qualification requires one complete observation per enabled operation in every contiguous 30-second window for the same run/table/process; missing, incomplete, failed, stale, dropped, or out-of-window observations remain UNKNOWN with no carry-forward.
+
+| Field | Type / units | Meaning |
+| --- | --- | --- |
+| `observed_at_ms` | `i64`, UTC Unix milliseconds | Operation observation/pass anchor. |
+| `source` | enum | `snapshot_active_files`, `bounded_physical_inventory`, `bounded_tombstone_replay`, `checkpoint_log_inventory`, `bounded_log_inventory`, or `verified_prune_proof`. |
+| `completeness` | `complete` / `incomplete` | Whether the bounded authoritative source covers the complete eligible set. |
+| `unit` | enum | `parquet_files`, `tombstones`, `commits`, or `log_objects`; applies to eligible/backlog counts. |
+| `due` | nullable boolean | Exact configured due condition; it may be false while a threshold-based operation has nonzero eligible count. |
+| `eligible_count`, `eligible_bytes` | nullable `u64` | Exact eligible work before action caps; bytes are null unless the planner measures them. |
+| `backlog_count`, `backlog_bytes` | nullable `u64` | Eligible work omitted only by an action cap; never use these for a truncated scan. |
+| `oldest_eligible_timestamp_ms` | nullable UTC Unix milliseconds | Timestamp, not age; basis is `ingestion_partition_start`, `delta_remove_timestamp`, or `log_object_last_modified`. |
+| `incomplete_reason` | nullable enum | `active_file_limit`, `physical_listing_limit`, `log_listing_limit`, `malformed_partition`, `unsupported_layout`, `missing_checkpoint_proof`, `undated_tombstones`, `stale_identity`, `operation_failed`, or `cancelled`. |
+
+A complete observation has exact `due` and `eligible_count`; optional byte/backlog/oldest fields remain null unless authoritatively measured. An incomplete observation has null `due`, eligible/backlog counts and bytes, and oldest timestamp, plus an `incomplete_reason`. A missing `maintenance_due_work` value or a top-level operation error without a report is UNKNOWN, never zero. A scan bound, malformed layout, stale identity, or missing proof cannot be relabeled as action-cap backlog.
+
+The wire path is `OperationResult.report.maintenance_due_work`. Successful wrappers omit `error` and `error_kind`; failures can retain pre-action evidence. An error, `report.interrupted=true`, or `report.outcome=partial` makes eligibility UNKNOWN even when retained evidence says `complete`. The idle service test emits `maintenance_due_work_serde_fixtures=` with all five real operation wrappers and explicitly constructed error/interrupted/partial/missing-report qualification cases for reader compatibility checks.
+
+| Operation | Authoritative source and unit |
+| --- | --- |
+| PURGE | Active-file plan or bounded physical inventory; `parquet_files`. |
+| OPTIMIZE | Active-file plan or bounded physical inventory; `parquet_files`. |
+| VACUUM | Bounded tombstone replay; `tombstones`. Physical object age cannot prove tombstone eligibility. |
+| CHECKPOINT | Checkpoint/log inventory; `commits`. |
+| PRUNE-LOG | Bounded log inventory or verified prune proof; `log_objects`. |
 
 ## Negative admission, before replay
 
@@ -22,14 +51,16 @@ Probes open the guarded storage transport only: no schema initialization, Delta 
 | Phase | Cheap negative proof |
 | --- | --- |
 | PURGE | No physical ingestion partition ends at or before the retention cutoff. Malformed or non-ingestion partition layouts require the normal planner or return an error. |
-| OPTIMIZE | No eligible physical partition contains the configured minimum small files (at least two). The newest ingestion partition is excluded when `sealedPartitionsOnly` is true; categorical/multi-column Hive partitions conservatively use the full planner. Inactive physical files can force a full plan, but cannot authorize compaction. |
-| VACUUM | Every physical data object is at or newer than the retention cutoff, no old log objects exist, and checkpoint debt is below the configured interval. This is a negative proof only; physical timestamps never authorize deletion. |
+| OPTIMIZE | No eligible physical partition contains the configured minimum small files (at least two). Ingestion partition names must decode and parse at the configured granularity; malformed names defer to the full planner and remain incomplete, even below the file-count threshold. The newest ingestion partition is excluded when `sealedPartitionsOnly` is true; categorical/multi-column Hive partitions conservatively use the full planner. Inactive physical files can force a full plan, but cannot authorize compaction. |
+| VACUUM | Always defers to bounded tombstone replay. Physical object timestamps cannot establish tombstone eligibility or prove zero debt. |
 | Checkpoint | Latest log version minus checkpoint version is below `delta.checkpointInterval`. Unsupported multipart/v2 layouts go through the full path. |
-| PRUNE-LOG | No checkpoint exists or no retained log object is older than log retention. Otherwise the existing checkpoint/history equivalence proof remains mandatory. |
+| PRUNE-LOG | No retained log object is older than log retention. Otherwise the existing checkpoint/history equivalence proof remains mandatory; missing proof is incomplete. Full apply preserves the plan's due-work evidence, including no-work exits. |
 
 Metadata-only filesystem property caches are fenced by log-object identity tokens, including checkpoint changes and same-version replacements. Retention probes are recomputed against the current clock every pass; they are never cached solely by version.
 
 ## Destructive safety
+
+OPTIMIZE decoded-input `resource_limit` diagnostics name `max_batch_bytes` (one decoded batch) or `max_decoded_bytes_per_bin` (cumulative decoded input for the bin), with `measured_bytes` and `allowed_bytes`. If both are exceeded, the batch bound is reported first. These diagnostics do not change either cap.
 
 **PURGE removes logical data; VACUUM physically deletes files.** Keep readers within the retained history window. Table properties cannot bypass the seven-day VACUUM floor, retained-tombstone constraints or the storage publication/reset fence. CLI-only disposable-test acknowledgements remain invocation controls and are never persisted into catalog policy.
 

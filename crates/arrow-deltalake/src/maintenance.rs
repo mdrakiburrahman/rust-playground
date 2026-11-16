@@ -1006,6 +1006,10 @@ impl DeltaTable {
         if config.max_listed_files == 0 || config.checkpoint_interval == 0 || config.optimize_min_files < 2 {
             return Err(fail(MaintenanceErrorKind::InvalidPlan, "invalid negative-probe bounds"));
         }
+        // Physical object age cannot prove VACUUM LITE tombstone eligibility.
+        if operation == ProbeOperation::Vacuum {
+            return Ok(None);
+        }
         if inventory
             .property_fingerprint
             .as_ref()
@@ -1078,7 +1082,7 @@ impl DeltaTable {
         });
         let no_work = match operation {
             ProbeOperation::Checkpoint => debt < config.checkpoint_interval,
-            ProbeOperation::PruneLog => checkpoint.is_none() || !old_logs,
+            ProbeOperation::PruneLog => !old_logs,
             ProbeOperation::Optimize | ProbeOperation::Purge | ProbeOperation::Vacuum => {
                 if inventory.physical.is_none() {
                     inventory.physical = Some(Arc::new(self.probe_physical_files(config.max_listed_files, control)?));
@@ -1098,6 +1102,16 @@ impl DeltaTable {
                         let ingestion = groups.keys().all(|partition| {
                             partition.starts_with("__arrowcol_ingestion=") && !partition.contains('/')
                         });
+                        for partition in groups.keys() {
+                            if let Some(value) = partition.strip_prefix("__arrowcol_ingestion=") {
+                                let Ok(value) = percent_decode(value) else {
+                                    return Ok(None);
+                                };
+                                if config.granularity.parse_partition(&value).is_err() {
+                                    return Ok(None);
+                                }
+                            }
+                        }
                         !groups.iter().any(|(partition, count)| {
                             *count >= config.optimize_min_files
                                 && (!config.sealed_partitions_only || !ingestion || Some(partition) != newest)
@@ -1159,6 +1173,50 @@ impl DeltaTable {
                 "log changed during negative probe; retry",
             ));
         }
+        let maintenance_due_work = Some(match operation {
+            ProbeOperation::Optimize | ProbeOperation::Purge => {
+                let mut evidence = MaintenanceDueWorkEvidence::complete(
+                    config.now_ms,
+                    MaintenanceDueWorkSource::BoundedPhysicalInventory,
+                    MaintenanceDueWorkUnit::ParquetFiles,
+                    false,
+                    0,
+                );
+                evidence.eligible_bytes = Some(0);
+                evidence.backlog_count = Some(0);
+                evidence.backlog_bytes = Some(0);
+                evidence
+            }
+            ProbeOperation::Vacuum => {
+                let mut evidence = MaintenanceDueWorkEvidence::complete(
+                    config.now_ms,
+                    MaintenanceDueWorkSource::BoundedPhysicalInventory,
+                    MaintenanceDueWorkUnit::Tombstones,
+                    false,
+                    0,
+                );
+                evidence.backlog_count = Some(0);
+                evidence
+            }
+            ProbeOperation::Checkpoint => MaintenanceDueWorkEvidence::complete(
+                config.now_ms,
+                MaintenanceDueWorkSource::CheckpointLogInventory,
+                MaintenanceDueWorkUnit::Commits,
+                false,
+                debt,
+            ),
+            ProbeOperation::PruneLog => {
+                let mut evidence = MaintenanceDueWorkEvidence::complete(
+                    config.now_ms,
+                    MaintenanceDueWorkSource::BoundedLogInventory,
+                    MaintenanceDueWorkUnit::LogObjects,
+                    false,
+                    0,
+                );
+                evidence.backlog_count = Some(0);
+                evidence
+            }
+        });
         Ok(Some(MaintenanceReport {
             operation: operation.label().into(),
             read_version: version,
@@ -1172,6 +1230,7 @@ impl DeltaTable {
                 backlog_bytes: 0,
                 oldest_eligible_partition_start_ms: None,
             }),
+            maintenance_due_work,
             ..MaintenanceReport::default()
         }))
     }
@@ -1514,6 +1573,131 @@ pub struct CompactionDebtEvidence {
     pub oldest_eligible_partition_start_ms: Option<i64>,
 }
 
+/// Source of a bounded maintenance due-work observation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaintenanceDueWorkSource {
+    SnapshotActiveFiles,
+    BoundedPhysicalInventory,
+    BoundedTombstoneReplay,
+    CheckpointLogInventory,
+    BoundedLogInventory,
+    VerifiedPruneProof,
+}
+
+/// Whether the observation covers the complete eligible-work set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaintenanceDueWorkCompleteness {
+    Complete,
+    Incomplete,
+}
+
+/// Unit used by the operation's eligible and backlog counters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaintenanceDueWorkUnit {
+    ParquetFiles,
+    Tombstones,
+    Commits,
+    LogObjects,
+}
+
+/// Why an observation with a known source cannot establish exact eligibility.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaintenanceDueWorkIncompleteReason {
+    ActiveFileLimit,
+    PhysicalListingLimit,
+    LogListingLimit,
+    MalformedPartition,
+    UnsupportedLayout,
+    MissingCheckpointProof,
+    UndatedTombstones,
+    StaleIdentity,
+    OperationFailed,
+    Cancelled,
+}
+
+/// Timestamp basis for an optional oldest-eligible timestamp.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaintenanceDueWorkTimestampBasis {
+    IngestionPartitionStart,
+    DeltaRemoveTimestamp,
+    LogObjectLastModified,
+}
+
+/// Bounded, pass-scoped maintenance debt. None in MaintenanceReport means UNKNOWN.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaintenanceDueWorkEvidence {
+    /// UTC milliseconds since the Unix epoch at the operation's observation anchor.
+    pub observed_at_ms: i64,
+    pub source: MaintenanceDueWorkSource,
+    pub completeness: MaintenanceDueWorkCompleteness,
+    pub unit: MaintenanceDueWorkUnit,
+    /// Whether this operation's configured due condition is met.
+    pub due: Option<bool>,
+    /// Exact eligible units before the action cap, when completeness is complete.
+    pub eligible_count: Option<u64>,
+    /// Exact eligible bytes only where the planner measures them.
+    pub eligible_bytes: Option<u64>,
+    /// Eligible units omitted by an action cap, not by an incomplete scan.
+    pub backlog_count: Option<u64>,
+    pub backlog_bytes: Option<u64>,
+    /// Oldest eligible timestamp, not an age; basis is operation-specific.
+    pub oldest_eligible_timestamp_ms: Option<i64>,
+    pub oldest_timestamp_basis: Option<MaintenanceDueWorkTimestampBasis>,
+    pub incomplete_reason: Option<MaintenanceDueWorkIncompleteReason>,
+}
+
+impl MaintenanceDueWorkEvidence {
+    fn complete(
+        observed_at_ms: i64,
+        source: MaintenanceDueWorkSource,
+        unit: MaintenanceDueWorkUnit,
+        due: bool,
+        eligible_count: u64,
+    ) -> Self {
+        Self {
+            observed_at_ms,
+            source,
+            completeness: MaintenanceDueWorkCompleteness::Complete,
+            unit,
+            due: Some(due),
+            eligible_count: Some(eligible_count),
+            eligible_bytes: None,
+            backlog_count: None,
+            backlog_bytes: None,
+            oldest_eligible_timestamp_ms: None,
+            oldest_timestamp_basis: None,
+            incomplete_reason: None,
+        }
+    }
+
+    fn incomplete(
+        observed_at_ms: i64,
+        source: MaintenanceDueWorkSource,
+        unit: MaintenanceDueWorkUnit,
+        reason: MaintenanceDueWorkIncompleteReason,
+    ) -> Self {
+        Self {
+            observed_at_ms,
+            source,
+            completeness: MaintenanceDueWorkCompleteness::Incomplete,
+            unit,
+            due: None,
+            eligible_count: None,
+            eligible_bytes: None,
+            backlog_count: None,
+            backlog_bytes: None,
+            oldest_eligible_timestamp_ms: None,
+            oldest_timestamp_basis: None,
+            incomplete_reason: Some(reason),
+        }
+    }
+}
+
 /// Counters for plan/apply, including partial progress.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MaintenanceReport {
@@ -1543,6 +1727,9 @@ pub struct MaintenanceReport {
     pub nonbeneficial_bins: u64,
     /// `null` means no complete compaction-debt inventory was available.
     pub compaction_debt: Option<CompactionDebtEvidence>,
+    /// Null means this operation has no trustworthy bounded due-work observation.
+    #[serde(default)]
+    pub maintenance_due_work: Option<MaintenanceDueWorkEvidence>,
     pub interrupted: bool,
     pub outputs: Vec<String>,
 }
@@ -2218,6 +2405,34 @@ impl OptimizePlan {
         report.outcome = outcome;
         report.backlog_files = self.backlog_files;
         report.compaction_debt = Some(self.compaction_debt.clone());
+        let source = match self.compaction_debt.source {
+            CompactionDebtSource::SnapshotActiveFiles => MaintenanceDueWorkSource::SnapshotActiveFiles,
+            CompactionDebtSource::BoundedPhysicalInventory => MaintenanceDueWorkSource::BoundedPhysicalInventory,
+        };
+        report.maintenance_due_work = Some(if self.skipped_partitions > 0 {
+            MaintenanceDueWorkEvidence::incomplete(
+                self.compaction_debt.observed_at_ms,
+                source,
+                MaintenanceDueWorkUnit::ParquetFiles,
+                MaintenanceDueWorkIncompleteReason::MalformedPartition,
+            )
+        } else {
+            let mut evidence = MaintenanceDueWorkEvidence::complete(
+                self.compaction_debt.observed_at_ms,
+                source,
+                MaintenanceDueWorkUnit::ParquetFiles,
+                self.compaction_debt.eligible_files > 0,
+                self.compaction_debt.eligible_files,
+            );
+            evidence.eligible_bytes = Some(self.compaction_debt.eligible_bytes);
+            evidence.backlog_count = Some(self.compaction_debt.backlog_files);
+            evidence.backlog_bytes = Some(self.compaction_debt.backlog_bytes);
+            evidence.oldest_eligible_timestamp_ms = self.compaction_debt.oldest_eligible_partition_start_ms;
+            evidence.oldest_timestamp_basis = evidence
+                .oldest_eligible_timestamp_ms
+                .map(|_| MaintenanceDueWorkTimestampBasis::IngestionPartitionStart);
+            evidence
+        });
         report.skipped_partitions = self.skipped_partitions;
         report.files_removed = self.bins.iter().map(|bin| bin.files.len() as u64).sum();
         report.bytes_removed = self.bins.iter().flat_map(|bin| &bin.files).map(|file| file.size).sum();
@@ -2915,10 +3130,22 @@ fn push_input_batch(
 ) -> Result<u64> {
     let size = batch.get_array_memory_size();
     *decoded = decoded.saturating_add(size as u64);
-    if size > config.max_batch_bytes || *decoded > config.max_decoded_bytes_per_bin {
+    if size > config.max_batch_bytes {
         return Err(fail(
             MaintenanceErrorKind::ResourceLimit,
-            "decoded Arrow input exceeds the configured bound",
+            format!(
+                "decoded Arrow input exceeds max_batch_bytes: measured_bytes={size}, allowed_bytes={}",
+                config.max_batch_bytes
+            ),
+        ));
+    }
+    if *decoded > config.max_decoded_bytes_per_bin {
+        return Err(fail(
+            MaintenanceErrorKind::ResourceLimit,
+            format!(
+                "decoded Arrow input exceeds max_decoded_bytes_per_bin: measured_bytes={}, allowed_bytes={}",
+                *decoded, config.max_decoded_bytes_per_bin
+            ),
         ));
     }
     let rows = batch.num_rows() as u64;
@@ -3347,7 +3574,10 @@ pub struct PurgePlan {
     /// Every valid partition ending at or before this is removed; also the replay fence.
     pub watermark_ms: Option<i64>,
     pub partitions: Vec<PurgePartition>,
+    pub eligible_files: u64,
+    pub eligible_bytes: u64,
     pub backlog_files: u64,
+    pub backlog_bytes: u64,
     pub skipped_partitions: u64,
 }
 
@@ -3363,6 +3593,30 @@ impl PurgePlan {
         report.outcome = outcome;
         report.cutoff_ms = Some(self.cutoff_ms);
         report.watermark_ms = self.watermark_ms;
+        report.maintenance_due_work = Some(if self.skipped_partitions > 0 {
+            MaintenanceDueWorkEvidence::incomplete(
+                self.anchor_ms,
+                MaintenanceDueWorkSource::SnapshotActiveFiles,
+                MaintenanceDueWorkUnit::ParquetFiles,
+                MaintenanceDueWorkIncompleteReason::MalformedPartition,
+            )
+        } else {
+            let mut evidence = MaintenanceDueWorkEvidence::complete(
+                self.anchor_ms,
+                MaintenanceDueWorkSource::SnapshotActiveFiles,
+                MaintenanceDueWorkUnit::ParquetFiles,
+                self.eligible_files > 0,
+                self.eligible_files,
+            );
+            evidence.eligible_bytes = Some(self.eligible_bytes);
+            evidence.backlog_count = Some(self.backlog_files);
+            evidence.backlog_bytes = Some(self.backlog_bytes);
+            evidence.oldest_eligible_timestamp_ms = self.partitions.first().map(|partition| partition.start_ms);
+            evidence.oldest_timestamp_basis = evidence
+                .oldest_eligible_timestamp_ms
+                .map(|_| MaintenanceDueWorkTimestampBasis::IngestionPartitionStart);
+            evidence
+        });
         report.backlog_files = self.backlog_files;
         report.skipped_partitions = self.skipped_partitions;
         report.files_removed = self
@@ -3437,12 +3691,28 @@ impl DeltaTable {
         let newest = valid.keys().next_back().copied();
         let mut partitions = Vec::new();
         let mut files = 0_usize;
+        let mut eligible_files = 0_u64;
+        let mut eligible_bytes = 0_u64;
         let mut backlog = 0_u64;
+        let mut backlog_bytes = 0_u64;
         for (start, (value, members)) in &valid {
             let end = start + width;
             if end > cutoff || Some(*start) == newest {
                 break;
             }
+            let member_count = u64::try_from(members.len())
+                .map_err(|_| fail(MaintenanceErrorKind::ResourceLimit, "eligible file count overflow"))?;
+            let partition_bytes = members.iter().try_fold(0_u64, |total, file| {
+                total
+                    .checked_add(file.size)
+                    .ok_or_else(|| fail(MaintenanceErrorKind::ResourceLimit, "eligible byte count overflow"))
+            })?;
+            eligible_files = eligible_files
+                .checked_add(member_count)
+                .ok_or_else(|| fail(MaintenanceErrorKind::ResourceLimit, "eligible file count overflow"))?;
+            eligible_bytes = eligible_bytes
+                .checked_add(partition_bytes)
+                .ok_or_else(|| fail(MaintenanceErrorKind::ResourceLimit, "eligible byte count overflow"))?;
             if backlog > 0 || files + members.len() > config.max_files_per_commit {
                 if partitions.is_empty() {
                     return Err(fail(
@@ -3450,7 +3720,12 @@ impl DeltaTable {
                         format!("partition {value} exceeds the per-commit file bound"),
                     ));
                 }
-                backlog += members.len() as u64;
+                backlog = backlog
+                    .checked_add(member_count)
+                    .ok_or_else(|| fail(MaintenanceErrorKind::ResourceLimit, "purge backlog overflow"))?;
+                backlog_bytes = backlog_bytes
+                    .checked_add(partition_bytes)
+                    .ok_or_else(|| fail(MaintenanceErrorKind::ResourceLimit, "purge backlog byte overflow"))?;
                 continue;
             }
             files += members.len();
@@ -3476,7 +3751,10 @@ impl DeltaTable {
             cutoff_ms: cutoff,
             watermark_ms: watermark,
             partitions,
+            eligible_files,
+            eligible_bytes,
             backlog_files: backlog,
+            backlog_bytes,
             skipped_partitions: skipped,
         };
         if serde_json::to_vec(&plan)?.len() > config.max_plan_bytes {
@@ -3711,6 +3989,29 @@ pub struct VacuumPlan {
     pub undated_tombstones: u64,
     pub retained_tombstones: u64,
     pub backlog_files: u64,
+}
+
+impl VacuumPlan {
+    fn due_work(&self) -> MaintenanceDueWorkEvidence {
+        if self.undated_tombstones > 0 {
+            return MaintenanceDueWorkEvidence::incomplete(
+                self.now_ms,
+                MaintenanceDueWorkSource::BoundedTombstoneReplay,
+                MaintenanceDueWorkUnit::Tombstones,
+                MaintenanceDueWorkIncompleteReason::UndatedTombstones,
+            );
+        }
+        let eligible_count = self.candidates.len() as u64 + self.backlog_files;
+        let mut evidence = MaintenanceDueWorkEvidence::complete(
+            self.now_ms,
+            MaintenanceDueWorkSource::BoundedTombstoneReplay,
+            MaintenanceDueWorkUnit::Tombstones,
+            eligible_count > 0,
+            eligible_count,
+        );
+        evidence.backlog_count = Some(self.backlog_files);
+        evidence
+    }
 }
 
 #[derive(Default)]
@@ -3976,6 +4277,26 @@ impl DeltaTable {
                 "checkpoint interval must be nonzero",
             ));
         }
+        self.checkpoint_if_due_at(min_commits, apply, now_ms()?)
+    }
+
+    /// Checkpoint with a caller-provided UTC observation anchor.
+    ///
+    /// # Errors
+    /// Rejects a zero interval or invalid anchor; returns authority, replay or write failures.
+    pub fn checkpoint_if_due_at(
+        &self,
+        min_commits: u64,
+        apply: bool,
+        observed_at_ms: i64,
+    ) -> Result<MaintenanceReport> {
+        if min_commits == 0 {
+            return Err(fail(
+                MaintenanceErrorKind::InvalidPlan,
+                "checkpoint interval must be nonzero",
+            ));
+        }
+        validate_anchor("checkpoint", observed_at_ms)?;
         let version = self.version()?;
         let mut report = MaintenanceReport {
             operation: "checkpoint".to_owned(),
@@ -3983,10 +4304,16 @@ impl DeltaTable {
             version,
             ..MaintenanceReport::default()
         };
-        let due = match self.hinted_checkpoint_version(false)? {
-            Some(hinted) => version.saturating_sub(hinted) >= min_commits,
-            None => version.saturating_add(1) >= min_commits,
-        };
+        let hinted = self.hinted_checkpoint_version(false)?;
+        let debt = hinted.map_or(version.saturating_add(1), |value| version.saturating_sub(value));
+        let due = debt >= min_commits;
+        report.maintenance_due_work = Some(MaintenanceDueWorkEvidence::complete(
+            observed_at_ms,
+            MaintenanceDueWorkSource::CheckpointLogInventory,
+            MaintenanceDueWorkUnit::Commits,
+            due,
+            debt,
+        ));
         report.outcome = match (due, apply) {
             (false, _) => Outcome::Noop,
             (true, false) => Outcome::Planned,
@@ -4401,6 +4728,7 @@ impl DeltaTable {
         let mut report = MaintenanceReport::new("vacuum", &plan.header);
         report.cutoff_ms = Some(effective);
         report.backlog_files = plan.backlog_files;
+        report.maintenance_due_work = Some(plan.due_work());
         let snapshot = self.snapshot()?;
         let reloaded;
         let state = match prepared {
@@ -5164,7 +5492,29 @@ impl PrunePlan {
         report.cutoff_ms = Some(self.log_cutoff_ms);
         report.files_removed = u64::try_from(self.deletions.len()).unwrap_or(u64::MAX);
         report.backlog_files = self.backlog_files;
+        report.maintenance_due_work = Some(self.due_work());
         report
+    }
+
+    fn due_work(&self) -> MaintenanceDueWorkEvidence {
+        if self.checkpoint_version.is_none() {
+            return MaintenanceDueWorkEvidence::incomplete(
+                self.now_ms,
+                MaintenanceDueWorkSource::BoundedLogInventory,
+                MaintenanceDueWorkUnit::LogObjects,
+                MaintenanceDueWorkIncompleteReason::MissingCheckpointProof,
+            );
+        }
+        let eligible_count = self.deletions.len() as u64 + self.backlog_files;
+        let mut evidence = MaintenanceDueWorkEvidence::complete(
+            self.now_ms,
+            MaintenanceDueWorkSource::VerifiedPruneProof,
+            MaintenanceDueWorkUnit::LogObjects,
+            eligible_count > 0,
+            eligible_count,
+        );
+        evidence.backlog_count = Some(self.backlog_files);
+        evidence
     }
 }
 
@@ -5792,6 +6142,7 @@ impl DeltaTable {
         let mut report = MaintenanceReport::new("prune_log", &plan.header);
         report.cutoff_ms = Some(plan.log_cutoff_ms);
         report.backlog_files = plan.backlog_files;
+        report.maintenance_due_work = Some(plan.due_work());
         let Some(checkpoint) = plan.checkpoint_version else {
             return Ok(report);
         };
@@ -5939,6 +6290,7 @@ impl MaintenancePlan {
                 report.cutoff_ms = Some(plan.cutoff_ms);
                 report.files_removed = plan.candidates.len() as u64;
                 report.backlog_files = plan.backlog_files;
+                report.maintenance_due_work = Some(plan.due_work());
                 report
             }
         }

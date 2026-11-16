@@ -1286,7 +1286,7 @@ fn run_operation(
 ) -> Result<MaintenanceReport> {
     let plan = match operation {
         Operation::Checkpoint => {
-            return table.checkpoint_if_due(settings.checkpoint_every_commits, settings.apply);
+            return table.checkpoint_if_due_at(settings.checkpoint_every_commits, settings.apply, anchor);
         }
         Operation::PruneLog => {
             let config = PruneConfig {
