@@ -1097,6 +1097,21 @@ mod io_tests {
         let committed = table.commit_files(&[staged])?;
         assert_eq!(committed, version + 1);
         let hint = root.join("_delta_log").join("_last_checkpoint");
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let control = crate::maintenance::MaintenanceControl::new(cancelled, None);
+        let error = table
+            .checkpoint_with_control(&control)
+            .expect_err("cancelled checkpoint must not start");
+        assert_eq!(
+            crate::maintenance::error_kind(&error),
+            Some(crate::maintenance::MaintenanceErrorKind::Cancelled)
+        );
+        assert!(
+            !root
+                .join("_delta_log")
+                .join(format!("{committed:020}.checkpoint.parquet"))
+                .exists()
+        );
         sync_hook::fail_on(&hint);
         assert!(table.checkpoint().is_err(), "hint fsync failure must propagate");
         sync_hook::reset(&base_path);
@@ -2629,9 +2644,22 @@ impl DeltaTable {
     /// # Errors
     /// Returns authority, checkpoint replay, write or synchronization failures.
     pub fn checkpoint(&self) -> Result<u64> {
+        self.checkpoint_with_control(&crate::maintenance::MaintenanceControl::default())
+    }
+
+    /// Write a classic V1 checkpoint while honoring cooperative maintenance cancellation.
+    ///
+    /// Cancellation is checked before checkpoint preparation and before the output and hint
+    /// mutations. Once output writing starts, the operation finishes publication atomically.
+    ///
+    /// # Errors
+    /// Returns cancellation, authority, replay, write or synchronization failures.
+    pub fn checkpoint_with_control(&self, control: &crate::maintenance::MaintenanceControl) -> Result<u64> {
+        control.check()?;
         self.check_publication()?;
         let snapshot = self.snapshot()?;
         Self::validate_retention(&snapshot)?;
+        control.check()?;
         let writer = Arc::clone(&snapshot).create_checkpoint_writer(&self.engine)?;
         let data = writer.checkpoint_data(&self.engine)?;
         let state = data.state();
@@ -2639,6 +2667,7 @@ impl DeltaTable {
             .map(|batch| batch.and_then(|batch| batch.apply_selection_vector()))
             .collect::<DeltaResult<Vec<_>>>()?;
         let location = writer.checkpoint_path()?;
+        control.check()?;
         self.check_publication()?;
         self.engine
             .parquet_handler()
@@ -2653,6 +2682,7 @@ impl DeltaTable {
         }
         let state = Arc::into_inner(state).context("checkpoint state remains shared")?;
         let statistics = delta_kernel::checkpoint::LastCheckpointHintStats::from_reconciliation_state(state, size, 0)?;
+        control.check()?;
         self.check_publication()?;
         writer.finalize(&self.engine, &statistics)?;
         if self.url.scheme() == "file" {
@@ -3790,6 +3820,11 @@ impl DeltaTable {
         }
         sync_directory(&log)?;
         sync_directory(&self.root)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn commit_files(&self, files: &[StagedAppend]) -> Result<u64> {
+        self.commit_files_timed(files).map(|(version, _, _)| version)
     }
 
     pub(crate) fn commit_files_timed(
