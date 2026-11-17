@@ -351,27 +351,30 @@ export class Azure {
   async _request_once(method: string, url: string, resource: string, body?: string | Buffer | null,
     headers: Headers = {}, missing_ok = false, capture?: (receipt: HttpReceipt) => void): Promise<[Buffer | null, Headers]> {
     const token = await this.token(resource);
-    let response: Response;
     try {
       const parsedUrl = new URL(url);
-      response = await dispatchExternalEffect({ transport: 'azure-rest', method, resource: parsedUrl.origin + '|' + resource,
-        path: parsedUrl.pathname + parsedUrl.search, body }, () => fetch(url, { method, body: body == null ? undefined : body as BodyInit,
-        signal: AbortSignal.timeout(30_000), redirect: 'error',
-        headers: { Authorization: 'Bearer ' + token, ...(resource === 'https://storage.azure.com/' ?
-          { 'x-ms-date': new Date().toUTCString() } : {}), ...headers } }));
-      const bytes = Buffer.from(await response.arrayBuffer());
-      capture?.({ status: response.status, bodyBase64: bytes.toString('base64'),
-        headers: Object.fromEntries([...response.headers.entries()].filter(([name]) =>
+      const response = await dispatchExternalEffect({ transport: 'azure-rest', method, resource: parsedUrl.origin + '|' + resource,
+        path: parsedUrl.pathname + parsedUrl.search, body }, async () => {
+        const received = await fetch(url, { method, body: body == null ? undefined : body as BodyInit,
+          signal: AbortSignal.timeout(30_000), redirect: 'error',
+          headers: { Authorization: 'Bearer ' + token, ...(resource === 'https://storage.azure.com/' ?
+            { 'x-ms-date': new Date().toUTCString() } : {}), ...headers } });
+        const bytes = Buffer.from(await received.arrayBuffer());
+        const responseHeaders = Object.fromEntries([...received.headers.entries()].filter(([name]) =>
           ['x-ms-request-id', 'x-ms-correlation-request-id', 'x-ms-client-request-id',
-            'x-ms-lease-id', 'x-ms-activity-id', 'etag', 'date'].includes(name))) });
+            'x-ms-lease-id', 'x-ms-activity-id', 'etag', 'date'].includes(name)));
+        capture?.({ status: received.status, bodyBase64: bytes.toString('base64'), headers: responseHeaders });
+        return { status: received.status, bytes, headers: responseHeaders };
+      });
       if (missing_ok && response.status === 404) return [null, {}];
-      if (!response.ok) throw new HttpFailure(response.status, `HTTP ${response.status}: ${this.c.redact(bytes.toString())}`);
-      return [bytes, { ...Object.fromEntries(response.headers.entries()), ':status': String(response.status) }];
+      if (response.status < 200 || response.status >= 300)
+        throw new HttpFailure(response.status, 'HTTP ' + response.status + ': ' + this.c.redact(response.bytes.toString()));
+      return [response.bytes, { ...response.headers, ':status': String(response.status) }];
     } catch (error) {
       if (error instanceof HttpFailure || error instanceof EffectBoundaryRefused) throw error;
       const code = (error as { cause?: { code?: unknown } } | null)?.cause?.code;
-      throw new Failure(this.c.redact(`${method} ${service_name(resource)} request failed: ${String(error)}` +
-        (typeof code === 'string' ? ` (${code})` : '')), { cause: error });
+      throw new Failure(this.c.redact(method + ' ' + service_name(resource) + ' request failed: ' + String(error) +
+        (typeof code === 'string' ? ' (' + code + ')' : '')), { cause: error });
     }
   }
   async arm(method: string, resourcePath: string, body?: any, missing_ok = false, api = API): Promise<any> {

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, chmodSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, chmodSync, writeFileSync, writeSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -8,7 +8,7 @@ import { Azure, Config, exchange_workload_identity_assertion, runtime } from '..
 import { defaultStampConfig } from '../../infra/azure/stamp.js';
 import { EffectBoundary, EffectBoundaryRefused, dispatchExternalEffect, withEffectBoundary,
   type EffectEnvelope, type EffectRule } from '../../infra/azure/effect-boundary.js';
-import { createBlobCampaignStore } from './aks-campaign.js';
+import { createBlobCampaignStore, managedIdentityToken, readArmOperationStatus } from './aks-campaign.js';
 import { boundedEffectRehearsal } from './aks-effect-rehearsal.js';
 
 const campaignId = 'c0ffee00-0000-4000-8000-000000000001';
@@ -202,4 +202,164 @@ test('workload identity refusal is preserved and does not retry transport', asyn
   assert.equal(fetches, 0);
   const rows = readFileSync(receiptPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
   assert.deepEqual(rows.map(row => row.event), ['refused']);
+});
+
+
+test('uncertain mutation responses do not unlock another dispatch but authoritative 412 does', async t => {
+  const directory = tempDir(); t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const effect = rule('baseline-put', 'campaign-blob', 'PUT',
+    'https://arrowcollector68590.blob.core.windows.net/checkpoints', '/checkpoints/baseline.json', 2);
+  const receipts = path.join(directory, 'effects.jsonl');
+  const boundary = new EffectBoundary(envelope([effect]), receipts);
+  let forwards = 0;
+  await withEffectBoundary(boundary, async () => {
+    await dispatchExternalEffect({ transport: effect.transport, method: effect.method, resource: effect.resource,
+      path: effect.path }, async () => { forwards++; return { status: 500 }; });
+    await assert.rejects(dispatchExternalEffect({ transport: effect.transport, method: effect.method, resource: effect.resource,
+      path: effect.path }, async () => { forwards++; return { status: 201 }; }), EffectBoundaryRefused);
+  });
+  assert.equal(forwards, 1);
+  assert.equal(JSON.parse(readFileSync(receipts, 'utf8').trim().split('\n')[1]!).outcome, 'unknown_after_forward');
+
+  const casReceipts = path.join(directory, 'cas-effects.jsonl');
+  const cas = new EffectBoundary(envelope([effect]), casReceipts);
+  await withEffectBoundary(cas, async () => {
+    assert.deepEqual(await dispatchExternalEffect({ transport: effect.transport, method: effect.method,
+      resource: effect.resource, path: effect.path }, async () => ({ status: 412 })), { status: 412 });
+    assert.deepEqual(await dispatchExternalEffect({ transport: effect.transport, method: effect.method,
+      resource: effect.resource, path: effect.path }, async () => ({ status: 201 })), { status: 201 });
+  });
+  const casRows = readFileSync(casReceipts, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+  assert.deepEqual(casRows.filter(row => row.event === 'result').map(row => row.outcome), ['definite_no_effect', 'confirmed_success']);
+});
+
+test('journal recovery rejects changed allocations and request bindings before effects', async t => {
+  const directory = tempDir(); t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const effect = rule('baseline-put', 'campaign-blob', 'PUT',
+    'https://arrowcollector68590.blob.core.windows.net/checkpoints', '/checkpoints/baseline.json', 2);
+  const allocation = envelope([effect]), receipts = path.join(directory, 'effects.jsonl');
+  await withEffectBoundary(new EffectBoundary(allocation, receipts), () => dispatchExternalEffect({
+    transport: effect.transport, method: effect.method, resource: effect.resource, path: effect.path,
+  }, async () => ({ status: 201 })));
+  assert.throws(() => new EffectBoundary(envelope([{ ...effect, max_calls: 3 }]), receipts), /allocation/);
+  const changedRows = readFileSync(receipts, 'utf8').trim().split('\n').map(line => {
+    const row = JSON.parse(line); if (row.event === 'dispatch' || row.event === 'result') row.path = '/checkpoints/other.json';
+    return JSON.stringify(row);
+  });
+  writeFileSync(receipts, changedRows.join('\n') + '\n', { mode: 0o600 });
+  assert.throws(() => new EffectBoundary(allocation, receipts), /binding changed/);
+});
+
+test('receipt journal completes short writes and refuses a zero-byte dispatch write', async t => {
+  const directory = tempDir(); t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const effect = rule('active-read', 'campaign-blob', 'GET',
+    'https://arrowcollector68590.blob.core.windows.net/checkpoints', '/checkpoints/active.json');
+  const shortReceipts = path.join(directory, 'short.jsonl');
+  const shortWriter = (fd: number, data: Buffer, offset: number, length: number) =>
+    writeSync(fd, data, offset, Math.min(length, 7));
+  let forwards = 0;
+  await withEffectBoundary(new EffectBoundary(envelope([effect]), shortReceipts, shortWriter), () =>
+    dispatchExternalEffect({ transport: effect.transport, method: effect.method, resource: effect.resource, path: effect.path },
+      async () => { forwards++; return { status: 200 }; }));
+  assert.equal(forwards, 1);
+  assert.equal(readFileSync(shortReceipts, 'utf8').trim().split('\n').length, 2);
+
+  const failedReceipts = path.join(directory, 'zero.jsonl');
+  const zeroWriter = () => 0;
+  let failedForwards = 0;
+  await assert.rejects(withEffectBoundary(new EffectBoundary(envelope([effect]), failedReceipts, zeroWriter), () =>
+    dispatchExternalEffect({ transport: effect.transport, method: effect.method, resource: effect.resource, path: effect.path },
+      async () => { failedForwards++; return { status: 200 }; })), /Dispatch receipt could not be durably recorded/);
+  assert.equal(failedForwards, 0);
+});
+
+test('ARM operation status network call requires its own allocation after allocated identity auth', async t => {
+  const directory = tempDir(); t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const endpoint = new URL('https://identity.test/metadata');
+  endpoint.searchParams.set('api-version', '2019-08-01');
+  endpoint.searchParams.set('resource', 'https://management.azure.com/');
+  endpoint.searchParams.set('client_id', 'client-id');
+  const identityRule = rule('identity-token', 'azure-auth', 'GET', endpoint.origin, endpoint.pathname + endpoint.search);
+  const boundary = new EffectBoundary(envelope([identityRule]), path.join(directory, 'effects.jsonl'));
+  const env = { IDENTITY_ENDPOINT: 'https://identity.test/metadata', IDENTITY_HEADER: 'test-header', AZURE_CLIENT_ID: 'client-id' };
+  let identityFetches = 0, statusFetches = 0, redirectMode: RequestRedirect | undefined;
+  const fetcher = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+    const url = new URL(String(input));
+    if (url.origin === endpoint.origin) {
+      identityFetches++; redirectMode = init?.redirect;
+      return new Response(JSON.stringify({ access_token: 'simulated-token' }), { status: 200 });
+    }
+    statusFetches++;
+    return new Response('{}', { status: 200 });
+  };
+  const operationUrl = 'https://management.azure.com/subscriptions/' + subscriptionId +
+    '/providers/Microsoft.ContainerService/locations/westus/operations/op-1?api-version=2024-10-01';
+  await assert.rejects(withEffectBoundary(boundary, () => readArmOperationStatus(operationUrl, subscriptionId, fetcher, env)),
+    EffectBoundaryRefused);
+  assert.equal(identityFetches, 1);
+  assert.equal(statusFetches, 0);
+  assert.equal(redirectMode, 'error');
+});
+
+test('identity and campaign Blob transports reject redirects only while the boundary is active', async t => {
+  const directory = tempDir(); t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const env = { IDENTITY_ENDPOINT: 'https://identity.test/metadata', IDENTITY_HEADER: 'test-header', AZURE_CLIENT_ID: 'client-id' };
+  const endpoint = new URL(env.IDENTITY_ENDPOINT);
+  endpoint.searchParams.set('api-version', '2019-08-01');
+  endpoint.searchParams.set('resource', 'https://management.azure.com/');
+  endpoint.searchParams.set('client_id', 'client-id');
+  const boundary = new EffectBoundary(envelope([rule('identity-token', 'azure-auth', 'GET', endpoint.origin,
+    endpoint.pathname + endpoint.search)]), path.join(directory, 'identity.jsonl'));
+  let activeRedirect: RequestRedirect | undefined, ordinaryRedirect: RequestRedirect | undefined;
+  const identityFetcher = async (_input: string | URL | Request, init?: RequestInit) => {
+    activeRedirect ??= init?.redirect;
+    return new Response(JSON.stringify({ access_token: 'simulated-token' }), { status: 200 });
+  };
+  await withEffectBoundary(boundary, () => managedIdentityToken('https://management.azure.com/', env, identityFetcher));
+  await managedIdentityToken('https://management.azure.com/', env, async (_input, init) => {
+    ordinaryRedirect = init?.redirect; return new Response(JSON.stringify({ access_token: 'simulated-token' }), { status: 200 });
+  });
+  assert.equal(activeRedirect, 'error');
+  assert.equal(ordinaryRedirect, undefined);
+
+  const blobPath = '/checkpoints/active.json';
+  const blobRule = rule('active-read', 'campaign-blob', 'GET',
+    'https://arrowcollector68590.blob.core.windows.net/checkpoints', blobPath);
+  const blobBoundary = new EffectBoundary(envelope([blobRule]), path.join(directory, 'blob.jsonl'));
+  let blobActiveRedirect: RequestRedirect | undefined, blobOrdinaryRedirect: RequestRedirect | undefined;
+  const activeStore = createBlobCampaignStore({ account: stamp.storage_account, container: stamp.state_container,
+    subscriptionId, recordPath: 'active.json' }, async (_input, init) => {
+      blobActiveRedirect = init?.redirect; return new Response(null, { status: 404 });
+    }, async () => 'simulated-token');
+  await withEffectBoundary(blobBoundary, () => activeStore.read());
+  const ordinaryStore = createBlobCampaignStore({ account: stamp.storage_account, container: stamp.state_container,
+    subscriptionId, recordPath: 'active.json' }, async (_input, init) => {
+      blobOrdinaryRedirect = init?.redirect; return new Response(null, { status: 404 });
+    }, async () => 'simulated-token');
+  await ordinaryStore.read();
+  assert.equal(blobActiveRedirect, 'error');
+  assert.equal(blobOrdinaryRedirect, undefined);
+});
+
+test('Azure REST response-body loss cannot replay a mutation on its retry path', async t => {
+  const directory = tempDir(); t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const resource = 'https://management.azure.com/';
+  const url = 'https://management.azure.com/subscriptions/' + subscriptionId +
+    '/resourceGroups/arrow-collector-rg?api-version=2024-10-01';
+  const effect = rule('arm-get', 'azure-rest', 'GET', 'https://management.azure.com|' + resource,
+    '/subscriptions/' + subscriptionId + '/resourceGroups/arrow-collector-rg?api-version=2024-10-01', 3);
+  const boundary = new EffectBoundary(envelope([effect]), path.join(directory, 'effects.jsonl'));
+  const azure = new Azure(new Config({ AZURE_SUBSCRIPTION_ID: subscriptionId, AZURE_RESOURCE_GROUP: 'rust-playground-schema-evo-test' }, 'schema-evolution'));
+  azure.tokens.set(resource, { at: runtime.now(), token: 'test-token', lifetime: 240 });
+  let fetches = 0;
+  t.mock.method(globalThis, 'fetch', async () => {
+    fetches++;
+    const response = new Response('body', { status: 200 });
+    response.arrayBuffer = async () => { throw new Error('simulated response-body loss'); };
+    return response;
+  });
+  await assert.rejects(withEffectBoundary(boundary, () => azure.request('GET', url, resource)), EffectBoundaryRefused);
+  assert.equal(fetches, 1);
+  const rows = readFileSync(path.join(directory, 'effects.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
+  assert.equal(rows.find(row => row.event === 'result')?.outcome, 'unknown_after_forward');
 });

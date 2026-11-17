@@ -4,7 +4,7 @@ import { pathToFileURL } from "node:url";
 import type { RunFicPlan } from '../../infra/azure/run_fic.js';
 import type { OatQapReference } from '../../infra/azure/oat_qap.js';
 import { loadCustodyConfig } from './aks-custody-config.js';
-import { dispatchExternalEffect } from '../../infra/azure/effect-boundary.js';
+import { dispatchExternalEffect, isEffectBoundaryActive } from '../../infra/azure/effect-boundary.js';
 import { ADMISSION_STOP_BUDGET_MS, DRAIN_BUDGET_MS, TERMINAL_CAPTURE_BUDGET_MS } from './aks-cleanup-budget.js';
 import { parseEffectiveStopBudgets } from './stop-budgets.js';
 export const HEARTBEAT_INTERVAL_MS = 60_000;
@@ -545,8 +545,10 @@ export async function managedIdentityToken(resource: string, env: NodeJS.Process
   url.searchParams.set('api-version', '2019-08-01');
   url.searchParams.set('resource', resource);
   url.searchParams.set('client_id', env.AZURE_CLIENT_ID);
+  const options: RequestInit = { headers: { 'X-IDENTITY-HEADER': header } };
+  if (isEffectBoundaryActive()) options.redirect = 'error';
   const response = await dispatchExternalEffect({ transport: 'azure-auth', method: 'GET', resource: url.origin,
-    path: url.pathname + url.search }, () => fetcher(url, { headers: { 'X-IDENTITY-HEADER': header } }));
+    path: url.pathname + url.search }, () => fetcher(url, options));
   if (!response.ok) throw new Error(`Managed identity token request failed with HTTP ${response.status}.`);
   const body: unknown = await response.json();
   if (!record(body) || typeof body.access_token !== 'string' || !body.access_token) throw new Error('Managed identity returned an invalid token response.');
@@ -579,8 +581,9 @@ export function createBlobCampaignStore(config: CampaignStoreConfig, fetcher: Fe
   const blobFetch: Fetcher = (input, init = {}) => {
     const url = new URL(String(input)), method = (init.method ?? 'GET').toUpperCase();
     const body = typeof init.body === 'string' || Buffer.isBuffer(init.body) ? init.body : undefined;
+    const requestInit: RequestInit = isEffectBoundaryActive() ? { ...init, redirect: 'error' } : init;
     return dispatchExternalEffect({ transport: 'campaign-blob', method, resource: url.origin + '/' + config.container,
-      path: url.pathname + url.search, body }, () => fetcher(input, init));
+      path: url.pathname + url.search, body }, () => fetcher(input, requestInit));
   };
   const headers = async () => ({ authorization: `Bearer ${await token('https://storage.azure.com/')}`,
     'x-ms-date': new Date().toUTCString(), 'x-ms-version': '2023-11-03' });
@@ -953,10 +956,14 @@ if (process.argv[1] && ['aks-campaign.ts', 'aks-campaign.js'].includes(path.base
   });
 }
 
-export async function readArmOperationStatus(operationUrl: string, subscriptionId: string, fetcher: Fetcher = fetch): Promise<{ status: number; body?: unknown }> {
-  const url = httpsManagementUrl(operationUrl, subscriptionId);
-  const accessToken = await getAccessToken('https://management.azure.com/', subscriptionId, process.env, fetcher);
-  const response = await fetcher(url, { headers: { authorization: `Bearer ${accessToken}` }, signal: AbortSignal.timeout(10_000) });
+export async function readArmOperationStatus(operationUrl: string, subscriptionId: string, fetcher: Fetcher = fetch,
+  env: NodeJS.ProcessEnv = process.env): Promise<{ status: number; body?: unknown }> {
+  const url = new URL(httpsManagementUrl(operationUrl, subscriptionId));
+  const accessToken = await getAccessToken('https://management.azure.com/', subscriptionId, env, fetcher);
+  const options: RequestInit = { headers: { authorization: `Bearer ${accessToken}` }, signal: AbortSignal.timeout(10_000) };
+  if (isEffectBoundaryActive()) options.redirect = 'error';
+  const response = await dispatchExternalEffect({ transport: 'azure-rest', method: 'GET',
+    resource: url.origin + '|https://management.azure.com/', path: url.pathname + url.search }, () => fetcher(url, options));
   if (response.status === 202) return { status: 202 };
   const text = await response.text();
   if (!text) return { status: response.status };
