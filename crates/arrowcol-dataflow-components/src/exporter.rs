@@ -1541,20 +1541,23 @@ mod tests {
         }
     }
 
-    fn envelope_pdata(envelope: ArrowcolBatchEnvelope) -> OtapPdata {
+    fn fixture_batch() -> arrow_array::RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::UInt64, false),
             Field::new("value", DataType::Utf8, true),
         ]));
-        let batch = arrow_array::RecordBatch::try_new(
+        arrow_array::RecordBatch::try_new(
             schema,
             vec![
                 Arc::new(UInt64Array::from(vec![1, 2])) as ArrayRef,
                 Arc::new(StringArray::from(vec![Some("a"), None])) as ArrayRef,
             ],
         )
-        .expect("batch");
-        let records = encode_record_batch(envelope, batch).expect("records");
+        .expect("batch")
+    }
+
+    fn envelope_pdata(envelope: ArrowcolBatchEnvelope) -> OtapPdata {
+        let records = encode_record_batch(envelope, fixture_batch()).expect("records");
         OtapPdata::new_todo_context(otel_arrow_dfe_pdata::OtapPayload::from_pdata_arrow(records))
     }
 
@@ -2957,6 +2960,7 @@ mod tests {
             age_flush_policy: arrowcol_tunables::AgeFlushPolicy::DrainReady,
             ..aged_backlog_policy()
         };
+        let bytes = arrow_deltalake::record_batch_logical_bytes(&fixture_batch()).expect("logical batch bytes");
         for (capped, expected) in [
             (
                 FileBatchConfig {
@@ -2974,21 +2978,21 @@ mod tests {
             ),
             (
                 FileBatchConfig {
-                    max_arrow_memory_per_flush: 1,
+                    max_arrow_memory_per_flush: 8 * bytes,
                     ..policy.clone()
                 },
-                vec![2; 33],
+                vec![2, 16, 16, 16, 16],
             ),
             (
                 FileBatchConfig {
                     adaptive_file: crate::config::AdaptiveFileConfig {
-                        min_input_bytes: 1,
-                        max_input_bytes: 1,
+                        min_input_bytes: 8 * bytes,
+                        max_input_bytes: 8 * bytes,
                         ..policy.adaptive_file
                     },
                     ..policy.clone()
                 },
-                vec![2; 33],
+                vec![2, 16, 16, 16, 16],
             ),
         ] {
             let (rows, _) = aged_backlog_fixture(capped, 32, BacklogBoundary::None).await;
