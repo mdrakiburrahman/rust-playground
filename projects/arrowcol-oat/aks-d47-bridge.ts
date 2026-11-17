@@ -1449,6 +1449,10 @@ export interface OwnedRunTableBridgeReceipt { schema_version: 1; kind: 'owned_ru
 export interface OwnedRunTableArtifactIdentity { source_commit: string; executable_sha256: string }
 export interface OwnedRunTableParentReceipt { schema_version: 1; kind: 'owned_run_table_parent_receipt';
   artifact_identity: OwnedRunTableArtifactIdentity; exchange_count: number; bridge_receipt: OwnedRunTableBridgeReceipt }
+const VALIDATED_OWNED_RUN_TABLE_PARENT_RECEIPTS = new WeakSet<object>();
+export function isValidatedOwnedRunTableParentReceipt(value: unknown): value is OwnedRunTableParentReceipt {
+  return object(value) && VALIDATED_OWNED_RUN_TABLE_PARENT_RECEIPTS.has(value);
+}
 interface OwnedRunBridgeInput { authority: StorageBridgeAuthority; original_deadline_unix_ms: number }
 const APPROVED_OWNED_RUN_BUILD_RECEIPT: OwnedRunTableArtifactIdentity = Object.freeze({
   source_commit: 'acd49e82bd4ba6e053ddf4bd641407b35fa65ba5',
@@ -1599,20 +1603,19 @@ function validateOwnedRunReceipt(value: unknown, plan: OwnedRunTablePlan, author
       field.type === 'string' && field.nullable === false)) throw new Error('Owned-run Delta schema lacks its exact ingestion partition column.');
 }
 function validateOwnedRunParentReceipt(value: unknown, artifactIdentity: OwnedRunTableArtifactIdentity,
-  plan: OwnedRunTablePlan, authority: StorageBridgeAuthority, deadline: number, requestCount: number): asserts value is OwnedRunTableParentReceipt {
+  plan: OwnedRunTablePlan, authority: StorageBridgeAuthority, deadline: number, requestCount: number | undefined): asserts value is OwnedRunTableParentReceipt {
   if (!object(value) || !exact(value, ['schema_version','kind','artifact_identity','exchange_count','bridge_receipt']) ||
       value.schema_version !== 1 || value.kind !== 'owned_run_table_parent_receipt' || !equal(value.artifact_identity, artifactIdentity) ||
-      value.exchange_count !== requestCount || !Number.isSafeInteger(value.exchange_count) || requestCount < 1)
+      !Number.isSafeInteger(value.exchange_count) || Number(value.exchange_count) < 1 ||
+      requestCount !== undefined && value.exchange_count !== requestCount)
     throw new Error('Owned-run parent receipt is not bound to the actual durable bridge transcript and build.');
   validateOwnedRunReceipt(value.bridge_receipt, plan, authority, deadline);
 }
 export function validateOwnedRunTableParentReceiptForNoLoad(value: unknown, planValue: unknown,
   authority: StorageBridgeAuthority, originalDeadlineUnixMs: number): OwnedRunTableParentReceipt {
   validateOwnedRunTablePlan(planValue);
-  if (!object(value) || !Number.isSafeInteger(value.exchange_count) || Number(value.exchange_count) < 1)
-    throw new Error('No-load preservation requires the actual completed owned-run bridge receipt.');
   validateOwnedRunParentReceipt(value, APPROVED_OWNED_RUN_BUILD_RECEIPT, planValue, authority,
-    originalDeadlineUnixMs, Number(value.exchange_count));
+    originalDeadlineUnixMs, undefined);
   return value;
 }
 export async function initializeOwnedRunTable(options: OwnedRunInitializerOptions): Promise<OwnedRunTableParentReceipt> {
@@ -1638,6 +1641,7 @@ export async function initializeOwnedRunTable(options: OwnedRunInitializerOption
     validateOwnedRunParentReceipt(cached, artifactIdentity, plan, authority, deadline, dispatcher.recordedRequestCount);
     dispatcher.assertDeltaCommitReadback(cached.bridge_receipt.receipt.delta, plan);
     dispatcher.assertPlannedStorageOperationsComplete();
+    VALIDATED_OWNED_RUN_TABLE_PARENT_RECEIPTS.add(cached);
     return cached;
   }
   assertBridgeLive(options.envelope, deadline, now);
@@ -1656,25 +1660,25 @@ export async function initializeOwnedRunTable(options: OwnedRunInitializerOption
     artifact_identity: artifactIdentity, exchange_count: child.exchangeCount, bridge_receipt: child.receipt };
   validateOwnedRunParentReceipt(result, artifactIdentity, plan, authority, deadline, dispatcher.recordedRequestCount);
   dispatcher.recordTerminalEvidence(result);
+  VALIDATED_OWNED_RUN_TABLE_PARENT_RECEIPTS.add(result);
   return result;
 }
 export async function persistOwnedRunTableInitialization(store: CampaignStore, expected: StoredCampaign,
-  planValue: unknown, parentValue: unknown, authorityValue: unknown, originalDeadlineUnixMs: number,
-  assertCurrent: () => Promise<void>): Promise<StoredCampaign> {
+  options: OwnedRunInitializerOptions, assertCurrent: () => Promise<void>): Promise<StoredCampaign> {
+  if (options.store !== store) throw new Error('Owned-run initializer and receipt persistence must use the same campaign store.');
+  const now = options.now ?? Date.now;
+  const planValue = privateJson(options.planPath, MAX_OUTPUT), bridgeValue = privateJson(options.bridgeInputPath, MAX_OUTPUT);
   validateOwnedRunTablePlan(planValue);
-  const bridgeInput = { authority: authorityValue, original_deadline_unix_ms: originalDeadlineUnixMs };
-  validateOwnedRunBridgeInput(bridgeInput, planValue, Date.now());
-  const plan = planValue, authority = bridgeInput.authority;
+  validateOwnedRunBridgeInput(bridgeValue, planValue, now());
+  const plan = planValue, deadline = bridgeValue.original_deadline_unix_ms;
   if (expected.state.status !== 'active' || !expected.state.runInventory ||
       expected.state.runInventory.campaign_id !== plan.campaign_id || expected.state.runInventory.cell_run_id !== plan.run_id ||
       expected.state.runInventory.owner_id !== plan.owner_id || expected.state.runInventory.fencing_token !== plan.fencing_token ||
-      expected.state.runInventory.load_admission !== 'not_authorized' || originalDeadlineUnixMs <= expected.state.startedAtMs ||
-      originalDeadlineUnixMs > expected.state.expiresAtMs)
+      expected.state.runInventory.load_admission !== 'not_authorized' || deadline <= expected.state.startedAtMs ||
+      deadline > expected.state.expiresAtMs)
     throw new Error('Owned-run receipt persistence requires the exact active not_authorized cell and original deadline.');
-  if (!object(parentValue) || !Number.isSafeInteger(parentValue.exchange_count) || Number(parentValue.exchange_count) < 1)
-    throw new Error('Owned-run receipt persistence requires the exact completed bridge parent response.');
-  validateOwnedRunParentReceipt(parentValue, APPROVED_OWNED_RUN_BUILD_RECEIPT, plan, authority, originalDeadlineUnixMs,
-    Number(parentValue.exchange_count));
+  await assertCurrent();
+  const parentValue = await initializeOwnedRunTable(options);
   const previous = expected.state.runInventory.owned_run_table_initialization;
   if (previous !== undefined) {
     if (!equal(previous, parentValue)) throw new Error('A different owned-run receipt is already persisted for this cell.');

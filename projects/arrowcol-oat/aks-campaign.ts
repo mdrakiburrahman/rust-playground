@@ -491,8 +491,10 @@ export function validateInitialRunInventory(value: unknown, campaignId: string, 
   if (!isInitialRunInventory(inventory)) throw new Error('Initial RunInventory must remain not_authorized with persisted maintenance budgets.');
   return inventory;
 }
-function mergeRunInventory(before: RunInventory | undefined, after: RunInventory): RunInventory {
+function mergeRunInventory(before: RunInventory | undefined, after: RunInventory, allowOwnedRunTableInitialization = false): RunInventory {
   const initial = () => {
+    if (!allowOwnedRunTableInitialization && after.owned_run_table_initialization !== undefined)
+      throw new Error('Owned table initialization receipt can be added only through validated initializer persistence.');
     if (!isInitialRunInventory(after))
       throw new Error('Initial RunInventory must positively record not_authorized before external provisioning.');
     return after;
@@ -519,6 +521,9 @@ function mergeRunInventory(before: RunInventory | undefined, after: RunInventory
   }
   if (before.evidence_destination && !sameFlatRecord(before.evidence_destination, after.evidence_destination))
     throw new Error('RunInventory evidence destination is immutable.');
+  if (!allowOwnedRunTableInitialization &&
+      JSON.stringify(before.owned_run_table_initialization) !== JSON.stringify(after.owned_run_table_initialization))
+    throw new Error('Owned table initialization receipt can be added or replaced only through validated initializer persistence.');
   if (before.owned_run_table_initialization !== undefined &&
       JSON.stringify(before.owned_run_table_initialization) !== JSON.stringify(after.owned_run_table_initialization) ||
       before.owned_run_table_initialization === undefined && after.owned_run_table_initialization !== undefined &&
@@ -953,6 +958,11 @@ export async function mutateCampaign(store: CampaignStore, change: (state: Campa
   for (let attempt = 0; attempt < retries; attempt++) {
     const current = await store.read();
     const next = validateCampaignState(change(current?.state));
+    if (current && current.state.campaignId === next.campaignId &&
+        !['complete', 'complete_unsettled'].includes(current.state.status) &&
+        JSON.stringify(current.state.runInventory?.owned_run_table_initialization) !==
+          JSON.stringify(next.runInventory?.owned_run_table_initialization))
+      throw new Error('Owned table initialization receipt can be added or replaced only through validated initializer persistence.');
     try { return { state: next, etag: await store.write(next, current?.etag) }; }
     catch (error) { if (!(error instanceof CampaignConflictError) || attempt === retries - 1) throw error; }
   }
@@ -1001,11 +1011,22 @@ export class CampaignWriteOutcomeUnknownError extends Error {
 }
 export async function compareAndSwapRunInventory(store: CampaignStore, expected: StoredCampaign,
   value: RunInventory, assertCurrent: () => Promise<void>): Promise<StoredCampaign> {
+  const changesOwnedReceipt = JSON.stringify(expected.state.runInventory?.owned_run_table_initialization) !==
+    JSON.stringify(value.owned_run_table_initialization);
+  if (changesOwnedReceipt) {
+    const { isValidatedOwnedRunTableParentReceipt } = await import('./aks-d47-bridge.js');
+    if (!isValidatedOwnedRunTableParentReceipt(value.owned_run_table_initialization))
+      throw new Error('Owned table initialization receipt must come from the validated initializer terminal.');
+  }
+  return compareAndSwapRunInventoryInternal(store, expected, value, assertCurrent, changesOwnedReceipt);
+}
+async function compareAndSwapRunInventoryInternal(store: CampaignStore, expected: StoredCampaign,
+  value: RunInventory, assertCurrent: () => Promise<void>, allowOwnedRunTableInitialization: boolean): Promise<StoredCampaign> {
   await assertCurrent();
   const current = await store.read();
   if (!current || current.etag !== expected.etag || JSON.stringify(current.state.runInventory) !== JSON.stringify(expected.state.runInventory))
     throw new CampaignConflictError();
-  const merged = mergeRunInventory(current.state.runInventory, validateRunInventory(value, current.state));
+  const merged = mergeRunInventory(current.state.runInventory, validateRunInventory(value, current.state), allowOwnedRunTableInitialization);
   const next = validateCampaignState({ ...current.state, runInventory: merged });
   let etag: string;
   try { etag = await store.write(next, current.etag); }

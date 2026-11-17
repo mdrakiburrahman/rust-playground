@@ -8,7 +8,7 @@ import { test } from 'node:test';
 import { CampaignConflictError, CUSTODY_CLEANUP_STEPS, MAX_CAMPAIGN_LIFETIME_MS, KNOWN_LIFECYCLE_CLEANUP_RESERVE_MS, assessCellLifetimeBudget,
   MISSED_HEARTBEAT_LIMIT, HEARTBEAT_INTERVAL_MS,
   createBlobCampaignStore,
-  armCampaign, assertCampaignEnvironment, assertRunInventoryReady, campaignStartReceipt, heartbeatCampaign, mutateCampaign, newCampaignState, publishCleanupRunInventory, publishRunInventory, runInventoryPublishReceipt, startCampaign,
+  armCampaign, assertCampaignEnvironment, assertRunInventoryReady, campaignStartReceipt, compareAndSwapRunInventory, heartbeatCampaign, mutateCampaign, newCampaignState, publishCleanupRunInventory, publishRunInventory, runInventoryPublishReceipt, startCampaign,
   validateCampaignState, type CampaignState, type CampaignStore, type RunInventory, type StoredCampaign,
   CampaignWriteOutcomeUnknownError, recordArmOperation } from './aks-campaign.js';
 import { evaluateCustody, reconcileArmOperation, reconcileCleanupOnce, reconcileOnce, reconcilePendingArmOperations } from './aks-reconcile.js';
@@ -105,6 +105,18 @@ test('load admission requires a pre-provisioning initial record and cannot skip 
   await publishRunInventory(store, { ...planned, load_admission: 'authorized' }, started.startedAtMs);
   await assert.rejects(publishRunInventory(store, planned, started.startedAtMs), /monotonically/);
   assert.equal((await store.read())!.state.runInventory!.load_admission, 'authorized');
+});
+
+test('generic inventory APIs cannot insert a shaped owned initializer receipt', async () => {
+  const store = await seed(), started = (await store.read())!.state, planned = inventoryFor(started), forged = {};
+  const fabricated = { ...planned, owned_run_table_initialization: forged };
+  await assert.rejects(publishRunInventory(store, fabricated, started.startedAtMs), /only through validated initializer/);
+  await assert.rejects(mutateCampaign(store, current => ({ ...current!, runInventory: fabricated })), /only through validated initializer/);
+  await publishRunInventory(store, planned, started.startedAtMs);
+  const stored = (await store.read())!;
+  await assert.rejects(publishRunInventory(store, fabricated, started.startedAtMs), /only through validated initializer/);
+  await assert.rejects(compareAndSwapRunInventory(store, stored, fabricated, async () => {}), /validated initializer terminal/);
+  assert.equal((await store.read())!.state.runInventory!.owned_run_table_initialization, undefined);
 });
 
 test('Rust RunInventory timing fields are strictly parsed and legacy inventory cannot arm', async () => {

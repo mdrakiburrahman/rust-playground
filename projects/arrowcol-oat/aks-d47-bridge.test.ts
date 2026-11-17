@@ -6,12 +6,12 @@ import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 import { EffectBoundary, effectAllocationFingerprint, withEffectBoundary, type EffectEnvelope } from '../../infra/azure/effect-boundary.js';
-import { initializeOwnedRunTable, PLANNED_CONTROL_OPERATION_IDS, PLANNED_STORAGE_OPERATION_IDS,
+import { initializeOwnedRunTable, persistOwnedRunTableInitialization, PLANNED_CONTROL_OPERATION_IDS, PLANNED_STORAGE_OPERATION_IDS,
   assertFixturePhaseOrder, runFixtureSetupChild, StorageBridgeDispatcher, type FixtureCommandRequest, type FixtureSetupInput,
   type StorageBridgeAuthority, type StorageBridgeRequest } from './aks-d47-bridge.js';
 import { Azure, Config } from '../../infra/azure/bootstrap.js';
 import { defaultStampConfig } from '../../infra/azure/stamp.js';
-import { createBlobCampaignStore, newCampaignState,
+import { CampaignConflictError, createBlobCampaignStore, newCampaignState,
   type CampaignStore, type RunInventory, type StoredCampaign } from './aks-campaign.js';
 
 function canonical(value: unknown): string {
@@ -129,7 +129,7 @@ function envelopeForRequests(authority: StorageBridgeAuthority, requests: Storag
     storage_account: authority.storage_account, state_container: 'checkpoints', effects };
 }
 
-function mutableCustodyStore(authority: StorageBridgeAuthority, now: number) {
+function mutableCustodyStore(authority: StorageBridgeAuthority, now: number, writable = false) {
   const step = () => ({ state: 'not_started' as const, deadline_unix_ms: null, reason_code: null });
   const inventory: RunInventory = {
     schema_version: 1,
@@ -156,9 +156,16 @@ function mutableCustodyStore(authority: StorageBridgeAuthority, now: number) {
     },
     etag: '"custody-1"',
   };
+  let revision = 1;
   const store: CampaignStore = {
     async read() { return structuredClone(current); },
-    async write() { throw new Error('custody witness must not write campaign state'); },
+    async write(state, etag) {
+      if (!writable) throw new Error('custody witness must not write campaign state');
+      if (etag !== current.etag) throw new CampaignConflictError();
+      const next = `"custody-${++revision}"`;
+      current = { state: structuredClone(state), etag: next };
+      return next;
+    },
   };
   return {
     store,
@@ -646,7 +653,7 @@ test('real loadgen initializer composes with the Node BR3 planned-identity paren
   const deltaReadbackFollowup = signedObjectRequest(authority, deadline, 21, "GET", logUrl, "",
     [["content-length", "0"], ["x-arrowcol-operation-id", PLANNED_STORAGE_OPERATION_IDS[7]]]);
   const envelope = envelopeForRequests(authority, [...controlRequests, initialListing, logListing, deltaCommit, postwriteListing, deltaLastCheckpoint, deltaVersionedLogListing, deltaReadback, deltaReadbackFollowup]);
-  const custody = mutableCustodyStore(authority, now);
+  const custody = mutableCustodyStore(authority, now, true);
   const azure = { c: { account }, async token() { return 'offline-test-token'; } } as unknown as Azure;
   const ledgerPath = path.join(directory, 'storage-ledger.jsonl');
   let publisherRegistry = '{}';
@@ -689,7 +696,14 @@ test('real loadgen initializer composes with the Node BR3 planned-identity paren
       return new Response('', { status: 500 });
     }, now: Date.now };
   const boundary = new EffectBoundary(envelope, path.join(directory, 'effects.jsonl'));
-  await withEffectBoundary(boundary, () => initializeOwnedRunTable(options));
+  await withEffectBoundary(boundary, async () => {
+    const expected = (await custody.store.read())!;
+    const persisted = await persistOwnedRunTableInitialization(custody.store, expected, options, async () => {});
+    const recovered = await persistOwnedRunTableInitialization(custody.store, persisted, options, async () => {});
+    assert.deepEqual(recovered.state.runInventory?.owned_run_table_initialization,
+      persisted.state.runInventory?.owned_run_table_initialization);
+    assert.equal(recovered.etag, persisted.etag);
+  });
 });
 
 test('real Rust zero-data fixture composes with response-derived Node phase allocations', {
