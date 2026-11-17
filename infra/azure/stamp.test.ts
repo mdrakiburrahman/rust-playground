@@ -17,7 +17,7 @@ test('loads the approved resource group, stamp and AKS baseline from YAML', () =
   assert.equal(defaults.aks.systemPool.maxCount, config.aks.systemPool.maxCount);
   assert.equal(defaults.aks.network.vnetIpv4Cidr, config.aks.network.vnetIpv4Cidr);
   assert.deepEqual(config.aks.userPools.map(pool => [pool.name, pool.initialCount, pool.minCount, pool.maxCount]),
-    [['benchd64', 0, 0, 1], ['benche64', 0, 0, 1]]);
+    [['benchd64', 0, 0, 4], ['benche64', 0, 0, 4]]);
   assert.equal(config.aks.network.dnsServiceIp, '10.247.0.10');
   assert.equal(config.storageReadLogDestination, 'storage');
   assert.equal(defaultStampConfig().storageReadLogDestination, 'log-analytics');
@@ -39,16 +39,16 @@ test('validates zero-scaled benchmark user pools and rejects invalid pool config
   const config = parseStampConfig(example);
   assert.deepEqual(config.aks.userPools.map(pool => pool.vmSize), ['Standard_D64ds_v6', 'Standard_E64ds_v6']);
   assert.equal(defaultStampConfig().aks.userPools[0]?.minCount, 0);
-  assert.throws(() => parseStampConfig(example.replace('initialCount: 0', 'initialCount: 2')), /counts must satisfy/);
+  assert.throws(() => parseStampConfig(example.replace('initialCount: 0', 'initialCount: 5')), /counts must satisfy/);
   assert.throws(() => parseStampConfig(example.replace('name: benche64', 'name: benchd64')), /names must be unique/);
-  assert.throws(() => parseStampConfig(example.replace('maxCount: 1', 'maxCount: 0')), /maxCount must be an integer/);
+  assert.throws(() => parseStampConfig(example.replace('maxCount: 4', 'maxCount: 0')), /maxCount must be an integer/);
   assert.deepEqual(config.aks.userPools.map(pool => pool.role), ['client', 'arrowcol']);
   assert.throws(() => parseStampConfig(example.replace('role: client', 'role: system')), /role is invalid/);
   const template = fs.readFileSync(new URL('./aks.bicep', import.meta.url), 'utf8');
   assert.ok(template.includes("nodeTaints: ['arrow-collector/role=${userPool.role}:NoSchedule']"));
   assert.ok(template.includes("nodeLabels: { type: 'benchmark', 'arrow-collector/role': userPool.role }"));
-  assert.equal(parseStampConfig(example.replace('maxCount: 1', 'maxCount: 100')).aks.userPools[0]?.maxCount, 100);
-  assert.throws(() => parseStampConfig(example.replaceAll('maxCount: 1', 'maxCount: 100')),
+  assert.equal(parseStampConfig(example.replace('maxCount: 4', 'maxCount: 100')).aks.userPools[0]?.maxCount, 100);
+  assert.throws(() => parseStampConfig(example.replaceAll('maxCount: 4', 'maxCount: 100')),
     /need 270 nodes; the node subnet fits 251 and the pod CIDR fits 256/);
 });
 
