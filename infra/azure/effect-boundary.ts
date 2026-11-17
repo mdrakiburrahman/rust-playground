@@ -155,17 +155,29 @@ function sameReceiptRequest(left: ReceiptRequest, right: ReceiptRequest): boolea
   return left.transport === right.transport && left.method === right.method && left.resource === right.resource &&
     left.path === right.path && left.body_sha256 === right.body_sha256;
 }
-function classifyOutcome(method: string, result: unknown): EffectOutcome {
-  if (readMethods.has(method)) return 'read_response';
-  if (!result || typeof result !== 'object') return 'unknown_after_forward';
-  const value = result as { status?: unknown; returncode?: unknown };
-  if (Number.isSafeInteger(value.status)) {
-    const status = value.status as number;
+function resultStatus(request: ExternalEffect, result: unknown): number | undefined {
+  if (result && typeof result === 'object' && !Array.isArray(result)) {
+    const status = (result as { status?: unknown }).status;
+    if (Number.isSafeInteger(status)) return status as number;
+  }
+  if (request.transport === 'campaign-blob' && Array.isArray(result) && result.length === 2 &&
+      result[1] && typeof result[1] === 'object' && !Array.isArray(result[1])) {
+    const status = (result[1] as Record<string, unknown>)[":status"];
+    if (typeof status === 'string' && /^[1-5][0-9]{2}$/.test(status)) return Number(status);
+  }
+  return undefined;
+}
+function classifyOutcome(request: ExternalEffect, result: unknown): EffectOutcome {
+  if (readMethods.has(request.method)) return 'read_response';
+  const status = resultStatus(request, result);
+  if (status !== undefined) {
     if (status >= 200 && status < 300) return 'confirmed_success';
     if (status === 412) return 'definite_no_effect';
     return 'unknown_after_forward';
   }
-  if (Number.isSafeInteger(value.returncode) && value.returncode === 0) return 'confirmed_success';
+  if (request.transport === 'process' && result && typeof result === 'object' &&
+      Number.isSafeInteger((result as { returncode?: unknown }).returncode) &&
+      (result as { returncode: number }).returncode === 0) return 'confirmed_success';
   return 'unknown_after_forward';
 }
 
@@ -301,13 +313,13 @@ export class EffectBoundary {
       }
       throw error;
     }
-    const outcome = classifyOutcome(method, result);
+    const outcome = classifyOutcome({ ...request, method }, result);
     const details: Record<string, unknown> = { dispatch_sequence: dispatchSequence };
-    if (result && typeof result === 'object') {
-      const response = result as { status?: unknown; returncode?: unknown };
-      if (Number.isSafeInteger(response.status) && (response.status as number) >= 100 && (response.status as number) <= 599)
-        details.status = response.status;
-      if (Number.isSafeInteger(response.returncode)) details.returncode = response.returncode;
+    const status = resultStatus({ ...request, method }, result);
+    if (status !== undefined && status >= 100 && status <= 599) details.status = status;
+    if (result && typeof result === 'object' && !Array.isArray(result)) {
+      const returncode = (result as { returncode?: unknown }).returncode;
+      if (Number.isSafeInteger(returncode)) details.returncode = returncode;
     }
     try { this.writeReceipt('result', rule.id, request, bodyHash, outcome, details); }
     catch (error) {
