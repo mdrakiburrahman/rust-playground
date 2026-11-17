@@ -262,7 +262,13 @@ impl KustoClient {
         }
         let response = builder.send().await.map_err(|error| request_failure(&error))?;
         let status = response.status();
-        let body = self.response_body(response).await?;
+        let body = self.response_body(response).await.map_err(|error| {
+            if self.response_byte_limit.is_some() && matches!(status.as_u16(), 502..=504) {
+                error.context(QapUnavailable).context(format!("Kusto HTTP {status}"))
+            } else {
+                error
+            }
+        })?;
         let public = sanitize(&body);
         append(
             &self.results.join("kusto-queries.jsonl"),
@@ -2465,7 +2471,10 @@ mod tests {
                 client.response_byte_limit = Some(OBSERVATION_RESPONSE_MAX_BYTES);
                 let result = client.execute(".show external tables", true, "observation").await;
                 if overflow {
-                    assert!(format!("{:#}", result.unwrap_err()).contains("4194304-byte bound"));
+                    assert!(
+                        format!("{:#}", result.err().context("oversized observation must fail")?)
+                            .contains("4194304-byte bound")
+                    );
                     let other = KustoClient::with_mode(&server.endpoint, &directory.0, Mode::Local, DATABASE)?;
                     assert_eq!(
                         other.execute(".show external tables", true, "validation").await?[0]["Rows"],
@@ -2482,15 +2491,16 @@ mod tests {
     #[tokio::test]
     async fn observation_response_rejects_malformed_and_truncated_bodies_without_payload_leaks() -> Result<()> {
         let directory = Directory::new()?;
-        for (body, extra_declared, expected) in [
-            (vec![0xff], 0, "not valid UTF-8"),
-            (b"CANARYSIG".to_vec(), 0, "not valid JSON"),
-            (b"{".to_vec(), 12, "response body failed"),
+        for (status, body, extra_declared, expected) in [
+            (200, vec![0xff], 0, "not valid UTF-8"),
+            (200, b"CANARYSIG".to_vec(), 0, "not valid JSON"),
+            (200, b"{".to_vec(), 12, "response body failed"),
+            (503, b"CANARYSIG".to_vec(), 0, "not valid JSON"),
         ] {
             let server = Server::start_transport(move |stream, _| {
                 write!(
                     stream,
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    "HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len() + extra_declared
                 )?;
                 stream.write_all(&body)?;
@@ -2501,8 +2511,10 @@ mod tests {
             let error = client
                 .execute(".show external tables", true, "observation")
                 .await
-                .unwrap_err();
+                .err()
+                .context("malformed observation must fail")?;
             let diagnostic = format!("{error:#}");
+            assert_eq!(error.is::<QapUnavailable>(), status == 503);
             assert!(diagnostic.contains(expected), "{diagnostic}");
             assert_public(&diagnostic);
         }
@@ -2568,7 +2580,8 @@ mod tests {
             Duration::from_millis(200),
         )
         .await
-        .unwrap_err();
+        .err()
+        .context("incomplete observation must time out")?;
         assert!(error.is::<QapUnavailable>());
         tokio::task::spawn_blocking(move || drop(server)).await?;
         assert!(

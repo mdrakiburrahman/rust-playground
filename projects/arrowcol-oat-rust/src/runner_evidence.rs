@@ -759,7 +759,7 @@ async fn read_native_stream(
     limit: usize,
 ) -> Result<Vec<u8>> {
     let mut bytes = Vec::with_capacity(limit.min(8192));
-    let mut chunk = [0; 8192];
+    let mut chunk = vec![0; limit.clamp(1, 8192)];
     loop {
         let length = reader.read(&mut chunk).await.context("read bounded native source stream")?;
         if length == 0 {
@@ -1039,7 +1039,7 @@ impl ResourceSampler {
     fn start(source: Option<ResourceSamplerSource>, config: OatConfig, start: u64, end: u64,
         prepared: Option<PreparedGuard>) -> Self {
         let native = match &source {
-            Some(ResourceSamplerSource::AksNative(native)) => Some(native.clone()),
+            Some(ResourceSamplerSource::AksNative(native)) => Some(Arc::clone(native)),
             _ => None,
         };
         let (signal, receiver) = watch::channel(if prepared.is_some() {
@@ -1089,18 +1089,17 @@ impl ResourceSampler {
                     if now >= end && guard.is_none() {
                         break;
                     }
-                    if let Some(source) = &native {
-                        if now.saturating_add(NATIVE_TELEMETRY_INTERVAL_MS) >= start
+                    if let Some(source) = &native
+                        && now.saturating_add(NATIVE_TELEMETRY_INTERVAL_MS) >= start
                             && last_native.is_none_or(|last| now.saturating_sub(last) >= NATIVE_TELEMETRY_INTERVAL_MS)
                             && native_tasks.is_empty()
                         {
                             last_native = Some(now);
-                            let source = source.clone();
+                            let source = Arc::clone(source);
                             let config = config.clone();
                             native_tasks.spawn(async move {
                                 capture_native_telemetry(&source, &config).await
                             });
-                        }
                     }
                     if now < start && guard.is_none() {
                         continue;
@@ -1325,7 +1324,7 @@ mod measurement_evidence_tests {
         }));
         tokio::time::timeout(Duration::from_secs(2), started).await??;
         task.abort();
-        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(task.await.err().context("aborted observer must cancel")?.is_cancelled());
         tokio::time::timeout(Duration::from_secs(2), observed_drop).await??;
         Ok(())
     }
@@ -1342,7 +1341,7 @@ mod measurement_evidence_tests {
                 assert_eq!(output.stdout, [0xc3, 0xa9]);
                 assert_eq!(output.stderr, b"x");
             } else {
-                assert!(format!("{:#}", output.unwrap_err()).contains("byte bound"));
+                assert!(format!("{:#}", output.err().context("oversized child must fail")?).contains("byte bound"));
             }
         }
         let child = Command::new("sh").args(["-c", "printf 12345; printf 67890 >&2; exit 0"])

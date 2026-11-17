@@ -370,7 +370,8 @@ export async function readOfficialNativeWindow(options: SourceOptions): Promise<
       pod.unavailableReasons.push('original_pod_uid_node_container_id_missing_changed_or_ambiguous');
       continue;
     }
-    const observations = rows.map((rows, i) => ({ ...rows[0]!, source_request_end_ms: frames[i]!.request_end_unix_ms }));
+    const observations: Record<string, unknown>[] = rows.map((rows, i) =>
+      ({ ...rows[0]!, source_request_end_ms: frames[i]!.request_end_unix_ms }));
     const firstIdentity = object(observations[0]!.identity, 'Native pod identity');
     const epoch = unsigned(firstIdentity.started_unix_ns);
     if (epoch === null || epoch === 0n) {
