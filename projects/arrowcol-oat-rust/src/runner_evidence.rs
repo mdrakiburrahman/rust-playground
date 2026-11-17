@@ -1120,7 +1120,7 @@ fn client_phase_evidence(output: &str) -> Result<Value> {
 mod downstream_runner_tests {
     use super::*;
 
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, Debug)]
     enum Fault {
         InitUnavailable,
         InitRequired,
@@ -1130,6 +1130,9 @@ mod downstream_runner_tests {
         ObservationBindingRejected,
         Collector,
         Pinning,
+        ScheduleArmBlocked,
+        ScheduleAckBlocked,
+        ScheduleAckCancellationFailed,
     }
 
     struct FaultPlatform {
@@ -1139,7 +1142,26 @@ mod downstream_runner_tests {
         start: std::sync::atomic::AtomicU64,
         clients_started: usize,
         client_schedule_wait_seconds: Option<u64>,
+        arm_attempts: usize,
+        arm_started: Option<tokio::time::Instant>,
+        delivery_drop_ms: std::sync::atomic::AtomicU64,
+        cancellations: std::sync::Mutex<Vec<String>>,
         unresolved: bool,
+    }
+
+    struct PendingDelivery<'a> {
+        started: tokio::time::Instant,
+        dropped_after_ms: &'a std::sync::atomic::AtomicU64,
+    }
+
+    impl Drop for PendingDelivery<'_> {
+        fn drop(&mut self) {
+            self.dropped_after_ms.store(
+                u64::try_from(self.started.elapsed().as_millis()).expect("bounded fixture duration"),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            tokio::time::resume();
+        }
     }
 
     #[async_trait::async_trait]
@@ -1217,15 +1239,24 @@ mod downstream_runner_tests {
                 .map(|pair| pair[1].parse())
                 .transpose()?;
             Ok(ClientHandle {
-                client_id: "client".to_owned(),
+                client_id: format!("client-{}", self.clients_started),
                 table: table.to_owned(),
                 process: ClientProcess::Local {
                     container_id: "fake".to_owned(),
                 },
             })
         }
-        async fn poll_client(&self, _: &OatConfig, _: &ClientHandle) -> Result<ClientProgress> {
+        async fn poll_client(&self, _: &OatConfig, handle: &ClientHandle) -> Result<ClientProgress> {
             let armed = self.start.load(std::sync::atomic::Ordering::SeqCst) != 0;
+            if armed && handle.client_id == "client-3"
+                && matches!(self.fault, Fault::ScheduleAckBlocked | Fault::ScheduleAckCancellationFailed)
+            {
+                let _pending = PendingDelivery {
+                    started: self.arm_started.context("fixture arm was not started")?,
+                    dropped_after_ms: &self.delivery_drop_ms,
+                };
+                return std::future::pending().await;
+            }
             Ok(ClientProgress {
                 ready: true,
                 schedule_received: armed,
@@ -1234,8 +1265,26 @@ mod downstream_runner_tests {
                 output: String::new(),
             })
         }
-        async fn arm_clients(&mut self, _: &OatConfig, _: &str, start: u64) -> Result<()> {
+        async fn arm_clients(&mut self, config: &OatConfig, _: &str, start: u64) -> Result<()> {
+            self.arm_attempts += 1;
+            self.arm_started = Some(tokio::time::Instant::now());
             self.start.store(start, std::sync::atomic::Ordering::SeqCst);
+            match self.fault {
+                Fault::ScheduleArmBlocked => {
+                    tokio::time::pause();
+                    let _pending = PendingDelivery {
+                        started: self.arm_started.context("fixture arm was not started")?,
+                        dropped_after_ms: &self.delivery_drop_ms,
+                    };
+                    return std::future::pending().await;
+                }
+                Fault::ScheduleAckBlocked | Fault::ScheduleAckCancellationFailed => {
+                    tokio::time::pause();
+                    // Leave only one quarter of the original lead for the blocked final ACK.
+                    tokio::time::advance(Duration::from_millis(config.schedule_lead_seconds * 750)).await;
+                }
+                _ => {}
+            }
             Ok(())
         }
         async fn finish_client(&self, config: &OatConfig, _: ClientHandle) -> Result<String> {
@@ -1247,7 +1296,11 @@ mod downstream_runner_tests {
                 100.0 / config.measure_seconds as f64
             ))
         }
-        async fn cancel_client(&self, _: &OatConfig, _: &ClientHandle) -> Result<()> {
+        async fn cancel_client(&self, _: &OatConfig, handle: &ClientHandle) -> Result<()> {
+            self.cancellations.lock().expect("fixture cancellations poisoned").push(handle.client_id.clone());
+            if matches!(self.fault, Fault::ScheduleAckCancellationFailed) && handle.client_id == "client-1" {
+                bail!("fixture_cancel_failed");
+            }
             Ok(())
         }
         async fn process_logs(&self, _: &OatConfig) -> Result<Vec<ProcessLog>> {
@@ -1308,6 +1361,10 @@ mod downstream_runner_tests {
             start: std::sync::atomic::AtomicU64::new(0),
             clients_started: 0,
             client_schedule_wait_seconds: None,
+            arm_attempts: 0,
+            arm_started: None,
+            delivery_drop_ms: std::sync::atomic::AtomicU64::new(0),
+            cancellations: std::sync::Mutex::new(Vec::new()),
             unresolved: false,
         };
         let mut config: OatConfig = serde_json::from_str(include_str!(
@@ -1318,6 +1375,9 @@ mod downstream_runner_tests {
         config.qap_timeout_seconds = if matches!(fault, Fault::InitTimeout) { 1 } else { 10 };
         if let Some(lead) = lead {
             config.schedule_lead_seconds = lead;
+        }
+        if matches!(fault, Fault::ScheduleArmBlocked | Fault::ScheduleAckBlocked | Fault::ScheduleAckCancellationFailed) {
+            config.clients_per_table = 3;
         }
         let run_id = uuid::Uuid::new_v4().to_string();
         let result = run_matrix_cell(
@@ -1348,6 +1408,9 @@ mod downstream_runner_tests {
             endpoint: "http://127.0.0.1:1".to_owned(),
             start: std::sync::atomic::AtomicU64::new(0), clients_started: 0,
             client_schedule_wait_seconds: None, unresolved: false,
+            arm_attempts: 0, arm_started: None,
+            delivery_drop_ms: std::sync::atomic::AtomicU64::new(0),
+            cancellations: std::sync::Mutex::new(Vec::new()),
         };
         let report = run_clients(&config, &uuid::Uuid::new_v4().to_string(), &config.tables, &mut platform).await?;
         assert_eq!(platform.clients_started, 0);
@@ -1401,6 +1464,38 @@ mod downstream_runner_tests {
             assert!(!validate_client_schedule(&[progress(false)], start - 1, start)?);
             assert!(validate_client_schedule(&[progress(false)], start, start).is_err());
             assert!(validate_client_schedule(&[progress(true)], start, start).is_err());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn schedule_delivery_timeout_drops_blocked_work_without_renewal_or_partial_success() -> Result<()> {
+        for fault in [Fault::ScheduleArmBlocked, Fault::ScheduleAckBlocked, Fault::ScheduleAckCancellationFailed] {
+            let (rows, platform) = tokio::time::timeout(
+                Duration::from_secs(10),
+                run_fault_with_lead(fault, crate::config::OatMode::Local, Some(2)),
+            ).await.context("production delivery did not terminate within the bounded witness")??;
+            assert_eq!(platform.arm_attempts, 1, "{fault:?}");
+            assert_eq!(platform.clients_started, 3, "{fault:?}");
+            let dropped_after_ms = platform.delivery_drop_ms.load(std::sync::atomic::Ordering::SeqCst);
+            assert!((1_900..=2_100).contains(&dropped_after_ms), "{fault:?}: dropped after {dropped_after_ms}ms");
+            let cancelled = platform.cancellations.lock().expect("fixture cancellations poisoned");
+            assert_eq!(cancelled.len(), 3, "{fault:?}");
+            assert_eq!(cancelled.iter().cloned().collect::<HashSet<_>>(),
+                ["client-1", "client-2", "client-3"].map(str::to_owned).into_iter().collect::<HashSet<_>>());
+            assert_eq!(rows[0].status, "failed", "{fault:?}");
+            let failure = rows[0].failure.as_deref().context("missing timeout failure")?;
+            assert!(failure.contains("schedule delivery/acknowledgement timed out"), "{failure}");
+            assert!(failure.contains("not retried"), "{failure}");
+            if matches!(fault, Fault::ScheduleAckCancellationFailed) {
+                assert!(failure.contains("fixture_cancel_failed"), "{failure}");
+                assert!(failure.contains("cancelling clients after schedule delivery failure also failed"), "{failure}");
+            }
+            assert!(rows[0].rows.is_none() && rows[0].duration_ms.is_none() && rows[0].rows_per_second.is_none());
+            let evidence: Value = serde_json::from_str(rows[0].evidence_json.as_deref().context("missing failure evidence")?)?;
+            assert!(evidence["client_schedule"].is_null());
+            assert!(evidence["backlog"]["measurement_window"].is_null());
+            eprintln!("delivery_fault={fault:?} dropped_after_ms={dropped_after_ms} arm_attempts={} cancelled={:?}; measurement/schedule receipt absent", platform.arm_attempts, *cancelled);
         }
         Ok(())
     }
