@@ -245,11 +245,31 @@ export function createDefaultCleanupProviders(store: CampaignStore, options: Def
   return {
     ...lifecycle,
     captureTerminalState: async (inventory, key, authority) => {
-      await assertCleaningActor(store, authority);
-      const token = { ownerId: authority.ownerId, fencingToken: authority.fencingToken };
-      const scaleAdapter = createDefaultScaleAdapter(store, { azure, token, runCommand: options.runCommand, authority });
-      if (await restoreCampaignScaleTrials(store, scaleAdapter, token) === 'pending') return 'pending';
+      const state = (await store.read())?.state;
+      if (!state || canonical_json(state.runInventory) !== canonical_json(inventory)) throw new Error('Terminal capture inventory changed.');
+      const unresolved = (state.scaleTrials ?? []).some(trial => !['restored', 'restore-stopped', 'reverted'].includes(trial.phase));
+      if (unresolved) {
+        await assertCleaningActor(store, authority);
+        const token = { ownerId: authority.ownerId, fencingToken: authority.fencingToken };
+        const scaleAdapter = createDefaultScaleAdapter(store, { azure, token, runCommand: options.runCommand, authority });
+        if (await restoreCampaignScaleTrials(store, scaleAdapter, token) === 'pending') return 'pending';
+      }
       return lifecycle.captureTerminalState(inventory, key, authority);
+    },
+    recoverLifecycle: async (field, inventory, deadlineUnixMs, key, authority) => {
+      if (field === 'terminal_capture') {
+        const state = (await store.read())?.state;
+        if (!state || canonical_json(state.runInventory) !== canonical_json(inventory)) throw new Error('Terminal recovery inventory changed.');
+        const unresolved = (state.scaleTrials ?? []).some(trial => !['restored', 'restore-stopped', 'reverted'].includes(trial.phase));
+        if (unresolved) {
+          await assertCleaningActor(store, authority);
+          const token = { ownerId: authority.ownerId, fencingToken: authority.fencingToken };
+          const scaleAdapter = createDefaultScaleAdapter(store, { azure, token, runCommand: options.runCommand, authority });
+          if (await restoreCampaignScaleTrials(store, scaleAdapter, token) === 'pending') return 'pending';
+        }
+      }
+      if (!lifecycle.recoverLifecycle) return 'pending';
+      return lifecycle.recoverLifecycle(field, inventory, deadlineUnixMs, key, authority);
     },
     verifyCellPreservation: async (inventory, authority) => {
       await authority.assertCurrent();

@@ -143,13 +143,22 @@ export function createExternalCleanupExecutor(store: CampaignStore, actions: Ext
     const ownerId = suppliedState.ownerId;
     const campaignId = suppliedState.campaignId;
     const fencingToken = suppliedState.fencingToken;
-    let effectEtag: string | undefined;
+    let effectEtag: string | undefined, effectState: CampaignState | undefined;
+    const withoutScaleTrials = (state: CampaignState) => { const copy = { ...state }; delete copy.scaleTrials; return copy; };
     const assertCurrent = async () => {
       const current = await store.read();
       if (!current || current.state.status !== 'cleaning' || current.state.campaignId !== campaignId ||
-          current.state.ownerId !== ownerId || current.state.fencingToken !== fencingToken || !current.state.runInventory ||
-          effectEtag !== undefined && current.etag !== effectEtag ||
-          current.state.runInventory.owner_id !== suppliedState.runInventory!.owner_id ||
+          current.state.ownerId !== ownerId || current.state.fencingToken !== fencingToken || !current.state.runInventory)
+        throw new Error('Cleanup controller fencing changed before the mutation gate.');
+      if (effectEtag !== undefined && current.etag !== effectEtag) {
+        if (step !== 'record-terminal-state' || !effectState ||
+            canonical_json(current.state.scaleTrials ?? []) === canonical_json(effectState.scaleTrials ?? []) ||
+            canonical_json(withoutScaleTrials(current.state)) !== canonical_json(withoutScaleTrials(effectState)))
+          throw new Error('Cleanup controller fencing changed before the mutation gate.');
+        effectEtag = current.etag;
+        effectState = current.state;
+      }
+      if (current.state.runInventory.owner_id !== suppliedState.runInventory!.owner_id ||
           current.state.runInventory.fencing_token !== suppliedState.runInventory!.fencing_token ||
           current.state.runInventory.cell_run_id !== suppliedState.runInventory!.cell_run_id ||
           current.state.runInventory.orchestration_run_id !== suppliedState.runInventory!.orchestration_run_id ||
@@ -180,12 +189,13 @@ export function createExternalCleanupExecutor(store: CampaignStore, actions: Ext
       const admitted = (await store.read())!;
       if (canonical_json(admitted.state.runInventory) !== canonical_json(inventory)) throw new Error('Cleanup inventory changed before effect admission.');
       effectEtag = admitted.etag;
+      effectState = admitted.state;
       let result: CleanupActionResult;
       try {
         await authority.assertCurrent();
         result = recovering ? await actions.recoverLifecycle!(field, inventory, running.deadline_unix_ms, idempotencyKey, authority) :
           await action(running.deadline_unix_ms);
-      } finally { effectEtag = undefined; }
+      } finally { effectEtag = undefined; effectState = undefined; }
       if (result === 'pending') {
         if (recovering) return 'pending';
         inventory = (await writeInventory(value => ({ ...value, cleanup: { ...value.cleanup, [field]: setStep(value.cleanup[field], 'pending', budgetMs) } }))).state.runInventory!;

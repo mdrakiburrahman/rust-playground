@@ -184,6 +184,19 @@ test('default lifecycle confirms exact Job suspension, physical stop and sanitiz
   assert.equal(await f.actions.recoverLifecycle!('stop_maintenance', f.inventory, f.inventory.cleanup.stop_maintenance.deadline_unix_ms, 'key', f.authority), 'complete');
   assert.equal(f.patchCount, 1, 'confirmed recovery must never PATCH again');
 });
+test('default cell terminal capture preserves the active producer path when the scale journal is empty', async t => {
+  const f = await fixture(t);
+  let captures = 0;
+  const lifecycle = { ...f.actions, captureTerminalState: async () => { captures++; return 'complete' as const; } };
+  const defaults = createDefaultCleanupProviders(f.store, { azure: f.azure, workDirectory: '.', lifecycle });
+  const cellProviders = createDefaultCellCleanupProviders({ ...defaults,
+    discoverExactInventory: async inventory => structuredClone(inventory) });
+  await cellProviders.terminal_capture!.execute(f.inventory, 'terminal-capture', f.authority);
+  assert.equal(captures, 1);
+  assert.equal(f.state.scaleTrials, undefined);
+  assert.equal(f.state.status, 'active');
+});
+
 test('default lifecycle unknown PATCH/empty recovery journals never dispatch an execute fallback', async t => {
   const f = await fixture(t);
   await assert.rejects(f.actions.recoverLifecycle!('stop_maintenance', f.inventory, null, 'key', f.authority), /no durable/);

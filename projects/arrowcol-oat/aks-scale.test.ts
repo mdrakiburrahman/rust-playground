@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { assessScaleTrial, executeScaleTrial, recommendScaleStep, validateScaleTarget, type ScaleEvidence, type ScaleTarget } from './aks-scale.js';
+import { assessScaleTrial, executeScaleTrial, main as scaleMain, recommendScaleStep, validateScaleTarget, type ScaleEvidence, type ScaleTarget } from './aks-scale.js';
 import { verifySafeIdle, ensureSafeIdle, type SafeIdleObservation } from './aks-reconcile.js';
 
 function evidence(overrides: Partial<ScaleEvidence> = {}): ScaleEvidence {
@@ -27,6 +27,15 @@ function safeIdle(overrides: Partial<SafeIdleObservation> = {}): SafeIdleObserva
     kustoAutoscaleMin: 2, kustoAutoscaleMax: 4, kustoAutoStopEnabled: true, ...overrides,
   };
 }
+
+test('real scale CLI refuses self-labeled telemetry before configuration, storage, or command access', async () => {
+  let commandCalls = 0;
+  await assert.rejects(scaleMain(['22222222-2222-4222-8222-222222222222', '1', '--env-file', 'missing.env',
+    '--stamp-config', 'missing.yaml', '--runtime-config', 'missing.json', '--evidence-file', 'evidence.json',
+    '--measurement-file', 'measurement.json'], async () => { commandCalls++; throw new Error('must not run'); }),
+  /no trusted committed-window, Prometheus, QAP and RunInventory evidence verifier/);
+  assert.equal(commandCalls, 0);
+});
 
 test('load-generator expansion requires generator saturation, collector headroom, and offered-load headroom', () => {
   const step = recommendScaleStep(evidence({ generatorCpuSaturated: true }));

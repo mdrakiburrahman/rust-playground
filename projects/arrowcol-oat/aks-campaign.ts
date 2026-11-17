@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { canonical_json } from '../../infra/azure/bootstrap.js';
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import type { RunFicPlan } from '../../infra/azure/run_fic.js';
@@ -61,12 +62,19 @@ export interface ScaleResourceIdentity {
   transport: 'azure-rest' | 'kubernetes'; resource_id: string; api_version: string | null; kind: string;
   namespace: string | null; name: string; uid: string | null;
 }
-export type ScaleTrialPhase = 'apply-intent' | 'applied' | 'kept' | 'restore-intent' | 'restored' | 'reverted' | 'unknown';
+export type ScaleTrialPhase = 'apply-intent' | 'apply-dispatch' | 'applied' | 'kept' | 'restore-intent' |
+  'restore-dispatch' | 'restored' | 'restore-stopped' | 'reverted' | 'unknown';
+export interface ScaleEffectDispatch {
+  state: 'forwarding' | 'confirmed' | 'unknown'; transport: 'azure-rest' | 'kubernetes'; method: 'PUT' | 'PATCH' | 'kubectl-json-patch';
+  target: ScaleTarget; before: number | string; started_at_ms: number; request_sha256: string;
+  resource_version?: string; etag?: string; response_status?: number; returncode?: number; operation_url?: string;
+}
 export interface ScaleTrialReceipt {
   schema_version: 1; trial_id: string; campaign_id: string; owner_id: string; fencing_token: number; cell_run_id: string;
   started_at_ms: number; deadline_at_ms: number; restore_deadline_at_ms: number; target: ScaleTarget; restore: ScaleTarget; evidence: string[];
   baseline: { committed_rows_per_second: number; qap_pending_backlog: number; qap_p95_latency_ms: number };
   resource: ScaleResourceIdentity; phase: ScaleTrialPhase; operation_url?: string;
+  dispatches?: { apply?: ScaleEffectDispatch; restore?: ScaleEffectDispatch };
   result?: { outcome: 'keep' | 'revert' | 'stop' | 'unknown'; committed_rows_per_second: number | null;
     qap_pending_backlog: number | null; qap_p95_latency_ms: number | null; ineffective_increments: number; reason: string };
 }
@@ -97,7 +105,8 @@ export function validateScaleTarget(value: unknown): ScaleTarget {
 }
 function validScaleTrial(value: unknown, state: CampaignState): value is ScaleTrialReceipt {
   if (!record(value) || !optionalRecord(value, ['schema_version', 'trial_id', 'campaign_id', 'owner_id', 'fencing_token', 'cell_run_id',
-      'started_at_ms', 'deadline_at_ms', 'restore_deadline_at_ms', 'target', 'restore', 'evidence', 'baseline', 'resource', 'phase'], ['operation_url', 'result'])) return false;
+      'started_at_ms', 'deadline_at_ms', 'restore_deadline_at_ms', 'target', 'restore', 'evidence', 'baseline', 'resource', 'phase'],
+      ['operation_url', 'result', 'dispatches'])) return false;
   let target: ScaleTarget, restore: ScaleTarget;
   try { target = validateScaleTarget(value.target); restore = validateScaleTarget(value.restore); } catch { return false; }
   const resource = value.resource as Record<string, unknown>;
@@ -121,7 +130,37 @@ function validScaleTrial(value: unknown, state: CampaignState): value is ScaleTr
       !nonnegative(value.restore_deadline_at_ms) || !Number.isSafeInteger(value.deadline_at_ms + SCALE_RESTORE_TIMEOUT_MS) ||
       value.restore_deadline_at_ms !== value.deadline_at_ms + SCALE_RESTORE_TIMEOUT_MS ||
       value.deadline_at_ms < value.started_at_ms || value.deadline_at_ms > state.expiresAtMs || value.restore_deadline_at_ms > state.expiresAtMs ||
-      !['apply-intent', 'applied', 'kept', 'restore-intent', 'restored', 'reverted', 'unknown'].includes(String(value.phase))) return false;
+      !['apply-intent', 'apply-dispatch', 'applied', 'kept', 'restore-intent', 'restore-dispatch', 'restored',
+        'restore-stopped', 'reverted', 'unknown'].includes(String(value.phase))) return false;
+  if (value.dispatches !== undefined) {
+    const dispatches = value.dispatches;
+    if (!record(dispatches) || !optionalRecord(dispatches, [], ['apply', 'restore'])) return false;
+    for (const [kind, dispatch, expectedTarget] of [['apply', dispatches.apply, target], ['restore', dispatches.restore, restore]] as const) {
+      if (dispatch === undefined) continue;
+      if (!record(dispatch)) return false;
+      const responseStatus = dispatch.response_status, returncode = dispatch.returncode, operationUrl = dispatch.operation_url;
+      if (!optionalRecord(dispatch, ['state', 'transport', 'method', 'target', 'before', 'started_at_ms', 'request_sha256'],
+          ['resource_version', 'etag', 'response_status', 'returncode', 'operation_url']) ||
+          !['forwarding', 'confirmed', 'unknown'].includes(String(dispatch.state)) ||
+          !['azure-rest', 'kubernetes'].includes(String(dispatch.transport)) ||
+          !['PUT', 'PATCH', 'kubectl-json-patch'].includes(String(dispatch.method)) ||
+          canonical_json(dispatch.target) !== canonical_json(expectedTarget) || dispatch.before !== expectedTarget.before ||
+          !nonnegative(dispatch.started_at_ms) || dispatch.started_at_ms < value.started_at_ms ||
+          dispatch.started_at_ms >= (kind === 'apply' ? value.deadline_at_ms : value.restore_deadline_at_ms) ||
+          typeof dispatch.request_sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(dispatch.request_sha256) ||
+          dispatch.transport === 'kubernetes' && (dispatch.method !== 'kubectl-json-patch' || !nonempty(dispatch.resource_version) || dispatch.etag !== undefined) ||
+          dispatch.transport === 'azure-rest' && (!['PUT', 'PATCH'].includes(String(dispatch.method)) || !nonempty(dispatch.etag) || dispatch.resource_version !== undefined) ||
+          responseStatus !== undefined && (typeof responseStatus !== 'number' || !Number.isSafeInteger(responseStatus) || responseStatus < 100 || responseStatus > 599) ||
+          returncode !== undefined && (typeof returncode !== 'number' || !Number.isSafeInteger(returncode)) ||
+          dispatch.state === 'confirmed' && (dispatch.transport === 'azure-rest' ? typeof responseStatus !== 'number' || responseStatus < 200 || responseStatus >= 300 : typeof returncode !== 'number' || returncode !== 0) ||
+          operationUrl !== undefined && (dispatch.transport !== 'azure-rest' || typeof operationUrl !== 'string' || !operationUrl.startsWith('https://management.azure.com/'))) return false;
+    }
+    const applyState = record(dispatches.apply) ? dispatches.apply.state : undefined;
+    const restoreState = record(dispatches.restore) ? dispatches.restore.state : undefined;
+    if (value.phase === 'apply-dispatch' && !['forwarding', 'confirmed'].includes(String(applyState)) ||
+        value.phase === 'restore-dispatch' && !['forwarding', 'confirmed'].includes(String(restoreState)) ||
+        value.phase === 'restore-stopped' && (target.dimension !== 'loadgen-max' || dispatches.restore !== undefined)) return false;
+  }
   if (value.result !== undefined) {
     const result = value.result;
     if (!record(result) || !exactRecord(result, ['outcome', 'committed_rows_per_second', 'qap_pending_backlog', 'qap_p95_latency_ms', 'ineffective_increments', 'reason']) ||
@@ -571,10 +610,10 @@ export function validateCampaignState(value: unknown): CampaignState {
   for (const trial of scaleTrials) {
     if (!validScaleTrial(trial, state) || trialIds.has(trial.trial_id)) throw new Error('Scale trial receipt is malformed or duplicated.');
     trialIds.add(trial.trial_id);
-    if (['apply-intent', 'applied', 'restore-intent', 'unknown'].includes(trial.phase)) unresolvedTrials++;
+    if (['apply-intent', 'apply-dispatch', 'applied', 'restore-intent', 'restore-dispatch', 'unknown'].includes(trial.phase)) unresolvedTrials++;
   }
   if (unresolvedTrials > 1) throw new Error('Campaign has multiple unresolved scale trials.');
-  if (['complete', 'complete_unsettled'].includes(state.status) && scaleTrials.some(trial => !['restored', 'reverted'].includes(trial.phase)))
+  if (['complete', 'complete_unsettled'].includes(state.status) && scaleTrials.some(trial => !['restored', 'restore-stopped', 'reverted'].includes(trial.phase)))
     throw new Error('Campaign cannot finalize while scale effects are not restored.');
   const ids = new Set<string>();
   for (const operation of state.operations) {

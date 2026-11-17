@@ -14,10 +14,13 @@ export { SCALE_RESTORE_TIMEOUT_MS } from './aks-campaign.js';
 export { validateCampaignScaleTarget as validateScaleTarget };
 export type { ScaleDimension, ScaleTarget } from './aks-campaign.js';
 const SCALE_TRIAL_TIMEOUT_MS = 15 * 60 * 1000;
-const inFlightPhases = new Set(['apply-intent', 'applied', 'restore-intent', 'unknown']);
+const inFlightPhases = new Set(['apply-intent', 'apply-dispatch', 'applied', 'restore-intent', 'restore-dispatch', 'unknown']);
 const transitions: Record<ScaleTrialReceipt['phase'], ScaleTrialReceipt['phase'][]> = {
-  'apply-intent': ['applied', 'reverted', 'unknown'], applied: ['kept', 'restore-intent', 'unknown'], kept: ['restore-intent'],
-  'restore-intent': ['restored', 'unknown'], restored: [], reverted: [], unknown: ['applied', 'restore-intent', 'restored', 'reverted'],
+  'apply-intent': ['apply-dispatch', 'applied', 'reverted', 'unknown'], 'apply-dispatch': ['applied', 'unknown'],
+  applied: ['kept', 'restore-intent', 'unknown'], kept: ['restore-intent'],
+  'restore-intent': ['restore-dispatch', 'restored', 'restore-stopped', 'unknown'],
+  'restore-dispatch': ['restored', 'unknown'], restored: [], 'restore-stopped': [], reverted: [],
+  unknown: ['applied', 'restore-intent', 'restored', 'restore-stopped', 'reverted'],
 };
 
 export async function persistScaleTrial(store: CampaignStore, receipt: ScaleTrialReceipt, actor: ScaleCustodyToken,
@@ -53,10 +56,33 @@ export async function persistScaleTrial(store: CampaignStore, receipt: ScaleTria
         existing.result !== undefined && canonical_json(existing.result) !== canonical_json(receipt.result) ||
         receipt.operation_url !== undefined && existing.resource.transport !== 'azure-rest')
       throw new CampaignFencedError('Scale trial immutable target/resource binding changed.');
+    for (const kind of ['apply', 'restore'] as const) {
+      const prior = existing.dispatches?.[kind], next = receipt.dispatches?.[kind];
+      if (!prior && next) {
+        if (next.state !== 'forwarding' || receipt.phase !== (kind === 'apply' ? 'apply-dispatch' : 'restore-dispatch'))
+          throw new CampaignFencedError('Scale dispatch receipt is not an exclusive forward-and-outcome transition.');
+        continue;
+      }
+      if (prior && !next) throw new CampaignFencedError('Scale dispatch receipt cannot be removed.');
+      if (prior && next) {
+        const { state: priorState, response_status: priorStatus, returncode: priorCode, operation_url: priorUrl, ...priorBinding } = prior;
+        const { state: nextState, response_status: nextStatus, returncode: nextCode, operation_url: nextUrl, ...nextBinding } = next;
+        if (canonical_json(priorBinding) !== canonical_json(nextBinding) ||
+            priorState !== nextState && (priorState !== 'forwarding' || !['confirmed', 'unknown'].includes(nextState)) ||
+            priorState !== 'forwarding' && canonical_json(prior) !== canonical_json(next))
+          throw new CampaignFencedError('Scale dispatch outcome is immutable after its single forward.');
+      }
+    }
     if (existing.phase !== receipt.phase && !transitions[existing.phase].includes(receipt.phase))
       throw new CampaignFencedError('Scale trial phase transition is not permitted.');
-    if (cleanup && !['restore-intent', 'restored', 'reverted', 'unknown'].includes(receipt.phase))
+    if (cleanup && !['applied', 'restore-intent', 'restore-dispatch', 'restored', 'restore-stopped', 'reverted', 'unknown'].includes(receipt.phase))
       throw new CampaignFencedError('Cleanup may only reconcile or restore a scale trial.');
+    if (!cleanup && existing.phase === 'apply-intent' && receipt.phase === 'applied')
+      throw new CampaignFencedError('Only cleanup may recover an apply intent at after-state.');
+    if (cleanup && receipt.phase === 'applied' && !(existing.phase === 'apply-intent' && !existing.dispatches?.apply ||
+        existing.phase === 'apply-dispatch' && existing.dispatches?.apply ||
+        existing.phase === 'unknown' && existing.dispatches?.apply && !existing.dispatches.restore))
+      throw new CampaignFencedError('Cleanup may publish applied only when reconciling a durable apply dispatch.');
     const updated = [...trials];
     updated[index] = receipt;
     return { ...current, scaleTrials: updated };
@@ -242,10 +268,11 @@ export interface ScaleAdapter {
   persistIntent(step: ScaleTarget, token: ScaleCustodyToken, trial?: ScaleStep): Promise<void>;
   finish?(result: ScaleTrialResult): Promise<void>;
   finishUnknown?(reason: string): Promise<void>;
-  beginMeasurement?(): Promise<void>;
   apply(step: ScaleTarget, token: ScaleCustodyToken): Promise<void>;
   reconcile(step: ScaleTarget): Promise<'before' | 'after' | 'pending' | 'unknown'>;
-  measure(): Promise<ScaleMeasurement>;
+  deadlineFor?(step: ScaleTarget): Promise<{ trial: number; restore: number }>;
+  measure(deadlineAtMs?: number): Promise<ScaleMeasurement>;
+  beginMeasurement?(deadlineAtMs?: number): Promise<void>;
 }
 export async function executeScaleTrial(step: ScaleStep, adapter: ScaleAdapter, token: ScaleCustodyToken,
   previousIneffectiveIncrements = 0): Promise<ScaleTrialResult> {
@@ -256,6 +283,7 @@ export async function executeScaleTrial(step: ScaleStep, adapter: ScaleAdapter, 
     await adapter.assertCustody(token);
     await adapter.persistIntent(target, token, step);
     const before = await adapter.reconcile(target);
+    if (before === 'after') return;
     if (before !== 'before') throw new Error('Scale target state is ' + before + '; refusing to apply without an exact before-state readback.');
     let applyError: unknown;
     try { await adapter.apply(target, token); } catch (error) { applyError = error; }
@@ -285,8 +313,11 @@ export async function executeScaleTrial(step: ScaleStep, adapter: ScaleAdapter, 
   await applyOnce(step);
   let result: ScaleTrialResult;
   try {
-    await adapter.beginMeasurement?.();
-    result = assessScaleTrial(step, await adapter.measure(), previousIneffectiveIncrements);
+    const deadlines = await adapter.deadlineFor?.(step);
+    const trialDeadline = deadlines?.trial ?? Date.now() + SCALE_TRIAL_TIMEOUT_MS;
+    if (Date.now() >= trialDeadline) throw new Error('Scale trial deadline expired before measurement.');
+    await adapter.beginMeasurement?.(trialDeadline);
+    result = assessScaleTrial(step, await adapter.measure(trialDeadline), previousIneffectiveIncrements);
   } catch (error) {
     try {
       await restore();
@@ -304,7 +335,7 @@ export async function executeScaleTrial(step: ScaleStep, adapter: ScaleAdapter, 
 
 
 const evidenceSources = ['committed-window', 'lgtm-prometheus', 'qap', 'runinventory'] as const;
-interface ScaleEvidenceEnvelope {
+export interface ScaleEvidenceEnvelope {
   schema_version: 1; campaign_id: string; cell_run_id: string; observed_at_ms: number; window_ms: number;
   sources: string[]; evidence: ScaleEvidence;
 }
@@ -351,6 +382,7 @@ function measurementEnvelope(value: unknown, state: CampaignState, now: number):
       measurement.qapPendingBacklog < 0 || !nonnegative(measurement.qapP95LatencyMs)) throw new Error('Scale measurement is UNKNOWN.');
   return value as unknown as ScaleMeasurementEnvelope;
 }
+export type ScaleEvidenceVerifier = (evidence: ScaleEvidenceEnvelope, state: CampaignState) => Promise<void>;
 async function readJsonFile(file: string): Promise<unknown> {
   const bytes = await readFile(resolve(ROOT, file));
   if (bytes.byteLength > 262_144) throw new Error('Scale evidence file exceeds its fixed size bound.');
@@ -378,7 +410,7 @@ async function waitForScaleMeasurement(file: string, state: CampaignState, notBe
   throw new Error('No fresh post-scale measurement arrived before the bounded trial deadline.');
 }
 
-export async function main(args: string[], runner: typeof runtime.run_tree = runtime.run_tree): Promise<void> {
+export async function main(args: string[], runner: typeof runtime.run_tree = runtime.run_tree, verifyEvidence?: ScaleEvidenceVerifier): Promise<void> {
   const parsed = parseArgs({ args, allowPositionals: true, options: {
     'env-file': { type: 'string' }, 'stamp-config': { type: 'string' }, 'runtime-config': { type: 'string' },
     'evidence-file': { type: 'string' }, 'measurement-file': { type: 'string' },
@@ -388,6 +420,7 @@ export async function main(args: string[], runner: typeof runtime.run_tree = run
     throw new Error('Usage: arrowcol-oat aks scale <owner-id> <fencing-token> --env-file PATH --stamp-config PATH --runtime-config PATH --evidence-file PATH --measurement-file PATH');
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(positionals[0]!) || !/^\d+$/.test(positionals[1]!))
     throw new Error('Scale requires an exact owner UUID and numeric fencing token.');
+  if (!verifyEvidence) throw new Error('Scale admission is closed: no trusted committed-window, Prometheus, QAP and RunInventory evidence verifier is configured.');
   const selected = loadCustodyConfig(['--env-file', String(values['env-file'] ?? ''), '--stamp-config', String(values['stamp-config'] ?? '')]);
   const store = createBlobCampaignStore({ account: selected.config.account, container: selected.config.checkpoints,
     subscriptionId: selected.config.subscription });
@@ -401,6 +434,7 @@ export async function main(args: string[], runner: typeof runtime.run_tree = run
   if (state.status !== 'active' || state.mode !== 'armed' || state.ownerId !== token.ownerId || state.fencingToken !== token.fencingToken || !state.runInventory)
     throw new CampaignFencedError('Scale requires the exact active armed campaign owner and fence.');
   const evidence = scaleEnvelope(await readJsonFile(values['evidence-file']!), state, Date.now());
+  await verifyEvidence(evidence, state);
   const step = recommendScaleStep(evidence.evidence);
   if (!step) { console.log(JSON.stringify({ status: 'no-measured-bottleneck', campaign_id: state.campaignId })); return; }
   const previous = [...(state.scaleTrials ?? [])].reverse().find(item => item.target.dimension === step.dimension)?.result?.ineffective_increments ?? 0;
@@ -408,12 +442,10 @@ export async function main(args: string[], runner: typeof runtime.run_tree = run
   const runtimeConfig = validateRuntime(await readJsonFile(values['runtime-config']));
   if (runtimeConfig.subscriptionId !== selected.config.subscription) throw new Error('Runtime configuration subscription differs from the selected stamp.');
   if (runtimeConfig.stamp !== selected.config.stamp) throw new Error('Runtime configuration stamp differs from the selected stamp.');
-  const trialDeadlineAt = Date.now() + SCALE_TRIAL_TIMEOUT_MS;
-  let measurementStartedAt = 0;
+  let measurementStartedAt = 0, trialDeadlineAt = 0;
   const adapter = createDefaultScaleAdapter(store, { azure, token, runCommand: runner as CustodyCommandRunner, runtimeConfig,
-    beginMeasurement: () => { measurementStartedAt = Date.now(); },
-    measure: () => waitForScaleMeasurement(values['measurement-file']!, state, measurementStartedAt,
-      trialDeadlineAt) });
+    beginMeasurement: deadlineAtMs => { measurementStartedAt = Date.now(); trialDeadlineAt = deadlineAtMs; },
+    measure: () => waitForScaleMeasurement(values['measurement-file']!, state, measurementStartedAt, trialDeadlineAt) });
   const result = await executeScaleTrial(step, adapter, token, previous);
   console.log(JSON.stringify({ campaign_id: state.campaignId, cell_run_id: state.runInventory.cell_run_id, step, result }));
 }
