@@ -22,6 +22,73 @@ use crate::{
 
 const INGESTION: &str = INGESTION_PARTITION;
 
+/// Original normal AKS allocation; validation is not authorization to create a table.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NormalAksFreshTablePlan {
+    pub account: String,
+    pub container: String,
+    pub shared_delta_root: String,
+    pub run_delta_root: String,
+    pub table_root: String,
+    pub run_id: String,
+    pub namespace: String,
+    pub namespace_uid: String,
+    pub owner_token: String,
+    pub generation: String,
+    pub setup_deadline_unix_ms: u64,
+}
+
+impl NormalAksFreshTablePlan {
+    /// Validate the retained allocation and derive the canonical hot-table schema.
+    ///
+    /// # Errors
+    /// Rejects inconsistent roots, noncanonical identities, and expired deadlines.
+    pub fn target(&self, now_unix_ms: u64) -> Result<(Url, Arc<Schema>)> {
+        for value in [&self.run_id, &self.namespace_uid, &self.owner_token, &self.generation] {
+            canonical_uuid(value)?;
+        }
+        if self.setup_deadline_unix_ms <= now_unix_ms
+            || self.namespace.is_empty()
+            || self.namespace.len() > 63
+            || !self
+                .namespace
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+            || self.namespace.starts_with('-')
+            || self.namespace.ends_with('-')
+        {
+            bail!("normal AKS fresh table requires a valid namespace and unexpired original deadline");
+        }
+        let shared = checked_root(&self.shared_delta_root, &self.account, &self.container)?;
+        let run = checked_root(&self.run_delta_root, &self.account, &self.container)?;
+        let expected_parent = shared
+            .path()
+            .strip_suffix("/dataflow/")
+            .context("shared root must end in dataflow")?;
+        let expected_path = format!("{expected_parent}/runs/{}/dataflow/", self.run_id);
+        if shared.as_str() != self.shared_delta_root
+            || run.as_str() != self.run_delta_root
+            || run.path() != expected_path
+            || shared.path().contains("//")
+        {
+            bail!("normal AKS fresh table root does not match the retained run allocation");
+        }
+        let statement = schema_statements()?
+            .into_iter()
+            .find(|statement| {
+                statement.identity.to_string() == "telemetry.sqlserver.sqlserver_availability_replica_states"
+            })
+            .context("canonical hot table is absent")?;
+        let (_, schema) = canonical_entry(&statement)?;
+        let target = run.join("telemetry/sqlserver/sqlserver_availability_replica_states/")?;
+        if target.as_str() != self.table_root {
+            bail!("normal AKS fresh table target differs from the derived root");
+        }
+        Ok((target, schema))
+    }
+}
+
 /// Strict input allocation for one fresh table, not permission to execute cloud operations.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -625,6 +692,36 @@ mod tests {
     use super::*;
     use crate::schema::TABLE_COUNT;
     use arrow_deltalake::maintenance::{Granularity, MaintenanceControl, Outcome, PurgeConfig, now_ms};
+
+    #[test]
+    fn normal_aks_plan_rejects_root_and_deadline_drift() -> Result<()> {
+        let run_id = "00000000-0000-4000-8000-000000000001";
+        let shared = "abfss://data@arrowcollector1.dfs.core.windows.net/stamp/dataflow/";
+        let run = format!("abfss://data@arrowcollector1.dfs.core.windows.net/stamp/runs/{run_id}/dataflow/");
+        let mut plan = NormalAksFreshTablePlan {
+            account: "arrowcollector1".into(),
+            container: "data".into(),
+            shared_delta_root: shared.into(),
+            run_delta_root: run.clone(),
+            table_root: format!("{run}telemetry/sqlserver/sqlserver_availability_replica_states/"),
+            run_id: run_id.into(),
+            namespace: "arrowcol-oat".into(),
+            namespace_uid: run_id.into(),
+            owner_token: run_id.into(),
+            generation: run_id.into(),
+            setup_deadline_unix_ms: 100,
+        };
+        let (root, schema) = plan.target(99)?;
+        assert_eq!(root.as_str(), plan.table_root);
+        assert!(schema.field_with_name(INGESTION).is_ok());
+        assert!(plan.target(100).is_err());
+        plan.table_root = format!("{run}dataflow/telemetry/sqlserver/sqlserver_availability_replica_states/");
+        assert!(plan.target(99).is_err());
+        plan.table_root = format!("{run}telemetry/sqlserver/sqlserver_availability_replica_states/");
+        plan.run_delta_root = run.replace(run_id, "00000000-0000-4000-8000-000000000002");
+        assert!(plan.target(99).is_err());
+        Ok(())
+    }
 
     #[test]
     fn fresh_local_partition_is_purgeable_and_existing_table_is_untouched() -> Result<()> {
