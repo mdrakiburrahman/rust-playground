@@ -184,11 +184,11 @@ async fn loopback_compression_does_not_bypass_disabled_codec_or_decompressed_lim
             };
             if limit == "disabled" {
                 assert_eq!(error.code(), Code::Unimplemented);
+            } else if limit == "message" {
+                assert_eq!(error.code(), Code::InvalidArgument);
+                assert_eq!(error.message(), "invalid Arrow Flight stream");
             } else {
-                assert!(
-                    matches!(error.code(), Code::ResourceExhausted | Code::OutOfRange),
-                    "{limit}: {error}"
-                );
+                assert_eq!(error.code(), Code::ResourceExhausted, "{limit}: {error}");
             }
             assert_eq!(admission.begin_count(), 0, "{encoding:?}/{limit}");
         }
@@ -219,9 +219,10 @@ async fn loopback_compression_retains_admission_wait_and_identity_rejection() ->
             .send_compressed(encoding)
             .accept_compressed(encoding);
         let mut forged = wire_ingest_request(&fixture.v1).await?;
-        forged
-            .metadata_mut()
-            .insert("x-arrowcol-internal-auth-context", MetadataValue::from_static("forged"));
+        forged.metadata_mut().insert_bin(
+            arrowcol_flight::INTERNAL_IDENTITY_METADATA_KEY,
+            MetadataValue::from_bytes(b"forged"),
+        );
         let error = client
             .do_put(forged)
             .await
