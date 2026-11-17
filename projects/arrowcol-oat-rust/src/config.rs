@@ -385,10 +385,30 @@ impl OatConfig {
             if self.tunables.wal.is_some() {
                 bail!("scale_out_single_table campaign requires WAL to be absent");
             }
-            let maintenance = self.tunables.maintenance.as_ref()
+            if !self.overload_guard.enabled {
+                bail!("scale_out_single_table campaign requires overload protection");
+            }
+            let maintenance = self
+                .tunables
+                .maintenance
+                .as_ref()
                 .context("scale_out_single_table campaign requires enabled, applying maintenance")?;
-            if maintenance.enabled != Some(true) || maintenance.apply != Some(true) || maintenance.max_cycles.is_some() {
+            if maintenance.enabled != Some(true)
+                || maintenance.apply != Some(true)
+                || maintenance.max_cycles.is_some()
+            {
                 bail!("scale_out_single_table campaign requires continuous, enabled, applying maintenance");
+            }
+            let operations = maintenance
+                .operations
+                .as_ref()
+                .context("scale_out_single_table campaign requires all maintenance operations")?;
+            use arrowcol_tunables::MaintenanceOperation::{Checkpoint, Optimize, PruneLog, Purge, Vacuum};
+            if [Purge, Optimize, Vacuum, Checkpoint, PruneLog]
+                .iter()
+                .any(|operation| !operations.contains(operation))
+            {
+                bail!("scale_out_single_table campaign requires purge, optimize, vacuum, checkpoint and prune_log");
             }
             return Ok(());
         }
@@ -1917,6 +1937,7 @@ mod tests {
         config.clients_per_table = 5;
         assert!(config.validate().is_err());
         config.campaign_profile = Some(CampaignProfile::ScaleOutSingleTable);
+        config.overload_guard.enabled = true;
         config.tables = vec!["sqlserver_availability_replica_states".to_owned()];
         config.maintenance_image = Some(format!("maintenance@sha256:{}", "a".repeat(64)));
         config.tunables = serde_json::from_value(serde_json::json!({
@@ -1936,6 +1957,32 @@ mod tests {
         config.clients_per_table = 1;
         config.tables.push("sqlserver_wait_stats".to_owned());
         assert!(config.validate().is_err());
+        config.tables.clear();
+        assert!(config.validate().is_err());
+        config.tables.push("sqlserver_wait_stats".to_owned());
+        assert!(config.validate().is_err());
+        config.tables[0] = "sqlserver_availability_replica_states".to_owned();
+        config.tunables.wal = Some(arrowcol_tunables::WalTunables::default());
+        assert!(config.validate().is_err());
+        config.tunables.wal = None;
+        let maintenance = config.tunables.maintenance.take().context("missing test maintenance")?;
+        assert!(config.validate().is_err());
+        config.tunables.maintenance = Some(maintenance);
+        config.tunables.maintenance.as_mut().context("missing test maintenance")?.enabled = Some(false);
+        assert!(config.validate().is_err());
+        config.tunables.maintenance.as_mut().context("missing test maintenance")?.enabled = Some(true);
+        config.tunables.maintenance.as_mut().context("missing test maintenance")?.apply = Some(false);
+        assert!(config.validate().is_err());
+        config.tunables.maintenance.as_mut().context("missing test maintenance")?.apply = Some(true);
+        config.tunables.maintenance.as_mut().context("missing test maintenance")?.operations = Some(vec![]);
+        assert!(config.validate().is_err());
+        config.tunables.maintenance.as_mut().context("missing test maintenance")?.operations = Some(vec![
+            arrowcol_tunables::MaintenanceOperation::Purge, arrowcol_tunables::MaintenanceOperation::Optimize,
+            arrowcol_tunables::MaintenanceOperation::Vacuum, arrowcol_tunables::MaintenanceOperation::Checkpoint,
+            arrowcol_tunables::MaintenanceOperation::PruneLog,
+        ]);
+        config.overload_guard.enabled = false;
+        assert!(config.validate_campaign_profile().is_err());
         assert!(serde_json::from_str::<CampaignProfile>(r#""scale_out_single_tables""#).is_err());
         assert_eq!(serde_json::to_string(&CampaignProfile::ScaleOutSingleTable)?, r#""scale_out_single_table""#);
         Ok(())

@@ -9304,7 +9304,14 @@ async fn prepare_aks_platform(
     runtime_config["effective_stop_budgets"] = serde_json::to_value(config.maintenance_stop_budget()?)?;
     runtime_config["resources"] = serde_json::to_value(config.effective_aks_resources())?;
     if config.campaign_profile == Some(crate::config::CampaignProfile::ScaleOutSingleTable) {
+        let [hot_table] = config.tables.as_slice() else {
+            bail!("scale_out_single_table runtime requires exactly one hot table");
+        };
+        if hot_table != "sqlserver_availability_replica_states" {
+            bail!("scale_out_single_table runtime hot table is invalid");
+        }
         runtime_config["campaignProfile"] = json!("scale_out_single_table");
+        runtime_config["hotTable"] = json!(hot_table);
         set_runtime_replicas(&mut runtime_config, replicas)?;
     }
     runtime_config["collectorWorkers"] = json!(
