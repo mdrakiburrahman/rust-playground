@@ -1119,6 +1119,28 @@ struct ResourceSampler {
 const PUBLICATION_BACKLOG_SAMPLING_INTERVAL: Duration = Duration::from_secs(1);
 const PUBLICATION_BACKLOG_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 
+fn publication_backlog_timeout_ms(request_start: u64, window_start: u64, window_end: u64) -> u64 {
+    let original = PUBLICATION_BACKLOG_REQUEST_TIMEOUT.as_millis() as u64;
+    if (window_start..window_end).contains(&request_start) {
+        original.min(window_end - request_start)
+    } else {
+        original
+    }
+}
+
+async fn bounded_publication_backlog_scrape(
+    scraper: Option<&PublicationBacklogScraper>,
+    deadline: tokio::time::Instant,
+) -> Result<(u64, Result<PublicationBacklogMetrics>)> {
+    tokio::time::timeout_at(deadline, async {
+        let result = match scraper {
+            Some(scraper) => scraper.scrape().await,
+            None => Err(anyhow::anyhow!("publication backlog metrics endpoint unavailable")),
+        };
+        Ok((unix_time_ms_u64()?, result))
+    }).await.context("publication backlog scrape exceeded its bounded deadline")?
+}
+
 async fn sample_resources(source: &ResourceSamplerSource, config: &OatConfig) -> Result<ResourceMetrics> {
     match source {
         ResourceSamplerSource::Aks | ResourceSamplerSource::AksNative(_) => collect_aks_metrics(config).await,
@@ -1232,7 +1254,11 @@ impl ResourceSampler {
                             Ok::<_, anyhow::Error>(ResourceSample { sampled_at_unix_ms:unix_time_ms_u64()?, metrics })
                         });
                     }
+                    let request_anchor = tokio::time::Instant::now();
                     let request_start_unix_ms = unix_time_ms_u64()?;
+                    if request_start_unix_ms >= end && guard.is_none() {
+                        break;
+                    }
                     let sample = async {
                         if asynchronous_resources {
                             Ok(None)
@@ -1240,17 +1266,11 @@ impl ResourceSampler {
                             sample_resources(&source, &config).await.map(Some)
                         }
                     };
-                    let timeout_ms = if guard.is_some() {
+                    let timeout_ms = publication_backlog_timeout_ms(request_start_unix_ms, start, end);
+                    let other_timeout_ms = if guard.is_some() {
                         PUBLICATION_BACKLOG_REQUEST_TIMEOUT.as_millis() as u64
                     } else {
-                        (PUBLICATION_BACKLOG_REQUEST_TIMEOUT.as_millis() as u64).min(end - now)
-                    };
-                    let backlog_sample = async {
-                        let result = match &backlog_scraper {
-                            Some(scraper) => scraper.scrape().await,
-                            None => Err(anyhow::anyhow!("publication backlog metrics endpoint unavailable")),
-                        };
-                        Ok::<_, anyhow::Error>((unix_time_ms_u64()?, result))
+                        timeout_ms
                     };
                     let guard_reading = async {
                         match (&mut guard, &backlog_scraper) {
@@ -1259,9 +1279,10 @@ impl ResourceSampler {
                         }
                     };
                     let (resource_result, backlog_result, guard_result) = tokio::join!(
-                        tokio::time::timeout(Duration::from_millis(timeout_ms), sample),
-                        tokio::time::timeout(Duration::from_millis(timeout_ms), backlog_sample),
-                        tokio::time::timeout(Duration::from_millis(timeout_ms), guard_reading),
+                        tokio::time::timeout(Duration::from_millis(other_timeout_ms), sample),
+                        bounded_publication_backlog_scrape(backlog_scraper.as_ref(),
+                            request_anchor + Duration::from_millis(timeout_ms)),
+                        tokio::time::timeout(Duration::from_millis(other_timeout_ms), guard_reading),
                     );
                     match resource_result {
                         Ok(Ok(Some(metrics))) => {
@@ -1282,7 +1303,7 @@ impl ResourceSampler {
                         }
                     }
                     let (request_end_unix_ms, backlog_result) = match backlog_result {
-                        Ok(Ok((request_end, result))) => (request_end, result),
+                        Ok((request_end, result)) => (request_end, result),
                         _ => (unix_time_ms_u64()?, Err(anyhow::anyhow!("publication backlog scrape exceeded its bounded deadline"))),
                     };
                     let backlog_sample = match backlog_result {
@@ -1566,6 +1587,49 @@ mod measurement_evidence_tests {
              arrowcol_publication_backlog_oldest_age_seconds {age}\n\
              arrowcol_publication_backlog_status{{status=\"{status}\"}} 1\n"
         )
+    }
+
+    #[tokio::test]
+    async fn backlog_scrape_honors_the_actual_remaining_window_deadline() -> Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        assert_eq!(publication_backlog_timeout_ms(1_000, 1_000, 10_000), 3_000);
+        assert_eq!(publication_backlog_timeout_ms(9_000, 1_000, 10_000), 1_000);
+        assert_eq!(publication_backlog_timeout_ms(10_000, 1_000, 10_000), 3_000);
+        for delay in [10_u64, 500] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let address = listener.local_addr()?;
+            let body = publication_backlog_exposition(1, "2", "7", "256", "1.25", "available");
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await?;
+                let mut request = [0; 1024];
+                if stream.read(&mut request).await? == 0 {
+                    return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+                }
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+                stream.write_all(response.as_bytes()).await
+            });
+            let scraper = PublicationBacklogScraper {
+                endpoint: format!("http://{address}/metrics"),
+                _tunnel: None,
+                client: reqwest::Client::builder().timeout(PUBLICATION_BACKLOG_REQUEST_TIMEOUT).build()?,
+            };
+            let anchor = tokio::time::Instant::now();
+            let request_start = unix_time_ms_u64()?;
+            let budget = publication_backlog_timeout_ms(request_start, request_start, request_start + 200);
+            let result = bounded_publication_backlog_scrape(Some(&scraper), anchor + Duration::from_millis(budget)).await;
+            if delay < budget {
+                let (request_end, metrics) = result?;
+                assert!(request_end <= request_start + budget);
+                assert_eq!(metrics?.rows, Some(7));
+                server.await??;
+            } else {
+                assert!(result.is_err());
+                server.abort();
+            }
+        }
+        Ok(())
     }
 
     #[test]
