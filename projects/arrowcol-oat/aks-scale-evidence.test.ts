@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { test, type TestContext } from 'node:test';
 import { Azure, Config, canonical_json } from '../../infra/azure/bootstrap.js';
-import { newCampaignState, type CampaignStore, type RunInventory } from './aks-campaign.js';
+import { createBlobCampaignStore, newCampaignState, type CampaignStore, type RunInventory } from './aks-campaign.js';
 import { createScaleEvidenceVerifier, readBoundedSourceBytes, readOfficialCellMeasurement, readOfficialKustoWindow,
   readOfficialNativeWindow } from './aks-scale-evidence.js';
 import type { ScaleMeasurementEnvelope } from './aks-scale.js';
@@ -85,6 +85,66 @@ function syntheticAuthenticatedTransport(t: TestContext, supplied?: Uint8Array, 
     },
     failStatus: () => { status = 403; }, wrongEtag: () => { returnedEtag = '"forged"'; }, fence: () => { changed = true; } };
 }
+
+test('official reader caps actual custody transport before and after the immutable object under its original deadline', async t => {
+  for (const defect of ['none', 'initial-overflow', 'final-overflow', 'blocked-final', 'changed-custody'] as const) {
+    await t.test(defect, async t => {
+      const f = syntheticAuthenticatedTransport(t);
+      let clock = now, afterObjectReads = 0, pulls = 0, cancelled = false;
+      t.mock.method(Date, 'now', () => clock);
+      f.options.now = () => clock;
+      f.options.deadlineAtMs = now + 100;
+      const artifactFetch = f.options.fetcher;
+      f.options.fetcher = async (input, init) => {
+        const response = await artifactFetch(input, init);
+        clock += 50;
+        return response;
+      };
+      if (defect === 'changed-custody') f.fence();
+      const fetchCustody: typeof fetch = async (input, init) => {
+        const afterObject = f.counts().reads > 0;
+        if (afterObject) afterObjectReads++;
+        assert.equal(new URL(String(input)).pathname, '/' + f.options.azure.c.checkpoints + '/active.json');
+        assert.equal(new Headers(init?.headers).get('authorization'), 'Bearer synthetic-offline-token');
+        assert.ok(init?.signal, 'the actual custody transport must receive the original deadline signal');
+        if (defect === 'initial-overflow' || defect === 'final-overflow' && afterObject)
+          return new Response(new ReadableStream<Uint8Array>({
+            pull(controller) {
+              assert.ok(++pulls <= 2, 'overflow must cancel before a third chunk is requested');
+              controller.enqueue(new Uint8Array(2_097_153));
+            },
+            cancel() { cancelled = true; },
+          }, { highWaterMark: 0 }), { headers: { etag: '"synthetic-custody"' } });
+        if (defect === 'blocked-final' && afterObject)
+          return new Response(new ReadableStream<Uint8Array>({ cancel() { cancelled = true; } }),
+            { headers: { etag: '"synthetic-custody"' } });
+        return new Response(JSON.stringify(f.state), { headers: { etag: '"synthetic-custody"' } });
+      };
+      const store = createBlobCampaignStore({ account: f.options.azure.c.account,
+        container: f.options.azure.c.checkpoints, subscriptionId: campaignId }, fetchCustody,
+      resource => f.options.azure.token(resource));
+      const read = store.read.bind(store);
+      store.read = options => {
+        assert.deepEqual(options, { maxResponseBodyBytes: 4_194_304, deadlineUnixMs: now + 100 });
+        return read(options);
+      };
+      f.options.store = store;
+      const keepAlive = setTimeout(() => {}, 1000);
+      try {
+        if (defect === 'none') {
+          assert.equal((await readOfficialCellMeasurement(f.options)).committedRowsPerSecond, 1234);
+          assert.equal(afterObjectReads, 1);
+        } else {
+          await assert.rejects(readOfficialCellMeasurement(f.options),
+            defect.includes('overflow') ? /byte cap/ : defect === 'blocked-final' ? /original deadline/ : /fenc|inventory|custody/i);
+          if (defect !== 'changed-custody') assert.equal(cancelled, true);
+          if (defect.includes('overflow')) assert.equal(pulls, 2);
+          assert.equal(f.counts().reads, defect === 'initial-overflow' ? 0 : 1);
+        }
+      } finally { clearTimeout(keepAlive); }
+    });
+  }
+});
 
 function syntheticNativeTransport(t: TestContext) {
   const f = syntheticAuthenticatedTransport(t), start = now - 60_000, end = now - 30_000;

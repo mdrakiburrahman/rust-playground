@@ -66,7 +66,8 @@ function assertSourceDeadline(options: SourceOptions) {
 }
 async function currentMeasurementState(options: SourceOptions): Promise<CampaignState> {
   assertSourceDeadline(options);
-  const state = (await options.store.read())?.state, now = (options.now ?? Date.now)(), token = options.token;
+  const state = (await options.store.read({ maxResponseBodyBytes: MAX_SOURCE_BYTES,
+    deadlineUnixMs: options.deadlineAtMs }))?.state, now = (options.now ?? Date.now)(), token = options.token;
   assertSourceDeadline(options);
   if (!state || state.status !== 'active' || state.mode !== 'armed' || state.ownerId !== token.ownerId ||
       state.fencingToken !== token.fencingToken || now < state.heartbeatAtMs || now >= state.expiresAtMs ||
