@@ -6,6 +6,7 @@ import { CampaignConflictError, CampaignWriteOutcomeUnknownError, CUSTODY_CLEANU
  import { captureCellBaseline, captureTerminalData, observeDataPreservation } from './aks-data-safety.js';
 import type { CleanupMutationAuthority } from './aks-cleanup-executor.js';
 import { createDefaultCleanupProviders } from './aks-default-providers.js';
+import { PLANNED_CONTROL_OPERATION_IDS, PLANNED_STORAGE_OPERATION_IDS, type OwnedRunTablePlan } from './aks-d47-bridge.js';
 
 const campaignId = '11111111-1111-4111-8111-111111111111';
 const ownerId = '22222222-2222-4222-8222-222222222222';
@@ -72,6 +73,68 @@ function fixture(t: TestContext) {
     change: (update: Partial<CampaignState>) => { state = { ...state, ...update }; },
     inventory, deny: () => { denyStorage = true; }, lose: () => { loseWrite = true; } };
 }
+function ownedRunTableReceipt(azure: Azure, deadline: number): { plan: OwnedRunTablePlan; parent: Record<string, unknown> } {
+  const generation = '44444444-4444-4444-8444-444444444444', publisher = '55555555-5555-4555-8555-555555555555';
+  const leases: [string, string] = ['66666666-6666-4666-8666-666666666666', '77777777-7777-4777-8777-777777777777'];
+  const tableId = '88888888-8888-4888-8888-888888888888', txnId = '99999999-9999-4999-8999-999999999999';
+  const relative = 'dataflow/telemetry/sqlserver/sqlserver_availability_replica_states/';
+  const campaignRoot = 'abfss://' + azure.c.checkpoints + '@' + azure.c.account + '.dfs.core.windows.net/campaigns/' + campaignId + '/';
+  const runRoot = campaignRoot + 'runs/' + cellId + '/';
+  const timestamp = Date.now(), createdTime = timestamp - 1;
+  const schema = JSON.stringify({ type: 'struct', fields: [{ name: '__arrowcol_ingestion', type: 'string', nullable: false, metadata: {} }],
+    nullable: false, metadata: {} });
+  const body = [
+    { commitInfo: { engineInfo: 'offline', kernelVersion: 'v0.29.0', operation: 'CREATE TABLE', operationParameters: {}, timestamp, txnId } },
+    { protocol: { minReaderVersion: 3, minWriterVersion: 7, readerFeatures: [], writerFeatures: ['invariants'] } },
+    { metaData: { configuration: {}, createdTime, format: { provider: 'parquet', options: {} }, id: tableId,
+      partitionColumns: ['__arrowcol_ingestion'], schemaString: schema } },
+  ].map(action => JSON.stringify(action)).join('\n') + '\n';
+  const plan: OwnedRunTablePlan = { account: azure.c.account, container: azure.c.checkpoints, campaign_root: campaignRoot, run_root: runRoot,
+    campaign_id: campaignId, run_id: cellId, generation, publisher_id: publisher, control_lease_ids: leases,
+    control_operation_ids: [...PLANNED_CONTROL_OPERATION_IDS], storage_operation_ids: [...PLANNED_STORAGE_OPERATION_IDS],
+    table: 'telemetry.sqlserver.sqlserver_availability_replica_states', partition_by_ingestion_date: true, owner_id: ownerId,
+    fencing_token: 1, delta_v0: { body, body_sha256: createHash('sha256').update(body).digest('hex'), timestamp, txn_id: txnId,
+      table_id: tableId, created_time: createdTime } };
+  const authority = { campaign_id: campaignId, cell_run_id: cellId, owner_id: ownerId, fencing_token: 1,
+    storage_account: azure.c.account, table_root_url: new URL(relative, runRoot).href,
+    control_container_url: 'https://' + azure.c.account + '.blob.core.windows.net/' + azure.c.checkpoints,
+    sandbox_id: azure.c.sandbox, reset_generation: generation };
+  const delta = { table_id: tableId, version: 0, schema_json: schema, partition_columns: ['__arrowcol_ingestion'], active_files: 0 };
+  return { plan, parent: { schema_version: 1, kind: 'owned_run_table_parent_receipt',
+    artifact_identity: { source_commit: 'acd49e82bd4ba6e053ddf4bd641407b35fa65ba5',
+      executable_sha256: 'c02241f65bc8ed3b204a0ab5d082cad853f02a0fa725a445356d85c9de2e5e98' }, exchange_count: 1,
+    bridge_receipt: { schema_version: 1, kind: 'owned_run_table_receipt', authority, original_deadline_unix_ms: deadline,
+      receipt: { allocation: plan, delta, publisher_drained: true } } } };
+}
+
+test('producer no-load preservation accepts only the pinned fresh zero-file table and persisted absence receipts', async t => {
+  const f = fixture(t), now = Date.now(), namespace = f.inventory.namespace.name;
+  const deadline = Math.min(f.state.expiresAtMs, now + 60_000), owned = ownedRunTableReceipt(f.azure, deadline);
+  const step = { state: 'complete' as const, deadline_unix_ms: deadline, reason_code: null };
+  const ficPlan = { version: 1, runId: cellId, namespace, serviceAccount: 'fixture-sa',
+    identityId: f.azure.c.identity_id, resourceId: f.azure.c.identity_id + '/federatedIdentityCredentials/arrowcol-run-' + cellId,
+    clientId: ownerId, tenantId: ownerId, aksId: f.azure.c.base + '/providers/Microsoft.ContainerService/managedClusters/' + f.azure.c.cluster,
+    server: 'https://fixture.example', credentialName: 'arrowcol-run-' + cellId, issuer: 'https://issuer.example',
+    subject: 'system:serviceaccount:' + namespace + ':fixture-sa', audience: 'api://AzureADTokenExchange' } satisfies NonNullable<RunInventory['fic']>['plan'];
+  const fic: NonNullable<RunInventory['fic']> = { resource_id: ficPlan.resourceId, name: ficPlan.credentialName,
+    state: 'absent', absence: { resource_id: ficPlan.resourceId, name: ficPlan.credentialName, observed_at_unix_ms: now }, plan: ficPlan };
+  const resource = { api_version: 'apps/v1', kind: 'Deployment', namespace, name: 'arrowcol', uid: null, role: 'collector' as const,
+    state: 'absent' as const, absence: { api_version: 'apps/v1', kind: 'Deployment', namespace, name: 'arrowcol',
+      namespace_uid: cellId, observed_at_unix_ms: now } };
+  const resources: RunInventory['resources'] = [resource];
+  const inventory: RunInventory = { ...f.inventory, qap: null, namespace: { ...f.inventory.namespace, uid: cellId }, resources,
+    evidence_destination: { account: f.azure.c.account, container: f.azure.c.checkpoints, blob_prefix: 'campaign/' + cellId },
+    owned_run_table_initialization: owned.parent, fic, cleanup: { ...f.inventory.cleanup, bounded_drain: step } };
+  const authority: CleanupMutationAuthority = { mode: 'producer', campaignId, ownerId, fencingToken: 1, assertCurrent: async () => {} };
+  f.change({ runInventory: { ...inventory, resources: [{ ...resources[0]!, absence: null }] } });
+  await assert.rejects(observeDataPreservation(f.store, f.azure, f.state, authority), /persisted inventory.*absence/);
+  f.change({ runInventory: inventory });
+  const proof = await observeDataPreservation(f.store, f.azure, f.state, authority);
+  assert.equal(proof.status, 'preserved');
+  assert.equal(proof.delta.reason, 'owned_run_table_empty_no_load');
+  assert.deepEqual(proof.owned_run_table_initialization, owned.parent);
+});
+
 test('qap-null producer preservation refuses without the owned Delta receipt and persisted absence proofs', async t => {
   const f = fixture(t), namespace = f.inventory.namespace.name;
   const ficPlan = { version: 1, runId: cellId, namespace, serviceAccount: 'fixture-sa',

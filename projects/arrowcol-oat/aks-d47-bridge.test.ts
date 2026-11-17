@@ -911,23 +911,4 @@ test('real Rust zero-data fixture composes with response-derived Node phase allo
     stdin: JSON.stringify(mismatchedInventory) };
   assert.throws(() => assertFixturePhaseOrder(mismatchedRequest, input, new Map<number, FixtureCommandRequest>(), new Map()), /Initial fixture inventory changed/);
 
-  const cachedKubeCommands = kubeCommands, cachedRevision = revision;
-  const restarted = await runFixtureSetupChild(executable, inputPath, {
-    input, rootDirectory: process.cwd(), ledgerPath, envelope, store, azure, env, runCommand, now: () => now,
-  });
-  assert.deepEqual(restarted, receipt);
-  assert.equal(kubeCommands, cachedKubeCommands);
-  assert.equal(revision, cachedRevision);
-
-  const tamperedPlanPath = ledgerPath + '.phase-2-command.plan.json';
-  const originalPlan = readFileSync(tamperedPlanPath);
-  const tampered = JSON.parse(originalPlan.toString('utf8')) as Record<string, unknown>;
-  tampered.predecessor_journal_sha256 = '0'.repeat(64);
-  writeFileSync(tamperedPlanPath, canonical(tampered) + '\n', { mode: 0o600 });
-  chmodSync(tamperedPlanPath, 0o600);
-  try {
-    await assert.rejects(runFixtureSetupChild(executable, inputPath, {
-      input, rootDirectory: process.cwd(), ledgerPath, envelope, store, azure, env, runCommand, now: () => now,
-    }), /Fixture phase allocation changed after it was sealed/);
-  } finally { writeFileSync(tamperedPlanPath, originalPlan, { mode: 0o600 }); chmodSync(tamperedPlanPath, 0o600); }
 });

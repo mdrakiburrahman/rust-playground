@@ -1638,9 +1638,6 @@ export async function initializeOwnedRunTable(options: OwnedRunInitializerOption
     validateOwnedRunParentReceipt(cached, artifactIdentity, plan, authority, deadline, dispatcher.recordedRequestCount);
     dispatcher.assertDeltaCommitReadback(cached.bridge_receipt.receipt.delta, plan);
     dispatcher.assertPlannedStorageOperationsComplete();
-    const current = await options.store.read();
-    if (!current?.state.runInventory || JSON.stringify(current.state.runInventory.owned_run_table_initialization) !== JSON.stringify(cached))
-      throw new Error('Cached owned-run receipt lacks its original guarded RunInventory persistence; refusing replay.');
     return cached;
   }
   assertBridgeLive(options.envelope, deadline, now);
@@ -1659,19 +1656,31 @@ export async function initializeOwnedRunTable(options: OwnedRunInitializerOption
     artifact_identity: artifactIdentity, exchange_count: child.exchangeCount, bridge_receipt: child.receipt };
   validateOwnedRunParentReceipt(result, artifactIdentity, plan, authority, deadline, dispatcher.recordedRequestCount);
   dispatcher.recordTerminalEvidence(result);
-  const current = await options.store.read();
-  const inventory = current?.state.runInventory;
-  if (!current || current.state.status !== 'active' || !inventory || inventory.campaign_id !== plan.campaign_id ||
-      inventory.cell_run_id !== plan.run_id || inventory.owner_id !== plan.owner_id || inventory.fencing_token !== plan.fencing_token ||
-      inventory.load_admission !== 'not_authorized' || inventory.owned_run_table_initialization !== undefined || now() >= deadline)
-    throw new Error('Owned-run no-load receipt cannot be persisted outside its exact active not_authorized cell.');
-  const updated = { ...inventory, owned_run_table_initialization: result };
-  await compareAndSwapRunInventory(options.store, current, updated, async () => {
-    const latest = await options.store.read();
-    if (!latest || latest.state.status !== 'active' || latest.state.campaignId !== plan.campaign_id ||
-        latest.state.ownerId !== plan.owner_id || latest.state.fencingToken !== plan.fencing_token ||
-        latest.state.runInventory?.cell_run_id !== plan.run_id || latest.state.runInventory?.load_admission !== 'not_authorized' ||
-        now() >= deadline) throw new Error('Owned-run receipt RunInventory CAS authority or original deadline changed.');
-  });
   return result;
+}
+export async function persistOwnedRunTableInitialization(store: CampaignStore, expected: StoredCampaign,
+  planValue: unknown, parentValue: unknown, authorityValue: unknown, originalDeadlineUnixMs: number,
+  assertCurrent: () => Promise<void>): Promise<StoredCampaign> {
+  validateOwnedRunTablePlan(planValue);
+  const bridgeInput = { authority: authorityValue, original_deadline_unix_ms: originalDeadlineUnixMs };
+  validateOwnedRunBridgeInput(bridgeInput, planValue, Date.now());
+  const plan = planValue, authority = bridgeInput.authority;
+  if (expected.state.status !== 'active' || !expected.state.runInventory ||
+      expected.state.runInventory.campaign_id !== plan.campaign_id || expected.state.runInventory.cell_run_id !== plan.run_id ||
+      expected.state.runInventory.owner_id !== plan.owner_id || expected.state.runInventory.fencing_token !== plan.fencing_token ||
+      expected.state.runInventory.load_admission !== 'not_authorized' || originalDeadlineUnixMs <= expected.state.startedAtMs ||
+      originalDeadlineUnixMs > expected.state.expiresAtMs)
+    throw new Error('Owned-run receipt persistence requires the exact active not_authorized cell and original deadline.');
+  if (!object(parentValue) || !Number.isSafeInteger(parentValue.exchange_count) || Number(parentValue.exchange_count) < 1)
+    throw new Error('Owned-run receipt persistence requires the exact completed bridge parent response.');
+  validateOwnedRunParentReceipt(parentValue, APPROVED_OWNED_RUN_BUILD_RECEIPT, plan, authority, originalDeadlineUnixMs,
+    Number(parentValue.exchange_count));
+  const previous = expected.state.runInventory.owned_run_table_initialization;
+  if (previous !== undefined) {
+    if (!equal(previous, parentValue)) throw new Error('A different owned-run receipt is already persisted for this cell.');
+    await assertCurrent();
+    return expected;
+  }
+  return compareAndSwapRunInventory(store, expected,
+    { ...expected.state.runInventory, owned_run_table_initialization: parentValue }, assertCurrent);
 }
