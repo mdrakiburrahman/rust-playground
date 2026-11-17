@@ -7095,6 +7095,17 @@ fn local_client_image(rendered: &Value) -> Result<&str> {
         .context("effective local OAT client image missing or invalid")
 }
 
+fn local_client_image_id(image: &str) -> Result<&str> {
+    let image = image.trim();
+    if !image
+        .strip_prefix("sha256:")
+        .is_some_and(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
+        bail!("local OAT client image did not resolve to an immutable Docker content ID");
+    }
+    Ok(image)
+}
+
 async fn resolve_local_client_image(config: &OatConfig, platform: &LocalPlatform) -> Result<String> {
     let compose_file = config
         .platform
@@ -7134,14 +7145,7 @@ async fn resolve_local_client_image(config: &OatConfig, platform: &LocalPlatform
             .await?
             .stdout,
     )?;
-    let image = image.trim();
-    if !image
-        .strip_prefix("sha256:")
-        .is_some_and(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
-    {
-        bail!("local OAT client image did not resolve to an immutable Docker content ID");
-    }
-    Ok(image.to_owned())
+    Ok(local_client_image_id(&image)?.to_owned())
 }
 
 async fn verify_local_bind_mount(config: &OatConfig, platform: &LocalPlatform) -> Result<()> {
@@ -13053,6 +13057,15 @@ mod tests {
             serde_json::json!({"services": {"oat-client": {"image": "not valid"}}}),
         ] {
             assert!(super::local_client_image(&invalid).is_err());
+        }
+        let valid_id = format!("sha256:{}", "a".repeat(64));
+        assert_eq!(super::local_client_image_id(&format!("{valid_id}\n"))?, valid_id);
+        for invalid in [
+            String::from("arrowcol-oat-client:local"),
+            String::from("sha256:1234"),
+            format!("sha256:{}", "g".repeat(64)),
+        ] {
+            assert!(super::local_client_image_id(&invalid).is_err());
         }
         Ok(())
     }
