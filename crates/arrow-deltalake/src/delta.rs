@@ -2277,6 +2277,9 @@ pub struct FreshTableCommitPlan {
 
 impl FreshTableCommitPlan {
     /// Validate the complete plan before any publisher admission or storage effect.
+    ///
+    /// # Errors
+    /// Returns an error when the body, digest, generated values, or action shape is invalid.
     pub fn validate(&self) -> Result<()> {
         if self.body.len() > 1024 * 1024 || !self.body.ends_with('\n') {
             bail!("planned Delta version-zero body is missing, oversized or not newline-terminated");
@@ -2753,6 +2756,9 @@ impl DeltaTable {
     }
 
     /// Create a fresh schema whose exact version-zero bytes were captured before envelope creation.
+    ///
+    /// # Errors
+    /// Returns an error when the plan, schema creation, or commit fails validation.
     pub fn initialize_fresh_url_with_planned_session(
         url: Url,
         schema: SchemaRef,
@@ -3009,7 +3015,7 @@ impl DeltaTable {
         schema: SchemaRef,
         partition_columns: Vec<String>,
     ) -> Result<FreshTableCommitPlan> {
-        let store = Arc::new(object_store::memory::InMemory::new());
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
         let table = Self::open_connection_with_store(url, partition_columns, None, None, Some(Arc::clone(&store)), true)?;
         let stage = table.root.clone();
         let capture = (|| {
