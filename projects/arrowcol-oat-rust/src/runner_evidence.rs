@@ -61,6 +61,9 @@ fn validate_official_measurement_reference(inventory: &RunInventory) -> Result<(
 fn official_measurement_bytes(
     inventory: &RunInventory, config: &OatConfig, rows: &[OatResult], submitted: Option<&SubmittedConfigIdentity>,
 ) -> Result<Vec<u8>> {
+    if config.campaign_profile == Some(crate::config::CampaignProfile::ScaleOutSingleTable) {
+        bail!("exploratory scale-out evidence is not custody-qualified");
+    }
     let [row] = rows else { bail!("official campaign measurement requires exactly one original hot-table result") };
     let tunables: Value = serde_json::from_str(&row.tunables_json)?;
     if row.run_id != inventory.cell_run_id
@@ -155,7 +158,8 @@ async fn publish_campaign_official_measurement(
     submitted: Option<&SubmittedConfigIdentity>,
     deadline: tokio::time::Instant,
 ) -> Result<()> {
-    if config.campaign_profile.is_none() {
+    if config.campaign_profile.is_none()
+        || config.campaign_profile == Some(crate::config::CampaignProfile::ScaleOutSingleTable) {
         return Ok(());
     }
     require_lifecycle_remaining(
@@ -322,6 +326,9 @@ mod official_cell_measurement_tests {
         config.schedule_lead_seconds += 1;
         let changed: Value = serde_json::from_slice(&official_measurement_bytes(&inventory, &config, &rows, None)?)?;
         assert_ne!(payload["effective_config_sha256"], changed["effective_config_sha256"]);
+        config.campaign_profile = Some(crate::config::CampaignProfile::ScaleOutSingleTable);
+        assert!(official_measurement_bytes(&inventory, &config, &rows, None).is_err());
+        config.campaign_profile = Some(crate::config::CampaignProfile::SingleHotTable);
         let mut wrong = inventory;
         wrong.cell_run_id = "c0ffee00-0000-4000-8000-000000000099".to_owned();
         assert!(official_measurement_bytes(&wrong, &config, &rows, None).is_err());
@@ -356,6 +363,19 @@ mod official_cell_measurement_tests {
         assert!(publish_immutable_official_bytes(store, &path, &vec![0; OFFICIAL_MEASUREMENT_MAX_BYTES + 1]).await.is_err());
         Ok(())
     }
+}
+
+fn mark_scale_out_exploratory_evidence(evidence: &mut Value) {
+    let count_bounds = evidence["reconciliation"].take();
+    evidence["campaign"] = json!({
+        "label": "D53 exploratory / ScaleOutSingleTable",
+        "custody_qualified": false,
+    });
+    evidence["reconciliation"] = json!({
+        "status": "unavailable",
+        "reason": "exact_active_snapshot_identity_reconciliation_not_implemented",
+        "count_bounds_diagnostic_only": count_bounds,
+    });
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize)]
@@ -1894,6 +1914,12 @@ mod measurement_evidence_tests {
         assert_eq!(reconciliation["status"], "within_bound");
         assert_eq!(reconciliation["exact_match_required"], true);
         assert_eq!(reconciliation["exact_match"], true);
+        let mut exploratory = evidence.for_table("table", None);
+        mark_scale_out_exploratory_evidence(&mut exploratory);
+        assert_eq!(exploratory["campaign"]["label"], "D53 exploratory / ScaleOutSingleTable");
+        assert_eq!(exploratory["campaign"]["custody_qualified"], false);
+        assert_eq!(exploratory["reconciliation"]["status"], "unavailable");
+        assert_eq!(exploratory["reconciliation"]["count_bounds_diagnostic_only"]["exact_match"], true);
 
         evidence.client_reports.insert("table".to_owned(), vec![json!({
             "phase_counters": {"process_cumulative": {"completed_rows": 10, "ambiguous_rows": 2}}

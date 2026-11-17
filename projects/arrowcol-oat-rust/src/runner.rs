@@ -4190,7 +4190,7 @@ fn result_rows(
         "requested_durability_class": config.tunables.wal.as_ref().map(|_| config.tunables.durability_class()),
         "capabilities": capability_evidence(),
     });
-    let details = [
+    let mut details = [
         client_run.failure.clone(),
         client_run
             .pinning
@@ -4202,6 +4202,9 @@ fn result_rows(
     .into_iter()
     .flatten()
     .collect::<Vec<_>>();
+    if config.campaign_profile == Some(crate::config::CampaignProfile::ScaleOutSingleTable) {
+        details.push("exact_active_snapshot_identity_reconciliation_not_implemented".to_owned());
+    }
     let failure = (!details.is_empty()).then(|| details.join("; "));
     let pinning_ok = client_run.pinning.violation.is_none()
         && client_run.pinning.verification_error.is_none()
@@ -4260,6 +4263,9 @@ fn result_rows(
             tunables_json: serde_json::to_string(&table_tunables)?,
             evidence_json: {
                 let mut evidence = client_run.evidence.for_table(&table, client);
+                if config.campaign_profile == Some(crate::config::CampaignProfile::ScaleOutSingleTable) {
+                    mark_scale_out_exploratory_evidence(&mut evidence);
+                }
                 if let Some(resource_evidence) = &resource_evidence {
                     evidence["aks_resources"] = resource_evidence.clone();
                 }
