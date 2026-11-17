@@ -54,6 +54,12 @@ enable it on the peer. Unknown names (including `brotli`) fail parsing rather
 than falling back. Message limits apply to decompressed protobuf bytes;
 schema validation, authentication and bounded admission remain unchanged.
 
+`into_tonic_service()` returns a tonic `InterceptedService` around the generated
+server, not a bare `FlightServiceServer` builder. Set codecs in `RuntimeLimits`
+before conversion. The interceptor checks the original metadata budget before
+restricting response negotiation: tonic 0.14.6 otherwise selects any compiled
+codec advertised by the client, not only the configured send codec.
+
 ## Server implementation APIs
 
 Direct collector adapters implement:

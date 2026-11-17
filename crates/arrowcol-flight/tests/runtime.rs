@@ -162,7 +162,14 @@ async fn loopback_compression_negotiates_requests_and_responses_independently() 
 #[tokio::test]
 async fn loopback_compression_does_not_bypass_disabled_codec_or_decompressed_limits() -> Result<()> {
     for encoding in [CompressionEncoding::Gzip, CompressionEncoding::Zstd] {
-        for limit in ["disabled", "mismatch", "schema", "message", "metadata"] {
+        for limit in [
+            "disabled",
+            "mismatch",
+            "schema",
+            "message",
+            "metadata",
+            "negotiation_metadata",
+        ] {
             let fixture = Fixture::with_current(false).await?;
             let admission = MockAdmission::new(TestCompletion::BestEffort, None);
             let mut limits = RuntimeLimits::default();
@@ -183,16 +190,22 @@ async fn loopback_compression_does_not_bypass_disabled_codec_or_decompressed_lim
                     limits.max_message_bytes = 32;
                 }
                 "metadata" => limits.max_metadata_bytes = 1,
+                "negotiation_metadata" => {
+                    limits.max_metadata_bytes = 1024;
+                    limits.grpc_send_compression = Some(encoding);
+                }
                 _ => {}
             }
             let service = fixture.service_with_limits(ImplementationPool::Dataflow, admission.clone(), limits)?;
             let server = LoopbackFlight::start(service).await?;
-            let result = server
-                .client
-                .clone()
-                .send_compressed(encoding)
-                .do_put(wire_ingest_request(&fixture.v1).await?)
-                .await;
+            let mut request = wire_ingest_request(&fixture.v1).await?;
+            if limit == "negotiation_metadata" {
+                request.metadata_mut().insert(
+                    "grpc-accept-encoding",
+                    MetadataValue::try_from(format!("{},gzip,zstd", "unknown,".repeat(256)))?,
+                );
+            }
+            let result = server.client.clone().send_compressed(encoding).do_put(request).await;
             let error = match result {
                 Err(error) => error,
                 Ok(response) => response
