@@ -259,7 +259,8 @@ mod official_cell_measurement_tests {
             assert_eq!(fixture_sha256(raw.as_bytes()), server_sha);
             let submitted: OatConfig = serde_json::from_str(raw)?;
             submitted.validate()?;
-            let (config, inventory, rows) = original_measurement_for_config(submitted, id)?;
+            let (config, inventory, mut rows) = original_measurement_for_config(submitted, id)?;
+            rows[0].git_sha = std::env::var("GIT_SHA").unwrap_or_else(|_| "unknown".to_owned());
             let state = AppState::default();
             assert!(capture_submitted_config_identity(&state, id).await.is_none());
             state.runs.lock().await.insert(id.to_owned(), crate::model::RunStatus {
