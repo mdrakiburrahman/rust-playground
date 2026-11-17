@@ -3,13 +3,14 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 import { Azure, canonical_json } from '../../infra/azure/bootstrap.js';
-import { EffectBoundary, readEffectEnvelope, ResponseWithholdingSupervisor, withEffectBoundary,
+import { EffectBoundary, isResponseWithholdingTargetSupported, readEffectEnvelope, ResponseWithholdingSupervisor, withEffectBoundary,
   type ResponseWithholdingTarget } from '../../infra/azure/effect-boundary.js';
 import { loadCustodyConfig } from './aks-custody-config.js';
 import { assertCampaignEnvironment, createBlobCampaignStore, campaignMain, validateInitialRunInventory,
   type CampaignStore } from './aks-campaign.js';
 import { CELL_CLEANUP_SELECTORS } from './aks-cell-cleanup.js';
 import { watchdogOnce } from './aks-watchdog.js';
+const MAX_RESPONSE_WITHHOLDING_RECEIPT_BYTES = 4_194_304;
 
 export interface BoundedEffectRehearsalDependencies {
   store?: CampaignStore;
@@ -127,6 +128,8 @@ function readResponseWithholdingPlan(filename: string, envelope: ReturnType<type
   const typedTarget: ResponseWithholdingTarget = { transport: target.transport as ResponseWithholdingTarget['transport'],
     method: target.method, resource: target.resource, path: target.path,
     ...(typeof target.body_sha256 === 'string' ? { body_sha256: target.body_sha256 } : {}) };
+  if (!isResponseWithholdingTargetSupported(typedTarget))
+    throw new Error('Response-withholding target is not an allowed baseline PUT or exact UID/RV-tested stop PATCH.');
   const allocation = envelope.effects.find(effect => effect.transport === typedTarget.transport &&
     effect.method === typedTarget.method && effect.resource === typedTarget.resource && effect.path === typedTarget.path &&
     effect.body_sha256 === typedTarget.body_sha256);
@@ -150,12 +153,15 @@ function readResponseWithholdingPlan(filename: string, envelope: ReturnType<type
         processEvidence && (typeof evidence.returncode !== 'number' || !Number.isSafeInteger(evidence.returncode)) ||
         !processEvidence && (typeof evidence.status !== 'number' || !Number.isSafeInteger(evidence.status)))
       throw new Error('Response-withholding restart evidence does not bind the exact original effect response.');
+    let text: string;
+    try { text = fs.readFileSync(receiptFile, 'utf8'); }
+    catch (error) { throw new Error('Response-withholding restart cannot read the original effect receipt journal.', { cause: error }); }
+    if (Buffer.byteLength(text) > MAX_RESPONSE_WITHHOLDING_RECEIPT_BYTES)
+      throw new Error('Response-withholding restart effect receipt journal exceeds its bound.');
+    if (!text.endsWith('\n')) throw new Error('Response-withholding restart effect receipt journal is incomplete.');
     let rows: unknown[];
-    try {
-      const text = fs.readFileSync(receiptFile, 'utf8');
-      if (Buffer.byteLength(text) > MAX_OUTPUT || !text.endsWith('\n')) throw new Error();
-      rows = text.trimEnd().split('\n').map(line => JSON.parse(line) as unknown);
-    } catch { throw new Error('Response-withholding restart requires the original bounded effect receipt journal.'); }
+    try { rows = text.trimEnd().split('\n').map(line => JSON.parse(line) as unknown); }
+    catch (error) { throw new Error('Response-withholding restart effect receipt journal is malformed.', { cause: error }); }
     const matching = rows.filter(row => isObject(row) && row.event === 'result' && row.campaign_id === envelope.campaign_id &&
       row.run_id === envelope.run_id && row.transport === typedTarget.transport && row.method === typedTarget.method.toUpperCase() &&
       row.resource === typedTarget.resource && row.path === typedTarget.path &&

@@ -188,11 +188,29 @@ function supportedWithholdingTarget(target: ReceiptRequest): boolean {
   try {
     const argv: unknown = JSON.parse(target.path);
     if (!Array.isArray(argv) || argv.some(value => typeof value !== 'string')) return false;
-    const serialized = JSON.stringify(argv);
-    return argv.includes('patch') && argv.includes('--type=json') && serialized.includes('\"uid\"') &&
-      serialized.includes('\"resourceVersion\"') && serialized.includes('/spec/replicas');
+    const patchFlags = argv.flatMap((value, index) => value === '--patch' || value === '-p' ? [index] : []);
+    if (!argv.includes('patch') || !argv.includes('--type=json') || patchFlags.length !== 1) return false;
+    const patch = JSON.parse(argv[patchFlags[0]! + 1] as string) as unknown;
+    if (!Array.isArray(patch) || patch.length !== 3) return false;
+    const operation = (value: unknown, op: string, operationPath: string): value is Record<string, unknown> =>
+      value !== null && typeof value === 'object' && !Array.isArray(value) &&
+      Object.keys(value).sort().join(',') === 'op,path,value' &&
+      (value as Record<string, unknown>).op === op && (value as Record<string, unknown>).path === operationPath;
+    const uid = patch[0], resourceVersion = patch[1], stop = patch[2];
+    return operation(uid, 'test', '/metadata/uid') && typeof uid.value === 'string' && uid.value.length > 0 &&
+      operation(resourceVersion, 'test', '/metadata/resourceVersion') &&
+      typeof resourceVersion.value === 'string' && /^[1-9][0-9]*$/.test(resourceVersion.value) &&
+      (operation(stop, 'add', '/spec/replicas') && stop.value === 0 ||
+        operation(stop, 'add', '/spec/suspend') && stop.value === true);
   } catch { return false; }
 }
+export function isResponseWithholdingTargetSupported(target: ResponseWithholdingTarget): boolean {
+  try {
+    return supportedWithholdingTarget(parseReceiptRequest({ transport: target.transport, method: target.method,
+      resource: target.resource, path: target.path, ...(target.body_sha256 === undefined ? {} : { body_sha256: target.body_sha256 }) }));
+  } catch { return false; }
+}
+
 
 export class ResponseWithholdingSupervisor {
   private triggered = false;

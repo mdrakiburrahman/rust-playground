@@ -263,25 +263,32 @@ test('producer rehearsal dispatches an accepted underscore cleanup selector', as
   assert.equal(result, undefined);
 });
 
-test('watchdog rehearsal returns its actual custody evaluation', async t => {
 test('terminal-capture restart validates the original withheld PATCH and never forwards it twice', async t => {
   const directory = tempDir(); t.after(() => rmSync(directory, { recursive: true, force: true }));
   const state = createSyntheticArmedCampaignState(campaignId, runId);
   const fixture = writeRehearsalFixture(directory, runId, state.runInventory!.cell_run_id);
-  const argv = ['--context', 'fixture-context', '--server', 'https://kubernetes.example',
-    'patch', 'deployment', 'arrowcol', '--namespace', state.runInventory!.namespace.name, '--type=json', '-p',
+  const argv = ['--server', 'https://kubernetes.example', '--insecure-skip-tls-verify=false',
+    '--request-timeout', '10000ms', 'patch', 'deployment.apps', 'arrowcol',
+    '--namespace', state.runInventory!.namespace.name, '--type=json', '--patch',
     JSON.stringify([
       { op: 'test', path: '/metadata/uid', value: 'c0ffee00-0000-4000-8000-000000000004' },
       { op: 'test', path: '/metadata/resourceVersion', value: '17' },
-      { op: 'replace', path: '/spec/replicas', value: 0 },
+      { op: 'add', path: '/spec/replicas', value: 0 },
     ])];
   const effect = processEffectRequest(['kubectl', ...argv]);
-  writeFileSync(fixture.allocationPath, JSON.stringify(envelope([
-    rule('terminal-patch', effect.transport, effect.method, effect.resource, effect.path),
-  ])), { mode: 0o600 });
+  const invalidArgv = [...argv];
+  invalidArgv[invalidArgv.indexOf('--patch') + 1] = JSON.stringify([
+    { op: 'test', path: '/metadata/uid', value: 'c0ffee00-0000-4000-8000-000000000004' },
+    { op: 'add', path: '/spec/replicas', value: 0 },
+  ]);
+  assert.throws(() => new ResponseWithholdingSupervisor(campaignId, state.runInventory!.cell_run_id,
+    processEffectRequest(['kubectl', ...invalidArgv]), path.join(directory, 'invalid-evidence.json')), /UID\/RV-tested/);
+  const allocation = JSON.parse(readFileSync(fixture.allocationPath, 'utf8')) as EffectEnvelope;
+  allocation.effects = [rule('terminal-patch', effect.transport, effect.method, effect.resource, effect.path)];
+  writeFileSync(fixture.allocationPath, JSON.stringify(allocation), { mode: 0o600 });
   const evidencePath = path.join(directory, 'patch-response.json');
   const planPath = path.join(directory, 'withhold-plan.json');
-  writeFileSync(planPath, JSON.stringify({ schema_version: 1, campaign_id: campaignId, run_id: runId,
+  writeFileSync(planPath, JSON.stringify({ schema_version: 1, campaign_id: campaignId, run_id: state.runInventory!.cell_run_id,
     target: { transport: effect.transport, method: effect.method, resource: effect.resource, path: effect.path },
     evidence_file: path.basename(evidencePath) }), { mode: 0o600 });
   const args = ['--mode', 'producer-cleanup-step', '--selector', 'terminal_capture', '--env-file', fixture.envPath,
@@ -313,6 +320,7 @@ test('terminal-capture restart validates the original withheld PATCH and never f
   assert.equal(calls, 2);
   assert.equal(forwards, 1);
 });
+test('watchdog rehearsal returns its actual custody evaluation', async t => {
   const directory = tempDir(); t.after(() => rmSync(directory, { recursive: true, force: true }));
   const state = createSyntheticArmedCampaignState(campaignId, runId);
   const fixture = writeRehearsalFixture(directory, runId, state.runInventory!.cell_run_id);
