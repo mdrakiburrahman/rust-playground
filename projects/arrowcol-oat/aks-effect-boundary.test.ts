@@ -170,7 +170,7 @@ test('Azure REST and process adapters reject unallocated targets before transpor
   const directory = tempDir(); t.after(() => rmSync(directory, { recursive: true, force: true }));
   const resource = 'https://management.azure.com/';
   const url = 'https://management.azure.com/subscriptions/' + subscriptionId + '/resourceGroups/arrow-collector-rg?api-version=2024-10-01';
-  const request = rule('arm-get', 'azure-rest', 'GET', 'https://management.azure.com|' + resource,
+  const request = rule('arm-put', 'azure-rest', 'PUT', 'https://management.azure.com|' + resource,
     '/subscriptions/' + subscriptionId + '/resourceGroups/arrow-collector-rg?api-version=2024-10-01');
   const boundary = new EffectBoundary(envelope([request]), path.join(directory, 'effects.jsonl'));
   const config = new Config({ AZURE_SUBSCRIPTION_ID: subscriptionId, AZURE_RESOURCE_GROUP: 'rust-playground-schema-evo-test' }, 'schema-evolution');
@@ -179,7 +179,7 @@ test('Azure REST and process adapters reject unallocated targets before transpor
   let fetches = 0;
   t.mock.method(globalThis, 'fetch', async () => { fetches++; return new Response(null, { status: 200 }); });
   await withEffectBoundary(boundary, async () => {
-    await azure.request('GET', url, resource);
+    await azure.request('PUT', url, resource, '{"phase":"intent"}', {}, false, true);
     await assert.rejects(azure.request('GET', url + '&unexpected=true', resource), /refused before forwarding/);
     const command = ['kubectl', '--server', 'https://example.invalid', 'delete', 'namespace', 'unallocated'];
     await assert.rejects(runtime.run_tree(command, 1), /refused before forwarding/);
@@ -346,7 +346,7 @@ test('Azure REST response-body loss cannot replay a mutation on its retry path',
   const resource = 'https://management.azure.com/';
   const url = 'https://management.azure.com/subscriptions/' + subscriptionId +
     '/resourceGroups/arrow-collector-rg?api-version=2024-10-01';
-  const effect = rule('arm-get', 'azure-rest', 'GET', 'https://management.azure.com|' + resource,
+  const effect = rule('arm-put', 'azure-rest', 'PUT', 'https://management.azure.com|' + resource,
     '/subscriptions/' + subscriptionId + '/resourceGroups/arrow-collector-rg?api-version=2024-10-01', 3);
   const boundary = new EffectBoundary(envelope([effect]), path.join(directory, 'effects.jsonl'));
   const azure = new Azure(new Config({ AZURE_SUBSCRIPTION_ID: subscriptionId, AZURE_RESOURCE_GROUP: 'rust-playground-schema-evo-test' }, 'schema-evolution'));
@@ -358,8 +358,72 @@ test('Azure REST response-body loss cannot replay a mutation on its retry path',
     response.arrayBuffer = async () => { throw new Error('simulated response-body loss'); };
     return response;
   });
-  await assert.rejects(withEffectBoundary(boundary, () => azure.request('GET', url, resource)), EffectBoundaryRefused);
+  await assert.rejects(withEffectBoundary(boundary, () => azure.request('PUT', url, resource, '{"phase":"intent"}', {}, false, true)), EffectBoundaryRefused);
   assert.equal(fetches, 1);
   const rows = readFileSync(path.join(directory, 'effects.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
   assert.equal(rows.find(row => row.event === 'result')?.outcome, 'unknown_after_forward');
+});
+
+
+test('Azure REST HTTP 5xx cannot unlock a retrying mutation', async t => {
+  const directory = tempDir(); t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const resource = 'https://management.azure.com/';
+  const url = 'https://management.azure.com/subscriptions/' + subscriptionId +
+    '/resourceGroups/arrow-collector-rg?api-version=2024-10-01';
+  const effect = rule('arm-put', 'azure-rest', 'PUT', 'https://management.azure.com|' + resource,
+    '/subscriptions/' + subscriptionId + '/resourceGroups/arrow-collector-rg?api-version=2024-10-01', 3);
+  const receiptPath = path.join(directory, 'effects.jsonl');
+  const boundary = new EffectBoundary(envelope([effect]), receiptPath);
+  const azure = new Azure(new Config({ AZURE_SUBSCRIPTION_ID: subscriptionId, AZURE_RESOURCE_GROUP: 'rust-playground-schema-evo-test' }, 'schema-evolution'));
+  azure.tokens.set(resource, { at: runtime.now(), token: 'test-token', lifetime: 240 });
+  let fetches = 0;
+  t.mock.method(globalThis, 'fetch', async () => { fetches++; return new Response('server failed', { status: 500 }); });
+  await assert.rejects(withEffectBoundary(boundary, () => azure.request('PUT', url, resource, '{"phase":"intent"}', {}, false, true)),
+    EffectBoundaryRefused);
+  assert.equal(fetches, 1);
+  const rows = readFileSync(receiptPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+  assert.equal(rows.find(row => row.event === 'result')?.outcome, 'unknown_after_forward');
+  assert.equal(rows.find(row => row.event === 'result')?.status, 500);
+});
+
+test('nonzero process exits remain unresolved and cannot replay a command', async t => {
+  const directory = tempDir(); t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const command = ['node', '-e', 'process.exit(17)'];
+  const effect = rule('nonzero-command', 'process', 'PROCESS_NODE', 'node', JSON.stringify(command.slice(1)), 2);
+  const receiptPath = path.join(directory, 'effects.jsonl');
+  const boundary = new EffectBoundary(envelope([effect]), receiptPath);
+  await withEffectBoundary(boundary, async () => {
+    assert.equal((await runtime.run_tree(command, 5)).returncode, 17);
+    await assert.rejects(runtime.run_tree(command, 5), EffectBoundaryRefused);
+  });
+  const rows = readFileSync(receiptPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+  assert.equal(rows.find(row => row.event === 'result')?.outcome, 'unknown_after_forward');
+  assert.equal(rows.find(row => row.event === 'result')?.returncode, 17);
+});
+
+
+test('recovery rejects success receipts without transport acknowledgement or with prior errors', async t => {
+  const directory = tempDir(); t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const effect = rule('baseline-put', 'campaign-blob', 'PUT',
+    'https://arrowcollector68590.blob.core.windows.net/checkpoints', '/checkpoints/baseline.json');
+  const allocation = envelope([effect]);
+  const missingAckPath = path.join(directory, 'missing-ack.jsonl');
+  await withEffectBoundary(new EffectBoundary(allocation, missingAckPath), () => dispatchExternalEffect({
+    transport: effect.transport, method: effect.method, resource: effect.resource, path: effect.path,
+  }, async () => ({ status: 201 })));
+  const missingAckRows = readFileSync(missingAckPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+  const missingAckResult = missingAckRows.find(row => row.event === 'result');
+  delete missingAckResult.status;
+  missingAckResult.outcome = 'confirmed_success';
+  writeFileSync(missingAckPath, missingAckRows.map(row => JSON.stringify(row)).join('\n') + '\n', { mode: 0o600 });
+  assert.throws(() => new EffectBoundary(allocation, missingAckPath), /outcome does not match/);
+
+  const relabelledPath = path.join(directory, 'relabelled-error.jsonl');
+  await assert.rejects(withEffectBoundary(new EffectBoundary(allocation, relabelledPath), () => dispatchExternalEffect({
+    transport: effect.transport, method: effect.method, resource: effect.resource, path: effect.path,
+  }, async () => { throw new Error('acknowledgement lost'); })));
+  const relabelledRows = readFileSync(relabelledPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+  relabelledRows.find(row => row.event === 'result').outcome = 'confirmed_success';
+  writeFileSync(relabelledPath, relabelledRows.map(row => JSON.stringify(row)).join('\n') + '\n', { mode: 0o600 });
+  assert.throws(() => new EffectBoundary(allocation, relabelledPath), /outcome does not match/);
 });

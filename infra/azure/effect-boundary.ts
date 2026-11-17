@@ -236,12 +236,15 @@ export class EffectBoundary {
           if (!dispatched || dispatched.effect_id !== row.effect_id || !sameReceiptRequest(request, dispatched))
             throw new Error('Effect receipt journal result is unpaired or has changed request binding.');
           const outcome = row.outcome as EffectOutcome;
+          const confirmedAcknowledgement = request.transport === 'process' ?
+            row.status === undefined && row.returncode === 0 :
+            row.returncode === undefined && Number.isSafeInteger(row.status) &&
+              (row.status as number) >= 200 && (row.status as number) < 300;
           if (outcome === 'read_response' && !readMethods.has(request.method) ||
               (outcome === 'confirmed_success' || outcome === 'definite_no_effect') && readMethods.has(request.method) ||
-              outcome === 'confirmed_success' &&
-                (Number.isSafeInteger(row.status) && ((row.status as number) < 200 || (row.status as number) >= 300) ||
-                 Number.isSafeInteger(row.returncode) && row.returncode !== 0) ||
-              outcome === 'definite_no_effect' && row.status !== 412)
+              outcome === 'confirmed_success' && (!confirmedAcknowledgement || row.error_type !== undefined) ||
+              outcome === 'definite_no_effect' &&
+                (request.transport === 'process' || row.status !== 412 || row.returncode !== undefined || row.error_type !== undefined))
             throw new Error('Effect receipt result outcome does not match the recorded response.');
           this.pending.delete(row.dispatch_sequence as number);
           if (outcome === 'confirmed_success' || outcome === 'definite_no_effect')

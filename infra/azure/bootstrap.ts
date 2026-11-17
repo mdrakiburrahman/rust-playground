@@ -360,10 +360,11 @@ export class Azure {
           headers: { Authorization: 'Bearer ' + token, ...(resource === 'https://storage.azure.com/' ?
             { 'x-ms-date': new Date().toUTCString() } : {}), ...headers } });
         const bytes = Buffer.from(await received.arrayBuffer());
-        const responseHeaders = Object.fromEntries([...received.headers.entries()].filter(([name]) =>
+        const responseHeaders = Object.fromEntries(received.headers.entries());
+        const receiptHeaders = Object.fromEntries(Object.entries(responseHeaders).filter(([name]) =>
           ['x-ms-request-id', 'x-ms-correlation-request-id', 'x-ms-client-request-id',
             'x-ms-lease-id', 'x-ms-activity-id', 'etag', 'date'].includes(name)));
-        capture?.({ status: received.status, bodyBase64: bytes.toString('base64'), headers: responseHeaders });
+        capture?.({ status: received.status, bodyBase64: bytes.toString('base64'), headers: receiptHeaders });
         return { status: received.status, bytes, headers: responseHeaders };
       });
       if (missing_ok && response.status === 404) return [null, {}];
