@@ -941,12 +941,16 @@ mod tests {
                 context: &crate::delta::PublicationFenceContext<'_>,
             ) -> std::result::Result<(), PublicationFenceError> {
                 if context.file_count() > 0
-                    && let Some(entered) = self.entered.lock().expect("gate lock").take()
+                    && let Some(entered) = self
+                        .entered
+                        .lock()
+                        .map_err(|_| PublicationFenceError::check_failed("test entry gate poisoned"))?
+                        .take()
                 {
                     let _ = entered.send(());
                     self.release
                         .lock()
-                        .expect("gate lock")
+                        .map_err(|_| PublicationFenceError::check_failed("test release gate poisoned"))?
                         .recv_timeout(Duration::from_secs(10))
                         .map_err(|_| PublicationFenceError::check_failed("test gate was not released"))?;
                 }
