@@ -77,7 +77,7 @@ test('example stamp fits the default run, 32-table pilot, and documented E1-E5 p
   const E4 = experimentCounts.find((experiment) => experiment.name === 'E4');
   assert.ok(E4);
   const undersizedClientPools = stamp.aks.userPools.map((pool) =>
-    pool.role === 'client' ? { ...pool, maxPods: 30 } : pool);
+    pool.role === 'client' ? { ...pool, maxPods: 30, maxCount: 1 } : pool);
   assert.throws(() => assertExperimentPoolCapacity(undersizedClientPools, [E4]),
     /E4 requires 128 client pods.*only 0 combined workload slots.*raise aks\.userPools\[0\]\.maxPods to at least 160\./);
 });
@@ -86,7 +86,7 @@ test('capacity sums same-role pool slots before rejecting an experiment', async 
   const stamp = parseStampConfig(await readFile('infra/azure/stamp.example.yaml', 'utf8'));
   const E4 = experimentPoolPodCount('E4', { tables, clients_per_table: 4, replica_counts: [16] });
   const splitPools = stamp.aks.userPools.flatMap((pool) => pool.role === 'client'
-    ? [{ ...pool, name: `${pool.name}-a`, maxPods: 100 }, { ...pool, name: `${pool.name}-b`, maxPods: 100 }]
+    ? [{ ...pool, name: `${pool.name}-a`, maxPods: 100, maxCount: 1 }, { ...pool, name: `${pool.name}-b`, maxPods: 100, maxCount: 1 }]
     : [pool]);
   const firstClientPool = splitPools.find((pool) => pool.role === 'client');
   assert.ok(firstClientPool);
@@ -94,7 +94,7 @@ test('capacity sums same-role pool slots before rejecting an experiment', async 
   assert.throws(() => assertExperimentPoolCapacity(firstOnlyClientPools, [E4]), /only 68 combined workload slots/);
   assert.doesNotThrow(() => assertExperimentPoolCapacity(splitPools, [E4]));
   const insufficientPools = stamp.aks.userPools.flatMap((pool) => pool.role === 'client'
-    ? [{ ...pool, name: `${pool.name}-a`, maxPods: 60 }, { ...pool, name: `${pool.name}-b`, maxPods: 50 }]
+    ? [{ ...pool, name: `${pool.name}-a`, maxPods: 60, maxCount: 1 }, { ...pool, name: `${pool.name}-b`, maxPods: 50, maxCount: 1 }]
     : [pool]);
   assert.throws(() => assertExperimentPoolCapacity(insufficientPools, [E4]),
     /E4 requires 128 client pods.*only 46 combined workload slots.*raise aks\.userPools\[0\]\.maxPods to at least 142\./);
@@ -103,7 +103,7 @@ test('capacity sums same-role pool slots before rejecting an experiment', async 
 test('capacity recommendations use maxCount safely beyond the per-node pod limit', async () => {
   const stamp = parseStampConfig(await readFile('infra/azure/stamp.example.yaml', 'utf8'));
   const largeRun = experimentPoolPodCount('512-client-pod run', { tables, clients_per_table: 16, replica_counts: [1] });
-  const fullPods = stamp.aks.userPools.map((pool) => pool.role === 'client' ? { ...pool, maxPods: 250 } : pool);
+  const fullPods = stamp.aks.userPools.map((pool) => pool.role === 'client' ? { ...pool, maxPods: 250, maxCount: 1 } : pool);
   assert.throws(() => assertExperimentPoolCapacity(fullPods, [largeRun]),
     /512-client-pod run requires 512 client pods.*only 218 combined workload slots.*raise aks\.userPools\[0\]\.maxCount to at least 3 with maxPods=250\./);
 
