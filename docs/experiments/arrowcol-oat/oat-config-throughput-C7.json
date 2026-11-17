@@ -351,17 +351,183 @@
         }
       ],
       "candidate_limit": 4
+    },
+    {
+      "id": "input-read-strategy",
+      "factor": "tunables.maintenance.input_read_strategy",
+      "candidates": [
+        {
+          "id": "input-memory",
+          "overrides": {
+            "tunables": {
+              "maintenance": {
+                "input_read_strategy": "memory"
+              }
+            }
+          }
+        },
+        {
+          "id": "input-spool",
+          "overrides": {
+            "tunables": {
+              "maintenance": {
+                "input_read_strategy": "spool"
+              }
+            }
+          }
+        },
+        {
+          "id": "input-range",
+          "overrides": {
+            "tunables": {
+              "maintenance": {
+                "input_read_strategy": "range"
+              }
+            }
+          }
+        }
+      ],
+      "candidate_limit": 4
+    },
+    {
+      "id": "granularity",
+      "factor": "tunables.maintenance.granularity",
+      "candidates": [
+        {
+          "id": "granularity-minute",
+          "overrides": {
+            "tunables": {
+              "maintenance": {
+                "granularity": "minute"
+              }
+            }
+          }
+        },
+        {
+          "id": "granularity-hour",
+          "overrides": {
+            "tunables": {
+              "maintenance": {
+                "granularity": "hour"
+              }
+            }
+          }
+        },
+        {
+          "id": "granularity-day",
+          "overrides": {
+            "tunables": {
+              "maintenance": {
+                "granularity": "day"
+              }
+            }
+          }
+        }
+      ],
+      "candidate_limit": 4
+    },
+    {
+      "id": "optimize-upload-mode",
+      "factor": "tunables.maintenance.optimize_upload_mode",
+      "candidates": [
+        {
+          "id": "put-create",
+          "overrides": {
+            "tunables": {
+              "maintenance": {
+                "optimize_upload_mode": "put_create"
+              }
+            }
+          }
+        },
+        {
+          "id": "buffered-multipart",
+          "overrides": {
+            "tunables": {
+              "maintenance": {
+                "optimize_upload_mode": "buffered_multipart",
+                "optimize_upload_buffer_bytes": 8388608
+              }
+            }
+          },
+          "qualification": "exploratory"
+        }
+      ],
+      "candidate_limit": 4
     }
   ],
+  "source_enum_coverage": {
+    "input_read_strategy": {
+      "path": "tunables.maintenance.input_read_strategy",
+      "accepted": [
+        "memory",
+        "spool",
+        "range"
+      ],
+      "configured": [
+        "memory",
+        "spool",
+        "range"
+      ],
+      "excluded": {},
+      "pending": [],
+      "status": "config-screened-not-runtime-qualified"
+    },
+    "granularity": {
+      "path": "tunables.maintenance.granularity",
+      "accepted": [
+        "minute",
+        "hour",
+        "day"
+      ],
+      "configured": [
+        "minute",
+        "hour",
+        "day"
+      ],
+      "excluded": {},
+      "pending": [],
+      "status": "config-screened-not-runtime-qualified"
+    },
+    "optimize_upload_mode": {
+      "path": "tunables.maintenance.optimize_upload_mode",
+      "accepted": [
+        "put_create",
+        "buffered_multipart"
+      ],
+      "configured": [
+        "put_create",
+        "buffered_multipart"
+      ],
+      "excluded": {},
+      "pending": [],
+      "coupled_setting": "buffered_multipart candidate requests optimize_upload_buffer_bytes=8388608; source bounds are 4194304..67108864.",
+      "status": "config-screened-buffered-multipart-exploratory"
+    },
+    "operations": {
+      "path": "tunables.maintenance.operations",
+      "accepted": [
+        "purge",
+        "optimize",
+        "vacuum",
+        "checkpoint",
+        "prune_log"
+      ],
+      "configured": [
+        "optimize",
+        "purge",
+        "vacuum",
+        "checkpoint",
+        "prune_log"
+      ],
+      "excluded": {},
+      "pending": [],
+      "status": "fixed-campaign-invariant-never-varied"
+    }
+  },
   "runnable": false,
   "config_validation": {
-    "status": "config-validated",
-    "validator": "arrowcol-oat-rust --validate-config",
-    "source_sha": "95153097739bae15432a54e646b9b612f180812a",
-    "baseline_count": 1,
-    "candidate_count": 17,
-    "pass_count": 18,
-    "fail_count": 0
+    "status": "not-validated"
   },
   "runtime_qualification": "unqualified"
 }

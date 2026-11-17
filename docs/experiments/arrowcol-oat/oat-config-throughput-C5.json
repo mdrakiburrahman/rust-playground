@@ -387,15 +387,57 @@
       "candidate_limit": 4
     }
   ],
+  "source_enum_coverage": {
+    "data_mode": {
+      "path": "tunables.client.data_mode",
+      "accepted": [
+        "shared",
+        "independent"
+      ],
+      "configured": [],
+      "excluded": {
+        "shared": "Typed field has no environment projection or load-generator consumer in the pinned source.",
+        "independent": "Typed field has no environment projection or load-generator consumer in the pinned source."
+      },
+      "pending": [],
+      "status": "typed-no-runtime-consumer"
+    },
+    "ipc_compression": {
+      "path": "tunables.transport.ipc_compression",
+      "accepted": [
+        "none",
+        "lz4_frame",
+        "zstd"
+      ],
+      "configured": [
+        "none",
+        "lz4_frame",
+        "zstd"
+      ],
+      "excluded": {},
+      "pending": [],
+      "status": "config-screened-not-runtime-qualified"
+    },
+    "grpc_compression": {
+      "path": "tunables.transport.grpc_send_compression and grpc_accept_compression",
+      "accepted": [
+        "none",
+        "gzip",
+        "zstd"
+      ],
+      "configured": [],
+      "excluded": {
+        "none": "Pinned capability table marks gRPC compression disabled; fields have no runtime projection/consumer.",
+        "gzip": "Pinned capability table marks gRPC compression disabled; fields have no runtime projection/consumer.",
+        "zstd": "Pinned capability table marks gRPC compression disabled; fields have no runtime projection/consumer."
+      },
+      "pending": [],
+      "status": "typed-no-runtime-consumer"
+    }
+  },
   "runnable": false,
   "config_validation": {
-    "status": "config-validated",
-    "validator": "arrowcol-oat-rust --validate-config",
-    "source_sha": "95153097739bae15432a54e646b9b612f180812a",
-    "baseline_count": 1,
-    "candidate_count": 19,
-    "pass_count": 20,
-    "fail_count": 0
+    "status": "not-validated"
   },
   "runtime_qualification": "unqualified"
 }

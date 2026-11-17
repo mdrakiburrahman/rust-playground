@@ -8,7 +8,7 @@
 | Guard and envelope | Every baseline requests `overload_guard` enabled, cap fraction 0.90, two zero-progress windows, and a 4 GiB local collector memory limit. This common initial request is not measured headroom or proof of host suitability. |
 | Maintenance | Continuous, enabled, and applying in every cell. Idle work must be a no-op; due work stays enabled. |
 | Verdict | Set `dataflow_verdict_policy` to `single_hot_table_campaign` to make QAP lag a separate finding. Missing QAP observations remain UNKNOWN/non-PASS; default legacy semantics are unchanged. |
-| Files | `oat-config-throughput-C1.json` through `C8.json` are bounded manifests, not launch configs. Their eight baselines and 94 candidates have config validation recorded separately from runtime qualification in `oat-config-throughput-validation.json`. |
+| Files | `oat-config-throughput-C1.json` through `C8.json` are bounded manifests, not launch configs. Their eight baselines and 104 candidates have config validation recorded separately from runtime qualification in `oat-config-throughput-validation.json`. |
 | Pictures | Result pictures may show exploratory observations; no sustainable winner is shown until contiguous 30-second buckets, reconciliation, and validated timestamped pressure/maintenance-debt evidence qualify. Missing or unavailable evidence remains UNKNOWN. |
 
 ## Qualification
@@ -35,12 +35,12 @@ Each comparison contains at most four candidates, except the C1 coarse codec swe
 | Cohort | Comparisons |
 | --- | --- |
 | C1 | Coarse codec comparison: uncompressed, Snappy, LZ4_RAW, gzip, Brotli, and Zstd 1/3/6 (eight points). If Zstd wins, refine around its winning level with up to three adjacent registry-supported levels while retaining the winner as control (four candidates max). |
-| C2 | Dictionary on/off; Delta Binary Packed and Byte Stream Split on integer columns; explicit Plain, Delta Length Byte Array, and Delta Byte Array on `availability_group_name` with dictionary disabled. |
-| C3 | Row groups and maxRows include 16K/64K/128K/1M; page rows are separate; input-cap candidates include 128/256/512 MiB, setting layout, per-flush, and writer caps together so effective cap is `min(layout, per-flush, writer)`; coalescing and flush age (1s/5s/15s/60s) are separate comparisons. |
+| C2 | Dictionary on/off; Delta Binary Packed and Byte Stream Split on integer columns; explicit Plain, Delta Length Byte Array, and Delta Byte Array on `availability_group_name` with dictionary disabled. Transport dictionary handling keeps `hydrate`; `resend` is rejected for the frozen plain DMV schema. |
+| C3 | Row groups and maxRows include 16K/64K/128K/1M; page rows are separate; input-cap candidates include 128/256/512 MiB, setting layout, per-flush, and writer caps together so effective cap is `min(layout, per-flush, writer)`; coalescing, flush age (1s/5s/15s/60s), and age-flush policy (`immediate`/`drain_ready`) are separate comparisons. |
 | C4 | Low-to-high cardinality sort candidates for the final availability-replica table: none; `sample_time_utc`; `replica_server_name, sample_time_utc`; `availability_group_id, replica_server_name, sample_time_utc`. `customer_id` is constant per client and excluded. |
-| C5 | Workers, streams, connections, corpus rows, send interval (including zero), and IPC compression as separate comparisons. |
-| C6 | DFE cores, CPU workers, upload concurrency, flush concurrency, then router pooling if supported by the registry. |
-| C7 | Maintenance cadence, stale-plan retry bound, sealed-partition preference, small-file threshold, and checkpoint interval; every operation remains enabled and applying. Cadence 30/60/120 seconds is explicitly exploratory: it cannot reliably provide an observation in every 30-second window. Idle-backoff is coupled to cadence to satisfy config constraints. |
+| C5 | Workers, streams, connections, corpus rows, send interval (including zero), and IPC compression as separate comparisons. Typed data-mode and gRPC-compression enums are recorded as excluded because the pinned source has no runtime consumer. |
+| C6 | DFE cores, CPU workers, upload limit, and flush concurrency. Collector `buffered_multipart` upload is excluded by the pinned backend capability (no conditional completion); request concurrency is only valid with that mode. |
+| C7 | Maintenance cadence, stale-plan retry bound, sealed-partition preference, small-file threshold, checkpoint interval, input-read strategy (`memory`/`spool`/`range`), granularity, and OPTIMIZE upload mode. All operations remain enabled and applying; buffered-multipart uses the coupled 8 MiB buffer and is exploratory/unqualified. Cadence 30/60/120 seconds is exploratory; idle-backoff is coupled to cadence. |
 | C8 | Comparisons cover commit window and files-per-commit. Staging-overlap remains a separate `pending-L1b` candidate set until its consumer and safety clearance are integrated. |
 
 Generate or refresh manifests with:
@@ -65,6 +65,20 @@ The generator hashes the PR #125 tunables profile as a seed, not a complete capa
 C3's flush-age comparison requests `tunables.collector.batching.max_age` at 1s, 5s, 15s, and 60s; the shared baseline request is 1s. Record the effective age separately from the request using the collector's startup `consumer_effective_config.batching.max_age` readback. A longer age alone need not produce larger files if row, input-byte, memory, or adaptive target thresholds trigger first. Interpret each run with per-run deltas of `arrowcol_pipeline_flushes_total` by reason (especially `age`, `row_cap`, `batch_cap`, `memory_cap`, `min_input_bytes`, `max_input_bytes`, and `target_parquet_bytes`) alongside physical file sizes and latency. The earlier 231-file observation with all files under 8 MiB does not establish that age was the limiting factor. No performance effect is claimed by this configuration-only comparison.
 
 The C1/C2 manifests distinguish accepted enum values from configured candidates and exclusions. RLE is accepted only for BOOLEAN, absent from the frozen table. Legacy `lz4` remains accepted for compatibility but is excluded from the campaign by consumer/deprecation policy; `lz4_raw` is configured instead. Configured values have not thereby been runtime-screened.
+
+The manifests’ `source_enum_coverage` records separate typed enum acceptance, rendered values, exclusions, and pending work. Values are grounded in the Tunables and component consumers at source `5687e6459c424362f4504d21c32f954aa3b07d05`; config validation does not make a value runtime-qualified.
+
+| Path | Accepted and configured | Excluded or pending |
+| --- | --- | --- |
+| C2 `transport.dictionary_handling` | `hydrate` | `resend` fails current plain-DMV validation. |
+| C5 `transport.ipc_compression` | `none`, `lz4_frame`, `zstd` | None; still runtime-unqualified. |
+| C5 `client.data_mode` | Typed `shared`/`independent`; no candidate | Neither has an environment projection or load-generator consumer. |
+| C5 `transport.grpc_*_compression` | Typed `none`/`gzip`/`zstd`; no candidate | Capability is disabled and the fields have no runtime projection/consumer. |
+| C6 `collector.upload.mode` | `put_create` | `buffered_multipart` is excluded: pinned collector capability says conditional completion is unavailable. |
+| C7 `maintenance.input_read_strategy` | `memory`, `spool`, `range` | None; these change OPTIMIZE input reading, not WAL/collector durability. |
+| C7 `maintenance.granularity` | `minute`, `hour`, `day` | None; maintenance operations remain fixed and enabled. |
+| C7 `maintenance.optimize_upload_mode` | `put_create`, `buffered_multipart` | Buffered multipart is config-tested but explicitly exploratory and not scored as qualified. |
+| C8 `collector.commit.staging_overlap` | Not configured | Pending `pending-L1b` until its consumer and safety clearance are integrated. |
 
 On that source the CLI also accepted the 8 MiB and 1 TiB cap boundaries and an omitted cap, and rejected 12 malformed or out-of-range guard/cap inputs. An omitted cap is config-valid but cannot establish guarded local admission.
 

@@ -274,15 +274,26 @@
     },
     "status": "configured-not-runtime-screened"
   },
+  "source_enum_coverage": {
+    "dictionary_handling": {
+      "path": "tunables.transport.dictionary_handling",
+      "accepted": [
+        "hydrate",
+        "resend"
+      ],
+      "configured": [
+        "hydrate"
+      ],
+      "excluded": {
+        "resend": "Pinned Tunables validation rejects resend for the frozen plain DMV schema."
+      },
+      "pending": [],
+      "status": "config-screened-not-runtime-qualified"
+    }
+  },
   "runnable": false,
   "config_validation": {
-    "status": "config-validated",
-    "validator": "arrowcol-oat-rust --validate-config",
-    "source_sha": "95153097739bae15432a54e646b9b612f180812a",
-    "baseline_count": 1,
-    "candidate_count": 7,
-    "pass_count": 8,
-    "fail_count": 0
+    "status": "not-validated"
   },
   "runtime_qualification": "unqualified"
 }

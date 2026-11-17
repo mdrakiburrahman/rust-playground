@@ -72,6 +72,9 @@ const cohorts: Cohort[] = [
     compare('flush-age', 'collector.batching.max_age', ['1s', '5s', '15s', '60s'].map(value => candidate('age-' + value, {
       collector: { batching: { max_age: value } },
     }))),
+    compare('age-flush-policy', 'collector.batching.age_flush_policy', ['immediate', 'drain_ready'].map(value => candidate('age-policy-' + value, {
+      collector: { batching: { age_flush_policy: value } },
+    }))),
   ] },
   { id: 'C4', comparisons: [compare('sort-key', 'collector.layout.sort_columns', [
     candidate('none', { collector: { layout: { enabled: true, sort_columns: [] } }, parquet_writer: { sorting_columns: [] } }),
@@ -115,6 +118,21 @@ const cohorts: Cohort[] = [
     compare('small-file-threshold', 'tunables.maintenance.small_file_bytes', [16777216, 33554432, 67108864].map(value => candidate('small-file-' + value, { maintenance: { small_file_bytes: value } }))),
     compare('retry-budget', 'tunables.maintenance.commit_attempts', [1, 3, 5].map(value => candidate('attempts-' + value, { maintenance: { commit_attempts: value } }))),
     compare('checkpoint-interval', 'tunables.maintenance.checkpoint_every_commits', [64, 256, 1024].map(value => candidate('checkpoint-' + value, { maintenance: { checkpoint_every_commits: value } }))),
+    compare('input-read-strategy', 'tunables.maintenance.input_read_strategy', ['memory', 'spool', 'range'].map(value => candidate('input-' + value, {
+      maintenance: { input_read_strategy: value },
+    }))),
+    compare('granularity', 'tunables.maintenance.granularity', ['minute', 'hour', 'day'].map(value => candidate('granularity-' + value, {
+      maintenance: { granularity: value },
+    }))),
+    compare('optimize-upload-mode', 'tunables.maintenance.optimize_upload_mode', [
+      candidate('put-create', { maintenance: { optimize_upload_mode: 'put_create' } }),
+      {
+        ...candidate('buffered-multipart', { maintenance: {
+          optimize_upload_mode: 'buffered_multipart', optimize_upload_buffer_bytes: 8_388_608,
+        } }),
+        qualification: 'exploratory' as const,
+      },
+    ]),
   ] },
   { id: 'C8', comparisons: [
     compare('commit-window', 'tunables.collector.commit.batch_window', ['1s', '2s', '5s'].map(value => candidate('window-' + value, { collector: { commit: { batch_window: value } } }))),
@@ -200,6 +218,106 @@ export function buildThroughputManifests(registry: unknown): JsonObject[] {
         configured: ['plain', 'delta_binary_packed', 'delta_length_byte_array', 'delta_byte_array', 'byte_stream_split'],
         excluded: { rle: 'BOOLEAN-only; frozen table has no Boolean column' },
         status: 'configured-not-runtime-screened',
+      } } : {}),
+      ...(cohort.id === 'C2' ? { source_enum_coverage: {
+        dictionary_handling: {
+          path: 'tunables.transport.dictionary_handling',
+          accepted: ['hydrate', 'resend'],
+          configured: ['hydrate'],
+          excluded: { resend: 'Pinned Tunables validation rejects resend for the frozen plain DMV schema.' },
+          pending: [],
+          status: 'config-screened-not-runtime-qualified',
+        },
+      } } : {}),
+      ...(cohort.id === 'C3' ? { source_enum_coverage: {
+        age_flush_policy: {
+          path: 'tunables.collector.batching.age_flush_policy',
+          accepted: ['immediate', 'drain_ready'],
+          configured: ['immediate', 'drain_ready'],
+          excluded: {},
+          pending: [],
+          status: 'config-screened-not-runtime-qualified',
+        },
+      } } : {}),
+      ...(cohort.id === 'C5' ? { source_enum_coverage: {
+        data_mode: {
+          path: 'tunables.client.data_mode',
+          accepted: ['shared', 'independent'],
+          configured: [],
+          excluded: {
+            shared: 'Typed field has no environment projection or load-generator consumer in the pinned source.',
+            independent: 'Typed field has no environment projection or load-generator consumer in the pinned source.',
+          },
+          pending: [],
+          status: 'typed-no-runtime-consumer',
+        },
+        ipc_compression: {
+          path: 'tunables.transport.ipc_compression',
+          accepted: ['none', 'lz4_frame', 'zstd'],
+          configured: ['none', 'lz4_frame', 'zstd'],
+          excluded: {},
+          pending: [],
+          status: 'config-screened-not-runtime-qualified',
+        },
+        grpc_compression: {
+          path: 'tunables.transport.grpc_send_compression and grpc_accept_compression',
+          accepted: ['none', 'gzip', 'zstd'],
+          configured: [],
+          excluded: {
+            none: 'Pinned capability table marks gRPC compression disabled; fields have no runtime projection/consumer.',
+            gzip: 'Pinned capability table marks gRPC compression disabled; fields have no runtime projection/consumer.',
+            zstd: 'Pinned capability table marks gRPC compression disabled; fields have no runtime projection/consumer.',
+          },
+          pending: [],
+          status: 'typed-no-runtime-consumer',
+        },
+      } } : {}),
+      ...(cohort.id === 'C6' ? { source_enum_coverage: {
+        collector_upload_mode: {
+          path: 'tunables.collector.upload.mode',
+          accepted: ['put_create', 'buffered_multipart'],
+          configured: ['put_create'],
+          excluded: {
+            buffered_multipart: 'Pinned capability table marks collector multipart upload unsupported because the backend lacks conditional completion; not a scored candidate.',
+          },
+          pending: [],
+          status: 'safety-excluded-by-pinned-backend-capability',
+        },
+      } } : {}),
+      ...(cohort.id === 'C7' ? { source_enum_coverage: {
+        input_read_strategy: {
+          path: 'tunables.maintenance.input_read_strategy',
+          accepted: ['memory', 'spool', 'range'],
+          configured: ['memory', 'spool', 'range'],
+          excluded: {},
+          pending: [],
+          status: 'config-screened-not-runtime-qualified',
+        },
+        granularity: {
+          path: 'tunables.maintenance.granularity',
+          accepted: ['minute', 'hour', 'day'],
+          configured: ['minute', 'hour', 'day'],
+          excluded: {},
+          pending: [],
+          status: 'config-screened-not-runtime-qualified',
+        },
+        optimize_upload_mode: {
+          path: 'tunables.maintenance.optimize_upload_mode',
+          accepted: ['put_create', 'buffered_multipart'],
+          configured: ['put_create', 'buffered_multipart'],
+          excluded: {},
+          pending: [],
+          coupled_setting: 'buffered_multipart candidate requests optimize_upload_buffer_bytes=8388608; source bounds are 4194304..67108864.',
+          status: 'config-screened-buffered-multipart-exploratory',
+        },
+        operations: {
+          path: 'tunables.maintenance.operations',
+          accepted: ['purge', 'optimize', 'vacuum', 'checkpoint', 'prune_log'],
+          configured: ['optimize', 'purge', 'vacuum', 'checkpoint', 'prune_log'],
+          excluded: {},
+          pending: [],
+          status: 'fixed-campaign-invariant-never-varied',
+        },
       } } : {}),
       ...(cohort.id === 'C3' ? { flush_age_semantics: {
         requested_path: 'tunables.collector.batching.max_age',

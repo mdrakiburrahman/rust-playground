@@ -307,15 +307,26 @@
       "candidate_limit": 4
     }
   ],
+  "source_enum_coverage": {
+    "collector_upload_mode": {
+      "path": "tunables.collector.upload.mode",
+      "accepted": [
+        "put_create",
+        "buffered_multipart"
+      ],
+      "configured": [
+        "put_create"
+      ],
+      "excluded": {
+        "buffered_multipart": "Pinned capability table marks collector multipart upload unsupported because the backend lacks conditional completion; not a scored candidate."
+      },
+      "pending": [],
+      "status": "safety-excluded-by-pinned-backend-capability"
+    }
+  },
   "runnable": false,
   "config_validation": {
-    "status": "config-validated",
-    "validator": "arrowcol-oat-rust --validate-config",
-    "source_sha": "95153097739bae15432a54e646b9b612f180812a",
-    "baseline_count": 1,
-    "candidate_count": 13,
-    "pass_count": 14,
-    "fail_count": 0
+    "status": "not-validated"
   },
   "runtime_qualification": "unqualified"
 }

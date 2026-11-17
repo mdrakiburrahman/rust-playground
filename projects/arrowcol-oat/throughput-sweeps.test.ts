@@ -71,6 +71,84 @@ test('generates the C3 flush-age comparison as a single-factor sweep', () => {
   assert.equal((omittedManifest.flush_age_semantics as { baseline_requested: unknown }).baseline_requested, null);
 });
 
+test('covers applicable enum factors and records unsupported typed values without promoting them', () => {
+  const base = {
+    platform: { kind: 'local' },
+    tunables: { collector: { batching: {} }, maintenance: { operations: ['optimize', 'purge', 'vacuum', 'checkpoint', 'prune_log'] } },
+  };
+  const manifests = buildThroughputManifests(base);
+  const getManifest = (cohort: string) => manifests.find(item => item.cohort === cohort)!;
+  const getComparison = (cohort: string, id: string) =>
+    (getManifest(cohort).comparisons as Array<{ id: string; factor: string; candidates: Array<{ id: string; qualification?: string }> }>)
+      .find(item => item.id === id)!;
+  const coverage = (cohort: string) => getManifest(cohort).source_enum_coverage as Record<string, {
+    accepted: string[]; configured: string[]; excluded: Record<string, string>; pending: string[]; status: string;
+  }>;
+  const renderWithout = (cohort: string, comparison: string, candidates: string[], paths: string[][]) =>
+    candidates.map(candidate => {
+      const config = renderThroughputConfig(base, getManifest(cohort), comparison, candidate);
+      for (const path of paths) {
+        const parent = at(config, path.slice(0, -1));
+        assert.ok(parent && typeof parent === 'object' && !Array.isArray(parent));
+        delete (parent as Record<string, unknown>)[path.at(-1)!];
+      }
+      return config;
+    });
+
+  const agePolicy = getComparison('C3', 'age-flush-policy');
+  assert.equal(agePolicy.factor, 'collector.batching.age_flush_policy');
+  const agePolicyIds = ['age-policy-immediate', 'age-policy-drain_ready'];
+  assert.deepEqual(agePolicy.candidates.map(item => item.id), agePolicyIds);
+  const agePolicyConfigs = renderWithout('C3', agePolicy.id, agePolicyIds, [['tunables', 'collector', 'batching', 'age_flush_policy']]);
+  assert.deepEqual(agePolicyConfigs[0], agePolicyConfigs[1]);
+  assert.deepEqual(coverage('C3').age_flush_policy.configured, ['immediate', 'drain_ready']);
+
+  const inputRead = getComparison('C7', 'input-read-strategy');
+  assert.equal(inputRead.factor, 'tunables.maintenance.input_read_strategy');
+  const inputIds = ['input-memory', 'input-spool', 'input-range'];
+  assert.deepEqual(inputRead.candidates.map(item => item.id), inputIds);
+  assert.deepEqual(inputIds.map(id => at(renderThroughputConfig(base, getManifest('C7'), inputRead.id, id),
+    ['tunables', 'maintenance', 'input_read_strategy'])), ['memory', 'spool', 'range']);
+  const inputConfigs = renderWithout('C7', inputRead.id, inputIds, [['tunables', 'maintenance', 'input_read_strategy']]);
+  assert.deepEqual(inputConfigs[0], inputConfigs[1]);
+  assert.deepEqual(inputConfigs[1], inputConfigs[2]);
+  assert.deepEqual(coverage('C7').input_read_strategy.accepted, ['memory', 'spool', 'range']);
+  const granularity = getComparison('C7', 'granularity');
+  const granularityIds = ['granularity-minute', 'granularity-hour', 'granularity-day'];
+  assert.deepEqual(granularity.candidates.map(item => item.id), granularityIds);
+  assert.deepEqual(granularityIds.map(id => at(renderThroughputConfig(base, getManifest('C7'), granularity.id, id),
+    ['tunables', 'maintenance', 'granularity'])), ['minute', 'hour', 'day']);
+  const granularityConfigs = renderWithout('C7', granularity.id, granularityIds, [['tunables', 'maintenance', 'granularity']]);
+  assert.deepEqual(granularityConfigs[0], granularityConfigs[1]);
+  assert.deepEqual(granularityConfigs[1], granularityConfigs[2]);
+  const optimizeUpload = getComparison('C7', 'optimize-upload-mode');
+  const uploadIds = ['put-create', 'buffered-multipart'];
+  assert.deepEqual(optimizeUpload.candidates.map(item => item.id), uploadIds);
+  assert.equal(optimizeUpload.candidates[1]!.qualification, 'exploratory');
+  const bufferedUpload = renderThroughputConfig(base, getManifest('C7'), optimizeUpload.id, 'buffered-multipart');
+  assert.equal(at(bufferedUpload, ['tunables', 'maintenance', 'optimize_upload_buffer_bytes']), 8_388_608);
+  const uploadConfigs = renderWithout('C7', optimizeUpload.id, uploadIds, [
+    ['tunables', 'maintenance', 'optimize_upload_mode'],
+    ['tunables', 'maintenance', 'optimize_upload_buffer_bytes'],
+  ]);
+  assert.deepEqual(uploadConfigs[0], uploadConfigs[1]);
+  assert.deepEqual(coverage('C7').operations.configured, ['optimize', 'purge', 'vacuum', 'checkpoint', 'prune_log']);
+
+  const dictionary = coverage('C2').dictionary_handling;
+  assert.deepEqual(dictionary.accepted, ['hydrate', 'resend']);
+  assert.deepEqual(dictionary.configured, ['hydrate']);
+  assert.match(dictionary.excluded.resend!, /plain DMV schema/);
+  const clientAndTransport = coverage('C5');
+  assert.deepEqual(clientAndTransport.ipc_compression.configured, ['none', 'lz4_frame', 'zstd']);
+  assert.deepEqual(clientAndTransport.data_mode.configured, []);
+  assert.deepEqual(Object.keys(clientAndTransport.data_mode.excluded).sort(), ['independent', 'shared']);
+  assert.deepEqual(clientAndTransport.grpc_compression.configured, []);
+  assert.deepEqual(Object.keys(clientAndTransport.grpc_compression.excluded).sort(), ['gzip', 'none', 'zstd']);
+  const collectorUpload = coverage('C6').collector_upload_mode;
+  assert.deepEqual(collectorUpload.configured, ['put_create']);
+  assert.match(collectorUpload.excluded.buffered_multipart!, /lacks conditional completion/);
+});
+
 test('generates bounded local single-writer manifests from the tunables registry', () => {
   const manifests = buildThroughputManifests({ tunables: { client: { workers: 16 }, maintenance: { enabled: true } } });
   assert.deepEqual(manifests.map(manifest => manifest.cohort), ['C1', 'C2', 'C3', 'C4', 'C5', 'C6', 'C7', 'C8']);
@@ -216,7 +294,9 @@ test('renders candidate overlays as OAT configs without changing the baseline or
         assert.deepEqual(config.overload_guard, baseline.overload_guard);
         assert.equal(at(config, ['platform', 'local', 'collector_memory_limit_bytes']), 4_294_967_296);
         assert.equal(config.measure_seconds, 150);
-        assert.equal(at(config, ['tunables', 'maintenance', 'granularity']), 'hour');
+        if (!(manifest.cohort === 'C7' && comparison.id === 'granularity')) {
+          assert.equal(at(config, ['tunables', 'maintenance', 'granularity']), 'hour');
+        }
         assert.equal(at(config, ['tunables', 'maintenance', 'purge_retention_secs']), 2_592_000);
         assert.equal(at(config, ['tunables', 'maintenance', 'enabled']), true);
         assert.equal(at(config, ['tunables', 'maintenance', 'apply']), true);
