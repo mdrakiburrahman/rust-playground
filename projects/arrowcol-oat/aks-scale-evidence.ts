@@ -166,6 +166,303 @@ export async function readOfficialCellMeasurement(options: {
 // Microsoft.Kusto/clusters: Percent/Average/PT1M, not row latency or cache fullness.
 // https://learn.microsoft.com/azure/azure-monitor/reference/supported-metrics/microsoft-kusto-clusters-metrics
 export const KUSTO_SATURATION_THRESHOLDS = Object.freeze({ cpuPercent: 90, ingestionUtilizationPercent: 90 });
+/**
+ * Original-cell qualification: 10s cadence + 3s capture; CPU >=90% of a frozen observed hard limit,
+ * accounting for native timestamp precision; memory >=90% from in-window working-set samples (not peak RSS);
+ * throttling >=10% of CFS periods. No authenticated link capacity means network saturation is UNKNOWN.
+ */
+export const NATIVE_TELEMETRY_THRESHOLDS = Object.freeze({
+  cadenceMs: 10_000, requestTimeoutMs: 3000, maxGapMs: 13_000, maxEdgeAgeMs: 13_000,
+  cpuLimitFraction: 0.9, memoryLimitFraction: 0.9, throttledPeriodFraction: 0.1,
+});
+
+interface NativeQapWindow {
+  unit: 'pending_data_files';
+  pendingDataFiles: number | null;
+  pendingDataBytes: number | null;
+  growing: boolean | null;
+  samples: JsonRecord[];
+  unavailableReason: string | null;
+}
+interface NativePodWindow {
+  identity: JsonRecord;
+  counterObservationScope: 'bracketing_source_intervals_not_original_window_averages';
+  cpuCores: number | null;
+  cpuCounterInterval: { startUnixNs: string; endUnixNs: string } | null;
+  cpuSaturated: boolean | null;
+  memorySaturated: boolean | null;
+  rxBytesPerSecond: number | null;
+  txBytesPerSecond: number | null;
+  throttling: number | null;
+  throttled: boolean | null;
+  networkSaturated: null;
+  unavailableReasons: string[];
+}
+export interface OfficialNativeWindow {
+  original: OfficialCellMeasurement;
+  qap: NativeQapWindow;
+  pods: NativePodWindow[];
+  thresholds: typeof NATIVE_TELEMETRY_THRESHOLDS;
+  authorization: 'hold_explicit_paired_cell_custody_and_qualified_inputs_required';
+  unavailableReasons: string[];
+}
+function unsigned(value: unknown): bigint | null {
+  if (typeof value !== 'string' || !/^(0|[1-9]\d{0,19})$/.test(value)) return null;
+  const parsed = BigInt(value);
+  return parsed <= 18_446_744_073_709_551_615n ? parsed : null;
+}
+function quantity(value: unknown, memory: boolean): number | null {
+  if (typeof value !== 'string') return null;
+  const parsed = /^(\d+(?:\.\d+)?)([a-zA-Z]*)$/.exec(value);
+  if (!parsed) return null;
+  const factors: Record<string, number> = memory
+    ? { '': 1, k: 1000, M: 1e6, G: 1e9, T: 1e12, Ki: 1024, Mi: 1024 ** 2, Gi: 1024 ** 3, Ti: 1024 ** 4 }
+    : { '': 1, m: 0.001 };
+  const factor = factors[parsed[2]!], result = Number(parsed[1]) * (factor ?? NaN);
+  return Number.isFinite(result) && result > 0 && result <= Number.MAX_SAFE_INTEGER ? result : null;
+}
+function sameNativeOrigin(left: unknown, right: unknown): boolean {
+  if (typeof left !== 'string' || typeof right !== 'string' || !left || !right) return false;
+  try {
+    const origins = [left, right].map(value => new URL(value));
+    return origins.every(url => url.protocol === 'https:' && url.username === '' && url.password === '' &&
+      url.pathname === '/' && url.search === '' && url.hash === '') && origins[0]!.origin === origins[1]!.origin;
+  } catch { return false; }
+}
+function nativeSeries(rows: JsonRecord[], key: string, start: number, end: number,
+  counter: string): { first: bigint; last: bigint; firstNs: bigint; lastNs: bigint;
+    originalMinimum: bigint; originalMaximum: bigint; increments: bigint[] } | null {
+  const series = rows.map(row => {
+    const metric = record(row[key]) ? row[key] : {};
+    const identity = record(row.identity) ? row.identity : {};
+    return { time: unsigned(metric.time_unix_ns), resolution: unsigned(metric.time_resolution_ns),
+      value: unsigned(metric[counter]), epoch: unsigned(identity.started_unix_ns),
+      requestEndNs: BigInt(Number(row.source_request_end_ms)) * 1_000_000n };
+  });
+  if (series.length < 2 || series.some(point => point.time === null || point.value === null ||
+      point.resolution === null || point.resolution < 1n || point.resolution > 1_000_000_000n ||
+      point.epoch === null || point.time < point.epoch || point.time > point.requestEndNs)) return null;
+  const first = series[0]!, last = series.at(-1)!;
+  const upper = (point: typeof first) => point.time! + point.resolution! < point.requestEndNs
+    ? point.time! + point.resolution! : point.requestEndNs;
+  const startNs = BigInt(start) * 1_000_000n, endNs = BigInt(end) * 1_000_000n;
+  const bound = BigInt(NATIVE_TELEMETRY_THRESHOLDS.maxEdgeAgeMs) * 1_000_000n;
+  if (upper(first) > startNs || first.time! < startNs - bound || last.time! < endNs ||
+      upper(last) > endNs + bound || last.time! <= upper(first))
+    return null;
+  for (let i = 1; i < series.length; i++) {
+    const before = series[i - 1]!, after = series[i]!;
+    if (after.time! <= before.time! || after.time! - before.time! > bound || after.value! < before.value!) return null;
+  }
+  const reverse = [...series].reverse();
+  const beforeStart = reverse.find(point => upper(point) <= startNs)!;
+  const afterStart = series.find(point => point.time! >= startNs)!;
+  const beforeEnd = reverse.find(point => upper(point) <= endNs)!;
+  const afterEnd = series.find(point => point.time! >= endNs)!;
+  // Only increments wholly inside the original window are guaranteed; boundary-straddling work may be outside.
+  const interior = beforeEnd.value! - afterStart.value!;
+  return { first: first.value!, last: last.value!, firstNs: first.time!, lastNs: last.time!,
+    originalMinimum: interior > 0n ? interior : 0n,
+    originalMaximum: afterEnd.value! - beforeStart.value!,
+    increments: series.slice(1).map((point, i) => point.value! - series[i]!.value!) };
+}
+function nativeRate(series: ReturnType<typeof nativeSeries>, bytes: boolean): number | null {
+  if (!series || series.last - series.first > BigInt(Number.MAX_SAFE_INTEGER)) return null;
+  const rate = Number(series.last - series.first) / Number(series.lastNs - series.firstNs) * (bytes ? 1e9 : 1);
+  return Number.isFinite(rate) ? rate : null;
+}
+
+/** Reads producer-retained native observations only through current authenticated immutable original-cell custody. */
+export async function readOfficialNativeWindow(options: SourceOptions): Promise<OfficialNativeWindow> {
+  const original = await readOfficialCellMeasurement(options), inventory = original.inventory;
+  const qap: NativeQapWindow = { unit: 'pending_data_files', pendingDataFiles: null, pendingDataBytes: null,
+    growing: null, samples: [], unavailableReason: 'original_cell_native_qap_history_unavailable' };
+  const result: OfficialNativeWindow = { original, qap, pods: [], thresholds: NATIVE_TELEMETRY_THRESHOLDS,
+    authorization: 'hold_explicit_paired_cell_custody_and_qualified_inputs_required', unavailableReasons: [] };
+  const evidence = object(original.officialResult.evidence, 'Original official evidence');
+  const history = record(evidence.native_telemetry) ? evidence.native_telemetry : {};
+  const binding = record(history.binding) ? history.binding : {};
+  const start = original.startMs, end = original.endMs;
+  if (start === null || end === null || original.committedRowsPerSecond === null ||
+      history.schema_version !== 1 || history.scope !== 'original_cell_source_observations_not_scale_authorization' ||
+      history.window_start_unix_ms !== start || history.window_end_unix_ms !== end ||
+      history.cadence_ms !== NATIVE_TELEMETRY_THRESHOLDS.cadenceMs || history.sample_timeout_ms !== 3000 ||
+      binding.campaign_id !== inventory.campaign_id || binding.owner_id !== inventory.owner_id ||
+      binding.fencing_token !== inventory.fencing_token || binding.cell_run_id !== inventory.cell_run_id ||
+      !inventory.namespace.uid || binding.namespace_uid !== inventory.namespace.uid ||
+      binding.namespace !== inventory.namespace.name || history.samples_dropped !== 0 ||
+      !Array.isArray(history.samples) || history.samples.length < 2 || history.samples.length > 1024) {
+    result.unavailableReasons.push('original_cell_native_history_binding_or_complete_window_unavailable');
+    return result;
+  }
+  const frames = history.samples.filter(record);
+  if (frames.length !== history.samples.length || frames.some((frame, i) =>
+    !integer(frame.request_start_unix_ms) || !integer(frame.request_end_unix_ms) ||
+    frame.request_end_unix_ms < frame.request_start_unix_ms ||
+    frame.request_end_unix_ms - frame.request_start_unix_ms > NATIVE_TELEMETRY_THRESHOLDS.requestTimeoutMs ||
+    frame.request_end_unix_ms > (options.now ?? Date.now)() ||
+    i > 0 && frame.request_start_unix_ms < Number(frames[i - 1]!.request_end_unix_ms))) {
+    result.unavailableReasons.push('original_cell_native_source_intervals_invalid');
+    return result;
+  }
+  const first = frames[0]!, last = frames.at(-1)!;
+  const complete = Number(first.request_end_unix_ms) <= start &&
+    start - Number(first.request_end_unix_ms) <= NATIVE_TELEMETRY_THRESHOLDS.maxEdgeAgeMs &&
+    Number(last.request_start_unix_ms) >= end &&
+    Number(last.request_start_unix_ms) - end <= NATIVE_TELEMETRY_THRESHOLDS.maxEdgeAgeMs &&
+    frames.every((frame, i) => i === 0 || Number(frame.request_start_unix_ms) -
+      Number(frames[i - 1]!.request_end_unix_ms) <= NATIVE_TELEMETRY_THRESHOLDS.maxGapMs);
+  if (!complete) {
+    result.unavailableReasons.push('native_sources_do_not_bracket_the_complete_original_window');
+    return result;
+  }
+  const typed = object(original.effectiveConfig.typed_oat_config, 'Original typed effective config');
+  const admittedQap = inventory.qap;
+  if (admittedQap?.bindings.length === 1 && admittedQap.reference && options.azure.c.uri &&
+      binding.qap_endpoint === typed.qap_endpoint && sameNativeOrigin(binding.qap_endpoint, options.azure.c.uri) &&
+      binding.qap_database === admittedQap.database &&
+      canonical_json(binding.qap_bindings) === canonical_json(admittedQap.bindings) &&
+      canonical_json(binding.qap_reference) === canonical_json(admittedQap.reference)) {
+    const name = admittedQap.bindings[0]!.external_table;
+    const samples = frames.map(frame => {
+      const observed = record(frame.qap) ? frame.qap : {}, tables = record(observed.tables) ? observed.tables : {};
+      const table = record(tables[name]) ? tables[name] : {};
+      const stats = record(table.statistics) ? table.statistics : {}, state = record(table.state) ? table.state : {};
+      return { requestStartMs: Number(frame.request_start_unix_ms), requestEndMs: Number(frame.request_end_unix_ms),
+        observedAtMs: observed.observed_unix_ms, available: table.available,
+        pendingDataFiles: stats.AccelerationPendingDataFilesCount, pendingDataBytes: stats.AccelerationPendingDataFilesSize,
+        completePercentage: stats.AccelerationCompletePercentage, lastUpdatedDateTime: stats.LastUpdatedDateTime,
+        eligible: stats.Eligible, healthy: state.IsHealthy, notHealthyReason: state.NotHealthyReason };
+    });
+    qap.samples = samples;
+    if (samples.every(sample => sample.available === true && sample.eligible === true && sample.healthy === true &&
+        (sample.notHealthyReason === null || sample.notHealthyReason === '') &&
+        integer(sample.pendingDataFiles) && integer(sample.observedAtMs) &&
+        sample.observedAtMs >= sample.requestStartMs && sample.observedAtMs <= sample.requestEndMs &&
+        typeof sample.completePercentage === 'number' && Number.isFinite(sample.completePercentage) &&
+        sample.completePercentage >= 0 && sample.completePercentage <= 100)) {
+      const inside = samples.filter(sample => sample.requestStartMs >= start && sample.requestEndMs <= end);
+      if (inside.length >= 2) {
+        qap.pendingDataFiles = Number(inside.at(-1)!.pendingDataFiles);
+        qap.pendingDataBytes = integer(inside.at(-1)!.pendingDataBytes) ? Number(inside.at(-1)!.pendingDataBytes) : null;
+        qap.growing = qap.pendingDataFiles > Number(inside[0]!.pendingDataFiles);
+        qap.unavailableReason = null;
+      }
+    }
+  }
+  const plan = inventory.fic?.plan;
+  if (!plan || binding.server !== plan.server || typeof binding.kube_context !== 'string' ||
+      binding.kube_context !== typed.kubectl_context || !Array.isArray(history.pod_targets)) {
+    result.unavailableReasons.push('exact_api_server_context_or_original_pod_targets_unavailable');
+    return result;
+  }
+  const resources = record(original.effectiveConfig.resolved_aks_resources) ? original.effectiveConfig.resolved_aks_resources : {};
+  const targets = history.pod_targets.filter(record);
+  if (targets.length !== history.pod_targets.length || targets.length === 0 || targets.length > 64 ||
+      new Set(targets.map(target => canonical_json(target))).size !== targets.length) {
+    result.unavailableReasons.push('original_pod_identity_set_incomplete_or_ambiguous');
+    return result;
+  }
+  for (const target of targets) {
+    const pod: NativePodWindow = { identity: target,
+      counterObservationScope: 'bracketing_source_intervals_not_original_window_averages',
+      cpuCores: null, cpuCounterInterval: null,
+      cpuSaturated: null, memorySaturated: null,
+      rxBytesPerSecond: null, txBytesPerSecond: null, throttling: null, throttled: null, networkSaturated: null,
+      unavailableReasons: ['authenticated_network_link_capacity_unavailable'] };
+    result.pods.push(pod);
+    const rows = frames.map(frame => Array.isArray(frame.pods) ? frame.pods.filter(record).filter(row => {
+      const identity = record(row.identity) ? row.identity : {};
+      return identity.namespace === inventory.namespace.name &&
+        ['role', 'pod', 'uid', 'node', 'container', 'container_id'].every(key => identity[key] === target[key]);
+    }) : []);
+    if (!['collector', 'client', 'router', 'catalog'].includes(String(target.role)) ||
+        ['pod', 'uid', 'node', 'container', 'container_id'].some(key =>
+          typeof target[key] !== 'string' || target[key] === '' || String(target[key]).length > 1024) ||
+        rows.some(rows => rows.length !== 1) || rows.some(rows => !record(rows[0]!.identity))) {
+      pod.unavailableReasons.push('original_pod_uid_node_container_id_missing_changed_or_ambiguous');
+      continue;
+    }
+    const observations: Record<string, unknown>[] = rows.map((rows, i) =>
+      ({ ...rows[0]!, source_request_end_ms: frames[i]!.request_end_unix_ms }));
+    const firstIdentity = object(observations[0]!.identity, 'Native pod identity');
+    const epoch = unsigned(firstIdentity.started_unix_ns);
+    if (epoch === null || epoch === 0n) {
+      pod.unavailableReasons.push('native_container_epoch_unavailable');
+      continue;
+    }
+    if (observations.some(row => canonical_json(row.identity) !== canonical_json(observations[0]!.identity) ||
+        canonical_json(row.limits) !== canonical_json(observations[0]!.limits))) {
+      pod.unavailableReasons.push('pod_container_epoch_or_limits_changed_inside_original_window');
+      continue;
+    }
+    const limits = record(observations[0]!.limits) ? observations[0]!.limits : {};
+    const resource = typeof target.role === 'string' ? resources[target.role] : undefined;
+    const expected = record(resource) && record(resource.limits) ? resource.limits : {};
+    const cpuLimit = quantity(limits.cpu, false), memoryLimit = quantity(limits.memory, true);
+    const cpu = nativeSeries(observations, 'cpu', start, end, 'usage_core_nanoseconds');
+    pod.cpuCores = nativeRate(cpu, false);
+    if (cpu) pod.cpuCounterInterval = { startUnixNs: cpu.firstNs.toString(), endUnixNs: cpu.lastNs.toString() };
+    const milliLimit = cpuLimit === null ? null : cpuLimit * 1000;
+    if (milliLimit !== null && Number.isSafeInteger(milliLimit) &&
+        cpuLimit === quantity(expected.cpu, false) && cpu) {
+      const threshold = BigInt(end - start) * 1_000_000n * BigInt(milliLimit) *
+        BigInt(NATIVE_TELEMETRY_THRESHOLDS.cpuLimitFraction * 100);
+      pod.cpuSaturated = cpu.originalMinimum * 100_000n >= threshold ? true :
+        cpu.originalMaximum * 100_000n < threshold ? false : null;
+      if (pod.cpuSaturated === null)
+        pod.unavailableReasons.push('original_window_cpu_boundary_contributions_or_timestamp_precision_ambiguous');
+    }
+    else pod.unavailableReasons.push('complete_native_cpu_counter_window_or_frozen_hard_limit_unavailable');
+    const memory = observations.map(row => record(row.memory) ? row.memory : {});
+    const memoryTimes = memory.map(value => unsigned(value.time_unix_ns));
+    const memoryResolution = memory.map(value => unsigned(value.time_resolution_ns));
+    const memoryValues = memory.map(value => unsigned(value.working_set_bytes));
+    const startNs = BigInt(start) * 1_000_000n, endNs = BigInt(end) * 1_000_000n;
+    const edgeNs = BigInt(NATIVE_TELEMETRY_THRESHOLDS.maxEdgeAgeMs) * 1_000_000n;
+    const memoryUpper = memoryTimes.map((time, i) => time === null || memoryResolution[i] === null ? null :
+      time + memoryResolution[i]! < BigInt(Number(frames[i]!.request_end_unix_ms)) * 1_000_000n ?
+        time + memoryResolution[i]! : BigInt(Number(frames[i]!.request_end_unix_ms)) * 1_000_000n);
+    const insideMemory = memoryValues.filter((_, i) => memoryTimes[i] !== null &&
+      memoryTimes[i]! >= startNs && memoryUpper[i] !== null && memoryUpper[i]! <= endNs);
+    if (memoryLimit !== null && memoryLimit === quantity(expected.memory, true) &&
+        memoryTimes.every((time, i) => time !== null &&
+          time >= epoch &&
+          memoryResolution[i] !== null && memoryResolution[i]! >= 1n && memoryResolution[i]! <= 1_000_000_000n &&
+          time <= BigInt(Number(frames[i]!.request_end_unix_ms)) * 1_000_000n &&
+          (i === 0 || time > memoryTimes[i - 1]! && time - memoryTimes[i - 1]! <= 13_000_000_000n)) &&
+        memoryValues.every(value => value !== null && value <= BigInt(Number.MAX_SAFE_INTEGER)) &&
+        memoryUpper[0]! <= startNs && memoryTimes[0]! >= startNs - edgeNs &&
+        memoryTimes.at(-1)! >= endNs && memoryUpper.at(-1)! <= endNs + edgeNs && insideMemory.length > 0)
+      pod.memorySaturated = Math.max(...insideMemory.map(Number)) / memoryLimit >= NATIVE_TELEMETRY_THRESHOLDS.memoryLimitFraction;
+    else pod.unavailableReasons.push('complete_native_memory_window_or_frozen_hard_limit_unavailable');
+    if (observations.every(row => record(row.network) && row.network.scope === 'pod_network_not_container_or_link_capacity')) {
+      pod.rxBytesPerSecond = nativeRate(nativeSeries(observations, 'network', start, end, 'rx_bytes'), true);
+      pod.txBytesPerSecond = nativeRate(nativeSeries(observations, 'network', start, end, 'tx_bytes'), true);
+    }
+    const periods = nativeSeries(observations, 'throttling', start, end, 'periods');
+    const throttled = nativeSeries(observations, 'throttling', start, end, 'throttled_periods');
+    const validCfs = observations.every(row => {
+      const metric = record(row.throttling) ? row.throttling : {};
+      const total = unsigned(metric.periods), throttled = unsigned(metric.throttled_periods);
+      return total !== null && throttled !== null && throttled <= total && total <= BigInt(Number.MAX_SAFE_INTEGER);
+    });
+    if (validCfs && periods && throttled && periods.firstNs === throttled.firstNs && periods.lastNs === throttled.lastNs &&
+        periods.last > periods.first &&
+        throttled.increments.every((increment, i) => increment <= periods.increments[i]!)) {
+      pod.throttling = Number(throttled.last - throttled.first) / Number(periods.last - periods.first);
+      const thresholdPercent = BigInt(NATIVE_TELEMETRY_THRESHOLDS.throttledPeriodFraction * 100);
+      pod.throttled = periods.originalMaximum > 0n &&
+        throttled.originalMinimum * 100n >= periods.originalMaximum * thresholdPercent ? true :
+        periods.originalMinimum > 0n &&
+          throttled.originalMaximum * 100n < periods.originalMinimum * thresholdPercent ? false : null;
+      if (pod.throttled === null)
+        pod.unavailableReasons.push('original_window_cfs_boundary_contributions_or_timestamp_precision_ambiguous');
+    } else pod.unavailableReasons.push('original_window_source_timestamped_exact_cgroup_cfs_unavailable');
+  }
+  return result;
+}
+
 const MONITOR_GRAIN_MS = 60_000;
 interface MonitorMetric {
   averagePercent: number | null;
