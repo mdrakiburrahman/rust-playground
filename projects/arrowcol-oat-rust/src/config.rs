@@ -1309,7 +1309,12 @@ mod tests {
         }
         config.client_ready_timeout_seconds = 30;
         config.qap_timeout_seconds = 1;
-        for valid in [1, 180, 1_800] {
+        for valid in [1, 17, 180, 1_800] {
+            request["schedule_lead_seconds"] = serde_json::json!(valid);
+            assert_eq!(
+                serde_json::from_value::<OatConfig>(request.clone())?.schedule_lead_seconds,
+                valid
+            );
             config.schedule_lead_seconds = valid;
             config.validate()?;
         }
@@ -1871,6 +1876,7 @@ mod tests {
         let mut config = valid();
         config.client_ready_timeout_seconds = 1_800;
         config.qap_timeout_seconds = 300;
+        config.schedule_lead_seconds = 60;
         config.warmup_seconds = 300;
         config.measure_seconds = 600;
         config.run_pin_ttl_ms = config.timing_budget()?.minimum_pin_ttl_ms;
