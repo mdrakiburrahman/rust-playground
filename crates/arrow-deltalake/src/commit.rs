@@ -938,9 +938,11 @@ mod tests {
         impl PublicationFence for Gate {
             fn check_before_commit(
                 &self,
-                _: &crate::delta::PublicationFenceContext<'_>,
+                context: &crate::delta::PublicationFenceContext<'_>,
             ) -> std::result::Result<(), PublicationFenceError> {
-                if let Some(entered) = self.entered.lock().expect("gate lock").take() {
+                if context.file_count() > 0
+                    && let Some(entered) = self.entered.lock().expect("gate lock").take()
+                {
                     let _ = entered.send(());
                     self.release
                         .lock()
@@ -963,14 +965,16 @@ mod tests {
             .stage_coalesced_publications(vec![(input()?, "first".into(), 0, 10)])
             .await?;
         let first = table.submit_prepared_group(prepared, true).await?;
-        tokio::time::timeout(Duration::from_secs(3), observed).await??;
+        tokio::time::timeout(Duration::from_secs(3), observed)
+            .await
+            .context("first append reached fence")??;
         let second = tokio::time::timeout(
             Duration::from_secs(3),
             table.stage_coalesced_publications(vec![(input()?, "second".into(), 0, 20)]),
         )
         .await;
         release.send(())?;
-        let prepared = second??;
+        let prepared = second.context("preparation must not wait for a prior commit")??;
         assert_eq!(prepared.appends.len(), 1);
         assert_eq!(first.wait().await?.version, 1);
         assert_eq!(

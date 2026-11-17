@@ -3267,73 +3267,81 @@ impl DeltaTable {
     }
 
     fn ensure_schema(&self, incoming: SchemaRef) -> Result<SnapshotRef> {
-        let _guard = self
-            .commit_lock
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Delta commit lock poisoned"))?;
-        let exists = if self.url.scheme() == "file" {
-            self.root.join("_delta_log").exists()
-        } else {
-            let store = Arc::clone(&self.store);
-            let prefix = self.object_path("_delta_log/")?;
-            shared_executor()?.block_on(async move {
-                use futures::StreamExt;
-                let mut entries = store.list(Some(&prefix));
-                entries.next().await.transpose().map(|entry| entry.is_some())
-            })?
-        };
-        if !exists {
-            for entry in fs::read_dir(&self.root)? {
-                let entry = entry?;
-                if entry.file_name() != WRITER_LOCK {
-                    bail!("refusing to adopt non-Delta directory {}", self.root.display());
+        let mut schema_guard = None;
+        loop {
+            let existing = self.existing_snapshot()?;
+            if existing.is_none() && schema_guard.is_none() {
+                schema_guard = Some(
+                    self.commit_lock
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("Delta commit lock poisoned"))?,
+                );
+                continue;
+            }
+            if existing.is_none() {
+                for entry in fs::read_dir(&self.root)? {
+                    let entry = entry?;
+                    if entry.file_name() != WRITER_LOCK {
+                        bail!("refusing to adopt non-Delta directory {}", self.root.display());
+                    }
+                }
+                self.create_schema(Arc::clone(&incoming), None)?;
+            }
+            let snapshot = match existing {
+                Some(snapshot) => snapshot,
+                None => self.snapshot()?,
+            };
+            Self::validate_retention(&snapshot)?;
+            if !self.partition_columns.is_empty()
+                && snapshot.table_configuration().metadata().partition_columns() != self.partition_columns
+            {
+                bail!("incompatible table partition columns");
+            }
+            let existing: arrow::datatypes::Schema = snapshot.schema().as_ref().try_into_arrow()?;
+            for field in existing.fields() {
+                if !field.is_nullable() && incoming.fields().find(field.name()).is_none() {
+                    bail!("missing required column {}", field.name());
                 }
             }
-            self.create_schema(Arc::clone(&incoming), None)?;
-        }
-        let snapshot = self.snapshot()?;
-        Self::validate_retention(&snapshot)?;
-        if !self.partition_columns.is_empty()
-            && snapshot.table_configuration().metadata().partition_columns() != self.partition_columns
-        {
-            bail!("incompatible table partition columns");
-        }
-        let existing: arrow::datatypes::Schema = snapshot.schema().as_ref().try_into_arrow()?;
-        for field in existing.fields() {
-            if !field.is_nullable() && incoming.fields().find(field.name()).is_none() {
-                bail!("missing required column {}", field.name());
-            }
-        }
-        let mut additions = Vec::new();
-        for field in incoming.fields() {
-            if let Some((_, old)) = existing.fields().find(field.name()) {
-                if old.data_type() != field.data_type() {
-                    bail!("incompatible type/nested evolution for {}", field.name());
+            let mut additions = Vec::new();
+            for field in incoming.fields() {
+                if let Some((_, old)) = existing.fields().find(field.name()) {
+                    if old.data_type() != field.data_type() {
+                        bail!("incompatible type/nested evolution for {}", field.name());
+                    }
+                    if old.metadata().get(normalize::ORIGINAL_TYPE) != field.metadata().get(normalize::ORIGINAL_TYPE) {
+                        bail!("incompatible logical Arrow type for {}", field.name());
+                    }
+                } else {
+                    if !field.is_nullable() {
+                        bail!("new column {} must be nullable", field.name());
+                    }
+                    additions.push(delta_kernel::schema::StructField::try_from_arrow(field.as_ref())?);
                 }
-                if old.metadata().get(normalize::ORIGINAL_TYPE) != field.metadata().get(normalize::ORIGINAL_TYPE) {
-                    bail!("incompatible logical Arrow type for {}", field.name());
-                }
-            } else {
-                if !field.is_nullable() {
-                    bail!("new column {} must be nullable", field.name());
-                }
-                additions.push(delta_kernel::schema::StructField::try_from_arrow(field.as_ref())?);
             }
-        }
-        if !additions.is_empty() {
-            let mut additions = additions.into_iter();
-            let first = additions.next().context("missing schema addition")?;
-            let mut builder = snapshot.alter_table().add_column(first);
-            for field in additions {
-                builder = builder.add_column(field);
+            if !additions.is_empty() {
+                if schema_guard.is_none() {
+                    schema_guard = Some(
+                        self.commit_lock
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("Delta commit lock poisoned"))?,
+                    );
+                    continue;
+                }
+                let mut additions = additions.into_iter();
+                let first = additions.next().context("missing schema addition")?;
+                let mut builder = snapshot.alter_table().add_column(first);
+                for field in additions {
+                    builder = builder.add_column(field);
+                }
+                let transaction = builder.build(&self.engine, self.committer())?;
+                committed(transaction.commit(&self.engine)?)?;
+                return self.snapshot();
             }
-            let transaction = builder.build(&self.engine, self.committer())?;
-            committed(transaction.commit(&self.engine)?)?;
-            return self.snapshot();
+            // Preparation and publication both refresh storage state; the cache only
+            // avoids re-parsing historical metadata after checking log integrity.
+            return Ok(snapshot);
         }
-        // Preparation and publication both refresh storage state; the cache only
-        // avoids re-parsing historical metadata after checking log integrity.
-        Ok(snapshot)
     }
 
     fn create_schema(&self, incoming: SchemaRef, fresh_fence: Option<Arc<dyn PublicationFence>>) -> Result<()> {
