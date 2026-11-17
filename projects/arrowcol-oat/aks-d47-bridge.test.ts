@@ -429,16 +429,21 @@ test('planned control dispatcher refuses random, reordered, and reused lease ide
   let forwards = 0;
   const dispatcher = new StorageBridgeDispatcher({ authority, originalDeadlineUnixMs: deadline, envelope, azure,
     store: custody.store, ledgerPath: path.join(directory, 'storage-ledger.jsonl'), controlPlan,
-    planIdentity: { plan: controlPlan }, fetcher: async () => { forwards++; return new Response('', { status: 201 }); } });
+    planIdentity: { plan: controlPlan }, fetcher: async () => { forwards++; return new Response('', { status: 409 }); } });
   const boundary = new EffectBoundary(envelope, path.join(directory, 'effects.jsonl'));
-  await assert.rejects(dispatcher.exchange(random), /next immutable plan identity/);
+  await assert.rejects(withEffectBoundary(boundary, () => dispatcher.exchange(random)), /next immutable plan identity/);
+  const failedAcquire = await withEffectBoundary(boundary, () => dispatcher.exchange(planned));
+  assert.equal(failedAcquire.outcome, 'response');
+  const reused = makeAcquire(2, leaseIds[0]);
+  await assert.rejects(withEffectBoundary(boundary, () => dispatcher.exchange(reused)));
   const metadataFirst = signedControlRequest(authority, deadline, 1,
     authority.control_container_url + '?restype=container&comp=metadata',
     [['x-ms-lease-id', leaseIds[0]], ['x-ms-meta-publishers', JSON.stringify({ [publisherId]:
       { generation: authority.reset_generation, state: 'active' } })]]);
-  await assert.rejects(withEffectBoundary(boundary, () => dispatcher.exchange(metadataFirst)), /active immutable plan identity/);
-  assert.equal(forwards, 0);
-  assert.equal(readFileSync(path.join(directory, 'storage-ledger.jsonl'), 'utf8').trim().split('\n').length, 1);
+  await assert.rejects(withEffectBoundary(boundary, () => dispatcher.exchange(metadataFirst)));
+  assert.equal(forwards, 1);
+  assert.equal(dispatcher.recordedRequestCount, 1);
+  assert.equal(readFileSync(path.join(directory, 'storage-ledger.jsonl'), 'utf8').trim().split('\n').length, 3);
 });
 
 test('planned control restart serves the exact cached reply and refuses new mutations', async t => {
@@ -477,6 +482,6 @@ test('planned control restart serves the exact cached reply and refuses new muta
   assert.equal(initial.outcome, 'response');
   const restarted = create();
   assert.deepEqual(await withEffectBoundary(boundary, () => restarted.exchange(acquire)), initial);
-  await assert.rejects(restarted.exchange(metadata), /recovered bridge ledger permits cached replies and bounded reads only/);
+  await assert.rejects(withEffectBoundary(boundary, () => restarted.exchange(metadata)), /recovered bridge ledger permits cached replies and bounded reads only/);
   assert.equal(forwards, 1);
 });
