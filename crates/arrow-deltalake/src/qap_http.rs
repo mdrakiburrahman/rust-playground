@@ -372,7 +372,7 @@ mod storage_bridge {
         ///
         /// # Errors
         /// Rejects invalid operation markers or an invalid bridge configuration.
-        pub(crate) fn new_with_planned_object_operation_ids<R, W>(
+        pub fn new_with_planned_object_operation_ids<R, W>(
             authority: StorageBridgeAuthority,
             original_deadline_unix_ms: u64,
             operation_ids: Vec<String>,
