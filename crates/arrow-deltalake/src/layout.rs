@@ -13,6 +13,7 @@ use parquet::basic::Compression;
 use parquet::file::metadata::SortingColumn;
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use parquet::schema::types::ColumnPath;
+#[cfg(feature = "delta")]
 use sha2::Digest;
 use std::sync::Arc;
 
@@ -232,11 +233,13 @@ impl FileSortBuffer {
         Ok(true)
     }
 
+    #[cfg(any(feature = "delta", test))]
     pub(crate) fn at_budget(&self) -> bool {
         self.rows >= self.policy.max_rows || self.input_bytes >= self.policy.max_input_bytes
     }
 
     /// A rejected batch cannot make this buffer reusable as full.
+    #[cfg(any(feature = "delta", test))]
     pub(crate) fn full_for_next(&self, _batch: &RecordBatch) -> bool {
         self.at_budget()
     }
