@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 import { EffectBoundary, withEffectBoundary, type EffectEnvelope } from '../../infra/azure/effect-boundary.js';
-import { initializeOwnedRunTable, StorageBridgeDispatcher, type StorageBridgeAuthority, type StorageBridgeRequest } from './aks-d47-bridge.js';
+import { initializeOwnedRunTable, PLANNED_CONTROL_OPERATION_IDS, StorageBridgeDispatcher, type StorageBridgeAuthority, type StorageBridgeRequest } from './aks-d47-bridge.js';
 import type { Azure } from '../../infra/azure/bootstrap.js';
 import { newCampaignState, type CampaignStore, type RunInventory, type StoredCampaign } from './aks-campaign.js';
 
@@ -83,14 +83,16 @@ function envelopeFor(authority: StorageBridgeAuthority, request: StorageBridgeRe
 }
 
 function signedControlRequest(authority: StorageBridgeAuthority, deadline: number, requestId: number, url: string,
-  headers: [string, string][]): StorageBridgeRequest {
+  headers: [string, string][], method = 'PUT', operationId?: string): StorageBridgeRequest {
   const volatile: [string, string][] = [
     ['x-ms-client-request-id', 'c0ffee00-0000-4000-8000-' + String(requestId).padStart(12, '0')],
     ['date', new Date(deadline - 30_000).toUTCString()], ['x-ms-date', new Date(deadline - 30_000).toUTCString()],
   ];
   const unsigned = { schema_version: 1 as const, kind: 'storage_http_request' as const, request_id: requestId,
     authority, original_deadline_unix_ms: deadline, remaining_timeout_ms: 10_000, target: 'control' as const,
-    method: 'PUT', url, headers: [...volatile, ['x-ms-version', '2023-11-03'], ...headers], body: '', body_sha256: sha('') };
+    method, url, headers: ([...headers, ...(operationId ? [['x-arrowcol-operation-id', operationId] as [string, string]] : []),
+      ...volatile, ['x-ms-version', '2023-11-03'], ...(method === 'PUT' ? [['content-length', '0'] as [string, string]] : [])] as [string, string][]),
+    body: '', body_sha256: sha('') };
   return { ...unsigned, request_sha256: sha(canonical(unsigned)) };
 }
 
@@ -356,133 +358,131 @@ test('StorageBridge revalidates current custody after token preparation before a
   assert.equal(reply.outcome, 'unknown');
   assert.equal(fetches, 0);
 });
-test('planned control identities admit only the exact registration and clean-release trace', async t => {
+test('planned control identities admit the exact 11-operation registration and clean-release trace', async t => {
   const directory = mkdtempSync(path.join(os.tmpdir(), 'oat-d47-planned-ids-'));
   chmodSync(directory, 0o700);
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   const authority: StorageBridgeAuthority = {
-    campaign_id: 'c0ffee00-0000-4000-8000-000000000001',
-    cell_run_id: 'c0ffee00-0000-4000-8000-000000000002',
-    owner_id: 'c0ffee00-0000-4000-8000-000000000003', fencing_token: 1,
-    storage_account: 'arrowcollector68590',
+    campaign_id: 'c0ffee00-0000-4000-8000-000000000001', cell_run_id: 'c0ffee00-0000-4000-8000-000000000002',
+    owner_id: 'c0ffee00-0000-4000-8000-000000000003', fencing_token: 1, storage_account: 'arrowcollector68590',
     table_root_url: 'abfss://checkpoints@arrowcollector68590.dfs.core.windows.net/campaigns/c0ffee00-0000-4000-8000-000000000001/runs/c0ffee00-0000-4000-8000-000000000002/dataflow/telemetry/sqlserver/sqlserver_availability_replica_states/',
     control_container_url: 'https://arrowcollector68590.blob.core.windows.net/checkpoints', sandbox_id: 'offline-stamp',
     reset_generation: 'c0ffee00-0000-4000-8000-000000000004',
   };
-  const now = Date.now(), deadline = now + 60_000;
-  const publisherId = 'c0ffee00-0000-4000-8000-000000000011';
+  const now = Date.now(), deadline = now + 60_000, publisherId = 'c0ffee00-0000-4000-8000-000000000011';
   const leaseIds = ['c0ffee00-0000-4000-8000-000000000012', 'c0ffee00-0000-4000-8000-000000000013'] as const;
-  const controlPlan = { publisher_id: publisherId, generation: authority.reset_generation, control_lease_ids: leaseIds } as const;
-  const baseUrl = authority.control_container_url;
-  const leaseUrl = baseUrl + '?comp=lease&restype=container';
+  const controlPlan = { publisher_id: publisherId, generation: authority.reset_generation, control_lease_ids: leaseIds,
+    control_operation_ids: PLANNED_CONTROL_OPERATION_IDS } as const;
+  const baseUrl = authority.control_container_url, leaseUrl = baseUrl + '?comp=lease&restype=container';
   const metadataUrl = baseUrl + '?restype=container&comp=metadata';
-  const request = (id: number, action: 'acquire' | 'metadata' | 'release', leaseId: string, state?: 'active' | 'uncertain' | 'removed') => {
+  const read = (id: number, index: number) => signedControlRequest(authority, deadline, id,
+    baseUrl + '?restype=container', [], 'HEAD', PLANNED_CONTROL_OPERATION_IDS[index]);
+  const request = (id: number, index: number, action: 'acquire' | 'metadata' | 'release', leaseId: string,
+    state?: 'active' | 'uncertain' | 'removed') => {
     if (action === 'acquire') return signedControlRequest(authority, deadline, id, leaseUrl,
-      [['x-ms-lease-action', 'acquire'], ['x-ms-lease-duration', '15'], ['x-ms-proposed-lease-id', leaseId]]);
+      [['x-ms-lease-action', 'acquire'], ['x-ms-lease-duration', '15'], ['x-ms-proposed-lease-id', leaseId]],
+      'PUT', PLANNED_CONTROL_OPERATION_IDS[index]);
     if (action === 'release') return signedControlRequest(authority, deadline, id, leaseUrl,
-      [['x-ms-lease-action', 'release'], ['x-ms-lease-id', leaseId]]);
+      [['x-ms-lease-action', 'release'], ['x-ms-lease-id', leaseId]], 'PUT', PLANNED_CONTROL_OPERATION_IDS[index]);
     const registry = state === 'removed' ? '{}' : JSON.stringify({ [publisherId]: { generation: authority.reset_generation,
       state: state === 'uncertain' ? 'uncertain' : 'active' } });
     return signedControlRequest(authority, deadline, id, metadataUrl,
-      [['x-ms-lease-id', leaseId], ['x-ms-meta-publishers', registry]]);
+      [['x-ms-lease-id', leaseId], ['x-ms-meta-publishers', registry]], 'PUT', PLANNED_CONTROL_OPERATION_IDS[index]);
   };
-  const requests = [request(1, 'acquire', leaseIds[0]), request(2, 'metadata', leaseIds[0], 'active'),
-    request(3, 'release', leaseIds[0]), request(4, 'acquire', leaseIds[1]),
-    request(5, 'metadata', leaseIds[1], 'removed'), request(6, 'release', leaseIds[1])];
+  const requests = [read(1, 0), request(2, 1, 'acquire', leaseIds[0]), read(3, 2),
+    request(4, 3, 'metadata', leaseIds[0], 'active'), request(5, 4, 'release', leaseIds[0]), read(6, 5), read(7, 6),
+    request(8, 7, 'acquire', leaseIds[1]), read(9, 8), request(10, 9, 'metadata', leaseIds[1], 'removed'),
+    request(11, 10, 'release', leaseIds[1])];
   const envelope = envelopeForRequests(authority, requests), custody = mutableCustodyStore(authority, now);
   const azure = { c: { account: authority.storage_account }, async token() { return 'offline-test-token'; } } as unknown as Azure;
-  const statuses = [201, 200, 200, 201, 200, 200];
+  const statuses = [200, 201, 200, 200, 200, 200, 200, 201, 200, 200, 200];
   let forwards = 0;
   const dispatcher = new StorageBridgeDispatcher({ authority, originalDeadlineUnixMs: deadline, envelope, azure,
     store: custody.store, ledgerPath: path.join(directory, 'storage-ledger.jsonl'), controlPlan,
-    planIdentity: { plan: { publisher_id: publisherId, generation: authority.reset_generation, control_lease_ids: leaseIds } },
+    planIdentity: { plan: { publisher_id: publisherId, generation: authority.reset_generation,
+      control_lease_ids: leaseIds, control_operation_ids: PLANNED_CONTROL_OPERATION_IDS } },
     fetcher: async () => new Response('', { status: statuses[forwards++]! }) });
   const boundary = new EffectBoundary(envelope, path.join(directory, 'effects.jsonl'));
   for (const item of requests) assert.equal((await withEffectBoundary(boundary, () => dispatcher.exchange(item))).outcome, 'response');
-  assert.equal(forwards, 6);
-  assert.equal(dispatcher.recordedRequestCount, 6);
+  assert.equal(forwards, 11);
+  assert.equal(dispatcher.recordedRequestCount, 11);
   assert.doesNotThrow(() => dispatcher.assertControlPlanComplete());
 });
-
-test('planned control dispatcher refuses random, reordered, and reused lease identities before forwarding', async t => {
+test('planned control dispatcher rejects missing, duplicate, unknown, reused and mutated markers before forwarding', async t => {
   const directory = mkdtempSync(path.join(os.tmpdir(), 'oat-d47-planned-refusal-'));
   chmodSync(directory, 0o700);
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   const authority: StorageBridgeAuthority = {
-    campaign_id: 'c0ffee00-0000-4000-8000-000000000001',
-    cell_run_id: 'c0ffee00-0000-4000-8000-000000000002',
-    owner_id: 'c0ffee00-0000-4000-8000-000000000003', fencing_token: 1,
-    storage_account: 'arrowcollector68590',
+    campaign_id: 'c0ffee00-0000-4000-8000-000000000001', cell_run_id: 'c0ffee00-0000-4000-8000-000000000002',
+    owner_id: 'c0ffee00-0000-4000-8000-000000000003', fencing_token: 1, storage_account: 'arrowcollector68590',
     table_root_url: 'abfss://checkpoints@arrowcollector68590.dfs.core.windows.net/campaigns/c0ffee00-0000-4000-8000-000000000001/runs/c0ffee00-0000-4000-8000-000000000002/dataflow/telemetry/sqlserver/sqlserver_availability_replica_states/',
     control_container_url: 'https://arrowcollector68590.blob.core.windows.net/checkpoints', sandbox_id: 'offline-stamp',
     reset_generation: 'c0ffee00-0000-4000-8000-000000000004',
   };
   const now = Date.now(), deadline = now + 60_000, publisherId = 'c0ffee00-0000-4000-8000-000000000011';
   const leaseIds = ['c0ffee00-0000-4000-8000-000000000012', 'c0ffee00-0000-4000-8000-000000000013'] as const;
-  const controlPlan = { publisher_id: publisherId, generation: authority.reset_generation, control_lease_ids: leaseIds } as const;
-  const url = authority.control_container_url + '?comp=lease&restype=container';
-  const makeAcquire = (id: number, leaseId: string) => signedControlRequest(authority, deadline, id, url,
-    [['x-ms-lease-action', 'acquire'], ['x-ms-lease-duration', '15'], ['x-ms-proposed-lease-id', leaseId]]);
-  const planned = makeAcquire(1, leaseIds[0]), random = makeAcquire(1, 'c0ffee00-0000-4000-8000-000000000099');
-  const envelope = envelopeForRequests(authority, [planned]), custody = mutableCustodyStore(authority, now);
-  const azure = { c: { account: authority.storage_account }, async token() { return 'offline-test-token'; } } as unknown as Azure;
-  let forwards = 0;
-  const dispatcher = new StorageBridgeDispatcher({ authority, originalDeadlineUnixMs: deadline, envelope, azure,
-    store: custody.store, ledgerPath: path.join(directory, 'storage-ledger.jsonl'), controlPlan,
-    planIdentity: { plan: controlPlan }, fetcher: async () => { forwards++; return new Response('', { status: 409 }); } });
-  const boundary = new EffectBoundary(envelope, path.join(directory, 'effects.jsonl'));
-  await assert.rejects(withEffectBoundary(boundary, () => dispatcher.exchange(random)), /next immutable plan identity/);
-  const failedAcquire = await withEffectBoundary(boundary, () => dispatcher.exchange(planned));
-  assert.equal(failedAcquire.outcome, 'response');
-  const reused = makeAcquire(2, leaseIds[0]);
-  await assert.rejects(withEffectBoundary(boundary, () => dispatcher.exchange(reused)));
-  const metadataFirst = signedControlRequest(authority, deadline, 1,
-    authority.control_container_url + '?restype=container&comp=metadata',
-    [['x-ms-lease-id', leaseIds[0]], ['x-ms-meta-publishers', JSON.stringify({ [publisherId]:
-      { generation: authority.reset_generation, state: 'active' } })]]);
-  await assert.rejects(withEffectBoundary(boundary, () => dispatcher.exchange(metadataFirst)));
-  assert.equal(forwards, 1);
-  assert.equal(dispatcher.recordedRequestCount, 1);
-  assert.equal(readFileSync(path.join(directory, 'storage-ledger.jsonl'), 'utf8').trim().split('\n').length, 3);
+  const controlPlan = { publisher_id: publisherId, generation: authority.reset_generation, control_lease_ids: leaseIds,
+    control_operation_ids: PLANNED_CONTROL_OPERATION_IDS } as const;
+  const base = authority.control_container_url, headUrl = base + '?restype=container';
+  const makeHead = (id: number, marker: string | undefined, extra: [string, string][] = []) => {
+    const request = signedControlRequest(authority, deadline, id, headUrl, extra, 'HEAD', marker);
+    return request;
+  };
+  const expected = makeHead(1, PLANNED_CONTROL_OPERATION_IDS[0]);
+  const missing = makeHead(1, undefined);
+  const duplicate = resignRequest(expected, [...expected.headers, ['x-arrowcol-operation-id', PLANNED_CONTROL_OPERATION_IDS[0]]]);
+  const unknown = makeHead(1, 'registration-read-unplanned');
+  const reused = makeHead(2, PLANNED_CONTROL_OPERATION_IDS[0], [['x-ms-version', '2023-11-04']]);
+  const mutated = makeHead(1, PLANNED_CONTROL_OPERATION_IDS[0], [['x-ms-version', '2023-11-04']]);
+  const variants = [missing, duplicate, unknown, reused, mutated];
+  for (const [index, invalid] of variants.entries()) {
+    const caseDir = path.join(directory, String(index));
+    const envelope = envelopeForRequests(authority, [expected, invalid]);
+    const custody = mutableCustodyStore(authority, now), azure = { c: { account: authority.storage_account },
+      async token() { return 'offline-test-token'; } } as unknown as Azure;
+    let forwards = 0;
+    const dispatcher = new StorageBridgeDispatcher({ authority, originalDeadlineUnixMs: deadline, envelope, azure,
+      store: custody.store, ledgerPath: path.join(caseDir, 'storage-ledger.jsonl'), controlPlan,
+      planIdentity: { plan: controlPlan }, fetcher: async () => { forwards++; return new Response(null, { status: 200 }); } });
+    const boundary = new EffectBoundary(envelope, path.join(caseDir, 'effects.jsonl'));
+    await assert.rejects(withEffectBoundary(boundary, () => dispatcher.exchange(invalid)));
+    assert.equal(forwards, 0);
+    assert.equal(dispatcher.recordedRequestCount, 0);
+  }
 });
-
-test('planned control restart serves the exact cached reply and refuses new mutations', async t => {
+test('planned control restart serves an exact cached reply without forwarding again', async t => {
   const directory = mkdtempSync(path.join(os.tmpdir(), 'oat-d47-planned-restart-'));
   chmodSync(directory, 0o700);
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   const authority: StorageBridgeAuthority = {
-    campaign_id: 'c0ffee00-0000-4000-8000-000000000001',
-    cell_run_id: 'c0ffee00-0000-4000-8000-000000000002',
-    owner_id: 'c0ffee00-0000-4000-8000-000000000003', fencing_token: 1,
-    storage_account: 'arrowcollector68590',
+    campaign_id: 'c0ffee00-0000-4000-8000-000000000001', cell_run_id: 'c0ffee00-0000-4000-8000-000000000002',
+    owner_id: 'c0ffee00-0000-4000-8000-000000000003', fencing_token: 1, storage_account: 'arrowcollector68590',
     table_root_url: 'abfss://checkpoints@arrowcollector68590.dfs.core.windows.net/campaigns/c0ffee00-0000-4000-8000-000000000001/runs/c0ffee00-0000-4000-8000-000000000002/dataflow/telemetry/sqlserver/sqlserver_availability_replica_states/',
     control_container_url: 'https://arrowcollector68590.blob.core.windows.net/checkpoints', sandbox_id: 'offline-stamp',
     reset_generation: 'c0ffee00-0000-4000-8000-000000000004',
   };
   const now = Date.now(), deadline = now + 60_000, publisherId = 'c0ffee00-0000-4000-8000-000000000011';
   const leaseIds = ['c0ffee00-0000-4000-8000-000000000012', 'c0ffee00-0000-4000-8000-000000000013'] as const;
-  const controlPlan = { publisher_id: publisherId, generation: authority.reset_generation, control_lease_ids: leaseIds } as const;
-  const leaseUrl = authority.control_container_url + '?comp=lease&restype=container';
-  const acquire = signedControlRequest(authority, deadline, 1, leaseUrl,
-    [['x-ms-lease-action', 'acquire'], ['x-ms-lease-duration', '15'], ['x-ms-proposed-lease-id', leaseIds[0]]]);
-  const metadata = signedControlRequest(authority, deadline, 2,
-    authority.control_container_url + '?restype=container&comp=metadata',
-    [['x-ms-lease-id', leaseIds[0]], ['x-ms-meta-publishers', JSON.stringify({ [publisherId]:
-      { generation: authority.reset_generation, state: 'active' } })]]);
-  const envelope = envelopeForRequests(authority, [acquire, metadata]), custody = mutableCustodyStore(authority, now);
+  const controlPlan = { publisher_id: publisherId, generation: authority.reset_generation, control_lease_ids: leaseIds,
+    control_operation_ids: PLANNED_CONTROL_OPERATION_IDS } as const;
+  const read = signedControlRequest(authority, deadline, 1, authority.control_container_url + '?restype=container', [], 'HEAD',
+    PLANNED_CONTROL_OPERATION_IDS[0]);
+  const acquire = signedControlRequest(authority, deadline, 2, authority.control_container_url + '?comp=lease&restype=container',
+    [['x-ms-lease-action', 'acquire'], ['x-ms-lease-duration', '15'], ['x-ms-proposed-lease-id', leaseIds[0]]], 'PUT',
+    PLANNED_CONTROL_OPERATION_IDS[1]);
+  const envelope = envelopeForRequests(authority, [read, acquire]), custody = mutableCustodyStore(authority, now);
   const azure = { c: { account: authority.storage_account }, async token() { return 'offline-test-token'; } } as unknown as Azure;
   const ledgerPath = path.join(directory, 'storage-ledger.jsonl');
   let forwards = 0;
   const create = () => new StorageBridgeDispatcher({ authority, originalDeadlineUnixMs: deadline, envelope, azure,
     store: custody.store, ledgerPath, controlPlan, planIdentity: { plan: controlPlan },
-    fetcher: async () => { forwards++; return new Response('', { status: 201 }); } });
+    fetcher: async () => { forwards++; return new Response(null, { status: 200 }); } });
   const boundary = new EffectBoundary(envelope, path.join(directory, 'effects.jsonl'));
-  const first = create();
-  const initial = await withEffectBoundary(boundary, () => first.exchange(acquire));
+  const first = create(), initial = await withEffectBoundary(boundary, () => first.exchange(read));
   assert.equal(initial.outcome, 'response');
   const restarted = create();
-  assert.deepEqual(await withEffectBoundary(boundary, () => restarted.exchange(acquire)), initial);
-  await assert.rejects(withEffectBoundary(boundary, () => restarted.exchange(metadata)), /recovered bridge ledger permits cached replies and bounded reads only/);
+  assert.deepEqual(await withEffectBoundary(boundary, () => restarted.exchange(read)), initial);
+  await assert.rejects(withEffectBoundary(boundary, () => restarted.exchange(acquire)), /recovered bridge ledger permits cached replies and bounded reads only/);
   assert.equal(forwards, 1);
 });
 test('real loadgen initializer composes with the Node BR3 planned-identity parent', { skip: !process.env.OAT_BR3_LOADGEN_BIN }, async t => {
@@ -504,20 +504,36 @@ test('real loadgen initializer composes with the Node BR3 planned-identity paren
     sandbox_id: 'offline-stamp', reset_generation: generation };
   const plan = { account, container, campaign_root: campaignRoot, run_root: runRoot, campaign_id: campaign, run_id: run,
     generation, publisher_id: publisherId, control_lease_ids: [...controlLeaseIds],
+    control_operation_ids: [...PLANNED_CONTROL_OPERATION_IDS],
     table: 'telemetry.sqlserver.sqlserver_availability_replica_states', partition_by_ingestion_date: true,
     owner_id: owner, fencing_token: 1 };
   const planPath = path.join(directory, 'plan.json'), bridgeInputPath = path.join(directory, 'bridge-input.json');
   writeFileSync(planPath, JSON.stringify(plan)); chmodSync(planPath, 0o600);
   writeFileSync(bridgeInputPath, JSON.stringify({ authority, original_deadline_unix_ms: deadline })); chmodSync(bridgeInputPath, 0o600);
-  const seed = signedRequest(authority, deadline);
-  const envelope = envelopeFor(authority, seed);
+  const firstHead = signedControlRequest(authority, deadline, 1,
+    authority.control_container_url + '?restype=container', [], 'HEAD');
+  const acquire = signedControlRequest(authority, deadline, 2,
+    authority.control_container_url + '?comp=lease&restype=container',
+    [['x-ms-lease-action', 'acquire'], ['x-ms-lease-duration', '15'], ['x-ms-proposed-lease-id', controlLeaseIds[0]]]);
+  const secondHead = signedControlRequest(authority, deadline, 3,
+    authority.control_container_url + '?restype=container', [], 'HEAD');
+  const envelope = envelopeForRequests(authority, [firstHead, acquire, secondHead]);
   const custody = mutableCustodyStore(authority, now);
   const azure = { c: { account }, async token() { return 'offline-test-token'; } } as unknown as Azure;
   const ledgerPath = path.join(directory, 'storage-ledger.jsonl');
   const options = { executable, artifactIdentity: { source_commit: '2d329ab907f15c8123a08b933c01d98670bfd755',
     executable_sha256: createHash('sha256').update(readFileSync(executable)).digest('hex') }, planPath, bridgeInputPath,
     ledgerPath, rootDirectory: process.cwd(), envelope, store: custody.store, azure,
-    fetcher: async () => new Response('', { status: 500 }), now: Date.now };
+    fetcher: async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input)), headers = new Headers(init?.headers);
+      if (init?.method === 'HEAD') return new Response(null, { status: 200, headers: { etag: '\"offline-etag\"',
+        'x-ms-meta-sandboxid': 'offline-stamp', 'x-ms-meta-resetstate': 'ready-v1', 'x-ms-meta-resetgeneration': generation,
+        'x-ms-meta-publisherregistryversion': '1', 'x-ms-meta-publishers': '{}', 'x-ms-meta-occupancy': 'released' } });
+      if (url.searchParams.get('comp') === 'lease' && headers.get('x-ms-lease-action') === 'acquire')
+        return new Response(null, { status: 201, headers: { 'x-ms-lease-id': headers.get('x-ms-proposed-lease-id')! } });
+      if (init?.method === 'PUT') return new Response(null, { status: 200 });
+      return new Response('', { status: 500 });
+    }, now: Date.now };
   const boundary = new EffectBoundary(envelope, path.join(directory, 'effects.jsonl'));
   if (process.env.OAT_BR3_DISCOVER === '1') {
     try { await withEffectBoundary(boundary, () => initializeOwnedRunTable(options)); }

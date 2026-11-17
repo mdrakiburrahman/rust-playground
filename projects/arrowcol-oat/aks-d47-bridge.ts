@@ -14,6 +14,11 @@ const MAX_OUTPUT = 1024 * 1024;
 const MAX_STORAGE_BODY = 1024 * 1024;
 const STORAGE_RESOURCE = 'https://storage.azure.com/';
 const VOLATILE_STORAGE_EFFECT_HEADERS = new Set(['x-ms-client-request-id', 'date', 'x-ms-date']);
+export const PLANNED_CONTROL_OPERATION_IDS = [
+  'registration-read', 'registration-acquire', 'registration-compare-read', 'registration-metadata-write',
+  'registration-release', 'commit-authority-read', 'terminal-read', 'terminal-acquire', 'terminal-compare-read',
+  'terminal-metadata-write', 'terminal-release',
+] as const;
 type Obj = Record<string, unknown>;
 
 export interface FixtureAuthority { campaign_id: string; cell_run_id: string; owner_id: string; fencing_token: number;
@@ -45,11 +50,14 @@ export type StorageBridgeReply =
 export interface StorageDispatcherOptions { authority: StorageBridgeAuthority; originalDeadlineUnixMs: number;
   envelope: EffectEnvelope; azure: Azure; store: CampaignStore; ledgerPath: string; phase?: string; planIdentity?: unknown;
   controlPlan?: PlannedControlPlan; fetcher?: typeof fetch; now?: () => number }
-interface PlannedControlPlan { publisher_id: string; generation: string; control_lease_ids: readonly [string, string] }
+interface PlannedControlPlan { publisher_id: string; generation: string; control_lease_ids: readonly [string, string];
+  control_operation_ids: readonly string[] }
 interface PlannedControlProgress { stage: 0 | 1; phase: 'acquire' | 'metadata' | 'release' | 'blocked' | 'done';
-  registered: boolean; metadataState?: 'active' | 'uncertain' | 'removed'; complete: boolean }
-interface PlannedControlStep { kind: 'acquire' | 'metadata' | 'release'; stage: 0 | 1; leaseId: string;
-  metadataState?: 'active' | 'uncertain' | 'removed' }
+  registered: boolean; metadataState?: 'active' | 'uncertain' | 'removed'; complete: boolean; operationIndex: number }
+type PlannedControlStep =
+  | { kind: 'read'; stage: 0 | 1 }
+  | { kind: 'acquire' | 'release'; stage: 0 | 1; leaseId: string }
+  | { kind: 'metadata'; stage: 0 | 1; leaseId: string; metadataState: 'active' | 'uncertain' | 'removed' };
 
 function object(value: unknown): value is Obj { return value !== null && typeof value === 'object' && !Array.isArray(value); }
 function exact(value: Obj, keys: string[]): boolean { return Object.keys(value).sort().join(',') === keys.slice().sort().join(','); }
@@ -319,6 +327,12 @@ class DurableBridgeLedger {
     this.append(record); this.terminal = record;
   }
   terminalReceipt(): unknown | undefined { return this.terminal?.receipt; }
+  storageControlOperationMarkers(): string[][] {
+    return [...this.records.values()].sort((left, right) => left.request_id - right.request_id)
+      .filter(record => record.request_evidence?.target === 'control')
+      .map(record => record.request_evidence!.headers.filter(([name]) => name.toLowerCase() === 'x-arrowcol-operation-id')
+        .map(([, value]) => value));
+  }
   get requestCount(): number { return this.maxId; }
 }
 function ledgerBinding(scope: string, authority: unknown, deadline: number, phase: string, plan: unknown,
@@ -669,7 +683,7 @@ function storageHeaderAllowed(name: string, response: boolean): boolean {
       'content-range','x-ms-error-code','x-ms-blob-type','x-ms-blob-content-md5','x-ms-lease-status','x-ms-lease-state',
       'x-ms-lease-duration','x-ms-creation-time','x-ms-server-encrypted','transfer-encoding'] : ['if-match','if-none-match',
       'if-modified-since','if-unmodified-since','range','x-ms-range','x-ms-lease-action','x-ms-lease-duration',
-      'x-ms-proposed-lease-id','x-ms-blob-type','user-agent','accept','accept-encoding'])].includes(name);
+      'x-ms-proposed-lease-id','x-ms-blob-type','x-arrowcol-operation-id','user-agent','accept','accept-encoding'])].includes(name);
 }
 function validateStorageRoute(target: StorageBridgeRequest['target'], method: string, url: URL,
   headers: [string, string][], body: Buffer, authority: StorageBridgeAuthority): void {
@@ -737,7 +751,12 @@ export class StorageBridgeDispatcher {
     this.ledger = new DurableBridgeLedger(options.ledgerPath, ledgerBinding('storage-http', options.authority,
       options.originalDeadlineUnixMs, options.phase ?? 'storage-http', options.planIdentity ?? options.authority, this.envelope));
     this.recoveredLedger = this.ledger.requestCount > 0;
-    this.controlProgress = options.controlPlan ? { stage: 0, phase: 'acquire', registered: false, complete: false } : undefined;
+    const consumedMarkers = this.ledger.storageControlOperationMarkers();
+    if (options.controlPlan && consumedMarkers.some((values, index) => values.length !== 1 ||
+        values[0] !== options.controlPlan!.control_operation_ids[index]))
+      throw new Error('Recovered control-operation marker history is missing, duplicated, reordered or unknown.');
+    this.controlProgress = options.controlPlan ? { stage: 0, phase: 'acquire', registered: false, complete: false,
+      operationIndex: consumedMarkers.length } : undefined;
     this.campaignStore = boundedCampaignStore(options.store, { campaign_id: options.authority.campaign_id,
       cell_run_id: options.authority.cell_run_id, owner_id: options.authority.owner_id,
       fencing_token: options.authority.fencing_token }, options.originalDeadlineUnixMs, this.envelope, this.now, false);
@@ -746,36 +765,57 @@ export class StorageBridgeDispatcher {
   get recordedRequestCount(): number { return this.ledger.requestCount; }
   recordTerminalEvidence(value: unknown): void { this.ledger.recordTerminal(value); }
   assertControlPlanComplete(): void {
-    if (this.options.controlPlan && (this.recoveredLedger || !this.controlProgress?.complete))
-      throw new Error('Owned-run initializer did not consume both planned control identities in the exact registration/drain trace.');
+    if (this.options.controlPlan && (this.recoveredLedger || !this.controlProgress?.complete ||
+        this.controlProgress.operationIndex !== this.options.controlPlan.control_operation_ids.length))
+      throw new Error('Owned-run initializer did not consume the exact planned control-operation trace through clean release.');
   }
   private plannedControlStep(request: StorageBridgeRequest): PlannedControlStep | undefined {
     const plan = this.options.controlPlan, progress = this.controlProgress;
-    if (!plan || !progress || request.method === 'GET' || request.method === 'HEAD') return undefined;
-    if (this.recoveredLedger) throw new Error('A recovered bridge ledger permits cached replies and bounded reads only; mutating replay is forbidden.');
+    const marker = singleHeader(request.headers, 'x-arrowcol-operation-id');
+    if (!plan || !progress) {
+      if (marker !== undefined) throw new Error('Control-operation markers are reserved for immutable planned bridge requests.');
+      return undefined;
+    }
+    if (this.recoveredLedger && request.method !== 'GET' && request.method !== 'HEAD')
+      throw new Error('A recovered bridge ledger permits cached replies and bounded reads only; mutating replay is forbidden.');
     if (request.target === 'object_store') {
-      if (!progress.registered || progress.stage !== 1 || progress.phase !== 'acquire')
+      if (marker !== undefined) throw new Error('Control-operation markers are not valid on object-store requests.');
+      if (!progress.registered || progress.stage !== 1 || progress.phase !== 'acquire' || progress.operationIndex !== 6)
         throw new Error('Object-store effects require the exact planned publisher registration before terminal drain.');
       return undefined;
     }
+    const index = progress.operationIndex, expectedMarker = plan.control_operation_ids[index];
+    if (expectedMarker === undefined || marker !== expectedMarker)
+      throw new Error('Control request is missing, reuses, reorders or substitutes its exact planned operation marker.');
     const url = new URL(request.url), leaseId = plan.control_lease_ids[progress.stage];
+    const expectedRead = [0, 2, 5, 6, 8].includes(index);
+    if (expectedRead) {
+      const expectedState = index === 0 ? progress.stage === 0 && progress.phase === 'acquire' && !progress.registered :
+        index === 2 ? progress.stage === 0 && progress.phase === 'metadata' && !progress.registered :
+        index === 5 || index === 6 ? progress.stage === 1 && progress.phase === 'acquire' && progress.registered :
+        progress.stage === 1 && progress.phase === 'metadata' && progress.registered;
+      if (request.method !== 'HEAD' || url.searchParams.size !== 1 || url.searchParams.get('restype') !== 'container' || !expectedState)
+        throw new Error('Planned control read does not match its exact operation phase and order.');
+      return { kind: 'read', stage: progress.stage };
+    }
+    if (request.method !== 'PUT') throw new Error('Planned control mutation has the wrong HTTP method for its operation marker.');
     if (url.searchParams.get('comp') === 'lease') {
       const action = singleHeader(request.headers, 'x-ms-lease-action');
-      if (action === 'acquire') {
+      if (action === 'acquire' && [1, 7].includes(index)) {
         const proposed = singleHeader(request.headers, 'x-ms-proposed-lease-id');
         if (progress.phase !== 'acquire' || proposed !== leaseId)
           throw new Error('Control lease acquisition does not match the next immutable plan identity.');
         return { kind: 'acquire', stage: progress.stage, leaseId };
       }
-      if (action === 'release') {
+      if (action === 'release' && [4, 10].includes(index)) {
         const supplied = singleHeader(request.headers, 'x-ms-lease-id');
         if (progress.phase !== 'release' || supplied !== leaseId)
           throw new Error('Control lease release does not match the active immutable plan identity.');
         return { kind: 'release', stage: progress.stage, leaseId };
       }
-      throw new Error('Planned control lease action is not permitted.');
+      throw new Error('Planned control lease action does not match its allocated operation marker.');
     }
-    if (url.searchParams.get('comp') === 'metadata') {
+    if (url.searchParams.get('comp') === 'metadata' && [3, 9].includes(index)) {
       const supplied = singleHeader(request.headers, 'x-ms-lease-id');
       if (progress.phase !== 'metadata' || supplied !== leaseId)
         throw new Error('Control metadata write does not match the active immutable plan identity.');
@@ -787,6 +827,8 @@ export class StorageBridgeDispatcher {
   private recordPlannedControlResponse(step: PlannedControlStep | undefined, reply: StorageBridgeReply): void {
     if (!step || !this.controlProgress) return;
     const progress = this.controlProgress;
+    progress.operationIndex++;
+    if (step.kind === 'read') return;
     if (step.kind === 'acquire') {
       if (reply.outcome === 'response' && reply.status === 201) progress.phase = 'metadata';
       else if (reply.outcome === 'unknown' || reply.outcome === 'response' && reply.status >= 500) progress.phase = 'release';
@@ -934,7 +976,8 @@ export async function runFixtureSetupChild(executable: string, inputPath: string
   return dispatcher.validateReceipt(result.receipt);
 }
 interface OwnedRunTablePlan { account: string; container: string; campaign_root: string; run_root: string; campaign_id: string; run_id: string;
-  generation: string; publisher_id: string; control_lease_ids: [string, string]; table: string; partition_by_ingestion_date: boolean;
+  generation: string; publisher_id: string; control_lease_ids: [string, string]; control_operation_ids: string[];
+  table: string; partition_by_ingestion_date: boolean;
   owner_id: string; fencing_token: number }
 export interface OwnedRunTableReceipt { allocation: OwnedRunTablePlan; delta: { table_id: string; version: number; schema_json: string;
   partition_columns: string[]; active_files: number }; publisher_drained: true }
@@ -955,7 +998,7 @@ export interface OwnedRunInitializerOptions extends Omit<StorageDispatcherOption
 }
 function validateOwnedRunTablePlan(value: unknown): asserts value is OwnedRunTablePlan {
   const keys = ['account','container','campaign_root','run_root','campaign_id','run_id','generation','publisher_id',
-    'control_lease_ids','table','partition_by_ingestion_date','owner_id','fencing_token'];
+    'control_lease_ids','control_operation_ids','table','partition_by_ingestion_date','owner_id','fencing_token'];
   if (!object(value) || !exact(value, keys) || typeof value.account !== 'string' || !/^[a-z0-9]{3,24}$/.test(value.account) ||
       typeof value.container !== 'string' || !/^[a-z0-9](?:[a-z0-9-]{1,61}[a-z0-9])?$/.test(value.container) ||
       typeof value.campaign_root !== 'string' || typeof value.run_root !== 'string' || typeof value.table !== 'string' ||
@@ -968,6 +1011,9 @@ function validateOwnedRunTablePlan(value: unknown): asserts value is OwnedRunTab
   value.control_lease_ids.forEach((id, index) => uuidV4(id, 'planned control lease ' + index));
   if (new Set([value.publisher_id, ...value.control_lease_ids]).size !== 3)
     throw new Error('Owned-run publisher and control lease identities must be distinct.');
+  if (!Array.isArray(value.control_operation_ids) || !equal(value.control_operation_ids, PLANNED_CONTROL_OPERATION_IDS) ||
+      new Set(value.control_operation_ids).size !== PLANNED_CONTROL_OPERATION_IDS.length)
+    throw new Error('Owned-run plan must allocate the exact unique ordered control-operation markers before envelope creation.');
   integer(value.fencing_token, 1, Number.MAX_SAFE_INTEGER, 'fencing token');
   const root = (raw: string): URL => {
     let url: URL; try { url = new URL(raw); } catch { throw new Error('Owned-run table plan root is invalid.'); }
@@ -990,6 +1036,9 @@ function validatePlannedControlPlan(value: PlannedControlPlan): void {
   value.control_lease_ids.forEach((id, index) => uuidV4(id, 'planned control lease ' + index));
   if (new Set([value.publisher_id, ...value.control_lease_ids]).size !== 3)
     throw new Error('Planned publisher and control lease identities must be distinct.');
+  if (!Array.isArray(value.control_operation_ids) || !equal(value.control_operation_ids, PLANNED_CONTROL_OPERATION_IDS) ||
+      new Set(value.control_operation_ids).size !== PLANNED_CONTROL_OPERATION_IDS.length)
+    throw new Error('Storage bridge requires the exact unique ordered planned control-operation markers.');
 }
 function plannedPublisherState(headers: [string, string][], plan: PlannedControlPlan, stage: 0 | 1): 'active' | 'uncertain' | 'removed' {
   const raw = singleHeader(headers, 'x-ms-meta-publishers');
@@ -1073,7 +1122,8 @@ export async function initializeOwnedRunTable(options: OwnedRunInitializerOption
   const dispatcher = new StorageBridgeDispatcher({ authority, originalDeadlineUnixMs: deadline, envelope: options.envelope,
     azure: options.azure, store: options.store, ledgerPath: options.ledgerPath, phase: 'owned-run-table-initialization',
     planIdentity: { plan, artifact_identity: artifactIdentity },
-    controlPlan: { publisher_id: plan.publisher_id, generation: plan.generation, control_lease_ids: plan.control_lease_ids },
+    controlPlan: { publisher_id: plan.publisher_id, generation: plan.generation, control_lease_ids: plan.control_lease_ids,
+      control_operation_ids: plan.control_operation_ids },
     fetcher: options.fetcher, now });
   const cached = dispatcher.terminalEvidence();
   if (cached !== undefined) {

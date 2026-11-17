@@ -339,6 +339,11 @@ pub trait ControlMetadata: Send + Sync + fmt::Debug {
     ) -> CasOutcome {
         CasOutcome::Rejected("control metadata backend does not support planned lease identities".into())
     }
+
+    /// Reject successful completion when a planned control operation was unused.
+    fn verify_planned_control_operations(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// A metadata transition was sent without a definite outcome. The member, if
@@ -643,11 +648,12 @@ fn causes<'a>(error: &'a object_store::Error) -> impl Iterator<Item = &'a (dyn s
         cause.source()
     })
 }
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct PlannedPublisherIdentities {
     publisher_id: Uuid,
     registration_lease_id: Uuid,
     terminal_lease_id: Uuid,
+    control_operation_ids: Vec<String>,
 }
 
 struct Registration {
@@ -1005,6 +1011,7 @@ impl PublisherSession {
         bridge: Arc<crate::qap_http::StorageBridge>,
         publisher_id: Uuid,
         control_lease_ids: [Uuid; 2],
+        control_operation_ids: Vec<String>,
     ) -> Result<Arc<Self>> {
         Self::open_bridged(
             url,
@@ -1013,6 +1020,7 @@ impl PublisherSession {
                 publisher_id,
                 registration_lease_id: control_lease_ids[0],
                 terminal_lease_id: control_lease_ids[1],
+                control_operation_ids,
             }),
         )
         .await
@@ -1025,7 +1033,12 @@ impl PublisherSession {
     ) -> Result<Arc<Self>> {
         bridge.validate_root(url)?;
         let authority = bridge.authority().clone();
-        let control = Arc::new(AzureControlContainer::bridged(Arc::clone(&bridge)));
+        let control = Arc::new(match &planned {
+            Some(identities) => AzureControlContainer::bridged_with_plan(
+                Arc::clone(&bridge), identities.control_operation_ids.clone(),
+            ),
+            None => AzureControlContainer::bridged(Arc::clone(&bridge)),
+        });
         Self::register(
             control,
             authority.sandbox_id,
@@ -1174,14 +1187,14 @@ impl PublisherSession {
         } else if mode == SessionMode::Bootstrap {
             bail!("bootstrap requires the operator's captured expected reset generation");
         }
-        let publisher = planned.map_or_else(Uuid::new_v4, |identities| identities.publisher_id);
+        let publisher = planned.as_ref().map_or_else(Uuid::new_v4, |identities| identities.publisher_id);
         let mut generation = String::new();
         transition(
             control.as_ref(),
             &sandbox_id,
             publisher,
             "registration",
-            planned.map(|identities| identities.registration_lease_id),
+            planned.as_ref().map(|identities| identities.registration_lease_id),
             |registry| {
             if let Some(expected) = expected_generation
                 && registry.generation != expected
@@ -1232,13 +1245,16 @@ impl PublisherSession {
                 sandbox_id,
                 publisher,
                 generation,
-                planned_terminal_lease_id: planned.map(|identities| identities.terminal_lease_id),
+                planned_terminal_lease_id: planned.as_ref().map(|identities| identities.terminal_lease_id),
                 planned_terminal_used: AtomicBool::new(false),
             }),
             close: tokio::sync::Mutex::new(()),
         }))
     }
     pub fn verify_planned_control_identities(&self) -> Result<()> {
+        if let Some(registration) = &self.registration {
+            registration.control.verify_planned_control_operations()?;
+        }
         if let Some(registration) = &self.registration
             && registration.planned_terminal_lease_id.is_some()
             && !registration.planned_terminal_used.load(Ordering::Acquire)

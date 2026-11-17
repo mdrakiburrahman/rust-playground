@@ -218,7 +218,7 @@ mod storage_bridge {
                     | "date"
                     | "x-ms-version"
                     | "x-ms-date"
-                    | "x-ms-client-request-id"
+                    | "x-arrowcol-operation-id" | "x-ms-client-request-id"
                     | "x-ms-request-id"
                     | "x-ms-lease-id"
             )

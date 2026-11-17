@@ -21,6 +21,19 @@ use crate::{
 };
 
 const INGESTION: &str = INGESTION_PARTITION;
+const PLANNED_CONTROL_OPERATION_IDS: [&str; 11] = [
+    "registration-read",
+    "registration-acquire",
+    "registration-compare-read",
+    "registration-metadata-write",
+    "registration-release",
+    "commit-authority-read",
+    "terminal-read",
+    "terminal-acquire",
+    "terminal-compare-read",
+    "terminal-metadata-write",
+    "terminal-release",
+];
 
 /// Strict input allocation for one fresh table, not permission to execute cloud operations.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -44,6 +57,8 @@ pub struct OwnedRunTablePlan {
     pub publisher_id: String,
     /// Ordered registration and terminal control-container lease identities.
     pub control_lease_ids: Vec<String>,
+    /// Ordered operation markers for every control request in admission, create and drain.
+    pub control_operation_ids: Vec<String>,
     /// Frozen canonical identity; no arbitrary schema or table selection.
     pub table: String,
     /// Must select the existing ingestion partition.
@@ -73,6 +88,9 @@ impl OwnedRunTablePlan {
             if !identities.insert(identity.clone()) {
                 bail!("owned-run publisher and control lease identities must be distinct");
             }
+        }
+        if self.control_operation_ids.iter().map(String::as_str).ne(PLANNED_CONTROL_OPERATION_IDS) {
+            bail!("owned-run plan must allocate the exact ordered control-operation markers before envelope creation");
         }
         if self.fencing_token == 0
             || !self.partition_by_ingestion_date
@@ -327,7 +345,10 @@ where
     let bridge = StorageBridge::new(input.authority.clone(), input.original_deadline_unix_ms, reader, writer)?;
     let publisher_id = canonical_uuid(&plan.publisher_id)?;
     let control_lease_ids = [canonical_uuid(&plan.control_lease_ids[0])?, canonical_uuid(&plan.control_lease_ids[1])?];
-    let session = PublisherSession::open_bridged_with_plan_async(&url, bridge, publisher_id, control_lease_ids).await?;
+    let session = PublisherSession::open_bridged_with_plan_async(
+        &url, bridge, publisher_id, control_lease_ids, plan.control_operation_ids.clone(),
+    )
+    .await?;
     let data = session.store_for_url(&url).map(|store| FreshTableTransport {
         store,
         mutation_retries: MutationRetries::Disabled,

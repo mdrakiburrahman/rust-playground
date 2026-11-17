@@ -21,6 +21,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 const API_VERSION: &str = "2023-11-03";
@@ -44,6 +45,12 @@ pub(crate) struct AzureControlContainer {
     transport: ControlTransport,
     endpoint: String,
     sandbox_id: String,
+    planned_operation_ids: Option<Arc<PlannedOperationIds>>,
+}
+
+struct PlannedOperationIds {
+    ids: Vec<String>,
+    next: AtomicUsize,
 }
 
 enum ControlTransport {
@@ -245,6 +252,7 @@ impl AzureControlContainer {
             },
             endpoint,
             sandbox_id,
+            planned_operation_ids: None,
         })
     }
 
@@ -253,6 +261,22 @@ impl AzureControlContainer {
             endpoint: bridge.authority().control_container_url.clone(),
             sandbox_id: bridge.authority().sandbox_id.clone(),
             transport: ControlTransport::Bridge(bridge),
+            planned_operation_ids: None,
+        }
+    }
+
+    pub(crate) fn bridged_with_plan(
+        bridge: Arc<crate::qap_http::StorageBridge>,
+        operation_ids: Vec<String>,
+    ) -> Self {
+        Self {
+            endpoint: bridge.authority().control_container_url.clone(),
+            sandbox_id: bridge.authority().sandbox_id.clone(),
+            transport: ControlTransport::Bridge(bridge),
+            planned_operation_ids: Some(Arc::new(PlannedOperationIds {
+                ids: operation_ids,
+                next: AtomicUsize::new(0),
+            })),
         }
     }
 
@@ -268,11 +292,24 @@ impl AzureControlContainer {
                 return Exchange::NotSent("invalid Azure control request".into());
             };
             *request.uri_mut() = uri;
+            let operation_id = if let Some(planned) = &self.planned_operation_ids {
+                let index = planned.next.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    (current < planned.ids.len()).then_some(current + 1)
+                });
+                let Ok(index) = index else {
+                    return Exchange::NotSent("planned control-operation markers exhausted".into());
+                };
+                Some(planned.ids[index].as_str())
+            } else {
+                None
+            };
             let client_request_id = uuid::Uuid::new_v4().to_string();
             let date = chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+            let operation_header = operation_id.map(|id| ("x-arrowcol-operation-id", id));
             for (name, value) in headers
                 .iter()
                 .map(|(k, v)| (k.as_str(), v.as_str()))
+                .chain(operation_header)
                 .chain([("x-ms-client-request-id", client_request_id.as_str()),
                     ("x-ms-version", API_VERSION), ("x-ms-date", date.as_str())])
             {
@@ -476,6 +513,15 @@ impl ControlMetadata for AzureControlContainer {
         lease_id: uuid::Uuid,
     ) -> CasOutcome {
         self.compare_and_set_inner(expected, metadata, lease_id).await
+    }
+
+    fn verify_planned_control_operations(&self) -> Result<()> {
+        if let Some(planned) = &self.planned_operation_ids
+            && planned.next.load(Ordering::Acquire) != planned.ids.len()
+        {
+            bail!("owned-run control operation markers were not fully consumed before success");
+        }
+        Ok(())
     }
 }
 
