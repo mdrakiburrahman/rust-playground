@@ -1604,10 +1604,17 @@ mod target_readback_tests {
         Ok(())
     }
 
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum TargetChange {
+        Identity,
+        InvalidMetadata,
+        MissingLog,
+    }
+
     struct AdvancingTarget {
         table: DiscoveredTable,
         on_clock: bool,
-        fail_refresh: bool,
+        change: TargetChange,
         advanced: AtomicBool,
     }
 
@@ -1622,6 +1629,10 @@ mod target_readback_tests {
                 .to_file_path()
                 .map_err(|()| anyhow::anyhow!("table path"))?
                 .join("_delta_log/00000000000000000000.json");
+            if self.change == TargetChange::MissingLog {
+                std::fs::remove_file(path)?;
+                return Ok(());
+            }
             let original = std::fs::read_to_string(&path)?;
             let mut actions = original
                 .lines()
@@ -1632,7 +1643,7 @@ mod target_readback_tests {
                     metadata["id"] = serde_json::json!("replacement-table-id");
                 }
             }
-            let replacement = if self.fail_refresh {
+            let replacement = if self.change == TargetChange::InvalidMetadata {
                 String::from("invalid metadata JSON\n")
             } else {
                 actions
@@ -1664,7 +1675,8 @@ mod target_readback_tests {
         }
     }
 
-    fn stale_target_case(in_setup: bool, fail_refresh: bool) -> Result<()> {
+    fn stale_target_case(in_setup: bool, change: TargetChange) -> Result<()> {
+        let fail_refresh = change != TargetChange::Identity;
         let root = tempfile::tempdir()?;
         let url = Url::from_directory_path(root.path().join("events")).map_err(|()| anyhow::anyhow!("table URL"))?;
         DeltaTable::initialize_url_for_bootstrap(
@@ -1680,7 +1692,7 @@ mod target_readback_tests {
                 log_token: None,
             },
             on_clock: !in_setup,
-            fail_refresh,
+            change,
             advanced: AtomicBool::new(false),
         };
         let settings = Settings {
@@ -1785,22 +1797,32 @@ mod target_readback_tests {
 
     #[test]
     fn stale_target_setup_latches_new_metadata_identity() -> Result<()> {
-        stale_target_case(true, false)
+        stale_target_case(true, TargetChange::Identity)
     }
 
     #[test]
     fn stale_target_setup_failed_refresh_is_unresolved() -> Result<()> {
-        stale_target_case(true, true)
+        stale_target_case(true, TargetChange::InvalidMetadata)
     }
 
     #[test]
     fn stale_target_operation_latches_new_metadata_identity() -> Result<()> {
-        stale_target_case(false, false)
+        stale_target_case(false, TargetChange::Identity)
     }
 
     #[test]
     fn stale_target_operation_failed_refresh_is_unresolved() -> Result<()> {
-        stale_target_case(false, true)
+        stale_target_case(false, TargetChange::InvalidMetadata)
+    }
+
+    #[test]
+    fn stale_target_setup_missing_log_is_unresolved() -> Result<()> {
+        stale_target_case(true, TargetChange::MissingLog)
+    }
+
+    #[test]
+    fn stale_target_operation_missing_log_is_unresolved() -> Result<()> {
+        stale_target_case(false, TargetChange::MissingLog)
     }
 
     #[test]
