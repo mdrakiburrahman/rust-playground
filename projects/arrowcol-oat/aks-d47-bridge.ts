@@ -57,9 +57,9 @@ interface PlannedControlPlan { publisher_id: string; generation: string; control
   control_operation_ids: readonly string[]; storage_operation_ids: readonly string[] }
 interface PlannedControlProgress { stage: 0 | 1; phase: 'acquire' | 'metadata' | 'release' | 'blocked' | 'done';
   registered: boolean; metadataState?: 'active' | 'uncertain' | 'removed'; complete: boolean; operationIndex: number }
-type PlannedControlStep =
 interface PlannedStorageProgress { operationIndex: number; blocked: boolean }
 interface PlannedStorageStep { operationIndex: number }
+type PlannedControlStep =
   | { kind: 'read'; stage: 0 | 1 }
   | { kind: 'acquire' | 'release'; stage: 0 | 1; leaseId: string }
   | { kind: 'metadata'; stage: 0 | 1; leaseId: string; metadataState: 'active' | 'uncertain' | 'removed' };

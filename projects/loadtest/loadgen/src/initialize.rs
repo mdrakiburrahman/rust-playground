@@ -131,7 +131,9 @@ impl OwnedRunTablePlan {
             .map(String::as_str)
             .ne(PLANNED_STORAGE_OPERATION_IDS)
         {
-            bail!("owned-run plan must allocate the exact ordered object-store operation markers before envelope creation");
+            bail!(
+                "owned-run plan must allocate the exact ordered object-store operation markers before envelope creation"
+            );
         }
         if self.fencing_token == 0
             || !self.partition_by_ingestion_date
@@ -426,8 +428,13 @@ where
     {
         bail!("storage bridge authority differs from the original owned-run table allocation");
     }
-    let bridge = StorageBridge::new_with_planned_object_operation_ids(input.authority.clone(), input.original_deadline_unix_ms,
-        plan.storage_operation_ids.clone(), reader, writer)?;
+    let bridge = StorageBridge::new_with_planned_object_operation_ids(
+        input.authority.clone(),
+        input.original_deadline_unix_ms,
+        plan.storage_operation_ids.clone(),
+        reader,
+        writer,
+    )?;
     let publisher_id = canonical_uuid(&plan.publisher_id)?;
     let control_lease_ids = [
         canonical_uuid(&plan.control_lease_ids[0])?,

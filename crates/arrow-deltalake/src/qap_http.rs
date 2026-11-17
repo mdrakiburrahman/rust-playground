@@ -58,9 +58,9 @@ mod storage_bridge {
     use object_store::client::{HttpError, HttpErrorKind, HttpRequest, HttpResponse, HttpService};
     use serde::{Deserialize, Serialize};
     use sha2::{Digest, Sha256};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
     use tokio::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::time::Instant;
     use url::Url;
 
@@ -221,7 +221,8 @@ mod storage_bridge {
                     | "date"
                     | "x-ms-version"
                     | "x-ms-date"
-                    | "x-arrowcol-operation-id" | "x-ms-client-request-id"
+                    | "x-arrowcol-operation-id"
+                    | "x-ms-client-request-id"
                     | "x-ms-request-id"
                     | "x-ms-lease-id"
             )
@@ -387,7 +388,9 @@ mod storage_bridge {
                 || operation_ids.iter().enumerate().any(|(index, id)| {
                     id.is_empty()
                         || id.len() > 64
-                        || !id.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+                        || !id
+                            .bytes()
+                            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
                         || operation_ids[..index].contains(id)
                 })
             {
@@ -400,7 +403,6 @@ mod storage_bridge {
             inner.planned_object_operation_ids = Some(operation_ids);
             Ok(bridge)
         }
-
 
         pub(crate) fn authority(&self) -> &StorageBridgeAuthority {
             &self.authority
