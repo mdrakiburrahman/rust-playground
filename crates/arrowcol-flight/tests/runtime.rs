@@ -102,12 +102,25 @@ async fn wire_ingest_request(
 
 #[tokio::test]
 async fn loopback_compression_negotiates_requests_and_responses_independently() -> Result<()> {
-    for (request_encoding, response_encoding, advertise_response) in [
-        (None, None, false),
-        (Some(CompressionEncoding::Gzip), Some(CompressionEncoding::Gzip), true),
-        (Some(CompressionEncoding::Zstd), Some(CompressionEncoding::Zstd), true),
-        (Some(CompressionEncoding::Gzip), Some(CompressionEncoding::Zstd), true),
-        (None, Some(CompressionEncoding::Gzip), false),
+    for (request_encoding, response_encoding, client_accept) in [
+        (None, None, None),
+        (
+            Some(CompressionEncoding::Gzip),
+            Some(CompressionEncoding::Gzip),
+            Some(CompressionEncoding::Gzip),
+        ),
+        (
+            Some(CompressionEncoding::Zstd),
+            Some(CompressionEncoding::Zstd),
+            Some(CompressionEncoding::Zstd),
+        ),
+        (
+            Some(CompressionEncoding::Gzip),
+            Some(CompressionEncoding::Zstd),
+            Some(CompressionEncoding::Zstd),
+        ),
+        (None, Some(CompressionEncoding::Gzip), None),
+        (None, Some(CompressionEncoding::Gzip), Some(CompressionEncoding::Zstd)),
     ] {
         let fixture = Fixture::with_current(false).await?;
         let admission = MockAdmission::new(TestCompletion::BestEffort, None);
@@ -122,11 +135,11 @@ async fn loopback_compression_negotiates_requests_and_responses_independently() 
         if let Some(encoding) = request_encoding {
             client = client.send_compressed(encoding);
         }
-        if advertise_response && let Some(encoding) = response_encoding {
+        if let Some(encoding) = client_accept {
             client = client.accept_compressed(encoding);
         }
         let response = client.do_put(wire_ingest_request(&fixture.v1).await?).await?;
-        let expected = if advertise_response { response_encoding } else { None };
+        let expected = response_encoding.filter(|encoding| Some(*encoding) == client_accept);
         assert_eq!(
             response
                 .metadata()
@@ -149,7 +162,7 @@ async fn loopback_compression_negotiates_requests_and_responses_independently() 
 #[tokio::test]
 async fn loopback_compression_does_not_bypass_disabled_codec_or_decompressed_limits() -> Result<()> {
     for encoding in [CompressionEncoding::Gzip, CompressionEncoding::Zstd] {
-        for limit in ["disabled", "schema", "message", "metadata"] {
+        for limit in ["disabled", "mismatch", "schema", "message", "metadata"] {
             let fixture = Fixture::with_current(false).await?;
             let admission = MockAdmission::new(TestCompletion::BestEffort, None);
             let mut limits = RuntimeLimits::default();
@@ -157,6 +170,13 @@ async fn loopback_compression_does_not_bypass_disabled_codec_or_decompressed_lim
                 limits.grpc_accept_compression = Some(encoding);
             }
             match limit {
+                "mismatch" => {
+                    limits.grpc_accept_compression = Some(if encoding == CompressionEncoding::Gzip {
+                        CompressionEncoding::Zstd
+                    } else {
+                        CompressionEncoding::Gzip
+                    })
+                }
                 "schema" => limits.max_schema_bytes = 16,
                 "message" => {
                     limits.max_schema_bytes = 32;
@@ -182,7 +202,7 @@ async fn loopback_compression_does_not_bypass_disabled_codec_or_decompressed_lim
                     .err()
                     .ok_or_else(|| anyhow!("compressed {limit} request unexpectedly succeeded"))?,
             };
-            if limit == "disabled" {
+            if matches!(limit, "disabled" | "mismatch") {
                 assert_eq!(error.code(), Code::Unimplemented);
             } else if limit == "message" {
                 assert_eq!(error.code(), Code::InvalidArgument);
