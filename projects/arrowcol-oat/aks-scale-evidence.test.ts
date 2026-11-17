@@ -4,7 +4,7 @@ import { readFile } from 'node:fs/promises';
 import { test, type TestContext } from 'node:test';
 import { Azure, Config, canonical_json } from '../../infra/azure/bootstrap.js';
 import { newCampaignState, type CampaignStore, type RunInventory } from './aks-campaign.js';
-import { createScaleEvidenceVerifier, readBoundedSourceBytes, readOfficialCellMeasurement } from './aks-scale-evidence.js';
+import { createScaleEvidenceVerifier, readBoundedSourceBytes, readOfficialCellMeasurement, readOfficialKustoWindow } from './aks-scale-evidence.js';
 import type { ScaleMeasurementEnvelope } from './aks-scale.js';
 
 const hash = (value: string | Uint8Array) => createHash('sha256').update(value).digest('hex');
@@ -12,7 +12,7 @@ const campaignId = 'c0ffee00-0000-4000-8000-000000000001', ownerId = 'c0ffee00-0
 const cellId = 'c0ffee00-0000-4000-8000-000000000003', orchestrationId = 'c0ffee00-0000-4000-8000-000000000004';
 const now = 1_800_000_000_000;
 
-function syntheticAuthenticatedTransport(t: TestContext, supplied?: Uint8Array) {
+function syntheticAuthenticatedTransport(t: TestContext, supplied?: Uint8Array, window?: { startMs: number; endMs: number }) {
   const azure = new Azure(new Config({ AZURE_SUBSCRIPTION_ID: campaignId, AZURE_STAMP: '12345' }));
   const state = newCampaignState(campaignId, ownerId, now - 120_000);
   state.mode = 'armed';
@@ -33,8 +33,8 @@ function syntheticAuthenticatedTransport(t: TestContext, supplied?: Uint8Array) 
     official_result: { run_id: cellId, table: 'synthetic_offline_table', status: 'succeeded', git_sha: 'a'.repeat(40),
       tunables: { orchestration_run_id: orchestrationId }, evidence: { version: 1, commit_window_output_throughput: {
         scope: 'new_ingestion_commits_finished_in_half_open_shared_window_not_client_cohort',
-        measurement_start_unix_ms: now - 60_000, measurement_end_unix_ms: now - 30_000,
-        window_seconds: 30, rows_per_second: 1234,
+        measurement_start_unix_ms: window?.startMs ?? now - 60_000, measurement_end_unix_ms: window?.endMs ?? now - 30_000,
+        window_seconds: window ? (window.endMs - window.startMs) / 1000 : 30, rows_per_second: 1234,
       } } } };
   let bytes = supplied ?? Buffer.from(canonical_json(document));
   const decoded = JSON.parse(new TextDecoder().decode(bytes)) as typeof document;
@@ -120,6 +120,108 @@ test('source streaming cap stops retention on overflow and rejects a truncated d
   assert.equal(cancelled, true);
   await assert.rejects(readBoundedSourceBytes(new Response('tiny', { headers: { 'content-length': '8' } }), 8), /truncated/);
   await assert.rejects(readBoundedSourceBytes(new Response('tiny', { headers: { 'content-length': '9' } }), 8), /byte bound/);
+});
+
+function syntheticMonitorTransport(t: TestContext) {
+  const start = now - 120_000, end = now, f = syntheticAuthenticatedTransport(t, undefined, { startMs: start, endMs: end });
+  const resourceId = f.options.azure.c.cluster_id, tokens: string[] = [];
+  t.mock.method(f.options.azure, 'token', async (resource: string) => {
+    tokens.push(resource);
+    if (resource === 'https://storage.azure.com/') return 'synthetic-offline-token';
+    assert.equal(resource, 'https://management.azure.com/');
+    return 'synthetic-offline-arm-token';
+  });
+  const metric = (name: string, value: number) => ({ id: `${resourceId}/providers/Microsoft.Insights/metrics/${name}`,
+    type: 'Microsoft.Insights/metrics', name: { value: name }, unit: 'Percent',
+    timeseries: [{ metadatavalues: [], data: [start, start + 60_000].map(timestamp => ({
+      timeStamp: new Date(timestamp).toISOString(), average: value })) }] });
+  const body = { interval: 'PT1M', timespan: new Date(start).toISOString() + '/' + new Date(end).toISOString(),
+    value: [metric('CPU', 92), metric('IngestionUtilization', 20)] };
+  let metricReads = 0, status = 200, afterRead = () => {}, declaredSize: string | undefined;
+  const fetcher: typeof fetch = async (input, init) => {
+    if (new URL(String(input)).hostname !== 'management.azure.com') return f.options.fetcher(input, init);
+    metricReads++;
+    const url = new URL(String(input));
+    assert.equal(url.pathname, `${resourceId}/providers/Microsoft.Insights/metrics`);
+    assert.equal(url.searchParams.get('timespan'), new Date(start).toISOString() + '/' + new Date(end).toISOString());
+    assert.equal(url.searchParams.get('metricnames'), 'CPU,IngestionUtilization');
+    assert.equal(url.searchParams.get('interval'), 'PT1M');
+    assert.equal(url.searchParams.get('aggregation'), 'Average');
+    assert.equal(url.searchParams.get('AutoAdjustTimegrain'), 'false');
+    assert.equal(url.searchParams.get('api-version'), '2023-10-01');
+    assert.equal(new Headers(init?.headers).get('authorization'), 'Bearer synthetic-offline-arm-token');
+    assert.equal(init?.redirect, 'error');
+    assert.ok(init?.signal);
+    afterRead();
+    return new Response(JSON.stringify(body), { status, headers: declaredSize ? { 'content-length': declaredSize } : {} });
+  };
+  return { ...f, body, tokens, options: { ...f.options, fetcher }, reads: () => metricReads,
+    setStatus: (value: number) => { status = value; }, afterRead: (fn: () => void) => { afterRead = fn; },
+    setDeclaredSize: (value: string) => { declaredSize = value; } };
+}
+
+test('Azure Monitor binds native percent metrics to exact selected ARM resource and complete original grains', async t => {
+  const f = syntheticMonitorTransport(t), measured = await readOfficialKustoWindow(f.options);
+  assert.equal(measured.resourceId, f.options.azure.c.cluster_id);
+  assert.equal(measured.cpu.averagePercent, 92);
+  assert.equal(measured.ingestionUtilization.averagePercent, 20);
+  assert.equal(measured.saturated, true);
+  assert.equal(measured.responseSha256, hash(JSON.stringify(f.body)));
+  assert.deepEqual(f.tokens, ['https://storage.azure.com/', 'https://management.azure.com/']);
+  assert.equal(f.reads(), 1);
+});
+
+test('one unknown Kusto metric never becomes false and does not erase independent measured saturation', async t => {
+  for (const [ingestion, expected] of [[95, true], [20, null]] as const) {
+    const f = syntheticMonitorTransport(t);
+    f.body.value[0].id = '/subscriptions/other/providers/Microsoft.Insights/metrics/CPU';
+    f.body.value[1].timeseries[0].data.forEach(point => { point.average = ingestion; });
+    const result = await readOfficialKustoWindow(f.options);
+    assert.equal(result.cpu.averagePercent, null);
+    assert.equal(result.saturated, expected);
+    assert.match(result.cpu.unavailableReason!, /resource/);
+  }
+  const f = syntheticMonitorTransport(t);
+  f.body.value.forEach(metric => metric.timeseries[0].data.forEach(point => { point.average = 10; }));
+  assert.equal((await readOfficialKustoWindow(f.options)).saturated, false);
+});
+
+test('partial, duplicated, reordered, wrong-unit and changed-grain metrics stay UNKNOWN', async t => {
+  for (const change of ['missing', 'duplicate', 'reorder', 'unit', 'grain', 'window'] as const) {
+    const f = syntheticMonitorTransport(t);
+    if (change === 'missing') f.body.value[0].timeseries[0].data.pop();
+    if (change === 'duplicate') f.body.value.push(structuredClone(f.body.value[0]));
+    if (change === 'reorder') f.body.value[0].timeseries[0].data.reverse();
+    if (change === 'unit') f.body.value[0].unit = 'Count';
+    if (change === 'grain') f.body.interval = 'PT5M';
+    if (change === 'window') f.body.timespan = new Date(now - 180_000).toISOString() + '/' + new Date(now).toISOString();
+    const result = await readOfficialKustoWindow(f.options);
+    assert.equal(result.cpu.averagePercent, null, change);
+    assert.equal(result.saturated, null, change);
+  }
+});
+
+test('misaligned original windows are not expanded or replaced with a later Monitor snapshot', async t => {
+  const f = syntheticAuthenticatedTransport(t), result = await readOfficialKustoWindow(f.options);
+  assert.equal(result.saturated, null);
+  assert.match(result.cpu.unavailableReason!, /original_window/);
+  assert.equal(f.counts().tokenReads, 1);
+});
+
+test('Monitor permission errors stay UNKNOWN while changed custody, late reads and oversized bodies refuse', async t => {
+  const denied = syntheticMonitorTransport(t);
+  denied.setStatus(403);
+  assert.match((await readOfficialKustoWindow(denied.options)).cpu.unavailableReason!, /HTTP_403/);
+  const fenced = syntheticMonitorTransport(t);
+  fenced.afterRead(() => { fenced.state.fencingToken++; });
+  await assert.rejects(readOfficialKustoWindow(fenced.options), /custody/);
+  const late = syntheticMonitorTransport(t);
+  let clock = now;
+  late.afterRead(() => { clock = late.options.deadlineAtMs; });
+  await assert.rejects(readOfficialKustoWindow({ ...late.options, now: () => clock }), /deadline/);
+  const oversized = syntheticMonitorTransport(t);
+  oversized.setDeclaredSize('1048577');
+  await assert.rejects(readOfficialKustoWindow(oversized.options), /byte bound/);
 });
 
 test('actual Rust immutable producer bytes remain an original window with unavailable submitted identity', {
