@@ -670,7 +670,7 @@ enum Slot {
     /// An owned admission task is running; it always settles the slot.
     Admitting(tokio::sync::watch::Receiver<Settled>),
     Ready(Arc<PublisherSession>),
-    /// Unknown or abandoned admission: permanent, never re-enrolled.
+    /// Unknown, applied-but-unsettled or abandoned admission: never re-enrolled.
     Poisoned(String),
 }
 
@@ -703,10 +703,10 @@ impl Admission {
             }
             Err(error) => {
                 let message = format!("{error:#}");
-                if is_unknown(&error) {
+                if is_unknown(&error) || error.chain().any(|cause| cause.is::<UnsettledTransition>()) {
                     cache.insert(self.key.clone(), Slot::Poisoned(message.clone()));
                 } else {
-                    // Definite failure: nothing was written, so nothing is cached.
+                    // Definite no-write failure: nothing needs to be retained.
                     cache.remove(&self.key);
                 }
                 Err(message)
@@ -794,9 +794,9 @@ impl PublisherSession {
     /// admission runs as one owned task on the shared Delta I/O runtime that
     /// always settles the key. A dropped or timed-out caller therefore never
     /// causes a second enrollment: later callers join the same admission. An
-    /// unknown or abandoned outcome is cached as a permanent error: no
-    /// adoption and no re-enrollment. Definite failures wrote nothing and are
-    /// not cached. Azure admission is pinned to [`RESET_GENERATION_ENV`].
+    /// unknown, applied-but-unsettled or abandoned admission is cached as a
+    /// permanent error: no adoption and no re-enrollment. Definite no-write
+    /// failures are not cached. Azure admission is pinned to [`RESET_GENERATION_ENV`].
     ///
     /// # Errors
     /// Returns admission, authority, authentication or unknown-outcome failures.
@@ -892,8 +892,8 @@ impl PublisherSession {
     /// Process shutdown: close every cached shared session after its guarded
     /// mutations drain. Never registers anything. Refuses without side effects
     /// while any shared admission is still in progress. Otherwise each ready
-    /// session is attempted; a failed one stays registered. Any unknown or
-    /// abandoned admission makes the result an error: the process is never
+    /// session is attempted; a failed one stays registered. Any permanent
+    /// admission failure makes the result an error: the process is never
     /// reported clean while a possible member is unaccounted for.
     ///
     /// # Errors
