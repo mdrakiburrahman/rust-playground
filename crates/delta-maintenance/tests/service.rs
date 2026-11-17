@@ -780,6 +780,91 @@ fn scrape(port: u16) -> Result<String> {
     Ok(body)
 }
 
+#[test]
+fn scheduled_health_resolves_initialized_target_before_any_data_commit() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let root_url = Url::from_directory_path(root.path()).map_err(|()| anyhow!("root URL"))?;
+    let port = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("delta-maintenance"))
+        .env_remove("OTEL_EXPORTER_OTLP_ENDPOINT")
+        .args([
+            "--root",
+            root_url.as_str(),
+            "--table",
+            "telemetry.sqlserver.events",
+            "--operation",
+            "optimize",
+            "--interval-secs",
+            "1",
+            "--max-cycles",
+            "5",
+            "--listen",
+            &format!("127.0.0.1:{port}"),
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    let observation = (|| -> Result<()> {
+        let read_target = || -> Result<serde_json::Value> {
+            let mut stream = TcpStream::connect(("127.0.0.1", port))?;
+            stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+            stream.write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")?;
+            let mut response = String::new();
+            stream.read_to_string(&mut response)?;
+            let (_, body) = response.split_once("\r\n\r\n").context("health HTTP body")?;
+            let health: serde_json::Value = serde_json::from_str(body)?;
+            Ok(health["delta_targets"][0].clone())
+        };
+        let wait_for = |state: &str| -> Result<serde_json::Value> {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                if let Ok(target) = read_target()
+                    && target["state"] == state
+                {
+                    return Ok(target);
+                }
+                anyhow::ensure!(Instant::now() < deadline, "health never reached {state}");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        };
+        let pending = wait_for("unresolved")?;
+        anyhow::ensure!(pending.get("normalized_root").is_none(), "{pending}");
+        anyhow::ensure!(pending.get("delta_table_id").is_none(), "{pending}");
+        let table_path = root.path().join("telemetry/sqlserver/events");
+        let table_url = Url::from_directory_path(&table_path).map_err(|()| anyhow!("table URL"))?;
+        DeltaTable::initialize_url_for_bootstrap(table_url.clone(), schema(), vec![INGESTION_PARTITION.into()])?;
+        let resolved = wait_for("resolved")?;
+        anyhow::ensure!(
+            resolved["table"]
+                == serde_json::json!({
+                    "catalog": "telemetry", "schema": "sqlserver", "table": "events",
+                }),
+            "{resolved}"
+        );
+        anyhow::ensure!(
+            resolved["normalized_root"] == table_url.as_str().trim_end_matches('/'),
+            "{resolved}"
+        );
+        let metadata_id = std::fs::read_to_string(table_path.join("_delta_log/00000000000000000000.json"))?
+            .lines()
+            .map(serde_json::from_str::<serde_json::Value>)
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .find_map(|action| action["metaData"]["id"].as_str().map(str::to_owned))
+            .context("initialized metadata ID")?;
+        anyhow::ensure!(resolved["delta_table_id"] == metadata_id, "{resolved}");
+        anyhow::ensure!(version(&table_path)? == 1, "readback created another commit");
+        Ok(())
+    })();
+    if observation.is_err() && child.try_wait()?.is_none() {
+        child.kill()?;
+    }
+    let status = child.wait()?;
+    observation?;
+    assert!(status.success());
+    Ok(())
+}
+
 /// Scenario: scheduled mode with a metrics listener.
 /// Guarantees: Prometheus exposes bounded operation/outcome series and a heartbeat.
 #[test]
