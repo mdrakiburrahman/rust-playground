@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { chmodSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 import { EffectBoundary, withEffectBoundary, type EffectEnvelope } from '../../infra/azure/effect-boundary.js';
-import { StorageBridgeDispatcher, type StorageBridgeAuthority, type StorageBridgeRequest } from './aks-d47-bridge.js';
+import { initializeOwnedRunTable, StorageBridgeDispatcher, type StorageBridgeAuthority, type StorageBridgeRequest } from './aks-d47-bridge.js';
 import type { Azure } from '../../infra/azure/bootstrap.js';
 import { newCampaignState, type CampaignStore, type RunInventory, type StoredCampaign } from './aks-campaign.js';
 
@@ -484,4 +484,46 @@ test('planned control restart serves the exact cached reply and refuses new muta
   assert.deepEqual(await withEffectBoundary(boundary, () => restarted.exchange(acquire)), initial);
   await assert.rejects(withEffectBoundary(boundary, () => restarted.exchange(metadata)), /recovered bridge ledger permits cached replies and bounded reads only/);
   assert.equal(forwards, 1);
+});
+test('real loadgen initializer composes with the Node BR3 planned-identity parent', { skip: !process.env.OAT_BR3_LOADGEN_BIN }, async t => {
+  const executable = process.env.OAT_BR3_LOADGEN_BIN!;
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'oat-d47-real-composition-'));
+  chmodSync(directory, 0o700);
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const now = Date.now(), deadline = now + 300_000;
+  const campaign = 'c0ffee00-0000-4000-8000-000000000001', run = 'c0ffee00-0000-4000-8000-000000000002';
+  const owner = 'c0ffee00-0000-4000-8000-000000000003', generation = 'c0ffee00-0000-4000-8000-000000000004';
+  const publisherId = 'c0ffee00-0000-4000-8000-000000000011';
+  const controlLeaseIds = ['c0ffee00-0000-4000-8000-000000000012', 'c0ffee00-0000-4000-8000-000000000013'] as const;
+  const account = 'arrowcollector68590', container = 'checkpoints';
+  const campaignRoot = 'abfss://' + container + '@' + account + '.dfs.core.windows.net/campaigns/' + campaign + '/';
+  const runRoot = campaignRoot + 'runs/' + run + '/';
+  const tableRoot = runRoot + 'dataflow/telemetry/sqlserver/sqlserver_availability_replica_states/';
+  const authority: StorageBridgeAuthority = { campaign_id: campaign, cell_run_id: run, owner_id: owner, fencing_token: 1,
+    storage_account: account, table_root_url: tableRoot, control_container_url: 'https://' + account + '.blob.core.windows.net/' + container,
+    sandbox_id: 'offline-stamp', reset_generation: generation };
+  const plan = { account, container, campaign_root: campaignRoot, run_root: runRoot, campaign_id: campaign, run_id: run,
+    generation, publisher_id: publisherId, control_lease_ids: [...controlLeaseIds],
+    table: 'telemetry.sqlserver.sqlserver_availability_replica_states', partition_by_ingestion_date: true,
+    owner_id: owner, fencing_token: 1 };
+  const planPath = path.join(directory, 'plan.json'), bridgeInputPath = path.join(directory, 'bridge-input.json');
+  writeFileSync(planPath, JSON.stringify(plan)); chmodSync(planPath, 0o600);
+  writeFileSync(bridgeInputPath, JSON.stringify({ authority, original_deadline_unix_ms: deadline })); chmodSync(bridgeInputPath, 0o600);
+  const seed = signedRequest(authority, deadline);
+  const envelope = envelopeFor(authority, seed);
+  const custody = mutableCustodyStore(authority, now);
+  const azure = { c: { account }, async token() { return 'offline-test-token'; } } as unknown as Azure;
+  const ledgerPath = path.join(directory, 'storage-ledger.jsonl');
+  const options = { executable, artifactIdentity: { source_commit: '2d329ab907f15c8123a08b933c01d98670bfd755',
+    executable_sha256: createHash('sha256').update(readFileSync(executable)).digest('hex') }, planPath, bridgeInputPath,
+    ledgerPath, rootDirectory: process.cwd(), envelope, store: custody.store, azure,
+    fetcher: async () => new Response('', { status: 500 }), now: Date.now };
+  const boundary = new EffectBoundary(envelope, path.join(directory, 'effects.jsonl'));
+  if (process.env.OAT_BR3_DISCOVER === '1') {
+    try { await withEffectBoundary(boundary, () => initializeOwnedRunTable(options)); }
+    catch (error) { console.log('BR3_DISCOVERY_ERROR', String(error)); }
+    console.log('BR3_DISCOVERY_LEDGER', readFileSync(ledgerPath, 'utf8'));
+    return;
+  }
+  await withEffectBoundary(boundary, () => initializeOwnedRunTable(options));
 });

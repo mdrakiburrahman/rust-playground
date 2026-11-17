@@ -876,9 +876,15 @@ function privateJson(filename: string, limit: number): unknown {
     throw new Error('Bridge input must be a bounded private regular file.');
   try { return JSON.parse(fs.readFileSync(filename, 'utf8')) as unknown; } catch { throw new Error('Bridge input is not valid JSON.'); }
 }
-function bridgeChildEnvironment(): NodeJS.ProcessEnv {
+function bridgeChildEnvironment(qap?: { marker: string; tracePath: string }): NodeJS.ProcessEnv {
   const environment: NodeJS.ProcessEnv = {};
   for (const key of ['PATH','HOME','TMPDIR','TMP','TEMP','LANG','LC_ALL']) if (process.env[key] !== undefined) environment[key] = process.env[key];
+  if (qap) {
+    if (!/^arrowcol-qap\/[A-Za-z0-9._-]{1,128}\/[A-Za-z0-9._-]{1,128}$/.test(qap.marker) || !path.isAbsolute(qap.tracePath))
+      throw new Error('Owned-run QAP child attribution is invalid.');
+    environment.ARROWCOL_QAP_CLIENT_MARKER = qap.marker;
+    environment.ARROWCOL_QAP_HTTP_TRACE = qap.tracePath;
+  }
   return environment;
 }
 async function writeFrame(child: ChildProcess, value: unknown): Promise<void> {
@@ -889,9 +895,10 @@ async function writeFrame(child: ChildProcess, value: unknown): Promise<void> {
   });
 }
 async function runBridgeChild(executable: string, args: string[], cwd: string, deadline: number,
-  requestKind: string, finalKind: string, exchange: (request: unknown) => Promise<unknown>): Promise<{ receipt: unknown; exchangeCount: number }> {
+  requestKind: string, finalKind: string, exchange: (request: unknown) => Promise<unknown>,
+  qap?: { marker: string; tracePath: string }): Promise<{ receipt: unknown; exchangeCount: number }> {
   if (!path.isAbsolute(executable) || !path.isAbsolute(cwd) || Date.now() >= deadline) throw new Error('Bridge child path or original deadline is invalid.');
-  const child = spawn(executable, args, { cwd, env: bridgeChildEnvironment(), detached: true, stdio: ['pipe','pipe','pipe'] });
+  const child = spawn(executable, args, { cwd, env: bridgeChildEnvironment(qap), detached: true, stdio: ['pipe','pipe','pipe'] });
   let stderr = Buffer.alloc(0), final: unknown, finalSeen = false, failure: Error | undefined, exchangeCount = 0;
   const kill = () => { if (!child.pid) return; try { process.kill(-child.pid, 'SIGKILL'); } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ESRCH') failure = new Error('Bridge child could not be stopped; effect outcome is unknown.'); } };
@@ -1076,7 +1083,8 @@ export async function initializeOwnedRunTable(options: OwnedRunInitializerOption
   assertBridgeLive(options.envelope, deadline, now);
   const child = await withinBridgeDeadline(runBridgeChild(options.executable,
     ['initialize-owned-run-table', '--plan', options.planPath, '--storage-bridge-input', options.bridgeInputPath, '--storage-bridge-stdio'],
-    options.rootDirectory, deadline, 'storage_http_request', 'owned_run_table_receipt', request => dispatcher.exchange(request)),
+    options.rootDirectory, deadline, 'storage_http_request', 'owned_run_table_receipt', request => dispatcher.exchange(request),
+    { marker: 'arrowcol-qap/' + plan.run_id + '/owned-run-table-initialization', tracePath: options.ledgerPath + '.qap.jsonl' }),
     deadline, now, 'Owned-run initializer');
   validateOwnedRunReceipt(child.receipt, plan, authority, deadline);
   if (child.exchangeCount !== dispatcher.recordedRequestCount)

@@ -268,11 +268,13 @@ impl AzureControlContainer {
                 return Exchange::NotSent("invalid Azure control request".into());
             };
             *request.uri_mut() = uri;
+            let client_request_id = uuid::Uuid::new_v4().to_string();
             let date = chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string();
             for (name, value) in headers
                 .iter()
                 .map(|(k, v)| (k.as_str(), v.as_str()))
-                .chain([("x-ms-version", API_VERSION), ("x-ms-date", date.as_str())])
+                .chain([("x-ms-client-request-id", client_request_id.as_str()),
+                    ("x-ms-version", API_VERSION), ("x-ms-date", date.as_str())])
             {
                 let (Ok(name), Ok(value)) = (
                     reqwest::header::HeaderName::from_bytes(name.as_bytes()),
