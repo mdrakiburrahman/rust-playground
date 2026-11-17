@@ -19,8 +19,8 @@ const scaleOutConfig = (): RuntimeConfig => {
   const c = config();
   c.campaignProfile = 'scale_out_single_table';
   c.hotTable = 'sqlserver_availability_replica_states';
-  c.collectorReplicas = 3;
-  c.routerReplicas = 3;
+  c.collectorReplicas = 1;
+  c.routerReplicas = 1;
   c.quiver = false;
   c.resources = { collector: { requests: { cpu: '2', memory: '4Gi' }, limits: { cpu: null, memory: '6Gi' } } };
   c.maintenance = { tables: ['telemetry.sqlserver.sqlserver_availability_replica_states'],
@@ -65,7 +65,7 @@ test('AKS resource overrides are strict and project through to role manifests', 
   assert.throws(() => validateRuntime({ ...config(), resources: { collector: { requests: { cpu: '1.0001', memory: '1Gi' }, limits: { cpu: '2', memory: '6Gi' } } } }), /Kubernetes CPU quantity/);
 });
 
-test('scale-out admits one memory-only hot table with matching spread replicas and explicit maintenance', async () => {
+test('scale-out admits exactly one memory-only collector for the hot table with explicit maintenance', async () => {
   const c = scaleOutConfig();
   validateRuntime(c);
   const render = async () => renderRuntime(c, 'workload');
@@ -73,8 +73,8 @@ test('scale-out admits one memory-only hot table with matching spread replicas a
   const get = (name: string) => objects.find(o => o.kind === 'Deployment' && o.metadata.name === name)!;
   const collector = get('arrowcol');
   const router = get('arrowcol-router');
-  assert.equal(collector.spec.replicas, 3);
-  assert.equal(router.spec.replicas, 3);
+  assert.equal(collector.spec.replicas, 1);
+  assert.equal(router.spec.replicas, 1);
   for (const deployment of [collector, router]) {
     assert.deepEqual(deployment.spec.template.spec.affinity.podAntiAffinity.requiredDuringSchedulingIgnoredDuringExecution, [{
       labelSelector: { matchLabels: { app: deployment.metadata.name } }, topologyKey: 'kubernetes.io/hostname',
@@ -110,21 +110,15 @@ test('scale-out admits one memory-only hot table with matching spread replicas a
   assert.throws(() => validateRuntime(c), /memory-only buffering/);
   c.quiver = false;
   c.routerReplicas = 2;
-  assert.throws(() => validateRuntime(c), /matching 1..16/);
-  c.routerReplicas = 3;
-  c.collectorReplicas = 17;
-  c.routerReplicas = 17;
-  assert.throws(() => validateRuntime(c), /matching 1..16/);
-  c.collectorReplicas = 3;
-  c.routerReplicas = 3;
-  c.collectorReplicas = 1;
+  assert.throws(() => validateRuntime(c), /exactly one collector\/router replica/);
   c.routerReplicas = 1;
+  for (const replicas of [undefined, null, '1', 0, -1, 1.5, 2, 3, 16, 17]) {
+    assert.throws(() => validateRuntime({ ...c, collectorReplicas: replicas, routerReplicas: replicas }),
+      /exactly one collector\/router replica/);
+  }
+  await assert.rejects(renderRuntime({ ...c, collectorReplicas: 2, routerReplicas: 2 }, 'workload'),
+    /exactly one collector\/router replica/);
   validateRuntime(c);
-  c.collectorReplicas = 16;
-  c.routerReplicas = 16;
-  validateRuntime(c);
-  c.collectorReplicas = 3;
-  c.routerReplicas = 3;
   c.maintenance!.apply = false;
   assert.throws(() => validateRuntime(c), /all five operations/);
   c.maintenance!.apply = true;
