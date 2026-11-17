@@ -44,16 +44,16 @@ For the planned zero-interval comparison, keep Profile A unpooled (`sql_pool_max
 
 ## Flight gRPC compression direction
 
-These controls are independent of Arrow IPC and Parquet compression. Each end defaults to [0m`none` and accepts the strict enum [0m`none | gzip | zstd`; a default of [0m`none` does not enable compression.
+These controls are independent of Arrow IPC and Parquet compression. Each end defaults to `none` and accepts the strict enum `none | gzip | zstd`; a default of `none` does not enable compression.
 
 | Setting | Direction and required peer match |
 | --- | --- |
-| [0m`transport.grpc_send_compression` | Client request encoding; match with receiver [0m`collector.limits.grpc_accept_compression`. |
-| [0m`transport.grpc_accept_compression` | Client response acceptance; match with receiver [0m`collector.limits.grpc_send_compression`. |
-| [0m`collector.limits.grpc_accept_compression` | Receiver request acceptance; match with client [0m`transport.grpc_send_compression`. |
-| [0m`collector.limits.grpc_send_compression` | Receiver response encoding; match with client [0m`transport.grpc_accept_compression`. |
+| `transport.grpc_send_compression` | Client request encoding; match with receiver `collector.limits.grpc_accept_compression`. |
+| `transport.grpc_accept_compression` | Client response acceptance; match with receiver `collector.limits.grpc_send_compression`. |
+| `collector.limits.grpc_accept_compression` | Receiver request acceptance; match with client `transport.grpc_send_compression`. |
+| `collector.limits.grpc_send_compression` | Receiver response encoding; match with client `transport.grpc_accept_compression`. |
 
-Receiver settings are projected through [0m`ARROWCOL_COLLECTOR_LIMITS_CONFIG`. See the [Flight receiver configuration and negotiation notes](../../../crates/arrowcol-flight/README.md). These options configure codec negotiation only; they do not prove wire-byte savings, durable Delta writes, or performance qualification.
+Receiver settings are projected through `ARROWCOL_COLLECTOR_LIMITS_CONFIG`. See the [Flight receiver configuration and negotiation notes](../../../crates/arrowcol-flight/README.md). These options configure codec negotiation only; they do not prove wire-byte savings, durable Delta writes, or performance qualification.
 
 ## Overload retry and admission policy
 
