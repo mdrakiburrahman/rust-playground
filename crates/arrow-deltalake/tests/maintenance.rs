@@ -157,7 +157,12 @@ fn identity_scan_uses_one_active_snapshot_during_compaction() -> Result<()> {
     let mut first = true;
     let mut observed = Vec::new();
     let before = arrow_deltalake::maintenance::scan_active_endpoint_urls(&url, 100, |values| {
-        observed.extend(values.iter().map(|value| value.expect("non-null identity").to_owned()));
+        observed.extend(
+            values
+                .iter()
+                .map(|value| value.map(str::to_owned).context("null identity"))
+                .collect::<Result<Vec<_>>>()?,
+        );
         if first {
             first = false;
             maintenance.apply_optimize(&plan, &config, &control())?;
@@ -173,7 +178,12 @@ fn identity_scan_uses_one_active_snapshot_during_compaction() -> Result<()> {
     assert_eq!(before.rows, 4);
     let mut after_values = Vec::new();
     let after = arrow_deltalake::maintenance::scan_active_endpoint_urls(&url, 100, |values| {
-        after_values.extend(values.iter().map(|value| value.expect("non-null identity").to_owned()));
+        after_values.extend(
+            values
+                .iter()
+                .map(|value| value.map(str::to_owned).context("null identity"))
+                .collect::<Result<Vec<_>>>()?,
+        );
         Ok(())
     })?;
     after_values.sort();

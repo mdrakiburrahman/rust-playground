@@ -989,7 +989,9 @@ impl PublisherSession {
             .context("Azure publisher requires a DFS account host")?;
         if url.scheme() != "abfss"
             || !(3..=24).contains(&account.len())
-            || !account.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+            || !account
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
             || url.username().is_empty()
             || !url
                 .username()
@@ -1002,7 +1004,11 @@ impl PublisherSession {
         {
             bail!("invalid credential-free Azure publisher root");
         }
-        let control = Arc::new(AzureControlContainer::new_with_ownership(account, Arc::clone(&credentials), ownership)?);
+        let control = Arc::new(AzureControlContainer::new_with_ownership(
+            account,
+            Arc::clone(&credentials),
+            ownership,
+        )?);
         let sandbox_id = control.sandbox_id().to_owned();
         Self::register(
             control,
@@ -1930,10 +1936,15 @@ mod classify_tests {
             resource_group: "arrow-collector-rg".to_owned(),
             checkpoint_container: "checkpoints".to_owned(),
         };
-        let error = PublisherSession::open_with_azure_credentials(&valid_root, "bad-generation", Arc::clone(&credentials), &ownership)
-            .await
-            .err()
-            .context("invalid generation must fail")?;
+        let error = PublisherSession::open_with_azure_credentials(
+            &valid_root,
+            "bad-generation",
+            Arc::clone(&credentials),
+            &ownership,
+        )
+        .await
+        .err()
+        .context("invalid generation must fail")?;
         assert!(format!("{error:#}").contains("invalid expected reset generation"));
         for root in [
             "file:///tmp/table",
@@ -1944,9 +1955,14 @@ mod classify_tests {
             "abfss://data@account123.dfs.core.windows.net/root#fragment",
         ] {
             assert!(
-                PublisherSession::open_with_azure_credentials(&Url::parse(root)?, valid_generation, Arc::clone(&credentials), &ownership)
-                    .await
-                    .is_err(),
+                PublisherSession::open_with_azure_credentials(
+                    &Url::parse(root)?,
+                    valid_generation,
+                    Arc::clone(&credentials),
+                    &ownership
+                )
+                .await
+                .is_err(),
                 "invalid root must fail before admission: {root}"
             );
         }

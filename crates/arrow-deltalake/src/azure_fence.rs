@@ -192,13 +192,18 @@ impl AzureControlContainer {
         ownership: &NormalAzureOwnership,
     ) -> Result<Self> {
         canonical_uuid(&ownership.subscription_id).context("invalid captured Azure subscription")?;
-        if ownership.stamp.len() != 5
-            || !ownership.stamp.bytes().all(|byte| byte.is_ascii_digit())
-            || ownership.resource_group != "arrow-collector-rg"
+        let container = ownership.checkpoint_container.as_bytes();
+        let alphanumeric = |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
+        if ownership.resource_group != "arrow-collector-rg"
             || !(3..=63).contains(&ownership.checkpoint_container.len())
-            || !ownership.checkpoint_container.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+            || !container.first().is_some_and(|byte| alphanumeric(*byte))
+            || !container.last().is_some_and(|byte| alphanumeric(*byte))
+            || !container.iter().all(|byte| alphanumeric(*byte) || *byte == b'-')
+            || container.windows(2).any(|pair| pair == b"--")
             || account.is_empty()
-            || !account.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+            || !account
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
         {
             bail!("invalid captured normal Azure ownership");
         }
@@ -210,7 +215,10 @@ impl AzureControlContainer {
             Some(&ownership.stamp),
         )?;
         Self::with_endpoint(
-            format!("https://{account}.blob.core.windows.net/{}", ownership.checkpoint_container),
+            format!(
+                "https://{account}.blob.core.windows.net/{}",
+                ownership.checkpoint_container
+            ),
             sandbox_id,
             credentials,
         )
@@ -544,6 +552,40 @@ mod tests {
 
     const SANDBOX: &str = "0123456789ab";
     const GENERATION: &str = "00000000-0000-4000-8000-000000000001";
+
+    #[test]
+    fn explicit_normal_ownership_binds_account_and_control_container() -> Result<()> {
+        let credentials: AzureCredentialProvider = Arc::new(object_store::StaticCredentialProvider::new(
+            AzureCredential::BearerToken("test-token".into()),
+        ));
+        let binding = NormalAzureOwnership {
+            subscription_id: "00000000-0000-0000-0000-000000000001".into(),
+            stamp: "1".into(),
+            resource_group: "arrow-collector-rg".into(),
+            checkpoint_container: "checkpoints".into(),
+        };
+        let control = AzureControlContainer::new_with_ownership("arrowcollector1", Arc::clone(&credentials), &binding)?;
+        assert_eq!(control.sandbox_id, "stamp-1");
+        assert_eq!(
+            control.endpoint,
+            "https://arrowcollector1.blob.core.windows.net/checkpoints"
+        );
+        assert!(
+            AzureControlContainer::new_with_ownership("arrowcollector2", Arc::clone(&credentials), &binding).is_err()
+        );
+        for invalid in ["", "-abc", "ab--cd", "abc-", "ab/c", "ABC"] {
+            let mut changed = binding.clone();
+            changed.checkpoint_container = invalid.into();
+            assert!(
+                AzureControlContainer::new_with_ownership("arrowcollector1", Arc::clone(&credentials), &changed)
+                    .is_err()
+            );
+        }
+        let mut changed = binding.clone();
+        changed.resource_group = "rust-playground-schema-evo".into();
+        assert!(AzureControlContainer::new_with_ownership("arrowcollector1", credentials, &changed).is_err());
+        Ok(())
+    }
 
     #[test]
     fn explicit_isolated_identity_matches_typescript() -> Result<()> {

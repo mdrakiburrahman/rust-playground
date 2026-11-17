@@ -151,14 +151,20 @@ impl BoundedAzureCli {
                     return Ok(None);
                 }
                 let (Some(client_id), Some(tenant_id), Some(token_file)) = (client_id, tenant_id, token_file) else {
-                    return Err(failure("workload identity requires client ID, tenant ID and token file"));
+                    return Err(failure(
+                        "workload identity requires client ID, tenant ID and token file",
+                    ));
                 };
                 let assertion = tokio::fs::read_to_string(token_file)
                     .await
                     .map_err(|_| failure("projected workload identity token could not be read"))?;
                 (client_id, tenant_id, assertion)
             }
-            AuthenticationSource::WorkloadIdentity { client_id, tenant_id, assertion_file } => {
+            AuthenticationSource::WorkloadIdentity {
+                client_id,
+                tenant_id,
+                assertion_file,
+            } => {
                 let assertion = read_private_assertion(assertion_file).await?;
                 (client_id.clone(), tenant_id.clone(), assertion)
             }
@@ -367,9 +373,16 @@ impl BoundedAzureCli {
 fn open_private_assertion(path: &Path) -> Result<std::fs::File> {
     use std::os::unix::fs::MetadataExt;
     if !path.is_absolute()
-        || path.components().any(|component| matches!(component, std::path::Component::ParentDir | std::path::Component::CurDir))
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
     {
-        return Err(failure("workload identity assertion path must be absolute and canonical"));
+        return Err(failure(
+            "workload identity assertion path must be absolute and canonical",
+        ));
     }
     let fd = rustix::fs::openat2(
         rustix::fs::CWD,
@@ -380,16 +393,25 @@ fn open_private_assertion(path: &Path) -> Result<std::fs::File> {
     )
     .map_err(|_| failure("workload identity assertion could not be opened safely"))?;
     let file = std::fs::File::from(fd);
-    let opened = file.metadata().map_err(|_| failure("workload identity assertion could not be inspected"))?;
-    if !opened.file_type().is_file() || opened.mode() & 0o077 != 0 || opened.uid() != rustix::process::geteuid().as_raw() {
-        return Err(failure("workload identity assertion must be a private owned regular file"));
+    let opened = file
+        .metadata()
+        .map_err(|_| failure("workload identity assertion could not be inspected"))?;
+    if !opened.file_type().is_file()
+        || opened.mode() & 0o077 != 0
+        || opened.uid() != rustix::process::geteuid().as_raw()
+    {
+        return Err(failure(
+            "workload identity assertion must be a private owned regular file",
+        ));
     }
     Ok(file)
 }
 
 #[cfg(not(target_os = "linux"))]
 fn open_private_assertion(_path: &Path) -> Result<std::fs::File> {
-    Err(failure("explicit workload identity requires Linux no-symlink private-file checks"))
+    Err(failure(
+        "explicit workload identity requires Linux no-symlink private-file checks",
+    ))
 }
 
 async fn read_private_assertion(path: &Path) -> Result<String> {
@@ -466,7 +488,8 @@ impl AzureCliTokenProvider {
         anyhow::ensure!(scope == STORAGE_SCOPE, "workload identity requires the storage scope");
         crate::publisher::canonical_uuid(tenant_id).map_err(|_| anyhow::anyhow!("invalid workload tenant ID"))?;
         crate::publisher::canonical_uuid(client_id).map_err(|_| anyhow::anyhow!("invalid workload client ID"))?;
-        open_private_assertion(assertion_file).map_err(|_| anyhow::anyhow!("invalid private workload assertion file"))?;
+        open_private_assertion(assertion_file)
+            .map_err(|_| anyhow::anyhow!("invalid private workload assertion file"))?;
         Ok(Self(BoundedAzureCli {
             program: OsString::new(),
             leading_args: Vec::new(),
@@ -496,24 +519,24 @@ impl AzureCliTokenProvider {
 }
 
 fn validate_scope_and_deadline(scope: &str, deadline: Duration) -> anyhow::Result<()> {
-        let url = url::Url::parse(scope).map_err(|_| anyhow::anyhow!("invalid Azure CLI scope"))?;
-        anyhow::ensure!(
-            url.scheme() == "https"
-                && url.host_str().is_some_and(|host| !host.is_empty())
-                && url.port().is_none()
-                && url.username().is_empty()
-                && url.password().is_none()
-                && url.query().is_none()
-                && url.fragment().is_none()
-                && url.path() == "/.default"
-                && url.as_str() == scope,
-            "Azure CLI scope must be exactly https://<host>/.default"
-        );
-        anyhow::ensure!(
-            !deadline.is_zero() && deadline <= Duration::from_secs(60),
-            "Azure CLI deadline must be within (0, 60s]"
-        );
-        Ok(())
+    let url = url::Url::parse(scope).map_err(|_| anyhow::anyhow!("invalid Azure CLI scope"))?;
+    anyhow::ensure!(
+        url.scheme() == "https"
+            && url.host_str().is_some_and(|host| !host.is_empty())
+            && url.port().is_none()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none()
+            && url.path() == "/.default"
+            && url.as_str() == scope,
+        "Azure CLI scope must be exactly https://<host>/.default"
+    );
+    anyhow::ensure!(
+        !deadline.is_zero() && deadline <= Duration::from_secs(60),
+        "Azure CLI deadline must be within (0, 60s]"
+    );
+    Ok(())
 }
 
 #[cfg(all(test, unix))]
@@ -529,25 +552,45 @@ mod tests {
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))?;
         let tenant = "11111111-1111-4111-8111-111111111111";
         let client = "22222222-2222-4222-8222-222222222222";
-        let mut provider = AzureCliTokenProvider::for_workload_identity(
-            STORAGE_SCOPE, tenant, client, &file, Duration::from_secs(1),
-        )?;
+        let mut provider =
+            AzureCliTokenProvider::for_workload_identity(STORAGE_SCOPE, tenant, client, &file, Duration::from_secs(1))?;
         assert_eq!(read_private_assertion(&file).await?, "first");
         std::fs::write(&file, "refreshed")?;
         assert_eq!(read_private_assertion(&file).await?, "refreshed");
         for invalid in ["", "not-a-uuid"] {
-            assert!(AzureCliTokenProvider::for_workload_identity(
-                STORAGE_SCOPE, invalid, client, &file, Duration::from_secs(1)
-            ).is_err());
+            assert!(
+                AzureCliTokenProvider::for_workload_identity(
+                    STORAGE_SCOPE,
+                    invalid,
+                    client,
+                    &file,
+                    Duration::from_secs(1)
+                )
+                .is_err()
+            );
         }
-        assert!(AzureCliTokenProvider::for_workload_identity(
-            STORAGE_SCOPE, tenant, client, Path::new("relative"), Duration::from_secs(1)
-        ).is_err());
+        assert!(
+            AzureCliTokenProvider::for_workload_identity(
+                STORAGE_SCOPE,
+                tenant,
+                client,
+                Path::new("relative"),
+                Duration::from_secs(1)
+            )
+            .is_err()
+        );
         let linked = root.path().join("linked");
         symlink(&file, &linked)?;
-        assert!(AzureCliTokenProvider::for_workload_identity(
-            STORAGE_SCOPE, tenant, client, &linked, Duration::from_secs(1)
-        ).is_err());
+        assert!(
+            AzureCliTokenProvider::for_workload_identity(
+                STORAGE_SCOPE,
+                tenant,
+                client,
+                &linked,
+                Duration::from_secs(1)
+            )
+            .is_err()
+        );
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644))?;
         assert!(read_private_assertion(&file).await.is_err());
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))?;
