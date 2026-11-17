@@ -2160,11 +2160,11 @@ fn maintain_table(
         let limits = &settings.operation_limits;
         let probe = discovery.open_probe_table(&discovered.url, limits.discovery_max_log_files);
         // Storage errors may include credential-bearing URIs.
-        let target = match &probe {
+        let metadata = match &probe {
             Ok(probe) => match probe
-                .maintenance_target_with_limits(limits.discovery_max_log_files, limits.discovery_max_log_file_bytes)
+                .maintenance_metadata_with_limits(limits.discovery_max_log_files, limits.discovery_max_log_file_bytes)
             {
-                Ok(target) => target,
+                Ok(metadata) => Some(metadata),
                 Err(_) => {
                     eprintln!("delta-maintenance target metadata readback failed; identity unresolved table={name}");
                     None
@@ -2175,7 +2175,8 @@ fn maintain_table(
                 None
             }
         };
-        if let Err(error) = metrics.observe_target(name, target) {
+        if let Err(error) = metrics.observe_target(name, metadata.as_ref().and_then(|metadata| metadata.target.clone()))
+        {
             eprintln!("delta-maintenance target readback update failed: {error:#}");
         }
         let (effective, props) = effective_settings(settings, &discovered.properties)?;
@@ -2199,17 +2200,17 @@ fn maintain_table(
         }
         let probe = probe?;
         let token = probe.probe_log_token(limits.discovery_max_log_files)?;
-        if discovered.log_token.as_ref().is_none_or(|previous| *previous != token)
-            && !policy_matches(
-                settings,
-                &probe.maintenance_properties_with_limits(
+        if discovered.log_token.as_ref().is_none_or(|previous| *previous != token) {
+            let current_properties = match metadata.filter(|metadata| metadata.log_token == token) {
+                Some(metadata) => metadata.properties,
+                None => probe.maintenance_properties_with_limits(
                     limits.discovery_max_log_files,
                     limits.discovery_max_log_file_bytes,
                 )?,
-                &props,
-            )?
-        {
-            bail!("table properties changed after discovery; retry");
+            };
+            if !policy_matches(settings, &current_properties, &props)? {
+                bail!("table properties changed after discovery; retry");
+            }
         }
         discovered.log_token = Some(token);
         let config = configuration_evidence(settings, &effective, &props)?;

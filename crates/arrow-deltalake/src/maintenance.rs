@@ -556,6 +556,13 @@ impl Granularity {
     }
 }
 
+/// A bounded metadata observation that can be reused only at its exact log token.
+pub struct MaintenanceMetadata {
+    pub target: Option<(String, String)>,
+    pub properties: BTreeMap<String, String>,
+    pub log_token: String,
+}
+
 /// Table identity, metadata and protocol a plan was derived from.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TableFingerprint {
@@ -919,7 +926,7 @@ impl DeltaTable {
     ) -> Result<BTreeMap<String, String>> {
         Ok(self
             .maintenance_metadata_with_limits(max_log_files, max_log_file_bytes)?
-            .1)
+            .properties)
     }
 
     /// Read the actual table root and metadata ID without creating or changing the table.
@@ -931,18 +938,20 @@ impl DeltaTable {
         max_log_files: usize,
         max_log_file_bytes: u64,
     ) -> Result<Option<(String, String)>> {
-        let Some(root) = crate::delta::normalize_delta_target_root(self.url.as_str()) else {
-            return Ok(None);
-        };
-        let (id, _) = self.maintenance_metadata_with_limits(max_log_files, max_log_file_bytes)?;
-        Ok(id.map(|id| (root, id)))
+        Ok(self
+            .maintenance_metadata_with_limits(max_log_files, max_log_file_bytes)?
+            .target)
     }
 
-    fn maintenance_metadata_with_limits(
+    /// Read properties and destination identity under the same object-identity fence.
+    ///
+    /// # Errors
+    /// Rejects corrupt or incomplete logs and concurrent metadata advancement.
+    pub fn maintenance_metadata_with_limits(
         &self,
         max_log_files: usize,
         max_log_file_bytes: u64,
-    ) -> Result<(Option<String>, BTreeMap<String, String>)> {
+    ) -> Result<MaintenanceMetadata> {
         let names = self.list_log(max_log_files)?;
         let version = probe_version(&names)?;
         let token = log_token(&names)?;
@@ -972,7 +981,11 @@ impl DeltaTable {
             }
             if let Some(configuration) = configuration {
                 self.require_probe_token(&token, max_log_files)?;
-                return Ok((id, configuration));
+                return Ok(MaintenanceMetadata {
+                    target: crate::delta::normalize_delta_target_root(self.url.as_str()).zip(id),
+                    properties: configuration,
+                    log_token: token,
+                });
             }
         }
         let snapshot = self.snapshot()?;
@@ -984,10 +997,12 @@ impl DeltaTable {
         }
         let fingerprint = TableFingerprint::of(&snapshot);
         self.require_probe_token(&token, max_log_files)?;
-        Ok((
-            (!fingerprint.table_id.is_empty()).then_some(fingerprint.table_id),
-            fingerprint.configuration,
-        ))
+        Ok(MaintenanceMetadata {
+            target: crate::delta::normalize_delta_target_root(self.url.as_str())
+                .zip((!fingerprint.table_id.is_empty()).then_some(fingerprint.table_id)),
+            properties: fingerprint.configuration,
+            log_token: token,
+        })
     }
 
     fn require_probe_token(&self, token: &str, max_files: usize) -> Result<()> {
