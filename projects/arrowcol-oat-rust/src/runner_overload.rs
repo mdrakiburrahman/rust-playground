@@ -521,6 +521,400 @@ mod overload_guard_tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_endpoint_refresh_after_scaling_never_reuses_previous_bindings() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("oat-endpoint-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root)?;
+        fs::create_dir(root.join("bin"))?;
+        let result = async {
+            let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/endpoint-refresh.ts");
+            let docker = root.join("bin/docker");
+            fs::write(
+                &docker,
+                format!("#!/bin/sh\nexec node --import tsx '{}' \"$@\"\n", script.display()),
+            )?;
+            fs::set_permissions(docker, fs::Permissions::from_mode(0o700))?;
+            let before = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let after = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let old = before.local_addr()?.port();
+            let new = after.local_addr()?.port();
+            let mut state = json!({"scaled":false,"before":{"router":old,"dataflow-1":old,"kusto":old},
+                "after":{"router":new,"dataflow-1":new,"kusto":new}});
+            fs::write(root.join("state.json"), state.to_string())?;
+            let config: OatConfig = serde_json::from_str(include_str!(
+                "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+            ))?;
+            let mut paths = vec![root.join("bin")];
+            paths.extend(std::env::split_paths(
+                &std::env::var_os("PATH").context("fixture PATH")?,
+            ));
+            let mut platform = LocalPlatform {
+                run_id: uuid::Uuid::new_v4().to_string(),
+                state_dir: root.clone(),
+                control_dir: root.clone(),
+                environment: HashMap::from([
+                    (
+                        "PATH".to_owned(),
+                        std::env::join_paths(paths)?
+                            .into_string()
+                            .map_err(|_| anyhow::anyhow!("invalid fixture PATH"))?,
+                    ),
+                    (
+                        "OAT_ENDPOINT_FIXTURE_ROOT".to_owned(),
+                        root.to_str().context("fixture path")?.to_owned(),
+                    ),
+                ]),
+                client_progress: std::sync::Mutex::new(HashMap::new()),
+                router_metrics_url: None,
+                collector_metrics_url: None,
+                qap_url: None,
+                daemon_endpoint: Some("unix:///var/run/docker.sock".to_owned()),
+                shutdown_drain_evidence: None,
+                maintenance_cell_baseline: Vec::new(),
+            };
+            platform.router_metrics_url =
+                Some(local_compose_endpoint(&config, &platform, "router", "50050", "/metrics").await?);
+            platform.collector_metrics_url =
+                Some(local_compose_endpoint(&config, &platform, "dataflow-1", "32011", "/metrics").await?);
+            platform.qap_url = Some(local_compose_endpoint(&config, &platform, "kusto", "8080", "").await?);
+            let previous = platform.collector_metrics_url.clone();
+            platform.scale_arrowcols(&config, 1, 1).await?;
+            assert_ne!(
+                platform.collector_metrics_url, previous,
+                "scale/recreate must rediscover published bindings"
+            );
+            assert_eq!(
+                platform.collector_metrics_url,
+                Some(format!("http://127.0.0.1:{new}/metrics"))
+            );
+            assert_eq!(
+                platform.router_metrics_url,
+                Some(format!("http://127.0.0.1:{new}/metrics"))
+            );
+            assert_eq!(platform.qap_url, Some(format!("http://127.0.0.1:{new}")));
+            let Some(ResourceSamplerSource::Local {
+                collector_metrics_url, ..
+            }) = platform.resource_sampler_source()
+            else {
+                bail!("local sampler source missing");
+            };
+            assert_eq!(collector_metrics_url, platform.collector_metrics_url);
+
+            state["scaled"] = json!(true);
+            state["fail"] = json!("dataflow-1");
+            fs::write(root.join("state.json"), state.to_string())?;
+            platform.scale_arrowcols(&config, 1, 1).await?;
+            assert!(
+                platform.collector_metrics_url.is_none(),
+                "failed rediscovery must discard the previous collector URL"
+            );
+            let source = platform.resource_sampler_source().context("sampler source missing")?;
+            let error = PublicationBacklogScraper::start(&source, &config)
+                .await
+                .err()
+                .context("missing endpoint admitted")?;
+            assert!(format!("{error:#}").contains("metrics endpoint is unavailable"));
+
+            state["fail"] = json!("kusto");
+            fs::write(root.join("state.json"), state.to_string())?;
+            platform.scale_arrowcols(&config, 1, 1).await?;
+            assert!(
+                platform.qap_url.is_none(),
+                "optional downstream failure must not retain an old URL"
+            );
+            assert!(platform.collector_metrics_url.is_some());
+
+            state["fail"] = json!("router");
+            fs::write(root.join("state.json"), state.to_string())?;
+            assert!(
+                platform.scale_arrowcols(&config, 1, 1).await.is_err(),
+                "required router rediscovery must fail"
+            );
+            assert!(platform.router_metrics_url.is_none());
+            assert!(platform.collector_metrics_url.is_none());
+            assert!(platform.qap_url.is_none());
+            let commands = fs::read_to_string(root.join("commands"))?;
+            assert!(!commands.contains("oat-client"));
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        fs::remove_dir_all(&root)?;
+        result
+    }
+
+    #[tokio::test]
+    #[ignore = "requires authorized no-load setup/recreate/pin/maintenance admission with cached component images"]
+    async fn local_endpoint_actual_docker_lifecycle_without_clients() -> Result<()> {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize()?;
+        if std::env::var_os("OAT_ENDPOINT_LIFECYCLE_CHILD").is_none() {
+            let mut command = Command::new(std::env::current_exe()?);
+            command
+                .current_dir(&workspace)
+                .env("OAT_ENDPOINT_LIFECYCLE_CHILD", "1")
+                .args([
+                    "--exact",
+                    "runner::overload_guard_tests::local_endpoint_actual_docker_lifecycle_without_clients",
+                    "--ignored",
+                    "--nocapture",
+                ]);
+            tokio::time::timeout(
+                Duration::from_secs(900),
+                run_streaming_command(command, "bounded no-load local endpoint lifecycle"),
+            )
+            .await
+            .context("no-load lifecycle timed out; inspect its run-owned resources before cleanup")??;
+            return Ok(());
+        }
+        let mut config: OatConfig =
+            serde_json::from_slice(&fs::read(std::env::var("OAT_ENDPOINT_LIFECYCLE_CONFIG")?)?)?;
+        anyhow::ensure!(
+            config.platform.kind == crate::config::OatMode::Local,
+            "local config required"
+        );
+        anyhow::ensure!(
+            config.platform.local.collector_memory_limit_bytes == Some(4 * 1024 * 1024 * 1024),
+            "this lifecycle proof requires an explicit 4 GiB cap"
+        );
+        anyhow::ensure!(
+            config.platform.local.bind_host.is_some() && config.platform.local.endpoint_host.is_some(),
+            "explicit reachable Docker-host binding and endpoint required for the lifecycle proof"
+        );
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let root = workspace
+            .join("out/arrowcol-oat")
+            .join(format!("endpoint-lifecycle-{run_id}"));
+        fs::create_dir(&root)?;
+        config.platform.compose_state_root = Some(root.join("state").to_str().context("state path")?.to_owned());
+        config.platform.local.snapshot_root = None;
+        config.platform.compose_project = Some("oat-endpoint-lifecycle".to_owned());
+        config.maintenance_image = Some("arrowcol-oat/maintenance:local".to_owned());
+        let mut overlay: serde_yaml::Value = serde_yaml::from_str(&fs::read_to_string(
+            config
+                .platform
+                .compose_override_file
+                .as_deref()
+                .context("local override missing")?,
+        )?)?;
+        for service in [
+            "sqlserver",
+            "database-bootstrap",
+            "arrowcol-migrate",
+            "arrowcol-catalog",
+            "dataflow-1",
+            "router",
+            "oat-client",
+        ] {
+            overlay["services"][service]["build"] =
+                serde_yaml::Value::Tagged(Box::new(serde_yaml::value::TaggedValue {
+                    tag: serde_yaml::value::Tag::new("!reset"),
+                    value: serde_yaml::Value::Null,
+                }));
+        }
+        let override_path = root.join("cached-components.yaml");
+        fs::write(&override_path, serde_yaml::to_string(&overlay)?)?;
+        config.platform.compose_override_file = Some(override_path.to_str().context("override path")?.to_owned());
+        let mut platform = LocalPlatform::new(&config, &run_id)?;
+        let receipt_path = root.join("receipt.json");
+        println!(
+            "endpoint_lifecycle_scope {}",
+            json!({"run_id":run_id,"receipt":receipt_path,
+            "classification":"unscored_no_load_lifecycle","workload_clients":0,"schedule_armed":false})
+        );
+        let mut receipt = json!({"run_id":run_id,"classification":"unscored_no_load_lifecycle",
+            "workload_clients":0,"schedule_armed":false});
+        let result = async {
+            platform.ensure_stack(&config, &run_id).await?;
+            let before = platform
+                .process_logs_for_role(&config, ComponentRole::Collector)
+                .await?;
+            let [before] = before.as_slice() else {
+                bail!("initial collector identity ambiguous");
+            };
+            receipt["before"] = json!({"container_id":before.instance_id,"metrics_url":platform.collector_metrics_url});
+            println!("endpoint_lifecycle_before {}", receipt["before"]);
+            platform.scale_arrowcols(&config, 1, 1).await?;
+            let after = platform
+                .process_logs_for_role(&config, ComponentRole::Collector)
+                .await?;
+            let [after] = after.as_slice() else {
+                bail!("scaled collector identity ambiguous");
+            };
+            receipt["after"] = json!({"container_id":after.instance_id,"metrics_url":platform.collector_metrics_url});
+            println!("endpoint_lifecycle_after {}", receipt["after"]);
+            anyhow::ensure!(
+                before.instance_id != after.instance_id,
+                "scale did not recreate collector"
+            );
+            anyhow::ensure!(
+                receipt["before"]["metrics_url"] != receipt["after"]["metrics_url"],
+                "mapped port did not change"
+            );
+            let endpoint = platform
+                .collector_metrics_url
+                .clone()
+                .context("collector endpoint missing after scale")?;
+            let status = reqwest::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()?
+                .get(&endpoint)
+                .send()
+                .await?
+                .status();
+            anyhow::ensure!(
+                status == reqwest::StatusCode::OK,
+                "fresh collector metrics returned {status}"
+            );
+            receipt["metrics_http_status"] = json!(status.as_u16());
+            let tables = config.tables.clone();
+            let now = unix_time_ms_u64()?;
+            platform
+                .initialize_run_table_pins(
+                    &config,
+                    &run_id,
+                    &expected_pin_keys_json(&tables)?,
+                    now.checked_add(config.run_pin_ttl_ms).context("pin expiry overflow")?,
+                    now,
+                )
+                .await?;
+            let baseline = platform.process_logs(&config).await?;
+            platform.retain_cell_process_baseline(&baseline);
+            let prepared = tokio::time::timeout(Duration::from_secs(5), PreparedGuard::prepare(&config, &platform))
+                .await
+                .context("guard preparation deadline")??;
+            anyhow::ensure!(
+                prepared.probe.instance_id == after.instance_id,
+                "guard retained stale container identity"
+            );
+            anyhow::ensure!(prepared.scraper.endpoint == endpoint, "guard retained stale endpoint");
+            receipt["guard"] = json!({"status":"prepared","container_id":prepared.probe.instance_id,
+                "collector_instance":prepared.probe.collector_instance,"metrics_url":prepared.scraper.endpoint,
+                "readback":prepared.engine.proof});
+            let mut cgroup = Command::new("docker");
+            cgroup.args([
+                "exec",
+                &after.instance_id,
+                "cat",
+                "/proc/self/cgroup",
+                "/sys/fs/cgroup/memory.current",
+                "/sys/fs/cgroup/memory.max",
+            ]);
+            let cgroup = String::from_utf8(
+                run_command(cgroup, "read recreated collector private cgroup")
+                    .await?
+                    .stdout,
+            )?;
+            guard_container_memory(&cgroup, Some(4 * 1024 * 1024 * 1024))?;
+            receipt["cgroup_readback"] = json!(cgroup);
+            platform
+                .prepare_campaign_load_admission(&config, &run_id, &tables)
+                .await?;
+            receipt["policy_preparation"] = json!("passed");
+            let maintenance = platform
+                .process_logs_for_role(&config, ComponentRole::Maintenance)
+                .await?;
+            let [maintenance] = maintenance.as_slice() else {
+                bail!("maintenance identity ambiguous");
+            };
+            receipt["maintenance_configuration"] = process_configurations(&maintenance.text)?;
+            let policy = maintenance
+                .text
+                .lines()
+                .filter_map(|line| line.strip_prefix("arrowcol_maintenance_table_config "))
+                .map(serde_json::from_str::<Value>)
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            anyhow::ensure!(!policy.is_empty(), "effective maintenance table readback missing");
+            for event in &policy {
+                anyhow::ensure!(
+                    event.pointer("/config/table_policy/arrowcol.partition.granularity") == Some(&json!("hour")),
+                    "effective hour granularity not proved"
+                );
+                anyhow::ensure!(
+                    event.pointer("/config/table_policy/arrowcol.optimize.sealedPartitionsOnly") == Some(&json!(false)),
+                    "effective sealed=false not proved"
+                );
+            }
+            receipt["maintenance_table_readback"] = json!(policy);
+            fs::write(root.join("maintenance.log"), &maintenance.text)?;
+            fs::write(root.join("collector.log"), &after.text)?;
+            anyhow::ensure!(
+                fs::read_to_string(platform.control_dir.join("schedule"))? == "pending\n",
+                "schedule was armed"
+            );
+            let project =
+                scoped_compose_project(config.platform.compose_project.as_deref().context("project")?, &run_id);
+            let mut clients = Command::new("docker");
+            clients.args(local_oat_client_list_args(&project));
+            anyhow::ensure!(
+                run_command(clients, "verify no workload clients exist")
+                    .await?
+                    .stdout
+                    .is_empty(),
+                "workload clients existed"
+            );
+            println!("endpoint_lifecycle_prepared {}", receipt);
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        if let Err(error) = &result {
+            receipt["failure"] = json!(format!("{error:#}"));
+        }
+        fs::write(&receipt_path, serde_json::to_vec_pretty(&receipt)?)?;
+        let cleanup = platform.cleanup(&config).await;
+        match cleanup {
+            Ok(()) => receipt["cleanup"] = platform.shutdown_drain_evidence().context("cleanup evidence missing")?,
+            Err(error) => {
+                receipt["cleanup_error"] = json!(format!("{error:#}"));
+                fs::write(&receipt_path, serde_json::to_vec_pretty(&receipt)?)?;
+                return Err(error.context("no-load cleanup failed; retain run-owned custody"));
+            }
+        }
+        fs::write(&receipt_path, serde_json::to_vec_pretty(&receipt)?)?;
+        let project = scoped_compose_project(config.platform.compose_project.as_deref().context("project")?, &run_id);
+        let mut list = Command::new("docker");
+        list.args([
+            "ps",
+            "-aq",
+            "--filter",
+            &format!("label=com.docker.compose.project={project}"),
+        ]);
+        let ids = String::from_utf8(
+            run_command(list, "verify run-owned workloads stopped after normal cleanup")
+                .await?
+                .stdout,
+        )?
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        if !ids.is_empty() {
+            let mut inspect = Command::new("docker");
+            inspect.arg("inspect").args(&ids);
+            let remaining: Vec<Value> = serde_json::from_slice(
+                &run_command(inspect, "verify stopped test-owned cleanup residue")
+                    .await?
+                    .stdout,
+            )?;
+            anyhow::ensure!(
+                remaining.len() == ids.len()
+                    && remaining
+                        .iter()
+                        .all(|container| container.pointer("/State/Running") == Some(&json!(false))
+                            && container.pointer("/Config/Labels/com.docker.compose.project") == Some(&json!(project))),
+                "normal cleanup left running or unowned resources; retain custody"
+            );
+            receipt["normal_cleanup_stopped_container_residue"] = json!(ids);
+            fs::write(&receipt_path, serde_json::to_vec_pretty(&receipt)?)?;
+            let mut remove = Command::new("docker");
+            remove.arg("rm").args(&ids);
+            run_command(remove, "remove only verified stopped test-owned container residue").await?;
+        }
+        receipt["test_owned_containers_removed"] = json!(true);
+        fs::write(&receipt_path, serde_json::to_vec_pretty(&receipt)?)?;
+        println!("endpoint_lifecycle_receipt {}", receipt_path.display());
+        result
+    }
+
     #[tokio::test]
     #[ignore = "requires an explicitly authorized test-owned no-load Docker collector; see TUNABLES.md"]
     async fn overload_actual_docker_admission_and_idle_sampling() -> Result<()> {
@@ -813,6 +1207,7 @@ mod overload_guard_tests {
                 started_at_ms: 0,
                 qap: QapMetrics::default(),
                 resources: None,
+                resource_evidence: None,
             },
         )?;
         let mut outcome = finish_matrix_cell(

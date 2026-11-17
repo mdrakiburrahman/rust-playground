@@ -50,6 +50,26 @@ impl TableDiscovery for CatalogTable {
     }
 }
 
+struct StopAtMaintenanceClock {
+    source: CatalogTable,
+    stop: Arc<AtomicBool>,
+}
+
+impl TableDiscovery for StopAtMaintenanceClock {
+    fn tables(&self) -> Result<Vec<String>> {
+        self.source.tables()
+    }
+
+    fn table(&self, name: &str) -> Result<DiscoveredTable> {
+        self.source.table(name)
+    }
+
+    fn maintenance_now_ms(&self) -> Result<i64> {
+        self.stop.store(true, Ordering::SeqCst);
+        Ok(BASE + 3 * 60_000)
+    }
+}
+
 fn fixture() -> Result<(tempfile::TempDir, Settings, CatalogTable)> {
     let root = tempfile::tempdir()?;
     let table_path = root.path().join("events");
@@ -144,6 +164,36 @@ fn one_shot_rejects_missing_allowlisted_tables_before_reporting_success() -> Res
         error
             .to_string()
             .contains("allowlisted tables were missing or ambiguous")
+    );
+    Ok(())
+}
+
+#[test]
+fn graceful_stop_does_not_interrupt_an_admitted_table_operation() -> Result<()> {
+    let (_root, mut settings, source) = fixture()?;
+    settings.operations = vec![Operation::Optimize];
+    settings.anchor_ms = None;
+    let stop = Arc::new(AtomicBool::new(false));
+    let discovery = StopAtMaintenanceClock {
+        source,
+        stop: Arc::clone(&stop),
+    };
+
+    let results = run_cycle_with_discovery(&settings, &discovery, &Metrics::new(), &stop)?;
+
+    assert!(
+        stop.load(Ordering::SeqCst),
+        "the test must request shutdown after table admission"
+    );
+    assert_eq!(
+        results.len(),
+        1,
+        "the admitted OPTIMIZE operation must produce a result: {results:?}"
+    );
+    assert_eq!(results[0].operation, Operation::Optimize);
+    assert!(
+        results[0].error_kind.is_none(),
+        "graceful shutdown interrupted admitted work: {results:?}"
     );
     Ok(())
 }

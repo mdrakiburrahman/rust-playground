@@ -510,6 +510,9 @@ fn verify_process_configuration(config: &OatConfig, role: ComponentRole, observe
         if name == "ARROWCOL_ROUTER_UPSTREAM_PING_INTERVAL_SECONDS" && expected == 0 {
             expected = Value::Null;
         }
+        if matches!(role, ComponentRole::Maintenance) && name == "ARROWCOL_MAINT_OPERATION_TIMEOUT_SECS" {
+            continue;
+        }
         if matches!(role, ComponentRole::Maintenance) && name.starts_with("ARROWCOL_MAINT_") {
             let (actual, expected) = maintenance_readback_value(observed, &name, expected)?;
             if !contains_requested(&actual, &expected) {

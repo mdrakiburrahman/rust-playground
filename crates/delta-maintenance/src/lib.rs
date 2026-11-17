@@ -1802,7 +1802,7 @@ fn maintain_table(
     settings: &Settings,
     discovery: &dyn TableDiscovery,
     name: &str,
-    cancel: &Arc<AtomicBool>,
+    force_abort: &Arc<AtomicBool>,
     emit: &dyn Fn(&OperationResult),
     schedule: Option<&Mutex<ScheduledTables>>,
 ) -> Vec<OperationResult> {
@@ -1871,7 +1871,7 @@ fn maintain_table(
         .into_iter()
         .filter(|operation| operations.contains(operation))
     {
-        if cancel.load(Ordering::SeqCst) {
+        if force_abort.load(Ordering::SeqCst) {
             break;
         }
         let started = Instant::now();
@@ -1889,8 +1889,9 @@ fn maintain_table(
                     Some(anchor) => anchor,
                     None => discovery.maintenance_now_ms()?,
                 };
-                let control = MaintenanceControl::new(Arc::clone(cancel), Some(started + effective.operation_timeout))
-                    .with_commit_retry_limits(effective.commit_attempts, effective.commit_budget)?;
+                let control =
+                    MaintenanceControl::new(Arc::clone(force_abort), Some(started + effective.operation_timeout))
+                        .with_commit_retry_limits(effective.commit_attempts, effective.commit_budget)?;
                 let probe_started = Instant::now();
                 let probe_result = (|| -> Result<Option<MaintenanceReport>> {
                     let token = probe.probe_log_token(settings.operation_limits.discovery_max_log_files)?;
@@ -2035,7 +2036,8 @@ pub fn run_cycle(settings: &Settings, metrics: &Metrics, cancel: &Arc<AtomicBool
         settings.operation_limits.discovery_max_log_files,
         settings.operation_limits.discovery_max_log_file_bytes,
     );
-    match cycle_with_discovery(settings, &source, metrics, cancel, None) {
+    let force_abort = Arc::new(AtomicBool::new(false));
+    match cycle_with_discovery(settings, &source, metrics, cancel, &force_abort, None) {
         Ok(results) => results,
         Err(error) => {
             let result = discovery_failure(settings, error);
@@ -2055,7 +2057,8 @@ pub fn run_cycle_with_discovery(
     metrics: &Metrics,
     cancel: &Arc<AtomicBool>,
 ) -> Result<Vec<OperationResult>> {
-    cycle_with_discovery(settings, discovery, metrics, cancel, None)
+    let force_abort = Arc::new(AtomicBool::new(false));
+    cycle_with_discovery(settings, discovery, metrics, cancel, &force_abort, None)
 }
 
 fn discovery_failure(settings: &Settings, error: anyhow::Error) -> OperationResult {
@@ -2079,7 +2082,8 @@ fn cycle_with_discovery(
     settings: &Settings,
     discovery: &dyn TableDiscovery,
     metrics: &Metrics,
-    cancel: &Arc<AtomicBool>,
+    stop_admission: &Arc<AtomicBool>,
+    force_abort: &Arc<AtomicBool>,
     schedule: Option<&Mutex<ScheduledTables>>,
 ) -> Result<Vec<OperationResult>> {
     let names = discovery.tables()?;
@@ -2122,12 +2126,15 @@ fn cycle_with_discovery(
         for _ in 0..workers {
             scope.spawn(|| {
                 loop {
-                    if cancel.load(Ordering::SeqCst) {
+                    if stop_admission.load(Ordering::SeqCst) || force_abort.load(Ordering::SeqCst) {
                         break;
                     }
                     let next = queue.lock().ok().and_then(|mut queue| queue.pop_front());
                     let Some(name) = next else { break };
-                    let mut done = maintain_table(settings, discovery, &name, cancel, &emit, schedule);
+                    if stop_admission.load(Ordering::SeqCst) || force_abort.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let mut done = maintain_table(settings, discovery, &name, force_abort, &emit, schedule);
                     if let Ok(mut results) = results.lock() {
                         results.append(&mut done);
                     }
@@ -2141,20 +2148,31 @@ fn cycle_with_discovery(
         .map_err(|_| anyhow::anyhow!("maintenance results mutex poisoned"))
 }
 
-/// Run once or on a schedule with idle exponential backoff until cancelled.
-/// Returns `false` for non-retryable failures or bounded stale-plan starvation.
+/// Run once or on a schedule until graceful stop or force-abort is requested.
+/// Returns `false` for operation failures, force-abort, or bounded stale-plan starvation.
 #[must_use]
-pub fn run(settings: &Settings, metrics: &Metrics, cancel: &Arc<AtomicBool>) -> bool {
+pub fn run(settings: &Settings, metrics: &Metrics, stop_admission: &Arc<AtomicBool>) -> bool {
+    let force_abort = Arc::new(AtomicBool::new(false));
+    run_with_shutdown(settings, metrics, stop_admission, &force_abort)
+}
+
+/// Run filesystem discovery with separate graceful-stop and force-abort signals.
+#[must_use]
+pub fn run_with_shutdown(
+    settings: &Settings,
+    metrics: &Metrics,
+    stop_admission: &Arc<AtomicBool>,
+    force_abort: &Arc<AtomicBool>,
+) -> bool {
     let source = FilesystemDiscovery::new(settings.root.clone(), settings.tables.clone()).with_log_limits(
         settings.operation_limits.discovery_max_log_files,
         settings.operation_limits.discovery_max_log_file_bytes,
     );
-    run_with_discovery(settings, &source, metrics, cancel)
+    run_with_discovery_shutdown(settings, &source, metrics, stop_admission, force_abort)
 }
 
 fn cycle_results_are_healthy(
     results: &[OperationResult],
-    signal_cancellation_requested: bool,
     stale_plans: &mut BTreeMap<(String, &'static str), u32>,
     stale_plan_limit: u32,
 ) -> bool {
@@ -2175,8 +2193,7 @@ fn cycle_results_are_healthy(
                     consecutive,
                 );
             }
-        } else if !(signal_cancellation_requested && result.error_kind == Some(MaintenanceErrorKind::Cancelled.label()))
-        {
+        } else {
             healthy = false;
         }
     }
@@ -2191,6 +2208,19 @@ pub fn run_with_discovery(
     metrics: &Metrics,
     cancel: &Arc<AtomicBool>,
 ) -> bool {
+    let force_abort = Arc::new(AtomicBool::new(false));
+    run_with_discovery_shutdown(settings, discovery, metrics, cancel, &force_abort)
+}
+
+/// Run the bounded scheduler with distinct graceful-stop and force-abort signals.
+#[must_use]
+pub fn run_with_discovery_shutdown(
+    settings: &Settings,
+    discovery: &dyn TableDiscovery,
+    metrics: &Metrics,
+    stop_admission: &Arc<AtomicBool>,
+    force_abort: &Arc<AtomicBool>,
+) -> bool {
     let mut healthy = true;
     let mut stale_plans = BTreeMap::new();
     let schedule = Mutex::new(BTreeMap::new());
@@ -2198,7 +2228,14 @@ pub fn run_with_discovery(
     let mut cycles = 0_u64;
     let mut previous_pending = Some(Vec::new());
     loop {
-        let results = match cycle_with_discovery(settings, discovery, metrics, cancel, Some(&schedule)) {
+        let results = match cycle_with_discovery(
+            settings,
+            discovery,
+            metrics,
+            stop_admission,
+            force_abort,
+            Some(&schedule),
+        ) {
             Ok(results) => results,
             Err(error) => {
                 let result = discovery_failure(settings, error);
@@ -2213,7 +2250,6 @@ pub fn run_with_discovery(
         cycles += 1;
         healthy &= cycle_results_are_healthy(
             &results,
-            cancel.load(Ordering::SeqCst),
             &mut stale_plans,
             if settings.interval.is_some() {
                 settings.max_consecutive_stale_plans
@@ -2244,7 +2280,10 @@ pub fn run_with_discovery(
             }
         };
         let Some(interval) = settings.interval else { break };
-        if settings.max_cycles.is_some_and(|max| cycles >= max) || cancel.load(Ordering::SeqCst) {
+        if settings.max_cycles.is_some_and(|max| cycles >= max)
+            || stop_admission.load(Ordering::SeqCst)
+            || force_abort.load(Ordering::SeqCst)
+        {
             break;
         }
         let idle =
@@ -2261,14 +2300,19 @@ pub fn run_with_discovery(
             interval
         });
         let wake = Instant::now() + current;
-        while Instant::now() < wake && !cancel.load(Ordering::SeqCst) {
+        while Instant::now() < wake && !stop_admission.load(Ordering::SeqCst) && !force_abort.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_millis(100).min(wake.saturating_duration_since(Instant::now())));
         }
-        if cancel.load(Ordering::SeqCst) {
+        if stop_admission.load(Ordering::SeqCst) || force_abort.load(Ordering::SeqCst) {
             break;
         }
     }
-    healthy
+    if force_abort.load(Ordering::SeqCst) {
+        eprintln!("delta-maintenance force-aborted after shutdown request");
+        false
+    } else {
+        healthy
+    }
 }
 
 #[cfg(test)]
@@ -2293,18 +2337,16 @@ mod signal_cancellation_tests {
     }
 
     #[test]
-    fn signal_cancellation_is_healthy_without_masking_operation_failures() {
+    fn cancellation_and_failures_are_unhealthy_while_stale_plans_retry() {
         let cancelled = result_with_error_kind(Some(MaintenanceErrorKind::Cancelled.label()));
         let mut stale_plans = BTreeMap::new();
-        assert!(cycle_results_are_healthy(
+        assert!(!cycle_results_are_healthy(
             std::slice::from_ref(&cancelled),
-            true,
             &mut stale_plans,
             8
         ));
         assert!(!cycle_results_are_healthy(
             std::slice::from_ref(&cancelled),
-            false,
             &mut stale_plans,
             8
         ));
@@ -2312,7 +2354,6 @@ mod signal_cancellation_tests {
         let failed = result_with_error_kind(Some("commit_budget_exhausted"));
         assert!(!cycle_results_are_healthy(
             std::slice::from_ref(&failed),
-            true,
             &mut stale_plans,
             8
         ));
@@ -2323,9 +2364,8 @@ mod signal_cancellation_tests {
         let stale = result_with_error_kind(Some(MaintenanceErrorKind::StalePlan.label()));
         let success = result_with_error_kind(None);
         let mut counts = BTreeMap::new();
-        let observe = |results: &[OperationResult], counts: &mut BTreeMap<_, _>| {
-            cycle_results_are_healthy(results, false, counts, 3)
-        };
+        let observe =
+            |results: &[OperationResult], counts: &mut BTreeMap<_, _>| cycle_results_are_healthy(results, counts, 3);
         assert!(observe(std::slice::from_ref(&stale), &mut counts));
         assert!(observe(std::slice::from_ref(&success), &mut counts));
         assert!(observe(std::slice::from_ref(&stale), &mut counts));
@@ -2336,7 +2376,6 @@ mod signal_cancellation_tests {
         assert!(!observe(&[stale.clone(), other], &mut counts));
         assert!(!cycle_results_are_healthy(
             std::slice::from_ref(&stale),
-            false,
             &mut BTreeMap::new(),
             1
         ));

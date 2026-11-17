@@ -5,11 +5,12 @@ use arrow_deltalake::maintenance::{Granularity, InputReadStrategy, OptimizeConfi
 use clap::Parser;
 use delta_kernel::metrics::WithMetricsReporterLayer;
 use delta_maintenance::{
-    Metrics, Operation, OperationLimits, OptimizeUploadMode, Settings, run, serve_metrics, startup_configuration,
+    Metrics, Operation, OperationLimits, OptimizeUploadMode, Settings, run_with_shutdown, serve_metrics,
+    startup_configuration,
 };
 use delta_maintenance::{
     catalog::{CatalogDiscovery, CatalogOptions},
-    run_with_discovery,
+    run_with_discovery_shutdown,
 };
 use opentelemetry_otlp::{Protocol, WithExportConfig};
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
@@ -389,6 +390,12 @@ fn main() -> ExitCode {
     }
 }
 
+fn request_shutdown(stop_admission: &AtomicBool, force_abort: &AtomicBool) {
+    if stop_admission.swap(true, Ordering::SeqCst) {
+        force_abort.store(true, Ordering::SeqCst);
+    }
+}
+
 fn main_inner() -> Result<bool> {
     let cli = Cli::parse();
     let catalog_endpoint = cli.catalog_endpoint.clone();
@@ -398,12 +405,14 @@ fn main_inner() -> Result<bool> {
     startup["log_filter"] = serde_json::json!(effective_log_filter());
     eprintln!("arrowcol_maintenance_effective_config {startup}");
     let provider = telemetry()?;
-    let cancel = Arc::new(AtomicBool::new(false));
-    let handler = Arc::clone(&cancel);
-    ctrlc::set_handler(move || handler.store(true, Ordering::SeqCst))?;
+    let stop_admission = Arc::new(AtomicBool::new(false));
+    let force_abort = Arc::new(AtomicBool::new(false));
+    let handler_stop = Arc::clone(&stop_admission);
+    let handler_force = Arc::clone(&force_abort);
+    ctrlc::set_handler(move || request_shutdown(&handler_stop, &handler_force))?;
     let metrics = Metrics::new();
     let listener = if settings.interval.is_some() && !no_listener {
-        Some(serve_metrics(listen, metrics.clone(), Arc::clone(&cancel))?)
+        Some(serve_metrics(listen, metrics.clone(), Arc::clone(&stop_admission))?)
     } else {
         None
     };
@@ -413,11 +422,11 @@ fn main_inner() -> Result<bool> {
             settings.tables.clone(),
             settings.catalog_options.clone(),
         )?;
-        run_with_discovery(&settings, &discovery, &metrics, &cancel)
+        run_with_discovery_shutdown(&settings, &discovery, &metrics, &stop_admission, &force_abort)
     } else {
-        run(&settings, &metrics, &cancel)
+        run_with_shutdown(&settings, &metrics, &stop_admission, &force_abort)
     };
-    cancel.store(true, Ordering::SeqCst);
+    stop_admission.store(true, Ordering::SeqCst);
     if let Some(listener) = listener {
         listener.join().map_err(|_| anyhow!("metrics listener panicked"))?;
     }
@@ -435,6 +444,17 @@ fn main_inner() -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn repeated_shutdown_signal_escalates_to_force_abort() {
+        let stop_admission = AtomicBool::new(false);
+        let force_abort = AtomicBool::new(false);
+        request_shutdown(&stop_admission, &force_abort);
+        assert!(stop_admission.load(Ordering::SeqCst));
+        assert!(!force_abort.load(Ordering::SeqCst));
+        request_shutdown(&stop_admission, &force_abort);
+        assert!(stop_admission.load(Ordering::SeqCst));
+        assert!(force_abort.load(Ordering::SeqCst));
+    }
 
     #[test]
     fn cli_limits_are_validated_and_propagated() -> Result<()> {

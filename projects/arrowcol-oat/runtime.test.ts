@@ -11,6 +11,7 @@ const config = (): RuntimeConfig => ({
   workloadIdentityClientId: '00000000-0000-0000-0000-000000000001',
   subscriptionId: '00000000-0000-0000-0000-000000000002', stamp: '89152',
   deltaRoot: 'abfss://onelake@arrowcollector89152.dfs.core.windows.net/dataflow',
+  effective_stop_budgets: { maintenance_grace_seconds: 4_800, maintenance_stop_timeout_ms: 5_100_000 },
   images: Object.fromEntries(['sqlserver', 'catalog', 'router', 'dataflow'].map((role) =>
     [role, `arrowcollector89152.azurecr.io/${role}@sha256:${'a'.repeat(64)}`])) as RuntimeConfig['images'],
 });
@@ -26,6 +27,30 @@ test('rejects mutable images, QAP namespace, wrong stamp and unknown fields', ()
   assert.throws(() => validateRuntime({ ...config(), quiver: 'true' }), /explicit boolean/);
 });
 
+test('AKS resource overrides are strict and project through to role manifests', async () => {
+  const c = config();
+  c.collectorWorkers = 7;
+  c.resources = { collector: { requests: { cpu: '3', memory: '8Gi' }, limits: { cpu: '4', memory: '10Gi' } },
+    client: { requests: { cpu: '500m', memory: '512Mi' }, limits: { cpu: '2', memory: '3Gi' } } };
+  c.maintenance = { tables: ['telemetry.sqlserver.sqlserver_cpu_utilization'], operations: ['optimize'], apply: false,
+    granularity: 'day' };
+  c.effective_stop_budgets = { maintenance_grace_seconds: 1200, maintenance_stop_timeout_ms: 1_500_000 };
+  c.images.maintenance = 'arrowcollector89152.azurecr.io/delta-maintenance@sha256:' + 'b'.repeat(64);
+  const objects = await renderRuntime(c, 'workload');
+  const get = (name: string) => objects.find(o => o.kind === 'Deployment' && o.metadata.name === name)!;
+  const collector = get('arrowcol').spec.template.spec.containers[0];
+  assert.deepEqual(collector.resources, { requests: { cpu: '3', memory: '8Gi' }, limits: { cpu: '4', memory: '10Gi' } });
+  assert.deepEqual(collector.args.slice(-2), ['--num-cores', '7']);
+  assert.equal(collector.env.find((e: any) => e.name === 'ARROWCOL_PARTITION_GRANULARITY').value, 'day');
+  assert.equal(parse(objects.find(o => o.kind === 'ConfigMap')!.data['dataflow.yaml']).policies.resources.core_allocation.count, 7);
+  assert.equal(get('arrowcol-catalog').spec.template.spec.containers[0].resources.requests.memory, '1Gi');
+  assert.equal(get('arrowcol-router').spec.template.spec.containers[0].resources.requests.cpu, '500m');
+  assert.equal(get('delta-maintenance').spec.template.spec.terminationGracePeriodSeconds, 1200);
+  assert.throws(() => validateRuntime({ ...config(), resources: { unknown: {} } }));
+  assert.throws(() => validateRuntime({ ...config(), resources: { collector: { requests: { cpu: '3', memory: '1Gi' }, limits: { cpu: '2', memory: '6Gi' } } } }), /must not exceed limits/);
+  assert.throws(() => validateRuntime({ ...config(), resources: { collector: { requests: { cpu: '1.0001', memory: '1Gi' }, limits: { cpu: '2', memory: '6Gi' } } } }), /Kubernetes CPU quantity/);
+});
+
 test('only explicit Quiver topology installs the durable processor and isolated pod storage', async () => {
   for (const quiver of [false, true]) {
     const objects = await renderRuntime({ ...config(), quiver }, 'workload');
@@ -33,7 +58,7 @@ test('only explicit Quiver topology installs the durable processor and isolated 
     const pipeline = engine.groups.arrowcol.pipelines.ingest;
     assert.equal(pipeline.nodes.flight.config.native_quiver, quiver);
     assert.equal(Boolean(pipeline.nodes.durable), quiver);
-    assert.equal(engine.policies.resources, undefined);
+    assert.equal(engine.policies.resources.core_allocation.count, 1);
     assert.deepEqual(pipeline.connections.map((connection: { from: string; to: string }) => `${connection.from}:${connection.to}`),
       quiver ? ['flight:durable', 'durable:delta'] : ['flight:delta']);
     const pod = objects.find(o => o.kind === 'Deployment' && o.metadata.name === 'arrowcol')!.spec.template.spec;
@@ -53,6 +78,7 @@ test('maintenance requires a pinned sixth image and explicit allowlist/operation
   const objects = await renderRuntime(c, 'workload');
   const worker = objects.find(o => o.kind === 'Deployment' && o.metadata.name === 'delta-maintenance')!;
   assert.equal(worker.spec.replicas, 0);
+  assert.equal(worker.spec.template.spec.terminationGracePeriodSeconds, 4_800);
   const process = worker.spec.template.spec.containers[0];
   assert.equal(process.image, c.images.maintenance);
   assert.ok(process.args.includes(c.maintenance.tables[0]));
@@ -95,7 +121,7 @@ test('isolated integrated topology pins images, WI, identity, probes and pooled 
     volume.name === 'auth' && volume.secret.secretName === 'arrowcol-router-auth'));
   const configs = get('ConfigMap', 'arrowcol-config').data;
   const engine = parse(configs['dataflow.yaml']);
-  assert.equal(engine.policies.resources, undefined);
+  assert.equal(engine.policies.resources.core_allocation.count, 1);
   assert.equal(engine.groups.arrowcol.pipelines.ingest.nodes.flight.type, 'receiver:arrow_flight');
   assert.equal(engine.groups.arrowcol.pipelines.ingest.nodes.delta.type, 'exporter:arrow_deltalake');
   const router = parse(configs['router.yaml']);
