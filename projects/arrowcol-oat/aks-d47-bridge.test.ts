@@ -24,7 +24,7 @@ function sha(value: string): string {
 }
 
 function signedRequest(authority: StorageBridgeAuthority, deadline: number, method = 'GET', body = '',
-  options: { requestId?: number; clientRequestId?: string; date?: string; extraHeaders?: [string, string][] } = {}): StorageBridgeRequest {
+  options: { requestId?: number; clientRequestId?: string; date?: string; extraHeaders?: [string, string][]; url?: string } = {}): StorageBridgeRequest {
   const date = options.date ?? new Date().toUTCString();
   const headers: [string, string][] = [
     ['x-ms-client-request-id', options.clientRequestId ?? 'c0ffee00-0000-4000-8000-000000000006'],
@@ -41,8 +41,8 @@ function signedRequest(authority: StorageBridgeAuthority, deadline: number, meth
     remaining_timeout_ms: 10_000,
     target: 'object_store' as const,
     method,
-    url: `https://${authority.storage_account}.blob.core.windows.net/${new URL(authority.table_root_url).username}` +
-      `${new URL(authority.table_root_url).pathname}_delta_log/00000000000000000000.json`,
+    url: options.url ?? (`https://${authority.storage_account}.blob.core.windows.net/${new URL(authority.table_root_url).username}` +
+      `${new URL(authority.table_root_url).pathname}_delta_log/00000000000000000000.json`),
     headers,
     body,
     body_sha256: sha(body),
@@ -121,6 +121,40 @@ function mutableCustodyStore(authority: StorageBridgeAuthority, now: number) {
     },
   };
 }
+
+test('StorageBridge accepts the approved Delta log list cursors', async t => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'oat-d47-list-cursors-'));
+  chmodSync(directory, 0o700);
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const authority: StorageBridgeAuthority = {
+    campaign_id: 'c0ffee00-0000-4000-8000-000000000001',
+    cell_run_id: 'c0ffee00-0000-4000-8000-000000000002',
+    owner_id: 'c0ffee00-0000-4000-8000-000000000003',
+    fencing_token: 1,
+    storage_account: 'arrowcollector68590',
+    table_root_url: 'abfss://checkpoints@arrowcollector68590.dfs.core.windows.net/campaigns/c0ffee00-0000-4000-8000-000000000001/runs/c0ffee00-0000-4000-8000-000000000002/dataflow/telemetry/sqlserver/sqlserver_availability_replica_states/',
+    control_container_url: 'https://arrowcollector68590.blob.core.windows.net/checkpoints',
+    sandbox_id: 'offline-stamp',
+    reset_generation: 'c0ffee00-0000-4000-8000-000000000004',
+  };
+  const now = Date.now(), deadline = now + 60_000;
+  const prefix = new URL(authority.table_root_url).pathname.slice(1) + '_delta_log/';
+  const cursors = [prefix.slice(0, -1), prefix + '00000000000000000000'];
+  for (const [index, startFrom] of cursors.entries()) {
+    const query = new URLSearchParams([['restype', 'container'], ['comp', 'list'], ['prefix', prefix], ['startFrom', startFrom]]);
+    const request = signedRequest(authority, deadline, 'GET', '', { requestId: 1,
+      url: 'https://arrowcollector68590.blob.core.windows.net/checkpoints?' + query.toString() });
+    const custody = mutableCustodyStore(authority, now), ledgerPath = path.join(directory, 'storage-' + index + '.jsonl');
+    const azure = { c: { account: authority.storage_account }, async token() { return 'offline-test-token'; } } as unknown as Azure;
+    const dispatcher = new StorageBridgeDispatcher({ authority, originalDeadlineUnixMs: deadline, envelope: envelopeFor(authority, request),
+      azure, store: custody.store, phase: 'owned-run-table-initialization', planIdentity: { run_id: authority.cell_run_id },
+      ledgerPath, fetcher: async () => new Response('<EnumerationResults><Blobs></Blobs><NextMarker></NextMarker></EnumerationResults>',
+        { status: 200, headers: { 'content-type': 'application/xml' } }) });
+    const boundary = new EffectBoundary(envelopeFor(authority, request), path.join(directory, 'effects-' + index + '.jsonl'));
+    const result = await withEffectBoundary(boundary, () => dispatcher.exchange(request));
+    assert.equal(result.outcome, 'response');
+  }
+});
 
 test('StorageBridge normalizes only approved volatile headers and retains raw request evidence', async t => {
   const directory = mkdtempSync(path.join(os.tmpdir(), 'oat-d47-header-normalization-'));
