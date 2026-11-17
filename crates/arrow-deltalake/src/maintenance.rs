@@ -2515,6 +2515,7 @@ fn optimize_no_benefit_proof(
     state: &ActiveState,
     bin: &OptimizeBin,
     output_policy_fingerprint: &str,
+    batch_rows: usize,
 ) -> Result<OptimizeNoBenefitProof> {
     let partition_files = state
         .files
@@ -2524,6 +2525,7 @@ fn optimize_no_benefit_proof(
         .collect::<Vec<_>>();
     Ok(OptimizeNoBenefitProof {
         output_policy_fingerprint: output_policy_fingerprint.to_owned(),
+        batch_rows,
         partition_fingerprint: optimize_files_fingerprint(
             &state.fingerprint.table_id,
             &bin.partition_values,
@@ -2974,7 +2976,13 @@ impl DeltaTable {
             Ok(())
         };
         still_active(&state, &plan.bins.iter().collect::<Vec<_>>())?;
-        let no_benefit_record = self.read_record::<OptimizeNoBenefitRecord>(OPTIMIZE_NO_BENEFIT_RECORD)?;
+        let schema: SchemaRef = Arc::new(state.snapshot.schema().as_ref().try_into_arrow()?);
+        let reuse_no_benefit_proofs = resolve_optimize_layout(config, &schema)?.is_some();
+        let no_benefit_record: Option<OptimizeNoBenefitRecord> = if reuse_no_benefit_proofs {
+            self.read_record(OPTIMIZE_NO_BENEFIT_RECORD)?
+        } else {
+            None
+        };
         if let Some(record) = &no_benefit_record {
             record.validate()?;
         }
@@ -2986,11 +2994,14 @@ impl DeltaTable {
         let mut kept: Vec<&OptimizeBin> = Vec::new();
         let mut actions = 0_usize;
         for bin in &plan.bins {
-            let proof = optimize_no_benefit_proof(&state, bin, output_policy_fingerprint)?;
-            if no_benefit_record
-                .as_ref()
-                .is_some_and(|record| record.table_id == state.fingerprint.table_id && record.proofs.contains(&proof))
-            {
+            let proof = reuse_no_benefit_proofs
+                .then(|| optimize_no_benefit_proof(&state, bin, output_policy_fingerprint, config.batch_rows))
+                .transpose()?;
+            if proof.as_ref().is_some_and(|proof| {
+                no_benefit_record.as_ref().is_some_and(|record| {
+                    record.table_id == state.fingerprint.table_id && record.proofs.contains(proof)
+                })
+            }) {
                 report.nonbeneficial_bins += 1;
                 continue;
             }
@@ -3032,8 +3043,10 @@ impl DeltaTable {
                     );
                     return Err(self.discard_after(&outputs, error, &mut report));
                 }
-                if !beneficial {
-                    self.record_optimize_no_benefit_proof(&state.fingerprint.table_id, proof)?;
+                if !beneficial && let Some(proof) = proof {
+                    if let Err(error) = self.record_optimize_no_benefit_proof(&state.fingerprint.table_id, proof) {
+                        return Err(self.discard_after(&outputs, error, &mut report));
+                    }
                 }
                 continue;
             }
@@ -5165,6 +5178,8 @@ const MAX_OPTIMIZE_NO_BENEFIT_PROOFS: usize = 128;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct OptimizeNoBenefitProof {
+    #[serde(default)]
+    batch_rows: usize,
     output_policy_fingerprint: String,
     partition_fingerprint: String,
     bin_fingerprint: String,

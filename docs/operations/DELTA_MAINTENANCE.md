@@ -152,6 +152,8 @@ A sorted output that reaches the applied `LayoutPolicy` row or input-memory budg
 
 A partial sorted bin that was rewritten without reducing file count records a bounded proof in `_arrowcol_maintenance/optimize-no-benefit.json`. Each proof binds the table, exact bin and full active-file set in its partition to the effective output-policy fingerprint; the record retains at most 128 proofs. Matching bins remain visible in eligible debt but are not rewritten again. Any active-file change in the partition or output-policy change invalidates the proof, and proof read/write errors fail maintenance rather than being treated as absence.
 
+Proof reuse is limited to the resolved sorted-layout path and also binds `batch_rows`, since input batch sizing affects packing. Unsorted OPTIMIZE does not read or write these proofs. Greedy packing remains path-order-sensitive and is not guaranteed to find a globally minimal file count; a proof only prevents repeating a no-benefit rewrite for the same active inputs and packing context. If proof persistence fails, unpublished outputs from earlier beneficial bins are discarded, or reported as retained if cleanup fails.
+
 ## Commands and expected results
 
 Run these inside the repository devcontainer on a leased devbox:

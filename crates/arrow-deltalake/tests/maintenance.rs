@@ -2164,10 +2164,18 @@ fn optimize_d42_residual_proof_write_failure_discards_prior_bin_outputs() -> Res
         .apply_optimize(&plan, &config, &control())
         .err()
         .context("no-benefit proof persistence failure must surface")?;
-    assert!(format!("{error:#}").contains(".lock"), "{error:#}");
-    assert_eq!(maintenance.version()?, version, "the failed proof write must not commit");
+    assert!(format!("{error:#}").contains("Is a directory"), "{error:#}");
+    assert_eq!(
+        maintenance.version()?,
+        version,
+        "the failed proof write must not commit"
+    );
     assert_eq!(active_files(root.path())?.len(), 4);
-    assert_eq!(parquet_files(root.path(), &newest)?, 2, "earlier bin output must be discarded");
+    assert_eq!(
+        parquet_files(root.path(), &newest)?,
+        2,
+        "earlier bin output must be discarded"
+    );
     assert_eq!(parquet_files(root.path(), &minute(0))?, 2);
     Ok(())
 }
