@@ -433,14 +433,15 @@ async fn run_transport(case: Case, unix_socket: bool) -> Result<Parent> {
         None
     };
     let mut child = command.spawn()?;
-    let (input, output): (Box<dyn AsyncWrite + Unpin + Send>, Box<dyn AsyncRead + Unpin + Send>) = match sockets {
+    let (input_writer, output): (Box<dyn AsyncWrite + Unpin + Send>, Box<dyn AsyncRead + Unpin + Send>) = match sockets
+    {
         Some((input, output)) => (Box::new(input), Box::new(output)),
         None => (
             Box::new(child.stdin.take().context("stdin")?),
             Box::new(child.stdout.take().context("stdout")?),
         ),
     };
-    let mut input_pipe = Some(input);
+    let mut input_pipe = Some(input_writer);
     let mut output = BufReader::new(output);
     let stderr = child.stderr.take().context("stderr")?;
     let errors = tokio::spawn(async move {
