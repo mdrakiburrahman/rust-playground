@@ -972,7 +972,7 @@ mod storage_bridge {
         }
 
         #[tokio::test]
-        async fn azure_kernel_log_directory_listing_accepts_sdk_start_from() -> anyhow::Result<()> {
+        async fn azure_kernel_log_directory_listing_uses_sdk_prefix() -> anyhow::Result<()> {
             let root = format!("abfss://data@offlineaccount.dfs.core.windows.net/{KERNEL_TABLE_PATH}");
             let mut authority = authority();
             authority.table_root_url = root.clone();
@@ -1006,17 +1006,41 @@ mod storage_bridge {
             assert_eq!(query.get("restype").map(String::as_str), Some("container"));
             assert_eq!(query.get("comp").map(String::as_str), Some("list"));
             assert_eq!(query.get("prefix").map(String::as_str), Some(KERNEL_LOG_PREFIX));
-            assert_eq!(
-                query.get("startFrom").map(String::as_str),
-                Some(KERNEL_LOG_PREFIX.trim_end_matches('/'))
-            );
             let expected_query = format!(
-                "restype=container&comp=list&prefix={}&startFrom={}",
-                KERNEL_LOG_PREFIX.replace('/', "%2F"),
-                KERNEL_LOG_PREFIX.trim_end_matches('/').replace('/', "%2F")
+                "restype=container&comp=list&prefix={}",
+                KERNEL_LOG_PREFIX.replace('/', "%2F")
             );
             assert_eq!(request_url.query(), Some(expected_query.as_str()));
             session.close_after_drain_async().await?;
+            server.abort();
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn actual_kernel_start_from_request_is_forwarded() -> anyhow::Result<()> {
+            let root = format!("abfss://tables@offlineproof.dfs.core.windows.net/{KERNEL_TABLE_PATH}");
+            let mut authority = authority();
+            authority.storage_account = "offlineproof".into();
+            authority.control_container_url = "https://offlineproof.blob.core.windows.net/checkpoints".into();
+            authority.table_root_url = root;
+            let (child, parent) = tokio::io::duplex(MAX_FRAME);
+            let (read, write) = tokio::io::split(child);
+            let bridge = StorageBridge::new(authority, deadline(10_000)?, read, write)?;
+            let fixture = Arc::new(Mutex::new(Fixture::ready()));
+            let server = tokio::spawn(serve(parent, Arc::clone(&fixture), None));
+            let url = format!(
+                "https://offlineproof.blob.core.windows.net/tables?restype=container&comp=list&prefix={}&startFrom={}",
+                KERNEL_LOG_PREFIX.replace('/', "%2F"),
+                KERNEL_LOG_PREFIX.trim_end_matches('/').replace('/', "%2F")
+            );
+
+            assert!(matches!(
+                bridge.exchange(object_list(&url)?, "object_store").await,
+                Outcome::Response(_)
+            ));
+            let requests = fixture.lock().await.requests.clone();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0]["url"], url);
             server.abort();
             Ok(())
         }
