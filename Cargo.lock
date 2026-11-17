@@ -974,6 +974,7 @@ dependencies = [
  "collector-chain",
  "fs2",
  "futures-util",
+ "nix 0.31.3",
  "object_store",
  "otel-arrow-dfe-config",
  "otel-arrow-dfe-quiver",
