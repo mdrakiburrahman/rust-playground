@@ -6,9 +6,12 @@ import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 import { EffectBoundary, withEffectBoundary, type EffectEnvelope } from '../../infra/azure/effect-boundary.js';
-import { initializeOwnedRunTable, PLANNED_CONTROL_OPERATION_IDS, PLANNED_STORAGE_OPERATION_IDS, StorageBridgeDispatcher, type StorageBridgeAuthority, type StorageBridgeRequest } from './aks-d47-bridge.js';
+import { initializeOwnedRunTable, PLANNED_CONTROL_OPERATION_IDS, PLANNED_STORAGE_OPERATION_IDS,
+  runFixtureSetupChild, StorageBridgeDispatcher, type FixtureDispatcherOptions, type FixtureSetupInput,
+  type StorageBridgeAuthority, type StorageBridgeRequest } from './aks-d47-bridge.js';
 import type { Azure } from '../../infra/azure/bootstrap.js';
-import { newCampaignState, type CampaignStore, type RunInventory, type StoredCampaign } from './aks-campaign.js';
+import { newCampaignState, publishRunInventory, runInventoryPublishReceipt, type CampaignStore, type RunInventory,
+  type StoredCampaign } from './aks-campaign.js';
 
 function canonical(value: unknown): string {
   if (Array.isArray(value)) return '[' + value.map(canonical).join(',') + ']';
@@ -686,4 +689,157 @@ test('real loadgen initializer composes with the Node BR3 planned-identity paren
     }, now: Date.now };
   const boundary = new EffectBoundary(envelope, path.join(directory, 'effects.jsonl'));
   await withEffectBoundary(boundary, () => initializeOwnedRunTable(options));
+});
+
+test('real Rust zero-data fixture composes with response-derived Node phase allocations', {
+  skip: !process.env.OAT_D47_FIXTURE_BIN,
+}, async t => {
+  const executable = process.env.OAT_D47_FIXTURE_BIN!;
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'oat-d47-fixture-composition-'));
+  chmodSync(directory, 0o700);
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+
+  const now = Date.now(), deadline = now + 300_000;
+  const campaign = 'c0ffee00-0000-4000-8000-000000000101';
+  const owner = 'c0ffee00-0000-4000-8000-000000000102';
+  const orchestration = 'c0ffee00-0000-4000-8000-000000000103';
+  const run = 'c0ffee00-0000-4000-8000-000000000104';
+  const namespace = 'fixture-' + run.replaceAll('-', '');
+  const serviceAccount = 'fixture-sa';
+  const server = 'https://offline.invalid/';
+  const ficPlan = {
+    version: 1 as const, runId: run, namespace, serviceAccount,
+    identityId: '/subscriptions/offline/identities/fixture',
+    resourceId: '/subscriptions/offline/identities/fixture/federatedIdentityCredentials/arrowcol-run-' + run,
+    clientId: 'c0ffee00-0000-4000-8000-000000000105',
+    tenantId: 'c0ffee00-0000-4000-8000-000000000106',
+    aksId: '/subscriptions/offline/clusters/fixture', server,
+    credentialName: 'arrowcol-run-' + run, issuer: 'https://offline.invalid/issuer',
+    subject: `system:serviceaccount:${namespace}:${serviceAccount}`,
+    audience: 'api://AzureADTokenExchange',
+  };
+  const notStarted = () => ({ state: 'not_started' as const, deadline_unix_ms: null, reason_code: null });
+  const inventory: RunInventory = {
+    schema_version: 1, campaign_id: campaign, owner_id: owner, fencing_token: 1,
+    orchestration_run_id: orchestration, cell_run_id: run, load_admission: 'not_authorized',
+    namespace: { name: namespace, uid: null, owner_token: owner }, resources: [],
+    fic: { resource_id: null, name: null, state: 'planned', absence: null, plan: ficPlan },
+    qap: null, planned_cell_duration_ms: 0,
+    effective_stop_budgets: { maintenance_grace_seconds: 4_800, maintenance_stop_timeout_ms: 5_100_000 },
+    cleanup: { stop_admission: notStarted(), bounded_drain: notStarted(), evidence_capture: notStarted(),
+      stop_maintenance: notStarted(), terminal_capture: notStarted(), handoff: notStarted() },
+  };
+  const authority = { campaign_id: campaign, cell_run_id: run, owner_id: owner, fencing_token: 1,
+    namespace, server, context: 'reviewed-offline-context' };
+  const image = 'registry.k8s.io/pause@sha256:' + 'a'.repeat(64);
+  const manifests = [
+    { apiVersion: 'v1', kind: 'Namespace', metadata: { name: namespace } },
+    { apiVersion: 'v1', kind: 'ServiceAccount', metadata: { name: serviceAccount, namespace }, automountServiceAccountToken: false },
+    ...(['client', 'collector', 'maintenance'] as const).map(role => {
+      const name = role === 'maintenance' ? 'delta-maintenance' : 'arrowcol-' + role;
+      const app = role === 'client' ? 'arrowcol-oat-client' : name;
+      return { apiVersion: 'apps/v1', kind: 'Deployment', metadata: { name, namespace, labels: { app } },
+        spec: { replicas: 1, selector: { matchLabels: { app } }, template: {
+          metadata: { labels: { app } }, spec: { serviceAccountName: serviceAccount, automountServiceAccountToken: false,
+            containers: [{ name: role, image, resources: { requests: { cpu: '10m', memory: '16Mi' },
+              limits: { cpu: '100m', memory: '64Mi' } } }] },
+        } } };
+    }),
+  ];
+  const input: FixtureSetupInput = { schema_version: 1, authority, original_deadline_unix_ms: deadline, inventory,
+    service_account: serviceAccount, manifests, runtime_directory: directory,
+    stamp_config_path: path.join(directory, 'stamp.yaml'), bootstrap_env_file: path.join(directory, 'campaign.env') };
+  const inputPath = path.join(directory, 'fixture-input.json'), ledgerPath = path.join(directory, 'fixture-ledger.jsonl');
+  writeFileSync(inputPath, JSON.stringify(input), { mode: 0o600 });
+  chmodSync(inputPath, 0o600);
+
+  const resource = 'https://offlinestorage.blob.core.windows.net/checkpoints';
+  const activePath = '/checkpoints/active.json';
+  const effects: EffectEnvelope['effects'] = [
+    { id: 'active-read', transport: 'campaign-blob', method: 'GET', resource, path: activePath, max_calls: 1 },
+    { id: 'active-write', transport: 'campaign-blob', method: 'PUT', resource, path: activePath, max_calls: 1 },
+    { id: 'baseline-read', transport: 'campaign-blob', method: 'GET', resource,
+      path: `/checkpoints/campaigns/${campaign}/baseline.json`, max_calls: 1 },
+  ];
+  const envelope: EffectEnvelope = { schema_version: 1, campaign_id: campaign, run_id: run,
+    subscription_id: 'c0ffee00-0000-4000-8000-000000000107', resource_group: 'offline',
+    storage_account: 'offlinestorage', state_container: 'checkpoints', effects };
+
+  let stored: StoredCampaign = { state: newCampaignState(campaign, owner, now), etag: '"0"' };
+  let revision = 0;
+  const store: CampaignStore = {
+    async read() { return structuredClone(stored); },
+    async write(state, expectedEtag) {
+      if (expectedEtag !== stored.etag) throw new Error('offline campaign CAS conflict');
+      stored = { state: structuredClone(state), etag: `"${++revision}"` };
+      return stored.etag;
+    },
+  };
+  const azure = { c: { account: 'offlinestorage' } } as unknown as Azure;
+  const env = { CAMPAIGN_ID: campaign, CAMPAIGN_OWNER_ID: owner, CAMPAIGN_FENCING_TOKEN: '1' };
+  const namespaceIdentity: Record<string, unknown> = {
+    apiVersion: 'v1', kind: 'Namespace', metadata: { name: namespace,
+      labels: { 'arrowcol-oat/run-id': run, 'arrowcol-oat/owner-token': owner },
+      annotations: { 'arrowcol-oat/run-id': run, 'arrowcol-oat/owner-token': owner },
+      uid: 'c0ffee00-0000-4000-8000-000000000108', resourceVersion: '17' },
+  };
+  let createdResources: Record<string, unknown>[] = [];
+  let kubeCommands = 0, publications = 0;
+  const campaignMain: NonNullable<FixtureDispatcherOptions['campaignMain']> = async (_args, dependencies) => {
+    publications++;
+    const updated = await publishRunInventory(dependencies?.store ?? store, dependencies?.runInventoryInput, now,
+      dependencies?.runInventoryWriteOptions);
+    console.log(JSON.stringify({ ok: true, receipt: runInventoryPublishReceipt(updated) }));
+  };
+  const runCommand = async (command: string[], stdin: Buffer | undefined) => {
+    kubeCommands++;
+    const args = command.slice(1);
+    const action = args.find(value => value === 'get' || value === 'create');
+    const body = stdin ? JSON.parse(stdin.toString('utf8')) as Record<string, unknown> : undefined;
+    if (action === 'get' && args.includes('namespace')) {
+      return { returncode: 0, stdout: kubeCommands === 1 ? '' : JSON.stringify(namespaceIdentity), stderr: '' };
+    }
+    if (action === 'create' && args.includes('-f') && body?.kind === 'Namespace') {
+      return { returncode: 0, stdout: JSON.stringify(namespaceIdentity), stderr: '' };
+    }
+    if (action === 'get' && args.includes('--ignore-not-found')) {
+      return { returncode: 0, stdout: JSON.stringify({ items: [] }), stderr: '' };
+    }
+    if (action === 'create' && body?.kind === 'List' && Array.isArray(body.items)) {
+      createdResources = body.items.map((item, index) => {
+        const resource = structuredClone(item) as Record<string, unknown>;
+        const metadata = resource.metadata as Record<string, unknown>;
+        metadata.uid = `c0ffee00-0000-4000-8000-${String(109 + index).padStart(12, '0')}`;
+        metadata.resourceVersion = '17';
+        if (resource.kind === 'Deployment') metadata.generation = 1;
+        return resource;
+      });
+      return { returncode: 0, stdout: createdResources.map(value => JSON.stringify(value)).join('\n') + '\n', stderr: '' };
+    }
+    if (action === 'get') return { returncode: 0, stdout: JSON.stringify({ items: createdResources }), stderr: '' };
+    throw new Error('Unexpected offline fixture command: ' + JSON.stringify(command));
+  };
+
+  const receipt = await runFixtureSetupChild(executable, inputPath, { input, rootDirectory: directory, ledgerPath,
+    envelope, store, azure, env, campaignMain, runCommand, now: () => now });
+  assert.equal(receipt.load_admitted, false);
+  assert.equal(receipt.inventory.load_admission, 'not_authorized');
+  assert.equal(receipt.inventory.planned_cell_duration_ms, 0);
+  assert.equal(receipt.inventory.resources.length, 4);
+  assert.ok(receipt.inventory.resources.every(item => item.state === 'observed' && item.uid));
+  assert.equal(receipt.command_responses.length, 10);
+  assert.equal(publications, 4);
+  assert.equal(kubeCommands, 6);
+  assert.equal((await store.read())?.state.runInventory?.namespace.uid,
+    (namespaceIdentity.metadata as Record<string, unknown>).uid);
+
+  for (let requestId = 1; requestId <= 10; requestId++) {
+    const planPath = `${ledgerPath}.phase-${requestId}-command.plan.json`;
+    const plan = JSON.parse(readFileSync(planPath, 'utf8')) as Record<string, unknown>;
+    assert.equal(plan.request_id, requestId);
+    assert.equal(plan.phase, 'command');
+    assert.match(String(plan.allocation_sha256), /^[0-9a-f]{64}$/);
+    assert.match(String(plan.predecessor_journal_sha256), /^[0-9a-f]{64}$/);
+    assert.match(String(plan.predecessor_response_sha256), /^[0-9a-f]{64}$/);
+  }
 });
