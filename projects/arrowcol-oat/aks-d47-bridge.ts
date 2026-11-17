@@ -653,11 +653,11 @@ export class FixtureCommandDispatcher {
     for (const resource of receipt.inventory.resources) {
       const actual = (readbackValues[0].items as unknown[]).find(item => object(item) && object(item.metadata) &&
         item.kind === resource.kind && item.metadata.name === resource.name && item.metadata.namespace === resource.namespace);
-      if (!object(actual) || !object(actual.metadata) || actual.metadata.uid !== resource.uid ||
-          typeof actual.metadata.resourceVersion !== 'string' || !actual.metadata.resourceVersion ||
-          !['labels', 'annotations'].every(field => object(actual.metadata[field]) &&
-            actual.metadata[field]['arrowcol-oat/run-id'] === this.options.input.authority.cell_run_id &&
-            actual.metadata[field]['arrowcol-oat/owner-token'] === this.options.input.authority.owner_id))
+      const metadata = object(actual) && object(actual.metadata) ? actual.metadata : undefined;
+      if (!metadata || metadata.uid !== resource.uid || typeof metadata.resourceVersion !== 'string' || !metadata.resourceVersion ||
+          !['labels', 'annotations'].every(field => object(metadata[field]) &&
+            metadata[field]['arrowcol-oat/run-id'] === this.options.input.authority.cell_run_id &&
+            metadata[field]['arrowcol-oat/owner-token'] === this.options.input.authority.owner_id))
         throw new Error('Fixture resource readback differs from the exact published inventory identity.');
     }
     const namespaceReadback = [...this.seen.values()].find(request => request.executable.endsWith('kubectl') &&
@@ -668,12 +668,12 @@ export class FixtureCommandDispatcher {
       throw new Error('Fixture namespace readback did not return success.');
     const namespaceValues = parseJsonValues(namespaceReadbackResponse.stdout);
     const observedNamespace = namespaceValues.length === 1 ? namespaceValues[0] : undefined;
-    if (!object(observedNamespace) || !object(observedNamespace.metadata) ||
-        observedNamespace.metadata.uid !== receipt.inventory.namespace.uid ||
-        typeof observedNamespace.metadata.resourceVersion !== 'string' || !observedNamespace.metadata.resourceVersion ||
-        !['labels', 'annotations'].every(field => object(observedNamespace.metadata[field]) &&
-          observedNamespace.metadata[field]['arrowcol-oat/run-id'] === this.options.input.authority.cell_run_id &&
-          observedNamespace.metadata[field]['arrowcol-oat/owner-token'] === this.options.input.authority.owner_id))
+    const namespaceMetadata = object(observedNamespace) && object(observedNamespace.metadata) ? observedNamespace.metadata : undefined;
+    if (!namespaceMetadata || namespaceMetadata.uid !== receipt.inventory.namespace.uid ||
+        typeof namespaceMetadata.resourceVersion !== 'string' || !namespaceMetadata.resourceVersion ||
+        !['labels', 'annotations'].every(field => object(namespaceMetadata[field]) &&
+          namespaceMetadata[field]['arrowcol-oat/run-id'] === this.options.input.authority.cell_run_id &&
+          namespaceMetadata[field]['arrowcol-oat/owner-token'] === this.options.input.authority.owner_id))
       throw new Error('Fixture namespace readback differs from its original create identity.');
     assertBridgeLive(this.envelope, this.options.input.original_deadline_unix_ms, this.now);
     const stored = await this.campaignStore.read();
