@@ -456,6 +456,11 @@ mod storage_bridge {
             if let Err(code) = self.validate_request(&request, target) {
                 return Outcome::NotSent(code);
             }
+            let lease_release = target == "control"
+                && request
+                    .headers()
+                    .get("x-ms-lease-action")
+                    .is_some_and(|value| value == "release");
             let mut bytes = Vec::new();
             while let Some(frame) = request.body_mut().frame().await {
                 let Ok(frame) = frame else {
@@ -604,7 +609,7 @@ mod storage_bridge {
                     if !state.reader.buffer().is_empty() {
                         return Outcome::Unknown(Code::Protocol);
                     }
-                    state.poisoned = false;
+                    state.poisoned = lease_release && !status.is_success();
                     Outcome::Response(response)
                 }
                 Reply::DefinitelyNotSent {
@@ -626,7 +631,7 @@ mod storage_bridge {
                     {
                         return Outcome::Unknown(Code::Protocol);
                     }
-                    state.poisoned = false;
+                    state.poisoned = lease_release;
                     Outcome::NotSent(error_code)
                 }
                 Reply::Unknown {
