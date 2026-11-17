@@ -8,7 +8,7 @@
 | Guard and envelope | Every baseline requests `overload_guard` enabled, cap fraction 0.90, two zero-progress windows, and a 4 GiB local collector memory limit. This common initial request is not measured headroom or proof of host suitability. |
 | Maintenance | Continuous, enabled, and applying in every cell. Idle work must be a no-op; due work stays enabled. |
 | Verdict | Set `dataflow_verdict_policy` to `single_hot_table_campaign` to make QAP lag a separate finding. Missing QAP observations remain UNKNOWN/non-PASS; default legacy semantics are unchanged. |
-| Files | `oat-config-throughput-C1.json` through `C8.json` are bounded manifests, not launch configs. Their eight baselines and 108 candidates (116 configs) are config-only and remain runtime-unqualified; successor Rust validation is pending in `oat-config-throughput-validation.json`. |
+| Files | `oat-config-throughput-C1.json` through `C8.json` are bounded manifests, not launch configs. All 116 configs passed Rust config validation at source `22c1490`; they remain runtime-unqualified. See `oat-config-throughput-validation.json` for evidence. |
 | Pictures | Result pictures may show exploratory observations; no sustainable winner is shown until contiguous 30-second buckets, reconciliation, and validated timestamped pressure/maintenance-debt evidence qualify. Missing or unavailable evidence remains UNKNOWN. |
 
 ## Qualification
