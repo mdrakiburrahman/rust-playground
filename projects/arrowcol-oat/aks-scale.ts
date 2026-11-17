@@ -118,9 +118,9 @@ export interface ScaleStep extends ScaleTarget {
   evidence: string[];
   restore: ScaleTarget;
   baselineCommittedRowsPerSecond: number;
-  baselineQapPendingBacklog: number;
+  baselineQapPendingBacklog: number | null;
 }
-export interface ScaleEvidence {
+interface ScaleEvidenceValues {
   committedRowsPerSecond: number;
   offeredRowsPerSecond: number;
   estimatedCollectorCapacityRowsPerSecond: number;
@@ -133,6 +133,7 @@ export interface ScaleEvidence {
   collectorNodePoolAtMaximum: boolean;
   qapBacklogGrowing: boolean;
   committedRateStable: boolean;
+  /** Native AccelerationPendingDataFilesCount: data files, not bytes, rows, or per-row latency. */
   qapPendingBacklog: number;
   previousQapPendingBacklog: number;
   kustoSaturated: boolean;
@@ -151,14 +152,15 @@ export interface ScaleEvidence {
   unschedulablePods: number;
   pdbBlockedDrains: number;
 }
+export type ScaleEvidence = { [K in keyof ScaleEvidenceValues]: ScaleEvidenceValues[K] | null };
 export interface ScaleMeasurement {
   committedRowsPerSecond: number;
-  qapPendingBacklog: number;
+  qapPendingBacklog: number | null;
 }
 export interface ScaleTrialResult {
   outcome: 'keep' | 'revert' | 'stop';
   committedRowsPerSecond: number;
-  qapPendingBacklog: number;
+  qapPendingBacklog: number | null;
   ineffectiveIncrements: number;
   reason: string;
 }
@@ -171,14 +173,17 @@ function target(dimension: ScaleDimension, before: number | string, after: numbe
 function oneStep(step: ScaleStep): ScaleStep {
   validateCampaignScaleTarget({ dimension: step.dimension, before: step.before, after: step.after });
   validateCampaignScaleTarget(step.restore);
-  if (!nonnegative(step.baselineCommittedRowsPerSecond) || !Number.isSafeInteger(step.baselineQapPendingBacklog) ||
-      step.baselineQapPendingBacklog < 0 ||
+  const kusto = step.dimension === 'kusto-capacity' || step.dimension === 'kusto-sku';
+  if (!nonnegative(step.baselineCommittedRowsPerSecond) ||
+      (step.baselineQapPendingBacklog === null ? kusto :
+        !Number.isSafeInteger(step.baselineQapPendingBacklog) || step.baselineQapPendingBacklog < 0) ||
       step.before === step.after || step.restore.dimension !== step.dimension || step.restore.before !== step.after ||
       step.restore.after !== step.before) throw new Error('Scale step must be a measured, reversible, single-dimension change.');
   return step;
 }
 function makeStep(evidence: ScaleEvidence, dimension: ScaleDimension, before: number | string, after: number | string,
   tags: string[]): ScaleStep {
+  if (evidence.committedRowsPerSecond === null) throw new Error('Official committed-window evidence is UNKNOWN.');
   return oneStep({ ...target(dimension, before, after), restore: target(dimension, after, before), evidence: tags,
     baselineCommittedRowsPerSecond: evidence.committedRowsPerSecond, baselineQapPendingBacklog: evidence.qapPendingBacklog,
   });
@@ -192,40 +197,47 @@ export function recommendScaleStep(evidence: ScaleEvidence): ScaleStep | undefin
   const counts = [evidence.qapPendingBacklog, evidence.previousQapPendingBacklog, evidence.loadgenMax, evidence.loadgenMaximum,
     evidence.collectorNodeMax, evidence.collectorNodeMaxMaximum, evidence.kustoCapacity, evidence.kustoCapacityMaximum,
     evidence.systemPoolCount, evidence.unschedulablePods, evidence.pdbBlockedDrains];
-  if (measurements.some(value => !nonnegative(value)) || counts.some(value => !Number.isSafeInteger(value) || value < 0)) {
+  if (measurements.some(value => value !== null && !nonnegative(value)) ||
+      counts.some(value => value !== null && (!Number.isSafeInteger(value) || value < 0))) {
     throw new Error('Scale evidence has invalid or incomplete numeric measurements.');
   }
-  if (!['Standard_E4ads_v5', 'Standard_E8ads_v5'].includes(evidence.kustoSku) ||
+  if (evidence.kustoSku !== null && !['Standard_E4ads_v5', 'Standard_E8ads_v5'].includes(evidence.kustoSku) ||
       [evidence.generatorCpuSaturated, evidence.generatorNetworkSaturated, evidence.collectorCpuSaturated,
         evidence.collectorThrottled, evidence.collectorMemorySaturated, evidence.collectorPlacementBlocked,
         evidence.collectorNodePoolAtMaximum, evidence.qapBacklogGrowing, evidence.committedRateStable, evidence.kustoSaturated]
-        .some(value => typeof value !== 'boolean')) throw new Error('Scale evidence has invalid signal values.');
+        .some(value => value !== null && typeof value !== 'boolean')) throw new Error('Scale evidence has invalid signal values.');
 
-  if (evidence.unschedulablePods > 0 || evidence.pdbBlockedDrains > 0) return undefined;
-  if (evidence.collectorPlacementBlocked && !evidence.collectorNodePoolAtMaximum &&
+  if (evidence.committedRowsPerSecond === null || evidence.unschedulablePods !== 0 || evidence.pdbBlockedDrains !== 0) return undefined;
+  if (evidence.collectorPlacementBlocked === true && evidence.collectorNodePoolAtMaximum === false &&
+      evidence.collectorNodeMax !== null && evidence.collectorNodeMaxMaximum !== null &&
       evidence.collectorNodeMax < evidence.collectorNodeMaxMaximum) {
     return makeStep(evidence, 'collector-node-max', evidence.collectorNodeMax, evidence.collectorNodeMax + 1,
       ['collector-placement-blocked']);
   }
-  if (evidence.collectorCpuSaturated || evidence.collectorThrottled) {
-    if (evidence.collectorCpuLimitCores >= evidence.collectorCpuLimitMaximum) return undefined;
+  if ((evidence.collectorCpuSaturated === true || evidence.collectorThrottled === true) &&
+      evidence.collectorCpuLimitCores !== null && evidence.collectorCpuLimitMaximum !== null &&
+      evidence.collectorCpuLimitCores < evidence.collectorCpuLimitMaximum) {
     return makeStep(evidence, 'collector-cpu-limit', evidence.collectorCpuLimitCores,
       Math.min(evidence.collectorCpuLimitMaximum, evidence.collectorCpuLimitCores + 1),
       [evidence.collectorThrottled ? 'collector-cpu-throttling' : 'collector-cpu-saturated']);
   }
-  if (evidence.collectorMemorySaturated) {
-    if (evidence.collectorMemoryLimitGiB >= evidence.collectorMemoryLimitMaximumGiB) return undefined;
+  if (evidence.collectorMemorySaturated === true && evidence.collectorMemoryLimitGiB !== null &&
+      evidence.collectorMemoryLimitMaximumGiB !== null && evidence.collectorMemoryLimitGiB < evidence.collectorMemoryLimitMaximumGiB) {
     return makeStep(evidence, 'collector-memory-limit', evidence.collectorMemoryLimitGiB,
       Math.min(evidence.collectorMemoryLimitMaximumGiB, evidence.collectorMemoryLimitGiB + 2), ['collector-memory-saturated']);
   }
-  const collectorNotSaturated = !evidence.collectorCpuSaturated && !evidence.collectorThrottled && !evidence.collectorMemorySaturated;
-  const generatorSaturated = evidence.generatorCpuSaturated || evidence.generatorNetworkSaturated;
-  if (collectorNotSaturated && generatorSaturated && evidence.offeredRowsPerSecond < evidence.estimatedCollectorCapacityRowsPerSecond &&
+  const collectorNotSaturated = evidence.collectorCpuSaturated === false && evidence.collectorThrottled === false && evidence.collectorMemorySaturated === false;
+  const generatorSaturated = evidence.generatorCpuSaturated === true || evidence.generatorNetworkSaturated === true;
+  if (collectorNotSaturated && generatorSaturated && evidence.offeredRowsPerSecond !== null &&
+      evidence.estimatedCollectorCapacityRowsPerSecond !== null && evidence.loadgenMax !== null && evidence.loadgenMaximum !== null &&
+      evidence.offeredRowsPerSecond < evidence.estimatedCollectorCapacityRowsPerSecond &&
       evidence.loadgenMax < evidence.loadgenMaximum) {
     return makeStep(evidence, 'loadgen-max', evidence.loadgenMax, evidence.loadgenMax + 1,
       [evidence.generatorCpuSaturated ? 'generator-cpu-saturated' : 'generator-network-saturated', 'collector-has-headroom']);
   }
-  if (evidence.qapBacklogGrowing && evidence.committedRateStable && evidence.kustoSaturated) {
+  if (evidence.qapBacklogGrowing === true && evidence.committedRateStable === true && evidence.kustoSaturated === true &&
+      evidence.qapPendingBacklog !== null && evidence.previousQapPendingBacklog !== null &&
+      evidence.qapPendingBacklog > evidence.previousQapPendingBacklog && evidence.kustoCapacity !== null && evidence.kustoCapacityMaximum !== null) {
     if (evidence.kustoCapacity < evidence.kustoCapacityMaximum) return makeStep(evidence, 'kusto-capacity', evidence.kustoCapacity,
       evidence.kustoCapacity + 1, ['qap-backlog-growing', 'committed-rate-stable', 'kusto-side-saturated']);
     if (evidence.kustoSku === 'Standard_E4ads_v5') return makeStep(evidence, 'kusto-sku', evidence.kustoSku,
@@ -237,14 +249,16 @@ export function recommendScaleStep(evidence: ScaleEvidence): ScaleStep | undefin
 function improvedByFivePercent(after: number, before: number): boolean { return before > 0 && after <= before * 0.95; }
 export function assessScaleTrial(step: ScaleStep, measurement: ScaleMeasurement, previousIneffectiveIncrements = 0): ScaleTrialResult {
   oneStep(step);
-  if (!measurement || !nonnegative(measurement.committedRowsPerSecond) || !Number.isSafeInteger(measurement.qapPendingBacklog) ||
-      measurement.qapPendingBacklog < 0 ||
+  if (!measurement || !nonnegative(measurement.committedRowsPerSecond) ||
+      (measurement.qapPendingBacklog !== null && (!Number.isSafeInteger(measurement.qapPendingBacklog) || measurement.qapPendingBacklog < 0)) ||
       !Number.isSafeInteger(previousIneffectiveIncrements) || previousIneffectiveIncrements < 0) {
     throw new Error('Scale trial result is malformed.');
   }
   let targetImproved = measurement.committedRowsPerSecond > step.baselineCommittedRowsPerSecond;
   let reason = 'committed-throughput-improved';
   if (step.dimension === 'kusto-capacity' || step.dimension === 'kusto-sku') {
+    if (measurement.qapPendingBacklog === null || step.baselineQapPendingBacklog === null)
+      throw new Error('Native QAP pending data-file count is UNKNOWN for the Kusto trial.');
     const baseline = step.baselineCommittedRowsPerSecond;
     const ingressStable = baseline === 0 ? measurement.committedRowsPerSecond === 0 :
       Math.abs(measurement.committedRowsPerSecond - baseline) <= baseline * 0.05;
@@ -328,29 +342,25 @@ export async function executeScaleTrial(step: ScaleStep, adapter: ScaleAdapter, 
 }
 
 
-const evidenceSources = ['committed-window', 'lgtm-prometheus', 'qap', 'runinventory'] as const;
 export interface ScaleEvidenceEnvelope {
-  schema_version: 1; campaign_id: string; cell_run_id: string; observed_at_ms: number; window_ms: number;
-  sources: string[]; evidence: ScaleEvidence;
+  schema_version: 2; campaign_id: string; cell_run_id: string; observed_at_ms: number; window_ms: number;
+  evidence: ScaleEvidence;
 }
-interface ScaleMeasurementEnvelope {
-  schema_version: 1; campaign_id: string; cell_run_id: string; observed_at_ms: number; window_ms: number;
-  sources: string[]; measurement: ScaleMeasurement;
+export interface ScaleMeasurementEnvelope {
+  schema_version: 2; campaign_id: string; cell_run_id: string; observed_at_ms: number; window_ms: number;
+  measurement: ScaleMeasurement;
 }
 function record(value: unknown): value is Record<string, unknown> { return typeof value === 'object' && value !== null && !Array.isArray(value); }
 function exactKeys(value: Record<string, unknown>, keys: string[]): boolean {
   return Object.keys(value).sort().join() === [...keys].sort().join();
 }
-function validEvidenceSources(value: unknown): value is string[] {
-  return Array.isArray(value) && value.length === evidenceSources.length && evidenceSources.every(source => value.includes(source));
-}
 function scaleEnvelope(value: unknown, state: CampaignState, now: number): ScaleEvidenceEnvelope {
-  if (!record(value) || !exactKeys(value, ['schema_version', 'campaign_id', 'cell_run_id', 'observed_at_ms', 'window_ms', 'sources', 'evidence']) ||
-      value.schema_version !== 1 || value.campaign_id !== state.campaignId || value.cell_run_id !== state.runInventory?.cell_run_id ||
-      !Number.isSafeInteger(value.observed_at_ms) || (value.observed_at_ms as number) > now + 5_000 ||
+  if (!record(value) || !exactKeys(value, ['schema_version', 'campaign_id', 'cell_run_id', 'observed_at_ms', 'window_ms', 'evidence']) ||
+      value.schema_version !== 2 || value.campaign_id !== state.campaignId || value.cell_run_id !== state.runInventory?.cell_run_id ||
+      !Number.isSafeInteger(value.observed_at_ms) || (value.observed_at_ms as number) > now ||
       now - (value.observed_at_ms as number) > 300_000 || !Number.isSafeInteger(value.window_ms) ||
       (value.window_ms as number) < 30_000 || (value.window_ms as number) > 300_000 ||
-      !validEvidenceSources(value.sources) || !record(value.evidence) ||
+      !record(value.evidence) ||
       !exactKeys(value.evidence, ['committedRowsPerSecond', 'offeredRowsPerSecond', 'estimatedCollectorCapacityRowsPerSecond',
         'generatorCpuSaturated', 'generatorNetworkSaturated', 'collectorCpuSaturated', 'collectorThrottled', 'collectorMemorySaturated',
         'collectorPlacementBlocked', 'collectorNodePoolAtMaximum', 'qapBacklogGrowing', 'committedRateStable', 'qapPendingBacklog',
@@ -363,20 +373,27 @@ function scaleEnvelope(value: unknown, state: CampaignState, now: number): Scale
   return value as unknown as ScaleEvidenceEnvelope;
 }
 function measurementEnvelope(value: unknown, state: CampaignState, now: number): ScaleMeasurementEnvelope {
-  if (!record(value) || !exactKeys(value, ['schema_version', 'campaign_id', 'cell_run_id', 'observed_at_ms', 'window_ms', 'sources', 'measurement']) ||
-      value.schema_version !== 1 || value.campaign_id !== state.campaignId || value.cell_run_id !== state.runInventory?.cell_run_id ||
-      !Number.isSafeInteger(value.observed_at_ms) || (value.observed_at_ms as number) > now + 5_000 ||
+  if (!record(value) || !exactKeys(value, ['schema_version', 'campaign_id', 'cell_run_id', 'observed_at_ms', 'window_ms', 'measurement']) ||
+      value.schema_version !== 2 || value.campaign_id !== state.campaignId || value.cell_run_id !== state.runInventory?.cell_run_id ||
+      !Number.isSafeInteger(value.observed_at_ms) || (value.observed_at_ms as number) > now ||
       now - (value.observed_at_ms as number) > 300_000 || !Number.isSafeInteger(value.window_ms) ||
       (value.window_ms as number) < 30_000 || (value.window_ms as number) > 300_000 ||
-      !validEvidenceSources(value.sources) || !record(value.measurement) ||
+      !record(value.measurement) ||
       !exactKeys(value.measurement, ['committedRowsPerSecond', 'qapPendingBacklog']))
     throw new Error('Scale measurement envelope is stale, incomplete or belongs to another campaign/run.');
   const measurement = value.measurement as unknown as ScaleMeasurement;
-  if (!nonnegative(measurement.committedRowsPerSecond) || !Number.isSafeInteger(measurement.qapPendingBacklog) ||
-      measurement.qapPendingBacklog < 0) throw new Error('Scale measurement is UNKNOWN.');
+  if (!nonnegative(measurement.committedRowsPerSecond) ||
+      measurement.qapPendingBacklog !== null && (!Number.isSafeInteger(measurement.qapPendingBacklog) || measurement.qapPendingBacklog < 0))
+    throw new Error('Scale measurement is UNKNOWN.');
   return value as unknown as ScaleMeasurementEnvelope;
 }
-export type ScaleEvidenceVerifier = (evidence: ScaleEvidenceEnvelope, state: CampaignState) => Promise<void>;
+export interface ScaleVerificationWindow {
+  startMs: number; endMs: number; notBeforeMs: number; deadlineAtMs: number;
+}
+export interface ScaleEvidenceVerifier {
+  verifyInitial(envelope: ScaleEvidenceEnvelope, state: CampaignState): Promise<ScaleEvidence>;
+  verifyMeasurement(envelope: ScaleMeasurementEnvelope, state: CampaignState, window: ScaleVerificationWindow): Promise<ScaleMeasurement>;
+}
 export async function readJsonFile(file: string): Promise<unknown> {
   const handle = await open(resolve(ROOT, file), 'r');
   try {
@@ -392,7 +409,12 @@ export async function readJsonFile(file: string): Promise<unknown> {
     catch { throw new Error('Scale evidence file is not valid JSON.'); }
   } finally { await handle.close(); }
 }
-async function waitForScaleMeasurement(file: string, state: CampaignState, notBefore: number, deadline: number): Promise<ScaleMeasurement> {
+export async function waitForScaleMeasurement(file: string, state: CampaignState, notBefore: number, deadline: number,
+  verifier: ScaleEvidenceVerifier): Promise<ScaleMeasurement> {
+  if (!verifier || typeof verifier.verifyMeasurement !== 'function')
+    throw new Error('Post-scale admission is closed: no trusted measurement verifier is configured.');
+  if (!Number.isSafeInteger(notBefore) || !Number.isSafeInteger(deadline) || notBefore < 1 || deadline <= notBefore)
+    throw new Error('Post-scale measurement has no valid original convergence/deadline interval.');
   while (Date.now() < deadline) {
     let input: unknown;
     try { input = await readJsonFile(file); }
@@ -408,8 +430,19 @@ async function waitForScaleMeasurement(file: string, state: CampaignState, notBe
       continue;
     }
     const envelope = measurementEnvelope(input, state, Date.now());
-    return envelope.measurement;
-    await new Promise(resolve => setTimeout(resolve, 1000));
+    const window = { startMs: envelope.observed_at_ms - envelope.window_ms, endMs: envelope.observed_at_ms,
+      notBeforeMs: notBefore, deadlineAtMs: deadline };
+    const assertWindow = () => {
+      if (Date.now() >= deadline || window.startMs < notBefore || window.endMs > Date.now() ||
+          window.endMs > deadline) throw new Error('Post-scale evidence does not cover a complete window after convergence within the original deadline.');
+    };
+    assertWindow();
+    const measurement = await verifier.verifyMeasurement(envelope, state, window);
+    assertWindow();
+    if (!nonnegative(measurement.committedRowsPerSecond) ||
+        measurement.qapPendingBacklog !== null && (!Number.isSafeInteger(measurement.qapPendingBacklog) || measurement.qapPendingBacklog < 0))
+      throw new Error('Verified scale measurement is malformed.');
+    return measurement;
   }
   throw new Error('No fresh post-scale measurement arrived before the bounded trial deadline.');
 }
@@ -424,7 +457,8 @@ export async function main(args: string[], runner: typeof runtime.run_tree = run
     throw new Error('Usage: arrowcol-oat aks scale <owner-id> <fencing-token> --env-file PATH --stamp-config PATH --runtime-config PATH --evidence-file PATH --measurement-file PATH');
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(positionals[0]!) || !/^\d+$/.test(positionals[1]!))
     throw new Error('Scale requires an exact owner UUID and numeric fencing token.');
-  if (!verifyEvidence) throw new Error('Scale admission is closed: no trusted committed-window, Prometheus, QAP and RunInventory evidence verifier is configured.');
+  if (!verifyEvidence || typeof verifyEvidence.verifyInitial !== 'function' || typeof verifyEvidence.verifyMeasurement !== 'function')
+    throw new Error('Scale admission is closed: no trusted initial and post-scale evidence verifier is configured.');
   const selected = loadCustodyConfig(['--env-file', String(values['env-file'] ?? ''), '--stamp-config', String(values['stamp-config'] ?? '')]);
   const store = createBlobCampaignStore({ account: selected.config.account, container: selected.config.checkpoints,
     subscriptionId: selected.config.subscription });
@@ -437,10 +471,15 @@ export async function main(args: string[], runner: typeof runtime.run_tree = run
   const token = { ownerId: positionals[0]!, fencingToken: Number(positionals[1]) };
   if (state.status !== 'active' || state.mode !== 'armed' || state.ownerId !== token.ownerId || state.fencingToken !== token.fencingToken || !state.runInventory)
     throw new CampaignFencedError('Scale requires the exact active armed campaign owner and fence.');
-  const evidence = scaleEnvelope(await readJsonFile(values['evidence-file']!), state, Date.now());
-  await verifyEvidence(evidence, state);
-  const step = recommendScaleStep(evidence.evidence);
-  if (!step) { console.log(JSON.stringify({ status: 'no-measured-bottleneck', campaign_id: state.campaignId })); return; }
+  const envelope = scaleEnvelope(await readJsonFile(values['evidence-file']!), state, Date.now());
+  const evidence = await verifyEvidence.verifyInitial(envelope, state);
+  const step = recommendScaleStep(evidence);
+  if (!step) {
+    const unknown = Object.entries(evidence).filter(([, value]) => value === null).map(([field]) => field);
+    if (unknown.length) throw new Error('Scale admission refused: source dimensions remain UNKNOWN: ' + unknown.join(','));
+    console.log(JSON.stringify({ status: 'no-measured-bottleneck', campaign_id: state.campaignId }));
+    return;
+  }
   const previous = [...(state.scaleTrials ?? [])].reverse().find(item => item.target.dimension === step.dimension)?.result?.ineffective_increments ?? 0;
   if (previous >= 2) { console.log(JSON.stringify({ status: 'stopped-after-ineffective-increments', dimension: step.dimension })); return; }
   const runtimeConfig = validateRuntime(await readJsonFile(values['runtime-config']));
@@ -449,7 +488,7 @@ export async function main(args: string[], runner: typeof runtime.run_tree = run
   let measurementStartedAt = 0, trialDeadlineAt = 0;
   const adapter = createDefaultScaleAdapter(store, { azure, token, runCommand: runner as CustodyCommandRunner, runtimeConfig,
     beginMeasurement: deadlineAtMs => { measurementStartedAt = Date.now(); trialDeadlineAt = deadlineAtMs; },
-    measure: () => waitForScaleMeasurement(values['measurement-file']!, state, measurementStartedAt, trialDeadlineAt) });
+    measure: () => waitForScaleMeasurement(values['measurement-file']!, state, measurementStartedAt, trialDeadlineAt, verifyEvidence) });
   const result = await executeScaleTrial(step, adapter, token, previous);
   console.log(JSON.stringify({ campaign_id: state.campaignId, cell_run_id: state.runInventory.cell_run_id, step, result }));
 }

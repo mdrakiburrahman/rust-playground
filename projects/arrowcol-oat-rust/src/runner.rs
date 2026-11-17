@@ -99,6 +99,8 @@ pub struct RunInventory {
     #[serde(default)]
     pub evidence_destination: Option<InventoryEvidenceDestination>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub official_measurement: Option<InventoryOfficialMeasurement>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_stop_budgets: Option<EffectiveStopBudgets>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub planned_cell_duration_ms: Option<u64>,
@@ -267,6 +269,22 @@ pub struct InventoryEvidenceDestination {
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+pub struct InventoryOfficialMeasurement {
+    pub schema_version: u32,
+    pub blob: String,
+    pub etag: String,
+    pub version: Option<String>,
+    pub sha256: String,
+    pub byte_length: u64,
+    pub effective_config_sha256: String,
+    pub submitted_config_sha256: Option<String>,
+    pub source_revision: Option<String>,
+    pub measurement_start_unix_ms: Option<u64>,
+    pub measurement_end_unix_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct InventoryQapAbsenceReceipt {
     pub database: String,
     pub external_table: String,
@@ -339,6 +357,7 @@ impl RunInventory {
         if self.schema_version != 1 || self.fencing_token == 0 {
             bail!("invalid custody inventory version or fencing token");
         }
+        validate_official_measurement_reference(self)?;
         if let Some(budgets) = self.effective_stop_budgets {
             budgets.validate()?;
         }
@@ -680,6 +699,13 @@ impl RunInventory {
     pub fn validate_successor(&self, next: &Self) -> Result<()> {
         self.validate()?;
         next.validate()?;
+        if self
+            .official_measurement
+            .as_ref()
+            .is_some_and(|value| next.official_measurement.as_ref() != Some(value))
+        {
+            bail!("original official cell measurement binding is immutable");
+        }
         if self.campaign_id != next.campaign_id
             || self.owner_id != next.owner_id
             || self.fencing_token != next.fencing_token
@@ -1018,6 +1044,14 @@ trait Platform: Send + Sync {
         _config: &OatConfig,
         _run_id: &str,
         _tables: &[String],
+    ) -> Result<()> {
+        Ok(())
+    }
+    async fn publish_official_measurement(
+        &mut self,
+        _config: &OatConfig,
+        _rows: &[OatResult],
+        _deadline: tokio::time::Instant,
     ) -> Result<()> {
         Ok(())
     }
@@ -1562,6 +1596,15 @@ impl Platform for AksPlatform {
         persist_campaign_inventory_snapshot(self, &final_inventory, &final_etag).await?;
         final_inventory.assert_custody_ready(self.campaign_cli_paths()?).await?;
         Ok(())
+    }
+
+    async fn publish_official_measurement(
+        &mut self,
+        config: &OatConfig,
+        rows: &[OatResult],
+        deadline: tokio::time::Instant,
+    ) -> Result<()> {
+        publish_campaign_official_measurement(self, config, rows, deadline).await
     }
 
     fn mark_qap_outcome_unresolved(&mut self) {
@@ -3832,7 +3875,7 @@ async fn run_matrix_cell(
             }
         }
     }
-    result_rows(
+    let mut rows = result_rows(
         config,
         orchestration_id,
         run_id,
@@ -3845,7 +3888,21 @@ async fn run_matrix_cell(
             resources: metrics,
             resource_evidence: platform.resource_evidence(),
         },
-    )
+    )?;
+    if let Err(error) = platform
+        .publish_official_measurement(config, &rows, lifecycle_deadline)
+        .await
+    {
+        tracing::error!(%error, "official cell measurement publication failed; retaining original rows for normal cleanup");
+        for row in &mut rows {
+            row.status = "failed".to_owned();
+            row.failure = Some(match row.failure.take() {
+                Some(prior) => format!("{prior}; official_measurement_publication_failed"),
+                None => "official_measurement_publication_failed".to_owned(),
+            });
+        }
+    }
+    Ok(rows)
 }
 
 struct CellMeasurements {
@@ -8830,6 +8887,7 @@ fn initial_campaign_inventory(
             container: container.to_owned(),
             blob_prefix: format!("campaigns/{}/cells/{}/evidence", identity.campaign_id, cell_run_id),
         }),
+        official_measurement: None,
         effective_stop_budgets: Some(budget.effective_stop_budgets.validate()?),
         planned_cell_duration_ms: Some(budget.planned_cell_duration_ms),
         cleanup: InventoryCleanup {

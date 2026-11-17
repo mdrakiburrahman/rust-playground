@@ -3,7 +3,9 @@ import { test } from 'node:test';
 import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { assessScaleTrial, executeScaleTrial, main as scaleMain, readJsonFile, recommendScaleStep, validateScaleTarget, type ScaleEvidence, type ScaleTarget } from './aks-scale.js';
+import { assessScaleTrial, executeScaleTrial, main as scaleMain, readJsonFile, recommendScaleStep, validateScaleTarget,
+  waitForScaleMeasurement, type ScaleEvidence, type ScaleEvidenceVerifier, type ScaleTarget } from './aks-scale.js';
+import { newCampaignState } from './aks-campaign.js';
 import { verifySafeIdle, ensureSafeIdle, type SafeIdleObservation } from './aks-reconcile.js';
 
 function evidence(overrides: Partial<ScaleEvidence> = {}): ScaleEvidence {
@@ -48,8 +50,74 @@ test('real scale CLI refuses self-labeled telemetry before configuration, storag
   await assert.rejects(scaleMain(['22222222-2222-4222-8222-222222222222', '1', '--env-file', 'missing.env',
     '--stamp-config', 'missing.yaml', '--runtime-config', 'missing.json', '--evidence-file', 'evidence.json',
     '--measurement-file', 'measurement.json'], async () => { commandCalls++; throw new Error('must not run'); }),
-  /no trusted committed-window, Prometheus, QAP and RunInventory evidence verifier/);
+  /no trusted initial and post-scale evidence verifier/);
   assert.equal(commandCalls, 0);
+});
+
+test('UNKNOWN dimensions do not become false or block an independent measured bottleneck', () => {
+  const partial = { qapPendingBacklog: null, previousQapPendingBacklog: null, qapBacklogGrowing: null,
+    kustoSaturated: null, estimatedCollectorCapacityRowsPerSecond: null };
+  const cpu = recommendScaleStep(evidence({ ...partial, collectorThrottled: true }));
+  assert.equal(cpu?.dimension, 'collector-cpu-limit');
+  assert.equal(cpu?.baselineQapPendingBacklog, null);
+  assert.equal(assessScaleTrial(cpu!, { committedRowsPerSecond: 1100, qapPendingBacklog: null }).outcome, 'keep');
+  assert.equal(recommendScaleStep(evidence({ ...partial, generatorCpuSaturated: true })), undefined);
+  assert.equal(recommendScaleStep(evidence({ generatorCpuSaturated: true, collectorThrottled: null })), undefined);
+  const kusto = recommendScaleStep(evidence({ collectorCpuSaturated: null, collectorThrottled: null,
+    collectorMemorySaturated: null, qapBacklogGrowing: true, committedRateStable: true, kustoSaturated: true,
+    qapPendingBacklog: 20, previousQapPendingBacklog: 10 }));
+  assert.equal(kusto?.dimension, 'kusto-capacity');
+  assert.throws(() => assessScaleTrial(kusto!, { committedRowsPerSecond: 1000, qapPendingBacklog: null }), /UNKNOWN/);
+});
+
+test('production measurement wait verifies a complete original post-convergence window and rechecks its deadline', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'oat-post-scale-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  let now = 1_800_000_000_000;
+  t.mock.method(Date, 'now', () => now);
+  const state = newCampaignState('c0ffee00-0000-4000-8000-000000000001', 'c0ffee00-0000-4000-8000-000000000002', now - 120_000);
+  const step = () => ({ state: 'not_started' as const, deadline_unix_ms: null, reason_code: null });
+  state.runInventory = { schema_version: 1, campaign_id: state.campaignId, owner_id: state.ownerId, fencing_token: 1,
+    orchestration_run_id: 'c0ffee00-0000-4000-8000-000000000004', cell_run_id: 'c0ffee00-0000-4000-8000-000000000003',
+    load_admission: 'authorized', namespace: { name: 'synthetic-offline', uid: null, owner_token: state.ownerId },
+    resources: [], fic: null, qap: null,
+    cleanup: { stop_admission: step(), bounded_drain: step(), evidence_capture: step(), stop_maintenance: step(), terminal_capture: step(), handoff: step() } };
+  const file = join(directory, 'measurement.json'), deadline = now + 60_000, notBefore = now - 60_000;
+  const input = { schema_version: 2, campaign_id: state.campaignId, cell_run_id: state.runInventory.cell_run_id,
+    observed_at_ms: now, window_ms: 30_000, measurement: { committedRowsPerSecond: 999, qapPendingBacklog: 1 } };
+  let calls = 0, expire = false, fenced = false;
+  const verifier: ScaleEvidenceVerifier = {
+    verifyInitial: async () => { throw new Error('not an initial request'); },
+    verifyMeasurement: async (_envelope, _state, window) => {
+      calls++;
+      assert.equal(window.deadlineAtMs, deadline);
+      assert.equal(window.notBeforeMs, notBefore);
+      assert.equal(window.startMs, input.observed_at_ms - input.window_ms);
+      if (fenced) throw new Error('authenticated custody changed');
+      if (expire) now = deadline;
+      return { committedRowsPerSecond: 1200, qapPendingBacklog: null };
+    },
+  };
+  await writeFile(file, JSON.stringify(input));
+  assert.deepEqual(await waitForScaleMeasurement(file, state, notBefore, deadline, verifier),
+    { committedRowsPerSecond: 1200, qapPendingBacklog: null });
+  assert.equal(calls, 1);
+  for (const invalid of [{ ...input, sources: ['committed-window', 'qap'] },
+    { ...input, cell_run_id: 'c0ffee00-0000-4000-8000-000000000099' },
+    { ...input, window_ms: 90_000 }, { ...input, window_ms: 29_999 }, { ...input, observed_at_ms: now + 1 }]) {
+    await writeFile(file, JSON.stringify(invalid));
+    await assert.rejects(waitForScaleMeasurement(file, state, notBefore, deadline, verifier), /window|envelope|campaign\/run/);
+  }
+  assert.equal(calls, 1);
+  await writeFile(file, JSON.stringify(input));
+  fenced = true;
+  await assert.rejects(waitForScaleMeasurement(file, state, notBefore, deadline, verifier), /custody changed/);
+  fenced = false;
+  expire = true;
+  await assert.rejects(waitForScaleMeasurement(file, state, notBefore, deadline, verifier), /original deadline/);
+  const expiredCalls = calls;
+  await assert.rejects(waitForScaleMeasurement(file, state, notBefore, deadline, verifier), /bounded trial deadline/);
+  assert.equal(calls, expiredCalls);
 });
 
 test('load-generator expansion requires generator saturation, collector headroom, and offered-load headroom', () => {
