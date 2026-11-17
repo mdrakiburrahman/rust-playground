@@ -1375,9 +1375,7 @@ impl PreparedClient {
                 _live_batch_permit: None,
             });
         }
-        let live_batch_permit = self
-            .live_batch_slots
-            .clone()
+        let live_batch_permit = Arc::clone(&self.live_batch_slots)
             .acquire_owned()
             .await
             .context("acquire realistic live-batch memory reservation")?;
