@@ -536,6 +536,44 @@ test('renders frozen submitted configs with only candidate-declared changes and 
   assert.deepEqual(frozen, original);
 });
 
+test('renders frozen candidates with null or missing optional intermediate parents', () => {
+  const seed = JSON.parse(readFileSync(new URL('../../docs/experiments/arrowcol-oat/oat-config.tuned.json', import.meta.url), 'utf8')) as Record<string, unknown>;
+  const manifest = buildThroughputManifests(seed).find(item => item.cohort === 'C3')!;
+  const expectedDelta = [
+    '/tunables/collector/layout/enabled',
+    '/tunables/collector/layout/row_group_rows',
+    '/tunables/parquet_writer/max_row_group_rows',
+  ];
+  const cases: Array<{ name: string; prepare: (config: Record<string, unknown>) => Record<string, unknown> }> = [
+    { name: 'explicit null layout', prepare: config => {
+      const collector = at(config, ['tunables', 'collector']) as Record<string, unknown>;
+      collector.layout = null;
+      return collector;
+    } },
+    { name: 'missing layout', prepare: config => {
+      const collector = at(config, ['tunables', 'collector']) as Record<string, unknown>;
+      delete collector.layout;
+      return collector;
+    } },
+  ];
+  for (const item of cases) {
+    const frozen = structuredClone(seed);
+    const collector = item.prepare(frozen);
+    const batching = structuredClone(collector.batching);
+    const runtime = structuredClone(collector.runtime);
+    const rendered = renderFrozenThroughputConfig(frozen, manifest, 'row-groups', 'row-group-65536');
+    assert.deepEqual(rendered.delta_paths, expectedDelta, item.name);
+    assert.deepEqual(at(rendered.config, ['tunables', 'collector', 'batching']), batching, item.name);
+    assert.deepEqual(at(rendered.config, ['tunables', 'collector', 'runtime']), runtime, item.name);
+  }
+  const frozen = structuredClone(seed);
+  const tunables = at(frozen, ['tunables']) as Record<string, unknown>;
+  tunables.collector = null;
+  const rendered = renderFrozenThroughputConfig(frozen, manifest, 'row-groups', 'row-group-65536');
+  assert.deepEqual(rendered.delta_paths, expectedDelta);
+  assert.deepEqual(at(rendered.config, ['tunables', 'collector', 'layout']), { enabled: true, row_group_rows: 65_536 });
+});
+
 test('rejects invalid frozen configs and non-JSON candidate overrides', () => {
   const seed = JSON.parse(readFileSync(new URL('../../docs/experiments/arrowcol-oat/oat-config.tuned.json', import.meta.url), 'utf8')) as Record<string, unknown>;
   const manifest = buildThroughputManifests(seed).find(item => item.cohort === 'C5')!;

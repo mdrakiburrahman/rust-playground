@@ -501,7 +501,7 @@ function jsonPointer(path: string[]): string {
 function overrideLeafPaths(value: unknown, path: string[] = []): string[] {
   if (!isRecord(value)) return path.length > 0 ? [jsonPointer(path)] : [];
   const keys = Object.keys(value);
-  if (keys.length === 0) return [];
+  if (keys.length === 0) return path.length > 0 ? [jsonPointer(path)] : [];
   return keys.flatMap(key => overrideLeafPaths(value[key], [...path, key]));
 }
 
@@ -515,11 +515,15 @@ function changedJsonPaths(
       Object.prototype.hasOwnProperty.call(after, key),
     ));
   }
-  if (!beforePresent && afterPresent && isRecord(after)) {
-    return Object.keys(after).sort().flatMap(key => changedJsonPaths(undefined, after[key], [...path, key], false, true));
+  if (afterPresent && isRecord(after) && (!beforePresent || !isRecord(before))) {
+    const keys = Object.keys(after).sort();
+    if (keys.length === 0) return path.length > 0 ? [jsonPointer(path)] : [];
+    return keys.flatMap(key => changedJsonPaths(undefined, after[key], [...path, key], false, true));
   }
   if (beforePresent && !afterPresent && isRecord(before)) {
-    return Object.keys(before).sort().flatMap(key => changedJsonPaths(before[key], undefined, [...path, key], true, false));
+    const keys = Object.keys(before).sort();
+    if (keys.length === 0) return path.length > 0 ? [jsonPointer(path)] : [];
+    return keys.flatMap(key => changedJsonPaths(before[key], undefined, [...path, key], true, false));
   }
   if (beforePresent === afterPresent && (!beforePresent || JSON.stringify(before) === JSON.stringify(after))) return [];
   return path.length > 0 ? [jsonPointer(path)] : ['/'];
