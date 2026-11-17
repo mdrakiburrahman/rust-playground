@@ -50,6 +50,21 @@ test('AKS resource overrides are strict and project through to role manifests', 
     granularity: 'day' };
   c.effective_stop_budgets = { maintenance_grace_seconds: 1200, maintenance_stop_timeout_ms: 1_500_000 };
   c.images.maintenance = 'arrowcollector89152.azurecr.io/delta-maintenance@sha256:' + 'b'.repeat(64);
+  const objects = await renderRuntime(c, 'workload');
+  const get = (name: string) => objects.find(o => o.kind === 'Deployment' && o.metadata.name === name)!;
+  const collector = get('arrowcol').spec.template.spec.containers[0];
+  assert.deepEqual(collector.resources, { requests: { cpu: '3', memory: '8Gi' }, limits: { cpu: '4', memory: '10Gi' } });
+  assert.deepEqual(collector.args.slice(-2), ['--num-cores', '7']);
+  assert.equal(collector.env.find((e: any) => e.name === 'ARROWCOL_PARTITION_GRANULARITY').value, 'day');
+  assert.equal(parse(objects.find(o => o.kind === 'ConfigMap')!.data['dataflow.yaml']).policies.resources.core_allocation.count, 7);
+  assert.equal(get('arrowcol-catalog').spec.template.spec.containers[0].resources.requests.memory, '1Gi');
+  assert.equal(get('arrowcol-router').spec.template.spec.containers[0].resources.requests.cpu, '500m');
+  assert.equal(get('delta-maintenance').spec.template.spec.terminationGracePeriodSeconds, 1200);
+  assert.throws(() => validateRuntime({ ...config(), resources: { unknown: {} } }));
+  assert.throws(() => validateRuntime({ ...config(), resources: { collector: { requests: { cpu: '3', memory: '1Gi' }, limits: { cpu: '2', memory: '6Gi' } } } }), /must not exceed limits/);
+  assert.throws(() => validateRuntime({ ...config(), resources: { collector: { requests: { cpu: '1.0001', memory: '1Gi' }, limits: { cpu: '2', memory: '6Gi' } } } }), /Kubernetes CPU quantity/);
+});
+
 test('scale-out admits one memory-only hot table with matching spread replicas and explicit maintenance', async () => {
   const c = scaleOutConfig();
   validateRuntime(c);
@@ -96,10 +111,25 @@ test('scale-out admits one memory-only hot table with matching spread replicas a
   assert.throws(() => validateRuntime(c), /matching 1..16/);
   c.collectorReplicas = 3;
   c.routerReplicas = 3;
+  c.collectorReplicas = 1;
+  c.routerReplicas = 1;
+  validateRuntime(c);
+  c.collectorReplicas = 16;
+  c.routerReplicas = 16;
+  validateRuntime(c);
+  c.collectorReplicas = 3;
+  c.routerReplicas = 3;
   c.maintenance!.apply = false;
   assert.throws(() => validateRuntime(c), /all five operations/);
   c.maintenance!.apply = true;
   c.maintenance!.operations.pop();
+  assert.throws(() => validateRuntime(c), /all five operations/);
+  c.maintenance!.operations = ['optimize', 'checkpoint', 'purge', 'vacuum', 'prune-log'];
+  c.maintenance!.tables = [];
+  assert.throws(() => validateRuntime(c), /all five operations/);
+  c.maintenance!.tables = ['telemetry.sqlserver.sqlserver_availability_replica_states', 'telemetry.sqlserver.sqlserver_availability_replica_states'];
+  assert.throws(() => validateRuntime(c), /all five operations/);
+  c.maintenance!.tables = ['telemetry.sqlserver.other_table'];
   assert.throws(() => validateRuntime(c), /all five operations/);
 
   const legacy = await renderRuntime(config(), 'workload');
@@ -108,21 +138,6 @@ test('scale-out admits one memory-only hot table with matching spread replicas a
   assert.equal(legacyCollector.spec.template.spec.containers[0].resources.limits.cpu, '2');
   assert.equal(legacyCollector.spec.template.spec.affinity, undefined);
   assert.throws(() => validateRuntime({ ...config(), collectorReplicas: 2 }), /require campaignProfile/);
-});
-
-  const objects = await renderRuntime(c, 'workload');
-  const get = (name: string) => objects.find(o => o.kind === 'Deployment' && o.metadata.name === name)!;
-  const collector = get('arrowcol').spec.template.spec.containers[0];
-  assert.deepEqual(collector.resources, { requests: { cpu: '3', memory: '8Gi' }, limits: { cpu: '4', memory: '10Gi' } });
-  assert.deepEqual(collector.args.slice(-2), ['--num-cores', '7']);
-  assert.equal(collector.env.find((e: any) => e.name === 'ARROWCOL_PARTITION_GRANULARITY').value, 'day');
-  assert.equal(parse(objects.find(o => o.kind === 'ConfigMap')!.data['dataflow.yaml']).policies.resources.core_allocation.count, 7);
-  assert.equal(get('arrowcol-catalog').spec.template.spec.containers[0].resources.requests.memory, '1Gi');
-  assert.equal(get('arrowcol-router').spec.template.spec.containers[0].resources.requests.cpu, '500m');
-  assert.equal(get('delta-maintenance').spec.template.spec.terminationGracePeriodSeconds, 1200);
-  assert.throws(() => validateRuntime({ ...config(), resources: { unknown: {} } }));
-  assert.throws(() => validateRuntime({ ...config(), resources: { collector: { requests: { cpu: '3', memory: '1Gi' }, limits: { cpu: '2', memory: '6Gi' } } } }), /must not exceed limits/);
-  assert.throws(() => validateRuntime({ ...config(), resources: { collector: { requests: { cpu: '1.0001', memory: '1Gi' }, limits: { cpu: '2', memory: '6Gi' } } } }), /Kubernetes CPU quantity/);
 });
 
 test('only explicit Quiver topology installs the durable processor and isolated pod storage', async () => {
