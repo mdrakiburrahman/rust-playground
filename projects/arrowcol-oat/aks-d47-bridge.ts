@@ -4,10 +4,11 @@ import path from 'node:path';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { TextDecoder } from 'node:util';
 import { Azure, type ProcessResult } from '../../infra/azure/bootstrap.js';
-import { dispatchExternalEffect, EffectBoundaryRefused, effectAllocationFingerprint, processEffectRequest,
-  type EffectEnvelope, type ExternalEffect, isEffectBoundaryActiveFor } from '../../infra/azure/effect-boundary.js';
-import { assertCampaignCustodyState, campaignMain, validateInitialRunInventory, type CampaignStore,
-  type CampaignStoreOperationOptions, type RunInventory } from './aks-campaign.js';
+import { dispatchExternalEffect, EffectBoundary, EffectBoundaryRefused, effectAllocationFingerprint, processEffectRequest,
+  withEffectBoundary, type EffectEnvelope, type ExternalEffect, isEffectBoundaryActiveFor } from '../../infra/azure/effect-boundary.js';
+import { assertCampaignCustodyState, campaignMain, isInitialRunInventory, publishRunInventory, validateCampaignState,
+  validateInitialRunInventory, type CampaignState, type CampaignStore, type CampaignStoreOperationOptions, type RunInventory,
+  type StoredCampaign } from './aks-campaign.js';
 
 const MAX_FRAME = 4 * 1024 * 1024;
 const MAX_OUTPUT = 1024 * 1024;
@@ -271,6 +272,8 @@ class DurableBridgeLedger {
     }));
     return sha(canonical(exchanges));
   }
+  transcriptDigest(): string { return this.transcriptSha256(); }
+  latestResponseDigest(): string | undefined { return this.records.get(this.maxId)?.response_sha256; }
   private append(record: LedgerBinding | LedgerRecord | LedgerTerminalRecord): void {
     const data = Buffer.from(canonical(record) + '\n'), fd = fs.openSync(this.filename,
       fs.constants.O_WRONLY | fs.constants.O_APPEND | (fs.constants.O_NOFOLLOW ?? 0));
@@ -541,11 +544,216 @@ async function callCampaignMain(options: FixtureDispatcherOptions, request: Fixt
   if (Buffer.byteLength(stdout) > MAX_OUTPUT) throw new Error('Campaign publisher output exceeded the fixture response bound.');
   return { returncode: 0, stdout, stderr: '' };
 }
+function sealFixturePhase(ledgerPath: string, request: FixtureCommandRequest, phase: 'preflight' | 'command',
+  envelope: EffectEnvelope, predecessor: { allocation_sha256: string; journal_sha256: string; response_sha256: string }):
+  { receiptPath: string; allocationSha256: string; planSha256: string } {
+  const allocationSha256 = effectAllocationFingerprint(envelope);
+  const planPath = ledgerPath + '.phase-' + request.request_id + '-' + phase + '.plan.json';
+  const plan = { schema_version: 1, kind: 'fixture_command_phase', campaign_id: envelope.campaign_id,
+    run_id: envelope.run_id, request_id: request.request_id, request_sha256: request.request_sha256, phase,
+    predecessor_allocation_sha256: predecessor.allocation_sha256,
+    predecessor_journal_sha256: predecessor.journal_sha256,
+    predecessor_response_sha256: predecessor.response_sha256, allocation_sha256: allocationSha256, envelope };
+  const bytes = Buffer.from(canonical(plan) + '\n');
+  if (fs.existsSync(planPath)) {
+    const stat = fs.lstatSync(planPath);
+    if (!stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0 || !fs.readFileSync(planPath).equals(bytes))
+      throw new Error('Fixture phase allocation changed after it was sealed.');
+  } else {
+    const fd = fs.openSync(planPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL |
+      (fs.constants.O_NOFOLLOW ?? 0), 0o600);
+    try { fs.writeSync(fd, bytes); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+  }
+  return { receiptPath: planPath + '.receipts', allocationSha256, planSha256: sha(bytes) };
+}
+async function fixturePhaseEnvelope(base: EffectEnvelope, phase: 'preflight' | 'command', request: FixtureCommandRequest,
+  kind: 'kubectl' | 'campaign', stored?: StoredCampaign, now = Date.now()): Promise<EffectEnvelope> {
+  const effects: EffectEnvelope['effects'] = [];
+  const prefix = 'fixture-' + request.request_id + '-' + phase + '-';
+  let serial = 0;
+  const add = (rule: EffectEnvelope['effects'][number], maxCalls = rule.max_calls, bodySha256 = rule.body_sha256) => {
+    effects.push({ id: prefix + (++serial), transport: rule.transport, method: rule.method, resource: rule.resource,
+      path: rule.path, max_calls: maxCalls, ...(bodySha256 === undefined ? {} : { body_sha256: bodySha256 }) });
+  };
+  const activeRead = base.effects.find(rule => rule.transport === 'campaign-blob' && rule.method === 'GET' && rule.path.endsWith('/active.json'));
+  if (!activeRead || activeRead.body_sha256 !== undefined) throw new Error('Fixture parent allocation lacks the exact campaign-state read template.');
+  for (const rule of base.effects) if (rule.transport === 'azure-auth' ||
+      rule.transport === 'process' && rule.method === 'AZURE_ACCOUNT_GET-ACCESS-TOKEN') add(rule);
+  if (phase === 'preflight') add(activeRead, 1);
+  else {
+    const effect = fixtureEffect(request), bodySha256 = effect.body == null ? undefined : sha(effect.body);
+    effects.push({ id: prefix + (++serial), transport: effect.transport, method: effect.method, resource: effect.resource,
+      path: effect.path, max_calls: 1, ...(bodySha256 === undefined ? {} : { body_sha256: bodySha256 }) });
+    if (kind === 'kubectl') add(activeRead, 1);
+    else {
+      if (!stored) throw new Error('Fixture campaign publication requires an actual predecessor state.');
+      const inventory = JSON.parse(request.stdin!) as RunInventory;
+      let nextState: CampaignState | undefined;
+      const planningStore: CampaignStore = {
+        read: async () => structuredClone(stored),
+        write: async (state: CampaignState) => { nextState = state; return stored.etag; },
+      };
+      await publishRunInventory(planningStore, inventory, now);
+      if (!nextState) throw new Error('Fixture campaign phase did not produce its planned successor state.');
+      const body = JSON.stringify(validateCampaignState(nextState));
+      const activeWrite = base.effects.find(rule => rule.transport === 'campaign-blob' && rule.method === 'PUT' &&
+        rule.resource === activeRead.resource && rule.path === activeRead.path);
+      if (!activeWrite) throw new Error('Fixture parent allocation lacks the campaign-state write template.');
+      const initial = isInitialRunInventory(nextState.runInventory);
+      add(activeRead, initial ? 5 : 6);
+      add(activeWrite, 1, sha(body));
+      if (!initial) {
+        const baselineRead = base.effects.find(rule => rule.transport === 'campaign-blob' && rule.method === 'GET' &&
+          rule.resource === activeRead.resource && rule.path.endsWith('/baseline.json'));
+        if (!baselineRead) throw new Error('Fixture parent allocation lacks the original baseline read template.');
+        add(baselineRead, 1);
+      }
+    }
+  }
+  return { ...base, effects };
+}
+function fixtureCreatedResources(text: string): Obj[] {
+  const resources: Obj[] = [];
+  for (const value of parseJsonValues(text)) {
+    if (!object(value)) throw new Error('Fixture create response is not a resource object.');
+    if (Array.isArray(value.items)) {
+      for (const item of value.items) { if (!object(item)) throw new Error('Fixture create response contains a malformed resource.'); resources.push(item); }
+    } else resources.push(value);
+  }
+  return resources;
+}
+function fixtureHasOriginMarkers(metadata: Obj, input: FixtureSetupInput): boolean {
+  return ['labels', 'annotations'].every(field => object(metadata[field]) &&
+    metadata[field]['arrowcol-oat/run-id'] === input.authority.cell_run_id &&
+    metadata[field]['arrowcol-oat/owner-token'] === input.authority.owner_id);
+}
+function fixtureCommandPhase(request: FixtureCommandRequest): string {
+  if (request.argv[3] === 'publish-inventory') return 'publish-inventory';
+  const args = request.argv.slice(4);
+  if (args[0] === 'get' && args[1] === 'namespace') return 'namespace-read';
+  if (args[0] === 'create' && args[1] === '-f') return 'namespace-create';
+  if (args[0] === 'get' && args[1] === '--namespace' && args.includes('--ignore-not-found')) return 'resource-collision';
+  if (args[0] === 'create' && args[1] === '--namespace') return 'resource-create';
+  if (args[0] === 'get' && args[1] === '--namespace') return 'resource-readback';
+  throw new Error('Fixture command has no recognized setup phase.');
+}
+function fixturePlannedInventory(input: FixtureSetupInput, namespaceInventory: RunInventory): RunInventory {
+  const resources: RunInventory['resources'] = input.manifests.slice(1).map(value => {
+    const manifest = addOriginMarkers(value, input.authority, object(value) && value.kind === 'Deployment');
+    if (!object(manifest.metadata)) throw new Error('Fixture manifest metadata is invalid.');
+    const metadata = manifest.metadata;
+    if (typeof manifest.apiVersion !== 'string' || typeof manifest.kind !== 'string' ||
+        typeof metadata.namespace !== 'string' || typeof metadata.name !== 'string')
+      throw new Error('Fixture planned resource identity is invalid.');
+    const app = object(metadata.labels) && typeof metadata.labels.app === 'string' ? metadata.labels.app : '';
+    const role: RunInventory['resources'][number]['role'] = (manifest.kind === 'Deployment' && app === 'arrowcol-oat-client') ? 'client' :
+      metadata.name === 'delta-maintenance' ? 'maintenance' :
+        metadata.name.includes('router') || app.includes('router') ? 'router' : 'collector';
+    return { api_version: manifest.apiVersion, kind: manifest.kind, namespace: metadata.namespace, name: metadata.name,
+      uid: null, absence: null, role, state: 'planned' };
+  });
+  return { ...structuredClone(namespaceInventory), resources };
+}
+function fixtureObservedInventory(input: FixtureSetupInput, planned: RunInventory, value: unknown, created: Obj[]): RunInventory {
+  if (!object(value) || !Array.isArray(value.items) || value.items.length !== planned.resources.length ||
+      created.length !== planned.resources.length) throw new Error('Fixture resource readback is incomplete or malformed.');
+  const items = value.items, seenUids = new Set<string>();
+  const resources: RunInventory['resources'] = planned.resources.map(resource => {
+    const actual = items.find(item => object(item) && object(item.metadata) && item.kind === resource.kind &&
+      item.metadata.namespace === resource.namespace && item.metadata.name === resource.name);
+    const createdResource = created.find(item => object(item.metadata) && item.kind === resource.kind &&
+      item.metadata.namespace === resource.namespace && item.metadata.name === resource.name);
+    if (!object(actual) || !object(actual.metadata) || typeof actual.metadata.uid !== 'string' || !actual.metadata.uid ||
+        typeof actual.metadata.resourceVersion !== 'string' || !actual.metadata.resourceVersion || !fixtureHasOriginMarkers(actual.metadata, input) ||
+        !object(createdResource) || !object(createdResource.metadata) || createdResource.metadata.uid !== actual.metadata.uid ||
+        createdResource.metadata.generation !== actual.metadata.generation || !Number.isSafeInteger(actual.metadata.generation) ||
+        seenUids.has(actual.metadata.uid)) throw new Error('Fixture readback differs from the original fresh-create identity.');
+    if (['Deployment', 'StatefulSet', 'DaemonSet', 'Job'].includes(resource.kind) &&
+        (!object(actual.spec) || !object(actual.spec.template) || !object(actual.spec.template.metadata) ||
+          !fixtureHasOriginMarkers(actual.spec.template.metadata, input)))
+      throw new Error('Fixture pod-template readback is missing its exact origin markers.');
+    seenUids.add(actual.metadata.uid);
+    return { ...resource, uid: actual.metadata.uid, state: 'observed' };
+  });
+  return { ...structuredClone(planned), resources };
+}
+function assertFixturePhaseOrder(request: FixtureCommandRequest, input: FixtureSetupInput,
+  seen: Map<number, FixtureCommandRequest>, responses: Map<number, FixtureCommandResponse>): void {
+  const expected = ['publish-inventory', 'namespace-read', 'namespace-create', 'publish-inventory', 'publish-inventory',
+    'resource-collision', 'resource-create', 'resource-readback', 'namespace-read', 'publish-inventory'];
+  if (request.request_id !== responses.size + 1 || request.request_id > expected.length ||
+      fixtureCommandPhase(request) !== expected[request.request_id - 1])
+    throw new Error('Fixture command phase is out of order or outside the immutable setup sequence.');
+  const response = (id: number) => {
+    const value = responses.get(id);
+    if (!value || value.exit_code !== 0) throw new Error('Fixture predecessor phase did not return successful evidence.');
+    return value;
+  };
+  if (request.request_id === 1) {
+    if (!equal(JSON.parse(request.stdin!) as unknown, input.inventory)) throw new Error('Initial fixture inventory changed.');
+  } else if (request.request_id === 2) {
+    response(1);
+  } else if (request.request_id === 3) {
+    if (response(2).stdout.trim()) throw new Error('Fixture namespace collision was not proven absent before create.');
+  } else if (request.request_id === 4) {
+    const created = fixtureCreatedResources(response(3).stdout), namespace = created.length === 1 ? created[0] : undefined;
+    if (!object(namespace) || !object(namespace.metadata) || typeof namespace.metadata.uid !== 'string' || !namespace.metadata.uid ||
+        typeof namespace.metadata.resourceVersion !== 'string' || !namespace.metadata.resourceVersion ||
+        !fixtureHasOriginMarkers(namespace.metadata, input))
+      throw new Error('Fixture namespace create lacks a valid actual identity response.');
+    const expectedInventory = structuredClone(input.inventory);
+    expectedInventory.namespace.uid = namespace.metadata.uid;
+    if (!equal(JSON.parse(request.stdin!) as unknown, expectedInventory))
+      throw new Error('Fixture namespace UID publication is not derived from the create response.');
+  } else if (request.request_id === 5) {
+    const namespaceInventory = JSON.parse(seen.get(4)!.stdin!) as RunInventory;
+    if (!equal(JSON.parse(request.stdin!) as unknown, fixturePlannedInventory(input, namespaceInventory)))
+      throw new Error('Fixture planned resources differ from the approved manifests.');
+  } else if (request.request_id === 6) {
+    response(5);
+  } else if (request.request_id === 7) {
+    const collision = parseJsonValues(response(6).stdout);
+    if (collision.length !== 1 || !object(collision[0]) || !Array.isArray(collision[0].items) || collision[0].items.length !== 0)
+      throw new Error('Fixture resources were not proven absent before fresh create.');
+  } else if (request.request_id === 8) {
+    response(7);
+  } else if (request.request_id === 9) {
+    fixtureObservedInventory(input, JSON.parse(seen.get(5)!.stdin!) as RunInventory,
+      parseJsonValues(response(8).stdout)[0], fixtureCreatedResources(response(7).stdout));
+  } else {
+    const namespaceReadback = parseJsonValues(response(9).stdout), namespace = namespaceReadback.length === 1 ? namespaceReadback[0] : undefined;
+    const created = fixtureCreatedResources(response(3).stdout), createdNamespace = created.length === 1 ? created[0] : undefined;
+    if (!object(namespace) || !object(namespace.metadata) || typeof namespace.metadata.resourceVersion !== 'string' ||
+        !namespace.metadata.resourceVersion || !fixtureHasOriginMarkers(namespace.metadata, input) ||
+        !object(createdNamespace) || !object(createdNamespace.metadata) ||
+        namespace.metadata.uid !== createdNamespace.metadata.uid)
+      throw new Error('Fixture namespace readback differs from the original create response.');
+    const planned = JSON.parse(seen.get(5)!.stdin!) as RunInventory;
+    const readback = parseJsonValues(response(8).stdout)[0];
+    const finalInventory = fixtureObservedInventory(input, planned, readback, fixtureCreatedResources(response(7).stdout));
+    if (!equal(JSON.parse(request.stdin!) as unknown, finalInventory))
+      throw new Error('Fixture observed inventory is not derived from resource readback.');
+  }
+}
+function readFixturePhaseAllocation(ledgerPath: string, requestId: number, campaignId: string, runId: string): string {
+  const filename = ledgerPath + '.phase-' + requestId + '-command.plan.json';
+  const stat = fs.lstatSync(filename);
+  if (!stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0)
+    throw new Error('Fixture predecessor phase plan is not a private regular file.');
+  const plan = JSON.parse(fs.readFileSync(filename, 'utf8')) as unknown;
+  if (!object(plan) || plan.schema_version !== 1 || plan.kind !== 'fixture_command_phase' ||
+      plan.phase !== 'command' || plan.request_id !== requestId || plan.campaign_id !== campaignId || plan.run_id !== runId ||
+      typeof plan.allocation_sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(plan.allocation_sha256) ||
+      effectAllocationFingerprint(plan.envelope) !== plan.allocation_sha256)
+    throw new Error('Fixture predecessor phase plan is malformed.');
+  return plan.allocation_sha256;
+}
 export class FixtureCommandDispatcher {
   private readonly now: () => number;
   private readonly ledger: DurableBridgeLedger;
   private readonly envelope: EffectEnvelope;
   private readonly campaignStore: CampaignStore;
+  private lastPublishedStored?: StoredCampaign;
   private readonly seen = new Map<number, FixtureCommandRequest>();
   private readonly responses = new Map<number, FixtureCommandResponse>();
   constructor(private readonly options: FixtureDispatcherOptions) {
@@ -563,19 +771,40 @@ export class FixtureCommandDispatcher {
   async exchange(value: unknown): Promise<FixtureCommandResponse> {
     const request = fixtureRequest(value, this.options.input.authority, this.options.input.original_deadline_unix_ms, this.now());
     const kind = assertFixtureCommand(request, this.options.input), effect = fixtureEffect(request);
-    assertAllocated(this.envelope, effect); this.seen.set(request.request_id, request);
     assertBridgeLive(this.envelope, request.original_deadline_unix_ms, this.now);
-    await this.campaignStore.read();
-    const cached = this.ledger.begin(request.request_id, request.request_sha256);
-    if (cached !== undefined) { this.responses.set(request.request_id, cached as FixtureCommandResponse); return cached as FixtureCommandResponse; }
+    const cached = this.ledger.peek(request.request_id, request.request_sha256);
+    if (cached !== undefined) { this.seen.set(request.request_id, request); this.responses.set(request.request_id, cached as FixtureCommandResponse); return cached as FixtureCommandResponse; }
+    assertFixturePhaseOrder(request, this.options.input, this.seen, this.responses);
+    const priorTranscript = sha(fs.readFileSync(this.options.ledgerPath));
+    const predecessorResponse = this.ledger.latestResponseDigest() ?? sha(canonical({ authority: this.options.input.authority,
+      inventory: this.options.input.inventory, allocation_sha256: effectAllocationFingerprint(this.envelope) }));
+    const predecessorAllocation = request.request_id === 1 ? effectAllocationFingerprint(this.envelope) :
+      readFixturePhaseAllocation(this.options.ledgerPath, request.request_id - 1,
+        this.options.input.authority.campaign_id, this.options.input.authority.cell_run_id);
+    this.seen.set(request.request_id, request);
+    this.ledger.begin(request.request_id, request.request_sha256);
+    const preflightEnvelope = await fixturePhaseEnvelope(this.envelope, 'preflight', request, kind, undefined, this.now());
+    const preflight = sealFixturePhase(this.options.ledgerPath, request, 'preflight', preflightEnvelope, {
+      allocation_sha256: predecessorAllocation, journal_sha256: priorTranscript, response_sha256: predecessorResponse,
+    });
+    const preflightBoundary = new EffectBoundary(preflightEnvelope, preflight.receiptPath);
+    const stored = await withEffectBoundary(preflightBoundary, async () => this.campaignStore.read());
+    const commandEnvelope = await fixturePhaseEnvelope(this.envelope, 'command', request, kind, stored, this.now());
+    assertAllocated(commandEnvelope, effect);
+    const command = sealFixturePhase(this.options.ledgerPath, request, 'command', commandEnvelope, {
+      allocation_sha256: preflight.allocationSha256,
+      journal_sha256: sha(fs.readFileSync(this.options.ledgerPath)),
+      response_sha256: sha(canonical({ stored: stored ?? null, receipt_sha256: sha(fs.readFileSync(preflight.receiptPath)) })),
+    });
+    const boundary = new EffectBoundary(commandEnvelope, command.receiptPath);
     let result: ProcessResult;
-    if (kind === 'campaign') result = await dispatchExternalEffect(effect, async () => {
+    if (kind === 'campaign') result = await withEffectBoundary(boundary, async () => dispatchExternalEffect(effect, async () => {
       assertBridgeLive(this.envelope, request.original_deadline_unix_ms, this.now);
       await this.campaignStore.read();
       assertBridgeLive(this.envelope, request.original_deadline_unix_ms, this.now);
       return callCampaignMain(this.options, request, this.campaignStore);
-    });
-    else result = await dispatchExternalEffect(effect, async () => {
+    }));
+    else result = await withEffectBoundary(boundary, async () => dispatchExternalEffect(effect, async () => {
       assertBridgeLive(this.envelope, request.original_deadline_unix_ms, this.now);
       await this.campaignStore.read();
       assertBridgeLive(this.envelope, request.original_deadline_unix_ms, this.now);
@@ -583,14 +812,16 @@ export class FixtureCommandDispatcher {
         request.stdin === null ? undefined : Buffer.from(request.stdin),
         Math.min(request.remaining_timeout_ms, request.original_deadline_unix_ms - this.now()),
         request.current_dir ?? this.options.rootDirectory);
-    });
+    }));
     assertBridgeLive(this.envelope, request.original_deadline_unix_ms, this.now);
     if (!Number.isSafeInteger(result.returncode) || result.stdout.length > MAX_OUTPUT || result.stderr.length > MAX_OUTPUT)
       throw new Error('Fixture command result is invalid or oversized; outcome is not reusable.');
     if (kind === 'campaign') {
       const inventory = JSON.parse(request.stdin!) as RunInventory; publishReceipt(result.stdout, inventory);
-      const stored = await this.campaignStore.read();
-      if (!stored || !equal(stored.state.runInventory, inventory)) throw new Error('Campaign store readback does not match the actual published inventory.');
+      const confirmed = await withEffectBoundary(boundary, async () => this.campaignStore.read());
+      if (!confirmed || !equal(confirmed.state.runInventory, inventory))
+        throw new Error('Campaign store readback does not match the actual published inventory.');
+      this.lastPublishedStored = confirmed;
     }
     const response: FixtureCommandResponse = { schema_version: 1, kind: 'command_response', request_id: request.request_id,
       request_sha256: request.request_sha256, exit_code: result.returncode, stdout: result.stdout, stderr: result.stderr, truncated: false };
@@ -625,7 +856,7 @@ export class FixtureCommandDispatcher {
     const created: Obj[] = [];
     for (const request of this.seen.values()) if (request.executable.endsWith('kubectl') && request.argv.includes('create')) {
       const response = this.responses.get(request.request_id); if (!response || response.exit_code !== 0) throw new Error('Fixture create response is incomplete.');
-      for (const resource of parseJsonValues(response.stdout)) { if (!object(resource)) throw new Error('Fixture create response is not a resource object.'); created.push(resource); }
+      created.push(...fixtureCreatedResources(response.stdout));
     }
     const namespace = created.find(resource => resource.kind === 'Namespace' && object(resource.metadata) && resource.metadata.name === receipt.inventory.namespace.name);
     if (!namespace || !equal(namespace, receipt.namespace_response) || !object(namespace.metadata) ||
@@ -676,8 +907,8 @@ export class FixtureCommandDispatcher {
           namespaceMetadata[field]['arrowcol-oat/owner-token'] === this.options.input.authority.owner_id))
       throw new Error('Fixture namespace readback differs from its original create identity.');
     assertBridgeLive(this.envelope, this.options.input.original_deadline_unix_ms, this.now);
-    const stored = await this.campaignStore.read();
-    if (!stored || !equal(stored.state.runInventory, receipt.inventory)) throw new Error('Fixture final inventory differs from the durable campaign store.');
+    if (!this.lastPublishedStored || !equal(this.lastPublishedStored.state.runInventory, receipt.inventory))
+      throw new Error('Fixture final inventory differs from the durable campaign store.');
     return receipt;
   }
 }
