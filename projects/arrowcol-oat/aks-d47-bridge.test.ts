@@ -96,6 +96,16 @@ function signedControlRequest(authority: StorageBridgeAuthority, deadline: numbe
   return { ...unsigned, request_sha256: sha(canonical(unsigned)) };
 }
 
+function signedObjectRequest(authority: StorageBridgeAuthority, deadline: number, requestId: number, method: string, url: string, body = ''): StorageBridgeRequest {
+  const unsigned = { schema_version: 1 as const, kind: 'storage_http_request' as const, request_id: requestId, authority,
+    original_deadline_unix_ms: deadline, remaining_timeout_ms: 10_000, target: 'object_store' as const, method, url,
+    headers: [['date', new Date(deadline - 30_000).toUTCString()], ['x-ms-version', '2023-11-03'],
+      ['user-agent', 'arrowcol-qap/' + authority.cell_run_id + '/owned-run-table-initialization'],
+      ['x-ms-client-request-id', 'c0ffee00-0000-4000-8000-' + String(requestId).padStart(12, '0')]] as [string, string][],
+    body, body_sha256: sha(body) };
+  return { ...unsigned, request_sha256: sha(canonical(unsigned)) };
+}
+
 function envelopeForRequests(authority: StorageBridgeAuthority, requests: StorageBridgeRequest[]): EffectEnvelope {
   const effects = requests.map((request, index) => {
     const stableHeaders = request.headers.filter(([name]) => !['x-ms-client-request-id', 'date', 'x-ms-date'].includes(name.toLowerCase()));
@@ -358,7 +368,7 @@ test('StorageBridge revalidates current custody after token preparation before a
   assert.equal(reply.outcome, 'unknown');
   assert.equal(fetches, 0);
 });
-test('planned control identities admit the exact 11-operation registration and clean-release trace', async t => {
+test('planned control identities admit the exact 13-operation admission, create and clean-release trace', async t => {
   const directory = mkdtempSync(path.join(os.tmpdir(), 'oat-d47-planned-ids-'));
   chmodSync(directory, 0o700);
   t.after(() => rmSync(directory, { recursive: true, force: true }));
@@ -391,11 +401,11 @@ test('planned control identities admit the exact 11-operation registration and c
   };
   const requests = [read(1, 0), request(2, 1, 'acquire', leaseIds[0]), read(3, 2),
     request(4, 3, 'metadata', leaseIds[0], 'active'), request(5, 4, 'release', leaseIds[0]), read(6, 5), read(7, 6),
-    request(8, 7, 'acquire', leaseIds[1]), read(9, 8), request(10, 9, 'metadata', leaseIds[1], 'removed'),
-    request(11, 10, 'release', leaseIds[1])];
+    read(8, 7), read(9, 8), request(10, 9, 'acquire', leaseIds[1]), read(11, 10),
+    request(12, 11, 'metadata', leaseIds[1], 'removed'), request(13, 12, 'release', leaseIds[1])];
   const envelope = envelopeForRequests(authority, requests), custody = mutableCustodyStore(authority, now);
   const azure = { c: { account: authority.storage_account }, async token() { return 'offline-test-token'; } } as unknown as Azure;
-  const statuses = [200, 201, 200, 200, 200, 200, 200, 201, 200, 200, 200];
+  const statuses = [200, 201, 200, 200, 200, 200, 200, 200, 200, 201, 200, 200, 200];
   let forwards = 0;
   const dispatcher = new StorageBridgeDispatcher({ authority, originalDeadlineUnixMs: deadline, envelope, azure,
     store: custody.store, ledgerPath: path.join(directory, 'storage-ledger.jsonl'), controlPlan,
@@ -404,9 +414,12 @@ test('planned control identities admit the exact 11-operation registration and c
     fetcher: async () => new Response('', { status: statuses[forwards++]! }) });
   const boundary = new EffectBoundary(envelope, path.join(directory, 'effects.jsonl'));
   for (const item of requests) assert.equal((await withEffectBoundary(boundary, () => dispatcher.exchange(item))).outcome, 'response');
-  assert.equal(forwards, 11);
-  assert.equal(dispatcher.recordedRequestCount, 11);
+  assert.equal(forwards, 13);
+  assert.equal(dispatcher.recordedRequestCount, 13);
   assert.doesNotThrow(() => dispatcher.assertControlPlanComplete());
+  assert.throws(() => dispatcher.assertDeltaCommitReadback({ table_id: 'c0ffee00-0000-4000-8000-000000000099',
+    version: 0, schema_json: '{}', partition_columns: ['__arrowcol_ingestion'], active_files: 0 }),
+  /exactly one actual version-zero commit request/);
 });
 test('planned control dispatcher rejects missing, duplicate, unknown, reused and mutated markers before forwarding', async t => {
   const directory = mkdtempSync(path.join(os.tmpdir(), 'oat-d47-planned-refusal-'));
@@ -485,6 +498,60 @@ test('planned control restart serves an exact cached reply without forwarding ag
   await assert.rejects(withEffectBoundary(boundary, () => restarted.exchange(acquire)), /recovered bridge ledger permits cached replies and bounded reads only/);
   assert.equal(forwards, 1);
 });
+test('Delta terminal proof correlates the actual accepted commit with an identical successful readback', async t => {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'oat-d47-delta-proof-'));
+  chmodSync(root, 0o700);
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const authority: StorageBridgeAuthority = {
+    campaign_id: 'c0ffee00-0000-4000-8000-000000000001', cell_run_id: 'c0ffee00-0000-4000-8000-000000000002',
+    owner_id: 'c0ffee00-0000-4000-8000-000000000003', fencing_token: 1, storage_account: 'arrowcollector68590',
+    table_root_url: 'abfss://checkpoints@arrowcollector68590.dfs.core.windows.net/campaigns/c0ffee00-0000-4000-8000-000000000001/runs/c0ffee00-0000-4000-8000-000000000002/dataflow/telemetry/sqlserver/sqlserver_availability_replica_states/',
+    control_container_url: 'https://arrowcollector68590.blob.core.windows.net/checkpoints', sandbox_id: 'offline-stamp',
+    reset_generation: 'c0ffee00-0000-4000-8000-000000000004',
+  };
+  const now = Date.now(), deadline = now + 60_000, tableId = 'c0ffee00-0000-4000-8000-000000000014';
+  const schemaJson = JSON.stringify({ type: 'struct', fields: [{ name: '__arrowcol_ingestion', type: 'string', nullable: false, metadata: {} }] });
+  const body = JSON.stringify({ metaData: { id: tableId, schemaString: schemaJson, partitionColumns: ['__arrowcol_ingestion'] } }) + '\n';
+  const url = `https://${authority.storage_account}.blob.core.windows.net/checkpoints${new URL(authority.table_root_url).pathname}_delta_log/00000000000000000000.json`;
+  const makeDispatcher = (statuses: number[], includeReadback: boolean) => {
+    const directory = mkdtempSync(path.join(root, 'case-'));
+    chmodSync(directory, 0o700);
+    const rawCommit = signedObjectRequest(authority, deadline, 1, 'PUT', url, body);
+    const commit = resignRequest(rawCommit, [...rawCommit.headers, ['if-none-match', '*'], ['content-type', 'application/json']]);
+    const readback = signedObjectRequest(authority, deadline, 2, 'GET', url);
+    const requests = includeReadback ? [commit, readback] : [commit];
+    const envelope = envelopeForRequests(authority, requests), custody = mutableCustodyStore(authority, now);
+    const azure = { c: { account: authority.storage_account }, async token() { return 'offline-test-token'; } } as unknown as Azure;
+    let forwarded = 0;
+    const dispatcher = new StorageBridgeDispatcher({ authority, originalDeadlineUnixMs: deadline, envelope, azure,
+      store: custody.store, ledgerPath: path.join(directory, 'storage-ledger.jsonl'),
+      fetcher: async () => {
+        const status = statuses[forwarded++];
+        if (status === undefined) throw new Error('Unexpected provider request.');
+        return new Response(status === 200 && forwarded > 1 ? body : null, { status });
+      } });
+    const boundary = new EffectBoundary(envelope, path.join(directory, 'effects.jsonl'));
+    return { dispatcher, boundary, requests };
+  };
+  const expected = { table_id: tableId, version: 0, schema_json: schemaJson,
+    partition_columns: ['__arrowcol_ingestion'], active_files: 0 };
+  const success = makeDispatcher([201, 200], true);
+  for (const request of success.requests)
+    assert.equal((await withEffectBoundary(success.boundary, () => success.dispatcher.exchange(request))).outcome, 'response');
+  assert.doesNotThrow(() => success.dispatcher.assertDeltaCommitReadback(expected));
+  assert.throws(() => success.dispatcher.assertDeltaCommitReadback({ ...expected,
+    table_id: 'c0ffee00-0000-4000-8000-000000000099' }), /differs from the actual committed table identity/);
+  assert.throws(() => success.dispatcher.assertDeltaCommitReadback({ ...expected,
+    schema_json: JSON.stringify({ type: 'struct', fields: [] }) }), /differs from the actual committed table identity/);
+  const incomplete = makeDispatcher([201], false);
+  await withEffectBoundary(incomplete.boundary, () => incomplete.dispatcher.exchange(incomplete.requests[0]));
+  assert.throws(() => incomplete.dispatcher.assertDeltaCommitReadback(expected), /missing the actual version-zero log readback/);
+  const failedReadback = makeDispatcher([201, 503], true);
+  for (const request of failedReadback.requests)
+    await withEffectBoundary(failedReadback.boundary, () => failedReadback.dispatcher.exchange(request));
+  assert.throws(() => failedReadback.dispatcher.assertDeltaCommitReadback(expected), /readback is incomplete, failed or differs/);
+});
+
 test('real loadgen initializer composes with the Node BR3 planned-identity parent', { skip: !process.env.OAT_BR3_LOADGEN_BIN }, async t => {
   const executable = process.env.OAT_BR3_LOADGEN_BIN!;
   const directory = mkdtempSync(path.join(os.tmpdir(), 'oat-d47-real-composition-'));
@@ -510,36 +577,58 @@ test('real loadgen initializer composes with the Node BR3 planned-identity paren
   const planPath = path.join(directory, 'plan.json'), bridgeInputPath = path.join(directory, 'bridge-input.json');
   writeFileSync(planPath, JSON.stringify(plan)); chmodSync(planPath, 0o600);
   writeFileSync(bridgeInputPath, JSON.stringify({ authority, original_deadline_unix_ms: deadline })); chmodSync(bridgeInputPath, 0o600);
-  const firstHead = signedControlRequest(authority, deadline, 1,
-    authority.control_container_url + '?restype=container', [], 'HEAD');
-  const acquire = signedControlRequest(authority, deadline, 2,
-    authority.control_container_url + '?comp=lease&restype=container',
-    [['x-ms-lease-action', 'acquire'], ['x-ms-lease-duration', '15'], ['x-ms-proposed-lease-id', controlLeaseIds[0]]]);
-  const secondHead = signedControlRequest(authority, deadline, 3,
-    authority.control_container_url + '?restype=container', [], 'HEAD');
-  const envelope = envelopeForRequests(authority, [firstHead, acquire, secondHead]);
+  const controlBase = authority.control_container_url;
+  const controlLeaseUrl = controlBase + '?comp=lease&restype=container';
+  const controlMetadataUrl = controlBase + '?restype=container&comp=metadata';
+  const controlRead = (id: number, index: number) => signedControlRequest(authority, deadline, id,
+    controlBase + '?restype=container', [], 'HEAD', PLANNED_CONTROL_OPERATION_IDS[index]);
+  const controlAcquire = (id: number, index: number, leaseId: string) => signedControlRequest(authority, deadline, id,
+    controlLeaseUrl, [['x-ms-lease-action', 'acquire'], ['x-ms-lease-duration', '15'], ['x-ms-proposed-lease-id', leaseId]],
+    'PUT', PLANNED_CONTROL_OPERATION_IDS[index]);
+  const controlRelease = (id: number, index: number, leaseId: string) => signedControlRequest(authority, deadline, id,
+    controlLeaseUrl, [['x-ms-lease-action', 'release'], ['x-ms-lease-id', leaseId]], 'PUT', PLANNED_CONTROL_OPERATION_IDS[index]);
+  const controlMetadata = (id: number, index: number, leaseId: string, registry: string) => signedControlRequest(authority, deadline, id,
+    controlMetadataUrl, [['x-ms-lease-id', leaseId], ['x-ms-meta-occupancy', 'released'],
+      ['x-ms-meta-publisherregistryversion', '1'], ['x-ms-meta-publishers', registry],
+      ['x-ms-meta-resetgeneration', generation], ['x-ms-meta-resetstate', 'ready-v1'], ['x-ms-meta-sandboxid', 'offline-stamp']],
+    'PUT', PLANNED_CONTROL_OPERATION_IDS[index]);
+  const activeRegistry = JSON.stringify({ [publisherId]: { generation, state: 'active' } });
+  const controlRequests = [controlRead(1, 0), controlAcquire(2, 1, controlLeaseIds[0]), controlRead(3, 2),
+    controlMetadata(4, 3, controlLeaseIds[0], activeRegistry), controlRelease(5, 4, controlLeaseIds[0]), controlRead(6, 5),
+    controlRead(7, 6), controlRead(8, 7), controlAcquire(9, 8, controlLeaseIds[1]), controlRead(10, 9),
+    controlMetadata(11, 10, controlLeaseIds[1], '{}'), controlRelease(12, 11, controlLeaseIds[1])];
+  const listPrefix = new URL(authority.table_root_url).pathname.slice(1);
+  const listUrl = controlBase + '?restype=container&comp=list&prefix=' + encodeURIComponent(listPrefix);
+  const initialListing = signedObjectRequest(authority, deadline, 7, 'GET', listUrl);
+  const deltaLogPrefix = listPrefix + '_delta_log/';
+  const logListingUrl = controlBase + '?restype=container&comp=list&prefix=' + encodeURIComponent(deltaLogPrefix) +
+    '&startFrom=' + encodeURIComponent(deltaLogPrefix.slice(0, -1));
+  const logListing = signedObjectRequest(authority, deadline, 8, 'GET', logListingUrl);
+  const envelope = envelopeForRequests(authority, [...controlRequests, initialListing, logListing]);
   const custody = mutableCustodyStore(authority, now);
   const azure = { c: { account }, async token() { return 'offline-test-token'; } } as unknown as Azure;
   const ledgerPath = path.join(directory, 'storage-ledger.jsonl');
-  const options = { executable, artifactIdentity: { source_commit: '2d329ab907f15c8123a08b933c01d98670bfd755',
-    executable_sha256: createHash('sha256').update(readFileSync(executable)).digest('hex') }, planPath, bridgeInputPath,
+  let publisherRegistry = '{}';
+  const options = { executable, planPath, bridgeInputPath,
     ledgerPath, rootDirectory: process.cwd(), envelope, store: custody.store, azure,
     fetcher: async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = new URL(String(input)), headers = new Headers(init?.headers);
-      if (init?.method === 'HEAD') return new Response(null, { status: 200, headers: { etag: '\"offline-etag\"',
+      if (init?.method === 'HEAD') return new Response(null, { status: 200, headers: { etag: '"offline-etag"',
         'x-ms-meta-sandboxid': 'offline-stamp', 'x-ms-meta-resetstate': 'ready-v1', 'x-ms-meta-resetgeneration': generation,
-        'x-ms-meta-publisherregistryversion': '1', 'x-ms-meta-publishers': '{}', 'x-ms-meta-occupancy': 'released' } });
+        'x-ms-meta-publisherregistryversion': '1', 'x-ms-meta-publishers': publisherRegistry,
+        'x-ms-meta-occupancy': 'released' } });
       if (url.searchParams.get('comp') === 'lease' && headers.get('x-ms-lease-action') === 'acquire')
         return new Response(null, { status: 201, headers: { 'x-ms-lease-id': headers.get('x-ms-proposed-lease-id')! } });
-      if (init?.method === 'PUT') return new Response(null, { status: 200 });
+      if (url.searchParams.get('comp') === 'metadata' && init?.method === 'PUT') {
+        publisherRegistry = headers.get('x-ms-meta-publishers') ?? '{}';
+        return new Response(null, { status: 200 });
+      }
+      if (url.searchParams.get('comp') === 'lease' && headers.get('x-ms-lease-action') === 'release') return new Response(null, { status: 200 });
+      if (url.searchParams.get('comp') === 'list') return new Response(
+        '<?xml version="1.0" encoding="utf-8"?><EnumerationResults><Blobs></Blobs><NextMarker></NextMarker></EnumerationResults>',
+        { status: 200, headers: { 'content-type': 'application/xml' } });
       return new Response('', { status: 500 });
     }, now: Date.now };
   const boundary = new EffectBoundary(envelope, path.join(directory, 'effects.jsonl'));
-  if (process.env.OAT_BR3_DISCOVER === '1') {
-    try { await withEffectBoundary(boundary, () => initializeOwnedRunTable(options)); }
-    catch (error) { console.log('BR3_DISCOVERY_ERROR', String(error)); }
-    console.log('BR3_DISCOVERY_LEDGER', readFileSync(ledgerPath, 'utf8'));
-    return;
-  }
   await withEffectBoundary(boundary, () => initializeOwnedRunTable(options));
 });

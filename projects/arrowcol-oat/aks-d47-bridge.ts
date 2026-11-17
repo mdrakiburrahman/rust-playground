@@ -16,8 +16,8 @@ const STORAGE_RESOURCE = 'https://storage.azure.com/';
 const VOLATILE_STORAGE_EFFECT_HEADERS = new Set(['x-ms-client-request-id', 'date', 'x-ms-date']);
 export const PLANNED_CONTROL_OPERATION_IDS = [
   'registration-read', 'registration-acquire', 'registration-compare-read', 'registration-metadata-write',
-  'registration-release', 'commit-authority-read', 'terminal-read', 'terminal-acquire', 'terminal-compare-read',
-  'terminal-metadata-write', 'terminal-release',
+  'registration-release', 'open-publisher-check', 'commit-authority-read', 'terminal-read', 'schema-commit-authority-read',
+  'terminal-acquire', 'terminal-compare-read', 'terminal-metadata-write', 'terminal-release',
 ] as const;
 type Obj = Record<string, unknown>;
 
@@ -184,7 +184,7 @@ function storageAuthority(value: unknown): asserts value is StorageBridgeAuthori
 interface LedgerBinding { schema_version: 1; kind: 'binding'; scope: string; authority_sha256: string;
   original_deadline_unix_ms: number; phase: string; plan_sha256: string; allocation_sha256: string }
 interface StorageLedgerRequest { target: 'control' | 'object_store'; method: string; url: string;
-  headers: [string, string][]; body_sha256: string }
+  headers: [string, string][]; body: string; body_sha256: string }
 interface LedgerRecord { schema_version: 1; scope: string; authority_sha256: string; request_id: number;
   request_sha256: string; state: 'pending' | 'response'; request_evidence?: StorageLedgerRequest;
   response?: unknown; response_sha256?: string }
@@ -332,6 +332,14 @@ class DurableBridgeLedger {
       .filter(record => record.request_evidence?.target === 'control')
       .map(record => record.request_evidence!.headers.filter(([name]) => name.toLowerCase() === 'x-arrowcol-operation-id')
         .map(([, value]) => value));
+  }
+  storageTranscript(): Array<{ requestId: number; requestSha256: string; request: StorageLedgerRequest; response: unknown }> {
+    return [...this.records.values()].sort((left, right) => left.request_id - right.request_id).map(record => {
+      if (record.state !== 'response' || !record.request_evidence)
+        throw new Error('Delta terminal proof requires every durable storage exchange to have a response.');
+      return { requestId: record.request_id, requestSha256: record.request_sha256, request: record.request_evidence,
+        response: record.response };
+    });
   }
   get requestCount(): number { return this.maxId; }
 }
@@ -659,10 +667,11 @@ function validateStorageEffectHeaders(headers: [string, string][], now: number):
   }
 }
 function validateStorageLedgerRequest(value: unknown): asserts value is StorageLedgerRequest {
-  if (!object(value) || !exact(value, ['target', 'method', 'url', 'headers', 'body_sha256']) ||
+  if (!object(value) || !exact(value, ['target', 'method', 'url', 'headers', 'body', 'body_sha256']) ||
       !['control', 'object_store'].includes(String(value.target)) || typeof value.method !== 'string' ||
-      !/^[A-Z]+$/.test(value.method) || typeof value.url !== 'string' || typeof value.body_sha256 !== 'string' ||
-      !/^[0-9a-f]{64}$/.test(value.body_sha256) || !Array.isArray(value.headers) ||
+      !/^[A-Z]+$/.test(value.method) || typeof value.url !== 'string' || typeof value.body !== 'string' ||
+      Buffer.byteLength(value.body) > MAX_STORAGE_BODY || typeof value.body_sha256 !== 'string' ||
+      !/^[0-9a-f]{64}$/.test(value.body_sha256) || sha(value.body) !== value.body_sha256 || !Array.isArray(value.headers) ||
       value.headers.some(pair => !Array.isArray(pair) || pair.length !== 2 || pair.some(part => typeof part !== 'string')))
     throw new Error('Bridge ledger raw storage request evidence is malformed.');
   const seen = new Set<string>();
@@ -769,6 +778,55 @@ export class StorageBridgeDispatcher {
         this.controlProgress.operationIndex !== this.options.controlPlan.control_operation_ids.length))
       throw new Error('Owned-run initializer did not consume the exact planned control-operation trace through clean release.');
   }
+  assertDeltaCommitReadback(delta: { table_id: string; version: number; schema_json: string;
+    partition_columns: string[]; active_files: number }): void {
+    const transcript = this.ledger.storageTranscript();
+    const tableRoot = new URL(this.options.authority.table_root_url);
+    const logUrl = `https://${this.options.authority.storage_account}.blob.core.windows.net/${tableRoot.username}${tableRoot.pathname}_delta_log/00000000000000000000.json`;
+    const commits = transcript.map((entry, index) => ({ ...entry, index })).filter(entry =>
+      entry.request.target === 'object_store' && entry.request.method === 'PUT' && entry.request.url === logUrl);
+    if (commits.length !== 1) throw new Error('Delta terminal proof requires exactly one actual version-zero commit request.');
+    const commit = commits[0]!;
+    const commitReply = this.validateTranscriptResponse(commit);
+    if (commitReply.status !== 201) throw new Error('Delta version-zero commit was not accepted by the forwarded provider response.');
+    const actions = parseJsonValues(commit.request.body);
+    const metadata = actions.filter((action): action is Obj => object(action) && object(action.metaData)).map(action => action.metaData as Obj);
+    if (metadata.length !== 1 || typeof metadata[0]!.id !== 'string' || typeof metadata[0]!.schemaString !== 'string' ||
+        !Array.isArray(metadata[0]!.partitionColumns))
+      throw new Error('Actual Delta commit does not contain one complete table metadata action.');
+    const committed = metadata[0]!;
+    if (committed.id !== delta.table_id || committed.schemaString !== delta.schema_json ||
+        !equal(committed.partitionColumns, [OWNED_RUN_PARTITION]) || delta.version !== 0 || delta.active_files !== 0 ||
+        !equal(delta.partition_columns, committed.partitionColumns))
+      throw new Error('Delta terminal receipt differs from the actual committed table identity, schema, version or partition.');
+    let committedSchema: unknown;
+    try { committedSchema = JSON.parse(String(committed.schemaString)) as unknown; }
+    catch { throw new Error('Actual Delta commit schema is invalid JSON.'); }
+    if (!object(committedSchema) || !Array.isArray(committedSchema.fields) ||
+        !committedSchema.fields.some(field => object(field) && field.name === OWNED_RUN_PARTITION &&
+          field.type === 'string' && field.nullable === false))
+      throw new Error('Actual Delta commit omits the exact ingestion partition column.');
+    const readbacks = transcript.map((entry, index) => ({ ...entry, index })).filter(entry => entry.index > commit.index && entry.request.target === 'object_store' &&
+      entry.request.method === 'GET' && entry.request.url === logUrl);
+    if (readbacks.length === 0) throw new Error('Delta terminal proof is missing the actual version-zero log readback.');
+    for (const readback of readbacks) {
+      const response = this.validateTranscriptResponse(readback);
+      if (response.status !== 200 || response.body !== commit.request.body)
+        throw new Error('Delta version-zero readback is incomplete, failed or differs from the committed bytes.');
+    }
+  }
+  private validateTranscriptResponse(entry: { requestId: number; requestSha256: string; response: unknown }):
+    { status: number; body: string } {
+    const value = entry.response;
+    if (!object(value) || !exact(value, ['schema_version','kind','request_id','request_sha256','outcome','status','headers','body','body_sha256','truncated']) ||
+        value.schema_version !== 1 || value.kind !== 'storage_http_response' || value.request_id !== entry.requestId ||
+        value.request_sha256 !== entry.requestSha256 || value.outcome !== 'response' || !Number.isInteger(value.status) ||
+        Number(value.status) < 100 || Number(value.status) > 599 || typeof value.body !== 'string' ||
+        value.body_sha256 !== sha(value.body) || value.truncated !== false || !Array.isArray(value.headers) ||
+        value.headers.some(pair => !Array.isArray(pair) || pair.length !== 2 || pair.some(part => typeof part !== 'string')))
+      throw new Error('Delta terminal proof encountered an invalid or non-response durable storage record.');
+    return { status: Number(value.status), body: value.body };
+  }
   private plannedControlStep(request: StorageBridgeRequest): PlannedControlStep | undefined {
     const plan = this.options.controlPlan, progress = this.controlProgress;
     const marker = singleHeader(request.headers, 'x-arrowcol-operation-id');
@@ -780,34 +838,38 @@ export class StorageBridgeDispatcher {
       throw new Error('A recovered bridge ledger permits cached replies and bounded reads only; mutating replay is forbidden.');
     if (request.target === 'object_store') {
       if (marker !== undefined) throw new Error('Control-operation markers are not valid on object-store requests.');
-      if (!progress.registered || progress.stage !== 1 || progress.phase !== 'acquire' || progress.operationIndex !== 6)
-        throw new Error('Object-store effects require the exact planned publisher registration before terminal drain.');
+      const url = new URL(request.url);
+      const listing = request.method === 'GET' && url.searchParams.get('comp') === 'list' && [6, 7].includes(progress.operationIndex);
+      const terminalLog = request.method === 'PUT' || request.method === 'GET' && url.pathname.endsWith('/_delta_log/00000000000000000000.json');
+      const commitOrReadback = terminalLog && progress.operationIndex === 8;
+      if (!progress.registered || progress.stage !== 1 || progress.phase !== 'acquire' || !(listing || commitOrReadback))
+        throw new Error(`Object-store ${request.method} ${url.href} is outside the registered phase at operation ${progress.operationIndex}.`);
       return undefined;
     }
     const index = progress.operationIndex, expectedMarker = plan.control_operation_ids[index];
     if (expectedMarker === undefined || marker !== expectedMarker)
       throw new Error('Control request is missing, reuses, reorders or substitutes its exact planned operation marker.');
     const url = new URL(request.url), leaseId = plan.control_lease_ids[progress.stage];
-    const expectedRead = [0, 2, 5, 6, 8].includes(index);
+    const expectedRead = [0, 2, 5, 6, 7, 8, 10].includes(index);
     if (expectedRead) {
       const expectedState = index === 0 ? progress.stage === 0 && progress.phase === 'acquire' && !progress.registered :
         index === 2 ? progress.stage === 0 && progress.phase === 'metadata' && !progress.registered :
-        index === 5 || index === 6 ? progress.stage === 1 && progress.phase === 'acquire' && progress.registered :
+        index === 5 || index === 6 || index === 7 || index === 8 ? progress.stage === 1 && progress.phase === 'acquire' && progress.registered :
         progress.stage === 1 && progress.phase === 'metadata' && progress.registered;
       if (request.method !== 'HEAD' || url.searchParams.size !== 1 || url.searchParams.get('restype') !== 'container' || !expectedState)
         throw new Error('Planned control read does not match its exact operation phase and order.');
       return { kind: 'read', stage: progress.stage };
     }
-    if (request.method !== 'PUT') throw new Error('Planned control mutation has the wrong HTTP method for its operation marker.');
+    if (request.method !== 'PUT') throw new Error('Planned control operation ' + expectedMarker + ' requires PUT, not ' + request.method + '.');
     if (url.searchParams.get('comp') === 'lease') {
       const action = singleHeader(request.headers, 'x-ms-lease-action');
-      if (action === 'acquire' && [1, 7].includes(index)) {
+      if (action === 'acquire' && [1, 9].includes(index)) {
         const proposed = singleHeader(request.headers, 'x-ms-proposed-lease-id');
         if (progress.phase !== 'acquire' || proposed !== leaseId)
           throw new Error('Control lease acquisition does not match the next immutable plan identity.');
         return { kind: 'acquire', stage: progress.stage, leaseId };
       }
-      if (action === 'release' && [4, 10].includes(index)) {
+      if (action === 'release' && [4, 12].includes(index)) {
         const supplied = singleHeader(request.headers, 'x-ms-lease-id');
         if (progress.phase !== 'release' || supplied !== leaseId)
           throw new Error('Control lease release does not match the active immutable plan identity.');
@@ -815,7 +877,7 @@ export class StorageBridgeDispatcher {
       }
       throw new Error('Planned control lease action does not match its allocated operation marker.');
     }
-    if (url.searchParams.get('comp') === 'metadata' && [3, 9].includes(index)) {
+    if (url.searchParams.get('comp') === 'metadata' && [3, 11].includes(index)) {
       const supplied = singleHeader(request.headers, 'x-ms-lease-id');
       if (progress.phase !== 'metadata' || supplied !== leaseId)
         throw new Error('Control metadata write does not match the active immutable plan identity.');
@@ -860,7 +922,7 @@ export class StorageBridgeDispatcher {
     assertBridgeLive(this.envelope, this.options.originalDeadlineUnixMs, this.now);
     await this.campaignStore.read();
     const requestEvidence: StorageLedgerRequest = { target: request.target, method: request.method, url: request.url,
-      headers: request.headers.map(([name, value]) => [name, value] as [string, string]), body_sha256: request.body_sha256 };
+      headers: request.headers.map(([name, value]) => [name, value] as [string, string]), body: request.body, body_sha256: request.body_sha256 };
     const cached = this.ledger.peek(request.request_id, request.request_sha256, requestEvidence);
     if (cached !== undefined) return cached as StorageBridgeReply;
     if (this.recoveredLedger && request.method !== 'GET' && request.method !== 'HEAD')
@@ -987,13 +1049,16 @@ export interface OwnedRunTableArtifactIdentity { source_commit: string; executab
 export interface OwnedRunTableParentReceipt { schema_version: 1; kind: 'owned_run_table_parent_receipt';
   artifact_identity: OwnedRunTableArtifactIdentity; exchange_count: number; bridge_receipt: OwnedRunTableBridgeReceipt }
 interface OwnedRunBridgeInput { authority: StorageBridgeAuthority; original_deadline_unix_ms: number }
-const APPROVED_OWNED_RUN_SOURCE = '2d329ab907f15c8123a08b933c01d98670bfd755';
+const APPROVED_OWNED_RUN_BUILD_RECEIPT: OwnedRunTableArtifactIdentity = Object.freeze({
+  source_commit: '23934d55fe2967156859ca5d3d4103f5faaaa9b5',
+  executable_sha256: '285bb1dc79e6c5531e9621a78d33a651c85135f2e25bcfbe9c2c49c78645f4cf',
+});
 const OWNED_RUN_TABLE = 'telemetry.sqlserver.sqlserver_availability_replica_states';
 const OWNED_RUN_PARTITION = '__arrowcol_ingestion';
 const OWNED_RUN_TABLE_RELATIVE_PATH = 'dataflow/telemetry/sqlserver/sqlserver_availability_replica_states/';
 export interface OwnedRunInitializerOptions extends Omit<StorageDispatcherOptions,
   'authority' | 'originalDeadlineUnixMs' | 'ledgerPath' | 'phase' | 'planIdentity'> {
-  executable: string; artifactIdentity: OwnedRunTableArtifactIdentity; planPath: string; bridgeInputPath: string;
+  executable: string; planPath: string; bridgeInputPath: string;
   ledgerPath: string; rootDirectory: string; now?: () => number
 }
 function validateOwnedRunTablePlan(value: unknown): asserts value is OwnedRunTablePlan {
@@ -1068,18 +1133,14 @@ function validateOwnedRunBridgeInput(value: unknown, plan: OwnedRunTablePlan, no
       value.authority.control_container_url !== `https://${plan.account}.blob.core.windows.net/${plan.container}`)
     throw new Error('Owned-run bridge authority differs from the exact selected one-table allocation.');
 }
-function validateOwnedRunArtifact(executable: string, identity: OwnedRunTableArtifactIdentity): OwnedRunTableArtifactIdentity {
-  if (!object(identity) || !exact(identity, ['source_commit','executable_sha256']) ||
-      identity.source_commit !== APPROVED_OWNED_RUN_SOURCE || typeof identity.executable_sha256 !== 'string' ||
-      !/^[0-9a-f]{64}$/.test(identity.executable_sha256))
-    throw new Error('Owned-run initializer artifact identity is not the approved integrated source.');
+function validateOwnedRunArtifact(executable: string): OwnedRunTableArtifactIdentity {
   const stat = fs.lstatSync(executable);
   if (!stat.isFile() || stat.isSymbolicLink() || stat.size === 0 || stat.size > 512 * 1024 * 1024)
     throw new Error('Owned-run initializer executable must be a bounded regular non-symlink file.');
   fs.accessSync(executable, fs.constants.X_OK);
-  if (sha(fs.readFileSync(executable)) !== identity.executable_sha256)
-    throw new Error('Owned-run initializer executable does not match its pinned build identity.');
-  return identity;
+  if (sha(fs.readFileSync(executable)) !== APPROVED_OWNED_RUN_BUILD_RECEIPT.executable_sha256)
+    throw new Error('Owned-run initializer executable does not match the pinned reviewed build receipt.');
+  return APPROVED_OWNED_RUN_BUILD_RECEIPT;
 }
 function validateOwnedRunReceipt(value: unknown, plan: OwnedRunTablePlan, authority: StorageBridgeAuthority,
   deadline: number): asserts value is OwnedRunTableBridgeReceipt {
@@ -1118,7 +1179,7 @@ export async function initializeOwnedRunTable(options: OwnedRunInitializerOption
   if (options.envelope.campaign_id !== plan.campaign_id || options.envelope.run_id !== plan.run_id ||
       options.envelope.storage_account !== plan.account || options.azure.c.account !== plan.account)
     throw new Error('Owned-run initializer does not match the exact active effect envelope and selected stamp.');
-  const artifactIdentity = validateOwnedRunArtifact(options.executable, options.artifactIdentity);
+  const artifactIdentity = validateOwnedRunArtifact(options.executable);
   const dispatcher = new StorageBridgeDispatcher({ authority, originalDeadlineUnixMs: deadline, envelope: options.envelope,
     azure: options.azure, store: options.store, ledgerPath: options.ledgerPath, phase: 'owned-run-table-initialization',
     planIdentity: { plan, artifact_identity: artifactIdentity },
@@ -1128,6 +1189,7 @@ export async function initializeOwnedRunTable(options: OwnedRunInitializerOption
   const cached = dispatcher.terminalEvidence();
   if (cached !== undefined) {
     validateOwnedRunParentReceipt(cached, artifactIdentity, plan, authority, deadline, dispatcher.recordedRequestCount);
+    dispatcher.assertDeltaCommitReadback(cached.bridge_receipt.receipt.delta);
     return cached;
   }
   assertBridgeLive(options.envelope, deadline, now);
@@ -1140,6 +1202,7 @@ export async function initializeOwnedRunTable(options: OwnedRunInitializerOption
   if (child.exchangeCount !== dispatcher.recordedRequestCount)
     throw new Error('Owned-run child exchanges are not a one-to-one match for the retained durable transcript.');
   dispatcher.assertControlPlanComplete();
+  dispatcher.assertDeltaCommitReadback(child.receipt.receipt.delta);
   const result: OwnedRunTableParentReceipt = { schema_version: 1, kind: 'owned_run_table_parent_receipt',
     artifact_identity: artifactIdentity, exchange_count: child.exchangeCount, bridge_receipt: child.receipt };
   validateOwnedRunParentReceipt(result, artifactIdentity, plan, authority, deadline, dispatcher.recordedRequestCount);
