@@ -546,6 +546,7 @@ struct LogicalBatchRange {
 struct LogicalBatch {
     batch: EncodedBatch,
     manifest_index: Option<usize>,
+    _live_batch_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 struct Counters {
@@ -793,6 +794,8 @@ impl Measurement {
             "completed_rows": self.rows.load(Ordering::Relaxed),
             "completed_bytes": self.bytes.load(Ordering::Relaxed),
             "completed_wire_bytes": self.bytes.load(Ordering::Relaxed),
+            "completed_flight_data_bytes_configured_ipc_compression": self.bytes.load(Ordering::Relaxed),
+            "completed_flight_data_bytes_uncompressed": self.raw_arrow_bytes.load(Ordering::Relaxed),
             "completed_raw_arrow_bytes": self.raw_arrow_bytes.load(Ordering::Relaxed),
             "worker_completed_rows": self.worker_rows.iter().map(|value| value.load(Ordering::Relaxed)).collect::<Vec<_>>(),
             "pilot_window_rows": self.pilot_rows.iter().map(|value| value.load(Ordering::Relaxed)).collect::<Vec<_>>(),
@@ -803,6 +806,8 @@ impl Measurement {
                 serde_json::json!({
                     "start_unix_ms": start_unix_ms, "end_unix_ms": end_unix_ms,
                     "completed_rows": self.pilot_rows[index].load(Ordering::Relaxed),
+                    "completed_flight_data_bytes_uncompressed": self.raw_window_bytes[index].load(Ordering::Relaxed),
+                    "completed_flight_data_bytes_configured_ipc_compression": self.wire_window_bytes[index].load(Ordering::Relaxed),
                     "completed_raw_arrow_bytes": self.raw_window_bytes[index].load(Ordering::Relaxed),
                     "completed_wire_bytes": self.wire_window_bytes[index].load(Ordering::Relaxed),
                     "send_latency_us": latency_percentiles(&latency),
@@ -887,6 +892,7 @@ pub struct PreparedClient {
     pub options: Options,
     corpus: Vec<Arc<Vec<EncodedBatch>>>,
     channels: Vec<Vec<Channel>>,
+    live_batch_slots: Arc<tokio::sync::Semaphore>,
     signer: Option<EdgeRequestSigner>,
     counters: Vec<Counters>,
     next: AtomicU64,
@@ -947,12 +953,7 @@ impl PreparedClient {
             options.max_rows == 0 || options.max_rows >= rows.min(options.batch_rows) as u64,
             "max-rows must fit at least one complete corpus batch"
         );
-        let estimate = memory_estimate(&tables, rows, row_bytes, copies, &options)?;
-        anyhow::ensure!(
-            estimate <= options.max_memory_bytes,
-            "corpus needs a conservative {estimate} bytes including encoding scratch, exceeding max-memory-bytes={}",
-            options.max_memory_bytes
-        );
+        let memory = memory_budget(&tables, client_id, rows, row_bytes, copies, &options)?;
         for table in &tables {
             for field in table.schema.fields() {
                 if field.data_type() == &DataType::Utf8 {
@@ -1026,8 +1027,8 @@ impl PreparedClient {
                         .checked_add(wire_bytes)
                         .context("encoded corpus size overflow")?;
                     anyhow::ensure!(
-                        encoded_bytes <= options.max_memory_bytes,
-                        "encoded corpus exceeded max-memory-bytes"
+                        encoded_bytes <= memory.corpus_bytes,
+                        "encoded corpus exceeded its reserved corpus-memory budget"
                     );
                     batches.push(EncodedBatch {
                         table: Arc::clone(table),
@@ -1052,10 +1053,18 @@ impl PreparedClient {
         }
         let preparation = serde_json::json!({
             "corpus_rows": rows as u64 * table_count as u64 * copies as u64,
+            "corpus_uncompressed_flight_data_bytes": raw_arrow_bytes_total,
+            "corpus_configured_ipc_compression_flight_data_bytes": encoded_bytes,
             "corpus_uncompressed_ipc_bytes": raw_arrow_bytes_total,
             "corpus_encoded_bytes": encoded_bytes,
             "retained_encoded_bytes": encoded_bytes,
-            "memory_reservation_bytes": estimate,
+            "memory_reservation_bytes": memory.total_bytes,
+            "corpus_memory_reservation_bytes": memory.corpus_bytes,
+            "live_identity_batch_bytes": memory.per_live_batch_bytes,
+            "live_identity_batch_reservation_bytes": memory.live_batch_bytes,
+            "configured_live_slots": memory.configured_live_slots,
+            "admitted_live_slots": memory.admitted_live_slots,
+            "max_memory_bytes": options.max_memory_bytes,
             "generation_wall_seconds": generation_seconds,
             "generation_cpu_seconds": generation_cpu_seconds,
             "encoding_cpu_seconds": encoding_cpu_seconds,
@@ -1073,6 +1082,7 @@ impl PreparedClient {
             options,
             corpus,
             channels,
+            live_batch_slots: Arc::new(tokio::sync::Semaphore::new(memory.admitted_live_slots)),
             signer,
             next: AtomicU64::new(0),
             reserved_rows: AtomicU64::new(0),
@@ -1292,7 +1302,10 @@ impl PreparedClient {
                 "identity_column": "endpoint_url",
                 "identity_format": "https://x.invalid/v1/{run_uuid_simple32}/{incarnation_uuid_simple32}/{worker_decimal}/{logical_batch_sequence_base36}/{row_ordinal_decimal}",
                 "run_uuid": self.run_id.simple().to_string(),
+                "run_uuid_source": "client_generated",
+                "oat_run_uuid": null,
                 "incarnation_uuid": self.incarnation_id.simple().to_string(),
+                "incarnation_uuid_source": "client_generated",
                 "prepared_logical_batches": records.len(),
                 "attempted_logical_batches": records.iter().filter(|record| record.attempts > 0).count(),
                 "acknowledged_logical_batches": counts[1],
@@ -1324,7 +1337,10 @@ impl PreparedClient {
                 "record_cap": MAX_LOGICAL_BATCH_RECORDS,
                 "measurement_bounds": measurement_bounds,
                 "run_uuid": self.run_id.simple().to_string(),
+                "run_uuid_source": "client_generated",
+                "oat_run_uuid": null,
                 "incarnation_uuid": self.incarnation_id.simple().to_string(),
+                "incarnation_uuid_source": "client_generated",
             }));
         }
         Ok(manifest)
@@ -1356,8 +1372,15 @@ impl PreparedClient {
             return Ok(LogicalBatch {
                 batch: template.clone(),
                 manifest_index: None,
+                _live_batch_permit: None,
             });
         }
+        let live_batch_permit = self
+            .live_batch_slots
+            .clone()
+            .acquire_owned()
+            .await
+            .context("acquire realistic live-batch memory reservation")?;
         let sequence = self.next_logical_batch_sequence(worker)?;
         let batch =
             batch_with_logical_identity(&template.template, self.run_id, self.incarnation_id, worker, sequence)?;
@@ -1381,6 +1404,7 @@ impl PreparedClient {
         Ok(LogicalBatch {
             batch: prepared,
             manifest_index: Some(manifest_index),
+            _live_batch_permit: Some(live_batch_permit),
         })
     }
 
@@ -1794,9 +1818,11 @@ impl PreparedClient {
             "completion_semantics": "validated_admission_response_not_delta_commit",
             "send_latency_scope": "request_metadata_protobuf_grpc_compression_network_and_acknowledgement_excluding_interval",
             "bytes_semantics": {
-                "raw_arrow_bytes": "uncompressed_arrow_ipc_flight_data_protobuf_encoded_lengths",
-                "wire_bytes": "configured_arrow_ipc_compression_flight_data_protobuf_encoded_lengths",
-                "exclusions": "grpc_http2"
+                "uncompressed_flight_data_bytes": "sum_of_FlightData_protobuf_encoded_lengths_before_Arrow_IPC_compression",
+                "configured_ipc_compression_flight_data_bytes": "sum_of_FlightData_protobuf_encoded_lengths_after_configured_Arrow_IPC_compression",
+                "legacy_completed_raw_arrow_bytes": "deprecated_alias_for_uncompressed_flight_data_bytes",
+                "legacy_completed_wire_bytes": "alias_for_configured_ipc_compression_flight_data_bytes",
+                "exclusions": "these_counts_are_not_logical_Arrow_buffer_bytes_and_exclude_gRPC_and_HTTP/2_framing"
             },
             "send_observation": {
                 "id_header": CLIENT_SEND_OBSERVATION_ID_HEADER,
@@ -1822,10 +1848,7 @@ impl PreparedClient {
             {
                 metrics["phase"] = serde_json::json!("failed");
             }
-            let receipt_json_bytes = serde_json::to_vec(&metrics)?.len();
-            let receipt_bytes = receipt_json_bytes
-                .checked_add(b"OAT_CLIENT_METRICS ".len() + 1)
-                .context("terminal OAT metrics line size overflow")?;
+            let receipt_bytes = oat_client_metrics_line_bytes(&metrics)?;
             if receipt_bytes > MAX_OAT_CLIENT_METRICS_LINE_BYTES {
                 self.manifest_capacity_reached.store(true, Ordering::Relaxed);
                 metrics["phase"] = serde_json::json!("failed");
@@ -1840,6 +1863,21 @@ impl PreparedClient {
                     "serialized_bytes": receipt_bytes,
                     "serialized_byte_cap": MAX_OAT_CLIENT_METRICS_LINE_BYTES,
                 });
+                let receipt_bytes_after_manifest = oat_client_metrics_line_bytes(&metrics)?;
+                if receipt_bytes_after_manifest > MAX_OAT_CLIENT_METRICS_LINE_BYTES {
+                    metrics = serde_json::json!({
+                        "version": 1,
+                        "phase": "failed",
+                        "scope": "process_cumulative",
+                        "terminal_failure": "serialized_terminal_receipt_exceeds_limit",
+                        "serialized_bytes": receipt_bytes_after_manifest,
+                        "serialized_byte_cap": MAX_OAT_CLIENT_METRICS_LINE_BYTES,
+                    });
+                    anyhow::ensure!(
+                        oat_client_metrics_line_bytes(&metrics)? <= MAX_OAT_CLIENT_METRICS_LINE_BYTES,
+                        "minimal terminal OAT metrics receipt exceeds its line-size cap"
+                    );
+                }
             }
         }
         Ok(metrics)
@@ -1944,6 +1982,129 @@ fn estimated_row_bytes(table: &DmvTable, client_id: &str, options: &Options) -> 
         .max(1)
 }
 
+#[derive(Clone, Copy, Debug)]
+struct MemoryBudget {
+    corpus_bytes: u64,
+    per_live_batch_bytes: u64,
+    live_batch_bytes: u64,
+    configured_live_slots: usize,
+    admitted_live_slots: usize,
+    total_bytes: u64,
+}
+
+fn memory_budget(
+    tables: &[DmvTable],
+    client_id: &str,
+    rows: usize,
+    row_bytes: u64,
+    copies: usize,
+    options: &Options,
+) -> Result<MemoryBudget> {
+    anyhow::ensure!(
+        rows > 0 && options.batch_rows > 0 && options.workers > 0 && options.streams_per_worker > 0,
+        "memory budgeting requires positive corpus, batch, worker, and stream counts"
+    );
+    let corpus_bytes = memory_estimate(tables, rows, row_bytes, copies, options)?;
+    let configured_live_slots = options
+        .workers
+        .checked_mul(options.streams_per_worker)
+        .context("configured live stream count overflow")?;
+    let mut budget = MemoryBudget {
+        corpus_bytes,
+        per_live_batch_bytes: 0,
+        live_batch_bytes: 0,
+        configured_live_slots,
+        admitted_live_slots: 0,
+        total_bytes: corpus_bytes,
+    };
+    if options.data_profile == DataProfile::Realistic {
+        let identity_row_bytes = tables
+            .iter()
+            .map(|table| estimated_identity_row_bytes(table, client_id, options))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .max()
+            .context("realistic profile has no tables for live-batch budgeting")?;
+        let rows_per_batch = rows.min(options.batch_rows);
+        budget.per_live_batch_bytes = memory_estimate(tables, rows_per_batch, identity_row_bytes, 1, options)?;
+        let available = options
+            .max_memory_bytes
+            .checked_sub(corpus_bytes)
+            .context("corpus reservation exceeds max-memory-bytes")?;
+        anyhow::ensure!(
+            available >= budget.per_live_batch_bytes,
+            "one realistic live batch needs {} reserved bytes beyond the {}-byte corpus reservation, exceeding max-memory-bytes={}",
+            budget.per_live_batch_bytes,
+            corpus_bytes,
+            options.max_memory_bytes
+        );
+        budget.admitted_live_slots =
+            usize::try_from((available / budget.per_live_batch_bytes).min(configured_live_slots as u64))
+                .context("admitted live-batch slot count exceeds address space")?;
+        anyhow::ensure!(
+            budget.admitted_live_slots > 0,
+            "no realistic live-batch slot fits max-memory-bytes"
+        );
+        budget.live_batch_bytes = budget
+            .per_live_batch_bytes
+            .checked_mul(budget.admitted_live_slots as u64)
+            .context("live-batch reservation overflow")?;
+        budget.total_bytes = corpus_bytes
+            .checked_add(budget.live_batch_bytes)
+            .context("total memory reservation overflow")?;
+    }
+    anyhow::ensure!(
+        budget.total_bytes <= options.max_memory_bytes,
+        "conservative workload reservation needs {} bytes, exceeding max-memory-bytes={}",
+        budget.total_bytes,
+        options.max_memory_bytes
+    );
+    Ok(budget)
+}
+
+fn estimated_identity_row_bytes(table: &DmvTable, client_id: &str, options: &Options) -> Result<u64> {
+    let identity_width = logical_identity_max_width(options)?;
+    let endpoint = table
+        .schema
+        .fields()
+        .iter()
+        .find(|field| field.name() == "endpoint_url")
+        .context("realistic logical identity requires the public endpoint_url column")?;
+    anyhow::ensure!(
+        endpoint.data_type() == &DataType::Utf8,
+        "logical identity endpoint_url column must be a nonnullable string"
+    );
+    let previous_width = match endpoint.name() {
+        "customer_id" => client_id.len(),
+        name => realistic_category_max_width(name).unwrap_or_else(|| {
+            if options.string_width == 0 {
+                name.len() + 32
+            } else {
+                options.string_width
+            }
+        }),
+    };
+    estimated_row_bytes(table, client_id, options)
+        .checked_sub(previous_width as u64 + 5)
+        .and_then(|bytes| bytes.checked_add(identity_width as u64 + 5))
+        .context("identity-bearing row memory estimate overflow")
+}
+
+fn logical_identity_max_width(options: &Options) -> Result<usize> {
+    anyhow::ensure!(
+        options.workers > 0 && options.batch_rows > 0,
+        "identity memory sizing requires positive workers and batch-rows"
+    );
+    logical_identity_url(
+        uuid::Uuid::nil(),
+        uuid::Uuid::nil(),
+        options.workers - 1,
+        u64::MAX,
+        options.batch_rows - 1,
+    )
+    .map(|identity| identity.len())
+}
+
 fn memory_estimate(tables: &[DmvTable], rows: usize, row_bytes: u64, copies: usize, options: &Options) -> Result<u64> {
     let fields = tables
         .iter()
@@ -1957,6 +2118,13 @@ fn memory_estimate(tables: &[DmvTable], rows: usize, row_bytes: u64, copies: usi
         .and_then(|bytes| batches.checked_mul(fields)?.checked_mul(4096)?.checked_add(bytes))
         .and_then(|bytes| bytes.checked_mul(copies as u64))
         .context("corpus memory estimate overflow")
+}
+
+fn oat_client_metrics_line_bytes(metrics: &serde_json::Value) -> Result<usize> {
+    serde_json::to_vec(metrics)?
+        .len()
+        .checked_add(b"OAT_CLIENT_METRICS ".len() + 1)
+        .context("terminal OAT metrics line size overflow")
 }
 
 fn mix(mut value: u64) -> u64 {
@@ -2689,6 +2857,7 @@ mod tests {
         Ok(PreparedClient {
             corpus: Vec::new(),
             channels: Vec::new(),
+            live_batch_slots: Arc::new(tokio::sync::Semaphore::new(1)),
             signer: None,
             counters: (0..workers).map(|_| Counters::default()).collect(),
             next: AtomicU64::new(0),
@@ -2757,6 +2926,18 @@ mod tests {
         drop(records);
 
         let manifest = client.logical_manifest("completed")?;
+        assert_eq!(manifest["run_uuid_source"], "client_generated");
+        assert_eq!(manifest["oat_run_uuid"], serde_json::Value::Null);
+        assert_eq!(manifest["incarnation_uuid_source"], "client_generated");
+        let metrics = client.metrics("failed")?;
+        assert_eq!(
+            metrics["bytes_semantics"]["uncompressed_flight_data_bytes"],
+            "sum_of_FlightData_protobuf_encoded_lengths_before_Arrow_IPC_compression"
+        );
+        assert_eq!(
+            metrics["bytes_semantics"]["exclusions"],
+            "these_counts_are_not_logical_Arrow_buffer_bytes_and_exclude_gRPC_and_HTTP/2_framing"
+        );
         assert_eq!(manifest["record_count"], 2);
         assert_eq!(manifest["retry_attempts"], 2);
         let range = manifest["ranges"][0].as_object().context("manifest range")?;
@@ -2815,11 +2996,25 @@ mod tests {
             receipt["logical_batch_manifest"]["terminal_failure"],
             "serialized_manifest_exceeds_limit"
         );
-        let line = format!("OAT_CLIENT_METRICS {receipt}");
-        assert!(line.len() < MAX_OAT_CLIENT_METRICS_LINE_BYTES);
+        let line = format!("OAT_CLIENT_METRICS {receipt}\n");
+        assert!(line.len() <= MAX_OAT_CLIENT_METRICS_LINE_BYTES);
         let payload = line.strip_prefix("OAT_CLIENT_METRICS ").context("metrics prefix")?;
-        serde_json::from_str::<serde_json::Value>(payload)?;
+        serde_json::from_str::<serde_json::Value>(payload.trim_end())?;
         assert!(client.ensure_terminal_manifest_complete().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn non_manifest_terminal_overflow_emits_a_bounded_failure_receipt() -> Result<()> {
+        let mut client = manifest_test_client()?;
+        client.preparation = serde_json::json!({
+            "non_manifest_witness": "x".repeat(MAX_OAT_CLIENT_METRICS_LINE_BYTES)
+        });
+
+        let receipt = client.metrics("completed")?;
+        assert_eq!(receipt["phase"], "failed");
+        assert_eq!(receipt["terminal_failure"], "serialized_terminal_receipt_exceeds_limit");
+        assert!(oat_client_metrics_line_bytes(&receipt)? <= MAX_OAT_CLIENT_METRICS_LINE_BYTES);
         Ok(())
     }
 
@@ -3154,6 +3349,61 @@ mod tests {
     }
 
     #[test]
+    fn realistic_memory_budget_admits_only_live_batches_that_fit() -> Result<()> {
+        let table = table_named("sqlserver_availability_replica_states")?;
+        let tables = vec![table];
+        let mut options = options()?;
+        options.data_profile = DataProfile::Realistic;
+        options.workers = 32;
+        options.streams_per_worker = 32;
+        options.batch_rows = 32_768;
+        options.corpus_rows = 32_768;
+        options.string_width = 96;
+        options.max_memory_bytes = 512 * 1_024 * 1_024;
+        let row_bytes = estimated_row_bytes(&tables[0], "client", &options);
+        let budget = memory_budget(&tables, "client", options.corpus_rows, row_bytes, 1, &options)?;
+        assert_eq!(budget.configured_live_slots, 1_024);
+        assert!(budget.admitted_live_slots > 0);
+        assert!(budget.admitted_live_slots < budget.configured_live_slots);
+        assert_eq!(budget.total_bytes, budget.corpus_bytes + budget.live_batch_bytes);
+        assert!(budget.total_bytes <= options.max_memory_bytes);
+
+        options.max_memory_bytes = budget.corpus_bytes + budget.per_live_batch_bytes - 1;
+        assert!(memory_budget(&tables, "client", options.corpus_rows, row_bytes, 1, &options).is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn realistic_live_batch_reservation_is_held_and_released_by_raii() -> Result<()> {
+        let mut client = manifest_test_client()?;
+        let table = Arc::new(table_named("sqlserver_availability_replica_states")?);
+        let template_batch = synthetic_batch(&table, "client", 8, 0, 0, &client.options)?;
+        let version = "v1".to_owned();
+        let (data, raw_arrow_bytes, encoded_bytes) =
+            encode_with_sizes(&table, &version, template_batch.clone(), &client.options).await?;
+        let template = EncodedBatch {
+            table,
+            version,
+            template: template_batch,
+            data: Arc::new(data),
+            rows: 8,
+            raw_arrow_bytes,
+            encoded_bytes,
+        };
+        let max_message_bytes = client.options.max_message_bytes;
+        client.options.max_message_bytes = 1;
+        assert!(client.prepare_logical_batch(0, &template).await.is_err());
+        assert_eq!(client.live_batch_slots.available_permits(), 1);
+
+        client.options.max_message_bytes = max_message_bytes;
+        let logical = client.prepare_logical_batch(0, &template).await?;
+        assert_eq!(client.live_batch_slots.available_permits(), 0);
+        drop(logical);
+        assert_eq!(client.live_batch_slots.available_permits(), 1);
+        Ok(())
+    }
+
+    #[test]
     fn nullability_width_skew_and_entropy_are_applied_without_changing_customer_identity() -> Result<()> {
         use arrow_schema::Field;
         let mut table = table_named("sqlserver_wait_stats")?;
@@ -3217,6 +3467,7 @@ mod tests {
                 encoded_bytes,
             }])],
             channels: vec![vec![channel]],
+            live_batch_slots: Arc::new(tokio::sync::Semaphore::new(0)),
             signer: None,
             counters: vec![Counters::default()],
             next: AtomicU64::new(0),
@@ -3371,9 +3622,16 @@ mod tests {
         assert_eq!(snapshot["completed_rows"], 500);
         assert_eq!(snapshot["completed_bytes"], 5000);
         assert_eq!(snapshot["completed_raw_arrow_bytes"], 4500);
+        assert_eq!(snapshot["completed_flight_data_bytes_uncompressed"], 4500);
+        assert_eq!(snapshot["completed_flight_data_bytes_configured_ipc_compression"], 5000);
         assert_eq!(snapshot["worker_completed_rows"], serde_json::json!([500, 0]));
         assert_eq!(snapshot["pilot_window_rows"], serde_json::json!([200, 300]));
         assert_eq!(snapshot["windows"][0]["completed_raw_arrow_bytes"], 1800);
+        assert_eq!(snapshot["windows"][0]["completed_flight_data_bytes_uncompressed"], 1800);
+        assert_eq!(
+            snapshot["windows"][0]["completed_flight_data_bytes_configured_ipc_compression"],
+            2000
+        );
         assert_eq!(snapshot["windows"][0]["send_latency_us"]["samples"], 2);
         assert_eq!(snapshot["windows"][1]["send_latency_us"]["samples"], 2);
         Ok(())
@@ -3402,6 +3660,7 @@ mod tests {
         let client = PreparedClient {
             corpus: vec![corpus(), corpus()],
             channels: vec![],
+            live_batch_slots: Arc::new(tokio::sync::Semaphore::new(0)),
             signer: None,
             counters: vec![],
             next: AtomicU64::new(0),
@@ -3659,15 +3918,18 @@ mod tests {
             client.ensure_terminal_manifest_complete()?;
             let window = &snapshot["measurement_window"];
             let rows = window["completed_rows"].as_u64().context("missing completed rows")?;
-            let raw_bytes = window["completed_raw_arrow_bytes"]
+            let uncompressed_bytes = window["completed_flight_data_bytes_uncompressed"]
                 .as_u64()
-                .context("missing uncompressed Arrow bytes")?;
-            let rows_per_second_per_core = rows as f64 / workers as f64;
-            let gb_per_second_per_core = raw_bytes as f64 / 1_000_000_000.0 / workers as f64;
+                .context("missing uncompressed FlightData bytes")?;
+            let configured_bytes = window["completed_flight_data_bytes_configured_ipc_compression"]
+                .as_u64()
+                .context("missing configured-compression FlightData bytes")?;
+            let measurement_seconds = (measurement_end - measurement_start) as f64 / 1000.0;
             eprintln!(
-                "W2_CLIENT_CEILING workers={workers} rows_per_second={} raw_GB_per_second={:.6} rows_per_second_per_core={rows_per_second_per_core:.3} raw_GB_per_second_per_core={gb_per_second_per_core:.6}",
-                rows,
-                raw_bytes as f64 / 1_000_000_000.0,
+                "W2_CLIENT_SINK_PROBE tokio_runtime_threads=8 workers={workers} aggregate_rows_per_second={:.3} uncompressed_flight_data_GB_per_second={:.6} configured_ipc_compression_flight_data_GB_per_second={:.6}",
+                rows as f64 / measurement_seconds,
+                uncompressed_bytes as f64 / 1_000_000_000.0 / measurement_seconds,
+                configured_bytes as f64 / 1_000_000_000.0 / measurement_seconds,
             );
             assert!(rows > 0, "null Flight sink received no rows with {workers} workers");
         }
