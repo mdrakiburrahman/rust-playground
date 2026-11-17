@@ -1,6 +1,6 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use anyhow::{Context, Result, bail};
@@ -16,8 +16,31 @@ pub(crate) static PROCESS_ROUTING_SHUTDOWN: LazyLock<RoutingShutdown> = LazyLock
 pub struct RoutingShutdown {
     registrations: Mutex<Vec<(Arc<dyn RoutingStore>, CollectorInstanceId)>>,
     failed: AtomicBool,
-    pending: Mutex<HashSet<PublicationId>>,
+    next_publication_generation: AtomicU64,
+    pending: Mutex<HashMap<PublicationId, PendingPublication>>,
     workers: Mutex<HashMap<PathBuf, Arc<AtomicBool>>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PublicationState {
+    NeverStaged,
+    Staged,
+    Nacked,
+}
+
+struct PendingPublication {
+    state: PublicationState,
+    generation: u64,
+    active_admissions: usize,
+    owner_failed: bool,
+    send_succeeded: bool,
+}
+
+#[derive(Default, Debug, PartialEq, Eq)]
+struct PendingCounts {
+    never_staged: usize,
+    staged: usize,
+    nacked: usize,
 }
 
 impl RoutingShutdown {
@@ -38,6 +61,15 @@ impl RoutingShutdown {
         self.failed.store(true, Ordering::Release);
     }
 
+    fn next_publication_generation(&self) -> Result<u64> {
+        self.next_publication_generation
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |generation| {
+                generation.checked_add(1)
+            })
+            .map(|previous| previous + 1)
+            .map_err(|_| anyhow::anyhow!("publication generation exhausted"))
+    }
+
     /// Tracks an admitted or NACKed publication until that exact identity publishes successfully.
     ///
     /// # Errors
@@ -50,9 +82,117 @@ impl RoutingShutdown {
         if published {
             pending.remove(&publication_id);
         } else {
-            pending.insert(publication_id);
+            match pending.entry(publication_id) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    entry.get_mut().state = PublicationState::Nacked;
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(PendingPublication {
+                        state: PublicationState::Nacked,
+                        generation: self.next_publication_generation()?,
+                        active_admissions: 0,
+                        owner_failed: false,
+                        send_succeeded: false,
+                    });
+                }
+            }
         }
         Ok(())
+    }
+
+    pub(crate) fn publication_staged(&self, publication_id: PublicationId) -> Result<()> {
+        let mut pending = self
+            .pending
+            .lock()
+            .map_err(|_| anyhow::anyhow!("publication accounting poisoned"))?;
+        match pending.entry(publication_id) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                let state = &mut entry.get_mut().state;
+                if *state != PublicationState::Nacked {
+                    *state = PublicationState::Staged;
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(PendingPublication {
+                    state: PublicationState::Staged,
+                    generation: self.next_publication_generation()?,
+                    active_admissions: 0,
+                    owner_failed: false,
+                    send_succeeded: false,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Tracks a fresh identity across its downstream send, forgetting it only when the send returned it.
+    ///
+    /// The identity is tracked before sending so a fast publication outcome cannot precede it. An
+    /// explicit send error hands the message back, so that identity never reached the exporter. A
+    /// cancelled send keeps the identity: a dropped flume send can already have been delivered.
+    ///
+    /// # Errors
+    /// Reports poisoned publication accounting; an unforgettable identity stays tracked.
+    pub(crate) async fn admit_publication<E>(
+        &self,
+        publication_id: PublicationId,
+        send: impl Future<Output = Result<(), E>>,
+    ) -> Result<Result<(), E>> {
+        let (generation, is_owner) = {
+            let mut pending = self
+                .pending
+                .lock()
+                .map_err(|_| anyhow::anyhow!("publication accounting poisoned"))?;
+            match pending.entry(publication_id) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let generation = self.next_publication_generation()?;
+                    entry.insert(PendingPublication {
+                        state: PublicationState::NeverStaged,
+                        generation,
+                        active_admissions: 1,
+                        owner_failed: false,
+                        send_succeeded: false,
+                    });
+                    (generation, true)
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    let pending = entry.get_mut();
+                    pending.active_admissions = pending
+                        .active_admissions
+                        .checked_add(1)
+                        .ok_or_else(|| anyhow::anyhow!("publication admission count exhausted"))?;
+                    (pending.generation, false)
+                }
+            }
+        };
+        let result = send.await;
+        let mut pending = self
+            .pending
+            .lock()
+            .map_err(|_| anyhow::anyhow!("publication accounting poisoned"))?;
+        let remove = match pending.get_mut(&publication_id) {
+            Some(entry) if entry.generation == generation => {
+                if is_owner && result.is_err() {
+                    entry.owner_failed = true;
+                }
+                if result.is_ok() {
+                    entry.send_succeeded = true;
+                }
+                entry.active_admissions = entry
+                    .active_admissions
+                    .checked_sub(1)
+                    .ok_or_else(|| anyhow::anyhow!("publication admission accounting underflow"))?;
+                entry.owner_failed
+                    && entry.active_admissions == 0
+                    && !entry.send_succeeded
+                    && entry.state == PublicationState::NeverStaged
+            }
+            _ => false,
+        };
+        if remove {
+            pending.remove(&publication_id);
+        }
+        Ok(result)
     }
 
     pub(crate) fn track_worker(&self, root: PathBuf, retired: Arc<AtomicBool>) -> Result<()> {
@@ -73,11 +213,21 @@ impl RoutingShutdown {
             .lock()
             .map_err(|_| anyhow::anyhow!("routing shutdown registry poisoned"))?
             .clone();
-        let pending = self
-            .pending
-            .lock()
-            .map_err(|_| anyhow::anyhow!("publication accounting poisoned"))?
-            .len();
+        let (pending_total, counts) = {
+            let pending = self
+                .pending
+                .lock()
+                .map_err(|_| anyhow::anyhow!("publication accounting poisoned"))?;
+            let mut counts = PendingCounts::default();
+            for publication in pending.values() {
+                match publication.state {
+                    PublicationState::NeverStaged => counts.never_staged += 1,
+                    PublicationState::Staged => counts.staged += 1,
+                    PublicationState::Nacked => counts.nacked += 1,
+                }
+            }
+            (pending.len(), counts)
+        };
         let retired = self
             .workers
             .lock()
@@ -85,12 +235,18 @@ impl RoutingShutdown {
             .values()
             .filter(|worker| worker.load(Ordering::Acquire))
             .count();
-        let failed = self.failed.load(Ordering::Acquire) || pending != 0 || retired != 0;
+        let failed = self.failed.load(Ordering::Acquire) || pending_total != 0 || retired != 0;
         let state = terminal_state(clean, failed);
         let now = now_unix_millis().map_err(anyhow::Error::msg)?;
         let mut errors = Vec::new();
         if failed {
-            errors.push(format!("dataflow drain incomplete: {pending} unpublished identities, {retired} retired workers, ingress failure={}", self.failed.load(Ordering::Acquire)));
+            tracing::error!(
+                never_staged = counts.never_staged,
+                staged_unpublished = counts.staged,
+                nacked = counts.nacked,
+                "dataflow shutdown publication accounting"
+            );
+            errors.push(format!("dataflow drain incomplete: {pending_total} unpublished identities (never_staged={}, staged_unpublished={}, nacked={}), {retired} retired workers, ingress failure={}", counts.never_staged, counts.staged, counts.nacked, self.failed.load(Ordering::Acquire)));
         }
         for (store, instance_id) in registrations {
             if let Err(error) = store.set_collector_state(instance_id, state, now).await {
@@ -151,6 +307,176 @@ mod tests {
         shutdown.track_worker(root.clone(), Arc::new(AtomicBool::new(true)))?;
         assert!(shutdown.finish(true).await.is_err());
         shutdown.track_worker(root, Arc::new(AtomicBool::new(false)))?;
+        shutdown.finish(true).await
+    }
+
+    #[tokio::test]
+    async fn returned_send_is_not_unpublished_work() -> Result<()> {
+        let shutdown = RoutingShutdown::default();
+        for error in ["route closed", "route full"] {
+            let sent = shutdown
+                .admit_publication(PublicationId::new(), async { Err(error) })
+                .await?;
+            assert_eq!(sent, Err(error));
+        }
+        shutdown.finish(true).await
+    }
+
+    #[tokio::test]
+    async fn failed_creator_preserves_overlapping_successful_admission() -> Result<()> {
+        let shutdown = RoutingShutdown::default();
+        let publication = PublicationId::new();
+        let (first_started_tx, first_started_rx) = tokio::sync::oneshot::channel();
+        let (release_first_tx, release_first_rx) = tokio::sync::oneshot::channel();
+        let first = shutdown.admit_publication(publication, async move {
+            first_started_tx.send(()).map_err(|_| "first admission dropped")?;
+            release_first_rx.await.map_err(|_| "release dropped")?;
+            Err("route full")
+        });
+        let second = async {
+            first_started_rx.await?;
+            let result = shutdown
+                .admit_publication(publication, async { Ok::<(), &str>(()) })
+                .await?;
+            release_first_tx
+                .send(())
+                .map_err(|_| anyhow::anyhow!("first admission stopped"))?;
+            Ok::<_, anyhow::Error>(result)
+        };
+        let (first, second) = tokio::join!(first, second);
+        assert_eq!(first?, Err("route full"));
+        assert_eq!(second?, Ok(()));
+        let error = shutdown
+            .finish(true)
+            .await
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("overlapping admission must remain pending"))?
+            .to_string();
+        assert!(error.contains("never_staged=1"), "{error}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stale_creator_cannot_remove_replacement_generation() -> Result<()> {
+        let shutdown = RoutingShutdown::default();
+        let publication = PublicationId::new();
+        let (first_started_tx, first_started_rx) = tokio::sync::oneshot::channel();
+        let (release_first_tx, release_first_rx) = tokio::sync::oneshot::channel();
+        let first = shutdown.admit_publication(publication, async move {
+            first_started_tx.send(()).map_err(|_| "first admission dropped")?;
+            release_first_rx.await.map_err(|_| "release dropped")?;
+            Err("route full")
+        });
+        let replacement = async {
+            first_started_rx.await?;
+            shutdown.publication_finished(publication, true)?;
+            let result = shutdown
+                .admit_publication(publication, async { Ok::<(), &str>(()) })
+                .await?;
+            release_first_tx
+                .send(())
+                .map_err(|_| anyhow::anyhow!("first admission stopped"))?;
+            Ok::<_, anyhow::Error>(result)
+        };
+        let (first, replacement) = tokio::join!(first, replacement);
+        assert_eq!(first?, Err("route full"));
+        assert_eq!(replacement?, Ok(()));
+        let error = shutdown
+            .finish(true)
+            .await
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("replacement generation must remain pending"))?
+            .to_string();
+        assert!(error.contains("never_staged=1"), "{error}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn returned_retry_preserves_preexisting_nacked_identity() -> Result<()> {
+        let shutdown = RoutingShutdown::default();
+        let publication = PublicationId::new();
+        shutdown.publication_finished(publication, false)?;
+
+        let sent = shutdown
+            .admit_publication(publication, async { Err("route full") })
+            .await?;
+        assert_eq!(sent, Err("route full"));
+        let error = shutdown
+            .finish(true)
+            .await
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("the preexisting NACK must remain unpublished"))?
+            .to_string();
+        assert!(
+            error.contains("1 unpublished identities (never_staged=0, staged_unpublished=0, nacked=1)"),
+            "{error}"
+        );
+
+        shutdown.publication_finished(publication, true)?;
+        shutdown.finish(true).await
+    }
+
+    #[tokio::test]
+    async fn cancelled_send_after_delivery_and_nack_stays_unpublished() -> Result<()> {
+        let shutdown = RoutingShutdown::default();
+        let publication = PublicationId::new();
+        let delivered_then_nacked = async {
+            shutdown.publication_staged(publication)?;
+            shutdown.publication_finished(publication, false)?;
+            std::future::pending::<Result<()>>().await
+        };
+        let cancelled = shutdown.admit_publication(publication, delivered_then_nacked);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(1), cancelled)
+                .await
+                .is_err()
+        );
+        assert!(shutdown.finish(true).await.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pending_categories_reflect_exporter_progress_and_nacks() -> Result<()> {
+        let shutdown = RoutingShutdown::default();
+        let never_staged = PublicationId::new();
+        let staged = PublicationId::new();
+        let nacked = PublicationId::new();
+        for id in [never_staged, staged, nacked] {
+            shutdown
+                .admit_publication(id, async { Ok::<_, ()>(()) })
+                .await?
+                .map_err(|()| anyhow::anyhow!("send failed"))?;
+        }
+        shutdown.publication_staged(staged)?;
+        shutdown.publication_staged(nacked)?;
+        shutdown.publication_finished(nacked, false)?;
+        shutdown.publication_staged(nacked)?;
+        let error = shutdown
+            .finish(true)
+            .await
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("unpublished work must fail"))?
+            .to_string();
+        assert!(
+            error.contains("3 unpublished identities (never_staged=1, staged_unpublished=1, nacked=1)"),
+            "{error}"
+        );
+        for id in [never_staged, staged, nacked] {
+            shutdown.publication_finished(id, true)?;
+        }
+        shutdown.finish(true).await
+    }
+
+    #[tokio::test]
+    async fn admitted_send_stays_unpublished_until_that_identity_publishes() -> Result<()> {
+        let shutdown = RoutingShutdown::default();
+        let publication = PublicationId::new();
+        shutdown
+            .admit_publication(publication, async { Ok::<_, ()>(()) })
+            .await?
+            .map_err(|()| anyhow::anyhow!("send failed"))?;
+        assert!(shutdown.finish(true).await.is_err());
+        shutdown.publication_finished(publication, true)?;
         shutdown.finish(true).await
     }
 

@@ -388,16 +388,18 @@ impl StreamLifecycle for DfeStreamLifecycle {
         let mut pending_send = PendingSendGuard::new(Arc::clone(&self.pending), correlation_id);
         let pdata = OtapPdata::new_todo_context(OtapPayload::from_pdata_arrow(records));
         crate::shutdown::PROCESS_ROUTING_SHUTDOWN
-            .publication_finished(publication_id, false)
-            .map_err(|_| RuntimeError::internal())?;
-        match self.sender.send(correlation_id, pdata).await {
-            Ok(()) => {
-                pending_send.disarm();
-                Ok(())
-            }
-            Err(error) => {
+            .admit_publication(publication_id, async {
+                let sent = self.sender.send(correlation_id, pdata).await;
+                if sent.is_ok() {
+                    pending_send.disarm();
+                }
+                sent
+            })
+            .await
+            .map_err(|_| RuntimeError::internal())?
+            .map_err(|error| {
                 self.metrics.enqueue_failed();
-                Err(match error {
+                match error {
                     PdataSendError::Closed => RuntimeError::new(
                         ErrorCode::PoolUnavailable,
                         tonic::Code::Unavailable,
@@ -408,9 +410,8 @@ impl StreamLifecycle for DfeStreamLifecycle {
                         tonic::Code::Unavailable,
                         "DFE downstream admission is unavailable",
                     ),
-                })
-            }
-        }
+                }
+            })
     }
 
     async fn complete(&mut self, _summary: StreamSummary) -> RuntimeResult<StreamCompletion> {
