@@ -1958,7 +1958,8 @@ impl PublicationFenceContext<'_> {
         self.table_path
     }
 
-    /// Snapshot version used to build the pending append.
+    /// Snapshot version used to build the pending append. Fresh schema creation
+    /// has no prior snapshot and reports zero for both versions, with zero files.
     #[must_use]
     pub const fn read_version(&self) -> u64 {
         self.read_version

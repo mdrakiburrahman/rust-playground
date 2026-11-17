@@ -190,9 +190,9 @@ async fn owned_run_setup_creates_one_zero_row_table_and_refuses_collision_withou
     let receipt = initialize_owned_run_table_with(
         plan.clone(),
         SANDBOX,
-        metadata.clone(),
+        Arc::<Memory>::clone(&metadata),
         owned_transport(local(&scratch)?),
-        owned_authority(&plan, fence.clone()),
+        owned_authority(&plan, Arc::<SetupFence>::clone(&fence)),
     )
     .await?;
     assert!(receipt.publisher_drained);
@@ -217,9 +217,9 @@ async fn owned_run_setup_creates_one_zero_row_table_and_refuses_collision_withou
         initialize_owned_run_table_with(
             plan.clone(),
             SANDBOX,
-            metadata.clone(),
+            Arc::<Memory>::clone(&metadata),
             owned_transport(local(&scratch)?),
-            owned_authority(&plan, fence.clone()),
+            owned_authority(&plan, Arc::<SetupFence>::clone(&fence)),
         )
         .await
         .is_err()
@@ -236,9 +236,9 @@ async fn owned_run_setup_creates_one_zero_row_table_and_refuses_collision_withou
     let error = initialize_owned_run_table_with(
         plan.clone(),
         SANDBOX,
-        metadata.clone(),
+        Arc::<Memory>::clone(&metadata),
         owned_transport(local(&collision)?),
-        owned_authority(&plan, collision_fence.clone()),
+        owned_authority(&plan, Arc::<SetupFence>::clone(&collision_fence)),
     )
     .await
     .err()
@@ -276,7 +276,7 @@ async fn owned_run_setup_refuses_bad_bindings_generation_authority_and_nonempty_
             initialize_owned_run_table_with(
                 plan,
                 SANDBOX,
-                metadata.clone(),
+                Arc::<Memory>::clone(&metadata),
                 owned_transport(local(&scratch)?),
                 owned_authority(&original, Arc::new(SetupFence::default())),
             )
@@ -294,7 +294,7 @@ async fn owned_run_setup_refuses_bad_bindings_generation_authority_and_nonempty_
             initialize_owned_run_table_with(
                 original.clone(),
                 SANDBOX,
-                metadata.clone(),
+                Arc::<Memory>::clone(&metadata),
                 owned_transport(local(&scratch)?),
                 owned_authority(&original, Arc::new(SetupFence::default())),
             )
@@ -311,9 +311,9 @@ async fn owned_run_setup_refuses_bad_bindings_generation_authority_and_nonempty_
         initialize_owned_run_table_with(
             original.clone(),
             SANDBOX,
-            metadata.clone(),
+            Arc::<Memory>::clone(&metadata),
             owned_transport(local(&scratch)?),
-            owned_authority(&original, fence.clone()),
+            owned_authority(&original, Arc::<SetupFence>::clone(&fence)),
         )
         .await
         .is_err()
@@ -327,9 +327,9 @@ async fn owned_run_setup_refuses_bad_bindings_generation_authority_and_nonempty_
         initialize_owned_run_table_with(
             original.clone(),
             SANDBOX,
-            metadata.clone(),
+            Arc::<Memory>::clone(&metadata),
             opaque,
-            owned_authority(&original, fence.clone()),
+            owned_authority(&original, Arc::<SetupFence>::clone(&fence)),
         )
         .await
         .is_err()
@@ -348,9 +348,9 @@ async fn owned_run_setup_refuses_bad_bindings_generation_authority_and_nonempty_
         initialize_owned_run_table_with(
             original.clone(),
             SANDBOX,
-            metadata.clone(),
+            Arc::<Memory>::clone(&metadata),
             owned_transport(local(&scratch)?),
-            owned_authority(&original, fence.clone()),
+            owned_authority(&original, Arc::<SetupFence>::clone(&fence)),
         )
         .await
         .is_err()
@@ -370,7 +370,7 @@ async fn owned_run_setup_unknown_schema_mutation_retains_registration() -> Resul
     let error = initialize_owned_run_table_with(
         plan.clone(),
         SANDBOX,
-        metadata.clone(),
+        Arc::<Memory>::clone(&metadata),
         owned_transport(Arc::new(DataflowPutsTimeOut(LocalFileSystem::new_with_prefix(
             scratch.data(),
         )?))),
@@ -416,7 +416,7 @@ async fn owned_run_setup_lost_registration_response_never_forces_unregister() ->
     let error = arrowcol_loadgen::initialize::initialize_owned_run_table_with(
         plan.clone(),
         SANDBOX,
-        Arc::new(LostRegistration(metadata.clone())),
+        Arc::new(LostRegistration(Arc::<Memory>::clone(&metadata))),
         owned_transport(local(&scratch)?),
         owned_authority(&plan, Arc::new(SetupFence::default())),
     )
