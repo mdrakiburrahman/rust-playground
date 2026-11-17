@@ -300,9 +300,10 @@ prefix. Initialization does not insert data or prove Azure/QAP readiness.
 ### Held single owned-run setup
 
 `arrowcol-loadgen initialize-owned-run-table --plan <private-plan.json>` validates
-the allocation, then **fails before authentication or publisher admission**. The
-per-operation auth/control/storage bridge is not yet wired; there is no bypass
-flag. This is not a replacement for `initialize-azure` and changes no defaults.
+the allocation, then **HOLDs before authentication or publisher admission** unless
+both `--storage-bridge-input <private-bridge.json>` and `--storage-bridge-stdio`
+are supplied. There is no direct-network fallback or bypass flag. This is not a
+replacement for `initialize-azure` and changes no defaults.
 
 | Plan binding | Required value |
 | --- | --- |
@@ -311,14 +312,25 @@ flag. This is not a replacement for `initialize-azure` and changes no defaults.
 | `campaign_root`, `run_root` | Canonical URLs ending `/campaigns/<campaign_id>/` and `/campaigns/<campaign_id>/runs/<run_id>/` |
 | `table`, `partition_by_ingestion_date`, `fencing_token` | `telemetry.sqlserver.sqlserver_availability_replica_states`, `true`, original positive token |
 
+Explicit bridge mode requires owner-private regular JSON files. The strict bridge
+input contains `authority` (the existing `StorageBridgeAuthority`) and
+`original_deadline_unix_ms`; authority must match the plan and retain the original
+deadline. `table_root_url` is the exact canonical selected table URL with trailing
+slash, **not the run root**. Dedicated stdin/stdout carry unchanged StorageBridge
+response/request frames; no tokens, auth headers or SAS belong in these files or
+frames. A versioned `kind: "owned_run_table_receipt"` frame is emitted only after
+Kernel readback **and completed normal publisher drain**. It preserves the same
+authority/deadline and contains the existing setup receipt.
+
 The explicit-transport library body uses normal `ready-v1` publisher admission,
 not bootstrap/reset. It creates only `dataflow/telemetry/sqlserver/` plus the
 selected table beneath the run root. Kernel creates version0 with no data files;
 the original publication fence runs at the actual schema commit. Nonempty roots,
 collisions, stale authority and uncertain outcomes cannot succeed. Its creation
-readback is provisional until clean publisher drain. Offline fixture receipts
-are not live evidence; shared registry/lease/drain effects require their own
-reviewed per-operation bridge and execution clearance.
+readback is provisional until clean publisher drain. This is source/offline
+delivery, not live qualification: offline fixture receipts are not live evidence;
+shared registry/lease/drain effects require reviewed per-operation parent
+coverage and separate execution clearance.
 
 ## Options
 
