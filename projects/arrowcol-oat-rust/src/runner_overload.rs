@@ -393,6 +393,132 @@ struct GuardProbe {
     since_ms: u64,
 }
 
+async fn scale_out_collector_snapshot(config: &OatConfig, replicas: u32) -> Result<Vec<ScaleOutCollectorIdentity>> {
+    let deployment = deployment(config, &config.dfe_deployment).await?;
+    let selector = deployment_selector(&deployment)?;
+    let (sets, pods) = tokio::try_join!(
+        kubectl(config, vec!["get", "replicasets", "--namespace", &config.namespace, "-o", "json"], None),
+        kubectl(config, vec!["get", "pods", "--namespace", &config.namespace, "--selector", &selector, "-o", "json"], None),
+    )?;
+    scale_out_collector_identities(
+        &config.namespace, &config.dfe_container, replicas, &deployment,
+        &serde_json::from_str(&sets)?, &serde_json::from_str(&pods)?,
+    )
+}
+
+async fn scale_out_collector_scraper(config: &OatConfig, pod: &str) -> Result<PublicationBacklogScraper> {
+    let reservation = TcpListener::bind("127.0.0.1:0").await.context("reserve collector tunnel port")?;
+    let port = reservation.local_addr()?.port();
+    drop(reservation);
+    let target = format!("pod/{pod}");
+    let mapping = format!("{port}:32011");
+    let mut command = Command::new("kubectl");
+    if let Some(context) = &config.kubectl_context {
+        command.args(["--context", context]);
+    }
+    command.args(["port-forward", "--address", "127.0.0.1", "--namespace", &config.namespace, &target, &mapping])
+        .stdout(Stdio::null()).stderr(Stdio::piped()).kill_on_drop(true);
+    let mut child = command.spawn().context("start scale-out collector metrics port-forward")?;
+    let stderr = child.stderr.take().context("capture collector tunnel diagnostics")?;
+    let stderr = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        let mut stderr = stderr;
+        stderr.read_to_end(&mut bytes).await.map(|_| bytes)
+    });
+    let mut forward = OwnedKubectlProcess { child, stderr };
+    let client = reqwest::Client::builder().timeout(Duration::from_secs(2)).build()?;
+    let ready_url = format!("http://127.0.0.1:{port}/readyz");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = forward.child.try_wait().context("check collector metrics port-forward")? {
+            let stderr = collect_kubectl_stderr(forward.stderr).await?;
+            bail!("collector metrics port-forward exited with {status}: {}", String::from_utf8_lossy(&stderr).trim());
+        }
+        if client.get(&ready_url).send().await.is_ok_and(|response| response.status().is_success()) {
+            return Ok(PublicationBacklogScraper {
+                endpoint: format!("http://127.0.0.1:{port}/metrics"),
+                _tunnel: Some(forward),
+                client: reqwest::Client::builder().timeout(Duration::from_secs(3)).build()?,
+            });
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let stderr = collect_kubectl_stderr(stop_kubectl_process(forward).await?).await?;
+            bail!("collector metrics tunnel readiness timed out: {}", String::from_utf8_lossy(&stderr).trim());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+struct ScaleOutCollectorProbe {
+    identity: ScaleOutCollectorIdentity,
+    scraper: PublicationBacklogScraper,
+    probe: GuardProbe,
+}
+
+struct PreparedScaleOutGuard {
+    replicas: u32,
+    expected: Vec<ScaleOutCollectorIdentity>,
+    collectors: Vec<ScaleOutCollectorProbe>,
+    engine: GuardEngine,
+}
+
+impl PreparedScaleOutGuard {
+    async fn prepare(config: &OatConfig, platform: &dyn Platform, replicas: u32) -> Result<Self> {
+        if platform.kind() != crate::config::OatMode::Aks || config.tunables.wal.is_some() {
+            bail!("scale-out guard requires AKS memory-only collectors");
+        }
+        let expected = scale_out_collector_snapshot(config, replicas).await?;
+        let logs = platform.process_logs_for_role(config, ComponentRole::Collector).await?;
+        if logs.len() != expected.len() {
+            bail!("scale-out collector startup evidence does not cover the expected pod set");
+        }
+        let mut collectors = Vec::with_capacity(expected.len());
+        for identity in &expected {
+            let instance_id = format!("{}/{}", identity.pod, config.dfe_container);
+            let matches = logs.iter().filter(|log| log.instance_id == instance_id).collect::<Vec<_>>();
+            let [log] = matches.as_slice() else { bail!("scale-out collector startup identity is missing or ambiguous") };
+            if !log.complete { bail!("scale-out collector startup readback is incomplete") }
+            let observed = process_configurations(&log.text)?;
+            if observed["commit_telemetry"] != json!({"schema_version":1,
+                "scope":"new_ingestion_addfiles_after_sync","clock":"system_unix_ms"}) {
+                bail!("scale-out collector ingestion-only producer capability unavailable");
+            }
+            let rss_cap = observed.pointer("/pressure/rss_limit_bytes").and_then(Value::as_u64)
+                .filter(|value| *value > 0).context("collector RSS cap unavailable")?;
+            let buffer_cap = observed.pointer("/pressure/buffered_bytes_limit").and_then(Value::as_u64)
+                .filter(|value| *value > 0).context("collector buffer cap unavailable")?;
+            collectors.push(ScaleOutCollectorProbe {
+                identity: identity.clone(),
+                scraper: scale_out_collector_scraper(config, &identity.pod).await?,
+                probe: GuardProbe { instance_id, rss_cap, buffer_cap, collector_instance:None,
+                    local:false, since_ms:unix_time_ms_u64()?.saturating_sub(GUARD_MAX_GAP_MS) },
+            });
+        }
+        let mut prepared = Self { replicas, expected, collectors, engine:GuardEngine::new(config.overload_guard.clone()) };
+        let (reading, backlog, per_pod) = prepared.read(config).await?;
+        prepared.engine.proof["last_per_pod"] = per_pod;
+        prepared.engine.observe(reading, &publication_backlog_sample(backlog, 0, 0, 0))?;
+        Ok(prepared)
+    }
+
+    async fn read(&mut self, config: &OatConfig) -> Result<(GuardReading, PublicationBacklogMetrics, Value)> {
+        if scale_out_collector_snapshot(config, self.replicas).await? != self.expected {
+            bail!("scale-out collector identity changed before observation");
+        }
+        let samples = futures_util::future::try_join_all(self.collectors.iter_mut().map(|collector| async move {
+            let (reading, backlog) = tokio::try_join!(
+                collector.probe.read(config, &collector.scraper),
+                collector.scraper.scrape(),
+            )?;
+            Ok::<_, anyhow::Error>((collector.identity.clone(), reading, backlog))
+        })).await?;
+        if scale_out_collector_snapshot(config, self.replicas).await? != self.expected {
+            bail!("scale-out collector identity changed during observation");
+        }
+        aggregate_scale_out_readings(&self.expected, samples)
+    }
+}
+
 struct PreparedGuard {
     scraper: PublicationBacklogScraper,
     probe: GuardProbe,
