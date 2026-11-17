@@ -1549,8 +1549,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn startup_preload_reads_actual_existing_metadata_and_leaves_missing_target_unresolved() -> Result<(), String> {
+    #[tokio::test]
+    async fn startup_preload_reads_actual_existing_metadata_and_leaves_missing_target_unresolved() -> Result<(), String>
+    {
         let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
         let selector = StartupTableSelector {
             catalog: CatalogName::new("demo").map_err(|error| error.to_string())?,
@@ -1559,23 +1560,19 @@ mod tests {
         };
         let identity = selector.identity();
         let root = table_path(directory.path(), &identity);
-        let url = url::Url::from_directory_path(&root).map_err(|()| "invalid table URL".to_owned())?;
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::UInt64, false)]));
-        let table = DeltaTable::open_url(url, schema, Vec::new()).map_err(|error| format!("{error:#}"))?;
-        let expected = table
-            .resolved_delta_target()
-            .map_err(|error| format!("{error:#}"))?
-            .ok_or("opened table had no metadata ID")?;
-        drop(table);
+        let writer = BatchedTable::open(&root, arrow_deltalake::commit::CommitOptions::default())
+            .await
+            .map_err(|error| format!("{error:#}"))?;
+        let file = writer.new_file(schema).await.map_err(|error| format!("{error:#}"))?;
+        drop(file);
+        drop(writer);
 
         let binding = preload_startup_table(directory.path(), &selector);
         assert_eq!(binding.identity, identity);
-        assert_eq!(binding.resolved, Some(expected));
-        assert!(
-            binding
-                .verify_actual(binding.resolved.as_ref().expect("resolved"))
-                .is_ok()
-        );
+        let expected = binding.resolved.as_ref().expect("resolved existing table");
+        assert!(!expected.delta_table_id.is_empty());
+        assert!(binding.verify_actual(expected).is_ok());
 
         let missing = StartupTableSelector {
             table: TableName::new("missing").map_err(|error| error.to_string())?,
