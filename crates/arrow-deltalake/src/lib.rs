@@ -129,6 +129,7 @@ impl ParquetFileWriter {
             .create_new(true)
             .open(&path)
             .with_context(|| format!("create Parquet {}", path.display()))?;
+        let max_row_group_rows = properties.max_row_group_row_count().unwrap_or(usize::MAX);
         let writer = if effective_encoding_threads > 1 {
             let max_row_group_bytes = config
                 .max_row_group_bytes
@@ -138,7 +139,7 @@ impl ParquetFileWriter {
                 schema.clone(),
                 properties,
                 requested_encoding_threads,
-                config.max_row_group_rows.unwrap_or(1_000_000),
+                max_row_group_rows,
                 max_row_group_bytes,
             )?)
         } else {
@@ -229,10 +230,6 @@ impl ParquetFileWriter {
         self.input_bytes = written_input_bytes;
         Ok(())
     }
-    /// Write the footer and synchronize data and its directory before success.
-    ///
-    /// # Errors
-    /// Returns close, metadata, or synchronization errors.
     /// Write the footer and synchronize data and its directory before success.
     ///
     /// # Errors

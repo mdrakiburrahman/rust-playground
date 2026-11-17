@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result, ensure};
 use arrow::datatypes::SchemaRef;
+use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowSchemaConverter;
 use parquet::arrow::arrow_writer::{
     ArrowColumnChunk, ArrowColumnWriter, ArrowLeafColumn, ArrowRowGroupWriterFactory, ArrowWriter as SyncArrowWriter,
@@ -13,7 +14,11 @@ use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterPrope
 use parquet::schema::types::ColumnPath;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::fs::File;
+use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::thread::{self, JoinHandle};
 
 pub const PARQUET_CONFIG_ENV: &str = "ARROWCOL_PARQUET_CONFIG";
 static PROCESS_CONFIG: OnceLock<Result<ParquetWriterConfig, String>> = OnceLock::new();
@@ -720,7 +725,7 @@ fn column_worker(
                 let result = writers
                     .iter_mut()
                     .zip(leaves)
-                    .try_for_each(|(writer, leaf)| writer.write(&[leaf]));
+                    .try_for_each(|(writer, leaf)| writer.write(&leaf));
                 let stats = result.as_ref().map(|()| {
                     writers.iter().fold((0usize, 0usize), |(memory, estimate), writer| {
                         (
