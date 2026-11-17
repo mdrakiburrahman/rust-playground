@@ -439,8 +439,8 @@ test('preflight reserves only additional quota for existing AKS pools', async ()
         return [{ name: vmSize, family: 'testFamily', capabilities: [{ name: 'vCPUs', value: '1' }] }];
       }
       case 'vm list-usage': return [
-        { name: { value: 'testFamily' }, currentValue: 0, limit: 2 },
-        { name: { value: 'cores' }, currentValue: 0, limit: 2 },
+        { name: { value: 'testFamily' }, currentValue: 0, limit: 8 },
+        { name: { value: 'cores' }, currentValue: 0, limit: 8 },
       ];
       case 'feature show': return { properties: { state: 'Registered' } };
       case 'network vnet': return [];
