@@ -29,6 +29,26 @@ impl IdentityDeadline {
         let end = now()?
             .checked_add(duration)
             .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "identity deadline overflow"))?;
+        Self::from_absolute(end)
+    }
+
+    /// Preserve the original deadline when passing it to the owned worker.
+    #[must_use]
+    pub fn absolute(&self) -> Timespec {
+        self.end
+    }
+
+    /// Arm the same absolute BOOTTIME deadline in the same time namespace.
+    ///
+    /// # Errors
+    /// Rejects malformed or already-expired deadlines and unavailable controls.
+    pub fn from_absolute(end: Timespec) -> io::Result<Self> {
+        if end.tv_sec < 0 || !(0..1_000_000_000).contains(&end.tv_nsec) {
+            return Err(io::Error::new(ErrorKind::InvalidInput, "invalid absolute identity deadline"));
+        }
+        if now()? >= end {
+            return Err(io::Error::new(ErrorKind::TimedOut, "identity deadline expired"));
+        }
         let fd = timerfd_create(
             TimerfdClockId::Boottime,
             TimerfdFlags::CLOEXEC | TimerfdFlags::NONBLOCK,
@@ -101,10 +121,13 @@ mod tests {
 
     #[tokio::test]
     async fn timer_expires_without_extending_its_deadline() -> io::Result<()> {
-        let deadline = IdentityDeadline::new(Duration::from_millis(10))?;
+        let deadline = IdentityDeadline::new(Duration::from_millis(200))?;
+        let second = IdentityDeadline::from_absolute(deadline.absolute())?;
         deadline.wait().await?;
         deadline.wait().await?;
         assert_eq!(deadline.check().expect_err("deadline must expire").kind(), ErrorKind::TimedOut);
+        assert_eq!(second.check().expect_err("same deadline must expire").kind(), ErrorKind::TimedOut);
+        assert!(IdentityDeadline::from_absolute(deadline.absolute()).is_err());
         Ok(())
     }
 
@@ -112,5 +135,6 @@ mod tests {
     async fn invalid_deadline_budgets_are_refused() {
         assert!(IdentityDeadline::new(Duration::ZERO).is_err());
         assert!(IdentityDeadline::new(Duration::MAX).is_err());
+        assert!(IdentityDeadline::from_absolute(Timespec { tv_sec: -1, tv_nsec: 0 }).is_err());
     }
 }
