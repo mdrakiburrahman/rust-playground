@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { assessScaleTrial, executeScaleTrial, main as scaleMain, recommendScaleStep, validateScaleTarget, type ScaleEvidence, type ScaleTarget } from './aks-scale.js';
+import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { assessScaleTrial, executeScaleTrial, main as scaleMain, readJsonFile, recommendScaleStep, validateScaleTarget, type ScaleEvidence, type ScaleTarget } from './aks-scale.js';
 import { verifySafeIdle, ensureSafeIdle, type SafeIdleObservation } from './aks-reconcile.js';
 
 function evidence(overrides: Partial<ScaleEvidence> = {}): ScaleEvidence {
@@ -9,7 +12,7 @@ function evidence(overrides: Partial<ScaleEvidence> = {}): ScaleEvidence {
     generatorCpuSaturated: false, generatorNetworkSaturated: false, collectorCpuSaturated: false,
     collectorThrottled: false, collectorMemorySaturated: false, collectorPlacementBlocked: false, collectorNodePoolAtMaximum: false,
     qapBacklogGrowing: false, committedRateStable: false, qapPendingBacklog: 0, previousQapPendingBacklog: 0,
-    qapP95LatencyMs: 0, previousQapP95LatencyMs: 0, kustoSaturated: false,
+    kustoSaturated: false,
     loadgenMax: 1, loadgenMaximum: 4, collectorCpuLimitCores: 2, collectorCpuLimitMaximum: 8,
     collectorMemoryLimitGiB: 6, collectorMemoryLimitMaximumGiB: 24, collectorNodeMax: 1,
     collectorNodeMaxMaximum: 4, kustoCapacity: 2, kustoCapacityMaximum: 4, kustoSku: 'Standard_E4ads_v5',
@@ -27,6 +30,18 @@ function safeIdle(overrides: Partial<SafeIdleObservation> = {}): SafeIdleObserva
     kustoAutoscaleMin: 2, kustoAutoscaleMax: 4, kustoAutoStopEnabled: true, ...overrides,
   };
 }
+
+test('scale JSON reader admits the exact byte bound and rejects overflow or truncated input', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'oat-scale-evidence-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const file = join(directory, 'evidence.json'), value = 'x'.repeat(262_142);
+  await writeFile(file, JSON.stringify(value));
+  assert.equal(await readJsonFile(file), value);
+  await writeFile(file, JSON.stringify(value + 'x'));
+  await assert.rejects(readJsonFile(file), /fixed size bound/);
+  await writeFile(file, '{"truncated":');
+  await assert.rejects(readJsonFile(file), /not valid JSON/);
+});
 
 test('real scale CLI refuses self-labeled telemetry before configuration, storage, or command access', async () => {
   let commandCalls = 0;
@@ -55,7 +70,7 @@ test('collector and Kusto scale only on their measured bottleneck signals', () =
   assert.equal(recommendScaleStep(evidence({ collectorMemorySaturated: true }))?.dimension, 'collector-memory-limit');
   assert.equal(recommendScaleStep(evidence({ qapBacklogGrowing: true, committedRateStable: true }))?.dimension, undefined);
   const kusto = recommendScaleStep(evidence({ qapBacklogGrowing: true, committedRateStable: true, kustoSaturated: true,
-    qapPendingBacklog: 12, qapP95LatencyMs: 80 }));
+    qapPendingBacklog: 12 }));
   assert.equal(kusto?.dimension, 'kusto-capacity');
   assert.deepEqual(kusto?.restore, { dimension: 'kusto-capacity', before: 3, after: 2 });
 });
@@ -92,7 +107,7 @@ test('scale restoration is attempted when measurement setup fails after an exact
     reconcile: async (target: ScaleTarget) => current === target.before ? 'before' as const :
       current === target.after ? 'after' as const : 'unknown' as const,
     beginMeasurement: async () => { throw new Error('measurement setup failed'); },
-    measure: async () => ({ committedRowsPerSecond: 1000, qapPendingBacklog: 0, qapP95LatencyMs: 0 }),
+    measure: async () => ({ committedRowsPerSecond: 1000, qapPendingBacklog: 0 }),
   };
   await assert.rejects(executeScaleTrial(step, adapter, token), /measurement setup failed/);
   assert.deepEqual(applied.map(target => target.after), [step.after, step.restore.after]);
@@ -108,7 +123,7 @@ test('an uncertain scale application is neither replayed nor rolled back', async
     assertCustody: async () => {}, persistIntent: async () => {},
     apply: async (target: ScaleTarget) => { applied.push(target); throw new Error('lost response'); },
     reconcile: async () => observations++ === 0 ? 'before' as const : 'unknown' as const,
-    measure: async () => ({ committedRowsPerSecond: 1000, qapPendingBacklog: 0, qapP95LatencyMs: 0 }),
+    measure: async () => ({ committedRowsPerSecond: 1000, qapPendingBacklog: 0 }),
   };
   await assert.rejects(executeScaleTrial(step, adapter, token), /refusing to replay or roll back/);
   assert.deepEqual(applied.map(target => target.after), [2]);
@@ -124,7 +139,7 @@ test('a lost apply response with exact after-state is measured without replay', 
     apply: async (target: ScaleTarget) => { applied.push(target); current = target.after; throw new Error('lost response'); },
     reconcile: async (target: ScaleTarget) => current === target.before ? 'before' as const :
       current === target.after ? 'after' as const : 'unknown' as const,
-    measure: async () => ({ committedRowsPerSecond: 1100, qapPendingBacklog: 0, qapP95LatencyMs: 0 }),
+    measure: async () => ({ committedRowsPerSecond: 1100, qapPendingBacklog: 0 }),
   };
   assert.equal((await executeScaleTrial(step, adapter, token)).outcome, 'keep');
   assert.deepEqual(applied.map(target => target.after), [2]);
@@ -143,7 +158,7 @@ test('an uncertain restore response is reconciled instead of replayed', async ()
     },
     reconcile: async (target: ScaleTarget) => current === target.before ? 'before' as const :
       current === target.after ? 'after' as const : 'unknown' as const,
-    measure: async () => ({ committedRowsPerSecond: 1000, qapPendingBacklog: 0, qapP95LatencyMs: 0 }),
+    measure: async () => ({ committedRowsPerSecond: 1000, qapPendingBacklog: 0 }),
   };
   assert.equal((await executeScaleTrial(step, adapter, token)).outcome, 'revert');
   assert.deepEqual(applied.map(target => target.after), [2, 1]);
@@ -151,10 +166,14 @@ test('an uncertain restore response is reconciled instead of replayed', async ()
 
 test('Kusto trials keep QAP improvement at stable ingress and revert without it', () => {
   const step = recommendScaleStep(evidence({ qapBacklogGrowing: true, committedRateStable: true, kustoSaturated: true,
-    qapPendingBacklog: 20, qapP95LatencyMs: 100 }))!;
-  assert.equal(assessScaleTrial(step, { committedRowsPerSecond: 1000, qapPendingBacklog: 18, qapP95LatencyMs: 94 }).outcome, 'keep');
-  assert.equal(assessScaleTrial(step, { committedRowsPerSecond: 900, qapPendingBacklog: 10, qapP95LatencyMs: 80 }).outcome, 'revert');
-  assert.equal(assessScaleTrial(step, { committedRowsPerSecond: 1000, qapPendingBacklog: 19, qapP95LatencyMs: 110 }).outcome, 'revert');
+    qapPendingBacklog: 20 }))!;
+  assert.equal(assessScaleTrial(step, { committedRowsPerSecond: 1000, qapPendingBacklog: 19 }).outcome, 'keep');
+  assert.equal(assessScaleTrial(step, { committedRowsPerSecond: 950, qapPendingBacklog: 19 }).outcome, 'keep');
+  assert.equal(assessScaleTrial(step, { committedRowsPerSecond: 1050, qapPendingBacklog: 19 }).outcome, 'keep');
+  assert.equal(assessScaleTrial(step, { committedRowsPerSecond: 949, qapPendingBacklog: 10 }).outcome, 'revert');
+  assert.equal(assessScaleTrial(step, { committedRowsPerSecond: 1051, qapPendingBacklog: 10 }).outcome, 'revert');
+  assert.equal(assessScaleTrial(step, { committedRowsPerSecond: 1000, qapPendingBacklog: 20 }).outcome, 'revert');
+  assert.equal(assessScaleTrial(step, { committedRowsPerSecond: 1000, qapPendingBacklog: 21 }, 1).outcome, 'stop');
 });
 
 test('scale input parser rejects unknown and nonreversible target shapes', () => {
@@ -162,7 +181,7 @@ test('scale input parser rejects unknown and nonreversible target shapes', () =>
   assert.throws(() => validateScaleTarget({ dimension: 'loadgen-max', before: 1.5, after: 2 }), /safe integers/);
   assert.throws(() => assessScaleTrial({ dimension: 'kusto-capacity', before: 2, after: 3,
     restore: { dimension: 'kusto-capacity', before: 3, after: 4 }, evidence: ['saturated'], baselineCommittedRowsPerSecond: 1,
-    baselineQapPendingBacklog: 1, baselineQapP95LatencyMs: 1 }, { committedRowsPerSecond: 2, qapPendingBacklog: 0, qapP95LatencyMs: 0 }), /reversible/);
+    baselineQapPendingBacklog: 1 }, { committedRowsPerSecond: 2, qapPendingBacklog: 0 }), /reversible/);
 });
 
 test('safe idle requires stable QAP, healthy pods, preserved rows, and recorded AKS/Kusto baselines', () => {

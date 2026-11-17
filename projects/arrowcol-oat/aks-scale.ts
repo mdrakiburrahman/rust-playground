@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
+import { open } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import { pathToFileURL } from 'node:url';
@@ -110,7 +110,7 @@ export function newScaleTrialReceipt(input: {
     deadline_at_ms: now + timeoutMs, restore_deadline_at_ms: now + timeoutMs + SCALE_RESTORE_TIMEOUT_MS, target: validatedTarget,
     restore: validateCampaignScaleTarget({ dimension: validatedTarget.dimension, before: validatedTarget.after, after: validatedTarget.before }),
     evidence: [...step.evidence], baseline: { committed_rows_per_second: step.baselineCommittedRowsPerSecond,
-      qap_pending_backlog: step.baselineQapPendingBacklog, qap_p95_latency_ms: step.baselineQapP95LatencyMs },
+      qap_pending_backlog: step.baselineQapPendingBacklog },
     resource: structuredClone(resource), phase: 'apply-intent' };
 }
 
@@ -119,7 +119,6 @@ export interface ScaleStep extends ScaleTarget {
   restore: ScaleTarget;
   baselineCommittedRowsPerSecond: number;
   baselineQapPendingBacklog: number;
-  baselineQapP95LatencyMs: number;
 }
 export interface ScaleEvidence {
   committedRowsPerSecond: number;
@@ -136,8 +135,6 @@ export interface ScaleEvidence {
   committedRateStable: boolean;
   qapPendingBacklog: number;
   previousQapPendingBacklog: number;
-  qapP95LatencyMs: number;
-  previousQapP95LatencyMs: number;
   kustoSaturated: boolean;
   loadgenMax: number;
   loadgenMaximum: number;
@@ -157,13 +154,11 @@ export interface ScaleEvidence {
 export interface ScaleMeasurement {
   committedRowsPerSecond: number;
   qapPendingBacklog: number;
-  qapP95LatencyMs: number;
 }
 export interface ScaleTrialResult {
   outcome: 'keep' | 'revert' | 'stop';
   committedRowsPerSecond: number;
   qapPendingBacklog: number;
-  qapP95LatencyMs: number;
   ineffectiveIncrements: number;
   reason: string;
 }
@@ -177,7 +172,7 @@ function oneStep(step: ScaleStep): ScaleStep {
   validateCampaignScaleTarget({ dimension: step.dimension, before: step.before, after: step.after });
   validateCampaignScaleTarget(step.restore);
   if (!nonnegative(step.baselineCommittedRowsPerSecond) || !Number.isSafeInteger(step.baselineQapPendingBacklog) ||
-      step.baselineQapPendingBacklog < 0 || !nonnegative(step.baselineQapP95LatencyMs) ||
+      step.baselineQapPendingBacklog < 0 ||
       step.before === step.after || step.restore.dimension !== step.dimension || step.restore.before !== step.after ||
       step.restore.after !== step.before) throw new Error('Scale step must be a measured, reversible, single-dimension change.');
   return step;
@@ -186,14 +181,14 @@ function makeStep(evidence: ScaleEvidence, dimension: ScaleDimension, before: nu
   tags: string[]): ScaleStep {
   return oneStep({ ...target(dimension, before, after), restore: target(dimension, after, before), evidence: tags,
     baselineCommittedRowsPerSecond: evidence.committedRowsPerSecond, baselineQapPendingBacklog: evidence.qapPendingBacklog,
-    baselineQapP95LatencyMs: evidence.qapP95LatencyMs });
+  });
 }
 
 /** Select one reversible step only when its corresponding bottleneck is measured. */
 export function recommendScaleStep(evidence: ScaleEvidence): ScaleStep | undefined {
   const measurements = [evidence.committedRowsPerSecond, evidence.offeredRowsPerSecond, evidence.estimatedCollectorCapacityRowsPerSecond,
     evidence.collectorCpuLimitCores, evidence.collectorCpuLimitMaximum, evidence.collectorMemoryLimitGiB,
-    evidence.collectorMemoryLimitMaximumGiB, evidence.qapP95LatencyMs, evidence.previousQapP95LatencyMs];
+    evidence.collectorMemoryLimitMaximumGiB];
   const counts = [evidence.qapPendingBacklog, evidence.previousQapPendingBacklog, evidence.loadgenMax, evidence.loadgenMaximum,
     evidence.collectorNodeMax, evidence.collectorNodeMaxMaximum, evidence.kustoCapacity, evidence.kustoCapacityMaximum,
     evidence.systemPoolCount, evidence.unschedulablePods, evidence.pdbBlockedDrains];
@@ -240,11 +235,10 @@ export function recommendScaleStep(evidence: ScaleEvidence): ScaleStep | undefin
 }
 
 function improvedByFivePercent(after: number, before: number): boolean { return before > 0 && after <= before * 0.95; }
-function regressedByMoreThanFivePercent(after: number, before: number): boolean { return before === 0 ? after > 0 : after > before * 1.05; }
 export function assessScaleTrial(step: ScaleStep, measurement: ScaleMeasurement, previousIneffectiveIncrements = 0): ScaleTrialResult {
   oneStep(step);
   if (!measurement || !nonnegative(measurement.committedRowsPerSecond) || !Number.isSafeInteger(measurement.qapPendingBacklog) ||
-      measurement.qapPendingBacklog < 0 || !nonnegative(measurement.qapP95LatencyMs) ||
+      measurement.qapPendingBacklog < 0 ||
       !Number.isSafeInteger(previousIneffectiveIncrements) || previousIneffectiveIncrements < 0) {
     throw new Error('Scale trial result is malformed.');
   }
@@ -254,11 +248,7 @@ export function assessScaleTrial(step: ScaleStep, measurement: ScaleMeasurement,
     const baseline = step.baselineCommittedRowsPerSecond;
     const ingressStable = baseline === 0 ? measurement.committedRowsPerSecond === 0 :
       Math.abs(measurement.committedRowsPerSecond - baseline) <= baseline * 0.05;
-    const qapImproved = improvedByFivePercent(measurement.qapPendingBacklog, step.baselineQapPendingBacklog) ||
-      improvedByFivePercent(measurement.qapP95LatencyMs, step.baselineQapP95LatencyMs);
-    const qapNotRegressed = !regressedByMoreThanFivePercent(measurement.qapPendingBacklog, step.baselineQapPendingBacklog) &&
-      !regressedByMoreThanFivePercent(measurement.qapP95LatencyMs, step.baselineQapP95LatencyMs);
-    targetImproved = ingressStable && qapImproved && qapNotRegressed;
+    targetImproved = ingressStable && improvedByFivePercent(measurement.qapPendingBacklog, step.baselineQapPendingBacklog);
     reason = targetImproved ? 'qap-pressure-improved-at-stable-ingress' : 'kusto-trial-did-not-improve-qap-pressure';
   }
   if (targetImproved) return { outcome: 'keep', ...measurement, ineffectiveIncrements: 0, reason };
@@ -364,7 +354,7 @@ function scaleEnvelope(value: unknown, state: CampaignState, now: number): Scale
       !exactKeys(value.evidence, ['committedRowsPerSecond', 'offeredRowsPerSecond', 'estimatedCollectorCapacityRowsPerSecond',
         'generatorCpuSaturated', 'generatorNetworkSaturated', 'collectorCpuSaturated', 'collectorThrottled', 'collectorMemorySaturated',
         'collectorPlacementBlocked', 'collectorNodePoolAtMaximum', 'qapBacklogGrowing', 'committedRateStable', 'qapPendingBacklog',
-        'previousQapPendingBacklog', 'qapP95LatencyMs', 'previousQapP95LatencyMs', 'kustoSaturated', 'loadgenMax', 'loadgenMaximum',
+        'previousQapPendingBacklog', 'kustoSaturated', 'loadgenMax', 'loadgenMaximum',
         'collectorCpuLimitCores', 'collectorCpuLimitMaximum', 'collectorMemoryLimitGiB', 'collectorMemoryLimitMaximumGiB',
         'collectorNodeMax', 'collectorNodeMaxMaximum', 'kustoCapacity', 'kustoCapacityMaximum', 'kustoSku', 'systemPoolCount',
         'unschedulablePods', 'pdbBlockedDrains'])) throw new Error('Scale evidence envelope is stale, incomplete or belongs to another campaign/run.');
@@ -379,18 +369,28 @@ function measurementEnvelope(value: unknown, state: CampaignState, now: number):
       now - (value.observed_at_ms as number) > 300_000 || !Number.isSafeInteger(value.window_ms) ||
       (value.window_ms as number) < 30_000 || (value.window_ms as number) > 300_000 ||
       !validEvidenceSources(value.sources) || !record(value.measurement) ||
-      !exactKeys(value.measurement, ['committedRowsPerSecond', 'qapPendingBacklog', 'qapP95LatencyMs']))
+      !exactKeys(value.measurement, ['committedRowsPerSecond', 'qapPendingBacklog']))
     throw new Error('Scale measurement envelope is stale, incomplete or belongs to another campaign/run.');
   const measurement = value.measurement as unknown as ScaleMeasurement;
   if (!nonnegative(measurement.committedRowsPerSecond) || !Number.isSafeInteger(measurement.qapPendingBacklog) ||
-      measurement.qapPendingBacklog < 0 || !nonnegative(measurement.qapP95LatencyMs)) throw new Error('Scale measurement is UNKNOWN.');
+      measurement.qapPendingBacklog < 0) throw new Error('Scale measurement is UNKNOWN.');
   return value as unknown as ScaleMeasurementEnvelope;
 }
 export type ScaleEvidenceVerifier = (evidence: ScaleEvidenceEnvelope, state: CampaignState) => Promise<void>;
-async function readJsonFile(file: string): Promise<unknown> {
-  const bytes = await readFile(resolve(ROOT, file));
-  if (bytes.byteLength > 262_144) throw new Error('Scale evidence file exceeds its fixed size bound.');
-  try { return JSON.parse(bytes.toString('utf8')) as unknown; } catch { throw new Error('Scale evidence file is not valid JSON.'); }
+export async function readJsonFile(file: string): Promise<unknown> {
+  const handle = await open(resolve(ROOT, file), 'r');
+  try {
+    const bytes = Buffer.alloc(262_145);
+    let length = 0;
+    while (length < bytes.length) {
+      const read = await handle.read(bytes, length, bytes.length - length, null);
+      if (!read.bytesRead) break;
+      length += read.bytesRead;
+    }
+    if (length > 262_144) throw new Error('Scale evidence file exceeds its fixed size bound.');
+    try { return JSON.parse(bytes.subarray(0, length).toString('utf8')) as unknown; }
+    catch { throw new Error('Scale evidence file is not valid JSON.'); }
+  } finally { await handle.close(); }
 }
 async function waitForScaleMeasurement(file: string, state: CampaignState, notBefore: number, deadline: number): Promise<ScaleMeasurement> {
   while (Date.now() < deadline) {

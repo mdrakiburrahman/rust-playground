@@ -386,7 +386,7 @@ test('scale trial journal rejects malformed target bindings and duplicate ids', 
   const armed = { ...state, mode: 'armed' as const, runInventory: inventory };
   const target = { dimension: 'collector-cpu-limit' as const, before: 2, after: 3 };
   const step: ScaleStep = { ...target, restore: { dimension: target.dimension, before: 3, after: 2 }, evidence: ['collector-cpu-saturated'],
-    baselineCommittedRowsPerSecond: 100, baselineQapPendingBacklog: 1, baselineQapP95LatencyMs: 10 };
+    baselineCommittedRowsPerSecond: 100, baselineQapPendingBacklog: 1 };
   const generated = newScaleTrialReceipt({ state: armed, step, resource: { transport: 'kubernetes',
     resource_id: 'apps/v1/Deployment/' + inventory.namespace.name + '/arrowcol/' + inventory.resources[0]!.uid, api_version: 'apps/v1',
     kind: 'Deployment', namespace: inventory.namespace.name, name: 'arrowcol', uid: inventory.resources[0]!.uid }, now: armed.startedAtMs });
@@ -398,12 +398,17 @@ test('scale trial journal rejects malformed target bindings and duplicate ids', 
     fencing_token: 1, cell_run_id: inventory.cell_run_id, started_at_ms: armed.startedAtMs, deadline_at_ms: armed.startedAtMs + 60_000,
     restore_deadline_at_ms: armed.startedAtMs + 360_000,
     target, restore: { dimension: target.dimension, before: 3, after: 2 }, evidence: ['collector-cpu-saturated'],
-    baseline: { committed_rows_per_second: 100, qap_pending_backlog: 1, qap_p95_latency_ms: 10 },
+    baseline: { committed_rows_per_second: 100, qap_pending_backlog: 1 },
     resource: { transport: 'kubernetes' as const, resource_id: 'apps/v1/Deployment/' + inventory.namespace.name + '/arrowcol/' + inventory.resources[0]!.uid,
       api_version: 'apps/v1', kind: 'Deployment', namespace: inventory.namespace.name, name: 'arrowcol', uid: inventory.resources[0]!.uid },
     phase: 'apply-intent' as const,
   };
   assert.equal(validateCampaignState({ ...armed, scaleTrials: [receipt] }).scaleTrials?.length, 1);
+  assert.throws(() => validateCampaignState({ ...armed, scaleTrials: [{ ...receipt,
+    baseline: { ...receipt.baseline, qap_p95_latency_ms: 10 } }] }), /malformed/);
+  assert.throws(() => validateCampaignState({ ...armed, scaleTrials: [{ ...receipt, phase: 'kept',
+    result: { outcome: 'keep', committed_rows_per_second: 110, qap_pending_backlog: 1,
+      qap_p95_latency_ms: 10, ineffective_increments: 0, reason: 'legacy-row-latency-is-not-evidence' } }] }), /malformed/);
   assert.throws(() => validateCampaignState({ ...armed, scaleTrials: [receipt, receipt] }), /duplicated/);
   assert.throws(() => validateCampaignState({ ...armed, scaleTrials: [{ ...receipt, restore: { ...receipt.restore, after: 4 } }] }), /malformed/);
   assert.throws(() => validateCampaignState({ ...armed, scaleTrials: [{ ...receipt, restore_deadline_at_ms: receipt.deadline_at_ms }] }), /malformed/);

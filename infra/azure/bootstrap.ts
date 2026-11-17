@@ -266,11 +266,14 @@ export function write_private(filename: string, values: Record<string, string>):
 }
 export interface ProcessResult { returncode: number; stdout: string; stderr: string }
 export async function run_tree(command: string[], timeout: number, cwd?: string,
-  env?: NodeJS.ProcessEnv, onStderr?: (chunk: string) => void): Promise<ProcessResult> {
+  env?: NodeJS.ProcessEnv, onStderr?: (chunk: string) => void, maxOutputBytes?: number): Promise<ProcessResult> {
+  if (maxOutputBytes !== undefined && (!Number.isSafeInteger(maxOutputBytes) || maxOutputBytes < 1))
+    throw new Failure('maxOutputBytes must be a positive safe integer before command admission.');
   return new Promise((resolve, reject) => {
     const child = spawn(command[0], command.slice(1), { detached: true, cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
-    let stdout = '', stderr = '', failure: Failure | undefined;
+    let stdout = '', stderr = '', failure: Failure | undefined, outputBytes = 0, overflow = false;
     const kill = (message: string) => {
+      if (failure) return;
       failure = new Failure(message);
       if (child.pid) { try { process.kill(-child.pid, 'SIGKILL'); } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'ESRCH') failure = new Failure('Process group could not be terminated; outcome unknown.');
@@ -279,8 +282,19 @@ export async function run_tree(command: string[], timeout: number, cwd?: string,
     const interrupt = () => kill('Command interrupted; outcome unknown and process group killed. Authority stays blocking; no automatic clear.');
     const timer = setTimeout(() => kill('Command timed out; outcome unknown and process group killed. Authority stays blocking; no automatic clear.'), timeout * 1000);
     process.on('SIGINT', interrupt); process.on('SIGTERM', interrupt);
-    child.stdout.on('data', data => { stdout += data.toString(); });
+    const accept = (data: Buffer): boolean => {
+      if (overflow) return false;
+      if (maxOutputBytes !== undefined && data.byteLength > maxOutputBytes - outputBytes) {
+        overflow = true;
+        kill('Command output exceeded its fixed byte bound; outcome unknown and process group killed.');
+        return false;
+      }
+      outputBytes += data.byteLength;
+      return true;
+    };
+    child.stdout.on('data', (data: Buffer) => { if (accept(data)) stdout += data.toString(); });
     child.stderr.on('data', data => {
+      if (!accept(data)) return;
       const chunk = data.toString();
       stderr += chunk;
       onStderr?.(chunk);

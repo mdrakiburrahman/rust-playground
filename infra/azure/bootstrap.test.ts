@@ -1498,6 +1498,26 @@ test('isolated initializer hook accepts the approved group family and rejects in
     assert.equal(result.stdout, '');
   }
 });
+test('process output cap rejects combined raw stdout/stderr bytes even on successful exit', async () => {
+  const command = [process.execPath, '-e', "process.stdout.write('€'); process.stderr.write('é')"];
+  await assert.rejects(realRun(command, 5, undefined, undefined, undefined, 4), /output.*bound/i);
+  const accepted = await realRun(command, 5, undefined, undefined, undefined, 5);
+  assert.equal(accepted.stdout, '€');
+  assert.equal(accepted.stderr, 'é');
+  assert.equal(accepted.returncode, 0);
+  await assert.rejects(realRun([process.execPath, '-e', "process.stdout.write('€')"],
+    5, undefined, undefined, undefined, 2), /output.*bound/i);
+});
+test('process output overflow stops stderr callbacks and an omitted cap preserves output', async () => {
+  let callbacks = 0;
+  const command = [process.execPath, '-e', "process.stderr.write('x'.repeat(65536))"];
+  await assert.rejects(realRun(command, 5, undefined, undefined, () => { callbacks++; }, 8), /output.*bound/i);
+  assert.equal(callbacks, 0);
+  const uncapped = await realRun(command, 5);
+  assert.equal(uncapped.stderr.length, 65536);
+  for (const invalid of [0, -1, 0.5, Number.NaN, Number.POSITIVE_INFINITY])
+    await assert.rejects(realRun(['must-not-spawn-invalid-cap'], 5, undefined, undefined, undefined, invalid), /maxOutputBytes/);
+});
 test('timeout kills complete process group and reports unknown outcome', async () => {
   const marker = path.join(directory, 'child-survived');
   await assert.rejects(() => realRun(['bash', '-c', `(sleep .8; touch '${marker}') & sleep 30`], 0.1), /outcome unknown/);
