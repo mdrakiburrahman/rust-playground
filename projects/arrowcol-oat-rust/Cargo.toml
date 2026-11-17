@@ -10,6 +10,14 @@ repository.workspace = true
 description = "Rust OAT benchmark server for ArrowCol"
 publish = false
 
+[features]
+signal-fixture = ["dep:nix", "tokio/signal"]
+
+[[bin]]
+name = "oat-signal-fixture"
+path = "src/bin/oat-signal-fixture.rs"
+required-features = ["signal-fixture"]
+
 [dependencies]
 anyhow.workspace = true
 async-trait = "0.1"
@@ -43,6 +51,7 @@ url = "2"
 uuid = { version = "1", features = ["v4"] }
 
 [target.'cfg(unix)'.dependencies]
+nix = { version = "0.31.3", default-features = false, features = ["signal"], optional = true }
 rustix = { version = "1", features = ["process"] }
 
 [lints]
