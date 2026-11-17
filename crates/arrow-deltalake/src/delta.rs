@@ -2477,6 +2477,15 @@ impl DeltaTable {
             bail!("fresh table target is not empty; existing objects are never adopted");
         }
         table.create_schema(Arc::clone(&incoming), Some(publication_fence))?;
+        let prefix = table.object_path("")?;
+        let store = Arc::clone(&table.store);
+        let objects: Vec<_> = shared_executor()?.block_on(async move {
+            use futures::{StreamExt, TryStreamExt};
+            store.list(Some(&prefix)).take(2).try_collect().await
+        })?;
+        if objects.len() != 1 || objects[0].location != table.object_path("_delta_log/00000000000000000000.json")? {
+            bail!("fresh table readback contains objects other than its version0 log");
+        }
         let snapshot = table.snapshot()?;
         let metadata = snapshot.table_configuration().metadata();
         let existing: arrow::datatypes::Schema = snapshot.schema().as_ref().try_into_arrow()?;

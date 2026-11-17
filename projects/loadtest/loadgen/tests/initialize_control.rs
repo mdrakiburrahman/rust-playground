@@ -143,9 +143,7 @@ impl arrow_deltalake::delta::PublicationFence for SetupFence {
         self.calls.fetch_add(1, Ordering::SeqCst);
         assert_eq!((context.proposed_version(), context.file_count()), (0, 0));
         if self.reject {
-            return Err(PublicationFenceError::stale_ownership(
-                "original publication authority lost",
-            ));
+            return Err(PublicationFenceError::stale("original publication authority lost"));
         }
         if let Some((path, bytes)) = &self.collision {
             let result = (|| -> Result<()> {
@@ -180,7 +178,12 @@ async fn owned_run_setup_creates_one_zero_row_table_and_refuses_collision_withou
     let scratch = Scratch::new()?;
     let mut initial = authority("ready-v1");
     initial.insert("operatornote".into(), "preserve".into());
-    initial.insert("publishers".into(), format!(r#"{{"{ROTATED}":"active"}}"#));
+    initial.insert("occupancy".into(), "testing".into());
+    initial.insert("occupancyid".into(), GENERATION.into());
+    initial.insert(
+        "publishers".into(),
+        serde_json::json!({ROTATED: {"generation": GENERATION, "state": "active"}}).to_string(),
+    );
     let metadata = Memory::new(initial.clone());
     let plan = owned_plan();
     let fence = Arc::new(SetupFence::default());
@@ -318,6 +321,21 @@ async fn owned_run_setup_refuses_bad_bindings_generation_authority_and_nonempty_
     assert_eq!(fence.calls.load(Ordering::SeqCst), 1);
     assert_eq!(metadata.metadata(), initial);
     assert_eq!(files(&scratch.data())?, 0);
+    let mut opaque = owned_transport(local(&scratch)?);
+    opaque.mutation_retries = arrow_deltalake::publisher::MutationRetries::Opaque;
+    assert!(
+        initialize_owned_run_table_with(
+            original.clone(),
+            SANDBOX,
+            metadata.clone(),
+            opaque,
+            owned_authority(&original, fence.clone()),
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(metadata.metadata(), initial);
+    assert_eq!(files(&scratch.data())?, 0);
     let path = owned_log_path(&scratch)
         .parent()
         .context("log directory")?
@@ -364,6 +382,49 @@ async fn owned_run_setup_unknown_schema_mutation_retains_registration() -> Resul
     assert!(format!("{error:#}").contains("registration retained"), "{error:#}");
     assert_eq!(metadata.members()?, 1);
     assert!(metadata.metadata()["publishers"].contains("uncertain"));
+    assert_eq!(files(&scratch.data())?, 0);
+    Ok(())
+}
+
+struct LostRegistration(Arc<Memory>);
+
+impl fmt::Debug for LostRegistration {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("LostRegistration")
+    }
+}
+
+#[async_trait]
+impl ControlMetadata for LostRegistration {
+    async fn read(&self) -> Result<MetadataSnapshot> {
+        self.0.read().await
+    }
+
+    async fn compare_and_set(&self, expected: &MetadataSnapshot, metadata: &BTreeMap<String, String>) -> CasOutcome {
+        match self.0.compare_and_set(expected, metadata).await {
+            CasOutcome::Applied => CasOutcome::Unknown("offline response loss after registration".into()),
+            other => other,
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn owned_run_setup_lost_registration_response_never_forces_unregister() -> Result<()> {
+    let scratch = Scratch::new()?;
+    let metadata = Memory::new(authority("ready-v1"));
+    let plan = owned_plan();
+    let error = arrowcol_loadgen::initialize::initialize_owned_run_table_with(
+        plan.clone(),
+        SANDBOX,
+        Arc::new(LostRegistration(metadata.clone())),
+        owned_transport(local(&scratch)?),
+        owned_authority(&plan, Arc::new(SetupFence::default())),
+    )
+    .await
+    .err()
+    .context("lost registration response succeeded")?;
+    assert!(format!("{error:#}").contains("outcome unknown"), "{error:#}");
+    assert_eq!(metadata.members()?, 1);
     assert_eq!(files(&scratch.data())?, 0);
     Ok(())
 }

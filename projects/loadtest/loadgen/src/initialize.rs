@@ -66,6 +66,8 @@ impl OwnedRunTablePlan {
         let run = checked_root(&self.run_root, &self.account, &self.container)?;
         let suffix = format!("/campaigns/{}/", self.campaign_id);
         if !campaign.path().ends_with(&suffix)
+            || self.campaign_root != campaign.as_str()
+            || self.run_root != run.as_str()
             || campaign.path().contains("//")
             || campaign
                 .path()
@@ -84,15 +86,9 @@ impl OwnedRunTablePlan {
             .into_iter()
             .find(|statement| statement.identity.to_string() == self.table)
             .context("frozen canonical table is absent")?;
-        let identity = &statement.identity;
-        let relative = format!(
-            "dataflow/{}/{}/{}",
-            identity.catalog(),
-            identity.schema(),
-            identity.table()
-        );
+        let (entry, schema) = canonical_entry(&statement)?;
         let root = checked_root(&self.run_root, &self.account, &self.container)?;
-        Ok((root.join(&relative)?, partitioned_schema(&statement)?))
+        Ok((root.join(&entry.relative_path)?, schema))
     }
 }
 
@@ -235,24 +231,23 @@ fn partitioned_schema(statement: &SchemaStatement) -> Result<Arc<Schema>> {
 }
 
 fn entries() -> Result<Vec<(ManifestEntry, Arc<Schema>)>> {
-    let mut entries = Vec::new();
-    for statement in schema_statements()? {
-        let schema = partitioned_schema(&statement)?;
-        let identity = statement.identity;
-        entries.push((
-            ManifestEntry {
-                name: format!("dataflow_{}", identity.table()),
-                relative_path: format!(
-                    "dataflow/{}/{}/{}",
-                    identity.catalog(),
-                    identity.schema(),
-                    identity.table()
-                ),
-            },
-            schema,
-        ));
-    }
-    Ok(entries)
+    schema_statements()?.iter().map(canonical_entry).collect()
+}
+
+fn canonical_entry(statement: &SchemaStatement) -> Result<(ManifestEntry, Arc<Schema>)> {
+    let identity = &statement.identity;
+    Ok((
+        ManifestEntry {
+            name: format!("dataflow_{}", identity.table()),
+            relative_path: format!(
+                "dataflow/{}/{}/{}",
+                identity.catalog(),
+                identity.schema(),
+                identity.table()
+            ),
+        },
+        partitioned_schema(statement)?,
+    ))
 }
 
 /// Initialize only selected, fresh local table directories; existing tables are never opened.

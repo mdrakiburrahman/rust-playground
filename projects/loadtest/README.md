@@ -297,6 +297,29 @@ written; paths such as `dataflow/telemetry/sqlserver/sqlserver_active_sessions`
 are relative to `ARROWCOL_AZURE_TABLE_ROOT`, including any private isolated-run
 prefix. Initialization does not insert data or prove Azure/QAP readiness.
 
+### Held single owned-run setup
+
+`arrowcol-loadgen initialize-owned-run-table --plan <private-plan.json>` validates
+the allocation, then **fails before authentication or publisher admission**. The
+per-operation auth/control/storage bridge is not yet wired; there is no bypass
+flag. This is not a replacement for `initialize-azure` and changes no defaults.
+
+| Plan binding | Required value |
+| --- | --- |
+| `account`, `container` | Exact selected ADLS account/data container; credential-free `abfss` roots |
+| `campaign_id`, `run_id`, `generation`, `owner_id` | Canonical lowercase UUIDs, retaining the captured generation and original publication owner |
+| `campaign_root`, `run_root` | Canonical URLs ending `/campaigns/<campaign_id>/` and `/campaigns/<campaign_id>/runs/<run_id>/` |
+| `table`, `partition_by_ingestion_date`, `fencing_token` | `telemetry.sqlserver.sqlserver_availability_replica_states`, `true`, original positive token |
+
+The explicit-transport library body uses normal `ready-v1` publisher admission,
+not bootstrap/reset. It creates only `dataflow/telemetry/sqlserver/` plus the
+selected table beneath the run root. Kernel creates version0 with no data files;
+the original publication fence runs at the actual schema commit. Nonempty roots,
+collisions, stale authority and uncertain outcomes cannot succeed. Its creation
+readback is provisional until clean publisher drain. Offline fixture receipts
+are not live evidence; shared registry/lease/drain effects require their own
+reviewed per-operation bridge and execution clearance.
+
 ## Options
 
 | Option | Meaning | Default |
