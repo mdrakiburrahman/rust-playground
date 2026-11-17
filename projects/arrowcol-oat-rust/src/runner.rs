@@ -9319,6 +9319,8 @@ fn project_scale_out_runtime(runtime_config: &mut Value, config: &OatConfig, rep
     set_runtime_replicas(runtime_config, replicas)?;
     runtime_config["campaignProfile"] = json!("scale_out_single_table");
     runtime_config["hotTable"] = json!(hot_table);
+    runtime_config["collectorStartupTable"] =
+        json!({"catalog": "telemetry", "schema": "sqlserver", "table": hot_table});
     Ok(())
 }
 
@@ -13644,6 +13646,9 @@ mod tests {
         project_scale_out_runtime(&mut runtime, &config, 2)?;
         assert_eq!(runtime["campaignProfile"], "scale_out_single_table");
         assert_eq!(runtime["hotTable"], config.tables[0]);
+        assert_eq!(runtime["collectorStartupTable"], json!({
+            "catalog": "telemetry", "schema": "sqlserver", "table": config.tables[0]
+        }));
         assert_eq!(runtime["collectorReplicas"], 2);
         assert_eq!(runtime["routerReplicas"], 2);
         config.tables.push("sqlserver_wait_stats".to_owned());

@@ -35,6 +35,7 @@ export interface RuntimeConfig {
   hotTable?: string;
   collectorReplicas?: number;
   routerReplicas?: number;
+  collectorStartupTable?: { catalog: string; schema: string; table: string } | null;
 }
 type Resource = Record<string, any>;
 export type Phase = 'identity' | 'foundation' | 'bootstrap' | 'workload';
@@ -98,7 +99,7 @@ export function validateRuntime(input: unknown, allowUnpublishedImages = false):
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('runtime config must be an object');
   const c = input as RuntimeConfig;
   const required = ['deltaRoot', 'effective_stop_budgets', 'images', 'namespace', 'oatRunId', 'workloadIdentityClientId', 'subscriptionId', 'stamp'];
-  if (required.some((key) => !Object.hasOwn(c, key)) || Object.keys(c).some((key) => ![...required, 'serviceAccount', 'maintenance', 'quiver', 'resources', 'collectorWorkers', 'campaignProfile', 'hotTable', 'collectorReplicas', 'routerReplicas'].includes(key))) {
+  if (required.some((key) => !Object.hasOwn(c, key)) || Object.keys(c).some((key) => ![...required, 'serviceAccount', 'maintenance', 'quiver', 'resources', 'collectorWorkers', 'campaignProfile', 'hotTable', 'collectorReplicas', 'routerReplicas', 'collectorStartupTable'].includes(key))) {
     throw new Error('runtime config has missing or unknown fields');
   }
   parseEffectiveStopBudgets(c.effective_stop_budgets);
@@ -123,6 +124,14 @@ export function validateRuntime(input: unknown, allowUnpublishedImages = false):
   }
   if (Object.hasOwn(c, 'collectorWorkers') && (!Number.isSafeInteger(c.collectorWorkers) || c.collectorWorkers! < 1 || c.collectorWorkers! > 256))
     throw new Error('collectorWorkers must be an integer from 1 to 256');
+  if (c.collectorStartupTable != null) {
+    const table = c.collectorStartupTable;
+    if (typeof table !== 'object' || Array.isArray(table) ||
+        Object.keys(table).sort().join() !== 'catalog,schema,table' ||
+        [table.catalog, table.schema, table.table].some(value =>
+          typeof value !== 'string' || !/^[a-z][a-z0-9_]*$/.test(value)))
+      throw new Error('collectorStartupTable must be a strict qualified table selector');
+  }
   if (typeof c.namespace !== 'string' || !dns.test(c.namespace) || c.namespace.startsWith('kube-') || ['default', 'azure-qap'].includes(c.namespace)) {
     throw new Error('use a dedicated OAT namespace (not the QAP namespace)');
   }
@@ -328,6 +337,7 @@ export async function renderRuntime(input: unknown, phase: Phase): Promise<Resou
       name: 'dataflow', image: c.images.dataflow, securityContext: security,
       args: ['--config', '/etc/oat/dataflow.yaml', '--num-cores', String(c.collectorWorkers ?? 1)],
       env: [...cloudEnv, env('ARROWCOL_SQL_HOST', 'arrowcol-sql'), env('ARROWCOL_SQL_PASSWORD_FILE', '/run/app/password'),
+        ...(c.collectorStartupTable ? [env('ARROWCOL_COLLECTOR_EXPORTER_CONFIG', JSON.stringify({ startup_table: c.collectorStartupTable }))] : []),
         env('ARROWCOL_PARTITION_GRANULARITY', c.maintenance?.granularity ?? 'hour'),
         env('ARROWCOL_SQL_TRUST_CERT', 'true'), env('ARROWCOL_CATALOG_ENDPOINT', 'http://arrowcol-catalog:8817'),
         env('ARROWCOL_CATALOG_DDL_IDENTITY_SECRET_FILE', '/run/auth/internal-hmac'),

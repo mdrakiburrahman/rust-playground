@@ -41,6 +41,21 @@ test('rejects mutable images, QAP namespace, wrong stamp and unknown fields', ()
   assert.throws(() => validateRuntime({ ...config(), quiver: 'true' }), /explicit boolean/);
 });
 
+test('collector startup table is strictly validated and projected only when requested', async () => {
+  const selector = { catalog: 'telemetry', schema: 'sqlserver', table: 'sqlserver_availability_replica_states' };
+  for (const requested of [undefined, null, selector]) {
+    const objects = await renderRuntime({ ...config(), collectorStartupTable: requested }, 'workload');
+    const collector = objects.find(o => o.kind === 'Deployment' && o.metadata.name === 'arrowcol')!.spec.template.spec.containers[0];
+    const override = collector.env.find((entry: { name: string }) => entry.name === 'ARROWCOL_COLLECTOR_EXPORTER_CONFIG');
+    if (requested) assert.deepEqual(JSON.parse(override.value), { startup_table: selector });
+    else assert.equal(override, undefined);
+  }
+  for (const invalid of [{ ...selector, root: 'unexpected' }, { ...selector, schema: '' },
+    { ...selector, table: 1 }, { catalog: 'telemetry', schema: 'sqlserver' }, [], 'table']) {
+    assert.throws(() => validateRuntime({ ...config(), collectorStartupTable: invalid }), /strict qualified table selector/);
+  }
+});
+
 test('AKS resource overrides are strict and project through to role manifests', async () => {
   const c = config();
   c.collectorWorkers = 7;
