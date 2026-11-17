@@ -22,6 +22,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 #[cfg(test)]
 use std::sync::Arc;
+use std::sync::Arc;
 use std::time::Duration;
 
 const API_VERSION: &str = "2023-11-03";

@@ -631,6 +631,388 @@ mod storage_bridge {
             ))
         }
     }
+
+    #[cfg(test)]
+    mod bridge_tests {
+        use super::*;
+        use crate::publisher::PublisherSession;
+        use futures::TryStreamExt;
+        use object_store::{ObjectStore, PutMode, PutOptions};
+        use serde_json::{Value, json};
+        use tokio::io::{AsyncReadExt, DuplexStream};
+        use tokio::sync::Notify;
+
+        const GENERATION: &str = "00000000-0000-0000-0000-000000000003";
+        const UNRELATED: &str = "00000000-0000-0000-0000-000000000009";
+        const ROOT: &str = "abfss://data@offlineaccount.dfs.core.windows.net/owned-run/table/";
+
+        fn authority() -> StorageBridgeAuthority {
+            StorageBridgeAuthority {
+                campaign_id: "00000000-0000-0000-0000-000000000001".into(),
+                cell_run_id: "00000000-0000-0000-0000-000000000004".into(),
+                owner_id: "00000000-0000-0000-0000-000000000002".into(),
+                fencing_token: 7,
+                storage_account: "offlineaccount".into(),
+                table_root_url: ROOT.into(),
+                control_container_url: "https://offlineaccount.blob.core.windows.net/checkpoints".into(),
+                sandbox_id: "offline-sandbox".into(),
+                reset_generation: GENERATION.into(),
+            }
+        }
+
+        fn deadline(milliseconds: u64) -> anyhow::Result<u64> {
+            Ok(u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())? + milliseconds)
+        }
+
+        fn bridge(milliseconds: u64) -> anyhow::Result<(Arc<StorageBridge>, DuplexStream)> {
+            let (child, parent) = tokio::io::duplex(MAX_FRAME);
+            let (read, write) = tokio::io::split(child);
+            Ok((
+                StorageBridge::new(authority(), deadline(milliseconds)?, read, write)?,
+                parent,
+            ))
+        }
+
+        fn head() -> anyhow::Result<HttpRequest> {
+            let mut request = HttpRequest::new(object_store::client::HttpRequestBody::empty());
+            *request.method_mut() = reqwest::Method::HEAD;
+            *request.uri_mut() =
+                "https://offlineaccount.blob.core.windows.net/checkpoints?restype=container".parse()?;
+            Ok(request)
+        }
+
+        fn response(request: &Value, status: u16, headers: Vec<(String, String)>, body: &str) -> Value {
+            json!({
+                "schema_version": 1, "kind": "storage_http_response",
+                "request_id": request["request_id"], "request_sha256": request["request_sha256"],
+                "outcome": "response", "status": status, "headers": headers,
+                "body": body, "body_sha256": digest(body.as_bytes()), "truncated": false,
+            })
+        }
+
+        async fn read_request(reader: &mut BufReader<tokio::io::ReadHalf<DuplexStream>>) -> anyhow::Result<Value> {
+            let mut line = String::new();
+            anyhow::ensure!(reader.read_line(&mut line).await? > 0, "offline bridge EOF");
+            let mut value: Value = serde_json::from_str(&line)?;
+            let actual = value
+                .as_object_mut()
+                .ok_or_else(invalid)?
+                .remove("request_sha256")
+                .ok_or_else(invalid)?;
+            anyhow::ensure!(
+                actual == digest(&canonical(&value)?),
+                "canonical request digest mismatch"
+            );
+            value
+                .as_object_mut()
+                .ok_or_else(invalid)?
+                .insert("request_sha256".into(), actual);
+            anyhow::ensure!(value["body_sha256"] == digest(value["body"].as_str().ok_or_else(invalid)?.as_bytes()));
+            Ok(value)
+        }
+
+        struct Fixture {
+            metadata: BTreeMap<String, String>,
+            requests: Vec<Value>,
+            object: Option<String>,
+            responses: Vec<Value>,
+        }
+
+        impl Fixture {
+            fn ready() -> Self {
+                Self {
+                    metadata: BTreeMap::from([
+                        ("sandboxid".into(), "offline-sandbox".into()),
+                        ("resetstate".into(), "ready-v1".into()),
+                        ("resetgeneration".into(), GENERATION.into()),
+                        ("publisherregistryversion".into(), "1".into()),
+                        (
+                            "publishers".into(),
+                            json!({UNRELATED: {"generation": GENERATION, "state": "active"}}).to_string(),
+                        ),
+                        ("occupancy".into(), "released".into()),
+                        ("unrelated".into(), "preserve-me".into()),
+                    ]),
+                    requests: Vec::new(),
+                    object: None,
+                    responses: Vec::new(),
+                }
+            }
+        }
+
+        async fn serve(
+            parent: DuplexStream,
+            fixture: Arc<Mutex<Fixture>>,
+            hold_put: Option<Arc<Notify>>,
+        ) -> anyhow::Result<()> {
+            let (read, mut write) = tokio::io::split(parent);
+            let mut reader = BufReader::new(read);
+            loop {
+                let request = match read_request(&mut reader).await {
+                    Ok(request) => request,
+                    Err(_) => return Ok(()),
+                };
+                let mut state = fixture.lock().await;
+                state.requests.push(request.clone());
+                let method = request["method"].as_str().ok_or_else(invalid)?;
+                let url = Url::parse(request["url"].as_str().ok_or_else(invalid)?)?;
+                let headers: Vec<(String, String)> = serde_json::from_value(request["headers"].clone())?;
+                anyhow::ensure!(
+                    headers
+                        .iter()
+                        .all(|(name, _)| !name.eq_ignore_ascii_case("authorization"))
+                );
+                let mut status = 200;
+                let mut output_headers = Vec::new();
+                let mut body = String::new();
+                if request["target"] == "control" {
+                    if method == "HEAD" {
+                        output_headers.push(("etag".into(), format!("\"{}\"", state.requests.len())));
+                        output_headers.extend(
+                            state
+                                .metadata
+                                .iter()
+                                .map(|(k, v)| (format!("x-ms-meta-{k}"), v.clone())),
+                        );
+                    } else if url
+                        .query_pairs()
+                        .any(|(key, value)| key == "comp" && value == "metadata")
+                    {
+                        state.metadata = headers
+                            .iter()
+                            .filter_map(|(k, v)| k.strip_prefix("x-ms-meta-").map(|k| (k.to_owned(), v.clone())))
+                            .collect();
+                    } else if headers.iter().any(|(k, v)| k == "x-ms-lease-action" && v == "acquire") {
+                        status = 201;
+                    }
+                } else if method == "PUT" {
+                    if let Some(notify) = &hold_put {
+                        notify.notify_one();
+                        drop(state);
+                        std::future::pending::<()>().await;
+                        unreachable!();
+                    }
+                    anyhow::ensure!(headers.iter().any(|(k, v)| k == "if-none-match" && v == "*"));
+                    state.object = Some(request["body"].as_str().ok_or_else(invalid)?.to_owned());
+                    status = 201;
+                    output_headers.push(("etag".into(), "\"offline-object\"".into()));
+                    output_headers.push(("last-modified".into(), "Tue, 17 Nov 2026 03:00:00 GMT".into()));
+                } else if url.query_pairs().any(|(key, value)| key == "comp" && value == "list") {
+                    body = "<?xml version=\"1.0\"?><EnumerationResults ServiceEndpoint=\"https://offlineaccount.blob.core.windows.net\" ContainerName=\"data\"><Blobs></Blobs><NextMarker /></EnumerationResults>".into();
+                } else if let Some(object) = &state.object {
+                    body = object.clone();
+                    output_headers.push(("etag".into(), "\"offline-object\"".into()));
+                    output_headers.push(("last-modified".into(), "Tue, 17 Nov 2026 03:00:00 GMT".into()));
+                    output_headers.push(("content-length".into(), body.len().to_string()));
+                } else {
+                    status = 404;
+                }
+                let reply = response(&request, status, output_headers, &body);
+                state.responses.push(reply.clone());
+                drop(state);
+                write.write_all(&serde_json::to_vec(&reply)?).await?;
+                write.write_all(b"\n").await?;
+                write.flush().await?;
+            }
+        }
+
+        #[tokio::test]
+        async fn production_session_sdk_control_and_drain_use_one_unsigned_bridge() -> anyhow::Result<()> {
+            let (bridge, parent) = bridge(30_000)?;
+            let fixture = Arc::new(Mutex::new(Fixture::ready()));
+            let server = tokio::spawn(serve(parent, Arc::clone(&fixture), None));
+            let url = Url::parse(ROOT)?;
+            let session = PublisherSession::open_bridged_async(&url, Arc::clone(&bridge)).await?;
+            let publisher = session.publisher_id().ok_or_else(invalid)?.to_string();
+            let store = session.store_for_url(&url)?;
+            let empty = store
+                .list(Some(&object_store::path::Path::from("owned-run/table/")))
+                .try_collect::<Vec<_>>()
+                .await?;
+            assert!(empty.is_empty());
+            let path = object_store::path::Path::from("owned-run/table/_delta_log/00000000000000000000.json");
+            store
+                .put_opts(
+                    &path,
+                    "{\"offline_sdk_transport_witness\":true}\n".into(),
+                    PutOptions {
+                        mode: PutMode::Create,
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            assert!(store.get(&path).await?.bytes().await?.starts_with(b"{"));
+            session.close_after_drain_async().await?;
+            let state = fixture.lock().await;
+            assert!(state.metadata["publishers"].contains(UNRELATED));
+            assert!(!state.metadata["publishers"].contains(&publisher));
+            assert_eq!(state.metadata["unrelated"], "preserve-me");
+            assert!(
+                state
+                    .requests
+                    .iter()
+                    .any(|v| v["target"] == "object_store" && v["method"] == "PUT")
+            );
+            assert!(
+                state
+                    .requests
+                    .iter()
+                    .any(|v| v["target"] == "control" && v["method"] == "PUT")
+            );
+            assert!(
+                state
+                    .requests
+                    .windows(2)
+                    .all(|pair| pair[0]["request_id"].as_u64() < pair[1]["request_id"].as_u64())
+            );
+            eprintln!(
+                "D47_OFFLINE_GOLDEN={}",
+                json!({"offline_protocol_fixture_only":true,"requests":state.requests,"responses":state.responses})
+            );
+            drop(state);
+            server.abort();
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn cancelled_guarded_put_poisoning_retains_registration_and_blocks_forwarding() -> anyhow::Result<()> {
+            let (bridge, parent) = bridge(30_000)?;
+            let fixture = Arc::new(Mutex::new(Fixture::ready()));
+            let hold = Arc::new(Notify::new());
+            let server = tokio::spawn(serve(parent, Arc::clone(&fixture), Some(Arc::clone(&hold))));
+            let url = Url::parse(ROOT)?;
+            let session = PublisherSession::open_bridged_async(&url, bridge).await?;
+            let publisher = session.publisher_id().ok_or_else(invalid)?.to_string();
+            let store = session.store_for_url(&url)?;
+            let mutation = tokio::spawn({
+                let store = Arc::clone(&store);
+                async move {
+                    store
+                        .put_opts(
+                            &object_store::path::Path::from("owned-run/table/_delta_log/00000000000000000000.json"),
+                            "{}".into(),
+                            PutOptions {
+                                mode: PutMode::Create,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(5), hold.notified()).await?;
+            mutation.abort();
+            assert!(mutation.await.is_err());
+            let count = fixture.lock().await.requests.len();
+            assert!(
+                store
+                    .get(&object_store::path::Path::from(
+                        "owned-run/table/_delta_log/00000000000000000000.json"
+                    ))
+                    .await
+                    .is_err()
+            );
+            assert!(session.status().uncertain.is_some());
+            assert!(session.close_after_drain_async().await.is_err());
+            let state = fixture.lock().await;
+            assert_eq!(state.requests.len(), count);
+            assert!(state.metadata["publishers"].contains(&publisher));
+            assert!(state.metadata["publishers"].contains(UNRELATED));
+            server.abort();
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn corrupt_unknown_and_lost_replies_never_allow_a_second_frame() -> anyhow::Result<()> {
+            for fault in [
+                "unknown",
+                "mismatch",
+                "body_digest",
+                "truncated",
+                "duplicate",
+                "eof",
+                "late",
+            ] {
+                let (bridge, parent) = bridge(if fault == "late" { 100 } else { 5_000 })?;
+                let (read, mut write) = tokio::io::split(parent);
+                let server = tokio::spawn(async move {
+                    let mut reader = BufReader::new(read);
+                    let request = read_request(&mut reader).await?;
+                    let mut reply = response(&request, 200, Vec::new(), "");
+                    match fault {
+                        "unknown" => {
+                            reply = json!({"schema_version":1,"kind":"storage_http_response","request_id":request["request_id"],"request_sha256":request["request_sha256"],"outcome":"unknown","error_code":"admission_refused"})
+                        }
+                        "mismatch" => reply["request_id"] = json!(999),
+                        "body_digest" => reply["body_sha256"] = json!("invalid"),
+                        "truncated" => reply["truncated"] = json!(true),
+                        "late" => tokio::time::sleep(Duration::from_millis(150)).await,
+                        "eof" => return Ok::<_, anyhow::Error>(()),
+                        _ => {}
+                    }
+                    let mut bytes = serde_json::to_vec(&reply)?;
+                    bytes.push(b'\n');
+                    if fault == "duplicate" {
+                        bytes.extend_from_within(..);
+                    }
+                    write.write_all(&bytes).await?;
+                    write.flush().await?;
+                    Ok(())
+                });
+                assert!(
+                    matches!(bridge.exchange(head()?, "control").await, Outcome::Unknown(_)),
+                    "{fault}"
+                );
+                assert!(
+                    matches!(
+                        bridge.exchange(head()?, "control").await,
+                        Outcome::Unknown(Code::Poisoned)
+                    ),
+                    "{fault}"
+                );
+                server.abort();
+            }
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn secrets_wrong_root_and_deadline_refuse_before_framing() -> anyhow::Result<()> {
+            let (bridge, mut parent) = bridge(5_000)?;
+            for secret in [true, false] {
+                let mut request = head()?;
+                if secret {
+                    request.headers_mut().insert(
+                        reqwest::header::AUTHORIZATION,
+                        reqwest::header::HeaderValue::from_static("forbidden-offline-value"),
+                    );
+                } else {
+                    *request.uri_mut() =
+                        "https://offlineaccount.blob.core.windows.net/checkpoints?restype=container&sig=forbidden"
+                            .parse()?;
+                }
+                assert!(matches!(
+                    bridge.exchange(request, "control").await,
+                    Outcome::NotSent(Code::InvalidRequest)
+                ));
+            }
+            assert!(
+                bridge
+                    .validate_root(&Url::parse("abfss://data@offlineaccount.dfs.core.windows.net/other/")?)
+                    .is_err()
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), parent.read_u8())
+                    .await
+                    .is_err()
+            );
+            let (expired, _) = self::bridge(1)?;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            assert!(matches!(
+                expired.exchange(head()?, "control").await,
+                Outcome::NotSent(Code::DeadlineExceeded)
+            ));
+            Ok(())
+        }
+    }
 }
 
 /// Build the shared Azure transport, parsing QAP configuration once.
