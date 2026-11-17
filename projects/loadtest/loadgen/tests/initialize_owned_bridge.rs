@@ -433,6 +433,7 @@ async fn run_transport(case: Case, unix_socket: bool) -> Result<Parent> {
         None
     };
     let mut child = command.spawn()?;
+    drop(command);
     let (input_writer, output): (Box<dyn AsyncWrite + Unpin + Send>, Box<dyn AsyncRead + Unpin + Send>) = match sockets
     {
         Some((input, output)) => (Box::new(input), Box::new(output)),

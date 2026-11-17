@@ -163,6 +163,43 @@ fn read_setup_input<T: serde::de::DeserializeOwned>(path: &Path, private: bool) 
     Ok(serde_json::from_slice(&bytes)?)
 }
 
+#[cfg(unix)]
+fn bridge_socket(file: fs::File) -> Result<tokio::net::UnixStream> {
+    use std::os::{fd::OwnedFd, unix::net::UnixStream};
+    let socket = UnixStream::from(OwnedFd::from(file));
+    socket.local_addr().context("bridge stdio requires local Unix IPC")?;
+    socket.set_nonblocking(true)?;
+    Ok(tokio::net::UnixStream::from_std(socket)?)
+}
+
+#[cfg(unix)]
+fn bridge_reader() -> Result<Box<dyn AsyncRead + Unpin + Send>> {
+    use std::os::{fd::AsFd, unix::fs::FileTypeExt};
+    let file = fs::File::from(std::io::stdin().as_fd().try_clone_to_owned()?);
+    if file.metadata()?.file_type().is_socket() {
+        Ok(Box::new(bridge_socket(file)?))
+    } else {
+        Ok(Box::new(
+            tokio::net::unix::pipe::Receiver::from_file(file)
+                .context("bridge stdin must be a Unix pipe or Unix socket")?,
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn bridge_writer() -> Result<Box<dyn AsyncWrite + Unpin + Send>> {
+    use std::os::{fd::AsFd, unix::fs::FileTypeExt};
+    let file = fs::File::from(std::io::stdout().as_fd().try_clone_to_owned()?);
+    if file.metadata()?.file_type().is_socket() {
+        Ok(Box::new(bridge_socket(file)?))
+    } else {
+        Ok(Box::new(
+            tokio::net::unix::pipe::Sender::from_file(file)
+                .context("bridge stdout must be a Unix pipe or Unix socket")?,
+        ))
+    }
+}
+
 /// Initialize only through explicit, validated dedicated StorageBridge stdio.
 ///
 /// # Errors
@@ -180,7 +217,7 @@ pub async fn initialize_owned_run_table(args: InitializeOwnedRunTableArgs) -> Re
     #[cfg(unix)]
     {
         use std::time::{Duration, SystemTime, UNIX_EPOCH};
-        use tokio::{io::AsyncWriteExt, net::unix::pipe::OpenOptions, time::Instant};
+        use tokio::{io::AsyncWriteExt, time::Instant};
 
         let now = u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())?;
         let remaining = input
@@ -191,17 +228,10 @@ pub async fn initialize_owned_run_table(args: InitializeOwnedRunTableArgs) -> Re
         let deadline = Instant::now()
             .checked_add(Duration::from_millis(remaining))
             .context("owned-run original deadline is out of range")?;
-        // Tokio stdio uses uncancellable blocking tasks; explicit bridge mode requires real pipes.
-        let pipes = OpenOptions::new();
-        let reader = pipes
-            .open_receiver("/dev/stdin")
-            .context("bridge stdin must be a Unix pipe")?;
-        let writer = pipes
-            .open_sender("/dev/stdout")
-            .context("bridge stdout must be a Unix pipe")?;
-        let mut output = pipes
-            .open_sender("/dev/stdout")
-            .context("receipt stdout must be a Unix pipe")?;
+        // Tokio stdio uses uncancellable blocking tasks; retain readiness-driven local IPC.
+        let reader = bridge_reader()?;
+        let writer = bridge_writer()?;
+        let mut output = bridge_writer()?;
         let receipt = initialize_owned_run_table_bridged(plan, input, reader, writer).await?;
         let mut bytes = serde_json::to_vec(&receipt)?;
         bytes.push(b'\n');
