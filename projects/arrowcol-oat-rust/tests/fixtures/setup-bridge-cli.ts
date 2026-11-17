@@ -45,7 +45,7 @@ function canonical(value: unknown): string {
       .map(([key, item]) => `${JSON.stringify(key)}:${canonical(item)}`).join(",")}}`;
   }
   const json = JSON.stringify(value);
-  assert.notEqual(json, undefined);
+  assert.ok(json !== undefined);
   return json;
 }
 
@@ -230,6 +230,10 @@ for (const mode of cases) {
     } else {
       assert.notEqual(code, 0, `${mode} must refuse successful setup; stderr=${stderr}`);
       assert.equal(receipt, undefined);
+      const persisted = JSON.parse(await readFile(join(work, "runtime", "campaign-inventory.json"), "utf8")) as Inventory;
+      assert.equal(persisted.resources.length, 4);
+      assert.ok(persisted.resources.every(item => item.uid === null && item.state === "planned"),
+        "actual Rust evidence file must retain the planned inventory after uncertainty");
       assert.ok(lastInventory?.resources.every(item => item.uid === null && item.state === "planned"),
         "failed/partial setup must retain planned custody, not publish successful child identity");
       assert.equal(creates, 2, "must not replay a create after an uncertain or invalid result");

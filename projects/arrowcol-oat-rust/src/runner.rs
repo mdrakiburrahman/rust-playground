@@ -10249,6 +10249,9 @@ async fn record_resource_uids_with_creation(
         stored.uid = Some(uid.to_owned());
         stored.state = InventoryResourceState::Observed;
     }
+    if created.is_some() {
+        verify_fresh_namespace_readback(config, platform).await?;
+    }
     current.validate_successor(&next)?;
     persist_campaign_inventory(platform, &next).await
 }

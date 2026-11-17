@@ -131,7 +131,9 @@ mod fixture_setup_tests {
                 match args[0].as_str() {
                     "get" if args[1] == "namespace" => {
                         assert!(state.inventory.is_some(), "planned inventory must precede Kubernetes");
-                        if state.fault == "namespace_collision" {
+                        if let Some(namespace) = state.created.first() {
+                            serde_json::to_string(namespace)?
+                        } else if state.fault == "namespace_collision" {
                             "{}".to_owned()
                         } else {
                             String::new()

@@ -418,6 +418,39 @@ fn parse_fresh_create_responses(output: &str, expected: &[Value]) -> Result<Vec<
     Ok(responses)
 }
 
+async fn verify_fresh_namespace_readback(config: &OatConfig, platform: &AksPlatform) -> Result<()> {
+    let output = kubectl(
+        config,
+        vec![
+            "get",
+            "namespace",
+            &config.namespace,
+            "--ignore-not-found",
+            "-o",
+            "json",
+        ],
+        None,
+    )
+    .await
+    .context("reobserve the original fresh Namespace before setup publication")?;
+    if output.trim().is_empty() {
+        bail!("fresh Namespace is absent at setup readback; retaining planned custody");
+    }
+    let observed: Value = serde_json::from_str(&output).context("parse fresh Namespace readback")?;
+    let mut expected = json!({"apiVersion":"v1","kind":"Namespace","metadata":{"name":config.namespace}});
+    set_origin_markers(
+        &mut expected["metadata"],
+        &platform.run_id,
+        &platform.namespace_owner_token,
+    )?;
+    fixture_response_identity(&observed, &expected)?;
+    if observed["metadata"]["uid"].as_str() != platform.namespace_uid.as_deref() {
+        bail!("fresh Namespace UID changed after creation; retaining planned custody");
+    }
+    // This is an observation, not an atomic Namespace-UID precondition on child creation.
+    Ok(())
+}
+
 async fn fixture_setup_with_transport(
     input: FixtureSetupInput,
     transport: Option<Arc<dyn FixtureCommandTransport>>,
