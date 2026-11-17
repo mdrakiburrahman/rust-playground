@@ -219,8 +219,8 @@ impl RoutingShutdown {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("publication accounting poisoned"))?;
             let mut counts = PendingCounts::default();
-            for state in pending.values() {
-                match state {
+            for publication in pending.values() {
+                match publication.state {
                     PublicationState::NeverStaged => counts.never_staged += 1,
                     PublicationState::Staged => counts.staged += 1,
                     PublicationState::Nacked => counts.nacked += 1,
