@@ -18,6 +18,14 @@ export interface OatRunStatus {
   progress: string;
   result_count: number;
   error: string | null;
+  started_at_unix_ms?: number;
+  finished_at_unix_ms?: number | null;
+  local_teardown?: {
+    cell_id: string;
+    schedule_unix_ms: number;
+    measurement_end_unix_ms: number;
+    started_at_unix_ms: number;
+  } | null;
 }
 
 type FetchLike = typeof fetch;
@@ -118,12 +126,21 @@ interface LauncherDeadlineReceipt {
   overrun_at_unix_ms: number | null;
   creation_state: DeadlineCreationState;
   server_url: string | null;
+  server_pid?: number | null;
+  server_start_ticks?: string | null;
+  server_executable?: string | null;
   run_id: string | null;
   run_state: OatRunStatus['state'] | 'not_started' | 'unknown';
+  terminal_observation?: LauncherTerminalObservation | null;
   cancellation_attempts: number;
   last_cancel_result: string | null;
   cleanup_state: DeadlineCleanupState;
   error: string | null;
+}
+
+interface LauncherTerminalObservation {
+  observed_at_unix_ms: number;
+  status: OatRunStatus;
 }
 
 async function writeAtomicJson(path: string, value: unknown): Promise<void> {
@@ -187,8 +204,12 @@ export class OatLauncherDeadline {
       overrun_at_unix_ms: null,
       creation_state: 'not_started',
       server_url: null,
+      server_pid: null,
+      server_start_ticks: null,
+      server_executable: null,
       run_id: null,
       run_state: 'not_started',
+      terminal_observation: null,
       cancellation_attempts: 0,
       last_cancel_result: null,
       cleanup_state: 'not_started',
@@ -208,10 +229,17 @@ export class OatLauncherDeadline {
   static async restore(path: string, writeReceipt = writeAtomicJson): Promise<OatLauncherDeadline> {
     const parsed: unknown = JSON.parse(await readFile(path, 'utf8'));
     if (!isLauncherDeadlineReceipt(parsed)) throw new Error(`Invalid launcher deadline receipt ${path}`);
-    const deadline = new OatLauncherDeadline(path, parsed, writeReceipt);
-    if (!parsed.overrun && parsed.deadline_at_unix_ms !== null && Date.now() >= parsed.deadline_at_unix_ms) {
-      parsed.overrun = true;
-      parsed.overrun_at_unix_ms = Date.now();
+    const restored: LauncherDeadlineReceipt = {
+      ...parsed,
+      server_pid: parsed.server_pid ?? null,
+      server_start_ticks: parsed.server_start_ticks ?? null,
+      server_executable: parsed.server_executable ?? null,
+      terminal_observation: parsed.terminal_observation ?? null,
+    };
+    const deadline = new OatLauncherDeadline(path, restored, writeReceipt);
+    if (!restored.overrun && restored.deadline_at_unix_ms !== null && Date.now() >= restored.deadline_at_unix_ms) {
+      restored.overrun = true;
+      restored.overrun_at_unix_ms = Date.now();
       await deadline.persist();
     }
     return deadline;
@@ -292,6 +320,25 @@ export class OatLauncherDeadline {
     await this.persist();
   }
 
+  async recordOwnedServerIdentity(identity: Readonly<OatOwnedRunIdentity>): Promise<void> {
+    const receipt = this.receipt;
+    if (identity.invocationId !== receipt.invocation_id || receipt.creation_state !== 'accepted' ||
+        receipt.run_id !== identity.runId || receipt.server_url !== identity.serverUrl ||
+        !Number.isSafeInteger(identity.serverPid) || identity.serverPid <= 0 ||
+        !identity.serverStartTicks || !identity.serverExecutable) {
+      throw new Error('Owned OAT server identity does not match the accepted invocation receipt');
+    }
+    const alreadyBound = receipt.server_pid != null || receipt.server_start_ticks != null || receipt.server_executable != null;
+    if (alreadyBound && (receipt.server_pid !== identity.serverPid || receipt.server_start_ticks !== identity.serverStartTicks ||
+        receipt.server_executable !== identity.serverExecutable)) {
+      throw new Error('Owned OAT server identity changed for the accepted invocation receipt');
+    }
+    receipt.server_pid = identity.serverPid;
+    receipt.server_start_ticks = identity.serverStartTicks;
+    receipt.server_executable = identity.serverExecutable;
+    await this.persist();
+  }
+
   async markCreationRejected(error: unknown): Promise<void> {
     this.receipt.creation_state = 'rejected';
     this.receipt.run_state = 'not_started';
@@ -324,6 +371,16 @@ export class OatLauncherDeadline {
     this.receipt.run_state = status.state;
     this.receipt.cleanup_state = this.receipt.config_binding_error ? 'unsettled' : cleanupStateFor(status);
     this.receipt.error = this.receipt.config_binding_error ?? status.error;
+    const identityBound = Number.isSafeInteger(this.receipt.server_pid) && (this.receipt.server_pid ?? 0) > 0 &&
+      typeof this.receipt.server_start_ticks === 'string' && this.receipt.server_start_ticks.length > 0 &&
+      typeof this.receipt.server_executable === 'string' && this.receipt.server_executable.length > 0;
+    const terminal = status.state === 'succeeded' || status.state === 'failed' || status.state === 'cancelled';
+    if (terminal && this.receipt.terminal_observation == null && identityBound &&
+        this.receipt.creation_state === 'accepted' && this.receipt.run_id === status.id &&
+        this.receipt.server_url !== null && this.receipt.submitted_config_sha256 !== null &&
+        this.receipt.config_binding_error === null && status.config_sha256 === this.receipt.submitted_config_sha256) {
+      this.receipt.terminal_observation = { observed_at_unix_ms: Date.now(), status: structuredClone(status) };
+    }
     await this.persist();
   }
 
@@ -372,6 +429,19 @@ function isLauncherDeadlineReceipt(value: unknown): value is LauncherDeadlineRec
     typeof value.submitted_config_sha256 === 'string' && /^[0-9a-f]{64}$/.test(value.submitted_config_sha256) &&
     typeof value.source_config_sha256 === 'string' && /^[0-9a-f]{64}$/.test(value.source_config_sha256) &&
     createHash('sha256').update(value.submitted_config_body, 'utf8').digest('hex') === value.submitted_config_sha256;
+  const identityFieldsAbsent = !('server_pid' in value) && !('server_start_ticks' in value) && !('server_executable' in value);
+  const identityIsNull = value.server_pid === null && value.server_start_ticks === null && value.server_executable === null;
+  const identityIsValid = typeof value.server_pid === 'number' && Number.isSafeInteger(value.server_pid) && value.server_pid > 0 &&
+    typeof value.server_start_ticks === 'string' && value.server_start_ticks.length > 0 &&
+    typeof value.server_executable === 'string' && value.server_executable.length > 0;
+  const observationAbsent = !('terminal_observation' in value);
+  const observationIsValid = value.terminal_observation === null || isLauncherTerminalObservation(value.terminal_observation);
+  const observationMatches = value.terminal_observation === undefined || value.terminal_observation === null ||
+    (identityIsValid && isLauncherTerminalObservation(value.terminal_observation) &&
+      value.creation_state === 'accepted' && value.run_id === value.terminal_observation.status.id &&
+      value.server_url !== null && typeof value.submitted_config_sha256 === 'string' &&
+      value.submitted_config_sha256 === value.terminal_observation.status.config_sha256 &&
+      value.run_state === value.terminal_observation.status.state);
   return value.version === 1 && typeof value.invocation_id === 'string' &&
     typeof value.started_at_unix_ms === 'number' && (value.deadline_at_unix_ms === null || typeof value.deadline_at_unix_ms === 'number') &&
     typeof value.started_at_monotonic_ms === 'number' &&
@@ -389,7 +459,20 @@ function isLauncherDeadlineReceipt(value: unknown): value is LauncherDeadlineRec
       value.cleanup_state === 'confirmed' || value.cleanup_state === 'unsettled') &&
     typeof value.cancellation_attempts === 'number' && Number.isSafeInteger(value.cancellation_attempts) &&
     (value.last_cancel_result === null || typeof value.last_cancel_result === 'string') &&
-    (value.error === null || typeof value.error === 'string');
+    (value.error === null || typeof value.error === 'string') &&
+    (identityFieldsAbsent || identityIsNull || identityIsValid) &&
+    (identityFieldsAbsent || identityIsNull || (value.creation_state === 'accepted' && value.run_id !== null && value.server_url !== null)) &&
+    (observationAbsent || observationIsValid) && observationMatches;
+}
+
+function isLauncherTerminalObservation(value: unknown): value is LauncherTerminalObservation {
+  if (!isRecord(value) || typeof value.observed_at_unix_ms !== 'number' || !Number.isSafeInteger(value.observed_at_unix_ms) ||
+      !isRecord(value.status)) return false;
+  const status = value.status;
+  return typeof status.id === 'string' && ['succeeded', 'failed', 'cancelled'].includes(String(status.state)) &&
+    typeof status.progress === 'string' && typeof status.result_count === 'number' &&
+    (status.error === null || typeof status.error === 'string') &&
+    (status.config_sha256 === null || typeof status.config_sha256 === 'string');
 }
 
 function isLocalOatServerUrl(value: string): boolean {
@@ -1403,6 +1486,15 @@ export async function main(
       const onRunStarted = localMarker ? async (status: OatRunStatus): Promise<void> => {
         await persistLocalRunMarker(localMarker, status, submission);
         markerWritten = true;
+        const identity: Readonly<OatOwnedRunIdentity> = Object.freeze({
+          invocationId: deadline.invocationId,
+          runId: status.id,
+          serverUrl: localMarker.marker.serverUrl,
+          serverPid: localMarker.marker.serverPid,
+          serverStartTicks: localMarker.marker.serverStartTicks,
+          serverExecutable: localMarker.marker.serverExecutable,
+        });
+        await deadline.recordOwnedServerIdentity(identity);
         if (onOwnedRun && !supplementaryEmitted) {
           if (interrupt?.controller.signal.aborted ||
               localMarker.marker.serverUrl !== new URL(server.url).href || localMarker.marker.serverPid !== server.child.pid ||
@@ -1411,14 +1503,6 @@ export async function main(
             return;
           }
           supplementaryEmitted = true;
-          const identity: Readonly<OatOwnedRunIdentity> = Object.freeze({
-            invocationId: deadline.invocationId,
-            runId: status.id,
-            serverUrl: localMarker.marker.serverUrl,
-            serverPid: localMarker.marker.serverPid,
-            serverStartTicks: localMarker.marker.serverStartTicks,
-            serverExecutable: localMarker.marker.serverExecutable,
-          });
           const diagnostic = (error: unknown): void => {
             console.error('[oat] Supplementary owned-run observer failed:', error);
           };

@@ -76,6 +76,8 @@ const runStatus = (state) => ({
   id: ${JSON.stringify(options.invalidRunId ? 'invalid-run-id' : '123e4567-e89b-42d3-a456-426614174000')}, state,
   progress: state === 'succeeded' ? 'published' : state, result_count: state === 'succeeded' ? 1 : 0,
   error: state === 'failed' ? 'synthetic cleanup failure' : null, config_sha256: configHash,
+  started_at_unix_ms: Date.now() - 1,
+  finished_at_unix_ms: state === 'queued' || state === 'running' ? null : Date.now(),
 });
 http.createServer((request, response) => {
   response.setHeader('content-type', 'application/json');
@@ -343,6 +345,238 @@ test('successful deadline main exposes one frozen durable identity without waiti
     process.exitCode = previousExitCode;
     await fixture.stop();
     await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test('terminal receipt remains readable after the owned server stops before observer polling', { skip: process.platform !== 'linux', timeout: 15_000 }, async () => {
+  const fixture = await passingMainFixture({ initialState: 'running' });
+  const previousExitCode = process.exitCode;
+  let observerPromise: Promise<void> | undefined;
+  try {
+    process.exitCode = undefined;
+    await main(['--deadline-seconds', '10', '--no-viewer', '--config', fixture.configPath], fixture.runner, undefined, fixture.receiptRoot, undefined,
+      (identity, receiptPath) => {
+        const markerName = readdirSync(fixture.stateRoot).find((name) => name.startsWith('.arrowcol-oat-owner-'));
+        assert.ok(markerName);
+        const marker = JSON.parse(readFileSync(path.join(fixture.stateRoot, markerName), 'utf8')) as {
+          serverUrl: string; serverPid: number; serverStartTicks: string; serverExecutable: string; runId: string;
+          submitted_config_sha256: string;
+        };
+        const activeReceipt = JSON.parse(readFileSync(receiptPath, 'utf8')) as {
+          invocation_id: string; run_id: string; server_url: string; server_pid: number;
+          server_start_ticks: string; server_executable: string; submitted_config_sha256: string;
+        };
+        assert.equal(path.basename(receiptPath), identity.invocationId + '.json');
+        assert.equal(activeReceipt.invocation_id, identity.invocationId);
+        assert.equal(activeReceipt.run_id, identity.runId);
+        assert.equal(activeReceipt.server_url, identity.serverUrl);
+        assert.equal(activeReceipt.server_pid, identity.serverPid);
+        assert.equal(activeReceipt.server_start_ticks, identity.serverStartTicks);
+        assert.equal(activeReceipt.server_executable, identity.serverExecutable);
+        assert.equal(activeReceipt.submitted_config_sha256, marker.submitted_config_sha256);
+        observerPromise = (async () => {
+          const stopDeadline = performance.now() + 5000;
+          while (await processStartTicks(identity.serverPid) !== undefined && performance.now() < stopDeadline) {
+            await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+          }
+          assert.equal(await processStartTicks(identity.serverPid), undefined, 'owned server must stop before observer reads the receipt');
+          assert.equal(path.basename(receiptPath), identity.invocationId + '.json');
+          const receipt = JSON.parse(await readFile(receiptPath, 'utf8')) as {
+            invocation_id: string; run_id: string; server_url: string; server_pid: number;
+            server_start_ticks: string; server_executable: string; submitted_config_sha256: string;
+            terminal_observation: { observed_at_unix_ms: number; status: OatRunStatus } | null;
+          };
+          assert.equal(receipt.invocation_id, identity.invocationId);
+          assert.equal(receipt.run_id, identity.runId);
+          assert.equal(receipt.server_url, identity.serverUrl);
+          assert.equal(receipt.server_pid, identity.serverPid);
+          assert.equal(receipt.server_start_ticks, identity.serverStartTicks);
+          assert.equal(receipt.server_executable, identity.serverExecutable);
+          assert.equal(receipt.server_url, marker.serverUrl);
+          assert.equal(receipt.server_pid, marker.serverPid);
+          assert.equal(receipt.server_start_ticks, marker.serverStartTicks);
+          assert.equal(receipt.server_executable, marker.serverExecutable);
+          assert.equal(receipt.run_id, marker.runId);
+          assert.equal(receipt.submitted_config_sha256, marker.submitted_config_sha256);
+          assert.ok(receipt.terminal_observation);
+          const observation = receipt.terminal_observation;
+          assert.equal(observation.status.id, identity.runId);
+          assert.equal(observation.status.config_sha256, marker.submitted_config_sha256);
+          assert.equal(observation.status.state, 'succeeded');
+          assert.equal(observation.status.progress, 'published');
+          assert.equal(observation.status.result_count, 1);
+          assert.equal(observation.status.error, null);
+          assert.equal(typeof observation.status.started_at_unix_ms, 'number');
+          assert.equal(typeof observation.status.finished_at_unix_ms, 'number');
+          assert.ok(observation.observed_at_unix_ms >= observation.status.finished_at_unix_ms!);
+        })();
+      });
+    assert.ok(observerPromise);
+    await observerPromise;
+    assert.equal(process.exitCode, undefined);
+    assert.deepEqual(await readdir(fixture.stateRoot), []);
+  } finally {
+    process.exitCode = previousExitCode;
+    await fixture.stop();
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test('terminal observations require exact accepted run, config and server identity', async () => {
+  const runId = '123e4567-e89b-42d3-a456-426614174020';
+  const serverUrl = 'http://127.0.0.1:8088';
+  const submittedConfigBody = '{"platform":{"kind":"local"}}';
+  const submittedConfigSha256 = createHash('sha256').update(submittedConfigBody).digest('hex');
+  const scenarios = [
+    { name: 'missing server identity', bindIdentity: false, statusId: runId, statusSha: submittedConfigSha256 },
+    { name: 'different run ID', bindIdentity: true, statusId: '123e4567-e89b-42d3-a456-426614174021', statusSha: submittedConfigSha256 },
+    { name: 'different config hash', bindIdentity: true, statusId: runId, statusSha: 'b'.repeat(64) },
+  ];
+  for (const scenario of scenarios) {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'oat-terminal-binding-'));
+    const deadline = await OatLauncherDeadline.create(600, performance.now(), directory);
+    try {
+      await deadline.setSubmissionBinding({
+        submitted_config_body: submittedConfigBody,
+        submitted_config_sha256: submittedConfigSha256,
+        source_config_sha256: 'a'.repeat(64),
+      });
+      await deadline.markCreationPending(serverUrl);
+      await deadline.recordRunStarted({ ...status('running'), id: runId });
+      if (scenario.bindIdentity) {
+        await deadline.recordOwnedServerIdentity({
+          invocationId: deadline.invocationId, runId, serverUrl, serverPid: process.pid,
+          serverStartTicks: 'fixture-start-ticks', serverExecutable: process.execPath,
+        });
+      }
+      await deadline.recordTerminal({
+        ...status('succeeded'), id: scenario.statusId, config_sha256: scenario.statusSha,
+        started_at_unix_ms: Date.now() - 1, finished_at_unix_ms: Date.now(),
+      });
+      const receipt = JSON.parse(await readFile(deadline.receiptPath, 'utf8')) as { terminal_observation: unknown };
+      assert.equal(receipt.terminal_observation, null, scenario.name);
+    } finally {
+      deadline.dispose();
+      await rm(directory, { recursive: true, force: true });
+    }
+  }
+});
+
+test('failed terminal response is retained as termination evidence without confirming cleanup', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'oat-terminal-failed-'));
+  const runId = '123e4567-e89b-42d3-a456-426614174022';
+  const serverUrl = 'http://127.0.0.1:8088';
+  const submittedConfigBody = '{"platform":{"kind":"local"}}';
+  const submittedConfigSha256 = createHash('sha256').update(submittedConfigBody).digest('hex');
+  const deadline = await OatLauncherDeadline.create(600, performance.now(), directory);
+  try {
+    await deadline.setSubmissionBinding({
+      submitted_config_body: submittedConfigBody,
+      submitted_config_sha256: submittedConfigSha256,
+      source_config_sha256: 'a'.repeat(64),
+    });
+    await deadline.markCreationPending(serverUrl);
+    await deadline.recordRunStarted({ ...status('running'), id: runId });
+    await deadline.recordOwnedServerIdentity({
+      invocationId: deadline.invocationId, runId, serverUrl, serverPid: process.pid,
+      serverStartTicks: 'fixture-start-ticks', serverExecutable: process.execPath,
+    });
+    await deadline.recordTerminal({
+      ...status('failed'), id: runId, state: 'failed', error: 'synthetic terminal failure',
+      started_at_unix_ms: Date.now() - 1, finished_at_unix_ms: Date.now(),
+    });
+    const receipt = JSON.parse(await readFile(deadline.receiptPath, 'utf8')) as {
+      cleanup_state: string; terminal_observation: { status: OatRunStatus } | null;
+    };
+    assert.equal(receipt.cleanup_state, 'unsettled');
+    assert.equal(receipt.terminal_observation?.status.state, 'failed');
+    assert.equal(receipt.terminal_observation?.status.error, 'synthetic terminal failure');
+  } finally {
+    deadline.dispose();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('legacy deadline receipts remain readable without new terminal identity fields', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'oat-terminal-legacy-'));
+  const deadline = await OatLauncherDeadline.create(600, performance.now(), directory);
+  try {
+    const legacy = JSON.parse(await readFile(deadline.receiptPath, 'utf8')) as Record<string, unknown>;
+    delete legacy.server_pid;
+    delete legacy.server_start_ticks;
+    delete legacy.server_executable;
+    delete legacy.terminal_observation;
+    await writeFile(deadline.receiptPath, JSON.stringify(legacy));
+    const restored = await OatLauncherDeadline.restore(deadline.receiptPath);
+    await restored.markNoRun();
+    const receipt = JSON.parse(await readFile(deadline.receiptPath, 'utf8')) as {
+      server_pid: number | null; server_start_ticks: string | null; server_executable: string | null;
+      terminal_observation: unknown;
+    };
+    assert.equal(receipt.server_pid, null);
+    assert.equal(receipt.server_start_ticks, null);
+    assert.equal(receipt.server_executable, null);
+    assert.equal(receipt.terminal_observation, null);
+    restored.dispose();
+  } finally {
+    deadline.dispose();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('restoring an expired receipt persists overrun on the normalized receipt', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'oat-terminal-expired-'));
+  const deadline = await OatLauncherDeadline.create(600, performance.now(), directory);
+  try {
+    deadline.dispose();
+    const expired = JSON.parse(await readFile(deadline.receiptPath, 'utf8')) as Record<string, unknown>;
+    expired.deadline_at_unix_ms = Date.now() - 1;
+    expired.overrun = false;
+    expired.overrun_at_unix_ms = null;
+    await writeFile(deadline.receiptPath, JSON.stringify(expired));
+    const restored = await OatLauncherDeadline.restore(deadline.receiptPath);
+    const receipt = JSON.parse(await readFile(deadline.receiptPath, 'utf8')) as {
+      deadline_at_unix_ms: number; overrun: boolean; overrun_at_unix_ms: number | null;
+    };
+    assert.equal(receipt.overrun, true);
+    assert.ok(receipt.overrun_at_unix_ms !== null && receipt.overrun_at_unix_ms >= receipt.deadline_at_unix_ms);
+    restored.dispose();
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('malformed terminal observation identity is rejected during receipt restore', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'oat-terminal-malformed-'));
+  const runId = '123e4567-e89b-42d3-a456-426614174023';
+  const serverUrl = 'http://127.0.0.1:8088';
+  const submittedConfigBody = '{"platform":{"kind":"local"}}';
+  const submittedConfigSha256 = createHash('sha256').update(submittedConfigBody).digest('hex');
+  const deadline = await OatLauncherDeadline.create(600, performance.now(), directory);
+  try {
+    await deadline.setSubmissionBinding({
+      submitted_config_body: submittedConfigBody,
+      submitted_config_sha256: submittedConfigSha256,
+      source_config_sha256: 'a'.repeat(64),
+    });
+    await deadline.markCreationPending(serverUrl);
+    await deadline.recordRunStarted({ ...status('running'), id: runId });
+    await deadline.recordOwnedServerIdentity({
+      invocationId: deadline.invocationId, runId, serverUrl, serverPid: process.pid,
+      serverStartTicks: 'fixture-start-ticks', serverExecutable: process.execPath,
+    });
+    await deadline.recordTerminal({
+      ...status('succeeded'), id: runId, started_at_unix_ms: Date.now() - 1, finished_at_unix_ms: Date.now(),
+    });
+    const receipt = JSON.parse(await readFile(deadline.receiptPath, 'utf8')) as {
+      terminal_observation: { status: { id: string } };
+    };
+    receipt.terminal_observation.status.id = '123e4567-e89b-42d3-a456-426614174024';
+    await writeFile(deadline.receiptPath, JSON.stringify(receipt));
+    await assert.rejects(OatLauncherDeadline.restore(deadline.receiptPath), /Invalid launcher deadline receipt/);
+  } finally {
+    deadline.dispose();
+    await rm(directory, { recursive: true, force: true });
   }
 });
 
