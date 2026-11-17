@@ -599,13 +599,19 @@ struct Registration {
     generation: String,
 }
 
+enum SessionTransport {
+    Injected,
+    Direct(AzureCredentialProvider),
+    Bridge(Arc<crate::qap_http::StorageBridge>),
+}
+
 /// One persistent publisher registration shared by every guarded store of a
 /// mutating process in one account and control container.
 pub struct PublisherSession {
     shared: Arc<Shared>,
     mode: SessionMode,
     account: Option<String>,
-    credentials: Option<AzureCredentialProvider>,
+    transport: SessionTransport,
     registration: Option<Registration>,
     close: tokio::sync::Mutex<()>,
 }
@@ -794,7 +800,7 @@ impl PublisherSession {
                 control,
                 sandbox_id,
                 account,
-                None,
+                SessionTransport::Injected,
                 SessionMode::Publisher,
                 Some(&expected),
             )
@@ -923,6 +929,26 @@ impl PublisherSession {
         Self::open_url(url, SessionMode::Publisher, None).await
     }
 
+    /// Register a normal publisher through the explicit credential-free D47 transport.
+    /// The same immutable bridge covers admission, guarded storage, authority checks and drain.
+    ///
+    /// # Errors
+    /// Rejects mismatched roots, invalid authority, non-ready generations and uncertain exchanges.
+    pub async fn open_bridged_async(url: &Url, bridge: Arc<crate::qap_http::StorageBridge>) -> Result<Arc<Self>> {
+        bridge.validate_root(url)?;
+        let authority = bridge.authority().clone();
+        let control = Arc::new(AzureControlContainer::bridged(Arc::clone(&bridge)));
+        Self::register(
+            control,
+            authority.sandbox_id,
+            authority.storage_account,
+            SessionTransport::Bridge(bridge),
+            SessionMode::Publisher,
+            Some(&authority.reset_generation),
+        )
+        .await
+    }
+
     /// Synchronous [`Self::open_bootstrap_async`].
     ///
     /// # Errors
@@ -995,7 +1021,7 @@ impl PublisherSession {
             control,
             sandbox_id,
             account,
-            Some(credentials),
+            SessionTransport::Direct(credentials),
             mode,
             Some(expected_generation),
         )
@@ -1007,7 +1033,7 @@ impl PublisherSession {
             shared: Shared::new(),
             mode: SessionMode::Publisher,
             account: None,
-            credentials: None,
+            transport: SessionTransport::Injected,
             registration: None,
             close: tokio::sync::Mutex::new(()),
         }
@@ -1036,7 +1062,7 @@ impl PublisherSession {
             control,
             sandbox_id.to_owned(),
             account.to_owned(),
-            None,
+            SessionTransport::Injected,
             mode,
             expected_generation,
         )
@@ -1047,7 +1073,7 @@ impl PublisherSession {
         control: Arc<dyn ControlMetadata>,
         sandbox_id: String,
         account: String,
-        credentials: Option<AzureCredentialProvider>,
+        transport: SessionTransport,
         mode: SessionMode,
         expected_generation: Option<&str>,
     ) -> Result<Arc<Self>> {
@@ -1101,7 +1127,7 @@ impl PublisherSession {
             shared: Shared::new(),
             mode,
             account: Some(account),
-            credentials,
+            transport,
             registration: Some(Registration {
                 control,
                 sandbox_id,
@@ -1167,6 +1193,9 @@ impl PublisherSession {
     }
 
     fn validate_url(&self, url: &Url) -> Result<()> {
+        if let SessionTransport::Bridge(bridge) = &self.transport {
+            bridge.validate_root(url)?;
+        }
         match (&self.account, url.scheme()) {
             (None, "file") => Ok(()),
             (Some(account), _) if is_azure(url) => {
@@ -1189,15 +1218,20 @@ impl PublisherSession {
         let store: Arc<dyn ObjectStore> = if url.scheme() == "file" {
             Arc::new(object_store::local::LocalFileSystem::new())
         } else {
-            let credentials = self
-                .credentials
-                .clone()
-                .context("publisher session has no Azure credential")?;
-            Arc::new(
-                object_store::azure::MicrosoftAzureBuilder::from_env()
+            let builder = match &self.transport {
+                SessionTransport::Bridge(bridge) => object_store::azure::MicrosoftAzureBuilder::new()
+                    .with_url(url.as_str())
+                    .with_http_connector(crate::qap_http::bridge_http_connector(Arc::clone(bridge))?)
+                    .with_credentials(Arc::new(crate::qap_http::DeniedBridgeCredentials))
+                    .with_skip_signature(true),
+                SessionTransport::Direct(credentials) => object_store::azure::MicrosoftAzureBuilder::from_env()
                     .with_url(url.as_str())
                     .with_http_connector(crate::qap_http::azure_http_connector()?)
-                    .with_credentials(credentials)
+                    .with_credentials(Arc::clone(credentials)),
+                SessionTransport::Injected => bail!("publisher session has no Azure credential"),
+            };
+            Arc::new(
+                builder
                     .with_retry(object_store::RetryConfig {
                         max_retries: 0,
                         retry_timeout: Duration::from_secs(10),

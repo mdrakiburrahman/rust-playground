@@ -42,10 +42,32 @@ fn sandbox_ownership(subscription: &str, stamp: Option<&str>) -> Result<String> 
 
 /// Lease-serialized metadata transactions on the checkpoint control container.
 pub(crate) struct AzureControlContainer {
-    credentials: AzureCredentialProvider,
-    client: reqwest::Client,
+    transport: ControlTransport,
     endpoint: String,
     sandbox_id: String,
+}
+
+enum ControlTransport {
+    Direct {
+        credentials: AzureCredentialProvider,
+        client: reqwest::Client,
+    },
+    Bridge(Arc<crate::qap_http::StorageBridge>),
+}
+
+struct ControlResponse {
+    status: StatusCode,
+    headers: reqwest::header::HeaderMap,
+}
+
+impl ControlResponse {
+    fn status(&self) -> StatusCode {
+        self.status
+    }
+
+    fn headers(&self) -> &reqwest::header::HeaderMap {
+        &self.headers
+    }
 }
 
 impl fmt::Debug for AzureControlContainer {
@@ -59,7 +81,7 @@ impl fmt::Debug for AzureControlContainer {
 }
 
 enum Exchange {
-    Response(reqwest::Response),
+    Response(ControlResponse),
     /// Definitely never reached the service.
     NotSent(String),
     /// Possibly reached the service without a response.
@@ -218,11 +240,21 @@ impl AzureControlContainer {
         credentials: AzureCredentialProvider,
     ) -> Result<Self> {
         Ok(Self {
-            credentials,
-            client: reqwest::Client::builder().timeout(Duration::from_secs(10)).build()?,
+            transport: ControlTransport::Direct {
+                credentials,
+                client: reqwest::Client::builder().timeout(Duration::from_secs(10)).build()?,
+            },
             endpoint,
             sandbox_id,
         })
+    }
+
+    pub(crate) fn bridged(bridge: Arc<crate::qap_http::StorageBridge>) -> Self {
+        Self {
+            endpoint: bridge.authority().control_container_url.clone(),
+            sandbox_id: bridge.authority().sandbox_id.clone(),
+            transport: ControlTransport::Bridge(bridge),
+        }
     }
 
     pub(crate) fn sandbox_id(&self) -> &str {
@@ -230,15 +262,57 @@ impl AzureControlContainer {
     }
 
     async fn send(&self, method: Method, query: &str, headers: &[(String, String)]) -> Exchange {
-        let token = match self.credentials.get_credential().await {
+        if let ControlTransport::Bridge(bridge) = &self.transport {
+            let mut request = object_store::client::HttpRequest::new(object_store::client::HttpRequestBody::empty());
+            *request.method_mut() = method;
+            let Ok(uri) = format!("{}?{query}", self.endpoint).parse() else {
+                return Exchange::NotSent("invalid Azure control request".into());
+            };
+            *request.uri_mut() = uri;
+            let date = chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+            for (name, value) in headers
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .chain([("x-ms-version", API_VERSION), ("x-ms-date", date.as_str())])
+            {
+                let (Ok(name), Ok(value)) = (
+                    reqwest::header::HeaderName::from_bytes(name.as_bytes()),
+                    reqwest::header::HeaderValue::from_str(value),
+                ) else {
+                    return Exchange::NotSent("invalid Azure control header".into());
+                };
+                request.headers_mut().append(name, value);
+            }
+            if request.method() == Method::PUT {
+                request.headers_mut().insert(
+                    reqwest::header::CONTENT_LENGTH,
+                    reqwest::header::HeaderValue::from_static("0"),
+                );
+            }
+            return match bridge.exchange(request, "control").await {
+                crate::qap_http::StorageBridgeOutcome::Response(response) => Exchange::Response(ControlResponse {
+                    status: response.status(),
+                    headers: response.headers().clone(),
+                }),
+                crate::qap_http::StorageBridgeOutcome::NotSent(code) => {
+                    Exchange::NotSent(format!("storage bridge {code}"))
+                }
+                crate::qap_http::StorageBridgeOutcome::Unknown(code) => {
+                    Exchange::Ambiguous(format!("storage bridge {code}"))
+                }
+            };
+        }
+        let ControlTransport::Direct { credentials, client } = &self.transport else {
+            return Exchange::NotSent("invalid Azure control transport".into());
+        };
+        let token = match credentials.get_credential().await {
             Ok(credential) => match credential.as_ref() {
                 AzureCredential::BearerToken(token) => token.clone(),
                 _ => return Exchange::NotSent("Azure control container requires bearer identity".into()),
             },
             Err(_) => return Exchange::NotSent("Azure control container authentication failed".into()),
         };
-        let mut request = self
-            .client
+        let mut request = client
             .request(method.clone(), format!("{}?{query}", self.endpoint))
             .bearer_auth(token)
             .header("x-ms-version", API_VERSION)
@@ -254,7 +328,10 @@ impl AzureControlContainer {
             request = request.header(reqwest::header::CONTENT_LENGTH, "0").body(Vec::new());
         }
         match request.send().await {
-            Ok(response) => Exchange::Response(response),
+            Ok(response) => Exchange::Response(ControlResponse {
+                status: response.status(),
+                headers: response.headers().clone(),
+            }),
             Err(error) if error.is_builder() => Exchange::NotSent("invalid Azure control request".into()),
             Err(error) if error.is_connect() => Exchange::NotSent("Azure control connection failed".into()),
             Err(_) => Exchange::Ambiguous("Azure control request has no definite response".into()),

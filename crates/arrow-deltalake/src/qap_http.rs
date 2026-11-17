@@ -24,6 +24,615 @@ use serde::Serialize;
 use url::Url;
 use uuid::Uuid;
 
+pub(crate) use storage_bridge::Outcome as StorageBridgeOutcome;
+pub use storage_bridge::{StorageBridge, StorageBridgeAuthority};
+
+#[derive(Debug)]
+pub(crate) struct DeniedBridgeCredentials;
+
+#[async_trait]
+impl object_store::CredentialProvider for DeniedBridgeCredentials {
+    type Credential = object_store::azure::AzureCredential;
+
+    async fn get_credential(&self) -> object_store::Result<Arc<Self::Credential>> {
+        Err(store_error(invalid(
+            "child authentication is forbidden for the storage bridge",
+        )))
+    }
+}
+
+mod storage_bridge {
+    use std::collections::BTreeMap;
+    use std::fmt;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use async_trait::async_trait;
+    use http_body_util::BodyExt;
+    use object_store::client::{HttpError, HttpErrorKind, HttpRequest, HttpResponse, HttpService};
+    use serde::{Deserialize, Serialize};
+    use sha2::{Digest, Sha256};
+    use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+    use tokio::sync::Mutex;
+    use tokio::time::Instant;
+    use url::Url;
+
+    const MAX_BODY: usize = 1_048_576;
+    const MAX_FRAME: usize = 4_194_304;
+    const JSON_SAFE: u64 = 9_007_199_254_740_991;
+
+    /// Immutable authority for one explicitly bridged zero-row fixture.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct StorageBridgeAuthority {
+        pub campaign_id: String,
+        pub cell_run_id: String,
+        pub owner_id: String,
+        pub fencing_token: u64,
+        pub storage_account: String,
+        pub table_root_url: String,
+        pub control_container_url: String,
+        pub sandbox_id: String,
+        pub reset_generation: String,
+    }
+
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub(crate) enum Code {
+        AdmissionRefused,
+        DeadlineExceeded,
+        InvalidRequest,
+        Protocol,
+        ResponseLost,
+        TransportUnavailable,
+        Poisoned,
+    }
+
+    impl fmt::Display for Code {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(match self {
+                Self::AdmissionRefused => "admission_refused",
+                Self::DeadlineExceeded => "deadline_exceeded",
+                Self::InvalidRequest => "invalid_request",
+                Self::Protocol => "protocol",
+                Self::ResponseLost => "response_lost",
+                Self::TransportUnavailable => "transport_unavailable",
+                Self::Poisoned => "poisoned",
+            })
+        }
+    }
+
+    pub(crate) enum Outcome {
+        Response(HttpResponse),
+        NotSent(Code),
+        Unknown(Code),
+    }
+
+    #[derive(Serialize)]
+    struct Request<'a> {
+        schema_version: u8,
+        kind: &'static str,
+        request_id: u64,
+        authority: &'a StorageBridgeAuthority,
+        original_deadline_unix_ms: u64,
+        remaining_timeout_ms: u64,
+        target: &'a str,
+        method: &'a str,
+        url: &'a str,
+        headers: Vec<(String, String)>,
+        body: String,
+        body_sha256: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        request_sha256: Option<String>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+    enum Response {
+        Response {
+            schema_version: u8,
+            kind: String,
+            request_id: u64,
+            request_sha256: String,
+            status: u16,
+            headers: Vec<(String, String)>,
+            body: String,
+            body_sha256: String,
+            truncated: bool,
+        },
+        DefinitelyNotSent {
+            schema_version: u8,
+            kind: String,
+            request_id: u64,
+            request_sha256: String,
+            error_code: Code,
+        },
+        Unknown {
+            schema_version: u8,
+            kind: String,
+            request_id: u64,
+            request_sha256: String,
+            error_code: Code,
+        },
+    }
+
+    struct State {
+        reader: BufReader<Pin<Box<dyn AsyncRead + Send>>>,
+        writer: Pin<Box<dyn AsyncWrite + Send>>,
+        next_id: u64,
+        poisoned: bool,
+    }
+
+    /// Dedicated sequential pipes; never performs authentication or direct networking.
+    pub struct StorageBridge {
+        authority: StorageBridgeAuthority,
+        original_deadline_unix_ms: u64,
+        deadline: Instant,
+        data_endpoint: Url,
+        data_prefix: String,
+        state: Mutex<State>,
+    }
+
+    impl fmt::Debug for StorageBridge {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("StorageBridge").finish_non_exhaustive()
+        }
+    }
+
+    fn invalid() -> anyhow::Error {
+        anyhow::anyhow!("invalid storage bridge configuration")
+    }
+
+    fn digest(bytes: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(bytes))
+    }
+
+    fn canonical(value: &serde_json::Value) -> Result<Vec<u8>, serde_json::Error> {
+        fn sorted(value: &serde_json::Value) -> serde_json::Value {
+            match value {
+                serde_json::Value::Object(map) => {
+                    let ordered: BTreeMap<_, _> = map.iter().collect();
+                    serde_json::Value::Object(ordered.into_iter().map(|(k, v)| (k.clone(), sorted(v))).collect())
+                }
+                serde_json::Value::Array(items) => serde_json::Value::Array(items.iter().map(sorted).collect()),
+                value => value.clone(),
+            }
+        }
+        serde_json::to_vec(&sorted(value))
+    }
+
+    fn header_allowed(name: &str, response: bool) -> bool {
+        let name = name.to_ascii_lowercase();
+        name.starts_with("x-ms-meta-")
+            || matches!(
+                name.as_str(),
+                "content-length"
+                    | "content-type"
+                    | "content-md5"
+                    | "date"
+                    | "x-ms-version"
+                    | "x-ms-date"
+                    | "x-ms-client-request-id"
+                    | "x-ms-request-id"
+                    | "x-ms-lease-id"
+            )
+            || if response {
+                matches!(
+                    name.as_str(),
+                    "etag"
+                        | "last-modified"
+                        | "server"
+                        | "accept-ranges"
+                        | "content-range"
+                        | "x-ms-error-code"
+                        | "x-ms-blob-type"
+                        | "x-ms-blob-content-md5"
+                        | "x-ms-lease-status"
+                        | "x-ms-lease-state"
+                        | "x-ms-lease-duration"
+                        | "x-ms-creation-time"
+                        | "x-ms-server-encrypted"
+                        | "transfer-encoding"
+                )
+            } else {
+                matches!(
+                    name.as_str(),
+                    "if-match"
+                        | "if-none-match"
+                        | "if-modified-since"
+                        | "if-unmodified-since"
+                        | "range"
+                        | "x-ms-range"
+                        | "x-ms-lease-action"
+                        | "x-ms-lease-duration"
+                        | "x-ms-proposed-lease-id"
+                        | "x-ms-blob-type"
+                        | "user-agent"
+                        | "accept"
+                        | "accept-encoding"
+                )
+            }
+    }
+
+    impl StorageBridge {
+        /// Bind dedicated protocol pipes to the original absolute deadline.
+        ///
+        /// # Errors
+        /// Rejects invalid authority, credential-bearing endpoints and expired budgets.
+        pub fn new<R, W>(
+            authority: StorageBridgeAuthority,
+            original_deadline_unix_ms: u64,
+            reader: R,
+            writer: W,
+        ) -> anyhow::Result<Arc<Self>>
+        where
+            R: AsyncRead + Send + 'static,
+            W: AsyncWrite + Send + 'static,
+        {
+            for id in [
+                &authority.campaign_id,
+                &authority.cell_run_id,
+                &authority.owner_id,
+                &authority.reset_generation,
+            ] {
+                crate::publisher::canonical_uuid(id)?;
+            }
+            if !(1..=JSON_SAFE).contains(&authority.fencing_token)
+                || original_deadline_unix_ms > JSON_SAFE
+                || authority.sandbox_id.is_empty()
+                || authority.sandbox_id.len() > 256
+            {
+                return Err(invalid());
+            }
+            let root = Url::parse(&authority.table_root_url).map_err(|_| invalid())?;
+            if root.scheme() != "abfss"
+                || !root.path().ends_with('/')
+                || root.path() == "/"
+                || root.query().is_some()
+                || root.fragment().is_some()
+                || root.password().is_some()
+                || crate::publisher::azure_account(&root)? != authority.storage_account
+            {
+                return Err(invalid());
+            }
+            let container = root.username();
+            if container.is_empty()
+                || !container
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            {
+                return Err(invalid());
+            }
+            let origin = format!("https://{}.blob.core.windows.net", authority.storage_account);
+            let control = Url::parse(&authority.control_container_url).map_err(|_| invalid())?;
+            if control.origin().ascii_serialization() != origin
+                || control.query().is_some()
+                || control.fragment().is_some()
+                || !control.username().is_empty()
+                || control.password().is_some()
+                || control.path().trim_matches('/').is_empty()
+                || control.path().trim_matches('/').contains('/')
+                || control.path().ends_with('/')
+            {
+                return Err(invalid());
+            }
+            let now = u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())?;
+            let remaining = original_deadline_unix_ms
+                .checked_sub(now)
+                .filter(|x| *x > 0)
+                .ok_or_else(invalid)?;
+            let data_endpoint = Url::parse(&format!("{origin}/{container}")).map_err(|_| invalid())?;
+            let data_prefix = root.path().trim_start_matches('/').to_owned();
+            Ok(Arc::new(Self {
+                authority,
+                original_deadline_unix_ms,
+                deadline: Instant::now() + Duration::from_millis(remaining),
+                data_endpoint,
+                data_prefix,
+                state: Mutex::new(State {
+                    reader: BufReader::new(Box::pin(reader)),
+                    writer: Box::pin(writer),
+                    next_id: 1,
+                    poisoned: false,
+                }),
+            }))
+        }
+
+        pub(crate) fn authority(&self) -> &StorageBridgeAuthority {
+            &self.authority
+        }
+
+        pub(crate) fn validate_root(&self, url: &Url) -> anyhow::Result<()> {
+            if url.as_str() != self.authority.table_root_url {
+                return Err(invalid());
+            }
+            Ok(())
+        }
+
+        fn validate_request(&self, request: &HttpRequest, target: &str) -> Result<(), Code> {
+            let url = Url::parse(&request.uri().to_string()).map_err(|_| Code::InvalidRequest)?;
+            if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
+                return Err(Code::InvalidRequest);
+            }
+            let mut query = BTreeMap::new();
+            for (key, value) in url.query_pairs() {
+                if query.insert(key.into_owned(), value.into_owned()).is_some() {
+                    return Err(Code::InvalidRequest);
+                }
+            }
+            let method = request.method().as_str();
+            let allowed = match target {
+                "control" => {
+                    let mut endpoint = url.clone();
+                    endpoint.set_query(None);
+                    endpoint.as_str() == self.authority.control_container_url
+                        && query.get("restype").is_some_and(|x| x == "container")
+                        && match (method, query.get("comp").map(String::as_str)) {
+                            ("HEAD", None) => query.len() == 1,
+                            ("PUT", Some("lease")) => {
+                                query.len() == 2
+                                    && request
+                                        .headers()
+                                        .get("x-ms-lease-action")
+                                        .is_some_and(|x| x == "acquire" || x == "release")
+                            }
+                            ("PUT", Some("metadata")) => query.len() == 2,
+                            _ => false,
+                        }
+                        && request.body().content_length() == 0
+                }
+                "object_store" => {
+                    let prefix = format!("{}/{}", self.data_endpoint.path(), self.data_prefix);
+                    url.origin() == self.data_endpoint.origin()
+                        && match method {
+                            "GET" if url.path() == self.data_endpoint.path() => {
+                                query.len() >= 3
+                                    && query.len() <= 5
+                                    && query.get("restype").is_some_and(|x| x == "container")
+                                    && query.get("comp").is_some_and(|x| x == "list")
+                                    && query.get("prefix").is_some_and(|x| x.starts_with(&self.data_prefix))
+                                    && query.keys().all(|x| {
+                                        matches!(x.as_str(), "restype" | "comp" | "prefix" | "marker" | "maxresults")
+                                    })
+                            }
+                            "GET" | "HEAD" => {
+                                query.is_empty() && url.path().starts_with(&format!("{prefix}_delta_log/"))
+                            }
+                            "PUT" => {
+                                query.is_empty()
+                                    && url.path() == format!("{prefix}_delta_log/00000000000000000000.json")
+                                    && request.headers().get("if-none-match").is_some_and(|x| x == "*")
+                            }
+                            _ => false,
+                        }
+                }
+                _ => false,
+            };
+            if !allowed || request.body().content_length() > MAX_BODY {
+                return Err(Code::InvalidRequest);
+            }
+            for (name, value) in request.headers() {
+                if !header_allowed(name.as_str(), false) || value.to_str().is_err() {
+                    return Err(Code::InvalidRequest);
+                }
+            }
+            Ok(())
+        }
+
+        pub(crate) async fn exchange(&self, mut request: HttpRequest, target: &str) -> Outcome {
+            let mut state = self.state.lock().await;
+            if state.poisoned {
+                return Outcome::Unknown(Code::Poisoned);
+            }
+            if let Err(code) = self.validate_request(&request, target) {
+                return Outcome::NotSent(code);
+            }
+            let mut bytes = Vec::new();
+            while let Some(frame) = request.body_mut().frame().await {
+                let Ok(frame) = frame else {
+                    return Outcome::NotSent(Code::InvalidRequest);
+                };
+                let Ok(data) = frame.into_data() else {
+                    return Outcome::NotSent(Code::InvalidRequest);
+                };
+                if data.len() > MAX_BODY - bytes.len() {
+                    return Outcome::NotSent(Code::InvalidRequest);
+                }
+                bytes.extend_from_slice(&data);
+            }
+            let Ok(body) = String::from_utf8(bytes) else {
+                return Outcome::NotSent(Code::InvalidRequest);
+            };
+            let deadline = self.deadline.min(Instant::now() + Duration::from_secs(10));
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let Ok(remaining_timeout_ms) = u64::try_from(remaining.as_millis()) else {
+                return Outcome::NotSent(Code::DeadlineExceeded);
+            };
+            if remaining_timeout_ms == 0 || state.next_id > JSON_SAFE {
+                return Outcome::NotSent(Code::DeadlineExceeded);
+            }
+            let headers = request
+                .headers()
+                .iter()
+                .map(|(k, v)| v.to_str().map(|value| (k.to_string(), value.to_owned())))
+                .collect::<Result<Vec<_>, _>>();
+            let Ok(headers) = headers else {
+                return Outcome::NotSent(Code::InvalidRequest);
+            };
+            let url = request.uri().to_string();
+            let mut envelope = Request {
+                schema_version: 1,
+                kind: "storage_http_request",
+                request_id: state.next_id,
+                authority: &self.authority,
+                original_deadline_unix_ms: self.original_deadline_unix_ms,
+                remaining_timeout_ms,
+                target,
+                method: request.method().as_str(),
+                url: &url,
+                headers,
+                body_sha256: digest(body.as_bytes()),
+                body,
+                request_sha256: None,
+            };
+            let Ok(value) = serde_json::to_value(&envelope) else {
+                return Outcome::NotSent(Code::InvalidRequest);
+            };
+            let Ok(unsigned) = canonical(&value) else {
+                return Outcome::NotSent(Code::InvalidRequest);
+            };
+            let request_sha256 = digest(&unsigned);
+            envelope.request_sha256 = Some(request_sha256.clone());
+            let Ok(value) = serde_json::to_value(envelope) else {
+                return Outcome::NotSent(Code::InvalidRequest);
+            };
+            let Ok(mut frame) = canonical(&value) else {
+                return Outcome::NotSent(Code::InvalidRequest);
+            };
+            if frame.len() + 1 > MAX_FRAME {
+                return Outcome::NotSent(Code::InvalidRequest);
+            }
+            frame.push(b'\n');
+            // Set before the first write: dropping this future must never permit a second forward.
+            state.poisoned = true;
+            state.next_id += 1;
+            let result = tokio::time::timeout_at(deadline, async {
+                state.writer.write_all(&frame).await?;
+                state.writer.flush().await?;
+                let mut reply = Vec::new();
+                loop {
+                    let available = state.reader.fill_buf().await?;
+                    if available.is_empty() {
+                        return Err(std::io::Error::other("bridge EOF"));
+                    }
+                    let length = available
+                        .iter()
+                        .position(|b| *b == b'\n')
+                        .map_or(available.len(), |n| n + 1);
+                    if length > MAX_FRAME - reply.len() {
+                        return Err(std::io::Error::other("bridge frame limit"));
+                    }
+                    let complete = available[length - 1] == b'\n';
+                    reply.extend_from_slice(&available[..length]);
+                    state.reader.consume(length);
+                    if complete {
+                        break;
+                    }
+                }
+                Ok::<_, std::io::Error>(reply)
+            })
+            .await;
+            let Ok(Ok(reply)) = result else {
+                return Outcome::Unknown(Code::ResponseLost);
+            };
+            let Ok(response) = serde_json::from_slice::<Response>(&reply) else {
+                return Outcome::Unknown(Code::Protocol);
+            };
+            let matches = |version, kind: &str, id, hash: &str| {
+                version == 1 && kind == "storage_http_response" && id == state.next_id - 1 && hash == request_sha256
+            };
+            match response {
+                Response::Response {
+                    schema_version,
+                    kind,
+                    request_id,
+                    request_sha256,
+                    status,
+                    headers,
+                    body,
+                    body_sha256,
+                    truncated,
+                } => {
+                    if !matches(schema_version, &kind, request_id, &request_sha256)
+                        || truncated
+                        || body.len() > MAX_BODY
+                        || digest(body.as_bytes()) != body_sha256
+                        || !(200..=599).contains(&status)
+                        || (300..=399).contains(&status)
+                    {
+                        return Outcome::Unknown(Code::Protocol);
+                    }
+                    let mut response = HttpResponse::new(body.into());
+                    let Ok(status) = reqwest::StatusCode::from_u16(status) else {
+                        return Outcome::Unknown(Code::Protocol);
+                    };
+                    *response.status_mut() = status;
+                    for (name, value) in headers {
+                        if !header_allowed(&name, true) {
+                            return Outcome::Unknown(Code::Protocol);
+                        }
+                        let Ok(name) = reqwest::header::HeaderName::from_bytes(name.as_bytes()) else {
+                            return Outcome::Unknown(Code::Protocol);
+                        };
+                        let Ok(value) = reqwest::header::HeaderValue::from_str(&value) else {
+                            return Outcome::Unknown(Code::Protocol);
+                        };
+                        response.headers_mut().append(name, value);
+                    }
+                    if !state.reader.buffer().is_empty() {
+                        return Outcome::Unknown(Code::Protocol);
+                    }
+                    state.poisoned = false;
+                    Outcome::Response(response)
+                }
+                Response::DefinitelyNotSent {
+                    schema_version,
+                    kind,
+                    request_id,
+                    request_sha256,
+                    error_code,
+                } => {
+                    if !matches(schema_version, &kind, request_id, &request_sha256)
+                        || !matches!(
+                            error_code,
+                            Code::AdmissionRefused
+                                | Code::DeadlineExceeded
+                                | Code::InvalidRequest
+                                | Code::TransportUnavailable
+                        )
+                        || !state.reader.buffer().is_empty()
+                    {
+                        return Outcome::Unknown(Code::Protocol);
+                    }
+                    state.poisoned = false;
+                    Outcome::NotSent(error_code)
+                }
+                Response::Unknown {
+                    schema_version,
+                    kind,
+                    request_id,
+                    request_sha256,
+                    error_code,
+                } => {
+                    if !matches(schema_version, &kind, request_id, &request_sha256) {
+                        return Outcome::Unknown(Code::Protocol);
+                    }
+                    Outcome::Unknown(error_code)
+                }
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    pub(super) struct Service(pub Arc<StorageBridge>);
+
+    #[async_trait]
+    impl HttpService for Service {
+        async fn call(&self, request: HttpRequest) -> Result<HttpResponse, HttpError> {
+            let (kind, code) = match self.0.exchange(request, "object_store").await {
+                Outcome::Response(response) => return Ok(response),
+                Outcome::NotSent(code) => (HttpErrorKind::Connect, code),
+                Outcome::Unknown(code) => (HttpErrorKind::Unknown, code),
+            };
+            Err(HttpError::new(
+                kind,
+                std::io::Error::other(format!("storage bridge {code}")),
+            ))
+        }
+    }
+}
+
 /// Build the shared Azure transport, parsing QAP configuration once.
 ///
 /// With neither environment variable set this is the ordinary SDK connector.
@@ -34,6 +643,16 @@ use uuid::Uuid;
 /// Rejects partial/non-Unicode configuration, invalid markers, non-absolute
 /// paths, unsafe files, and failures to open/synchronize the trace.
 pub fn azure_http_connector() -> object_store::Result<impl HttpConnector> {
+    configured_connector()
+}
+
+pub(crate) fn bridge_http_connector(bridge: Arc<StorageBridge>) -> object_store::Result<impl HttpConnector> {
+    let mut connector = configured_connector()?;
+    connector.bridge = Some(bridge);
+    Ok(connector)
+}
+
+fn configured_connector() -> object_store::Result<Connector> {
     let marker = std::env::var("ARROWCOL_QAP_CLIENT_MARKER");
     let path = std::env::var("ARROWCOL_QAP_HTTP_TRACE");
     let value = |result| match result {
@@ -64,12 +683,16 @@ fn http_error(source: io::Error) -> HttpError {
 #[derive(Debug)]
 struct Connector {
     trace: Option<Arc<Trace>>,
+    bridge: Option<Arc<StorageBridge>>,
 }
 
 impl Connector {
     fn configured(marker: Option<&str>, path: Option<&Path>) -> io::Result<Self> {
         match (marker, path) {
-            (None, None) => Ok(Self { trace: None }),
+            (None, None) => Ok(Self {
+                trace: None,
+                bridge: None,
+            }),
             (Some(marker), Some(path)) => {
                 let parts: Vec<_> = marker.split('/').collect();
                 let safe_part = |part: &str| {
@@ -114,6 +737,7 @@ impl Connector {
                 }
                 file.sync_all()?;
                 Ok(Self {
+                    bridge: None,
                     trace: Some(Arc::new(Trace {
                         marker,
                         path: path.to_owned(),
@@ -128,6 +752,16 @@ impl Connector {
 
 impl HttpConnector for Connector {
     fn connect(&self, options: &ClientOptions) -> object_store::Result<HttpClient> {
+        if let Some(bridge) = &self.bridge {
+            let inner = HttpClient::new(storage_bridge::Service(Arc::clone(bridge)));
+            return Ok(match &self.trace {
+                Some(trace) => HttpClient::new(Service {
+                    inner,
+                    trace: Arc::clone(trace),
+                }),
+                None => inner,
+            });
+        }
         match &self.trace {
             None => ReqwestConnector::default().connect(options),
             Some(trace) => Ok(HttpClient::new(Service {
