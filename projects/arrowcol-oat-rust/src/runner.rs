@@ -3565,7 +3565,7 @@ fn matrix_cell_specs(config: &OatConfig) -> Vec<(u32, u32, String)> {
 
 fn platform_for_run(config: &OatConfig, run_id: &str) -> Result<Box<dyn Platform>> {
     if config.campaign_profile == Some(crate::config::CampaignProfile::ScaleOutSingleTable) {
-        bail!("scale_out_single_table is blocked until multi-pod protection and delivery reconciliation are implemented");
+        bail!("scale_out_single_table is blocked until runtime qualification and delivery reconciliation are implemented");
     }
     if config.platform.kind == crate::config::OatMode::Aks
         && config.campaign_profile == Some(crate::config::CampaignProfile::SingleHotTable)
@@ -4415,32 +4415,15 @@ async fn run_clients_inner(
     pinning: &mut PinningReport,
     replicas: u32,
 ) -> Result<ClientRun> {
+    require_single_scale_out_collector(config, replicas)?;
     let mut evidence = CellEvidence::default();
-    let scale_out = config.campaign_profile == Some(crate::config::CampaignProfile::ScaleOutSingleTable);
-    let mut prepared_scale_out = if scale_out {
-        match tokio::time::timeout(Duration::from_secs(30), PreparedScaleOutGuard::prepare(config, platform, replicas)).await {
-            Ok(Ok(prepared)) => Some(prepared),
-            result => {
-                let error = match result {
-                    Ok(Err(error)) => format!("{error:#}"),
-                    Err(error) => error.to_string(),
-                    Ok(Ok(_)) => unreachable!("successful guard preparation returned above"),
-                };
-                tracing::error!(%error, "scale-out overload protection unavailable before admission");
-                evidence.overload_guard = Some(json!({
-                    "status":"unavailable","settings":config.overload_guard,
-                    "unavailable_reason":"scale_out_pre_admission_readback_unavailable","error":error,
-                }));
-                return Ok(ClientRun {
-                    metrics: HashMap::new(), pinning: std::mem::take(pinning),
-                    qap_tables: Vec::new(), failure: Some("scale-out overload protection unavailable before admission".to_owned()),
-                    evidence,
-                });
-            }
-        }
-    } else { None };
-    let mut prepared_guard = if config.overload_guard.enabled && !scale_out {
-        match tokio::time::timeout(Duration::from_secs(5), PreparedGuard::prepare(config, platform)).await {
+    let mut prepared_guard = if config.overload_guard.enabled {
+        let timeout = if config.campaign_profile == Some(crate::config::CampaignProfile::ScaleOutSingleTable) {
+            Duration::from_secs(30)
+        } else {
+            Duration::from_secs(5)
+        };
+        match tokio::time::timeout(timeout, PreparedGuard::prepare(config, platform)).await {
             Ok(Ok(prepared)) => Some(prepared),
             result => {
                 let error = match result {
@@ -4464,10 +4447,8 @@ async fn run_clients_inner(
                 });
             }
         }
-    } else if !config.overload_guard.enabled {
-        evidence.overload_guard = Some(json!({"status":"disabled","settings":config.overload_guard}));
-        None
     } else {
+        evidence.overload_guard = Some(json!({"status":"disabled","settings":config.overload_guard}));
         None
     };
     if let Some(prepared) = &prepared_guard {
@@ -4480,16 +4461,6 @@ async fn run_clients_inner(
                 qap_tables: Vec::new(),
                 failure: Some(reason),
                 evidence,
-            });
-        }
-    }
-    if let Some(prepared) = &prepared_scale_out {
-        evidence.overload_guard = Some(prepared.engine.proof.clone());
-        evidence.overload_stop = prepared.engine.stop.clone();
-        if let Some(reason) = prepared.engine.failure() {
-            return Ok(ClientRun {
-                metrics: HashMap::new(), pinning: std::mem::take(pinning),
-                qap_tables: Vec::new(), failure: Some(reason), evidence,
             });
         }
     }
@@ -4740,14 +4711,6 @@ async fn run_clients_inner(
         prepared.engine.proof["run_id"] = json!(project_run_id);
         prepared.probe.since_ms = unix_time_ms_u64()?.saturating_sub(GUARD_MAX_GAP_MS);
     }
-    if let Some(prepared) = &mut prepared_scale_out {
-        prepared.engine.arm(run_start_unix_ms, measurement_end_unix_ms);
-        prepared.engine.proof["run_id"] = json!(project_run_id);
-        let since_ms = unix_time_ms_u64()?.saturating_sub(GUARD_MAX_GAP_MS);
-        for collector in &mut prepared.collectors {
-            collector.probe.since_ms = since_ms;
-        }
-    }
     let native = match platform.native_telemetry_source(config, &qap_tables).await {
         Ok(source) => source,
         Err(_) => {
@@ -4768,7 +4731,6 @@ async fn run_clients_inner(
         measurement_start_unix_ms,
         measurement_end_unix_ms,
         prepared_guard,
-        prepared_scale_out,
     );
     let mut client_metrics = HashMap::<String, Vec<ClientMeasurement>>::with_capacity(tables.len());
     let mut completed_clients = HashSet::new();
@@ -9306,10 +9268,18 @@ fn set_runtime_replicas(runtime_config: &mut Value, replicas: u32) -> Result<()>
     Ok(())
 }
 
+fn require_single_scale_out_collector(config: &OatConfig, replicas: u32) -> Result<()> {
+    if config.campaign_profile == Some(crate::config::CampaignProfile::ScaleOutSingleTable) && replicas != 1 {
+        bail!("scale_out_single_table runtime requires exactly one collector replica");
+    }
+    Ok(())
+}
+
 fn project_scale_out_runtime(runtime_config: &mut Value, config: &OatConfig, replicas: u32) -> Result<()> {
     if config.campaign_profile != Some(crate::config::CampaignProfile::ScaleOutSingleTable) {
         return Ok(());
     }
+    require_single_scale_out_collector(config, replicas)?;
     let [hot_table] = config.tables.as_slice() else {
         bail!("scale_out_single_table runtime requires exactly one hot table");
     };
@@ -9330,6 +9300,7 @@ async fn prepare_aks_platform(
     orchestration_run_id: &str,
     replicas: u32,
 ) -> Result<()> {
+    require_single_scale_out_collector(config, replicas)?;
     let parent = std::env::temp_dir().join("arrowcol-oat");
     tokio::fs::create_dir_all(&parent)
         .await
@@ -13643,14 +13614,19 @@ mod tests {
         assert_eq!(runtime, original);
         config.campaign_profile = Some(crate::config::CampaignProfile::ScaleOutSingleTable);
         config.tables = vec!["sqlserver_availability_replica_states".to_owned()];
-        project_scale_out_runtime(&mut runtime, &config, 2)?;
+        for replicas in [0, 2, 16] {
+            let before = runtime.clone();
+            assert!(project_scale_out_runtime(&mut runtime, &config, replicas).is_err());
+            assert_eq!(runtime, before);
+        }
+        project_scale_out_runtime(&mut runtime, &config, 1)?;
         assert_eq!(runtime["campaignProfile"], "scale_out_single_table");
         assert_eq!(runtime["hotTable"], config.tables[0]);
         assert_eq!(runtime["collectorStartupTable"], json!({
             "catalog": "telemetry", "schema": "sqlserver", "table": config.tables[0]
         }));
-        assert_eq!(runtime["collectorReplicas"], 2);
-        assert_eq!(runtime["routerReplicas"], 2);
+        assert_eq!(runtime["collectorReplicas"], 1);
+        assert_eq!(runtime["routerReplicas"], 1);
         for cpu in [Some("2"), None] {
             config.platform.resources = Some(serde_json::from_value(json!({
                 "collector": {"requests": {"cpu": "2", "memory": "4Gi"},
@@ -13663,7 +13639,7 @@ mod tests {
             );
         }
         config.tables.push("sqlserver_wait_stats".to_owned());
-        assert!(project_scale_out_runtime(&mut runtime, &config, 2).is_err());
+        assert!(project_scale_out_runtime(&mut runtime, &config, 1).is_err());
         Ok(())
     }
 
@@ -13676,7 +13652,7 @@ mod tests {
         for kind in [crate::config::OatMode::Local, crate::config::OatMode::Aks] {
             config.platform.kind = kind;
             let error = platform_for_run(&config, "test-run").err().context("scale-out was admitted")?;
-            assert!(error.to_string().contains("blocked until multi-pod protection"));
+            assert!(error.to_string().contains("blocked until runtime qualification"));
         }
         Ok(())
     }

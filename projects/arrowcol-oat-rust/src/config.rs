@@ -395,6 +395,9 @@ impl OatConfig {
             if self.tables.as_slice() != ["sqlserver_availability_replica_states"] {
                 bail!("scale_out_single_table campaign requires exactly the public sqlserver_availability_replica_states DMV table");
             }
+            if self.replica_counts != [1] {
+                bail!("scale_out_single_table campaign requires replica_counts [1]");
+            }
             if self.tunables.wal.is_some() {
                 bail!("scale_out_single_table campaign requires WAL to be absent");
             }
@@ -1976,6 +1979,11 @@ mod tests {
         }))?;
         config.clients_per_table = 128;
         config.validate()?;
+        for replicas in [vec![2], vec![1, 2], vec![]] {
+            config.replica_counts = replicas;
+            assert!(config.validate_campaign_profile().unwrap_err().to_string().contains("replica_counts [1]"));
+        }
+        config.replica_counts = vec![1];
         config.clients_per_table = 129;
         assert!(config.validate().is_err());
         config.clients_per_table = 0;

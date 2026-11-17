@@ -1189,12 +1189,12 @@ impl Drop for ResourceSampler {
 
 impl ResourceSampler {
     fn start(source: Option<ResourceSamplerSource>, config: OatConfig, start: u64, end: u64,
-        prepared: Option<PreparedGuard>, mut scale_guard: Option<PreparedScaleOutGuard>) -> Self {
+        prepared: Option<PreparedGuard>) -> Self {
         let native = match &source {
             Some(ResourceSamplerSource::AksNative(native)) => Some(Arc::clone(native)),
             _ => None,
         };
-        let (signal, receiver) = watch::channel(if prepared.is_some() || scale_guard.is_some() {
+        let (signal, receiver) = watch::channel(if prepared.is_some() {
             GuardSignal::Monitoring
         } else {
             GuardSignal::Disabled
@@ -1213,8 +1213,6 @@ impl ResourceSampler {
                 let mut last_native = None;
                 let (backlog_scraper, mut guard) = if let Some(prepared) = prepared {
                     (Some(prepared.scraper), Some((prepared.probe, prepared.engine)))
-                } else if scale_guard.is_some() {
-                    (None, None)
                 } else {
                     (match PublicationBacklogScraper::start(&source, &config).await {
                         Ok(scraper) => Some(scraper),
@@ -1240,7 +1238,7 @@ impl ResourceSampler {
                             _ => native_failures += 1,
                         }
                     }
-                    if now >= end && guard.is_none() && scale_guard.is_none() {
+                    if now >= end && guard.is_none() {
                         break;
                     }
                     if let Some(source) = &native
@@ -1255,7 +1253,7 @@ impl ResourceSampler {
                                 capture_native_telemetry(&source, &config).await
                             });
                     }
-                    if now < start && guard.is_none() && scale_guard.is_none() {
+                    if now < start && guard.is_none() {
                         continue;
                     }
                     while let Some(sample) = resource_tasks.try_join_next() {
@@ -1269,7 +1267,7 @@ impl ResourceSampler {
                             }
                         }
                     }
-                    let asynchronous_resources = guard.is_some() || scale_guard.is_some();
+                    let asynchronous_resources = guard.is_some();
                     if asynchronous_resources && resource_tasks.is_empty() && now >= start && now < end {
                         let source = source.clone();
                         let config = config.clone();
@@ -1281,7 +1279,7 @@ impl ResourceSampler {
                     }
                     let request_anchor = tokio::time::Instant::now();
                     let request_start_unix_ms = unix_time_ms_u64()?;
-                    if request_start_unix_ms >= end && guard.is_none() && scale_guard.is_none() {
+                    if request_start_unix_ms >= end && guard.is_none() {
                         break;
                     }
                     let sample = async {
@@ -1292,20 +1290,15 @@ impl ResourceSampler {
                         }
                     };
                     let timeout_ms = publication_backlog_timeout_ms(request_start_unix_ms, start, end);
-                    let other_timeout_ms = if guard.is_some() || scale_guard.is_some() {
+                    let other_timeout_ms = if guard.is_some() {
                         PUBLICATION_BACKLOG_REQUEST_TIMEOUT.as_millis() as u64
                     } else {
                         timeout_ms
                     };
-                    let scale_out = scale_guard.is_some();
                     let guard_reading = async {
-                        if let Some(scale) = &mut scale_guard {
-                            scale.read(&config).await.map(|(reading, backlog, per_pod)| Some((reading, Some(backlog), Some(per_pod))))
-                        } else {
-                            match (&mut guard, &backlog_scraper) {
-                                (Some((probe, _)), Some(scraper)) => probe.read(&config, scraper).await.map(|reading| Some((reading, None, None))),
-                                _ => Ok(None),
-                            }
+                        match (&mut guard, &backlog_scraper) {
+                            (Some((probe, _)), Some(scraper)) => probe.read(&config, scraper).await.map(Some),
+                            _ => Ok(None),
                         }
                     };
                     let (resource_result, backlog_result, guard_result) = tokio::join!(
@@ -1322,7 +1315,7 @@ impl ResourceSampler {
                                     sampled_at_unix_ms,
                                     metrics,
                                 });
-                            } else if guard.is_none() && scale_guard.is_none() {
+                            } else if guard.is_none() {
                                 evidence.resource_sampling_failures += 1;
                             }
                         }
@@ -1332,17 +1325,13 @@ impl ResourceSampler {
                             tracing::warn!("resource sample unavailable or exceeded its bounded deadline");
                         }
                     }
-                    let (observation, scale_backlog, per_pod) = match guard_result {
-                        Ok(Ok(Some((reading, backlog, per_pod)))) => (Ok(reading), backlog, per_pod),
-                        _ => (Err(anyhow::anyhow!("live cap or ingestion commit readback unavailable")), None, None),
+                    let observation = match guard_result {
+                        Ok(Ok(Some(reading))) => Ok(reading),
+                        _ => Err(anyhow::anyhow!("live cap or ingestion commit readback unavailable")),
                     };
-                    let (request_end_unix_ms, backlog_result) = if scale_out {
-                        (unix_time_ms_u64()?, scale_backlog.context("scale-out backlog readback unavailable"))
-                    } else {
-                        match backlog_result {
-                            Ok((request_end, result)) => (request_end, result),
-                            _ => (unix_time_ms_u64()?, Err(anyhow::anyhow!("publication backlog scrape exceeded its bounded deadline"))),
-                        }
+                    let (request_end_unix_ms, backlog_result) = match backlog_result {
+                        Ok((request_end, result)) => (request_end, result),
+                        _ => (unix_time_ms_u64()?, Err(anyhow::anyhow!("publication backlog scrape exceeded its bounded deadline"))),
                     };
                     let backlog_sample = match backlog_result {
                         Ok(metrics) => publication_backlog_sample(
@@ -1357,7 +1346,7 @@ impl ResourceSampler {
                                 request_start_unix_ms,
                                 request_end_unix_ms,
                                 timeout_ms,
-                                if backlog_scraper.is_some() || scale_out {
+                                if backlog_scraper.is_some() {
                                     "scrape_failed"
                                 } else {
                                     "endpoint_unavailable"
@@ -1365,25 +1354,7 @@ impl ResourceSampler {
                             )
                         }
                     };
-                    let engine = match (&mut guard, &mut scale_guard) {
-                        (Some((_, engine)), None) => Some(engine),
-                        (None, Some(scale)) => Some(&mut scale.engine),
-                        _ => None,
-                    };
-                    if let Some(engine) = engine {
-                        if let Some(per_pod) = per_pod {
-                            if engine.proof["per_pod_observations"].is_null() {
-                                engine.proof["per_pod_observations"] = json!([]);
-                            }
-                            let observations = engine.proof["per_pod_observations"].as_array_mut()
-                                .context("scale-out guard observations missing")?;
-                            if observations.len() >= 4096 {
-                                engine.unavailable("scale_out_pod_evidence_capacity_reached");
-                            } else {
-                                observations.push(json!({"request_start_unix_ms":request_start_unix_ms,
-                                    "request_end_unix_ms":request_end_unix_ms,"pods":per_pod}));
-                            }
-                        }
+                    if let Some((_, engine)) = &mut guard {
                         engine.record(observation, &backlog_sample);
                         if let Some(reason) = engine.failure() {
                             signal.send_replace(GuardSignal::Stop(reason));
@@ -1401,7 +1372,7 @@ impl ResourceSampler {
                             evidence.backlog_samples_dropped += 1;
                         }
                         evidence.backlog_samples.push(backlog_sample);
-                    } else if (guard.is_none() && scale_guard.is_none()) || now >= start && now < end {
+                    } else if guard.is_none() || now >= start && now < end {
                         evidence.backlog_sampling_failures += 1;
                     }
                 }
@@ -1433,10 +1404,6 @@ impl ResourceSampler {
                 if let Some((_, engine)) = guard {
                     evidence.overload_guard = Some(engine.proof);
                     evidence.overload_stop = engine.stop;
-                }
-                if let Some(scale) = scale_guard {
-                    evidence.overload_guard = Some(scale.engine.proof);
-                    evidence.overload_stop = scale.engine.stop;
                 }
                 Ok(evidence)
             })
