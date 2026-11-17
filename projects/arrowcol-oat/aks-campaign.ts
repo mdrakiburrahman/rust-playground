@@ -733,12 +733,18 @@ export function createBlobCampaignStore(config: CampaignStoreConfig, fetcher: Fe
     throw new Error('Campaign store record path is invalid.');
   const endpoint = `https://${config.account}.blob.core.windows.net/${config.container}/` +
     segments.map(segment => encodeURIComponent(segment)).join('/');
-  const blobFetch: Fetcher = (input, init = {}) => {
+  const blobFetch = (input: Parameters<typeof fetch>[0], init: Parameters<typeof fetch>[1] = {}, deadlineUnixMs?: number): Promise<Response> => {
     const url = new URL(String(input)), method = (init.method ?? 'GET').toUpperCase();
     const body = typeof init.body === 'string' || Buffer.isBuffer(init.body) ? init.body : undefined;
     const requestInit: RequestInit = isEffectBoundaryActive() ? { ...init, redirect: 'error' } : init;
     return dispatchExternalEffect({ transport: 'campaign-blob', method, resource: url.origin + '/' + config.container,
-      path: url.pathname + url.search, body }, () => fetcher(input, requestInit));
+      path: url.pathname + url.search, body }, () => {
+        if (deadlineUnixMs === undefined) return fetcher(input, requestInit);
+        if (!nonnegative(deadlineUnixMs)) throw new Error('Campaign store deadline is invalid.');
+        const remaining = deadlineUnixMs - Date.now();
+        if (remaining <= 0) throw new Error('Campaign store operation exceeded its original deadline.');
+        return fetcher(input, { ...requestInit, signal: AbortSignal.timeout(remaining) });
+      });
   };
   const headers = async () => ({ authorization: `Bearer ${await token('https://storage.azure.com/')}`,
     'x-ms-date': new Date().toUTCString(), 'x-ms-version': '2023-11-03' });
@@ -753,7 +759,7 @@ export function createBlobCampaignStore(config: CampaignStoreConfig, fetcher: Fe
     async read(options) {
       const requestHeaders = await headers();
       await options?.beforeDispatch?.();
-      const response = await blobFetch(endpoint, { headers: requestHeaders, signal: operationSignal(options) });
+      const response = await blobFetch(endpoint, { headers: requestHeaders, signal: operationSignal(options) }, options?.deadlineUnixMs);
       if (response.status === 404) return undefined;
       if (!response.ok) throw new Error(`Campaign state read failed with HTTP ${response.status}.`);
       const etag = response.headers.get('etag');
@@ -768,7 +774,7 @@ export function createBlobCampaignStore(config: CampaignStoreConfig, fetcher: Fe
       const requestHeaders = { ...(await headers()), ...condition,
         'content-type': 'application/json', 'content-length': String(Buffer.byteLength(body)), 'x-ms-blob-type': 'BlockBlob' };
       await options?.beforeDispatch?.();
-      const response = await blobFetch(endpoint, { method: 'PUT', headers: requestHeaders, body, signal: operationSignal(options) });
+      const response = await blobFetch(endpoint, { method: 'PUT', headers: requestHeaders, body, signal: operationSignal(options) }, options?.deadlineUnixMs);
       if (response.status === 412) throw new CampaignConflictError();
       if (!response.ok) throw new Error(`Campaign state write failed with HTTP ${response.status}.`);
       const etag = response.headers.get('etag');

@@ -1,4 +1,9 @@
+import { EffectBoundary, withEffectBoundary, type EffectEnvelope } from '../../infra/azure/effect-boundary.js';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import { chmodSync, mkdtempSync, rmSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { test } from 'node:test';
 import { CampaignConflictError, CUSTODY_CLEANUP_STEPS, MAX_CAMPAIGN_LIFETIME_MS, KNOWN_LIFECYCLE_CLEANUP_RESERVE_MS, assessCellLifetimeBudget,
   MISSED_HEARTBEAT_LIMIT, HEARTBEAT_INTERVAL_MS,
@@ -434,6 +439,41 @@ test('strict state schema rejects additional persisted fields', async () => {
   assert.equal((await store.read())!.state.campaignId, campaignId);
 });
 
+
+test('default campaign Blob store rechecks its deadline after effect journaling', async () => {
+  let fetches = 0;
+  const envelope: EffectEnvelope = {
+    schema_version: 1, campaign_id: campaignId, run_id: 'c0ffee00-0000-4000-8000-000000000004',
+    subscription_id: subscriptionId, resource_group: 'perf69', storage_account: 'arrowcollector12345',
+    state_container: 'checkpoints', effects: [{ id: 'campaign-write', transport: 'campaign-blob', method: 'PUT',
+      resource: 'https://arrowcollector12345.blob.core.windows.net/checkpoints', path: '/checkpoints/active.json', max_calls: 1 }],
+  };
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'oat-campaign-deadline-journal-'));
+  chmodSync(directory, 0o700);
+  try {
+    const journalPath = path.join(directory, 'effects.jsonl');
+    const boundary = new EffectBoundary(envelope, journalPath);
+    const store = createBlobCampaignStore({ account: 'arrowcollector12345', container: 'checkpoints', subscriptionId },
+      async () => { fetches++; return new Response('', { status: 201, headers: { etag: '"saved"' } }); },
+      async () => 'offline-token');
+    const originalFsync = fs.fsyncSync;
+    fs.fsyncSync = (fd: number) => {
+      const started = Date.now();
+      while (Date.now() - started < 350) { /* deliberate synchronous journal delay */ }
+      return originalFsync(fd);
+    };
+    const deadline = Date.now() + 250;
+    try {
+      await assert.rejects(withEffectBoundary(boundary, () => store.write(newCampaignState(campaignId, ownerId, Date.now()), undefined,
+        { deadlineUnixMs: deadline })), /original deadline/);
+    } finally { fs.fsyncSync = originalFsync; }
+    assert.ok(Date.now() >= deadline);
+    assert.equal(fetches, 0);
+    const journal = fs.readFileSync(journalPath, 'utf8');
+    assert.match(journal, /"event":"dispatch"/);
+    assert.match(journal, /"outcome":"unknown_after_forward"/);
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
 
 test('campaign Blob store keeps the default record path and supports isolated paths', async () => {
   const paths: string[] = [];

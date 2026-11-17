@@ -13,6 +13,7 @@ const MAX_FRAME = 4 * 1024 * 1024;
 const MAX_OUTPUT = 1024 * 1024;
 const MAX_STORAGE_BODY = 1024 * 1024;
 const STORAGE_RESOURCE = 'https://storage.azure.com/';
+const VOLATILE_STORAGE_EFFECT_HEADERS = new Set(['x-ms-client-request-id', 'date', 'x-ms-date']);
 type Obj = Record<string, unknown>;
 
 export interface FixtureAuthority { campaign_id: string; cell_run_id: string; owner_id: string; fencing_token: number;
@@ -160,15 +161,22 @@ function storageAuthority(value: unknown): asserts value is StorageBridgeAuthori
 }
 interface LedgerBinding { schema_version: 1; kind: 'binding'; scope: string; authority_sha256: string;
   original_deadline_unix_ms: number; phase: string; plan_sha256: string; allocation_sha256: string }
+interface StorageLedgerRequest { target: 'control' | 'object_store'; method: string; url: string;
+  headers: [string, string][]; body_sha256: string }
 interface LedgerRecord { schema_version: 1; scope: string; authority_sha256: string; request_id: number;
-  request_sha256: string; state: 'pending' | 'response'; response?: unknown; response_sha256?: string }
+  request_sha256: string; state: 'pending' | 'response'; request_evidence?: StorageLedgerRequest;
+  response?: unknown; response_sha256?: string }
+interface LedgerTerminalRecord extends Omit<LedgerBinding, 'kind'> { kind: 'terminal_receipt'; request_count: number;
+  transcript_sha256: string; receipt: unknown; receipt_sha256: string }
 class DurableBridgeLedger {
   private readonly records = new Map<number, LedgerRecord>();
   private maxId = 0;
+  private terminal?: LedgerTerminalRecord;
   private readonly scope: string;
   private readonly authorityHash: string;
+  private readonly binding: LedgerBinding;
   constructor(private readonly filename: string, binding: LedgerBinding) {
-    this.scope = binding.scope; this.authorityHash = binding.authority_sha256;
+    this.binding = binding; this.scope = binding.scope; this.authorityHash = binding.authority_sha256;
     const directory = path.dirname(path.resolve(filename)); fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
     const dir = fs.lstatSync(directory);
     if (!dir.isDirectory() || dir.isSymbolicLink() || (dir.mode & 0o077) !== 0) throw new Error('Bridge ledger directory must be private and non-symlink.');
@@ -184,49 +192,104 @@ class DurableBridgeLedger {
       if (!object(persisted) || !exact(persisted, ['schema_version','kind','scope','authority_sha256','original_deadline_unix_ms',
           'phase','plan_sha256','allocation_sha256']) || !equal(persisted, binding))
         throw new Error('Bridge ledger immutable deadline, phase, plan or allocation identity changed after restart.');
-      for (const line of lines.slice(1)) this.load(JSON.parse(line) as unknown);
+      for (let index = 1; index < lines.length; index++) {
+        const value = JSON.parse(lines[index]!) as unknown;
+        if (object(value) && value.kind === 'terminal_receipt') {
+          if (index !== lines.length - 1) throw new Error('Bridge ledger has records after its terminal receipt.');
+          this.loadTerminal(value);
+        } else {
+          if (this.terminal) throw new Error('Bridge ledger has records after its terminal receipt.');
+          this.load(value);
+        }
+      }
     }
+  }
+  private loadTerminal(value: Obj): void {
+    const keys = ['schema_version','kind','scope','authority_sha256','original_deadline_unix_ms','phase','plan_sha256',
+      'allocation_sha256','request_count','transcript_sha256','receipt','receipt_sha256'];
+    if (!exact(value, keys) || value.schema_version !== 1 || value.kind !== 'terminal_receipt' ||
+        value.scope !== this.scope || value.authority_sha256 !== this.binding.authority_sha256 ||
+        value.original_deadline_unix_ms !== this.binding.original_deadline_unix_ms || value.phase !== this.binding.phase ||
+        value.plan_sha256 !== this.binding.plan_sha256 || value.allocation_sha256 !== this.binding.allocation_sha256 ||
+        value.request_count !== this.maxId || this.maxId < 1 || [...this.records.values()].some(record => record.state !== 'response') ||
+        value.transcript_sha256 !== this.transcriptSha256() || typeof value.receipt_sha256 !== 'string' ||
+        sha(canonical(value.receipt)) !== value.receipt_sha256 || Buffer.byteLength(canonical(value.receipt)) > MAX_FRAME)
+      throw new Error('Bridge ledger terminal receipt is unpaired, changed, or not bound to completed exchanges.');
+    this.terminal = value as unknown as LedgerTerminalRecord;
   }
   private load(value: unknown): void {
     const keys = ['schema_version', 'scope', 'authority_sha256', 'request_id', 'request_sha256', 'state'];
     if (!object(value) || value.schema_version !== 1 || value.scope !== this.scope || value.authority_sha256 !== this.authorityHash ||
         !Number.isSafeInteger(value.request_id) || typeof value.request_sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(value.request_sha256))
       throw new Error('Bridge ledger record is malformed or bound to another authority.');
+    const hasEvidence = Object.hasOwn(value, 'request_evidence');
+    if ((this.scope === 'storage-http') !== hasEvidence) throw new Error('Bridge ledger request evidence is missing or unexpected.');
+    if (hasEvidence) validateStorageLedgerRequest(value.request_evidence);
     const id = Number(value.request_id), prior = this.records.get(id);
     if (!prior) {
-      if (!exact(value, keys) || id !== this.maxId + 1 || value.state !== 'pending') throw new Error('Bridge ledger request sequence is invalid.');
+      if (!exact(value, hasEvidence ? [...keys, 'request_evidence'] : keys) || id !== this.maxId + 1 || value.state !== 'pending')
+        throw new Error('Bridge ledger request sequence is invalid.');
       this.maxId = id; this.records.set(id, value as unknown as LedgerRecord); return;
     }
-    if (!exact(value, [...keys, 'response', 'response_sha256']) || prior.state !== 'pending' ||
+    if (!exact(value, [...keys, ...(hasEvidence ? ['request_evidence'] : []), 'response', 'response_sha256']) || prior.state !== 'pending' ||
         value.request_sha256 !== prior.request_sha256 || value.state !== 'response' || typeof value.response_sha256 !== 'string' ||
-        sha(canonical(value.response)) !== value.response_sha256) throw new Error('Bridge ledger response transition is invalid.');
+        hasEvidence && !equal(value.request_evidence, prior.request_evidence) || sha(canonical(value.response)) !== value.response_sha256)
+      throw new Error('Bridge ledger response transition is invalid.');
     this.records.set(id, value as unknown as LedgerRecord);
   }
-  private append(record: LedgerBinding | LedgerRecord): void {
+  private transcriptSha256(): string {
+    const exchanges = [...this.records.values()].sort((left, right) => left.request_id - right.request_id).map(record => ({
+      request_id: record.request_id, request_sha256: record.request_sha256, request_evidence: record.request_evidence,
+      response_sha256: record.response_sha256,
+    }));
+    return sha(canonical(exchanges));
+  }
+  private append(record: LedgerBinding | LedgerRecord | LedgerTerminalRecord): void {
     const data = Buffer.from(canonical(record) + '\n'), fd = fs.openSync(this.filename,
       fs.constants.O_WRONLY | fs.constants.O_APPEND | (fs.constants.O_NOFOLLOW ?? 0));
     try { let offset = 0; while (offset < data.length) { const n = fs.writeSync(fd, data, offset, data.length - offset);
       if (n <= 0) throw new Error('Bridge ledger write failed.'); offset += n; } fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
   }
-  begin(id: number, digest: string): unknown | undefined {
+  begin(id: number, digest: string, requestEvidence?: StorageLedgerRequest): unknown | undefined {
+    if (this.terminal) throw new Error('Bridge ledger already contains a terminal receipt; no further exchange is permitted.');
+    if ((this.scope === 'storage-http') !== (requestEvidence !== undefined))
+      throw new Error('Bridge ledger request evidence does not match its scope.');
+    if (requestEvidence) validateStorageLedgerRequest(requestEvidence);
     const prior = this.records.get(id);
     if (prior) {
-      if (prior.request_sha256 !== digest) throw new Error('Bridge request ID reused with a different digest.');
+      if (prior.request_sha256 !== digest || (requestEvidence !== undefined) !== (prior.request_evidence !== undefined) ||
+          requestEvidence !== undefined && !equal(prior.request_evidence, requestEvidence))
+        throw new Error('Bridge request ID reused with a different digest or raw request evidence.');
       if (prior.state !== 'response') throw new Error('Bridge request has an unresolved prior forward; never replay.');
       return prior.response;
     }
     if (id !== this.maxId + 1) throw new Error('Bridge request ID is not the next durable sequence.');
     const record: LedgerRecord = { schema_version: 1, scope: this.scope, authority_sha256: this.authorityHash,
-      request_id: id, request_sha256: digest, state: 'pending' };
+      request_id: id, request_sha256: digest, state: 'pending', ...(requestEvidence ? { request_evidence: requestEvidence } : {}) };
     this.append(record); this.records.set(id, record); this.maxId = id; return undefined;
   }
   complete(id: number, digest: string, response: unknown): void {
+    if (this.terminal) throw new Error('Bridge ledger already contains a terminal receipt; no further exchange is permitted.');
     const prior = this.records.get(id);
     if (!prior || prior.state !== 'pending' || prior.request_sha256 !== digest) throw new Error('Bridge response does not match pending durable request.');
     if (Buffer.byteLength(canonical(response)) > MAX_FRAME) throw new Error('Bridge response exceeds durable frame limit.');
     const record: LedgerRecord = { ...prior, state: 'response', response, response_sha256: sha(canonical(response)) };
     this.append(record); this.records.set(id, record);
   }
+  recordTerminal(receipt: unknown): void {
+    if (this.scope !== 'storage-http' || this.maxId < 1 || [...this.records.values()].some(record => record.state !== 'response') ||
+        Buffer.byteLength(canonical(receipt)) > MAX_FRAME)
+      throw new Error('Bridge terminal receipt requires a bounded, fully resolved StorageBridge transcript.');
+    const record: LedgerTerminalRecord = { ...this.binding, kind: 'terminal_receipt', request_count: this.maxId,
+      transcript_sha256: this.transcriptSha256(), receipt, receipt_sha256: sha(canonical(receipt)) };
+    if (this.terminal) {
+      if (!equal(this.terminal, record)) throw new Error('Bridge terminal receipt changed after restart.');
+      return;
+    }
+    this.append(record); this.terminal = record;
+  }
+  terminalReceipt(): unknown | undefined { return this.terminal?.receipt; }
+  get requestCount(): number { return this.maxId; }
 }
 function ledgerBinding(scope: string, authority: unknown, deadline: number, phase: string, plan: unknown,
   envelope: EffectEnvelope): LedgerBinding {
@@ -536,8 +599,38 @@ function storageRequest(value: unknown, authority: StorageBridgeAuthority, deadl
     if (seen.has(key) || !storageHeaderAllowed(key, false) || /[\r\n\0]/.test(content)) throw new Error('Storage request header is duplicated or not permitted.');
     seen.add(key);
   }
+  validateStorageEffectHeaders(value.headers as [string, string][], now);
   validateStorageRoute(value.target as StorageBridgeRequest['target'], value.method, url, value.headers as [string, string][], body, authority);
   return value as unknown as StorageBridgeRequest;
+}
+function validateStorageEffectHeaders(headers: [string, string][], now: number): void {
+  const requestIds = headers.filter(([name]) => name.toLowerCase() === 'x-ms-client-request-id');
+  if (requestIds.length !== 1 || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(requestIds[0]![1]))
+    throw new Error('Storage request must carry one canonical lowercase UUID v4 client request ID.');
+  for (const [name, value] of headers) if (name.toLowerCase() === 'date' || name.toLowerCase() === 'x-ms-date') {
+    const timestamp = Date.parse(value);
+    if (!Number.isFinite(timestamp) || new Date(timestamp).toUTCString() !== value || Math.abs(timestamp - now) > 300_000)
+      throw new Error('Storage request date header must be a current IMF-fixdate within five minutes.');
+  }
+}
+function validateStorageLedgerRequest(value: unknown): asserts value is StorageLedgerRequest {
+  if (!object(value) || !exact(value, ['target', 'method', 'url', 'headers', 'body_sha256']) ||
+      !['control', 'object_store'].includes(String(value.target)) || typeof value.method !== 'string' ||
+      !/^[A-Z]+$/.test(value.method) || typeof value.url !== 'string' || typeof value.body_sha256 !== 'string' ||
+      !/^[0-9a-f]{64}$/.test(value.body_sha256) || !Array.isArray(value.headers) ||
+      value.headers.some(pair => !Array.isArray(pair) || pair.length !== 2 || pair.some(part => typeof part !== 'string')))
+    throw new Error('Bridge ledger raw storage request evidence is malformed.');
+  const seen = new Set<string>();
+  for (const [name, content] of value.headers as [string, string][]) {
+    const key = name.toLowerCase();
+    if (seen.has(key) || !storageHeaderAllowed(key, false) || /[\r\n\0]/.test(content))
+      throw new Error('Bridge ledger raw storage request headers are invalid.');
+    seen.add(key);
+  }
+  const url = new URL(value.url);
+  if (url.href !== value.url || url.username || url.password || url.hash ||
+      /(?:sig|access_token|refresh_token|client_secret)=/i.test(value.url))
+    throw new Error('Bridge ledger raw storage request URL is invalid.');
 }
 function storageHeaderAllowed(name: string, response: boolean): boolean {
   return name.startsWith('x-ms-meta-') || ['content-length','content-type','content-md5','date','x-ms-version','x-ms-date',
@@ -567,10 +660,16 @@ function validateStorageRoute(target: StorageBridgeRequest['target'], method: st
   const root = new URL(authority.table_root_url), container = root.username, origin = `https://${authority.storage_account}.blob.core.windows.net`;
   const endpoint = `${origin}/${container}`, prefix = `/${container}${root.pathname}`;
   const listingPrefix = query.get('prefix') ?? '';
-  const allowedListKeys = ['restype','comp','prefix','marker','maxresults'];
+  const allowedListKeys = ['restype','comp','prefix','marker','maxresults','startFrom'];
+  const startFrom = query.get('startFrom'), expectedLogPrefix = `${root.pathname.slice(1)}_delta_log/`;
+  const startFromValid = startFrom === undefined || query.size === 4 && query.get('prefix') === expectedLogPrefix &&
+    (startFrom === expectedLogPrefix.slice(0, -1) || startFrom.startsWith(expectedLogPrefix) &&
+      /^[0-9]{20}$/.test(startFrom.slice(expectedLogPrefix.length))) &&
+    url.search.slice(1) === new URLSearchParams([['restype', 'container'], ['comp', 'list'],
+      ['prefix', expectedLogPrefix], ['startFrom', startFrom]]).toString();
   const isList = method === 'GET' && url.origin === origin && url.pathname === `/${container}` && query.size >= 3 && query.size <= 5 &&
     query.get('restype') === 'container' && query.get('comp') === 'list' && listingPrefix.startsWith(root.pathname.slice(1)) &&
-    [...query.keys()].every(key => allowedListKeys.includes(key));
+    startFromValid && [...query.keys()].every(key => allowedListKeys.includes(key));
   const isLogRead = ['GET','HEAD'].includes(method) && url.origin === origin && url.pathname.startsWith(`${prefix}_delta_log/`) && query.size === 0;
   const isCommit = method === 'PUT' && url.origin === origin && url.pathname === `${prefix}_delta_log/00000000000000000000.json` &&
     query.size === 0 && header('if-none-match') === '*' && body.length > 0;
@@ -579,8 +678,9 @@ function validateStorageRoute(target: StorageBridgeRequest['target'], method: st
 }
 function storageEffect(request: StorageBridgeRequest): ExternalEffect {
   const url = new URL(request.url), body = Buffer.from(request.body, 'utf8');
+  const allocationHeaders = request.headers.filter(([name]) => !VOLATILE_STORAGE_EFFECT_HEADERS.has(name.toLowerCase()));
   return { transport: 'azure-rest', method: request.method, resource: `${url.origin}|${STORAGE_RESOURCE}`,
-    path: `${url.pathname}${url.search}|headers-sha256=${sha(canonical(request.headers))}`, body };
+    path: `${url.pathname}${url.search}|headers-sha256=${sha(canonical(allocationHeaders))}`, body };
 }
 async function readBody(response: Response, maxBytes: number): Promise<Buffer> {
   if (!response.body) return Buffer.alloc(0);
@@ -606,12 +706,17 @@ export class StorageBridgeDispatcher {
       cell_run_id: options.authority.cell_run_id, owner_id: options.authority.owner_id,
       fencing_token: options.authority.fencing_token }, options.originalDeadlineUnixMs, this.envelope, this.now, false);
   }
+  terminalEvidence(): unknown | undefined { return this.ledger.terminalReceipt(); }
+  get recordedRequestCount(): number { return this.ledger.requestCount; }
+  recordTerminalEvidence(value: unknown): void { this.ledger.recordTerminal(value); }
   async exchange(value: unknown): Promise<StorageBridgeReply> {
     const request = storageRequest(value, this.options.authority, this.options.originalDeadlineUnixMs, this.now());
     const effect = storageEffect(request);
     assertBridgeLive(this.envelope, this.options.originalDeadlineUnixMs, this.now);
     await this.campaignStore.read();
-    const cached = this.ledger.begin(request.request_id, request.request_sha256);
+    const requestEvidence: StorageLedgerRequest = { target: request.target, method: request.method, url: request.url,
+      headers: request.headers.map(([name, value]) => [name, value] as [string, string]), body_sha256: request.body_sha256 };
+    const cached = this.ledger.begin(request.request_id, request.request_sha256, requestEvidence);
     if (cached !== undefined) return cached as StorageBridgeReply;
     let reply: StorageBridgeReply;
     try {
@@ -675,7 +780,7 @@ async function writeFrame(child: ChildProcess, value: unknown): Promise<void> {
   });
 }
 async function runBridgeChild(executable: string, args: string[], cwd: string, deadline: number,
-  requestKind: string, finalKind: string, exchange: (request: unknown) => Promise<unknown>): Promise<unknown> {
+  requestKind: string, finalKind: string, exchange: (request: unknown) => Promise<unknown>): Promise<{ receipt: unknown; exchangeCount: number }> {
   if (!path.isAbsolute(executable) || !path.isAbsolute(cwd) || Date.now() >= deadline) throw new Error('Bridge child path or original deadline is invalid.');
   const child = spawn(executable, args, { cwd, env: bridgeChildEnvironment(), detached: true, stdio: ['pipe','pipe','pipe'] });
   let stderr = Buffer.alloc(0), final: unknown, finalSeen = false, failure: Error | undefined, exchangeCount = 0;
@@ -701,16 +806,16 @@ async function runBridgeChild(executable: string, args: string[], cwd: string, d
     if (failure) throw failure;
     if (result.code !== 0 || !finalSeen) throw new Error('Bridge child failed or omitted its final actual receipt; no fallback is permitted.');
     if (exchangeCount === 0) throw new Error('Bridge child emitted a final receipt without any actual bridge exchange.');
-    return final;
+    return { receipt: final, exchangeCount };
   } catch (error) { kill(); await closed.catch(() => undefined); throw error; }
   finally { clearTimeout(timeout); }
 }
 export async function runFixtureSetupChild(executable: string, inputPath: string, options: FixtureDispatcherOptions): Promise<FixtureReceipt> {
   if (!path.isAbsolute(inputPath) || !equal(privateJson(inputPath, MAX_OUTPUT), options.input)) throw new Error('Fixture child input file differs from its bound setup allocation.');
   const dispatcher = new FixtureCommandDispatcher(options);
-  const value = await runBridgeChild(executable, ['--fixture-setup', inputPath, '--fixture-bridge-stdio'],
+  const result = await runBridgeChild(executable, ['--fixture-setup', inputPath, '--fixture-bridge-stdio'],
     options.rootDirectory, options.input.original_deadline_unix_ms, 'command_request', 'fixture_setup_receipt', request => dispatcher.exchange(request));
-  return dispatcher.validateReceipt(value);
+  return dispatcher.validateReceipt(result.receipt);
 }
 interface OwnedRunTablePlan { account: string; container: string; campaign_root: string; run_root: string; campaign_id: string; run_id: string;
   generation: string; table: string; partition_by_ingestion_date: boolean; owner_id: string; fencing_token: number }
@@ -718,8 +823,126 @@ export interface OwnedRunTableReceipt { allocation: OwnedRunTablePlan; delta: { 
   partition_columns: string[]; active_files: number }; publisher_drained: true }
 export interface OwnedRunTableBridgeReceipt { schema_version: 1; kind: 'owned_run_table_receipt'; authority: StorageBridgeAuthority;
   original_deadline_unix_ms: number; receipt: OwnedRunTableReceipt }
-export interface OwnedRunInitializerOptions extends Omit<StorageDispatcherOptions, 'authority' | 'originalDeadlineUnixMs' | 'ledgerPath'> {
-  executable: string; planPath: string; bridgeInputPath: string; ledgerPath: string; rootDirectory: string; now?: () => number }
-export async function initializeOwnedRunTable(_options: OwnedRunInitializerOptions): Promise<OwnedRunTableBridgeReceipt> {
-  throw new Error('D47 HOLD: the reviewed, integrated production initializer adapter is not available; no child receipt is accepted.');
+export interface OwnedRunTableArtifactIdentity { source_commit: string; executable_sha256: string }
+export interface OwnedRunTableParentReceipt { schema_version: 1; kind: 'owned_run_table_parent_receipt';
+  artifact_identity: OwnedRunTableArtifactIdentity; exchange_count: number; bridge_receipt: OwnedRunTableBridgeReceipt }
+interface OwnedRunBridgeInput { authority: StorageBridgeAuthority; original_deadline_unix_ms: number }
+const APPROVED_OWNED_RUN_SOURCE = '2d329ab907f15c8123a08b933c01d98670bfd755';
+const OWNED_RUN_TABLE = 'telemetry.sqlserver.sqlserver_availability_replica_states';
+const OWNED_RUN_PARTITION = '__arrowcol_ingestion';
+const OWNED_RUN_TABLE_RELATIVE_PATH = 'dataflow/telemetry/sqlserver/sqlserver_availability_replica_states/';
+export interface OwnedRunInitializerOptions extends Omit<StorageDispatcherOptions,
+  'authority' | 'originalDeadlineUnixMs' | 'ledgerPath' | 'phase' | 'planIdentity'> {
+  executable: string; artifactIdentity: OwnedRunTableArtifactIdentity; planPath: string; bridgeInputPath: string;
+  ledgerPath: string; rootDirectory: string; now?: () => number
+}
+function validateOwnedRunTablePlan(value: unknown): asserts value is OwnedRunTablePlan {
+  const keys = ['account','container','campaign_root','run_root','campaign_id','run_id','generation','table',
+    'partition_by_ingestion_date','owner_id','fencing_token'];
+  if (!object(value) || !exact(value, keys) || typeof value.account !== 'string' || !/^[a-z0-9]{3,24}$/.test(value.account) ||
+      typeof value.container !== 'string' || !/^[a-z0-9](?:[a-z0-9-]{1,61}[a-z0-9])?$/.test(value.container) ||
+      typeof value.campaign_root !== 'string' || typeof value.run_root !== 'string' || typeof value.table !== 'string' ||
+      value.table !== OWNED_RUN_TABLE || value.partition_by_ingestion_date !== true)
+    throw new Error('Owned-run table plan schema or frozen table selection is invalid.');
+  uuid(value.campaign_id, 'campaign'); uuid(value.run_id, 'run'); uuid(value.generation, 'generation'); uuid(value.owner_id, 'owner');
+  integer(value.fencing_token, 1, Number.MAX_SAFE_INTEGER, 'fencing token');
+  const root = (raw: string): URL => {
+    let url: URL; try { url = new URL(raw); } catch { throw new Error('Owned-run table plan root is invalid.'); }
+    if (url.protocol !== 'abfss:' || url.username !== value.container || url.hostname !== `${value.account}.dfs.core.windows.net` ||
+        url.password || url.port || url.search || url.hash || !url.pathname.endsWith('/') || url.href !== raw ||
+        raw.includes('%') || raw.includes('\\') || url.pathname.split('/').some(part => part === '.' || part === '..') ||
+        /[\u0000-\u0020]/.test(url.pathname)) throw new Error('Owned-run table plan root is not canonical and credential-free.');
+    return url;
+  };
+  const campaign = root(value.campaign_root), run = root(value.run_root);
+  if (!campaign.pathname.endsWith(`/campaigns/${value.campaign_id}/`) ||
+      run.href !== new URL(`runs/${value.run_id}/`, campaign).href)
+    throw new Error('Owned-run table roots do not bind the exact campaign and run.');
+}
+function validateOwnedRunBridgeInput(value: unknown, plan: OwnedRunTablePlan, now: number): asserts value is OwnedRunBridgeInput {
+  if (!object(value) || !exact(value, ['authority','original_deadline_unix_ms']))
+    throw new Error('Owned-run bridge sidecar schema is invalid.');
+  storageAuthority(value.authority);
+  integer(value.original_deadline_unix_ms, 1, Number.MAX_SAFE_INTEGER, 'original deadline');
+  checkDeadline(value.original_deadline_unix_ms, value.original_deadline_unix_ms - now, now, 600_000);
+  const tableRoot = new URL(OWNED_RUN_TABLE_RELATIVE_PATH, plan.run_root).href;
+  if (value.authority.campaign_id !== plan.campaign_id || value.authority.cell_run_id !== plan.run_id ||
+      value.authority.owner_id !== plan.owner_id || value.authority.fencing_token !== plan.fencing_token ||
+      value.authority.reset_generation !== plan.generation || value.authority.storage_account !== plan.account ||
+      new URL(value.authority.table_root_url).username !== plan.container || value.authority.table_root_url !== tableRoot ||
+      value.authority.control_container_url !== `https://${plan.account}.blob.core.windows.net/${plan.container}`)
+    throw new Error('Owned-run bridge authority differs from the exact selected one-table allocation.');
+}
+function validateOwnedRunArtifact(executable: string, identity: OwnedRunTableArtifactIdentity): OwnedRunTableArtifactIdentity {
+  if (!object(identity) || !exact(identity, ['source_commit','executable_sha256']) ||
+      identity.source_commit !== APPROVED_OWNED_RUN_SOURCE || typeof identity.executable_sha256 !== 'string' ||
+      !/^[0-9a-f]{64}$/.test(identity.executable_sha256))
+    throw new Error('Owned-run initializer artifact identity is not the approved integrated source.');
+  const stat = fs.lstatSync(executable);
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.size === 0 || stat.size > 512 * 1024 * 1024)
+    throw new Error('Owned-run initializer executable must be a bounded regular non-symlink file.');
+  fs.accessSync(executable, fs.constants.X_OK);
+  if (sha(fs.readFileSync(executable)) !== identity.executable_sha256)
+    throw new Error('Owned-run initializer executable does not match its pinned build identity.');
+  return identity;
+}
+function validateOwnedRunReceipt(value: unknown, plan: OwnedRunTablePlan, authority: StorageBridgeAuthority,
+  deadline: number): asserts value is OwnedRunTableBridgeReceipt {
+  if (!object(value) || !exact(value, ['schema_version','kind','authority','original_deadline_unix_ms','receipt']) ||
+      value.schema_version !== 1 || value.kind !== 'owned_run_table_receipt' || !equal(value.authority, authority) ||
+      value.original_deadline_unix_ms !== deadline || !object(value.receipt) ||
+      !exact(value.receipt, ['allocation','delta','publisher_drained']) || !equal(value.receipt.allocation, plan) ||
+      value.receipt.publisher_drained !== true || !object(value.receipt.delta) ||
+      !exact(value.receipt.delta, ['table_id','version','schema_json','partition_columns','active_files']))
+    throw new Error('Owned-run initializer terminal receipt is malformed or not bound to the exact authority/plan.');
+  const delta = value.receipt.delta;
+  uuid(delta.table_id, 'actual Delta table ID');
+  if (delta.version !== 0 || delta.active_files !== 0 || typeof delta.schema_json !== 'string' || !Array.isArray(delta.partition_columns) ||
+      !equal(delta.partition_columns, [OWNED_RUN_PARTITION]))
+    throw new Error('Owned-run initializer receipt is not a fresh zero-file version-zero Delta readback.');
+  let schema: unknown; try { schema = JSON.parse(delta.schema_json) as unknown; } catch { throw new Error('Owned-run Delta schema readback is invalid.'); }
+  if (!object(schema) || !Array.isArray(schema.fields) || !schema.fields.some(field => object(field) && field.name === OWNED_RUN_PARTITION &&
+      field.type === 'string' && field.nullable === false)) throw new Error('Owned-run Delta schema lacks its exact ingestion partition column.');
+}
+function validateOwnedRunParentReceipt(value: unknown, artifactIdentity: OwnedRunTableArtifactIdentity,
+  plan: OwnedRunTablePlan, authority: StorageBridgeAuthority, deadline: number, requestCount: number): asserts value is OwnedRunTableParentReceipt {
+  if (!object(value) || !exact(value, ['schema_version','kind','artifact_identity','exchange_count','bridge_receipt']) ||
+      value.schema_version !== 1 || value.kind !== 'owned_run_table_parent_receipt' || !equal(value.artifact_identity, artifactIdentity) ||
+      value.exchange_count !== requestCount || !Number.isSafeInteger(value.exchange_count) || requestCount < 1)
+    throw new Error('Owned-run parent receipt is not bound to the actual durable bridge transcript and build.');
+  validateOwnedRunReceipt(value.bridge_receipt, plan, authority, deadline);
+}
+export async function initializeOwnedRunTable(options: OwnedRunInitializerOptions): Promise<OwnedRunTableParentReceipt> {
+  const now = options.now ?? Date.now;
+  if (![options.executable, options.planPath, options.bridgeInputPath, options.rootDirectory, options.ledgerPath].every(path.isAbsolute))
+    throw new Error('Owned-run initializer paths must be absolute.');
+  const planValue = privateJson(options.planPath, MAX_OUTPUT), bridgeValue = privateJson(options.bridgeInputPath, MAX_OUTPUT);
+  validateOwnedRunTablePlan(planValue);
+  validateOwnedRunBridgeInput(bridgeValue, planValue, now());
+  const plan = planValue, authority = bridgeValue.authority, deadline = bridgeValue.original_deadline_unix_ms;
+  if (options.envelope.campaign_id !== plan.campaign_id || options.envelope.run_id !== plan.run_id ||
+      options.envelope.storage_account !== plan.account || options.azure.c.account !== plan.account)
+    throw new Error('Owned-run initializer does not match the exact active effect envelope and selected stamp.');
+  const artifactIdentity = validateOwnedRunArtifact(options.executable, options.artifactIdentity);
+  const dispatcher = new StorageBridgeDispatcher({ authority, originalDeadlineUnixMs: deadline, envelope: options.envelope,
+    azure: options.azure, store: options.store, ledgerPath: options.ledgerPath, phase: 'owned-run-table-initialization',
+    planIdentity: { plan, artifact_identity: artifactIdentity }, fetcher: options.fetcher, now });
+  const cached = dispatcher.terminalEvidence();
+  if (cached !== undefined) {
+    validateOwnedRunParentReceipt(cached, artifactIdentity, plan, authority, deadline, dispatcher.recordedRequestCount);
+    return cached;
+  }
+  assertBridgeLive(options.envelope, deadline, now);
+  const child = await withinBridgeDeadline(runBridgeChild(options.executable,
+    ['initialize-owned-run-table', '--plan', options.planPath, '--storage-bridge-input', options.bridgeInputPath, '--storage-bridge-stdio'],
+    options.rootDirectory, deadline, 'storage_http_request', 'owned_run_table_receipt', request => dispatcher.exchange(request)),
+    deadline, now, 'Owned-run initializer');
+  validateOwnedRunReceipt(child.receipt, plan, authority, deadline);
+  if (child.exchangeCount !== dispatcher.recordedRequestCount)
+    throw new Error('Owned-run child exchanges are not a one-to-one match for the retained durable transcript.');
+  const result: OwnedRunTableParentReceipt = { schema_version: 1, kind: 'owned_run_table_parent_receipt',
+    artifact_identity: artifactIdentity, exchange_count: child.exchangeCount, bridge_receipt: child.receipt };
+  validateOwnedRunParentReceipt(result, artifactIdentity, plan, authority, deadline, dispatcher.recordedRequestCount);
+  dispatcher.recordTerminalEvidence(result);
+  return result;
 }

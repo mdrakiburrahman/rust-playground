@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { chmodSync, mkdtempSync, rmSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -23,12 +23,19 @@ function sha(value: string): string {
   return createHash('sha256').update(value, 'utf8').digest('hex');
 }
 
-function signedRequest(authority: StorageBridgeAuthority, deadline: number, method = 'GET', body = ''): StorageBridgeRequest {
-  const headers: [string, string][] = method === 'PUT' ? [['if-none-match', '*'], ['content-type', 'application/json']] : [];
+function signedRequest(authority: StorageBridgeAuthority, deadline: number, method = 'GET', body = '',
+  options: { requestId?: number; clientRequestId?: string; date?: string; extraHeaders?: [string, string][] } = {}): StorageBridgeRequest {
+  const date = options.date ?? new Date().toUTCString();
+  const headers: [string, string][] = [
+    ['x-ms-client-request-id', options.clientRequestId ?? 'c0ffee00-0000-4000-8000-000000000006'],
+    ['date', date], ['x-ms-date', date],
+    ...(method === 'PUT' ? [['if-none-match', '*'], ['content-type', 'application/json']] as [string, string][] : []),
+    ...(options.extraHeaders ?? []),
+  ];
   const unsigned = {
     schema_version: 1 as const,
     kind: 'storage_http_request' as const,
-    request_id: 1,
+    request_id: options.requestId ?? 1,
     authority,
     original_deadline_unix_ms: deadline,
     remaining_timeout_ms: 10_000,
@@ -43,15 +50,24 @@ function signedRequest(authority: StorageBridgeAuthority, deadline: number, meth
   return { ...unsigned, request_sha256: sha(canonical(unsigned)) };
 }
 
-function envelopeFor(authority: StorageBridgeAuthority, request: StorageBridgeRequest): EffectEnvelope {
-  const headersHash = sha(canonical(request.headers));
+function resignRequest(request: StorageBridgeRequest, headers: [string, string][], requestId = request.request_id): StorageBridgeRequest {
+  const { request_sha256, ...rest } = request;
+  void request_sha256;
+  const unsigned = { ...rest, request_id: requestId, headers };
+  return { ...unsigned, request_sha256: sha(canonical(unsigned)) };
+}
+
+function envelopeFor(authority: StorageBridgeAuthority, request: StorageBridgeRequest, maxCalls = 1): EffectEnvelope {
+  const stableHeaders = request.headers.filter(([name]) => !['x-ms-client-request-id', 'date', 'x-ms-date'].includes(name.toLowerCase()));
+  const headersHash = sha(canonical(stableHeaders));
+  const url = new URL(request.url);
   const effect: EffectEnvelope['effects'][number] = {
     id: 'storage-request',
     transport: 'azure-rest',
     method: request.method,
     resource: `https://${authority.storage_account}.blob.core.windows.net|https://storage.azure.com/`,
-    path: `${new URL(request.url).pathname}|headers-sha256=${headersHash}`,
-    max_calls: 1,
+    path: `${url.pathname}${url.search}|headers-sha256=${headersHash}`,
+    max_calls: maxCalls,
     body_sha256: sha(request.body),
   };
   return {
@@ -105,6 +121,92 @@ function mutableCustodyStore(authority: StorageBridgeAuthority, now: number) {
     },
   };
 }
+
+test('StorageBridge normalizes only approved volatile headers and retains raw request evidence', async t => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'oat-d47-header-normalization-'));
+  chmodSync(directory, 0o700);
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const authority: StorageBridgeAuthority = {
+    campaign_id: 'c0ffee00-0000-4000-8000-000000000001',
+    cell_run_id: 'c0ffee00-0000-4000-8000-000000000002',
+    owner_id: 'c0ffee00-0000-4000-8000-000000000003',
+    fencing_token: 1,
+    storage_account: 'arrowcollector68590',
+    table_root_url: 'abfss://checkpoints@arrowcollector68590.dfs.core.windows.net/campaigns/c0ffee00-0000-4000-8000-000000000001/runs/c0ffee00-0000-4000-8000-000000000002/dataflow/telemetry/sqlserver/sqlserver_availability_replica_states/',
+    control_container_url: 'https://arrowcollector68590.blob.core.windows.net/checkpoints',
+    sandbox_id: 'offline-stamp',
+    reset_generation: 'c0ffee00-0000-4000-8000-000000000004',
+  };
+  const now = Date.now(), deadline = now + 60_000;
+  const request1 = signedRequest(authority, deadline, 'GET', '', { requestId: 1,
+    clientRequestId: 'c0ffee00-0000-4000-8000-000000000006', date: new Date(now).toUTCString() });
+  const request2 = signedRequest(authority, deadline, 'GET', '', { requestId: 2,
+    clientRequestId: 'c0ffee00-0000-4000-8000-000000000007', date: new Date(now + 2_000).toUTCString() });
+  const changedStableHeader = signedRequest(authority, deadline, 'GET', '', { requestId: 3,
+    clientRequestId: 'c0ffee00-0000-4000-8000-000000000008', date: new Date(now + 3_000).toUTCString(),
+    extraHeaders: [['user-agent', 'changed-marker']] });
+  const envelope = envelopeFor(authority, request1, 3), custody = mutableCustodyStore(authority, now);
+  let forwards = 0;
+  const azure = { c: { account: authority.storage_account }, async token() { return 'offline-test-token'; } } as unknown as Azure;
+  const ledgerPath = path.join(directory, 'storage-ledger.jsonl');
+  const dispatcher = new StorageBridgeDispatcher({ authority, originalDeadlineUnixMs: deadline, envelope, azure,
+    store: custody.store, phase: 'owned-run-table-initialization', planIdentity: { run_id: authority.cell_run_id },
+    ledgerPath, fetcher: async () => { forwards++; return new Response('ok', { status: 200 }); } });
+  const boundary = new EffectBoundary(envelope, path.join(directory, 'effects.jsonl'));
+  const first = await withEffectBoundary(boundary, () => dispatcher.exchange(request1));
+  const second = await withEffectBoundary(boundary, () => dispatcher.exchange(request2));
+  const changed = await withEffectBoundary(boundary, () => dispatcher.exchange(changedStableHeader));
+  assert.equal(first.outcome, 'response');
+  assert.equal(second.outcome, 'response');
+  assert.equal(changed.outcome, 'definitely_not_sent');
+  assert.equal(forwards, 2);
+  const rows = readFileSync(ledgerPath, 'utf8').trim().split('\n').map(line => JSON.parse(line) as Record<string, unknown>);
+  const responseRows = rows.filter(row => row.state === 'response');
+  assert.equal(responseRows.length, 3);
+  assert.deepEqual((responseRows[0]!.request_evidence as { headers: [string, string][] }).headers, request1.headers);
+  assert.deepEqual((responseRows[1]!.request_evidence as { headers: [string, string][] }).headers, request2.headers);
+  assert.deepEqual((responseRows[2]!.request_evidence as { headers: [string, string][] }).headers, changedStableHeader.headers);
+});
+
+test('StorageBridge rejects malformed volatile headers before durable request admission', async t => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'oat-d47-invalid-headers-'));
+  chmodSync(directory, 0o700);
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const authority: StorageBridgeAuthority = {
+    campaign_id: 'c0ffee00-0000-4000-8000-000000000001',
+    cell_run_id: 'c0ffee00-0000-4000-8000-000000000002',
+    owner_id: 'c0ffee00-0000-4000-8000-000000000003',
+    fencing_token: 1,
+    storage_account: 'arrowcollector68590',
+    table_root_url: 'abfss://checkpoints@arrowcollector68590.dfs.core.windows.net/campaigns/c0ffee00-0000-4000-8000-000000000001/runs/c0ffee00-0000-4000-8000-000000000002/dataflow/telemetry/sqlserver/sqlserver_availability_replica_states/',
+    control_container_url: 'https://arrowcollector68590.blob.core.windows.net/checkpoints',
+    sandbox_id: 'offline-stamp',
+    reset_generation: 'c0ffee00-0000-4000-8000-000000000004',
+  };
+  const now = Date.now(), deadline = now + 60_000, request = signedRequest(authority, deadline);
+  const envelope = envelopeFor(authority, request), custody = mutableCustodyStore(authority, now);
+  let tokens = 0, forwards = 0;
+  const azure = { c: { account: authority.storage_account }, async token() { tokens++; return 'offline-test-token'; } } as unknown as Azure;
+  const ledgerPath = path.join(directory, 'storage-ledger.jsonl');
+  const dispatcher = new StorageBridgeDispatcher({ authority, originalDeadlineUnixMs: deadline, envelope, azure,
+    store: custody.store, phase: 'owned-run-table-initialization', planIdentity: { run_id: authority.cell_run_id },
+    ledgerPath, fetcher: async () => { forwards++; return new Response('', { status: 200 }); } });
+  const validDate = new Date(now).toUTCString();
+  const invalidCases: Array<{ headers: [string, string][]; error: RegExp }> = [
+    { headers: request.headers.filter(([name]) => name.toLowerCase() !== 'x-ms-client-request-id'), error: /one canonical lowercase UUID v4/ },
+    { headers: [...request.headers, ['X-MS-CLIENT-REQUEST-ID', 'c0ffee00-0000-4000-8000-000000000006']], error: /duplicated or not permitted/ },
+    { headers: request.headers.map(([name, value]) => name.toLowerCase() === 'x-ms-client-request-id' ? [name, value.toUpperCase()] : [name, value]), error: /one canonical lowercase UUID v4/ },
+    { headers: request.headers.map(([name, value]) => name.toLowerCase() === 'date' ? [name, 'not-a-date'] : [name, value]), error: /current IMF-fixdate/ },
+    { headers: request.headers.map(([name, value]) => name.toLowerCase() === 'date' ? [name, new Date(now - 600_000).toUTCString()] : [name, value]), error: /current IMF-fixdate/ },
+    { headers: [...request.headers, ['DATE', validDate]], error: /duplicated or not permitted/ },
+  ];
+  for (const invalid of invalidCases) {
+    await assert.rejects(dispatcher.exchange(resignRequest(request, invalid.headers)), invalid.error);
+  }
+  assert.equal(tokens, 0);
+  assert.equal(forwards, 0);
+  assert.equal(readFileSync(ledgerPath, 'utf8').trim().split('\n').length, 1);
+});
 
 test('StorageBridge returns its durable actual response after restart without forwarding twice', async t => {
   const directory = mkdtempSync(path.join(os.tmpdir(), 'oat-d47-storage-bridge-'));
