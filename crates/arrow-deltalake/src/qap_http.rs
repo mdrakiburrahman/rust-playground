@@ -418,16 +418,21 @@ mod storage_bridge {
                                 let start_from_valid = match query.get("startFrom") {
                                     Some(start_from) => {
                                         let expected_prefix = format!("{}_delta_log/", self.data_prefix);
+                                        let is_directory_cursor = start_from == expected_prefix.trim_end_matches('/');
+                                        let is_version_cursor =
+                                            start_from.strip_prefix(&expected_prefix).is_some_and(|version| {
+                                                version.len() == 20 && version.bytes().all(|byte| byte.is_ascii_digit())
+                                            });
                                         let mut canonical_query = url::form_urlencoded::Serializer::new(String::new());
                                         canonical_query
                                             .append_pair("restype", "container")
                                             .append_pair("comp", "list")
                                             .append_pair("prefix", &expected_prefix)
-                                            .append_pair("startFrom", expected_prefix.trim_end_matches('/'));
+                                            .append_pair("startFrom", start_from);
                                         let canonical_query = canonical_query.finish();
                                         query.len() == 4
                                             && query.get("prefix") == Some(&expected_prefix)
-                                            && start_from == expected_prefix.trim_end_matches('/')
+                                            && (is_directory_cursor || is_version_cursor)
                                             && url.query() == Some(canonical_query.as_str())
                                     }
                                     None => true,
