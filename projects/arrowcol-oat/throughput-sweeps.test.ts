@@ -200,9 +200,11 @@ test('renders C5 candidates against the committed seed without changing non-fact
     assert.deepEqual(comparison.candidates.map(item => item.id), axis.candidates);
     for (const candidate of comparison.candidates) {
       const client = at(renderThroughputConfig(seed, manifest, comparison.id, candidate.id), ['tunables', 'client']) as Record<string, unknown>;
-      for (const key of ['workers', 'streams_per_worker', 'connections_per_worker']) {
-        if (key !== axis.leaf) assert.deepEqual(client[key], baselineClient[key], axis.id + ' changed non-factor ' + key);
-      }
+      const candidateWithoutFactor = structuredClone(client);
+      const baselineWithoutFactor = structuredClone(baselineClient);
+      delete candidateWithoutFactor[axis.leaf];
+      delete baselineWithoutFactor[axis.leaf];
+      assert.deepEqual(candidateWithoutFactor, baselineWithoutFactor, axis.id + ' changed a non-factor client setting');
     }
   }
   const dataMode = comparisons.find(item => item.id === 'data-mode')!;

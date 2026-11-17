@@ -223,7 +223,13 @@
   ],
   "runnable": false,
   "config_validation": {
-    "status": "not-validated"
+    "status": "config-validated",
+    "source_commit": "22c1490edd7479831916be701213061fa39fb7d4",
+    "validator_binary_sha256": "9c5bc506371ba533ade8bc3477be17ade82cda2a3139988d23cf3219f0706901",
+    "baseline_count": 1,
+    "candidate_count": 6,
+    "pass_count": 7,
+    "fail_count": 0
   },
   "runtime_qualification": "unqualified",
   "pending_candidate_sets": [
