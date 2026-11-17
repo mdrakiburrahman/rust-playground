@@ -226,6 +226,17 @@ export class OatLauncherDeadline {
   get submittedConfigSha256(): string | null { return this.receipt.submitted_config_sha256; }
   isExpired(): boolean { return this.deadlineAtMonotonicMs !== null && performance.now() >= this.deadlineAtMonotonicMs; }
 
+  canObserveOwnedRun(status: OatRunStatus, serverUrl: string, submittedConfigSha256: string): boolean {
+    const receipt = this.receipt;
+    return receipt.creation_state === 'accepted' && receipt.run_id === status.id &&
+      receipt.server_url === serverUrl && receipt.run_state === status.state &&
+      (status.state === 'queued' || status.state === 'running') && status.error === null &&
+      receipt.cleanup_state === 'pending' && receipt.error === null && receipt.config_binding_error === null &&
+      receipt.submitted_config_sha256 === submittedConfigSha256 && status.config_sha256 === submittedConfigSha256 &&
+      receipt.cancellation_attempts === 0 && receipt.last_cancel_result === null &&
+      !receipt.overrun && !this.signal.aborted && !this.isExpired() && this.backgroundWriteFailure === undefined;
+  }
+
   private async persist(): Promise<void> {
     const snapshot = structuredClone(this.receipt);
     const nextWrite = this.writeTail.catch(() => undefined).then(() => this.writeReceipt(this.receiptPath, snapshot));
@@ -1392,7 +1403,13 @@ export async function main(
       const onRunStarted = localMarker ? async (status: OatRunStatus): Promise<void> => {
         await persistLocalRunMarker(localMarker, status, submission);
         markerWritten = true;
-        if (onOwnedRun && !supplementaryEmitted && status.config_sha256 === submission.submitted_config_sha256) {
+        if (onOwnedRun && !supplementaryEmitted) {
+          if (interrupt?.controller.signal.aborted ||
+              localMarker.marker.serverUrl !== new URL(server.url).href || localMarker.marker.serverPid !== server.child.pid ||
+              !deadline.canObserveOwnedRun(status, localMarker.marker.serverUrl, submission.submitted_config_sha256)) {
+            console.error('[oat] Supplementary owned-run identity skipped: accepted run is no longer eligible');
+            return;
+          }
           supplementaryEmitted = true;
           const identity: Readonly<OatOwnedRunIdentity> = Object.freeze({
             invocationId: deadline.invocationId,

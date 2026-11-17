@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { execFileSync, spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { readFileSync, readdirSync, writeFileSync } from 'node:fs';
-import { mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, unlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, open, readFile, readdir, readlink, realpath, rm, stat, unlink, writeFile, type FileHandle } from 'node:fs/promises';
 import { createServer, request as createHttpRequest } from 'node:http';
 import { connect as createTcpConnection } from 'node:net';
 import os from 'node:os';
@@ -44,6 +44,8 @@ async function ownedBuildFixture(options: {
   stopDelayMs?: number;
   configHash?: string | null;
   invalidRunId?: boolean;
+  initialState?: OatRunStatus['state'];
+  cancelState?: 'cancelled' | 'failed';
 } = {}) {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'oat-owned-build-'));
   const executable = path.join(directory, 'built-server');
@@ -68,6 +70,13 @@ require('node:fs').writeFileSync(${JSON.stringify(pidPath)}, String(process.pid)
 const address = process.argv[process.argv.indexOf('--listen') + 1];
 const [host, port] = address.split(':');
 if (${options.stopDelayMs ?? 0} > 0) process.on('SIGTERM', () => setTimeout(() => process.exit(0), ${options.stopDelayMs ?? 0}));
+let configHash;
+let cancelled = false;
+const runStatus = (state) => ({
+  id: ${JSON.stringify(options.invalidRunId ? 'invalid-run-id' : '123e4567-e89b-42d3-a456-426614174000')}, state,
+  progress: state === 'succeeded' ? 'published' : state, result_count: state === 'succeeded' ? 1 : 0,
+  error: state === 'failed' ? 'synthetic cleanup failure' : null, config_sha256: configHash,
+});
 http.createServer((request, response) => {
   response.setHeader('content-type', 'application/json');
   if (request.method === 'POST' && request.url === '/runs') {
@@ -80,16 +89,22 @@ http.createServer((request, response) => {
         return;
       }
       if (${options.succeedRun ?? false}) {
-        response.end(JSON.stringify({
-          id: ${JSON.stringify(options.invalidRunId ? 'invalid-run-id' : '123e4567-e89b-42d3-a456-426614174000')}, state: 'succeeded',
-          progress: 'published', result_count: 1, error: null,
-          config_sha256: ${options.configHash === undefined ? "createHash('sha256').update(body).digest('hex')" : JSON.stringify(options.configHash)},
-        }));
+        configHash = ${options.configHash === undefined ? "createHash('sha256').update(body).digest('hex')" : JSON.stringify(options.configHash)};
+        response.end(JSON.stringify(runStatus(${JSON.stringify(options.initialState ?? 'succeeded')})));
         return;
       }
       response.end(JSON.stringify({ status: 'ok', git_sha: process.env.GIT_SHA,
         stamp_config: process.env.ARROWCOL_AKS_STAMP_CONFIG_FILE ?? null }));
     });
+    return;
+  }
+  if (request.method === 'POST' && request.url === '/runs/123e4567-e89b-42d3-a456-426614174000/cancel') {
+    cancelled = true;
+    response.writeHead(202).end();
+    return;
+  }
+  if (request.method === 'GET' && request.url === '/runs/123e4567-e89b-42d3-a456-426614174000') {
+    response.end(JSON.stringify(runStatus(${options.cancelState ? `cancelled ? ${JSON.stringify(options.cancelState)} : 'running'` : "'succeeded'"})));
     return;
   }
   response.end(JSON.stringify({ status: 'ok', git_sha: process.env.GIT_SHA,
@@ -285,7 +300,7 @@ test('deadline-enabled main path fails if a successful report crosses the deadli
 });
 
 test('successful deadline main exposes one frozen durable identity without waiting on supplementary work', { skip: process.platform !== 'linux' }, async () => {
-  const fixture = await passingMainFixture();
+  const fixture = await passingMainFixture({ initialState: 'running' });
   const previousExitCode = process.exitCode;
   let calls = 0;
   let observerError: unknown;
@@ -334,7 +349,7 @@ test('successful deadline main exposes one frozen durable identity without waiti
 test('supplementary observer throw and rejection preserve the actual main scorer and cleanup result', { skip: process.platform !== 'linux' }, async (t) => {
   for (const kind of ['throw', 'reject'] as const) {
     await t.test(kind, async (t) => {
-      const fixture = await passingMainFixture();
+      const fixture = await passingMainFixture({ initialState: 'running' });
       const previousExitCode = process.exitCode;
       const diagnostics: unknown[][] = [];
       t.mock.method(console, 'error', (...args: unknown[]) => { diagnostics.push(args); });
@@ -357,6 +372,82 @@ test('supplementary observer throw and rejection preserve the actual main scorer
         await rm(fixture.directory, { recursive: true, force: true });
       }
     });
+  }
+});
+
+test('owned main skips supplementary identity for initial non-running statuses', { skip: process.platform !== 'linux' }, async (t) => {
+  for (const initialState of ['succeeded', 'failed', 'cancelled'] as const) {
+    await t.test(initialState, async (t) => {
+      const fixture = await passingMainFixture({ initialState });
+      const previousExitCode = process.exitCode;
+      const diagnostics: unknown[][] = [];
+      t.mock.method(console, 'error', (...args: unknown[]) => { diagnostics.push(args); });
+      let calls = 0;
+      try {
+        process.exitCode = undefined;
+        await main(['--deadline-seconds', '10', '--no-viewer', '--config', fixture.configPath], fixture.runner, undefined,
+          fixture.receiptRoot, undefined, () => { calls++; });
+        assert.equal(calls, 0);
+        assert.equal(process.exitCode, initialState === 'succeeded' ? undefined : 1);
+        assert.ok(diagnostics.some(([message]) => /Supplementary owned-run identity skipped/.test(String(message))));
+      } finally {
+        process.exitCode = previousExitCode;
+        await fixture.stop();
+        await rm(fixture.directory, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test('owned main rechecks supplementary eligibility after cancellation during marker persistence', { skip: process.platform !== 'linux', timeout: 15_000 }, async (t) => {
+  const fixture = await passingMainFixture({ initialState: 'running', cancelState: 'failed' });
+  const previousExitCode = process.exitCode;
+  const diagnostics: unknown[][] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { diagnostics.push(args); });
+  const probe = await open(path.join(fixture.directory, 'probe'), 'w');
+  const handles = Object.getPrototypeOf(probe) as FileHandle;
+  const sync = handles.sync;
+  await probe.close();
+  let releaseMarker!: () => void;
+  const terminalRecorded = new Promise<void>((resolve) => { releaseMarker = resolve; });
+  let markerHeld = false;
+  const recordTerminal = OatLauncherDeadline.prototype.recordTerminal;
+  t.mock.method(OatLauncherDeadline.prototype, 'recordTerminal', async function (this: OatLauncherDeadline, run: OatRunStatus) {
+    await recordTerminal.call(this, run);
+    if (run.state === 'failed') {
+      assert.equal(markerHeld, true);
+      assert.equal(this.cleanupState, 'unsettled');
+      releaseMarker();
+    }
+  });
+  t.mock.method(handles, 'sync', async function (this: FileHandle) {
+    await sync.call(this);
+    const file = await readlink(`/proc/self/fd/${this.fd}`);
+    if (path.dirname(file) === fixture.stateRoot && path.basename(file).startsWith('.arrowcol-oat-owner-')) {
+      markerHeld = true;
+      process.emit('SIGTERM');
+      await terminalRecorded;
+    }
+  });
+  let calls = 0;
+  try {
+    process.exitCode = undefined;
+    await main(['--deadline-seconds', '10', '--no-viewer', '--config', fixture.configPath], fixture.runner, undefined,
+      fixture.receiptRoot, undefined, () => { calls++; });
+    assert.equal(markerHeld, true);
+    assert.equal(calls, 0);
+    assert.equal(process.exitCode, 143);
+    const [name] = await readdir(fixture.receiptRoot);
+    const receipt = JSON.parse(await readFile(path.join(fixture.receiptRoot, name!), 'utf8'));
+    assert.equal(receipt.run_state, 'failed');
+    assert.equal(receipt.cleanup_state, 'unsettled');
+    assert.equal(receipt.cancellation_attempts, 1);
+    assert.ok(diagnostics.some(([message]) => /Supplementary owned-run identity skipped/.test(String(message))));
+  } finally {
+    releaseMarker();
+    process.exitCode = previousExitCode;
+    await fixture.stop();
+    await rm(fixture.directory, { recursive: true, force: true });
   }
 });
 
