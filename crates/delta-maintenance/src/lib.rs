@@ -2435,7 +2435,11 @@ fn maintain_table(
             schedule.insert(name.into(), (now, policy));
         }
         let probe = probe?;
-        let token = probe.probe_log_token(limits.discovery_max_log_files)?;
+        let token = probe.probe_log_token(limits.discovery_max_log_files).inspect_err(|_| {
+            if let Err(error) = metrics.observe_target(name, None) {
+                eprintln!("delta-maintenance target invalidation failed: {error:#}");
+            }
+        })?;
         let metadata = match metadata.filter(|metadata| metadata.log_token == token) {
             Some(metadata) => Ok(metadata),
             None => refresh_target_metadata(metrics, name, || {
@@ -2500,7 +2504,13 @@ fn maintain_table(
                         .with_commit_retry_limits(effective.commit_attempts, effective.commit_budget)?;
                 let probe_started = Instant::now();
                 let probe_result = (|| -> Result<Option<MaintenanceReport>> {
-                    let token = probe.probe_log_token(settings.operation_limits.discovery_max_log_files)?;
+                    let token = probe
+                        .probe_log_token(settings.operation_limits.discovery_max_log_files)
+                        .inspect_err(|_| {
+                            if let Err(error) = metrics.observe_target(name, None) {
+                                eprintln!("delta-maintenance target invalidation failed: {error:#}");
+                            }
+                        })?;
                     if observed_token.as_ref().is_some_and(|previous| *previous != token)
                         && !policy_matches(
                             settings,
