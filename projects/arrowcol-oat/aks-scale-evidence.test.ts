@@ -371,6 +371,7 @@ test('real raw POST/GET identity crosses Rust immutable publication, custody and
     fixture_source: string; cases: { submitted_config_body: string; official_measurement_utf8: string }[];
   };
   assert.equal(proof.fixture_source, 'retained_loopback_post_get');
+  assert.ok(process.env.GIT_SHA, 'actual raw-byte witness requires the exact source revision');
   assert.equal(proof.cases.length, 2);
   assert.deepEqual(JSON.parse(proof.cases[0]!.submitted_config_body) as unknown,
     JSON.parse(proof.cases[1]!.submitted_config_body) as unknown);
@@ -381,6 +382,7 @@ test('real raw POST/GET identity crosses Rust immutable publication, custody and
     const matched = await readOfficialNativeWindow({ ...f.options, submittedConfigBytes: exactBytes });
     assert.equal(matched.original.submittedConfigIdentity, 'verified_exact_server_bytes');
     assert.equal(matched.original.reference.submitted_config_sha256, hash(exactBytes));
+    assert.equal(matched.original.reference.source_revision, process.env.GIT_SHA);
     assert.notEqual(matched.original.reference.effective_config_sha256, hash(exactBytes));
     assert.equal(matched.original.startMs, 1_000);
     assert.equal(matched.original.endMs, 31_000);
