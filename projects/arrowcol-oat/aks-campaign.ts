@@ -1,7 +1,9 @@
 import { spawnSync } from "node:child_process";
+import { constants as bufferConstants } from "node:buffer";
 import { canonical_json } from '../../infra/azure/bootstrap.js';
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { TextDecoder } from "node:util";
 import type { RunFicPlan } from '../../infra/azure/run_fic.js';
 import type { OatQapReference } from '../../infra/azure/oat_qap.js';
 import { loadCustodyConfig } from './aks-custody-config.js';
@@ -205,7 +207,11 @@ export interface CampaignState {
   runInventory?: RunInventory; operations: ArmOperationReceipt[]; scaleTrials?: ScaleTrialReceipt[];
 }
 export interface StoredCampaign { state: CampaignState; etag: string; }
-export interface CampaignStore { read(): Promise<StoredCampaign | undefined>; write(state: CampaignState, expectedEtag?: string): Promise<string>; }
+export interface CampaignStoreReadOptions { maxResponseBodyBytes?: number; deadlineUnixMs?: number; }
+export interface CampaignStore {
+  read(options?: CampaignStoreReadOptions): Promise<StoredCampaign | undefined>;
+  write(state: CampaignState, expectedEtag?: string): Promise<string>;
+}
 export type TokenProvider = (resource: string) => Promise<string>;
 export type Fetcher = typeof fetch;
 function record(value: unknown): value is Record<string, unknown> {
@@ -767,24 +773,145 @@ export function createBlobCampaignStore(config: CampaignStoreConfig, fetcher: Fe
     throw new Error('Campaign store record path is invalid.');
   const endpoint = `https://${config.account}.blob.core.windows.net/${config.container}/` +
     segments.map(segment => encodeURIComponent(segment)).join('/');
-  const blobFetch: Fetcher = (input, init = {}) => {
+  const blobFetch = (input: Parameters<Fetcher>[0], init: Parameters<Fetcher>[1] = {},
+    deadlineUnixMs?: number): Promise<Response> => {
     const url = new URL(String(input)), method = (init.method ?? 'GET').toUpperCase();
     const body = typeof init.body === 'string' || Buffer.isBuffer(init.body) ? init.body : undefined;
     const requestInit: RequestInit = isEffectBoundaryActive() ? { ...init, redirect: 'error' } : init;
     return dispatchExternalEffect({ transport: 'campaign-blob', method, resource: url.origin + '/' + config.container,
-      path: url.pathname + url.search, body }, () => fetcher(input, requestInit));
+      path: url.pathname + url.search, body }, () => {
+        if (deadlineUnixMs === undefined) return fetcher(input, requestInit);
+        const remaining = deadlineUnixMs - Date.now();
+        if (remaining <= 0 || requestInit.signal?.aborted)
+          throw new Error('Campaign store read exceeded its original deadline.');
+        return fetcher(input, { ...requestInit, signal: requestInit.signal ?? AbortSignal.timeout(remaining) });
+      });
   };
   const headers = async () => ({ authorization: `Bearer ${await token('https://storage.azure.com/')}`,
     'x-ms-date': new Date().toUTCString(), 'x-ms-version': '2023-11-03' });
+  const deadlineSignal = (deadlineUnixMs?: number): AbortSignal | undefined => {
+    if (deadlineUnixMs === undefined) return undefined;
+    if (!nonnegative(deadlineUnixMs)) throw new Error('Campaign store read deadline is invalid.');
+    const remaining = deadlineUnixMs - Date.now();
+    if (remaining <= 0) throw new Error('Campaign store read exceeded its original deadline.');
+    return AbortSignal.timeout(remaining);
+  };
+  const cancelResponseBody = async (response: Response, reason: Error, message: string): Promise<void> => {
+    if (!response.body) return;
+    try { await response.body.cancel(reason); }
+    catch (cancelError) { throw new AggregateError([reason, cancelError], message); }
+  };
+  const readCappedResponseBytes = async (response: Response, maxBytes: number, signal?: AbortSignal,
+    deadlineUnixMs?: number): Promise<Buffer> => {
+    const contentLength = response.headers.get('content-length');
+    const declaredLength = contentLength === null || !/^\d+$/.test(contentLength) ? undefined : Number(contentLength);
+    if (contentLength !== null && (declaredLength === undefined || !Number.isSafeInteger(declaredLength) || declaredLength > maxBytes)) {
+      const error = new Error('Campaign state response exceeds its byte cap or has invalid Content-Length.');
+      await cancelResponseBody(response, error, 'Campaign state response refusal could not cancel its body.');
+      throw error;
+    }
+    if (!response.body) return Buffer.alloc(0);
+    const reader = response.body.getReader(), chunks: Uint8Array[] = [];
+    let size = 0;
+    const assertLive = () => {
+      if (signal?.aborted || deadlineUnixMs !== undefined && Date.now() >= deadlineUnixMs)
+        throw new Error('Campaign store read exceeded its original deadline.');
+    };
+    const readNext = async (): Promise<ReadableStreamReadResult<Uint8Array>> => {
+      assertLive();
+      const pending = reader.read();
+      if (!signal) return pending;
+      return new Promise((resolve, reject) => {
+        let settled = false;
+        const cleanup = () => signal.removeEventListener('abort', onAbort);
+        const onAbort = () => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          reject(new Error('Campaign store read exceeded its original deadline.'));
+        };
+        signal.addEventListener('abort', onAbort, { once: true });
+        if (signal.aborted) { onAbort(); return; }
+        pending.then(value => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          resolve(value);
+        }, error => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          reject(error);
+        });
+      });
+    };
+    try {
+      for (;;) {
+        const next = await readNext();
+        assertLive();
+        if (next.done) break;
+        if (next.value.byteLength > maxBytes - size)
+          throw new Error('Campaign state response exceeds its byte cap.');
+        size += next.value.byteLength;
+        chunks.push(Buffer.from(next.value));
+      }
+      assertLive();
+      return Buffer.concat(chunks, size);
+    } catch (error) {
+      try { await reader.cancel(error); }
+      catch (cancelError) { throw new AggregateError([error, cancelError], 'Campaign state response read refusal could not cancel its body.'); }
+      throw error;
+    } finally {
+      reader.releaseLock();
+    }
+  };
   return {
-    async read() {
-      const response = await blobFetch(endpoint, { headers: await headers() });
-      if (response.status === 404) return undefined;
-      if (!response.ok) throw new Error(`Campaign state read failed with HTTP ${response.status}.`);
+    async read(options) {
+      const maxResponseBodyBytes = options?.maxResponseBodyBytes;
+      const deadlineUnixMs = options?.deadlineUnixMs;
+      if (maxResponseBodyBytes !== undefined && (!Number.isSafeInteger(maxResponseBodyBytes) ||
+          maxResponseBodyBytes < 1 || maxResponseBodyBytes > bufferConstants.MAX_LENGTH))
+        throw new Error('Campaign store response byte cap must be a positive safe integer within the Buffer limit.');
+      if (deadlineUnixMs !== undefined && maxResponseBodyBytes === undefined)
+        throw new Error('Campaign store read deadlines require a response-body cap.');
+      const signal = deadlineSignal(deadlineUnixMs);
+      const requestInit: RequestInit = { headers: await headers() };
+      if (signal) requestInit.signal = signal;
+      const response = await blobFetch(endpoint, requestInit, deadlineUnixMs);
+      if (deadlineUnixMs !== undefined && (signal?.aborted || Date.now() >= deadlineUnixMs)) {
+        const error = new Error('Campaign store read exceeded its original deadline.');
+        if (maxResponseBodyBytes !== undefined)
+          await cancelResponseBody(response, error, 'Campaign state deadline refusal could not cancel its body.');
+        throw error;
+      }
+      if (response.status === 404) {
+        if (maxResponseBodyBytes !== undefined)
+          await cancelResponseBody(response, new Error('Campaign state blob is absent.'), 'Campaign state absence refusal could not cancel its body.');
+        return undefined;
+      }
+      if (!response.ok) {
+        const error = new Error(`Campaign state read failed with HTTP ${response.status}.`);
+        if (maxResponseBodyBytes !== undefined)
+          await cancelResponseBody(response, error, 'Campaign state status refusal could not cancel its body.');
+        throw error;
+      }
       const etag = response.headers.get('etag');
-      if (!etag) throw new Error('Campaign state response has no ETag.');
+      if (!etag) {
+        const error = new Error('Campaign state response has no ETag.');
+        if (maxResponseBodyBytes !== undefined)
+          await cancelResponseBody(response, error, 'Campaign state ETag refusal could not cancel its body.');
+        throw error;
+      }
       let value: unknown;
-      try { value = await response.json(); } catch { throw new Error('Campaign state blob is not valid JSON.'); }
+      if (maxResponseBodyBytes === undefined) {
+        try { value = await response.json(); } catch { throw new Error('Campaign state blob is not valid JSON.'); }
+      } else {
+        const bytes = await readCappedResponseBytes(response, maxResponseBodyBytes, signal, deadlineUnixMs);
+        let text: string;
+        try { text = new TextDecoder('utf-8', { fatal: true }).decode(bytes); }
+        catch { throw new Error('Campaign state blob is not valid UTF-8.'); }
+        try { value = JSON.parse(text) as unknown; } catch { throw new Error('Campaign state blob is not valid JSON.'); }
+      }
       return { state: validateCampaignState(value), etag };
     },
     async write(state, expectedEtag) {
