@@ -59,7 +59,7 @@ const CAPABILITIES: &[Capability] = &[
     capability!("client.workers", "0 (available parallelism)"),
     capability!("client.runtime_threads", "0 (automatic)"),
     capability!("client.data_mode", "shared"),
-    capability!("client.data_profile", "realistic"),
+    capability!("client.data_profile", "diagnostic"),
     capability!(
         "client.string_length_distribution",
         "uniform (realistic), fixed (diagnostic)"
@@ -3056,6 +3056,20 @@ mod tests {
 
     #[test]
     fn client_profile_and_shard_selector_are_strict_and_projected() -> Result<()> {
+        let defaults = Tunables::parse_oat_json(serde_json::json!({"client": {}}))?;
+        assert!(
+            !defaults
+                .environment_for(ComponentRole::Client)?
+                .contains_key("ARROWCOL_CLIENT_DATA_PROFILE")
+        );
+        assert_eq!(
+            capability_table()
+                .iter()
+                .find(|capability| capability.name == "client.data_profile")
+                .map(|capability| capability.default),
+            Some("diagnostic")
+        );
+
         let config: Tunables = serde_json::from_str(
             r#"{"client":{"data_profile":"realistic","string_length_distribution":"uniform","value_variation":"per_row","guid_uniqueness":"per_row","shard_index_mode":"worker_spread","pod_ordinal":3}}"#,
         )?;

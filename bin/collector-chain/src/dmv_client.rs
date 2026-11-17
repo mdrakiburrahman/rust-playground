@@ -55,8 +55,8 @@ pub enum GrpcCompression {
 #[derive(Clone, Copy, Debug, Default, Serialize, ValueEnum, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DataProfile {
-    Diagnostic,
     #[default]
+    Diagnostic,
     Realistic,
 }
 
@@ -110,7 +110,7 @@ pub struct Options {
     pub runtime_threads: usize,
     #[arg(long, env = "ARROWCOL_CLIENT_DATA_MODE", value_enum, default_value_t = DataMode::Shared)]
     pub data_mode: DataMode,
-    #[arg(long, env = "ARROWCOL_CLIENT_DATA_PROFILE", value_enum, default_value_t = DataProfile::Realistic)]
+    #[arg(long, env = "ARROWCOL_CLIENT_DATA_PROFILE", value_enum, default_value_t = DataProfile::Diagnostic)]
     pub data_profile: DataProfile,
     #[arg(long, env = "ARROWCOL_CLIENT_STRING_LENGTH_DISTRIBUTION", value_enum)]
     pub string_length_distribution: Option<StringLengthDistribution>,
@@ -2846,7 +2846,9 @@ mod tests {
 
     #[test]
     fn profile_defaults_preserve_diagnostic_and_expand_realistic_row_variation() -> Result<()> {
-        let diagnostic = options()?;
+        let diagnostic = Cli::try_parse_from(["test", "--workers", "2"])?
+            .options
+            .resolve(1024, 1)?;
         assert_eq!(diagnostic.data_profile, DataProfile::Diagnostic);
         assert_eq!(
             diagnostic.string_length_distribution,

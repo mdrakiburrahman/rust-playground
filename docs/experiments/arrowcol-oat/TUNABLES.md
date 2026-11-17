@@ -14,7 +14,7 @@
 
 | Setting | Contract |
 | --- | --- |
-| `client.data_profile` | Strict `realistic` (default) or `diagnostic`. Realistic uses variable-width strings, per-row numeric/timestamp values, GUID uniqueness, and a fresh row identity in `endpoint_url`; diagnostic preserves the older replayable values and is not eligible for unique-delivery proof. |
+| `client.data_profile` | Strict `diagnostic` (default) or `realistic`. Diagnostic preserves the older replayable values; `realistic` must be explicitly selected for D53 and uses variable-width strings, per-row numeric/timestamp values, GUID uniqueness, and a fresh row identity in `endpoint_url`. Diagnostic replay is not eligible for unique-delivery proof. |
 | Generation telemetry | `preparation.steady_state_generation` is `true` for realistic data because fresh identity-bearing frames are generated and encoded per logical send; it is `false` for diagnostic corpus replay. Startup generation rates do not represent the realistic hot path. |
 | `client.string_width` / `client.string_length_distribution` | Width defaults to 96 for realistic data; distribution defaults to `uniform` for realistic and `fixed` for diagnostic. The identity URL in realistic mode is additional required width and is included in reported uncompressed IPC bytes. |
 | `client.value_variation` / `client.guid_uniqueness` | Each accepts `cardinality` or `per_row`; realistic defaults to `per_row`, diagnostic to `cardinality`. Existing `client.cardinality`, `client.skew`, and `client.entropy` remain the shared distribution controls; required fixture columns are never nulled. |
