@@ -961,6 +961,49 @@ impl PublisherSession {
         Self::open_url(url, SessionMode::Publisher, None).await
     }
 
+    /// Register a normal publisher using explicitly supplied Azure credentials and generation.
+    ///
+    /// # Errors
+    /// Rejects invalid Azure roots or generations before admission, and propagates
+    /// authentication, ready-generation, registration and unknown-outcome failures.
+    pub async fn open_with_azure_credentials(
+        url: &Url,
+        expected_generation: &str,
+        credentials: AzureCredentialProvider,
+    ) -> Result<Arc<Self>> {
+        canonical_uuid(expected_generation).context("invalid expected reset generation")?;
+        let host = url.host_str().context("missing Azure account host")?;
+        let account = host
+            .strip_suffix(".dfs.core.windows.net")
+            .context("Azure publisher requires a DFS account host")?;
+        if url.scheme() != "abfss"
+            || !(3..=24).contains(&account.len())
+            || !account.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+            || url.username().is_empty()
+            || !url
+                .username()
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+            || url.password().is_some()
+            || url.port().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            bail!("invalid credential-free Azure publisher root");
+        }
+        let control = Arc::new(AzureControlContainer::new(account, Arc::clone(&credentials))?);
+        let sandbox_id = control.sandbox_id().to_owned();
+        Self::register(
+            control,
+            sandbox_id,
+            account.to_owned(),
+            SessionTransport::Direct(credentials),
+            SessionMode::Publisher,
+            Some(expected_generation),
+        )
+        .await
+    }
+
     /// Register a normal publisher through the explicit credential-free D47 transport.
     /// The same immutable bridge covers admission, guarded storage, authority checks and drain.
     ///
@@ -1858,6 +1901,36 @@ impl MultipartUpload for GuardedUpload {
 #[cfg(test)]
 mod classify_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn explicit_azure_publisher_rejects_bad_binding_before_admission() -> Result<()> {
+        let credentials: AzureCredentialProvider = Arc::new(object_store::StaticCredentialProvider::new(
+            object_store::azure::AzureCredential::BearerToken("test-token".into()),
+        ));
+        let valid_generation = "11111111-1111-4111-8111-111111111111";
+        let valid_root = Url::parse("abfss://data@account123.dfs.core.windows.net/root/")?;
+        let error = PublisherSession::open_with_azure_credentials(&valid_root, "bad-generation", Arc::clone(&credentials))
+            .await
+            .err()
+            .context("invalid generation must fail")?;
+        assert!(format!("{error:#}").contains("invalid expected reset generation"));
+        for root in [
+            "file:///tmp/table",
+            "az://container/root",
+            "abfss://data@account123.example.com/root",
+            "abfss://data:secret@account123.dfs.core.windows.net/root",
+            "abfss://data@account123.dfs.core.windows.net/root?token=redacted",
+            "abfss://data@account123.dfs.core.windows.net/root#fragment",
+        ] {
+            assert!(
+                PublisherSession::open_with_azure_credentials(&Url::parse(root)?, valid_generation, Arc::clone(&credentials))
+                    .await
+                    .is_err(),
+                "invalid root must fail before admission: {root}"
+            );
+        }
+        Ok(())
+    }
 
     fn generic(source: Box<dyn std::error::Error + Send + Sync>) -> object_store::Error {
         object_store::Error::Generic {
