@@ -10371,18 +10371,7 @@ async fn apply_runtime_resources_with_mode(
             )
             .await
             .context("fresh-create run-scoped AKS runtime resources; do not replay uncertain creation")?;
-            let response: Value = serde_json::from_str(&output)?;
-            let items = response
-                .get("items")
-                .and_then(Value::as_array)
-                .context("fresh-create response is not a List")?;
-            if items.len() != resources.len() {
-                bail!("fresh-create response did not return every requested resource");
-            }
-            for (actual, expected) in items.iter().zip(&resources) {
-                fixture_response_identity(actual, expected)?;
-            }
-            Some(items.clone())
+            Some(parse_fresh_create_responses(&output, &resources)?)
         }
     };
     record_resource_uids_with_creation(config, platform, &resources, created.as_deref()).await?;

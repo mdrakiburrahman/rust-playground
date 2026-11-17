@@ -169,7 +169,12 @@ mod fixture_setup_tests {
                                 .map(|(index, item)| observed(item.clone(), index + 1))
                                 .collect::<Vec<_>>();
                             state.created.extend(actual.clone());
-                            serde_json::to_string(&json!({"items":actual}))?
+                            actual
+                                .iter()
+                                .map(serde_json::to_string_pretty)
+                                .collect::<std::result::Result<Vec<_>, _>>()?
+                                .join("\n")
+                                + "\n"
                         }
                     }
                     "get" => {

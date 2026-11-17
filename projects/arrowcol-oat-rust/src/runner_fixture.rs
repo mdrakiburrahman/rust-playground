@@ -384,6 +384,40 @@ fn fixture_response_identity(resource: &Value, expected: &Value) -> Result<()> {
     Ok(())
 }
 
+fn parse_fresh_create_responses(output: &str, expected: &[Value]) -> Result<Vec<Value>> {
+    // kubectl prints each created object separately; a failed batch may already have created a subset.
+    let responses = serde_json::Deserializer::from_str(output)
+        .into_iter::<Value>()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("fresh-create returned malformed/truncated JSON; creation outcome unknown, do not replay")?;
+    if responses.len() != expected.len() {
+        bail!("fresh-create did not return every requested identity; creation outcome unknown, do not replay");
+    }
+    let mut identities = BTreeSet::new();
+    let mut uids = BTreeSet::new();
+    for actual in &responses {
+        let requested = expected
+            .iter()
+            .find(|requested| {
+                ["/apiVersion", "/kind", "/metadata/namespace", "/metadata/name"]
+                    .iter()
+                    .all(|path| actual.pointer(path) == requested.pointer(path))
+            })
+            .context("fresh-create returned an unexpected resource identity; do not adopt or replay")?;
+        fixture_response_identity(actual, requested)?;
+        let identity = (
+            actual["apiVersion"].as_str(),
+            actual["kind"].as_str(),
+            actual["metadata"]["namespace"].as_str(),
+            actual["metadata"]["name"].as_str(),
+        );
+        if !identities.insert(identity) || !uids.insert(actual["metadata"]["uid"].as_str()) {
+            bail!("fresh-create returned duplicate resource identity or UID; do not adopt or replay");
+        }
+    }
+    Ok(responses)
+}
+
 async fn fixture_setup_with_transport(
     input: FixtureSetupInput,
     transport: Option<Arc<dyn FixtureCommandTransport>>,
