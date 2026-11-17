@@ -730,6 +730,7 @@ impl CellEvidence {
 #[derive(Clone)]
 enum ResourceSamplerSource {
     Aks,
+    AksNative(NativeTelemetrySource),
     Local {
         run_id: String,
         environment: HashMap<String, String>,
@@ -832,18 +833,19 @@ fn native_pod_sample(target: &AksResourcePodTarget, namespace: &str, pod: &Value
     let container = unique(pod_summary["containers"].as_array(), &target.container)?;
     let started = native_time_ns(&container["startTime"]).context("native summary container start time unavailable")?;
     anyhow::ensure!(
-        native_time_ns(&status["state"]["running"]["startedAt"]).as_deref() == Some(&started),
+        status.pointer("/state/running/startedAt").or_else(|| status.pointer("/state/terminated/startedAt"))
+            .and_then(native_time_ns).as_deref() == Some(&started),
         "native container ID/start-time binding is unavailable or changed"
     );
     Ok(json!({
         "identity": {"role": target.role, "pod": target.pod, "uid": target.uid,
             "node": target.node, "container": target.container, "container_id": container_id, "started_unix_ns": started},
         "limits": spec.pointer("/resources/limits"),
-        "cpu": {"time_unix_ns": native_time_ns(&container["cpu"]["time"]),
+        "cpu": {"time_unix_ns": native_time_ns(&container["cpu"]["time"]), "time_resolution_ns": "1000000000",
             "usage_core_nanoseconds": native_counter(&container["cpu"]["usageCoreNanoSeconds"])},
-        "memory": {"time_unix_ns": native_time_ns(&container["memory"]["time"]),
+        "memory": {"time_unix_ns": native_time_ns(&container["memory"]["time"]), "time_resolution_ns": "1000000000",
             "working_set_bytes": native_counter(&container["memory"]["workingSetBytes"])},
-        "network": {"time_unix_ns": native_time_ns(&pod_summary["network"]["time"]),
+        "network": {"time_unix_ns": native_time_ns(&pod_summary["network"]["time"]), "time_resolution_ns": "1000000000",
             "rx_bytes": native_counter(&pod_summary["network"]["rxBytes"]),
             "tx_bytes": native_counter(&pod_summary["network"]["txBytes"]),
             "scope": "pod_network_not_container_or_link_capacity"},
@@ -851,23 +853,97 @@ fn native_pod_sample(target: &AksResourcePodTarget, namespace: &str, pod: &Value
     }))
 }
 
-async fn native_kubernetes_get(config: &OatConfig, source: &NativeTelemetrySource, args: Vec<&str>) -> Result<Value> {
+fn native_cfs_sample(target: &AksResourcePodTarget, namespace: &str, metrics: &str) -> Result<Value> {
+    let container_id = target.container_id.as_deref().context("original container ID unavailable")?;
+    let (runtime, hash) = container_id.split_once("://").context("container runtime ID unavailable")?;
+    anyhow::ensure!(hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "container runtime hash unavailable");
+    let scope_prefix = match runtime {
+        "containerd" => "cri-containerd-", "docker" => "docker-", "cri-o" => "crio-",
+        _ => bail!("unrecognized container runtime cgroup binding"),
+    };
+    let pod_group = format!("pod{}", target.uid);
+    let systemd_pod = format!("-pod{}.slice", target.uid.replace('-', "_"));
+    let scope = format!("{scope_prefix}{hash}.scope");
+    let mut found = BTreeMap::new();
+    for line in metrics.lines() {
+        let Some((name, sample)) = line.split_once('{') else { continue };
+        if !matches!(name, "container_cpu_cfs_periods_total" | "container_cpu_cfs_throttled_periods_total") { continue; }
+        let (labels, values) = sample.rsplit_once('}').context("malformed native cAdvisor sample")?;
+        let labels = parse_metric_labels(labels)?;
+        if labels.get("namespace").map(String::as_str) != Some(namespace)
+            || labels.get("pod").map(String::as_str) != Some(&target.pod)
+            || labels.get("container").map(String::as_str) != Some(&target.container) { continue; }
+        let id = labels.get("id").context("native cAdvisor cgroup identity unavailable")?;
+        let groups = id.split('/').filter(|group| !group.is_empty()).collect::<Vec<_>>();
+        anyhow::ensure!(
+            groups.iter().any(|group| *group == pod_group || group.ends_with(&systemd_pod))
+                && groups.last().is_some_and(|group| *group == hash || *group == scope),
+            "native cAdvisor cgroup does not match the original pod UID and container ID"
+        );
+        let fields = values.split_whitespace().collect::<Vec<_>>();
+        anyhow::ensure!(fields.len() == 2, "native cAdvisor counter has no explicit source timestamp");
+        let count = fields[0].parse::<f64>()?;
+        anyhow::ensure!(count.is_finite() && count >= 0.0 && count.fract() == 0.0
+            && count <= 9_007_199_254_740_991.0, "native cAdvisor counter is not an exact bounded integer");
+        let timestamp = fields[1].parse::<u64>()?.checked_mul(1_000_000)
+            .filter(|value| *value > 0).context("native cAdvisor source timestamp invalid")?;
+        anyhow::ensure!(found.insert(name, (count as u64, timestamp)).is_none(), "native cAdvisor counter is ambiguous");
+    }
+    let (periods, timestamp) = found.get("container_cpu_cfs_periods_total").context("native CPU periods unavailable")?;
+    let (throttled, throttled_timestamp) = found.get("container_cpu_cfs_throttled_periods_total")
+        .context("native throttled CPU periods unavailable")?;
+    anyhow::ensure!(timestamp == throttled_timestamp && throttled <= periods,
+        "native cAdvisor timestamps or counter values are inconsistent");
+    Ok(json!({"time_unix_ns": timestamp.to_string(), "time_resolution_ns": "1000000", "periods": periods.to_string(),
+        "throttled_periods": throttled.to_string()}))
+}
+
+async fn native_kubernetes_text(config: &OatConfig, source: &NativeTelemetrySource, args: Vec<&str>) -> Result<String> {
     let context = source.context.as_deref().context("native source has no explicit selected kube context")?;
     anyhow::ensure!(config.kubectl_context.as_deref() == Some(context), "native selected kube context changed");
     let mut exact = vec!["--server", &source.server, "--insecure-skip-tls-verify=false"];
     exact.extend(args);
-    let body = kubectl_with_output_bound(config, exact, None, Some(OFFICIAL_MEASUREMENT_MAX_BYTES)).await?;
+    kubectl_with_output_bound(config, exact, None, Some(OFFICIAL_MEASUREMENT_MAX_BYTES)).await
+}
+
+async fn native_kubernetes_get(config: &OatConfig, source: &NativeTelemetrySource, args: Vec<&str>) -> Result<Value> {
+    let body = native_kubernetes_text(config, source, args).await?;
     serde_json::from_str(&body).context("native Kubernetes source is not valid JSON")
+}
+
+async fn run_native_observation<F, O>(observe: F) -> Result<Value>
+where
+    F: FnOnce(Duration) -> O + Send + 'static,
+    O: std::future::Future<Output = Result<Value>>,
+{
+    let deadline = std::time::Instant::now() + PUBLICATION_BACKLOG_REQUEST_TIMEOUT;
+    let (_cancel, mut cancelled) = watch::channel(());
+    tokio::task::spawn_blocking(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        anyhow::ensure!(!remaining.is_zero(), "native QAP original sample deadline expired before dispatch");
+        runtime.block_on(async {
+            tokio::select! {
+                biased;
+                _ = cancelled.changed() => bail!("native QAP source capture cancelled"),
+                observation = observe(remaining) => observation,
+            }
+        })
+    }).await.context("join existing native QAP observation runtime")?
 }
 
 async fn capture_native_telemetry(source: &NativeTelemetrySource, config: &OatConfig) -> Result<Value> {
     let started = unix_time_ms_u64()?;
     let qap = async {
         tokio::fs::create_dir_all(&source.results).await?;
-        let observation = arrowcol_loadgen::observe_qap_with_mode(
-            &source.qap_endpoint, &source.results, arrowcol_loadgen::ObservationMode::Azure,
-            &source.qap_database, &source.qap_tables, PUBLICATION_BACKLOG_REQUEST_TIMEOUT,
-        ).await?;
+        let observer = source.clone();
+        let observation = run_native_observation(move |remaining| async move {
+            arrowcol_loadgen::observe_qap_with_mode(
+                &observer.qap_endpoint, &observer.results, arrowcol_loadgen::ObservationMode::Azure,
+                &observer.qap_database, &observer.qap_tables, remaining,
+            ).await
+        }).await?;
         Ok::<_, anyhow::Error>(json!({
             "observed_unix_ms": observation["observed_unix_ms"],
             "tables": source.qap_tables.iter().map(|name| {
@@ -881,21 +957,31 @@ async fn capture_native_telemetry(source: &NativeTelemetrySource, config: &OatCo
         let nodes = source.targets.iter().map(|target| target.node.clone()).collect::<BTreeSet<_>>();
         let summaries = join_all(nodes.iter().map(|node| async move {
             if node.is_empty() || !node.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.')) {
-                return (node.clone(), None);
+                return (node.clone(), (None, None));
             }
             let path = format!("/api/v1/nodes/{node}/proxy/stats/summary");
-            let result = native_kubernetes_get(config, source, vec!["get", "--raw", &path, "--request-timeout=3s"]).await;
-            (node.clone(), result.ok())
+            let cadvisor_path = format!("/api/v1/nodes/{node}/proxy/metrics/cadvisor");
+            let (summary, cadvisor) = tokio::join!(
+                native_kubernetes_get(config, source, vec!["get", "--raw", &path, "--request-timeout=3s"]),
+                native_kubernetes_text(config, source, vec!["get", "--raw", &cadvisor_path, "--request-timeout=3s"]),
+            );
+            (node.clone(), (summary.ok(), cadvisor.ok()))
         })).await.into_iter().collect::<HashMap<_, _>>();
         join_all(source.targets.iter().map(|target| {
             let summaries = &summaries;
             async move {
                 let observation = async {
-                    let summary = summaries.get(&target.node).and_then(Option::as_ref)
+                    let summary = summaries.get(&target.node).and_then(|(summary, _)| summary.as_ref())
                         .context("native exact-node summary unavailable")?;
                     let pod = native_kubernetes_get(config, source, vec!["get", "pod", &target.pod,
                         "--namespace", &config.namespace, "-o", "json", "--request-timeout=3s"]).await?;
-                    native_pod_sample(target, &config.namespace, &pod, summary)
+                    let mut sample = native_pod_sample(target, &config.namespace, &pod, summary)?;
+                    if let Some((_, Some(metrics))) = summaries.get(&target.node) {
+                        sample["throttling"] = native_cfs_sample(target, &config.namespace, metrics)
+                            .unwrap_or_else(|_| json!({"value": null,
+                                "unavailable_reason": "native_cadvisor_source_timestamp_or_exact_cgroup_binding_unavailable"}));
+                    }
+                    Ok::<_, anyhow::Error>(sample)
                 }.await;
                 observation.unwrap_or_else(|_| json!({
                     "identity": target, "unavailable_reason": "native_exact_pod_identity_credentials_or_summary_unavailable"
@@ -928,7 +1014,7 @@ const PUBLICATION_BACKLOG_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 
 async fn sample_resources(source: &ResourceSamplerSource, config: &OatConfig) -> Result<ResourceMetrics> {
     match source {
-        ResourceSamplerSource::Aks => collect_aks_metrics(config).await,
+        ResourceSamplerSource::Aks | ResourceSamplerSource::AksNative(_) => collect_aks_metrics(config).await,
         ResourceSamplerSource::Local { run_id, environment, .. } => collect_local_metrics(config, run_id, environment).await,
     }
 }
@@ -951,7 +1037,11 @@ impl Drop for ResourceSampler {
 
 impl ResourceSampler {
     fn start(source: Option<ResourceSamplerSource>, config: OatConfig, start: u64, end: u64,
-        prepared: Option<PreparedGuard>, native: Option<NativeTelemetrySource>) -> Self {
+        prepared: Option<PreparedGuard>) -> Self {
+        let native = match &source {
+            Some(ResourceSamplerSource::AksNative(native)) => Some(native.clone()),
+            _ => None,
+        };
         let (signal, receiver) = watch::channel(if prepared.is_some() {
             GuardSignal::Monitoring
         } else {
@@ -1141,8 +1231,8 @@ impl ResourceSampler {
                     native_failures += native_tasks.len() as u64;
                     native_tasks.abort_all();
                     while native_tasks.join_next().await.is_some() {}
-                    if unix_time_ms_u64()? >= end && !*stop_receiver.borrow()
-                        && !matches!(&*signal.borrow(), GuardSignal::Stop(_))
+                    let stopped = *stop_receiver.borrow() || matches!(&*signal.borrow(), GuardSignal::Stop(_));
+                    if unix_time_ms_u64()? >= end && !stopped
                     {
                         match capture_native_telemetry(&source, &config).await {
                             Ok(sample) if native_samples.len() < NATIVE_TELEMETRY_MAX_SAMPLES => native_samples.push(sample),
@@ -1157,7 +1247,7 @@ impl ResourceSampler {
                         "cadence_ms": NATIVE_TELEMETRY_INTERVAL_MS, "sample_timeout_ms": 3000,
                         "samples": native_samples, "sampling_failures": native_failures,
                         "samples_dropped": native_dropped,
-                        "throttling_unavailable_reason": "existing_cadvisor_is_scheduled_load_to_client_completion_not_source_timestamped_original_window",
+                        "throttling_scope": "explicit_native_cadvisor_source_timestamps_and_exact_pod_uid_container_id_only_not_legacy_whole_load_ratio",
                         "network_saturation_unavailable_reason": "native_pod_network_has_no_authenticated_link_capacity",
                     }));
                 }
@@ -1218,6 +1308,29 @@ mod measurement_evidence_tests {
     use super::*;
 
     #[tokio::test]
+    async fn native_observation_runtime_cancels_pending_source_when_sampler_is_dropped() -> Result<()> {
+        struct NotifyDrop(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for NotifyDrop {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() { let _ = sender.send(()); }
+            }
+        }
+        let (ready, started) = tokio::sync::oneshot::channel();
+        let (dropped, observed_drop) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(run_native_observation(move |remaining| async move {
+            assert!(remaining <= PUBLICATION_BACKLOG_REQUEST_TIMEOUT);
+            let _guard = NotifyDrop(Some(dropped));
+            ready.send(()).map_err(|_| anyhow::anyhow!("source start receiver closed"))?;
+            std::future::pending::<Result<Value>>().await
+        }));
+        tokio::time::timeout(Duration::from_secs(2), started).await??;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(2), observed_drop).await??;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn native_child_cap_counts_combined_raw_bytes_before_utf8_and_exit() -> Result<()> {
         for limit in [2, 3] {
             let child = Command::new("sh").args(["-c", "printf '\\303\\251'; printf x >&2"])
@@ -1235,6 +1348,29 @@ mod measurement_evidence_tests {
         let child = Command::new("sh").args(["-c", "printf 12345; printf 67890 >&2; exit 0"])
             .stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true).spawn()?;
         assert!(bounded_native_child_output(child, 9).await.is_err(), "a successful process exit cannot hide overflow");
+        Ok(())
+    }
+
+    #[test]
+    fn native_cfs_requires_source_timestamps_and_exact_cgroup_uid_and_container_hash() -> Result<()> {
+        let hash = "a".repeat(64);
+        let target = AksResourcePodTarget {
+            role: "collector".to_owned(), pod: "collector-pod".to_owned(), uid: "pod-uid".to_owned(),
+            container: "collector".to_owned(), node: "node-1".to_owned(),
+            container_id: Some(format!("containerd://{hash}")),
+        };
+        let sample = |timestamp: &str, uid: &str, hash: &str| format!(
+            "container_cpu_cfs_periods_total{{namespace=\"oat\",pod=\"collector-pod\",container=\"collector\",id=\"/kubepods/pod{uid}/{hash}\",extra=\"escaped,comma\"}} 100{timestamp}\n\
+             container_cpu_cfs_throttled_periods_total{{namespace=\"oat\",pod=\"collector-pod\",container=\"collector\",id=\"/kubepods/pod{uid}/{hash}\"}} 10{timestamp}\n"
+        );
+        let valid = sample(" 1767225660123", &target.uid, &hash);
+        let observed = native_cfs_sample(&target, "oat", &valid)?;
+        assert_eq!(observed["time_unix_ns"], "1767225660123000000");
+        assert_eq!(observed["periods"], "100");
+        for invalid in [sample("", &target.uid, &hash), sample(" 1767225660123", "other-uid", &hash),
+            sample(" 1767225660123", &target.uid, &"b".repeat(64)), format!("{valid}{valid}")] {
+            assert!(native_cfs_sample(&target, "oat", &invalid).is_err());
+        }
         Ok(())
     }
 

@@ -4,7 +4,8 @@ import { readFile } from 'node:fs/promises';
 import { test, type TestContext } from 'node:test';
 import { Azure, Config, canonical_json } from '../../infra/azure/bootstrap.js';
 import { newCampaignState, type CampaignStore, type RunInventory } from './aks-campaign.js';
-import { createScaleEvidenceVerifier, readBoundedSourceBytes, readOfficialCellMeasurement, readOfficialKustoWindow } from './aks-scale-evidence.js';
+import { createScaleEvidenceVerifier, readBoundedSourceBytes, readOfficialCellMeasurement, readOfficialKustoWindow,
+  readOfficialNativeWindow } from './aks-scale-evidence.js';
 import type { ScaleMeasurementEnvelope } from './aks-scale.js';
 
 const hash = (value: string | Uint8Array) => createHash('sha256').update(value).digest('hex');
@@ -77,8 +78,131 @@ function syntheticAuthenticatedTransport(t: TestContext, supplied?: Uint8Array, 
     deadlineAtMs: now + 60_000, now: () => now, fetcher }),
     options: { azure, store, token, deadlineAtMs: now + 60_000, now: () => now, fetcher },
     counts: () => ({ reads, tokenReads }), corrupt: () => { bytes = Buffer.from('not the original bytes'); },
+    publishSyntheticDocument: () => {
+      bytes = Buffer.from(canonical_json(document));
+      Object.assign(inventory.official_measurement!, { sha256: hash(bytes), byte_length: bytes.byteLength,
+        effective_config_sha256: document.effective_config_sha256 });
+    },
     failStatus: () => { status = 403; }, wrongEtag: () => { returnedEtag = '"forged"'; }, fence: () => { changed = true; } };
 }
+
+function syntheticNativeTransport(t: TestContext) {
+  const f = syntheticAuthenticatedTransport(t), start = now - 60_000, end = now - 30_000;
+  const namespaceUid = 'c0ffee00-0000-4000-8000-000000000005';
+  f.inventory.namespace.uid = namespaceUid;
+  Object.assign(f.document.origin, { namespace_uid: namespaceUid });
+  f.options.azure.c.uri = 'https://synthetic-offline.kusto.windows.net';
+  const context = 'synthetic-offline-context', server = 'https://synthetic-offline.invalid';
+  f.inventory.fic = { resource_id: '/synthetic/federatedIdentityCredentials/offline', name: 'offline',
+    state: 'observed', absence: null, plan: { version: 1, runId: cellId, namespace: f.inventory.namespace.name,
+      serviceAccount: 'oat', identityId: '/synthetic/identity', resourceId: '/synthetic/federatedIdentityCredentials/offline',
+      clientId: campaignId, tenantId: ownerId, aksId: '/synthetic/aks', server, credentialName: 'offline',
+      issuer: 'https://synthetic-offline.invalid/oidc/', subject: 'system:serviceaccount:synthetic:oat',
+      audience: 'api://AzureADTokenExchange' } };
+  f.inventory.qap = { database: 'synthetic', state: 'observed', absence: [],
+    bindings: [{ external_table: 'synthetic_external', relative_path: 'synthetic_offline_table' }],
+    reference: { schema_version: 1, account: f.options.azure.c.account, container: f.options.azure.c.checkpoints,
+      blob: 'synthetic/qap.json', run_id: cellId, nonce: ownerId, manifest_sha256: 'f'.repeat(64),
+      namespace_uid: namespaceUid, namespace_owner_token: ownerId } };
+  const effective = { typed_oat_config: { tables: ['synthetic_offline_table'],
+    qap_endpoint: f.options.azure.c.uri, kubectl_context: context },
+    resolved_aks_resources: { collector: { limits: { cpu: '2', memory: '1Gi' } } } };
+  f.document.effective_config_json = canonical_json(effective);
+  f.document.effective_config_sha256 = hash(f.document.effective_config_json);
+  const identity = { role: 'collector', pod: 'collector-pod', uid: 'synthetic-pod-uid', node: 'synthetic-node',
+    container: 'collector', container_id: 'containerd://synthetic-original' };
+  const frames = [start - 1000, start + 9000, start + 19_000, end + 1000].map((at, i) => {
+    const time = at + 50;
+    return { request_start_unix_ms: at, request_end_unix_ms: at + 100,
+      qap: { observed_unix_ms: at + 50, tables: { synthetic_external: { available: true,
+        statistics: { AccelerationPendingDataFilesCount: 10 + 2 * i, AccelerationPendingDataFilesSize: 1000 + 200 * i,
+          AccelerationCompletePercentage: 50, LastUpdatedDateTime: '2010-01-01T00:00:00Z', Eligible: true, Fresh: null },
+        state: { IsHealthy: true, NotHealthyReason: null } } } },
+      pods: [{ identity: { ...identity, started_unix_ns: (BigInt(start - 10_000) * 1_000_000n).toString() },
+        limits: { cpu: '2', memory: '1Gi' },
+        cpu: { time_unix_ns: (BigInt(time) * 1_000_000n).toString(), time_resolution_ns: '1000000000',
+          usage_core_nanoseconds: (9_007_199_254_740_993n + BigInt(time - start + 1000) * 2_000_000n).toString() },
+        memory: { time_unix_ns: (BigInt(time) * 1_000_000n).toString(), time_resolution_ns: '1000000000',
+          working_set_bytes: '1000000000' },
+        network: { time_unix_ns: (BigInt(time) * 1_000_000n).toString(), time_resolution_ns: '1000000000',
+          scope: 'pod_network_not_container_or_link_capacity',
+          rx_bytes: (BigInt(time - start + 1000) * 1000n).toString(),
+          tx_bytes: (BigInt(time - start + 1000) * 2000n).toString() } }] };
+  });
+  const history = { schema_version: 1, scope: 'original_cell_source_observations_not_scale_authorization',
+    binding: { campaign_id: campaignId, owner_id: ownerId, fencing_token: 1, cell_run_id: cellId,
+      namespace_uid: namespaceUid, namespace: f.inventory.namespace.name, server, kube_context: context,
+      qap_endpoint: f.options.azure.c.uri, qap_database: f.inventory.qap.database,
+      qap_bindings: f.inventory.qap.bindings, qap_reference: f.inventory.qap.reference },
+    window_start_unix_ms: start, window_end_unix_ms: end, cadence_ms: 10_000, sample_timeout_ms: 3000,
+    samples: frames, sampling_failures: 0, samples_dropped: 0, pod_targets: [identity] };
+  Object.assign(f.document.official_result.evidence, { native_telemetry: history });
+  f.publishSyntheticDocument();
+  return { ...f, history };
+}
+
+test('native observations use immutable cell custody, original windows and exact stable container counters', async t => {
+  const f = syntheticNativeTransport(t), measured = await readOfficialNativeWindow(f.options);
+  assert.equal(measured.qap.unit, 'pending_data_files');
+  assert.equal(measured.qap.pendingDataFiles, 14);
+  assert.equal(measured.qap.pendingDataBytes, 1400);
+  assert.equal(measured.qap.growing, true);
+  assert.equal(measured.qap.samples[0]!.lastUpdatedDateTime, '2010-01-01T00:00:00Z');
+  assert.equal(measured.pods[0]!.cpuCores, 2);
+  assert.equal(measured.pods[0]!.cpuSaturated, true);
+  assert.equal(measured.pods[0]!.memorySaturated, true);
+  assert.equal(measured.pods[0]!.rxBytesPerSecond, 1_000_000);
+  assert.equal(measured.pods[0]!.networkSaturated, null);
+  assert.equal(measured.pods[0]!.throttling, null);
+  assert.match(measured.authorization, /hold/);
+});
+
+test('native dimensions independently refuse wrong source, resource identity, partial history and counter resets', async t => {
+  for (const defect of ['qap-origin', 'qap-table', 'pod-id', 'reset', 'future-counter', 'server', 'partial', 'cell'] as const) {
+    const f = syntheticNativeTransport(t);
+    if (defect === 'qap-origin') f.history.binding.qap_endpoint = 'https://wrong-offline.invalid';
+    if (defect === 'qap-table') f.history.samples[1]!.qap.tables.synthetic_external.available = false;
+    if (defect === 'pod-id') f.history.samples[1]!.pods[0]!.identity.container_id = 'containerd://restarted';
+    if (defect === 'reset') f.history.samples[1]!.pods[0]!.cpu.usage_core_nanoseconds = '1';
+    if (defect === 'future-counter') f.history.samples[1]!.pods[0]!.cpu.time_unix_ns = (BigInt(now) * 1_000_000n).toString();
+    if (defect === 'server') f.history.binding.server = 'https://wrong-offline.invalid';
+    if (defect === 'partial') f.history.samples.pop();
+    if (defect === 'cell') f.history.binding.cell_run_id = ownerId;
+    f.publishSyntheticDocument();
+    const measured = await readOfficialNativeWindow(f.options);
+    if (['qap-origin', 'qap-table', 'partial', 'cell'].includes(defect)) assert.equal(measured.qap.growing, null, defect);
+    else assert.equal(measured.qap.growing, true, defect);
+    if (['pod-id', 'reset', 'future-counter'].includes(defect)) {
+      assert.equal(measured.pods[0]!.cpuSaturated, null, defect);
+      if (defect !== 'pod-id') assert.equal(measured.pods[0]!.memorySaturated, true, defect);
+    }
+    if (['qap-origin', 'qap-table'].includes(defect)) assert.equal(measured.pods[0]!.cpuSaturated, true, defect);
+    assert.match(measured.authorization, /hold/);
+  }
+});
+
+test('native throttling needs timestamped CFS history and quantized CPU near a threshold remains unknown', async t => {
+  for (const timestamps of [true, false]) {
+    const f = syntheticNativeTransport(t);
+    f.history.samples.forEach((frame, i) => Object.assign(frame.pods[0]!, { throttling: {
+      time_unix_ns: timestamps ? frame.pods[0]!.cpu.time_unix_ns : null,
+      time_resolution_ns: '1000000', periods: String(1000 + 100 * i), throttled_periods: String(100 + 20 * i),
+    } }));
+    f.publishSyntheticDocument();
+    const measured = await readOfficialNativeWindow(f.options);
+    assert.equal(measured.pods[0]!.throttling, timestamps ? 0.2 : null);
+    assert.equal(measured.pods[0]!.throttled, timestamps ? true : null);
+    assert.equal(measured.pods[0]!.cpuSaturated, true);
+  }
+  const f = syntheticNativeTransport(t);
+  const base = 9_007_199_254_740_993n, first = f.history.samples[0]!.request_start_unix_ms;
+  f.history.samples.forEach(frame => {
+    frame.pods[0]!.cpu.usage_core_nanoseconds = (base + BigInt(frame.request_start_unix_ms - first) * 1_800_000n).toString();
+  });
+  f.publishSyntheticDocument();
+  assert.equal((await readOfficialNativeWindow(f.options)).pods[0]!.cpuSaturated, null,
+    'reported source-time precision cannot become a false positive at the 90% boundary');
+});
 
 test('immutable measurement reader uses selected authenticated storage and cannot authorize an unpaired scale trial', async t => {
   const f = syntheticAuthenticatedTransport(t), observed = await f.read();

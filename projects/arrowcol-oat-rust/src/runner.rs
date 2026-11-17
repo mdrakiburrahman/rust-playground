@@ -1150,7 +1150,7 @@ struct PublicationBacklogScraper {
 impl PublicationBacklogScraper {
     async fn start(source: &ResourceSamplerSource, config: &OatConfig) -> Result<Self> {
         let (endpoint, tunnel) = match source {
-            ResourceSamplerSource::Aks => {
+            ResourceSamplerSource::Aks | ResourceSamplerSource::AksNative(_) => {
                 let (endpoint, tunnel) = start_aks_collector_metrics_tunnel(config).await?;
                 (endpoint, Some(tunnel))
             }
@@ -4583,13 +4583,16 @@ async fn run_clients_inner(
             None
         }
     };
+    let sampler_source = match native {
+        Some(native) => Some(ResourceSamplerSource::AksNative(native)),
+        None => platform.resource_sampler_source(),
+    };
     let mut sampler = ResourceSampler::start(
-        platform.resource_sampler_source(),
+        sampler_source,
         config.clone(),
         measurement_start_unix_ms,
         measurement_end_unix_ms,
         prepared_guard,
-        native,
     );
     let mut client_metrics = HashMap::<String, Vec<ClientMeasurement>>::with_capacity(tables.len());
     let mut completed_clients = HashSet::new();
@@ -11510,7 +11513,6 @@ struct CpuThrottleSample {
     uid: String,
     container: String,
     node: String,
-    container_id: Option<String>,
     counters: Option<CpuThrottleCounters>,
     unavailable_reason: Option<String>,
 }
@@ -11586,6 +11588,7 @@ struct AksResourcePodTarget {
     uid: String,
     container: String,
     node: String,
+    container_id: Option<String>,
 }
 
 fn aks_resource_pod_targets(readbacks: &[Value]) -> Result<Vec<AksResourcePodTarget>> {
