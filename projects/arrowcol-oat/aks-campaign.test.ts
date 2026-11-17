@@ -175,6 +175,21 @@ test('campaign start receipt provides strict runner environment identities', () 
   assert.throws(() => assertCampaignEnvironment({ CAMPAIGN_ID: campaignId }, state), /does not match the durable fence/);
 });
 
+test('default campaign blob store refuses a write after token acquisition crosses the original deadline', async () => {
+  let fetches = 0;
+  const store = createBlobCampaignStore({ account: 'arrowcollector12345', container: 'checkpoints', subscriptionId },
+    async () => { fetches++; throw new Error('expired write must not reach fetch'); },
+    async () => { await new Promise(resolve => setTimeout(resolve, 30)); return 'offline-token'; });
+  const deadline = Date.now() + 5;
+  await assert.rejects(store.write(newCampaignState(campaignId, ownerId, Date.now()), undefined, {
+    deadlineUnixMs: deadline,
+    beforeDispatch: async () => {
+      if (Date.now() >= deadline) throw new Error('Original terminal deadline expired before blob dispatch.');
+    },
+  }), /Original terminal deadline expired/);
+  assert.equal(fetches, 0);
+});
+
 test('heartbeat cannot revive expired custody and stale fencing tokens are rejected', async () => {
   const store = await seed();
   const started = (await store.read())!.state;

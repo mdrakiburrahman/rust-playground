@@ -384,6 +384,11 @@ export class EffectBoundary {
     }
   }
 
+  matchesAllocation(input: unknown): boolean {
+    try { return this.allocationSha256 === effectAllocationFingerprint(input); }
+    catch { return false; }
+  }
+
   async dispatch<T>(request: ExternalEffect, forward: () => Promise<T>): Promise<T> {
     if (this.poisoned) throw new Error('Effect boundary journal is not durable; refusing all further dispatch.');
     const method = request.method.toUpperCase();
@@ -465,7 +470,13 @@ export class EffectBoundary {
     } finally { fs.closeSync(fd); }
   }
 }
+export function effectAllocationFingerprint(input: unknown): string {
+  return allocationFingerprint(parseEnvelope(input));
+}
 export function isEffectBoundaryActive(): boolean { return active.getStore() !== undefined; }
+export function isEffectBoundaryActiveFor(envelope: unknown): boolean {
+  return active.getStore()?.boundary.matchesAllocation(envelope) ?? false;
+}
 
 export function dispatchExternalEffect<T>(request: ExternalEffect, forward: () => Promise<T>): Promise<T> {
   const context = active.getStore();

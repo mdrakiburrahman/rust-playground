@@ -8,7 +8,7 @@ import { Azure, Config, TAGS, type HttpReceipt } from '../../infra/azure/bootstr
 import { dispatchExternalEffect, EffectBoundary, withEffectBoundary } from '../../infra/azure/effect-boundary.js';
 import { defaultStampConfig } from '../../infra/azure/stamp.js';
 import { CUSTODY_CLEANUP_STEPS, CampaignConflictError, CampaignWriteOutcomeUnknownError, campaignMain, newCampaignState, publishRunInventory, type CampaignState, type CampaignStore,
-  type RunInventory, type StoredCampaign } from './aks-campaign.js';
+  type CampaignStoreOperationOptions, type RunInventory, type StoredCampaign } from './aks-campaign.js';
 import { captureCleanupBaseline, createDefaultCleanupProviders, readCleanupBaseline, type StampHealthReceipt } from './aks-default-providers.js';
 import { buildAksPoolScalePayload } from './aks-arm-pool.js';
 import type { CleanupMutationAuthority } from './aks-cleanup-executor.js';
@@ -223,6 +223,40 @@ test('stock campaign capture freezes selected-stamp baseline, reuses its receipt
   await assert.rejects(readCleanupBaseline(f.azure, f.store.state), /baseline/);
   assert.deepEqual(f.mutations, [], 'source qualification must never mutate ARM');
 });
+
+test('campaign publisher carries the original deadline through delayed read and write readback', async t => {
+  const selected = selectedConfig(t), f = await fixture(t, false, selected.config);
+  f.inventory.namespace.uid = null;
+  const state = { ...newCampaignState(campaignId, ownerId, Date.now() - 1_000), heartbeatAtMs: Date.now(),
+    runInventory: f.inventory };
+  const deadline = Date.now() + 40, readOptions: (CampaignStoreOperationOptions | undefined)[] = [];
+  let reads = 0, writes = 0;
+  const store: CampaignStore = {
+    async read(options) {
+      readOptions.push(options);
+      reads++;
+      if (reads === 2) await new Promise(resolve => setTimeout(resolve, 80));
+      await options?.beforeDispatch?.();
+      return { state: structuredClone(state), etag: '"1"' };
+    },
+    async write(state, etag, options) {
+      await options?.beforeDispatch?.();
+      writes++;
+      return f.store.write(state, etag);
+    },
+  };
+  await assert.rejects(campaignMain(['publish-inventory', ...selected.args], {
+    store, azure: f.azure, env: {}, runInventoryInput: f.inventory,
+    runInventoryWriteOptions: { deadlineUnixMs: deadline,
+      beforeDispatch: async () => {
+        if (Date.now() >= deadline) throw new Error('Original terminal deadline expired before inventory dispatch.');
+      } },
+  }), error => error instanceof CampaignWriteOutcomeUnknownError);
+  assert.equal(writes, 0);
+  assert.equal(reads, 3);
+  assert.equal(readOptions[2]?.deadlineUnixMs, deadline);
+});
+
 test('stock authorization and ready boundaries refuse missing baseline without advancing admission', async t => {
   const selected = selectedConfig(t), f = await fixture(t, false, selected.config);
   f.inventory.load_admission = 'authorization_pending';

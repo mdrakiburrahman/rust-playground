@@ -4,9 +4,10 @@ import path from 'node:path';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { TextDecoder } from 'node:util';
 import { Azure, type ProcessResult } from '../../infra/azure/bootstrap.js';
-import { dispatchExternalEffect, EffectBoundaryRefused, processEffectRequest,
-  type EffectEnvelope, type ExternalEffect, isEffectBoundaryActive } from '../../infra/azure/effect-boundary.js';
-import { campaignMain, validateInitialRunInventory, type CampaignStore, type RunInventory } from './aks-campaign.js';
+import { dispatchExternalEffect, EffectBoundaryRefused, effectAllocationFingerprint, processEffectRequest,
+  type EffectEnvelope, type ExternalEffect, isEffectBoundaryActiveFor } from '../../infra/azure/effect-boundary.js';
+import { assertCampaignCustodyState, campaignMain, validateInitialRunInventory, type CampaignStore,
+  type CampaignStoreOperationOptions, type RunInventory } from './aks-campaign.js';
 
 const MAX_FRAME = 4 * 1024 * 1024;
 const MAX_OUTPUT = 1024 * 1024;
@@ -41,7 +42,8 @@ export type StorageBridgeReply =
       outcome: 'definitely_not_sent' | 'unknown'; error_code: 'admission_refused' | 'deadline_exceeded' | 'invalid_request' |
         'protocol' | 'response_lost' | 'transport_unavailable' };
 export interface StorageDispatcherOptions { authority: StorageBridgeAuthority; originalDeadlineUnixMs: number;
-  envelope: EffectEnvelope; azure: Azure; ledgerPath: string; fetcher?: typeof fetch; now?: () => number }
+  envelope: EffectEnvelope; azure: Azure; store: CampaignStore; ledgerPath: string; phase?: string; planIdentity?: unknown;
+  fetcher?: typeof fetch; now?: () => number }
 
 function object(value: unknown): value is Obj { return value !== null && typeof value === 'object' && !Array.isArray(value); }
 function exact(value: Obj, keys: string[]): boolean { return Object.keys(value).sort().join(',') === keys.slice().sort().join(','); }
@@ -156,6 +158,8 @@ function storageAuthority(value: unknown): asserts value is StorageBridgeAuthori
       control.pathname.split('/').filter(Boolean).length !== 1 || control.href !== value.control_container_url)
     throw new Error('Storage authority must bind canonical one-table and one-container URLs.');
 }
+interface LedgerBinding { schema_version: 1; kind: 'binding'; scope: string; authority_sha256: string;
+  original_deadline_unix_ms: number; phase: string; plan_sha256: string; allocation_sha256: string }
 interface LedgerRecord { schema_version: 1; scope: string; authority_sha256: string; request_id: number;
   request_sha256: string; state: 'pending' | 'response'; response?: unknown; response_sha256?: string }
 class DurableBridgeLedger {
@@ -163,8 +167,8 @@ class DurableBridgeLedger {
   private maxId = 0;
   private readonly scope: string;
   private readonly authorityHash: string;
-  constructor(private readonly filename: string, scope: string, authority: unknown) {
-    this.scope = scope; this.authorityHash = sha(canonical(authority));
+  constructor(private readonly filename: string, binding: LedgerBinding) {
+    this.scope = binding.scope; this.authorityHash = binding.authority_sha256;
     const directory = path.dirname(path.resolve(filename)); fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
     const dir = fs.lstatSync(directory);
     if (!dir.isDirectory() || dir.isSymbolicLink() || (dir.mode & 0o077) !== 0) throw new Error('Bridge ledger directory must be private and non-symlink.');
@@ -173,7 +177,15 @@ class DurableBridgeLedger {
     if (!stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0) throw new Error('Bridge ledger must be a private regular file.');
     const bytes = fs.readFileSync(filename, 'utf8');
     if (bytes && !bytes.endsWith('\n')) throw new Error('Bridge ledger ends with an incomplete record; outcome is unknown.');
-    for (const line of bytes.split('\n').filter(Boolean)) this.load(JSON.parse(line) as unknown);
+    const lines = bytes.split('\n').filter(Boolean);
+    if (lines.length === 0) this.append(binding);
+    else {
+      const persisted = JSON.parse(lines[0]!) as unknown;
+      if (!object(persisted) || !exact(persisted, ['schema_version','kind','scope','authority_sha256','original_deadline_unix_ms',
+          'phase','plan_sha256','allocation_sha256']) || !equal(persisted, binding))
+        throw new Error('Bridge ledger immutable deadline, phase, plan or allocation identity changed after restart.');
+      for (const line of lines.slice(1)) this.load(JSON.parse(line) as unknown);
+    }
   }
   private load(value: unknown): void {
     const keys = ['schema_version', 'scope', 'authority_sha256', 'request_id', 'request_sha256', 'state'];
@@ -190,7 +202,7 @@ class DurableBridgeLedger {
         sha(canonical(value.response)) !== value.response_sha256) throw new Error('Bridge ledger response transition is invalid.');
     this.records.set(id, value as unknown as LedgerRecord);
   }
-  private append(record: LedgerRecord): void {
+  private append(record: LedgerBinding | LedgerRecord): void {
     const data = Buffer.from(canonical(record) + '\n'), fd = fs.openSync(this.filename,
       fs.constants.O_WRONLY | fs.constants.O_APPEND | (fs.constants.O_NOFOLLOW ?? 0));
     try { let offset = 0; while (offset < data.length) { const n = fs.writeSync(fd, data, offset, data.length - offset);
@@ -215,7 +227,59 @@ class DurableBridgeLedger {
     const record: LedgerRecord = { ...prior, state: 'response', response, response_sha256: sha(canonical(response)) };
     this.append(record); this.records.set(id, record);
   }
-}function fixtureEffect(request: FixtureCommandRequest): ExternalEffect {
+}
+function ledgerBinding(scope: string, authority: unknown, deadline: number, phase: string, plan: unknown,
+  envelope: EffectEnvelope): LedgerBinding {
+  integer(deadline, 1, Number.MAX_SAFE_INTEGER, 'original deadline');
+  if (!/^[a-z0-9][a-z0-9._-]{0,63}$/.test(phase)) throw new Error('Bridge phase identity is invalid.');
+  return { schema_version: 1, kind: 'binding', scope, authority_sha256: sha(canonical(authority)),
+    original_deadline_unix_ms: deadline, phase, plan_sha256: sha(canonical(plan)),
+    allocation_sha256: effectAllocationFingerprint(envelope) };
+}
+function assertBridgeLive(envelope: EffectEnvelope, deadline: number, now: () => number): void {
+  if (!isEffectBoundaryActiveFor(envelope)) throw new Error('Bridge dispatch requires its exact active effect allocation.');
+  if (now() >= deadline) throw new Error('Bridge original deadline expired.');
+}
+async function withinBridgeDeadline<T>(promise: Promise<T>, deadline: number, now: () => number, label: string): Promise<T> {
+  const remaining = deadline - now();
+  if (remaining <= 0) throw new Error(`${label} exceeded the original deadline.`);
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([promise, new Promise<T>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`${label} exceeded the original deadline.`)), remaining);
+    })]);
+  } finally { if (timer) clearTimeout(timer); }
+}
+function boundedCampaignStore(base: CampaignStore, identity: { campaign_id: string; cell_run_id: string; owner_id: string;
+  fencing_token: number }, deadline: number, envelope: EffectEnvelope, now: () => number,
+  allowUnpublishedRun: boolean): CampaignStore {
+  const operationOptions = (beforeDispatch?: () => Promise<void>): CampaignStoreOperationOptions => ({
+    deadlineUnixMs: deadline,
+    beforeDispatch: async () => { assertBridgeLive(envelope, deadline, now); await beforeDispatch?.(); },
+  });
+  const read = async () => {
+    assertBridgeLive(envelope, deadline, now);
+    const stored = await withinBridgeDeadline(base.read(operationOptions()), deadline, now, 'Campaign store read');
+    assertBridgeLive(envelope, deadline, now);
+    return assertCampaignCustodyState(stored, { campaignId: identity.campaign_id, cellRunId: identity.cell_run_id,
+      ownerId: identity.owner_id, fencingToken: identity.fencing_token }, now(), allowUnpublishedRun);
+  };
+  const beforeMutation = async () => { await read(); assertBridgeLive(envelope, deadline, now); };
+  return {
+    read,
+    async write(state, expectedEtag, callOptions) {
+      assertBridgeLive(envelope, deadline, now);
+      const write = base.write(state, expectedEtag, operationOptions(async () => {
+        await callOptions?.beforeDispatch?.();
+        await beforeMutation();
+      }));
+      const etag = await withinBridgeDeadline(write, deadline, now, 'Campaign store write');
+      assertBridgeLive(envelope, deadline, now);
+      return etag;
+    },
+  };
+}
+function fixtureEffect(request: FixtureCommandRequest): ExternalEffect {
   const base = processEffectRequest([request.executable, ...request.argv]);
   return request.stdin === null ? base : { ...base, body: Buffer.from(request.stdin, 'utf8') };
 }
@@ -338,12 +402,13 @@ async function runProcess(command: string[], stdin: Buffer | undefined, timeoutM
     if (stdin) { child.stdin!.on('error', error => { if ((error as NodeJS.ErrnoException).code !== 'EPIPE') kill('Bridge process stdin failed; outcome is unknown.'); }); child.stdin!.end(stdin); }
   });
 }
-async function callCampaignMain(options: FixtureDispatcherOptions, request: FixtureCommandRequest): Promise<ProcessResult> {
+async function callCampaignMain(options: FixtureDispatcherOptions, request: FixtureCommandRequest, store: CampaignStore): Promise<ProcessResult> {
   const input = await readJsonObject(request.stdin!, 'RunInventory stdin');
   const args = request.argv.slice(3);
   const logs: string[] = [], original = console.log;
   console.log = (...values: unknown[]) => { logs.push(values.map(value => typeof value === 'string' ? value : String(value)).join(' ')); };
-  try { await (options.campaignMain ?? campaignMain)(args, { store: options.store, azure: options.azure, env: options.env, runInventoryInput: input }); }
+  try { await (options.campaignMain ?? campaignMain)(args, { store, azure: options.azure, env: options.env, runInventoryInput: input,
+    runInventoryWriteOptions: { deadlineUnixMs: options.input.original_deadline_unix_ms } }); }
   finally { console.log = original; }
   const stdout = logs.length ? logs.join('\n') + '\n' : '';
   if (Buffer.byteLength(stdout) > MAX_OUTPUT) throw new Error('Campaign publisher output exceeded the fixture response bound.');
@@ -352,43 +417,52 @@ async function callCampaignMain(options: FixtureDispatcherOptions, request: Fixt
 export class FixtureCommandDispatcher {
   private readonly now: () => number;
   private readonly ledger: DurableBridgeLedger;
+  private readonly envelope: EffectEnvelope;
+  private readonly campaignStore: CampaignStore;
   private readonly seen = new Map<number, FixtureCommandRequest>();
   private readonly responses = new Map<number, FixtureCommandResponse>();
   constructor(private readonly options: FixtureDispatcherOptions) {
     this.now = options.now ?? Date.now; validateFixtureInput(options.input, this.now());
-    if (options.envelope.campaign_id !== options.input.authority.campaign_id || options.envelope.run_id !== options.input.authority.cell_run_id ||
+    this.envelope = structuredClone(options.envelope);
+    if (this.envelope.campaign_id !== options.input.authority.campaign_id || this.envelope.run_id !== options.input.authority.cell_run_id ||
         options.env.CAMPAIGN_ID !== options.input.authority.campaign_id || options.env.CAMPAIGN_OWNER_ID !== options.input.authority.owner_id ||
         options.env.CAMPAIGN_FENCING_TOKEN !== String(options.input.authority.fencing_token))
       throw new Error('Fixture setup does not match the selected campaign/effect authority.');
-    this.ledger = new DurableBridgeLedger(options.ledgerPath, 'fixture-command', options.input.authority);
+    this.ledger = new DurableBridgeLedger(options.ledgerPath, ledgerBinding('fixture-command', options.input.authority,
+      options.input.original_deadline_unix_ms, 'fixture-setup', options.input, this.envelope));
+    this.campaignStore = boundedCampaignStore(options.store, options.input.authority, options.input.original_deadline_unix_ms,
+      this.envelope, this.now, true);
   }
   async exchange(value: unknown): Promise<FixtureCommandResponse> {
     const request = fixtureRequest(value, this.options.input.authority, this.options.input.original_deadline_unix_ms, this.now());
     const kind = assertFixtureCommand(request, this.options.input), effect = fixtureEffect(request);
-    assertAllocated(this.options.envelope, effect); this.seen.set(request.request_id, request);
-    if (!isEffectBoundaryActive() || this.now() >= request.original_deadline_unix_ms)
-      throw new Error('Fixture forward requires the original active boundary and unexpired deadline.');
+    assertAllocated(this.envelope, effect); this.seen.set(request.request_id, request);
+    assertBridgeLive(this.envelope, request.original_deadline_unix_ms, this.now);
+    await this.campaignStore.read();
     const cached = this.ledger.begin(request.request_id, request.request_sha256);
     if (cached !== undefined) { this.responses.set(request.request_id, cached as FixtureCommandResponse); return cached as FixtureCommandResponse; }
     let result: ProcessResult;
-    if (kind === 'campaign') result = await dispatchExternalEffect(effect, () => {
-      if (!isEffectBoundaryActive() || this.now() >= request.original_deadline_unix_ms)
-        throw new Error('Fixture original authority/deadline expired before campaign transport.');
-      return callCampaignMain(this.options, request);
+    if (kind === 'campaign') result = await dispatchExternalEffect(effect, async () => {
+      assertBridgeLive(this.envelope, request.original_deadline_unix_ms, this.now);
+      await this.campaignStore.read();
+      assertBridgeLive(this.envelope, request.original_deadline_unix_ms, this.now);
+      return callCampaignMain(this.options, request, this.campaignStore);
     });
-    else result = await dispatchExternalEffect(effect, () => {
-      if (!isEffectBoundaryActive() || this.now() >= request.original_deadline_unix_ms)
-        throw new Error('Fixture original authority/deadline expired before command transport.');
+    else result = await dispatchExternalEffect(effect, async () => {
+      assertBridgeLive(this.envelope, request.original_deadline_unix_ms, this.now);
+      await this.campaignStore.read();
+      assertBridgeLive(this.envelope, request.original_deadline_unix_ms, this.now);
       return (this.options.runCommand ?? runProcess)([request.executable, ...request.argv],
         request.stdin === null ? undefined : Buffer.from(request.stdin),
         Math.min(request.remaining_timeout_ms, request.original_deadline_unix_ms - this.now()),
         request.current_dir ?? this.options.rootDirectory);
     });
+    assertBridgeLive(this.envelope, request.original_deadline_unix_ms, this.now);
     if (!Number.isSafeInteger(result.returncode) || result.stdout.length > MAX_OUTPUT || result.stderr.length > MAX_OUTPUT)
       throw new Error('Fixture command result is invalid or oversized; outcome is not reusable.');
     if (kind === 'campaign') {
       const inventory = JSON.parse(request.stdin!) as RunInventory; publishReceipt(result.stdout, inventory);
-      const stored = await this.options.store.read();
+      const stored = await this.campaignStore.read();
       if (!stored || !equal(stored.state.runInventory, inventory)) throw new Error('Campaign store readback does not match the actual published inventory.');
     }
     const response: FixtureCommandResponse = { schema_version: 1, kind: 'command_response', request_id: request.request_id,
@@ -433,7 +507,8 @@ export class FixtureCommandDispatcher {
         throw new Error('Fixture resource identity is not derived from a unique actual create response.');
       seenUids.add(resource.uid);
     }
-    const stored = await this.options.store.read();
+    assertBridgeLive(this.envelope, this.options.input.original_deadline_unix_ms, this.now);
+    const stored = await this.campaignStore.read();
     if (!stored || !equal(stored.state.runInventory, receipt.inventory)) throw new Error('Fixture final inventory differs from the durable campaign store.');
     return receipt;
   }
@@ -518,26 +593,33 @@ async function readBody(response: Response, maxBytes: number): Promise<Buffer> {
 export class StorageBridgeDispatcher {
   private readonly now: () => number;
   private readonly ledger: DurableBridgeLedger;
+  private readonly envelope: EffectEnvelope;
+  private readonly campaignStore: CampaignStore;
   constructor(private readonly options: StorageDispatcherOptions) {
     this.now = options.now ?? Date.now; storageAuthority(options.authority);
+    this.envelope = structuredClone(options.envelope);
     if (options.azure.c.account !== options.authority.storage_account || options.envelope.campaign_id !== options.authority.campaign_id ||
         options.envelope.run_id !== options.authority.cell_run_id) throw new Error('Storage bridge does not match the selected stamp/effect envelope.');
-    this.ledger = new DurableBridgeLedger(options.ledgerPath, 'storage-http', options.authority);
+    this.ledger = new DurableBridgeLedger(options.ledgerPath, ledgerBinding('storage-http', options.authority,
+      options.originalDeadlineUnixMs, options.phase ?? 'storage-http', options.planIdentity ?? options.authority, this.envelope));
+    this.campaignStore = boundedCampaignStore(options.store, { campaign_id: options.authority.campaign_id,
+      cell_run_id: options.authority.cell_run_id, owner_id: options.authority.owner_id,
+      fencing_token: options.authority.fencing_token }, options.originalDeadlineUnixMs, this.envelope, this.now, false);
   }
   async exchange(value: unknown): Promise<StorageBridgeReply> {
     const request = storageRequest(value, this.options.authority, this.options.originalDeadlineUnixMs, this.now());
     const effect = storageEffect(request);
-    if (!isEffectBoundaryActive() || this.now() >= this.options.originalDeadlineUnixMs)
-      throw new Error('Storage forward requires the original active boundary and unexpired deadline.');
+    assertBridgeLive(this.envelope, this.options.originalDeadlineUnixMs, this.now);
+    await this.campaignStore.read();
     const cached = this.ledger.begin(request.request_id, request.request_sha256);
     if (cached !== undefined) return cached as StorageBridgeReply;
     let reply: StorageBridgeReply;
     try {
       const response = await dispatchExternalEffect(effect, async () => {
-        if (!isEffectBoundaryActive() || this.now() >= this.options.originalDeadlineUnixMs)
-          throw new Error('Storage original authority/deadline expired before transport.');
+        assertBridgeLive(this.envelope, this.options.originalDeadlineUnixMs, this.now);
         const token = await this.options.azure.token(STORAGE_RESOURCE);
-        if (this.now() >= this.options.originalDeadlineUnixMs) throw new Error('Storage original deadline expired before transport.');
+        await this.campaignStore.read();
+        assertBridgeLive(this.envelope, this.options.originalDeadlineUnixMs, this.now);
         const headers = Object.fromEntries(request.headers);
         headers.Authorization = `Bearer ${token}`;
         if (!Object.keys(headers).some(name => name.toLowerCase() === 'x-ms-date')) headers['x-ms-date'] = new Date(this.now()).toUTCString();
@@ -545,6 +627,7 @@ export class StorageBridgeDispatcher {
         const received = await (this.options.fetcher ?? fetch)(request.url, { method: request.method, headers, body: request.body || undefined,
           redirect: 'error', signal: AbortSignal.timeout(timeout) });
         const bytes = await readBody(received, MAX_STORAGE_BODY), text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+        assertBridgeLive(this.envelope, this.options.originalDeadlineUnixMs, this.now);
         const allowed = [...received.headers.entries()].filter(([name]) => storageHeaderAllowed(name.toLowerCase(), true));
         return { status: received.status, headers: allowed, body: text };
       });
@@ -595,7 +678,7 @@ async function runBridgeChild(executable: string, args: string[], cwd: string, d
   requestKind: string, finalKind: string, exchange: (request: unknown) => Promise<unknown>): Promise<unknown> {
   if (!path.isAbsolute(executable) || !path.isAbsolute(cwd) || Date.now() >= deadline) throw new Error('Bridge child path or original deadline is invalid.');
   const child = spawn(executable, args, { cwd, env: bridgeChildEnvironment(), detached: true, stdio: ['pipe','pipe','pipe'] });
-  let stderr = Buffer.alloc(0), final: unknown, finalSeen = false, failure: Error | undefined;
+  let stderr = Buffer.alloc(0), final: unknown, finalSeen = false, failure: Error | undefined, exchangeCount = 0;
   const kill = () => { if (!child.pid) return; try { process.kill(-child.pid, 'SIGKILL'); } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ESRCH') failure = new Error('Bridge child could not be stopped; effect outcome is unknown.'); } };
   child.stderr!.on('data', chunk => { const next = Buffer.concat([stderr, Buffer.from(chunk)]);
@@ -610,13 +693,14 @@ async function runBridgeChild(executable: string, args: string[], cwd: string, d
       let value: unknown; try { value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)) as unknown; }
       catch { throw new Error('Bridge child emitted a malformed/non-UTF8 frame.'); }
       if (!object(value) || typeof value.kind !== 'string') throw new Error('Bridge child frame has no typed kind.');
-      if (value.kind === requestKind) await writeFrame(child, await exchange(value));
+      if (value.kind === requestKind) { await writeFrame(child, await exchange(value)); exchangeCount++; }
       else if (value.kind === finalKind) { final = value; finalSeen = true; child.stdin!.end(); }
       else throw new Error('Bridge child emitted an unexpected frame kind.');
     }
     const result = await closed;
     if (failure) throw failure;
     if (result.code !== 0 || !finalSeen) throw new Error('Bridge child failed or omitted its final actual receipt; no fallback is permitted.');
+    if (exchangeCount === 0) throw new Error('Bridge child emitted a final receipt without any actual bridge exchange.');
     return final;
   } catch (error) { kill(); await closed.catch(() => undefined); throw error; }
   finally { clearTimeout(timeout); }
@@ -636,49 +720,6 @@ export interface OwnedRunTableBridgeReceipt { schema_version: 1; kind: 'owned_ru
   original_deadline_unix_ms: number; receipt: OwnedRunTableReceipt }
 export interface OwnedRunInitializerOptions extends Omit<StorageDispatcherOptions, 'authority' | 'originalDeadlineUnixMs' | 'ledgerPath'> {
   executable: string; planPath: string; bridgeInputPath: string; ledgerPath: string; rootDirectory: string; now?: () => number }
-function validateOwnedPlan(value: unknown, options: OwnedRunInitializerOptions, authority: StorageBridgeAuthority, deadline: number): OwnedRunTablePlan {
-  const keys = ['account','container','campaign_root','run_root','campaign_id','run_id','generation','table','partition_by_ingestion_date','owner_id','fencing_token'];
-  if (!object(value) || !exact(value, keys) || typeof value.account !== 'string' || typeof value.container !== 'string' ||
-      typeof value.campaign_root !== 'string' || typeof value.run_root !== 'string' || typeof value.generation !== 'string' ||
-      value.table !== 'telemetry.sqlserver.sqlserver_availability_replica_states' || value.partition_by_ingestion_date !== true)
-    throw new Error('Owned-run table plan is malformed or selects another table.');
-  uuid(value.campaign_id, 'campaign'); uuid(value.run_id, 'run'); uuid(value.owner_id, 'owner'); uuid(value.generation, 'generation');
-  integer(value.fencing_token, 1, Number.MAX_SAFE_INTEGER, 'fencing token');
-  const plan = value as unknown as OwnedRunTablePlan;
-  const expectedCampaign = `abfss://${plan.container}@${plan.account}.dfs.core.windows.net/campaigns/${plan.campaign_id}/`;
-  const expectedRun = `${expectedCampaign}runs/${plan.run_id}/`;
-  const root = new URL(plan.run_root), expectedTable = new URL('dataflow/telemetry/sqlserver/sqlserver_availability_replica_states/', root).href;
-  const expectedControl = `https://${options.azure.c.account}.blob.core.windows.net/${options.azure.c.checkpoints}`;
-  if (plan.account !== options.azure.c.account || plan.campaign_root !== expectedCampaign || plan.run_root !== expectedRun ||
-      root.href !== plan.run_root || authority.campaign_id !== plan.campaign_id || authority.cell_run_id !== plan.run_id ||
-      authority.owner_id !== plan.owner_id || authority.fencing_token !== plan.fencing_token || authority.storage_account !== plan.account ||
-      authority.reset_generation !== plan.generation || authority.table_root_url !== expectedTable || authority.control_container_url !== expectedControl ||
-      authority.sandbox_id !== options.azure.c.sandbox || options.envelope.campaign_id !== plan.campaign_id || options.envelope.run_id !== plan.run_id ||
-      options.envelope.storage_account !== options.azure.c.account || options.envelope.state_container !== options.azure.c.checkpoints || Date.now() >= deadline)
-    throw new Error('Owned-run plan, exact table root, selected stamp or original authority/deadline differs.');
-  return plan;
-}
-export async function initializeOwnedRunTable(options: OwnedRunInitializerOptions): Promise<OwnedRunTableBridgeReceipt> {
-  const now = options.now ?? Date.now, sidecar = privateJson(options.bridgeInputPath, 64 * 1024), plan = privateJson(options.planPath, 64 * 1024);
-  if (!path.isAbsolute(options.planPath) || !path.isAbsolute(options.bridgeInputPath) || !object(sidecar) ||
-      !exact(sidecar, ['authority','original_deadline_unix_ms'])) throw new Error('Owned-run bridge sidecar is malformed.');
-  storageAuthority(sidecar.authority); integer(sidecar.original_deadline_unix_ms, 1, Number.MAX_SAFE_INTEGER, 'deadline');
-  checkDeadline(sidecar.original_deadline_unix_ms, sidecar.original_deadline_unix_ms - now(), now(), 600_000);
-  const typedPlan = validateOwnedPlan(plan, options, sidecar.authority, sidecar.original_deadline_unix_ms);
-  const dispatcher = new StorageBridgeDispatcher({ authority: sidecar.authority, originalDeadlineUnixMs: sidecar.original_deadline_unix_ms,
-    envelope: options.envelope, azure: options.azure, ledgerPath: options.ledgerPath, fetcher: options.fetcher, now });
-  const final = await runBridgeChild(options.executable, ['initialize-owned-run-table','--plan',options.planPath,
-    '--storage-bridge-input',options.bridgeInputPath,'--storage-bridge-stdio'], options.rootDirectory,
-    sidecar.original_deadline_unix_ms, 'storage_http_request', 'owned_run_table_receipt', value => dispatcher.exchange(value));
-  if (!object(final) || !exact(final, ['schema_version','kind','authority','original_deadline_unix_ms','receipt']) ||
-      final.schema_version !== 1 || final.kind !== 'owned_run_table_receipt' || !equal(final.authority, sidecar.authority) ||
-      final.original_deadline_unix_ms !== sidecar.original_deadline_unix_ms || !object(final.receipt) ||
-      !exact(final.receipt, ['allocation','delta','publisher_drained']) || final.receipt.publisher_drained !== true ||
-      !equal(final.receipt.allocation, typedPlan) || !object(final.receipt.delta) ||
-      !exact(final.receipt.delta, ['table_id','version','schema_json','partition_columns','active_files']) ||
-      typeof final.receipt.delta.table_id !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(final.receipt.delta.table_id) ||
-      final.receipt.delta.version !== 0 || final.receipt.delta.active_files !== 0 || typeof final.receipt.delta.schema_json !== 'string' ||
-      !Array.isArray(final.receipt.delta.partition_columns) || !equal(final.receipt.delta.partition_columns, ['ingestion_date']))
-    throw new Error('Owned-run child omitted a genuine fresh version-0 table/readback/drain receipt.');
-  return final as unknown as OwnedRunTableBridgeReceipt;
+export async function initializeOwnedRunTable(_options: OwnedRunInitializerOptions): Promise<OwnedRunTableBridgeReceipt> {
+  throw new Error('D47 HOLD: the reviewed, integrated production initializer adapter is not available; no child receipt is accepted.');
 }
