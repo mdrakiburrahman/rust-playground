@@ -3522,7 +3522,7 @@ mod tests {
                 .await
         });
 
-        for workers in [1, 2, 4, 8] {
+        for workers in [1, 2, 4, 8, 16, 32] {
             let mut options = options()?;
             options.data_profile = DataProfile::Realistic;
             options.workers = workers;
