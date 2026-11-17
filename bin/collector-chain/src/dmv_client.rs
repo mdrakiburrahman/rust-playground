@@ -2329,12 +2329,14 @@ mod tests {
             Arc::clone(&store),
             Arc::new(AllowAllAuthenticator::new(auth)),
             Arc::new(SmokeAdmission(Arc::clone(&state))),
-            RuntimeLimits::default(),
+            RuntimeLimits {
+                grpc_accept_compression: Some(tonic::codec::CompressionEncoding::Gzip),
+                grpc_send_compression: Some(tonic::codec::CompressionEncoding::Gzip),
+                ..RuntimeLimits::default()
+            },
         )?
         .with_ddl_handler(Arc::new(CatalogControlPlane::new(DdlParser::default(), store)))
-        .into_tonic_service()
-        .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
-        .send_compressed(tonic::codec::CompressionEncoding::Gzip);
+        .into_tonic_service();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let endpoint = format!("http://{}", listener.local_addr()?);
         let incoming = stream::unfold(listener, |listener| async {
