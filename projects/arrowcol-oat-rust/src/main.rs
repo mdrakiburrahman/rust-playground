@@ -1,12 +1,15 @@
 use anyhow::{Context, Result, ensure};
 use arrowcol_oat_rust::config::{OatConfig, OatMode};
 use arrowcol_oat_rust::model::{AppState, CancelRunError, RunState, RunStatus, unix_time_ms};
-use axum::extract::{Path, State};
+use axum::extract::{FromRequest, Path, Request, State};
 use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use clap::Parser;
+use futures_util::TryStreamExt;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -90,8 +93,23 @@ async fn health() -> Json<Health> {
 
 async fn start_run(
     State(state): State<Arc<AppState>>,
-    Json(config): Json<OatConfig>,
-) -> Result<(StatusCode, Json<RunStatus>), (StatusCode, Json<ApiError>)> {
+    request: Request,
+) -> Result<(StatusCode, Json<RunStatus>), Response> {
+    let hasher = Arc::new(tokio::sync::Mutex::new(Sha256::new()));
+    let body_hasher = Arc::clone(&hasher);
+    let request = request.map(|body| {
+        axum::body::Body::from_stream(body.into_data_stream().and_then(move |chunk| {
+            let body_hasher = Arc::clone(&body_hasher);
+            async move {
+                body_hasher.lock().await.update(&chunk);
+                Ok(chunk)
+            }
+        }))
+    });
+    let Json(config) = Json::<OatConfig>::from_request(request, &state)
+        .await
+        .map_err(IntoResponse::into_response)?;
+    let config_sha256 = format!("{:x}", hasher.lock().await.clone().finalize());
     config.validate().map_err(|error| {
         (
             StatusCode::BAD_REQUEST,
@@ -99,6 +117,7 @@ async fn start_run(
                 error: format!("{error:#}"),
             }),
         )
+            .into_response()
     })?;
     let permit = state.try_start_run().ok_or_else(|| {
         (
@@ -107,10 +126,12 @@ async fn start_run(
                 error: "an OAT run is already active".to_owned(),
             }),
         )
+            .into_response()
     })?;
     let id = uuid::Uuid::new_v4().to_string();
     let status = RunStatus {
         id: id.clone(),
+        config_sha256,
         state: RunState::Queued,
         progress: "queued".to_owned(),
         result_count: 0,
@@ -198,4 +219,65 @@ async fn get_run(
             }),
         )
     })
+}
+
+#[cfg(test)]
+mod config_hash_tests {
+    use super::*;
+    use axum::body::{Body, to_bytes};
+    use sha2::{Digest, Sha256};
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn post_and_get_attest_raw_bytes_before_the_runner_is_scheduled() {
+        let raw = include_bytes!("../../../docs/experiments/arrowcol-oat/oat-config.quick.json");
+        let expected = format!("{:x}", Sha256::digest(raw));
+        let state = Arc::new(AppState::default());
+        let request = Request::builder()
+            .header("content-type", "application/json")
+            .body(Body::from(raw.as_slice()))
+            .unwrap();
+        // All awaits are immediately ready on this thread; the spawned workload is never polled.
+        let (code, Json(status)) = start_run(State(Arc::clone(&state)), request).await.unwrap();
+        assert_eq!(code, StatusCode::ACCEPTED);
+        assert_eq!(status.config_sha256, expected);
+        let Json(observed) = get_run(State(state), Path(status.id.clone()))
+            .await
+            .unwrap_or_else(|_| panic!("missing accepted run"));
+        assert_eq!(observed.id, status.id);
+        assert_eq!(observed.config_sha256, expected);
+        let parsed: serde_json::Value = serde_json::from_slice(raw).unwrap();
+        assert_ne!(
+            expected,
+            format!("{:x}", Sha256::digest(serde_json::to_vec(&parsed).unwrap()))
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_capture_preserves_json_extractor_rejections() {
+        for (content_type, body) in [
+            ("text/plain", "{}".to_owned()),
+            ("application/json", "{".to_owned()),
+            ("application/json", r#"{"platform":42}"#.to_owned()),
+            ("application/json", " ".repeat(2 * 1024 * 1024 + 1)),
+        ] {
+            let request = || {
+                Request::builder()
+                    .header("content-type", content_type)
+                    .body(Body::from(body.clone()))
+                    .unwrap()
+            };
+            let state = Arc::new(AppState::default());
+            let expected = Json::<OatConfig>::from_request(request(), &state)
+                .await
+                .unwrap_err()
+                .into_response();
+            let actual = start_run(State(state), request()).await.unwrap_err();
+            assert_eq!(actual.status(), expected.status());
+            assert_eq!(actual.headers(), expected.headers());
+            assert_eq!(
+                to_bytes(actual.into_body(), usize::MAX).await.unwrap(),
+                to_bytes(expected.into_body(), usize::MAX).await.unwrap()
+            );
+        }
+    }
 }
