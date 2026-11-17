@@ -299,11 +299,15 @@ prefix. Initialization does not insert data or prove Azure/QAP readiness.
 
 ### Held single owned-run setup
 
-`arrowcol-loadgen initialize-owned-run-table --plan <private-plan.json>` validates
-the allocation, then **HOLDs before authentication or publisher admission** unless
-both `--storage-bridge-input <private-bridge.json>` and `--storage-bridge-stdio`
-are supplied. There is no direct-network fallback or bypass flag. This is not a
-replacement for `initialize-azure` and changes no defaults.
+First capture the immutable Delta body with
+`arrowcol-loadgen plan-owned-run-table --plan <preliminary-plan.json> --output <private-plan.json>`.
+This uses an isolated in-memory store only; it records the exact version-zero NDJSON
+bytes, SHA-256 and four generated values before the static effect envelope is built.
+Then `arrowcol-loadgen initialize-owned-run-table --plan <private-plan.json>` validates
+the completed allocation and **HOLDs before authentication or publisher admission**
+unless both `--storage-bridge-input <private-bridge.json>` and
+`--storage-bridge-stdio` are supplied. There is no direct-network fallback or bypass
+flag. This is not a replacement for `initialize-azure` and changes no defaults.
 
 | Plan binding | Required value |
 | --- | --- |
@@ -311,6 +315,7 @@ replacement for `initialize-azure` and changes no defaults.
 | `campaign_id`, `run_id`, `generation`, `owner_id` | Canonical lowercase UUIDs, retaining the captured generation and original publication owner |
 | `campaign_root`, `run_root` | Canonical URLs ending `/campaigns/<campaign_id>/` and `/campaigns/<campaign_id>/runs/<run_id>/` |
 | `table`, `partition_by_ingestion_date`, `fencing_token` | `telemetry.sqlserver.sqlserver_availability_replica_states`, `true`, original positive token |
+| `delta_v0` | Captured exact commit body, SHA-256, canonical UUIDv4 identities and nonnegative timestamps; required before effect-envelope creation |
 
 Explicit bridge mode requires owner-private regular JSON files. The strict bridge
 input contains `authority` (the existing `StorageBridgeAuthority`) and

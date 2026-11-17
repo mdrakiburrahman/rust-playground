@@ -99,7 +99,7 @@ fn authority(state: &str) -> BTreeMap<String, String> {
 }
 
 fn owned_plan() -> arrowcol_loadgen::initialize::OwnedRunTablePlan {
-    arrowcol_loadgen::initialize::OwnedRunTablePlan {
+    let plan = arrowcol_loadgen::initialize::OwnedRunTablePlan {
         account: ACCOUNT.into(),
         container: CONTAINER.into(),
         campaign_root: format!("abfss://tables@acct.dfs.core.windows.net/fixture/campaigns/{GENERATION}/"),
@@ -113,15 +113,29 @@ fn owned_plan() -> arrowcol_loadgen::initialize::OwnedRunTablePlan {
             "00000000-0000-4000-8000-000000000016".into(),
         ],
         control_operation_ids: [
-            "registration-read", "registration-acquire", "registration-compare-read", "registration-metadata-write",
-            "registration-release", "open-publisher-check", "commit-authority-read", "terminal-read",
-            "schema-commit-authority-read", "terminal-acquire", "terminal-compare-read", "terminal-metadata-write", "terminal-release",
-        ].map(str::to_owned).to_vec(),
+            "registration-read",
+            "registration-acquire",
+            "registration-compare-read",
+            "registration-metadata-write",
+            "registration-release",
+            "open-publisher-check",
+            "commit-authority-read",
+            "terminal-read",
+            "schema-commit-authority-read",
+            "terminal-acquire",
+            "terminal-compare-read",
+            "terminal-metadata-write",
+            "terminal-release",
+        ]
+        .map(str::to_owned)
+        .to_vec(),
         table: "telemetry.sqlserver.sqlserver_availability_replica_states".into(),
         partition_by_ingestion_date: true,
         owner_id: ROTATED.into(),
         fencing_token: 7,
-    }
+        delta_v0: None,
+    };
+    arrowcol_loadgen::initialize::capture_owned_run_table_plan(plan).expect("capture deterministic fresh Delta body")
 }
 
 fn owned_authority(

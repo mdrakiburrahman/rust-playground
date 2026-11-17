@@ -60,6 +60,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::InitializeAzure(arguments) => arrowcol_loadgen::initialize::initialize(arguments).await,
         Command::AzureManifest(arguments) => arrowcol_loadgen::initialize::write_manifest(arguments).await,
         Command::InitializeLocal(arguments) => arrowcol_loadgen::initialize::initialize_local(arguments),
+        Command::PlanOwnedRunTable(arguments) => arrowcol_loadgen::initialize::plan_owned_run_table(arguments),
         Command::InitializeOwnedRunTable(arguments) => {
             arrowcol_loadgen::initialize::initialize_owned_run_table(arguments).await
         }

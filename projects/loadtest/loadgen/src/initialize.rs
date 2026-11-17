@@ -1,12 +1,18 @@
 //! Fenced Azure table bootstrap using the same registry as the Flight fixtures.
 
-use std::{collections::BTreeSet, env, fs, io::Read, path::Path, sync::Arc};
+use std::{
+    collections::BTreeSet,
+    env, fs,
+    io::{Read, Write},
+    path::Path,
+    sync::Arc,
+};
 
 use anyhow::{Context, Result, bail};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow_deltalake::delta::{
-    DeltaTable, FreshTableReceipt, FreshTableTransport, INGESTION_PARTITION, PublicationFence, PublicationFenceContext,
-    PublicationFenceError,
+    DeltaTable, FreshTableCommitPlan, FreshTableReceipt, FreshTableTransport, INGESTION_PARTITION, PublicationFence,
+    PublicationFenceContext, PublicationFenceError,
 };
 use arrow_deltalake::publisher::{ControlMetadata, MutationRetries, PublisherSession, SessionMode, canonical_uuid};
 use arrow_deltalake::qap_http::{StorageBridge, StorageBridgeAuthority};
@@ -69,6 +75,9 @@ pub struct OwnedRunTablePlan {
     pub owner_id: String,
     /// Original campaign publication fencing token.
     pub fencing_token: u64,
+    /// Captured exact version-zero Delta log body, required before envelope creation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_v0: Option<FreshTableCommitPlan>,
 }
 
 impl OwnedRunTablePlan {
@@ -77,6 +86,14 @@ impl OwnedRunTablePlan {
     /// # Errors
     /// Rejects unowned/noncanonical roots, missing identity/generation/authority or another table.
     pub fn validate(&self) -> Result<()> {
+        self.validate_allocation()?;
+        self.delta_v0
+            .as_ref()
+            .context("owned-run plan must capture exact Delta version-zero bytes before envelope creation")?
+            .validate()
+    }
+
+    fn validate_allocation(&self) -> Result<()> {
         for value in [&self.campaign_id, &self.run_id, &self.generation, &self.owner_id] {
             canonical_uuid(value)?;
         }
@@ -91,7 +108,12 @@ impl OwnedRunTablePlan {
                 bail!("owned-run publisher and control lease identities must be distinct");
             }
         }
-        if self.control_operation_ids.iter().map(String::as_str).ne(PLANNED_CONTROL_OPERATION_IDS) {
+        if self
+            .control_operation_ids
+            .iter()
+            .map(String::as_str)
+            .ne(PLANNED_CONTROL_OPERATION_IDS)
+        {
             bail!("owned-run plan must allocate the exact ordered control-operation markers before envelope creation");
         }
         if self.fencing_token == 0
@@ -120,6 +142,15 @@ impl OwnedRunTablePlan {
 
     fn target(&self) -> Result<(Url, Arc<Schema>)> {
         self.validate()?;
+        self.target_unchecked()
+    }
+
+    fn target_for_capture(&self) -> Result<(Url, Arc<Schema>)> {
+        self.validate_allocation()?;
+        self.target_unchecked()
+    }
+
+    fn target_unchecked(&self) -> Result<(Url, Arc<Schema>)> {
         let statement = schema_statements()?
             .into_iter()
             .find(|statement| statement.identity.to_string() == self.table)
@@ -244,6 +275,40 @@ fn bridge_writer() -> Result<Box<dyn AsyncWrite + Unpin + Send>> {
     }
 }
 
+/// Produce an immutable plan containing the exact fresh Kernel version-zero body.
+/// This uses an isolated in-memory object store and never creates provider effects.
+pub fn capture_owned_run_table_plan(mut plan: OwnedRunTablePlan) -> Result<OwnedRunTablePlan> {
+    plan.validate_allocation()?;
+    if plan.delta_v0.is_some() {
+        bail!("plan capture input must not already contain a Delta version-zero body");
+    }
+    let (url, schema) = plan.target_for_capture()?;
+    plan.delta_v0 = Some(DeltaTable::capture_fresh_table_commit(
+        url,
+        schema,
+        vec![INGESTION.to_owned()],
+    )?);
+    plan.validate()?;
+    Ok(plan)
+}
+
+pub fn plan_owned_run_table(args: crate::cli::PlanOwnedRunTableArgs) -> Result<()> {
+    let plan: OwnedRunTablePlan = read_setup_input(&args.plan, false)?;
+    let plan = capture_owned_run_table_plan(plan)?;
+    let bytes = serde_json::to_vec(&plan)?;
+    let mut output_options = fs::OpenOptions::new();
+    output_options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        output_options.mode(0o600);
+    }
+    let mut output = output_options.open(args.output)?;
+    output.write_all(&bytes)?;
+    output.sync_all()?;
+    Ok(())
+}
+
 /// Initialize only through explicit, validated dedicated StorageBridge stdio.
 ///
 /// # Errors
@@ -346,9 +411,16 @@ where
     }
     let bridge = StorageBridge::new(input.authority.clone(), input.original_deadline_unix_ms, reader, writer)?;
     let publisher_id = canonical_uuid(&plan.publisher_id)?;
-    let control_lease_ids = [canonical_uuid(&plan.control_lease_ids[0])?, canonical_uuid(&plan.control_lease_ids[1])?];
+    let control_lease_ids = [
+        canonical_uuid(&plan.control_lease_ids[0])?,
+        canonical_uuid(&plan.control_lease_ids[1])?,
+    ];
     let session = PublisherSession::open_bridged_with_plan_async(
-        &url, bridge, publisher_id, control_lease_ids, plan.control_operation_ids.clone(),
+        &url,
+        bridge,
+        publisher_id,
+        control_lease_ids,
+        plan.control_operation_ids.clone(),
     )
     .await?;
     let data = session.store_for_url(&url).map(|store| FreshTableTransport {
@@ -409,16 +481,21 @@ async fn create_owned_run_table(
     fence: Arc<dyn PublicationFence>,
 ) -> Result<OwnedRunTableReceipt> {
     let owned_session = Arc::clone(&session);
+    let planned_commit = plan
+        .delta_v0
+        .clone()
+        .context("owned-run plan lost its captured Delta version-zero body")?;
     let creation = match data {
         Ok(data) => {
             tokio::task::spawn_blocking(move || {
-                DeltaTable::initialize_fresh_url_with_session(
+                DeltaTable::initialize_fresh_url_with_planned_session(
                     url,
                     schema,
                     vec![INGESTION.to_owned()],
                     owned_session,
                     fence,
                     data,
+                    planned_commit,
                 )
             })
             .await

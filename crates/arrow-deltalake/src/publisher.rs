@@ -341,6 +341,9 @@ pub trait ControlMetadata: Send + Sync + fmt::Debug {
     }
 
     /// Reject successful completion when a planned control operation was unused.
+    ///
+    /// # Errors
+    /// Returns an error when a planned control operation remains unused.
     fn verify_planned_control_operations(&self) -> Result<()> {
         Ok(())
     }
@@ -1006,6 +1009,9 @@ impl PublisherSession {
     }
 
     /// Register using identities fixed in the owned-run plan before its effect envelope is built.
+    ///
+    /// # Errors
+    /// Rejects invalid roots, authority, identities, or uncertain bridge exchanges.
     pub async fn open_bridged_with_plan_async(
         url: &Url,
         bridge: Arc<crate::qap_http::StorageBridge>,
@@ -1251,6 +1257,10 @@ impl PublisherSession {
             close: tokio::sync::Mutex::new(()),
         }))
     }
+    /// Verify that all planned control identities were consumed by a successful lifecycle.
+    ///
+    /// # Errors
+    /// Returns an error when planned control identities remain unused.
     pub fn verify_planned_control_identities(&self) -> Result<()> {
         if let Some(registration) = &self.registration {
             registration.control.verify_planned_control_operations()?;

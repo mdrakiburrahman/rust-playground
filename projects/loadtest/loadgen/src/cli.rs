@@ -35,6 +35,8 @@ pub enum Command {
     AzureManifest(InitializeAzureArgs),
     /// Create one fresh local ingestion-partitioned table without connecting to Flight or sending rows.
     InitializeLocal(InitializeLocalArgs),
+    /// Capture an owned-run plan's exact fresh Delta version-zero body without provider effects.
+    PlanOwnedRunTable(PlanOwnedRunTableArgs),
     /// Create one fresh owned-run table only through an explicitly supplied storage bridge.
     InitializeOwnedRunTable(InitializeOwnedRunTableArgs),
     /// Print the exact public Flight SQL schema fixture.
@@ -135,6 +137,17 @@ pub struct InitializeLocalArgs {
     /// Absolute, existing, writable run-owned local Dataflow root.
     #[arg(long, required = true)]
     pub dataflow_root: PathBuf,
+}
+
+/// Exact offline capture inputs for an owned-run immutable plan.
+#[derive(Clone, Debug, Args)]
+pub struct PlanOwnedRunTableArgs {
+    /// Strict preliminary plan without a `delta_v0` body.
+    #[arg(long, required = true)]
+    pub plan: PathBuf,
+    /// New output path for the completed immutable plan.
+    #[arg(long, required = true)]
+    pub output: PathBuf,
 }
 
 /// One fresh zero-row table; never the all-table bootstrap.

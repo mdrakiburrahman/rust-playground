@@ -779,7 +779,7 @@ export class StorageBridgeDispatcher {
       throw new Error('Owned-run initializer did not consume the exact planned control-operation trace through clean release.');
   }
   assertDeltaCommitReadback(delta: { table_id: string; version: number; schema_json: string;
-    partition_columns: string[]; active_files: number }): void {
+    partition_columns: string[]; active_files: number }, plan: Pick<OwnedRunTablePlan, 'delta_v0'>): void {
     const transcript = this.ledger.storageTranscript();
     const tableRoot = new URL(this.options.authority.table_root_url);
     const logUrl = `https://${this.options.authority.storage_account}.blob.core.windows.net/${tableRoot.username}${tableRoot.pathname}_delta_log/00000000000000000000.json`;
@@ -789,9 +789,13 @@ export class StorageBridgeDispatcher {
     const commit = commits[0]!;
     const commitReply = this.validateTranscriptResponse(commit);
     if (commitReply.status !== 201) throw new Error('Delta version-zero commit was not accepted by the forwarded provider response.');
+    if (commit.request.body !== plan.delta_v0.body || commit.request.body_sha256 !== plan.delta_v0.body_sha256 ||
+        sha(commit.request.body) !== plan.delta_v0.body_sha256)
+      throw new Error('Actual Delta version-zero commit differs from the exact plan-time body and SHA-256.');
     const actions = parseJsonValues(commit.request.body);
     const metadata = actions.filter((action): action is Obj => object(action) && object(action.metaData)).map(action => action.metaData as Obj);
-    if (metadata.length !== 1 || typeof metadata[0]!.id !== 'string' || typeof metadata[0]!.schemaString !== 'string' ||
+    const protocols = actions.filter((action): action is Obj => object(action) && object(action.protocol)).map(action => action.protocol as Obj);
+    if (metadata.length !== 1 || protocols.length !== 1 || typeof metadata[0]!.id !== 'string' || typeof metadata[0]!.schemaString !== 'string' ||
         !Array.isArray(metadata[0]!.partitionColumns))
       throw new Error('Actual Delta commit does not contain one complete table metadata action.');
     const committed = metadata[0]!;
@@ -1039,8 +1043,8 @@ export async function runFixtureSetupChild(executable: string, inputPath: string
 }
 interface OwnedRunTablePlan { account: string; container: string; campaign_root: string; run_root: string; campaign_id: string; run_id: string;
   generation: string; publisher_id: string; control_lease_ids: [string, string]; control_operation_ids: string[];
-  table: string; partition_by_ingestion_date: boolean;
-  owner_id: string; fencing_token: number }
+  table: string; partition_by_ingestion_date: boolean; owner_id: string; fencing_token: number;
+  delta_v0: { body: string; body_sha256: string; timestamp: number; txn_id: string; table_id: string; created_time: number } }
 export interface OwnedRunTableReceipt { allocation: OwnedRunTablePlan; delta: { table_id: string; version: number; schema_json: string;
   partition_columns: string[]; active_files: number }; publisher_drained: true }
 export interface OwnedRunTableBridgeReceipt { schema_version: 1; kind: 'owned_run_table_receipt'; authority: StorageBridgeAuthority;
@@ -1063,7 +1067,7 @@ export interface OwnedRunInitializerOptions extends Omit<StorageDispatcherOption
 }
 function validateOwnedRunTablePlan(value: unknown): asserts value is OwnedRunTablePlan {
   const keys = ['account','container','campaign_root','run_root','campaign_id','run_id','generation','publisher_id',
-    'control_lease_ids','control_operation_ids','table','partition_by_ingestion_date','owner_id','fencing_token'];
+    'control_lease_ids','control_operation_ids','table','partition_by_ingestion_date','owner_id','fencing_token','delta_v0'];
   if (!object(value) || !exact(value, keys) || typeof value.account !== 'string' || !/^[a-z0-9]{3,24}$/.test(value.account) ||
       typeof value.container !== 'string' || !/^[a-z0-9](?:[a-z0-9-]{1,61}[a-z0-9])?$/.test(value.container) ||
       typeof value.campaign_root !== 'string' || typeof value.run_root !== 'string' || typeof value.table !== 'string' ||
@@ -1080,6 +1084,37 @@ function validateOwnedRunTablePlan(value: unknown): asserts value is OwnedRunTab
       new Set(value.control_operation_ids).size !== PLANNED_CONTROL_OPERATION_IDS.length)
     throw new Error('Owned-run plan must allocate the exact unique ordered control-operation markers before envelope creation.');
   integer(value.fencing_token, 1, Number.MAX_SAFE_INTEGER, 'fencing token');
+  const delta = value.delta_v0;
+  if (!object(delta) || !exact(delta, ['body','body_sha256','timestamp','txn_id','table_id','created_time']) ||
+      typeof delta.body !== 'string' || Buffer.byteLength(delta.body, 'utf8') > 1024 * 1024 || !delta.body.endsWith('\n') ||
+      typeof delta.body_sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(delta.body_sha256) || sha(delta.body) !== delta.body_sha256 ||
+      !Number.isSafeInteger(delta.timestamp) || Number(delta.timestamp) < 0 || !Number.isSafeInteger(delta.created_time) || Number(delta.created_time) < 0)
+    throw new Error('Owned-run plan lacks a bounded exact Delta version-zero body and SHA-256.');
+  uuidV4(delta.txn_id, 'planned Delta txnId'); uuidV4(delta.table_id, 'planned Delta table ID');
+  if (delta.txn_id === delta.table_id) throw new Error('Planned Delta txnId and table ID must be distinct.');
+  const deltaActions = parseJsonValues(delta.body);
+  if (deltaActions.length !== 3 || !object(deltaActions[0]) || !exact(deltaActions[0], ['commitInfo']) ||
+      !object(deltaActions[1]) || !exact(deltaActions[1], ['protocol']) || !object(deltaActions[2]) || !exact(deltaActions[2], ['metaData']) ||
+      !object(deltaActions[0].commitInfo) || !exact(deltaActions[0].commitInfo,
+        ['engineInfo','kernelVersion','operation','operationParameters','timestamp','txnId']) ||
+      !object(deltaActions[1].protocol) || !exact(deltaActions[1].protocol,
+        ['minReaderVersion','minWriterVersion','readerFeatures','writerFeatures']) || !object(deltaActions[2].metaData) ||
+      !exact(deltaActions[2].metaData, ['configuration','createdTime','format','id','partitionColumns','schemaString']) ||
+      deltaActions[0].commitInfo.timestamp !== delta.timestamp || deltaActions[0].commitInfo.txnId !== delta.txn_id ||
+      deltaActions[2].metaData.id !== delta.table_id || deltaActions[2].metaData.createdTime !== delta.created_time ||
+      deltaActions[0].commitInfo.operation !== 'CREATE TABLE' || deltaActions[0].commitInfo.kernelVersion !== 'v0.29.0' ||
+      deltaActions[1].protocol.minReaderVersion !== 3 || deltaActions[1].protocol.minWriterVersion !== 7 ||
+      !equal(deltaActions[1].protocol.readerFeatures, []) || !equal(deltaActions[1].protocol.writerFeatures, ['invariants']) ||
+      !equal(deltaActions[2].metaData.configuration, {}) || !object(deltaActions[2].metaData.format) ||
+      !exact(deltaActions[2].metaData.format, ['provider','options']) || deltaActions[2].metaData.format.provider !== 'parquet' ||
+      !equal(deltaActions[2].metaData.format.options, {}) || !equal(deltaActions[2].metaData.partitionColumns, [OWNED_RUN_PARTITION]))
+    throw new Error('Owned-run plan Delta version-zero body has an invalid action trace, protocol, metadata or generated identity.');
+  let plannedSchema: unknown;
+  try { plannedSchema = JSON.parse(String(deltaActions[2].metaData.schemaString)) as unknown; }
+  catch { throw new Error('Owned-run plan Delta schema is invalid JSON.'); }
+  if (!object(plannedSchema) || !Array.isArray(plannedSchema.fields) ||
+      !plannedSchema.fields.some(field => object(field) && field.name === OWNED_RUN_PARTITION && field.type === 'string' && field.nullable === false))
+    throw new Error('Owned-run plan Delta schema lacks the exact ingestion partition column.');
   const root = (raw: string): URL => {
     let url: URL; try { url = new URL(raw); } catch { throw new Error('Owned-run table plan root is invalid.'); }
     if (url.protocol !== 'abfss:' || url.username !== value.container || url.hostname !== `${value.account}.dfs.core.windows.net` ||
@@ -1189,7 +1224,7 @@ export async function initializeOwnedRunTable(options: OwnedRunInitializerOption
   const cached = dispatcher.terminalEvidence();
   if (cached !== undefined) {
     validateOwnedRunParentReceipt(cached, artifactIdentity, plan, authority, deadline, dispatcher.recordedRequestCount);
-    dispatcher.assertDeltaCommitReadback(cached.bridge_receipt.receipt.delta);
+    dispatcher.assertDeltaCommitReadback(cached.bridge_receipt.receipt.delta, plan);
     return cached;
   }
   assertBridgeLive(options.envelope, deadline, now);
@@ -1202,7 +1237,7 @@ export async function initializeOwnedRunTable(options: OwnedRunInitializerOption
   if (child.exchangeCount !== dispatcher.recordedRequestCount)
     throw new Error('Owned-run child exchanges are not a one-to-one match for the retained durable transcript.');
   dispatcher.assertControlPlanComplete();
-  dispatcher.assertDeltaCommitReadback(child.receipt.receipt.delta);
+  dispatcher.assertDeltaCommitReadback(child.receipt.receipt.delta, plan);
   const result: OwnedRunTableParentReceipt = { schema_version: 1, kind: 'owned_run_table_parent_receipt',
     artifact_identity: artifactIdentity, exchange_count: child.exchangeCount, bridge_receipt: child.receipt };
   validateOwnedRunParentReceipt(result, artifactIdentity, plan, authority, deadline, dispatcher.recordedRequestCount);

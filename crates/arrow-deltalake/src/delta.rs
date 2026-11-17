@@ -23,7 +23,10 @@ use delta_kernel_default_engine::parquet::DataFileMetadata;
 use delta_kernel_default_engine::stats::FileStatsAccumulator;
 use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder, build_add_file_metadata};
 use fs2::FileExt;
-use object_store::{ObjectStore, ObjectStoreExt, PutMode};
+use object_store::{
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, ObjectStoreExt, PutMode,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions,
+};
 use parquet::file::properties::WriterProperties;
 use sha2::Digest;
 use std::collections::BTreeMap;
@@ -31,6 +34,7 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::fs::{self, File, OpenOptions};
 use std::num::NonZeroUsize;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::UNIX_EPOCH;
@@ -2259,6 +2263,295 @@ struct FreshSchemaCommitter {
     root: PathBuf,
 }
 
+/// Immutable bytes and generated identities for a planned fresh version-zero commit.
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FreshTableCommitPlan {
+    pub body: String,
+    pub body_sha256: String,
+    pub timestamp: i64,
+    pub txn_id: String,
+    pub table_id: String,
+    pub created_time: i64,
+}
+
+impl FreshTableCommitPlan {
+    /// Validate the complete plan before any publisher admission or storage effect.
+    pub fn validate(&self) -> Result<()> {
+        if self.body.len() > 1024 * 1024 || !self.body.ends_with('\n') {
+            bail!("planned Delta version-zero body is missing, oversized or not newline-terminated");
+        }
+        if sha256_hex(self.body.as_bytes()) != self.body_sha256 {
+            bail!("planned Delta version-zero body SHA-256 does not match its bytes");
+        }
+        let actions = parse_fresh_commit_actions(&self.body)?;
+        let (timestamp, txn_id, table_id, created_time) = fresh_commit_values(&actions)?;
+        if timestamp != self.timestamp
+            || txn_id != self.txn_id
+            || table_id != self.table_id
+            || created_time != self.created_time
+        {
+            bail!("planned Delta version-zero identities differ from the captured body");
+        }
+        validate_uuid_v4(&self.txn_id, "Delta txnId")?;
+        validate_uuid_v4(&self.table_id, "Delta table id")?;
+        if self.txn_id == self.table_id || self.timestamp < 0 || self.created_time < 0 {
+            bail!("planned Delta version-zero identities or timestamps are invalid");
+        }
+        Ok(())
+    }
+}
+
+fn validate_uuid_v4(value: &str, name: &str) -> Result<()> {
+    let parsed = uuid::Uuid::parse_str(value).with_context(|| format!("invalid {name}"))?;
+    if parsed.to_string() != value || parsed.get_version_num() != 4 {
+        bail!("{name} must be a canonical lowercase UUID v4");
+    }
+    Ok(())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    sha2::Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn parse_fresh_commit_actions(body: &str) -> Result<Vec<serde_json::Value>> {
+    let lines = body
+        .strip_suffix('\n')
+        .context("planned Delta commit is not newline-terminated")?;
+    let actions = lines
+        .split('\n')
+        .map(serde_json::from_str)
+        .collect::<std::result::Result<Vec<serde_json::Value>, _>>()?;
+    if actions.len() != 3
+        || !actions[0]
+            .as_object()
+            .is_some_and(|action| action.len() == 1 && action.contains_key("commitInfo"))
+        || !actions[1]
+            .as_object()
+            .is_some_and(|action| action.len() == 1 && action.contains_key("protocol"))
+        || !actions[2]
+            .as_object()
+            .is_some_and(|action| action.len() == 1 && action.contains_key("metaData"))
+    {
+        bail!("planned Delta version-zero body must contain exactly commitInfo, protocol and metaData in order");
+    }
+    let commit_info = actions[0]["commitInfo"]
+        .as_object()
+        .context("Delta commitInfo is invalid")?;
+    if commit_info.contains_key("inCommitTimestamp") {
+        bail!("unsupported runtime-generated Delta inCommitTimestamp requires plan review");
+    }
+    Ok(actions)
+}
+
+fn fresh_commit_values(actions: &[serde_json::Value]) -> Result<(i64, String, String, i64)> {
+    let commit_info = actions[0]["commitInfo"]
+        .as_object()
+        .context("Delta commitInfo is invalid")?;
+    let metadata = actions[2]["metaData"]
+        .as_object()
+        .context("Delta metaData is invalid")?;
+    let timestamp = commit_info
+        .get("timestamp")
+        .and_then(serde_json::Value::as_i64)
+        .context("Delta commit timestamp is invalid")?;
+    let txn_id = commit_info
+        .get("txnId")
+        .and_then(serde_json::Value::as_str)
+        .context("Delta commit txnId is invalid")?
+        .to_owned();
+    let table_id = metadata
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .context("Delta table id is invalid")?
+        .to_owned();
+    let created_time = metadata
+        .get("createdTime")
+        .and_then(serde_json::Value::as_i64)
+        .context("Delta createdTime is invalid")?;
+    Ok((timestamp, txn_id, table_id, created_time))
+}
+
+fn matches_planned_fresh_body(actual: &str, plan: &FreshTableCommitPlan) -> Result<()> {
+    let mut actual_actions = parse_fresh_commit_actions(actual)?;
+    let planned_actions = parse_fresh_commit_actions(&plan.body)?;
+    let (timestamp, txn_id, table_id, created_time) = fresh_commit_values(&actual_actions)?;
+    validate_uuid_v4(&txn_id, "Delta txnId")?;
+    validate_uuid_v4(&table_id, "Delta table id")?;
+    if timestamp < 0 || created_time < 0 || txn_id == table_id {
+        bail!("actual Delta version-zero generated identities or timestamps are invalid");
+    }
+    actual_actions[0]["commitInfo"]["timestamp"] = planned_actions[0]["commitInfo"]["timestamp"].clone();
+    actual_actions[0]["commitInfo"]["txnId"] = planned_actions[0]["commitInfo"]["txnId"].clone();
+    actual_actions[2]["metaData"]["id"] = planned_actions[2]["metaData"]["id"].clone();
+    actual_actions[2]["metaData"]["createdTime"] = planned_actions[2]["metaData"]["createdTime"].clone();
+    if actual_actions != planned_actions {
+        bail!("actual Delta version-zero body differs from its plan outside the four allocated identities");
+    }
+    Ok(())
+}
+
+struct PlannedFreshSchemaStore {
+    inner: Arc<dyn ObjectStore>,
+    plan: FreshTableCommitPlan,
+    commit_attempted: std::sync::atomic::AtomicBool,
+}
+
+impl PlannedFreshSchemaStore {
+    fn is_delta_log(&self, location: &object_store::path::Path) -> bool {
+        location.as_ref().contains("_delta_log/")
+    }
+
+    fn refusal(message: String) -> object_store::Error {
+        object_store::Error::Generic {
+            store: "planned-fresh-schema",
+            source: Box::new(std::io::Error::other(message)),
+        }
+    }
+}
+
+impl Display for PlannedFreshSchemaStore {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        write!(formatter, "PlannedFreshSchema({})", self.inner)
+    }
+}
+
+impl fmt::Debug for PlannedFreshSchemaStore {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PlannedFreshSchemaStore")
+            .field("inner", &self.inner)
+            .finish()
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for PlannedFreshSchemaStore {
+    async fn put_opts(
+        &self,
+        location: &object_store::path::Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        if !self.is_delta_log(location) {
+            return Err(Self::refusal("fresh schema path attempted a non-log write".into()));
+        }
+        if !location.as_ref().ends_with("_delta_log/00000000000000000000.json") || opts.mode != PutMode::Create {
+            return Err(Self::refusal(
+                "fresh schema path attempted a non-create-only version-zero write".into(),
+            ));
+        }
+        if self.commit_attempted.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return Err(Self::refusal(
+                "fresh version-zero commit allocation was already consumed".into(),
+            ));
+        }
+        if payload.content_length() > 1024 * 1024 {
+            return Err(Self::refusal(
+                "actual Delta version-zero body exceeds its admission bound".into(),
+            ));
+        }
+        let mut actual = Vec::with_capacity(payload.content_length());
+        for chunk in payload.iter() {
+            actual.extend_from_slice(chunk);
+        }
+        let body = std::str::from_utf8(&actual)
+            .map_err(|error| Self::refusal(format!("actual Delta version-zero body is not UTF-8: {error}")))?;
+        matches_planned_fresh_body(body, &self.plan).map_err(|error| Self::refusal(format!("{error:#}")))?;
+        self.inner
+            .put_opts(location, PutPayload::from(self.plan.body.as_bytes().to_vec()), opts)
+            .await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &object_store::path::Path,
+        _opts: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        Err(Self::refusal(format!(
+            "fresh schema path refuses multipart writes at {location}"
+        )))
+    }
+
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: GetOptions,
+    ) -> object_store::Result<GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    async fn get_ranges(
+        &self,
+        location: &object_store::path::Path,
+        ranges: &[Range<u64>],
+    ) -> object_store::Result<Vec<bytes::Bytes>> {
+        self.inner.get_ranges(location, ranges).await
+    }
+
+    fn delete_stream(
+        &self,
+        _locations: futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        use futures::StreamExt;
+        futures::stream::once(async { Err(Self::refusal("fresh schema path refuses delete effects".into())) }).boxed()
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+        offset: &object_store::path::Path,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list_with_offset(prefix, offset)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&object_store::path::Path>) -> object_store::Result<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        _from: &object_store::path::Path,
+        _to: &object_store::path::Path,
+        _options: CopyOptions,
+    ) -> object_store::Result<()> {
+        Err(Self::refusal("fresh schema path refuses copy effects".into()))
+    }
+
+    async fn rename_opts(
+        &self,
+        _from: &object_store::path::Path,
+        _to: &object_store::path::Path,
+        _options: RenameOptions,
+    ) -> object_store::Result<()> {
+        Err(Self::refusal("fresh schema path refuses rename effects".into()))
+    }
+}
+
+struct CaptureFreshSchemaFence;
+
+impl PublicationFence for CaptureFreshSchemaFence {
+    fn check_before_commit(&self, context: &PublicationFenceContext<'_>) -> Result<(), PublicationFenceError> {
+        if context.read_version() == 0 && context.proposed_version() == 0 && context.file_count() == 0 {
+            Ok(())
+        } else {
+            Err(PublicationFenceError::stale(
+                "plan capture permits only an empty fresh version-zero schema",
+            ))
+        }
+    }
+}
+
 impl Committer for FreshSchemaCommitter {
     fn commit(
         &self,
@@ -2456,13 +2749,58 @@ impl DeltaTable {
         publication_fence: Arc<dyn PublicationFence>,
         data: FreshTableTransport,
     ) -> Result<FreshTableReceipt> {
+        Self::initialize_fresh_url_inner(url, schema, partition_columns, session, publication_fence, data, None)
+    }
+
+    /// Create a fresh schema whose exact version-zero bytes were captured before envelope creation.
+    pub fn initialize_fresh_url_with_planned_session(
+        url: Url,
+        schema: SchemaRef,
+        partition_columns: Vec<String>,
+        session: Arc<PublisherSession>,
+        publication_fence: Arc<dyn PublicationFence>,
+        data: FreshTableTransport,
+        plan: FreshTableCommitPlan,
+    ) -> Result<FreshTableReceipt> {
+        plan.validate()?;
+        Self::initialize_fresh_url_inner(
+            url,
+            schema,
+            partition_columns,
+            session,
+            publication_fence,
+            data,
+            Some(plan),
+        )
+    }
+
+    fn initialize_fresh_url_inner(
+        url: Url,
+        schema: SchemaRef,
+        partition_columns: Vec<String>,
+        session: Arc<PublisherSession>,
+        publication_fence: Arc<dyn PublicationFence>,
+        data: FreshTableTransport,
+        planned_commit: Option<FreshTableCommitPlan>,
+    ) -> Result<FreshTableReceipt> {
         if session.mode() != SessionMode::Publisher
             || data.mutation_retries != crate::publisher::MutationRetries::Disabled
         {
             bail!("fresh table initialization requires a normal publisher and no mutation retries");
         }
         let incoming = normalize::schema(&schema)?;
-        let table = Self::open_connection_with_store(url, partition_columns, None, Some(session), Some(data.store))?;
+        let planned_store = planned_commit.as_ref().map(|plan| {
+            Arc::new(PlannedFreshSchemaStore {
+                inner: Arc::clone(&data.store),
+                plan: plan.clone(),
+                commit_attempted: std::sync::atomic::AtomicBool::new(false),
+            })
+        });
+        let store: Arc<dyn ObjectStore> = match &planned_store {
+            Some(store) => Arc::clone(store) as Arc<dyn ObjectStore>,
+            None => Arc::clone(&data.store),
+        };
+        let table = Self::open_connection_with_store(url, partition_columns, None, Some(session), Some(store), false)?;
         let prefix = table.object_path("")?;
         let store = Arc::clone(&table.store);
         let nonempty = shared_executor()?.block_on(async move {
@@ -2478,6 +2816,12 @@ impl DeltaTable {
             bail!("fresh table target is not empty; existing objects are never adopted");
         }
         table.create_schema(Arc::clone(&incoming), Some(publication_fence))?;
+        if planned_store
+            .as_ref()
+            .is_some_and(|store| !store.commit_attempted.load(std::sync::atomic::Ordering::Acquire))
+        {
+            bail!("planned fresh schema completed without consuming its exact version-zero body");
+        }
         let prefix = table.object_path("")?;
         let store = Arc::clone(&table.store);
         let objects: Vec<_> = shared_executor()?.block_on(async move {
@@ -2615,7 +2959,7 @@ impl DeltaTable {
         data: Option<Arc<dyn ObjectStore>>,
     ) -> Result<()> {
         let initialized =
-            Self::open_connection_with_store(url, partition_columns, None, Some(Arc::clone(session)), data)
+            Self::open_connection_with_store(url, partition_columns, None, Some(Arc::clone(session)), data, false)
                 .and_then(|table| table.ensure_schema(normalize::schema(schema)?));
         let closed = session.close_after_drain();
         match (initialized, closed) {
@@ -2655,13 +2999,51 @@ impl DeltaTable {
         }
     }
 
+    /// Capture the exact fresh Kernel commit against an isolated in-memory store only.
+    /// No credentials, provider client, publisher registration or external effect is created.
+    ///
+    /// # Errors
+    /// Returns an error if schema creation or commit-body capture fails.
+    pub fn capture_fresh_table_commit(
+        url: Url,
+        schema: SchemaRef,
+        partition_columns: Vec<String>,
+    ) -> Result<FreshTableCommitPlan> {
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let table = Self::open_connection_with_store(url, partition_columns, None, None, Some(Arc::clone(&store)), true)?;
+        let stage = table.root.clone();
+        let capture = (|| {
+            let incoming = normalize::schema(&schema)?;
+            table.create_schema(incoming, Some(Arc::new(CaptureFreshSchemaFence)))?;
+            let path = table.object_path("_delta_log/00000000000000000000.json")?;
+            let store = Arc::clone(&store);
+            let bytes = shared_executor()?.block_on(async move { store.get(&path).await?.bytes().await })?;
+            let body = String::from_utf8(bytes.to_vec()).context("captured Delta version-zero body is not UTF-8")?;
+            let actions = parse_fresh_commit_actions(&body)?;
+            let (timestamp, txn_id, table_id, created_time) = fresh_commit_values(&actions)?;
+            let plan = FreshTableCommitPlan {
+                body_sha256: sha256_hex(body.as_bytes()),
+                body,
+                timestamp,
+                txn_id,
+                table_id,
+                created_time,
+            };
+            plan.validate()?;
+            Ok(plan)
+        })();
+        drop(table);
+        fs::remove_dir_all(&stage).context("failed to remove isolated Delta plan-capture staging directory")?;
+        capture
+    }
+
     pub(crate) fn open_connection(
         url: Url,
         partition_columns: Vec<String>,
         publication_fence: Option<Arc<dyn PublicationFence>>,
         session: Option<Arc<PublisherSession>>,
     ) -> Result<Arc<Self>> {
-        Self::open_connection_with_store(url, partition_columns, publication_fence, session, None)
+        Self::open_connection_with_store(url, partition_columns, publication_fence, session, None, false)
     }
 
     /// `data` replaces only the inner transport; it is always wrapped by the
@@ -2672,12 +3054,14 @@ impl DeltaTable {
         publication_fence: Option<Arc<dyn PublicationFence>>,
         session: Option<Arc<PublisherSession>>,
         data: Option<Arc<dyn ObjectStore>>,
+        allow_unbound_data: bool,
     ) -> Result<Arc<Self>> {
         if !url.path().ends_with('/') {
             url.set_path(&format!("{}/", url.path()));
         }
         let session = match (url.scheme(), session) {
             (_, Some(session)) => Some(session),
+            (_, None) if allow_unbound_data && data.is_some() => None,
             ("file", None) => None,
             ("abfs" | "abfss" | "az", None) => Some(PublisherSession::shared_for_url(&url)?),
             _ => bail!("only file and ADLS URLs are supported"),
@@ -2694,6 +3078,7 @@ impl DeltaTable {
             }
             (Some(session), None) => session.store_for_url(&url)?,
             (None, None) => Arc::new(object_store::local::LocalFileSystem::new()),
+            (None, Some(data)) if allow_unbound_data => data,
             (None, Some(_)) => bail!("an injected data store requires a publisher session"),
         };
         let root = if url.scheme() == "file" {
@@ -5241,6 +5626,83 @@ mod layout_readback_tests {
         assert!(event["inactive_controls"].as_array().is_some_and(|keys| {
             keys.contains(&serde_json::json!("max_rows")) && keys.contains(&serde_json::json!("max_input_bytes"))
         }));
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod fresh_table_plan_tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    fn captured_plan() -> Result<FreshTableCommitPlan> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("event_id", DataType::Utf8, false),
+            Field::new(INGESTION_PARTITION, DataType::Utf8, false),
+        ]));
+        DeltaTable::capture_fresh_table_commit(
+            Url::parse("abfss://events@storageaccount.dfs.core.windows.net/campaign/run/table/")?,
+            schema,
+            vec![INGESTION_PARTITION.to_owned()],
+        )
+    }
+
+    fn body(actions: &[serde_json::Value]) -> Result<String> {
+        let mut result = actions
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .join("\n");
+        result.push('\n');
+        Ok(result)
+    }
+
+    #[test]
+    fn captures_exact_fresh_body_and_default_kernel_identities_remain_unique() -> Result<()> {
+        let first = captured_plan()?;
+        let second = captured_plan()?;
+        first.validate()?;
+        second.validate()?;
+        assert_eq!(sha256_hex(first.body.as_bytes()), first.body_sha256);
+        assert_ne!(first.txn_id, second.txn_id);
+        assert_ne!(first.table_id, second.table_id);
+        matches_planned_fresh_body(&first.body, &first)?;
+        Ok(())
+    }
+
+    #[test]
+    fn planned_body_refuses_schema_partition_protocol_configuration_and_volatile_drift() -> Result<()> {
+        let plan = captured_plan()?;
+        let original = parse_fresh_commit_actions(&plan.body)?;
+        for mutate in [
+            |actions: &mut Vec<serde_json::Value>| {
+                actions[2]["metaData"]["schemaString"] = serde_json::Value::String("{}".into())
+            },
+            |actions: &mut Vec<serde_json::Value>| actions[2]["metaData"]["partitionColumns"] = serde_json::json!([]),
+            |actions: &mut Vec<serde_json::Value>| actions[1]["protocol"]["minWriterVersion"] = serde_json::json!(999),
+            |actions: &mut Vec<serde_json::Value>| {
+                actions[2]["metaData"]["configuration"]["unexpected"] = serde_json::json!("changed")
+            },
+        ] {
+            let mut changed = original.clone();
+            mutate(&mut changed);
+            assert!(matches_planned_fresh_body(&body(&changed)?, &plan).is_err());
+        }
+        let mut volatile = original.clone();
+        volatile[0]["commitInfo"]["inCommitTimestamp"] = serde_json::json!(1);
+        assert!(parse_fresh_commit_actions(&body(&volatile)?).is_err());
+        let mut missing = original.clone();
+        missing[2]["metaData"].as_object_mut().context("missing metaData object")?.remove("createdTime");
+        assert!(matches_planned_fresh_body(&body(&missing)?, &plan).is_err());
+        let mut duplicate_action = original.clone();
+        duplicate_action.insert(1, original[1].clone());
+        assert!(parse_fresh_commit_actions(&body(&duplicate_action)?).is_err());
+        let mut malformed = original.clone();
+        malformed[0]["commitInfo"]["txnId"] = serde_json::json!("not-a-uuid");
+        assert!(matches_planned_fresh_body(&body(&malformed)?, &plan).is_err());
+        let mut duplicate_identity = original;
+        duplicate_identity[0]["commitInfo"]["txnId"] = serde_json::json!(plan.table_id);
+        assert!(matches_planned_fresh_body(&body(&duplicate_identity)?, &plan).is_err());
         Ok(())
     }
 }

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -96,12 +97,12 @@ function signedControlRequest(authority: StorageBridgeAuthority, deadline: numbe
   return { ...unsigned, request_sha256: sha(canonical(unsigned)) };
 }
 
-function signedObjectRequest(authority: StorageBridgeAuthority, deadline: number, requestId: number, method: string, url: string, body = ''): StorageBridgeRequest {
+function signedObjectRequest(authority: StorageBridgeAuthority, deadline: number, requestId: number, method: string, url: string, body = '', extraHeaders: [string, string][] = []): StorageBridgeRequest {
   const unsigned = { schema_version: 1 as const, kind: 'storage_http_request' as const, request_id: requestId, authority,
     original_deadline_unix_ms: deadline, remaining_timeout_ms: 10_000, target: 'object_store' as const, method, url,
     headers: [['date', new Date(deadline - 30_000).toUTCString()], ['x-ms-version', '2023-11-03'],
       ['user-agent', 'arrowcol-qap/' + authority.cell_run_id + '/owned-run-table-initialization'],
-      ['x-ms-client-request-id', 'c0ffee00-0000-4000-8000-' + String(requestId).padStart(12, '0')]] as [string, string][],
+      ['x-ms-client-request-id', 'c0ffee00-0000-4000-8000-' + String(requestId).padStart(12, '0')], ...extraHeaders] as [string, string][],
     body, body_sha256: sha(body) };
   return { ...unsigned, request_sha256: sha(canonical(unsigned)) };
 }
@@ -418,7 +419,8 @@ test('planned control identities admit the exact 13-operation admission, create 
   assert.equal(dispatcher.recordedRequestCount, 13);
   assert.doesNotThrow(() => dispatcher.assertControlPlanComplete());
   assert.throws(() => dispatcher.assertDeltaCommitReadback({ table_id: 'c0ffee00-0000-4000-8000-000000000099',
-    version: 0, schema_json: '{}', partition_columns: ['__arrowcol_ingestion'], active_files: 0 }),
+    version: 0, schema_json: '{}', partition_columns: ['__arrowcol_ingestion'], active_files: 0 },
+    { delta_v0: { body: '', body_sha256: '', timestamp: 0, txn_id: '', table_id: '', created_time: 0 } }),
   /exactly one actual version-zero commit request/);
 });
 test('planned control dispatcher rejects missing, duplicate, unknown, reused and mutated markers before forwarding', async t => {
@@ -511,7 +513,12 @@ test('Delta terminal proof correlates the actual accepted commit with an identic
   };
   const now = Date.now(), deadline = now + 60_000, tableId = 'c0ffee00-0000-4000-8000-000000000014';
   const schemaJson = JSON.stringify({ type: 'struct', fields: [{ name: '__arrowcol_ingestion', type: 'string', nullable: false, metadata: {} }] });
-  const body = JSON.stringify({ metaData: { id: tableId, schemaString: schemaJson, partitionColumns: ['__arrowcol_ingestion'] } }) + '\n';
+  const txnId = 'c0ffee00-0000-4000-8000-000000000015';
+  const body = [JSON.stringify({ commitInfo: { timestamp: 1, txnId } }),
+    JSON.stringify({ protocol: { minReaderVersion: 3, minWriterVersion: 7, readerFeatures: [], writerFeatures: ['invariants'] } }),
+    JSON.stringify({ metaData: { id: tableId, format: { provider: 'parquet', options: {} }, schemaString: schemaJson,
+      partitionColumns: ['__arrowcol_ingestion'], configuration: {}, createdTime: 1 } })].join('\n') + '\n';
+  const deltaPlan = { body, body_sha256: sha(body), timestamp: 1, txn_id: txnId, table_id: tableId, created_time: 1 };
   const url = `https://${authority.storage_account}.blob.core.windows.net/checkpoints${new URL(authority.table_root_url).pathname}_delta_log/00000000000000000000.json`;
   const makeDispatcher = (statuses: number[], includeReadback: boolean) => {
     const directory = mkdtempSync(path.join(root, 'case-'));
@@ -538,18 +545,22 @@ test('Delta terminal proof correlates the actual accepted commit with an identic
   const success = makeDispatcher([201, 200], true);
   for (const request of success.requests)
     assert.equal((await withEffectBoundary(success.boundary, () => success.dispatcher.exchange(request))).outcome, 'response');
-  assert.doesNotThrow(() => success.dispatcher.assertDeltaCommitReadback(expected));
+  assert.doesNotThrow(() => success.dispatcher.assertDeltaCommitReadback(expected, { delta_v0: deltaPlan }));
   assert.throws(() => success.dispatcher.assertDeltaCommitReadback({ ...expected,
-    table_id: 'c0ffee00-0000-4000-8000-000000000099' }), /differs from the actual committed table identity/);
+    table_id: 'c0ffee00-0000-4000-8000-000000000099' }, { delta_v0: deltaPlan }), /differs from the actual committed table identity/);
   assert.throws(() => success.dispatcher.assertDeltaCommitReadback({ ...expected,
-    schema_json: JSON.stringify({ type: 'struct', fields: [] }) }), /differs from the actual committed table identity/);
+    schema_json: JSON.stringify({ type: 'struct', fields: [] }) }, { delta_v0: deltaPlan }), /differs from the actual committed table identity/);
+  const alteredProtocolBody = body.replace('"minWriterVersion":7', '"minWriterVersion":8');
+  assert.notEqual(alteredProtocolBody, body);
+  assert.throws(() => success.dispatcher.assertDeltaCommitReadback(expected, { delta_v0: { ...deltaPlan,
+    body: alteredProtocolBody, body_sha256: sha(alteredProtocolBody) } }), /exact plan-time body/);
   const incomplete = makeDispatcher([201], false);
   await withEffectBoundary(incomplete.boundary, () => incomplete.dispatcher.exchange(incomplete.requests[0]));
-  assert.throws(() => incomplete.dispatcher.assertDeltaCommitReadback(expected), /missing the actual version-zero log readback/);
+  assert.throws(() => incomplete.dispatcher.assertDeltaCommitReadback(expected, { delta_v0: deltaPlan }), /missing the actual version-zero log readback/);
   const failedReadback = makeDispatcher([201, 503], true);
   for (const request of failedReadback.requests)
     await withEffectBoundary(failedReadback.boundary, () => failedReadback.dispatcher.exchange(request));
-  assert.throws(() => failedReadback.dispatcher.assertDeltaCommitReadback(expected), /readback is incomplete, failed or differs/);
+  assert.throws(() => failedReadback.dispatcher.assertDeltaCommitReadback(expected, { delta_v0: deltaPlan }), /readback is incomplete, failed or differs/);
 });
 
 test('real loadgen initializer composes with the Node BR3 planned-identity parent', { skip: !process.env.OAT_BR3_LOADGEN_BIN }, async t => {
@@ -569,13 +580,17 @@ test('real loadgen initializer composes with the Node BR3 planned-identity paren
   const authority: StorageBridgeAuthority = { campaign_id: campaign, cell_run_id: run, owner_id: owner, fencing_token: 1,
     storage_account: account, table_root_url: tableRoot, control_container_url: 'https://' + account + '.blob.core.windows.net/' + container,
     sandbox_id: 'offline-stamp', reset_generation: generation };
-  const plan = { account, container, campaign_root: campaignRoot, run_root: runRoot, campaign_id: campaign, run_id: run,
+  const preliminaryPlan = { account, container, campaign_root: campaignRoot, run_root: runRoot, campaign_id: campaign, run_id: run,
     generation, publisher_id: publisherId, control_lease_ids: [...controlLeaseIds],
     control_operation_ids: [...PLANNED_CONTROL_OPERATION_IDS],
     table: 'telemetry.sqlserver.sqlserver_availability_replica_states', partition_by_ingestion_date: true,
     owner_id: owner, fencing_token: 1 };
+  const preliminaryPlanPath = path.join(directory, 'preliminary-plan.json');
   const planPath = path.join(directory, 'plan.json'), bridgeInputPath = path.join(directory, 'bridge-input.json');
-  writeFileSync(planPath, JSON.stringify(plan)); chmodSync(planPath, 0o600);
+  writeFileSync(preliminaryPlanPath, JSON.stringify(preliminaryPlan)); chmodSync(preliminaryPlanPath, 0o600);
+  execFileSync(executable, ['plan-owned-run-table', '--plan', preliminaryPlanPath, '--output', planPath], { cwd: process.cwd(), stdio: 'pipe' });
+  chmodSync(planPath, 0o600);
+  const plan = JSON.parse(readFileSync(planPath, 'utf8')) as typeof preliminaryPlan & { delta_v0: { body: string; body_sha256: string; timestamp: number; txn_id: string; table_id: string; created_time: number } };
   writeFileSync(bridgeInputPath, JSON.stringify({ authority, original_deadline_unix_ms: deadline })); chmodSync(bridgeInputPath, 0o600);
   const controlBase = authority.control_container_url;
   const controlLeaseUrl = controlBase + '?comp=lease&restype=container';
@@ -599,16 +614,21 @@ test('real loadgen initializer composes with the Node BR3 planned-identity paren
     controlMetadata(11, 10, controlLeaseIds[1], '{}'), controlRelease(12, 11, controlLeaseIds[1])];
   const listPrefix = new URL(authority.table_root_url).pathname.slice(1);
   const listUrl = controlBase + '?restype=container&comp=list&prefix=' + encodeURIComponent(listPrefix);
-  const initialListing = signedObjectRequest(authority, deadline, 7, 'GET', listUrl);
+  const initialListing = signedObjectRequest(authority, deadline, 13, 'GET', listUrl);
   const deltaLogPrefix = listPrefix + '_delta_log/';
   const logListingUrl = controlBase + '?restype=container&comp=list&prefix=' + encodeURIComponent(deltaLogPrefix) +
     '&startFrom=' + encodeURIComponent(deltaLogPrefix.slice(0, -1));
-  const logListing = signedObjectRequest(authority, deadline, 8, 'GET', logListingUrl);
-  const envelope = envelopeForRequests(authority, [...controlRequests, initialListing, logListing]);
+  const logListing = signedObjectRequest(authority, deadline, 14, 'GET', logListingUrl);
+  const logUrl = `https://${account}.blob.core.windows.net/${listPrefix}_delta_log/00000000000000000000.json`;
+  const deltaCommit = signedObjectRequest(authority, deadline, 15, 'PUT', logUrl, plan.delta_v0.body,
+    [['if-none-match', '*'], ['x-ms-blob-type', 'BlockBlob'], ['content-length', String(Buffer.byteLength(plan.delta_v0.body, 'utf8'))]]);
+  const deltaReadback = signedObjectRequest(authority, deadline, 16, 'GET', logUrl);
+  const envelope = envelopeForRequests(authority, [...controlRequests, initialListing, logListing, deltaCommit, deltaReadback]);
   const custody = mutableCustodyStore(authority, now);
   const azure = { c: { account }, async token() { return 'offline-test-token'; } } as unknown as Azure;
   const ledgerPath = path.join(directory, 'storage-ledger.jsonl');
   let publisherRegistry = '{}';
+  let deltaLogBody: string | undefined;
   const options = { executable, planPath, bridgeInputPath,
     ledgerPath, rootDirectory: process.cwd(), envelope, store: custody.store, azure,
     fetcher: async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -624,6 +644,12 @@ test('real loadgen initializer composes with the Node BR3 planned-identity paren
         return new Response(null, { status: 200 });
       }
       if (url.searchParams.get('comp') === 'lease' && headers.get('x-ms-lease-action') === 'release') return new Response(null, { status: 200 });
+      if (url.pathname.endsWith('/_delta_log/00000000000000000000.json') && init?.method === 'PUT') {
+        deltaLogBody = typeof init.body === 'string' ? init.body : await new Response(init.body).text();
+        return new Response(null, { status: 201, headers: { etag: '"delta-v0"' } });
+      }
+      if (url.pathname.endsWith('/_delta_log/00000000000000000000.json') && init?.method === 'GET')
+        return new Response(deltaLogBody ?? null, { status: deltaLogBody === undefined ? 404 : 200 });
       if (url.searchParams.get('comp') === 'list') return new Response(
         '<?xml version="1.0" encoding="utf-8"?><EnumerationResults><Blobs></Blobs><NextMarker></NextMarker></EnumerationResults>',
         { status: 200, headers: { 'content-type': 'application/xml' } });
