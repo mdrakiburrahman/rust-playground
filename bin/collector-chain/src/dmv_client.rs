@@ -1922,12 +1922,21 @@ fn estimated_row_bytes(table: &DmvTable, client_id: &str, options: &Options) -> 
         .map(|field| match field.data_type() {
             DataType::Utf8 if field.name() == "customer_id" => client_id.len() as u64 + 5,
             DataType::Utf8 => {
-                (if options.string_width == 0 {
-                    field.name().len() + 32
+                let category_width = if options.data_profile == DataProfile::Realistic {
+                    realistic_category_max_width(field.name())
                 } else {
-                    options.string_width
-                }) as u64
-                    + 5
+                    None
+                };
+                if let Some(width) = category_width {
+                    width as u64 + 5
+                } else {
+                    (if options.string_width == 0 {
+                        field.name().len() + 32
+                    } else {
+                        options.string_width
+                    }) as u64
+                        + 5
+                }
             }
             _ => 9,
         })
@@ -1963,6 +1972,46 @@ fn unit(value: u64) -> f64 {
 
 fn is_guid_field(name: &str) -> bool {
     name.ends_with("_id") && name != "customer_id"
+}
+
+fn realistic_category_values(field_name: &str) -> Option<&'static [&'static str]> {
+    match field_name {
+        "replica_role" => Some(&["RESOLVING", "PRIMARY", "SECONDARY"]),
+        "operational_state_desc" => Some(&[
+            "PENDING_FAILOVER",
+            "PENDING",
+            "ONLINE",
+            "OFFLINE",
+            "FAILED",
+            "FAILED_NO_QUORUM",
+        ]),
+        "recovery_health_desc" => Some(&["ONLINE_IN_PROGRESS", "ONLINE"]),
+        "synchronization_health_desc" => Some(&["NOT_HEALTHY", "PARTIALLY_HEALTHY", "HEALTHY"]),
+        "connected_state_desc" => Some(&["DISCONNECTED", "CONNECTED"]),
+        "availability_mode_desc" => Some(&["ASYNCHRONOUS_COMMIT", "SYNCHRONOUS_COMMIT", "CONFIGURATION_ONLY"]),
+        "failover_mode_desc" => Some(&["MANUAL", "AUTOMATIC"]),
+        "primary_role_allow_connections_desc" => Some(&["ALL", "READ_WRITE"]),
+        "secondary_role_allow_connections_desc" => Some(&["NO", "READ_ONLY", "ALL"]),
+        "seeding_mode_desc" => Some(&["AUTOMATIC", "MANUAL"]),
+        _ => None,
+    }
+}
+
+fn realistic_category_max_width(field_name: &str) -> Option<usize> {
+    realistic_category_values(field_name)?
+        .iter()
+        .map(|value| value.len())
+        .max()
+}
+
+fn realistic_name_parts(field_name: &str, key: u64) -> Option<(String, &'static str)> {
+    match field_name {
+        "sql_server_instance_name" => Some((format!("sql-{key:04}-"), ".example.invalid")),
+        "machine_name" => Some((format!("machine-{key:04}-"), ".example.invalid")),
+        "availability_group_name" => Some((format!("ag_{key:04}_"), "")),
+        "replica_server_name" => Some((format!("replica-{key:04}-"), ".example.invalid")),
+        _ => None,
+    }
 }
 
 fn synthetic_guid(seed: u64, pod_ordinal: u32, worker: usize, column: usize, row: usize) -> String {
@@ -2029,6 +2078,12 @@ fn synthetic_batch(
                             && options.guid_uniqueness.unwrap_or(GuidUniqueness::Cardinality) == GuidUniqueness::PerRow
                         {
                             synthetic_guid(options.seed, options.pod_ordinal, worker, column, offset + row)
+                        } else if let Some(value) = (options.data_profile == DataProfile::Realistic)
+                            .then(|| realistic_category_values(field.name()))
+                            .flatten()
+                            .map(|values| values[(string_key(row) % values.len() as u64) as usize])
+                        {
+                            value.to_owned()
                         } else if options.string_width == 0
                             && options.data_profile == DataProfile::Diagnostic
                             && options.string_length_distribution == Some(StringLengthDistribution::Fixed)
@@ -2052,16 +2107,30 @@ fn synthetic_batch(
                                     minimum + (random(row) % (maximum_width - minimum + 1) as u64) as usize
                                 }
                             };
-                            (0..width)
-                                .map(|index| {
-                                    state = mix(state);
-                                    if index as f64 / (maximum_width as f64) < options.entropy {
-                                        (b'a' + (state % 26) as u8) as char
-                                    } else {
-                                        'a'
-                                    }
-                                })
-                                .collect::<String>()
+                            let (prefix, suffix) = if options.data_profile == DataProfile::Realistic {
+                                realistic_name_parts(field.name(), key).unwrap_or_default()
+                            } else {
+                                (String::new(), "")
+                            };
+                            let prefix_len = prefix.len().min(width);
+                            let suffix = if prefix_len == prefix.len() && prefix.len() + suffix.len() <= width {
+                                suffix
+                            } else {
+                                ""
+                            };
+                            let mut value = String::with_capacity(width);
+                            value.push_str(&prefix[..prefix_len]);
+                            let body_width = width - prefix_len - suffix.len();
+                            for index in 0..body_width {
+                                state = mix(state);
+                                if index as f64 / (maximum_width as f64) < options.entropy {
+                                    value.push((b'a' + (state % 26) as u8) as char);
+                                } else {
+                                    value.push('a');
+                                }
+                            }
+                            value.push_str(suffix);
+                            value
                         }
                     })
                 }))),
@@ -2872,7 +2941,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn realistic_profile_calibrates_target_arrow_width_and_varies_ids_integers_and_timestamps() -> Result<()> {
+    async fn realistic_profile_uses_documented_categories_and_varies_ids_integers_and_timestamps() -> Result<()> {
         let options = Cli::try_parse_from(["test", "--data-profile", "realistic"])?
             .options
             .resolve(1024, 1)?;
@@ -2908,10 +2977,38 @@ mod tests {
             name_lengths.iter().max().context("missing string lengths")?,
         );
         assert!(
-            (1_000..=1_300).contains(&identity_ipc_bytes_per_row),
+            (500..=800).contains(&identity_ipc_bytes_per_row),
             "identity-bearing realistic profile produced {identity_ipc_bytes_per_row} uncompressed Arrow IPC bytes per row"
         );
         assert!(identity_ipc_bytes_per_row >= base_ipc_bytes_per_row);
+
+        for field_name in [
+            "replica_role",
+            "operational_state_desc",
+            "recovery_health_desc",
+            "synchronization_health_desc",
+            "connected_state_desc",
+            "availability_mode_desc",
+            "failover_mode_desc",
+            "primary_role_allow_connections_desc",
+            "secondary_role_allow_connections_desc",
+            "seeding_mode_desc",
+        ] {
+            let allowed = realistic_category_values(field_name).context("category values missing")?;
+            let values = batch
+                .column_by_name(field_name)
+                .context("categorical string field missing")?
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .context("categorical field is not a string array")?;
+            let observed = values.iter().flatten().collect::<std::collections::BTreeSet<_>>();
+            assert!(observed.len() > 1, "{field_name} did not vary across rows");
+            assert!(
+                observed.iter().all(|value| allowed.contains(value)),
+                "{field_name} emitted a value outside its documented category set"
+            );
+        }
+
         let identity_urls = identity_batch
             .column_by_name("endpoint_url")
             .context("endpoint_url missing")?
@@ -2932,11 +3029,25 @@ mod tests {
         let unique_guids = guid.iter().collect::<std::collections::BTreeSet<_>>();
         assert_eq!(unique_guids.len(), batch.num_rows());
 
-        assert!(
-            names
-                .iter()
-                .all(|value| value.is_some_and(|value| (48..=96).contains(&value.len())))
-        );
+        assert!(names.iter().all(|value| {
+            value.is_some_and(|value| (48..=96).contains(&value.len()) && value.ends_with(".example.invalid"))
+        }));
+        assert!(names.iter().flatten().collect::<std::collections::BTreeSet<_>>().len() > 1);
+
+        for (field_name, prefix) in [
+            ("machine_name", "machine-"),
+            ("availability_group_name", "ag_"),
+            ("replica_server_name", "replica-"),
+        ] {
+            let values = batch
+                .column_by_name(field_name)
+                .context("structured name field missing")?
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .context("structured name is not a string array")?;
+            assert!(values.iter().flatten().all(|value| value.starts_with(prefix)));
+            assert!(values.iter().flatten().collect::<std::collections::BTreeSet<_>>().len() > 1);
+        }
 
         let errors = batch
             .column_by_name("last_connect_error_number")
