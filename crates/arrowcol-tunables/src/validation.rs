@@ -3056,6 +3056,7 @@ mod tests {
 
     #[test]
     fn client_profile_and_shard_selector_are_strict_and_projected() -> Result<()> {
+        assert_eq!(ClientDataProfile::default(), ClientDataProfile::Diagnostic);
         let defaults = Tunables::parse_oat_json(serde_json::json!({"client": {}}))?;
         assert!(
             !defaults
