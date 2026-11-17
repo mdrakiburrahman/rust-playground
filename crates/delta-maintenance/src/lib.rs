@@ -8,9 +8,9 @@ use anyhow::{Context, Result, bail};
 use arrow_deltalake::delta::DeltaTable;
 use arrow_deltalake::maintenance::{
     DEFAULT_OPTIMIZE_UPLOAD_BUFFER_BYTES, Granularity, MaintenanceControl, MaintenanceError, MaintenanceErrorKind,
-    MaintenancePlan, MaintenanceReport, NegativeProbeConfig, OptimizeConfig, OptimizePlan, Outcome, PassProbeInventory,
-    ProbeOperation, PruneConfig, PurgeConfig, TableFingerprint, VacuumConfig, attach_error_report, error_details,
-    error_report, now_ms,
+    MaintenanceMetadata, MaintenancePlan, MaintenanceReport, NegativeProbeConfig, OptimizeConfig, OptimizePlan,
+    Outcome, PassProbeInventory, ProbeOperation, PruneConfig, PurgeConfig, TableFingerprint, VacuumConfig,
+    attach_error_report, error_details, error_report, now_ms,
 };
 use arrowcol_props::{PropValue, ResolvedProps, resolve};
 use serde::Serialize;
@@ -287,6 +287,95 @@ pub struct DiscoveredTable {
     pub log_token: Option<String>,
 }
 
+/// Catalog identity used by maintenance target readback.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct TargetTable {
+    pub catalog: String,
+    pub schema: String,
+    pub table: String,
+}
+
+impl TargetTable {
+    fn from_name(name: &str) -> Self {
+        let parts = name.split('.').collect::<Vec<_>>();
+        if let [catalog, schema, table] = parts.as_slice() {
+            Self {
+                catalog: (*catalog).into(),
+                schema: (*schema).into(),
+                table: (*table).into(),
+            }
+        } else {
+            Self {
+                catalog: String::new(),
+                schema: String::new(),
+                table: name.into(),
+            }
+        }
+    }
+
+    fn complete(&self) -> bool {
+        !self.catalog.is_empty() && !self.schema.is_empty() && !self.table.is_empty()
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum TargetState {
+    Unresolved,
+    Resolved,
+    Conflicting,
+}
+
+#[derive(Serialize)]
+struct DeltaTarget {
+    table: TargetTable,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    normalized_root: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delta_table_id: Option<String>,
+    state: TargetState,
+    #[serde(skip)]
+    observed: Option<(String, String)>,
+}
+
+impl DeltaTarget {
+    fn new(table: TargetTable) -> Self {
+        Self {
+            table,
+            normalized_root: None,
+            delta_table_id: None,
+            state: TargetState::Unresolved,
+            observed: None,
+        }
+    }
+
+    fn observe(&mut self, identity: Option<(String, String)>) {
+        self.normalized_root = None;
+        self.delta_table_id = None;
+        if self.state == TargetState::Conflicting {
+            return;
+        }
+        let Some((root, id)) = identity.filter(|(root, id)| !root.is_empty() && !id.is_empty()) else {
+            self.state = TargetState::Unresolved;
+            return;
+        };
+        if self
+            .observed
+            .as_ref()
+            .is_some_and(|previous| previous != &(root.clone(), id.clone()))
+        {
+            self.state = TargetState::Conflicting;
+            return;
+        }
+        self.observed = Some((root.clone(), id.clone()));
+        if self.table.complete() {
+            self.normalized_root = Some(root);
+            self.delta_table_id = Some(id);
+            self.state = TargetState::Resolved;
+        }
+    }
+}
+
 /// The catalog client implements this interface without filesystem discovery.
 pub trait TableDiscovery: Sync {
     /// List table identities for this service's bounded pass.
@@ -300,6 +389,14 @@ pub trait TableDiscovery: Sync {
     /// # Errors
     /// Returns missing-table, corrupt metadata or authority failures.
     fn table(&self, name: &str) -> Result<DiscoveredTable>;
+
+    /// Return the logical identity from discovery, without consulting requested locations.
+    ///
+    /// # Errors
+    /// Returns catalog identity access failures.
+    fn table_identity(&self, name: &str) -> Result<TargetTable> {
+        Ok(TargetTable::from_name(name))
+    }
 
     /// Return the wall-clock anchor for the current operation.
     ///
@@ -1121,6 +1218,7 @@ struct Counters {
     pending_tables: u64,
     heartbeat_ms: i64,
     cycles: u64,
+    delta_targets: BTreeMap<String, DeltaTarget>,
 }
 
 /// Prometheus and OpenTelemetry metrics. Labels are restricted to the bounded
@@ -1139,6 +1237,64 @@ impl Metrics {
     #[must_use]
     pub fn new() -> Self {
         Self(Arc::default(), Arc::new(Instruments::new()))
+    }
+
+    fn invalidate_targets(&self) -> Result<()> {
+        let mut counters = self
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("target readback mutex poisoned"))?;
+        for target in counters.delta_targets.values_mut() {
+            target.observe(None);
+        }
+        Ok(())
+    }
+
+    fn target_tables(&self, names: &[String], discovery: &dyn TableDiscovery) -> Result<()> {
+        let mut counters = self
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("target readback mutex poisoned"))?;
+        counters.delta_targets.retain(|name, _| names.contains(name));
+        for name in names {
+            let identity = discovery.table_identity(name)?;
+            let target = counters
+                .delta_targets
+                .entry(name.clone())
+                .or_insert_with(|| DeltaTarget::new(identity.clone()));
+            if target.table != identity {
+                target.state = TargetState::Conflicting;
+            }
+            target.observe(None);
+        }
+        Ok(())
+    }
+
+    fn observe_target(&self, name: &str, identity: Option<(String, String)>) -> Result<()> {
+        let mut counters = self
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("target readback mutex poisoned"))?;
+        counters
+            .delta_targets
+            .get_mut(name)
+            .context("target absent from maintenance discovery")?
+            .observe(identity);
+        Ok(())
+    }
+
+    /// Serialize actual loaded Delta destination observations on the metrics listener.
+    ///
+    /// # Errors
+    /// Returns readback synchronization or serialization errors.
+    pub fn health_json(&self) -> Result<String> {
+        let counters = self
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("target readback mutex poisoned"))?;
+        Ok(serde_json::to_string(&serde_json::json!({
+            "delta_targets": counters.delta_targets.values().collect::<Vec<_>>(),
+        }))?)
     }
 
     fn with(&self, update: impl FnOnce(&mut Counters)) {
@@ -1285,7 +1441,7 @@ fn report_items(report: &MaintenanceReport) -> [(&'static str, u64); 10] {
     ]
 }
 
-/// Serve `GET /metrics` on a bounded, sequential listener until cancelled.
+/// Serve `GET /metrics` and JSON `GET /health` on a bounded listener until cancelled.
 ///
 /// # Errors
 /// Returns bind errors.
@@ -1324,17 +1480,368 @@ fn respond(mut stream: TcpStream, metrics: &Metrics) -> Result<()> {
         }
         request.extend_from_slice(&chunk[..read]);
     }
-    let (status, body) = if request.starts_with(b"GET /metrics ") {
-        ("200 OK", metrics.render())
+    let (status, content_type, body) = if request.starts_with(b"GET /metrics ") {
+        ("200 OK", "text/plain; version=0.0.4", metrics.render())
+    } else if request.starts_with(b"GET /health ") {
+        match metrics.health_json() {
+            Ok(body) => ("200 OK", "application/json", body),
+            Err(error) => {
+                eprintln!("delta-maintenance health readback failed: {error:#}");
+                (
+                    "503 Service Unavailable",
+                    "application/json",
+                    String::from(r#"{"delta_targets":[],"error":"target readback unavailable"}"#),
+                )
+            }
+        }
     } else {
-        ("404 Not Found", String::from("not found\n"))
+        ("404 Not Found", "text/plain", String::from("not found\n"))
     };
     write!(
         stream,
-        "HTTP/1.1 {status}\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod target_readback_tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    fn target(metrics: &Metrics) -> Result<serde_json::Value> {
+        let health: serde_json::Value = serde_json::from_str(&metrics.health_json()?)?;
+        Ok(health["delta_targets"][0].clone())
+    }
+
+    #[test]
+    fn target_readback_requires_actual_initialized_metadata_without_data_commits() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let root_url = Url::from_directory_path(root.path()).map_err(|()| anyhow::anyhow!("temporary root URL"))?;
+        let name = "telemetry.sqlserver.events";
+        let discovery = FilesystemDiscovery::new(root_url, vec![name.into()]);
+        let metrics = Metrics::new();
+        metrics.target_tables(&[name.into()], &discovery)?;
+        assert_eq!(target(&metrics)?["state"], "unresolved");
+        assert!(target(&metrics)?.get("normalized_root").is_none());
+        assert!(target(&metrics)?.get("delta_table_id").is_none());
+
+        let url = discovery.url(name)?;
+        DeltaTable::initialize_url_for_bootstrap(
+            url.clone(),
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+            Vec::new(),
+        )?;
+        let mut sensitive_url = url.clone();
+        sensitive_url.set_query(Some("sig=secret"));
+        sensitive_url.set_fragment(Some("fragment"));
+        let probe = discovery.open_probe_table(&sensitive_url, 100)?;
+        metrics.observe_target(name, probe.maintenance_target_with_limits(100, 1024 * 1024)?)?;
+        let readback = target(&metrics)?;
+        assert_eq!(
+            readback["table"],
+            serde_json::json!({
+                "catalog": "telemetry", "schema": "sqlserver", "table": "events",
+            })
+        );
+        assert_eq!(readback["state"], "resolved");
+        assert_eq!(readback["normalized_root"], url.as_str().trim_end_matches('/'));
+        let log = url
+            .to_file_path()
+            .map_err(|()| anyhow::anyhow!("table path"))?
+            .join("_delta_log");
+        let metadata_id = std::fs::read_to_string(log.join("00000000000000000000.json"))?
+            .lines()
+            .map(serde_json::from_str::<serde_json::Value>)
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .find_map(|action| action["metaData"]["id"].as_str().map(str::to_owned))
+            .context("initialized metadata ID")?;
+        assert_eq!(readback["delta_table_id"], metadata_id);
+        assert!(!metrics.health_json()?.contains("secret"));
+        assert!(!metrics.health_json()?.contains("fragment"));
+        assert!(!log.join("00000000000000000001.json").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn target_readback_conflicts_latch_and_unresolved_never_exposes_prior_identity() -> Result<()> {
+        for changed in [("file:///tables/other", "first"), ("file:///tables/events", "second")] {
+            let mut readback = DeltaTarget::new(TargetTable::from_name("telemetry.sqlserver.events"));
+            readback.observe(Some(("file:///tables/events".into(), "first".into())));
+            readback.observe(None);
+            let unresolved = serde_json::to_value(&readback)?;
+            assert_eq!(unresolved["state"], "unresolved");
+            assert!(unresolved.get("normalized_root").is_none());
+            assert!(unresolved.get("delta_table_id").is_none());
+            readback.observe(Some((changed.0.into(), changed.1.into())));
+            readback.observe(Some(("file:///tables/events".into(), "first".into())));
+            let conflicting = serde_json::to_value(&readback)?;
+            assert_eq!(conflicting["state"], "conflicting");
+            assert!(conflicting.get("normalized_root").is_none());
+            assert!(conflicting.get("delta_table_id").is_none());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn target_readback_redacts_actual_root_and_rejects_unsafe_roots() -> Result<()> {
+        let mut readback = DeltaTarget::new(TargetTable::from_name("telemetry.sqlserver.events"));
+        let root = arrow_deltalake::delta::normalize_delta_target_root(
+            "https://user:password@account.blob.core.windows.net/container/events?sig=secret#fragment",
+        )
+        .context("safe normalized root")?;
+        readback.observe(Some((root, "actual-metadata-id".into())));
+        let json = serde_json::to_string(&readback)?;
+        assert!(json.contains("https://account.blob.core.windows.net/container/events"));
+        for forbidden in ["user", "password", "secret", "fragment", "sig=", "?"] {
+            assert!(!json.contains(forbidden), "{json}");
+        }
+        readback
+            .observe(arrow_deltalake::delta::normalize_delta_target_root("not a URI").map(|root| (root, "id".into())));
+        assert_eq!(serde_json::to_value(&readback)?["state"], "unresolved");
+        Ok(())
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum TargetChange {
+        Identity,
+        InvalidMetadata,
+        MissingLog,
+    }
+
+    struct AdvancingTarget {
+        table: DiscoveredTable,
+        on_clock: bool,
+        change: TargetChange,
+        advanced: AtomicBool,
+    }
+
+    impl AdvancingTarget {
+        fn advance(&self) -> Result<()> {
+            if self.advanced.swap(true, Ordering::SeqCst) {
+                return Ok(());
+            }
+            let path = self
+                .table
+                .url
+                .to_file_path()
+                .map_err(|()| anyhow::anyhow!("table path"))?
+                .join("_delta_log/00000000000000000000.json");
+            if self.change == TargetChange::MissingLog {
+                std::fs::remove_file(path)?;
+                return Ok(());
+            }
+            let original = std::fs::read_to_string(&path)?;
+            let mut actions = original
+                .lines()
+                .map(serde_json::from_str::<serde_json::Value>)
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            for action in &mut actions {
+                if let Some(metadata) = action.get_mut("metaData") {
+                    metadata["id"] = serde_json::json!("replacement-table-id");
+                }
+            }
+            let replacement = if self.change == TargetChange::InvalidMetadata {
+                String::from("invalid metadata JSON\n")
+            } else {
+                actions
+                    .iter()
+                    .map(serde_json::to_string)
+                    .collect::<std::result::Result<Vec<_>, _>>()?
+                    .join("\n")
+                    + "\n"
+            };
+            std::fs::write(path, replacement)?;
+            Ok(())
+        }
+    }
+
+    impl TableDiscovery for AdvancingTarget {
+        fn tables(&self) -> Result<Vec<String>> {
+            Ok(vec![self.table.name.clone()])
+        }
+
+        fn table(&self, _name: &str) -> Result<DiscoveredTable> {
+            Ok(self.table.clone())
+        }
+
+        fn maintenance_now_ms(&self) -> Result<i64> {
+            if self.on_clock {
+                self.advance()?;
+            }
+            Ok(1_704_067_380_000)
+        }
+    }
+
+    fn stale_target_case(in_setup: bool, change: TargetChange) -> Result<()> {
+        let fail_refresh = change != TargetChange::Identity;
+        let root = tempfile::tempdir()?;
+        let url = Url::from_directory_path(root.path().join("events")).map_err(|()| anyhow::anyhow!("table URL"))?;
+        DeltaTable::initialize_url_for_bootstrap(
+            url.clone(),
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+            Vec::new(),
+        )?;
+        let source = AdvancingTarget {
+            table: DiscoveredTable {
+                name: "telemetry.sqlserver.events".into(),
+                url: url.clone(),
+                properties: BTreeMap::new(),
+                log_token: None,
+            },
+            on_clock: !in_setup,
+            change,
+            advanced: AtomicBool::new(false),
+        };
+        let settings = Settings {
+            root: url,
+            tables: vec![source.table.name.clone()],
+            operations: vec![Operation::Checkpoint],
+            apply: false,
+            interval: None,
+            max_idle_backoff: Duration::from_secs(300),
+            max_cycles: None,
+            max_consecutive_stale_plans: 8,
+            max_concurrent_tables: 1,
+            max_concurrent_decoded_bytes: None,
+            operation_timeout: Duration::from_secs(30),
+            commit_attempts: 8,
+            commit_budget: Duration::from_secs(10),
+            catalog_options: Default::default(),
+            granularity: Some(Granularity::Minute),
+            purge_retention_ms: None,
+            anchor_ms: in_setup.then_some(1_704_067_380_000),
+            vacuum_retention_ms: 604_800_000,
+            allow_short_vacuum_retention: false,
+            unsafe_short_vacuum_for_tests: false,
+            optimize: OptimizeConfig::default(),
+            process_properties: BTreeMap::new(),
+            checkpoint_every_commits: 100,
+            log_retention_ms: None,
+            max_prune_files: 100,
+            operation_limits: Default::default(),
+        };
+        let metrics = Metrics::new();
+        let cancel = Arc::new(AtomicBool::new(false));
+        if in_setup {
+            metrics.target_tables(&source.tables()?, &source)?;
+            let schedule = Mutex::new(BTreeMap::new());
+            std::thread::scope(|scope| -> Result<()> {
+                let held = schedule.lock().map_err(|_| anyhow::anyhow!("test schedule lock"))?;
+                let worker = scope.spawn(|| {
+                    maintain_table(
+                        &settings,
+                        &source,
+                        &source.table.name,
+                        &cancel,
+                        &|_| {},
+                        Some(&schedule),
+                        &metrics,
+                    )
+                });
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while target(&metrics)?["state"] != "resolved" {
+                    if Instant::now() >= deadline {
+                        bail!("setup never published initial identity");
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                source.advance()?;
+                drop(held);
+                let results = worker
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("test maintenance worker panicked"))?;
+                assert_eq!(results.len(), 1);
+                assert_eq!(results[0].error_kind.is_some(), fail_refresh);
+                Ok(())
+            })?;
+        } else {
+            let results = run_cycle_with_discovery(&settings, &source, &metrics, &cancel)?;
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].error_kind.is_some(), fail_refresh);
+        }
+        assert!(
+            source.advanced.load(Ordering::SeqCst),
+            "witness must advance the actual table"
+        );
+        let readback = target(&metrics)?;
+        assert_eq!(
+            readback["state"],
+            if fail_refresh { "unresolved" } else { "conflicting" }
+        );
+        assert!(readback.get("normalized_root").is_none());
+        assert!(readback.get("delta_table_id").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn stale_target_refresh_invalidates_before_reading() -> Result<()> {
+        let metrics = Metrics::new();
+        let source = FilesystemDiscovery::new(Url::parse("file:///unused/")?, Vec::new());
+        let name = "telemetry.sqlserver.events";
+        metrics.target_tables(&[name.into()], &source)?;
+        metrics.observe_target(name, Some(("file:///tables/events".into(), "first-id".into())))?;
+        let result = refresh_target_metadata(&metrics, name, || {
+            let readback = target(&metrics)?;
+            assert_eq!(readback["state"], "unresolved");
+            assert!(readback.get("normalized_root").is_none());
+            assert!(readback.get("delta_table_id").is_none());
+            bail!("injected metadata read failure")
+        });
+        assert!(result.is_err());
+        assert_eq!(target(&metrics)?["state"], "unresolved");
+        Ok(())
+    }
+
+    #[test]
+    fn stale_target_setup_latches_new_metadata_identity() -> Result<()> {
+        stale_target_case(true, TargetChange::Identity)
+    }
+
+    #[test]
+    fn stale_target_setup_failed_refresh_is_unresolved() -> Result<()> {
+        stale_target_case(true, TargetChange::InvalidMetadata)
+    }
+
+    #[test]
+    fn stale_target_operation_latches_new_metadata_identity() -> Result<()> {
+        stale_target_case(false, TargetChange::Identity)
+    }
+
+    #[test]
+    fn stale_target_operation_failed_refresh_is_unresolved() -> Result<()> {
+        stale_target_case(false, TargetChange::InvalidMetadata)
+    }
+
+    #[test]
+    fn stale_target_setup_missing_log_is_unresolved() -> Result<()> {
+        stale_target_case(true, TargetChange::MissingLog)
+    }
+
+    #[test]
+    fn stale_target_operation_missing_log_is_unresolved() -> Result<()> {
+        stale_target_case(false, TargetChange::MissingLog)
+    }
+
+    #[test]
+    fn health_route_serializes_target_state_as_json() -> Result<()> {
+        let metrics = Metrics::new();
+        let discovery = FilesystemDiscovery::new(Url::parse("file:///unused/")?, Vec::new());
+        metrics.target_tables(&["telemetry.sqlserver.events".into()], &discovery)?;
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let mut client = TcpStream::connect(listener.local_addr()?)?;
+        client.write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")?;
+        respond(listener.accept()?.0, &metrics)?;
+        let mut response = String::new();
+        client.read_to_string(&mut response)?;
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\nContent-Type: application/json"));
+        let (_, body) = response.split_once("\r\n\r\n").context("HTTP body")?;
+        let health: serde_json::Value = serde_json::from_str(body)?;
+        assert_eq!(health["delta_targets"][0]["state"], "unresolved");
+        Ok(())
+    }
 }
 
 struct OperationProperties<'a> {
@@ -1856,6 +2363,21 @@ fn retry_stale_table_discovery<T>(table: &str, mut discover: impl FnMut() -> Res
     }
 }
 
+fn refresh_target_metadata(
+    metrics: &Metrics,
+    name: &str,
+    read: impl FnOnce() -> Result<MaintenanceMetadata>,
+) -> Result<MaintenanceMetadata> {
+    if let Err(error) = metrics.observe_target(name, None) {
+        eprintln!("delta-maintenance target invalidation failed: {error:#}");
+    }
+    let metadata = read()?;
+    if let Err(error) = metrics.observe_target(name, metadata.target.clone()) {
+        eprintln!("delta-maintenance target readback update failed: {error:#}");
+    }
+    Ok(metadata)
+}
+
 fn maintain_table(
     settings: &Settings,
     discovery: &dyn TableDiscovery,
@@ -1863,6 +2385,7 @@ fn maintain_table(
     force_abort: &Arc<AtomicBool>,
     emit: &dyn Fn(&OperationResult),
     schedule: Option<&Mutex<ScheduledTables>>,
+    metrics: &Metrics,
 ) -> Vec<OperationResult> {
     let mut results = Vec::new();
     let setup = (|| -> Result<_> {
@@ -1870,6 +2393,28 @@ fn maintain_table(
         let gate = table_gate(discovered.url.as_str())
             .lock()
             .map_err(|_| anyhow::anyhow!("per-table maintenance gate poisoned"))?;
+        let limits = &settings.operation_limits;
+        let probe = discovery.open_probe_table(&discovered.url, limits.discovery_max_log_files);
+        // Storage errors may include credential-bearing URIs.
+        let metadata = match &probe {
+            Ok(probe) => match probe
+                .maintenance_metadata_with_limits(limits.discovery_max_log_files, limits.discovery_max_log_file_bytes)
+            {
+                Ok(metadata) => Some(metadata),
+                Err(_) => {
+                    eprintln!("delta-maintenance target metadata readback failed; identity unresolved table={name}");
+                    None
+                }
+            },
+            Err(_) => {
+                eprintln!("delta-maintenance target open failed; identity unresolved table={name}");
+                None
+            }
+        };
+        if let Err(error) = metrics.observe_target(name, metadata.as_ref().and_then(|metadata| metadata.target.clone()))
+        {
+            eprintln!("delta-maintenance target readback update failed: {error:#}");
+        }
         let (effective, props) = effective_settings(settings, &discovered.properties)?;
         if let Some(schedule) = schedule {
             let mut schedule = schedule
@@ -1889,20 +2434,27 @@ fn maintain_table(
             }
             schedule.insert(name.into(), (now, policy));
         }
-        let limits = &settings.operation_limits;
-        let probe = discovery.open_probe_table(&discovered.url, limits.discovery_max_log_files)?;
-        let token = probe.probe_log_token(limits.discovery_max_log_files)?;
-        if discovered.log_token.as_ref().is_none_or(|previous| *previous != token)
-            && !policy_matches(
-                settings,
-                &probe.maintenance_properties_with_limits(
+        let probe = probe?;
+        let token = probe.probe_log_token(limits.discovery_max_log_files).inspect_err(|_| {
+            if let Err(error) = metrics.observe_target(name, None) {
+                eprintln!("delta-maintenance target invalidation failed: {error:#}");
+            }
+        })?;
+        let metadata = match metadata.filter(|metadata| metadata.log_token == token) {
+            Some(metadata) => Ok(metadata),
+            None => refresh_target_metadata(metrics, name, || {
+                probe.maintenance_metadata_with_limits(
                     limits.discovery_max_log_files,
                     limits.discovery_max_log_file_bytes,
-                )?,
-                &props,
-            )?
-        {
-            bail!("table properties changed after discovery; retry");
+                )
+            }),
+        };
+        if discovered.log_token.as_ref().is_none_or(|previous| *previous != token) {
+            if !policy_matches(settings, &metadata?.properties, &props)? {
+                bail!("table properties changed after discovery; retry");
+            }
+        } else if metadata.is_err() {
+            eprintln!("delta-maintenance target metadata refresh failed; identity unresolved table={name}");
         }
         discovered.log_token = Some(token);
         let config = configuration_evidence(settings, &effective, &props)?;
@@ -1952,14 +2504,23 @@ fn maintain_table(
                         .with_commit_retry_limits(effective.commit_attempts, effective.commit_budget)?;
                 let probe_started = Instant::now();
                 let probe_result = (|| -> Result<Option<MaintenanceReport>> {
-                    let token = probe.probe_log_token(settings.operation_limits.discovery_max_log_files)?;
+                    let token = probe
+                        .probe_log_token(settings.operation_limits.discovery_max_log_files)
+                        .inspect_err(|_| {
+                            if let Err(error) = metrics.observe_target(name, None) {
+                                eprintln!("delta-maintenance target invalidation failed: {error:#}");
+                            }
+                        })?;
                     if observed_token.as_ref().is_some_and(|previous| *previous != token)
                         && !policy_matches(
                             settings,
-                            &probe.maintenance_properties_with_limits(
-                                settings.operation_limits.discovery_max_log_files,
-                                settings.operation_limits.discovery_max_log_file_bytes,
-                            )?,
+                            &refresh_target_metadata(metrics, name, || {
+                                probe.maintenance_metadata_with_limits(
+                                    settings.operation_limits.discovery_max_log_files,
+                                    settings.operation_limits.discovery_max_log_file_bytes,
+                                )
+                            })?
+                            .properties,
                             props,
                         )?
                     {
@@ -2147,7 +2708,26 @@ fn cycle_with_discovery(
     force_abort: &Arc<AtomicBool>,
     schedule: Option<&Mutex<ScheduledTables>>,
 ) -> Result<Vec<OperationResult>> {
+    if let Err(error) = metrics.invalidate_targets() {
+        eprintln!("delta-maintenance target invalidation failed: {error:#}");
+    }
     let names = discovery.tables()?;
+    let mut target_names = names.clone();
+    match discovery.pending_tables() {
+        Ok(pending) => target_names.extend(pending),
+        Err(error) => {
+            eprintln!("delta-maintenance pending-target readback failed: {error:#}");
+            target_names.extend(settings.tables.iter().cloned());
+        }
+    }
+    target_names.sort();
+    target_names.dedup();
+    if target_names.len() > MAX_TABLES {
+        bail!("target readback exceeds {MAX_TABLES} tables");
+    }
+    if let Err(error) = metrics.target_tables(&target_names, discovery) {
+        eprintln!("delta-maintenance target inventory readback failed: {error:#}");
+    }
     if settings.interval.is_none() && !settings.tables.is_empty() {
         let missing = settings
             .tables
@@ -2195,7 +2775,7 @@ fn cycle_with_discovery(
                     if stop_admission.load(Ordering::SeqCst) || force_abort.load(Ordering::SeqCst) {
                         break;
                     }
-                    let mut done = maintain_table(settings, discovery, &name, force_abort, &emit, schedule);
+                    let mut done = maintain_table(settings, discovery, &name, force_abort, &emit, schedule, metrics);
                     if let Ok(mut results) = results.lock() {
                         results.append(&mut done);
                     }
