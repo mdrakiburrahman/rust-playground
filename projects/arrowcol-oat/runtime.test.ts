@@ -15,6 +15,20 @@ const config = (): RuntimeConfig => ({
   images: Object.fromEntries(['sqlserver', 'catalog', 'router', 'dataflow'].map((role) =>
     [role, `arrowcollector89152.azurecr.io/${role}@sha256:${'a'.repeat(64)}`])) as RuntimeConfig['images'],
 });
+const scaleOutConfig = (): RuntimeConfig => {
+  const c = config();
+  c.campaignProfile = 'scale_out_single_table';
+  c.hotTable = 'sqlserver_availability_replica_states';
+  c.collectorReplicas = 3;
+  c.routerReplicas = 3;
+  c.quiver = false;
+  c.resources = { collector: { requests: { cpu: '2', memory: '4Gi' }, limits: { cpu: null, memory: '6Gi' } } };
+  c.maintenance = { tables: ['telemetry.sqlserver.sqlserver_availability_replica_states'],
+    operations: ['optimize', 'checkpoint', 'purge', 'vacuum', 'prune-log'], apply: true };
+  c.images.maintenance = `arrowcollector89152.azurecr.io/delta-maintenance@sha256:${'b'.repeat(64)}`;
+  return c;
+};
+
 
 test('rejects mutable images, QAP namespace, wrong stamp and unknown fields', () => {
   assert.throws(() => validateRuntime({ ...config(), namespace: 'azure-qap' }));
@@ -36,6 +50,66 @@ test('AKS resource overrides are strict and project through to role manifests', 
     granularity: 'day' };
   c.effective_stop_budgets = { maintenance_grace_seconds: 1200, maintenance_stop_timeout_ms: 1_500_000 };
   c.images.maintenance = 'arrowcollector89152.azurecr.io/delta-maintenance@sha256:' + 'b'.repeat(64);
+test('scale-out admits one memory-only hot table with matching spread replicas and explicit maintenance', async () => {
+  const c = scaleOutConfig();
+  validateRuntime(c);
+  const render = async () => renderRuntime(c, 'workload');
+  let objects = await render();
+  const get = (name: string) => objects.find(o => o.kind === 'Deployment' && o.metadata.name === name)!;
+  const collector = get('arrowcol');
+  const router = get('arrowcol-router');
+  assert.equal(collector.spec.replicas, 3);
+  assert.equal(router.spec.replicas, 3);
+  for (const deployment of [collector, router]) {
+    assert.deepEqual(deployment.spec.template.spec.affinity.podAntiAffinity.requiredDuringSchedulingIgnoredDuringExecution, [{
+      labelSelector: { matchLabels: { app: deployment.metadata.name } }, topologyKey: 'kubernetes.io/hostname',
+    }]);
+  }
+  assert.deepEqual(collector.spec.template.spec.containers[0].resources.limits, { memory: '6Gi' });
+  const maintenance = get('delta-maintenance');
+  assert.equal(maintenance.spec.replicas, 0);
+  assert.ok(maintenance.spec.template.spec.containers[0].args.includes('--apply'));
+
+  c.resources!.collector!.limits.cpu = '4';
+  objects = await render();
+  assert.equal(get('arrowcol').spec.template.spec.containers[0].resources.limits.cpu, '4');
+  c.resources!.collector!.limits.cpu = 'invalid';
+  assert.throws(() => validateRuntime(c), /Kubernetes CPU quantity/);
+  c.resources!.collector!.limits.cpu = '1';
+  assert.throws(() => validateRuntime(c), /must not exceed limits/);
+  delete c.resources!.collector!.limits.cpu;
+  validateRuntime(c);
+  objects = await render();
+  assert.deepEqual(get('arrowcol').spec.template.spec.containers[0].resources.limits, { memory: '6Gi' });
+
+  c.hotTable = 'other_table';
+  assert.throws(() => validateRuntime(c), /approved hot table/);
+  c.hotTable = 'sqlserver_availability_replica_states';
+  c.quiver = true;
+  assert.throws(() => validateRuntime(c), /memory-only buffering/);
+  c.quiver = false;
+  c.routerReplicas = 2;
+  assert.throws(() => validateRuntime(c), /matching 1..16/);
+  c.routerReplicas = 3;
+  c.collectorReplicas = 17;
+  c.routerReplicas = 17;
+  assert.throws(() => validateRuntime(c), /matching 1..16/);
+  c.collectorReplicas = 3;
+  c.routerReplicas = 3;
+  c.maintenance!.apply = false;
+  assert.throws(() => validateRuntime(c), /all five operations/);
+  c.maintenance!.apply = true;
+  c.maintenance!.operations.pop();
+  assert.throws(() => validateRuntime(c), /all five operations/);
+
+  const legacy = await renderRuntime(config(), 'workload');
+  const legacyCollector = legacy.find(o => o.kind === 'Deployment' && o.metadata.name === 'arrowcol')!;
+  assert.equal(legacyCollector.spec.replicas, 1);
+  assert.equal(legacyCollector.spec.template.spec.containers[0].resources.limits.cpu, '2');
+  assert.equal(legacyCollector.spec.template.spec.affinity, undefined);
+  assert.throws(() => validateRuntime({ ...config(), collectorReplicas: 2 }), /require campaignProfile/);
+});
+
   const objects = await renderRuntime(c, 'workload');
   const get = (name: string) => objects.find(o => o.kind === 'Deployment' && o.metadata.name === name)!;
   const collector = get('arrowcol').spec.template.spec.containers[0];

@@ -25,7 +25,7 @@ aks:
       vmSize: Standard_D64ds_v6
       initialCount: 0
       minCount: 0
-      maxCount: 1
+      maxCount: 4
       maxPods: 250
       availabilityZones: []
     - name: benche64
@@ -33,7 +33,7 @@ aks:
       vmSize: Standard_E64ds_v6
       initialCount: 0
       minCount: 0
-      maxCount: 1
+      maxCount: 4
       maxPods: 250
       availabilityZones: []
   network:
