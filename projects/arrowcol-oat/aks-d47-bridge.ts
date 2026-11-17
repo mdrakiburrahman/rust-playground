@@ -20,7 +20,7 @@ export const PLANNED_CONTROL_OPERATION_IDS = [
   'terminal-acquire', 'terminal-compare-read', 'terminal-metadata-write', 'terminal-release',
 ] as const;
 export const PLANNED_STORAGE_OPERATION_IDS = [
-  'preflight-table-list', 'preflight-log-list', 'delta-v0-commit', 'postwrite-table-list', 'delta-v0-last-checkpoint', 'delta-v0-last-checkpoint-followup', 'delta-v0-readback',
+  'preflight-table-list', 'preflight-log-list', 'delta-v0-commit', 'postwrite-table-list', 'delta-v0-last-checkpoint', 'delta-v0-versioned-log-list', 'delta-v0-readback',
 ] as const;
 type Obj = Record<string, unknown>;
 
@@ -864,7 +864,7 @@ export class StorageBridgeDispatcher {
     if (request.target !== 'object_store') return undefined;
     const index = progress.operationIndex, expectedMarker = plan.storage_operation_ids[index];
     if (progress.blocked || expectedMarker === undefined || marker !== expectedMarker)
-      throw new Error('Object-store request is missing, reuses, reorders or substitutes its exact planned operation marker.');
+      throw new Error("Object-store request is missing, reuses, reorders or substitutes its exact planned operation marker.");
     const url = new URL(request.url), table = new URL(this.options.authority.table_root_url);
     const container = new URL(this.options.authority.control_container_url);
     const tablePrefix = table.pathname.slice(1);
@@ -883,15 +883,15 @@ export class StorageBridgeDispatcher {
       index === 1 ? exactList(tablePrefix + '_delta_log/', (tablePrefix + '_delta_log/').slice(0, -1)) :
       index === 2 ? request.method === 'PUT' && url.href === logUrl :
       index === 4 ? request.method === 'GET' && url.href === checkpointUrl :
-      index === 5 ? request.method === 'GET' && url.href === checkpointUrl :
+      index === 5 ? exactList(tablePrefix + '_delta_log/', tablePrefix + '_delta_log/00000000000000000000') :
       index === 6 ? request.method === 'GET' && url.href === logUrl : false;
     if (!phaseAllowed || !shapeAllowed)
-      throw new Error(`Object-store request does not match planned marker ${expectedMarker} at control operation ${control.operationIndex}.`);
+      throw new Error("Object-store request does not match the exact planned marker, phase and URL.");
     return { operationIndex: index };
   }
   private recordPlannedStorageResponse(step: PlannedStorageStep | undefined, reply: StorageBridgeReply): void {
     if (!step || !this.storageProgress) return;
-    const expectedStatus = step.operationIndex === 2 ? 201 : step.operationIndex === 4 || step.operationIndex === 5 ? 404 : 200;
+    const expectedStatus = step.operationIndex === 2 ? 201 : step.operationIndex === 4 ? 404 : 200;
     this.storageProgress.operationIndex++;
     if (reply.outcome !== 'response' || reply.status !== expectedStatus) this.storageProgress.blocked = true;
   }

@@ -626,18 +626,20 @@ test('real loadgen initializer composes with the Node BR3 planned-identity paren
   const logListing = signedObjectRequest(authority, deadline, 15, 'GET', logListingUrl, '', [['x-arrowcol-operation-id', PLANNED_STORAGE_OPERATION_IDS[1]]]);
   const logUrl = `https://${account}.blob.core.windows.net/${container}/${listPrefix}_delta_log/00000000000000000000.json`;
   const checkpointUrl = `https://${account}.blob.core.windows.net/${container}/${listPrefix}_delta_log/_last_checkpoint`;
+  const versionedLogListingUrl = controlBase + "?restype=container&comp=list&prefix=" +
+    encodeURIComponent(deltaLogPrefix) + "&startFrom=" + encodeURIComponent(deltaLogPrefix + "00000000000000000000");
   const deltaCommit = signedObjectRequest(authority, deadline, 16, 'PUT', logUrl, plan.delta_v0.body,
     [['if-none-match', '*'], ['x-ms-blob-type', 'BlockBlob'], ['content-length', String(Buffer.byteLength(plan.delta_v0.body, 'utf8'))],
       ['x-arrowcol-operation-id', PLANNED_STORAGE_OPERATION_IDS[2]]]);
   const postwriteListing = signedObjectRequest(authority, deadline, 17, 'GET', listUrl, '',
     [['x-arrowcol-operation-id', PLANNED_STORAGE_OPERATION_IDS[3]]]);
   const deltaLastCheckpoint = signedObjectRequest(authority, deadline, 18, 'GET', checkpointUrl, '',
-    [['x-arrowcol-operation-id', PLANNED_STORAGE_OPERATION_IDS[4]]]);
-  const deltaLastCheckpointFollowup = signedObjectRequest(authority, deadline, 19, 'GET', checkpointUrl, '',
+    [['content-length', '0'], ['x-arrowcol-operation-id', PLANNED_STORAGE_OPERATION_IDS[4]]]);
+  const deltaVersionedLogListing = signedObjectRequest(authority, deadline, 19, 'GET', versionedLogListingUrl, '',
     [['x-arrowcol-operation-id', PLANNED_STORAGE_OPERATION_IDS[5]]]);
   const deltaReadback = signedObjectRequest(authority, deadline, 20, 'GET', logUrl, '',
-    [['x-arrowcol-operation-id', PLANNED_STORAGE_OPERATION_IDS[6]]]);
-  const envelope = envelopeForRequests(authority, [...controlRequests, initialListing, logListing, deltaCommit, postwriteListing, deltaLastCheckpoint, deltaLastCheckpointFollowup, deltaReadback]);
+    [['content-length', '0'], ['x-arrowcol-operation-id', PLANNED_STORAGE_OPERATION_IDS[6]]]);
+  const envelope = envelopeForRequests(authority, [...controlRequests, initialListing, logListing, deltaCommit, postwriteListing, deltaLastCheckpoint, deltaVersionedLogListing, deltaReadback]);
   const custody = mutableCustodyStore(authority, now);
   const azure = { c: { account }, async token() { return 'offline-test-token'; } } as unknown as Azure;
   const ledgerPath = path.join(directory, 'storage-ledger.jsonl');
