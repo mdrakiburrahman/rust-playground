@@ -1157,7 +1157,8 @@ mod downstream_runner_tests {
     impl Drop for PendingDelivery<'_> {
         fn drop(&mut self) {
             self.dropped_after_ms.store(
-                u64::try_from(self.started.elapsed().as_millis()).expect("bounded fixture duration"),
+                u64::try_from(self.started.elapsed().as_millis())
+                    .unwrap_or_else(|error| panic!("bounded fixture duration overflow: {error}")),
                 std::sync::atomic::Ordering::SeqCst,
             );
             tokio::time::resume();
@@ -1297,7 +1298,9 @@ mod downstream_runner_tests {
             ))
         }
         async fn cancel_client(&self, _: &OatConfig, handle: &ClientHandle) -> Result<()> {
-            self.cancellations.lock().expect("fixture cancellations poisoned").push(handle.client_id.clone());
+            self.cancellations.lock()
+                .map_err(|error| anyhow::anyhow!("fixture cancellations poisoned: {error}"))?
+                .push(handle.client_id.clone());
             if matches!(self.fault, Fault::ScheduleAckCancellationFailed) && handle.client_id == "client-1" {
                 bail!("fixture_cancel_failed");
             }
@@ -1479,7 +1482,8 @@ mod downstream_runner_tests {
             assert_eq!(platform.clients_started, 3, "{fault:?}");
             let dropped_after_ms = platform.delivery_drop_ms.load(std::sync::atomic::Ordering::SeqCst);
             assert!((1_900..=2_100).contains(&dropped_after_ms), "{fault:?}: dropped after {dropped_after_ms}ms");
-            let cancelled = platform.cancellations.lock().expect("fixture cancellations poisoned");
+            let cancelled = platform.cancellations.lock()
+                .map_err(|error| anyhow::anyhow!("fixture cancellations poisoned: {error}"))?;
             assert_eq!(cancelled.len(), 3, "{fault:?}");
             assert_eq!(cancelled.iter().cloned().collect::<HashSet<_>>(),
                 ["client-1", "client-2", "client-3"].map(str::to_owned).into_iter().collect::<HashSet<_>>());
