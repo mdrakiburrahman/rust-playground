@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use anyhow::{Context, Result, bail};
@@ -16,7 +16,8 @@ pub(crate) static PROCESS_ROUTING_SHUTDOWN: LazyLock<RoutingShutdown> = LazyLock
 pub struct RoutingShutdown {
     registrations: Mutex<Vec<(Arc<dyn RoutingStore>, CollectorInstanceId)>>,
     failed: AtomicBool,
-    pending: Mutex<HashMap<PublicationId, PublicationState>>,
+    next_publication_generation: AtomicU64,
+    pending: Mutex<HashMap<PublicationId, PendingPublication>>,
     workers: Mutex<HashMap<PathBuf, Arc<AtomicBool>>>,
 }
 
@@ -25,6 +26,14 @@ enum PublicationState {
     NeverStaged,
     Staged,
     Nacked,
+}
+
+struct PendingPublication {
+    state: PublicationState,
+    generation: u64,
+    active_admissions: usize,
+    owner_failed: bool,
+    send_succeeded: bool,
 }
 
 #[derive(Default, Debug, PartialEq, Eq)]
@@ -52,6 +61,15 @@ impl RoutingShutdown {
         self.failed.store(true, Ordering::Release);
     }
 
+    fn next_publication_generation(&self) -> Result<u64> {
+        self.next_publication_generation
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |generation| {
+                generation.checked_add(1)
+            })
+            .map(|previous| previous + 1)
+            .map_err(|_| anyhow::anyhow!("publication generation exhausted"))
+    }
+
     /// Tracks an admitted or NACKed publication until that exact identity publishes successfully.
     ///
     /// # Errors
@@ -64,7 +82,20 @@ impl RoutingShutdown {
         if published {
             pending.remove(&publication_id);
         } else {
-            pending.insert(publication_id, PublicationState::Nacked);
+            match pending.entry(publication_id) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    entry.get_mut().state = PublicationState::Nacked;
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(PendingPublication {
+                        state: PublicationState::Nacked,
+                        generation: self.next_publication_generation()?,
+                        active_admissions: 0,
+                        owner_failed: false,
+                        send_succeeded: false,
+                    });
+                }
+            }
         }
         Ok(())
     }
@@ -74,9 +105,22 @@ impl RoutingShutdown {
             .pending
             .lock()
             .map_err(|_| anyhow::anyhow!("publication accounting poisoned"))?;
-        let state = pending.entry(publication_id).or_insert(PublicationState::Staged);
-        if *state != PublicationState::Nacked {
-            *state = PublicationState::Staged;
+        match pending.entry(publication_id) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                let state = &mut entry.get_mut().state;
+                if *state != PublicationState::Nacked {
+                    *state = PublicationState::Staged;
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(PendingPublication {
+                    state: PublicationState::Staged,
+                    generation: self.next_publication_generation()?,
+                    active_admissions: 0,
+                    owner_failed: false,
+                    send_succeeded: false,
+                });
+            }
         }
         Ok(())
     }
@@ -94,25 +138,59 @@ impl RoutingShutdown {
         publication_id: PublicationId,
         send: impl Future<Output = Result<(), E>>,
     ) -> Result<Result<(), E>> {
-        let created_entry = {
+        let (generation, is_owner) = {
             let mut pending = self
                 .pending
                 .lock()
                 .map_err(|_| anyhow::anyhow!("publication accounting poisoned"))?;
             match pending.entry(publication_id) {
                 std::collections::hash_map::Entry::Vacant(entry) => {
-                    entry.insert(PublicationState::NeverStaged);
-                    true
+                    let generation = self.next_publication_generation()?;
+                    entry.insert(PendingPublication {
+                        state: PublicationState::NeverStaged,
+                        generation,
+                        active_admissions: 1,
+                        owner_failed: false,
+                        send_succeeded: false,
+                    });
+                    (generation, true)
                 }
-                std::collections::hash_map::Entry::Occupied(_) => false,
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    let pending = entry.get_mut();
+                    pending.active_admissions = pending
+                        .active_admissions
+                        .checked_add(1)
+                        .ok_or_else(|| anyhow::anyhow!("publication admission count exhausted"))?;
+                    (pending.generation, false)
+                }
             }
         };
         let result = send.await;
-        if created_entry && result.is_err() {
-            self.pending
-                .lock()
-                .map_err(|_| anyhow::anyhow!("publication accounting poisoned"))?
-                .remove(&publication_id);
+        let mut pending = self
+            .pending
+            .lock()
+            .map_err(|_| anyhow::anyhow!("publication accounting poisoned"))?;
+        let remove = match pending.get_mut(&publication_id) {
+            Some(entry) if entry.generation == generation => {
+                if is_owner && result.is_err() {
+                    entry.owner_failed = true;
+                }
+                if result.is_ok() {
+                    entry.send_succeeded = true;
+                }
+                entry.active_admissions = entry
+                    .active_admissions
+                    .checked_sub(1)
+                    .ok_or_else(|| anyhow::anyhow!("publication admission accounting underflow"))?;
+                entry.owner_failed
+                    && entry.active_admissions == 0
+                    && !entry.send_succeeded
+                    && entry.state == PublicationState::NeverStaged
+            }
+            _ => false,
+        };
+        if remove {
+            pending.remove(&publication_id);
         }
         Ok(result)
     }
@@ -242,6 +320,65 @@ mod tests {
             assert_eq!(sent, Err(error));
         }
         shutdown.finish(true).await
+    }
+
+    #[tokio::test]
+    async fn failed_creator_preserves_overlapping_successful_admission() -> Result<()> {
+        let shutdown = RoutingShutdown::default();
+        let publication = PublicationId::new();
+        let (first_started_tx, first_started_rx) = tokio::sync::oneshot::channel();
+        let (release_first_tx, release_first_rx) = tokio::sync::oneshot::channel();
+        let first = shutdown.admit_publication(publication, async move {
+            first_started_tx.send(()).map_err(|_| "first admission dropped")?;
+            release_first_rx.await.map_err(|_| "release dropped")?;
+            Err("route full")
+        });
+        let second = async {
+            first_started_rx.await?;
+            let result = shutdown
+                .admit_publication(publication, async { Ok::<(), &str>(()) })
+                .await?;
+            release_first_tx
+                .send(())
+                .map_err(|_| anyhow::anyhow!("first admission stopped"))?;
+            Ok::<_, anyhow::Error>(result)
+        };
+        let (first, second) = tokio::join!(first, second);
+        assert_eq!(first?, Err("route full"));
+        assert_eq!(second?, Ok(()));
+        let error = shutdown.finish(true).await.unwrap_err().to_string();
+        assert!(error.contains("never_staged=1"), "{error}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stale_creator_cannot_remove_replacement_generation() -> Result<()> {
+        let shutdown = RoutingShutdown::default();
+        let publication = PublicationId::new();
+        let (first_started_tx, first_started_rx) = tokio::sync::oneshot::channel();
+        let (release_first_tx, release_first_rx) = tokio::sync::oneshot::channel();
+        let first = shutdown.admit_publication(publication, async move {
+            first_started_tx.send(()).map_err(|_| "first admission dropped")?;
+            release_first_rx.await.map_err(|_| "release dropped")?;
+            Err("route full")
+        });
+        let replacement = async {
+            first_started_rx.await?;
+            shutdown.publication_finished(publication, true)?;
+            let result = shutdown
+                .admit_publication(publication, async { Ok::<(), &str>(()) })
+                .await?;
+            release_first_tx
+                .send(())
+                .map_err(|_| anyhow::anyhow!("first admission stopped"))?;
+            Ok::<_, anyhow::Error>(result)
+        };
+        let (first, replacement) = tokio::join!(first, replacement);
+        assert_eq!(first?, Err("route full"));
+        assert_eq!(replacement?, Ok(()));
+        let error = shutdown.finish(true).await.unwrap_err().to_string();
+        assert!(error.contains("never_staged=1"), "{error}");
+        Ok(())
     }
 
     #[tokio::test]
