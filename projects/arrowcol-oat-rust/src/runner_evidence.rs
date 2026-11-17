@@ -267,6 +267,7 @@ mod official_cell_measurement_tests {
                 id: id.to_owned(), config_sha256: server_sha.to_owned(), state: crate::model::RunState::Running,
                 progress: "synthetic offline original-cell proof".to_owned(), result_count: 0,
                 error: None, started_at_unix_ms: 1_000, finished_at_unix_ms: None,
+                local_teardown: None,
             });
             let identity = capture_submitted_config_identity(&state, id).await.context("missing captured identity")?;
             assert!(capture_submitted_config_identity(&state, &inventory.cell_run_id).await.is_none());

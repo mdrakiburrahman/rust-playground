@@ -16,6 +16,9 @@ if (tool === 'docker') {
     const services = { 'guard-client': 'oat-client', 'guard-maintenance': 'delta-maintenance', 'guard-collector': 'dataflow-1' };
     if (args[0] === 'compose' && args.includes('down')) {
       writeFileSync(join(root, 'compose-destroyed'), '');
+      const profiles = args.flatMap((arg, index) => arg === '--profile' ? [args[index + 1]] : []);
+      writeFileSync(join(root, 'down-profiles'), JSON.stringify(profiles));
+      if (profiles.includes('maintenance')) writeFileSync(join(root, 'guard-maintenance-removed'), '');
     } else if (args[0] === 'ps' || args[0] === 'compose' && args.includes('ps')) {
       console.log(args.some(arg => arg.includes('service=oat-client'))
         ? existsSync(join(root, 'guard-client-removed')) ? '' : 'guard-client'

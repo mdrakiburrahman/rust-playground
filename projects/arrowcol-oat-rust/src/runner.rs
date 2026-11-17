@@ -3,7 +3,7 @@ use crate::config::{
     parse_cpu_millicores as parse_resource_cpu_millicores, parse_memory_bytes as parse_resource_memory_bytes,
 };
 use crate::model::{AppState, RunState, unix_time_ms};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
     TimestampMillisecondArray, UInt64Array,
@@ -3079,6 +3079,7 @@ async fn run_matrix(
     cancellation: watch::Receiver<bool>,
 ) -> MatrixOutcome {
     let submitted_config = capture_submitted_config_identity(&state, orchestration_id).await;
+    let cell_state = Arc::clone(&state);
     run_matrix_with(
         config,
         orchestration_id,
@@ -3092,6 +3093,7 @@ async fn run_matrix(
                 concurrency,
                 cancellation.clone(),
                 submitted_config.clone(),
+                Arc::clone(&cell_state),
             )
         },
     )
@@ -3114,6 +3116,7 @@ where
     for (completed, (replicas, concurrency, run_id)) in cells.into_iter().enumerate() {
         state
             .update(orchestration_id, |status| {
+                status.local_teardown = None;
                 status.progress = format!(
                     "experiment {}/{total}: ArrowCol replicas={replicas}, DFE --num-cores={concurrency}",
                     completed + 1
@@ -3155,6 +3158,70 @@ where
     }
 }
 
+fn local_teardown_transition(
+    config: &OatConfig,
+    cell_id: &str,
+    rows: &[OatResult],
+) -> Result<Option<crate::model::LocalTeardown>> {
+    if rows.is_empty() || rows.iter().any(|row| row.run_id != cell_id || row.status != "succeeded") {
+        return Ok(None);
+    }
+    let mut schedule = None;
+    for row in rows {
+        let evidence: Value = serde_json::from_str(row.evidence_json.as_deref().context("missing cell evidence")?)?;
+        let published = &evidence["client_schedule"];
+        ensure!(
+            published["scope"] == "orchestrator_assigned_schedule_with_observed_full_fleet_acknowledgement",
+            "missing acknowledged cell schedule"
+        );
+        let start = published["effective"]["run_start_unix_ms"].as_u64().context("missing schedule start")?;
+        let acknowledged = published["effective"]["acknowledged_at_unix_ms"].as_u64().context("missing schedule acknowledgement")?;
+        let measurement_start = published["effective"]["measurement_start_unix_ms"].as_u64().context("missing measurement start")?;
+        let end = published["effective"]["measurement_end_unix_ms"].as_u64().context("missing measurement end")?;
+        let expected_start = start.checked_add(config.warmup_seconds.checked_mul(1_000).context("warmup overflow")?)
+            .context("measurement start overflow")?;
+        let expected_end = start
+            .checked_add(config.warmup_seconds.checked_add(config.measure_seconds).context("duration overflow")?
+                .checked_mul(1_000).context("duration milliseconds overflow")?)
+            .context("measurement end overflow")?;
+        ensure!(start > 0 && acknowledged < start && measurement_start == expected_start && end == expected_end,
+            "measurement window identity mismatch");
+        ensure!(schedule.is_none_or(|previous| previous == (start, end)), "cell schedules differ");
+        schedule = Some((start, end));
+    }
+    let (start, end) = schedule.context("missing cell schedule")?;
+    let root = config.platform.compose_state_root.as_deref().context("local state root missing")?;
+    let path = std::env::current_dir()?.join(root).join(cell_id).join("control/schedule");
+    let raw = fs::read_to_string(path).context("read authoritative schedule before local teardown")?;
+    ensure!(raw == format!("{start}\n"), "authoritative schedule changed before local teardown");
+    let now = unix_time_ms_u64()?;
+    ensure!(now >= end, "measurement window has not ended");
+    Ok(Some(crate::model::LocalTeardown {
+        cell_id: cell_id.to_owned(),
+        schedule_unix_ms: start,
+        measurement_end_unix_ms: end,
+        started_at_unix_ms: now,
+    }))
+}
+
+async fn publish_local_teardown(
+    state: &AppState,
+    orchestration_id: &str,
+    config: &OatConfig,
+    run_id: &str,
+    rows: &[OatResult],
+) {
+    match local_teardown_transition(config, run_id, rows) {
+        Ok(Some(transition)) => state.update(orchestration_id, |status| {
+            if matches!(status.state, crate::model::RunState::Running) {
+                status.local_teardown = Some(transition);
+            }
+        }).await,
+        Ok(None) => {}
+        Err(error) => tracing::warn!(%error, "local teardown transition unavailable"),
+    }
+}
+
 async fn run_isolated_cell(
     config: OatConfig,
     orchestration_id: &str,
@@ -3163,6 +3230,7 @@ async fn run_isolated_cell(
     concurrency: u32,
     mut cancellation: watch::Receiver<bool>,
     submitted_config: Option<SubmittedConfigIdentity>,
+    state: Arc<AppState>,
 ) -> MatrixOutcome {
     let mut platform = match platform_for_run(&config, &run_id) {
         Ok(platform) => platform,
@@ -3238,6 +3306,11 @@ async fn run_isolated_cell(
         } => (result, false),
         _ = wait_for_cancellation(&mut cancellation) => (Err(anyhow::anyhow!("local OAT run cancelled")), true),
     };
+    if !cancelled && config.platform.kind == crate::config::OatMode::Local {
+        if let Ok(rows) = &result {
+            publish_local_teardown(&state, orchestration_id, &config, &run_id, rows).await;
+        }
+    }
     let cleanup = platform.cleanup(&config).await;
     let shutdown_drain_evidence = platform.shutdown_drain_evidence();
     if cancelled && cleanup.is_ok() {
@@ -7504,6 +7577,9 @@ async fn destroy_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
             &project,
             "benchmark",
         );
+        if maintenance_enabled(config) {
+            down.args(["--profile", "maintenance"]);
+        }
         down.envs(&platform.environment);
         down.args(["down", "--volumes", "--remove-orphans"]);
         run_streaming_command(down, "clean up local OAT stack").await?;
@@ -14308,7 +14384,8 @@ mod tests {
                 )
                 .await;
                 fs::remove_dir_all(&root)?;
-                result.context("cleanup regression timed out")??;
+                let output = result.context("cleanup regression timed out")??;
+                print!("{}", String::from_utf8_lossy(&output.stdout));
                 return Ok(());
             }
         };
@@ -14367,10 +14444,12 @@ mod tests {
         assert_eq!(outcomes[0]["exit_code"], 1);
         assert!(!serde_json::to_string(&outcomes)?.contains("private"));
         fs::write(fixture.join("mode"), "overload_success")?;
-        local.run_id = "guard-lifecycle".to_owned();
-        local.state_dir = fixture.join("guard-state");
+        local.run_id = "123e4567-e89b-42d3-a456-426614174002".to_owned();
+        local.state_dir = fixture.join(&local.run_id);
         local.control_dir = local.state_dir.clone();
         fs::create_dir(&local.state_dir)?;
+        config.platform.compose_state_root = Some(fixture.to_string_lossy().into_owned());
+        fs::create_dir(local.state_dir.join("control"))?;
         fs::write(
             fixture.join("project"),
             scoped_compose_project(
@@ -14387,7 +14466,41 @@ mod tests {
         let stop = json!({"classification":"above_ceiling","reason":"hard_cap_fraction","metric":"container_memory_bytes",
             "observed_value":900,"cap":1000,"fraction":0.9,"window_index":0,"timestamp_ms":1});
         row.evidence_json = Some(json!({"version":1,"overload_stop":stop}).to_string());
+        config.tunables.maintenance = Some(serde_json::from_value(json!({
+            "enabled": true, "operations": ["optimize", "purge", "vacuum", "checkpoint", "prune_log"]
+        }))?);
+        let duration = (config.warmup_seconds + config.measure_seconds) * 1_000;
+        let scheduled = unix_time_ms_u64()?.checked_sub(duration + 1_000).context("fixture clock")?;
+        let mut successful = sample_result(&local.run_id, "sqlserver_wait_stats", 1);
+        successful.evidence_json = Some(json!({"client_schedule":{
+            "scope":"orchestrator_assigned_schedule_with_observed_full_fleet_acknowledgement",
+            "effective":{"run_start_unix_ms":scheduled,"acknowledged_at_unix_ms":scheduled - 1,
+                "measurement_start_unix_ms":scheduled + config.warmup_seconds * 1_000,
+                "measurement_end_unix_ms":scheduled + duration}
+        }}).to_string());
+        let schedule_path = local.state_dir.join("control/schedule");
+        fs::write(&schedule_path, format!("{scheduled}\n"))?;
+        let state = AppState::default();
+        let orchestration = "123e4567-e89b-42d3-a456-426614174000";
+        state.runs.lock().await.insert(orchestration.to_owned(), crate::model::RunStatus {
+            id: orchestration.to_owned(), config_sha256: "0".repeat(64), state: crate::model::RunState::Running,
+            progress: "measurement complete".to_owned(), result_count: 0, error: None,
+            started_at_unix_ms: 1, finished_at_unix_ms: None, local_teardown: None,
+        });
+        fs::write(&schedule_path, format!("{}\n", scheduled + 1))?;
+        assert!(local_teardown_transition(&config, &local.run_id, std::slice::from_ref(&successful)).is_err());
+        fs::write(&schedule_path, format!("{scheduled}\n"))?;
+        publish_local_teardown(&state, orchestration, &config, &local.run_id, std::slice::from_ref(&successful)).await;
         local.cleanup(&config).await.context("guard-triggered normal cleanup")?;
+        assert!(!schedule_path.exists());
+        let status = state.runs.lock().await.get(orchestration).cloned().context("missing status")?;
+        assert!(matches!(status.state, crate::model::RunState::Running));
+        assert!(status.finished_at_unix_ms.is_none());
+        println!("D49_CLEANUP_GAP_STATUS {}", serde_json::to_string(&status)?);
+        let transition = status.local_teardown.context("missing pre-cleanup transition")?;
+        assert_eq!(transition.cell_id, local.run_id);
+        assert_eq!(transition.schedule_unix_ms, scheduled);
+        assert_eq!(transition.measurement_end_unix_ms, scheduled + duration);
         let receipt = local
             .shutdown_drain_evidence()
             .context("normal lifecycle receipt missing")?;
@@ -14412,6 +14525,9 @@ mod tests {
         );
         assert_eq!(retained["shutdown_drain"]["maintenance"][0]["exit_code"], 0);
         assert!(fixture.join("compose-destroyed").exists());
+        assert!(fixture.join("guard-maintenance-removed").exists());
+        let profiles: Vec<String> = serde_json::from_slice(&fs::read(fixture.join("down-profiles"))?)?;
+        assert_eq!(profiles, ["benchmark", "maintenance"]);
         let commands = fs::read_to_string(fixture.join("commands"))?;
         let ingress = commands
             .find("stop --time 300 guard-client")

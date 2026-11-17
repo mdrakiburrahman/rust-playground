@@ -14,6 +14,14 @@ pub enum RunState {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct LocalTeardown {
+    pub cell_id: String,
+    pub schedule_unix_ms: u64,
+    pub measurement_end_unix_ms: u64,
+    pub started_at_unix_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct RunStatus {
     pub id: String,
     pub config_sha256: String,
@@ -23,6 +31,8 @@ pub struct RunStatus {
     pub error: Option<String>,
     pub started_at_unix_ms: u128,
     pub finished_at_unix_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_teardown: Option<LocalTeardown>,
 }
 
 pub struct AppState {
@@ -136,6 +146,7 @@ mod cancellation_tests {
             error: None,
             started_at_unix_ms: unix_time_ms(),
             finished_at_unix_ms: None,
+            local_teardown: None,
         }
     }
 

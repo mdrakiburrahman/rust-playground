@@ -138,6 +138,7 @@ async fn start_run(
         error: None,
         started_at_unix_ms: unix_time_ms(),
         finished_at_unix_ms: None,
+        local_teardown: None,
     };
     state.runs.lock().await.insert(id.clone(), status.clone());
 
