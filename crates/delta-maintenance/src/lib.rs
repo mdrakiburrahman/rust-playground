@@ -1765,6 +1765,25 @@ mod target_readback_tests {
     }
 
     #[test]
+    fn stale_target_refresh_invalidates_before_reading() -> Result<()> {
+        let metrics = Metrics::new();
+        let source = FilesystemDiscovery::new(Url::parse("file:///unused/")?, Vec::new());
+        let name = "telemetry.sqlserver.events";
+        metrics.target_tables(&[name.into()], &source)?;
+        metrics.observe_target(name, Some(("file:///tables/events".into(), "first-id".into())))?;
+        let result = refresh_target_metadata(&metrics, name, || {
+            let readback = target(&metrics)?;
+            assert_eq!(readback["state"], "unresolved");
+            assert!(readback.get("normalized_root").is_none());
+            assert!(readback.get("delta_table_id").is_none());
+            bail!("injected metadata read failure")
+        });
+        assert!(result.is_err());
+        assert_eq!(target(&metrics)?["state"], "unresolved");
+        Ok(())
+    }
+
+    #[test]
     fn stale_target_setup_latches_new_metadata_identity() -> Result<()> {
         stale_target_case(true, false)
     }
@@ -2323,11 +2342,18 @@ fn retry_stale_table_discovery<T>(table: &str, mut discover: impl FnMut() -> Res
 }
 
 fn refresh_target_metadata(
-    _metrics: &Metrics,
-    _name: &str,
+    metrics: &Metrics,
+    name: &str,
     read: impl FnOnce() -> Result<MaintenanceMetadata>,
 ) -> Result<MaintenanceMetadata> {
-    read()
+    if let Err(error) = metrics.observe_target(name, None) {
+        eprintln!("delta-maintenance target invalidation failed: {error:#}");
+    }
+    let metadata = read()?;
+    if let Err(error) = metrics.observe_target(name, metadata.target.clone()) {
+        eprintln!("delta-maintenance target readback update failed: {error:#}");
+    }
+    Ok(metadata)
 }
 
 fn maintain_table(
@@ -2388,22 +2414,21 @@ fn maintain_table(
         }
         let probe = probe?;
         let token = probe.probe_log_token(limits.discovery_max_log_files)?;
+        let metadata = match metadata.filter(|metadata| metadata.log_token == token) {
+            Some(metadata) => Ok(metadata),
+            None => refresh_target_metadata(metrics, name, || {
+                probe.maintenance_metadata_with_limits(
+                    limits.discovery_max_log_files,
+                    limits.discovery_max_log_file_bytes,
+                )
+            }),
+        };
         if discovered.log_token.as_ref().is_none_or(|previous| *previous != token) {
-            let current_properties = match metadata.filter(|metadata| metadata.log_token == token) {
-                Some(metadata) => metadata.properties,
-                None => {
-                    refresh_target_metadata(metrics, name, || {
-                        probe.maintenance_metadata_with_limits(
-                            limits.discovery_max_log_files,
-                            limits.discovery_max_log_file_bytes,
-                        )
-                    })?
-                    .properties
-                }
-            };
-            if !policy_matches(settings, &current_properties, &props)? {
+            if !policy_matches(settings, &metadata?.properties, &props)? {
                 bail!("table properties changed after discovery; retry");
             }
+        } else if metadata.is_err() {
+            eprintln!("delta-maintenance target metadata refresh failed; identity unresolved table={name}");
         }
         discovered.log_token = Some(token);
         let config = configuration_evidence(settings, &effective, &props)?;
