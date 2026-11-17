@@ -800,34 +800,34 @@ mod storage_bridge {
                         .iter()
                         .all(|(name, _)| !name.eq_ignore_ascii_case("authorization"))
                 );
-                if headers.iter().any(|(k, v)| k == "x-ms-lease-action" && v == "release") {
-                    if let Some((fault, remaining)) = &mut state.release_fault {
-                        *remaining -= 1;
-                        if *remaining == 0 {
-                            let mut reply = response(&request, 500, Vec::new(), "");
-                            match *fault {
-                                "unknown" | "not_sent" => {
-                                    reply = json!({
-                                        "schema_version":1,"kind":"storage_http_response",
-                                        "request_id":request["request_id"],"request_sha256":request["request_sha256"],
-                                        "outcome":if *fault == "unknown" {"unknown"} else {"definitely_not_sent"},
-                                        "error_code":if *fault == "unknown" {"response_lost"} else {"admission_refused"}
-                                    });
-                                }
-                                "malformed" => {
-                                    write.write_all(b"{\n").await?;
-                                    return Ok(());
-                                }
-                                "eof" => return Ok(()),
-                                _ => {}
+                if headers.iter().any(|(k, v)| k == "x-ms-lease-action" && v == "release")
+                    && let Some((fault, remaining)) = &mut state.release_fault
+                {
+                    *remaining -= 1;
+                    if *remaining == 0 {
+                        let mut reply = response(&request, 500, Vec::new(), "");
+                        match *fault {
+                            "unknown" | "not_sent" => {
+                                reply = json!({
+                                    "schema_version":1,"kind":"storage_http_response",
+                                    "request_id":request["request_id"],"request_sha256":request["request_sha256"],
+                                    "outcome":if *fault == "unknown" {"unknown"} else {"definitely_not_sent"},
+                                    "error_code":if *fault == "unknown" {"response_lost"} else {"admission_refused"}
+                                });
                             }
-                            state.responses.push(reply.clone());
-                            drop(state);
-                            write.write_all(&serde_json::to_vec(&reply)?).await?;
-                            write.write_all(b"\n").await?;
-                            write.flush().await?;
-                            continue;
+                            "malformed" => {
+                                write.write_all(b"{\n").await?;
+                                return Ok(());
+                            }
+                            "eof" => return Ok(()),
+                            _ => {}
                         }
+                        state.responses.push(reply.clone());
+                        drop(state);
+                        write.write_all(&serde_json::to_vec(&reply)?).await?;
+                        write.write_all(b"\n").await?;
+                        write.flush().await?;
+                        continue;
                     }
                 }
                 let mut status = 200;
@@ -1069,7 +1069,7 @@ mod storage_bridge {
                 let store = session.store_for_url(&url)?;
                 let prefix = object_store::path::Path::parse(url.path())?;
                 assert!(store.list(Some(&prefix)).try_collect::<Vec<_>>().await?.is_empty());
-                let path = prefix.child("_delta_log").child("00000000000000000000.json");
+                let path = prefix.join("_delta_log").join("00000000000000000000.json");
                 store
                     .put_opts(
                         &path,
