@@ -274,7 +274,7 @@
   "config_validation": {
     "status": "config-validated",
     "validator": "arrowcol-oat-rust --validate-config",
-    "source_sha": "84f86b6c54b7fc9375c63666cdfbeed126ac8dbb",
+    "source_sha": "95153097739bae15432a54e646b9b612f180812a",
     "baseline_count": 1,
     "candidate_count": 8,
     "pass_count": 9,

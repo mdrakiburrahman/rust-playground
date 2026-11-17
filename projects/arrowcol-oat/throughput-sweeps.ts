@@ -69,6 +69,9 @@ const cohorts: Cohort[] = [
     compare('coalescing', 'collector.batching.coalesce_publications', [false, true].map(value => candidate('coalesce-' + value, {
       collector: { batching: { coalesce_publications: value } },
     }))),
+    compare('flush-age', 'collector.batching.max_age', ['1s', '5s', '15s', '60s'].map(value => candidate('age-' + value, {
+      collector: { batching: { max_age: value } },
+    }))),
   ] },
   { id: 'C4', comparisons: [compare('sort-key', 'collector.layout.sort_columns', [
     candidate('none', { collector: { layout: { enabled: true, sort_columns: [] } }, parquet_writer: { sorting_columns: [] } }),
@@ -133,6 +136,8 @@ export function buildThroughputManifests(registry: unknown): JsonObject[] {
   const tunables = registry.tunables;
   const registryHash = createHash('sha256').update(JSON.stringify(tunables)).digest('hex');
   return cohorts.map(cohort => {
+    const collector = isRecord(tunables.collector) ? tunables.collector : {};
+    const batching = isRecord(collector.batching) ? collector.batching : {};
     for (const comparison of cohort.comparisons) {
       if (comparison.candidates.length > comparison.candidate_limit) throw new Error(cohort.id + '/' + comparison.id + ' exceeds its candidate limit');
     }
@@ -195,6 +200,16 @@ export function buildThroughputManifests(registry: unknown): JsonObject[] {
         configured: ['plain', 'delta_binary_packed', 'delta_length_byte_array', 'delta_byte_array', 'byte_stream_split'],
         excluded: { rle: 'BOOLEAN-only; frozen table has no Boolean column' },
         status: 'configured-not-runtime-screened',
+      } } : {}),
+      ...(cohort.id === 'C3' ? { flush_age_semantics: {
+        requested_path: 'tunables.collector.batching.max_age',
+        baseline_requested: batching.max_age ?? null,
+        candidate_requests: ['1s', '5s', '15s', '60s'].map(value => ({ candidate: 'age-' + value, requested: value })),
+        effective_readback_path: 'consumer_effective_config.batching.max_age',
+        effective_status: 'requires-runtime-startup-readback',
+        flush_reason_metric: 'arrowcol_pipeline_flushes_total',
+        flush_reason_labels: ['age', 'target_parquet_bytes', 'min_input_bytes', 'max_input_bytes', 'row_cap', 'batch_cap', 'memory_cap', 'schema_change', 'explicit', 'shutdown_drain'],
+        interpretation: 'Compare per-run counter deltas and physical file sizes; the first satisfied time, row, input-byte, or memory cap determines flush behavior.',
       } } : {}),
       runnable: false,
       config_validation: { status: 'not-validated' },
