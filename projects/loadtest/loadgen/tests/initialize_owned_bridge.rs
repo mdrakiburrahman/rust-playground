@@ -120,13 +120,36 @@ impl Parent {
             serde_json::from_value::<Vec<(String, String)>>(request["headers"].clone())?
                 .into_iter()
                 .collect();
-        ensure!(headers.keys().all(|key| !key.eq_ignore_ascii_case("authorization")));
+        ensure!(headers.keys().all(|key| !matches!(
+            key.to_ascii_lowercase().as_str(),
+            "authorization" | "proxy-authorization" | "x-ms-encryption-key"
+        )));
+        let frame = serde_json::to_string(&request)?.to_ascii_lowercase();
+        for secret in ["bearer ", "sharedkey ", "accountkey=", "sharedaccesssignature="] {
+            ensure!(!frame.contains(secret), "credential-bearing frame");
+        }
         let url = url::Url::parse(request["url"].as_str().context("request URL")?)?;
         ensure!(url.username().is_empty() && url.password().is_none());
         ensure!(url.host_str() == Some("offlineproof.blob.core.windows.net"));
         ensure!(url.query_pairs().all(|(key, _)| !key.eq_ignore_ascii_case("sig")));
         let method = request["method"].as_str().context("method")?;
         let query: BTreeMap<_, _> = url.query_pairs().into_owned().collect();
+        ensure!(query.keys().all(|key| matches!(
+            key.as_str(),
+            "restype" | "comp" | "prefix" | "startFrom" | "marker" | "maxresults"
+        )));
+        if let Some(cursor) = query.get("startFrom") {
+            let root = url::Url::parse(
+                self.input["authority"]["table_root_url"]
+                    .as_str()
+                    .context("table root")?,
+            )?;
+            let directory = format!("{}_delta_log", root.path().trim_start_matches('/'));
+            ensure!(request["target"] == "object_store" && method == "GET");
+            ensure!(query.get("prefix") == Some(&format!("{directory}/")));
+            ensure!(cursor == &directory || cursor.starts_with(&format!("{directory}/")));
+            eprintln!("OWNED_BRIDGE_OFFLINE sdk_start_from_url={url}");
+        }
         self.requests.push(request.clone());
         let mut output = BTreeMap::new();
         let mut status = 200;
@@ -197,6 +220,7 @@ impl Parent {
                         format!(
                             "<Blob><Name>{key}</Name><Properties><Last-Modified>{STAMP}</Last-Modified>\
                      <Etag>\"offline-object\"</Etag><Content-Length>{}</Content-Length>\
+                     <Content-Type>application/json</Content-Type>\
                      <BlobType>BlockBlob</BlobType></Properties></Blob>",
                             body.len()
                         )
@@ -452,6 +476,17 @@ async fn run(case: Case) -> Result<Parent> {
 #[tokio::test]
 async fn actual_cli_bridge_creates_one_real_zero_row_table_and_drains() -> Result<()> {
     let parent = run(Case::Fresh).await?;
+    let mut original_cursor_forwarded = false;
+    for request in &parent.requests {
+        let url = url::Url::parse(request["url"].as_str().context("request URL")?)?;
+        original_cursor_forwarded |= url
+            .query_pairs()
+            .any(|(key, value)| key == "startFrom" && value.ends_with("/_delta_log"));
+    }
+    assert!(
+        original_cursor_forwarded,
+        "the original production SDK request must reach the parent"
+    );
     let receipt = &parent.receipt.context("terminal receipt")?["receipt"];
     assert_eq!(receipt["publisher_drained"], true);
     assert_eq!(receipt["delta"]["version"], 0);
@@ -558,6 +593,13 @@ async fn actual_cli_bridge_unknown_effects_never_report_success_or_force_cleanup
         );
         assert!(parent.receipt.is_none());
         assert_eq!(parent.puts, usize::from(!matches!(case, Case::UnknownAdmission)));
+        if matches!(case, Case::UnknownDrainWrite | Case::UnknownDrainRelease) {
+            assert!(
+                parent.error.contains("creation=Ok(Ok(FreshTableReceipt"),
+                "drain fault must follow successful real Kernel readback: {}",
+                parent.error
+            );
+        }
         assert_eq!(
             parent.objects.len(),
             usize::from(!matches!(case, Case::UnknownAdmission))
