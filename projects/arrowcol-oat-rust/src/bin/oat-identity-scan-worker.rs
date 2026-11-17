@@ -18,14 +18,19 @@ mod linux {
 
     impl Limits {
         pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Self> {
-            let args = args.into_iter().collect::<Vec<_>>();
-            ensure!(args.len() == 4, "worker requires parent, address, CPU and descriptor limits");
-            let limits = Self {
-                parent: args[0].parse().context("invalid expected parent")?,
-                address_bytes: args[1].parse().context("invalid address-space limit")?,
-                cpu_seconds: args[2].parse().context("invalid CPU limit")?,
-                descriptors: args[3].parse().context("invalid descriptor limit")?,
+            let mut args = args.into_iter();
+            let mut next = || -> Result<String> {
+                let value = args.next().context("missing worker limit")?;
+                ensure!(value.len() <= 20, "worker limit is too long");
+                Ok(value)
             };
+            let limits = Self {
+                parent: next()?.parse().context("invalid expected parent")?,
+                address_bytes: next()?.parse().context("invalid address-space limit")?,
+                cpu_seconds: next()?.parse().context("invalid CPU limit")?,
+                descriptors: next()?.parse().context("invalid descriptor limit")?,
+            };
+            ensure!(args.next().is_none(), "unexpected worker limit argument");
             ensure!(
                 limits.parent > 1
                     && (1..u64::MAX).contains(&limits.address_bytes)
@@ -85,6 +90,8 @@ mod linux {
             ] {
                 assert!(Limits::parse(values.map(str::to_owned)).is_err());
             }
+            assert!(Limits::parse(["2", "999999999999999999999", "1", "3"].map(str::to_owned)).is_err());
+            assert!(Limits::parse(["2", "1024", "1", "3", "extra"].map(str::to_owned)).is_err());
         }
 
         #[test]
