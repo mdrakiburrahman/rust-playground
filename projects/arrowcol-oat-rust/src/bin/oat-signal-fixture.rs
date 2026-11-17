@@ -176,10 +176,10 @@ mod fixture {
         emit("ready", &uid, started.elapsed())?;
         loop {
             let signal = signals.wait()?;
-            let elapsed = started.elapsed();
-            let event = {
+            let (event, elapsed) = {
                 let mut gate = state.0.lock().map_err(|_| anyhow::anyhow!("fixture state poisoned"))?;
-                gate.receive(signal, elapsed)?
+                let elapsed = started.elapsed();
+                (gate.receive(signal, elapsed)?, elapsed)
             };
             match event {
                 Event::TermSeen => {
@@ -189,6 +189,8 @@ mod fixture {
                 Event::EarlyReleaseInvalid => emit("early_release_invalid", &uid, elapsed)?,
                 Event::ReleaseSeen => {
                     emit("release_seen", &uid, elapsed)?;
+                    let gate = state.0.lock().map_err(|_| anyhow::anyhow!("fixture state poisoned"))?;
+                    ensure!(started.elapsed() < gate.deadline(), "signal fixture cap expired");
                     return Ok(());
                 }
                 Event::NoChange => {}
@@ -201,7 +203,7 @@ mod fixture {
         ensure!(std::process::id() != 1, "release cannot be PID1");
         ensure!(pod_uid()? == expected, "release Downward-API pod UID does not match");
         require_user(&read_bounded("/proc/self/status", 8192)?)?;
-        let own = fs::metadata(std::env::current_exe()?)?;
+        let own = fs::metadata("/proc/self/exe")?;
         let target = fs::metadata("/proc/1/exe")?;
         ensure!(
             own.dev() == target.dev() && own.ino() == target.ino(),

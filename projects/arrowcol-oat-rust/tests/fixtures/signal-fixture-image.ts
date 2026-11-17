@@ -24,7 +24,7 @@ interface Container {
   Args: string[];
   Config: { User: string; Labels: Record<string, string>; Env: string[] };
   HostConfig: { PidMode: string; NetworkMode: string; ReadonlyRootfs: boolean; CapDrop: string[]; SecurityOpt: string[]; Memory: number; NanoCpus: number };
-  State: { Running: boolean; ExitCode: number };
+  State: { Running: boolean; Paused: boolean; ExitCode: number };
 }
 
 function inspect(id: string): Container {
@@ -97,7 +97,7 @@ async function ready(id: string) {
   assert.equal(inspect(id).State.Running, true);
 }
 
-function signal(id: string, value: "TERM" | "USR1" | "STOP" | "CONT" | "INT") {
+function signal(id: string, value: "TERM" | "USR1" | "INT") {
   docker(["kill", `--signal=${value}`, id]);
 }
 
@@ -118,16 +118,19 @@ test("real private PID1 rejects early/queued release, holds repeated TERM and re
     await until(() => events(id), values => values.some(value => value.event === "early_release_invalid"), "early release invalid");
     assert.equal(inspect(id).State.Running, true);
 
-    signal(id, "STOP");
+    docker(["pause", id]);
+    assert.equal(inspect(id).State.Paused, true);
     signal(id, "USR1");
     signal(id, "TERM");
-    signal(id, "CONT");
+    docker(["unpause", id]);
+    assert.equal(inspect(id).State.Paused, false);
     await until(() => events(id), values => values.some(value => value.event === "term_seen"), "queued TERM observed");
     signal(id, "TERM");
     signal(id, "TERM");
     await delay(1000);
     assert.equal(inspect(id).State.Running, true, "pre-TERM USR1 must not latch, repeated TERM must not release");
     assert.equal(events(id).filter(value => value.event === "term_seen").length, 1);
+    console.log(JSON.stringify({ event: "bounded_container_stats", container_id: id, stats: JSON.parse(docker(["stats", "--no-stream", "--format", "{{json .}}", id]).stdout) }));
     const release = docker(["exec", id, "/oat-signal-fixture", "release", uid], true);
     const terminal = await until(() => inspect(id).State, value => !value.Running, "actual successful release exit");
     assert.equal(terminal.ExitCode, 0);
