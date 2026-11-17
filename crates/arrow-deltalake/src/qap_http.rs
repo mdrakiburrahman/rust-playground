@@ -1402,12 +1402,17 @@ mod storage_bridge {
                     .await
                     .is_err()
             );
-            let (expired, _) = self::bridge(1)?;
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            let (mut expired, mut expired_parent) = self::bridge(5_000)?;
+            Arc::get_mut(&mut expired).ok_or_else(invalid)?.deadline = Instant::now();
             assert!(matches!(
                 expired.exchange(head()?, "control").await,
                 Outcome::NotSent(Code::DeadlineExceeded)
             ));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), expired_parent.read_u8())
+                    .await
+                    .is_err()
+            );
             Ok(())
         }
 
