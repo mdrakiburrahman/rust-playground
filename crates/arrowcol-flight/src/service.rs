@@ -187,13 +187,56 @@ impl ArrowColFlightService {
         &self.drain
     }
 
-    /// Builds a tonic service with the runtime message-size limit.
+    /// Builds a tonic service with configured compression and message-size limits.
     #[must_use]
-    pub fn into_tonic_service(self) -> FlightServiceServer<Self> {
+    pub fn into_tonic_service(
+        self,
+    ) -> tonic::service::interceptor::InterceptedService<
+        FlightServiceServer<Self>,
+        impl tonic::service::Interceptor + Clone,
+    > {
         let maximum = self.limits.max_message_bytes;
-        FlightServiceServer::new(self)
+        let maximum_metadata = self.limits.max_metadata_bytes;
+        let accept = self.limits.grpc_accept_compression;
+        let send = self.limits.grpc_send_compression;
+        let mut service = FlightServiceServer::new(self)
             .max_decoding_message_size(maximum)
-            .max_encoding_message_size(maximum)
+            .max_encoding_message_size(maximum);
+        if let Some(encoding) = accept {
+            service = service.accept_compressed(encoding);
+        }
+        if let Some(encoding) = send {
+            service = service.send_compressed(encoding);
+        }
+        tonic::service::interceptor::InterceptedService::new(service, move |mut request: Request<()>| {
+            if send.is_none() {
+                return Ok(request);
+            }
+            validate_metadata_size(request.metadata(), maximum_metadata).map_err(RuntimeError::into_status)?;
+            // Tonic 0.14 selects any compiled codec once response compression is enabled.
+            let configured = send.map(|encoding| match encoding {
+                tonic::codec::CompressionEncoding::Gzip => "gzip",
+                tonic::codec::CompressionEncoding::Zstd => "zstd",
+                _ => "unsupported",
+            });
+            let advertised = configured.is_some_and(|configured| {
+                request
+                    .metadata()
+                    .get_all("grpc-accept-encoding")
+                    .iter()
+                    .filter_map(|value| value.to_str().ok())
+                    .flat_map(|value| value.split(','))
+                    .any(|value| value.trim() == configured)
+            });
+            request.metadata_mut().remove("grpc-accept-encoding");
+            if let Some(encoding) = configured.filter(|_| advertised) {
+                request.metadata_mut().insert(
+                    "grpc-accept-encoding",
+                    tonic::metadata::MetadataValue::from_static(encoding),
+                );
+            }
+            Ok(request)
+        })
     }
 
     /// Handles a generic `FlightData` stream, enabling focused tests without a

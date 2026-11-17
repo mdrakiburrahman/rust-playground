@@ -13,6 +13,22 @@ ran. Earlier parse-only drafts with 19 `TODO` table slots and fixed 30/120-secon
 timings are historical receipts, not executable inputs. The binder reads the
 now-approved canonical fixture rather than copying or inventing table names.
 
+## Local launcher deadline and recovery
+
+`--deadline-seconds <1..600>` is opt-in and valid only for a local run with `--no-viewer`; omitting it preserves the existing launcher behavior. The monotonic deadline begins when `launch.ts` starts and includes setup, server build, the run, report processing and owned-server shutdown. For example:
+
+```sh
+npx --no-install tsx projects/arrowcol-oat/launch.ts --mode local --config out/arrowcol-oat/oat-config.local.json --no-viewer --deadline-seconds 600
+```
+
+The launcher does not hard-kill itself or the OAT server. If the deadline expires while `POST /runs` is in flight, it waits for that request's existing 30-second bound; a late accepted response is recorded and only that exact UUID is canceled. A lost acceptance response is recorded as `UNKNOWN` with no fabricated ID, is never retried or searched for, and blocks the next deadline-enabled cell.
+
+Every benchmark invocation durably records `submitted_config_body` (the exact post-mode-rewrite string), its lowercase SHA-256 `submitted_config_sha256`, and the original file's `source_config_sha256` under `out/arrowcol-oat/deadline-receipts/<invocation_id>.json` before POST. Omitting the deadline leaves its timer/deadline fields absent or null; it does not omit the binding receipt. POST and GET must attest the same raw submitted-byte hash. Missing/mismatched attestation remains UNKNOWN, including after safe cleanup.
+
+The receipt also records the original deadline, accepted canonical run identity, overrun, cancellation intent and cleanup state. Cancellation is a durably recorded **once-only POST** for that exact run; an inconclusive response permits only bounded GET reconciliation, never another cancellation POST. Its first ten-minute cleanup deadline is persisted and reused on recovery, not renewed. Every response must name the exact accepted run. Only `succeeded` or `cancelled` confirms cleanup; `failed`, missing identity or binding uncertainty remains `UNSETTLED` and blocks another invocation. An overrun is always a failed launcher result, including expiry during scoring, final receipt persistence or owned-server shutdown. An unresolved run keeps its owned recovery server.
+
+The existing local marker at `<compose_state_root>/.arrowcol-oat-owner-<serverPid>.json` preserves `runId`, `ownerPid`, `ownerStartTicks`, `serverPid`, `serverStartTicks`, `serverUrl`, `serverExecutable` and the same three binding fields. The optional programmatic `main` observer receives a frozen `{invocationId, runId, serverUrl, serverPid, serverStartTicks, serverExecutable}` snapshot and the receipt path, directly from launcher-owned memory, only after the actual accepted run's receipt and marker are durable and its attestation matches. Immediately after marker persistence, emission rechecks the current in-memory accepted run/server identity, active non-error status, binding and absence of cancellation, expiry or unsettled cleanup. Initial terminal, external-server and unknown/mismatched runs emit nothing; ineligible owned runs produce a supplementary diagnostic. Observer throws/rejections are supplementary diagnostics only; the observer is not awaited and cannot authorize admission, scoring or cleanup. No production supervisor CLI is enabled by this seam.
+
 ## Capacity prerequisites
 
 The example's user pools can autoscale from zero to one node; per-node capacity

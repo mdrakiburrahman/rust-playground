@@ -5,7 +5,12 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 type JsonObject = Record<string, unknown>;
 type Candidate = { id: string; overrides: JsonObject; qualification?: 'exploratory' };
-type Comparison = { id: string; factor: string; candidates: Candidate[]; candidate_limit: number };
+type GrpcCompression = 'none' | 'gzip' | 'zstd';
+type Comparison = {
+  id: string; factor: string; candidates: Candidate[]; candidate_limit: number;
+  matched_control?: string; comparison_family?: string;
+  comparison_type?: 'single-factor' | 'interaction-top-pick'; selection_prerequisite?: string;
+};
 type PendingCandidateSet = { id: string; factor: string; status: string; candidates: Candidate[] };
 type Cohort = { id: string; comparisons: Comparison[]; refinement?: JsonObject; pendingCandidateSets?: PendingCandidateSet[] };
 
@@ -17,21 +22,40 @@ const maintenance = {
 const candidate = (id: string, value: JsonObject, rootOverrides: JsonObject = {}): Candidate => ({
   id, overrides: { ...rootOverrides, tunables: value },
 });
-const compare = (id: string, factor: string, candidates: Candidate[], candidateLimit = 4): Comparison => ({
-  id, factor, candidates, candidate_limit: candidateLimit,
+const maxCandidatesPerComparison = 4;
+const compare = (id: string, factor: string, candidates: Candidate[]): Comparison => ({
+  id, factor, candidates, candidate_limit: maxCandidatesPerComparison,
 });
+const compareWithControl = (
+  id: string, factor: string, control: Candidate, candidates: Candidate[], comparisonFamily?: string,
+): Comparison => ({
+  ...compare(id, factor, [control, ...candidates]),
+  matched_control: control.id,
+  ...(comparisonFamily ? { comparison_family: comparisonFamily } : {}),
+});
+const codecControl = candidate('uncompressed', {
+  parquet_writer: { defaults: { compression: 'uncompressed', compression_level: null } },
+});
+const directionalGrpcCandidate = (id: string, clientToReceiver: GrpcCompression, receiverToClient: GrpcCompression): Candidate => candidate(id, {
+  transport: { grpc_send_compression: clientToReceiver, grpc_accept_compression: receiverToClient },
+  collector: { limits: { grpc_accept_compression: clientToReceiver, grpc_send_compression: receiverToClient } },
+});
+const grpcNoneControl = directionalGrpcCandidate('grpc-none', 'none', 'none');
 const cohorts: Cohort[] = [
   { id: 'C1', comparisons: [
-    compare('codec', 'parquet_writer.defaults.compression', [
-      candidate('uncompressed', { parquet_writer: { defaults: { compression: 'uncompressed', compression_level: null } } }),
-      candidate('snappy', { parquet_writer: { defaults: { compression: 'snappy', compression_level: null } } }),
-      candidate('lz4-raw', { parquet_writer: { defaults: { compression: 'lz4_raw', compression_level: null } } }),
-      candidate('gzip', { parquet_writer: { defaults: { compression: 'gzip', compression_level: null } } }),
-      candidate('brotli', { parquet_writer: { defaults: { compression: 'brotli', compression_level: null } } }),
+    compareWithControl('codec-zstd-levels', 'parquet_writer.defaults.compression+compression_level', codecControl, [
       candidate('zstd-1', { parquet_writer: { defaults: { compression: 'zstd', compression_level: 1 } } }),
       candidate('zstd-3', { parquet_writer: { defaults: { compression: 'zstd', compression_level: 3 } } }),
       candidate('zstd-6', { parquet_writer: { defaults: { compression: 'zstd', compression_level: 6 } } }),
-    ], 8),
+    ], 'codec'),
+    compareWithControl('codec-snappy-lz4raw', 'parquet_writer.defaults.compression+compression_level', codecControl, [
+      candidate('snappy', { parquet_writer: { defaults: { compression: 'snappy', compression_level: null } } }),
+      candidate('lz4-raw', { parquet_writer: { defaults: { compression: 'lz4_raw', compression_level: null } } }),
+    ], 'codec'),
+    compareWithControl('codec-gzip-brotli', 'parquet_writer.defaults.compression+compression_level', codecControl, [
+      candidate('gzip', { parquet_writer: { defaults: { compression: 'gzip', compression_level: null } } }),
+      candidate('brotli', { parquet_writer: { defaults: { compression: 'brotli', compression_level: null } } }),
+    ], 'codec'),
   ], refinement: {
     comparison: 'codec',
     factor: 'parquet_writer.defaults.compression_level',
@@ -72,6 +96,9 @@ const cohorts: Cohort[] = [
     compare('flush-age', 'collector.batching.max_age', ['1s', '5s', '15s', '60s'].map(value => candidate('age-' + value, {
       collector: { batching: { max_age: value } },
     }))),
+    compare('age-flush-policy', 'collector.batching.age_flush_policy', ['immediate', 'drain_ready'].map(value => candidate('age-policy-' + value, {
+      collector: { batching: { age_flush_policy: value } },
+    }))),
   ] },
   { id: 'C4', comparisons: [compare('sort-key', 'collector.layout.sort_columns', [
     candidate('none', { collector: { layout: { enabled: true, sort_columns: [] } }, parquet_writer: { sorting_columns: [] } }),
@@ -81,17 +108,32 @@ const cohorts: Cohort[] = [
   ])] },
   { id: 'C5', comparisons: [
     compare('workers', 'tunables.client.workers', [8, 16, 32, 64].map(value => candidate('workers-' + value, {
-      client: { workers: value, streams_per_worker: 1, connections_per_worker: 1 },
+      client: { workers: value },
     }))),
     compare('streams', 'tunables.client.streams_per_worker', [1, 2, 4].map(value => candidate('streams-' + value, {
-      client: { workers: 16, streams_per_worker: value, connections_per_worker: 1 },
+      client: { streams_per_worker: value },
     }))),
     compare('connections', 'tunables.client.connections_per_worker', [1, 2, 4].map(value => candidate('connections-' + value, {
-      client: { workers: 16, streams_per_worker: 1, connections_per_worker: value },
+      client: { connections_per_worker: value },
     }))),
+    compareWithControl('data-mode', 'tunables.client.data_mode',
+      candidate('data-mode-shared', { client: { data_mode: 'shared' } }),
+      [candidate('data-mode-independent', { client: { data_mode: 'independent' } })], 'data-mode'),
     compare('corpus', 'tunables.client.corpus_rows', [16384, 65536, 262144].map(value => candidate('corpus-' + value, { client: { corpus_rows: value } }))),
     compare('interval', 'tunables.client.interval_us', [0, 1000, 10000].map(value => candidate('interval-' + value, { client: { interval_us: value } }))),
     compare('ipc-compression', 'tunables.transport.ipc_compression', ['none', 'lz4_frame', 'zstd'].map(value => candidate('ipc-' + value, { transport: { ipc_compression: value } }))),
+    compareWithControl('grpc-client-to-receiver', 'transport.grpc_send_compression + collector.limits.grpc_accept_compression', grpcNoneControl,
+      (['gzip', 'zstd'] as const).map(codec => directionalGrpcCandidate('grpc-client-to-receiver-' + codec, codec, 'none')), 'grpc-direction'),
+    compareWithControl('grpc-receiver-to-client', 'collector.limits.grpc_send_compression + transport.grpc_accept_compression', grpcNoneControl,
+      (['gzip', 'zstd'] as const).map(codec => directionalGrpcCandidate('grpc-receiver-to-client-' + codec, 'none', codec)), 'grpc-direction'),
+    {
+      ...compareWithControl('grpc-mixed-directions', 'paired client-to-receiver and receiver-to-client compression', grpcNoneControl, [
+        directionalGrpcCandidate('grpc-mixed-request-gzip-response-zstd', 'gzip', 'zstd'),
+        directionalGrpcCandidate('grpc-mixed-request-zstd-response-gzip', 'zstd', 'gzip'),
+      ], 'grpc-direction'),
+      comparison_type: 'interaction-top-pick',
+      selection_prerequisite: 'Select the request and response codecs independently from the pure-direction top picks; do not score as single-factor evidence.',
+    },
   ] },
   { id: 'C6', comparisons: [
     compare('dfe-concurrency', 'dfe_worker_concurrency', [1, 2, 4, 8].map(value => candidate('dfe-' + value, {}, { dfe_worker_concurrency: [value] }))),
@@ -115,6 +157,21 @@ const cohorts: Cohort[] = [
     compare('small-file-threshold', 'tunables.maintenance.small_file_bytes', [16777216, 33554432, 67108864].map(value => candidate('small-file-' + value, { maintenance: { small_file_bytes: value } }))),
     compare('retry-budget', 'tunables.maintenance.commit_attempts', [1, 3, 5].map(value => candidate('attempts-' + value, { maintenance: { commit_attempts: value } }))),
     compare('checkpoint-interval', 'tunables.maintenance.checkpoint_every_commits', [64, 256, 1024].map(value => candidate('checkpoint-' + value, { maintenance: { checkpoint_every_commits: value } }))),
+    compare('input-read-strategy', 'tunables.maintenance.input_read_strategy', ['memory', 'spool', 'range'].map(value => candidate('input-' + value, {
+      maintenance: { input_read_strategy: value },
+    }))),
+    compare('granularity', 'tunables.maintenance.granularity', ['minute', 'hour', 'day'].map(value => candidate('granularity-' + value, {
+      maintenance: { granularity: value },
+    }))),
+    compare('optimize-upload-mode', 'tunables.maintenance.optimize_upload_mode', [
+      candidate('put-create', { maintenance: { optimize_upload_mode: 'put_create' } }),
+      {
+        ...candidate('buffered-multipart', { maintenance: {
+          optimize_upload_mode: 'buffered_multipart', optimize_upload_buffer_bytes: 8_388_608,
+        } }),
+        qualification: 'exploratory' as const,
+      },
+    ]),
   ] },
   { id: 'C8', comparisons: [
     compare('commit-window', 'tunables.collector.commit.batch_window', ['1s', '2s', '5s'].map(value => candidate('window-' + value, { collector: { commit: { batch_window: value } } }))),
@@ -131,16 +188,58 @@ function isRecord(value: unknown): value is JsonObject {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
+function validateComparisons(comparisons: unknown, cohort: string): asserts comparisons is Comparison[] {
+  if (!Array.isArray(comparisons)) throw new Error(cohort + ' comparisons must be an array');
+  const controlFamilies = new Map<string, { id: string; overrides: string }>();
+  for (const comparison of comparisons) {
+    if (!isRecord(comparison) || typeof comparison.id !== 'string' || typeof comparison.factor !== 'string' ||
+        !Array.isArray(comparison.candidates)) throw new Error(cohort + ' contains an invalid comparison');
+    if (comparison.candidate_limit !== maxCandidatesPerComparison || comparison.candidates.length > maxCandidatesPerComparison) {
+      throw new Error(cohort + '/' + comparison.id + ' must enforce the ' + maxCandidatesPerComparison + '-candidate limit');
+    }
+    const candidateIds = new Set<string>();
+    for (const item of comparison.candidates) {
+      if (!isRecord(item) || typeof item.id !== 'string' || !isRecord(item.overrides) || candidateIds.has(item.id)) {
+        throw new Error(cohort + '/' + comparison.id + ' contains an invalid or duplicate candidate');
+      }
+      candidateIds.add(item.id);
+    }
+    if (comparison.matched_control !== undefined) {
+      if (typeof comparison.matched_control !== 'string') throw new Error(cohort + '/' + comparison.id + ' has an invalid matched control');
+      const control = comparison.candidates.find(item => isRecord(item) && item.id === comparison.matched_control);
+      if (!isRecord(control) || typeof control.id !== 'string' || !isRecord(control.overrides)) {
+        throw new Error(cohort + '/' + comparison.id + ' is missing its declared matched control');
+      }
+      if (comparison.comparison_family !== undefined) {
+        if (typeof comparison.comparison_family !== 'string' || comparison.comparison_family.length === 0) {
+          throw new Error(cohort + '/' + comparison.id + ' has an invalid comparison family');
+        }
+        const signature = JSON.stringify(control.overrides);
+        const prior = controlFamilies.get(comparison.comparison_family);
+        if (prior && (prior.id !== control.id || prior.overrides !== signature)) {
+          throw new Error(cohort + '/' + comparison.id + ' does not use the same matched control as its family');
+        }
+        controlFamilies.set(comparison.comparison_family, { id: control.id, overrides: signature });
+      }
+    } else if (comparison.comparison_family !== undefined) {
+      throw new Error(cohort + '/' + comparison.id + ' declares a family without a matched control');
+    }
+  }
+}
+
 export function buildThroughputManifests(registry: unknown): JsonObject[] {
   if (!isRecord(registry) || !isRecord(registry.tunables)) throw new Error('registry must contain the PR125 tunables object');
   const tunables = registry.tunables;
   const registryHash = createHash('sha256').update(JSON.stringify(tunables)).digest('hex');
   return cohorts.map(cohort => {
+    const client = isRecord(tunables.client) ? tunables.client : {};
+    const transport = isRecord(tunables.transport) ? tunables.transport : {};
     const collector = isRecord(tunables.collector) ? tunables.collector : {};
+    const upload = isRecord(collector.upload) ? collector.upload : {};
     const batching = isRecord(collector.batching) ? collector.batching : {};
-    for (const comparison of cohort.comparisons) {
-      if (comparison.candidates.length > comparison.candidate_limit) throw new Error(cohort.id + '/' + comparison.id + ' exceeds its candidate limit');
-    }
+    const collectorLimits = isRecord(collector.limits) ? collector.limits : {};
+    const maintenanceSeed = isRecord(tunables.maintenance) ? tunables.maintenance : {};
+    validateComparisons(cohort.comparisons, cohort.id);
     return {
       schema_version: 1,
       cohort: cohort.id,
@@ -192,6 +291,7 @@ export function buildThroughputManifests(registry: unknown): JsonObject[] {
         accepted: ['uncompressed', 'snappy', 'gzip', 'brotli', 'lz4', 'lz4_raw', 'zstd'],
         configured: ['uncompressed', 'snappy', 'gzip', 'brotli', 'lz4_raw', 'zstd'],
         excluded: { lz4: 'legacy Hadoop framing; accepted for compatibility but excluded by campaign consumer/deprecation policy' },
+        pending: [],
         status: 'configured-not-runtime-screened',
       } } : {}),
       ...(cohort.id === 'C2' ? { parquet_enum_coverage: {
@@ -199,7 +299,156 @@ export function buildThroughputManifests(registry: unknown): JsonObject[] {
         accepted: ['plain', 'rle', 'delta_binary_packed', 'delta_length_byte_array', 'delta_byte_array', 'byte_stream_split'],
         configured: ['plain', 'delta_binary_packed', 'delta_length_byte_array', 'delta_byte_array', 'byte_stream_split'],
         excluded: { rle: 'BOOLEAN-only; frozen table has no Boolean column' },
+        pending: [],
         status: 'configured-not-runtime-screened',
+      } } : {}),
+      ...(cohort.id === 'C2' ? { source_enum_coverage: {
+        dictionary_handling: {
+          path: 'tunables.transport.dictionary_handling',
+          accepted: ['hydrate', 'resend'],
+          configured: [],
+          baseline_requested: transport.dictionary_handling ?? null,
+          effective_default: 'hydrate (bin/collector-chain/src/dmv_client.rs::Options)',
+          consumer: 'ARROWCOL_CLIENT_DICTIONARY_HANDLING -> bin/collector-chain/src/dmv_client.rs::Options.dictionary_handling',
+          excluded: { resend: 'Pinned Tunables validation rejects resend for the frozen plain DMV schema.' },
+          pending: [],
+          status: 'single-runtime-compatible-value-no-contrast',
+        },
+      } } : {}),
+      ...(cohort.id === 'C3' ? { source_enum_coverage: {
+        age_flush_policy: {
+          path: 'tunables.collector.batching.age_flush_policy',
+          accepted: ['immediate', 'drain_ready'],
+          configured: ['immediate', 'drain_ready'],
+          baseline_requested: batching.age_flush_policy ?? null,
+          excluded: {},
+          pending: [],
+          status: 'config-screened-not-runtime-qualified',
+        },
+      } } : {}),
+      ...(cohort.id === 'C5' ? { source_enum_coverage: {
+        data_mode: {
+          path: 'tunables.client.data_mode',
+          accepted: ['shared', 'independent'],
+          configured: ['shared', 'independent'],
+          baseline_requested: client.data_mode ?? null,
+          effective_default: 'shared (bin/collector-chain/src/dmv_client.rs::Options)',
+          consumer: 'ARROWCOL_CLIENT_DATA_MODE -> bin/collector-chain/src/dmv_client.rs::Options.data_mode; shared uses one corpus copy and independent uses workers copies under max_memory_bytes',
+          excluded: {},
+          pending: [],
+          status: 'config-screened-not-runtime-qualified',
+        },
+        ipc_compression: {
+          path: 'tunables.transport.ipc_compression',
+          accepted: ['none', 'lz4_frame', 'zstd'],
+          configured: ['none', 'lz4_frame', 'zstd'],
+          baseline_requested: transport.ipc_compression ?? null,
+          excluded: {},
+          pending: [],
+          status: 'config-screened-not-runtime-qualified',
+        },
+        grpc_send_compression: {
+          path: 'tunables.transport.grpc_send_compression',
+          accepted: ['none', 'gzip', 'zstd'],
+          configured: ['none', 'gzip', 'zstd'],
+          baseline_requested: transport.grpc_send_compression ?? null,
+          effective_default: 'none (bin/collector-chain/src/dmv_client.rs::Options)',
+          client_build_supported: ['none', 'gzip', 'zstd'],
+          consumer: 'ARROWCOL_CLIENT_GRPC_SEND_COMPRESSION -> bin/collector-chain/src/dmv_client.rs::send_compressed; paired with tunables.collector.limits.grpc_accept_compression',
+          excluded: {},
+          pending: [],
+          status: 'config-screened-not-runtime-qualified',
+        },
+        grpc_accept_compression: {
+          path: 'tunables.transport.grpc_accept_compression',
+          accepted: ['none', 'gzip', 'zstd'],
+          configured: ['none', 'gzip', 'zstd'],
+          baseline_requested: transport.grpc_accept_compression ?? null,
+          effective_default: 'none (bin/collector-chain/src/dmv_client.rs::Options)',
+          client_build_supported: ['none', 'gzip', 'zstd'],
+          consumer: 'ARROWCOL_CLIENT_GRPC_ACCEPT_COMPRESSION -> bin/collector-chain/src/dmv_client.rs::accept_compressed; paired with tunables.collector.limits.grpc_send_compression',
+          excluded: {},
+          pending: [],
+          status: 'config-screened-not-runtime-qualified',
+        },
+        grpc_receiver_accept_compression: {
+          path: 'tunables.collector.limits.grpc_accept_compression',
+          accepted: ['none', 'gzip', 'zstd'],
+          configured: ['none', 'gzip', 'zstd'],
+          baseline_requested: collectorLimits.grpc_accept_compression ?? null,
+          effective_default: 'none (crates/arrowcol-dataflow-components/src/config.rs::RuntimeLimitsConfig)',
+          receiver_build_supported: ['none', 'gzip', 'zstd'],
+          consumer: 'ARROWCOL_COLLECTOR_LIMITS_CONFIG -> crates/arrowcol-dataflow-components/src/config.rs::RuntimeLimitsConfig -> crates/arrowcol-flight/src/service.rs::into_tonic_service; paired with transport.grpc_send_compression',
+          excluded: {},
+          pending: [],
+          status: 'config-screened-not-runtime-qualified',
+        },
+        grpc_receiver_send_compression: {
+          path: 'tunables.collector.limits.grpc_send_compression',
+          accepted: ['none', 'gzip', 'zstd'],
+          configured: ['none', 'gzip', 'zstd'],
+          baseline_requested: collectorLimits.grpc_send_compression ?? null,
+          effective_default: 'none (crates/arrowcol-dataflow-components/src/config.rs::RuntimeLimitsConfig)',
+          receiver_build_supported: ['none', 'gzip', 'zstd'],
+          consumer: 'ARROWCOL_COLLECTOR_LIMITS_CONFIG -> crates/arrowcol-dataflow-components/src/config.rs::RuntimeLimitsConfig -> crates/arrowcol-flight/src/service.rs::into_tonic_service; paired with transport.grpc_accept_compression',
+          excluded: {},
+          pending: [],
+          status: 'config-screened-not-runtime-qualified',
+        },
+      } } : {}),
+      ...(cohort.id === 'C6' ? { source_enum_coverage: {
+        collector_upload_mode: {
+          path: 'tunables.collector.upload.mode',
+          accepted: ['put_create', 'buffered_multipart'],
+          configured: [],
+          baseline_requested: upload.mode ?? null,
+          effective_default: 'put_create',
+          excluded: {
+            buffered_multipart: 'Pinned capability table marks collector multipart upload unsupported because the backend lacks conditional completion; not a scored candidate.',
+          },
+          pending: [],
+          status: 'safety-excluded-by-pinned-backend-capability',
+        },
+      } } : {}),
+      ...(cohort.id === 'C7' ? { source_enum_coverage: {
+        input_read_strategy: {
+          path: 'tunables.maintenance.input_read_strategy',
+          accepted: ['memory', 'spool', 'range'],
+          configured: ['memory', 'spool', 'range'],
+          baseline_requested: maintenanceSeed.input_read_strategy ?? null,
+          effective_default: 'memory',
+          excluded: {},
+          pending: [],
+          status: 'config-screened-not-runtime-qualified',
+        },
+        granularity: {
+          path: 'tunables.maintenance.granularity',
+          accepted: ['minute', 'hour', 'day'],
+          configured: ['minute', 'hour', 'day'],
+          baseline_requested: 'hour',
+          excluded: {},
+          pending: [],
+          status: 'config-screened-not-runtime-qualified',
+        },
+        optimize_upload_mode: {
+          path: 'tunables.maintenance.optimize_upload_mode',
+          accepted: ['put_create', 'buffered_multipart'],
+          configured: ['put_create', 'buffered_multipart'],
+          baseline_requested: maintenanceSeed.optimize_upload_mode ?? null,
+          effective_default: 'put_create',
+          excluded: {},
+          pending: [],
+          coupled_setting: 'buffered_multipart candidate requests optimize_upload_buffer_bytes=8388608; source bounds are 4194304..67108864.',
+          status: 'config-screened-buffered-multipart-exploratory',
+        },
+        operations: {
+          path: 'tunables.maintenance.operations',
+          accepted: ['purge', 'optimize', 'vacuum', 'checkpoint', 'prune_log'],
+          configured: ['optimize', 'purge', 'vacuum', 'checkpoint', 'prune_log'],
+          excluded: {},
+          pending: [],
+          status: 'fixed-campaign-invariant-never-varied',
+        },
       } } : {}),
       ...(cohort.id === 'C3' ? { flush_age_semantics: {
         requested_path: 'tunables.collector.batching.max_age',
@@ -233,6 +482,7 @@ export function renderThroughputBaseline(base: unknown, manifest: unknown): Json
       !isRecord(manifest.baseline_overrides) || !Array.isArray(manifest.comparisons)) {
     throw new Error('invalid base config or throughput manifest');
   }
+  validateComparisons(manifest.comparisons, String(manifest.cohort ?? 'unknown'));
   if (!isRecord(base.tunables) ||
       createHash('sha256').update(JSON.stringify(base.tunables)).digest('hex') !== manifest.registry_sha256) {
     throw new Error('base tunables do not match manifest seed');
@@ -254,7 +504,9 @@ async function main(args: string[]): Promise<void> {
   let registryPath = resolve(root, 'docs/experiments/arrowcol-oat/oat-config.tuned.json');
   let outputDirectory = resolve(root, 'docs/experiments/arrowcol-oat');
   let manifestDirectory = resolve(root, 'docs/experiments/arrowcol-oat');
+  let outputDirectoryProvided = false;
   let renderAll = false;
+  let supplement: string | undefined;
   for (let index = 0; index < args.length; index++) {
     const option = args[index];
     if (option === '--render-all') {
@@ -264,48 +516,78 @@ async function main(args: string[]): Promise<void> {
     const value = args[++index];
     if (!value || value.startsWith('--')) throw new Error('expected a value after ' + option);
     if (option === '--registry') registryPath = resolve(value);
-    else if (option === '--out') outputDirectory = resolve(value);
-    else if (option === '--manifests') manifestDirectory = resolve(value);
-    else throw new Error('unknown option: ' + option);
+    else if (option === '--out') {
+      outputDirectory = resolve(value);
+      outputDirectoryProvided = true;
+    } else if (option === '--manifests') manifestDirectory = resolve(value);
+    else if (option === '--supplement') {
+      if (value !== 'C5-grpc') throw new Error('unsupported supplemental manifest: ' + value);
+      supplement = value;
+    } else throw new Error('unknown option: ' + option);
   }
   const registry: unknown = JSON.parse(await readFile(registryPath, 'utf8'));
-  const manifests = renderAll
-    ? await Promise.all(cohorts.map(async cohort => {
-      const path = resolve(manifestDirectory, 'oat-config-throughput-' + cohort.id + '.json');
-      const manifest: unknown = JSON.parse(await readFile(path, 'utf8'));
-      if (!isRecord(manifest) || manifest.cohort !== cohort.id || !Array.isArray(manifest.comparisons)) {
-        throw new Error('invalid manifest: ' + path);
+  if (!renderAll) {
+    const generated = buildThroughputManifests(registry);
+    if (supplement) {
+      if (!outputDirectoryProvided || outputDirectory === manifestDirectory) {
+        throw new Error('--supplement generation requires --out distinct from --manifests to preserve checked-in evidence');
       }
-      return manifest;
-    }))
-    : buildThroughputManifests(registry);
-  await mkdir(outputDirectory, { recursive: true });
-  for (const manifest of manifests) {
-    const cohort = String(manifest.cohort);
-    if (!renderAll) {
-      await writeFile(resolve(outputDirectory, 'oat-config-throughput-' + cohort + '.json'), JSON.stringify(manifest, null, 2) + '\n');
-      continue;
+      const manifest = generated.find(item => item.cohort === 'C5');
+      if (!manifest) throw new Error('could not generate C5 supplement');
+      await mkdir(outputDirectory, { recursive: true });
+      await writeFile(resolve(outputDirectory, 'oat-config-throughput-' + supplement + '.json'), JSON.stringify(manifest, null, 2) + '\n');
+      return;
     }
-    const cohortDirectory = resolve(outputDirectory, cohort);
+    await mkdir(outputDirectory, { recursive: true });
+    for (const manifest of generated) {
+      const cohort = String(manifest.cohort);
+      if (cohort === 'C5') continue;
+      await writeFile(resolve(outputDirectory, 'oat-config-throughput-' + cohort + '.json'), JSON.stringify(manifest, null, 2) + '\n');
+    }
+    console.log('C5 is frozen; use --supplement C5-grpc to generate the additive profile.');
+    return;
+  }
+  const selectedCohorts = cohorts.filter(cohort => !supplement || cohort.id !== 'C5');
+  const manifests: Array<{ manifest: unknown; outputName: string }> = await Promise.all(selectedCohorts.map(async cohort => {
+    const path = resolve(manifestDirectory, 'oat-config-throughput-' + cohort.id + '.json');
+    const manifest: unknown = JSON.parse(await readFile(path, 'utf8'));
+    if (!isRecord(manifest) || manifest.cohort !== cohort.id || !Array.isArray(manifest.comparisons)) {
+      throw new Error('invalid manifest: ' + path);
+    }
+    return { manifest, outputName: cohort.id };
+  }));
+  if (supplement) {
+    const path = resolve(manifestDirectory, 'oat-config-throughput-' + supplement + '.json');
+    const manifest: unknown = JSON.parse(await readFile(path, 'utf8'));
+    if (!isRecord(manifest) || manifest.cohort !== 'C5' || !Array.isArray(manifest.comparisons)) {
+      throw new Error('invalid supplemental manifest: ' + path);
+    }
+    manifests.push({ manifest, outputName: supplement });
+  }
+  await mkdir(outputDirectory, { recursive: true });
+  for (const selected of manifests) {
+    const { manifest, outputName } = selected;
+    if (!isRecord(manifest)) throw new Error('invalid manifest: ' + outputName);
+    const cohort = String(manifest.cohort);
+    const cohortDirectory = resolve(outputDirectory, outputName);
     await mkdir(cohortDirectory, { recursive: true });
     await writeFile(resolve(cohortDirectory, 'baseline.json'),
       JSON.stringify(renderThroughputBaseline(registry, manifest), null, 2) + '\n');
     for (const comparison of manifest.comparisons as Comparison[]) {
       if (!isRecord(comparison) || typeof comparison.id !== 'string' || !/^[a-z0-9-]+$/.test(comparison.id) ||
           !Array.isArray(comparison.candidates)) throw new Error('invalid comparison in ' + cohort);
-      const directory = resolve(outputDirectory, cohort, comparison.id);
+      const directory = resolve(cohortDirectory, comparison.id);
       await mkdir(directory, { recursive: true });
-      for (const candidate of comparison.candidates) {
-        if (!isRecord(candidate) || typeof candidate.id !== 'string' || !/^[a-z0-9_-]+$/.test(candidate.id)) {
-          throw new Error('invalid candidate in ' + cohort + '/' + comparison.id);
+      for (const selectedCandidate of comparison.candidates) {
+        if (!isRecord(selectedCandidate) || typeof selectedCandidate.id !== 'string' || !/^[a-z0-9_-]+$/.test(selectedCandidate.id)) {
+          throw new Error('invalid candidate in ' + outputName + '/' + comparison.id);
         }
-        const config = renderThroughputConfig(registry, manifest, comparison.id, candidate.id);
-        await writeFile(resolve(directory, candidate.id + '.json'), JSON.stringify(config, null, 2) + '\n');
+        const config = renderThroughputConfig(registry, manifest, comparison.id, selectedCandidate.id);
+        await writeFile(resolve(directory, selectedCandidate.id + '.json'), JSON.stringify(config, null, 2) + '\n');
       }
     }
   }
 }
-
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   main(process.argv.slice(2)).catch(error => {
     console.error(error instanceof Error ? error.message : String(error));

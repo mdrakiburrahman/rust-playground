@@ -1051,6 +1051,7 @@ trait Platform: Send + Sync {
         &mut self,
         _config: &OatConfig,
         _rows: &[OatResult],
+        _submitted: Option<&SubmittedConfigIdentity>,
         _deadline: tokio::time::Instant,
     ) -> Result<()> {
         Ok(())
@@ -1077,6 +1078,13 @@ trait Platform: Send + Sync {
     async fn cancel_client(&self, config: &OatConfig, handle: &ClientHandle) -> Result<()>;
     fn resource_sampler_source(&self) -> Option<ResourceSamplerSource> {
         None
+    }
+    async fn native_telemetry_source(
+        &self,
+        _config: &OatConfig,
+        _qap_tables: &[String],
+    ) -> Result<Option<NativeTelemetrySource>> {
+        Ok(None)
     }
     async fn process_logs(&self, _config: &OatConfig) -> Result<Vec<ProcessLog>> {
         Ok(Vec::new())
@@ -1143,7 +1151,7 @@ struct PublicationBacklogScraper {
 impl PublicationBacklogScraper {
     async fn start(source: &ResourceSamplerSource, config: &OatConfig) -> Result<Self> {
         let (endpoint, tunnel) = match source {
-            ResourceSamplerSource::Aks => {
+            ResourceSamplerSource::Aks | ResourceSamplerSource::AksNative(_) => {
                 let (endpoint, tunnel) = start_aks_collector_metrics_tunnel(config).await?;
                 (endpoint, Some(tunnel))
             }
@@ -1602,9 +1610,10 @@ impl Platform for AksPlatform {
         &mut self,
         config: &OatConfig,
         rows: &[OatResult],
+        submitted: Option<&SubmittedConfigIdentity>,
         deadline: tokio::time::Instant,
     ) -> Result<()> {
-        publish_campaign_official_measurement(self, config, rows, deadline).await
+        publish_campaign_official_measurement(self, config, rows, submitted, deadline).await
     }
 
     fn mark_qap_outcome_unresolved(&mut self) {
@@ -1695,6 +1704,71 @@ impl Platform for AksPlatform {
 
     fn resource_sampler_source(&self) -> Option<ResourceSamplerSource> {
         Some(ResourceSamplerSource::Aks)
+    }
+
+    async fn native_telemetry_source(
+        &self,
+        config: &OatConfig,
+        qap_tables: &[String],
+    ) -> Result<Option<NativeTelemetrySource>> {
+        if self.campaign_cli_paths.is_none() {
+            return Ok(None);
+        }
+        anyhow::ensure!(
+            FIXTURE_BOUNDARY.try_with(|_| ()).is_err(),
+            "fixture boundary has no authenticated native telemetry transport"
+        );
+        let inventory = campaign_inventory_for_setup(self).await?;
+        let plan = inventory
+            .fic
+            .as_ref()
+            .and_then(|fic| fic.plan.as_ref())
+            .context("native telemetry has no exact API-server binding")?;
+        let database = self.qap_database(config)?;
+        let qap = inventory
+            .qap
+            .as_ref()
+            .context("native telemetry has no admitted QAP table bindings")?;
+        let expected = qap
+            .bindings
+            .iter()
+            .map(|binding| binding.external_table.clone())
+            .collect::<BTreeSet<_>>();
+        anyhow::ensure!(
+            inventory.load_admission == InventoryLoadAdmission::Authorized
+                && inventory.namespace.name == config.namespace
+                && qap.database == database
+                && expected == qap_tables.iter().cloned().collect()
+                && expected.len() == qap_tables.len()
+                && !expected.is_empty(),
+            "native telemetry differs from the admitted original cell and QAP tables"
+        );
+        let targets = aks_resource_pod_targets(&self.resource_readback)?;
+        anyhow::ensure!(
+            !targets.is_empty() && targets.len() <= 64,
+            "native telemetry pod identity set is unavailable or oversized"
+        );
+        Ok(Some(NativeTelemetrySource {
+            server: plan.server.clone(),
+            context: config.kubectl_context.clone(),
+            targets,
+            qap_endpoint: self.qap_endpoint(config),
+            qap_database: database,
+            qap_tables: qap_tables.to_vec(),
+            results: self
+                .runtime_dir
+                .as_ref()
+                .context("native telemetry runtime directory unavailable")?
+                .join("measurement-qap"),
+            binding: json!({
+                "campaign_id": inventory.campaign_id, "owner_id": inventory.owner_id,
+                "fencing_token": inventory.fencing_token, "cell_run_id": inventory.cell_run_id,
+                "namespace_uid": inventory.namespace.uid, "namespace": inventory.namespace.name,
+                "server": plan.server, "kube_context": config.kubectl_context,
+                "qap_database": qap.database, "qap_bindings": qap.bindings,
+                "qap_reference": qap.reference, "qap_endpoint": self.qap_endpoint(config),
+            }),
+        }))
     }
 
     async fn cleanup(&mut self, config: &OatConfig) -> Result<()> {
@@ -2436,7 +2510,8 @@ async fn start_aks_client_job(
         "job": job_name,
         "requested": client_resources,
         "effective": {"job_template": job_resources["effective"], "pod": pod["resources"]},
-        "scheduled_pod": {"name": pod["name"], "uid": pod["uid"], "node": pod["node"], "container": "client"},
+        "scheduled_pod": {"name": pod["name"], "uid": pod["uid"], "node": pod["node"],
+            "container": "client", "container_id": pod["container_id"]},
     }));
     Ok(ClientHandle {
         client_id: format!("{run_id}:{table}:{client_index}"),
@@ -2607,6 +2682,7 @@ async fn wait_for_aks_client_pod_resource_readback(
                     "name": metadata.get("name"),
                     "uid": metadata.get("uid"),
                     "node": node,
+                    "container_id": native_container_id(pod, "client"),
                     "resources": resources["effective"],
                 }));
             }
@@ -3002,6 +3078,7 @@ async fn run_matrix(
     state: Arc<AppState>,
     cancellation: watch::Receiver<bool>,
 ) -> MatrixOutcome {
+    let submitted_config = capture_submitted_config_identity(&state, orchestration_id).await;
     run_matrix_with(
         config,
         orchestration_id,
@@ -3014,6 +3091,7 @@ async fn run_matrix(
                 replicas,
                 concurrency,
                 cancellation.clone(),
+                submitted_config.clone(),
             )
         },
     )
@@ -3084,6 +3162,7 @@ async fn run_isolated_cell(
     replicas: u32,
     concurrency: u32,
     mut cancellation: watch::Receiver<bool>,
+    submitted_config: Option<SubmittedConfigIdentity>,
 ) -> MatrixOutcome {
     let mut platform = match platform_for_run(&config, &run_id) {
         Ok(platform) => platform,
@@ -3130,7 +3209,7 @@ async fn run_isolated_cell(
                 "ArrowCol scale",
             )?;
             match tokio::time::timeout_at(lifecycle_deadline, async {
-                run_matrix_cell(
+                let mut rows = run_matrix_cell(
                     &config,
                     orchestration_id,
                     &run_id,
@@ -3138,7 +3217,20 @@ async fn run_isolated_cell(
                     concurrency,
                     platform.as_mut(),
                     lifecycle_deadline,
-                ).await
+                ).await?;
+                if let Err(error) = platform.publish_official_measurement(
+                    &config, &rows, submitted_config.as_ref(), lifecycle_deadline,
+                ).await {
+                    tracing::error!(%error, "official cell measurement publication failed; retaining original rows for normal cleanup");
+                    for row in &mut rows {
+                        row.status = "failed".to_owned();
+                        row.failure = Some(match row.failure.take() {
+                            Some(prior) => format!("{prior}; official_measurement_publication_failed"),
+                            None => "official_measurement_publication_failed".to_owned(),
+                        });
+                    }
+                }
+                Ok(rows)
             }).await {
                 Ok(result) => result,
                 Err(_) => Err(anyhow::anyhow!("planned cell lifecycle duration expired; normal platform cleanup follows")),
@@ -3875,7 +3967,7 @@ async fn run_matrix_cell(
             }
         }
     }
-    let mut rows = result_rows(
+    result_rows(
         config,
         orchestration_id,
         run_id,
@@ -3888,21 +3980,7 @@ async fn run_matrix_cell(
             resources: metrics,
             resource_evidence: platform.resource_evidence(),
         },
-    )?;
-    if let Err(error) = platform
-        .publish_official_measurement(config, &rows, lifecycle_deadline)
-        .await
-    {
-        tracing::error!(%error, "official cell measurement publication failed; retaining original rows for normal cleanup");
-        for row in &mut rows {
-            row.status = "failed".to_owned();
-            row.failure = Some(match row.failure.take() {
-                Some(prior) => format!("{prior}; official_measurement_publication_failed"),
-                None => "official_measurement_publication_failed".to_owned(),
-            });
-        }
-    }
-    Ok(rows)
+    )
 }
 
 struct CellMeasurements {
@@ -4500,8 +4578,22 @@ async fn run_clients_inner(
         prepared.engine.proof["run_id"] = json!(project_run_id);
         prepared.probe.since_ms = unix_time_ms_u64()?.saturating_sub(GUARD_MAX_GAP_MS);
     }
+    let native = match platform.native_telemetry_source(config, &qap_tables).await {
+        Ok(source) => source,
+        Err(_) => {
+            evidence.native_telemetry = Some(json!({
+                "schema_version": 1, "unavailable_reason": "original_cell_native_source_binding_unavailable",
+                "samples": [],
+            }));
+            None
+        }
+    };
+    let sampler_source = match native {
+        Some(native) => Some(ResourceSamplerSource::AksNative(Arc::new(native))),
+        None => platform.resource_sampler_source(),
+    };
     let mut sampler = ResourceSampler::start(
-        platform.resource_sampler_source(),
+        sampler_source,
         config.clone(),
         measurement_start_unix_ms,
         measurement_end_unix_ms,
@@ -8748,14 +8840,19 @@ async fn campaign_inventory_for_setup(platform: &AksPlatform) -> Result<RunInven
         .as_deref()
         .context("campaign runtime directory is not available")?;
     let inventory: RunInventory = serde_json::from_slice(
-        &tokio::fs::read(runtime_dir.join("campaign-inventory.json"))
-            .await
-            .context("read persisted campaign inventory for setup")?,
+        &read_native_file(
+            &runtime_dir.join("campaign-inventory.json"),
+            OFFICIAL_MEASUREMENT_MAX_BYTES,
+        )
+        .await
+        .context("read persisted campaign inventory for setup")?,
     )
     .context("parse persisted campaign inventory for setup")?;
-    let etag = tokio::fs::read_to_string(runtime_dir.join("campaign-inventory-etag"))
-        .await
-        .context("read persisted campaign inventory ETag for setup")?;
+    let etag = String::from_utf8(
+        read_native_file(&runtime_dir.join("campaign-inventory-etag"), 4096)
+            .await
+            .context("read persisted campaign inventory ETag for setup")?,
+    )?;
     validate_campaign_etag(etag.trim())?;
     let identity = CampaignIdentity::from_lookup(|name| std::env::var(name).ok())?;
     validate_campaign_inventory_identity(
@@ -11374,6 +11471,7 @@ async fn aks_deployment_resource_readback(
             "pod": pod_name,
             "uid": metadata.get("uid"),
             "container": container_name,
+            "container_id": native_container_id(pod, container_name),
             "node": node_name,
             "resources": resources["effective"],
         }));
@@ -11488,12 +11586,14 @@ fn parse_cadvisor_cpu_counters(
     }
 }
 
+#[derive(Clone, serde::Serialize)]
 struct AksResourcePodTarget {
     role: String,
     pod: String,
     uid: String,
     container: String,
     node: String,
+    container_id: Option<String>,
 }
 
 fn aks_resource_pod_targets(readbacks: &[Value]) -> Result<Vec<AksResourcePodTarget>> {
@@ -11526,6 +11626,7 @@ fn aks_resource_pod_targets(readbacks: &[Value]) -> Result<Vec<AksResourcePodTar
                 uid: uid.to_owned(),
                 container: container.to_owned(),
                 node: node.to_owned(),
+                container_id: pod.get("container_id").and_then(Value::as_str).map(str::to_owned),
             });
             Ok(())
         };
@@ -12214,6 +12315,18 @@ fn parse_memory_bytes(value: &str) -> Result<u64> {
 }
 
 async fn kubectl(config: &OatConfig, args: Vec<&str>, stdin: Option<Vec<u8>>) -> Result<String> {
+    kubectl_with_output_bound(config, args, stdin, None).await
+}
+
+async fn kubectl_with_output_bound(
+    config: &OatConfig,
+    args: Vec<&str>,
+    stdin: Option<Vec<u8>>,
+    max_output_bytes: Option<usize>,
+) -> Result<String> {
+    if max_output_bytes.is_some_and(|limit| limit == 0 || limit > OFFICIAL_MEASUREMENT_MAX_BYTES) {
+        bail!("invalid native kubectl output byte bound");
+    }
     let mut command = Command::new("kubectl");
     if let Some(context) = &config.kubectl_context {
         command.args(["--context", context]);
@@ -12224,6 +12337,9 @@ async fn kubectl(config: &OatConfig, args: Vec<&str>, stdin: Option<Vec<u8>>) ->
     }
     command.args(&args);
     if let Some((code, stdout)) = fixture_command_output(&command, stdin.as_deref()).await? {
+        if max_output_bytes.is_some_and(|limit| stdout.len() > limit) {
+            bail!("native kubectl output exceeded its byte bound");
+        }
         if code != 0 {
             bail!("fixture kubectl command failed; outcome may be unknown and must not be replayed");
         }
@@ -12238,7 +12354,10 @@ async fn kubectl(config: &OatConfig, args: Vec<&str>, stdin: Option<Vec<u8>>) ->
         let mut input = child.stdin.take().context("open kubectl stdin")?;
         input.write_all(&payload).await.context("write kubectl manifest")?;
     }
-    let output = child.wait_with_output().await.context("wait for kubectl")?;
+    let output = match max_output_bytes {
+        Some(limit) => bounded_native_child_output(child, limit).await?,
+        None => child.wait_with_output().await.context("wait for kubectl")?,
+    };
     if !output.status.success() {
         bail!(
             "kubectl {} failed with {}: {}",

@@ -1,4 +1,9 @@
+import { EffectBoundary, withEffectBoundary, type EffectEnvelope } from '../../infra/azure/effect-boundary.js';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import { chmodSync, mkdtempSync, rmSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { test } from 'node:test';
 import { CampaignConflictError, CUSTODY_CLEANUP_STEPS, MAX_CAMPAIGN_LIFETIME_MS, KNOWN_LIFECYCLE_CLEANUP_RESERVE_MS, assessCellLifetimeBudget,
   MISSED_HEARTBEAT_LIMIT, HEARTBEAT_INTERVAL_MS,
@@ -14,6 +19,26 @@ const ownerId = 'c0ffee00-0000-4000-8000-000000000002';
 const subscriptionId = 'c0ffee00-0000-4000-8000-000000000003';
 const resourceId = `/subscriptions/${subscriptionId}/resourceGroups/perf69/providers/Microsoft.ContainerService/managedClusters/bench`;
 const operationUrl = `https://management.azure.com/subscriptions/${subscriptionId}/providers/Microsoft.ContainerService/locations/westus/operations/123?api-version=2024-10-01`;
+
+function chunkedResponse(chunks: Uint8Array[], headers: Record<string, string> = {}, close = true,
+  status = 200, etag: string | null = '"state-v1"') {
+  let cancelled = false, index = 0;
+  const body = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (index < chunks.length) {
+        controller.enqueue(chunks[index++]!);
+        if (close && index === chunks.length) controller.close();
+      }
+    },
+    cancel() { cancelled = true; },
+  });
+  const responseHeaders = { ...headers };
+  if (etag !== null) responseHeaders.etag = etag;
+  return {
+    response: new Response(body, { status, headers: responseHeaders }),
+    wasCancelled: () => cancelled,
+  };
+}
 
 class MemoryStore implements CampaignStore {
   current?: StoredCampaign;
@@ -470,4 +495,116 @@ test('campaign Blob store keeps the default record path and supports isolated pa
     '/checkpoints/_arrowcol-custody-rehearsal/rehearsal-1/active.json']);
   assert.throws(() => createBlobCampaignStore({ ...config, recordPath: '../active.json' }, fetcher,
     async () => 'fixture-token'), /Campaign store record path is invalid/);
+});
+
+test('campaign store reads chunked response bytes exactly at the cap without Content-Length', async () => {
+  const state = newCampaignState(campaignId, ownerId, Date.now());
+  const bytes = Buffer.from(JSON.stringify(state), 'utf8');
+  const split = Math.floor(bytes.length / 2);
+  const body = chunkedResponse([bytes.subarray(0, split), bytes.subarray(split)]);
+  assert.equal(body.response.headers.get('content-length'), null);
+  const store = createBlobCampaignStore({ account: 'arrowcollector12345', container: 'checkpoints', subscriptionId },
+    async () => body.response, async () => 'fixture-token');
+  assert.deepEqual(await store.read({ maxResponseBodyBytes: bytes.length }), { state, etag: '"state-v1"' });
+  assert.equal(body.wasCancelled(), false);
+});
+
+test('campaign store rejects chunked overflow despite a smaller Content-Length', async () => {
+  const state = newCampaignState(campaignId, ownerId, Date.now());
+  const bytes = Buffer.from(JSON.stringify(state), 'utf8');
+  const overflow = Buffer.concat([bytes, Buffer.from(' ')]);
+  const body = chunkedResponse([overflow], { 'content-length': String(bytes.length) }, false);
+  const store = createBlobCampaignStore({ account: 'arrowcollector12345', container: 'checkpoints', subscriptionId },
+    async () => body.response, async () => 'fixture-token');
+  await assert.rejects(store.read({ maxResponseBodyBytes: bytes.length }), /byte cap/);
+  assert.equal(body.wasCancelled(), true);
+});
+
+test('capped campaign reads cancel streaming bodies before 404, status, and missing ETag exits', async () => {
+  const config = { account: 'arrowcollector12345', container: 'checkpoints', subscriptionId };
+  const cases = [
+    { status: 404, etag: '"state-v1"', error: undefined },
+    { status: 503, etag: '"state-v1"', error: /HTTP 503/ },
+    { status: 200, etag: null, error: /no ETag/ },
+  ] as const;
+  for (const item of cases) {
+    const body = chunkedResponse([Buffer.from('pending')], {}, false, item.status, item.etag);
+    const store = createBlobCampaignStore(config, async () => body.response, async () => 'fixture-token');
+    if (item.error) await assert.rejects(store.read({ maxResponseBodyBytes: 32 }), item.error);
+    else assert.equal(await store.read({ maxResponseBodyBytes: 32 }), undefined);
+    assert.equal(body.wasCancelled(), true);
+  }
+});
+
+test('capped campaign reads decode split UTF-8 and reject invalid UTF-8 and JSON', async () => {
+  const state = newCampaignState(campaignId, ownerId, Date.now());
+  const text = JSON.stringify({ ...state, unexpected: '💠' });
+  const bytes = Buffer.from(text, 'utf8'), symbol = Buffer.from('💠', 'utf8');
+  const symbolStart = bytes.indexOf(symbol), split = symbolStart + 2;
+  const splitBody = chunkedResponse([bytes.subarray(0, split), bytes.subarray(split)]);
+  const config = { account: 'arrowcollector12345', container: 'checkpoints', subscriptionId };
+  const splitStore = createBlobCampaignStore(config, async () => splitBody.response, async () => 'fixture-token');
+  await assert.rejects(splitStore.read({ maxResponseBodyBytes: bytes.length }), /unknown fields/);
+
+  const invalidUtf8 = Buffer.concat([Buffer.from(JSON.stringify(state), 'utf8'), Buffer.from([0xff])]);
+  const utf8Store = createBlobCampaignStore(config, async () => chunkedResponse([invalidUtf8]).response,
+    async () => 'fixture-token');
+  await assert.rejects(utf8Store.read({ maxResponseBodyBytes: invalidUtf8.length }), /not valid UTF-8/);
+
+  const invalidJson = Buffer.from('{', 'utf8');
+  const jsonStore = createBlobCampaignStore(config, async () => chunkedResponse([invalidJson]).response,
+    async () => 'fixture-token');
+  await assert.rejects(jsonStore.read({ maxResponseBodyBytes: invalidJson.length }), /not valid JSON/);
+});
+
+test('capped campaign store rejects invalid caps before token acquisition or fetch', async () => {
+  let tokens = 0, fetches = 0;
+  const store = createBlobCampaignStore({ account: 'arrowcollector12345', container: 'checkpoints', subscriptionId },
+    async () => { fetches++; return new Response(null, { status: 404 }); },
+    async () => { tokens++; return 'fixture-token'; });
+  await assert.rejects(store.read({ maxResponseBodyBytes: 0 }), /positive safe integer/);
+  assert.equal(tokens, 0);
+  assert.equal(fetches, 0);
+});
+
+test('capped campaign read rechecks its original deadline after effect journaling', async () => {
+  let fetches = 0;
+  const envelope: EffectEnvelope = {
+    schema_version: 1, campaign_id: campaignId, run_id: 'c0ffee00-0000-4000-8000-000000000004',
+    subscription_id: subscriptionId, resource_group: 'perf69', storage_account: 'arrowcollector12345',
+    state_container: 'checkpoints', effects: [{ id: 'campaign-read', transport: 'campaign-blob', method: 'GET',
+      resource: 'https://arrowcollector12345.blob.core.windows.net/checkpoints', path: '/checkpoints/active.json', max_calls: 1 }],
+  };
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'oat-campaign-read-deadline-'));
+  chmodSync(directory, 0o700);
+  try {
+    const journalPath = path.join(directory, 'effects.jsonl');
+    const boundary = new EffectBoundary(envelope, journalPath);
+    const store = createBlobCampaignStore({ account: 'arrowcollector12345', container: 'checkpoints', subscriptionId },
+      async () => { fetches++; return new Response(null, { status: 404 }); }, async () => 'fixture-token');
+    const originalFsync = fs.fsyncSync;
+    fs.fsyncSync = (fd: number) => {
+      const started = Date.now();
+      while (Date.now() - started < 350) { /* deliberate synchronous journal delay */ }
+      return originalFsync(fd);
+    };
+    const deadlineUnixMs = Date.now() + 200;
+    try {
+      await assert.rejects(withEffectBoundary(boundary, () => store.read({
+        maxResponseBodyBytes: 4_194_304, deadlineUnixMs,
+      })), /original deadline/);
+    } finally { fs.fsyncSync = originalFsync; }
+    assert.equal(fetches, 0);
+    assert.match(fs.readFileSync(journalPath, 'utf8'), /"event":"dispatch"/);
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('capped campaign read cancels an unclosed body at its original deadline', async () => {
+  const state = newCampaignState(campaignId, ownerId, Date.now());
+  const body = chunkedResponse([Buffer.from(JSON.stringify(state), 'utf8')], {}, false);
+  const store = createBlobCampaignStore({ account: 'arrowcollector12345', container: 'checkpoints', subscriptionId },
+    async () => body.response, async () => 'fixture-token');
+  await assert.rejects(store.read({ maxResponseBodyBytes: 4_194_304, deadlineUnixMs: Date.now() + 100 }),
+    /original deadline/);
+  assert.equal(body.wasCancelled(), true);
 });

@@ -16,6 +16,7 @@ use arrow_flight::{
     encode::FlightDataEncoderBuilder,
     error::FlightError,
     flight_descriptor::DescriptorType,
+    flight_service_client::FlightServiceClient,
     sql::{CommandStatementUpdate, DoPutUpdateResult, ProstMessageExt},
 };
 use arrow_schema::{DataType, Field, Schema};
@@ -44,7 +45,240 @@ use tonic::{
     Code, Request, Status,
     metadata::{MetadataMap, MetadataValue},
 };
+use tonic::{
+    codec::CompressionEncoding,
+    transport::{Channel, Server},
+};
 use uuid::Uuid;
+
+struct LoopbackFlight {
+    client: FlightServiceClient<Channel>,
+    task: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+}
+
+impl LoopbackFlight {
+    async fn start(service: ArrowColFlightService) -> Result<Self> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let incoming = stream::unfold(listener, |listener| async {
+            Some((listener.accept().await.map(|(socket, _)| socket), listener))
+        });
+        let task = tokio::spawn(
+            Server::builder()
+                .add_service(service.into_tonic_service())
+                .serve_with_incoming(incoming),
+        );
+        let channel = Channel::from_shared(format!("http://{address}"))?
+            .connect_timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(5))
+            .connect()
+            .await?;
+        Ok(Self {
+            client: FlightServiceClient::new(channel),
+            task,
+        })
+    }
+}
+
+impl Drop for LoopbackFlight {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn wire_ingest_request(
+    schema: &CatalogSchemaVersion,
+) -> Result<Request<impl Stream<Item = FlightData> + Send + 'static>> {
+    let messages = encode_ingest(schema, vec![v1_batch(schema, 0)?]).await?;
+    let mut request = Request::new(stream::iter(messages));
+    insert_ingest_metadata(
+        request.metadata_mut(),
+        schema,
+        ImplementationPool::Dataflow,
+        schema.fingerprint(),
+    )?;
+    Ok(request)
+}
+
+#[tokio::test]
+async fn loopback_compression_negotiates_requests_and_responses_independently() -> Result<()> {
+    for (request_encoding, response_encoding, client_accept) in [
+        (None, None, None),
+        (None, None, Some(CompressionEncoding::Zstd)),
+        (
+            Some(CompressionEncoding::Gzip),
+            Some(CompressionEncoding::Gzip),
+            Some(CompressionEncoding::Gzip),
+        ),
+        (
+            Some(CompressionEncoding::Zstd),
+            Some(CompressionEncoding::Zstd),
+            Some(CompressionEncoding::Zstd),
+        ),
+        (
+            Some(CompressionEncoding::Gzip),
+            Some(CompressionEncoding::Zstd),
+            Some(CompressionEncoding::Zstd),
+        ),
+        (None, Some(CompressionEncoding::Gzip), None),
+        (None, Some(CompressionEncoding::Gzip), Some(CompressionEncoding::Zstd)),
+    ] {
+        let fixture = Fixture::with_current(false).await?;
+        let admission = MockAdmission::new(TestCompletion::BestEffort, None);
+        let limits = RuntimeLimits {
+            grpc_accept_compression: request_encoding,
+            grpc_send_compression: response_encoding,
+            ..Default::default()
+        };
+        let service = fixture.service_with_limits(ImplementationPool::Dataflow, admission.clone(), limits)?;
+        let server = LoopbackFlight::start(service).await?;
+        let mut client = server.client.clone();
+        if let Some(encoding) = request_encoding {
+            client = client.send_compressed(encoding);
+        }
+        if let Some(encoding) = client_accept {
+            client = client.accept_compressed(encoding);
+        }
+        let response = client.do_put(wire_ingest_request(&fixture.v1).await?).await?;
+        let expected = response_encoding.filter(|encoding| Some(*encoding) == client_accept);
+        assert_eq!(
+            response
+                .metadata()
+                .get("grpc-encoding")
+                .and_then(|value| value.to_str().ok()),
+            expected.map(|encoding| match encoding {
+                CompressionEncoding::Gzip => "gzip",
+                CompressionEncoding::Zstd => "zstd",
+                _ => "unsupported",
+            }),
+        );
+        let results = response.into_inner().try_collect::<Vec<_>>().await?;
+        assert_eq!(results.len(), 1);
+        assert_eq!(admission.begin_count(), 1);
+        assert_eq!(admission.batches().await, vec![v1_batch(&fixture.v1, 0)?]);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn loopback_compression_does_not_bypass_disabled_codec_or_decompressed_limits() -> Result<()> {
+    for encoding in [CompressionEncoding::Gzip, CompressionEncoding::Zstd] {
+        for limit in [
+            "disabled",
+            "mismatch",
+            "schema",
+            "message",
+            "metadata",
+            "negotiation_metadata",
+        ] {
+            let fixture = Fixture::with_current(false).await?;
+            let admission = MockAdmission::new(TestCompletion::BestEffort, None);
+            let mut limits = RuntimeLimits::default();
+            if limit != "disabled" {
+                limits.grpc_accept_compression = Some(encoding);
+            }
+            match limit {
+                "mismatch" => {
+                    limits.grpc_accept_compression = Some(if encoding == CompressionEncoding::Gzip {
+                        CompressionEncoding::Zstd
+                    } else {
+                        CompressionEncoding::Gzip
+                    })
+                }
+                "schema" => limits.max_schema_bytes = 16,
+                "message" => {
+                    limits.max_schema_bytes = 32;
+                    limits.max_message_bytes = 32;
+                }
+                "metadata" => limits.max_metadata_bytes = 1,
+                "negotiation_metadata" => {
+                    limits.max_metadata_bytes = 1024;
+                    limits.grpc_send_compression = Some(encoding);
+                }
+                _ => {}
+            }
+            let service = fixture.service_with_limits(ImplementationPool::Dataflow, admission.clone(), limits)?;
+            let server = LoopbackFlight::start(service).await?;
+            let mut request = wire_ingest_request(&fixture.v1).await?;
+            if limit == "negotiation_metadata" {
+                request.metadata_mut().insert(
+                    "grpc-accept-encoding",
+                    MetadataValue::try_from(format!("{},gzip,zstd", "unknown,".repeat(256)))?,
+                );
+            }
+            let result = server.client.clone().send_compressed(encoding).do_put(request).await;
+            let error = match result {
+                Err(error) => error,
+                Ok(response) => response
+                    .into_inner()
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .err()
+                    .ok_or_else(|| anyhow!("compressed {limit} request unexpectedly succeeded"))?,
+            };
+            if matches!(limit, "disabled" | "mismatch") {
+                assert_eq!(error.code(), Code::Unimplemented);
+            } else if limit == "message" {
+                assert_eq!(error.code(), Code::InvalidArgument);
+                assert_eq!(error.message(), "invalid Arrow Flight stream");
+            } else {
+                assert_eq!(error.code(), Code::ResourceExhausted, "{limit}: {error}");
+            }
+            assert_eq!(admission.begin_count(), 0, "{encoding:?}/{limit}");
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn loopback_compression_retains_admission_wait_and_identity_rejection() -> Result<()> {
+    for encoding in [CompressionEncoding::Gzip, CompressionEncoding::Zstd] {
+        let fixture = Fixture::with_current(false).await?;
+        let gate = Arc::new(BatchGate::new());
+        let admission = MockAdmission::new(TestCompletion::BestEffort, Some(Arc::clone(&gate)));
+        let service = fixture.service_with_limits(
+            ImplementationPool::Dataflow,
+            admission.clone(),
+            RuntimeLimits {
+                grpc_accept_compression: Some(encoding),
+                grpc_send_compression: Some(encoding),
+                batch_channel_capacity: 1,
+                ..Default::default()
+            },
+        )?;
+        let server = LoopbackFlight::start(service).await?;
+        let mut client = server
+            .client
+            .clone()
+            .send_compressed(encoding)
+            .accept_compressed(encoding);
+        let mut forged = wire_ingest_request(&fixture.v1).await?;
+        forged.metadata_mut().insert_bin(
+            arrowcol_flight::INTERNAL_IDENTITY_METADATA_KEY,
+            MetadataValue::from_bytes(b"forged"),
+        );
+        let error = client
+            .do_put(forged)
+            .await
+            .err()
+            .ok_or_else(|| anyhow!("forged identity accepted"))?;
+        assert_eq!(error.code(), Code::Unauthenticated);
+        assert_eq!(admission.begin_count(), 0);
+
+        let response = client.do_put(wire_ingest_request(&fixture.v1).await?).await?;
+        let mut pending = Box::pin(response.into_inner().try_collect::<Vec<_>>());
+        gate.wait_entered().await?;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut pending)
+                .await
+                .is_err()
+        );
+        gate.release();
+        assert_eq!(pending.await?.len(), 1);
+        assert_eq!(admission.begin_count(), 1);
+    }
+    Ok(())
+}
 
 #[tokio::test]
 async fn exact_schema_multi_batch_returns_durable_admission_without_receipt() -> Result<()> {

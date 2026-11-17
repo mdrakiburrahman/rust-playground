@@ -42,6 +42,19 @@
 
 For the planned zero-interval comparison, keep Profile A unpooled (`sql_pool_max_size: 0`) and set `logging.router: inherit` so its YAML filter matches the main router; use a positive pool size for Profile C (`64` is the documented comparison value), whose default `warn,tiberius=error` filter differs from A. Set `collector.cpu_pressure: process` in AKS Profile C; Profile A keeps the default `off`. Attribute any A/C result to both pooling and the log-filter change, and note that excluding CPU only changes admission when CPU sampling is `process`. Pooling changes connection reuse only; it does not cache, weaken or skip authoritative pin reads.
 
+## Flight gRPC compression direction
+
+These controls are independent of Arrow IPC and Parquet compression. Each end defaults to `none` and accepts the strict enum `none | gzip | zstd`; a default of `none` does not enable compression.
+
+| Setting | Direction and required peer match |
+| --- | --- |
+| `transport.grpc_send_compression` | Client request encoding; match with receiver `collector.limits.grpc_accept_compression`. |
+| `transport.grpc_accept_compression` | Client response acceptance; match with receiver `collector.limits.grpc_send_compression`. |
+| `collector.limits.grpc_accept_compression` | Receiver request acceptance; match with client `transport.grpc_send_compression`. |
+| `collector.limits.grpc_send_compression` | Receiver response encoding; match with client `transport.grpc_accept_compression`. |
+
+Receiver settings are projected through `ARROWCOL_COLLECTOR_LIMITS_CONFIG`. See the [Flight receiver configuration and negotiation notes](../../../crates/arrowcol-flight/README.md). These options configure codec negotiation only; they do not prove wire-byte savings, durable Delta writes, or performance qualification.
+
 ## Overload retry and admission policy
 
 | Setting or signal | Contract |

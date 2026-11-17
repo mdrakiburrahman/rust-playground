@@ -1,0 +1,1085 @@
+
+ NX   Running target verify for project arrowcol-oat and 2 tasks it depends on:
+
+
+
+> nx run arrowcol-oat:test
+
+> npx --no-install tsx --test projects/arrowcol-oat/*.test.ts
+
+
+> nx run arrowcol-oat:typecheck
+
+> npx --no-install tsc --project projects/arrowcol-oat/tsconfig.json
+
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1500000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1500000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+[32m✔ load admission requires a pre-provisioning initial record and cannot skip or reopen authorization [90m(44.581513ms)[39m[39m
+[32m✔ Rust RunInventory timing fields are strictly parsed and legacy inventory cannot arm [90m(4.672507ms)[39m[39m
+[32m✔ bounded lifetime arithmetic admits equality and rejects a one-millisecond shortfall [90m(2.832464ms)[39m[39m
+[32m✔ cell admission retains UNKNOWN for unbounded cleanup completion stages [90m(4.496202ms)[39m[39m
+[32m✔ zero-duration rehearsal stays not-authorized and cell duration/stop budgets cannot change [90m(5.26042ms)[39m[39m
+[32m✔ maintenance milestone is required, bounded, monotonic and required for handoff [90m(5.066015ms)[39m[39m
+[32m✔ new campaign is observe-only with fixed heartbeat and lifetime bounds [90m(1.226928ms)[39m[39m
+[32m✔ campaign start receipt provides strict runner environment identities [90m(0.833119ms)[39m[39m
+[32m✔ heartbeat cannot revive expired custody and stale fencing tokens are rejected [90m(1.772741ms)[39m[39m
+[32m✔ observer does not fence; armed controller fences once at three missed beats [90m(10.99015ms)[39m[39m
+[32m✔ max lifetime fences even when heartbeat is current [90m(11.083052ms)[39m[39m
+[32m✔ expired heartbeat blocks owner mutations before the watchdog fences [90m(0.851319ms)[39m[39m
+[32m✔ campaign ownership cannot be replaced until cleanup is verified [90m(0.645415ms)[39m[39m
+[32m✔ fenced cleanup retries the same idempotency key and completes ordered steps once [90m(22.739017ms)[39m[39m
+[32m✔ ARM operation receipts reject out-of-scope URLs and reconcile terminal public status values [90m(11.01305ms)[39m[39m
+[32m✔ RunInventory fenced merge preserves heartbeat and ARM receipts and blocks load until observed [90m(7.542971ms)[39m[39m
+[32m✔ RunInventory rejects unknown identities and reports an unconfirmed Blob write [90m(2.537258ms)[39m[39m
+[32m✔ successful inventory CAS receipt supports unknown FIC and QAP [90m(2.334753ms)[39m[39m
+[32m✔ RunInventory absent state requires immutable exact not-found receipts [90m(4.980813ms)[39m[39m
+[32m✔ watchdog cleanup CAS retains producer token and rejects stale producer writes [90m(14.538831ms)[39m[39m
+[32m✔ scale trial journal rejects malformed target bindings and duplicate ids [90m(8.954803ms)[39m[39m
+[32m✔ official measurement reference is exact, optional for legacy inspection, and immutable after publication [90m(9.784823ms)[39m[39m
+[32m✔ strict state schema rejects additional persisted fields [90m(0.926421ms)[39m[39m
+[32m✔ campaign Blob store keeps the default record path and supports isolated paths [90m(137.193017ms)[39m[39m
+[32m✔ campaign store reads chunked response bytes exactly at the cap without Content-Length [90m(56.157875ms)[39m[39m
+[32m✔ campaign store rejects chunked overflow despite a smaller Content-Length [90m(1.831541ms)[39m[39m
+[32m✔ capped campaign reads cancel streaming bodies before 404, status, and missing ETag exits [90m(2.443456ms)[39m[39m
+[32m✔ capped campaign reads decode split UTF-8 and reject invalid UTF-8 and JSON [90m(24.570158ms)[39m[39m
+[32m✔ capped campaign store rejects invalid caps before token acquisition or fetch [90m(0.42651ms)[39m[39m
+[32m✔ capped campaign read rechecks its original deadline after effect journaling [90m(744.333111ms)[39m[39m
+[32m✔ capped campaign read cancels an unclosed body at its original deadline [90m(101.394203ms)[39m[39m
+[32m✔ per-cell selectors execute each provider once, retain active origin, and hand off without stamp cleanup [90m(223.733283ms)[39m[39m
+[32m✔ stale input, missing provider, skipped order and changed actor fail before effects [90m(7.379668ms)[39m[39m
+[32m✔ handoff requires a positive final independent data observation and recovers UNKNOWN without skipping verification [90m(120.510438ms)[39m[39m
+[32m✔ capture without a durable destination is refused before a journal claim or effect [90m(32.195631ms)[39m[39m
+[32m✔ only pre-effect version refusals are stale_version; a conflict after effect dispatch is UNKNOWN [90m(12.045873ms)[39m[39m
+[32m✔ saved-running recovery cannot pass a same-actor inventory/version change during journal reads [90m(7.071761ms)[39m[39m
+[32m✔ recovery pins its confirmed current inventory version through provider authority checks [90m(14.125921ms)[39m[39m
+[32m✔ maintenance retains its original budget and refuses a second stop after the first exhausts it [90m(31.888124ms)[39m[39m
+[32m✔ positive effect survives before-commit write loss without executing twice [90m(20.028255ms)[39m[39m
+[32m✔ positive effect survives after-commit write loss without executing twice [90m(17.051387ms)[39m[39m
+[32m✔ a failed post-effect confirmation read is UNKNOWN and completes later without replay [90m(15.568354ms)[39m[39m
+[32m✔ unknown effect is never replayed and recovery uses current controller while retaining producer origin [90m(13.791113ms)[39m[39m
+[32m✔ handoff rejects unresolved resources even with all earlier cell receipts [90m(54.412836ms)[39m[39m
+[32m✔ cleanup CLI rejects unknown selectors with exactly one nonzero JSON error and no cloud access [90m(602.426886ms)[39m[39m
+[32m✔ guarded inventory refresh pairs the full inventory and strong ETag from exactly one read without proving an unknown effect [90m(5.990936ms)[39m[39m
+[32m✔ guarded inventory refresh rejects stale producer, wrong run/cell, environment and current controller fence [90m(1.429632ms)[39m[39m
+{"event":"custody_pre_remove_qap_unknown","cell_run_id":"33333333-3333-4333-8333-333333333333"}
+[32m✔ capture-cell-baseline freezes positive exact absence, not zero rows, and reuses the original version [90m(23.577336ms)[39m[39m
+[32m✔ capture-cell-baseline rejects stale, fenced, wrong-cell and non-exact path before data reads [90m(2.540358ms)[39m[39m
+[32m✔ in-flight authorization and storage denial cannot create a pre-load absence receipt [90m(6.076938ms)[39m[39m
+[32m✔ a lost post-write response stays UNKNOWN and recovery reads the original durable snapshot without replay [90m(9.24421ms)[39m[39m
+▶ terminal and independent final replay preserve explicit absence without manufacturing delivery or post-DROP QAP rows
+  [32m✔ default safe idle rejects missing first sample and unhealthy final [90m(15.118343ms)[39m[39m
+  [32m✔ default safe idle rejects missing first sample and healthy final [90m(7.991781ms)[39m[39m
+  [32m✔ default safe idle rejects missing final sample [90m(4.953713ms)[39m[39m
+  [32m✔ default safe idle rejects unhealthy final with both samples [90m(10.476738ms)[39m[39m
+  [32m✔ default safe idle rejects growing backlog with both samples [90m(14.941539ms)[39m[39m
+[32m✔ terminal and independent final replay preserve explicit absence without manufacturing delivery or post-DROP QAP rows [90m(100.937493ms)[39m[39m
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+[32m✔ exact Kubernetes observations use the injected command boundary [90m(3.908389ms)[39m[39m
+[32m✔ stock custody selection loads explicit nondefault stamp and refuses missing or mismatched selection before access [90m(82.067564ms)[39m[39m
+[32m✔ stock campaign capture freezes selected-stamp baseline, reuses its receipt, and gates arm on its full identity [90m(147.801457ms)[39m[39m
+[32m✔ stock authorization and ready boundaries refuse missing baseline without advancing admission [90m(44.947721ms)[39m[39m
+▶ first campaign baseline rejects late namespace/resource identity and noninitial milestones before observation
+  [32m✔ namespace [90m(10.516138ms)[39m[39m
+  [32m✔ resource_uid [90m(4.648906ms)[39m[39m
+  [32m✔ observed_resource [90m(23.116525ms)[39m[39m
+  [32m✔ observed_fic [90m(6.094239ms)[39m[39m
+  [32m✔ observed_qap [90m(2.548858ms)[39m[39m
+  [32m✔ cleanup [90m(3.894989ms)[39m[39m
+  [32m✔ cleanup_deadline [90m(2.432656ms)[39m[39m
+  [32m✔ armed [90m(10.384836ms)[39m[39m
+[32m✔ first campaign baseline rejects late namespace/resource identity and noninitial milestones before observation [90m(83.552898ms)[39m[39m
+▶ first campaign baseline pins the current inventory version throughout observation
+  [32m✔ same actor advances inventory [90m(5.167218ms)[39m[39m
+  [32m✔ same actor changes only version [90m(5.143317ms)[39m[39m
+[32m✔ first campaign baseline pins the current inventory version throughout observation [90m(11.347957ms)[39m[39m
+[32m✔ stock publication cannot advance initial preparation before the immutable campaign baseline exists [90m(68.22445ms)[39m[39m
+[32m✔ advancement after baseline write remains UNKNOWN and retry reads the original proof without another write [90m(5.111216ms)[39m[39m
+[32m✔ simulated lost immutable baseline PUT acknowledgement recovers through the guarded Azure Blob adapter [90m(275.452957ms)[39m[39m
+[32m✔ default restoration is a true no-op at supported safe capacity and capacity alone cannot complete full safety [90m(9.801322ms)[39m[39m
+[32m✔ default restoration changes only one dimension at a time and reconciles exact ARM targets before continuing [90m(27.357722ms)[39m[39m
+[32m✔ unknown ARM before-apply outcome is reconciled without replay [90m(12.261678ms)[39m[39m
+[32m✔ unknown ARM after-apply outcome is reconciled without replay [90m(10.12473ms)[39m[39m
+[32m✔ unschedulable two-node candidate falls back to original three nodes without oscillation [90m(12.952094ms)[39m[39m
+[32m✔ missing baseline and fencing after persisted intent never issue ARM mutations [90m(29.129562ms)[39m[39m
+[32m✔ additive producer plan and evidence reference fields retain immutable identities [90m(11.910371ms)[39m[39m
+[32m✔ fencing during ARM response reconciliation cannot publish stale progress or begin another mutation [90m(11.849869ms)[39m[39m
+[32m✔ AKS pool scale update preserves recognized writable fields and rejects unknown configuration [90m(0.601814ms)[39m[39m
+[32m✔ fresh replay preserves explicit zero only for measured empty active-file sets; references round trip strictly [90m(61.595999ms)[39m[39m
+[32m✔ ingestion append and dataChange=false OPTIMIZE preserve rows committed after baseline [90m(27.674228ms)[39m[39m
+[32m✔ unexplained logical removals cannot hide behind an unchanged baseline count [90m(5.944135ms)[39m[39m
+[32m✔ same ID and nondecreasing versions are required for terminal and current references [90m(11.262955ms)[39m[39m
+[32m✔ same-version terminal manifests and immutable history cannot be rewritten [90m(3.314176ms)[39m[39m
+[32m✔ missing file stats remain null and cannot yield PASS, including data compacted before the final replay [90m(15.919861ms)[39m[39m
+[32m✔ standard single and multipart Parquet checkpoints replay with contiguous following JSON commits [90m(235.699054ms)[39m[39m
+[32m✔ checkpoint recovery is not proof of missing post-baseline commit history [90m(19.484343ms)[39m[39m
+[32m✔ missing genesis, JSON gaps, incomplete checkpoints and v2/sidecar formats fail closed [90m(10.56584ms)[39m[39m
+[32m✔ changed GET ETags, listing races, missing receipts and nonpositive statuses never produce references [90m(4.186395ms)[39m[39m
+[32m✔ prefix listing is bounded, paginated, read-only and guarded around every request [90m(2.390255ms)[39m[39m
+[32m✔ URI/SAS components, traversal, escapes, ambiguous paths and another prefix are rejected before storage reads [90m(1.385431ms)[39m[39m
+[32m✔ unsupported deletion vectors, protocol features, unknown actions and unsafe integers are UNKNOWN [90m(2.360054ms)[39m[39m
+[32m✔ OPTIMIZE must be false-dataChange maintenance with equal measured input and output rows [90m(9.114507ms)[39m[39m
+[32m✔ a maintenance DELETE watermark alone is not configured-retention proof [90m(2.533658ms)[39m[39m
+[32m✔ only whole expired partitions, a maintenance watermark and explicit trusted retention explain PURGE rows [90m(13.870815ms)[39m[39m
+[32m✔ terminal rows are independently protected even when a pre-terminal PURGE explained other rows [90m(3.861788ms)[39m[39m
+[32m✔ exact planned-root absence needs two fresh positive complete listings and never manufactures zero rows [90m(1.714039ms)[39m[39m
+[32m✔ absence parsing requires exact null fields and deeply bound positive provenance [90m(6.519448ms)[39m[39m
+[32m✔ auth/permission failures, incomplete receipts, wrong prefixes and listing races cannot become absence [90m(3.96749ms)[39m[39m
+[32m✔ absent preload to actual terminal replays creation, ingestion and final maintenance independently [90m(2.701162ms)[39m[39m
+[32m✔ absent preload protects actual version-zero terminal and rejects its disappearance or replacement [90m(2.757663ms)[39m[39m
+[32m✔ an actual baseline cannot become an absent terminal; a table appearing after absent terminal is not absence proof [90m(1.656037ms)[39m[39m
+[32m✔ absent baseline requires all JSON history from creation even when current checkpoint is replayable [90m(12.468083ms)[39m[39m
+[32m✔ an absent baseline does not waive unexplained removal, missing stats or unknown creation operation [90m(5.688729ms)[39m[39m
+WARNING: Azure dataplane has no enforcing network-policy provider. In-cluster workloads can reach the passwordless dataflow port; there is no public ingress.
+Selected stamp 89152; network azure (auto: one Cilium fallback only for proven AKS creation failure).
+Provisioning pass 1/2: stamp 89152, network azure (timeout 3600s).
+Deploy receipt: /workspaces/rust-playground/out/deploy-test-bQrK1S/state/receipts/deploy-89152.yaml
+Selected stamp 89152; network azure (auto: one Cilium fallback only for proven AKS creation failure).
+Provisioning pass 1/2: stamp 89152, network azure (timeout 3600s).
+Deploy receipt: /workspaces/rust-playground/out/deploy-test-4pYfeQ/state/receipts/deploy-89152.yaml
+Selected stamp 89152; network azure (auto: one Cilium fallback only for proven AKS creation failure).
+Provisioning pass 1/2: stamp 89152, network azure (timeout 3600s).
+Provisioning pass 1 (azure) failed: DeploymentFailed cluster: ARM rejected creation
+Confirmed AKS-only creation failure; deleting only that failed cluster, then retrying once with Cilium.
+Provisioning pass 2/2: stamp 89152, network cilium (timeout 3600s).
+Identity receipt: primary resource group arrow-collector-rg contains exactly one UAMI, arrow-collector; managed-resource-group and deployment-wide counts were not verified. Native and publisher federation verified.
+Deployed stamp 89152; network path: azure -> cilium. Receipt: /workspaces/rust-playground/out/deploy-test-fhJ9oK/state/receipts/deploy-89152.yaml
+Selected stamp 89152; network azure (auto: one Cilium fallback only for proven AKS creation failure).
+Provisioning pass 1/2: stamp 89152, network azure (timeout 3600s).
+Provisioning pass 1 (azure) failed: DeploymentFailed cluster: ARM rejected creation
+Deploy receipt: /workspaces/rust-playground/out/deploy-test-xUKIEa/state/receipts/deploy-89152.yaml
+Selected stamp 89152; network azure (auto: one Cilium fallback only for proven AKS creation failure).
+Provisioning pass 1/2: stamp 89152, network azure (timeout 3600s).
+Provisioning pass 1 (azure) failed: DeploymentFailed cluster: ARM rejected creation
+Deploy receipt: /workspaces/rust-playground/out/deploy-test-8He9Hq/state/receipts/deploy-89152.yaml
+Selected stamp 89152; network azure (auto: one Cilium fallback only for proven AKS creation failure).
+Provisioning pass 1/2: stamp 89152, network azure (timeout 3600s).
+Provisioning pass 1 (azure) failed: DeploymentFailed cluster: ARM rejected creation
+Deploy receipt: /workspaces/rust-playground/out/deploy-test-UWDKZD/state/receipts/deploy-89152.yaml
+Selected stamp 89152; network azure (auto: one Cilium fallback only for proven AKS creation failure).
+Provisioning pass 1/2: stamp 89152, network azure (timeout 3600s).
+Provisioning pass 1 (azure) failed: DeploymentFailed cluster: ARM rejected creation
+Deploy receipt: /workspaces/rust-playground/out/deploy-test-EZBb7i/state/receipts/deploy-89152.yaml
+Selected stamp 89152; network azure (auto: one Cilium fallback only for proven AKS creation failure).
+Provisioning pass 1/2: stamp 89152, network azure (timeout 3600s).
+Provisioning pass 1 (azure) failed: DeploymentFailed cluster: ARM rejected creation
+Deploy receipt: /workspaces/rust-playground/out/deploy-test-ej3GXj/state/receipts/deploy-89152.yaml
+Selected stamp 89152; network azure (auto: one Cilium fallback only for proven AKS creation failure).
+Provisioning pass 1/2: stamp 89152, network azure (timeout 3600s).
+Provisioning pass 1 (azure) failed: DeploymentFailed cluster: ARM rejected creation
+Deploy receipt: /workspaces/rust-playground/out/deploy-test-2QHej5/state/receipts/deploy-89152.yaml
+Selected stamp 89152; network azure (auto: one Cilium fallback only for proven AKS creation failure).
+Provisioning pass 1/2: stamp 89152, network azure (timeout 3600s).
+Provisioning pass 1 (azure) failed: DeploymentFailed cluster: ARM rejected creation
+Deploy receipt: /workspaces/rust-playground/out/deploy-test-R3ewjH/state/receipts/deploy-89152.yaml
+Selected stamp 89152; network azure (auto: one Cilium fallback only for proven AKS creation failure).
+Provisioning pass 1/2: stamp 89152, network azure (timeout 3600s).
+Provisioning pass 1 (azure) failed: DeploymentFailed cluster: ARM rejected creation
+Deploy receipt: /workspaces/rust-playground/out/deploy-test-nTnlS9/state/receipts/deploy-89152.yaml
+Selected stamp 89152; network azure (auto: one Cilium fallback only for proven AKS creation failure).
+Provisioning pass 1/2: stamp 89152, network azure (timeout 3600s).
+Provisioning pass 1 (azure) failed: DeploymentFailed cluster: ARM rejected creation
+Deploy receipt: /workspaces/rust-playground/out/deploy-test-30mXrJ/state/receipts/deploy-89152.yaml
+Selected stamp 89152; network azure (auto: one Cilium fallback only for proven AKS creation failure).
+Provisioning pass 1/2: stamp 89152, network azure (timeout 3600s).
+Provisioning pass 1 (azure) failed: DeploymentFailed cluster: ARM rejected creation
+Deploy receipt: /workspaces/rust-playground/out/deploy-test-LvhAue/state/receipts/deploy-89152.yaml
+Selected stamp 89152; network azure (auto: one Cilium fallback only for proven AKS creation failure).
+Provisioning pass 1/2: stamp 89152, network azure (timeout 3600s).
+Provisioning pass 1 (azure) failed: DeploymentFailed other: ARM rejected creation
+Deploy receipt: /workspaces/rust-playground/out/deploy-test-byiRVu/state/receipts/deploy-89152.yaml
+Selected stamp 89152; network azure (auto: one Cilium fallback only for proven AKS creation failure).
+Provisioning pass 1/2: stamp 89152, network azure (timeout 3600s).
+Provisioning pass 1 (azure) failed: DeploymentFailed missing-target: ARM rejected creation
+Deploy receipt: /workspaces/rust-playground/out/deploy-test-5trZPO/state/receipts/deploy-89152.yaml
+Selected stamp 89152; network azure (auto: one Cilium fallback only for proven AKS creation failure).
+Provisioning pass 1/2: stamp 89152, network azure (timeout 3600s).
+Deploy receipt: /workspaces/rust-playground/out/deploy-test-g2oJdm/state/receipts/deploy-89152.yaml
+Selected stamp 89152; network azure (auto: one Cilium fallback only for proven AKS creation failure).
+Provisioning pass 1/2: stamp 89152, network azure (timeout 3600s).
+Provisioning pass 1 (azure) failed: DeploymentFailed cluster: ARM rejected creation
+Confirmed AKS-only creation failure; deleting only that failed cluster, then retrying once with Cilium.
+Provisioning pass 2/2: stamp 89152, network cilium (timeout 3600s).
+Provisioning pass 2 (cilium) failed: DeploymentFailed cluster: ARM rejected creation
+Deploy receipt: /workspaces/rust-playground/out/deploy-test-mdIchM/state/receipts/deploy-89152.yaml
+Selected stamp 89152; network azure (pinned).
+Provisioning pass 1/2: stamp 89152, network azure (timeout 3600s).
+Provisioning pass 1 (azure) failed: DeploymentFailed cluster: ARM rejected creation
+Deploy receipt: /workspaces/rust-playground/out/deploy-test-Is1x1e/state/receipts/deploy-89152.yaml
+Selected stamp 89152; network cilium (pinned).
+Provisioning pass 1/2: stamp 89152, network cilium (timeout 3600s).
+Provisioning pass 1 (cilium) failed: DeploymentFailed cluster: ARM rejected creation
+Deploy receipt: /workspaces/rust-playground/out/deploy-test-jPqVXl/state/receipts/deploy-89152.yaml
+Selected stamp 89152; network azure (auto: one Cilium fallback only for proven AKS creation failure).
+Deploy receipt: /workspaces/rust-playground/out/deploy-test-f0P8iF/state/receipts/deploy-89152.yaml
+Selected stamp 89152; network azure (auto: one Cilium fallback only for proven AKS creation failure).
+{"changes":[{"changeType":"Create","resourceId":"/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/arrow-collector-rg/providers/Microsoft.Kusto/clusters/arrow-collector-89152"}]}
+Read-only ARM what-if complete; private stamp YAML unchanged. Receipt: /workspaces/rust-playground/out/deploy-test-zx1CjB/state/receipts/deploy-89152.yaml
+Selected stamp 89152; network azure (auto: one Cilium fallback only for proven AKS creation failure).
+Provisioning pass 1/2: stamp 89152, network azure (timeout 3600s).
+Provisioning pass 1 (azure) failed: DELTA_LOGS_ABSENT
+Delta logs have not converged; allowing the final provision pass on the same network.
+Provisioning pass 2/2: stamp 89152, network azure (timeout 3600s).
+Identity receipt: primary resource group arrow-collector-rg contains exactly one UAMI, arrow-collector; managed-resource-group and deployment-wide counts were not verified. Native and publisher federation verified.
+Deployed stamp 89152; network path: azure -> azure. Receipt: /workspaces/rust-playground/out/deploy-test-kFqypn/state/receipts/deploy-89152.yaml
+WARNING: Azure dataplane has no enforcing network-policy provider. In-cluster workloads can reach the passwordless dataflow port; there is no public ingress.
+Selected stamp 89152; network azure (auto: one Cilium fallback only for proven AKS creation failure).
+Provisioning pass 1/2: stamp 89152, network azure (timeout 3600s).
+Deploy receipt: /workspaces/rust-playground/out/deploy-test-RgqT5z/state/receipts/deploy-89152.yaml
+Selected stamp 89152; network azure (auto: one Cilium fallback only for proven AKS creation failure).
+Provisioning pass 1/2: stamp 89152, network azure (timeout 3600s).
+Deploy receipt: /workspaces/rust-playground/out/deploy-test-H5vleC/state/receipts/deploy-89152.yaml
+Selected stamp 89152; network azure (auto: one Cilium fallback only for proven AKS creation failure).
+Provisioning pass 1/2: stamp 89152, network azure (timeout 3600s).
+Deploy receipt: /workspaces/rust-playground/out/deploy-test-ag9Ccu/state/receipts/deploy-89152.yaml
+Selected stamp 89152; network azure (auto: one Cilium fallback only for proven AKS creation failure).
+Provisioning pass 1/2: stamp 89152, network azure (timeout 3600s).
+Deploy receipt: /workspaces/rust-playground/out/deploy-test-cbiZRH/state/receipts/deploy-89152.yaml
+Selected stamp 89152; network azure (auto: one Cilium fallback only for proven AKS creation failure).
+Provisioning pass 1/2: stamp 89152, network azure (timeout 3600s).
+Deploy receipt: /workspaces/rust-playground/out/deploy-test-uY7wLX/state/receipts/deploy-89152.yaml
+Selected stamp 89152; network azure (auto: one Cilium fallback only for proven AKS creation failure).
+Provisioning pass 1/2: stamp 89152, network azure (timeout 3600s).
+Identity receipt: primary resource group arrow-collector-rg contains exactly one UAMI, arrow-collector; managed-resource-group and deployment-wide counts were not verified. Native and publisher federation verified.
+Deployed stamp 89152; network path: azure. Receipt: /workspaces/rust-playground/out/deploy-test-Uu8qW2/state/receipts/deploy-89152.yaml
+WARNING: Azure dataplane has no enforcing network-policy provider. In-cluster workloads can reach the passwordless dataflow port; there is no public ingress.
+Stamp 28683 unavailable; choosing another five-digit stamp.
+Stamp 79441 unavailable; choosing another five-digit stamp.
+Stamp 56194 unavailable; choosing another five-digit stamp.
+Stamp 25147 unavailable; choosing another five-digit stamp.
+Stamp 98311 unavailable; choosing another five-digit stamp.
+Stamp 50234 unavailable; choosing another five-digit stamp.
+Stamp 62569 unavailable; choosing another five-digit stamp.
+Stamp 30903 unavailable; choosing another five-digit stamp.
+Stamp 25401 unavailable; choosing another five-digit stamp.
+Stamp 57666 unavailable; choosing another five-digit stamp.
+Selected stamp 89152; network azure (auto: one Cilium fallback only for proven AKS creation failure).
+Provisioning pass 1/2: stamp 89152, network azure (timeout 3600s).
+Provisioning pass 1 (azure) failed: DeploymentFailed cluster: ARM rejected creation
+Deploy receipt: /workspaces/rust-playground/out/deploy-test-0KS4vN/state/receipts/deploy-89152.yaml
+Selected stamp 89152; network azure (auto: one Cilium fallback only for proven AKS creation failure).
+Provisioning pass 1/2: stamp 89152, network azure (timeout 3600s).
+Provisioning pass 1 (azure) failed: DeploymentFailed cluster: ARM rejected creation
+Deploy receipt: /workspaces/rust-playground/out/deploy-test-vZ6y4q/state/receipts/deploy-89152.yaml
+Selected stamp 89152; network azure (auto: one Cilium fallback only for proven AKS creation failure).
+Provisioning pass 1/2: stamp 89152, network azure (timeout 3600s).
+Provisioning pass 1 (azure) failed: DeploymentFailed cluster: ARM rejected creation
+Deploy receipt: /workspaces/rust-playground/out/deploy-test-ASvji4/state/receipts/deploy-89152.yaml
+Selected stamp 89152; network azure (auto: one Cilium fallback only for proven AKS creation failure).
+Provisioning pass 1/2: stamp 89152, network azure (timeout 3600s).
+Provisioning pass 1 (azure) failed: DeploymentFailed cluster: ARM rejected creation
+Deploy receipt: /workspaces/rust-playground/out/deploy-test-AQekuD/state/receipts/deploy-89152.yaml
+Selected stamp 89152; network azure (auto: one Cilium fallback only for proven AKS creation failure).
+Provisioning pass 1/2: stamp 89152, network azure (timeout 3600s).
+Identity receipt: primary resource group arrow-collector-rg contains exactly one UAMI, arrow-collector; managed-resource-group and deployment-wide counts were not verified. Native and publisher federation verified.
+Deployed stamp 89152; network path: azure. Receipt: /workspaces/rust-playground/out/deploy-test-u1gT6O/state/receipts/deploy-89152.yaml
+WARNING: Azure dataplane has no enforcing network-policy provider. In-cluster workloads can reach the passwordless dataflow port; there is no public ingress.
+Selected stamp 89152; network azure (auto: one Cilium fallback only for proven AKS creation failure).
+Provisioning pass 1/2: stamp 89152, network azure (timeout 3600s).
+Identity receipt: primary resource group arrow-collector-rg contains exactly one UAMI, arrow-collector; managed-resource-group and deployment-wide counts were not verified. Native and publisher federation verified.
+Deployed stamp 89152; network path: azure. Receipt: /workspaces/rust-playground/out/deploy-test-DZsOWA/state/receipts/deploy-89152.yaml
+WARNING: Azure dataplane has no enforcing network-policy provider. In-cluster workloads can reach the passwordless dataflow port; there is no public ingress.
+[32m✔ fresh success is one azure pass, records explicit postconditions and private receipt [90m(226.308942ms)[39m[39m
+[32m✔ ARM preview failure is recorded and never triggers create or network fallback [90m(73.644573ms)[39m[39m
+[32m✔ missing preview evidence fails closed even when bootstrap reports success [90m(48.646305ms)[39m[39m
+[32m✔ only proven AKS failure deletes that cluster and retries Cilium once [90m(102.887538ms)[39m[39m
+[32m✔ failed child deployments cannot trigger fallback with unproven terminal parent: {"name":"arrowcol-sandbox-stamp-89152","properties":{"provisioningState":"Running"}} [90m(56.094875ms)[39m[39m
+[32m✔ failed child deployments cannot trigger fallback with unproven terminal parent: {"name":"arrowcol-sandbox-stamp-89152","properties":{"provisioningState":"Accepted"}} [90m(40.93723ms)[39m[39m
+[32m✔ failed child deployments cannot trigger fallback with unproven terminal parent: {"name":"arrowcol-sandbox-stamp-89152","properties":{"provisioningState":"Creating"}} [90m(40.651123ms)[39m[39m
+[32m✔ failed child deployments cannot trigger fallback with unproven terminal parent: {"name":"arrowcol-sandbox-stamp-89152","properties":{"provisioningState":"Succeeded"}} [90m(60.193868ms)[39m[39m
+[32m✔ failed child deployments cannot trigger fallback with unproven terminal parent: {"name":"arrowcol-sandbox-stamp-89152","properties":{"provisioningState":"Unknown"}} [90m(63.82055ms)[39m[39m
+[32m✔ failed child deployments cannot trigger fallback with unproven terminal parent: null [90m(69.911188ms)[39m[39m
+[32m✔ failed child deployments cannot trigger fallback with unproven terminal parent: {} [90m(63.152334ms)[39m[39m
+[32m✔ failed child deployments cannot trigger fallback with unproven terminal parent: {"name":"arrowcol-sandbox-stamp-89152","properties":{}} [90m(70.577103ms)[39m[39m
+[32m✔ failed child deployments cannot trigger fallback with unproven terminal parent: {"name":"another-deployment","properties":{"provisioningState":"Failed"}} [90m(55.563962ms)[39m[39m
+[32m✔ failed subscription deployment read cannot authorize fallback [90m(94.028236ms)[39m[39m
+[32m✔ other failure cannot trigger destructive fallback [90m(123.454905ms)[39m[39m
+[32m✔ missing-target failure cannot trigger destructive fallback [90m(63.864851ms)[39m[39m
+[32m✔ timeout failure cannot trigger destructive fallback [90m(34.466083ms)[39m[39m
+[32m✔ both ARM failures persist and no third pass is allowed [90m(94.746452ms)[39m[39m
+[32m✔ pinned azure never changes network [90m(48.938912ms)[39m[39m
+[32m✔ pinned cilium never changes network [90m(51.227164ms)[39m[39m
+[32m✔ explicit name collision refuses before rewriting YAML or provisioning [90m(16.308371ms)[39m[39m
+[32m✔ live stamp refuses with exact destroy command [90m(20.010754ms)[39m[39m
+[32m✔ quota failure leaves YAML unchanged and provisions nothing [90m(41.430942ms)[39m[39m
+[32m✔ what-if previews first-attempt network and never invokes provision, delete, or setup [90m(39.758503ms)[39m[39m
+[32m✔ Delta convergence retries once without changing network [90m(68.897765ms)[39m[39m
+[32m✔ missing identity postcondition cannot claim deployed [90m(53.996827ms)[39m[39m
+[32m✔ missing database postcondition cannot claim deployed [90m(51.52347ms)[39m[39m
+[32m✔ missing publisher postcondition cannot claim deployed [90m(34.495384ms)[39m[39m
+[32m✔ missing native-federation postcondition cannot claim deployed [90m(35.609309ms)[39m[39m
+[32m✔ missing network postcondition cannot claim deployed [90m(36.903938ms)[39m[39m
+[32m✔ removed run-FIC Contributor role is not a deployment postcondition [90m(41.81345ms)[39m[39m
+[32m✔ stamp picker always produces a five-digit fresh-range integer [90m(3.014269ms)[39m[39m
+[32m✔ generated candidate collisions are bounded at ten with no mutation [90m(9.385614ms)[39m[39m
+[32m✔ CLI validates network and stamp before calling Azure [90m(1.947344ms)[39m[39m
+[32m✔ unauthenticated CLI prints the device-code login command without credentials [90m(6.237042ms)[39m[39m
+[32m✔ subscription mismatch is refused before Azure commands [90m(6.858656ms)[39m[39m
+[32m✔ tracked stamp configuration is never rewritten [90m(6.939658ms)[39m[39m
+[32m✔ stale derived state refuses instead of adopting a previous stamp [90m(6.324643ms)[39m[39m
+[32m✔ mixed resource and cluster ARM failures never delete the cluster [90m(38.534876ms)[39m[39m
+[32m✔ cluster in Creating is not a failed cluster eligible for fallback [90m(76.391535ms)[39m[39m
+[32m✔ cluster in Succeeded is not a failed cluster eligible for fallback [90m(50.854155ms)[39m[39m
+[32m✔ classification failure retains the original ARM error in the durable receipt [90m(48.903411ms)[39m[39m
+[32m✔ bootstrap receives fresh stamp-derived env and approved Kusto tags, not stale workload identity [90m(33.219654ms)[39m[39m
+[32m✔ native publisher federation works without optional external publisher credentials [90m(34.292779ms)[39m[39m
+[32m✔ diagnostic storage name collision is checked before any provisioning [90m(8.941603ms)[39m[39m
+resourceGroup: arrow-collector-rg
+existed: true
+managedResourceGroups:
+  - MC_arrow-collector-rg_arrow-collector-00000_canadacentral
+resources:
+  - name: arrowcollector00000
+    type: Microsoft.Storage/storageAccounts
+
+Read-only inventory; nothing changed. To delete: npx --no-install arrowcol-oat aks destroy --subscription 11111111-2222-3333-4444-555555555555 --confirm arrow-collector-rg
+resourceGroup: arrow-collector-rg
+existed: true
+managedResourceGroups:
+  - MC_arrow-collector-rg_arrow-collector-00000_canadacentral
+resources:
+  - name: arrowcollector00000
+    type: Microsoft.Storage/storageAccounts
+
+Deleted arrow-collector-rg; devbox-local derived state removed. Receipt: /tmp/oat-destroy-test-5ucyd4/receipt.json
+resourceGroup: arrow-collector-rg
+existed: false
+managedResourceGroups: []
+resources: []
+
+Read-only inventory; nothing changed. To delete: npx --no-install arrowcol-oat aks destroy --subscription 11111111-2222-3333-4444-555555555555 --confirm arrow-collector-rg
+resourceGroup: arrow-collector-rg
+existed: false
+managedResourceGroups: []
+resources: []
+
+Already absent: arrow-collector-rg; devbox-local derived state removed. Receipt: /tmp/oat-destroy-test-hjyxrr/receipt.json
+resourceGroup: arrow-collector-rg
+existed: false
+managedResourceGroups: []
+resources: []
+
+Already absent: arrow-collector-rg; devbox-local derived state removed. Receipt: /tmp/arrowcol-oat-destroy-ddc5606d-0b17-4006-b4fc-f8a0a99d3f21.json
+resourceGroup: arrow-collector-rg
+existed: true
+managedResourceGroups:
+  - MC_arrow-collector-rg_arrow-collector-00000_canadacentral
+resources:
+  - name: arrowcollector00000
+    type: Microsoft.Storage/storageAccounts
+
+resourceGroup: arrow-collector-rg
+existed: true
+managedResourceGroups:
+  - MC_arrow-collector-rg_arrow-collector-00000_canadacentral
+resources:
+  - name: arrowcollector00000
+    type: Microsoft.Storage/storageAccounts
+
+resourceGroup: arrow-collector-rg
+existed: true
+managedResourceGroups:
+  - MC_arrow-collector-rg_arrow-collector-00000_canadacentral
+resources:
+  - name: arrowcollector00000
+    type: Microsoft.Storage/storageAccounts
+
+resourceGroup: arrow-collector-rg
+existed: true
+managedResourceGroups:
+  - MC_arrow-collector-rg_arrow-collector-00000_canadacentral
+resources:
+  - name: arrowcollector00000
+    type: Microsoft.Storage/storageAccounts
+
+resourceGroup: arrow-collector-rg
+existed: true
+managedResourceGroups:
+  - MC_arrow-collector-rg_arrow-collector-00000_canadacentral
+resources:
+  - name: arrowcollector00000
+    type: Microsoft.Storage/storageAccounts
+
+resourceGroup: arrow-collector-rg
+existed: true
+managedResourceGroups:
+  - MC_arrow-collector-rg_arrow-collector-00000_canadacentral
+resources:
+  - name: arrowcollector00000
+    type: Microsoft.Storage/storageAccounts
+
+resourceGroup: arrow-collector-rg
+existed: true
+managedResourceGroups:
+  - MC_arrow-collector-rg_arrow-collector-00000_canadacentral
+resources:
+  - name: arrowcollector00000
+    type: Microsoft.Storage/storageAccounts
+
+resourceGroup: arrow-collector-rg
+existed: true
+managedResourceGroups:
+  - MC_arrow-collector-rg_arrow-collector-00000_canadacentral
+resources:
+  - name: arrowcollector00000
+    type: Microsoft.Storage/storageAccounts
+
+resourceGroup: arrow-collector-rg
+existed: true
+managedResourceGroups:
+  - MC_arrow-collector-rg_arrow-collector-00000_canadacentral
+resources:
+  - name: arrowcollector00000
+    type: Microsoft.Storage/storageAccounts
+
+resourceGroup: arrow-collector-rg
+existed: true
+managedResourceGroups:
+  - MC_arrow-collector-rg_arrow-collector-00000_canadacentral
+resources:
+  - name: arrowcollector00000
+    type: Microsoft.Storage/storageAccounts
+
+Read-only inventory; nothing changed. To delete: npx --no-install arrowcol-oat aks destroy --subscription 11111111-2222-3333-4444-555555555555 --confirm arrow-collector-rg
+[32m✔ unconfirmed live inventory is strictly read-only [90m(37.198246ms)[39m[39m
+[32m✔ confirmed live group cleans only the derived-state allowlist [90m(26.629605ms)[39m[39m
+[32m✔ unconfirmed absent inventory is strictly read-only [90m(3.620082ms)[39m[39m
+[32m✔ confirmed already absent group cleans only the derived-state allowlist [90m(5.356121ms)[39m[39m
+[32m✔ default receipt is unique, private and outside the checkout; CLI forwards timeout exactly [90m(18.89353ms)[39m[39m
+[32m✔ reset failure preserves all local state [90m(13.450305ms)[39m[39m
+[32m✔ unknown failure preserves all local state [90m(30.237787ms)[39m[39m
+[32m✔ receipt failure preserves all local state [90m(12.162076ms)[39m[39m
+[32m✔ remaining failure preserves all local state [90m(5.839132ms)[39m[39m
+[32m✔ account failure preserves all local state [90m(2.030946ms)[39m[39m
+[32m✔ wrong confirmation, subscription, group and timeout reject before Azure calls [90m(11.174754ms)[39m[39m
+[32m✔ confirmed receipt rejects relative, traversing, checkout, symlink and existing paths [90m(40.631123ms)[39m[39m
+[32m✔ dry-run does not touch even an existing requested receipt [90m(12.611587ms)[39m[39m
+[32m✔ real cleanup removes generated files and secrets but preserves static config and siblings [90m(28.206941ms)[39m[39m
+[32m✔ cleanup refuses a symlink ancestor before removing any generated state [90m(4.264597ms)[39m[39m
+[32m✔ exact effect allocations refuse target/method changes before forwarding and persist attributable receipts [90m(91.129671ms)[39m[39m
+[32m✔ effect envelopes reject missing identities and ambiguous duplicate allocations [90m(3.787987ms)[39m[39m
+[32m✔ lost response consumes the durable one-forward allocation across boundary restart [90m(59.906262ms)[39m[39m
+[32m✔ a bounded mutation sequence resumes only after a durably confirmed result [90m(107.773049ms)[39m[39m
+[32m✔ campaign Blob adapter is guarded and refuses a second exact read after its allocation is spent [90m(86.920775ms)[39m[39m
+[32m✔ bounded rehearsal constructs default campaign providers inside the fail-closed boundary [90m(162.506592ms)[39m[39m
+[32m✔ producer rehearsal dispatches an accepted underscore cleanup selector [90m(37.520252ms)[39m[39m
+[32m✔ watchdog rehearsal returns its actual custody evaluation [90m(16.992086ms)[39m[39m
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":5460000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+Transient PUT ARM failure; retry 1/4: PUT ARM request failed: Error: simulated response-body loss
+[32m✔ one-shot response withholding records the real Blob response and blocks restart replay [90m(365.250199ms)[39m[39m
+[32m✔ setup-baseline sequences the immutable inventory and resumes after withheld Blob acknowledgement [90m(254.90249ms)[39m[39m
+[32m✔ Azure REST and process adapters reject unallocated targets before transport [90m(111.939043ms)[39m[39m
+[32m✔ workload identity refusal is preserved and does not retry transport [90m(23.636937ms)[39m[39m
+[32m✔ uncertain mutation responses do not unlock another dispatch but authoritative 412 does [90m(181.988534ms)[39m[39m
+[32m✔ journal recovery rejects changed allocations and request bindings before effects [90m(78.252678ms)[39m[39m
+[32m✔ receipt journal completes short writes and refuses a zero-byte dispatch write [90m(82.262169ms)[39m[39m
+[32m✔ ARM operation status network call requires its own allocation after allocated identity auth [90m(125.558552ms)[39m[39m
+[32m✔ identity and campaign Blob transports reject redirects only while the boundary is active [90m(161.009058ms)[39m[39m
+Transient PUT ARM failure; retry 1/4: HTTP 500: server failed
+[32m✔ Azure REST response-body loss cannot replay a mutation on its retry path [90m(1067.64695ms)[39m[39m
+[32m✔ Azure REST HTTP 5xx cannot unlock a retrying mutation [90m(1053.846733ms)[39m[39m
+[32m✔ nonzero process exits remain unresolved and cannot replay a command [90m(78.39038ms)[39m[39m
+[32m✔ recovery rejects success receipts without transport acknowledgement or with prior errors [90m(59.094442ms)[39m[39m
+[32m✔ default lifecycle confirms exact Job suspension, physical stop and sanitized actual terminal/log receipts [90m(77.314156ms)[39m[39m
+[32m✔ default cell terminal capture preserves the active producer path when the scale journal is empty [90m(2.417855ms)[39m[39m
+[32m✔ default lifecycle unknown PATCH/empty recovery journals never dispatch an execute fallback [90m(6.822555ms)[39m[39m
+[32m✔ default lifecycle resumes a positively persisted completed response without replaying and rejects UID replacements [90m(42.481665ms)[39m[39m
+[32m✔ default lifecycle rejects a different workload UID before any intent or PATCH [90m(9.784822ms)[39m[39m
+[32m✔ controller terminal capture stops a residual collector after drain expiry without reopening drain or deleting resources [90m(91.699484ms)[39m[39m
+[32m✔ unknown residual PATCH is recovered only by positive exact stopped state through the guarded adapter [90m(1460.750681ms)[39m[39m
+[32m✔ terminal recovery and freeze refuse incomplete physical stop: init_sidecar [90m(11.349857ms)[39m[39m
+[32m✔ terminal recovery and freeze refuse incomplete physical stop: missing [90m(10.257633ms)[39m[39m
+[32m✔ terminal recovery and freeze refuse incomplete physical stop: ephemeral [90m(9.894225ms)[39m[39m
+[32m✔ terminal freeze shares complete container proof for maintenance writers [90m(12.79239ms)[39m[39m
+[32m✔ positive terminal proof retains observed regular, init-sidecar and ephemeral container receipts [90m(4.806409ms)[39m[39m
+[32m✔ expired terminal budget cannot admit a residual collector stop or reset its persisted deadline [90m(1.75344ms)[39m[39m
+[32m✔ already stopped residual Deployment is proved without another PATCH and missing response is never inferred as a drain success [90m(7.198364ms)[39m[39m
+[32m✔ residual stop retains genuine late response evidence, leaves terminal pending and cannot reset budget on restart [90m(8.33359ms)[39m[39m
+[32m✔ residual stop refuses a fencing race between durable intent and PATCH [90m(10.244332ms)[39m[39m
+[32m✔ delayed unbounded cleanup remains pending and leaves lifetime reserve UNKNOWN [90m(29.96628ms)[39m[39m
+[32m✔ controller executor pins inventory ETag across residual stop intent even when the actor and origin are unchanged [90m(9.22941ms)[39m[39m
+[32m✔ campaign LGTM stays in a dedicated namespace with pinned image and cluster-internal OTLP service [90m(16.204868ms)[39m[39m
+[32m✔ campaign monitor refuses alternate and shared namespace names [90m(1.136826ms)[39m[39m
+[32m✔ preflight uses the stamp config selected by setup for QAP hostname validation [90m(266.577957ms)[39m[39m
+[32m✔ preflight rejects a stamp config path that escapes the workspace [90m(22.974322ms)[39m[39m
+[32m✔ fresh-run preflight passes without staged workloads and exposes the no-provider risk [90m(63.847651ms)[39m[39m
+[32m✔ null QAP and invalid config do not mask independent readiness gates [90m(55.45256ms)[39m[39m
+[32m✔ configuration mismatches, private input custody and bootstrap generation fail closed [90m(66.213404ms)[39m[39m
+[32m✔ expired or mismatched publisher credentials block federation without disclosing assertions [90m(63.498943ms)[39m[39m
+[32m✔ final readiness rejects an assertion expiring during later requests but accepts an unexpired control [90m(145.467005ms)[39m[39m
+[32m✔ final readiness rejects private assertion changes and lost file custody during later requests [90m(154.170503ms)[39m[39m
+[32m✔ publisher identity and exact fixed federation remain mandatory [90m(64.765072ms)[39m[39m
+[32m✔ configured stamp publisher federation requires each exact name and trust tuple [90m(180.996011ms)[39m[39m
+[32m✔ empty external publisher federation remains optional [90m(40.415818ms)[39m[39m
+[32m✔ namespace permission and scale-from-zero pool headroom are checked without scaling [90m(57.834714ms)[39m[39m
+[32m✔ image, metrics, QAP binding and storage failures are independent and meaningful [90m(25.991091ms)[39m[39m
+[32m✔ Cilium requires healthy agents and a current exact-cluster behavioral receipt [90m(92.86791ms)[39m[39m
+[32m✔ database Admin matches the selected database and UAMI object ID; operator FIC permissions require write and delete [90m(84.385217ms)[39m[39m
+[32m✔ FIC headroom counts all trusts while leaked run resources are warnings, not silent cleanup [90m(32.12033ms)[39m[39m
+[32m✔ aks.env preserves generated child-helper fields, real overrides and never evaluates shell syntax [90m(21.046978ms)[39m[39m
+[32m✔ rehearsal record path is fixed to a disjoint prefix [90m(12.604286ms)[39m[39m
+[32m✔ synthetic armed fixture validates while preserving initial unprovisioned inventory [90m(19.80725ms)[39m[39m
+[32m✔ non-terminal real campaign blocks before any isolated write [90m(6.577349ms)[39m[39m
+[32m✔ owner heartbeat is gated by a fresh real-record read and stop leaves no extra write [90m(21.336385ms)[39m[39m
+[32m✔ watchdog reconciliation rechecks the real record immediately before its isolated CAS [90m(4.353499ms)[39m[39m
+[32m✔ expired owner is rejected before and after fencing; terminal cleanup is idempotent [90m(89.258628ms)[39m[39m
+[32m✔ CAS conflict is surfaced without retrying synthetic fixture creation [90m(3.52568ms)[39m[39m
+[32m✔ store override without injected cleanup executor refuses before default providers [90m(3.999091ms)[39m[39m
+[32m✔ default rehearsal ARM fetch is refused by the campaign boundary before network forwarding [90m(45.81004ms)[39m[39m
+[32m✔ read-only ARM adapter refuses non-GET and off-host requests before sending [90m(2.118048ms)[39m[39m
+▶ official reader caps actual custody transport before and after the immutable object under its original deadline
+  [32m✔ none [90m(189.763112ms)[39m[39m
+  [32m✔ initial-overflow [90m(55.192654ms)[39m[39m
+  [32m✔ final-overflow [90m(39.920207ms)[39m[39m
+  [32m✔ blocked-final [90m(88.342407ms)[39m[39m
+  [32m✔ changed-custody [90m(9.963126ms)[39m[39m
+[32m✔ official reader caps actual custody transport before and after the immutable object under its original deadline [90m(400.998411ms)[39m[39m
+[32m✔ native observations use immutable cell custody, original windows and exact stable container counters [90m(27.72323ms)[39m[39m
+[32m✔ native dimensions independently refuse wrong source, resource identity, partial history and counter resets [90m(116.005736ms)[39m[39m
+[32m✔ native throttling needs timestamped CFS history and ambiguous CPU windows remain unknown [90m(18.740825ms)[39m[39m
+▶ original-window counter saturation does not inherit an exterior CPU average
+  [32m✔ 92 percent original usage diluted by idle exterior [90m(19.038733ms)[39m[39m
+  [32m✔ outside-only burst cannot prove original saturation [90m(3.459679ms)[39m[39m
+  [32m✔ interior work alone proves saturation [90m(21.658592ms)[39m[39m
+  [32m✔ all bracketing work is below the original threshold [90m(8.947703ms)[39m[39m
+[32m✔ original-window counter saturation does not inherit an exterior CPU average [90m(54.866046ms)[39m[39m
+▶ original-window counter saturation does not inherit an exterior CFS fraction
+  [32m✔ boundary contributions can hide original throttling [90m(9.177208ms)[39m[39m
+  [32m✔ outside-only throttling cannot prove original throttling [90m(7.94738ms)[39m[39m
+  [32m✔ interior throttling proves the original threshold [90m(6.430346ms)[39m[39m
+  [32m✔ all bracketing throttling is below the original threshold [90m(7.063661ms)[39m[39m
+[32m✔ original-window counter saturation does not inherit an exterior CFS fraction [90m(36.488729ms)[39m[39m
+▶ original-window CPU bounds do not assign a precision-straddling counter to the exterior
+  [32m✔ 1ns precision [90m(6.135339ms)[39m[39m
+  [32m✔ 1000000000ns precision [90m(7.94288ms)[39m[39m
+[32m✔ original-window CPU bounds do not assign a precision-straddling counter to the exterior [90m(14.695934ms)[39m[39m
+[90m﹣ actual Rust native pod/cAdvisor producer bytes cross the authenticated immutable reader [90m(0.44201ms)[39m # requires retained synthetic Rust native producer bytes[39m
+[32m✔ immutable measurement reader uses selected authenticated storage and cannot authorize an unpaired scale trial [90m(7.340967ms)[39m[39m
+[32m✔ immutable measurement reader rejects changed bytes, source identity, permissions and custody [90m(4.84811ms)[39m[39m
+[32m✔ source streaming cap stops retention on overflow and rejects a truncated declared body [90m(1.222828ms)[39m[39m
+[32m✔ Azure Monitor binds native percent metrics to exact selected ARM resource and complete original grains [90m(7.736075ms)[39m[39m
+[32m✔ one unknown Kusto metric never becomes false and does not erase independent measured saturation [90m(10.905448ms)[39m[39m
+[32m✔ partial, duplicated, reordered, wrong-unit and changed-grain metrics stay UNKNOWN [90m(27.784931ms)[39m[39m
+[32m✔ misaligned original windows are not expanded or replaced with a later Monitor snapshot [90m(2.540758ms)[39m[39m
+[32m✔ Monitor permission errors stay UNKNOWN while changed custody, late reads and oversized bodies refuse [90m(14.379327ms)[39m[39m
+[90m﹣ actual Rust immutable producer bytes remain an original window with unavailable submitted identity [90m(0.122303ms)[39m # SKIP[39m
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+[32m✔ writer observation reuses the three existing GETs without coercing unavailable pod identities [90m(29.005359ms)[39m[39m
+[32m✔ scale admission rejects live rolling updates and multiple physical collector writers [90m(26.605005ms)[39m[39m
+[32m✔ producer admission rejects a deleting but ready collector pod [90m(10.008227ms)[39m[39m
+[32m✔ controller recovers an apply intent at after-state and restores within the original restore deadline [90m(36.54023ms)[39m[39m
+[32m✔ controller reconciles a durable apply dispatch at exact after-state for safe restoration [90m(7.48917ms)[39m[39m
+[32m✔ real scale adapter applies and reconciles only the inventory-bound stamp pool while load is authorized [90m(19.442142ms)[39m[39m
+[32m✔ accepted ARM operations stay unresolved until exact after-state readback [90m(16.74748ms)[39m[39m
+[32m✔ lost restore acknowledgement with a lagging ARM read is not replayed [90m(26.278597ms)[39m[39m
+[32m✔ HTTP 5xx ARM response remains UNKNOWN and is not replayed [90m(22.88212ms)[39m[39m
+[32m✔ expired persisted before-state intent cannot start an ARM request [90m(11.568862ms)[39m[39m
+[32m✔ real provider does not replay a lost ARM acknowledgement after restart with a lagging read [90m(22.518411ms)[39m[39m
+[32m✔ concurrent same-millisecond dispatch claims admit only one actual ARM forward [90m(12.896493ms)[39m[39m
+[32m✔ final ARM observation refuses target drift and fence change before forwarding [90m(6.969859ms)[39m[39m
+[32m✔ fencing during the final ARM read prevents forwarding [90m(7.396868ms)[39m[39m
+[32m✔ trial deadline crossing during final ARM read blocks dispatch [90m(7.733775ms)[39m[39m
+[32m✔ stopped collector CPU restoration patches only the template limit and keeps replicas at zero [90m(15.537953ms)[39m[39m
+[32m✔ stopped load generator cleanup records restore-stopped without restarting it [90m(7.91758ms)[39m[39m
+[32m✔ stopped collector restore requires a resourceVersion before forwarding [90m(6.704052ms)[39m[39m
+[32m✔ default executor restart restores a kept scale trial before lifecycle recovery despite the blob ETag change [90m(34.862892ms)[39m[39m
+[32m✔ terminal cleanup can persist a confirmed no-effect scale trial as reverted [90m(3.877888ms)[39m[39m
+[32m✔ cleanup treats a deleting but still-running collector pod as physically active [90m(5.924635ms)[39m[39m
+[32m✔ stopped load generator remains active while a deleting pod is still running [90m(10.58494ms)[39m[39m
+[32m✔ default executor reconciles a lost restore only after lagging read settles, without a second forward [90m(42.863774ms)[39m[39m
+[32m✔ default terminal execute refuses an expired persisted deadline before restore reads or forwards [90m(7.234864ms)[39m[39m
+[32m✔ default terminal recovery refuses an expired persisted deadline before restore reads or forwards [90m(5.176718ms)[39m[39m
+[32m✔ scale JSON reader admits the exact byte bound and rejects overflow or truncated input [90m(100.097174ms)[39m[39m
+[32m✔ real scale CLI refuses self-labeled telemetry before configuration, storage, or command access [90m(3.11007ms)[39m[39m
+[32m✔ UNKNOWN dimensions do not become false or block an independent measured bottleneck [90m(1.904643ms)[39m[39m
+[32m✔ production measurement wait verifies a complete original post-convergence window and rechecks its deadline [90m(54.338434ms)[39m[39m
+[32m✔ load-generator expansion requires generator saturation, collector headroom, and offered-load headroom [90m(3.985591ms)[39m[39m
+[32m✔ collector and Kusto scale only on their measured bottleneck signals [90m(0.646215ms)[39m[39m
+[32m✔ scale trials persist intent and restore only after exact target readback [90m(6.18174ms)[39m[39m
+[32m✔ scale restoration is attempted when measurement setup fails after an exact apply [90m(0.87922ms)[39m[39m
+[32m✔ an uncertain scale application is neither replayed nor rolled back [90m(5.802532ms)[39m[39m
+[32m✔ a lost apply response with exact after-state is measured without replay [90m(0.803318ms)[39m[39m
+[32m✔ an uncertain restore response is reconciled instead of replayed [90m(1.698538ms)[39m[39m
+[32m✔ Kusto trials keep QAP improvement at stable ingress and revert without it [90m(0.347708ms)[39m[39m
+[32m✔ scale input parser rejects unknown and nonreversible target shapes [90m(4.699107ms)[39m[39m
+[32m✔ safe idle requires stable QAP, healthy pods, preserved rows, and recorded AKS/Kusto baselines [90m(0.807818ms)[39m[39m
+[32m✔ safe-idle cleanup is a true no-op when the live state is already safe [90m(0.345608ms)[39m[39m
+[32m✔ discovers exactly one live stamp instead of trusting stale YAML [90m(147.720156ms)[39m[39m
+[32m✔ missing, ambiguous and malformed live stamps fail with actionable guidance [90m(70.167694ms)[39m[39m
+[32m✔ CLI validates options before attempting any Azure operation [90m(5.100316ms)[39m[39m
+Reusing five revision-verified images for 0123456789abcdef0123456789abcdef01234567.
+AKS preflight pass 1/3 for arrow-collector-89152
+WAIT: propagation
+AKS preflight pass 2/3 for arrow-collector-89152
+AKS preflight READY
+AKS setup READY: stamp 89152, arrow-collector-89152, five digest-pinned images.
+Host assertion lasts one hour; rerun setup before it expires. Next: npx --no-install arrowcol-oat --mode aks --stamp-config out/aks-setup-tests/case-1OIpda/stamp.yaml
+Reusing five revision-verified images for 0123456789abcdef0123456789abcdef01234567.
+AKS setup prepared (preflight skipped): stamp 89152, arrow-collector-89152, five digest-pinned images.
+Host assertion lasts one hour; rerun setup before it expires. Next: npx --no-install arrowcol-oat --mode aks --stamp-config out/aks-setup-tests/case-1OIpda/stamp.yaml
+Reusing five revision-verified images for 0123456789abcdef0123456789abcdef01234567.
+AKS setup prepared (preflight skipped): stamp 89152, arrow-collector-89152, five digest-pinned images.
+Host assertion lasts one hour; rerun setup before it expires. Next: npx --no-install arrowcol-oat --mode aks --stamp-config out/aks-setup-tests/case-1OIpda/stamp.yaml
+Reusing five revision-verified images for 0123456789abcdef0123456789abcdef01234567.
+AKS setup prepared (preflight skipped): stamp 89152, arrow-collector-89152, five digest-pinned images.
+Host assertion lasts one hour; rerun setup before it expires. Next: npx --no-install arrowcol-oat --mode aks --stamp-config out/aks-setup-tests/case-1OIpda/stamp.yaml
+Reusing five revision-verified images for 0123456789abcdef0123456789abcdef01234567.
+AKS preflight pass 1/3 for arrow-collector-89152
+WAIT: propagation
+AKS preflight pass 2/3 for arrow-collector-89152
+WAIT: propagation
+AKS preflight pass 3/3 for arrow-collector-89152
+WAIT: propagation
+[32m✔ setup safely repairs YAML, reuses published images, refreshes private inputs and bounds preflight [90m(478.365167ms)[39m[39m
+Reusing five revision-verified images for 0123456789abcdef0123456789abcdef01234567.
+AKS setup prepared (preflight skipped): stamp 89152, arrow-collector-89152, five digest-pinned images.
+Host assertion lasts one hour; rerun setup before it expires. Next: npx --no-install arrowcol-oat --mode aks --stamp-config out/aks-setup-tests/case-MdbMfO/stamp.yaml
+Reusing five revision-verified images for 0123456789abcdef0123456789abcdef01234567.
+AKS setup prepared (preflight skipped): stamp 89152, arrow-collector-89152, five digest-pinned images.
+Host assertion lasts one hour; rerun setup before it expires. Next: npx --no-install arrowcol-oat --mode aks --stamp-config out/aks-setup-tests/case-FzAtaG/stamp.yaml
+[32m✔ setup verifies kubelogin support and avoids duplicating the hardening argument [90m(240.912973ms)[39m[39m
+AKS setup prepared (preflight skipped): stamp 89152, arrow-collector-89152, five digest-pinned images.
+Host assertion lasts one hour; rerun setup before it expires. Next: npx --no-install arrowcol-oat --mode aks --stamp-config out/aks-setup-tests/case-GTknfp/stamp.yaml
+[32m✔ missing revision images build and publish all five once, then verify every registry digest [90m(188.103073ms)[39m[39m
+Reusing five revision-verified images for 0123456789abcdef0123456789abcdef01234567.
+AKS setup prepared (preflight skipped): stamp 89152, arrow-collector-89152, five digest-pinned images.
+Host assertion lasts one hour; rerun setup before it expires. Next: npx --no-install arrowcol-oat --mode aks --stamp-config out/aks-setup-tests/case-lEEDgo/stamp.yaml
+[32m✔ skip-images and hard provenance failures never trigger builds or overwrite a valid runtime [90m(363.64856ms)[39m[39m
+AKS setup prepared (preflight skipped): stamp 89152, arrow-collector-89152, five digest-pinned images.
+Host assertion lasts one hour; rerun setup before it expires. Next: npx --no-install arrowcol-oat --mode aks --stamp-config out/aks-setup-tests/case-44J8SX/stamp.yaml
+[32m✔ repositories with only older revision tags build and publish without pre-build manifest lookups [90m(109.328083ms)[39m[39m
+[32m✔ real absent-registry failure never becomes missing images or triggers build/publication [90m(40.978331ms)[39m[39m
+[32m✔ non-READY authority is refused before identity, assertion or image publication [90m(40.871829ms)[39m[39m
+[32m✔ operator credential failure is actionable and does not fall back to UAMI or publish images [90m(29.184663ms)[39m[39m
+[32m✔ tracked stamp configuration is refused before rewriting or requesting cluster credentials [90m(26.822909ms)[39m[39m
+[32m✔ generation drift is refused before changing the captured bootstrap file [90m(43.067778ms)[39m[39m
+Reusing five revision-verified images for 0123456789abcdef0123456789abcdef01234567.
+AKS setup prepared (preflight skipped): stamp 89152, arrow-collector-89152, five digest-pinned images.
+Host assertion lasts one hour; rerun setup before it expires. Next: npx --no-install arrowcol-oat --mode aks --stamp-config out/aks-setup-tests/case-a95zwj/stamp.yaml
+[32m✔ independent setup fixtures preserve another private output and its sentinel [90m(104.265168ms)[39m[39m
+[32m✔ persisted stamp splice preserves every other byte, comment and CRLF [90m(10.780845ms)[39m[39m
+[32m✔ quoted zero stamp remains five digits when replacing 89152 [90m(3.400878ms)[39m[39m
+[32m✔ quoted zero stamp remains five digits when replacing '89152' [90m(1.75484ms)[39m[39m
+[32m✔ quoted zero stamp remains five digits when replacing "89152" [90m(1.294129ms)[39m[39m
+[32m✔ temporary network candidate changes only its own rendering, never the source [90m(7.332367ms)[39m[39m
+[32m✔ invalid, duplicate, nested-only and non-scalar stamp inputs fail closed [90m(4.177495ms)[39m[39m
+[32m✔ only an expired current controller with positive admission and the same original drain may record unsettled expiry [90m(23.687038ms)[39m[39m
+[32m✔ expiry evidence is durably reread, exact, idempotent and survives restart without inventing row counts [90m(13.040496ms)[39m[39m
+[32m✔ fencing between durable failed evidence and terminal receipt cannot advance or manufacture proof [90m(4.751808ms)[39m[39m
+[32m✔ expired drain continues ordered cleanup to verified idle while keeping the cell failed and terminal-unsettled [90m(40.452119ms)[39m[39m
+[32m✔ only validated controller expiry can bypass the unresolved drain journal for later cell cleanup [90m(8.486793ms)[39m[39m
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+{"event":"cell_cleanup_lifetime_reserve","status":"unknown","lower_bound_required_ms":1560000,"uncovered_steps":["preserve-evidence","remove-run-namespace","remove-run-qap","remove-run-fic","restore-safe-idle","verify-safe-idle","handoff"]}
+[32m✔ watchdog consumes persisted stop budgets and assigns the ceiling to legacy records [90m(25.11217ms)[39m[39m
+[32m✔ watchdog expiry fences first, refuses missing cleanup, and resumes idempotent cleanup [90m(36.832136ms)[39m[39m
+[32m✔ external executor invokes safe-idle restoration exactly once under the cleanup fence [90m(19.294239ms)[39m[39m
+[32m✔ external executor mutation authority rereads the current cleanup token instead of trusting captured state [90m(7.085061ms)[39m[39m
+[32m✔ maintenance stop persists a deadline and retains uncertainty without replaying or advancing to terminal capture [90m(12.304579ms)[39m[39m
+[32m✔ isolated D40 watchdog uses its injected no-op executor and read-only status adapter [90m(4.584705ms)[39m[39m
+[32m✔ keeps observations exploratory until official sustainable evidence is complete [90m(45.909543ms)[39m[39m
+[32m✔ preserves Delta rate after Kustainer death and nulls only unavailable downstream metrics [90m(2.819864ms)[39m[39m
+[32m✔ rejects duplicate candidate-repeat identities [90m(1.887543ms)[39m[39m
+[32m✔ rejects incompatible frozen source, resource, or load baselines [90m(1.377031ms)[39m[39m
+[32m✔ parses synthetic backlog and producer-shaped maintenance evidence without claiming measured results [90m(17.558099ms)[39m[39m
+[32m✔ consumes actual Rust results through the E1 projection and keeps single-window or failed wrappers UNKNOWN [90m(3.937589ms)[39m[39m
+[32m✔ accepts actual Rust due/backlog samples but keeps the campaign unqualified and incomplete coverage UNKNOWN [90m(0.931021ms)[39m[39m
+[32m✔ rejects actual projected interrupted and missing-report records mixed with complete windows [90m(2.707161ms)[39m[39m
+[32m✔ rejects unknown, unavailable, dropped, gapped, or clock-reversed backlog contract samples [90m(9.293911ms)[39m[39m
+[32m✔ allows single-flight scrape timeouts longer than cadence with skipped ticks and shrinking end budgets [90m(2.064247ms)[39m[39m
+[32m✔ rejects sustained positive publication rows, bytes, publications, or age trends without zero filling [90m(3.206572ms)[39m[39m
+[32m✔ requires complete, contiguous five-window due-work for all operations and rejects growth or unknowns [90m(28.967358ms)[39m[39m
+[32m✔ preserves retries without failures but refuses missing records or growing protected debt [90m(19.594545ms)[39m[39m
+[32m✔ requires live guard coverage and confirmed caps and renders actual overload stops above the ceiling [90m(32.403636ms)[39m[39m
+[32m✔ requires measured OPTIMIZE and PURGE debt vectors while preserving legitimate nulls [90m(6.229442ms)[39m[39m
+[32m✔ rejects exact-window commit buckets that do not sum to the run output [90m(1.540035ms)[39m[39m
+[32m✔ reads one sustained run of contiguous emitter buckets but keeps missing debt proof unranked [90m(1.193827ms)[39m[39m
+[32m✔ does not combine separate cold runs or accept gapped buckets as a sustained repeat [90m(2.576759ms)[39m[39m
+[32m✔ requires actual distinct factor leaves and preserves frozen config paths [90m(0.989922ms)[39m[39m
+[32m✔ requires factor leaves to exist in generated C1 cohort configs [90m(7.01706ms)[39m[39m
+[32m✔ sorts qualified leaderboard metrics by descending mean then candidate name [90m(0.633215ms)[39m[39m
+[32m✔ AKS subcommands lazily dispatch only the selected module with its arguments and runner [90m(13.027996ms)[39m[39m
+[32m✔ missing and unknown AKS subcommands exit with usage instead of launching a benchmark [90m(1110.321119ms)[39m[39m
+[oat] Building benchmark server...
+[32m✔ non-AKS arguments and the injected runner pass through to the existing launcher [90m(110.195103ms)[39m[39m
+[32m✔ AKS defaults prefer generated private configuration but never override explicit or local configs [90m(7.393668ms)[39m[39m
+[32m✔ aks scale is reachable through the shared OAT CLI [90m(0.668416ms)[39m[39m
+[32m✔ only the launched orchestration, exact source revision and full matrix can pass [90m(3.433678ms)[39m[39m
+[32m✔ failed state, empty output, bad throughput and pinning fail with concrete reasons [90m(0.820918ms)[39m[39m
+[32m✔ AKS QAP requires every observation health condition; local omits it [90m(0.388809ms)[39m[39m
+[32m✔ single-hot-table campaign separates QAP lag from ingest validity and rejects unknown evidence [90m(2.042146ms)[39m[39m
+[32m✔ network summary retains the explicit accepted-risk warning and preflight warnings [90m(0.45031ms)[39m[39m
+[32m✔ v3 preserves local degraded evidence without relaxing AKS or pinning gates [90m(0.521211ms)[39m[39m
+[32m✔ v3 requires evidenced collector output, but known zero commits remain valid without delivery claims [90m(3.223573ms)[39m[39m
+[32m✔ run reporting returns failure exit status for a runner exception and success only after evidence passes [90m(2.790163ms)[39m[39m
+[32m✔ mirror reader pins a 30-second timeout and 16-MiB cap, including chunked responses [90m(49.423622ms)[39m[39m
+[32m✔ mirror deadline aborts both connection establishment and a stalled response body [90m(2.823364ms)[39m[39m
+result source: local authoritative Parquet
+[32m✔ real Parquet decodes and an unreadable local result fails closed [90m(122.146775ms)[39m[39m
+result source: local authoritative Parquet
+result source: local authoritative Parquet
+result source: local authoritative Parquet
+result source: public sanitized $web Parquet mirror
+result source: public sanitized $web Parquet mirror
+[32m✔ local evidence collection passes only a readable Parquet containing this run and revision [90m(74.245886ms)[39m[39m
+[32m✔ AKS collection preserves verified rows when cleanup evidence fails and passes only after absence [90m(21.866596ms)[39m[39m
+[32m✔ AKS mirror endpoint lookup uses configured subscription despite ambient selection [90m(1.247828ms)[39m[39m
+[32m✔ AKS mirror lookup rejects missing or malformed selected subscription before fallback [90m(0.528912ms)[39m[39m
+[32m✔ AKS reads sanitized mirror by configured path and visibly falls back only on unavailable mirror [90m(10.508939ms)[39m[39m
+[32m✔ cleanup waits for Terminating namespaces and scoped FICs, but ignores the native trust [90m(5.614528ms)[39m[39m
+[32m✔ cleanup fails closed when the selected subscription is missing or conflicts with the environment [90m(0.561413ms)[39m[39m
+[32m✔ heatmap bounds are measured once per column and rendered rows are capped [90m(5.048415ms)[39m[39m
+[32m✔ procfs ESRCH race is treated as an exited process [90m(3.398578ms)[39m[39m
+[32m✔ owned server starts the exact successful Cargo artifact, not a stale prebuilt path [90m(589.199883ms)[39m[39m
+OAT source has uncommitted changes; result git_sha will remain unknown.
+[32m✔ dirty owned builds retain unknown provenance instead of asserting a clean commit [90m(7.03596ms)[39m[39m
+[32m✔ changed source, failed builds and missing artifact metadata cannot start an attributed server [90m(46.156849ms)[39m[39m
+[32m✔ executable help resolves its tsx loader outside the repository [90m(464.07824ms)[39m[39m
+▶ failed local runs exit without serving absent or stale results
+  [32m✔ rejected: owned server [90m(635.209826ms)[39m[39m
+  [32m✔ rejected: external server [90m(622.191429ms)[39m[39m
+  [32m✔ failed-verdict: owned server [90m(666.297629ms)[39m[39m
+  [32m✔ failed-verdict: external server [90m(662.306837ms)[39m[39m
+[32m✔ failed local runs exit without serving absent or stale results [90m(2587.819562ms)[39m[39m
+[oat] Building benchmark server...
+[oat] Benchmark server: http://127.0.0.1:42339 (PID 98550; logs in this terminal)
+succeeded: published
+result source: local authoritative Parquet
+DATA FLOW: PASS
+run: 123e4567-e89b-42d3-a456-426614174000; matching result rows: 1
+git_sha: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+WARNING: 1 legacy result(s) have no committed-output telemetry; admission is not durability
+[32m✔ deadline-enabled main path fails if a successful report crosses the deadline during server shutdown [90m(3326.007794ms)[39m[39m
+[oat] Building benchmark server...
+[oat] Benchmark server: http://127.0.0.1:36667 (PID 98557; logs in this terminal)
+running: running
+succeeded: published
+result source: local authoritative Parquet
+DATA FLOW: PASS
+run: 123e4567-e89b-42d3-a456-426614174000; matching result rows: 1
+git_sha: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+WARNING: 1 legacy result(s) have no committed-output telemetry; admission is not durability
+[32m✔ successful deadline main exposes one frozen durable identity without waiting on supplementary work [90m(1724.351926ms)[39m[39m
+[oat] Building benchmark server...
+[oat] Benchmark server: http://127.0.0.1:38725 (PID 98564; logs in this terminal)
+running: running
+succeeded: published
+result source: local authoritative Parquet
+DATA FLOW: PASS
+run: 123e4567-e89b-42d3-a456-426614174000; matching result rows: 1
+git_sha: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+WARNING: 1 legacy result(s) have no committed-output telemetry; admission is not durability
+▶ supplementary observer throw and rejection preserve the actual main scorer and cleanup result
+  [32m✔ throw [90m(1752.413225ms)[39m[39m
+[oat] Building benchmark server...
+[oat] Benchmark server: http://127.0.0.1:32791 (PID 98571; logs in this terminal)
+running: running
+succeeded: published
+result source: local authoritative Parquet
+DATA FLOW: PASS
+run: 123e4567-e89b-42d3-a456-426614174000; matching result rows: 1
+git_sha: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+WARNING: 1 legacy result(s) have no committed-output telemetry; admission is not durability
+  [32m✔ reject [90m(1728.604084ms)[39m[39m
+[32m✔ supplementary observer throw and rejection preserve the actual main scorer and cleanup result [90m(3483.039054ms)[39m[39m
+[oat] Building benchmark server...
+[oat] Benchmark server: http://127.0.0.1:41267 (PID 98578; logs in this terminal)
+succeeded: published
+result source: local authoritative Parquet
+DATA FLOW: PASS
+run: 123e4567-e89b-42d3-a456-426614174000; matching result rows: 1
+git_sha: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+WARNING: 1 legacy result(s) have no committed-output telemetry; admission is not durability
+▶ owned main skips supplementary identity for initial non-running statuses
+  [32m✔ succeeded [90m(671.111339ms)[39m[39m
+[oat] Building benchmark server...
+[oat] Benchmark server: http://127.0.0.1:38017 (PID 98585; logs in this terminal)
+failed: failed
+DATA FLOW: FAIL
+run: 123e4567-e89b-42d3-a456-426614174000; state: failed
+FAIL: synthetic cleanup failure
+  [32m✔ failed [90m(698.098638ms)[39m[39m
+[oat] Building benchmark server...
+[oat] Benchmark server: http://127.0.0.1:34963 (PID 98592; logs in this terminal)
+cancelled: cancelled
+DATA FLOW: FAIL
+run: 123e4567-e89b-42d3-a456-426614174000; state: cancelled
+FAIL: OAT run 123e4567-e89b-42d3-a456-426614174000 cancelled
+  [32m✔ cancelled [90m(680.30084ms)[39m[39m
+[32m✔ owned main skips supplementary identity for initial non-running statuses [90m(2051.043552ms)[39m[39m
+[oat] Building benchmark server...
+[oat] Benchmark server: http://127.0.0.1:35805 (PID 98599; logs in this terminal)
+running: running
+failed: failed
+DATA FLOW: FAIL
+run: 123e4567-e89b-42d3-a456-426614174000; state: failed
+FAIL: synthetic cleanup failure
+[32m✔ owned main rechecks supplementary eligibility after cancellation during marker persistence [90m(844.232887ms)[39m[39m
+[oat] Building benchmark server...
+[oat] Benchmark server: http://127.0.0.1:43795 (PID 98606; logs in this terminal)
+DATA FLOW: FAIL
+FAIL: Could not start OAT run: invalid matrix fixture
+▶ owned main does not emit supplementary identity for rejected, unknown or unattested runs
+  [32m✔ {"rejectRun":true} [90m(633.279391ms)[39m[39m
+[oat] Building benchmark server...
+[oat] Benchmark server: http://127.0.0.1:38589 (PID 98613; logs in this terminal)
+DATA FLOW: FAIL
+FAIL: OAT server returned a run ID that cannot be safely pinned
+[oat] Preserving OAT server for unresolved run receipt /tmp/oat-owned-build-7myacR/receipts/92303414-7181-4649-8885-a6c8dfd5cea8.json
+  [32m✔ {"invalidRunId":true} [90m(669.489595ms)[39m[39m
+[oat] Building benchmark server...
+[oat] Benchmark server: http://127.0.0.1:34039 (PID 98620; logs in this terminal)
+[oat] Supplementary owned-run identity skipped: accepted run is no longer eligible
+succeeded: published
+DATA FLOW: FAIL
+run: 123e4567-e89b-42d3-a456-426614174000; state: succeeded
+FAIL: OAT server config_sha256 mismatch for run 123e4567-e89b-42d3-a456-426614174000
+[oat] Preserving OAT server for unresolved run receipt /tmp/oat-owned-build-ZgGaRd/receipts/d987860f-b5d9-45fd-bd64-818046f79ac4.json
+  [32m✔ {"configHash":null} [90m(780.676968ms)[39m[39m
+[oat] Building benchmark server...
+[oat] Benchmark server: http://127.0.0.1:35867 (PID 98627; logs in this terminal)
+[oat] Supplementary owned-run identity skipped: accepted run is no longer eligible
+succeeded: published
+DATA FLOW: FAIL
+run: 123e4567-e89b-42d3-a456-426614174000; state: succeeded
+FAIL: OAT server config_sha256 mismatch for run 123e4567-e89b-42d3-a456-426614174000
+[oat] Preserving OAT server for unresolved run receipt /tmp/oat-owned-build-FXKDYU/receipts/ca78f638-45b9-482d-bd0f-c9d1a7c35805.json
+  [32m✔ {"configHash":"0000000000000000000000000000000000000000000000000000000000000000"} [90m(737.125617ms)[39m[39m
+[32m✔ owned main does not emit supplementary identity for rejected, unknown or unattested runs [90m(2822.848923ms)[39m[39m
+[oat] Building benchmark server...
+[oat] Benchmark server: http://127.0.0.1:35537 (PID 98634; logs in this terminal)
+succeeded: published
+result source: local authoritative Parquet
+DATA FLOW: PASS
+run: 123e4567-e89b-42d3-a456-426614174000; matching result rows: 1
+git_sha: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+WARNING: 1 legacy result(s) have no committed-output telemetry; admission is not durability
+[32m✔ owned main cannot pass when real scoring crosses the original deadline [90m(733.406161ms)[39m[39m
+succeeded: succeeded
+DATA FLOW: FAIL
+run: 123e4567-e89b-42d3-a456-426614174000; matching result rows: 0
+git_sha: unavailable
+FAIL: no Parquet rows match this orchestration run
+FAIL: matching Parquet result count differs from runner result_count
+FAIL: expected server revision unavailable; cannot verify provenance
+FAIL: expected experiment matrix is missing
+FAIL: Invalid URL
+[32m✔ external --server submits unchanged configuration without building or attributing that server [90m(133.113523ms)[39m[39m
+succeeded: published
+result source: local authoritative Parquet
+DATA FLOW: PASS
+run: 123e4567-e89b-42d3-a456-426614174000; matching result rows: 1
+git_sha: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+WARNING: 1 legacy result(s) have no committed-output telemetry; admission is not durability
+[32m✔ external main rechecks the original deadline after final receipt work [90m(713.686011ms)[39m[39m
+[32m✔ posts the JSON config and polls until the server publishes results [90m(15.545353ms)[39m[39m
+[32m✔ build progress streams before process exit while preserving captured diagnostics [90m(61.933107ms)[39m[39m
+[32m✔ reports validation errors returned by the server [90m(4.187495ms)[39m[39m
+[32m✔ ownership persistence failures cancel the accepted run before propagating the disk error [90m(6.675152ms)[39m[39m
+[32m✔ allows the executable to select the platform mode without editing the config file [90m(3.607182ms)[39m[39m
+[32m✔ selects a per-mode quick config when no path is supplied [90m(2.421455ms)[39m[39m
+[32m✔ fills missing local Docker bridge hosts while preserving explicit values [90m(5.016714ms)[39m[39m
+[32m✔ serves local viewer byte ranges, suffix ranges, and HEAD requests [90m(8.39529ms)[39m[39m
+[32m✔ opens the existing local results in viewer-only mode without losing missing-file errors [90m(45.363931ms)[39m[39m
+[32m✔ CLI help is available and unknown options fail as usage errors [90m(2.893165ms)[39m[39m
+[32m✔ local cleanup removes only the Compose project derived from the supplied cell UUID [90m(5.641728ms)[39m[39m
+[32m✔ local cleanup refuses ambiguous legacy project before removing resources or state [90m(3.180172ms)[39m[39m
+Cleaned local Compose project(s): oat-recovery-te-123e4567e89b42d3a456426614174000
+[32m✔ local recovery and cleanup resolve relative state beside the owned server, not the caller cwd [90m(81.720956ms)[39m[39m
+[32m✔ local interruption requests cancellation and waits for the server to finish cleanup [90m(16.986586ms)[39m[39m
+[32m✔ owned server is isolated from the launcher foreground process group on Linux [90m(559.880615ms)[39m[39m
+[32m✔ a signal received during owned-server teardown prevents viewer startup [90m(0.641115ms)[39m[39m
+[32m✔ cleanup-local config resolution skips its UUID and honors positional and explicit config paths [90m(2.092047ms)[39m[39m
+[32m✔ immediately propagates cancellation HTTP and transport errors with a long poll interval [90m(23.559035ms)[39m[39m
+No resources found for local run 123e4567-e89b-42d3-a456-426614174000
+[32m✔ failed interrupted cleanup blocks startup and retains evidence until explicit local cleanup [90m(394.312855ms)[39m[39m
+[32m✔ deadline strictly validates its CLI values and preserves default behavior when absent [90m(3.506579ms)[39m[39m
+[32m✔ expired original monotonic deadline is not reset and prevents POST /runs [90m(123.847612ms)[39m[39m
+▶ abort during POST pins the accepted running identity before once-only cancellation
+  [32m✔ before original deadline [90m(457.162381ms)[39m[39m
+  [32m✔ receipt without deadline [90m(487.451469ms)[39m[39m
+[32m✔ abort during POST pins the accepted running identity before once-only cancellation [90m(948.232232ms)[39m[39m
+[32m✔ launcher deadline cancels the exact active run and reconciles a lost cancel response to terminal state [90m(1199.022523ms)[39m[39m
+[32m✔ deadline does not dispatch cancellation when cleanup budget cannot be persisted [90m(1015.122444ms)[39m[39m
+[32m✔ launcher never reports success when a run wins the race after the original deadline [90m(1222.373245ms)[39m[39m
+[32m✔ lost POST /runs response leaves an unknown owned receipt and blocks the next cell without retrying [90m(1244.413482ms)[39m[39m
+[32m✔ lost cancel response uses only GET reconciliation while the exact run remains active [90m(1168.097638ms)[39m[39m
+[32m✔ known-ID deadline receipt reconciles terminal status before allowing a next cell [90m(124.697423ms)[39m[39m
+▶ requires server config attestation and cancels the exact known run on missing or mismatched hashes
+  [32m✔ missing [90m(282.824201ms)[39m[39m
+  [32m✔ mismatched [90m(308.945991ms)[39m[39m
+[32m✔ requires server config attestation and cancels the exact known run on missing or mismatched hashes [90m(592.748414ms)[39m[39m
+[32m✔ persists exact submitted and source bytes before POST /runs [90m(121.030239ms)[39m[39m
+▶ failed terminal cleanup remains unsettled and blocks the next cell
+  [32m✔ initial [90m(186.211414ms)[39m[39m
+  [32m✔ poll [90m(191.82774ms)[39m[39m
+  [32m✔ cancel [90m(265.113998ms)[39m[39m
+[32m✔ failed terminal cleanup remains unsettled and blocks the next cell [90m(644.242178ms)[39m[39m
+[32m✔ restoring durable cancellation intent permits GETs but never another POST [90m(1206.056187ms)[39m[39m
+[32m✔ malformed initial run identity is unknown and never becomes a cancellation target [90m(115.103304ms)[39m[39m
+[32m✔ poll identity mismatch never redirects status or cancellation to another run [90m(121.264143ms)[39m[39m
+[32m✔ receipt reconciliation rejects a terminal status for a different run ID [90m(120.323322ms)[39m[39m
+[32m✔ expired persisted cleanup budget does not grant another cancellation allowance [90m(126.993072ms)[39m[39m
+[32m✔ receipt write crossing cleanup deadline prevents cancellation dispatch [90m(376.119808ms)[39m[39m
+[32m✔ real Compose merge removes fixed networking and preserves daemon-selected port bindings [90m(513.267259ms)[39m[39m
+[32m✔ canonical fixture supplies 32 names; E1-E5 change only their declared comparison dimension [90m(3.458479ms)[39m[39m
+[32m✔ example stamp fits the default run, 32-table pilot, and documented E1-E5 pod counts [90m(47.690283ms)[39m[39m
+[32m✔ capacity sums same-role pool slots before rejecting an experiment [90m(12.517184ms)[39m[39m
+[32m✔ capacity recommendations use maxCount safely beyond the per-node pod limit [90m(11.484161ms)[39m[39m
+[32m✔ binding refuses unknown/out-of-budget pilot settings, ambiguous baselines and invented tables [90m(1.382931ms)[39m[39m
+[32m✔ CLI fails before reading private settings when pilot values or private output scope are missing [90m(2.420954ms)[39m[39m
+[32m✔ CLI rejects a symlinked private root before writing outside it [90m(27.572027ms)[39m[39m
+[32m✔ CLI rejects a symlinked intermediate output parent without changing its target [90m(19.598045ms)[39m[39m
+Prepared E1-E5 in /tmp/oat-e1-e5-workspace-xgUdwJ/out/arrowcol-oat/test-e1-e5-e5692fb3-cbc5-403e-89c6-4e8d09d499a7/bound-default; no benchmark or cloud operation was performed. Pilot evidence requires operator review.
+Prepared E1-E5 in /tmp/oat-e1-e5-workspace-xgUdwJ/out/arrowcol-oat/test-e1-e5-e5692fb3-cbc5-403e-89c6-4e8d09d499a7/bound; no benchmark or cloud operation was performed. Pilot evidence requires operator review.
+[32m✔ offline CLI selects matching stamp capacity inputs and rejects mismatches or missing files [90m(129.969452ms)[39m[39m
+[32m✔ generates private inputs from authoritative generation and pins the complete AKS configuration [90m(99.93867ms)[39m[39m
+[32m✔ rerunning refreshes the assertion without rotating existing SQL or HMAC secrets [90m(145.858013ms)[39m[39m
+[32m✔ rejects expired or malformed assertions, mutable images and mismatched stamp endpoints [90m(12.517684ms)[39m[39m
+[32m✔ refuses another stamp and symlinked secrets without following them, and restricts an existing output directory [90m(34.205977ms)[39m[39m
+[32m✔ bootstrap generation is never synthesized and environment entries cannot inject lines [90m(0.800818ms)[39m[39m
+[32m✔ publishes four existing images as federated UAMI without applying identity and pins the ignored config [90m(152.627467ms)[39m[39m
+[32m✔ wrong existing ServiceAccount is rejected before minting a token or publishing [90m(61.789003ms)[39m[39m
+[32m✔ stale local image provenance is rejected before Azure credentials are used [90m(56.656587ms)[39m[39m
+[32m✔ invalid registry digest preserves the draft and removes isolated credential caches [90m(27.786431ms)[39m[39m
+[32m✔ missing or malformed run identity is rejected before credentials or publication [90m(35.173999ms)[39m[39m
+[32m✔ requires federation, matching runtime subject and all amd64 images before Azure calls [90m(24.953867ms)[39m[39m
+[32m✔ builds all five local images for linux/amd64 with the full revision label [90m(2.069347ms)[39m[39m
+[32m✔ publishes the revision-proven client image as a digest-pinned ACR reference [90m(18.398218ms)[39m[39m
+[32m✔ publishes the static viewer to the stamped root website through the federated UAMI [90m(37.901061ms)[39m[39m
+[32m✔ opt-in maintenance verifies a sixth immutable revision, while legacy setup still uses five [90m(13.930817ms)[39m[39m
+[32m✔ reads and verifies all five revision tags without building or pushing [90m(16.698679ms)[39m[39m
+[32m✔ published image provenance mismatch fails without building or pushing [90m(18.46212ms)[39m[39m
+[32m✔ existing repositories with only older revision tags return exactly the missing roles before metadata lookup [90m(9.869525ms)[39m[39m
+[32m✔ empty ACR inventory returns typed missing images without calling manifest lookup [90m(15.202746ms)[39m[39m
+[32m✔ real az tag-missing stderr becomes typed only after structured tag recheck confirms absence [90m(15.882861ms)[39m[39m
+[32m✔ real manifest-missing fixture becomes typed after structured tag recheck confirms absence [90m(18.407218ms)[39m[39m
+[32m✔ real tag-missing stderr stays hard when the structured recheck still lists the tag [90m(8.049983ms)[39m[39m
+[32m✔ exit code three with unrecognized wording stays hard without a tag recheck [90m(10.197731ms)[39m[39m
+[32m✔ registry absence and authorization errors remain hard failures [90m(27.670229ms)[39m[39m
+[32m✔ post-push missing digest lookup is a hard failure, not a rebuild signal [90m(5.69733ms)[39m[39m
+[32m✔ rejects mutable images, QAP namespace, wrong stamp and unknown fields [90m(4.989313ms)[39m[39m
+[32m✔ AKS resource overrides are strict and project through to role manifests [90m(90.319352ms)[39m[39m
+[32m✔ only explicit Quiver topology installs the durable processor and isolated pod storage [90m(87.306483ms)[39m[39m
+[32m✔ maintenance requires a pinned sixth image and explicit allowlist/operation/apply controls [90m(20.866874ms)[39m[39m
+[32m✔ isolated integrated topology pins images, WI, identity, probes and pooled table ownership [90m(16.74878ms)[39m[39m
+[32m✔ configured existing federation subject is used by every runtime phase [90m(11.273156ms)[39m[39m
+[32m✔ unpublished draft images cannot be rendered as deployable resources [90m(2.737262ms)[39m[39m
+[32m✔ SQL persistence and sequential bootstrap keep migration credentials out of runtime [90m(9.427815ms)[39m[39m
+[32m✔ secret preparation never rotates an existing key or invents a generation [90m(52.435191ms)[39m[39m
+[32m✔ Rust and TypeScript share derived stop-budget fixtures [90m(2.974068ms)[39m[39m
+[32m✔ parses Rust-produced default and reduced maintenance budgets [90m(0.407109ms)[39m[39m
+[32m✔ rejects malformed, undersized, over-ceiling, and extended maintenance budgets [90m(0.336908ms)[39m[39m
+[32m✔ screens applicable BYTE_ARRAY encodings with an explicit matched plain control [90m(6.052038ms)[39m[39m
+[32m✔ generates the C3 flush-age comparison as a single-factor sweep [90m(2.22775ms)[39m[39m
+[32m✔ covers applicable enum factors and records unsupported typed values without promoting them [90m(6.565849ms)[39m[39m
+[32m✔ renders C5 candidates against the committed seed without changing non-factor axes [90m(9.440114ms)[39m[39m
+[32m✔ generates bounded local single-writer manifests from the tunables registry [90m(2.590559ms)[39m[39m
+[32m✔ renders candidate overlays as OAT configs without changing the baseline or admission invariants [90m(13.580209ms)[39m[39m
+[32m✔ viewer keeps unknown measurements distinct from zero and unverified pinning distinct from violations [90m(45.500234ms)[39m[39m
+[32m✔ viewer derives commit-window output rather than backfilling legacy admissions or unavailable telemetry [90m(6.15624ms)[39m[39m
+[34mℹ tests 513[39m
+[34mℹ suites 0[39m
+[34mℹ pass 511[39m
+[34mℹ fail 0[39m
+[34mℹ cancelled 0[39m
+[34mℹ skipped 2[39m
+[34mℹ todo 0[39m
+[34mℹ duration_ms 34704.195849[39m
+
+> nx run arrowcol-oat:verify
+
+
+
+
+ NX   Successfully ran target verify for project arrowcol-oat and 2 tasks it depends on
+
+
+  Run duration:      35.4s
+  Cache:             0/3 hit (0%)
+  Critical path:     35.4s (2 tasks)
+  Recoverable time:  <1ms
+
+  Recommendations:
+    - Drastically reduce your run duration by sharing a cache across your team and CI → https://cloud.nx.app/connect/NCzhdX49zV.
+    - Speed up or split the longest tasks on the critical path:
+        arrowcol-oat:test    35.4s

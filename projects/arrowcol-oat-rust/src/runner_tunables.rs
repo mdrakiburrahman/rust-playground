@@ -91,7 +91,7 @@ fn local_dataflow_overlay(config: &OatConfig, state_dir: &Path, overlay: &mut Va
     }
     collector["stop_grace_period"] = json!(format!("{}s", config.collector_stop_grace_seconds));
     collector["ports"] = json!([{
-        "host_ip": "127.0.0.1",
+        "host_ip": config.platform.local.bind_host.map_or_else(|| "127.0.0.1".to_owned(), |host| host.to_string()),
         "target": 32011,
         "published": "0",
         "protocol": "tcp"
@@ -191,6 +191,33 @@ fn inject_workload_environment(config: &OatConfig, resources: &mut [Value]) -> R
 #[cfg(test)]
 mod tunable_injection_tests {
     use super::*;
+
+    #[test]
+    fn local_collector_port_uses_bind_host() -> Result<()> {
+        let proof_config = std::env::var_os("OAT_BIND_PROOF_CONFIG");
+        let source = match &proof_config {
+            Some(path) => std::fs::read_to_string(path)?,
+            None => include_str!("../../../docs/experiments/arrowcol-oat/oat-config.quick.json").to_owned(),
+        };
+        let mut config: OatConfig = serde_json::from_str(&source)?;
+        for (name, host, expected) in [
+            ("default", None, "127.0.0.1"),
+            ("gateway", Some("172.18.0.1".parse()?), "172.18.0.1"),
+            ("ipv6", Some("::1".parse()?), "::1"),
+        ] {
+            config.platform.local.bind_host = host;
+            let mut overlay = compose_tunables(&config)?;
+            local_dataflow_overlay(&config, Path::new("/owned/run"), &mut overlay)?;
+            assert_eq!(
+                overlay["services"]["dataflow-1"]["ports"],
+                json!([{"host_ip":expected,"target":32011,"published":"0","protocol":"tcp"}])
+            );
+            if proof_config.is_some() {
+                println!("OAT_BIND_OVERLAY_{name}={overlay}");
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn overload_local_memory_cap_is_explicit_and_scoped_to_the_collector() -> Result<()> {

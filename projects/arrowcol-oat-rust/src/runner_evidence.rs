@@ -3,6 +3,30 @@ const OFFICIAL_MEASUREMENT_SCOPE: &str = "original_official_cell_window_not_pair
 const OFFICIAL_MEASUREMENT_PUBLICATION_SECONDS: u64 = 20;
 const OFFICIAL_MEASUREMENT_RETENTION_RESERVE_SECONDS: u64 = 10;
 
+#[derive(Clone, Debug)]
+struct SubmittedConfigIdentity {
+    orchestration_run_id: String,
+    sha256: String,
+}
+
+async fn capture_submitted_config_identity(state: &AppState, orchestration_run_id: &str) -> Option<SubmittedConfigIdentity> {
+    let runs = state.runs.lock().await;
+    let status = runs.get(orchestration_run_id);
+    match status {
+        Some(status) if status.id == orchestration_run_id && valid_submitted_config_sha256(&status.config_sha256) => {
+            Some(SubmittedConfigIdentity { orchestration_run_id: status.id.clone(), sha256: status.config_sha256.clone() })
+        }
+        _ => {
+            tracing::warn!("original server run has no matching authoritative submitted config identity; identity remains UNKNOWN");
+            None
+        }
+    }
+}
+
+fn valid_submitted_config_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 fn official_measurement_blob(inventory: &RunInventory) -> Result<String> {
     let destination = inventory.evidence_destination.as_ref().context("official measurement has no custody destination")?;
     Ok(format!("{}/official-cell-measurement-v1.json", destination.blob_prefix))
@@ -34,7 +58,9 @@ fn validate_official_measurement_reference(inventory: &RunInventory) -> Result<(
     Ok(())
 }
 
-fn official_measurement_bytes(inventory: &RunInventory, config: &OatConfig, rows: &[OatResult]) -> Result<Vec<u8>> {
+fn official_measurement_bytes(
+    inventory: &RunInventory, config: &OatConfig, rows: &[OatResult], submitted: Option<&SubmittedConfigIdentity>,
+) -> Result<Vec<u8>> {
     let [row] = rows else { bail!("official campaign measurement requires exactly one original hot-table result") };
     let tunables: Value = serde_json::from_str(&row.tunables_json)?;
     if row.run_id != inventory.cell_run_id
@@ -61,7 +87,9 @@ fn official_measurement_bytes(inventory: &RunInventory, config: &OatConfig, rows
             "orchestration_run_id": inventory.orchestration_run_id, "cell_run_id": inventory.cell_run_id,
             "namespace_uid": inventory.namespace.uid,
         },
-        "submitted_config_sha256": null,
+        "submitted_config_sha256": submitted.filter(|identity| {
+            identity.orchestration_run_id == inventory.orchestration_run_id && valid_submitted_config_sha256(&identity.sha256)
+        }).map(|identity| identity.sha256.as_str()),
         "effective_config_json": effective_config_json,
         "effective_config_sha256": fixture_sha256(effective_config_json.as_bytes()),
         "source_revision": source_revision,
@@ -124,6 +152,7 @@ async fn publish_campaign_official_measurement(
     platform: &AksPlatform,
     config: &OatConfig,
     rows: &[OatResult],
+    submitted: Option<&SubmittedConfigIdentity>,
     deadline: tokio::time::Instant,
 ) -> Result<()> {
     if config.campaign_profile.is_none() {
@@ -142,7 +171,7 @@ async fn publish_campaign_official_measurement(
             platform, &identity, &cached.orchestration_run_id, publication_deadline.saturating_duration_since(tokio::time::Instant::now()),
         ).await?;
         current.assert_custody_ready(platform.campaign_cli_paths()?).await?;
-        let bytes = official_measurement_bytes(&current, config, rows)?;
+        let bytes = official_measurement_bytes(&current, config, rows, submitted)?;
         let payload: Value = serde_json::from_slice(&bytes)?;
         let destination = current.evidence_destination.as_ref().context("official measurement destination is missing")?;
         let blob = official_measurement_blob(&current)?;
@@ -154,7 +183,7 @@ async fn publish_campaign_official_measurement(
         next.official_measurement = Some(InventoryOfficialMeasurement {
             schema_version: 1, blob, etag, version, sha256: fixture_sha256(&bytes), byte_length: bytes.len() as u64,
             effective_config_sha256: payload["effective_config_sha256"].as_str().context("effective config digest missing")?.to_owned(),
-            submitted_config_sha256: None,
+            submitted_config_sha256: payload["submitted_config_sha256"].as_str().map(str::to_owned),
             source_revision: payload["source_revision"].as_str().map(str::to_owned),
             measurement_start_unix_ms: output["measurement_start_unix_ms"].as_u64(),
             measurement_end_unix_ms: output["measurement_end_unix_ms"].as_u64(),
@@ -169,9 +198,13 @@ mod official_cell_measurement_tests {
     use super::*;
 
     fn original_measurement() -> Result<(OatConfig, RunInventory, Vec<OatResult>)> {
-        let mut config: OatConfig = serde_json::from_str(include_str!(
+        let config: OatConfig = serde_json::from_str(include_str!(
             "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
         ))?;
+        original_measurement_for_config(config, "c0ffee00-0000-4000-8000-000000000004")
+    }
+
+    fn original_measurement_for_config(mut config: OatConfig, orchestration_id: &str) -> Result<(OatConfig, RunInventory, Vec<OatResult>)> {
         config.tables.truncate(1);
         let identity = CampaignIdentity {
             campaign_id: "c0ffee00-0000-4000-8000-000000000001".to_owned(),
@@ -180,7 +213,7 @@ mod official_cell_measurement_tests {
         };
         let cell = "c0ffee00-0000-4000-8000-000000000003";
         let inventory = initial_campaign_inventory(
-            &identity, "c0ffee00-0000-4000-8000-000000000004", cell,
+            &identity, orchestration_id, cell,
             &format!("oat-{}", cell.replace('-', "")), "arrowcollector12345", "checkpoints",
             CampaignCellBudget {
                 effective_stop_budgets: config.maintenance_stop_budget()?,
@@ -202,10 +235,83 @@ mod official_cell_measurement_tests {
         Ok((config, inventory, rows))
     }
 
+    #[tokio::test]
+    async fn submitted_identity_is_captured_once_from_the_exact_server_run_and_published_immutably() -> Result<()> {
+        let external = std::env::var_os("OAT_OFFLINE_RAW_SUBMISSION_FIXTURE");
+        let cases: Vec<Value> = if let Some(path) = &external {
+            serde_json::from_slice(&fs::read(path)?)?
+        } else {
+            let raw = include_str!("../../../docs/experiments/arrowcol-oat/oat-config.quick.json");
+            vec![json!({
+                "submitted_config_body": raw,
+                "post": {"id": "c0ffee00-0000-4000-8000-000000000004", "config_sha256": fixture_sha256(raw.as_bytes())},
+                "get": {"id": "c0ffee00-0000-4000-8000-000000000004", "config_sha256": fixture_sha256(raw.as_bytes())},
+            })]
+        };
+        assert!(!cases.is_empty());
+        let mut proofs = Vec::new();
+        for case in cases {
+            let raw = case["submitted_config_body"].as_str().context("missing exact submitted body")?;
+            let id = case["post"]["id"].as_str().context("missing actual server run id")?;
+            let server_sha = case["post"]["config_sha256"].as_str().context("missing server hash")?;
+            assert_eq!(case["get"]["id"], id);
+            assert_eq!(case["get"]["config_sha256"], server_sha);
+            assert_eq!(fixture_sha256(raw.as_bytes()), server_sha);
+            let submitted: OatConfig = serde_json::from_str(raw)?;
+            submitted.validate()?;
+            let (config, inventory, mut rows) = original_measurement_for_config(submitted, id)?;
+            rows[0].git_sha = std::env::var("GIT_SHA").unwrap_or_else(|_| "unknown".to_owned());
+            let state = AppState::default();
+            assert!(capture_submitted_config_identity(&state, id).await.is_none());
+            state.runs.lock().await.insert(id.to_owned(), crate::model::RunStatus {
+                id: id.to_owned(), config_sha256: server_sha.to_owned(), state: crate::model::RunState::Running,
+                progress: "synthetic offline original-cell proof".to_owned(), result_count: 0,
+                error: None, started_at_unix_ms: 1_000, finished_at_unix_ms: None,
+            });
+            let identity = capture_submitted_config_identity(&state, id).await.context("missing captured identity")?;
+            assert!(capture_submitted_config_identity(&state, &inventory.cell_run_id).await.is_none());
+            {
+                let mut runs = state.runs.lock().await;
+                let status = runs.get_mut(id).context("missing original status")?;
+                status.id = inventory.cell_run_id.clone();
+            }
+            assert!(capture_submitted_config_identity(&state, id).await.is_none());
+            for malformed in ["", "not-a-hash", &"A".repeat(64)] {
+                let mut runs = state.runs.lock().await;
+                let status = runs.get_mut(id).context("missing original status")?;
+                status.id = id.to_owned();
+                status.config_sha256 = malformed.to_owned();
+                drop(runs);
+                assert!(capture_submitted_config_identity(&state, id).await.is_none());
+            }
+            let bytes = official_measurement_bytes(&inventory, &config, &rows, Some(&identity))?;
+            let payload: Value = serde_json::from_slice(&bytes)?;
+            assert_eq!(payload["submitted_config_sha256"], server_sha);
+            assert_ne!(payload["effective_config_sha256"], server_sha);
+            let mut foreign = identity.clone();
+            foreign.orchestration_run_id = inventory.cell_run_id.clone();
+            let refused: Value = serde_json::from_slice(&official_measurement_bytes(&inventory, &config, &rows, Some(&foreign))?)?;
+            assert!(refused["submitted_config_sha256"].is_null());
+            let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+            let path = ObjectPath::from(official_measurement_blob(&inventory)?);
+            publish_immutable_official_bytes(Arc::clone(&store), &path, &bytes).await?;
+            let retained = store.get_opts(&path, GetOptions::default()).await?.bytes().await?;
+            assert_eq!(retained.as_ref(), bytes);
+            let other: Value = serde_json::from_slice(&official_measurement_bytes(&inventory, &config, &rows, None)?)?;
+            assert!(publish_immutable_official_bytes(store, &path, fixture_canonical_json(&other)?.as_bytes()).await.is_err());
+            proofs.push(json!({ "submitted_config_body": raw, "official_measurement_utf8": String::from_utf8(bytes)? }));
+        }
+        println!("D46_RAW_IDENTITY_PRODUCER_BYTES {}", serde_json::to_string(&json!({
+            "fixture_source": if external.is_some() { "retained_loopback_post_get" } else { "synthetic_state_invariant" },
+            "cases": proofs,
+        }))?);
+        Ok(())
+    }
+
     #[test]
     fn official_producer_retains_the_original_window_and_missing_submitted_identity() -> Result<()> {
         let (mut config, inventory, rows) = original_measurement()?;
-        let bytes = official_measurement_bytes(&inventory, &config, &rows)?;
+        let bytes = official_measurement_bytes(&inventory, &config, &rows, None)?;
         let payload: Value = serde_json::from_slice(&bytes)?;
         let original: Value = serde_json::from_str(rows[0].evidence_json.as_deref().context("missing evidence")?)?;
         assert_eq!(payload["official_result"]["evidence"]["commit_window_output_throughput"], original["commit_window_output_throughput"]);
@@ -213,11 +319,11 @@ mod official_cell_measurement_tests {
         let effective = payload["effective_config_json"].as_str().context("missing effective config")?;
         assert_eq!(payload["effective_config_sha256"], fixture_sha256(effective.as_bytes()));
         config.schedule_lead_seconds += 1;
-        let changed: Value = serde_json::from_slice(&official_measurement_bytes(&inventory, &config, &rows)?)?;
+        let changed: Value = serde_json::from_slice(&official_measurement_bytes(&inventory, &config, &rows, None)?)?;
         assert_ne!(payload["effective_config_sha256"], changed["effective_config_sha256"]);
         let mut wrong = inventory;
         wrong.cell_run_id = "c0ffee00-0000-4000-8000-000000000099".to_owned();
-        assert!(official_measurement_bytes(&wrong, &config, &rows).is_err());
+        assert!(official_measurement_bytes(&wrong, &config, &rows, None).is_err());
         println!("D46_OFFICIAL_PRODUCER_BYTES {}", String::from_utf8(bytes)?);
         Ok(())
     }
@@ -225,7 +331,7 @@ mod official_cell_measurement_tests {
     #[tokio::test]
     async fn official_publication_is_create_only_and_never_adopts_different_bytes() -> Result<()> {
         let (config, inventory, rows) = original_measurement()?;
-        let bytes = official_measurement_bytes(&inventory, &config, &rows)?;
+        let bytes = official_measurement_bytes(&inventory, &config, &rows, None)?;
         let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
         let path = ObjectPath::from(official_measurement_blob(&inventory)?);
         let first = publish_immutable_official_bytes(Arc::clone(&store), &path, &bytes).await?;
@@ -257,6 +363,7 @@ struct CellEvidence {
     overload_stop: Option<Value>,
     downstream_comment: Option<String>,
     qap_observation: Option<Value>,
+    native_telemetry: Option<Value>,
     resource_samples: Vec<ResourceSample>,
     resource_sampling_failures: u64,
     resource_samples_dropped: u64,
@@ -674,6 +781,7 @@ impl CellEvidence {
             "downstream_status": if self.downstream_comment.is_some() { "unavailable" } else { "observed_or_not_attempted" },
             "downstream_comment": self.downstream_comment,
             "qap_observation": self.qap_observation,
+            "native_telemetry": self.native_telemetry,
             "resources": {
                 "scope": "collector_fleet_measurement_window_only",
                 "cpu_summary": "arithmetic_mean_of_observed_samples",
@@ -728,11 +836,277 @@ impl CellEvidence {
 #[derive(Clone)]
 enum ResourceSamplerSource {
     Aks,
+    AksNative(Arc<NativeTelemetrySource>),
     Local {
         run_id: String,
         environment: HashMap<String, String>,
         collector_metrics_url: Option<String>,
     },
+}
+
+#[derive(Clone)]
+struct NativeTelemetrySource {
+    server: String,
+    context: Option<String>,
+    targets: Vec<AksResourcePodTarget>,
+    qap_endpoint: String,
+    qap_database: String,
+    qap_tables: Vec<String>,
+    results: PathBuf,
+    binding: Value,
+}
+
+const NATIVE_TELEMETRY_INTERVAL_MS: u64 = 10_000;
+const NATIVE_TELEMETRY_MAX_SAMPLES: usize = 1024;
+
+async fn read_native_stream(
+    mut reader: impl tokio::io::AsyncRead + Unpin,
+    retained: Arc<std::sync::atomic::AtomicUsize>,
+    limit: usize,
+) -> Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(limit.min(8192));
+    let mut chunk = vec![0; limit.clamp(1, 8192)];
+    loop {
+        let length = reader.read(&mut chunk).await.context("read bounded native source stream")?;
+        if length == 0 {
+            return Ok(bytes);
+        }
+        let previous = retained.fetch_add(length, std::sync::atomic::Ordering::AcqRel);
+        anyhow::ensure!(length <= limit.saturating_sub(previous), "native source exceeded its byte bound");
+        bytes.extend_from_slice(&chunk[..length]);
+    }
+}
+
+async fn bounded_native_child_output(mut child: Child, limit: usize) -> Result<std::process::Output> {
+    let stdout = child.stdout.take().context("native child stdout is not piped")?;
+    let stderr = child.stderr.take().context("native child stderr is not piped")?;
+    let retained = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let stderr_retained = Arc::clone(&retained);
+    let (status, stdout, stderr) = tokio::try_join!(
+        child.wait(),
+        async move { read_native_stream(stdout, retained, limit).await.map_err(std::io::Error::other) },
+        async move { read_native_stream(stderr, stderr_retained, limit).await.map_err(std::io::Error::other) },
+    ).context("bounded native child failed")?;
+    Ok(std::process::Output { status, stdout, stderr })
+}
+
+async fn read_native_file(path: &Path, limit: usize) -> Result<Vec<u8>> {
+    read_native_stream(tokio::fs::File::open(path).await?,
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)), limit).await
+}
+
+fn native_time_ns(value: &Value) -> Option<String> {
+    DateTime::parse_from_rfc3339(value.as_str()?).ok()?.timestamp_nanos_opt()
+        .filter(|value| *value > 0).map(|value| value.to_string())
+}
+
+fn native_counter(value: &Value) -> Option<String> {
+    value.as_u64().map(|value| value.to_string())
+}
+
+fn native_container_id<'a>(pod: &'a Value, container: &str) -> Option<&'a str> {
+    let mut statuses = pod.pointer("/status/containerStatuses")?.as_array()?.iter()
+        .filter(|status| status["name"] == container);
+    let id = statuses.next()?["containerID"].as_str().filter(|id| !id.is_empty())?;
+    if statuses.next().is_some() { None } else { Some(id) }
+}
+
+fn native_pod_sample(target: &AksResourcePodTarget, namespace: &str, pod: &Value, summary: &Value) -> Result<Value> {
+    anyhow::ensure!(
+        pod.pointer("/metadata/name").and_then(Value::as_str) == Some(&target.pod)
+            && pod.pointer("/metadata/namespace").and_then(Value::as_str) == Some(namespace)
+            && pod.pointer("/metadata/uid").and_then(Value::as_str) == Some(&target.uid)
+            && pod.pointer("/spec/nodeName").and_then(Value::as_str) == Some(&target.node)
+            && pod.pointer("/metadata/deletionTimestamp").is_none()
+            && summary.pointer("/node/nodeName").and_then(Value::as_str) == Some(&target.node),
+        "native pod/node identity is missing or changed"
+    );
+    let unique = |values: Option<&Vec<Value>>, name: &str| -> Result<Value> {
+        let selected = values.into_iter().flatten().filter(|value| value["name"] == name).collect::<Vec<_>>();
+        let [value] = selected.as_slice() else { bail!("native container identity is missing or ambiguous") };
+        Ok((*value).clone())
+    };
+    let spec = unique(pod.pointer("/spec/containers").and_then(Value::as_array), &target.container)?;
+    let status = unique(pod.pointer("/status/containerStatuses").and_then(Value::as_array), &target.container)?;
+    let container_id = status["containerID"].as_str().filter(|id| !id.is_empty())
+        .context("native container ID unavailable")?;
+    anyhow::ensure!(target.container_id.as_deref() == Some(container_id),
+        "native container ID differs from the original already-observed pod readback");
+    let summaries = summary["pods"].as_array().context("native pod summaries unavailable")?
+        .iter().filter(|entry| entry["podRef"]["uid"] == target.uid && entry["podRef"]["name"] == target.pod
+            && entry["podRef"]["namespace"] == namespace).collect::<Vec<_>>();
+    let [pod_summary] = summaries.as_slice() else { bail!("native summary pod UID is missing or ambiguous") };
+    let container = unique(pod_summary["containers"].as_array(), &target.container)?;
+    let started = native_time_ns(&container["startTime"]).context("native summary container start time unavailable")?;
+    anyhow::ensure!(
+        status.pointer("/state/running/startedAt").or_else(|| status.pointer("/state/terminated/startedAt"))
+            .and_then(native_time_ns).as_deref() == Some(&started),
+        "native container ID/start-time binding is unavailable or changed"
+    );
+    Ok(json!({
+        "identity": {"role": target.role, "namespace": namespace, "pod": target.pod, "uid": target.uid,
+            "node": target.node, "container": target.container, "container_id": container_id, "started_unix_ns": started},
+        "limits": spec.pointer("/resources/limits"),
+        "cpu": {"time_unix_ns": native_time_ns(&container["cpu"]["time"]), "time_resolution_ns": "1000000000",
+            "usage_core_nanoseconds": native_counter(&container["cpu"]["usageCoreNanoSeconds"])},
+        "memory": {"time_unix_ns": native_time_ns(&container["memory"]["time"]), "time_resolution_ns": "1000000000",
+            "working_set_bytes": native_counter(&container["memory"]["workingSetBytes"])},
+        "network": {"time_unix_ns": native_time_ns(&pod_summary["network"]["time"]), "time_resolution_ns": "1000000000",
+            "rx_bytes": native_counter(&pod_summary["network"]["rxBytes"]),
+            "tx_bytes": native_counter(&pod_summary["network"]["txBytes"]),
+            "scope": "pod_network_not_container_or_link_capacity"},
+        "throttling": {"value": null, "unavailable_reason": "existing_cadvisor_has_no_original_window_uid_container_id_source_timestamp_binding"},
+    }))
+}
+
+fn native_cfs_sample(target: &AksResourcePodTarget, namespace: &str, metrics: &str) -> Result<Value> {
+    let container_id = target.container_id.as_deref().context("original container ID unavailable")?;
+    let (runtime, hash) = container_id.split_once("://").context("container runtime ID unavailable")?;
+    anyhow::ensure!(hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "container runtime hash unavailable");
+    let scope_prefix = match runtime {
+        "containerd" => "cri-containerd-", "docker" => "docker-", "cri-o" => "crio-",
+        _ => bail!("unrecognized container runtime cgroup binding"),
+    };
+    let pod_group = format!("pod{}", target.uid);
+    let systemd_pod = format!("-pod{}.slice", target.uid.replace('-', "_"));
+    let scope = format!("{scope_prefix}{hash}.scope");
+    let mut found = BTreeMap::new();
+    for line in metrics.lines() {
+        let Some((name, sample)) = line.split_once('{') else { continue };
+        if !matches!(name, "container_cpu_cfs_periods_total" | "container_cpu_cfs_throttled_periods_total") { continue; }
+        let (labels, values) = sample.rsplit_once('}').context("malformed native cAdvisor sample")?;
+        let labels = parse_metric_labels(labels)?;
+        if labels.get("namespace").map(String::as_str) != Some(namespace)
+            || labels.get("pod").map(String::as_str) != Some(&target.pod)
+            || labels.get("container").map(String::as_str) != Some(&target.container) { continue; }
+        let id = labels.get("id").context("native cAdvisor cgroup identity unavailable")?;
+        let groups = id.split('/').filter(|group| !group.is_empty()).collect::<Vec<_>>();
+        anyhow::ensure!(
+            groups.iter().any(|group| *group == pod_group || group.ends_with(&systemd_pod))
+                && groups.last().is_some_and(|group| *group == hash || *group == scope),
+            "native cAdvisor cgroup does not match the original pod UID and container ID"
+        );
+        let fields = values.split_whitespace().collect::<Vec<_>>();
+        anyhow::ensure!(fields.len() == 2, "native cAdvisor counter has no explicit source timestamp");
+        let count = fields[0].parse::<f64>()?;
+        anyhow::ensure!(count.is_finite() && count >= 0.0 && count.fract() == 0.0
+            && count <= 9_007_199_254_740_991.0, "native cAdvisor counter is not an exact bounded integer");
+        let timestamp = fields[1].parse::<u64>()?.checked_mul(1_000_000)
+            .filter(|value| *value > 0).context("native cAdvisor source timestamp invalid")?;
+        anyhow::ensure!(found.insert(name, (count as u64, timestamp)).is_none(), "native cAdvisor counter is ambiguous");
+    }
+    let (periods, timestamp) = found.get("container_cpu_cfs_periods_total").context("native CPU periods unavailable")?;
+    let (throttled, throttled_timestamp) = found.get("container_cpu_cfs_throttled_periods_total")
+        .context("native throttled CPU periods unavailable")?;
+    anyhow::ensure!(timestamp == throttled_timestamp && throttled <= periods,
+        "native cAdvisor timestamps or counter values are inconsistent");
+    Ok(json!({"time_unix_ns": timestamp.to_string(), "time_resolution_ns": "1000000", "periods": periods.to_string(),
+        "throttled_periods": throttled.to_string()}))
+}
+
+async fn native_kubernetes_text(config: &OatConfig, source: &NativeTelemetrySource, args: Vec<&str>) -> Result<String> {
+    let context = source.context.as_deref().context("native source has no explicit selected kube context")?;
+    anyhow::ensure!(config.kubectl_context.as_deref() == Some(context), "native selected kube context changed");
+    let mut exact = vec!["--server", &source.server, "--insecure-skip-tls-verify=false"];
+    exact.extend(args);
+    kubectl_with_output_bound(config, exact, None, Some(OFFICIAL_MEASUREMENT_MAX_BYTES)).await
+}
+
+async fn native_kubernetes_get(config: &OatConfig, source: &NativeTelemetrySource, args: Vec<&str>) -> Result<Value> {
+    let body = native_kubernetes_text(config, source, args).await?;
+    serde_json::from_str(&body).context("native Kubernetes source is not valid JSON")
+}
+
+async fn run_native_observation<F, O>(observe: F) -> Result<Value>
+where
+    F: FnOnce(Duration) -> O + Send + 'static,
+    O: std::future::Future<Output = Result<Value>>,
+{
+    let deadline = std::time::Instant::now() + PUBLICATION_BACKLOG_REQUEST_TIMEOUT;
+    let (_cancel, mut cancelled) = watch::channel(());
+    tokio::task::spawn_blocking(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        anyhow::ensure!(!remaining.is_zero(), "native QAP original sample deadline expired before dispatch");
+        runtime.block_on(async {
+            tokio::select! {
+                biased;
+                _ = cancelled.changed() => bail!("native QAP source capture cancelled"),
+                observation = observe(remaining) => observation,
+            }
+        })
+    }).await.context("join existing native QAP observation runtime")?
+}
+
+async fn capture_native_telemetry(source: &Arc<NativeTelemetrySource>, config: &OatConfig) -> Result<Value> {
+    let started = unix_time_ms_u64()?;
+    let qap = async {
+        tokio::fs::create_dir_all(&source.results).await?;
+        let observer = Arc::clone(source);
+        let observation = run_native_observation(move |remaining| async move {
+            arrowcol_loadgen::observe_qap_with_mode(
+                &observer.qap_endpoint, &observer.results, arrowcol_loadgen::ObservationMode::Azure,
+                &observer.qap_database, &observer.qap_tables, remaining,
+            ).await
+        }).await?;
+        Ok::<_, anyhow::Error>(json!({
+            "observed_unix_ms": observation["observed_unix_ms"],
+            "tables": source.qap_tables.iter().map(|name| {
+                let table = &observation["tables"][name];
+                (name.clone(), json!({"available": table["available"], "statistics": table["statistics"],
+                    "state": table["state"]}))
+            }).collect::<BTreeMap<_, _>>(),
+        }))
+    };
+    let kubernetes = async {
+        let nodes = source.targets.iter().map(|target| target.node.clone()).collect::<BTreeSet<_>>();
+        let summaries = join_all(nodes.iter().map(|node| async move {
+            if node.is_empty() || !node.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.')) {
+                return (node.clone(), (None, None));
+            }
+            let path = format!("/api/v1/nodes/{node}/proxy/stats/summary");
+            let cadvisor_path = format!("/api/v1/nodes/{node}/proxy/metrics/cadvisor");
+            let (summary, cadvisor) = tokio::join!(
+                native_kubernetes_get(config, source, vec!["get", "--raw", &path, "--request-timeout=3s"]),
+                native_kubernetes_text(config, source, vec!["get", "--raw", &cadvisor_path, "--request-timeout=3s"]),
+            );
+            (node.clone(), (summary.ok(), cadvisor.ok()))
+        })).await.into_iter().collect::<HashMap<_, _>>();
+        join_all(source.targets.iter().map(|target| {
+            let summaries = &summaries;
+            async move {
+                let observation = async {
+                    let summary = summaries.get(&target.node).and_then(|(summary, _)| summary.as_ref())
+                        .context("native exact-node summary unavailable")?;
+                    let pod = native_kubernetes_get(config, source, vec!["get", "pod", &target.pod,
+                        "--namespace", &config.namespace, "-o", "json", "--request-timeout=3s"]).await?;
+                    let mut sample = native_pod_sample(target, &config.namespace, &pod, summary)?;
+                    if let Some((_, Some(metrics))) = summaries.get(&target.node) {
+                        sample["throttling"] = native_cfs_sample(target, &config.namespace, metrics)
+                            .unwrap_or_else(|_| json!({"value": null,
+                                "unavailable_reason": "native_cadvisor_source_timestamp_or_exact_cgroup_binding_unavailable"}));
+                    }
+                    Ok::<_, anyhow::Error>(sample)
+                }.await;
+                observation.unwrap_or_else(|_| json!({
+                    "identity": target, "unavailable_reason": "native_exact_pod_identity_credentials_or_summary_unavailable"
+                }))
+            }
+        })).await
+    };
+    let (qap, pods) = tokio::join!(
+        tokio::time::timeout(PUBLICATION_BACKLOG_REQUEST_TIMEOUT, qap),
+        tokio::time::timeout(PUBLICATION_BACKLOG_REQUEST_TIMEOUT, kubernetes),
+    );
+    Ok(json!({
+        "request_start_unix_ms": started, "request_end_unix_ms": unix_time_ms_u64()?,
+        "qap": qap.ok().and_then(Result::ok)
+            .unwrap_or_else(|| json!({"unavailable_reason": "native_qap_observation_unavailable"})),
+        "pods": pods.unwrap_or_else(|_| source.targets.iter().map(|target| json!({
+            "identity": target, "unavailable_reason": "native_exact_kubernetes_observation_deadline_expired"
+        })).collect::<Vec<_>>()),
+    }))
 }
 
 struct ResourceSampler {
@@ -746,7 +1120,7 @@ const PUBLICATION_BACKLOG_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 
 async fn sample_resources(source: &ResourceSamplerSource, config: &OatConfig) -> Result<ResourceMetrics> {
     match source {
-        ResourceSamplerSource::Aks => collect_aks_metrics(config).await,
+        ResourceSamplerSource::Aks | ResourceSamplerSource::AksNative(_) => collect_aks_metrics(config).await,
         ResourceSamplerSource::Local { run_id, environment, .. } => collect_local_metrics(config, run_id, environment).await,
     }
 }
@@ -770,6 +1144,10 @@ impl Drop for ResourceSampler {
 impl ResourceSampler {
     fn start(source: Option<ResourceSamplerSource>, config: OatConfig, start: u64, end: u64,
         prepared: Option<PreparedGuard>) -> Self {
+        let native = match &source {
+            Some(ResourceSamplerSource::AksNative(native)) => Some(Arc::clone(native)),
+            _ => None,
+        };
         let (signal, receiver) = watch::channel(if prepared.is_some() {
             GuardSignal::Monitoring
         } else {
@@ -782,6 +1160,11 @@ impl ResourceSampler {
                     backlog_scrape_configured: true,
                     ..Default::default()
                 };
+                let mut native_samples = Vec::new();
+                let mut native_failures = 0_u64;
+                let mut native_dropped = 0_u64;
+                let mut native_tasks = tokio::task::JoinSet::<Result<Value>>::new();
+                let mut last_native = None;
                 let (backlog_scraper, mut guard) = if let Some(prepared) = prepared {
                     (Some(prepared.scraper), Some((prepared.probe, prepared.engine)))
                 } else {
@@ -802,8 +1185,27 @@ impl ResourceSampler {
                         _ = stop_receiver.changed() => break,
                     }
                     let now = unix_time_ms_u64()?;
+                    while let Some(sample) = native_tasks.try_join_next() {
+                        match sample {
+                            Ok(Ok(sample)) if native_samples.len() < NATIVE_TELEMETRY_MAX_SAMPLES => native_samples.push(sample),
+                            Ok(Ok(_)) => native_dropped += 1,
+                            _ => native_failures += 1,
+                        }
+                    }
                     if now >= end && guard.is_none() {
                         break;
+                    }
+                    if let Some(source) = &native
+                        && now.saturating_add(NATIVE_TELEMETRY_INTERVAL_MS) >= start
+                            && last_native.is_none_or(|last| now.saturating_sub(last) >= NATIVE_TELEMETRY_INTERVAL_MS)
+                            && native_tasks.is_empty()
+                        {
+                            last_native = Some(now);
+                            let source = Arc::clone(source);
+                            let config = config.clone();
+                            native_tasks.spawn(async move {
+                                capture_native_telemetry(&source, &config).await
+                            });
                     }
                     if now < start && guard.is_none() {
                         continue;
@@ -930,6 +1332,30 @@ impl ResourceSampler {
                     }
                 }
                 evidence.resource_sampling_failures += resource_tasks.len() as u64;
+                if let Some(source) = native {
+                    native_failures += native_tasks.len() as u64;
+                    native_tasks.abort_all();
+                    while native_tasks.join_next().await.is_some() {}
+                    let stopped = *stop_receiver.borrow() || matches!(&*signal.borrow(), GuardSignal::Stop(_));
+                    if unix_time_ms_u64()? >= end && !stopped
+                    {
+                        match capture_native_telemetry(&source, &config).await {
+                            Ok(sample) if native_samples.len() < NATIVE_TELEMETRY_MAX_SAMPLES => native_samples.push(sample),
+                            Ok(_) => native_dropped += 1,
+                            Err(_) => native_failures += 1,
+                        }
+                    }
+                    evidence.native_telemetry = Some(json!({
+                        "schema_version": 1, "scope": "original_cell_source_observations_not_scale_authorization",
+                        "binding": source.binding, "pod_targets": source.targets,
+                        "window_start_unix_ms": start, "window_end_unix_ms": end,
+                        "cadence_ms": NATIVE_TELEMETRY_INTERVAL_MS, "sample_timeout_ms": 3000,
+                        "samples": native_samples, "sampling_failures": native_failures,
+                        "samples_dropped": native_dropped,
+                        "throttling_scope": "explicit_native_cadvisor_source_timestamps_and_exact_pod_uid_container_id_only_not_legacy_whole_load_ratio",
+                        "network_saturation_unavailable_reason": "native_pod_network_has_no_authenticated_link_capacity",
+                    }));
+                }
                 if let Some((_, engine)) = guard {
                     evidence.overload_guard = Some(engine.proof);
                     evidence.overload_stop = engine.stop;
@@ -968,6 +1394,9 @@ impl ResourceSampler {
                 evidence.overload_stop = sampled.overload_stop;
             }
             evidence.resource_samples = sampled.resource_samples;
+            if sampled.native_telemetry.is_some() {
+                evidence.native_telemetry = sampled.native_telemetry;
+            }
             evidence.resource_sampling_failures = sampled.resource_sampling_failures;
             evidence.resource_samples_dropped = sampled.resource_samples_dropped;
             evidence.backlog_scrape_configured = sampled.backlog_scrape_configured;
@@ -982,6 +1411,148 @@ impl ResourceSampler {
 #[cfg(test)]
 mod measurement_evidence_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn native_observation_runtime_cancels_pending_source_when_sampler_is_dropped() -> Result<()> {
+        struct NotifyDrop(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for NotifyDrop {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() { let _ = sender.send(()); }
+            }
+        }
+        let (ready, started) = tokio::sync::oneshot::channel();
+        let (dropped, observed_drop) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(run_native_observation(move |remaining| async move {
+            assert!(remaining <= PUBLICATION_BACKLOG_REQUEST_TIMEOUT);
+            let _guard = NotifyDrop(Some(dropped));
+            ready.send(()).map_err(|_| anyhow::anyhow!("source start receiver closed"))?;
+            std::future::pending::<Result<Value>>().await
+        }));
+        tokio::time::timeout(Duration::from_secs(2), started).await??;
+        task.abort();
+        assert!(task.await.err().context("aborted observer must cancel")?.is_cancelled());
+        tokio::time::timeout(Duration::from_secs(2), observed_drop).await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_child_cap_counts_combined_raw_bytes_before_utf8_and_exit() -> Result<()> {
+        for limit in [2, 3] {
+            let child = Command::new("sh").args(["-c", "printf '\\303\\251'; printf x >&2"])
+                .stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true).spawn()?;
+            let output = bounded_native_child_output(child, limit).await;
+            if limit == 3 {
+                let output = output?;
+                assert!(output.status.success());
+                assert_eq!(output.stdout, [0xc3, 0xa9]);
+                assert_eq!(output.stderr, b"x");
+            } else {
+                assert!(format!("{:#}", output.err().context("oversized child must fail")?).contains("byte bound"));
+            }
+        }
+        let child = Command::new("sh").args(["-c", "printf 12345; printf 67890 >&2; exit 0"])
+            .stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true).spawn()?;
+        assert!(bounded_native_child_output(child, 9).await.is_err(), "a successful process exit cannot hide overflow");
+        Ok(())
+    }
+
+    #[test]
+    fn native_cfs_requires_source_timestamps_and_exact_cgroup_uid_and_container_hash() -> Result<()> {
+        let hash = "a".repeat(64);
+        let target = AksResourcePodTarget {
+            role: "collector".to_owned(), pod: "collector-pod".to_owned(), uid: "pod-uid".to_owned(),
+            container: "collector".to_owned(), node: "node-1".to_owned(),
+            container_id: Some(format!("containerd://{hash}")),
+        };
+        let sample = |timestamp: &str, uid: &str, hash: &str| format!(
+            "container_cpu_cfs_periods_total{{namespace=\"oat\",pod=\"collector-pod\",container=\"collector\",id=\"/kubepods/pod{uid}/{hash}\",extra=\"escaped,comma\"}} 100{timestamp}\n\
+             container_cpu_cfs_throttled_periods_total{{namespace=\"oat\",pod=\"collector-pod\",container=\"collector\",id=\"/kubepods/pod{uid}/{hash}\"}} 10{timestamp}\n"
+        );
+        let valid = sample(" 1767225660123", &target.uid, &hash);
+        let observed = native_cfs_sample(&target, "oat", &valid)?;
+        assert_eq!(observed["time_unix_ns"], "1767225660123000000");
+        assert_eq!(observed["periods"], "100");
+        for invalid in [sample("", &target.uid, &hash), sample(" 1767225660123", "other-uid", &hash),
+            sample(" 1767225660123", &target.uid, &"b".repeat(64)), format!("{valid}{valid}")] {
+            assert!(native_cfs_sample(&target, "oat", &invalid).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_pod_source_binds_uid_node_container_epoch_and_exact_large_counters() -> Result<()> {
+        let target = AksResourcePodTarget {
+            role: "collector".to_owned(), pod: "collector-pod".to_owned(), uid: "pod-uid".to_owned(),
+            container: "collector".to_owned(), node: "node-1".to_owned(),
+            container_id: Some("containerd://original".to_owned()),
+        };
+        let pod = json!({
+            "metadata": {"name": "collector-pod", "namespace": "oat", "uid": "pod-uid"},
+            "spec": {"nodeName": "node-1", "containers": [{"name": "collector", "resources": {"limits": {"cpu": "2", "memory": "1Gi"}}}]},
+            "status": {"containerStatuses": [{"name": "collector", "containerID": "containerd://original",
+                "state": {"running": {"startedAt": "2026-01-01T00:00:00Z"}}}]},
+        });
+        let summary = json!({
+            "node": {"nodeName": "node-1"}, "pods": [{
+                "podRef": {"uid": "pod-uid", "name": "collector-pod", "namespace": "oat"},
+                "containers": [{"name": "collector", "startTime": "2026-01-01T00:00:00Z",
+                    "cpu": {"time": "2026-01-01T00:01:00.123456789Z", "usageCoreNanoSeconds": 9_007_199_254_740_993_u64},
+                    "memory": {"time": "2026-01-01T00:01:00.123456789Z", "workingSetBytes": 123}}],
+                "network": {"time": "2026-01-01T00:01:00.123456789Z", "rxBytes": 345, "txBytes": 678},
+            }],
+        });
+        let observed = native_pod_sample(&target, "oat", &pod, &summary)?;
+        assert_eq!(observed["cpu"]["usage_core_nanoseconds"], "9007199254740993");
+        assert_eq!(observed["cpu"]["time_unix_ns"], "1767225660123456789");
+        assert!(observed["throttling"]["value"].is_null());
+        for pointer in ["/metadata/uid", "/spec/nodeName", "/status/containerStatuses/0/containerID",
+            "/status/containerStatuses/0/state/running/startedAt"] {
+            let mut changed = pod.clone();
+            *changed.pointer_mut(pointer).context("fixture field")? = json!("changed");
+            assert!(native_pod_sample(&target, "oat", &changed, &summary).is_err(), "{pointer}");
+        }
+        let mut changed = summary.clone();
+        changed["pods"][0]["podRef"]["uid"] = json!("other-pod");
+        assert!(native_pod_sample(&target, "oat", &pod, &changed).is_err());
+        let mut missing = target.clone();
+        missing.container_id = None;
+        assert!(native_pod_sample(&missing, "oat", &pod, &summary).is_err());
+        let start = 1_800_000_000_000_i64 - 60_000;
+        let namespace = "synthetic-offline-c0ffee00000040008000000000000003";
+        let mut native_target = target.clone();
+        native_target.uid = "synthetic-pod-uid".to_owned();
+        native_target.node = "synthetic-node".to_owned();
+        native_target.container_id = Some(format!("containerd://{}", "a".repeat(64)));
+        let mut native_pod = pod.clone();
+        native_pod["metadata"]["namespace"] = json!(namespace);
+        native_pod["metadata"]["uid"] = json!(native_target.uid);
+        native_pod["spec"]["nodeName"] = json!(native_target.node);
+        native_pod["status"]["containerStatuses"][0]["containerID"] = json!(native_target.container_id);
+        let mut native_summary = summary.clone();
+        native_summary["node"]["nodeName"] = json!(native_target.node);
+        native_summary["pods"][0]["podRef"]["namespace"] = json!(namespace);
+        native_summary["pods"][0]["podRef"]["uid"] = json!(native_target.uid);
+        let mut produced = Vec::new();
+        for (index, at) in [start - 1000, start + 9000, start + 19_000, start + 31_000].into_iter().enumerate() {
+            let time = DateTime::from_timestamp_millis(at + 50).context("synthetic native timestamp")?
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+            native_summary["pods"][0]["containers"][0]["cpu"]["time"] = json!(time);
+            native_summary["pods"][0]["containers"][0]["cpu"]["usageCoreNanoSeconds"] =
+                json!(9_007_199_254_740_993_u64 + (at + 50 - start + 1000) as u64 * 2_000_000);
+            native_summary["pods"][0]["containers"][0]["memory"] = json!({"time":time,"workingSetBytes":1_000_000_000});
+            native_summary["pods"][0]["network"] = json!({"time":time,
+                "rxBytes":(at + 50 - start + 1000) as u64 * 1000,"txBytes":(at + 50 - start + 1000) as u64 * 2000});
+            let mut observed = native_pod_sample(&native_target, namespace, &native_pod, &native_summary)?;
+            let labels = format!("namespace=\"{namespace}\",pod=\"collector-pod\",container=\"collector\",id=\"/kubepods/pod{}/{}\"",
+                native_target.uid, "a".repeat(64));
+            let metrics = format!("container_cpu_cfs_periods_total{{{labels}}} {} {}\ncontainer_cpu_cfs_throttled_periods_total{{{labels}}} {} {}\n",
+                1000 + index * 100, at + 50, 100 + index * 20, at + 50);
+            observed["throttling"] = native_cfs_sample(&native_target, namespace, &metrics)?;
+            produced.push(observed);
+        }
+        println!("D46_NATIVE_PRODUCER_PODS {}", serde_json::to_string(&produced)?);
+        Ok(())
+    }
 
     fn publication_backlog_exposition(available: u8, publications: &str, rows: &str, bytes: &str, age: &str, status: &str) -> String {
         format!(

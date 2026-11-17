@@ -471,8 +471,56 @@
         }
       ],
       "candidate_limit": 4
+    },
+    {
+      "id": "age-flush-policy",
+      "factor": "collector.batching.age_flush_policy",
+      "candidates": [
+        {
+          "id": "age-policy-immediate",
+          "overrides": {
+            "tunables": {
+              "collector": {
+                "batching": {
+                  "age_flush_policy": "immediate"
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "age-policy-drain_ready",
+          "overrides": {
+            "tunables": {
+              "collector": {
+                "batching": {
+                  "age_flush_policy": "drain_ready"
+                }
+              }
+            }
+          }
+        }
+      ],
+      "candidate_limit": 4
     }
   ],
+  "source_enum_coverage": {
+    "age_flush_policy": {
+      "path": "tunables.collector.batching.age_flush_policy",
+      "accepted": [
+        "immediate",
+        "drain_ready"
+      ],
+      "configured": [
+        "immediate",
+        "drain_ready"
+      ],
+      "baseline_requested": null,
+      "excluded": {},
+      "pending": [],
+      "status": "config-screened-not-runtime-qualified"
+    }
+  },
   "flush_age_semantics": {
     "requested_path": "tunables.collector.batching.max_age",
     "baseline_requested": "1s",
@@ -514,11 +562,11 @@
   "runnable": false,
   "config_validation": {
     "status": "config-validated",
-    "validator": "arrowcol-oat-rust --validate-config",
-    "source_sha": "95153097739bae15432a54e646b9b612f180812a",
+    "source_commit": "22c1490edd7479831916be701213061fa39fb7d4",
+    "validator_binary_sha256": "9c5bc506371ba533ade8bc3477be17ade82cda2a3139988d23cf3219f0706901",
     "baseline_count": 1,
-    "candidate_count": 20,
-    "pass_count": 21,
+    "candidate_count": 22,
+    "pass_count": 23,
     "fail_count": 0
   },
   "runtime_qualification": "unqualified"

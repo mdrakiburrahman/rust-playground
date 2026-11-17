@@ -21,7 +21,7 @@ const config = {
   stamp: '00000', namespace: 'arrow-collector', kubectl_context: 'arrow-collector-00000', subscriptionId,
   qap_database: 'experimentqap', tables: ['sqlserver_active_sessions'], replica_counts: [1], dfe_worker_concurrency: [8],
 };
-const status: OatRunStatus = { id: orchestration, state: 'succeeded', progress: 'published', result_count: 1, error: null };
+const status: OatRunStatus = { id: orchestration, config_sha256: null, state: 'succeeded', progress: 'published', result_count: 1, error: null };
 function row(overrides: Record<string, unknown> = {}) {
   return {
     schema_version: 2, run_id: cell, mode: 'aks', stamp: '00000',

@@ -83,7 +83,8 @@ function parseOfficialRun(value: unknown, field: string): OfficialRun {
   });
   if (value.mode !== 'local' && value.mode !== 'aks') throw new Error(field + ' mode must be local or aks');
   return {
-    status: { id: status.id, state, progress: status.progress, result_count: Number(status.result_count), error: status.error },
+    status: { id: status.id, config_sha256: typeof status.config_sha256 === 'string' && /^[0-9a-f]{64}$/.test(status.config_sha256) ? status.config_sha256 : null,
+      state, progress: status.progress, result_count: Number(status.result_count), error: status.error },
     rows: runRows,
     expectedSha: requiredText(value.expectedSha, field + ' expectedSha'),
     mode: value.mode,
