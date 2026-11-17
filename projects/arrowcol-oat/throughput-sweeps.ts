@@ -9,6 +9,7 @@ type GrpcCompression = 'none' | 'gzip' | 'zstd';
 type Comparison = {
   id: string; factor: string; candidates: Candidate[]; candidate_limit: number;
   matched_control?: string; comparison_family?: string;
+  comparison_type?: 'single-factor' | 'interaction-top-pick'; selection_prerequisite?: string;
 };
 type PendingCandidateSet = { id: string; factor: string; status: string; candidates: Candidate[] };
 type Cohort = { id: string; comparisons: Comparison[]; refinement?: JsonObject; pendingCandidateSets?: PendingCandidateSet[] };
@@ -125,10 +126,14 @@ const cohorts: Cohort[] = [
       (['gzip', 'zstd'] as const).map(codec => directionalGrpcCandidate('grpc-client-to-receiver-' + codec, codec, 'none')), 'grpc-direction'),
     compareWithControl('grpc-receiver-to-client', 'collector.limits.grpc_send_compression + transport.grpc_accept_compression', grpcNoneControl,
       (['gzip', 'zstd'] as const).map(codec => directionalGrpcCandidate('grpc-receiver-to-client-' + codec, 'none', codec)), 'grpc-direction'),
-    compareWithControl('grpc-mixed-directions', 'paired client-to-receiver and receiver-to-client compression', grpcNoneControl, [
-      directionalGrpcCandidate('grpc-mixed-request-gzip-response-zstd', 'gzip', 'zstd'),
-      directionalGrpcCandidate('grpc-mixed-request-zstd-response-gzip', 'zstd', 'gzip'),
-    ], 'grpc-direction'),
+    {
+      ...compareWithControl('grpc-mixed-directions', 'paired client-to-receiver and receiver-to-client compression', grpcNoneControl, [
+        directionalGrpcCandidate('grpc-mixed-request-gzip-response-zstd', 'gzip', 'zstd'),
+        directionalGrpcCandidate('grpc-mixed-request-zstd-response-gzip', 'zstd', 'gzip'),
+      ], 'grpc-direction'),
+      comparison_type: 'interaction-top-pick',
+      selection_prerequisite: 'Select the request and response codecs independently from the pure-direction top picks; do not score as single-factor evidence.',
+    },
   ] },
   { id: 'C6', comparisons: [
     compare('dfe-concurrency', 'dfe_worker_concurrency', [1, 2, 4, 8].map(value => candidate('dfe-' + value, {}, { dfe_worker_concurrency: [value] }))),
@@ -499,7 +504,9 @@ async function main(args: string[]): Promise<void> {
   let registryPath = resolve(root, 'docs/experiments/arrowcol-oat/oat-config.tuned.json');
   let outputDirectory = resolve(root, 'docs/experiments/arrowcol-oat');
   let manifestDirectory = resolve(root, 'docs/experiments/arrowcol-oat');
+  let outputDirectoryProvided = false;
   let renderAll = false;
+  let supplement: string | undefined;
   for (let index = 0; index < args.length; index++) {
     const option = args[index];
     if (option === '--render-all') {
@@ -509,48 +516,78 @@ async function main(args: string[]): Promise<void> {
     const value = args[++index];
     if (!value || value.startsWith('--')) throw new Error('expected a value after ' + option);
     if (option === '--registry') registryPath = resolve(value);
-    else if (option === '--out') outputDirectory = resolve(value);
-    else if (option === '--manifests') manifestDirectory = resolve(value);
-    else throw new Error('unknown option: ' + option);
+    else if (option === '--out') {
+      outputDirectory = resolve(value);
+      outputDirectoryProvided = true;
+    } else if (option === '--manifests') manifestDirectory = resolve(value);
+    else if (option === '--supplement') {
+      if (value !== 'C5-grpc') throw new Error('unsupported supplemental manifest: ' + value);
+      supplement = value;
+    } else throw new Error('unknown option: ' + option);
   }
   const registry: unknown = JSON.parse(await readFile(registryPath, 'utf8'));
-  const manifests = renderAll
-    ? await Promise.all(cohorts.map(async cohort => {
-      const path = resolve(manifestDirectory, 'oat-config-throughput-' + cohort.id + '.json');
-      const manifest: unknown = JSON.parse(await readFile(path, 'utf8'));
-      if (!isRecord(manifest) || manifest.cohort !== cohort.id || !Array.isArray(manifest.comparisons)) {
-        throw new Error('invalid manifest: ' + path);
+  if (!renderAll) {
+    const generated = buildThroughputManifests(registry);
+    if (supplement) {
+      if (!outputDirectoryProvided || outputDirectory === manifestDirectory) {
+        throw new Error('--supplement generation requires --out distinct from --manifests to preserve checked-in evidence');
       }
-      return manifest;
-    }))
-    : buildThroughputManifests(registry);
-  await mkdir(outputDirectory, { recursive: true });
-  for (const manifest of manifests) {
-    const cohort = String(manifest.cohort);
-    if (!renderAll) {
-      await writeFile(resolve(outputDirectory, 'oat-config-throughput-' + cohort + '.json'), JSON.stringify(manifest, null, 2) + '\n');
-      continue;
+      const manifest = generated.find(item => item.cohort === 'C5');
+      if (!manifest) throw new Error('could not generate C5 supplement');
+      await mkdir(outputDirectory, { recursive: true });
+      await writeFile(resolve(outputDirectory, 'oat-config-throughput-' + supplement + '.json'), JSON.stringify(manifest, null, 2) + '\n');
+      return;
     }
-    const cohortDirectory = resolve(outputDirectory, cohort);
+    await mkdir(outputDirectory, { recursive: true });
+    for (const manifest of generated) {
+      const cohort = String(manifest.cohort);
+      if (cohort === 'C5') continue;
+      await writeFile(resolve(outputDirectory, 'oat-config-throughput-' + cohort + '.json'), JSON.stringify(manifest, null, 2) + '\n');
+    }
+    console.log('C5 is frozen; use --supplement C5-grpc to generate the additive profile.');
+    return;
+  }
+  const selectedCohorts = cohorts.filter(cohort => !supplement || cohort.id !== 'C5');
+  const manifests: Array<{ manifest: unknown; outputName: string }> = await Promise.all(selectedCohorts.map(async cohort => {
+    const path = resolve(manifestDirectory, 'oat-config-throughput-' + cohort.id + '.json');
+    const manifest: unknown = JSON.parse(await readFile(path, 'utf8'));
+    if (!isRecord(manifest) || manifest.cohort !== cohort.id || !Array.isArray(manifest.comparisons)) {
+      throw new Error('invalid manifest: ' + path);
+    }
+    return { manifest, outputName: cohort.id };
+  }));
+  if (supplement) {
+    const path = resolve(manifestDirectory, 'oat-config-throughput-' + supplement + '.json');
+    const manifest: unknown = JSON.parse(await readFile(path, 'utf8'));
+    if (!isRecord(manifest) || manifest.cohort !== 'C5' || !Array.isArray(manifest.comparisons)) {
+      throw new Error('invalid supplemental manifest: ' + path);
+    }
+    manifests.push({ manifest, outputName: supplement });
+  }
+  await mkdir(outputDirectory, { recursive: true });
+  for (const selected of manifests) {
+    const { manifest, outputName } = selected;
+    if (!isRecord(manifest)) throw new Error('invalid manifest: ' + outputName);
+    const cohort = String(manifest.cohort);
+    const cohortDirectory = resolve(outputDirectory, outputName);
     await mkdir(cohortDirectory, { recursive: true });
     await writeFile(resolve(cohortDirectory, 'baseline.json'),
       JSON.stringify(renderThroughputBaseline(registry, manifest), null, 2) + '\n');
     for (const comparison of manifest.comparisons as Comparison[]) {
       if (!isRecord(comparison) || typeof comparison.id !== 'string' || !/^[a-z0-9-]+$/.test(comparison.id) ||
           !Array.isArray(comparison.candidates)) throw new Error('invalid comparison in ' + cohort);
-      const directory = resolve(outputDirectory, cohort, comparison.id);
+      const directory = resolve(cohortDirectory, comparison.id);
       await mkdir(directory, { recursive: true });
-      for (const candidate of comparison.candidates) {
-        if (!isRecord(candidate) || typeof candidate.id !== 'string' || !/^[a-z0-9_-]+$/.test(candidate.id)) {
-          throw new Error('invalid candidate in ' + cohort + '/' + comparison.id);
+      for (const selectedCandidate of comparison.candidates) {
+        if (!isRecord(selectedCandidate) || typeof selectedCandidate.id !== 'string' || !/^[a-z0-9_-]+$/.test(selectedCandidate.id)) {
+          throw new Error('invalid candidate in ' + outputName + '/' + comparison.id);
         }
-        const config = renderThroughputConfig(registry, manifest, comparison.id, candidate.id);
-        await writeFile(resolve(directory, candidate.id + '.json'), JSON.stringify(config, null, 2) + '\n');
+        const config = renderThroughputConfig(registry, manifest, comparison.id, selectedCandidate.id);
+        await writeFile(resolve(directory, selectedCandidate.id + '.json'), JSON.stringify(config, null, 2) + '\n');
       }
     }
   }
 }
-
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   main(process.argv.slice(2)).catch(error => {
     console.error(error instanceof Error ? error.message : String(error));

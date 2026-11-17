@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import test from 'node:test';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { buildThroughputManifests, renderThroughputBaseline, renderThroughputConfig } from './throughput-sweeps.js';
 
 function at(value: unknown, path: string[]): unknown {
@@ -198,7 +202,7 @@ test('renders C5 candidates against the committed seed without changing non-fact
   }, { workers: 2, streams_per_worker: 2, connections_per_worker: 1 });
   const comparisons = manifest.comparisons as Array<{
     id: string; factor: string; candidates: Array<{ id: string }>; candidate_limit: number;
-    matched_control?: string; comparison_family?: string;
+    matched_control?: string; comparison_family?: string; comparison_type?: string; selection_prerequisite?: string;
   }>;
   assert.ok(comparisons.every(comparison => comparison.candidate_limit === 4 && comparison.candidates.length <= 4));
   const axisCases = [
@@ -233,6 +237,12 @@ test('renders C5 candidates against the committed seed without changing non-fact
     { comparison: 'grpc-receiver-to-client', candidates: ['grpc-none', 'grpc-receiver-to-client-gzip', 'grpc-receiver-to-client-zstd'] },
     { comparison: 'grpc-mixed-directions', candidates: ['grpc-none', 'grpc-mixed-request-gzip-response-zstd', 'grpc-mixed-request-zstd-response-gzip'] },
   ];
+  const mixedComparison = comparisons.find(item => item.id === 'grpc-mixed-directions')!;
+  assert.equal(mixedComparison.comparison_type, 'interaction-top-pick');
+  assert.match(mixedComparison.selection_prerequisite!, /independently.*top picks.*not score as single-factor evidence/);
+  for (const id of ['grpc-client-to-receiver', 'grpc-receiver-to-client']) {
+    assert.notEqual(comparisons.find(item => item.id === id)!.comparison_type, 'interaction-top-pick');
+  }
   const expectedGrpc = [
     { comparison: 'grpc-client-to-receiver', id: 'grpc-client-to-receiver-gzip', send: 'gzip', accept: 'none', receiverAccept: 'gzip', receiverSend: 'none' },
     { comparison: 'grpc-client-to-receiver', id: 'grpc-client-to-receiver-zstd', send: 'zstd', accept: 'none', receiverAccept: 'zstd', receiverSend: 'none' },
@@ -463,4 +473,60 @@ test('renders candidate overlays as OAT configs without changing the baseline or
   assert.throws(() => renderThroughputConfig(base, manifests[0], 'missing', 'none'), /unknown comparison/);
   assert.throws(() => renderThroughputConfig(base, manifests[7], 'staging-overlap', 'overlap-true'), /unknown comparison/);
   assert.throws(() => renderThroughputConfig({ ...base, tunables: {} }, manifests[0], 'codec', 'snappy'), /manifest seed/);
+});
+
+
+test('CLI selects the C5 gRPC supplement without overwriting the frozen C5 manifest', () => {
+  const repositoryRoot = fileURLToPath(new URL('../..', import.meta.url));
+  const script = fileURLToPath(new URL('./throughput-sweeps.ts', import.meta.url));
+  const manifestDirectory = fileURLToPath(new URL('../../docs/experiments/arrowcol-oat/', import.meta.url));
+  const registry = fileURLToPath(new URL('../../docs/experiments/arrowcol-oat/oat-config.tuned.json', import.meta.url));
+  const originalC5Path = join(manifestDirectory, 'oat-config-throughput-C5.json');
+  const originalC5 = readFileSync(originalC5Path);
+  const temporaryDirectory = mkdtempSync(join(tmpdir(), 'oat-sweep-cli-'));
+  const runCli = (...args: string[]) => {
+    const result = spawnSync(process.execPath, ['--import', 'tsx', script, ...args], {
+      cwd: repositoryRoot, encoding: 'utf8',
+    });
+    assert.equal(result.error, undefined);
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    return result.stdout;
+  };
+  try {
+    const standardOutput = join(temporaryDirectory, 'standard');
+    mkdirSync(standardOutput);
+    writeFileSync(join(standardOutput, 'oat-config-throughput-C5.json'), originalC5);
+    assert.match(runCli('--registry', registry, '--out', standardOutput), /C5 is frozen/);
+    assert.deepEqual(readFileSync(join(standardOutput, 'oat-config-throughput-C5.json')), originalC5);
+    assert.equal(existsSync(join(standardOutput, 'oat-config-throughput-C5-grpc.json')), false);
+
+    const generatedOutput = join(temporaryDirectory, 'generated');
+    runCli('--registry', registry, '--supplement', 'C5-grpc', '--out', generatedOutput);
+    const generatedSupplement = JSON.parse(readFileSync(join(generatedOutput, 'oat-config-throughput-C5-grpc.json'), 'utf8')) as {
+      comparisons: Array<{ id: string; candidates: Array<{ id: string }> }>;
+      config_validation: { status: string };
+    };
+    assert.equal(generatedSupplement.config_validation.status, 'not-validated');
+    assert.equal(generatedSupplement.comparisons.flatMap(item => item.candidates).filter(item => item.id.startsWith('grpc-')).length, 9);
+    assert.equal(existsSync(join(generatedOutput, 'oat-config-throughput-C5.json')), false);
+
+    const renderedOutput = join(temporaryDirectory, 'rendered');
+    runCli('--registry', registry, '--render-all', '--supplement', 'C5-grpc', '--manifests', manifestDirectory, '--out', renderedOutput);
+    const comparisonGroups: Array<[string, string[]]> = [
+      ['grpc-client-to-receiver', ['grpc-none.json', 'grpc-client-to-receiver-gzip.json', 'grpc-client-to-receiver-zstd.json']],
+      ['grpc-receiver-to-client', ['grpc-none.json', 'grpc-receiver-to-client-gzip.json', 'grpc-receiver-to-client-zstd.json']],
+      ['grpc-mixed-directions', ['grpc-none.json', 'grpc-mixed-request-gzip-response-zstd.json', 'grpc-mixed-request-zstd-response-gzip.json']],
+    ];
+    let renderedEntries = 0;
+    for (const [group, expectedFiles] of comparisonGroups) {
+      const files = readdirSync(join(renderedOutput, 'C5-grpc', group)).filter(name => name.endsWith('.json')).sort();
+      assert.deepEqual(files, [...expectedFiles].sort());
+      renderedEntries += files.length;
+    }
+    assert.equal(renderedEntries, 9);
+    assert.equal(existsSync(join(renderedOutput, 'C5')), false);
+    assert.deepEqual(readFileSync(originalC5Path), originalC5);
+  } finally {
+    rmSync(temporaryDirectory, { recursive: true, force: true });
+  }
 });

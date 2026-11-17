@@ -573,7 +573,9 @@
       ],
       "candidate_limit": 4,
       "matched_control": "grpc-none",
-      "comparison_family": "grpc-direction"
+      "comparison_family": "grpc-direction",
+      "comparison_type": "interaction-top-pick",
+      "selection_prerequisite": "Select the request and response codecs independently from the pure-direction top picks; do not score as single-factor evidence."
     }
   ],
   "source_enum_coverage": {
