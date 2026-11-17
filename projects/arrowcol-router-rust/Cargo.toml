@@ -36,6 +36,8 @@ tracing-subscriber = { workspace = true, features = ["env-filter", "fmt", "json"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
+arrowcol-catalog = { path = "../../crates/arrowcol-catalog" }
+arrowcol-flight = { path = "../../crates/arrowcol-flight" }
 arrow = { version = "58.4", default-features = false, features = ["ipc"] }
 arrow-flight = "58.4"
 futures = "0.3"

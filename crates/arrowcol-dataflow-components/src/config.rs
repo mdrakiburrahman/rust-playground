@@ -17,6 +17,45 @@ mod override_tests {
     use super::*;
 
     #[test]
+    fn receiver_compression_projects_typed_oat_json_into_actual_runtime_limits() -> Result<(), String> {
+        let defaults = RuntimeLimitsConfig::default()
+            .build()
+            .map_err(|error| error.to_string())?;
+        assert_eq!(defaults.grpc_accept_compression, None);
+        assert_eq!(defaults.grpc_send_compression, None);
+        for (name, expected) in [
+            ("none", None),
+            ("gzip", Some(tonic::codec::CompressionEncoding::Gzip)),
+            ("zstd", Some(tonic::codec::CompressionEncoding::Zstd)),
+        ] {
+            let tunables = arrowcol_tunables::Tunables::parse_oat_json(serde_json::json!({
+                "collector":{"limits":{"grpc_accept_compression":name,"grpc_send_compression":name}}
+            }))
+            .map_err(|error| error.to_string())?;
+            let environment = tunables
+                .environment_for(arrowcol_tunables::ComponentRole::Collector)
+                .map_err(|error| error.to_string())?;
+            let config = merge_config(
+                &RuntimeLimitsConfig::default(),
+                &environment["ARROWCOL_COLLECTOR_LIMITS_CONFIG"],
+                None,
+            )?;
+            let limits = config.build().map_err(|error| error.to_string())?;
+            assert_eq!(limits.grpc_accept_compression, expected);
+            assert_eq!(limits.grpc_send_compression, expected);
+            assert_eq!(limits.max_message_bytes, defaults.max_message_bytes);
+            assert_eq!(limits.batch_channel_capacity, defaults.batch_channel_capacity);
+        }
+        for field in ["grpc_accept_compression", "grpc_send_compression"] {
+            for value in ["brotli", "deflate", "Gzip", ""] {
+                let invalid = serde_json::json!({field:value}).to_string();
+                assert!(merge_config(&RuntimeLimitsConfig::default(), &invalid, None).is_err());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn nested_override_preserves_yaml_values_and_validates_final_budget() -> Result<(), String> {
         let config = FileBatchConfig {
             max_age: Duration::from_secs(5),
@@ -553,6 +592,10 @@ impl RoutingStoreConfig {
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct RuntimeLimitsConfig {
+    /// Accepted request compression; uncompressed requests remain accepted.
+    pub grpc_accept_compression: arrowcol_tunables::GrpcCompression,
+    /// Response compression when supported by the requesting client.
+    pub grpc_send_compression: arrowcol_tunables::GrpcCompression,
     /// Maximum aggregate gRPC metadata bytes.
     pub max_metadata_bytes: usize,
     /// Maximum encoded Arrow schema bytes.
@@ -578,6 +621,8 @@ impl Default for RuntimeLimitsConfig {
         let limits = RuntimeLimits::default();
         Self {
             max_metadata_bytes: limits.max_metadata_bytes,
+            grpc_accept_compression: arrowcol_tunables::GrpcCompression::None,
+            grpc_send_compression: arrowcol_tunables::GrpcCompression::None,
             max_schema_bytes: limits.max_schema_bytes,
             max_message_bytes: limits.max_message_bytes,
             batch_channel_capacity: limits.batch_channel_capacity,
@@ -592,6 +637,8 @@ impl Default for RuntimeLimitsConfig {
 impl RuntimeLimitsConfig {
     pub(crate) fn build(&self) -> RuntimeResult<RuntimeLimits> {
         let limits = RuntimeLimits {
+            grpc_accept_compression: grpc_compression_encoding(self.grpc_accept_compression),
+            grpc_send_compression: grpc_compression_encoding(self.grpc_send_compression),
             max_metadata_bytes: self.max_metadata_bytes,
             max_schema_bytes: self.max_schema_bytes,
             max_message_bytes: self.max_message_bytes,
@@ -618,6 +665,16 @@ impl RuntimeLimitsConfig {
             ));
         }
         Ok(limits)
+    }
+}
+
+fn grpc_compression_encoding(
+    compression: arrowcol_tunables::GrpcCompression,
+) -> Option<tonic::codec::CompressionEncoding> {
+    match compression {
+        arrowcol_tunables::GrpcCompression::None => None,
+        arrowcol_tunables::GrpcCompression::Gzip => Some(tonic::codec::CompressionEncoding::Gzip),
+        arrowcol_tunables::GrpcCompression::Zstd => Some(tonic::codec::CompressionEncoding::Zstd),
     }
 }
 
