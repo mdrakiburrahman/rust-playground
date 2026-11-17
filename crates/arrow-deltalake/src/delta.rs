@@ -398,11 +398,104 @@ pub fn verify_writable_uri(root: &str) -> Result<()> {
     Ok(())
 }
 
+/// Normalize a Delta table root without retaining credentials or SAS material.
+///
+/// ADLS filesystem names written in the URI authority are moved into the path,
+/// so the result contains only scheme, host, filesystem/container, and path.
+#[must_use]
+pub fn normalize_delta_target_root(root: &str) -> Option<String> {
+    let mut url = Url::parse(root).ok()?;
+    let scheme = url.scheme().to_owned();
+    if !matches!(scheme.as_str(), "abfs" | "abfss" | "az" | "file" | "http" | "https") {
+        return None;
+    }
+
+    let adls_container = if matches!(scheme.as_str(), "abfs" | "abfss") && !url.username().is_empty() {
+        if url.password().is_some()
+            || !url
+                .username()
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+            || url.username().starts_with('-')
+            || url.username().ends_with('-')
+        {
+            return None;
+        }
+        Some(url.username().to_owned())
+    } else {
+        None
+    };
+
+    if let Some(container) = adls_container {
+        url.set_username("").ok()?;
+        url.set_password(None).ok()?;
+        let path = url.path().trim_start_matches('/');
+        if path.is_empty() {
+            url.set_path(&format!("/{container}"));
+        } else {
+            url.set_path(&format!("/{container}/{path}"));
+        }
+    } else {
+        if !url.username().is_empty() {
+            url.set_username("").ok()?;
+        }
+        if url.password().is_some() {
+            url.set_password(None).ok()?;
+        }
+    }
+    if scheme != "file" && url.host_str().is_none() {
+        return None;
+    }
+    url.set_query(None);
+    url.set_fragment(None);
+    let path = url.path().trim_end_matches('/').to_owned();
+    url.set_path(if path.is_empty() { "/" } else { &path });
+    Some(url.to_string())
+}
+
 #[cfg(test)]
 mod io_tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema};
     use std::collections::HashSet;
+
+    #[test]
+    fn delta_target_root_redacts_credentials_query_and_fragment() {
+        assert_eq!(
+            normalize_delta_target_root(
+                "https://user:password@account.blob.core.windows.net/container/events?sig=secret#fragment"
+            )
+            .as_deref(),
+            Some("https://account.blob.core.windows.net/container/events")
+        );
+    }
+
+    #[test]
+    fn delta_target_root_moves_adls_filesystem_out_of_userinfo() {
+        assert_eq!(
+            normalize_delta_target_root("abfss://events@account.dfs.core.windows.net/data/?sig=secret").as_deref(),
+            Some("abfss://account.dfs.core.windows.net/events/data")
+        );
+    }
+
+    #[test]
+    fn delta_target_root_canonicalizes_file_slashes() {
+        assert_eq!(
+            normalize_delta_target_root("file:///var/lib/events/").as_deref(),
+            Some("file:///var/lib/events")
+        );
+        assert_eq!(normalize_delta_target_root("file:///").as_deref(), Some("file:///"));
+    }
+
+    #[test]
+    fn delta_target_root_rejects_unsafe_urls() {
+        assert_eq!(normalize_delta_target_root("not a URL"), None);
+        assert_eq!(normalize_delta_target_root("ftp://account/container/events"), None);
+        assert_eq!(
+            normalize_delta_target_root("abfss://user:password@account.dfs.core.windows.net/events"),
+            None
+        );
+    }
 
     #[test]
     fn physical_writer_schema_removes_partitions_before_sort_metadata() -> Result<()> {
