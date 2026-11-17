@@ -593,7 +593,7 @@ async function prepareLocalRunMarker(config: Record<string, unknown>, server: {
       ownerStartTicks,
       serverPid,
       serverStartTicks,
-      serverUrl: server.url,
+      serverUrl: new URL(server.url).href,
       serverExecutable: await realpath(server.executable),
     },
   };
@@ -1414,7 +1414,7 @@ export async function main(
         }
       } : undefined;
       const onRunFinished = (status: OatRunStatus): void => {
-        runCleanupComplete = status.state === 'succeeded' || status.state === 'cancelled';
+        runCleanupComplete = (status.state === 'succeeded' || status.state === 'cancelled') && deadline.cleanupState === 'confirmed';
       };
       const code = await reportDataFlowRun(
         (progress) => launchOat(configPath, server.url, pollValue, fetch, progress, mode, getDockerBridgeGateway, interrupt?.controller.signal, onRunStarted, onRunFinished, deadline, submission),

@@ -307,7 +307,7 @@ test('successful deadline main exposes one frozen durable identity without waiti
         assert.equal(receipt.creation_state, 'accepted');
         assert.equal(receipt.config_binding_error, null);
         assert.equal(receipt.run_id, marker.runId);
-        assert.equal(receipt.server_url, `${identity.serverUrl}/`);
+        assert.equal(receipt.server_url, identity.serverUrl);
         assert.equal(receipt.submitted_config_body, marker.submitted_config_body);
         assert.equal(receipt.submitted_config_sha256, marker.submitted_config_sha256);
         assert.equal(marker.ownerPid, process.pid);
@@ -376,6 +376,8 @@ test('owned main does not emit supplementary identity for rejected, unknown or u
           const receipt = JSON.parse(await readFile(path.join(fixture.receiptRoot, name!), 'utf8'));
           assert.equal(receipt.cleanup_state, 'unsettled');
           assert.match(receipt.config_binding_error, /config_sha256/);
+          const markers = await readdir(fixture.stateRoot);
+          assert.equal(markers.length, 1, 'an unresolved binding must retain the actual server ownership marker');
         }
       } finally {
         process.exitCode = previousExitCode;
