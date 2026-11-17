@@ -1981,7 +1981,8 @@ mod tests {
         config.validate()?;
         for replicas in [vec![2], vec![1, 2], vec![]] {
             config.replica_counts = replicas;
-            assert!(config.validate_campaign_profile().unwrap_err().to_string().contains("replica_counts [1]"));
+            let error = config.validate_campaign_profile().err().context("invalid replicas were accepted")?;
+            assert!(error.to_string().contains("replica_counts [1]"));
         }
         config.replica_counts = vec![1];
         config.clients_per_table = 129;
