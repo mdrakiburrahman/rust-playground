@@ -415,13 +415,34 @@ mod storage_bridge {
                     url.origin() == self.data_endpoint.origin()
                         && match method {
                             "GET" if url.path() == self.data_endpoint.path() => {
+                                let start_from_valid = match query.get("startFrom") {
+                                    Some(start_from) => {
+                                        let expected_prefix = format!("{}_delta_log/", self.data_prefix);
+                                        let mut canonical_query = url::form_urlencoded::Serializer::new(String::new());
+                                        canonical_query
+                                            .append_pair("restype", "container")
+                                            .append_pair("comp", "list")
+                                            .append_pair("prefix", &expected_prefix)
+                                            .append_pair("startFrom", expected_prefix.trim_end_matches('/'));
+                                        let canonical_query = canonical_query.finish();
+                                        query.len() == 4
+                                            && query.get("prefix") == Some(&expected_prefix)
+                                            && start_from == expected_prefix.trim_end_matches('/')
+                                            && url.query() == Some(canonical_query.as_str())
+                                    }
+                                    None => true,
+                                };
                                 query.len() >= 3
                                     && query.len() <= 5
                                     && query.get("restype").is_some_and(|x| x == "container")
                                     && query.get("comp").is_some_and(|x| x == "list")
                                     && query.get("prefix").is_some_and(|x| x.starts_with(&self.data_prefix))
+                                    && start_from_valid
                                     && query.keys().all(|x| {
-                                        matches!(x.as_str(), "restype" | "comp" | "prefix" | "marker" | "maxresults")
+                                        matches!(
+                                            x.as_str(),
+                                            "restype" | "comp" | "prefix" | "marker" | "maxresults" | "startFrom"
+                                        )
                                     })
                             }
                             "GET" | "HEAD" => {
