@@ -190,7 +190,7 @@ test('failed local runs exit without serving absent or stale results', { skip: p
       };
       try {
         await main(['--mode', 'local', '--config', configPath,
-          ...(server ? ['--server', server.url] : [])], fixture.runner);
+          ...(server ? ['--server', server.url] : [])], fixture.runner, undefined, path.join(fixture.directory, 'receipts'));
         assert.equal(process.exitCode, 1);
         assert.ok(lines.some((line) => line.includes(
           scenario === 'rejected' ? 'invalid matrix fixture' : 'DATA FLOW: FAIL')));
@@ -216,7 +216,7 @@ test('external --server submits unchanged configuration without building or attr
     for await (const chunk of request) body += chunk;
     posted = JSON.parse(body);
     response.setHeader('content-type', 'application/json');
-    response.end(JSON.stringify(status('succeeded')));
+    response.end(JSON.stringify({ ...status('succeeded'), config_sha256: createHash('sha256').update(body).digest('hex') }));
   });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   const address = server.address();
@@ -225,7 +225,7 @@ test('external --server submits unchanged configuration without building or attr
   try {
     await main(['--config', configPath, '--server', `http://127.0.0.1:${address.port}`], async () => {
       throw new Error('must not build or inspect source for an independently running server');
-    });
+    }, undefined, path.join(directory, 'receipts'));
     assert.equal(process.exitCode, 1);
     assert.deepEqual(posted, config);
     assert.equal(await readFile(configPath, 'utf8'), JSON.stringify(config));
@@ -657,7 +657,7 @@ test('local recovery and cleanup resolve relative state beside the owned server,
   process.chdir(callerDirectory);
   try {
     const runner = async () => { throw new Error('startup must remain blocked'); };
-    await assert.rejects(main(['--config', configPath], runner), /Interrupted OAT server is gone/);
+    await assert.rejects(main(['--config', configPath], runner, undefined, path.join(directory, 'receipts')), /Interrupted OAT server is gone/);
     await main(['--config', configPath, '--cleanup-local', runId], runner,
       (value, id) => cleanupLocalComposeProjects(value, id, () => ''));
     await assert.rejects(stat(cellState), { code: 'ENOENT' });
@@ -858,7 +858,7 @@ server.listen(Number(process.argv[2]), '127.0.0.1');
       submitted_config_body: '{}', submitted_config_sha256: '44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a', source_config_sha256: 'b'.repeat(64),
     }));
     const runner = async () => { throw new Error('startup must remain blocked'); };
-    await assert.rejects(main(['--config', configPath], runner), /synthetic Compose cleanup failure/);
+    await assert.rejects(main(['--config', configPath], runner, undefined, path.join(directory, 'receipts')), /synthetic Compose cleanup failure/);
     assert.ok((await stat(markerPath)).isFile());
     assert.ok((await stat(cellState)).isDirectory());
     assert.equal((await fetch(new URL('/runs/123e4567-e89b-42d3-a456-426614174000', serverUrl))).ok, true);

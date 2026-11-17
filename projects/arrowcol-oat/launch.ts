@@ -1137,7 +1137,12 @@ async function readStatus(response: Response, action: string, expectedId?: strin
   };
 }
 
-export async function main(args: string[], runner: typeof run_tree = run_tree, cleanupLocal = cleanupLocalComposeProjects): Promise<void> {
+export async function main(
+  args: string[],
+  runner: typeof run_tree = run_tree,
+  cleanupLocal = cleanupLocalComposeProjects,
+  receiptRoot = launcherDeadlineReceiptRoot,
+): Promise<void> {
   const launcherStartedAtUnixMs = Date.now();
   const launcherStartedAtMonotonicMs = performance.now();
   if (args.includes('-h') || args.includes('--help')) {
@@ -1240,8 +1245,8 @@ export async function main(args: string[], runner: typeof run_tree = run_tree, c
     }
     config.subscriptionId = subscriptionId;
   }
-  await assertNoUnsettledDeadlineReceipts();
-  const deadline = await OatLauncherDeadline.create(deadlineSeconds, launcherStartedAtMonotonicMs, launcherDeadlineReceiptRoot, launcherStartedAtUnixMs);
+  await assertNoUnsettledDeadlineReceipts(receiptRoot);
+  const deadline = await OatLauncherDeadline.create(deadlineSeconds, launcherStartedAtMonotonicMs, receiptRoot, launcherStartedAtUnixMs);
   if (deadlineSeconds !== undefined) {
     if (deadline.isExpired()) {
       await deadline.markOverrun();
