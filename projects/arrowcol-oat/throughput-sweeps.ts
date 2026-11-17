@@ -136,6 +136,8 @@ export function buildThroughputManifests(registry: unknown): JsonObject[] {
   const tunables = registry.tunables;
   const registryHash = createHash('sha256').update(JSON.stringify(tunables)).digest('hex');
   return cohorts.map(cohort => {
+    const collector = isRecord(tunables.collector) ? tunables.collector : {};
+    const batching = isRecord(collector.batching) ? collector.batching : {};
     for (const comparison of cohort.comparisons) {
       if (comparison.candidates.length > comparison.candidate_limit) throw new Error(cohort.id + '/' + comparison.id + ' exceeds its candidate limit');
     }
@@ -201,7 +203,7 @@ export function buildThroughputManifests(registry: unknown): JsonObject[] {
       } } : {}),
       ...(cohort.id === 'C3' ? { flush_age_semantics: {
         requested_path: 'tunables.collector.batching.max_age',
-        baseline_requested: '1s',
+        baseline_requested: batching.max_age ?? null,
         candidate_requests: ['1s', '5s', '15s', '60s'].map(value => ({ candidate: 'age-' + value, requested: value })),
         effective_readback_path: 'consumer_effective_config.batching.max_age',
         effective_status: 'requires-runtime-startup-readback',

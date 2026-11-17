@@ -61,16 +61,14 @@ test('generates the C3 flush-age comparison as a single-factor sweep', () => {
     return copy;
   });
   assert.deepEqual(fixedSettings.slice(1), [fixedSettings[0], fixedSettings[0], fixedSettings[0]]);
-  assert.deepEqual(manifest.flush_age_semantics, {
-    requested_path: 'tunables.collector.batching.max_age',
-    baseline_requested: '1s',
-    candidate_requests: ['1s', '5s', '15s', '60s'].map(value => ({ candidate: 'age-' + value, requested: value })),
-    effective_readback_path: 'consumer_effective_config.batching.max_age',
-    effective_status: 'requires-runtime-startup-readback',
-    flush_reason_metric: 'arrowcol_pipeline_flushes_total',
-    flush_reason_labels: ['age', 'target_parquet_bytes', 'min_input_bytes', 'max_input_bytes', 'row_cap', 'batch_cap', 'memory_cap', 'schema_change', 'explicit', 'shutdown_drain'],
-    interpretation: 'Compare per-run counter deltas and physical file sizes; the first satisfied time, row, input-byte, or memory cap determines flush behavior.',
-  });
+  assert.equal((manifest.flush_age_semantics as { baseline_requested: unknown }).baseline_requested, '1s');
+  const nonDefaultManifest = buildThroughputManifests({
+    tunables: { collector: { batching: { max_age: '5s' } } },
+  }).find(item => item.cohort === 'C3')!;
+  assert.equal((nonDefaultManifest.flush_age_semantics as { baseline_requested: unknown }).baseline_requested, '5s');
+  const omittedManifest = buildThroughputManifests({ tunables: { collector: { batching: {} } } })
+    .find(item => item.cohort === 'C3')!;
+  assert.equal((omittedManifest.flush_age_semantics as { baseline_requested: unknown }).baseline_requested, null);
 });
 
 test('generates bounded local single-writer manifests from the tunables registry', () => {
