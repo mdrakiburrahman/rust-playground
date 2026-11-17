@@ -7,6 +7,7 @@ use crate::delta::{
 use anyhow::{Context, Result, bail};
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
+use delta_kernel_default_engine::executor::TaskExecutor;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
@@ -510,23 +511,28 @@ impl BatchedTable {
     ) -> Result<PreparedPublicationGroup> {
         let table = Arc::clone(self.preparation.get().context("Delta owner is not initialized")?);
         let max_files = self.options.max_files_per_commit;
-        crate::delta_io::run_cpu_future(async move {
-            table
-                .stage_coalesced_publications(entries, max_files)
-                .await
-                .map(
-                    |(appends, identities, committed_identities, preparation_build, preparation_sort)| {
-                        PreparedPublicationGroup {
-                            appends,
-                            identities,
-                            committed_identities,
-                            preparation_build,
-                            preparation_sort,
-                        }
-                    },
-                )
-                .map_err(CommitReceiptError::from_anyhow)
-                .map_err(anyhow::Error::new)
+        crate::delta_io::run_cpu_async(move || {
+            let executor = crate::delta_io::shared_executor()?;
+            let _guard = executor.enter();
+            // Kernel's synchronous snapshot reads use futures::block_on themselves.
+            tokio::runtime::Handle::current().block_on(async move {
+                table
+                    .stage_coalesced_publications(entries, max_files)
+                    .await
+                    .map(
+                        |(appends, identities, committed_identities, preparation_build, preparation_sort)| {
+                            PreparedPublicationGroup {
+                                appends,
+                                identities,
+                                committed_identities,
+                                preparation_build,
+                                preparation_sort,
+                            }
+                        },
+                    )
+                    .map_err(CommitReceiptError::from_anyhow)
+                    .map_err(anyhow::Error::new)
+            })
         })
         .await?
     }

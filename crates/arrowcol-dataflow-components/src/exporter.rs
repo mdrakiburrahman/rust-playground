@@ -611,6 +611,8 @@ async fn run_batch_worker(
         adaptive_defaults: policy.adaptive_file.build(),
         pipeline_depth: policy.pipeline_depth,
         force_commit: policy.pipeline_depth == 1,
+        pending_flush: None,
+        observations: Vec::new(),
         in_flight: VecDeque::new(),
     };
     loop {
@@ -780,6 +782,17 @@ fn retired_owner_failure() -> ExportFailure {
 /// failure the publisher releases the worker and retires the owner before it
 /// settles the failed batches, so their retries reach a fresh owner that
 /// reopens the table under the current lease.
+struct PipelineOutcome {
+    estimator: AdaptiveFileSizeEstimator,
+    observations: Vec<arrow_deltalake::CompletedFileObservation>,
+    retired: bool,
+}
+
+struct PipelinePublication {
+    task: tokio::task::JoinHandle<PipelineOutcome>,
+    flush: Arc<std::sync::atomic::AtomicBool>,
+}
+
 struct GroupPublisher<'a> {
     table: &'a mut Option<Arc<BatchedTable>>,
     retired: &'a Arc<std::sync::atomic::AtomicBool>,
@@ -792,7 +805,9 @@ struct GroupPublisher<'a> {
     adaptive_defaults: arrow_deltalake::sizing::AdaptiveFileSizeConfig,
     pipeline_depth: usize,
     force_commit: bool,
-    in_flight: VecDeque<tokio::task::JoinHandle<(AdaptiveFileSizeEstimator, bool)>>,
+    pending_flush: Option<Arc<std::sync::atomic::AtomicBool>>,
+    observations: Vec<arrow_deltalake::CompletedFileObservation>,
+    in_flight: VecDeque<PipelinePublication>,
 }
 
 impl GroupPublisher<'_> {
@@ -831,10 +846,11 @@ impl GroupPublisher<'_> {
     }
 
     fn record_published_files(
-        &self,
+        &mut self,
         observations: impl IntoIterator<Item = arrow_deltalake::CompletedFileObservation>,
     ) {
         for observation in observations {
+            self.observations.push(observation);
             match u64::try_from(observation.rows) {
                 Ok(rows) => self.stage_metrics.record_file(observation.parquet_bytes, rows),
                 Err(error) => tracing::error!(
@@ -847,11 +863,16 @@ impl GroupPublisher<'_> {
     }
 
     async fn publish(&mut self, group: &mut Vec<QueuedBatch>, estimator: &mut AdaptiveFileSizeEstimator) {
-        while self.in_flight.front().is_some_and(tokio::task::JoinHandle::is_finished) {
+        while self
+            .in_flight
+            .front()
+            .is_some_and(|publication| publication.task.is_finished())
+        {
             self.finish_one(estimator).await;
         }
         if self.pipeline_depth == 1 || self.table.is_none() {
             self.publish_inline(group, estimator).await;
+            self.observations.clear();
             return;
         }
         if group.is_empty() {
@@ -868,6 +889,8 @@ impl GroupPublisher<'_> {
         let max_pending_files = self.max_pending_files;
         let coalesce_publications = self.coalesce_publications;
         let adaptive_defaults = self.adaptive_defaults;
+        let flush = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pending_flush = Arc::clone(&flush);
         let task = arrow_deltalake::delta::spawn_shared_io(async move {
             let mut publisher = GroupPublisher {
                 table: &mut table,
@@ -881,18 +904,27 @@ impl GroupPublisher<'_> {
                 adaptive_defaults,
                 pipeline_depth: 1,
                 force_commit: false,
+                pending_flush: Some(pending_flush),
+                observations: Vec::new(),
                 in_flight: VecDeque::new(),
             };
             publisher.publish_inline(&mut group, &mut estimate).await;
-            (estimate, publisher.retired())
+            PipelineOutcome {
+                estimator: estimate,
+                retired: publisher.retired(),
+                observations: publisher.observations,
+            }
         });
         match task {
-            Ok(task) => self.in_flight.push_back(task),
+            Ok(task) => self.in_flight.push_back(PipelinePublication { task, flush }),
             Err(error) => {
                 tracing::error!(error = %error, "Delta pipeline could not start a publication");
                 self.metrics.publication_backlog_mark_unknown();
                 self.metrics.set_healthy(false);
                 *self.table = None;
+                if self.in_flight.is_empty() {
+                    self.retired.store(true, std::sync::atomic::Ordering::Release);
+                }
             }
         }
         if self.in_flight.len() >= self.pipeline_depth {
@@ -901,11 +933,21 @@ impl GroupPublisher<'_> {
     }
 
     async fn finish_one(&mut self, estimator: &mut AdaptiveFileSizeEstimator) {
-        if let Some(task) = self.in_flight.pop_front() {
-            match task.await {
-                Ok((updated, failed)) => {
-                    *estimator = updated;
-                    if failed {
+        if let Some(publication) = self.in_flight.pop_front() {
+            match publication.task.await {
+                Ok(outcome) => {
+                    if estimator.config() != outcome.estimator.config() {
+                        *estimator = outcome.estimator;
+                    } else {
+                        for observation in outcome.observations {
+                            if let Err(error) = estimator.observe(observation) {
+                                tracing::error!(error = %error, "published file sizing observation failed");
+                                self.metrics.set_healthy(false);
+                                *self.table = None;
+                            }
+                        }
+                    }
+                    if outcome.retired {
                         *self.table = None;
                     }
                 }
@@ -923,6 +965,9 @@ impl GroupPublisher<'_> {
     }
 
     async fn finish_in_flight(&mut self, estimator: &mut AdaptiveFileSizeEstimator) {
+        for publication in &self.in_flight {
+            publication.flush.store(true, std::sync::atomic::Ordering::Release);
+        }
         if let Some(table) = self.table.as_ref() {
             table.flush_pending();
         }
@@ -935,7 +980,7 @@ impl GroupPublisher<'_> {
         if group.is_empty() {
             return;
         }
-        let Some(table) = self.table.as_ref() else {
+        let Some(table) = self.table.clone() else {
             self.metrics.publication_backlog_mark_unknown();
             for entry in group.drain(..) {
                 entry.complete(&Err(retired_owner_failure()));
@@ -1028,6 +1073,9 @@ impl GroupPublisher<'_> {
                     }
                     let submission_started = Instant::now();
                     let submission = table.submit_prepared_group(prepared, self.force_commit).await;
+                    if self.pending_flush.as_ref().is_some_and(|flush| flush.load(std::sync::atomic::Ordering::Acquire)) {
+                        table.flush_pending();
+                    }
                     self.stage_metrics.record_submission_wait(submission_started.elapsed());
                     let commit_result = match submission {
                         Ok(receipt) => receipt.wait().await.map_err(|error| {
@@ -1763,7 +1811,10 @@ mod tests {
             .stage(envelope_pdata(envelope_for(&lease)))
             .await
             .expect("third");
-        exporter.backend.flush_pending().await.expect("explicit barrier");
+        tokio::time::timeout(std::time::Duration::from_secs(5), exporter.backend.flush_pending())
+            .await
+            .expect("flush must wake submissions prepared after the barrier")
+            .expect("explicit barrier");
         third.wait().await.expect("barrier completed publication");
         assert_eq!(add_file_count(&root), 3);
         assert_eq!(exporter.backend.capacity.batches.available_permits(), 4096);
@@ -3370,45 +3421,49 @@ mod tests {
     /// Guarantees: The catalog boundary splits files, and draining publishes the residual group.
     #[tokio::test]
     async fn schema_version_transition_splits_files() {
-        let directory = tempfile::tempdir().expect("directory");
-        let store = Arc::new(MemoryRoutingStore::default());
-        let holder = CollectorInstanceId::new();
-        let lease = lease(&store, holder).await;
-        let exporter = GenericDeltaExporter::with_batching(
-            directory.path().to_path_buf(),
-            store as Arc<dyn RoutingStore>,
-            arrow_deltalake::commit::CommitOptions::default(),
-            FileBatchConfig {
-                max_age: std::time::Duration::from_secs(60),
-                ..Default::default()
-            },
-            Arc::new(RuntimeMetrics::new(holder)),
-        )
-        .expect("exporter");
-        let first = exporter.stage(pdata(&lease, lease.fencing_epoch)).await.expect("first");
-        let second = exporter
-            .stage(versioned_pdata(
-                &lease,
-                lease.fencing_epoch,
-                SchemaVersion::new(2).expect("version"),
-            ))
-            .await
-            .expect("second");
-        tokio::time::timeout(std::time::Duration::from_secs(3), first.wait())
-            .await
-            .expect("schema boundary")
-            .expect("first publication");
-        exporter.backend.start_draining().await;
-        tokio::time::timeout(std::time::Duration::from_secs(3), second.wait())
-            .await
-            .expect("drain")
-            .expect("second publication");
-        let files = std::fs::read_dir(directory.path().join("demo/generated/events"))
-            .expect("files")
-            .map(|entry| entry.expect("entry").path())
-            .filter(|path| path.extension().is_some_and(|extension| extension == "parquet"))
-            .count();
-        assert_eq!(files, 2);
+        for pipeline_depth in [1, 3] {
+            let directory = tempfile::tempdir().expect("directory");
+            let store = Arc::new(MemoryRoutingStore::default());
+            let holder = CollectorInstanceId::new();
+            let lease = lease(&store, holder).await;
+            let exporter = GenericDeltaExporter::with_batching(
+                directory.path().to_path_buf(),
+                store as Arc<dyn RoutingStore>,
+                arrow_deltalake::commit::CommitOptions::default(),
+                FileBatchConfig {
+                    max_age: std::time::Duration::from_secs(60),
+                    pipeline_depth,
+                    coalesce_publications: pipeline_depth > 1,
+                    ..Default::default()
+                },
+                Arc::new(RuntimeMetrics::new(holder)),
+            )
+            .expect("exporter");
+            let first = exporter.stage(pdata(&lease, lease.fencing_epoch)).await.expect("first");
+            let second = exporter
+                .stage(versioned_pdata(
+                    &lease,
+                    lease.fencing_epoch,
+                    SchemaVersion::new(2).expect("version"),
+                ))
+                .await
+                .expect("second");
+            tokio::time::timeout(std::time::Duration::from_secs(3), first.wait())
+                .await
+                .expect("schema boundary")
+                .expect("first publication");
+            exporter.backend.start_draining().await;
+            tokio::time::timeout(std::time::Duration::from_secs(3), second.wait())
+                .await
+                .expect("drain")
+                .expect("second publication");
+            let files = std::fs::read_dir(directory.path().join("demo/generated/events"))
+                .expect("files")
+                .map(|entry| entry.expect("entry").path())
+                .filter(|path| path.extension().is_some_and(|extension| extension == "parquet"))
+                .count();
+            assert_eq!(files, 2);
+        }
     }
 
     /// Scenario: Multiple batches in one grouped file lose their authoritative lease before the commit
@@ -3417,53 +3472,57 @@ mod tests {
     /// as published.
     #[tokio::test]
     async fn grouped_publication_failure_settles_all_batches() {
-        let directory = tempfile::tempdir().expect("directory");
-        let store = Arc::new(MemoryRoutingStore::default());
-        let holder = CollectorInstanceId::new();
-        let lease = lease(&store, holder).await;
-        let metrics = Arc::new(RuntimeMetrics::new(holder));
-        let exporter = GenericDeltaExporter::with_batching(
-            directory.path().to_path_buf(),
-            Arc::clone(&store) as Arc<dyn RoutingStore>,
-            arrow_deltalake::commit::CommitOptions::default(),
-            FileBatchConfig {
-                max_batches_per_flush: 3,
-                max_age: std::time::Duration::from_secs(60),
-                ..Default::default()
-            },
-            Arc::clone(&metrics),
-        )
-        .expect("exporter");
-        let first = exporter.stage(pdata(&lease, lease.fencing_epoch)).await.expect("first");
-        let second = exporter
-            .stage(pdata(&lease, lease.fencing_epoch))
+        for pipeline_depth in [1, 3] {
+            let directory = tempfile::tempdir().expect("directory");
+            let store = Arc::new(MemoryRoutingStore::default());
+            let holder = CollectorInstanceId::new();
+            let lease = lease(&store, holder).await;
+            let metrics = Arc::new(RuntimeMetrics::new(holder));
+            let exporter = GenericDeltaExporter::with_batching(
+                directory.path().to_path_buf(),
+                Arc::clone(&store) as Arc<dyn RoutingStore>,
+                arrow_deltalake::commit::CommitOptions::default(),
+                FileBatchConfig {
+                    max_batches_per_flush: 3,
+                    max_age: std::time::Duration::from_secs(60),
+                    pipeline_depth,
+                    coalesce_publications: pipeline_depth > 1,
+                    ..Default::default()
+                },
+                Arc::clone(&metrics),
+            )
+            .expect("exporter");
+            let first = exporter.stage(pdata(&lease, lease.fencing_epoch)).await.expect("first");
+            let second = exporter
+                .stage(pdata(&lease, lease.fencing_epoch))
+                .await
+                .expect("second");
+            reissue_lease(&store, &lease, CollectorInstanceId::new()).await;
+            exporter.backend.flush_pending().await.expect("flush");
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                assert!(
+                    first
+                        .wait()
+                        .await
+                        .expect_err("first fenced")
+                        .to_string()
+                        .contains("routing lease")
+                );
+                assert!(
+                    second
+                        .wait()
+                        .await
+                        .expect_err("second fenced")
+                        .to_string()
+                        .contains("routing lease")
+                );
+            })
             .await
-            .expect("second");
-        reissue_lease(&store, &lease, CollectorInstanceId::new()).await;
-        exporter.backend.flush_pending().await.expect("flush");
-        tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            assert!(
-                first
-                    .wait()
-                    .await
-                    .expect_err("first fenced")
-                    .to_string()
-                    .contains("routing lease")
-            );
-            assert!(
-                second
-                    .wait()
-                    .await
-                    .expect_err("second fenced")
-                    .to_string()
-                    .contains("routing lease")
-            );
-        })
-        .await
-        .expect("bounded failures");
-        assert_eq!(exporter.backend.capacity.batches.available_permits(), 4096);
-        assert!(metrics.prometheus().contains("arrowcol_delta_files_total 0\n"));
-        assert!(metrics.prometheus().contains("arrowcol_delta_failures_total 1\n"));
+            .expect("bounded failures");
+            assert_eq!(exporter.backend.capacity.batches.available_permits(), 4096);
+            assert!(metrics.prometheus().contains("arrowcol_delta_files_total 0\n"));
+            assert!(metrics.prometheus().contains("arrowcol_delta_failures_total 1\n"));
+        }
     }
 
     /// Scenario: A batch this process admitted under an older lease is retried after the lease was
