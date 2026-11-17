@@ -10,6 +10,12 @@
 //! writes the original batch through `arrow-deltalake`. The Flight exporter
 //! instead forwards each batch, after replaying its catalog DDL, to a
 //! downstream Arrowcol Flight receiver for collector-to-collector chaining.
+//!
+//! The `/v1/pressure` response includes `resolved_buffering_mode`, which is
+//! `unknown` until collector registration and buffering initialization complete.
+//! Its concrete values are `memory_only`, `quiver`, and `spill_recovery`;
+//! contradictory initialized paths report `mixed`. The legacy Quiver boolean
+//! remains informational and is not affirmative memory-only evidence.
 
 #![deny(unsafe_code)]
 
@@ -38,8 +44,9 @@ pub use flight_exporter::{
     ARROW_FLIGHT_EXPORTER, ARROW_FLIGHT_EXPORTER_URN, ArrowFlightExporter, FlightExporterConfig,
 };
 pub use metrics::{
-    DashboardCapabilities, DashboardPressure, FlushReason, NativeQuiverCapability, PipelineStage, RuntimeMetrics,
-    StageMetrics, TableVersionStatus, global_metrics, process_instance_id, process_instance_key,
+    DashboardCapabilities, DashboardPressure, FlushReason, NativeQuiverCapability, PipelineStage,
+    ResolvedBufferingMode, RuntimeMetrics, StageMetrics, TableVersionStatus, global_metrics, process_instance_id,
+    process_instance_key,
 };
 pub use receiver::{ARROW_FLIGHT_RECEIVER, ARROW_FLIGHT_RECEIVER_URN, DfeAdmission, PdataSendError, PdataSender};
 pub use routing::{LeaseResolver, StoreLeaseResolver};

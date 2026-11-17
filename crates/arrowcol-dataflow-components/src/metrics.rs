@@ -35,6 +35,17 @@ pub enum PipelineStage {
     Commit,
 }
 
+/// Effective buffering implementation resolved during collector startup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResolvedBufferingMode {
+    Unknown,
+    MemoryOnly,
+    Quiver,
+    SpillRecovery,
+    Mixed,
+}
+
 const STAGE_DURATION_BUCKETS: &[f64] = &[
     0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
 ];
@@ -1015,6 +1026,7 @@ pub struct RuntimeMetrics {
     instance_id: CollectorInstanceId,
     instance_key: OnceLock<String>,
     native_quiver: OnceLock<bool>,
+    resolved_buffering_mode: Mutex<ResolvedBufferingMode>,
     accepting: AtomicBool,
     healthy: AtomicBool,
     catalog_ready: AtomicBool,
@@ -1067,6 +1079,7 @@ impl RuntimeMetrics {
             instance_id,
             instance_key: OnceLock::new(),
             native_quiver: OnceLock::new(),
+            resolved_buffering_mode: Mutex::new(ResolvedBufferingMode::Unknown),
             accepting: AtomicBool::new(true),
             healthy: AtomicBool::new(true),
             catalog_ready: AtomicBool::new(false),
@@ -1245,6 +1258,37 @@ impl RuntimeMetrics {
     #[must_use]
     pub fn native_quiver_enabled(&self) -> bool {
         self.native_quiver.get().copied().unwrap_or(false)
+    }
+
+    /// Registers an initialized buffering implementation.
+    ///
+    /// Independent buffering paths register separately; contradictory modes resolve to
+    /// `mixed` and remain so for the lifetime of this process.
+    pub(crate) fn register_resolved_buffering_mode(&self, mode: ResolvedBufferingMode) -> Result<(), String> {
+        if matches!(mode, ResolvedBufferingMode::Unknown | ResolvedBufferingMode::Mixed) {
+            return Err("buffering registration requires one initialized concrete mode".to_owned());
+        }
+        let mut current = self
+            .resolved_buffering_mode
+            .lock()
+            .map_err(|_| "resolved buffering mode lock is poisoned".to_owned())?;
+        *current = match *current {
+            ResolvedBufferingMode::Unknown => mode,
+            existing if existing == mode => existing,
+            ResolvedBufferingMode::Mixed => ResolvedBufferingMode::Mixed,
+            _ => ResolvedBufferingMode::Mixed,
+        };
+        Ok(())
+    }
+
+    fn resolved_buffering_mode(&self) -> Result<ResolvedBufferingMode, String> {
+        if !self.registered.load(Ordering::Acquire) {
+            return Ok(ResolvedBufferingMode::Unknown);
+        }
+        self.resolved_buffering_mode
+            .lock()
+            .map(|mode| *mode)
+            .map_err(|_| "resolved buffering mode lock is poisoned".to_owned())
     }
 
     /// Returns the delivery guarantee label of the configured admission mode.
@@ -1581,6 +1625,7 @@ impl RuntimeMetrics {
     pub fn pressure(&self) -> Result<DashboardPressure, String> {
         let now = now_unix_millis()?;
         let native_quiver = self.native_quiver_enabled();
+        let resolved_buffering_mode = self.resolved_buffering_mode()?;
         let active = self.active_streams.load(Ordering::Acquire);
         let dfe_bytes = self.buffered_bytes.load(Ordering::Acquire);
         let dfe_rows = self.buffered_rows.load(Ordering::Acquire);
@@ -1687,6 +1732,7 @@ impl RuntimeMetrics {
             } else {
                 "ack_tracked_end_to_end"
             },
+            resolved_buffering_mode,
             native_quiver_enabled: native_quiver,
             native_quiver_buffered_bytes: native_quiver.then_some(backlog.bytes),
             native_quiver_buffered_rows: native_quiver.then_some(backlog.rows),
@@ -1966,6 +2012,8 @@ pub struct DashboardPressure {
     dfe_channel_capacity: u64,
     dfe_channel_occupancy: u64,
     dfe_channel_occupancy_source: &'static str,
+    /// Effective buffering mode; `unknown` is not affirmative memory-only evidence.
+    pub resolved_buffering_mode: ResolvedBufferingMode,
     native_quiver_enabled: bool,
     native_quiver_buffered_bytes: Option<u64>,
     native_quiver_buffered_rows: Option<u64>,
@@ -2430,6 +2478,91 @@ mod tests {
         assert!(metrics.native_quiver_enabled());
         assert!(metrics.configure_admission("dfe-1", true).is_err());
         assert!(metrics.configure_admission("dfe-0", false).is_err());
+    }
+
+    #[test]
+    fn resolved_buffering_mode_is_unknown_until_registered_and_ready() {
+        let metrics = RuntimeMetrics::new(CollectorInstanceId::new());
+        let pressure = metrics.pressure().expect("pressure");
+        assert_eq!(pressure.resolved_buffering_mode, ResolvedBufferingMode::Unknown);
+        assert_eq!(
+            serde_json::to_value(pressure).expect("pressure JSON")["resolved_buffering_mode"],
+            "unknown"
+        );
+        metrics
+            .register_resolved_buffering_mode(ResolvedBufferingMode::MemoryOnly)
+            .expect("memory-only mode");
+        assert_eq!(
+            metrics.pressure().expect("not registered").resolved_buffering_mode,
+            ResolvedBufferingMode::Unknown
+        );
+        metrics.set_registered(true);
+        let pressure = metrics.pressure().expect("ready");
+        assert_eq!(pressure.resolved_buffering_mode, ResolvedBufferingMode::MemoryOnly);
+        assert_eq!(
+            serde_json::to_value(pressure).expect("pressure JSON")["resolved_buffering_mode"],
+            "memory_only"
+        );
+    }
+
+    #[test]
+    fn resolved_buffering_mode_registers_quiver() {
+        let metrics = RuntimeMetrics::new(CollectorInstanceId::new());
+        metrics
+            .register_resolved_buffering_mode(ResolvedBufferingMode::Quiver)
+            .expect("Quiver mode");
+        metrics.set_registered(true);
+        let pressure = metrics.pressure().expect("pressure");
+        assert_eq!(pressure.resolved_buffering_mode, ResolvedBufferingMode::Quiver);
+        assert_eq!(
+            serde_json::to_value(pressure).expect("pressure JSON")["resolved_buffering_mode"],
+            "quiver"
+        );
+    }
+
+    #[test]
+    fn resolved_buffering_mode_registers_spill_recovery_independently() {
+        let metrics = RuntimeMetrics::new(CollectorInstanceId::new());
+        metrics
+            .register_resolved_buffering_mode(ResolvedBufferingMode::SpillRecovery)
+            .expect("spill/recovery mode");
+        metrics.set_registered(true);
+        let pressure = metrics.pressure().expect("pressure");
+        assert_eq!(pressure.resolved_buffering_mode, ResolvedBufferingMode::SpillRecovery);
+        assert_eq!(
+            serde_json::to_value(pressure).expect("pressure JSON")["resolved_buffering_mode"],
+            "spill_recovery"
+        );
+    }
+
+    #[test]
+    fn resolved_buffering_mode_repeats_identically_and_conflicts_stick() {
+        let metrics = RuntimeMetrics::new(CollectorInstanceId::new());
+        metrics.set_registered(true);
+        metrics
+            .register_resolved_buffering_mode(ResolvedBufferingMode::MemoryOnly)
+            .expect("first memory-only mode");
+        metrics
+            .register_resolved_buffering_mode(ResolvedBufferingMode::MemoryOnly)
+            .expect("repeat memory-only mode");
+        assert_eq!(
+            metrics.pressure().expect("same mode").resolved_buffering_mode,
+            ResolvedBufferingMode::MemoryOnly
+        );
+        metrics
+            .register_resolved_buffering_mode(ResolvedBufferingMode::Quiver)
+            .expect("conflicting Quiver mode");
+        assert_eq!(
+            metrics.pressure().expect("mixed mode").resolved_buffering_mode,
+            ResolvedBufferingMode::Mixed
+        );
+        metrics
+            .register_resolved_buffering_mode(ResolvedBufferingMode::SpillRecovery)
+            .expect("additional spill/recovery mode");
+        assert_eq!(
+            metrics.pressure().expect("sticky mixed mode").resolved_buffering_mode,
+            ResolvedBufferingMode::Mixed
+        );
     }
 
     /// Scenario: Multiple pipeline cores request the collector's stream allowance.

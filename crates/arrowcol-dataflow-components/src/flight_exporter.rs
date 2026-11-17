@@ -99,7 +99,10 @@ impl ArrowFlightExporter {
                     version
                 }
             };
-            if let Err(error) = self.put(client, &key.0, version, decoded.batch).await {
+            if let Err(error) = self
+                .put(client, &key.0, version, decoded.envelope.shard_index, decoded.batch)
+                .await
+            {
                 self.downstream_versions.remove(&key);
                 return Err(error);
             }
@@ -170,6 +173,7 @@ impl ArrowFlightExporter {
         client: &mut FlightServiceClient<Channel>,
         table: &TableIdentity,
         version: SchemaVersion,
+        shard_index: u8,
         batch: RecordBatch,
     ) -> Result<(), ExportFailure> {
         let schema = batch.schema();
@@ -191,10 +195,11 @@ impl ArrowFlightExporter {
             .await
             .map_err(|error| ExportFailure::Permanent(error.to_string()))?;
         let mut request = Request::new(stream::iter(encoded));
-        let metadata = IngestMetadata::new(
+        let metadata = IngestMetadata::new_with_shard_index(
             ProtocolVersion::CURRENT,
             ImplementationPool::Dataflow,
             table.clone(),
+            shard_index,
             ClaimedSchemaFingerprint::new(fingerprint_schema(schema.as_ref())),
         );
         for (key, value) in metadata.to_ascii_pairs() {
@@ -312,11 +317,11 @@ mod tests {
     use arrowcol_flight::{ArrowColFlightService, BatchAdmission};
     use arrowcol_protocol::{CollectorInstanceId, FencingToken, LeaseId, PublicationId};
     use arrowcol_routing::{LeaseKey, MemoryRoutingStore, RoutingStore};
-    use otel_arrow_dfe_pdata::OtapPayload;
+    use otel_arrow_dfe_pdata::{OtapPayload, PayloadData};
     use tokio_stream::wrappers::TcpListenerStream;
 
     use super::*;
-    use crate::envelope::encode_record_batch;
+    use crate::envelope::{decode_record_set, encode_record_batch};
     use crate::metrics::RuntimeMetrics;
     use crate::receiver::tests::{CaptureSender, ready_collector};
     use crate::receiver::{DfeAdmission, PdataSender, allow_all_authenticator};
@@ -393,7 +398,12 @@ mod tests {
         Ok((completion.identity().clone(), Arc::new(current.arrow_schema()?)))
     }
 
-    fn pdata(table: &TableIdentity, schema: &Arc<arrow_schema::Schema>, ids: Vec<i64>) -> Result<OtapPdata> {
+    fn pdata(
+        table: &TableIdentity,
+        schema: &Arc<arrow_schema::Schema>,
+        ids: Vec<i64>,
+        shard_index: u8,
+    ) -> Result<OtapPdata> {
         let bodies = ids.iter().map(|id| Some(format!("row-{id}"))).collect::<Vec<_>>();
         let batch = RecordBatch::try_new(
             Arc::clone(schema),
@@ -406,6 +416,7 @@ mod tests {
             publication_id: Some(PublicationId::new()),
             ingested_at_ms: None,
             table: table.clone(),
+            shard_index,
             source_schema_version: SchemaVersion::FIRST,
             target_schema_version: SchemaVersion::FIRST,
             lease_id: LeaseId::new(),
@@ -446,7 +457,7 @@ mod tests {
 
         for ids in [vec![1, 2], vec![3]] {
             exporter
-                .forward(&mut client, &pdata(&table, &schema, ids)?)
+                .forward(&mut client, &pdata(&table, &schema, ids, 7)?)
                 .await
                 .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         }
@@ -480,6 +491,14 @@ mod tests {
             .map(|(_, pdata)| pdata.clone().num_items())
             .sum::<usize>();
         assert_eq!(rows, 3);
+        for (_, forwarded) in downstream.sender.sent.lock().expect("capture lock").iter() {
+            let (_, payload) = forwarded.clone().into_parts();
+            let PayloadData::PdataArrowRecords(records) = payload.into_data() else {
+                return Err(anyhow::anyhow!("downstream captured non-Arrow pdata"));
+            };
+            let decoded = decode_record_set(*records)?;
+            assert_eq!(decoded[0].envelope.shard_index, 7);
+        }
         Ok(())
     }
 
@@ -497,7 +516,7 @@ mod tests {
         let downstream = downstream().await?;
         let (mut exporter, mut client) = exporter(&downstream.endpoint)?;
         let error = exporter
-            .forward(&mut client, &pdata(&unknown, &schema, vec![1])?)
+            .forward(&mut client, &pdata(&unknown, &schema, vec![1], 0)?)
             .await
             .expect_err("unknown table must fail");
         assert!(error.permanent());

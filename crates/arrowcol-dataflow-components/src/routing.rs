@@ -590,6 +590,7 @@ mod tests {
             publication_id: Some(arrowcol_protocol::PublicationId::new()),
             ingested_at_ms: Some(time(1_000)),
             table: table(),
+            shard_index: 0,
             source_schema_version: arrowcol_catalog::SchemaVersion::FIRST,
             target_schema_version: arrowcol_catalog::SchemaVersion::FIRST,
             lease_id: draining.lease_id,
