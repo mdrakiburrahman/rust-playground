@@ -11,6 +11,7 @@ import { captureStampKustoBaseline, observeDataPreservation, validateStampKustoB
 import { createDefaultLifecycleActions } from './aks-lifecycle.js';
 import { createCellCleanupProviders, type CellStepProviders } from './aks-cell-cleanup.js';
 import { createDefaultScaleAdapter, restoreCampaignScaleTrials } from './aks-scale-provider.js';
+import { withCleanupDeadline } from './aks-cleanup-budget.js';
 import { buildAksPoolScalePayload } from './aks-arm-pool.js';
 
 function object(value: unknown): Record<string, unknown> {
@@ -248,28 +249,31 @@ export function createDefaultCleanupProviders(store: CampaignStore, options: Def
       const state = (await store.read())?.state;
       if (!state || canonical_json(state.runInventory) !== canonical_json(inventory)) throw new Error('Terminal capture inventory changed.');
       const unresolved = (state.scaleTrials ?? []).some(trial => !['restored', 'restore-stopped', 'reverted'].includes(trial.phase));
+      const terminalAuthority = unresolved ? withCleanupDeadline(authority, inventory.cleanup.terminal_capture.deadline_unix_ms) : authority;
       if (unresolved) {
-        await assertCleaningActor(store, authority);
-        const token = { ownerId: authority.ownerId, fencingToken: authority.fencingToken };
-        const scaleAdapter = createDefaultScaleAdapter(store, { azure, token, runCommand: options.runCommand, authority });
+        await assertCleaningActor(store, terminalAuthority);
+        const token = { ownerId: terminalAuthority.ownerId, fencingToken: terminalAuthority.fencingToken };
+        const scaleAdapter = createDefaultScaleAdapter(store, { azure, token, runCommand: options.runCommand, authority: terminalAuthority });
         if (await restoreCampaignScaleTrials(store, scaleAdapter, token) === 'pending') return 'pending';
       }
-      return lifecycle.captureTerminalState(inventory, key, authority);
+      return lifecycle.captureTerminalState(inventory, key, terminalAuthority);
     },
     recoverLifecycle: async (field, inventory, deadlineUnixMs, key, authority) => {
+      let recoveryAuthority = authority;
       if (field === 'terminal_capture') {
         const state = (await store.read())?.state;
         if (!state || canonical_json(state.runInventory) !== canonical_json(inventory)) throw new Error('Terminal recovery inventory changed.');
         const unresolved = (state.scaleTrials ?? []).some(trial => !['restored', 'restore-stopped', 'reverted'].includes(trial.phase));
         if (unresolved) {
-          await assertCleaningActor(store, authority);
-          const token = { ownerId: authority.ownerId, fencingToken: authority.fencingToken };
-          const scaleAdapter = createDefaultScaleAdapter(store, { azure, token, runCommand: options.runCommand, authority });
+          recoveryAuthority = withCleanupDeadline(authority, deadlineUnixMs);
+          await assertCleaningActor(store, recoveryAuthority);
+          const token = { ownerId: recoveryAuthority.ownerId, fencingToken: recoveryAuthority.fencingToken };
+          const scaleAdapter = createDefaultScaleAdapter(store, { azure, token, runCommand: options.runCommand, authority: recoveryAuthority });
           if (await restoreCampaignScaleTrials(store, scaleAdapter, token) === 'pending') return 'pending';
         }
       }
       if (!lifecycle.recoverLifecycle) return 'pending';
-      return lifecycle.recoverLifecycle(field, inventory, deadlineUnixMs, key, authority);
+      return lifecycle.recoverLifecycle(field, inventory, deadlineUnixMs, key, recoveryAuthority);
     },
     verifyCellPreservation: async (inventory, authority) => {
       await authority.assertCurrent();

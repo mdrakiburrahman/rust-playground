@@ -59,14 +59,18 @@ export async function persistScaleTrial(store: CampaignStore, receipt: ScaleTria
     for (const kind of ['apply', 'restore'] as const) {
       const prior = existing.dispatches?.[kind], next = receipt.dispatches?.[kind];
       if (!prior && next) {
-        if (next.state !== 'forwarding' || receipt.phase !== (kind === 'apply' ? 'apply-dispatch' : 'restore-dispatch'))
-          throw new CampaignFencedError('Scale dispatch receipt is not an exclusive forward-and-outcome transition.');
+        const intentPhase = kind === 'apply' ? 'apply-intent' : 'restore-intent';
+        if (next.state !== 'forwarding' || existing.phase !== intentPhase ||
+            receipt.phase !== (kind === 'apply' ? 'apply-dispatch' : 'restore-dispatch'))
+          throw new CampaignFencedError('Scale dispatch claim must atomically consume a fresh durable intent.');
         continue;
       }
       if (prior && !next) throw new CampaignFencedError('Scale dispatch receipt cannot be removed.');
       if (prior && next) {
         const { state: priorState, response_status: priorStatus, returncode: priorCode, operation_url: priorUrl, ...priorBinding } = prior;
         const { state: nextState, response_status: nextStatus, returncode: nextCode, operation_url: nextUrl, ...nextBinding } = next;
+        if (priorState === 'forwarding' && nextState === 'forwarding')
+          throw new CampaignFencedError('Scale dispatch claim is already durably occupied.');
         if (canonical_json(priorBinding) !== canonical_json(nextBinding) ||
             priorState !== nextState && (priorState !== 'forwarding' || !['confirmed', 'unknown'].includes(nextState)) ||
             priorState !== 'forwarding' && canonical_json(prior) !== canonical_json(next))

@@ -76,7 +76,7 @@ async function assertWriterBoundary(inventory: RunInventory, authority: CleanupM
   const ownedReplicaSets = replicaSets.filter(set => Array.isArray(set.metadata?.ownerReferences) && set.metadata.ownerReferences.some((owner: Record<string, unknown>) =>
     owner.kind === 'Deployment' && owner.uid === collector.uid && owner.controller === true));
   const activeReplicaSets = ownedReplicaSets.filter(set => (set.spec?.replicas ?? 0) > 0);
-  const activePods = pods.filter(pod => !pod.metadata?.deletionTimestamp && !['Succeeded', 'Failed'].includes(String(pod.status?.phase)));
+  const activePods = pods.filter(pod => !['Succeeded', 'Failed'].includes(String(pod.status?.phase)));
   const status = object(deployment.status ?? {}, 'Scale Deployment status');
   const replicas = spec.replicas;
   if (authority.mode === 'controller') {
@@ -220,7 +220,7 @@ export function createDefaultScaleAdapter(store: CampaignStore, options: {
               ['pods', '--namespace', inventory.namespace.name, '--selector', selectorText], authority!, runCommand);
             const items = object(list, 'Scale client pod list').items;
             if (!Array.isArray(items) || items.some(value => { const pod = object(value, 'Scale client pod');
-              return !pod.metadata?.deletionTimestamp && !['Succeeded', 'Failed'].includes(String(pod.status?.phase)); }))
+              return !['Succeeded', 'Failed'].includes(String(pod.status?.phase)); }))
               throw new Error('Stopped load generator still has physical pods; scale cleanup remains pending.');
           }
           value = replicas;
@@ -489,6 +489,10 @@ export async function restoreCampaignScaleTrials(store: CampaignStore, adapter: 
   if (!state) throw new Error('Scale cleanup requires a campaign receipt.');
   for (let receipt of [...(state.scaleTrials ?? [])].reverse()) {
     if (['restored', 'restore-stopped', 'reverted'].includes(receipt.phase)) continue;
+    if (receipt.dispatches?.restore && ['restore-dispatch', 'unknown'].includes(receipt.phase)) {
+      if (await adapter.reconcile(receipt.restore) !== 'after') return 'pending';
+      continue;
+    }
     if (['apply-intent', 'apply-dispatch', 'unknown'].includes(receipt.phase)) {
       const current = await adapter.reconcile(receipt.target);
       if (current === 'before') {

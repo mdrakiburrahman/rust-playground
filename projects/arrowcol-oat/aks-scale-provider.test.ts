@@ -99,7 +99,7 @@ interface PoolApiOptions { beforeGet?: (count: number) => void | Promise<void>; 
   status?: number; commitPut?: boolean; operationUrl?: string }
 function mockPoolApi(t: TestContext, azure: Azure, options: PoolApiOptions = {}) {
   const poolId = `${azure.c.base}/providers/Microsoft.ContainerService/managedClusters/${azure.c.cluster}/agentPools/benche64`;
-  let maxCount = 1, etag = '"pool-v1"', puts = 0, reads = 0;
+  let maxCount = 1, etag = '"pool-v1"', puts = 0, forwards = 0, reads = 0;
   const resource = () => ({ id: poolId, name: 'benche64', properties: { count: 0, vmSize: 'Standard_D64ds_v6',
     mode: 'User', provisioningState: 'Succeeded', enableAutoScaling: true, minCount: 0, maxCount } });
   t.mock.method(azure, 'arm', async (method: string, _resourceId: string) => {
@@ -111,7 +111,7 @@ function mockPoolApi(t: TestContext, azure: Azure, options: PoolApiOptions = {})
     assert.equal(new URL(url).pathname, poolId);
     if (method === 'GET') { await options.beforeGet?.(++reads);
       return [Buffer.from(JSON.stringify(resource())), { ':status': '200', etag }]; }
-    assert.equal(method, 'PUT'); assert.equal(headers['If-Match'], etag); puts++;
+    forwards++; assert.equal(method, 'PUT'); assert.equal(headers['If-Match'], etag); puts++;
     const properties = (JSON.parse(String(body)) as { properties: Record<string, unknown> }).properties;
     await options.onPut?.(properties);
     const status = options.status ?? 200;
@@ -119,7 +119,7 @@ function mockPoolApi(t: TestContext, azure: Azure, options: PoolApiOptions = {})
     if (options.commitPut !== false) { maxCount = Number(properties.maxCount); etag = '"pool-v2"'; }
     return [null, { ':status': String(status), ...(options.operationUrl ? { 'azure-asyncoperation': options.operationUrl } : {}) }];
   });
-  return { get puts() { return puts; }, get reads() { return reads; }, get maxCount() { return maxCount; }, setMaxCount(value: number) { maxCount = value; } };
+  return { get puts() { return puts; }, get forwards() { return forwards; }, get reads() { return reads; }, get maxCount() { return maxCount; }, setMaxCount(value: number) { maxCount = value; } };
 }
 function controllerState(current: CampaignState, receipt: ScaleTrialReceipt, now: number): CampaignState {
   const terminalIndex = CUSTODY_CLEANUP_STEPS.indexOf('record-terminal-state');
@@ -298,15 +298,30 @@ test('real provider does not replay a lost ARM acknowledgement after restart wit
   assert.equal(api.puts, 1);
 });
 
-test('concurrent real provider invocations admit only one ARM dispatch', async t => {
+test('concurrent same-millisecond dispatch claims admit only one actual ARM forward', async t => {
   const { store, azure } = await fixture();
-  let release!: () => void; const bothReads = new Promise<void>(resolve => { release = resolve; }); let reads = 0;
-  const api = mockPoolApi(t, azure, { beforeGet: async () => { if (++reads === 2) release(); await bothReads; } });
+  const api = mockPoolApi(t, azure), fixedNow = Date.now();
+  let release!: () => void; const bothClaims = new Promise<void>(resolve => { release = resolve; });
+  const claimBindings: Array<{ startedAt: number; requestHash: string }> = [];
+  const originalWrite = store.write.bind(store);
+  store.write = async (state, etag) => {
+    const receipt = state.scaleTrials?.at(-1), dispatch = receipt?.dispatches?.apply;
+    if (receipt?.phase === 'apply-dispatch' && dispatch?.state === 'forwarding') {
+      claimBindings.push({ startedAt: dispatch.started_at_ms, requestHash: dispatch.request_sha256 });
+      if (claimBindings.length === 2) release();
+      await bothClaims;
+    }
+    return originalWrite(state, etag);
+  };
   const target: ScaleTarget = { dimension: poolStep.dimension, before: poolStep.before, after: poolStep.after };
-  const adapter = createDefaultScaleAdapter(store, { azure, token, runCommand: scaleRunner() });
+  const adapter = createDefaultScaleAdapter(store, { azure, token, runCommand: scaleRunner(), now: () => fixedNow });
   await adapter.persistIntent(target, token, poolStep);
   await Promise.allSettled([adapter.apply(target, token), adapter.apply(target, token)]);
-  assert.equal(api.puts, 1);
+  assert.ok(claimBindings.length >= 2);
+  assert.equal(claimBindings[0]?.startedAt, fixedNow);
+  assert.equal(claimBindings[1]?.startedAt, fixedNow);
+  assert.equal(claimBindings[0]?.requestHash, claimBindings[1]?.requestHash);
+  assert.equal(api.forwards, 1);
 });
 
 test('final ARM observation refuses target drift and fence change before forwarding', async t => {
@@ -482,4 +497,152 @@ test('terminal cleanup can persist a confirmed no-effect scale trial as reverted
       status: index < terminalIndex ? 'complete' : index === terminalIndex ? 'running' : 'pending' })), scaleTrials: [receipt] };
   await persistScaleTrial(store, { ...receipt, phase: 'reverted' }, { ownerId, fencingToken: 2 });
   assert.equal(store.current!.state.scaleTrials?.[0]?.phase, 'reverted');
+});
+
+
+function cleanupLifecycle(order: string[] = []): ExternalCleanupActions {
+  const complete = async (..._args: unknown[]) => 'complete' as const;
+  return {
+    discoverExactInventory: async inventory => inventory, stopAdmission: complete, boundedDrain: complete, preserveEvidence: complete,
+    stopMaintenanceIfUidAndOwnerMatch: complete, captureTerminalState: async () => { order.push('terminal-capture'); return 'complete'; },
+    deleteNamespaceIfUidAndOwnerMatch: complete, deleteQapBindingIfOwned: complete, deleteFicIfExact: complete,
+    verifyCellPreservation: complete, restoreSafeIdle: complete, verifySafeIdle: complete,
+    recoverLifecycle: async () => { order.push('lifecycle-recovery'); return 'complete'; },
+  };
+}
+
+function stoppedCollectorDeployment(name: string, namespace: string, uid: string) {
+  return { apiVersion: 'apps/v1', kind: 'Deployment', metadata: { name, namespace, uid, generation: 1, resourceVersion: 'rv-collector' },
+    spec: { replicas: 0, strategy: { type: 'Recreate' }, selector: { matchLabels: { app: 'arrowcol' } },
+      template: { spec: { containers: [{ name: 'dataflow', resources: { requests: { cpu: '1', memory: '4Gi' }, limits: { cpu: '2', memory: '8Gi' } } }] } } },
+    status: { observedGeneration: 1, availableReplicas: 0, readyReplicas: 0 } };
+}
+
+test('cleanup treats a deleting but still-running collector pod as physically active', async t => {
+  const { store, azure, namespace } = await fixture(); const current = store.current!.state, now = Date.now();
+  const collector = current.runInventory!.resources.find(resource => resource.role === 'collector')!;
+  const receipt: ScaleTrialReceipt = { ...newScaleTrialReceipt({ state: current, step: cpuStep, now, resource: {
+    transport: 'kubernetes', resource_id: `apps/v1/Deployment/${namespace}/${collector.name}/${collector.uid}`,
+    api_version: 'apps/v1', kind: 'Deployment', namespace, name: collector.name, uid: collector.uid } }), phase: 'applied', fencing_token: 1 };
+  store.current!.state = controllerState(current, receipt, now);
+  const pod = { metadata: { name: 'terminating-arrowcol', deletionTimestamp: new Date(now).toISOString() },
+    status: { phase: 'Running', containerStatuses: [{ ready: false, state: { running: {} } }] } };
+  const cleanupToken = { ownerId, fencingToken: 2 };
+  const runner: CustodyCommandRunner = async args => {
+    if (args.includes('patch')) return { returncode: 0, stdout: '', stderr: '' };
+    if (args.includes('replicasets')) return { returncode: 0, stdout: JSON.stringify({ items: [] }), stderr: '' };
+    if (args.includes('pods')) return { returncode: 0, stdout: JSON.stringify({ items: [pod] }), stderr: '' };
+    if (args.includes('deployment')) return { returncode: 0, stdout: JSON.stringify(stoppedCollectorDeployment('arrowcol', namespace, collector.uid!)), stderr: '' };
+    throw new Error('Unexpected collector termination proof command.');
+  };
+  const adapter = createDefaultScaleAdapter(store, { azure, token: cleanupToken,
+    authority: { mode: 'controller', campaignId, ownerId, fencingToken: 2, assertCurrent: async () => {} }, runCommand: runner });
+  await assert.rejects(adapter.assertCustody(cleanupToken), /quiescent collector with zero desired, available and physical writer pods/);
+});
+
+test('stopped load generator remains active while a deleting pod is still running', async t => {
+  const { store, azure, namespace } = await fixture(); const current = store.current!.state, now = Date.now();
+  const collector = current.runInventory!.resources.find(resource => resource.role === 'collector')!;
+  const client = current.runInventory!.resources.find(resource => resource.role === 'client')!;
+  const receipt: ScaleTrialReceipt = { ...newScaleTrialReceipt({ state: current, step: clientStep, now, resource: {
+    transport: 'kubernetes', resource_id: `apps/v1/Deployment/${namespace}/${client.name}/${client.uid}`,
+    api_version: 'apps/v1', kind: 'Deployment', namespace, name: client.name, uid: client.uid } }), phase: 'kept', fencing_token: 1 };
+  store.current!.state = controllerState(current, receipt, now);
+  const cleanupToken = { ownerId, fencingToken: 2 };
+  const pod = { metadata: { name: 'terminating-client', deletionTimestamp: new Date(now).toISOString() },
+    status: { phase: 'Running', containerStatuses: [{ state: { running: {} } }] } };
+  const stoppedClient = { apiVersion: 'apps/v1', kind: 'Deployment', metadata: { name: client.name, namespace, uid: client.uid, generation: 1, resourceVersion: 'rv-client' },
+    spec: { replicas: 0, selector: { matchLabels: { app: 'arrowcol-client' } } }, status: { observedGeneration: 1, availableReplicas: 0 } };
+  const base = scaleRunner(stoppedClient, 0);
+  let patches = 0;
+  const runner: CustodyCommandRunner = async (args, timeout) => {
+    if (args.includes('pods') && args[args.indexOf('--selector') + 1] === 'app=arrowcol-client')
+      return { returncode: 0, stdout: JSON.stringify({ items: [pod] }), stderr: '' };
+    if (args.includes('patch')) patches++;
+    return base(args, timeout);
+  };
+  const adapter = createDefaultScaleAdapter(store, { azure, token: cleanupToken,
+    authority: { mode: 'controller', campaignId, ownerId, fencingToken: 2, assertCurrent: async () => {} }, runCommand: runner });
+  await adapter.persistIntent(receipt.restore, cleanupToken);
+  await assert.rejects(adapter.reconcile(receipt.restore), /Stopped load generator still has physical pods/);
+  assert.equal(patches, 0);
+});
+
+test('default executor reconciles a lost restore only after lagging read settles, without a second forward', async t => {
+  const { store, azure, namespace } = await fixture(); const current = store.current!.state, now = Date.now();
+  const collector = current.runInventory!.resources.find(resource => resource.role === 'collector')!;
+  const receipt: ScaleTrialReceipt = { ...newScaleTrialReceipt({ state: current, step: poolStep, now, resource: {
+    transport: 'azure-rest', resource_id: `${azure.c.base}/providers/Microsoft.ContainerService/managedClusters/${azure.c.cluster}/agentPools/benche64`,
+    api_version: '2024-10-01', kind: 'Microsoft.ContainerService/managedClusters/agentPools', namespace: null, name: 'benche64', uid: null } }),
+    phase: 'kept', fencing_token: 1 };
+  store.current!.state = controllerState(current, receipt, now);
+  const api = mockPoolApi(t, azure, { onPut: async () => { throw new Error('injected lost restore acknowledgement'); } });
+  api.setMaxCount(2);
+  const lifecycleOrder: string[] = [];
+  const actions = createDefaultCleanupProviders(store, { azure, workDirectory: '.', lifecycle: cleanupLifecycle(lifecycleOrder),
+    runCommand: scaleRunner(stoppedCollectorDeployment(collector.name, namespace, collector.uid!), 0) });
+  const execute = createExternalCleanupExecutor(store, { ...actions, discoverExactInventory: async inventory => inventory },
+    { maintenanceGraceSeconds: 900, maintenanceStopTimeoutMs: 1_200_000, budget_source: 'effective_stop_budgets' });
+  const step = 'record-terminal-state', key = `${campaignId}:2:${step}`;
+  await assert.rejects(execute(step, store.current!.state, key), /injected lost restore acknowledgement/);
+  assert.equal(store.current!.state.scaleTrials?.[0]?.dispatches?.restore?.state, 'unknown');
+  assert.equal(api.forwards, 1);
+  assert.equal(await execute(step, store.current!.state, key), 'pending');
+  assert.equal(api.forwards, 1);
+  api.setMaxCount(1);
+  assert.equal(await execute(step, store.current!.state, key), 'complete');
+  assert.equal(api.forwards, 1);
+  assert.equal(store.current!.state.scaleTrials?.[0]?.phase, 'restored');
+  assert.deepEqual(lifecycleOrder, ['lifecycle-recovery']);
+});
+
+test('default terminal execute refuses an expired persisted deadline before restore reads or forwards', async t => {
+  const { store, azure, namespace } = await fixture(); const current = store.current!.state, started = Date.now();
+  const collector = current.runInventory!.resources.find(resource => resource.role === 'collector')!;
+  const receipt: ScaleTrialReceipt = { ...newScaleTrialReceipt({ state: current, step: poolStep, now: started, resource: {
+    transport: 'azure-rest', resource_id: `${azure.c.base}/providers/Microsoft.ContainerService/managedClusters/${azure.c.cluster}/agentPools/benche64`,
+    api_version: '2024-10-01', kind: 'Microsoft.ContainerService/managedClusters/agentPools', namespace: null, name: 'benche64', uid: null } }),
+    phase: 'kept', fencing_token: 1 };
+  store.current!.state = controllerState(current, receipt, started);
+  const api = mockPoolApi(t, azure); api.setMaxCount(2);
+  let clock = started; t.mock.method(Date, 'now', () => clock);
+  const originalWrite = store.write.bind(store);
+  store.write = async (state, etag) => {
+    const result = await originalWrite(state, etag), terminal = state.runInventory?.cleanup.terminal_capture;
+    if (terminal?.state === 'running' && terminal.deadline_unix_ms !== null) clock = terminal.deadline_unix_ms + 1;
+    return result;
+  };
+  const actions = createDefaultCleanupProviders(store, { azure, workDirectory: '.', lifecycle: cleanupLifecycle(),
+    runCommand: scaleRunner(stoppedCollectorDeployment(collector.name, namespace, collector.uid!), 0) });
+  const execute = createExternalCleanupExecutor(store, { ...actions, discoverExactInventory: async inventory => inventory },
+    { maintenanceGraceSeconds: 900, maintenanceStopTimeoutMs: 1_200_000, budget_source: 'effective_stop_budgets' });
+  const step = 'record-terminal-state', key = `${campaignId}:2:${step}`;
+  const outcome = await execute(step, store.current!.state, key).then(() => null, error => error);
+  assert.deepEqual({ refused: outcome instanceof Error && outcome.message.includes('Cleanup stop deadline expired'), reads: api.reads, forwards: api.forwards },
+    { refused: true, reads: 0, forwards: 0 });
+  assert.ok(store.current!.state.scaleTrials![0]!.restore_deadline_at_ms > clock);
+});
+
+test('default terminal recovery refuses an expired persisted deadline before restore reads or forwards', async t => {
+  const { store, azure, namespace } = await fixture(); const current = store.current!.state, started = Date.now();
+  const collector = current.runInventory!.resources.find(resource => resource.role === 'collector')!;
+  const receipt: ScaleTrialReceipt = { ...newScaleTrialReceipt({ state: current, step: poolStep, now: started, resource: {
+    transport: 'azure-rest', resource_id: `${azure.c.base}/providers/Microsoft.ContainerService/managedClusters/${azure.c.cluster}/agentPools/benche64`,
+    api_version: '2024-10-01', kind: 'Microsoft.ContainerService/managedClusters/agentPools', namespace: null, name: 'benche64', uid: null } }),
+    phase: 'kept', fencing_token: 1 };
+  const campaign = controllerState(current, receipt, started), deadline = started + 120_000;
+  campaign.runInventory = { ...campaign.runInventory!, cleanup: { ...campaign.runInventory!.cleanup,
+    terminal_capture: { state: 'running', deadline_unix_ms: deadline, reason_code: null } } };
+  store.current!.state = campaign;
+  const api = mockPoolApi(t, azure); api.setMaxCount(2);
+  t.mock.method(Date, 'now', () => deadline + 1);
+  const actions = createDefaultCleanupProviders(store, { azure, workDirectory: '.', lifecycle: cleanupLifecycle(),
+    runCommand: scaleRunner(stoppedCollectorDeployment(collector.name, namespace, collector.uid!), 0) });
+  const execute = createExternalCleanupExecutor(store, { ...actions, discoverExactInventory: async inventory => inventory },
+    { maintenanceGraceSeconds: 900, maintenanceStopTimeoutMs: 1_200_000, budget_source: 'effective_stop_budgets' });
+  const step = 'record-terminal-state', key = `${campaignId}:2:${step}`;
+  const outcome = await execute(step, store.current!.state, key).then(() => null, error => error);
+  assert.deepEqual({ refused: outcome instanceof Error && outcome.message.includes('Cleanup stop deadline expired'), reads: api.reads, forwards: api.forwards },
+    { refused: true, reads: 0, forwards: 0 });
+  assert.ok(store.current!.state.scaleTrials![0]!.restore_deadline_at_ms > deadline + 1);
 });
