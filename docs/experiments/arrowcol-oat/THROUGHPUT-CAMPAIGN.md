@@ -71,7 +71,7 @@ For a bounded local run based on an independently validated, submitted OAT confi
 
 Replace the placeholder hash with the SHA-256 pinned in the frozen packet. Keep this output separate from the submitted config and manifests:
 
-~~~bash
+```bash
 FROZEN_CONFIG=out/arrowcol-oat/frozen-submitted-oat.json
 EXPECTED_SHA256=<64-character-packet-sha256>
 npx --no-install tsx projects/arrowcol-oat/throughput-sweeps.ts --render-all \
@@ -79,7 +79,7 @@ npx --no-install tsx projects/arrowcol-oat/throughput-sweeps.ts --render-all \
   --frozen-config "$FROZEN_CONFIG" --frozen-config-sha256 "$EXPECTED_SHA256" \
   --out out/arrowcol-oat/frozen-sweep-configs
 cat out/arrowcol-oat/frozen-sweep-configs/C5-grpc/render-provenance.json
-~~~
+```
 
 The generator hashes the PR #125 tunables profile as a seed, not a complete capability registry. Rendering rejects a different seed. The current matrix contains 8 baselines and 108 candidates (116 configs); all 116 passed the production `--validate-config` binary built with `cargo build --locked --package arrowcol-oat-rust` from source commit `22c1490edd7479831916be701213061fa39fb7d4`. The binary SHA-256 is `9c5bc506371ba533ade8bc3477be17ade82cda2a3139988d23cf3219f0706901`. `oat-config-throughput-validation.json` binds each rendered config SHA-256 to its final manifest SHA-256; the successor session evidence preserves exact commands, input hashes, exit codes, stdout/stderr, build logs, and hash-command output. Only the original 116-config matrix has a Rust validator source set with no diff from pinned base `5687e6459c424362f4504d21c32f954aa3b07d05`; that attribution does not cover the successor gRPC collector fields, which are validated separately below against source `731085583a486d252faf0d6c410d5cc7173fbde7`. The earlier 112-config result remains owner-attested only and is superseded. No staging-overlap candidates are included. Parser success proves config shape only, not admission, effective settings, runtime, or sustainable qualification. `runnable: false` retains the runtime hold. Regeneration resets validation status; do not treat config generation as validation.
 
