@@ -187,13 +187,22 @@ impl ArrowColFlightService {
         &self.drain
     }
 
-    /// Builds a tonic service with the runtime message-size limit.
+    /// Builds a tonic service with configured compression and message-size limits.
     #[must_use]
     pub fn into_tonic_service(self) -> FlightServiceServer<Self> {
         let maximum = self.limits.max_message_bytes;
-        FlightServiceServer::new(self)
+        let accept = self.limits.grpc_accept_compression;
+        let send = self.limits.grpc_send_compression;
+        let mut service = FlightServiceServer::new(self)
             .max_decoding_message_size(maximum)
-            .max_encoding_message_size(maximum)
+            .max_encoding_message_size(maximum);
+        if let Some(encoding) = accept {
+            service = service.accept_compressed(encoding);
+        }
+        if let Some(encoding) = send {
+            service = service.send_compressed(encoding);
+        }
+        service
     }
 
     /// Handles a generic `FlightData` stream, enabling focused tests without a
