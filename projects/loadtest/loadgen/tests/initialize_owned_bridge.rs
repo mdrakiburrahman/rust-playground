@@ -34,6 +34,10 @@ enum Case {
     WrongOwner,
     Expired,
     MissingBridge,
+    UnpairedBridge,
+    PublicInput,
+    Nonready,
+    WrongGeneration,
 }
 
 fn digest(bytes: &[u8]) -> String {
@@ -180,6 +184,10 @@ impl Parent {
                 let blobs = self
                     .objects
                     .iter()
+                    .filter(|(key, _)| {
+                        query.get("prefix").is_some_and(|prefix| key.starts_with(prefix))
+                            && query.get("startFrom").is_none_or(|cursor| *key >= cursor)
+                    })
                     .map(|(key, body)| {
                         format!(
                             "<Blob><Name>{key}</Name><Properties><Last-Modified>{STAMP}</Last-Modified>\
@@ -323,10 +331,19 @@ async fn run(case: Case) -> Result<Parent> {
             .objects
             .insert(format!("{table_path}/foreign"), "preserve-original".into());
     }
+    if matches!(case, Case::Nonready) {
+        parent.metadata.insert("resetstate".into(), "fenced-v1".into());
+    }
+    if matches!(case, Case::WrongGeneration) {
+        parent.metadata.insert("resetgeneration".into(), RUN.into());
+    }
     let plan_path = scratch.path().join("plan.json");
     let input_path = scratch.path().join("bridge.json");
     private_json(&plan_path, &plan)?;
     private_json(&input_path, &input)?;
+    if matches!(case, Case::PublicInput) {
+        std::fs::set_permissions(&input_path, std::fs::Permissions::from_mode(0o644))?;
+    }
     let marker = scratch.path().join("unexpected-auth");
     let az = scratch.path().join("az");
     std::fs::write(
@@ -353,10 +370,10 @@ async fn run(case: Case) -> Result<Parent> {
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     if !matches!(case, Case::MissingBridge) {
-        command
-            .arg("--storage-bridge-input")
-            .arg(&input_path)
-            .arg("--storage-bridge-stdio");
+        command.arg("--storage-bridge-input").arg(&input_path);
+        if !matches!(case, Case::UnpairedBridge) {
+            command.arg("--storage-bridge-stdio");
+        }
     }
     let mut child = command.spawn()?;
     let mut input_pipe = child.stdin.take().context("stdin")?;
@@ -455,6 +472,8 @@ async fn actual_cli_bridge_fresh_refusals_never_adopt_or_replay() -> Result<()> 
         Case::Conflict,
         Case::RotateBeforeCommit,
         Case::RefusedPut,
+        Case::Nonready,
+        Case::WrongGeneration,
     ] {
         let parent = run(case).await?;
         assert!(parent.receipt.is_none());
@@ -483,6 +502,16 @@ async fn actual_cli_bridge_fresh_refusals_never_adopt_or_replay() -> Result<()> 
         if matches!(case, Case::Conflict | Case::RefusedPut) {
             assert_eq!(parent.puts, 1, "intended refusal was not reached: {}", parent.error);
         }
+        if matches!(case, Case::Nonready | Case::WrongGeneration) {
+            assert!(!parent.requests.is_empty());
+            assert!(
+                parent
+                    .requests
+                    .iter()
+                    .all(|request| request["target"] == "control" && request["method"] == "HEAD")
+            );
+            assert_eq!(parent.members()?.len(), 1);
+        }
     }
     Ok(())
 }
@@ -504,7 +533,14 @@ async fn actual_cli_bridge_retains_registration_on_unknown_admission_write_or_dr
 
 #[tokio::test]
 async fn actual_cli_missing_or_invalid_bridge_fails_before_first_exchange() -> Result<()> {
-    for case in [Case::MissingBridge, Case::WrongRoot, Case::WrongOwner, Case::Expired] {
+    for case in [
+        Case::MissingBridge,
+        Case::UnpairedBridge,
+        Case::PublicInput,
+        Case::WrongRoot,
+        Case::WrongOwner,
+        Case::Expired,
+    ] {
         let parent = run(case).await?;
         assert!(parent.requests.is_empty());
         assert!(parent.objects.is_empty());
