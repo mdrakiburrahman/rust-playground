@@ -8,7 +8,7 @@ import { test } from 'node:test';
 import { stringify } from 'yaml';
 import { Azure, Config, exchange_workload_identity_assertion, runtime } from '../../infra/azure/bootstrap.js';
 import { defaultStampConfig } from '../../infra/azure/stamp.js';
-import { EffectBoundary, EffectBoundaryRefused, ResponseWithholdingSupervisor, dispatchExternalEffect, withEffectBoundary,
+import { EffectBoundary, EffectBoundaryRefused, ResponseWithholdingSupervisor, dispatchExternalEffect, processEffectRequest, withEffectBoundary,
   type EffectEnvelope, type EffectRule } from '../../infra/azure/effect-boundary.js';
 import { createBlobCampaignStore, managedIdentityToken, publishRunInventory, readArmOperationStatus, startCampaign,
   type CampaignState, type CampaignStore } from './aks-campaign.js';
@@ -264,6 +264,55 @@ test('producer rehearsal dispatches an accepted underscore cleanup selector', as
 });
 
 test('watchdog rehearsal returns its actual custody evaluation', async t => {
+test('terminal-capture restart validates the original withheld PATCH and never forwards it twice', async t => {
+  const directory = tempDir(); t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const state = createSyntheticArmedCampaignState(campaignId, runId);
+  const fixture = writeRehearsalFixture(directory, runId, state.runInventory!.cell_run_id);
+  const argv = ['--context', 'fixture-context', '--server', 'https://kubernetes.example',
+    'patch', 'deployment', 'arrowcol', '--namespace', state.runInventory!.namespace.name, '--type=json', '-p',
+    JSON.stringify([
+      { op: 'test', path: '/metadata/uid', value: 'c0ffee00-0000-4000-8000-000000000004' },
+      { op: 'test', path: '/metadata/resourceVersion', value: '17' },
+      { op: 'replace', path: '/spec/replicas', value: 0 },
+    ])];
+  const effect = processEffectRequest(['kubectl', ...argv]);
+  writeFileSync(fixture.allocationPath, JSON.stringify(envelope([
+    rule('terminal-patch', effect.transport, effect.method, effect.resource, effect.path),
+  ])), { mode: 0o600 });
+  const evidencePath = path.join(directory, 'patch-response.json');
+  const planPath = path.join(directory, 'withhold-plan.json');
+  writeFileSync(planPath, JSON.stringify({ schema_version: 1, campaign_id: campaignId, run_id: runId,
+    target: { transport: effect.transport, method: effect.method, resource: effect.resource, path: effect.path },
+    evidence_file: path.basename(evidencePath) }), { mode: 0o600 });
+  const args = ['--mode', 'producer-cleanup-step', '--selector', 'terminal_capture', '--env-file', fixture.envPath,
+    '--stamp-config', fixture.stampPath, '--effect-envelope', fixture.allocationPath,
+    '--receipt-file', fixture.receiptPath, '--inventory-file', fixture.inventoryPath, '--withhold-response', planPath];
+  let calls = 0, forwards = 0;
+  const campaignMain: NonNullable<BoundedEffectRehearsalDependencies['campaignMain']> = async (command) => {
+    assert.deepEqual(command.slice(0, 2), ['cleanup-step', 'terminal_capture']);
+    calls++;
+    if (calls === 1) {
+      await dispatchExternalEffect(effect, async () => {
+        forwards++;
+        return { returncode: 0, stdout: '', stderr: '' };
+      });
+      return;
+    }
+    await assert.rejects(dispatchExternalEffect(effect, async () => {
+      forwards++;
+      return { returncode: 0, stdout: '', stderr: '' };
+    }), EffectBoundaryRefused);
+  };
+  await assert.rejects(boundedEffectRehearsal(args, { store: inMemoryCampaignStore(state), campaignMain }),
+    /durably captured and withheld/);
+  const evidence = JSON.parse(readFileSync(evidencePath, 'utf8')) as Record<string, unknown>;
+  assert.equal(evidence.event, 'provider_response_withheld');
+  assert.equal(evidence.response_sha256 !== undefined, true);
+  assert.equal(evidence.returncode, 0);
+  await boundedEffectRehearsal([...args, '--resume'], { store: inMemoryCampaignStore(state), campaignMain });
+  assert.equal(calls, 2);
+  assert.equal(forwards, 1);
+});
   const directory = tempDir(); t.after(() => rmSync(directory, { recursive: true, force: true }));
   const state = createSyntheticArmedCampaignState(campaignId, runId);
   const fixture = writeRehearsalFixture(directory, runId, state.runInventory!.cell_run_id);

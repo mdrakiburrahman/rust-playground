@@ -33,10 +33,12 @@ export async function boundedEffectRehearsal(args: string[], dependencies: Bound
       mode === 'producer-cleanup-step' && (!selector || !Object.hasOwn(CELL_CLEANUP_SELECTORS, selector) || !inventoryFile || initialInventoryFile !== undefined) ||
       mode === 'watchdog-once' && (selector !== undefined || inventoryFile !== undefined || initialInventoryFile !== undefined || withholdResponseFile !== undefined || resume) ||
       mode === 'setup-baseline' && (selector !== undefined || inventoryFile !== undefined || !initialInventoryFile) ||
-      mode !== 'setup-baseline' && (initialInventoryFile !== undefined || resume) ||
-      resume && withholdResponseFile !== undefined ||
+      mode !== 'setup-baseline' && initialInventoryFile !== undefined ||
+      resume && !(mode === 'setup-baseline' || mode === 'producer-cleanup-step' && selector === 'terminal_capture') ||
+      resume && mode === 'setup-baseline' && withholdResponseFile !== undefined ||
+      resume && mode === 'producer-cleanup-step' && selector === 'terminal_capture' && withholdResponseFile === undefined ||
       withholdResponseFile !== undefined && !(mode === 'setup-baseline' || mode === 'producer-cleanup-step' && selector === 'terminal_capture'))
-    throw new Error('Usage: aks-effect-rehearsal.ts --mode producer-cleanup-step --selector SELECTOR --inventory-file PATH --env-file PATH --stamp-config PATH --effect-envelope PATH --receipt-file PATH | --mode watchdog-once with the same identity and effect arguments.');
+    throw new Error('Usage: aks-effect-rehearsal.ts --mode producer-cleanup-step --selector SELECTOR --inventory-file PATH --env-file PATH --stamp-config PATH --effect-envelope PATH --receipt-file PATH [--withhold-response PATH [--resume]] | --mode watchdog-once with the same identity and effect arguments.');
   const selected = loadCustodyConfig(['--env-file', envFile, '--stamp-config', stampConfig], false);
   const envelope = readEffectEnvelope(effectFile);
   if (envelope.subscription_id !== selected.config.subscription || envelope.resource_group !== selected.config.group ||
@@ -45,7 +47,8 @@ export async function boundedEffectRehearsal(args: string[], dependencies: Bound
   if (fs.existsSync(receiptFile) && fs.realpathSync(receiptFile) === fs.realpathSync(effectFile))
     throw new Error('Effect receipt and allocation envelope must be separate files.');
   const boundary = new EffectBoundary(envelope, receiptFile);
-  const responseWithholding = withholdResponseFile ? readResponseWithholdingPlan(withholdResponseFile, envelope, effectFile!, receiptFile!) : undefined;
+  const responseWithholding = withholdResponseFile
+    ? readResponseWithholdingPlan(withholdResponseFile, envelope, effectFile!, receiptFile!, resume) : undefined;
   if (responseWithholding && (mode === 'setup-baseline' ? responseWithholding.transport !== 'campaign-blob' : responseWithholding.transport !== 'process'))
     throw new Error('Response-withholding target does not match the selected rehearsal stage.');
   const azure = dependencies.azure ?? new Azure(selected.config);
@@ -107,7 +110,7 @@ function exactKeys(value: Record<string, unknown>, expected: string[]): boolean 
 }
 
 function readResponseWithholdingPlan(filename: string, envelope: ReturnType<typeof readEffectEnvelope>,
-  effectFile: string, receiptFile: string): ResponseWithholdingSupervisor {
+  effectFile: string, receiptFile: string, resume = false): ResponseWithholdingSupervisor | undefined {
   const value = readPrivateJson(filename);
   if (!isObject(value) || !exactKeys(value, ['schema_version', 'campaign_id', 'run_id', 'target', 'evidence_file']) ||
       value.schema_version !== 1 || value.campaign_id !== envelope.campaign_id || value.run_id !== envelope.run_id ||
@@ -131,6 +134,36 @@ function readResponseWithholdingPlan(filename: string, envelope: ReturnType<type
   const evidencePath = path.resolve(path.dirname(filename), value.evidence_file);
   if ([filename, effectFile, receiptFile].some(file => path.resolve(file) === evidencePath))
     throw new Error('Response-withholding evidence must be separate from its plan, allocation and receipt journal.');
+  if (resume) {
+    const evidence = readPrivateJson(evidencePath);
+    const common = ['schema_version', 'campaign_id', 'run_id', 'observed_at', 'event', 'transport', 'method', 'resource', 'path',
+      'response_sha256'];
+    const processEvidence = isObject(evidence) && Object.hasOwn(evidence, 'returncode');
+    if (!isObject(evidence) || !exactKeys(evidence, [...common, ...(typedTarget.body_sha256 === undefined ? [] : ['body_sha256']),
+        ...(processEvidence ? ['returncode'] : ['status'])]) ||
+        evidence.schema_version !== 1 || evidence.campaign_id !== envelope.campaign_id || evidence.run_id !== envelope.run_id ||
+        typeof evidence.observed_at !== 'string' || !Number.isFinite(Date.parse(evidence.observed_at)) ||
+        evidence.event !== 'provider_response_withheld' || evidence.transport !== typedTarget.transport ||
+        evidence.method !== typedTarget.method.toUpperCase() || evidence.resource !== typedTarget.resource || evidence.path !== typedTarget.path ||
+        typedTarget.body_sha256 !== undefined && evidence.body_sha256 !== typedTarget.body_sha256 ||
+        typeof evidence.response_sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(evidence.response_sha256) ||
+        processEvidence && (typeof evidence.returncode !== 'number' || !Number.isSafeInteger(evidence.returncode)) ||
+        !processEvidence && (typeof evidence.status !== 'number' || !Number.isSafeInteger(evidence.status)))
+      throw new Error('Response-withholding restart evidence does not bind the exact original effect response.');
+    let rows: unknown[];
+    try {
+      const text = fs.readFileSync(receiptFile, 'utf8');
+      if (Buffer.byteLength(text) > MAX_OUTPUT || !text.endsWith('\n')) throw new Error();
+      rows = text.trimEnd().split('\n').map(line => JSON.parse(line) as unknown);
+    } catch { throw new Error('Response-withholding restart requires the original bounded effect receipt journal.'); }
+    const matching = rows.filter(row => isObject(row) && row.event === 'result' && row.campaign_id === envelope.campaign_id &&
+      row.run_id === envelope.run_id && row.transport === typedTarget.transport && row.method === typedTarget.method.toUpperCase() &&
+      row.resource === typedTarget.resource && row.path === typedTarget.path &&
+      (typedTarget.body_sha256 === undefined || row.body_sha256 === typedTarget.body_sha256));
+    if (matching.length !== 1 || !isObject(matching[0]) || matching[0].outcome !== 'unknown_after_forward')
+      throw new Error('Response-withholding restart requires exactly one original UNKNOWN effect receipt; never replay or infer success.');
+    return undefined;
+  }
   return new ResponseWithholdingSupervisor(envelope.campaign_id, envelope.run_id, typedTarget, evidencePath);
 }
 
