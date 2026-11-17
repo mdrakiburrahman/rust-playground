@@ -209,6 +209,9 @@ impl ArrowColFlightService {
             service = service.send_compressed(encoding);
         }
         tonic::service::interceptor::InterceptedService::new(service, move |mut request: Request<()>| {
+            if send.is_none() {
+                return Ok(request);
+            }
             validate_metadata_size(request.metadata(), maximum_metadata).map_err(RuntimeError::into_status)?;
             // Tonic 0.14 selects any compiled codec once response compression is enabled.
             let configured = send.map(|encoding| match encoding {

@@ -486,6 +486,7 @@ async fn production_pingora_forwards_configured_shared_flight_compression() -> a
     let (_, schema) = compression_catalog().await?;
     for (accept, send, client_send, client_accept) in [
         ("none", "none", None, None),
+        ("none", "none", None, Some(CompressionEncoding::Zstd)),
         (
             "gzip",
             "gzip",
@@ -603,7 +604,19 @@ async fn production_pingora_forwards_configured_shared_flight_compression() -> a
                     .err()
                     .ok_or_else(|| anyhow::anyhow!("oversized request unexpectedly accepted"))?,
             };
-            assert_eq!(error.code(), Code::InvalidArgument);
+            println!(
+                "COMPRESSION_LIMIT_WITNESS request={client_send:?} code={:?} message={}",
+                error.code(),
+                error.message()
+            );
+            assert_eq!(
+                error.code(),
+                if client_send.is_some() {
+                    Code::ResourceExhausted
+                } else {
+                    Code::InvalidArgument
+                }
+            );
             assert_eq!(std::fs::read_to_string(format!("{state}/compression-rows"))?, "1");
 
             if client_send == test_codec(accept)? && client_accept == test_codec(send)? {
@@ -675,7 +688,7 @@ async fn compression_catalog() -> anyhow::Result<(Arc<dyn CatalogStore>, Catalog
     let store: Arc<dyn CatalogStore> = Arc::new(MemoryCatalogStore::new());
     CatalogControlPlane::new(DdlParser::default(), Arc::clone(&store))
         .execute_ddl(FlightSqlDdlRequest::new(
-            "CREATE TABLE telemetry.prod.traces (value BIGINT)",
+            "CREATE TABLE telemetry.prod.traces (value BIGINT) USING DELTA",
         ))
         .await?;
     let schema = store
