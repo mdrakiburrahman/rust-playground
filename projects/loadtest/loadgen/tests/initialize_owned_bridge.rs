@@ -28,6 +28,7 @@ enum Case {
     RotateBeforeCommit,
     RefusedPut,
     UnknownPut,
+    LostPutResponse,
     UnknownAdmission,
     UnknownDrain,
     WrongRoot,
@@ -376,7 +377,7 @@ async fn run(case: Case) -> Result<Parent> {
         }
     }
     let mut child = command.spawn()?;
-    let mut input_pipe = child.stdin.take().context("stdin")?;
+    let mut input_pipe = Some(child.stdin.take().context("stdin")?);
     let mut output = BufReader::new(child.stdout.take().context("stdout")?);
     let stderr = child.stderr.take().context("stderr")?;
     let errors = tokio::spawn(async move {
@@ -404,10 +405,18 @@ async fn run(case: Case) -> Result<Parent> {
                 parent.receipt = Some(value);
             } else {
                 ensure!(parent.receipt.is_none(), "effect after final receipt");
+                let disconnect = matches!(case, Case::LostPutResponse)
+                    && value["target"] == "object_store"
+                    && value["method"] == "PUT";
                 let reply = parent.exchange(value)?;
-                input_pipe.write_all(&serde_json::to_vec(&reply)?).await?;
-                input_pipe.write_all(b"\n").await?;
-                input_pipe.flush().await?;
+                if disconnect {
+                    input_pipe.take();
+                    continue;
+                }
+                let writer = input_pipe.as_mut().context("request after parent pipe closed")?;
+                writer.write_all(&serde_json::to_vec(&reply)?).await?;
+                writer.write_all(b"\n").await?;
+                writer.flush().await?;
             }
         }
         child.wait().await.context("CLI exit")
@@ -518,7 +527,12 @@ async fn actual_cli_bridge_fresh_refusals_never_adopt_or_replay() -> Result<()> 
 
 #[tokio::test]
 async fn actual_cli_bridge_retains_registration_on_unknown_admission_write_or_drain() -> Result<()> {
-    for case in [Case::UnknownAdmission, Case::UnknownPut, Case::UnknownDrain] {
+    for case in [
+        Case::UnknownAdmission,
+        Case::UnknownPut,
+        Case::LostPutResponse,
+        Case::UnknownDrain,
+    ] {
         let parent = run(case).await?;
         assert_eq!(parent.members()?.len(), 2);
         assert!(parent.receipt.is_none());
