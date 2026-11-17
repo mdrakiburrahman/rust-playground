@@ -325,6 +325,65 @@ fn scale_out_collector_identities(
     Ok(identities)
 }
 
+fn aggregate_scale_out_readings(
+    expected: &[ScaleOutCollectorIdentity],
+    mut samples: Vec<(ScaleOutCollectorIdentity, GuardReading, PublicationBacklogMetrics)>,
+) -> Result<(GuardReading, PublicationBacklogMetrics, Value)> {
+    samples.sort_by(|left, right| left.0.cmp(&right.0));
+    if expected.is_empty() || samples.iter().map(|sample| &sample.0).ne(expected.iter()) {
+        bail!("scale-out collector observations do not cover the original exact pod set");
+    }
+    let mut start = u64::MAX;
+    let mut end = 0;
+    let mut caps: Vec<GuardCap> = Vec::new();
+    let mut commits = Vec::new();
+    let mut publications = 0_u64;
+    let mut rows = 0_u64;
+    let mut logical_bytes = 0_u64;
+    let mut oldest_age_seconds = 0.0_f64;
+    let mut per_pod = Vec::new();
+    for (identity, reading, backlog) in samples {
+        if reading.request_start_ms > reading.timestamp_ms
+            || !backlog.available || backlog.status != "available" {
+            bail!("scale-out collector readback is incomplete or unavailable");
+        }
+        if reading.caps.len() != 3 || reading.caps.iter().zip([
+            "container_memory_bytes", "collector_rss_bytes", "collector_buffered_bytes"
+        ]).any(|(cap, name)| cap.metric != name || !cap.confirmed || cap.cap == 0) {
+            bail!("scale-out collector cap readback is incomplete");
+        }
+        start = start.min(reading.request_start_ms);
+        end = end.max(reading.timestamp_ms);
+        publications = publications.checked_add(backlog.publications.context("missing pending publications")?)
+            .context("pending publication count overflow")?;
+        rows = rows.checked_add(backlog.rows.context("missing pending rows")?).context("pending row count overflow")?;
+        logical_bytes = logical_bytes.checked_add(backlog.logical_bytes.context("missing pending bytes")?)
+            .context("pending byte count overflow")?;
+        let age = backlog.oldest_age_seconds.context("missing pending age")?;
+        if !age.is_finite() || age < 0.0 { bail!("invalid pending age") }
+        oldest_age_seconds = oldest_age_seconds.max(age);
+        per_pod.push(json!({"pod":identity.pod, "uid":identity.pod_uid,
+            "container_id":identity.container_id, "caps":reading.caps,
+            "publications":backlog.publications, "rows":backlog.rows, "logical_bytes":backlog.logical_bytes}));
+        for (index, cap) in reading.caps.into_iter().enumerate() {
+            if caps.len() <= index {
+                caps.push(cap);
+            } else if u128::from(cap.observed_value) * u128::from(caps[index].cap)
+                > u128::from(caps[index].observed_value) * u128::from(cap.cap) {
+                caps[index] = cap;
+            }
+        }
+        commits.extend(reading.commits);
+    }
+    if end.checked_sub(start).is_none_or(|duration| duration > GUARD_MAX_GAP_MS) {
+        bail!("scale-out collector observation spans an unsafe sampling gap");
+    }
+    Ok((GuardReading { request_start_ms:start, timestamp_ms:end, caps, commits },
+        PublicationBacklogMetrics { available:true, publications:Some(publications), rows:Some(rows),
+            logical_bytes:Some(logical_bytes), oldest_age_seconds:Some(oldest_age_seconds), status:"available".to_owned() },
+        json!(per_pod)))
+}
+
 struct GuardProbe {
     instance_id: String,
     rss_cap: u64,
@@ -1255,6 +1314,44 @@ mod overload_guard_tests {
             time,
             3000,
         )
+    }
+
+    #[test]
+    fn scale_out_aggregation_covers_every_pod_and_uses_worst_cap_fraction() -> Result<()> {
+        let identity = |n: u8| ScaleOutCollectorIdentity {
+            pod: format!("pod-{n}"), pod_uid: format!("uid-{n}"),
+            replica_set_uid: "rs".to_owned(), container_id: format!("container-{n}"),
+        };
+        let backlog = |rows| PublicationBacklogMetrics {
+            available:true, publications:Some(1), rows:Some(rows),
+            logical_bytes:Some(rows * 10), oldest_age_seconds:Some(1.0), status:"available".to_owned(),
+        };
+        let expected = vec![identity(0), identity(1)];
+        let mut second = reading(101, 600);
+        second.caps[0].cap = 700;
+        let (aggregate, pending, evidence) = aggregate_scale_out_readings(&expected, vec![
+            (identity(1), second, backlog(3)), (identity(0), reading(100, 800), backlog(2))
+        ])?;
+        assert_eq!(aggregate.caps[0].observed_value, 600);
+        assert_eq!(aggregate.caps[0].cap, 700);
+        assert_eq!(pending.rows, Some(5));
+        assert_eq!(pending.logical_bytes, Some(50));
+        assert_eq!(evidence.as_array().context("missing pod evidence")?.len(), 2);
+        assert!(aggregate_scale_out_readings(&expected, vec![(identity(0), reading(100, 0), backlog(1))]).is_err());
+        let mut unavailable = backlog(1);
+        unavailable.available = false;
+        assert!(aggregate_scale_out_readings(&expected, vec![
+            (identity(0), reading(100, 0), backlog(1)), (identity(1), reading(100, 0), unavailable)
+        ]).is_err());
+        let mut overflow = backlog(1);
+        overflow.rows = Some(u64::MAX);
+        assert!(aggregate_scale_out_readings(&expected, vec![
+            (identity(0), reading(100, 0), backlog(1)), (identity(1), reading(100, 0), overflow)
+        ]).is_err());
+        assert!(aggregate_scale_out_readings(&expected, vec![
+            (identity(0), reading(100, 0), backlog(1)), (identity(1), reading(5_101, 0), backlog(1))
+        ]).is_err());
+        Ok(())
     }
 
     #[test]
