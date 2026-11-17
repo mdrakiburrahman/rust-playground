@@ -991,8 +991,42 @@ pub struct OptimizeEvidence {
     pub plan: OptimizePlan,
 }
 
+fn layout_policy_sources(settings: &Settings, table_properties: &BTreeMap<String, String>) -> serde_json::Value {
+    let keys = [
+        "arrowcol.layout.enabled",
+        "arrowcol.layout.sortColumns",
+        "arrowcol.layout.bloomColumns",
+        "arrowcol.layout.maxRows",
+        "arrowcol.layout.maxInputSize",
+        "arrowcol.layout.rowGroupRows",
+        "arrowcol.layout.pageRows",
+    ];
+    let sources: BTreeMap<&str, &str> = keys
+        .into_iter()
+        .map(|key| {
+            let source = if table_properties.contains_key(key) {
+                "table"
+            } else if settings.process_properties.contains_key(key) {
+                "process"
+            } else {
+                "registry"
+            };
+            (key, source)
+        })
+        .collect();
+    serde_json::json!(sources)
+}
+
 impl OptimizeEvidence {
-    fn new(config: &OptimizeConfig, plan: OptimizePlan) -> Self {
+    fn new(config: &OptimizeConfig, plan: OptimizePlan, layout_sources: serde_json::Value) -> Self {
+        let resolved_layout = config.layout.as_ref().or(config.automatic_layout.as_ref());
+        let layout_mode = if config.layout.is_some() && !config.use_default_layout {
+            "explicit"
+        } else if config.automatic_layout.is_some() || config.use_default_layout {
+            "automatic"
+        } else {
+            "disabled"
+        };
         Self {
             config: serde_json::json!({
                 "sealed_final": config.sealed_final,
@@ -1014,14 +1048,19 @@ impl OptimizeEvidence {
                 "use_default_layout": config.use_default_layout,
                 "max_output_file_bytes": config.max_output_file_bytes,
                 "max_active_files": config.max_active_files,
-                "layout": config.layout.as_ref().map(|layout| serde_json::json!({
+                "layout_mode": layout_mode,
+                "layout_applied": plan.layout_fingerprint.is_some(),
+                "layout_fingerprint": plan.layout_fingerprint,
+                "output_policy_fingerprint": plan.output_policy_fingerprint,
+                "layout_sources": layout_sources,
+                "layout": plan.layout_fingerprint.as_ref().and_then(|_| resolved_layout.map(|layout| serde_json::json!({
                     "sort_columns": layout.sort_columns,
                     "max_rows": layout.max_rows,
                     "max_input_bytes": layout.max_input_bytes,
                     "row_group_rows": layout.row_group_rows,
                     "page_rows": layout.page_rows,
                     "bloom_columns": layout.bloom_columns,
-                })),
+                }))),
             }),
             plan,
         }
@@ -1298,15 +1337,21 @@ fn respond(mut stream: TcpStream, metrics: &Metrics) -> Result<()> {
     Ok(())
 }
 
+struct OperationProperties<'a> {
+    table: &'a BTreeMap<String, String>,
+    resolved: &'a ResolvedProps,
+}
+
 fn run_operation(
     settings: &Settings,
     table: &DeltaTable,
+    properties: OperationProperties<'_>,
     operation: Operation,
     anchor: i64,
     control: &MaintenanceControl,
     optimize: &mut Option<OptimizeEvidence>,
-    props: &ResolvedProps,
 ) -> Result<MaintenanceReport> {
+    let props = properties.resolved;
     let plan = match operation {
         Operation::Checkpoint => {
             return table.checkpoint_if_due_at(settings.checkpoint_every_commits, settings.apply, anchor);
@@ -1329,14 +1374,27 @@ fn run_operation(
             return Ok(plan.report());
         }
         Operation::Optimize => {
+            let automatic_layout = if settings.optimize.layout.is_none() && settings.optimize.use_default_layout {
+                Some(arrow_deltalake::layout::LayoutPolicy::from_properties(props)?)
+            } else {
+                None
+            };
+            let automatic_layout_sort_columns_explicit = props.raw.contains_key("arrowcol.layout.sortColumns");
             let config = OptimizeConfig {
+                automatic_layout,
+                automatic_layout_sort_columns_explicit,
                 granularity: settings.granularity,
                 now_ms: Some(anchor),
                 min_files_per_bin: usize::try_from(props.unsigned("arrowcol.optimize.minFiles")?)?,
                 ..settings.optimize.clone()
             };
-            let prepared = table.prepare_optimize(&config)?;
-            *optimize = Some(OptimizeEvidence::new(&config, prepared.plan.clone()));
+            let writer_config = arrow_deltalake::writer::process_config()?;
+            let prepared = table.prepare_optimize_with_writer_config(&config, writer_config)?;
+            *optimize = Some(OptimizeEvidence::new(
+                &config,
+                prepared.plan.clone(),
+                layout_policy_sources(settings, properties.table),
+            ));
             if settings.apply && (!prepared.plan.bins.is_empty() || config.sealed_final) {
                 let upload_buffer_bytes =
                     if settings.operation_limits.optimize_upload_mode == OptimizeUploadMode::BufferedMultipart {
@@ -1354,7 +1412,7 @@ fn run_operation(
                     &config,
                     control,
                     upload_buffer_bytes,
-                    arrow_deltalake::writer::process_config()?,
+                    writer_config,
                 );
             }
             MaintenancePlan::Optimize(prepared.plan)
@@ -1967,11 +2025,14 @@ fn maintain_table(
                 let report = run_operation(
                     effective,
                     table.as_ref().context("maintenance table")?,
+                    OperationProperties {
+                        table: &discovered.properties,
+                        resolved: props,
+                    },
                     operation,
                     anchor,
                     &control,
                     &mut optimize,
-                    props,
                 );
                 plan_apply_duration_ms = u64::try_from(planner_started.elapsed().as_millis()).unwrap_or(u64::MAX);
                 report

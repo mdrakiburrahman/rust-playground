@@ -170,9 +170,14 @@ fn one_shot_rejects_missing_allowlisted_tables_before_reporting_success() -> Res
 
 #[test]
 fn graceful_stop_does_not_interrupt_an_admitted_table_operation() -> Result<()> {
-    let (_root, mut settings, source) = fixture()?;
+    let (_root, mut settings, mut source) = fixture()?;
     settings.operations = vec![Operation::Optimize];
     settings.anchor_ms = None;
+    source
+        .0
+        .properties
+        .insert("arrowcol.optimize.minFiles".into(), "2".into());
+    persist_policy(&source)?;
     let stop = Arc::new(AtomicBool::new(false));
     let discovery = StopAtMaintenanceClock {
         source,
@@ -194,6 +199,66 @@ fn graceful_stop_does_not_interrupt_an_admitted_table_operation() -> Result<()> 
     assert!(
         results[0].error_kind.is_none(),
         "graceful shutdown interrupted admitted work: {results:?}"
+    );
+    let report = results[0].report.as_ref().context("admitted OPTIMIZE report")?;
+    assert_eq!(report.outcome, Outcome::Committed);
+    assert!(report.files_removed > 0 && report.files_added > 0, "{report:?}");
+    assert_eq!((report.rows_removed, report.rows_added), (2, 2));
+    Ok(())
+}
+
+#[test]
+fn automatic_layout_uses_table_policy_over_process_and_reports_applied_source() -> Result<()> {
+    let (_root, mut settings, mut source) = fixture()?;
+    settings.operations = vec![Operation::Optimize];
+    settings
+        .process_properties
+        .insert("arrowcol.optimize.minFiles".into(), "2".into());
+    settings
+        .process_properties
+        .insert("arrowcol.layout.sortColumns".into(), "missing".into());
+    settings
+        .process_properties
+        .insert("arrowcol.layout.maxRows".into(), "3".into());
+    settings
+        .process_properties
+        .insert("arrowcol.layout.bloomColumns".into(), "customer_id".into());
+    source
+        .0
+        .properties
+        .insert("arrowcol.optimize.minFiles".into(), "2".into());
+    source
+        .0
+        .properties
+        .insert("arrowcol.layout.sortColumns".into(), "id".into());
+    source.0.properties.insert("arrowcol.layout.maxRows".into(), "2".into());
+    source
+        .0
+        .properties
+        .insert("arrowcol.layout.bloomColumns".into(), "id".into());
+    persist_policy(&source)?;
+
+    let results = run_cycle_with_discovery(&settings, &source, &Metrics::new(), &Arc::new(AtomicBool::new(false)))?;
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert!(results[0].error_kind.is_none(), "{results:?}");
+    let evidence = results[0].optimize.as_ref().context("OPTIMIZE evidence")?;
+    assert_eq!(evidence.config["layout_mode"], "automatic");
+    assert_eq!(evidence.config["layout_applied"], true);
+    assert_eq!(evidence.config["layout"]["sort_columns"], serde_json::json!(["id"]));
+    assert_eq!(evidence.config["layout"]["max_rows"], 2);
+    assert_eq!(evidence.config["layout"]["bloom_columns"], serde_json::json!(["id"]));
+    assert_eq!(
+        evidence.config["layout_sources"]["arrowcol.layout.bloomColumns"],
+        "table"
+    );
+    assert_eq!(
+        evidence.config["layout_sources"]["arrowcol.layout.sortColumns"],
+        "table"
+    );
+    assert_eq!(evidence.config["layout_sources"]["arrowcol.layout.maxRows"], "table");
+    assert_eq!(
+        evidence.config["layout_sources"]["arrowcol.layout.rowGroupRows"],
+        "registry"
     );
     Ok(())
 }
