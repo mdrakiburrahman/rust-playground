@@ -553,6 +553,7 @@ mod tests {
             let mut request = Request::new(());
             request_metadata(&mut request, &table, Some(&signer), None)?;
             let headers = request.metadata().clone().into_headers();
+            assert!(!headers.contains_key("x-arrowcol-shard"));
             let now = UnixMillis::new(u64::try_from(
                 SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
             )?)?;
@@ -584,6 +585,7 @@ mod tests {
         let verifier = arrowcol_router_rust::EdgeVerifier::new(router_key?, 30_000)?;
         let mut request = Request::new(());
         request_metadata(&mut request, &table, Some(&signer?), None)?;
+        assert!(!request.metadata().contains_key("x-arrowcol-shard"));
         let now = UnixMillis::new(u64::try_from(
             SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
         )?)?;

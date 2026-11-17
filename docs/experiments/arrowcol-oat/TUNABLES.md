@@ -10,6 +10,20 @@
 | Durability | Requested WAL class is recorded separately from consumer evidence. Nondefault weaker durability must not be compared as equivalent to durable configurations. |
 | Cleanup | Only run-owned resources/configuration are changed. Existing namespace, identity, pinning and cleanup guards remain required. Never delete a resource group to clean up an experiment. |
 
+## Client data profile and identity
+
+| Setting | Contract |
+| --- | --- |
+| `client.data_profile` | Strict `diagnostic` (default) or `realistic`. Diagnostic preserves the older replayable values; `realistic` must be explicitly selected for D53 and uses documented field-specific Always On state categories, variable-width strings elsewhere, per-row numeric/timestamp values, GUID uniqueness, and a fresh row identity in `endpoint_url`. Diagnostic replay is not eligible for unique-delivery proof. |
+| Generation telemetry | `preparation.steady_state_generation` is `true` for realistic data because fresh identity-bearing frames are generated and encoded per logical send; it is `false` for diagnostic corpus replay. Startup generation rates do not represent the realistic hot path. |
+| `client.max_memory_bytes` | Strict positive byte cap. Startup reserves the conservative encoded corpus plus identity-bearing live-batch slots; realistic stream admission is semaphore-bounded to the number of slots that fit. Startup fails before registration or generation if the corpus and one live batch cannot fit. A live slot remains reserved through retries and releases on completion, error, or cancellation. |
+| Byte accounting | `completed_flight_data_bytes_uncompressed` and `completed_flight_data_bytes_configured_ipc_compression` count serialized FlightData protobuf lengths before and after the configured Arrow IPC compression. They exclude gRPC/HTTP/2 framing and are not logical Arrow buffer sizes. Legacy `completed_raw_arrow_bytes` / `completed_wire_bytes` fields remain aliases. |
+| `client.string_width` / `client.string_length_distribution` | Width defaults to 96 for generated realistic strings; distribution defaults to `uniform` for realistic and `fixed` for diagnostic. Categorical state labels use their natural lengths. The identity URL in realistic mode is additional required width and is included in the uncompressed FlightData byte total. |
+| `client.value_variation` / `client.guid_uniqueness` | Each accepts `cardinality` or `per_row`; realistic defaults to `per_row`, diagnostic to `cardinality`. `client.cardinality` and `client.skew` also select category frequencies; `client.entropy` controls generated strings, not categorical state labels. Required fixture columns are never nulled. |
+| Logical row identity | Realistic rows encode a client-generated `run_uuid`, client-incarnation UUID, worker, logical-batch sequence, and row ordinal in the existing `endpoint_url` value. The client-pod `client.pod_ordinal` (strict unsigned 32-bit; assign a distinct value to each client pod) salts generated GUIDs separately and is independent of routing. `run_uuid_source` and `incarnation_uuid_source` are `client_generated`; `oat_run_uuid` is null because OAT does not supply that UUID. Retries reuse the exact same values and encoded bytes; fresh sends and process restarts use disjoint identities. |
+| `logical_batch_manifest_v1` | The terminal `OAT_CLIENT_METRICS` receipt includes every logical batch's attempted count, acknowledgement/ambiguity outcome, retry count, and cohort. Cohorts use the exact half-open measurement interval `[start_unix_ms, end_unix_ms)`. Contiguous equivalent batches may be range-coalesced without changing their identities. |
+| Manifest limits | At most 1,000,000 logical batches and 1 MiB serialized terminal manifest. The complete `OAT_CLIENT_METRICS ` line, including its newline, is capped at 1 MiB. The client remeasures after manifest truncation; if non-manifest fields still exceed the cap, it emits a minimal bounded failed receipt that preserves the first terminal failure reason. Oversized or incomplete evidence cannot qualify as a pass. |
+
 ## AKS per-role resources
 
 | Role | Default request | Default limit |

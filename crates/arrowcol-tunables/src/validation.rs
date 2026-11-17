@@ -59,6 +59,19 @@ const CAPABILITIES: &[Capability] = &[
     capability!("client.workers", "0 (available parallelism)"),
     capability!("client.runtime_threads", "0 (automatic)"),
     capability!("client.data_mode", "shared"),
+    capability!("client.data_profile", "diagnostic"),
+    capability!(
+        "client.string_length_distribution",
+        "uniform (realistic), fixed (diagnostic)"
+    ),
+    capability!(
+        "client.value_variation",
+        "per_row (realistic), cardinality (diagnostic)"
+    ),
+    capability!(
+        "client.guid_uniqueness",
+        "per_row (realistic), cardinality (diagnostic)"
+    ),
     capability!("client.string_width", "0 (canonical fallback)"),
     capability!("client.cardinality", "1024"),
     capability!("client.null_fraction", "0"),
@@ -68,6 +81,7 @@ const CAPABILITIES: &[Capability] = &[
     capability!("client.max_memory_bytes", "536870912"),
     capability!("client.interval_us", "0"),
     capability!("client.connections_per_worker", "1"),
+    capability!("client.pod_ordinal", "0 (per-client GUID salt; u32)"),
     capability!("client.streams_per_worker", "0 (legacy concurrency)"),
     capability!("client.max_rows", "component default"),
     capability!("client.stream_retry_max_attempts", "4"),
@@ -3023,6 +3037,79 @@ mod tests {
             ..Default::default()
         };
         assert!(error_text(invalid.validate()).contains("entropy"));
+    }
+
+    #[test]
+    fn client_profile_and_pod_ordinal_are_strict_and_projected() -> Result<()> {
+        assert_eq!(ClientDataProfile::default(), ClientDataProfile::Diagnostic);
+        let defaults = Tunables::parse_oat_json(serde_json::json!({"client": {}}))?;
+        assert!(
+            !defaults
+                .environment_for(ComponentRole::Client)?
+                .contains_key("ARROWCOL_CLIENT_DATA_PROFILE")
+        );
+        assert_eq!(
+            capability_table()
+                .iter()
+                .find(|capability| capability.name == "client.data_profile")
+                .map(|capability| capability.default),
+            Some("diagnostic")
+        );
+
+        let config: Tunables = serde_json::from_str(
+            r#"{"client":{"data_profile":"realistic","string_length_distribution":"uniform","value_variation":"per_row","guid_uniqueness":"per_row","pod_ordinal":3}}"#,
+        )?;
+        config.validate_for_oat()?;
+        let env = config.environment_for(ComponentRole::Client)?;
+        for (name, value) in [
+            ("ARROWCOL_CLIENT_DATA_PROFILE", "realistic"),
+            ("ARROWCOL_CLIENT_STRING_LENGTH_DISTRIBUTION", "uniform"),
+            ("ARROWCOL_CLIENT_VALUE_VARIATION", "per_row"),
+            ("ARROWCOL_CLIENT_GUID_UNIQUENESS", "per_row"),
+            ("ARROWCOL_CLIENT_POD_ORDINAL", "3"),
+        ] {
+            assert_eq!(env[name], value);
+        }
+
+        for (field, value) in [
+            ("data_profile", "realistic-ish"),
+            ("string_length_distribution", "zipf"),
+            ("value_variation", "unique"),
+            ("guid_uniqueness", "unique"),
+        ] {
+            let input = serde_json::json!({"client": {field: value}});
+            assert!(
+                serde_json::from_value::<Tunables>(input).is_err(),
+                "{field} accepted {value}"
+            );
+        }
+
+        for (field, value) in [
+            ("shard_index_mode", serde_json::json!("fixed")),
+            ("fixed_shard_index", serde_json::json!(1)),
+        ] {
+            let input = serde_json::json!({"client": {field: value}});
+            assert!(
+                serde_json::from_value::<Tunables>(input).is_err(),
+                "removed key {field} was accepted"
+            );
+        }
+
+        let max_ordinal = Tunables {
+            client: Some(ClientTunables {
+                pod_ordinal: Some(u32::MAX),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        max_ordinal.validate()?;
+        assert!(
+            serde_json::from_value::<Tunables>(serde_json::json!({
+                "client": {"pod_ordinal": 4_294_967_296_u64}
+            }))
+            .is_err()
+        );
+        Ok(())
     }
 
     #[test]
