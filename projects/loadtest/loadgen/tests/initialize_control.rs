@@ -135,6 +135,7 @@ fn owned_plan() -> arrowcol_loadgen::initialize::OwnedRunTablePlan {
             "delta-v0-commit",
             "postwrite-table-list",
             "delta-v0-last-checkpoint",
+            "delta-v0-last-checkpoint-followup",
             "delta-v0-readback",
         ]
         .map(str::to_owned)

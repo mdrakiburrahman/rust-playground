@@ -633,9 +633,11 @@ test('real loadgen initializer composes with the Node BR3 planned-identity paren
     [['x-arrowcol-operation-id', PLANNED_STORAGE_OPERATION_IDS[3]]]);
   const deltaLastCheckpoint = signedObjectRequest(authority, deadline, 18, 'GET', checkpointUrl, '',
     [['x-arrowcol-operation-id', PLANNED_STORAGE_OPERATION_IDS[4]]]);
-  const deltaReadback = signedObjectRequest(authority, deadline, 19, 'GET', logUrl, '',
+  const deltaLastCheckpointFollowup = signedObjectRequest(authority, deadline, 19, 'GET', checkpointUrl, '',
     [['x-arrowcol-operation-id', PLANNED_STORAGE_OPERATION_IDS[5]]]);
-  const envelope = envelopeForRequests(authority, [...controlRequests, initialListing, logListing, deltaCommit, postwriteListing, deltaLastCheckpoint, deltaReadback]);
+  const deltaReadback = signedObjectRequest(authority, deadline, 20, 'GET', logUrl, '',
+    [['x-arrowcol-operation-id', PLANNED_STORAGE_OPERATION_IDS[6]]]);
+  const envelope = envelopeForRequests(authority, [...controlRequests, initialListing, logListing, deltaCommit, postwriteListing, deltaLastCheckpoint, deltaLastCheckpointFollowup, deltaReadback]);
   const custody = mutableCustodyStore(authority, now);
   const azure = { c: { account }, async token() { return 'offline-test-token'; } } as unknown as Azure;
   const ledgerPath = path.join(directory, 'storage-ledger.jsonl');
@@ -660,7 +662,8 @@ test('real loadgen initializer composes with the Node BR3 planned-identity paren
         deltaLogBody = typeof init.body === 'string' ? init.body : await new Response(init.body).text();
         return new Response(null, { status: 201, headers: { etag: '"delta-v0"' } });
       }
-      if (url.pathname.endsWith('/_delta_log/_last_checkpoint') && init?.method === 'GET') return new Response(null, { status: 404 });
+      if (url.pathname.endsWith('/_delta_log/_last_checkpoint') && init?.method === 'GET') return new Response(null,
+        { status: 404, headers: { 'x-ms-error-code': 'BlobNotFound' } });
       if (url.pathname.endsWith('/_delta_log/00000000000000000000.json') && init?.method === 'GET')
         return new Response(deltaLogBody ?? null, { status: deltaLogBody === undefined ? 404 : 200 });
       if (url.searchParams.get('comp') === 'list') {

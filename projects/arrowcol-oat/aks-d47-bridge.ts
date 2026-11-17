@@ -20,7 +20,7 @@ export const PLANNED_CONTROL_OPERATION_IDS = [
   'terminal-acquire', 'terminal-compare-read', 'terminal-metadata-write', 'terminal-release',
 ] as const;
 export const PLANNED_STORAGE_OPERATION_IDS = [
-  'preflight-table-list', 'preflight-log-list', 'delta-v0-commit', 'postwrite-table-list', 'delta-v0-last-checkpoint', 'delta-v0-readback',
+  'preflight-table-list', 'preflight-log-list', 'delta-v0-commit', 'postwrite-table-list', 'delta-v0-last-checkpoint', 'delta-v0-last-checkpoint-followup', 'delta-v0-readback',
 ] as const;
 type Obj = Record<string, unknown>;
 
@@ -883,14 +883,15 @@ export class StorageBridgeDispatcher {
       index === 1 ? exactList(tablePrefix + '_delta_log/', (tablePrefix + '_delta_log/').slice(0, -1)) :
       index === 2 ? request.method === 'PUT' && url.href === logUrl :
       index === 4 ? request.method === 'GET' && url.href === checkpointUrl :
-      index === 5 ? request.method === 'GET' && url.href === logUrl : false;
+      index === 5 ? request.method === 'GET' && url.href === checkpointUrl :
+      index === 6 ? request.method === 'GET' && url.href === logUrl : false;
     if (!phaseAllowed || !shapeAllowed)
       throw new Error(`Object-store request does not match planned marker ${expectedMarker} at control operation ${control.operationIndex}.`);
     return { operationIndex: index };
   }
   private recordPlannedStorageResponse(step: PlannedStorageStep | undefined, reply: StorageBridgeReply): void {
     if (!step || !this.storageProgress) return;
-    const expectedStatus = step.operationIndex === 2 ? 201 : step.operationIndex === 4 ? 404 : 200;
+    const expectedStatus = step.operationIndex === 2 ? 201 : step.operationIndex === 4 || step.operationIndex === 5 ? 404 : 200;
     this.storageProgress.operationIndex++;
     if (reply.outcome !== 'response' || reply.status !== expectedStatus) this.storageProgress.blocked = true;
   }
