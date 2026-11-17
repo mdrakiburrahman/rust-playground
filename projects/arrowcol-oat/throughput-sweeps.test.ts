@@ -184,6 +184,11 @@ test('renders C5 candidates against the committed seed without changing non-fact
   const seed = JSON.parse(readFileSync(new URL('../../docs/experiments/arrowcol-oat/oat-config.tuned.json', import.meta.url), 'utf8')) as unknown;
   const manifests = buildThroughputManifests(seed);
   const manifest = manifests.find(item => item.cohort === 'C5')!;
+  const successor = JSON.parse(readFileSync(new URL('../../docs/experiments/arrowcol-oat/oat-config-throughput-C5-grpc.json', import.meta.url), 'utf8')) as Record<string, unknown>;
+  assert.deepEqual(successor.comparisons, manifest.comparisons);
+  assert.deepEqual(successor.source_enum_coverage, manifest.source_enum_coverage);
+  assert.equal(successor.runnable, false);
+  assert.equal(successor.runtime_qualification, 'unqualified');
   const baseline = renderThroughputBaseline(seed, manifest);
   const baselineClient = at(baseline, ['tunables', 'client']) as Record<string, unknown>;
   assert.deepEqual({
