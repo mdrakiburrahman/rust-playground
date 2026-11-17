@@ -954,8 +954,8 @@ mod tests {
             local.push(row % 2 == 0);
             updated.push(row as i64 * 10_000);
         }
-        let mut columns = vec![
-            Arc::new(StringArray::from(replica_ids)) as _,
+        let mut columns: Vec<arrow::array::ArrayRef> = vec![
+            Arc::new(StringArray::from(replica_ids)),
             Arc::new(StringArray::from(group_ids)),
             Arc::new(StringArray::from(server_names)),
             Arc::new(StringArray::from(endpoints)),
@@ -967,11 +967,9 @@ mod tests {
                 .into_iter()
                 .map(|detail| Arc::new(StringArray::from(detail)) as _),
         );
-        columns.extend([
-            Arc::new(Int32Array::from(roles)) as _,
-            Arc::new(arrow::array::BooleanArray::from(local)),
-            Arc::new(arrow::array::Int64Array::from(updated)),
-        ]);
+        columns.push(Arc::new(Int32Array::from(roles)));
+        columns.push(Arc::new(arrow::array::BooleanArray::from(local)));
+        columns.push(Arc::new(arrow::array::Int64Array::from(updated)));
         Ok(RecordBatch::try_new(Arc::clone(schema), columns)?)
     }
 
