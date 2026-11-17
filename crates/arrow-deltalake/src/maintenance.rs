@@ -2166,12 +2166,21 @@ pub struct EndpointSnapshotReceipt {
     pub rows: u64,
 }
 
-/// Read `endpoint_url` from one fixed Delta snapshot without opening a publisher.
+/// Refuse the unsupported in-process identity scan.
 ///
 /// # Errors
-/// Rejects unsupported table features, unsafe paths, incomplete or changed files,
-/// excessive active files or row groups, null identities, and callback failures.
+/// Always rejects until a resource-isolated worker owns snapshot construction and decoding.
 pub fn scan_active_endpoint_urls(
+    _root: &Url,
+    _max_files: usize,
+    _observe: impl FnMut(&arrow::array::StringViewArray) -> Result<()>,
+) -> Result<EndpointSnapshotReceipt> {
+    anyhow::bail!("identity scan is disabled: bounded worker and fenced store are not available")
+}
+
+// Retained only as source material for the isolated successor; no production caller can select it.
+#[allow(dead_code)]
+fn scan_active_endpoint_urls_unbounded(
     root: &Url,
     max_files: usize,
     mut observe: impl FnMut(&arrow::array::StringViewArray) -> Result<()>,
@@ -2313,6 +2322,19 @@ pub fn scan_active_endpoint_urls(
 mod range_reader_tests {
     use super::*;
     use object_store::memory::InMemory;
+
+    #[test]
+    fn in_process_identity_scan_fails_before_callback() -> Result<()> {
+        let root = Url::parse("file:///does-not-exist/")?;
+        let mut called = false;
+        let result = scan_active_endpoint_urls(&root, 1, |_| {
+            called = true;
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert!(!called);
+        Ok(())
+    }
 
     #[tokio::test]
     async fn rejects_replaced_input_between_range_requests() -> Result<()> {
