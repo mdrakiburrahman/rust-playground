@@ -549,17 +549,17 @@ mod storage_bridge {
             };
             let deadline = self.deadline.min(Instant::now() + Duration::from_secs(10));
             let remaining = deadline.saturating_duration_since(Instant::now());
-            if target == "object_store" {
-                if let Some(operation_ids) = &self.planned_object_operation_ids {
-                    let index = self.next_planned_object_operation.fetch_add(1, Ordering::Relaxed);
-                    let Some(operation_id) = operation_ids.get(index) else {
-                        return Outcome::NotSent(Code::InvalidRequest);
-                    };
-                    let Ok(value) = reqwest::header::HeaderValue::from_bytes(operation_id.as_bytes()) else {
-                        return Outcome::NotSent(Code::InvalidRequest);
-                    };
-                    request.headers_mut().insert("x-arrowcol-operation-id", value);
-                }
+            if target == "object_store"
+                && let Some(operation_ids) = &self.planned_object_operation_ids
+            {
+                let index = self.next_planned_object_operation.fetch_add(1, Ordering::Relaxed);
+                let Some(operation_id) = operation_ids.get(index) else {
+                    return Outcome::NotSent(Code::InvalidRequest);
+                };
+                let Ok(value) = reqwest::header::HeaderValue::from_bytes(operation_id.as_bytes()) else {
+                    return Outcome::NotSent(Code::InvalidRequest);
+                };
+                request.headers_mut().insert("x-arrowcol-operation-id", value);
             }
             let Ok(remaining_timeout_ms) = u64::try_from(remaining.as_millis()) else {
                 return Outcome::NotSent(Code::DeadlineExceeded);
