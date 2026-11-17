@@ -20,6 +20,23 @@ const subscriptionId = 'c0ffee00-0000-4000-8000-000000000003';
 const resourceId = `/subscriptions/${subscriptionId}/resourceGroups/perf69/providers/Microsoft.ContainerService/managedClusters/bench`;
 const operationUrl = `https://management.azure.com/subscriptions/${subscriptionId}/providers/Microsoft.ContainerService/locations/westus/operations/123?api-version=2024-10-01`;
 
+function chunkedResponse(chunks: Uint8Array[], headers: Record<string, string> = {}, close = true) {
+  let cancelled = false, index = 0;
+  const body = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (index < chunks.length) {
+        controller.enqueue(chunks[index++]!);
+        if (close && index === chunks.length) controller.close();
+      }
+    },
+    cancel() { cancelled = true; },
+  });
+  return {
+    response: new Response(body, { status: 200, headers: { etag: '"state-v1"', ...headers } }),
+    wasCancelled: () => cancelled,
+  };
+}
+
 class MemoryStore implements CampaignStore {
   current?: StoredCampaign;
   revision = 0;
@@ -489,4 +506,53 @@ test('campaign Blob store keeps the default record path and supports isolated pa
     '/checkpoints/_arrowcol-custody-rehearsal/rehearsal-1/active.json']);
   assert.throws(() => createBlobCampaignStore({ ...config, recordPath: '../active.json' }, fetcher,
     async () => 'fixture-token'), /Campaign store record path is invalid/);
+});
+
+test('campaign store reads a chunked body exactly at its caller byte cap when Content-Length is absent', async () => {
+  const state = newCampaignState(campaignId, ownerId, Date.now());
+  const bytes = Buffer.from(JSON.stringify(state), 'utf8');
+  const split = Math.floor(bytes.length / 2);
+  const chunked = chunkedResponse([bytes.subarray(0, split), bytes.subarray(split)]);
+  assert.equal(chunked.response.headers.get('content-length'), null);
+  const store = createBlobCampaignStore({ account: 'arrowcollector12345', container: 'checkpoints', subscriptionId },
+    async () => chunked.response, async () => 'fixture-token');
+  assert.deepEqual(await store.read({ maxResponseBodyBytes: bytes.length }), { state, etag: '"state-v1"' });
+  assert.equal(chunked.wasCancelled(), false);
+});
+
+test('campaign store counts streamed bytes despite a deceptive Content-Length and cancels overflow', async () => {
+  const state = newCampaignState(campaignId, ownerId, Date.now());
+  const bytes = Buffer.from(JSON.stringify(state), 'utf8');
+  const overflow = Buffer.concat([bytes, Buffer.from(' ')]);
+  const chunked = chunkedResponse([overflow], { 'content-length': String(bytes.length) }, false);
+  const store = createBlobCampaignStore({ account: 'arrowcollector12345', container: 'checkpoints', subscriptionId },
+    async () => chunked.response, async () => 'fixture-token');
+  await assert.rejects(store.read({ maxResponseBodyBytes: bytes.length }), /byte cap/);
+  assert.equal(chunked.wasCancelled(), true);
+});
+
+test('campaign store preserves split UTF-8 and rejects invalid UTF-8 under the cap', async () => {
+  const state = newCampaignState(campaignId, ownerId, Date.now());
+  const text = JSON.stringify({ ...state, unexpected: '💠' });
+  const bytes = Buffer.from(text, 'utf8'), symbol = Buffer.from('💠', 'utf8');
+  const symbolStart = bytes.indexOf(symbol), split = symbolStart + 2;
+  const splitBody = chunkedResponse([bytes.subarray(0, split), bytes.subarray(split)]);
+  const config = { account: 'arrowcollector12345', container: 'checkpoints', subscriptionId };
+  const splitStore = createBlobCampaignStore(config, async () => splitBody.response, async () => 'fixture-token');
+  await assert.rejects(splitStore.read({ maxResponseBodyBytes: bytes.length }), /unknown fields/);
+
+  const invalid = Buffer.concat([Buffer.from(JSON.stringify(state), 'utf8'), Buffer.from([0xff])]);
+  const invalidBody = chunkedResponse([invalid]);
+  const invalidStore = createBlobCampaignStore(config, async () => invalidBody.response, async () => 'fixture-token');
+  await assert.rejects(invalidStore.read({ maxResponseBodyBytes: invalid.length }), /not valid UTF-8/);
+});
+
+test('campaign store rejects zero response cap before token acquisition or network dispatch', async () => {
+  let tokens = 0, fetches = 0;
+  const store = createBlobCampaignStore({ account: 'arrowcollector12345', container: 'checkpoints', subscriptionId },
+    async () => { fetches++; return new Response(null, { status: 404 }); },
+    async () => { tokens++; return 'fixture-token'; });
+  await assert.rejects(store.read({ maxResponseBodyBytes: 0 }), /positive safe integer/);
+  assert.equal(tokens, 0);
+  assert.equal(fetches, 0);
 });
