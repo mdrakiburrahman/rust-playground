@@ -52,7 +52,7 @@ uuid = { version = "1", features = ["v4"] }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31.3", default-features = false, features = ["signal"], optional = true }
-rustix = { version = "1", features = ["process"] }
+rustix = { version = "1", features = ["process", "time"] }
 
 [lints]
 workspace = true
