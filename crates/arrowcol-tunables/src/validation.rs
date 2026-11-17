@@ -152,6 +152,7 @@ const CAPABILITIES: &[Capability] = &[
     capability!("router.upstream_idle_timeout_seconds", "60"),
     capability!("router.upstream_ping_interval_seconds", "15; 0 disables"),
     capability!("collector.batching.coalesce_publications", "false"),
+    capability!("collector.batching.age_flush_policy", "immediate"),
     capability!("collector.batching.global_capacity.bytes", "2147483648"),
     capability!("collector.batching.global_capacity.rows", "10000000"),
     capability!("collector.batching.global_capacity.batches", "4096"),
@@ -2686,6 +2687,7 @@ mod tests {
         let tunables = Tunables {
             collector: Some(CollectorTunables {
                 batching: Some(BatchingTunables {
+                    age_flush_policy: Some(AgeFlushPolicy::DrainReady),
                     max_age: Some("250ms".to_owned()),
                     global_capacity: Some(QueueCapacityTunables {
                         rows: Some(20_000_000),
@@ -2724,6 +2726,7 @@ mod tests {
         let env = tunables.environment_for(ComponentRole::Collector)?;
         let batching: serde_json::Value = serde_json::from_str(&env["ARROWCOL_COLLECTOR_BATCHING_CONFIG"])?;
         assert_eq!(batching["max_age"], "250ms");
+        assert_eq!(batching["age_flush_policy"], "drain_ready");
         assert_eq!(batching["global_capacity"]["rows"], 20_000_000);
         assert_eq!(env["ARROWCOL_COLLECTOR_COMMIT_CONFIG"], r#"{"batch_window":"1s"}"#);
         assert_eq!(env["ARROWCOL_COLLECTOR_LIMITS_CONFIG"], r#"{"admission_timeout":"5s"}"#);
@@ -2737,6 +2740,14 @@ mod tests {
         assert_eq!(env["ARROWCOL_COLLECTOR_LAYOUT_MAX_ROWS"], "100000");
         assert_eq!(env["ARROWCOL_COLLECTOR_RUNTIME_WORKERS"], "8");
         assert_eq!(env["ARROWCOL_COLLECTOR_BATCH_ROWS"], "16384");
+        for invalid in [serde_json::json!("drain_forever"), serde_json::json!(true)] {
+            assert!(
+                Tunables::parse_oat_json(serde_json::json!({
+                    "collector":{"batching":{"age_flush_policy":invalid}}
+                }))
+                .is_err()
+            );
+        }
         Ok(())
     }
 

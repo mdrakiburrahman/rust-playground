@@ -250,10 +250,21 @@ pub struct AdaptiveFileTunables {
     pub max_parquet_ratio: Option<f64>,
 }
 
+/// Collection behavior when the oldest queued batch reaches its age cutoff.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgeFlushPolicy {
+    #[default]
+    Immediate,
+    DrainReady,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BatchingTunables {
     pub coalesce_publications: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub age_flush_policy: Option<AgeFlushPolicy>,
     pub global_capacity: Option<QueueCapacityTunables>,
     pub per_table_capacity: Option<QueueCapacityTunables>,
     pub max_arrow_memory_per_flush: Option<u64>,
