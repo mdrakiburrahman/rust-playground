@@ -928,6 +928,107 @@ mod tests {
         ]))
     }
 
+    fn synthetic_availability_batch(start: usize, rows: usize, schema: &SchemaRef) -> Result<RecordBatch> {
+        let mut replica_ids = Vec::with_capacity(rows);
+        let mut group_ids = Vec::with_capacity(rows);
+        let mut server_names = Vec::with_capacity(rows);
+        let mut endpoints = Vec::with_capacity(rows);
+        let mut states = Vec::with_capacity(rows);
+        let mut errors = Vec::with_capacity(rows);
+        let mut details = Vec::with_capacity(rows);
+        let mut roles = Vec::with_capacity(rows);
+        let mut local = Vec::with_capacity(rows);
+        let mut updated = Vec::with_capacity(rows);
+        for row in start..start + rows {
+            let seed = row as u64 + 1;
+            replica_ids.push(synthetic_text(seed, 36));
+            group_ids.push(synthetic_text(seed ^ 0x9e37_79b9, 36));
+            server_names.push(synthetic_text(seed ^ 0x243f_6a88, 48));
+            endpoints.push(synthetic_text(seed ^ 0xb7e1_5162, 190));
+            states.push(synthetic_text(seed ^ 0xdead_beef, 24));
+            errors.push(synthetic_text(seed ^ 0x85eb_ca6b, 160));
+            details.push(synthetic_text(seed ^ 0xc2b2_ae35, 700));
+            roles.push((row % 3) as i32);
+            local.push(row % 2 == 0);
+            updated.push(row as i64 * 10_000);
+        }
+        Ok(RecordBatch::try_new(
+            Arc::clone(schema),
+            vec![
+                Arc::new(StringArray::from(replica_ids)),
+                Arc::new(StringArray::from(group_ids)),
+                Arc::new(StringArray::from(server_names)),
+                Arc::new(StringArray::from(endpoints)),
+                Arc::new(StringArray::from(states)),
+                Arc::new(StringArray::from(errors)),
+                Arc::new(StringArray::from(details)),
+                Arc::new(Int32Array::from(roles)),
+                Arc::new(arrow::array::BooleanArray::from(local)),
+                Arc::new(arrow::array::Int64Array::from(updated)),
+            ],
+        )?)
+    }
+
+    fn synthetic_text(mut state: u64, length: usize) -> String {
+        const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-";
+        let mut text = String::with_capacity(length);
+        for _ in 0..length {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            text.push(ALPHABET[(state as usize) % ALPHABET.len()] as char);
+        }
+        text
+    }
+
+    #[tokio::test]
+    #[ignore = "manual synthetic per-row-varying encode throughput benchmark"]
+    async fn synthetic_availability_replica_states_encode_benchmark() -> Result<()> {
+        let rows = std::env::var("W4_BENCH_ROWS")
+            .map(|value| value.parse::<usize>())
+            .transpose()?
+            .unwrap_or(131_072);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("replica_id", DataType::Utf8, false),
+            Field::new("group_id", DataType::Utf8, false),
+            Field::new("server_name", DataType::Utf8, false),
+            Field::new("endpoint_url", DataType::Utf8, false),
+            Field::new("state_desc", DataType::Utf8, false),
+            Field::new("last_connect_error", DataType::Utf8, false),
+            Field::new("health_details", DataType::Utf8, false),
+            Field::new("role", DataType::Int32, false),
+            Field::new("is_local", DataType::Boolean, false),
+            Field::new("last_update_ms", DataType::Int64, false),
+        ]));
+        let mut batches = Vec::new();
+        for start in (0..rows).step_by(1024) {
+            batches.push(synthetic_availability_batch(start, (rows - start).min(1024), &schema)?);
+        }
+        let input_bytes = batches.iter().try_fold(0u64, |total, batch| {
+            total
+                .checked_add(crate::record_batch_logical_bytes(batch)?)
+                .context("synthetic benchmark input byte count overflow")
+        })?;
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("availability-replica-states.parquet");
+        let mut writer = crate::ParquetFileWriter::create(&path, Arc::clone(&schema))?;
+        let requested_threads = writer.requested_encoding_threads();
+        let effective_threads = writer.effective_encoding_threads();
+        let started = std::time::Instant::now();
+        for batch in &batches {
+            writer.write(batch).await?;
+        }
+        writer.finish().await?;
+        let elapsed = started.elapsed().as_secs_f64();
+        let physical_bytes = std::fs::metadata(&path)?.len();
+        eprintln!(
+            "W4_BENCH profile=synthetic_availability_replica_states_v1 rows={rows} arrow_bytes={input_bytes} physical_bytes={physical_bytes} wall_seconds={elapsed:.3} input_mib_s={:.2} rows_s={:.0} requested_threads={requested_threads} effective_threads={effective_threads}",
+            input_bytes as f64 / elapsed / (1024.0 * 1024.0),
+            rows as f64 / elapsed,
+        );
+        Ok(())
+    }
+
     #[test]
     fn literal_dotted_paths_apply_and_ambiguous_selectors_fail() -> Result<()> {
         let literal = Arc::new(Schema::new(vec![Field::new("a.b", DataType::Int32, false)]));
