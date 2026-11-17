@@ -98,6 +98,294 @@ fn authority(state: &str) -> BTreeMap<String, String> {
     .collect()
 }
 
+fn owned_plan() -> arrowcol_loadgen::initialize::OwnedRunTablePlan {
+    arrowcol_loadgen::initialize::OwnedRunTablePlan {
+        account: ACCOUNT.into(),
+        container: CONTAINER.into(),
+        campaign_root: format!("abfss://tables@acct.dfs.core.windows.net/fixture/campaigns/{GENERATION}/"),
+        run_root: format!("abfss://tables@acct.dfs.core.windows.net/fixture/campaigns/{GENERATION}/runs/{ROTATED}/"),
+        campaign_id: GENERATION.into(),
+        run_id: ROTATED.into(),
+        generation: GENERATION.into(),
+        table: "telemetry.sqlserver.sqlserver_availability_replica_states".into(),
+        partition_by_ingestion_date: true,
+        owner_id: ROTATED.into(),
+        fencing_token: 7,
+    }
+}
+
+fn owned_authority(
+    plan: &arrowcol_loadgen::initialize::OwnedRunTablePlan,
+    fence: Arc<dyn arrow_deltalake::delta::PublicationFence>,
+) -> arrowcol_loadgen::initialize::OwnedRunTableAuthority {
+    arrowcol_loadgen::initialize::OwnedRunTableAuthority {
+        campaign_id: plan.campaign_id.clone(),
+        run_id: plan.run_id.clone(),
+        owner_id: plan.owner_id.clone(),
+        fencing_token: plan.fencing_token,
+        fence,
+    }
+}
+
+#[derive(Default)]
+struct SetupFence {
+    calls: AtomicUsize,
+    reject: bool,
+    collision: Option<(PathBuf, Vec<u8>)>,
+}
+
+impl arrow_deltalake::delta::PublicationFence for SetupFence {
+    fn check_before_commit(
+        &self,
+        context: &arrow_deltalake::delta::PublicationFenceContext<'_>,
+    ) -> std::result::Result<(), arrow_deltalake::delta::PublicationFenceError> {
+        use arrow_deltalake::delta::PublicationFenceError;
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        assert_eq!((context.proposed_version(), context.file_count()), (0, 0));
+        if self.reject {
+            return Err(PublicationFenceError::stale_ownership(
+                "original publication authority lost",
+            ));
+        }
+        if let Some((path, bytes)) = &self.collision {
+            let result = (|| -> Result<()> {
+                std::fs::create_dir_all(path.parent().context("log parent")?)?;
+                std::fs::write(path, bytes)?;
+                Ok(())
+            })();
+            result.map_err(|error| PublicationFenceError::check_failed(error.to_string()))?;
+        }
+        Ok(())
+    }
+}
+
+fn owned_transport(store: Arc<dyn ObjectStore>) -> arrow_deltalake::delta::FreshTableTransport {
+    arrow_deltalake::delta::FreshTableTransport {
+        store,
+        mutation_retries: arrow_deltalake::publisher::MutationRetries::Disabled,
+    }
+}
+
+fn owned_log_path(scratch: &Scratch) -> PathBuf {
+    scratch.data().join(format!(
+        "fixture/campaigns/{GENERATION}/runs/{ROTATED}/dataflow/telemetry/sqlserver/\
+         sqlserver_availability_replica_states/_delta_log/00000000000000000000.json"
+    ))
+}
+
+/// Offline production Kernel/session proof, with local storage and in-memory authority only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn owned_run_setup_creates_one_zero_row_table_and_refuses_collision_without_adoption() -> Result<()> {
+    use arrowcol_loadgen::initialize::initialize_owned_run_table_with;
+    let scratch = Scratch::new()?;
+    let mut initial = authority("ready-v1");
+    initial.insert("operatornote".into(), "preserve".into());
+    initial.insert("publishers".into(), format!(r#"{{"{ROTATED}":"active"}}"#));
+    let metadata = Memory::new(initial.clone());
+    let plan = owned_plan();
+    let fence = Arc::new(SetupFence::default());
+    let receipt = initialize_owned_run_table_with(
+        plan.clone(),
+        SANDBOX,
+        metadata.clone(),
+        owned_transport(local(&scratch)?),
+        owned_authority(&plan, fence.clone()),
+    )
+    .await?;
+    assert!(receipt.publisher_drained);
+    assert_eq!((receipt.delta.version, receipt.delta.active_files), (0, 0));
+    assert!(!receipt.delta.table_id.is_empty());
+    assert_eq!(receipt.delta.partition_columns, ["__arrowcol_ingestion"]);
+    assert!(receipt.delta.schema_json.contains("sample_time_utc__unix_nanos"));
+    assert_eq!(fence.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        metadata.metadata(),
+        initial,
+        "unrelated member and metadata survive drain"
+    );
+    let before = logs(&scratch.data())?;
+    assert_eq!(before.len(), 1);
+    let bytes = std::fs::read(owned_log_path(&scratch))?;
+    for line in std::str::from_utf8(&bytes)?.lines() {
+        assert!(serde_json::from_str::<serde_json::Value>(line)?.get("add").is_none());
+    }
+    assert_eq!(files(&scratch.data())?, 1, "no Parquet, checkpoint or other table");
+    assert!(
+        initialize_owned_run_table_with(
+            plan.clone(),
+            SANDBOX,
+            metadata.clone(),
+            owned_transport(local(&scratch)?),
+            owned_authority(&plan, fence.clone()),
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(logs(&scratch.data())?, before);
+    assert_eq!(metadata.metadata(), initial);
+    assert_eq!(fence.calls.load(Ordering::SeqCst), 1, "refused before commit");
+
+    let collision = Scratch::new()?;
+    let collision_fence = Arc::new(SetupFence {
+        collision: Some((owned_log_path(&collision), bytes.clone())),
+        ..SetupFence::default()
+    });
+    let error = initialize_owned_run_table_with(
+        plan.clone(),
+        SANDBOX,
+        metadata.clone(),
+        owned_transport(local(&collision)?),
+        owned_authority(&plan, collision_fence.clone()),
+    )
+    .await
+    .err()
+    .context("concurrent table was adopted")?;
+    assert!(format!("{error:#}").contains("conflict"), "{error:#}");
+    assert_eq!(collision_fence.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(std::fs::read(owned_log_path(&collision))?, bytes);
+    assert_eq!(metadata.metadata(), initial);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn owned_run_setup_refuses_bad_bindings_generation_authority_and_nonempty_targets() -> Result<()> {
+    use arrowcol_loadgen::initialize::initialize_owned_run_table_with;
+    let scratch = Scratch::new()?;
+    let initial = authority("ready-v1");
+    let metadata = Memory::new(initial.clone());
+    let original = owned_plan();
+    for (field, value) in [
+        ("generation", ""),
+        ("generation", "not-a-generation"),
+        ("generation", ROTATED),
+        ("account", "foreign"),
+        ("container", "foreign"),
+        ("run_id", GENERATION),
+        ("owner_id", ""),
+        ("table", "telemetry.sqlserver.sqlserver_active_sessions"),
+        ("run_root", "abfss://tables@acct.dfs.core.windows.net/unowned"),
+        ("campaign_root", "abfss://tables@acct.dfs.core.windows.net/arbitrary"),
+    ] {
+        let mut json = serde_json::to_value(&original)?;
+        json[field] = value.into();
+        let plan = serde_json::from_value(json)?;
+        assert!(
+            initialize_owned_run_table_with(
+                plan,
+                SANDBOX,
+                metadata.clone(),
+                owned_transport(local(&scratch)?),
+                owned_authority(&original, Arc::new(SetupFence::default())),
+            )
+            .await
+            .is_err(),
+            "{field}: {value}"
+        );
+        assert_eq!(metadata.metadata(), initial);
+        assert_eq!(files(&scratch.data())?, 0);
+    }
+    for state in ["fenced-v1", "cleaning-v1"] {
+        let state = authority(state);
+        let metadata = Memory::new(state.clone());
+        assert!(
+            initialize_owned_run_table_with(
+                original.clone(),
+                SANDBOX,
+                metadata.clone(),
+                owned_transport(local(&scratch)?),
+                owned_authority(&original, Arc::new(SetupFence::default())),
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(metadata.metadata(), state);
+    }
+    let fence = Arc::new(SetupFence {
+        reject: true,
+        ..SetupFence::default()
+    });
+    assert!(
+        initialize_owned_run_table_with(
+            original.clone(),
+            SANDBOX,
+            metadata.clone(),
+            owned_transport(local(&scratch)?),
+            owned_authority(&original, fence.clone()),
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(fence.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(metadata.metadata(), initial);
+    assert_eq!(files(&scratch.data())?, 0);
+    let path = owned_log_path(&scratch)
+        .parent()
+        .context("log directory")?
+        .parent()
+        .context("table")?
+        .join("foreign");
+    std::fs::create_dir_all(path.parent().context("parent")?)?;
+    std::fs::write(&path, "unowned data")?;
+    assert!(
+        initialize_owned_run_table_with(
+            original.clone(),
+            SANDBOX,
+            metadata.clone(),
+            owned_transport(local(&scratch)?),
+            owned_authority(&original, fence.clone()),
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(std::fs::read_to_string(path)?, "unowned data");
+    assert_eq!(fence.calls.load(Ordering::SeqCst), 1, "nonempty refused before commit");
+    assert_eq!(metadata.metadata(), initial);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn owned_run_setup_unknown_schema_mutation_retains_registration() -> Result<()> {
+    use arrowcol_loadgen::initialize::initialize_owned_run_table_with;
+    let scratch = Scratch::new()?;
+    let metadata = Memory::new(authority("ready-v1"));
+    let plan = owned_plan();
+    let error = initialize_owned_run_table_with(
+        plan.clone(),
+        SANDBOX,
+        metadata.clone(),
+        owned_transport(Arc::new(DataflowPutsTimeOut(LocalFileSystem::new_with_prefix(
+            scratch.data(),
+        )?))),
+        owned_authority(&plan, Arc::new(SetupFence::default())),
+    )
+    .await
+    .err()
+    .context("unknown creation succeeded")?;
+    assert!(format!("{error:#}").contains("registration retained"), "{error:#}");
+    assert_eq!(metadata.members()?, 1);
+    assert!(metadata.metadata()["publishers"].contains("uncertain"));
+    assert_eq!(files(&scratch.data())?, 0);
+    Ok(())
+}
+
+#[test]
+fn owned_run_cli_is_held_without_any_auth_or_session_admission() -> Result<()> {
+    let scratch = Scratch::new()?;
+    let input = scratch.0.join("plan.json");
+    std::fs::write(&input, serde_json::to_vec(&owned_plan())?)?;
+    assert_cmd::Command::cargo_bin("arrowcol-loadgen")?
+        .args(["initialize-owned-run-table", "--plan"])
+        .arg(&input)
+        .env("AZURE_CONFIG_DIR", scratch.0.join("no-credentials"))
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "per-operation auth/control/storage bridge is not wired",
+        ));
+    assert_eq!(files(&scratch.data())?, 0);
+    Ok(())
+}
+
 /// Disposable owned root; removed on drop.
 struct Scratch(PathBuf);
 

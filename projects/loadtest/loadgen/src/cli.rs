@@ -35,6 +35,8 @@ pub enum Command {
     AzureManifest(InitializeAzureArgs),
     /// Create one fresh local ingestion-partitioned table without connecting to Flight or sending rows.
     InitializeLocal(InitializeLocalArgs),
+    /// Validate one owned-run table plan; execution is held until the per-operation bridge is wired.
+    InitializeOwnedRunTable(InitializeOwnedRunTableArgs),
     /// Print the exact public Flight SQL schema fixture.
     PrintSchemas,
 }
@@ -133,6 +135,14 @@ pub struct InitializeLocalArgs {
     /// Absolute, existing, writable run-owned local Dataflow root.
     #[arg(long, required = true)]
     pub dataflow_root: PathBuf,
+}
+
+/// One fresh zero-row table; never the all-table bootstrap.
+#[derive(Clone, Debug, Args)]
+pub struct InitializeOwnedRunTableArgs {
+    /// Strict JSON plan binding storage, campaign/run, generation and publication authority.
+    #[arg(long)]
+    pub plan: PathBuf,
 }
 
 /// Benchmark scenario.

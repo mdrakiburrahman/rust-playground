@@ -2252,6 +2252,62 @@ struct GuardedCommitter {
     session: Option<Arc<PublisherSession>>,
 }
 
+struct FreshSchemaCommitter {
+    inner: GuardedCommitter,
+    fence: Arc<dyn PublicationFence>,
+    root: PathBuf,
+}
+
+impl Committer for FreshSchemaCommitter {
+    fn commit(
+        &self,
+        engine: &dyn Engine,
+        actions: DeltaResultIterator<'_, FilteredEngineData>,
+        metadata: CommitMetadata,
+    ) -> DeltaResult<CommitResponse> {
+        self.fence
+            .check_before_commit(&PublicationFenceContext {
+                table_path: &self.root,
+                read_version: 0,
+                proposed_version: 0,
+                file_count: 0,
+            })
+            .map_err(|error| delta_kernel::Error::generic(error.to_string()))?;
+        self.inner.commit(engine, actions, metadata)
+    }
+
+    fn is_catalog_committer(&self) -> bool {
+        false
+    }
+
+    fn publish(&self, engine: &dyn Engine, metadata: PublishMetadata) -> DeltaResult<()> {
+        self.inner.publish(engine, metadata)
+    }
+}
+
+/// Readback of one definite, fresh Kernel schema commit, before publisher drain.
+#[derive(Debug, serde::Serialize)]
+pub struct FreshTableReceipt {
+    /// Kernel-generated Delta table identity.
+    pub table_id: String,
+    /// Must be zero; no existing table is adopted.
+    pub version: u64,
+    /// Exact canonical Delta schema, including timestamp precision metadata.
+    pub schema_json: String,
+    /// Committed partition layout.
+    pub partition_columns: Vec<String>,
+    /// Must be zero; initialization does not publish data.
+    pub active_files: usize,
+}
+
+/// Explicit transport provenance for fresh initialization. Opaque retries are refused.
+pub struct FreshTableTransport {
+    /// Data transport; the initializer always adds the session guard.
+    pub store: Arc<dyn ObjectStore>,
+    /// Must be disabled, not inferred from a successful call.
+    pub mutation_retries: crate::publisher::MutationRetries,
+}
+
 impl Committer for GuardedCommitter {
     fn commit(
         &self,
@@ -2381,6 +2437,74 @@ impl DeltaTable {
         let table = Self::open_connection(url, partition_columns, None, Some(session))?;
         table.ensure_schema(normalize::schema(&schema)?)?;
         Ok(table)
+    }
+
+    /// Create exactly one fresh schema through a normal publisher and an explicit transport.
+    /// The caller must drop all tables and cleanly drain `session` before claiming success.
+    /// The transport must send mutations once; it is always wrapped by the session guard.
+    /// No default Azure transport or bootstrap authority is selected here.
+    ///
+    /// # Errors
+    /// Rejects bootstrap sessions, nonempty targets, fence refusal, conflicts, uncertain
+    /// creation, schema/layout drift, or active data. Never adopts/evolves an existing table.
+    pub fn initialize_fresh_url_with_session(
+        url: Url,
+        schema: SchemaRef,
+        partition_columns: Vec<String>,
+        session: Arc<PublisherSession>,
+        publication_fence: Arc<dyn PublicationFence>,
+        data: FreshTableTransport,
+    ) -> Result<FreshTableReceipt> {
+        if session.mode() != SessionMode::Publisher
+            || data.mutation_retries != crate::publisher::MutationRetries::Disabled
+        {
+            bail!("fresh table initialization requires a normal publisher and no mutation retries");
+        }
+        let incoming = normalize::schema(&schema)?;
+        let table = Self::open_connection_with_store(url, partition_columns, None, Some(session), Some(data.store))?;
+        let prefix = table.object_path("")?;
+        let store = Arc::clone(&table.store);
+        let nonempty = shared_executor()?.block_on(async move {
+            use futures::StreamExt;
+            store
+                .list(Some(&prefix))
+                .next()
+                .await
+                .transpose()
+                .map(|entry| entry.is_some())
+        })?;
+        if nonempty {
+            bail!("fresh table target is not empty; existing objects are never adopted");
+        }
+        table.create_schema(Arc::clone(&incoming), Some(publication_fence))?;
+        let snapshot = table.snapshot()?;
+        let metadata = snapshot.table_configuration().metadata();
+        let existing: arrow::datatypes::Schema = snapshot.schema().as_ref().try_into_arrow()?;
+        if snapshot.version() != 0 || existing != *incoming || metadata.partition_columns() != table.partition_columns {
+            bail!("fresh table schema/version/partition readback differs from creation");
+        }
+        for batch in Arc::clone(&snapshot)
+            .scan_builder()
+            .build()?
+            .scan_metadata(&table.engine)?
+        {
+            if batch?
+                .scan_files
+                .apply_selection_vector()?
+                .try_into_record_batch()?
+                .num_rows()
+                != 0
+            {
+                bail!("fresh table unexpectedly contains active data");
+            }
+        }
+        Ok(FreshTableReceipt {
+            table_id: metadata.id().to_string(),
+            version: snapshot.version(),
+            schema_json: metadata.schema_string().to_string(),
+            partition_columns: metadata.partition_columns().to_vec(),
+            active_files: 0,
+        })
     }
 
     /// [`Self::open_url`] for a schema already in canonical Delta representation
@@ -3062,24 +3186,7 @@ impl DeltaTable {
                     bail!("refusing to adopt non-Delta directory {}", self.root.display());
                 }
             }
-            let schema = Arc::new(StructType::try_from_arrow(Arc::clone(&incoming))?);
-            let mut builder =
-                delta_kernel::transaction::create_table::create_table(self.url.as_str(), schema, "arrow-deltalake");
-            if !self.partition_columns.is_empty() {
-                builder = builder.with_data_layout(delta_kernel::transaction::data_layout::DataLayout::partitioned(
-                    self.partition_columns.clone(),
-                ));
-            }
-            let transaction = builder.build(&self.engine, self.committer())?;
-            match transaction.commit(&self.engine)? {
-                CommitResult::Committed(_) | CommitResult::Conflicted(_) => {}
-                CommitResult::Retryable(retry) => {
-                    // A concurrently created table or unknown-success creation
-                    // must be loaded and validated, not blindly recreated.
-                    self.snapshot()
-                        .with_context(|| format!("uncertain table creation: {}", retry.error))?;
-                }
-            }
+            self.create_schema(Arc::clone(&incoming), None)?;
         }
         let snapshot = self.snapshot()?;
         Self::validate_retention(&snapshot)?;
@@ -3124,6 +3231,43 @@ impl DeltaTable {
         // Preparation and publication both refresh storage state; the cache only
         // avoids re-parsing historical metadata after checking log integrity.
         Ok(snapshot)
+    }
+
+    fn create_schema(&self, incoming: SchemaRef, fresh_fence: Option<Arc<dyn PublicationFence>>) -> Result<()> {
+        let schema = Arc::new(StructType::try_from_arrow(incoming)?);
+        let mut builder =
+            delta_kernel::transaction::create_table::create_table(self.url.as_str(), schema, "arrow-deltalake");
+        if !self.partition_columns.is_empty() {
+            builder = builder.with_data_layout(delta_kernel::transaction::data_layout::DataLayout::partitioned(
+                self.partition_columns.clone(),
+            ));
+        }
+        let strict = fresh_fence.is_some();
+        let committer: Box<dyn Committer> = if let Some(fence) = fresh_fence {
+            Box::new(FreshSchemaCommitter {
+                inner: GuardedCommitter {
+                    session: self.session.clone(),
+                },
+                fence,
+                root: self.root.clone(),
+            })
+        } else {
+            self.committer()
+        };
+        let transaction = builder.build(&self.engine, committer)?;
+        let result = transaction.commit(&self.engine)?;
+        if strict {
+            committed(result)?;
+        } else {
+            match result {
+                CommitResult::Committed(_) | CommitResult::Conflicted(_) => {}
+                CommitResult::Retryable(retry) => {
+                    self.snapshot()
+                        .with_context(|| format!("uncertain table creation: {}", retry.error))?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Resolve current table metadata for adaptive publication-group scheduling.

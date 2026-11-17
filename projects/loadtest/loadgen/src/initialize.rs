@@ -4,17 +4,187 @@ use std::{collections::BTreeSet, env, fs, path::Path, sync::Arc};
 
 use anyhow::{Context, Result, bail};
 use arrow::datatypes::{DataType, Field, Schema};
-use arrow_deltalake::delta::{DeltaTable, INGESTION_PARTITION};
+use arrow_deltalake::delta::{
+    DeltaTable, FreshTableReceipt, FreshTableTransport, INGESTION_PARTITION, PublicationFence,
+};
+use arrow_deltalake::publisher::{ControlMetadata, PublisherSession, SessionMode, canonical_uuid};
 use arrowcol_catalog::{DdlCommand, DdlParser};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::{
-    cli::{InitializeAzureArgs, InitializeLocalArgs},
+    cli::{InitializeAzureArgs, InitializeLocalArgs, InitializeOwnedRunTableArgs},
     schema::{SchemaStatement, schema_statements},
 };
 
 const INGESTION: &str = INGESTION_PARTITION;
+
+/// Strict input allocation for one fresh table, not permission to execute cloud operations.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnedRunTablePlan {
+    /// Exact selected ADLS account.
+    pub account: String,
+    /// Exact selected data container.
+    pub container: String,
+    /// Allocated campaign root, ending in `/campaigns/<campaign_id>/`.
+    pub campaign_root: String,
+    /// Exact run root: `<campaign_root>/runs/<run_id>/`.
+    pub run_root: String,
+    /// Canonical campaign identity.
+    pub campaign_id: String,
+    /// Canonical run identity.
+    pub run_id: String,
+    /// Captured normal-publisher reset generation.
+    pub generation: String,
+    /// Frozen canonical identity; no arbitrary schema or table selection.
+    pub table: String,
+    /// Must select the existing ingestion partition.
+    pub partition_by_ingestion_date: bool,
+    /// Original publication owner; never replaced with an initializer owner.
+    pub owner_id: String,
+    /// Original campaign publication fencing token.
+    pub fencing_token: u64,
+}
+
+impl OwnedRunTablePlan {
+    /// Validate the complete allocation before session admission or storage/authentication.
+    ///
+    /// # Errors
+    /// Rejects unowned/noncanonical roots, missing identity/generation/authority or another table.
+    pub fn validate(&self) -> Result<()> {
+        for value in [&self.campaign_id, &self.run_id, &self.generation, &self.owner_id] {
+            canonical_uuid(value)?;
+        }
+        if self.fencing_token == 0
+            || !self.partition_by_ingestion_date
+            || self.table != "telemetry.sqlserver.sqlserver_availability_replica_states"
+        {
+            bail!("owned-run initialization requires original authority, the frozen table and ingestion partition");
+        }
+        let campaign = checked_root(&self.campaign_root, &self.account, &self.container)?;
+        let run = checked_root(&self.run_root, &self.account, &self.container)?;
+        let suffix = format!("/campaigns/{}/", self.campaign_id);
+        if !campaign.path().ends_with(&suffix)
+            || campaign.path().contains("//")
+            || campaign
+                .path()
+                .bytes()
+                .any(|byte| byte.is_ascii_control() || byte == b' ')
+            || run != campaign.join(&format!("runs/{}/", self.run_id))?
+        {
+            bail!("owned-run root does not match the allocated campaign and run");
+        }
+        Ok(())
+    }
+
+    fn target(&self) -> Result<(Url, Arc<Schema>)> {
+        self.validate()?;
+        let statement = schema_statements()?
+            .into_iter()
+            .find(|statement| statement.identity.to_string() == self.table)
+            .context("frozen canonical table is absent")?;
+        let identity = &statement.identity;
+        let relative = format!(
+            "dataflow/{}/{}/{}",
+            identity.catalog(),
+            identity.schema(),
+            identity.table()
+        );
+        let root = checked_root(&self.run_root, &self.account, &self.container)?;
+        Ok((root.join(&relative)?, partitioned_schema(&statement)?))
+    }
+}
+
+/// Successful setup readback; emitted only after the actual publisher cleanly drains.
+#[derive(Debug, Serialize)]
+pub struct OwnedRunTableReceipt {
+    /// Original input binding, not fabricated provider evidence.
+    pub allocation: OwnedRunTablePlan,
+    /// Genuine Kernel schema-creation readback.
+    pub delta: FreshTableReceipt,
+    /// True only after `close_after_drain_async` returned success.
+    pub publisher_drained: bool,
+}
+
+/// Original authority captured by the caller, checked again by its fence at schema commit.
+/// The future bridge must derive this binding from the retained allocation, not ambient state.
+pub struct OwnedRunTableAuthority {
+    /// Original campaign.
+    pub campaign_id: String,
+    /// Original run.
+    pub run_id: String,
+    /// Original owner.
+    pub owner_id: String,
+    /// Original fencing token.
+    pub fencing_token: u64,
+    /// Guard executed at the real Kernel commit, not just during CLI validation.
+    pub fence: Arc<dyn PublicationFence>,
+}
+
+/// Validate the narrow setup command, then refuse all effects until its production bridge exists.
+///
+/// # Errors
+/// Always returns HOLD after input validation. No auth, registration, data or control I/O occurs.
+pub fn initialize_owned_run_table(args: InitializeOwnedRunTableArgs) -> Result<()> {
+    let plan: OwnedRunTablePlan = serde_json::from_slice(&fs::read(args.plan)?)?;
+    plan.validate()?;
+    bail!("owned-run setup HOLD: per-operation auth/control/storage bridge is not wired; nothing registered")
+}
+
+/// Production Kernel/session body with explicit control, data and original publication authority.
+/// Offline callers must label their transports as fixtures; no result proves live Azure coverage.
+/// The CLI deliberately cannot select this transport path until per-operation coverage is reviewed.
+///
+/// # Errors
+/// Refuses invalid allocations before admission, stale/non-ready authority, nonempty targets,
+/// conflicts and unknown outcomes. Drain failures never become successful setup receipts.
+pub async fn initialize_owned_run_table_with(
+    plan: OwnedRunTablePlan,
+    sandbox_id: &str,
+    control: Arc<dyn ControlMetadata>,
+    data: FreshTableTransport,
+    authority: OwnedRunTableAuthority,
+) -> Result<OwnedRunTableReceipt> {
+    let (url, schema) = plan.target()?;
+    if authority.campaign_id != plan.campaign_id
+        || authority.run_id != plan.run_id
+        || authority.owner_id != plan.owner_id
+        || authority.fencing_token != plan.fencing_token
+    {
+        bail!("owned-run table plan differs from the original publication authority");
+    }
+    let session = PublisherSession::open_with_control(
+        control,
+        sandbox_id,
+        &plan.account,
+        SessionMode::Publisher,
+        Some(&plan.generation),
+    )
+    .await?;
+    let owned_session = Arc::clone(&session);
+    let creation = tokio::task::spawn_blocking(move || {
+        DeltaTable::initialize_fresh_url_with_session(
+            url,
+            schema,
+            vec![INGESTION.to_owned()],
+            owned_session,
+            authority.fence,
+            data,
+        )
+    })
+    .await;
+    let drain = session.close_after_drain_async().await;
+    let delta = match (creation, drain) {
+        (Ok(Ok(delta)), Ok(())) => delta,
+        (creation, drain) => bail!("owned-run setup did not complete: creation={creation:?}; drain={drain:?}"),
+    };
+    Ok(OwnedRunTableReceipt {
+        allocation: plan,
+        delta,
+        publisher_drained: true,
+    })
+}
 
 #[derive(Debug, Serialize)]
 struct ManifestEntry {
