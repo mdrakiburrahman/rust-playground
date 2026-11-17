@@ -346,7 +346,12 @@ mod tests {
         let (first, second) = tokio::join!(first, second);
         assert_eq!(first?, Err("route full"));
         assert_eq!(second?, Ok(()));
-        let error = shutdown.finish(true).await.unwrap_err().to_string();
+        let error = shutdown
+            .finish(true)
+            .await
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("overlapping admission must remain pending"))?
+            .to_string();
         assert!(error.contains("never_staged=1"), "{error}");
         Ok(())
     }
@@ -376,7 +381,12 @@ mod tests {
         let (first, replacement) = tokio::join!(first, replacement);
         assert_eq!(first?, Err("route full"));
         assert_eq!(replacement?, Ok(()));
-        let error = shutdown.finish(true).await.unwrap_err().to_string();
+        let error = shutdown
+            .finish(true)
+            .await
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("replacement generation must remain pending"))?
+            .to_string();
         assert!(error.contains("never_staged=1"), "{error}");
         Ok(())
     }
