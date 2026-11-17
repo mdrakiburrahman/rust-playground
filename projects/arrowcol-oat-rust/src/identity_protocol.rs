@@ -1,6 +1,6 @@
 //! Bounded transport frames for the isolated identity reader.
 
-use std::io::{self, ErrorKind};
+use std::{fmt, io::{self, ErrorKind}};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 const HEADER_BYTES: u64 = 5;
@@ -38,10 +38,20 @@ impl FrameKind {
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Eq, PartialEq)]
 pub struct Frame {
     pub kind: FrameKind,
     pub payload: Vec<u8>,
+}
+
+impl fmt::Debug for Frame {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Frame")
+            .field("kind", &self.kind)
+            .field("payload_len", &self.payload.len())
+            .finish()
+    }
 }
 
 /// Read one frame; EOF is accepted only before the next header begins.
@@ -170,5 +180,12 @@ mod tests {
         );
         assert_eq!(budget, 32);
         Ok(())
+    }
+
+    #[test]
+    fn frame_debug_redacts_private_payload() {
+        let frame = Frame { kind: FrameKind::Request, payload: b"private-token".to_vec() };
+        let debug = format!("{frame:?}");
+        assert_eq!(debug, "Frame { kind: Request, payload_len: 13 }");
     }
 }
