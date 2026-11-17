@@ -199,3 +199,27 @@ async fn get_run(
         )
     })
 }
+
+#[cfg(test)]
+mod config_hash_tests {
+    use super::RunStatus;
+    use sha2::{Digest, Sha256};
+
+    #[test]
+    fn run_status_echoes_sha256_of_raw_config_bytes() {
+        let raw = br#"{  \"platform\": { \"kind\": \"local\" } }"#;
+        let expected: String = Sha256::digest(raw).iter().map(|byte| format!("{byte:02x}")).collect();
+        let status = RunStatus {
+            id: "123e4567-e89b-42d3-a456-426614174000".to_owned(),
+            config_sha256: expected.clone(),
+            state: super::RunState::Queued,
+            progress: "queued".to_owned(),
+            result_count: 0,
+            error: None,
+            started_at_unix_ms: 1,
+            finished_at_unix_ms: None,
+        };
+        assert_eq!(serde_json::to_value(status).unwrap()["config_sha256"], expected);
+        assert_ne!(expected, format!("{:x}", Sha256::digest(br#"{\"platform\":{\"kind\":\"local\"}}"#)));
+    }
+}
