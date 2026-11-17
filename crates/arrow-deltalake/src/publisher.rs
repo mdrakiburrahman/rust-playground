@@ -286,6 +286,9 @@ pub struct MetadataSnapshot {
 pub enum CasOutcome {
     /// The server definitively applied the replacement.
     Applied,
+    /// Metadata is confirmed applied, but terminal transport settlement failed.
+    /// The transition must not be replayed or reported as clean.
+    AppliedButUnsettled(String),
     /// Definitely not applied: busy, changed since `expected`, or lease lost.
     Conflict,
     /// Definitely not applied, for a non-retryable reason.
@@ -348,6 +351,27 @@ impl fmt::Display for UnknownTransition {
 
 impl std::error::Error for UnknownTransition {}
 
+/// Metadata was applied, but a terminal control operation did not settle cleanly.
+/// Membership reflects the confirmed write; this error must never cause replay.
+#[derive(Debug)]
+pub struct UnsettledTransition {
+    pub publisher: Uuid,
+    pub operation: &'static str,
+    detail: String,
+}
+
+impl fmt::Display for UnsettledTransition {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "publisher {} {} metadata applied but terminal settlement failed ({}); transition must not be replayed",
+            self.publisher, self.operation, self.detail
+        )
+    }
+}
+
+impl std::error::Error for UnsettledTransition {}
+
 fn is_unknown(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| cause.is::<UnknownTransition>())
 }
@@ -378,6 +402,14 @@ where
         let metadata = next.apply(&snapshot.metadata)?;
         match control.compare_and_set(&snapshot, &metadata).await {
             CasOutcome::Applied => return Ok(()),
+            CasOutcome::AppliedButUnsettled(detail) => {
+                return Err(UnsettledTransition {
+                    publisher,
+                    operation,
+                    detail,
+                }
+                .into());
+            }
             CasOutcome::Conflict => backoff(attempt).await,
             CasOutcome::Rejected(detail) => bail!("publisher {operation} rejected: {detail}"),
             CasOutcome::Unknown(detail) => {
@@ -599,13 +631,19 @@ struct Registration {
     generation: String,
 }
 
+enum SessionTransport {
+    Injected,
+    Direct(AzureCredentialProvider),
+    Bridge(Arc<crate::qap_http::StorageBridge>),
+}
+
 /// One persistent publisher registration shared by every guarded store of a
 /// mutating process in one account and control container.
 pub struct PublisherSession {
     shared: Arc<Shared>,
     mode: SessionMode,
     account: Option<String>,
-    credentials: Option<AzureCredentialProvider>,
+    transport: SessionTransport,
     registration: Option<Registration>,
     close: tokio::sync::Mutex<()>,
 }
@@ -632,7 +670,7 @@ enum Slot {
     /// An owned admission task is running; it always settles the slot.
     Admitting(tokio::sync::watch::Receiver<Settled>),
     Ready(Arc<PublisherSession>),
-    /// Unknown or abandoned admission: permanent, never re-enrolled.
+    /// Unknown, applied-but-unsettled or abandoned admission: never re-enrolled.
     Poisoned(String),
 }
 
@@ -665,10 +703,10 @@ impl Admission {
             }
             Err(error) => {
                 let message = format!("{error:#}");
-                if is_unknown(&error) {
+                if is_unknown(&error) || error.chain().any(|cause| cause.is::<UnsettledTransition>()) {
                     cache.insert(self.key.clone(), Slot::Poisoned(message.clone()));
                 } else {
-                    // Definite failure: nothing was written, so nothing is cached.
+                    // Definite no-write failure: nothing needs to be retained.
                     cache.remove(&self.key);
                 }
                 Err(message)
@@ -756,9 +794,9 @@ impl PublisherSession {
     /// admission runs as one owned task on the shared Delta I/O runtime that
     /// always settles the key. A dropped or timed-out caller therefore never
     /// causes a second enrollment: later callers join the same admission. An
-    /// unknown or abandoned outcome is cached as a permanent error: no
-    /// adoption and no re-enrollment. Definite failures wrote nothing and are
-    /// not cached. Azure admission is pinned to [`RESET_GENERATION_ENV`].
+    /// unknown, applied-but-unsettled or abandoned admission is cached as a
+    /// permanent error: no adoption and no re-enrollment. Definite no-write
+    /// failures are not cached. Azure admission is pinned to [`RESET_GENERATION_ENV`].
     ///
     /// # Errors
     /// Returns admission, authority, authentication or unknown-outcome failures.
@@ -794,7 +832,7 @@ impl PublisherSession {
                 control,
                 sandbox_id,
                 account,
-                None,
+                SessionTransport::Injected,
                 SessionMode::Publisher,
                 Some(&expected),
             )
@@ -854,8 +892,8 @@ impl PublisherSession {
     /// Process shutdown: close every cached shared session after its guarded
     /// mutations drain. Never registers anything. Refuses without side effects
     /// while any shared admission is still in progress. Otherwise each ready
-    /// session is attempted; a failed one stays registered. Any unknown or
-    /// abandoned admission makes the result an error: the process is never
+    /// session is attempted; a failed one stays registered. Any permanent
+    /// admission failure makes the result an error: the process is never
     /// reported clean while a possible member is unaccounted for.
     ///
     /// # Errors
@@ -921,6 +959,26 @@ impl PublisherSession {
     /// invalid or differs from the authority.
     pub async fn open_async(url: &Url) -> Result<Arc<Self>> {
         Self::open_url(url, SessionMode::Publisher, None).await
+    }
+
+    /// Register a normal publisher through the explicit credential-free D47 transport.
+    /// The same immutable bridge covers admission, guarded storage, authority checks and drain.
+    ///
+    /// # Errors
+    /// Rejects mismatched roots, invalid authority, non-ready generations and uncertain exchanges.
+    pub async fn open_bridged_async(url: &Url, bridge: Arc<crate::qap_http::StorageBridge>) -> Result<Arc<Self>> {
+        bridge.validate_root(url)?;
+        let authority = bridge.authority().clone();
+        let control = Arc::new(AzureControlContainer::bridged(Arc::clone(&bridge)));
+        Self::register(
+            control,
+            authority.sandbox_id,
+            authority.storage_account,
+            SessionTransport::Bridge(bridge),
+            SessionMode::Publisher,
+            Some(&authority.reset_generation),
+        )
+        .await
     }
 
     /// Synchronous [`Self::open_bootstrap_async`].
@@ -995,7 +1053,7 @@ impl PublisherSession {
             control,
             sandbox_id,
             account,
-            Some(credentials),
+            SessionTransport::Direct(credentials),
             mode,
             Some(expected_generation),
         )
@@ -1007,7 +1065,7 @@ impl PublisherSession {
             shared: Shared::new(),
             mode: SessionMode::Publisher,
             account: None,
-            credentials: None,
+            transport: SessionTransport::Injected,
             registration: None,
             close: tokio::sync::Mutex::new(()),
         }
@@ -1036,7 +1094,7 @@ impl PublisherSession {
             control,
             sandbox_id.to_owned(),
             account.to_owned(),
-            None,
+            SessionTransport::Injected,
             mode,
             expected_generation,
         )
@@ -1047,7 +1105,7 @@ impl PublisherSession {
         control: Arc<dyn ControlMetadata>,
         sandbox_id: String,
         account: String,
-        credentials: Option<AzureCredentialProvider>,
+        transport: SessionTransport,
         mode: SessionMode,
         expected_generation: Option<&str>,
     ) -> Result<Arc<Self>> {
@@ -1101,7 +1159,7 @@ impl PublisherSession {
             shared: Shared::new(),
             mode,
             account: Some(account),
-            credentials,
+            transport,
             registration: Some(Registration {
                 control,
                 sandbox_id,
@@ -1167,6 +1225,9 @@ impl PublisherSession {
     }
 
     fn validate_url(&self, url: &Url) -> Result<()> {
+        if let SessionTransport::Bridge(bridge) = &self.transport {
+            bridge.validate_root(url)?;
+        }
         match (&self.account, url.scheme()) {
             (None, "file") => Ok(()),
             (Some(account), _) if is_azure(url) => {
@@ -1189,15 +1250,20 @@ impl PublisherSession {
         let store: Arc<dyn ObjectStore> = if url.scheme() == "file" {
             Arc::new(object_store::local::LocalFileSystem::new())
         } else {
-            let credentials = self
-                .credentials
-                .clone()
-                .context("publisher session has no Azure credential")?;
-            Arc::new(
-                object_store::azure::MicrosoftAzureBuilder::from_env()
+            let builder = match &self.transport {
+                SessionTransport::Bridge(bridge) => object_store::azure::MicrosoftAzureBuilder::new()
+                    .with_url(url.as_str())
+                    .with_http_connector(crate::qap_http::bridge_http_connector(Arc::clone(bridge))?)
+                    .with_credentials(Arc::new(crate::qap_http::DeniedBridgeCredentials))
+                    .with_skip_signature(true),
+                SessionTransport::Direct(credentials) => object_store::azure::MicrosoftAzureBuilder::from_env()
                     .with_url(url.as_str())
                     .with_http_connector(crate::qap_http::azure_http_connector()?)
-                    .with_credentials(credentials)
+                    .with_credentials(Arc::clone(credentials)),
+                SessionTransport::Injected => bail!("publisher session has no Azure credential"),
+            };
+            Arc::new(
+                builder
                     .with_retry(object_store::RetryConfig {
                         max_retries: 0,
                         retry_timeout: Duration::from_secs(10),
