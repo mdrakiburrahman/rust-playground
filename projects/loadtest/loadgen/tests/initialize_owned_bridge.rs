@@ -208,6 +208,7 @@ impl Parent {
                 );
                 if matches!(self.case, Case::RotateBeforeCommit) {
                     self.metadata.insert("resetgeneration".into(), RUN.into());
+                    self.etag += 1;
                 }
             } else if method == "PUT" {
                 self.puts += 1;
@@ -221,6 +222,7 @@ impl Parent {
                     }));
                 }
                 if matches!(self.case, Case::Conflict) {
+                    ensure!(self.objects.insert(key, body.to_owned()).is_none());
                     status = 409;
                     output.insert("x-ms-error-code".into(), "BlobAlreadyExists".into());
                     response_body = "<Error><Code>BlobAlreadyExists</Code></Error>".into();
@@ -514,6 +516,13 @@ async fn actual_cli_bridge_fresh_refusals_never_adopt_or_replay() -> Result<()> 
         }
         if matches!(case, Case::Conflict | Case::RefusedPut) {
             assert_eq!(parent.puts, 1, "intended refusal was not reached: {}", parent.error);
+        }
+        if matches!(case, Case::Conflict) {
+            assert_eq!(
+                parent.objects.len(),
+                1,
+                "the conflicting Kernel log must exist, not merely return 409"
+            );
         }
         if matches!(case, Case::Nonready | Case::WrongGeneration) {
             assert!(!parent.requests.is_empty());
