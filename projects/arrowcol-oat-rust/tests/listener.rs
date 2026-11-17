@@ -5,6 +5,18 @@ use std::time::{Duration, Instant};
 
 struct Server(Child);
 
+#[test]
+fn fixture_setup_cli_preserves_create_streams_and_namespace_identity() -> std::io::Result<()> {
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/setup-bridge-cli.ts");
+    let status = Command::new("node")
+        .args(["--import", "tsx"])
+        .arg(script)
+        .arg(env!("CARGO_BIN_EXE_arrowcol-oat-rust"))
+        .status()?;
+    assert!(status.success(), "offline fixture CLI response/identity witness failed");
+    Ok(())
+}
+
 impl Drop for Server {
     fn drop(&mut self) {
         let _ = self.0.kill();

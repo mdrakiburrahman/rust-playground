@@ -44,6 +44,7 @@ include!("runner_commit_evidence.rs");
 include!("runner_maintenance.rs");
 include!("runner_wal.rs");
 include!("runner_overload.rs");
+include!("runner_fixture.rs");
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CampaignIdentity {
@@ -861,6 +862,12 @@ impl RunInventory {
             Vec::new()
         };
         let mut command = aks_campaign_cli_command(config_paths, action, &action_args)?;
+        if let Some((code, stdout)) = fixture_command_output(&command, payload.as_deref()).await? {
+            if code != 0 {
+                bail!("fixture custody command failed; outcome may be unknown and must not be replayed");
+            }
+            return self.validate_custody_receipt(stdout.as_bytes(), ready);
+        }
         command
             .stdin(if ready { Stdio::null() } else { Stdio::piped() })
             .stdout(Stdio::piped())
@@ -10093,7 +10100,9 @@ fn planned_inventory_resource(resource: &Value, namespace: &str) -> Result<Inven
         .pointer("/labels/app")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let role = if kind == "Job" && app == "arrowcol-oat-client" {
+    let role = if (kind == "Job" || (kind == "Deployment" && FIXTURE_BOUNDARY.try_with(|_| ()).is_ok()))
+        && app == "arrowcol-oat-client"
+    {
         InventoryResourceRole::Client
     } else if name == "delta-maintenance" {
         InventoryResourceRole::Maintenance
@@ -10124,6 +10133,15 @@ fn has_origin_markers(metadata: &Value, run_id: &str, owner_token: &str) -> bool
 }
 
 async fn record_applied_resource_uids(config: &OatConfig, platform: &AksPlatform, resources: &[Value]) -> Result<()> {
+    record_resource_uids_with_creation(config, platform, resources, None).await
+}
+
+async fn record_resource_uids_with_creation(
+    config: &OatConfig,
+    platform: &AksPlatform,
+    resources: &[Value],
+    created: Option<&[Value]>,
+) -> Result<()> {
     if config.campaign_profile != Some(crate::config::CampaignProfile::SingleHotTable) {
         return Ok(());
     }
@@ -10182,6 +10200,23 @@ async fn record_applied_resource_uids(config: &OatConfig, platform: &AksPlatform
                     && resource.pointer("/metadata/name").and_then(Value::as_str) == Some(planned.name.as_str())
             })
             .context("Kubernetes readback identity differs from the planned resource")?;
+        if let Some(created) = created {
+            fixture_response_identity(actual, rendered)?;
+            let original = created
+                .iter()
+                .find(|resource| {
+                    resource["apiVersion"] == actual["apiVersion"]
+                        && resource["kind"] == actual["kind"]
+                        && resource["metadata"]["namespace"] == actual["metadata"]["namespace"]
+                        && resource["metadata"]["name"] == actual["metadata"]["name"]
+                })
+                .context("readback identity was not returned by the original create")?;
+            for field in ["uid", "generation"] {
+                if original["metadata"][field] != actual["metadata"][field] {
+                    bail!("fresh-create readback changed original {field}; no identity adoption");
+                }
+            }
+        }
         let uid = actual
             .pointer("/metadata/uid")
             .and_then(Value::as_str)
@@ -10213,6 +10248,9 @@ async fn record_applied_resource_uids(config: &OatConfig, platform: &AksPlatform
         }
         stored.uid = Some(uid.to_owned());
         stored.state = InventoryResourceState::Observed;
+    }
+    if created.is_some() {
+        verify_fresh_namespace_readback(config, platform).await?;
     }
     current.validate_successor(&next)?;
     persist_campaign_inventory(platform, &next).await
@@ -10269,10 +10307,21 @@ async fn prepare_run_owned_resources(
     persist_campaign_inventory(platform, &next).await
 }
 
-async fn apply_runtime_resources(
+#[derive(Clone, Copy)]
+enum RuntimeResourceMode {
+    Apply,
+    FreshCreate,
+}
+
+async fn apply_runtime_resources(config: &OatConfig, platform: &mut AksPlatform, resources: Vec<Value>) -> Result<()> {
+    apply_runtime_resources_with_mode(config, platform, resources, RuntimeResourceMode::Apply).await
+}
+
+async fn apply_runtime_resources_with_mode(
     config: &OatConfig,
     platform: &mut AksPlatform,
     mut resources: Vec<Value>,
+    mode: RuntimeResourceMode,
 ) -> Result<()> {
     if resources.is_empty() {
         bail!("refusing to apply an empty AKS runtime phase");
@@ -10283,14 +10332,52 @@ async fn apply_runtime_resources(
         "kind": "List",
         "items": resources,
     }))?;
-    kubectl(
-        config,
-        vec!["apply", "--namespace", &config.namespace, "-f", "-"],
-        Some(payload),
-    )
-    .await
-    .context("apply run-scoped AKS runtime resources")?;
-    record_applied_resource_uids(config, platform, &resources).await?;
+    let created = match mode {
+        RuntimeResourceMode::Apply => {
+            kubectl(
+                config,
+                vec!["apply", "--namespace", &config.namespace, "-f", "-"],
+                Some(payload),
+            )
+            .await
+            .context("apply run-scoped AKS runtime resources")?;
+            None
+        }
+        RuntimeResourceMode::FreshCreate => {
+            let collision = kubectl(
+                config,
+                vec![
+                    "get",
+                    "--namespace",
+                    &config.namespace,
+                    "-f",
+                    "-",
+                    "--ignore-not-found",
+                    "-o",
+                    "json",
+                ],
+                Some(payload.clone()),
+            )
+            .await?;
+            let collision: Value = serde_json::from_str(&collision)?;
+            if collision
+                .get("items")
+                .and_then(Value::as_array)
+                .is_none_or(|items| !items.is_empty())
+            {
+                bail!("fresh-create resource collision or incomplete absence readback");
+            }
+            let output = kubectl(
+                config,
+                vec!["create", "--namespace", &config.namespace, "-f", "-", "-o", "json"],
+                Some(payload),
+            )
+            .await
+            .context("fresh-create run-scoped AKS runtime resources; do not replay uncertain creation")?;
+            Some(parse_fresh_create_responses(&output, &resources)?)
+        }
+    };
+    record_resource_uids_with_creation(config, platform, &resources, created.as_deref()).await?;
     Ok(())
 }
 
@@ -12059,11 +12146,18 @@ async fn kubectl(config: &OatConfig, args: Vec<&str>, stdin: Option<Vec<u8>>) ->
     if let Some(context) = &config.kubectl_context {
         command.args(["--context", context]);
     }
-    command
-        .args(&args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+    if FIXTURE_BOUNDARY.try_with(|_| ()).is_ok() {
+        let server = FIXTURE_BOUNDARY.with(|boundary| boundary.authority.server.clone());
+        command.args(["--server", &server]);
+    }
+    command.args(&args);
+    if let Some((code, stdout)) = fixture_command_output(&command, stdin.as_deref()).await? {
+        if code != 0 {
+            bail!("fixture kubectl command failed; outcome may be unknown and must not be replayed");
+        }
+        return Ok(stdout);
+    }
+    command.stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
     if stdin.is_some() {
         command.stdin(Stdio::piped());
     }
