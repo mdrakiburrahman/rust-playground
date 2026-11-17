@@ -10,7 +10,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 const CAMPAIGN: &str = "00000000-0000-4000-8000-000000000001";
 const RUN: &str = "00000000-0000-4000-8000-000000000002";
@@ -308,6 +308,10 @@ fn private_json(path: &Path, value: &Value) -> Result<()> {
 }
 
 async fn run(case: Case) -> Result<Parent> {
+    run_transport(case, false).await
+}
+
+async fn run_transport(case: Case, unix_socket: bool) -> Result<Parent> {
     let scratch = tempfile::tempdir()?;
     let silent = matches!(case, Case::SilentAdmission | Case::SilentPut);
     let started = tokio::time::Instant::now();
@@ -412,9 +416,32 @@ async fn run(case: Case) -> Result<Parent> {
             command.arg("--storage-bridge-stdio");
         }
     }
+    // Node's child-process "pipe" endpoints are Unix sockets, unlike Rust's anonymous pipes.
+    let sockets = if unix_socket {
+        use std::os::{fd::OwnedFd, unix::net::UnixStream};
+        let (input, child_input) = UnixStream::pair()?;
+        let (output, child_output) = UnixStream::pair()?;
+        input.set_nonblocking(true)?;
+        output.set_nonblocking(true)?;
+        command.stdin(Stdio::from(OwnedFd::from(child_input)));
+        command.stdout(Stdio::from(OwnedFd::from(child_output)));
+        Some((
+            tokio::net::UnixStream::from_std(input)?,
+            tokio::net::UnixStream::from_std(output)?,
+        ))
+    } else {
+        None
+    };
     let mut child = command.spawn()?;
-    let mut input_pipe = Some(child.stdin.take().context("stdin")?);
-    let mut output = BufReader::new(child.stdout.take().context("stdout")?);
+    let (input, output): (Box<dyn AsyncWrite + Unpin + Send>, Box<dyn AsyncRead + Unpin + Send>) = match sockets {
+        Some((input, output)) => (Box::new(input), Box::new(output)),
+        None => (
+            Box::new(child.stdin.take().context("stdin")?),
+            Box::new(child.stdout.take().context("stdout")?),
+        ),
+    };
+    let mut input_pipe = Some(input);
+    let mut output = BufReader::new(output);
     let stderr = child.stderr.take().context("stderr")?;
     let errors = tokio::spawn(async move {
         let mut bytes = Vec::new();
@@ -476,7 +503,7 @@ async fn run(case: Case) -> Result<Parent> {
     let exited_before_stdin_close = matches!(&completion, Ok(Ok(_)));
     if silent {
         eprintln!(
-            "SILENT_PIPE_BOUNDARY case={case:?} elapsed_ms={} original_budget_ms={budget_ms} exited_before_stdin_close={exited_before_stdin_close} stdin_writer_open={} child_running={} requests={} silence_at={silence_at:?} puts={} receipt={}",
+            "SILENT_PIPE_BOUNDARY case={case:?} unix_socket={unix_socket} elapsed_ms={} original_budget_ms={budget_ms} exited_before_stdin_close={exited_before_stdin_close} stdin_writer_open={} child_running={} requests={} silence_at={silence_at:?} puts={} receipt={}",
             started.elapsed().as_millis(),
             input_pipe.is_some(),
             child.try_wait()?.is_none(),
@@ -540,6 +567,14 @@ async fn run(case: Case) -> Result<Parent> {
         parent.members()?.len()
     );
     Ok(parent)
+}
+
+#[tokio::test]
+async fn actual_cli_unix_socket_parent_preserves_deadlines_and_normal_drain() -> Result<()> {
+    for case in [Case::Fresh, Case::SilentAdmission, Case::SilentPut] {
+        run_transport(case, true).await?;
+    }
+    Ok(())
 }
 
 #[tokio::test]
