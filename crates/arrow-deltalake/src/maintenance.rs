@@ -3043,10 +3043,11 @@ impl DeltaTable {
                     );
                     return Err(self.discard_after(&outputs, error, &mut report));
                 }
-                if !beneficial && let Some(proof) = proof {
-                    if let Err(error) = self.record_optimize_no_benefit_proof(&state.fingerprint.table_id, proof) {
-                        return Err(self.discard_after(&outputs, error, &mut report));
-                    }
+                if !beneficial
+                    && let Some(proof) = proof
+                    && let Err(error) = self.record_optimize_no_benefit_proof(&state.fingerprint.table_id, proof)
+                {
+                    return Err(self.discard_after(&outputs, error, &mut report));
                 }
                 continue;
             }
