@@ -16,6 +16,18 @@
 | Startup readback | `arrowcol_maintenance_effective_config.optimize_upload` reports mode, requested buffer, and effective buffer; `null` means inactive for `put_create`, while `buffered_multipart` defaults to 8 MiB. `startup.operation_limits` retains the exact parsed consumer values. |
 | Parquet writer | Optional OAT `maintenance.parquet_writer` is role-scoped: absent inherits the global writer; present replaces the maintenance writer only. Startup `parquet_writer_overrides` reports the maintenance process settings, and an omitted writer row-group limit preserves `output_row_group_rows`. |
 
+## Resolved Delta targets
+
+The existing metrics listener also serves JSON `GET /health` with `delta_targets: [{table: {catalog, schema, table}, normalized_root?, delta_table_id?, state}]`. Catalog discovery retains the catalog's structured identity; qualified filesystem allowlists use `catalog.schema.table`. An unqualified legacy name cannot establish a complete catalog identity and stays unresolved.
+
+| State | Contract |
+| --- | --- |
+| `unresolved` | Before metadata is read, for missing/pending tables, incomplete logical identities, unsafe roots or failed bounded reads. Both identity values are omitted; requested configuration is never a fallback. |
+| `resolved` | Both values come from the actual opened table: normalized URI and latest `metaData.id`, including initialized version-zero tables with no data commits. Metadata reads use the existing log/file bounds, object-identity fences and checkpoint fallback. |
+| `conflicting` | Different actual roots or metadata IDs observed for the same maintained identity. Both values are omitted; the conflict remains latched for that discovered table's lifetime in this process. |
+
+Normalization strips credentials, userinfo, query strings and fragments, retaining only safe scheme/authority/path. Readback is refreshed before per-table scheduling skips, does not create tables or write logs, and does not change maintenance eligibility or operation outcomes. Consumers must require the expected resolved pairs before admitting load; missing or unresolved readback is not proof of destination agreement.
+
 ## Due-work evidence
 
 `maintenance_due_work` uses snake_case JSON and is attached to each operation report. It is one observation, not a sustained-window verdict. Campaign qualification requires one complete observation per enabled operation in every contiguous 30-second window for the same run/table/process; missing, incomplete, failed, stale, dropped, or out-of-window observations remain UNKNOWN with no carry-forward.

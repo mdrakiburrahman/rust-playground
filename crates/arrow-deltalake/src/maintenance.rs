@@ -917,6 +917,32 @@ impl DeltaTable {
         max_log_files: usize,
         max_log_file_bytes: u64,
     ) -> Result<BTreeMap<String, String>> {
+        Ok(self
+            .maintenance_metadata_with_limits(max_log_files, max_log_file_bytes)?
+            .1)
+    }
+
+    /// Read the actual table root and metadata ID without creating or changing the table.
+    ///
+    /// # Errors
+    /// Rejects corrupt or incomplete logs and concurrent metadata advancement.
+    pub fn maintenance_target_with_limits(
+        &self,
+        max_log_files: usize,
+        max_log_file_bytes: u64,
+    ) -> Result<Option<(String, String)>> {
+        let Some(root) = crate::delta::normalize_delta_target_root(self.url.as_str()) else {
+            return Ok(None);
+        };
+        let (id, _) = self.maintenance_metadata_with_limits(max_log_files, max_log_file_bytes)?;
+        Ok(id.map(|id| (root, id)))
+    }
+
+    fn maintenance_metadata_with_limits(
+        &self,
+        max_log_files: usize,
+        max_log_file_bytes: u64,
+    ) -> Result<(Option<String>, BTreeMap<String, String>)> {
         let names = self.list_log(max_log_files)?;
         let version = probe_version(&names)?;
         let token = log_token(&names)?;
@@ -927,9 +953,15 @@ impl DeltaTable {
             let number = name[..20].parse::<u64>()?;
             let bytes = self.read_commit(number, max_log_file_bytes)?;
             let mut configuration = None;
+            let mut id = None;
             for line in bytes.split(|byte| *byte == b'\n').filter(|line| !line.is_empty()) {
                 let action: serde_json::Value = serde_json::from_slice(line)?;
                 if let Some(metadata) = action.get("metaData") {
+                    id = metadata
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|id| !id.is_empty())
+                        .map(str::to_owned);
                     configuration = Some(serde_json::from_value::<BTreeMap<String, String>>(
                         metadata
                             .get("configuration")
@@ -940,7 +972,7 @@ impl DeltaTable {
             }
             if let Some(configuration) = configuration {
                 self.require_probe_token(&token, max_log_files)?;
-                return Ok(configuration);
+                return Ok((id, configuration));
             }
         }
         let snapshot = self.snapshot()?;
@@ -950,9 +982,12 @@ impl DeltaTable {
                 "table advanced during property discovery",
             ));
         }
-        let configuration = TableFingerprint::of(&snapshot).configuration;
+        let fingerprint = TableFingerprint::of(&snapshot);
         self.require_probe_token(&token, max_log_files)?;
-        Ok(configuration)
+        Ok((
+            (!fingerprint.table_id.is_empty()).then_some(fingerprint.table_id),
+            fingerprint.configuration,
+        ))
     }
 
     fn require_probe_token(&self, token: &str, max_files: usize) -> Result<()> {
