@@ -378,6 +378,41 @@ mod tunable_injection_tests {
     }
 
     #[test]
+    fn aged_batching_policy_reaches_compose_aks_and_effective_readback() -> Result<()> {
+        let mut config = config()?;
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+            "collector":{"batching":{"age_flush_policy":"drain_ready"}}
+        }))?;
+        let environment = role_environment(&config, ComponentRole::Collector)?;
+        let requested: Value = serde_json::from_str(&environment["ARROWCOL_COLLECTOR_BATCHING_CONFIG"])?;
+        assert_eq!(requested, json!({"age_flush_policy":"drain_ready"}));
+        let compose = compose_tunables(&config)?;
+        assert_eq!(compose["services"]["dataflow-1"]["environment"], json!(environment));
+        let mut resources = vec![json!({
+            "kind":"Deployment", "metadata":{"name":config.dfe_deployment},
+            "spec":{"template":{"spec":{"containers":[{"name":config.dfe_container,"env":[]}]}}}
+        })];
+        inject_workload_environment(&config, &mut resources)?;
+        let injected = resources[0].pointer("/spec/template/spec/containers/0/env")
+            .and_then(Value::as_array).context("injected environment")?;
+        assert!(injected.iter().any(|entry| entry["name"] == "ARROWCOL_COLLECTOR_BATCHING_CONFIG"
+            && entry["value"] == environment["ARROWCOL_COLLECTOR_BATCHING_CONFIG"]));
+        let startup = |policy: &str| format!("arrowcol_effective_config {}\n", json!({
+            "component":"exporter","config":{"batching":{"age_flush_policy":policy,"max_age":"30s"}}
+        }));
+        let actual = process_configurations(&startup("drain_ready"))?;
+        verify_process_configuration(&config, ComponentRole::Collector, &actual)?;
+        assert_eq!(actual["batching"]["age_flush_policy"], requested["age_flush_policy"]);
+        for policy in ["immediate", "drain_forever"] {
+            assert!(verify_process_configuration(
+                &config, ComponentRole::Collector, &process_configurations(&startup(policy))?
+            ).is_err());
+        }
+        assert!(verify_process_configuration(&config, ComponentRole::Collector, &json!({})).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn typed_nondefault_client_value_has_identical_compose_and_aks_injection() -> Result<()> {
         let mut config = config()?;
         config.tunables = serde_json::from_value(json!({ "client": { "batch_rows": 257 } }))?;

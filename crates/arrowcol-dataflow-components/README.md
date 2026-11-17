@@ -163,6 +163,22 @@ Routing transfers a dead predecessor's lease to its same-instance-key
 successor, so replayed batches become publishable once the restarted process
 holds the lease.
 
+## Age cutoff collection
+
+| `batching.age_flush_policy` | Behavior |
+| --- | --- |
+| `immediate` (default) | Keep the existing receive/age-timer race. |
+| `drain_ready` | At age expiry, snapshot the number of queued commands and collect at most that many before publishing. |
+
+Set OAT `tunables.collector.batching.age_flush_policy`, or the collector's
+`ARROWCOL_COLLECTOR_BATCHING_CONFIG` JSON. Unknown values fail configuration
+parsing; startup readback reports the effective policy. The opt-in policy can
+extend collection past `max_age` by finite ready work, never by later arrivals.
+Existing adaptive/row/memory/batch caps, schema boundaries, explicit flushes and
+shutdown drain still apply. Admission timestamps and publication identities do
+not change. Combine with `coalesce_publications: true` to combine compatible
+publications into files; this policy alone does not change file identity.
+
 ## Pressure
 
 The pressure document counts active Flight streams, Ack-tracked DFE batches,

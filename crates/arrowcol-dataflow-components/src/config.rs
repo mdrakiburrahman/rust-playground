@@ -7,6 +7,7 @@ use arrowcol_catalog::{CatalogControlPlane, CatalogStore, DdlParser, FlightSqlDd
 use arrowcol_flight::{RuntimeLimits, RuntimeResult};
 use arrowcol_protocol::{PositiveMeasurement, UnixMillis};
 use arrowcol_routing::{MemoryRoutingStore, RoutingStore, SqlServerRoutingConfig, SqlServerRoutingStore};
+use arrowcol_tunables::AgeFlushPolicy;
 use serde::{Deserialize, Serialize};
 
 static CLOUD_GENERATION: OnceLock<String> = OnceLock::new();
@@ -35,6 +36,10 @@ mod override_tests {
         assert!(merge_config(&config, r#"{"max_row_per_flush":10}"#, None).is_err());
         assert!(merge_config(&config, r#"{"per_table_capacity":{"extra":1}}"#, None).is_err());
         assert!(merge_config(&config, "[]", None).is_err());
+        let merged = merge_config(&config, r#"{"age_flush_policy":"drain_ready"}"#, None)?;
+        assert_eq!(merged.age_flush_policy, AgeFlushPolicy::DrainReady);
+        assert!(merge_config(&config, r#"{"age_flush_policy":"drain_forever"}"#, None).is_err());
+        assert!(merge_config(&config, r#"{"age_flush_policy":true}"#, None).is_err());
         Ok(())
     }
 
@@ -141,6 +146,16 @@ mod override_tests {
         config.authority_timeout = resolved.authority_timeout;
         config.validate()?;
         assert_eq!(config.effective_config_json()["authority_timeout"], "250ms");
+        assert_eq!(
+            config.effective_config_json()["batching"]["age_flush_policy"],
+            "immediate"
+        );
+        config.batching = merge_config(&config.batching, r#"{"age_flush_policy":"drain_ready"}"#, None)?;
+        config.validate()?;
+        assert_eq!(
+            config.effective_config_json()["batching"]["age_flush_policy"],
+            "drain_ready"
+        );
         assert!(config.effective_config_json().get("base_path").is_none());
         assert!(merge_config(&current, r#"{"base_path":"replacement"}"#, None).is_err());
         config.authority_timeout = Duration::MAX;
@@ -892,6 +907,8 @@ pub struct BatchCapacity {
 pub struct FileBatchConfig {
     /// Combine publications only through replay-safe atomic file groups.
     pub coalesce_publications: bool,
+    /// Optionally collect a finite snapshot of ready commands at the age cutoff.
+    pub age_flush_policy: AgeFlushPolicy,
     /// Process-wide queued and in-flight capacity.
     pub global_capacity: BatchCapacity,
     /// Per-table queued and in-flight capacity.
@@ -915,6 +932,7 @@ impl Default for FileBatchConfig {
     fn default() -> Self {
         Self {
             coalesce_publications: false,
+            age_flush_policy: AgeFlushPolicy::Immediate,
             global_capacity: BatchCapacity {
                 bytes: 2 * 1024 * 1024 * 1024,
                 rows: 10_000_000,

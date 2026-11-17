@@ -597,6 +597,7 @@ async fn run_batch_worker(
     let mut rows = 0;
     let mut bytes = 0;
     let mut closing = false;
+    let mut age_ready_remaining = None;
     let stage_metrics = StageMetrics::default();
     let mut publisher = GroupPublisher {
         table: &mut table,
@@ -615,13 +616,30 @@ async fn run_batch_worker(
             receiver.recv().await
         } else if let Some(first) = group.first() {
             tokio::select! {
-                next = receiver.recv() => next,
-                _ = tokio::time::sleep_until(first.accepted + policy.max_age) => {
+                next = receiver.recv(), if age_ready_remaining != Some(0) => {
+                    if let Some(remaining) = age_ready_remaining.as_mut() {
+                        *remaining -= 1;
+                    }
+                    next
+                },
+                _ = tokio::time::sleep_until(first.accepted + policy.max_age),
+                    if age_ready_remaining.is_none_or(|remaining| remaining == 0) => {
+                    if policy.age_flush_policy == arrowcol_tunables::AgeFlushPolicy::DrainReady
+                        && age_ready_remaining.is_none()
+                    {
+                        let ready = receiver.len();
+                        if ready > 0 {
+                            // Count commands once; later arrivals cannot extend this collection window.
+                            age_ready_remaining = Some(ready);
+                            continue;
+                        }
+                    }
                     stage_metrics.record(PipelineStage::Collect, collect_started.elapsed());
                     stage_metrics.record_flush(FlushReason::Age);
                     publisher.publish(&mut group, &mut estimator).await;
                     rows = 0;
                     bytes = 0;
+                    age_ready_remaining = None;
                     if publisher.retired() {
                         break;
                     }
@@ -631,6 +649,7 @@ async fn run_batch_worker(
                     stage_metrics.record(PipelineStage::Collect, collect_started.elapsed());
                     receiver.close();
                     closing = true;
+                    age_ready_remaining = None;
                     continue;
                 }
             }
@@ -665,6 +684,7 @@ async fn run_batch_worker(
                 publisher.publish(&mut group, &mut estimator).await;
                 rows = 0;
                 bytes = 0;
+                age_ready_remaining = None;
                 let _ = reply.send(());
                 if publisher.retired() {
                     break;
@@ -680,6 +700,7 @@ async fn run_batch_worker(
             publisher.publish(&mut group, &mut estimator).await;
             rows = 0;
             bytes = 0;
+            age_ready_remaining = None;
             if publisher.retired() {
                 next.complete(&Err(retired_owner_failure()));
                 break;
@@ -720,6 +741,7 @@ async fn run_batch_worker(
             publisher.publish(&mut group, &mut estimator).await;
             rows = 0;
             bytes = 0;
+            age_ready_remaining = None;
             if publisher.retired() {
                 break;
             }
@@ -1519,20 +1541,23 @@ mod tests {
         }
     }
 
-    fn envelope_pdata(envelope: ArrowcolBatchEnvelope) -> OtapPdata {
+    fn fixture_batch() -> arrow_array::RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::UInt64, false),
             Field::new("value", DataType::Utf8, true),
         ]));
-        let batch = arrow_array::RecordBatch::try_new(
+        arrow_array::RecordBatch::try_new(
             schema,
             vec![
                 Arc::new(UInt64Array::from(vec![1, 2])) as ArrayRef,
                 Arc::new(StringArray::from(vec![Some("a"), None])) as ArrayRef,
             ],
         )
-        .expect("batch");
-        let records = encode_record_batch(envelope, batch).expect("records");
+        .expect("batch")
+    }
+
+    fn envelope_pdata(envelope: ArrowcolBatchEnvelope) -> OtapPdata {
+        let records = encode_record_batch(envelope, fixture_batch()).expect("records");
         OtapPdata::new_todo_context(otel_arrow_dfe_pdata::OtapPayload::from_pdata_arrow(records))
     }
 
@@ -2728,6 +2753,280 @@ mod tests {
         assert_eq!(rows, 4);
         assert!(metrics.prometheus().contains("arrowcol_delta_files_total 2\n"));
         assert_eq!(exporter.backend.capacity.batches.available_permits(), 4096);
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum BacklogBoundary {
+        None,
+        Explicit,
+        Schema,
+        Drain,
+        Refill,
+    }
+
+    fn aged_backlog_policy() -> FileBatchConfig {
+        FileBatchConfig {
+            coalesce_publications: true,
+            max_age: std::time::Duration::from_millis(20),
+            max_concurrent_flushes: 1,
+            ..Default::default()
+        }
+    }
+
+    async fn aged_backlog_fixture(
+        policy: FileBatchConfig,
+        batches: usize,
+        boundary: BacklogBoundary,
+    ) -> (Vec<usize>, Vec<u64>) {
+        let directory = tempfile::tempdir().expect("directory");
+        let store = Arc::new(MemoryRoutingStore::default());
+        let holder = CollectorInstanceId::new();
+        let lease = lease(&store, holder).await;
+        let metrics = Arc::new(RuntimeMetrics::new(holder));
+        let exporter = GenericDeltaExporter::with_batching(
+            directory.path().to_path_buf(),
+            store as Arc<dyn RoutingStore>,
+            arrow_deltalake::commit::CommitOptions::default(),
+            policy.clone(),
+            Arc::clone(&metrics),
+        )
+        .expect("exporter");
+        let publication_slot = Arc::clone(&exporter.backend.flush_slots)
+            .acquire_owned()
+            .await
+            .expect("hold publication slot");
+        let seed = envelope_for(&lease);
+        let mut identities = vec![seed.publication_id.expect("seed identity").to_string()];
+        let mut publications = vec![exporter.stage(envelope_pdata(seed)).await.expect("seed")];
+        let owner = Arc::clone(exporter.backend.tables.lock().await.get(&table()).expect("owner"));
+        let (reply, first_flush) = oneshot::channel();
+        owner
+            .sender
+            .send(WorkerCommand::Flush(reply))
+            .await
+            .expect("seed barrier");
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while owner.sender.capacity() != policy.per_table_capacity.batches as usize {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("worker blocked publishing seed before backlog admission");
+        let mut barrier = None;
+        for index in 0..batches {
+            if matches!(boundary, BacklogBoundary::Explicit) && index == batches / 2 {
+                let (reply, completion) = oneshot::channel();
+                owner
+                    .sender
+                    .send(WorkerCommand::Flush(reply))
+                    .await
+                    .expect("midpoint barrier");
+                barrier = Some(completion);
+            }
+            let mut envelope = envelope_for(&lease);
+            if matches!(boundary, BacklogBoundary::Schema) && index >= batches / 2 {
+                envelope.target_schema_version = SchemaVersion::new(2).expect("second version");
+            }
+            identities.push(envelope.publication_id.expect("identity").to_string());
+            publications.push(exporter.stage(envelope_pdata(envelope)).await.expect("backlog"));
+        }
+        let queued = batches + usize::from(barrier.is_some());
+        assert_eq!(
+            owner.sender.capacity(),
+            policy.per_table_capacity.batches as usize - queued
+        );
+        tokio::time::sleep(policy.max_age * 2).await;
+        if matches!(boundary, BacklogBoundary::Drain) {
+            owner.drain.send_replace(true);
+        }
+        drop(publication_slot);
+        tokio::time::timeout(std::time::Duration::from_secs(45), async {
+            first_flush.await.expect("seed committed");
+            if matches!(boundary, BacklogBoundary::Refill) {
+                while owner.sender.capacity() <= policy.per_table_capacity.batches as usize - batches / 2 {
+                    tokio::task::yield_now().await;
+                }
+                for index in 0..128 {
+                    let envelope = envelope_for(&lease);
+                    identities.push(envelope.publication_id.expect("late identity").to_string());
+                    publications.push(exporter.stage(envelope_pdata(envelope)).await.expect("late arrival"));
+                    if index == 0 {
+                        assert!(
+                            owner.sender.capacity() < policy.per_table_capacity.batches as usize - 32,
+                            "late arrivals overlap collection, not just publication"
+                        );
+                    }
+                }
+            }
+            if let Some(barrier) = barrier {
+                barrier.await.expect("midpoint barrier completed");
+            }
+            for publication in publications {
+                publication.wait().await.expect("original publication acknowledged");
+            }
+        })
+        .await
+        .expect("finite real-worker completion");
+
+        let root = directory.path().join("demo/generated/events");
+        let mut rows_per_file = std::fs::read_dir(&root)
+            .expect("files")
+            .map(|entry| entry.expect("entry").path())
+            .filter(|path| path.extension().is_some_and(|extension| extension == "parquet"))
+            .map(|path| {
+                ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(path).expect("file"))
+                    .expect("reader")
+                    .build()
+                    .expect("build")
+                    .map(|batch| batch.expect("batch").num_rows())
+                    .sum::<usize>()
+            })
+            .collect::<Vec<_>>();
+        rows_per_file.sort_unstable();
+        let reasons = metrics
+            .prometheus()
+            .lines()
+            .filter(|line| line.starts_with("arrowcol_pipeline_flushes_total{"))
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        eprintln!(
+            "AGED_BACKLOG policy={:?} boundary={boundary:?} batches={} rows={} files={} rows_per_file={rows_per_file:?} flushes={reasons:?}",
+            policy.age_flush_policy,
+            identities.len(),
+            identities.len() * 2,
+            rows_per_file.len()
+        );
+        assert_eq!(rows_per_file.iter().sum::<usize>(), identities.len() * 2);
+        let mut committed = HashMap::new();
+        for entry in std::fs::read_dir(root.join("_delta_log")).expect("Delta log") {
+            let path = entry.expect("log entry").path();
+            if path.extension().is_none_or(|extension| extension != "json") {
+                continue;
+            }
+            let version = path
+                .file_stem()
+                .expect("version")
+                .to_str()
+                .expect("UTF-8")
+                .parse::<u64>()
+                .expect("version");
+            for action in std::fs::read_to_string(path).expect("log contents").lines() {
+                let action: serde_json::Value = serde_json::from_str(action).expect("action");
+                if let Some(id) = action
+                    .pointer("/txn/appId")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|id| id.strip_prefix("arrowcol.publication."))
+                {
+                    assert_eq!(action["txn"]["version"], 0);
+                    assert!(
+                        committed.insert(id.to_owned(), version).is_none(),
+                        "identity committed once"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            committed.len(),
+            identities.len(),
+            "no substituted or missing publication identity"
+        );
+        let versions = identities.iter().map(|id| committed[id]).collect::<Vec<_>>();
+        assert_eq!(exporter.backend.capacity.batches.available_permits(), 4096);
+        assert_eq!(owner.capacity.batches.available_permits(), 1024);
+        exporter.backend.start_draining().await;
+        (rows_per_file, versions)
+    }
+
+    #[tokio::test]
+    async fn aged_ready_backlog_uses_real_worker_and_publication_path() {
+        let policy = aged_backlog_policy();
+        let (baseline, _) = aged_backlog_fixture(policy.clone(), 256, BacklogBoundary::None).await;
+        assert!(baseline.len() > 32, "unchanged default fragments expired ready work");
+        let (coalesced, _) = aged_backlog_fixture(
+            FileBatchConfig {
+                age_flush_policy: arrowcol_tunables::AgeFlushPolicy::DrainReady,
+                ..policy
+            },
+            256,
+            BacklogBoundary::None,
+        )
+        .await;
+        assert_eq!(coalesced, [2, 512], "one seed file and one finite ready snapshot");
+    }
+
+    #[tokio::test]
+    async fn aged_ready_snapshot_preserves_caps_barriers_schema_and_shutdown() {
+        let policy = FileBatchConfig {
+            age_flush_policy: arrowcol_tunables::AgeFlushPolicy::DrainReady,
+            ..aged_backlog_policy()
+        };
+        let bytes = arrow_deltalake::record_batch_logical_bytes(&fixture_batch()).expect("logical batch bytes");
+        for (capped, expected) in [
+            (
+                FileBatchConfig {
+                    max_batches_per_flush: 8,
+                    ..policy.clone()
+                },
+                vec![2, 16, 16, 16, 16],
+            ),
+            (
+                FileBatchConfig {
+                    max_rows_per_flush: 16,
+                    ..policy.clone()
+                },
+                vec![2, 16, 16, 16, 16],
+            ),
+            (
+                FileBatchConfig {
+                    max_arrow_memory_per_flush: 8 * bytes,
+                    ..policy.clone()
+                },
+                vec![2, 16, 16, 16, 16],
+            ),
+            (
+                FileBatchConfig {
+                    adaptive_file: crate::config::AdaptiveFileConfig {
+                        min_input_bytes: 8 * bytes,
+                        max_input_bytes: 8 * bytes,
+                        ..policy.adaptive_file
+                    },
+                    ..policy.clone()
+                },
+                vec![2, 16, 16, 16, 16],
+            ),
+        ] {
+            let (rows, _) = aged_backlog_fixture(capped, 32, BacklogBoundary::None).await;
+            assert_eq!(rows, expected, "each existing cap still ends collection");
+        }
+        for boundary in [BacklogBoundary::Explicit, BacklogBoundary::Schema] {
+            let (rows, versions) = aged_backlog_fixture(policy.clone(), 32, boundary).await;
+            assert_eq!(rows, [2, 32, 32]);
+            assert!(
+                versions[1..17].iter().max() < versions[17..].iter().min(),
+                "{boundary:?}"
+            );
+        }
+        let (rows, _) = aged_backlog_fixture(policy, 32, BacklogBoundary::Drain).await;
+        assert_eq!(rows, [2, 64], "drain closes admission and completes finite queued work");
+    }
+
+    #[tokio::test]
+    async fn aged_ready_snapshot_is_not_extended_by_arrivals_during_collection() {
+        let (rows, versions) = aged_backlog_fixture(
+            FileBatchConfig {
+                age_flush_policy: arrowcol_tunables::AgeFlushPolicy::DrainReady,
+                max_batches_per_flush: 1024,
+                ..aged_backlog_policy()
+            },
+            800,
+            BacklogBoundary::Refill,
+        )
+        .await;
+        assert!(versions[1..801].iter().max() < versions[801..].iter().min());
+        assert!(
+            rows.contains(&1600),
+            "later ready arrivals do not extend the expired snapshot"
+        );
     }
 
     /// Scenario: A sparse table receives one batch below the size and row thresholds.
