@@ -1113,8 +1113,8 @@ export interface OwnedRunTableParentReceipt { schema_version: 1; kind: 'owned_ru
   artifact_identity: OwnedRunTableArtifactIdentity; exchange_count: number; bridge_receipt: OwnedRunTableBridgeReceipt }
 interface OwnedRunBridgeInput { authority: StorageBridgeAuthority; original_deadline_unix_ms: number }
 const APPROVED_OWNED_RUN_BUILD_RECEIPT: OwnedRunTableArtifactIdentity = Object.freeze({
-  source_commit: '18049b923c49f7f74152004f8694e3ec8a568a4f',
-  executable_sha256: '3e56d166fc8409d8b41fedf1ff8d1a8bb3bd1aea8a979fc74d538c5f7c64f74f',
+  source_commit: '6af965a262478a9fe919fd8ca991f526c76919d0',
+  executable_sha256: '2915c86d13464a37cfc19ea3c4e976929ae5d215e441e5f3c2f1212ad303d300',
 });
 const OWNED_RUN_TABLE = 'telemetry.sqlserver.sqlserver_availability_replica_states';
 const OWNED_RUN_PARTITION = '__arrowcol_ingestion';
