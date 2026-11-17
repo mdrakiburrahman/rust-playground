@@ -3089,8 +3089,7 @@ async fn run_matrix(
                 cell_config,
                 orchestration_id,
                 run_id,
-                replicas,
-                concurrency,
+                (replicas, concurrency),
                 cancellation.clone(),
                 submitted_config.clone(),
                 Arc::clone(&cell_state),
@@ -3163,7 +3162,11 @@ fn local_teardown_transition(
     cell_id: &str,
     rows: &[OatResult],
 ) -> Result<Option<crate::model::LocalTeardown>> {
-    if rows.is_empty() || rows.iter().any(|row| row.run_id != cell_id || row.status != "succeeded") {
+    if rows.is_empty()
+        || rows
+            .iter()
+            .any(|row| row.run_id != cell_id || row.status != "succeeded")
+    {
         return Ok(None);
     }
     let mut schedule = None;
@@ -3174,26 +3177,56 @@ fn local_teardown_transition(
             published["scope"] == "orchestrator_assigned_schedule_with_observed_full_fleet_acknowledgement",
             "missing acknowledged cell schedule"
         );
-        let start = published["effective"]["run_start_unix_ms"].as_u64().context("missing schedule start")?;
-        let acknowledged = published["effective"]["acknowledged_at_unix_ms"].as_u64().context("missing schedule acknowledgement")?;
-        let measurement_start = published["effective"]["measurement_start_unix_ms"].as_u64().context("missing measurement start")?;
-        let end = published["effective"]["measurement_end_unix_ms"].as_u64().context("missing measurement end")?;
-        let expected_start = start.checked_add(config.warmup_seconds.checked_mul(1_000).context("warmup overflow")?)
+        let start = published["effective"]["run_start_unix_ms"]
+            .as_u64()
+            .context("missing schedule start")?;
+        let acknowledged = published["effective"]["acknowledged_at_unix_ms"]
+            .as_u64()
+            .context("missing schedule acknowledgement")?;
+        let measurement_start = published["effective"]["measurement_start_unix_ms"]
+            .as_u64()
+            .context("missing measurement start")?;
+        let end = published["effective"]["measurement_end_unix_ms"]
+            .as_u64()
+            .context("missing measurement end")?;
+        let expected_start = start
+            .checked_add(config.warmup_seconds.checked_mul(1_000).context("warmup overflow")?)
             .context("measurement start overflow")?;
         let expected_end = start
-            .checked_add(config.warmup_seconds.checked_add(config.measure_seconds).context("duration overflow")?
-                .checked_mul(1_000).context("duration milliseconds overflow")?)
+            .checked_add(
+                config
+                    .warmup_seconds
+                    .checked_add(config.measure_seconds)
+                    .context("duration overflow")?
+                    .checked_mul(1_000)
+                    .context("duration milliseconds overflow")?,
+            )
             .context("measurement end overflow")?;
-        ensure!(start > 0 && acknowledged < start && measurement_start == expected_start && end == expected_end,
-            "measurement window identity mismatch");
-        ensure!(schedule.is_none_or(|previous| previous == (start, end)), "cell schedules differ");
+        ensure!(
+            start > 0 && acknowledged < start && measurement_start == expected_start && end == expected_end,
+            "measurement window identity mismatch"
+        );
+        ensure!(
+            schedule.is_none_or(|previous| previous == (start, end)),
+            "cell schedules differ"
+        );
         schedule = Some((start, end));
     }
     let (start, end) = schedule.context("missing cell schedule")?;
-    let root = config.platform.compose_state_root.as_deref().context("local state root missing")?;
-    let path = std::env::current_dir()?.join(root).join(cell_id).join("control/schedule");
+    let root = config
+        .platform
+        .compose_state_root
+        .as_deref()
+        .context("local state root missing")?;
+    let path = std::env::current_dir()?
+        .join(root)
+        .join(cell_id)
+        .join("control/schedule");
     let raw = fs::read_to_string(path).context("read authoritative schedule before local teardown")?;
-    ensure!(raw == format!("{start}\n"), "authoritative schedule changed before local teardown");
+    ensure!(
+        raw == format!("{start}\n"),
+        "authoritative schedule changed before local teardown"
+    );
     let now = unix_time_ms_u64()?;
     ensure!(now >= end, "measurement window has not ended");
     Ok(Some(crate::model::LocalTeardown {
@@ -3212,11 +3245,15 @@ async fn publish_local_teardown(
     rows: &[OatResult],
 ) {
     match local_teardown_transition(config, run_id, rows) {
-        Ok(Some(transition)) => state.update(orchestration_id, |status| {
-            if matches!(status.state, crate::model::RunState::Running) {
-                status.local_teardown = Some(transition);
-            }
-        }).await,
+        Ok(Some(transition)) => {
+            state
+                .update(orchestration_id, |status| {
+                    if matches!(status.state, crate::model::RunState::Running) {
+                        status.local_teardown = Some(transition);
+                    }
+                })
+                .await
+        }
         Ok(None) => {}
         Err(error) => tracing::warn!(%error, "local teardown transition unavailable"),
     }
@@ -3226,12 +3263,12 @@ async fn run_isolated_cell(
     config: OatConfig,
     orchestration_id: &str,
     run_id: String,
-    replicas: u32,
-    concurrency: u32,
+    dimensions: (u32, u32),
     mut cancellation: watch::Receiver<bool>,
     submitted_config: Option<SubmittedConfigIdentity>,
     state: Arc<AppState>,
 ) -> MatrixOutcome {
+    let (replicas, concurrency) = dimensions;
     let mut platform = match platform_for_run(&config, &run_id) {
         Ok(platform) => platform,
         Err(error) => {
@@ -3306,10 +3343,11 @@ async fn run_isolated_cell(
         } => (result, false),
         _ = wait_for_cancellation(&mut cancellation) => (Err(anyhow::anyhow!("local OAT run cancelled")), true),
     };
-    if !cancelled && config.platform.kind == crate::config::OatMode::Local {
-        if let Ok(rows) = &result {
-            publish_local_teardown(&state, orchestration_id, &config, &run_id, rows).await;
-        }
+    if !cancelled
+        && config.platform.kind == crate::config::OatMode::Local
+        && let Ok(rows) = &result
+    {
+        publish_local_teardown(&state, orchestration_id, &config, &run_id, rows).await;
     }
     let cleanup = platform.cleanup(&config).await;
     let shutdown_drain_evidence = platform.shutdown_drain_evidence();
@@ -14470,30 +14508,57 @@ mod tests {
             "enabled": true, "operations": ["optimize", "purge", "vacuum", "checkpoint", "prune_log"]
         }))?);
         let duration = (config.warmup_seconds + config.measure_seconds) * 1_000;
-        let scheduled = unix_time_ms_u64()?.checked_sub(duration + 1_000).context("fixture clock")?;
+        let scheduled = unix_time_ms_u64()?
+            .checked_sub(duration + 1_000)
+            .context("fixture clock")?;
         let mut successful = sample_result(&local.run_id, "sqlserver_wait_stats", 1);
-        successful.evidence_json = Some(json!({"client_schedule":{
-            "scope":"orchestrator_assigned_schedule_with_observed_full_fleet_acknowledgement",
-            "effective":{"run_start_unix_ms":scheduled,"acknowledged_at_unix_ms":scheduled - 1,
-                "measurement_start_unix_ms":scheduled + config.warmup_seconds * 1_000,
-                "measurement_end_unix_ms":scheduled + duration}
-        }}).to_string());
+        successful.evidence_json = Some(
+            json!({"client_schedule":{
+                "scope":"orchestrator_assigned_schedule_with_observed_full_fleet_acknowledgement",
+                "effective":{"run_start_unix_ms":scheduled,"acknowledged_at_unix_ms":scheduled - 1,
+                    "measurement_start_unix_ms":scheduled + config.warmup_seconds * 1_000,
+                    "measurement_end_unix_ms":scheduled + duration}
+            }})
+            .to_string(),
+        );
         let schedule_path = local.state_dir.join("control/schedule");
         fs::write(&schedule_path, format!("{scheduled}\n"))?;
         let state = AppState::default();
         let orchestration = "123e4567-e89b-42d3-a456-426614174000";
-        state.runs.lock().await.insert(orchestration.to_owned(), crate::model::RunStatus {
-            id: orchestration.to_owned(), config_sha256: "0".repeat(64), state: crate::model::RunState::Running,
-            progress: "measurement complete".to_owned(), result_count: 0, error: None,
-            started_at_unix_ms: 1, finished_at_unix_ms: None, local_teardown: None,
-        });
+        state.runs.lock().await.insert(
+            orchestration.to_owned(),
+            crate::model::RunStatus {
+                id: orchestration.to_owned(),
+                config_sha256: "0".repeat(64),
+                state: crate::model::RunState::Running,
+                progress: "measurement complete".to_owned(),
+                result_count: 0,
+                error: None,
+                started_at_unix_ms: 1,
+                finished_at_unix_ms: None,
+                local_teardown: None,
+            },
+        );
         fs::write(&schedule_path, format!("{}\n", scheduled + 1))?;
         assert!(local_teardown_transition(&config, &local.run_id, std::slice::from_ref(&successful)).is_err());
         fs::write(&schedule_path, format!("{scheduled}\n"))?;
-        publish_local_teardown(&state, orchestration, &config, &local.run_id, std::slice::from_ref(&successful)).await;
+        publish_local_teardown(
+            &state,
+            orchestration,
+            &config,
+            &local.run_id,
+            std::slice::from_ref(&successful),
+        )
+        .await;
         local.cleanup(&config).await.context("guard-triggered normal cleanup")?;
         assert!(!schedule_path.exists());
-        let status = state.runs.lock().await.get(orchestration).cloned().context("missing status")?;
+        let status = state
+            .runs
+            .lock()
+            .await
+            .get(orchestration)
+            .cloned()
+            .context("missing status")?;
         assert!(matches!(status.state, crate::model::RunState::Running));
         assert!(status.finished_at_unix_ms.is_none());
         println!("D49_CLEANUP_GAP_STATUS {}", serde_json::to_string(&status)?);
