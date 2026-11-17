@@ -29,6 +29,7 @@ use futures::{FutureExt, StreamExt, TryStreamExt, future::BoxFuture};
 use object_store::{GetOptions, GetRange, ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, PutOptions, UpdateVersion};
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
+use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{ArrowReaderOptions, ParquetRecordBatchReaderBuilder};
 use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::errors::ParquetError;
@@ -1438,30 +1439,45 @@ impl PassProbeInventory {
 impl DeltaTable {
     /// Validate a log-relative data path and map it to its object-store location.
     fn safe_object_path(&self, raw: &str) -> Result<object_store::path::Path> {
-        let unsafe_path = |why: &str| {
-            fail(
-                MaintenanceErrorKind::UnsafeRequest,
-                format!("unsafe data path {raw:?}: {why}"),
-            )
-        };
-        if raw.is_empty() || raw.len() > 4096 || raw.starts_with('/') || raw.contains(['\\', '\0']) {
-            return Err(unsafe_path("empty, absolute or non-portable"));
-        }
-        if Url::parse(raw).is_ok() {
-            return Err(unsafe_path("external absolute URL"));
-        }
-        let decoded = percent_decode(raw).map_err(|_| unsafe_path("invalid escape"))?;
-        if decoded.contains(['\\', '\0'])
-            || decoded
-                .split('/')
-                .any(|segment| segment.is_empty() || segment == "." || segment == "..")
-            || decoded.split('/').next() == Some("_delta_log")
-        {
-            return Err(unsafe_path("traversal or log path"));
-        }
-        self.object_path(raw).map_err(|error| unsafe_path(&error.to_string()))
+        safe_snapshot_data_path(&self.url, raw)
     }
+}
 
+fn safe_snapshot_data_path(root: &Url, raw: &str) -> Result<object_store::path::Path> {
+    let unsafe_path = |why: &str| {
+        fail(
+            MaintenanceErrorKind::UnsafeRequest,
+            format!("unsafe data path {raw:?}: {why}"),
+        )
+    };
+    if raw.is_empty() || raw.len() > 4096 || raw.starts_with('/') || raw.contains(['\\', '\0']) {
+        return Err(unsafe_path("empty, absolute or non-portable"));
+    }
+    if Url::parse(raw).is_ok() {
+        return Err(unsafe_path("external absolute URL"));
+    }
+    let decoded = percent_decode(raw).map_err(|_| unsafe_path("invalid escape"))?;
+    if decoded.contains(['\\', '\0'])
+        || decoded
+            .split('/')
+            .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+        || decoded.split('/').next() == Some("_delta_log")
+    {
+        return Err(unsafe_path("traversal or log path"));
+    }
+    if raw.contains(['?', '#']) {
+        return Err(unsafe_path("query or fragment"));
+    }
+    let url = root.join(raw).map_err(|error| unsafe_path(&error.to_string()))?;
+    let path = object_store::path::Path::from_url_path(url.path()).map_err(|error| unsafe_path(&error.to_string()))?;
+    let base = object_store::path::Path::from_url_path(root.path()).map_err(|error| unsafe_path(&error.to_string()))?;
+    if url.scheme() != root.scheme() || url.host_str() != root.host_str() || !path.prefix_matches(&base) {
+        return Err(unsafe_path("data path escapes table root"));
+    }
+    Ok(path)
+}
+
+impl DeltaTable {
     fn data_url(&self, relative: &str) -> Result<Url> {
         let mut url = self.url.clone();
         url.path_segments_mut()
@@ -2138,6 +2154,138 @@ impl AsyncFileReader for FencedRangeReader {
         }
         .boxed()
     }
+}
+
+/// Identity and coverage of a completed, fixed-version active-file scan.
+#[derive(Clone, Debug)]
+pub struct EndpointSnapshotReceipt {
+    pub table_id: String,
+    pub version: u64,
+    pub files: u64,
+    pub rows: u64,
+}
+
+/// Read `endpoint_url` from one fixed Delta snapshot without opening a publisher.
+///
+/// # Errors
+/// Rejects unsupported table features, unsafe paths, incomplete or changed files,
+/// excessive active files or row groups, null identities, and callback failures.
+pub fn scan_active_endpoint_urls(
+    root: &Url,
+    max_files: usize,
+    mut observe: impl FnMut(&arrow::array::StringArray) -> Result<()>,
+) -> Result<EndpointSnapshotReceipt> {
+    let filesystem = root.username();
+    let valid_filesystem = filesystem.is_empty()
+        || (matches!(root.scheme(), "abfs" | "abfss")
+            && (3..=63).contains(&filesystem.len())
+            && filesystem
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'));
+    if max_files == 0
+        || max_files > 100_000
+        || !valid_filesystem
+        || root.password().is_some()
+        || root.query().is_some()
+        || root.fragment().is_some()
+        || !matches!(root.scheme(), "file" | "abfs" | "abfss" | "az")
+    {
+        anyhow::bail!("invalid fixed-snapshot scan root or file bound");
+    }
+    let mut root = root.clone();
+    if !root.path().ends_with('/') {
+        root.set_path(&format!("{}/", root.path()));
+    }
+    let store = object_store_for_url(&root)?;
+    let executor = shared_executor()?;
+    let engine = DefaultEngineBuilder::new(Arc::clone(&store))
+        .with_task_executor(Arc::clone(&executor))
+        .build();
+    let snapshot = Snapshot::builder_for(root.as_str()).build(&engine)?;
+    let fingerprint = TableFingerprint::of(&snapshot);
+    fingerprint.validate_supported(false)?;
+    let scan = Arc::clone(&snapshot).scan_builder().build()?;
+    let mut files = Vec::new();
+    let mut paths = BTreeSet::new();
+    for metadata in scan.scan_metadata(&engine)? {
+        let batch = metadata?.scan_files.apply_selection_vector()?.try_into_record_batch()?;
+        for file in parse_scan_rows(&batch, &fingerprint.partition_columns)? {
+            if files.len() == max_files {
+                anyhow::bail!("active file count exceeds scan bound");
+            }
+            let path = safe_snapshot_data_path(&root, &file.path)?;
+            if !paths.insert(path.clone()) {
+                anyhow::bail!("duplicate active snapshot file");
+            }
+            files.push((file, path));
+        }
+    }
+    let mut rows = 0_u64;
+    for (file, path) in &files {
+        let store = Arc::clone(&store);
+        let path = path.clone();
+        let size = file.size;
+        let mut stream = executor.block_on(async move {
+            let meta = store.head(&path).await?;
+            if meta.size != size || size > 1024 * 1024 * 1024 {
+                anyhow::bail!("active snapshot file size changed or exceeds scan bound");
+            }
+            let etag = meta
+                .e_tag
+                .filter(|value| !value.is_empty() && value != "*" && !value.starts_with("W/"))
+                .context("active snapshot file requires a strong ETag")?;
+            let reader = FencedRangeReader {
+                store,
+                path,
+                size,
+                etag,
+            };
+            let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
+            for group in builder.metadata().row_groups() {
+                if u64::try_from(group.total_byte_size()).unwrap_or(u64::MAX) > 512 * 1024 * 1024 {
+                    anyhow::bail!("snapshot input row group exceeds decode bound");
+                }
+            }
+            let index = builder.schema().index_of("endpoint_url")?;
+            if builder.schema().field(index).data_type() != &DataType::Utf8 {
+                anyhow::bail!("snapshot identity column must be UTF-8");
+            }
+            let projection = ProjectionMask::roots(builder.parquet_schema(), [index]);
+            Ok::<_, anyhow::Error>(builder.with_projection(projection).with_batch_size(4096).build()?)
+        })?;
+        let mut file_rows = 0_u64;
+        loop {
+            let (next_stream, batch) = executor.block_on(async move {
+                let batch = stream.next().await;
+                (stream, batch)
+            });
+            stream = next_stream;
+            let Some(batch) = batch else { break };
+            let batch = batch?;
+            let values = batch
+                .column_by_name("endpoint_url")
+                .context("snapshot projection omitted identity")?
+                .as_string_opt::<i32>()
+                .context("snapshot identity column is not UTF-8")?;
+            if values.null_count() != 0 {
+                anyhow::bail!("snapshot identity column contains null");
+            }
+            observe(values)?;
+            file_rows = file_rows
+                .checked_add(values.len() as u64)
+                .context("snapshot row count overflow")?;
+        }
+        if file.rows.is_some_and(|expected| expected != file_rows) {
+            anyhow::bail!("snapshot file rows disagree with Delta statistics");
+        }
+        rows = rows.checked_add(file_rows).context("snapshot row count overflow")?;
+    }
+    Ok(EndpointSnapshotReceipt {
+        table_id: fingerprint.table_id,
+        version: snapshot.version(),
+        files: files.len() as u64,
+        rows,
+    })
 }
 
 #[cfg(test)]

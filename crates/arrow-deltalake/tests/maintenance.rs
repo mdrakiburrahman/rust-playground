@@ -114,6 +114,79 @@ fn optimize_config() -> OptimizeConfig {
 }
 
 #[test]
+fn identity_scan_uses_one_active_snapshot_during_compaction() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let identity_schema = Arc::new(Schema::new(vec![
+        Field::new("endpoint_url", DataType::Utf8, false),
+        Field::new(INGESTION_PARTITION, DataType::Utf8, false),
+    ]));
+    let url = url_of(root.path())?;
+    let table = DeltaTable::open_url(
+        url.clone(),
+        Arc::clone(&identity_schema),
+        vec![INGESTION_PARTITION.into()],
+    )?;
+    for suffix in 0..2 {
+        let values = vec![format!("identity-{suffix}-0"), format!("identity-{suffix}-1")];
+        let data = RecordBatch::try_new(
+            Arc::clone(&identity_schema),
+            vec![
+                Arc::new(StringArray::from(values)),
+                Arc::new(StringArray::from(vec![minute(0); 2])),
+            ],
+        )?;
+        run(async {
+            let mut file = table
+                .new_file_partitioned(
+                    Arc::clone(&identity_schema),
+                    BTreeMap::from([(INGESTION_PARTITION.to_owned(), Some(minute(0)))]),
+                )?
+                .with_ingestion_time(BASE + 1)?;
+            file.write(&data).await?;
+            file.finish().await?;
+            Ok::<_, anyhow::Error>(())
+        })??;
+    }
+    let maintenance = DeltaTable::open_for_maintenance(&url)?;
+    let config = OptimizeConfig {
+        sealed_final: true,
+        ..optimize_config()
+    };
+    let plan = maintenance.plan_optimize(&config)?;
+    assert!(!plan.bins.is_empty());
+    let mut first = true;
+    let mut observed = Vec::new();
+    let before = arrow_deltalake::maintenance::scan_active_endpoint_urls(&url, 100, |values| {
+        observed.extend(values.iter().map(|value| value.expect("non-null identity").to_owned()));
+        if first {
+            first = false;
+            maintenance.apply_optimize(&plan, &config, &control())?;
+        }
+        Ok(())
+    })?;
+    observed.sort();
+    assert_eq!(
+        observed,
+        ["identity-0-0", "identity-0-1", "identity-1-0", "identity-1-1"]
+    );
+    assert_eq!(before.files, 2);
+    assert_eq!(before.rows, 4);
+    let mut after_values = Vec::new();
+    let after = arrow_deltalake::maintenance::scan_active_endpoint_urls(&url, 100, |values| {
+        after_values.extend(values.iter().map(|value| value.expect("non-null identity").to_owned()));
+        Ok(())
+    })?;
+    after_values.sort();
+    assert_eq!(after_values, observed);
+    assert!(after.version > before.version);
+    assert_eq!(after.rows, 4);
+    assert_eq!(after.files, 1);
+    assert_eq!(after.table_id, before.table_id);
+    assert!(arrow_deltalake::maintenance::scan_active_endpoint_urls(&url, 0, |_| Ok(())).is_err());
+    Ok(())
+}
+
+#[test]
 fn optimize_decode_limit_diagnostic_identifies_failed_bound() -> Result<()> {
     let root = tempfile::tempdir()?;
     let table = create(root.path())?;
