@@ -8,7 +8,14 @@ import { parseEffectiveStopBudgets } from './stop-budgets.js';
 export type RuntimeResourceRole = 'collector' | 'client' | 'maintenance' | 'router' | 'catalog';
 export interface ResourceValues { cpu: string; memory: string }
 export interface ResourceRequirements { requests: ResourceValues; limits: ResourceValues }
-export type RuntimeResources = Partial<Record<RuntimeResourceRole, ResourceRequirements>>;
+export interface CollectorResourceRequirements { requests: ResourceValues; limits: { cpu?: string | null; memory: string } }
+export type RuntimeResources = Partial<{
+  collector: CollectorResourceRequirements;
+  client: ResourceRequirements;
+  maintenance: ResourceRequirements;
+  router: ResourceRequirements;
+  catalog: ResourceRequirements;
+}>;
 
 export interface RuntimeConfig {
   namespace: string;
@@ -24,6 +31,10 @@ export interface RuntimeConfig {
   quiver?: boolean;
   resources?: RuntimeResources;
   collectorWorkers?: number;
+  campaignProfile?: 'scale_out_single_table';
+  hotTable?: string;
+  collectorReplicas?: number;
+  routerReplicas?: number;
 }
 type Resource = Record<string, any>;
 export type Phase = 'identity' | 'foundation' | 'bootstrap' | 'workload';
@@ -31,7 +42,7 @@ const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const dns = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 const roles = ['sqlserver', 'catalog', 'router', 'dataflow'] as const;
 const resourceRoles: RuntimeResourceRole[] = ['collector', 'client', 'maintenance', 'router', 'catalog'];
-const defaultResources: Record<RuntimeResourceRole, ResourceRequirements> = {
+const defaultResources: Record<RuntimeResourceRole, ResourceRequirements | CollectorResourceRequirements> = {
   collector: { requests: { cpu: '2', memory: '4Gi' }, limits: { cpu: '2', memory: '6Gi' } },
   client: { requests: { cpu: '250m', memory: '256Mi' }, limits: { cpu: '2', memory: '2Gi' } },
   maintenance: { requests: { cpu: '250m', memory: '512Mi' }, limits: { cpu: '1', memory: '2Gi' } },
@@ -60,7 +71,7 @@ function memoryBytes(value: unknown): bigint {
   return bytes;
 }
 
-function validateResources(value: unknown): asserts value is RuntimeResources {
+function validateResources(value: unknown, allowUncappedCollector = false): asserts value is RuntimeResources {
   if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).some(role => !resourceRoles.includes(role as RuntimeResourceRole)))
     throw new Error('resources must contain only known per-role settings');
   for (const [role, requirements] of Object.entries(value)) {
@@ -68,11 +79,17 @@ function validateResources(value: unknown): asserts value is RuntimeResources {
         Object.keys(requirements).sort().join() !== 'limits,requests') throw new Error(role + ' resources require requests and limits');
     for (const side of ['requests', 'limits'] as const) {
       const amounts = requirements[side];
-      if (!amounts || typeof amounts !== 'object' || Array.isArray(amounts) || Object.keys(amounts).sort().join() !== 'cpu,memory')
+      const cpuLimitMayBeAbsent = role === 'collector' && side === 'limits' && allowUncappedCollector &&
+        !(amounts && typeof amounts === 'object' && !Array.isArray(amounts) && Object.hasOwn(amounts, 'cpu'));
+      const expectedKeys = cpuLimitMayBeAbsent ? 'memory' : 'cpu,memory';
+      if (!amounts || typeof amounts !== 'object' || Array.isArray(amounts) || Object.keys(amounts).sort().join() !== expectedKeys)
         throw new Error(role + ' ' + side + ' requires cpu and memory quantities');
     }
     const request = requirements.requests, limit = requirements.limits;
-    if (cpuMilli(request.cpu) > cpuMilli(limit.cpu) || memoryBytes(request.memory) > memoryBytes(limit.memory))
+    const uncappedCollector = role === 'collector' && allowUncappedCollector && (!Object.hasOwn(limit, 'cpu') || limit.cpu === null);
+    const requestCpu = cpuMilli(request.cpu);
+    const limitCpu = uncappedCollector ? undefined : cpuMilli(limit.cpu);
+    if ((limitCpu !== undefined && requestCpu > limitCpu) || memoryBytes(request.memory) > memoryBytes(limit.memory))
       throw new Error(role + ' resource requests must not exceed limits');
   }
 }
@@ -81,12 +98,29 @@ export function validateRuntime(input: unknown, allowUnpublishedImages = false):
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('runtime config must be an object');
   const c = input as RuntimeConfig;
   const required = ['deltaRoot', 'effective_stop_budgets', 'images', 'namespace', 'oatRunId', 'workloadIdentityClientId', 'subscriptionId', 'stamp'];
-  if (required.some((key) => !Object.hasOwn(c, key)) || Object.keys(c).some((key) => ![...required, 'serviceAccount', 'maintenance', 'quiver', 'resources', 'collectorWorkers'].includes(key))) {
+  if (required.some((key) => !Object.hasOwn(c, key)) || Object.keys(c).some((key) => ![...required, 'serviceAccount', 'maintenance', 'quiver', 'resources', 'collectorWorkers', 'campaignProfile', 'hotTable', 'collectorReplicas', 'routerReplicas'].includes(key))) {
     throw new Error('runtime config has missing or unknown fields');
   }
   parseEffectiveStopBudgets(c.effective_stop_budgets);
+  const scaleOut = c.campaignProfile === 'scale_out_single_table';
+  if (Object.hasOwn(c, 'campaignProfile') && !scaleOut) throw new Error('campaignProfile must be scale_out_single_table');
+  if (!scaleOut && ['hotTable', 'collectorReplicas', 'routerReplicas'].some(key => Object.hasOwn(c, key)))
+    throw new Error('scale-out fields require campaignProfile scale_out_single_table');
   if (Object.hasOwn(c, 'quiver') && typeof c.quiver !== 'boolean') throw new Error('quiver must be an explicit boolean');
-  if (Object.hasOwn(c, 'resources')) validateResources(c.resources);
+  if (Object.hasOwn(c, 'resources')) validateResources(c.resources, scaleOut);
+  if (scaleOut) {
+    if (c.hotTable !== 'sqlserver_availability_replica_states' || c.quiver !== false ||
+        !Number.isSafeInteger(c.collectorReplicas) || c.collectorReplicas! < 1 || c.collectorReplicas! > 16 ||
+        c.routerReplicas !== c.collectorReplicas)
+      throw new Error('scale-out requires the approved hot table, memory-only buffering, and matching 1..16 collector/router replicas');
+    const maintenance = c.maintenance;
+    const requiredOperations = ['optimize', 'checkpoint', 'purge', 'vacuum', 'prune-log'];
+    if (!maintenance || maintenance.apply !== true || !Array.isArray(maintenance.tables) ||
+        maintenance.tables.length !== 1 || maintenance.tables[0] !== 'telemetry.sqlserver.sqlserver_availability_replica_states' ||
+        !Array.isArray(maintenance.operations) || maintenance.operations.length !== requiredOperations.length ||
+        requiredOperations.some(operation => !maintenance.operations.includes(operation)))
+      throw new Error('scale-out requires enabled maintenance for the approved table and all five operations');
+  }
   if (Object.hasOwn(c, 'collectorWorkers') && (!Number.isSafeInteger(c.collectorWorkers) || c.collectorWorkers! < 1 || c.collectorWorkers! > 256))
     throw new Error('collectorWorkers must be an integer from 1 to 256');
   if (typeof c.namespace !== 'string' || !dns.test(c.namespace) || c.namespace.startsWith('kube-') || ['default', 'azure-qap'].includes(c.namespace)) {
@@ -154,9 +188,9 @@ const secretVolume = (name: string, secretName: string) => ({
   name, secret: { secretName, defaultMode: 0o440 },
 });
 const mount = (name: string, mountPath: string, readOnly = true) => ({ name, mountPath, readOnly });
-const resourceSpec = (requirements: ResourceRequirements) => ({
+const resourceSpec = (requirements: ResourceRequirements | CollectorResourceRequirements) => ({
   requests: { cpu: requirements.requests.cpu, memory: requirements.requests.memory },
-  limits: { cpu: requirements.limits.cpu, memory: requirements.limits.memory },
+  limits: { ...(typeof requirements.limits.cpu === 'string' ? { cpu: requirements.limits.cpu } : {}), memory: requirements.limits.memory },
 });
 const resources = (cpu: string, memory: string, limitCpu = cpu, limitMemory = memory) => ({
   requests: { cpu, memory }, limits: { cpu: limitCpu, memory: limitMemory },
@@ -187,13 +221,18 @@ export async function renderRuntime(input: unknown, phase: Phase): Promise<Resou
       tolerations: [{
         key: 'arrow-collector/role', operator: 'Equal', value: 'arrowcol', effect: 'NoSchedule',
       }],
+      ...(c.campaignProfile === 'scale_out_single_table' && ['arrowcol', 'arrowcol-router'].includes(name) ? {
+        affinity: { podAntiAffinity: { requiredDuringSchedulingIgnoredDuringExecution: [{
+          labelSelector: { matchLabels: { app: name } }, topologyKey: 'kubernetes.io/hostname',
+        }] } },
+      } : {}),
       securityContext: { fsGroup: 10001, fsGroupChangePolicy: 'OnRootMismatch', seccompProfile: { type: 'RuntimeDefault' } },
       terminationGracePeriodSeconds: 360, containers, volumes,
     },
   });
-  const deployment = (name: string, containers: Resource[], volumes: Resource[], identity = false) => object('apps/v1', 'Deployment', name, {
+  const deployment = (name: string, containers: Resource[], volumes: Resource[], identity = false, replicas = 1) => object('apps/v1', 'Deployment', name, {
     // Recreate prevents old SQL table owners and replacement pods overlapping in a matrix case.
-    spec: { replicas: 1, strategy: { type: 'Recreate' }, selector: { matchLabels: { app: name } }, template: pod(name, containers, volumes, identity) },
+    spec: { replicas, strategy: { type: 'Recreate' }, selector: { matchLabels: { app: name } }, template: pod(name, containers, volumes, identity) },
   });
   const network = (name: string, app: string, from: string[], port: number) => object('networking.k8s.io/v1', 'NetworkPolicy', name, {
     spec: {
@@ -301,7 +340,7 @@ export async function renderRuntime(input: unknown, phase: Phase): Promise<Resou
       volumeMounts: [mount('config', '/etc/oat'), mount('app', '/run/app'), mount('auth', '/run/auth'),
         ...(c.quiver ? [mount('quiver', '/var/lib/arrowcol/quiver', false)] : [])],
     }], [{ name: 'config', configMap: { name: 'arrowcol-config' } }, secretVolume('app', 'arrowcol-sql-runtime'), secretVolume('auth', 'arrowcol-router-auth'),
-      ...(c.quiver ? [{ name: 'quiver', emptyDir: {} }] : [])], true),
+      ...(c.quiver ? [{ name: 'quiver', emptyDir: {} }] : [])], true, c.collectorReplicas ?? 1),
     deployment('arrowcol-router', [{
       name: 'router', image: c.images.router, securityContext: security,
       args: ['--config', '/etc/oat/router.yaml'],
@@ -309,7 +348,7 @@ export async function renderRuntime(input: unknown, phase: Phase): Promise<Resou
       startupProbe: { ...httpProbe('/readyz', 50050), failureThreshold: 120 },
       readinessProbe: httpProbe('/readyz', 50050), livenessProbe: httpProbe('/healthz', 50050),
       volumeMounts: [mount('config', '/etc/oat'), mount('app', '/run/app'), mount('auth', '/run/auth')],
-    }], [{ name: 'config', configMap: { name: 'arrowcol-config' } }, secretVolume('app', 'arrowcol-sql-runtime'), secretVolume('auth', 'arrowcol-router-auth')]),
+    }], [{ name: 'config', configMap: { name: 'arrowcol-config' } }, secretVolume('app', 'arrowcol-sql-runtime'), secretVolume('auth', 'arrowcol-router-auth')], false, c.routerReplicas ?? 1),
     network('catalog-internal', 'arrowcol-catalog', ['arrowcol', 'arrowcol-oat-client', ...(c.maintenance ? ['delta-maintenance'] : [])], 8817),
     network('flight-router-only', 'arrowcol', ['arrowcol-router'], 32010),
     network('router-oat-client-ingress', 'arrowcol-router', ['arrowcol-oat-client'], 50050),
