@@ -104,6 +104,7 @@ async fn wire_ingest_request(
 async fn loopback_compression_negotiates_requests_and_responses_independently() -> Result<()> {
     for (request_encoding, response_encoding, client_accept) in [
         (None, None, None),
+        (None, None, Some(CompressionEncoding::Zstd)),
         (
             Some(CompressionEncoding::Gzip),
             Some(CompressionEncoding::Gzip),
