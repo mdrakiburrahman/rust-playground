@@ -20,7 +20,7 @@ use arrowcol_catalog::{CatalogStore, DdlParser, FlightSqlDdlHandler, SchemaValid
 use arrowcol_protocol::{
     CATALOG_METADATA_KEY, CLAIMED_SCHEMA_FINGERPRINT_METADATA_KEY, ErrorCode, IMPLEMENTATION_POOL_METADATA_KEY,
     ImplementationPool, IngestMetadata, PROTOCOL_VERSION_METADATA_KEY, RawGrpcMetadata, SCHEMA_METADATA_KEY,
-    TABLE_METADATA_KEY, fingerprint_schema,
+    SHARD_INDEX_METADATA_KEY, TABLE_METADATA_KEY, fingerprint_schema,
 };
 use async_trait::async_trait;
 use futures::{Stream, StreamExt, stream};
@@ -1052,6 +1052,7 @@ fn parse_optional_ingest_metadata(metadata: &MetadataMap) -> RuntimeResult<Optio
         CATALOG_METADATA_KEY,
         SCHEMA_METADATA_KEY,
         TABLE_METADATA_KEY,
+        SHARD_INDEX_METADATA_KEY,
         CLAIMED_SCHEMA_FINGERPRINT_METADATA_KEY,
     ];
     if !keys.iter().any(|key| metadata.contains_key(*key)) {
@@ -1063,6 +1064,7 @@ fn parse_optional_ingest_metadata(metadata: &MetadataMap) -> RuntimeResult<Optio
         catalog: ascii_metadata(metadata, CATALOG_METADATA_KEY)?,
         schema: ascii_metadata(metadata, SCHEMA_METADATA_KEY)?,
         table: ascii_metadata(metadata, TABLE_METADATA_KEY)?,
+        shard_index: ascii_metadata(metadata, SHARD_INDEX_METADATA_KEY)?,
         claimed_schema_fingerprint: ascii_metadata(metadata, CLAIMED_SCHEMA_FINGERPRINT_METADATA_KEY)?,
     };
     IngestMetadata::parse(raw)
