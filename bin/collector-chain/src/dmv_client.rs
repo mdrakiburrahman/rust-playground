@@ -2996,6 +2996,11 @@ mod tests {
         );
         let line = format!("OAT_CLIENT_METRICS {receipt}\n");
         assert!(line.len() <= MAX_OAT_CLIENT_METRICS_LINE_BYTES);
+        eprintln!(
+            "W2_TERMINAL_MANIFEST receipt_line_bytes={} cap_bytes={}",
+            line.len(),
+            MAX_OAT_CLIENT_METRICS_LINE_BYTES
+        );
         let payload = line.strip_prefix("OAT_CLIENT_METRICS ").context("metrics prefix")?;
         serde_json::from_str::<serde_json::Value>(payload.trim_end())?;
         assert!(client.ensure_terminal_manifest_complete().is_err());
@@ -3012,7 +3017,12 @@ mod tests {
         let receipt = client.metrics("completed")?;
         assert_eq!(receipt["phase"], "failed");
         assert_eq!(receipt["terminal_failure"], "serialized_terminal_receipt_exceeds_limit");
-        assert!(oat_client_metrics_line_bytes(&receipt)? <= MAX_OAT_CLIENT_METRICS_LINE_BYTES);
+        let line_bytes = oat_client_metrics_line_bytes(&receipt)?;
+        assert!(line_bytes <= MAX_OAT_CLIENT_METRICS_LINE_BYTES);
+        eprintln!(
+            "W2_TERMINAL_NON_MANIFEST_OVERFLOW receipt_line_bytes={line_bytes} cap_bytes={MAX_OAT_CLIENT_METRICS_LINE_BYTES} failure={}",
+            receipt["terminal_failure"]
+        );
         Ok(())
     }
 
@@ -3365,9 +3375,23 @@ mod tests {
         assert!(budget.admitted_live_slots < budget.configured_live_slots);
         assert_eq!(budget.total_bytes, budget.corpus_bytes + budget.live_batch_bytes);
         assert!(budget.total_bytes <= options.max_memory_bytes);
+        eprintln!(
+            "W2_MEMORY_BUDGET cap_bytes={} corpus_bytes={} per_live_batch_bytes={} configured_slots={} admitted_slots={} live_reserved_bytes={} total_reserved_bytes={}",
+            options.max_memory_bytes,
+            budget.corpus_bytes,
+            budget.per_live_batch_bytes,
+            budget.configured_live_slots,
+            budget.admitted_live_slots,
+            budget.live_batch_bytes,
+            budget.total_bytes
+        );
 
         options.max_memory_bytes = budget.corpus_bytes + budget.per_live_batch_bytes - 1;
         assert!(memory_budget(&tables, "client", options.corpus_rows, row_bytes, 1, &options).is_err());
+        eprintln!(
+            "W2_MEMORY_SINGLE_BATCH_REJECT cap_bytes={} corpus_bytes={} required_one_live_batch_bytes={}",
+            options.max_memory_bytes, budget.corpus_bytes, budget.per_live_batch_bytes
+        );
         Ok(())
     }
 
