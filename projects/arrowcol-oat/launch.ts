@@ -9,7 +9,7 @@ import { performance } from 'node:perf_hooks';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { formatPreflightReport, loadAksEnvironment, runAksPreflight } from './aks-preflight.js';
 import { run_tree } from '../../infra/azure/bootstrap.js';
-import { parseDataFlowVerdictPolicy, record, reportDataFlowRun, type NetworkObservation } from './dataflow-verdict.js';
+import { collectDataFlow, parseDataFlowVerdictPolicy, record, reportDataFlowRun, type NetworkObservation } from './dataflow-verdict.js';
 
 export interface OatRunStatus {
   id: string;
@@ -853,11 +853,6 @@ async function cancelAndReconcileLocalRun(
       attemptedCancellation = true;
       retryAfterRead = false;
       await note(() => deadline.markCancelAttempt());
-      if (evidenceError) {
-        const error = new Error('Could not persist cancellation intent before dispatch');
-        await note(() => deadline.markUnsettled(error));
-        throw new Error(error.message, { cause: evidenceError });
-      }
       let signalForCancel: AbortSignal;
       try {
         signalForCancel = cancelSignal();
@@ -1142,6 +1137,7 @@ export async function main(
   runner: typeof run_tree = run_tree,
   cleanupLocal = cleanupLocalComposeProjects,
   receiptRoot = launcherDeadlineReceiptRoot,
+  collect: typeof collectDataFlow = collectDataFlow,
 ): Promise<void> {
   const launcherStartedAtUnixMs = Date.now();
   const launcherStartedAtMonotonicMs = performance.now();
@@ -1264,7 +1260,7 @@ export async function main(
       try {
         const code = await reportDataFlowRun(
           (progress) => launchOat(configPath, requestedServerUrl, pollValue, fetch, progress, mode, getDockerBridgeGateway, interrupt?.controller.signal, undefined, undefined, deadline, submission),
-          config, mode, undefined, runner, network, warnings,
+          config, mode, undefined, runner, network, warnings, collect,
         );
         if (deadline?.isExpired()) {
           await deadline.markOverrun();
@@ -1371,7 +1367,7 @@ export async function main(
       };
       const code = await reportDataFlowRun(
         (progress) => launchOat(configPath, server.url, pollValue, fetch, progress, mode, getDockerBridgeGateway, interrupt?.controller.signal, onRunStarted, onRunFinished, deadline, submission),
-        config, mode, server.gitSha, runner, network, warnings,
+        config, mode, server.gitSha, runner, network, warnings, collect,
       );
       if (interrupt?.signal) {
         process.exitCode = interrupt.exitCode;

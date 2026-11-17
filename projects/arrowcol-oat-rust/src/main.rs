@@ -98,7 +98,9 @@ async fn start_run(
     let config: OatConfig = serde_json::from_slice(&body).map_err(|error| {
         (
             StatusCode::BAD_REQUEST,
-            Json(ApiError { error: format!("{error:#}") }),
+            Json(ApiError {
+                error: format!("{error:#}"),
+            }),
         )
     })?;
     config.validate().map_err(|error| {
@@ -174,10 +176,7 @@ async fn start_run(
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 async fn cancel_run(
@@ -219,7 +218,7 @@ async fn get_run(
 
 #[cfg(test)]
 mod config_hash_tests {
-    use super::{sha256_hex, RunStatus};
+    use super::{RunStatus, sha256_hex};
     use sha2::{Digest, Sha256};
 
     #[test]

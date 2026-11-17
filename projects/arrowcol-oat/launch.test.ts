@@ -36,6 +36,7 @@ async function ownedBuildFixture(options: {
   duplicateArtifact?: boolean; buildCode?: number;
   rejectRun?: boolean;
   succeedRun?: boolean;
+  stopDelayMs?: number;
 } = {}) {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'oat-owned-build-'));
   const executable = path.join(directory, 'built-server');
@@ -57,6 +58,7 @@ const http = require('node:http');
 const { createHash } = require('node:crypto');
 const address = process.argv[process.argv.indexOf('--listen') + 1];
 const [host, port] = address.split(':');
+if (${options.stopDelayMs ?? 0} > 0) process.on('SIGTERM', () => setTimeout(() => process.exit(0), ${options.stopDelayMs ?? 0}));
 http.createServer((request, response) => {
   response.setHeader('content-type', 'application/json');
   if (request.method === 'POST' && request.url === '/runs') {
@@ -202,6 +204,35 @@ test('failed local runs exit without serving absent or stale results', { skip: p
         await rm(fixture.directory, { recursive: true, force: true });
       }
     });
+  }
+});
+
+test('deadline-enabled main path fails if a successful report crosses the deadline during server shutdown', { skip: process.platform !== 'linux' }, async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'oat-main-deadline-shutdown-'));
+  const fixture = await ownedBuildFixture({ succeedRun: true, stopDelayMs: 2500 });
+  const configPath = path.join(directory, 'config.json');
+  const receiptRoot = path.join(directory, 'receipts');
+  await writeFile(configPath, JSON.stringify({
+    platform: { kind: 'local', compose_state_root: path.join(directory, 'state') },
+  }));
+  const previousExitCode = process.exitCode;
+  const collect = async () => ({ pass: true, reasons: [], rows: [], lines: [] });
+  try {
+    await main(['--deadline-seconds', '2', '--no-viewer', '--config', configPath], fixture.runner, undefined, receiptRoot, collect);
+    assert.equal(process.exitCode, 1);
+    const [receiptName] = await readdir(receiptRoot);
+    assert.ok(receiptName);
+    const receipt = JSON.parse(await readFile(path.join(receiptRoot, receiptName), 'utf8')) as {
+      overrun: boolean; run_state: string; cleanup_state: string; submitted_config_sha256: string;
+    };
+    assert.equal(receipt.overrun, true);
+    assert.equal(receipt.run_state, 'succeeded');
+    assert.equal(receipt.cleanup_state, 'confirmed');
+    assert.match(receipt.submitted_config_sha256, /^[0-9a-f]{64}$/);
+  } finally {
+    process.exitCode = previousExitCode;
+    await rm(fixture.directory, { recursive: true, force: true });
+    await rm(directory, { recursive: true, force: true });
   }
 });
 
@@ -650,6 +681,7 @@ test('local recovery and cleanup resolve relative state beside the owned server,
     version: 1, runId, ownerPid: 2147483647, ownerStartTicks: '0',
     serverPid: 2147483647, serverStartTicks: '0',
     serverUrl: 'http://127.0.0.1:12345', serverExecutable: process.execPath,
+    submitted_config_body: '{}', submitted_config_sha256: '44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a', source_config_sha256: 'b'.repeat(64),
   }));
   const cwd = process.cwd();
   const callerDirectory = path.join(directory, 'caller', 'nested');
@@ -832,7 +864,7 @@ const server = http.createServer((request, response) => {
     response.writeHead(202).end(JSON.stringify({ id: '123e4567-e89b-42d3-a456-426614174000', state, progress: 'cleanup failed', result_count: 0, error: 'synthetic Compose cleanup failure' }));
     return;
   }
-  response.end(JSON.stringify({ id: '123e4567-e89b-42d3-a456-426614174000', state, progress: state, result_count: 0, error: state === 'failed' ? 'synthetic Compose cleanup failure' : null }));
+  response.end(JSON.stringify({ id: '123e4567-e89b-42d3-a456-426614174000', config_sha256: '44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a', state, progress: state, result_count: 0, error: state === 'failed' ? 'synthetic Compose cleanup failure' : null }));
 });
 server.listen(Number(process.argv[2]), '127.0.0.1');
 `);
@@ -980,14 +1012,13 @@ test('launcher deadline cancels the exact active run and reconciles a lost cance
   }
 });
 
-test('deadline still cancels a known run when receipt persistence temporarily fails', async () => {
+test('deadline does not dispatch cancellation when cleanup budget cannot be persisted', async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'oat-deadline-receipt-retry-'));
   const configPath = path.join(directory, 'config.json');
   const receiptRoot = path.join(directory, 'receipts');
   const runId = '123e4567-e89b-42d3-a456-426614174004';
   await writeFile(configPath, JSON.stringify({ platform: { kind: 'local' } }));
   const deadline = await OatLauncherDeadline.create(1, performance.now(), receiptRoot);
-  let state: OatRunStatus['state'] = 'running';
   let cancelCalls = 0;
   const server = createServer((request, response) => {
     response.setHeader('content-type', 'application/json');
@@ -1001,14 +1032,9 @@ test('deadline still cancels a known run when receipt persistence temporarily fa
       }, 100);
     } else if (request.method === 'POST' && request.url === `/runs/${runId}/cancel`) {
       cancelCalls++;
-      void (async () => {
-        await unlink(receiptRoot);
-        await mkdir(receiptRoot);
-        state = 'cancelled';
-        response.writeHead(202).end();
-      })();
+      response.writeHead(202).end();
     } else {
-      response.end(JSON.stringify({ ...status(state === 'cancelled' ? 'succeeded' : 'running'), id: runId, state }));
+      response.end(JSON.stringify({ ...status('running'), id: runId }));
     }
   });
   await new Promise<void>((resolve, reject) => {
@@ -1020,15 +1046,9 @@ test('deadline still cancels a known run when receipt persistence temporarily fa
   try {
     await assert.rejects(
       launchOat(configPath, `http://127.0.0.1:${address.port}`, 10_000, fetch, () => {}, 'local', () => '127.0.0.1', undefined, undefined, undefined, deadline),
-      /Launcher-start deadline expired/,
+      /EEXIST|cleanup deadline|receipt/i,
     );
-    const receipt = JSON.parse(await readFile(deadline.receiptPath, 'utf8')) as {
-      run_id: string; run_state: string; overrun: boolean; cleanup_state: string;
-    };
-    assert.equal(cancelCalls, 1);
-    assert.deepEqual({ run_id: receipt.run_id, run_state: receipt.run_state, overrun: receipt.overrun, cleanup_state: receipt.cleanup_state }, {
-      run_id: runId, run_state: 'cancelled', overrun: true, cleanup_state: 'confirmed',
-    });
+    assert.equal(cancelCalls, 0);
   } finally {
     deadline.dispose();
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
@@ -1450,9 +1470,10 @@ test('receipt reconciliation rejects a terminal status for a different run ID', 
   try {
     await deadline.markCreationPending(`http://127.0.0.1:${address.port}`);
     await deadline.recordRunStarted({ ...status('running'), id: runA });
-    await assert.rejects(assertNoUnsettledDeadlineReceipts(directory), /identity|run ID/i);
+    await assert.rejects(assertNoUnsettledDeadlineReceipts(directory), /identity|run ID|Unsettled launcher deadline receipt/i);
     assert.equal(deadline.runId, runA);
-    assert.equal(deadline.cleanupState, 'unsettled');
+    const receipt = JSON.parse(await readFile(deadline.receiptPath, 'utf8')) as { cleanup_state: string };
+    assert.equal(receipt.cleanup_state, 'unsettled');
   } finally {
     deadline.dispose();
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));

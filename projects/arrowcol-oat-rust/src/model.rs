@@ -129,6 +129,7 @@ mod cancellation_tests {
     fn status(id: &str) -> RunStatus {
         RunStatus {
             id: id.to_owned(),
+            config_sha256: "0".repeat(64),
             state: RunState::Queued,
             progress: "queued".to_owned(),
             result_count: 0,
