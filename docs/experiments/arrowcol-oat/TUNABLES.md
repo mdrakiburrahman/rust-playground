@@ -10,6 +10,18 @@
 | Durability | Requested WAL class is recorded separately from consumer evidence. Nondefault weaker durability must not be compared as equivalent to durable configurations. |
 | Cleanup | Only run-owned resources/configuration are changed. Existing namespace, identity, pinning and cleanup guards remain required. Never delete a resource group to clean up an experiment. |
 
+## AKS per-role resources
+
+| Role | Default request | Default limit |
+| --- | --- | --- |
+| Collector | 2 CPU / 4Gi | 2 CPU / 6Gi |
+| Client | 250m CPU / 256Mi | 2 CPU / 2Gi |
+| Maintenance | 250m CPU / 512Mi | 1 CPU / 2Gi |
+| Router | 500m CPU / 512Mi | 2 CPU / 1Gi |
+| Catalog | 500m CPU / 1Gi | 2 CPU / 4Gi |
+
+`platform.resources` may override any role with both CPU/memory requests and limits. Quantities are strictly parsed Kubernetes quantities; unknown fields, malformed values, and requests above limits fail before setup. AKS applies these settings to rendered workloads and client Jobs, then verifies the live Deployment/Job and scheduled pod resource specs and node names. The per-cell evidence records requested/effective values, configured collector/client concurrency, CPU limits, and oversubscription ratios. Oversubscription is intentionally allowed; thread counts do not prove throttling. OAT measures per-container CFS throttled-period deltas from kubelet cAdvisor between schedule arming and client completion; unavailable counters remain explicitly unavailable.
+
 ## Router timeout compatibility
 
 | Setting | Contract |

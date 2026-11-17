@@ -213,7 +213,7 @@ test('maintenance retains its original budget and refuses a second stop after th
       stopMaintenanceIfUidAndOwnerMatch: async (resource, _owner, _key, authority) => {
         const budget = cleanupBudget(authority)!;
         assert.equal(budget.deadlineUnixMs, f.store.state.runInventory!.cleanup.stop_maintenance.deadline_unix_ms);
-        assert.equal(budget.remainingMs, 120_000);
+        assert.equal(budget.remainingMs, 5_100_000);
         await authority.assertCurrent();
         confirmed.push(resource.uid!);
         now += budget.remainingMs + 1;
@@ -224,6 +224,8 @@ test('maintenance retains its original budget and refuses a second stop after th
     const deadline = f.store.state.runInventory!.cleanup.stop_maintenance.deadline_unix_ms;
     assert.equal(deadline, now - 1);
     assert.equal(f.store.state.runInventory!.cleanup.stop_maintenance.state, 'running');
+    f.store.state.heartbeatAtMs = now;
+    f.store.state.heartbeatSequence += 1;
     await assert.rejects(f.invoke('stop_maintenance', providers), /UNKNOWN/);
     assert.deepEqual(confirmed, [original.uid]);
     assert.equal(f.store.state.runInventory!.cleanup.stop_maintenance.deadline_unix_ms, deadline);

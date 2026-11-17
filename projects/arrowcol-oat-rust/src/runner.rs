@@ -1,4 +1,7 @@
-use crate::config::OatConfig;
+use crate::config::{
+    AKS_RESOURCE_COUNTER_SNAPSHOT_TIMEOUT_MS, EffectiveStopBudgets, OatConfig, ResourceRequirements, ResourceValues,
+    parse_cpu_millicores as parse_resource_cpu_millicores, parse_memory_bytes as parse_resource_memory_bytes,
+};
 use crate::model::{AppState, RunState, unix_time_ms};
 use anyhow::{Context, Result, bail};
 use arrow::array::{
@@ -94,6 +97,10 @@ pub struct RunInventory {
     pub qap: Option<InventoryQap>,
     #[serde(default)]
     pub evidence_destination: Option<InventoryEvidenceDestination>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_stop_budgets: Option<EffectiveStopBudgets>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planned_cell_duration_ms: Option<u64>,
     pub cleanup: InventoryCleanup,
 }
 
@@ -330,6 +337,17 @@ impl RunInventory {
     pub fn validate(&self) -> Result<()> {
         if self.schema_version != 1 || self.fencing_token == 0 {
             bail!("invalid custody inventory version or fencing token");
+        }
+        if let Some(budgets) = self.effective_stop_budgets {
+            budgets.validate()?;
+        }
+        if let Some(duration_ms) = self.planned_cell_duration_ms {
+            let no_row_rehearsal = duration_ms == 0 && self.load_admission == InventoryLoadAdmission::NotAuthorized;
+            if duration_ms > 9_007_199_254_740_991 || (duration_ms == 0 && !no_row_rehearsal) {
+                bail!(
+                    "planned_cell_duration_ms must be a positive JSON-safe integer except for not-authorized no-row rehearsal inventories"
+                );
+            }
         }
         for value in [
             &self.campaign_id,
@@ -667,6 +685,8 @@ impl RunInventory {
             || self.orchestration_run_id != next.orchestration_run_id
             || self.cell_run_id != next.cell_run_id
             || !self.load_admission.can_advance_to(next.load_admission)
+            || self.effective_stop_budgets != next.effective_stop_budgets
+            || self.planned_cell_duration_ms != next.planned_cell_duration_ms
             || self.namespace.name != next.namespace.name
             || self.namespace.owner_token != next.namespace.owner_token
             || self
@@ -1032,11 +1052,20 @@ trait Platform: Send + Sync {
     fn shutdown_drain_evidence(&self) -> Option<Value> {
         None
     }
+    fn resource_evidence(&self) -> Option<Value> {
+        None
+    }
+    async fn finish_resource_measurement(&mut self, _config: &OatConfig) -> Result<()> {
+        Ok(())
+    }
     async fn cleanup(&mut self, config: &OatConfig) -> Result<()>;
 }
 
 struct AksPlatform {
     run_id: String,
+    resource_readback: Vec<Value>,
+    cpu_throttling_start: Option<Vec<CpuThrottleSample>>,
+    cpu_throttling_evidence: Option<Value>,
     namespace_created: bool,
     namespace_create_attempted: bool,
     namespace_owner_token: String,
@@ -1146,6 +1175,22 @@ struct LocalPlatform {
 
 #[async_trait::async_trait]
 impl Platform for AksPlatform {
+    fn resource_evidence(&self) -> Option<Value> {
+        Some(json!({
+            "readbacks": self.resource_readback,
+            "cpu_throttling": self.cpu_throttling_evidence,
+        }))
+    }
+
+    async fn finish_resource_measurement(&mut self, config: &OatConfig) -> Result<()> {
+        let end = capture_aks_cpu_throttling(config, &self.resource_readback).await?;
+        self.cpu_throttling_evidence = Some(compare_cpu_throttling(
+            self.cpu_throttling_start.take().as_deref().unwrap_or_default(),
+            &end,
+        ));
+        Ok(())
+    }
+
     fn kind(&self) -> crate::config::OatMode {
         crate::config::OatMode::Aks
     }
@@ -1190,6 +1235,7 @@ impl Platform for AksPlatform {
         for name in config.deployment_names() {
             rollout(config, name).await?;
         }
+        self.resource_readback = aks_deployment_resource_evidence(config).await?;
         Ok(())
     }
 
@@ -1210,7 +1256,21 @@ impl Platform for AksPlatform {
             now_unix_ms,
         )
         .await?;
-        start_aks_maintenance(config).await
+        start_aks_maintenance(config).await?;
+        if maintenance_enabled(config) {
+            let resources = config.effective_aks_resources();
+            self.resource_readback.push(
+                aks_deployment_resource_readback(
+                    config,
+                    "maintenance",
+                    "delta-maintenance",
+                    "maintenance",
+                    &resources.maintenance,
+                )
+                .await?,
+            );
+        }
+        verify_maintenance_stop_budget_before_admission(config, self).await
     }
 
     fn qap_observation_mode(&self) -> arrowcol_loadgen::ObservationMode {
@@ -1546,6 +1606,7 @@ impl Platform for AksPlatform {
     }
 
     async fn arm_clients(&mut self, config: &OatConfig, _run_id: &str, run_start_unix_ms: u64) -> Result<()> {
+        self.cpu_throttling_start = Some(capture_aks_cpu_throttling(config, &self.resource_readback).await?);
         let mut configmap = json!({
             "apiVersion": "v1",
             "kind": "ConfigMap",
@@ -1673,6 +1734,7 @@ impl Platform for LocalPlatform {
         _run_id: &str,
         tables: &[String],
     ) -> Result<()> {
+        verify_maintenance_stop_budget_before_admission(config, self).await?;
         verify_local_partition_policy_before_admission(config, self, tables).await
     }
 
@@ -2288,6 +2350,8 @@ async fn start_aks_client_job(
         args,
         run_seconds,
     });
+    let client_resources = config.effective_aks_resources().client;
+    configure_client_job_resources(&mut job, &client_resources)?;
     inject_container_environment(
         job.pointer_mut("/spec/template/spec/containers/0")
             .context("AKS client container is missing")?,
@@ -2303,6 +2367,27 @@ async fn start_aks_client_job(
     .await
     .with_context(|| format!("create AKS DMV client Job {job_name}"))?;
     record_applied_resource_uids(config, platform, std::slice::from_ref(&job)).await?;
+    let applied_job_json = kubectl(
+        config,
+        vec!["get", "job", &job_name, "--namespace", &config.namespace, "-o", "json"],
+        None,
+    )
+    .await
+    .context("read applied AKS client Job resource spec")?;
+    let applied_job: Value = serde_json::from_str(&applied_job_json).context("parse applied AKS client Job")?;
+    let job_containers = applied_job
+        .pointer("/spec/template/spec/containers")
+        .and_then(Value::as_array)
+        .context("applied AKS client Job has no containers")?;
+    let job_resources = verify_container_resources(job_containers, "client", "client", &client_resources)?;
+    let pod = wait_for_aks_client_pod_resource_readback(config, &job_name, &client_resources).await?;
+    platform.resource_readback.push(json!({
+        "role": "client",
+        "job": job_name,
+        "requested": client_resources,
+        "effective": {"job_template": job_resources["effective"], "pod": pod["resources"]},
+        "scheduled_pod": {"name": pod["name"], "uid": pod["uid"], "node": pod["node"], "container": "client"},
+    }));
     Ok(ClientHandle {
         client_id: format!("{run_id}:{table}:{client_index}"),
         table: table.to_owned(),
@@ -2420,6 +2505,66 @@ fn build_aks_client_job(spec: AksClientJobSpec<'_>) -> Value {
             },
         },
     })
+}
+
+async fn wait_for_aks_client_pod_resource_readback(
+    config: &OatConfig,
+    job_name: &str,
+    expected: &ResourceRequirements,
+) -> Result<Value> {
+    tokio::time::timeout(Duration::from_secs(config.client_ready_timeout_seconds), async {
+        loop {
+            let pod_json = kubectl(
+                config,
+                vec![
+                    "get",
+                    "pods",
+                    "--namespace",
+                    &config.namespace,
+                    "--selector",
+                    &format!("job-name={job_name}"),
+                    "-o",
+                    "json",
+                ],
+                None,
+            )
+            .await
+            .context("read AKS client pod placement and resource spec")?;
+            let pod_list: Value = serde_json::from_str(&pod_json).context("parse AKS client pod list")?;
+            let pods = pod_list
+                .get("items")
+                .and_then(Value::as_array)
+                .context("AKS client pod list omitted items")?;
+            for pod in pods {
+                let phase = pod.pointer("/status/phase").and_then(Value::as_str);
+                if phase == Some("Failed") {
+                    bail!("AKS client Job pod failed before load authorization");
+                }
+                let Some(node) = pod
+                    .pointer("/spec/nodeName")
+                    .and_then(Value::as_str)
+                    .filter(|node| !node.is_empty())
+                else {
+                    continue;
+                };
+                let metadata = pod.get("metadata").context("AKS client pod metadata is missing")?;
+                let containers = pod
+                    .pointer("/spec/containers")
+                    .and_then(Value::as_array)
+                    .context("AKS client pod has no containers")?;
+                let resources = verify_container_resources(containers, "client", "client", expected)?;
+                return Ok(json!({
+                    "name": metadata.get("name"),
+                    "uid": metadata.get("uid"),
+                    "node": node,
+                    "resources": resources["effective"],
+                }));
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    })
+    .await
+    .context("AKS client pod did not schedule before the configured readiness deadline")?
 }
 
 async fn poll_aks_client_job(config: &OatConfig, handle: &ClientHandle) -> Result<ClientProgress> {
@@ -2904,21 +3049,49 @@ async fn run_isolated_cell(
             );
         }
     };
+    let timing_budget = match config.timing_budget() {
+        Ok(budget) => budget,
+        Err(error) => {
+            return finish_matrix_cell(
+                &config,
+                orchestration_id,
+                &run_id,
+                replicas,
+                concurrency,
+                Err(error),
+                Ok(()),
+            );
+        }
+    };
+    let lifecycle_started_at = tokio::time::Instant::now();
+    let lifecycle_deadline = lifecycle_started_at + Duration::from_millis(timing_budget.planned_cell_duration_ms);
+    let setup_deadline = lifecycle_started_at + Duration::from_millis(timing_budget.pre_cell_setup_timeout_ms);
     let (result, cancelled) = tokio::select! {
         result = async {
-            match platform.ensure_stack(&config, orchestration_id).await {
-                Ok(()) => {
-                    run_matrix_cell(
-                        &config,
-                        orchestration_id,
-                        &run_id,
-                        replicas,
-                        concurrency,
-                        platform.as_mut(),
-                    )
-                    .await
-                }
-                Err(error) => Err(error).context("prepare isolated OAT matrix-cell platform"),
+            match tokio::time::timeout_at(setup_deadline, platform.ensure_stack(&config, orchestration_id)).await {
+                Ok(result) => result.context("prepare isolated OAT matrix-cell platform")?,
+                Err(_) => bail!("planned pre-cell setup deadline expired; normal platform cleanup follows"),
+            }
+            let timing = config.timing_budget()?;
+            require_lifecycle_remaining_at(
+                tokio::time::Instant::now(),
+                lifecycle_deadline,
+                Duration::from_millis(timing.after_setup_budget_ms),
+                "ArrowCol scale",
+            )?;
+            match tokio::time::timeout_at(lifecycle_deadline, async {
+                run_matrix_cell(
+                    &config,
+                    orchestration_id,
+                    &run_id,
+                    replicas,
+                    concurrency,
+                    platform.as_mut(),
+                    lifecycle_deadline,
+                ).await
+            }).await {
+                Ok(result) => result,
+                Err(_) => Err(anyhow::anyhow!("planned cell lifecycle duration expired; normal platform cleanup follows")),
             }
         } => (result, false),
         _ = wait_for_cancellation(&mut cancellation) => (Err(anyhow::anyhow!("local OAT run cancelled")), true),
@@ -3067,6 +3240,7 @@ fn finish_matrix_cell(
                         started_at_ms,
                         qap: QapMetrics::default(),
                         resources: None,
+                        resource_evidence: None,
                     },
                 )
             })();
@@ -3146,6 +3320,9 @@ fn platform_for_run(config: &OatConfig, run_id: &str) -> Result<Box<dyn Platform
         crate::config::OatMode::Local => Ok(Box::new(LocalPlatform::new(config, run_id)?)),
         crate::config::OatMode::Aks => Ok(Box::new(AksPlatform {
             run_id: run_id.to_owned(),
+            resource_readback: Vec::new(),
+            cpu_throttling_start: None,
+            cpu_throttling_evidence: None,
             namespace_created: false,
             namespace_create_attempted: false,
             namespace_owner_token: uuid::Uuid::new_v4().to_string(),
@@ -3430,6 +3607,63 @@ async fn settle_cell_commit_evidence(
     }
 }
 
+#[cfg(test)]
+#[test]
+fn local_lifecycle_budget_allows_positive_setup_elapsed_and_rejects_exhaustion() -> Result<()> {
+    let mut config: OatConfig = serde_json::from_str(include_str!(
+        "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+    ))?;
+    config.platform.kind = crate::config::OatMode::Local;
+    let budget = config.timing_budget()?;
+    assert_eq!(budget.after_setup_budget_ms, budget.minimum_pin_ttl_ms);
+    assert_eq!(
+        budget.planned_cell_duration_ms,
+        budget.pre_cell_setup_timeout_ms + budget.after_setup_budget_ms
+    );
+
+    let started = tokio::time::Instant::now();
+    let setup_elapsed = Duration::from_secs(30);
+    let deadline = started + Duration::from_millis(budget.planned_cell_duration_ms);
+    let post_setup_now = started + setup_elapsed;
+    assert!(
+        require_lifecycle_remaining_at(
+            post_setup_now,
+            deadline,
+            Duration::from_millis(budget.after_setup_budget_ms),
+            "Local admission"
+        )
+        .is_ok()
+    );
+
+    let exhausted_now = deadline - Duration::from_millis(budget.after_setup_budget_ms) + Duration::from_millis(1);
+    assert!(
+        require_lifecycle_remaining_at(
+            exhausted_now,
+            deadline,
+            Duration::from_millis(budget.after_setup_budget_ms),
+            "Local admission"
+        )
+        .is_err()
+    );
+    Ok(())
+}
+
+fn require_lifecycle_remaining_at(
+    now: tokio::time::Instant,
+    deadline: tokio::time::Instant,
+    required: Duration,
+    next_stage: &str,
+) -> Result<()> {
+    if deadline.saturating_duration_since(now) < required {
+        bail!("planned cell lifecycle deadline would expire before {next_stage}");
+    }
+    Ok(())
+}
+
+fn require_lifecycle_remaining(deadline: tokio::time::Instant, required: Duration, next_stage: &str) -> Result<()> {
+    require_lifecycle_remaining_at(tokio::time::Instant::now(), deadline, required, next_stage)
+}
+
 async fn run_matrix_cell(
     config: &OatConfig,
     orchestration_id: &str,
@@ -3437,8 +3671,41 @@ async fn run_matrix_cell(
     replicas: u32,
     concurrency: u32,
     platform: &mut dyn Platform,
+    lifecycle_deadline: tokio::time::Instant,
 ) -> Result<Vec<OatResult>> {
+    let timing_budget = config.timing_budget()?;
+    let rollout_ms = if config.platform.kind == crate::config::OatMode::Aks {
+        config
+            .aks_rollout_timeout_seconds
+            .checked_mul(1_000)
+            .context("AKS rollout deadline overflow")?
+    } else {
+        0
+    };
+    let scale_rollout_ms = rollout_ms
+        .checked_mul(u64::try_from(config.deployment_names().len())?)
+        .context("AKS scale rollout deadline overflow")?;
+    let maintenance_rollout_ms = if config.platform.kind == crate::config::OatMode::Aks && maintenance_enabled(config) {
+        rollout_ms
+    } else {
+        0
+    };
+    let pre_scale_budget = timing_budget
+        .minimum_pin_ttl_ms
+        .checked_add(scale_rollout_ms)
+        .and_then(|value| value.checked_add(maintenance_rollout_ms))
+        .context("post-setup lifecycle budget overflow")?;
+    require_lifecycle_remaining(
+        lifecycle_deadline,
+        Duration::from_millis(pre_scale_budget),
+        "ArrowCol scale",
+    )?;
     platform.scale_arrowcols(config, replicas, concurrency).await?;
+    require_lifecycle_remaining(
+        lifecycle_deadline,
+        Duration::from_millis(timing_budget.minimum_pin_ttl_ms.saturating_add(maintenance_rollout_ms)),
+        "run table-pin and maintenance initialization",
+    )?;
     let assigned_tables = config.tables.clone();
     let expected_keys_json = expected_pin_keys_json(&assigned_tables)?;
     let pin_now_unix_ms = unix_time_ms_u64()?;
@@ -3454,12 +3721,21 @@ async fn run_matrix_cell(
             pin_now_unix_ms,
         )
         .await?;
+    let before_clients_ms = timing_budget
+        .minimum_pin_ttl_ms
+        .saturating_sub(crate::config::PIN_INIT_SETUP_TIMEOUT_SECONDS.saturating_mul(1_000));
+    require_lifecycle_remaining(
+        lifecycle_deadline,
+        Duration::from_millis(before_clients_ms),
+        "client admission",
+    )?;
     let cell_start_unix_ms = unix_time_ms_u64()?;
     let started_at_ms =
         i64::try_from(cell_start_unix_ms).context("run start timestamp exceeds Arrow timestamp range")?;
     let baseline_logs = platform.process_logs(config).await?;
     platform.retain_cell_process_baseline(&baseline_logs);
     let mut client_run = run_clients(config, run_id, &assigned_tables, platform).await?;
+    platform.finish_resource_measurement(config).await?;
     let guard_stopped = client_run.evidence.overload_stop.is_some()
         || client_run
             .evidence
@@ -3467,6 +3743,16 @@ async fn run_matrix_cell(
             .as_ref()
             .is_some_and(|guard| guard["status"] == "unavailable");
     let capture = async {
+        let post_client_ms = config
+            .reconciliation_settle_timeout_seconds
+            .checked_add(config.qap_timeout_seconds)
+            .and_then(|seconds| seconds.checked_mul(1_000))
+            .context("post-client lifecycle deadline overflow")?;
+        require_lifecycle_remaining(
+            lifecycle_deadline,
+            Duration::from_millis(post_client_ms),
+            "commit reconciliation",
+        )?;
         let (_collector_logs, durable_commits) = settle_cell_commit_evidence(
             config,
             platform,
@@ -3508,6 +3794,11 @@ async fn run_matrix_cell(
             if client_run.qap_tables.is_empty() {
                 return Err(anyhow::anyhow!(LocalDownstreamUnavailable));
             }
+            require_lifecycle_remaining(
+                lifecycle_deadline,
+                Duration::from_secs(config.qap_timeout_seconds),
+                "final QAP observation",
+            )?;
             let (metrics, observation) = observe_qap(
                 &platform.qap_endpoint(config),
                 &platform.qap_observation_mode(),
@@ -3545,6 +3836,7 @@ async fn run_matrix_cell(
             started_at_ms,
             qap,
             resources: metrics,
+            resource_evidence: platform.resource_evidence(),
         },
     )
 }
@@ -3554,6 +3846,7 @@ struct CellMeasurements {
     started_at_ms: i64,
     qap: QapMetrics,
     resources: Option<ResourceMetrics>,
+    resource_evidence: Option<Value>,
 }
 
 fn result_rows(
@@ -3569,6 +3862,7 @@ fn result_rows(
         started_at_ms,
         qap,
         resources: metrics,
+        resource_evidence,
     } = measurements;
     let assigned_tables = config.tables.clone();
     let client_count = config
@@ -3576,6 +3870,38 @@ fn result_rows(
         .checked_mul(assigned_tables.len())
         .context("OAT client count overflow")?;
     let observed_owners = client_run.pinning.owners.values().collect::<HashSet<_>>().len();
+    let cpu_quota_evidence = if config.platform.kind == crate::config::OatMode::Aks {
+        let requested = config.effective_aks_resources();
+        let collector_limit_millicores = parse_resource_cpu_millicores(&requested.collector.limits.cpu)?;
+        let client_limit_millicores = parse_resource_cpu_millicores(&requested.client.limits.cpu)?;
+        let throttling = resource_evidence
+            .as_ref()
+            .and_then(|evidence| evidence.get("cpu_throttling"))
+            .cloned()
+            .unwrap_or_else(|| {
+                json!({
+                    "status": "unavailable",
+                    "reason": "AKS cAdvisor throttling evidence is unavailable"
+                })
+            });
+        Some(json!({
+            "collector": {
+                "requested_workers": concurrency,
+                "limit_cpu": requested.collector.limits.cpu,
+                "limit_millicores": collector_limit_millicores,
+                "workers_per_cpu_core": f64::from(concurrency) * 1_000.0 / collector_limit_millicores as f64,
+            },
+            "client": {
+                "requested_concurrency_per_process": config.dmv_concurrency,
+                "limit_cpu": requested.client.limits.cpu,
+                "limit_millicores": client_limit_millicores,
+                "concurrency_per_cpu_core": config.dmv_concurrency as f64 * 1_000.0 / client_limit_millicores as f64,
+            },
+            "throttling": throttling,
+        }))
+    } else {
+        None
+    };
     let tunables = json!({
         "arrowcols": replicas,
         "clients": client_count,
@@ -3594,7 +3920,11 @@ fn result_rows(
         "pinning_violation": client_run.pinning.violation.is_some(),
         "pinning_verification_error": client_run.pinning.verification_error.as_ref().map(|_| "ownership_verification_failed"),
         "delta_delivery": "not_established",
+        "effective_stop_budgets": config.maintenance_stop_budget()?,
+        "planned_cell_duration_ms": config.timing_budget()?.planned_cell_duration_ms,
         "requested_tunables": serde_json::from_str::<Value>(&config.tunables.canonical_json()?)?,
+        "requested_aks_resources": if config.platform.kind == crate::config::OatMode::Aks { Some(config.effective_aks_resources()) } else { None },
+        "cpu_quota": cpu_quota_evidence,
         "requested_durability_class": config.tunables.wal.as_ref().map(|_| config.tunables.durability_class()),
         "capabilities": capability_evidence(),
     });
@@ -3666,7 +3996,13 @@ fn result_rows(
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or_else(|| "unknown".to_owned()),
             tunables_json: serde_json::to_string(&table_tunables)?,
-            evidence_json: Some(serde_json::to_string(&client_run.evidence.for_table(&table, client))?),
+            evidence_json: {
+                let mut evidence = client_run.evidence.for_table(&table, client);
+                if let Some(resource_evidence) = &resource_evidence {
+                    evidence["aks_resources"] = resource_evidence.clone();
+                }
+                Some(serde_json::to_string(&evidence)?)
+            },
             replicas: u64::from(replicas),
             dfe_worker_concurrency: u64::from(concurrency),
             table,
@@ -6576,8 +6912,10 @@ async fn stop_local_snapshot_writers(config: &OatConfig, platform: &LocalPlatfor
         }
         if !phase.is_empty() {
             let mut stop = Command::new("docker");
+            let stop_budgets = config.maintenance_stop_budget()?;
             stop.args(local_phase_stop_args(
                 phase_index,
+                stop_budgets.maintenance_grace_seconds,
                 config.collector_stop_grace_seconds,
                 phase,
             ));
@@ -6870,15 +7208,24 @@ fn build_shutdown_drain_evidence(containers: &[Value]) -> Value {
     })
 }
 
-fn local_phase_stop_args(phase: usize, collector_grace: u64, containers: Vec<String>) -> Vec<String> {
-    let grace = if phase == 2 { collector_grace } else { 300 };
+fn local_phase_stop_args(
+    phase: usize,
+    maintenance_grace: u64,
+    collector_grace: u64,
+    containers: Vec<String>,
+) -> Vec<String> {
+    let grace = match phase {
+        1 => maintenance_grace,
+        2 => collector_grace,
+        _ => 300,
+    };
     let mut args = vec!["stop".to_owned(), "--time".to_owned(), grace.to_string()];
     args.extend(containers);
     args
 }
 
-fn local_stop_deadline(collector_grace: u64) -> Duration {
-    Duration::from_secs(collector_grace + 3 * 300 + 120)
+fn local_stop_deadline(collector_grace: u64, maintenance_timeout_ms: u64) -> Duration {
+    Duration::from_millis(maintenance_timeout_ms) + Duration::from_secs(collector_grace + 2 * 300 + 120)
 }
 
 async fn stop_then_destroy<T>(
@@ -6893,9 +7240,13 @@ async fn stop_then_destroy<T>(
 }
 
 async fn cleanup_local_platform(config: &OatConfig, platform: &LocalPlatform) -> Result<Value> {
+    let stop_budgets = config.maintenance_stop_budget()?;
     let stop = async {
         tokio::time::timeout(
-            local_stop_deadline(config.collector_stop_grace_seconds),
+            local_stop_deadline(
+                config.collector_stop_grace_seconds,
+                stop_budgets.maintenance_stop_timeout_ms,
+            ),
             stop_local_snapshot_writers(config, platform),
         )
         .await
@@ -7086,6 +7437,11 @@ async fn configure_deployments(config: &OatConfig, replicas: u32, concurrency: u
         }
         if name == config.dfe_deployment {
             configure_workers(&mut desired, &config.dfe_container, concurrency)?;
+            configure_deployment_container_resources(
+                &mut desired,
+                &config.dfe_container,
+                &config.effective_aks_resources().collector,
+            )?;
             desired["spec"]["template"]["spec"]["terminationGracePeriodSeconds"] =
                 json!(config.collector_stop_grace_seconds);
             inject_deployment_environment(
@@ -7098,6 +7454,16 @@ async fn configure_deployments(config: &OatConfig, replicas: u32, concurrency: u
         if name == config.dfe_deployment {
             let applied = deployment(config, name).await?;
             verify_aks_collector_stop_grace(&applied, config.collector_stop_grace_seconds)?;
+            let containers = applied
+                .pointer("/spec/template/spec/containers")
+                .and_then(Value::as_array)
+                .context("applied collector Deployment has no containers")?;
+            verify_container_resources(
+                containers,
+                &config.dfe_container,
+                "collector",
+                &config.effective_aks_resources().collector,
+            )?;
         }
     }
     Ok(())
@@ -8065,15 +8431,26 @@ fn campaign_cleanup_operation_deadline_ms(
     inventory: &RunInventory,
     now_unix_ms: u64,
 ) -> Result<u64> {
-    // These start-state budgets match the deadlines assigned by mark() in aks-cell-cleanup.ts.
-    let default_timeout_ms = match action {
-        CampaignCleanupAction::StopAdmission => 60_000,
-        CampaignCleanupAction::BoundedDrain | CampaignCleanupAction::StopMaintenance => 120_000,
-        _ => CAMPAIGN_CLEANUP_DEFAULT_TIMEOUT_MS,
-    };
-    let deadline = campaign_cleanup_step(action, inventory)
-        .and_then(|step| step.deadline_unix_ms)
-        .unwrap_or_else(|| now_unix_ms.saturating_add(default_timeout_ms));
+    let deadline =
+        if let Some(deadline) = campaign_cleanup_step(action, inventory).and_then(|step| step.deadline_unix_ms) {
+            deadline
+        } else {
+            let timeout_ms = match action {
+                CampaignCleanupAction::StopAdmission => 60_000,
+                CampaignCleanupAction::BoundedDrain => 120_000,
+                CampaignCleanupAction::StopMaintenance => {
+                    inventory
+                        .effective_stop_budgets
+                        .context("new campaign inventory omitted effective maintenance stop budgets")?
+                        .validate()?
+                        .maintenance_stop_timeout_ms
+                }
+                _ => CAMPAIGN_CLEANUP_DEFAULT_TIMEOUT_MS,
+            };
+            now_unix_ms
+                .checked_add(timeout_ms)
+                .context("campaign cleanup deadline overflow")?
+        };
     if deadline <= now_unix_ms {
         bail!("campaign cleanup {} operation deadline has expired", action.selector());
     }
@@ -8343,6 +8720,9 @@ fn validate_campaign_inventory_load_admission(
         .as_ref()
         .is_some_and(|fic| fic.state == InventoryResourceState::Observed);
     if inventory.load_admission != expected_admission
+        || (expected_admission != InventoryLoadAdmission::NotAuthorized
+            && (inventory.planned_cell_duration_ms.is_none_or(|duration| duration == 0)
+                || inventory.effective_stop_budgets.is_none()))
         || inventory.namespace.uid.is_none()
         || !resources_are_observed
         || !fic_is_observed
@@ -8388,6 +8768,12 @@ async fn persist_campaign_inventory(platform: &AksPlatform, inventory: &RunInven
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct CampaignCellBudget {
+    effective_stop_budgets: EffectiveStopBudgets,
+    planned_cell_duration_ms: u64,
+}
+
 fn initial_campaign_inventory(
     identity: &CampaignIdentity,
     orchestration_run_id: &str,
@@ -8395,6 +8781,7 @@ fn initial_campaign_inventory(
     namespace: &str,
     account: &str,
     container: &str,
+    budget: CampaignCellBudget,
 ) -> Result<RunInventory> {
     let step = || InventoryStep {
         state: InventoryStepState::NotStarted,
@@ -8422,6 +8809,8 @@ fn initial_campaign_inventory(
             container: container.to_owned(),
             blob_prefix: format!("campaigns/{}/cells/{}/evidence", identity.campaign_id, cell_run_id),
         }),
+        effective_stop_budgets: Some(budget.effective_stop_budgets.validate()?),
+        planned_cell_duration_ms: Some(budget.planned_cell_duration_ms),
         cleanup: InventoryCleanup {
             stop_admission: step(),
             bounded_drain: step(),
@@ -8453,6 +8842,10 @@ async fn initialize_campaign_inventory(
         &config.namespace,
         &account,
         &container,
+        CampaignCellBudget {
+            effective_stop_budgets: config.maintenance_stop_budget()?,
+            planned_cell_duration_ms: config.timing_budget()?.planned_cell_duration_ms,
+        },
     )?;
     persist_campaign_inventory(platform, &inventory).await?;
     validate_campaign_baseline_capture_inventory(&inventory, &identity)?;
@@ -8542,6 +8935,16 @@ async fn prepare_aks_platform(
     runtime_config["namespace"] = json!(config.namespace);
     runtime_config["oatRunId"] = json!(platform.run_id);
     runtime_config["quiver"] = json!(config.tunables.wal.is_some());
+    runtime_config["effective_stop_budgets"] = serde_json::to_value(config.maintenance_stop_budget()?)?;
+    runtime_config["resources"] = serde_json::to_value(config.effective_aks_resources())?;
+    runtime_config["collectorWorkers"] = json!(
+        config
+            .dfe_worker_concurrency
+            .iter()
+            .copied()
+            .max()
+            .context("empty worker concurrency sweep")?
+    );
     if let Some(maintenance) = maintenance_runtime(config)? {
         runtime_config["maintenance"] = maintenance;
         runtime_config["images"]["maintenance"] = json!(
@@ -10361,8 +10764,11 @@ async fn stop_aks_workloads_in_order(config: &OatConfig) -> Result<Value> {
         );
     }
     if maintenance_enabled(config) {
-        maintenance
-            .push(stop_aks_deployment_for_cleanup(config, "delta-maintenance", ComponentRole::Maintenance, 60).await?);
+        let grace_seconds = config.maintenance_stop_budget()?.maintenance_grace_seconds;
+        maintenance.push(
+            stop_aks_deployment_for_cleanup(config, "delta-maintenance", ComponentRole::Maintenance, grace_seconds)
+                .await?,
+        );
     }
     collectors.push(
         stop_aks_deployment_for_cleanup(
@@ -10652,6 +11058,479 @@ async fn remove_runtime_dir_except(directory: &Path, preserve: &[PathBuf]) -> Re
             .with_context(|| format!("remove empty private runtime directory {}", directory.display()))?;
     }
     Ok(())
+}
+
+fn configure_client_job_resources(job: &mut Value, requirements: &ResourceRequirements) -> Result<()> {
+    let container = job
+        .pointer_mut("/spec/template/spec/containers/0")
+        .context("AKS client container is missing")?;
+    container["resources"] = serde_json::to_value(requirements)?;
+    Ok(())
+}
+
+fn configure_deployment_container_resources(
+    deployment: &mut Value,
+    container_name: &str,
+    requirements: &ResourceRequirements,
+) -> Result<()> {
+    let containers = deployment
+        .pointer_mut("/spec/template/spec/containers")
+        .and_then(Value::as_array_mut)
+        .context("Deployment has no container list")?;
+    let mut selected = containers
+        .iter_mut()
+        .filter(|container| container.get("name").and_then(Value::as_str) == Some(container_name));
+    let container = selected
+        .next()
+        .with_context(|| format!("container {container_name:?} was not found"))?;
+    if selected.next().is_some() {
+        bail!("container {container_name:?} is ambiguous in Deployment");
+    }
+    container["resources"] = serde_json::to_value(requirements)?;
+    Ok(())
+}
+
+fn verify_container_resources(
+    containers: &[Value],
+    container_name: &str,
+    role: &str,
+    expected: &ResourceRequirements,
+) -> Result<Value> {
+    let mut selected = containers
+        .iter()
+        .filter(|container| container.get("name").and_then(Value::as_str) == Some(container_name));
+    let container = selected
+        .next()
+        .with_context(|| format!("{role} container {container_name:?} is missing"))?;
+    if selected.next().is_some() {
+        bail!("{role} container {container_name:?} is ambiguous");
+    }
+    let resources = container
+        .get("resources")
+        .context("container resource readback is missing")?;
+    let quantity = |side: &str, name: &str| -> Result<String> {
+        resources
+            .pointer(&format!("/{side}/{name}"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .with_context(|| format!("{role} resource readback omitted {side}.{name}"))
+    };
+    let actual = ResourceRequirements {
+        requests: ResourceValues {
+            cpu: quantity("requests", "cpu")?,
+            memory: quantity("requests", "memory")?,
+        },
+        limits: ResourceValues {
+            cpu: quantity("limits", "cpu")?,
+            memory: quantity("limits", "memory")?,
+        },
+    };
+    let quantities_match = parse_resource_cpu_millicores(&actual.requests.cpu)?
+        == parse_resource_cpu_millicores(&expected.requests.cpu)?
+        && parse_cpu_millicores(&actual.limits.cpu)? == parse_cpu_millicores(&expected.limits.cpu)?
+        && parse_resource_memory_bytes(&actual.requests.memory)?
+            == parse_resource_memory_bytes(&expected.requests.memory)?
+        && parse_memory_bytes(&actual.limits.memory)? == parse_memory_bytes(&expected.limits.memory)?;
+    if !quantities_match {
+        bail!("{role} effective pod resource readback differs from requested values");
+    }
+    Ok(json!({"requested": expected, "effective": actual}))
+}
+
+fn deployment_selector(deployment: &Value) -> Result<String> {
+    let labels = deployment
+        .pointer("/spec/selector/matchLabels")
+        .and_then(Value::as_object)
+        .context("Deployment selector.matchLabels is missing")?;
+    let selector = labels
+        .iter()
+        .map(|(key, value)| {
+            value
+                .as_str()
+                .map(|value| format!("{key}={value}"))
+                .context("Deployment selector labels must be strings")
+        })
+        .collect::<Result<Vec<_>>>()?
+        .join(",");
+    anyhow::ensure!(!selector.is_empty(), "Deployment selector must not be empty");
+    Ok(selector)
+}
+
+async fn aks_deployment_resource_readback(
+    config: &OatConfig,
+    role: &str,
+    deployment_name: &str,
+    container_name: &str,
+    expected: &ResourceRequirements,
+) -> Result<Value> {
+    let deployment = deployment(config, deployment_name).await?;
+    let template_containers = deployment
+        .pointer("/spec/template/spec/containers")
+        .and_then(Value::as_array)
+        .context("Deployment pod template has no containers")?;
+    let template = verify_container_resources(template_containers, container_name, role, expected)?;
+    let selector = deployment_selector(&deployment)?;
+    let pod_json = kubectl(
+        config,
+        vec![
+            "get",
+            "pods",
+            "--namespace",
+            &config.namespace,
+            "--selector",
+            &selector,
+            "-o",
+            "json",
+        ],
+        None,
+    )
+    .await
+    .with_context(|| format!("read {role} pod resource and placement readbacks"))?;
+    let pod_list: Value = serde_json::from_str(&pod_json).context("parse resource-readback pod list")?;
+    let pods = pod_list
+        .get("items")
+        .and_then(Value::as_array)
+        .context("resource-readback pod list omitted items")?;
+    let mut scheduled = Vec::new();
+    for pod in pods
+        .iter()
+        .filter(|pod| pod.pointer("/metadata/deletionTimestamp").is_none())
+    {
+        let metadata = pod.get("metadata").context("pod metadata is missing")?;
+        let pod_name = metadata
+            .get("name")
+            .and_then(Value::as_str)
+            .context("pod name is missing")?;
+        let node_name = pod
+            .pointer("/spec/nodeName")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .with_context(|| format!("{role} pod {pod_name} has no scheduled node"))?;
+        let containers = pod
+            .pointer("/spec/containers")
+            .and_then(Value::as_array)
+            .context("pod spec has no containers")?;
+        let resources = verify_container_resources(containers, container_name, role, expected)?;
+        scheduled.push(json!({
+            "pod": pod_name,
+            "uid": metadata.get("uid"),
+            "container": container_name,
+            "node": node_name,
+            "resources": resources["effective"],
+        }));
+    }
+    anyhow::ensure!(
+        !scheduled.is_empty(),
+        "{role} has no active pod with resource and scheduled-node readback"
+    );
+    Ok(json!({
+        "role": role,
+        "deployment": deployment_name,
+        "requested": expected,
+        "effective": {"template": template["effective"], "pods": scheduled},
+    }))
+}
+
+async fn aks_deployment_resource_evidence(config: &OatConfig) -> Result<Vec<Value>> {
+    let resources = config.effective_aks_resources();
+    let evidence = vec![
+        aks_deployment_resource_readback(
+            config,
+            "collector",
+            &config.dfe_deployment,
+            &config.dfe_container,
+            &resources.collector,
+        )
+        .await?,
+        aks_deployment_resource_readback(config, "router", "arrowcol-router", "router", &resources.router).await?,
+        aks_deployment_resource_readback(config, "catalog", "arrowcol-catalog", "catalog", &resources.catalog).await?,
+    ];
+    Ok(evidence)
+}
+
+#[derive(Clone, Debug)]
+struct CpuThrottleCounters {
+    periods: u64,
+    throttled_periods: u64,
+}
+
+#[derive(Clone, Debug)]
+struct CpuThrottleSample {
+    role: String,
+    pod: String,
+    uid: String,
+    container: String,
+    node: String,
+    counters: Option<CpuThrottleCounters>,
+    unavailable_reason: Option<String>,
+}
+
+fn parse_cadvisor_cpu_counters(
+    metrics: &str,
+    namespace: &str,
+    pod: &str,
+    container: &str,
+) -> Result<Option<CpuThrottleCounters>> {
+    let mut periods = None;
+    let mut throttled_periods = None;
+    for line in metrics.lines().filter(|line| !line.starts_with('#')) {
+        let Some((name, remainder)) = line.split_once('{') else {
+            continue;
+        };
+        if !matches!(
+            name,
+            "container_cpu_cfs_periods_total" | "container_cpu_cfs_throttled_periods_total"
+        ) {
+            continue;
+        }
+        let Some((labels_text, value_text)) = remainder.split_once('}') else {
+            continue;
+        };
+        let mut labels = HashMap::new();
+        for label in labels_text.split(',') {
+            let Some((key, value)) = label.split_once('=') else {
+                continue;
+            };
+            labels.insert(key.trim(), value.trim().trim_matches('"'));
+        }
+        if labels.get("namespace").copied() != Some(namespace)
+            || labels.get("pod").or_else(|| labels.get("pod_name")).copied() != Some(pod)
+            || labels.get("container").copied() != Some(container)
+        {
+            continue;
+        }
+        let value_text = value_text
+            .split_whitespace()
+            .next()
+            .context("cAdvisor metric value is missing")?;
+        let value = value_text.parse::<f64>().context("cAdvisor counter is not numeric")?;
+        if !value.is_finite() || value < 0.0 || value.fract() != 0.0 || value > u64::MAX as f64 {
+            bail!("cAdvisor throttling counters must be nonnegative integers");
+        }
+        let counter = value as u64;
+        match name {
+            "container_cpu_cfs_periods_total" if periods.is_some() => {
+                bail!("cAdvisor returned ambiguous CPU period counters for {pod}/{container}");
+            }
+            "container_cpu_cfs_periods_total" => periods = Some(counter),
+            "container_cpu_cfs_throttled_periods_total" if throttled_periods.is_some() => {
+                bail!("cAdvisor returned ambiguous throttling counters for {pod}/{container}");
+            }
+            "container_cpu_cfs_throttled_periods_total" => throttled_periods = Some(counter),
+            _ => {}
+        }
+    }
+    match (periods, throttled_periods) {
+        (Some(periods), Some(throttled_periods)) => Ok(Some(CpuThrottleCounters {
+            periods,
+            throttled_periods,
+        })),
+        _ => Ok(None),
+    }
+}
+
+struct AksResourcePodTarget {
+    role: String,
+    pod: String,
+    uid: String,
+    container: String,
+    node: String,
+}
+
+fn aks_resource_pod_targets(readbacks: &[Value]) -> Result<Vec<AksResourcePodTarget>> {
+    let mut targets = Vec::new();
+    for readback in readbacks {
+        let role = readback
+            .get("role")
+            .and_then(Value::as_str)
+            .context("AKS resource evidence omitted role")?;
+        let mut add_pod = |pod: &Value, pod_field: &str| -> Result<()> {
+            let name = pod
+                .get(pod_field)
+                .and_then(Value::as_str)
+                .context("AKS resource evidence omitted pod name")?;
+            let uid = pod
+                .get("uid")
+                .and_then(Value::as_str)
+                .context("AKS resource evidence omitted pod UID")?;
+            let node = pod
+                .get("node")
+                .and_then(Value::as_str)
+                .context("AKS resource evidence omitted node")?;
+            let container = pod
+                .get("container")
+                .and_then(Value::as_str)
+                .context("AKS resource evidence omitted container")?;
+            targets.push(AksResourcePodTarget {
+                role: role.to_owned(),
+                pod: name.to_owned(),
+                uid: uid.to_owned(),
+                container: container.to_owned(),
+                node: node.to_owned(),
+            });
+            Ok(())
+        };
+        if role == "client" {
+            add_pod(
+                readback
+                    .get("scheduled_pod")
+                    .context("client resource evidence omitted scheduled pod")?,
+                "name",
+            )?;
+        } else {
+            for pod in readback
+                .pointer("/effective/pods")
+                .and_then(Value::as_array)
+                .context("AKS resource evidence omitted deployment pods")?
+            {
+                add_pod(pod, "pod")?;
+            }
+        }
+    }
+    Ok(targets)
+}
+
+async fn capture_aks_cpu_throttling(config: &OatConfig, readbacks: &[Value]) -> Result<Vec<CpuThrottleSample>> {
+    let targets = aks_resource_pod_targets(readbacks)?;
+    let nodes = targets
+        .iter()
+        .map(|target| target.node.clone())
+        .collect::<BTreeSet<_>>();
+    let scrape = tokio::time::timeout(
+        Duration::from_millis(AKS_RESOURCE_COUNTER_SNAPSHOT_TIMEOUT_MS),
+        join_all(nodes.iter().map(|node| async move {
+            let path = format!("/api/v1/nodes/{node}/proxy/metrics/cadvisor");
+            let result = kubectl(config, vec!["get", "--raw", &path, "--request-timeout=5s"], None).await;
+            (node.clone(), result.map_err(|error| format!("{error:#}")))
+        })),
+    )
+    .await;
+    let node_metrics = match scrape {
+        Ok(results) => results.into_iter().collect::<HashMap<_, _>>(),
+        Err(_) => nodes
+            .iter()
+            .cloned()
+            .map(|node| {
+                (
+                    node,
+                    Err("cAdvisor snapshot exceeded its five-second budget".to_owned()),
+                )
+            })
+            .collect::<HashMap<_, _>>(),
+    };
+    let mut samples = Vec::with_capacity(targets.len());
+    for target in targets {
+        let (counters, unavailable_reason) = match node_metrics.get(&target.node) {
+            Some(Ok(metrics)) => {
+                match parse_cadvisor_cpu_counters(metrics, &config.namespace, &target.pod, &target.container) {
+                    Ok(Some(counters)) => (Some(counters), None),
+                    Ok(None) => (None, Some("cAdvisor cgroup CPU counters are unavailable".to_owned())),
+                    Err(error) => (
+                        None,
+                        Some(format!("cAdvisor counters are ambiguous or invalid: {error:#}")),
+                    ),
+                }
+            }
+            Some(Err(error)) => (None, Some(format!("cAdvisor scrape failed: {error}"))),
+            None => (None, Some("cAdvisor node scrape was not attempted".to_owned())),
+        };
+        samples.push(CpuThrottleSample {
+            role: target.role,
+            pod: target.pod,
+            uid: target.uid,
+            container: target.container,
+            node: target.node,
+            counters,
+            unavailable_reason,
+        });
+    }
+    Ok(samples)
+}
+
+fn compare_cpu_throttling(start: &[CpuThrottleSample], end: &[CpuThrottleSample]) -> Value {
+    let start_by_identity = start
+        .iter()
+        .map(|sample| {
+            (
+                (
+                    sample.role.as_str(),
+                    sample.pod.as_str(),
+                    sample.uid.as_str(),
+                    sample.container.as_str(),
+                ),
+                sample,
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let mut measured = 0;
+    let mut pod_evidence = Vec::with_capacity(end.len());
+    for sample in end {
+        let key = (
+            sample.role.as_str(),
+            sample.pod.as_str(),
+            sample.uid.as_str(),
+            sample.container.as_str(),
+        );
+        let result = start_by_identity.get(&key).and_then(|before| {
+            let before = before.counters.as_ref()?;
+            let after = sample.counters.as_ref()?;
+            Some((
+                after.periods.checked_sub(before.periods)?,
+                after.throttled_periods.checked_sub(before.throttled_periods)?,
+            ))
+        });
+        match result {
+            Some((periods, throttled_periods)) if periods > 0 => {
+                measured += 1;
+                pod_evidence.push(json!({
+                    "role": sample.role,
+                    "pod": sample.pod,
+                    "uid": sample.uid,
+                    "container": sample.container,
+                    "node": sample.node,
+                    "status": "measured",
+                    "periods": periods,
+                    "throttled_periods": throttled_periods,
+                    "throttled_period_fraction": throttled_periods as f64 / periods as f64,
+                }));
+            }
+            _ => {
+                let start_sample = start_by_identity.get(&key).copied();
+                let initial_unavailable_reason = start_sample
+                    .filter(|before| before.counters.is_none())
+                    .and_then(|before| before.unavailable_reason.as_deref());
+                let reason = initial_unavailable_reason
+                    .or(sample.unavailable_reason.as_deref())
+                    .unwrap_or(if start_sample.is_some() {
+                        "counter reset, identity changed, or no CPU periods elapsed"
+                    } else {
+                        "initial cAdvisor snapshot omitted this pod identity"
+                    });
+                pod_evidence.push(json!({
+                    "role": sample.role,
+                    "pod": sample.pod,
+                    "uid": sample.uid,
+                    "container": sample.container,
+                    "node": sample.node,
+                    "status": "unavailable",
+                    "reason": reason,
+                }));
+            }
+        }
+    }
+    let status = if measured == end.len() && measured > 0 {
+        "measured"
+    } else if measured > 0 {
+        "partial"
+    } else {
+        "unavailable"
+    };
+    json!({
+        "status": status,
+        "scope": "scheduled_load_to_client_completion",
+        "source": "kubelet cAdvisor container CPU CFS counters",
+        "pods": pod_evidence,
+    })
 }
 
 async fn apply_deployment(config: &OatConfig, mut deployment: Value) -> Result<()> {
@@ -11853,6 +12732,7 @@ mod tests {
                 "workloadIdentityClientId": "00000000-0000-0000-0000-000000000001",
                 "subscriptionId": "00000000-0000-0000-0000-000000000002", "stamp": "89152",
                 "deltaRoot": "abfss://onelake@arrowcollector89152.dfs.core.windows.net/dataflow", "images": images,
+                "effective_stop_budgets": {"maintenance_grace_seconds": 4_800, "maintenance_stop_timeout_ms": 5_100_000},
                 "maintenance": {"tables": ["telemetry.sqlserver.sqlserver_active_sessions"], "operations": ["optimize"], "apply": false},
             });
             let input_path = directory.join("runtime.json");
@@ -12363,6 +13243,13 @@ mod tests {
             "arrow-collector-00000000000000000000000000000004",
             "campaignstorage",
             "checkpoints",
+            CampaignCellBudget {
+                effective_stop_budgets: EffectiveStopBudgets {
+                    maintenance_grace_seconds: 1_200,
+                    maintenance_stop_timeout_ms: 1_500_000,
+                },
+                planned_cell_duration_ms: 1_000,
+            },
         )?;
         super::validate_campaign_baseline_capture_inventory(&inventory, &identity)?;
         let value = serde_json::to_value(&inventory)?;
@@ -12371,6 +13258,25 @@ mod tests {
         assert_eq!(value["resources"], serde_json::json!([]));
         assert_eq!(value["fic"], serde_json::Value::Null);
         assert_eq!(value["qap"], serde_json::Value::Null);
+        assert_eq!(value["effective_stop_budgets"]["maintenance_grace_seconds"], 1_200);
+        assert_eq!(
+            value["effective_stop_budgets"]["maintenance_stop_timeout_ms"],
+            1_500_000
+        );
+        assert_eq!(value["planned_cell_duration_ms"], 1_000);
+        let mut no_row_rehearsal = inventory.clone();
+        no_row_rehearsal.planned_cell_duration_ms = Some(0);
+        no_row_rehearsal.resources.push(InventoryResource {
+            api_version: "apps/v1".to_owned(),
+            kind: "Deployment".to_owned(),
+            namespace: no_row_rehearsal.namespace.name.clone(),
+            name: "arrowcol".to_owned(),
+            uid: None,
+            role: InventoryResourceRole::Collector,
+            state: InventoryResourceState::Planned,
+            absence: None,
+        });
+        no_row_rehearsal.validate()?;
         println!("E1_RUST_INITIAL_INVENTORY={}", serde_json::to_string(&inventory)?);
         Ok(())
     }
@@ -12499,6 +13405,13 @@ mod tests {
             namespace,
             "campaignstorage",
             "checkpoints",
+            CampaignCellBudget {
+                effective_stop_budgets: EffectiveStopBudgets {
+                    maintenance_grace_seconds: 1_200,
+                    maintenance_stop_timeout_ms: 1_500_000,
+                },
+                planned_cell_duration_ms: 1_000,
+            },
         )?;
         inventory.namespace.uid = Some("00000000-0000-0000-0000-000000000005".to_owned());
         inventory.resources.push(InventoryResource {
@@ -12704,6 +13617,8 @@ mod tests {
             "orchestration_run_id":"00000000-0000-0000-0000-000000000003",
             "cell_run_id":"00000000-0000-0000-0000-000000000004",
             "load_admission":"not_authorized",
+            "effective_stop_budgets":{"maintenance_grace_seconds":1200,"maintenance_stop_timeout_ms":1500000},
+            "planned_cell_duration_ms":1000,
             "namespace":{"name":"oat-00000000000000000000000000000004", "uid":null,
                 "owner_token":"00000000-0000-0000-0000-000000000002"},
             "resources":[{"api_version":"apps/v1","kind":"Deployment",
@@ -12747,6 +13662,23 @@ mod tests {
         assert_eq!(
             campaign_cleanup_operation_deadline_ms(&CampaignCleanupAction::BoundedDrain, &declared_deadline, 1_000)?,
             5_000
+        );
+        assert_eq!(
+            campaign_cleanup_operation_deadline_ms(&CampaignCleanupAction::StopMaintenance, &inventory, 1_000)?,
+            inventory
+                .effective_stop_budgets
+                .context("inventory stop budgets")?
+                .maintenance_stop_timeout_ms
+                + 1_000
+        );
+        let mut legacy_cleanup = inventory.clone();
+        legacy_cleanup.effective_stop_budgets = None;
+        legacy_cleanup.planned_cell_duration_ms = None;
+        legacy_cleanup.cleanup.stop_maintenance.deadline_unix_ms = Some(5_000);
+        assert_eq!(
+            campaign_cleanup_operation_deadline_ms(&CampaignCleanupAction::StopMaintenance, &legacy_cleanup, 1_000)?,
+            5_000,
+            "legacy cleanup must retain its originally persisted deadline without extending it"
         );
         let mut expired_deadline = inventory.clone();
         expired_deadline.cleanup.stop_admission.deadline_unix_ms = Some(61_000);
@@ -13199,9 +14131,11 @@ mod tests {
         let ingress = commands
             .find("stop --time 300 guard-client")
             .context("ingress was not stopped")?;
+        let maintenance_grace = config.maintenance_stop_budget()?.maintenance_grace_seconds;
+        let maintenance_command = format!("stop --time {maintenance_grace} guard-maintenance");
         let maintenance = commands
-            .find("stop --time 300 guard-maintenance")
-            .context("maintenance was not stopped")?;
+            .find(&maintenance_command)
+            .context("maintenance was not stopped with its derived grace")?;
         let collector = commands
             .find("stop --time 300 guard-collector")
             .context("collector was not stopped")?;
@@ -13237,6 +14171,9 @@ mod tests {
         )?;
         let mut platform = AksPlatform {
             run_id: "fixture-run".to_owned(),
+            resource_readback: Vec::new(),
+            cpu_throttling_start: None,
+            cpu_throttling_evidence: None,
             namespace_created: true,
             namespace_create_attempted: true,
             namespace_owner_token: "fixture-owner".to_owned(),
@@ -13314,10 +14251,10 @@ mod tests {
     }
 
     #[test]
-    fn local_stop_arguments_preserve_noncollector_ceilings() {
-        for (phase, grace) in [(0, 300), (1, 300), (2, 3600), (3, 300)] {
+    fn local_stop_arguments_use_the_shared_maintenance_and_collector_graces() {
+        for (phase, grace) in [(0, 300), (1, 1200), (2, 3600), (3, 300)] {
             assert_eq!(
-                local_phase_stop_args(phase, 3600, vec!["owned-container".to_owned()]),
+                local_phase_stop_args(phase, 1200, 3600, vec!["owned-container".to_owned()]),
                 vec![
                     "stop".to_owned(),
                     "--time".to_owned(),
@@ -13329,10 +14266,13 @@ mod tests {
     }
 
     #[test]
-    fn local_stop_deadline_covers_maximum_collector_grace_and_all_other_phases() {
-        let deadline = local_stop_deadline(3600);
+    fn local_stop_deadline_covers_derived_maintenance_budget_and_other_phases() {
+        let deadline = local_stop_deadline(3600, 900_000);
+        assert_eq!(
+            deadline,
+            Duration::from_millis(900_000) + Duration::from_secs(3600 + 2 * 300 + 120)
+        );
         assert!(deadline > Duration::from_secs(3600 + 3 * 300));
-        assert!(deadline > Duration::from_secs(1440));
     }
 
     #[test]
@@ -13721,9 +14661,10 @@ mod tests {
             (budget.client_job_lifetime_seconds
                 + crate::config::PIN_INIT_SETUP_TIMEOUT_SECONDS
                 + config.reconciliation_settle_timeout_seconds
-                + config.collector_stop_grace_seconds)
+                + config.collector_stop_grace_seconds
+                + config.qap_timeout_seconds)
                 * 1_000,
-            "the immutable pin lifetime must cover setup, the client Job, settling, and collector drain"
+            "the immutable pin lifetime must cover setup, the client Job, settling, collector drain, and final QAP observation"
         );
         Ok(())
     }
@@ -14602,6 +15543,7 @@ mod tests {
                 started_at_ms: 1,
                 qap,
                 resources: None,
+                resource_evidence: None,
             },
         )?;
         assert_eq!(rows[0].status, "succeeded");
@@ -14856,5 +15798,174 @@ mod tests {
             memory_bytes: Some(1024),
             qap: QapMetrics::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod aks_resource_readback_tests {
+    use super::*;
+
+    fn requirements() -> ResourceRequirements {
+        ResourceRequirements {
+            requests: ResourceValues {
+                cpu: "2".to_owned(),
+                memory: "4Gi".to_owned(),
+            },
+            limits: ResourceValues {
+                cpu: "2".to_owned(),
+                memory: "6Gi".to_owned(),
+            },
+        }
+    }
+
+    #[test]
+    fn resource_readback_accepts_equivalent_kubernetes_quantity_spellings() -> Result<()> {
+        let containers = vec![json!({
+            "name": "dataflow",
+            "resources": {
+                "requests": {"cpu": "2000m", "memory": "4096Mi"},
+                "limits": {"cpu": "2", "memory": "6Gi"}
+            }
+        })];
+        let evidence = verify_container_resources(&containers, "dataflow", "collector", &requirements())?;
+        assert_eq!(evidence["requested"]["requests"]["cpu"], "2");
+        assert_eq!(evidence["effective"]["requests"]["cpu"], "2000m");
+        Ok(())
+    }
+
+    #[test]
+    fn resource_readback_rejects_mismatch_and_missing_limit() {
+        let expected = requirements();
+        let mismatch = vec![json!({
+            "name": "dataflow",
+            "resources": {
+                "requests": {"cpu": "2", "memory": "4Gi"},
+                "limits": {"cpu": "1", "memory": "6Gi"}
+            }
+        })];
+        assert!(verify_container_resources(&mismatch, "dataflow", "collector", &expected).is_err());
+
+        let missing = vec![json!({"name": "dataflow", "resources": {"requests": {"cpu": "2", "memory": "4Gi"}}})];
+        assert!(verify_container_resources(&missing, "dataflow", "collector", &expected).is_err());
+    }
+
+    #[test]
+    fn client_job_configuration_projects_resource_requirements() -> Result<()> {
+        let mut job = json!({"spec": {"template": {"spec": {"containers": [{"name": "client"}]}}}});
+        let expected: ResourceRequirements = serde_json::from_value(json!({
+            "requests": {"cpu": "1", "memory": "512Mi"},
+            "limits": {"cpu": "3", "memory": "3Gi"}
+        }))?;
+        configure_client_job_resources(&mut job, &expected)?;
+        assert_eq!(
+            job.pointer("/spec/template/spec/containers/0/resources"),
+            Some(&serde_json::to_value(expected)?)
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod aks_cpu_throttling_tests {
+    use super::*;
+
+    #[test]
+    fn parses_cadvisor_cfs_counters_for_exact_pod_identity() -> Result<()> {
+        let metrics = concat!(
+            "container_cpu_cfs_periods_total{namespace=\"oat-test\",pod=\"worker-a\",container=\"dataflow\"} 500\n",
+            "container_cpu_cfs_throttled_periods_total{namespace=\"oat-test\",pod=\"worker-a\",container=\"dataflow\"} 75\n",
+            "container_cpu_cfs_periods_total{namespace=\"other\",pod=\"worker-a\",container=\"dataflow\"} 999\n",
+        );
+        let counters = parse_cadvisor_cpu_counters(metrics, "oat-test", "worker-a", "dataflow")?
+            .context("matching cAdvisor counters missing")?;
+        assert_eq!(counters.periods, 500);
+        assert_eq!(counters.throttled_periods, 75);
+        Ok(())
+    }
+
+    #[test]
+    fn ignores_unrelated_fractional_and_nan_metrics_when_reading_cfs_counters() -> Result<()> {
+        let metrics = concat!(
+            "container_cpu_usage_seconds_total{namespace=\"oat-test\",pod=\"worker-a\",container=\"dataflow\"} 3.14159\n",
+            "container_cpu_cfs_throttled_seconds_total{namespace=\"oat-test\",pod=\"worker-a\",container=\"dataflow\"} 0.125\n",
+            "container_memory_usage_bytes{namespace=\"oat-test\",pod=\"worker-a\",container=\"dataflow\"} NaN\n",
+            "container_cpu_cfs_periods_total{namespace=\"oat-test\",pod=\"worker-a\",container=\"dataflow\"} 500\n",
+            "container_cpu_cfs_throttled_periods_total{namespace=\"oat-test\",pod=\"worker-a\",container=\"dataflow\"} 75\n",
+        );
+        let counters = parse_cadvisor_cpu_counters(metrics, "oat-test", "worker-a", "dataflow")?
+            .context("matching cAdvisor counters missing")?;
+        assert_eq!(counters.periods, 500);
+        assert_eq!(counters.throttled_periods, 75);
+        Ok(())
+    }
+
+    #[test]
+    fn preserves_initial_scrape_reason_when_end_counters_are_available() {
+        let start = CpuThrottleSample {
+            role: "collector".to_owned(),
+            pod: "worker-a".to_owned(),
+            uid: "uid-a".to_owned(),
+            container: "dataflow".to_owned(),
+            node: "node-a".to_owned(),
+            counters: None,
+            unavailable_reason: Some("start cAdvisor scrape failed: forbidden".to_owned()),
+        };
+        let end = CpuThrottleSample {
+            counters: Some(CpuThrottleCounters {
+                periods: 200,
+                throttled_periods: 20,
+            }),
+            unavailable_reason: None,
+            ..start.clone()
+        };
+        let evidence = compare_cpu_throttling(&[start], &[end]);
+        assert_eq!(evidence["status"], "unavailable");
+        assert_eq!(evidence["pods"][0]["reason"], "start cAdvisor scrape failed: forbidden");
+    }
+
+    #[test]
+    fn reports_measured_throttling_delta_without_inferring_from_worker_count() {
+        let sample = |periods, throttled_periods| CpuThrottleSample {
+            role: "collector".to_owned(),
+            pod: "worker-a".to_owned(),
+            uid: "uid-a".to_owned(),
+            container: "dataflow".to_owned(),
+            node: "node-a".to_owned(),
+            counters: Some(CpuThrottleCounters {
+                periods,
+                throttled_periods,
+            }),
+            unavailable_reason: None,
+        };
+        let evidence = compare_cpu_throttling(&[sample(100, 10)], &[sample(300, 70)]);
+        assert_eq!(evidence["status"], "measured");
+        assert_eq!(evidence["pods"][0]["periods"], 200);
+        assert_eq!(evidence["pods"][0]["throttled_periods"], 60);
+        assert_eq!(evidence["pods"][0]["throttled_period_fraction"], 0.3);
+    }
+}
+
+#[cfg(test)]
+mod aks_resource_budget_tests {
+    use super::*;
+
+    #[test]
+    fn aks_lifecycle_budget_includes_both_bounded_throttling_snapshots() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        config.platform.kind = crate::config::OatMode::Aks;
+        let budget = config.timing_budget()?;
+        let maintenance_rollouts = u64::from(maintenance_enabled(&config));
+        let scale_rollouts = u64::try_from(config.deployment_names().len())? + maintenance_rollouts;
+        let expected = budget.minimum_pin_ttl_ms
+            + scale_rollouts * config.aks_rollout_timeout_seconds * 1_000
+            + AKS_RESOURCE_COUNTER_SNAPSHOT_TIMEOUT_MS * 2;
+        assert_eq!(budget.after_setup_budget_ms, expected);
+        assert_eq!(
+            budget.planned_cell_duration_ms,
+            budget.pre_cell_setup_timeout_ms + budget.after_setup_budget_ms
+        );
+        Ok(())
     }
 }

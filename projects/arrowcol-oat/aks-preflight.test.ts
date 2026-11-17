@@ -42,6 +42,7 @@ async function fixture() {
     namespace: 'arrow-collector', oatRunId: runId, workloadIdentityClientId: clientId,
     subscriptionId: subscription, stamp: '00000',
     deltaRoot: 'abfss://arrowcol@arrowcollector00000.dfs.core.windows.net/dataflow',
+    effective_stop_budgets: { maintenance_grace_seconds: 4_800, maintenance_stop_timeout_ms: 5_100_000 },
     images: { sqlserver: image('sqlserver'), catalog: image('catalog'), router: image('router'), dataflow: image('dataflow') },
   };
   const config = {

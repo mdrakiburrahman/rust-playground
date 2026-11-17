@@ -3,6 +3,7 @@ import { assertCampaignEnvironment, CampaignConflictError, CampaignFencedError, 
   CUSTODY_CLEANUP_STEPS, validateCampaignState, type CampaignState, type CampaignStore, type RunInventory, type StoredCampaign } from './aks-campaign.js';
 import type { CleanupMutationAuthority, ExternalCleanupActions } from './aks-cleanup-executor.js';
 import { withCleanupDeadline } from './aks-cleanup-budget.js';
+import { DEFAULT_EFFECTIVE_STOP_BUDGETS, parseEffectiveStopBudgets } from './stop-budgets.js';
 
 export const CELL_CLEANUP_SELECTORS = {
   stop_admission: 'stop-admission', bounded_drain: 'bounded-drain', evidence_capture: 'preserve-evidence',
@@ -97,12 +98,21 @@ function field(selector: CellCleanupSelector): keyof RunInventory['cleanup'] | u
   return selector === 'stop_admission' || selector === 'bounded_drain' || selector === 'evidence_capture' || selector === 'stop_maintenance' ||
     selector === 'terminal_capture' || selector === 'handoff' ? selector : undefined;
 }
+function maintenanceStopTimeoutMs(inventory: RunInventory): number {
+  const value = (inventory as RunInventory & { effective_stop_budgets?: unknown }).effective_stop_budgets;
+  return value === undefined ? DEFAULT_EFFECTIVE_STOP_BUDGETS.maintenanceStopTimeoutMs :
+    parseEffectiveStopBudgets(value).maintenanceStopTimeoutMs;
+}
 function mark(inventory: RunInventory, selector: CellCleanupSelector, state: 'running' | 'complete'): RunInventory {
   const next = structuredClone(inventory), name = field(selector);
-  if (name) next.cleanup[name] = { ...next.cleanup[name], state, reason_code: null,
-    deadline_unix_ms: next.cleanup[name].deadline_unix_ms ??
+  if (name) {
+    const step = next.cleanup[name];
+    const deadline = step.deadline_unix_ms ??
       (selector === 'stop_admission' ? Date.now() + 60_000 :
-        selector === 'bounded_drain' || selector === 'stop_maintenance' || selector === 'terminal_capture' ? Date.now() + 120_000 : null) };
+        selector === 'stop_maintenance' ? Date.now() + maintenanceStopTimeoutMs(inventory) :
+          selector === 'bounded_drain' || selector === 'terminal_capture' ? Date.now() + 120_000 : null);
+    next.cleanup[name] = { ...step, state, reason_code: null, deadline_unix_ms: deadline };
+  }
   return next;
 }
 function terminal(inventory: RunInventory) {

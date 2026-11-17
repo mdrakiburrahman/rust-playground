@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use arrowcol_tunables::Tunables;
 use otel_arrow_dfe_quiver::{DiskBudget, QuiverConfig};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::Path;
 use url::Url;
@@ -104,6 +104,180 @@ pub struct PlatformConfig {
     pub bootstrap_env_file: Option<String>,
     #[serde(default)]
     pub local: LocalOptions,
+    #[serde(default)]
+    pub resources: Option<AksResourceOverrides>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AksResourceOverrides {
+    pub collector: Option<ResourceRequirements>,
+    pub client: Option<ResourceRequirements>,
+    pub maintenance: Option<ResourceRequirements>,
+    pub router: Option<ResourceRequirements>,
+    pub catalog: Option<ResourceRequirements>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct AksResourceConfig {
+    pub collector: ResourceRequirements,
+    pub client: ResourceRequirements,
+    pub maintenance: ResourceRequirements,
+    pub router: ResourceRequirements,
+    pub catalog: ResourceRequirements,
+}
+
+impl Default for AksResourceConfig {
+    fn default() -> Self {
+        Self {
+            collector: ResourceRequirements::new("2", "4Gi", "2", "6Gi"),
+            client: ResourceRequirements::new("250m", "256Mi", "2", "2Gi"),
+            maintenance: ResourceRequirements::new("250m", "512Mi", "1", "2Gi"),
+            router: ResourceRequirements::new("500m", "512Mi", "2", "1Gi"),
+            catalog: ResourceRequirements::new("500m", "1Gi", "2", "4Gi"),
+        }
+    }
+}
+
+impl AksResourceOverrides {
+    fn resolve(&self) -> AksResourceConfig {
+        let defaults = AksResourceConfig::default();
+        AksResourceConfig {
+            collector: self.collector.clone().unwrap_or(defaults.collector),
+            client: self.client.clone().unwrap_or(defaults.client),
+            maintenance: self.maintenance.clone().unwrap_or(defaults.maintenance),
+            router: self.router.clone().unwrap_or(defaults.router),
+            catalog: self.catalog.clone().unwrap_or(defaults.catalog),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceRequirements {
+    pub requests: ResourceValues,
+    pub limits: ResourceValues,
+}
+
+impl ResourceRequirements {
+    fn new(request_cpu: &str, request_memory: &str, limit_cpu: &str, limit_memory: &str) -> Self {
+        Self {
+            requests: ResourceValues {
+                cpu: request_cpu.to_owned(),
+                memory: request_memory.to_owned(),
+            },
+            limits: ResourceValues {
+                cpu: limit_cpu.to_owned(),
+                memory: limit_memory.to_owned(),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceValues {
+    pub cpu: String,
+    pub memory: String,
+}
+
+impl AksResourceConfig {
+    fn validate(&self) -> Result<()> {
+        for (role, requirements) in [
+            ("collector", &self.collector),
+            ("client", &self.client),
+            ("maintenance", &self.maintenance),
+            ("router", &self.router),
+            ("catalog", &self.catalog),
+        ] {
+            let request_cpu = parse_cpu_millicores(&requirements.requests.cpu)
+                .with_context(|| format!("platform.resources.{role}.requests.cpu"))?;
+            let limit_cpu = parse_cpu_millicores(&requirements.limits.cpu)
+                .with_context(|| format!("platform.resources.{role}.limits.cpu"))?;
+            let request_memory = parse_memory_bytes(&requirements.requests.memory)
+                .with_context(|| format!("platform.resources.{role}.requests.memory"))?;
+            let limit_memory = parse_memory_bytes(&requirements.limits.memory)
+                .with_context(|| format!("platform.resources.{role}.limits.memory"))?;
+            if request_cpu > limit_cpu || request_memory > limit_memory {
+                bail!("platform.resources.{role} requests must not exceed limits");
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn parse_cpu_millicores(value: &str) -> Result<u64> {
+    let parsed = if let Some(milli) = value.strip_suffix('m') {
+        if milli.is_empty() || !milli.bytes().all(|byte| byte.is_ascii_digit()) {
+            bail!("invalid Kubernetes CPU quantity {value:?}");
+        }
+        milli.parse::<u64>().context("CPU milli quantity is out of range")?
+    } else if let Some((whole, fraction)) = value.split_once('.') {
+        if whole.is_empty()
+            || fraction.is_empty()
+            || fraction.len() > 3
+            || !whole.bytes().all(|byte| byte.is_ascii_digit())
+            || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            bail!("invalid Kubernetes CPU quantity {value:?}");
+        }
+        let whole = whole.parse::<u64>().context("CPU quantity is out of range")?;
+        let mut milli_fraction = fraction.to_owned();
+        while milli_fraction.len() < 3 {
+            milli_fraction.push('0');
+        }
+        whole
+            .checked_mul(1000)
+            .and_then(|n| n.checked_add(milli_fraction.parse::<u64>().ok()?))
+            .context("CPU quantity is out of range")?
+    } else {
+        if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            bail!("invalid Kubernetes CPU quantity {value:?}");
+        }
+        value
+            .parse::<u64>()
+            .context("CPU quantity is out of range")?
+            .checked_mul(1000)
+            .context("CPU quantity is out of range")?
+    };
+    if parsed == 0 {
+        bail!("Kubernetes CPU quantity must be positive");
+    }
+    Ok(parsed)
+}
+
+pub(crate) fn parse_memory_bytes(value: &str) -> Result<u64> {
+    const UNITS: [(&str, u64); 13] = [
+        ("Ei", 1_u64 << 60),
+        ("Pi", 1_u64 << 50),
+        ("Ti", 1_u64 << 40),
+        ("Gi", 1_u64 << 30),
+        ("Mi", 1_u64 << 20),
+        ("Ki", 1_u64 << 10),
+        ("E", 1_000_000_000_000_000_000),
+        ("P", 1_000_000_000_000_000),
+        ("T", 1_000_000_000_000),
+        ("G", 1_000_000_000),
+        ("M", 1_000_000),
+        ("k", 1_000),
+        ("", 1),
+    ];
+    let (digits, multiplier) = UNITS
+        .iter()
+        .find_map(|(suffix, multiplier)| value.strip_suffix(suffix).map(|digits| (digits, *multiplier)))
+        .context("memory quantity must use an integer Kubernetes byte quantity")?;
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        bail!("invalid Kubernetes memory quantity {value:?}");
+    }
+    let bytes = digits
+        .parse::<u64>()
+        .context("memory quantity is out of range")?
+        .checked_mul(multiplier)
+        .context("memory quantity is out of range")?;
+    if bytes == 0 {
+        bail!("Kubernetes memory quantity must be positive");
+    }
+    Ok(bytes)
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -153,6 +327,7 @@ fn default_collector_stop_grace_seconds() -> u64 {
 }
 
 pub(crate) const SCHEDULE_DELIVERY_TIMEOUT_SECONDS: u64 = 180;
+pub(crate) const AKS_RESOURCE_COUNTER_SNAPSHOT_TIMEOUT_MS: u64 = 5_000;
 pub(crate) const PIN_INIT_SETUP_TIMEOUT_SECONDS: u64 = 180;
 const CLIENT_JOB_CLEANUP_GRACE_SECONDS: u64 = 300;
 const DEFAULT_WAL_RETENTION_SIZE_CAP_BYTES: u64 = 4 * 1024 * 1024 * 1024;
@@ -162,6 +337,35 @@ pub(crate) struct RunTimingBudget {
     pub(crate) schedule_wait_seconds: u64,
     pub(crate) client_job_lifetime_seconds: u64,
     pub(crate) minimum_pin_ttl_ms: u64,
+    pub(crate) pre_cell_setup_timeout_ms: u64,
+    pub(crate) after_setup_budget_ms: u64,
+    pub(crate) planned_cell_duration_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EffectiveStopBudgets {
+    pub maintenance_grace_seconds: u64,
+    pub maintenance_stop_timeout_ms: u64,
+}
+
+impl EffectiveStopBudgets {
+    pub(crate) fn validate(self) -> Result<Self> {
+        let minimum_timeout_ms = self
+            .maintenance_grace_seconds
+            .checked_add(300)
+            .and_then(|seconds| seconds.checked_mul(1_000))
+            .context("effective maintenance cleanup headroom calculation overflow")?;
+        if self.maintenance_grace_seconds == 0
+            || self.maintenance_stop_timeout_ms < minimum_timeout_ms
+            || self.maintenance_stop_timeout_ms > 5_100_000
+        {
+            bail!(
+                "effective maintenance stop timeout must cover grace plus 300 seconds and not exceed the fixed timeout ceiling"
+            );
+        }
+        Ok(self)
+    }
 }
 
 impl OatConfig {
@@ -204,6 +408,69 @@ impl OatConfig {
             bail!("single_hot_table campaign requires purge, optimize, vacuum, checkpoint and prune_log");
         }
         Ok(())
+    }
+
+    fn validate_platform_resources(&self) -> Result<()> {
+        if self.platform.kind == OatMode::Local {
+            if self.platform.resources.is_some() {
+                bail!("platform.resources is only valid for AKS");
+            }
+            return Ok(());
+        }
+        self.effective_aks_resources().validate()
+    }
+
+    pub(crate) fn effective_aks_resources(&self) -> AksResourceConfig {
+        self.platform
+            .resources
+            .as_ref()
+            .map(AksResourceOverrides::resolve)
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn maintenance_stop_budget(&self) -> Result<EffectiveStopBudgets> {
+        const DEFAULT_GRACE_SECONDS: u64 = 4_800;
+        const DEFAULT_TIMEOUT_MS: u64 = 5_100_000;
+        const OPERATION_HEADROOM_SECONDS: u64 = 300;
+        const CLEANUP_HEADROOM_SECONDS: u64 = 300;
+        let Some(settings) = self
+            .tunables
+            .maintenance
+            .as_ref()
+            .filter(|settings| settings.enabled == Some(true))
+        else {
+            return EffectiveStopBudgets {
+                maintenance_grace_seconds: DEFAULT_GRACE_SECONDS,
+                maintenance_stop_timeout_ms: DEFAULT_TIMEOUT_MS,
+            }
+            .validate();
+        };
+        let operation_count = u64::try_from(
+            settings
+                .operations
+                .as_ref()
+                .context("enabled maintenance requires operations")?
+                .len(),
+        )?;
+        let operation_timeout = settings.operation_timeout_secs.unwrap_or(900);
+        let grace = operation_timeout
+            .checked_mul(operation_count)
+            .and_then(|seconds| seconds.checked_add(OPERATION_HEADROOM_SECONDS))
+            .context("maintenance stop grace calculation overflow")?;
+        let timeout_ms = grace
+            .checked_add(CLEANUP_HEADROOM_SECONDS)
+            .and_then(|seconds| seconds.checked_mul(1_000))
+            .context("maintenance cleanup timeout calculation overflow")?;
+        if timeout_ms > DEFAULT_TIMEOUT_MS {
+            bail!(
+                "maintenance.operation_timeout_secs and enabled operation count exceed the fixed 5100-second cleanup budget"
+            );
+        }
+        EffectiveStopBudgets {
+            maintenance_grace_seconds: grace,
+            maintenance_stop_timeout_ms: timeout_ms,
+        }
+        .validate()
     }
 
     fn validate_local_purge_inputs(&self) -> Result<()> {
@@ -362,13 +629,69 @@ impl OatConfig {
             .checked_add(PIN_INIT_SETUP_TIMEOUT_SECONDS)
             .and_then(|seconds| seconds.checked_add(self.reconciliation_settle_timeout_seconds))
             .and_then(|seconds| seconds.checked_add(self.collector_stop_grace_seconds))
+            .and_then(|seconds| seconds.checked_add(self.qap_timeout_seconds))
             .context("OAT pin initialization and collector drain lifetime budget overflow")?
             .checked_mul(1_000)
             .context("OAT run pin lifetime budget overflow")?;
+        let rollout_timeout_ms = if self.platform.kind == OatMode::Aks {
+            self.aks_rollout_timeout_seconds
+                .checked_mul(1_000)
+                .context("OAT AKS rollout timeout overflow")?
+        } else {
+            0
+        };
+        let maintenance_rollouts = u64::from(
+            self.tunables
+                .maintenance
+                .as_ref()
+                .is_some_and(|settings| settings.enabled == Some(true)),
+        );
+        let setup_rollout_count = if self.platform.kind == OatMode::Aks {
+            u64::try_from(self.deployment_names().len())?
+                .checked_add(1)
+                .context("OAT AKS setup rollout count overflow")?
+        } else {
+            0
+        };
+        let scale_rollout_count = if self.platform.kind == OatMode::Aks {
+            u64::try_from(self.deployment_names().len())?
+                .checked_add(maintenance_rollouts)
+                .context("OAT AKS scale rollout count overflow")?
+        } else {
+            0
+        };
+        let pre_cell_setup_timeout_ms = if self.platform.kind == OatMode::Aks {
+            setup_rollout_count
+                .checked_mul(rollout_timeout_ms)
+                .context("OAT AKS setup timeout overflow")?
+        } else {
+            1_260_000
+        };
+        let resource_counter_snapshot_budget_ms = if self.platform.kind == OatMode::Aks {
+            AKS_RESOURCE_COUNTER_SNAPSHOT_TIMEOUT_MS
+                .checked_mul(2)
+                .context("OAT AKS resource-counter snapshot budget overflow")?
+        } else {
+            0
+        };
+        let after_setup_budget_ms = minimum_pin_ttl_ms
+            .checked_add(
+                scale_rollout_count
+                    .checked_mul(rollout_timeout_ms)
+                    .context("OAT scale rollout budget overflow")?,
+            )
+            .and_then(|budget| budget.checked_add(resource_counter_snapshot_budget_ms))
+            .context("OAT post-setup cell budget overflow")?;
+        let planned_cell_duration_ms = pre_cell_setup_timeout_ms
+            .checked_add(after_setup_budget_ms)
+            .context("OAT planned cell lifecycle duration overflow")?;
         Ok(RunTimingBudget {
             schedule_wait_seconds,
             client_job_lifetime_seconds,
             minimum_pin_ttl_ms,
+            pre_cell_setup_timeout_ms,
+            after_setup_budget_ms,
+            planned_cell_duration_ms,
         })
     }
 
@@ -396,6 +719,8 @@ impl OatConfig {
         self.validate_campaign_profile()?;
         self.validate_local_purge_inputs()?;
         self.tunables.validate_for_oat()?;
+        self.validate_platform_resources()?;
+        self.maintenance_stop_budget()?;
         self.validate_selected_parquet_schemas()?;
         self.validate_selected_layout_schemas()?;
         if self
@@ -851,6 +1176,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn aks_resources_keep_defaults_validate_quantities_and_allow_oversubscription() -> Result<()> {
+        use serde_json::json;
+
+        let defaults = serde_json::to_value(AksResourceConfig::default())?;
+        assert_eq!(defaults["collector"]["requests"]["cpu"], "2");
+        assert_eq!(defaults["collector"]["limits"]["memory"], "6Gi");
+        assert_eq!(defaults["client"]["requests"]["cpu"], "250m");
+        assert_eq!(defaults["client"]["limits"]["memory"], "2Gi");
+        assert_eq!(defaults["maintenance"]["requests"]["memory"], "512Mi");
+        assert_eq!(defaults["router"]["limits"]["memory"], "1Gi");
+        assert_eq!(defaults["catalog"]["limits"]["memory"], "4Gi");
+
+        let mut config = valid();
+        config.platform.resources = Some(serde_json::from_value(json!({
+            "collector": { "requests": {"cpu":"250m","memory":"1Gi"}, "limits": {"cpu":"1","memory":"6Gi"} },
+            "client": { "requests": {"cpu":"250m","memory":"256Mi"}, "limits": {"cpu":"1","memory":"2Gi"} }
+        }))?);
+        config.dfe_worker_concurrency = vec![4];
+        config.dmv_concurrency = 16;
+        config.validate()?;
+
+        for bad in ["1.0001", "1n", "0m", "", " 1"] {
+            let mut invalid = valid();
+            invalid.platform.resources = Some(serde_json::from_value(json!({
+                "collector": { "requests": {"cpu":bad,"memory":"1Gi"}, "limits": {"cpu":"2","memory":"6Gi"} }
+            }))?);
+            assert!(invalid.validate().is_err(), "accepted invalid CPU quantity {bad:?}");
+        }
+        let mut invalid = valid();
+        invalid.platform.resources = Some(serde_json::from_value(json!({
+            "collector": { "requests": {"cpu":"2","memory":"7Gi"}, "limits": {"cpu":"1","memory":"6Gi"} }
+        }))?);
+        assert!(invalid.validate().is_err());
+        assert!(serde_json::from_value::<AksResourceOverrides>(json!({"collector":{"cpu":"2"}})).is_err());
+        assert!(serde_json::from_value::<AksResourceOverrides>(json!({"client_typo":{}})).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn overload_guard_rejects_malformed_or_protocol_weakening_settings() -> Result<()> {
         use serde_json::json;
 
@@ -929,6 +1293,7 @@ mod tests {
                 runtime_config_file: Some(runtime_config.to_string_lossy().into_owned()),
                 bootstrap_env_file: Some(bootstrap_env.to_string_lossy().into_owned()),
                 local: LocalOptions::default(),
+                resources: None,
             },
             stamp: Some("00000".to_owned()),
             warmup_seconds: 30,
@@ -1404,13 +1769,53 @@ mod tests {
     }
 
     #[test]
+    fn rust_and_typescript_stop_budgets_share_the_same_fixtures() -> Result<()> {
+        let fixtures: Vec<serde_json::Value> =
+            serde_json::from_str(include_str!("../../arrowcol-oat/stop-budget-fixtures.json"))?;
+        for fixture in fixtures {
+            if fixture.get("validation").is_some() {
+                let budget: EffectiveStopBudgets = serde_json::from_value(fixture["validation"].clone())?;
+                assert!(
+                    budget.validate().is_err(),
+                    "{} must be rejected by Rust",
+                    fixture["name"]
+                );
+                continue;
+            }
+            let mut config = valid();
+            let mut maintenance = serde_json::json!({
+                "enabled": true,
+                "apply": true,
+                "operations": fixture["operations"].clone(),
+            });
+            if let Some(timeout) = fixture["operation_timeout_secs"].as_u64() {
+                maintenance["operation_timeout_secs"] = serde_json::json!(timeout);
+            }
+            config.tunables =
+                arrowcol_tunables::Tunables::parse_oat_json(serde_json::json!({"maintenance": maintenance}))?;
+            let result = config.maintenance_stop_budget();
+            if fixture["rejected"] == true {
+                assert!(result.is_err(), "{} must be rejected by Rust", fixture["name"]);
+            } else {
+                assert_eq!(
+                    serde_json::to_value(result?)?,
+                    fixture["expected"],
+                    "{}",
+                    fixture["name"]
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn pin_ttl_covers_the_full_startup_and_client_lifetime_envelope() -> Result<()> {
         let mut config = valid();
         config.client_ready_timeout_seconds = 1_800;
         config.qap_timeout_seconds = 300;
         config.warmup_seconds = 300;
         config.measure_seconds = 600;
-        config.run_pin_ttl_ms = 4_080_000;
+        config.run_pin_ttl_ms = config.timing_budget()?.minimum_pin_ttl_ms;
         config.validate()?;
 
         config.run_pin_ttl_ms -= 1;
@@ -1492,6 +1897,7 @@ mod tests {
             runtime_config_file: None,
             bootstrap_env_file: None,
             local: LocalOptions::default(),
+            resources: None,
         };
         config.result_url = "file:///tmp/arrowcol-oat/results.parquet".to_owned();
         config.website_url = "file:///tmp/arrowcol-oat/site/results.parquet".to_owned();
@@ -1512,6 +1918,7 @@ mod tests {
             runtime_config_file: None,
             bootstrap_env_file: None,
             local: LocalOptions::default(),
+            resources: None,
         };
         config.result_url = "file:///tmp/arrowcol-oat/results.parquet".to_owned();
         config.website_url = "abfss://$web@account.dfs.core.windows.net/results.parquet".to_owned();
@@ -1585,6 +1992,7 @@ mod tests {
             runtime_config_file: None,
             bootstrap_env_file: None,
             local: LocalOptions::default(),
+            resources: None,
         };
         config.result_url = "file:///tmp/arrowcol-oat/results.parquet".to_owned();
         config.website_url = "file:///tmp/arrowcol-oat/site/results.parquet".to_owned();

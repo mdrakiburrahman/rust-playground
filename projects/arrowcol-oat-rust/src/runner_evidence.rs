@@ -1308,6 +1308,7 @@ mod downstream_runner_tests {
             1,
             1,
             &mut platform,
+            tokio::time::Instant::now() + Duration::from_millis(config.timing_budget()?.planned_cell_duration_ms),
         )
         .await;
         server.abort();

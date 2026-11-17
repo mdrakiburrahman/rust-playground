@@ -36,6 +36,7 @@ fn maintenance_runtime(config: &OatConfig) -> Result<Option<Value>> {
         "tables": config.tables.iter().map(|table| canonical_dmv_table_name(table)).collect::<Result<Vec<_>>>()?,
         "operations": operations,
         "apply": settings.apply.unwrap_or(false),
+        "granularity": settings.granularity.unwrap_or(arrowcol_tunables::MaintenanceGranularity::Hour),
     })))
 }
 
@@ -699,6 +700,63 @@ fn maintenance_due_work(value: &Value) -> Result<Option<MaintenanceDueWorkEviden
     Ok(Some(evidence))
 }
 
+fn verify_effective_maintenance_stop_budget(config: &OatConfig, table_policy: &Value) -> Result<()> {
+    let settings = config.tunables.maintenance.as_ref().context("maintenance settings missing")?;
+    let operation_count = u64::try_from(settings.operations.as_ref().context("maintenance operations missing")?.len())?;
+    if operation_count == 0 {
+        bail!("maintenance stop budget requires at least one enabled operation");
+    }
+    let operation_timeout_ms = table_policy
+        .get("arrowcol.maintenance.operationTimeout")
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0)
+        .context("effective per-table maintenance operationTimeout is missing or invalid")?;
+    let required_grace_ms = operation_timeout_ms
+        .checked_mul(operation_count)
+        .and_then(|value| value.checked_add(300_000))
+        .context("effective per-table maintenance grace calculation overflow")?;
+    let required_stop_timeout_ms = required_grace_ms
+        .checked_add(300_000)
+        .context("effective per-table maintenance stop timeout calculation overflow")?;
+    let budget = config.maintenance_stop_budget()?.validate()?;
+    if required_grace_ms > budget.maintenance_grace_seconds.saturating_mul(1_000)
+        || required_stop_timeout_ms > budget.maintenance_stop_timeout_ms
+    {
+        bail!("effective per-table maintenance operationTimeout exceeds the persisted stop budget");
+    }
+    Ok(())
+}
+
+async fn verify_maintenance_stop_budget_before_admission(config: &OatConfig, platform: &dyn Platform) -> Result<()> {
+    if !maintenance_enabled(config) {
+        return Ok(());
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let logs = platform.process_logs_for_role(config, ComponentRole::Maintenance).await?;
+        let [log] = logs.as_slice() else {
+            bail!("maintenance stop-budget readback requires exactly one maintenance process");
+        };
+        if !log.complete {
+            bail!("maintenance stop-budget readback log is incomplete");
+        }
+        let policy_count = log
+            .text
+            .lines()
+            .filter(|line| line.starts_with("arrowcol_maintenance_table_config "))
+            .count();
+        if policy_count >= config.tables.len() {
+            let evidence = maintenance_table_evidence(config, &log.text)?;
+            local_progress(config, &format!("pre-admission maintenance stop-budget readback: {}", evidence["tables"]));
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!("maintenance omitted effective per-table operationTimeout before load admission");
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
 fn maintenance_table_evidence(config: &OatConfig, text: &str) -> Result<Value> {
     let mut tables = serde_json::Map::new();
     for line in text
@@ -725,6 +783,7 @@ fn maintenance_table_evidence(config: &OatConfig, text: &str) -> Result<Value> {
             bail!("maintenance table readback omitted resolved table policy");
         }
         verify_maintenance_controls(config, &policy)?;
+        verify_effective_maintenance_stop_budget(config, &policy["table_policy"])?;
         if let Some(previous) = tables.insert(table.to_owned(), policy.clone())
             && previous != policy
         {
@@ -925,7 +984,7 @@ mod maintenance_topology_tests {
         }))?;
         let table = canonical_dmv_table_name(&config.tables[0])?;
         let mut text = format!("arrowcol_maintenance_table_config {}\n", json!({
-            "table": table, "config": {"active":true, "table_policy":{},
+            "table": table, "config": {"active":true, "table_policy":{"arrowcol.maintenance.operationTimeout":300_000},
                 "startup":{"apply":true,"operations":["optimize","purge","vacuum","checkpoint","prune_log"],"interval_secs":60}}
         }));
         for result in operation_results {
@@ -984,7 +1043,8 @@ mod maintenance_topology_tests {
             json!({"maintenance":{"enabled":true,"operations":["optimize"],"target_file_mib":17}}),
         )?;
         let startup = json!({"startup":{"apply":false,"operations":["optimize"],"interval_secs":60},
-            "table_policy":{"arrowcol.optimize.targetFileSize":17_u64*1024*1024},"active":true});
+            "table_policy":{"arrowcol.optimize.targetFileSize":17_u64*1024*1024,
+                "arrowcol.maintenance.operationTimeout":300_000},"active":true});
         verify_process_configuration(&config, ComponentRole::Maintenance, &startup)?;
         let (actual, expected) = maintenance_readback_value(&startup, "ARROWCOL_MAINT_TARGET_FILE_MIB", json!(17))?;
         assert_eq!(actual, expected);
@@ -1159,6 +1219,38 @@ mod maintenance_topology_tests {
                 maintenance_readback_value(&observed, &format!("ARROWCOL_MAINT_{variable}"), expected)?;
             assert_eq!(actual, requested);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn effective_table_timeout_is_budgeted_before_admission() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+            "maintenance":{"enabled":true,"apply":true,"operations":["optimize"]}
+        }))?;
+        let table = canonical_dmv_table_name(&config.tables[0])?;
+        let event = |timeout_ms| json!({
+            "table": table,
+            "config": {"active":true,"table_policy":{"arrowcol.maintenance.operationTimeout":timeout_ms},
+                "startup":{"apply":true,"operations":["optimize"],"interval_secs":60}}
+        });
+        let default_timeout = format!("arrowcol_maintenance_table_config {}\n", event(300_000));
+        assert!(maintenance_table_evidence(&config, &default_timeout).is_ok(),
+            "the resolved registry default must remain eligible when it fits the persisted deadline");
+        let oversized_timeout = format!("arrowcol_maintenance_table_config {}\n", event(1_200_000));
+        assert!(maintenance_table_evidence(&config, &oversized_timeout).is_err(),
+            "a 1,200-second table override must not outlive the 900-second requested/default budget");
+
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+            "maintenance":{"enabled":true,"apply":true,"operations":["optimize"],"operation_timeout_secs":900}
+        }))?;
+        let safe_override = event(600_000);
+        verify_process_configuration(&config, ComponentRole::Maintenance, &safe_override["config"])?;
+        let shorter_override = format!("arrowcol_maintenance_table_config {}\n", safe_override);
+        assert!(maintenance_table_evidence(&config, &shorter_override).is_ok(),
+            "a safe table override may differ from the requested process default");
         Ok(())
     }
 
