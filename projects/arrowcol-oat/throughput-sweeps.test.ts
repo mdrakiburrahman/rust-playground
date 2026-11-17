@@ -41,6 +41,38 @@ test('screens applicable BYTE_ARRAY encodings with an explicit matched plain con
   });
 });
 
+test('generates the C3 flush-age comparison as a single-factor sweep', () => {
+  const base = { platform: { kind: 'local' }, tunables: { collector: { batching: { max_age: '1s' } } } };
+  const manifest = buildThroughputManifests(base).find(item => item.cohort === 'C3')!;
+  const comparisons = manifest.comparisons as Array<{
+    id: string; factor: string; candidate_limit: number; candidates: Array<{ id: string; overrides: Record<string, unknown> }>;
+  }>;
+  const age = comparisons.find(comparison => comparison.id === 'flush-age');
+  assert.ok(age);
+  assert.equal(age.factor, 'collector.batching.max_age');
+  assert.equal(age.candidate_limit, 4);
+  assert.deepEqual(age.candidates.map(item => [
+    item.id, at(item.overrides, ['tunables', 'collector', 'batching', 'max_age']),
+  ]), [['age-1s', '1s'], ['age-5s', '5s'], ['age-15s', '15s'], ['age-60s', '60s']]);
+  const configs = age.candidates.map(item => renderThroughputConfig(base, manifest, age.id, item.id));
+  const fixedSettings = configs.map(config => {
+    const copy = structuredClone(config);
+    delete (at(copy, ['tunables', 'collector', 'batching']) as Record<string, unknown>).max_age;
+    return copy;
+  });
+  assert.deepEqual(fixedSettings.slice(1), [fixedSettings[0], fixedSettings[0], fixedSettings[0]]);
+  assert.deepEqual(manifest.flush_age_semantics, {
+    requested_path: 'tunables.collector.batching.max_age',
+    baseline_requested: '1s',
+    candidate_requests: ['1s', '5s', '15s', '60s'].map(value => ({ candidate: 'age-' + value, requested: value })),
+    effective_readback_path: 'consumer_effective_config.batching.max_age',
+    effective_status: 'requires-runtime-startup-readback',
+    flush_reason_metric: 'arrowcol_pipeline_flushes_total',
+    flush_reason_labels: ['age', 'target_parquet_bytes', 'min_input_bytes', 'max_input_bytes', 'row_cap', 'batch_cap', 'memory_cap', 'schema_change', 'explicit', 'shutdown_drain'],
+    interpretation: 'Compare per-run counter deltas and physical file sizes; the first satisfied time, row, input-byte, or memory cap determines flush behavior.',
+  });
+});
+
 test('generates bounded local single-writer manifests from the tunables registry', () => {
   const manifests = buildThroughputManifests({ tunables: { client: { workers: 16 }, maintenance: { enabled: true } } });
   assert.deepEqual(manifests.map(manifest => manifest.cohort), ['C1', 'C2', 'C3', 'C4', 'C5', 'C6', 'C7', 'C8']);
