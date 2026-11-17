@@ -65,6 +65,22 @@ cargo run --locked --package arrowcol-oat-rust -- --validate-config \
   out/arrowcol-oat/sweep-configs/C1/codec-snappy-lz4raw/snappy.json
 ```
 
+## Frozen submitted-config rendering
+
+For a bounded local run based on an independently validated, submitted OAT config, render candidates from that exact file rather than the PR #125 seed. Do not pass a consumer-effective readback as the submitted config. The expected hash is SHA-256 over the file's raw bytes; the renderer rejects missing/malformed hashes and mismatches. In this opt-in mode baseline.json is byte-identical to the submitted input, candidate files apply only their manifest-declared overrides (including explicit null values), and each cohort's render-provenance.json records the baseline hash plus every output hash and JSON-pointer delta path. It does not apply manifest baseline overlays or validate the result; runnable: false and runtime qualification remain unchanged.
+
+Replace the placeholder hash with the SHA-256 pinned in the frozen packet. Keep this output separate from the submitted config and manifests:
+
+~~~bash
+FROZEN_CONFIG=out/arrowcol-oat/frozen-submitted-oat.json
+EXPECTED_SHA256=<64-character-packet-sha256>
+npx --no-install tsx projects/arrowcol-oat/throughput-sweeps.ts --render-all \
+  --supplement C5-grpc --manifests docs/experiments/arrowcol-oat \
+  --frozen-config "$FROZEN_CONFIG" --frozen-config-sha256 "$EXPECTED_SHA256" \
+  --out out/arrowcol-oat/frozen-sweep-configs
+cat out/arrowcol-oat/frozen-sweep-configs/C5-grpc/render-provenance.json
+~~~
+
 The generator hashes the PR #125 tunables profile as a seed, not a complete capability registry. Rendering rejects a different seed. The current matrix contains 8 baselines and 108 candidates (116 configs); all 116 passed the production `--validate-config` binary built with `cargo build --locked --package arrowcol-oat-rust` from source commit `22c1490edd7479831916be701213061fa39fb7d4`. The binary SHA-256 is `9c5bc506371ba533ade8bc3477be17ade82cda2a3139988d23cf3219f0706901`. `oat-config-throughput-validation.json` binds each rendered config SHA-256 to its final manifest SHA-256; the successor session evidence preserves exact commands, input hashes, exit codes, stdout/stderr, build logs, and hash-command output. Only the original 116-config matrix has a Rust validator source set with no diff from pinned base `5687e6459c424362f4504d21c32f954aa3b07d05`; that attribution does not cover the successor gRPC collector fields, which are validated separately below against source `731085583a486d252faf0d6c410d5cc7173fbde7`. The earlier 112-config result remains owner-attested only and is superseded. No staging-overlap candidates are included. Parser success proves config shape only, not admission, effective settings, runtime, or sustainable qualification. `runnable: false` retains the runtime hold. Regeneration resets validation status; do not treat config generation as validation.
 
 The directional gRPC set is supplemental `oat-config-throughput-C5-grpc.json`; the original C5 manifest and validation evidence remain unchanged. The successor contains 30 comparison entries (the original 21 plus nine entries across three bounded direction groups, including the repeated matched control), remains non-runnable/unqualified, and is selected as the C5 replacement only when `--supplement C5-grpc` is passed. All 125 rendered successor configs (8 baselines, 117 candidates) passed strict Rust config validation against source `731085583a486d252faf0d6c410d5cc7173fbde7`, binary SHA-256 `91e474cb7188f323d5b37a276e3668bc208f9878bb9068496798bdf8d2e75f8e`, and Cargo.lock SHA-256 `7fbc71f511e50ac954563d7556827a767f0f371cf7c09af05c35bf6b0a760df3`. `oat-config-throughput-validation-grpc.json` binds each rendered input and the final supplemental manifest hash to exact commands, outputs, exits, and malformed enum/type rejections. After adding the interaction classification, the explicit successor render matched all 125 recorded validator input hashes; only the C5 manifest hash was rebound, and the raw per-config command records were retained. No Rust rerun was needed because the rendered config bytes did not change. This proves config shape only, not runtime or performance qualification.

@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
+import { TextDecoder } from 'node:util';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 type JsonObject = Record<string, unknown>;
@@ -477,6 +478,53 @@ function mergeObjects(base: JsonObject, overrides: JsonObject): JsonObject {
   return result;
 }
 
+function sha256(bytes: Uint8Array): string {
+  return createHash('sha256').update(bytes).digest('hex');
+}
+
+function isJsonValue(value: unknown, seen = new Set<object>()): boolean {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return true;
+  if (typeof value === 'number') return Number.isFinite(value);
+  if (typeof value !== 'object' || seen.has(value)) return false;
+  seen.add(value);
+  const valid = Array.isArray(value)
+    ? value.every(item => isJsonValue(item, seen))
+    : isRecord(value) && Object.values(value).every(item => isJsonValue(item, seen));
+  seen.delete(value);
+  return valid;
+}
+
+function jsonPointer(path: string[]): string {
+  return '/' + path.map(segment => segment.replace(/~/g, '~0').split('/').join('~1')).join('/');
+}
+
+function overrideLeafPaths(value: unknown, path: string[] = []): string[] {
+  if (!isRecord(value)) return path.length > 0 ? [jsonPointer(path)] : [];
+  const keys = Object.keys(value);
+  if (keys.length === 0) return [];
+  return keys.flatMap(key => overrideLeafPaths(value[key], [...path, key]));
+}
+
+function changedJsonPaths(
+  before: unknown, after: unknown, path: string[] = [], beforePresent = true, afterPresent = true,
+): string[] {
+  if (beforePresent && afterPresent && isRecord(before) && isRecord(after)) {
+    const keys = [...new Set([...Object.keys(before), ...Object.keys(after)])].sort();
+    return keys.flatMap(key => changedJsonPaths(
+      before[key], after[key], [...path, key], Object.prototype.hasOwnProperty.call(before, key),
+      Object.prototype.hasOwnProperty.call(after, key),
+    ));
+  }
+  if (!beforePresent && afterPresent && isRecord(after)) {
+    return Object.keys(after).sort().flatMap(key => changedJsonPaths(undefined, after[key], [...path, key], false, true));
+  }
+  if (beforePresent && !afterPresent && isRecord(before)) {
+    return Object.keys(before).sort().flatMap(key => changedJsonPaths(before[key], undefined, [...path, key], true, false));
+  }
+  if (beforePresent === afterPresent && (!beforePresent || JSON.stringify(before) === JSON.stringify(after))) return [];
+  return path.length > 0 ? [jsonPointer(path)] : ['/'];
+}
+
 export function renderThroughputBaseline(base: unknown, manifest: unknown): JsonObject {
   if (!isRecord(base) || !isRecord(manifest) || !isRecord(manifest.baseline_tunables) ||
       !isRecord(manifest.baseline_overrides) || !Array.isArray(manifest.comparisons)) {
@@ -500,6 +548,31 @@ export function renderThroughputConfig(base: unknown, manifest: unknown, compari
   return mergeObjects(baseline, selected.overrides);
 }
 
+export function renderFrozenThroughputConfig(
+  base: unknown, manifest: unknown, comparisonId: string, candidateId: string,
+): { config: JsonObject; delta_paths: string[] } {
+  if (!isRecord(base) || !isRecord(base.tunables) || !isJsonValue(base)) {
+    throw new Error('frozen config must be a JSON OAT object with a tunables object');
+  }
+  if (!isRecord(manifest) || !Array.isArray(manifest.comparisons)) throw new Error('invalid frozen throughput manifest');
+  validateComparisons(manifest.comparisons, String(manifest.cohort ?? 'unknown'));
+  const comparison = manifest.comparisons.find(item => isRecord(item) && item.id === comparisonId);
+  if (!isRecord(comparison) || !Array.isArray(comparison.candidates)) throw new Error('unknown comparison: ' + comparisonId);
+  const selected = comparison.candidates.find(item => isRecord(item) && item.id === candidateId);
+  if (!isRecord(selected) || !isRecord(selected.overrides) || !isJsonValue(selected.overrides)) {
+    throw new Error('unknown candidate or non-JSON candidate overrides: ' + candidateId);
+  }
+  const config = mergeObjects(base, selected.overrides);
+  const deltaPaths = changedJsonPaths(base, config);
+  const declaredPaths = overrideLeafPaths(selected.overrides);
+  const undeclaredPaths = deltaPaths.filter(path =>
+    !declaredPaths.some(declared => path === declared || path.startsWith(declared + '/')));
+  if (undeclaredPaths.length > 0) {
+    throw new Error('candidate mutated paths outside its declared overrides: ' + undeclaredPaths.join(', '));
+  }
+  return { config, delta_paths: deltaPaths };
+}
+
 async function main(args: string[]): Promise<void> {
   let registryPath = resolve(root, 'docs/experiments/arrowcol-oat/oat-config.tuned.json');
   let outputDirectory = resolve(root, 'docs/experiments/arrowcol-oat');
@@ -507,10 +580,24 @@ async function main(args: string[]): Promise<void> {
   let outputDirectoryProvided = false;
   let renderAll = false;
   let supplement: string | undefined;
+  let frozenConfigPath: string | undefined;
+  let frozenConfigSha256: string | undefined;
   for (let index = 0; index < args.length; index++) {
     const option = args[index];
     if (option === '--render-all') {
       renderAll = true;
+      continue;
+    }
+    if (option === '--frozen-config' || option === '--frozen-config-sha256') {
+      const value = args[++index];
+      if (!value || value.startsWith('--')) throw new Error('expected a value after ' + option);
+      if (option === '--frozen-config') {
+        if (frozenConfigPath !== undefined) throw new Error('duplicate --frozen-config option');
+        frozenConfigPath = resolve(value);
+      } else {
+        if (frozenConfigSha256 !== undefined) throw new Error('duplicate --frozen-config-sha256 option');
+        frozenConfigSha256 = value;
+      }
       continue;
     }
     const value = args[++index];
@@ -525,7 +612,40 @@ async function main(args: string[]): Promise<void> {
       supplement = value;
     } else throw new Error('unknown option: ' + option);
   }
-  const registry: unknown = JSON.parse(await readFile(registryPath, 'utf8'));
+  const frozenRequested = frozenConfigPath !== undefined || frozenConfigSha256 !== undefined;
+  if (frozenRequested && (!frozenConfigPath || !frozenConfigSha256)) {
+    throw new Error('--frozen-config and --frozen-config-sha256 must be supplied together');
+  }
+  if (frozenRequested && !renderAll) throw new Error('frozen config rendering requires --render-all');
+  let frozenConfig: JsonObject | undefined;
+  let frozenConfigBytes: Buffer | undefined;
+  let frozenConfigHash: string | undefined;
+  if (frozenConfigPath && frozenConfigSha256) {
+    if (!/^[a-f0-9]{64}$/i.test(frozenConfigSha256)) throw new Error('--frozen-config-sha256 must be a 64-character SHA-256 hex digest');
+    frozenConfigBytes = await readFile(frozenConfigPath);
+    frozenConfigHash = sha256(frozenConfigBytes);
+    if (frozenConfigHash !== frozenConfigSha256.toLowerCase()) {
+      throw new Error('frozen config SHA-256 mismatch: expected ' + frozenConfigSha256.toLowerCase() + ', got ' + frozenConfigHash);
+    }
+    let text: string;
+    try {
+      text = new TextDecoder('utf-8', { fatal: true }).decode(frozenConfigBytes);
+    } catch {
+      throw new Error('frozen config must be valid UTF-8 JSON');
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      throw new Error('frozen config is not valid JSON');
+    }
+    if (!isRecord(parsed) || !isRecord(parsed.tunables) || !isJsonValue(parsed)) {
+      throw new Error('frozen config must be a JSON OAT object with a tunables object');
+    }
+    frozenConfig = parsed;
+  }
+  let registry: unknown = undefined;
+  if (!frozenConfig) registry = JSON.parse(await readFile(registryPath, 'utf8'));
   if (!renderAll) {
     const generated = buildThroughputManifests(registry);
     if (supplement) {
@@ -571,8 +691,20 @@ async function main(args: string[]): Promise<void> {
     const cohort = String(manifest.cohort);
     const cohortDirectory = resolve(outputDirectory, outputName);
     await mkdir(cohortDirectory, { recursive: true });
-    await writeFile(resolve(cohortDirectory, 'baseline.json'),
-      JSON.stringify(renderThroughputBaseline(registry, manifest), null, 2) + '\n');
+    if (frozenConfig && frozenConfigBytes) {
+      await writeFile(resolve(cohortDirectory, 'baseline.json'), frozenConfigBytes);
+    } else {
+      await writeFile(resolve(cohortDirectory, 'baseline.json'),
+        JSON.stringify(renderThroughputBaseline(registry, manifest), null, 2) + '\n');
+    }
+    const provenance = frozenConfigHash ? {
+      schema_version: 1,
+      frozen_submitted_config_sha256: frozenConfigHash,
+      baseline_config_sha256: frozenConfigHash,
+      candidate_configs: [] as Array<{
+        comparison_id: string; candidate_id: string; config_path: string; config_sha256: string; delta_paths: string[];
+      }>,
+    } : undefined;
     for (const comparison of manifest.comparisons as Comparison[]) {
       if (!isRecord(comparison) || typeof comparison.id !== 'string' || !/^[a-z0-9-]+$/.test(comparison.id) ||
           !Array.isArray(comparison.candidates)) throw new Error('invalid comparison in ' + cohort);
@@ -582,9 +714,26 @@ async function main(args: string[]): Promise<void> {
         if (!isRecord(selectedCandidate) || typeof selectedCandidate.id !== 'string' || !/^[a-z0-9_-]+$/.test(selectedCandidate.id)) {
           throw new Error('invalid candidate in ' + outputName + '/' + comparison.id);
         }
-        const config = renderThroughputConfig(registry, manifest, comparison.id, selectedCandidate.id);
-        await writeFile(resolve(directory, selectedCandidate.id + '.json'), JSON.stringify(config, null, 2) + '\n');
+        const frozenRender = frozenConfig
+          ? renderFrozenThroughputConfig(frozenConfig, manifest, comparison.id, selectedCandidate.id)
+          : undefined;
+        const config = frozenRender?.config ?? renderThroughputConfig(registry, manifest, comparison.id, selectedCandidate.id);
+        const outputBytes = Buffer.from(JSON.stringify(config, null, 2) + '\n');
+        const outputPath = resolve(directory, selectedCandidate.id + '.json');
+        await writeFile(outputPath, outputBytes);
+        if (provenance && frozenRender) {
+          provenance.candidate_configs.push({
+            comparison_id: comparison.id,
+            candidate_id: selectedCandidate.id,
+            config_path: comparison.id + '/' + selectedCandidate.id + '.json',
+            config_sha256: sha256(outputBytes),
+            delta_paths: frozenRender.delta_paths,
+          });
+        }
       }
+    }
+    if (provenance) {
+      await writeFile(resolve(cohortDirectory, 'render-provenance.json'), JSON.stringify(provenance, null, 2) + '\n');
     }
   }
 }

@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import test from 'node:test';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { buildThroughputManifests, renderThroughputBaseline, renderThroughputConfig } from './throughput-sweeps.js';
+import { buildThroughputManifests, renderFrozenThroughputConfig, renderThroughputBaseline, renderThroughputConfig } from './throughput-sweeps.js';
 
 function at(value: unknown, path: string[]): unknown {
   let current = value;
@@ -475,6 +476,159 @@ test('renders candidate overlays as OAT configs without changing the baseline or
   assert.throws(() => renderThroughputConfig({ ...base, tunables: {} }, manifests[0], 'codec', 'snappy'), /manifest seed/);
 });
 
+
+test('renders frozen submitted configs with only candidate-declared changes and exact delta paths', () => {
+  const seed = JSON.parse(readFileSync(new URL('../../docs/experiments/arrowcol-oat/oat-config.tuned.json', import.meta.url), 'utf8')) as Record<string, unknown>;
+  const manifests = buildThroughputManifests(seed);
+  const frozen = structuredClone(seed);
+  const client = at(frozen, ['tunables', 'client']) as Record<string, unknown>;
+  client.workers = 5;
+  client.streams_per_worker = 3;
+  client.connections_per_worker = 2;
+  const platform = at(frozen, ['platform']) as Record<string, unknown>;
+  platform.local = { collector_memory_limit_bytes: 3_221_225_472 };
+  frozen.warmup_seconds = 13;
+  frozen.measure_seconds = 90;
+  frozen.rows_per_table = 32_768;
+  frozen.overload_guard = { enabled: true, cap_fraction: 0.80, zero_progress_windows: 1 };
+  const maintenance = at(frozen, ['tunables', 'maintenance']) as Record<string, unknown>;
+  Object.assign(maintenance, {
+    enabled: true, apply: true, operations: ['optimize', 'purge', 'vacuum', 'checkpoint', 'prune_log'],
+    interval_secs: 45, max_idle_backoff_secs: 45,
+  });
+  const parquetWriter = at(frozen, ['tunables', 'parquet_writer']) as Record<string, unknown>;
+  const parquetDefaults = at(frozen, ['tunables', 'parquet_writer', 'defaults']) as Record<string, unknown>;
+  parquetDefaults.compression = 'zstd';
+  parquetDefaults.compression_level = 3;
+  parquetWriter.max_row_group_rows = 16_384;
+  const collector = at(frozen, ['tunables', 'collector']) as Record<string, unknown>;
+  collector.layout = { enabled: true, row_group_rows: 16_384 };
+  const original = structuredClone(frozen);
+
+  const c5 = manifests.find(item => item.cohort === 'C5')!;
+  const workers = renderFrozenThroughputConfig(frozen, c5, 'workers', 'workers-32');
+  assert.equal(at(workers.config, ['tunables', 'client', 'workers']), 32);
+  assert.equal(at(workers.config, ['tunables', 'client', 'streams_per_worker']), 3);
+  assert.equal(at(workers.config, ['tunables', 'client', 'connections_per_worker']), 2);
+  assert.equal(workers.config.measure_seconds, 90);
+  assert.equal(workers.config.warmup_seconds, 13);
+  assert.equal(workers.config.rows_per_table, 32_768);
+  assert.equal(at(workers.config, ['platform', 'local', 'collector_memory_limit_bytes']), 3_221_225_472);
+  assert.deepEqual(workers.config.overload_guard, { enabled: true, cap_fraction: 0.80, zero_progress_windows: 1 });
+  assert.equal(at(workers.config, ['tunables', 'maintenance', 'interval_secs']), 45);
+  assert.deepEqual(workers.delta_paths, ['/tunables/client/workers']);
+
+  const c3 = manifests.find(item => item.cohort === 'C3')!;
+  const rowGroups = renderFrozenThroughputConfig(frozen, c3, 'row-groups', 'row-group-65536');
+  assert.deepEqual(rowGroups.delta_paths, [
+    '/tunables/collector/layout/row_group_rows', '/tunables/parquet_writer/max_row_group_rows',
+  ]);
+  assert.equal(at(rowGroups.config, ['tunables', 'collector', 'layout', 'row_group_rows']), 65_536);
+  assert.equal(at(rowGroups.config, ['tunables', 'parquet_writer', 'max_row_group_rows']), 65_536);
+
+  const c1 = manifests.find(item => item.cohort === 'C1')!;
+  const snappy = renderFrozenThroughputConfig(frozen, c1, 'codec-snappy-lz4raw', 'snappy');
+  assert.equal(at(snappy.config, ['tunables', 'parquet_writer', 'defaults', 'compression']), 'snappy');
+  assert.equal(at(snappy.config, ['tunables', 'parquet_writer', 'defaults', 'compression_level']), null);
+  assert.deepEqual(snappy.delta_paths, [
+    '/tunables/parquet_writer/defaults/compression', '/tunables/parquet_writer/defaults/compression_level',
+  ]);
+  assert.deepEqual(frozen, original);
+});
+
+test('rejects invalid frozen configs and non-JSON candidate overrides', () => {
+  const seed = JSON.parse(readFileSync(new URL('../../docs/experiments/arrowcol-oat/oat-config.tuned.json', import.meta.url), 'utf8')) as Record<string, unknown>;
+  const manifest = buildThroughputManifests(seed).find(item => item.cohort === 'C5')!;
+  assert.throws(() => renderFrozenThroughputConfig({ tunables: null }, manifest, 'workers', 'workers-32'), /frozen config/);
+  const invalidManifest = structuredClone(manifest);
+  const comparisons = invalidManifest.comparisons as Array<{
+    id: string; candidates: Array<{ id: string; overrides: Record<string, unknown> }>;
+  }>;
+  const workerComparison = comparisons.find(item => item.id === 'workers')!;
+  const selected = workerComparison.candidates.find(item => item.id === 'workers-32')!;
+  const overrideTunables = selected.overrides.tunables as Record<string, unknown>;
+  const overrideClient = overrideTunables.client as Record<string, unknown>;
+  overrideClient.workers = Number.NaN;
+  assert.throws(() => renderFrozenThroughputConfig(seed, invalidManifest, 'workers', 'workers-32'), /non-JSON candidate overrides/);
+});
+
+test('CLI verifies frozen bytes and records baseline, output hashes, and delta paths', () => {
+  const repositoryRoot = fileURLToPath(new URL('../..', import.meta.url));
+  const script = fileURLToPath(new URL('./throughput-sweeps.ts', import.meta.url));
+  const manifestDirectory = fileURLToPath(new URL('../../docs/experiments/arrowcol-oat/', import.meta.url));
+  const registry = fileURLToPath(new URL('../../docs/experiments/arrowcol-oat/oat-config.tuned.json', import.meta.url));
+  const temporaryDirectory = mkdtempSync(join(tmpdir(), 'oat-frozen-cli-'));
+  const frozenConfigPath = join(temporaryDirectory, 'frozen-submitted-oat.json');
+  const output = join(temporaryDirectory, 'rendered');
+  const invokeCli = (...args: string[]) => spawnSync(process.execPath, ['--import', 'tsx', script, ...args], {
+    cwd: repositoryRoot, encoding: 'utf8',
+  });
+  try {
+    const frozen = JSON.parse(readFileSync(registry, 'utf8')) as Record<string, unknown>;
+    const client = at(frozen, ['tunables', 'client']) as Record<string, unknown>;
+    client.workers = 5;
+    client.streams_per_worker = 3;
+    client.connections_per_worker = 2;
+    frozen.warmup_seconds = 13;
+    frozen.measure_seconds = 90;
+    frozen.rows_per_table = 32_768;
+    const platform = at(frozen, ['platform']) as Record<string, unknown>;
+    platform.local = { collector_memory_limit_bytes: 3_221_225_472 };
+    const maintenance = at(frozen, ['tunables', 'maintenance']) as Record<string, unknown>;
+    Object.assign(maintenance, {
+      enabled: true, apply: true, operations: ['optimize', 'purge', 'vacuum', 'checkpoint', 'prune_log'],
+      interval_secs: 45, max_idle_backoff_secs: 45,
+    });
+    frozen.overload_guard = { enabled: true, cap_fraction: 0.80, zero_progress_windows: 1 };
+    const frozenBytes = Buffer.from(JSON.stringify(frozen, null, 2) + '\n');
+    writeFileSync(frozenConfigPath, frozenBytes);
+    const expectedHash = createHash('sha256').update(frozenBytes).digest('hex');
+    const args = [
+      '--registry', join(temporaryDirectory, 'unused-registry.json'), '--render-all', '--manifests', manifestDirectory, '--out', output,
+      '--frozen-config', frozenConfigPath, '--frozen-config-sha256', expectedHash,
+    ];
+    const rendered = invokeCli(...args);
+    assert.equal(rendered.error, undefined);
+    assert.equal(rendered.status, 0, rendered.stderr || rendered.stdout);
+    assert.deepEqual(readFileSync(join(output, 'C5', 'baseline.json')), frozenBytes);
+
+    const workerPath = join(output, 'C5', 'workers', 'workers-32.json');
+    const workerBytes = readFileSync(workerPath);
+    const worker = JSON.parse(workerBytes.toString('utf8')) as Record<string, unknown>;
+    assert.equal(at(worker, ['tunables', 'client', 'workers']), 32);
+    assert.equal(at(worker, ['tunables', 'client', 'streams_per_worker']), 3);
+    assert.equal(at(worker, ['tunables', 'client', 'connections_per_worker']), 2);
+    assert.equal(worker.measure_seconds, 90);
+    assert.equal(worker.warmup_seconds, 13);
+    assert.equal(worker.rows_per_table, 32_768);
+    assert.equal(at(worker, ['platform', 'local', 'collector_memory_limit_bytes']), 3_221_225_472);
+    assert.equal(at(worker, ['tunables', 'maintenance', 'interval_secs']), 45);
+
+    const provenance = JSON.parse(readFileSync(join(output, 'C5', 'render-provenance.json'), 'utf8')) as {
+      frozen_submitted_config_sha256: string; baseline_config_sha256: string;
+      candidate_configs: Array<{ comparison_id: string; candidate_id: string; config_path: string; config_sha256: string; delta_paths: string[] }>;
+    };
+    assert.equal(provenance.frozen_submitted_config_sha256, expectedHash);
+    assert.equal(provenance.baseline_config_sha256, expectedHash);
+    const workerEntry = provenance.candidate_configs.find(item => item.comparison_id === 'workers' && item.candidate_id === 'workers-32');
+    assert.ok(workerEntry);
+    assert.equal(workerEntry.config_path, 'workers/workers-32.json');
+    assert.equal(workerEntry.config_sha256, createHash('sha256').update(workerBytes).digest('hex'));
+    assert.deepEqual(workerEntry.delta_paths, ['/tunables/client/workers']);
+
+    const invalidHash = invokeCli(...args.slice(0, -1), 'not-a-hash');
+    assert.equal(invalidHash.status, 1);
+    assert.match(invalidHash.stderr, /64-character SHA-256/);
+    const mismatch = invokeCli(...args.slice(0, -1), '0'.repeat(64));
+    assert.equal(mismatch.status, 1);
+    assert.match(mismatch.stderr, /SHA-256 mismatch/);
+    const missingHash = invokeCli(...args.slice(0, -2));
+    assert.equal(missingHash.status, 1);
+    assert.match(missingHash.stderr, /must be supplied together/);
+  } finally {
+    rmSync(temporaryDirectory, { recursive: true, force: true });
+  }
+});
 
 test('CLI selects the C5 gRPC supplement without overwriting the frozen C5 manifest', () => {
   const repositoryRoot = fileURLToPath(new URL('../..', import.meta.url));
