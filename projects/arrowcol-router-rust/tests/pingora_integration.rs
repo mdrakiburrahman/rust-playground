@@ -1148,6 +1148,7 @@ fn test_config(listen: SocketAddr, state_directory: String) -> RouterConfig {
             oat_run_id: None,
             readiness_max_staleness_ms: 300_000,
             distinct_table_owners: false,
+            shard_count: 1,
         },
         auth: AuthConfig {
             authenticator: arrowcol_router_rust::AuthenticatorMode::DevOnlyAllowAll,
