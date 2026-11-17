@@ -345,10 +345,61 @@ test('actual Rust native pod/cAdvisor producer bytes cross the authenticated imm
   assert.match(measured.authorization, /hold/);
 });
 
+test('raw submitted bytes must match the server identity, not merely equivalent JSON or a source label', async t => {
+  const raw = Buffer.from('{\n  "rows_per_table": 10, "note": "\\u03bb"\n}\n');
+  for (const defect of ['none', 'missing', 'reserialized', 'oversize'] as const) {
+    await t.test(defect, async t => {
+      const f = syntheticAuthenticatedTransport(t);
+      f.document.submitted_config_sha256 = hash(raw);
+      f.inventory.official_measurement!.submitted_config_sha256 = hash(raw);
+      f.publishSyntheticDocument();
+      const supplied = defect === 'missing' ? undefined : defect === 'reserialized'
+        ? Buffer.from(JSON.stringify(JSON.parse(raw.toString('utf8')) as unknown))
+        : defect === 'oversize' ? new Uint8Array(2_097_153) : raw;
+      const observed = await readOfficialCellMeasurement({ ...f.options, submittedConfigBytes: supplied });
+      assert.equal(observed.unavailableReasons.some(reason => reason.startsWith('submitted_config_bytes_')), defect !== 'none');
+      assert.equal(observed.submittedConfigIdentity, defect === 'none' ? 'verified_exact_server_bytes' : 'unknown');
+      assert.equal(observed.committedRowsPerSecond, 1234);
+    });
+  }
+});
+
+test('real raw POST/GET identity crosses Rust immutable publication, custody and the native reader without JSON reconstruction', {
+  skip: !process.env.OAT_OFFLINE_RAW_IDENTITY_FIXTURE,
+}, async t => {
+  const proof = JSON.parse(await readFile(process.env.OAT_OFFLINE_RAW_IDENTITY_FIXTURE!, 'utf8')) as {
+    fixture_source: string; cases: { submitted_config_body: string; official_measurement_utf8: string }[];
+  };
+  assert.equal(proof.fixture_source, 'retained_loopback_post_get');
+  assert.equal(proof.cases.length, 2);
+  assert.deepEqual(JSON.parse(proof.cases[0]!.submitted_config_body) as unknown,
+    JSON.parse(proof.cases[1]!.submitted_config_body) as unknown);
+  assert.notEqual(hash(proof.cases[0]!.submitted_config_body), hash(proof.cases[1]!.submitted_config_body));
+  for (const entry of proof.cases) {
+    const f = syntheticAuthenticatedTransport(t, Buffer.from(entry.official_measurement_utf8));
+    const exactBytes = Buffer.from(entry.submitted_config_body, 'utf8');
+    const matched = await readOfficialNativeWindow({ ...f.options, submittedConfigBytes: exactBytes });
+    assert.equal(matched.original.submittedConfigIdentity, 'verified_exact_server_bytes');
+    assert.equal(matched.original.reference.submitted_config_sha256, hash(exactBytes));
+    assert.notEqual(matched.original.reference.effective_config_sha256, hash(exactBytes));
+    assert.equal(matched.original.startMs, 1_000);
+    assert.equal(matched.original.endMs, 31_000);
+    assert.equal(matched.original.committedRowsPerSecond, null);
+    assert.match(matched.authorization, /hold/);
+    const otherBytes = Buffer.from(proof.cases.find(other => other !== entry)!.submitted_config_body, 'utf8');
+    const mismatch = await readOfficialNativeWindow({ ...f.options, submittedConfigBytes: otherBytes });
+    assert.equal(mismatch.original.submittedConfigIdentity, 'unknown');
+    assert.ok(mismatch.original.unavailableReasons.includes('submitted_config_bytes_differ_from_server_identity'));
+    const missing = await readOfficialNativeWindow(f.options);
+    assert.equal(missing.original.submittedConfigIdentity, 'unknown');
+    assert.ok(missing.original.unavailableReasons.includes('submitted_config_bytes_unavailable'));
+  }
+});
+
 test('immutable measurement reader uses selected authenticated storage and cannot authorize an unpaired scale trial', async t => {
   const f = syntheticAuthenticatedTransport(t), observed = await f.read();
   assert.equal(observed.committedRowsPerSecond, 1234);
-  assert.deepEqual(observed.unavailableReasons, []);
+  assert.deepEqual(observed.unavailableReasons, ['submitted_config_bytes_unavailable']);
   assert.deepEqual(f.counts(), { reads: 1, tokenReads: 1 });
   const envelope: ScaleMeasurementEnvelope = { schema_version: 2, campaign_id: campaignId, cell_run_id: cellId,
     observed_at_ms: observed.endMs!, window_ms: observed.endMs! - observed.startMs!,

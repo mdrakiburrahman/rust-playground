@@ -3,6 +3,30 @@ const OFFICIAL_MEASUREMENT_SCOPE: &str = "original_official_cell_window_not_pair
 const OFFICIAL_MEASUREMENT_PUBLICATION_SECONDS: u64 = 20;
 const OFFICIAL_MEASUREMENT_RETENTION_RESERVE_SECONDS: u64 = 10;
 
+#[derive(Clone, Debug)]
+struct SubmittedConfigIdentity {
+    orchestration_run_id: String,
+    sha256: String,
+}
+
+async fn capture_submitted_config_identity(state: &AppState, orchestration_run_id: &str) -> Option<SubmittedConfigIdentity> {
+    let runs = state.runs.lock().await;
+    let status = runs.get(orchestration_run_id);
+    match status {
+        Some(status) if status.id == orchestration_run_id && valid_submitted_config_sha256(&status.config_sha256) => {
+            Some(SubmittedConfigIdentity { orchestration_run_id: status.id.clone(), sha256: status.config_sha256.clone() })
+        }
+        _ => {
+            tracing::warn!("original server run has no matching authoritative submitted config identity; identity remains UNKNOWN");
+            None
+        }
+    }
+}
+
+fn valid_submitted_config_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 fn official_measurement_blob(inventory: &RunInventory) -> Result<String> {
     let destination = inventory.evidence_destination.as_ref().context("official measurement has no custody destination")?;
     Ok(format!("{}/official-cell-measurement-v1.json", destination.blob_prefix))
@@ -34,7 +58,9 @@ fn validate_official_measurement_reference(inventory: &RunInventory) -> Result<(
     Ok(())
 }
 
-fn official_measurement_bytes(inventory: &RunInventory, config: &OatConfig, rows: &[OatResult]) -> Result<Vec<u8>> {
+fn official_measurement_bytes(
+    inventory: &RunInventory, config: &OatConfig, rows: &[OatResult], submitted: Option<&SubmittedConfigIdentity>,
+) -> Result<Vec<u8>> {
     let [row] = rows else { bail!("official campaign measurement requires exactly one original hot-table result") };
     let tunables: Value = serde_json::from_str(&row.tunables_json)?;
     if row.run_id != inventory.cell_run_id
@@ -61,7 +87,9 @@ fn official_measurement_bytes(inventory: &RunInventory, config: &OatConfig, rows
             "orchestration_run_id": inventory.orchestration_run_id, "cell_run_id": inventory.cell_run_id,
             "namespace_uid": inventory.namespace.uid,
         },
-        "submitted_config_sha256": null,
+        "submitted_config_sha256": submitted.filter(|identity| {
+            identity.orchestration_run_id == inventory.orchestration_run_id && valid_submitted_config_sha256(&identity.sha256)
+        }).map(|identity| identity.sha256.as_str()),
         "effective_config_json": effective_config_json,
         "effective_config_sha256": fixture_sha256(effective_config_json.as_bytes()),
         "source_revision": source_revision,
@@ -142,7 +170,7 @@ async fn publish_campaign_official_measurement(
             platform, &identity, &cached.orchestration_run_id, publication_deadline.saturating_duration_since(tokio::time::Instant::now()),
         ).await?;
         current.assert_custody_ready(platform.campaign_cli_paths()?).await?;
-        let bytes = official_measurement_bytes(&current, config, rows)?;
+        let bytes = official_measurement_bytes(&current, config, rows, platform.submitted_config.as_ref())?;
         let payload: Value = serde_json::from_slice(&bytes)?;
         let destination = current.evidence_destination.as_ref().context("official measurement destination is missing")?;
         let blob = official_measurement_blob(&current)?;
@@ -154,7 +182,7 @@ async fn publish_campaign_official_measurement(
         next.official_measurement = Some(InventoryOfficialMeasurement {
             schema_version: 1, blob, etag, version, sha256: fixture_sha256(&bytes), byte_length: bytes.len() as u64,
             effective_config_sha256: payload["effective_config_sha256"].as_str().context("effective config digest missing")?.to_owned(),
-            submitted_config_sha256: None,
+            submitted_config_sha256: payload["submitted_config_sha256"].as_str().map(str::to_owned),
             source_revision: payload["source_revision"].as_str().map(str::to_owned),
             measurement_start_unix_ms: output["measurement_start_unix_ms"].as_u64(),
             measurement_end_unix_ms: output["measurement_end_unix_ms"].as_u64(),
@@ -169,9 +197,13 @@ mod official_cell_measurement_tests {
     use super::*;
 
     fn original_measurement() -> Result<(OatConfig, RunInventory, Vec<OatResult>)> {
-        let mut config: OatConfig = serde_json::from_str(include_str!(
+        let config: OatConfig = serde_json::from_str(include_str!(
             "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
         ))?;
+        original_measurement_for_config(config, "c0ffee00-0000-4000-8000-000000000004")
+    }
+
+    fn original_measurement_for_config(mut config: OatConfig, orchestration_id: &str) -> Result<(OatConfig, RunInventory, Vec<OatResult>)> {
         config.tables.truncate(1);
         let identity = CampaignIdentity {
             campaign_id: "c0ffee00-0000-4000-8000-000000000001".to_owned(),
@@ -180,7 +212,7 @@ mod official_cell_measurement_tests {
         };
         let cell = "c0ffee00-0000-4000-8000-000000000003";
         let inventory = initial_campaign_inventory(
-            &identity, "c0ffee00-0000-4000-8000-000000000004", cell,
+            &identity, orchestration_id, cell,
             &format!("oat-{}", cell.replace('-', "")), "arrowcollector12345", "checkpoints",
             CampaignCellBudget {
                 effective_stop_budgets: config.maintenance_stop_budget()?,
@@ -202,10 +234,82 @@ mod official_cell_measurement_tests {
         Ok((config, inventory, rows))
     }
 
+    #[tokio::test]
+    async fn submitted_identity_is_captured_once_from_the_exact_server_run_and_published_immutably() -> Result<()> {
+        let external = std::env::var_os("OAT_OFFLINE_RAW_SUBMISSION_FIXTURE");
+        let cases: Vec<Value> = if let Some(path) = &external {
+            serde_json::from_slice(&fs::read(path)?)?
+        } else {
+            let raw = include_str!("../../../docs/experiments/arrowcol-oat/oat-config.quick.json");
+            vec![json!({
+                "submitted_config_body": raw,
+                "post": {"id": "c0ffee00-0000-4000-8000-000000000004", "config_sha256": fixture_sha256(raw.as_bytes())},
+                "get": {"id": "c0ffee00-0000-4000-8000-000000000004", "config_sha256": fixture_sha256(raw.as_bytes())},
+            })]
+        };
+        assert!(!cases.is_empty());
+        let mut proofs = Vec::new();
+        for case in cases {
+            let raw = case["submitted_config_body"].as_str().context("missing exact submitted body")?;
+            let id = case["post"]["id"].as_str().context("missing actual server run id")?;
+            let server_sha = case["post"]["config_sha256"].as_str().context("missing server hash")?;
+            assert_eq!(case["get"]["id"], id);
+            assert_eq!(case["get"]["config_sha256"], server_sha);
+            assert_eq!(fixture_sha256(raw.as_bytes()), server_sha);
+            let submitted: OatConfig = serde_json::from_str(raw)?;
+            submitted.validate()?;
+            let (config, inventory, rows) = original_measurement_for_config(submitted, id)?;
+            let state = AppState::default();
+            assert!(capture_submitted_config_identity(&state, id).await.is_none());
+            state.runs.lock().await.insert(id.to_owned(), crate::model::RunStatus {
+                id: id.to_owned(), config_sha256: server_sha.to_owned(), state: crate::model::RunState::Running,
+                progress: "synthetic offline original-cell proof".to_owned(), result_count: 0,
+                error: None, started_at_unix_ms: 1_000, finished_at_unix_ms: None,
+            });
+            let identity = capture_submitted_config_identity(&state, id).await.context("missing captured identity")?;
+            assert!(capture_submitted_config_identity(&state, &inventory.cell_run_id).await.is_none());
+            {
+                let mut runs = state.runs.lock().await;
+                let status = runs.get_mut(id).context("missing original status")?;
+                status.id = inventory.cell_run_id.clone();
+            }
+            assert!(capture_submitted_config_identity(&state, id).await.is_none());
+            for malformed in ["", "not-a-hash", &"A".repeat(64)] {
+                let mut runs = state.runs.lock().await;
+                let status = runs.get_mut(id).context("missing original status")?;
+                status.id = id.to_owned();
+                status.config_sha256 = malformed.to_owned();
+                drop(runs);
+                assert!(capture_submitted_config_identity(&state, id).await.is_none());
+            }
+            let bytes = official_measurement_bytes(&inventory, &config, &rows, Some(&identity))?;
+            let payload: Value = serde_json::from_slice(&bytes)?;
+            assert_eq!(payload["submitted_config_sha256"], server_sha);
+            assert_ne!(payload["effective_config_sha256"], server_sha);
+            let mut foreign = identity.clone();
+            foreign.orchestration_run_id = inventory.cell_run_id.clone();
+            let refused: Value = serde_json::from_slice(&official_measurement_bytes(&inventory, &config, &rows, Some(&foreign))?)?;
+            assert!(refused["submitted_config_sha256"].is_null());
+            let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+            let path = ObjectPath::from(official_measurement_blob(&inventory)?);
+            publish_immutable_official_bytes(Arc::clone(&store), &path, &bytes).await?;
+            let retained = store.get_opts(&path, GetOptions::default()).await?.bytes().await?;
+            assert_eq!(retained.as_ref(), bytes);
+            let other: Value = serde_json::from_slice(&official_measurement_bytes(&inventory, &config, &rows, None)?)?;
+            assert!(publish_immutable_official_bytes(store, &path, fixture_canonical_json(&other)?.as_bytes()).await.is_err());
+            proofs.push(json!({ "submitted_config_body": raw, "official_measurement_utf8": String::from_utf8(bytes)? }));
+        }
+        println!("D46_RAW_IDENTITY_PRODUCER_BYTES {}", serde_json::to_string(&json!({
+            "fixture_source": if external.is_some() { "retained_loopback_post_get" } else { "synthetic_state_invariant" },
+            "cases": proofs,
+        }))?);
+        Ok(())
+    }
+
     #[test]
     fn official_producer_retains_the_original_window_and_missing_submitted_identity() -> Result<()> {
         let (mut config, inventory, rows) = original_measurement()?;
-        let bytes = official_measurement_bytes(&inventory, &config, &rows)?;
+        let bytes = official_measurement_bytes(&inventory, &config, &rows, None)?;
         let payload: Value = serde_json::from_slice(&bytes)?;
         let original: Value = serde_json::from_str(rows[0].evidence_json.as_deref().context("missing evidence")?)?;
         assert_eq!(payload["official_result"]["evidence"]["commit_window_output_throughput"], original["commit_window_output_throughput"]);
@@ -213,11 +317,11 @@ mod official_cell_measurement_tests {
         let effective = payload["effective_config_json"].as_str().context("missing effective config")?;
         assert_eq!(payload["effective_config_sha256"], fixture_sha256(effective.as_bytes()));
         config.schedule_lead_seconds += 1;
-        let changed: Value = serde_json::from_slice(&official_measurement_bytes(&inventory, &config, &rows)?)?;
+        let changed: Value = serde_json::from_slice(&official_measurement_bytes(&inventory, &config, &rows, None)?)?;
         assert_ne!(payload["effective_config_sha256"], changed["effective_config_sha256"]);
         let mut wrong = inventory;
         wrong.cell_run_id = "c0ffee00-0000-4000-8000-000000000099".to_owned();
-        assert!(official_measurement_bytes(&wrong, &config, &rows).is_err());
+        assert!(official_measurement_bytes(&wrong, &config, &rows, None).is_err());
         println!("D46_OFFICIAL_PRODUCER_BYTES {}", String::from_utf8(bytes)?);
         Ok(())
     }
@@ -225,7 +329,7 @@ mod official_cell_measurement_tests {
     #[tokio::test]
     async fn official_publication_is_create_only_and_never_adopts_different_bytes() -> Result<()> {
         let (config, inventory, rows) = original_measurement()?;
-        let bytes = official_measurement_bytes(&inventory, &config, &rows)?;
+        let bytes = official_measurement_bytes(&inventory, &config, &rows, None)?;
         let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
         let path = ObjectPath::from(official_measurement_blob(&inventory)?);
         let first = publish_immutable_official_bytes(Arc::clone(&store), &path, &bytes).await?;
