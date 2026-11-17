@@ -347,18 +347,20 @@ test('actual Rust native pod/cAdvisor producer bytes cross the authenticated imm
 
 test('raw submitted bytes must match the server identity, not merely equivalent JSON or a source label', async t => {
   const raw = Buffer.from('{\n  "rows_per_table": 10, "note": "\\u03bb"\n}\n');
-  for (const defect of ['none', 'missing', 'reserialized', 'oversize'] as const) {
+  for (const defect of ['none', 'boundary', 'missing', 'reserialized', 'oversize'] as const) {
     await t.test(defect, async t => {
       const f = syntheticAuthenticatedTransport(t);
-      f.document.submitted_config_sha256 = hash(raw);
-      f.inventory.official_measurement!.submitted_config_sha256 = hash(raw);
+      const size = defect === 'boundary' ? 2_097_152 : defect === 'oversize' ? 2_097_153 : raw.byteLength;
+      const submitted = Buffer.concat([raw, Buffer.alloc(size - raw.byteLength, 0x20)]);
+      f.document.submitted_config_sha256 = hash(submitted);
+      f.inventory.official_measurement!.submitted_config_sha256 = hash(submitted);
       f.publishSyntheticDocument();
       const supplied = defect === 'missing' ? undefined : defect === 'reserialized'
-        ? Buffer.from(JSON.stringify(JSON.parse(raw.toString('utf8')) as unknown))
-        : defect === 'oversize' ? new Uint8Array(2_097_153) : raw;
+        ? Buffer.from(JSON.stringify(JSON.parse(raw.toString('utf8')) as unknown)) : submitted;
       const observed = await readOfficialCellMeasurement({ ...f.options, submittedConfigBytes: supplied });
-      assert.equal(observed.unavailableReasons.some(reason => reason.startsWith('submitted_config_bytes_')), defect !== 'none');
-      assert.equal(observed.submittedConfigIdentity, defect === 'none' ? 'verified_exact_server_bytes' : 'unknown');
+      const matching = defect === 'none' || defect === 'boundary';
+      assert.equal(observed.unavailableReasons.some(reason => reason.startsWith('submitted_config_bytes_')), !matching);
+      assert.equal(observed.submittedConfigIdentity, matching ? 'verified_exact_server_bytes' : 'unknown');
       assert.equal(observed.committedRowsPerSecond, 1234);
     });
   }
