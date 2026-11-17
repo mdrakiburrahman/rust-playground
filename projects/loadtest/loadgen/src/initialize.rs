@@ -42,11 +42,12 @@ const PLANNED_CONTROL_OPERATION_IDS: [&str; 13] = [
     "terminal-metadata-write",
     "terminal-release",
 ];
-const PLANNED_STORAGE_OPERATION_IDS: [&str; 5] = [
+const PLANNED_STORAGE_OPERATION_IDS: [&str; 6] = [
     "preflight-table-list",
     "preflight-log-list",
     "delta-v0-commit",
     "postwrite-table-list",
+    "delta-v0-last-checkpoint",
     "delta-v0-readback",
 ];
 

@@ -625,14 +625,17 @@ test('real loadgen initializer composes with the Node BR3 planned-identity paren
     '&startFrom=' + encodeURIComponent(deltaLogPrefix.slice(0, -1));
   const logListing = signedObjectRequest(authority, deadline, 15, 'GET', logListingUrl, '', [['x-arrowcol-operation-id', PLANNED_STORAGE_OPERATION_IDS[1]]]);
   const logUrl = `https://${account}.blob.core.windows.net/${container}/${listPrefix}_delta_log/00000000000000000000.json`;
+  const checkpointUrl = `https://${account}.blob.core.windows.net/${container}/${listPrefix}_delta_log/_last_checkpoint`;
   const deltaCommit = signedObjectRequest(authority, deadline, 16, 'PUT', logUrl, plan.delta_v0.body,
     [['if-none-match', '*'], ['x-ms-blob-type', 'BlockBlob'], ['content-length', String(Buffer.byteLength(plan.delta_v0.body, 'utf8'))],
       ['x-arrowcol-operation-id', PLANNED_STORAGE_OPERATION_IDS[2]]]);
   const postwriteListing = signedObjectRequest(authority, deadline, 17, 'GET', listUrl, '',
     [['x-arrowcol-operation-id', PLANNED_STORAGE_OPERATION_IDS[3]]]);
-  const deltaReadback = signedObjectRequest(authority, deadline, 18, 'GET', logUrl, '',
+  const deltaLastCheckpoint = signedObjectRequest(authority, deadline, 18, 'GET', checkpointUrl, '',
     [['x-arrowcol-operation-id', PLANNED_STORAGE_OPERATION_IDS[4]]]);
-  const envelope = envelopeForRequests(authority, [...controlRequests, initialListing, logListing, deltaCommit, postwriteListing, deltaReadback]);
+  const deltaReadback = signedObjectRequest(authority, deadline, 19, 'GET', logUrl, '',
+    [['x-arrowcol-operation-id', PLANNED_STORAGE_OPERATION_IDS[5]]]);
+  const envelope = envelopeForRequests(authority, [...controlRequests, initialListing, logListing, deltaCommit, postwriteListing, deltaLastCheckpoint, deltaReadback]);
   const custody = mutableCustodyStore(authority, now);
   const azure = { c: { account }, async token() { return 'offline-test-token'; } } as unknown as Azure;
   const ledgerPath = path.join(directory, 'storage-ledger.jsonl');
@@ -657,6 +660,7 @@ test('real loadgen initializer composes with the Node BR3 planned-identity paren
         deltaLogBody = typeof init.body === 'string' ? init.body : await new Response(init.body).text();
         return new Response(null, { status: 201, headers: { etag: '"delta-v0"' } });
       }
+      if (url.pathname.endsWith('/_delta_log/_last_checkpoint') && init?.method === 'GET') return new Response(null, { status: 404 });
       if (url.pathname.endsWith('/_delta_log/00000000000000000000.json') && init?.method === 'GET')
         return new Response(deltaLogBody ?? null, { status: deltaLogBody === undefined ? 404 : 200 });
       if (url.searchParams.get('comp') === 'list') {
