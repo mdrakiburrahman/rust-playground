@@ -129,6 +129,15 @@ fn owned_plan() -> arrowcol_loadgen::initialize::OwnedRunTablePlan {
         ]
         .map(str::to_owned)
         .to_vec(),
+        storage_operation_ids: [
+            "preflight-table-list",
+            "preflight-log-list",
+            "delta-v0-commit",
+            "postwrite-table-list",
+            "delta-v0-readback",
+        ]
+        .map(str::to_owned)
+        .to_vec(),
         table: "telemetry.sqlserver.sqlserver_availability_replica_states".into(),
         partition_by_ingestion_date: true,
         owner_id: ROTATED.into(),
