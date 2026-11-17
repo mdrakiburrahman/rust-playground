@@ -96,12 +96,19 @@ npx --no-install arrowcol-oat --config "$OAT_SMOKE_ROOT/config.json" --mode loca
 ```
 
 The one-second measurement still follows image/stack startup, trusted immutable
-pin initialization, whole-fleet preflight/QAP setup and a fixed 60-second schedule
-lead. The viewer stays open after completion until Ctrl+C. A successful smoke
+pin initialization, whole-fleet preflight/QAP setup and the schedule lead.
+The viewer stays open after completion until Ctrl+C. A successful smoke
 must have real positive committed rows in the exported dataset, not merely an
 upload acknowledgement. Parquet summary schema v2 remains unchanged: missing QAP
 measurements stay null; a completed pinning violation is published as failed
 pinning, while preparation/client/cleanup errors can abort before Parquet exists.
+
+| Scheduling setting / evidence | Contract |
+| --- | --- |
+| Top-level `schedule_lead_seconds` | Integer `1..=1800`, default `180` when omitted. This is the common lead from schedule creation to warm-up start and the **same original absolute timeout** for arming and full-fleet acknowledgment. Short leads are unqualified controls, not guaranteed deliverable schedules. |
+| Client compatibility | `client_ready_timeout_seconds + qap_timeout_seconds + schedule_lead_seconds` must fit the pinned `arrowcol-dmv --schedule-timeout-secs` ceiling of `2160`; invalid totals fail before effects. Client Job lifetime, minimum pin TTL and planned cell duration use that same selected lead with their unchanged margins. `run_pin_ttl_ms` must still cover the resulting minimum. |
+| Requested/effective proof | `tunables_json.schedule_lead_seconds` records the selected input (including its omitted-field default). `evidence_json.client_schedule` records requested/effective lead, actual assigned absolute phase boundaries, full-fleet acknowledgment time and derived lifetime budgets. It remains null without verified acknowledgment; missing/late delivery fails, is cancelled and is never replayed or relabelled ready. |
+| Scope | No existing C3 JSON/hash is changed. Reducing the lead does not shorten warm-up/measurement, maintenance, reconciliation, collector drain or the agreed stability/600-second pilot protocol, and does not qualify a shorter lead for that protocol. |
 
 | Retained output | Evidence / limits |
 | --- | --- |
