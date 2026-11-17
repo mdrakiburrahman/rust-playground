@@ -31,6 +31,29 @@ The service enforces metadata, schema, and protobuf message limits in addition
 to tonic's decoding limit. `DrainController` stops new admission, waits for
 active work, and force-cancels only after a caller-selected graceful timeout.
 
+## gRPC compression
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `collector.limits.grpc_accept_compression` | `none` | Accept identity requests plus the selected `gzip` or `zstd` request codec. |
+| `collector.limits.grpc_send_compression` | `none` | Compress responses with `gzip` or `zstd` only when the client advertises that codec. |
+
+OAT strictly parses these enum values and projects them through
+`ARROWCOL_COLLECTOR_LIMITS_CONFIG`. The dataflow receiver builds the shared
+`RuntimeLimits` before opening listeners. Direct embedded adapters set the
+corresponding `RuntimeLimits` fields to `None` or
+`Some(tonic::codec::CompressionEncoding::{Gzip,Zstd})`; all callers must use
+`into_tonic_service()` to apply codecs and message limits. Both codec features
+are compiled in; omitted settings still disable compression.
+
+Client `transport.grpc_send_compression` and
+`transport.grpc_accept_compression` configure the opposite ends independently.
+For example, client send `gzip` requires receiver accept `gzip`; receiver send
+`zstd` additionally requires client accept `zstd`. Selecting a codec does not
+enable it on the peer. Unknown names (including `brotli`) fail parsing rather
+than falling back. Message limits apply to decompressed protobuf bytes;
+schema validation, authentication and bounded admission remain unchanged.
+
 ## Server implementation APIs
 
 Direct collector adapters implement:

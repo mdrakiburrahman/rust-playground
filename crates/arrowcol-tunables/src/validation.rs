@@ -195,6 +195,8 @@ const CAPABILITIES: &[Capability] = &[
     capability!("collector.commit.max_files_per_commit", "64"),
     capability!("collector.commit.max_pending_files", "256"),
     capability!("collector.limits.max_metadata_bytes", "16384"),
+    capability!("collector.limits.grpc_accept_compression", "none"),
+    capability!("collector.limits.grpc_send_compression", "none"),
     capability!("collector.limits.max_schema_bytes", "1048576"),
     capability!("collector.limits.max_message_bytes", "16777216"),
     capability!("collector.limits.batch_channel_capacity", "4"),
@@ -2022,6 +2024,46 @@ mod tests {
         assert_eq!(
             tunables.environment_for(ComponentRole::Collector)?["ARROWCOL_COLLECTOR_CPU_PRESSURE"],
             "process"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn receiver_compression_is_strict_and_projected_separately_from_client() -> Result<()> {
+        for codec in ["none", "gzip", "zstd"] {
+            let tunables = Tunables::parse_oat_json(serde_json::json!({
+                "collector":{"limits":{"grpc_accept_compression":codec,"grpc_send_compression":"none"}},
+                "transport":{"grpc_send_compression":"none","grpc_accept_compression":"zstd"}
+            }))?;
+            let environment = tunables.environment_for(ComponentRole::Collector)?;
+            let limits: Value = serde_json::from_str(&environment["ARROWCOL_COLLECTOR_LIMITS_CONFIG"])?;
+            assert_eq!(limits["grpc_accept_compression"], codec);
+            assert_eq!(limits["grpc_send_compression"], "none");
+            let client = tunables.environment_for(ComponentRole::Client)?;
+            assert_eq!(client["ARROWCOL_CLIENT_GRPC_SEND_COMPRESSION"], "none");
+            assert_eq!(client["ARROWCOL_CLIENT_GRPC_ACCEPT_COMPRESSION"], "zstd");
+            assert!(!client.contains_key("ARROWCOL_COLLECTOR_LIMITS_CONFIG"));
+        }
+        for field in ["grpc_accept_compression", "grpc_send_compression"] {
+            for invalid in [
+                serde_json::json!("brotli"),
+                serde_json::json!("Gzip"),
+                serde_json::json!(""),
+                serde_json::json!(true),
+                serde_json::json!(["gzip"]),
+            ] {
+                assert!(
+                    Tunables::parse_oat_json(serde_json::json!({
+                        "collector":{"limits":{field:invalid}}
+                    }))
+                    .is_err()
+                );
+            }
+        }
+        assert!(
+            !Tunables::default()
+                .environment_for(ComponentRole::Collector)?
+                .contains_key("ARROWCOL_COLLECTOR_LIMITS_CONFIG")
         );
         Ok(())
     }

@@ -298,6 +298,8 @@ pub struct LayoutTunables {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LimitsTunables {
+    pub grpc_accept_compression: Option<GrpcCompression>,
+    pub grpc_send_compression: Option<GrpcCompression>,
     pub max_metadata_bytes: Option<usize>,
     pub max_schema_bytes: Option<usize>,
     pub max_message_bytes: Option<usize>,
