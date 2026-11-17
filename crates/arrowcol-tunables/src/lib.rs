@@ -43,6 +43,10 @@ pub struct ClientTunables {
     pub workers: Option<usize>,
     pub runtime_threads: Option<usize>,
     pub data_mode: Option<DataMode>,
+    pub data_profile: Option<ClientDataProfile>,
+    pub string_length_distribution: Option<ClientStringLengthDistribution>,
+    pub value_variation: Option<ClientValueVariation>,
+    pub guid_uniqueness: Option<ClientGuidUniqueness>,
     pub string_width: Option<usize>,
     pub cardinality: Option<usize>,
     pub null_fraction: Option<f64>,
@@ -52,6 +56,9 @@ pub struct ClientTunables {
     pub max_memory_bytes: Option<u64>,
     pub interval_us: Option<u64>,
     pub connections_per_worker: Option<usize>,
+    pub shard_index_mode: Option<ClientShardIndexMode>,
+    pub fixed_shard_index: Option<u8>,
+    pub pod_ordinal: Option<u32>,
     pub streams_per_worker: Option<usize>,
     pub max_rows: Option<u64>,
     pub stream_retry_max_attempts: Option<u32>,
@@ -355,6 +362,46 @@ pub enum DictionaryHandling {
 pub enum DataMode {
     Shared,
     Independent,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientDataProfile {
+    Diagnostic,
+    #[default]
+    Realistic,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientStringLengthDistribution {
+    #[default]
+    Fixed,
+    Uniform,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientValueVariation {
+    #[default]
+    Cardinality,
+    PerRow,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientGuidUniqueness {
+    #[default]
+    Cardinality,
+    PerRow,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientShardIndexMode {
+    #[default]
+    Fixed,
+    WorkerSpread,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]

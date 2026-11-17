@@ -361,6 +361,7 @@ fn request_metadata<T>(
     table: &DmvTable,
     signer: Option<&EdgeRequestSigner>,
     observation: Option<&SendObservation>,
+    shard_index: Option<u8>,
 ) -> Result<()> {
     let metadata = IngestMetadata::new(
         ProtocolVersion::CURRENT,
@@ -373,6 +374,12 @@ fn request_metadata<T>(
         headers.insert(
             http::header::HeaderName::from_static(key),
             http::HeaderValue::try_from(value)?,
+        );
+    }
+    if let Some(shard_index) = shard_index {
+        headers.insert(
+            http::header::HeaderName::from_static("x-arrowcol-shard"),
+            http::HeaderValue::try_from(shard_index.to_string())?,
         );
     }
     if let Some(run_id) = std::env::var_os(OAT_RUN_ID_ENV) {
@@ -444,7 +451,7 @@ async fn register(
         flight_descriptor: Some(descriptor),
         ..FlightData::default()
     }]));
-    request_metadata(&mut request, table, signer, None)?;
+    request_metadata(&mut request, table, signer, None, None)?;
     let response = client.do_put(request).await?;
     let completion = decode_ddl_completion_metadata(response.metadata())?;
     let mut results = response.into_inner();
@@ -477,7 +484,7 @@ async fn put(
         .try_collect::<Vec<_>>()
         .await?;
     let mut request = Request::new(stream::iter(encoded));
-    request_metadata(&mut request, table, signer, None)?;
+    request_metadata(&mut request, table, signer, None, None)?;
     completed_admission(client.do_put(request).await?.into_inner()).await
 }
 
@@ -551,8 +558,9 @@ mod tests {
         let verifier = arrowcol_router_rust::EdgeVerifier::new(key, 30_000)?;
         for _ in 0..2 {
             let mut request = Request::new(());
-            request_metadata(&mut request, &table, Some(&signer), None)?;
+            request_metadata(&mut request, &table, Some(&signer), None, Some(2))?;
             let headers = request.metadata().clone().into_headers();
+            assert_eq!(headers["x-arrowcol-shard"], "2");
             let now = UnixMillis::new(u64::try_from(
                 SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
             )?)?;
@@ -583,7 +591,14 @@ mod tests {
         std::fs::remove_dir_all(&directory)?;
         let verifier = arrowcol_router_rust::EdgeVerifier::new(router_key?, 30_000)?;
         let mut request = Request::new(());
-        request_metadata(&mut request, &table, Some(&signer?), None)?;
+        request_metadata(&mut request, &table, Some(&signer?), None, Some(0))?;
+        assert_eq!(
+            request
+                .metadata()
+                .get("x-arrowcol-shard")
+                .context("missing shard metadata")?,
+            "0"
+        );
         let now = UnixMillis::new(u64::try_from(
             SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
         )?)?;

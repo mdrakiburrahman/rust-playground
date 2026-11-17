@@ -10,6 +10,19 @@
 | Durability | Requested WAL class is recorded separately from consumer evidence. Nondefault weaker durability must not be compared as equivalent to durable configurations. |
 | Cleanup | Only run-owned resources/configuration are changed. Existing namespace, identity, pinning and cleanup guards remain required. Never delete a resource group to clean up an experiment. |
 
+## Client data profile, identity, and shard selection
+
+| Setting | Contract |
+| --- | --- |
+| `client.data_profile` | Strict `realistic` (default) or `diagnostic`. Realistic uses variable-width strings, per-row numeric/timestamp values, GUID uniqueness, and a fresh row identity in `endpoint_url`; diagnostic preserves the older replayable values and is not eligible for unique-delivery proof. |
+| Generation telemetry | `preparation.steady_state_generation` is `true` for realistic data because fresh identity-bearing frames are generated and encoded per logical send; it is `false` for diagnostic corpus replay. Startup generation rates do not represent the realistic hot path. |
+| `client.string_width` / `client.string_length_distribution` | Width defaults to 96 for realistic data; distribution defaults to `uniform` for realistic and `fixed` for diagnostic. The identity URL in realistic mode is additional required width and is included in reported uncompressed IPC bytes. |
+| `client.value_variation` / `client.guid_uniqueness` | Each accepts `cardinality` or `per_row`; realistic defaults to `per_row`, diagnostic to `cardinality`. Existing `client.cardinality`, `client.skew`, and `client.entropy` remain the shared distribution controls; required fixture columns are never nulled. |
+| `client.shard_index_mode` | Strict `fixed` (default) or `worker_spread`. Fixed mode uses `client.fixed_shard_index` (default 0); worker-spread mode uses `(pod_ordinal * workers + worker_id) mod router.shard_count`, with `client.pod_ordinal` defaulting to 0. `router.shard_count` is the only shard-count source and is projected to the client; the client rejects any selected index outside it. |
+| Logical row identity | Realistic rows encode `run_uuid`, client-incarnation UUID, worker, logical-batch sequence, and row ordinal in the existing `endpoint_url` value. Retries reuse the exact same values and encoded bytes; fresh sends and process restarts use disjoint identities. |
+| `logical_batch_manifest_v1` | The terminal `OAT_CLIENT_METRICS` receipt includes every logical batch's attempted count, acknowledgement/ambiguity outcome, retry count, and cohort. Cohorts use the exact half-open measurement interval `[start_unix_ms, end_unix_ms)`. Contiguous equivalent batches may be range-coalesced without changing their identities. |
+| Manifest limits | At most 1,000,000 logical batches and 1 MiB serialized terminal manifest. The complete `OAT_CLIENT_METRICS ` line, including its newline, is also capped at 1 MiB; oversized or incomplete evidence fails before completed output is emitted. Truncated manifests cannot qualify as a pass. |
+
 ## AKS per-role resources
 
 | Role | Default request | Default limit |

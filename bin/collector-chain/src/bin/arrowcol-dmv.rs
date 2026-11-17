@@ -85,10 +85,10 @@ async fn run(args: Args) -> Result<()> {
         options,
     )
     .await?;
-    println!("OAT_CLIENT_METRICS {}", client.metrics("prepared"));
+    println!("OAT_CLIENT_METRICS {}", client.metrics("prepared")?);
     let result = run_prepared(&args, &client).await;
     if result.is_err() {
-        eprintln!("OAT_CLIENT_METRICS {}", client.metrics("failed"));
+        eprintln!("OAT_CLIENT_METRICS {}", client.metrics("failed")?);
     }
     result
 }
@@ -151,6 +151,8 @@ async fn run_prepared(args: &Args, client: &std::sync::Arc<dmv::client::Prepared
         preflight_table_count
     };
     let (best_effort_streams, durable_streams) = client.admission_counts();
+    let terminal_metrics = client.metrics("completed")?;
+    client.ensure_terminal_manifest_complete()?;
     println!(
         "OAT_COLLECTOR_COMPLETION {}",
         serde_json::json!({
@@ -160,7 +162,7 @@ async fn run_prepared(args: &Args, client: &std::sync::Arc<dmv::client::Prepared
             "completed_at_unix_ms": unix_time_ms()?,
         })
     );
-    println!("OAT_CLIENT_METRICS {}", client.metrics("completed"));
+    println!("OAT_CLIENT_METRICS {terminal_metrics}");
     println!(
         "prepared {table_count} DMV tables; workers={} streams_per_worker={} batch_rows={}",
         client.options.workers, client.options.streams_per_worker, client.options.batch_rows

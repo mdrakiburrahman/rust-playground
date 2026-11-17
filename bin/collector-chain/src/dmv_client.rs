@@ -8,10 +8,14 @@ use clap::{Args, ValueEnum};
 use serde::Serialize;
 use std::sync::{
     Mutex,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::Instant;
 use tokio::task::JoinSet;
+
+const MAX_LOGICAL_BATCH_RECORDS: usize = 1_000_000;
+const MAX_LOGICAL_MANIFEST_BYTES: usize = 1_048_576;
+const MAX_OAT_CLIENT_METRICS_LINE_BYTES: usize = 1_048_576;
 
 #[derive(Clone, Copy, Debug, Default, Serialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
@@ -48,6 +52,49 @@ pub enum GrpcCompression {
     Zstd,
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize, ValueEnum, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DataProfile {
+    Diagnostic,
+    #[default]
+    Realistic,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, ValueEnum, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StringLengthDistribution {
+    #[default]
+    Fixed,
+    Uniform,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, ValueEnum, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ValueVariation {
+    #[default]
+    Cardinality,
+    #[value(name = "per_row")]
+    PerRow,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, ValueEnum, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GuidUniqueness {
+    #[default]
+    Cardinality,
+    #[value(name = "per_row")]
+    PerRow,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, ValueEnum, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ShardIndexMode {
+    #[default]
+    Fixed,
+    #[value(name = "worker_spread")]
+    WorkerSpread,
+}
+
 /// All settings are resolved and validated before allocation, registration, or connection.
 #[derive(Args, Clone, Debug, Serialize)]
 pub struct Options {
@@ -63,6 +110,14 @@ pub struct Options {
     pub runtime_threads: usize,
     #[arg(long, env = "ARROWCOL_CLIENT_DATA_MODE", value_enum, default_value_t = DataMode::Shared)]
     pub data_mode: DataMode,
+    #[arg(long, env = "ARROWCOL_CLIENT_DATA_PROFILE", value_enum, default_value_t = DataProfile::Realistic)]
+    pub data_profile: DataProfile,
+    #[arg(long, env = "ARROWCOL_CLIENT_STRING_LENGTH_DISTRIBUTION", value_enum)]
+    pub string_length_distribution: Option<StringLengthDistribution>,
+    #[arg(long, env = "ARROWCOL_CLIENT_VALUE_VARIATION", value_enum)]
+    pub value_variation: Option<ValueVariation>,
+    #[arg(long, env = "ARROWCOL_CLIENT_GUID_UNIQUENESS", value_enum)]
+    pub guid_uniqueness: Option<GuidUniqueness>,
     #[arg(long, env = "ARROWCOL_CLIENT_STRING_WIDTH", default_value_t = 0)]
     pub string_width: usize,
     #[arg(long, env = "ARROWCOL_CLIENT_CARDINALITY", default_value_t = 1024)]
@@ -81,6 +136,14 @@ pub struct Options {
     pub interval_us: u64,
     #[arg(long, env = "ARROWCOL_CLIENT_CONNECTIONS_PER_WORKER", default_value_t = 1)]
     pub connections_per_worker: usize,
+    #[arg(long, env = "ARROWCOL_CLIENT_SHARD_INDEX_MODE", value_enum, default_value_t = ShardIndexMode::Fixed)]
+    pub shard_index_mode: ShardIndexMode,
+    #[arg(long, env = "ARROWCOL_CLIENT_FIXED_SHARD_INDEX", default_value_t = 0)]
+    pub fixed_shard_index: u8,
+    #[arg(long, env = "ARROWCOL_CLIENT_POD_ORDINAL", default_value_t = 0)]
+    pub pod_ordinal: u32,
+    #[arg(long, env = "ARROWCOL_CLIENT_SHARD_COUNT", default_value_t = 1)]
+    pub shard_count: u8,
     /// Zero inherits the legacy --concurrency setting.
     #[arg(long, env = "ARROWCOL_CLIENT_STREAMS_PER_WORKER", default_value_t = 0)]
     pub streams_per_worker: usize,
@@ -168,6 +231,11 @@ impl Options {
             "workers": self.workers, "runtime_threads": self.runtime_threads,
             "batch_rows": self.batch_rows, "corpus_rows": self.corpus_rows,
             "corpus_bytes": self.corpus_bytes, "streams_per_worker": self.streams_per_worker,
+            "data_profile": self.data_profile, "string_width": self.string_width,
+            "string_length_distribution": self.string_length_distribution,
+            "value_variation": self.value_variation, "guid_uniqueness": self.guid_uniqueness,
+            "shard_index_mode": self.shard_index_mode, "fixed_shard_index": self.fixed_shard_index,
+            "pod_ordinal": self.pod_ordinal, "shard_count": self.shard_count,
             "stream_retry_max_attempts": self.stream_retry_max_attempts,
             "stream_retry_base_backoff_ms": self.stream_retry_base_backoff_ms,
             "stream_retry_max_backoff_ms": self.stream_retry_max_backoff_ms,
@@ -204,6 +272,21 @@ impl Options {
         if self.streams_per_worker == 0 {
             self.streams_per_worker = concurrency;
         }
+        self.string_length_distribution.get_or_insert(match self.data_profile {
+            DataProfile::Diagnostic => StringLengthDistribution::Fixed,
+            DataProfile::Realistic => StringLengthDistribution::Uniform,
+        });
+        self.value_variation.get_or_insert(match self.data_profile {
+            DataProfile::Diagnostic => ValueVariation::Cardinality,
+            DataProfile::Realistic => ValueVariation::PerRow,
+        });
+        self.guid_uniqueness.get_or_insert(match self.data_profile {
+            DataProfile::Diagnostic => GuidUniqueness::Cardinality,
+            DataProfile::Realistic => GuidUniqueness::PerRow,
+        });
+        if self.data_profile == DataProfile::Realistic && self.string_width == 0 {
+            self.string_width = 96;
+        }
         anyhow::ensure!((1..=1024).contains(&self.workers), "workers must resolve to 1..=1024");
         anyhow::ensure!(
             (1..=1024).contains(&self.runtime_threads),
@@ -217,6 +300,19 @@ impl Options {
             "connections-per-worker must be 1..=256, streams-per-worker 1..=1024; totals <=4096 connections and <=65536 streams"
         );
         anyhow::ensure!(self.string_width <= 65536, "string-width must be 0..=65536");
+        anyhow::ensure!((1..=32).contains(&self.shard_count), "shard-count must be 1..=32");
+        anyhow::ensure!(
+            self.fixed_shard_index < self.shard_count,
+            "fixed-shard-index must be less than shard-count"
+        );
+        anyhow::ensure!(
+            self.shard_index_mode != ShardIndexMode::Fixed || self.pod_ordinal == 0,
+            "pod-ordinal is only used with shard-index-mode=worker-spread"
+        );
+        anyhow::ensure!(
+            self.shard_index_mode != ShardIndexMode::WorkerSpread || self.fixed_shard_index == 0,
+            "fixed-shard-index is only used with shard-index-mode=fixed"
+        );
         anyhow::ensure!(self.cardinality > 0, "cardinality must be positive");
         for (name, value) in [
             ("null-fraction", self.null_fraction),
@@ -292,6 +388,11 @@ impl Options {
                 "workers": self.workers, "runtime_threads": self.runtime_threads,
                 "batch_rows": self.batch_rows, "corpus_rows": self.corpus_rows,
                 "corpus_bytes": self.corpus_bytes, "streams_per_worker": self.streams_per_worker,
+                "data_profile": self.data_profile, "string_width": self.string_width,
+                "string_length_distribution": self.string_length_distribution,
+                "value_variation": self.value_variation, "guid_uniqueness": self.guid_uniqueness,
+                "shard_index_mode": self.shard_index_mode, "fixed_shard_index": self.fixed_shard_index,
+                "pod_ordinal": self.pod_ordinal, "shard_count": self.shard_count,
             "stream_retry_max_attempts": self.stream_retry_max_attempts,
             "stream_retry_base_backoff_ms": self.stream_retry_base_backoff_ms,
             "stream_retry_max_backoff_ms": self.stream_retry_max_backoff_ms,
@@ -299,6 +400,22 @@ impl Options {
             "corpus_rows_source": corpus_rows_source,
         });
         Ok((self, evidence))
+    }
+
+    fn shard_index(&self, worker: usize) -> Result<u8> {
+        anyhow::ensure!(worker < self.workers, "worker id must be less than workers");
+        let index = match self.shard_index_mode {
+            ShardIndexMode::Fixed => self.fixed_shard_index,
+            ShardIndexMode::WorkerSpread => {
+                ((u128::from(self.pod_ordinal) * self.workers as u128 + worker as u128) % u128::from(self.shard_count))
+                    as u8
+            }
+        };
+        anyhow::ensure!(
+            index < self.shard_count,
+            "computed shard index must be less than shard-count"
+        );
+        Ok(index)
     }
 
     fn endpoint(&self, address: &str) -> Result<Endpoint> {
@@ -368,12 +485,67 @@ impl Options {
     }
 }
 
+#[derive(Clone)]
 struct EncodedBatch {
     table: Arc<DmvTable>,
+    version: String,
+    template: RecordBatch,
     data: Arc<Vec<FlightData>>,
     rows: u64,
     raw_arrow_bytes: u64,
     encoded_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ManifestCohort {
+    Unscheduled,
+    Warmup,
+    Measurement,
+    PostWindow,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ManifestOutcome {
+    Pending,
+    Acknowledged,
+    NotAdmitted,
+    Ambiguous,
+    Failed,
+}
+
+#[derive(Clone, Debug)]
+struct LogicalBatchRecord {
+    table: String,
+    worker: u16,
+    sequence: u64,
+    row_count: u32,
+    cohort: ManifestCohort,
+    attempts: u16,
+    outcome: ManifestOutcome,
+    first_send_unix_ns: Option<u64>,
+    last_outcome_unix_ms: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct LogicalBatchRange {
+    table: String,
+    worker: u16,
+    first_sequence: u64,
+    last_sequence: u64,
+    batch_count: u64,
+    rows_per_batch: u32,
+    cohort: ManifestCohort,
+    attempts: u16,
+    outcome: ManifestOutcome,
+    first_send_unix_ns: Option<u64>,
+    last_outcome_unix_ms: Option<u64>,
+}
+
+struct LogicalBatch {
+    batch: EncodedBatch,
+    manifest_index: Option<usize>,
 }
 
 struct Counters {
@@ -473,6 +645,8 @@ impl Counters {
 struct Attempt<'a> {
     counters: &'a Counters,
     batch: &'a EncodedBatch,
+    manifest: Option<(&'a PreparedClient, usize)>,
+    send_started: bool,
     started: Instant,
     finished: bool,
 }
@@ -687,6 +861,17 @@ pub struct ContinuousReport {
 impl Drop for Attempt<'_> {
     fn drop(&mut self) {
         if !self.finished {
+            if self.send_started
+                && let Some((client, index)) = self.manifest
+            {
+                let mut records = client
+                    .logical_batches
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(record) = records.get_mut(index) {
+                    record.outcome = ManifestOutcome::Ambiguous;
+                }
+            }
             self.counters
                 .cancelled_rows
                 .fetch_add(self.batch.rows, Ordering::Relaxed);
@@ -706,8 +891,13 @@ pub struct PreparedClient {
     counters: Vec<Counters>,
     next: AtomicU64,
     worker_next: Vec<AtomicU64>,
+    worker_batch_sequence: Vec<AtomicU64>,
     reserved_rows: AtomicU64,
     measurement: Mutex<Option<Arc<Measurement>>>,
+    run_id: uuid::Uuid,
+    incarnation_id: uuid::Uuid,
+    logical_batches: Mutex<Vec<LogicalBatchRecord>>,
+    manifest_capacity_reached: AtomicBool,
     pub table_count: usize,
     preparation: serde_json::Value,
     started: Instant,
@@ -798,7 +988,7 @@ impl PreparedClient {
         let table_count = tables.len();
         let tables = tables.drain(..).map(Arc::new).collect::<Vec<_>>();
         let mut corpus = Vec::new();
-        let mut decoded_bytes = 0_u64;
+        let mut raw_arrow_bytes_total = 0_u64;
         let mut encoded_bytes = 0_u64;
         let mut generation_seconds = 0.0;
         let mut encoding_seconds = 0.0;
@@ -819,20 +1009,19 @@ impl PreparedClient {
                     {
                         *total += (end - start).max(0.0);
                     }
-                    let bytes = batch.get_array_memory_size() as u64;
-                    decoded_bytes = decoded_bytes
-                        .checked_add(bytes)
-                        .context("decoded corpus size overflow")?;
                     let encoding_start = Instant::now();
                     let cpu_start = thread_cpu_seconds()?;
-                    let data = encode(table, version, batch, &options).await?;
+                    let (data, raw_arrow_bytes, wire_bytes) =
+                        encode_with_sizes(table, version, batch.clone(), &options).await?;
                     encoding_seconds += encoding_start.elapsed().as_secs_f64();
                     if let Some((total, (end, start))) =
                         encoding_cpu_seconds.as_mut().zip(thread_cpu_seconds()?.zip(cpu_start))
                     {
                         *total += (end - start).max(0.0);
                     }
-                    let wire_bytes = data.iter().map(|message| message.encoded_len() as u64).sum::<u64>();
+                    raw_arrow_bytes_total = raw_arrow_bytes_total
+                        .checked_add(raw_arrow_bytes)
+                        .context("raw Arrow IPC corpus size overflow")?;
                     encoded_bytes = encoded_bytes
                         .checked_add(wire_bytes)
                         .context("encoded corpus size overflow")?;
@@ -842,9 +1031,11 @@ impl PreparedClient {
                     );
                     batches.push(EncodedBatch {
                         table: Arc::clone(table),
+                        version: version.clone(),
+                        template: batch,
                         data: Arc::new(data),
                         rows: length as u64,
-                        raw_arrow_bytes: bytes,
+                        raw_arrow_bytes,
                         encoded_bytes: wire_bytes,
                     });
                 }
@@ -861,7 +1052,7 @@ impl PreparedClient {
         }
         let preparation = serde_json::json!({
             "corpus_rows": rows as u64 * table_count as u64 * copies as u64,
-            "corpus_decoded_bytes": decoded_bytes,
+            "corpus_uncompressed_ipc_bytes": raw_arrow_bytes_total,
             "corpus_encoded_bytes": encoded_bytes,
             "retained_encoded_bytes": encoded_bytes,
             "memory_reservation_bytes": estimate,
@@ -873,11 +1064,12 @@ impl PreparedClient {
             "encoding_wall_seconds": encoding_seconds,
             "preparation_wall_seconds": started.elapsed().as_secs_f64(),
             "generator_rows_per_second": rows as f64 * table_count as f64 * copies as f64 / generation_seconds.max(f64::MIN_POSITIVE),
-            "steady_state_generation": false,
+            "steady_state_generation": options.data_profile == DataProfile::Realistic,
         });
         Ok(Arc::new(Self {
             counters: (0..options.workers).map(|_| Counters::default()).collect(),
             worker_next: (0..options.workers).map(|_| AtomicU64::new(0)).collect(),
+            worker_batch_sequence: (0..options.workers).map(|_| AtomicU64::new(0)).collect(),
             options,
             corpus,
             channels,
@@ -885,6 +1077,10 @@ impl PreparedClient {
             next: AtomicU64::new(0),
             reserved_rows: AtomicU64::new(0),
             measurement: Mutex::new(None),
+            run_id: uuid::Uuid::new_v4(),
+            incarnation_id: uuid::Uuid::new_v4(),
+            logical_batches: Mutex::new(Vec::new()),
+            manifest_capacity_reached: AtomicBool::new(false),
             table_count,
             preparation,
             started: Instant::now(),
@@ -901,6 +1097,291 @@ impl PreparedClient {
         } else {
             &corpus[cursor.fetch_add(1, Ordering::Relaxed) as usize % corpus.len()]
         }
+    }
+
+    fn next_logical_batch_sequence(&self, worker: usize) -> Result<u64> {
+        let sequence = self
+            .worker_batch_sequence
+            .get(worker)
+            .context("logical batch worker id is out of range")?
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| value.checked_add(1))
+            .map_err(|_| anyhow::anyhow!("logical batch sequence overflow for worker {worker}"))?;
+        Ok(sequence)
+    }
+
+    fn reserve_manifest_record(&self, batch: &EncodedBatch, worker: usize, sequence: u64) -> Result<usize> {
+        let mut records = self
+            .logical_batches
+            .lock()
+            .map_err(|_| anyhow::anyhow!("logical batch manifest state poisoned"))?;
+        if records.len() >= MAX_LOGICAL_BATCH_RECORDS {
+            self.manifest_capacity_reached.store(true, Ordering::Relaxed);
+            anyhow::bail!(
+                "logical batch manifest reached its {MAX_LOGICAL_BATCH_RECORDS}-record cap before starting another send"
+            );
+        }
+        records
+            .try_reserve(1)
+            .context("reserve logical batch manifest record")?;
+        let index = records.len();
+        records.push(LogicalBatchRecord {
+            table: batch.table.identity.table().as_str().to_owned(),
+            worker: u16::try_from(worker).context("logical batch worker id exceeds u16")?,
+            sequence,
+            row_count: u32::try_from(batch.rows).context("logical batch row count exceeds u32")?,
+            cohort: ManifestCohort::Unscheduled,
+            attempts: 0,
+            outcome: ManifestOutcome::Pending,
+            first_send_unix_ns: None,
+            last_outcome_unix_ms: None,
+        });
+        Ok(index)
+    }
+
+    fn record_manifest_attempt(
+        &self,
+        index: usize,
+        send_unix_ns: u64,
+        measurement: Option<&Measurement>,
+    ) -> Result<()> {
+        let mut records = self
+            .logical_batches
+            .lock()
+            .map_err(|_| anyhow::anyhow!("logical batch manifest state poisoned"))?;
+        let record = records
+            .get_mut(index)
+            .context("logical batch manifest index is out of range")?;
+        if record.attempts == 0 {
+            record.first_send_unix_ns = Some(send_unix_ns);
+            record.cohort = measurement.map_or(ManifestCohort::Unscheduled, |window| {
+                let send_unix_ms = send_unix_ns / 1_000_000;
+                if send_unix_ms < window.start_unix_ms {
+                    ManifestCohort::Warmup
+                } else if send_unix_ms < window.end_unix_ms {
+                    ManifestCohort::Measurement
+                } else {
+                    ManifestCohort::PostWindow
+                }
+            });
+        }
+        record.attempts = record
+            .attempts
+            .checked_add(1)
+            .context("logical batch attempt count overflow")?;
+        Ok(())
+    }
+
+    fn record_manifest_outcome(
+        &self,
+        index: usize,
+        outcome: ManifestOutcome,
+        observed_unix_ms: Option<u64>,
+    ) -> Result<()> {
+        let mut records = self
+            .logical_batches
+            .lock()
+            .map_err(|_| anyhow::anyhow!("logical batch manifest state poisoned"))?;
+        let record = records
+            .get_mut(index)
+            .context("logical batch manifest index is out of range")?;
+        record.outcome = outcome;
+        if observed_unix_ms.is_some() {
+            record.last_outcome_unix_ms = observed_unix_ms;
+        }
+        Ok(())
+    }
+
+    fn logical_manifest(&self, phase: &str) -> Result<serde_json::Value> {
+        let records = self
+            .logical_batches
+            .lock()
+            .map_err(|_| anyhow::anyhow!("logical batch manifest state poisoned"))?
+            .clone();
+        let mut ordered = records.clone();
+        ordered.sort_by_key(|record| (record.worker, record.sequence));
+        let mut ranges: Vec<LogicalBatchRange> = Vec::new();
+        for record in ordered {
+            let merge = ranges.last().is_some_and(|range| {
+                range.table == record.table
+                    && range.worker == record.worker
+                    && range.last_sequence.checked_add(1) == Some(record.sequence)
+                    && range.rows_per_batch == record.row_count
+                    && range.cohort == record.cohort
+                    && range.attempts == record.attempts
+                    && range.outcome == record.outcome
+            });
+            if merge {
+                let range = ranges.last_mut().context("manifest range disappeared")?;
+                range.last_sequence = record.sequence;
+                range.batch_count = range
+                    .batch_count
+                    .checked_add(1)
+                    .context("logical batch range count overflow")?;
+                range.first_send_unix_ns = match (range.first_send_unix_ns, record.first_send_unix_ns) {
+                    (Some(left), Some(right)) => Some(left.min(right)),
+                    (left, right) => left.or(right),
+                };
+                range.last_outcome_unix_ms = match (range.last_outcome_unix_ms, record.last_outcome_unix_ms) {
+                    (Some(left), Some(right)) => Some(left.max(right)),
+                    (left, right) => left.or(right),
+                };
+            } else {
+                ranges.push(LogicalBatchRange {
+                    table: record.table,
+                    worker: record.worker,
+                    first_sequence: record.sequence,
+                    last_sequence: record.sequence,
+                    batch_count: 1,
+                    rows_per_batch: record.row_count,
+                    cohort: record.cohort,
+                    attempts: record.attempts,
+                    outcome: record.outcome,
+                    first_send_unix_ns: record.first_send_unix_ns,
+                    last_outcome_unix_ms: record.last_outcome_unix_ms,
+                });
+            }
+        }
+        let counts = records.iter().fold([0_u64; 5], |mut counts, record| {
+            let index = match record.outcome {
+                ManifestOutcome::Pending => 0,
+                ManifestOutcome::Acknowledged => 1,
+                ManifestOutcome::NotAdmitted => 2,
+                ManifestOutcome::Ambiguous => 3,
+                ManifestOutcome::Failed => 4,
+            };
+            counts[index] += 1;
+            counts
+        });
+        let measurement_bounds = self
+            .measurement
+            .lock()
+            .map_err(|_| anyhow::anyhow!("measurement state poisoned"))?
+            .as_ref()
+            .map(|window| {
+                serde_json::json!({
+                    "start_unix_ms_inclusive": window.start_unix_ms,
+                    "end_unix_ms_exclusive": window.end_unix_ms,
+                })
+            });
+        let complete =
+            phase == "completed" && !self.manifest_capacity_reached.load(Ordering::Relaxed) && counts[0] == 0;
+        let mut manifest = if self.options.data_profile == DataProfile::Diagnostic {
+            serde_json::json!({
+                "schema": "arrowcol.logical_batch_manifest.v1",
+                "identity_status": "diagnostic_only",
+                "eligible_for_identity_reconciliation": false,
+                "complete": false,
+                "truncated": false,
+                "reason": "diagnostic profile replays identity-free corpus frames",
+                "measurement_bounds": measurement_bounds,
+                "records": [],
+            })
+        } else {
+            serde_json::json!({
+                "schema": "arrowcol.logical_batch_manifest.v1",
+                "version": 1,
+                "identity_status": "identity_bearing",
+                "eligible_for_identity_reconciliation": true,
+                "complete": complete,
+                "truncated": false,
+                "record_count": records.len(),
+                "record_cap": MAX_LOGICAL_BATCH_RECORDS,
+                "record_capacity_reached": self.manifest_capacity_reached.load(Ordering::Relaxed),
+                "measurement_bounds": measurement_bounds,
+                "cohort_rule": "first_send_unix_ms < start => warmup; start <= first_send_unix_ms < end => measurement; otherwise post_window; bounds are [start,end)",
+                "identity_column": "endpoint_url",
+                "identity_format": "https://x.invalid/v1/{run_uuid_simple32}/{incarnation_uuid_simple32}/{worker_decimal}/{logical_batch_sequence_base36}/{row_ordinal_decimal}",
+                "run_uuid": self.run_id.simple().to_string(),
+                "incarnation_uuid": self.incarnation_id.simple().to_string(),
+                "prepared_logical_batches": records.len(),
+                "attempted_logical_batches": records.iter().filter(|record| record.attempts > 0).count(),
+                "acknowledged_logical_batches": counts[1],
+                "not_admitted_logical_batches": counts[2],
+                "ambiguous_logical_batches": counts[3],
+                "failed_logical_batches": counts[4],
+                "pending_logical_batches": counts[0],
+                "retry_attempts": records.iter().map(|record| u64::from(record.attempts.saturating_sub(1))).sum::<u64>(),
+                "ranges": ranges,
+            })
+        };
+        if self.manifest_capacity_reached.load(Ordering::Relaxed) {
+            manifest["terminal_failure"] = serde_json::json!("record_capacity_reached");
+        }
+        let serialized_bytes = serde_json::to_vec(&manifest)?.len();
+        if serialized_bytes > MAX_LOGICAL_MANIFEST_BYTES {
+            self.manifest_capacity_reached.store(true, Ordering::Relaxed);
+            return Ok(serde_json::json!({
+                "schema": "arrowcol.logical_batch_manifest.v1",
+                "version": 1,
+                "identity_status": "unavailable",
+                "eligible_for_identity_reconciliation": false,
+                "complete": false,
+                "truncated": true,
+                "terminal_failure": "serialized_manifest_exceeds_limit",
+                "serialized_bytes": serialized_bytes,
+                "serialized_byte_cap": MAX_LOGICAL_MANIFEST_BYTES,
+                "record_count": records.len(),
+                "record_cap": MAX_LOGICAL_BATCH_RECORDS,
+                "measurement_bounds": measurement_bounds,
+                "run_uuid": self.run_id.simple().to_string(),
+                "incarnation_uuid": self.incarnation_id.simple().to_string(),
+            }));
+        }
+        Ok(manifest)
+    }
+
+    /// Rejects terminal success when the logical batch manifest is incomplete or over capacity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the evidence exceeded a cap or contains a pending logical batch.
+    pub fn ensure_terminal_manifest_complete(&self) -> Result<()> {
+        anyhow::ensure!(
+            !self.manifest_capacity_reached.load(Ordering::Relaxed),
+            "logical batch manifest exceeded a hard capacity; refusing successful completion"
+        );
+        let records = self
+            .logical_batches
+            .lock()
+            .map_err(|_| anyhow::anyhow!("logical batch manifest state poisoned"))?;
+        anyhow::ensure!(
+            records.iter().all(|record| record.outcome != ManifestOutcome::Pending),
+            "logical batch manifest contains pending outcomes; refusing successful completion"
+        );
+        Ok(())
+    }
+
+    async fn prepare_logical_batch(&self, worker: usize, template: &EncodedBatch) -> Result<LogicalBatch> {
+        if self.options.data_profile == DataProfile::Diagnostic {
+            return Ok(LogicalBatch {
+                batch: template.clone(),
+                manifest_index: None,
+            });
+        }
+        let sequence = self.next_logical_batch_sequence(worker)?;
+        let batch =
+            batch_with_logical_identity(&template.template, self.run_id, self.incarnation_id, worker, sequence)?;
+        let (data, raw_arrow_bytes, encoded_bytes) =
+            encode_with_sizes(&template.table, &template.version, batch.clone(), &self.options).await?;
+        anyhow::ensure!(
+            data.iter()
+                .all(|message| message.encoded_len() <= self.options.max_message_bytes),
+            "identity-bearing Arrow IPC message exceeded max-message-bytes"
+        );
+        let prepared = EncodedBatch {
+            table: Arc::clone(&template.table),
+            version: template.version.clone(),
+            template: batch,
+            data: Arc::new(data),
+            rows: template.rows,
+            raw_arrow_bytes,
+            encoded_bytes,
+        };
+        let manifest_index = self.reserve_manifest_record(&prepared, worker, sequence)?;
+        Ok(LogicalBatch {
+            batch: prepared,
+            manifest_index: Some(manifest_index),
+        })
     }
 
     /// Continuously replenish each worker's independent stream slots through warm-up and measurement.
@@ -965,7 +1446,7 @@ impl PreparedClient {
                 "client did not start within 250ms of the shared measurement interval"
             );
             measurement.record_resource_sample(ResourceSample::capture()?, true)?;
-            println!("OAT_CLIENT_METRICS {}", self.metrics("measurement_start"));
+            println!("OAT_CLIENT_METRICS {}", self.metrics("measurement_start")?);
             Ok::<u64, anyhow::Error>(observed)
         };
         tokio::pin!(phase);
@@ -1086,15 +1567,14 @@ impl PreparedClient {
                         })
                         .collect()
                 };
+                let stream_limit = this.options.streams_per_worker;
                 let streams = stream::iter(indices.into_iter().enumerate()).map(|(stream_index, index)| {
+                    let client = Arc::clone(&this);
                     let batch = &corpus[index];
                     let channel = this.channels[worker][stream_index % this.channels[worker].len()].clone();
-                    this.send_one(worker, channel, batch, None)
+                    async move { client.send_fresh_one(worker, channel, batch, None).await }
                 });
-                streams
-                    .buffer_unordered(this.options.streams_per_worker)
-                    .try_collect::<Vec<_>>()
-                    .await
+                streams.buffer_unordered(stream_limit).try_collect::<Vec<_>>().await
             });
         }
         let mut report = UploadReport {
@@ -1122,11 +1602,11 @@ impl PreparedClient {
         Ok(report)
     }
 
-    async fn send_one(
+    async fn send_fresh_one(
         &self,
         worker: usize,
         channel: Channel,
-        batch: &EncodedBatch,
+        template: &EncodedBatch,
         measurement: Option<&Measurement>,
     ) -> Result<Option<(DeliveryGuarantee, u64)>> {
         if measurement.is_none()
@@ -1134,13 +1614,25 @@ impl PreparedClient {
             && self
                 .reserved_rows
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |rows| {
-                    rows.checked_add(batch.rows)
+                    rows.checked_add(template.rows)
                         .filter(|next| *next <= self.options.max_rows)
                 })
                 .is_err()
         {
             return Ok(None);
         }
+        let logical = self.prepare_logical_batch(worker, template).await?;
+        self.send_encoded_one(worker, channel, &logical, measurement).await
+    }
+
+    async fn send_encoded_one(
+        &self,
+        worker: usize,
+        channel: Channel,
+        logical: &LogicalBatch,
+        measurement: Option<&Measurement>,
+    ) -> Result<Option<(DeliveryGuarantee, u64)>> {
+        let batch = &logical.batch;
         let counters = &self.counters[worker];
         counters.attempted_rows.fetch_add(batch.rows, Ordering::Relaxed);
         counters
@@ -1149,6 +1641,8 @@ impl PreparedClient {
         let mut attempt = Attempt {
             counters,
             batch,
+            manifest: logical.manifest_index.map(|index| (self, index)),
+            send_started: false,
             started: Instant::now(),
             finished: false,
         };
@@ -1156,13 +1650,32 @@ impl PreparedClient {
         let mut request = Request::new(stream::iter(batch.data.as_ref().clone()));
         let timeout = Duration::from_millis(self.options.request_timeout_ms);
         let result = tokio::time::timeout(timeout, async {
-            request_metadata(&mut request, &batch.table, self.signer.as_ref(), Some(&observation))?;
+            request_metadata(
+                &mut request,
+                &batch.table,
+                self.signer.as_ref(),
+                Some(&observation),
+                Some(self.options.shard_index(worker)?),
+            )?;
             request.set_timeout(timeout);
+            if let Some(index) = logical.manifest_index {
+                self.record_manifest_attempt(index, observation.send_unix_ns, measurement)?;
+                attempt.send_started = true;
+            }
             completed_admission(self.options.client(channel).do_put(request).await?.into_inner()).await
         })
         .await
         .context("DMV upload timeout")
         .and_then(std::convert::identity);
+        if let Some(index) = logical.manifest_index {
+            let outcome = match &result {
+                Ok(_) => ManifestOutcome::Acknowledged,
+                Err(error) if is_not_admitted(error) => ManifestOutcome::NotAdmitted,
+                Err(error) if is_ambiguous_continuous_error(error) => ManifestOutcome::Ambiguous,
+                Err(_) => ManifestOutcome::Failed,
+            };
+            self.record_manifest_outcome(index, outcome, Some(unix_ms()?))?;
+        }
         let completed_unix_ms = if result.is_ok() && measurement.is_some() {
             Some(unix_ms()?)
         } else {
@@ -1222,8 +1735,12 @@ impl PreparedClient {
         batch: &EncodedBatch,
         measurement: &Measurement,
     ) -> Result<bool> {
+        let logical = self.prepare_logical_batch(worker, batch).await?;
         for attempt in 1..=self.options.stream_retry_max_attempts {
-            match self.send_one(worker, channel.clone(), batch, Some(measurement)).await {
+            match self
+                .send_encoded_one(worker, channel.clone(), &logical, Some(measurement))
+                .await
+            {
                 Ok(Some(_)) => return Ok(true),
                 Ok(None) => return Ok(false),
                 Err(error) if is_not_admitted(&error) => {
@@ -1258,17 +1775,29 @@ impl PreparedClient {
         unreachable!("validated stream retry attempt count is positive")
     }
 
-    #[must_use]
-    pub fn metrics(&self, phase: &str) -> serde_json::Value {
-        let measurement = self.measurement.lock().unwrap_or_else(|error| {
-            eprintln!("measurement state was poisoned; retaining recorded counters");
-            error.into_inner()
-        });
-        serde_json::json!({
+    /// Returns a versioned metrics snapshot for one lifecycle phase.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if telemetry state is poisoned or terminal receipt sizing overflows.
+    #[must_use = "metrics snapshots must be emitted to preserve OAT evidence"]
+    pub fn metrics(&self, phase: &str) -> Result<serde_json::Value> {
+        let measurement_window = {
+            let measurement = self.measurement.lock().unwrap_or_else(|error| {
+                eprintln!("measurement state was poisoned; retaining recorded counters");
+                error.into_inner()
+            });
+            measurement.as_ref().map(|value| value.snapshot())
+        };
+        let mut metrics = serde_json::json!({
             "version": 1, "phase": phase, "scope": "process_cumulative",
             "completion_semantics": "validated_admission_response_not_delta_commit",
             "send_latency_scope": "request_metadata_protobuf_grpc_compression_network_and_acknowledgement_excluding_interval",
-            "bytes_semantics": "sum_of_protobuf_flight_data_encoded_lengths_excluding_grpc_http2",
+            "bytes_semantics": {
+                "raw_arrow_bytes": "uncompressed_arrow_ipc_flight_data_protobuf_encoded_lengths",
+                "wire_bytes": "configured_arrow_ipc_compression_flight_data_protobuf_encoded_lengths",
+                "exclusions": "grpc_http2"
+            },
             "send_observation": {
                 "id_header": CLIENT_SEND_OBSERVATION_ID_HEADER,
                 "timestamp_header": CLIENT_SEND_UNIX_NS_HEADER,
@@ -1278,13 +1807,42 @@ impl PreparedClient {
             },
             "elapsed_seconds": self.started.elapsed().as_secs_f64(),
             "preparation": self.preparation,
-            "measurement_window": measurement.as_ref().map(|value| value.snapshot()),
+            "measurement_window": measurement_window,
             "workers": self.counters.iter().enumerate().map(|(id, counters)| {
                 let mut value = counters.snapshot(self.started.elapsed().as_secs_f64());
                 value["worker"] = serde_json::json!(id);
                 value
             }).collect::<Vec<_>>(),
-        })
+        });
+        if matches!(phase, "completed" | "failed") {
+            metrics["logical_batch_manifest"] = self.logical_manifest(phase)?;
+            if self.options.data_profile != DataProfile::Diagnostic
+                && (!metrics["logical_batch_manifest"]["complete"].as_bool().unwrap_or(false)
+                    || self.manifest_capacity_reached.load(Ordering::Relaxed))
+            {
+                metrics["phase"] = serde_json::json!("failed");
+            }
+            let receipt_json_bytes = serde_json::to_vec(&metrics)?.len();
+            let receipt_bytes = receipt_json_bytes
+                .checked_add(b"OAT_CLIENT_METRICS ".len() + 1)
+                .context("terminal OAT metrics line size overflow")?;
+            if receipt_bytes > MAX_OAT_CLIENT_METRICS_LINE_BYTES {
+                self.manifest_capacity_reached.store(true, Ordering::Relaxed);
+                metrics["phase"] = serde_json::json!("failed");
+                metrics["logical_batch_manifest"] = serde_json::json!({
+                    "schema": "arrowcol.logical_batch_manifest.v1",
+                    "version": 1,
+                    "identity_status": "unavailable",
+                    "eligible_for_identity_reconciliation": false,
+                    "complete": false,
+                    "truncated": true,
+                    "terminal_failure": "serialized_terminal_receipt_exceeds_limit",
+                    "serialized_bytes": receipt_bytes,
+                    "serialized_byte_cap": MAX_OAT_CLIENT_METRICS_LINE_BYTES,
+                });
+            }
+        }
+        Ok(metrics)
     }
 }
 
@@ -1403,6 +1961,17 @@ fn unit(value: u64) -> f64 {
     (value >> 11) as f64 / (1_u64 << 53) as f64
 }
 
+fn is_guid_field(name: &str) -> bool {
+    name.ends_with("_id") && name != "customer_id"
+}
+
+fn synthetic_guid(seed: u64, pod_ordinal: u32, worker: usize, column: usize, row: usize) -> String {
+    let identity = (u64::from(pod_ordinal) << 32) | ((worker as u64) << 16) | column as u64;
+    let high = mix(seed ^ identity) as u128;
+    let value = (high << 64) | row as u128;
+    uuid::Uuid::from_u128(value).to_string()
+}
+
 fn synthetic_batch(
     table: &DmvTable,
     client_id: &str,
@@ -1419,12 +1988,23 @@ fn synthetic_batch(
         .map(|(column, field)| -> Result<ArrayRef> {
             let random =
                 |row: usize| mix(options.seed ^ mix((offset + row) as u64) ^ mix(column as u64) ^ mix(worker as u64));
-            let key = |row: usize| {
+            let string_key = |row: usize| {
                 let value = random(row);
                 if unit(mix(value)) < options.skew {
                     0
                 } else {
                     value % options.cardinality as u64
+                }
+            };
+            let value_key = |row: usize| {
+                let value = random(row);
+                if unit(mix(value)) < options.skew {
+                    0
+                } else {
+                    match options.value_variation.unwrap_or(ValueVariation::Cardinality) {
+                        ValueVariation::Cardinality => value % options.cardinality as u64,
+                        ValueVariation::PerRow => value,
+                    }
                 }
             };
             let valid = |row: usize| {
@@ -1445,14 +2025,37 @@ fn synthetic_batch(
                 }
                 DataType::Utf8 => Arc::new(StringArray::from_iter((0..rows).map(|row| {
                     valid(row).then(|| {
-                        if options.string_width == 0 {
-                            format!("{}-{}", field.name(), key(row))
+                        if is_guid_field(field.name())
+                            && options.guid_uniqueness.unwrap_or(GuidUniqueness::Cardinality) == GuidUniqueness::PerRow
+                        {
+                            synthetic_guid(options.seed, options.pod_ordinal, worker, column, offset + row)
+                        } else if options.string_width == 0
+                            && options.data_profile == DataProfile::Diagnostic
+                            && options.string_length_distribution == Some(StringLengthDistribution::Fixed)
+                        {
+                            format!("{}-{}", field.name(), string_key(row))
                         } else {
-                            let mut state = mix(options.seed ^ key(row) ^ mix(column as u64) ^ mix(worker as u64));
-                            (0..options.string_width)
+                            let key = string_key(row);
+                            let mut state = mix(options.seed ^ key ^ mix(column as u64) ^ mix(worker as u64));
+                            let maximum_width = if options.string_width == 0 {
+                                field.name().len() + 32
+                            } else {
+                                options.string_width
+                            };
+                            let width = match options
+                                .string_length_distribution
+                                .unwrap_or(StringLengthDistribution::Fixed)
+                            {
+                                StringLengthDistribution::Fixed => maximum_width,
+                                StringLengthDistribution::Uniform => {
+                                    let minimum = maximum_width.div_ceil(2);
+                                    minimum + (random(row) % (maximum_width - minimum + 1) as u64) as usize
+                                }
+                            };
+                            (0..width)
                                 .map(|index| {
                                     state = mix(state);
-                                    if index as f64 / (options.string_width as f64) < options.entropy {
+                                    if index as f64 / (maximum_width as f64) < options.entropy {
                                         (b'a' + (state % 26) as u8) as char
                                     } else {
                                         'a'
@@ -1462,17 +2065,16 @@ fn synthetic_batch(
                         }
                     })
                 }))),
-                DataType::Boolean => primitive!(BooleanArray, |row| key(row).is_multiple_of(2)),
-                DataType::UInt8 => primitive!(UInt8Array, |row| (key(row) % 255) as u8),
-                DataType::Int16 => primitive!(Int16Array, |row| (key(row) % 32767) as i16),
-                DataType::Int32 => primitive!(Int32Array, |row| (key(row) % i32::MAX as u64) as i32),
-                DataType::Int64 => primitive!(Int64Array, |row| (key(row) & i64::MAX as u64) as i64),
-                DataType::Float64 => primitive!(Float64Array, |row| key(row) as f64 / 10.0),
+                DataType::Boolean => primitive!(BooleanArray, |row| value_key(row).is_multiple_of(2)),
+                DataType::UInt8 => primitive!(UInt8Array, |row| (value_key(row) % 255) as u8),
+                DataType::Int16 => primitive!(Int16Array, |row| (value_key(row) % 32767) as i16),
+                DataType::Int32 => primitive!(Int32Array, |row| (value_key(row) % i32::MAX as u64) as i32),
+                DataType::Int64 => primitive!(Int64Array, |row| (value_key(row) & i64::MAX as u64) as i64),
+                DataType::Float64 => primitive!(Float64Array, |row| value_key(row) as f64 / 10.0),
                 DataType::Timestamp(TimeUnit::Microsecond, timezone) => Arc::new(
-                    TimestampMicrosecondArray::from_iter(
-                        (0..rows)
-                            .map(|row| valid(row).then(|| 1_790_000_000_000_000_i64 + (key(row) % 1_000_000) as i64)),
-                    )
+                    TimestampMicrosecondArray::from_iter((0..rows).map(|row| {
+                        valid(row).then(|| 1_790_000_000_000_000_i64 + (value_key(row) % 1_000_000) as i64)
+                    }))
                     .with_timezone_opt(timezone.clone()),
                 ),
                 other => bail!("unsupported synthetic DMV type {other}"),
@@ -1480,6 +2082,71 @@ fn synthetic_batch(
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(RecordBatch::try_new(Arc::clone(&table.schema), columns)?)
+}
+
+fn base36(mut value: u64) -> String {
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    if value == 0 {
+        return "0".to_owned();
+    }
+    let mut reversed = String::new();
+    while value > 0 {
+        reversed.push(DIGITS[(value % 36) as usize] as char);
+        value /= 36;
+    }
+    reversed.chars().rev().collect()
+}
+
+fn logical_identity_url(
+    run_id: uuid::Uuid,
+    incarnation_id: uuid::Uuid,
+    worker: usize,
+    sequence: u64,
+    row: usize,
+) -> Result<String> {
+    anyhow::ensure!(worker < 1_024, "logical identity worker id exceeds 1023");
+    let row = u32::try_from(row).context("logical identity row ordinal exceeds u32")?;
+    Ok(format!(
+        "https://x.invalid/v1/{}/{}/{}/{}/{row}",
+        run_id.simple(),
+        incarnation_id.simple(),
+        worker,
+        base36(sequence),
+    ))
+}
+
+fn batch_with_logical_identity(
+    batch: &RecordBatch,
+    run_id: uuid::Uuid,
+    incarnation_id: uuid::Uuid,
+    worker: usize,
+    sequence: u64,
+) -> Result<RecordBatch> {
+    let identity_column = batch
+        .schema()
+        .index_of("endpoint_url")
+        .context("realistic logical identity requires the public endpoint_url column")?;
+    anyhow::ensure!(
+        batch.schema().field(identity_column).data_type() == &DataType::Utf8,
+        "logical identity endpoint_url column must be a nonnullable string"
+    );
+    let values = (0..batch.num_rows())
+        .map(|row| logical_identity_url(run_id, incarnation_id, worker, sequence, row))
+        .collect::<Result<Vec<_>>>()?;
+    let identity: ArrayRef = Arc::new(StringArray::from_iter_values(values.iter().map(String::as_str)));
+    let columns = batch
+        .columns()
+        .iter()
+        .enumerate()
+        .map(|(index, column)| {
+            if index == identity_column {
+                Arc::clone(&identity)
+            } else {
+                Arc::clone(column)
+            }
+        })
+        .collect();
+    Ok(RecordBatch::try_new(batch.schema(), columns)?)
 }
 
 async fn encode(table: &DmvTable, version: &str, batch: RecordBatch, options: &Options) -> Result<Vec<FlightData>> {
@@ -1516,6 +2183,33 @@ async fn encode(table: &DmvTable, version: &str, batch: RecordBatch, options: &O
         "encoded FlightData exceeds max-message-bytes"
     );
     Ok(data)
+}
+
+fn flight_data_bytes(messages: &[FlightData]) -> Result<u64> {
+    messages.iter().try_fold(0_u64, |total, message| {
+        total
+            .checked_add(u64::try_from(message.encoded_len())?)
+            .context("encoded Arrow IPC size overflow")
+    })
+}
+
+async fn encode_with_sizes(
+    table: &DmvTable,
+    version: &str,
+    batch: RecordBatch,
+    options: &Options,
+) -> Result<(Vec<FlightData>, u64, u64)> {
+    let data = encode(table, version, batch.clone(), options).await?;
+    let encoded_bytes = flight_data_bytes(&data)?;
+    let raw_arrow_bytes = if matches!(options.ipc_compression, IpcCompression::None) {
+        encoded_bytes
+    } else {
+        let mut uncompressed = options.clone();
+        uncompressed.ipc_compression = IpcCompression::None;
+        let raw = encode(table, version, batch, &uncompressed).await?;
+        flight_data_bytes(&raw)?
+    };
+    Ok((data, raw_arrow_bytes, encoded_bytes))
 }
 
 fn thread_cpu_seconds() -> Result<Option<f64>> {
@@ -1837,6 +2531,8 @@ mod tests {
         ambiguous_remaining: AtomicU64,
         fast_completions: AtomicU64,
         rows: AtomicU64,
+        capture_identities: AtomicBool,
+        identities: Mutex<Vec<String>>,
     }
 
     struct SmokeAdmission(Arc<SmokeState>);
@@ -1873,6 +2569,16 @@ mod tests {
     impl StreamLifecycle for SmokeStream {
         async fn push_batch(&mut self, batch: RecordBatch) -> RuntimeResult<()> {
             self.rows += batch.num_rows() as u64;
+            if self.state.capture_identities.load(Ordering::Relaxed)
+                && let Ok(index) = batch.schema().index_of("endpoint_url")
+                && let Some(values) = batch.column(index).as_any().downcast_ref::<StringArray>()
+            {
+                self.state
+                    .identities
+                    .lock()
+                    .map_err(|_| RuntimeError::internal())?
+                    .extend(values.iter().flatten().map(str::to_owned));
+            }
             Ok(())
         }
         async fn complete(&mut self, _: StreamSummary) -> RuntimeResult<StreamCompletion> {
@@ -1902,7 +2608,150 @@ mod tests {
     }
 
     fn options() -> Result<Options> {
-        Cli::try_parse_from(["test", "--workers", "2"])?.options.resolve(100, 1)
+        Cli::try_parse_from(["test", "--workers", "2", "--data-profile", "diagnostic"])?
+            .options
+            .resolve(100, 1)
+    }
+
+    fn manifest_test_client() -> Result<PreparedClient> {
+        let mut options = options()?;
+        options.data_profile = DataProfile::Realistic;
+        let workers = options.workers;
+        Ok(PreparedClient {
+            corpus: Vec::new(),
+            channels: Vec::new(),
+            signer: None,
+            counters: (0..workers).map(|_| Counters::default()).collect(),
+            next: AtomicU64::new(0),
+            worker_next: (0..workers).map(|_| AtomicU64::new(0)).collect(),
+            worker_batch_sequence: (0..workers).map(|_| AtomicU64::new(0)).collect(),
+            reserved_rows: AtomicU64::new(0),
+            measurement: Mutex::new(None),
+            run_id: uuid::Uuid::new_v4(),
+            incarnation_id: uuid::Uuid::new_v4(),
+            logical_batches: Mutex::new(Vec::new()),
+            manifest_capacity_reached: AtomicBool::new(false),
+            table_count: 0,
+            preparation: serde_json::json!({}),
+            started: Instant::now(),
+            options,
+        })
+    }
+
+    #[test]
+    fn logical_identity_namespaces_are_injective_and_checked() -> Result<()> {
+        let run = uuid::Uuid::from_u128(1);
+        let incarnation = uuid::Uuid::from_u128(2);
+        let identities = [
+            logical_identity_url(run, incarnation, 0, 0, 0)?,
+            logical_identity_url(run, incarnation, 0, 0, 1)?,
+            logical_identity_url(run, incarnation, 0, 1, 0)?,
+            logical_identity_url(run, incarnation, 1, 0, 0)?,
+            logical_identity_url(run, uuid::Uuid::from_u128(3), 0, 0, 0)?,
+            logical_identity_url(uuid::Uuid::from_u128(4), incarnation, 0, 0, 0)?,
+        ];
+        assert_eq!(
+            identities.iter().collect::<std::collections::HashSet<_>>().len(),
+            identities.len()
+        );
+        assert!(logical_identity_url(run, incarnation, 1_024, 0, 0).is_err());
+        assert!(logical_identity_url(run, incarnation, 0, 0, u32::MAX as usize + 1).is_err());
+
+        let client = manifest_test_client()?;
+        client.worker_batch_sequence[0].store(u64::MAX, Ordering::Relaxed);
+        assert!(client.next_logical_batch_sequence(0).is_err());
+        assert!(client.next_logical_batch_sequence(usize::MAX).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn manifest_ranges_preserve_rows_needed_to_detect_equal_count_substitution() -> Result<()> {
+        let client = manifest_test_client()?;
+        let table = "sqlserver_availability_replica_states".to_owned();
+        let mut records = client
+            .logical_batches
+            .lock()
+            .map_err(|_| anyhow::anyhow!("logical batch manifest state poisoned"))?;
+        for sequence in 0..2 {
+            records.push(LogicalBatchRecord {
+                table: table.clone(),
+                worker: 0,
+                sequence,
+                row_count: 2,
+                cohort: ManifestCohort::Measurement,
+                attempts: 2,
+                outcome: ManifestOutcome::Acknowledged,
+                first_send_unix_ns: Some(1_000_000_000),
+                last_outcome_unix_ms: Some(1_000),
+            });
+        }
+        drop(records);
+
+        let manifest = client.logical_manifest("completed")?;
+        assert_eq!(manifest["record_count"], 2);
+        assert_eq!(manifest["retry_attempts"], 2);
+        let range = manifest["ranges"][0].as_object().context("manifest range")?;
+        assert_eq!(range["first_sequence"], 0);
+        assert_eq!(range["last_sequence"], 1);
+        assert_eq!(range["batch_count"], 2);
+        assert_eq!(range["rows_per_batch"], 2);
+
+        let expected_ids = (0..=1)
+            .flat_map(|sequence| {
+                (0..2).map(move |row| logical_identity_url(client.run_id, client.incarnation_id, 0, sequence, row))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let expected = expected_ids
+            .into_iter()
+            .fold(std::collections::BTreeMap::new(), |mut counts, id| {
+                *counts.entry(id).or_insert(0_u64) += 1;
+                counts
+            });
+        let mut observed = expected.clone();
+        let duplicate = logical_identity_url(client.run_id, client.incarnation_id, 0, 0, 0)?;
+        let missing = logical_identity_url(client.run_id, client.incarnation_id, 0, 1, 1)?;
+        *observed.get_mut(&missing).context("expected identity missing")? -= 1;
+        *observed.entry(duplicate).or_default() += 1;
+        assert_eq!(observed.values().sum::<u64>(), expected.values().sum::<u64>());
+        assert_ne!(observed, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_terminal_manifest_fails_closed_within_oat_line_bound() -> Result<()> {
+        let client = manifest_test_client()?;
+        let mut records = client
+            .logical_batches
+            .lock()
+            .map_err(|_| anyhow::anyhow!("logical batch manifest state poisoned"))?;
+        for index in 0..10_000_u64 {
+            records.push(LogicalBatchRecord {
+                table: "sqlserver_availability_replica_states".to_owned(),
+                worker: 0,
+                sequence: index * 2,
+                row_count: 100,
+                cohort: ManifestCohort::Measurement,
+                attempts: 1,
+                outcome: ManifestOutcome::Acknowledged,
+                first_send_unix_ns: Some(1_000_000_000 + index),
+                last_outcome_unix_ms: Some(1_000),
+            });
+        }
+        drop(records);
+
+        let receipt = client.metrics("completed")?;
+        assert_eq!(receipt["phase"], "failed");
+        assert_eq!(receipt["logical_batch_manifest"]["truncated"], true);
+        assert_eq!(
+            receipt["logical_batch_manifest"]["terminal_failure"],
+            "serialized_manifest_exceeds_limit"
+        );
+        let line = format!("OAT_CLIENT_METRICS {receipt}");
+        assert!(line.len() < MAX_OAT_CLIENT_METRICS_LINE_BYTES);
+        let payload = line.strip_prefix("OAT_CLIENT_METRICS ").context("metrics prefix")?;
+        serde_json::from_str::<serde_json::Value>(payload)?;
+        assert!(client.ensure_terminal_manifest_complete().is_err());
+        Ok(())
     }
 
     #[test]
@@ -1958,6 +2807,11 @@ mod tests {
         for args in [
             vec!["--ipc-compression", "gzip"],
             vec!["--data-mode", "replicated"],
+            vec!["--data-profile", "random"],
+            vec!["--string-length-distribution", "exponential"],
+            vec!["--value-variation", "batch"],
+            vec!["--guid-uniqueness", "never"],
+            vec!["--shard-index-mode", "round_robin"],
             vec!["--dictionary-handling", "silent"],
         ] {
             assert!(Cli::try_parse_from(std::iter::once("test").chain(args)).is_err());
@@ -1972,6 +2826,11 @@ mod tests {
             vec!["--stream-window-bytes", "2147483648"],
             vec!["--dictionary-handling", "resend"],
             vec!["--stream-retry-max-attempts", "0"],
+            vec!["--shard-count", "0"],
+            vec!["--shard-count", "33"],
+            vec!["--fixed-shard-index", "1", "--shard-count", "1"],
+            vec!["--pod-ordinal", "1"],
+            vec!["--shard-index-mode", "worker_spread", "--fixed-shard-index", "1"],
             vec![
                 "--stream-retry-base-backoff-ms",
                 "100",
@@ -1982,6 +2841,137 @@ mod tests {
             let parsed = Cli::try_parse_from(std::iter::once("test").chain(args));
             assert!(parsed.map(|cli| cli.options.resolve(10, 1).is_err()).unwrap_or(true));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn profile_defaults_preserve_diagnostic_and_expand_realistic_row_variation() -> Result<()> {
+        let diagnostic = options()?;
+        assert_eq!(diagnostic.data_profile, DataProfile::Diagnostic);
+        assert_eq!(
+            diagnostic.string_length_distribution,
+            Some(StringLengthDistribution::Fixed)
+        );
+        assert_eq!(diagnostic.value_variation, Some(ValueVariation::Cardinality));
+        assert_eq!(diagnostic.guid_uniqueness, Some(GuidUniqueness::Cardinality));
+        assert_eq!(diagnostic.string_width, 0);
+
+        let realistic = Cli::try_parse_from(["test", "--data-profile", "realistic"])?
+            .options
+            .resolve(1024, 1)?;
+        assert_eq!(realistic.string_width, 96);
+        assert_eq!(
+            realistic.string_length_distribution,
+            Some(StringLengthDistribution::Uniform)
+        );
+        assert_eq!(realistic.value_variation, Some(ValueVariation::PerRow));
+        assert_eq!(realistic.guid_uniqueness, Some(GuidUniqueness::PerRow));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn realistic_profile_calibrates_target_arrow_width_and_varies_ids_integers_and_timestamps() -> Result<()> {
+        let options = Cli::try_parse_from(["test", "--data-profile", "realistic"])?
+            .options
+            .resolve(1024, 1)?;
+        let table = table_named("sqlserver_availability_replica_states")?;
+        let batch = synthetic_batch(&table, "client", 1024, 0, 0, &options)?;
+        let base_ipc_data = encode(&table, "v1", batch.clone(), &options).await?;
+        let base_ipc_bytes_per_row =
+            base_ipc_data.iter().map(|message| message.encoded_len()).sum::<usize>() / batch.num_rows();
+        let identity_batch = batch_with_logical_identity(&batch, uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), 0, 0)?;
+        let identity_ipc_data = encode(&table, "v1", identity_batch.clone(), &options).await?;
+        let identity_ipc_bytes_per_row = identity_ipc_data
+            .iter()
+            .map(|message| message.encoded_len())
+            .sum::<usize>()
+            / batch.num_rows();
+        let string_bytes_per_row = batch
+            .columns()
+            .iter()
+            .filter(|column| column.data_type() == &DataType::Utf8)
+            .map(|column| column.get_array_memory_size() / batch.num_rows())
+            .collect::<Vec<_>>();
+        let names = batch
+            .column_by_name("sql_server_instance_name")
+            .context("sql_server_instance_name missing")?
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .context("sql_server_instance_name is not a string array")?;
+        let name_lengths = names.iter().flatten().map(str::len).collect::<Vec<_>>();
+        eprintln!(
+            "realistic base_ipc_bytes_per_row={base_ipc_bytes_per_row} identity_ipc_bytes_per_row={identity_ipc_bytes_per_row} array_bytes_per_row={} string_columns={string_bytes_per_row:?} name_length={}..{}",
+            batch.get_array_memory_size() / batch.num_rows(),
+            name_lengths.iter().min().context("missing string lengths")?,
+            name_lengths.iter().max().context("missing string lengths")?,
+        );
+        assert!(
+            (1_000..=1_300).contains(&identity_ipc_bytes_per_row),
+            "identity-bearing realistic profile produced {identity_ipc_bytes_per_row} uncompressed Arrow IPC bytes per row"
+        );
+        assert!(identity_ipc_bytes_per_row >= base_ipc_bytes_per_row);
+        let identity_urls = identity_batch
+            .column_by_name("endpoint_url")
+            .context("endpoint_url missing")?
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .context("endpoint_url is not a string array")?;
+        assert_eq!(
+            identity_urls.iter().collect::<std::collections::BTreeSet<_>>().len(),
+            identity_batch.num_rows()
+        );
+
+        let guid = batch
+            .column_by_name("availability_group_id")
+            .context("availability_group_id missing")?
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .context("availability_group_id is not a string array")?;
+        let unique_guids = guid.iter().collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(unique_guids.len(), batch.num_rows());
+
+        assert!(
+            names
+                .iter()
+                .all(|value| value.is_some_and(|value| (48..=96).contains(&value.len())))
+        );
+
+        let errors = batch
+            .column_by_name("last_connect_error_number")
+            .context("last_connect_error_number missing")?
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .context("last_connect_error_number is not an int32 array")?;
+        assert!(errors.iter().collect::<std::collections::BTreeSet<_>>().len() > 1_000);
+
+        let timestamps = batch
+            .column_by_name("sample_time_utc")
+            .context("sample_time_utc missing")?
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .context("sample_time_utc is not a timestamp array")?;
+        assert!(timestamps.iter().collect::<std::collections::BTreeSet<_>>().len() > 990);
+        Ok(())
+    }
+
+    #[test]
+    fn shard_selection_is_bounded_and_spreads_worker_slots_deterministically() -> Result<()> {
+        let mut options = options()?;
+        options.workers = 4;
+        options.shard_count = 3;
+        options.shard_index_mode = ShardIndexMode::WorkerSpread;
+        options.pod_ordinal = 2;
+        assert_eq!(
+            (0..options.workers)
+                .map(|worker| options.shard_index(worker))
+                .collect::<Result<Vec<_>>>()?,
+            vec![2, 0, 1, 2]
+        );
+        options.shard_index_mode = ShardIndexMode::Fixed;
+        options.pod_ordinal = 0;
+        options.fixed_shard_index = 1;
+        assert_eq!(options.shard_index(3)?, 1);
+        assert!(options.shard_index(4).is_err());
         Ok(())
     }
 
@@ -2099,13 +3089,15 @@ mod tests {
         options.request_timeout_ms = 100;
         let table = Arc::new(table_named("sqlserver_wait_stats")?);
         let record = synthetic_batch(&table, "client", 8, 0, 0, &options)?;
-        let raw_arrow_bytes = record.get_array_memory_size() as u64;
-        let data = encode(&table, "v1", record, &options).await?;
-        let encoded_bytes = data.iter().map(|message| message.encoded_len() as u64).sum();
+        let version = "v1".to_owned();
+        let (data, raw_arrow_bytes, encoded_bytes) =
+            encode_with_sizes(&table, &version, record.clone(), &options).await?;
         let channel = options.endpoint("http://127.0.0.1:0")?.connect_lazy();
         let client = Arc::new(PreparedClient {
             corpus: vec![Arc::new(vec![EncodedBatch {
-                table,
+                table: Arc::clone(&table),
+                version,
+                template: record,
                 data: Arc::new(data),
                 rows: 8,
                 raw_arrow_bytes,
@@ -2116,8 +3108,13 @@ mod tests {
             counters: vec![Counters::default()],
             next: AtomicU64::new(0),
             worker_next: vec![AtomicU64::new(0)],
+            worker_batch_sequence: vec![AtomicU64::new(0)],
             reserved_rows: AtomicU64::new(0),
             measurement: Mutex::new(None),
+            run_id: uuid::Uuid::new_v4(),
+            incarnation_id: uuid::Uuid::new_v4(),
+            logical_batches: Mutex::new(Vec::new()),
+            manifest_capacity_reached: AtomicBool::new(false),
             table_count: 1,
             preparation: serde_json::json!({}),
             started: Instant::now(),
@@ -2125,7 +3122,7 @@ mod tests {
         });
         assert!(client.send_round().await.is_err());
         assert_eq!(client.send_round().await?.completed_rows, 0);
-        let metrics = client.metrics("failed");
+        let metrics = client.metrics("failed")?;
         assert_eq!(metrics["workers"][0]["attempted_rows"], 8);
         assert_eq!(metrics["workers"][0]["error_rows"], 8);
         assert_eq!(metrics["workers"][0]["completed_rows"], 0);
@@ -2279,6 +3276,8 @@ mod tests {
                 (1..=4)
                     .map(|rows| EncodedBatch {
                         table: Arc::clone(&table),
+                        version: String::new(),
+                        template: RecordBatch::new_empty(Arc::clone(table.schema())),
                         data: Arc::new(Vec::new()),
                         rows,
                         raw_arrow_bytes: 0,
@@ -2294,8 +3293,13 @@ mod tests {
             counters: vec![],
             next: AtomicU64::new(0),
             worker_next: vec![AtomicU64::new(0), AtomicU64::new(0)],
+            worker_batch_sequence: vec![AtomicU64::new(0), AtomicU64::new(0)],
             reserved_rows: AtomicU64::new(0),
             measurement: Mutex::new(None),
+            run_id: uuid::Uuid::new_v4(),
+            incarnation_id: uuid::Uuid::new_v4(),
+            logical_batches: Mutex::new(Vec::new()),
+            manifest_capacity_reached: AtomicBool::new(false),
             table_count: 1,
             preparation: serde_json::json!({}),
             started: Instant::now(),
@@ -2359,9 +3363,23 @@ mod tests {
         options.ipc_compression = IpcCompression::Zstd;
         options.grpc_send_compression = GrpcCompression::Gzip;
         options.grpc_accept_compression = GrpcCompression::Gzip;
-        let client = PreparedClient::prepare(&endpoint, "smoke", Some("sqlserver_wait_stats"), None, options).await?;
+        options.data_profile = DataProfile::Realistic;
+        let client = PreparedClient::prepare(
+            &endpoint,
+            "smoke",
+            Some("sqlserver_availability_replica_states"),
+            None,
+            options,
+        )
+        .await?;
         assert_eq!(client.send_once().await?.completed_rows, 8);
         assert_eq!(state.rows.load(Ordering::Relaxed), 8);
+        state
+            .identities
+            .lock()
+            .map_err(|_| anyhow::anyhow!("smoke identity lock poisoned"))?
+            .clear();
+        state.capture_identities.store(true, Ordering::Relaxed);
         state.fast_completions.store(0, Ordering::Relaxed);
         state.slow_next.store(true, Ordering::SeqCst);
         state.rejections_remaining.store(2, Ordering::SeqCst);
@@ -2386,7 +3404,7 @@ mod tests {
             "a slow peer stalled the fast worker"
         );
         assert!(report.completed_rows > 8, "fast worker did not replenish its slot");
-        let metrics = client.metrics("completed");
+        let metrics = client.metrics("completed")?;
         let retry_counts = |name: &str| -> Result<u64> {
             metrics["workers"]
                 .as_array()
@@ -2403,6 +3421,38 @@ mod tests {
         assert_eq!(retry_counts("given_up_rows")?, 0);
         assert!(retry_counts("ambiguous_streams")? >= 1);
         assert!(retry_counts("ambiguous_rows")? >= 8);
+        let (retried_worker, retried_sequence) = {
+            let records = client
+                .logical_batches
+                .lock()
+                .map_err(|_| anyhow::anyhow!("logical batch manifest state poisoned"))?;
+            let record = records
+                .iter()
+                .find(|record| record.attempts > 1 && record.outcome == ManifestOutcome::Acknowledged)
+                .context("missing acknowledged retry record")?;
+            (usize::from(record.worker), record.sequence)
+        };
+        let retried_row_identity = logical_identity_url(
+            client.run_id,
+            client.incarnation_id,
+            retried_worker,
+            retried_sequence,
+            0,
+        )?;
+        let retried_identity_count = {
+            let observed_identities = state
+                .identities
+                .lock()
+                .map_err(|_| anyhow::anyhow!("smoke identity lock poisoned"))?;
+            observed_identities
+                .iter()
+                .filter(|identity| identity.as_str() == retried_row_identity.as_str())
+                .count()
+        };
+        assert_eq!(
+            retried_identity_count, 1,
+            "the acknowledged retry must contain the original logical batch identity exactly once"
+        );
         assert!(metrics["measurement_window"]["ambiguous_streams"].as_u64().unwrap_or(0) >= 1);
         let total = metrics["workers"]
             .as_array()
@@ -2428,6 +3478,90 @@ mod tests {
         shutdown
             .send(())
             .map_err(|()| anyhow::anyhow!("smoke server stopped early"))?;
+        tokio::time::timeout(Duration::from_secs(2), server).await???;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore = "explicit client-ceiling measurement against an in-memory Flight sink"]
+    async fn null_flight_sink_client_ceiling_across_worker_counts() -> Result<()> {
+        use arrowcol_catalog::{CatalogControlPlane, CatalogStore, MemoryCatalogStore};
+        use arrowcol_flight::{AllowAllAuthenticator, ArrowColFlightService, RuntimeLimits};
+        use arrowcol_protocol::{AuthContext, AuthMethod, AuthenticatedPrincipal, PrincipalId, PrincipalIssuer};
+        let store: Arc<dyn CatalogStore> = Arc::new(MemoryCatalogStore::new());
+        let principal = AuthenticatedPrincipal::new(
+            PrincipalId::new("ceiling")?,
+            PrincipalIssuer::new("ceiling")?,
+            Default::default(),
+        )?;
+        let auth = AuthContext::new(principal, AuthMethod::WorkloadIdentity, UnixMillis::new(1)?, None)?;
+        let state = Arc::new(SmokeState::default());
+        let service = ArrowColFlightService::new(
+            ImplementationPool::Dataflow,
+            Arc::clone(&store),
+            Arc::new(AllowAllAuthenticator::new(auth)),
+            Arc::new(SmokeAdmission(Arc::clone(&state))),
+            RuntimeLimits::default(),
+        )?
+        .with_ddl_handler(Arc::new(CatalogControlPlane::new(DdlParser::default(), store)))
+        .into_tonic_service();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let incoming = stream::unfold(listener, |listener| async {
+            Some((listener.accept().await.map(|(socket, _)| socket), listener))
+        });
+        let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(service)
+                .serve_with_incoming_shutdown(incoming, async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+
+        for workers in [1, 2, 4, 8] {
+            let mut options = options()?;
+            options.data_profile = DataProfile::Realistic;
+            options.workers = workers;
+            options.corpus_rows = 4_096;
+            options.batch_rows = 4_096;
+            options.streams_per_worker = 2;
+            options.interval_us = 0;
+            let client = PreparedClient::prepare(
+                &endpoint,
+                "ceiling",
+                Some("sqlserver_availability_replica_states"),
+                None,
+                options,
+            )
+            .await?;
+            let scheduled_start = unix_ms()? + 100;
+            let measurement_start = scheduled_start + 50;
+            let measurement_end = measurement_start + 1_000;
+            client
+                .run_continuous(scheduled_start, measurement_start, measurement_end)
+                .await?;
+            let snapshot = client.metrics("completed")?;
+            client.ensure_terminal_manifest_complete()?;
+            let window = &snapshot["measurement_window"];
+            let rows = window["completed_rows"].as_u64().context("missing completed rows")?;
+            let raw_bytes = window["completed_raw_arrow_bytes"]
+                .as_u64()
+                .context("missing uncompressed Arrow bytes")?;
+            let rows_per_second_per_core = rows as f64 / workers as f64;
+            let gb_per_second_per_core = raw_bytes as f64 / 1_000_000_000.0 / workers as f64;
+            eprintln!(
+                "W2_CLIENT_CEILING workers={workers} rows_per_second={} raw_GB_per_second={:.6} rows_per_second_per_core={rows_per_second_per_core:.3} raw_GB_per_second_per_core={gb_per_second_per_core:.6}",
+                rows,
+                raw_bytes as f64 / 1_000_000_000.0,
+            );
+            assert!(rows > 0, "null Flight sink received no rows with {workers} workers");
+        }
+
+        shutdown
+            .send(())
+            .map_err(|()| anyhow::anyhow!("null sink stopped early"))?;
         tokio::time::timeout(Duration::from_secs(2), server).await???;
         Ok(())
     }
