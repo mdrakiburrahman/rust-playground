@@ -635,11 +635,13 @@ test('real loadgen initializer composes with the Node BR3 planned-identity paren
     [['x-arrowcol-operation-id', PLANNED_STORAGE_OPERATION_IDS[3]]]);
   const deltaLastCheckpoint = signedObjectRequest(authority, deadline, 18, 'GET', checkpointUrl, '',
     [['content-length', '0'], ['x-arrowcol-operation-id', PLANNED_STORAGE_OPERATION_IDS[4]]]);
-  const deltaVersionedLogListing = signedObjectRequest(authority, deadline, 19, 'GET', versionedLogListingUrl, '',
-    [['x-arrowcol-operation-id', PLANNED_STORAGE_OPERATION_IDS[5]]]);
-  const deltaReadback = signedObjectRequest(authority, deadline, 20, 'GET', logUrl, '',
-    [['content-length', '0'], ['x-arrowcol-operation-id', PLANNED_STORAGE_OPERATION_IDS[6]]]);
-  const envelope = envelopeForRequests(authority, [...controlRequests, initialListing, logListing, deltaCommit, postwriteListing, deltaLastCheckpoint, deltaVersionedLogListing, deltaReadback]);
+  const deltaVersionedLogListing = signedObjectRequest(authority, deadline, 19, "GET", versionedLogListingUrl, "",
+    [["x-arrowcol-operation-id", PLANNED_STORAGE_OPERATION_IDS[5]]]);
+  const deltaReadback = signedObjectRequest(authority, deadline, 20, "GET", logUrl, "",
+    [["content-length", "0"], ["x-arrowcol-operation-id", PLANNED_STORAGE_OPERATION_IDS[6]]]);
+  const deltaReadbackFollowup = signedObjectRequest(authority, deadline, 21, "GET", logUrl, "",
+    [["content-length", "0"], ["x-arrowcol-operation-id", PLANNED_STORAGE_OPERATION_IDS[7]]]);
+  const envelope = envelopeForRequests(authority, [...controlRequests, initialListing, logListing, deltaCommit, postwriteListing, deltaLastCheckpoint, deltaVersionedLogListing, deltaReadback, deltaReadbackFollowup]);
   const custody = mutableCustodyStore(authority, now);
   const azure = { c: { account }, async token() { return 'offline-test-token'; } } as unknown as Azure;
   const ledgerPath = path.join(directory, 'storage-ledger.jsonl');
@@ -667,7 +669,8 @@ test('real loadgen initializer composes with the Node BR3 planned-identity paren
       if (url.pathname.endsWith('/_delta_log/_last_checkpoint') && init?.method === 'GET') return new Response(null,
         { status: 404, headers: { 'x-ms-error-code': 'BlobNotFound' } });
       if (url.pathname.endsWith('/_delta_log/00000000000000000000.json') && init?.method === 'GET')
-        return new Response(deltaLogBody ?? null, { status: deltaLogBody === undefined ? 404 : 200 });
+        return deltaLogBody === undefined ? new Response(null, { status: 404 }) :
+          new Response(deltaLogBody, { status: 200, headers: { "content-length": String(Buffer.byteLength(deltaLogBody, "utf8")), "last-modified": "Tue, 17 Nov 2026 11:03:18 GMT", etag: "\"offline-delta-v0\"" } });
       if (url.searchParams.get('comp') === 'list') {
         const prefix = url.searchParams.get('prefix') ?? '';
         const name = listPrefix + '_delta_log/00000000000000000000.json';

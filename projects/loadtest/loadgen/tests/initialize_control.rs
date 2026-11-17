@@ -137,6 +137,7 @@ fn owned_plan() -> arrowcol_loadgen::initialize::OwnedRunTablePlan {
             "delta-v0-last-checkpoint",
             "delta-v0-versioned-log-list",
             "delta-v0-readback",
+            "delta-v0-readback-followup",
         ]
         .map(str::to_owned)
         .to_vec(),

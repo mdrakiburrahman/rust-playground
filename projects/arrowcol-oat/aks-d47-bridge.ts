@@ -20,7 +20,7 @@ export const PLANNED_CONTROL_OPERATION_IDS = [
   'terminal-acquire', 'terminal-compare-read', 'terminal-metadata-write', 'terminal-release',
 ] as const;
 export const PLANNED_STORAGE_OPERATION_IDS = [
-  'preflight-table-list', 'preflight-log-list', 'delta-v0-commit', 'postwrite-table-list', 'delta-v0-last-checkpoint', 'delta-v0-versioned-log-list', 'delta-v0-readback',
+  'preflight-table-list', 'preflight-log-list', 'delta-v0-commit', 'postwrite-table-list', 'delta-v0-last-checkpoint', 'delta-v0-versioned-log-list', 'delta-v0-readback', 'delta-v0-readback-followup',
 ] as const;
 type Obj = Record<string, unknown>;
 
@@ -884,7 +884,7 @@ export class StorageBridgeDispatcher {
       index === 2 ? request.method === 'PUT' && url.href === logUrl :
       index === 4 ? request.method === 'GET' && url.href === checkpointUrl :
       index === 5 ? exactList(tablePrefix + '_delta_log/', tablePrefix + '_delta_log/00000000000000000000') :
-      index === 6 ? request.method === 'GET' && url.href === logUrl : false;
+      index === 6 || index === 7 ? request.method === 'GET' && url.href === logUrl : false;
     if (!phaseAllowed || !shapeAllowed)
       throw new Error("Object-store request does not match the exact planned marker, phase and URL.");
     return { operationIndex: index };
@@ -1086,7 +1086,7 @@ async function runBridgeChild(executable: string, args: string[], cwd: string, d
     }
     const result = await closed;
     if (failure) throw failure;
-    if (result.code !== 0 || !finalSeen) throw new Error('Bridge child failed or omitted its final actual receipt; no fallback is permitted.');
+    if (result.code !== 0 || !finalSeen) throw new Error("Bridge child failed or omitted its final actual receipt; stderr=" + stderr.toString("utf8"));
     if (exchangeCount === 0) throw new Error('Bridge child emitted a final receipt without any actual bridge exchange.');
     return { receipt: final, exchangeCount };
   } catch (error) { kill(); await closed.catch(() => undefined); throw error; }

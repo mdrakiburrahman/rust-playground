@@ -42,7 +42,7 @@ const PLANNED_CONTROL_OPERATION_IDS: [&str; 13] = [
     "terminal-metadata-write",
     "terminal-release",
 ];
-const PLANNED_STORAGE_OPERATION_IDS: [&str; 7] = [
+const PLANNED_STORAGE_OPERATION_IDS: [&str; 8] = [
     "preflight-table-list",
     "preflight-log-list",
     "delta-v0-commit",
@@ -50,6 +50,7 @@ const PLANNED_STORAGE_OPERATION_IDS: [&str; 7] = [
     "delta-v0-last-checkpoint",
     "delta-v0-versioned-log-list",
     "delta-v0-readback",
+    "delta-v0-readback-followup",
 ];
 
 /// Strict input allocation for one fresh table, not permission to execute cloud operations.
