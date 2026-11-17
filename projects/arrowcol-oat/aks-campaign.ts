@@ -763,6 +763,12 @@ export function createBlobCampaignStore(config: CampaignStoreConfig, fetcher: Fe
     if (remaining <= 0) throw new Error('Campaign store operation exceeded its original deadline.');
     return AbortSignal.timeout(remaining);
   };
+  const cancelCappedResponseBody = async (response: Response, maxResponseBodyBytes: number | undefined,
+    reason: Error, message: string): Promise<void> => {
+    if (maxResponseBodyBytes === undefined || !response.body) return;
+    try { await response.body.cancel(reason); }
+    catch (cancelError) { throw new AggregateError([reason, cancelError], message); }
+  };
   const readCappedResponseBytes = async (response: Response, maxBytes: number, signal?: AbortSignal,
     deadlineUnixMs?: number): Promise<Buffer> => {
     const contentLength = response.headers.get('content-length');
@@ -843,14 +849,28 @@ export function createBlobCampaignStore(config: CampaignStoreConfig, fetcher: Fe
       if (maxResponseBodyBytes !== undefined &&
           (signal?.aborted || options?.deadlineUnixMs !== undefined && Date.now() >= options.deadlineUnixMs)) {
         const error = new Error('Campaign store operation exceeded its original deadline.');
-        try { await response.body?.cancel(error); }
-        catch (cancelError) { throw new AggregateError([error, cancelError], 'Campaign state response deadline refusal could not cancel its body.'); }
+        await cancelCappedResponseBody(response, maxResponseBodyBytes, error,
+          'Campaign state response deadline refusal could not cancel its body.');
         throw error;
       }
-      if (response.status === 404) return undefined;
-      if (!response.ok) throw new Error(`Campaign state read failed with HTTP ${response.status}.`);
+      if (response.status === 404) {
+        await cancelCappedResponseBody(response, maxResponseBodyBytes, new Error('Campaign state blob is absent.'),
+          'Campaign state absence refusal could not cancel its body.');
+        return undefined;
+      }
+      if (!response.ok) {
+        const error = new Error(`Campaign state read failed with HTTP ${response.status}.`);
+        await cancelCappedResponseBody(response, maxResponseBodyBytes, error,
+          'Campaign state status refusal could not cancel its body.');
+        throw error;
+      }
       const etag = response.headers.get('etag');
-      if (!etag) throw new Error('Campaign state response has no ETag.');
+      if (!etag) {
+        const error = new Error('Campaign state response has no ETag.');
+        await cancelCappedResponseBody(response, maxResponseBodyBytes, error,
+          'Campaign state ETag refusal could not cancel its body.');
+        throw error;
+      }
       let value: unknown;
       if (maxResponseBodyBytes === undefined) {
         try { value = await response.json(); } catch { throw new Error('Campaign state blob is not valid JSON.'); }

@@ -20,7 +20,8 @@ const subscriptionId = 'c0ffee00-0000-4000-8000-000000000003';
 const resourceId = `/subscriptions/${subscriptionId}/resourceGroups/perf69/providers/Microsoft.ContainerService/managedClusters/bench`;
 const operationUrl = `https://management.azure.com/subscriptions/${subscriptionId}/providers/Microsoft.ContainerService/locations/westus/operations/123?api-version=2024-10-01`;
 
-function chunkedResponse(chunks: Uint8Array[], headers: Record<string, string> = {}, close = true) {
+function chunkedResponse(chunks: Uint8Array[], headers: Record<string, string> = {}, close = true,
+  status = 200, etag: string | null = '"state-v1"') {
   let cancelled = false, index = 0;
   const body = new ReadableStream<Uint8Array>({
     pull(controller) {
@@ -31,8 +32,10 @@ function chunkedResponse(chunks: Uint8Array[], headers: Record<string, string> =
     },
     cancel() { cancelled = true; },
   });
+  const responseHeaders = { ...headers };
+  if (etag !== null) responseHeaders.etag = etag;
   return {
-    response: new Response(body, { status: 200, headers: { etag: '"state-v1"', ...headers } }),
+    response: new Response(body, { status, headers: responseHeaders }),
     wasCancelled: () => cancelled,
   };
 }
@@ -555,4 +558,20 @@ test('campaign store rejects zero response cap before token acquisition or netwo
   await assert.rejects(store.read({ maxResponseBodyBytes: 0 }), /positive safe integer/);
   assert.equal(tokens, 0);
   assert.equal(fetches, 0);
+});
+
+test('capped campaign reads cancel streaming bodies on 404, status, and missing ETag exits', async () => {
+  const config = { account: 'arrowcollector12345', container: 'checkpoints', subscriptionId };
+  const cases = [
+    { status: 404, etag: '"state-v1"', error: undefined },
+    { status: 503, etag: '"state-v1"', error: /HTTP 503/ },
+    { status: 200, etag: null, error: /no ETag/ },
+  ] as const;
+  for (const item of cases) {
+    const body = chunkedResponse([Buffer.from('pending')], {}, false, item.status, item.etag);
+    const store = createBlobCampaignStore(config, async () => body.response, async () => 'fixture-token');
+    if (item.error) await assert.rejects(store.read({ maxResponseBodyBytes: 32 }), item.error);
+    else assert.equal(await store.read({ maxResponseBodyBytes: 32 }), undefined);
+    assert.equal(body.wasCancelled(), true, `HTTP ${item.status} / ETag ${item.etag} body must be cancelled`);
+  }
 });
