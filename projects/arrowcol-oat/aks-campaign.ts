@@ -53,6 +53,100 @@ export type CleanupArmTarget =
   { kind: 'kusto'; sku: 'Standard_E4ads_v5'; capacity: 2; minimum: 2; maximum: 4; autoStop: true };
 export interface ArmOperationReceipt { id: string; resourceId: string; operationUrl: string; submittedAtMs: number;
   status: ArmOperationStatus; lastCheckedAtMs?: number; cleanupTarget?: CleanupArmTarget; }
+export const SCALE_RESTORE_TIMEOUT_MS = 5 * 60 * 1000;
+export type ScaleDimension = 'loadgen-max' | 'collector-cpu-limit' | 'collector-memory-limit' |
+  'collector-node-max' | 'kusto-capacity' | 'kusto-sku' | 'system-pool-count';
+export interface ScaleTarget { dimension: ScaleDimension; before: number | string; after: number | string }
+export interface ScaleResourceIdentity {
+  transport: 'azure-rest' | 'kubernetes'; resource_id: string; api_version: string | null; kind: string;
+  namespace: string | null; name: string; uid: string | null;
+}
+export type ScaleTrialPhase = 'apply-intent' | 'applied' | 'kept' | 'restore-intent' | 'restored' | 'reverted' | 'unknown';
+export interface ScaleTrialReceipt {
+  schema_version: 1; trial_id: string; campaign_id: string; owner_id: string; fencing_token: number; cell_run_id: string;
+  started_at_ms: number; deadline_at_ms: number; restore_deadline_at_ms: number; target: ScaleTarget; restore: ScaleTarget; evidence: string[];
+  baseline: { committed_rows_per_second: number; qap_pending_backlog: number; qap_p95_latency_ms: number };
+  resource: ScaleResourceIdentity; phase: ScaleTrialPhase; operation_url?: string;
+  result?: { outcome: 'keep' | 'revert' | 'stop' | 'unknown'; committed_rows_per_second: number | null;
+    qap_pending_backlog: number | null; qap_p95_latency_ms: number | null; ineffective_increments: number; reason: string };
+}
+export function validateScaleTarget(value: unknown): ScaleTarget {
+  if (!record(value) || !exactRecord(value, ['dimension', 'before', 'after']) ||
+      !['loadgen-max', 'collector-cpu-limit', 'collector-memory-limit', 'collector-node-max', 'kusto-capacity',
+        'kusto-sku', 'system-pool-count'].includes(String(value.dimension)) ||
+      typeof value.before !== typeof value.after || !['number', 'string'].includes(typeof value.before) || value.before === value.after)
+    throw new Error('Scale target is invalid or has an unsupported dimension.');
+  const dimension = value.dimension as ScaleDimension;
+  if (typeof value.before === 'number' && (!Number.isSafeInteger(value.before) || value.before < 0 ||
+      !Number.isSafeInteger(value.after) || (value.after as number) < 0))
+    throw new Error('Scale target numeric values must be nonnegative safe integers.');
+  if (dimension === 'kusto-sku' && (!['Standard_E4ads_v5', 'Standard_E8ads_v5'].includes(String(value.before)) ||
+      !['Standard_E4ads_v5', 'Standard_E8ads_v5'].includes(String(value.after))))
+    throw new Error('Kusto SKU target is not an approved one-step size.');
+  const bounds: Partial<Record<ScaleDimension, { min: number; max: number; delta: number }>> = {
+    'loadgen-max': { min: 1, max: 4, delta: 1 }, 'collector-cpu-limit': { min: 1, max: 8, delta: 1 },
+    'collector-memory-limit': { min: 1, max: 24, delta: 2 }, 'collector-node-max': { min: 0, max: 4, delta: 1 },
+    'kusto-capacity': { min: 2, max: 4, delta: 1 }, 'system-pool-count': { min: 2, max: 4, delta: 1 },
+  };
+  const bound = bounds[dimension];
+  if (bound && (typeof value.before !== 'number' || typeof value.after !== 'number' ||
+      value.before < bound.min || value.before > bound.max || value.after < bound.min || value.after > bound.max ||
+      Math.abs(value.after - value.before) !== bound.delta))
+    throw new Error('Scale target exceeds the approved one-step range.');
+  return value as unknown as ScaleTarget;
+}
+function validScaleTrial(value: unknown, state: CampaignState): value is ScaleTrialReceipt {
+  if (!record(value) || !optionalRecord(value, ['schema_version', 'trial_id', 'campaign_id', 'owner_id', 'fencing_token', 'cell_run_id',
+      'started_at_ms', 'deadline_at_ms', 'restore_deadline_at_ms', 'target', 'restore', 'evidence', 'baseline', 'resource', 'phase'], ['operation_url', 'result'])) return false;
+  let target: ScaleTarget, restore: ScaleTarget;
+  try { target = validateScaleTarget(value.target); restore = validateScaleTarget(value.restore); } catch { return false; }
+  const resource = value.resource as Record<string, unknown>;
+  if (!record(resource) || !exactRecord(resource, ['transport', 'resource_id', 'api_version', 'kind', 'namespace', 'name', 'uid']) ||
+      !['azure-rest', 'kubernetes'].includes(String(resource.transport)) || !nonempty(resource.resource_id) ||
+      !nonempty(resource.kind) || !nonempty(resource.name) ||
+      !(resource.api_version === null || nonempty(resource.api_version)) ||
+      !(resource.namespace === null || k8sName(resource.namespace)) ||
+      !(resource.uid === null || uuid.test(String(resource.uid))) ||
+      target.dimension !== restore.dimension || target.before !== restore.after || target.after !== restore.before ||
+      !Array.isArray(value.evidence) || value.evidence.length < 1 || value.evidence.length > 8 ||
+      value.evidence.some(item => typeof item !== 'string' || item.length > 64 || !/^[a-z0-9-]+$/.test(item)) ||
+      !record(value.baseline) || !exactRecord(value.baseline, ['committed_rows_per_second', 'qap_pending_backlog', 'qap_p95_latency_ms']) ||
+      typeof value.baseline.committed_rows_per_second !== 'number' || !Number.isFinite(value.baseline.committed_rows_per_second) || value.baseline.committed_rows_per_second < 0 ||
+      !nonnegative(value.baseline.qap_pending_backlog) || typeof value.baseline.qap_p95_latency_ms !== 'number' ||
+      !Number.isFinite(value.baseline.qap_p95_latency_ms) || value.baseline.qap_p95_latency_ms < 0 ||
+      value.schema_version !== 1 || !uuid.test(String(value.trial_id)) || value.campaign_id !== state.campaignId ||
+      value.owner_id !== state.ownerId || !nonnegative(value.fencing_token) || value.fencing_token < 1 ||
+      value.fencing_token > state.fencingToken || !state.runInventory || state.mode !== 'armed' ||
+      !uuid.test(String(value.cell_run_id)) || !nonnegative(value.started_at_ms) || !nonnegative(value.deadline_at_ms) ||
+      !nonnegative(value.restore_deadline_at_ms) || !Number.isSafeInteger(value.deadline_at_ms + SCALE_RESTORE_TIMEOUT_MS) ||
+      value.restore_deadline_at_ms !== value.deadline_at_ms + SCALE_RESTORE_TIMEOUT_MS ||
+      value.deadline_at_ms < value.started_at_ms || value.deadline_at_ms > state.expiresAtMs || value.restore_deadline_at_ms > state.expiresAtMs ||
+      !['apply-intent', 'applied', 'kept', 'restore-intent', 'restored', 'reverted', 'unknown'].includes(String(value.phase))) return false;
+  if (value.result !== undefined) {
+    const result = value.result;
+    if (!record(result) || !exactRecord(result, ['outcome', 'committed_rows_per_second', 'qap_pending_backlog', 'qap_p95_latency_ms', 'ineffective_increments', 'reason']) ||
+        !['keep', 'revert', 'stop', 'unknown'].includes(String(result.outcome)) ||
+        ![result.committed_rows_per_second, result.qap_p95_latency_ms].every(item => item === null || typeof item === 'number' && Number.isFinite(item) && item >= 0) ||
+        !(result.qap_pending_backlog === null || nonnegative(result.qap_pending_backlog)) || typeof result.ineffective_increments !== 'number' || !Number.isSafeInteger(result.ineffective_increments) || result.ineffective_increments < 0 ||
+        typeof result.reason !== 'string' || result.reason.length === 0 || result.reason.length > 128 || /[\u0000-\u001f]/.test(result.reason) ||
+        result.outcome === 'unknown' !== [result.committed_rows_per_second, result.qap_pending_backlog, result.qap_p95_latency_ms].every(item => item === null)) return false;
+  }
+  if (resource.transport === 'azure-rest') {
+    if (!String(resource.resource_id).startsWith('/subscriptions/') || resource.namespace !== null || resource.uid !== null ||
+        typeof resource.api_version !== 'string') return false;
+    if (value.operation_url !== undefined) {
+      try {
+        const url = new URL(String(value.operation_url));
+        const subscription = /^\/subscriptions\/([0-9a-f-]{36})\//i.exec(String(resource.resource_id))?.[1];
+        if (!subscription || url.protocol !== 'https:' || url.hostname !== 'management.azure.com' || url.username || url.password || url.hash ||
+            !url.pathname.toLowerCase().includes('/subscriptions/' + subscription.toLowerCase())) return false;
+      } catch { return false; }
+    }
+  } else if (resource.transport === 'kubernetes' && (resource.api_version !== 'apps/v1' || resource.kind !== 'Deployment' ||
+      resource.namespace === null || resource.uid === null || value.operation_url !== undefined ||
+      resource.resource_id !== 'apps/v1/Deployment/' + resource.namespace + '/' + resource.name + '/' + resource.uid)) return false;
+  return true;
+}
 export function validCleanupArmTarget(value: unknown): value is CleanupArmTarget {
   if (!record(value)) return false;
   if (value.kind === 'aks-pool') return exactRecord(value, ['kind', 'count', 'autoscale', 'minimum', 'maximum']) &&
@@ -67,7 +161,7 @@ export interface CampaignState {
   startedAtMs: number; heartbeatAtMs: number; heartbeatSequence: number; expiresAtMs: number; lastEvaluatedAtMs?: number;
   lastMissedHeartbeatCount?: number; fenceReason?: 'heartbeat-expired' | 'max-lifetime'; fencedAtMs?: number;
   cleanupStatus: 'not-started' | 'pending' | 'running' | 'verified' | 'verified_with_unsettled'; cleanupSteps: CleanupReceipt[];
-  runInventory?: RunInventory; operations: ArmOperationReceipt[];
+  runInventory?: RunInventory; operations: ArmOperationReceipt[]; scaleTrials?: ScaleTrialReceipt[];
 }
 export interface StoredCampaign { state: CampaignState; etag: string; }
 export interface CampaignStore { read(): Promise<StoredCampaign | undefined>; write(state: CampaignState, expectedEtag?: string): Promise<string>; }
@@ -414,7 +508,7 @@ export function validateCampaignState(value: unknown): CampaignState {
   if (!record(value) || Object.keys(value).some(key => ![
     'schemaVersion', 'campaignId', 'ownerId', 'fencingToken', 'mode', 'status', 'startedAtMs', 'heartbeatAtMs',
     'heartbeatSequence', 'expiresAtMs', 'lastEvaluatedAtMs', 'lastMissedHeartbeatCount', 'fenceReason', 'fencedAtMs',
-    'cleanupStatus', 'cleanupSteps', 'runInventory', 'operations',
+    'cleanupStatus', 'cleanupSteps', 'runInventory', 'operations', 'scaleTrials',
   ].includes(key))) throw new Error('Campaign state has unknown fields or is not an object.');
   const state = value as unknown as CampaignState;
   if (state.schemaVersion !== 1 || !uuid.test(state.campaignId) || !uuid.test(state.ownerId) ||
@@ -424,7 +518,8 @@ export function validateCampaignState(value: unknown): CampaignState {
       !Number.isSafeInteger(state.heartbeatSequence) || state.heartbeatSequence < 0 ||
       state.expiresAtMs !== state.startedAtMs + MAX_CAMPAIGN_LIFETIME_MS ||
       !['not-started', 'pending', 'running', 'verified', 'verified_with_unsettled'].includes(state.cleanupStatus) ||
-      !Array.isArray(state.operations) || state.operations.length > MAX_ARM_OPERATIONS || !Array.isArray(state.cleanupSteps))  {
+      !Array.isArray(state.operations) || state.operations.length > MAX_ARM_OPERATIONS || !Array.isArray(state.cleanupSteps) ||
+      state.scaleTrials !== undefined && (!Array.isArray(state.scaleTrials) || state.scaleTrials.length > 64))  {
     throw new Error('Campaign state is malformed or violates the fixed custody limits.');
   }
   if (state.lastEvaluatedAtMs !== undefined && !nonnegative(state.lastEvaluatedAtMs) ||
@@ -464,6 +559,18 @@ export function validateCampaignState(value: unknown): CampaignState {
   if (state.mode === 'armed' && !state.runInventory || state.status !== 'active' && !state.runInventory) {
     throw new Error('Campaign cannot be armed or fenced without a persisted RunInventory.');
   }
+  const scaleTrials = state.scaleTrials ?? [];
+  if (!Array.isArray(scaleTrials) || scaleTrials.length > 64) throw new Error('Scale trial journal exceeds its fixed receipt bound.');
+  const trialIds = new Set<string>();
+  let unresolvedTrials = 0;
+  for (const trial of scaleTrials) {
+    if (!validScaleTrial(trial, state) || trialIds.has(trial.trial_id)) throw new Error('Scale trial receipt is malformed or duplicated.');
+    trialIds.add(trial.trial_id);
+    if (['apply-intent', 'applied', 'restore-intent', 'unknown'].includes(trial.phase)) unresolvedTrials++;
+  }
+  if (unresolvedTrials > 1) throw new Error('Campaign has multiple unresolved scale trials.');
+  if (['complete', 'complete_unsettled'].includes(state.status) && scaleTrials.some(trial => !['restored', 'reverted'].includes(trial.phase)))
+    throw new Error('Campaign cannot finalize while scale effects are not restored.');
   const ids = new Set<string>();
   for (const operation of state.operations) {
     if (!record(operation) || !uuid.test(operation.id) || ids.has(operation.id) ||

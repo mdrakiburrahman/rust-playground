@@ -37,6 +37,7 @@ test('load-generator expansion requires generator saturation, collector headroom
   assert.equal(recommendScaleStep(evidence({ collectorCpuSaturated: true, collectorCpuLimitCores: 8,
     collectorPlacementBlocked: false }))?.dimension, undefined);
   assert.equal(recommendScaleStep(evidence({ collectorPlacementBlocked: true }))?.dimension, 'collector-node-max');
+  assert.equal(recommendScaleStep(evidence({ unschedulablePods: 1 }))?.dimension, undefined);
   assert.throws(() => recommendScaleStep(evidence({ loadgenMax: 1.5 })), /numeric measurements/);
 });
 
@@ -50,20 +51,93 @@ test('collector and Kusto scale only on their measured bottleneck signals', () =
   assert.deepEqual(kusto?.restore, { dimension: 'kusto-capacity', before: 3, after: 2 });
 });
 
-test('scale trials persist custody-fenced intent before mutation and restore when measurement fails', async () => {
+test('scale trials persist intent and restore only after exact target readback', async () => {
   const step = recommendScaleStep(evidence({ generatorNetworkSaturated: true }))!;
   const token = { ownerId: 'c0ffee00-0000-4000-8000-000000000002', fencingToken: 2 };
   const sequence: string[] = [];
   const applied: ScaleTarget[] = [];
+  let current = step.before;
   const adapter = {
     assertCustody: async (actual: typeof token) => { assert.equal(actual, token); sequence.push('assert'); },
     persistIntent: async (target: ScaleTarget) => { sequence.push('intent:' + target.after); },
-    apply: async (target: ScaleTarget) => { applied.push(target); sequence.push('apply:' + target.after); },
+    apply: async (target: ScaleTarget) => { applied.push(target); current = target.after; sequence.push('apply:' + target.after); },
+    reconcile: async (target: ScaleTarget) => current === target.before ? 'before' as const :
+      current === target.after ? 'after' as const : 'unknown' as const,
     measure: async () => { throw new Error('measurement failed'); },
   };
   await assert.rejects(executeScaleTrial(step, adapter, token), /measurement failed/);
   assert.deepEqual(applied.map(target => target.after), [2, 1]);
-  assert.deepEqual(sequence, ['assert', 'intent:2', 'apply:2', 'assert', 'intent:1', 'apply:1']);
+  assert.equal(current, 1);
+  assert.ok(sequence.indexOf('intent:2') < sequence.indexOf('apply:2'));
+  assert.ok(sequence.indexOf('intent:1') < sequence.indexOf('apply:1'));
+});
+
+test('scale restoration is attempted when measurement setup fails after an exact apply', async () => {
+  const step = recommendScaleStep(evidence({ generatorCpuSaturated: true }))!;
+  const token = { ownerId: 'c0ffee00-0000-4000-8000-000000000002', fencingToken: 2 };
+  const applied: ScaleTarget[] = [];
+  let current = step.before;
+  const adapter = {
+    assertCustody: async () => {}, persistIntent: async () => {},
+    apply: async (target: ScaleTarget) => { applied.push(target); current = target.after; },
+    reconcile: async (target: ScaleTarget) => current === target.before ? 'before' as const :
+      current === target.after ? 'after' as const : 'unknown' as const,
+    beginMeasurement: async () => { throw new Error('measurement setup failed'); },
+    measure: async () => ({ committedRowsPerSecond: 1000, qapPendingBacklog: 0, qapP95LatencyMs: 0 }),
+  };
+  await assert.rejects(executeScaleTrial(step, adapter, token), /measurement setup failed/);
+  assert.deepEqual(applied.map(target => target.after), [step.after, step.restore.after]);
+  assert.equal(current, step.before);
+});
+
+test('an uncertain scale application is neither replayed nor rolled back', async () => {
+  const step = recommendScaleStep(evidence({ generatorCpuSaturated: true }))!;
+  const token = { ownerId: 'c0ffee00-0000-4000-8000-000000000002', fencingToken: 2 };
+  const applied: ScaleTarget[] = [];
+  let observations = 0;
+  const adapter = {
+    assertCustody: async () => {}, persistIntent: async () => {},
+    apply: async (target: ScaleTarget) => { applied.push(target); throw new Error('lost response'); },
+    reconcile: async () => observations++ === 0 ? 'before' as const : 'unknown' as const,
+    measure: async () => ({ committedRowsPerSecond: 1000, qapPendingBacklog: 0, qapP95LatencyMs: 0 }),
+  };
+  await assert.rejects(executeScaleTrial(step, adapter, token), /refusing to replay or roll back/);
+  assert.deepEqual(applied.map(target => target.after), [2]);
+});
+
+test('a lost apply response with exact after-state is measured without replay', async () => {
+  const step = recommendScaleStep(evidence({ generatorNetworkSaturated: true }))!;
+  const token = { ownerId: 'c0ffee00-0000-4000-8000-000000000002', fencingToken: 2 };
+  let current = step.before;
+  const applied: ScaleTarget[] = [];
+  const adapter = {
+    assertCustody: async () => {}, persistIntent: async () => {},
+    apply: async (target: ScaleTarget) => { applied.push(target); current = target.after; throw new Error('lost response'); },
+    reconcile: async (target: ScaleTarget) => current === target.before ? 'before' as const :
+      current === target.after ? 'after' as const : 'unknown' as const,
+    measure: async () => ({ committedRowsPerSecond: 1100, qapPendingBacklog: 0, qapP95LatencyMs: 0 }),
+  };
+  assert.equal((await executeScaleTrial(step, adapter, token)).outcome, 'keep');
+  assert.deepEqual(applied.map(target => target.after), [2]);
+});
+
+test('an uncertain restore response is reconciled instead of replayed', async () => {
+  const step = recommendScaleStep(evidence({ generatorCpuSaturated: true }))!;
+  const token = { ownerId: 'c0ffee00-0000-4000-8000-000000000002', fencingToken: 2 };
+  let current = step.before;
+  const applied: ScaleTarget[] = [];
+  const adapter = {
+    assertCustody: async () => {}, persistIntent: async () => {},
+    apply: async (target: ScaleTarget) => {
+      applied.push(target); current = target.after;
+      if (target === step.restore) throw new Error('restore response lost');
+    },
+    reconcile: async (target: ScaleTarget) => current === target.before ? 'before' as const :
+      current === target.after ? 'after' as const : 'unknown' as const,
+    measure: async () => ({ committedRowsPerSecond: 1000, qapPendingBacklog: 0, qapP95LatencyMs: 0 }),
+  };
+  assert.equal((await executeScaleTrial(step, adapter, token)).outcome, 'revert');
+  assert.deepEqual(applied.map(target => target.after), [2, 1]);
 });
 
 test('Kusto trials keep QAP improvement at stable ingress and revert without it', () => {
@@ -76,7 +150,7 @@ test('Kusto trials keep QAP improvement at stable ingress and revert without it'
 
 test('scale input parser rejects unknown and nonreversible target shapes', () => {
   assert.throws(() => validateScaleTarget({ dimension: 'unvalidated', before: 1, after: 2 }), /invalid/);
-  assert.throws(() => validateScaleTarget({ dimension: 'loadgen-max', before: 1.5, after: 2 }), /integers/);
+  assert.throws(() => validateScaleTarget({ dimension: 'loadgen-max', before: 1.5, after: 2 }), /safe integers/);
   assert.throws(() => assessScaleTrial({ dimension: 'kusto-capacity', before: 2, after: 3,
     restore: { dimension: 'kusto-capacity', before: 3, after: 4 }, evidence: ['saturated'], baselineCommittedRowsPerSecond: 1,
     baselineQapPendingBacklog: 1, baselineQapP95LatencyMs: 1 }, { committedRowsPerSecond: 2, qapPendingBacklog: 0, qapP95LatencyMs: 0 }), /reversible/);

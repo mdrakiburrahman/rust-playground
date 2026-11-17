@@ -10,6 +10,7 @@ import { defaultStampConfig } from '../../infra/azure/stamp.js';
 import { CUSTODY_CLEANUP_STEPS, CampaignConflictError, CampaignWriteOutcomeUnknownError, campaignMain, newCampaignState, publishRunInventory, type CampaignState, type CampaignStore,
   type RunInventory, type StoredCampaign } from './aks-campaign.js';
 import { captureCleanupBaseline, createDefaultCleanupProviders, readCleanupBaseline, type StampHealthReceipt } from './aks-default-providers.js';
+import { buildAksPoolScalePayload } from './aks-arm-pool.js';
 import type { CleanupMutationAuthority } from './aks-cleanup-executor.js';
 import { loadCustodyConfig } from './aks-custody-config.js';
 import { observeExactKubernetes, type CustodyCommandRunner } from './aks-setup-cleanup.js';
@@ -506,4 +507,18 @@ test('fencing during ARM response reconciliation cannot publish stale progress o
   await assert.rejects(f.providers.restoreSafeIdle(f.store.state, 'restore', f.authority), /stale cleanup actor/);
   assert.equal(f.store.state.operations[0].status, 'pending');
   assert.equal(f.mutations.length, 1);
+});
+
+
+test('AKS pool scale update preserves recognized writable fields and rejects unknown configuration', () => {
+  const resource = { id: '/subscriptions/11111111-1111-4111-8111-111111111111/resourceGroups/perf69/providers/Microsoft.ContainerService/managedClusters/bench/agentPools/benche64',
+    properties: { count: 0, vmSize: 'Standard_E64ds_v6', mode: 'User', osType: 'Linux', osSKU: 'AzureLinux', maxPods: 250,
+      enableAutoScaling: true, minCount: 0, maxCount: 1, provisioningState: 'Succeeded', nodeLabels: { 'arrow-collector/role': 'arrowcol' } } };
+  const payload = buildAksPoolScalePayload(resource, { count: 0, autoscale: true, minimum: 0, maximum: 2 });
+  const properties = payload.properties as Record<string, unknown>;
+  assert.equal(properties.maxCount, 2);
+  assert.equal(properties.vmSize, 'Standard_E64ds_v6');
+  assert.deepEqual(properties.nodeLabels, { 'arrow-collector/role': 'arrowcol' });
+  assert.throws(() => buildAksPoolScalePayload({ ...resource, properties: { ...resource.properties, guessedField: true } },
+    { count: 0, autoscale: true, minimum: 0, maximum: 2 }), /Unrecognized pool configuration/);
 });
