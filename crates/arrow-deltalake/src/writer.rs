@@ -1018,6 +1018,23 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn process_peak_rss_bytes() -> Result<u64> {
+        let status = std::fs::read_to_string("/proc/self/status")?;
+        let line = status
+            .lines()
+            .find(|line| line.starts_with("VmHWM:"))
+            .context("read process peak resident memory")?;
+        let kilobytes = line
+            .split_whitespace()
+            .nth(1)
+            .context("parse process peak resident memory")?
+            .parse::<u64>()?;
+        kilobytes
+            .checked_mul(1024)
+            .context("process peak resident memory overflow")
+    }
+
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     #[ignore = "manual synthetic per-row-varying encode throughput benchmark"]
     async fn synthetic_availability_replica_states_encode_benchmark() -> Result<()> {
@@ -1066,8 +1083,9 @@ mod tests {
         let elapsed = started.elapsed().as_secs_f64();
         let cpu_seconds = process_cpu_seconds()? - cpu_started;
         let physical_bytes = std::fs::metadata(&path)?.len();
+        let peak_rss_bytes = process_peak_rss_bytes()?;
         eprintln!(
-            "W4_BENCH profile=synthetic_availability_replica_states_v1 rows={rows} arrow_bytes={input_bytes} physical_bytes={physical_bytes} arrow_parquet_ratio={:.2} arrow_bytes_per_row={:.1} wall_seconds={elapsed:.3} cpu_seconds={cpu_seconds:.3} input_mib_s={:.2} mib_s_per_core={:.2} rows_s={:.0} requested_threads={requested_threads} effective_threads={effective_threads}",
+            "W4_BENCH profile=synthetic_availability_replica_states_v1 rows={rows} arrow_bytes={input_bytes} physical_bytes={physical_bytes} peak_rss_bytes={peak_rss_bytes} arrow_parquet_ratio={:.2} arrow_bytes_per_row={:.1} wall_seconds={elapsed:.3} cpu_seconds={cpu_seconds:.3} input_mib_s={:.2} mib_s_per_core={:.2} rows_s={:.0} requested_threads={requested_threads} effective_threads={effective_threads}",
             input_bytes as f64 / physical_bytes as f64,
             input_bytes as f64 / rows as f64,
             input_bytes as f64 / elapsed / (1024.0 * 1024.0),
