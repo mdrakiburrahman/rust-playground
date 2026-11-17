@@ -19,6 +19,8 @@ pub struct OatConfig {
     pub stamp: Option<String>,
     pub warmup_seconds: u64,
     pub measure_seconds: u64,
+    #[serde(default = "default_schedule_lead_seconds")]
+    pub schedule_lead_seconds: u64,
     #[serde(default = "default_client_ready_timeout_seconds")]
     pub client_ready_timeout_seconds: u64,
     #[serde(default = "default_aks_rollout_timeout_seconds")]
@@ -326,7 +328,12 @@ fn default_collector_stop_grace_seconds() -> u64 {
     300
 }
 
-pub(crate) const SCHEDULE_DELIVERY_TIMEOUT_SECONDS: u64 = 180;
+fn default_schedule_lead_seconds() -> u64 {
+    180
+}
+
+// Matches the pinned arrowcol-dmv --schedule-timeout-secs consumer ceiling.
+const MAX_CLIENT_SCHEDULE_WAIT_SECONDS: u64 = 2_160;
 pub(crate) const AKS_RESOURCE_COUNTER_SNAPSHOT_TIMEOUT_MS: u64 = 5_000;
 pub(crate) const PIN_INIT_SETUP_TIMEOUT_SECONDS: u64 = 180;
 const CLIENT_JOB_CLEANUP_GRACE_SECONDS: u64 = 300;
@@ -615,11 +622,19 @@ impl OatConfig {
     }
 
     pub(crate) fn timing_budget(&self) -> Result<RunTimingBudget> {
+        if !(1..=1_800).contains(&self.schedule_lead_seconds) {
+            bail!("schedule_lead_seconds must be between 1 and 1800");
+        }
         let schedule_wait_seconds = self
             .client_ready_timeout_seconds
             .checked_add(self.qap_timeout_seconds)
-            .and_then(|seconds| seconds.checked_add(SCHEDULE_DELIVERY_TIMEOUT_SECONDS))
+            .and_then(|seconds| seconds.checked_add(self.schedule_lead_seconds))
             .context("OAT startup schedule wait budget overflow")?;
+        if schedule_wait_seconds > MAX_CLIENT_SCHEDULE_WAIT_SECONDS {
+            bail!(
+                "client_ready_timeout_seconds + qap_timeout_seconds + schedule_lead_seconds must not exceed the arrowcol-dmv schedule wait limit of {MAX_CLIENT_SCHEDULE_WAIT_SECONDS} seconds"
+            );
+        }
         let client_job_lifetime_seconds = schedule_wait_seconds
             .checked_add(self.warmup_seconds)
             .and_then(|seconds| seconds.checked_add(self.measure_seconds))
@@ -1269,6 +1284,48 @@ mod tests {
         }
     }
 
+    #[test]
+    fn schedule_lead_is_strict_bounded_and_fits_the_actual_client_wait_limit() -> Result<()> {
+        let mut request: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.example.json"
+        ))?;
+        let omitted: OatConfig = serde_json::from_value(request.clone())?;
+        assert_eq!(omitted.schedule_lead_seconds, 180);
+        for invalid in [
+            serde_json::Value::Null,
+            serde_json::json!("5"),
+            serde_json::json!(0.5),
+            serde_json::json!(-1),
+            serde_json::json!(true),
+        ] {
+            request["schedule_lead_seconds"] = invalid;
+            assert!(serde_json::from_value::<OatConfig>(request.clone()).is_err());
+        }
+        let mut config = valid();
+        for invalid in [0, 1_801, u64::MAX] {
+            config.schedule_lead_seconds = invalid;
+            assert!(config.timing_budget().is_err());
+            assert!(config.validate().is_err());
+        }
+        config.client_ready_timeout_seconds = 30;
+        config.qap_timeout_seconds = 1;
+        for valid in [1, 180, 1_800] {
+            config.schedule_lead_seconds = valid;
+            config.validate()?;
+        }
+        config.client_ready_timeout_seconds = 1_800;
+        config.qap_timeout_seconds = 300;
+        config.schedule_lead_seconds = 60;
+        config.validate()?;
+        config.schedule_lead_seconds = 61;
+        let error = config
+            .validate()
+            .err()
+            .context("accepted a wait beyond the client CLI ceiling")?;
+        assert!(error.to_string().contains("arrowcol-dmv schedule wait limit"));
+        Ok(())
+    }
+
     fn valid() -> TestConfig {
         let directory = std::env::temp_dir().join(format!("arrowcol-oat-config-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&directory)
@@ -1298,6 +1355,7 @@ mod tests {
             stamp: Some("00000".to_owned()),
             warmup_seconds: 30,
             measure_seconds: 60,
+            schedule_lead_seconds: default_schedule_lead_seconds(),
             client_ready_timeout_seconds: 600,
             aks_rollout_timeout_seconds: 600,
             reconciliation_settle_timeout_seconds: 120,

@@ -14,6 +14,7 @@ struct CellEvidence {
     client_reports: HashMap<String, Vec<Value>>,
     processes: Option<Value>,
     measurement_window: Option<(u64, u64)>,
+    client_schedule: Option<Value>,
     durable_commits: HashMap<String, Value>,
     router_sql: Option<Value>,
     router_cpu_pressure: Option<Value>,
@@ -407,6 +408,7 @@ impl CellEvidence {
         });
         json!({
             "version": 1,
+            "client_schedule": self.client_schedule,
             "overload_guard": self.overload_guard,
             "overload_stop": self.overload_stop,
             "processes": self.processes,
@@ -1136,6 +1138,7 @@ mod downstream_runner_tests {
         endpoint: String,
         start: std::sync::atomic::AtomicU64,
         clients_started: usize,
+        client_schedule_wait_seconds: Option<u64>,
         unresolved: bool,
     }
 
@@ -1206,9 +1209,13 @@ mod downstream_runner_tests {
             _: &str,
             table: &str,
             _: usize,
-            _: &[String],
+            arguments: &[String],
         ) -> Result<ClientHandle> {
             self.clients_started += 1;
+            self.client_schedule_wait_seconds = arguments.windows(2)
+                .find(|pair| pair[0] == "--schedule-timeout-secs")
+                .map(|pair| pair[1].parse())
+                .transpose()?;
             Ok(ClientHandle {
                 client_id: "client".to_owned(),
                 table: table.to_owned(),
@@ -1264,6 +1271,14 @@ mod downstream_runner_tests {
     }
 
     async fn run_fault(fault: Fault, kind: crate::config::OatMode) -> Result<(Vec<OatResult>, FaultPlatform)> {
+        run_fault_with_lead(fault, kind, None).await
+    }
+
+    async fn run_fault_with_lead(
+        fault: Fault,
+        kind: crate::config::OatMode,
+        lead: Option<u64>,
+    ) -> Result<(Vec<OatResult>, FaultPlatform)> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let endpoint = format!("http://{}", listener.local_addr()?);
         let metric = if matches!(fault, Fault::Pinning) {
@@ -1292,6 +1307,7 @@ mod downstream_runner_tests {
             endpoint,
             start: std::sync::atomic::AtomicU64::new(0),
             clients_started: 0,
+            client_schedule_wait_seconds: None,
             unresolved: false,
         };
         let mut config: OatConfig = serde_json::from_str(include_str!(
@@ -1300,6 +1316,9 @@ mod downstream_runner_tests {
         config.platform.kind = kind;
         config.overload_guard.enabled = false;
         config.qap_timeout_seconds = if matches!(fault, Fault::InitTimeout) { 1 } else { 10 };
+        if let Some(lead) = lead {
+            config.schedule_lead_seconds = lead;
+        }
         let run_id = uuid::Uuid::new_v4().to_string();
         let result = run_matrix_cell(
             &config,
@@ -1327,13 +1346,62 @@ mod downstream_runner_tests {
         let mut platform = FaultPlatform {
             kind: crate::config::OatMode::Local, fault: Fault::InitUnavailable,
             endpoint: "http://127.0.0.1:1".to_owned(),
-            start: std::sync::atomic::AtomicU64::new(0), clients_started: 0, unresolved: false,
+            start: std::sync::atomic::AtomicU64::new(0), clients_started: 0,
+            client_schedule_wait_seconds: None, unresolved: false,
         };
         let report = run_clients(&config, &uuid::Uuid::new_v4().to_string(), &config.tables, &mut platform).await?;
         assert_eq!(platform.clients_started, 0);
         assert!(report.failure.as_deref().is_some_and(|reason| reason.contains("protection unavailable")));
         assert_eq!(report.evidence.overload_guard.as_ref().map(|guard| &guard["status"]), Some(&json!("unavailable")));
         assert!(report.evidence.overload_stop.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn schedule_lead_reaches_actual_arm_client_wait_budgets_and_acknowledgement_guard() -> Result<()> {
+        let mut default_budgets = None;
+        for (requested, selected) in [(None, 180), (Some(17), 17)] {
+            let (rows, platform) = run_fault_with_lead(
+                Fault::ObservationUnavailable, crate::config::OatMode::Local, requested
+            ).await?;
+            assert_eq!(rows[0].status, "succeeded", "{:?}", rows[0].failure);
+            let tunables: Value = serde_json::from_str(&rows[0].tunables_json)?;
+            assert_eq!(tunables["schedule_lead_seconds"], selected);
+            let evidence: Value = serde_json::from_str(rows[0].evidence_json.as_deref().context("missing evidence")?)?;
+            let schedule = &evidence["client_schedule"];
+            assert_eq!(schedule["requested"]["schedule_lead_seconds"], selected);
+            assert_eq!(schedule["effective"]["schedule_lead_seconds"], selected);
+            let effective = &schedule["effective"];
+            let start = effective["run_start_unix_ms"].as_u64().context("missing actual start")?;
+            assert_eq!(platform.start.load(std::sync::atomic::Ordering::SeqCst), start);
+            assert_eq!(start - effective["schedule_created_at_unix_ms"].as_u64().context("missing creation time")?, selected * 1_000);
+            assert!(effective["acknowledged_at_unix_ms"].as_u64().context("missing acknowledgement")? < start);
+            let measurement_start = effective["measurement_start_unix_ms"].as_u64().context("measurement start")?;
+            let measurement_end = effective["measurement_end_unix_ms"].as_u64().context("measurement end")?;
+            assert_eq!(measurement_start - start, tunables["warmup_seconds"].as_u64().context("warmup")? * 1_000);
+            assert_eq!(measurement_end - measurement_start, tunables["measure_seconds"].as_u64().context("measurement")? * 1_000);
+            let schedule_wait = effective["schedule_wait_seconds"].as_u64().context("client wait")?;
+            assert_eq!(platform.client_schedule_wait_seconds, Some(schedule_wait));
+            let budgets = [
+                schedule_wait * 1_000,
+                effective["client_job_lifetime_seconds"].as_u64().context("client lifetime")? * 1_000,
+                effective["minimum_pin_ttl_ms"].as_u64().context("pin TTL")?,
+                effective["planned_cell_duration_ms"].as_u64().context("cell duration")?,
+            ];
+            if let Some(defaults) = default_budgets {
+                for (default, configured) in std::iter::zip(defaults, budgets) {
+                    assert_eq!(default - configured, (180 - selected) * 1_000);
+                }
+            } else {
+                default_budgets = Some(budgets);
+            }
+            let progress = |received| ClientProgress {
+                ready: true, schedule_received: received, ..ClientProgress::default()
+            };
+            assert!(!validate_client_schedule(&[progress(false)], start - 1, start)?);
+            assert!(validate_client_schedule(&[progress(false)], start, start).is_err());
+            assert!(validate_client_schedule(&[progress(true)], start, start).is_err());
+        }
         Ok(())
     }
 

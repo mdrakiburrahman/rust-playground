@@ -3910,6 +3910,7 @@ fn result_rows(
         "dmv_concurrency": config.dmv_concurrency,
         "idle_arrowcols": replicas.saturating_sub(observed_owners as u32),
         "measure_seconds": config.measure_seconds,
+        "schedule_lead_seconds": config.schedule_lead_seconds,
         "orchestration_run_id": orchestration_id,
         "pilot_mode": config.pilot_mode,
         "run_pin_ttl_ms": config.run_pin_ttl_ms,
@@ -4337,85 +4338,98 @@ async fn run_clients_inner(
     platform
         .finalize_campaign_load_admission(config, project_run_id, tables)
         .await?;
-    let schedule_deadline =
-        tokio::time::Instant::now() + Duration::from_secs(crate::config::SCHEDULE_DELIVERY_TIMEOUT_SECONDS);
-    let run_start_unix_ms = unix_time_ms_u64()?
-        .checked_add(crate::config::SCHEDULE_DELIVERY_TIMEOUT_SECONDS.saturating_mul(1_000))
+    let schedule_deadline = tokio::time::Instant::now() + Duration::from_secs(config.schedule_lead_seconds);
+    let schedule_created_at_unix_ms = unix_time_ms_u64()?;
+    let run_start_unix_ms = schedule_created_at_unix_ms
+        .checked_add(
+            config
+                .schedule_lead_seconds
+                .checked_mul(1_000)
+                .context("OAT schedule lead overflow")?,
+        )
         .context("shared OAT run start timestamp overflow")?;
-    if let Err(error) = platform.arm_clients(config, project_run_id, run_start_unix_ms).await {
-        let cleanup = cancel_clients(platform, config, &handles).await;
-        return match cleanup {
-            Ok(()) => Err(error).context("arm common OAT client schedule"),
-            Err(cleanup_error) => Err(error.context(format!(
-                "cancelling clients after schedule-arm failure also failed: {cleanup_error:#}"
-            ))),
-        };
-    }
-    local_progress(
-        config,
-        &format!(
-            "clients armed; schedule lead {}s, warm-up {}s, measurement {}s",
-            crate::config::SCHEDULE_DELIVERY_TIMEOUT_SECONDS,
-            config.warmup_seconds,
-            config.measure_seconds
-        ),
-    );
-
-    let mut schedule_acknowledged = false;
-    while tokio::time::Instant::now() < schedule_deadline {
-        let progress = match poll_clients(platform, config, &handles).await {
-            Ok(progress) => progress,
-            Err(error) => {
-                let cleanup = cancel_clients(platform, config, &handles).await;
-                return match cleanup {
-                    Ok(()) => Err(error),
-                    Err(cleanup_error) => Err(error.context(format!(
-                        "cancelling clients after schedule polling failed also failed: {cleanup_error:#}"
-                    ))),
-                };
-            }
-        };
-        match validate_client_schedule(&progress, unix_time_ms_u64()?, run_start_unix_ms) {
-            Ok(true) => {
-                schedule_acknowledged = true;
-                break;
-            }
-            Ok(false) => {}
-            Err(error) => {
-                let cleanup = cancel_clients(platform, config, &handles).await;
-                return match cleanup {
-                    Ok(()) => Err(error),
-                    Err(cleanup_error) => Err(error.context(format!(
-                        "cancelling clients after schedule failure also failed: {cleanup_error:#}"
-                    ))),
-                };
-            }
-        }
-        record_owner_observation(
-            pinning,
-            sample_router_table_owners(platform, config, &metrics_client, tables).await,
-            tables,
-            false,
-        );
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-    if !schedule_acknowledged {
-        let error =
-            anyhow::anyhow!("OAT client schedule acknowledgement timed out or the final armed window was missed");
-        let cleanup = cancel_clients(platform, config, &handles).await;
-        return match cleanup {
-            Ok(()) => Err(error),
-            Err(cleanup_error) => Err(error.context(format!(
-                "cancelling clients after schedule acknowledgement failure also failed: {cleanup_error:#}"
-            ))),
-        };
-    }
     let measurement_start_unix_ms = run_start_unix_ms
-        .checked_add(config.warmup_seconds.saturating_mul(1_000))
+        .checked_add(
+            config
+                .warmup_seconds
+                .checked_mul(1_000)
+                .context("OAT warm-up duration overflow")?,
+        )
         .context("shared OAT measurement start timestamp overflow")?;
     let measurement_end_unix_ms = measurement_start_unix_ms
-        .checked_add(config.measure_seconds.saturating_mul(1_000))
+        .checked_add(
+            config
+                .measure_seconds
+                .checked_mul(1_000)
+                .context("OAT measurement duration overflow")?,
+        )
         .context("shared OAT measurement end timestamp overflow")?;
+    let delivery = tokio::time::timeout_at(schedule_deadline, async {
+        platform
+            .arm_clients(config, project_run_id, run_start_unix_ms)
+            .await
+            .context("arm common OAT client schedule")?;
+        local_progress(
+            config,
+            &format!(
+                "clients armed; schedule lead {}s, warm-up {}s, measurement {}s",
+                config.schedule_lead_seconds, config.warmup_seconds, config.measure_seconds
+            ),
+        );
+        loop {
+            let progress = poll_clients(platform, config, &handles)
+                .await
+                .context("poll OAT client schedule acknowledgement")?;
+            let observed_at = unix_time_ms_u64()?;
+            let acknowledged = validate_client_schedule(&progress, observed_at, run_start_unix_ms)?;
+            anyhow::ensure!(
+                tokio::time::Instant::now() < schedule_deadline,
+                "OAT client schedule acknowledgement exceeded the original delivery deadline"
+            );
+            if acknowledged {
+                break Ok::<_, anyhow::Error>(observed_at);
+            }
+            record_owner_observation(
+                pinning,
+                sample_router_table_owners(platform, config, &metrics_client, tables).await,
+                tables,
+                false,
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    })
+    .await;
+    let delivery = delivery.unwrap_or_else(|_| Err(anyhow::anyhow!(
+        "OAT client schedule delivery/acknowledgement timed out; the arm outcome may be indeterminate and is not retried"
+    )));
+    let acknowledged_at_unix_ms = match delivery {
+        Ok(observed_at) => observed_at,
+        Err(error) => {
+            let cleanup = cancel_clients(platform, config, &handles).await;
+            return match cleanup {
+                Ok(()) => Err(error),
+                Err(cleanup_error) => Err(error.context(format!(
+                    "cancelling clients after schedule delivery failure also failed: {cleanup_error:#}"
+                ))),
+            };
+        }
+    };
+    evidence.client_schedule = Some(json!({
+        "requested": {"schedule_lead_seconds": config.schedule_lead_seconds},
+        "effective": {
+            "schedule_lead_seconds": (run_start_unix_ms - schedule_created_at_unix_ms) / 1_000,
+            "schedule_created_at_unix_ms": schedule_created_at_unix_ms,
+            "run_start_unix_ms": run_start_unix_ms,
+            "measurement_start_unix_ms": measurement_start_unix_ms,
+            "measurement_end_unix_ms": measurement_end_unix_ms,
+            "acknowledged_at_unix_ms": acknowledged_at_unix_ms,
+            "schedule_wait_seconds": timing_budget.schedule_wait_seconds,
+            "client_job_lifetime_seconds": timing_budget.client_job_lifetime_seconds,
+            "minimum_pin_ttl_ms": timing_budget.minimum_pin_ttl_ms,
+            "planned_cell_duration_ms": timing_budget.planned_cell_duration_ms,
+        },
+        "scope": "orchestrator_assigned_schedule_with_observed_full_fleet_acknowledgement",
+    }));
     evidence.measurement_window = Some((measurement_start_unix_ms, measurement_end_unix_ms));
     if let Some(prepared) = &mut prepared_guard {
         prepared.engine.arm(run_start_unix_ms, measurement_end_unix_ms);
@@ -14640,7 +14654,7 @@ mod tests {
         let first_client_ready_at = 1_u64;
         let whole_fleet_ready_at = 29_u64;
         let qap_preparation_seconds = 29_u64;
-        let final_schedule_delivery_seconds = crate::config::SCHEDULE_DELIVERY_TIMEOUT_SECONDS;
+        let final_schedule_delivery_seconds = config.schedule_lead_seconds;
         assert!(whole_fleet_ready_at <= config.client_ready_timeout_seconds);
         assert!(qap_preparation_seconds <= config.qap_timeout_seconds);
         let earliest_client_schedule_wait = whole_fleet_ready_at
