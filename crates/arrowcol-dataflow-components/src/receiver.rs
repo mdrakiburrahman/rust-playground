@@ -44,9 +44,7 @@ use tonic::transport::Server;
 use crate::FlightReceiverConfig;
 use crate::config::{checked_add_millis, config_error, now_unix_millis, parse_config};
 use crate::envelope::ArrowcolBatchEnvelope;
-use crate::metrics::{
-    DurableStream, PendingTracker, ResolvedBufferingMode, RuntimeMetrics, global_metrics, process_instance_id,
-};
+use crate::metrics::{DurableStream, PendingTracker, RuntimeMetrics, global_metrics, process_instance_id};
 use crate::routing::{LeaseResolver, StoreLeaseResolver};
 
 /// DFE URN for arbitrary Arrow Flight ingress.
@@ -558,13 +556,6 @@ impl receiver::Receiver<OtapPdata> for ArrowFlightReceiver {
             admission = admission.with_durable_admission(limits.admission_timeout);
         }
         let admission = Arc::new(admission);
-        self.metrics
-            .register_resolved_buffering_mode(if self.config.native_quiver {
-                ResolvedBufferingMode::Quiver
-            } else {
-                ResolvedBufferingMode::MemoryOnly
-            })
-            .map_err(|error| receiver_error(&effect_handler, ReceiverErrorKind::Configuration, error))?;
         let admission_trait: Arc<dyn BatchAdmission> = Arc::clone(&admission) as Arc<dyn BatchAdmission>;
         let drain = DrainController::new();
         let ddl_handler: Arc<dyn FlightSqlDdlHandler> = ddl;

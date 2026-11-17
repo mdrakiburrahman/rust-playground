@@ -1262,11 +1262,11 @@ impl RuntimeMetrics {
         self.native_quiver.get().copied().unwrap_or(false)
     }
 
-    /// Registers an initialized buffering implementation.
+    /// Registers a buffering implementation after its actual runtime path has initialized.
     ///
-    /// Independent buffering paths register separately; contradictory modes resolve to
-    /// `mixed` and remain so for the lifetime of this process.
-    pub(crate) fn register_resolved_buffering_mode(&self, mode: ResolvedBufferingMode) -> Result<(), String> {
+    /// Callers must not use an ACK-contract setting as evidence. Independent buffering paths
+    /// register separately; contradictory modes resolve to `mixed` for this process lifetime.
+    pub fn register_resolved_buffering_mode(&self, mode: ResolvedBufferingMode) -> Result<(), String> {
         if matches!(mode, ResolvedBufferingMode::Unknown | ResolvedBufferingMode::Mixed) {
             return Err("buffering registration requires one initialized concrete mode".to_owned());
         }
@@ -2626,6 +2626,20 @@ mod tests {
             assert_eq!(status["delta_targets"][0]["state"], "conflicting");
             assert!(status["delta_targets"][0].get("normalized_root").is_none());
             assert!(status["delta_targets"][0].get("delta_table_id").is_none());
+        }
+    }
+
+    #[test]
+    fn admission_ack_setting_does_not_resolve_buffering_mode() {
+        for native_quiver in [false, true] {
+            let metrics = RuntimeMetrics::new(CollectorInstanceId::new());
+            metrics
+                .configure_admission("dfe", native_quiver)
+                .expect("admission configuration");
+            metrics.registered.store(true, Ordering::Release);
+            let pressure = metrics.pressure().expect("pressure");
+            assert_eq!(pressure.native_quiver_enabled, native_quiver);
+            assert_eq!(pressure.resolved_buffering_mode, ResolvedBufferingMode::Unknown);
         }
     }
 
