@@ -730,7 +730,7 @@ impl CellEvidence {
 #[derive(Clone)]
 enum ResourceSamplerSource {
     Aks,
-    AksNative(NativeTelemetrySource),
+    AksNative(Arc<NativeTelemetrySource>),
     Local {
         run_id: String,
         environment: HashMap<String, String>,
@@ -838,7 +838,7 @@ fn native_pod_sample(target: &AksResourcePodTarget, namespace: &str, pod: &Value
         "native container ID/start-time binding is unavailable or changed"
     );
     Ok(json!({
-        "identity": {"role": target.role, "pod": target.pod, "uid": target.uid,
+        "identity": {"role": target.role, "namespace": namespace, "pod": target.pod, "uid": target.uid,
             "node": target.node, "container": target.container, "container_id": container_id, "started_unix_ns": started},
         "limits": spec.pointer("/resources/limits"),
         "cpu": {"time_unix_ns": native_time_ns(&container["cpu"]["time"]), "time_resolution_ns": "1000000000",
@@ -933,11 +933,11 @@ where
     }).await.context("join existing native QAP observation runtime")?
 }
 
-async fn capture_native_telemetry(source: &NativeTelemetrySource, config: &OatConfig) -> Result<Value> {
+async fn capture_native_telemetry(source: &Arc<NativeTelemetrySource>, config: &OatConfig) -> Result<Value> {
     let started = unix_time_ms_u64()?;
     let qap = async {
         tokio::fs::create_dir_all(&source.results).await?;
-        let observer = source.clone();
+        let observer = Arc::clone(source);
         let observation = run_native_observation(move |remaining| async move {
             arrowcol_loadgen::observe_qap_with_mode(
                 &observer.qap_endpoint, &observer.results, arrowcol_loadgen::ObservationMode::Azure,
@@ -1412,6 +1412,40 @@ mod measurement_evidence_tests {
         let mut missing = target.clone();
         missing.container_id = None;
         assert!(native_pod_sample(&missing, "oat", &pod, &summary).is_err());
+        let start = 1_800_000_000_000_i64 - 60_000;
+        let namespace = "synthetic-offline-c0ffee00000040008000000000000003";
+        let mut native_target = target.clone();
+        native_target.uid = "synthetic-pod-uid".to_owned();
+        native_target.node = "synthetic-node".to_owned();
+        native_target.container_id = Some(format!("containerd://{}", "a".repeat(64)));
+        let mut native_pod = pod.clone();
+        native_pod["metadata"]["namespace"] = json!(namespace);
+        native_pod["metadata"]["uid"] = json!(native_target.uid);
+        native_pod["spec"]["nodeName"] = json!(native_target.node);
+        native_pod["status"]["containerStatuses"][0]["containerID"] = json!(native_target.container_id);
+        let mut native_summary = summary.clone();
+        native_summary["node"]["nodeName"] = json!(native_target.node);
+        native_summary["pods"][0]["podRef"]["namespace"] = json!(namespace);
+        native_summary["pods"][0]["podRef"]["uid"] = json!(native_target.uid);
+        let mut produced = Vec::new();
+        for (index, at) in [start - 1000, start + 9000, start + 19_000, start + 31_000].into_iter().enumerate() {
+            let time = DateTime::from_timestamp_millis(at + 50).context("synthetic native timestamp")?
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+            native_summary["pods"][0]["containers"][0]["cpu"]["time"] = json!(time);
+            native_summary["pods"][0]["containers"][0]["cpu"]["usageCoreNanoSeconds"] =
+                json!(9_007_199_254_740_993_u64 + (at + 50 - start + 1000) as u64 * 2_000_000);
+            native_summary["pods"][0]["containers"][0]["memory"] = json!({"time":time,"workingSetBytes":1_000_000_000});
+            native_summary["pods"][0]["network"] = json!({"time":time,
+                "rxBytes":(at + 50 - start + 1000) as u64 * 1000,"txBytes":(at + 50 - start + 1000) as u64 * 2000});
+            let mut observed = native_pod_sample(&native_target, namespace, &native_pod, &native_summary)?;
+            let labels = format!("namespace=\"{namespace}\",pod=\"collector-pod\",container=\"collector\",id=\"/kubepods/pod{}/{}\"",
+                native_target.uid, "a".repeat(64));
+            let metrics = format!("container_cpu_cfs_periods_total{{{labels}}} {} {}\ncontainer_cpu_cfs_throttled_periods_total{{{labels}}} {} {}\n",
+                1000 + index * 100, at + 50, 100 + index * 20, at + 50);
+            observed["throttling"] = native_cfs_sample(&native_target, namespace, &metrics)?;
+            produced.push(observed);
+        }
+        println!("D46_NATIVE_PRODUCER_PODS {}", serde_json::to_string(&produced)?);
         Ok(())
     }
 

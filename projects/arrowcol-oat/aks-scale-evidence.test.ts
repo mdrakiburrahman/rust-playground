@@ -110,7 +110,7 @@ function syntheticNativeTransport(t: TestContext) {
   f.document.effective_config_json = canonical_json(effective);
   f.document.effective_config_sha256 = hash(f.document.effective_config_json);
   const identity = { role: 'collector', pod: 'collector-pod', uid: 'synthetic-pod-uid', node: 'synthetic-node',
-    container: 'collector', container_id: 'containerd://synthetic-original' };
+    container: 'collector', container_id: 'containerd://' + 'a'.repeat(64) };
   const frames = [start - 1000, start + 9000, start + 19_000, end + 1000].map((at, i) => {
     const time = at + 50;
     return { request_start_unix_ms: at, request_end_unix_ms: at + 100,
@@ -118,7 +118,8 @@ function syntheticNativeTransport(t: TestContext) {
         statistics: { AccelerationPendingDataFilesCount: 10 + 2 * i, AccelerationPendingDataFilesSize: 1000 + 200 * i,
           AccelerationCompletePercentage: 50, LastUpdatedDateTime: '2010-01-01T00:00:00Z', Eligible: true, Fresh: null },
         state: { IsHealthy: true, NotHealthyReason: null } } } },
-      pods: [{ identity: { ...identity, started_unix_ns: (BigInt(start - 10_000) * 1_000_000n).toString() },
+      pods: [{ identity: { ...identity, namespace: f.inventory.namespace.name,
+        started_unix_ns: (BigInt(start - 10_000) * 1_000_000n).toString() },
         limits: { cpu: '2', memory: '1Gi' },
         cpu: { time_unix_ns: (BigInt(time) * 1_000_000n).toString(), time_resolution_ns: '1000000000',
           usage_core_nanoseconds: (9_007_199_254_740_993n + BigInt(time - start + 1000) * 2_000_000n).toString() },
@@ -202,6 +203,24 @@ test('native throttling needs timestamped CFS history and quantized CPU near a t
   f.publishSyntheticDocument();
   assert.equal((await readOfficialNativeWindow(f.options)).pods[0]!.cpuSaturated, null,
     'reported source-time precision cannot become a false positive at the 90% boundary');
+});
+
+test('actual Rust native pod/cAdvisor producer bytes cross the authenticated immutable reader', async t => {
+  const path = process.env.OAT_OFFLINE_NATIVE_PODS_FIXTURE;
+  if (!path) { t.skip('requires retained synthetic Rust native producer bytes'); return; }
+  const pods: unknown = JSON.parse(await readFile(path, 'utf8')) as unknown;
+  assert.ok(Array.isArray(pods));
+  assert.equal(pods.length, 4);
+  const f = syntheticNativeTransport(t);
+  f.history.samples.forEach((frame, i) => Object.assign(frame, { pods: [pods[i]] }));
+  f.publishSyntheticDocument();
+  const measured = await readOfficialNativeWindow(f.options);
+  assert.equal(measured.pods[0]!.cpuCores, 2);
+  assert.equal(measured.pods[0]!.cpuSaturated, true);
+  assert.equal(measured.pods[0]!.memorySaturated, true);
+  assert.equal(measured.pods[0]!.throttling, 0.2);
+  assert.equal(measured.pods[0]!.throttled, true);
+  assert.match(measured.authorization, /hold/);
 });
 
 test('immutable measurement reader uses selected authenticated storage and cannot authorize an unpaired scale trial', async t => {

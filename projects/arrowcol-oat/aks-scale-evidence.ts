@@ -166,7 +166,11 @@ export async function readOfficialCellMeasurement(options: {
 // Microsoft.Kusto/clusters: Percent/Average/PT1M, not row latency or cache fullness.
 // https://learn.microsoft.com/azure/azure-monitor/reference/supported-metrics/microsoft-kusto-clusters-metrics
 export const KUSTO_SATURATION_THRESHOLDS = Object.freeze({ cpuPercent: 90, ingestionUtilizationPercent: 90 });
-/** Original-cell source qualification: 10s cadence + 3s capture; CPU/memory saturation requires an observed hard limit. */
+/**
+ * Original-cell qualification: 10s cadence + 3s capture; CPU >=90% of a frozen observed hard limit,
+ * accounting for native timestamp precision; memory >=90% from in-window working-set samples (not peak RSS);
+ * throttling >=10% of CFS periods. No authenticated link capacity means network saturation is UNKNOWN.
+ */
 export const NATIVE_TELEMETRY_THRESHOLDS = Object.freeze({
   cadenceMs: 10_000, requestTimeoutMs: 3000, maxGapMs: 13_000, maxEdgeAgeMs: 13_000,
   cpuLimitFraction: 0.9, memoryLimitFraction: 0.9, throttledPeriodFraction: 0.1,
@@ -356,7 +360,8 @@ export async function readOfficialNativeWindow(options: SourceOptions): Promise<
     result.pods.push(pod);
     const rows = frames.map(frame => Array.isArray(frame.pods) ? frame.pods.filter(record).filter(row => {
       const identity = record(row.identity) ? row.identity : {};
-      return ['role', 'pod', 'uid', 'node', 'container', 'container_id'].every(key => identity[key] === target[key]);
+      return identity.namespace === inventory.namespace.name &&
+        ['role', 'pod', 'uid', 'node', 'container', 'container_id'].every(key => identity[key] === target[key]);
     }) : []);
     if (!['collector', 'client', 'router', 'catalog'].includes(String(target.role)) ||
         ['pod', 'uid', 'node', 'container', 'container_id'].some(key =>
@@ -420,7 +425,12 @@ export async function readOfficialNativeWindow(options: SourceOptions): Promise<
     }
     const periods = nativeSeries(observations, 'throttling', start, end, 'periods');
     const throttled = nativeSeries(observations, 'throttling', start, end, 'throttled_periods');
-    if (periods && throttled && periods.firstNs === throttled.firstNs && periods.lastNs === throttled.lastNs &&
+    const validCfs = observations.every(row => {
+      const metric = record(row.throttling) ? row.throttling : {};
+      const total = unsigned(metric.periods), throttled = unsigned(metric.throttled_periods);
+      return total !== null && throttled !== null && throttled <= total && total <= BigInt(Number.MAX_SAFE_INTEGER);
+    });
+    if (validCfs && periods && throttled && periods.firstNs === throttled.firstNs && periods.lastNs === throttled.lastNs &&
         periods.last > periods.first && throttled.last - throttled.first <= periods.last - periods.first) {
       pod.throttling = Number(throttled.last - throttled.first) / Number(periods.last - periods.first);
       pod.throttled = pod.throttling >= NATIVE_TELEMETRY_THRESHOLDS.throttledPeriodFraction;

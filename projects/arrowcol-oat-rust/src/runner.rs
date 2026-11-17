@@ -1734,6 +1734,7 @@ impl Platform for AksPlatform {
             .collect::<BTreeSet<_>>();
         anyhow::ensure!(
             inventory.load_admission == InventoryLoadAdmission::Authorized
+                && inventory.namespace.name == config.namespace
                 && qap.database == database
                 && expected == qap_tables.iter().cloned().collect()
                 && expected.len() == qap_tables.len()
@@ -4584,7 +4585,7 @@ async fn run_clients_inner(
         }
     };
     let sampler_source = match native {
-        Some(native) => Some(ResourceSamplerSource::AksNative(native)),
+        Some(native) => Some(ResourceSamplerSource::AksNative(Arc::new(native))),
         None => platform.resource_sampler_source(),
     };
     let mut sampler = ResourceSampler::start(
