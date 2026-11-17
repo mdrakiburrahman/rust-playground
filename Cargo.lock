@@ -432,6 +432,7 @@ dependencies = [
  "delta_kernel_default_engine",
  "fs2",
  "futures",
+ "http-body-util",
  "object_store",
  "opentelemetry 0.31.0",
  "opentelemetry_sdk 0.31.0",
