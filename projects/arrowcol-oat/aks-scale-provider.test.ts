@@ -3,7 +3,7 @@ import { test, type TestContext } from 'node:test';
 import { Azure, Config } from '../../infra/azure/bootstrap.js';
 import { CampaignConflictError, CUSTODY_CLEANUP_STEPS, armCampaign, publishRunInventory, startCampaign, validateCampaignState,
   type CampaignState, type CampaignStore, type RunInventory, type StoredCampaign, type ScaleTrialReceipt } from './aks-campaign.js';
-import { createDefaultScaleAdapter, restoreCampaignScaleTrials } from './aks-scale-provider.js';
+import { assertWriterBoundary, createDefaultScaleAdapter, restoreCampaignScaleTrials } from './aks-scale-provider.js';
 import { createDefaultCleanupProviders } from './aks-default-providers.js';
 import { createExternalCleanupExecutor, type ExternalCleanupActions } from './aks-cleanup-executor.js';
 import { newScaleTrialReceipt, persistScaleTrial, type ScaleStep, type ScaleTarget } from './aks-scale.js';
@@ -137,6 +137,39 @@ const clientStep: ScaleStep = { dimension: 'loadgen-max', before: 2, after: 3, e
 const cpuStep: ScaleStep = { dimension: 'collector-cpu-limit', before: 1, after: 2, evidence: ['collector-cpu-saturated'],
   restore: { dimension: 'collector-cpu-limit', before: 2, after: 1 }, baselineCommittedRowsPerSecond: 1000,
   baselineQapPendingBacklog: 0 };
+
+test('writer observation reuses the three existing GETs without coercing unavailable pod identities', async () => {
+  const { store, namespace } = await fixture(), inventory = store.current!.state.runInventory!;
+  const authority: CleanupMutationAuthority = { mode: 'producer', campaignId, ownerId, fencingToken: 1, assertCurrent: async () => {} };
+  for (const identity of ['missing', 'observed', 'invalid'] as const) {
+    const reads: string[][] = [], original = scaleRunner();
+    const runner: CustodyCommandRunner = async (...args) => {
+      reads.push(args[0]);
+      assert.equal(args[0].includes('patch'), false);
+      const result = await original(...args);
+      if (identity !== 'missing' && args[0].includes('pods')) {
+        const list = JSON.parse(result.stdout) as { items: Array<{ metadata: { uid?: unknown };
+          spec?: { nodeName: unknown }; status: { containerStatuses: Array<{ ready: boolean; name?: unknown; containerID?: unknown }> } }> };
+        list.items[0].metadata.uid = identity === 'observed' ? 'synthetic-pod-uid' : 7;
+        list.items[0].spec = { nodeName: identity === 'observed' ? 'synthetic-node' : 7 };
+        Object.assign(list.items[0].status.containerStatuses[0], {
+          name: identity === 'observed' ? 'dataflow' : 7, containerID: identity === 'observed' ? 'containerd://synthetic' : 7 });
+        result.stdout = JSON.stringify(list);
+      }
+      return result;
+    };
+    assert.deepEqual(await assertWriterBoundary(inventory, authority, runner), {
+      server: inventory.fic!.plan!.server, namespace, deploymentUid: inventory.resources[0].uid, podName: 'arrowcol-0',
+      podUid: identity === 'observed' ? 'synthetic-pod-uid' : null,
+      nodeName: identity === 'observed' ? 'synthetic-node' : null,
+      containerName: identity === 'observed' ? 'dataflow' : null,
+      containerId: identity === 'observed' ? 'containerd://synthetic' : null });
+    assert.equal(reads.length, 3);
+    for (const kind of ['deployment', 'replicasets', 'pods']) assert.equal(reads.filter(args => args.includes(kind)).length, 1);
+  }
+  assert.equal(await assertWriterBoundary(inventory, { ...authority, mode: 'controller' },
+    scaleRunner(undefined, 0, 'Recreate', 0)), undefined);
+});
 
 test('scale admission rejects live rolling updates and multiple physical collector writers', async t => {
   for (const [strategy, writers] of [['RollingUpdate', 1], ['Recreate', 2]] as const) {

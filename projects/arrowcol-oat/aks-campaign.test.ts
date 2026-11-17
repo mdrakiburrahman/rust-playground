@@ -404,6 +404,16 @@ test('scale trial journal rejects malformed target bindings and duplicate ids', 
     phase: 'apply-intent' as const,
   };
   assert.equal(validateCampaignState({ ...armed, scaleTrials: [receipt] }).scaleTrials?.length, 1);
+  const unrelatedUnknown = { ...receipt, baseline: { ...receipt.baseline, qap_pending_backlog: null }, phase: 'kept',
+    result: { outcome: 'keep', committed_rows_per_second: 110, qap_pending_backlog: null, ineffective_increments: 0, reason: 'measured-collector-throughput' } };
+  assert.equal(validateCampaignState({ ...armed, scaleTrials: [unrelatedUnknown] }).scaleTrials?.length, 1);
+  const kusto = { ...receipt, target: { dimension: 'kusto-capacity', before: 2, after: 3 },
+    restore: { dimension: 'kusto-capacity', before: 3, after: 2 },
+    resource: { transport: 'azure-rest', resource_id: `/subscriptions/${campaignId}/resourceGroups/synthetic/providers/Microsoft.Kusto/clusters/synthetic`,
+      api_version: '2024-04-13', kind: 'Microsoft.Kusto/clusters', namespace: null, name: 'synthetic', uid: null } };
+  assert.equal(validateCampaignState({ ...armed, scaleTrials: [kusto] }).scaleTrials?.length, 1);
+  assert.throws(() => validateCampaignState({ ...armed, scaleTrials: [{ ...kusto, baseline: unrelatedUnknown.baseline }] }), /malformed/);
+  assert.throws(() => validateCampaignState({ ...armed, scaleTrials: [{ ...kusto, phase: 'kept', result: unrelatedUnknown.result }] }), /malformed/);
   assert.throws(() => validateCampaignState({ ...armed, scaleTrials: [{ ...receipt,
     baseline: { ...receipt.baseline, qap_p95_latency_ms: 10 } }] }), /malformed/);
   assert.throws(() => validateCampaignState({ ...armed, scaleTrials: [{ ...receipt, phase: 'kept',

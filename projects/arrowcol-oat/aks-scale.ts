@@ -133,6 +133,7 @@ interface ScaleEvidenceValues {
   collectorNodePoolAtMaximum: boolean;
   qapBacklogGrowing: boolean;
   committedRateStable: boolean;
+  /** Native AccelerationPendingDataFilesCount: data files, not bytes, rows, or per-row latency. */
   qapPendingBacklog: number;
   previousQapPendingBacklog: number;
   kustoSaturated: boolean;
@@ -473,7 +474,12 @@ export async function main(args: string[], runner: typeof runtime.run_tree = run
   const envelope = scaleEnvelope(await readJsonFile(values['evidence-file']!), state, Date.now());
   const evidence = await verifyEvidence.verifyInitial(envelope, state);
   const step = recommendScaleStep(evidence);
-  if (!step) { console.log(JSON.stringify({ status: 'no-measured-bottleneck', campaign_id: state.campaignId })); return; }
+  if (!step) {
+    const unknown = Object.entries(evidence).filter(([, value]) => value === null).map(([field]) => field);
+    if (unknown.length) throw new Error('Scale admission refused: source dimensions remain UNKNOWN: ' + unknown.join(','));
+    console.log(JSON.stringify({ status: 'no-measured-bottleneck', campaign_id: state.campaignId }));
+    return;
+  }
   const previous = [...(state.scaleTrials ?? [])].reverse().find(item => item.target.dimension === step.dimension)?.result?.ineffective_increments ?? 0;
   if (previous >= 2) { console.log(JSON.stringify({ status: 'stopped-after-ineffective-increments', dimension: step.dimension })); return; }
   const runtimeConfig = validateRuntime(await readJsonFile(values['runtime-config']));

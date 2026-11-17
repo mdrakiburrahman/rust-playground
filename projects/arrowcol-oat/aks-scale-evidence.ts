@@ -150,14 +150,17 @@ export async function readOfficialCellMeasurement(options: {
     committedRowsPerSecond: complete ? output.rows_per_second as number : null, unavailableReasons };
 }
 
+/** Authenticates original per-cell evidence, but cannot authorize a same-cell reschedule in place of explicit serial-cell pairing. */
 export function createScaleEvidenceVerifier(options: Parameters<typeof readOfficialCellMeasurement>[0]): ScaleEvidenceVerifier {
   const verify = async (envelope: ScaleEvidenceEnvelope | ScaleMeasurementEnvelope, state: CampaignState,
     post?: ScaleVerificationWindow): Promise<never> => {
     const original = await readOfficialCellMeasurement(options);
-    if (canonical_json(original.inventory) !== canonical_json(state.runInventory) ||
+    if (state.campaignId !== original.inventory.campaign_id || state.ownerId !== original.inventory.owner_id ||
+        state.fencingToken !== original.inventory.fencing_token || canonical_json(original.inventory) !== canonical_json(state.runInventory) ||
         envelope.campaign_id !== state.campaignId || envelope.cell_run_id !== original.inventory.cell_run_id ||
         original.endMs !== envelope.observed_at_ms || original.startMs !== envelope.observed_at_ms - envelope.window_ms ||
-        post && (original.startMs === null || original.endMs === null || original.startMs < post.notBeforeMs ||
+        post && (original.startMs === null || original.endMs === null || original.startMs !== post.startMs ||
+          original.endMs !== post.endMs || !Number.isSafeInteger(post.notBeforeMs) || original.startMs < post.notBeforeMs ||
           original.endMs > post.deadlineAtMs || post.deadlineAtMs !== options.deadlineAtMs))
       throw new Error('Official measurement does not match the selected original cell/window/deadline.');
     if (original.unavailableReasons.length) throw new Error('Official measurement is UNKNOWN: ' + original.unavailableReasons.join(','));

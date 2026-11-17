@@ -5,7 +5,7 @@ import { test, type TestContext } from 'node:test';
 import { Azure, Config, canonical_json } from '../../infra/azure/bootstrap.js';
 import { newCampaignState, type CampaignStore, type RunInventory } from './aks-campaign.js';
 import { createScaleEvidenceVerifier, readBoundedSourceBytes, readOfficialCellMeasurement } from './aks-scale-evidence.js';
-import type { ScaleEvidenceEnvelope } from './aks-scale.js';
+import type { ScaleMeasurementEnvelope } from './aks-scale.js';
 
 const hash = (value: string | Uint8Array) => createHash('sha256').update(value).digest('hex');
 const campaignId = 'c0ffee00-0000-4000-8000-000000000001', ownerId = 'c0ffee00-0000-4000-8000-000000000002';
@@ -53,7 +53,7 @@ function syntheticAuthenticatedTransport(t: TestContext, supplied?: Uint8Array) 
   state.runInventory = inventory;
   let reads = 0, tokenReads = 0, status = 200, returnedEtag = inventory.official_measurement.etag, changed = false;
   const token = { ownerId: state.ownerId, fencingToken: state.fencingToken };
-  t.mock.method(azure, 'token', async resource => {
+  t.mock.method(azure, 'token', async (resource: string) => {
     assert.equal(resource, 'https://storage.azure.com/');
     tokenReads++;
     return 'synthetic-offline-token';
@@ -70,7 +70,7 @@ function syntheticAuthenticatedTransport(t: TestContext, supplied?: Uint8Array) 
     assert.equal(new Headers(init?.headers).get('authorization'), 'Bearer synthetic-offline-token');
     assert.equal(init?.redirect, 'error');
     if (changed) state.fencingToken++;
-    return new Response(bytes, { status, headers: { etag: returnedEtag, 'x-ms-version-id': reference.version!,
+    return new Response(new Uint8Array(bytes), { status, headers: { etag: returnedEtag, 'x-ms-version-id': reference.version!,
       'content-length': String(bytes.byteLength) } });
   };
   return { state, inventory, document, read: () => readOfficialCellMeasurement({ azure, store, token,
@@ -85,10 +85,15 @@ test('immutable measurement reader uses selected authenticated storage and canno
   assert.equal(observed.committedRowsPerSecond, 1234);
   assert.deepEqual(observed.unavailableReasons, []);
   assert.deepEqual(f.counts(), { reads: 1, tokenReads: 1 });
-  const envelope: ScaleEvidenceEnvelope = { schema_version: 2, campaign_id: campaignId, cell_run_id: cellId,
+  const envelope: ScaleMeasurementEnvelope = { schema_version: 2, campaign_id: campaignId, cell_run_id: cellId,
     observed_at_ms: observed.endMs!, window_ms: observed.endMs! - observed.startMs!,
-    evidence: {} as ScaleEvidenceEnvelope['evidence'] };
-  await assert.rejects(createScaleEvidenceVerifier(f.options).verifyInitial(envelope, f.state), /paired baseline\/trial cell custody/);
+    measurement: { committedRowsPerSecond: 1234, qapPendingBacklog: null } };
+  const verifier = createScaleEvidenceVerifier(f.options), window = { startMs: observed.startMs!, endMs: observed.endMs!,
+    notBeforeMs: observed.startMs!, deadlineAtMs: f.options.deadlineAtMs };
+  await assert.rejects(verifier.verifyMeasurement(envelope, f.state, window), /paired baseline\/trial cell custody/);
+  for (const invalid of [{ ...window, startMs: window.startMs + 1 }, { ...window, endMs: window.endMs - 1 },
+    { ...window, notBeforeMs: window.startMs + 1 }, { ...window, deadlineAtMs: window.deadlineAtMs + 1 }])
+    await assert.rejects(verifier.verifyMeasurement(envelope, f.state, invalid), /original cell\/window\/deadline/);
 });
 
 test('immutable measurement reader rejects changed bytes, source identity, permissions and custody', async t => {
