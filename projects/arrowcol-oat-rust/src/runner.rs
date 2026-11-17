@@ -4128,8 +4128,10 @@ fn result_rows(
     let observed_owners = client_run.pinning.owners.values().collect::<HashSet<_>>().len();
     let cpu_quota_evidence = if config.platform.kind == crate::config::OatMode::Aks {
         let requested = config.effective_aks_resources();
-        let collector_limit_millicores = parse_resource_cpu_millicores(&requested.collector.limits.cpu)?;
-        let client_limit_millicores = parse_resource_cpu_millicores(&requested.client.limits.cpu)?;
+        let collector_limit_millicores = requested.collector.limits.cpu.as_deref()
+            .map(parse_resource_cpu_millicores).transpose()?;
+        let client_limit_millicores = parse_resource_cpu_millicores(
+            requested.client.limits.cpu.as_deref().context("client CPU limit is missing")?)?;
         let throttling = resource_evidence
             .as_ref()
             .and_then(|evidence| evidence.get("cpu_throttling"))
@@ -4145,7 +4147,7 @@ fn result_rows(
                 "requested_workers": concurrency,
                 "limit_cpu": requested.collector.limits.cpu,
                 "limit_millicores": collector_limit_millicores,
-                "workers_per_cpu_core": f64::from(concurrency) * 1_000.0 / collector_limit_millicores as f64,
+                "workers_per_cpu_core": collector_limit_millicores.map(|limit| f64::from(concurrency) * 1_000.0 / limit as f64),
             },
             "client": {
                 "requested_concurrency_per_process": config.dmv_concurrency,
@@ -11543,7 +11545,14 @@ fn configure_deployment_container_resources(
     if selected.next().is_some() {
         bail!("container {container_name:?} is ambiguous in Deployment");
     }
-    container["resources"] = serde_json::to_value(requirements)?;
+    let mut resources = serde_json::to_value(requirements)?;
+    if requirements.limits.cpu.is_none() {
+        resources["limits"]
+            .as_object_mut()
+            .context("resource limits must be an object")?
+            .remove("cpu");
+    }
+    container["resources"] = resources;
     Ok(())
 }
 
@@ -11572,19 +11581,29 @@ fn verify_container_resources(
             .map(str::to_owned)
             .with_context(|| format!("{role} resource readback omitted {side}.{name}"))
     };
+    let limits = resources.get("limits").and_then(Value::as_object)
+        .context("resource readback omitted limits")?;
+    let limit_cpu = match limits.get("cpu") {
+        None => None,
+        Some(Value::String(value)) => Some(value.clone()),
+        Some(_) => bail!("{role} resource CPU limit readback has an invalid type"),
+    };
     let actual = ResourceRequirements {
         requests: ResourceValues {
-            cpu: quantity("requests", "cpu")?,
+            cpu: Some(quantity("requests", "cpu")?),
             memory: quantity("requests", "memory")?,
         },
         limits: ResourceValues {
-            cpu: quantity("limits", "cpu")?,
+            cpu: limit_cpu,
             memory: quantity("limits", "memory")?,
         },
     };
-    let quantities_match = parse_resource_cpu_millicores(&actual.requests.cpu)?
-        == parse_resource_cpu_millicores(&expected.requests.cpu)?
-        && parse_cpu_millicores(&actual.limits.cpu)? == parse_cpu_millicores(&expected.limits.cpu)?
+    let actual_request = actual.requests.cpu.as_deref().context("actual CPU request missing")?;
+    let expected_request = expected.requests.cpu.as_deref().context("expected CPU request missing")?;
+    let quantities_match = parse_resource_cpu_millicores(actual_request)?
+        == parse_resource_cpu_millicores(expected_request)?
+        && actual.limits.cpu.as_deref().map(parse_cpu_millicores).transpose()?
+            == expected.limits.cpu.as_deref().map(parse_cpu_millicores).transpose()?
         && parse_resource_memory_bytes(&actual.requests.memory)?
             == parse_resource_memory_bytes(&expected.requests.memory)?
         && parse_memory_bytes(&actual.limits.memory)? == parse_memory_bytes(&expected.limits.memory)?;
@@ -16402,11 +16421,11 @@ mod aks_resource_readback_tests {
     fn requirements() -> ResourceRequirements {
         ResourceRequirements {
             requests: ResourceValues {
-                cpu: "2".to_owned(),
+                cpu: Some("2".to_owned()),
                 memory: "4Gi".to_owned(),
             },
             limits: ResourceValues {
-                cpu: "2".to_owned(),
+                cpu: Some("2".to_owned()),
                 memory: "6Gi".to_owned(),
             },
         }
@@ -16424,6 +16443,24 @@ mod aks_resource_readback_tests {
         let evidence = verify_container_resources(&containers, "dataflow", "collector", &requirements())?;
         assert_eq!(evidence["requested"]["requests"]["cpu"], "2");
         assert_eq!(evidence["effective"]["requests"]["cpu"], "2000m");
+        Ok(())
+    }
+
+    #[test]
+    fn uncapped_collector_omits_cpu_limit_and_requires_matching_readback() -> Result<()> {
+        let mut expected = requirements();
+        expected.limits.cpu = None;
+        let mut deployment = json!({"spec":{"template":{"spec":{"containers":[{"name":"dataflow"}]}}}});
+        configure_deployment_container_resources(&mut deployment, "dataflow", &expected)?;
+        let container = &deployment["spec"]["template"]["spec"]["containers"][0];
+        assert!(container.pointer("/resources/limits/cpu").is_none());
+        verify_container_resources(std::slice::from_ref(container), "dataflow", "collector", &expected)?;
+        let mut with_cap = container.clone();
+        with_cap["resources"]["limits"]["cpu"] = json!("2");
+        assert!(verify_container_resources(&[with_cap], "dataflow", "collector", &expected).is_err());
+        let mut with_null = container.clone();
+        with_null["resources"]["limits"]["cpu"] = Value::Null;
+        assert!(verify_container_resources(&[with_null], "dataflow", "collector", &expected).is_err());
         Ok(())
     }
 

@@ -165,11 +165,11 @@ impl ResourceRequirements {
     fn new(request_cpu: &str, request_memory: &str, limit_cpu: &str, limit_memory: &str) -> Self {
         Self {
             requests: ResourceValues {
-                cpu: request_cpu.to_owned(),
+                cpu: Some(request_cpu.to_owned()),
                 memory: request_memory.to_owned(),
             },
             limits: ResourceValues {
-                cpu: limit_cpu.to_owned(),
+                cpu: Some(limit_cpu.to_owned()),
                 memory: limit_memory.to_owned(),
             },
         }
@@ -179,12 +179,20 @@ impl ResourceRequirements {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResourceValues {
-    pub cpu: String,
+    #[serde(deserialize_with = "deserialize_nullable_cpu")]
+    pub cpu: Option<String>,
     pub memory: String,
 }
 
+fn deserialize_nullable_cpu<'de, D>(deserializer: D) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer)
+}
+
 impl AksResourceConfig {
-    fn validate(&self) -> Result<()> {
+    fn validate(&self, allow_uncapped_collector: bool) -> Result<()> {
         for (role, requirements) in [
             ("collector", &self.collector),
             ("client", &self.client),
@@ -192,15 +200,20 @@ impl AksResourceConfig {
             ("router", &self.router),
             ("catalog", &self.catalog),
         ] {
-            let request_cpu = parse_cpu_millicores(&requirements.requests.cpu)
+            let request_cpu = parse_cpu_millicores(requirements.requests.cpu.as_deref()
+                .with_context(|| format!("platform.resources.{role}.requests.cpu must not be null"))?)
                 .with_context(|| format!("platform.resources.{role}.requests.cpu"))?;
-            let limit_cpu = parse_cpu_millicores(&requirements.limits.cpu)
-                .with_context(|| format!("platform.resources.{role}.limits.cpu"))?;
+            let limit_cpu = match requirements.limits.cpu.as_deref() {
+                Some(value) => Some(parse_cpu_millicores(value)
+                    .with_context(|| format!("platform.resources.{role}.limits.cpu"))?),
+                None if role == "collector" && allow_uncapped_collector => None,
+                None => bail!("platform.resources.{role}.limits.cpu must not be null"),
+            };
             let request_memory = parse_memory_bytes(&requirements.requests.memory)
                 .with_context(|| format!("platform.resources.{role}.requests.memory"))?;
             let limit_memory = parse_memory_bytes(&requirements.limits.memory)
                 .with_context(|| format!("platform.resources.{role}.limits.memory"))?;
-            if request_cpu > limit_cpu || request_memory > limit_memory {
+            if limit_cpu.is_some_and(|limit| request_cpu > limit) || request_memory > limit_memory {
                 bail!("platform.resources.{role} requests must not exceed limits");
             }
         }
@@ -459,7 +472,8 @@ impl OatConfig {
             }
             return Ok(());
         }
-        self.effective_aks_resources().validate()
+        self.effective_aks_resources()
+            .validate(self.campaign_profile == Some(CampaignProfile::ScaleOutSingleTable))
     }
 
     pub(crate) fn effective_aks_resources(&self) -> AksResourceConfig {
@@ -1266,6 +1280,20 @@ mod tests {
         assert!(invalid.validate().is_err());
         assert!(serde_json::from_value::<AksResourceOverrides>(json!({"collector":{"cpu":"2"}})).is_err());
         assert!(serde_json::from_value::<AksResourceOverrides>(json!({"client_typo":{}})).is_err());
+        let uncapped: AksResourceOverrides = serde_json::from_value(json!({
+            "collector": {"requests":{"cpu":"2","memory":"4Gi"}, "limits":{"cpu":null,"memory":"6Gi"}}
+        }))?;
+        assert!(uncapped.resolve().validate(false).is_err());
+        uncapped.resolve().validate(true)?;
+        let mut bad = uncapped.clone();
+        bad.client = bad.collector.clone();
+        assert!(bad.resolve().validate(true).is_err());
+        let mut bad = uncapped.clone();
+        bad.collector.as_mut().context("missing collector")?.requests.cpu = None;
+        assert!(bad.resolve().validate(true).is_err());
+        assert!(serde_json::from_value::<AksResourceOverrides>(json!({
+            "collector": {"requests":{"cpu":"2","memory":"4Gi"}, "limits":{"memory":"6Gi"}}
+        })).is_err());
         Ok(())
     }
 
