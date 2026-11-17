@@ -951,13 +951,13 @@ mod tests {
         for row in start..start + rows {
             let seed = row as u64 + 1;
             replica_ids.push(synthetic_text(seed, 36));
-            group_ids.push(synthetic_text(seed ^ 0x9e37_79b9, 36));
-            server_names.push(synthetic_text(seed ^ 0x243f_6a88, 48));
-            endpoints.push(synthetic_text(seed ^ 0xb7e1_5162, 190));
-            states.push(synthetic_text(seed ^ 0xdead_beef, 24));
-            errors.push(synthetic_text(seed ^ 0x85eb_ca6b, 160));
+            group_ids.push(synthetic_text(seed / 1024, 36));
+            server_names.push(synthetic_text(seed % 64 + 1, 48));
+            endpoints.push(synthetic_text(seed % 128 + 1, 190));
+            states.push(synthetic_text(seed % 6 + 1, 24));
+            errors.push(synthetic_text(seed % 32 + 1, 160));
             for (index, detail) in details.iter_mut().enumerate() {
-                detail.push(synthetic_text(seed ^ (0xc2b2_ae35 + index as u64 * 0x27d4_eb2f), 175));
+                detail.push(synthetic_text(seed % 16 + 1 + index as u64 * 32, 175));
             }
             roles.push((row % 3) as i32);
             local.push(row % 2 == 0);
@@ -1063,7 +1063,8 @@ mod tests {
         let cpu_seconds = process_cpu_seconds()? - cpu_started;
         let physical_bytes = std::fs::metadata(&path)?.len();
         eprintln!(
-            "W4_BENCH profile=synthetic_availability_replica_states_v1 rows={rows} arrow_bytes={input_bytes} physical_bytes={physical_bytes} wall_seconds={elapsed:.3} cpu_seconds={cpu_seconds:.3} input_mib_s={:.2} mib_s_per_core={:.2} rows_s={:.0} requested_threads={requested_threads} effective_threads={effective_threads}",
+            "W4_BENCH profile=synthetic_availability_replica_states_v1 rows={rows} arrow_bytes={input_bytes} physical_bytes={physical_bytes} arrow_parquet_ratio={:.2} wall_seconds={elapsed:.3} cpu_seconds={cpu_seconds:.3} input_mib_s={:.2} mib_s_per_core={:.2} rows_s={:.0} requested_threads={requested_threads} effective_threads={effective_threads}",
+            input_bytes as f64 / physical_bytes as f64,
             input_bytes as f64 / elapsed / (1024.0 * 1024.0),
             input_bytes as f64 / cpu_seconds / (1024.0 * 1024.0),
             rows as f64 / elapsed,
