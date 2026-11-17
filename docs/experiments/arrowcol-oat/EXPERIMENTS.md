@@ -13,6 +13,18 @@ ran. Earlier parse-only drafts with 19 `TODO` table slots and fixed 30/120-secon
 timings are historical receipts, not executable inputs. The binder reads the
 now-approved canonical fixture rather than copying or inventing table names.
 
+## Local launcher deadline and recovery
+
+`--deadline-seconds <1..600>` is opt-in and valid only for a local run with `--no-viewer`; omitting it preserves the existing launcher behavior. The monotonic deadline begins when `launch.ts` starts and includes setup, server build, the run, report processing and owned-server shutdown. For example:
+
+```sh
+npx --no-install tsx projects/arrowcol-oat/launch.ts --mode local --config out/arrowcol-oat/oat-config.local.json --no-viewer --deadline-seconds 600
+```
+
+The launcher does not hard-kill itself or the OAT server. If the deadline expires while `POST /runs` is in flight, it waits for that request's existing 30-second bound; a late accepted response is recorded and only that exact UUID is canceled. A lost acceptance response is recorded as `UNKNOWN` with no fabricated ID, is never retried or searched for, and blocks the next deadline-enabled cell.
+
+Each invocation atomically records its original monotonic deadline, run identity, overrun, cancellation attempts and cleanup state under `out/arrowcol-oat/deadline-receipts/`. Once the run ID is known, cancellation targets that ID and polls its status to terminal using the existing ten-minute cleanup allowance. A cancel request is retried only after a fresh status read confirms that same run is still active. On a later invocation, known-ID receipts are reconciled before a new cell; missing identity or unresolved cleanup remains `UNSETTLED` and blocks the cell. An overrun is always a failed launcher result, even if the run reaches `succeeded`.
+
 ## Capacity prerequisites
 
 The example's user pools can autoscale from zero to one node; per-node capacity

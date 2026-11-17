@@ -1,9 +1,11 @@
+import { randomUUID } from 'node:crypto';
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { lstat, mkdir, readFile, realpath, readdir, rm, stat, unlink, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, open, readFile, realpath, readdir, rename, rm, stat, unlink, writeFile } from 'node:fs/promises';
 import { createServer as createHttpServer } from 'node:http';
 import { createServer as createTcpServer, isIP } from 'node:net';
-import { extname, isAbsolute, relative, resolve, sep } from 'node:path';
+import { dirname, extname, isAbsolute, relative, resolve, sep } from 'node:path';
+import { performance } from 'node:perf_hooks';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { formatPreflightReport, loadAksEnvironment, runAksPreflight } from './aks-preflight.js';
 import { run_tree } from '../../infra/azure/bootstrap.js';
@@ -31,7 +33,10 @@ interface LocalViewerConfig {
 }
 
 const workspaceRoot = resolve(fileURLToPath(new URL('../..', import.meta.url)));
-const cliValuedOptions = new Set(['--config', '--mode', '--server', '--poll-ms', '--cleanup-local', '--stamp-config']);
+const launcherDeadlineReceiptRoot = resolve(workspaceRoot, 'out/arrowcol-oat/deadline-receipts');
+const launcherDeadlineMaxSeconds = 600;
+const localCancellationCleanupMs = 10 * 60 * 1000;
+const cliValuedOptions = new Set(['--config', '--mode', '--server', '--poll-ms', '--cleanup-local', '--stamp-config', '--deadline-seconds']);
 
 export class OatCliError extends Error {
   readonly exitCode = 2;
@@ -68,11 +73,270 @@ Options:
   --stamp-config <path> Use the private stamp YAML for AKS validation
   --server <URL>       Use an existing OAT API server
   --poll-ms <number>   Set the status polling interval
+  --deadline-seconds <1..600> Fail closed after this launcher-start deadline (local only)
   --viewer-only        Serve existing local results without running a benchmark
   --no-viewer          Exit after a successful local run without serving results
   --preflight-only     Run the read-only AKS preflight
   --cleanup-local <id> Remove one abandoned local Compose cell by its run UUID
   -h, --help           Show this help`;
+
+type DeadlineCreationState = 'not_started' | 'pending' | 'accepted' | 'rejected' | 'unknown';
+type DeadlineCleanupState = 'not_started' | 'pending' | 'confirmed' | 'unsettled';
+
+interface LauncherDeadlineReceipt {
+  version: 1;
+  invocation_id: string;
+  started_at_unix_ms: number;
+  deadline_at_unix_ms: number;
+  started_at_monotonic_ms: number;
+  deadline_seconds: number;
+  deadline_at_monotonic_ms: number;
+  overrun: boolean;
+  overrun_at_unix_ms: number | null;
+  creation_state: DeadlineCreationState;
+  server_url: string | null;
+  run_id: string | null;
+  run_state: OatRunStatus['state'] | 'not_started' | 'unknown';
+  cancellation_attempts: number;
+  last_cancel_result: string | null;
+  cleanup_state: DeadlineCleanupState;
+  error: string | null;
+}
+
+async function writeAtomicJson(path: string, value: unknown): Promise<void> {
+  const directory = dirname(path);
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  const temporary = `${path}.${randomUUID()}.tmp`;
+  const file = await open(temporary, 'wx', 0o600);
+  try {
+    await file.writeFile(`${JSON.stringify(value, null, 2)}\n`);
+    await file.sync();
+  } finally {
+    await file.close();
+  }
+  await rename(temporary, path);
+  const directoryHandle = await open(directory, 'r');
+  try {
+    await directoryHandle.sync();
+  } finally {
+    await directoryHandle.close();
+  }
+}
+
+export class OatLauncherDeadline {
+  readonly signal: AbortSignal;
+  readonly receiptPath: string;
+  readonly deadlineAtMonotonicMs: number;
+  private readonly controller = new AbortController();
+  private readonly receipt: LauncherDeadlineReceipt;
+  private timer: NodeJS.Timeout | undefined;
+  private writeTail: Promise<void> = Promise.resolve();
+  private backgroundWriteFailure: unknown;
+
+  private constructor(receiptPath: string, receipt: LauncherDeadlineReceipt) {
+    this.receiptPath = receiptPath;
+    this.receipt = receipt;
+    this.deadlineAtMonotonicMs = receipt.deadline_at_monotonic_ms;
+    this.signal = this.controller.signal;
+  }
+
+  static async create(seconds: number, startedAtMonotonicMs = performance.now(), receiptRoot = launcherDeadlineReceiptRoot, startedAtUnixMs = Date.now()): Promise<OatLauncherDeadline> {
+    if (!Number.isSafeInteger(seconds) || seconds < 1 || seconds > launcherDeadlineMaxSeconds) {
+      throw new OatCliError(`--deadline-seconds must be an integer from 1 to ${launcherDeadlineMaxSeconds}`);
+    }
+    const invocationId = randomUUID();
+    const receipt: LauncherDeadlineReceipt = {
+      version: 1,
+      invocation_id: invocationId,
+      started_at_unix_ms: startedAtUnixMs,
+      deadline_at_unix_ms: startedAtUnixMs + seconds * 1000,
+      started_at_monotonic_ms: startedAtMonotonicMs,
+      deadline_seconds: seconds,
+      deadline_at_monotonic_ms: startedAtMonotonicMs + seconds * 1000,
+      overrun: false,
+      overrun_at_unix_ms: null,
+      creation_state: 'not_started',
+      server_url: null,
+      run_id: null,
+      run_state: 'not_started',
+      cancellation_attempts: 0,
+      last_cancel_result: null,
+      cleanup_state: 'not_started',
+      error: null,
+    };
+    const deadline = new OatLauncherDeadline(resolve(receiptRoot, `${invocationId}.json`), receipt);
+    await deadline.persist();
+    deadline.timer = setTimeout(() => {
+      void deadline.markOverrun().catch((error: unknown) => { deadline.backgroundWriteFailure = error; });
+      deadline.controller.abort(new Error('launcher-start deadline expired'));
+    }, Math.max(0, deadline.deadlineAtMonotonicMs - performance.now()));
+    return deadline;
+  }
+
+  static async restore(path: string): Promise<OatLauncherDeadline> {
+    const parsed: unknown = JSON.parse(await readFile(path, 'utf8'));
+    if (!isLauncherDeadlineReceipt(parsed)) throw new Error(`Invalid launcher deadline receipt ${path}`);
+    const deadline = new OatLauncherDeadline(path, parsed);
+    if (!parsed.overrun && Date.now() >= parsed.deadline_at_unix_ms) {
+      parsed.overrun = true;
+      parsed.overrun_at_unix_ms = Date.now();
+      await deadline.persist();
+    }
+    return deadline;
+  }
+
+  get creationState(): DeadlineCreationState { return this.receipt.creation_state; }
+  get cleanupState(): DeadlineCleanupState { return this.receipt.cleanup_state; }
+  get runId(): string | null { return this.receipt.run_id; }
+  get serverUrl(): string | null { return this.receipt.server_url; }
+  isExpired(): boolean { return performance.now() >= this.deadlineAtMonotonicMs; }
+
+  private async persist(): Promise<void> {
+    const snapshot = structuredClone(this.receipt);
+    const nextWrite = this.writeTail.catch(() => undefined).then(() => writeAtomicJson(this.receiptPath, snapshot));
+    this.writeTail = nextWrite;
+    try {
+      await nextWrite;
+      this.backgroundWriteFailure = undefined;
+    } catch (error) {
+      this.backgroundWriteFailure = error;
+      throw error;
+    }
+  }
+
+  async markCreationPending(serverUrl: string): Promise<void> {
+    this.receipt.server_url = serverUrl;
+    this.receipt.creation_state = 'pending';
+    this.receipt.run_state = 'unknown';
+    this.receipt.cleanup_state = 'pending';
+    await this.persist();
+  }
+
+  async recordRunStarted(status: OatRunStatus): Promise<void> {
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(status.id)) {
+      throw new Error('OAT server returned a run ID that cannot be safely persisted');
+    }
+    this.receipt.creation_state = 'accepted';
+    this.receipt.run_id = status.id;
+    this.receipt.run_state = status.state;
+    this.receipt.cleanup_state = status.state === 'queued' || status.state === 'running' ? 'pending' : 'confirmed';
+    await this.persist();
+  }
+
+  async markCreationRejected(error: unknown): Promise<void> {
+    this.receipt.creation_state = 'rejected';
+    this.receipt.run_state = 'not_started';
+    this.receipt.cleanup_state = 'confirmed';
+    this.receipt.error = error instanceof Error ? error.message : String(error);
+    await this.persist();
+  }
+
+  async markCreationUnknown(error: unknown): Promise<void> {
+    this.receipt.creation_state = 'unknown';
+    this.receipt.run_state = 'unknown';
+    this.receipt.cleanup_state = 'unsettled';
+    this.receipt.error = error instanceof Error ? error.message : String(error);
+    await this.persist();
+  }
+
+  async markCancelAttempt(): Promise<void> {
+    this.receipt.cancellation_attempts++;
+    this.receipt.last_cancel_result = 'pending';
+    await this.persist();
+  }
+
+  async markCancelResult(result: string): Promise<void> {
+    this.receipt.last_cancel_result = result;
+    await this.persist();
+  }
+
+  async recordTerminal(status: OatRunStatus): Promise<void> {
+    this.receipt.run_state = status.state;
+    this.receipt.cleanup_state = status.state === 'queued' || status.state === 'running' ? 'pending' : 'confirmed';
+    this.receipt.error = status.error;
+    await this.persist();
+  }
+
+  async markUnsettled(error: unknown): Promise<void> {
+    this.receipt.cleanup_state = 'unsettled';
+    this.receipt.error = error instanceof Error ? error.message : String(error);
+    await this.persist();
+  }
+
+  async markNoRun(error?: unknown): Promise<void> {
+    if (this.receipt.creation_state !== 'not_started') return;
+    this.receipt.run_state = 'not_started';
+    this.receipt.cleanup_state = 'confirmed';
+    if (error !== undefined) this.receipt.error = error instanceof Error ? error.message : String(error);
+    await this.persist();
+  }
+
+  async markOverrun(): Promise<void> {
+    if (!this.receipt.overrun) {
+      this.receipt.overrun = true;
+      this.receipt.overrun_at_unix_ms = Date.now();
+    }
+    await this.persist();
+  }
+
+  dispose(): void { if (this.timer) clearTimeout(this.timer); }
+}
+
+function isLauncherDeadlineReceipt(value: unknown): value is LauncherDeadlineReceipt {
+  if (!isRecord(value)) return false;
+  return value.version === 1 && typeof value.invocation_id === 'string' &&
+    typeof value.started_at_unix_ms === 'number' && typeof value.deadline_at_unix_ms === 'number' &&
+    typeof value.started_at_monotonic_ms === 'number' &&
+    typeof value.deadline_seconds === 'number' && typeof value.deadline_at_monotonic_ms === 'number' &&
+    typeof value.overrun === 'boolean' && (value.overrun_at_unix_ms === null || typeof value.overrun_at_unix_ms === 'number') &&
+    ['not_started', 'pending', 'accepted', 'rejected', 'unknown'].includes(String(value.creation_state)) &&
+    (value.server_url === null || typeof value.server_url === 'string') &&
+    (value.run_id === null || typeof value.run_id === 'string') &&
+    ['queued', 'running', 'succeeded', 'failed', 'cancelled', 'not_started', 'unknown'].includes(String(value.run_state)) &&
+    (value.cleanup_state === 'not_started' || value.cleanup_state === 'pending' ||
+      value.cleanup_state === 'confirmed' || value.cleanup_state === 'unsettled') &&
+    typeof value.cancellation_attempts === 'number' && Number.isSafeInteger(value.cancellation_attempts) &&
+    (value.last_cancel_result === null || typeof value.last_cancel_result === 'string') &&
+    (value.error === null || typeof value.error === 'string');
+}
+
+function isLocalOatServerUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'http:' && !url.username && !url.password &&
+      ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname);
+  } catch {
+    return false;
+  }
+}
+
+export async function assertNoUnsettledDeadlineReceipts(root = launcherDeadlineReceiptRoot): Promise<void> {
+  const names = await readdir(root).catch((error: unknown) => {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return [];
+    throw error;
+  });
+  for (const name of names.filter((entry) => entry.endsWith('.json'))) {
+    const path = resolve(root, name);
+    const deadline = await OatLauncherDeadline.restore(path);
+    if (deadline.creationState !== 'pending' && deadline.creationState !== 'unknown' &&
+        deadline.cleanupState !== 'pending' && deadline.cleanupState !== 'unsettled') continue;
+    if (!deadline.runId || !deadline.serverUrl ||
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(deadline.runId) ||
+        !isLocalOatServerUrl(deadline.serverUrl)) {
+      const identity = deadline.runId ? `run ${deadline.runId}` : 'run identity UNKNOWN';
+      throw new Error(`Unsettled launcher deadline receipt ${path} (${identity}); refusing another run until this exact receipt is reconciled`);
+    }
+    try {
+      await cancelAndReconcileLocalRun(new URL(deadline.serverUrl), deadline.runId, fetch, 1000, deadline);
+    } catch (error) {
+      throw new Error(`Unsettled launcher deadline receipt ${path}; refusing another run`, { cause: error });
+    }
+    if (deadline.cleanupState !== 'confirmed') {
+      throw new Error(`Launcher deadline receipt ${path} remains unsettled; refusing another run`);
+    }
+  }
+}
+
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -421,6 +685,118 @@ export async function readOatConfigForMode(
   return { ...parsed, platform };
 }
 
+async function cancelAndReconcileLocalRun(
+  server: URL,
+  runId: string,
+  fetcher: FetchLike,
+  pollIntervalMs: number,
+  deadline: OatLauncherDeadline,
+  initialEvidenceError?: unknown,
+): Promise<OatRunStatus> {
+  const cleanupDeadline = performance.now() + localCancellationCleanupMs;
+  let cancellationAttempted = false;
+  let cancellationAccepted = false;
+  let retryAfterRead = false;
+  let evidenceError = initialEvidenceError;
+  let lastError: unknown = new Error('no cancellation response received');
+  const note = async (operation: () => Promise<void>): Promise<void> => {
+    try {
+      await operation();
+      evidenceError = undefined;
+    } catch (error) {
+      evidenceError = error;
+    }
+  };
+  const wait = async (): Promise<void> => {
+    const remaining = cleanupDeadline - performance.now();
+    if (remaining > 0) await new Promise<void>((resolveWait) => setTimeout(resolveWait, Math.min(pollIntervalMs, remaining)));
+  };
+  const timeoutSignal = (): AbortSignal => AbortSignal.timeout(Math.max(1, Math.min(30_000, Math.floor(cleanupDeadline - performance.now()))));
+
+  while (performance.now() < cleanupDeadline) {
+    let response: Response;
+    try {
+      response = await fetcher(new URL('/runs/' + encodeURIComponent(runId), server), { signal: timeoutSignal() });
+    } catch (error) {
+      lastError = error;
+      await wait();
+      continue;
+    }
+    if (!response.ok) {
+      if (response.status >= 500 || response.status === 408 || response.status === 429) {
+        lastError = new Error(`Run status read returned HTTP ${response.status}`);
+        await wait();
+        continue;
+      }
+      const error = new Error(`Could not reconcile local OAT run ${runId}: HTTP ${response.status}`);
+      await note(() => deadline.markUnsettled(error));
+      throw error;
+    }
+    let status: OatRunStatus;
+    try {
+      status = await readStatus(response, 'reconcile local OAT run');
+    } catch (error) {
+      await note(() => deadline.markUnsettled(error));
+      throw error;
+    }
+    if (status.state !== 'queued' && status.state !== 'running') {
+      await note(() => deadline.recordTerminal(status));
+      if (evidenceError) {
+        const persistError = evidenceError;
+        const error = new Error(`OAT run ${runId} reached ${status.state}, but its terminal receipt could not be persisted`);
+        await note(() => deadline.markUnsettled(error));
+        throw new Error(error.message, { cause: persistError });
+      }
+      return status;
+    }
+
+    let attemptedCancellation = false;
+    if (!cancellationAccepted && (!cancellationAttempted || retryAfterRead)) {
+      cancellationAttempted = true;
+      attemptedCancellation = true;
+      retryAfterRead = false;
+      await note(() => deadline.markCancelAttempt());
+      let cancelResponse: Response;
+      try {
+        cancelResponse = await fetcher(new URL('/runs/' + encodeURIComponent(runId) + '/cancel', server), {
+          method: 'POST',
+          signal: timeoutSignal(),
+        });
+      } catch (error) {
+        lastError = error;
+        retryAfterRead = true;
+        await note(() => deadline.markCancelResult('response_unknown'));
+        continue;
+      }
+      if (cancelResponse.ok) {
+        cancellationAccepted = true;
+        await note(() => deadline.markCancelResult('accepted'));
+      } else if (cancelResponse.status === 409) {
+        cancellationAccepted = true;
+        await note(() => deadline.markCancelResult('not_active'));
+      } else if (cancelResponse.status >= 500 || cancelResponse.status === 408 || cancelResponse.status === 429) {
+        lastError = new Error(`Cancel response was inconclusive (HTTP ${cancelResponse.status})`);
+        retryAfterRead = true;
+        await note(() => deadline.markCancelResult('response_unknown'));
+      } else {
+        const error = new Error(`Could not cancel local OAT run ${runId}: HTTP ${cancelResponse.status}`);
+        await note(() => deadline.markCancelResult(`rejected_http_${cancelResponse.status}`));
+        await note(() => deadline.markUnsettled(error));
+        throw error;
+      }
+    }
+    if (attemptedCancellation) continue;
+    await wait();
+  }
+
+  const detail = lastError instanceof Error ? lastError.message : String(lastError);
+  const error = new Error(`Local OAT run ${runId} cleanup was not confirmed within the existing ${localCancellationCleanupMs / 1000}s allowance: ${detail}`);
+  await note(() => deadline.markUnsettled(error));
+  if (evidenceError) throw new Error(`${error.message}; launcher receipt persistence also failed`, { cause: evidenceError });
+  throw error;
+}
+
+
 export async function launchOat(
   configPath: string,
   serverUrl = 'http://127.0.0.1:8088',
@@ -431,7 +807,8 @@ export async function launchOat(
   bridgeGateway: () => string = getDockerBridgeGateway,
   signal?: AbortSignal,
   onRunStarted?: (status: OatRunStatus) => Promise<void>,
-  onRunFinished?: (status: OatRunStatus) => void,
+  onRunFinished?: (status: OatRunStatus) => void | Promise<void>,
+  deadline?: OatLauncherDeadline,
 ): Promise<OatRunStatus> {
   if (!Number.isSafeInteger(pollIntervalMs) || pollIntervalMs < 1) {
     throw new Error('poll interval must be a positive integer');
@@ -445,41 +822,82 @@ export async function launchOat(
     : JSON.parse(await readFile(configPath, 'utf8'));
   if (!isRecord(config)) throw new Error('OAT config must be a JSON object');
 
-  const startResponse = await fetcher(new URL('/runs', server), {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(config),
-    signal: AbortSignal.timeout(30_000),
-  });
-  let status = await readStatus(startResponse, 'start OAT run');
+  if (deadline) {
+    if (deadline.isExpired()) {
+      await deadline.markOverrun();
+      await deadline.markNoRun(new Error('launcher-start deadline expired before run creation'));
+      throw new Error(`Launcher-start deadline expired before OAT run creation; receipt: ${deadline.receiptPath}`);
+    }
+    await deadline.markCreationPending(server.href);
+    if (deadline.isExpired()) {
+      await deadline.markOverrun();
+      const error = new Error('launcher-start deadline expired before POST /runs');
+      await deadline.markCreationRejected(error);
+      throw error;
+    }
+  }
+
+  let startResponse: Response;
+  try {
+    startResponse = await fetcher(new URL('/runs', server), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(config),
+      signal: AbortSignal.timeout(30_000),
+    });
+  } catch (error) {
+    if (deadline) await deadline.markCreationUnknown(error);
+    throw error;
+  }
+
+  let status: OatRunStatus;
+  try {
+    status = await readStatus(startResponse, 'start OAT run');
+  } catch (error) {
+    if (deadline) {
+      if (startResponse.status >= 400 && startResponse.status < 500) await deadline.markCreationRejected(error);
+      else await deadline.markCreationUnknown(error);
+    }
+    throw error;
+  }
+
   let startFailure: { error: unknown } | undefined;
-  type CancellationOutcome = { ok: true } | { ok: false; error: unknown };
+  type CancellationOutcome = { ok: true; status?: OatRunStatus } | { ok: false; error: unknown };
   let cancellationRequest: Promise<CancellationOutcome> = Promise.resolve({ ok: true });
   let cancellationRequested = false;
   let cancellationObserved = false;
   let resolveCancellationStarted!: () => void;
-  const cancellationStarted = new Promise<void>((resolve) => { resolveCancellationStarted = resolve; });
+  const cancellationStarted = new Promise<void>((resolveStarted) => { resolveCancellationStarted = resolveStarted; });
+  const runSignal = deadline
+    ? signal ? AbortSignal.any([signal, deadline.signal]) : deadline.signal
+    : signal;
   const requestCancellation = (): void => {
     if (cancellationRequested) return;
     cancellationRequested = true;
     resolveCancellationStarted();
-    cancellationRequest = (async (): Promise<void> => {
+    cancellationRequest = (async (): Promise<CancellationOutcome> => {
+      if (deadline) {
+        let evidenceError: unknown;
+        if (deadline.isExpired()) {
+          try { await deadline.markOverrun(); } catch (error) { evidenceError = error; }
+        }
+        const terminal = await cancelAndReconcileLocalRun(server, status.id, fetcher, pollIntervalMs, deadline, evidenceError);
+        return { ok: true, status: terminal };
+      }
       const response = await fetcher(new URL('/runs/' + encodeURIComponent(status.id) + '/cancel', server), {
         method: 'POST',
         signal: AbortSignal.timeout(30_000),
       });
-      if (!response.ok && response.status !== 409) {
-        await readStatus(response, 'cancel local OAT run');
-      }
-    })().then(
-      () => ({ ok: true as const }),
-      (error: unknown) => ({ ok: false as const, error }),
-    );
+      if (!response.ok && response.status !== 409) await readStatus(response, 'cancel local OAT run');
+      return { ok: true };
+    })().catch((error: unknown) => ({ ok: false, error }));
   };
-  if (signal?.aborted) requestCancellation();
-  else signal?.addEventListener('abort', requestCancellation, { once: true });
+  if (runSignal?.aborted) requestCancellation();
+  else runSignal?.addEventListener('abort', requestCancellation, { once: true });
+
   try {
     try {
+      await deadline?.recordRunStarted(status);
       await onRunStarted?.(status);
     } catch (error) {
       startFailure = { error };
@@ -489,8 +907,8 @@ export async function launchOat(
     while (status.state === 'queued' || status.state === 'running') {
       if (!cancellationRequested || cancellationObserved) {
         let pollTimer: NodeJS.Timeout;
-        const pollDelay = new Promise<'poll'>((resolve) => {
-          pollTimer = setTimeout(() => resolve('poll'), pollIntervalMs);
+        const pollDelay = new Promise<'poll'>((resolvePoll) => {
+          pollTimer = setTimeout(() => resolvePoll('poll'), pollIntervalMs);
         });
         if (cancellationRequested) {
           await pollDelay;
@@ -506,6 +924,13 @@ export async function launchOat(
         const result = await cancellationRequest;
         cancellationObserved = true;
         if (!result.ok) throw result.error instanceof Error ? result.error : new Error(String(result.error));
+        if (result.status) {
+          const changed = result.status.state !== status.state || result.status.progress !== status.progress ||
+            result.status.result_count !== status.result_count || result.status.error !== status.error;
+          status = result.status;
+          if (changed) onProgress(status);
+          break;
+        }
       }
       const response = await fetcher(new URL('/runs/' + encodeURIComponent(status.id), server), {
         signal: AbortSignal.timeout(30_000),
@@ -517,6 +942,9 @@ export async function launchOat(
       if (changed) onProgress(status);
     }
   } catch (error) {
+    if (deadline && deadline.runId && deadline.cleanupState !== 'confirmed') {
+      await deadline.markUnsettled(error);
+    }
     if (startFailure) {
       const original = startFailure.error instanceof Error ? startFailure.error.message : String(startFailure.error);
       const cleanup = error instanceof Error ? error.message : String(error);
@@ -524,9 +952,15 @@ export async function launchOat(
     }
     throw error;
   } finally {
-    signal?.removeEventListener('abort', requestCancellation);
+    runSignal?.removeEventListener('abort', requestCancellation);
   }
-  onRunFinished?.(status);
+
+  await deadline?.recordTerminal(status);
+  await onRunFinished?.(status);
+  if (deadline?.isExpired()) {
+    await deadline.markOverrun();
+    throw new Error(`Launcher-start deadline expired; run ${status.id} is ${status.state}; receipt: ${deadline.receiptPath}`);
+  }
   if (startFailure) {
     if (status.state !== 'succeeded' && status.state !== 'cancelled') {
       const original = startFailure.error instanceof Error ? startFailure.error.message : String(startFailure.error);
@@ -561,6 +995,8 @@ async function readStatus(response: Response, action: string): Promise<OatRunSta
 }
 
 export async function main(args: string[], runner: typeof run_tree = run_tree, cleanupLocal = cleanupLocalComposeProjects): Promise<void> {
+  const launcherStartedAtUnixMs = Date.now();
+  const launcherStartedAtMonotonicMs = performance.now();
   if (args.includes('-h') || args.includes('--help')) {
     console.log(cliUsage);
     return;
@@ -578,6 +1014,13 @@ export async function main(args: string[], runner: typeof run_tree = run_tree, c
     throw new OatCliError('--mode must be local or aks');
   }
   const requestedServerUrl = option('--server');
+  const deadlineOptionCount = args.filter((argument) => argument === '--deadline-seconds').length;
+  if (deadlineOptionCount > 1) throw new OatCliError('--deadline-seconds may be specified only once');
+  const deadlineValue = option('--deadline-seconds');
+  const deadlineSeconds = deadlineValue === undefined ? undefined : Number(deadlineValue);
+  if (deadlineValue !== undefined && (!/^[1-9][0-9]{0,2}$/.test(deadlineValue) || !Number.isSafeInteger(deadlineSeconds) || deadlineSeconds! > launcherDeadlineMaxSeconds)) {
+    throw new OatCliError(`--deadline-seconds must be an integer from 1 to ${launcherDeadlineMaxSeconds}`);
+  }
   const requestedStampConfigPath = option('--stamp-config');
   if (requestedStampConfigPath !== undefined && requestedMode !== 'aks') {
     throw new OatCliError('--stamp-config requires --mode aks');
@@ -586,10 +1029,16 @@ export async function main(args: string[], runner: typeof run_tree = run_tree, c
   const viewerOnly = args.includes('--viewer-only');
   const noViewer = args.includes('--no-viewer');
   const preflightOnly = args.includes('--preflight-only');
+  if (deadlineSeconds !== undefined && (requestedMode === 'aks' || viewerOnly || !noViewer)) {
+    throw new OatCliError('--deadline-seconds requires a local benchmark run with --no-viewer');
+  }
+  if (deadlineSeconds !== undefined && requestedServerUrl && !isLocalOatServerUrl(requestedServerUrl)) {
+    throw new OatCliError('--deadline-seconds requires a loopback --server URL');
+  }
   if (noViewer && (requestedMode === 'aks' || viewerOnly)) {
     throw new OatCliError('--no-viewer requires a local benchmark run and cannot be combined with --viewer-only');
   }
-  if (cleanupRunId !== undefined && (requestedMode === 'aks' || requestedServerUrl || args.includes('--poll-ms') || args.includes('--viewer-only') || args.includes('--preflight-only'))) {
+  if (cleanupRunId !== undefined && (requestedMode === 'aks' || requestedServerUrl || args.includes('--poll-ms') || args.includes('--viewer-only') || args.includes('--preflight-only') || deadlineSeconds !== undefined)) {
     throw new OatCliError('--cleanup-local requires local mode and cannot be combined with server, poll, viewer, or preflight options');
   }
   if (requestedMode === 'aks') Object.assign(process.env, await loadAksEnvironment(workspaceRoot));
@@ -646,15 +1095,33 @@ export async function main(args: string[], runner: typeof run_tree = run_tree, c
     }
     config.subscriptionId = subscriptionId;
   }
+  let deadline: OatLauncherDeadline | undefined;
+  if (deadlineSeconds !== undefined) {
+    await assertNoUnsettledDeadlineReceipts();
+    deadline = await OatLauncherDeadline.create(deadlineSeconds, launcherStartedAtMonotonicMs, launcherDeadlineReceiptRoot, launcherStartedAtUnixMs);
+    if (deadline.isExpired()) {
+      await deadline.markOverrun();
+      await deadline.markNoRun(new Error('launcher-start deadline expired during setup'));
+      deadline.dispose();
+      process.exitCode = 1;
+      console.error(`[oat] Launcher deadline expired during setup; receipt: ${deadline.receiptPath}`);
+      return;
+    }
+  }
   if (requestedServerUrl) {
     const interrupt = mode === 'local' ? registerLocalInterrupts() : undefined;
     let runPassed = false;
     try {
       try {
         const code = await reportDataFlowRun(
-          (progress) => launchOat(configPath, requestedServerUrl, pollValue, fetch, progress, mode, getDockerBridgeGateway, interrupt?.controller.signal),
+          (progress) => launchOat(configPath, requestedServerUrl, pollValue, fetch, progress, mode, getDockerBridgeGateway, interrupt?.controller.signal, undefined, undefined, deadline),
           config, mode, undefined, runner, network, warnings,
         );
+        if (deadline?.isExpired()) {
+          await deadline.markOverrun();
+          process.exitCode = 1;
+          return;
+        }
         if (interrupt?.signal) {
           process.exitCode = interrupt.exitCode;
           return;
@@ -668,23 +1135,70 @@ export async function main(args: string[], runner: typeof run_tree = run_tree, c
       }
     } finally {
       interrupt?.dispose();
+      if (deadline) {
+        try {
+          if (deadline.isExpired()) await deadline.markOverrun();
+          await deadline.markNoRun();
+        } finally {
+          deadline.dispose();
+        }
+      }
     }
     if (runPassed && !noViewer) await maybeServeLocalViewer(configPath, mode);
     return;
   }
 
-  if (mode === 'local') await recoverInterruptedLocalRuns(config);
+  if (mode === 'local') {
+    try {
+      await recoverInterruptedLocalRuns(config);
+    } catch (error) {
+      if (deadline) {
+        if (deadline.isExpired()) await deadline.markOverrun();
+        await deadline.markNoRun(error);
+        deadline.dispose();
+      }
+      throw error;
+    }
+  }
+  if (deadline?.isExpired()) {
+    await deadline.markOverrun();
+    await deadline.markNoRun(new Error('launcher-start deadline expired during local recovery'));
+    deadline.dispose();
+    process.exitCode = 1;
+    console.error(`[oat] Launcher deadline expired during local recovery; receipt: ${deadline.receiptPath}`);
+    return;
+  }
   const serverEnvironment = mode === 'aks'
     ? { ARROWCOL_AKS_STAMP_CONFIG_FILE: requestedStampConfigPath ?? 'infra/azure/stamp.yaml' }
     : {};
   console.log('[oat] Building benchmark server...');
-  const server = await startLocalServer(runner, serverEnvironment);
+  let server: Awaited<ReturnType<typeof startLocalServer>>;
+  try {
+    server = await startLocalServer(runner, serverEnvironment);
+  } catch (error) {
+    if (deadline?.isExpired()) await deadline.markOverrun();
+    await deadline?.markNoRun(error);
+    deadline?.dispose();
+    throw error;
+  }
+  if (deadline?.isExpired()) {
+    await deadline.markOverrun();
+    await deadline.markNoRun(new Error('launcher-start deadline expired before run creation'));
+    await stopLocalServer(server.child);
+    deadline.dispose();
+    process.exitCode = 1;
+    console.error(`[oat] Launcher deadline expired before run creation; receipt: ${deadline.receiptPath}`);
+    return;
+  }
   console.log(`[oat] Benchmark server: ${server.url} (PID ${server.child.pid}; logs in this terminal)`);
   let markerContext: LocalRunMarkerContext | undefined;
   try {
     if (mode === 'local') markerContext = await prepareLocalRunMarker(config, server);
   } catch (error) {
     await stopLocalServer(server.child);
+    if (deadline?.isExpired()) await deadline.markOverrun();
+    await deadline?.markNoRun(error);
+    deadline?.dispose();
     throw error;
   }
   let markerWritten = false;
@@ -702,7 +1216,7 @@ export async function main(args: string[], runner: typeof run_tree = run_tree, c
         runCleanupComplete = status.state === 'succeeded' || status.state === 'cancelled';
       };
       const code = await reportDataFlowRun(
-        (progress) => launchOat(configPath, server.url, pollValue, fetch, progress, mode, getDockerBridgeGateway, interrupt?.controller.signal, onRunStarted, onRunFinished),
+        (progress) => launchOat(configPath, server.url, pollValue, fetch, progress, mode, getDockerBridgeGateway, interrupt?.controller.signal, onRunStarted, onRunFinished, deadline),
         config, mode, server.gitSha, runner, network, warnings,
       );
       if (interrupt?.signal) {
@@ -717,14 +1231,31 @@ export async function main(args: string[], runner: typeof run_tree = run_tree, c
       return;
     }
   } finally {
-    await finishOwnedLocalRun(
-      () => stopLocalServer(server.child),
-      async () => {
-        if (markerWritten && runCleanupComplete && markerContext) await unlink(markerContext.path);
-      },
-      interrupt,
-      async () => { if (runPassed && !noViewer) await maybeServeLocalViewer(configPath, mode); },
-    );
+    try {
+      await finishOwnedLocalRun(
+        async () => {
+          if (deadline && deadline.cleanupState !== 'confirmed') {
+            console.error(`[oat] Preserving OAT server for unresolved run receipt ${deadline.receiptPath}`);
+            return;
+          }
+          await stopLocalServer(server.child);
+        },
+        async () => {
+          if (markerWritten && runCleanupComplete && markerContext) await unlink(markerContext.path);
+        },
+        interrupt,
+        async () => { if (runPassed && !noViewer) await maybeServeLocalViewer(configPath, mode); },
+      );
+    } finally {
+      if (deadline) {
+        try {
+          if (deadline.isExpired()) await deadline.markOverrun();
+          await deadline.markNoRun();
+        } finally {
+          deadline.dispose();
+        }
+      }
+    }
   }
 }
 
