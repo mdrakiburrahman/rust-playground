@@ -2010,7 +2010,8 @@ fn optimize_reconsiders_partial_outputs_after_reopen_and_new_arrival() -> Result
         customer_schema(),
         vec![INGESTION_PARTITION.into()],
     )?;
-    append_customers(&reopened, 0, &["c14", "c15"], 14)?;
+    // A one-row arrival fits either partial output regardless of UUID path order.
+    append_customers(&reopened, 0, &["c14"], 14)?;
     drop(reopened);
     let maintenance = DeltaTable::open_for_maintenance(&url_of(root.path())?)?;
     let second = maintenance.plan_optimize(&config)?;
@@ -2028,7 +2029,7 @@ fn optimize_reconsiders_partial_outputs_after_reopen_and_new_arrival() -> Result
             second_report.rows_removed,
             second_report.rows_added,
         ),
-        (Outcome::Committed, 3, 2, 16, 16)
+        (Outcome::Committed, 3, 2, 15, 15)
     );
 
     let mut actual_rows = Vec::new();
@@ -2058,9 +2059,116 @@ fn optimize_reconsiders_partial_outputs_after_reopen_and_new_arrival() -> Result
         assert!(file_customers.windows(2).all(|pair| pair[0] <= pair[1]));
     }
     actual_rows.sort();
-    let mut expected_rows: Vec<_> = (0..16).map(|id| (format!("c{id}"), id)).collect();
+    let mut expected_rows: Vec<_> = (0..15).map(|id| (format!("c{id}"), id)).collect();
     expected_rows.sort();
     assert_eq!(actual_rows, expected_rows);
+    Ok(())
+}
+
+#[test]
+fn optimize_d42_residual_batch_rows_change_invalidates_no_benefit_proof() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let table = DeltaTable::open_url(
+        url_of(root.path())?,
+        customer_schema(),
+        vec![INGESTION_PARTITION.into()],
+    )?;
+    append_customers(&table, 0, &["c0", "c1", "c2", "c3", "c4", "c5"], 0)?;
+    append_customers(&table, 0, &["c6", "c7", "c8", "c9", "c10", "c11"], 6)?;
+    append_customers(&table, 0, &["c12", "c13", "c14", "c15", "c16", "c17"], 12)?;
+    let layout = LayoutPolicy {
+        max_rows: 10,
+        max_input_bytes: 1024 * 1024,
+        row_group_rows: 10,
+        page_rows: 2,
+        ..LayoutPolicy::default()
+    };
+    let six_row_batches = OptimizeConfig {
+        layout: Some(layout),
+        sealed_final: true,
+        batch_rows: 6,
+        ..optimize_config()
+    };
+    let maintenance = DeltaTable::open_for_maintenance(&url_of(root.path())?)?;
+    let plan = maintenance.plan_optimize(&six_row_batches)?;
+    assert_eq!(plan.bins.iter().flat_map(|bin| &bin.files).count(), 3);
+    let first = maintenance.apply_optimize(&plan, &six_row_batches, &control())?;
+    assert_eq!(first.outcome, Outcome::Noop);
+    assert_eq!(first.nonbeneficial_bins, 1);
+
+    drop(maintenance);
+    drop(table);
+    let reopened = DeltaTable::open_for_maintenance(&url_of(root.path())?)?;
+    let two_row_batches = OptimizeConfig {
+        batch_rows: 2,
+        ..six_row_batches
+    };
+    let changed = reopened.plan_optimize(&two_row_batches)?;
+    assert_eq!(changed.bins.iter().flat_map(|bin| &bin.files).count(), 3);
+    let report = reopened.apply_optimize(&changed, &two_row_batches, &control())?;
+    assert_eq!(
+        (
+            report.outcome,
+            report.files_removed,
+            report.files_added,
+            report.rows_removed,
+            report.rows_added,
+        ),
+        (Outcome::Committed, 3, 2, 18, 18)
+    );
+    assert_eq!(active_files(root.path())?.len(), 2);
+    Ok(())
+}
+
+#[test]
+fn optimize_d42_residual_proof_write_failure_discards_prior_bin_outputs() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let table = DeltaTable::open_url(
+        url_of(root.path())?,
+        customer_schema(),
+        vec![INGESTION_PARTITION.into()],
+    )?;
+    append_customers(&table, 1, &["c0", "c1", "c2"], 0)?;
+    append_customers(&table, 1, &["c3", "c4", "c5"], 3)?;
+    append_customers(&table, 0, &["c6", "c7", "c8", "c9", "c10", "c11"], 6)?;
+    append_customers(&table, 0, &["c12", "c13", "c14", "c15", "c16", "c17"], 12)?;
+    let config = OptimizeConfig {
+        layout: Some(LayoutPolicy {
+            max_rows: 10,
+            max_input_bytes: 1024 * 1024,
+            row_group_rows: 10,
+            page_rows: 2,
+            ..LayoutPolicy::default()
+        }),
+        sealed_final: true,
+        batch_rows: 6,
+        ..optimize_config()
+    };
+    let maintenance = DeltaTable::open_for_maintenance(&url_of(root.path())?)?;
+    let plan = maintenance.plan_optimize(&config)?;
+    assert_eq!(plan.bins.len(), 2);
+    let newest = minute(1);
+    assert_eq!(
+        plan.bins[0]
+            .partition_values
+            .get(INGESTION_PARTITION)
+            .and_then(Option::as_deref),
+        Some(newest.as_str())
+    );
+    let version = maintenance.version()?;
+    let record_dir = root.path().join("_arrowcol_maintenance");
+    fs::create_dir_all(&record_dir)?;
+    fs::create_dir(record_dir.join(".lock"))?;
+
+    let error = maintenance
+        .apply_optimize(&plan, &config, &control())
+        .err()
+        .context("no-benefit proof persistence failure must surface")?;
+    assert!(format!("{error:#}").contains(".lock"), "{error:#}");
+    assert_eq!(maintenance.version()?, version, "the failed proof write must not commit");
+    assert_eq!(active_files(root.path())?.len(), 4);
+    assert_eq!(parquet_files(root.path(), &newest)?, 2, "earlier bin output must be discarded");
+    assert_eq!(parquet_files(root.path(), &minute(0))?, 2);
     Ok(())
 }
 
