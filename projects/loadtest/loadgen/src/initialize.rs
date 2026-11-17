@@ -8,7 +8,7 @@ use arrow_deltalake::delta::{
     DeltaTable, FreshTableReceipt, FreshTableTransport, INGESTION_PARTITION, PublicationFence, PublicationFenceContext,
     PublicationFenceError,
 };
-use arrow_deltalake::publisher::{ControlMetadata, MutationRetries, PublisherSession, SessionMode, canonical_uuid};
+use arrow_deltalake::publisher::{ControlMetadata, InvalidNormalStamp, MutationRetries, PublisherSession, SessionMode, canonical_uuid};
 use arrow_deltalake::qap_http::{StorageBridge, StorageBridgeAuthority};
 use arrowcol_catalog::{DdlCommand, DdlParser};
 use serde::{Deserialize, Serialize};
@@ -27,6 +27,7 @@ const INGESTION: &str = INGESTION_PARTITION;
 #[serde(deny_unknown_fields)]
 pub struct NormalAksFreshTablePlan {
     pub account: String,
+    pub stamp: String,
     pub container: String,
     pub shared_delta_root: String,
     pub run_delta_root: String,
@@ -47,6 +48,15 @@ impl NormalAksFreshTablePlan {
     pub fn target(&self, now_unix_ms: u64) -> Result<(Url, Arc<Schema>)> {
         for value in [&self.run_id, &self.namespace_uid, &self.owner_token, &self.generation] {
             canonical_uuid(value)?;
+        }
+        if self.stamp.len() != 5
+            || !self.stamp.bytes().all(|byte| byte.is_ascii_digit())
+            || self.stamp.starts_with('0')
+        {
+            return Err(InvalidNormalStamp.into());
+        }
+        if self.account != format!("arrowcollector{}", self.stamp) {
+            bail!("normal AKS account does not match the retained stamp");
         }
         if self.setup_deadline_unix_ms <= now_unix_ms
             || self.namespace.is_empty()
@@ -696,10 +706,11 @@ mod tests {
     #[test]
     fn normal_aks_plan_rejects_root_and_deadline_drift() -> Result<()> {
         let run_id = "00000000-0000-4000-8000-000000000001";
-        let shared = "abfss://data@arrowcollector1.dfs.core.windows.net/stamp/dataflow/";
-        let run = format!("abfss://data@arrowcollector1.dfs.core.windows.net/stamp/runs/{run_id}/dataflow/");
+        let shared = "abfss://data@arrowcollector12345.dfs.core.windows.net/stamp/dataflow/";
+        let run = format!("abfss://data@arrowcollector12345.dfs.core.windows.net/stamp/runs/{run_id}/dataflow/");
         let mut plan = NormalAksFreshTablePlan {
-            account: "arrowcollector1".into(),
+            account: "arrowcollector12345".into(),
+            stamp: "12345".into(),
             container: "data".into(),
             shared_delta_root: shared.into(),
             run_delta_root: run.clone(),
@@ -714,6 +725,15 @@ mod tests {
         let (root, schema) = plan.target(99)?;
         assert_eq!(root.as_str(), plan.table_root);
         assert!(schema.field_with_name(INGESTION).is_ok());
+        for invalid in ["00000", "00001", "01234", "1234", "123456", "12a45"] {
+            plan.stamp = invalid.into();
+            let error = plan.target(99).expect_err("invalid normal stamp must fail");
+            assert!(error.downcast_ref::<InvalidNormalStamp>().is_some());
+        }
+        plan.stamp = "12345".into();
+        plan.account = "arrowcollector54321".into();
+        assert!(plan.target(99).is_err());
+        plan.account = "arrowcollector12345".into();
         assert!(plan.target(100).is_err());
         plan.table_root = format!("{run}dataflow/telemetry/sqlserver/sqlserver_availability_replica_states/");
         assert!(plan.target(99).is_err());

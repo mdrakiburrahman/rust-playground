@@ -638,6 +638,18 @@ enum SessionTransport {
     Bridge(Arc<crate::qap_http::StorageBridge>),
 }
 
+/// A captured normal stamp is not a canonical, positive decimal value.
+#[derive(Debug)]
+pub struct InvalidNormalStamp;
+
+impl fmt::Display for InvalidNormalStamp {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("normal Azure stamp must be a canonical positive decimal no greater than 999999")
+    }
+}
+
+impl std::error::Error for InvalidNormalStamp {}
+
 /// Original normal stamped Azure ownership selected by setup.
 #[derive(Clone, Debug)]
 pub struct NormalAzureOwnership {

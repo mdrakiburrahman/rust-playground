@@ -10,7 +10,7 @@
 //! clobber metadata and must not exist. Leases serialize transitions only;
 //! registry membership never expires.
 
-use crate::publisher::{CasOutcome, ControlMetadata, MetadataSnapshot, NormalAzureOwnership, canonical_uuid};
+use crate::publisher::{CasOutcome, ControlMetadata, InvalidNormalStamp, MetadataSnapshot, NormalAzureOwnership, canonical_uuid};
 #[cfg(test)]
 use crate::publisher::{Registry, ResetState};
 use anyhow::{Context, Result, bail};
@@ -192,6 +192,10 @@ impl AzureControlContainer {
         ownership: &NormalAzureOwnership,
     ) -> Result<Self> {
         canonical_uuid(&ownership.subscription_id).context("invalid captured Azure subscription")?;
+        let stamp = ownership.stamp.parse::<u32>().map_err(|_| InvalidNormalStamp)?;
+        if !(1..=999_999).contains(&stamp) || stamp.to_string() != ownership.stamp {
+            return Err(InvalidNormalStamp.into());
+        }
         let container = ownership.checkpoint_container.as_bytes();
         let alphanumeric = |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
         if ownership.resource_group != "arrow-collector-rg"
@@ -573,6 +577,13 @@ mod tests {
         assert!(
             AzureControlContainer::new_with_ownership("arrowcollector2", Arc::clone(&credentials), &binding).is_err()
         );
+        for invalid in ["0", "00000", "01", "00001", "+1", "1000000"] {
+            let mut changed = binding.clone();
+            changed.stamp = invalid.into();
+            let error = AzureControlContainer::new_with_ownership("arrowcollector1", Arc::clone(&credentials), &changed)
+                .err().expect("invalid stamp must fail");
+            assert!(error.downcast_ref::<InvalidNormalStamp>().is_some());
+        }
         for invalid in ["", "-abc", "ab--cd", "abc-", "ab/c", "ABC"] {
             let mut changed = binding.clone();
             changed.checkpoint_container = invalid.into();
