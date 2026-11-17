@@ -743,6 +743,20 @@ fn column_worker(
     writers.into_iter().map(ArrowColumnWriter::close).collect()
 }
 
+fn proportional_input_bytes(total_bytes: u64, segment_rows: usize, total_rows: usize) -> Result<u64> {
+    ensure!(
+        total_rows > 0 && segment_rows <= total_rows,
+        "invalid Parquet input byte segment"
+    );
+    let total_rows = u128::try_from(total_rows)?;
+    let segment_rows = u128::try_from(segment_rows)?;
+    let weighted = u128::from(total_bytes)
+        .checked_mul(segment_rows)
+        .context("Parquet segment byte estimate overflow")?;
+    let bytes = weighted / total_rows + u128::from(weighted % total_rows != 0);
+    u64::try_from(bytes).context("Parquet segment byte estimate exceeds u64")
+}
+
 /// Bounded low-level writer used only when column encoding concurrency is requested.
 pub(crate) struct ParallelColumnWriter {
     writer: Option<parquet::file::writer::SerializedFileWriter<File>>,
@@ -821,12 +835,7 @@ impl ParallelColumnWriter {
             }
             let candidate_rows = (rows - offset).min(self.max_row_group_rows - current_rows);
             let remaining_bytes = max_group_bytes - current_bytes;
-            let candidate = batch.slice(offset, candidate_rows);
-            let candidate_bytes = if offset == 0 && candidate_rows == rows {
-                input_bytes
-            } else {
-                crate::record_batch_logical_bytes(&candidate)?
-            };
+            let candidate_bytes = proportional_input_bytes(input_bytes, candidate_rows, rows)?;
             let (segment_rows, segment_bytes) = if candidate_bytes <= remaining_bytes {
                 (candidate_rows, candidate_bytes)
             } else {
@@ -834,7 +843,7 @@ impl ParallelColumnWriter {
                 let mut high = candidate_rows;
                 while low < high {
                     let middle = low + (high - low).div_ceil(2);
-                    let bytes = crate::record_batch_logical_bytes(&batch.slice(offset, middle))?;
+                    let bytes = proportional_input_bytes(input_bytes, middle, rows)?;
                     if bytes <= remaining_bytes {
                         low = middle;
                     } else {
@@ -848,7 +857,7 @@ impl ParallelColumnWriter {
                     }
                     anyhow::bail!("single Arrow row exceeds the parallel Parquet row-group byte bound");
                 }
-                (low, crate::record_batch_logical_bytes(&batch.slice(offset, low))?)
+                (low, proportional_input_bytes(input_bytes, low, rows)?)
             };
             let segment = batch.slice(offset, segment_rows);
             self.write_segment(&segment, segment_rows, segment_bytes)?;
@@ -1253,6 +1262,40 @@ mod tests {
 
         let reader = ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(&path)?)?;
         assert_eq!(reader.metadata().num_row_groups(), 2);
+        let decoded = reader.build()?.collect::<std::result::Result<Vec<_>, _>>()?;
+        assert_eq!(arrow::compute::concat_batches(&schema, &decoded)?, batch);
+        Ok(())
+    }
+
+    #[test]
+    fn parallel_column_writer_splits_large_input_estimates_by_rows() -> Result<()> {
+        let schema = schema();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5])),
+                Arc::new(StringArray::from(vec!["a", "bb", "ccc", "dddd", "eeeee"])),
+            ],
+        )?;
+        let config: ParquetWriterConfig = serde_json::from_str(
+            r#"{"parallel_column_encoding_threads":2,"max_row_group_rows":10,"max_row_group_bytes":1024}"#,
+        )?;
+        let properties = config.writer_properties(&schema, None, &[])?;
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("byte-capped.parquet");
+        let mut writer = ParallelColumnWriter::try_new(
+            std::fs::File::create(&path)?,
+            Arc::clone(&schema),
+            properties,
+            2,
+            10,
+            1024,
+        )?;
+        writer.write(&batch, batch.num_rows(), 5_000)?;
+        writer.finish()?;
+
+        let reader = ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(&path)?)?;
+        assert_eq!(reader.metadata().num_row_groups(), 5);
         let decoded = reader.build()?.collect::<std::result::Result<Vec<_>, _>>()?;
         assert_eq!(arrow::compute::concat_batches(&schema, &decoded)?, batch);
         Ok(())
