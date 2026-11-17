@@ -95,6 +95,21 @@ mod linux {
         }
 
         #[test]
+        fn changed_parent_fails_before_resource_changes() -> Result<()> {
+            let parent = getppid().context("missing parent")?.as_raw_pid();
+            let limits = Limits {
+                parent: parent.checked_add(1).context("parent PID overflow")?,
+                address_bytes: 1024 * 1024 * 1024,
+                cpu_seconds: 30,
+                descriptors: 64,
+            };
+            let core = getrlimit(Resource::Core);
+            assert!(limits.install().is_err());
+            assert_eq!(getrlimit(Resource::Core), core);
+            Ok(())
+        }
+
+        #[test]
         fn limits_install_and_read_back_in_owned_child() -> Result<()> {
             const CHILD: &str = "OAT_LIMIT_TEST_CHILD";
             if std::env::var_os(CHILD).is_some() {
