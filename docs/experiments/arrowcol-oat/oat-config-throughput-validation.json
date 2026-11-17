@@ -2,10 +2,10 @@
   "schema_version": 1,
   "validation_kind": "config-validation-only",
   "validator": "arrowcol-oat-rust --validate-config",
-  "source_sha": "84f86b6c54b7fc9375c63666cdfbeed126ac8dbb",
+  "source_sha": "95153097739bae15432a54e646b9b612f180812a",
   "baseline_count": 8,
-  "candidate_count": 90,
-  "pass_count": 98,
+  "candidate_count": 94,
+  "pass_count": 102,
   "fail_count": 0,
   "runtime_qualification": "unqualified",
   "manifests": [
@@ -31,8 +31,8 @@
       "cohort": "C3",
       "status": "config-validated",
       "baseline_count": 1,
-      "candidate_count": 16,
-      "pass_count": 17,
+      "candidate_count": 20,
+      "pass_count": 21,
       "fail_count": 0,
       "excluded_pending_candidate_sets": []
     },
@@ -369,6 +369,38 @@
       "candidate": "coalesce-true",
       "qualification": "runtime-unqualified",
       "config_sha256": "736db4ab230cd11d61d5500251efd28fa1886aaee50fc25d1636d62668f75e58",
+      "status": "pass"
+    },
+    {
+      "cohort": "C3",
+      "comparison": "flush-age",
+      "candidate": "age-1s",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "736db4ab230cd11d61d5500251efd28fa1886aaee50fc25d1636d62668f75e58",
+      "status": "pass"
+    },
+    {
+      "cohort": "C3",
+      "comparison": "flush-age",
+      "candidate": "age-5s",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "495b73361b1d79d6e65c9f5ced00a2fe5a082d65156f1e218aa3cc0c66d38eb5",
+      "status": "pass"
+    },
+    {
+      "cohort": "C3",
+      "comparison": "flush-age",
+      "candidate": "age-15s",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "e24d7245178f83656d0298e1a13e73765a0a5254fbba8ab48f28b50f54fbdeb3",
+      "status": "pass"
+    },
+    {
+      "cohort": "C3",
+      "comparison": "flush-age",
+      "candidate": "age-60s",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "e294d53e4a07742ab46962ce7d446380d16d736b802cbb41fac3eaa217a1154c",
       "status": "pass"
     },
     {
