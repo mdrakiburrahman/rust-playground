@@ -281,6 +281,10 @@ const CAPABILITIES: &[Capability] = &[
     capability!("parquet_writer.data_page_row_count_limit", "inherit component default"),
     capability!("parquet_writer.write_batch_size", "inherit component default"),
     capability!(
+        "parquet_writer.parallel_column_encoding_threads",
+        "1 (serial); 1..=32; >1 requires max_row_group_bytes <= 67108864"
+    ),
+    capability!(
         "parquet_writer.offset_index_enabled",
         "inherit component default; Page statistics require offset index"
     ),
@@ -2064,6 +2068,29 @@ mod tests {
             serde_json::json!({"collector":{"commit":{"staging_overlap":true}}}),
             serde_json::json!({"client":{"workers":1025}}),
             serde_json::json!({"client":{"workers":"16"}}),
+        ] {
+            assert!(Tunables::parse_oat_json(value).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn oat_projects_parallel_column_encoding_and_rejects_unsafe_bounds() -> Result<()> {
+        let value = serde_json::json!({"parquet_writer": {
+            "parallel_column_encoding_threads": 4,
+            "max_row_group_bytes": 16777216
+        }});
+        let tunables = Tunables::parse_oat_json(value)?;
+        let env = tunables.environment_for(ComponentRole::Collector)?;
+        let projected: Value = serde_json::from_str(&env["ARROWCOL_PARQUET_CONFIG"])?;
+        assert_eq!(projected["parallel_column_encoding_threads"], 4);
+        assert_eq!(projected["max_row_group_bytes"], 16777216);
+
+        for value in [
+            serde_json::json!({"parquet_writer":{"parallel_column_encoding_threads":0}}),
+            serde_json::json!({"parquet_writer":{"parallel_column_encoding_threads":33}}),
+            serde_json::json!({"parquet_writer":{"parallel_column_encoding_threads":2}}),
+            serde_json::json!({"parquet_writer":{"parallel_column_encoding_threads":2,"max_row_group_bytes":67108865}}),
         ] {
             assert!(Tunables::parse_oat_json(value).is_err());
         }

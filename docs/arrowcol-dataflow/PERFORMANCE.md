@@ -2,7 +2,7 @@
 
 | Interface | Effect | Timing |
 | --- | --- | --- |
-| `ARROWCOL_PARQUET_CONFIG` | Strict `arrow_deltalake::writer::ParquetWriterConfig` JSON: global/per-physical-column codecs, levels, encoding, dictionary, statistics/page indexes, offset index, Bloom filters, pages, row groups, sorting metadata | Startup |
+| `ARROWCOL_PARQUET_CONFIG` | Strict `arrow_deltalake::writer::ParquetWriterConfig` JSON: global/per-physical-column codecs, levels, encoding, dictionary, statistics/page indexes, offset index, Bloom filters, pages, row groups, sorting metadata, and bounded parallel column encoding | Startup |
 | `ARROWCOL_COLLECTOR_BATCHING_CONFIG` | Deep JSON override of exporter `batching`: byte/row/batch capacities and flush limits, age, flush concurrency, adaptive sizing, `coalesce_publications` | Startup |
 | `ARROWCOL_COLLECTOR_COMMIT_CONFIG` | Deep JSON override of exporter `commit`: `batch_window`, `max_files_per_commit`, `max_pending_files` | Startup |
 | `ARROWCOL_COLLECTOR_LIMITS_CONFIG` | Deep JSON override of receiver `limits`: Flight sizes, channels and deadlines | Startup |
@@ -33,6 +33,16 @@ ARROWCOL_PARQUET_CONFIG='{"defaults":{"compression":"zstd","compression_level":1
 ARROWCOL_COLLECTOR_BATCHING_CONFIG='{"max_age":"2s","max_concurrent_flushes":4}' \
 cargo run --locked --package arrowcol-dataflow-rust -- --config projects/arrowcol-dataflow-rust/config.quiver.yaml
 ```
+
+`parallel_column_encoding_threads` defaults to `1`, preserving the existing
+`AsyncArrowWriter` path. Values `2..=32` encode independent physical Parquet
+leaves concurrently; effective workers are capped by the file's physical leaf
+count and are available separately from the requested value on
+`ParquetFileWriter`. Parallel mode requires an explicit
+`max_row_group_bytes <= 67108864` and flushes on the configured row limit or
+estimated/retained row-group bytes. This bounds accumulated encoder state, not
+process RSS; one incoming batch can transiently exceed the row-group bound.
+The setting does not parallelize Delta commits or uploads.
 
 Parquet compression accepts uncompressed, snappy, gzip (0..9), brotli (0..11),
 zstd (1..22), lz4_raw and legacy lz4. `lz4` uses deprecated Hadoop framing and

@@ -3,6 +3,10 @@
 use anyhow::{Context, Result, ensure};
 use arrow::datatypes::SchemaRef;
 use parquet::arrow::ArrowSchemaConverter;
+use parquet::arrow::arrow_writer::{
+    ArrowColumnChunk, ArrowColumnWriter, ArrowLeafColumn, ArrowRowGroupWriterFactory, ArrowWriter as SyncArrowWriter,
+    compute_leaves,
+};
 use parquet::basic::{BrotliLevel, Compression, Encoding, GzipLevel, Type, ZstdLevel};
 use parquet::file::metadata::SortingColumn;
 use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterPropertiesBuilder, WriterVersion};
@@ -265,7 +269,7 @@ pub struct SortColumn {
 
 /// Startup-only policy. Column paths are physical Parquet leaf paths, joined with dots.
 /// Sorting metadata is accepted only when the caller proves that exact ordering.
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct ParquetWriterConfig {
     pub defaults: ColumnOptions,
@@ -275,10 +279,30 @@ pub struct ParquetWriterConfig {
     pub max_row_group_bytes: Option<usize>,
     pub data_page_row_count_limit: Option<usize>,
     pub write_batch_size: Option<usize>,
+    pub parallel_column_encoding_threads: usize,
     pub offset_index_enabled: Option<bool>,
     pub column_index_truncate_length: Option<usize>,
     pub statistics_truncate_length: Option<usize>,
     pub sorting_columns: Option<Vec<SortColumn>>,
+}
+
+impl Default for ParquetWriterConfig {
+    fn default() -> Self {
+        Self {
+            defaults: ColumnOptions::default(),
+            columns: BTreeMap::new(),
+            writer_version: None,
+            max_row_group_rows: None,
+            max_row_group_bytes: None,
+            data_page_row_count_limit: None,
+            write_batch_size: None,
+            parallel_column_encoding_threads: 1,
+            offset_index_enabled: None,
+            column_index_truncate_length: None,
+            statistics_truncate_length: None,
+            sorting_columns: None,
+        }
+    }
 }
 
 impl ParquetWriterConfig {
@@ -304,7 +328,30 @@ impl ParquetWriterConfig {
                 ensure!(value > 0, "{name} must be positive");
             }
         }
+        ensure!(
+            (1..=32).contains(&self.parallel_column_encoding_threads),
+            "parallel_column_encoding_threads must be between 1 and 32"
+        );
+        if self.parallel_column_encoding_threads > 1 {
+            let max_row_group_bytes = self
+                .max_row_group_bytes
+                .context("parallel column encoding requires max_row_group_bytes")?;
+            ensure!(
+                max_row_group_bytes <= 64 * 1024 * 1024,
+                "parallel column encoding requires max_row_group_bytes <= 67108864"
+            );
+        }
         Ok(())
+    }
+
+    /// Resolve requested column-encoding concurrency against the physical schema.
+    ///
+    /// # Errors
+    /// Rejects invalid configuration or an unsupported Arrow schema.
+    pub fn effective_column_encoding_threads(&self, schema: &SchemaRef) -> Result<usize> {
+        self.validate()?;
+        let leaf_count = ArrowSchemaConverter::new().convert(schema)?.columns().len();
+        Ok(self.parallel_column_encoding_threads.min(leaf_count).max(1))
     }
 
     /// Resolve validated properties against the actual physical writer schema.
@@ -520,6 +567,346 @@ pub(crate) fn sorting_from_properties(
         .collect()
 }
 
+enum ColumnWorkerMessage {
+    Write(
+        Vec<ArrowLeafColumn>,
+        SyncSender<std::result::Result<(usize, usize), String>>,
+    ),
+    Finish,
+}
+
+struct ColumnWorker {
+    sender: SyncSender<ColumnWorkerMessage>,
+    handle: Option<JoinHandle<parquet::errors::Result<Vec<ArrowColumnChunk>>>>,
+    columns: usize,
+}
+
+impl Drop for ColumnWorker {
+    fn drop(&mut self) {
+        let _ = self.sender.send(ColumnWorkerMessage::Finish);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+struct ParallelRowGroup {
+    workers: Vec<ColumnWorker>,
+    rows: usize,
+    input_bytes: u64,
+    memory_bytes: usize,
+    estimated_bytes: usize,
+}
+
+impl ParallelRowGroup {
+    fn new(
+        factory: &ArrowRowGroupWriterFactory,
+        row_group_index: usize,
+        requested_threads: usize,
+        leaf_count: usize,
+    ) -> Result<Self> {
+        let writers = factory.create_column_writers(row_group_index)?;
+        ensure!(
+            writers.len() == leaf_count,
+            "Parquet column writer count changed across row groups"
+        );
+        let worker_count = requested_threads.min(leaf_count);
+        ensure!(
+            worker_count > 1,
+            "parallel row group requires at least two physical columns"
+        );
+        let mut writer_groups = (0..worker_count).map(|_| Vec::new()).collect::<Vec<_>>();
+        for (index, writer) in writers.into_iter().enumerate() {
+            writer_groups[index * worker_count / leaf_count].push(writer);
+        }
+        let mut workers = Vec::with_capacity(worker_count);
+        for column_writers in writer_groups {
+            let columns = column_writers.len();
+            let (sender, receiver) = mpsc::sync_channel(0);
+            let handle = thread::Builder::new()
+                .name("parquet-column-encoder".into())
+                .spawn(move || column_worker(column_writers, receiver))?;
+            workers.push(ColumnWorker {
+                sender,
+                handle: Some(handle),
+                columns,
+            });
+        }
+        Ok(Self {
+            workers,
+            rows: 0,
+            input_bytes: 0,
+            memory_bytes: 0,
+            estimated_bytes: 0,
+        })
+    }
+
+    fn write(&mut self, leaves: Vec<ArrowLeafColumn>, rows: usize, input_bytes: u64) -> Result<()> {
+        let expected = self.workers.iter().map(|worker| worker.columns).sum::<usize>();
+        ensure!(
+            leaves.len() == expected,
+            "Arrow batch does not match Parquet physical leaf count"
+        );
+        let mut leaves = leaves.into_iter();
+        let mut replies = Vec::with_capacity(self.workers.len());
+        for worker in &self.workers {
+            let columns = (0..worker.columns)
+                .map(|_| leaves.next().context("missing Parquet leaf column"))
+                .collect::<Result<Vec<_>>>()?;
+            let (reply_tx, reply_rx) = mpsc::sync_channel(0);
+            worker
+                .sender
+                .send(ColumnWorkerMessage::Write(columns, reply_tx))
+                .map_err(|_| anyhow::anyhow!("Parquet column encoder stopped before write"))?;
+            replies.push(reply_rx);
+        }
+        let mut memory_bytes = 0usize;
+        let mut estimated_bytes = 0usize;
+        for reply in replies {
+            let (memory, estimated) = reply
+                .recv()
+                .context("Parquet column encoder stopped before acknowledging write")?
+                .map_err(|error| anyhow::anyhow!("Parquet column encoding failed: {error}"))?;
+            memory_bytes = memory_bytes.saturating_add(memory);
+            estimated_bytes = estimated_bytes.saturating_add(estimated);
+        }
+        self.rows = self
+            .rows
+            .checked_add(rows)
+            .context("Parquet row-group row count overflow")?;
+        self.input_bytes = self
+            .input_bytes
+            .checked_add(input_bytes)
+            .context("Parquet row-group input byte count overflow")?;
+        self.memory_bytes = memory_bytes;
+        self.estimated_bytes = estimated_bytes;
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<Vec<ArrowColumnChunk>> {
+        for worker in &self.workers {
+            let _ = worker.sender.send(ColumnWorkerMessage::Finish);
+        }
+        let workers = std::mem::take(&mut self.workers);
+        let mut chunks = Vec::new();
+        let mut first_error = None;
+        for mut worker in workers {
+            if let Some(handle) = worker.handle.take() {
+                match handle.join() {
+                    Ok(Ok(mut worker_chunks)) => chunks.append(&mut worker_chunks),
+                    Ok(Err(error)) => {
+                        first_error.get_or_insert_with(|| anyhow::Error::new(error));
+                    }
+                    Err(_) => {
+                        first_error.get_or_insert_with(|| anyhow::anyhow!("Parquet column encoder panicked"));
+                    }
+                }
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        Ok(chunks)
+    }
+}
+
+fn column_worker(
+    mut writers: Vec<ArrowColumnWriter>,
+    receiver: Receiver<ColumnWorkerMessage>,
+) -> parquet::errors::Result<Vec<ArrowColumnChunk>> {
+    while let Ok(message) = receiver.recv() {
+        match message {
+            ColumnWorkerMessage::Write(leaves, reply) => {
+                let result = writers
+                    .iter_mut()
+                    .zip(leaves)
+                    .try_for_each(|(writer, leaf)| writer.write(&[leaf]));
+                let stats = result.as_ref().map(|()| {
+                    writers.iter().fold((0usize, 0usize), |(memory, estimate), writer| {
+                        (
+                            memory.saturating_add(writer.memory_size()),
+                            estimate.saturating_add(writer.get_estimated_total_bytes()),
+                        )
+                    })
+                });
+                let _ = reply.send(stats.map_err(|error| error.to_string()));
+                result?;
+            }
+            ColumnWorkerMessage::Finish => break,
+        }
+    }
+    writers.into_iter().map(ArrowColumnWriter::close).collect()
+}
+
+/// Bounded low-level writer used only when column encoding concurrency is requested.
+pub(crate) struct ParallelColumnWriter {
+    writer: Option<parquet::file::writer::SerializedFileWriter<File>>,
+    factory: ArrowRowGroupWriterFactory,
+    schema: SchemaRef,
+    leaf_count: usize,
+    effective_threads: usize,
+    max_row_group_rows: usize,
+    max_row_group_bytes: usize,
+    row_group_index: usize,
+    current: Option<ParallelRowGroup>,
+}
+
+impl ParallelColumnWriter {
+    pub(crate) fn try_new(
+        file: File,
+        schema: SchemaRef,
+        properties: WriterProperties,
+        requested_threads: usize,
+        max_row_group_rows: usize,
+        max_row_group_bytes: usize,
+    ) -> Result<Self> {
+        ensure!(
+            (1..=32).contains(&requested_threads),
+            "parallel column encoding threads must be between 1 and 32"
+        );
+        ensure!(
+            max_row_group_rows > 0,
+            "parallel column encoding requires a positive row-group row limit"
+        );
+        ensure!(
+            max_row_group_bytes > 0 && max_row_group_bytes <= 64 * 1024 * 1024,
+            "parallel column encoding requires a row-group byte bound <= 67108864"
+        );
+        let leaf_count = ArrowSchemaConverter::new().convert(&schema)?.columns().len();
+        let effective_threads = requested_threads.min(leaf_count).max(1);
+        ensure!(
+            effective_threads > 1,
+            "parallel column encoding requires at least two physical Parquet columns"
+        );
+        let arrow_writer = SyncArrowWriter::try_new(file, Arc::clone(&schema), Some(properties))?;
+        let (writer, factory) = arrow_writer.into_serialized_writer()?;
+        Ok(Self {
+            writer: Some(writer),
+            factory,
+            schema,
+            leaf_count,
+            effective_threads,
+            max_row_group_rows,
+            max_row_group_bytes,
+            row_group_index: 0,
+            current: None,
+        })
+    }
+
+    pub(crate) fn write(&mut self, batch: &RecordBatch, rows: usize, input_bytes: u64) -> Result<()> {
+        ensure!(
+            batch.num_columns() == self.schema.fields().len(),
+            "Arrow batch column count does not match Parquet schema"
+        );
+        ensure!(
+            rows == batch.num_rows(),
+            "Parquet row accounting does not match Arrow batch"
+        );
+        if rows == 0 {
+            return Ok(());
+        }
+        let max_group_bytes = u64::try_from(self.max_row_group_bytes)?;
+        let mut offset = 0usize;
+        while offset < rows {
+            let current_rows = self.current.as_ref().map_or(0, |group| group.rows);
+            let current_bytes = self.current.as_ref().map_or(0, |group| group.input_bytes);
+            if current_rows >= self.max_row_group_rows || current_bytes >= max_group_bytes {
+                self.flush_row_group()?;
+                continue;
+            }
+            let candidate_rows = (rows - offset).min(self.max_row_group_rows - current_rows);
+            let remaining_bytes = max_group_bytes - current_bytes;
+            let candidate = batch.slice(offset, candidate_rows);
+            let candidate_bytes = if offset == 0 && candidate_rows == rows {
+                input_bytes
+            } else {
+                crate::record_batch_logical_bytes(&candidate)?
+            };
+            let (segment_rows, segment_bytes) = if candidate_bytes <= remaining_bytes {
+                (candidate_rows, candidate_bytes)
+            } else {
+                let mut low = 0usize;
+                let mut high = candidate_rows;
+                while low < high {
+                    let middle = low + (high - low).div_ceil(2);
+                    let bytes = crate::record_batch_logical_bytes(&batch.slice(offset, middle))?;
+                    if bytes <= remaining_bytes {
+                        low = middle;
+                    } else {
+                        high = middle - 1;
+                    }
+                }
+                if low == 0 {
+                    if current_rows > 0 {
+                        self.flush_row_group()?;
+                        continue;
+                    }
+                    anyhow::bail!("single Arrow row exceeds the parallel Parquet row-group byte bound");
+                }
+                (low, crate::record_batch_logical_bytes(&batch.slice(offset, low))?)
+            };
+            let segment = batch.slice(offset, segment_rows);
+            self.write_segment(&segment, segment_rows, segment_bytes)?;
+            offset += segment_rows;
+            let current = self.current.as_ref().context("Parquet row group unavailable")?;
+            if current.rows >= self.max_row_group_rows
+                || current.memory_bytes >= self.max_row_group_bytes
+                || current.estimated_bytes >= self.max_row_group_bytes
+                || current.input_bytes >= max_group_bytes
+            {
+                self.flush_row_group()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn write_segment(&mut self, batch: &RecordBatch, rows: usize, input_bytes: u64) -> Result<()> {
+        if self.current.is_none() {
+            self.current = Some(ParallelRowGroup::new(
+                &self.factory,
+                self.row_group_index,
+                self.effective_threads,
+                self.leaf_count,
+            )?);
+        }
+        let mut leaves = Vec::with_capacity(self.leaf_count);
+        for (field, column) in self.schema.fields().iter().zip(batch.columns()) {
+            leaves.extend(compute_leaves(field, column)?);
+        }
+        self.current
+            .as_mut()
+            .context("Parquet row group unavailable")?
+            .write(leaves, rows, input_bytes)
+    }
+
+    pub(crate) fn finish(mut self) -> Result<()> {
+        self.flush_row_group()?;
+        self.writer
+            .take()
+            .context("parallel Parquet writer unavailable")?
+            .close()?;
+        Ok(())
+    }
+
+    fn flush_row_group(&mut self) -> Result<()> {
+        let Some(row_group) = self.current.take() else {
+            return Ok(());
+        };
+        let chunks = row_group.finish()?;
+        let writer = self.writer.as_mut().context("parallel Parquet writer unavailable")?;
+        let mut row_group_writer = writer.next_row_group()?;
+        for chunk in chunks {
+            chunk.append_to_row_group(&mut row_group_writer)?;
+        }
+        row_group_writer.close()?;
+        self.row_group_index = self
+            .row_group_index
+            .checked_add(1)
+            .context("Parquet row-group index overflow")?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -675,6 +1062,60 @@ mod tests {
         assert!(config.writer_properties(&schema(), None, &[]).is_err());
         let config: ParquetWriterConfig = serde_json::from_str(r#"{"sorting_columns":[{"path":"id"}]}"#)?;
         assert!(config.writer_properties(&schema(), None, &[]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn parallel_encoding_bounds_and_effective_leaf_count_are_validated() -> Result<()> {
+        assert_eq!(ParquetWriterConfig::default().parallel_column_encoding_threads, 1);
+        for json in [
+            r#"{"parallel_column_encoding_threads":0}"#,
+            r#"{"parallel_column_encoding_threads":33}"#,
+            r#"{"parallel_column_encoding_threads":2}"#,
+            r#"{"parallel_column_encoding_threads":2,"max_row_group_bytes":67108865}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<ParquetWriterConfig>(json)?.validate().is_err(),
+                "{json}"
+            );
+        }
+        let config: ParquetWriterConfig =
+            serde_json::from_str(r#"{"parallel_column_encoding_threads":32,"max_row_group_bytes":67108864}"#)?;
+        assert_eq!(config.effective_column_encoding_threads(&schema())?, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn parallel_column_writer_preserves_rows_and_row_group_caps() -> Result<()> {
+        let schema = schema();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5])),
+                Arc::new(StringArray::from(vec!["a", "bb", "ccc", "dddd", "eeeee"])),
+            ],
+        )?;
+        let config: ParquetWriterConfig = serde_json::from_str(
+            r#"{"parallel_column_encoding_threads":2,"max_row_group_rows":3,"max_row_group_bytes":1024}"#,
+        )?;
+        let properties = config.writer_properties(&schema, None, &[])?;
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("parallel.parquet");
+        let mut writer = ParallelColumnWriter::try_new(
+            std::fs::File::create(&path)?,
+            Arc::clone(&schema),
+            properties,
+            2,
+            3,
+            1024,
+        )?;
+        writer.write(&batch, batch.num_rows(), crate::record_batch_logical_bytes(&batch)?)?;
+        writer.finish()?;
+
+        let reader = ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(&path)?)?;
+        assert_eq!(reader.metadata().num_row_groups(), 2);
+        let decoded = reader.build()?.collect::<std::result::Result<Vec<_>, _>>()?;
+        assert_eq!(arrow::compute::concat_batches(&schema, &decoded)?, batch);
         Ok(())
     }
 

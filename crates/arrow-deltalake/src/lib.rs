@@ -82,12 +82,19 @@ impl CompletedFile {
 }
 
 /// Streaming Parquet file writer. Dropping it does not finish the file.
+enum ParquetFileWriterImpl {
+    Async(AsyncArrowWriter<tokio::fs::File>),
+    Parallel(writer::ParallelColumnWriter),
+}
+
 pub struct ParquetFileWriter {
-    writer: Option<AsyncArrowWriter<tokio::fs::File>>,
+    writer: Option<ParquetFileWriterImpl>,
     durable_handle: File,
     path: PathBuf,
     rows: usize,
     input_bytes: u64,
+    requested_encoding_threads: usize,
+    effective_encoding_threads: usize,
 }
 
 impl ParquetFileWriter {
@@ -108,7 +115,10 @@ impl ParquetFileWriter {
         schema: SchemaRef,
         properties: Option<WriterProperties>,
     ) -> Result<Self> {
-        let properties = writer::process_config()?.writer_properties(
+        let config = writer::process_config()?;
+        let requested_encoding_threads = config.parallel_column_encoding_threads;
+        let effective_encoding_threads = config.effective_column_encoding_threads(&schema)?;
+        let properties = config.writer_properties(
             &schema,
             properties.clone(),
             &writer::sorting_from_properties(&schema, properties.as_ref())?,
@@ -119,14 +129,30 @@ impl ParquetFileWriter {
             .create_new(true)
             .open(&path)
             .with_context(|| format!("create Parquet {}", path.display()))?;
-        let output = tokio::fs::File::from_std(durable_handle.try_clone()?);
-        let writer = AsyncArrowWriter::try_new(output, schema, Some(properties))?;
+        let writer = if effective_encoding_threads > 1 {
+            let max_row_group_bytes = config
+                .max_row_group_bytes
+                .context("parallel column encoding requires max_row_group_bytes")?;
+            ParquetFileWriterImpl::Parallel(writer::ParallelColumnWriter::try_new(
+                durable_handle.try_clone()?,
+                schema.clone(),
+                properties,
+                requested_encoding_threads,
+                config.max_row_group_rows.unwrap_or(1_000_000),
+                max_row_group_bytes,
+            )?)
+        } else {
+            let output = tokio::fs::File::from_std(durable_handle.try_clone()?);
+            ParquetFileWriterImpl::Async(AsyncArrowWriter::try_new(output, schema, Some(properties))?)
+        };
         Ok(Self {
             writer: Some(writer),
             durable_handle,
             path,
             rows: 0,
             input_bytes: 0,
+            requested_encoding_threads,
+            effective_encoding_threads,
         })
     }
 
@@ -151,9 +177,21 @@ impl ParquetFileWriter {
         self.input_bytes
     }
 
+    /// Requested Parquet column-encoding worker count.
+    #[must_use]
+    pub const fn requested_encoding_threads(&self) -> usize {
+        self.requested_encoding_threads
+    }
+
+    /// Effective Parquet column-encoding worker count after schema capping.
+    #[must_use]
+    pub const fn effective_encoding_threads(&self) -> usize {
+        self.effective_encoding_threads
+    }
+
     pub(crate) async fn write_accounted(&mut self, batch: &RecordBatch, rows: usize, input_bytes: u64) -> Result<()> {
-        let rows = self.rows.checked_add(rows).context("row count overflow")?;
-        let input_bytes = self
+        let written_rows = self.rows.checked_add(rows).context("row count overflow")?;
+        let written_input_bytes = self
             .input_bytes
             .checked_add(input_bytes)
             .context("input Arrow byte count overflow")?;
@@ -165,7 +203,12 @@ impl ParquetFileWriter {
                 .context("Parquet writer unavailable after interrupted write")?;
             let batch = batch.clone();
             let (writer, result) = delta_io::run_cpu_future(async move {
-                let result = writer.write(&batch).await;
+                let result = match &mut writer {
+                    ParquetFileWriterImpl::Async(writer) => {
+                        writer.write(&batch).await.map(|()| ()).map_err(anyhow::Error::from)
+                    }
+                    ParquetFileWriterImpl::Parallel(writer) => writer.write(&batch, rows, input_bytes),
+                };
                 (writer, result)
             })
             .await?;
@@ -173,16 +216,23 @@ impl ParquetFileWriter {
             result?;
         }
         #[cfg(not(feature = "delta"))]
-        self.writer
-            .as_mut()
-            .context("Parquet writer unavailable")?
-            .write(batch)
-            .await?;
-        self.rows = rows;
-        self.input_bytes = input_bytes;
+        {
+            let result = match self.writer.as_mut().context("Parquet writer unavailable")? {
+                ParquetFileWriterImpl::Async(writer) => {
+                    writer.write(batch).await.map(|()| ()).map_err(anyhow::Error::from)
+                }
+                ParquetFileWriterImpl::Parallel(writer) => writer.write(batch, rows, input_bytes),
+            };
+            result?;
+        }
+        self.rows = written_rows;
+        self.input_bytes = written_input_bytes;
         Ok(())
     }
-
+    /// Write the footer and synchronize data and its directory before success.
+    ///
+    /// # Errors
+    /// Returns close, metadata, or synchronization errors.
     /// Write the footer and synchronize data and its directory before success.
     ///
     /// # Errors
@@ -192,9 +242,20 @@ impl ParquetFileWriter {
             .writer
             .context("Parquet writer unavailable after interrupted write")?;
         #[cfg(feature = "delta")]
-        delta_io::run_cpu_future(async move { writer.close().await }).await??;
+        delta_io::run_cpu_future(async move {
+            match writer {
+                ParquetFileWriterImpl::Async(writer) => writer.close().await.map(|_| ()).map_err(anyhow::Error::from),
+                ParquetFileWriterImpl::Parallel(writer) => writer.finish(),
+            }
+        })
+        .await??;
         #[cfg(not(feature = "delta"))]
-        writer.close().await?;
+        match writer {
+            ParquetFileWriterImpl::Async(writer) => {
+                writer.close().await?;
+            }
+            ParquetFileWriterImpl::Parallel(writer) => writer.finish()?,
+        }
         let durable_handle = tokio::fs::File::from_std(self.durable_handle);
         durable_handle.sync_all().await?;
         let bytes = durable_handle.metadata().await?.len();
