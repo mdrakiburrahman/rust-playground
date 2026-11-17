@@ -19,7 +19,7 @@ import {
 } from './launch.js';
 
 const status = (state: 'queued' | 'running' | 'succeeded') => ({
-  id: 'run-a', state, progress: state, result_count: state === 'succeeded' ? 2 : 0, error: null,
+  id: '123e4567-e89b-42d3-a456-426614174000', config_sha256: null, state, progress: state, result_count: state === 'succeeded' ? 2 : 0, error: null,
 });
 
 test('procfs ESRCH race is treated as an exited process', { skip: process.platform !== 'linux' }, async () => {
@@ -54,19 +54,31 @@ async function ownedBuildFixture(options: {
     assert.equal(command[0], 'cargo');
     await writeFile(executable, `#!/usr/bin/env node
 const http = require('node:http');
+const { createHash } = require('node:crypto');
 const address = process.argv[process.argv.indexOf('--listen') + 1];
 const [host, port] = address.split(':');
 http.createServer((request, response) => {
   response.setHeader('content-type', 'application/json');
-  if (${options.rejectRun ?? false} && request.url === '/runs') {
-    response.writeHead(422).end(JSON.stringify({ error: 'invalid matrix fixture' }));
-    return;
-  }
-  if (${options.succeedRun ?? false} && request.url === '/runs') {
-    response.end(JSON.stringify({
-      id: '123e4567-e89b-42d3-a456-426614174000', state: 'succeeded',
-      progress: 'published', result_count: 1, error: null,
-    }));
+  if (request.method === 'POST' && request.url === '/runs') {
+    const chunks = [];
+    request.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
+    request.on('end', () => {
+      const body = Buffer.concat(chunks);
+      if (${options.rejectRun ?? false}) {
+        response.writeHead(422).end(JSON.stringify({ error: 'invalid matrix fixture' }));
+        return;
+      }
+      if (${options.succeedRun ?? false}) {
+        response.end(JSON.stringify({
+          id: '123e4567-e89b-42d3-a456-426614174000', state: 'succeeded',
+          progress: 'published', result_count: 1, error: null,
+          config_sha256: createHash('sha256').update(body).digest('hex'),
+        }));
+        return;
+      }
+      response.end(JSON.stringify({ status: 'ok', git_sha: process.env.GIT_SHA,
+        stamp_config: process.env.ARROWCOL_AKS_STAMP_CONFIG_FILE ?? null }));
+    });
     return;
   }
   response.end(JSON.stringify({ status: 'ok', git_sha: process.env.GIT_SHA,
@@ -246,7 +258,7 @@ test('posts the JSON config and polls until the server publishes results', async
     assert.deepEqual(progress, ['queued: queued', 'running: running', 'running: measuring', 'succeeded: succeeded']);
     assert.deepEqual(calls.map((call) => call.method), ['POST', 'GET', 'GET', 'GET', 'GET', 'GET']);
     assert.equal(calls[0]?.url, 'http://127.0.0.1:8088/runs');
-    assert.equal(calls[1]?.url, 'http://127.0.0.1:8088/runs/run-a');
+    assert.equal(calls[1]?.url, 'http://127.0.0.1:8088/runs/123e4567-e89b-42d3-a456-426614174000');
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -316,8 +328,8 @@ test('ownership persistence failures cancel the accepted run before propagating 
         () => { cleanupFinished = true; }),
       cleanupFails ? /ENOSPC writing ownership marker.*synthetic cleanup failure/ : /ENOSPC writing ownership marker/);
       assert.deepEqual(calls, cleanupFails
-        ? ['POST /runs', 'POST /runs/run-a/cancel']
-        : ['POST /runs', 'POST /runs/run-a/cancel', 'GET /runs/run-a']);
+        ? ['POST /runs', 'POST /runs/123e4567-e89b-42d3-a456-426614174000/cancel']
+        : ['POST /runs', 'POST /runs/123e4567-e89b-42d3-a456-426614174000/cancel', 'GET /runs/123e4567-e89b-42d3-a456-426614174000']);
       assert.equal(cleanupFinished, !cleanupFails);
     }
   } finally {
@@ -663,13 +675,13 @@ test('local interruption requests cancellation and waits for the server to finis
     platform: { kind: 'local', local: { bind_host: '127.0.0.1', endpoint_host: '127.0.0.1' } },
   }));
   const requests: string[] = [];
-  let status: { id: string; state: string; progress: string; result_count: number; error: string | null } = { id: 'run-a', state: 'running', progress: 'starting', result_count: 0, error: null };
+  let status: { id: string; state: string; progress: string; result_count: number; error: string | null } = { id: '123e4567-e89b-42d3-a456-426614174000', state: 'running', progress: 'starting', result_count: 0, error: null };
   const server = createServer((request, response) => {
     requests.push(request.method + ' ' + request.url);
     response.setHeader('content-type', 'application/json');
     if (request.method === 'POST' && request.url === '/runs') {
       response.writeHead(202).end(JSON.stringify(status));
-    } else if (request.method === 'POST' && request.url === '/runs/run-a/cancel') {
+    } else if (request.method === 'POST' && request.url === '/runs/123e4567-e89b-42d3-a456-426614174000/cancel') {
       status = { ...status, state: 'cancelled', progress: 'local resources cleaned', error: 'run cancelled by request' };
       response.writeHead(202).end();
     } else {
@@ -689,8 +701,8 @@ test('local interruption requests cancellation and waits for the server to finis
       launchOat(configPath, 'http://127.0.0.1:' + address.port, 1, fetch, () => {}, 'local', () => '127.0.0.1', controller.signal),
       /run cancelled by request/,
     );
-    assert.ok(requests.includes('POST /runs/run-a/cancel'));
-    assert.ok(requests.some(request => request === 'GET /runs/run-a'));
+    assert.ok(requests.includes('POST /runs/123e4567-e89b-42d3-a456-426614174000/cancel'));
+    assert.ok(requests.some(request => request === 'GET /runs/123e4567-e89b-42d3-a456-426614174000'));
     assert.equal(status.state, 'cancelled');
   } finally {
     clearTimeout(timer);
@@ -843,6 +855,7 @@ server.listen(Number(process.argv[2]), '127.0.0.1');
     await writeFile(markerPath, JSON.stringify({
       version: 1, runId: '123e4567-e89b-42d3-a456-426614174000', ownerPid: 2147483647, ownerStartTicks: '0',
       serverPid: child.pid, serverStartTicks, serverUrl, serverExecutable: await realpath(process.execPath),
+      submitted_config_body: '{}', submitted_config_sha256: '44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a', source_config_sha256: 'b'.repeat(64),
     }));
     const runner = async () => { throw new Error('startup must remain blocked'); };
     await assert.rejects(main(['--config', configPath], runner), /synthetic Compose cleanup failure/);
@@ -1214,6 +1227,12 @@ test('requires server config attestation and cancels the exact known run on miss
       const runId = '123e4567-e89b-42d3-a456-426614174010';
       await writeFile(configPath, JSON.stringify({ platform: { kind: 'local' } }));
       const deadline = await OatLauncherDeadline.create(600, performance.now(), receiptRoot);
+      const submitted_config_body = '{"platform":{"kind":"local"}}';
+      const binding = {
+        submitted_config_body,
+        submitted_config_sha256: createHash('sha256').update(submitted_config_body).digest('hex'),
+        source_config_sha256: createHash('sha256').update(await readFile(configPath)).digest('hex'),
+      };
       let state: OatRunStatus['state'] = 'running';
       let cancelCalls = 0;
       let activeReads = 0;
@@ -1239,12 +1258,13 @@ test('requires server config attestation and cancels the exact known run on miss
       assert.ok(address && typeof address !== 'string');
       try {
         await assert.rejects(
-          launchOat(configPath, `http://127.0.0.1:${address.port}`, 1, fetch, () => {}, 'local', () => '127.0.0.1', undefined, undefined, undefined, deadline),
+          launchOat(configPath, `http://127.0.0.1:${address.port}`, 1, fetch, () => {}, 'local', () => '127.0.0.1', undefined, undefined, undefined, deadline, binding),
           /config_sha256/,
         );
         assert.equal(cancelCalls, 1);
         assert.equal(deadline.runId, runId);
-        assert.equal(deadline.cleanupState, 'confirmed');
+        assert.equal(deadline.cleanupState, 'unsettled');
+        await assert.rejects(assertNoUnsettledDeadlineReceipts(receiptRoot), /config hash mismatch|unsettled/i);
       } finally {
         deadline.dispose();
         await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));

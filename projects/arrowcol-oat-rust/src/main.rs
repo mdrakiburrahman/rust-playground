@@ -220,11 +220,13 @@ async fn get_run(
 #[cfg(test)]
 mod config_hash_tests {
     use super::{sha256_hex, RunStatus};
+    use sha2::{Digest, Sha256};
 
     #[test]
     fn run_status_echoes_sha256_of_raw_config_bytes() {
         let raw = include_bytes!("../../../docs/experiments/arrowcol-oat/oat-config.quick.json");
-        let expected = sha256_hex(raw);
+        let expected: String = Sha256::digest(raw).iter().map(|byte| format!("{byte:02x}")).collect();
+        assert_eq!(sha256_hex(raw), expected);
         let status = RunStatus {
             id: "123e4567-e89b-42d3-a456-426614174000".to_owned(),
             config_sha256: expected.clone(),
