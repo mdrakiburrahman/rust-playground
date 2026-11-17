@@ -419,10 +419,10 @@ function assertAllocated(envelope: EffectEnvelope, effect: ExternalEffect): void
       rule.resource === effect.resource && rule.path === effect.path && rule.body_sha256 === bodyHash))
     throw new Error('Bridge request differs from every exact original effect allocation.');
 }
-function assertFixtureCommand(request: FixtureCommandRequest, input: FixtureSetupInput): 'kubectl' | 'campaign' {
+function assertFixtureCommand(request: FixtureCommandRequest, input: FixtureSetupInput,
+  rootDirectory: string): 'kubectl' | 'campaign' {
   const executable = path.posix.basename(request.executable);
-  if (request.current_dir !== null) throw new Error('Fixture command unexpectedly changed its production working directory.');
-  if (executable === 'kubectl' && request.argv.length >= 5 && request.argv[0] === '--context' &&
+  if (executable === 'kubectl' && request.current_dir === null && request.argv.length >= 5 && request.argv[0] === '--context' &&
       request.argv[1] === input.authority.context && request.argv[2] === '--server' && request.argv[3] === input.authority.server) {
     const args = request.argv.slice(4), verb = args[0];
     const getNamespace = verb === 'get' && args.length === 6 && args[1] === 'namespace' && args[2] === input.authority.namespace &&
@@ -440,7 +440,8 @@ function assertFixtureCommand(request: FixtureCommandRequest, input: FixtureSetu
       args[5] === '-o' && args[6] === 'json' && request.stdin === fixtureRuntimeList(input);
     if ((getNamespace && request.stdin === null) || getResourceCollision || getResourceReadback || createNamespace || createResources) return 'kubectl';
   }
-  if (executable === 'npx' && request.stdin !== null && request.argv.length === 8 && request.argv[0] === '--no-install' &&
+  if (executable === 'npx' && request.current_dir === rootDirectory && request.stdin !== null &&
+      request.argv.length === 8 && request.argv[0] === '--no-install' &&
       request.argv[1] === 'tsx' && request.argv[2] === 'projects/arrowcol-oat/aks-campaign.ts' &&
       request.argv[3] === 'publish-inventory' && request.argv[4] === '--env-file' && request.argv[5] === input.bootstrap_env_file &&
       request.argv[6] === '--stamp-config' && request.argv[7] === input.stamp_config_path) return 'campaign';
@@ -666,7 +667,8 @@ function fixtureObservedInventory(input: FixtureSetupInput, planned: RunInventor
     if (!object(actual) || !object(actual.metadata) || typeof actual.metadata.uid !== 'string' || !actual.metadata.uid ||
         typeof actual.metadata.resourceVersion !== 'string' || !actual.metadata.resourceVersion || !fixtureHasOriginMarkers(actual.metadata, input) ||
         !object(createdResource) || !object(createdResource.metadata) || createdResource.metadata.uid !== actual.metadata.uid ||
-        createdResource.metadata.generation !== actual.metadata.generation || !Number.isSafeInteger(actual.metadata.generation) ||
+        resource.kind === 'Deployment' && (createdResource.metadata.generation !== actual.metadata.generation ||
+          !Number.isSafeInteger(actual.metadata.generation)) ||
         seenUids.has(actual.metadata.uid)) throw new Error('Fixture readback differs from the original fresh-create identity.');
     if (['Deployment', 'StatefulSet', 'DaemonSet', 'Job'].includes(resource.kind) &&
         (!object(actual.spec) || !object(actual.spec.template) || !object(actual.spec.template.metadata) ||
@@ -752,7 +754,6 @@ export class FixtureCommandDispatcher {
   private readonly now: () => number;
   private readonly ledger: DurableBridgeLedger;
   private readonly envelope: EffectEnvelope;
-  private readonly campaignStore: CampaignStore;
   private lastPublishedStored?: StoredCampaign;
   private readonly seen = new Map<number, FixtureCommandRequest>();
   private readonly responses = new Map<number, FixtureCommandResponse>();
@@ -765,12 +766,14 @@ export class FixtureCommandDispatcher {
       throw new Error('Fixture setup does not match the selected campaign/effect authority.');
     this.ledger = new DurableBridgeLedger(options.ledgerPath, ledgerBinding('fixture-command', options.input.authority,
       options.input.original_deadline_unix_ms, 'fixture-setup', options.input, this.envelope));
-    this.campaignStore = boundedCampaignStore(options.store, options.input.authority, options.input.original_deadline_unix_ms,
-      this.envelope, this.now, true);
+  }
+  private campaignStoreFor(envelope: EffectEnvelope): CampaignStore {
+    return boundedCampaignStore(this.options.store, this.options.input.authority,
+      this.options.input.original_deadline_unix_ms, envelope, this.now, true);
   }
   async exchange(value: unknown): Promise<FixtureCommandResponse> {
     const request = fixtureRequest(value, this.options.input.authority, this.options.input.original_deadline_unix_ms, this.now());
-    const kind = assertFixtureCommand(request, this.options.input), effect = fixtureEffect(request);
+    const kind = assertFixtureCommand(request, this.options.input, this.options.rootDirectory), effect = fixtureEffect(request);
     assertBridgeLive(this.envelope, request.original_deadline_unix_ms, this.now);
     const cached = this.ledger.peek(request.request_id, request.request_sha256);
     if (cached !== undefined) { this.seen.set(request.request_id, request); this.responses.set(request.request_id, cached as FixtureCommandResponse); return cached as FixtureCommandResponse; }
@@ -788,7 +791,8 @@ export class FixtureCommandDispatcher {
       allocation_sha256: predecessorAllocation, journal_sha256: priorTranscript, response_sha256: predecessorResponse,
     });
     const preflightBoundary = new EffectBoundary(preflightEnvelope, preflight.receiptPath);
-    const stored = await withEffectBoundary(preflightBoundary, async () => this.campaignStore.read());
+    const preflightStore = this.campaignStoreFor(preflightEnvelope);
+    const stored = await withEffectBoundary(preflightBoundary, async () => preflightStore.read());
     const commandEnvelope = await fixturePhaseEnvelope(this.envelope, 'command', request, kind, stored, this.now());
     assertAllocated(commandEnvelope, effect);
     const command = sealFixturePhase(this.options.ledgerPath, request, 'command', commandEnvelope, {
@@ -797,17 +801,18 @@ export class FixtureCommandDispatcher {
       response_sha256: sha(canonical({ stored: stored ?? null, receipt_sha256: sha(fs.readFileSync(preflight.receiptPath)) })),
     });
     const boundary = new EffectBoundary(commandEnvelope, command.receiptPath);
+    const commandStore = this.campaignStoreFor(commandEnvelope);
     let result: ProcessResult;
     if (kind === 'campaign') result = await withEffectBoundary(boundary, async () => dispatchExternalEffect(effect, async () => {
-      assertBridgeLive(this.envelope, request.original_deadline_unix_ms, this.now);
-      await this.campaignStore.read();
-      assertBridgeLive(this.envelope, request.original_deadline_unix_ms, this.now);
-      return callCampaignMain(this.options, request, this.campaignStore);
+      assertBridgeLive(commandEnvelope, request.original_deadline_unix_ms, this.now);
+      await commandStore.read();
+      assertBridgeLive(commandEnvelope, request.original_deadline_unix_ms, this.now);
+      return callCampaignMain(this.options, request, commandStore);
     }));
     else result = await withEffectBoundary(boundary, async () => dispatchExternalEffect(effect, async () => {
-      assertBridgeLive(this.envelope, request.original_deadline_unix_ms, this.now);
-      await this.campaignStore.read();
-      assertBridgeLive(this.envelope, request.original_deadline_unix_ms, this.now);
+      assertBridgeLive(commandEnvelope, request.original_deadline_unix_ms, this.now);
+      await commandStore.read();
+      assertBridgeLive(commandEnvelope, request.original_deadline_unix_ms, this.now);
       return (this.options.runCommand ?? runProcess)([request.executable, ...request.argv],
         request.stdin === null ? undefined : Buffer.from(request.stdin),
         Math.min(request.remaining_timeout_ms, request.original_deadline_unix_ms - this.now()),
@@ -818,7 +823,7 @@ export class FixtureCommandDispatcher {
       throw new Error('Fixture command result is invalid or oversized; outcome is not reusable.');
     if (kind === 'campaign') {
       const inventory = JSON.parse(request.stdin!) as RunInventory; publishReceipt(result.stdout, inventory);
-      const confirmed = await withEffectBoundary(boundary, async () => this.campaignStore.read());
+      const confirmed = await withEffectBoundary(boundary, async () => commandStore.read());
       if (!confirmed || !equal(confirmed.state.runInventory, inventory))
         throw new Error('Campaign store readback does not match the actual published inventory.');
       this.lastPublishedStored = confirmed;
@@ -867,7 +872,8 @@ export class FixtureCommandDispatcher {
       const actual = created.find(item => object(item.metadata) && item.kind === resource.kind && item.metadata.name === resource.name &&
         item.metadata.namespace === resource.namespace);
       if (!actual || !object(actual.metadata) || !actual.metadata.uid || actual.metadata.uid !== resource.uid ||
-          typeof actual.metadata.resourceVersion !== 'string' || !actual.metadata.resourceVersion || !Number.isSafeInteger(actual.metadata.generation) ||
+          typeof actual.metadata.resourceVersion !== 'string' || !actual.metadata.resourceVersion ||
+          resource.kind === 'Deployment' && !Number.isSafeInteger(actual.metadata.generation) ||
           !resource.uid || resource.state !== 'observed' || resource.absence !== null || seenUids.has(resource.uid))
         throw new Error('Fixture resource identity is not derived from a unique actual create response.');
       seenUids.add(resource.uid);

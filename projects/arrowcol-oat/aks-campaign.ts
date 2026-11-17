@@ -354,6 +354,7 @@ function validateRunInventory(value: unknown, state: CampaignState): RunInventor
     const fic = inventory.fic;
     if (fic.plan) {
       const plan = fic.plan;
+      const unmaterializedPlan = fic.state === 'planned' && fic.resource_id === null && fic.name === null;
       const safeHttps = (input: unknown, originOnly = false) => {
         if (typeof input !== 'string') return false;
         try { const url = new URL(input); return url.protocol === 'https:' && !url.username && !url.password &&
@@ -362,7 +363,7 @@ function validateRunInventory(value: unknown, state: CampaignState): RunInventor
       if (!exactRecord(plan, ['version', 'runId', 'namespace', 'serviceAccount', 'identityId', 'resourceId', 'clientId',
         'tenantId', 'aksId', 'server', 'credentialName', 'issuer', 'subject', 'audience']) || plan.version !== 1 ||
           plan.runId !== inventory.cell_run_id || plan.namespace !== inventory.namespace.name || !k8sName(plan.serviceAccount) ||
-          plan.resourceId !== fic.resource_id || plan.credentialName !== fic.name ||
+          !unmaterializedPlan && (plan.resourceId !== fic.resource_id || plan.credentialName !== fic.name) ||
           plan.credentialName !== 'arrowcol-run-' + inventory.cell_run_id ||
           plan.resourceId !== plan.identityId + '/federatedIdentityCredentials/' + plan.credentialName ||
           !canonicalUuid(plan.clientId) || !canonicalUuid(plan.tenantId) || !safeHttps(plan.server, true) || !safeHttps(plan.issuer) ||
@@ -433,7 +434,8 @@ function validateRunInventory(value: unknown, state: CampaignState): RunInventor
     if (!exactRecord(resource, ['api_version', 'kind', 'namespace', 'name', 'uid', 'absence', 'role', 'state']) ||
         !nonempty(resource.api_version) || !nonempty(resource.kind) || resource.namespace !== inventory.namespace.name ||
         typeof resource.name !== 'string' || resource.name.length === 0 || resource.name.length > 253 ||
-        !/^[a-z0-9.-]+$/.test(resource.name) || !['apps/v1:Deployment', 'batch/v1:Job', 'v1:Pod'].includes(resource.api_version + ':' + resource.kind) ||
+        !/^[a-z0-9.-]+$/.test(resource.name) ||
+        !['apps/v1:Deployment', 'batch/v1:Job', 'v1:Pod', 'v1:ServiceAccount'].includes(resource.api_version + ':' + resource.kind) ||
         !['collector', 'client', 'maintenance', 'router'].includes(String(resource.role)) || !stateValue(resource.state) ||
         !(resource.uid === null || canonicalUuid(resource.uid)) ||
         ['observed', 'removed'].includes(resource.state) && (resource.uid === null || inventory.namespace.uid === null) ||

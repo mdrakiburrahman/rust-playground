@@ -10,8 +10,8 @@ import { initializeOwnedRunTable, PLANNED_CONTROL_OPERATION_IDS, PLANNED_STORAGE
   runFixtureSetupChild, StorageBridgeDispatcher, type FixtureDispatcherOptions, type FixtureSetupInput,
   type StorageBridgeAuthority, type StorageBridgeRequest } from './aks-d47-bridge.js';
 import type { Azure } from '../../infra/azure/bootstrap.js';
-import { newCampaignState, publishRunInventory, runInventoryPublishReceipt, type CampaignStore, type RunInventory,
-  type StoredCampaign } from './aks-campaign.js';
+import { createBlobCampaignStore, newCampaignState, publishRunInventory, runInventoryPublishReceipt,
+  type CampaignStore, type RunInventory, type StoredCampaign } from './aks-campaign.js';
 
 function canonical(value: unknown): string {
   if (Array.isArray(value)) return '[' + value.map(canonical).join(',') + ']';
@@ -707,13 +707,15 @@ test('real Rust zero-data fixture composes with response-derived Node phase allo
   const namespace = 'fixture-' + run.replaceAll('-', '');
   const serviceAccount = 'fixture-sa';
   const server = 'https://offline.invalid/';
+  const subscription = 'c0ffee00-0000-4000-8000-000000000107';
+  const identityId = `/subscriptions/${subscription}/resourceGroups/offline/providers/Microsoft.ManagedIdentity/userAssignedIdentities/fixture`;
   const ficPlan = {
     version: 1 as const, runId: run, namespace, serviceAccount,
-    identityId: '/subscriptions/offline/identities/fixture',
-    resourceId: '/subscriptions/offline/identities/fixture/federatedIdentityCredentials/arrowcol-run-' + run,
+    identityId,
+    resourceId: identityId + '/federatedIdentityCredentials/arrowcol-run-' + run,
     clientId: 'c0ffee00-0000-4000-8000-000000000105',
     tenantId: 'c0ffee00-0000-4000-8000-000000000106',
-    aksId: '/subscriptions/offline/clusters/fixture', server,
+    aksId: `/subscriptions/${subscription}/resourceGroups/offline/providers/Microsoft.ContainerService/managedClusters/fixture`, server,
     credentialName: 'arrowcol-run-' + run, issuer: 'https://offline.invalid/issuer',
     subject: `system:serviceaccount:${namespace}:${serviceAccount}`,
     audience: 'api://AzureADTokenExchange',
@@ -725,6 +727,8 @@ test('real Rust zero-data fixture composes with response-derived Node phase allo
     namespace: { name: namespace, uid: null, owner_token: owner }, resources: [],
     fic: { resource_id: null, name: null, state: 'planned', absence: null, plan: ficPlan },
     qap: null, planned_cell_duration_ms: 0,
+    evidence_destination: { account: 'offlinestorage', container: 'checkpoints',
+      blob_prefix: `campaigns/${campaign}/cells/${run}/evidence` },
     effective_stop_budgets: { maintenance_grace_seconds: 4_800, maintenance_stop_timeout_ms: 5_100_000 },
     cleanup: { stop_admission: notStarted(), bounded_drain: notStarted(), evidence_capture: notStarted(),
       stop_maintenance: notStarted(), terminal_capture: notStarted(), handoff: notStarted() },
@@ -747,7 +751,7 @@ test('real Rust zero-data fixture composes with response-derived Node phase allo
     }),
   ];
   const input: FixtureSetupInput = { schema_version: 1, authority, original_deadline_unix_ms: deadline, inventory,
-    service_account: serviceAccount, manifests, runtime_directory: directory,
+    service_account: serviceAccount, manifests, runtime_directory: path.join(directory, 'runtime'),
     stamp_config_path: path.join(directory, 'stamp.yaml'), bootstrap_env_file: path.join(directory, 'campaign.env') };
   const inputPath = path.join(directory, 'fixture-input.json'), ledgerPath = path.join(directory, 'fixture-ledger.jsonl');
   writeFileSync(inputPath, JSON.stringify(input), { mode: 0o600 });
@@ -762,19 +766,25 @@ test('real Rust zero-data fixture composes with response-derived Node phase allo
       path: `/checkpoints/campaigns/${campaign}/baseline.json`, max_calls: 1 },
   ];
   const envelope: EffectEnvelope = { schema_version: 1, campaign_id: campaign, run_id: run,
-    subscription_id: 'c0ffee00-0000-4000-8000-000000000107', resource_group: 'offline',
+    subscription_id: subscription, resource_group: 'offline',
     storage_account: 'offlinestorage', state_container: 'checkpoints', effects };
 
   let stored: StoredCampaign = { state: newCampaignState(campaign, owner, now), etag: '"0"' };
   let revision = 0;
-  const store: CampaignStore = {
-    async read() { return structuredClone(stored); },
-    async write(state, expectedEtag) {
-      if (expectedEtag !== stored.etag) throw new Error('offline campaign CAS conflict');
-      stored = { state: structuredClone(state), etag: `"${++revision}"` };
-      return stored.etag;
-    },
-  };
+  const store = createBlobCampaignStore({ account: 'offlinestorage', container: 'checkpoints', subscriptionId: subscription },
+    async (input, init) => {
+      const request = new URL(String(input)), method = (init?.method ?? 'GET').toUpperCase();
+      if (request.pathname !== activePath) throw new Error('Unexpected offline campaign blob path.');
+      if (method === 'GET') return new Response(JSON.stringify(stored.state), { status: 200, headers: { etag: stored.etag } });
+      if (method === 'PUT') {
+        const headers = new Headers(init?.headers);
+        if (headers.get('if-match') !== stored.etag || typeof init?.body !== 'string')
+          throw new Error('Offline campaign CAS condition or body changed.');
+        stored = { state: JSON.parse(init.body) as StoredCampaign['state'], etag: `"${++revision}"` };
+        return new Response(null, { status: 201, headers: { etag: stored.etag } });
+      }
+      throw new Error('Unexpected offline campaign blob method.');
+    }, async () => 'offline-token');
   const azure = { c: { account: 'offlinestorage' } } as unknown as Azure;
   const env = { CAMPAIGN_ID: campaign, CAMPAIGN_OWNER_ID: owner, CAMPAIGN_FENCING_TOKEN: '1' };
   const namespaceIdentity: Record<string, unknown> = {
@@ -820,8 +830,10 @@ test('real Rust zero-data fixture composes with response-derived Node phase allo
     throw new Error('Unexpected offline fixture command: ' + JSON.stringify(command));
   };
 
-  const receipt = await runFixtureSetupChild(executable, inputPath, { input, rootDirectory: directory, ledgerPath,
-    envelope, store, azure, env, campaignMain, runCommand, now: () => now });
+  const outerBoundary = new EffectBoundary(envelope, path.join(directory, 'outer-effects.jsonl'));
+  const receipt = await withEffectBoundary(outerBoundary, () => runFixtureSetupChild(executable, inputPath, {
+    input, rootDirectory: process.cwd(), ledgerPath, envelope, store, azure, env, campaignMain, runCommand, now: () => now,
+  }));
   assert.equal(receipt.load_admitted, false);
   assert.equal(receipt.inventory.load_admission, 'not_authorized');
   assert.equal(receipt.inventory.planned_cell_duration_ms, 0);
