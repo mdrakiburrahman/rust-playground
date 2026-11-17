@@ -84,6 +84,8 @@ fn rendezvous_score(key: &LeaseKey, collector: &CollectorRecord, now: UnixMillis
     hasher.update([0]);
     hasher.update(key.table.to_string().as_bytes());
     hasher.update([0]);
+    hasher.update([key.shard_index]);
+    hasher.update([0]);
     hasher.update(collector.registration.instance_id.as_uuid().as_bytes());
     let digest = hasher.finalize();
     let mut bytes = [0_u8; 8];

@@ -139,7 +139,11 @@ impl RoutingEngine {
     /// authoritative lease is draining/unsafe, no collector is eligible, or a
     /// required lease compare-and-set fails.
     pub async fn route_ingest(&self, metadata: &IngestMetadata, now: UnixMillis) -> RoutingResult<RouteAssignment> {
-        let key = LeaseKey::new(metadata.implementation_pool(), metadata.table().clone());
+        let key = LeaseKey::for_shard(
+            metadata.implementation_pool(),
+            metadata.table().clone(),
+            metadata.shard_index(),
+        );
         let mut view = self.view.read().await.clone().ok_or_else(|| {
             RoutingError::new(
                 RoutingErrorKind::PoolUnavailable,
@@ -237,7 +241,11 @@ impl RoutingEngine {
         }
         validate_oat_run_id(run_id, run_expires_at, now)?;
         let metadata = canonical_oat_metadata(metadata)?;
-        let key = LeaseKey::new(metadata.implementation_pool(), metadata.table().clone());
+        let key = LeaseKey::for_shard(
+            metadata.implementation_pool(),
+            metadata.table().clone(),
+            metadata.shard_index(),
+        );
         let pin = self.store.get_run_table_pin(run_id, &key, now).await?.ok_or_else(|| {
             RoutingError::new(
                 RoutingErrorKind::Conflict,

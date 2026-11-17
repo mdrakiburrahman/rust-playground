@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use arrowcol_protocol::{
@@ -1677,6 +1678,52 @@ async fn weighted_rendezvous_is_deterministic_and_excludes_hard_pressure() {
     let right = rank_collectors(&view, &key, millis(100_001), &RoutingPolicy::default(), false);
     assert_eq!(left, right);
     assert_eq!(left, vec![second]);
+}
+
+#[tokio::test]
+async fn ingest_routes_each_shard_independently_and_spreads_owners() {
+    let (store, _, _) = seeded_store().await;
+    let engine = long_lease_engine(&store);
+    engine
+        .refresh(millis(100_001))
+        .await
+        .unwrap_or_else(|error| panic!("refresh routing view: {error}"));
+    let fingerprint = ClaimedSchemaFingerprint::new(SchemaFingerprint::from_bytes([7; 32]));
+    let mut owners = BTreeSet::new();
+
+    for shard_index in 0..32 {
+        let metadata = IngestMetadata::new_with_shard_index(
+            ProtocolVersion::CURRENT,
+            ImplementationPool::Dataflow,
+            table(),
+            shard_index,
+            fingerprint,
+        );
+        let route = engine
+            .route_ingest(&metadata, millis(100_001))
+            .await
+            .unwrap_or_else(|error| panic!("route shard {shard_index}: {error}"));
+        let lease = route.lease.expect("ingest route has a shard lease");
+        assert_eq!(
+            lease.key,
+            LeaseKey::for_shard(ImplementationPool::Dataflow, table(), shard_index)
+        );
+        owners.insert(route.instance_id);
+
+        let retry = engine
+            .route_ingest(&metadata, millis(100_001))
+            .await
+            .unwrap_or_else(|error| panic!("reuse shard {shard_index}: {error}"));
+        assert_eq!(retry.instance_id, route.instance_id);
+        assert_eq!(retry.lease, Some(lease));
+    }
+
+    assert!(owners.len() > 1, "shard rendezvous must spread across collectors");
+    let view = store
+        .load_view(millis(100_001))
+        .await
+        .unwrap_or_else(|error| panic!("load sharded view: {error}"));
+    assert_eq!(view.leases.len(), 32);
 }
 
 #[test]

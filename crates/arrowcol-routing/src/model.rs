@@ -466,15 +466,24 @@ pub struct LeaseKey {
     pub implementation_pool: ImplementationPool,
     /// Fully qualified table.
     pub table: TableIdentity,
+    /// Zero-based routing shard within the table.
+    pub shard_index: u8,
 }
 
 impl LeaseKey {
-    /// Creates a routing lease key.
+    /// Creates the legacy shard-zero routing lease key.
     #[must_use]
     pub const fn new(implementation_pool: ImplementationPool, table: TableIdentity) -> Self {
+        Self::for_shard(implementation_pool, table, 0)
+    }
+
+    /// Creates a routing lease key for one zero-based shard.
+    #[must_use]
+    pub const fn for_shard(implementation_pool: ImplementationPool, table: TableIdentity, shard_index: u8) -> Self {
         Self {
             implementation_pool,
             table,
+            shard_index,
         }
     }
 }
@@ -488,7 +497,7 @@ pub enum LeaseState {
     Draining,
 }
 
-/// Fenced ownership for one implementation-pool/table pair.
+/// Fenced ownership for one implementation-pool/table/shard key.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RoutingLease {
     /// Lease key.
