@@ -56,6 +56,7 @@ export interface OfficialCellMeasurement {
   startMs: number | null;
   endMs: number | null;
   committedRowsPerSecond: number | null;
+  submittedConfigIdentity: 'verified_exact_server_bytes' | 'unknown';
   unavailableReasons: string[];
 }
 
@@ -87,6 +88,8 @@ async function assertOriginalCustody(options: SourceOptions, original: OfficialC
 export async function readOfficialCellMeasurement(options: {
   azure: Azure; store: CampaignStore; token: ScaleCustodyToken; deadlineAtMs: number;
   fetcher?: typeof fetch; now?: () => number;
+  /** Untrusted exact POST bytes, e.g. UTF-8 of the launcher's retained submitted_config_body; never reserialized JSON. */
+  submittedConfigBytes?: Uint8Array;
 }): Promise<OfficialCellMeasurement> {
   const { azure, deadlineAtMs } = options, now = options.now ?? Date.now;
   const assertDeadline = () => assertSourceDeadline(options);
@@ -150,7 +153,18 @@ export async function readOfficialCellMeasurement(options: {
   const output = object(evidence.commit_window_output_throughput, 'Original official commit window');
   const start = output.measurement_start_unix_ms, end = output.measurement_end_unix_ms;
   const unavailableReasons: string[] = [];
-  if (reference.submitted_config_sha256 === null) unavailableReasons.push('authoritative_submitted_config_identity_unavailable');
+  let submittedConfigIdentity: OfficialCellMeasurement['submittedConfigIdentity'] = 'unknown';
+  if (reference.submitted_config_sha256 === null || !/^[0-9a-f]{64}$/.test(reference.submitted_config_sha256)) {
+    unavailableReasons.push('authoritative_submitted_config_identity_unavailable');
+  } else if (!options.submittedConfigBytes) {
+    unavailableReasons.push('submitted_config_bytes_unavailable');
+  } else if (options.submittedConfigBytes.byteLength > 2_097_152) {
+    unavailableReasons.push('submitted_config_bytes_exceed_server_request_bound');
+  } else if (sha(options.submittedConfigBytes) !== reference.submitted_config_sha256) {
+    unavailableReasons.push('submitted_config_bytes_differ_from_server_identity');
+  } else {
+    submittedConfigIdentity = 'verified_exact_server_bytes';
+  }
   if (reference.source_revision === null) unavailableReasons.push('official_source_revision_unavailable');
   if (result.status !== 'succeeded') unavailableReasons.push('original_official_cell_did_not_succeed');
   const complete = integer(start) && integer(end) && start >= before.startedAtMs && end > start && end <= now() &&
@@ -159,9 +173,10 @@ export async function readOfficialCellMeasurement(options: {
     output.unavailable_reason == null && typeof output.rows_per_second === 'number' &&
     Number.isFinite(output.rows_per_second) && output.rows_per_second >= 0;
   if (!complete) unavailableReasons.push('original_official_commit_window_incomplete');
+  assertDeadline();
   return { reference: structuredClone(reference), inventory: structuredClone(inventory), effectiveConfig,
     officialResult: result, output, startMs: integer(start) ? start : null, endMs: integer(end) ? end : null,
-    committedRowsPerSecond: complete ? output.rows_per_second as number : null, unavailableReasons };
+    committedRowsPerSecond: complete ? output.rows_per_second as number : null, submittedConfigIdentity, unavailableReasons };
 }
 
 // Microsoft.Kusto/clusters: Percent/Average/PT1M, not row latency or cache fullness.

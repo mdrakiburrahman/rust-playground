@@ -1055,6 +1055,7 @@ trait Platform: Send + Sync {
     ) -> Result<()> {
         Ok(())
     }
+    fn bind_submitted_config(&mut self, _identity: Option<SubmittedConfigIdentity>) {}
     fn mark_qap_outcome_unresolved(&mut self) {}
     async fn prepare_client_fleet(&mut self, config: &OatConfig, run_id: &str) -> Result<()>;
     async fn start_client(
@@ -1111,6 +1112,7 @@ trait Platform: Send + Sync {
 
 struct AksPlatform {
     run_id: String,
+    submitted_config: Option<SubmittedConfigIdentity>,
     resource_readback: Vec<Value>,
     cpu_throttling_start: Option<Vec<CpuThrottleSample>>,
     cpu_throttling_evidence: Option<Value>,
@@ -1223,6 +1225,10 @@ struct LocalPlatform {
 
 #[async_trait::async_trait]
 impl Platform for AksPlatform {
+    fn bind_submitted_config(&mut self, identity: Option<SubmittedConfigIdentity>) {
+        self.submitted_config = identity;
+    }
+
     fn resource_evidence(&self) -> Option<Value> {
         Some(json!({
             "readbacks": self.resource_readback,
@@ -3076,6 +3082,7 @@ async fn run_matrix(
     state: Arc<AppState>,
     cancellation: watch::Receiver<bool>,
 ) -> MatrixOutcome {
+    let submitted_config = capture_submitted_config_identity(&state, orchestration_id).await;
     run_matrix_with(
         config,
         orchestration_id,
@@ -3088,6 +3095,7 @@ async fn run_matrix(
                 replicas,
                 concurrency,
                 cancellation.clone(),
+                submitted_config.clone(),
             )
         },
     )
@@ -3158,6 +3166,7 @@ async fn run_isolated_cell(
     replicas: u32,
     concurrency: u32,
     mut cancellation: watch::Receiver<bool>,
+    submitted_config: Option<SubmittedConfigIdentity>,
 ) -> MatrixOutcome {
     let mut platform = match platform_for_run(&config, &run_id) {
         Ok(platform) => platform,
@@ -3173,6 +3182,7 @@ async fn run_isolated_cell(
             );
         }
     };
+    platform.bind_submitted_config(submitted_config);
     let timing_budget = match config.timing_budget() {
         Ok(budget) => budget,
         Err(error) => {
@@ -3444,6 +3454,7 @@ fn platform_for_run(config: &OatConfig, run_id: &str) -> Result<Box<dyn Platform
         crate::config::OatMode::Local => Ok(Box::new(LocalPlatform::new(config, run_id)?)),
         crate::config::OatMode::Aks => Ok(Box::new(AksPlatform {
             run_id: run_id.to_owned(),
+            submitted_config: None,
             resource_readback: Vec::new(),
             cpu_throttling_start: None,
             cpu_throttling_evidence: None,
@@ -14452,6 +14463,7 @@ mod tests {
         )?;
         let mut platform = AksPlatform {
             run_id: "fixture-run".to_owned(),
+            submitted_config: None,
             resource_readback: Vec::new(),
             cpu_throttling_start: None,
             cpu_throttling_evidence: None,
