@@ -30,6 +30,7 @@
 | Standard GPv2 storage in Canada Central | 40,000 requests/s, 60 Gbps ingress, 200 Gbps egress | The campaign account is StorageV2, `Standard_LRS`, with HNS enabled. These are account targets, not a guarantee; increase limits only if measured throttling or saturation identifies storage as the bottleneck. |
 
 Sources: [Ddsv6 sizes](https://learn.microsoft.com/azure/virtual-machines/sizes/general-purpose/ddsv6-series), [Edsv6 sizes](https://learn.microsoft.com/azure/virtual-machines/sizes/memory-optimized/edsv6-series), [VM network bandwidth](https://learn.microsoft.com/azure/virtual-network/virtual-machine-network-throughput), and [standard storage scalability targets](https://learn.microsoft.com/azure/storage/common/scalability-targets-standard-account).
+
 ## Router timeout compatibility
 
 | Setting | Contract |
