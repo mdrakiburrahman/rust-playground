@@ -5,6 +5,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 type JsonObject = Record<string, unknown>;
 type Candidate = { id: string; overrides: JsonObject; qualification?: 'exploratory' };
+type GrpcCompression = 'none' | 'gzip' | 'zstd';
 type Comparison = {
   id: string; factor: string; candidates: Candidate[]; candidate_limit: number;
   matched_control?: string; comparison_family?: string;
@@ -34,6 +35,11 @@ const compareWithControl = (
 const codecControl = candidate('uncompressed', {
   parquet_writer: { defaults: { compression: 'uncompressed', compression_level: null } },
 });
+const directionalGrpcCandidate = (id: string, clientToReceiver: GrpcCompression, receiverToClient: GrpcCompression): Candidate => candidate(id, {
+  transport: { grpc_send_compression: clientToReceiver, grpc_accept_compression: receiverToClient },
+  collector: { limits: { grpc_accept_compression: clientToReceiver, grpc_send_compression: receiverToClient } },
+});
+const grpcNoneControl = directionalGrpcCandidate('grpc-none', 'none', 'none');
 const cohorts: Cohort[] = [
   { id: 'C1', comparisons: [
     compareWithControl('codec-zstd-levels', 'parquet_writer.defaults.compression+compression_level', codecControl, [
@@ -115,6 +121,14 @@ const cohorts: Cohort[] = [
     compare('corpus', 'tunables.client.corpus_rows', [16384, 65536, 262144].map(value => candidate('corpus-' + value, { client: { corpus_rows: value } }))),
     compare('interval', 'tunables.client.interval_us', [0, 1000, 10000].map(value => candidate('interval-' + value, { client: { interval_us: value } }))),
     compare('ipc-compression', 'tunables.transport.ipc_compression', ['none', 'lz4_frame', 'zstd'].map(value => candidate('ipc-' + value, { transport: { ipc_compression: value } }))),
+    compareWithControl('grpc-client-to-receiver', 'transport.grpc_send_compression + collector.limits.grpc_accept_compression', grpcNoneControl,
+      (['gzip', 'zstd'] as const).map(codec => directionalGrpcCandidate('grpc-client-to-receiver-' + codec, codec, 'none')), 'grpc-direction'),
+    compareWithControl('grpc-receiver-to-client', 'collector.limits.grpc_send_compression + transport.grpc_accept_compression', grpcNoneControl,
+      (['gzip', 'zstd'] as const).map(codec => directionalGrpcCandidate('grpc-receiver-to-client-' + codec, 'none', codec)), 'grpc-direction'),
+    compareWithControl('grpc-mixed-directions', 'paired client-to-receiver and receiver-to-client compression', grpcNoneControl, [
+      directionalGrpcCandidate('grpc-mixed-request-gzip-response-zstd', 'gzip', 'zstd'),
+      directionalGrpcCandidate('grpc-mixed-request-zstd-response-gzip', 'zstd', 'gzip'),
+    ], 'grpc-direction'),
   ] },
   { id: 'C6', comparisons: [
     compare('dfe-concurrency', 'dfe_worker_concurrency', [1, 2, 4, 8].map(value => candidate('dfe-' + value, {}, { dfe_worker_concurrency: [value] }))),
@@ -218,6 +232,7 @@ export function buildThroughputManifests(registry: unknown): JsonObject[] {
     const collector = isRecord(tunables.collector) ? tunables.collector : {};
     const upload = isRecord(collector.upload) ? collector.upload : {};
     const batching = isRecord(collector.batching) ? collector.batching : {};
+    const collectorLimits = isRecord(collector.limits) ? collector.limits : {};
     const maintenanceSeed = isRecord(tunables.maintenance) ? tunables.maintenance : {};
     validateComparisons(cohort.comparisons, cohort.id);
     return {
@@ -330,32 +345,50 @@ export function buildThroughputManifests(registry: unknown): JsonObject[] {
         grpc_send_compression: {
           path: 'tunables.transport.grpc_send_compression',
           accepted: ['none', 'gzip', 'zstd'],
-          configured: [],
+          configured: ['none', 'gzip', 'zstd'],
           baseline_requested: transport.grpc_send_compression ?? null,
           effective_default: 'none (bin/collector-chain/src/dmv_client.rs::Options)',
           client_build_supported: ['none', 'gzip', 'zstd'],
-          consumer: 'ARROWCOL_CLIENT_GRPC_SEND_COMPRESSION -> bin/collector-chain/src/dmv_client.rs::send_compressed',
-          excluded: {
-            gzip: 'The production Arrow Flight receiver in crates/arrowcol-flight/src/service.rs::into_tonic_service does not enable accept_compressed; gzip is enabled only by a test server in dmv_client.rs.',
-            zstd: 'The production Arrow Flight receiver in crates/arrowcol-flight/src/service.rs::into_tonic_service does not enable accept_compressed; client build support alone does not establish receiver compatibility.',
-          },
+          consumer: 'ARROWCOL_CLIENT_GRPC_SEND_COMPRESSION -> bin/collector-chain/src/dmv_client.rs::send_compressed; paired with tunables.collector.limits.grpc_accept_compression',
+          excluded: {},
           pending: [],
-          status: 'client-supported-but-production-receiver-incompatible',
+          status: 'config-screened-not-runtime-qualified',
         },
         grpc_accept_compression: {
           path: 'tunables.transport.grpc_accept_compression',
           accepted: ['none', 'gzip', 'zstd'],
-          configured: [],
+          configured: ['none', 'gzip', 'zstd'],
           baseline_requested: transport.grpc_accept_compression ?? null,
           effective_default: 'none (bin/collector-chain/src/dmv_client.rs::Options)',
           client_build_supported: ['none', 'gzip', 'zstd'],
-          consumer: 'ARROWCOL_CLIENT_GRPC_ACCEPT_COMPRESSION -> bin/collector-chain/src/dmv_client.rs::accept_compressed',
-          excluded: {
-            gzip: 'The production Arrow Flight receiver in crates/arrowcol-flight/src/service.rs::into_tonic_service does not enable send_compressed, so no compressed server response can exercise this setting.',
-            zstd: 'The production Arrow Flight receiver in crates/arrowcol-flight/src/service.rs::into_tonic_service does not enable send_compressed, so no compressed server response can exercise this setting.',
-          },
+          consumer: 'ARROWCOL_CLIENT_GRPC_ACCEPT_COMPRESSION -> bin/collector-chain/src/dmv_client.rs::accept_compressed; paired with tunables.collector.limits.grpc_send_compression',
+          excluded: {},
           pending: [],
-          status: 'no-production-receiver-response-compression',
+          status: 'config-screened-not-runtime-qualified',
+        },
+        grpc_receiver_accept_compression: {
+          path: 'tunables.collector.limits.grpc_accept_compression',
+          accepted: ['none', 'gzip', 'zstd'],
+          configured: ['none', 'gzip', 'zstd'],
+          baseline_requested: collectorLimits.grpc_accept_compression ?? null,
+          effective_default: 'none (crates/arrowcol-dataflow-components/src/config.rs::RuntimeLimitsConfig)',
+          receiver_build_supported: ['none', 'gzip', 'zstd'],
+          consumer: 'ARROWCOL_COLLECTOR_LIMITS_CONFIG -> crates/arrowcol-dataflow-components/src/config.rs::RuntimeLimitsConfig -> crates/arrowcol-flight/src/service.rs::into_tonic_service; paired with transport.grpc_send_compression',
+          excluded: {},
+          pending: [],
+          status: 'config-screened-not-runtime-qualified',
+        },
+        grpc_receiver_send_compression: {
+          path: 'tunables.collector.limits.grpc_send_compression',
+          accepted: ['none', 'gzip', 'zstd'],
+          configured: ['none', 'gzip', 'zstd'],
+          baseline_requested: collectorLimits.grpc_send_compression ?? null,
+          effective_default: 'none (crates/arrowcol-dataflow-components/src/config.rs::RuntimeLimitsConfig)',
+          receiver_build_supported: ['none', 'gzip', 'zstd'],
+          consumer: 'ARROWCOL_COLLECTOR_LIMITS_CONFIG -> crates/arrowcol-dataflow-components/src/config.rs::RuntimeLimitsConfig -> crates/arrowcol-flight/src/service.rs::into_tonic_service; paired with transport.grpc_accept_compression',
+          excluded: {},
+          pending: [],
+          status: 'config-screened-not-runtime-qualified',
         },
       } } : {}),
       ...(cohort.id === 'C6' ? { source_enum_coverage: {

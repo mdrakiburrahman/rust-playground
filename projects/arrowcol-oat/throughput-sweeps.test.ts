@@ -85,7 +85,7 @@ test('covers applicable enum factors and records unsupported typed values withou
       .find(item => item.id === id)!;
   const coverage = (cohort: string) => getManifest(cohort).source_enum_coverage as Record<string, {
     accepted: string[]; configured: string[]; excluded: Record<string, string>; pending: string[]; status: string;
-    baseline_requested?: unknown; effective_default?: string; consumer?: string; client_build_supported?: string[];
+    baseline_requested?: unknown; effective_default?: string; consumer?: string; client_build_supported?: string[]; receiver_build_supported?: string[];
   }>;
   const renderWithout = (cohort: string, comparison: string, candidates: string[], paths: string[][]) =>
     candidates.map(candidate => {
@@ -152,14 +152,20 @@ test('covers applicable enum factors and records unsupported typed values withou
   assert.match(clientAndTransport.data_mode.consumer!, /ARROWCOL_CLIENT_DATA_MODE/);
   assert.equal(clientAndTransport.data_mode.status, 'config-screened-not-runtime-qualified');
   assert.deepEqual(clientAndTransport.grpc_send_compression.accepted, ['none', 'gzip', 'zstd']);
-  assert.deepEqual(clientAndTransport.grpc_send_compression.configured, []);
+  assert.deepEqual(clientAndTransport.grpc_send_compression.configured, ['none', 'gzip', 'zstd']);
   assert.deepEqual(clientAndTransport.grpc_send_compression.baseline_requested, null);
   assert.deepEqual(clientAndTransport.grpc_send_compression.client_build_supported, ['none', 'gzip', 'zstd']);
-  assert.match(clientAndTransport.grpc_send_compression.excluded.gzip!, /does not enable accept_compressed/);
+  assert.deepEqual(clientAndTransport.grpc_send_compression.excluded, {});
   assert.deepEqual(clientAndTransport.grpc_accept_compression.accepted, ['none', 'gzip', 'zstd']);
-  assert.deepEqual(clientAndTransport.grpc_accept_compression.configured, []);
+  assert.deepEqual(clientAndTransport.grpc_accept_compression.configured, ['none', 'gzip', 'zstd']);
   assert.deepEqual(clientAndTransport.grpc_accept_compression.baseline_requested, null);
-  assert.match(clientAndTransport.grpc_accept_compression.excluded.zstd!, /does not enable send_compressed/);
+  assert.deepEqual(clientAndTransport.grpc_accept_compression.excluded, {});
+  for (const field of ['grpc_receiver_accept_compression', 'grpc_receiver_send_compression']) {
+    assert.deepEqual(clientAndTransport[field].accepted, ['none', 'gzip', 'zstd']);
+    assert.deepEqual(clientAndTransport[field].configured, ['none', 'gzip', 'zstd']);
+    assert.deepEqual(clientAndTransport[field].excluded, {});
+    assert.deepEqual(clientAndTransport[field].receiver_build_supported, ['none', 'gzip', 'zstd']);
+  }
   const collectorUpload = coverage('C6').collector_upload_mode;
   assert.deepEqual(collectorUpload.configured, []);
   assert.equal(collectorUpload.baseline_requested, null);
@@ -187,6 +193,7 @@ test('renders C5 candidates against the committed seed without changing non-fact
   }, { workers: 2, streams_per_worker: 2, connections_per_worker: 1 });
   const comparisons = manifest.comparisons as Array<{
     id: string; factor: string; candidates: Array<{ id: string }>; candidate_limit: number;
+    matched_control?: string; comparison_family?: string;
   }>;
   assert.ok(comparisons.every(comparison => comparison.candidate_limit === 4 && comparison.candidates.length <= 4));
   const axisCases = [
@@ -215,6 +222,50 @@ test('renders C5 candidates against the committed seed without changing non-fact
     const baselineWithoutMode = structuredClone(baselineClient);
     delete baselineWithoutMode.data_mode;
     assert.deepEqual(client, baselineWithoutMode);
+  }
+  const grpcComparisonCases = [
+    { comparison: 'grpc-client-to-receiver', candidates: ['grpc-none', 'grpc-client-to-receiver-gzip', 'grpc-client-to-receiver-zstd'] },
+    { comparison: 'grpc-receiver-to-client', candidates: ['grpc-none', 'grpc-receiver-to-client-gzip', 'grpc-receiver-to-client-zstd'] },
+    { comparison: 'grpc-mixed-directions', candidates: ['grpc-none', 'grpc-mixed-request-gzip-response-zstd', 'grpc-mixed-request-zstd-response-gzip'] },
+  ];
+  const expectedGrpc = [
+    { comparison: 'grpc-client-to-receiver', id: 'grpc-client-to-receiver-gzip', send: 'gzip', accept: 'none', receiverAccept: 'gzip', receiverSend: 'none' },
+    { comparison: 'grpc-client-to-receiver', id: 'grpc-client-to-receiver-zstd', send: 'zstd', accept: 'none', receiverAccept: 'zstd', receiverSend: 'none' },
+    { comparison: 'grpc-receiver-to-client', id: 'grpc-receiver-to-client-gzip', send: 'none', accept: 'gzip', receiverAccept: 'none', receiverSend: 'gzip' },
+    { comparison: 'grpc-receiver-to-client', id: 'grpc-receiver-to-client-zstd', send: 'none', accept: 'zstd', receiverAccept: 'none', receiverSend: 'zstd' },
+    { comparison: 'grpc-mixed-directions', id: 'grpc-mixed-request-gzip-response-zstd', send: 'gzip', accept: 'zstd', receiverAccept: 'gzip', receiverSend: 'zstd' },
+    { comparison: 'grpc-mixed-directions', id: 'grpc-mixed-request-zstd-response-gzip', send: 'zstd', accept: 'gzip', receiverAccept: 'zstd', receiverSend: 'gzip' },
+  ];
+  const withoutGrpcSettings = (value: unknown): unknown => {
+    const config = structuredClone(value) as { tunables: Record<string, unknown> };
+    const transport = config.tunables.transport as Record<string, unknown>;
+    delete transport.grpc_send_compression;
+    delete transport.grpc_accept_compression;
+    const collector = config.tunables.collector as Record<string, unknown>;
+    const limits = collector.limits as Record<string, unknown> | undefined;
+    if (limits) {
+      delete limits.grpc_accept_compression;
+      delete limits.grpc_send_compression;
+      if (Object.keys(limits).length === 0) delete collector.limits;
+    }
+    return config;
+  };
+  const grpcBaseline = renderThroughputConfig(seed, manifest, 'grpc-client-to-receiver', 'grpc-none');
+  for (const group of grpcComparisonCases) {
+    const comparison = comparisons.find(item => item.id === group.comparison)!;
+    assert.equal(comparison.candidate_limit, 4);
+    assert.equal(comparison.matched_control, 'grpc-none');
+    assert.equal(comparison.comparison_family, 'grpc-direction');
+    assert.deepEqual(comparison.candidates.map(item => item.id), group.candidates);
+    assert.deepEqual(renderThroughputConfig(seed, manifest, group.comparison, 'grpc-none'), grpcBaseline);
+  }
+  for (const expected of expectedGrpc) {
+    const config = renderThroughputConfig(seed, manifest, expected.comparison, expected.id);
+    assert.equal(at(config, ['tunables', 'transport', 'grpc_send_compression']), expected.send);
+    assert.equal(at(config, ['tunables', 'transport', 'grpc_accept_compression']), expected.accept);
+    assert.equal(at(config, ['tunables', 'collector', 'limits', 'grpc_accept_compression']), expected.receiverAccept);
+    assert.equal(at(config, ['tunables', 'collector', 'limits', 'grpc_send_compression']), expected.receiverSend);
+    assert.deepEqual(withoutGrpcSettings(config), withoutGrpcSettings(baseline), expected.id + ' changed a non-gRPC setting');
   }
 });
 
