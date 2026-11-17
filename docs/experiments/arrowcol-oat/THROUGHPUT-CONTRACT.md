@@ -20,6 +20,8 @@ committed_new_rows/s = sum(new ingestion rows from durable commits finished in [
 
 Deduplicate by `(table identity, Delta version)`. Count only ingestion appends whose durable commit finished in the interval; exclude OPTIMIZE/other rewrites, retries, admission completions and post-window drain. Keep `arrow-deltalake::telemetry::data_commit` and OAT `runner_commit_evidence::commit_window_output` as the primary output series. Keep offered, admitted, committed-window and drain rates separate. Committed-window rate is not unique-delivery proof; report unique delivery as UNKNOWN unless independently established.
 
+`delta.commit.input_bytes` counts logical uncompressed Arrow slice bytes for newly committed files, excluding unused capacity. It is process-wide; derive per-window table rates from commit events. Reconciled ambiguous commits lack byte attribution, so do not treat the counter as complete when such events occur.
+
 Use only bounded metric dimensions: `run`, `variant`, `component`, and the fixed `stage` enumeration. Never add row, publication, file, table-version, or other per-event IDs as metric labels. The stage names are `collect`, `build`, `sort`, `encode`, `upload`, and `commit`. Preserve sample counts and histogram bounds; missing, censored, or unmeasured values are null/UNKNOWN, never a success-shaped zero. Report requested and effective configuration separately.
 
 `crates/arrowcol-dataflow-components/src/metrics.rs` defines the shared `PipelineStage` and `StageMetrics` recorder surface. The initial recorder is a compile-time stub; L4 binds it to the OTel instruments, and L1a/L1b/L2 use the same fixed stage API.
