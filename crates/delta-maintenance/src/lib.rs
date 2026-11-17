@@ -8,9 +8,9 @@ use anyhow::{Context, Result, bail};
 use arrow_deltalake::delta::DeltaTable;
 use arrow_deltalake::maintenance::{
     DEFAULT_OPTIMIZE_UPLOAD_BUFFER_BYTES, Granularity, MaintenanceControl, MaintenanceError, MaintenanceErrorKind,
-    MaintenancePlan, MaintenanceReport, NegativeProbeConfig, OptimizeConfig, OptimizePlan, Outcome, PassProbeInventory,
-    ProbeOperation, PruneConfig, PurgeConfig, TableFingerprint, VacuumConfig, attach_error_report, error_details,
-    error_report, now_ms,
+    MaintenanceMetadata, MaintenancePlan, MaintenanceReport, NegativeProbeConfig, OptimizeConfig, OptimizePlan,
+    Outcome, PassProbeInventory, ProbeOperation, PruneConfig, PurgeConfig, TableFingerprint, VacuumConfig,
+    attach_error_report, error_details, error_report, now_ms,
 };
 use arrowcol_props::{PropValue, ResolvedProps, resolve};
 use serde::Serialize;
@@ -1604,6 +1604,186 @@ mod target_readback_tests {
         Ok(())
     }
 
+    struct AdvancingTarget {
+        table: DiscoveredTable,
+        on_clock: bool,
+        fail_refresh: bool,
+        advanced: AtomicBool,
+    }
+
+    impl AdvancingTarget {
+        fn advance(&self) -> Result<()> {
+            if self.advanced.swap(true, Ordering::SeqCst) {
+                return Ok(());
+            }
+            let path = self
+                .table
+                .url
+                .to_file_path()
+                .map_err(|()| anyhow::anyhow!("table path"))?
+                .join("_delta_log/00000000000000000000.json");
+            let original = std::fs::read_to_string(&path)?;
+            let mut actions = original
+                .lines()
+                .map(serde_json::from_str::<serde_json::Value>)
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            for action in &mut actions {
+                if let Some(metadata) = action.get_mut("metaData") {
+                    metadata["id"] = serde_json::json!("replacement-table-id");
+                }
+            }
+            let replacement = if self.fail_refresh {
+                String::from("invalid metadata JSON\n")
+            } else {
+                actions
+                    .iter()
+                    .map(serde_json::to_string)
+                    .collect::<std::result::Result<Vec<_>, _>>()?
+                    .join("\n")
+                    + "\n"
+            };
+            std::fs::write(path, replacement)?;
+            Ok(())
+        }
+    }
+
+    impl TableDiscovery for AdvancingTarget {
+        fn tables(&self) -> Result<Vec<String>> {
+            Ok(vec![self.table.name.clone()])
+        }
+
+        fn table(&self, _name: &str) -> Result<DiscoveredTable> {
+            Ok(self.table.clone())
+        }
+
+        fn maintenance_now_ms(&self) -> Result<i64> {
+            if self.on_clock {
+                self.advance()?;
+            }
+            Ok(1_704_067_380_000)
+        }
+    }
+
+    fn stale_target_case(in_setup: bool, fail_refresh: bool) -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let url = Url::from_directory_path(root.path().join("events")).map_err(|()| anyhow::anyhow!("table URL"))?;
+        DeltaTable::initialize_url_for_bootstrap(
+            url.clone(),
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+            Vec::new(),
+        )?;
+        let source = AdvancingTarget {
+            table: DiscoveredTable {
+                name: "telemetry.sqlserver.events".into(),
+                url: url.clone(),
+                properties: BTreeMap::new(),
+                log_token: None,
+            },
+            on_clock: !in_setup,
+            fail_refresh,
+            advanced: AtomicBool::new(false),
+        };
+        let settings = Settings {
+            root: url,
+            tables: vec![source.table.name.clone()],
+            operations: vec![Operation::Checkpoint],
+            apply: false,
+            interval: None,
+            max_idle_backoff: Duration::from_secs(300),
+            max_cycles: None,
+            max_consecutive_stale_plans: 8,
+            max_concurrent_tables: 1,
+            max_concurrent_decoded_bytes: None,
+            operation_timeout: Duration::from_secs(30),
+            commit_attempts: 8,
+            commit_budget: Duration::from_secs(10),
+            catalog_options: Default::default(),
+            granularity: Some(Granularity::Minute),
+            purge_retention_ms: None,
+            anchor_ms: in_setup.then_some(1_704_067_380_000),
+            vacuum_retention_ms: 604_800_000,
+            allow_short_vacuum_retention: false,
+            unsafe_short_vacuum_for_tests: false,
+            optimize: OptimizeConfig::default(),
+            process_properties: BTreeMap::new(),
+            checkpoint_every_commits: 100,
+            log_retention_ms: None,
+            max_prune_files: 100,
+            operation_limits: Default::default(),
+        };
+        let metrics = Metrics::new();
+        let cancel = Arc::new(AtomicBool::new(false));
+        if in_setup {
+            metrics.target_tables(&source.tables()?, &source)?;
+            let schedule = Mutex::new(BTreeMap::new());
+            std::thread::scope(|scope| -> Result<()> {
+                let held = schedule.lock().map_err(|_| anyhow::anyhow!("test schedule lock"))?;
+                let worker = scope.spawn(|| {
+                    maintain_table(
+                        &settings,
+                        &source,
+                        &source.table.name,
+                        &cancel,
+                        &|_| {},
+                        Some(&schedule),
+                        &metrics,
+                    )
+                });
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while target(&metrics)?["state"] != "resolved" {
+                    if Instant::now() >= deadline {
+                        bail!("setup never published initial identity");
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                source.advance()?;
+                drop(held);
+                let results = worker
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("test maintenance worker panicked"))?;
+                assert_eq!(results.len(), 1);
+                assert_eq!(results[0].error_kind.is_some(), fail_refresh);
+                Ok(())
+            })?;
+        } else {
+            let results = run_cycle_with_discovery(&settings, &source, &metrics, &cancel)?;
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].error_kind.is_some(), fail_refresh);
+        }
+        assert!(
+            source.advanced.load(Ordering::SeqCst),
+            "witness must advance the actual table"
+        );
+        let readback = target(&metrics)?;
+        assert_eq!(
+            readback["state"],
+            if fail_refresh { "unresolved" } else { "conflicting" }
+        );
+        assert!(readback.get("normalized_root").is_none());
+        assert!(readback.get("delta_table_id").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn stale_target_setup_latches_new_metadata_identity() -> Result<()> {
+        stale_target_case(true, false)
+    }
+
+    #[test]
+    fn stale_target_setup_failed_refresh_is_unresolved() -> Result<()> {
+        stale_target_case(true, true)
+    }
+
+    #[test]
+    fn stale_target_operation_latches_new_metadata_identity() -> Result<()> {
+        stale_target_case(false, false)
+    }
+
+    #[test]
+    fn stale_target_operation_failed_refresh_is_unresolved() -> Result<()> {
+        stale_target_case(false, true)
+    }
+
     #[test]
     fn health_route_serializes_target_state_as_json() -> Result<()> {
         let metrics = Metrics::new();
@@ -2142,6 +2322,14 @@ fn retry_stale_table_discovery<T>(table: &str, mut discover: impl FnMut() -> Res
     }
 }
 
+fn refresh_target_metadata(
+    _metrics: &Metrics,
+    _name: &str,
+    read: impl FnOnce() -> Result<MaintenanceMetadata>,
+) -> Result<MaintenanceMetadata> {
+    read()
+}
+
 fn maintain_table(
     settings: &Settings,
     discovery: &dyn TableDiscovery,
@@ -2203,10 +2391,15 @@ fn maintain_table(
         if discovered.log_token.as_ref().is_none_or(|previous| *previous != token) {
             let current_properties = match metadata.filter(|metadata| metadata.log_token == token) {
                 Some(metadata) => metadata.properties,
-                None => probe.maintenance_properties_with_limits(
-                    limits.discovery_max_log_files,
-                    limits.discovery_max_log_file_bytes,
-                )?,
+                None => {
+                    refresh_target_metadata(metrics, name, || {
+                        probe.maintenance_metadata_with_limits(
+                            limits.discovery_max_log_files,
+                            limits.discovery_max_log_file_bytes,
+                        )
+                    })?
+                    .properties
+                }
             };
             if !policy_matches(settings, &current_properties, &props)? {
                 bail!("table properties changed after discovery; retry");
@@ -2264,10 +2457,13 @@ fn maintain_table(
                     if observed_token.as_ref().is_some_and(|previous| *previous != token)
                         && !policy_matches(
                             settings,
-                            &probe.maintenance_properties_with_limits(
-                                settings.operation_limits.discovery_max_log_files,
-                                settings.operation_limits.discovery_max_log_file_bytes,
-                            )?,
+                            &refresh_target_metadata(metrics, name, || {
+                                probe.maintenance_metadata_with_limits(
+                                    settings.operation_limits.discovery_max_log_files,
+                                    settings.operation_limits.discovery_max_log_file_bytes,
+                                )
+                            })?
+                            .properties,
                             props,
                         )?
                     {
