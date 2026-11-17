@@ -3,7 +3,7 @@ use std::error::Error;
 use arrowcol_protocol::{
     CATALOG_METADATA_KEY, CLAIMED_SCHEMA_FINGERPRINT_METADATA_KEY, IMPLEMENTATION_POOL_METADATA_KEY,
     ImplementationPool, IngestMetadata, MetadataParseError, PROTOCOL_VERSION_METADATA_KEY, RawGrpcMetadata,
-    SCHEMA_METADATA_KEY, TABLE_METADATA_KEY,
+    SCHEMA_METADATA_KEY, SHARD_INDEX_METADATA_KEY, TABLE_METADATA_KEY,
 };
 
 const FINGERPRINT: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
@@ -15,6 +15,7 @@ fn valid_raw() -> RawGrpcMetadata<'static> {
         catalog: Some("telemetry"),
         schema: Some("prod"),
         table: Some("traces"),
+        shard_index: None,
         claimed_schema_fingerprint: Some(FINGERPRINT),
     }
 }
@@ -31,11 +32,38 @@ fn parses_and_reencodes_canonical_metadata() -> Result<(), Box<dyn Error>> {
     assert_eq!(pairs[2], (CATALOG_METADATA_KEY, "telemetry".to_owned()));
     assert_eq!(pairs[3], (SCHEMA_METADATA_KEY, "prod".to_owned()));
     assert_eq!(pairs[4], (TABLE_METADATA_KEY, "traces".to_owned()));
+    assert_eq!(pairs[5], (SHARD_INDEX_METADATA_KEY, "0".to_owned()));
     assert_eq!(
-        pairs[5],
+        pairs[6],
         (CLAIMED_SCHEMA_FINGERPRINT_METADATA_KEY, FINGERPRINT.to_owned())
     );
     Ok(())
+}
+
+#[test]
+fn shard_index_defaults_to_zero_and_requires_canonical_unsigned_ascii_decimal() {
+    assert_eq!(
+        IngestMetadata::parse(valid_raw()).expect("metadata without a shard header is valid").shard_index(),
+        0
+    );
+
+    let mut valid = valid_raw();
+    valid.shard_index = Some("31");
+    let parsed = IngestMetadata::parse(valid).expect("canonical shard index is valid");
+    assert_eq!(parsed.shard_index(), 31);
+    assert_eq!(parsed.to_ascii_pairs()[5], (SHARD_INDEX_METADATA_KEY, "31".to_owned()));
+
+    for value in ["", "+1", "-1", " 1", "1 ", "01", "١", "256"] {
+        let mut malformed = valid_raw();
+        malformed.shard_index = Some(value);
+        assert!(matches!(
+            IngestMetadata::parse(malformed),
+            Err(MetadataParseError::Malformed {
+                key: SHARD_INDEX_METADATA_KEY,
+                ..
+            })
+        ), "accepted malformed shard index {value:?}");
+    }
 }
 
 #[test]

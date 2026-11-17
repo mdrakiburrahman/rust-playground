@@ -14,6 +14,8 @@ pub const CATALOG_METADATA_KEY: &str = "x-arrowcol-catalog";
 pub const SCHEMA_METADATA_KEY: &str = "x-arrowcol-schema";
 /// gRPC metadata key carrying the table component.
 pub const TABLE_METADATA_KEY: &str = "x-arrowcol-table";
+/// gRPC metadata key carrying the zero-based routing shard.
+pub const SHARD_INDEX_METADATA_KEY: &str = "x-arrowcol-shard";
 /// gRPC metadata key carrying the client's untrusted schema fingerprint claim.
 pub const CLAIMED_SCHEMA_FINGERPRINT_METADATA_KEY: &str = "x-arrowcol-schema-fingerprint";
 /// Absolute bound applied before parsing any Arrow collector metadata value.
@@ -24,6 +26,8 @@ pub const MAX_PROTOCOL_VERSION_METADATA_VALUE_BYTES: usize = 16;
 pub const MAX_IMPLEMENTATION_POOL_METADATA_VALUE_BYTES: usize = 16;
 /// Maximum catalog, schema, or table metadata value length.
 pub const MAX_IDENTITY_METADATA_VALUE_BYTES: usize = MAX_IDENTITY_COMPONENT_BYTES;
+/// Maximum canonical unsigned-decimal shard-index metadata value length.
+pub const MAX_SHARD_INDEX_METADATA_VALUE_BYTES: usize = 3;
 /// Maximum canonical claimed-fingerprint metadata value length.
 pub const MAX_CLAIMED_SCHEMA_FINGERPRINT_METADATA_VALUE_BYTES: usize = 71;
 
@@ -43,6 +47,8 @@ pub struct RawGrpcMetadata<'a> {
     pub schema: Option<&'a str>,
     /// Raw table metadata.
     pub table: Option<&'a str>,
+    /// Raw zero-based shard metadata.
+    pub shard_index: Option<&'a str>,
     /// Raw, untrusted schema fingerprint claim.
     pub claimed_schema_fingerprint: Option<&'a str>,
 }
@@ -53,6 +59,7 @@ pub struct IngestMetadata {
     protocol_version: ProtocolVersion,
     implementation_pool: ImplementationPool,
     table: TableIdentity,
+    shard_index: u8,
     claimed_schema_fingerprint: ClaimedSchemaFingerprint,
 }
 
@@ -69,6 +76,25 @@ impl IngestMetadata {
             protocol_version,
             implementation_pool,
             table,
+            shard_index: 0,
+            claimed_schema_fingerprint,
+        }
+    }
+
+    /// Creates metadata from validated contract values and a zero-based shard index.
+    #[must_use]
+    pub const fn new_with_shard_index(
+        protocol_version: ProtocolVersion,
+        implementation_pool: ImplementationPool,
+        table: TableIdentity,
+        shard_index: u8,
+        claimed_schema_fingerprint: ClaimedSchemaFingerprint,
+    ) -> Self {
+        Self {
+            protocol_version,
+            implementation_pool,
+            table,
+            shard_index,
             claimed_schema_fingerprint,
         }
     }
@@ -129,6 +155,30 @@ impl IngestMetadata {
             reason: "invalid table identity",
         })?;
 
+        let shard_index = match raw.shard_index {
+            None => 0,
+            Some(value) => {
+                let value = required(
+                    SHARD_INDEX_METADATA_KEY,
+                    Some(value),
+                    MAX_SHARD_INDEX_METADATA_VALUE_BYTES,
+                )?;
+                if value.is_empty()
+                    || !value.bytes().all(|byte| byte.is_ascii_digit())
+                    || (value.len() > 1 && value.starts_with('0'))
+                {
+                    return Err(MetadataParseError::Malformed {
+                        key: SHARD_INDEX_METADATA_KEY,
+                        reason: "expected canonical unsigned decimal",
+                    });
+                }
+                value.parse().map_err(|_| MetadataParseError::Malformed {
+                    key: SHARD_INDEX_METADATA_KEY,
+                    reason: "shard index exceeds the supported integer range",
+                })?
+            }
+        };
+
         let claimed_schema_fingerprint = required(
             CLAIMED_SCHEMA_FINGERPRINT_METADATA_KEY,
             raw.claimed_schema_fingerprint,
@@ -144,6 +194,7 @@ impl IngestMetadata {
             protocol_version,
             implementation_pool: pool,
             table: TableIdentity::new(catalog, schema, table),
+            shard_index,
             claimed_schema_fingerprint,
         })
     }
@@ -166,6 +217,12 @@ impl IngestMetadata {
         &self.table
     }
 
+    /// Returns the validated zero-based shard index.
+    #[must_use]
+    pub const fn shard_index(&self) -> u8 {
+        self.shard_index
+    }
+
     /// Returns the client's untrusted schema fingerprint claim.
     #[must_use]
     pub const fn claimed_schema_fingerprint(&self) -> ClaimedSchemaFingerprint {
@@ -174,13 +231,14 @@ impl IngestMetadata {
 
     /// Encodes this validated contract as canonical ASCII gRPC metadata pairs.
     #[must_use]
-    pub fn to_ascii_pairs(&self) -> [(&'static str, String); 6] {
+    pub fn to_ascii_pairs(&self) -> [(&'static str, String); 7] {
         [
             (PROTOCOL_VERSION_METADATA_KEY, self.protocol_version.to_string()),
             (IMPLEMENTATION_POOL_METADATA_KEY, self.implementation_pool.to_string()),
             (CATALOG_METADATA_KEY, self.table.catalog().to_string()),
             (SCHEMA_METADATA_KEY, self.table.schema().to_string()),
             (TABLE_METADATA_KEY, self.table.table().to_string()),
+            (SHARD_INDEX_METADATA_KEY, self.shard_index.to_string()),
             (
                 CLAIMED_SCHEMA_FINGERPRINT_METADATA_KEY,
                 self.claimed_schema_fingerprint.to_string(),
