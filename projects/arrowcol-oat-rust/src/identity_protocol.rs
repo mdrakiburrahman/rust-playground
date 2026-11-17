@@ -44,6 +44,74 @@ pub struct Frame {
     pub payload: Vec<u8>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Phase {
+    Ready,
+    Snapshot,
+    Identities,
+    Terminal,
+    Failed,
+}
+
+/// Output ordering and row admission only; a terminal frame is not a successful verdict.
+pub struct OutputOrder {
+    phase: Phase,
+    rows: u64,
+    max_rows: u64,
+}
+
+impl OutputOrder {
+    /// Construct a finite row bound before processing any output.
+    ///
+    /// # Errors
+    /// Rejects zero or unlimited bounds.
+    pub fn new(max_rows: u64) -> io::Result<Self> {
+        if max_rows == 0 || max_rows == u64::MAX {
+            return Err(io::Error::new(ErrorKind::InvalidInput, "invalid identity row limit"));
+        }
+        Ok(Self {
+            phase: Phase::Ready,
+            rows: 0,
+            max_rows,
+        })
+    }
+
+    /// Admit the next frame without deduplicating identities.
+    ///
+    /// # Errors
+    /// Rejects unexpected, duplicate, or out-of-order frames and excess rows.
+    pub fn accept(&mut self, kind: FrameKind) -> io::Result<()> {
+        match (self.phase, kind) {
+            (Phase::Ready, FrameKind::Ready) => self.phase = Phase::Snapshot,
+            (Phase::Snapshot, FrameKind::Snapshot) => self.phase = Phase::Identities,
+            (Phase::Identities, FrameKind::Identity) => {
+                if self.rows == self.max_rows {
+                    self.phase = Phase::Failed;
+                    return Err(io::Error::new(ErrorKind::InvalidData, "identity row budget exhausted"));
+                }
+                self.rows += 1;
+            }
+            (Phase::Identities, FrameKind::Terminal) => self.phase = Phase::Terminal,
+            _ => {
+                self.phase = Phase::Failed;
+                return Err(io::Error::new(ErrorKind::InvalidData, "unexpected identity frame"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Complete framing after actual EOF, returning only the provisional row count.
+    ///
+    /// # Errors
+    /// Rejects EOF before a terminal frame.
+    pub fn finish_eof(self) -> io::Result<u64> {
+        if self.phase != Phase::Terminal {
+            return Err(io::Error::new(ErrorKind::UnexpectedEof, "identity stream ended before terminal frame"));
+        }
+        Ok(self.rows)
+    }
+}
+
 impl fmt::Debug for Frame {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -187,5 +255,39 @@ mod tests {
         let frame = Frame { kind: FrameKind::Request, payload: b"private-token".to_vec() };
         let debug = format!("{frame:?}");
         assert_eq!(debug, "Frame { kind: Request, payload_len: 13 }");
+    }
+
+    #[test]
+    fn output_order_rejects_missing_extra_and_excess_rows() -> io::Result<()> {
+        let mut order = OutputOrder::new(2)?;
+        order.accept(FrameKind::Ready)?;
+        order.accept(FrameKind::Snapshot)?;
+        order.accept(FrameKind::Identity)?;
+        order.accept(FrameKind::Identity)?;
+        order.accept(FrameKind::Terminal)?;
+        assert_eq!(order.finish_eof()?, 2);
+        let mut extra = OutputOrder::new(1)?;
+        extra.accept(FrameKind::Ready)?;
+        extra.accept(FrameKind::Snapshot)?;
+        extra.accept(FrameKind::Terminal)?;
+        assert!(extra.accept(FrameKind::Identity).is_err());
+        assert!(extra.finish_eof().is_err());
+        let mut excessive = OutputOrder::new(1)?;
+        excessive.accept(FrameKind::Ready)?;
+        excessive.accept(FrameKind::Snapshot)?;
+        excessive.accept(FrameKind::Identity)?;
+        assert!(excessive.accept(FrameKind::Identity).is_err());
+        assert!(excessive.accept(FrameKind::Terminal).is_err());
+        assert!(excessive.finish_eof().is_err());
+        let mut unordered = OutputOrder::new(1)?;
+        assert!(unordered.accept(FrameKind::Identity).is_err());
+        assert!(unordered.finish_eof().is_err());
+        let mut incomplete = OutputOrder::new(1)?;
+        incomplete.accept(FrameKind::Ready)?;
+        incomplete.accept(FrameKind::Snapshot)?;
+        assert!(incomplete.finish_eof().is_err());
+        assert!(OutputOrder::new(0).is_err());
+        assert!(OutputOrder::new(u64::MAX).is_err());
+        Ok(())
     }
 }
