@@ -384,7 +384,8 @@ test('real raw POST/GET identity crosses Rust immutable publication, custody and
     assert.notEqual(matched.original.reference.effective_config_sha256, hash(exactBytes));
     assert.equal(matched.original.startMs, 1_000);
     assert.equal(matched.original.endMs, 31_000);
-    assert.equal(matched.original.committedRowsPerSecond, null);
+    assert.equal(matched.original.committedRowsPerSecond, 0);
+    assert.ok(matched.original.unavailableReasons.includes('original_official_cell_did_not_succeed'));
     assert.match(matched.authorization, /hold/);
     const otherBytes = Buffer.from(proof.cases.find(other => other !== entry)!.submitted_config_body, 'utf8');
     const mismatch = await readOfficialNativeWindow({ ...f.options, submittedConfigBytes: otherBytes });
@@ -397,14 +398,18 @@ test('real raw POST/GET identity crosses Rust immutable publication, custody and
 });
 
 test('immutable measurement reader uses selected authenticated storage and cannot authorize an unpaired scale trial', async t => {
-  const f = syntheticAuthenticatedTransport(t), observed = await f.read();
+  const f = syntheticAuthenticatedTransport(t), raw = Buffer.from('{"synthetic_offline_accepted_submission":true}');
+  f.document.submitted_config_sha256 = hash(raw);
+  f.inventory.official_measurement!.submitted_config_sha256 = hash(raw);
+  f.publishSyntheticDocument();
+  const options = { ...f.options, submittedConfigBytes: raw }, observed = await readOfficialCellMeasurement(options);
   assert.equal(observed.committedRowsPerSecond, 1234);
-  assert.deepEqual(observed.unavailableReasons, ['submitted_config_bytes_unavailable']);
+  assert.deepEqual(observed.unavailableReasons, []);
   assert.deepEqual(f.counts(), { reads: 1, tokenReads: 1 });
   const envelope: ScaleMeasurementEnvelope = { schema_version: 2, campaign_id: campaignId, cell_run_id: cellId,
     observed_at_ms: observed.endMs!, window_ms: observed.endMs! - observed.startMs!,
     measurement: { committedRowsPerSecond: 1234, qapPendingBacklog: null } };
-  const verifier = createScaleEvidenceVerifier(f.options), window = { startMs: observed.startMs!, endMs: observed.endMs!,
+  const verifier = createScaleEvidenceVerifier(options), window = { startMs: observed.startMs!, endMs: observed.endMs!,
     notBeforeMs: observed.startMs!, deadlineAtMs: f.options.deadlineAtMs };
   await assert.rejects(verifier.verifyMeasurement(envelope, f.state, window), /paired baseline\/trial cell custody/);
   for (const invalid of [{ ...window, startMs: window.startMs + 1 }, { ...window, endMs: window.endMs - 1 },
