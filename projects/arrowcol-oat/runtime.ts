@@ -110,9 +110,9 @@ export function validateRuntime(input: unknown, allowUnpublishedImages = false):
   if (Object.hasOwn(c, 'resources')) validateResources(c.resources, scaleOut);
   if (scaleOut) {
     if (c.hotTable !== 'sqlserver_availability_replica_states' || c.quiver !== false ||
-        !Number.isSafeInteger(c.collectorReplicas) || c.collectorReplicas! < 1 || c.collectorReplicas! > 16 ||
+        c.collectorReplicas !== 1 ||
         c.routerReplicas !== c.collectorReplicas)
-      throw new Error('scale-out requires the approved hot table, memory-only buffering, and matching 1..16 collector/router replicas');
+      throw new Error('scale-out requires the approved hot table, memory-only buffering, and exactly one collector/router replica');
     const maintenance = c.maintenance;
     const requiredOperations = ['optimize', 'checkpoint', 'purge', 'vacuum', 'prune-log'];
     if (!maintenance || maintenance.apply !== true || !Array.isArray(maintenance.tables) ||
