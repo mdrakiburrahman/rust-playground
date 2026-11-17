@@ -1018,7 +1018,7 @@ trait Platform: Send + Sync {
         Ok((self.router_metrics_endpoint(config)?, false))
     }
     fn qap_endpoint(&self, config: &OatConfig) -> String;
-    async fn ensure_stack(&mut self, config: &OatConfig, orchestration_run_id: &str) -> Result<()>;
+    async fn ensure_stack(&mut self, config: &OatConfig, orchestration_run_id: &str, replicas: u32) -> Result<()>;
     async fn scale_arrowcols(&mut self, config: &OatConfig, replicas: u32, concurrency: u32) -> Result<()>;
     async fn initialize_run_table_pins(
         &mut self,
@@ -1271,8 +1271,8 @@ impl Platform for AksPlatform {
         config.qap_endpoint.clone()
     }
 
-    async fn ensure_stack(&mut self, config: &OatConfig, orchestration_run_id: &str) -> Result<()> {
-        prepare_aks_platform(config, self, orchestration_run_id).await?;
+    async fn ensure_stack(&mut self, config: &OatConfig, orchestration_run_id: &str, replicas: u32) -> Result<()> {
+        prepare_aks_platform(config, self, orchestration_run_id, replicas).await?;
         if let Some(overlay) = config.platform.kustomize_overlay.as_deref() {
             apply_aks_overlay(config, overlay, self).await?;
         }
@@ -1821,7 +1821,7 @@ impl Platform for LocalPlatform {
         self.qap_url.clone().unwrap_or_else(|| config.qap_endpoint.clone())
     }
 
-    async fn ensure_stack(&mut self, config: &OatConfig, _orchestration_run_id: &str) -> Result<()> {
+    async fn ensure_stack(&mut self, config: &OatConfig, _orchestration_run_id: &str, _replicas: u32) -> Result<()> {
         self.daemon_endpoint = Some(local_docker_daemon().await?);
         prepare_local_platform(config, self).await?;
         self.refresh_endpoints(config).await
@@ -3302,7 +3302,7 @@ async fn run_isolated_cell(
     let setup_deadline = lifecycle_started_at + Duration::from_millis(timing_budget.pre_cell_setup_timeout_ms);
     let (result, cancelled) = tokio::select! {
         result = async {
-            match tokio::time::timeout_at(setup_deadline, platform.ensure_stack(&config, orchestration_id)).await {
+            match tokio::time::timeout_at(setup_deadline, platform.ensure_stack(&config, orchestration_id, replicas)).await {
                 Ok(result) => result.context("prepare isolated OAT matrix-cell platform")?,
                 Err(_) => bail!("planned pre-cell setup deadline expired; normal platform cleanup follows"),
             }
@@ -9236,10 +9236,21 @@ async fn record_campaign_namespace_uid(config: &OatConfig, platform: &AksPlatfor
     persist_campaign_inventory(platform, &next).await
 }
 
+fn set_runtime_replicas(runtime_config: &mut Value, replicas: u32) -> Result<()> {
+    if !(1..=16).contains(&replicas) {
+        bail!("AKS cell replicas must be between 1 and 16");
+    }
+    let object = runtime_config.as_object_mut().context("runtime config must be an object")?;
+    object.insert("collectorReplicas".to_owned(), json!(replicas));
+    object.insert("routerReplicas".to_owned(), json!(replicas));
+    Ok(())
+}
+
 async fn prepare_aks_platform(
     config: &OatConfig,
     platform: &mut AksPlatform,
     orchestration_run_id: &str,
+    replicas: u32,
 ) -> Result<()> {
     let parent = std::env::temp_dir().join("arrowcol-oat");
     tokio::fs::create_dir_all(&parent)
@@ -9289,6 +9300,7 @@ async fn prepare_aks_platform(
     runtime_config["quiver"] = json!(config.tunables.wal.is_some());
     runtime_config["effective_stop_budgets"] = serde_json::to_value(config.maintenance_stop_budget()?)?;
     runtime_config["resources"] = serde_json::to_value(config.effective_aks_resources())?;
+    set_runtime_replicas(&mut runtime_config, replicas)?;
     runtime_config["collectorWorkers"] = json!(
         config
             .dfe_worker_concurrency
@@ -13512,6 +13524,21 @@ mod tests {
                 .as_deref()
                 .is_some_and(|failure| failure.contains("fixture cleanup failure"))
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn aks_runtime_projects_exact_cell_replicas() -> Result<()> {
+        for replicas in [1, 2, 16] {
+            let mut runtime = json!({"collectorReplicas":7,"routerReplicas":8,"other":"retained"});
+            set_runtime_replicas(&mut runtime, replicas)?;
+            assert_eq!(runtime["collectorReplicas"], replicas);
+            assert_eq!(runtime["routerReplicas"], replicas);
+            assert_eq!(runtime["other"], "retained");
+        }
+        assert!(set_runtime_replicas(&mut json!({}), 0).is_err());
+        assert!(set_runtime_replicas(&mut json!({}), 17).is_err());
+        assert!(set_runtime_replicas(&mut Value::Null, 1).is_err());
         Ok(())
     }
 

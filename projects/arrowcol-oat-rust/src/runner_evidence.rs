@@ -2068,7 +2068,7 @@ mod downstream_runner_tests {
         fn qap_endpoint(&self, _: &OatConfig) -> String {
             self.endpoint.clone()
         }
-        async fn ensure_stack(&mut self, _: &OatConfig, _: &str) -> Result<()> {
+        async fn ensure_stack(&mut self, _: &OatConfig, _: &str, _: u32) -> Result<()> {
             Ok(())
         }
         async fn scale_arrowcols(&mut self, _: &OatConfig, _: u32, _: u32) -> Result<()> {

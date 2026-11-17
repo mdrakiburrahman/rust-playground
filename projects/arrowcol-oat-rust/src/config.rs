@@ -987,13 +987,13 @@ impl OatConfig {
         if self.rows_per_table == 0 || self.rows_per_table > 1_000_000 || !(1..=64).contains(&self.dmv_concurrency) {
             bail!("rows_per_table must be 1..=1000000 and dmv_concurrency 1..=64");
         }
-        if !(1..=4).contains(&self.clients_per_table)
+        if !(1..=128).contains(&self.clients_per_table)
             || self
                 .clients_per_table
                 .checked_mul(self.tables.len())
                 .is_none_or(|total| total > 128)
         {
-            bail!("clients_per_table must be between 1 and 4 and the client fleet may not exceed 128");
+            bail!("clients_per_table must be between 1 and 128 and the client fleet may not exceed 128");
         }
         let qap_endpoint = Url::parse(&self.qap_endpoint).context("qap_endpoint must be a URL")?;
         if !matches!(qap_endpoint.scheme(), "http" | "https")
@@ -1887,6 +1887,26 @@ mod tests {
             config.validate().is_err(),
             "a pin expiring before the bounded Job lifetime must be rejected"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn client_fleet_is_bounded_across_tables() -> Result<()> {
+        let mut config = valid();
+        assert_eq!(config.clients_per_table, 1);
+        config.clients_per_table = 64;
+        config.validate()?;
+        config.clients_per_table = 65;
+        assert!(config.validate().is_err());
+        config.tables.truncate(1);
+        config.clients_per_table = 128;
+        config.validate()?;
+        config.clients_per_table = 129;
+        assert!(config.validate().is_err());
+        config.clients_per_table = 0;
+        assert!(config.validate().is_err());
+        config.clients_per_table = usize::MAX;
+        assert!(config.validate().is_err());
         Ok(())
     }
 

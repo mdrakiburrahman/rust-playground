@@ -725,7 +725,7 @@ mod overload_guard_tests {
         let mut receipt = json!({"run_id":run_id,"classification":"unscored_no_load_lifecycle",
             "workload_clients":0,"schedule_armed":false});
         let result = async {
-            platform.ensure_stack(&config, &run_id).await?;
+            platform.ensure_stack(&config, &run_id, 1).await?;
             let before = platform
                 .process_logs_for_role(&config, ComponentRole::Collector)
                 .await?;
