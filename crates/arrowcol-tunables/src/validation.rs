@@ -2540,9 +2540,12 @@ mod tests {
     #[test]
     fn shard_count_rejects_out_of_range_and_non_numeric_oat_values() {
         for value in [serde_json::json!(0), serde_json::json!(33)] {
-            assert!(Tunables::parse_oat_json(serde_json::json!({
-                "router": { "shard_count": value }
-            })).is_err());
+            assert!(
+                Tunables::parse_oat_json(serde_json::json!({
+                    "router": { "shard_count": value }
+                }))
+                .is_err()
+            );
         }
         for value in [
             serde_json::json!(-1),
@@ -2550,9 +2553,12 @@ mod tests {
             serde_json::json!("4"),
             serde_json::json!(256),
         ] {
-            assert!(Tunables::parse_oat_json(serde_json::json!({
-                "router": { "shard_count": value }
-            })).is_err());
+            assert!(
+                Tunables::parse_oat_json(serde_json::json!({
+                    "router": { "shard_count": value }
+                }))
+                .is_err()
+            );
         }
     }
 

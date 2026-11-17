@@ -72,7 +72,15 @@ impl ProductionRouter {
         upstream: UpstreamConfig,
         metrics: RouterMetrics,
     ) -> Self {
-        Self::new_with_shard_count(routing, authenticator, edge_verifier, internal_signer, upstream, metrics, 1)
+        Self::new_with_shard_count(
+            routing,
+            authenticator,
+            edge_verifier,
+            internal_signer,
+            upstream,
+            metrics,
+            1,
+        )
     }
 
     /// Creates the proxy application with its configured number of routing shards.

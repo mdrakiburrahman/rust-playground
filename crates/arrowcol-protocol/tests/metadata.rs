@@ -43,7 +43,9 @@ fn parses_and_reencodes_canonical_metadata() -> Result<(), Box<dyn Error>> {
 #[test]
 fn shard_index_defaults_to_zero_and_requires_canonical_unsigned_ascii_decimal() {
     assert_eq!(
-        IngestMetadata::parse(valid_raw()).expect("metadata without a shard header is valid").shard_index(),
+        IngestMetadata::parse(valid_raw())
+            .expect("metadata without a shard header is valid")
+            .shard_index(),
         0
     );
 
@@ -56,13 +58,16 @@ fn shard_index_defaults_to_zero_and_requires_canonical_unsigned_ascii_decimal() 
     for value in ["", "+1", "-1", " 1", "1 ", "01", "١", "256"] {
         let mut malformed = valid_raw();
         malformed.shard_index = Some(value);
-        assert!(matches!(
-            IngestMetadata::parse(malformed),
-            Err(MetadataParseError::Malformed {
-                key: SHARD_INDEX_METADATA_KEY,
-                ..
-            })
-        ), "accepted malformed shard index {value:?}");
+        assert!(
+            matches!(
+                IngestMetadata::parse(malformed),
+                Err(MetadataParseError::Malformed {
+                    key: SHARD_INDEX_METADATA_KEY,
+                    ..
+                })
+            ),
+            "accepted malformed shard index {value:?}"
+        );
     }
 }
 

@@ -415,11 +415,7 @@ fn apply_environment_overrides(
         "ARROWCOL_ROUTER_DISTINCT_TABLE_OWNERS",
         bool
     );
-    set_from_env!(
-        &mut config.routing.shard_count,
-        "ARROWCOL_ROUTER_SHARD_COUNT",
-        u8
-    );
+    set_from_env!(&mut config.routing.shard_count, "ARROWCOL_ROUTER_SHARD_COUNT", u8);
     set_from_env!(
         &mut config.auth.edge_replay_max_nonces,
         "ARROWCOL_ROUTER_EDGE_REPLAY_MAX_NONCES",
