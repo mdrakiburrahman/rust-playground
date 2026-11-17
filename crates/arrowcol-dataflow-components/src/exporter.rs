@@ -2957,30 +2957,42 @@ mod tests {
             age_flush_policy: arrowcol_tunables::AgeFlushPolicy::DrainReady,
             ..aged_backlog_policy()
         };
-        for capped in [
-            FileBatchConfig {
-                max_batches_per_flush: 8,
-                ..policy.clone()
-            },
-            FileBatchConfig {
-                max_rows_per_flush: 16,
-                ..policy.clone()
-            },
-            FileBatchConfig {
-                max_arrow_memory_per_flush: 8 * 42,
-                ..policy.clone()
-            },
-            FileBatchConfig {
-                adaptive_file: crate::config::AdaptiveFileConfig {
-                    min_input_bytes: 8 * 42,
-                    max_input_bytes: 8 * 42,
-                    ..policy.adaptive_file
+        for (capped, expected) in [
+            (
+                FileBatchConfig {
+                    max_batches_per_flush: 8,
+                    ..policy.clone()
                 },
-                ..policy.clone()
-            },
+                vec![2, 16, 16, 16, 16],
+            ),
+            (
+                FileBatchConfig {
+                    max_rows_per_flush: 16,
+                    ..policy.clone()
+                },
+                vec![2, 16, 16, 16, 16],
+            ),
+            (
+                FileBatchConfig {
+                    max_arrow_memory_per_flush: 1,
+                    ..policy.clone()
+                },
+                vec![2; 33],
+            ),
+            (
+                FileBatchConfig {
+                    adaptive_file: crate::config::AdaptiveFileConfig {
+                        min_input_bytes: 1,
+                        max_input_bytes: 1,
+                        ..policy.adaptive_file
+                    },
+                    ..policy.clone()
+                },
+                vec![2; 33],
+            ),
         ] {
             let (rows, _) = aged_backlog_fixture(capped, 32, BacklogBoundary::None).await;
-            assert_eq!(rows, [2, 16, 16, 16, 16], "each existing cap still ends collection");
+            assert_eq!(rows, expected, "each existing cap still ends collection");
         }
         for boundary in [BacklogBoundary::Explicit, BacklogBoundary::Schema] {
             let (rows, versions) = aged_backlog_fixture(policy.clone(), 32, boundary).await;
