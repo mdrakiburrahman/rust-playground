@@ -5,6 +5,7 @@ import { pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
 import { Azure } from '../../infra/azure/bootstrap.js';
+import { dispatchExternalEffect } from '../../infra/azure/effect-boundary.js';
 import { loadCustodyConfig } from './aks-custody-config.js';
 import { CampaignConflictError, createBlobCampaignStore, heartbeatCampaign, newCampaignState, validateCampaignState,
   type CampaignState, type CampaignStore, type CleanupStepName, type RunInventory, type StoredCampaign,
@@ -135,8 +136,11 @@ export class ReadOnlyAzureAdapter implements WatchdogReadOnlyAzure {
 export function createReadOnlyAzureAdapter(azure: Azure, evidence: RehearsalEvidenceSink): ReadOnlyAzureAdapter {
   return new ReadOnlyAzureAdapter(async (_method, url) => {
     const token = await azure.token('https://management.azure.com/');
-    const response = await fetch(url, { method: 'GET', headers: { authorization: `Bearer ${token}` },
-      signal: AbortSignal.timeout(10_000), redirect: 'error' });
+    const parsedUrl = new URL(url);
+    const response = await dispatchExternalEffect({ transport: 'azure-rest', method: 'GET',
+      resource: parsedUrl.origin + '|https://management.azure.com/', path: parsedUrl.pathname + parsedUrl.search },
+      () => fetch(url, { method: 'GET', headers: { authorization: `Bearer ${token}` },
+        signal: AbortSignal.timeout(10_000), redirect: 'error' }));
     return { status: response.status, body: Buffer.from(await response.arrayBuffer()),
       requestId: response.headers.get('x-ms-request-id') ?? response.headers.get('x-ms-correlation-request-id') ?? undefined };
   }, evidence);

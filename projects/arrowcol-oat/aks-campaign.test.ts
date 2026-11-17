@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { CampaignConflictError, CUSTODY_CLEANUP_STEPS, MAX_CAMPAIGN_LIFETIME_MS, OTHER_CLEANUP_HANDOFF_RESERVE_MS,
+import { CampaignConflictError, CUSTODY_CLEANUP_STEPS, MAX_CAMPAIGN_LIFETIME_MS, KNOWN_LIFECYCLE_CLEANUP_RESERVE_MS, assessCellLifetimeBudget,
   MISSED_HEARTBEAT_LIMIT, HEARTBEAT_INTERVAL_MS,
   createBlobCampaignStore,
   armCampaign, assertCampaignEnvironment, assertRunInventoryReady, campaignStartReceipt, heartbeatCampaign, mutateCampaign, newCampaignState, publishCleanupRunInventory, publishRunInventory, runInventoryPublishReceipt, startCampaign,
@@ -81,23 +81,47 @@ test('load admission requires a pre-provisioning initial record and cannot skip 
   assert.equal((await store.read())!.state.runInventory!.load_admission, 'authorized');
 });
 
-test('cell admission requires exact remaining lifetime and rejects the one-millisecond-short boundary', async () => {
-  const required = MAX_CAMPAIGN_LIFETIME_MS;
-  const duration = required - 1_200_000 - OTHER_CLEANUP_HANDOFF_RESERVE_MS;
-  const exactState = newCampaignState(campaignId, ownerId, 100);
-  const exactNow = exactState.expiresAtMs - required;
-  exactState.heartbeatAtMs = exactNow;
-  const exact = new MemoryStore();
-  exact.current = { state: exactState, etag: 'etag-1' };
-  await publishRunInventory(exact, { ...inventoryFor(exactState), planned_cell_duration_ms: duration }, exactNow);
+test('Rust RunInventory timing fields are strictly parsed and legacy inventory cannot arm', async () => {
+  const store = await seed(), started = (await store.read())!.state;
+  const rustInventory = JSON.parse(JSON.stringify(inventoryFor(started))) as RunInventory;
+  await publishRunInventory(store, rustInventory, started.startedAtMs);
+  const invalidBudgets = [
+    { maintenance_grace_seconds: 900, maintenance_stop_timeout_ms: 1_199_999 },
+    { maintenance_grace_seconds: 900, maintenance_stop_timeout_ms: 5_100_001 },
+    { maintenance_grace_seconds: 900, maintenance_stop_timeout_ms: 1_200_000, extra: true },
+  ];
+  for (const effective_stop_budgets of invalidBudgets)
+    await assert.rejects(publishRunInventory(store, { ...rustInventory, effective_stop_budgets }, started.startedAtMs),
+      /effective|timeout/);
 
-  const shortState = newCampaignState(campaignId, ownerId, 100);
-  const shortNow = shortState.expiresAtMs - required + 1;
-  shortState.heartbeatAtMs = shortNow;
-  const short = new MemoryStore();
-  short.current = { state: shortState, etag: 'etag-1' };
-  await assert.rejects(publishRunInventory(short, { ...inventoryFor(shortState), planned_cell_duration_ms: duration }, shortNow),
-    /cannot cover the planned cell/);
+  const legacyStore = await seed(), legacyStarted = (await legacyStore.read())!.state;
+  const inventory = inventoryFor(legacyStarted);
+  const { planned_cell_duration_ms: _duration, effective_stop_budgets: _budgets, ...legacy } = inventory;
+  legacyStore.current = { state: validateCampaignState({ ...legacyStarted, runInventory: legacy }), etag: 'legacy-etag' };
+  await assert.rejects(armCampaign(legacyStore, ownerId, legacyStarted.fencingToken, legacyStarted.startedAtMs),
+    /without a new-cell duration and maintenance stop budget/);
+});
+
+test('bounded lifetime arithmetic admits equality and rejects a one-millisecond shortfall', async () => {
+  const stopTimeout = 1_200_000;
+  const duration = MAX_CAMPAIGN_LIFETIME_MS - stopTimeout - KNOWN_LIFECYCLE_CLEANUP_RESERVE_MS;
+  assert.deepEqual(assessCellLifetimeBudget(MAX_CAMPAIGN_LIFETIME_MS, duration, stopTimeout,
+    KNOWN_LIFECYCLE_CLEANUP_RESERVE_MS), { status: 'ready', required_ms: MAX_CAMPAIGN_LIFETIME_MS });
+  assert.deepEqual(assessCellLifetimeBudget(MAX_CAMPAIGN_LIFETIME_MS - 1, duration, stopTimeout,
+    KNOWN_LIFECYCLE_CLEANUP_RESERVE_MS), { status: 'insufficient', required_ms: MAX_CAMPAIGN_LIFETIME_MS });
+});
+
+test('cell admission retains UNKNOWN for unbounded cleanup completion stages', async () => {
+  const state = newCampaignState(campaignId, ownerId, 100);
+  const store = new MemoryStore(); store.current = { state, etag: 'etag-1' };
+  const assessment = assessCellLifetimeBudget(MAX_CAMPAIGN_LIFETIME_MS, 0, 1_200_000);
+  assert.equal(assessment.status, 'unknown');
+  if (assessment.status === 'unknown') {
+    assert.equal(assessment.required_ms, 1_200_000 + KNOWN_LIFECYCLE_CLEANUP_RESERVE_MS);
+    assert.match(assessment.reason, /preserve-evidence.*remove-run-namespace/);
+  }
+  await publishRunInventory(store, { ...inventoryFor(state), planned_cell_duration_ms: 0 }, state.startedAtMs);
+  assert.equal((await store.read())!.state.runInventory!.planned_cell_duration_ms, 0);
 });
 
 test('zero-duration rehearsal stays not-authorized and cell duration/stop budgets cannot change', async () => {

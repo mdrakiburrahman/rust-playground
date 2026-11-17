@@ -8,17 +8,17 @@ import path from 'node:path';
 import { Azure } from '../../infra/azure/bootstrap.js';
 import { loadCustodyConfig } from './aks-custody-config.js';
 import { WATCHDOG_INTERVAL_MS } from './aks-cleanup-budget.js';
+import { DEFAULT_EFFECTIVE_STOP_BUDGETS, parseEffectiveStopBudgets, type EffectiveStopBudgets } from './stop-budgets.js';
 export { WATCHDOG_INTERVAL_MS };
 
 export type CleanupExecutor = (step: CleanupStepName, state: CampaignState, idempotencyKey: string) => Promise<'pending' | 'complete'>;
 export interface WatchdogReadOnlyAzure { readArmStatus(url: string): Promise<{ status: number; body?: unknown }> }
 
-function stopBudgetsForInventory(inventory: NonNullable<CampaignState['runInventory']>):
-  { maintenanceGraceSeconds: number; maintenanceStopTimeoutMs: number; budget_source: 'effective_stop_budgets' | 'legacy_ceiling' } {
+type StopBudgetSource = EffectiveStopBudgets & { budget_source: 'effective_stop_budgets' | 'legacy_ceiling' };
+function stopBudgetsForInventory(inventory: NonNullable<CampaignState['runInventory']>): StopBudgetSource {
   const persisted = inventory.effective_stop_budgets;
-  if (!persisted) return { maintenanceGraceSeconds: 4_800, maintenanceStopTimeoutMs: 5_100_000, budget_source: 'legacy_ceiling' };
-  return { maintenanceGraceSeconds: persisted.maintenance_grace_seconds,
-    maintenanceStopTimeoutMs: persisted.maintenance_stop_timeout_ms, budget_source: 'effective_stop_budgets' };
+  if (!persisted) return { ...DEFAULT_EFFECTIVE_STOP_BUDGETS, budget_source: 'legacy_ceiling' };
+  return { ...parseEffectiveStopBudgets(persisted), budget_source: 'effective_stop_budgets' };
 }
 
 export async function watchdogOnce(env: NodeJS.ProcessEnv = process.env, executeCleanup?: CleanupExecutor,

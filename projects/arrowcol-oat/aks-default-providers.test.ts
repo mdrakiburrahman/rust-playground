@@ -5,6 +5,7 @@ import path from 'node:path';
 import { test, type TestContext } from 'node:test';
 import { stringify } from 'yaml';
 import { Azure, Config, TAGS, type HttpReceipt } from '../../infra/azure/bootstrap.js';
+import { dispatchExternalEffect, EffectBoundary, withEffectBoundary } from '../../infra/azure/effect-boundary.js';
 import { defaultStampConfig } from '../../infra/azure/stamp.js';
 import { CUSTODY_CLEANUP_STEPS, CampaignConflictError, CampaignWriteOutcomeUnknownError, campaignMain, newCampaignState, publishRunInventory, type CampaignState, type CampaignStore,
   type RunInventory, type StoredCampaign } from './aks-campaign.js';
@@ -344,29 +345,53 @@ test('advancement after baseline write remains UNKNOWN and retry reads the origi
   assert.equal(writes, 1);
 });
 
-test('simulated lost immutable baseline PUT acknowledgement retries the original proof without recapture or rewrite', async t => {
+test('simulated lost immutable baseline PUT acknowledgement recovers through the guarded Azure Blob adapter', async t => {
   const f = await fixture(t, false);
   f.inventory.namespace.uid = null;
   f.store.state = { ...newCampaignState(campaignId, ownerId, f.store.state.startedAtMs), runInventory: f.inventory };
   const blob = f.azure.blob.bind(f.azure);
-  let writes = 0, loseAck = true;
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'oat-baseline-effect-boundary-'));
+  fs.chmodSync(directory, 0o700);
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const receipts = path.join(directory, 'effects.jsonl');
+  const name = '_arrowcol-custody/campaigns/' + campaignId + '/baseline.json';
+  const pathValue = '/' + f.azure.c.checkpoints + '/' + name.split('/').map(encodeURIComponent).join('/');
+  const resource = 'https://' + f.azure.c.account + '.blob.core.windows.net|https://storage.azure.com/';
+  const envelope = { schema_version: 1 as const, campaign_id: campaignId, run_id: f.inventory.cell_run_id,
+    subscription_id: f.azure.c.subscription, resource_group: f.azure.c.group, storage_account: f.azure.c.account,
+    state_container: f.azure.c.checkpoints, effects: [
+      { id: 'baseline-read', transport: 'azure-rest' as const, method: 'GET', resource, path: pathValue, max_calls: 3 },
+      { id: 'baseline-put', transport: 'azure-rest' as const, method: 'PUT', resource, path: pathValue, max_calls: 1 },
+    ] };
+  let activeBoundary = new EffectBoundary(envelope, receipts), writes = 0, loseAck = true;
   t.mock.method(f.azure, 'blob', async (...args: Parameters<Azure['blob']>) => {
-    const result = await blob(...args);
-    if (args[0] === 'PUT') {
-      writes++;
-      if (loseAck) { loseAck = false; throw new Error('Simulated lost baseline PUT acknowledgement.'); }
-    }
-    return result;
+    const [method, container, blobName = '', , body] = args;
+    const request = { transport: 'azure-rest' as const, method: method.toUpperCase(), resource,
+      path: '/' + container + '/' + blobName.split('/').map(encodeURIComponent).join('/'), ...(body !== undefined ? { body } : {}) };
+    const result = await withEffectBoundary(activeBoundary, () => dispatchExternalEffect(request, async () => {
+      const response = await blob(...args);
+      if (method === 'PUT') {
+        writes++;
+        if (loseAck) { loseAck = false; throw new Error('Simulated lost baseline PUT acknowledgement.'); }
+      }
+      return { status: Number(response[1][':status'] ?? 200), response };
+    }));
+    return result.response;
   });
   await assert.rejects(captureCleanupBaseline(f.store, f.azure, ownerId, 1), CampaignWriteOutcomeUnknownError);
   const [key, saved] = [...f.blobs][0]!, original = Buffer.from(saved.bytes), etag = saved.etag;
   t.mock.method(f.azure, 'kql', async () => { throw new Error('Baseline retry must not recapture Kusto.'); });
   t.mock.method(f.azure, 'request', async () => { throw new Error('Baseline retry must not reobserve capacity.'); });
+  activeBoundary = new EffectBoundary(envelope, receipts);
   const receipt = await captureCleanupBaseline(f.store, f.azure, ownerId, 1);
   assert.equal(receipt.blob, key);
   assert.equal(receipt.etag, etag);
   assert.deepEqual(f.blobs.get(key)!.bytes, original);
   assert.equal(writes, 1);
+  const rows = fs.readFileSync(receipts, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+  const put = rows.filter(row => row.method === 'PUT' && row.path === pathValue);
+  assert.deepEqual(put.map(row => row.event), ['dispatch', 'result']);
+  assert.equal(put[1].outcome, 'unknown_after_forward');
 });
 
 test('default restoration is a true no-op at supported safe capacity and capacity alone cannot complete full safety', async t => {

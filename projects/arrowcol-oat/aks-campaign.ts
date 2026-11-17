@@ -4,15 +4,35 @@ import { pathToFileURL } from "node:url";
 import type { RunFicPlan } from '../../infra/azure/run_fic.js';
 import type { OatQapReference } from '../../infra/azure/oat_qap.js';
 import { loadCustodyConfig } from './aks-custody-config.js';
-import { ADMISSION_STOP_BUDGET_MS, DRAIN_BUDGET_MS, TERMINAL_CAPTURE_BUDGET_MS, WATCHDOG_INTERVAL_MS } from './aks-cleanup-budget.js';
+import { dispatchExternalEffect } from '../../infra/azure/effect-boundary.js';
+import { ADMISSION_STOP_BUDGET_MS, DRAIN_BUDGET_MS, TERMINAL_CAPTURE_BUDGET_MS } from './aks-cleanup-budget.js';
+import { parseEffectiveStopBudgets } from './stop-budgets.js';
 export const HEARTBEAT_INTERVAL_MS = 60_000;
 export const MISSED_HEARTBEAT_LIMIT = 3;
 export const MAX_CAMPAIGN_LIFETIME_MS = 6 * 60 * 60 * 1000;
-const MAX_MAINTENANCE_STOP_TIMEOUT_MS = 5_100_000;
 const MAX_ARM_OPERATIONS = 128;
 export const CUSTODY_CLEANUP_STEPS = ["stop-admission", "bounded-drain", "preserve-evidence", "stop-maintenance", "record-terminal-state", "remove-run-namespace", "remove-run-qap", "remove-run-fic", "restore-safe-idle", "verify-safe-idle"] as const;
-export const OTHER_CLEANUP_HANDOFF_RESERVE_MS = ADMISSION_STOP_BUDGET_MS + DRAIN_BUDGET_MS + TERMINAL_CAPTURE_BUDGET_MS +
-  MISSED_HEARTBEAT_LIMIT * HEARTBEAT_INTERVAL_MS + CUSTODY_CLEANUP_STEPS.length * WATCHDOG_INTERVAL_MS;
+export const KNOWN_LIFECYCLE_CLEANUP_RESERVE_MS = ADMISSION_STOP_BUDGET_MS + DRAIN_BUDGET_MS + TERMINAL_CAPTURE_BUDGET_MS;
+export const UNBOUNDED_CLEANUP_RESERVE_STEPS = ['preserve-evidence', 'remove-run-namespace', 'remove-run-qap',
+  'remove-run-fic', 'restore-safe-idle', 'verify-safe-idle', 'handoff'] as const;
+export type CellLifetimeAssessment =
+  | { status: 'ready'; required_ms: number }
+  | { status: 'insufficient'; required_ms: number }
+  | { status: 'unknown'; required_ms: number; reason: string }
+  | { status: 'invalid'; reason: string };
+export function assessCellLifetimeBudget(remainingMs: number, durationMs: number, maintenanceStopMs: number,
+  cleanupReserveMs?: number): CellLifetimeAssessment {
+  if (![remainingMs, durationMs, maintenanceStopMs].every(nonnegative) ||
+      cleanupReserveMs !== undefined && !nonnegative(cleanupReserveMs))
+    return { status: 'invalid', reason: 'Cell admission budget values must be nonnegative safe integers.' };
+  const reserve = cleanupReserveMs ?? KNOWN_LIFECYCLE_CLEANUP_RESERVE_MS;
+  const required = durationMs + maintenanceStopMs + reserve;
+  if (!Number.isSafeInteger(required)) return { status: 'invalid', reason: 'Cell admission budget sum exceeds safe integer bounds.' };
+  if (remainingMs < required) return { status: 'insufficient', required_ms: required };
+  return cleanupReserveMs === undefined ? { status: 'unknown', required_ms: required,
+    reason: 'Cleanup completion has unbounded steps: ' + UNBOUNDED_CLEANUP_RESERVE_STEPS.join(', ') } :
+    { status: 'ready', required_ms: required };
+}
 export type CleanupStepName = typeof CUSTODY_CLEANUP_STEPS[number];
 export const DRAIN_UNSETTLED_REASON = 'drain_deadline_expired_unsettled';
 export interface DrainExpiryReceipt {
@@ -116,13 +136,10 @@ function validStep(value: unknown): value is InventoryStep {
     (value.reason_code === null || typeof value.reason_code === 'string' && value.reason_code.length > 0 && value.reason_code.length <= 64 && /^[a-z0-9_]+$/.test(value.reason_code)) &&
     (!['failed', 'uncertain'].includes(String(value.state)) || value.reason_code !== null);
 }
-function validEffectiveStopBudgets(value: unknown): value is NonNullable<RunInventory['effective_stop_budgets']> {
-  if (!exactRecord(value, ['maintenance_grace_seconds', 'maintenance_stop_timeout_ms'])) return false;
-  const grace = value.maintenance_grace_seconds, timeout = value.maintenance_stop_timeout_ms;
-  return nonnegative(grace) && grace > 0 && nonnegative(timeout) && timeout > 0 &&
-    Number.isSafeInteger(grace * 1_000) && timeout >= grace * 1_000 && timeout <= MAX_MAINTENANCE_STOP_TIMEOUT_MS;
-}
 function validateRunInventory(value: unknown, state: CampaignState): RunInventory {
+  const stopBudgets = value && typeof value === 'object' && !Array.isArray(value) ?
+    (value as Record<string, unknown>).effective_stop_budgets : undefined;
+  if (stopBudgets !== undefined) parseEffectiveStopBudgets(stopBudgets);
   const fields = ['schema_version', 'campaign_id', 'owner_id', 'fencing_token', 'orchestration_run_id', 'cell_run_id', 'load_admission',
     'namespace', 'resources', 'fic', 'qap', 'cleanup'];
   if (!optionalRecord(value, fields, ['evidence_destination', 'planned_cell_duration_ms', 'effective_stop_budgets']) || value.schema_version !== 1 || value.campaign_id !== state.campaignId ||
@@ -132,7 +149,6 @@ function validateRunInventory(value: unknown, state: CampaignState): RunInventor
       (value.planned_cell_duration_ms === undefined) !== (value.effective_stop_budgets === undefined) ||
       value.planned_cell_duration_ms !== undefined && (!nonnegative(value.planned_cell_duration_ms) ||
         value.planned_cell_duration_ms === 0 && value.load_admission !== 'not_authorized') ||
-      value.effective_stop_budgets !== undefined && !validEffectiveStopBudgets(value.effective_stop_budgets) ||
       !exactRecord(value.namespace, ['name', 'uid', 'owner_token']) || !k8sName(value.namespace.name) ||
       !String(value.namespace.name).endsWith('-' + value.cell_run_id.replace(/-/g, '')) ||
       !(value.namespace.uid === null || canonicalUuid(value.namespace.uid)) || !canonicalUuid(value.namespace.owner_token) ||
@@ -529,7 +545,8 @@ export async function managedIdentityToken(resource: string, env: NodeJS.Process
   url.searchParams.set('api-version', '2019-08-01');
   url.searchParams.set('resource', resource);
   url.searchParams.set('client_id', env.AZURE_CLIENT_ID);
-  const response = await fetcher(url, { headers: { 'X-IDENTITY-HEADER': header } });
+  const response = await dispatchExternalEffect({ transport: 'azure-auth', method: 'GET', resource: url.origin,
+    path: url.pathname + url.search }, () => fetcher(url, { headers: { 'X-IDENTITY-HEADER': header } }));
   if (!response.ok) throw new Error(`Managed identity token request failed with HTTP ${response.status}.`);
   const body: unknown = await response.json();
   if (!record(body) || typeof body.access_token !== 'string' || !body.access_token) throw new Error('Managed identity returned an invalid token response.');
@@ -537,12 +554,14 @@ export async function managedIdentityToken(resource: string, env: NodeJS.Process
 }
 
 async function localToken(resource: string, subscriptionId: string): Promise<string> {
-  const result = spawnSync("az", ["account", "get-access-token", "--subscription", subscriptionId,
-    "--resource", resource, "--query", "accessToken", "--output", "tsv", "--only-show-errors"],
-    { encoding: "utf8", timeout: 30_000, windowsHide: true });
-  const token = typeof result.stdout === "string" ? result.stdout.trim() : "";
+  const args = ['account', 'get-access-token', '--subscription', subscriptionId,
+    '--resource', resource, '--query', 'accessToken', '--output', 'tsv', '--only-show-errors'];
+  const result = await dispatchExternalEffect({ transport: 'process', method: 'AZURE_ACCOUNT_GET-ACCESS-TOKEN',
+    resource: 'az', path: JSON.stringify(args) }, async () => spawnSync('az', args,
+    { encoding: 'utf8', timeout: 30_000, windowsHide: true }));
+  const token = typeof result.stdout === 'string' ? result.stdout.trim() : '';
   if (result.error || result.status !== 0 || !token || /[[:space:]]/.test(token))
-    throw new Error("Azure CLI could not provide a token for the campaign store.");
+    throw new Error('Azure CLI could not provide a token for the campaign store.');
   return token;
 }
 
@@ -557,11 +576,17 @@ export function createBlobCampaignStore(config: CampaignStoreConfig, fetcher: Fe
     throw new Error('Campaign store record path is invalid.');
   const endpoint = `https://${config.account}.blob.core.windows.net/${config.container}/` +
     segments.map(segment => encodeURIComponent(segment)).join('/');
+  const blobFetch: Fetcher = (input, init = {}) => {
+    const url = new URL(String(input)), method = (init.method ?? 'GET').toUpperCase();
+    const body = typeof init.body === 'string' || Buffer.isBuffer(init.body) ? init.body : undefined;
+    return dispatchExternalEffect({ transport: 'campaign-blob', method, resource: url.origin + '/' + config.container,
+      path: url.pathname + url.search, body }, () => fetcher(input, init));
+  };
   const headers = async () => ({ authorization: `Bearer ${await token('https://storage.azure.com/')}`,
     'x-ms-date': new Date().toUTCString(), 'x-ms-version': '2023-11-03' });
   return {
     async read() {
-      const response = await fetcher(endpoint, { headers: await headers() });
+      const response = await blobFetch(endpoint, { headers: await headers() });
       if (response.status === 404) return undefined;
       if (!response.ok) throw new Error(`Campaign state read failed with HTTP ${response.status}.`);
       const etag = response.headers.get('etag');
@@ -572,7 +597,7 @@ export function createBlobCampaignStore(config: CampaignStoreConfig, fetcher: Fe
     },
     async write(state, expectedEtag) {
       const condition: Record<string, string> = expectedEtag ? { 'if-match': expectedEtag } : { 'if-none-match': '*' };
-      const response = await fetcher(endpoint, { method: 'PUT', headers: { ...(await headers()), ...condition,
+      const response = await blobFetch(endpoint, { method: 'PUT', headers: { ...(await headers()), ...condition,
         'content-type': 'application/json', 'content-length': String(Buffer.byteLength(JSON.stringify(state))),
         'x-ms-blob-type': 'BlockBlob' }, body: JSON.stringify(validateCampaignState(state)) });
       if (response.status === 412) throw new CampaignConflictError();
@@ -682,10 +707,13 @@ export async function publishRunInventory(store: CampaignStore, value: unknown, 
     const stopTimeout = inventory.effective_stop_budgets?.maintenance_stop_timeout_ms;
     if (!nonnegative(now) || now < state.startedAtMs || !nonnegative(duration) || !nonnegative(stopTimeout))
       throw new Error('Cell admission requires explicit planned duration and persisted maintenance stop budget.');
-    const required = duration + stopTimeout + OTHER_CLEANUP_HANDOFF_RESERVE_MS;
     const remaining = state.expiresAtMs - now;
-    if (!Number.isSafeInteger(required) || !Number.isSafeInteger(remaining) || remaining < required)
-      throw new Error('Campaign lifetime cannot cover the planned cell, maintenance stop, and cleanup/handoff reserves.');
+    const assessment = assessCellLifetimeBudget(remaining, duration, stopTimeout);
+    if (assessment.status === 'invalid') throw new Error(assessment.reason);
+    if (assessment.status === 'insufficient')
+      throw new Error('Campaign lifetime cannot cover the planned cell, maintenance stop, and bounded cleanup reserves.');
+    if (assessment.status === 'unknown') console.warn(JSON.stringify({ event: 'cell_cleanup_lifetime_reserve',
+      status: assessment.status, lower_bound_required_ms: assessment.required_ms, uncovered_steps: UNBOUNDED_CLEANUP_RESERVE_STEPS }));
   }
   throw new CampaignConflictError();
 }
@@ -799,7 +827,7 @@ async function readRunInventoryStdin(): Promise<unknown> {
 }
 
 export async function campaignMain(args: string[], dependencies: {
-  store?: CampaignStore; azure?: import('../../infra/azure/bootstrap.js').Azure; env?: NodeJS.ProcessEnv;
+  store?: CampaignStore; azure?: import('../../infra/azure/bootstrap.js').Azure; env?: NodeJS.ProcessEnv; cleanupEnvelope?: unknown;
 } = {}): Promise<void> {
   if (args[0] === 'cleanup-step') {
     const cell = await import('./aks-cell-cleanup.js');
@@ -890,7 +918,7 @@ export async function campaignMain(args: string[], dependencies: {
   } else if (action === 'cleanup-step' && args.length === 2) {
     const cell = await import('./aks-cell-cleanup.js');
     if (!Object.hasOwn(cell.CELL_CLEANUP_SELECTORS, args[1]!)) throw new Error('Unknown cleanup-step selector.');
-    const input = cell.parseCellCleanupEnvelope(await readRunInventoryStdin());
+    const input = cell.parseCellCleanupEnvelope(dependencies.cleanupEnvelope ?? await readRunInventoryStdin());
     await cell.readCellRunInventory(store, { schema_version: 1, campaign_id: input.inventory.campaign_id,
       orchestration_run_id: input.inventory.orchestration_run_id, cell_run_id: input.inventory.cell_run_id, actor: input.actor }, env);
     const { createDefaultCleanupProviders, createDefaultCellCleanupProviders } = await import('./aks-default-providers.js');

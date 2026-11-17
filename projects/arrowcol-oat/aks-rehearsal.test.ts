@@ -1,9 +1,14 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { test } from 'node:test';
+import { Azure, Config, runtime } from '../../infra/azure/bootstrap.js';
+import { EffectBoundary, withEffectBoundary } from '../../infra/azure/effect-boundary.js';
 import { CampaignConflictError, HEARTBEAT_INTERVAL_MS, MAX_CAMPAIGN_LIFETIME_MS, newCampaignState,
   validateCampaignState, type CampaignState, type CampaignStore, type StoredCampaign } from './aks-campaign.js';
-import { assertRehearsalPathIsolated, createSyntheticArmedCampaignState, ReadOnlyAzureAdapter, rehearsalCampaignRecordPath,
+import { assertRehearsalPathIsolated, createReadOnlyAzureAdapter, createSyntheticArmedCampaignState, ReadOnlyAzureAdapter, rehearsalCampaignRecordPath,
   runRehearsalOwner, runRehearsalOwnerHeartbeatOnce, runRehearsalStaleOwnerProbe, runRehearsalWatchdogOnce,
   type ReadOnlyCampaignStore, type RehearsalEvidenceRecord } from './aks-rehearsal.js';
 import { watchdogOnce } from './aks-watchdog.js';
@@ -194,6 +199,28 @@ test('store override without injected cleanup executor refuses before default pr
   assert.equal(isolatedStore.current?.state.status, 'fenced');
   assert.equal(requests.length, 0);
   assertSyntheticEvidence(evidence);
+});
+
+test('default rehearsal ARM fetch is refused by the campaign boundary before network forwarding', async t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'oat-rehearsal-effect-boundary-'));
+  fs.chmodSync(directory, 0o700);
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const config = new Config({ AZURE_SUBSCRIPTION_ID: subscriptionId, AZURE_STAMP: '12345', AZURE_LOCATION: 'canadacentral' });
+  const azure = new Azure(config), resource = 'https://management.azure.com/';
+  azure.tokens.set(resource, { at: runtime.now(), token: 'test-token', lifetime: 240 });
+  const url = 'https://management.azure.com/subscriptions/' + subscriptionId + '/resourceGroups/' + config.group + '?api-version=2024-10-01';
+  const envelope = { schema_version: 1 as const, campaign_id: campaignId, run_id: ownerId,
+    subscription_id: config.subscription, resource_group: config.group, storage_account: config.account,
+    state_container: config.checkpoints, effects: [{ id: 'other-read', transport: 'azure-rest' as const,
+      method: 'GET', resource: 'https://management.azure.com|https://management.azure.com/', path: '/not-allocated', max_calls: 1 }] };
+  const boundary = new EffectBoundary(envelope, path.join(directory, 'effects.jsonl'));
+  const adapter = createReadOnlyAzureAdapter(azure, () => {});
+  let fetches = 0;
+  t.mock.method(globalThis, 'fetch', async () => { fetches++; return new Response('{}', { status: 200 }); });
+  await assert.rejects(withEffectBoundary(boundary, () => adapter.readArmStatus(url)), /refused before forwarding/);
+  assert.equal(fetches, 0);
+  const rows = fs.readFileSync(path.join(directory, 'effects.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
+  assert.deepEqual(rows.map(row => row.event), ['refused']);
 });
 
 test('read-only ARM adapter refuses non-GET and off-host requests before sending', async () => {

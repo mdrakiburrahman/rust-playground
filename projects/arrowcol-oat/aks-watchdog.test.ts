@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { CampaignConflictError, CUSTODY_CLEANUP_STEPS, HEARTBEAT_INTERVAL_MS, MAX_CAMPAIGN_LIFETIME_MS, armCampaign, publishRunInventory, startCampaign, validateCampaignState, type CampaignState, type CampaignStore, type RunInventory, type StoredCampaign } from './aks-campaign.js';
+import { CampaignConflictError, CUSTODY_CLEANUP_STEPS, HEARTBEAT_INTERVAL_MS, MAX_CAMPAIGN_LIFETIME_MS, armCampaign, newCampaignState, publishRunInventory, startCampaign, validateCampaignState, type CampaignState, type CampaignStore, type RunInventory, type StoredCampaign } from './aks-campaign.js';
 import { watchdogOnce } from './aks-watchdog.js';
 import { createSyntheticArmedCampaignState, ReadOnlyAzureAdapter, runRehearsalWatchdogOnce, type RehearsalEvidenceRecord } from './aks-rehearsal.js';
 import { createExternalCleanupExecutor, type ExternalCleanupActions } from './aks-cleanup-executor.js';
@@ -54,6 +54,26 @@ async function armedStore(): Promise<MemoryStore> {
   await publishRunInventory(store, observed, state.startedAtMs);
   return store;
 }
+
+test('watchdog consumes persisted stop budgets and assigns the ceiling to legacy records', async () => {
+  const now = Date.now(), base = newCampaignState(campaignId, ownerId, now);
+  const observed = inventoryFor(base), step = { state: 'not_started' as const, deadline_unix_ms: null, reason_code: null };
+  const planned: RunInventory = { ...observed, load_admission: 'not_authorized', namespace: { ...observed.namespace, uid: null },
+    resources: observed.resources.map(resource => ({ ...resource, uid: null, state: 'planned' })),
+    fic: observed.fic ? { ...observed.fic, state: 'planned' } : null,
+    qap: observed.qap ? { ...observed.qap, state: 'planned' } : null,
+    cleanup: { stop_admission: step, bounded_drain: step, evidence_capture: step, stop_maintenance: step, terminal_capture: step, handoff: step } };
+  const persistedStore = new MemoryStore();
+  persistedStore.current = { state: validateCampaignState({ ...base, runInventory: planned }), etag: 'persisted' };
+  const persisted = await watchdogOnce({ ARM_SUBSCRIPTION_ID: subscriptionId }, undefined, persistedStore);
+  assert.deepEqual(persisted.maintenanceStopBudget, { maintenance_stop_timeout_ms: 1_200_000, budget_source: 'effective_stop_budgets' });
+
+  const { planned_cell_duration_ms: _duration, effective_stop_budgets: _budgets, ...legacyInventory } = planned;
+  const legacyStore = new MemoryStore();
+  legacyStore.current = { state: validateCampaignState({ ...base, runInventory: legacyInventory }), etag: 'legacy' };
+  const legacy = await watchdogOnce({ ARM_SUBSCRIPTION_ID: subscriptionId }, undefined, legacyStore);
+  assert.deepEqual(legacy.maintenanceStopBudget, { maintenance_stop_timeout_ms: 5_100_000, budget_source: 'legacy_ceiling' });
+});
 
 test('watchdog expiry fences first, refuses missing cleanup, and resumes idempotent cleanup', async () => {
   const env = { ARM_SUBSCRIPTION_ID: subscriptionId };

@@ -9,6 +9,7 @@ import { DRAIN_UNSETTLED_REASON, hasVerifiedUnsettledDrain, publishCleanupRunInv
 import type { CleanupExecutor } from './aks-reconcile.js';
 import { assertRunCleanupActor, createSetupRunCleanupActions } from './aks-setup-cleanup.js';
 import { ADMISSION_STOP_BUDGET_MS, DRAIN_BUDGET_MS, TERMINAL_CAPTURE_BUDGET_MS, withCleanupDeadline } from './aks-cleanup-budget.js';
+import { MAINTENANCE_STOP_TIMEOUT_CEILING_MS, type EffectiveStopBudgets } from './stop-budgets.js';
 
 export type CleanupActionResult = 'pending' | 'complete' | 'uncertain';
 export interface CleanupMutationAuthority {
@@ -127,12 +128,12 @@ export function createOwnedRunCleanupActions(store: CampaignStore, azure: Azure,
 }
 
 export function createExternalCleanupExecutor(store: CampaignStore, actions: ExternalCleanupActions,
-  stopBudgets: { maintenanceGraceSeconds: number; maintenanceStopTimeoutMs: number; budget_source: 'effective_stop_budgets' | 'legacy_ceiling' }): CleanupExecutor {
+  stopBudgets: EffectiveStopBudgets & { budget_source: 'effective_stop_budgets' | 'legacy_ceiling' }): CleanupExecutor {
   if (!Number.isSafeInteger(stopBudgets.maintenanceGraceSeconds) || stopBudgets.maintenanceGraceSeconds <= 0 ||
       !Number.isSafeInteger(stopBudgets.maintenanceStopTimeoutMs) || stopBudgets.maintenanceStopTimeoutMs <= 0 ||
-      stopBudgets.maintenanceStopTimeoutMs > 5_100_000 ||
+      stopBudgets.maintenanceStopTimeoutMs > MAINTENANCE_STOP_TIMEOUT_CEILING_MS ||
       stopBudgets.maintenanceStopTimeoutMs < stopBudgets.maintenanceGraceSeconds * 1_000 ||
-      stopBudgets.budget_source === 'legacy_ceiling' && stopBudgets.maintenanceStopTimeoutMs !== 5_100_000)
+      stopBudgets.budget_source === 'legacy_ceiling' && stopBudgets.maintenanceStopTimeoutMs !== MAINTENANCE_STOP_TIMEOUT_CEILING_MS)
     throw new Error('External cleanup requires valid persisted maintenance stop budgets.');
   return async (step, suppliedState, idempotencyKey) => {
     if (suppliedState.status !== 'cleaning' || !suppliedState.runInventory ||
