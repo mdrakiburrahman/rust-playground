@@ -3005,7 +3005,7 @@ impl DeltaTable {
         }
     }
 
-    /// Capture the exact fresh Kernel commit against an isolated in-memory store only.
+    /// Capture the exact fresh Kernel commit from an ADLS URL against an isolated in-memory store.
     /// No credentials, provider client, publisher registration or external effect is created.
     ///
     /// # Errors
@@ -3015,6 +3015,9 @@ impl DeltaTable {
         schema: SchemaRef,
         partition_columns: Vec<String>,
     ) -> Result<FreshTableCommitPlan> {
+        if url.scheme() != "abfss" {
+            bail!("planned Delta commit capture only accepts secure ADLS URLs");
+        }
         let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
         let table = Self::open_connection_with_store(url, partition_columns, None, None, Some(Arc::clone(&store)), true)?;
         let stage = table.root.clone();
@@ -5661,6 +5664,24 @@ mod fresh_table_plan_tests {
             .join("\n");
         result.push('\n');
         Ok(result)
+    }
+
+    #[test]
+    fn non_adls_capture_refuses_without_removing_caller_owned_directory() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let sentinel = directory.path().join("caller-owned-sentinel.txt");
+        fs::write(&sentinel, b"preserve")?;
+        let url = Url::from_directory_path(directory.path())
+            .map_err(|()| anyhow::anyhow!("failed to construct local capture URL"))?;
+        let result = DeltaTable::capture_fresh_table_commit(
+            url,
+            Arc::new(Schema::new(Vec::<Field>::new())),
+            Vec::new(),
+        );
+        assert!(result.is_err());
+        assert_eq!(fs::read(&sentinel)?, b"preserve");
+        assert!(directory.path().is_dir());
+        Ok(())
     }
 
     #[test]

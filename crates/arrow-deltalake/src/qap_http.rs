@@ -516,9 +516,10 @@ mod storage_bridge {
                 .iter()
                 .map(|(k, v)| v.to_str().map(|value| (k.to_string(), value.to_owned())))
                 .collect::<Result<Vec<_>, _>>();
-            let Ok(headers) = headers else {
+            let Ok(mut headers) = headers else {
                 return Outcome::NotSent(Code::InvalidRequest);
             };
+            headers.sort_unstable();
             let url = request.uri().to_string();
             let mut envelope = Request {
                 schema_version: 1,

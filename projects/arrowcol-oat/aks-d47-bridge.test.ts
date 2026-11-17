@@ -83,6 +83,11 @@ function envelopeFor(authority: StorageBridgeAuthority, request: StorageBridgeRe
   };
 }
 
+function sortedHeaderPairs(headers: [string, string][]): [string, string][] {
+  return [...headers].sort(([leftName, leftValue], [rightName, rightValue]) => leftName < rightName ? -1 : leftName > rightName ? 1 :
+    leftValue < rightValue ? -1 : leftValue > rightValue ? 1 : 0);
+}
+
 function signedControlRequest(authority: StorageBridgeAuthority, deadline: number, requestId: number, url: string,
   headers: [string, string][], method = 'PUT', operationId?: string): StorageBridgeRequest {
   const volatile: [string, string][] = [
@@ -91,7 +96,7 @@ function signedControlRequest(authority: StorageBridgeAuthority, deadline: numbe
   ];
   const unsigned = { schema_version: 1 as const, kind: 'storage_http_request' as const, request_id: requestId,
     authority, original_deadline_unix_ms: deadline, remaining_timeout_ms: 10_000, target: 'control' as const,
-    method, url, headers: ([...headers, ...(operationId ? [['x-arrowcol-operation-id', operationId] as [string, string]] : []),
+    method, url, headers: sortedHeaderPairs([...headers, ...(operationId ? [['x-arrowcol-operation-id', operationId] as [string, string]] : []),
       ...volatile, ['x-ms-version', '2023-11-03'], ...(method === 'PUT' ? [['content-length', '0'] as [string, string]] : [])] as [string, string][]),
     body: '', body_sha256: sha('') };
   return { ...unsigned, request_sha256: sha(canonical(unsigned)) };
@@ -100,9 +105,9 @@ function signedControlRequest(authority: StorageBridgeAuthority, deadline: numbe
 function signedObjectRequest(authority: StorageBridgeAuthority, deadline: number, requestId: number, method: string, url: string, body = '', extraHeaders: [string, string][] = []): StorageBridgeRequest {
   const unsigned = { schema_version: 1 as const, kind: 'storage_http_request' as const, request_id: requestId, authority,
     original_deadline_unix_ms: deadline, remaining_timeout_ms: 10_000, target: 'object_store' as const, method, url,
-    headers: [['date', new Date(deadline - 30_000).toUTCString()], ['x-ms-version', '2023-11-03'],
+    headers: sortedHeaderPairs([['date', new Date(deadline - 30_000).toUTCString()], ['x-ms-version', '2023-11-03'],
       ['user-agent', 'arrowcol-qap/' + authority.cell_run_id + '/owned-run-table-initialization'],
-      ['x-ms-client-request-id', 'c0ffee00-0000-4000-8000-' + String(requestId).padStart(12, '0')], ...extraHeaders] as [string, string][],
+      ['x-ms-client-request-id', 'c0ffee00-0000-4000-8000-' + String(requestId).padStart(12, '0')], ...extraHeaders] as [string, string][]),
     body, body_sha256: sha(body) };
   return { ...unsigned, request_sha256: sha(canonical(unsigned)) };
 }
@@ -650,9 +655,17 @@ test('real loadgen initializer composes with the Node BR3 planned-identity paren
       }
       if (url.pathname.endsWith('/_delta_log/00000000000000000000.json') && init?.method === 'GET')
         return new Response(deltaLogBody ?? null, { status: deltaLogBody === undefined ? 404 : 200 });
-      if (url.searchParams.get('comp') === 'list') return new Response(
-        '<?xml version="1.0" encoding="utf-8"?><EnumerationResults><Blobs></Blobs><NextMarker></NextMarker></EnumerationResults>',
-        { status: 200, headers: { 'content-type': 'application/xml' } });
+      if (url.searchParams.get('comp') === 'list') {
+        const prefix = url.searchParams.get('prefix') ?? '';
+        const name = listPrefix + '_delta_log/00000000000000000000.json';
+        const blob = deltaLogBody !== undefined && name.startsWith(prefix)
+          ? '<Blob><Name>' + name + '</Name><Properties><Last-Modified>Tue, 17 Nov 2026 11:03:18 GMT</Last-Modified>' +
+            '<Content-Length>' + Buffer.byteLength(deltaLogBody, 'utf8') + '</Content-Length><Content-Type>application/json</Content-Type>' +
+            '<Etag>"offline-delta-v0"</Etag></Properties></Blob>' : '';
+        return new Response('<?xml version="1.0" encoding="utf-8"?><EnumerationResults><Blobs>' + blob +
+          '</Blobs><NextMarker></NextMarker></EnumerationResults>',
+          { status: 200, headers: { 'content-type': 'application/xml' } });
+      }
       return new Response('', { status: 500 });
     }, now: Date.now };
   const boundary = new EffectBoundary(envelope, path.join(directory, 'effects.jsonl'));
