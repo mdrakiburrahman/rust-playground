@@ -2570,7 +2570,7 @@ mod tests {
         .await
         .unwrap_err();
         assert!(error.is::<QapUnavailable>());
-        drop(server);
+        tokio::task::spawn_blocking(move || drop(server)).await?;
         assert!(
             dropped.load(Ordering::Acquire),
             "the original deadline must drop the pending response"
