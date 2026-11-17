@@ -8,7 +8,9 @@ use arrow_deltalake::delta::{
     DeltaTable, FreshTableReceipt, FreshTableTransport, INGESTION_PARTITION, PublicationFence, PublicationFenceContext,
     PublicationFenceError,
 };
-use arrow_deltalake::publisher::{ControlMetadata, InvalidNormalStamp, MutationRetries, PublisherSession, SessionMode, canonical_uuid};
+use arrow_deltalake::publisher::{
+    ControlMetadata, InvalidNormalStamp, MutationRetries, PublisherSession, SessionMode, canonical_uuid,
+};
 use arrow_deltalake::qap_http::{StorageBridge, StorageBridgeAuthority};
 use arrowcol_catalog::{DdlCommand, DdlParser};
 use serde::{Deserialize, Serialize};

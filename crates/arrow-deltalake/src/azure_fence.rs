@@ -10,7 +10,9 @@
 //! clobber metadata and must not exist. Leases serialize transitions only;
 //! registry membership never expires.
 
-use crate::publisher::{CasOutcome, ControlMetadata, InvalidNormalStamp, MetadataSnapshot, NormalAzureOwnership, canonical_uuid};
+use crate::publisher::{
+    CasOutcome, ControlMetadata, InvalidNormalStamp, MetadataSnapshot, NormalAzureOwnership, canonical_uuid,
+};
 #[cfg(test)]
 use crate::publisher::{Registry, ResetState};
 use anyhow::{Context, Result, bail};
@@ -581,7 +583,8 @@ mod tests {
             let mut changed = binding.clone();
             changed.stamp = invalid.into();
             let error = AzureControlContainer::new_with_ownership("arrowcollector1", Arc::clone(&credentials), &changed)
-                .err().expect("invalid stamp must fail");
+                .err()
+                .expect("invalid stamp must fail");
             assert!(error.downcast_ref::<InvalidNormalStamp>().is_some());
         }
         for invalid in ["", "-abc", "ab--cd", "abc-", "ab/c", "ABC"] {
