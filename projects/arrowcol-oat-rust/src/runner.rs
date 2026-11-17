@@ -3990,7 +3990,7 @@ async fn run_matrix_cell(
         i64::try_from(cell_start_unix_ms).context("run start timestamp exceeds Arrow timestamp range")?;
     let baseline_logs = platform.process_logs(config).await?;
     platform.retain_cell_process_baseline(&baseline_logs);
-    let mut client_run = run_clients(config, run_id, &assigned_tables, platform).await?;
+    let mut client_run = run_clients(config, run_id, &assigned_tables, platform, replicas).await?;
     platform.finish_resource_measurement(config).await?;
     let guard_stopped = client_run.evidence.overload_stop.is_some()
         || client_run
@@ -4325,9 +4325,10 @@ async fn run_clients(
     project_run_id: &str,
     tables: &[String],
     platform: &mut dyn Platform,
+    replicas: u32,
 ) -> Result<ClientRun> {
     let mut pinning = PinningReport::default();
-    match run_clients_inner(config, project_run_id, tables, platform, &mut pinning).await {
+    match run_clients_inner(config, project_run_id, tables, platform, &mut pinning, replicas).await {
         Ok(report) => Ok(report),
         Err(error) => {
             let sample = async {
@@ -4403,9 +4404,33 @@ async fn run_clients_inner(
     tables: &[String],
     platform: &mut dyn Platform,
     pinning: &mut PinningReport,
+    replicas: u32,
 ) -> Result<ClientRun> {
     let mut evidence = CellEvidence::default();
-    let mut prepared_guard = if config.overload_guard.enabled {
+    let scale_out = config.campaign_profile == Some(crate::config::CampaignProfile::ScaleOutSingleTable);
+    let mut prepared_scale_out = if scale_out {
+        match tokio::time::timeout(Duration::from_secs(30), PreparedScaleOutGuard::prepare(config, platform, replicas)).await {
+            Ok(Ok(prepared)) => Some(prepared),
+            result => {
+                let error = match result {
+                    Ok(Err(error)) => format!("{error:#}"),
+                    Err(error) => error.to_string(),
+                    Ok(Ok(_)) => unreachable!("successful guard preparation returned above"),
+                };
+                tracing::error!(%error, "scale-out overload protection unavailable before admission");
+                evidence.overload_guard = Some(json!({
+                    "status":"unavailable","settings":config.overload_guard,
+                    "unavailable_reason":"scale_out_pre_admission_readback_unavailable","error":error,
+                }));
+                return Ok(ClientRun {
+                    metrics: HashMap::new(), pinning: std::mem::take(pinning),
+                    qap_tables: Vec::new(), failure: Some("scale-out overload protection unavailable before admission".to_owned()),
+                    evidence,
+                });
+            }
+        }
+    } else { None };
+    let mut prepared_guard = if config.overload_guard.enabled && !scale_out {
         match tokio::time::timeout(Duration::from_secs(5), PreparedGuard::prepare(config, platform)).await {
             Ok(Ok(prepared)) => Some(prepared),
             result => {
@@ -4430,8 +4455,10 @@ async fn run_clients_inner(
                 });
             }
         }
-    } else {
+    } else if !config.overload_guard.enabled {
         evidence.overload_guard = Some(json!({"status":"disabled","settings":config.overload_guard}));
+        None
+    } else {
         None
     };
     if let Some(prepared) = &prepared_guard {
@@ -4444,6 +4471,16 @@ async fn run_clients_inner(
                 qap_tables: Vec::new(),
                 failure: Some(reason),
                 evidence,
+            });
+        }
+    }
+    if let Some(prepared) = &prepared_scale_out {
+        evidence.overload_guard = Some(prepared.engine.proof.clone());
+        evidence.overload_stop = prepared.engine.stop.clone();
+        if let Some(reason) = prepared.engine.failure() {
+            return Ok(ClientRun {
+                metrics: HashMap::new(), pinning: std::mem::take(pinning),
+                qap_tables: Vec::new(), failure: Some(reason), evidence,
             });
         }
     }
@@ -4694,6 +4731,14 @@ async fn run_clients_inner(
         prepared.engine.proof["run_id"] = json!(project_run_id);
         prepared.probe.since_ms = unix_time_ms_u64()?.saturating_sub(GUARD_MAX_GAP_MS);
     }
+    if let Some(prepared) = &mut prepared_scale_out {
+        prepared.engine.arm(run_start_unix_ms, measurement_end_unix_ms);
+        prepared.engine.proof["run_id"] = json!(project_run_id);
+        let since_ms = unix_time_ms_u64()?.saturating_sub(GUARD_MAX_GAP_MS);
+        for collector in &mut prepared.collectors {
+            collector.probe.since_ms = since_ms;
+        }
+    }
     let native = match platform.native_telemetry_source(config, &qap_tables).await {
         Ok(source) => source,
         Err(_) => {
@@ -4714,6 +4759,7 @@ async fn run_clients_inner(
         measurement_start_unix_ms,
         measurement_end_unix_ms,
         prepared_guard,
+        prepared_scale_out,
     );
     let mut client_metrics = HashMap::<String, Vec<ClientMeasurement>>::with_capacity(tables.len());
     let mut completed_clients = HashSet::new();

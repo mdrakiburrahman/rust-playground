@@ -472,7 +472,7 @@ impl PreparedScaleOutGuard {
         if logs.len() != expected.len() {
             bail!("scale-out collector startup evidence does not cover the expected pod set");
         }
-        let mut collectors = Vec::with_capacity(expected.len());
+        let mut probes = Vec::with_capacity(expected.len());
         for identity in &expected {
             let instance_id = format!("{}/{}", identity.pod, config.dfe_container);
             let matches = logs.iter().filter(|log| log.instance_id == instance_id).collect::<Vec<_>>();
@@ -487,13 +487,13 @@ impl PreparedScaleOutGuard {
                 .filter(|value| *value > 0).context("collector RSS cap unavailable")?;
             let buffer_cap = observed.pointer("/pressure/buffered_bytes_limit").and_then(Value::as_u64)
                 .filter(|value| *value > 0).context("collector buffer cap unavailable")?;
-            collectors.push(ScaleOutCollectorProbe {
-                identity: identity.clone(),
-                scraper: scale_out_collector_scraper(config, &identity.pod).await?,
-                probe: GuardProbe { instance_id, rss_cap, buffer_cap, collector_instance:None,
-                    local:false, since_ms:unix_time_ms_u64()?.saturating_sub(GUARD_MAX_GAP_MS) },
-            });
+            probes.push((identity.clone(), GuardProbe { instance_id, rss_cap, buffer_cap, collector_instance:None,
+                local:false, since_ms:unix_time_ms_u64()?.saturating_sub(GUARD_MAX_GAP_MS) }));
         }
+        let collectors = futures_util::future::try_join_all(probes.into_iter().map(|(identity, probe)| async move {
+            let scraper = scale_out_collector_scraper(config, &identity.pod).await?;
+            Ok::<_, anyhow::Error>(ScaleOutCollectorProbe { identity, scraper, probe })
+        })).await?;
         let mut prepared = Self { replicas, expected, collectors, engine:GuardEngine::new(config.overload_guard.clone()) };
         let (reading, backlog, per_pod) = prepared.read(config).await?;
         prepared.engine.proof["last_per_pod"] = per_pod;
@@ -1367,7 +1367,7 @@ mod overload_guard_tests {
                     prepared.engine.arm(start, end);
                     prepared.engine.proof["run_id"] = json!(run_id);
                     let mut evidence = CellEvidence::default();
-                    ResourceSampler::start(missing.resource_sampler_source(), config.clone(), start, end, Some(prepared))
+                    ResourceSampler::start(missing.resource_sampler_source(), config.clone(), start, end, Some(prepared), None)
                         .finish(&mut evidence).await?;
                     let proof = evidence.overload_guard.context("idle guard proof missing")?;
                     println!("guard_docker_idle {}", serde_json::to_string(&proof)?);
