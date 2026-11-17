@@ -1239,6 +1239,17 @@ impl Metrics {
         Self(Arc::default(), Arc::new(Instruments::new()))
     }
 
+    fn invalidate_targets(&self) -> Result<()> {
+        let mut counters = self
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("target readback mutex poisoned"))?;
+        for target in counters.delta_targets.values_mut() {
+            target.observe(None);
+        }
+        Ok(())
+    }
+
     fn target_tables(&self, names: &[String], discovery: &dyn TableDiscovery) -> Result<()> {
         let mut counters = self
             .0
@@ -2147,15 +2158,20 @@ fn maintain_table(
             .lock()
             .map_err(|_| anyhow::anyhow!("per-table maintenance gate poisoned"))?;
         let limits = &settings.operation_limits;
-        let target = match discovery
-            .open_probe_table(&discovered.url, limits.discovery_max_log_files)
-            .and_then(|probe| {
-                probe
-                    .maintenance_target_with_limits(limits.discovery_max_log_files, limits.discovery_max_log_file_bytes)
-            }) {
-            Ok(target) => target,
+        let probe = discovery.open_probe_table(&discovered.url, limits.discovery_max_log_files);
+        // Storage errors may include credential-bearing URIs.
+        let target = match &probe {
+            Ok(probe) => match probe
+                .maintenance_target_with_limits(limits.discovery_max_log_files, limits.discovery_max_log_file_bytes)
+            {
+                Ok(target) => target,
+                Err(_) => {
+                    eprintln!("delta-maintenance target metadata readback failed; identity unresolved table={name}");
+                    None
+                }
+            },
             Err(_) => {
-                eprintln!("delta-maintenance target metadata readback failed; identity unresolved table={name}");
+                eprintln!("delta-maintenance target open failed; identity unresolved table={name}");
                 None
             }
         };
@@ -2181,7 +2197,7 @@ fn maintain_table(
             }
             schedule.insert(name.into(), (now, policy));
         }
-        let probe = discovery.open_probe_table(&discovered.url, limits.discovery_max_log_files)?;
+        let probe = probe?;
         let token = probe.probe_log_token(limits.discovery_max_log_files)?;
         if discovered.log_token.as_ref().is_none_or(|previous| *previous != token)
             && !policy_matches(
@@ -2438,6 +2454,9 @@ fn cycle_with_discovery(
     force_abort: &Arc<AtomicBool>,
     schedule: Option<&Mutex<ScheduledTables>>,
 ) -> Result<Vec<OperationResult>> {
+    if let Err(error) = metrics.invalidate_targets() {
+        eprintln!("delta-maintenance target invalidation failed: {error:#}");
+    }
     let names = discovery.tables()?;
     let mut target_names = names.clone();
     match discovery.pending_tables() {
