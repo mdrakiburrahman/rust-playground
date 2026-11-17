@@ -519,8 +519,8 @@ async fn run(case: Case) -> Result<Parent> {
             "CLI exited before the unanswered request deadline"
         );
         ensure!(
-            errors.contains("deadline") || errors.contains("timeout"),
-            "exit was not a transport deadline failure: {errors}"
+            errors.contains("storage bridge response_lost"),
+            "deadline did not retain the unknown transport outcome: {errors}"
         );
     }
     ensure!(!marker.exists(), "direct credential fallback");
