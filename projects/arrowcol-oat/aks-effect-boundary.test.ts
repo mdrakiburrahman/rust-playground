@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import { once } from 'node:events';
+import { createServer } from 'node:http';
 import { mkdtempSync, readFileSync, rmSync, chmodSync, writeFileSync, writeSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -6,11 +8,12 @@ import { test } from 'node:test';
 import { stringify } from 'yaml';
 import { Azure, Config, exchange_workload_identity_assertion, runtime } from '../../infra/azure/bootstrap.js';
 import { defaultStampConfig } from '../../infra/azure/stamp.js';
-import { EffectBoundary, EffectBoundaryRefused, dispatchExternalEffect, withEffectBoundary,
+import { EffectBoundary, EffectBoundaryRefused, ResponseWithholdingSupervisor, dispatchExternalEffect, withEffectBoundary,
   type EffectEnvelope, type EffectRule } from '../../infra/azure/effect-boundary.js';
-import { createBlobCampaignStore, managedIdentityToken, readArmOperationStatus, type CampaignState, type CampaignStore } from './aks-campaign.js';
+import { createBlobCampaignStore, managedIdentityToken, publishRunInventory, readArmOperationStatus, startCampaign,
+  type CampaignState, type CampaignStore } from './aks-campaign.js';
 import { isCellCleanupSelector } from './aks-cell-cleanup.js';
-import { boundedEffectRehearsal } from './aks-effect-rehearsal.js';
+import { boundedEffectRehearsal, type BoundedEffectRehearsalDependencies } from './aks-effect-rehearsal.js';
 import { createSyntheticArmedCampaignState } from './aks-rehearsal.js';
 
 const campaignId = 'c0ffee00-0000-4000-8000-000000000001';
@@ -42,6 +45,43 @@ function inMemoryCampaignStore(initial: CampaignState): CampaignStore {
       revision++;
       return String(revision);
     },
+  };
+}
+
+
+function emptyCampaignStore(): CampaignStore {
+  let current: { state: CampaignState; etag: string } | undefined;
+  let revision = 0;
+  return {
+    async read() { return current && structuredClone(current); },
+    async write(state, expectedEtag) {
+      if (expectedEtag !== current?.etag) throw new Error('in-memory campaign CAS conflict');
+      const etag = String(++revision);
+      current = { state: structuredClone(state), etag };
+      return etag;
+    },
+  };
+}
+
+function initialRunInventory(ownerId: string): Record<string, unknown> {
+  const step = { state: 'not_started', deadline_unix_ms: null, reason_code: null };
+  const namespace = 'arrowcol-' + runId.replace(/-/g, '');
+  return {
+    schema_version: 1, campaign_id: campaignId, owner_id: ownerId, fencing_token: 1,
+    orchestration_run_id: 'c0ffee00-0000-4000-8000-000000000003', cell_run_id: runId,
+    load_admission: 'not_authorized', planned_cell_duration_ms: 60_000,
+    effective_stop_budgets: { maintenance_grace_seconds: 4_800, maintenance_stop_timeout_ms: 5_100_000 },
+    namespace: { name: namespace, uid: null, owner_token: ownerId },
+    resources: ['arrowcol', 'arrowcol-client', 'delta-maintenance'].map((name, index) => ({
+      api_version: 'apps/v1', kind: 'Deployment', namespace, name, uid: null, absence: null, state: 'planned',
+      role: index === 0 ? 'collector' : index === 1 ? 'client' : 'maintenance',
+    })),
+    fic: { resource_id: '/subscriptions/' + subscriptionId + '/resourceGroups/perf69/providers/Microsoft.ManagedIdentity/userAssignedIdentities/arrow-collector/federatedIdentityCredentials/arrowcol-run-' + runId,
+      name: 'arrowcol-run-' + runId, state: 'planned', absence: null },
+    qap: { database: 'perf69-qap', bindings: [{ external_table: 'arrowcol_data', relative_path: 'perf69/' + runId }],
+      state: 'planned', absence: [] },
+    cleanup: { stop_admission: { ...step }, bounded_drain: { ...step }, evidence_capture: { ...step },
+      stop_maintenance: { ...step }, terminal_capture: { ...step }, handoff: { ...step } },
   };
 }
 
@@ -237,6 +277,106 @@ test('watchdog rehearsal returns its actual custody evaluation', async t => {
   assert.equal(evaluation?.cleanupStatus, 'not-started');
   assert.equal(evaluation?.pendingArmOperations, 0);
   assert.equal(evaluation?.cleanupProgress, undefined);
+});
+
+test('one-shot response withholding records the real Blob response and blocks restart replay', async t => {
+  const directory = tempDir(); t.after(() => rmSync(directory, { recursive: true, force: true }));
+  let forwards = 0;
+  const server = createServer((request, response) => {
+    forwards++;
+    request.resume();
+    request.on('end', () => {
+      response.writeHead(201, { etag: '"baseline-etag"', connection: 'close' });
+      response.end('created-by-local-provider');
+    });
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  t.after(async () => {
+    await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+  });
+  const address = server.address();
+  assert.ok(address && typeof address === 'object');
+  const localUrl = 'http://127.0.0.1:' + address.port;
+  const fetcher: typeof fetch = async (_input, init) => fetch(localUrl, init);
+  const effect = rule('baseline-put', 'campaign-blob', 'PUT',
+    'https://arrowcollector68590.blob.core.windows.net/checkpoints', '/checkpoints/baseline.json');
+  const allocation = envelope([effect]), receiptPath = path.join(directory, 'effects.jsonl');
+  const evidencePath = path.join(directory, 'withheld-response.json');
+  const target = { transport: effect.transport, method: effect.method, resource: effect.resource, path: effect.path };
+  const supervisor = new ResponseWithholdingSupervisor(campaignId, runId, target, evidencePath);
+  const store = createBlobCampaignStore({ account: stamp.storage_account, container: stamp.state_container,
+    subscriptionId, recordPath: 'baseline.json' }, fetcher, async () => 'test-only-token');
+  const state = createSyntheticArmedCampaignState(campaignId, runId);
+  await assert.rejects(withEffectBoundary(new EffectBoundary(allocation, receiptPath), () => store.write(state), supervisor),
+    /durably captured and withheld/);
+  assert.equal(supervisor.wasTriggered, true);
+  assert.equal(forwards, 1);
+  const evidence = JSON.parse(readFileSync(evidencePath, 'utf8'));
+  assert.equal(evidence.event, 'provider_response_withheld');
+  assert.equal(evidence.status, 201);
+  assert.match(evidence.response_sha256, /^[0-9a-f]{64}$/);
+  assert.equal(JSON.stringify(evidence).includes('created-by-local-provider'), false);
+
+  const restartedStore = createBlobCampaignStore({ account: stamp.storage_account, container: stamp.state_container,
+    subscriptionId, recordPath: 'baseline.json' }, fetcher, async () => 'test-only-token');
+  await assert.rejects(withEffectBoundary(new EffectBoundary(allocation, receiptPath), () => restartedStore.write(state)),
+    EffectBoundaryRefused);
+  assert.equal(forwards, 1);
+  const receipts = readFileSync(receiptPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+  assert.equal(receipts.find(row => row.event === 'result')?.outcome, 'unknown_after_forward');
+});
+
+
+test('setup-baseline sequences the immutable inventory and resumes after withheld Blob acknowledgement', async t => {
+  const directory = tempDir(); t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const fixture = writeRehearsalFixture(directory, runId, runId);
+  const resource = 'https://arrowcollector12345.blob.core.windows.net/checkpoints';
+  const baselinePath = '/checkpoints/_arrowcol-custody/campaigns/' + campaignId + '/baseline.json';
+  const allocation = { ...envelope([rule('baseline-lookup', 'campaign-blob', 'GET', resource, baselinePath, 2),
+    rule('baseline-write', 'campaign-blob', 'PUT', resource, baselinePath)]), storage_account: 'arrowcollector12345' };
+  writeFileSync(fixture.allocationPath, JSON.stringify(allocation), { mode: 0o600 });
+  const initialInventoryPath = path.join(directory, 'initial-inventory.json');
+  writeFileSync(initialInventoryPath, JSON.stringify(initialRunInventory(runId)), { mode: 0o600 });
+  const planPath = path.join(directory, 'withhold-plan.json');
+  const evidencePath = path.join(directory, 'withheld-response.json');
+  writeFileSync(planPath, JSON.stringify({ schema_version: 1, campaign_id: campaignId, run_id: runId,
+    target: { transport: 'campaign-blob', method: 'PUT', resource, path: baselinePath },
+    evidence_file: path.basename(evidencePath) }), { mode: 0o600 });
+
+  const store = emptyCampaignStore();
+  const calls: string[] = [];
+  let lookupCount = 0, writeCount = 0;
+  const campaignMain: NonNullable<BoundedEffectRehearsalDependencies['campaignMain']> = async (args, dependencies) => {
+    calls.push(args[0]!);
+    if (args[0] === 'start') await startCampaign(store, args[1]!, args[2]!, 1_000_000);
+    else if (args[0] === 'publish-inventory') await publishRunInventory(store, dependencies?.runInventoryInput, 1_000_001);
+    else if (args[0] === 'capture-baseline') {
+      const existing = await dispatchExternalEffect({ transport: 'campaign-blob', method: 'GET', resource, path: baselinePath },
+        async () => new Response(null, { status: lookupCount++ === 0 ? 404 : 200 }));
+      if (existing instanceof Response && existing.status === 404) {
+        await dispatchExternalEffect({ transport: 'campaign-blob', method: 'PUT', resource, path: baselinePath,
+          body: Buffer.from('provider-generated-baseline') }, async () => {
+          writeCount++;
+          return new Response('created', { status: 201, headers: { etag: '"baseline"' } });
+        });
+      }
+    } else throw new Error('Unexpected campaign action: ' + args[0]);
+  };
+  const firstArgs = ['--mode', 'setup-baseline', '--env-file', fixture.envPath, '--stamp-config', fixture.stampPath,
+    '--effect-envelope', fixture.allocationPath, '--receipt-file', fixture.receiptPath,
+    '--initial-inventory-file', initialInventoryPath, '--withhold-response', planPath];
+  await assert.rejects(boundedEffectRehearsal(firstArgs, { store, campaignMain }), /durably captured and withheld/);
+  assert.deepEqual(calls, ['start', 'publish-inventory', 'capture-baseline']);
+  assert.equal(writeCount, 1);
+  assert.equal(JSON.parse(readFileSync(evidencePath, 'utf8')).status, 201);
+
+  await boundedEffectRehearsal([...firstArgs.slice(0, -2), '--resume'], { store, campaignMain });
+  assert.deepEqual(calls, ['start', 'publish-inventory', 'capture-baseline', 'capture-baseline']);
+  assert.equal(lookupCount, 2);
+  assert.equal(writeCount, 1);
+  const receipts = readFileSync(fixture.receiptPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+  assert.equal(receipts.filter(row => row.event === 'result' && row.method === 'PUT' && row.outcome === 'unknown_after_forward').length, 1);
 });
 
 test('Azure REST and process adapters reject unallocated targets before transport', async t => {

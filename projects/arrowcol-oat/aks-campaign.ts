@@ -396,6 +396,11 @@ export function isInitialRunInventory(inventory: RunInventory | undefined): bool
     Object.values(inventory.cleanup).every(step =>
       step.state === 'not_started' && step.deadline_unix_ms === null && step.reason_code === null));
 }
+export function validateInitialRunInventory(value: unknown, campaignId: string, ownerId: string): RunInventory {
+  const inventory = validateRunInventory(value, newCampaignState(campaignId, ownerId, 0));
+  if (!isInitialRunInventory(inventory)) throw new Error('Initial RunInventory must remain not_authorized with persisted maintenance budgets.');
+  return inventory;
+}
 function mergeRunInventory(before: RunInventory | undefined, after: RunInventory): RunInventory {
   const initial = () => {
     if (!isInitialRunInventory(after))
@@ -938,6 +943,7 @@ async function readRunInventoryStdin(): Promise<unknown> {
 
 export async function campaignMain(args: string[], dependencies: {
   store?: CampaignStore; azure?: import('../../infra/azure/bootstrap.js').Azure; env?: NodeJS.ProcessEnv; cleanupEnvelope?: unknown;
+  runInventoryInput?: unknown;
 } = {}): Promise<void> {
   if (args[0] === 'cleanup-step') {
     const cell = await import('./aks-cell-cleanup.js');
@@ -976,8 +982,8 @@ export async function campaignMain(args: string[], dependencies: {
     const result = await armCampaign(store, current.state.ownerId, Number(fencingTokenText));
     console.log(JSON.stringify({ campaignId: result.state.campaignId, mode: result.state.mode }));
   } else if (action === 'publish-inventory' && args.length === 1) {
-    const input = await readRunInventoryStdin();
-    if (!record(input)) throw new Error('RunInventory stdin must be an object.');
+    const input = dependencies.runInventoryInput ?? await readRunInventoryStdin();
+    if (!record(input)) throw new Error('RunInventory input must be an object.');
     const current = await store.read();
     if (!current) throw new Error('No active campaign state exists.');
     assertCampaignEnvironment(env, current.state);
