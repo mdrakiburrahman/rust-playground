@@ -939,6 +939,7 @@ mod tests {
 
     fn synthetic_availability_batch(start: usize, rows: usize, schema: &SchemaRef) -> Result<RecordBatch> {
         let mut replica_ids = Vec::with_capacity(rows);
+        let mut diagnostic_tokens = Vec::with_capacity(rows);
         let mut group_ids = Vec::with_capacity(rows);
         let mut server_names = Vec::with_capacity(rows);
         let mut endpoints = Vec::with_capacity(rows);
@@ -951,6 +952,7 @@ mod tests {
         for row in start..start + rows {
             let seed = row as u64 + 1;
             replica_ids.push(synthetic_text(seed, 36));
+            diagnostic_tokens.push(synthetic_text(seed ^ 0x4f1b_bcdd, 48));
             group_ids.push(synthetic_text(seed / 1024, 36));
             server_names.push(synthetic_text(seed % 64 + 1, 48));
             endpoints.push(synthetic_text(seed % 128 + 1, 190));
@@ -965,6 +967,7 @@ mod tests {
         }
         let mut columns: Vec<arrow::array::ArrayRef> = vec![
             Arc::new(StringArray::from(replica_ids)),
+            Arc::new(StringArray::from(diagnostic_tokens)),
             Arc::new(StringArray::from(group_ids)),
             Arc::new(StringArray::from(server_names)),
             Arc::new(StringArray::from(endpoints)),
@@ -1026,6 +1029,7 @@ mod tests {
         ensure!(rows > 0, "W4_BENCH_ROWS must be positive");
         let schema = Arc::new(Schema::new(vec![
             Field::new("replica_id", DataType::Utf8, false),
+            Field::new("diagnostic_token", DataType::Utf8, false),
             Field::new("group_id", DataType::Utf8, false),
             Field::new("server_name", DataType::Utf8, false),
             Field::new("endpoint_url", DataType::Utf8, false),
@@ -1063,8 +1067,9 @@ mod tests {
         let cpu_seconds = process_cpu_seconds()? - cpu_started;
         let physical_bytes = std::fs::metadata(&path)?.len();
         eprintln!(
-            "W4_BENCH profile=synthetic_availability_replica_states_v1 rows={rows} arrow_bytes={input_bytes} physical_bytes={physical_bytes} arrow_parquet_ratio={:.2} wall_seconds={elapsed:.3} cpu_seconds={cpu_seconds:.3} input_mib_s={:.2} mib_s_per_core={:.2} rows_s={:.0} requested_threads={requested_threads} effective_threads={effective_threads}",
+            "W4_BENCH profile=synthetic_availability_replica_states_v1 rows={rows} arrow_bytes={input_bytes} physical_bytes={physical_bytes} arrow_parquet_ratio={:.2} arrow_bytes_per_row={:.1} wall_seconds={elapsed:.3} cpu_seconds={cpu_seconds:.3} input_mib_s={:.2} mib_s_per_core={:.2} rows_s={:.0} requested_threads={requested_threads} effective_threads={effective_threads}",
             input_bytes as f64 / physical_bytes as f64,
+            input_bytes as f64 / rows as f64,
             input_bytes as f64 / elapsed / (1024.0 * 1024.0),
             input_bytes as f64 / cpu_seconds / (1024.0 * 1024.0),
             rows as f64 / elapsed,
