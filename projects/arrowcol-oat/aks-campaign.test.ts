@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { CampaignConflictError, CUSTODY_CLEANUP_STEPS, MAX_CAMPAIGN_LIFETIME_MS, MISSED_HEARTBEAT_LIMIT, HEARTBEAT_INTERVAL_MS,
+import { CampaignConflictError, CUSTODY_CLEANUP_STEPS, MAX_CAMPAIGN_LIFETIME_MS, KNOWN_LIFECYCLE_CLEANUP_RESERVE_MS, assessCellLifetimeBudget,
+  MISSED_HEARTBEAT_LIMIT, HEARTBEAT_INTERVAL_MS,
+  createBlobCampaignStore,
   armCampaign, assertCampaignEnvironment, assertRunInventoryReady, campaignStartReceipt, heartbeatCampaign, mutateCampaign, newCampaignState, publishCleanupRunInventory, publishRunInventory, runInventoryPublishReceipt, startCampaign,
   validateCampaignState, type CampaignState, type CampaignStore, type RunInventory, type StoredCampaign,
   CampaignWriteOutcomeUnknownError, recordArmOperation } from './aks-campaign.js';
@@ -42,6 +44,7 @@ const inventoryFor = (state: CampaignState, observed = false): RunInventory => {
   return {
     schema_version: 1, campaign_id: state.campaignId, owner_id: state.ownerId, fencing_token: state.runInventory?.fencing_token ?? state.fencingToken,
     orchestration_run_id: orchestrationRunId, cell_run_id: cellRunId, load_admission: state.runInventory?.load_admission ?? 'not_authorized',
+    planned_cell_duration_ms: 60_000, effective_stop_budgets: { maintenance_grace_seconds: 900, maintenance_stop_timeout_ms: 1_200_000 },
     namespace: { name: namespace, uid: observed ? 'c0ffee00-0000-4000-8000-000000000009' : null, owner_token: state.ownerId },
     resources: names.map((name, index) => ({ api_version: 'apps/v1', kind: 'Deployment', namespace, name,
       uid: observed ? uids[index]! : null, absence: null, role: index === 0 ? 'collector' : index === 1 ? 'client' : 'maintenance', state: stateName })),
@@ -76,6 +79,59 @@ test('load admission requires a pre-provisioning initial record and cannot skip 
   await publishRunInventory(store, { ...planned, load_admission: 'authorized' }, started.startedAtMs);
   await assert.rejects(publishRunInventory(store, planned, started.startedAtMs), /monotonically/);
   assert.equal((await store.read())!.state.runInventory!.load_admission, 'authorized');
+});
+
+test('Rust RunInventory timing fields are strictly parsed and legacy inventory cannot arm', async () => {
+  const store = await seed(), started = (await store.read())!.state;
+  const rustInventory = JSON.parse(JSON.stringify(inventoryFor(started))) as RunInventory;
+  await publishRunInventory(store, rustInventory, started.startedAtMs);
+  const invalidBudgets = [
+    { maintenance_grace_seconds: 900, maintenance_stop_timeout_ms: 1_199_999 },
+    { maintenance_grace_seconds: 900, maintenance_stop_timeout_ms: 5_100_001 },
+    { maintenance_grace_seconds: 900, maintenance_stop_timeout_ms: 1_200_000, extra: true },
+  ];
+  for (const effective_stop_budgets of invalidBudgets)
+    await assert.rejects(publishRunInventory(store, { ...rustInventory, effective_stop_budgets }, started.startedAtMs),
+      /effective|timeout/);
+
+  const legacyStore = await seed(), legacyStarted = (await legacyStore.read())!.state;
+  const inventory = inventoryFor(legacyStarted);
+  const { planned_cell_duration_ms: _duration, effective_stop_budgets: _budgets, ...legacy } = inventory;
+  legacyStore.current = { state: validateCampaignState({ ...legacyStarted, runInventory: legacy }), etag: 'legacy-etag' };
+  await assert.rejects(armCampaign(legacyStore, ownerId, legacyStarted.fencingToken, legacyStarted.startedAtMs),
+    /without a new-cell duration and maintenance stop budget/);
+});
+
+test('bounded lifetime arithmetic admits equality and rejects a one-millisecond shortfall', async () => {
+  const stopTimeout = 1_200_000;
+  const duration = MAX_CAMPAIGN_LIFETIME_MS - stopTimeout - KNOWN_LIFECYCLE_CLEANUP_RESERVE_MS;
+  assert.deepEqual(assessCellLifetimeBudget(MAX_CAMPAIGN_LIFETIME_MS, duration, stopTimeout,
+    KNOWN_LIFECYCLE_CLEANUP_RESERVE_MS), { status: 'ready', required_ms: MAX_CAMPAIGN_LIFETIME_MS });
+  assert.deepEqual(assessCellLifetimeBudget(MAX_CAMPAIGN_LIFETIME_MS - 1, duration, stopTimeout,
+    KNOWN_LIFECYCLE_CLEANUP_RESERVE_MS), { status: 'insufficient', required_ms: MAX_CAMPAIGN_LIFETIME_MS });
+});
+
+test('cell admission retains UNKNOWN for unbounded cleanup completion stages', async () => {
+  const state = newCampaignState(campaignId, ownerId, 100);
+  const store = new MemoryStore(); store.current = { state, etag: 'etag-1' };
+  const assessment = assessCellLifetimeBudget(MAX_CAMPAIGN_LIFETIME_MS, 0, 1_200_000);
+  assert.equal(assessment.status, 'unknown');
+  if (assessment.status === 'unknown') {
+    assert.equal(assessment.required_ms, 1_200_000 + KNOWN_LIFECYCLE_CLEANUP_RESERVE_MS);
+    assert.match(assessment.reason, /preserve-evidence.*remove-run-namespace/);
+  }
+  await publishRunInventory(store, { ...inventoryFor(state), planned_cell_duration_ms: 0 }, state.startedAtMs);
+  assert.equal((await store.read())!.state.runInventory!.planned_cell_duration_ms, 0);
+});
+
+test('zero-duration rehearsal stays not-authorized and cell duration/stop budgets cannot change', async () => {
+  const store = await seed(), started = (await store.read())!.state;
+  const rowFree = { ...inventoryFor(started), planned_cell_duration_ms: 0 };
+  await publishRunInventory(store, rowFree, started.startedAtMs);
+  await assert.rejects(publishRunInventory(store, { ...rowFree, load_admission: 'authorization_pending' }, started.startedAtMs), /malformed/);
+  await assert.rejects(publishRunInventory(store, { ...rowFree, planned_cell_duration_ms: 1 }, started.startedAtMs), /immutable/);
+  await assert.rejects(publishRunInventory(store, { ...rowFree,
+    effective_stop_budgets: { maintenance_grace_seconds: 900, maintenance_stop_timeout_ms: 1_200_001 } }, started.startedAtMs), /immutable/);
 });
 
 test('maintenance milestone is required, bounded, monotonic and required for handoff', async () => {
@@ -329,4 +385,21 @@ test('strict state schema rejects additional persisted fields', async () => {
   const store = new MemoryStore();
   await mutateCampaign(store, () => state);
   assert.equal((await store.read())!.state.campaignId, campaignId);
+});
+
+
+test('campaign Blob store keeps the default record path and supports isolated paths', async () => {
+  const paths: string[] = [];
+  const fetcher: typeof fetch = async input => {
+    paths.push(new URL(String(input)).pathname);
+    return new Response(null, { status: 404 });
+  };
+  const config = { account: 'arrowcollector12345', container: 'checkpoints', subscriptionId };
+  await createBlobCampaignStore(config, fetcher, async () => 'fixture-token').read();
+  await createBlobCampaignStore({ ...config, recordPath: '_arrowcol-custody-rehearsal/rehearsal-1/active.json' },
+    fetcher, async () => 'fixture-token').read();
+  assert.deepEqual(paths, ['/checkpoints/active.json',
+    '/checkpoints/_arrowcol-custody-rehearsal/rehearsal-1/active.json']);
+  assert.throws(() => createBlobCampaignStore({ ...config, recordPath: '../active.json' }, fetcher,
+    async () => 'fixture-token'), /Campaign store record path is invalid/);
 });

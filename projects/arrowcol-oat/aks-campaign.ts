@@ -4,11 +4,35 @@ import { pathToFileURL } from "node:url";
 import type { RunFicPlan } from '../../infra/azure/run_fic.js';
 import type { OatQapReference } from '../../infra/azure/oat_qap.js';
 import { loadCustodyConfig } from './aks-custody-config.js';
+import { dispatchExternalEffect, isEffectBoundaryActive } from '../../infra/azure/effect-boundary.js';
+import { ADMISSION_STOP_BUDGET_MS, DRAIN_BUDGET_MS, TERMINAL_CAPTURE_BUDGET_MS } from './aks-cleanup-budget.js';
+import { parseEffectiveStopBudgets } from './stop-budgets.js';
 export const HEARTBEAT_INTERVAL_MS = 60_000;
 export const MISSED_HEARTBEAT_LIMIT = 3;
 export const MAX_CAMPAIGN_LIFETIME_MS = 6 * 60 * 60 * 1000;
 const MAX_ARM_OPERATIONS = 128;
 export const CUSTODY_CLEANUP_STEPS = ["stop-admission", "bounded-drain", "preserve-evidence", "stop-maintenance", "record-terminal-state", "remove-run-namespace", "remove-run-qap", "remove-run-fic", "restore-safe-idle", "verify-safe-idle"] as const;
+export const KNOWN_LIFECYCLE_CLEANUP_RESERVE_MS = ADMISSION_STOP_BUDGET_MS + DRAIN_BUDGET_MS + TERMINAL_CAPTURE_BUDGET_MS;
+export const UNBOUNDED_CLEANUP_RESERVE_STEPS = ['preserve-evidence', 'remove-run-namespace', 'remove-run-qap',
+  'remove-run-fic', 'restore-safe-idle', 'verify-safe-idle', 'handoff'] as const;
+export type CellLifetimeAssessment =
+  | { status: 'ready'; required_ms: number }
+  | { status: 'insufficient'; required_ms: number }
+  | { status: 'unknown'; required_ms: number; reason: string }
+  | { status: 'invalid'; reason: string };
+export function assessCellLifetimeBudget(remainingMs: number, durationMs: number, maintenanceStopMs: number,
+  cleanupReserveMs?: number): CellLifetimeAssessment {
+  if (![remainingMs, durationMs, maintenanceStopMs].every(nonnegative) ||
+      cleanupReserveMs !== undefined && !nonnegative(cleanupReserveMs))
+    return { status: 'invalid', reason: 'Cell admission budget values must be nonnegative safe integers.' };
+  const reserve = cleanupReserveMs ?? KNOWN_LIFECYCLE_CLEANUP_RESERVE_MS;
+  const required = durationMs + maintenanceStopMs + reserve;
+  if (!Number.isSafeInteger(required)) return { status: 'invalid', reason: 'Cell admission budget sum exceeds safe integer bounds.' };
+  if (remainingMs < required) return { status: 'insufficient', required_ms: required };
+  return cleanupReserveMs === undefined ? { status: 'unknown', required_ms: required,
+    reason: 'Cleanup completion has unbounded steps: ' + UNBOUNDED_CLEANUP_RESERVE_STEPS.join(', ') } :
+    { status: 'ready', required_ms: required };
+}
 export type CleanupStepName = typeof CUSTODY_CLEANUP_STEPS[number];
 export const DRAIN_UNSETTLED_REASON = 'drain_deadline_expired_unsettled';
 export interface DrainExpiryReceipt {
@@ -96,6 +120,8 @@ export interface RunInventory {
   fic: { resource_id: string | null; name: string | null; state: RunInventoryResourceState; absence: InventoryFicAbsenceReceipt | null; plan?: RunFicPlan | null } | null;
   qap: { database: string; bindings: Array<{ external_table: string; relative_path: string }>; state: RunInventoryResourceState; absence: InventoryQapAbsenceReceipt[]; reference?: OatQapReference | null } | null;
   evidence_destination?: { account: string; container: string; blob_prefix: string } | null;
+  planned_cell_duration_ms?: number;
+  effective_stop_budgets?: { maintenance_grace_seconds: number; maintenance_stop_timeout_ms: number };
   cleanup: { stop_admission: InventoryStep; bounded_drain: InventoryStep; evidence_capture: InventoryStep; stop_maintenance: InventoryStep;
     terminal_capture: InventoryStep; handoff: InventoryStep };
 }
@@ -111,12 +137,18 @@ function validStep(value: unknown): value is InventoryStep {
     (!['failed', 'uncertain'].includes(String(value.state)) || value.reason_code !== null);
 }
 function validateRunInventory(value: unknown, state: CampaignState): RunInventory {
+  const stopBudgets = value && typeof value === 'object' && !Array.isArray(value) ?
+    (value as Record<string, unknown>).effective_stop_budgets : undefined;
+  if (stopBudgets !== undefined) parseEffectiveStopBudgets(stopBudgets);
   const fields = ['schema_version', 'campaign_id', 'owner_id', 'fencing_token', 'orchestration_run_id', 'cell_run_id', 'load_admission',
     'namespace', 'resources', 'fic', 'qap', 'cleanup'];
-  if (!optionalRecord(value, fields, ['evidence_destination']) || value.schema_version !== 1 || value.campaign_id !== state.campaignId ||
+  if (!optionalRecord(value, fields, ['evidence_destination', 'planned_cell_duration_ms', 'effective_stop_budgets']) || value.schema_version !== 1 || value.campaign_id !== state.campaignId ||
       value.owner_id !== state.ownerId || value.fencing_token !== (state.status === 'active' ? state.fencingToken : state.runInventory?.fencing_token) || !nonnegative(value.fencing_token) || value.fencing_token === 0 ||
       !canonicalUuid(value.campaign_id) || !canonicalUuid(value.owner_id) || !canonicalUuid(value.orchestration_run_id) || !canonicalUuid(value.cell_run_id) ||
       !['not_authorized', 'authorization_pending', 'authorized'].includes(String(value.load_admission)) ||
+      (value.planned_cell_duration_ms === undefined) !== (value.effective_stop_budgets === undefined) ||
+      value.planned_cell_duration_ms !== undefined && (!nonnegative(value.planned_cell_duration_ms) ||
+        value.planned_cell_duration_ms === 0 && value.load_admission !== 'not_authorized') ||
       !exactRecord(value.namespace, ['name', 'uid', 'owner_token']) || !k8sName(value.namespace.name) ||
       !String(value.namespace.name).endsWith('-' + value.cell_run_id.replace(/-/g, '')) ||
       !(value.namespace.uid === null || canonicalUuid(value.namespace.uid)) || !canonicalUuid(value.namespace.owner_token) ||
@@ -263,6 +295,7 @@ function mergeStep(before: InventoryStep, after: InventoryStep): InventoryStep {
 }
 export function isInitialRunInventory(inventory: RunInventory | undefined): boolean {
   return Boolean(inventory && inventory.load_admission === 'not_authorized' && inventory.namespace.uid === null &&
+    nonnegative(inventory.planned_cell_duration_ms) && inventory.effective_stop_budgets !== undefined &&
     inventory.resources.every(resource => resource.state === 'planned' && resource.uid === null && resource.absence === null) &&
     (!inventory.fic || inventory.fic.state === 'planned' && inventory.fic.absence === null) &&
     (!inventory.qap || inventory.qap.state === 'planned' && inventory.qap.absence.length === 0 && !inventory.qap.reference) &&
@@ -286,6 +319,11 @@ function mergeRunInventory(before: RunInventory | undefined, after: RunInventory
   const admission = ['not_authorized', 'authorization_pending', 'authorized'];
   const from = admission.indexOf(before.load_admission), to = admission.indexOf(after.load_admission);
   if (to < from || to > from + 1) throw new Error('RunInventory load admission must advance monotonically through authorization_pending.');
+  if (before.planned_cell_duration_ms !== after.planned_cell_duration_ms ||
+      (before.effective_stop_budgets === undefined) !== (after.effective_stop_budgets === undefined) ||
+      before.effective_stop_budgets && after.effective_stop_budgets &&
+        !sameFlatRecord(before.effective_stop_budgets, after.effective_stop_budgets))
+    throw new Error('RunInventory cell duration and maintenance stop budget are immutable.');
   if (before.namespace.name !== after.namespace.name || before.namespace.owner_token !== after.namespace.owner_token ||
       before.namespace.uid && after.namespace.uid && before.namespace.uid !== after.namespace.uid) {
     throw new Error('RunInventory immutable ownership fields changed.');
@@ -465,7 +503,8 @@ export function validateCampaignState(value: unknown): CampaignState {
 }
 
 export function newCampaignState(campaignId: string, ownerId: string, now = Date.now()): CampaignState {
-  if (!uuid.test(campaignId) || !uuid.test(ownerId) || !nonnegative(now)) throw new Error('Campaign and owner IDs must be UUIDs and the clock must be valid.');
+  if (!uuid.test(campaignId) || !uuid.test(ownerId) || !nonnegative(now) || !Number.isSafeInteger(now + MAX_CAMPAIGN_LIFETIME_MS))
+    throw new Error('Campaign and owner IDs must be UUIDs and the clock must be valid.');
   return { schemaVersion: 1, campaignId, ownerId, fencingToken: 1, mode: 'observe', status: 'active',
     startedAtMs: now, heartbeatAtMs: now, heartbeatSequence: 0, expiresAtMs: now + MAX_CAMPAIGN_LIFETIME_MS,
     cleanupStatus: 'not-started', cleanupSteps: [], operations: [] };
@@ -496,7 +535,7 @@ export function cleanupFailureCode(error: unknown): 'stale_version' | 'write_out
     return 'campaign_fenced';
   return 'invalid_or_storage_error';
 }
-export interface CampaignStoreConfig { account: string; container: string; subscriptionId: string }
+export interface CampaignStoreConfig { account: string; container: string; subscriptionId: string; recordPath?: string }
 
 export async function managedIdentityToken(resource: string, env: NodeJS.ProcessEnv = process.env, fetcher: Fetcher = fetch): Promise<string> {
   const endpoint = env.IDENTITY_ENDPOINT;
@@ -506,7 +545,10 @@ export async function managedIdentityToken(resource: string, env: NodeJS.Process
   url.searchParams.set('api-version', '2019-08-01');
   url.searchParams.set('resource', resource);
   url.searchParams.set('client_id', env.AZURE_CLIENT_ID);
-  const response = await fetcher(url, { headers: { 'X-IDENTITY-HEADER': header } });
+  const options: RequestInit = { headers: { 'X-IDENTITY-HEADER': header } };
+  if (isEffectBoundaryActive()) options.redirect = 'error';
+  const response = await dispatchExternalEffect({ transport: 'azure-auth', method: 'GET', resource: url.origin,
+    path: url.pathname + url.search }, () => fetcher(url, options));
   if (!response.ok) throw new Error(`Managed identity token request failed with HTTP ${response.status}.`);
   const body: unknown = await response.json();
   if (!record(body) || typeof body.access_token !== 'string' || !body.access_token) throw new Error('Managed identity returned an invalid token response.');
@@ -514,26 +556,40 @@ export async function managedIdentityToken(resource: string, env: NodeJS.Process
 }
 
 async function localToken(resource: string, subscriptionId: string): Promise<string> {
-  const result = spawnSync("az", ["account", "get-access-token", "--subscription", subscriptionId,
-    "--resource", resource, "--query", "accessToken", "--output", "tsv", "--only-show-errors"],
-    { encoding: "utf8", timeout: 30_000, windowsHide: true });
-  const token = typeof result.stdout === "string" ? result.stdout.trim() : "";
+  const args = ['account', 'get-access-token', '--subscription', subscriptionId,
+    '--resource', resource, '--query', 'accessToken', '--output', 'tsv', '--only-show-errors'];
+  const result = await dispatchExternalEffect({ transport: 'process', method: 'AZURE_ACCOUNT_GET-ACCESS-TOKEN',
+    resource: 'az', path: JSON.stringify(args) }, async () => spawnSync('az', args,
+    { encoding: 'utf8', timeout: 30_000, windowsHide: true }));
+  const token = typeof result.stdout === 'string' ? result.stdout.trim() : '';
   if (result.error || result.status !== 0 || !token || /[[:space:]]/.test(token))
-    throw new Error("Azure CLI could not provide a token for the campaign store.");
+    throw new Error('Azure CLI could not provide a token for the campaign store.');
   return token;
 }
 
 export function createBlobCampaignStore(config: CampaignStoreConfig, fetcher: Fetcher = fetch,
   token: TokenProvider = resource => getAccessToken(resource, config.subscriptionId, process.env, fetcher)): CampaignStore {
+  const recordPath = config.recordPath ?? 'active.json';
+  const segments = recordPath.split('/');
   if (!storageName.test(config.account) || !containerName.test(config.container) || !uuid.test(config.subscriptionId)) {
     throw new Error('Campaign store requires a storage account, container and subscription ID.');
   }
-  const endpoint = `https://${config.account}.blob.core.windows.net/${config.container}/active.json`;
+  if (recordPath.length > 1024 || segments.some(segment => !/^[A-Za-z0-9._-]+$/.test(segment) || segment === '.' || segment === '..'))
+    throw new Error('Campaign store record path is invalid.');
+  const endpoint = `https://${config.account}.blob.core.windows.net/${config.container}/` +
+    segments.map(segment => encodeURIComponent(segment)).join('/');
+  const blobFetch: Fetcher = (input, init = {}) => {
+    const url = new URL(String(input)), method = (init.method ?? 'GET').toUpperCase();
+    const body = typeof init.body === 'string' || Buffer.isBuffer(init.body) ? init.body : undefined;
+    const requestInit: RequestInit = isEffectBoundaryActive() ? { ...init, redirect: 'error' } : init;
+    return dispatchExternalEffect({ transport: 'campaign-blob', method, resource: url.origin + '/' + config.container,
+      path: url.pathname + url.search, body }, () => fetcher(input, requestInit));
+  };
   const headers = async () => ({ authorization: `Bearer ${await token('https://storage.azure.com/')}`,
     'x-ms-date': new Date().toUTCString(), 'x-ms-version': '2023-11-03' });
   return {
     async read() {
-      const response = await fetcher(endpoint, { headers: await headers() });
+      const response = await blobFetch(endpoint, { headers: await headers() });
       if (response.status === 404) return undefined;
       if (!response.ok) throw new Error(`Campaign state read failed with HTTP ${response.status}.`);
       const etag = response.headers.get('etag');
@@ -544,7 +600,7 @@ export function createBlobCampaignStore(config: CampaignStoreConfig, fetcher: Fe
     },
     async write(state, expectedEtag) {
       const condition: Record<string, string> = expectedEtag ? { 'if-match': expectedEtag } : { 'if-none-match': '*' };
-      const response = await fetcher(endpoint, { method: 'PUT', headers: { ...(await headers()), ...condition,
+      const response = await blobFetch(endpoint, { method: 'PUT', headers: { ...(await headers()), ...condition,
         'content-type': 'application/json', 'content-length': String(Buffer.byteLength(JSON.stringify(state))),
         'x-ms-blob-type': 'BlockBlob' }, body: JSON.stringify(validateCampaignState(state)) });
       if (response.status === 412) throw new CampaignConflictError();
@@ -626,7 +682,8 @@ async function writeInventoryWithReadback(store: CampaignStore, current: StoredC
   }
 }
 function runInventoryReady(inventory: RunInventory | undefined): inventory is RunInventory {
-  return Boolean(inventory && inventory.load_admission === 'authorized' && inventory.namespace.uid && inventory.resources.length > 0 &&
+  return Boolean(inventory && inventory.load_admission === 'authorized' && nonnegative(inventory.planned_cell_duration_ms) &&
+    inventory.planned_cell_duration_ms > 0 && inventory.effective_stop_budgets && inventory.namespace.uid && inventory.resources.length > 0 &&
     inventory.resources.every(resource => resource.state === 'observed' && resource.uid) &&
     inventory.fic !== null && inventory.fic.state === 'observed' && inventory.qap !== null && inventory.qap.state === 'observed' && inventory.qap.bindings.length > 0 &&
     inventory.cleanup.handoff.state !== 'complete');
@@ -639,9 +696,27 @@ export async function publishRunInventory(store: CampaignStore, value: unknown, 
     const inventory = validateRunInventory(value, current.state);
     requireOwner(current.state, inventory.owner_id, inventory.fencing_token, now);
     const merged = mergeRunInventory(current.state.runInventory, inventory);
+    const previous = current.state.runInventory;
+    const newCell = !previous || previous.campaign_id !== inventory.campaign_id || previous.owner_id !== inventory.owner_id ||
+      previous.orchestration_run_id !== inventory.orchestration_run_id || previous.cell_run_id !== inventory.cell_run_id;
+    const authorizingClients = inventory.load_admission === 'authorized' && previous?.load_admission !== 'authorized';
+    if (newCell || authorizingClients) assertCellLifetimeBudget(current.state, merged, now);
     const next = validateCampaignState({ ...current.state, runInventory: merged });
     const written = await writeInventoryWithReadback(store, current, next, merged, 'active', current.state.fencingToken);
     if (written) return written;
+  }
+  function assertCellLifetimeBudget(state: CampaignState, inventory: RunInventory, now: number): void {
+    const duration = inventory.planned_cell_duration_ms;
+    const stopTimeout = inventory.effective_stop_budgets?.maintenance_stop_timeout_ms;
+    if (!nonnegative(now) || now < state.startedAtMs || !nonnegative(duration) || !nonnegative(stopTimeout))
+      throw new Error('Cell admission requires explicit planned duration and persisted maintenance stop budget.');
+    const remaining = state.expiresAtMs - now;
+    const assessment = assessCellLifetimeBudget(remaining, duration, stopTimeout);
+    if (assessment.status === 'invalid') throw new Error(assessment.reason);
+    if (assessment.status === 'insufficient')
+      throw new Error('Campaign lifetime cannot cover the planned cell, maintenance stop, and bounded cleanup reserves.');
+    if (assessment.status === 'unknown') console.warn(JSON.stringify({ event: 'cell_cleanup_lifetime_reserve',
+      status: assessment.status, lower_bound_required_ms: assessment.required_ms, uncovered_steps: UNBOUNDED_CLEANUP_RESERVE_STEPS }));
   }
   throw new CampaignConflictError();
 }
@@ -700,6 +775,8 @@ export async function armCampaign(store: CampaignStore, ownerId: string, fencing
     const state = requireOwner(current, ownerId, fencingToken, now);
     if (state.mode !== 'observe') throw new Error('Campaign is already armed.');
     if (!state.runInventory) throw new Error('RunInventory must be persisted before arming.');
+    if (!nonnegative(state.runInventory.planned_cell_duration_ms) || !state.runInventory.effective_stop_budgets)
+      throw new Error('Campaign cannot be armed without a new-cell duration and maintenance stop budget.');
     return { ...state, mode: 'armed' };
   });
 }
@@ -753,7 +830,7 @@ async function readRunInventoryStdin(): Promise<unknown> {
 }
 
 export async function campaignMain(args: string[], dependencies: {
-  store?: CampaignStore; azure?: import('../../infra/azure/bootstrap.js').Azure; env?: NodeJS.ProcessEnv;
+  store?: CampaignStore; azure?: import('../../infra/azure/bootstrap.js').Azure; env?: NodeJS.ProcessEnv; cleanupEnvelope?: unknown;
 } = {}): Promise<void> {
   if (args[0] === 'cleanup-step') {
     const cell = await import('./aks-cell-cleanup.js');
@@ -844,7 +921,7 @@ export async function campaignMain(args: string[], dependencies: {
   } else if (action === 'cleanup-step' && args.length === 2) {
     const cell = await import('./aks-cell-cleanup.js');
     if (!Object.hasOwn(cell.CELL_CLEANUP_SELECTORS, args[1]!)) throw new Error('Unknown cleanup-step selector.');
-    const input = cell.parseCellCleanupEnvelope(await readRunInventoryStdin());
+    const input = cell.parseCellCleanupEnvelope(dependencies.cleanupEnvelope ?? await readRunInventoryStdin());
     await cell.readCellRunInventory(store, { schema_version: 1, campaign_id: input.inventory.campaign_id,
       orchestration_run_id: input.inventory.orchestration_run_id, cell_run_id: input.inventory.cell_run_id, actor: input.actor }, env);
     const { createDefaultCleanupProviders, createDefaultCellCleanupProviders } = await import('./aks-default-providers.js');
@@ -879,10 +956,14 @@ if (process.argv[1] && ['aks-campaign.ts', 'aks-campaign.js'].includes(path.base
   });
 }
 
-export async function readArmOperationStatus(operationUrl: string, subscriptionId: string, fetcher: Fetcher = fetch): Promise<{ status: number; body?: unknown }> {
-  const url = httpsManagementUrl(operationUrl, subscriptionId);
-  const accessToken = await getAccessToken('https://management.azure.com/', subscriptionId, process.env, fetcher);
-  const response = await fetcher(url, { headers: { authorization: `Bearer ${accessToken}` }, signal: AbortSignal.timeout(10_000) });
+export async function readArmOperationStatus(operationUrl: string, subscriptionId: string, fetcher: Fetcher = fetch,
+  env: NodeJS.ProcessEnv = process.env): Promise<{ status: number; body?: unknown }> {
+  const url = new URL(httpsManagementUrl(operationUrl, subscriptionId));
+  const accessToken = await getAccessToken('https://management.azure.com/', subscriptionId, env, fetcher);
+  const options: RequestInit = { headers: { authorization: `Bearer ${accessToken}` }, signal: AbortSignal.timeout(10_000) };
+  if (isEffectBoundaryActive()) options.redirect = 'error';
+  const response = await dispatchExternalEffect({ transport: 'azure-rest', method: 'GET',
+    resource: url.origin + '|https://management.azure.com/', path: url.pathname + url.search }, () => fetcher(url, options));
   if (response.status === 202) return { status: 202 };
   const text = await response.text();
   if (!text) return { status: response.status };

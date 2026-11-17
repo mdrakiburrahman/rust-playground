@@ -1,5 +1,10 @@
 import type { CleanupMutationAuthority } from './aks-cleanup-executor.js';
 
+export const ADMISSION_STOP_BUDGET_MS = 60_000;
+export const DRAIN_BUDGET_MS = 120_000;
+export const TERMINAL_CAPTURE_BUDGET_MS = 120_000;
+export const WATCHDOG_INTERVAL_MS = 60_000;
+
 export interface CleanupBudget { deadlineUnixMs: number; remainingMs: number }
 export function withCleanupDeadline(authority: CleanupMutationAuthority, deadline: number | null):
   CleanupMutationAuthority & { budget: CleanupBudget } {

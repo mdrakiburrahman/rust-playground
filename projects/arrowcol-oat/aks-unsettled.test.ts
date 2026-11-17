@@ -26,6 +26,7 @@ function fixture() {
   const now = Date.now(), started = now - 300_000, step = { state: 'not_started' as const, deadline_unix_ms: null, reason_code: null };
   const inventory: RunInventory = { schema_version: 1, campaign_id: campaignId, owner_id: ownerId, fencing_token: 1,
     orchestration_run_id: campaignId, cell_run_id: cellId, load_admission: 'authorized', namespace: { name: namespace, uid: cellId, owner_token: ownerId },
+    planned_cell_duration_ms: 60_000, effective_stop_budgets: { maintenance_grace_seconds: 900, maintenance_stop_timeout_ms: 1_200_000 },
     resources: ['collector', 'maintenance'].map((name, index) => ({ api_version: 'apps/v1', kind: 'Deployment', namespace, name,
       uid: index === 0 ? campaignId : ownerId, role: index === 0 ? 'collector' : 'maintenance', state: 'observed', absence: null })),
     fic: null, qap: null, evidence_destination: { account: 'fixtureaccount', container: 'checkpoints', blob_prefix: 'evidence/' + cellId },
@@ -125,7 +126,8 @@ test('expired drain continues ordered cleanup to verified idle while keeping the
       assert.ok(state.runInventory!.resources.every(resource => resource.state === 'removed'));
       events.push('verify'); return 'complete';
     } };
-  const execute = createExternalCleanupExecutor(store, actions);
+  const execute = createExternalCleanupExecutor(store, actions,
+    { maintenanceGraceSeconds: 900, maintenanceStopTimeoutMs: 1_200_000, budget_source: 'effective_stop_budgets' });
   let progress = await reconcileCleanupOnce(store, execute);
   for (let iterations = 0; progress !== 'complete_unsettled'; iterations++) {
     assert.ok(iterations < 12);

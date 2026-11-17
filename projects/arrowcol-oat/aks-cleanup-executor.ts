@@ -8,7 +8,8 @@ import { DRAIN_UNSETTLED_REASON, hasVerifiedUnsettledDrain, publishCleanupRunInv
   type CampaignState, type CampaignStore, type InventoryStep, type RunInventory, type RunInventoryResource } from './aks-campaign.js';
 import type { CleanupExecutor } from './aks-reconcile.js';
 import { assertRunCleanupActor, createSetupRunCleanupActions } from './aks-setup-cleanup.js';
-import { withCleanupDeadline } from './aks-cleanup-budget.js';
+import { ADMISSION_STOP_BUDGET_MS, DRAIN_BUDGET_MS, TERMINAL_CAPTURE_BUDGET_MS, withCleanupDeadline } from './aks-cleanup-budget.js';
+import { MAINTENANCE_STOP_TIMEOUT_CEILING_MS, type EffectiveStopBudgets } from './stop-budgets.js';
 
 export type CleanupActionResult = 'pending' | 'complete' | 'uncertain';
 export interface CleanupMutationAuthority {
@@ -39,11 +40,6 @@ export interface ExternalCleanupActions {
   restoreSafeIdle(state: CampaignState, idempotencyKey: string, authority: CleanupMutationAuthority): Promise<CleanupActionResult>;
   verifySafeIdle(state: CampaignState, idempotencyKey: string): Promise<CleanupActionResult>;
 }
-
-const ADMISSION_STOP_BUDGET_MS = 60_000;
-const DRAIN_BUDGET_MS = 120_000;
-const MAINTENANCE_STOP_BUDGET_MS = 120_000;
-const TERMINAL_CAPTURE_BUDGET_MS = 120_000;
 
 function hasUnresolvedIdentity(inventory: RunInventory): boolean {
   return inventory.resources.some(resource => resource.state === 'planned' || resource.state === 'uncertain') ||
@@ -131,7 +127,14 @@ export function createOwnedRunCleanupActions(store: CampaignStore, azure: Azure,
   };
 }
 
-export function createExternalCleanupExecutor(store: CampaignStore, actions: ExternalCleanupActions): CleanupExecutor {
+export function createExternalCleanupExecutor(store: CampaignStore, actions: ExternalCleanupActions,
+  stopBudgets: EffectiveStopBudgets & { budget_source: 'effective_stop_budgets' | 'legacy_ceiling' }): CleanupExecutor {
+  if (!Number.isSafeInteger(stopBudgets.maintenanceGraceSeconds) || stopBudgets.maintenanceGraceSeconds <= 0 ||
+      !Number.isSafeInteger(stopBudgets.maintenanceStopTimeoutMs) || stopBudgets.maintenanceStopTimeoutMs <= 0 ||
+      stopBudgets.maintenanceStopTimeoutMs > MAINTENANCE_STOP_TIMEOUT_CEILING_MS ||
+      stopBudgets.maintenanceStopTimeoutMs < stopBudgets.maintenanceGraceSeconds * 1_000 ||
+      stopBudgets.budget_source === 'legacy_ceiling' && stopBudgets.maintenanceStopTimeoutMs !== MAINTENANCE_STOP_TIMEOUT_CEILING_MS)
+    throw new Error('External cleanup requires valid persisted maintenance stop budgets.');
   return async (step, suppliedState, idempotencyKey) => {
     if (suppliedState.status !== 'cleaning' || !suppliedState.runInventory ||
         !suppliedState.cleanupSteps.some(receipt => receipt.step === step && receipt.idempotencyKey === idempotencyKey && receipt.status === 'running')) {
@@ -218,7 +221,7 @@ export function createExternalCleanupExecutor(store: CampaignStore, actions: Ext
             }
           }
           return 'complete';
-        }, MAINTENANCE_STOP_BUDGET_MS);
+        }, stopBudgets.maintenanceStopTimeoutMs);
       }
       case 'record-terminal-state':
         return runAction('terminal_capture', () => actions.captureTerminalState(inventory, idempotencyKey, authority), TERMINAL_CAPTURE_BUDGET_MS);

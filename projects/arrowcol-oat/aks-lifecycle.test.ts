@@ -1,8 +1,13 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { test, type TestContext } from 'node:test';
 import { Azure, Config, runtime, TAGS } from '../../infra/azure/bootstrap.js';
+import { dispatchExternalEffect, EffectBoundary, processEffectRequest, withEffectBoundary,
+  type EffectEnvelope, type ExternalEffect } from '../../infra/azure/effect-boundary.js';
 import { plan_run_fic } from '../../infra/azure/run_fic.js';
-import { CUSTODY_CLEANUP_STEPS, newCampaignState, validateCampaignState,
+import { assessCellLifetimeBudget, CUSTODY_CLEANUP_STEPS, newCampaignState, validateCampaignState,
   type CampaignState, type CampaignStore, type RunInventory } from './aks-campaign.js';
 import { createDefaultLifecycleActions } from './aks-lifecycle.js';
 import { recordUnsettledDrain } from './aks-reconcile.js';
@@ -30,6 +35,7 @@ async function fixture(t: TestContext, deployment = false) {
   const step = { state: 'not_started' as const, deadline_unix_ms: null, reason_code: null };
   const inventory: RunInventory = { schema_version: 1, campaign_id: campaignId, owner_id: ownerId, fencing_token: 1,
     orchestration_run_id: campaignId, cell_run_id: cellId, load_admission: 'authorized',
+    planned_cell_duration_ms: 60_000, effective_stop_budgets: { maintenance_grace_seconds: 900, maintenance_stop_timeout_ms: 1_200_000 },
     namespace: { name: namespace, uid: cellId, owner_token: ownerId },
     resources: [{ api_version: deployment ? 'apps/v1' : 'batch/v1', kind: deployment ? 'Deployment' : 'Job', namespace, name: 'maintenance', uid: workloadUid,
       role: 'maintenance', state: 'observed', absence: null }],
@@ -47,23 +53,30 @@ async function fixture(t: TestContext, deployment = false) {
     assert.equal(state.fencingToken, 1, 'fenced actors may not act');
   } };
   const blobs = new Map<string, { bytes: Buffer; etag: string }>();
+  const effectCalls: ExternalEffect[] = [];
   let fault: 'none' | 'patch_unknown' | 'completion_unknown' = 'none', patched = false, patchCount = 0, wrongUid = false;
   let onPatch: (() => void) | undefined, onIntent: (() => void) | undefined;
   let podShape: 'regular' | 'init_sidecar' | 'missing' | 'ephemeral' | 'terminal_auxiliary' = 'regular';
   const timeouts: number[] = [];
-  t.mock.method(azure, 'blob', async (method: string, container: string, name: string, _query?: unknown,
-    body?: string | Buffer | null, headers?: Record<string, string>) => {
-    assert.equal(container, c.checkpoints);
-    const previous = blobs.get(name);
-    if (method === 'GET') return [previous?.bytes ?? null, previous ? { etag: previous.etag } : {}];
-    assert.equal(method, 'PUT');
-    assert.equal(headers?.['If-Match'] ?? headers?.['If-None-Match'], previous?.etag ?? '*');
-    const bytes = Buffer.from(String(body)), etag = `"${blobs.size}-${previous?.etag.length ?? 0}-${bytes.length}"`;
-    blobs.set(name, { bytes, etag });
-    if (JSON.parse(bytes.toString()).phase === 'intent') onIntent?.();
-    if (fault === 'completion_unknown' && JSON.parse(bytes.toString()).phase === 'complete')
-      throw new Error('Lost completed journal response');
-    return [null, { ':status': '201', etag }];
+  t.mock.method(azure, 'blob', async (...args: Parameters<Azure['blob']>) => {
+    const [method, container, name = '', , body, headers] = args;
+    const effect: ExternalEffect = { transport: 'campaign-blob', method: method.toUpperCase(),
+      resource: `https://${c.account}.blob.core.windows.net/${container}`,
+      path: `/${container}/${name.split('/').map(encodeURIComponent).join('/')}`, ...(body !== undefined ? { body } : {}) };
+    effectCalls.push(effect);
+    return dispatchExternalEffect(effect, async () => {
+      assert.equal(container, c.checkpoints);
+      const previous = blobs.get(name);
+      if (method === 'GET') return [previous?.bytes ?? null, previous ? { etag: previous.etag } : {}];
+      assert.equal(method, 'PUT');
+      assert.equal(headers?.['If-Match'] ?? headers?.['If-None-Match'], previous?.etag ?? '*');
+      const bytes = Buffer.from(String(body)), etag = `"${blobs.size}-${previous?.etag.length ?? 0}-${bytes.length}"`;
+      blobs.set(name, { bytes, etag });
+      if (JSON.parse(bytes.toString()).phase === 'intent') onIntent?.();
+      if (fault === 'completion_unknown' && JSON.parse(bytes.toString()).phase === 'complete')
+        throw new Error('Lost completed journal response');
+      return [null, { ':status': '201', etag }];
+    });
   });
   const marks = { 'arrowcol-oat/run-id': cellId, 'arrowcol-oat/owner-token': ownerId };
   const metadata = (name: string, uid: string) => ({ name, namespace, uid, resourceVersion: patched ? '2' : '1',
@@ -73,6 +86,7 @@ async function fixture(t: TestContext, deployment = false) {
     spec: { ...(deployment ? { replicas: patched ? 0 : 1 } : { parallelism: 1, suspend: patched }), selector: { matchLabels: { job: 'maintenance' } } },
     status: { observedGeneration: patched ? 2 : 1, conditions: patched ? [{ type: 'Suspended', status: 'True' }] : [] } });
   t.mock.method(runtime, 'run_tree', async (args: string[], timeout?: number) => {
+    effectCalls.push(processEffectRequest(args));
     timeouts.push(timeout ?? -1);
     if (args.includes('patch')) {
       patchCount++;
@@ -132,12 +146,26 @@ async function fixture(t: TestContext, deployment = false) {
       assertCurrent: async () => { assert.equal(state.fencingToken, 2, 'actor changed'); } };
     return { inventory: state.runInventory!, authority: guarded };
   };
-  return { azure, store, inventory, authority, blobs, timeouts, actions: createDefaultLifecycleActions(store, azure), controller,
+  return { azure, store, inventory, authority, blobs, timeouts, effectCalls, actions: createDefaultLifecycleActions(store, azure), controller,
     onPatch: (value: () => void) => { onPatch = value; }, onIntent: (value: () => void) => { onIntent = value; },
     alreadyStopped: () => { patched = true; }, touchVersion: () => { revision++; },
     setPodShape: (value: typeof podShape) => { podShape = value; },
     fence: () => { state.fencingToken++; }, get state() { return state; },
     get patchCount() { return patchCount; }, setFault: (value: typeof fault) => { fault = value; }, wrongUid: () => { wrongUid = true; } };
+}
+function envelopeFromTrace(f: Awaited<ReturnType<typeof fixture>>, calls: ExternalEffect[]): EffectEnvelope {
+  const grouped = new Map<string, { request: ExternalEffect; count: number }>();
+  for (const request of calls) {
+    const key = [request.transport, request.method.toUpperCase(), request.resource, request.path].join('\0');
+    const entry = grouped.get(key);
+    if (entry) entry.count++;
+    else grouped.set(key, { request, count: 1 });
+  }
+  return { schema_version: 1, campaign_id: campaignId, run_id: cellId, subscription_id: f.azure.c.subscription,
+    resource_group: f.azure.c.group, storage_account: f.azure.c.account, state_container: f.azure.c.checkpoints,
+    effects: [...grouped.values()].map(({ request, count }, index) => ({ id: `effect-${index}`,
+      transport: request.transport, method: request.method.toUpperCase(), resource: request.resource,
+      path: request.path, max_calls: count })) };
 }
 test('default lifecycle confirms exact Job suspension, physical stop and sanitized actual terminal/log receipts', async t => {
   const f = await fixture(t);
@@ -187,14 +215,35 @@ test('controller terminal capture stops a residual collector after drain expiry 
   assert.equal(await f.actions.recoverLifecycle!('terminal_capture', current.inventory, deadline, 'terminal', current.authority), 'complete');
   assert.equal(f.patchCount, 1);
 });
-test('unknown residual PATCH is recovered only by positive exact stopped state, never by repeating PATCH', async t => {
-  const f = await fixture(t), current = await f.controller(); f.setFault('patch_unknown');
-  await assert.rejects(f.actions.captureTerminalState(current.inventory, 'terminal', current.authority), /Lost PATCH/);
-  f.setFault('none');
-  assert.equal(await f.actions.recoverLifecycle!('terminal_capture', current.inventory, null, 'terminal', current.authority), 'complete');
+test('unknown residual PATCH is recovered only by positive exact stopped state through the guarded adapter', async t => {
+  const dry = await fixture(t);
+  const exercise = async (value: Awaited<ReturnType<typeof fixture>>) => {
+    const current = await value.controller(), deadline = current.inventory.cleanup.terminal_capture.deadline_unix_ms;
+    value.setFault('patch_unknown');
+    await assert.rejects(value.actions.captureTerminalState(current.inventory, 'terminal', current.authority), /Lost PATCH/);
+    value.setFault('none');
+    const restartedActions = createDefaultLifecycleActions(value.store, value.azure);
+    assert.equal(await restartedActions.recoverLifecycle!('terminal_capture', current.inventory, deadline, 'terminal', current.authority), 'complete');
+    assert.equal(value.patchCount, 1);
+    const stops = [...value.blobs.values()].map(blob => JSON.parse(blob.bytes.toString())).filter(blob => blob.phase === 'complete');
+    assert.equal(stops[0].response.source, 'exact_state_recovery');
+    assert.equal(stops[0].deadline_unix_ms, deadline);
+  };
+  await exercise(dry);
+  assert.ok(dry.effectCalls.some(request => request.transport === 'process' && request.method === 'KUBECTL_PATCH'));
+  const envelope = envelopeFromTrace(dry, dry.effectCalls);
+  t.mock.restoreAll();
+  const f = await fixture(t);
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'oat-lifecycle-effect-boundary-'));
+  fs.chmodSync(directory, 0o700);
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const receiptPath = path.join(directory, 'effects.jsonl');
+  await withEffectBoundary(new EffectBoundary(envelope, receiptPath), () => exercise(f));
+  const receipts = fs.readFileSync(receiptPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+  const patch = receipts.filter(row => row.transport === 'process' && row.method === 'KUBECTL_PATCH');
+  assert.deepEqual(patch.map(row => row.event), ['dispatch', 'result']);
+  assert.equal(patch[1].outcome, 'unknown_after_forward');
   assert.equal(f.patchCount, 1);
-  const stops = [...f.blobs.values()].map(value => JSON.parse(value.bytes.toString())).filter(value => value.phase === 'complete');
-  assert.equal(stops[0].response.source, 'exact_state_recovery');
 });
 for (const shape of ['init_sidecar', 'missing', 'ephemeral'] as const) {
   test(`terminal recovery and freeze refuse incomplete physical stop: ${shape}`, async t => {
@@ -264,6 +313,32 @@ test('residual stop refuses a fencing race between durable intent and PATCH', as
   await assert.rejects(f.actions.captureTerminalState(current.inventory, 'terminal', current.authority), /actor changed/);
   assert.equal(f.patchCount, 0);
 });
+test('delayed unbounded cleanup remains pending and leaves lifetime reserve UNKNOWN', async t => {
+  const f = await fixture(t);
+  await f.controller();
+  f.state.runInventory!.cleanup.evidence_capture = { state: 'not_started', deadline_unix_ms: null, reason_code: null };
+  f.state.cleanupSteps = CUSTODY_CLEANUP_STEPS.map((step, index) => ({ step,
+    idempotencyKey: `${campaignId}:2:${step}`, status: index < 2 ? 'complete' : index === 2 ? 'running' : 'pending' }));
+  let settled = false;
+  const complete = async () => 'complete' as const;
+  const actions: ExternalCleanupActions = {
+    discoverExactInventory: async inventory => inventory,
+    stopAdmission: complete, boundedDrain: complete,
+    preserveEvidence: async () => { await new Promise(resolve => setTimeout(resolve, 20)); settled = true; return 'pending'; },
+    stopMaintenanceIfUidAndOwnerMatch: complete, captureTerminalState: complete,
+    deleteNamespaceIfUidAndOwnerMatch: complete, deleteQapBindingIfOwned: complete, deleteFicIfExact: complete,
+    restoreSafeIdle: complete, verifySafeIdle: complete,
+  };
+  const execute = createExternalCleanupExecutor(f.store, actions,
+    { maintenanceGraceSeconds: 900, maintenanceStopTimeoutMs: 1_200_000, budget_source: 'effective_stop_budgets' });
+  assert.equal(await execute('preserve-evidence', f.state, `${campaignId}:2:preserve-evidence`), 'pending');
+  assert.equal(settled, true);
+  const saved = (await f.store.read())!.state.runInventory!.cleanup.evidence_capture;
+  assert.equal(saved.state, 'pending');
+  assert.equal(saved.deadline_unix_ms, null);
+  assert.equal(assessCellLifetimeBudget(6 * 60 * 60 * 1000, 0, 5_100_000).status, 'unknown');
+});
+
 test('controller executor pins inventory ETag across residual stop intent even when the actor and origin are unchanged', async t => {
   const f = await fixture(t), current = await f.controller();
   f.state.runInventory!.cleanup.terminal_capture.state = 'not_started';
@@ -272,7 +347,8 @@ test('controller executor pins inventory ETag across residual stop intent even w
   const actions: ExternalCleanupActions = { ...f.actions, discoverExactInventory: async inventory => inventory,
     deleteNamespaceIfUidAndOwnerMatch: forbidden, deleteQapBindingIfOwned: forbidden, deleteFicIfExact: forbidden,
     restoreSafeIdle: forbidden, verifySafeIdle: forbidden };
-  const execute = createExternalCleanupExecutor(f.store, actions);
+  const execute = createExternalCleanupExecutor(f.store, actions,
+    { maintenanceGraceSeconds: 900, maintenanceStopTimeoutMs: 1_200_000, budget_source: 'effective_stop_budgets' });
   await assert.rejects(execute('record-terminal-state', f.state, `${campaignId}:2:record-terminal-state`), /fencing changed/);
   assert.equal(f.patchCount, 0);
 });

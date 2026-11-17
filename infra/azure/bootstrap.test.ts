@@ -1918,3 +1918,19 @@ test('failed file fsync cleans unpublished intermediates and never claims cleanu
   assert.throws(() => b.write_reset_record(recordPath, makeRecord()), /fsync failure/);
   assert.deepEqual(fs.readdirSync(directory), ['tables.json']); assert.deepEqual(azure.events, []);
 });
+
+test('Azure request returns full provider headers while durable capture stays filtered', async () => {
+  const real = new b.Azure(azure.c);
+  real.token = async () => 'fixture-token';
+  const operationUrl = 'https://management.azure.com/operations/one';
+  const captured: b.HttpReceipt[] = [];
+  mock.method(globalThis, 'fetch', async () => new Response('ok', { status: 200, headers: {
+    'azure-asyncoperation': operationUrl, 'x-ms-continuation': 'next-page',
+    'x-ms-request-id': 'fixture-request', 'set-cookie': 'not-part-of-receipt',
+  } }));
+  const [, headers] = await real.request('GET', 'https://management.azure.com/subscriptions/x/resourceGroups/y',
+    'https://management.azure.com/', undefined, {}, false, false, receipt => captured.push(receipt));
+  assert.equal(headers['azure-asyncoperation'], operationUrl);
+  assert.equal(headers['x-ms-continuation'], 'next-page');
+  assert.deepEqual(captured[0]?.headers, { 'x-ms-request-id': 'fixture-request' });
+});

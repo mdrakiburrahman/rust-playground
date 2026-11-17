@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { CampaignConflictError, CUSTODY_CLEANUP_STEPS, armCampaign, publishRunInventory, startCampaign, type CampaignState, type CampaignStore, type RunInventory, type StoredCampaign } from './aks-campaign.js';
+import { CampaignConflictError, CUSTODY_CLEANUP_STEPS, HEARTBEAT_INTERVAL_MS, MAX_CAMPAIGN_LIFETIME_MS, armCampaign, newCampaignState, publishRunInventory, startCampaign, validateCampaignState, type CampaignState, type CampaignStore, type RunInventory, type StoredCampaign } from './aks-campaign.js';
 import { watchdogOnce } from './aks-watchdog.js';
+import { createSyntheticArmedCampaignState, ReadOnlyAzureAdapter, runRehearsalWatchdogOnce, type RehearsalEvidenceRecord } from './aks-rehearsal.js';
 import { createExternalCleanupExecutor, type ExternalCleanupActions } from './aks-cleanup-executor.js';
 import { reconcileCleanupOnce, reconcileOnce } from './aks-reconcile.js';
 
@@ -28,6 +29,7 @@ const inventoryFor = (state: CampaignState): RunInventory => {
   return {
     schema_version: 1, campaign_id: campaignId, owner_id: ownerId, fencing_token: state.fencingToken,
     orchestration_run_id: 'c0ffee00-0000-4000-8000-000000000005', cell_run_id: cellRunId, load_admission: 'authorized',
+    planned_cell_duration_ms: 60_000, effective_stop_budgets: { maintenance_grace_seconds: 900, maintenance_stop_timeout_ms: 1_200_000 },
     namespace: { name: namespace, uid: 'c0ffee00-0000-4000-8000-000000000009', owner_token: ownerId },
     resources: [{ api_version: 'apps/v1', kind: 'Deployment', namespace, name: 'arrowcol',
       uid: 'c0ffee00-0000-4000-8000-000000000006', absence: null, role: 'collector', state: 'observed' }],
@@ -52,6 +54,26 @@ async function armedStore(): Promise<MemoryStore> {
   await publishRunInventory(store, observed, state.startedAtMs);
   return store;
 }
+
+test('watchdog consumes persisted stop budgets and assigns the ceiling to legacy records', async () => {
+  const now = Date.now(), base = newCampaignState(campaignId, ownerId, now);
+  const observed = inventoryFor(base), step = { state: 'not_started' as const, deadline_unix_ms: null, reason_code: null };
+  const planned: RunInventory = { ...observed, load_admission: 'not_authorized', namespace: { ...observed.namespace, uid: null },
+    resources: observed.resources.map(resource => ({ ...resource, uid: null, state: 'planned' })),
+    fic: observed.fic ? { ...observed.fic, state: 'planned' } : null,
+    qap: observed.qap ? { ...observed.qap, state: 'planned' } : null,
+    cleanup: { stop_admission: step, bounded_drain: step, evidence_capture: step, stop_maintenance: step, terminal_capture: step, handoff: step } };
+  const persistedStore = new MemoryStore();
+  persistedStore.current = { state: validateCampaignState({ ...base, runInventory: planned }), etag: 'persisted' };
+  const persisted = await watchdogOnce({ ARM_SUBSCRIPTION_ID: subscriptionId }, undefined, persistedStore);
+  assert.deepEqual(persisted.maintenanceStopBudget, { maintenance_stop_timeout_ms: 1_200_000, budget_source: 'effective_stop_budgets' });
+
+  const { planned_cell_duration_ms: _duration, effective_stop_budgets: _budgets, ...legacyInventory } = planned;
+  const legacyStore = new MemoryStore();
+  legacyStore.current = { state: validateCampaignState({ ...base, runInventory: legacyInventory }), etag: 'legacy' };
+  const legacy = await watchdogOnce({ ARM_SUBSCRIPTION_ID: subscriptionId }, undefined, legacyStore);
+  assert.deepEqual(legacy.maintenanceStopBudget, { maintenance_stop_timeout_ms: 5_100_000, budget_source: 'legacy_ceiling' });
+});
 
 test('watchdog expiry fences first, refuses missing cleanup, and resumes idempotent cleanup', async () => {
   const env = { ARM_SUBSCRIPTION_ID: subscriptionId };
@@ -94,7 +116,8 @@ test('external executor invokes safe-idle restoration exactly once under the cle
     restoreSafeIdle: async (_state, _key, authority) => { await authority.assertCurrent(); restoreCalls++; return 'complete'; },
     verifySafeIdle: complete,
   };
-  const result = await reconcileCleanupOnce(store, createExternalCleanupExecutor(store, actions));
+  const result = await reconcileCleanupOnce(store, createExternalCleanupExecutor(store, actions,
+    { maintenanceGraceSeconds: 900, maintenanceStopTimeoutMs: 1_200_000, budget_source: 'effective_stop_budgets' }));
   assert.equal(result, 'progress');
   assert.equal(restoreCalls, 1);
 });
@@ -116,7 +139,8 @@ test('external executor mutation authority rereads the current cleanup token ins
     captureTerminalState: complete, deleteNamespaceIfUidAndOwnerMatch: complete, deleteQapBindingIfOwned: complete,
     deleteFicIfExact: complete, restoreSafeIdle: complete, verifySafeIdle: complete,
   };
-  await assert.rejects(reconcileCleanupOnce(store, createExternalCleanupExecutor(store, actions)), /fencing changed/);
+  await assert.rejects(reconcileCleanupOnce(store, createExternalCleanupExecutor(store, actions,
+    { maintenanceGraceSeconds: 900, maintenanceStopTimeoutMs: 1_200_000, budget_source: 'effective_stop_budgets' })), /fencing changed/);
   assert.equal(effects, 0);
   assert.equal(store.current!.state.runInventory!.fencing_token, 1);
 });
@@ -143,7 +167,8 @@ test('maintenance stop persists a deadline and retains uncertainty without repla
     captureTerminalState: async () => { terminal++; return 'complete'; },
     deleteNamespaceIfUidAndOwnerMatch: complete, deleteQapBindingIfOwned: complete, deleteFicIfExact: complete,
     restoreSafeIdle: complete, verifySafeIdle: complete };
-  const executor = createExternalCleanupExecutor(store, actions);
+  const executor = createExternalCleanupExecutor(store, actions,
+    { maintenanceGraceSeconds: 900, maintenanceStopTimeoutMs: 1_200_000, budget_source: 'effective_stop_budgets' });
   assert.equal(await reconcileCleanupOnce(store, executor), 'pending');
   const uncertain = structuredClone(store.current!.state.runInventory!.cleanup.stop_maintenance);
   assert.equal(uncertain.state, 'uncertain');
@@ -152,4 +177,28 @@ test('maintenance stop persists a deadline and retains uncertainty without repla
   assert.deepEqual(store.current!.state.runInventory!.cleanup.stop_maintenance, uncertain);
   assert.equal(stops, 1);
   assert.equal(terminal, 0);
+});
+
+
+test('isolated D40 watchdog uses its injected no-op executor and read-only status adapter', async () => {
+  const realStore = new MemoryStore(), store = new MemoryStore();
+  const fixture = createSyntheticArmedCampaignState(campaignId, ownerId);
+  const startedAtMs = Date.now() - 4 * HEARTBEAT_INTERVAL_MS;
+  store.current = { state: validateCampaignState({ ...fixture, startedAtMs, heartbeatAtMs: startedAtMs,
+    expiresAtMs: startedAtMs + MAX_CAMPAIGN_LIFETIME_MS }), etag: 'etag-seed' };
+  const evidence: RehearsalEvidenceRecord[] = [], armReads: string[] = [];
+  const adapter = new ReadOnlyAzureAdapter(async (method, url) => {
+    armReads.push(method + ' ' + url);
+    return { status: 200, body: Buffer.from('{"status":"InProgress"}') };
+  }, event => evidence.push(event));
+  const result = await runRehearsalWatchdogOnce({ env: { ARM_SUBSCRIPTION_ID: subscriptionId }, rehearsalId: campaignId,
+    ownerId, realStore, isolatedStore: store, readOnlyAzure: adapter, evidence: event => evidence.push(event) });
+  const current = (await store.read())!;
+  assert.equal(current.state.status, 'cleaning');
+  assert.equal(current.state.cleanupSteps[0]!.status, 'complete');
+  assert.equal(result.cleanupProgress, 'progress');
+  assert.deepEqual(armReads, []);
+  assert.equal(evidence.some(event => event.event === 'recording_cleanup_noop'), true);
+  assert.equal(evidence.some(event => event.event === 'campaign_transition' && event.fencing_token === 2), true);
+  assert.ok(evidence.every(event => event.rehearsal_fixture === 'synthetic custody fixture' && event.cleanup_effects === 'simulated'));
 });

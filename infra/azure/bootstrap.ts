@@ -10,6 +10,7 @@ import { Failure, HttpFailure, ControlConflict, NotReady, DeploymentFailed, cano
   canonical_json, publisher_registry, require_released, uuid, type Metadata } from './authority.js';
 import { PublisherControl, READY, FENCED, CLEANING, UnknownTransition } from './publisher_control.js';
 import { assertNoStampNetworkOverlap, defaultStampConfig, loadStampConfig, type StampConfig } from './stamp.js';
+import { dispatchExternalEffect, EffectBoundaryRefused, processEffectRequest } from './effect-boundary.js';
 export * from './authority.js';
 
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
@@ -33,7 +34,7 @@ export const service_name = (resource: string): string => SERVICE_NAMES[resource
 export const runtime = {
   sleep: (seconds: number) => new Promise<void>(resolve => setTimeout(resolve, seconds * 1000)),
   now: () => performance.now() / 1000,
-  run_tree,
+  run_tree: (...args: Parameters<typeof run_tree>) => dispatchExternalEffect(processEffectRequest(args[0]), () => run_tree(...args)),
 };
 export function load_env(filename: string): Record<string, string> {
   if (!fs.existsSync(filename) || !fs.statSync(filename).isFile())
@@ -338,7 +339,7 @@ export class Azure {
     for (let attempt = 0; attempt < attempts; attempt++) {
       try { return await this._request_once(method, url, resource, body, headers, missing_ok, capture); }
       catch (error) {
-        if (!(error instanceof Failure) || attempt + 1 === attempts ||
+        if (error instanceof EffectBoundaryRefused || !(error instanceof Failure) || attempt + 1 === attempts ||
             (error instanceof HttpFailure && !TRANSIENT_HTTP.has(error.code))) throw error;
         console.error(`Transient ${method} ${service_name(resource)} failure; retry ${attempt + 1}/${attempts - 1}: ` +
           error.message.slice(0, 200));
@@ -350,25 +351,31 @@ export class Azure {
   async _request_once(method: string, url: string, resource: string, body?: string | Buffer | null,
     headers: Headers = {}, missing_ok = false, capture?: (receipt: HttpReceipt) => void): Promise<[Buffer | null, Headers]> {
     const token = await this.token(resource);
-    let response: Response;
     try {
-      response = await fetch(url, { method, body: body == null ? undefined : body as BodyInit,
-        signal: AbortSignal.timeout(30_000), redirect: 'error',
-        headers: { Authorization: 'Bearer ' + token, ...(resource === 'https://storage.azure.com/' ?
-          { 'x-ms-date': new Date().toUTCString() } : {}), ...headers } });
-      const bytes = Buffer.from(await response.arrayBuffer());
-      capture?.({ status: response.status, bodyBase64: bytes.toString('base64'),
-        headers: Object.fromEntries([...response.headers.entries()].filter(([name]) =>
+      const parsedUrl = new URL(url);
+      const response = await dispatchExternalEffect({ transport: 'azure-rest', method, resource: parsedUrl.origin + '|' + resource,
+        path: parsedUrl.pathname + parsedUrl.search, body }, async () => {
+        const received = await fetch(url, { method, body: body == null ? undefined : body as BodyInit,
+          signal: AbortSignal.timeout(30_000), redirect: 'error',
+          headers: { Authorization: 'Bearer ' + token, ...(resource === 'https://storage.azure.com/' ?
+            { 'x-ms-date': new Date().toUTCString() } : {}), ...headers } });
+        const bytes = Buffer.from(await received.arrayBuffer());
+        const responseHeaders = Object.fromEntries(received.headers.entries());
+        const receiptHeaders = Object.fromEntries(Object.entries(responseHeaders).filter(([name]) =>
           ['x-ms-request-id', 'x-ms-correlation-request-id', 'x-ms-client-request-id',
-            'x-ms-lease-id', 'x-ms-activity-id', 'etag', 'date'].includes(name))) });
+            'x-ms-lease-id', 'x-ms-activity-id', 'etag', 'date'].includes(name)));
+        capture?.({ status: received.status, bodyBase64: bytes.toString('base64'), headers: receiptHeaders });
+        return { status: received.status, bytes, headers: responseHeaders };
+      });
       if (missing_ok && response.status === 404) return [null, {}];
-      if (!response.ok) throw new HttpFailure(response.status, `HTTP ${response.status}: ${this.c.redact(bytes.toString())}`);
-      return [bytes, { ...Object.fromEntries(response.headers.entries()), ':status': String(response.status) }];
+      if (response.status < 200 || response.status >= 300)
+        throw new HttpFailure(response.status, 'HTTP ' + response.status + ': ' + this.c.redact(response.bytes.toString()));
+      return [response.bytes, { ...response.headers, ':status': String(response.status) }];
     } catch (error) {
-      if (error instanceof HttpFailure) throw error;
+      if (error instanceof HttpFailure || error instanceof EffectBoundaryRefused) throw error;
       const code = (error as { cause?: { code?: unknown } } | null)?.cause?.code;
-      throw new Failure(this.c.redact(`${method} ${service_name(resource)} request failed: ${String(error)}` +
-        (typeof code === 'string' ? ` (${code})` : '')), { cause: error });
+      throw new Failure(this.c.redact(method + ' ' + service_name(resource) + ' request failed: ' + String(error) +
+        (typeof code === 'string' ? ' (' + code + ')' : '')), { cause: error });
     }
   }
   async arm(method: string, resourcePath: string, body?: any, missing_ok = false, api = API): Promise<any> {
@@ -507,15 +514,16 @@ export async function exchange_workload_identity_assertion(resource: string, cli
   const scope = resource.replace(/\/+$/, '') + '/.default';
   let response: Response;
   try {
-    response = await fetch(`https://login.microsoftonline.com/${encodeURIComponent(tenantId)}/oauth2/v2.0/token`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({ client_id: clientId, scope, grant_type: 'client_credentials',
-        client_assertion_type: 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer', client_assertion: assertion }),
-      signal: AbortSignal.timeout(timeoutMs),
-      redirect: 'error',
-    });
+    const tokenUrl = `https://login.microsoftonline.com/${encodeURIComponent(tenantId)}/oauth2/v2.0/token`;
+    const parsedUrl = new URL(tokenUrl);
+    const body = new URLSearchParams({ client_id: clientId, scope, grant_type: 'client_credentials',
+      client_assertion_type: 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer', client_assertion: assertion });
+    response = await dispatchExternalEffect({ transport: 'azure-auth', method: 'POST', resource: parsedUrl.origin,
+      path: parsedUrl.pathname + parsedUrl.search, body: body.toString() }, () => fetch(tokenUrl, {
+      method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body,
+      signal: AbortSignal.timeout(timeoutMs), redirect: 'error' }));
   } catch (error) {
+    if (error instanceof EffectBoundaryRefused) throw error;
     throw new Failure('Workload identity token exchange request failed.', { cause: error });
   }
   if (!response.ok) {

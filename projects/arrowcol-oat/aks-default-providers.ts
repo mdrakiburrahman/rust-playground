@@ -4,7 +4,8 @@ import { observe_custody_idle_capacity } from '../../infra/azure/aks-safe-idle.j
 import { plan_run_fic } from '../../infra/azure/run_fic.js';
 import { CampaignConflictError, CampaignFencedError, CampaignWriteOutcomeUnknownError, isInitialRunInventory, recordCleanupArmOperation, type CampaignState, type CampaignStore, type CleanupArmTarget } from './aks-campaign.js';
 import { createOwnedRunCleanupActions, type CleanupMutationAuthority, type ExternalCleanupActions } from './aks-cleanup-executor.js';
-import { assertCleaningActor, assertRunCleanupActor, discoverOwnedRunInventory, observeExactKubernetes } from './aks-setup-cleanup.js';
+import { assertCleaningActor, assertRunCleanupActor, discoverOwnedRunInventory, observeExactKubernetes,
+  type CustodyCommandRunner } from './aks-setup-cleanup.js';
 import { reconcilePendingArmOperations, verifySafeIdle, type SafeIdleObservation } from './aks-reconcile.js';
 import { captureStampKustoBaseline, observeDataPreservation, validateStampKustoBaseline, type DataPreservationReceipt } from './aks-data-safety.js';
 import { createDefaultLifecycleActions } from './aks-lifecycle.js';
@@ -133,7 +134,8 @@ export interface StampHealthReceipt {
   pdb_blocked: boolean;
   versions: Array<{ namespace: string; kind: string; resource_version: string }>;
 }
-export async function observeStampHealth(azure: Azure, state: CampaignState, authority: CleanupMutationAuthority): Promise<StampHealthReceipt> {
+export async function observeStampHealth(azure: Azure, state: CampaignState, authority: CleanupMutationAuthority,
+  runCommand?: CustodyCommandRunner): Promise<StampHealthReceipt> {
   const plan = state.runInventory?.fic?.plan;
   if (!plan || plan.aksId !== azure.c.base + '/providers/Microsoft.ContainerService/managedClusters/' + azure.c.cluster)
     throw new Error('Stamp health requires the exact persisted selected AKS identity.');
@@ -143,7 +145,7 @@ export async function observeStampHealth(azure: Azure, state: CampaignState, aut
   let blocked = false;
   for (const namespace of [...new Set(['kube-system', azure.c.kubernetesNamespace])]) {
     for (const kind of ['pods', 'poddisruptionbudgets.policy']) {
-      const list = await observeExactKubernetes(plan.server, [kind, '--namespace', namespace], authority);
+      const list = await observeExactKubernetes(plan.server, [kind, '--namespace', namespace], authority, runCommand);
       if (!list || !Array.isArray(list.items) || list.kind !== (kind === 'pods' ? 'PodList' : 'PodDisruptionBudgetList'))
         throw new Error('Full stamp pod/PDB observation is UNKNOWN.');
       versions.push({ namespace, kind, resource_version: text(object(list.metadata).resourceVersion) });
@@ -229,13 +231,14 @@ type IndependentProviders = 'discoverExactInventory' | 'deleteNamespaceIfUidAndO
 export interface DefaultCleanupProviderOptions {
   azure: Azure;
   workDirectory: string;
+  runCommand?: CustodyCommandRunner;
   lifecycle?: Omit<ExternalCleanupActions, IndependentProviders>;
   readDataSafety?: (state: CampaignState, authority: CleanupMutationAuthority) => Promise<FullDataSafetyReceipt | DataPreservationReceipt>;
   readHealth?: typeof observeStampHealth;
 }
 export function createDefaultCleanupProviders(store: CampaignStore, options: DefaultCleanupProviderOptions): ExternalCleanupActions {
   const { azure } = options, readHealth = options.readHealth ?? observeStampHealth;
-  const lifecycle = options.lifecycle ?? createDefaultLifecycleActions(store, azure);
+  const lifecycle = options.lifecycle ?? createDefaultLifecycleActions(store, azure, options.runCommand);
   const readDataSafety = options.readDataSafety ?? ((state: CampaignState, authority: CleanupMutationAuthority) =>
     observeDataPreservation(store, azure, state, authority));
   const authorityFor = (state: CampaignState): CleanupMutationAuthority => ({
@@ -270,7 +273,7 @@ export function createDefaultCleanupProviders(store: CampaignStore, options: Def
     discoverExactInventory: async inventory => {
       const state = (await store.read())?.state;
       if (!state || canonical_json(state.runInventory) !== canonical_json(inventory)) throw new Error('Discovery inventory/version changed.');
-      return discoverOwnedRunInventory(azure, inventory, authorityFor(state));
+      return discoverOwnedRunInventory(azure, inventory, authorityFor(state), options.runCommand);
     },
     deleteNamespaceIfUidAndOwnerMatch: async (namespace, key, authority) => (await owned(authority)).deleteNamespaceIfUidAndOwnerMatch(namespace, key, authority),
     deleteQapBindingIfOwned: async (database, binding, campaignId, key, authority) =>
@@ -290,7 +293,7 @@ export function createDefaultCleanupProviders(store: CampaignStore, options: Def
       if (state.operations.some(operation => operation.cleanupTarget && operation.status === 'failed'))
         throw new Error('ARM rollback failed; retained durable intent requires explicit reconciliation.');
       const baselineCount = await baselineSystemCount(azure, state), observed = await observe_custody_idle_capacity(azure);
-      const health = await readHealth(azure, state, authority);
+      const health = await readHealth(azure, state, authority, options.runCommand);
       if (observed.kusto.state !== 'Running') throw new Error('Kusto is not Running; never stop/start it as guessed cleanup.');
       if (observed.aks_provisioning_state !== 'Succeeded' || observed.system_pool.provisioning_state !== 'Succeeded' ||
           observed.user_pools.some(pool => pool.provisioning_state !== 'Succeeded') || observed.kusto.provisioning_state !== 'Succeeded')
@@ -324,7 +327,7 @@ export function createDefaultCleanupProviders(store: CampaignStore, options: Def
       const authority = authorityFor(state);
       await assertCleaningActor(store, authority);
       await authority.assertCurrent();
-      const capacity = await observe_custody_idle_capacity(azure), health = await readHealth(azure, state, authority);
+      const capacity = await observe_custody_idle_capacity(azure), health = await readHealth(azure, state, authority, options.runCommand);
       if (capacity.status !== 'capacity_idle') return 'pending';
       const data = await readDataSafety(state, authority);
       if (data.campaign_id !== state.campaignId || data.cell_run_id !== state.runInventory?.cell_run_id ||
