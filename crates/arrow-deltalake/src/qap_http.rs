@@ -415,13 +415,39 @@ mod storage_bridge {
                     url.origin() == self.data_endpoint.origin()
                         && match method {
                             "GET" if url.path() == self.data_endpoint.path() => {
+                                let start_from_valid = match query.get("startFrom") {
+                                    Some(start_from) => {
+                                        let expected_prefix = format!("{}_delta_log/", self.data_prefix);
+                                        let is_directory_cursor = start_from == expected_prefix.trim_end_matches('/');
+                                        let is_version_cursor =
+                                            start_from.strip_prefix(&expected_prefix).is_some_and(|version| {
+                                                version.len() == 20 && version.bytes().all(|byte| byte.is_ascii_digit())
+                                            });
+                                        let mut canonical_query = url::form_urlencoded::Serializer::new(String::new());
+                                        canonical_query
+                                            .append_pair("restype", "container")
+                                            .append_pair("comp", "list")
+                                            .append_pair("prefix", &expected_prefix)
+                                            .append_pair("startFrom", start_from);
+                                        let canonical_query = canonical_query.finish();
+                                        query.len() == 4
+                                            && query.get("prefix") == Some(&expected_prefix)
+                                            && (is_directory_cursor || is_version_cursor)
+                                            && url.query() == Some(canonical_query.as_str())
+                                    }
+                                    None => true,
+                                };
                                 query.len() >= 3
                                     && query.len() <= 5
                                     && query.get("restype").is_some_and(|x| x == "container")
                                     && query.get("comp").is_some_and(|x| x == "list")
                                     && query.get("prefix").is_some_and(|x| x.starts_with(&self.data_prefix))
+                                    && start_from_valid
                                     && query.keys().all(|x| {
-                                        matches!(x.as_str(), "restype" | "comp" | "prefix" | "marker" | "maxresults")
+                                        matches!(
+                                            x.as_str(),
+                                            "restype" | "comp" | "prefix" | "marker" | "maxresults" | "startFrom"
+                                        )
                                     })
                             }
                             "GET" | "HEAD" => {
@@ -681,6 +707,8 @@ mod storage_bridge {
         const GENERATION: &str = "00000000-0000-0000-0000-000000000003";
         const UNRELATED: &str = "00000000-0000-0000-0000-000000000009";
         const ROOT: &str = "abfss://data@offlineaccount.dfs.core.windows.net/owned-run/table/";
+        const KERNEL_TABLE_PATH: &str = "fixture/campaigns/00000000-0000-4000-8000-000000000001/runs/00000000-0000-4000-8000-000000000002/dataflow/telemetry/sqlserver/sqlserver_availability_replica_states/";
+        const KERNEL_LOG_PREFIX: &str = "fixture/campaigns/00000000-0000-4000-8000-000000000001/runs/00000000-0000-4000-8000-000000000002/dataflow/telemetry/sqlserver/sqlserver_availability_replica_states/_delta_log/";
 
         fn authority() -> StorageBridgeAuthority {
             StorageBridgeAuthority {
@@ -714,6 +742,13 @@ mod storage_bridge {
             *request.method_mut() = reqwest::Method::HEAD;
             *request.uri_mut() =
                 "https://offlineaccount.blob.core.windows.net/checkpoints?restype=container".parse()?;
+            Ok(request)
+        }
+
+        fn object_list(uri: &str) -> anyhow::Result<HttpRequest> {
+            let mut request = HttpRequest::new(object_store::client::HttpRequestBody::empty());
+            *request.method_mut() = reqwest::Method::GET;
+            *request.uri_mut() = uri.parse()?;
             Ok(request)
         }
 
@@ -959,6 +994,156 @@ mod storage_bridge {
             );
             drop(state);
             server.abort();
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn azure_kernel_offset_listing_emits_canonical_directory_and_version_cursors() -> anyhow::Result<()> {
+            let root = format!("abfss://tables@offlineproof.dfs.core.windows.net/{KERNEL_TABLE_PATH}");
+            let mut authority = authority();
+            authority.storage_account = "offlineproof".into();
+            authority.control_container_url = "https://offlineproof.blob.core.windows.net/checkpoints".into();
+            authority.table_root_url = root.clone();
+            let (child, parent) = tokio::io::duplex(MAX_FRAME);
+            let (read, write) = tokio::io::split(child);
+            let bridge = StorageBridge::new(authority, deadline(10_000)?, read, write)?;
+            let fixture = Arc::new(Mutex::new(Fixture::ready()));
+            let server = tokio::spawn(serve(parent, Arc::clone(&fixture), None));
+
+            let url = Url::parse(&root)?;
+            let session = PublisherSession::open_bridged_async(&url, Arc::clone(&bridge)).await?;
+            let store = session.store_for_url(&url)?;
+            let prefix = object_store::path::Path::parse(KERNEL_LOG_PREFIX)?;
+            assert!(
+                store
+                    .list_with_offset(Some(&prefix), &prefix)
+                    .try_collect::<Vec<_>>()
+                    .await?
+                    .is_empty()
+            );
+            let version_cursor = object_store::path::Path::parse(format!("{KERNEL_LOG_PREFIX}00000000000000000000"))?;
+            assert!(
+                store
+                    .list_with_offset(Some(&prefix), &version_cursor)
+                    .try_collect::<Vec<_>>()
+                    .await?
+                    .is_empty()
+            );
+
+            let requests = fixture.lock().await.requests.clone();
+            let lists: Vec<_> = requests
+                .iter()
+                .filter(|request| request["target"] == "object_store" && request["method"] == "GET")
+                .collect();
+            assert_eq!(lists.len(), 2);
+            let encoded_prefix = KERNEL_LOG_PREFIX.replace('/', "%2F");
+            let expected_directory_url = format!(
+                "https://offlineproof.blob.core.windows.net/tables?restype=container&comp=list&prefix={encoded_prefix}&startFrom={}",
+                KERNEL_LOG_PREFIX.trim_end_matches('/').replace('/', "%2F")
+            );
+            let encoded_version_cursor = format!("{KERNEL_LOG_PREFIX}00000000000000000000").replace('/', "%2F");
+            let expected_version_url = format!(
+                "https://offlineproof.blob.core.windows.net/tables?restype=container&comp=list&prefix={encoded_prefix}&startFrom={}",
+                encoded_version_cursor
+            );
+            assert_eq!(lists[0]["url"], expected_directory_url);
+            assert_eq!(lists[1]["url"], expected_version_url);
+            session.close_after_drain_async().await?;
+            server.abort();
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn azure_list_start_from_rejects_out_of_scope_cursors() -> anyhow::Result<()> {
+            let (bridge, mut parent) = bridge(5_000)?;
+            let prefix = "owned-run/table/_delta_log/";
+            let list_url = |prefix: &str, start_from: &str| {
+                let mut query = url::form_urlencoded::Serializer::new(String::new());
+                query
+                    .append_pair("restype", "container")
+                    .append_pair("comp", "list")
+                    .append_pair("prefix", prefix)
+                    .append_pair("startFrom", start_from);
+                format!("https://offlineaccount.blob.core.windows.net/data?{}", query.finish())
+            };
+            for start_from in [
+                "owned-run/other-table/_delta_log",
+                "owned-run/table/_delta_log/_last_checkpoint",
+                "owned-run/table/_delta_log/0000000000000000000",
+                "owned-run/table/_delta_log/000000000000000000000",
+                "owned-run/table/_delta_log/0000000000000000000a",
+                "owned-run/table/_delta_log/00000000000000000000.json",
+                "owned-run/table/_delta_log/+0000000000000000000",
+                "owned-run/table/_delta_log/../00000000000000000000",
+                "owned-run/table/_delta_log/%2F00000000000000000000",
+            ] {
+                let url = list_url(prefix, start_from);
+                assert!(
+                    matches!(
+                        bridge.exchange(object_list(&url)?, "object_store").await,
+                        Outcome::NotSent(Code::InvalidRequest)
+                    ),
+                    "{url}",
+                    url = url
+                );
+            }
+            assert!(matches!(
+                bridge
+                    .exchange(
+                        object_list(&list_url("owned-run/table/_commits/", "owned-run/table/_commits"))?,
+                        "object_store"
+                    )
+                    .await,
+                Outcome::NotSent(Code::InvalidRequest)
+            ));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), parent.read_u8())
+                    .await
+                    .is_err()
+            );
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn azure_list_start_from_rejects_noncanonical_query_shape() -> anyhow::Result<()> {
+            let (bridge, mut parent) = bridge(5_000)?;
+            let prefix = "owned-run/table/_delta_log/";
+            let cursor = "owned-run/table/_delta_log/00000000000000000000";
+            let encoded_prefix = prefix.replace('/', "%2F");
+            let encoded_cursor = cursor.replace('/', "%2F");
+            for query in [
+                format!("restype=container&comp=list&prefix={encoded_prefix}&startFrom={encoded_cursor}&marker="),
+                format!("restype=container&prefix={encoded_prefix}&comp=list&startFrom={encoded_cursor}"),
+                format!(
+                    "restype=container&comp=list&prefix={encoded_prefix}&startFrom={}",
+                    cursor
+                ),
+                format!(
+                    "restype=container&comp=list&prefix={encoded_prefix}&startFrom={}",
+                    encoded_cursor.replace("%2F", "%2f")
+                ),
+                format!(
+                    "restype=container&comp=list&prefix={encoded_prefix}&startFrom={}",
+                    encoded_cursor.replace("%2F", "%252F")
+                ),
+                format!(
+                    "restype=container&comp=list&prefix={encoded_prefix}&startFrom={encoded_cursor}&startFrom={encoded_cursor}"
+                ),
+            ] {
+                let url = format!("https://offlineaccount.blob.core.windows.net/data?{query}");
+                assert!(
+                    matches!(
+                        bridge.exchange(object_list(&url)?, "object_store").await,
+                        Outcome::NotSent(Code::InvalidRequest)
+                    ),
+                    "{url}"
+                );
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), parent.read_u8())
+                    .await
+                    .is_err()
+            );
             Ok(())
         }
 

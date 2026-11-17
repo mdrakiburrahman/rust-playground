@@ -35,7 +35,7 @@ pub enum Command {
     AzureManifest(InitializeAzureArgs),
     /// Create one fresh local ingestion-partitioned table without connecting to Flight or sending rows.
     InitializeLocal(InitializeLocalArgs),
-    /// Validate one owned-run table plan; execution is held until the per-operation bridge is wired.
+    /// Create one fresh owned-run table only through an explicitly supplied storage bridge.
     InitializeOwnedRunTable(InitializeOwnedRunTableArgs),
     /// Print the exact public Flight SQL schema fixture.
     PrintSchemas,
@@ -143,6 +143,12 @@ pub struct InitializeOwnedRunTableArgs {
     /// Strict JSON plan binding storage, campaign/run, generation and publication authority.
     #[arg(long)]
     pub plan: PathBuf,
+    /// Private JSON with original StorageBridge authority and absolute deadline.
+    #[arg(long, requires = "storage_bridge_stdio")]
+    pub storage_bridge_input: Option<PathBuf>,
+    /// Dedicated StorageBridge request/response pipes; never a direct-network fallback.
+    #[arg(long, requires = "storage_bridge_input")]
+    pub storage_bridge_stdio: bool,
 }
 
 /// Benchmark scenario.
