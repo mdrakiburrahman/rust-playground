@@ -49,7 +49,18 @@ function resourceIdentity(transport: ScaleResourceIdentity['transport'], resourc
   kind: string, namespace: string | null, name: string, uid: string | null): ScaleResourceIdentity {
   return { transport, resource_id: resourceId, api_version: apiVersion, kind, namespace, name, uid };
 }
-async function assertWriterBoundary(inventory: RunInventory, authority: CleanupMutationAuthority, runCommand: CustodyCommandRunner): Promise<void> {
+export interface ScaleWriterObservation {
+  server: string;
+  namespace: string;
+  deploymentUid: string | null;
+  podName: string | null;
+  podUid: string | null;
+  nodeName: string | null;
+  containerName: string | null;
+  containerId: string | null;
+}
+export async function assertWriterBoundary(inventory: RunInventory, authority: CleanupMutationAuthority,
+  runCommand: CustodyCommandRunner): Promise<ScaleWriterObservation | undefined> {
   if (!inventory.fic?.plan?.server) throw new Error('Scale admission has no exact Kubernetes API server binding.');
   const collector = oneResource(inventory, 'collector');
   const deployment = await observeExactKubernetes(inventory.fic.plan.server,
@@ -94,6 +105,11 @@ async function assertWriterBoundary(inventory: RunInventory, authority: CleanupM
         pods[0]?.status?.phase !== 'Running' || !Array.isArray(pods[0]?.status?.containerStatuses) ||
         pods[0].status.containerStatuses.length !== 1 || pods[0].status.containerStatuses[0]?.ready !== true)
       throw new Error('Scale admission requires exactly one ready physical ArrowCol writer and no overlapping rollout pods.');
+    const text = (value: unknown) => typeof value === 'string' && value.length > 0 ? value : null;
+    return { server: inventory.fic.plan.server, namespace: inventory.namespace.name, deploymentUid: text(collector.uid),
+      podName: text(pods[0]?.metadata?.name), podUid: text(pods[0]?.metadata?.uid), nodeName: text(pods[0]?.spec?.nodeName),
+      containerName: text(pods[0]?.status?.containerStatuses?.[0]?.name),
+      containerId: text(pods[0]?.status?.containerStatuses?.[0]?.containerID) };
   }
 }
 function scaleReceipt(state: CampaignState, target: ScaleTarget): ScaleTrialReceipt {

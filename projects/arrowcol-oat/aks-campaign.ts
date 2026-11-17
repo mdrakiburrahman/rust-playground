@@ -72,7 +72,7 @@ export interface ScaleEffectDispatch {
 export interface ScaleTrialReceipt {
   schema_version: 1; trial_id: string; campaign_id: string; owner_id: string; fencing_token: number; cell_run_id: string;
   started_at_ms: number; deadline_at_ms: number; restore_deadline_at_ms: number; target: ScaleTarget; restore: ScaleTarget; evidence: string[];
-  baseline: { committed_rows_per_second: number; qap_pending_backlog: number };
+  baseline: { committed_rows_per_second: number; qap_pending_backlog: number | null };
   resource: ScaleResourceIdentity; phase: ScaleTrialPhase; operation_url?: string;
   dispatches?: { apply?: ScaleEffectDispatch; restore?: ScaleEffectDispatch };
   result?: { outcome: 'keep' | 'revert' | 'stop' | 'unknown'; committed_rows_per_second: number | null;
@@ -121,7 +121,8 @@ function validScaleTrial(value: unknown, state: CampaignState): value is ScaleTr
       value.evidence.some(item => typeof item !== 'string' || item.length > 64 || !/^[a-z0-9-]+$/.test(item)) ||
       !record(value.baseline) || !exactRecord(value.baseline, ['committed_rows_per_second', 'qap_pending_backlog']) ||
       typeof value.baseline.committed_rows_per_second !== 'number' || !Number.isFinite(value.baseline.committed_rows_per_second) || value.baseline.committed_rows_per_second < 0 ||
-      !nonnegative(value.baseline.qap_pending_backlog) ||
+      !(value.baseline.qap_pending_backlog === null ? !['kusto-capacity', 'kusto-sku'].includes(target.dimension) :
+        nonnegative(value.baseline.qap_pending_backlog)) ||
       value.schema_version !== 1 || !uuid.test(String(value.trial_id)) || value.campaign_id !== state.campaignId ||
       value.owner_id !== state.ownerId || !nonnegative(value.fencing_token) || value.fencing_token < 1 ||
       value.fencing_token > state.fencingToken || !state.runInventory || state.mode !== 'armed' ||
@@ -167,7 +168,9 @@ function validScaleTrial(value: unknown, state: CampaignState): value is ScaleTr
         !(result.committed_rows_per_second === null || typeof result.committed_rows_per_second === 'number' && Number.isFinite(result.committed_rows_per_second) && result.committed_rows_per_second >= 0) ||
         !(result.qap_pending_backlog === null || nonnegative(result.qap_pending_backlog)) || typeof result.ineffective_increments !== 'number' || !Number.isSafeInteger(result.ineffective_increments) || result.ineffective_increments < 0 ||
         typeof result.reason !== 'string' || result.reason.length === 0 || result.reason.length > 128 || /[\u0000-\u001f]/.test(result.reason) ||
-        result.outcome === 'unknown' !== [result.committed_rows_per_second, result.qap_pending_backlog].every(item => item === null)) return false;
+        (result.outcome === 'unknown' ? result.committed_rows_per_second !== null || result.qap_pending_backlog !== null :
+          result.committed_rows_per_second === null ||
+          ['kusto-capacity', 'kusto-sku'].includes(target.dimension) && result.qap_pending_backlog === null)) return false;
   }
   if (resource.transport === 'azure-rest') {
     if (!String(resource.resource_id).startsWith('/subscriptions/') || resource.namespace !== null || resource.uid !== null ||
@@ -252,10 +255,24 @@ export interface RunInventory {
   fic: { resource_id: string | null; name: string | null; state: RunInventoryResourceState; absence: InventoryFicAbsenceReceipt | null; plan?: RunFicPlan | null } | null;
   qap: { database: string; bindings: Array<{ external_table: string; relative_path: string }>; state: RunInventoryResourceState; absence: InventoryQapAbsenceReceipt[]; reference?: OatQapReference | null } | null;
   evidence_destination?: { account: string; container: string; blob_prefix: string } | null;
+  official_measurement?: OfficialCellMeasurementReference | null;
   planned_cell_duration_ms?: number;
   effective_stop_budgets?: { maintenance_grace_seconds: number; maintenance_stop_timeout_ms: number };
   cleanup: { stop_admission: InventoryStep; bounded_drain: InventoryStep; evidence_capture: InventoryStep; stop_maintenance: InventoryStep;
     terminal_capture: InventoryStep; handoff: InventoryStep };
+}
+export interface OfficialCellMeasurementReference {
+  schema_version: 1;
+  blob: string;
+  etag: string;
+  version: string | null;
+  sha256: string;
+  byte_length: number;
+  effective_config_sha256: string;
+  submitted_config_sha256: string | null;
+  source_revision: string | null;
+  measurement_start_unix_ms: number | null;
+  measurement_end_unix_ms: number | null;
 }
 function stateValue(value: unknown): value is RunInventoryResourceState { return ['planned', 'observed', 'removed', 'absent', 'uncertain'].includes(String(value)); }
 function stepStateValue(value: unknown): value is InventoryStepState { return ['not_started', 'pending', 'running', 'complete', 'failed', 'uncertain'].includes(String(value)); }
@@ -274,7 +291,7 @@ function validateRunInventory(value: unknown, state: CampaignState): RunInventor
   if (stopBudgets !== undefined) parseEffectiveStopBudgets(stopBudgets);
   const fields = ['schema_version', 'campaign_id', 'owner_id', 'fencing_token', 'orchestration_run_id', 'cell_run_id', 'load_admission',
     'namespace', 'resources', 'fic', 'qap', 'cleanup'];
-  if (!optionalRecord(value, fields, ['evidence_destination', 'planned_cell_duration_ms', 'effective_stop_budgets']) || value.schema_version !== 1 || value.campaign_id !== state.campaignId ||
+  if (!optionalRecord(value, fields, ['evidence_destination', 'official_measurement', 'planned_cell_duration_ms', 'effective_stop_budgets']) || value.schema_version !== 1 || value.campaign_id !== state.campaignId ||
       value.owner_id !== state.ownerId || value.fencing_token !== (state.status === 'active' ? state.fencingToken : state.runInventory?.fencing_token) || !nonnegative(value.fencing_token) || value.fencing_token === 0 ||
       !canonicalUuid(value.campaign_id) || !canonicalUuid(value.owner_id) || !canonicalUuid(value.orchestration_run_id) || !canonicalUuid(value.cell_run_id) ||
       !['not_authorized', 'authorization_pending', 'authorized'].includes(String(value.load_admission)) ||
@@ -303,6 +320,26 @@ function validateRunInventory(value: unknown, state: CampaignState): RunInventor
       throw new Error('RunInventory evidence destination must be an exact credential-free Blob prefix.');
   } else if (inventory.evidence_destination !== undefined && inventory.evidence_destination !== null)
     throw new Error('RunInventory evidence destination is malformed.');
+  if (inventory.official_measurement !== undefined && inventory.official_measurement !== null) {
+    const reference = inventory.official_measurement;
+    const hash = (value: unknown) => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
+    if (!exactRecord(reference, ['schema_version', 'blob', 'etag', 'version', 'sha256', 'byte_length',
+        'effective_config_sha256', 'submitted_config_sha256', 'source_revision', 'measurement_start_unix_ms', 'measurement_end_unix_ms']) ||
+        reference.schema_version !== 1 || !inventory.evidence_destination ||
+        reference.blob !== inventory.evidence_destination.blob_prefix + '/official-cell-measurement-v1.json' ||
+        typeof reference.etag !== 'string' || reference.etag.length < 1 || reference.etag.length > 512 ||
+        reference.etag === '*' || reference.etag.startsWith('W/') || /[\u0000-\u001f\u007f]/.test(reference.etag) ||
+        !hash(reference.sha256) || !hash(reference.effective_config_sha256) ||
+        !(reference.submitted_config_sha256 === null || hash(reference.submitted_config_sha256)) ||
+        !(reference.source_revision === null || typeof reference.source_revision === 'string' && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(reference.source_revision)) ||
+        !nonnegative(reference.byte_length) || reference.byte_length < 1 || reference.byte_length > 4_194_304 ||
+        !(reference.version === null || typeof reference.version === 'string' && reference.version.length > 0 &&
+          reference.version.length <= 1024 && !/[\u0000-\u001f\u007f]/.test(reference.version)) ||
+        !((reference.measurement_start_unix_ms === null && reference.measurement_end_unix_ms === null) ||
+          nonnegative(reference.measurement_start_unix_ms) && reference.measurement_start_unix_ms > 0 &&
+          nonnegative(reference.measurement_end_unix_ms) && reference.measurement_end_unix_ms > reference.measurement_start_unix_ms))
+      throw new Error('RunInventory official measurement reference is malformed or has another destination.');
+  }
   if (inventory.fic !== null) {
     const fic = inventory.fic;
     if (fic.plan) {
@@ -467,6 +504,8 @@ function mergeRunInventory(before: RunInventory | undefined, after: RunInventory
   }
   if (before.evidence_destination && !sameFlatRecord(before.evidence_destination, after.evidence_destination))
     throw new Error('RunInventory evidence destination is immutable.');
+  if (before.official_measurement && !sameFlatRecord(before.official_measurement, after.official_measurement))
+    throw new Error('RunInventory original official cell measurement binding is immutable.');
   const resources = new Map(before.resources.map(resource => [[resource.api_version, resource.kind, resource.name].join('|'), resource]));
   for (const next of after.resources) {
     const key = [next.api_version, next.kind, next.name].join('|');

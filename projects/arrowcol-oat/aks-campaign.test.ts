@@ -416,6 +416,27 @@ test('scale trial journal rejects malformed target bindings and duplicate ids', 
   assert.throws(() => validateCampaignState({ ...armed, scaleTrials: [{ ...receipt, resource: { ...receipt.resource, uid: 'c0ffee00-0000-4000-8000-000000000099' } }] }), /malformed/);
 });
 
+test('official measurement reference is exact, optional for legacy inspection, and immutable after publication', async () => {
+  const store = await seed();
+  const state = await armForTest(store);
+  const inventory = { ...state.runInventory!,
+    evidence_destination: { account: 'arrowcollector12345', container: 'checkpoints', blob_prefix: 'synthetic-offline/cell-evidence' } };
+  await publishRunInventory(store, inventory, state.startedAtMs + 2);
+  const reference = { schema_version: 1 as const, blob: inventory.evidence_destination.blob_prefix + '/official-cell-measurement-v1.json',
+    etag: '"original-etag"', version: null, sha256: 'a'.repeat(64), byte_length: 2048,
+    effective_config_sha256: 'b'.repeat(64), submitted_config_sha256: null, source_revision: null,
+    measurement_start_unix_ms: state.startedAtMs, measurement_end_unix_ms: state.startedAtMs + 30_000 };
+  const bound = { ...inventory, official_measurement: reference };
+  await publishRunInventory(store, bound, state.startedAtMs + 3);
+  await assert.rejects(publishRunInventory(store, { ...bound, official_measurement: { ...reference, sha256: 'c'.repeat(64) } },
+    state.startedAtMs + 4), /immutable/);
+  await assert.rejects(publishRunInventory(store, { ...bound, official_measurement: null }, state.startedAtMs + 4), /immutable/);
+  for (const invalid of [{ ...reference, blob: 'another-cell/official-cell-measurement-v1.json' },
+    { ...reference, byte_length: 4_194_305 }, { ...reference, measurement_end_unix_ms: null },
+    { ...reference, submitted_config_sha256: 'self-asserted-not-a-digest' }, { ...reference, etag: '*' }])
+    assert.throws(() => validateCampaignState({ ...state, runInventory: { ...inventory, official_measurement: invalid } }), /measurement reference/);
+});
+
 test('strict state schema rejects additional persisted fields', async () => {
   const state = newCampaignState(campaignId, ownerId, 1);
   await assert.rejects(async () => validateCampaignState({ ...state, unexpected: true }), /unknown fields/);

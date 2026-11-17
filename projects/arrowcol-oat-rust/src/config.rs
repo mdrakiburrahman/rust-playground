@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use url::Url;
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OatConfig {
     #[serde(default)]
@@ -93,7 +93,7 @@ impl Default for OverloadGuardConfig {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlatformConfig {
     pub kind: OatMode,
@@ -110,7 +110,7 @@ pub struct PlatformConfig {
     pub resources: Option<AksResourceOverrides>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AksResourceOverrides {
     pub collector: Option<ResourceRequirements>,
@@ -282,7 +282,7 @@ pub(crate) fn parse_memory_bytes(value: &str) -> Result<u64> {
     Ok(bytes)
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LocalOptions {
     pub collector_memory_limit_bytes: Option<u64>,
@@ -291,14 +291,14 @@ pub struct LocalOptions {
     pub snapshot_root: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum OatMode {
     Local,
     Aks,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum CampaignProfile {
     SingleHotTable,

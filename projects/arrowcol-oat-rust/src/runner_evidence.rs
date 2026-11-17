@@ -1,3 +1,256 @@
+const OFFICIAL_MEASUREMENT_MAX_BYTES: usize = 4_194_304;
+const OFFICIAL_MEASUREMENT_SCOPE: &str = "original_official_cell_window_not_paired_scale_authorization";
+const OFFICIAL_MEASUREMENT_PUBLICATION_SECONDS: u64 = 20;
+const OFFICIAL_MEASUREMENT_RETENTION_RESERVE_SECONDS: u64 = 10;
+
+fn official_measurement_blob(inventory: &RunInventory) -> Result<String> {
+    let destination = inventory.evidence_destination.as_ref().context("official measurement has no custody destination")?;
+    Ok(format!("{}/official-cell-measurement-v1.json", destination.blob_prefix))
+}
+
+fn validate_official_measurement_reference(inventory: &RunInventory) -> Result<()> {
+    let Some(reference) = &inventory.official_measurement else { return Ok(()) };
+    let sha = |value: &str| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    if reference.schema_version != 1
+        || reference.blob != official_measurement_blob(inventory)?
+        || !sha(&reference.sha256)
+        || !sha(&reference.effective_config_sha256)
+        || reference.submitted_config_sha256.as_deref().is_some_and(|value| !sha(value))
+        || reference.source_revision.as_deref().is_some_and(|value| {
+            !matches!(value.len(), 40 | 64) || !value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        || reference.byte_length == 0
+        || reference.byte_length > OFFICIAL_MEASUREMENT_MAX_BYTES as u64
+        || reference.version.as_deref().is_some_and(|value| value.is_empty() || value.len() > 1024 || value.chars().any(char::is_control))
+        || match (reference.measurement_start_unix_ms, reference.measurement_end_unix_ms) {
+            (None, None) => false,
+            (Some(start), Some(end)) => start == 0 || end <= start || end > 9_007_199_254_740_991,
+            _ => true,
+        }
+    {
+        bail!("official cell measurement reference is malformed or belongs to another destination");
+    }
+    validate_campaign_etag(&reference.etag)?;
+    Ok(())
+}
+
+fn official_measurement_bytes(inventory: &RunInventory, config: &OatConfig, rows: &[OatResult]) -> Result<Vec<u8>> {
+    let [row] = rows else { bail!("official campaign measurement requires exactly one original hot-table result") };
+    let tunables: Value = serde_json::from_str(&row.tunables_json)?;
+    if row.run_id != inventory.cell_run_id
+        || tunables["orchestration_run_id"] != inventory.orchestration_run_id
+        || config.tables.as_slice() != std::slice::from_ref(&row.table)
+    {
+        bail!("official cell result does not match the original inventory and table");
+    }
+    let evidence: Value = serde_json::from_str(row.evidence_json.as_deref().context("official result has no evidence")?)?;
+    let effective = json!({
+        "typed_oat_config": config,
+        "resolved_aks_resources": config.effective_aks_resources(),
+        "result_url": config.effective_result_url()?,
+        "website_url": config.effective_website_url()?,
+    });
+    let effective_config_json = fixture_canonical_json(&effective)?;
+    let source_revision = ((row.git_sha.len() == 40 || row.git_sha.len() == 64)
+        && row.git_sha.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+        .then_some(row.git_sha.as_str());
+    let payload = json!({
+        "schema_version": 1, "scope": OFFICIAL_MEASUREMENT_SCOPE,
+        "origin": {
+            "campaign_id": inventory.campaign_id, "owner_id": inventory.owner_id, "fencing_token": inventory.fencing_token,
+            "orchestration_run_id": inventory.orchestration_run_id, "cell_run_id": inventory.cell_run_id,
+            "namespace_uid": inventory.namespace.uid,
+        },
+        "submitted_config_sha256": null,
+        "effective_config_json": effective_config_json,
+        "effective_config_sha256": fixture_sha256(effective_config_json.as_bytes()),
+        "source_revision": source_revision,
+        "official_result": {
+            "run_id": row.run_id, "table": row.table, "status": row.status,
+            "git_sha": row.git_sha, "tunables": tunables, "evidence": evidence,
+        },
+    });
+    let bytes = fixture_canonical_json(&payload)?.into_bytes();
+    if bytes.len() > OFFICIAL_MEASUREMENT_MAX_BYTES {
+        bail!("official cell measurement exceeds its fixed byte bound");
+    }
+    Ok(bytes)
+}
+
+async fn publish_immutable_official_bytes(
+    store: Arc<dyn ObjectStore>,
+    path: &ObjectPath,
+    bytes: &[u8],
+) -> Result<(String, Option<String>)> {
+    use futures_util::TryStreamExt;
+    if bytes.is_empty() || bytes.len() > OFFICIAL_MEASUREMENT_MAX_BYTES {
+        bail!("official measurement publication exceeds its byte bound");
+    }
+    let before = match store.get_opts(path, GetOptions::default()).await {
+        Ok(existing) => Some(existing),
+        Err(object_store::Error::NotFound { .. }) => None,
+        Err(error) => return Err(error).context("observe original immutable measurement before creation"),
+    };
+    let object = match before {
+        Some(existing) => existing,
+        None => {
+            store.put_opts(path, PutPayload::from(Bytes::copy_from_slice(bytes)),
+                PutOptions { mode: PutMode::Create, ..PutOptions::default() }).await
+                .context("create original immutable official measurement once; uncertain outcome is not replayed")?;
+            store.get_opts(path, GetOptions::default()).await.context("read back original immutable official measurement")?
+        }
+    };
+    if object.meta.size != bytes.len() as u64 {
+        bail!("immutable official measurement length differs from original bytes");
+    }
+    let etag = object.meta.e_tag.clone().context("immutable measurement has no ETag")?;
+    validate_campaign_etag(&etag)?;
+    let version = object.meta.version.clone();
+    let mut stream = object.into_stream();
+    let mut offset = 0;
+    while let Some(chunk) = stream.try_next().await? {
+        if chunk.len() > bytes.len() - offset || chunk.as_ref() != &bytes[offset..offset + chunk.len()] {
+            bail!("immutable official measurement bytes differ; refusing adoption or overwrite");
+        }
+        offset += chunk.len();
+    }
+    if offset != bytes.len() {
+        bail!("immutable official measurement response was truncated");
+    }
+    Ok((etag, version))
+}
+
+async fn publish_campaign_official_measurement(
+    platform: &AksPlatform,
+    config: &OatConfig,
+    rows: &[OatResult],
+    deadline: tokio::time::Instant,
+) -> Result<()> {
+    if config.campaign_profile.is_none() {
+        return Ok(());
+    }
+    require_lifecycle_remaining(
+        deadline,
+        Duration::from_secs(OFFICIAL_MEASUREMENT_PUBLICATION_SECONDS + OFFICIAL_MEASUREMENT_RETENTION_RESERVE_SECONDS),
+        "immutable official measurement publication and failure retention",
+    )?;
+    let publication_deadline = tokio::time::Instant::now() + Duration::from_secs(OFFICIAL_MEASUREMENT_PUBLICATION_SECONDS);
+    tokio::time::timeout_at(publication_deadline, async {
+        let cached = campaign_inventory_for_setup(platform).await?;
+        let identity = CampaignIdentity::from_lookup(|name| std::env::var(name).ok())?;
+        let (current, _) = read_authoritative_campaign_inventory(
+            platform, &identity, &cached.orchestration_run_id, publication_deadline.saturating_duration_since(tokio::time::Instant::now()),
+        ).await?;
+        current.assert_custody_ready(platform.campaign_cli_paths()?).await?;
+        let bytes = official_measurement_bytes(&current, config, rows)?;
+        let payload: Value = serde_json::from_slice(&bytes)?;
+        let destination = current.evidence_destination.as_ref().context("official measurement destination is missing")?;
+        let blob = official_measurement_blob(&current)?;
+        let url = Url::parse(&format!("abfss://{}@{}.dfs.core.windows.net/{blob}", destination.container, destination.account))?;
+        let store = object_store_for_url(&url)?;
+        let (etag, version) = publish_immutable_official_bytes(store, &ObjectPath::from_url_path(url.path())?, &bytes).await?;
+        let output = &payload["official_result"]["evidence"]["commit_window_output_throughput"];
+        let mut next = current.clone();
+        next.official_measurement = Some(InventoryOfficialMeasurement {
+            schema_version: 1, blob, etag, version, sha256: fixture_sha256(&bytes), byte_length: bytes.len() as u64,
+            effective_config_sha256: payload["effective_config_sha256"].as_str().context("effective config digest missing")?.to_owned(),
+            submitted_config_sha256: None,
+            source_revision: payload["source_revision"].as_str().map(str::to_owned),
+            measurement_start_unix_ms: output["measurement_start_unix_ms"].as_u64(),
+            measurement_end_unix_ms: output["measurement_end_unix_ms"].as_u64(),
+        });
+        current.validate_successor(&next)?;
+        persist_campaign_inventory(platform, &next).await
+    }).await.context("bounded publication budget inside the original cell deadline expired; publication/custody outcome is UNKNOWN")?
+}
+
+#[cfg(test)]
+mod official_cell_measurement_tests {
+    use super::*;
+
+    fn original_measurement() -> Result<(OatConfig, RunInventory, Vec<OatResult>)> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        config.tables.truncate(1);
+        let identity = CampaignIdentity {
+            campaign_id: "c0ffee00-0000-4000-8000-000000000001".to_owned(),
+            owner_id: "c0ffee00-0000-4000-8000-000000000002".to_owned(),
+            fencing_token: 1,
+        };
+        let cell = "c0ffee00-0000-4000-8000-000000000003";
+        let inventory = initial_campaign_inventory(
+            &identity, "c0ffee00-0000-4000-8000-000000000004", cell,
+            &format!("oat-{}", cell.replace('-', "")), "arrowcollector12345", "checkpoints",
+            CampaignCellBudget {
+                effective_stop_budgets: config.maintenance_stop_budget()?,
+                planned_cell_duration_ms: config.timing_budget()?.planned_cell_duration_ms,
+            },
+        )?;
+        let mut rows = result_rows(&config, &inventory.orchestration_run_id, cell, 1, 1, CellMeasurements {
+            clients: ClientRun {
+                metrics: HashMap::new(), pinning: PinningReport::default(), qap_tables: Vec::new(),
+                failure: Some("synthetic_offline_fixture".to_owned()), evidence: CellEvidence::default(),
+            },
+            started_at_ms: 1_000, qap: QapMetrics::default(), resources: None, resource_evidence: None,
+        })?;
+        let output = commit_window_output(&BTreeMap::new(), &config.tables[0], 1_000, 31_000, None, None)?;
+        rows[0].evidence_json = Some(serde_json::to_string(&json!({
+            "version": 1, "commit_window_output_throughput": output,
+        }))?);
+        rows[0].git_sha = "a".repeat(40);
+        Ok((config, inventory, rows))
+    }
+
+    #[test]
+    fn official_producer_retains_the_original_window_and_missing_submitted_identity() -> Result<()> {
+        let (mut config, inventory, rows) = original_measurement()?;
+        let bytes = official_measurement_bytes(&inventory, &config, &rows)?;
+        let payload: Value = serde_json::from_slice(&bytes)?;
+        let original: Value = serde_json::from_str(rows[0].evidence_json.as_deref().context("missing evidence")?)?;
+        assert_eq!(payload["official_result"]["evidence"]["commit_window_output_throughput"], original["commit_window_output_throughput"]);
+        assert!(payload["submitted_config_sha256"].is_null());
+        let effective = payload["effective_config_json"].as_str().context("missing effective config")?;
+        assert_eq!(payload["effective_config_sha256"], fixture_sha256(effective.as_bytes()));
+        config.schedule_lead_seconds += 1;
+        let changed: Value = serde_json::from_slice(&official_measurement_bytes(&inventory, &config, &rows)?)?;
+        assert_ne!(payload["effective_config_sha256"], changed["effective_config_sha256"]);
+        let mut wrong = inventory;
+        wrong.cell_run_id = "c0ffee00-0000-4000-8000-000000000099".to_owned();
+        assert!(official_measurement_bytes(&wrong, &config, &rows).is_err());
+        println!("D46_OFFICIAL_PRODUCER_BYTES {}", String::from_utf8(bytes)?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn official_publication_is_create_only_and_never_adopts_different_bytes() -> Result<()> {
+        let (config, inventory, rows) = original_measurement()?;
+        let bytes = official_measurement_bytes(&inventory, &config, &rows)?;
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let path = ObjectPath::from(official_measurement_blob(&inventory)?);
+        let first = publish_immutable_official_bytes(Arc::clone(&store), &path, &bytes).await?;
+        let same = publish_immutable_official_bytes(Arc::clone(&store), &path, &bytes).await?;
+        assert_eq!(first, same);
+        let mut changed = bytes.clone();
+        changed[0] = b'[';
+        assert!(publish_immutable_official_bytes(Arc::clone(&store), &path, &changed).await.is_err());
+        assert_eq!(store.get_opts(&path, GetOptions::default()).await?.bytes().await?.as_ref(), bytes);
+        let mut bound = inventory.clone();
+        bound.official_measurement = Some(InventoryOfficialMeasurement {
+            schema_version: 1, blob: official_measurement_blob(&inventory)?, etag: first.0, version: first.1,
+            sha256: fixture_sha256(&bytes), byte_length: bytes.len() as u64, effective_config_sha256: "a".repeat(64),
+            submitted_config_sha256: None, source_revision: Some("a".repeat(40)),
+            measurement_start_unix_ms: Some(1_000), measurement_end_unix_ms: Some(31_000),
+        });
+        inventory.validate_successor(&bound)?;
+        let mut dropped = bound.clone();
+        dropped.official_measurement = None;
+        assert!(bound.validate_successor(&dropped).is_err());
+        assert!(publish_immutable_official_bytes(store, &path, &vec![0; OFFICIAL_MEASUREMENT_MAX_BYTES + 1]).await.is_err());
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Default, serde::Serialize)]
 struct CellEvidence {
     overload_guard: Option<Value>,
