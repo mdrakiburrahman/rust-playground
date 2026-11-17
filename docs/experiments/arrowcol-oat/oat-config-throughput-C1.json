@@ -246,11 +246,35 @@
       "candidate_limit": 8
     }
   ],
+  "parquet_enum_coverage": {
+    "kind": "compression",
+    "accepted": [
+      "uncompressed",
+      "snappy",
+      "gzip",
+      "brotli",
+      "lz4",
+      "lz4_raw",
+      "zstd"
+    ],
+    "configured": [
+      "uncompressed",
+      "snappy",
+      "gzip",
+      "brotli",
+      "lz4_raw",
+      "zstd"
+    ],
+    "excluded": {
+      "lz4": "legacy Hadoop framing; accepted for compatibility but excluded by campaign consumer/deprecation policy"
+    },
+    "status": "configured-not-runtime-screened"
+  },
   "runnable": false,
   "config_validation": {
     "status": "config-validated",
     "validator": "arrowcol-oat-rust --validate-config",
-    "source_sha": "02703b71d3c6a2ac92c690f70f1d967b8ac4c7c7",
+    "source_sha": "84f86b6c54b7fc9375c63666cdfbeed126ac8dbb",
     "baseline_count": 1,
     "candidate_count": 8,
     "pass_count": 9,

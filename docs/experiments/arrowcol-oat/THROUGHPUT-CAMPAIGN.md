@@ -8,7 +8,7 @@
 | Guard and envelope | Every baseline requests `overload_guard` enabled, cap fraction 0.90, two zero-progress windows, and a 4 GiB local collector memory limit. This common initial request is not measured headroom or proof of host suitability. |
 | Maintenance | Continuous, enabled, and applying in every cell. Idle work must be a no-op; due work stays enabled. |
 | Verdict | Set `dataflow_verdict_policy` to `single_hot_table_campaign` to make QAP lag a separate finding. Missing QAP observations remain UNKNOWN/non-PASS; default legacy semantics are unchanged. |
-| Files | `oat-config-throughput-C1.json` through `C8.json` are bounded manifests, not launch configs. Their eight baselines and 87 candidates have config validation recorded separately from runtime qualification in `oat-config-throughput-validation.json`. |
+| Files | `oat-config-throughput-C1.json` through `C8.json` are bounded manifests, not launch configs. Their eight baselines and 90 candidates have config validation recorded separately from runtime qualification in `oat-config-throughput-validation.json`. |
 | Pictures | Result pictures may show exploratory observations; no sustainable winner is shown until contiguous 30-second buckets, reconciliation, and validated timestamped pressure/maintenance-debt evidence qualify. Missing or unavailable evidence remains UNKNOWN. |
 
 ## Qualification
@@ -35,7 +35,7 @@ Each comparison contains at most four candidates, except the C1 coarse codec swe
 | Cohort | Comparisons |
 | --- | --- |
 | C1 | Coarse codec comparison: uncompressed, Snappy, LZ4_RAW, gzip, Brotli, and Zstd 1/3/6 (eight points). If Zstd wins, refine around its winning level with up to three adjacent registry-supported levels while retaining the winner as control (four candidates max). |
-| C2 | Dictionary on/off by cardinality; Delta Binary Packed and Byte Stream Split on schema-compatible columns. |
+| C2 | Dictionary on/off; Delta Binary Packed and Byte Stream Split on integer columns; explicit Plain, Delta Length Byte Array, and Delta Byte Array on `availability_group_name` with dictionary disabled. |
 | C3 | Row groups and maxRows include 16K/64K/128K/1M; page rows are separate; input-cap candidates include 128/256/512 MiB, setting layout, per-flush, and writer caps together so effective cap is `min(layout, per-flush, writer)`; coalescing remains a separate comparison. |
 | C4 | Low-to-high cardinality sort candidates for the final availability-replica table: none; `sample_time_utc`; `replica_server_name, sample_time_utc`; `availability_group_id, replica_server_name, sample_time_utc`. `customer_id` is constant per client and excluded. |
 | C5 | Workers, streams, connections, corpus rows, send interval (including zero), and IPC compression as separate comparisons. |
@@ -60,7 +60,9 @@ cargo run --locked --package arrowcol-oat-rust -- --validate-config \
   out/arrowcol-oat/sweep-configs/C1/codec/snappy.json
 ```
 
-The generator hashes the PR #125 tunables profile as a seed, not a complete capability registry. Rendering rejects a different seed. `oat-config-throughput-validation.json` records SHA-256 per rendered config and the exact validator source: 8 baselines and 87 candidates passed `--validate-config` on private combined source `02703b71d3c6a2ac92c690f70f1d967b8ac4c7c7` (sweep branch `ad976777e07ead7d3decb891f2ddb47cbb7a37fc` plus E1 guard `d8032288fa9b18ad521073d65795d5f46382b677`); no staging-overlap candidates were included. This proves config shape only, not an admission, effective-setting, runtime, or sustainable qualification. `runnable: false` retains the runtime hold. Regeneration resets each manifest's validation status; revalidate after source, seed, manifest, or rendered config changes rather than relying on an old matrix.
+The generator hashes the PR #125 tunables profile as a seed, not a complete capability registry. Rendering rejects a different seed. `oat-config-throughput-validation.json` records SHA-256 per rendered config and the exact validator source: 8 baselines and 90 candidates passed `--validate-config` at `84f86b6c54b7fc9375c63666cdfbeed126ac8dbb`; no staging-overlap candidates were included. This proves config shape only, not an admission, effective-setting, runtime, or sustainable qualification. `runnable: false` retains the runtime hold. Regeneration resets each manifest's validation status; revalidate after source, seed, manifest, or rendered config changes rather than relying on an old matrix.
+
+The C1/C2 manifests distinguish accepted enum values from configured candidates and exclusions. RLE is accepted only for BOOLEAN, absent from the frozen table. Legacy `lz4` remains accepted for compatibility but is excluded from the campaign by consumer/deprecation policy; `lz4_raw` is configured instead. Configured values have not thereby been runtime-screened.
 
 On that source the CLI also accepted the 8 MiB and 1 TiB cap boundaries and an omitted cap, and rejected 12 malformed or out-of-range guard/cap inputs. An omitted cap is config-valid but cannot establish guarded local admission.
 

@@ -2,10 +2,10 @@
   "schema_version": 1,
   "validation_kind": "config-validation-only",
   "validator": "arrowcol-oat-rust --validate-config",
-  "source_sha": "02703b71d3c6a2ac92c690f70f1d967b8ac4c7c7",
+  "source_sha": "84f86b6c54b7fc9375c63666cdfbeed126ac8dbb",
   "baseline_count": 8,
-  "candidate_count": 87,
-  "pass_count": 95,
+  "candidate_count": 90,
+  "pass_count": 98,
   "fail_count": 0,
   "runtime_qualification": "unqualified",
   "manifests": [
@@ -22,8 +22,8 @@
       "cohort": "C2",
       "status": "config-validated",
       "baseline_count": 1,
-      "candidate_count": 4,
-      "pass_count": 5,
+      "candidate_count": 7,
+      "pass_count": 8,
       "fail_count": 0,
       "excluded_pending_candidate_sets": []
     },
@@ -209,6 +209,30 @@
       "candidate": "last-connect-error-byte-stream-split",
       "qualification": "runtime-unqualified",
       "config_sha256": "d4e309edfb77ae2f92a30a3bbfc83b7f680d37b95f28afa3622bc8dbe238a476",
+      "status": "pass"
+    },
+    {
+      "cohort": "C2",
+      "comparison": "string-encoding",
+      "candidate": "plain",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "47d41924f1fa737073bc9e5dd96acfaf24ef5f668f69f784c692ead9ba4a266e",
+      "status": "pass"
+    },
+    {
+      "cohort": "C2",
+      "comparison": "string-encoding",
+      "candidate": "delta-length-byte-array",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "4e2524b92b21af0a4fc35d96a495d7db388ce32da53cddde44e29b89b6328758",
+      "status": "pass"
+    },
+    {
+      "cohort": "C2",
+      "comparison": "string-encoding",
+      "candidate": "delta-byte-array",
+      "qualification": "runtime-unqualified",
+      "config_sha256": "4dffb2cf0ff6d7c23eccbb0ae2badd234f558ebcb770d674328a191283a41246",
       "status": "pass"
     },
     {

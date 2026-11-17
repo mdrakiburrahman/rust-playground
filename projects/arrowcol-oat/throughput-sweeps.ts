@@ -44,7 +44,13 @@ const cohorts: Cohort[] = [
     candidate('availability-group-name-dictionary-on', { parquet_writer: { columns: { availability_group_name: { dictionary_enabled: true } } } }),
     candidate('last-connect-error-delta-binary-packed', { parquet_writer: { columns: { last_connect_error_number: { dictionary_enabled: false, encoding: 'delta_binary_packed' } } } }),
     candidate('last-connect-error-byte-stream-split', { parquet_writer: { columns: { last_connect_error_number: { dictionary_enabled: false, encoding: 'byte_stream_split' } } } }),
-  ])] },
+  ]), compare('string-encoding', 'parquet_writer.columns.availability_group_name.encoding', ([
+    ['plain', 'plain'],
+    ['delta-length-byte-array', 'delta_length_byte_array'],
+    ['delta-byte-array', 'delta_byte_array'],
+  ] as const).map(([id, encoding]) => candidate(id, {
+    parquet_writer: { columns: { availability_group_name: { dictionary_enabled: false, encoding } } },
+  }))) ] },
   { id: 'C3', comparisons: [
     compare('row-groups', 'parquet_writer.max_row_group_rows', [16384, 65536, 131072, 1000000].map(value => candidate('row-group-' + value, {
       parquet_writer: { max_row_group_rows: value }, collector: { layout: { enabled: true, row_group_rows: value } },
@@ -176,6 +182,20 @@ export function buildThroughputManifests(registry: unknown): JsonObject[] {
         },
       },
       comparisons: cohort.comparisons,
+      ...(cohort.id === 'C1' ? { parquet_enum_coverage: {
+        kind: 'compression',
+        accepted: ['uncompressed', 'snappy', 'gzip', 'brotli', 'lz4', 'lz4_raw', 'zstd'],
+        configured: ['uncompressed', 'snappy', 'gzip', 'brotli', 'lz4_raw', 'zstd'],
+        excluded: { lz4: 'legacy Hadoop framing; accepted for compatibility but excluded by campaign consumer/deprecation policy' },
+        status: 'configured-not-runtime-screened',
+      } } : {}),
+      ...(cohort.id === 'C2' ? { parquet_enum_coverage: {
+        kind: 'value_encoding',
+        accepted: ['plain', 'rle', 'delta_binary_packed', 'delta_length_byte_array', 'delta_byte_array', 'byte_stream_split'],
+        configured: ['plain', 'delta_binary_packed', 'delta_length_byte_array', 'delta_byte_array', 'byte_stream_split'],
+        excluded: { rle: 'BOOLEAN-only; frozen table has no Boolean column' },
+        status: 'configured-not-runtime-screened',
+      } } : {}),
       runnable: false,
       config_validation: { status: 'not-validated' },
       runtime_qualification: 'unqualified',
