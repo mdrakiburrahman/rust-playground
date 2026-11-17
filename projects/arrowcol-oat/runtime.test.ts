@@ -94,6 +94,12 @@ test('scale-out admits one memory-only hot table with matching spread replicas a
   assert.throws(() => validateRuntime(c), /must not exceed limits/);
   delete c.resources!.collector!.limits.cpu;
   validateRuntime(c);
+  assert.throws(() => validateRuntime({ ...c, resources: { collector: {
+    requests: { memory: '4Gi' }, limits: { memory: '6Gi' },
+  } } }), /requires cpu and memory quantities/);
+  assert.throws(() => validateRuntime({ ...c, resources: { collector: {
+    requests: { cpu: '0', memory: '4Gi' }, limits: { cpu: null, memory: '6Gi' },
+  } } }), /quantities must be positive/);
   objects = await render();
   assert.deepEqual(get('arrowcol').spec.template.spec.containers[0].resources.limits, { memory: '6Gi' });
 

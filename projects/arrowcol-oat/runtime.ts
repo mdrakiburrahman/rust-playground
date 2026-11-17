@@ -87,7 +87,9 @@ function validateResources(value: unknown, allowUncappedCollector = false): asse
     }
     const request = requirements.requests, limit = requirements.limits;
     const uncappedCollector = role === 'collector' && allowUncappedCollector && (!Object.hasOwn(limit, 'cpu') || limit.cpu === null);
-    if ((!uncappedCollector && cpuMilli(request.cpu) > cpuMilli(limit.cpu)) || memoryBytes(request.memory) > memoryBytes(limit.memory))
+    const requestCpu = cpuMilli(request.cpu);
+    const limitCpu = uncappedCollector ? undefined : cpuMilli(limit.cpu);
+    if ((limitCpu !== undefined && requestCpu > limitCpu) || memoryBytes(request.memory) > memoryBytes(limit.memory))
       throw new Error(role + ' resource requests must not exceed limits');
   }
 }
