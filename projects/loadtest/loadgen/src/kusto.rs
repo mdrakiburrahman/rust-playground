@@ -63,6 +63,7 @@ const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const CACHE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_CACHE_TIMEOUT: Duration = Duration::from_secs(300);
 const TOKEN_TIMEOUT: Duration = Duration::from_secs(60);
+const OBSERVATION_RESPONSE_MAX_BYTES: usize = 4_194_304;
 /// Shortest policy the service accepts; bounds cache staleness after each Delta commit.
 const LOCAL_MAX_AGE: &str = "00:01:00";
 const LOCAL_HOT_WINDOW: &str = "1.00:00:00";
@@ -109,6 +110,7 @@ struct KustoClient {
     heavy_query_permits: Arc<Semaphore>,
     /// Local emulator query-acceleration workers, pinned once per client family.
     pinned_capacity: Arc<OnceCell<u64>>,
+    response_byte_limit: Option<usize>,
 }
 
 impl KustoClient {
@@ -169,6 +171,7 @@ impl KustoClient {
             query_permits: Arc::new(Semaphore::new(QUERY_CONCURRENCY)),
             heavy_query_permits: Arc::new(Semaphore::new(HEAVY_QUERY_CONCURRENCY)),
             pinned_capacity: Arc::new(OnceCell::new()),
+            response_byte_limit: None,
         })
     }
 
@@ -186,6 +189,33 @@ impl KustoClient {
 
     async fn execute_heavy(&self, command: &str, phase: &str) -> Result<Vec<BTreeMap<String, Value>>> {
         self.execute_admitted(command, false, true, phase).await
+    }
+
+    async fn response_body(&self, mut response: reqwest::Response) -> Result<Value> {
+        if let Some(limit) = self.response_byte_limit {
+            let mut bytes = Vec::with_capacity(limit.min(8192));
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(|error| request_failure(&error))
+                .context("Kusto observation response body failed")?
+            {
+                ensure!(
+                    chunk.len() <= limit - bytes.len(),
+                    "Kusto observation response exceeded its {limit}-byte bound"
+                );
+                bytes.extend_from_slice(&chunk);
+            }
+            let text = std::str::from_utf8(&bytes).context("Kusto observation response is not valid UTF-8")?;
+            return serde_json::from_str(text)
+                .map_err(|_| anyhow::anyhow!("Kusto observation response is not valid JSON"));
+        }
+        let text = response
+            .text()
+            .await
+            .map_err(|error| request_failure(&error))
+            .context("Kusto response body failed")?;
+        Ok(serde_json::from_str(&text).unwrap_or_else(|_| json!({"error": text})))
     }
 
     async fn execute_admitted(
@@ -232,12 +262,7 @@ impl KustoClient {
         }
         let response = builder.send().await.map_err(|error| request_failure(&error))?;
         let status = response.status();
-        let text = response
-            .text()
-            .await
-            .map_err(|error| request_failure(&error))
-            .context("Kusto response body failed")?;
-        let body: Value = serde_json::from_str(&text).unwrap_or_else(|_| json!({"error": text}));
+        let body = self.response_body(response).await?;
         let public = sanitize(&body);
         append(
             &self.results.join("kusto-queries.jsonl"),
@@ -1991,6 +2016,7 @@ pub async fn observe_qap_with_mode(
     let mut timed_out = false;
     let outcome = async {
         let mut client = KustoClient::with_mode(endpoint, results, mode, database)?;
+        client.response_byte_limit = Some(OBSERVATION_RESPONSE_MAX_BYTES);
         client.queries_completed = Arc::clone(&queries_completed);
         tokio::time::timeout(deadline, async {
             let mut requested = BTreeSet::new();
@@ -2323,6 +2349,22 @@ mod tests {
 
     impl Server {
         fn start(mut handler: impl FnMut(Value) -> Result<Option<Value>> + Send + 'static) -> Result<Self> {
+            Self::start_transport(move |stream, request| {
+                if let Some(body) = handler(request)? {
+                    let body = body.to_string();
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )?;
+                }
+                Ok(())
+            })
+        }
+
+        fn start_transport(
+            mut handler: impl FnMut(&mut TcpStream, Value) -> Result<()> + Send + 'static,
+        ) -> Result<Self> {
             let listener = TcpListener::bind("127.0.0.1:0")?;
             let endpoint = format!("http://{}", listener.local_addr()?);
             let stop = Arc::new(AtomicBool::new(false));
@@ -2353,14 +2395,7 @@ mod tests {
                         .parse::<usize>()?;
                     let mut bytes = vec![0; length];
                     stream.read_exact(&mut bytes)?;
-                    if let Some(body) = handler(serde_json::from_slice(&bytes)?)? {
-                        let body = body.to_string();
-                        write!(
-                            stream,
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                            body.len()
-                        )?;
-                    }
+                    handler(&mut stream, serde_json::from_slice(&bytes)?)?;
                 }
                 Ok(())
             });
@@ -2383,6 +2418,166 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn observation_response_stream_caps_actual_bytes_and_preserves_other_clients() -> Result<()> {
+        let directory = Directory::new()?;
+        for chunked in [false, true] {
+            for overflow in [false, true] {
+                let mut body = response(&["Rows"], vec![json!([7])]).to_string().into_bytes();
+                body.resize(OBSERVATION_RESPONSE_MAX_BYTES + usize::from(overflow), b' ');
+                let server = Server::start_transport(move |stream, _| {
+                    let mut send = || -> std::io::Result<()> {
+                        if chunked {
+                            write!(
+                                stream,
+                                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+                            )?;
+                            for chunk in body.chunks(8192) {
+                                write!(stream, "{:x}\r\n", chunk.len())?;
+                                stream.write_all(chunk)?;
+                                stream.write_all(b"\r\n")?;
+                            }
+                            stream.write_all(b"0\r\n\r\n")
+                        } else {
+                            write!(
+                                stream,
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            )?;
+                            stream.write_all(&body)
+                        }
+                    };
+                    if let Err(error) = send() {
+                        ensure!(
+                            overflow
+                                && matches!(
+                                    error.kind(),
+                                    std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                                ),
+                            "unexpected fixture transport failure: {error}"
+                        );
+                    }
+                    Ok(())
+                })?;
+                let mut client = KustoClient::with_mode(&server.endpoint, &directory.0, Mode::Local, DATABASE)?;
+                client.response_byte_limit = Some(OBSERVATION_RESPONSE_MAX_BYTES);
+                let result = client.execute(".show external tables", true, "observation").await;
+                if overflow {
+                    assert!(format!("{:#}", result.unwrap_err()).contains("4194304-byte bound"));
+                    let other = KustoClient::with_mode(&server.endpoint, &directory.0, Mode::Local, DATABASE)?;
+                    assert_eq!(
+                        other.execute(".show external tables", true, "validation").await?[0]["Rows"],
+                        7
+                    );
+                } else {
+                    assert_eq!(result?[0]["Rows"], 7);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn observation_response_rejects_malformed_and_truncated_bodies_without_payload_leaks() -> Result<()> {
+        let directory = Directory::new()?;
+        for (body, extra_declared, expected) in [
+            (vec![0xff], 0, "not valid UTF-8"),
+            (b"CANARYSIG".to_vec(), 0, "not valid JSON"),
+            (b"{".to_vec(), 12, "response body failed"),
+        ] {
+            let server = Server::start_transport(move |stream, _| {
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len() + extra_declared
+                )?;
+                stream.write_all(&body)?;
+                Ok(())
+            })?;
+            let mut client = KustoClient::with_mode(&server.endpoint, &directory.0, Mode::Local, DATABASE)?;
+            client.response_byte_limit = Some(OBSERVATION_RESPONSE_MAX_BYTES);
+            let error = client
+                .execute(".show external tables", true, "observation")
+                .await
+                .unwrap_err();
+            let diagnostic = format!("{error:#}");
+            assert!(diagnostic.contains(expected), "{diagnostic}");
+            assert_public(&diagnostic);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_observation_uses_stream_cap_and_original_body_deadline() -> Result<()> {
+        let directory = Directory::new()?;
+        let server = Server::start_transport(|stream, _| {
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+            )?;
+            let chunk = [b' '; 8192];
+            for _ in 0..=OBSERVATION_RESPONSE_MAX_BYTES / chunk.len() {
+                if write!(stream, "{:x}\r\n", chunk.len())
+                    .and_then(|()| stream.write_all(&chunk))
+                    .and_then(|()| stream.write_all(b"\r\n"))
+                    .is_err()
+                {
+                    return Ok(());
+                }
+            }
+            let _ = stream.write_all(b"0\r\n\r\n");
+            Ok(())
+        })?;
+        let observed = observe_qap_with_mode(
+            &server.endpoint,
+            &directory.0,
+            Mode::Local,
+            DATABASE,
+            &["oat".to_owned()],
+            Duration::from_secs(5),
+        )
+        .await?;
+        assert_eq!(observed["tables"]["oat"]["available"], false);
+        assert!(
+            observed["tables"]["oat"]["error"]
+                .as_str()
+                .context("table error")?
+                .contains("4194304-byte bound")
+        );
+        drop(server);
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let saw_drop = Arc::clone(&dropped);
+        let server = Server::start_transport(move |stream, _| {
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n1\r\n{{\r\n"
+            )?;
+            let mut byte = [0];
+            saw_drop.store(stream.read(&mut byte)? == 0, Ordering::Release);
+            Ok(())
+        })?;
+        let error = observe_qap_with_mode(
+            &server.endpoint,
+            &directory.0,
+            Mode::Local,
+            DATABASE,
+            &["oat".to_owned()],
+            Duration::from_millis(200),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.is::<QapUnavailable>());
+        drop(server);
+        assert!(
+            dropped.load(Ordering::Acquire),
+            "the original deadline must drop the pending response"
+        );
+        let diagnostic: Value = serde_json::from_slice(&fs::read(directory.0.join("observation-diagnostic.json"))?)?;
+        assert_eq!(diagnostic["code"], "deadline_exceeded");
+        Ok(())
     }
 
     #[test]
