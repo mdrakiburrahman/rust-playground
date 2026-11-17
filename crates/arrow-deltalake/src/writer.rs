@@ -984,10 +984,11 @@ mod tests {
     #[tokio::test]
     #[ignore = "manual synthetic per-row-varying encode throughput benchmark"]
     async fn synthetic_availability_replica_states_encode_benchmark() -> Result<()> {
-        let rows = std::env::var("W4_BENCH_ROWS")
-            .map(|value| value.parse::<usize>())
-            .transpose()?
-            .unwrap_or(131_072);
+        let rows = match std::env::var("W4_BENCH_ROWS") {
+            Ok(value) => value.parse::<usize>()?,
+            Err(std::env::VarError::NotPresent) => 131_072,
+            Err(error) => return Err(error.into()),
+        };
         let schema = Arc::new(Schema::new(vec![
             Field::new("replica_id", DataType::Utf8, false),
             Field::new("group_id", DataType::Utf8, false),
