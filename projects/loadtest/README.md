@@ -318,7 +318,9 @@ input contains `authority` (the existing `StorageBridgeAuthority`) and
 deadline. `table_root_url` is the exact canonical selected table URL with trailing
 slash, **not the run root**. Dedicated stdin/stdout carry unchanged StorageBridge
 response/request frames; no tokens, auth headers or SAS belong in these files or
-frames. A versioned `kind: "owned_run_table_receipt"` frame is emitted only after
+frames. Stdin/stdout must be Unix pipes; nonblocking I/O and terminal-frame writing
+retain the original deadline even with an open, silent parent.
+A versioned `kind: "owned_run_table_receipt"` frame is emitted only after
 Kernel readback **and completed normal publisher drain**. It preserves the same
 authority/deadline and contains the existing setup receipt.
 

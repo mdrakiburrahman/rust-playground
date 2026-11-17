@@ -12,7 +12,7 @@ use arrow_deltalake::publisher::{ControlMetadata, MutationRetries, PublisherSess
 use arrow_deltalake::qap_http::{StorageBridge, StorageBridgeAuthority};
 use arrowcol_catalog::{DdlCommand, DdlParser};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 use url::Url;
 
 use crate::{
@@ -176,14 +176,52 @@ pub async fn initialize_owned_run_table(args: InitializeOwnedRunTableArgs) -> Re
             "owned-run setup HOLD: per-operation auth/control/storage bridge is not wired for this invocation; nothing registered"
         );
     };
-    let input = read_setup_input(&input, true)?;
-    let receipt = initialize_owned_run_table_bridged(plan, input, tokio::io::stdin(), tokio::io::stdout()).await?;
-    let mut bytes = serde_json::to_vec(&receipt)?;
-    bytes.push(b'\n');
-    let mut output = tokio::io::stdout();
-    output.write_all(&bytes).await?;
-    output.flush().await?;
-    Ok(())
+    let input: OwnedRunBridgeInput = read_setup_input(&input, true)?;
+    #[cfg(unix)]
+    {
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+        use tokio::{io::AsyncWriteExt, net::unix::pipe::OpenOptions, time::Instant};
+
+        let now = u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())?;
+        let remaining = input
+            .original_deadline_unix_ms
+            .checked_sub(now)
+            .filter(|remaining| *remaining > 0)
+            .context("owned-run original deadline expired")?;
+        let deadline = Instant::now()
+            .checked_add(Duration::from_millis(remaining))
+            .context("owned-run original deadline is out of range")?;
+        // Tokio stdio uses uncancellable blocking tasks; explicit bridge mode requires real pipes.
+        let pipes = OpenOptions::new();
+        let reader = pipes
+            .open_receiver("/dev/stdin")
+            .context("bridge stdin must be a Unix pipe")?;
+        let writer = pipes
+            .open_sender("/dev/stdout")
+            .context("bridge stdout must be a Unix pipe")?;
+        let mut output = pipes
+            .open_sender("/dev/stdout")
+            .context("receipt stdout must be a Unix pipe")?;
+        let receipt = initialize_owned_run_table_bridged(plan, input, reader, writer).await?;
+        let mut bytes = serde_json::to_vec(&receipt)?;
+        bytes.push(b'\n');
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "owned-run original deadline expired before terminal receipt"
+        );
+        tokio::time::timeout_at(deadline, async {
+            output.write_all(&bytes).await?;
+            output.flush().await
+        })
+        .await
+        .context("owned-run terminal receipt exceeded original deadline")??;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (plan, input);
+        bail!("bridged owned-run setup requires cancellable Unix pipes");
+    }
 }
 
 struct BridgedSetupFence {
