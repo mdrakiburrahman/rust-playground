@@ -297,12 +297,31 @@ mod storage_bridge {
                 || root.query().is_some()
                 || root.fragment().is_some()
                 || root.password().is_some()
-                || crate::publisher::azure_account(&root)? != authority.storage_account
+                || !(3..=24).contains(&authority.storage_account.len())
+                || !authority
+                    .storage_account
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+                || root.host_str() != Some(format!("{}.dfs.core.windows.net", authority.storage_account).as_str())
+                || root.port().is_some()
+                || root.as_str() != authority.table_root_url
+                || root.path().contains("//")
+                || !root
+                    .path()
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_./".contains(&b))
             {
                 return Err(invalid());
             }
+            let data_path = object_store::path::Path::parse(root.path()).map_err(|_| invalid())?;
+            if format!("/{data_path}/") != root.path() {
+                return Err(invalid());
+            }
             let container = root.username();
-            if container.is_empty()
+            if !(3..=63).contains(&container.len())
+                || container.starts_with('-')
+                || container.ends_with('-')
+                || container.contains("--")
                 || !container
                     .bytes()
                     .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
@@ -328,7 +347,7 @@ mod storage_bridge {
                 .filter(|x| *x > 0)
                 .ok_or_else(invalid)?;
             let data_endpoint = Url::parse(&format!("{origin}/{container}")).map_err(|_| invalid())?;
-            let data_prefix = root.path().trim_start_matches('/').to_owned();
+            let data_prefix = format!("{data_path}/");
             Ok(Arc::new(Self {
                 authority,
                 original_deadline_unix_ms,
@@ -346,6 +365,10 @@ mod storage_bridge {
 
         pub(crate) fn authority(&self) -> &StorageBridgeAuthority {
             &self.authority
+        }
+
+        pub(crate) async fn poison(&self) {
+            self.state.lock().await.poisoned = true;
         }
 
         pub(crate) fn validate_root(&self, url: &Url) -> anyhow::Result<()> {
@@ -724,6 +747,7 @@ mod storage_bridge {
             requests: Vec<Value>,
             object: Option<String>,
             responses: Vec<Value>,
+            release_fault: Option<(&'static str, usize)>,
         }
 
         impl Fixture {
@@ -744,6 +768,7 @@ mod storage_bridge {
                     requests: Vec::new(),
                     object: None,
                     responses: Vec::new(),
+                    release_fault: None,
                 }
             }
         }
@@ -770,6 +795,36 @@ mod storage_bridge {
                         .iter()
                         .all(|(name, _)| !name.eq_ignore_ascii_case("authorization"))
                 );
+                if headers.iter().any(|(k, v)| k == "x-ms-lease-action" && v == "release") {
+                    if let Some((fault, remaining)) = &mut state.release_fault {
+                        *remaining -= 1;
+                        if *remaining == 0 {
+                            let mut reply = response(&request, 500, Vec::new(), "");
+                            match *fault {
+                                "unknown" | "not_sent" => {
+                                    reply = json!({
+                                        "schema_version":1,"kind":"storage_http_response",
+                                        "request_id":request["request_id"],"request_sha256":request["request_sha256"],
+                                        "outcome":if *fault == "unknown" {"unknown"} else {"definitely_not_sent"},
+                                        "error_code":if *fault == "unknown" {"response_lost"} else {"admission_refused"}
+                                    });
+                                }
+                                "malformed" => {
+                                    write.write_all(b"{\n").await?;
+                                    return Ok(());
+                                }
+                                "eof" => return Ok(()),
+                                _ => {}
+                            }
+                            state.responses.push(reply.clone());
+                            drop(state);
+                            write.write_all(&serde_json::to_vec(&reply)?).await?;
+                            write.write_all(b"\n").await?;
+                            write.flush().await?;
+                            continue;
+                        }
+                    }
+                }
                 let mut status = 200;
                 let mut output_headers = Vec::new();
                 let mut body = String::new();
@@ -899,6 +954,131 @@ mod storage_bridge {
             );
             drop(state);
             server.abort();
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn final_release_failure_never_reports_clean_close_or_admission() -> anyhow::Result<()> {
+            for fault in ["unknown", "malformed", "eof", "not_sent", "status"] {
+                for admission in [false, true] {
+                    let (bridge, parent) = bridge(5_000)?;
+                    let mut initial = Fixture::ready();
+                    initial.release_fault = Some((fault, if admission { 1 } else { 2 }));
+                    let fixture = Arc::new(Mutex::new(initial));
+                    let server = tokio::spawn(serve(parent, Arc::clone(&fixture), None));
+                    let url = Url::parse(ROOT)?;
+                    let opened = PublisherSession::open_bridged_async(&url, Arc::clone(&bridge)).await;
+                    if admission {
+                        assert!(
+                            opened.is_err(),
+                            "{fault}: failed final registration release admitted a session"
+                        );
+                    } else {
+                        let session = opened?;
+                        let member = session.publisher_id().ok_or_else(invalid)?.to_string();
+                        assert!(
+                            session.close_after_drain_async().await.is_err(),
+                            "{fault}: failed final release closed cleanly"
+                        );
+                        assert_ne!(session.status().phase, crate::publisher::Phase::Closed);
+                        assert!(!fixture.lock().await.metadata["publishers"].contains(&member));
+                        let count = fixture.lock().await.requests.len();
+                        assert!(session.close_after_drain_async().await.is_err());
+                        assert_eq!(
+                            fixture.lock().await.requests.len(),
+                            count,
+                            "{fault}: repeated close replayed control"
+                        );
+                    }
+                    let count = fixture.lock().await.requests.len();
+                    assert!(PublisherSession::open_bridged_async(&url, bridge).await.is_err());
+                    let state = fixture.lock().await;
+                    assert_eq!(
+                        state.requests.len(),
+                        count,
+                        "{fault}: failed release permitted re-registration"
+                    );
+                    assert!(state.metadata["publishers"].contains(UNRELATED));
+                    let members: BTreeMap<String, Value> = serde_json::from_str(&state.metadata["publishers"])?;
+                    assert_eq!(members.len(), if admission { 2 } else { 1 });
+                    assert_eq!(state.metadata["unrelated"], "preserve-me");
+                    server.abort();
+                }
+            }
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn public_open_rejects_noncanonical_roots_before_any_control_frame() -> anyhow::Result<()> {
+            for root in [
+                "abfss://data@offlineaccount.attacker.invalid/owned-run/table/",
+                "abfss://data@offlineaccount.dfs.core.windows.net:443/owned-run/table/",
+                "abfss://data@offlineaccount.dfs.core.windows.net:8443/owned-run/table/",
+                "abfss://data@offlineaccount.dfs.core.windows.net/owned%20run/table/",
+                "abfss://data@offlineaccount.dfs.core.windows.net/owned%2Frun/table/",
+                "abfss://data@offlineaccount.dfs.core.windows.net/owned-run//table/",
+            ] {
+                let mut authority = authority();
+                authority.table_root_url = root.into();
+                let (child, mut parent) = tokio::io::duplex(MAX_FRAME);
+                let (read, write) = tokio::io::split(child);
+                if let Ok(bridge) = StorageBridge::new(authority, deadline(5_000)?, read, write) {
+                    assert!(
+                        PublisherSession::open_bridged_async(&Url::parse(root)?, bridge)
+                            .await
+                            .is_err(),
+                        "{root}: invalid root admitted"
+                    );
+                }
+                assert_eq!(
+                    tokio::time::timeout(Duration::from_millis(20), parent.read(&mut [0_u8; 1])).await??,
+                    0,
+                    "{root}: invalid root emitted a control frame"
+                );
+                let (canonical, mut parent) = bridge(5_000)?;
+                assert!(
+                    PublisherSession::open_bridged_async(&Url::parse(root)?, canonical)
+                        .await
+                        .is_err()
+                );
+                assert_eq!(parent.read(&mut [0_u8; 1]).await?, 0);
+            }
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn canonical_root_sdk_list_and_object_paths_agree() -> anyhow::Result<()> {
+            for root in [
+                ROOT,
+                "abfss://data@offlineaccount.dfs.core.windows.net/owned_run-2/table.v1/",
+            ] {
+                let mut authority = authority();
+                authority.table_root_url = root.into();
+                let (child, parent) = tokio::io::duplex(MAX_FRAME);
+                let (read, write) = tokio::io::split(child);
+                let bridge = StorageBridge::new(authority, deadline(5_000)?, read, write)?;
+                let fixture = Arc::new(Mutex::new(Fixture::ready()));
+                let server = tokio::spawn(serve(parent, Arc::clone(&fixture), None));
+                let url = Url::parse(root)?;
+                let session = PublisherSession::open_bridged_async(&url, bridge).await?;
+                let store = session.store_for_url(&url)?;
+                let prefix = object_store::path::Path::parse(url.path())?;
+                assert!(store.list(Some(&prefix)).try_collect::<Vec<_>>().await?.is_empty());
+                let path = prefix.child("_delta_log").child("00000000000000000000.json");
+                store
+                    .put_opts(
+                        &path,
+                        "{}".into(),
+                        PutOptions {
+                            mode: PutMode::Create,
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                assert_eq!(store.get(&path).await?.bytes().await?.as_ref(), b"{}");
+                session.close_after_drain_async().await?;
+                server.abort();
+            }
             Ok(())
         }
 

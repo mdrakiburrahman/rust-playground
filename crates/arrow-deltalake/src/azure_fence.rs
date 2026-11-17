@@ -441,7 +441,21 @@ impl ControlMetadata for AzureControlContainer {
             }
         }
         let outcome = self.leased_write(&lease_id, expected, metadata).await;
-        let _ = self.lease("release", &lease_id).await;
+        let release = self.lease("release", &lease_id).await;
+        if let ControlTransport::Bridge(bridge) = &self.transport {
+            let failure = match release {
+                Exchange::Response(response) if response.status().is_success() => None,
+                Exchange::Response(response) => Some(format!("lease release status {}", response.status())),
+                Exchange::NotSent(detail) => Some(format!("lease release definitely not sent: {detail}")),
+                Exchange::Ambiguous(detail) => Some(format!("lease release outcome unknown: {detail}")),
+            };
+            if let Some(detail) = failure {
+                bridge.poison().await;
+                if matches!(outcome, CasOutcome::Applied) {
+                    return CasOutcome::AppliedButUnsettled(detail);
+                }
+            }
+        }
         outcome
     }
 }

@@ -286,6 +286,9 @@ pub struct MetadataSnapshot {
 pub enum CasOutcome {
     /// The server definitively applied the replacement.
     Applied,
+    /// Metadata is confirmed applied, but terminal transport settlement failed.
+    /// The transition must not be replayed or reported as clean.
+    AppliedButUnsettled(String),
     /// Definitely not applied: busy, changed since `expected`, or lease lost.
     Conflict,
     /// Definitely not applied, for a non-retryable reason.
@@ -348,6 +351,27 @@ impl fmt::Display for UnknownTransition {
 
 impl std::error::Error for UnknownTransition {}
 
+/// Metadata was applied, but a terminal control operation did not settle cleanly.
+/// Membership reflects the confirmed write; this error must never cause replay.
+#[derive(Debug)]
+pub struct UnsettledTransition {
+    pub publisher: Uuid,
+    pub operation: &'static str,
+    detail: String,
+}
+
+impl fmt::Display for UnsettledTransition {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "publisher {} {} metadata applied but terminal settlement failed ({}); transition must not be replayed",
+            self.publisher, self.operation, self.detail
+        )
+    }
+}
+
+impl std::error::Error for UnsettledTransition {}
+
 fn is_unknown(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| cause.is::<UnknownTransition>())
 }
@@ -378,6 +402,14 @@ where
         let metadata = next.apply(&snapshot.metadata)?;
         match control.compare_and_set(&snapshot, &metadata).await {
             CasOutcome::Applied => return Ok(()),
+            CasOutcome::AppliedButUnsettled(detail) => {
+                return Err(UnsettledTransition {
+                    publisher,
+                    operation,
+                    detail,
+                }
+                .into());
+            }
             CasOutcome::Conflict => backoff(attempt).await,
             CasOutcome::Rejected(detail) => bail!("publisher {operation} rejected: {detail}"),
             CasOutcome::Unknown(detail) => {
