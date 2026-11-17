@@ -26,7 +26,7 @@ pub mod delta;
 #[cfg(feature = "delta")]
 mod delta_io;
 #[cfg(feature = "delta")]
-pub use delta_io::{DeltaRuntimeConfig, runtime_config};
+pub use delta_io::{DeltaRuntimeConfig, initialize_identity_worker_runtime, runtime_config};
 pub mod layout;
 #[cfg(feature = "delta")]
 pub mod maintenance;

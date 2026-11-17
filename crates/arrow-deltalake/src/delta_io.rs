@@ -210,6 +210,30 @@ impl DeltaRuntimeConfig {
 
 static CONFIG: OnceLock<std::result::Result<DeltaRuntimeConfig, String>> = OnceLock::new();
 
+/// Install the isolated identity worker's fixed runtime settings before any Delta I/O.
+///
+/// # Errors
+/// Rejects invalid settings or any prior process-wide configuration, even identical settings.
+pub fn initialize_identity_worker_runtime() -> Result<()> {
+    let config = DeltaRuntimeConfig {
+        runtime_workers: 1,
+        blocking_workers: 2,
+        upload_limit: 1,
+        upload_mode: UploadMode::PutCreate,
+        upload_buffer_capacity_bytes: DEFAULT_UPLOAD_BUFFER_CAPACITY_BYTES,
+        upload_request_concurrency: DEFAULT_UPLOAD_REQUEST_CONCURRENCY,
+        task_limit: 2,
+        read_ahead: 1,
+        batch_rows: 1,
+        cpu_workers: 1,
+    };
+    config.validate()?;
+    CONFIG
+        .set(Ok(config))
+        .map_err(|_| anyhow::anyhow!("Delta runtime was initialized before the identity worker"))?;
+    Ok(())
+}
+
 /// Return the immutable effective startup settings (including environment overrides).
 ///
 /// # Errors

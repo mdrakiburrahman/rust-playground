@@ -70,6 +70,7 @@ mod linux {
     pub fn run() -> Result<()> {
         let limits = Limits::parse(std::env::args().skip(1))?;
         limits.install()?;
+        arrow_deltalake::initialize_identity_worker_runtime()?;
         bail!("identity decoding is disabled until the worker protocol and supervisor are complete")
     }
 
@@ -112,7 +113,7 @@ mod linux {
         #[test]
         fn limits_install_and_read_back_in_owned_child() -> Result<()> {
             const CHILD: &str = "OAT_LIMIT_TEST_CHILD";
-            if std::env::var_os(CHILD).is_some() {
+            if let Some(mode) = std::env::var_os(CHILD) {
                 let parent = getppid().context("missing parent")?.as_raw_pid();
                 let limits = Limits::parse([
                     parent.to_string(),
@@ -121,13 +122,36 @@ mod linux {
                     "64".to_owned(),
                 ])?;
                 limits.install()?;
+                if mode == "prior-error" {
+                    assert!(arrow_deltalake::runtime_config().is_err());
+                    assert!(arrow_deltalake::initialize_identity_worker_runtime().is_err());
+                    return Ok(());
+                }
+                arrow_deltalake::initialize_identity_worker_runtime()?;
+                let config = arrow_deltalake::runtime_config()?;
+                assert_eq!(
+                    (
+                        config.runtime_workers,
+                        config.blocking_workers,
+                        config.task_limit,
+                        config.read_ahead,
+                        config.batch_rows,
+                        config.cpu_workers,
+                        config.upload_limit
+                    ),
+                    (1, 2, 2, 1, 1, 1, 1)
+                );
+                assert!(arrow_deltalake::initialize_identity_worker_runtime().is_err());
                 return Ok(());
             }
-            let status = Command::new(std::env::current_exe()?)
-                .args(["--exact", "linux::tests::limits_install_and_read_back_in_owned_child"])
-                .env(CHILD, "1")
-                .status()?;
-            ensure!(status.success(), "owned limit-test child failed");
+            for (mode, override_value) in [("fresh", "64"), ("prior-error", "invalid")] {
+                let status = Command::new(std::env::current_exe()?)
+                    .args(["--exact", "linux::tests::limits_install_and_read_back_in_owned_child"])
+                    .env(CHILD, mode)
+                    .env("ARROWCOL_COLLECTOR_RUNTIME_WORKERS", override_value)
+                    .status()?;
+                ensure!(status.success(), "owned limit-test child failed in {mode}");
+            }
             Ok(())
         }
     }
