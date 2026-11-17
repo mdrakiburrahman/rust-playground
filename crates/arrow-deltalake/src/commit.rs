@@ -2,7 +2,7 @@
 
 use crate::delta::{
     AppendResult, CoalescedCommitGroup, DeltaFileWriter, DeltaTable, PublicationFence, PublicationFenceError,
-    StagedAppend,
+    ResolvedDeltaTarget, StagedAppend,
 };
 use anyhow::{Context, Result, bail};
 use arrow::array::RecordBatch;
@@ -82,6 +82,7 @@ struct Publication {
 
 enum Request {
     Ready(oneshot::Sender<std::result::Result<(), CommitReceiptError>>),
+    ResolvedTarget(oneshot::Sender<std::result::Result<Option<ResolvedDeltaTarget>, CommitReceiptError>>),
     AdaptiveConfig(
         crate::sizing::AdaptiveFileSizeConfig,
         oneshot::Sender<std::result::Result<crate::sizing::AdaptiveFileSizeConfig, CommitReceiptError>>,
@@ -400,6 +401,22 @@ impl BatchedTable {
             .map_err(anyhow::Error::new)
     }
 
+    /// Read the identity from the table opened by this commit worker without writing.
+    ///
+    /// # Errors
+    /// Returns Delta metadata or worker initialization errors.
+    pub async fn resolved_delta_target(&self) -> Result<Option<ResolvedDeltaTarget>> {
+        let (reply, receive) = oneshot::channel();
+        self.sender
+            .send(Request::ResolvedTarget(reply))
+            .await
+            .context("Delta worker stopped")?;
+        receive
+            .await
+            .context("Delta worker stopped during target readback")?
+            .map_err(anyhow::Error::new)
+    }
+
     /// Read current adaptive scheduling policy on the table's IO worker.
     ///
     /// # Errors
@@ -706,6 +723,15 @@ fn run_worker(
                     Some(Request::Ready(reply)) => {
                         let _ = reply.send(failure.as_ref().map_or(Ok(()), |error| Err(error.clone())));
                     }
+                    Some(Request::ResolvedTarget(reply)) => {
+                        let result = match (&table, &failure) {
+                            (Ok(table), None) => table.resolved_delta_target().map_err(CommitReceiptError::from_anyhow),
+                            _ => Err(failure.clone().unwrap_or_else(|| {
+                                CommitReceiptError::commit_failed("Delta table initialization failed")
+                            })),
+                        };
+                        let _ = reply.send(result);
+                    }
                     Some(Request::AdaptiveConfig(defaults, reply)) => {
                         let result = match (&table, &failure) {
                             (Ok(table), None) => table
@@ -828,6 +854,9 @@ fn run_worker(
             while let Some(request) = receiver.blocking_recv() {
                 match request {
                     Request::Ready(reply) => {
+                        let _ = reply.send(Err(message.clone()));
+                    }
+                    Request::ResolvedTarget(reply) => {
                         let _ = reply.send(Err(message.clone()));
                     }
                     Request::AdaptiveConfig(_, reply) => {

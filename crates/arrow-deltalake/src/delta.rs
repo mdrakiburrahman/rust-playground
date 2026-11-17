@@ -1573,6 +1573,31 @@ mod io_tests {
         )?)
     }
 
+    #[test]
+    fn existing_delta_readback_does_not_create_missing_local_roots() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let missing = directory.path().join("not-created");
+        assert!(DeltaTable::open_existing_for_readback(&missing.to_string_lossy())?.is_none());
+        assert!(!missing.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn existing_delta_readback_returns_actual_opened_root_and_id() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let url = Url::from_directory_path(directory.path()).map_err(|()| anyhow::anyhow!("invalid temp URL"))?;
+        let table = DeltaTable::open_url(url, input_batch()?.schema(), Vec::new())?;
+        let expected = table
+            .resolved_delta_target()?
+            .context("missing actual table identity")?;
+        drop(table);
+
+        let opened = DeltaTable::open_existing_for_readback(&directory.path().to_string_lossy())?
+            .context("existing Delta table was not opened")?;
+        assert_eq!(opened.resolved_delta_target()?, Some(expected));
+        Ok(())
+    }
+
     /// Scenario: a concurrent subprocess inherits the writer's descriptor before exec.
     /// Guarantees: the last owner releases its lock even while a duplicate descriptor remains open.
     #[cfg(unix)]
@@ -1607,6 +1632,51 @@ mod io_tests {
                 .push((context.read_version(), context.proposed_version()));
             Ok(())
         }
+    }
+
+    #[derive(Default)]
+    struct TargetUrlFence(Mutex<Vec<(PathBuf, Url)>>);
+
+    impl PublicationFence for TargetUrlFence {
+        fn check_before_commit(
+            &self,
+            context: &PublicationFenceContext<'_>,
+        ) -> std::result::Result<(), PublicationFenceError> {
+            self.0
+                .lock()
+                .map_err(|error| PublicationFenceError::check_failed(error.to_string()))?
+                .push((context.table_path().to_path_buf(), context.target_url().clone()));
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn publication_fence_receives_actual_url_for_fresh_and_ordinary_commits() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let target_url =
+            Url::from_directory_path(directory.path()).map_err(|()| anyhow::anyhow!("invalid temp URL"))?;
+        let fence = Arc::new(TargetUrlFence::default());
+        let publication_fence: Arc<dyn PublicationFence> = fence.clone();
+        let table = DeltaTable::open_connection(
+            target_url.clone(),
+            Vec::new(),
+            Some(Arc::clone(&publication_fence)),
+            None,
+        )?;
+        let input = input_batch()?;
+        table.create_schema(input.schema(), Some(Arc::clone(&publication_fence)))?;
+        let mut file = table.new_file(input.schema())?;
+        file.write(&input).await?;
+        file.finish().await?;
+
+        let observations = fence.0.lock().map_err(|error| anyhow::anyhow!("{error}"))?;
+        assert_eq!(observations.len(), 2);
+        assert!(
+            observations
+                .iter()
+                .all(|(path, url)| path == &table.root && url == &target_url)
+        );
+        Ok(())
     }
 
     /// Scenario: a warm snapshot is reused while an external transaction evolves the schema.
@@ -2039,6 +2109,7 @@ pub const WRITER_LOCK: &str = ".arrow-lake-writer.lock";
 #[derive(Clone, Copy, Debug)]
 pub struct PublicationFenceContext<'a> {
     table_path: &'a Path,
+    target_url: &'a Url,
     read_version: u64,
     proposed_version: u64,
     file_count: usize,
@@ -2049,6 +2120,12 @@ impl PublicationFenceContext<'_> {
     #[must_use]
     pub const fn table_path(&self) -> &Path {
         self.table_path
+    }
+
+    /// Actual Delta table URL opened by the committer; unlike `table_path`, this is not a local staging path.
+    #[must_use]
+    pub const fn target_url(&self) -> &Url {
+        self.target_url
     }
 
     /// Snapshot version used to build the pending append. Fresh schema creation
@@ -2350,6 +2427,7 @@ struct FreshSchemaCommitter {
     inner: GuardedCommitter,
     fence: Arc<dyn PublicationFence>,
     root: PathBuf,
+    target_url: Url,
 }
 
 impl Committer for FreshSchemaCommitter {
@@ -2362,6 +2440,7 @@ impl Committer for FreshSchemaCommitter {
         self.fence
             .check_before_commit(&PublicationFenceContext {
                 table_path: &self.root,
+                target_url: &self.target_url,
                 read_version: 0,
                 proposed_version: 0,
                 file_count: 0,
@@ -2379,11 +2458,22 @@ impl Committer for FreshSchemaCommitter {
     }
 }
 
+/// Actual normalized root and Kernel identity read from an opened Delta table.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedDeltaTarget {
+    /// Scheme, account/host, container/filesystem and path only.
+    pub normalized_root: String,
+    /// The table's committed `metaData.id`.
+    pub delta_table_id: String,
+}
+
 /// Readback of one definite, fresh Kernel schema commit, before publisher drain.
 #[derive(Debug, serde::Serialize)]
 pub struct FreshTableReceipt {
     /// Kernel-generated Delta table identity.
     pub table_id: String,
+    /// Normalized root of the table that was actually opened and initialized.
+    pub normalized_root: String,
     /// Must be zero; no existing table is adopted.
     pub version: u64,
     /// Exact canonical Delta schema, including timestamp precision metadata.
@@ -2601,8 +2691,11 @@ impl DeltaTable {
                 bail!("fresh table unexpectedly contains active data");
             }
         }
+        let normalized_root = normalize_delta_target_root(table.url.as_str())
+            .context("fresh Delta table root cannot be normalized safely")?;
         Ok(FreshTableReceipt {
             table_id: metadata.id().to_string(),
+            normalized_root,
             version: snapshot.version(),
             schema_json: metadata.schema_string().to_string(),
             partition_columns: metadata.partition_columns().to_vec(),
@@ -2718,6 +2811,65 @@ impl DeltaTable {
         }
     }
 
+    /// Open an existing table for metadata readback without taking its local writer lock.
+    ///
+    /// This reuses the process-wide storage session used by later writes. A local target path
+    /// must already exist; the method never creates a target directory or Delta log.
+    ///
+    /// # Errors
+    /// Returns URL, storage-session, snapshot or metadata-read errors.
+    pub fn open_existing_for_readback(root: &str) -> Result<Option<Arc<Self>>> {
+        let url = match Url::parse(root) {
+            Ok(url) => url,
+            Err(_) => {
+                let path = Path::new(root);
+                if !path.is_absolute() || !path.is_dir() {
+                    return Ok(None);
+                }
+                Url::from_directory_path(fs::canonicalize(path)?)
+                    .map_err(|()| anyhow::anyhow!("invalid local Delta table path"))?
+            }
+        };
+        if url.scheme() == "file" {
+            let path = url
+                .to_file_path()
+                .map_err(|()| anyhow::anyhow!("invalid local Delta table URL"))?;
+            if !path.is_dir() {
+                return Ok(None);
+            }
+        } else if !matches!(url.scheme(), "abfs" | "abfss" | "az") {
+            bail!("only existing file and ADLS Delta tables can be read back");
+        }
+        let table = Self::open_connection_with_store_mode(url, Vec::new(), None, None, None, false)?;
+        if table.existing_snapshot()?.is_some() {
+            Ok(Some(table))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Return the normalized root and actual `metaData.id` from this open table.
+    ///
+    /// # Errors
+    /// Returns snapshot read errors. Returns `None` when the table has no committed metadata
+    /// or its root cannot be normalized safely.
+    pub fn resolved_delta_target(&self) -> Result<Option<ResolvedDeltaTarget>> {
+        let Some(snapshot) = self.existing_snapshot()? else {
+            return Ok(None);
+        };
+        let Some(normalized_root) = normalize_delta_target_root(self.url.as_str()) else {
+            return Ok(None);
+        };
+        let delta_table_id = snapshot.table_configuration().metadata().id().to_owned();
+        if delta_table_id.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(ResolvedDeltaTarget {
+            normalized_root,
+            delta_table_id,
+        }))
+    }
+
     /// Open a collector-owned local path or an independently coordinated ADLS URI.
     ///
     /// # Errors
@@ -2760,11 +2912,22 @@ impl DeltaTable {
     /// `data` replaces only the inner transport; it is always wrapped by the
     /// session's guard, so admission and URL/account checks are unchanged.
     fn open_connection_with_store(
+        url: Url,
+        partition_columns: Vec<String>,
+        publication_fence: Option<Arc<dyn PublicationFence>>,
+        session: Option<Arc<PublisherSession>>,
+        data: Option<Arc<dyn ObjectStore>>,
+    ) -> Result<Arc<Self>> {
+        Self::open_connection_with_store_mode(url, partition_columns, publication_fence, session, data, true)
+    }
+
+    fn open_connection_with_store_mode(
         mut url: Url,
         partition_columns: Vec<String>,
         publication_fence: Option<Arc<dyn PublicationFence>>,
         session: Option<Arc<PublisherSession>>,
         data: Option<Arc<dyn ObjectStore>>,
+        create_local_root: bool,
     ) -> Result<Arc<Self>> {
         if !url.path().ends_with('/') {
             url.set_path(&format!("{}/", url.path()));
@@ -2793,9 +2956,15 @@ impl DeltaTable {
             let path = url
                 .to_file_path()
                 .map_err(|()| anyhow::anyhow!("invalid local table URL"))?;
-            fs::create_dir_all(&path)?;
+            if create_local_root {
+                fs::create_dir_all(&path)?;
+            } else if !path.is_dir() {
+                bail!("existing Delta table directory is missing");
+            }
             let path = fs::canonicalize(path)?;
-            sync_ancestors(&path)?;
+            if create_local_root {
+                sync_ancestors(&path)?;
+            }
             path
         } else {
             // Staging is intentionally retained after ambiguous failures, never
@@ -3353,6 +3522,7 @@ impl DeltaTable {
                 },
                 fence,
                 root: self.root.clone(),
+                target_url: self.url.clone(),
             })
         } else {
             self.committer()
@@ -4413,6 +4583,7 @@ impl DeltaTable {
                 publication_fence
                     .check_before_commit(&PublicationFenceContext {
                         table_path: &self.root,
+                        target_url: &self.url,
                         read_version,
                         proposed_version,
                         file_count: files.len(),

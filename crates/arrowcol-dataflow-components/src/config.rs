@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use arrowcol_catalog::{CatalogControlPlane, CatalogStore, DdlParser, FlightSqlDdlHandler, MemoryCatalogStore};
 use arrowcol_flight::{RuntimeLimits, RuntimeResult};
-use arrowcol_protocol::{PositiveMeasurement, UnixMillis};
+use arrowcol_protocol::{CatalogName, PositiveMeasurement, SchemaName, TableIdentity, TableName, UnixMillis};
 use arrowcol_routing::{MemoryRoutingStore, RoutingStore, SqlServerRoutingConfig, SqlServerRoutingStore};
 use arrowcol_tunables::AgeFlushPolicy;
 use serde::{Deserialize, Serialize};
@@ -176,15 +176,41 @@ mod override_tests {
             routing: RoutingStoreConfig::Standalone,
             commit: CommitConfig::default(),
             batching: FileBatchConfig::default(),
+            startup_table: None,
             authority_timeout: Duration::from_secs(10),
         };
         let current = ExporterOverrides {
             authority_timeout: config.authority_timeout,
+            startup_table: config.startup_table.clone(),
         };
-        let resolved = merge_config(&current, r#"{"authority_timeout":"250ms"}"#, None)?;
+        let resolved = merge_config(
+            &current,
+            r#"{"authority_timeout":"250ms","startup_table":{"catalog":"lakehouse","schema":"dbo","table":"events"}}"#,
+            None,
+        )?;
         config.authority_timeout = resolved.authority_timeout;
+        config.startup_table = resolved.startup_table;
         config.validate()?;
         assert_eq!(config.effective_config_json()["authority_timeout"], "250ms");
+        assert_eq!(config.effective_config_json()["startup_table"]["catalog"], "lakehouse");
+        assert_eq!(config.effective_config_json()["startup_table"]["schema"], "dbo");
+        assert_eq!(config.effective_config_json()["startup_table"]["table"], "events");
+        assert!(
+            merge_config(
+                &current,
+                r#"{"startup_table":{"catalog":"lakehouse","schema":"dbo","table":"events","root":"/tmp"}}"#,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            merge_config(
+                &current,
+                r#"{"startup_table":{"catalog":"lakehouse","schema":"dbo","table":"not valid"}}"#,
+                None,
+            )
+            .is_err()
+        );
         assert_eq!(
             config.effective_config_json()["batching"]["age_flush_policy"],
             "immediate"
@@ -247,11 +273,29 @@ struct RoutingOverrides {
     command_timeout: Duration,
 }
 
+/// A single logical table selected for metadata-only startup readback.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StartupTableSelector {
+    pub catalog: CatalogName,
+    pub schema: SchemaName,
+    pub table: TableName,
+}
+
+impl StartupTableSelector {
+    #[must_use]
+    pub fn identity(&self) -> TableIdentity {
+        TableIdentity::new(self.catalog.clone(), self.schema.clone(), self.table.clone())
+    }
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ExporterOverrides {
     #[serde(with = "humantime_serde")]
     authority_timeout: Duration,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    startup_table: Option<StartupTableSelector>,
 }
 
 fn merge_config<T: Serialize + serde::de::DeserializeOwned>(
@@ -896,6 +940,9 @@ impl CommitConfig {
 pub struct DeltaExporterConfig {
     /// Absolute local root or abfss URI for logical Arrowcol tables.
     pub base_path: PathBuf,
+    /// Optional existing logical table to read back before data-plane admission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_table: Option<StartupTableSelector>,
     /// Authoritative routing lease store.
     pub routing: RoutingStoreConfig,
     /// Bounded publication settings.
@@ -916,9 +963,11 @@ impl DeltaExporterConfig {
         self.routing.apply_environment()?;
         let mut overrides = ExporterOverrides {
             authority_timeout: self.authority_timeout,
+            startup_table: self.startup_table.clone(),
         };
         apply_json_environment(&mut overrides, "ARROWCOL_COLLECTOR_EXPORTER_CONFIG", None)?;
         self.authority_timeout = overrides.authority_timeout;
+        self.startup_table = overrides.startup_table;
         Ok(())
     }
 
@@ -927,6 +976,7 @@ impl DeltaExporterConfig {
             "batching": self.batching,
             "commit": self.commit,
             "routing": self.routing.effective_config_json(),
+            "startup_table": self.startup_table,
             "authority_timeout": format!("{:?}", self.authority_timeout)
         })
     }

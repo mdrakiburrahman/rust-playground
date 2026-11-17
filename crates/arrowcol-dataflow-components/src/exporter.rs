@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 
 use arrow_deltalake::commit::{BatchedTable, CommitReceiptError};
+use arrow_deltalake::delta::{DeltaTable, ResolvedDeltaTarget};
 use arrow_deltalake::sizing::{AdaptiveFileSizeEstimator, FlushTrigger};
 use async_trait::async_trait;
 use futures::future::{FutureExt, LocalBoxFuture};
@@ -26,13 +27,14 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use tokio::time::Instant;
 
 use crate::DeltaExporterConfig;
-use crate::config::{BatchCapacity, FileBatchConfig, config_error, parse_config, table_path};
+use crate::config::{BatchCapacity, FileBatchConfig, StartupTableSelector, config_error, parse_config, table_path};
 use crate::envelope::{ArrowcolBatchEnvelope, DecodedArrowBatch, EnvelopeError, decode_record_set};
 use crate::metrics::{FlushReason, PipelineStage, RuntimeMetrics, StageMetrics, global_metrics};
 use crate::routing::{
     AuthorityClient, ExportingProcess, LEASE_VIEW_TTL, LeaseBinder, LeaseBinding, LeaseEvidence,
     RoutingPublicationFence,
 };
+use arrowcol_protocol::TableIdentity;
 
 /// DFE URN for arbitrary Arrow Delta output.
 pub const ARROW_DELTALAKE_EXPORTER_URN: &str = "urn:otel:exporter:arrow_deltalake";
@@ -64,6 +66,21 @@ impl GenericDeltaExporter {
             }
             return Ok(Self { backend: existing });
         }
+        let startup_table = config
+            .startup_table
+            .as_ref()
+            .map(|selector| preload_startup_table(&config.base_path, selector));
+        if let Some(binding) = &startup_table {
+            metrics
+                .register_delta_target(
+                    binding.identity.clone(),
+                    binding
+                        .resolved
+                        .as_ref()
+                        .map(|target| (target.normalized_root.clone(), target.delta_table_id.clone())),
+                )
+                .map_err(|error| format!("register startup Delta target: {error}"))?;
+        }
         let store = config.routing.build()?;
         let options = config.commit.build()?;
         metrics.configure_exporter(options.max_pending_files);
@@ -84,6 +101,7 @@ impl GenericDeltaExporter {
             authority,
             leases: LeaseBinder::new(store, LEASE_VIEW_TTL),
             metrics,
+            startup_table,
             tables: tokio::sync::Mutex::new(HashMap::new()),
         });
         registry.insert(config.base_path, Arc::downgrade(&backend));
@@ -139,6 +157,7 @@ impl GenericDeltaExporter {
                 backlog_capacity,
                 draining: std::sync::atomic::AtomicBool::new(false),
                 metrics,
+                startup_table: None,
                 tables: tokio::sync::Mutex::new(HashMap::new()),
             }),
         })
@@ -211,6 +230,67 @@ impl GenericDeltaExporter {
     }
 }
 
+#[derive(Clone, Debug)]
+struct StartupTableBinding {
+    identity: TableIdentity,
+    resolved: Option<ResolvedDeltaTarget>,
+}
+
+impl StartupTableBinding {
+    fn verify_actual(&self, actual: &ResolvedDeltaTarget) -> Result<(), ExportFailure> {
+        let Some(expected) = &self.resolved else {
+            return Err(ExportFailure::TerminalConfiguration(format!(
+                "selected startup Delta table {} was not resolved before admission",
+                self.identity
+            )));
+        };
+        if expected != actual {
+            return Err(ExportFailure::TerminalConfiguration(format!(
+                "selected startup Delta table {} changed root or table ID before writer open",
+                self.identity
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn preload_startup_table(base_path: &std::path::Path, selector: &StartupTableSelector) -> StartupTableBinding {
+    let identity = selector.identity();
+    let root = table_path(base_path, &identity);
+    let resolved = match DeltaTable::open_existing_for_readback(&root.to_string_lossy()) {
+        Ok(Some(table)) => match table.resolved_delta_target() {
+            Ok(target) => target,
+            Err(error) => {
+                tracing::warn!(
+                    component = "exporter",
+                    table = %identity,
+                    error = %arrowcol_buffer::safe_error_message(&format!("{error:#}")),
+                    "selected startup Delta target is unresolved"
+                );
+                None
+            }
+        },
+        Ok(None) => {
+            tracing::warn!(
+                component = "exporter",
+                table = %identity,
+                "selected startup Delta target has no existing committed metadata"
+            );
+            None
+        }
+        Err(error) => {
+            tracing::warn!(
+                component = "exporter",
+                table = %identity,
+                error = %arrowcol_buffer::safe_error_message(&format!("{error:#}")),
+                "selected startup Delta target could not be opened read-only"
+            );
+            None
+        }
+    };
+    StartupTableBinding { identity, resolved }
+}
+
 struct DeltaBackend {
     configuration: Option<DeltaExporterConfig>,
     base_path: PathBuf,
@@ -223,6 +303,7 @@ struct DeltaBackend {
     leases: LeaseBinder,
     backlog_capacity: Arc<crate::metrics::PublicationBacklogCapacityGuard>,
     metrics: Arc<RuntimeMetrics>,
+    startup_table: Option<StartupTableBinding>,
     tables: tokio::sync::Mutex<HashMap<arrowcol_protocol::TableIdentity, Arc<TableOwner>>>,
 }
 
@@ -248,6 +329,16 @@ impl DeltaBackend {
             // the worker, so reopening below waits for that worker to stop and starts a fresh one.
             tables.remove(&decoded.envelope.table);
         }
+        let selected_startup_target = self
+            .startup_table
+            .as_ref()
+            .filter(|binding| binding.identity == decoded.envelope.table);
+        if selected_startup_target.is_some_and(|binding| binding.resolved.is_none()) {
+            return Err(ExportFailure::TerminalConfiguration(format!(
+                "selected startup Delta table {} was not resolved before admission",
+                decoded.envelope.table
+            )));
+        }
         let evidence = LeaseEvidence::from_envelope(&decoded.envelope);
         let fence = Arc::new(RoutingPublicationFence::new(evidence.clone(), self.authority.clone()));
         let publication_fence: Arc<dyn arrow_deltalake::delta::PublicationFence> =
@@ -256,6 +347,28 @@ impl DeltaBackend {
         let table = BatchedTable::open_uri_with_fence(&root.to_string_lossy(), self.options.clone(), publication_fence)
             .await
             .map_err(|error| ExportFailure::Transient(format!("{error:#}")))?;
+        if let Some(binding) = selected_startup_target {
+            let actual = table
+                .resolved_delta_target()
+                .await
+                .map_err(|error| ExportFailure::Transient(format!("{error:#}")))?;
+            let Some(actual) = actual else {
+                self.metrics
+                    .register_delta_target(binding.identity.clone(), None)
+                    .map_err(ExportFailure::Transient)?;
+                return Err(ExportFailure::TerminalConfiguration(format!(
+                    "selected startup Delta table {} lost its committed metadata before writer open",
+                    binding.identity
+                )));
+            };
+            self.metrics
+                .register_delta_target(
+                    binding.identity.clone(),
+                    Some((actual.normalized_root.clone(), actual.delta_table_id.clone())),
+                )
+                .map_err(ExportFailure::Transient)?;
+            binding.verify_actual(&actual)?;
+        }
         let (sender, receiver) = mpsc::channel(self.batching.per_table_capacity.batches as usize);
         let (drain, drain_rx) = watch::channel(false);
         let estimator = AdaptiveFileSizeEstimator::new(self.batching.adaptive_file.build())
@@ -1436,6 +1549,71 @@ mod tests {
         }
     }
 
+    #[test]
+    fn startup_preload_reads_actual_existing_metadata_and_leaves_missing_target_unresolved() -> Result<(), String> {
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let selector = StartupTableSelector {
+            catalog: CatalogName::new("demo").map_err(|error| error.to_string())?,
+            schema: SchemaName::new("generated").map_err(|error| error.to_string())?,
+            table: TableName::new("events").map_err(|error| error.to_string())?,
+        };
+        let identity = selector.identity();
+        let root = table_path(directory.path(), &identity);
+        let url = url::Url::from_directory_path(&root).map_err(|()| "invalid table URL".to_owned())?;
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::UInt64, false)]));
+        let table = DeltaTable::open_url(url, schema, Vec::new()).map_err(|error| format!("{error:#}"))?;
+        let expected = table
+            .resolved_delta_target()
+            .map_err(|error| format!("{error:#}"))?
+            .ok_or("opened table had no metadata ID")?;
+        drop(table);
+
+        let binding = preload_startup_table(directory.path(), &selector);
+        assert_eq!(binding.identity, identity);
+        assert_eq!(binding.resolved, Some(expected));
+        assert!(
+            binding
+                .verify_actual(binding.resolved.as_ref().expect("resolved"))
+                .is_ok()
+        );
+
+        let missing = StartupTableSelector {
+            table: TableName::new("missing").map_err(|error| error.to_string())?,
+            ..selector
+        };
+        let missing_root = table_path(directory.path(), &missing.identity());
+        let unresolved = preload_startup_table(directory.path(), &missing);
+        assert!(unresolved.resolved.is_none());
+        assert!(!missing_root.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn startup_writer_target_must_match_preloaded_root_and_table_id() -> Result<(), String> {
+        let binding = StartupTableBinding {
+            identity: table(),
+            resolved: Some(ResolvedDeltaTarget {
+                normalized_root: "file:///data/events".to_owned(),
+                delta_table_id: "delta-id".to_owned(),
+            }),
+        };
+        let expected = binding.resolved.as_ref().expect("expected target");
+        assert!(binding.verify_actual(expected).is_ok());
+        for actual in [
+            ResolvedDeltaTarget {
+                normalized_root: "file:///other/events".to_owned(),
+                delta_table_id: "delta-id".to_owned(),
+            },
+            ResolvedDeltaTarget {
+                normalized_root: "file:///data/events".to_owned(),
+                delta_table_id: "other-id".to_owned(),
+            },
+        ] {
+            assert!(binding.verify_actual(&actual).is_err());
+        }
+        Ok(())
+    }
+
     fn now() -> UnixMillis {
         crate::config::now_unix_millis().expect("now")
     }
@@ -2608,6 +2786,7 @@ mod tests {
                 max_age: std::time::Duration::from_secs(60),
                 ..Default::default()
             },
+            startup_table: None,
             authority_timeout: std::time::Duration::from_secs(2),
         };
         let mut first = GenericDeltaExporter::with_batching(
@@ -3573,6 +3752,7 @@ mod tests {
             routing: crate::config::RoutingStoreConfig::Memory,
             commit: crate::config::CommitConfig::default(),
             batching: FileBatchConfig::default(),
+            startup_table: None,
             authority_timeout: std::time::Duration::from_secs(2),
         };
         let barrier = Arc::new(std::sync::Barrier::new(4));

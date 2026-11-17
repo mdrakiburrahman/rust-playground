@@ -1027,6 +1027,7 @@ pub struct RuntimeMetrics {
     instance_key: OnceLock<String>,
     native_quiver: OnceLock<bool>,
     resolved_buffering_mode: Mutex<ResolvedBufferingMode>,
+    delta_targets: Mutex<BTreeMap<TableIdentity, DeltaTargetStatus>>,
     accepting: AtomicBool,
     healthy: AtomicBool,
     catalog_ready: AtomicBool,
@@ -1080,6 +1081,7 @@ impl RuntimeMetrics {
             instance_key: OnceLock::new(),
             native_quiver: OnceLock::new(),
             resolved_buffering_mode: Mutex::new(ResolvedBufferingMode::Unknown),
+            delta_targets: Mutex::new(BTreeMap::new()),
             accepting: AtomicBool::new(true),
             healthy: AtomicBool::new(true),
             catalog_ready: AtomicBool::new(false),
@@ -1289,6 +1291,66 @@ impl RuntimeMetrics {
             .lock()
             .map(|mode| *mode)
             .map_err(|_| "resolved buffering mode lock is poisoned".to_owned())
+    }
+
+    /// Records a selected logical table's actual opened Delta identity.
+    ///
+    /// Unknown registrations do not erase a resolved identity; different roots or IDs
+    /// make the state conflicting and remain so for the process lifetime.
+    pub(crate) fn register_delta_target(
+        &self,
+        table: TableIdentity,
+        target: Option<(String, String)>,
+    ) -> Result<(), String> {
+        if target
+            .as_ref()
+            .is_some_and(|(root, table_id)| root.is_empty() || table_id.is_empty())
+        {
+            return Err("resolved Delta target requires a normalized root and table ID".to_owned());
+        }
+        let mut targets = self
+            .delta_targets
+            .lock()
+            .map_err(|_| "Delta target readback lock is poisoned".to_owned())?;
+        let Some(target) = target else {
+            let status = targets.entry(table.clone()).or_insert(DeltaTargetStatus {
+                table,
+                normalized_root: None,
+                delta_table_id: None,
+                state: DeltaTargetState::Unresolved,
+            });
+            if status.state != DeltaTargetState::Conflicting {
+                status.normalized_root = None;
+                status.delta_table_id = None;
+                status.state = DeltaTargetState::Unresolved;
+            }
+            return Ok(());
+        };
+        let (normalized_root, delta_table_id) = target;
+        let status = targets.entry(table.clone()).or_insert(DeltaTargetStatus {
+            table,
+            normalized_root: None,
+            delta_table_id: None,
+            state: DeltaTargetState::Unresolved,
+        });
+        match status.state {
+            DeltaTargetState::Conflicting => {}
+            DeltaTargetState::Unresolved => {
+                status.normalized_root = Some(normalized_root);
+                status.delta_table_id = Some(delta_table_id);
+                status.state = DeltaTargetState::Resolved;
+            }
+            DeltaTargetState::Resolved => {
+                if status.normalized_root.as_deref() != Some(normalized_root.as_str())
+                    || status.delta_table_id.as_deref() != Some(delta_table_id.as_str())
+                {
+                    status.normalized_root = None;
+                    status.delta_table_id = None;
+                    status.state = DeltaTargetState::Conflicting;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Returns the delivery guarantee label of the configured admission mode.
@@ -1724,6 +1786,7 @@ impl RuntimeMetrics {
         Ok(DashboardPressure {
             rich,
             table_versions: self.table_versions(),
+            delta_targets: self.delta_targets(),
             actual_rss_bytes: actual_rss,
             dfe_channel_capacity: self.dfe_channel_capacity.load(Ordering::Acquire),
             dfe_channel_occupancy: dfe_batches,
@@ -1807,6 +1870,13 @@ impl RuntimeMetrics {
                     })
                     .collect()
             },
+        )
+    }
+
+    fn delta_targets(&self) -> Vec<DeltaTargetStatus> {
+        self.delta_targets.lock().map_or_else(
+            |_| Vec::new(),
+            |targets| targets.values().take(MAX_TABLE_PRESSURE_ENTRIES).cloned().collect(),
         )
     }
 
@@ -2008,6 +2078,8 @@ pub struct DashboardPressure {
     pub rich: RichPressureSnapshot,
     /// Catalog and Delta versions observed per bounded table entry.
     pub table_versions: Vec<TableVersionStatus>,
+    /// Actual selected Delta targets observed during startup and writer open.
+    pub delta_targets: Vec<DeltaTargetStatus>,
     actual_rss_bytes: u64,
     dfe_channel_capacity: u64,
     dfe_channel_occupancy: u64,
@@ -2022,6 +2094,29 @@ pub struct DashboardPressure {
     replayed_batches: u64,
     rebound_batches: u64,
     replay_deferred_batches: u64,
+}
+
+/// State of a selected logical table's opened Delta target.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeltaTargetState {
+    /// No actual Delta metadata has been read successfully.
+    Unresolved,
+    /// Every observed writer reported the same root and Delta table ID.
+    Resolved,
+    /// Writers reported different roots or Delta table IDs.
+    Conflicting,
+}
+
+/// Actual Delta target readback for one selected logical table.
+#[derive(Clone, Debug, Serialize)]
+pub struct DeltaTargetStatus {
+    pub table: TableIdentity,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub normalized_root: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta_table_id: Option<String>,
+    pub state: DeltaTargetState,
 }
 
 /// Version lineage retained for one logical table.
@@ -2478,6 +2573,60 @@ mod tests {
         assert!(metrics.native_quiver_enabled());
         assert!(metrics.configure_admission("dfe-1", true).is_err());
         assert!(metrics.configure_admission("dfe-0", false).is_err());
+    }
+
+    #[test]
+    fn delta_target_readback_resolves_consistent_shards_and_sticks_on_conflict() {
+        let identity = table();
+        let metrics = RuntimeMetrics::new(CollectorInstanceId::new());
+        let initial = serde_json::to_value(metrics.pressure().expect("pressure")).expect("pressure JSON");
+        assert_eq!(initial["delta_targets"], serde_json::json!([]));
+
+        metrics
+            .register_delta_target(identity.clone(), None)
+            .expect("unresolved target");
+        let unresolved = serde_json::to_value(metrics.pressure().expect("pressure")).expect("pressure JSON");
+        assert_eq!(unresolved["delta_targets"][0]["state"], "unresolved");
+        assert!(unresolved["delta_targets"][0].get("normalized_root").is_none());
+        assert!(unresolved["delta_targets"][0].get("delta_table_id").is_none());
+
+        let pair = (
+            "https://account.blob.core.windows.net/container/events".to_owned(),
+            "delta-id".to_owned(),
+        );
+        metrics
+            .register_delta_target(identity.clone(), Some(pair.clone()))
+            .expect("resolved target");
+        metrics
+            .register_delta_target(identity.clone(), Some(pair.clone()))
+            .expect("consistent shard target");
+        let resolved = serde_json::to_value(metrics.pressure().expect("pressure")).expect("pressure JSON");
+        assert_eq!(resolved["delta_targets"][0]["state"], "resolved");
+        assert_eq!(resolved["delta_targets"][0]["normalized_root"], pair.0);
+        assert_eq!(resolved["delta_targets"][0]["delta_table_id"], pair.1);
+
+        for conflicting in [
+            (
+                "https://account.blob.core.windows.net/container/other".to_owned(),
+                "delta-id".to_owned(),
+            ),
+            (pair.0.clone(), "other-id".to_owned()),
+        ] {
+            let metrics = RuntimeMetrics::new(CollectorInstanceId::new());
+            metrics
+                .register_delta_target(identity.clone(), Some(pair.clone()))
+                .expect("initial target");
+            metrics
+                .register_delta_target(identity.clone(), Some(conflicting))
+                .expect("conflicting target registration");
+            metrics
+                .register_delta_target(identity.clone(), Some(pair.clone()))
+                .expect("conflict remains sticky");
+            let status = serde_json::to_value(metrics.pressure().expect("pressure")).expect("pressure JSON");
+            assert_eq!(status["delta_targets"][0]["state"], "conflicting");
+            assert!(status["delta_targets"][0].get("normalized_root").is_none());
+            assert!(status["delta_targets"][0].get("delta_table_id").is_none());
+        }
     }
 
     #[test]
