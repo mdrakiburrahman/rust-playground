@@ -216,6 +216,8 @@ mod fixture {
             expected,
         )?;
         // PID1 cannot be reused while another process survives in its PID namespace.
+        // This acknowledges dispatch only; the parent must separately observe
+        // term_seen before release, then release_seen and the target's exit0.
         rustix::process::kill_process(rustix::process::Pid::INIT, rustix::process::Signal::USR1)?;
         Ok(())
     }

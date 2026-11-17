@@ -97,7 +97,7 @@ async function ready(id: string) {
   assert.equal(inspect(id).State.Running, true);
 }
 
-function signal(id: string, value: "TERM" | "USR1" | "INT") {
+function signal(id: string, value: "TERM" | "USR1" | "INT" | "STOP" | "CONT") {
   docker(["kill", `--signal=${value}`, id]);
 }
 
@@ -118,12 +118,18 @@ test("real private PID1 rejects early/queued release, holds repeated TERM and re
     await until(() => events(id), values => values.some(value => value.event === "early_release_invalid"), "early release invalid");
     assert.equal(inspect(id).State.Running, true);
 
-    docker(["pause", id]);
-    assert.equal(inspect(id).State.Paused, true);
+    // Docker kill unpauses cgroup-paused containers. Observe a real SIGSTOP
+    // instead, and never use the reported host PIDs as signal targets.
+    const processStates = () => docker(["top", id, "-eo", "pid,stat,comm"]).stdout.trim().split("\n").slice(1)
+      .map(line => line.trim().split(/\s+/)[1]!);
+    signal(id, "STOP");
+    const before = await until(processStates, values => values.length > 0 && values.every(value => value.startsWith("T")), "owned process actually stopped");
     signal(id, "USR1");
     signal(id, "TERM");
-    docker(["unpause", id]);
-    assert.equal(inspect(id).State.Paused, false);
+    const after = processStates();
+    assert.ok(after.length > 0 && after.every(value => value.startsWith("T")), "both signals must remain queued until CONT");
+    console.log(JSON.stringify({ event: "queued_signal_witness", container_id: id, before, after }));
+    signal(id, "CONT");
     await until(() => events(id), values => values.some(value => value.event === "term_seen"), "queued TERM observed");
     signal(id, "TERM");
     signal(id, "TERM");
