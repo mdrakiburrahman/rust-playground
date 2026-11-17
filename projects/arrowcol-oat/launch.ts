@@ -9,7 +9,7 @@ import { performance } from 'node:perf_hooks';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { formatPreflightReport, loadAksEnvironment, runAksPreflight } from './aks-preflight.js';
 import { run_tree } from '../../infra/azure/bootstrap.js';
-import { parseDataFlowVerdictPolicy, record, reportDataFlowRun, type NetworkObservation } from './dataflow-verdict.js';
+import { collectDataFlow, parseDataFlowVerdictPolicy, record, reportDataFlowRun, type NetworkObservation } from './dataflow-verdict.js';
 
 export interface OatRunStatus {
   id: string;
@@ -22,6 +22,17 @@ export interface OatRunStatus {
 
 type FetchLike = typeof fetch;
 type ProgressHandler = (status: OatRunStatus) => void;
+
+export interface OatOwnedRunIdentity {
+  readonly invocationId: string;
+  readonly runId: string;
+  readonly serverUrl: string;
+  readonly serverPid: number;
+  readonly serverStartTicks: string;
+  readonly serverExecutable: string;
+}
+
+export type OatOwnedRunObserver = (identity: Readonly<OatOwnedRunIdentity>, receiptPath: string) => void | Promise<void>;
 
 export interface LocalViewer {
   url: string;
@@ -207,9 +218,12 @@ export class OatLauncherDeadline {
   }
 
   get creationState(): DeadlineCreationState { return this.receipt.creation_state; }
+  get invocationId(): string { return this.receipt.invocation_id; }
   get cleanupState(): DeadlineCleanupState { return this.receipt.cleanup_state; }
   get runId(): string | null { return this.receipt.run_id; }
   get serverUrl(): string | null { return this.receipt.server_url; }
+  get cancellationAttempts(): number { return this.receipt.cancellation_attempts; }
+  get submittedConfigSha256(): string | null { return this.receipt.submitted_config_sha256; }
   isExpired(): boolean { return this.deadlineAtMonotonicMs !== null && performance.now() >= this.deadlineAtMonotonicMs; }
 
   private async persist(): Promise<void> {
@@ -284,6 +298,7 @@ export class OatLauncherDeadline {
   }
 
   async markCancelAttempt(): Promise<void> {
+    if (this.receipt.cancellation_attempts !== 0) throw new Error('Cancellation intent was already recorded for this OAT run');
     this.receipt.cancellation_attempts++;
     this.receipt.last_cancel_result = 'pending';
     await this.persist();
@@ -589,7 +604,19 @@ async function persistLocalRunMarker(context: LocalRunMarkerContext, status: Oat
     throw new Error('OAT server returned a noncanonical run ID; local recovery marker was not written');
   }
   const marker: LocalRunMarker = { ...context.marker, ...binding, runId: status.id };
-  await writeFile(context.path, JSON.stringify(marker), { flag: 'wx', mode: 0o600 });
+  const file = await open(context.path, 'wx', 0o600);
+  try {
+    await file.writeFile(JSON.stringify(marker));
+    await file.sync();
+  } finally {
+    await file.close();
+  }
+  const directory = await open(dirname(context.path), 'r');
+  try {
+    await directory.sync();
+  } finally {
+    await directory.close();
+  }
 }
 
 function parseLocalRunMarker(text: string, markerPath: string): LocalRunMarker {
@@ -781,10 +808,10 @@ async function cancelAndReconcileLocalRun(
   deadline: OatLauncherDeadline,
   initialEvidenceError?: unknown,
 ): Promise<OatRunStatus> {
+  if (deadline.runId !== runId) throw new Error('Cleanup run ID differs from the accepted OAT run');
   const cleanupDeadlineAtUnixMs = await deadline.ensureCleanupDeadline();
-  let cancellationAttempted = false;
-  let cancellationAccepted = false;
-  let retryAfterRead = false;
+  const cleanupDeadlineAtMonotonicMs = performance.now() + Math.max(0, cleanupDeadlineAtUnixMs - Date.now());
+  let cancellationAttempted = deadline.cancellationAttempts !== 0;
   let firstRead = true;
   let evidenceError = initialEvidenceError;
   let lastError: unknown = new Error('no cancellation response received');
@@ -796,7 +823,7 @@ async function cancelAndReconcileLocalRun(
       evidenceError = error;
     }
   };
-  const remainingMs = (): number => cleanupDeadlineAtUnixMs - Date.now();
+  const remainingMs = (): number => Math.min(cleanupDeadlineAtUnixMs - Date.now(), cleanupDeadlineAtMonotonicMs - performance.now());
   const wait = async (): Promise<void> => {
     const remaining = remainingMs();
     if (remaining > 0) await new Promise<void>((resolveWait) => setTimeout(resolveWait, Math.min(pollIntervalMs, remaining)));
@@ -804,7 +831,7 @@ async function cancelAndReconcileLocalRun(
   const cancelSignal = (): AbortSignal => {
     const remaining = remainingMs();
     if (remaining <= 0) throw new Error('Persisted OAT cleanup budget expired before cancellation dispatch');
-    return AbortSignal.timeout(Math.min(30_000, Math.floor(remaining)));
+    return AbortSignal.timeout(Math.max(1, Math.min(30_000, Math.floor(remaining))));
   };
 
   while (firstRead || remainingMs() > 0) {
@@ -836,6 +863,9 @@ async function cancelAndReconcileLocalRun(
       await note(() => deadline.markUnsettled(error));
       throw error;
     }
+    if (deadline.submittedConfigSha256 !== null && status.config_sha256 !== deadline.submittedConfigSha256) {
+      await note(() => deadline.markBindingFailure(new Error(`OAT server config_sha256 mismatch for run ${runId}`)));
+    }
     if (status.state !== 'queued' && status.state !== 'running') {
       await note(() => deadline.recordTerminal(status));
       if (evidenceError) {
@@ -848,15 +878,15 @@ async function cancelAndReconcileLocalRun(
     }
 
     let attemptedCancellation = false;
-    if (!cancellationAccepted && (!cancellationAttempted || retryAfterRead)) {
+    if (!cancellationAttempted) {
       cancellationAttempted = true;
       attemptedCancellation = true;
-      retryAfterRead = false;
       await note(() => deadline.markCancelAttempt());
       if (evidenceError) {
+        const persistError = evidenceError;
         const error = new Error('Could not persist cancellation intent before dispatch');
         await note(() => deadline.markUnsettled(error));
-        throw new Error(error.message, { cause: evidenceError });
+        throw new Error(error.message, { cause: persistError });
       }
       let signalForCancel: AbortSignal;
       try {
@@ -873,19 +903,15 @@ async function cancelAndReconcileLocalRun(
         });
       } catch (error) {
         lastError = error;
-        retryAfterRead = true;
         await note(() => deadline.markCancelResult('response_unknown'));
         continue;
       }
       if (cancelResponse.ok) {
-        cancellationAccepted = true;
         await note(() => deadline.markCancelResult('accepted'));
       } else if (cancelResponse.status === 409) {
-        cancellationAccepted = true;
         await note(() => deadline.markCancelResult('not_active'));
       } else if (cancelResponse.status >= 500 || cancelResponse.status === 408 || cancelResponse.status === 429) {
         lastError = new Error(`Cancel response was inconclusive (HTTP ${cancelResponse.status})`);
-        retryAfterRead = true;
         await note(() => deadline.markCancelResult('response_unknown'));
       } else {
         const error = new Error(`Could not cancel local OAT run ${runId}: HTTP ${cancelResponse.status}`);
@@ -982,7 +1008,7 @@ export async function launchOat(
     throw error;
   }
   const ownedRunId = status.id;
-  let bindingFailure: Error | undefined = submission && status.config_sha256 !== submission.submitted_config_sha256
+  let bindingFailure: Error | undefined = (deadline || submission) && status.config_sha256 !== binding.submitted_config_sha256
     ? new Error(`OAT server config_sha256 mismatch for run ${ownedRunId}`)
     : undefined;
   let startFailure: { error: unknown } | undefined;
@@ -1065,8 +1091,9 @@ export async function launchOat(
         signal: AbortSignal.timeout(30_000),
       });
       const next = await readStatus(response, 'poll OAT run', ownedRunId);
-      if (submission && next.config_sha256 !== submission.submitted_config_sha256) {
+      if ((deadline || submission) && next.config_sha256 !== binding.submitted_config_sha256) {
         bindingFailure = new Error(`OAT server config_sha256 mismatch for run ${ownedRunId}`);
+        await deadline?.markBindingFailure(bindingFailure);
         if (next.state === 'queued' || next.state === 'running') requestCancellation();
       }
       const changed = next.state !== status.state || next.progress !== status.progress ||
@@ -1142,6 +1169,8 @@ export async function main(
   runner: typeof run_tree = run_tree,
   cleanupLocal = cleanupLocalComposeProjects,
   receiptRoot = launcherDeadlineReceiptRoot,
+  collect: typeof collectDataFlow = collectDataFlow,
+  onOwnedRun?: OatOwnedRunObserver,
 ): Promise<void> {
   const launcherStartedAtUnixMs = Date.now();
   const launcherStartedAtMonotonicMs = performance.now();
@@ -1264,13 +1293,8 @@ export async function main(
       try {
         const code = await reportDataFlowRun(
           (progress) => launchOat(configPath, requestedServerUrl, pollValue, fetch, progress, mode, getDockerBridgeGateway, interrupt?.controller.signal, undefined, undefined, deadline, submission),
-          config, mode, undefined, runner, network, warnings,
+          config, mode, undefined, runner, network, warnings, collect,
         );
-        if (deadline?.isExpired()) {
-          await deadline.markOverrun();
-          process.exitCode = 1;
-          return;
-        }
         if (interrupt?.signal) {
           process.exitCode = interrupt.exitCode;
           return;
@@ -1291,8 +1315,11 @@ export async function main(
       interrupt?.dispose();
       if (deadline) {
         try {
-          if (deadline.isExpired()) await deadline.markOverrun();
           await deadline.markNoRun();
+          if (deadline.isExpired()) {
+            await deadline.markOverrun();
+            process.exitCode = 1;
+          }
         } finally {
           deadline.dispose();
         }
@@ -1356,6 +1383,7 @@ export async function main(
     throw error;
   }
   let markerWritten = false;
+  let supplementaryEmitted = false;
   let runCleanupComplete = false;
   let runPassed = false;
   const interrupt = mode === 'local' ? registerLocalInterrupts() : undefined;
@@ -1365,13 +1393,32 @@ export async function main(
       const onRunStarted = localMarker ? async (status: OatRunStatus): Promise<void> => {
         await persistLocalRunMarker(localMarker, status, submission);
         markerWritten = true;
+        if (onOwnedRun && !supplementaryEmitted && status.config_sha256 === submission.submitted_config_sha256) {
+          supplementaryEmitted = true;
+          const identity: Readonly<OatOwnedRunIdentity> = Object.freeze({
+            invocationId: deadline.invocationId,
+            runId: status.id,
+            serverUrl: localMarker.marker.serverUrl,
+            serverPid: localMarker.marker.serverPid,
+            serverStartTicks: localMarker.marker.serverStartTicks,
+            serverExecutable: localMarker.marker.serverExecutable,
+          });
+          const diagnostic = (error: unknown): void => {
+            console.error('[oat] Supplementary owned-run observer failed:', error);
+          };
+          try {
+            void Promise.resolve(onOwnedRun(identity, deadline.receiptPath)).catch(diagnostic);
+          } catch (error) {
+            diagnostic(error);
+          }
+        }
       } : undefined;
       const onRunFinished = (status: OatRunStatus): void => {
         runCleanupComplete = status.state === 'succeeded' || status.state === 'cancelled';
       };
       const code = await reportDataFlowRun(
         (progress) => launchOat(configPath, server.url, pollValue, fetch, progress, mode, getDockerBridgeGateway, interrupt?.controller.signal, onRunStarted, onRunFinished, deadline, submission),
-        config, mode, server.gitSha, runner, network, warnings,
+        config, mode, server.gitSha, runner, network, warnings, collect,
       );
       if (interrupt?.signal) {
         process.exitCode = interrupt.exitCode;
@@ -1408,17 +1455,16 @@ export async function main(
     } finally {
       if (deadline) {
         try {
-          if (deadline.isExpired()) await deadline.markOverrun();
           await deadline.markNoRun();
+          if (deadline.isExpired()) {
+            await deadline.markOverrun();
+            process.exitCode = 1;
+          }
         } finally {
           deadline.dispose();
         }
       }
     }
-  }
-  if (deadline.isExpired()) {
-    await deadline.markOverrun();
-    process.exitCode = 1;
   }
 }
 
