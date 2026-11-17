@@ -314,9 +314,9 @@
         "put_create",
         "buffered_multipart"
       ],
-      "configured": [
-        "put_create"
-      ],
+      "configured": [],
+      "baseline_requested": null,
+      "effective_default": "put_create",
       "excluded": {
         "buffered_multipart": "Pinned capability table marks collector multipart upload unsupported because the backend lacks conditional completion; not a scored candidate."
       },
@@ -326,7 +326,112 @@
   },
   "runnable": false,
   "config_validation": {
-    "status": "not-validated"
+    "status": "config-validated",
+    "validator": "arrowcol-oat-rust --validate-config",
+    "validator_source_commit": "5687e6459c424362f4504d21c32f954aa3b07d05",
+    "validator_binary_sha256": "9c5bc506371ba533ade8bc3477be17ade82cda2a3139988d23cf3219f0706901",
+    "baseline_count": 1,
+    "candidate_count": 13,
+    "pass_count": 14,
+    "fail_count": 0,
+    "configs": [
+      {
+        "kind": "baseline",
+        "path": "out/arrowcol-oat/sweep-configs/C6/baseline.json",
+        "sha256": "736db4ab230cd11d61d5500251efd28fa1886aaee50fc25d1636d62668f75e58"
+      },
+      {
+        "kind": "candidate",
+        "comparison": "dfe-concurrency",
+        "candidate": "dfe-1",
+        "path": "out/arrowcol-oat/sweep-configs/C6/dfe-concurrency/dfe-1.json",
+        "sha256": "e0c921c81a6ea23901096811c20c8d4fc0b7c1f286bda65fc8616acaa33a45a1"
+      },
+      {
+        "kind": "candidate",
+        "comparison": "dfe-concurrency",
+        "candidate": "dfe-2",
+        "path": "out/arrowcol-oat/sweep-configs/C6/dfe-concurrency/dfe-2.json",
+        "sha256": "736db4ab230cd11d61d5500251efd28fa1886aaee50fc25d1636d62668f75e58"
+      },
+      {
+        "kind": "candidate",
+        "comparison": "dfe-concurrency",
+        "candidate": "dfe-4",
+        "path": "out/arrowcol-oat/sweep-configs/C6/dfe-concurrency/dfe-4.json",
+        "sha256": "bc2507a97161ecaa6fe9854b64371ce0cbef4e63a7876aac0be5220353e992aa"
+      },
+      {
+        "kind": "candidate",
+        "comparison": "dfe-concurrency",
+        "candidate": "dfe-8",
+        "path": "out/arrowcol-oat/sweep-configs/C6/dfe-concurrency/dfe-8.json",
+        "sha256": "4ace5b509b791e2b592b837d17233c9a0fc86bd983df16acd38294dccaaf7fe3"
+      },
+      {
+        "kind": "candidate",
+        "comparison": "cpu-workers",
+        "candidate": "cpu-1",
+        "path": "out/arrowcol-oat/sweep-configs/C6/cpu-workers/cpu-1.json",
+        "sha256": "134092e55547a87016968c992d6ecf0f852c35b656a87def35b6cf9ec7fe9558"
+      },
+      {
+        "kind": "candidate",
+        "comparison": "cpu-workers",
+        "candidate": "cpu-2",
+        "path": "out/arrowcol-oat/sweep-configs/C6/cpu-workers/cpu-2.json",
+        "sha256": "b3dc037f645f246f1434836f4066ccc953a89615fbe238d55e5f79c38032e5ae"
+      },
+      {
+        "kind": "candidate",
+        "comparison": "cpu-workers",
+        "candidate": "cpu-4",
+        "path": "out/arrowcol-oat/sweep-configs/C6/cpu-workers/cpu-4.json",
+        "sha256": "736db4ab230cd11d61d5500251efd28fa1886aaee50fc25d1636d62668f75e58"
+      },
+      {
+        "kind": "candidate",
+        "comparison": "upload-concurrency",
+        "candidate": "upload-1",
+        "path": "out/arrowcol-oat/sweep-configs/C6/upload-concurrency/upload-1.json",
+        "sha256": "bbde1ace88d9a240f97756670940fb308b7225ccd598406a669e94d40dca4ec6"
+      },
+      {
+        "kind": "candidate",
+        "comparison": "upload-concurrency",
+        "candidate": "upload-4",
+        "path": "out/arrowcol-oat/sweep-configs/C6/upload-concurrency/upload-4.json",
+        "sha256": "e40f323c54de521c844f7c7ccd43abfb518f6462f53641e7803ed8248e92149d"
+      },
+      {
+        "kind": "candidate",
+        "comparison": "upload-concurrency",
+        "candidate": "upload-8",
+        "path": "out/arrowcol-oat/sweep-configs/C6/upload-concurrency/upload-8.json",
+        "sha256": "736db4ab230cd11d61d5500251efd28fa1886aaee50fc25d1636d62668f75e58"
+      },
+      {
+        "kind": "candidate",
+        "comparison": "flush-concurrency",
+        "candidate": "flush-1",
+        "path": "out/arrowcol-oat/sweep-configs/C6/flush-concurrency/flush-1.json",
+        "sha256": "3a19dc88e5ae799bd3e8e5231b3c6b88a7bb026db62d68330a7336641b23e37c"
+      },
+      {
+        "kind": "candidate",
+        "comparison": "flush-concurrency",
+        "candidate": "flush-2",
+        "path": "out/arrowcol-oat/sweep-configs/C6/flush-concurrency/flush-2.json",
+        "sha256": "736db4ab230cd11d61d5500251efd28fa1886aaee50fc25d1636d62668f75e58"
+      },
+      {
+        "kind": "candidate",
+        "comparison": "flush-concurrency",
+        "candidate": "flush-4",
+        "path": "out/arrowcol-oat/sweep-configs/C6/flush-concurrency/flush-4.json",
+        "sha256": "c46c5e9fa3c7c09a17aad7eec839c384e9602498d4b5d6e2bf74fc1e0048a0be"
+      }
+    ]
   },
   "runtime_qualification": "unqualified"
 }

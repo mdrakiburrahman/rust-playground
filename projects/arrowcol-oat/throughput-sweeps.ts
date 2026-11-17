@@ -154,8 +154,12 @@ export function buildThroughputManifests(registry: unknown): JsonObject[] {
   const tunables = registry.tunables;
   const registryHash = createHash('sha256').update(JSON.stringify(tunables)).digest('hex');
   return cohorts.map(cohort => {
+    const client = isRecord(tunables.client) ? tunables.client : {};
+    const transport = isRecord(tunables.transport) ? tunables.transport : {};
     const collector = isRecord(tunables.collector) ? tunables.collector : {};
+    const upload = isRecord(collector.upload) ? collector.upload : {};
     const batching = isRecord(collector.batching) ? collector.batching : {};
+    const maintenanceSeed = isRecord(tunables.maintenance) ? tunables.maintenance : {};
     for (const comparison of cohort.comparisons) {
       if (comparison.candidates.length > comparison.candidate_limit) throw new Error(cohort.id + '/' + comparison.id + ' exceeds its candidate limit');
     }
@@ -210,6 +214,7 @@ export function buildThroughputManifests(registry: unknown): JsonObject[] {
         accepted: ['uncompressed', 'snappy', 'gzip', 'brotli', 'lz4', 'lz4_raw', 'zstd'],
         configured: ['uncompressed', 'snappy', 'gzip', 'brotli', 'lz4_raw', 'zstd'],
         excluded: { lz4: 'legacy Hadoop framing; accepted for compatibility but excluded by campaign consumer/deprecation policy' },
+        pending: [],
         status: 'configured-not-runtime-screened',
       } } : {}),
       ...(cohort.id === 'C2' ? { parquet_enum_coverage: {
@@ -217,16 +222,19 @@ export function buildThroughputManifests(registry: unknown): JsonObject[] {
         accepted: ['plain', 'rle', 'delta_binary_packed', 'delta_length_byte_array', 'delta_byte_array', 'byte_stream_split'],
         configured: ['plain', 'delta_binary_packed', 'delta_length_byte_array', 'delta_byte_array', 'byte_stream_split'],
         excluded: { rle: 'BOOLEAN-only; frozen table has no Boolean column' },
+        pending: [],
         status: 'configured-not-runtime-screened',
       } } : {}),
       ...(cohort.id === 'C2' ? { source_enum_coverage: {
         dictionary_handling: {
           path: 'tunables.transport.dictionary_handling',
           accepted: ['hydrate', 'resend'],
-          configured: ['hydrate'],
+          configured: [],
+          baseline_requested: transport.dictionary_handling ?? null,
+          effective_default: 'hydrate (Tunables capability table)',
           excluded: { resend: 'Pinned Tunables validation rejects resend for the frozen plain DMV schema.' },
           pending: [],
-          status: 'config-screened-not-runtime-qualified',
+          status: 'source-screened-no-runtime-projection',
         },
       } } : {}),
       ...(cohort.id === 'C3' ? { source_enum_coverage: {
@@ -234,6 +242,7 @@ export function buildThroughputManifests(registry: unknown): JsonObject[] {
           path: 'tunables.collector.batching.age_flush_policy',
           accepted: ['immediate', 'drain_ready'],
           configured: ['immediate', 'drain_ready'],
+          baseline_requested: batching.age_flush_policy ?? null,
           excluded: {},
           pending: [],
           status: 'config-screened-not-runtime-qualified',
@@ -244,6 +253,7 @@ export function buildThroughputManifests(registry: unknown): JsonObject[] {
           path: 'tunables.client.data_mode',
           accepted: ['shared', 'independent'],
           configured: [],
+          baseline_requested: client.data_mode ?? null,
           excluded: {
             shared: 'Typed field has no environment projection or load-generator consumer in the pinned source.',
             independent: 'Typed field has no environment projection or load-generator consumer in the pinned source.',
@@ -255,6 +265,7 @@ export function buildThroughputManifests(registry: unknown): JsonObject[] {
           path: 'tunables.transport.ipc_compression',
           accepted: ['none', 'lz4_frame', 'zstd'],
           configured: ['none', 'lz4_frame', 'zstd'],
+          baseline_requested: transport.ipc_compression ?? null,
           excluded: {},
           pending: [],
           status: 'config-screened-not-runtime-qualified',
@@ -263,6 +274,10 @@ export function buildThroughputManifests(registry: unknown): JsonObject[] {
           path: 'tunables.transport.grpc_send_compression and grpc_accept_compression',
           accepted: ['none', 'gzip', 'zstd'],
           configured: [],
+          baseline_requested: {
+            send: transport.grpc_send_compression ?? null,
+            accept: transport.grpc_accept_compression ?? null,
+          },
           excluded: {
             none: 'Pinned capability table marks gRPC compression disabled; fields have no runtime projection/consumer.',
             gzip: 'Pinned capability table marks gRPC compression disabled; fields have no runtime projection/consumer.',
@@ -276,7 +291,9 @@ export function buildThroughputManifests(registry: unknown): JsonObject[] {
         collector_upload_mode: {
           path: 'tunables.collector.upload.mode',
           accepted: ['put_create', 'buffered_multipart'],
-          configured: ['put_create'],
+          configured: [],
+          baseline_requested: upload.mode ?? null,
+          effective_default: 'put_create',
           excluded: {
             buffered_multipart: 'Pinned capability table marks collector multipart upload unsupported because the backend lacks conditional completion; not a scored candidate.',
           },
@@ -289,6 +306,8 @@ export function buildThroughputManifests(registry: unknown): JsonObject[] {
           path: 'tunables.maintenance.input_read_strategy',
           accepted: ['memory', 'spool', 'range'],
           configured: ['memory', 'spool', 'range'],
+          baseline_requested: maintenanceSeed.input_read_strategy ?? null,
+          effective_default: 'memory',
           excluded: {},
           pending: [],
           status: 'config-screened-not-runtime-qualified',
@@ -297,6 +316,7 @@ export function buildThroughputManifests(registry: unknown): JsonObject[] {
           path: 'tunables.maintenance.granularity',
           accepted: ['minute', 'hour', 'day'],
           configured: ['minute', 'hour', 'day'],
+          baseline_requested: 'hour',
           excluded: {},
           pending: [],
           status: 'config-screened-not-runtime-qualified',
@@ -305,6 +325,8 @@ export function buildThroughputManifests(registry: unknown): JsonObject[] {
           path: 'tunables.maintenance.optimize_upload_mode',
           accepted: ['put_create', 'buffered_multipart'],
           configured: ['put_create', 'buffered_multipart'],
+          baseline_requested: maintenanceSeed.optimize_upload_mode ?? null,
+          effective_default: 'put_create',
           excluded: {},
           pending: [],
           coupled_setting: 'buffered_multipart candidate requests optimize_upload_buffer_bytes=8388608; source bounds are 4194304..67108864.',

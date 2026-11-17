@@ -268,11 +268,82 @@
     "excluded": {
       "lz4": "legacy Hadoop framing; accepted for compatibility but excluded by campaign consumer/deprecation policy"
     },
+    "pending": [],
     "status": "configured-not-runtime-screened"
   },
   "runnable": false,
   "config_validation": {
-    "status": "not-validated"
+    "status": "config-validated",
+    "validator": "arrowcol-oat-rust --validate-config",
+    "validator_source_commit": "5687e6459c424362f4504d21c32f954aa3b07d05",
+    "validator_binary_sha256": "9c5bc506371ba533ade8bc3477be17ade82cda2a3139988d23cf3219f0706901",
+    "baseline_count": 1,
+    "candidate_count": 8,
+    "pass_count": 9,
+    "fail_count": 0,
+    "configs": [
+      {
+        "kind": "baseline",
+        "path": "out/arrowcol-oat/sweep-configs/C1/baseline.json",
+        "sha256": "736db4ab230cd11d61d5500251efd28fa1886aaee50fc25d1636d62668f75e58"
+      },
+      {
+        "kind": "candidate",
+        "comparison": "codec",
+        "candidate": "uncompressed",
+        "path": "out/arrowcol-oat/sweep-configs/C1/codec/uncompressed.json",
+        "sha256": "a9c23b5a4430ef624324d241e49d4936be760c3d43079a2d2911973727aec796"
+      },
+      {
+        "kind": "candidate",
+        "comparison": "codec",
+        "candidate": "snappy",
+        "path": "out/arrowcol-oat/sweep-configs/C1/codec/snappy.json",
+        "sha256": "2dcd69f97a032c6385a389453717760b6b508da20aea2a68f4923dcec7518f49"
+      },
+      {
+        "kind": "candidate",
+        "comparison": "codec",
+        "candidate": "lz4-raw",
+        "path": "out/arrowcol-oat/sweep-configs/C1/codec/lz4-raw.json",
+        "sha256": "00b76ab120006cb9341aa1e796144b4d1781411ab5e96927536c56860b2d9eb0"
+      },
+      {
+        "kind": "candidate",
+        "comparison": "codec",
+        "candidate": "gzip",
+        "path": "out/arrowcol-oat/sweep-configs/C1/codec/gzip.json",
+        "sha256": "7154880ff79d6c99271d0538d0269d415496c6a22017aa5edd608c49e47f68b3"
+      },
+      {
+        "kind": "candidate",
+        "comparison": "codec",
+        "candidate": "brotli",
+        "path": "out/arrowcol-oat/sweep-configs/C1/codec/brotli.json",
+        "sha256": "b34363696f802464554c4218a85787a99229908f5c8fe8d47ac04b20a7ad5646"
+      },
+      {
+        "kind": "candidate",
+        "comparison": "codec",
+        "candidate": "zstd-1",
+        "path": "out/arrowcol-oat/sweep-configs/C1/codec/zstd-1.json",
+        "sha256": "77c89cac526dc4d653b3c124d09dcdea2ad342faab08db039eb10d6496d6db28"
+      },
+      {
+        "kind": "candidate",
+        "comparison": "codec",
+        "candidate": "zstd-3",
+        "path": "out/arrowcol-oat/sweep-configs/C1/codec/zstd-3.json",
+        "sha256": "736db4ab230cd11d61d5500251efd28fa1886aaee50fc25d1636d62668f75e58"
+      },
+      {
+        "kind": "candidate",
+        "comparison": "codec",
+        "candidate": "zstd-6",
+        "path": "out/arrowcol-oat/sweep-configs/C1/codec/zstd-6.json",
+        "sha256": "3a3d9d57c4c09fd3a10276805703709e014af2dadca31f18ac5abdbe25be0ee7"
+      }
+    ]
   },
   "runtime_qualification": "unqualified",
   "refinement": {

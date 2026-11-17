@@ -37,6 +37,7 @@ test('screens applicable BYTE_ARRAY encodings with an explicit matched plain con
     accepted: ['plain', 'rle', 'delta_binary_packed', 'delta_length_byte_array', 'delta_byte_array', 'byte_stream_split'],
     configured: ['plain', 'delta_binary_packed', 'delta_length_byte_array', 'delta_byte_array', 'byte_stream_split'],
     excluded: { rle: 'BOOLEAN-only; frozen table has no Boolean column' },
+    pending: [],
     status: 'configured-not-runtime-screened',
   });
 });
@@ -83,6 +84,7 @@ test('covers applicable enum factors and records unsupported typed values withou
       .find(item => item.id === id)!;
   const coverage = (cohort: string) => getManifest(cohort).source_enum_coverage as Record<string, {
     accepted: string[]; configured: string[]; excluded: Record<string, string>; pending: string[]; status: string;
+    baseline_requested?: unknown; effective_default?: string;
   }>;
   const renderWithout = (cohort: string, comparison: string, candidates: string[], paths: string[][]) =>
     candidates.map(candidate => {
@@ -136,17 +138,28 @@ test('covers applicable enum factors and records unsupported typed values withou
 
   const dictionary = coverage('C2').dictionary_handling;
   assert.deepEqual(dictionary.accepted, ['hydrate', 'resend']);
-  assert.deepEqual(dictionary.configured, ['hydrate']);
+  assert.deepEqual(dictionary.configured, []);
+  assert.equal(dictionary.baseline_requested, null);
+  assert.match(dictionary.effective_default!, /hydrate/);
   assert.match(dictionary.excluded.resend!, /plain DMV schema/);
   const clientAndTransport = coverage('C5');
   assert.deepEqual(clientAndTransport.ipc_compression.configured, ['none', 'lz4_frame', 'zstd']);
   assert.deepEqual(clientAndTransport.data_mode.configured, []);
   assert.deepEqual(Object.keys(clientAndTransport.data_mode.excluded).sort(), ['independent', 'shared']);
   assert.deepEqual(clientAndTransport.grpc_compression.configured, []);
+  assert.deepEqual(clientAndTransport.grpc_compression.baseline_requested, { send: null, accept: null });
   assert.deepEqual(Object.keys(clientAndTransport.grpc_compression.excluded).sort(), ['gzip', 'none', 'zstd']);
   const collectorUpload = coverage('C6').collector_upload_mode;
-  assert.deepEqual(collectorUpload.configured, ['put_create']);
+  assert.deepEqual(collectorUpload.configured, []);
+  assert.equal(collectorUpload.baseline_requested, null);
+  assert.equal(collectorUpload.effective_default, 'put_create');
   assert.match(collectorUpload.excluded.buffered_multipart!, /lacks conditional completion/);
+
+  const requested = buildThroughputManifests({ tunables: { transport: {
+    grpc_send_compression: 'gzip', grpc_accept_compression: 'zstd',
+  } } }).find(item => item.cohort === 'C5')!;
+  const requestedGrpc = (requested.source_enum_coverage as Record<string, { baseline_requested: Record<string, unknown> }>).grpc_compression;
+  assert.deepEqual(requestedGrpc.baseline_requested, { send: 'gzip', accept: 'zstd' });
 });
 
 test('generates bounded local single-writer manifests from the tunables registry', () => {
