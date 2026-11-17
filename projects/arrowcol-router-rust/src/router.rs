@@ -6,7 +6,7 @@ use arrowcol_protocol::NOT_ADMITTED_METADATA_KEY;
 use arrowcol_protocol::{
     CATALOG_METADATA_KEY, CLAIMED_SCHEMA_FINGERPRINT_METADATA_KEY, IMPLEMENTATION_POOL_METADATA_KEY,
     ImplementationPool, IngestMetadata, PROTOCOL_VERSION_METADATA_KEY, RawGrpcMetadata, SCHEMA_METADATA_KEY,
-    TABLE_METADATA_KEY, UnixMillis,
+    SHARD_INDEX_METADATA_KEY, TABLE_METADATA_KEY, UnixMillis,
 };
 use arrowcol_routing::{ControlOperation, ControlRoute, RouteAssignment, RouteSource, RoutingEngine, RoutingErrorKind};
 use async_trait::async_trait;
@@ -57,6 +57,7 @@ pub struct ProductionRouter {
     internal_signer: Arc<InternalIdentitySigner>,
     upstream: UpstreamConfig,
     metrics: RouterMetrics,
+    shard_count: u8,
 }
 
 impl ProductionRouter {
@@ -71,6 +72,21 @@ impl ProductionRouter {
         upstream: UpstreamConfig,
         metrics: RouterMetrics,
     ) -> Self {
+        Self::new_with_shard_count(routing, authenticator, edge_verifier, internal_signer, upstream, metrics, 1)
+    }
+
+    /// Creates the proxy application with its configured number of routing shards.
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn new_with_shard_count(
+        routing: Arc<RoutingEngine>,
+        authenticator: Arc<dyn Authenticator>,
+        edge_verifier: Arc<EdgeVerifier>,
+        internal_signer: Arc<InternalIdentitySigner>,
+        upstream: UpstreamConfig,
+        metrics: RouterMetrics,
+        shard_count: u8,
+    ) -> Self {
         Self {
             routing,
             authenticator,
@@ -78,6 +94,7 @@ impl ProductionRouter {
             internal_signer,
             upstream,
             metrics,
+            shard_count,
         }
     }
 
@@ -141,7 +158,7 @@ impl ProductionRouter {
         context.is_grpc = true;
 
         if request.uri.path() == DO_PUT_PATH {
-            let metadata = match parse_ingest_metadata(&request.headers) {
+            let metadata = match parse_ingest_metadata(&request.headers, self.shard_count) {
                 Ok(metadata) => metadata,
                 Err(message) => {
                     self.metrics.failure("doput", "unknown", "invalid_metadata");
@@ -724,16 +741,23 @@ pub fn build_server(
     Ok(server)
 }
 
-fn parse_ingest_metadata(headers: &http::HeaderMap) -> Result<IngestMetadata, String> {
+fn parse_ingest_metadata(headers: &http::HeaderMap, shard_count: u8) -> Result<IngestMetadata, String> {
     let raw = RawGrpcMetadata {
         protocol_version: ascii_header(headers, PROTOCOL_VERSION_METADATA_KEY)?,
         implementation_pool: ascii_header(headers, IMPLEMENTATION_POOL_METADATA_KEY)?,
         catalog: ascii_header(headers, CATALOG_METADATA_KEY)?,
         schema: ascii_header(headers, SCHEMA_METADATA_KEY)?,
         table: ascii_header(headers, TABLE_METADATA_KEY)?,
+        shard_index: ascii_header(headers, SHARD_INDEX_METADATA_KEY)?,
         claimed_schema_fingerprint: ascii_header(headers, CLAIMED_SCHEMA_FINGERPRINT_METADATA_KEY)?,
     };
-    IngestMetadata::parse(raw).map_err(|cause| cause.to_string())
+    let metadata = IngestMetadata::parse(raw).map_err(|cause| cause.to_string())?;
+    if metadata.shard_index() >= shard_count {
+        return Err(format!(
+            "gRPC metadata {SHARD_INDEX_METADATA_KEY} must be less than the configured shard_count"
+        ));
+    }
+    Ok(metadata)
 }
 
 fn parse_oat_run_id(headers: &http::HeaderMap) -> Result<Option<String>, String> {
@@ -788,6 +812,49 @@ mod oat_run_mode_tests {
         assert!(validate_oat_run_mode(Some("run-a"), Some("run-a")).is_ok());
         assert!(validate_oat_run_mode(Some("run-a"), None).is_err());
         assert!(validate_oat_run_mode(Some("run-a"), Some("run-b")).is_err());
+    }
+}
+
+#[cfg(test)]
+mod shard_metadata_tests {
+    use super::*;
+
+    fn valid_headers() -> http::HeaderMap {
+        let mut headers = http::HeaderMap::new();
+        for (key, value) in [
+            (PROTOCOL_VERSION_METADATA_KEY, "1"),
+            (IMPLEMENTATION_POOL_METADATA_KEY, "dataflow"),
+            (CATALOG_METADATA_KEY, "telemetry"),
+            (SCHEMA_METADATA_KEY, "prod"),
+            (TABLE_METADATA_KEY, "traces"),
+            (
+                CLAIMED_SCHEMA_FINGERPRINT_METADATA_KEY,
+                "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            ),
+        ] {
+            headers.insert(key, http::HeaderValue::from_static(value));
+        }
+        headers
+    }
+
+    #[test]
+    fn absent_shard_defaults_to_zero_and_explicit_shard_must_be_in_range() {
+        let mut headers = valid_headers();
+        assert_eq!(parse_ingest_metadata(&headers, 1).unwrap().shard_index(), 0);
+
+        headers.insert(SHARD_INDEX_METADATA_KEY, http::HeaderValue::from_static("1"));
+        assert_eq!(parse_ingest_metadata(&headers, 2).unwrap().shard_index(), 1);
+        assert!(parse_ingest_metadata(&headers, 1).is_err());
+    }
+
+    #[test]
+    fn configured_maximum_shard_is_accepted_but_next_index_is_rejected() {
+        let mut headers = valid_headers();
+        headers.insert(SHARD_INDEX_METADATA_KEY, http::HeaderValue::from_static("31"));
+        assert_eq!(parse_ingest_metadata(&headers, 32).unwrap().shard_index(), 31);
+
+        headers.insert(SHARD_INDEX_METADATA_KEY, http::HeaderValue::from_static("32"));
+        assert!(parse_ingest_metadata(&headers, 32).is_err());
     }
 }
 

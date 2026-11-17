@@ -143,6 +143,7 @@ const CAPABILITIES: &[Capability] = &[
     capability!("router.oat_run_pin_ttl_ms", "consumer default"),
     capability!("router.readiness_max_staleness_ms", "30000"),
     capability!("router.distinct_table_owners", "false"),
+    capability!("router.shard_count", "1; inclusive range 1..=32"),
     capability!("router.edge_replay_max_nonces", "consumer default"),
     capability!("router.upstream_max_h2_streams", "128"),
     capability!("router.upstream_stream_window_bytes", "1048576"),
@@ -652,6 +653,11 @@ impl Tunables {
                 canonicalize(serde_json::to_value(writer)?).to_string(),
             );
         }
+        if matches!(role, ComponentRole::Client)
+            && let Some(shard_count) = self.router.as_ref().and_then(|router| router.shard_count)
+        {
+            selected.insert("ARROWCOL_CLIENT_SHARD_COUNT".to_owned(), shard_count.to_string());
+        }
         if matches!(role, ComponentRole::Router) {
             let level = self
                 .logging
@@ -866,6 +872,9 @@ impl Tunables {
 
 fn validate_router(router: Option<&RouterTunables>) -> Result<()> {
     let router = router.cloned().unwrap_or_default();
+    if router.shard_count.is_some_and(|count| !(1..=32).contains(&count)) {
+        bail!("router.shard_count must be between 1 and 32");
+    }
     for (name, value, minimum, maximum) in [
         ("workers", router.workers, 1, 256),
         ("listener_tasks_per_fd", router.listener_tasks_per_fd, 1, 64),
@@ -2482,6 +2491,7 @@ mod tests {
                 refresh_interval_ms: Some(2_000),
                 upstream_ping_interval_seconds: Some(0),
                 upstream_idle_timeout_seconds: Some(0),
+                shard_count: Some(4),
                 ..Default::default()
             }),
             ..Default::default()
@@ -2498,9 +2508,13 @@ mod tests {
         assert_eq!(env["ARROWCOL_ROUTER_SQL_POOL_ACQUIRE_TIMEOUT_MS"], "2500");
         assert_eq!(env["RUST_LOG"], "warn,tiberius=error");
         assert_eq!(env["ARROWCOL_ROUTER_REFRESH_INTERVAL_MS"], "2000");
+        assert_eq!(env["ARROWCOL_ROUTER_SHARD_COUNT"], "4");
         assert_eq!(env["ARROWCOL_ROUTER_UPSTREAM_PING_INTERVAL_SECONDS"], "0");
         assert_eq!(env["ARROWCOL_ROUTER_UPSTREAM_IDLE_TIMEOUT_SECONDS"], "0");
         assert!(!env.contains_key("ARROWCOL_ROUTER_WORKER_THREADS"));
+        let client_env = config.environment_for(ComponentRole::Client)?;
+        assert_eq!(client_env["ARROWCOL_CLIENT_SHARD_COUNT"], "4");
+        assert!(!client_env.contains_key("ARROWCOL_ROUTER_SHARD_COUNT"));
 
         let invalid = Tunables {
             router: Some(RouterTunables {
@@ -2521,6 +2535,25 @@ mod tests {
         };
         assert!(error_text(invalid_idle_timeout.validate()).contains("between 0 and 86400"));
         Ok(())
+    }
+
+    #[test]
+    fn shard_count_rejects_out_of_range_and_non_numeric_oat_values() {
+        for value in [serde_json::json!(0), serde_json::json!(33)] {
+            assert!(Tunables::parse_oat_json(serde_json::json!({
+                "router": { "shard_count": value }
+            })).is_err());
+        }
+        for value in [
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("4"),
+            serde_json::json!(256),
+        ] {
+            assert!(Tunables::parse_oat_json(serde_json::json!({
+                "router": { "shard_count": value }
+            })).is_err());
+        }
     }
 
     #[test]

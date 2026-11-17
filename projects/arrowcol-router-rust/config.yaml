@@ -33,6 +33,7 @@ routing:
   minimum_warmup_bps: 1000
   lease_ttl_ms: 30000
   readiness_max_staleness_ms: 30000
+  shard_count: 1
 
 auth:
   authenticator: dev_only_allow_all

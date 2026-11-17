@@ -123,6 +123,7 @@ pub struct RouterTunables {
     pub oat_run_pin_ttl_ms: Option<u64>,
     pub readiness_max_staleness_ms: Option<u64>,
     pub distinct_table_owners: Option<bool>,
+    pub shard_count: Option<u8>,
     pub edge_replay_max_nonces: Option<usize>,
     pub upstream_max_h2_streams: Option<usize>,
     pub upstream_stream_window_bytes: Option<u32>,

@@ -85,13 +85,14 @@ fn main() -> Result<()> {
         internal_secret,
         config.auth.internal_identity_ttl_ms,
     )?);
-    let router = ProductionRouter::new(
+    let router = ProductionRouter::new_with_shard_count(
         Arc::clone(&routing),
         authenticator,
         edge_verifier,
         internal_signer,
         config.upstream.clone(),
         metrics.clone(),
+        config.routing.shard_count,
     );
     let control_loop = RouterControlLoop::new(
         routing,
@@ -137,6 +138,7 @@ fn emit_effective_config(config: &RouterConfig, log_filter_source: &str) {
             "oat_run_pin_ttl_ms": config.routing.oat_run_pin_ttl_ms,
             "readiness_max_staleness_ms": config.routing.readiness_max_staleness_ms,
             "distinct_table_owners": config.routing.distinct_table_owners,
+            "shard_count": config.routing.shard_count,
         },
         "edge_replay_max_nonces": config.auth.edge_replay_max_nonces,
         "upstream": {

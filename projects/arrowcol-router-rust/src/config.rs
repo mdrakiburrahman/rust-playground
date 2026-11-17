@@ -77,6 +77,8 @@ pub struct RouterOverrides {
     #[arg(long, action = clap::ArgAction::Set)]
     pub distinct_table_owners: Option<bool>,
     #[arg(long)]
+    pub shard_count: Option<u8>,
+    #[arg(long)]
     pub edge_replay_max_nonces: Option<usize>,
     #[arg(long)]
     pub upstream_max_h2_streams: Option<usize>,
@@ -215,6 +217,10 @@ impl RouterConfig {
         ensure!(
             !self.sql_server.password_file.as_os_str().is_empty(),
             "sql_server.password_file must not be empty"
+        );
+        ensure!(
+            (1..=32).contains(&self.routing.shard_count),
+            "routing.shard_count must be between 1 and 32"
         );
         ensure!(
             self.routing.refresh_interval_ms > 0,
@@ -410,6 +416,11 @@ fn apply_environment_overrides(
         bool
     );
     set_from_env!(
+        &mut config.routing.shard_count,
+        "ARROWCOL_ROUTER_SHARD_COUNT",
+        u8
+    );
+    set_from_env!(
         &mut config.auth.edge_replay_max_nonces,
         "ARROWCOL_ROUTER_EDGE_REPLAY_MAX_NONCES",
         usize
@@ -499,6 +510,7 @@ fn apply_cli_overrides(config: &mut RouterConfig, overrides: &RouterOverrides) {
     set_from_cli!(oat_run_pin_ttl_ms, config.routing.oat_run_pin_ttl_ms);
     set_from_cli!(readiness_max_staleness_ms, config.routing.readiness_max_staleness_ms);
     set_from_cli!(distinct_table_owners, config.routing.distinct_table_owners);
+    set_from_cli!(shard_count, config.routing.shard_count);
     set_from_cli!(edge_replay_max_nonces, config.auth.edge_replay_max_nonces);
     set_from_cli!(upstream_max_h2_streams, config.upstream.max_h2_streams);
     set_from_cli!(upstream_stream_window_bytes, config.upstream.stream_window_bytes);
@@ -626,6 +638,13 @@ pub struct RoutingConfig {
     /// Require each active table lease in a pool to have a distinct collector.
     #[serde(default)]
     pub distinct_table_owners: bool,
+    /// Number of zero-based routing shards for every table.
+    #[serde(default = "default_shard_count")]
+    pub shard_count: u8,
+}
+
+fn default_shard_count() -> u8 {
+    1
 }
 
 impl RoutingConfig {
@@ -786,12 +805,24 @@ mod routing_policy_tests {
         let defaults = RouterConfig::from_yaml(include_bytes!("../config.yaml"))
             .unwrap_or_else(|error| panic!("parse default router configuration: {error}"));
         assert!(!defaults.routing.distinct_table_owners);
+        assert_eq!(defaults.routing.shard_count, 1);
 
         let loadtest: serde_yaml::Value = serde_yaml::from_slice(include_bytes!("../../loadtest/config/router.yaml"))
             .unwrap_or_else(|error| panic!("parse loadtest router configuration: {error}"));
         let routing: RoutingConfig = serde_yaml::from_value(loadtest["routing"].clone())
             .unwrap_or_else(|error| panic!("parse loadtest routing policy: {error}"));
         assert!(!routing.distinct_table_owners);
+    }
+
+    #[test]
+    fn shard_count_is_bounded_by_router_config() {
+        let defaults = RouterConfig::from_yaml(include_bytes!("../config.yaml"))
+            .unwrap_or_else(|error| panic!("parse default router configuration: {error}"));
+        for shard_count in [0, 33] {
+            let mut invalid = defaults.clone();
+            invalid.routing.shard_count = shard_count;
+            assert!(invalid.validate().is_err());
+        }
     }
 
     #[test]
@@ -802,6 +833,8 @@ mod routing_policy_tests {
             "8",
             "--upstream-ping-interval-seconds",
             "0",
+            "--shard-count",
+            "4",
             "--sql-pool-max-size",
             "64",
             "--sql-pool-acquire-timeout-ms",
@@ -820,6 +853,7 @@ mod routing_policy_tests {
             .unwrap_or_else(|error| panic!("validate router CLI overrides: {error}"));
         assert_eq!(config.server.threads, 8);
         assert_eq!(config.upstream.ping_interval_seconds, None);
+        assert_eq!(config.routing.shard_count, 4);
         assert_eq!(config.sql_server.sql_pool_max_size, 64);
         assert_eq!(config.sql_server.sql_pool_acquire_timeout_ms, 2_500);
         assert_eq!(config.telemetry.log_filter, "debug,tiberius=error");
@@ -843,6 +877,7 @@ mod routing_policy_tests {
             ("ARROWCOL_ROUTER_H2_MAX_CONCURRENT_STREAMS", "512"),
             ("ARROWCOL_ROUTER_UPSTREAM_PING_INTERVAL_SECONDS", "0"),
             ("ARROWCOL_ROUTER_DISTINCT_TABLE_OWNERS", "true"),
+            ("ARROWCOL_ROUTER_SHARD_COUNT", "5"),
             ("ARROWCOL_ROUTER_SQL_POOL_MAX_SIZE", "32"),
             ("ARROWCOL_ROUTER_SQL_POOL_ACQUIRE_TIMEOUT_MS", "1500"),
             ("RUST_LOG", "info,tiberius=error"),
@@ -866,6 +901,7 @@ mod routing_policy_tests {
         assert_eq!(config.sql_server.sql_pool_acquire_timeout_ms, 1_500);
         assert_eq!(config.telemetry.log_filter, "info,tiberius=error");
         assert!(config.routing.distinct_table_owners);
+        assert_eq!(config.routing.shard_count, 5);
         assert_eq!(
             config.routing.excluded_admission_gauges,
             vec![AdmissionPressureGauge::CpuUtilizationBps]

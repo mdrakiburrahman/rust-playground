@@ -33,6 +33,7 @@
 
 | Setting | Contract |
 | --- | --- |
+| `router.shard_count` | Strict integer `1..=32`, default `1`. One configured count is projected to the router and client; absent `x-arrowcol-shard` selects shard `0`, and explicit shard indices must be less than the configured count. |
 | `router.sql_pool_max_size` | Env `ARROWCOL_ROUTER_SQL_POOL_MAX_SIZE`, CLI `--sql-pool-max-size`; default `0` (unpooled, matching main), valid `0..=1024`. A positive value enables the shared pool. |
 | `router.sql_pool_acquire_timeout_ms` | Env `ARROWCOL_ROUTER_SQL_POOL_ACQUIRE_TIMEOUT_MS`, CLI `--sql-pool-acquire-timeout-ms`; defaults to `10000` in the router when pooling is enabled, valid `1..=600000`, and requires a positive pool size when explicitly set. |
 | `router.max_future_skew_ms` | Default `2000`; increasing it permits more future-dated pressure observations, weakening the clock-skew guard. It does not repair stale observations or expired ownership. |
