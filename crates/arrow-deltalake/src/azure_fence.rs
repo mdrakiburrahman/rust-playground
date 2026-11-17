@@ -20,8 +20,6 @@ use reqwest::{Method, StatusCode};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt;
-#[cfg(test)]
-use std::sync::Arc;
 use std::sync::Arc;
 use std::time::Duration;
 

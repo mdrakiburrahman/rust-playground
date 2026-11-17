@@ -6,6 +6,11 @@
 //! returning its result. A cancelled attempt may leave an unmatched request;
 //! consumers must treat unmatched requests as incomplete attribution.
 //! Traced clients disable redirects: canonical Azure endpoints are required.
+//!
+//! [`StorageBridge`] is an explicit, zero-row fixture transport using dedicated
+//! sequential NDJSON pipes. Its parent owns authentication and effect admission.
+//! It never enables itself from environment configuration, performs direct network
+//! fallback, or grants provider execution clearance. Its original deadline includes drain.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
@@ -129,7 +134,7 @@ mod storage_bridge {
 
     #[derive(Deserialize)]
     #[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
-    enum Response {
+    enum Reply {
         Response {
             schema_version: u8,
             kind: String,
@@ -526,14 +531,17 @@ mod storage_bridge {
             let Ok(Ok(reply)) = result else {
                 return Outcome::Unknown(Code::ResponseLost);
             };
-            let Ok(response) = serde_json::from_slice::<Response>(&reply) else {
+            if Instant::now() >= deadline {
+                return Outcome::Unknown(Code::DeadlineExceeded);
+            }
+            let Ok(response) = serde_json::from_slice::<Reply>(&reply) else {
                 return Outcome::Unknown(Code::Protocol);
             };
             let matches = |version, kind: &str, id, hash: &str| {
                 version == 1 && kind == "storage_http_response" && id == state.next_id - 1 && hash == request_sha256
             };
             match response {
-                Response::Response {
+                Reply::Response {
                     schema_version,
                     kind,
                     request_id,
@@ -549,7 +557,7 @@ mod storage_bridge {
                         || body.len() > MAX_BODY
                         || digest(body.as_bytes()) != body_sha256
                         || !(200..=599).contains(&status)
-                        || (300..=399).contains(&status)
+                        || ((300..=399).contains(&status) && status != 304)
                     {
                         return Outcome::Unknown(Code::Protocol);
                     }
@@ -576,7 +584,7 @@ mod storage_bridge {
                     state.poisoned = false;
                     Outcome::Response(response)
                 }
-                Response::DefinitelyNotSent {
+                Reply::DefinitelyNotSent {
                     schema_version,
                     kind,
                     request_id,
@@ -598,7 +606,7 @@ mod storage_bridge {
                     state.poisoned = false;
                     Outcome::NotSent(error_code)
                 }
-                Response::Unknown {
+                Reply::Unknown {
                     schema_version,
                     kind,
                     request_id,
@@ -637,7 +645,7 @@ mod storage_bridge {
         use super::*;
         use crate::publisher::PublisherSession;
         use futures::TryStreamExt;
-        use object_store::{ObjectStore, PutMode, PutOptions};
+        use object_store::{ObjectStoreExt, PutMode, PutOptions};
         use serde_json::{Value, json};
         use tokio::io::{AsyncReadExt, DuplexStream};
         use tokio::sync::Notify;
@@ -793,10 +801,17 @@ mod storage_bridge {
                         unreachable!();
                     }
                     anyhow::ensure!(headers.iter().any(|(k, v)| k == "if-none-match" && v == "*"));
-                    state.object = Some(request["body"].as_str().ok_or_else(invalid)?.to_owned());
-                    status = 201;
-                    output_headers.push(("etag".into(), "\"offline-object\"".into()));
-                    output_headers.push(("last-modified".into(), "Tue, 17 Nov 2026 03:00:00 GMT".into()));
+                    if state.object.is_some() {
+                        status = 409;
+                        output_headers.push(("x-ms-error-code".into(), "BlobAlreadyExists".into()));
+                        body =
+                            "<Error><Code>BlobAlreadyExists</Code><Message>offline collision</Message></Error>".into();
+                    } else {
+                        state.object = Some(request["body"].as_str().ok_or_else(invalid)?.to_owned());
+                        status = 201;
+                        output_headers.push(("etag".into(), "\"offline-object\"".into()));
+                        output_headers.push(("last-modified".into(), "Tue, 17 Nov 2026 03:00:00 GMT".into()));
+                    }
                 } else if url.query_pairs().any(|(key, value)| key == "comp" && value == "list") {
                     body = "<?xml version=\"1.0\"?><EnumerationResults ServiceEndpoint=\"https://offlineaccount.blob.core.windows.net\" ContainerName=\"data\"><Blobs></Blobs><NextMarker /></EnumerationResults>".into();
                 } else if let Some(object) = &state.object {
@@ -842,6 +857,19 @@ mod storage_bridge {
                 )
                 .await?;
             assert!(store.get(&path).await?.bytes().await?.starts_with(b"{"));
+            assert!(matches!(
+                store
+                    .put_opts(
+                        &path,
+                        "must-not-replace".into(),
+                        PutOptions {
+                            mode: PutMode::Create,
+                            ..Default::default()
+                        }
+                    )
+                    .await,
+                Err(object_store::Error::AlreadyExists { .. })
+            ));
             session.close_after_drain_async().await?;
             let state = fixture.lock().await;
             assert!(state.metadata["publishers"].contains(UNRELATED));
@@ -1010,6 +1038,72 @@ mod storage_bridge {
                 expired.exchange(head()?, "control").await,
                 Outcome::NotSent(Code::DeadlineExceeded)
             ));
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn positive_not_sent_is_distinct_from_unknown_and_does_not_reset_budget() -> anyhow::Result<()> {
+            let (bridge, parent) = bridge(5_000)?;
+            let original = bridge.original_deadline_unix_ms;
+            let (read, mut write) = tokio::io::split(parent);
+            let server = tokio::spawn(async move {
+                let mut reader = BufReader::new(read);
+                for id in 1..=2 {
+                    let request = read_request(&mut reader).await?;
+                    anyhow::ensure!(request["request_id"] == id);
+                    anyhow::ensure!(request["original_deadline_unix_ms"] == original);
+                    let reply = json!({
+                        "schema_version":1,"kind":"storage_http_response",
+                        "request_id":request["request_id"],"request_sha256":request["request_sha256"],
+                        "outcome":"definitely_not_sent","error_code":"admission_refused"
+                    });
+                    write.write_all(&serde_json::to_vec(&reply)?).await?;
+                    write.write_all(b"\n").await?;
+                }
+                Ok::<_, anyhow::Error>(())
+            });
+            for _ in 0..2 {
+                assert!(matches!(
+                    bridge.exchange(head()?, "control").await,
+                    Outcome::NotSent(Code::AdmissionRefused)
+                ));
+            }
+            server.await??;
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn stale_or_fenced_authority_never_enrolls_and_expired_drain_retains_member() -> anyhow::Result<()> {
+            for (field, value) in [("resetstate", "fenced-v1"), ("resetgeneration", UNRELATED)] {
+                let (bridge, parent) = bridge(5_000)?;
+                let mut state = Fixture::ready();
+                state.metadata.insert(field.into(), value.into());
+                if field == "resetgeneration" {
+                    state.metadata.insert("publishers".into(), "{}".into());
+                }
+                let fixture = Arc::new(Mutex::new(state));
+                let server = tokio::spawn(serve(parent, Arc::clone(&fixture), None));
+                assert!(
+                    PublisherSession::open_bridged_async(&Url::parse(ROOT)?, bridge)
+                        .await
+                        .is_err()
+                );
+                assert!(fixture.lock().await.requests.iter().all(|r| r["method"] == "HEAD"));
+                server.abort();
+            }
+            let (bridge, parent) = bridge(1_000)?;
+            let end = bridge.deadline;
+            let fixture = Arc::new(Mutex::new(Fixture::ready()));
+            let server = tokio::spawn(serve(parent, Arc::clone(&fixture), None));
+            let session = PublisherSession::open_bridged_async(&Url::parse(ROOT)?, bridge).await?;
+            let member = session.publisher_id().ok_or_else(invalid)?.to_string();
+            let count = fixture.lock().await.requests.len();
+            tokio::time::sleep_until(end + Duration::from_millis(1)).await;
+            assert!(session.close_after_drain_async().await.is_err());
+            let state = fixture.lock().await;
+            assert_eq!(state.requests.len(), count);
+            assert!(state.metadata["publishers"].contains(&member));
+            server.abort();
             Ok(())
         }
     }
