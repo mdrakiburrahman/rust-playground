@@ -2500,6 +2500,38 @@ fn resolve_optimize_layout(config: &OptimizeConfig, schema: &SchemaRef) -> Resul
     }
 }
 
+fn optimize_files_fingerprint(
+    table_id: &str,
+    partition_values: &BTreeMap<String, Option<String>>,
+    files: &[DataFile],
+) -> Result<String> {
+    let mut files = files.to_vec();
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    let digest = sha2::Sha256::digest(serde_json::to_vec(&(table_id, partition_values, files))?);
+    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn optimize_no_benefit_proof(
+    state: &ActiveState,
+    bin: &OptimizeBin,
+    output_policy_fingerprint: &str,
+) -> Result<OptimizeNoBenefitProof> {
+    let partition_files = state
+        .files
+        .iter()
+        .filter(|file| file.partition_values == bin.partition_values)
+        .cloned()
+        .collect::<Vec<_>>();
+    Ok(OptimizeNoBenefitProof {
+        output_policy_fingerprint: output_policy_fingerprint.to_owned(),
+        partition_fingerprint: optimize_files_fingerprint(
+            &state.fingerprint.table_id,
+            &bin.partition_values,
+            &partition_files,
+        )?,
+        bin_fingerprint: optimize_files_fingerprint(&state.fingerprint.table_id, &bin.partition_values, &bin.files)?,
+    })
+}
 fn optimize_output_policy_fingerprint(
     config: &OptimizeConfig,
     layout: Option<&LayoutPolicy>,
@@ -2942,10 +2974,26 @@ impl DeltaTable {
             Ok(())
         };
         still_active(&state, &plan.bins.iter().collect::<Vec<_>>())?;
+        let no_benefit_record = self.read_record::<OptimizeNoBenefitRecord>(OPTIMIZE_NO_BENEFIT_RECORD)?;
+        if let Some(record) = &no_benefit_record {
+            record.validate()?;
+        }
+        let output_policy_fingerprint = plan
+            .output_policy_fingerprint
+            .as_deref()
+            .context("missing output policy fingerprint")?;
         let mut outputs = Vec::new();
         let mut kept: Vec<&OptimizeBin> = Vec::new();
         let mut actions = 0_usize;
         for bin in &plan.bins {
+            let proof = optimize_no_benefit_proof(&state, bin, output_policy_fingerprint)?;
+            if no_benefit_record
+                .as_ref()
+                .is_some_and(|record| record.table_id == state.fingerprint.table_id && record.proofs.contains(&proof))
+            {
+                report.nonbeneficial_bins += 1;
+                continue;
+            }
             let written = match self.rewrite_bin(
                 &state.snapshot,
                 bin,
@@ -2983,6 +3031,9 @@ impl DeltaTable {
                         format!("dropping an unpublishable rewrite failed: {cleanup}"),
                     );
                     return Err(self.discard_after(&outputs, error, &mut report));
+                }
+                if !beneficial {
+                    self.record_optimize_no_benefit_proof(&state.fingerprint.table_id, proof)?;
                 }
                 continue;
             }
@@ -5108,6 +5159,34 @@ pub const MAINTENANCE_DIR: &str = "_arrowcol_maintenance";
 pub const VACUUM_PROGRESS_RECORD: &str = "vacuum-lite.json";
 /// Durable log floor record under [`MAINTENANCE_DIR`].
 pub const LOG_FLOOR_RECORD: &str = "log-floor.json";
+/// Durable proof that a specific active input set did not reduce file count.
+pub const OPTIMIZE_NO_BENEFIT_RECORD: &str = "optimize-no-benefit.json";
+const MAX_OPTIMIZE_NO_BENEFIT_PROOFS: usize = 128;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct OptimizeNoBenefitProof {
+    output_policy_fingerprint: String,
+    partition_fingerprint: String,
+    bin_fingerprint: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct OptimizeNoBenefitRecord {
+    table_id: String,
+    proofs: Vec<OptimizeNoBenefitProof>,
+}
+
+impl OptimizeNoBenefitRecord {
+    fn validate(&self) -> Result<()> {
+        if self.proofs.len() > MAX_OPTIMIZE_NO_BENEFIT_PROOFS {
+            return Err(fail(
+                MaintenanceErrorKind::ResourceLimit,
+                "OPTIMIZE no-benefit record exceeds its proof bound",
+            ));
+        }
+        Ok(())
+    }
+}
 /// Default `delta.logRetentionDuration` (30 days).
 pub const DEFAULT_LOG_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 /// Default read bound for one checkpoint file.
@@ -5698,6 +5777,31 @@ impl DeltaTable {
         self.read_record(LOG_FLOOR_RECORD)
     }
 
+    fn record_optimize_no_benefit_proof(&self, table_id: &str, proof: OptimizeNoBenefitProof) -> Result<()> {
+        self.update_record(
+            OPTIMIZE_NO_BENEFIT_RECORD,
+            |current: Option<&OptimizeNoBenefitRecord>| {
+                if let Some(current) = current {
+                    current.validate()?;
+                }
+                let mut next = match current.filter(|record| record.table_id == table_id) {
+                    Some(current) => current.clone(),
+                    None => OptimizeNoBenefitRecord {
+                        table_id: table_id.to_owned(),
+                        proofs: Vec::new(),
+                    },
+                };
+                if next.proofs.contains(&proof) {
+                    return Ok(None);
+                }
+                next.proofs.push(proof.clone());
+                if next.proofs.len() > MAX_OPTIMIZE_NO_BENEFIT_PROOFS {
+                    next.proofs.remove(0);
+                }
+                Ok(Some(next))
+            },
+        )
+    }
     fn read_record<T: serde::de::DeserializeOwned>(&self, name: &str) -> Result<Option<T>> {
         let path = self.object_path(&format!("{MAINTENANCE_DIR}/{name}"))?;
         let fetched = shared_executor()?.block_on(fetch_record(Arc::clone(&self.store), path))?;

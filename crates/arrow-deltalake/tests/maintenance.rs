@@ -2072,9 +2072,7 @@ fn optimize_byte_limited_partial_outputs_do_not_churn_until_candidates_change() 
         customer_schema(),
         vec![INGESTION_PARTITION.into()],
     )?;
-    let wide_values: Vec<String> = (0..4)
-        .map(|index| format!("{index}{}", "x".repeat(299_999)))
-        .collect();
+    let wide_values: Vec<String> = (0..4).map(|index| format!("{index}{}", "x".repeat(299_999))).collect();
     let sample = RecordBatch::try_new(
         customer_schema(),
         vec![
