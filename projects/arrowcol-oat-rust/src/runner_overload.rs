@@ -221,6 +221,110 @@ impl GuardEngine {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct ScaleOutCollectorIdentity {
+    pod: String,
+    pod_uid: String,
+    replica_set_uid: String,
+    container_id: String,
+}
+
+fn controlling_owner(value: &Value, kind: &str) -> Result<(String, String)> {
+    let owners = value.pointer("/metadata/ownerReferences").and_then(Value::as_array)
+        .context("Kubernetes owner references missing")?;
+    let controllers = owners.iter().filter(|owner| owner["controller"] == true).collect::<Vec<_>>();
+    let [owner] = controllers.as_slice() else {
+        bail!("Kubernetes object must have exactly one controlling owner");
+    };
+    if owner["kind"] != kind {
+        bail!("Kubernetes controlling owner kind mismatched");
+    }
+    let field = |key| owner[key].as_str().filter(|value| !value.is_empty())
+        .map(str::to_owned).context("Kubernetes controlling owner identity missing");
+    Ok((field("name")?, field("uid")?))
+}
+
+fn scale_out_collector_identities(
+    namespace: &str,
+    container: &str,
+    expected_replicas: u32,
+    deployment: &Value,
+    replica_sets: &Value,
+    pods: &Value,
+) -> Result<Vec<ScaleOutCollectorIdentity>> {
+    if !(1..=16).contains(&expected_replicas) || !rollout_generation_ready(deployment)
+        || deployment.pointer("/spec/replicas").and_then(Value::as_u64) != Some(u64::from(expected_replicas))
+        || deployment.pointer("/metadata/namespace").and_then(Value::as_str) != Some(namespace)
+    {
+        bail!("collector deployment does not match the ready expected topology");
+    }
+    let deployment_name = deployment.pointer("/metadata/name").and_then(Value::as_str)
+        .filter(|value| !value.is_empty()).context("collector deployment name missing")?;
+    let deployment_uid = deployment.pointer("/metadata/uid").and_then(Value::as_str)
+        .filter(|value| !value.is_empty()).context("collector deployment UID missing")?;
+    let labels = deployment.pointer("/spec/selector/matchLabels").and_then(Value::as_object)
+        .filter(|value| !value.is_empty()).context("collector deployment selector missing")?;
+    let mut owned_sets = BTreeMap::new();
+    for replica_set in replica_sets["items"].as_array().context("replica set inventory missing")? {
+        if replica_set.pointer("/metadata/namespace").and_then(Value::as_str) != Some(namespace) {
+            continue;
+        }
+        if controlling_owner(replica_set, "Deployment").ok().as_ref()
+            != Some(&(deployment_name.to_owned(), deployment_uid.to_owned())) {
+            continue;
+        }
+        let name = replica_set.pointer("/metadata/name").and_then(Value::as_str)
+            .filter(|value| !value.is_empty()).context("replica set name missing")?;
+        let uid = replica_set.pointer("/metadata/uid").and_then(Value::as_str)
+            .filter(|value| !value.is_empty()).context("replica set UID missing")?;
+        if owned_sets.insert(uid.to_owned(), name.to_owned()).is_some() {
+            bail!("duplicate replica set UID");
+        }
+    }
+    let items = pods["items"].as_array().context("collector pod inventory missing")?;
+    if items.len() != expected_replicas as usize {
+        bail!("collector pod count differs from the selected cell");
+    }
+    let mut identities = Vec::with_capacity(items.len());
+    for pod in items {
+        if pod.pointer("/metadata/namespace").and_then(Value::as_str) != Some(namespace)
+            || !pod.pointer("/metadata/deletionTimestamp").is_none_or(Value::is_null)
+            || !labels.iter().all(|(key, value)| pod.pointer("/metadata/labels").and_then(Value::as_object)
+                .and_then(|pod_labels| pod_labels.get(key)) == Some(value))
+        {
+            bail!("collector pod namespace, selector or lifecycle mismatched");
+        }
+        let (owner_name, owner_uid) = controlling_owner(pod, "ReplicaSet")?;
+        if owned_sets.get(&owner_uid) != Some(&owner_name) {
+            bail!("collector pod is not owned by the selected deployment");
+        }
+        let name = pod.pointer("/metadata/name").and_then(Value::as_str)
+            .filter(|value| !value.is_empty()).context("collector pod name missing")?;
+        let uid = pod.pointer("/metadata/uid").and_then(Value::as_str)
+            .filter(|value| !value.is_empty()).context("collector pod UID missing")?;
+        let statuses = pod.pointer("/status/containerStatuses").and_then(Value::as_array)
+            .context("collector container statuses missing")?.iter()
+            .filter(|status| status["name"] == container).collect::<Vec<_>>();
+        let [status] = statuses.as_slice() else { bail!("collector container status is missing or ambiguous") };
+        if status["ready"] != true || status["restartCount"].as_u64() != Some(0)
+            || !status.pointer("/state/running").is_some_and(Value::is_object) {
+            bail!("collector container is not ready or has restarted");
+        }
+        let container_id = status["containerID"].as_str().filter(|value| !value.is_empty())
+            .context("collector container ID missing")?;
+        identities.push(ScaleOutCollectorIdentity {
+            pod: name.to_owned(), pod_uid: uid.to_owned(), replica_set_uid: owner_uid, container_id: container_id.to_owned(),
+        });
+    }
+    identities.sort();
+    if identities.iter().map(|value| &value.pod_uid).collect::<HashSet<_>>().len() != identities.len()
+        || identities.iter().map(|value| &value.pod).collect::<HashSet<_>>().len() != identities.len()
+        || identities.iter().map(|value| &value.container_id).collect::<HashSet<_>>().len() != identities.len() {
+        bail!("collector identities are not unique");
+    }
+    Ok(identities)
+}
+
 struct GuardProbe {
     instance_id: String,
     rss_cap: u64,
@@ -483,6 +587,53 @@ enum GuardSignal {
 #[cfg(test)]
 mod overload_guard_tests {
     use super::*;
+
+    #[test]
+    fn scale_out_collector_set_requires_complete_owned_unrestarted_pods() -> Result<()> {
+        let deployment = json!({
+            "metadata":{"name":"collector","namespace":"run","uid":"deployment","generation":1},
+            "spec":{"replicas":2,"selector":{"matchLabels":{"app":"collector"}}},
+            "status":{"observedGeneration":1,"updatedReplicas":2,"replicas":2,"availableReplicas":2}
+        });
+        let replica_sets = json!({"items":[{
+            "metadata":{"name":"rs","namespace":"run","uid":"rs-uid","ownerReferences":[
+                {"kind":"Deployment","name":"collector","uid":"deployment","controller":true}
+            ]}
+        }]});
+        let pod = |index| json!({
+            "metadata":{"name":format!("pod-{index}"),"namespace":"run","uid":format!("uid-{index}"),
+                "labels":{"app":"collector"},"ownerReferences":[
+                    {"kind":"ReplicaSet","name":"rs","uid":"rs-uid","controller":true}
+                ]},
+            "status":{"containerStatuses":[{"name":"dataflow","ready":true,"restartCount":0,
+                "containerID":format!("container-{index}"),"state":{"running":{}}}]}
+        });
+        let pods = json!({"items":[pod(0), pod(1)]});
+        let identities = scale_out_collector_identities("run", "dataflow", 2, &deployment, &replica_sets, &pods)?;
+        assert_eq!(identities.len(), 2);
+        assert_eq!(identities[0].pod_uid, "uid-0");
+        let mut missing = pods.clone();
+        missing["items"].as_array_mut().context("missing pod array")?.pop();
+        assert!(scale_out_collector_identities("run", "dataflow", 2, &deployment, &replica_sets, &missing).is_err());
+        let mut extra = pods.clone();
+        extra["items"].as_array_mut().context("missing pod array")?.push(pod(2));
+        assert!(scale_out_collector_identities("run", "dataflow", 2, &deployment, &replica_sets, &extra).is_err());
+        for (pointer, value) in [
+            ("/items/0/status/containerStatuses/0/restartCount", json!(1)),
+            ("/items/0/status/containerStatuses/0/containerID", Value::Null),
+            ("/items/0/metadata/ownerReferences/0/uid", json!("foreign")),
+            ("/items/0/metadata/labels/app", json!("foreign")),
+            ("/items/0/metadata/uid", json!("uid-1")),
+        ] {
+            let mut bad = pods.clone();
+            *bad.pointer_mut(pointer).context("missing test field")? = value;
+            assert!(scale_out_collector_identities("run", "dataflow", 2, &deployment, &replica_sets, &bad).is_err());
+        }
+        let mut restarted = pods.clone();
+        restarted["items"][0]["status"]["containerStatuses"][0]["containerID"] = json!("replacement");
+        assert_ne!(identities, scale_out_collector_identities("run", "dataflow", 2, &deployment, &replica_sets, &restarted)?);
+        Ok(())
+    }
 
     #[test]
     fn overload_cgroup_accounting_and_incremental_cursor_refuse_invented_limits() -> Result<()> {
