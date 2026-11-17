@@ -1970,6 +1970,7 @@ mod tests {
         config.campaign_profile = Some(CampaignProfile::ScaleOutSingleTable);
         config.overload_guard.enabled = true;
         config.tables = vec!["sqlserver_availability_replica_states".to_owned()];
+        config.replica_counts = vec![1];
         config.maintenance_image = Some(format!("maintenance@sha256:{}", "a".repeat(64)));
         config.tunables = serde_json::from_value(serde_json::json!({
             "maintenance": {
