@@ -993,8 +993,12 @@ mod storage_bridge {
             let list = requests
                 .iter()
                 .find(|request| request["target"] == "object_store" && request["method"] == "GET")
-                .context("SDK listing was not forwarded")?;
-            let request_url = Url::parse(list["url"].as_str().context("listing URL missing")?)?;
+                .ok_or_else(|| anyhow::anyhow!("SDK listing was not forwarded"))?;
+            let request_url = Url::parse(
+                list["url"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("listing URL missing"))?,
+            )?;
             let query: BTreeMap<_, _> = request_url
                 .query_pairs()
                 .map(|(key, value)| (key.to_string(), value.to_string()))
