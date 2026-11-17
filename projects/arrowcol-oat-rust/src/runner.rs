@@ -9317,7 +9317,7 @@ fn project_scale_out_runtime(runtime_config: &mut Value, config: &OatConfig, rep
         bail!("scale_out_single_table runtime hot table is invalid");
     }
     set_runtime_replicas(runtime_config, replicas)?;
-    runtime_config["campaignProfile"] = json!("scale_out_single_table");
+    runtime_config["campaignProfile"] = serde_json::to_value(config.campaign_profile)?;
     runtime_config["hotTable"] = json!(hot_table);
     runtime_config["collectorStartupTable"] =
         json!({"catalog": "telemetry", "schema": "sqlserver", "table": hot_table});
@@ -13651,6 +13651,17 @@ mod tests {
         }));
         assert_eq!(runtime["collectorReplicas"], 2);
         assert_eq!(runtime["routerReplicas"], 2);
+        for cpu in [Some("2"), None] {
+            config.platform.resources = Some(serde_json::from_value(json!({
+                "collector": {"requests": {"cpu": "2", "memory": "4Gi"},
+                              "limits": {"cpu": cpu, "memory": "6Gi"}}
+            }))?);
+            runtime["resources"] = serde_json::to_value(config.effective_aks_resources())?;
+            assert_eq!(
+                runtime.pointer("/resources/collector/limits/cpu"),
+                Some(&json!(cpu))
+            );
+        }
         config.tables.push("sqlserver_wait_stats".to_owned());
         assert!(project_scale_out_runtime(&mut runtime, &config, 2).is_err());
         Ok(())
