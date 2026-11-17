@@ -9,7 +9,8 @@ use arrow_deltalake::delta::{
     PublicationFenceError,
 };
 use arrow_deltalake::publisher::{
-    ControlMetadata, InvalidNormalStamp, MutationRetries, PublisherSession, SessionMode, canonical_uuid,
+    ControlMetadata, InvalidNormalStamp, MutationRetries, NormalAzureOwnership, PublisherSession, SessionMode,
+    canonical_uuid,
 };
 use arrow_deltalake::qap_http::{StorageBridge, StorageBridgeAuthority};
 use arrowcol_catalog::{DdlCommand, DdlParser};
@@ -28,9 +29,11 @@ const INGESTION: &str = INGESTION_PARTITION;
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NormalAksFreshTablePlan {
+    pub subscription_id: String,
     pub account: String,
     pub stamp: String,
     pub container: String,
+    pub checkpoint_container: String,
     pub shared_delta_root: String,
     pub run_delta_root: String,
     pub table_root: String,
@@ -43,12 +46,33 @@ pub struct NormalAksFreshTablePlan {
 }
 
 impl NormalAksFreshTablePlan {
+    /// Check the control binding against the retained allocation; this does not establish provenance.
+    ///
+    /// # Errors
+    /// Rejects a different subscription, stamp, checkpoint container or resource group.
+    pub fn validate_ownership(&self, ownership: &NormalAzureOwnership) -> Result<()> {
+        if ownership.subscription_id != self.subscription_id
+            || ownership.stamp != self.stamp
+            || ownership.resource_group != "arrow-collector-rg"
+            || ownership.checkpoint_container != self.checkpoint_container
+        {
+            bail!("normal Azure ownership differs from the retained AKS allocation");
+        }
+        Ok(())
+    }
+
     /// Validate the retained allocation and derive the canonical hot-table schema.
     ///
     /// # Errors
     /// Rejects inconsistent roots, noncanonical identities, and expired deadlines.
     pub fn target(&self, now_unix_ms: u64) -> Result<(Url, Arc<Schema>)> {
-        for value in [&self.run_id, &self.namespace_uid, &self.owner_token, &self.generation] {
+        for value in [
+            &self.subscription_id,
+            &self.run_id,
+            &self.namespace_uid,
+            &self.owner_token,
+            &self.generation,
+        ] {
             canonical_uuid(value)?;
         }
         if self.stamp.len() != 5
@@ -711,9 +735,11 @@ mod tests {
         let shared = "abfss://data@arrowcollector12345.dfs.core.windows.net/stamp/dataflow/";
         let run = format!("abfss://data@arrowcollector12345.dfs.core.windows.net/stamp/runs/{run_id}/dataflow/");
         let mut plan = NormalAksFreshTablePlan {
+            subscription_id: run_id.into(),
             account: "arrowcollector12345".into(),
             stamp: "12345".into(),
             container: "data".into(),
+            checkpoint_container: "checkpoints".into(),
             shared_delta_root: shared.into(),
             run_delta_root: run.clone(),
             table_root: format!("{run}telemetry/sqlserver/sqlserver_availability_replica_states/"),
@@ -727,6 +753,24 @@ mod tests {
         let (root, schema) = plan.target(99)?;
         assert_eq!(root.as_str(), plan.table_root);
         assert!(schema.field_with_name(INGESTION).is_ok());
+        let mut ownership = NormalAzureOwnership {
+            subscription_id: run_id.into(),
+            stamp: "12345".into(),
+            resource_group: "arrow-collector-rg".into(),
+            checkpoint_container: "checkpoints".into(),
+        };
+        plan.validate_ownership(&ownership)?;
+        ownership.subscription_id = "00000000-0000-4000-8000-000000000002".into();
+        assert!(plan.validate_ownership(&ownership).is_err());
+        ownership.subscription_id = run_id.into();
+        ownership.checkpoint_container = "another".into();
+        assert!(plan.validate_ownership(&ownership).is_err());
+        ownership.checkpoint_container = "checkpoints".into();
+        ownership.stamp = "54321".into();
+        assert!(plan.validate_ownership(&ownership).is_err());
+        ownership.stamp = "12345".into();
+        ownership.resource_group = "other".into();
+        assert!(plan.validate_ownership(&ownership).is_err());
         for invalid in ["00000", "00001", "01234", "1234", "123456", "12a45"] {
             plan.stamp = invalid.into();
             let error = plan.target(99).expect_err("invalid normal stamp must fail");
@@ -736,6 +780,9 @@ mod tests {
         plan.account = "arrowcollector54321".into();
         assert!(plan.target(99).is_err());
         plan.account = "arrowcollector12345".into();
+        plan.subscription_id = "not-a-subscription".into();
+        assert!(plan.target(99).is_err());
+        plan.subscription_id = run_id.into();
         assert!(plan.target(100).is_err());
         plan.table_root = format!("{run}dataflow/telemetry/sqlserver/sqlserver_availability_replica_states/");
         assert!(plan.target(99).is_err());
