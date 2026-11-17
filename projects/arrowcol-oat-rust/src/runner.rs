@@ -7087,7 +7087,65 @@ async fn local_docker_daemon() -> Result<String> {
     Ok(endpoint)
 }
 
+fn local_client_image(rendered: &Value) -> Result<&str> {
+    rendered
+        .pointer("/services/oat-client/image")
+        .and_then(Value::as_str)
+        .filter(|image| !image.is_empty() && !image.chars().any(char::is_whitespace))
+        .context("effective local OAT client image missing or invalid")
+}
+
+async fn resolve_local_client_image(config: &OatConfig, platform: &LocalPlatform) -> Result<String> {
+    let compose_file = config
+        .platform
+        .compose_file
+        .as_deref()
+        .context("local compose file is missing")?;
+    let base_project = config
+        .platform
+        .compose_project
+        .as_deref()
+        .context("local project is missing")?;
+    let project = scoped_compose_project(base_project, &platform.run_id);
+    let mut render = compose_command(
+        compose_file,
+        config.platform.compose_override_file.as_deref(),
+        &project,
+        "oat",
+    );
+    platform.add_compose_environment(&mut render);
+    render.args(["config", "--format", "json"]);
+    let rendered: Value = serde_json::from_slice(
+        &run_command(render, "read effective local OAT client image")
+            .await?
+            .stdout,
+    )
+    .context("parse effective local OAT client image")?;
+    let mut inspect = Command::new("docker");
+    inspect.args([
+        "image",
+        "inspect",
+        "--format",
+        "{{.Id}}",
+        local_client_image(&rendered)?,
+    ]);
+    let image = String::from_utf8(
+        run_command(inspect, "resolve local OAT client image content identity")
+            .await?
+            .stdout,
+    )?;
+    let image = image.trim();
+    if !image
+        .strip_prefix("sha256:")
+        .is_some_and(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
+        bail!("local OAT client image did not resolve to an immutable Docker content ID");
+    }
+    Ok(image.to_owned())
+}
+
 async fn verify_local_bind_mount(config: &OatConfig, platform: &LocalPlatform) -> Result<()> {
+    let image = resolve_local_client_image(config, platform).await?;
     let nonce = uuid::Uuid::new_v4().to_string();
     let probe = platform.state_dir.join("control/daemon-bind-probe");
     fs::write(&probe, &nonce)?;
@@ -7129,11 +7187,11 @@ async fn verify_local_bind_mount(config: &OatConfig, platform: &LocalPlatform) -
     let user = format!("{uid}:{gid}");
     let mut command = Command::new("docker");
     command.args([
-        "run", "--rm", "--network", "none", "--read-only",
+        "run", "--rm", "--pull", "never", "--network", "none", "--read-only",
         "--user", &user,
         "--mount", &format!("type=bind,source={state},target=/oat-bind,readonly"),
         "--mount", &format!("type=bind,source={source},target=/oat-observability,readonly"),
-        "--entrypoint", "/bin/sh", "arrowcol-oat-client:local", "-ec",
+        "--entrypoint", "/bin/sh", &image, "-ec",
         "test \"$(cat /oat-bind/control/daemon-bind-probe)\" = \"$1\" && test -f /oat-bind/router-state/config.yaml && printf '%s' \"$2\" | sha256sum -c -",
         "oat-bind-probe", &nonce, &checksums,
     ]);
@@ -12982,6 +13040,23 @@ fn platform_host_label(kind: crate::config::OatMode) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn local_bind_probe_uses_effective_client_image() -> anyhow::Result<()> {
+        let rendered = serde_json::json!({"services": {
+            "oat-client": {"image": "sha256:0123456789abcdef"},
+            "dataflow-1": {"image": "other"}
+        }});
+        assert_eq!(super::local_client_image(&rendered)?, "sha256:0123456789abcdef");
+        for invalid in [
+            serde_json::json!({"services": {"oat-client": {}}}),
+            serde_json::json!({"services": {"oat-client": {"image": ""}}}),
+            serde_json::json!({"services": {"oat-client": {"image": "not valid"}}}),
+        ] {
+            assert!(super::local_client_image(&invalid).is_err());
+        }
+        Ok(())
+    }
+
     #[test]
     fn local_partition_initializer_uses_campaign_table_and_shared_run_root() -> anyhow::Result<()> {
         let root = std::env::temp_dir().join(format!("oat-partition-root-{}", uuid::Uuid::new_v4()));
