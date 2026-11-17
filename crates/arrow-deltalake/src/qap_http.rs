@@ -681,6 +681,8 @@ mod storage_bridge {
         const GENERATION: &str = "00000000-0000-0000-0000-000000000003";
         const UNRELATED: &str = "00000000-0000-0000-0000-000000000009";
         const ROOT: &str = "abfss://data@offlineaccount.dfs.core.windows.net/owned-run/table/";
+        const KERNEL_TABLE_PATH: &str = "fixture/campaigns/00000000-0000-4000-8000-000000000001/runs/00000000-0000-4000-8000-000000000002/dataflow/telemetry/sqlserver/sqlserver_availability_replica_states/";
+        const KERNEL_LOG_PREFIX: &str = "fixture/campaigns/00000000-0000-4000-8000-000000000001/runs/00000000-0000-4000-8000-000000000002/dataflow/telemetry/sqlserver/sqlserver_availability_replica_states/_delta_log/";
 
         fn authority() -> StorageBridgeAuthority {
             StorageBridgeAuthority {
@@ -714,6 +716,13 @@ mod storage_bridge {
             *request.method_mut() = reqwest::Method::HEAD;
             *request.uri_mut() =
                 "https://offlineaccount.blob.core.windows.net/checkpoints?restype=container".parse()?;
+            Ok(request)
+        }
+
+        fn object_list(uri: &str) -> anyhow::Result<HttpRequest> {
+            let mut request = HttpRequest::new(object_store::client::HttpRequestBody::empty());
+            *request.method_mut() = reqwest::Method::GET;
+            *request.uri_mut() = uri.parse()?;
             Ok(request)
         }
 
@@ -959,6 +968,78 @@ mod storage_bridge {
             );
             drop(state);
             server.abort();
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn azure_kernel_log_directory_listing_accepts_sdk_start_from() -> anyhow::Result<()> {
+            let root = format!("abfss://data@offlineaccount.dfs.core.windows.net/{KERNEL_TABLE_PATH}");
+            let mut authority = authority();
+            authority.table_root_url = root.clone();
+            let (child, parent) = tokio::io::duplex(MAX_FRAME);
+            let (read, write) = tokio::io::split(child);
+            let bridge = StorageBridge::new(authority, deadline(10_000)?, read, write)?;
+            let fixture = Arc::new(Mutex::new(Fixture::ready()));
+            let server = tokio::spawn(serve(parent, Arc::clone(&fixture), None));
+
+            let url = Url::parse(&root)?;
+            let session = PublisherSession::open_bridged_async(&url, Arc::clone(&bridge)).await?;
+            let store = session.store_for_url(&url)?;
+            let prefix = object_store::path::Path::parse(KERNEL_LOG_PREFIX)?;
+            let entries = store.list(Some(&prefix)).try_collect::<Vec<_>>().await?;
+            assert!(entries.is_empty());
+
+            let requests = fixture.lock().await.requests.clone();
+            let list = requests
+                .iter()
+                .find(|request| request["target"] == "object_store" && request["method"] == "GET")
+                .context("SDK listing was not forwarded")?;
+            let request_url = Url::parse(list["url"].as_str().context("listing URL missing")?)?;
+            let query: BTreeMap<_, _> = request_url
+                .query_pairs()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect();
+            assert_eq!(query.get("restype").map(String::as_str), Some("container"));
+            assert_eq!(query.get("comp").map(String::as_str), Some("list"));
+            assert_eq!(query.get("prefix").map(String::as_str), Some(KERNEL_LOG_PREFIX));
+            assert_eq!(
+                query.get("startFrom").map(String::as_str),
+                Some(KERNEL_LOG_PREFIX.trim_end_matches('/'))
+            );
+            let expected_query = format!(
+                "restype=container&comp=list&prefix={}&startFrom={}",
+                KERNEL_LOG_PREFIX.replace('/', "%2F"),
+                KERNEL_LOG_PREFIX.trim_end_matches('/').replace('/', "%2F")
+            );
+            assert_eq!(request_url.query(), Some(expected_query.as_str()));
+            session.close_after_drain_async().await?;
+            server.abort();
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn azure_list_start_from_rejects_escape_duplicate_and_noncanonical_queries() -> anyhow::Result<()> {
+            let (bridge, mut parent) = bridge(5_000)?;
+            for url in [
+                "https://offlineaccount.blob.core.windows.net/data?restype=container&comp=list&prefix=owned-run/table-escape/_delta_log/&startFrom=owned-run/table-escape/_delta_log",
+                "https://offlineaccount.blob.core.windows.net/data?restype=container&comp=list&prefix=owned-run/table/_delta_log/&startFrom=owned-run/table/other",
+                "https://offlineaccount.blob.core.windows.net/data?restype=container&comp=list&prefix=owned-run/table/_delta_log/&startFrom=owned-run/table/_delta_log&startFrom=owned-run/table/_delta_log",
+                "https://offlineaccount.blob.core.windows.net/data?restype=container&comp=list&prefix=owned-run/table/_delta_log/&prefix=owned-run/table/_delta_log/&startFrom=owned-run/table/_delta_log",
+                "https://offlineaccount.blob.core.windows.net/data?restype=container&comp=list&prefix=owned-run%2ftable%2F_delta_log%2F&startFrom=owned-run%2ftable%2F_delta_log",
+            ] {
+                assert!(
+                    matches!(
+                        bridge.exchange(object_list(url)?, "object_store").await,
+                        Outcome::NotSent(Code::InvalidRequest)
+                    ),
+                    "{url}"
+                );
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), parent.read_u8())
+                    .await
+                    .is_err()
+            );
             Ok(())
         }
 
