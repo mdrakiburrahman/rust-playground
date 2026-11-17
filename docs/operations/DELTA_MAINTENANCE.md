@@ -150,6 +150,8 @@ OPTIMIZE uses `dataChange=false` and preserves exact rows, schema, partition val
 
 A sorted output that reaches the applied `LayoutPolicy` row or input-memory budget is marked in its durable Parquet filename with a fingerprint of the applied layout and effective Parquet writer policy. Planning and application validate the same identity; a change to layout or writer settings makes marked files eligible for re-layout. Partial outputs remain eligible. The automatic default path resolves `arrowcol.layout.*` with table > process > registry precedence, and each OPTIMIZE evidence record includes the applied layout, output-policy fingerprint and per-property source.
 
+A partial sorted bin that was rewritten without reducing file count records a bounded proof in `_arrowcol_maintenance/optimize-no-benefit.json`. Each proof binds the table, exact bin and full active-file set in its partition to the effective output-policy fingerprint; the record retains at most 128 proofs. Matching bins remain visible in eligible debt but are not rewritten again. Any active-file change in the partition or output-policy change invalidates the proof, and proof read/write errors fail maintenance rather than being treated as absence.
+
 ## Commands and expected results
 
 Run these inside the repository devcontainer on a leased devbox:
