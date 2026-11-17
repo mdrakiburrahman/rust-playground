@@ -941,7 +941,7 @@ export async function campaignMain(args: string[], dependencies: {
 } = {}): Promise<void> {
   if (args[0] === 'cleanup-step') {
     const cell = await import('./aks-cell-cleanup.js');
-    if (args[1] && !Object.hasOwn(cell.CELL_CLEANUP_SELECTORS, args[1])) throw new Error('Unknown cleanup-step selector.');
+    if (args[1] && !cell.isCellCleanupSelector(args[1])) throw new Error('Unknown cleanup-step selector.');
   }
   const selected = loadCustodyConfig(args, false, dependencies.env);
   args = selected.positionals;
@@ -1027,7 +1027,8 @@ export async function campaignMain(args: string[], dependencies: {
     console.log(JSON.stringify({ ok: true, receipt }));
   } else if (action === 'cleanup-step' && args.length === 2) {
     const cell = await import('./aks-cell-cleanup.js');
-    if (!Object.hasOwn(cell.CELL_CLEANUP_SELECTORS, args[1]!)) throw new Error('Unknown cleanup-step selector.');
+    const cleanupSelector = args[1];
+    if (!cleanupSelector || !cell.isCellCleanupSelector(cleanupSelector)) throw new Error('Unknown cleanup-step selector.');
     const input = cell.parseCellCleanupEnvelope(dependencies.cleanupEnvelope ?? await readRunInventoryStdin());
     await cell.readCellRunInventory(store, { schema_version: 1, campaign_id: input.inventory.campaign_id,
       orchestration_run_id: input.inventory.orchestration_run_id, cell_run_id: input.inventory.cell_run_id, actor: input.actor }, env);
@@ -1040,7 +1041,7 @@ export async function campaignMain(args: string[], dependencies: {
     let receipt: import('./aks-cell-cleanup.js').CellCleanupReceipt;
     try {
       console.log = (...values: unknown[]) => console.error(...values);
-      receipt = await cell.executeCellCleanupStep(store, input, args[1] as import('./aks-cell-cleanup.js').CellCleanupSelector,
+      receipt = await cell.executeCellCleanupStep(store, input, cleanupSelector,
         providers, assertCurrent => cell.createBlobCellStepJournal(azure, input, assertCurrent));
     } finally {
       console.log = log;

@@ -11,6 +11,9 @@ export const CELL_CLEANUP_SELECTORS = {
   remove_qap: 'remove-run-qap', remove_fic: 'remove-run-fic', handoff: 'cell-handoff',
 } as const;
 export type CellCleanupSelector = keyof typeof CELL_CLEANUP_SELECTORS;
+export function isCellCleanupSelector(value: string): value is CellCleanupSelector {
+  return Object.hasOwn(CELL_CLEANUP_SELECTORS, value);
+}
 const selectors = Object.keys(CELL_CLEANUP_SELECTORS) as CellCleanupSelector[];
 export interface CellCleanupActor { mode: 'producer' | 'controller'; owner_id: string; fencing_token: number }
 export interface CellCleanupEnvelope { schema_version: 1; inventory: RunInventory; expected_etag: string; actor: CellCleanupActor }

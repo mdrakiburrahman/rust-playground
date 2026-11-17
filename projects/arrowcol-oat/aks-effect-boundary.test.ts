@@ -8,8 +8,10 @@ import { Azure, Config, exchange_workload_identity_assertion, runtime } from '..
 import { defaultStampConfig } from '../../infra/azure/stamp.js';
 import { EffectBoundary, EffectBoundaryRefused, dispatchExternalEffect, withEffectBoundary,
   type EffectEnvelope, type EffectRule } from '../../infra/azure/effect-boundary.js';
-import { createBlobCampaignStore, managedIdentityToken, readArmOperationStatus } from './aks-campaign.js';
+import { createBlobCampaignStore, managedIdentityToken, readArmOperationStatus, type CampaignState, type CampaignStore } from './aks-campaign.js';
+import { isCellCleanupSelector } from './aks-cell-cleanup.js';
 import { boundedEffectRehearsal } from './aks-effect-rehearsal.js';
+import { createSyntheticArmedCampaignState } from './aks-rehearsal.js';
 
 const campaignId = 'c0ffee00-0000-4000-8000-000000000001';
 const runId = 'c0ffee00-0000-4000-8000-000000000002';
@@ -27,6 +29,40 @@ function envelope(effects: EffectRule[]): EffectEnvelope {
 function rule(id: string, transport: EffectRule['transport'], method: string, resource: string, pathValue: string,
   max_calls = 1): EffectRule {
   return { id, transport, method, resource, path: pathValue, max_calls };
+}
+
+function inMemoryCampaignStore(initial: CampaignState): CampaignStore {
+  let state = initial;
+  let revision = 0;
+  return {
+    async read() { return { state, etag: String(revision) }; },
+    async write(next, expectedEtag) {
+      if (expectedEtag !== String(revision)) throw new Error('in-memory campaign CAS conflict');
+      state = next;
+      revision++;
+      return String(revision);
+    },
+  };
+}
+
+function writeRehearsalFixture(directory: string, ownerId: string, cellRunId: string) {
+  const stampPath = path.join(directory, 'stamp.yaml'), envPath = path.join(directory, 'campaign.env');
+  const allocationPath = path.join(directory, 'allocation.json'), receiptPath = path.join(directory, 'effects.jsonl');
+  const inventoryPath = path.join(directory, 'inventory.json');
+  writeFileSync(stampPath, stringify(defaultStampConfig({ AZURE_SUBSCRIPTION_ID: subscriptionId,
+    AZURE_STAMP: '12345', AZURE_LOCATION: 'canadacentral' })), { mode: 0o600 });
+  writeFileSync(envPath, [
+    'AZURE_SUBSCRIPTION_ID=' + subscriptionId, 'ARM_SUBSCRIPTION_ID=' + subscriptionId,
+    'CAMPAIGN_STORAGE_ACCOUNT=arrowcollector12345', 'CAMPAIGN_STATE_CONTAINER=checkpoints',
+    'CAMPAIGN_ID=' + campaignId, 'CAMPAIGN_OWNER_ID=' + ownerId, 'CAMPAIGN_FENCING_TOKEN=1',
+  ].join('\n'), { mode: 0o600 });
+  const account = 'arrowcollector12345';
+  writeFileSync(allocationPath, JSON.stringify({ schema_version: 1, campaign_id: campaignId, run_id: cellRunId,
+    subscription_id: subscriptionId, resource_group: 'arrow-collector-rg', storage_account: account,
+    state_container: 'checkpoints', effects: [rule('unused', 'campaign-blob', 'GET',
+      'https://' + account + '.blob.core.windows.net/checkpoints', '/checkpoints/not-active.json')] }), { mode: 0o600 });
+  writeFileSync(inventoryPath, '{}', { mode: 0o600 });
+  return { stampPath, envPath, allocationPath, receiptPath, inventoryPath };
 }
 
 test('exact effect allocations refuse target/method changes before forwarding and persist attributable receipts', async t => {
@@ -164,6 +200,43 @@ test('bounded rehearsal constructs default campaign providers inside the fail-cl
   assert.equal(fetches, 0);
   const rows = readFileSync(receiptPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
   assert.deepEqual(rows.map(row => row.event), ['refused']);
+});
+
+test('producer rehearsal dispatches an accepted underscore cleanup selector', async t => {
+  const directory = tempDir(); t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const state = createSyntheticArmedCampaignState(campaignId, runId);
+  const cellRunId = state.runInventory!.cell_run_id;
+  const fixture = writeRehearsalFixture(directory, runId, cellRunId);
+  const store = inMemoryCampaignStore(state);
+  let dispatched: string | undefined;
+  const result = await boundedEffectRehearsal([
+    '--mode', 'producer-cleanup-step', '--selector', 'stop_admission', '--env-file', fixture.envPath,
+    '--stamp-config', fixture.stampPath, '--effect-envelope', fixture.allocationPath,
+    '--receipt-file', fixture.receiptPath, '--inventory-file', fixture.inventoryPath,
+  ], { store, campaignMain: async (args) => {
+    assert.equal(args[0], 'cleanup-step');
+    assert.equal(args[1], 'stop_admission');
+    assert.ok(isCellCleanupSelector(args[1]!));
+    dispatched = args[1];
+  } });
+  assert.equal(dispatched, 'stop_admission');
+  assert.equal(result, undefined);
+});
+
+test('watchdog rehearsal returns its actual custody evaluation', async t => {
+  const directory = tempDir(); t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const state = createSyntheticArmedCampaignState(campaignId, runId);
+  const fixture = writeRehearsalFixture(directory, runId, state.runInventory!.cell_run_id);
+  const evaluation = await boundedEffectRehearsal([
+    '--mode', 'watchdog-once', '--env-file', fixture.envPath, '--stamp-config', fixture.stampPath,
+    '--effect-envelope', fixture.allocationPath, '--receipt-file', fixture.receiptPath,
+  ], { store: inMemoryCampaignStore(state) });
+  assert.equal(evaluation?.event, 'campaign_custody_evaluation');
+  assert.equal(evaluation?.status, 'observed');
+  assert.equal(evaluation?.campaignStatus, 'active');
+  assert.equal(evaluation?.cleanupStatus, 'not-started');
+  assert.equal(evaluation?.pendingArmOperations, 0);
+  assert.equal(evaluation?.cleanupProgress, undefined);
 });
 
 test('Azure REST and process adapters reject unallocated targets before transport', async t => {
