@@ -1184,6 +1184,73 @@ test('expired original monotonic deadline is not reset and prevents POST /runs',
   }
 });
 
+test('abort during POST pins the accepted running identity before once-only cancellation', async (t) => {
+  for (const seconds of [600, undefined]) {
+    await t.test(seconds === undefined ? 'receipt without deadline' : 'before original deadline', async () => {
+      const directory = await mkdtemp(path.join(os.tmpdir(), 'oat-aborted-post-'));
+      const configPath = path.join(directory, 'config.json');
+      await writeFile(configPath, JSON.stringify({ platform: { kind: 'local' } }));
+      const deadline = await OatLauncherDeadline.create(seconds, performance.now(), path.join(directory, 'receipts'));
+      const controller = new AbortController();
+      const runId = '123e4567-e89b-42d3-a456-426614174019';
+      const requests: string[] = [];
+      let configHash: string;
+      let cancelCalls = 0;
+      const server = createServer(async (request, response) => {
+        requests.push(`${request.method} ${request.url}`);
+        response.setHeader('content-type', 'application/json');
+        if (request.method === 'POST' && request.url === '/runs') {
+          const chunks: Buffer[] = [];
+          for await (const chunk of request) chunks.push(Buffer.from(chunk));
+          configHash = createHash('sha256').update(Buffer.concat(chunks)).digest('hex');
+          assert.equal(deadline.isExpired(), false);
+          controller.abort();
+          response.writeHead(202).end(JSON.stringify({ ...status('running'), id: runId, config_sha256: configHash }));
+        } else if (request.method === 'POST' && request.url === `/runs/${runId}/cancel`) {
+          cancelCalls++;
+          response.writeHead(202).end();
+        } else if (request.method === 'GET' && request.url === `/runs/${runId}`) {
+          response.end(JSON.stringify({ ...status(cancelCalls ? 'cancelled' : 'running'), id: runId, config_sha256: configHash,
+            error: cancelCalls ? 'cancelled by request' : null }));
+        } else {
+          response.writeHead(404).end();
+        }
+      });
+      await new Promise<void>((resolve, reject) => {
+        server.once('error', reject);
+        server.listen(0, '127.0.0.1', resolve);
+      });
+      const address = server.address();
+      assert.ok(address && typeof address !== 'string');
+      try {
+        let failure: unknown;
+        try {
+          await launchOat(configPath, `http://127.0.0.1:${address.port}`, 1, fetch, () => {}, 'local',
+            () => '127.0.0.1', controller.signal, undefined, undefined, deadline);
+        } catch (error) {
+          failure = error;
+        }
+        assert.equal(cancelCalls, 1);
+        assert.ok(failure instanceof Error && /cancelled by request/.test(failure.message));
+        assert.deepEqual(requests, ['POST /runs', `GET /runs/${runId}`, `POST /runs/${runId}/cancel`, `GET /runs/${runId}`]);
+        const receipt = JSON.parse(await readFile(deadline.receiptPath, 'utf8')) as Record<string, unknown>;
+        assert.equal(receipt.run_id, runId);
+        assert.equal(receipt.run_state, 'cancelled');
+        assert.equal(receipt.cleanup_state, 'confirmed');
+        assert.equal(receipt.cancellation_attempts, 1);
+        assert.equal(receipt.config_binding_error, null);
+        assert.equal(receipt.overrun, false);
+        assert.equal(deadline.isExpired(), false);
+        if (seconds === undefined) assert.equal(receipt.deadline_at_unix_ms, null);
+      } finally {
+        deadline.dispose();
+        await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+        await rm(directory, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
 test('launcher deadline cancels the exact active run and reconciles a lost cancel response to terminal state', async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'oat-deadline-cancel-'));
   const configPath = path.join(directory, 'config.json');

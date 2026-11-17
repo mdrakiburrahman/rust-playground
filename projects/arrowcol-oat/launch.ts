@@ -1042,12 +1042,11 @@ export async function launchOat(
       return { ok: true };
     })().catch((error: unknown) => ({ ok: false, error }));
   };
-  if (runSignal?.aborted) requestCancellation();
-  else runSignal?.addEventListener('abort', requestCancellation, { once: true });
-
   try {
     try {
       await deadline?.recordRunStarted(status);
+      if (runSignal?.aborted) requestCancellation();
+      else runSignal?.addEventListener('abort', requestCancellation, { once: true });
       await onRunStarted?.(status);
       if (bindingFailure) {
         await deadline?.markBindingFailure(bindingFailure);
