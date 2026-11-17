@@ -2730,6 +2730,111 @@ mod tests {
         assert_eq!(exporter.backend.capacity.batches.available_permits(), 4096);
     }
 
+    #[tokio::test]
+    async fn aged_ready_backlog_uses_real_worker_and_publication_path() {
+        let directory = tempfile::tempdir().expect("directory");
+        let store = Arc::new(MemoryRoutingStore::default());
+        let holder = CollectorInstanceId::new();
+        let lease = lease(&store, holder).await;
+        let metrics = Arc::new(RuntimeMetrics::new(holder));
+        let policy = FileBatchConfig {
+            coalesce_publications: true,
+            max_age: std::time::Duration::from_millis(20),
+            max_concurrent_flushes: 1,
+            ..Default::default()
+        };
+        let exporter = GenericDeltaExporter::with_batching(
+            directory.path().to_path_buf(),
+            store as Arc<dyn RoutingStore>,
+            arrow_deltalake::commit::CommitOptions::default(),
+            policy.clone(),
+            Arc::clone(&metrics),
+        )
+        .expect("exporter");
+        let publication_slot = Arc::clone(&exporter.backend.flush_slots)
+            .acquire_owned()
+            .await
+            .expect("hold publication slot");
+        let mut publications = vec![exporter.stage(pdata(&lease, lease.fencing_epoch)).await.expect("seed")];
+        let owner = Arc::clone(exporter.backend.tables.lock().await.get(&table()).expect("owner"));
+        let (reply, first_flush) = oneshot::channel();
+        owner
+            .sender
+            .send(WorkerCommand::Flush(reply))
+            .await
+            .expect("seed barrier");
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while owner.sender.capacity() != policy.per_table_capacity.batches as usize {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("worker blocked publishing seed before backlog admission");
+        for _ in 0..256 {
+            publications.push(
+                exporter
+                    .stage(pdata(&lease, lease.fencing_epoch))
+                    .await
+                    .expect("backlog"),
+            );
+        }
+        assert_eq!(
+            owner.sender.capacity(),
+            policy.per_table_capacity.batches as usize - 256
+        );
+        tokio::time::sleep(policy.max_age * 2).await;
+        let (reply, final_flush) = oneshot::channel();
+        owner
+            .sender
+            .send(WorkerCommand::Flush(reply))
+            .await
+            .expect("terminal barrier");
+        drop(publication_slot);
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            first_flush.await.expect("seed committed");
+            final_flush.await.expect("backlog committed");
+            for publication in publications {
+                publication.wait().await.expect("original publication acknowledged");
+            }
+        })
+        .await
+        .expect("finite real-worker completion");
+
+        let root = directory.path().join("demo/generated/events");
+        let mut rows_per_file = std::fs::read_dir(&root)
+            .expect("files")
+            .map(|entry| entry.expect("entry").path())
+            .filter(|path| path.extension().is_some_and(|extension| extension == "parquet"))
+            .map(|path| {
+                ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(path).expect("file"))
+                    .expect("reader")
+                    .build()
+                    .expect("build")
+                    .map(|batch| batch.expect("batch").num_rows())
+                    .sum::<usize>()
+            })
+            .collect::<Vec<_>>();
+        rows_per_file.sort_unstable();
+        let reasons = metrics
+            .prometheus()
+            .lines()
+            .filter(|line| line.starts_with("arrowcol_pipeline_flushes_total{"))
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        eprintln!(
+            "AGED_BACKLOG_BASELINE batches=257 rows=514 files={} rows_per_file={rows_per_file:?} flushes={reasons:?}",
+            rows_per_file.len()
+        );
+        assert_eq!(rows_per_file.iter().sum::<usize>(), 514);
+        assert!(
+            rows_per_file.len() > 32,
+            "expired age fragments the finite ready backlog"
+        );
+        assert_eq!(exporter.backend.capacity.batches.available_permits(), 4096);
+        assert_eq!(owner.capacity.batches.available_permits(), 1024);
+        exporter.backend.start_draining().await;
+    }
+
     /// Scenario: A sparse table receives one batch below the size and row thresholds.
     /// Guarantees: The age timer publishes it without additional traffic or a shutdown request.
     #[tokio::test]
