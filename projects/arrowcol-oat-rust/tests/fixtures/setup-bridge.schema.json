@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "E1 fixture-only setup bridge v1 (not runtime clearance)",
+  "description": "Sequential NDJSON: one command_request on child stdout, one command_response on child stdin. Request SHA256 hashes UTF-8 compact recursively key-sorted JSON with request_sha256 omitted; integers are JSON-safe. stdin_sha256 hashes exact UTF-8 stdin bytes (empty bytes for null). The driver must validate immutable authority/deadline and exact executable/argv/body against original durable effect allowances before EVERY forward. Request IDs only correlate responses; they never allocate or reset allowances across requests/processes. Return only actual production transport results; never inject successful provider output. All command responses are retained in fixture_setup_receipt. EOF, truncation, duplicate/out-of-order/mismatched/late responses fail closed with no direct-spawn fallback or retry. stdout/stderr are <=1048576 UTF-8 bytes each, each NDJSON frame <=4194304 bytes. Do not serialize environment values or credentials. Inventory publication is an npx command with inventory stdin; its nested provider operations still need E2b's bounded in-process production forwarding, not a blanket subprocess exemption. This source/offline protocol does not authorize effects.",
+  "oneOf": [
+    { "$ref": "#/$defs/request" },
+    { "$ref": "#/$defs/response" }
+  ],
+  "$defs": {
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["campaign_id", "cell_run_id", "owner_id", "fencing_token", "namespace", "server", "context"],
+      "properties": {
+        "campaign_id": { "type": "string" },
+        "cell_run_id": { "type": "string" },
+        "owner_id": { "type": "string" },
+        "fencing_token": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "namespace": { "type": "string" },
+        "server": { "type": "string" },
+        "context": { "type": "string" }
+      }
+    },
+    "request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "kind", "request_id", "authority", "original_deadline_unix_ms", "remaining_timeout_ms", "executable", "argv", "current_dir", "stdin", "stdin_sha256", "request_sha256"],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "kind": { "const": "command_request" },
+        "request_id": { "type": "integer", "minimum": 1 },
+        "authority": { "$ref": "#/$defs/authority" },
+        "original_deadline_unix_ms": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "remaining_timeout_ms": { "type": "integer", "minimum": 1, "maximum": 600000 },
+        "executable": { "type": "string" },
+        "argv": { "type": "array", "items": { "type": "string" } },
+        "current_dir": { "type": ["string", "null"] },
+        "stdin": { "type": ["string", "null"] },
+        "stdin_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "request_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "response": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "kind", "request_id", "request_sha256", "exit_code", "stdout", "stderr", "truncated"],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "kind": { "const": "command_response" },
+        "request_id": { "type": "integer", "minimum": 1 },
+        "request_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "exit_code": { "type": "integer", "minimum": -2147483648, "maximum": 2147483647 },
+        "stdout": { "type": "string", "maxLength": 1048576 },
+        "stderr": { "type": "string", "maxLength": 1048576 },
+        "truncated": { "const": false }
+      }
+    }
+  }
+}

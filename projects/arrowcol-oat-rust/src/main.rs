@@ -41,10 +41,6 @@ struct ApiError {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
     let args = Args::parse();
     if let Some(path) = args.fixture_setup {
         let result = arrowcol_oat_rust::runner::run_fixture_setup(&path, args.fixture_bridge_stdio).await;
@@ -54,6 +50,9 @@ async fn main() -> Result<()> {
         // Tokio's stdin reader may still block after a bridge timeout; this dedicated CLI owns no background work.
         std::process::exit(if result.is_ok() { 0 } else { 1 });
     }
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
     if let Some(path) = args.validate_config {
         let source = fs::read_to_string(&path)
             .await

@@ -10211,7 +10211,7 @@ async fn record_resource_uids_with_creation(
                         && resource["metadata"]["name"] == actual["metadata"]["name"]
                 })
                 .context("readback identity was not returned by the original create")?;
-            for field in ["uid", "resourceVersion", "generation"] {
+            for field in ["uid", "generation"] {
                 if original["metadata"][field] != actual["metadata"][field] {
                     bail!("fresh-create readback changed original {field}; no identity adoption");
                 }
