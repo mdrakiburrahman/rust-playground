@@ -21,12 +21,13 @@ use crate::{
 };
 
 const INGESTION: &str = INGESTION_PARTITION;
-const PLANNED_CONTROL_OPERATION_IDS: [&str; 11] = [
+const PLANNED_CONTROL_OPERATION_IDS: [&str; 12] = [
     "registration-read",
     "registration-acquire",
     "registration-compare-read",
     "registration-metadata-write",
     "registration-release",
+    "open-publisher-check",
     "commit-authority-read",
     "terminal-read",
     "terminal-acquire",
