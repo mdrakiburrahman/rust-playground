@@ -265,6 +265,7 @@ export interface RunInventory {
   fic: { resource_id: string | null; name: string | null; state: RunInventoryResourceState; absence: InventoryFicAbsenceReceipt | null; plan?: RunFicPlan | null } | null;
   qap: { database: string; bindings: Array<{ external_table: string; relative_path: string }>; state: RunInventoryResourceState; absence: InventoryQapAbsenceReceipt[]; reference?: OatQapReference | null } | null;
   evidence_destination?: { account: string; container: string; blob_prefix: string } | null;
+  owned_run_table_initialization?: unknown;
   official_measurement?: OfficialCellMeasurementReference | null;
   planned_cell_duration_ms?: number;
   effective_stop_budgets?: { maintenance_grace_seconds: number; maintenance_stop_timeout_ms: number };
@@ -301,7 +302,7 @@ function validateRunInventory(value: unknown, state: CampaignState): RunInventor
   if (stopBudgets !== undefined) parseEffectiveStopBudgets(stopBudgets);
   const fields = ['schema_version', 'campaign_id', 'owner_id', 'fencing_token', 'orchestration_run_id', 'cell_run_id', 'load_admission',
     'namespace', 'resources', 'fic', 'qap', 'cleanup'];
-  if (!optionalRecord(value, fields, ['evidence_destination', 'official_measurement', 'planned_cell_duration_ms', 'effective_stop_budgets']) || value.schema_version !== 1 || value.campaign_id !== state.campaignId ||
+  if (!optionalRecord(value, fields, ['evidence_destination', 'owned_run_table_initialization', 'official_measurement', 'planned_cell_duration_ms', 'effective_stop_budgets']) || value.schema_version !== 1 || value.campaign_id !== state.campaignId ||
       value.owner_id !== state.ownerId || value.fencing_token !== (state.status === 'active' ? state.fencingToken : state.runInventory?.fencing_token) || !nonnegative(value.fencing_token) || value.fencing_token === 0 ||
       !canonicalUuid(value.campaign_id) || !canonicalUuid(value.owner_id) || !canonicalUuid(value.orchestration_run_id) || !canonicalUuid(value.cell_run_id) ||
       !['not_authorized', 'authorization_pending', 'authorized'].includes(String(value.load_admission)) ||
@@ -319,6 +320,8 @@ function validateRunInventory(value: unknown, state: CampaignState): RunInventor
     throw new Error('RunInventory is malformed or fenced to another owner.');
   }
   const inventory = value as unknown as RunInventory;
+  if (inventory.owned_run_table_initialization !== undefined && !record(inventory.owned_run_table_initialization))
+    throw new Error('RunInventory owned table initialization receipt is malformed.');
   if (state.status !== 'active' && state.runInventory && inventory.load_admission !== state.runInventory.load_admission)
     throw new Error('Fenced cleanup cannot change the producer load-admission disposition.');
   const safePath = (path: unknown): path is string => typeof path === 'string' && path.length > 0 && path.length <= 2048 &&
@@ -516,6 +519,11 @@ function mergeRunInventory(before: RunInventory | undefined, after: RunInventory
   }
   if (before.evidence_destination && !sameFlatRecord(before.evidence_destination, after.evidence_destination))
     throw new Error('RunInventory evidence destination is immutable.');
+  if (before.owned_run_table_initialization !== undefined &&
+      JSON.stringify(before.owned_run_table_initialization) !== JSON.stringify(after.owned_run_table_initialization) ||
+      before.owned_run_table_initialization === undefined && after.owned_run_table_initialization !== undefined &&
+      before.load_admission !== 'not_authorized')
+    throw new Error('RunInventory owned table initialization receipt is immutable and may be added only before load authorization.');
   if (before.official_measurement && !sameFlatRecord(before.official_measurement, after.official_measurement))
     throw new Error('RunInventory original official cell measurement binding is immutable.');
   const resources = new Map(before.resources.map(resource => [[resource.api_version, resource.kind, resource.name].join('|'), resource]));

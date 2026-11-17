@@ -6,9 +6,9 @@ import { TextDecoder } from 'node:util';
 import { Azure, type ProcessResult } from '../../infra/azure/bootstrap.js';
 import { dispatchExternalEffect, EffectBoundary, EffectBoundaryRefused, effectAllocationFingerprint, processEffectRequest,
   withEffectBoundary, type EffectEnvelope, type ExternalEffect, isEffectBoundaryActiveFor } from '../../infra/azure/effect-boundary.js';
-import { assertCampaignCustodyState, campaignMain, isInitialRunInventory, publishRunInventory, validateCampaignState,
-  validateInitialRunInventory, type CampaignState, type CampaignStore, type CampaignStoreOperationOptions, type RunInventory,
-  type StoredCampaign } from './aks-campaign.js';
+import { assertCampaignCustodyState, campaignMain, compareAndSwapRunInventory, isInitialRunInventory, publishRunInventory,
+  validateCampaignState, validateInitialRunInventory, type CampaignState, type CampaignStore, type CampaignStoreOperationOptions,
+  type RunInventory, type StoredCampaign } from './aks-campaign.js';
 
 const MAX_FRAME = 4 * 1024 * 1024;
 const MAX_OUTPUT = 1024 * 1024;
@@ -546,21 +546,25 @@ async function callCampaignMain(options: FixtureDispatcherOptions, request: Fixt
   return { returncode: 0, stdout, stderr: '' };
 }
 function sealFixturePhase(ledgerPath: string, request: FixtureCommandRequest, phase: 'preflight' | 'command',
-  envelope: EffectEnvelope, predecessor: { allocation_sha256: string; journal_sha256: string; response_sha256: string }):
+  envelope: EffectEnvelope, predecessor: { allocation_sha256: string; journal_sha256: string; response_sha256: string },
+  predecessorState?: StoredCampaign | null, plannedAtUnixMs = Date.now(), requireExisting = false):
   { receiptPath: string; allocationSha256: string; planSha256: string } {
   const allocationSha256 = effectAllocationFingerprint(envelope);
   const planPath = ledgerPath + '.phase-' + request.request_id + '-' + phase + '.plan.json';
   const plan = { schema_version: 1, kind: 'fixture_command_phase', campaign_id: envelope.campaign_id,
     run_id: envelope.run_id, request_id: request.request_id, request_sha256: request.request_sha256, phase,
+    planned_at_unix_ms: plannedAtUnixMs,
     predecessor_allocation_sha256: predecessor.allocation_sha256,
     predecessor_journal_sha256: predecessor.journal_sha256,
-    predecessor_response_sha256: predecessor.response_sha256, allocation_sha256: allocationSha256, envelope };
+    predecessor_response_sha256: predecessor.response_sha256, allocation_sha256: allocationSha256, envelope,
+    ...(phase === 'command' ? { predecessor_state: predecessorState ?? null } : {}) };
   const bytes = Buffer.from(canonical(plan) + '\n');
   if (fs.existsSync(planPath)) {
     const stat = fs.lstatSync(planPath);
     if (!stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0 || !fs.readFileSync(planPath).equals(bytes))
       throw new Error('Fixture phase allocation changed after it was sealed.');
   } else {
+    if (requireExisting) throw new Error('Fixture phase allocation disappeared after its effect was sealed.');
     const fd = fs.openSync(planPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL |
       (fs.constants.O_NOFOLLOW ?? 0), 0o600);
     try { fs.writeSync(fd, bytes); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
@@ -608,6 +612,10 @@ async function fixturePhaseEnvelope(base: EffectEnvelope, phase: 'preflight' | '
           rule.resource === activeRead.resource && rule.path.endsWith('/baseline.json'));
         if (!baselineRead) throw new Error('Fixture parent allocation lacks the original baseline read template.');
         add(baselineRead, 1);
+        const baselineAzureRead = base.effects.find(rule => rule.transport === 'azure-rest' && rule.method === 'GET' &&
+          rule.path.endsWith('/baseline.json'));
+        if (!baselineAzureRead) throw new Error('Fixture parent allocation lacks the guarded Azure baseline read template.');
+        add(baselineAzureRead, 1);
       }
     }
   }
@@ -628,7 +636,7 @@ function fixtureHasOriginMarkers(metadata: Obj, input: FixtureSetupInput): boole
     metadata[field]['arrowcol-oat/run-id'] === input.authority.cell_run_id &&
     metadata[field]['arrowcol-oat/owner-token'] === input.authority.owner_id);
 }
-function fixtureCommandPhase(request: FixtureCommandRequest): string {
+function fixtureCommandPhase(request: Pick<FixtureCommandRequest, 'argv'>): string {
   if (request.argv[3] === 'publish-inventory') return 'publish-inventory';
   const args = request.argv.slice(4);
   if (args[0] === 'get' && args[1] === 'namespace') return 'namespace-read';
@@ -679,8 +687,8 @@ function fixtureObservedInventory(input: FixtureSetupInput, planned: RunInventor
   });
   return { ...structuredClone(planned), resources };
 }
-function assertFixturePhaseOrder(request: FixtureCommandRequest, input: FixtureSetupInput,
-  seen: Map<number, FixtureCommandRequest>, responses: Map<number, FixtureCommandResponse>): void {
+export function assertFixturePhaseOrder(request: Pick<FixtureCommandRequest, 'request_id' | 'argv' | 'stdin'>,
+  input: FixtureSetupInput, seen: Map<number, FixtureCommandRequest>, responses: Map<number, FixtureCommandResponse>): void {
   const expected = ['publish-inventory', 'namespace-read', 'namespace-create', 'publish-inventory', 'publish-inventory',
     'resource-collision', 'resource-create', 'resource-readback', 'namespace-read', 'publish-inventory'];
   if (request.request_id !== responses.size + 1 || request.request_id > expected.length ||
@@ -771,13 +779,63 @@ export class FixtureCommandDispatcher {
     return boundedCampaignStore(this.options.store, this.options.input.authority,
       this.options.input.original_deadline_unix_ms, envelope, this.now, true);
   }
+  private async assertRetainedPhasePlans(request: FixtureCommandRequest, kind: 'kubectl' | 'campaign'): Promise<void> {
+    const lines = fs.readFileSync(this.options.ledgerPath, 'utf8').split('\n').filter(Boolean);
+    const prefixSha = (lineCount: number) => {
+      if (lines.length < lineCount) throw new Error('Fixture predecessor journal is incomplete.');
+      return sha(lines.slice(0, lineCount).join('\n') + '\n');
+    };
+    const id = request.request_id;
+    const predecessorAllocation = id === 1 ? effectAllocationFingerprint(this.envelope) :
+      readFixturePhaseAllocation(this.options.ledgerPath, id - 1,
+        this.options.input.authority.campaign_id, this.options.input.authority.cell_run_id);
+    const predecessorResponse = id === 1 ? sha(canonical({ authority: this.options.input.authority,
+      inventory: this.options.input.inventory, allocation_sha256: effectAllocationFingerprint(this.envelope) })) :
+      (() => {
+        const record = JSON.parse(lines[2 * (id - 1)]!) as unknown;
+        if (!object(record) || typeof record.response_sha256 !== 'string') throw new Error('Fixture predecessor response is incomplete.');
+        return record.response_sha256;
+      })();
+    const preflightPath = this.options.ledgerPath + '.phase-' + id + '-preflight.plan.json';
+    const preflightPlan = privateJson(preflightPath, MAX_OUTPUT);
+    if (!object(preflightPlan) || !Number.isSafeInteger(preflightPlan.planned_at_unix_ms))
+      throw new Error('Fixture preflight allocation time is missing.');
+    const preflightAt = Number(preflightPlan.planned_at_unix_ms);
+    const preflightEnvelope = await fixturePhaseEnvelope(this.envelope, 'preflight', request, kind, undefined, preflightAt);
+    const preflight = sealFixturePhase(this.options.ledgerPath, request, 'preflight', preflightEnvelope, {
+      allocation_sha256: predecessorAllocation, journal_sha256: prefixSha(1 + 2 * (id - 1)),
+      response_sha256: predecessorResponse,
+    }, undefined, preflightAt, true);
+    const commandPlan = privateJson(this.options.ledgerPath + '.phase-' + id + '-command.plan.json', MAX_OUTPUT);
+    if (!object(commandPlan) || !Number.isSafeInteger(commandPlan.planned_at_unix_ms) ||
+        !Object.hasOwn(commandPlan, 'predecessor_state')) throw new Error('Fixture command allocation lacks its response-bound predecessor state.');
+    let stored: StoredCampaign | undefined;
+    if (commandPlan.predecessor_state !== null) {
+      const snapshot = commandPlan.predecessor_state;
+      if (!object(snapshot) || !Object.hasOwn(snapshot, 'state') || typeof snapshot.etag !== 'string')
+        throw new Error('Fixture command predecessor state is malformed.');
+      stored = { state: validateCampaignState(snapshot.state), etag: snapshot.etag };
+    }
+    const commandAt = Number(commandPlan.planned_at_unix_ms);
+    const commandEnvelope = await fixturePhaseEnvelope(this.envelope, 'command', request, kind, stored, commandAt);
+    const preflightReceiptSha = sha(fs.readFileSync(preflight.receiptPath, 'utf8'));
+    const commandResponse = sha(canonical({ stored: stored ?? null, receipt_sha256: preflightReceiptSha }));
+    sealFixturePhase(this.options.ledgerPath, request, 'command', commandEnvelope, {
+      allocation_sha256: preflight.allocationSha256, journal_sha256: prefixSha(2 + 2 * (id - 1)),
+      response_sha256: commandResponse,
+    }, stored ?? null, commandAt, true);
+  }
   async exchange(value: unknown): Promise<FixtureCommandResponse> {
     const request = fixtureRequest(value, this.options.input.authority, this.options.input.original_deadline_unix_ms, this.now());
     const kind = assertFixtureCommand(request, this.options.input, this.options.rootDirectory), effect = fixtureEffect(request);
     assertBridgeLive(this.envelope, request.original_deadline_unix_ms, this.now);
-    const cached = this.ledger.peek(request.request_id, request.request_sha256);
-    if (cached !== undefined) { this.seen.set(request.request_id, request); this.responses.set(request.request_id, cached as FixtureCommandResponse); return cached as FixtureCommandResponse; }
     assertFixturePhaseOrder(request, this.options.input, this.seen, this.responses);
+    const cached = this.ledger.peek(request.request_id, request.request_sha256);
+    if (cached !== undefined) {
+      await this.assertRetainedPhasePlans(request, kind);
+      this.seen.set(request.request_id, request); this.responses.set(request.request_id, cached as FixtureCommandResponse);
+      return cached as FixtureCommandResponse;
+    }
     const priorTranscript = sha(fs.readFileSync(this.options.ledgerPath));
     const predecessorResponse = this.ledger.latestResponseDigest() ?? sha(canonical({ authority: this.options.input.authority,
       inventory: this.options.input.inventory, allocation_sha256: effectAllocationFingerprint(this.envelope) }));
@@ -786,20 +844,22 @@ export class FixtureCommandDispatcher {
         this.options.input.authority.campaign_id, this.options.input.authority.cell_run_id);
     this.seen.set(request.request_id, request);
     this.ledger.begin(request.request_id, request.request_sha256);
-    const preflightEnvelope = await fixturePhaseEnvelope(this.envelope, 'preflight', request, kind, undefined, this.now());
+    const preflightAt = this.now();
+    const preflightEnvelope = await fixturePhaseEnvelope(this.envelope, 'preflight', request, kind, undefined, preflightAt);
     const preflight = sealFixturePhase(this.options.ledgerPath, request, 'preflight', preflightEnvelope, {
       allocation_sha256: predecessorAllocation, journal_sha256: priorTranscript, response_sha256: predecessorResponse,
-    });
+    }, undefined, preflightAt);
     const preflightBoundary = new EffectBoundary(preflightEnvelope, preflight.receiptPath);
     const preflightStore = this.campaignStoreFor(preflightEnvelope);
     const stored = await withEffectBoundary(preflightBoundary, async () => preflightStore.read());
-    const commandEnvelope = await fixturePhaseEnvelope(this.envelope, 'command', request, kind, stored, this.now());
+    const commandAt = this.now();
+    const commandEnvelope = await fixturePhaseEnvelope(this.envelope, 'command', request, kind, stored, commandAt);
     assertAllocated(commandEnvelope, effect);
     const command = sealFixturePhase(this.options.ledgerPath, request, 'command', commandEnvelope, {
       allocation_sha256: preflight.allocationSha256,
       journal_sha256: sha(fs.readFileSync(this.options.ledgerPath)),
       response_sha256: sha(canonical({ stored: stored ?? null, receipt_sha256: sha(fs.readFileSync(preflight.receiptPath)) })),
-    });
+    }, stored ?? null, commandAt);
     const boundary = new EffectBoundary(commandEnvelope, command.receiptPath);
     const commandStore = this.campaignStoreFor(commandEnvelope);
     let result: ProcessResult;
@@ -1377,7 +1437,7 @@ export async function runFixtureSetupChild(executable: string, inputPath: string
     options.rootDirectory, options.input.original_deadline_unix_ms, 'command_request', 'fixture_setup_receipt', request => dispatcher.exchange(request));
   return dispatcher.validateReceipt(result.receipt);
 }
-interface OwnedRunTablePlan { account: string; container: string; campaign_root: string; run_root: string; campaign_id: string; run_id: string;
+export interface OwnedRunTablePlan { account: string; container: string; campaign_root: string; run_root: string; campaign_id: string; run_id: string;
   generation: string; publisher_id: string; control_lease_ids: [string, string]; control_operation_ids: string[];
   storage_operation_ids: string[];
   table: string; partition_by_ingestion_date: boolean; owner_id: string; fencing_token: number;
@@ -1546,6 +1606,15 @@ function validateOwnedRunParentReceipt(value: unknown, artifactIdentity: OwnedRu
     throw new Error('Owned-run parent receipt is not bound to the actual durable bridge transcript and build.');
   validateOwnedRunReceipt(value.bridge_receipt, plan, authority, deadline);
 }
+export function validateOwnedRunTableParentReceiptForNoLoad(value: unknown, planValue: unknown,
+  authority: StorageBridgeAuthority, originalDeadlineUnixMs: number): OwnedRunTableParentReceipt {
+  validateOwnedRunTablePlan(planValue);
+  if (!object(value) || !Number.isSafeInteger(value.exchange_count) || Number(value.exchange_count) < 1)
+    throw new Error('No-load preservation requires the actual completed owned-run bridge receipt.');
+  validateOwnedRunParentReceipt(value, APPROVED_OWNED_RUN_BUILD_RECEIPT, planValue, authority,
+    originalDeadlineUnixMs, Number(value.exchange_count));
+  return value;
+}
 export async function initializeOwnedRunTable(options: OwnedRunInitializerOptions): Promise<OwnedRunTableParentReceipt> {
   const now = options.now ?? Date.now;
   if (![options.executable, options.planPath, options.bridgeInputPath, options.rootDirectory, options.ledgerPath].every(path.isAbsolute))
@@ -1569,6 +1638,9 @@ export async function initializeOwnedRunTable(options: OwnedRunInitializerOption
     validateOwnedRunParentReceipt(cached, artifactIdentity, plan, authority, deadline, dispatcher.recordedRequestCount);
     dispatcher.assertDeltaCommitReadback(cached.bridge_receipt.receipt.delta, plan);
     dispatcher.assertPlannedStorageOperationsComplete();
+    const current = await options.store.read();
+    if (!current?.state.runInventory || JSON.stringify(current.state.runInventory.owned_run_table_initialization) !== JSON.stringify(cached))
+      throw new Error('Cached owned-run receipt lacks its original guarded RunInventory persistence; refusing replay.');
     return cached;
   }
   assertBridgeLive(options.envelope, deadline, now);
@@ -1587,5 +1659,19 @@ export async function initializeOwnedRunTable(options: OwnedRunInitializerOption
     artifact_identity: artifactIdentity, exchange_count: child.exchangeCount, bridge_receipt: child.receipt };
   validateOwnedRunParentReceipt(result, artifactIdentity, plan, authority, deadline, dispatcher.recordedRequestCount);
   dispatcher.recordTerminalEvidence(result);
+  const current = await options.store.read();
+  const inventory = current?.state.runInventory;
+  if (!current || current.state.status !== 'active' || !inventory || inventory.campaign_id !== plan.campaign_id ||
+      inventory.cell_run_id !== plan.run_id || inventory.owner_id !== plan.owner_id || inventory.fencing_token !== plan.fencing_token ||
+      inventory.load_admission !== 'not_authorized' || inventory.owned_run_table_initialization !== undefined || now() >= deadline)
+    throw new Error('Owned-run no-load receipt cannot be persisted outside its exact active not_authorized cell.');
+  const updated = { ...inventory, owned_run_table_initialization: result };
+  await compareAndSwapRunInventory(options.store, current, updated, async () => {
+    const latest = await options.store.read();
+    if (!latest || latest.state.status !== 'active' || latest.state.campaignId !== plan.campaign_id ||
+        latest.state.ownerId !== plan.owner_id || latest.state.fencingToken !== plan.fencing_token ||
+        latest.state.runInventory?.cell_run_id !== plan.run_id || latest.state.runInventory?.load_admission !== 'not_authorized' ||
+        now() >= deadline) throw new Error('Owned-run receipt RunInventory CAS authority or original deadline changed.');
+  });
   return result;
 }

@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { test, type TestContext } from 'node:test';
 import { Azure, Config, TAGS, canonical_json, type HttpReceipt } from '../../infra/azure/bootstrap.js';
 import { CampaignConflictError, CampaignWriteOutcomeUnknownError, CUSTODY_CLEANUP_STEPS, newCampaignState, type CampaignState, type CampaignStore, type RunInventory } from './aks-campaign.js';
-import { captureCellBaseline, captureTerminalData, observeDataPreservation } from './aks-data-safety.js';
+ import { captureCellBaseline, captureTerminalData, observeDataPreservation } from './aks-data-safety.js';
 import type { CleanupMutationAuthority } from './aks-cleanup-executor.js';
 import { createDefaultCleanupProviders } from './aks-default-providers.js';
 
@@ -72,6 +72,24 @@ function fixture(t: TestContext) {
     change: (update: Partial<CampaignState>) => { state = { ...state, ...update }; },
     inventory, deny: () => { denyStorage = true; }, lose: () => { loseWrite = true; } };
 }
+test('qap-null producer preservation refuses without the owned Delta receipt and persisted absence proofs', async t => {
+  const f = fixture(t), namespace = f.inventory.namespace.name;
+  const ficPlan = { version: 1, runId: cellId, namespace, serviceAccount: 'fixture-sa',
+    identityId: f.azure.c.identity_id, resourceId: f.azure.c.identity_id + '/federatedIdentityCredentials/arrowcol-run-' + cellId,
+    clientId: ownerId, tenantId: ownerId, aksId: f.azure.c.base + '/providers/Microsoft.ContainerService/managedClusters/' + f.azure.c.cluster,
+    server: 'https://fixture.example', credentialName: 'arrowcol-run-' + cellId, issuer: 'https://issuer.example',
+    subject: 'system:serviceaccount:' + namespace + ':fixture-sa', audience: 'api://AzureADTokenExchange' } satisfies NonNullable<RunInventory['fic']>['plan'];
+  const step = { state: 'complete' as const, deadline_unix_ms: Date.now() + 60_000, reason_code: null };
+  const resourceId = ficPlan.resourceId, ficName = ficPlan.credentialName;
+  const inventory: RunInventory = { ...f.inventory, qap: null, namespace: { ...f.inventory.namespace, uid: cellId },
+    evidence_destination: { account: f.azure.c.account, container: f.azure.c.checkpoints, blob_prefix: 'campaign/' + cellId },
+    fic: { resource_id: resourceId, name: ficName, state: 'absent', absence: { resource_id: resourceId, name: ficName,
+      observed_at_unix_ms: Date.now() }, plan: ficPlan },
+    cleanup: { ...f.inventory.cleanup, bounded_drain: step } };
+  f.change({ runInventory: inventory });
+  const authority: CleanupMutationAuthority = { mode: 'producer', campaignId, ownerId, fencingToken: 1, assertCurrent: async () => {} };
+  await assert.rejects(observeDataPreservation(f.store, f.azure, f.state, authority), /owned Delta v0 receipt/);
+});
 test('capture-cell-baseline freezes positive exact absence, not zero rows, and reuses the original version', async t => {
   const f = fixture(t), receipt = await captureCellBaseline(f.store, f.azure, f.input);
   assert.equal(receipt.delta_state, 'observed_absent');

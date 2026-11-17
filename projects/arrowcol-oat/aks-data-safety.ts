@@ -7,6 +7,7 @@ import { readDeltaReference, parseDeltaReplayReference, verifyDeltaPreservation,
 import type { CleanupMutationAuthority } from './aks-cleanup-executor.js';
 import { create_namespace_deletion_journal } from '../../infra/azure/aks-namespace-custody.js';
 import { find_run_fic_record, plan_run_fic } from '../../infra/azure/run_fic.js';
+import { validateOwnedRunTableParentReceiptForNoLoad, type OwnedRunTableParentReceipt, type StorageBridgeAuthority } from './aks-d47-bridge.js';
 
 const digest = (value: unknown) => createHash('sha256').update(canonical_json(value)).digest('hex');
 function object(value: unknown): Record<string, unknown> {
@@ -93,9 +94,10 @@ export interface DataPreservationReceipt {
   schema_version: 1; scope: 'delta_and_non_run_kusto_preservation'; campaign_id: string; cell_run_id: string;
   status: 'preserved' | 'unknown' | 'failed'; reason: string | null; observed_at_unix_ms: number; evidence_etag: string;
   delta: Awaited<ReturnType<typeof verifyDeltaPreservation>> | {
-    status: 'preserved'; reason: 'setup_not_load_authorized'; disposition: 'setup_not_load_authorized';
-    current: null; purge_explained_rows: null;
+    status: 'preserved'; reason: 'setup_not_load_authorized' | 'owned_run_table_empty_no_load';
+    disposition: 'setup_not_load_authorized' | 'owned_run_table_empty_no_load'; current: null; purge_explained_rows: null;
   };
+  owned_run_table_initialization: OwnedRunTableParentReceipt | null;
   non_run_kusto: Array<{ identity: StampKustoTable; after: KustoCountReceipt; qap_after: QapStateReceipt | null }>;
   run_owned_qap_after: { rows: null; reason: 'run_owned_qap_removed_by_design' };
 }
@@ -110,6 +112,22 @@ function validateQapState(value: unknown): QapStateReceipt {
     is_healthy: record.is_healthy, not_healthy_reason_present: record.not_healthy_reason_present,
     pending_files: integer(record.pending_files), row_count: integer(record.row_count),
     accelerated_row_count: integer(record.accelerated_row_count), table_version: integer(record.table_version) };
+}
+function ownedRunStorageAuthority(value: unknown): StorageBridgeAuthority {
+  const record = object(value), keys = ['campaign_id', 'cell_run_id', 'owner_id', 'fencing_token', 'storage_account',
+    'table_root_url', 'control_container_url', 'sandbox_id', 'reset_generation'];
+  if (Object.keys(record).sort().join() !== [...keys].sort().join() || keys.filter(key => key !== 'fencing_token').some(key =>
+      typeof record[key] !== 'string') || typeof record.fencing_token !== 'number' || !Number.isSafeInteger(record.fencing_token) ||
+      record.fencing_token < 1)
+    throw new Error('Owned-run no-load storage authority is malformed.');
+  const text = (key: string) => {
+    const value = record[key];
+    if (typeof value !== 'string') throw new Error('Owned-run no-load storage authority is malformed.');
+    return value;
+  };
+  return { campaign_id: text('campaign_id'), cell_run_id: text('cell_run_id'), owner_id: text('owner_id'),
+    fencing_token: record.fencing_token, storage_account: text('storage_account'), table_root_url: text('table_root_url'),
+    control_container_url: text('control_container_url'), sandbox_id: text('sandbox_id'), reset_generation: text('reset_generation') };
 }
 function validateCampaignBaseline(value: Record<string, unknown>, state: CampaignState) {
   if (value.schema_version !== 1 || value.campaign_id !== state.campaignId || value.owner_id !== state.ownerId ||
@@ -405,22 +423,50 @@ export async function observeDataPreservation(store: CampaignStore, azure: Azure
   if (!campaign) throw new Error('Original stamp preservation reference is absent.');
   validateCampaignBaseline(campaign.value, state);
   let delta: DataPreservationReceipt['delta'];
+  let ownedRunInitialization: OwnedRunTableParentReceipt | null = null;
   let references: { before_etag: string; terminal_etag: string } | null = null;
   if (inventory.qap === null) {
-    const plan = inventory.fic?.plan;
-    if (authority.mode !== 'controller' || state.status !== 'cleaning' || inventory.fencing_token >= authority.fencingToken ||
-        inventory.load_admission !== 'not_authorized' || !inventory.namespace.uid || !plan ||
-        canonical_json(plan) !== canonical_json(await plan_run_fic(azure, plan.runId, plan.namespace, plan.serviceAccount)) ||
-        plan.runId !== inventory.cell_run_id || plan.namespace !== inventory.namespace.name)
-      throw new Error('Missing QAP is not no-load evidence; exact fenced not_authorized setup is required.');
-    await create_namespace_deletion_journal(azure, { version: 1, runId: inventory.cell_run_id, namespace: inventory.namespace.name,
-      namespaceUid: inventory.namespace.uid, namespaceOwner: inventory.namespace.owner_token, aksId: plan.aksId, server: plan.server }, authority).stopped();
-    const fic = await find_run_fic_record(azure, plan, authority);
-    if (inventory.fic?.state === 'removed' ? !fic || fic.phase !== 'deleted' || fic.namespaceUid !== inventory.namespace.uid ||
-        fic.namespaceOwner !== inventory.namespace.owner_token : inventory.fic?.state !== 'absent' || !inventory.fic.absence)
-      throw new Error('No-load final preservation requires the original exact FIC removal/absence proof.');
-    delta = { status: 'preserved', reason: 'setup_not_load_authorized', disposition: 'setup_not_load_authorized',
-      current: null, purge_explained_rows: null };
+    const fic = inventory.fic, ficPlan = fic?.plan;
+    if (!fic || !ficPlan || ficPlan.runId !== inventory.cell_run_id || ficPlan.namespace !== inventory.namespace.name)
+      throw new Error('No-load final preservation requires the exact persisted FIC setup plan.');
+    if (authority.mode === 'producer' && state.status === 'active') {
+      if (durable.state.status !== 'active' || durable.state.runInventory?.load_admission !== 'not_authorized' ||
+          inventory.load_admission !== 'not_authorized' || authority.campaignId !== inventory.campaign_id ||
+          authority.ownerId !== inventory.owner_id || authority.fencingToken !== inventory.fencing_token ||
+          !inventory.namespace.uid || inventory.cleanup.bounded_drain.state !== 'complete' ||
+          !fic || !['absent', 'removed'].includes(fic.state) || !fic.absence || !fic.resource_id || !fic.name ||
+          fic.absence.resource_id !== fic.resource_id || fic.absence.name !== fic.name ||
+          inventory.resources.some(resource => !['absent', 'removed'].includes(resource.state) || !resource.absence) ||
+          !inventory.evidence_destination || !inventory.owned_run_table_initialization)
+        throw new Error('Producer no-load preservation requires not_authorized, a drained owned Delta v0 receipt, and persisted inventory/FIC absence.');
+      const parent = object(inventory.owned_run_table_initialization), bridge = object(parent.bridge_receipt), bridgeReceipt = object(bridge.receipt);
+      const plan = object(bridgeReceipt.allocation), storageAuthority = ownedRunStorageAuthority(bridge.authority);
+      const deadline = integer(bridge.original_deadline_unix_ms);
+      if (deadline <= state.startedAtMs || deadline > state.expiresAtMs || plan.campaign_id !== inventory.campaign_id ||
+          plan.run_id !== inventory.cell_run_id || plan.owner_id !== inventory.owner_id || plan.fencing_token !== inventory.fencing_token ||
+          plan.account !== inventory.evidence_destination.account || plan.container !== inventory.evidence_destination.container ||
+          storageAuthority.campaign_id !== inventory.campaign_id || storageAuthority.cell_run_id !== inventory.cell_run_id ||
+          storageAuthority.owner_id !== inventory.owner_id || storageAuthority.fencing_token !== inventory.fencing_token ||
+          storageAuthority.sandbox_id !== azure.c.sandbox || storageAuthority.reset_generation !== plan.generation)
+        throw new Error('Owned Delta initializer receipt differs from the exact campaign, cell, stamp generation, or storage root.');
+      ownedRunInitialization = validateOwnedRunTableParentReceiptForNoLoad(inventory.owned_run_table_initialization,
+        bridgeReceipt.allocation, storageAuthority, deadline);
+      delta = { status: 'preserved', reason: 'owned_run_table_empty_no_load', disposition: 'owned_run_table_empty_no_load',
+        current: null, purge_explained_rows: null };
+    } else {
+      if (authority.mode !== 'controller' || state.status !== 'cleaning' || inventory.fencing_token >= authority.fencingToken ||
+          inventory.load_admission !== 'not_authorized' || !inventory.namespace.uid ||
+          canonical_json(ficPlan) !== canonical_json(await plan_run_fic(azure, ficPlan.runId, ficPlan.namespace, ficPlan.serviceAccount)))
+        throw new Error('Missing QAP is not no-load evidence; exact fenced not_authorized setup is required.');
+      await create_namespace_deletion_journal(azure, { version: 1, runId: inventory.cell_run_id, namespace: inventory.namespace.name,
+        namespaceUid: inventory.namespace.uid, namespaceOwner: inventory.namespace.owner_token, aksId: ficPlan.aksId, server: ficPlan.server }, authority).stopped();
+      const observedFic = await find_run_fic_record(azure, ficPlan, authority);
+      if (fic.state === 'removed' ? !observedFic || observedFic.phase !== 'deleted' || observedFic.namespaceUid !== inventory.namespace.uid ||
+          observedFic.namespaceOwner !== inventory.namespace.owner_token : fic.state !== 'absent' || !fic.absence)
+        throw new Error('No-load final preservation requires the original exact FIC removal/absence proof.');
+      delta = { status: 'preserved', reason: 'setup_not_load_authorized', disposition: 'setup_not_load_authorized',
+        current: null, purge_explained_rows: null };
+    }
   } else {
     const before = await readBlob(azure, cellBlob(inventory, 'delta-before'), authority.assertCurrent);
     const terminal = await readBlob(azure, cellBlob(inventory, 'delta-terminal'), authority.assertCurrent);
@@ -475,13 +521,15 @@ export async function observeDataPreservation(store: CampaignStore, azure: Azure
   await authority.assertCurrent();
   const result = { schema_version: 1 as const, scope: 'delta_and_non_run_kusto_preservation' as const, campaign_id: state.campaignId,
     cell_run_id: inventory.cell_run_id, origin: origin(inventory), status, reason, observed_at_unix_ms: Date.now(),
-    delta, references, non_run_kusto: nonRun, run_owned_qap_after: { rows: null, reason: 'run_owned_qap_removed_by_design' } };
+    delta, references, owned_run_table_initialization: ownedRunInitialization, non_run_kusto: nonRun,
+    run_owned_qap_after: { rows: null, reason: 'run_owned_qap_removed_by_design' } };
   const etag = await immutableBlob(azure, cellBlob(inventory, 'data-final/' + digest(result)), result, authority.assertCurrent);
   if (status === 'preserved') {
     const originalFinal = await readBlob(azure, cellBlob(inventory, 'data-final'), authority.assertCurrent);
     if (!originalFinal) await immutableBlob(azure, cellBlob(inventory, 'data-final'), result, authority.assertCurrent);
     else if (originalFinal.value.status !== 'preserved' || canonical_json(originalFinal.value.origin) !== canonical_json(origin(inventory)) ||
-        canonical_json(originalFinal.value.references) !== canonical_json(references))
+        canonical_json(originalFinal.value.references) !== canonical_json(references) ||
+        canonical_json(originalFinal.value.owned_run_table_initialization ?? null) !== canonical_json(ownedRunInitialization))
       throw new Error('Original final cell preservation proof differs; never overwrite it.');
   }
   return { ...result, run_owned_qap_after: { rows: null, reason: 'run_owned_qap_removed_by_design' }, evidence_etag: etag };

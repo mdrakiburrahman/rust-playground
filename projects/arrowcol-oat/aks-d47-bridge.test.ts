@@ -5,12 +5,13 @@ import { execFileSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
-import { EffectBoundary, withEffectBoundary, type EffectEnvelope } from '../../infra/azure/effect-boundary.js';
+import { EffectBoundary, effectAllocationFingerprint, withEffectBoundary, type EffectEnvelope } from '../../infra/azure/effect-boundary.js';
 import { initializeOwnedRunTable, PLANNED_CONTROL_OPERATION_IDS, PLANNED_STORAGE_OPERATION_IDS,
-  runFixtureSetupChild, StorageBridgeDispatcher, type FixtureDispatcherOptions, type FixtureSetupInput,
+  assertFixturePhaseOrder, runFixtureSetupChild, StorageBridgeDispatcher, type FixtureCommandRequest, type FixtureSetupInput,
   type StorageBridgeAuthority, type StorageBridgeRequest } from './aks-d47-bridge.js';
-import type { Azure } from '../../infra/azure/bootstrap.js';
-import { createBlobCampaignStore, newCampaignState, publishRunInventory, runInventoryPublishReceipt,
+import { Azure, Config } from '../../infra/azure/bootstrap.js';
+import { defaultStampConfig } from '../../infra/azure/stamp.js';
+import { createBlobCampaignStore, newCampaignState,
   type CampaignStore, type RunInventory, type StoredCampaign } from './aks-campaign.js';
 
 function canonical(value: unknown): string {
@@ -708,6 +709,8 @@ test('real Rust zero-data fixture composes with response-derived Node phase allo
   const serviceAccount = 'fixture-sa';
   const server = 'https://offline.invalid/';
   const subscription = 'c0ffee00-0000-4000-8000-000000000107';
+  const stampConfig = defaultStampConfig({ AZURE_SUBSCRIPTION_ID: subscription });
+  const config = new Config({ AZURE_SUBSCRIPTION_ID: subscription }, stampConfig);
   const identityId = `/subscriptions/${subscription}/resourceGroups/offline/providers/Microsoft.ManagedIdentity/userAssignedIdentities/fixture`;
   const ficPlan = {
     version: 1 as const, runId: run, namespace, serviceAccount,
@@ -727,7 +730,7 @@ test('real Rust zero-data fixture composes with response-derived Node phase allo
     namespace: { name: namespace, uid: null, owner_token: owner }, resources: [],
     fic: { resource_id: null, name: null, state: 'planned', absence: null, plan: ficPlan },
     qap: null, planned_cell_duration_ms: 0,
-    evidence_destination: { account: 'offlinestorage', container: 'checkpoints',
+    evidence_destination: { account: config.account, container: config.checkpoints,
       blob_prefix: `campaigns/${campaign}/cells/${run}/evidence` },
     effective_stop_budgets: { maintenance_grace_seconds: 4_800, maintenance_stop_timeout_ms: 5_100_000 },
     cleanup: { stop_admission: notStarted(), bounded_drain: notStarted(), evidence_capture: notStarted(),
@@ -756,26 +759,53 @@ test('real Rust zero-data fixture composes with response-derived Node phase allo
   const inputPath = path.join(directory, 'fixture-input.json'), ledgerPath = path.join(directory, 'fixture-ledger.jsonl');
   writeFileSync(inputPath, JSON.stringify(input), { mode: 0o600 });
   chmodSync(inputPath, 0o600);
+  writeFileSync(input.stamp_config_path, JSON.stringify(stampConfig), { mode: 0o600 });
+  chmodSync(input.stamp_config_path, 0o600);
+  writeFileSync(input.bootstrap_env_file, 'ARM_SUBSCRIPTION_ID=' + subscription + '\nCAMPAIGN_STORAGE_ACCOUNT=' + config.account +
+    '\nCAMPAIGN_STATE_CONTAINER=' + config.checkpoints + '\n', { mode: 0o600 });
+  chmodSync(input.bootstrap_env_file, 0o600);
 
-  const resource = 'https://offlinestorage.blob.core.windows.net/checkpoints';
+  const resource = 'https://' + config.account + '.blob.core.windows.net/' + config.checkpoints;
   const activePath = '/checkpoints/active.json';
   const effects: EffectEnvelope['effects'] = [
     { id: 'active-read', transport: 'campaign-blob', method: 'GET', resource, path: activePath, max_calls: 1 },
     { id: 'active-write', transport: 'campaign-blob', method: 'PUT', resource, path: activePath, max_calls: 1 },
     { id: 'baseline-read', transport: 'campaign-blob', method: 'GET', resource,
-      path: `/checkpoints/campaigns/${campaign}/baseline.json`, max_calls: 1 },
+      path: `/checkpoints/_arrowcol-custody/campaigns/${campaign}/baseline.json`, max_calls: 1 },
+    { id: 'baseline-azure-read', transport: 'azure-rest', method: 'GET',
+      resource: `https://${config.account}.blob.core.windows.net|https://storage.azure.com/`,
+      path: `/checkpoints/_arrowcol-custody/campaigns/${campaign}/baseline.json`, max_calls: 3 },
   ];
   const envelope: EffectEnvelope = { schema_version: 1, campaign_id: campaign, run_id: run,
     subscription_id: subscription, resource_group: 'offline',
-    storage_account: 'offlinestorage', state_container: 'checkpoints', effects };
+    storage_account: config.account, state_container: config.checkpoints, effects };
 
   let stored: StoredCampaign = { state: newCampaignState(campaign, owner, now), etag: '"0"' };
+  const baselineCapturedAt = Date.now();
+  const aksId = config.base + '/providers/Microsoft.ContainerService/managedClusters/' + config.cluster;
+  const baseline = { schema_version: 1, campaign_id: campaign, owner_id: owner, producer_fencing_token: 1,
+    started_at_unix_ms: stored.state.startedAtMs, captured_at_unix_ms: baselineCapturedAt,
+    capacity: { scope: 'arm_capacity_only', status: 'capacity_idle',
+      system_pool: { count: 3, vm_size: 'Standard_D8ds_v6', autoscale_enabled: false, autoscale_min: null, autoscale_max: null },
+      kusto: { sku: 'Standard_E4ads_v5', capacity: 2, autoscale_enabled: true, autoscale_min: 2, autoscale_max: 4, auto_stop_enabled: true },
+      receipts: [aksId, ...['systempool', 'benchd64', 'benche64'].map(name => aksId + '/agentPools/' + name), config.cluster_id]
+        .map(resource_id => ({ resource_id, http_status: 200, request_id: 'offline-idle-baseline',
+          body_sha256: '1'.repeat(64), observed_at_unix_ms: baselineCapturedAt })) },
+    non_run_kusto: { schema_version: 1, scope: 'configured_stamp_databases_non_current_run_tables', tables: [],
+      databases: [...new Set([config.database, config.experimentDatabase])], observed_at_unix_ms: baselineCapturedAt,
+      source: '.show tables and .show external tables with exact current run ownership exclusion',
+      empty_reason: 'positive_inventory_contains_no_non_run_tables' } };
   let revision = 0;
-  const store = createBlobCampaignStore({ account: 'offlinestorage', container: 'checkpoints', subscriptionId: subscription },
+  const campaignStateReads: StoredCampaign[] = [];
+  const store = createBlobCampaignStore({ account: config.account, container: config.checkpoints, subscriptionId: subscription },
     async (input, init) => {
       const request = new URL(String(input)), method = (init?.method ?? 'GET').toUpperCase();
       if (request.pathname !== activePath) throw new Error('Unexpected offline campaign blob path.');
-      if (method === 'GET') return new Response(JSON.stringify(stored.state), { status: 200, headers: { etag: stored.etag } });
+      if (method === 'GET') {
+        const snapshot = JSON.parse(JSON.stringify(stored)) as StoredCampaign;
+        campaignStateReads.push(snapshot);
+        return new Response(JSON.stringify(snapshot.state), { status: 200, headers: { etag: snapshot.etag } });
+      }
       if (method === 'PUT') {
         const headers = new Headers(init?.headers);
         if (headers.get('if-match') !== stored.etag || typeof init?.body !== 'string')
@@ -785,8 +815,17 @@ test('real Rust zero-data fixture composes with response-derived Node phase allo
       }
       throw new Error('Unexpected offline campaign blob method.');
     }, async () => 'offline-token');
-  const azure = { c: { account: 'offlinestorage' } } as unknown as Azure;
-  const env = { CAMPAIGN_ID: campaign, CAMPAIGN_OWNER_ID: owner, CAMPAIGN_FENCING_TOKEN: '1' };
+  const azure = new Azure(config);
+  t.mock.method(azure, 'token', async () => 'offline-token');
+  t.mock.method(globalThis, 'fetch', async (input: Parameters<typeof fetch>[0]) => {
+    const url = new URL(String(input));
+    assert.equal(url.pathname, '/checkpoints/_arrowcol-custody/campaigns/' + campaign + '/baseline.json');
+    return new Response(JSON.stringify(baseline), { status: 200,
+      headers: { etag: '"campaign-baseline"', 'x-ms-request-id': 'offline-baseline-read' } });
+  });
+  const env = { CAMPAIGN_ID: campaign, CAMPAIGN_OWNER_ID: owner, CAMPAIGN_FENCING_TOKEN: '1',
+    AZURE_SUBSCRIPTION_ID: subscription, ARM_SUBSCRIPTION_ID: subscription,
+    CAMPAIGN_STORAGE_ACCOUNT: config.account, CAMPAIGN_STATE_CONTAINER: config.checkpoints };
   const namespaceIdentity: Record<string, unknown> = {
     apiVersion: 'v1', kind: 'Namespace', metadata: { name: namespace,
       labels: { 'arrowcol-oat/run-id': run, 'arrowcol-oat/owner-token': owner },
@@ -794,13 +833,7 @@ test('real Rust zero-data fixture composes with response-derived Node phase allo
       uid: 'c0ffee00-0000-4000-8000-000000000108', resourceVersion: '17' },
   };
   let createdResources: Record<string, unknown>[] = [];
-  let kubeCommands = 0, publications = 0;
-  const campaignMain: NonNullable<FixtureDispatcherOptions['campaignMain']> = async (_args, dependencies) => {
-    publications++;
-    const updated = await publishRunInventory(dependencies?.store ?? store, dependencies?.runInventoryInput, now,
-      dependencies?.runInventoryWriteOptions);
-    console.log(JSON.stringify({ ok: true, receipt: runInventoryPublishReceipt(updated) }));
-  };
+  let kubeCommands = 0;
   const runCommand = async (command: string[], stdin: Buffer | undefined) => {
     kubeCommands++;
     const args = command.slice(1);
@@ -832,7 +865,7 @@ test('real Rust zero-data fixture composes with response-derived Node phase allo
 
   const outerBoundary = new EffectBoundary(envelope, path.join(directory, 'outer-effects.jsonl'));
   const receipt = await withEffectBoundary(outerBoundary, () => runFixtureSetupChild(executable, inputPath, {
-    input, rootDirectory: process.cwd(), ledgerPath, envelope, store, azure, env, campaignMain, runCommand, now: () => now,
+    input, rootDirectory: process.cwd(), ledgerPath, envelope, store, azure, env, runCommand, now: () => now,
   }));
   assert.equal(receipt.load_admitted, false);
   assert.equal(receipt.inventory.load_admission, 'not_authorized');
@@ -840,18 +873,61 @@ test('real Rust zero-data fixture composes with response-derived Node phase allo
   assert.equal(receipt.inventory.resources.length, 4);
   assert.ok(receipt.inventory.resources.every(item => item.state === 'observed' && item.uid));
   assert.equal(receipt.command_responses.length, 10);
-  assert.equal(publications, 4);
+  assert.equal(receipt.command_responses.filter(response => response.stdout.includes('\"ok\":true')).length, 4);
   assert.equal(kubeCommands, 6);
   assert.equal((await store.read())?.state.runInventory?.namespace.uid,
     (namespaceIdentity.metadata as Record<string, unknown>).uid);
 
+  const ledgerLines = readFileSync(ledgerPath, 'utf8').trimEnd().split('\n');
+  const ledgerRecords = ledgerLines.map(line => JSON.parse(line) as Record<string, unknown>);
+  const prefixSha = (lineCount: number) => sha(ledgerLines.slice(0, lineCount).join('\n') + '\n');
+  const initialResponse = sha(canonical({ authority, inventory, allocation_sha256: effectAllocationFingerprint(envelope) }));
   for (let requestId = 1; requestId <= 10; requestId++) {
-    const planPath = `${ledgerPath}.phase-${requestId}-command.plan.json`;
-    const plan = JSON.parse(readFileSync(planPath, 'utf8')) as Record<string, unknown>;
-    assert.equal(plan.request_id, requestId);
-    assert.equal(plan.phase, 'command');
-    assert.match(String(plan.allocation_sha256), /^[0-9a-f]{64}$/);
-    assert.match(String(plan.predecessor_journal_sha256), /^[0-9a-f]{64}$/);
-    assert.match(String(plan.predecessor_response_sha256), /^[0-9a-f]{64}$/);
+    const preflightPath = ledgerPath + '.phase-' + requestId + '-preflight.plan.json';
+    const commandPath = ledgerPath + '.phase-' + requestId + '-command.plan.json';
+    const preflight = JSON.parse(readFileSync(preflightPath, 'utf8')) as Record<string, unknown>;
+    const command = JSON.parse(readFileSync(commandPath, 'utf8')) as Record<string, unknown>;
+    const previousAllocation = requestId === 1 ? effectAllocationFingerprint(envelope) :
+      String((JSON.parse(readFileSync(ledgerPath + '.phase-' + (requestId - 1) + '-command.plan.json', 'utf8')) as Record<string, unknown>).allocation_sha256);
+    assert.equal(preflight.predecessor_allocation_sha256, previousAllocation);
+    assert.equal(command.predecessor_allocation_sha256, preflight.allocation_sha256);
+    assert.equal(preflight.predecessor_journal_sha256, prefixSha(1 + 2 * (requestId - 1)));
+    assert.equal(command.predecessor_journal_sha256, prefixSha(2 + 2 * (requestId - 1)));
+    assert.equal(preflight.predecessor_response_sha256, requestId === 1 ? initialResponse :
+      ledgerRecords[2 * (requestId - 1)]?.response_sha256);
+    const preflightReceiptSha = sha(readFileSync(preflightPath + '.receipts', 'utf8'));
+    const expectedCommandResponse = sha(canonical({ stored: command.predecessor_state, receipt_sha256: preflightReceiptSha }));
+    assert.equal(command.predecessor_response_sha256, expectedCommandResponse);
+    const snapshot = campaignStateReads.find(value => sha(canonical({ stored: value, receipt_sha256: preflightReceiptSha })) === expectedCommandResponse);
+    assert.ok(snapshot);
+    assert.deepEqual(command.predecessor_state, snapshot);
   }
+
+  const skippedRequest = { request_id: 2, argv: ['node', 'runner', 'setup', 'kubectl', 'get', 'namespace'], stdin: null };
+  assert.throws(() => assertFixturePhaseOrder(skippedRequest, input, new Map<number, FixtureCommandRequest>(), new Map()), /phase is out of order/);
+  const mismatchedInventory = structuredClone(input.inventory);
+  mismatchedInventory.namespace.name = 'other-fixture';
+  const mismatchedRequest = { request_id: 1, argv: ['node', 'runner', 'setup', 'publish-inventory'],
+    stdin: JSON.stringify(mismatchedInventory) };
+  assert.throws(() => assertFixturePhaseOrder(mismatchedRequest, input, new Map<number, FixtureCommandRequest>(), new Map()), /Initial fixture inventory changed/);
+
+  const cachedKubeCommands = kubeCommands, cachedRevision = revision;
+  const restarted = await runFixtureSetupChild(executable, inputPath, {
+    input, rootDirectory: process.cwd(), ledgerPath, envelope, store, azure, env, runCommand, now: () => now,
+  });
+  assert.deepEqual(restarted, receipt);
+  assert.equal(kubeCommands, cachedKubeCommands);
+  assert.equal(revision, cachedRevision);
+
+  const tamperedPlanPath = ledgerPath + '.phase-2-command.plan.json';
+  const originalPlan = readFileSync(tamperedPlanPath);
+  const tampered = JSON.parse(originalPlan.toString('utf8')) as Record<string, unknown>;
+  tampered.predecessor_journal_sha256 = '0'.repeat(64);
+  writeFileSync(tamperedPlanPath, canonical(tampered) + '\n', { mode: 0o600 });
+  chmodSync(tamperedPlanPath, 0o600);
+  try {
+    await assert.rejects(runFixtureSetupChild(executable, inputPath, {
+      input, rootDirectory: process.cwd(), ledgerPath, envelope, store, azure, env, runCommand, now: () => now,
+    }), /Fixture phase allocation changed after it was sealed/);
+  } finally { writeFileSync(tamperedPlanPath, originalPlan, { mode: 0o600 }); chmodSync(tamperedPlanPath, 0o600); }
 });
