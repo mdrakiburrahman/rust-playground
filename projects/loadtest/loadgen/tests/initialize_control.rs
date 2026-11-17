@@ -115,7 +115,7 @@ fn owned_plan() -> arrowcol_loadgen::initialize::OwnedRunTablePlan {
         control_operation_ids: [
             "registration-read", "registration-acquire", "registration-compare-read", "registration-metadata-write",
             "registration-release", "open-publisher-check", "commit-authority-read", "terminal-read",
-            "terminal-acquire", "terminal-compare-read", "terminal-metadata-write", "terminal-release",
+            "schema-commit-authority-read", "terminal-acquire", "terminal-compare-read", "terminal-metadata-write", "terminal-release",
         ].map(str::to_owned).to_vec(),
         table: "telemetry.sqlserver.sqlserver_availability_replica_states".into(),
         partition_by_ingestion_date: true,
