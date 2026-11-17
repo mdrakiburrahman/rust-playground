@@ -77,6 +77,7 @@ struct Parent {
     objects: BTreeMap<String, String>,
     requests: Vec<Value>,
     receipt: Option<Value>,
+    error: String,
     lease: Option<String>,
     etag: u64,
     releases: usize,
@@ -311,6 +312,7 @@ async fn run(case: Case) -> Result<Parent> {
         objects: BTreeMap::new(),
         requests: Vec::new(),
         receipt: None,
+        error: String::new(),
         lease: None,
         etag: 1,
         releases: 0,
@@ -404,6 +406,7 @@ async fn run(case: Case) -> Result<Parent> {
         parent.receipt.is_some() == status.success(),
         "failure-shaped terminal receipt"
     );
+    parent.error = errors;
     eprintln!(
         "OWNED_BRIDGE_OFFLINE case={case:?} success={} requests={} puts={} members={}",
         status.success(),
@@ -462,9 +465,23 @@ async fn actual_cli_bridge_fresh_refusals_never_adopt_or_replay() -> Result<()> 
                 Some("preserve-original")
             );
             assert_eq!(parent.puts, 0);
+            assert!(
+                parent.error.contains("fresh table target is not empty"),
+                "{}",
+                parent.error
+            );
         }
         if matches!(case, Case::RotateBeforeCommit) {
             assert_eq!(parent.puts, 0);
+            assert!(
+                parent
+                    .requests
+                    .iter()
+                    .any(|request| request["target"] == "object_store")
+            );
+        }
+        if matches!(case, Case::Conflict | Case::RefusedPut) {
+            assert_eq!(parent.puts, 1, "intended refusal was not reached: {}", parent.error);
         }
     }
     Ok(())
@@ -477,6 +494,10 @@ async fn actual_cli_bridge_retains_registration_on_unknown_admission_write_or_dr
         assert_eq!(parent.members()?.len(), 2);
         assert!(parent.receipt.is_none());
         assert_eq!(parent.puts, usize::from(!matches!(case, Case::UnknownAdmission)));
+        assert_eq!(
+            parent.objects.len(),
+            usize::from(!matches!(case, Case::UnknownAdmission))
+        );
     }
     Ok(())
 }
