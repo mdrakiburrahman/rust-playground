@@ -469,13 +469,13 @@ export function createDefaultScaleAdapter(store: CampaignStore, options: {
       const receipt = await findAny();
       const phase = result.outcome === 'keep' ? 'kept' : receipt.phase;
       await transition(receipt, phase, { outcome: result.outcome, committed_rows_per_second: result.committedRowsPerSecond,
-        qap_pending_backlog: result.qapPendingBacklog, qap_p95_latency_ms: result.qapP95LatencyMs,
+        qap_pending_backlog: result.qapPendingBacklog,
         ineffective_increments: result.ineffectiveIncrements, reason: result.reason });
     },
     async finishUnknown(reason) {
       const receipt = await findAny();
       await transition(receipt, receipt.phase, { outcome: 'unknown', committed_rows_per_second: null, qap_pending_backlog: null,
-        qap_p95_latency_ms: null, ineffective_increments: 0, reason });
+        ineffective_increments: 0, reason });
     },
   };
   async function findAny(): Promise<ScaleTrialReceipt> {

@@ -41,8 +41,9 @@ export async function observeExactKubernetes(server: string, args: string[], aut
   if (remaining <= 0) throw new Error('Exact Kubernetes observation budget expired before admission.');
   const response = await runCommand(['kubectl', '--server', server, '--insecure-skip-tls-verify=false',
     '--request-timeout', `${Math.max(1, Math.floor(Math.min(15_000, remaining)))}ms`,
-    'get', ...args, '--ignore-not-found', '--output', 'json'], Math.min(20, remaining / 1000));
-  if (response.returncode !== 0 || response.stdout.length > 4_194_304)
+    'get', ...args, '--ignore-not-found', '--output', 'json'], Math.min(20, remaining / 1000),
+    undefined, undefined, undefined, 4_194_304);
+  if (response.returncode !== 0 || Buffer.byteLength(response.stdout) + Buffer.byteLength(response.stderr) > 4_194_304)
     throw new Error('Exact Kubernetes observation failed; permission/API errors are not absence.');
   if (!response.stdout.trim()) return undefined;
   return object(JSON.parse(response.stdout) as unknown);

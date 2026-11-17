@@ -72,11 +72,11 @@ export interface ScaleEffectDispatch {
 export interface ScaleTrialReceipt {
   schema_version: 1; trial_id: string; campaign_id: string; owner_id: string; fencing_token: number; cell_run_id: string;
   started_at_ms: number; deadline_at_ms: number; restore_deadline_at_ms: number; target: ScaleTarget; restore: ScaleTarget; evidence: string[];
-  baseline: { committed_rows_per_second: number; qap_pending_backlog: number; qap_p95_latency_ms: number };
+  baseline: { committed_rows_per_second: number; qap_pending_backlog: number };
   resource: ScaleResourceIdentity; phase: ScaleTrialPhase; operation_url?: string;
   dispatches?: { apply?: ScaleEffectDispatch; restore?: ScaleEffectDispatch };
   result?: { outcome: 'keep' | 'revert' | 'stop' | 'unknown'; committed_rows_per_second: number | null;
-    qap_pending_backlog: number | null; qap_p95_latency_ms: number | null; ineffective_increments: number; reason: string };
+    qap_pending_backlog: number | null; ineffective_increments: number; reason: string };
 }
 export function validateScaleTarget(value: unknown): ScaleTarget {
   if (!record(value) || !exactRecord(value, ['dimension', 'before', 'after']) ||
@@ -119,10 +119,9 @@ function validScaleTrial(value: unknown, state: CampaignState): value is ScaleTr
       target.dimension !== restore.dimension || target.before !== restore.after || target.after !== restore.before ||
       !Array.isArray(value.evidence) || value.evidence.length < 1 || value.evidence.length > 8 ||
       value.evidence.some(item => typeof item !== 'string' || item.length > 64 || !/^[a-z0-9-]+$/.test(item)) ||
-      !record(value.baseline) || !exactRecord(value.baseline, ['committed_rows_per_second', 'qap_pending_backlog', 'qap_p95_latency_ms']) ||
+      !record(value.baseline) || !exactRecord(value.baseline, ['committed_rows_per_second', 'qap_pending_backlog']) ||
       typeof value.baseline.committed_rows_per_second !== 'number' || !Number.isFinite(value.baseline.committed_rows_per_second) || value.baseline.committed_rows_per_second < 0 ||
-      !nonnegative(value.baseline.qap_pending_backlog) || typeof value.baseline.qap_p95_latency_ms !== 'number' ||
-      !Number.isFinite(value.baseline.qap_p95_latency_ms) || value.baseline.qap_p95_latency_ms < 0 ||
+      !nonnegative(value.baseline.qap_pending_backlog) ||
       value.schema_version !== 1 || !uuid.test(String(value.trial_id)) || value.campaign_id !== state.campaignId ||
       value.owner_id !== state.ownerId || !nonnegative(value.fencing_token) || value.fencing_token < 1 ||
       value.fencing_token > state.fencingToken || !state.runInventory || state.mode !== 'armed' ||
@@ -163,12 +162,12 @@ function validScaleTrial(value: unknown, state: CampaignState): value is ScaleTr
   }
   if (value.result !== undefined) {
     const result = value.result;
-    if (!record(result) || !exactRecord(result, ['outcome', 'committed_rows_per_second', 'qap_pending_backlog', 'qap_p95_latency_ms', 'ineffective_increments', 'reason']) ||
+    if (!record(result) || !exactRecord(result, ['outcome', 'committed_rows_per_second', 'qap_pending_backlog', 'ineffective_increments', 'reason']) ||
         !['keep', 'revert', 'stop', 'unknown'].includes(String(result.outcome)) ||
-        ![result.committed_rows_per_second, result.qap_p95_latency_ms].every(item => item === null || typeof item === 'number' && Number.isFinite(item) && item >= 0) ||
+        !(result.committed_rows_per_second === null || typeof result.committed_rows_per_second === 'number' && Number.isFinite(result.committed_rows_per_second) && result.committed_rows_per_second >= 0) ||
         !(result.qap_pending_backlog === null || nonnegative(result.qap_pending_backlog)) || typeof result.ineffective_increments !== 'number' || !Number.isSafeInteger(result.ineffective_increments) || result.ineffective_increments < 0 ||
         typeof result.reason !== 'string' || result.reason.length === 0 || result.reason.length > 128 || /[\u0000-\u001f]/.test(result.reason) ||
-        result.outcome === 'unknown' !== [result.committed_rows_per_second, result.qap_pending_backlog, result.qap_p95_latency_ms].every(item => item === null)) return false;
+        result.outcome === 'unknown' !== [result.committed_rows_per_second, result.qap_pending_backlog].every(item => item === null)) return false;
   }
   if (resource.transport === 'azure-rest') {
     if (!String(resource.resource_id).startsWith('/subscriptions/') || resource.namespace !== null || resource.uid !== null ||

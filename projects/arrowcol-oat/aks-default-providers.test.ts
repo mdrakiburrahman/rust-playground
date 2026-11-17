@@ -126,7 +126,8 @@ test('exact Kubernetes observations use the injected command boundary', async ()
   const command: string[] = [], authority: CleanupMutationAuthority = {
     campaignId, ownerId, fencingToken: 1, assertCurrent: async () => {},
   };
-  const runCommand: CustodyCommandRunner = async args => {
+  const runCommand: CustodyCommandRunner = async (args, _timeout, _cwd, _env, _stderr, maxOutputBytes) => {
+    assert.equal(maxOutputBytes, 4_194_304);
     command.push(...args);
     return { returncode: 0, stdout: JSON.stringify({ apiVersion: 'v1', kind: 'Namespace' }), stderr: '' };
   };

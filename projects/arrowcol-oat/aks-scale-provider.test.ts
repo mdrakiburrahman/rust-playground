@@ -130,13 +130,13 @@ function controllerState(current: CampaignState, receipt: ScaleTrialReceipt, now
 
 const poolStep: ScaleStep = { dimension: 'collector-node-max', before: 1, after: 2, evidence: ['collector-placement-blocked'],
   restore: { dimension: 'collector-node-max', before: 2, after: 1 }, baselineCommittedRowsPerSecond: 1000,
-  baselineQapPendingBacklog: 0, baselineQapP95LatencyMs: 100 };
+  baselineQapPendingBacklog: 0 };
 const clientStep: ScaleStep = { dimension: 'loadgen-max', before: 2, after: 3, evidence: ['generator-cpu-saturated'],
   restore: { dimension: 'loadgen-max', before: 3, after: 2 }, baselineCommittedRowsPerSecond: 1000,
-  baselineQapPendingBacklog: 0, baselineQapP95LatencyMs: 100 };
+  baselineQapPendingBacklog: 0 };
 const cpuStep: ScaleStep = { dimension: 'collector-cpu-limit', before: 1, after: 2, evidence: ['collector-cpu-saturated'],
   restore: { dimension: 'collector-cpu-limit', before: 2, after: 1 }, baselineCommittedRowsPerSecond: 1000,
-  baselineQapPendingBacklog: 0, baselineQapP95LatencyMs: 100 };
+  baselineQapPendingBacklog: 0 };
 
 test('scale admission rejects live rolling updates and multiple physical collector writers', async t => {
   for (const [strategy, writers] of [['RollingUpdate', 1], ['Recreate', 2]] as const) {
