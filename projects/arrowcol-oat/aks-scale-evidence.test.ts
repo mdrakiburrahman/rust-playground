@@ -150,7 +150,8 @@ test('native observations use immutable cell custody, original windows and exact
   assert.equal(measured.qap.growing, true);
   assert.equal(measured.qap.samples[0]!.lastUpdatedDateTime, '2010-01-01T00:00:00Z');
   assert.equal(measured.pods[0]!.cpuCores, 2);
-  assert.equal(measured.pods[0]!.cpuSaturated, true);
+  assert.equal(measured.pods[0]!.cpuSaturated, null);
+  assert.equal(measured.pods[0]!.counterObservationScope, 'bracketing_source_intervals_not_original_window_averages');
   assert.equal(measured.pods[0]!.memorySaturated, true);
   assert.equal(measured.pods[0]!.rxBytesPerSecond, 1_000_000);
   assert.equal(measured.pods[0]!.networkSaturated, null);
@@ -177,12 +178,12 @@ test('native dimensions independently refuse wrong source, resource identity, pa
       assert.equal(measured.pods[0]!.cpuSaturated, null, defect);
       if (defect !== 'pod-id') assert.equal(measured.pods[0]!.memorySaturated, true, defect);
     }
-    if (['qap-origin', 'qap-table'].includes(defect)) assert.equal(measured.pods[0]!.cpuSaturated, true, defect);
+    if (['qap-origin', 'qap-table'].includes(defect)) assert.equal(measured.pods[0]!.cpuCores, 2, defect);
     assert.match(measured.authorization, /hold/);
   }
 });
 
-test('native throttling needs timestamped CFS history and quantized CPU near a threshold remains unknown', async t => {
+test('native throttling needs timestamped CFS history and ambiguous CPU windows remain unknown', async t => {
   for (const timestamps of [true, false]) {
     const f = syntheticNativeTransport(t);
     f.history.samples.forEach((frame, i) => Object.assign(frame.pods[0]!, { throttling: {
@@ -192,8 +193,8 @@ test('native throttling needs timestamped CFS history and quantized CPU near a t
     f.publishSyntheticDocument();
     const measured = await readOfficialNativeWindow(f.options);
     assert.equal(measured.pods[0]!.throttling, timestamps ? 0.2 : null);
-    assert.equal(measured.pods[0]!.throttled, timestamps ? true : null);
-    assert.equal(measured.pods[0]!.cpuSaturated, true);
+    assert.equal(measured.pods[0]!.throttled, null);
+    assert.equal(measured.pods[0]!.cpuSaturated, null);
   }
   const f = syntheticNativeTransport(t);
   const base = 9_007_199_254_740_993n, first = f.history.samples[0]!.request_start_unix_ms;
@@ -202,7 +203,68 @@ test('native throttling needs timestamped CFS history and quantized CPU near a t
   });
   f.publishSyntheticDocument();
   assert.equal((await readOfficialNativeWindow(f.options)).pods[0]!.cpuSaturated, null,
-    'reported source-time precision cannot become a false positive at the 90% boundary');
+    'boundary contributions or source-time precision cannot become a false positive at the 90% boundary');
+});
+
+test('original-window counter saturation does not inherit an exterior CPU average', async t => {
+  for (const [name, increments, saturated] of [
+    ['92 percent original usage diluted by idle exterior', [0n, 16_652_000_000n, 35_052_000_000n, 55_200_000_000n], null],
+    ['outside-only burst cannot prove original saturation', [0n, 64_000_000_000n, 64_000_000_000n, 64_000_000_000n], null],
+    ['interior work alone proves saturation', [0n, 1_000_000_000n, 56_000_000_000n, 60_000_000_000n], true],
+    ['all bracketing work is below the original threshold', [0n, 10_000_000_000n, 20_000_000_000n, 25_000_000_000n], false],
+  ] as const) {
+    await t.test(name, async t => {
+      const f = syntheticNativeTransport(t);
+      f.history.samples.forEach((frame, i) => {
+        frame.pods[0]!.cpu.usage_core_nanoseconds = (9_007_199_254_740_993n + increments[i]!).toString();
+      });
+      f.publishSyntheticDocument();
+      const measured = await readOfficialNativeWindow(f.options);
+      assert.equal(measured.pods[0]!.cpuSaturated, saturated);
+    });
+  }
+});
+
+test('original-window counter saturation does not inherit an exterior CFS fraction', async t => {
+  for (const [name, counts, saturated] of [
+    ['boundary contributions can hide original throttling', [0, 0, 20, 20], null],
+    ['outside-only throttling cannot prove original throttling', [0, 40, 40, 40], null],
+    ['interior throttling proves the original threshold', [0, 0, 40, 40], true],
+    ['all bracketing throttling is below the original threshold', [0, 0, 1, 1], false],
+  ] as const) {
+    await t.test(name, async t => {
+      const f = syntheticNativeTransport(t);
+      f.history.samples.forEach((frame, i) => Object.assign(frame.pods[0]!, { throttling: {
+        time_unix_ns: frame.pods[0]!.cpu.time_unix_ns, time_resolution_ns: '1000000',
+        periods: String(1000 + 100 * i), throttled_periods: String(100 + counts[i]!),
+      } }));
+      f.publishSyntheticDocument();
+      assert.equal((await readOfficialNativeWindow(f.options)).pods[0]!.throttled, saturated);
+    });
+  }
+});
+
+test('original-window CPU bounds do not assign a precision-straddling counter to the exterior', async t => {
+  for (const [resolution, expected] of [['1', false], ['1000000000', null]] as const) {
+    await t.test(resolution + 'ns precision', async t => {
+      const f = syntheticNativeTransport(t), start = f.history.window_start_unix_ms;
+      const increments = [0n, 16_652_000_000n, 35_052_000_000n, 55_200_000_000n];
+      f.history.samples.forEach((frame, i) => {
+        frame.pods[0]!.cpu.usage_core_nanoseconds = (9_007_199_254_740_993n + increments[i]!).toString();
+      });
+      const boundary = structuredClone(f.history.samples[0]!);
+      boundary.request_start_unix_ms = start - 100;
+      boundary.request_end_unix_ms = start + 100;
+      boundary.qap.observed_unix_ms = start - 50;
+      for (const metric of [boundary.pods[0]!.cpu, boundary.pods[0]!.memory, boundary.pods[0]!.network])
+        metric.time_unix_ns = (BigInt(start - 50) * 1_000_000n).toString();
+      boundary.pods[0]!.cpu.time_resolution_ns = resolution;
+      boundary.pods[0]!.cpu.usage_core_nanoseconds = (9_007_199_254_740_993n + 10_000_000_000n).toString();
+      f.history.samples.splice(1, 0, boundary);
+      f.publishSyntheticDocument();
+      assert.equal((await readOfficialNativeWindow(f.options)).pods[0]!.cpuSaturated, expected);
+    });
+  }
 });
 
 test('actual Rust native pod/cAdvisor producer bytes cross the authenticated immutable reader', async t => {
@@ -216,10 +278,10 @@ test('actual Rust native pod/cAdvisor producer bytes cross the authenticated imm
   f.publishSyntheticDocument();
   const measured = await readOfficialNativeWindow(f.options);
   assert.equal(measured.pods[0]!.cpuCores, 2);
-  assert.equal(measured.pods[0]!.cpuSaturated, true);
+  assert.equal(measured.pods[0]!.cpuSaturated, null);
   assert.equal(measured.pods[0]!.memorySaturated, true);
   assert.equal(measured.pods[0]!.throttling, 0.2);
-  assert.equal(measured.pods[0]!.throttled, true);
+  assert.equal(measured.pods[0]!.throttled, null);
   assert.match(measured.authorization, /hold/);
 });
 

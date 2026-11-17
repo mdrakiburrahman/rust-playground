@@ -186,6 +186,7 @@ interface NativeQapWindow {
 }
 interface NativePodWindow {
   identity: JsonRecord;
+  counterObservationScope: 'bracketing_source_intervals_not_original_window_averages';
   cpuCores: number | null;
   cpuCounterInterval: { startUnixNs: string; endUnixNs: string } | null;
   cpuSaturated: boolean | null;
@@ -229,7 +230,8 @@ function sameNativeOrigin(left: unknown, right: unknown): boolean {
   } catch { return false; }
 }
 function nativeSeries(rows: JsonRecord[], key: string, start: number, end: number,
-  counter: string): { first: bigint; last: bigint; firstNs: bigint; lastNs: bigint; firstUpperNs: bigint; lastUpperNs: bigint } | null {
+  counter: string): { first: bigint; last: bigint; firstNs: bigint; lastNs: bigint;
+    originalMinimum: bigint; originalMaximum: bigint; increments: bigint[] } | null {
   const series = rows.map(row => {
     const metric = record(row[key]) ? row[key] : {};
     const identity = record(row.identity) ? row.identity : {};
@@ -252,8 +254,17 @@ function nativeSeries(rows: JsonRecord[], key: string, start: number, end: numbe
     const before = series[i - 1]!, after = series[i]!;
     if (after.time! <= before.time! || after.time! - before.time! > bound || after.value! < before.value!) return null;
   }
+  const reverse = [...series].reverse();
+  const beforeStart = reverse.find(point => upper(point) <= startNs)!;
+  const afterStart = series.find(point => point.time! >= startNs)!;
+  const beforeEnd = reverse.find(point => upper(point) <= endNs)!;
+  const afterEnd = series.find(point => point.time! >= endNs)!;
+  // Only increments wholly inside the original window are guaranteed; boundary-straddling work may be outside.
+  const interior = beforeEnd.value! - afterStart.value!;
   return { first: first.value!, last: last.value!, firstNs: first.time!, lastNs: last.time!,
-    firstUpperNs: upper(first), lastUpperNs: upper(last) };
+    originalMinimum: interior > 0n ? interior : 0n,
+    originalMaximum: afterEnd.value! - beforeStart.value!,
+    increments: series.slice(1).map((point, i) => point.value! - series[i]!.value!) };
 }
 function nativeRate(series: ReturnType<typeof nativeSeries>, bytes: boolean): number | null {
   if (!series || series.last - series.first > BigInt(Number.MAX_SAFE_INTEGER)) return null;
@@ -353,7 +364,9 @@ export async function readOfficialNativeWindow(options: SourceOptions): Promise<
     return result;
   }
   for (const target of targets) {
-    const pod: NativePodWindow = { identity: target, cpuCores: null, cpuCounterInterval: null,
+    const pod: NativePodWindow = { identity: target,
+      counterObservationScope: 'bracketing_source_intervals_not_original_window_averages',
+      cpuCores: null, cpuCounterInterval: null,
       cpuSaturated: null, memorySaturated: null,
       rxBytesPerSecond: null, txBytesPerSecond: null, throttling: null, throttled: null, networkSaturated: null,
       unavailableReasons: ['authenticated_network_link_capacity_unavailable'] };
@@ -390,12 +403,15 @@ export async function readOfficialNativeWindow(options: SourceOptions): Promise<
     const cpu = nativeSeries(observations, 'cpu', start, end, 'usage_core_nanoseconds');
     pod.cpuCores = nativeRate(cpu, false);
     if (cpu) pod.cpuCounterInterval = { startUnixNs: cpu.firstNs.toString(), endUnixNs: cpu.lastNs.toString() };
-    if (cpuLimit !== null && cpuLimit === quantity(expected.cpu, false) && pod.cpuCores !== null && cpu) {
-      const lower = Number(cpu.last - cpu.first) / Number(cpu.lastUpperNs - cpu.firstNs) / cpuLimit;
-      const upper = Number(cpu.last - cpu.first) / Number(cpu.lastNs - cpu.firstUpperNs) / cpuLimit;
-      pod.cpuSaturated = lower >= NATIVE_TELEMETRY_THRESHOLDS.cpuLimitFraction ? true :
-        upper < NATIVE_TELEMETRY_THRESHOLDS.cpuLimitFraction ? false : null;
-      if (pod.cpuSaturated === null) pod.unavailableReasons.push('native_cpu_timestamp_precision_straddles_saturation_threshold');
+    const milliLimit = cpuLimit === null ? null : cpuLimit * 1000;
+    if (milliLimit !== null && Number.isSafeInteger(milliLimit) &&
+        cpuLimit === quantity(expected.cpu, false) && cpu) {
+      const threshold = BigInt(end - start) * 1_000_000n * BigInt(milliLimit) *
+        BigInt(NATIVE_TELEMETRY_THRESHOLDS.cpuLimitFraction * 100);
+      pod.cpuSaturated = cpu.originalMinimum * 100_000n >= threshold ? true :
+        cpu.originalMaximum * 100_000n < threshold ? false : null;
+      if (pod.cpuSaturated === null)
+        pod.unavailableReasons.push('original_window_cpu_boundary_contributions_or_timestamp_precision_ambiguous');
     }
     else pod.unavailableReasons.push('complete_native_cpu_counter_window_or_frozen_hard_limit_unavailable');
     const memory = observations.map(row => record(row.memory) ? row.memory : {});
@@ -432,9 +448,16 @@ export async function readOfficialNativeWindow(options: SourceOptions): Promise<
       return total !== null && throttled !== null && throttled <= total && total <= BigInt(Number.MAX_SAFE_INTEGER);
     });
     if (validCfs && periods && throttled && periods.firstNs === throttled.firstNs && periods.lastNs === throttled.lastNs &&
-        periods.last > periods.first && throttled.last - throttled.first <= periods.last - periods.first) {
+        periods.last > periods.first &&
+        throttled.increments.every((increment, i) => increment <= periods.increments[i]!)) {
       pod.throttling = Number(throttled.last - throttled.first) / Number(periods.last - periods.first);
-      pod.throttled = pod.throttling >= NATIVE_TELEMETRY_THRESHOLDS.throttledPeriodFraction;
+      const thresholdPercent = BigInt(NATIVE_TELEMETRY_THRESHOLDS.throttledPeriodFraction * 100);
+      pod.throttled = periods.originalMaximum > 0n &&
+        throttled.originalMinimum * 100n >= periods.originalMaximum * thresholdPercent ? true :
+        periods.originalMinimum > 0n &&
+          throttled.originalMaximum * 100n < periods.originalMinimum * thresholdPercent ? false : null;
+      if (pod.throttled === null)
+        pod.unavailableReasons.push('original_window_cfs_boundary_contributions_or_timestamp_precision_ambiguous');
     } else pod.unavailableReasons.push('original_window_source_timestamped_exact_cgroup_cfs_unavailable');
   }
   return result;
