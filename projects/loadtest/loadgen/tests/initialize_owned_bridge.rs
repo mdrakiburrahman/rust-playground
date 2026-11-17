@@ -40,6 +40,8 @@ enum Case {
     PublicInput,
     Nonready,
     WrongGeneration,
+    SilentAdmission,
+    SilentPut,
 }
 
 fn digest(bytes: &[u8]) -> String {
@@ -307,6 +309,10 @@ fn private_json(path: &Path, value: &Value) -> Result<()> {
 
 async fn run(case: Case) -> Result<Parent> {
     let scratch = tempfile::tempdir()?;
+    let silent = matches!(case, Case::SilentAdmission | Case::SilentPut);
+    let started = tokio::time::Instant::now();
+    let budget_ms = if silent { 1_000 } else { 30_000 };
+    let exit_by = started + Duration::from_millis(if silent { budget_ms + 2_000 } else { 35_000 });
     let plan = json!({
         "account":"offlineproof","container":"tables",
         "campaign_root":format!("abfss://tables@offlineproof.dfs.core.windows.net/fixture/campaigns/{CAMPAIGN}/"),
@@ -325,7 +331,7 @@ async fn run(case: Case) -> Result<Parent> {
             "control_container_url":"https://offlineproof.blob.core.windows.net/checkpoints",
             "sandbox_id":"offline-sandbox","reset_generation":GENERATION
         },
-        "original_deadline_unix_ms":u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())? + 30_000
+        "original_deadline_unix_ms":u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())? + budget_ms
     });
     match case {
         Case::WrongRoot => input["authority"]["table_root_url"] = plan["run_root"].clone(),
@@ -415,7 +421,8 @@ async fn run(case: Case) -> Result<Parent> {
         stderr.take(256 * 1024).read_to_end(&mut bytes).await?;
         Ok::<_, std::io::Error>(bytes)
     });
-    let status = tokio::time::timeout(Duration::from_secs(35), async {
+    let mut silence_at = None;
+    let completion = tokio::time::timeout_at(exit_by, async {
         loop {
             let mut line = String::new();
             let bytes = (&mut output).take(FRAME_LIMIT as u64 + 1).read_line(&mut line).await?;
@@ -435,10 +442,24 @@ async fn run(case: Case) -> Result<Parent> {
                 parent.receipt = Some(value);
             } else {
                 ensure!(parent.receipt.is_none(), "effect after final receipt");
+                if silence_at.is_some() {
+                    parent.requests.push(value);
+                    continue;
+                }
+                let keep_open_silent = (matches!(case, Case::SilentAdmission)
+                    && value["target"] == "control"
+                    && value["method"] == "HEAD")
+                    || (matches!(case, Case::SilentPut)
+                        && value["target"] == "object_store"
+                        && value["method"] == "PUT");
                 let disconnect = matches!(case, Case::LostPutResponse)
                     && value["target"] == "object_store"
                     && value["method"] == "PUT";
                 let reply = parent.exchange(value)?;
+                if keep_open_silent {
+                    silence_at = Some(parent.requests.len());
+                    continue;
+                }
                 if disconnect {
                     input_pipe.take();
                     continue;
@@ -451,9 +472,57 @@ async fn run(case: Case) -> Result<Parent> {
         }
         child.wait().await.context("CLI exit")
     })
-    .await
-    .context("bounded CLI bridge completion")??;
+    .await;
+    let exited_before_stdin_close = matches!(&completion, Ok(Ok(_)));
+    if silent {
+        eprintln!(
+            "SILENT_PIPE_BOUNDARY case={case:?} elapsed_ms={} original_budget_ms={budget_ms} exited_before_stdin_close={exited_before_stdin_close} stdin_writer_open={} child_running={} requests={} silence_at={silence_at:?} puts={} receipt={}",
+            started.elapsed().as_millis(),
+            input_pipe.is_some(),
+            child.try_wait()?.is_none(),
+            parent.requests.len(),
+            parent.puts,
+            parent.receipt.is_some()
+        );
+    }
+    let status = match completion {
+        Ok(status) => status?,
+        Err(_) if silent => {
+            // The missed exit bound is recorded above, before closing stdin or killing the child.
+            input_pipe.take();
+            match tokio::time::timeout(Duration::from_secs(1), child.wait()).await {
+                Ok(status) => status?,
+                Err(_) => {
+                    child.kill().await?;
+                    child.wait().await?
+                }
+            }
+        }
+        Err(error) => return Err(error).context("bounded CLI bridge completion"),
+    };
     let errors = String::from_utf8(errors.await??)?;
+    if silent {
+        ensure!(
+            exited_before_stdin_close,
+            "silent parent kept CLI alive beyond original deadline + 2s; cleanup only after boundary recorded; stderr={errors}"
+        );
+        ensure!(input_pipe.is_some(), "stdin was closed before exit verification");
+        ensure!(parent.receipt.is_none(), "silent parent produced a setup receipt");
+        ensure!(
+            parent.requests.len() == silence_at.context("silent boundary was never reached")?,
+            "request replay or corrective cleanup after unanswered operation"
+        );
+        ensure!(parent.puts == usize::from(matches!(case, Case::SilentPut)));
+        ensure!(parent.members()?.len() == if matches!(case, Case::SilentPut) { 2 } else { 1 });
+        ensure!(
+            started.elapsed() >= Duration::from_millis(budget_ms - 50),
+            "CLI exited before the unanswered request deadline"
+        );
+        ensure!(
+            errors.contains("deadline") || errors.contains("timeout"),
+            "exit was not a transport deadline failure: {errors}"
+        );
+    }
     ensure!(!marker.exists(), "direct credential fallback");
     ensure!(parent.metadata["unrelated"] == "preserved");
     ensure!(parent.members()?.get(UNRELATED) == Some(&json!({"generation":GENERATION,"state":"active"})));
@@ -471,6 +540,18 @@ async fn run(case: Case) -> Result<Parent> {
         parent.members()?.len()
     );
     Ok(parent)
+}
+
+#[tokio::test]
+async fn actual_cli_silent_parent_exits_before_stdin_close_at_admission_deadline() -> Result<()> {
+    run(Case::SilentAdmission).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn actual_cli_silent_parent_exits_before_stdin_close_after_applied_put() -> Result<()> {
+    run(Case::SilentPut).await?;
+    Ok(())
 }
 
 #[tokio::test]
