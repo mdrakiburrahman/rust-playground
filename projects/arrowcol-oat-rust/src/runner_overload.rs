@@ -364,7 +364,8 @@ fn aggregate_scale_out_readings(
         oldest_age_seconds = oldest_age_seconds.max(age);
         per_pod.push(json!({"pod":identity.pod, "uid":identity.pod_uid,
             "container_id":identity.container_id, "caps":reading.caps,
-            "publications":backlog.publications, "rows":backlog.rows, "logical_bytes":backlog.logical_bytes}));
+            "publications":backlog.publications, "rows":backlog.rows, "logical_bytes":backlog.logical_bytes,
+            "resolved_buffering_mode":"memory_only"}));
         for (index, cap) in reading.caps.into_iter().enumerate() {
             if caps.len() <= index {
                 caps.push(cap);
@@ -611,6 +612,13 @@ fn guard_container_memory(text: &str, requested: Option<u64>) -> Result<GuardCap
     })
 }
 
+fn verify_scale_out_buffering_mode(pressure: &Value) -> Result<()> {
+    if pressure.get("resolved_buffering_mode").and_then(Value::as_str) != Some("memory_only") {
+        bail!("scale-out collector did not affirmatively resolve memory-only buffering");
+    }
+    Ok(())
+}
+
 impl GuardProbe {
     fn command(&self, config: &OatConfig, logs: bool) -> Result<Command> {
         let since = DateTime::from_timestamp_millis(i64::try_from(self.since_ms)?)
@@ -682,6 +690,9 @@ impl GuardProbe {
             },
         )?;
         let pressure: Value = serde_json::from_str(&pressure)?;
+        if config.campaign_profile == Some(crate::config::CampaignProfile::ScaleOutSingleTable) {
+            verify_scale_out_buffering_mode(&pressure)?;
+        }
         let rich: arrowcol_routing::RichPressureSnapshot = serde_json::from_value(pressure["rich"].clone())?;
         let timestamp_ms = unix_time_ms_u64()?;
         let observed_ms = rich.observed_at_unix_ms.get();
@@ -1440,6 +1451,20 @@ mod overload_guard_tests {
             time,
             3000,
         )
+    }
+
+    #[test]
+    fn scale_out_buffering_requires_affirmative_memory_mode() {
+        assert!(verify_scale_out_buffering_mode(&json!({"resolved_buffering_mode":"memory_only"})).is_ok());
+        for pressure in [
+            json!({}), json!({"native_quiver_enabled":false}),
+            json!({"resolved_buffering_mode":null}), json!({"resolved_buffering_mode":false}),
+            json!({"resolved_buffering_mode":"unknown"}), json!({"resolved_buffering_mode":"quiver"}),
+            json!({"resolved_buffering_mode":"spill_recovery"}), json!({"resolved_buffering_mode":"mixed"}),
+            json!({"resolved_buffering_mode":"future_mode"}),
+        ] {
+            assert!(verify_scale_out_buffering_mode(&pressure).is_err());
+        }
     }
 
     #[test]

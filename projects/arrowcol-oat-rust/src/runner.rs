@@ -1429,6 +1429,9 @@ impl Platform for AksPlatform {
         run_id: &str,
         tables: &[String],
     ) -> Result<()> {
+        if config.campaign_profile == Some(crate::config::CampaignProfile::ScaleOutSingleTable) {
+            return verify_maintenance_stop_budget_before_admission(config, self).await;
+        }
         if config.campaign_profile != Some(crate::config::CampaignProfile::SingleHotTable) {
             return Ok(());
         }

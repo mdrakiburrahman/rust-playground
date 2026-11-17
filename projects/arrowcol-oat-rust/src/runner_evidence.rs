@@ -615,7 +615,10 @@ impl CellEvidence {
     fn record_client(&mut self, config: &OatConfig, table: &str, output: &str) -> Result<()> {
         let effective = process_configurations(output)?;
         verify_process_configuration(config, ComponentRole::Client, &effective)?;
-        let counters = client_phase_evidence(output)?;
+        let counters = client_phase_evidence(
+            output,
+            config.campaign_profile == Some(crate::config::CampaignProfile::ScaleOutSingleTable),
+        )?;
         if let Some(window) = counters.get("measurement_window").filter(|value| !value.is_null()) {
             let report = parse_client_metrics(output)?;
             if self.measurement_window != window["start_unix_ms"].as_u64().zip(window["end_unix_ms"].as_u64())
@@ -1844,15 +1847,25 @@ mod measurement_evidence_tests {
                 "scope": "per_stream_admission_completion_observed_in_half_open_shared_unix_window",
             },
         });
-        let snapshots = [start, end]
+        let mut snapshots = [start, end]
             .into_iter()
             .map(serde_json::from_value::<ClientCounterSnapshot>)
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        let output = client_snapshot_delta(&snapshots)?;
+        let output = client_snapshot_delta(&snapshots, false)?;
         assert_eq!(output["workers"][0]["rejected_rows"], 0);
         assert_eq!(output["workers"][0]["retried_streams"], 0);
         assert_eq!(output["measurement_window"]["ambiguous_rows"], 0);
         assert_eq!(output["process_cumulative"]["ambiguous_rows"], 0);
+        assert!(output.get("logical_batch_manifest").is_none());
+        let manifest = json!({"schema":"arrowcol.logical_batch_manifest.v1", "ranges":[{"worker":0}]});
+        snapshots[1].logical_batch_manifest = Some(manifest.clone());
+        snapshots[1].preparation = Some(json!({"steady_state_generation":true}));
+        assert!(client_snapshot_delta(&snapshots, false).is_err());
+        let output = client_snapshot_delta(&snapshots, true)?;
+        assert_eq!(output["logical_batch_manifest"], manifest);
+        assert_eq!(output["preparation"]["steady_state_generation"], true);
+        snapshots[0].logical_batch_manifest = Some(manifest);
+        assert!(client_snapshot_delta(&snapshots, true).is_err());
         Ok(())
     }
 
@@ -1951,6 +1964,8 @@ struct ClientCounterSnapshot {
     workers: Vec<WorkerCounterSnapshot>,
     preparation: Option<Value>,
     measurement_window: Option<ClientMeasurementWindow>,
+    #[serde(default)]
+    logical_batch_manifest: Option<Value>,
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -1980,7 +1995,7 @@ struct ClientMeasurementWindow {
     scope: String,
 }
 
-fn client_preparation(value: Option<&Value>) -> Result<Value> {
+fn client_preparation(value: Option<&Value>, allow_generation: bool) -> Result<Value> {
     let Some(value) = value else {
         return Ok(Value::Null);
     };
@@ -2017,7 +2032,7 @@ fn client_preparation(value: Option<&Value>) -> Result<Value> {
         }
     }
     if let Some(value) = object.get("steady_state_generation") {
-        if value.as_bool() != Some(false) {
+        if value.as_bool().is_none_or(|generated| generated && !allow_generation) {
             bail!("unexpected hot-path generation in prepared client");
         }
         result.insert("steady_state_generation".to_owned(), value.clone());
@@ -2025,7 +2040,7 @@ fn client_preparation(value: Option<&Value>) -> Result<Value> {
     Ok(Value::Object(result))
 }
 
-fn client_phase_evidence(output: &str) -> Result<Value> {
+fn client_phase_evidence(output: &str, allow_generation: bool) -> Result<Value> {
     let snapshots = output
         .lines()
         .filter_map(|line| line.strip_prefix("OAT_CLIENT_METRICS "))
@@ -2035,7 +2050,7 @@ fn client_phase_evidence(output: &str) -> Result<Value> {
     if snapshots.is_empty() {
         return Ok(json!({ "unavailable_reason": "client_did_not_report_phase_counters" }));
     }
-    client_snapshot_delta(&snapshots)
+    client_snapshot_delta(&snapshots, allow_generation)
 }
 
 #[cfg(test)]
@@ -2478,7 +2493,7 @@ mod downstream_runner_tests {
         Ok(())
     }
 }
-fn client_snapshot_delta(snapshots: &[ClientCounterSnapshot]) -> Result<Value> {
+fn client_snapshot_delta(snapshots: &[ClientCounterSnapshot], allow_generation: bool) -> Result<Value> {
     let phase = |name| -> Result<&ClientCounterSnapshot> {
         let mut matches = snapshots.iter().filter(|snapshot| snapshot.phase == name);
         let snapshot = matches.next().context("missing client counter phase")?;
@@ -2498,6 +2513,11 @@ fn client_snapshot_delta(snapshots: &[ClientCounterSnapshot]) -> Result<Value> {
         let mut workers = HashSet::new();
         if snapshot.workers.is_empty() || snapshot.workers.iter().any(|worker| !workers.insert(worker.worker)) {
             bail!("empty or duplicate client counter workers");
+        }
+        if let Some(manifest) = &snapshot.logical_batch_manifest
+            && (snapshot.phase != "completed" || !manifest.is_object())
+        {
+            bail!("client logical batch manifest must be an object in the completed receipt");
         }
     }
     let start = phase("measurement_start")?;
@@ -2565,7 +2585,7 @@ fn client_snapshot_delta(snapshots: &[ClientCounterSnapshot]) -> Result<Value> {
             .try_fold(0_u64, |total, worker| total.checked_add(field(worker)))
             .context("client cumulative counter overflow")
     };
-    Ok(json!({
+    let mut result = json!({
         "scope": "measurement_start_to_completed_snapshot_delta_not_unique_delivery",
         "process_cumulative": {
             "completed_rows": cumulative_total(|worker| worker.completed_rows)?,
@@ -2576,9 +2596,13 @@ fn client_snapshot_delta(snapshots: &[ClientCounterSnapshot]) -> Result<Value> {
         "bytes_semantics": "sum_of_protobuf_flight_data_encoded_lengths_excluding_grpc_http2",
         "latency_scope": "process_cumulative_includes_preflight_and_warmup_not_phase_percentiles",
         "workers": deltas,
-        "preparation": client_preparation(end.preparation.as_ref())?,
+        "preparation": client_preparation(end.preparation.as_ref(), allow_generation)?,
         "measurement_window": end.measurement_window,
-    }))
+    });
+    if let Some(manifest) = &end.logical_batch_manifest {
+        result["logical_batch_manifest"] = manifest.clone();
+    }
+    Ok(result)
 }
 
 #[test]

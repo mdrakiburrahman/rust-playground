@@ -782,6 +782,11 @@ fn maintenance_table_evidence(config: &OatConfig, text: &str) -> Result<Value> {
         if !policy["table_policy"].is_object() || !policy["active"].is_boolean() {
             bail!("maintenance table readback omitted resolved table policy");
         }
+        if config.campaign_profile == Some(crate::config::CampaignProfile::ScaleOutSingleTable)
+            && policy["active"] != true
+        {
+            bail!("scale-out maintenance is not active for the selected table");
+        }
         verify_maintenance_controls(config, &policy)?;
         verify_effective_maintenance_stop_budget(config, &policy["table_policy"])?;
         if let Some(previous) = tables.insert(table.to_owned(), policy.clone())
@@ -1239,6 +1244,14 @@ mod maintenance_topology_tests {
         let default_timeout = format!("arrowcol_maintenance_table_config {}\n", event(300_000));
         assert!(maintenance_table_evidence(&config, &default_timeout).is_ok(),
             "the resolved registry default must remain eligible when it fits the persisted deadline");
+        config.campaign_profile = Some(crate::config::CampaignProfile::ScaleOutSingleTable);
+        assert!(maintenance_table_evidence(&config, &default_timeout).is_ok());
+        let mut inactive = event(300_000);
+        inactive["config"]["active"] = json!(false);
+        let inactive = format!("arrowcol_maintenance_table_config {}\n", inactive);
+        assert!(maintenance_table_evidence(&config, &inactive).is_err());
+        config.campaign_profile = None;
+        assert!(maintenance_table_evidence(&config, &inactive).is_ok());
         let oversized_timeout = format!("arrowcol_maintenance_table_config {}\n", event(1_200_000));
         assert!(maintenance_table_evidence(&config, &oversized_timeout).is_err(),
             "a 1,200-second table override must not outlive the 900-second requested/default budget");
