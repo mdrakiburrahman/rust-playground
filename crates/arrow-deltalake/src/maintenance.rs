@@ -30,7 +30,7 @@ use object_store::{GetOptions, GetRange, ObjectMeta, ObjectStore, ObjectStoreExt
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
 use parquet::arrow::ProjectionMask;
-use parquet::arrow::arrow_reader::{ArrowReaderOptions, ParquetRecordBatchReaderBuilder};
+use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder};
 use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::errors::ParquetError;
 use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
@@ -2094,6 +2094,7 @@ pub enum InputReadStrategy {
     Range,
 }
 
+#[derive(Clone)]
 struct FencedRangeReader {
     store: Arc<dyn ObjectStore>,
     path: object_store::path::Path,
@@ -2173,7 +2174,7 @@ pub struct EndpointSnapshotReceipt {
 pub fn scan_active_endpoint_urls(
     root: &Url,
     max_files: usize,
-    mut observe: impl FnMut(&arrow::array::StringArray) -> Result<()>,
+    mut observe: impl FnMut(&arrow::array::StringViewArray) -> Result<()>,
 ) -> Result<EndpointSnapshotReceipt> {
     let filesystem = root.username();
     let valid_filesystem = filesystem.is_empty()
@@ -2240,7 +2241,7 @@ pub fn scan_active_endpoint_urls(
                 size,
                 etag,
             };
-            let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
+            let builder = ParquetRecordBatchStreamBuilder::new(reader.clone()).await?;
             for group in builder.metadata().row_groups() {
                 if u64::try_from(group.total_byte_size()).unwrap_or(u64::MAX) > 512 * 1024 * 1024 {
                     anyhow::bail!("snapshot input row group exceeds decode bound");
@@ -2251,7 +2252,27 @@ pub fn scan_active_endpoint_urls(
                 anyhow::bail!("snapshot identity column must be UTF-8");
             }
             let projection = ProjectionMask::roots(builder.parquet_schema(), [index]);
-            Ok::<_, anyhow::Error>(builder.with_projection(projection).with_batch_size(4096).build()?)
+            let fields = builder
+                .schema()
+                .fields()
+                .iter()
+                .enumerate()
+                .map(|(field_index, field)| {
+                    if field_index == index {
+                        Arc::new(field.as_ref().clone().with_data_type(DataType::Utf8View))
+                    } else {
+                        Arc::clone(field)
+                    }
+                })
+                .collect::<Vec<_>>();
+            let schema = Arc::new(Schema::new_with_metadata(fields, builder.schema().metadata().clone()));
+            let metadata = ArrowReaderMetadata::try_new(
+                Arc::clone(builder.metadata()),
+                ArrowReaderOptions::new().with_schema(schema),
+            )?;
+            let builder = ParquetRecordBatchStreamBuilder::new_with_metadata(reader, metadata);
+            // Prefix encoding can expand across rows, unlike dictionary views.
+            Ok::<_, anyhow::Error>(builder.with_projection(projection).with_batch_size(1).build()?)
         })?;
         let mut file_rows = 0_u64;
         loop {
@@ -2265,7 +2286,7 @@ pub fn scan_active_endpoint_urls(
             let values = batch
                 .column_by_name("endpoint_url")
                 .context("snapshot projection omitted identity")?
-                .as_string_opt::<i32>()
+                .as_string_view_opt()
                 .context("snapshot identity column is not UTF-8")?;
             if values.null_count() != 0 {
                 anyhow::bail!("snapshot identity column contains null");

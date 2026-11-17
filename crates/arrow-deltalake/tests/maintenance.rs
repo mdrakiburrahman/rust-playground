@@ -187,6 +187,76 @@ fn identity_scan_uses_one_active_snapshot_during_compaction() -> Result<()> {
 }
 
 #[test]
+fn identity_scan_bounds_dictionary_and_prefix_expansion() -> Result<()> {
+    use parquet::basic::Encoding;
+    use parquet::file::properties::WriterProperties;
+
+    for prefix_encoding in [false, true] {
+        let root = tempfile::tempdir()?;
+        let identity_schema = Arc::new(Schema::new(vec![
+            Field::new("endpoint_url", DataType::Utf8, false),
+            Field::new(INGESTION_PARTITION, DataType::Utf8, false),
+        ]));
+        let url = url_of(root.path())?;
+        let table = DeltaTable::open_url(
+            url.clone(),
+            Arc::clone(&identity_schema),
+            vec![INGESTION_PARTITION.into()],
+        )?;
+        let identity = "x".repeat(16 * 1024);
+        let data = RecordBatch::try_new(
+            Arc::clone(&identity_schema),
+            vec![
+                Arc::new(StringArray::from(vec![identity.as_str(); 4096])),
+                Arc::new(StringArray::from(vec![minute(0); 4096])),
+            ],
+        )?;
+        let mut properties = WriterProperties::builder().set_dictionary_enabled(!prefix_encoding);
+        if prefix_encoding {
+            properties = properties.set_encoding(Encoding::DELTA_BYTE_ARRAY);
+        }
+        run(async {
+            let mut file = table
+                .new_file_partitioned_with_properties(
+                    Arc::clone(&identity_schema),
+                    BTreeMap::from([(INGESTION_PARTITION.to_owned(), Some(minute(0)))]),
+                    properties.build(),
+                )?
+                .with_ingestion_time(BASE + 1)?;
+            file.write(&data).await?;
+            file.finish().await?;
+            Ok::<_, anyhow::Error>(())
+        })??;
+        drop(data);
+        let files = active_files(root.path())?;
+        let path = data_path(root.path(), files.keys().next().context("active file")?)?;
+        let parquet = ParquetRecordBatchReaderBuilder::try_new(fs::File::open(path)?)?;
+        let encodings = parquet
+            .metadata()
+            .row_group(0)
+            .column(0)
+            .encodings()
+            .collect::<Vec<_>>();
+        let expected = if prefix_encoding {
+            Encoding::DELTA_BYTE_ARRAY
+        } else {
+            Encoding::RLE_DICTIONARY
+        };
+        assert!(encodings.contains(&expected), "actual encodings: {encodings:?}");
+        let mut seen = 0;
+        let result = arrow_deltalake::maintenance::scan_active_endpoint_urls(&url, 100, |values| {
+            assert!(values.get_array_memory_size() < 2 * 1024 * 1024);
+            assert!(values.iter().all(|value| value == Some(identity.as_str())));
+            seen += values.len();
+            Ok(())
+        });
+        assert_eq!(result?.rows, 4096);
+        assert_eq!(seen, 4096);
+    }
+    Ok(())
+}
+
+#[test]
 fn optimize_decode_limit_diagnostic_identifies_failed_bound() -> Result<()> {
     let root = tempfile::tempdir()?;
     let table = create(root.path())?;
