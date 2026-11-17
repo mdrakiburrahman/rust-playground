@@ -83,6 +83,8 @@ async function assertWriterBoundary(inventory: RunInventory, authority: CleanupM
     if (replicas !== 0 || activePods.length !== 0 || (status.availableReplicas ?? 0) !== 0)
       throw new Error('Scale cleanup requires a quiescent collector with zero desired, available and physical writer pods.');
   } else {
+    if (pods.some(pod => pod.metadata?.deletionTimestamp !== undefined && pod.metadata.deletionTimestamp !== null))
+      throw new Error('Scale admission rejects a deleting ArrowCol pod.');
     const activeSet = activeReplicaSets.length === 1 ? activeReplicaSets[0] : undefined;
     const activeOwner = activeSet?.metadata?.uid;
     const ownedPods = pods.filter(pod => Array.isArray(pod.metadata?.ownerReferences) && pod.metadata.ownerReferences.some((owner: Record<string, unknown>) =>

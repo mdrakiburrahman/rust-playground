@@ -148,6 +148,20 @@ test('scale admission rejects live rolling updates and multiple physical collect
   }
 });
 
+test('producer admission rejects a deleting but ready collector pod', async t => {
+  const { store, azure } = await fixture();
+  const base = scaleRunner();
+  const runner: CustodyCommandRunner = async (...args) => {
+    const result = await base(...args);
+    if (!args[0].includes('pods')) return result;
+    const list = JSON.parse(result.stdout) as { items: Array<{ metadata: Record<string, unknown> }> };
+    list.items[0]!.metadata.deletionTimestamp = '2026-11-17T00:00:00Z';
+    return { ...result, stdout: JSON.stringify(list) };
+  };
+  const adapter = createDefaultScaleAdapter(store, { azure, token, runCommand: runner });
+  await assert.rejects(adapter.assertCustody(token), /deleting ArrowCol pod/);
+});
+
 test('controller recovers an apply intent at after-state and restores within the original restore deadline', async t => {
   const { store, azure } = await fixture(); const current = store.current!.state, now = Date.now();
   const resourceId = azure.c.base + '/providers/Microsoft.ContainerService/managedClusters/' + azure.c.cluster + '/agentPools/benche64';
