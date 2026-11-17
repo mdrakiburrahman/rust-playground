@@ -107,6 +107,11 @@ fn owned_plan() -> arrowcol_loadgen::initialize::OwnedRunTablePlan {
         campaign_id: GENERATION.into(),
         run_id: ROTATED.into(),
         generation: GENERATION.into(),
+        publisher_id: "00000000-0000-4000-8000-000000000014".into(),
+        control_lease_ids: vec![
+            "00000000-0000-4000-8000-000000000015".into(),
+            "00000000-0000-4000-8000-000000000016".into(),
+        ],
         table: "telemetry.sqlserver.sqlserver_availability_replica_states".into(),
         partition_by_ingestion_date: true,
         owner_id: ROTATED.into(),
