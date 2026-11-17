@@ -30,7 +30,8 @@ enum Case {
     UnknownPut,
     LostPutResponse,
     UnknownAdmission,
-    UnknownDrain,
+    UnknownDrainWrite,
+    UnknownDrainRelease,
     WrongRoot,
     WrongOwner,
     Expired,
@@ -150,7 +151,7 @@ impl Parent {
                         self.lease = None;
                         self.releases += 1;
                         if (matches!(self.case, Case::UnknownAdmission) && self.releases == 1)
-                            || (matches!(self.case, Case::UnknownDrain) && self.releases == 2)
+                            || (matches!(self.case, Case::UnknownDrainRelease) && self.releases == 2)
                         {
                             return Ok(uncertain(&request));
                         }
@@ -160,6 +161,9 @@ impl Parent {
             } else {
                 ensure!(method == "PUT" && query.get("comp").map(String::as_str) == Some("metadata"));
                 ensure!(self.lease.is_some() && headers.get("x-ms-lease-id") == self.lease.as_ref());
+                if matches!(self.case, Case::UnknownDrainWrite) && self.releases == 1 {
+                    return Ok(uncertain(&request));
+                }
                 self.metadata = headers
                     .iter()
                     .filter_map(|(key, value)| {
@@ -526,15 +530,23 @@ async fn actual_cli_bridge_fresh_refusals_never_adopt_or_replay() -> Result<()> 
 }
 
 #[tokio::test]
-async fn actual_cli_bridge_retains_registration_on_unknown_admission_write_or_drain() -> Result<()> {
+async fn actual_cli_bridge_unknown_effects_never_report_success_or_force_cleanup() -> Result<()> {
     for case in [
         Case::UnknownAdmission,
         Case::UnknownPut,
         Case::LostPutResponse,
-        Case::UnknownDrain,
+        Case::UnknownDrainWrite,
+        Case::UnknownDrainRelease,
     ] {
         let parent = run(case).await?;
-        assert_eq!(parent.members()?.len(), 2);
+        assert_eq!(
+            parent.members()?.len(),
+            if matches!(case, Case::UnknownDrainRelease) {
+                1
+            } else {
+                2
+            }
+        );
         assert!(parent.receipt.is_none());
         assert_eq!(parent.puts, usize::from(!matches!(case, Case::UnknownAdmission)));
         assert_eq!(
