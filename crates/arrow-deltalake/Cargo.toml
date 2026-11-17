@@ -43,7 +43,7 @@ tracing.workspace = true
 tempfile = "3"
 
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1", features = ["process"] }
+rustix = { version = "1", features = ["fs", "process"] }
 
 [dev-dependencies]
 opentelemetry_sdk = { workspace = true, features = ["testing"] }

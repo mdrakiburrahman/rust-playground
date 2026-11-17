@@ -634,7 +634,17 @@ struct Registration {
 enum SessionTransport {
     Injected,
     Direct(AzureCredentialProvider),
+    ExplicitDirect(AzureCredentialProvider),
     Bridge(Arc<crate::qap_http::StorageBridge>),
+}
+
+/// Original normal stamped Azure ownership selected by setup.
+#[derive(Clone, Debug)]
+pub struct NormalAzureOwnership {
+    pub subscription_id: String,
+    pub stamp: String,
+    pub resource_group: String,
+    pub checkpoint_container: String,
 }
 
 /// One persistent publisher registration shared by every guarded store of a
@@ -970,6 +980,7 @@ impl PublisherSession {
         url: &Url,
         expected_generation: &str,
         credentials: AzureCredentialProvider,
+        ownership: &NormalAzureOwnership,
     ) -> Result<Arc<Self>> {
         canonical_uuid(expected_generation).context("invalid expected reset generation")?;
         let host = url.host_str().context("missing Azure account host")?;
@@ -991,13 +1002,13 @@ impl PublisherSession {
         {
             bail!("invalid credential-free Azure publisher root");
         }
-        let control = Arc::new(AzureControlContainer::new(account, Arc::clone(&credentials))?);
+        let control = Arc::new(AzureControlContainer::new_with_ownership(account, Arc::clone(&credentials), ownership)?);
         let sandbox_id = control.sandbox_id().to_owned();
         Self::register(
             control,
             sandbox_id,
             account.to_owned(),
-            SessionTransport::Direct(credentials),
+            SessionTransport::ExplicitDirect(credentials),
             SessionMode::Publisher,
             Some(expected_generation),
         )
@@ -1300,6 +1311,10 @@ impl PublisherSession {
                     .with_credentials(Arc::new(crate::qap_http::DeniedBridgeCredentials))
                     .with_skip_signature(true),
                 SessionTransport::Direct(credentials) => object_store::azure::MicrosoftAzureBuilder::from_env()
+                    .with_url(url.as_str())
+                    .with_http_connector(crate::qap_http::azure_http_connector()?)
+                    .with_credentials(Arc::clone(credentials)),
+                SessionTransport::ExplicitDirect(credentials) => object_store::azure::MicrosoftAzureBuilder::new()
                     .with_url(url.as_str())
                     .with_http_connector(crate::qap_http::azure_http_connector()?)
                     .with_credentials(Arc::clone(credentials)),
@@ -1909,7 +1924,13 @@ mod classify_tests {
         ));
         let valid_generation = "11111111-1111-4111-8111-111111111111";
         let valid_root = Url::parse("abfss://data@account123.dfs.core.windows.net/root/")?;
-        let error = PublisherSession::open_with_azure_credentials(&valid_root, "bad-generation", Arc::clone(&credentials))
+        let ownership = NormalAzureOwnership {
+            subscription_id: "33333333-3333-4333-8333-333333333333".to_owned(),
+            stamp: "89152".to_owned(),
+            resource_group: "arrow-collector-rg".to_owned(),
+            checkpoint_container: "checkpoints".to_owned(),
+        };
+        let error = PublisherSession::open_with_azure_credentials(&valid_root, "bad-generation", Arc::clone(&credentials), &ownership)
             .await
             .err()
             .context("invalid generation must fail")?;
@@ -1923,7 +1944,7 @@ mod classify_tests {
             "abfss://data@account123.dfs.core.windows.net/root#fragment",
         ] {
             assert!(
-                PublisherSession::open_with_azure_credentials(&Url::parse(root)?, valid_generation, Arc::clone(&credentials))
+                PublisherSession::open_with_azure_credentials(&Url::parse(root)?, valid_generation, Arc::clone(&credentials), &ownership)
                     .await
                     .is_err(),
                 "invalid root must fail before admission: {root}"

@@ -3,6 +3,7 @@
 use object_store::azure::AzureCredential;
 use object_store::{CredentialProvider, Error, Result};
 use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -12,6 +13,15 @@ use tokio::sync::Mutex;
 struct Cached {
     token: Arc<AzureCredential>,
     until: Instant,
+}
+
+enum AuthenticationSource {
+    Legacy,
+    WorkloadIdentity {
+        client_id: String,
+        tenant_id: String,
+        assertion_file: PathBuf,
+    },
 }
 
 #[cfg(unix)]
@@ -44,6 +54,7 @@ pub(crate) struct BoundedAzureCli {
     subscription: Option<OsString>,
     deadline: Duration,
     cache: Mutex<Option<Cached>>,
+    source: AuthenticationSource,
 }
 
 impl std::fmt::Debug for BoundedAzureCli {
@@ -124,22 +135,33 @@ impl Default for BoundedAzureCli {
             subscription: std::env::var_os("AZURE_SUBSCRIPTION_ID"),
             deadline: Duration::from_secs(5),
             cache: Mutex::new(None),
+            source: AuthenticationSource::Legacy,
         }
     }
 }
 
 impl BoundedAzureCli {
     async fn acquire_federated(&self) -> Result<Option<(Arc<AzureCredential>, u64)>> {
-        let client_id = std::env::var("AZURE_CLIENT_ID").ok();
-        let tenant_id = std::env::var("AZURE_TENANT_ID").ok();
-        let token_file = std::env::var("AZURE_FEDERATED_TOKEN_FILE").ok();
-        if client_id.is_none() && tenant_id.is_none() && token_file.is_none() {
-            return Ok(None);
-        }
-        let (Some(client_id), Some(tenant_id), Some(token_file)) = (client_id, tenant_id, token_file) else {
-            return Err(failure(
-                "workload identity requires client ID, tenant ID and token file",
-            ));
+        let (client_id, tenant_id, assertion) = match &self.source {
+            AuthenticationSource::Legacy => {
+                let client_id = std::env::var("AZURE_CLIENT_ID").ok();
+                let tenant_id = std::env::var("AZURE_TENANT_ID").ok();
+                let token_file = std::env::var("AZURE_FEDERATED_TOKEN_FILE").ok();
+                if client_id.is_none() && tenant_id.is_none() && token_file.is_none() {
+                    return Ok(None);
+                }
+                let (Some(client_id), Some(tenant_id), Some(token_file)) = (client_id, tenant_id, token_file) else {
+                    return Err(failure("workload identity requires client ID, tenant ID and token file"));
+                };
+                let assertion = tokio::fs::read_to_string(token_file)
+                    .await
+                    .map_err(|_| failure("projected workload identity token could not be read"))?;
+                (client_id, tenant_id, assertion)
+            }
+            AuthenticationSource::WorkloadIdentity { client_id, tenant_id, assertion_file } => {
+                let assertion = read_private_assertion(assertion_file).await?;
+                (client_id.clone(), tenant_id.clone(), assertion)
+            }
         };
         if !client_id
             .chars()
@@ -150,9 +172,6 @@ impl BoundedAzureCli {
         {
             return Err(failure("workload identity identifiers are invalid"));
         }
-        let assertion = tokio::fs::read_to_string(token_file)
-            .await
-            .map_err(|_| failure("projected workload identity token could not be read"))?;
         let assertion = assertion.trim();
         if assertion.is_empty() || assertion.len() > 16_384 {
             return Err(failure("projected workload identity token is empty or too large"));
@@ -180,10 +199,27 @@ impl BoundedAzureCli {
         if !response.status().is_success() {
             return Err(token_exchange_response_failure(response).await);
         }
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|_| failure("workload identity token response could not be read"))?;
+        let bytes = if matches!(self.source, AuthenticationSource::WorkloadIdentity { .. }) {
+            let mut response = response;
+            let mut bytes = Vec::new();
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(|_| failure("workload identity token response could not be read"))?
+            {
+                if chunk.len() > OAUTH_ERROR_BODY_LIMIT - bytes.len() {
+                    return Err(failure("workload identity token response exceeds limit"));
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            bytes
+        } else {
+            response
+                .bytes()
+                .await
+                .map_err(|_| failure("workload identity token response could not be read"))?
+                .to_vec()
+        };
         let value: serde_json::Value =
             serde_json::from_slice(&bytes).map_err(|_| failure("workload identity token response was invalid"))?;
         if !value
@@ -214,6 +250,9 @@ impl BoundedAzureCli {
 
     async fn acquire(&self) -> Result<Arc<AzureCredential>> {
         let mut cache = self.cache.lock().await;
+        if let AuthenticationSource::WorkloadIdentity { assertion_file, .. } = &self.source {
+            open_private_assertion(assertion_file)?;
+        }
         if let Some(cached) = cache.as_ref()
             && Instant::now() < cached.until
         {
@@ -225,6 +264,9 @@ impl BoundedAzureCli {
                 until: Instant::now() + Duration::from_secs(seconds),
             });
             return Ok(credential);
+        }
+        if matches!(self.source, AuthenticationSource::WorkloadIdentity { .. }) {
+            return Err(failure("explicit workload identity could not be acquired"));
         }
         let mut command = tokio::process::Command::new(&self.program);
         command
@@ -321,6 +363,49 @@ impl BoundedAzureCli {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn open_private_assertion(path: &Path) -> Result<std::fs::File> {
+    use std::os::unix::fs::MetadataExt;
+    if !path.is_absolute()
+        || path.components().any(|component| matches!(component, std::path::Component::ParentDir | std::path::Component::CurDir))
+    {
+        return Err(failure("workload identity assertion path must be absolute and canonical"));
+    }
+    let fd = rustix::fs::openat2(
+        rustix::fs::CWD,
+        path,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NONBLOCK,
+        rustix::fs::Mode::empty(),
+        rustix::fs::ResolveFlags::NO_SYMLINKS,
+    )
+    .map_err(|_| failure("workload identity assertion could not be opened safely"))?;
+    let file = std::fs::File::from(fd);
+    let opened = file.metadata().map_err(|_| failure("workload identity assertion could not be inspected"))?;
+    if !opened.file_type().is_file() || opened.mode() & 0o077 != 0 || opened.uid() != rustix::process::geteuid().as_raw() {
+        return Err(failure("workload identity assertion must be a private owned regular file"));
+    }
+    Ok(file)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_private_assertion(_path: &Path) -> Result<std::fs::File> {
+    Err(failure("explicit workload identity requires Linux no-symlink private-file checks"))
+}
+
+async fn read_private_assertion(path: &Path) -> Result<String> {
+    let file = open_private_assertion(path)?;
+    let mut bytes = Vec::new();
+    tokio::fs::File::from_std(file)
+        .take(16_385)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|_| failure("workload identity assertion could not be read"))?;
+    if bytes.len() > 16_384 {
+        return Err(failure("workload identity assertion is too large"));
+    }
+    String::from_utf8(bytes).map_err(|_| failure("workload identity assertion is not UTF-8"))
+}
+
 #[async_trait::async_trait]
 impl CredentialProvider for BoundedAzureCli {
     type Credential = AzureCredential;
@@ -358,6 +443,59 @@ impl AzureCliTokenProvider {
     /// # Errors
     /// Rejects scopes with another scheme or path, a port, credentials, query or fragment.
     pub fn new(scope: &str, deadline: Duration) -> anyhow::Result<Self> {
+        validate_scope_and_deadline(scope, deadline)?;
+        Ok(Self(BoundedAzureCli {
+            scope: scope.to_owned(),
+            deadline,
+            ..BoundedAzureCli::default()
+        }))
+    }
+
+    /// Bind an immutable workload identity to one private assertion path.
+    ///
+    /// # Errors
+    /// Rejects invalid scope, identifiers, timeout or unsafe assertion file.
+    pub fn for_workload_identity(
+        scope: &str,
+        tenant_id: &str,
+        client_id: &str,
+        assertion_file: &Path,
+        deadline: Duration,
+    ) -> anyhow::Result<Self> {
+        validate_scope_and_deadline(scope, deadline)?;
+        anyhow::ensure!(scope == STORAGE_SCOPE, "workload identity requires the storage scope");
+        crate::publisher::canonical_uuid(tenant_id).map_err(|_| anyhow::anyhow!("invalid workload tenant ID"))?;
+        crate::publisher::canonical_uuid(client_id).map_err(|_| anyhow::anyhow!("invalid workload client ID"))?;
+        open_private_assertion(assertion_file).map_err(|_| anyhow::anyhow!("invalid private workload assertion file"))?;
+        Ok(Self(BoundedAzureCli {
+            program: OsString::new(),
+            leading_args: Vec::new(),
+            scope: scope.to_owned(),
+            subscription: None,
+            deadline,
+            cache: Mutex::new(None),
+            source: AuthenticationSource::WorkloadIdentity {
+                tenant_id: tenant_id.to_owned(),
+                client_id: client_id.to_owned(),
+                assertion_file: assertion_file.to_owned(),
+            },
+        }))
+    }
+
+    /// Return a bearer token for the bound scope.
+    ///
+    /// # Errors
+    /// Returns bounded acquisition, process or token-metadata failures without CLI output.
+    /// Failed workload exchanges include only HTTP status, known OAuth error names and bounded numeric AAD codes.
+    pub async fn token(&self) -> anyhow::Result<String> {
+        match self.0.get_credential().await?.as_ref() {
+            AzureCredential::BearerToken(token) => Ok(token.clone()),
+            _ => anyhow::bail!("Azure CLI returned an unsupported credential"),
+        }
+    }
+}
+
+fn validate_scope_and_deadline(scope: &str, deadline: Duration) -> anyhow::Result<()> {
         let url = url::Url::parse(scope).map_err(|_| anyhow::anyhow!("invalid Azure CLI scope"))?;
         anyhow::ensure!(
             url.scheme() == "https"
@@ -375,29 +513,55 @@ impl AzureCliTokenProvider {
             !deadline.is_zero() && deadline <= Duration::from_secs(60),
             "Azure CLI deadline must be within (0, 60s]"
         );
-        Ok(Self(BoundedAzureCli {
-            scope: scope.to_owned(),
-            deadline,
-            ..BoundedAzureCli::default()
-        }))
-    }
-
-    /// Return a bearer token for the bound scope.
-    ///
-    /// # Errors
-    /// Returns bounded acquisition, process or token-metadata failures without CLI output.
-    /// Failed workload exchanges include only HTTP status, known OAuth error names and bounded numeric AAD codes.
-    pub async fn token(&self) -> anyhow::Result<String> {
-        match self.0.get_credential().await?.as_ref() {
-            AzureCredential::BearerToken(token) => Ok(token.clone()),
-            _ => anyhow::bail!("Azure CLI returned an unsupported credential"),
-        }
-    }
+        Ok(())
 }
 
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn explicit_workload_binding_is_private_fixed_and_never_uses_cli() -> anyhow::Result<()> {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let root = tempfile::tempdir()?;
+        let file = root.path().join("assertion");
+        std::fs::write(&file, "first")?;
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))?;
+        let tenant = "11111111-1111-4111-8111-111111111111";
+        let client = "22222222-2222-4222-8222-222222222222";
+        let mut provider = AzureCliTokenProvider::for_workload_identity(
+            STORAGE_SCOPE, tenant, client, &file, Duration::from_secs(1),
+        )?;
+        assert_eq!(read_private_assertion(&file).await?, "first");
+        std::fs::write(&file, "refreshed")?;
+        assert_eq!(read_private_assertion(&file).await?, "refreshed");
+        for invalid in ["", "not-a-uuid"] {
+            assert!(AzureCliTokenProvider::for_workload_identity(
+                STORAGE_SCOPE, invalid, client, &file, Duration::from_secs(1)
+            ).is_err());
+        }
+        assert!(AzureCliTokenProvider::for_workload_identity(
+            STORAGE_SCOPE, tenant, client, Path::new("relative"), Duration::from_secs(1)
+        ).is_err());
+        let linked = root.path().join("linked");
+        symlink(&file, &linked)?;
+        assert!(AzureCliTokenProvider::for_workload_identity(
+            STORAGE_SCOPE, tenant, client, &linked, Duration::from_secs(1)
+        ).is_err());
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644))?;
+        assert!(read_private_assertion(&file).await.is_err());
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))?;
+        let marker = root.path().join("cli-ran");
+        let script = root.path().join("fake-cli");
+        std::fs::write(&script, format!("echo called > '{}'\n", marker.display()))?;
+        provider.0.program = OsString::from("/bin/sh");
+        provider.0.leading_args = vec![script.into_os_string()];
+        std::fs::remove_file(&file)?;
+        symlink(&linked, &file)?;
+        assert!(provider.get_credential().await.is_err());
+        assert!(!marker.exists());
+        Ok(())
+    }
 
     #[test]
     fn workload_identity_failure_reports_only_oauth_error_and_aad_codes() {

@@ -10,7 +10,7 @@
 //! clobber metadata and must not exist. Leases serialize transitions only;
 //! registry membership never expires.
 
-use crate::publisher::{CasOutcome, ControlMetadata, MetadataSnapshot};
+use crate::publisher::{CasOutcome, ControlMetadata, MetadataSnapshot, NormalAzureOwnership, canonical_uuid};
 #[cfg(test)]
 use crate::publisher::{Registry, ResetState};
 use anyhow::{Context, Result, bail};
@@ -186,6 +186,36 @@ fn optional_env(key: &str) -> Result<Option<String>> {
 }
 
 impl AzureControlContainer {
+    pub(crate) fn new_with_ownership(
+        account: &str,
+        credentials: AzureCredentialProvider,
+        ownership: &NormalAzureOwnership,
+    ) -> Result<Self> {
+        canonical_uuid(&ownership.subscription_id).context("invalid captured Azure subscription")?;
+        if ownership.stamp.len() != 5
+            || !ownership.stamp.bytes().all(|byte| byte.is_ascii_digit())
+            || ownership.resource_group != "arrow-collector-rg"
+            || !(3..=63).contains(&ownership.checkpoint_container.len())
+            || !ownership.checkpoint_container.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+            || account.is_empty()
+            || !account.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        {
+            bail!("invalid captured normal Azure ownership");
+        }
+        let sandbox_id = configured_ownership(
+            &ownership.subscription_id,
+            account,
+            Some("stamped"),
+            Some(&ownership.resource_group),
+            Some(&ownership.stamp),
+        )?;
+        Self::with_endpoint(
+            format!("https://{account}.blob.core.windows.net/{}", ownership.checkpoint_container),
+            sandbox_id,
+            credentials,
+        )
+    }
+
     pub(crate) fn new(account: &str, credentials: AzureCredentialProvider) -> Result<Self> {
         let container = std::env::var("AZURE_STORAGE_CHECKPOINT_CONTAINER").unwrap_or_else(|_| "checkpoints".into());
         if account.is_empty()
