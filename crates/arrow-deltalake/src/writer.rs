@@ -935,7 +935,7 @@ mod tests {
         let mut endpoints = Vec::with_capacity(rows);
         let mut states = Vec::with_capacity(rows);
         let mut errors = Vec::with_capacity(rows);
-        let mut details = Vec::with_capacity(rows);
+        let mut details = (0..4).map(|_| Vec::with_capacity(rows)).collect::<Vec<_>>();
         let mut roles = Vec::with_capacity(rows);
         let mut local = Vec::with_capacity(rows);
         let mut updated = Vec::with_capacity(rows);
@@ -947,26 +947,32 @@ mod tests {
             endpoints.push(synthetic_text(seed ^ 0xb7e1_5162, 190));
             states.push(synthetic_text(seed ^ 0xdead_beef, 24));
             errors.push(synthetic_text(seed ^ 0x85eb_ca6b, 160));
-            details.push(synthetic_text(seed ^ 0xc2b2_ae35, 700));
+            for (index, detail) in details.iter_mut().enumerate() {
+                detail.push(synthetic_text(seed ^ (0xc2b2_ae35 + index as u64 * 0x27d4_eb2f), 175));
+            }
             roles.push((row % 3) as i32);
             local.push(row % 2 == 0);
             updated.push(row as i64 * 10_000);
         }
-        Ok(RecordBatch::try_new(
-            Arc::clone(schema),
-            vec![
-                Arc::new(StringArray::from(replica_ids)),
-                Arc::new(StringArray::from(group_ids)),
-                Arc::new(StringArray::from(server_names)),
-                Arc::new(StringArray::from(endpoints)),
-                Arc::new(StringArray::from(states)),
-                Arc::new(StringArray::from(errors)),
-                Arc::new(StringArray::from(details)),
-                Arc::new(Int32Array::from(roles)),
-                Arc::new(arrow::array::BooleanArray::from(local)),
-                Arc::new(arrow::array::Int64Array::from(updated)),
-            ],
-        )?)
+        let mut columns = vec![
+            Arc::new(StringArray::from(replica_ids)) as _,
+            Arc::new(StringArray::from(group_ids)),
+            Arc::new(StringArray::from(server_names)),
+            Arc::new(StringArray::from(endpoints)),
+            Arc::new(StringArray::from(states)),
+            Arc::new(StringArray::from(errors)),
+        ];
+        columns.extend(
+            details
+                .into_iter()
+                .map(|detail| Arc::new(StringArray::from(detail)) as _),
+        );
+        columns.extend([
+            Arc::new(Int32Array::from(roles)) as _,
+            Arc::new(arrow::array::BooleanArray::from(local)),
+            Arc::new(arrow::array::Int64Array::from(updated)),
+        ]);
+        Ok(RecordBatch::try_new(Arc::clone(schema), columns)?)
     }
 
     fn synthetic_text(mut state: u64, length: usize) -> String {
@@ -981,6 +987,27 @@ mod tests {
         text
     }
 
+    #[cfg(target_os = "linux")]
+    fn process_cpu_seconds() -> Result<f64> {
+        let stat = std::fs::read_to_string("/proc/self/stat")?;
+        let fields = stat
+            .rsplit_once(')')
+            .context("parse /proc/self/stat command name")?
+            .1
+            .split_whitespace()
+            .collect::<Vec<_>>();
+        let user_ticks = fields.get(11).context("read process user CPU ticks")?.parse::<u64>()?;
+        let system_ticks = fields
+            .get(12)
+            .context("read process system CPU ticks")?
+            .parse::<u64>()?;
+        let clock_ticks = std::process::Command::new("getconf").arg("CLK_TCK").output()?;
+        ensure!(clock_ticks.status.success(), "getconf CLK_TCK failed");
+        let clock_ticks = String::from_utf8(clock_ticks.stdout)?.trim().parse::<f64>()?;
+        Ok(user_ticks.saturating_add(system_ticks) as f64 / clock_ticks)
+    }
+
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     #[ignore = "manual synthetic per-row-varying encode throughput benchmark"]
     async fn synthetic_availability_replica_states_encode_benchmark() -> Result<()> {
@@ -989,6 +1016,7 @@ mod tests {
             Err(std::env::VarError::NotPresent) => 131_072,
             Err(error) => return Err(error.into()),
         };
+        ensure!(rows > 0, "W4_BENCH_ROWS must be positive");
         let schema = Arc::new(Schema::new(vec![
             Field::new("replica_id", DataType::Utf8, false),
             Field::new("group_id", DataType::Utf8, false),
@@ -996,7 +1024,10 @@ mod tests {
             Field::new("endpoint_url", DataType::Utf8, false),
             Field::new("state_desc", DataType::Utf8, false),
             Field::new("last_connect_error", DataType::Utf8, false),
-            Field::new("health_details", DataType::Utf8, false),
+            Field::new("health_details_0", DataType::Utf8, false),
+            Field::new("health_details_1", DataType::Utf8, false),
+            Field::new("health_details_2", DataType::Utf8, false),
+            Field::new("health_details_3", DataType::Utf8, false),
             Field::new("role", DataType::Int32, false),
             Field::new("is_local", DataType::Boolean, false),
             Field::new("last_update_ms", DataType::Int64, false),
@@ -1015,16 +1046,19 @@ mod tests {
         let mut writer = crate::ParquetFileWriter::create(&path, Arc::clone(&schema))?;
         let requested_threads = writer.requested_encoding_threads();
         let effective_threads = writer.effective_encoding_threads();
+        let cpu_started = process_cpu_seconds()?;
         let started = std::time::Instant::now();
         for batch in &batches {
             writer.write(batch).await?;
         }
         writer.finish().await?;
         let elapsed = started.elapsed().as_secs_f64();
+        let cpu_seconds = process_cpu_seconds()? - cpu_started;
         let physical_bytes = std::fs::metadata(&path)?.len();
         eprintln!(
-            "W4_BENCH profile=synthetic_availability_replica_states_v1 rows={rows} arrow_bytes={input_bytes} physical_bytes={physical_bytes} wall_seconds={elapsed:.3} input_mib_s={:.2} rows_s={:.0} requested_threads={requested_threads} effective_threads={effective_threads}",
+            "W4_BENCH profile=synthetic_availability_replica_states_v1 rows={rows} arrow_bytes={input_bytes} physical_bytes={physical_bytes} wall_seconds={elapsed:.3} cpu_seconds={cpu_seconds:.3} input_mib_s={:.2} mib_s_per_core={:.2} rows_s={:.0} requested_threads={requested_threads} effective_threads={effective_threads}",
             input_bytes as f64 / elapsed / (1024.0 * 1024.0),
+            input_bytes as f64 / cpu_seconds / (1024.0 * 1024.0),
             rows as f64 / elapsed,
         );
         Ok(())
