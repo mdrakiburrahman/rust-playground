@@ -19,6 +19,9 @@ export const PLANNED_CONTROL_OPERATION_IDS = [
   'registration-release', 'open-publisher-check', 'commit-authority-read', 'terminal-read', 'schema-commit-authority-read',
   'terminal-acquire', 'terminal-compare-read', 'terminal-metadata-write', 'terminal-release',
 ] as const;
+export const PLANNED_STORAGE_OPERATION_IDS = [
+  'preflight-table-list', 'preflight-log-list', 'delta-v0-commit', 'postwrite-table-list', 'delta-v0-readback',
+] as const;
 type Obj = Record<string, unknown>;
 
 export interface FixtureAuthority { campaign_id: string; cell_run_id: string; owner_id: string; fencing_token: number;
@@ -51,10 +54,12 @@ export interface StorageDispatcherOptions { authority: StorageBridgeAuthority; o
   envelope: EffectEnvelope; azure: Azure; store: CampaignStore; ledgerPath: string; phase?: string; planIdentity?: unknown;
   controlPlan?: PlannedControlPlan; fetcher?: typeof fetch; now?: () => number }
 interface PlannedControlPlan { publisher_id: string; generation: string; control_lease_ids: readonly [string, string];
-  control_operation_ids: readonly string[] }
+  control_operation_ids: readonly string[]; storage_operation_ids: readonly string[] }
 interface PlannedControlProgress { stage: 0 | 1; phase: 'acquire' | 'metadata' | 'release' | 'blocked' | 'done';
   registered: boolean; metadataState?: 'active' | 'uncertain' | 'removed'; complete: boolean; operationIndex: number }
 type PlannedControlStep =
+interface PlannedStorageProgress { operationIndex: number; blocked: boolean }
+interface PlannedStorageStep { operationIndex: number }
   | { kind: 'read'; stage: 0 | 1 }
   | { kind: 'acquire' | 'release'; stage: 0 | 1; leaseId: string }
   | { kind: 'metadata'; stage: 0 | 1; leaseId: string; metadataState: 'active' | 'uncertain' | 'removed' };
@@ -330,6 +335,12 @@ class DurableBridgeLedger {
   storageControlOperationMarkers(): string[][] {
     return [...this.records.values()].sort((left, right) => left.request_id - right.request_id)
       .filter(record => record.request_evidence?.target === 'control')
+      .map(record => record.request_evidence!.headers.filter(([name]) => name.toLowerCase() === 'x-arrowcol-operation-id')
+        .map(([, value]) => value));
+  }
+  storageObjectOperationMarkers(): string[][] {
+    return [...this.records.values()].sort((left, right) => left.request_id - right.request_id)
+      .filter(record => record.request_evidence?.target === 'object_store')
       .map(record => record.request_evidence!.headers.filter(([name]) => name.toLowerCase() === 'x-arrowcol-operation-id')
         .map(([, value]) => value));
   }
@@ -751,6 +762,7 @@ export class StorageBridgeDispatcher {
   private readonly campaignStore: CampaignStore;
   private readonly recoveredLedger: boolean;
   private readonly controlProgress?: PlannedControlProgress;
+  private readonly storageProgress?: PlannedStorageProgress;
   constructor(private readonly options: StorageDispatcherOptions) {
     this.now = options.now ?? Date.now; storageAuthority(options.authority);
     this.envelope = structuredClone(options.envelope);
@@ -766,6 +778,11 @@ export class StorageBridgeDispatcher {
       throw new Error('Recovered control-operation marker history is missing, duplicated, reordered or unknown.');
     this.controlProgress = options.controlPlan ? { stage: 0, phase: 'acquire', registered: false, complete: false,
       operationIndex: consumedMarkers.length } : undefined;
+    const storageMarkers = this.ledger.storageObjectOperationMarkers();
+    if (options.controlPlan && storageMarkers.some((values, index) => values.length !== 1 ||
+        values[0] !== options.controlPlan!.storage_operation_ids[index]))
+      throw new Error('Recovered object-operation marker history is missing, duplicated, reordered or unknown.');
+    this.storageProgress = options.controlPlan ? { operationIndex: storageMarkers.length, blocked: false } : undefined;
     this.campaignStore = boundedCampaignStore(options.store, { campaign_id: options.authority.campaign_id,
       cell_run_id: options.authority.cell_run_id, owner_id: options.authority.owner_id,
       fencing_token: options.authority.fencing_token }, options.originalDeadlineUnixMs, this.envelope, this.now, false);
@@ -777,6 +794,12 @@ export class StorageBridgeDispatcher {
     if (this.options.controlPlan && (this.recoveredLedger || !this.controlProgress?.complete ||
         this.controlProgress.operationIndex !== this.options.controlPlan.control_operation_ids.length))
       throw new Error('Owned-run initializer did not consume the exact planned control-operation trace through clean release.');
+  }
+  assertPlannedStorageOperationsComplete(): void {
+    const plan = this.options.controlPlan, progress = this.storageProgress;
+    if (plan && (!progress || progress.blocked || progress.operationIndex !== plan.storage_operation_ids.length ||
+        this.recoveredLedger && this.ledger.terminalReceipt() === undefined))
+      throw new Error('Owned-run initializer did not consume the exact planned object-store operation trace.');
   }
   assertDeltaCommitReadback(delta: { table_id: string; version: number; schema_json: string;
     partition_columns: string[]; active_files: number }, plan: Pick<OwnedRunTablePlan, 'delta_v0'>): void {
@@ -831,6 +854,45 @@ export class StorageBridgeDispatcher {
       throw new Error('Delta terminal proof encountered an invalid or non-response durable storage record.');
     return { status: Number(value.status), body: value.body };
   }
+  private plannedStorageStep(request: StorageBridgeRequest): PlannedStorageStep | undefined {
+    const plan = this.options.controlPlan, progress = this.storageProgress;
+    const marker = singleHeader(request.headers, 'x-arrowcol-operation-id');
+    if (!plan || !progress) {
+      if (marker !== undefined) throw new Error('Storage-operation markers are reserved for immutable planned bridge requests.');
+      return undefined;
+    }
+    if (request.target !== 'object_store') return undefined;
+    const index = progress.operationIndex, expectedMarker = plan.storage_operation_ids[index];
+    if (progress.blocked || expectedMarker === undefined || marker !== expectedMarker)
+      throw new Error('Object-store request is missing, reuses, reorders or substitutes its exact planned operation marker.');
+    const url = new URL(request.url), table = new URL(this.options.authority.table_root_url);
+    const container = new URL(this.options.authority.control_container_url);
+    const tablePrefix = table.pathname.slice(1);
+    const logUrl = `https://${this.options.authority.storage_account}.blob.core.windows.net/${table.username}${table.pathname}_delta_log/00000000000000000000.json`;
+    const list = request.method === 'GET' && url.origin === container.origin && url.pathname === container.pathname &&
+      url.searchParams.get('restype') === 'container' && url.searchParams.get('comp') === 'list';
+    const exactList = (prefix: string, startFrom?: string) => list && url.searchParams.get('prefix') === prefix &&
+      url.searchParams.size === (startFrom === undefined ? 3 : 4) &&
+      (startFrom === undefined ? !url.searchParams.has('startFrom') : url.searchParams.get('startFrom') === startFrom);
+    const control = this.controlProgress;
+    if (!control || !control.registered || control.stage !== 1 || control.phase !== 'acquire')
+      throw new Error('Object-store request is outside the registered publisher phase.');
+    const phaseAllowed = index < 2 ? [6, 7].includes(control.operationIndex) : control.operationIndex === 8;
+    const shapeAllowed = index === 0 || index === 3 ? exactList(tablePrefix) :
+      index === 1 ? exactList(tablePrefix + '_delta_log/', (tablePrefix + '_delta_log/').slice(0, -1)) :
+      index === 2 ? request.method === 'PUT' && url.href === logUrl :
+      index === 4 ? request.method === 'GET' && url.href === logUrl : false;
+    if (!phaseAllowed || !shapeAllowed)
+      throw new Error(`Object-store request does not match planned marker ${expectedMarker} at control operation ${control.operationIndex}.`);
+    return { operationIndex: index };
+  }
+  private recordPlannedStorageResponse(step: PlannedStorageStep | undefined, reply: StorageBridgeReply): void {
+    if (!step || !this.storageProgress) return;
+    const expectedStatus = step.operationIndex === 2 ? 201 : 200;
+    this.storageProgress.operationIndex++;
+    if (reply.outcome !== 'response' || reply.status !== expectedStatus) this.storageProgress.blocked = true;
+  }
+
   private plannedControlStep(request: StorageBridgeRequest): PlannedControlStep | undefined {
     const plan = this.options.controlPlan, progress = this.controlProgress;
     const marker = singleHeader(request.headers, 'x-arrowcol-operation-id');
@@ -840,16 +902,7 @@ export class StorageBridgeDispatcher {
     }
     if (this.recoveredLedger && request.method !== 'GET' && request.method !== 'HEAD')
       throw new Error('A recovered bridge ledger permits cached replies and bounded reads only; mutating replay is forbidden.');
-    if (request.target === 'object_store') {
-      if (marker !== undefined) throw new Error('Control-operation markers are not valid on object-store requests.');
-      const url = new URL(request.url);
-      const listing = request.method === 'GET' && url.searchParams.get('comp') === 'list' && [6, 7].includes(progress.operationIndex);
-      const terminalLog = request.method === 'PUT' || request.method === 'GET' && url.pathname.endsWith('/_delta_log/00000000000000000000.json');
-      const commitOrReadback = terminalLog && progress.operationIndex === 8;
-      if (!progress.registered || progress.stage !== 1 || progress.phase !== 'acquire' || !(listing || commitOrReadback))
-        throw new Error(`Object-store ${request.method} ${url.href} is outside the registered phase at operation ${progress.operationIndex}.`);
-      return undefined;
-    }
+    if (request.target === 'object_store') return undefined;
     const index = progress.operationIndex, expectedMarker = plan.control_operation_ids[index];
     if (expectedMarker === undefined || marker !== expectedMarker)
       throw new Error('Control request is missing, reuses, reorders or substitutes its exact planned operation marker.');
@@ -932,6 +985,7 @@ export class StorageBridgeDispatcher {
     if (this.recoveredLedger && request.method !== 'GET' && request.method !== 'HEAD')
       throw new Error('A recovered bridge ledger permits cached replies and bounded reads only; mutating replay is forbidden.');
     const controlStep = this.plannedControlStep(request);
+    const storageStep = this.plannedStorageStep(request);
     this.ledger.begin(request.request_id, request.request_sha256, requestEvidence);
     let reply: StorageBridgeReply;
     try {
@@ -964,6 +1018,7 @@ export class StorageBridgeDispatcher {
     }
     this.ledger.complete(request.request_id, request.request_sha256, reply);
     this.recordPlannedControlResponse(controlStep, reply);
+    this.recordPlannedStorageResponse(storageStep, reply);
     return reply;
   }
 }async function* ndjsonLines(stream: NodeJS.ReadableStream): AsyncGenerator<Buffer> {
@@ -1043,6 +1098,7 @@ export async function runFixtureSetupChild(executable: string, inputPath: string
 }
 interface OwnedRunTablePlan { account: string; container: string; campaign_root: string; run_root: string; campaign_id: string; run_id: string;
   generation: string; publisher_id: string; control_lease_ids: [string, string]; control_operation_ids: string[];
+  storage_operation_ids: string[];
   table: string; partition_by_ingestion_date: boolean; owner_id: string; fencing_token: number;
   delta_v0: { body: string; body_sha256: string; timestamp: number; txn_id: string; table_id: string; created_time: number } }
 export interface OwnedRunTableReceipt { allocation: OwnedRunTablePlan; delta: { table_id: string; version: number; schema_json: string;
@@ -1054,8 +1110,8 @@ export interface OwnedRunTableParentReceipt { schema_version: 1; kind: 'owned_ru
   artifact_identity: OwnedRunTableArtifactIdentity; exchange_count: number; bridge_receipt: OwnedRunTableBridgeReceipt }
 interface OwnedRunBridgeInput { authority: StorageBridgeAuthority; original_deadline_unix_ms: number }
 const APPROVED_OWNED_RUN_BUILD_RECEIPT: OwnedRunTableArtifactIdentity = Object.freeze({
-  source_commit: 'cb8f55d05d4f3fc9937d9a3f295796e28c40ffa5',
-  executable_sha256: 'e3130a6bc0bf15537a325a82809afb119cfc81f5dc65fa3616def6cc47e0998b',
+  source_commit: '32964aeb15a89b3db8ce2f9adc285691b62c0e78',
+  executable_sha256: '86803bcd9fae72f077d2d4350f30516f2903ce2f7e26774143df3d1d35e6fc3f',
 });
 const OWNED_RUN_TABLE = 'telemetry.sqlserver.sqlserver_availability_replica_states';
 const OWNED_RUN_PARTITION = '__arrowcol_ingestion';
@@ -1067,7 +1123,7 @@ export interface OwnedRunInitializerOptions extends Omit<StorageDispatcherOption
 }
 function validateOwnedRunTablePlan(value: unknown): asserts value is OwnedRunTablePlan {
   const keys = ['account','container','campaign_root','run_root','campaign_id','run_id','generation','publisher_id',
-    'control_lease_ids','control_operation_ids','table','partition_by_ingestion_date','owner_id','fencing_token','delta_v0'];
+    'control_lease_ids','control_operation_ids','storage_operation_ids','table','partition_by_ingestion_date','owner_id','fencing_token','delta_v0'];
   if (!object(value) || !exact(value, keys) || typeof value.account !== 'string' || !/^[a-z0-9]{3,24}$/.test(value.account) ||
       typeof value.container !== 'string' || !/^[a-z0-9](?:[a-z0-9-]{1,61}[a-z0-9])?$/.test(value.container) ||
       typeof value.campaign_root !== 'string' || typeof value.run_root !== 'string' || typeof value.table !== 'string' ||
@@ -1083,6 +1139,9 @@ function validateOwnedRunTablePlan(value: unknown): asserts value is OwnedRunTab
   if (!Array.isArray(value.control_operation_ids) || !equal(value.control_operation_ids, PLANNED_CONTROL_OPERATION_IDS) ||
       new Set(value.control_operation_ids).size !== PLANNED_CONTROL_OPERATION_IDS.length)
     throw new Error('Owned-run plan must allocate the exact unique ordered control-operation markers before envelope creation.');
+  if (!Array.isArray(value.storage_operation_ids) || !equal(value.storage_operation_ids, PLANNED_STORAGE_OPERATION_IDS) ||
+      new Set(value.storage_operation_ids).size !== PLANNED_STORAGE_OPERATION_IDS.length)
+    throw new Error('Owned-run plan must allocate the exact unique ordered object-store operation markers before envelope creation.');
   integer(value.fencing_token, 1, Number.MAX_SAFE_INTEGER, 'fencing token');
   const delta = value.delta_v0;
   if (!object(delta) || !exact(delta, ['body','body_sha256','timestamp','txn_id','table_id','created_time']) ||
@@ -1139,6 +1198,9 @@ function validatePlannedControlPlan(value: PlannedControlPlan): void {
   if (!Array.isArray(value.control_operation_ids) || !equal(value.control_operation_ids, PLANNED_CONTROL_OPERATION_IDS) ||
       new Set(value.control_operation_ids).size !== PLANNED_CONTROL_OPERATION_IDS.length)
     throw new Error('Storage bridge requires the exact unique ordered planned control-operation markers.');
+  if (!Array.isArray(value.storage_operation_ids) || !equal(value.storage_operation_ids, PLANNED_STORAGE_OPERATION_IDS) ||
+      new Set(value.storage_operation_ids).size !== PLANNED_STORAGE_OPERATION_IDS.length)
+    throw new Error('Storage bridge requires the exact unique ordered planned object-store operation markers.');
 }
 function plannedPublisherState(headers: [string, string][], plan: PlannedControlPlan, stage: 0 | 1): 'active' | 'uncertain' | 'removed' {
   const raw = singleHeader(headers, 'x-ms-meta-publishers');
@@ -1219,12 +1281,13 @@ export async function initializeOwnedRunTable(options: OwnedRunInitializerOption
     azure: options.azure, store: options.store, ledgerPath: options.ledgerPath, phase: 'owned-run-table-initialization',
     planIdentity: { plan, artifact_identity: artifactIdentity },
     controlPlan: { publisher_id: plan.publisher_id, generation: plan.generation, control_lease_ids: plan.control_lease_ids,
-      control_operation_ids: plan.control_operation_ids },
+      control_operation_ids: plan.control_operation_ids, storage_operation_ids: plan.storage_operation_ids },
     fetcher: options.fetcher, now });
   const cached = dispatcher.terminalEvidence();
   if (cached !== undefined) {
     validateOwnedRunParentReceipt(cached, artifactIdentity, plan, authority, deadline, dispatcher.recordedRequestCount);
     dispatcher.assertDeltaCommitReadback(cached.bridge_receipt.receipt.delta, plan);
+    dispatcher.assertPlannedStorageOperationsComplete();
     return cached;
   }
   assertBridgeLive(options.envelope, deadline, now);
@@ -1236,6 +1299,7 @@ export async function initializeOwnedRunTable(options: OwnedRunInitializerOption
   validateOwnedRunReceipt(child.receipt, plan, authority, deadline);
   if (child.exchangeCount !== dispatcher.recordedRequestCount)
     throw new Error('Owned-run child exchanges are not a one-to-one match for the retained durable transcript.');
+  dispatcher.assertPlannedStorageOperationsComplete();
   dispatcher.assertControlPlanComplete();
   dispatcher.assertDeltaCommitReadback(child.receipt.receipt.delta, plan);
   const result: OwnedRunTableParentReceipt = { schema_version: 1, kind: 'owned_run_table_parent_receipt',

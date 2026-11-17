@@ -60,6 +60,7 @@ mod storage_bridge {
     use sha2::{Digest, Sha256};
     use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
     use tokio::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::time::Instant;
     use url::Url;
 
@@ -177,6 +178,8 @@ mod storage_bridge {
         data_endpoint: Url,
         data_prefix: String,
         state: Mutex<State>,
+        planned_object_operation_ids: Option<Vec<String>>,
+        next_planned_object_operation: AtomicUsize,
     }
 
     impl fmt::Debug for StorageBridge {
@@ -354,6 +357,8 @@ mod storage_bridge {
                 deadline: Instant::now() + Duration::from_millis(remaining),
                 data_endpoint,
                 data_prefix,
+                planned_object_operation_ids: None,
+                next_planned_object_operation: AtomicUsize::new(0),
                 state: Mutex::new(State {
                     reader: BufReader::new(Box::pin(reader)),
                     writer: Box::pin(writer),
@@ -362,6 +367,40 @@ mod storage_bridge {
                 }),
             }))
         }
+        /// Bind immutable object-store operation identities for a plan-driven initialization.
+        ///
+        /// # Errors
+        /// Rejects invalid operation markers or an invalid bridge configuration.
+        pub(crate) fn new_with_planned_object_operation_ids<R, W>(
+            authority: StorageBridgeAuthority,
+            original_deadline_unix_ms: u64,
+            operation_ids: Vec<String>,
+            reader: R,
+            writer: W,
+        ) -> anyhow::Result<Arc<Self>>
+        where
+            R: AsyncRead + Send + 'static,
+            W: AsyncWrite + Send + 'static,
+        {
+            if operation_ids.is_empty()
+                || operation_ids.len() > 16
+                || operation_ids.iter().enumerate().any(|(index, id)| {
+                    id.is_empty()
+                        || id.len() > 64
+                        || !id.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+                        || operation_ids[..index].contains(id)
+                })
+            {
+                return Err(invalid());
+            }
+            let mut bridge = Self::new(authority, original_deadline_unix_ms, reader, writer)?;
+            let Some(inner) = Arc::get_mut(&mut bridge) else {
+                return Err(invalid());
+            };
+            inner.planned_object_operation_ids = Some(operation_ids);
+            Ok(bridge)
+        }
+
 
         pub(crate) fn authority(&self) -> &StorageBridgeAuthority {
             &self.authority
@@ -479,6 +518,9 @@ mod storage_bridge {
             if state.poisoned {
                 return Outcome::Unknown(Code::Poisoned);
             }
+            if target == "object_store" && request.headers().contains_key("x-arrowcol-operation-id") {
+                return Outcome::NotSent(Code::InvalidRequest);
+            }
             if let Err(code) = self.validate_request(&request, target) {
                 return Outcome::NotSent(code);
             }
@@ -505,6 +547,18 @@ mod storage_bridge {
             };
             let deadline = self.deadline.min(Instant::now() + Duration::from_secs(10));
             let remaining = deadline.saturating_duration_since(Instant::now());
+            if target == "object_store" {
+                if let Some(operation_ids) = &self.planned_object_operation_ids {
+                    let index = self.next_planned_object_operation.fetch_add(1, Ordering::Relaxed);
+                    let Some(operation_id) = operation_ids.get(index) else {
+                        return Outcome::NotSent(Code::InvalidRequest);
+                    };
+                    let Ok(value) = reqwest::header::HeaderValue::from_bytes(operation_id.as_bytes()) else {
+                        return Outcome::NotSent(Code::InvalidRequest);
+                    };
+                    request.headers_mut().insert("x-arrowcol-operation-id", value);
+                }
+            }
             let Ok(remaining_timeout_ms) = u64::try_from(remaining.as_millis()) else {
                 return Outcome::NotSent(Code::DeadlineExceeded);
             };

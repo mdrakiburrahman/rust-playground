@@ -42,6 +42,13 @@ const PLANNED_CONTROL_OPERATION_IDS: [&str; 13] = [
     "terminal-metadata-write",
     "terminal-release",
 ];
+const PLANNED_STORAGE_OPERATION_IDS: [&str; 5] = [
+    "preflight-table-list",
+    "preflight-log-list",
+    "delta-v0-commit",
+    "postwrite-table-list",
+    "delta-v0-readback",
+];
 
 /// Strict input allocation for one fresh table, not permission to execute cloud operations.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -67,6 +74,8 @@ pub struct OwnedRunTablePlan {
     pub control_lease_ids: Vec<String>,
     /// Ordered operation markers for every control request in admission, create and drain.
     pub control_operation_ids: Vec<String>,
+    /// Ordered operation markers for preflight listing, the v0 commit and its actual readback.
+    pub storage_operation_ids: Vec<String>,
     /// Frozen canonical identity; no arbitrary schema or table selection.
     pub table: String,
     /// Must select the existing ingestion partition.
@@ -115,6 +124,14 @@ impl OwnedRunTablePlan {
             .ne(PLANNED_CONTROL_OPERATION_IDS)
         {
             bail!("owned-run plan must allocate the exact ordered control-operation markers before envelope creation");
+        }
+        if self
+            .storage_operation_ids
+            .iter()
+            .map(String::as_str)
+            .ne(PLANNED_STORAGE_OPERATION_IDS)
+        {
+            bail!("owned-run plan must allocate the exact ordered object-store operation markers before envelope creation");
         }
         if self.fencing_token == 0
             || !self.partition_by_ingestion_date
@@ -409,7 +426,8 @@ where
     {
         bail!("storage bridge authority differs from the original owned-run table allocation");
     }
-    let bridge = StorageBridge::new(input.authority.clone(), input.original_deadline_unix_ms, reader, writer)?;
+    let bridge = StorageBridge::new_with_planned_object_operation_ids(input.authority.clone(), input.original_deadline_unix_ms,
+        plan.storage_operation_ids.clone(), reader, writer)?;
     let publisher_id = canonical_uuid(&plan.publisher_id)?;
     let control_lease_ids = [
         canonical_uuid(&plan.control_lease_ids[0])?,

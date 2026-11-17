@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 import { EffectBoundary, withEffectBoundary, type EffectEnvelope } from '../../infra/azure/effect-boundary.js';
-import { initializeOwnedRunTable, PLANNED_CONTROL_OPERATION_IDS, StorageBridgeDispatcher, type StorageBridgeAuthority, type StorageBridgeRequest } from './aks-d47-bridge.js';
+import { initializeOwnedRunTable, PLANNED_CONTROL_OPERATION_IDS, PLANNED_STORAGE_OPERATION_IDS, StorageBridgeDispatcher, type StorageBridgeAuthority, type StorageBridgeRequest } from './aks-d47-bridge.js';
 import type { Azure } from '../../infra/azure/bootstrap.js';
 import { newCampaignState, type CampaignStore, type RunInventory, type StoredCampaign } from './aks-campaign.js';
 
@@ -388,7 +388,7 @@ test('planned control identities admit the exact 13-operation admission, create 
   const now = Date.now(), deadline = now + 60_000, publisherId = 'c0ffee00-0000-4000-8000-000000000011';
   const leaseIds = ['c0ffee00-0000-4000-8000-000000000012', 'c0ffee00-0000-4000-8000-000000000013'] as const;
   const controlPlan = { publisher_id: publisherId, generation: authority.reset_generation, control_lease_ids: leaseIds,
-    control_operation_ids: PLANNED_CONTROL_OPERATION_IDS } as const;
+    control_operation_ids: PLANNED_CONTROL_OPERATION_IDS, storage_operation_ids: PLANNED_STORAGE_OPERATION_IDS } as const;
   const baseUrl = authority.control_container_url, leaseUrl = baseUrl + '?comp=lease&restype=container';
   const metadataUrl = baseUrl + '?restype=container&comp=metadata';
   const read = (id: number, index: number) => signedControlRequest(authority, deadline, id,
@@ -416,7 +416,7 @@ test('planned control identities admit the exact 13-operation admission, create 
   const dispatcher = new StorageBridgeDispatcher({ authority, originalDeadlineUnixMs: deadline, envelope, azure,
     store: custody.store, ledgerPath: path.join(directory, 'storage-ledger.jsonl'), controlPlan,
     planIdentity: { plan: { publisher_id: publisherId, generation: authority.reset_generation,
-      control_lease_ids: leaseIds, control_operation_ids: PLANNED_CONTROL_OPERATION_IDS } },
+      control_lease_ids: leaseIds, control_operation_ids: PLANNED_CONTROL_OPERATION_IDS, storage_operation_ids: PLANNED_STORAGE_OPERATION_IDS } },
     fetcher: async () => new Response('', { status: statuses[forwards++]! }) });
   const boundary = new EffectBoundary(envelope, path.join(directory, 'effects.jsonl'));
   for (const item of requests) assert.equal((await withEffectBoundary(boundary, () => dispatcher.exchange(item))).outcome, 'response');
@@ -442,7 +442,7 @@ test('planned control dispatcher rejects missing, duplicate, unknown, reused and
   const now = Date.now(), deadline = now + 60_000, publisherId = 'c0ffee00-0000-4000-8000-000000000011';
   const leaseIds = ['c0ffee00-0000-4000-8000-000000000012', 'c0ffee00-0000-4000-8000-000000000013'] as const;
   const controlPlan = { publisher_id: publisherId, generation: authority.reset_generation, control_lease_ids: leaseIds,
-    control_operation_ids: PLANNED_CONTROL_OPERATION_IDS } as const;
+    control_operation_ids: PLANNED_CONTROL_OPERATION_IDS, storage_operation_ids: PLANNED_STORAGE_OPERATION_IDS } as const;
   const base = authority.control_container_url, headUrl = base + '?restype=container';
   const makeHead = (id: number, marker: string | undefined, extra: [string, string][] = []) => {
     const request = signedControlRequest(authority, deadline, id, headUrl, extra, 'HEAD', marker);
@@ -484,7 +484,7 @@ test('planned control restart serves an exact cached reply without forwarding ag
   const now = Date.now(), deadline = now + 60_000, publisherId = 'c0ffee00-0000-4000-8000-000000000011';
   const leaseIds = ['c0ffee00-0000-4000-8000-000000000012', 'c0ffee00-0000-4000-8000-000000000013'] as const;
   const controlPlan = { publisher_id: publisherId, generation: authority.reset_generation, control_lease_ids: leaseIds,
-    control_operation_ids: PLANNED_CONTROL_OPERATION_IDS } as const;
+    control_operation_ids: PLANNED_CONTROL_OPERATION_IDS, storage_operation_ids: PLANNED_STORAGE_OPERATION_IDS } as const;
   const read = signedControlRequest(authority, deadline, 1, authority.control_container_url + '?restype=container', [], 'HEAD',
     PLANNED_CONTROL_OPERATION_IDS[0]);
   const acquire = signedControlRequest(authority, deadline, 2, authority.control_container_url + '?comp=lease&restype=container',
@@ -572,7 +572,6 @@ test('real loadgen initializer composes with the Node BR3 planned-identity paren
   const executable = process.env.OAT_BR3_LOADGEN_BIN!;
   const directory = mkdtempSync(path.join(os.tmpdir(), 'oat-d47-real-composition-'));
   chmodSync(directory, 0o700);
-  t.after(() => rmSync(directory, { recursive: true, force: true }));
   const now = Date.now(), deadline = now + 300_000;
   const campaign = 'c0ffee00-0000-4000-8000-000000000001', run = 'c0ffee00-0000-4000-8000-000000000002';
   const owner = 'c0ffee00-0000-4000-8000-000000000003', generation = 'c0ffee00-0000-4000-8000-000000000004';
@@ -588,6 +587,7 @@ test('real loadgen initializer composes with the Node BR3 planned-identity paren
   const preliminaryPlan = { account, container, campaign_root: campaignRoot, run_root: runRoot, campaign_id: campaign, run_id: run,
     generation, publisher_id: publisherId, control_lease_ids: [...controlLeaseIds],
     control_operation_ids: [...PLANNED_CONTROL_OPERATION_IDS],
+    storage_operation_ids: [...PLANNED_STORAGE_OPERATION_IDS],
     table: 'telemetry.sqlserver.sqlserver_availability_replica_states', partition_by_ingestion_date: true,
     owner_id: owner, fencing_token: 1 };
   const preliminaryPlanPath = path.join(directory, 'preliminary-plan.json');
@@ -615,20 +615,24 @@ test('real loadgen initializer composes with the Node BR3 planned-identity paren
   const activeRegistry = JSON.stringify({ [publisherId]: { generation, state: 'active' } });
   const controlRequests = [controlRead(1, 0), controlAcquire(2, 1, controlLeaseIds[0]), controlRead(3, 2),
     controlMetadata(4, 3, controlLeaseIds[0], activeRegistry), controlRelease(5, 4, controlLeaseIds[0]), controlRead(6, 5),
-    controlRead(7, 6), controlRead(8, 7), controlAcquire(9, 8, controlLeaseIds[1]), controlRead(10, 9),
-    controlMetadata(11, 10, controlLeaseIds[1], '{}'), controlRelease(12, 11, controlLeaseIds[1])];
+    controlRead(7, 6), controlRead(8, 7), controlRead(9, 8), controlAcquire(10, 9, controlLeaseIds[1]), controlRead(11, 10),
+    controlMetadata(12, 11, controlLeaseIds[1], '{}'), controlRelease(13, 12, controlLeaseIds[1])];
   const listPrefix = new URL(authority.table_root_url).pathname.slice(1);
   const listUrl = controlBase + '?restype=container&comp=list&prefix=' + encodeURIComponent(listPrefix);
-  const initialListing = signedObjectRequest(authority, deadline, 13, 'GET', listUrl);
+  const initialListing = signedObjectRequest(authority, deadline, 14, 'GET', listUrl, '', [['x-arrowcol-operation-id', PLANNED_STORAGE_OPERATION_IDS[0]]]);
   const deltaLogPrefix = listPrefix + '_delta_log/';
   const logListingUrl = controlBase + '?restype=container&comp=list&prefix=' + encodeURIComponent(deltaLogPrefix) +
     '&startFrom=' + encodeURIComponent(deltaLogPrefix.slice(0, -1));
-  const logListing = signedObjectRequest(authority, deadline, 14, 'GET', logListingUrl);
-  const logUrl = `https://${account}.blob.core.windows.net/${listPrefix}_delta_log/00000000000000000000.json`;
-  const deltaCommit = signedObjectRequest(authority, deadline, 15, 'PUT', logUrl, plan.delta_v0.body,
-    [['if-none-match', '*'], ['x-ms-blob-type', 'BlockBlob'], ['content-length', String(Buffer.byteLength(plan.delta_v0.body, 'utf8'))]]);
-  const deltaReadback = signedObjectRequest(authority, deadline, 16, 'GET', logUrl);
-  const envelope = envelopeForRequests(authority, [...controlRequests, initialListing, logListing, deltaCommit, deltaReadback]);
+  const logListing = signedObjectRequest(authority, deadline, 15, 'GET', logListingUrl, '', [['x-arrowcol-operation-id', PLANNED_STORAGE_OPERATION_IDS[1]]]);
+  const logUrl = `https://${account}.blob.core.windows.net/${container}/${listPrefix}_delta_log/00000000000000000000.json`;
+  const deltaCommit = signedObjectRequest(authority, deadline, 16, 'PUT', logUrl, plan.delta_v0.body,
+    [['if-none-match', '*'], ['x-ms-blob-type', 'BlockBlob'], ['content-length', String(Buffer.byteLength(plan.delta_v0.body, 'utf8'))],
+      ['x-arrowcol-operation-id', PLANNED_STORAGE_OPERATION_IDS[2]]]);
+  const postwriteListing = signedObjectRequest(authority, deadline, 17, 'GET', listUrl, '',
+    [['x-arrowcol-operation-id', PLANNED_STORAGE_OPERATION_IDS[3]]]);
+  const deltaReadback = signedObjectRequest(authority, deadline, 18, 'GET', logUrl, '',
+    [['x-arrowcol-operation-id', PLANNED_STORAGE_OPERATION_IDS[4]]]);
+  const envelope = envelopeForRequests(authority, [...controlRequests, initialListing, logListing, deltaCommit, postwriteListing, deltaReadback]);
   const custody = mutableCustodyStore(authority, now);
   const azure = { c: { account }, async token() { return 'offline-test-token'; } } as unknown as Azure;
   const ledgerPath = path.join(directory, 'storage-ledger.jsonl');
