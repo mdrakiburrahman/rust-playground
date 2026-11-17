@@ -3561,6 +3561,9 @@ fn matrix_cell_specs(config: &OatConfig) -> Vec<(u32, u32, String)> {
 }
 
 fn platform_for_run(config: &OatConfig, run_id: &str) -> Result<Box<dyn Platform>> {
+    if config.campaign_profile == Some(crate::config::CampaignProfile::ScaleOutSingleTable) {
+        bail!("scale_out_single_table is blocked until multi-pod protection and delivery reconciliation are implemented");
+    }
     if config.platform.kind == crate::config::OatMode::Aks
         && config.campaign_profile == Some(crate::config::CampaignProfile::SingleHotTable)
     {
@@ -9300,7 +9303,10 @@ async fn prepare_aks_platform(
     runtime_config["quiver"] = json!(config.tunables.wal.is_some());
     runtime_config["effective_stop_budgets"] = serde_json::to_value(config.maintenance_stop_budget()?)?;
     runtime_config["resources"] = serde_json::to_value(config.effective_aks_resources())?;
-    set_runtime_replicas(&mut runtime_config, replicas)?;
+    if config.campaign_profile == Some(crate::config::CampaignProfile::ScaleOutSingleTable) {
+        runtime_config["campaignProfile"] = json!("scale_out_single_table");
+        set_runtime_replicas(&mut runtime_config, replicas)?;
+    }
     runtime_config["collectorWorkers"] = json!(
         config
             .dfe_worker_concurrency

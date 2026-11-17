@@ -302,6 +302,7 @@ pub enum OatMode {
 #[serde(rename_all = "snake_case")]
 pub enum CampaignProfile {
     SingleHotTable,
+    ScaleOutSingleTable,
 }
 
 fn deserialize_oat_tunables<'de, D>(deserializer: D) -> std::result::Result<Tunables, D::Error>
@@ -377,6 +378,20 @@ impl EffectiveStopBudgets {
 
 impl OatConfig {
     fn validate_campaign_profile(&self) -> Result<()> {
+        if self.campaign_profile == Some(CampaignProfile::ScaleOutSingleTable) {
+            if self.tables.as_slice() != ["sqlserver_availability_replica_states"] {
+                bail!("scale_out_single_table campaign requires exactly the public sqlserver_availability_replica_states DMV table");
+            }
+            if self.tunables.wal.is_some() {
+                bail!("scale_out_single_table campaign requires WAL to be absent");
+            }
+            let maintenance = self.tunables.maintenance.as_ref()
+                .context("scale_out_single_table campaign requires enabled, applying maintenance")?;
+            if maintenance.enabled != Some(true) || maintenance.apply != Some(true) || maintenance.max_cycles.is_some() {
+                bail!("scale_out_single_table campaign requires continuous, enabled, applying maintenance");
+            }
+            return Ok(());
+        }
         if self.campaign_profile != Some(CampaignProfile::SingleHotTable) {
             return Ok(());
         }
@@ -987,13 +1002,18 @@ impl OatConfig {
         if self.rows_per_table == 0 || self.rows_per_table > 1_000_000 || !(1..=64).contains(&self.dmv_concurrency) {
             bail!("rows_per_table must be 1..=1000000 and dmv_concurrency 1..=64");
         }
-        if !(1..=128).contains(&self.clients_per_table)
+        let max_clients_per_table = if self.campaign_profile == Some(CampaignProfile::ScaleOutSingleTable) {
+            128
+        } else {
+            4
+        };
+        if !(1..=max_clients_per_table).contains(&self.clients_per_table)
             || self
                 .clients_per_table
                 .checked_mul(self.tables.len())
                 .is_none_or(|total| total > 128)
         {
-            bail!("clients_per_table must be between 1 and 128 and the client fleet may not exceed 128");
+            bail!("clients_per_table must be between 1 and {max_clients_per_table} and the client fleet may not exceed 128");
         }
         let qap_endpoint = Url::parse(&self.qap_endpoint).context("qap_endpoint must be a URL")?;
         if !matches!(qap_endpoint.scheme(), "http" | "https")
@@ -1894,11 +1914,17 @@ mod tests {
     fn client_fleet_is_bounded_across_tables() -> Result<()> {
         let mut config = valid();
         assert_eq!(config.clients_per_table, 1);
-        config.clients_per_table = 64;
-        config.validate()?;
-        config.clients_per_table = 65;
+        config.clients_per_table = 5;
         assert!(config.validate().is_err());
-        config.tables.truncate(1);
+        config.campaign_profile = Some(CampaignProfile::ScaleOutSingleTable);
+        config.tables = vec!["sqlserver_availability_replica_states".to_owned()];
+        config.maintenance_image = Some(format!("maintenance@sha256:{}", "a".repeat(64)));
+        config.tunables = serde_json::from_value(serde_json::json!({
+            "maintenance": {
+                "enabled": true, "apply": true,
+                "operations": ["purge", "optimize", "vacuum", "checkpoint", "prune_log"]
+            }
+        }))?;
         config.clients_per_table = 128;
         config.validate()?;
         config.clients_per_table = 129;
@@ -1907,6 +1933,11 @@ mod tests {
         assert!(config.validate().is_err());
         config.clients_per_table = usize::MAX;
         assert!(config.validate().is_err());
+        config.clients_per_table = 1;
+        config.tables.push("sqlserver_wait_stats".to_owned());
+        assert!(config.validate().is_err());
+        assert!(serde_json::from_str::<CampaignProfile>(r#""scale_out_single_tables""#).is_err());
+        assert_eq!(serde_json::to_string(&CampaignProfile::ScaleOutSingleTable)?, r#""scale_out_single_table""#);
         Ok(())
     }
 
