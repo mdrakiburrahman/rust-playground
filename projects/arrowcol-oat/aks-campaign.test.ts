@@ -7,6 +7,7 @@ import { CampaignConflictError, CUSTODY_CLEANUP_STEPS, MAX_CAMPAIGN_LIFETIME_MS,
   validateCampaignState, type CampaignState, type CampaignStore, type RunInventory, type StoredCampaign,
   CampaignWriteOutcomeUnknownError, recordArmOperation } from './aks-campaign.js';
 import { evaluateCustody, reconcileArmOperation, reconcileCleanupOnce, reconcileOnce, reconcilePendingArmOperations } from './aks-reconcile.js';
+import { newScaleTrialReceipt, SCALE_RESTORE_TIMEOUT_MS, type ScaleStep } from './aks-scale.js';
 
 const campaignId = 'c0ffee00-0000-4000-8000-000000000001';
 const ownerId = 'c0ffee00-0000-4000-8000-000000000002';
@@ -377,6 +378,37 @@ test('watchdog cleanup CAS retains producer token and rejects stale producer wri
   assert.equal(merged.fencingToken, cleaning.fencingToken);
   assert.equal(merged.runInventory!.cleanup.stop_admission.state, 'pending');
   await assert.rejects(publishCleanupRunInventory(store, updated, ownerId, armed.fencingToken), /fenced|cleaning token/);
+});
+
+test('scale trial journal rejects malformed target bindings and duplicate ids', () => {
+  const state = newCampaignState(campaignId, ownerId, 1_000_000);
+  const inventory = inventoryFor(state, true);
+  const armed = { ...state, mode: 'armed' as const, runInventory: inventory };
+  const target = { dimension: 'collector-cpu-limit' as const, before: 2, after: 3 };
+  const step: ScaleStep = { ...target, restore: { dimension: target.dimension, before: 3, after: 2 }, evidence: ['collector-cpu-saturated'],
+    baselineCommittedRowsPerSecond: 100, baselineQapPendingBacklog: 1, baselineQapP95LatencyMs: 10 };
+  const generated = newScaleTrialReceipt({ state: armed, step, resource: { transport: 'kubernetes',
+    resource_id: 'apps/v1/Deployment/' + inventory.namespace.name + '/arrowcol/' + inventory.resources[0]!.uid, api_version: 'apps/v1',
+    kind: 'Deployment', namespace: inventory.namespace.name, name: 'arrowcol', uid: inventory.resources[0]!.uid }, now: armed.startedAtMs });
+  assert.equal(generated.restore_deadline_at_ms - generated.deadline_at_ms, SCALE_RESTORE_TIMEOUT_MS);
+  assert.throws(() => newScaleTrialReceipt({ state: armed, step, resource: generated.resource,
+    now: armed.expiresAtMs - SCALE_RESTORE_TIMEOUT_MS }), /bounded remaining lifetime/);
+  const receipt = {
+    schema_version: 1 as const, trial_id: 'c0ffee00-0000-4000-8000-000000000010', campaign_id: campaignId, owner_id: ownerId,
+    fencing_token: 1, cell_run_id: inventory.cell_run_id, started_at_ms: armed.startedAtMs, deadline_at_ms: armed.startedAtMs + 60_000,
+    restore_deadline_at_ms: armed.startedAtMs + 360_000,
+    target, restore: { dimension: target.dimension, before: 3, after: 2 }, evidence: ['collector-cpu-saturated'],
+    baseline: { committed_rows_per_second: 100, qap_pending_backlog: 1, qap_p95_latency_ms: 10 },
+    resource: { transport: 'kubernetes' as const, resource_id: 'apps/v1/Deployment/' + inventory.namespace.name + '/arrowcol/' + inventory.resources[0]!.uid,
+      api_version: 'apps/v1', kind: 'Deployment', namespace: inventory.namespace.name, name: 'arrowcol', uid: inventory.resources[0]!.uid },
+    phase: 'apply-intent' as const,
+  };
+  assert.equal(validateCampaignState({ ...armed, scaleTrials: [receipt] }).scaleTrials?.length, 1);
+  assert.throws(() => validateCampaignState({ ...armed, scaleTrials: [receipt, receipt] }), /duplicated/);
+  assert.throws(() => validateCampaignState({ ...armed, scaleTrials: [{ ...receipt, restore: { ...receipt.restore, after: 4 } }] }), /malformed/);
+  assert.throws(() => validateCampaignState({ ...armed, scaleTrials: [{ ...receipt, restore_deadline_at_ms: receipt.deadline_at_ms }] }), /malformed/);
+  assert.throws(() => validateCampaignState({ ...armed, scaleTrials: [{ ...receipt, restore_deadline_at_ms: receipt.restore_deadline_at_ms + 1 }] }), /malformed/);
+  assert.throws(() => validateCampaignState({ ...armed, scaleTrials: [{ ...receipt, resource: { ...receipt.resource, uid: 'c0ffee00-0000-4000-8000-000000000099' } }] }), /malformed/);
 });
 
 test('strict state schema rejects additional persisted fields', async () => {

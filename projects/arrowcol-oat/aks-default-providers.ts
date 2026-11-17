@@ -10,6 +10,9 @@ import { reconcilePendingArmOperations, verifySafeIdle, type SafeIdleObservation
 import { captureStampKustoBaseline, observeDataPreservation, validateStampKustoBaseline, type DataPreservationReceipt } from './aks-data-safety.js';
 import { createDefaultLifecycleActions } from './aks-lifecycle.js';
 import { createCellCleanupProviders, type CellStepProviders } from './aks-cell-cleanup.js';
+import { createDefaultScaleAdapter, restoreCampaignScaleTrials } from './aks-scale-provider.js';
+import { withCleanupDeadline } from './aks-cleanup-budget.js';
+import { buildAksPoolScalePayload } from './aks-arm-pool.js';
 
 function object(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Provider observation is UNKNOWN.');
@@ -171,14 +174,6 @@ export async function observeStampHealth(azure: Azure, state: CampaignState, aut
   return { observed_at_unix_ms: Date.now(), pods, pdb_blocked: blocked, versions };
 }
 
-const poolWritable = new Set(['count', 'vmSize', 'osDiskSizeGB', 'osDiskType', 'kubeletDiskType', 'vnetSubnetID',
-  'podSubnetID', 'maxPods', 'osType', 'osSKU', 'type', 'mode', 'availabilityZones', 'enableAutoScaling', 'minCount',
-  'maxCount', 'enableNodePublicIP', 'nodePublicIPPrefixID', 'nodeLabels', 'nodeTaints', 'orchestratorVersion',
-  'upgradeSettings', 'enableEncryptionAtHost', 'enableUltraSSD', 'enableFIPS', 'kubeletConfig', 'linuxOSConfig',
-  'scaleDownMode', 'powerState', 'creationData', 'securityProfile', 'networkProfile', 'gpuInstanceProfile',
-  'capacityReservationGroupID', 'tags']);
-const poolReadonly = new Set(['provisioningState', 'currentOrchestratorVersion', 'nodeImageVersion',
-  'status', 'eTag']);
 async function restoreOne(store: CampaignStore, azure: Azure, state: CampaignState, authority: CleanupMutationAuthority,
   resourceId: string, api: string, target: CleanupArmTarget): Promise<void> {
   const operationUrl = `https://management.azure.com${resourceId}?api-version=${api}`;
@@ -189,19 +184,7 @@ async function restoreOne(store: CampaignStore, azure: Azure, state: CampaignSta
   if (text(resource.id).toLowerCase() !== resourceId.toLowerCase()) throw new Error('Restore ARM resource identity changed.');
   let method: 'PUT' | 'PATCH', payload: Record<string, unknown>;
   if (target.kind === 'aks-pool') {
-    const properties = object(resource.properties);
-    for (const key of Object.keys(properties)) if (!poolWritable.has(key) && !poolReadonly.has(key))
-      throw new Error('Unrecognized pool configuration cannot be safely preserved during rollback: ' + key);
-    const preserved = Object.fromEntries(Object.entries(properties).filter(([key]) => poolWritable.has(key)));
-    if (typeof preserved.vmSize !== 'string' || !['System', 'User'].includes(String(preserved.mode)))
-      throw new Error('Pool identity/configuration is incomplete for safe rollback.');
-    const name = resourceId.split('/').at(-1);
-    if (target.autoscale !== (preserved.mode === 'User') ||
-        (target.autoscale ? !['benchd64', 'benche64'].includes(String(name)) : name !== 'systempool'))
-      throw new Error('Restore pool mode differs from the exact selected target.');
-    if (!target.autoscale) { delete preserved.minCount; delete preserved.maxCount; }
-    payload = { properties: { ...preserved, count: target.count, enableAutoScaling: target.autoscale,
-      ...(target.autoscale ? { minCount: target.minimum, maxCount: target.maximum } : {}) } };
+    payload = buildAksPoolScalePayload(resource, target);
     method = 'PUT';
   } else {
     payload = { sku: { name: target.sku, tier: 'Standard', capacity: target.capacity },
@@ -262,6 +245,36 @@ export function createDefaultCleanupProviders(store: CampaignStore, options: Def
   };
   return {
     ...lifecycle,
+    captureTerminalState: async (inventory, key, authority) => {
+      const state = (await store.read())?.state;
+      if (!state || canonical_json(state.runInventory) !== canonical_json(inventory)) throw new Error('Terminal capture inventory changed.');
+      const unresolved = (state.scaleTrials ?? []).some(trial => !['restored', 'restore-stopped', 'reverted'].includes(trial.phase));
+      const terminalAuthority = unresolved ? withCleanupDeadline(authority, inventory.cleanup.terminal_capture.deadline_unix_ms) : authority;
+      if (unresolved) {
+        await assertCleaningActor(store, terminalAuthority);
+        const token = { ownerId: terminalAuthority.ownerId, fencingToken: terminalAuthority.fencingToken };
+        const scaleAdapter = createDefaultScaleAdapter(store, { azure, token, runCommand: options.runCommand, authority: terminalAuthority });
+        if (await restoreCampaignScaleTrials(store, scaleAdapter, token) === 'pending') return 'pending';
+      }
+      return lifecycle.captureTerminalState(inventory, key, terminalAuthority);
+    },
+    recoverLifecycle: async (field, inventory, deadlineUnixMs, key, authority) => {
+      let recoveryAuthority = authority;
+      if (field === 'terminal_capture') {
+        const state = (await store.read())?.state;
+        if (!state || canonical_json(state.runInventory) !== canonical_json(inventory)) throw new Error('Terminal recovery inventory changed.');
+        const unresolved = (state.scaleTrials ?? []).some(trial => !['restored', 'restore-stopped', 'reverted'].includes(trial.phase));
+        if (unresolved) {
+          recoveryAuthority = withCleanupDeadline(authority, deadlineUnixMs);
+          await assertCleaningActor(store, recoveryAuthority);
+          const token = { ownerId: recoveryAuthority.ownerId, fencingToken: recoveryAuthority.fencingToken };
+          const scaleAdapter = createDefaultScaleAdapter(store, { azure, token, runCommand: options.runCommand, authority: recoveryAuthority });
+          if (await restoreCampaignScaleTrials(store, scaleAdapter, token) === 'pending') return 'pending';
+        }
+      }
+      if (!lifecycle.recoverLifecycle) return 'pending';
+      return lifecycle.recoverLifecycle(field, inventory, deadlineUnixMs, key, recoveryAuthority);
+    },
     verifyCellPreservation: async (inventory, authority) => {
       await authority.assertCurrent();
       const state = (await store.read())?.state;

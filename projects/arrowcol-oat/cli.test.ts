@@ -26,7 +26,7 @@ test('missing and unknown AKS subcommands exit with usage instead of launching a
   for (const args of [['aks'], ['aks', 'unknown']]) {
     const result = spawnSync(process.execPath, ['projects/arrowcol-oat/cli.mjs', ...args], { encoding: 'utf8' });
     assert.equal(result.status, 2);
-    assert.match(result.stderr, /Usage: arrowcol-oat aks <destroy\|deploy\|setup>/);
+    assert.match(result.stderr, /Usage: arrowcol-oat aks <destroy\|deploy\|setup\|scale>/);
     assert.equal(result.stdout, '');
   }
 });
@@ -60,4 +60,15 @@ test('AKS defaults prefer generated private configuration but never override exp
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test('aks scale is reachable through the shared OAT CLI', async () => {
+  let selected = '';
+  let passed: string[] = [];
+  await main(['aks', 'scale', 'owner', '2'], undefined, async subcommand => {
+    selected = subcommand;
+    return { main: async args => { passed = args; } };
+  });
+  assert.equal(selected, 'scale');
+  assert.deepEqual(passed, ['owner', '2']);
 });

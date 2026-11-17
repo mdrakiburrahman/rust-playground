@@ -35,7 +35,11 @@ const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const name = /^[a-z][a-z0-9-]{1,62}$/;
 const transports = new Set<EffectTransport>(['azure-rest', 'azure-auth', 'campaign-blob', 'process']);
 const readMethods = new Set(['GET', 'HEAD', 'AZURE_ACCOUNT_GET-ACCESS-TOKEN', 'KUBECTL_GET', 'KUBECTL_LOGS']);
-interface BoundaryContext { boundary: EffectBoundary; forwarding: Set<string> }
+interface BoundaryContext {
+  boundary: EffectBoundary;
+  forwarding: Set<string>;
+  responseWithholding?: ResponseWithholdingSupervisor;
+}
 const active = new AsyncLocalStorage<BoundaryContext>();
 
 export class EffectBoundaryRefused extends Error {
@@ -147,6 +151,109 @@ function parseReceiptRequest(row: Record<string, unknown>): ReceiptRequest {
   return { transport: row.transport as EffectTransport, method: row.method, resource: row.resource, path: row.path,
     ...(row.body_sha256 === undefined ? {} : { body_sha256: row.body_sha256 as string }) };
 }
+export interface ResponseWithholdingTarget {
+  transport: EffectTransport;
+  method: string;
+  resource: string;
+  path: string;
+  body_sha256?: string;
+}
+
+interface WithheldResponseSummary { status?: number; returncode?: number; response_sha256: string }
+
+async function summarizeWithheldResponse(value: unknown): Promise<WithheldResponseSummary> {
+  if (value instanceof Response) {
+    const body = Buffer.from(await value.clone().arrayBuffer());
+    return { status: value.status, response_sha256: createHash('sha256').update(String(value.status)).update('\0').update(body).digest('hex') };
+  }
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    const result = value as { status?: unknown; returncode?: unknown; stdout?: unknown; stderr?: unknown };
+    if (Number.isSafeInteger(result.returncode)) {
+      const stdout = Buffer.isBuffer(result.stdout) ? result.stdout : Buffer.from(typeof result.stdout === 'string' ? result.stdout : '');
+      const stderr = Buffer.isBuffer(result.stderr) ? result.stderr : Buffer.from(typeof result.stderr === 'string' ? result.stderr : '');
+      return { returncode: result.returncode as number, response_sha256: createHash('sha256').update(String(result.returncode))
+        .update('\0').update(stdout).update('\0').update(stderr).digest('hex') };
+    }
+    if (Number.isSafeInteger(result.status)) {
+      const status = result.status as number;
+      return { status, response_sha256: createHash('sha256').update(JSON.stringify({ status })).digest('hex') };
+    }
+  }
+  throw new Error('Response-withholding supervisor cannot safely summarize this provider response.');
+}
+
+function supportedWithholdingTarget(target: ReceiptRequest): boolean {
+  if (target.transport === 'campaign-blob' && target.method === 'PUT' && /\/baseline\.json(?:\?|$)/.test(target.path)) return true;
+  if (target.transport !== 'process' || target.method !== 'KUBECTL_PATCH') return false;
+  try {
+    const argv: unknown = JSON.parse(target.path);
+    if (!Array.isArray(argv) || argv.some(value => typeof value !== 'string')) return false;
+    const serialized = JSON.stringify(argv);
+    return argv.includes('patch') && argv.includes('--type=json') && serialized.includes('\"uid\"') &&
+      serialized.includes('\"resourceVersion\"') && serialized.includes('/spec/replicas');
+  } catch { return false; }
+}
+
+export class ResponseWithholdingSupervisor {
+  private triggered = false;
+  private readonly target: ReceiptRequest;
+  private readonly evidencePath: string;
+
+  constructor(readonly campaignId: string, readonly runId: string, target: ResponseWithholdingTarget, evidencePath: string) {
+    if (!uuid.test(campaignId) || !uuid.test(runId)) throw new Error('Response-withholding campaign/run identity is invalid.');
+    this.target = parseReceiptRequest({ transport: target.transport, method: target.method, resource: target.resource,
+      path: target.path, ...(target.body_sha256 === undefined ? {} : { body_sha256: target.body_sha256 }) });
+    if (!supportedWithholdingTarget(this.target))
+      throw new Error('Response withholding is limited to the exact campaign baseline PUT or UID/RV-tested replica PATCH.');
+    this.evidencePath = path.resolve(evidencePath);
+    const parent = fs.lstatSync(path.dirname(this.evidencePath));
+    if (!parent.isDirectory() || parent.isSymbolicLink() || (parent.mode & 0o077) !== 0)
+      throw new Error('Response-withholding evidence directory must be private and non-symlink.');
+    if (fs.existsSync(this.evidencePath)) throw new Error('Response-withholding evidence already exists; fault is single-use.');
+  }
+
+  get wasTriggered(): boolean { return this.triggered; }
+  get transport(): EffectTransport { return this.target.transport; }
+
+  assertConsumed(): void {
+    if (!this.triggered) throw new Error('Response-withholding target was not forwarded; fault rehearsal is incomplete.');
+  }
+
+  matches(request: ExternalEffect): boolean {
+    return request.transport === this.target.transport && request.method.toUpperCase() === this.target.method &&
+      request.resource === this.target.resource && request.path === this.target.path &&
+      (this.target.body_sha256 === undefined || hash(request.body) === this.target.body_sha256);
+  }
+
+  async forward<T>(request: ExternalEffect, forward: () => Promise<T>): Promise<T> {
+    const result = await forward();
+    if (!this.matches(request)) return result;
+    const response = await summarizeWithheldResponse(result);
+    const bodyHash = hash(request.body);
+    const evidence = { schema_version: 1, campaign_id: this.campaignId, run_id: this.runId,
+      observed_at: new Date().toISOString(), event: 'provider_response_withheld',
+      transport: request.transport, method: request.method.toUpperCase(), resource: request.resource,
+      path: request.path, ...(bodyHash ? { body_sha256: bodyHash } : {}), ...response };
+    const data = Buffer.from(JSON.stringify(evidence) + '\n');
+    const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW ?? 0);
+    const fd = fs.openSync(this.evidencePath, flags, 0o600);
+    try {
+      let offset = 0;
+      while (offset < data.length) {
+        const written = fs.writeSync(fd, data, offset, data.length - offset);
+        if (!Number.isSafeInteger(written) || written <= 0 || written > data.length - offset)
+          throw new Error('Response-withholding evidence write returned an invalid byte count.');
+        offset += written;
+      }
+      fs.fsyncSync(fd);
+    } finally { fs.closeSync(fd); }
+    const directory = fs.openSync(path.dirname(this.evidencePath), fs.constants.O_RDONLY);
+    try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
+    this.triggered = true;
+    throw new Error('Provider response was durably captured and withheld; evidence is at ' + this.evidencePath + '.');
+  }
+}
+
 function receiptMatchesRule(request: ReceiptRequest, rule: EffectRule): boolean {
   return request.transport === rule.transport && request.method === rule.method && request.resource === rule.resource &&
     request.path === rule.path && (rule.body_sha256 === undefined || request.body_sha256 === rule.body_sha256);
@@ -366,9 +473,11 @@ export function dispatchExternalEffect<T>(request: ExternalEffect, forward: () =
   const signature = [request.transport, request.method.toUpperCase(), request.resource, request.path, hash(request.body) ?? ''].join('\0');
   if (context.forwarding.has(signature)) return forward();
   return context.boundary.dispatch(request, () => active.run({ boundary: context.boundary,
-    forwarding: new Set([...context.forwarding, signature]) }, forward));
+    forwarding: new Set([...context.forwarding, signature]), responseWithholding: context.responseWithholding },
+    () => context.responseWithholding ? context.responseWithholding.forward(request, forward) : forward()));
 }
 
-export function withEffectBoundary<T>(boundary: EffectBoundary, work: () => Promise<T>): Promise<T> {
-  return active.run({ boundary, forwarding: new Set() }, work);
+export function withEffectBoundary<T>(boundary: EffectBoundary, work: () => Promise<T>,
+  responseWithholding?: ResponseWithholdingSupervisor): Promise<T> {
+  return active.run({ boundary, forwarding: new Set(), responseWithholding }, work);
 }
