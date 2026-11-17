@@ -1018,6 +1018,8 @@ dependencies = [
  "arrow 58.4.0",
  "arrow-flight",
  "arrowcol-buffer",
+ "arrowcol-catalog",
+ "arrowcol-flight",
  "arrowcol-protocol",
  "arrowcol-routing",
  "arrowcol-sql-server",
