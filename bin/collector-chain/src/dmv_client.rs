@@ -2074,7 +2074,7 @@ fn estimated_identity_row_bytes(table: &DmvTable, client_id: &str, options: &Opt
         endpoint.data_type() == &DataType::Utf8,
         "logical identity endpoint_url column must be a nonnullable string"
     );
-    let previous_width = match endpoint.name() {
+    let previous_width = match endpoint.name().as_str() {
         "customer_id" => client_id.len(),
         name => realistic_category_max_width(name).unwrap_or_else(|| {
             if options.string_width == 0 {
