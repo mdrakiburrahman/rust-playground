@@ -1,0 +1,21 @@
+# Local-only Linux x86_64 build context: one statically linked oat-signal-fixture.
+# From the repository: cargo rustc --locked -p arrowcol-oat-rust --features signal-fixture
+# --bin oat-signal-fixture -- -C target-feature=+crt-static
+# Verify no ELF interpreter; copy that binary into a private context, then:
+# docker build --network=none -f projects/arrowcol-oat-rust/Dockerfile.signal-fixture
+# --build-arg SOURCE_REVISION=<actual-commit> --build-arg BINARY_SHA256=<actual-hash>
+# -t oat-signal-fixture:local <private-context>
+# Record the compiler, source/binary hash, architecture and local image ID, not a registry digest.
+# Test: OAT_SIGNAL_FIXTURE_IMAGE=sha256:<local-image-id> npx --no-install tsx --test
+# projects/arrowcol-oat-rust/tests/fixtures/signal-fixture-image.ts
+# No manifest fault profile, published image or terminating-pod release is qualified here.
+FROM scratch
+ARG SOURCE_REVISION
+ARG BINARY_SHA256
+LABEL org.opencontainers.image.revision=$SOURCE_REVISION
+LABEL io.arrowcol.fixture.binary-sha256=$BINARY_SHA256
+COPY --chmod=0555 oat-signal-fixture /oat-signal-fixture
+USER 10001:10001
+STOPSIGNAL SIGTERM
+ENTRYPOINT ["/oat-signal-fixture"]
+CMD ["wait"]
