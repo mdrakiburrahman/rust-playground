@@ -607,14 +607,21 @@ export class FixtureCommandDispatcher {
         receipt.inventory.cell_run_id !== this.options.input.authority.cell_run_id || receipt.inventory.owner_id !== this.options.input.authority.owner_id ||
         receipt.inventory.fencing_token !== this.options.input.authority.fencing_token || receipt.inventory.load_admission !== 'not_authorized' ||
         receipt.inventory.planned_cell_duration_ms !== 0 || receipt.inventory.namespace.name !== this.options.input.authority.namespace ||
-        !receipt.inventory.namespace.uid || receipt.inventory.resources.length !== 3 || receipt.command_responses.length !== this.responses.size ||
+        !receipt.inventory.namespace.uid || receipt.inventory.resources.length !== 4 || receipt.command_responses.length !== this.responses.size ||
         !equal(receipt.command_responses, [...this.responses.values()].sort((a, b) => a.request_id - b.request_id)))
       throw new Error('Fixture final receipt does not bind actual created responses and the zero-row authority.');
-    const publisher = [...this.seen.values()].find(request => request.argv[3] === 'publish-inventory');
-    if (!publisher || !equal(JSON.parse(publisher.stdin!) as unknown, receipt.inventory)) throw new Error('Fixture inventory lacks its exact publish-inventory request.');
-    const publishResponse = this.responses.get(publisher.request_id);
-    if (!publishResponse || publishResponse.exit_code !== 0) throw new Error('Fixture inventory publication did not return success.');
-    publishReceipt(publishResponse.stdout, receipt.inventory);
+    const publishers = [...this.seen.values()].filter(request => request.argv[3] === 'publish-inventory')
+      .sort((left, right) => left.request_id - right.request_id);
+    if (publishers.length !== 4) throw new Error('Fixture inventory is missing an expected response-derived publication phase.');
+    for (const publisher of publishers) {
+      const inventory = JSON.parse(publisher.stdin!) as RunInventory;
+      const publishResponse = this.responses.get(publisher.request_id);
+      if (!publishResponse || publishResponse.exit_code !== 0) throw new Error('Fixture inventory publication did not return success.');
+      publishReceipt(publishResponse.stdout, inventory);
+    }
+    const finalPublisher = publishers[publishers.length - 1]!;
+    if (!equal(JSON.parse(finalPublisher.stdin!) as unknown, receipt.inventory))
+      throw new Error('Fixture final inventory differs from the last successful publication.');
     const created: Obj[] = [];
     for (const request of this.seen.values()) if (request.executable.endsWith('kubectl') && request.argv.includes('create')) {
       const response = this.responses.get(request.request_id); if (!response || response.exit_code !== 0) throw new Error('Fixture create response is incomplete.');
@@ -634,6 +641,40 @@ export class FixtureCommandDispatcher {
         throw new Error('Fixture resource identity is not derived from a unique actual create response.');
       seenUids.add(resource.uid);
     }
+    const resourceReadback = [...this.seen.values()].find(request => request.executable.endsWith('kubectl') &&
+      request.argv.includes('get') && request.argv.includes('-f') && !request.argv.includes('--ignore-not-found'));
+    const resourceReadbackResponse = resourceReadback && this.responses.get(resourceReadback.request_id);
+    if (!resourceReadback || !resourceReadbackResponse || resourceReadbackResponse.exit_code !== 0)
+      throw new Error('Fixture resource readback did not return success.');
+    const readbackValues = parseJsonValues(resourceReadbackResponse.stdout);
+    if (readbackValues.length !== 1 || !object(readbackValues[0]) || !Array.isArray(readbackValues[0].items) ||
+        readbackValues[0].items.length !== receipt.inventory.resources.length)
+      throw new Error('Fixture resource readback is incomplete or malformed.');
+    for (const resource of receipt.inventory.resources) {
+      const actual = (readbackValues[0].items as unknown[]).find(item => object(item) && object(item.metadata) &&
+        item.kind === resource.kind && item.metadata.name === resource.name && item.metadata.namespace === resource.namespace);
+      if (!object(actual) || !object(actual.metadata) || actual.metadata.uid !== resource.uid ||
+          typeof actual.metadata.resourceVersion !== 'string' || !actual.metadata.resourceVersion ||
+          !['labels', 'annotations'].every(field => object(actual.metadata[field]) &&
+            actual.metadata[field]['arrowcol-oat/run-id'] === this.options.input.authority.cell_run_id &&
+            actual.metadata[field]['arrowcol-oat/owner-token'] === this.options.input.authority.owner_id))
+        throw new Error('Fixture resource readback differs from the exact published inventory identity.');
+    }
+    const namespaceReadback = [...this.seen.values()].find(request => request.executable.endsWith('kubectl') &&
+      request.argv.includes('namespace') && request.argv.includes('--ignore-not-found') &&
+      request.request_id > resourceReadback.request_id);
+    const namespaceReadbackResponse = namespaceReadback && this.responses.get(namespaceReadback.request_id);
+    if (!namespaceReadbackResponse || namespaceReadbackResponse.exit_code !== 0)
+      throw new Error('Fixture namespace readback did not return success.');
+    const namespaceValues = parseJsonValues(namespaceReadbackResponse.stdout);
+    const observedNamespace = namespaceValues.length === 1 ? namespaceValues[0] : undefined;
+    if (!object(observedNamespace) || !object(observedNamespace.metadata) ||
+        observedNamespace.metadata.uid !== receipt.inventory.namespace.uid ||
+        typeof observedNamespace.metadata.resourceVersion !== 'string' || !observedNamespace.metadata.resourceVersion ||
+        !['labels', 'annotations'].every(field => object(observedNamespace.metadata[field]) &&
+          observedNamespace.metadata[field]['arrowcol-oat/run-id'] === this.options.input.authority.cell_run_id &&
+          observedNamespace.metadata[field]['arrowcol-oat/owner-token'] === this.options.input.authority.owner_id))
+      throw new Error('Fixture namespace readback differs from its original create identity.');
     assertBridgeLive(this.envelope, this.options.input.original_deadline_unix_ms, this.now);
     const stored = await this.campaignStore.read();
     if (!stored || !equal(stored.state.runInventory, receipt.inventory)) throw new Error('Fixture final inventory differs from the durable campaign store.');
