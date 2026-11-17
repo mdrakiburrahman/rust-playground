@@ -21,6 +21,15 @@
 | Catalog | 500m CPU / 1Gi | 2 CPU / 4Gi |
 
 `platform.resources` may override any role with CPU/memory requests and limits. Only `scale_out_single_table` may omit or set `collector.limits.cpu: null` for an uncapped collector; a finite CPU limit is strictly parsed and preserved. Other resource fields remain required, and unknown fields, malformed quantities, and requests above finite limits fail before setup. This profile requires the exact hot table, memory-only buffering, matching 1..16 collector/router replicas, hostname anti-affinity, and enabled same-table maintenance with all five operations. AKS applies the settings to rendered workloads and client Jobs, then verifies live resource specs and node names. Per-cell evidence records requested/effective values, configured concurrency, CPU limits, and oversubscription ratios. OAT measures per-container CFS throttled-period deltas from kubelet cAdvisor; unavailable counters remain explicitly unavailable.
+### D53 capacity reference
+
+| Resource | Published target | Interpretation |
+| --- | --- | --- |
+| `Standard_D64ds_v6` / `Standard_E64ds_v6` | 30,000 Mbps aggregate network bandwidth per VM | Four nodes imply 120 Gbps of nominal VM bandwidth per pool; this is not a workload guarantee. Azure measures the VM allocation on outbound traffic. |
+| Standard GPv2 storage in Canada Central | 40,000 requests/s, 60 Gbps ingress, 200 Gbps egress | The campaign account is StorageV2, `Standard_LRS`, with HNS enabled. These are account targets, not a guarantee; increase limits only if measured throttling or saturation identifies storage as the bottleneck. |
+
+Sources: [Ddsv6 sizes](https://learn.microsoft.com/azure/virtual-machines/sizes/general-purpose/ddsv6-series), [Edsv6 sizes](https://learn.microsoft.com/azure/virtual-machines/sizes/memory-optimized/edsv6-series), [VM network bandwidth](https://learn.microsoft.com/azure/virtual-network/virtual-machine-network-throughput), and [standard storage scalability targets](https://learn.microsoft.com/azure/storage/common/scalability-targets-standard-account).
+
 
 ## Router timeout compatibility
 
