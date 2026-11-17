@@ -22,6 +22,11 @@ struct Args {
     allow_insecure_non_loopback: bool,
     #[arg(long)]
     validate_config: Option<PathBuf>,
+    /// Fixture-only zero-row Kubernetes setup. Requires the per-command NDJSON bridge.
+    #[arg(long, conflicts_with = "validate_config")]
+    fixture_setup: Option<PathBuf>,
+    #[arg(long, requires = "fixture_setup")]
+    fixture_bridge_stdio: bool,
 }
 
 #[derive(Serialize)]
@@ -37,9 +42,18 @@ struct ApiError {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     let args = Args::parse();
+    if let Some(path) = args.fixture_setup {
+        let result = arrowcol_oat_rust::runner::run_fixture_setup(&path, args.fixture_bridge_stdio).await;
+        if let Err(error) = &result {
+            eprintln!("{error:#}");
+        }
+        // Tokio's stdin reader may still block after a bridge timeout; this dedicated CLI owns no background work.
+        std::process::exit(if result.is_ok() { 0 } else { 1 });
+    }
     if let Some(path) = args.validate_config {
         let source = fs::read_to_string(&path)
             .await
