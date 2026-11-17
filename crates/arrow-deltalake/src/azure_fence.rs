@@ -413,19 +413,17 @@ impl AzureControlContainer {
             Exchange::Ambiguous(detail) => CasOutcome::Unknown(detail),
         }
     }
-}
 
-#[async_trait]
-impl ControlMetadata for AzureControlContainer {
-    async fn read(&self) -> Result<MetadataSnapshot> {
-        self.read_metadata().await
-    }
-
-    async fn compare_and_set(&self, expected: &MetadataSnapshot, metadata: &BTreeMap<String, String>) -> CasOutcome {
+    async fn compare_and_set_inner(
+        &self,
+        expected: &MetadataSnapshot,
+        metadata: &BTreeMap<String, String>,
+        lease_id: uuid::Uuid,
+    ) -> CasOutcome {
         if let Err(detail) = valid_metadata(metadata) {
             return CasOutcome::Rejected(detail);
         }
-        let lease_id = uuid::Uuid::new_v4().hyphenated().to_string();
+        let lease_id = lease_id.hyphenated().to_string();
         match self.lease("acquire", &lease_id).await {
             Exchange::Response(response) if response.status() == StatusCode::CREATED => {}
             Exchange::Response(response) if response.status() == StatusCode::CONFLICT => return CasOutcome::Conflict,
@@ -433,8 +431,7 @@ impl ControlMetadata for AzureControlContainer {
                 return CasOutcome::Rejected(format!("lease acquire status {}", response.status()));
             }
             Exchange::NotSent(detail) => return CasOutcome::Rejected(detail),
-            // No metadata write was attempted; a lease we may hold is released
-            // here or expires within the lease duration.
+            // No metadata write was attempted; a lease we may hold is released here or expires.
             Exchange::Response(_) | Exchange::Ambiguous(_) => {
                 let _ = self.lease("release", &lease_id).await;
                 return CasOutcome::Conflict;
@@ -457,6 +454,26 @@ impl ControlMetadata for AzureControlContainer {
             }
         }
         outcome
+    }
+}
+
+#[async_trait]
+impl ControlMetadata for AzureControlContainer {
+    async fn read(&self) -> Result<MetadataSnapshot> {
+        self.read_metadata().await
+    }
+
+    async fn compare_and_set(&self, expected: &MetadataSnapshot, metadata: &BTreeMap<String, String>) -> CasOutcome {
+        self.compare_and_set_inner(expected, metadata, uuid::Uuid::new_v4()).await
+    }
+
+    async fn compare_and_set_with_lease_id(
+        &self,
+        expected: &MetadataSnapshot,
+        metadata: &BTreeMap<String, String>,
+        lease_id: uuid::Uuid,
+    ) -> CasOutcome {
+        self.compare_and_set_inner(expected, metadata, lease_id).await
     }
 }
 

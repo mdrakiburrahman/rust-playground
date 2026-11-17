@@ -32,6 +32,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
@@ -328,6 +329,16 @@ pub trait ControlMetadata: Send + Sync + fmt::Debug {
 
     /// Replace all metadata only if the content still equals `expected`.
     async fn compare_and_set(&self, expected: &MetadataSnapshot, metadata: &BTreeMap<String, String>) -> CasOutcome;
+
+    /// Planned bridge transactions use one immutable lease ID and never retry a CAS conflict.
+    async fn compare_and_set_with_lease_id(
+        &self,
+        _expected: &MetadataSnapshot,
+        _metadata: &BTreeMap<String, String>,
+        _lease_id: Uuid,
+    ) -> CasOutcome {
+        CasOutcome::Rejected("control metadata backend does not support planned lease identities".into())
+    }
 }
 
 /// A metadata transition was sent without a definite outcome. The member, if
@@ -388,6 +399,7 @@ async fn transition<F>(
     sandbox_id: &str,
     publisher: Uuid,
     operation: &'static str,
+    planned_lease_id: Option<Uuid>,
     mut decide: F,
 ) -> Result<()>
 where
@@ -400,7 +412,11 @@ where
             return Ok(());
         };
         let metadata = next.apply(&snapshot.metadata)?;
-        match control.compare_and_set(&snapshot, &metadata).await {
+        let outcome = match planned_lease_id {
+            Some(lease_id) => control.compare_and_set_with_lease_id(&snapshot, &metadata, lease_id).await,
+            None => control.compare_and_set(&snapshot, &metadata).await,
+        };
+        match outcome {
             CasOutcome::Applied => return Ok(()),
             CasOutcome::AppliedButUnsettled(detail) => {
                 return Err(UnsettledTransition {
@@ -409,6 +425,9 @@ where
                     detail,
                 }
                 .into());
+            }
+            CasOutcome::Conflict if planned_lease_id.is_some() => {
+                bail!("publisher {operation} conflict; planned control identities prohibit retry")
             }
             CasOutcome::Conflict => backoff(attempt).await,
             CasOutcome::Rejected(detail) => bail!("publisher {operation} rejected: {detail}"),
@@ -624,11 +643,20 @@ fn causes<'a>(error: &'a object_store::Error) -> impl Iterator<Item = &'a (dyn s
         cause.source()
     })
 }
+#[derive(Clone, Copy)]
+struct PlannedPublisherIdentities {
+    publisher_id: Uuid,
+    registration_lease_id: Uuid,
+    terminal_lease_id: Uuid,
+}
+
 struct Registration {
     control: Arc<dyn ControlMetadata>,
     sandbox_id: String,
     publisher: Uuid,
     generation: String,
+    planned_terminal_lease_id: Option<Uuid>,
+    planned_terminal_used: AtomicBool,
 }
 
 enum SessionTransport {
@@ -835,6 +863,7 @@ impl PublisherSession {
                 SessionTransport::Injected,
                 SessionMode::Publisher,
                 Some(&expected),
+                None,
             )
             .await
         })
@@ -967,6 +996,33 @@ impl PublisherSession {
     /// # Errors
     /// Rejects mismatched roots, invalid authority, non-ready generations and uncertain exchanges.
     pub async fn open_bridged_async(url: &Url, bridge: Arc<crate::qap_http::StorageBridge>) -> Result<Arc<Self>> {
+        Self::open_bridged(url, bridge, None).await
+    }
+
+    /// Register using identities fixed in the owned-run plan before its effect envelope is built.
+    pub async fn open_bridged_with_plan_async(
+        url: &Url,
+        bridge: Arc<crate::qap_http::StorageBridge>,
+        publisher_id: Uuid,
+        control_lease_ids: [Uuid; 2],
+    ) -> Result<Arc<Self>> {
+        Self::open_bridged(
+            url,
+            bridge,
+            Some(PlannedPublisherIdentities {
+                publisher_id,
+                registration_lease_id: control_lease_ids[0],
+                terminal_lease_id: control_lease_ids[1],
+            }),
+        )
+        .await
+    }
+
+    async fn open_bridged(
+        url: &Url,
+        bridge: Arc<crate::qap_http::StorageBridge>,
+        planned: Option<PlannedPublisherIdentities>,
+    ) -> Result<Arc<Self>> {
         bridge.validate_root(url)?;
         let authority = bridge.authority().clone();
         let control = Arc::new(AzureControlContainer::bridged(Arc::clone(&bridge)));
@@ -977,6 +1033,7 @@ impl PublisherSession {
             SessionTransport::Bridge(bridge),
             SessionMode::Publisher,
             Some(&authority.reset_generation),
+            planned,
         )
         .await
     }
@@ -1056,6 +1113,7 @@ impl PublisherSession {
             SessionTransport::Direct(credentials),
             mode,
             Some(expected_generation),
+            None,
         )
         .await
     }
@@ -1097,6 +1155,7 @@ impl PublisherSession {
             SessionTransport::Injected,
             mode,
             expected_generation,
+            None,
         )
         .await
     }
@@ -1108,15 +1167,22 @@ impl PublisherSession {
         transport: SessionTransport,
         mode: SessionMode,
         expected_generation: Option<&str>,
+        planned: Option<PlannedPublisherIdentities>,
     ) -> Result<Arc<Self>> {
         if let Some(expected) = expected_generation {
             canonical_uuid(expected).context("invalid expected reset generation")?;
         } else if mode == SessionMode::Bootstrap {
             bail!("bootstrap requires the operator's captured expected reset generation");
         }
-        let publisher = Uuid::new_v4();
+        let publisher = planned.map_or_else(Uuid::new_v4, |identities| identities.publisher_id);
         let mut generation = String::new();
-        transition(control.as_ref(), &sandbox_id, publisher, "registration", |registry| {
+        transition(
+            control.as_ref(),
+            &sandbox_id,
+            publisher,
+            "registration",
+            planned.map(|identities| identities.registration_lease_id),
+            |registry| {
             if let Some(expected) = expected_generation
                 && registry.generation != expected
             {
@@ -1153,7 +1219,8 @@ impl PublisherSession {
             next.publishers.insert(publisher, MemberState::Active);
             generation.clone_from(&registry.generation);
             Ok(Some(next))
-        })
+        },
+        )
         .await?;
         Ok(Arc::new(Self {
             shared: Shared::new(),
@@ -1165,10 +1232,22 @@ impl PublisherSession {
                 sandbox_id,
                 publisher,
                 generation,
+                planned_terminal_lease_id: planned.map(|identities| identities.terminal_lease_id),
+                planned_terminal_used: AtomicBool::new(false),
             }),
             close: tokio::sync::Mutex::new(()),
         }))
     }
+    pub fn verify_planned_control_identities(&self) -> Result<()> {
+        if let Some(registration) = &self.registration
+            && registration.planned_terminal_lease_id.is_some()
+            && !registration.planned_terminal_used.load(Ordering::Acquire)
+        {
+            bail!("owned-run publisher did not consume both planned control lease identities");
+        }
+        Ok(())
+    }
+
     #[must_use]
     pub fn publisher_id(&self) -> Option<Uuid> {
         self.registration.as_ref().map(|registration| registration.publisher)
@@ -1397,6 +1476,7 @@ impl PublisherSession {
                 &registration.sandbox_id,
                 registration.publisher,
                 "uncertain marking",
+                registration.planned_terminal_lease_id,
                 |registry| {
                     if registry.generation != registration.generation {
                         bail!("authority generation changed");
@@ -1413,6 +1493,9 @@ impl PublisherSession {
                 },
             )
             .await;
+            if marked.is_ok() && registration.planned_terminal_lease_id.is_some() {
+                registration.planned_terminal_used.store(true, Ordering::Release);
+            }
             let note = marked
                 .err()
                 .map(|error| format!("; marking failed: {error:#}"))
@@ -1425,6 +1508,7 @@ impl PublisherSession {
             &registration.sandbox_id,
             registration.publisher,
             "clean release",
+            registration.planned_terminal_lease_id,
             |registry| {
                 if registry.generation != registration.generation {
                     stale = true;
@@ -1451,6 +1535,9 @@ impl PublisherSession {
         match released {
             Ok(()) => {
                 lifecycle.phase = Phase::Closed;
+                if registration.planned_terminal_lease_id.is_some() {
+                    registration.planned_terminal_used.store(true, Ordering::Release);
+                }
                 Ok(())
             }
             Err(error) => {

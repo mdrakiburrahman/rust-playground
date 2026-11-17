@@ -40,6 +40,10 @@ pub struct OwnedRunTablePlan {
     pub run_id: String,
     /// Captured normal-publisher reset generation.
     pub generation: String,
+    /// Publisher identity included in the static effect envelope.
+    pub publisher_id: String,
+    /// Ordered registration and terminal control-container lease identities.
+    pub control_lease_ids: Vec<String>,
     /// Frozen canonical identity; no arbitrary schema or table selection.
     pub table: String,
     /// Must select the existing ingestion partition.
@@ -58,6 +62,17 @@ impl OwnedRunTablePlan {
     pub fn validate(&self) -> Result<()> {
         for value in [&self.campaign_id, &self.run_id, &self.generation, &self.owner_id] {
             canonical_uuid(value)?;
+        }
+        canonical_uuid_v4(&self.publisher_id)?;
+        if self.control_lease_ids.len() != 2 {
+            bail!("owned-run initialization requires exactly two ordered control lease identities");
+        }
+        let mut identities = BTreeSet::from([self.publisher_id.clone()]);
+        for identity in &self.control_lease_ids {
+            canonical_uuid_v4(identity)?;
+            if !identities.insert(identity.clone()) {
+                bail!("owned-run publisher and control lease identities must be distinct");
+            }
         }
         if self.fencing_token == 0
             || !self.partition_by_ingestion_date
@@ -93,6 +108,15 @@ impl OwnedRunTablePlan {
         let root = checked_root(&self.run_root, &self.account, &self.container)?;
         Ok((root.join(&entry.relative_path)?, schema))
     }
+}
+
+fn canonical_uuid_v4(value: &str) -> Result<()> {
+    let parsed = canonical_uuid(value)?;
+    let bytes = parsed.as_bytes();
+    if bytes[6] >> 4 != 4 || bytes[8] >> 6 != 2 {
+        bail!("planned publisher and control lease identities must be UUID v4");
+    }
+    Ok(())
 }
 
 /// Successful setup readback; emitted only after the actual publisher cleanly drains.
@@ -301,7 +325,9 @@ where
         bail!("storage bridge authority differs from the original owned-run table allocation");
     }
     let bridge = StorageBridge::new(input.authority.clone(), input.original_deadline_unix_ms, reader, writer)?;
-    let session = PublisherSession::open_bridged_async(&url, bridge).await?;
+    let publisher_id = canonical_uuid(&plan.publisher_id)?;
+    let control_lease_ids = [canonical_uuid(&plan.control_lease_ids[0])?, canonical_uuid(&plan.control_lease_ids[1])?];
+    let session = PublisherSession::open_bridged_with_plan_async(&url, bridge, publisher_id, control_lease_ids).await?;
     let data = session.store_for_url(&url).map(|store| FreshTableTransport {
         store,
         mutation_retries: MutationRetries::Disabled,
@@ -381,6 +407,7 @@ async fn create_owned_run_table(
         (Ok(Ok(delta)), Ok(())) => delta,
         (creation, drain) => bail!("owned-run setup did not complete: creation={creation:?}; drain={drain:?}"),
     };
+    session.verify_planned_control_identities()?;
     Ok(OwnedRunTableReceipt {
         allocation: plan,
         delta,
