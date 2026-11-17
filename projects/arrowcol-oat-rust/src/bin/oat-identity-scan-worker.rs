@@ -17,12 +17,12 @@ mod linux {
     }
 
     impl Limits {
-        pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Self> {
+        pub fn parse(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<Self> {
             let mut args = args.into_iter();
             let mut next = || -> Result<String> {
                 let value = args.next().context("missing worker limit")?;
-                ensure!(value.len() <= 20, "worker limit is too long");
-                Ok(value)
+                ensure!(value.as_encoded_bytes().len() <= 20, "worker limit is too long");
+                value.into_string().map_err(|_| anyhow::anyhow!("worker limit must be UTF-8"))
             };
             let limits = Self {
                 parent: next()?.parse().context("invalid expected parent")?,
@@ -68,7 +68,7 @@ mod linux {
     }
 
     pub fn run() -> Result<()> {
-        let limits = Limits::parse(std::env::args().skip(1))?;
+        let limits = Limits::parse(std::env::args_os().skip(1))?;
         limits.install()?;
         arrow_deltalake::initialize_identity_worker_runtime()?;
         bail!("identity decoding is disabled until the worker protocol and supervisor are complete")
@@ -89,10 +89,13 @@ mod linux {
                 ["2", "1024", "1", "2"],
                 ["2", "bad", "1", "3"],
             ] {
-                assert!(Limits::parse(values.map(str::to_owned)).is_err());
+                assert!(Limits::parse(values.map(std::ffi::OsString::from)).is_err());
             }
-            assert!(Limits::parse(["2", "999999999999999999999", "1", "3"].map(str::to_owned)).is_err());
-            assert!(Limits::parse(["2", "1024", "1", "3", "extra"].map(str::to_owned)).is_err());
+            assert!(Limits::parse(["2", "999999999999999999999", "1", "3"].map(std::ffi::OsString::from)).is_err());
+            assert!(Limits::parse(["2", "1024", "1", "3", "extra"].map(std::ffi::OsString::from)).is_err());
+            use std::os::unix::ffi::OsStringExt;
+            let invalid = std::ffi::OsString::from_vec(vec![0xff]);
+            assert!(Limits::parse([invalid, "1024".into(), "1".into(), "3".into()]).is_err());
         }
 
         #[test]
@@ -120,7 +123,7 @@ mod linux {
                     (1024_u64 * 1024 * 1024).to_string(),
                     "30".to_owned(),
                     "64".to_owned(),
-                ])?;
+                ].map(std::ffi::OsString::from))?;
                 limits.install()?;
                 if mode == "prior-error" {
                     assert!(arrow_deltalake::runtime_config().is_err());
