@@ -61,6 +61,9 @@ fn validate_official_measurement_reference(inventory: &RunInventory) -> Result<(
 fn official_measurement_bytes(
     inventory: &RunInventory, config: &OatConfig, rows: &[OatResult], submitted: Option<&SubmittedConfigIdentity>,
 ) -> Result<Vec<u8>> {
+    if config.campaign_profile == Some(crate::config::CampaignProfile::ScaleOutSingleTable) {
+        bail!("exploratory scale-out evidence is not custody-qualified");
+    }
     let [row] = rows else { bail!("official campaign measurement requires exactly one original hot-table result") };
     let tunables: Value = serde_json::from_str(&row.tunables_json)?;
     if row.run_id != inventory.cell_run_id
@@ -155,7 +158,8 @@ async fn publish_campaign_official_measurement(
     submitted: Option<&SubmittedConfigIdentity>,
     deadline: tokio::time::Instant,
 ) -> Result<()> {
-    if config.campaign_profile.is_none() {
+    if config.campaign_profile.is_none()
+        || config.campaign_profile == Some(crate::config::CampaignProfile::ScaleOutSingleTable) {
         return Ok(());
     }
     require_lifecycle_remaining(
@@ -322,6 +326,9 @@ mod official_cell_measurement_tests {
         config.schedule_lead_seconds += 1;
         let changed: Value = serde_json::from_slice(&official_measurement_bytes(&inventory, &config, &rows, None)?)?;
         assert_ne!(payload["effective_config_sha256"], changed["effective_config_sha256"]);
+        config.campaign_profile = Some(crate::config::CampaignProfile::ScaleOutSingleTable);
+        assert!(official_measurement_bytes(&inventory, &config, &rows, None).is_err());
+        config.campaign_profile = Some(crate::config::CampaignProfile::SingleHotTable);
         let mut wrong = inventory;
         wrong.cell_run_id = "c0ffee00-0000-4000-8000-000000000099".to_owned();
         assert!(official_measurement_bytes(&wrong, &config, &rows, None).is_err());
@@ -1272,17 +1279,40 @@ impl ResourceSampler {
                     } else {
                         timeout_ms
                     };
+                    let expected_identity = guard.as_ref()
+                        .and_then(|(probe, _)| probe.expected_scale_out_identity.clone());
                     let guard_reading = async {
                         match (&mut guard, &backlog_scraper) {
                             (Some((probe, _)), Some(scraper)) => probe.read(&config, scraper).await.map(Some),
                             _ => Ok(None),
                         }
                     };
-                    let (resource_result, backlog_result, guard_result) = tokio::join!(
+                    let deadline = request_anchor + Duration::from_millis(other_timeout_ms);
+                    let (resource_result, (guard_result, backlog_result)) = tokio::join!(
                         tokio::time::timeout(Duration::from_millis(other_timeout_ms), sample),
-                        bounded_publication_backlog_scrape(backlog_scraper.as_ref(),
-                            request_anchor + Duration::from_millis(timeout_ms)),
-                        tokio::time::timeout(Duration::from_millis(other_timeout_ms), guard_reading),
+                        guarded_composite_observation(
+                            async {
+                                tokio::time::timeout(Duration::from_millis(other_timeout_ms), guard_reading)
+                                    .await.context("live cap or ingestion commit readback deadline exceeded")?
+                            },
+                            bounded_publication_backlog_scrape(backlog_scraper.as_ref(),
+                                request_anchor + Duration::from_millis(timeout_ms)),
+                            async {
+                                if expected_identity.is_some() {
+                                    if tokio::time::Instant::now() >= deadline {
+                                        bail!("collector identity fence deadline exceeded");
+                                    }
+                                    tokio::time::timeout_at(
+                                        deadline,
+                                        verify_guard_identity(&config, expected_identity.as_deref()),
+                                    ).await.context("collector identity fence deadline exceeded")??;
+                                    if tokio::time::Instant::now() >= deadline {
+                                        bail!("collector identity fence deadline exceeded");
+                                    }
+                                }
+                                Ok(())
+                            },
+                        ),
                     );
                     match resource_result {
                         Ok(Ok(Some(metrics))) => {
@@ -1329,8 +1359,9 @@ impl ResourceSampler {
                     };
                     if let Some((_, engine)) = &mut guard {
                         let observation = match guard_result {
-                            Ok(Ok(Some(reading))) => Ok(reading),
-                            _ => Err(anyhow::anyhow!("live cap or ingestion commit readback unavailable")),
+                            Ok(Some(reading)) => Ok(reading),
+                            Ok(None) => Err(anyhow::anyhow!("live cap or ingestion commit readback unavailable")),
+                            Err(error) => Err(error),
                         };
                         engine.record(observation, &backlog_sample);
                         if let Some(reason) = engine.failure() {
@@ -2068,7 +2099,7 @@ mod downstream_runner_tests {
         fn qap_endpoint(&self, _: &OatConfig) -> String {
             self.endpoint.clone()
         }
-        async fn ensure_stack(&mut self, _: &OatConfig, _: &str) -> Result<()> {
+        async fn ensure_stack(&mut self, _: &OatConfig, _: &str, _: u32) -> Result<()> {
             Ok(())
         }
         async fn scale_arrowcols(&mut self, _: &OatConfig, _: u32, _: u32) -> Result<()> {
@@ -2304,7 +2335,7 @@ mod downstream_runner_tests {
             delivery_drop_ms: std::sync::atomic::AtomicU64::new(0),
             cancellations: std::sync::Mutex::new(Vec::new()),
         };
-        let report = run_clients(&config, &uuid::Uuid::new_v4().to_string(), &config.tables, &mut platform).await?;
+        let report = run_clients(&config, &uuid::Uuid::new_v4().to_string(), &config.tables, &mut platform, 1).await?;
         assert_eq!(platform.clients_started, 0);
         assert!(report.failure.as_deref().is_some_and(|reason| reason.contains("protection unavailable")));
         assert_eq!(report.evidence.overload_guard.as_ref().map(|guard| &guard["status"]), Some(&json!("unavailable")));

@@ -165,11 +165,11 @@ impl ResourceRequirements {
     fn new(request_cpu: &str, request_memory: &str, limit_cpu: &str, limit_memory: &str) -> Self {
         Self {
             requests: ResourceValues {
-                cpu: request_cpu.to_owned(),
+                cpu: Some(request_cpu.to_owned()),
                 memory: request_memory.to_owned(),
             },
             limits: ResourceValues {
-                cpu: limit_cpu.to_owned(),
+                cpu: Some(limit_cpu.to_owned()),
                 memory: limit_memory.to_owned(),
             },
         }
@@ -179,12 +179,20 @@ impl ResourceRequirements {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResourceValues {
-    pub cpu: String,
+    #[serde(default, deserialize_with = "deserialize_nullable_cpu")]
+    pub cpu: Option<String>,
     pub memory: String,
 }
 
+fn deserialize_nullable_cpu<'de, D>(deserializer: D) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer)
+}
+
 impl AksResourceConfig {
-    fn validate(&self) -> Result<()> {
+    fn validate(&self, allow_uncapped_collector: bool) -> Result<()> {
         for (role, requirements) in [
             ("collector", &self.collector),
             ("client", &self.client),
@@ -192,15 +200,26 @@ impl AksResourceConfig {
             ("router", &self.router),
             ("catalog", &self.catalog),
         ] {
-            let request_cpu = parse_cpu_millicores(&requirements.requests.cpu)
-                .with_context(|| format!("platform.resources.{role}.requests.cpu"))?;
-            let limit_cpu = parse_cpu_millicores(&requirements.limits.cpu)
-                .with_context(|| format!("platform.resources.{role}.limits.cpu"))?;
+            let request_cpu = parse_cpu_millicores(
+                requirements
+                    .requests
+                    .cpu
+                    .as_deref()
+                    .with_context(|| format!("platform.resources.{role}.requests.cpu must not be null"))?,
+            )
+            .with_context(|| format!("platform.resources.{role}.requests.cpu"))?;
+            let limit_cpu = match requirements.limits.cpu.as_deref() {
+                Some(value) => {
+                    Some(parse_cpu_millicores(value).with_context(|| format!("platform.resources.{role}.limits.cpu"))?)
+                }
+                None if role == "collector" && allow_uncapped_collector => None,
+                None => bail!("platform.resources.{role}.limits.cpu must not be null"),
+            };
             let request_memory = parse_memory_bytes(&requirements.requests.memory)
                 .with_context(|| format!("platform.resources.{role}.requests.memory"))?;
             let limit_memory = parse_memory_bytes(&requirements.limits.memory)
                 .with_context(|| format!("platform.resources.{role}.limits.memory"))?;
-            if request_cpu > limit_cpu || request_memory > limit_memory {
+            if limit_cpu.is_some_and(|limit| request_cpu > limit) || request_memory > limit_memory {
                 bail!("platform.resources.{role} requests must not exceed limits");
             }
         }
@@ -302,6 +321,7 @@ pub enum OatMode {
 #[serde(rename_all = "snake_case")]
 pub enum CampaignProfile {
     SingleHotTable,
+    ScaleOutSingleTable,
 }
 
 fn deserialize_oat_tunables<'de, D>(deserializer: D) -> std::result::Result<Tunables, D::Error>
@@ -377,6 +397,43 @@ impl EffectiveStopBudgets {
 
 impl OatConfig {
     fn validate_campaign_profile(&self) -> Result<()> {
+        if self.campaign_profile == Some(CampaignProfile::ScaleOutSingleTable) {
+            if self.tables.as_slice() != ["sqlserver_availability_replica_states"] {
+                bail!(
+                    "scale_out_single_table campaign requires exactly the public sqlserver_availability_replica_states DMV table"
+                );
+            }
+            if self.replica_counts != [1] {
+                bail!("scale_out_single_table campaign requires replica_counts [1]");
+            }
+            if self.tunables.wal.is_some() {
+                bail!("scale_out_single_table campaign requires WAL to be absent");
+            }
+            if !self.overload_guard.enabled {
+                bail!("scale_out_single_table campaign requires overload protection");
+            }
+            let maintenance = self
+                .tunables
+                .maintenance
+                .as_ref()
+                .context("scale_out_single_table campaign requires enabled, applying maintenance")?;
+            if maintenance.enabled != Some(true) || maintenance.apply != Some(true) || maintenance.max_cycles.is_some()
+            {
+                bail!("scale_out_single_table campaign requires continuous, enabled, applying maintenance");
+            }
+            let operations = maintenance
+                .operations
+                .as_ref()
+                .context("scale_out_single_table campaign requires all maintenance operations")?;
+            use arrowcol_tunables::MaintenanceOperation::{Checkpoint, Optimize, PruneLog, Purge, Vacuum};
+            if [Purge, Optimize, Vacuum, Checkpoint, PruneLog]
+                .iter()
+                .any(|operation| !operations.contains(operation))
+            {
+                bail!("scale_out_single_table campaign requires purge, optimize, vacuum, checkpoint and prune_log");
+            }
+            return Ok(());
+        }
         if self.campaign_profile != Some(CampaignProfile::SingleHotTable) {
             return Ok(());
         }
@@ -424,7 +481,8 @@ impl OatConfig {
             }
             return Ok(());
         }
-        self.effective_aks_resources().validate()
+        self.effective_aks_resources()
+            .validate(self.campaign_profile == Some(CampaignProfile::ScaleOutSingleTable))
     }
 
     pub(crate) fn effective_aks_resources(&self) -> AksResourceConfig {
@@ -987,13 +1045,20 @@ impl OatConfig {
         if self.rows_per_table == 0 || self.rows_per_table > 1_000_000 || !(1..=64).contains(&self.dmv_concurrency) {
             bail!("rows_per_table must be 1..=1000000 and dmv_concurrency 1..=64");
         }
-        if !(1..=4).contains(&self.clients_per_table)
+        let max_clients_per_table = if self.campaign_profile == Some(CampaignProfile::ScaleOutSingleTable) {
+            128
+        } else {
+            4
+        };
+        if !(1..=max_clients_per_table).contains(&self.clients_per_table)
             || self
                 .clients_per_table
                 .checked_mul(self.tables.len())
                 .is_none_or(|total| total > 128)
         {
-            bail!("clients_per_table must be between 1 and 4 and the client fleet may not exceed 128");
+            bail!(
+                "clients_per_table must be between 1 and {max_clients_per_table} and the client fleet may not exceed 128"
+            );
         }
         let qap_endpoint = Url::parse(&self.qap_endpoint).context("qap_endpoint must be a URL")?;
         if !matches!(qap_endpoint.scheme(), "http" | "https")
@@ -1226,6 +1291,22 @@ mod tests {
         assert!(invalid.validate().is_err());
         assert!(serde_json::from_value::<AksResourceOverrides>(json!({"collector":{"cpu":"2"}})).is_err());
         assert!(serde_json::from_value::<AksResourceOverrides>(json!({"client_typo":{}})).is_err());
+        let uncapped: AksResourceOverrides = serde_json::from_value(json!({
+            "collector": {"requests":{"cpu":"2","memory":"4Gi"}, "limits":{"cpu":null,"memory":"6Gi"}}
+        }))?;
+        assert!(uncapped.resolve().validate(false).is_err());
+        uncapped.resolve().validate(true)?;
+        let mut bad = uncapped.clone();
+        bad.client = bad.collector.clone();
+        assert!(bad.resolve().validate(true).is_err());
+        let mut bad = uncapped.clone();
+        bad.collector.as_mut().context("missing collector")?.requests.cpu = None;
+        assert!(bad.resolve().validate(true).is_err());
+        let omitted: AksResourceOverrides = serde_json::from_value(json!({
+            "collector": {"requests":{"cpu":"2","memory":"4Gi"}, "limits":{"memory":"6Gi"}}
+        }))?;
+        omitted.resolve().validate(true)?;
+        assert!(omitted.resolve().validate(false).is_err());
         Ok(())
     }
 
@@ -1886,6 +1967,109 @@ mod tests {
         assert!(
             config.validate().is_err(),
             "a pin expiring before the bounded Job lifetime must be rejected"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn client_fleet_is_bounded_across_tables() -> Result<()> {
+        let mut config = valid();
+        assert_eq!(config.clients_per_table, 1);
+        config.clients_per_table = 5;
+        assert!(config.validate().is_err());
+        config.campaign_profile = Some(CampaignProfile::ScaleOutSingleTable);
+        config.overload_guard.enabled = true;
+        config.tables = vec!["sqlserver_availability_replica_states".to_owned()];
+        config.replica_counts = vec![1];
+        config.maintenance_image = Some(format!("maintenance@sha256:{}", "a".repeat(64)));
+        config.tunables = serde_json::from_value(serde_json::json!({
+            "maintenance": {
+                "enabled": true, "apply": true,
+                "operations": ["purge", "optimize", "vacuum", "checkpoint", "prune_log"]
+            }
+        }))?;
+        config.clients_per_table = 128;
+        config.validate()?;
+        for replicas in [vec![2], vec![1, 2], vec![]] {
+            config.replica_counts = replicas;
+            let error = config
+                .validate_campaign_profile()
+                .err()
+                .context("invalid replicas were accepted")?;
+            assert!(error.to_string().contains("replica_counts [1]"));
+        }
+        config.replica_counts = vec![1];
+        config.clients_per_table = 129;
+        assert!(config.validate().is_err());
+        config.clients_per_table = 0;
+        assert!(config.validate().is_err());
+        config.clients_per_table = usize::MAX;
+        assert!(config.validate().is_err());
+        config.clients_per_table = 1;
+        config.tables.push("sqlserver_wait_stats".to_owned());
+        assert!(config.validate().is_err());
+        config.tables.clear();
+        assert!(config.validate().is_err());
+        config.tables.push("sqlserver_wait_stats".to_owned());
+        assert!(config.validate().is_err());
+        config.tables[0] = "sqlserver_availability_replica_states".to_owned();
+        config.tunables.wal = Some(arrowcol_tunables::WalTunables::default());
+        assert!(config.validate().is_err());
+        config.tunables.wal = None;
+        let maintenance = config.tunables.maintenance.take().context("missing test maintenance")?;
+        assert!(config.validate().is_err());
+        config.tunables.maintenance = Some(maintenance);
+        config
+            .tunables
+            .maintenance
+            .as_mut()
+            .context("missing test maintenance")?
+            .enabled = Some(false);
+        assert!(config.validate().is_err());
+        config
+            .tunables
+            .maintenance
+            .as_mut()
+            .context("missing test maintenance")?
+            .enabled = Some(true);
+        config
+            .tunables
+            .maintenance
+            .as_mut()
+            .context("missing test maintenance")?
+            .apply = Some(false);
+        assert!(config.validate().is_err());
+        config
+            .tunables
+            .maintenance
+            .as_mut()
+            .context("missing test maintenance")?
+            .apply = Some(true);
+        config
+            .tunables
+            .maintenance
+            .as_mut()
+            .context("missing test maintenance")?
+            .operations = Some(vec![]);
+        assert!(config.validate().is_err());
+        config
+            .tunables
+            .maintenance
+            .as_mut()
+            .context("missing test maintenance")?
+            .operations = Some(vec![
+            arrowcol_tunables::MaintenanceOperation::Purge,
+            arrowcol_tunables::MaintenanceOperation::Optimize,
+            arrowcol_tunables::MaintenanceOperation::Vacuum,
+            arrowcol_tunables::MaintenanceOperation::Checkpoint,
+            arrowcol_tunables::MaintenanceOperation::PruneLog,
+        ]);
+        config.overload_guard.enabled = false;
+        assert!(config.validate_campaign_profile().is_err());
+        assert!(serde_json::from_str::<CampaignProfile>(r#""scale_out_single_tables""#).is_err());
+        assert_eq!(
+            serde_json::to_string(&CampaignProfile::ScaleOutSingleTable)?,
+            r#""scale_out_single_table""#
         );
         Ok(())
     }

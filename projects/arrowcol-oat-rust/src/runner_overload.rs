@@ -221,13 +221,154 @@ impl GuardEngine {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct ScaleOutCollectorIdentity {
+    pod: String,
+    pod_uid: String,
+    replica_set_uid: String,
+    container_id: String,
+}
+
+fn controlling_owner(value: &Value, kind: &str) -> Result<(String, String)> {
+    let owners = value.pointer("/metadata/ownerReferences").and_then(Value::as_array)
+        .context("Kubernetes owner references missing")?;
+    let controllers = owners.iter().filter(|owner| owner["controller"] == true).collect::<Vec<_>>();
+    let [owner] = controllers.as_slice() else {
+        bail!("Kubernetes object must have exactly one controlling owner");
+    };
+    if owner["kind"] != kind {
+        bail!("Kubernetes controlling owner kind mismatched");
+    }
+    let field = |key| owner[key].as_str().filter(|value| !value.is_empty())
+        .map(str::to_owned).context("Kubernetes controlling owner identity missing");
+    Ok((field("name")?, field("uid")?))
+}
+
+fn scale_out_collector_identities(
+    namespace: &str,
+    container: &str,
+    expected_replicas: u32,
+    deployment: &Value,
+    replica_sets: &Value,
+    pods: &Value,
+) -> Result<Vec<ScaleOutCollectorIdentity>> {
+    if expected_replicas != 1 || !rollout_generation_ready(deployment)
+        || deployment.pointer("/spec/replicas").and_then(Value::as_u64) != Some(u64::from(expected_replicas))
+        || deployment.pointer("/metadata/namespace").and_then(Value::as_str) != Some(namespace)
+    {
+        bail!("collector deployment does not match the ready expected topology");
+    }
+    let deployment_name = deployment.pointer("/metadata/name").and_then(Value::as_str)
+        .filter(|value| !value.is_empty()).context("collector deployment name missing")?;
+    let deployment_uid = deployment.pointer("/metadata/uid").and_then(Value::as_str)
+        .filter(|value| !value.is_empty()).context("collector deployment UID missing")?;
+    let labels = deployment.pointer("/spec/selector/matchLabels").and_then(Value::as_object)
+        .filter(|value| !value.is_empty()).context("collector deployment selector missing")?;
+    let mut owned_sets = BTreeMap::new();
+    for replica_set in replica_sets["items"].as_array().context("replica set inventory missing")? {
+        if replica_set.pointer("/metadata/namespace").and_then(Value::as_str) != Some(namespace) {
+            continue;
+        }
+        if controlling_owner(replica_set, "Deployment").ok().as_ref()
+            != Some(&(deployment_name.to_owned(), deployment_uid.to_owned())) {
+            continue;
+        }
+        let name = replica_set.pointer("/metadata/name").and_then(Value::as_str)
+            .filter(|value| !value.is_empty()).context("replica set name missing")?;
+        let uid = replica_set.pointer("/metadata/uid").and_then(Value::as_str)
+            .filter(|value| !value.is_empty()).context("replica set UID missing")?;
+        if owned_sets.insert(uid.to_owned(), name.to_owned()).is_some() {
+            bail!("duplicate replica set UID");
+        }
+    }
+    let items = pods["items"].as_array().context("collector pod inventory missing")?;
+    if items.len() != expected_replicas as usize {
+        bail!("collector pod count differs from the selected cell");
+    }
+    let mut identities = Vec::with_capacity(items.len());
+    for pod in items {
+        if pod.pointer("/metadata/namespace").and_then(Value::as_str) != Some(namespace)
+            || !pod.pointer("/metadata/deletionTimestamp").is_none_or(Value::is_null)
+            || !labels.iter().all(|(key, value)| pod.pointer("/metadata/labels").and_then(Value::as_object)
+                .and_then(|pod_labels| pod_labels.get(key)) == Some(value))
+        {
+            bail!("collector pod namespace, selector or lifecycle mismatched");
+        }
+        let (owner_name, owner_uid) = controlling_owner(pod, "ReplicaSet")?;
+        if owned_sets.get(&owner_uid) != Some(&owner_name) {
+            bail!("collector pod is not owned by the selected deployment");
+        }
+        let name = pod.pointer("/metadata/name").and_then(Value::as_str)
+            .filter(|value| !value.is_empty()).context("collector pod name missing")?;
+        let uid = pod.pointer("/metadata/uid").and_then(Value::as_str)
+            .filter(|value| !value.is_empty()).context("collector pod UID missing")?;
+        let statuses = pod.pointer("/status/containerStatuses").and_then(Value::as_array)
+            .context("collector container statuses missing")?.iter()
+            .filter(|status| status["name"] == container).collect::<Vec<_>>();
+        let [status] = statuses.as_slice() else { bail!("collector container status is missing or ambiguous") };
+        if status["ready"] != true || status["restartCount"].as_u64() != Some(0)
+            || !status.pointer("/state/running").is_some_and(Value::is_object) {
+            bail!("collector container is not ready or has restarted");
+        }
+        let container_id = status["containerID"].as_str().filter(|value| !value.is_empty())
+            .context("collector container ID missing")?;
+        identities.push(ScaleOutCollectorIdentity {
+            pod: name.to_owned(), pod_uid: uid.to_owned(), replica_set_uid: owner_uid, container_id: container_id.to_owned(),
+        });
+    }
+    identities.sort();
+    if identities.iter().map(|value| &value.pod_uid).collect::<HashSet<_>>().len() != identities.len()
+        || identities.iter().map(|value| &value.pod).collect::<HashSet<_>>().len() != identities.len()
+        || identities.iter().map(|value| &value.container_id).collect::<HashSet<_>>().len() != identities.len() {
+        bail!("collector identities are not unique");
+    }
+    Ok(identities)
+}
+
 struct GuardProbe {
     instance_id: String,
     rss_cap: u64,
     buffer_cap: u64,
     collector_instance: Option<arrowcol_protocol::CollectorInstanceId>,
+    expected_scale_out_identity: Option<Vec<ScaleOutCollectorIdentity>>,
     local: bool,
     since_ms: u64,
+}
+
+async fn scale_out_collector_snapshot(config: &OatConfig, replicas: u32) -> Result<Vec<ScaleOutCollectorIdentity>> {
+    let deployment = deployment(config, &config.dfe_deployment).await?;
+    let selector = deployment_selector(&deployment)?;
+    let (sets, pods) = tokio::try_join!(
+        kubectl(config, vec!["get", "replicasets", "--namespace", &config.namespace, "-o", "json"], None),
+        kubectl(config, vec!["get", "pods", "--namespace", &config.namespace, "--selector", &selector, "-o", "json"], None),
+    )?;
+    scale_out_collector_identities(
+        &config.namespace, &config.dfe_container, replicas, &deployment,
+        &serde_json::from_str(&sets)?, &serde_json::from_str(&pods)?,
+    )
+}
+
+async fn verify_guard_identity(config: &OatConfig, expected: Option<&[ScaleOutCollectorIdentity]>) -> Result<()> {
+    if let Some(expected) = expected
+        && scale_out_collector_snapshot(config, 1).await? != expected
+    {
+        bail!("collector identity changed during composite observation");
+    }
+    Ok(())
+}
+
+async fn guarded_composite_observation<T, B>(
+    reading: impl std::future::Future<Output = Result<T>>,
+    backlog: impl std::future::Future<Output = B>,
+    fence: impl std::future::Future<Output = Result<()>>,
+) -> (Result<T>, B) {
+    let (reading, backlog) = tokio::join!(reading, backlog);
+    let reading = async {
+        let reading = reading?;
+        fence.await?;
+        Ok(reading)
+    }.await;
+    (reading, backlog)
 }
 
 struct PreparedGuard {
@@ -251,6 +392,22 @@ impl PreparedGuard {
         if !log.complete {
             bail!("collector cap readback is incomplete");
         }
+        let expected_scale_out_identity =
+            if config.campaign_profile == Some(crate::config::CampaignProfile::ScaleOutSingleTable) {
+                if platform.kind() != crate::config::OatMode::Aks {
+                    bail!("scale-out guard requires an AKS collector");
+                }
+                let expected = scale_out_collector_snapshot(config, 1).await?;
+                let [identity] = expected.as_slice() else {
+                    bail!("scale-out guard requires exactly one collector identity");
+                };
+                if log.instance_id != format!("{}/{}", identity.pod, config.dfe_container) {
+                    bail!("collector startup evidence does not match the owned collector");
+                }
+                Some(expected)
+            } else {
+                None
+            };
         let observed = process_configurations(&log.text)?;
         if observed["commit_telemetry"]
             != json!({"schema_version":1,
@@ -273,6 +430,7 @@ impl PreparedGuard {
                     .filter(|cap| *cap > 0)
                     .context("buffer hard-cap readback missing")?,
                 collector_instance: None,
+                expected_scale_out_identity,
                 local: platform.kind() == crate::config::OatMode::Local,
                 since_ms: unix_time_ms_u64()?.saturating_sub(GUARD_MAX_GAP_MS),
             },
@@ -283,13 +441,15 @@ impl PreparedGuard {
         prepared.engine.proof["collector_rss_limit_source"] = json!("registration_configuration_not_cgroup");
         prepared.engine.proof["commit_log_sampling"] = json!({"mode":"incremental_since_with_dedupe",
             "overlap_ms":GUARD_MAX_GAP_MS,"capability_source":"initial_complete_startup_readback"});
-        let (reading, backlog) = tokio::try_join!(
+        let expected = prepared.probe.expected_scale_out_identity.clone();
+        let (reading, backlog) = guarded_composite_observation(
             prepared.probe.read(config, &prepared.scraper),
             prepared.scraper.scrape(),
-        )?;
+            verify_guard_identity(config, expected.as_deref()),
+        ).await;
         prepared
             .engine
-            .observe(reading, &publication_backlog_sample(backlog, 0, 0, 0))?;
+            .observe(reading?, &publication_backlog_sample(backlog?, 0, 0, 0))?;
         Ok(prepared)
     }
 }
@@ -320,6 +480,13 @@ fn guard_container_memory(text: &str, requested: Option<u64>) -> Result<GuardCap
         cap,
         confirmed: true,
     })
+}
+
+fn verify_scale_out_buffering_mode(pressure: &Value) -> Result<()> {
+    if pressure.get("resolved_buffering_mode").and_then(Value::as_str) != Some("memory_only") {
+        bail!("scale-out collector did not affirmatively resolve memory-only buffering");
+    }
+    Ok(())
 }
 
 impl GuardProbe {
@@ -373,6 +540,11 @@ impl GuardProbe {
 
     async fn read(&mut self, config: &OatConfig, scraper: &PublicationBacklogScraper) -> Result<GuardReading> {
         let request_start_ms = unix_time_ms_u64()?;
+        if let Some(expected) = &self.expected_scale_out_identity
+            && scale_out_collector_snapshot(config, 1).await? != *expected
+        {
+            bail!("collector identity changed before observation");
+        }
         let mut pressure_url = Url::parse(&scraper.endpoint)?;
         pressure_url.set_path("/v1/pressure");
         pressure_url.set_query(None);
@@ -393,6 +565,9 @@ impl GuardProbe {
             },
         )?;
         let pressure: Value = serde_json::from_str(&pressure)?;
+        if config.campaign_profile == Some(crate::config::CampaignProfile::ScaleOutSingleTable) {
+            verify_scale_out_buffering_mode(&pressure)?;
+        }
         let rich: arrowcol_routing::RichPressureSnapshot = serde_json::from_value(pressure["rich"].clone())?;
         let timestamp_ms = unix_time_ms_u64()?;
         let observed_ms = rich.observed_at_unix_ms.get();
@@ -448,6 +623,11 @@ impl GuardProbe {
                 bail!("live ingestion commit table identity mismatched");
             }
         }
+        if let Some(expected) = &self.expected_scale_out_identity
+            && scale_out_collector_snapshot(config, 1).await? != *expected
+        {
+            bail!("collector identity changed during observation");
+        }
         self.since_ms = request_start_ms.saturating_sub(GUARD_MAX_GAP_MS);
         Ok(GuardReading {
             request_start_ms,
@@ -485,6 +665,53 @@ mod overload_guard_tests {
     use super::*;
 
     #[test]
+    fn scale_out_collector_set_requires_complete_owned_unrestarted_pods() -> Result<()> {
+        let deployment = json!({
+            "metadata":{"name":"collector","namespace":"run","uid":"deployment","generation":1},
+            "spec":{"replicas":1,"selector":{"matchLabels":{"app":"collector"}}},
+            "status":{"observedGeneration":1,"updatedReplicas":1,"replicas":1,"availableReplicas":1}
+        });
+        let replica_sets = json!({"items":[{
+            "metadata":{"name":"rs","namespace":"run","uid":"rs-uid","ownerReferences":[
+                {"kind":"Deployment","name":"collector","uid":"deployment","controller":true}
+            ]}
+        }]});
+        let pod = |index| json!({
+            "metadata":{"name":format!("pod-{index}"),"namespace":"run","uid":format!("uid-{index}"),
+                "labels":{"app":"collector"},"ownerReferences":[
+                    {"kind":"ReplicaSet","name":"rs","uid":"rs-uid","controller":true}
+                ]},
+            "status":{"containerStatuses":[{"name":"dataflow","ready":true,"restartCount":0,
+                "containerID":format!("container-{index}"),"state":{"running":{}}}]}
+        });
+        let pods = json!({"items":[pod(0)]});
+        let identities = scale_out_collector_identities("run", "dataflow", 1, &deployment, &replica_sets, &pods)?;
+        assert_eq!(identities.len(), 1);
+        assert!(scale_out_collector_identities("run", "dataflow", 2, &deployment, &replica_sets, &pods).is_err());
+        assert_eq!(identities[0].pod_uid, "uid-0");
+        let mut missing = pods.clone();
+        missing["items"].as_array_mut().context("missing pod array")?.pop();
+        assert!(scale_out_collector_identities("run", "dataflow", 1, &deployment, &replica_sets, &missing).is_err());
+        let mut extra = pods.clone();
+        extra["items"].as_array_mut().context("missing pod array")?.push(pod(2));
+        assert!(scale_out_collector_identities("run", "dataflow", 1, &deployment, &replica_sets, &extra).is_err());
+        for (pointer, value) in [
+            ("/items/0/status/containerStatuses/0/restartCount", json!(1)),
+            ("/items/0/status/containerStatuses/0/containerID", Value::Null),
+            ("/items/0/metadata/ownerReferences/0/uid", json!("foreign")),
+            ("/items/0/metadata/labels/app", json!("foreign")),
+        ] {
+            let mut bad = pods.clone();
+            *bad.pointer_mut(pointer).context("missing test field")? = value;
+            assert!(scale_out_collector_identities("run", "dataflow", 1, &deployment, &replica_sets, &bad).is_err());
+        }
+        let mut restarted = pods.clone();
+        restarted["items"][0]["status"]["containerStatuses"][0]["containerID"] = json!("replacement");
+        assert_ne!(identities, scale_out_collector_identities("run", "dataflow", 1, &deployment, &replica_sets, &restarted)?);
+        Ok(())
+    }
+
+    #[test]
     fn overload_cgroup_accounting_and_incremental_cursor_refuse_invented_limits() -> Result<()> {
         assert_eq!(guard_container_memory("0::/\n100\n1000\n", Some(1000))?.cap, 1000);
         for text in ["0::/\n100\nmax\n", "0::/host\n100\n1000\n", "0::/\n100\n999\n"] {
@@ -498,6 +725,7 @@ mod overload_guard_tests {
             rss_cap: 1000,
             buffer_cap: 1000,
             collector_instance: None,
+            expected_scale_out_identity: None,
             local: true,
             since_ms: 595_000,
         };
@@ -725,7 +953,7 @@ mod overload_guard_tests {
         let mut receipt = json!({"run_id":run_id,"classification":"unscored_no_load_lifecycle",
             "workload_clients":0,"schedule_armed":false});
         let result = async {
-            platform.ensure_stack(&config, &run_id).await?;
+            platform.ensure_stack(&config, &run_id, 1).await?;
             let before = platform
                 .process_logs_for_role(&config, ComponentRole::Collector)
                 .await?;
@@ -1104,6 +1332,72 @@ mod overload_guard_tests {
             time,
             3000,
         )
+    }
+
+    #[tokio::test]
+    async fn composite_guard_fences_late_backlog_before_startup_and_final_sample() -> Result<()> {
+        use std::sync::atomic::{AtomicU8, Ordering};
+        for (mode, startup) in (0..4).flat_map(|mode| [(mode, true), (mode, false)]) {
+            let identity = Arc::new(AtomicU8::new(0));
+            let observed = Arc::clone(&identity);
+            let (probe_done, wait_probe) = tokio::sync::oneshot::channel();
+            let (release_backlog, backlog_gate) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(async move {
+                guarded_composite_observation(
+                    async {
+                        probe_done.send(()).map_err(|_| anyhow::anyhow!("probe waiter dropped"))?;
+                        Ok(reading(0, 100))
+                    },
+                    async {
+                        backlog_gate.await.context("backlog gate dropped")?;
+                        Ok::<_, anyhow::Error>(pending(0, 0))
+                    },
+                    async {
+                        match observed.load(Ordering::SeqCst) {
+                            0 => Ok(()),
+                            1 => bail!("collector identity changed during composite observation"),
+                            2 => bail!("collector identity read failed"),
+                            _ => tokio::time::timeout_at(
+                                tokio::time::Instant::now(),
+                                std::future::pending::<Result<()>>(),
+                            ).await.context("collector identity fence deadline exceeded")?,
+                        }
+                    },
+                ).await
+            });
+            wait_probe.await.context("probe did not complete")?;
+            identity.store(mode, Ordering::SeqCst);
+            release_backlog.send(()).map_err(|_| anyhow::anyhow!("backlog waiter dropped"))?;
+            let (result, backlog) = task.await.context("composite task failed")?;
+            let backlog = backlog?;
+            let mut engine = GuardEngine::new(Default::default());
+            if startup {
+                let accepted = result.and_then(|reading| engine.observe(reading, &backlog));
+                assert_eq!(accepted.is_ok(), mode == 0);
+                assert_eq!(engine.proof["sample_count"], json!(u64::from(mode == 0)));
+            } else {
+                engine.record(result, &backlog);
+                assert_eq!(engine.failure().is_none(), mode == 0);
+                if mode != 0 {
+                    assert_eq!(engine.proof["status"], "unavailable");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn scale_out_buffering_requires_affirmative_memory_mode() {
+        assert!(verify_scale_out_buffering_mode(&json!({"resolved_buffering_mode":"memory_only"})).is_ok());
+        for pressure in [
+            json!({}), json!({"native_quiver_enabled":false}),
+            json!({"resolved_buffering_mode":null}), json!({"resolved_buffering_mode":false}),
+            json!({"resolved_buffering_mode":"unknown"}), json!({"resolved_buffering_mode":"quiver"}),
+            json!({"resolved_buffering_mode":"spill_recovery"}), json!({"resolved_buffering_mode":"mixed"}),
+            json!({"resolved_buffering_mode":"future_mode"}),
+        ] {
+            assert!(verify_scale_out_buffering_mode(&pressure).is_err());
+        }
     }
 
     #[test]

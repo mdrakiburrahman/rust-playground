@@ -1018,7 +1018,7 @@ trait Platform: Send + Sync {
         Ok((self.router_metrics_endpoint(config)?, false))
     }
     fn qap_endpoint(&self, config: &OatConfig) -> String;
-    async fn ensure_stack(&mut self, config: &OatConfig, orchestration_run_id: &str) -> Result<()>;
+    async fn ensure_stack(&mut self, config: &OatConfig, orchestration_run_id: &str, replicas: u32) -> Result<()>;
     async fn scale_arrowcols(&mut self, config: &OatConfig, replicas: u32, concurrency: u32) -> Result<()>;
     async fn initialize_run_table_pins(
         &mut self,
@@ -1271,8 +1271,8 @@ impl Platform for AksPlatform {
         config.qap_endpoint.clone()
     }
 
-    async fn ensure_stack(&mut self, config: &OatConfig, orchestration_run_id: &str) -> Result<()> {
-        prepare_aks_platform(config, self, orchestration_run_id).await?;
+    async fn ensure_stack(&mut self, config: &OatConfig, orchestration_run_id: &str, replicas: u32) -> Result<()> {
+        prepare_aks_platform(config, self, orchestration_run_id, replicas).await?;
         if let Some(overlay) = config.platform.kustomize_overlay.as_deref() {
             apply_aks_overlay(config, overlay, self).await?;
         }
@@ -1429,6 +1429,9 @@ impl Platform for AksPlatform {
         run_id: &str,
         tables: &[String],
     ) -> Result<()> {
+        if config.campaign_profile == Some(crate::config::CampaignProfile::ScaleOutSingleTable) {
+            return verify_maintenance_stop_budget_before_admission(config, self).await;
+        }
         if config.campaign_profile != Some(crate::config::CampaignProfile::SingleHotTable) {
             return Ok(());
         }
@@ -1821,7 +1824,7 @@ impl Platform for LocalPlatform {
         self.qap_url.clone().unwrap_or_else(|| config.qap_endpoint.clone())
     }
 
-    async fn ensure_stack(&mut self, config: &OatConfig, _orchestration_run_id: &str) -> Result<()> {
+    async fn ensure_stack(&mut self, config: &OatConfig, _orchestration_run_id: &str, _replicas: u32) -> Result<()> {
         self.daemon_endpoint = Some(local_docker_daemon().await?);
         prepare_local_platform(config, self).await?;
         self.refresh_endpoints(config).await
@@ -3302,7 +3305,7 @@ async fn run_isolated_cell(
     let setup_deadline = lifecycle_started_at + Duration::from_millis(timing_budget.pre_cell_setup_timeout_ms);
     let (result, cancelled) = tokio::select! {
         result = async {
-            match tokio::time::timeout_at(setup_deadline, platform.ensure_stack(&config, orchestration_id)).await {
+            match tokio::time::timeout_at(setup_deadline, platform.ensure_stack(&config, orchestration_id, replicas)).await {
                 Ok(result) => result.context("prepare isolated OAT matrix-cell platform")?,
                 Err(_) => bail!("planned pre-cell setup deadline expired; normal platform cleanup follows"),
             }
@@ -3561,6 +3564,11 @@ fn matrix_cell_specs(config: &OatConfig) -> Vec<(u32, u32, String)> {
 }
 
 fn platform_for_run(config: &OatConfig, run_id: &str) -> Result<Box<dyn Platform>> {
+    if config.campaign_profile == Some(crate::config::CampaignProfile::ScaleOutSingleTable) {
+        bail!(
+            "scale_out_single_table is blocked until runtime qualification and delivery reconciliation are implemented"
+        );
+    }
     if config.platform.kind == crate::config::OatMode::Aks
         && config.campaign_profile == Some(crate::config::CampaignProfile::SingleHotTable)
     {
@@ -3987,7 +3995,7 @@ async fn run_matrix_cell(
         i64::try_from(cell_start_unix_ms).context("run start timestamp exceeds Arrow timestamp range")?;
     let baseline_logs = platform.process_logs(config).await?;
     platform.retain_cell_process_baseline(&baseline_logs);
-    let mut client_run = run_clients(config, run_id, &assigned_tables, platform).await?;
+    let mut client_run = run_clients(config, run_id, &assigned_tables, platform, replicas).await?;
     platform.finish_resource_measurement(config).await?;
     let guard_stopped = client_run.evidence.overload_stop.is_some()
         || client_run
@@ -4125,8 +4133,21 @@ fn result_rows(
     let observed_owners = client_run.pinning.owners.values().collect::<HashSet<_>>().len();
     let cpu_quota_evidence = if config.platform.kind == crate::config::OatMode::Aks {
         let requested = config.effective_aks_resources();
-        let collector_limit_millicores = parse_resource_cpu_millicores(&requested.collector.limits.cpu)?;
-        let client_limit_millicores = parse_resource_cpu_millicores(&requested.client.limits.cpu)?;
+        let collector_limit_millicores = requested
+            .collector
+            .limits
+            .cpu
+            .as_deref()
+            .map(parse_resource_cpu_millicores)
+            .transpose()?;
+        let client_limit_millicores = parse_resource_cpu_millicores(
+            requested
+                .client
+                .limits
+                .cpu
+                .as_deref()
+                .context("client CPU limit is missing")?,
+        )?;
         let throttling = resource_evidence
             .as_ref()
             .and_then(|evidence| evidence.get("cpu_throttling"))
@@ -4142,7 +4163,7 @@ fn result_rows(
                 "requested_workers": concurrency,
                 "limit_cpu": requested.collector.limits.cpu,
                 "limit_millicores": collector_limit_millicores,
-                "workers_per_cpu_core": f64::from(concurrency) * 1_000.0 / collector_limit_millicores as f64,
+                "workers_per_cpu_core": collector_limit_millicores.map(|limit| f64::from(concurrency) * 1_000.0 / limit as f64),
             },
             "client": {
                 "requested_concurrency_per_process": config.dmv_concurrency,
@@ -4182,7 +4203,7 @@ fn result_rows(
         "requested_durability_class": config.tunables.wal.as_ref().map(|_| config.tunables.durability_class()),
         "capabilities": capability_evidence(),
     });
-    let details = [
+    let mut details = [
         client_run.failure.clone(),
         client_run
             .pinning
@@ -4194,6 +4215,9 @@ fn result_rows(
     .into_iter()
     .flatten()
     .collect::<Vec<_>>();
+    if config.campaign_profile == Some(crate::config::CampaignProfile::ScaleOutSingleTable) {
+        details.push("exact_active_snapshot_identity_reconciliation_not_implemented".to_owned());
+    }
     let failure = (!details.is_empty()).then(|| details.join("; "));
     let pinning_ok = client_run.pinning.violation.is_none()
         && client_run.pinning.verification_error.is_none()
@@ -4320,9 +4344,10 @@ async fn run_clients(
     project_run_id: &str,
     tables: &[String],
     platform: &mut dyn Platform,
+    replicas: u32,
 ) -> Result<ClientRun> {
     let mut pinning = PinningReport::default();
-    match run_clients_inner(config, project_run_id, tables, platform, &mut pinning).await {
+    match run_clients_inner(config, project_run_id, tables, platform, &mut pinning, replicas).await {
         Ok(report) => Ok(report),
         Err(error) => {
             let sample = async {
@@ -4398,10 +4423,17 @@ async fn run_clients_inner(
     tables: &[String],
     platform: &mut dyn Platform,
     pinning: &mut PinningReport,
+    replicas: u32,
 ) -> Result<ClientRun> {
+    require_single_scale_out_collector(config, replicas)?;
     let mut evidence = CellEvidence::default();
     let mut prepared_guard = if config.overload_guard.enabled {
-        match tokio::time::timeout(Duration::from_secs(5), PreparedGuard::prepare(config, platform)).await {
+        let timeout = if config.campaign_profile == Some(crate::config::CampaignProfile::ScaleOutSingleTable) {
+            Duration::from_secs(30)
+        } else {
+            Duration::from_secs(5)
+        };
+        match tokio::time::timeout(timeout, PreparedGuard::prepare(config, platform)).await {
             Ok(Ok(prepared)) => Some(prepared),
             result => {
                 let error = match result {
@@ -9236,11 +9268,51 @@ async fn record_campaign_namespace_uid(config: &OatConfig, platform: &AksPlatfor
     persist_campaign_inventory(platform, &next).await
 }
 
+fn set_runtime_replicas(runtime_config: &mut Value, replicas: u32) -> Result<()> {
+    if !(1..=16).contains(&replicas) {
+        bail!("AKS cell replicas must be between 1 and 16");
+    }
+    let object = runtime_config
+        .as_object_mut()
+        .context("runtime config must be an object")?;
+    object.insert("collectorReplicas".to_owned(), json!(replicas));
+    object.insert("routerReplicas".to_owned(), json!(replicas));
+    Ok(())
+}
+
+fn require_single_scale_out_collector(config: &OatConfig, replicas: u32) -> Result<()> {
+    if config.campaign_profile == Some(crate::config::CampaignProfile::ScaleOutSingleTable) && replicas != 1 {
+        bail!("scale_out_single_table runtime requires exactly one collector replica");
+    }
+    Ok(())
+}
+
+fn project_scale_out_runtime(runtime_config: &mut Value, config: &OatConfig, replicas: u32) -> Result<()> {
+    if config.campaign_profile != Some(crate::config::CampaignProfile::ScaleOutSingleTable) {
+        return Ok(());
+    }
+    require_single_scale_out_collector(config, replicas)?;
+    let [hot_table] = config.tables.as_slice() else {
+        bail!("scale_out_single_table runtime requires exactly one hot table");
+    };
+    if hot_table != "sqlserver_availability_replica_states" {
+        bail!("scale_out_single_table runtime hot table is invalid");
+    }
+    set_runtime_replicas(runtime_config, replicas)?;
+    runtime_config["campaignProfile"] = serde_json::to_value(config.campaign_profile)?;
+    runtime_config["hotTable"] = json!(hot_table);
+    runtime_config["collectorStartupTable"] =
+        json!({"catalog": "telemetry", "schema": "sqlserver", "table": hot_table});
+    Ok(())
+}
+
 async fn prepare_aks_platform(
     config: &OatConfig,
     platform: &mut AksPlatform,
     orchestration_run_id: &str,
+    replicas: u32,
 ) -> Result<()> {
+    require_single_scale_out_collector(config, replicas)?;
     let parent = std::env::temp_dir().join("arrowcol-oat");
     tokio::fs::create_dir_all(&parent)
         .await
@@ -9289,6 +9361,7 @@ async fn prepare_aks_platform(
     runtime_config["quiver"] = json!(config.tunables.wal.is_some());
     runtime_config["effective_stop_budgets"] = serde_json::to_value(config.maintenance_stop_budget()?)?;
     runtime_config["resources"] = serde_json::to_value(config.effective_aks_resources())?;
+    project_scale_out_runtime(&mut runtime_config, config, replicas)?;
     runtime_config["collectorWorkers"] = json!(
         config
             .dfe_worker_concurrency
@@ -11518,7 +11591,14 @@ fn configure_deployment_container_resources(
     if selected.next().is_some() {
         bail!("container {container_name:?} is ambiguous in Deployment");
     }
-    container["resources"] = serde_json::to_value(requirements)?;
+    let mut resources = serde_json::to_value(requirements)?;
+    if requirements.limits.cpu.is_none() {
+        resources["limits"]
+            .as_object_mut()
+            .context("resource limits must be an object")?
+            .remove("cpu");
+    }
+    container["resources"] = resources;
     Ok(())
 }
 
@@ -11547,19 +11627,35 @@ fn verify_container_resources(
             .map(str::to_owned)
             .with_context(|| format!("{role} resource readback omitted {side}.{name}"))
     };
+    let limits = resources
+        .get("limits")
+        .and_then(Value::as_object)
+        .context("resource readback omitted limits")?;
+    let limit_cpu = match limits.get("cpu") {
+        None => None,
+        Some(Value::String(value)) => Some(value.clone()),
+        Some(_) => bail!("{role} resource CPU limit readback has an invalid type"),
+    };
     let actual = ResourceRequirements {
         requests: ResourceValues {
-            cpu: quantity("requests", "cpu")?,
+            cpu: Some(quantity("requests", "cpu")?),
             memory: quantity("requests", "memory")?,
         },
         limits: ResourceValues {
-            cpu: quantity("limits", "cpu")?,
+            cpu: limit_cpu,
             memory: quantity("limits", "memory")?,
         },
     };
-    let quantities_match = parse_resource_cpu_millicores(&actual.requests.cpu)?
-        == parse_resource_cpu_millicores(&expected.requests.cpu)?
-        && parse_cpu_millicores(&actual.limits.cpu)? == parse_cpu_millicores(&expected.limits.cpu)?
+    let actual_request = actual.requests.cpu.as_deref().context("actual CPU request missing")?;
+    let expected_request = expected
+        .requests
+        .cpu
+        .as_deref()
+        .context("expected CPU request missing")?;
+    let quantities_match = parse_resource_cpu_millicores(actual_request)?
+        == parse_resource_cpu_millicores(expected_request)?
+        && actual.limits.cpu.as_deref().map(parse_cpu_millicores).transpose()?
+            == expected.limits.cpu.as_deref().map(parse_cpu_millicores).transpose()?
         && parse_resource_memory_bytes(&actual.requests.memory)?
             == parse_resource_memory_bytes(&expected.requests.memory)?
         && parse_memory_bytes(&actual.limits.memory)? == parse_memory_bytes(&expected.limits.memory)?;
@@ -13512,6 +13608,72 @@ mod tests {
                 .as_deref()
                 .is_some_and(|failure| failure.contains("fixture cleanup failure"))
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn aks_runtime_projects_exact_cell_replicas() -> Result<()> {
+        for replicas in [1, 2, 16] {
+            let mut runtime = json!({"collectorReplicas":7,"routerReplicas":8,"other":"retained"});
+            set_runtime_replicas(&mut runtime, replicas)?;
+            assert_eq!(runtime["collectorReplicas"], replicas);
+            assert_eq!(runtime["routerReplicas"], replicas);
+            assert_eq!(runtime["other"], "retained");
+        }
+        assert!(set_runtime_replicas(&mut json!({}), 0).is_err());
+        assert!(set_runtime_replicas(&mut json!({}), 17).is_err());
+        assert!(set_runtime_replicas(&mut Value::Null, 1).is_err());
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        let original = json!({"other":"retained","collectorReplicas":7});
+        let mut runtime = original.clone();
+        project_scale_out_runtime(&mut runtime, &config, 2)?;
+        assert_eq!(runtime, original);
+        config.campaign_profile = Some(crate::config::CampaignProfile::ScaleOutSingleTable);
+        config.tables = vec!["sqlserver_availability_replica_states".to_owned()];
+        for replicas in [0, 2, 16] {
+            let before = runtime.clone();
+            assert!(project_scale_out_runtime(&mut runtime, &config, replicas).is_err());
+            assert_eq!(runtime, before);
+        }
+        project_scale_out_runtime(&mut runtime, &config, 1)?;
+        assert_eq!(runtime["campaignProfile"], "scale_out_single_table");
+        assert_eq!(runtime["hotTable"], config.tables[0]);
+        assert_eq!(
+            runtime["collectorStartupTable"],
+            json!({
+                "catalog": "telemetry", "schema": "sqlserver", "table": config.tables[0]
+            })
+        );
+        assert_eq!(runtime["collectorReplicas"], 1);
+        assert_eq!(runtime["routerReplicas"], 1);
+        for cpu in [Some("2"), None] {
+            config.platform.resources = Some(serde_json::from_value(json!({
+                "collector": {"requests": {"cpu": "2", "memory": "4Gi"},
+                              "limits": {"cpu": cpu, "memory": "6Gi"}}
+            }))?);
+            runtime["resources"] = serde_json::to_value(config.effective_aks_resources())?;
+            assert_eq!(runtime.pointer("/resources/collector/limits/cpu"), Some(&json!(cpu)));
+        }
+        config.tables.push("sqlserver_wait_stats".to_owned());
+        assert!(project_scale_out_runtime(&mut runtime, &config, 1).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn scale_out_profile_remains_blocked_before_platform_creation() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        config.campaign_profile = Some(crate::config::CampaignProfile::ScaleOutSingleTable);
+        for kind in [crate::config::OatMode::Local, crate::config::OatMode::Aks] {
+            config.platform.kind = kind;
+            let error = platform_for_run(&config, "test-run")
+                .err()
+                .context("scale-out was admitted")?;
+            assert!(error.to_string().contains("blocked until runtime qualification"));
+        }
         Ok(())
     }
 
@@ -16362,11 +16524,11 @@ mod aks_resource_readback_tests {
     fn requirements() -> ResourceRequirements {
         ResourceRequirements {
             requests: ResourceValues {
-                cpu: "2".to_owned(),
+                cpu: Some("2".to_owned()),
                 memory: "4Gi".to_owned(),
             },
             limits: ResourceValues {
-                cpu: "2".to_owned(),
+                cpu: Some("2".to_owned()),
                 memory: "6Gi".to_owned(),
             },
         }
@@ -16384,6 +16546,24 @@ mod aks_resource_readback_tests {
         let evidence = verify_container_resources(&containers, "dataflow", "collector", &requirements())?;
         assert_eq!(evidence["requested"]["requests"]["cpu"], "2");
         assert_eq!(evidence["effective"]["requests"]["cpu"], "2000m");
+        Ok(())
+    }
+
+    #[test]
+    fn uncapped_collector_omits_cpu_limit_and_requires_matching_readback() -> Result<()> {
+        let mut expected = requirements();
+        expected.limits.cpu = None;
+        let mut deployment = json!({"spec":{"template":{"spec":{"containers":[{"name":"dataflow"}]}}}});
+        configure_deployment_container_resources(&mut deployment, "dataflow", &expected)?;
+        let container = &deployment["spec"]["template"]["spec"]["containers"][0];
+        assert!(container.pointer("/resources/limits/cpu").is_none());
+        verify_container_resources(std::slice::from_ref(container), "dataflow", "collector", &expected)?;
+        let mut with_cap = container.clone();
+        with_cap["resources"]["limits"]["cpu"] = json!("2");
+        assert!(verify_container_resources(&[with_cap], "dataflow", "collector", &expected).is_err());
+        let mut with_null = container.clone();
+        with_null["resources"]["limits"]["cpu"] = Value::Null;
+        assert!(verify_container_resources(&[with_null], "dataflow", "collector", &expected).is_err());
         Ok(())
     }
 
