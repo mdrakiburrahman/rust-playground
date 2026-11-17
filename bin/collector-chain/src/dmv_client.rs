@@ -86,15 +86,6 @@ pub enum GuidUniqueness {
     PerRow,
 }
 
-#[derive(Clone, Copy, Debug, Default, Serialize, ValueEnum, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ShardIndexMode {
-    #[default]
-    Fixed,
-    #[value(name = "worker_spread")]
-    WorkerSpread,
-}
-
 /// All settings are resolved and validated before allocation, registration, or connection.
 #[derive(Args, Clone, Debug, Serialize)]
 pub struct Options {
@@ -136,14 +127,8 @@ pub struct Options {
     pub interval_us: u64,
     #[arg(long, env = "ARROWCOL_CLIENT_CONNECTIONS_PER_WORKER", default_value_t = 1)]
     pub connections_per_worker: usize,
-    #[arg(long, env = "ARROWCOL_CLIENT_SHARD_INDEX_MODE", value_enum, default_value_t = ShardIndexMode::Fixed)]
-    pub shard_index_mode: ShardIndexMode,
-    #[arg(long, env = "ARROWCOL_CLIENT_FIXED_SHARD_INDEX", default_value_t = 0)]
-    pub fixed_shard_index: u8,
     #[arg(long, env = "ARROWCOL_CLIENT_POD_ORDINAL", default_value_t = 0)]
     pub pod_ordinal: u32,
-    #[arg(long, env = "ARROWCOL_CLIENT_SHARD_COUNT", default_value_t = 1)]
-    pub shard_count: u8,
     /// Zero inherits the legacy --concurrency setting.
     #[arg(long, env = "ARROWCOL_CLIENT_STREAMS_PER_WORKER", default_value_t = 0)]
     pub streams_per_worker: usize,
@@ -234,8 +219,7 @@ impl Options {
             "data_profile": self.data_profile, "string_width": self.string_width,
             "string_length_distribution": self.string_length_distribution,
             "value_variation": self.value_variation, "guid_uniqueness": self.guid_uniqueness,
-            "shard_index_mode": self.shard_index_mode, "fixed_shard_index": self.fixed_shard_index,
-            "pod_ordinal": self.pod_ordinal, "shard_count": self.shard_count,
+            "pod_ordinal": self.pod_ordinal,
             "stream_retry_max_attempts": self.stream_retry_max_attempts,
             "stream_retry_base_backoff_ms": self.stream_retry_base_backoff_ms,
             "stream_retry_max_backoff_ms": self.stream_retry_max_backoff_ms,
@@ -300,19 +284,6 @@ impl Options {
             "connections-per-worker must be 1..=256, streams-per-worker 1..=1024; totals <=4096 connections and <=65536 streams"
         );
         anyhow::ensure!(self.string_width <= 65536, "string-width must be 0..=65536");
-        anyhow::ensure!((1..=32).contains(&self.shard_count), "shard-count must be 1..=32");
-        anyhow::ensure!(
-            self.fixed_shard_index < self.shard_count,
-            "fixed-shard-index must be less than shard-count"
-        );
-        anyhow::ensure!(
-            self.shard_index_mode != ShardIndexMode::Fixed || self.pod_ordinal == 0,
-            "pod-ordinal is only used with shard-index-mode=worker-spread"
-        );
-        anyhow::ensure!(
-            self.shard_index_mode != ShardIndexMode::WorkerSpread || self.fixed_shard_index == 0,
-            "fixed-shard-index is only used with shard-index-mode=fixed"
-        );
         anyhow::ensure!(self.cardinality > 0, "cardinality must be positive");
         for (name, value) in [
             ("null-fraction", self.null_fraction),
@@ -391,31 +362,14 @@ impl Options {
                 "data_profile": self.data_profile, "string_width": self.string_width,
                 "string_length_distribution": self.string_length_distribution,
                 "value_variation": self.value_variation, "guid_uniqueness": self.guid_uniqueness,
-                "shard_index_mode": self.shard_index_mode, "fixed_shard_index": self.fixed_shard_index,
-                "pod_ordinal": self.pod_ordinal, "shard_count": self.shard_count,
-            "stream_retry_max_attempts": self.stream_retry_max_attempts,
-            "stream_retry_base_backoff_ms": self.stream_retry_base_backoff_ms,
-            "stream_retry_max_backoff_ms": self.stream_retry_max_backoff_ms,
+                "pod_ordinal": self.pod_ordinal,
+                "stream_retry_max_attempts": self.stream_retry_max_attempts,
+                "stream_retry_base_backoff_ms": self.stream_retry_base_backoff_ms,
+                "stream_retry_max_backoff_ms": self.stream_retry_max_backoff_ms,
             },
             "corpus_rows_source": corpus_rows_source,
         });
         Ok((self, evidence))
-    }
-
-    fn shard_index(&self, worker: usize) -> Result<u8> {
-        anyhow::ensure!(worker < self.workers, "worker id must be less than workers");
-        let index = match self.shard_index_mode {
-            ShardIndexMode::Fixed => self.fixed_shard_index,
-            ShardIndexMode::WorkerSpread => {
-                ((u128::from(self.pod_ordinal) * self.workers as u128 + worker as u128) % u128::from(self.shard_count))
-                    as u8
-            }
-        };
-        anyhow::ensure!(
-            index < self.shard_count,
-            "computed shard index must be less than shard-count"
-        );
-        Ok(index)
     }
 
     fn endpoint(&self, address: &str) -> Result<Endpoint> {
@@ -1731,13 +1685,7 @@ impl PreparedClient {
         let mut request = Request::new(stream::iter(batch.data.as_ref().clone()));
         let timeout = Duration::from_millis(self.options.request_timeout_ms);
         let result = tokio::time::timeout(timeout, async {
-            request_metadata(
-                &mut request,
-                &batch.table,
-                self.signer.as_ref(),
-                Some(&observation),
-                Some(self.options.shard_index(worker)?),
-            )?;
+            request_metadata(&mut request, &batch.table, self.signer.as_ref(), Some(&observation))?;
             request.set_timeout(timeout);
             if let Some(index) = logical.manifest_index {
                 self.record_manifest_attempt(index, observation.send_unix_ns, measurement)?;
@@ -3202,7 +3150,6 @@ mod tests {
             vec!["--string-length-distribution", "exponential"],
             vec!["--value-variation", "batch"],
             vec!["--guid-uniqueness", "never"],
-            vec!["--shard-index-mode", "round_robin"],
             vec!["--dictionary-handling", "silent"],
         ] {
             assert!(Cli::try_parse_from(std::iter::once("test").chain(args)).is_err());
@@ -3217,11 +3164,6 @@ mod tests {
             vec!["--stream-window-bytes", "2147483648"],
             vec!["--dictionary-handling", "resend"],
             vec!["--stream-retry-max-attempts", "0"],
-            vec!["--shard-count", "0"],
-            vec!["--shard-count", "33"],
-            vec!["--fixed-shard-index", "1", "--shard-count", "1"],
-            vec!["--pod-ordinal", "1"],
-            vec!["--shard-index-mode", "worker_spread", "--fixed-shard-index", "1"],
             vec![
                 "--stream-retry-base-backoff-ms",
                 "100",
@@ -3390,29 +3332,21 @@ mod tests {
     }
 
     #[test]
-    fn shard_selection_is_bounded_and_spreads_worker_slots_deterministically() -> Result<()> {
-        let mut options = options()?;
-        options.workers = 4;
-        options.shard_count = 3;
-        options.shard_index_mode = ShardIndexMode::WorkerSpread;
-        options.pod_ordinal = 2;
-        assert_eq!(
-            (0..options.workers)
-                .map(|worker| options.shard_index(worker))
-                .collect::<Result<Vec<_>>>()?,
-            vec![2, 0, 1, 2]
-        );
-        options.shard_index_mode = ShardIndexMode::Fixed;
-        options.pod_ordinal = 0;
-        options.fixed_shard_index = 1;
-        assert_eq!(options.shard_index(3)?, 1);
-        assert!(options.shard_index(4).is_err());
-        Ok(())
+    fn rejects_parked_client_shard_selector_options() {
+        for args in [
+            vec!["--shard-index-mode", "fixed"],
+            vec!["--fixed-shard-index", "0"],
+            vec!["--shard-count", "1"],
+        ] {
+            assert!(Cli::try_parse_from(std::iter::once("test").chain(args)).is_err());
+        }
     }
 
     #[test]
     fn resolution_retains_auto_and_legacy_sources_without_guessing_byte_target_rows() -> Result<()> {
-        let requested_options = Cli::try_parse_from(["test", "--workers", "0", "--runtime-threads", "0"])?.options;
+        let requested_options =
+            Cli::try_parse_from(["test", "--workers", "0", "--runtime-threads", "0", "--pod-ordinal", "3"])?.options;
+        assert_eq!(requested_options.pod_ordinal, 3);
         let (resolved, evidence) = requested_options.resolve_with_evidence(123, 7)?;
         assert_eq!(evidence["requested"]["workers"], 0);
         assert_eq!(evidence["requested"]["runtime_threads"], 0);
