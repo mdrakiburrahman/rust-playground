@@ -9,6 +9,18 @@
 | Namespace and scheduling | Every AKS cell gets a namespace derived from the configured prefix plus its compact run UUID. The runtime selects `arrow-collector/role=arrowcol` nodes (amd64) and tolerates that role's `NoSchedule` taint. |
 | Identity | `aks setup` prepares the shared `arrow-collector` ServiceAccount and workload identity. OAT cells use run-scoped namespaces and clean up only their owned namespace/FIC; no Azure/GitHub CLI credential mounts. |
 
+## Scale-out profile (held)
+
+`campaign_profile: "scale_out_single_table"` is exploratory and remains **blocked from execution** until multi-pod protection and exact delivery reconciliation are implemented and independently reviewed. It is not custody-qualified.
+
+| Input | Requirement |
+| --- | --- |
+| Table and buffering | Exactly `sqlserver_availability_replica_states`; no WAL. |
+| Maintenance | Continuous, enabled and applying purge, optimize, vacuum, checkpoint and prune-log. |
+| Fleet | `replica_counts` values 1–16; `clients_per_table` 1–128 and at most 128 clients total. |
+| CPU | Collector `platform.resources.collector.limits.cpu` is a positive quantity or explicit `null` for no CPU limit; other CPU requirements remain finite. Omitted resource overrides retain defaults. |
+| Protection | `overload_guard.enabled: true`. |
+
 OAT router configurations explicitly select `auth.authenticator: dev_only_allow_all`. Missing, legacy `allow_all` and unknown modes fail startup. Every non-public request still needs a valid edge HMAC; the shared development principal is not production caller authorization. Rebuild router and signing-client images together because `x-arrowcol-oat-run-id` is now signed, including its absence.
 
 Catalog Flight SQL and CES requests require signed internal identity by default. Each assertion binds the RPC method and payload digest, carries a one-time nonce, and expires within 30 seconds; the replay cache is bounded at 65,536 requests per catalog replica and rejects new requests when full. AKS catalog and dataflow pods mount the `internal-hmac` key from `arrowcol-router-auth` at `/run/auth/internal-hmac`; generated direct OAT client Jobs mount the same key at `/run/secrets/internal-hmac` and set `LOADTEST_INTERNAL_SECRET_FILE` to that path. `--ddl-auth-mode dev_only_allow_unsigned` bypasses catalog RPC identity checks and is for development only; do not use it in AKS. The separate data-plane Flight SQL service is unchanged. TLS/mTLS is deferred, no NetworkPolicy enforcement is assumed, and no QAP host allowlist is added.

@@ -9251,6 +9251,22 @@ fn set_runtime_replicas(runtime_config: &mut Value, replicas: u32) -> Result<()>
     Ok(())
 }
 
+fn project_scale_out_runtime(runtime_config: &mut Value, config: &OatConfig, replicas: u32) -> Result<()> {
+    if config.campaign_profile != Some(crate::config::CampaignProfile::ScaleOutSingleTable) {
+        return Ok(());
+    }
+    let [hot_table] = config.tables.as_slice() else {
+        bail!("scale_out_single_table runtime requires exactly one hot table");
+    };
+    if hot_table != "sqlserver_availability_replica_states" {
+        bail!("scale_out_single_table runtime hot table is invalid");
+    }
+    set_runtime_replicas(runtime_config, replicas)?;
+    runtime_config["campaignProfile"] = json!("scale_out_single_table");
+    runtime_config["hotTable"] = json!(hot_table);
+    Ok(())
+}
+
 async fn prepare_aks_platform(
     config: &OatConfig,
     platform: &mut AksPlatform,
@@ -9305,17 +9321,7 @@ async fn prepare_aks_platform(
     runtime_config["quiver"] = json!(config.tunables.wal.is_some());
     runtime_config["effective_stop_budgets"] = serde_json::to_value(config.maintenance_stop_budget()?)?;
     runtime_config["resources"] = serde_json::to_value(config.effective_aks_resources())?;
-    if config.campaign_profile == Some(crate::config::CampaignProfile::ScaleOutSingleTable) {
-        let [hot_table] = config.tables.as_slice() else {
-            bail!("scale_out_single_table runtime requires exactly one hot table");
-        };
-        if hot_table != "sqlserver_availability_replica_states" {
-            bail!("scale_out_single_table runtime hot table is invalid");
-        }
-        runtime_config["campaignProfile"] = json!("scale_out_single_table");
-        runtime_config["hotTable"] = json!(hot_table);
-        set_runtime_replicas(&mut runtime_config, replicas)?;
-    }
+    project_scale_out_runtime(&mut runtime_config, config, replicas)?;
     runtime_config["collectorWorkers"] = json!(
         config
             .dfe_worker_concurrency
@@ -13571,6 +13577,36 @@ mod tests {
         assert!(set_runtime_replicas(&mut json!({}), 0).is_err());
         assert!(set_runtime_replicas(&mut json!({}), 17).is_err());
         assert!(set_runtime_replicas(&mut Value::Null, 1).is_err());
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        let original = json!({"other":"retained","collectorReplicas":7});
+        let mut runtime = original.clone();
+        project_scale_out_runtime(&mut runtime, &config, 2)?;
+        assert_eq!(runtime, original);
+        config.campaign_profile = Some(crate::config::CampaignProfile::ScaleOutSingleTable);
+        config.tables = vec!["sqlserver_availability_replica_states".to_owned()];
+        project_scale_out_runtime(&mut runtime, &config, 2)?;
+        assert_eq!(runtime["campaignProfile"], "scale_out_single_table");
+        assert_eq!(runtime["hotTable"], config.tables[0]);
+        assert_eq!(runtime["collectorReplicas"], 2);
+        assert_eq!(runtime["routerReplicas"], 2);
+        config.tables.push("sqlserver_wait_stats".to_owned());
+        assert!(project_scale_out_runtime(&mut runtime, &config, 2).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn scale_out_profile_remains_blocked_before_platform_creation() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        config.campaign_profile = Some(crate::config::CampaignProfile::ScaleOutSingleTable);
+        for kind in [crate::config::OatMode::Local, crate::config::OatMode::Aks] {
+            config.platform.kind = kind;
+            let error = platform_for_run(&config, "test-run").err().context("scale-out was admitted")?;
+            assert!(error.to_string().contains("blocked until multi-pod protection"));
+        }
         Ok(())
     }
 
