@@ -250,49 +250,7 @@
   ],
   "runnable": false,
   "config_validation": {
-    "status": "config-validated",
-    "validator": "arrowcol-oat-rust --validate-config",
-    "validator_source_commit": "5687e6459c424362f4504d21c32f954aa3b07d05",
-    "validator_binary_sha256": "9c5bc506371ba533ade8bc3477be17ade82cda2a3139988d23cf3219f0706901",
-    "baseline_count": 1,
-    "candidate_count": 4,
-    "pass_count": 5,
-    "fail_count": 0,
-    "configs": [
-      {
-        "kind": "baseline",
-        "path": "out/arrowcol-oat/sweep-configs/C4/baseline.json",
-        "sha256": "736db4ab230cd11d61d5500251efd28fa1886aaee50fc25d1636d62668f75e58"
-      },
-      {
-        "kind": "candidate",
-        "comparison": "sort-key",
-        "candidate": "none",
-        "path": "out/arrowcol-oat/sweep-configs/C4/sort-key/none.json",
-        "sha256": "ef2315f356e7d6099961dcf0dc4d6bc80585fad06f3059196a7d31b9ef6a78cc"
-      },
-      {
-        "kind": "candidate",
-        "comparison": "sort-key",
-        "candidate": "sample-time",
-        "path": "out/arrowcol-oat/sweep-configs/C4/sort-key/sample-time.json",
-        "sha256": "238ba7537d1665c1364905d9e0302a8276a24e8c9a6bbfbe067f956c66a9011e"
-      },
-      {
-        "kind": "candidate",
-        "comparison": "sort-key",
-        "candidate": "replica-sample-time",
-        "path": "out/arrowcol-oat/sweep-configs/C4/sort-key/replica-sample-time.json",
-        "sha256": "be310b45a3ddf5e4a879e76723d25876b4863a8010b9d6924fbfd9d8ea882630"
-      },
-      {
-        "kind": "candidate",
-        "comparison": "sort-key",
-        "candidate": "group-replica-sample-time",
-        "path": "out/arrowcol-oat/sweep-configs/C4/sort-key/group-replica-sample-time.json",
-        "sha256": "76eecd71bbfc5f3b554fcdafa54f8c56918347181bbc27906410c065232bf92a"
-      }
-    ]
+    "status": "not-validated"
   },
   "runtime_qualification": "unqualified"
 }

@@ -8,7 +8,7 @@
 | Guard and envelope | Every baseline requests `overload_guard` enabled, cap fraction 0.90, two zero-progress windows, and a 4 GiB local collector memory limit. This common initial request is not measured headroom or proof of host suitability. |
 | Maintenance | Continuous, enabled, and applying in every cell. Idle work must be a no-op; due work stays enabled. |
 | Verdict | Set `dataflow_verdict_policy` to `single_hot_table_campaign` to make QAP lag a separate finding. Missing QAP observations remain UNKNOWN/non-PASS; default legacy semantics are unchanged. |
-| Files | `oat-config-throughput-C1.json` through `C8.json` are bounded manifests, not launch configs. Their eight baselines and 104 candidates have config validation recorded separately from runtime qualification in `oat-config-throughput-validation.json`. |
+| Files | `oat-config-throughput-C1.json` through `C8.json` are bounded manifests, not launch configs. Their eight baselines and 108 candidates (116 configs) are config-only and remain runtime-unqualified; successor Rust validation is pending in `oat-config-throughput-validation.json`. |
 | Pictures | Result pictures may show exploratory observations; no sustainable winner is shown until contiguous 30-second buckets, reconciliation, and validated timestamped pressure/maintenance-debt evidence qualify. Missing or unavailable evidence remains UNKNOWN. |
 
 ## Qualification
@@ -30,15 +30,15 @@ Compare candidates within the same box. Change one variable at a time; only test
 
 ## Cohorts
 
-Each comparison contains at most four candidates, except the C1 coarse codec sweep (eight); sequential comparisons in a cohort stay on the same box. Candidate changes are overlays on the baseline, not additional writers or tables. The C8 staging-overlap comparison remains outside executable candidates in `pending_candidate_sets` with status `pending-L1b`; it is not config-validated.
+Every executable comparison contains at most four entries, including any repeated matched control; sequential comparisons in a cohort stay on the same box. Candidate changes are overlays on the baseline, not additional writers or tables. The C8 staging-overlap comparison remains outside executable candidates in `pending_candidate_sets` with status `pending-L1b`; it is not config-validated.
 
 | Cohort | Comparisons |
 | --- | --- |
-| C1 | Coarse codec comparison: uncompressed, Snappy, LZ4_RAW, gzip, Brotli, and Zstd 1/3/6 (eight points). If Zstd wins, refine around its winning level with up to three adjacent registry-supported levels while retaining the winner as control (four candidates max). |
-| C2 | Dictionary on/off; Delta Binary Packed and Byte Stream Split on integer columns; explicit Plain, Delta Length Byte Array, and Delta Byte Array on `availability_group_name` with dictionary disabled. The typed transport dictionary-handling field is not swept: the capability default is `hydrate`, while `resend` is rejected for the frozen plain DMV schema and has no runtime projection. |
+| C1 | Three bounded comparisons share an explicit uncompressed control: Zstd 1/3/6 (four entries), Snappy/LZ4_RAW (three), and gzip/Brotli (three). If Zstd wins, refine around its winning level with up to three adjacent registry-supported levels while retaining the winner as control (four entries max). |
+| C2 | Dictionary on/off; Delta Binary Packed and Byte Stream Split on integer columns; explicit Plain, Delta Length Byte Array, and Delta Byte Array on `availability_group_name` with dictionary disabled. The client consumes projected `dictionary_handling`; `hydrate` is its default, while `resend` is rejected for the frozen plain DMV schema. |
 | C3 | Row groups and maxRows include 16K/64K/128K/1M; page rows are separate; input-cap candidates include 128/256/512 MiB, setting layout, per-flush, and writer caps together so effective cap is `min(layout, per-flush, writer)`; coalescing, flush age (1s/5s/15s/60s), and age-flush policy (`immediate`/`drain_ready`) are separate comparisons. |
 | C4 | Low-to-high cardinality sort candidates for the final availability-replica table: none; `sample_time_utc`; `replica_server_name, sample_time_utc`; `availability_group_id, replica_server_name, sample_time_utc`. `customer_id` is constant per client and excluded. |
-| C5 | Workers, streams, connections, corpus rows, send interval (including zero), and IPC compression as separate comparisons. Typed data-mode and gRPC-compression enums remain excluded because the pinned source has no runtime consumer; the seed requests gRPC send compression `none`, but that request has no runtime effect. |
+| C5 | Workers, streams, connections, shared/independent data mode, corpus rows, send interval (including zero), and IPC compression as separate comparisons. Worker, stream, and connection candidates override only their own axis against the committed 2×2×1 seed. gRPC send/accept values are projected and consumed by the client, but gzip/zstd remain excluded because the production Flight receiver does not enable matching receive/send compression; test-server support is not production evidence. |
 | C6 | DFE cores, CPU workers, upload limit, and flush concurrency. Collector `buffered_multipart` upload is excluded by the pinned backend capability (no conditional completion); request concurrency is only valid with that mode. |
 | C7 | Maintenance cadence, stale-plan retry bound, sealed-partition preference, small-file threshold, checkpoint interval, input-read strategy (`memory`/`spool`/`range`), granularity, and OPTIMIZE upload mode. All operations remain enabled and applying; buffered-multipart uses the coupled 8 MiB buffer and is exploratory/unqualified. Cadence 30/60/120 seconds is exploratory; idle-backoff is coupled to cadence. |
 | C8 | Comparisons cover commit window and files-per-commit. Staging-overlap remains a separate `pending-L1b` candidate set until its consumer and safety clearance are integrated. |
@@ -57,10 +57,10 @@ Render CLI-consumable baselines and candidate overlays from the checked-in manif
 npx --no-install tsx projects/arrowcol-oat/throughput-sweeps.ts --render-all \
   --out out/arrowcol-oat/sweep-configs
 cargo run --locked --package arrowcol-oat-rust -- --validate-config \
-  out/arrowcol-oat/sweep-configs/C1/codec/snappy.json
+  out/arrowcol-oat/sweep-configs/C1/codec-snappy-lz4raw/snappy.json
 ```
 
-The generator hashes the PR #125 tunables profile as a seed, not a complete capability registry. Rendering rejects a different seed. `oat-config-throughput-validation.json` records SHA-256 per rendered config and the exact validator source: 8 baselines and 104 candidates (112 configs) passed the production `--validate-config` binary built from source commit `5687e6459c424362f4504d21c32f954aa3b07d05`; binary SHA-256 is `9c5bc506371ba533ade8bc3477be17ade82cda2a3139988d23cf3219f0706901`. No staging-overlap candidates were included. This proves config shape only, not an admission, effective-setting, runtime, or sustainable qualification. `runnable: false` retains the runtime hold. Regeneration resets each manifest's validation status; revalidate after source, seed, manifest, or rendered config changes rather than relying on an old matrix.
+The generator hashes the PR #125 tunables profile as a seed, not a complete capability registry. Rendering rejects a different seed. The current matrix contains 8 baselines and 108 candidates (116 configs); successor Rust validation remains pending until exact source/build/binary provenance and per-config command, input hash, exit code, stdout, and stderr are captured. The earlier 112-config result was owner-attested and is not raw validator evidence. No staging-overlap candidates are included. Parser success proves config shape only, not admission, effective settings, runtime, or sustainable qualification. `runnable: false` retains the runtime hold. Regeneration resets validation status; do not treat config generation as validation.
 
 C3's flush-age comparison requests `tunables.collector.batching.max_age` at 1s, 5s, 15s, and 60s; the shared baseline request is 1s. Record the effective age separately from the request using the collector's startup `consumer_effective_config.batching.max_age` readback. A longer age alone need not produce larger files if row, input-byte, memory, or adaptive target thresholds trigger first. Interpret each run with per-run deltas of `arrowcol_pipeline_flushes_total` by reason (especially `age`, `row_cap`, `batch_cap`, `memory_cap`, `min_input_bytes`, `max_input_bytes`, and `target_parquet_bytes`) alongside physical file sizes and latency. The earlier 231-file observation with all files under 8 MiB does not establish that age was the limiting factor. No performance effect is claimed by this configuration-only comparison.
 
@@ -70,10 +70,11 @@ The manifests’ `source_enum_coverage` records typed acceptance, explicit seed 
 
 | Path | Accepted, seed request, or configured candidates | Excluded, effective default, or pending |
 | --- | --- | --- |
-| C2 `transport.dictionary_handling` | Enum accepts `hydrate`/`resend`; seed omits the field | Capability default is `hydrate`; `resend` fails current plain-DMV validation. No runtime projection; not a candidate. |
+| C2 `transport.dictionary_handling` | Enum accepts `hydrate`/`resend`; seed omits the field | Client consumes the projected value; effective default is `hydrate`. `resend` is excluded because validation rejects it for the frozen plain DMV schema. |
 | C5 `transport.ipc_compression` | Candidates `none`, `lz4_frame`, `zstd`; seed explicitly requests `zstd` | None; still runtime-unqualified. |
-| C5 `client.data_mode` | Typed `shared`/`independent`; seed omits the field; no candidate | Neither has an environment projection or load-generator consumer. |
-| C5 `transport.grpc_*_compression` | Typed `none`/`gzip`/`zstd`; seed requests send `none` and omits accept; no candidates | Capability is disabled and fields have no runtime projection/consumer, so the seed request is not effective. |
+| C5 `client.data_mode` | Matched `shared`/`independent` candidates; seed omits the field | Both are projected and consumed. Shared uses one corpus copy; independent uses one per worker under the same memory cap. Config-screened only; runtime-unqualified. |
+| C5 `transport.grpc_send_compression` | Enum accepts `none`/`gzip`/`zstd`; seed requests `none`; no candidate | Client build supports all three, but production Flight receiver does not enable `accept_compressed`; gzip/zstd are excluded. |
+| C5 `transport.grpc_accept_compression` | Enum accepts `none`/`gzip`/`zstd`; seed omits the field; no candidate | Client accepts these projected values, but production Flight receiver does not send compressed responses; gzip/zstd are excluded. |
 | C6 `collector.upload.mode` | Typed values; seed omits mode; no candidate | Effective default is `put_create`; `buffered_multipart` is excluded because the pinned collector lacks conditional completion. |
 | C7 `maintenance.input_read_strategy` | Candidates `memory`, `spool`, `range`; seed omits the field | Effective default is `memory`; these change OPTIMIZE input reading, not WAL/collector durability. |
 | C7 `maintenance.granularity` | Candidates `minute`, `hour`, `day`; generated baseline explicitly uses `hour` | No exclusion; maintenance operations remain fixed and enabled. |

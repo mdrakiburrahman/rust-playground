@@ -223,63 +223,7 @@
   ],
   "runnable": false,
   "config_validation": {
-    "status": "config-validated",
-    "validator": "arrowcol-oat-rust --validate-config",
-    "validator_source_commit": "5687e6459c424362f4504d21c32f954aa3b07d05",
-    "validator_binary_sha256": "9c5bc506371ba533ade8bc3477be17ade82cda2a3139988d23cf3219f0706901",
-    "baseline_count": 1,
-    "candidate_count": 6,
-    "pass_count": 7,
-    "fail_count": 0,
-    "configs": [
-      {
-        "kind": "baseline",
-        "path": "out/arrowcol-oat/sweep-configs/C8/baseline.json",
-        "sha256": "736db4ab230cd11d61d5500251efd28fa1886aaee50fc25d1636d62668f75e58"
-      },
-      {
-        "kind": "candidate",
-        "comparison": "commit-window",
-        "candidate": "window-1s",
-        "path": "out/arrowcol-oat/sweep-configs/C8/commit-window/window-1s.json",
-        "sha256": "397cd497ed038b406dde217049d4f0f952ffa999ff98f99338cd38405571d91a"
-      },
-      {
-        "kind": "candidate",
-        "comparison": "commit-window",
-        "candidate": "window-2s",
-        "path": "out/arrowcol-oat/sweep-configs/C8/commit-window/window-2s.json",
-        "sha256": "e23551659ab537ef3992cfcd442712620bd9e3d9de99272e0ac6338eaf08eaa2"
-      },
-      {
-        "kind": "candidate",
-        "comparison": "commit-window",
-        "candidate": "window-5s",
-        "path": "out/arrowcol-oat/sweep-configs/C8/commit-window/window-5s.json",
-        "sha256": "27f98627834a8bf46d78821a1f5849fe9dd6095cb28e3305315435fdb0719998"
-      },
-      {
-        "kind": "candidate",
-        "comparison": "files-per-commit",
-        "candidate": "files-16",
-        "path": "out/arrowcol-oat/sweep-configs/C8/files-per-commit/files-16.json",
-        "sha256": "2f5c461c7134d6c24f425e381f9d9db7bc007a0e63cd4883a7742ebc51d7a1df"
-      },
-      {
-        "kind": "candidate",
-        "comparison": "files-per-commit",
-        "candidate": "files-64",
-        "path": "out/arrowcol-oat/sweep-configs/C8/files-per-commit/files-64.json",
-        "sha256": "bc9289d15d653a5d3c590468fa7283bace115acb7889eb6567fc53586ab04821"
-      },
-      {
-        "kind": "candidate",
-        "comparison": "files-per-commit",
-        "candidate": "files-128",
-        "path": "out/arrowcol-oat/sweep-configs/C8/files-per-commit/files-128.json",
-        "sha256": "6541fc10b85d7fcf5a066098726d5f12b29faa1208e54f61e7444d3f22547562"
-      }
-    ]
+    "status": "not-validated"
   },
   "runtime_qualification": "unqualified",
   "pending_candidate_sets": [

@@ -5,7 +5,10 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 type JsonObject = Record<string, unknown>;
 type Candidate = { id: string; overrides: JsonObject; qualification?: 'exploratory' };
-type Comparison = { id: string; factor: string; candidates: Candidate[]; candidate_limit: number };
+type Comparison = {
+  id: string; factor: string; candidates: Candidate[]; candidate_limit: number;
+  matched_control?: string; comparison_family?: string;
+};
 type PendingCandidateSet = { id: string; factor: string; status: string; candidates: Candidate[] };
 type Cohort = { id: string; comparisons: Comparison[]; refinement?: JsonObject; pendingCandidateSets?: PendingCandidateSet[] };
 
@@ -17,21 +20,35 @@ const maintenance = {
 const candidate = (id: string, value: JsonObject, rootOverrides: JsonObject = {}): Candidate => ({
   id, overrides: { ...rootOverrides, tunables: value },
 });
-const compare = (id: string, factor: string, candidates: Candidate[], candidateLimit = 4): Comparison => ({
-  id, factor, candidates, candidate_limit: candidateLimit,
+const maxCandidatesPerComparison = 4;
+const compare = (id: string, factor: string, candidates: Candidate[]): Comparison => ({
+  id, factor, candidates, candidate_limit: maxCandidatesPerComparison,
+});
+const compareWithControl = (
+  id: string, factor: string, control: Candidate, candidates: Candidate[], comparisonFamily?: string,
+): Comparison => ({
+  ...compare(id, factor, [control, ...candidates]),
+  matched_control: control.id,
+  ...(comparisonFamily ? { comparison_family: comparisonFamily } : {}),
+});
+const codecControl = candidate('uncompressed', {
+  parquet_writer: { defaults: { compression: 'uncompressed', compression_level: null } },
 });
 const cohorts: Cohort[] = [
   { id: 'C1', comparisons: [
-    compare('codec', 'parquet_writer.defaults.compression', [
-      candidate('uncompressed', { parquet_writer: { defaults: { compression: 'uncompressed', compression_level: null } } }),
-      candidate('snappy', { parquet_writer: { defaults: { compression: 'snappy', compression_level: null } } }),
-      candidate('lz4-raw', { parquet_writer: { defaults: { compression: 'lz4_raw', compression_level: null } } }),
-      candidate('gzip', { parquet_writer: { defaults: { compression: 'gzip', compression_level: null } } }),
-      candidate('brotli', { parquet_writer: { defaults: { compression: 'brotli', compression_level: null } } }),
+    compareWithControl('codec-zstd-levels', 'parquet_writer.defaults.compression+compression_level', codecControl, [
       candidate('zstd-1', { parquet_writer: { defaults: { compression: 'zstd', compression_level: 1 } } }),
       candidate('zstd-3', { parquet_writer: { defaults: { compression: 'zstd', compression_level: 3 } } }),
       candidate('zstd-6', { parquet_writer: { defaults: { compression: 'zstd', compression_level: 6 } } }),
-    ], 8),
+    ], 'codec'),
+    compareWithControl('codec-snappy-lz4raw', 'parquet_writer.defaults.compression+compression_level', codecControl, [
+      candidate('snappy', { parquet_writer: { defaults: { compression: 'snappy', compression_level: null } } }),
+      candidate('lz4-raw', { parquet_writer: { defaults: { compression: 'lz4_raw', compression_level: null } } }),
+    ], 'codec'),
+    compareWithControl('codec-gzip-brotli', 'parquet_writer.defaults.compression+compression_level', codecControl, [
+      candidate('gzip', { parquet_writer: { defaults: { compression: 'gzip', compression_level: null } } }),
+      candidate('brotli', { parquet_writer: { defaults: { compression: 'brotli', compression_level: null } } }),
+    ], 'codec'),
   ], refinement: {
     comparison: 'codec',
     factor: 'parquet_writer.defaults.compression_level',
@@ -84,14 +101,17 @@ const cohorts: Cohort[] = [
   ])] },
   { id: 'C5', comparisons: [
     compare('workers', 'tunables.client.workers', [8, 16, 32, 64].map(value => candidate('workers-' + value, {
-      client: { workers: value, streams_per_worker: 1, connections_per_worker: 1 },
+      client: { workers: value },
     }))),
     compare('streams', 'tunables.client.streams_per_worker', [1, 2, 4].map(value => candidate('streams-' + value, {
-      client: { workers: 16, streams_per_worker: value, connections_per_worker: 1 },
+      client: { streams_per_worker: value },
     }))),
     compare('connections', 'tunables.client.connections_per_worker', [1, 2, 4].map(value => candidate('connections-' + value, {
-      client: { workers: 16, streams_per_worker: 1, connections_per_worker: value },
+      client: { connections_per_worker: value },
     }))),
+    compareWithControl('data-mode', 'tunables.client.data_mode',
+      candidate('data-mode-shared', { client: { data_mode: 'shared' } }),
+      [candidate('data-mode-independent', { client: { data_mode: 'independent' } })], 'data-mode'),
     compare('corpus', 'tunables.client.corpus_rows', [16384, 65536, 262144].map(value => candidate('corpus-' + value, { client: { corpus_rows: value } }))),
     compare('interval', 'tunables.client.interval_us', [0, 1000, 10000].map(value => candidate('interval-' + value, { client: { interval_us: value } }))),
     compare('ipc-compression', 'tunables.transport.ipc_compression', ['none', 'lz4_frame', 'zstd'].map(value => candidate('ipc-' + value, { transport: { ipc_compression: value } }))),
@@ -149,6 +169,45 @@ function isRecord(value: unknown): value is JsonObject {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
+function validateComparisons(comparisons: unknown, cohort: string): asserts comparisons is Comparison[] {
+  if (!Array.isArray(comparisons)) throw new Error(cohort + ' comparisons must be an array');
+  const controlFamilies = new Map<string, { id: string; overrides: string }>();
+  for (const comparison of comparisons) {
+    if (!isRecord(comparison) || typeof comparison.id !== 'string' || typeof comparison.factor !== 'string' ||
+        !Array.isArray(comparison.candidates)) throw new Error(cohort + ' contains an invalid comparison');
+    if (comparison.candidate_limit !== maxCandidatesPerComparison || comparison.candidates.length > maxCandidatesPerComparison) {
+      throw new Error(cohort + '/' + comparison.id + ' must enforce the ' + maxCandidatesPerComparison + '-candidate limit');
+    }
+    const candidateIds = new Set<string>();
+    for (const item of comparison.candidates) {
+      if (!isRecord(item) || typeof item.id !== 'string' || !isRecord(item.overrides) || candidateIds.has(item.id)) {
+        throw new Error(cohort + '/' + comparison.id + ' contains an invalid or duplicate candidate');
+      }
+      candidateIds.add(item.id);
+    }
+    if (comparison.matched_control !== undefined) {
+      if (typeof comparison.matched_control !== 'string') throw new Error(cohort + '/' + comparison.id + ' has an invalid matched control');
+      const control = comparison.candidates.find(item => isRecord(item) && item.id === comparison.matched_control);
+      if (!isRecord(control) || typeof control.id !== 'string' || !isRecord(control.overrides)) {
+        throw new Error(cohort + '/' + comparison.id + ' is missing its declared matched control');
+      }
+      if (comparison.comparison_family !== undefined) {
+        if (typeof comparison.comparison_family !== 'string' || comparison.comparison_family.length === 0) {
+          throw new Error(cohort + '/' + comparison.id + ' has an invalid comparison family');
+        }
+        const signature = JSON.stringify(control.overrides);
+        const prior = controlFamilies.get(comparison.comparison_family);
+        if (prior && (prior.id !== control.id || prior.overrides !== signature)) {
+          throw new Error(cohort + '/' + comparison.id + ' does not use the same matched control as its family');
+        }
+        controlFamilies.set(comparison.comparison_family, { id: control.id, overrides: signature });
+      }
+    } else if (comparison.comparison_family !== undefined) {
+      throw new Error(cohort + '/' + comparison.id + ' declares a family without a matched control');
+    }
+  }
+}
+
 export function buildThroughputManifests(registry: unknown): JsonObject[] {
   if (!isRecord(registry) || !isRecord(registry.tunables)) throw new Error('registry must contain the PR125 tunables object');
   const tunables = registry.tunables;
@@ -160,9 +219,7 @@ export function buildThroughputManifests(registry: unknown): JsonObject[] {
     const upload = isRecord(collector.upload) ? collector.upload : {};
     const batching = isRecord(collector.batching) ? collector.batching : {};
     const maintenanceSeed = isRecord(tunables.maintenance) ? tunables.maintenance : {};
-    for (const comparison of cohort.comparisons) {
-      if (comparison.candidates.length > comparison.candidate_limit) throw new Error(cohort.id + '/' + comparison.id + ' exceeds its candidate limit');
-    }
+    validateComparisons(cohort.comparisons, cohort.id);
     return {
       schema_version: 1,
       cohort: cohort.id,
@@ -231,10 +288,11 @@ export function buildThroughputManifests(registry: unknown): JsonObject[] {
           accepted: ['hydrate', 'resend'],
           configured: [],
           baseline_requested: transport.dictionary_handling ?? null,
-          effective_default: 'hydrate (Tunables capability table)',
+          effective_default: 'hydrate (bin/collector-chain/src/dmv_client.rs::Options)',
+          consumer: 'ARROWCOL_CLIENT_DICTIONARY_HANDLING -> bin/collector-chain/src/dmv_client.rs::Options.dictionary_handling',
           excluded: { resend: 'Pinned Tunables validation rejects resend for the frozen plain DMV schema.' },
           pending: [],
-          status: 'source-screened-no-runtime-projection',
+          status: 'single-runtime-compatible-value-no-contrast',
         },
       } } : {}),
       ...(cohort.id === 'C3' ? { source_enum_coverage: {
@@ -252,14 +310,13 @@ export function buildThroughputManifests(registry: unknown): JsonObject[] {
         data_mode: {
           path: 'tunables.client.data_mode',
           accepted: ['shared', 'independent'],
-          configured: [],
+          configured: ['shared', 'independent'],
           baseline_requested: client.data_mode ?? null,
-          excluded: {
-            shared: 'Typed field has no environment projection or load-generator consumer in the pinned source.',
-            independent: 'Typed field has no environment projection or load-generator consumer in the pinned source.',
-          },
+          effective_default: 'shared (bin/collector-chain/src/dmv_client.rs::Options)',
+          consumer: 'ARROWCOL_CLIENT_DATA_MODE -> bin/collector-chain/src/dmv_client.rs::Options.data_mode; shared uses one corpus copy and independent uses workers copies under max_memory_bytes',
+          excluded: {},
           pending: [],
-          status: 'typed-no-runtime-consumer',
+          status: 'config-screened-not-runtime-qualified',
         },
         ipc_compression: {
           path: 'tunables.transport.ipc_compression',
@@ -270,21 +327,35 @@ export function buildThroughputManifests(registry: unknown): JsonObject[] {
           pending: [],
           status: 'config-screened-not-runtime-qualified',
         },
-        grpc_compression: {
-          path: 'tunables.transport.grpc_send_compression and grpc_accept_compression',
+        grpc_send_compression: {
+          path: 'tunables.transport.grpc_send_compression',
           accepted: ['none', 'gzip', 'zstd'],
           configured: [],
-          baseline_requested: {
-            send: transport.grpc_send_compression ?? null,
-            accept: transport.grpc_accept_compression ?? null,
-          },
+          baseline_requested: transport.grpc_send_compression ?? null,
+          effective_default: 'none (bin/collector-chain/src/dmv_client.rs::Options)',
+          client_build_supported: ['none', 'gzip', 'zstd'],
+          consumer: 'ARROWCOL_CLIENT_GRPC_SEND_COMPRESSION -> bin/collector-chain/src/dmv_client.rs::send_compressed',
           excluded: {
-            none: 'Pinned capability table marks gRPC compression disabled; fields have no runtime projection/consumer.',
-            gzip: 'Pinned capability table marks gRPC compression disabled; fields have no runtime projection/consumer.',
-            zstd: 'Pinned capability table marks gRPC compression disabled; fields have no runtime projection/consumer.',
+            gzip: 'The production Arrow Flight receiver in crates/arrowcol-flight/src/service.rs::into_tonic_service does not enable accept_compressed; gzip is enabled only by a test server in dmv_client.rs.',
+            zstd: 'The production Arrow Flight receiver in crates/arrowcol-flight/src/service.rs::into_tonic_service does not enable accept_compressed; client build support alone does not establish receiver compatibility.',
           },
           pending: [],
-          status: 'typed-no-runtime-consumer',
+          status: 'client-supported-but-production-receiver-incompatible',
+        },
+        grpc_accept_compression: {
+          path: 'tunables.transport.grpc_accept_compression',
+          accepted: ['none', 'gzip', 'zstd'],
+          configured: [],
+          baseline_requested: transport.grpc_accept_compression ?? null,
+          effective_default: 'none (bin/collector-chain/src/dmv_client.rs::Options)',
+          client_build_supported: ['none', 'gzip', 'zstd'],
+          consumer: 'ARROWCOL_CLIENT_GRPC_ACCEPT_COMPRESSION -> bin/collector-chain/src/dmv_client.rs::accept_compressed',
+          excluded: {
+            gzip: 'The production Arrow Flight receiver in crates/arrowcol-flight/src/service.rs::into_tonic_service does not enable send_compressed, so no compressed server response can exercise this setting.',
+            zstd: 'The production Arrow Flight receiver in crates/arrowcol-flight/src/service.rs::into_tonic_service does not enable send_compressed, so no compressed server response can exercise this setting.',
+          },
+          pending: [],
+          status: 'no-production-receiver-response-compression',
         },
       } } : {}),
       ...(cohort.id === 'C6' ? { source_enum_coverage: {
@@ -373,6 +444,7 @@ export function renderThroughputBaseline(base: unknown, manifest: unknown): Json
       !isRecord(manifest.baseline_overrides) || !Array.isArray(manifest.comparisons)) {
     throw new Error('invalid base config or throughput manifest');
   }
+  validateComparisons(manifest.comparisons, String(manifest.cohort ?? 'unknown'));
   if (!isRecord(base.tunables) ||
       createHash('sha256').update(JSON.stringify(base.tunables)).digest('hex') !== manifest.registry_sha256) {
     throw new Error('base tunables do not match manifest seed');

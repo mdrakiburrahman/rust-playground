@@ -143,9 +143,7 @@
           "overrides": {
             "tunables": {
               "client": {
-                "workers": 8,
-                "streams_per_worker": 1,
-                "connections_per_worker": 1
+                "workers": 8
               }
             }
           }
@@ -155,9 +153,7 @@
           "overrides": {
             "tunables": {
               "client": {
-                "workers": 16,
-                "streams_per_worker": 1,
-                "connections_per_worker": 1
+                "workers": 16
               }
             }
           }
@@ -167,9 +163,7 @@
           "overrides": {
             "tunables": {
               "client": {
-                "workers": 32,
-                "streams_per_worker": 1,
-                "connections_per_worker": 1
+                "workers": 32
               }
             }
           }
@@ -179,9 +173,7 @@
           "overrides": {
             "tunables": {
               "client": {
-                "workers": 64,
-                "streams_per_worker": 1,
-                "connections_per_worker": 1
+                "workers": 64
               }
             }
           }
@@ -198,9 +190,7 @@
           "overrides": {
             "tunables": {
               "client": {
-                "workers": 16,
-                "streams_per_worker": 1,
-                "connections_per_worker": 1
+                "streams_per_worker": 1
               }
             }
           }
@@ -210,9 +200,7 @@
           "overrides": {
             "tunables": {
               "client": {
-                "workers": 16,
-                "streams_per_worker": 2,
-                "connections_per_worker": 1
+                "streams_per_worker": 2
               }
             }
           }
@@ -222,9 +210,7 @@
           "overrides": {
             "tunables": {
               "client": {
-                "workers": 16,
-                "streams_per_worker": 4,
-                "connections_per_worker": 1
+                "streams_per_worker": 4
               }
             }
           }
@@ -241,8 +227,6 @@
           "overrides": {
             "tunables": {
               "client": {
-                "workers": 16,
-                "streams_per_worker": 1,
                 "connections_per_worker": 1
               }
             }
@@ -253,8 +237,6 @@
           "overrides": {
             "tunables": {
               "client": {
-                "workers": 16,
-                "streams_per_worker": 1,
                 "connections_per_worker": 2
               }
             }
@@ -265,8 +247,6 @@
           "overrides": {
             "tunables": {
               "client": {
-                "workers": 16,
-                "streams_per_worker": 1,
                 "connections_per_worker": 4
               }
             }
@@ -274,6 +254,35 @@
         }
       ],
       "candidate_limit": 4
+    },
+    {
+      "id": "data-mode",
+      "factor": "tunables.client.data_mode",
+      "candidates": [
+        {
+          "id": "data-mode-shared",
+          "overrides": {
+            "tunables": {
+              "client": {
+                "data_mode": "shared"
+              }
+            }
+          }
+        },
+        {
+          "id": "data-mode-independent",
+          "overrides": {
+            "tunables": {
+              "client": {
+                "data_mode": "independent"
+              }
+            }
+          }
+        }
+      ],
+      "candidate_limit": 4,
+      "matched_control": "data-mode-shared",
+      "comparison_family": "data-mode"
     },
     {
       "id": "corpus",
@@ -394,14 +403,16 @@
         "shared",
         "independent"
       ],
-      "configured": [],
+      "configured": [
+        "shared",
+        "independent"
+      ],
       "baseline_requested": null,
-      "excluded": {
-        "shared": "Typed field has no environment projection or load-generator consumer in the pinned source.",
-        "independent": "Typed field has no environment projection or load-generator consumer in the pinned source."
-      },
+      "effective_default": "shared (bin/collector-chain/src/dmv_client.rs::Options)",
+      "consumer": "ARROWCOL_CLIENT_DATA_MODE -> bin/collector-chain/src/dmv_client.rs::Options.data_mode; shared uses one corpus copy and independent uses workers copies under max_memory_bytes",
+      "excluded": {},
       "pending": [],
-      "status": "typed-no-runtime-consumer"
+      "status": "config-screened-not-runtime-qualified"
     },
     "ipc_compression": {
       "path": "tunables.transport.ipc_compression",
@@ -420,177 +431,56 @@
       "pending": [],
       "status": "config-screened-not-runtime-qualified"
     },
-    "grpc_compression": {
-      "path": "tunables.transport.grpc_send_compression and grpc_accept_compression",
+    "grpc_send_compression": {
+      "path": "tunables.transport.grpc_send_compression",
       "accepted": [
         "none",
         "gzip",
         "zstd"
       ],
       "configured": [],
-      "baseline_requested": {
-        "send": "none",
-        "accept": null
-      },
+      "baseline_requested": "none",
+      "effective_default": "none (bin/collector-chain/src/dmv_client.rs::Options)",
+      "client_build_supported": [
+        "none",
+        "gzip",
+        "zstd"
+      ],
+      "consumer": "ARROWCOL_CLIENT_GRPC_SEND_COMPRESSION -> bin/collector-chain/src/dmv_client.rs::send_compressed",
       "excluded": {
-        "none": "Pinned capability table marks gRPC compression disabled; fields have no runtime projection/consumer.",
-        "gzip": "Pinned capability table marks gRPC compression disabled; fields have no runtime projection/consumer.",
-        "zstd": "Pinned capability table marks gRPC compression disabled; fields have no runtime projection/consumer."
+        "gzip": "The production Arrow Flight receiver in crates/arrowcol-flight/src/service.rs::into_tonic_service does not enable accept_compressed; gzip is enabled only by a test server in dmv_client.rs.",
+        "zstd": "The production Arrow Flight receiver in crates/arrowcol-flight/src/service.rs::into_tonic_service does not enable accept_compressed; client build support alone does not establish receiver compatibility."
       },
       "pending": [],
-      "status": "typed-no-runtime-consumer"
+      "status": "client-supported-but-production-receiver-incompatible"
+    },
+    "grpc_accept_compression": {
+      "path": "tunables.transport.grpc_accept_compression",
+      "accepted": [
+        "none",
+        "gzip",
+        "zstd"
+      ],
+      "configured": [],
+      "baseline_requested": null,
+      "effective_default": "none (bin/collector-chain/src/dmv_client.rs::Options)",
+      "client_build_supported": [
+        "none",
+        "gzip",
+        "zstd"
+      ],
+      "consumer": "ARROWCOL_CLIENT_GRPC_ACCEPT_COMPRESSION -> bin/collector-chain/src/dmv_client.rs::accept_compressed",
+      "excluded": {
+        "gzip": "The production Arrow Flight receiver in crates/arrowcol-flight/src/service.rs::into_tonic_service does not enable send_compressed, so no compressed server response can exercise this setting.",
+        "zstd": "The production Arrow Flight receiver in crates/arrowcol-flight/src/service.rs::into_tonic_service does not enable send_compressed, so no compressed server response can exercise this setting."
+      },
+      "pending": [],
+      "status": "no-production-receiver-response-compression"
     }
   },
   "runnable": false,
   "config_validation": {
-    "status": "config-validated",
-    "validator": "arrowcol-oat-rust --validate-config",
-    "validator_source_commit": "5687e6459c424362f4504d21c32f954aa3b07d05",
-    "validator_binary_sha256": "9c5bc506371ba533ade8bc3477be17ade82cda2a3139988d23cf3219f0706901",
-    "baseline_count": 1,
-    "candidate_count": 19,
-    "pass_count": 20,
-    "fail_count": 0,
-    "configs": [
-      {
-        "kind": "baseline",
-        "path": "out/arrowcol-oat/sweep-configs/C5/baseline.json",
-        "sha256": "736db4ab230cd11d61d5500251efd28fa1886aaee50fc25d1636d62668f75e58"
-      },
-      {
-        "kind": "candidate",
-        "comparison": "workers",
-        "candidate": "workers-8",
-        "path": "out/arrowcol-oat/sweep-configs/C5/workers/workers-8.json",
-        "sha256": "fb7b45eb7a8aa07be1f793f546a2ccee9857030adb06ceb12c7742beedc21525"
-      },
-      {
-        "kind": "candidate",
-        "comparison": "workers",
-        "candidate": "workers-16",
-        "path": "out/arrowcol-oat/sweep-configs/C5/workers/workers-16.json",
-        "sha256": "e4917f90491f830ed9cb5829d05c30d158052cb39231870a124fae6a2ed0a799"
-      },
-      {
-        "kind": "candidate",
-        "comparison": "workers",
-        "candidate": "workers-32",
-        "path": "out/arrowcol-oat/sweep-configs/C5/workers/workers-32.json",
-        "sha256": "95aa62515969af079672f2fa6767b0fa431245d11d023809482feb0321da0252"
-      },
-      {
-        "kind": "candidate",
-        "comparison": "workers",
-        "candidate": "workers-64",
-        "path": "out/arrowcol-oat/sweep-configs/C5/workers/workers-64.json",
-        "sha256": "f6b307016ccc1ba86823e9f9f0ba98048ff800a02d82d737c8f2841346d5d6ee"
-      },
-      {
-        "kind": "candidate",
-        "comparison": "streams",
-        "candidate": "streams-1",
-        "path": "out/arrowcol-oat/sweep-configs/C5/streams/streams-1.json",
-        "sha256": "e4917f90491f830ed9cb5829d05c30d158052cb39231870a124fae6a2ed0a799"
-      },
-      {
-        "kind": "candidate",
-        "comparison": "streams",
-        "candidate": "streams-2",
-        "path": "out/arrowcol-oat/sweep-configs/C5/streams/streams-2.json",
-        "sha256": "22c62ea335f9c8c725b0bb40ea136d72a28eb6a98d35fc6a93590a083362ffb9"
-      },
-      {
-        "kind": "candidate",
-        "comparison": "streams",
-        "candidate": "streams-4",
-        "path": "out/arrowcol-oat/sweep-configs/C5/streams/streams-4.json",
-        "sha256": "e4c624bf86ae6ae4424fa6cc5e62a98d5171e3a953af04b3ae646ee779c6a4bc"
-      },
-      {
-        "kind": "candidate",
-        "comparison": "connections",
-        "candidate": "connections-1",
-        "path": "out/arrowcol-oat/sweep-configs/C5/connections/connections-1.json",
-        "sha256": "e4917f90491f830ed9cb5829d05c30d158052cb39231870a124fae6a2ed0a799"
-      },
-      {
-        "kind": "candidate",
-        "comparison": "connections",
-        "candidate": "connections-2",
-        "path": "out/arrowcol-oat/sweep-configs/C5/connections/connections-2.json",
-        "sha256": "0cbf25e7cb2073172c307626106fd200ffd20690bb874394e3aaedb0f63b7040"
-      },
-      {
-        "kind": "candidate",
-        "comparison": "connections",
-        "candidate": "connections-4",
-        "path": "out/arrowcol-oat/sweep-configs/C5/connections/connections-4.json",
-        "sha256": "5a476ea9b4926813a42d027d9c010e523fcd8cef885f25bfac262d06770f6210"
-      },
-      {
-        "kind": "candidate",
-        "comparison": "corpus",
-        "candidate": "corpus-16384",
-        "path": "out/arrowcol-oat/sweep-configs/C5/corpus/corpus-16384.json",
-        "sha256": "89f745df8853e36d94f38b4de10bb2d337377e473a130b6e9f3ea6cc4f8d0b2c"
-      },
-      {
-        "kind": "candidate",
-        "comparison": "corpus",
-        "candidate": "corpus-65536",
-        "path": "out/arrowcol-oat/sweep-configs/C5/corpus/corpus-65536.json",
-        "sha256": "736db4ab230cd11d61d5500251efd28fa1886aaee50fc25d1636d62668f75e58"
-      },
-      {
-        "kind": "candidate",
-        "comparison": "corpus",
-        "candidate": "corpus-262144",
-        "path": "out/arrowcol-oat/sweep-configs/C5/corpus/corpus-262144.json",
-        "sha256": "402e105542b40d95fe3901d21d5a3a0c5d041524ff3d1efc7e962591c8fa4ac6"
-      },
-      {
-        "kind": "candidate",
-        "comparison": "interval",
-        "candidate": "interval-0",
-        "path": "out/arrowcol-oat/sweep-configs/C5/interval/interval-0.json",
-        "sha256": "f420835d53af5f6cb397971bdb966994fe11527087e53dd16a9711d61724a9b3"
-      },
-      {
-        "kind": "candidate",
-        "comparison": "interval",
-        "candidate": "interval-1000",
-        "path": "out/arrowcol-oat/sweep-configs/C5/interval/interval-1000.json",
-        "sha256": "7cacc2222407fb0e0b1de98de718c5fd51d40a38e1d15c963f5f9dc2e55cb3ad"
-      },
-      {
-        "kind": "candidate",
-        "comparison": "interval",
-        "candidate": "interval-10000",
-        "path": "out/arrowcol-oat/sweep-configs/C5/interval/interval-10000.json",
-        "sha256": "7a1db5df7ed1ffa037aa2315d1e52cfcfcb1c7668283bc7999076f130f9d0a02"
-      },
-      {
-        "kind": "candidate",
-        "comparison": "ipc-compression",
-        "candidate": "ipc-none",
-        "path": "out/arrowcol-oat/sweep-configs/C5/ipc-compression/ipc-none.json",
-        "sha256": "8e249274bef3ccefef86485030bdcccea839db6cf383b242de189777fe2cfce6"
-      },
-      {
-        "kind": "candidate",
-        "comparison": "ipc-compression",
-        "candidate": "ipc-lz4_frame",
-        "path": "out/arrowcol-oat/sweep-configs/C5/ipc-compression/ipc-lz4_frame.json",
-        "sha256": "7bfe3daa6c1a780b90f7a24b4f904ea39a4836a2a546f38cc6d208de9a2cd512"
-      },
-      {
-        "kind": "candidate",
-        "comparison": "ipc-compression",
-        "candidate": "ipc-zstd",
-        "path": "out/arrowcol-oat/sweep-configs/C5/ipc-compression/ipc-zstd.json",
-        "sha256": "736db4ab230cd11d61d5500251efd28fa1886aaee50fc25d1636d62668f75e58"
-      }
-    ]
+    "status": "not-validated"
   },
   "runtime_qualification": "unqualified"
 }

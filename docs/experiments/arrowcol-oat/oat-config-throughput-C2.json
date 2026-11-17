@@ -284,80 +284,18 @@
       ],
       "configured": [],
       "baseline_requested": null,
-      "effective_default": "hydrate (Tunables capability table)",
+      "effective_default": "hydrate (bin/collector-chain/src/dmv_client.rs::Options)",
+      "consumer": "ARROWCOL_CLIENT_DICTIONARY_HANDLING -> bin/collector-chain/src/dmv_client.rs::Options.dictionary_handling",
       "excluded": {
         "resend": "Pinned Tunables validation rejects resend for the frozen plain DMV schema."
       },
       "pending": [],
-      "status": "source-screened-no-runtime-projection"
+      "status": "single-runtime-compatible-value-no-contrast"
     }
   },
   "runnable": false,
   "config_validation": {
-    "status": "config-validated",
-    "validator": "arrowcol-oat-rust --validate-config",
-    "validator_source_commit": "5687e6459c424362f4504d21c32f954aa3b07d05",
-    "validator_binary_sha256": "9c5bc506371ba533ade8bc3477be17ade82cda2a3139988d23cf3219f0706901",
-    "baseline_count": 1,
-    "candidate_count": 7,
-    "pass_count": 8,
-    "fail_count": 0,
-    "configs": [
-      {
-        "kind": "baseline",
-        "path": "out/arrowcol-oat/sweep-configs/C2/baseline.json",
-        "sha256": "736db4ab230cd11d61d5500251efd28fa1886aaee50fc25d1636d62668f75e58"
-      },
-      {
-        "kind": "candidate",
-        "comparison": "dictionary-encoding",
-        "candidate": "availability-group-name-dictionary-off",
-        "path": "out/arrowcol-oat/sweep-configs/C2/dictionary-encoding/availability-group-name-dictionary-off.json",
-        "sha256": "f295e1e1c146a24e73d4bc2b3adfbd7388020d23cc3500e3504f108ff48fc128"
-      },
-      {
-        "kind": "candidate",
-        "comparison": "dictionary-encoding",
-        "candidate": "availability-group-name-dictionary-on",
-        "path": "out/arrowcol-oat/sweep-configs/C2/dictionary-encoding/availability-group-name-dictionary-on.json",
-        "sha256": "28903d2099bc892ffa498befc1861e24e6a73071f256bd78cd1c247bad5017a8"
-      },
-      {
-        "kind": "candidate",
-        "comparison": "dictionary-encoding",
-        "candidate": "last-connect-error-delta-binary-packed",
-        "path": "out/arrowcol-oat/sweep-configs/C2/dictionary-encoding/last-connect-error-delta-binary-packed.json",
-        "sha256": "25de1e5b33c318725d3fcb7ba84e1b2f330e39f513d1382171864caf3aa6ffa8"
-      },
-      {
-        "kind": "candidate",
-        "comparison": "dictionary-encoding",
-        "candidate": "last-connect-error-byte-stream-split",
-        "path": "out/arrowcol-oat/sweep-configs/C2/dictionary-encoding/last-connect-error-byte-stream-split.json",
-        "sha256": "d4e309edfb77ae2f92a30a3bbfc83b7f680d37b95f28afa3622bc8dbe238a476"
-      },
-      {
-        "kind": "candidate",
-        "comparison": "string-encoding",
-        "candidate": "plain",
-        "path": "out/arrowcol-oat/sweep-configs/C2/string-encoding/plain.json",
-        "sha256": "47d41924f1fa737073bc9e5dd96acfaf24ef5f668f69f784c692ead9ba4a266e"
-      },
-      {
-        "kind": "candidate",
-        "comparison": "string-encoding",
-        "candidate": "delta-length-byte-array",
-        "path": "out/arrowcol-oat/sweep-configs/C2/string-encoding/delta-length-byte-array.json",
-        "sha256": "4e2524b92b21af0a4fc35d96a495d7db388ce32da53cddde44e29b89b6328758"
-      },
-      {
-        "kind": "candidate",
-        "comparison": "string-encoding",
-        "candidate": "delta-byte-array",
-        "path": "out/arrowcol-oat/sweep-configs/C2/string-encoding/delta-byte-array.json",
-        "sha256": "4dffb2cf0ff6d7c23eccbb0ae2badd234f558ebcb770d674328a191283a41246"
-      }
-    ]
+    "status": "not-validated"
   },
   "runtime_qualification": "unqualified"
 }
