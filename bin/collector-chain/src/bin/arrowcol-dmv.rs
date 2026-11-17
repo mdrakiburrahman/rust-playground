@@ -88,7 +88,7 @@ async fn run(args: Args) -> Result<()> {
     println!("OAT_CLIENT_METRICS {}", client.metrics("prepared")?);
     let result = run_prepared(&args, &client).await;
     if result.is_err() {
-        eprintln!("OAT_CLIENT_METRICS {}", client.metrics("failed")?);
+        eprintln!("OAT_CLIENT_METRICS {}", client.failed_terminal_metrics()?);
     }
     result
 }
@@ -151,8 +151,7 @@ async fn run_prepared(args: &Args, client: &std::sync::Arc<dmv::client::Prepared
         preflight_table_count
     };
     let (best_effort_streams, durable_streams) = client.admission_counts();
-    let terminal_metrics = client.metrics("completed")?;
-    client.ensure_terminal_manifest_complete()?;
+    let terminal_metrics = client.completed_terminal_metrics()?;
     println!(
         "OAT_COLLECTOR_COMPLETION {}",
         serde_json::json!({

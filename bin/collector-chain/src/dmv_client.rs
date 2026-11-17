@@ -864,6 +864,7 @@ pub struct PreparedClient {
     incarnation_id: uuid::Uuid,
     logical_batches: Mutex<Vec<LogicalBatchRecord>>,
     manifest_capacity_reached: AtomicBool,
+    terminal_failure_reason: Mutex<Option<&'static str>>,
     pub table_count: usize,
     preparation: serde_json::Value,
     started: Instant,
@@ -1051,6 +1052,7 @@ impl PreparedClient {
             incarnation_id: uuid::Uuid::new_v4(),
             logical_batches: Mutex::new(Vec::new()),
             manifest_capacity_reached: AtomicBool::new(false),
+            terminal_failure_reason: Mutex::new(None),
             table_count,
             preparation,
             started: Instant::now(),
@@ -1159,6 +1161,21 @@ impl PreparedClient {
             record.last_outcome_unix_ms = observed_unix_ms;
         }
         Ok(())
+    }
+
+    fn remember_first_terminal_failure(&self, reason: &'static str) -> Result<&'static str> {
+        let mut first = self
+            .terminal_failure_reason
+            .lock()
+            .map_err(|_| anyhow::anyhow!("terminal failure reason state poisoned"))?;
+        Ok(*first.get_or_insert(reason))
+    }
+
+    fn first_terminal_failure(&self) -> Result<Option<&'static str>> {
+        self.terminal_failure_reason
+            .lock()
+            .map(|first| *first)
+            .map_err(|_| anyhow::anyhow!("terminal failure reason state poisoned"))
     }
 
     fn logical_manifest(&self, phase: &str) -> Result<serde_json::Value> {
@@ -1278,11 +1295,13 @@ impl PreparedClient {
             })
         };
         if self.manifest_capacity_reached.load(Ordering::Relaxed) {
-            manifest["terminal_failure"] = serde_json::json!("record_capacity_reached");
+            let reason = self.remember_first_terminal_failure("record_capacity_reached")?;
+            manifest["terminal_failure"] = serde_json::json!(reason);
         }
         let serialized_bytes = serde_json::to_vec(&manifest)?.len();
         if serialized_bytes > MAX_LOGICAL_MANIFEST_BYTES {
             self.manifest_capacity_reached.store(true, Ordering::Relaxed);
+            let reason = self.remember_first_terminal_failure("serialized_manifest_exceeds_limit")?;
             return Ok(serde_json::json!({
                 "schema": "arrowcol.logical_batch_manifest.v1",
                 "version": 1,
@@ -1290,7 +1309,7 @@ impl PreparedClient {
                 "eligible_for_identity_reconciliation": false,
                 "complete": false,
                 "truncated": true,
-                "terminal_failure": "serialized_manifest_exceeds_limit",
+                "terminal_failure": reason,
                 "serialized_bytes": serialized_bytes,
                 "serialized_byte_cap": MAX_LOGICAL_MANIFEST_BYTES,
                 "record_count": records.len(),
@@ -1304,6 +1323,26 @@ impl PreparedClient {
             }));
         }
         Ok(manifest)
+    }
+
+    /// Builds completed-phase metrics and rejects an incomplete terminal manifest.
+    ///
+    /// # Errors
+    ///
+    /// Propagates metrics serialization errors or an incomplete-manifest error.
+    pub fn completed_terminal_metrics(&self) -> Result<serde_json::Value> {
+        let metrics = self.metrics("completed")?;
+        self.ensure_terminal_manifest_complete()?;
+        Ok(metrics)
+    }
+
+    /// Builds failed-phase metrics while retaining any earlier terminal failure reason.
+    ///
+    /// # Errors
+    ///
+    /// Propagates metrics serialization errors.
+    pub fn failed_terminal_metrics(&self) -> Result<serde_json::Value> {
+        self.metrics("failed")
     }
 
     /// Rejects terminal success when the logical batch manifest is incomplete or over capacity.
@@ -1896,9 +1935,15 @@ impl PreparedClient {
             {
                 metrics["phase"] = serde_json::json!("failed");
             }
+            if let Some(reason) = self.first_terminal_failure()? {
+                metrics["terminal_failure"] = serde_json::json!(reason);
+            }
             let receipt_bytes = oat_client_metrics_line_bytes(&metrics)?;
             if receipt_bytes > MAX_OAT_CLIENT_METRICS_LINE_BYTES {
                 self.manifest_capacity_reached.store(true, Ordering::Relaxed);
+                let first_terminal_failure =
+                    self.remember_first_terminal_failure("serialized_terminal_receipt_exceeds_limit")?;
+                metrics["terminal_failure"] = serde_json::json!(first_terminal_failure);
                 metrics["phase"] = serde_json::json!("failed");
                 metrics["logical_batch_manifest"] = serde_json::json!({
                     "schema": "arrowcol.logical_batch_manifest.v1",
@@ -1907,7 +1952,7 @@ impl PreparedClient {
                     "eligible_for_identity_reconciliation": false,
                     "complete": false,
                     "truncated": true,
-                    "terminal_failure": "serialized_terminal_receipt_exceeds_limit",
+                    "terminal_failure": first_terminal_failure,
                     "serialized_bytes": receipt_bytes,
                     "serialized_byte_cap": MAX_OAT_CLIENT_METRICS_LINE_BYTES,
                 });
@@ -1917,7 +1962,7 @@ impl PreparedClient {
                         "version": 1,
                         "phase": "failed",
                         "scope": "process_cumulative",
-                        "terminal_failure": "serialized_terminal_receipt_exceeds_limit",
+                        "terminal_failure": first_terminal_failure,
                         "serialized_bytes": receipt_bytes_after_manifest,
                         "serialized_byte_cap": MAX_OAT_CLIENT_METRICS_LINE_BYTES,
                     });
@@ -2934,6 +2979,7 @@ mod tests {
             incarnation_id: uuid::Uuid::new_v4(),
             logical_batches: Mutex::new(Vec::new()),
             manifest_capacity_reached: AtomicBool::new(false),
+            terminal_failure_reason: Mutex::new(None),
             table_count: 0,
             preparation: serde_json::json!({}),
             started: Instant::now(),
@@ -3089,6 +3135,46 @@ mod tests {
         eprintln!(
             "W2_TERMINAL_NON_MANIFEST_OVERFLOW receipt_line_bytes={line_bytes} cap_bytes={MAX_OAT_CLIENT_METRICS_LINE_BYTES} failure={}",
             receipt["terminal_failure"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn first_terminal_overflow_reason_survives_completed_error_failed_path() -> Result<()> {
+        let mut client = manifest_test_client()?;
+        client.preparation = serde_json::json!({
+            "non_manifest_witness": "x".repeat(MAX_OAT_CLIENT_METRICS_LINE_BYTES)
+        });
+        let mut records = client
+            .logical_batches
+            .lock()
+            .map_err(|_| anyhow::anyhow!("logical batch manifest state poisoned"))?;
+        for index in 0..10_000_u64 {
+            records.push(LogicalBatchRecord {
+                table: "sqlserver_availability_replica_states".to_owned(),
+                worker: 0,
+                sequence: index * 2,
+                row_count: 100,
+                cohort: ManifestCohort::Measurement,
+                attempts: 1,
+                outcome: ManifestOutcome::Acknowledged,
+                first_send_unix_ns: Some(1_000_000_000 + index),
+                last_outcome_unix_ms: Some(1_000),
+            });
+        }
+        drop(records);
+
+        let completed = client.completed_terminal_metrics();
+        assert!(completed.is_err(), "oversized terminal manifest was accepted");
+        let failed = client.failed_terminal_metrics()?;
+        assert_eq!(failed["phase"], "failed");
+        assert_eq!(failed["terminal_failure"], "serialized_manifest_exceeds_limit");
+        assert_eq!(failed["serialized_byte_cap"], MAX_OAT_CLIENT_METRICS_LINE_BYTES);
+        let line_bytes = oat_client_metrics_line_bytes(&failed)?;
+        assert!(line_bytes <= MAX_OAT_CLIENT_METRICS_LINE_BYTES);
+        eprintln!(
+            "E1_FIRST_TERMINAL_FAILURE completed=error failed_reason={} receipt_line_bytes={line_bytes} cap_bytes={MAX_OAT_CLIENT_METRICS_LINE_BYTES}",
+            failed["terminal_failure"]
         );
         Ok(())
     }
@@ -3861,6 +3947,7 @@ mod tests {
             incarnation_id: uuid::Uuid::new_v4(),
             logical_batches: Mutex::new(Vec::new()),
             manifest_capacity_reached: AtomicBool::new(false),
+            terminal_failure_reason: Mutex::new(None),
             table_count: 1,
             preparation: serde_json::json!({}),
             started: Instant::now(),
@@ -4054,6 +4141,7 @@ mod tests {
             incarnation_id: uuid::Uuid::new_v4(),
             logical_batches: Mutex::new(Vec::new()),
             manifest_capacity_reached: AtomicBool::new(false),
+            terminal_failure_reason: Mutex::new(None),
             table_count: 1,
             preparation: serde_json::json!({}),
             started: Instant::now(),

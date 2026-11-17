@@ -81,9 +81,7 @@ const CAPABILITIES: &[Capability] = &[
     capability!("client.max_memory_bytes", "536870912"),
     capability!("client.interval_us", "0"),
     capability!("client.connections_per_worker", "1"),
-    capability!("client.shard_index_mode", "fixed"),
-    capability!("client.fixed_shard_index", "0"),
-    capability!("client.pod_ordinal", "0"),
+    capability!("client.pod_ordinal", "0 (per-client GUID salt; u32)"),
     capability!("client.streams_per_worker", "0 (legacy concurrency)"),
     capability!("client.max_rows", "component default"),
     capability!("client.stream_retry_max_attempts", "4"),
@@ -471,19 +469,6 @@ impl Tunables {
             }
             if client.string_width.is_some_and(|width| width > 65_536) {
                 bail!("client.string_width must be at most 65536");
-            }
-            if client.fixed_shard_index.is_some_and(|index| index >= 32) {
-                bail!("client.fixed_shard_index must be less than the maximum shard count of 32");
-            }
-            if client.shard_index_mode.unwrap_or_default() != ClientShardIndexMode::WorkerSpread
-                && client.pod_ordinal.is_some_and(|ordinal| ordinal != 0)
-            {
-                bail!("client.pod_ordinal is only used with client.shard_index_mode=worker_spread");
-            }
-            if client.shard_index_mode == Some(ClientShardIndexMode::WorkerSpread)
-                && client.fixed_shard_index.is_some_and(|index| index != 0)
-            {
-                bail!("client.fixed_shard_index is only used with client.shard_index_mode=fixed");
             }
             if client.corpus_rows.is_some_and(|rows| rows > 0) && client.corpus_bytes.is_some_and(|bytes| bytes > 0) {
                 bail!("client.corpus_rows and client.corpus_bytes are mutually exclusive");
@@ -3055,7 +3040,7 @@ mod tests {
     }
 
     #[test]
-    fn client_profile_and_shard_selector_are_strict_and_projected() -> Result<()> {
+    fn client_profile_and_pod_ordinal_are_strict_and_projected() -> Result<()> {
         assert_eq!(ClientDataProfile::default(), ClientDataProfile::Diagnostic);
         let defaults = Tunables::parse_oat_json(serde_json::json!({"client": {}}))?;
         assert!(
@@ -3072,7 +3057,7 @@ mod tests {
         );
 
         let config: Tunables = serde_json::from_str(
-            r#"{"client":{"data_profile":"realistic","string_length_distribution":"uniform","value_variation":"per_row","guid_uniqueness":"per_row","shard_index_mode":"worker_spread","pod_ordinal":3}}"#,
+            r#"{"client":{"data_profile":"realistic","string_length_distribution":"uniform","value_variation":"per_row","guid_uniqueness":"per_row","pod_ordinal":3}}"#,
         )?;
         config.validate_for_oat()?;
         let env = config.environment_for(ComponentRole::Client)?;
@@ -3081,7 +3066,6 @@ mod tests {
             ("ARROWCOL_CLIENT_STRING_LENGTH_DISTRIBUTION", "uniform"),
             ("ARROWCOL_CLIENT_VALUE_VARIATION", "per_row"),
             ("ARROWCOL_CLIENT_GUID_UNIQUENESS", "per_row"),
-            ("ARROWCOL_CLIENT_SHARD_INDEX_MODE", "worker_spread"),
             ("ARROWCOL_CLIENT_POD_ORDINAL", "3"),
         ] {
             assert_eq!(env[name], value);
@@ -3092,7 +3076,6 @@ mod tests {
             ("string_length_distribution", "zipf"),
             ("value_variation", "unique"),
             ("guid_uniqueness", "unique"),
-            ("shard_index_mode", "round_robin"),
         ] {
             let input = serde_json::json!({"client": {field: value}});
             assert!(
@@ -3101,30 +3084,31 @@ mod tests {
             );
         }
 
-        for client in [
-            ClientTunables {
-                fixed_shard_index: Some(32),
-                ..Default::default()
-            },
-            ClientTunables {
-                pod_ordinal: Some(3),
-                ..Default::default()
-            },
-            ClientTunables {
-                shard_index_mode: Some(ClientShardIndexMode::WorkerSpread),
-                fixed_shard_index: Some(1),
-                ..Default::default()
-            },
+        for (field, value) in [
+            ("shard_index_mode", serde_json::json!("fixed")),
+            ("fixed_shard_index", serde_json::json!(1)),
         ] {
+            let input = serde_json::json!({"client": {field: value}});
             assert!(
-                Tunables {
-                    client: Some(client),
-                    ..Default::default()
-                }
-                .validate()
-                .is_err()
+                serde_json::from_value::<Tunables>(input).is_err(),
+                "removed key {field} was accepted"
             );
         }
+
+        let max_ordinal = Tunables {
+            client: Some(ClientTunables {
+                pod_ordinal: Some(u32::MAX),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        max_ordinal.validate()?;
+        assert!(
+            serde_json::from_value::<Tunables>(serde_json::json!({
+                "client": {"pod_ordinal": 4_294_967_296_u64}
+            }))
+            .is_err()
+        );
         Ok(())
     }
 
