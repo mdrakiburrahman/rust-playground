@@ -549,6 +549,12 @@ struct LogicalBatch {
     _live_batch_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
+struct ContinuousAdmission<P, E, W> {
+    acquire_permit: P,
+    window_end: E,
+    window_open: W,
+}
+
 struct Counters {
     attempted_rows: AtomicU64,
     attempted_bytes: AtomicU64,
@@ -1368,6 +1374,62 @@ impl PreparedClient {
     }
 
     async fn prepare_logical_batch(&self, worker: usize, template: &EncodedBatch) -> Result<LogicalBatch> {
+        let live_batch_permit = if self.options.data_profile == DataProfile::Diagnostic {
+            None
+        } else {
+            Some(
+                Arc::clone(&self.live_batch_slots)
+                    .acquire_owned()
+                    .await
+                    .context("acquire realistic live-batch memory reservation")?,
+            )
+        };
+        self.prepare_logical_batch_with_permit(worker, template, live_batch_permit)
+            .await
+    }
+
+    async fn prepare_continuous_logical_batch<P, E, W>(
+        &self,
+        worker: usize,
+        template: &EncodedBatch,
+        admission: ContinuousAdmission<P, E, W>,
+    ) -> Result<Option<LogicalBatch>>
+    where
+        P: std::future::Future<Output = Result<tokio::sync::OwnedSemaphorePermit>>,
+        E: std::future::Future<Output = Result<()>>,
+        W: FnMut() -> Result<bool>,
+    {
+        let ContinuousAdmission {
+            acquire_permit,
+            window_end,
+            mut window_open,
+        } = admission;
+        if !window_open()? {
+            return Ok(None);
+        }
+        let live_batch_permit = if self.options.data_profile == DataProfile::Diagnostic {
+            None
+        } else {
+            let Some(permit) = acquire_owned_permit_before_end(acquire_permit, window_end).await? else {
+                return Ok(None);
+            };
+            if !window_open()? {
+                return Ok(None);
+            }
+            Some(permit)
+        };
+        Ok(Some(
+            self.prepare_logical_batch_with_permit(worker, template, live_batch_permit)
+                .await?,
+        ))
+    }
+
+    async fn prepare_logical_batch_with_permit(
+        &self,
+        worker: usize,
+        template: &EncodedBatch,
+        live_batch_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) -> Result<LogicalBatch> {
         if self.options.data_profile == DataProfile::Diagnostic {
             return Ok(LogicalBatch {
                 batch: template.clone(),
@@ -1375,10 +1437,7 @@ impl PreparedClient {
                 _live_batch_permit: None,
             });
         }
-        let live_batch_permit = Arc::clone(&self.live_batch_slots)
-            .acquire_owned()
-            .await
-            .context("acquire realistic live-batch memory reservation")?;
+        let live_batch_permit = live_batch_permit.context("realistic logical batch requires a memory reservation")?;
         let sequence = self.next_logical_batch_sequence(worker)?;
         let batch =
             batch_with_logical_identity(&template.template, self.run_id, self.incarnation_id, worker, sequence)?;
@@ -1757,7 +1816,50 @@ impl PreparedClient {
         batch: &EncodedBatch,
         measurement: &Measurement,
     ) -> Result<bool> {
-        let logical = self.prepare_logical_batch(worker, batch).await?;
+        let end_unix_ms = measurement.end_unix_ms;
+        let remaining_ms = end_unix_ms.saturating_sub(unix_ms()?);
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(remaining_ms);
+        let live_batch_slots = Arc::clone(&self.live_batch_slots);
+        let acquire_permit = async move {
+            live_batch_slots
+                .acquire_owned()
+                .await
+                .context("acquire realistic live-batch memory reservation")
+        };
+        let window_end = async move {
+            tokio::time::sleep_until(deadline).await;
+            Ok::<(), anyhow::Error>(())
+        };
+        self.send_continuous_one_with_admission(
+            worker,
+            channel,
+            batch,
+            measurement,
+            ContinuousAdmission {
+                acquire_permit,
+                window_end,
+                window_open: || Ok::<bool, anyhow::Error>(unix_ms()? < end_unix_ms),
+            },
+        )
+        .await
+    }
+
+    async fn send_continuous_one_with_admission<P, E, W>(
+        &self,
+        worker: usize,
+        channel: Channel,
+        batch: &EncodedBatch,
+        measurement: &Measurement,
+        admission: ContinuousAdmission<P, E, W>,
+    ) -> Result<bool>
+    where
+        P: std::future::Future<Output = Result<tokio::sync::OwnedSemaphorePermit>>,
+        E: std::future::Future<Output = Result<()>>,
+        W: FnMut() -> Result<bool>,
+    {
+        let Some(logical) = self.prepare_continuous_logical_batch(worker, batch, admission).await? else {
+            return Ok(false);
+        };
         for attempt in 1..=self.options.stream_retry_max_attempts {
             match self
                 .send_encoded_one(worker, channel.clone(), &logical, Some(measurement))
@@ -1948,6 +2050,23 @@ where
         }
     }
     Ok(())
+}
+
+async fn acquire_owned_permit_before_end<P, E>(
+    acquire_permit: P,
+    window_end: E,
+) -> Result<Option<tokio::sync::OwnedSemaphorePermit>>
+where
+    P: std::future::Future<Output = Result<tokio::sync::OwnedSemaphorePermit>>,
+    E: std::future::Future<Output = Result<()>>,
+{
+    tokio::select! {
+        permit = acquire_permit => Ok(Some(permit?)),
+        result = window_end => {
+            result?;
+            Ok(None)
+        }
+    }
 }
 
 fn estimated_row_bytes(table: &DmvTable, client_id: &str, options: &Options) -> u64 {
@@ -3421,6 +3540,313 @@ mod tests {
         let logical = client.prepare_logical_batch(0, &template).await?;
         assert_eq!(client.live_batch_slots.available_permits(), 0);
         drop(logical);
+        assert_eq!(client.live_batch_slots.available_permits(), 1);
+        Ok(())
+    }
+
+    async fn realistic_test_batch(client: &PreparedClient) -> Result<EncodedBatch> {
+        let table = Arc::new(table_named("sqlserver_availability_replica_states")?);
+        let template = synthetic_batch(&table, "client", 8, 0, 0, &client.options)?;
+        let (data, raw_arrow_bytes, encoded_bytes) =
+            encode_with_sizes(&table, "v1", template.clone(), &client.options).await?;
+        Ok(EncodedBatch {
+            table,
+            version: "v1".to_owned(),
+            template,
+            data: Arc::new(data),
+            rows: 8,
+            raw_arrow_bytes,
+            encoded_bytes,
+        })
+    }
+
+    #[tokio::test]
+    async fn expired_continuous_window_does_not_start_a_queued_realistic_batch() -> Result<()> {
+        let client = Arc::new(manifest_test_client()?);
+        let table = Arc::new(table_named("sqlserver_availability_replica_states")?);
+        let template_batch = synthetic_batch(&table, "client", 8, 0, 0, &client.options)?;
+        let (data, raw_arrow_bytes, encoded_bytes) =
+            encode_with_sizes(&table, "v1", template_batch.clone(), &client.options).await?;
+        let template = EncodedBatch {
+            table,
+            version: "v1".to_owned(),
+            template: template_batch,
+            data: Arc::new(data),
+            rows: 8,
+            raw_arrow_bytes,
+            encoded_bytes,
+        };
+        let channel = client.options.endpoint("http://127.0.0.1:0")?.connect_lazy();
+        let end_unix_ms = unix_ms()?.saturating_sub(1);
+        let measurement = Measurement::new(end_unix_ms.saturating_sub(1), end_unix_ms, 2)?;
+        let held = Arc::clone(&client.live_batch_slots).acquire_owned().await?;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                let _ = started_tx.send(());
+                client.send_continuous_one(0, channel, &template, &measurement).await
+            })
+        };
+        started_rx.await?;
+        drop(held);
+        let result = task.await?;
+        assert!(
+            matches!(result, Ok(false)),
+            "expired measurement started a new batch instead of skipping: {result:?}"
+        );
+        assert_eq!(client.worker_batch_sequence[0].load(Ordering::Relaxed), 0);
+        assert!(
+            client
+                .logical_batches
+                .lock()
+                .map_err(|_| anyhow::anyhow!("logical batch manifest state poisoned"))?
+                .is_empty()
+        );
+        assert_eq!(client.counters[0].attempted_rows.load(Ordering::Relaxed), 0);
+        assert_eq!(client.live_batch_slots.available_permits(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn queued_realistic_work_stops_at_window_end_without_identity_or_send() -> Result<()> {
+        let mut prepared = manifest_test_client()?;
+        let workers = 64;
+        let streams_per_worker = 16;
+        let admitted_slots = 3;
+        let configured_slots = workers * streams_per_worker;
+        assert_eq!(configured_slots, 1_024);
+        prepared.options.workers = workers;
+        prepared.options.streams_per_worker = streams_per_worker;
+        prepared.live_batch_slots = Arc::new(tokio::sync::Semaphore::new(admitted_slots));
+        prepared.counters = (0..workers).map(|_| Counters::default()).collect();
+        prepared.worker_next = (0..workers).map(|_| AtomicU64::new(0)).collect();
+        prepared.worker_batch_sequence = (0..workers).map(|_| AtomicU64::new(0)).collect();
+        let client = Arc::new(prepared);
+        let template = Arc::new(realistic_test_batch(&client).await?);
+        let channel = client.options.endpoint("http://127.0.0.1:0")?.connect_lazy();
+        let start = unix_ms()?;
+        let measurement = Arc::new(Measurement::new(start, start + 60_000, workers)?);
+        let held = vec![
+            Arc::clone(&client.live_batch_slots).acquire_owned().await?,
+            Arc::clone(&client.live_batch_slots).acquire_owned().await?,
+            Arc::clone(&client.live_batch_slots).acquire_owned().await?,
+        ];
+        let waiter_count = configured_slots - admitted_slots;
+        let (queued_tx, mut queued_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (end_tx, end_rx) = tokio::sync::watch::channel(false);
+        let open = Arc::new(AtomicBool::new(true));
+        let mut waiters = tokio::task::JoinSet::new();
+        for index in 0..waiter_count {
+            let client = Arc::clone(&client);
+            let template = Arc::clone(&template);
+            let measurement = Arc::clone(&measurement);
+            let slots = Arc::clone(&client.live_batch_slots);
+            let queued_tx = queued_tx.clone();
+            let mut end_rx = end_rx.clone();
+            let open = Arc::clone(&open);
+            let worker = index / streams_per_worker;
+            let channel = channel.clone();
+            let acquire_permit = async move {
+                let waiting = slots.acquire_owned();
+                queued_tx
+                    .send(())
+                    .map_err(|_| anyhow::anyhow!("permit waiter observation was dropped"))?;
+                waiting.await.context("acquire realistic live-batch memory reservation")
+            };
+            let window_end = async move {
+                end_rx.changed().await.context("window-end signal was dropped")?;
+                Ok::<(), anyhow::Error>(())
+            };
+            let window_open = move || Ok::<bool, anyhow::Error>(open.load(Ordering::SeqCst));
+            waiters.spawn(async move {
+                client
+                    .send_continuous_one_with_admission(
+                        worker,
+                        channel.clone(),
+                        &template,
+                        &measurement,
+                        ContinuousAdmission {
+                            acquire_permit,
+                            window_end,
+                            window_open,
+                        },
+                    )
+                    .await
+            });
+        }
+        drop(queued_tx);
+        for _ in 0..waiter_count {
+            queued_rx
+                .recv()
+                .await
+                .context("not all realistic waiters reached semaphore admission")?;
+        }
+        open.store(false, Ordering::SeqCst);
+        end_tx
+            .send(true)
+            .context("queued realistic waiters were not subscribed to window end")?;
+        while let Some(result) = waiters.join_next().await {
+            assert!(!result??);
+        }
+        drop(held);
+        assert_eq!(client.live_batch_slots.available_permits(), admitted_slots);
+        assert_eq!(
+            client
+                .worker_batch_sequence
+                .iter()
+                .map(|value| value.load(Ordering::Relaxed))
+                .sum::<u64>(),
+            0
+        );
+        assert!(
+            client
+                .logical_batches
+                .lock()
+                .map_err(|_| anyhow::anyhow!("logical batch manifest state poisoned"))?
+                .is_empty()
+        );
+        assert_eq!(
+            client
+                .counters
+                .iter()
+                .map(|counter| counter.attempted_rows.load(Ordering::Relaxed))
+                .sum::<u64>(),
+            0
+        );
+        assert_eq!(
+            client
+                .counters
+                .iter()
+                .map(|counter| counter.attempted_bytes.load(Ordering::Relaxed))
+                .sum::<u64>(),
+            0
+        );
+        eprintln!(
+            "W2_END_AWARE configured_slots={configured_slots} admitted_slots={admitted_slots} queued_waiters={waiter_count} post_end_starts=0"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn permit_ready_at_window_end_is_released_before_identity_allocation() -> Result<()> {
+        let client = Arc::new(manifest_test_client()?);
+        let template = realistic_test_batch(&client).await?;
+        let channel = client.options.endpoint("http://127.0.0.1:0")?.connect_lazy();
+        let start = unix_ms()?;
+        let measurement = Measurement::new(start, start + 60_000, 2)?;
+        let slots = Arc::clone(&client.live_batch_slots);
+        let acquire_permit = async move {
+            slots
+                .acquire_owned()
+                .await
+                .context("acquire realistic live-batch memory reservation")
+        };
+        let window_end = std::future::pending::<Result<()>>();
+        let checks = Arc::new(AtomicU64::new(0));
+        let window_open = {
+            let checks = Arc::clone(&checks);
+            move || Ok::<bool, anyhow::Error>(checks.fetch_add(1, Ordering::SeqCst) == 0)
+        };
+        assert!(
+            !client
+                .send_continuous_one_with_admission(
+                    0,
+                    channel,
+                    &template,
+                    &measurement,
+                    ContinuousAdmission {
+                        acquire_permit,
+                        window_end,
+                        window_open,
+                    },
+                )
+                .await?
+        );
+        assert_eq!(checks.load(Ordering::SeqCst), 2);
+        assert_eq!(client.live_batch_slots.available_permits(), 1);
+        assert_eq!(client.worker_batch_sequence[0].load(Ordering::Relaxed), 0);
+        assert!(
+            client
+                .logical_batches
+                .lock()
+                .map_err(|_| anyhow::anyhow!("logical batch manifest state poisoned"))?
+                .is_empty()
+        );
+        assert_eq!(client.counters[0].attempted_rows.load(Ordering::Relaxed), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn expired_window_skips_before_polling_permit_acquisition() -> Result<()> {
+        let client = Arc::new(manifest_test_client()?);
+        let template = realistic_test_batch(&client).await?;
+        let channel = client.options.endpoint("http://127.0.0.1:0")?.connect_lazy();
+        let start = unix_ms()?;
+        let measurement = Measurement::new(start, start + 60_000, 2)?;
+        let polled = Arc::new(AtomicBool::new(false));
+        let acquire_permit = {
+            let polled = Arc::clone(&polled);
+            async move {
+                polled.store(true, Ordering::SeqCst);
+                Err(anyhow::anyhow!("expired window polled permit acquisition"))
+            }
+        };
+        let window_end = std::future::pending::<Result<()>>();
+        assert!(
+            !client
+                .send_continuous_one_with_admission(
+                    0,
+                    channel,
+                    &template,
+                    &measurement,
+                    ContinuousAdmission {
+                        acquire_permit,
+                        window_end,
+                        window_open: || Ok(false),
+                    },
+                )
+                .await?
+        );
+        assert!(!polled.load(Ordering::SeqCst));
+        assert_eq!(client.live_batch_slots.available_permits(), 1);
+        assert_eq!(client.worker_batch_sequence[0].load(Ordering::Relaxed), 0);
+        assert!(
+            client
+                .logical_batches
+                .lock()
+                .map_err(|_| anyhow::anyhow!("logical batch manifest state poisoned"))?
+                .is_empty()
+        );
+        assert_eq!(client.counters[0].attempted_rows.load(Ordering::Relaxed), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancellation_releases_a_prepared_realistic_batch_permit() -> Result<()> {
+        let client = Arc::new(manifest_test_client()?);
+        let template = realistic_test_batch(&client).await?;
+        let (prepared_tx, prepared_rx) = tokio::sync::oneshot::channel();
+        let task = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                let logical = client.prepare_logical_batch(0, &template).await?;
+                prepared_tx
+                    .send(())
+                    .map_err(|_| anyhow::anyhow!("prepared batch observer was dropped"))?;
+                std::future::pending::<()>().await;
+                drop(logical);
+                Ok::<(), anyhow::Error>(())
+            })
+        };
+        prepared_rx.await.context("logical batch was not prepared")?;
+        assert_eq!(client.live_batch_slots.available_permits(), 0);
+        task.abort();
+        let join_error = match task.await {
+            Ok(result) => anyhow::bail!("cancelled prepared task completed normally: {result:?}"),
+            Err(error) => error,
+        };
+        assert!(join_error.is_cancelled());
         assert_eq!(client.live_batch_slots.available_permits(), 1);
         Ok(())
     }
