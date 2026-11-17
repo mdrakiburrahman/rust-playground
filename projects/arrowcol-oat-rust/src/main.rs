@@ -228,32 +228,31 @@ mod config_hash_tests {
     use sha2::{Digest, Sha256};
 
     #[tokio::test(flavor = "current_thread")]
-    async fn post_and_get_attest_raw_bytes_before_the_runner_is_scheduled() {
+    async fn post_and_get_attest_raw_bytes_before_the_runner_is_scheduled() -> Result<()> {
         let raw = include_bytes!("../../../docs/experiments/arrowcol-oat/oat-config.quick.json");
         let expected = format!("{:x}", Sha256::digest(raw));
         let state = Arc::new(AppState::default());
         let request = Request::builder()
             .header("content-type", "application/json")
-            .body(Body::from(raw.as_slice()))
-            .unwrap();
+            .body(Body::from(raw.as_slice()))?;
         // All awaits are immediately ready on this thread; the spawned workload is never polled.
-        let (code, Json(status)) = start_run(State(Arc::clone(&state)), request).await.unwrap();
+        let (code, Json(status)) = start_run(State(Arc::clone(&state)), request)
+            .await
+            .map_err(|response| anyhow::anyhow!("run rejected: {}", response.status()))?;
         assert_eq!(code, StatusCode::ACCEPTED);
         assert_eq!(status.config_sha256, expected);
         let Json(observed) = get_run(State(state), Path(status.id.clone()))
             .await
-            .unwrap_or_else(|_| panic!("missing accepted run"));
+            .map_err(|(code, _)| anyhow::anyhow!("missing accepted run: {code}"))?;
         assert_eq!(observed.id, status.id);
         assert_eq!(observed.config_sha256, expected);
-        let parsed: serde_json::Value = serde_json::from_slice(raw).unwrap();
-        assert_ne!(
-            expected,
-            format!("{:x}", Sha256::digest(serde_json::to_vec(&parsed).unwrap()))
-        );
+        let parsed: serde_json::Value = serde_json::from_slice(raw)?;
+        assert_ne!(expected, format!("{:x}", Sha256::digest(serde_json::to_vec(&parsed)?)));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn raw_capture_preserves_json_extractor_rejections() {
+    async fn raw_capture_preserves_json_extractor_rejections() -> Result<()> {
         for (content_type, body) in [
             ("text/plain", "{}".to_owned()),
             ("application/json", "{".to_owned()),
@@ -264,20 +263,22 @@ mod config_hash_tests {
                 Request::builder()
                     .header("content-type", content_type)
                     .body(Body::from(body.clone()))
-                    .unwrap()
             };
             let state = Arc::new(AppState::default());
-            let expected = Json::<OatConfig>::from_request(request(), &state)
-                .await
-                .unwrap_err()
-                .into_response();
-            let actual = start_run(State(state), request()).await.unwrap_err();
+            let Err(expected) = Json::<OatConfig>::from_request(request()?, &state).await else {
+                anyhow::bail!("JSON extractor unexpectedly accepted the request");
+            };
+            let expected = expected.into_response();
+            let Err(actual) = start_run(State(state), request()?).await else {
+                anyhow::bail!("run handler unexpectedly accepted the request");
+            };
             assert_eq!(actual.status(), expected.status());
             assert_eq!(actual.headers(), expected.headers());
             assert_eq!(
-                to_bytes(actual.into_body(), usize::MAX).await.unwrap(),
-                to_bytes(expected.into_body(), usize::MAX).await.unwrap()
+                to_bytes(actual.into_body(), usize::MAX).await?,
+                to_bytes(expected.into_body(), usize::MAX).await?
             );
         }
+        Ok(())
     }
 }
