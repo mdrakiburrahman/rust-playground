@@ -384,8 +384,8 @@ export async function readOfficialNativeWindow(options: SourceOptions): Promise<
       continue;
     }
     const limits = record(observations[0]!.limits) ? observations[0]!.limits : {};
-    const resource = typeof target.role === 'string' && record(resources[target.role]) ? resources[target.role] : {};
-    const expected = record(resource.limits) ? resource.limits : {};
+    const resource = typeof target.role === 'string' ? resources[target.role] : undefined;
+    const expected = record(resource) && record(resource.limits) ? resource.limits : {};
     const cpuLimit = quantity(limits.cpu, false), memoryLimit = quantity(limits.memory, true);
     const cpu = nativeSeries(observations, 'cpu', start, end, 'usage_core_nanoseconds');
     pod.cpuCores = nativeRate(cpu, false);
