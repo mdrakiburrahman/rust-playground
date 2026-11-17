@@ -272,6 +272,7 @@ pub struct BatchingTunables {
     pub max_batches_per_flush: Option<u64>,
     pub max_age: Option<String>,
     pub max_concurrent_flushes: Option<usize>,
+    pub pipeline_depth: Option<usize>,
     pub adaptive_file: Option<AdaptiveFileTunables>,
 }
 

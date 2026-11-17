@@ -31,6 +31,24 @@
 
 Sources: [Ddsv6 sizes](https://learn.microsoft.com/azure/virtual-machines/sizes/general-purpose/ddsv6-series), [Edsv6 sizes](https://learn.microsoft.com/azure/virtual-machines/sizes/memory-optimized/edsv6-series), [VM network bandwidth](https://learn.microsoft.com/azure/virtual-network/virtual-machine-network-throughput), and [standard storage scalability targets](https://learn.microsoft.com/azure/storage/common/scalability-targets-standard-account).
 
+## Single-table preparation and commit overlap
+
+| Setting | Contract |
+| --- | --- |
+| `collector.batching.pipeline_depth` | Integer `1..=64`, default `1`. Bounds in-flight preparation/publication groups per logical table through durable receipts. Values above `1` require `coalesce_publications: true`. Projected unchanged inside `ARROWCOL_COLLECTOR_BATCHING_CONFIG`; exporter startup readback reports the resolved value. |
+| `collector.batching.max_concurrent_flushes` | Existing exporter-backend semaphore, shared across cores using the same root. Bounds active file groups including their commit wait; independent of the per-table pipeline depth. |
+| `collector.commit.max_files_per_commit` | Existing maximum add actions per version (default `64`). A coalesced group remains indivisible; separate groups may share a version only when their identities do not overlap and their combined file count fits. |
+| `collector.commit.batch_window` | Existing maximum collection interval (default `10s`), starting at the first ready group. Depth `1` preserves immediate forced group commits; pipelined groups use this interval or the file cap. Explicit flush, schema transitions and shutdown wait for all prior groups. |
+| `collector.commit.max_pending_files` | Existing file admission bound (default `256`), held through terminal commit results. |
+| `collector.runtime.cpu_workers` / `upload_limit` | Existing CPU pool and upload admission bounds. These do not imply that more file groups are active; pipeline depth, flush slots and Arrow queue capacities must also permit overlap. |
+
+Coalesced preparation uses the same opened table as the single Delta commit worker,
+without acquiring another writer. Arrow reservations remain charged until terminal
+publication results. Kernel commit-time identity, schema, retention and ownership
+checks remain authoritative; staging is not acknowledgment. Existing bounded append
+conflict retries refresh and replan against maintenance commits and emit publication
+attempt/conflict telemetry. A larger depth is not evidence of a throughput gain.
+
 ## Router timeout compatibility
 
 | Setting | Contract |

@@ -70,7 +70,7 @@ export function safeCollectorPolicies(dataflow: Document): Document {
     commit: pick(nodes.delta.config.commit, ['batch_window', 'max_files_per_commit', 'max_pending_files']),
     batching: pick(nodes.delta.config.batching, [
       'global_capacity', 'per_table_capacity', 'max_arrow_memory_per_flush', 'max_rows_per_flush', 'max_batches_per_flush',
-      'max_age', 'max_concurrent_flushes', 'adaptive_file',
+      'max_age', 'max_concurrent_flushes', 'pipeline_depth', 'adaptive_file',
     ]),
     native_quiver: nodes.flight.config.native_quiver === true,
     durable_buffer: pick(Object.values(nodes as Document).find((node) => node.type === 'processor:durable_buffer')?.config ?? {}, [

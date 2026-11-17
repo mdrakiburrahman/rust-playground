@@ -164,6 +164,7 @@ const CAPABILITIES: &[Capability] = &[
     capability!("collector.batching.max_batches_per_flush", "512"),
     capability!("collector.batching.max_age", "30s"),
     capability!("collector.batching.max_concurrent_flushes", "4"),
+    capability!("collector.batching.pipeline_depth", "1"),
     capability!("collector.batching.adaptive_file.target_parquet_bytes", "134217728"),
     capability!("collector.batching.adaptive_file.min_input_bytes", "16777216"),
     capability!("collector.batching.adaptive_file.max_input_bytes", "1073741824"),
@@ -1224,6 +1225,13 @@ fn validate_batching(batching: Option<&BatchingTunables>) -> Result<()> {
     if flushes > (usize::MAX >> 3) {
         bail!("collector.batching.max_concurrent_flushes exceeds Semaphore::MAX_PERMITS");
     }
+    let depth = batching.pipeline_depth.unwrap_or(1);
+    if !(1..=64).contains(&depth) {
+        bail!("collector.batching.pipeline_depth must be in 1..=64");
+    }
+    if depth > 1 && batching.coalesce_publications != Some(true) {
+        bail!("collector.batching.pipeline_depth > 1 requires coalesce_publications=true");
+    }
     validate_duration("collector.batching.max_age", batching.max_age.as_deref(), "30s")?;
     if flush_bytes > u64::from(table_bytes)
         || flush_rows > u64::from(table_rows)
@@ -1965,6 +1973,30 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn pipeline_depth_is_bounded_and_projects_without_a_second_source() -> Result<()> {
+        let valid = serde_json::json!({"collector":{"batching":{
+            "coalesce_publications":true,"pipeline_depth":4
+        }}});
+        let env = Tunables::parse_oat_json(valid.clone())?.environment_for(ComponentRole::Collector)?;
+        let batching: Value = serde_json::from_str(&env["ARROWCOL_COLLECTOR_BATCHING_CONFIG"])?;
+        assert_eq!(batching["pipeline_depth"], 4);
+        for value in [
+            serde_json::json!(0),
+            serde_json::json!(65),
+            serde_json::json!(1.5),
+            serde_json::json!("4"),
+        ] {
+            let mut candidate = valid.clone();
+            candidate["collector"]["batching"]["pipeline_depth"] = value;
+            assert!(Tunables::parse_oat_json(candidate).is_err());
+        }
+        let mut no_coalescing = valid;
+        no_coalescing["collector"]["batching"]["coalesce_publications"] = serde_json::json!(false);
+        assert!(Tunables::parse_oat_json(no_coalescing).is_err());
+        Ok(())
+    }
 
     #[test]
     fn collector_upload_validation_and_projection() -> Result<()> {
