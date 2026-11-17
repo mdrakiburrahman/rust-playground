@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { lstat, mkdir, open, readFile, realpath, readdir, rename, rm, stat, unlink, writeFile } from 'node:fs/promises';
@@ -13,6 +13,7 @@ import { parseDataFlowVerdictPolicy, record, reportDataFlowRun, type NetworkObse
 
 export interface OatRunStatus {
   id: string;
+  config_sha256: string | null;
   state: 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled';
   progress: string;
   result_count: number;
@@ -83,14 +84,24 @@ Options:
 type DeadlineCreationState = 'not_started' | 'pending' | 'accepted' | 'rejected' | 'unknown';
 type DeadlineCleanupState = 'not_started' | 'pending' | 'confirmed' | 'unsettled';
 
+export interface SubmittedOatConfig {
+  submitted_config_body: string;
+  submitted_config_sha256: string;
+  source_config_sha256: string;
+}
+
 interface LauncherDeadlineReceipt {
   version: 1;
   invocation_id: string;
   started_at_unix_ms: number;
-  deadline_at_unix_ms: number;
+  deadline_at_unix_ms: number | null;
   started_at_monotonic_ms: number;
-  deadline_seconds: number;
-  deadline_at_monotonic_ms: number;
+  deadline_seconds: number | null;
+  deadline_at_monotonic_ms: number | null;
+  submitted_config_body: string | null;
+  submitted_config_sha256: string | null;
+  source_config_sha256: string | null;
+  cleanup_deadline_at_unix_ms: number | null;
   overrun: boolean;
   overrun_at_unix_ms: number | null;
   creation_state: DeadlineCreationState;
@@ -126,7 +137,7 @@ async function writeAtomicJson(path: string, value: unknown): Promise<void> {
 export class OatLauncherDeadline {
   readonly signal: AbortSignal;
   readonly receiptPath: string;
-  readonly deadlineAtMonotonicMs: number;
+  readonly deadlineAtMonotonicMs: number | null;
   private readonly controller = new AbortController();
   private readonly receipt: LauncherDeadlineReceipt;
   private timer: NodeJS.Timeout | undefined;
@@ -140,8 +151,8 @@ export class OatLauncherDeadline {
     this.signal = this.controller.signal;
   }
 
-  static async create(seconds: number, startedAtMonotonicMs = performance.now(), receiptRoot = launcherDeadlineReceiptRoot, startedAtUnixMs = Date.now()): Promise<OatLauncherDeadline> {
-    if (!Number.isSafeInteger(seconds) || seconds < 1 || seconds > launcherDeadlineMaxSeconds) {
+  static async create(seconds: number | undefined, startedAtMonotonicMs = performance.now(), receiptRoot = launcherDeadlineReceiptRoot, startedAtUnixMs = Date.now()): Promise<OatLauncherDeadline> {
+    if (seconds !== undefined && (!Number.isSafeInteger(seconds) || seconds < 1 || seconds > launcherDeadlineMaxSeconds)) {
       throw new OatCliError(`--deadline-seconds must be an integer from 1 to ${launcherDeadlineMaxSeconds}`);
     }
     const invocationId = randomUUID();
@@ -149,10 +160,14 @@ export class OatLauncherDeadline {
       version: 1,
       invocation_id: invocationId,
       started_at_unix_ms: startedAtUnixMs,
-      deadline_at_unix_ms: startedAtUnixMs + seconds * 1000,
+      deadline_at_unix_ms: seconds === undefined ? null : startedAtUnixMs + seconds * 1000,
       started_at_monotonic_ms: startedAtMonotonicMs,
-      deadline_seconds: seconds,
-      deadline_at_monotonic_ms: startedAtMonotonicMs + seconds * 1000,
+      deadline_seconds: seconds ?? null,
+      deadline_at_monotonic_ms: seconds === undefined ? null : startedAtMonotonicMs + seconds * 1000,
+      submitted_config_body: null,
+      submitted_config_sha256: null,
+      source_config_sha256: null,
+      cleanup_deadline_at_unix_ms: null,
       overrun: false,
       overrun_at_unix_ms: null,
       creation_state: 'not_started',
@@ -166,10 +181,12 @@ export class OatLauncherDeadline {
     };
     const deadline = new OatLauncherDeadline(resolve(receiptRoot, `${invocationId}.json`), receipt);
     await deadline.persist();
-    deadline.timer = setTimeout(() => {
-      void deadline.markOverrun().catch((error: unknown) => { deadline.backgroundWriteFailure = error; });
-      deadline.controller.abort(new Error('launcher-start deadline expired'));
-    }, Math.max(0, deadline.deadlineAtMonotonicMs - performance.now()));
+    if (seconds !== undefined) {
+      deadline.timer = setTimeout(() => {
+        void deadline.markOverrun().catch((error: unknown) => { deadline.backgroundWriteFailure = error; });
+        deadline.controller.abort(new Error('launcher-start deadline expired'));
+      }, Math.max(0, deadline.deadlineAtMonotonicMs! - performance.now()));
+    }
     return deadline;
   }
 
@@ -177,7 +194,7 @@ export class OatLauncherDeadline {
     const parsed: unknown = JSON.parse(await readFile(path, 'utf8'));
     if (!isLauncherDeadlineReceipt(parsed)) throw new Error(`Invalid launcher deadline receipt ${path}`);
     const deadline = new OatLauncherDeadline(path, parsed);
-    if (!parsed.overrun && Date.now() >= parsed.deadline_at_unix_ms) {
+    if (!parsed.overrun && parsed.deadline_at_unix_ms !== null && Date.now() >= parsed.deadline_at_unix_ms) {
       parsed.overrun = true;
       parsed.overrun_at_unix_ms = Date.now();
       await deadline.persist();
@@ -189,7 +206,7 @@ export class OatLauncherDeadline {
   get cleanupState(): DeadlineCleanupState { return this.receipt.cleanup_state; }
   get runId(): string | null { return this.receipt.run_id; }
   get serverUrl(): string | null { return this.receipt.server_url; }
-  isExpired(): boolean { return performance.now() >= this.deadlineAtMonotonicMs; }
+  isExpired(): boolean { return this.deadlineAtMonotonicMs !== null && performance.now() >= this.deadlineAtMonotonicMs; }
 
   private async persist(): Promise<void> {
     const snapshot = structuredClone(this.receipt);
@@ -202,6 +219,24 @@ export class OatLauncherDeadline {
       this.backgroundWriteFailure = error;
       throw error;
     }
+  }
+
+  async setSubmissionBinding(binding: SubmittedOatConfig): Promise<void> {
+    this.receipt.submitted_config_body = binding.submitted_config_body;
+    this.receipt.submitted_config_sha256 = binding.submitted_config_sha256;
+    this.receipt.source_config_sha256 = binding.source_config_sha256;
+    await this.persist();
+  }
+
+  async ensureCleanupDeadline(now = Date.now()): Promise<number> {
+    if (this.receipt.cleanup_deadline_at_unix_ms === null) {
+      if (this.receipt.cancellation_attempts !== 0) {
+        throw new Error('Existing OAT cleanup receipt has cancellation attempts but no persisted cleanup deadline');
+      }
+      this.receipt.cleanup_deadline_at_unix_ms = now + localCancellationCleanupMs;
+      await this.persist();
+    }
+    return this.receipt.cleanup_deadline_at_unix_ms;
   }
 
   async markCreationPending(serverUrl: string): Promise<void> {
@@ -219,7 +254,7 @@ export class OatLauncherDeadline {
     this.receipt.creation_state = 'accepted';
     this.receipt.run_id = status.id;
     this.receipt.run_state = status.state;
-    this.receipt.cleanup_state = status.state === 'queued' || status.state === 'running' ? 'pending' : 'confirmed';
+    this.receipt.cleanup_state = cleanupStateFor(status);
     await this.persist();
   }
 
@@ -252,7 +287,7 @@ export class OatLauncherDeadline {
 
   async recordTerminal(status: OatRunStatus): Promise<void> {
     this.receipt.run_state = status.state;
-    this.receipt.cleanup_state = status.state === 'queued' || status.state === 'running' ? 'pending' : 'confirmed';
+    this.receipt.cleanup_state = cleanupStateFor(status);
     this.receipt.error = status.error;
     await this.persist();
   }
@@ -282,12 +317,23 @@ export class OatLauncherDeadline {
   dispose(): void { if (this.timer) clearTimeout(this.timer); }
 }
 
+function cleanupStateFor(status: OatRunStatus): DeadlineCleanupState {
+  if (status.state === 'succeeded' || status.state === 'cancelled') return 'confirmed';
+  if (status.state === 'failed') return 'unsettled';
+  return 'pending';
+}
+
 function isLauncherDeadlineReceipt(value: unknown): value is LauncherDeadlineReceipt {
   if (!isRecord(value)) return false;
   return value.version === 1 && typeof value.invocation_id === 'string' &&
-    typeof value.started_at_unix_ms === 'number' && typeof value.deadline_at_unix_ms === 'number' &&
+    typeof value.started_at_unix_ms === 'number' && (value.deadline_at_unix_ms === null || typeof value.deadline_at_unix_ms === 'number') &&
     typeof value.started_at_monotonic_ms === 'number' &&
-    typeof value.deadline_seconds === 'number' && typeof value.deadline_at_monotonic_ms === 'number' &&
+    (value.deadline_seconds === null || typeof value.deadline_seconds === 'number') &&
+    (value.deadline_at_monotonic_ms === null || typeof value.deadline_at_monotonic_ms === 'number') &&
+    (value.submitted_config_body === null || typeof value.submitted_config_body === 'string') &&
+    (value.submitted_config_sha256 === null || typeof value.submitted_config_sha256 === 'string') &&
+    (value.source_config_sha256 === null || typeof value.source_config_sha256 === 'string') &&
+    (value.cleanup_deadline_at_unix_ms === null || typeof value.cleanup_deadline_at_unix_ms === 'number') &&
     typeof value.overrun === 'boolean' && (value.overrun_at_unix_ms === null || typeof value.overrun_at_unix_ms === 'number') &&
     ['not_started', 'pending', 'accepted', 'rejected', 'unknown'].includes(String(value.creation_state)) &&
     (value.server_url === null || typeof value.server_url === 'string') &&
@@ -337,6 +383,15 @@ export async function assertNoUnsettledDeadlineReceipts(root = launcherDeadlineR
   }
 }
 
+
+function bindSubmittedConfig(config: Record<string, unknown>, sourceBytes: Buffer): SubmittedOatConfig {
+  const submitted_config_body = JSON.stringify(config);
+  return {
+    submitted_config_body,
+    submitted_config_sha256: createHash('sha256').update(submitted_config_body, 'utf8').digest('hex'),
+    source_config_sha256: createHash('sha256').update(sourceBytes).digest('hex'),
+  };
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -439,7 +494,7 @@ export async function cleanupLocalComposeProjects(
   }
   return [...projects];
 }
-interface LocalRunMarker {
+interface LocalRunMarker extends SubmittedOatConfig {
   version: 1;
   runId: string;
   ownerPid: number;
@@ -452,7 +507,7 @@ interface LocalRunMarker {
 
 interface LocalRunMarkerContext {
   path: string;
-  marker: Omit<LocalRunMarker, 'runId'>;
+  marker: Omit<LocalRunMarker, 'runId' | keyof SubmittedOatConfig>;
 }
 
 function localStateRoot(config: Record<string, unknown>): string {
@@ -509,11 +564,11 @@ async function prepareLocalRunMarker(config: Record<string, unknown>, server: {
   };
 }
 
-async function persistLocalRunMarker(context: LocalRunMarkerContext, status: OatRunStatus): Promise<void> {
+async function persistLocalRunMarker(context: LocalRunMarkerContext, status: OatRunStatus, binding: SubmittedOatConfig): Promise<void> {
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(status.id)) {
     throw new Error('OAT server returned a noncanonical run ID; local recovery marker was not written');
   }
-  const marker: LocalRunMarker = { ...context.marker, runId: status.id };
+  const marker: LocalRunMarker = { ...context.marker, ...binding, runId: status.id };
   await writeFile(context.path, JSON.stringify(marker), { flag: 'wx', mode: 0o600 });
 }
 
@@ -525,7 +580,10 @@ function parseLocalRunMarker(text: string, markerPath: string): LocalRunMarker {
       typeof value.ownerStartTicks !== 'string' ||
       typeof value.serverPid !== 'number' || !Number.isSafeInteger(value.serverPid) ||
       typeof value.serverStartTicks !== 'string' ||
-      typeof value.serverUrl !== 'string' || typeof value.serverExecutable !== 'string') {
+      typeof value.serverUrl !== 'string' || typeof value.serverExecutable !== 'string' ||
+      typeof value.submitted_config_body !== 'string' ||
+      typeof value.submitted_config_sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(value.submitted_config_sha256) ||
+      typeof value.source_config_sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(value.source_config_sha256)) {
     throw new Error(`Invalid local OAT ownership marker: ${markerPath}`);
   }
   const server = new URL(value.serverUrl);
@@ -541,13 +599,16 @@ function parseLocalRunMarker(text: string, markerPath: string): LocalRunMarker {
     serverStartTicks: value.serverStartTicks,
     serverUrl: value.serverUrl,
     serverExecutable: value.serverExecutable,
+    submitted_config_body: value.submitted_config_body,
+    submitted_config_sha256: value.submitted_config_sha256,
+    source_config_sha256: value.source_config_sha256,
   };
 }
 
 async function cancelMarkedRun(marker: LocalRunMarker): Promise<OatRunStatus> {
   const statusUrl = new URL('/runs/' + encodeURIComponent(marker.runId), marker.serverUrl);
   let response = await fetch(statusUrl, { signal: AbortSignal.timeout(10_000) });
-  let status = await readStatus(response, 'inspect interrupted local OAT run');
+  let status = await readStatus(response, 'inspect interrupted local OAT run', marker.runId);
   if (status.state === 'queued' || status.state === 'running') {
     response = await fetch(new URL('/runs/' + encodeURIComponent(marker.runId) + '/cancel', marker.serverUrl), {
       method: 'POST',
@@ -559,7 +620,7 @@ async function cancelMarkedRun(marker: LocalRunMarker): Promise<OatRunStatus> {
       if (Date.now() >= deadline) throw new Error('Timed out waiting for local OAT cleanup for run ' + marker.runId);
       await new Promise((resolvePromise) => setTimeout(resolvePromise, 250));
       response = await fetch(statusUrl, { signal: AbortSignal.timeout(10_000) });
-      status = await readStatus(response, 'wait for interrupted local OAT cleanup');
+      status = await readStatus(response, 'wait for interrupted local OAT cleanup', marker.runId);
     }
   }
   return status;
@@ -693,10 +754,11 @@ async function cancelAndReconcileLocalRun(
   deadline: OatLauncherDeadline,
   initialEvidenceError?: unknown,
 ): Promise<OatRunStatus> {
-  const cleanupDeadline = performance.now() + localCancellationCleanupMs;
+  const cleanupDeadlineAtUnixMs = await deadline.ensureCleanupDeadline();
   let cancellationAttempted = false;
   let cancellationAccepted = false;
   let retryAfterRead = false;
+  let firstRead = true;
   let evidenceError = initialEvidenceError;
   let lastError: unknown = new Error('no cancellation response received');
   const note = async (operation: () => Promise<void>): Promise<void> => {
@@ -707,24 +769,32 @@ async function cancelAndReconcileLocalRun(
       evidenceError = error;
     }
   };
+  const remainingMs = (): number => cleanupDeadlineAtUnixMs - Date.now();
   const wait = async (): Promise<void> => {
-    const remaining = cleanupDeadline - performance.now();
+    const remaining = remainingMs();
     if (remaining > 0) await new Promise<void>((resolveWait) => setTimeout(resolveWait, Math.min(pollIntervalMs, remaining)));
   };
-  const timeoutSignal = (): AbortSignal => AbortSignal.timeout(Math.max(1, Math.min(30_000, Math.floor(cleanupDeadline - performance.now()))));
+  const cancelSignal = (): AbortSignal => {
+    const remaining = remainingMs();
+    if (remaining <= 0) throw new Error('Persisted OAT cleanup budget expired before cancellation dispatch');
+    return AbortSignal.timeout(Math.min(30_000, Math.floor(remaining)));
+  };
 
-  while (performance.now() < cleanupDeadline) {
+  while (firstRead || remainingMs() > 0) {
+    firstRead = false;
     let response: Response;
     try {
-      response = await fetcher(new URL('/runs/' + encodeURIComponent(runId), server), { signal: timeoutSignal() });
+      response = await fetcher(new URL('/runs/' + encodeURIComponent(runId), server), { signal: AbortSignal.timeout(10_000) });
     } catch (error) {
       lastError = error;
+      if (remainingMs() <= 0) break;
       await wait();
       continue;
     }
     if (!response.ok) {
       if (response.status >= 500 || response.status === 408 || response.status === 429) {
         lastError = new Error(`Run status read returned HTTP ${response.status}`);
+        if (remainingMs() <= 0) break;
         await wait();
         continue;
       }
@@ -734,7 +804,7 @@ async function cancelAndReconcileLocalRun(
     }
     let status: OatRunStatus;
     try {
-      status = await readStatus(response, 'reconcile local OAT run');
+      status = await readStatus(response, 'reconcile local OAT run', runId);
     } catch (error) {
       await note(() => deadline.markUnsettled(error));
       throw error;
@@ -756,11 +826,12 @@ async function cancelAndReconcileLocalRun(
       attemptedCancellation = true;
       retryAfterRead = false;
       await note(() => deadline.markCancelAttempt());
+      const signalForCancel = cancelSignal();
       let cancelResponse: Response;
       try {
         cancelResponse = await fetcher(new URL('/runs/' + encodeURIComponent(runId) + '/cancel', server), {
           method: 'POST',
-          signal: timeoutSignal(),
+          signal: signalForCancel,
         });
       } catch (error) {
         lastError = error;
@@ -786,16 +857,16 @@ async function cancelAndReconcileLocalRun(
       }
     }
     if (attemptedCancellation) continue;
+    if (remainingMs() <= 0) break;
     await wait();
   }
 
   const detail = lastError instanceof Error ? lastError.message : String(lastError);
-  const error = new Error(`Local OAT run ${runId} cleanup was not confirmed within the existing ${localCancellationCleanupMs / 1000}s allowance: ${detail}`);
+  const error = new Error(`Local OAT run ${runId} cleanup was not confirmed within the persisted ${localCancellationCleanupMs / 1000}s allowance: ${detail}`);
   await note(() => deadline.markUnsettled(error));
   if (evidenceError) throw new Error(`${error.message}; launcher receipt persistence also failed`, { cause: evidenceError });
   throw error;
 }
-
 
 export async function launchOat(
   configPath: string,
@@ -809,6 +880,7 @@ export async function launchOat(
   onRunStarted?: (status: OatRunStatus) => Promise<void>,
   onRunFinished?: (status: OatRunStatus) => void | Promise<void>,
   deadline?: OatLauncherDeadline,
+  submission?: SubmittedOatConfig,
 ): Promise<OatRunStatus> {
   if (!Number.isSafeInteger(pollIntervalMs) || pollIntervalMs < 1) {
     throw new Error('poll interval must be a positive integer');
@@ -817,10 +889,13 @@ export async function launchOat(
   if (!['http:', 'https:'].includes(server.protocol)) {
     throw new Error('server URL must use HTTP or HTTPS');
   }
+  const sourceBytes = await readFile(configPath);
   const config = mode
     ? await readOatConfigForMode(configPath, mode, bridgeGateway)
-    : JSON.parse(await readFile(configPath, 'utf8'));
+    : JSON.parse(sourceBytes.toString('utf8'));
   if (!isRecord(config)) throw new Error('OAT config must be a JSON object');
+  const binding = submission ?? bindSubmittedConfig(config, sourceBytes);
+  if (deadline) await deadline.setSubmissionBinding(binding);
 
   if (deadline) {
     if (deadline.isExpired()) {
@@ -842,7 +917,7 @@ export async function launchOat(
     startResponse = await fetcher(new URL('/runs', server), {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(config),
+      body: binding.submitted_config_body,
       signal: AbortSignal.timeout(30_000),
     });
   } catch (error) {
@@ -861,6 +936,15 @@ export async function launchOat(
     throw error;
   }
 
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(status.id)) {
+    const error = new Error('OAT server returned a run ID that cannot be safely pinned');
+    if (deadline) await deadline.markCreationUnknown(error);
+    throw error;
+  }
+  const ownedRunId = status.id;
+  let bindingFailure: Error | undefined = submission && status.config_sha256 !== submission.submitted_config_sha256
+    ? new Error(`OAT server config hash mismatch for run ${ownedRunId}`)
+    : undefined;
   let startFailure: { error: unknown } | undefined;
   type CancellationOutcome = { ok: true; status?: OatRunStatus } | { ok: false; error: unknown };
   let cancellationRequest: Promise<CancellationOutcome> = Promise.resolve({ ok: true });
@@ -881,10 +965,10 @@ export async function launchOat(
         if (deadline.isExpired()) {
           try { await deadline.markOverrun(); } catch (error) { evidenceError = error; }
         }
-        const terminal = await cancelAndReconcileLocalRun(server, status.id, fetcher, pollIntervalMs, deadline, evidenceError);
+        const terminal = await cancelAndReconcileLocalRun(server, ownedRunId, fetcher, pollIntervalMs, deadline, evidenceError);
         return { ok: true, status: terminal };
       }
-      const response = await fetcher(new URL('/runs/' + encodeURIComponent(status.id) + '/cancel', server), {
+      const response = await fetcher(new URL('/runs/' + encodeURIComponent(ownedRunId) + '/cancel', server), {
         method: 'POST',
         signal: AbortSignal.timeout(30_000),
       });
@@ -899,6 +983,10 @@ export async function launchOat(
     try {
       await deadline?.recordRunStarted(status);
       await onRunStarted?.(status);
+      if (bindingFailure) {
+        startFailure = { error: bindingFailure };
+        if (status.state === 'queued' || status.state === 'running') requestCancellation();
+      }
     } catch (error) {
       startFailure = { error };
       if (status.state === 'queued' || status.state === 'running') requestCancellation();
@@ -932,10 +1020,14 @@ export async function launchOat(
           break;
         }
       }
-      const response = await fetcher(new URL('/runs/' + encodeURIComponent(status.id), server), {
+      const response = await fetcher(new URL('/runs/' + encodeURIComponent(ownedRunId), server), {
         signal: AbortSignal.timeout(30_000),
       });
-      const next = await readStatus(response, 'poll OAT run');
+      const next = await readStatus(response, 'poll OAT run', ownedRunId);
+      if (submission && next.config_sha256 !== submission.submitted_config_sha256) {
+        bindingFailure = new Error(`OAT server config hash mismatch for run ${ownedRunId}`);
+        if (next.state === 'queued' || next.state === 'running') requestCancellation();
+      }
       const changed = next.state !== status.state || next.progress !== status.progress ||
         next.result_count !== status.result_count || next.error !== status.error;
       status = next;
@@ -957,6 +1049,10 @@ export async function launchOat(
 
   await deadline?.recordTerminal(status);
   await onRunFinished?.(status);
+  if (bindingFailure) {
+    await deadline?.markUnsettled(bindingFailure);
+    throw bindingFailure;
+  }
   if (deadline?.isExpired()) {
     await deadline.markOverrun();
     throw new Error(`Launcher-start deadline expired; run ${status.id} is ${status.state}; receipt: ${deadline.receiptPath}`);
@@ -974,7 +1070,7 @@ export async function launchOat(
   return status;
 }
 
-async function readStatus(response: Response, action: string): Promise<OatRunStatus> {
+async function readStatus(response: Response, action: string, expectedId?: string): Promise<OatRunStatus> {
   const body: unknown = await response.json().catch(() => undefined);
   if (!response.ok) {
     const error = body !== null && typeof body === 'object' && 'error' in body && typeof body.error === 'string'
@@ -991,7 +1087,13 @@ async function readStatus(response: Response, action: string): Promise<OatRunSta
   ) {
     throw new Error(`Server returned an invalid status while trying to ${action}`);
   }
-  return body as OatRunStatus;
+  if (expectedId !== undefined && body.id !== expectedId) {
+    throw new Error(`Server returned run ID ${body.id} while trying to ${action} for owned run ${expectedId}`);
+  }
+  return {
+    ...(body as Omit<OatRunStatus, 'config_sha256'>),
+    config_sha256: 'config_sha256' in body && typeof body.config_sha256 === 'string' ? body.config_sha256 : null,
+  };
 }
 
 export async function main(args: string[], runner: typeof run_tree = run_tree, cleanupLocal = cleanupLocalComposeProjects): Promise<void> {
@@ -1080,6 +1182,7 @@ export async function main(args: string[], runner: typeof run_tree = run_tree, c
     }
   }
   const config = await readOatConfigForMode(configPath, mode);
+  const submission = bindSubmittedConfig(config, await readFile(configPath));
   if (cleanupRunId !== undefined) {
     if (mode !== 'local') throw new OatCliError('--cleanup-local is local-only');
     const recoveredProjects = await recoverInterruptedLocalRuns(config, cleanupRunId, cleanupLocal);
@@ -1095,10 +1198,9 @@ export async function main(args: string[], runner: typeof run_tree = run_tree, c
     }
     config.subscriptionId = subscriptionId;
   }
-  let deadline: OatLauncherDeadline | undefined;
+  await assertNoUnsettledDeadlineReceipts();
+  const deadline = await OatLauncherDeadline.create(deadlineSeconds, launcherStartedAtMonotonicMs, launcherDeadlineReceiptRoot, launcherStartedAtUnixMs);
   if (deadlineSeconds !== undefined) {
-    await assertNoUnsettledDeadlineReceipts();
-    deadline = await OatLauncherDeadline.create(deadlineSeconds, launcherStartedAtMonotonicMs, launcherDeadlineReceiptRoot, launcherStartedAtUnixMs);
     if (deadline.isExpired()) {
       await deadline.markOverrun();
       await deadline.markNoRun(new Error('launcher-start deadline expired during setup'));
@@ -1114,7 +1216,7 @@ export async function main(args: string[], runner: typeof run_tree = run_tree, c
     try {
       try {
         const code = await reportDataFlowRun(
-          (progress) => launchOat(configPath, requestedServerUrl, pollValue, fetch, progress, mode, getDockerBridgeGateway, interrupt?.controller.signal, undefined, undefined, deadline),
+          (progress) => launchOat(configPath, requestedServerUrl, pollValue, fetch, progress, mode, getDockerBridgeGateway, interrupt?.controller.signal, undefined, undefined, deadline, submission),
           config, mode, undefined, runner, network, warnings,
         );
         if (deadline?.isExpired()) {
@@ -1124,6 +1226,11 @@ export async function main(args: string[], runner: typeof run_tree = run_tree, c
         }
         if (interrupt?.signal) {
           process.exitCode = interrupt.exitCode;
+          return;
+        }
+        if (deadline.isExpired()) {
+          await deadline.markOverrun();
+          process.exitCode = 1;
           return;
         }
         runPassed = code === 0;
@@ -1209,18 +1316,23 @@ export async function main(args: string[], runner: typeof run_tree = run_tree, c
     try {
       const localMarker = markerContext;
       const onRunStarted = localMarker ? async (status: OatRunStatus): Promise<void> => {
-        await persistLocalRunMarker(localMarker, status);
+        await persistLocalRunMarker(localMarker, status, submission);
         markerWritten = true;
       } : undefined;
       const onRunFinished = (status: OatRunStatus): void => {
         runCleanupComplete = status.state === 'succeeded' || status.state === 'cancelled';
       };
       const code = await reportDataFlowRun(
-        (progress) => launchOat(configPath, server.url, pollValue, fetch, progress, mode, getDockerBridgeGateway, interrupt?.controller.signal, onRunStarted, onRunFinished, deadline),
+        (progress) => launchOat(configPath, server.url, pollValue, fetch, progress, mode, getDockerBridgeGateway, interrupt?.controller.signal, onRunStarted, onRunFinished, deadline, submission),
         config, mode, server.gitSha, runner, network, warnings,
       );
       if (interrupt?.signal) {
         process.exitCode = interrupt.exitCode;
+        return;
+      }
+      if (deadline.isExpired()) {
+        await deadline.markOverrun();
+        process.exitCode = 1;
         return;
       }
       runPassed = code === 0;
@@ -1256,6 +1368,10 @@ export async function main(args: string[], runner: typeof run_tree = run_tree, c
         }
       }
     }
+  }
+  if (deadline.isExpired()) {
+    await deadline.markOverrun();
+    process.exitCode = 1;
   }
 }
 

@@ -1,12 +1,14 @@
 use anyhow::{Context, Result, ensure};
 use arrowcol_oat_rust::config::{OatConfig, OatMode};
 use arrowcol_oat_rust::model::{AppState, CancelRunError, RunState, RunStatus, unix_time_ms};
+use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use clap::Parser;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -90,8 +92,15 @@ async fn health() -> Json<Health> {
 
 async fn start_run(
     State(state): State<Arc<AppState>>,
-    Json(config): Json<OatConfig>,
+    body: Bytes,
 ) -> Result<(StatusCode, Json<RunStatus>), (StatusCode, Json<ApiError>)> {
+    let config_sha256 = sha256_hex(&body);
+    let config: OatConfig = serde_json::from_slice(&body).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ApiError { error: format!("{error:#}") }),
+        )
+    })?;
     config.validate().map_err(|error| {
         (
             StatusCode::BAD_REQUEST,
@@ -111,6 +120,7 @@ async fn start_run(
     let id = uuid::Uuid::new_v4().to_string();
     let status = RunStatus {
         id: id.clone(),
+        config_sha256,
         state: RunState::Queued,
         progress: "queued".to_owned(),
         result_count: 0,
@@ -163,6 +173,13 @@ async fn start_run(
     Ok((StatusCode::ACCEPTED, Json(status)))
 }
 
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 async fn cancel_run(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -202,13 +219,12 @@ async fn get_run(
 
 #[cfg(test)]
 mod config_hash_tests {
-    use super::RunStatus;
-    use sha2::{Digest, Sha256};
+    use super::{sha256_hex, RunStatus};
 
     #[test]
     fn run_status_echoes_sha256_of_raw_config_bytes() {
-        let raw = br#"{  \"platform\": { \"kind\": \"local\" } }"#;
-        let expected: String = Sha256::digest(raw).iter().map(|byte| format!("{byte:02x}")).collect();
+        let raw = include_bytes!("../../../docs/experiments/arrowcol-oat/oat-config.quick.json");
+        let expected = sha256_hex(raw);
         let status = RunStatus {
             id: "123e4567-e89b-42d3-a456-426614174000".to_owned(),
             config_sha256: expected.clone(),
@@ -220,6 +236,6 @@ mod config_hash_tests {
             finished_at_unix_ms: None,
         };
         assert_eq!(serde_json::to_value(status).unwrap()["config_sha256"], expected);
-        assert_ne!(expected, format!("{:x}", Sha256::digest(br#"{\"platform\":{\"kind\":\"local\"}}"#)));
+        assert_ne!(expected, sha256_hex(br#"{"platform":{"kind":"local"}}"#));
     }
 }

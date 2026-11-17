@@ -16,6 +16,7 @@ pub enum RunState {
 #[derive(Clone, Debug, Serialize)]
 pub struct RunStatus {
     pub id: String,
+    pub config_sha256: String,
     pub state: RunState,
     pub progress: String,
     pub result_count: usize,
