@@ -152,6 +152,7 @@ async fn publish_campaign_official_measurement(
     platform: &AksPlatform,
     config: &OatConfig,
     rows: &[OatResult],
+    submitted: Option<&SubmittedConfigIdentity>,
     deadline: tokio::time::Instant,
 ) -> Result<()> {
     if config.campaign_profile.is_none() {
@@ -170,7 +171,7 @@ async fn publish_campaign_official_measurement(
             platform, &identity, &cached.orchestration_run_id, publication_deadline.saturating_duration_since(tokio::time::Instant::now()),
         ).await?;
         current.assert_custody_ready(platform.campaign_cli_paths()?).await?;
-        let bytes = official_measurement_bytes(&current, config, rows, platform.submitted_config.as_ref())?;
+        let bytes = official_measurement_bytes(&current, config, rows, submitted)?;
         let payload: Value = serde_json::from_slice(&bytes)?;
         let destination = current.evidence_destination.as_ref().context("official measurement destination is missing")?;
         let blob = official_measurement_blob(&current)?;

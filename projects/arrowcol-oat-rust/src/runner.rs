@@ -1051,11 +1051,11 @@ trait Platform: Send + Sync {
         &mut self,
         _config: &OatConfig,
         _rows: &[OatResult],
+        _submitted: Option<&SubmittedConfigIdentity>,
         _deadline: tokio::time::Instant,
     ) -> Result<()> {
         Ok(())
     }
-    fn bind_submitted_config(&mut self, _identity: Option<SubmittedConfigIdentity>) {}
     fn mark_qap_outcome_unresolved(&mut self) {}
     async fn prepare_client_fleet(&mut self, config: &OatConfig, run_id: &str) -> Result<()>;
     async fn start_client(
@@ -1112,7 +1112,6 @@ trait Platform: Send + Sync {
 
 struct AksPlatform {
     run_id: String,
-    submitted_config: Option<SubmittedConfigIdentity>,
     resource_readback: Vec<Value>,
     cpu_throttling_start: Option<Vec<CpuThrottleSample>>,
     cpu_throttling_evidence: Option<Value>,
@@ -1225,10 +1224,6 @@ struct LocalPlatform {
 
 #[async_trait::async_trait]
 impl Platform for AksPlatform {
-    fn bind_submitted_config(&mut self, identity: Option<SubmittedConfigIdentity>) {
-        self.submitted_config = identity;
-    }
-
     fn resource_evidence(&self) -> Option<Value> {
         Some(json!({
             "readbacks": self.resource_readback,
@@ -1615,9 +1610,10 @@ impl Platform for AksPlatform {
         &mut self,
         config: &OatConfig,
         rows: &[OatResult],
+        submitted: Option<&SubmittedConfigIdentity>,
         deadline: tokio::time::Instant,
     ) -> Result<()> {
-        publish_campaign_official_measurement(self, config, rows, deadline).await
+        publish_campaign_official_measurement(self, config, rows, submitted, deadline).await
     }
 
     fn mark_qap_outcome_unresolved(&mut self) {
@@ -3182,7 +3178,6 @@ async fn run_isolated_cell(
             );
         }
     };
-    platform.bind_submitted_config(submitted_config);
     let timing_budget = match config.timing_budget() {
         Ok(budget) => budget,
         Err(error) => {
@@ -3214,7 +3209,7 @@ async fn run_isolated_cell(
                 "ArrowCol scale",
             )?;
             match tokio::time::timeout_at(lifecycle_deadline, async {
-                run_matrix_cell(
+                let mut rows = run_matrix_cell(
                     &config,
                     orchestration_id,
                     &run_id,
@@ -3222,7 +3217,20 @@ async fn run_isolated_cell(
                     concurrency,
                     platform.as_mut(),
                     lifecycle_deadline,
-                ).await
+                ).await?;
+                if let Err(error) = platform.publish_official_measurement(
+                    &config, &rows, submitted_config.as_ref(), lifecycle_deadline,
+                ).await {
+                    tracing::error!(%error, "official cell measurement publication failed; retaining original rows for normal cleanup");
+                    for row in &mut rows {
+                        row.status = "failed".to_owned();
+                        row.failure = Some(match row.failure.take() {
+                            Some(prior) => format!("{prior}; official_measurement_publication_failed"),
+                            None => "official_measurement_publication_failed".to_owned(),
+                        });
+                    }
+                }
+                Ok(rows)
             }).await {
                 Ok(result) => result,
                 Err(_) => Err(anyhow::anyhow!("planned cell lifecycle duration expired; normal platform cleanup follows")),
@@ -3454,7 +3462,6 @@ fn platform_for_run(config: &OatConfig, run_id: &str) -> Result<Box<dyn Platform
         crate::config::OatMode::Local => Ok(Box::new(LocalPlatform::new(config, run_id)?)),
         crate::config::OatMode::Aks => Ok(Box::new(AksPlatform {
             run_id: run_id.to_owned(),
-            submitted_config: None,
             resource_readback: Vec::new(),
             cpu_throttling_start: None,
             cpu_throttling_evidence: None,
@@ -3960,7 +3967,7 @@ async fn run_matrix_cell(
             }
         }
     }
-    let mut rows = result_rows(
+    result_rows(
         config,
         orchestration_id,
         run_id,
@@ -3973,21 +3980,7 @@ async fn run_matrix_cell(
             resources: metrics,
             resource_evidence: platform.resource_evidence(),
         },
-    )?;
-    if let Err(error) = platform
-        .publish_official_measurement(config, &rows, lifecycle_deadline)
-        .await
-    {
-        tracing::error!(%error, "official cell measurement publication failed; retaining original rows for normal cleanup");
-        for row in &mut rows {
-            row.status = "failed".to_owned();
-            row.failure = Some(match row.failure.take() {
-                Some(prior) => format!("{prior}; official_measurement_publication_failed"),
-                None => "official_measurement_publication_failed".to_owned(),
-            });
-        }
-    }
-    Ok(rows)
+    )
 }
 
 struct CellMeasurements {
@@ -14463,7 +14456,6 @@ mod tests {
         )?;
         let mut platform = AksPlatform {
             run_id: "fixture-run".to_owned(),
-            submitted_config: None,
             resource_readback: Vec::new(),
             cpu_throttling_start: None,
             cpu_throttling_evidence: None,
