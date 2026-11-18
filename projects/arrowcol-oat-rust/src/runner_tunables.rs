@@ -311,6 +311,9 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
         entry["value"] = json!(r#"{"startup_table":{"catalog":"telemetry","schema":"sqlserver","table":"other"}}"#);
         assert!(inject_workload_environment(&config, &mut tampered).is_err());
         inject_workload_environment(&config, &mut resources)?;
+        let collector = resources.iter_mut().find(|resource| resource["kind"] == "Deployment"
+            && resource["metadata"]["name"] == config.dfe_deployment).context("collector Deployment missing")?;
+        configure_collector_deployment(&config, collector, 1)?;
         let collector = resources.iter().find(|resource| resource["kind"] == "Deployment"
             && resource["metadata"]["name"] == config.dfe_deployment).context("collector Deployment missing")?;
         let entries = collector.pointer("/spec/template/spec/containers/0/env")

@@ -7814,19 +7814,7 @@ async fn configure_deployments(config: &OatConfig, replicas: u32, concurrency: u
             desired["spec"]["replicas"] = json!(replicas);
         }
         if name == config.dfe_deployment {
-            configure_workers(&mut desired, &config.dfe_container, concurrency)?;
-            configure_deployment_container_resources(
-                &mut desired,
-                &config.dfe_container,
-                &config.effective_aks_resources().collector,
-            )?;
-            desired["spec"]["template"]["spec"]["terminationGracePeriodSeconds"] =
-                json!(config.collector_stop_grace_seconds);
-            inject_deployment_environment(
-                &mut desired,
-                &config.dfe_container,
-                &role_environment(config, ComponentRole::Collector)?,
-            )?;
+            configure_collector_deployment(config, &mut desired, concurrency)?;
         }
         apply_deployment(config, desired).await?;
         if name == config.dfe_deployment {
@@ -7845,6 +7833,21 @@ async fn configure_deployments(config: &OatConfig, replicas: u32, concurrency: u
         }
     }
     Ok(())
+}
+
+fn configure_collector_deployment(config: &OatConfig, desired: &mut Value, concurrency: u32) -> Result<()> {
+    configure_workers(desired, &config.dfe_container, concurrency)?;
+    configure_deployment_container_resources(
+        desired,
+        &config.dfe_container,
+        &config.effective_aks_resources().collector,
+    )?;
+    desired["spec"]["template"]["spec"]["terminationGracePeriodSeconds"] = json!(config.collector_stop_grace_seconds);
+    inject_deployment_environment(
+        desired,
+        &config.dfe_container,
+        &role_environment(config, ComponentRole::Collector)?,
+    )
 }
 
 fn verify_aks_collector_stop_grace(deployment: &Value, expected_seconds: u64) -> Result<()> {
