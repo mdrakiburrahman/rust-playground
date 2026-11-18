@@ -516,6 +516,15 @@ fn router_readback_path(variable: &str) -> Result<String> {
 }
 
 fn verify_process_configuration(config: &OatConfig, role: ComponentRole, observed: &Value) -> Result<()> {
+    verify_process_configuration_recording(config, role, observed, &mut None)
+}
+
+fn verify_process_configuration_recording(
+    config: &OatConfig,
+    role: ComponentRole,
+    observed: &Value,
+    diff: &mut Option<Value>,
+) -> Result<()> {
     if matches!(role, ComponentRole::Collector) {
         verify_wal_configuration(config, observed)?;
     }
@@ -541,6 +550,7 @@ fn verify_process_configuration(config: &OatConfig, role: ComponentRole, observe
         if matches!(role, ComponentRole::Maintenance) && name.starts_with("ARROWCOL_MAINT_") {
             let (actual, expected) = maintenance_readback_value(observed, &name, expected)?;
             if !contains_requested(&actual, &expected) {
+                *diff = Some(startup_mismatch(role, &name, &expected, Some(&actual)));
                 bail!("maintenance startup does not match applied tunable {name}");
             }
             continue;
@@ -599,15 +609,19 @@ fn verify_process_configuration(config: &OatConfig, role: ComponentRole, observe
             ),
             _ => bail!("no effective readback adapter for {name}"),
         };
-        let actual = observed
-            .pointer(&path)
-            .with_context(|| format!("{} startup readback omitted applied tunable {name}", role_name(role)))?;
-        let matches = if name == "ARROWCOL_COLLECTOR_PRESSURE_CONFIG" {
-            matches_collector_pressure(actual, &expected)?
-        } else {
-            contains_requested(actual, &expected)
+        let Some(actual) = observed.pointer(&path) else {
+            *diff = Some(startup_mismatch(role, &name, &expected, None));
+            bail!("{} startup readback omitted applied tunable {name}", role_name(role));
         };
-        if !matches {
+        let matches = if name == "ARROWCOL_COLLECTOR_PRESSURE_CONFIG" {
+            matches_collector_pressure(actual, &expected)
+        } else {
+            Ok(contains_requested(actual, &expected))
+        };
+        if !matches.as_ref().is_ok_and(|equal| *equal) {
+            *diff = Some(startup_mismatch(role, &name, &expected, Some(actual)));
+        }
+        if !matches? {
             bail!(
                 "{} startup readback does not match applied tunable {name}",
                 role_name(role)
@@ -757,14 +771,19 @@ fn process_evidence(config: &OatConfig, logs: &[ProcessLog]) -> Result<Value> {
             text: format!("arrowcol_router_effective_config {{\"log_filter\":{}}}\n", serde_json::to_string(&log_filter)?),
         });
     }
-    let mut evidence = process_evidence_for_cell(config, &logs, &[])?;
+    let mut evidence = process_evidence_for_cell(config, &logs, &[], &mut None)?;
     if added_router && let Some(entries) = evidence.as_array_mut() {
         entries.retain(|entry| entry["component"] != "router");
     }
     Ok(evidence)
 }
 
-fn process_evidence_for_cell(config: &OatConfig, logs: &[ProcessLog], baseline_logs: &[ProcessLog]) -> Result<Value> {
+fn process_evidence_for_cell(
+    config: &OatConfig,
+    logs: &[ProcessLog],
+    baseline_logs: &[ProcessLog],
+    diff: &mut Option<Value>,
+) -> Result<Value> {
     let mut result = Vec::new();
     for role in [
         ComponentRole::Router,
@@ -787,7 +806,7 @@ fn process_evidence_for_cell(config: &OatConfig, logs: &[ProcessLog], baseline_l
                 bail!("maintenance operation log was truncated; safety outcomes cannot be established");
             }
             let resolved = process_configurations(&log.text)?;
-            verify_process_configuration(config, role, &resolved)?;
+            verify_process_configuration_recording(config, role, &resolved, diff)?;
             let observed = !resolved.as_object().is_none_or(serde_json::Map::is_empty);
             let maintenance_tables = if matches!(role, ComponentRole::Maintenance) {
                 Some(maintenance_table_evidence(config, &log.text)?)

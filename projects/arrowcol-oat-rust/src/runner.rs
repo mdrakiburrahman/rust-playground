@@ -47,6 +47,7 @@ include!("runner_maintenance.rs");
 include!("runner_catalog_registration.rs");
 include!("runner_wal.rs");
 include!("runner_overload.rs");
+include!("runner_admission_diagnostics.rs");
 include!("runner_fixture.rs");
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4138,13 +4139,24 @@ async fn run_matrix_cell(
     let baseline_logs = platform.process_logs(config).await?;
     platform.retain_cell_process_baseline(&baseline_logs);
     let mut client_run = run_clients(config, run_id, &assigned_tables, platform, replicas).await?;
-    platform.finish_resource_measurement(config).await?;
+    let diagnostics_root = Path::new("out/arrowcol-oat/admission-diagnostics");
+    if let Err(error) = platform.finish_resource_measurement(config).await {
+        retain_admission_diagnostics(
+            diagnostics_root,
+            orchestration_id,
+            run_id,
+            client_run.evidence.overload_guard.as_mut(),
+            None,
+        );
+        return Err(error);
+    }
     let guard_stopped = client_run.evidence.overload_stop.is_some()
         || client_run
             .evidence
             .overload_guard
             .as_ref()
             .is_some_and(|guard| guard["status"] == "unavailable");
+    let mut startup_readback_diff = None;
     let capture = async {
         let post_client_ms = config
             .reconciliation_settle_timeout_seconds
@@ -4166,10 +4178,22 @@ async fn run_matrix_cell(
         .await?;
         client_run.evidence.durable_commits = durable_commits;
         let process_logs = platform.process_logs(config).await?;
-        client_run.evidence.processes = Some(process_evidence_for_cell(config, &process_logs, &baseline_logs)?);
+        client_run.evidence.processes = Some(process_evidence_for_cell(
+            config,
+            &process_logs,
+            &baseline_logs,
+            &mut startup_readback_diff,
+        )?);
         Ok::<(), anyhow::Error>(())
     }
     .await;
+    retain_admission_diagnostics(
+        diagnostics_root,
+        orchestration_id,
+        run_id,
+        client_run.evidence.overload_guard.as_mut(),
+        startup_readback_diff,
+    );
     if let Err(error) = capture {
         if !guard_stopped {
             return Err(error);
@@ -4661,7 +4685,13 @@ async fn run_clients_inner(
         } else {
             Duration::from_secs(5)
         };
-        match tokio::time::timeout(timeout, PreparedGuard::prepare(config, platform)).await {
+        let mut diagnostics = json!({});
+        match tokio::time::timeout(
+            timeout,
+            PreparedGuard::prepare_recording(config, platform, &mut diagnostics),
+        )
+        .await
+        {
             Ok(Ok(prepared)) => Some(prepared),
             result => {
                 let error = match result {
@@ -4675,6 +4705,7 @@ async fn run_clients_inner(
                     "unavailable_reason":"pre_admission_cap_backlog_or_commit_readback_unavailable",
                     "requested_container_memory_limit_bytes":config.platform.local.collector_memory_limit_bytes,
                     "error":error,
+                    "admission_diagnostics":diagnostics,
                 }));
                 return Ok(ClientRun {
                     metrics: HashMap::new(),

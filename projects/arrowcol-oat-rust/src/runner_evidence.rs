@@ -1288,7 +1288,10 @@ impl ResourceSampler {
                         .and_then(|(probe, _)| probe.expected_scale_out_identity.clone());
                     let guard_reading = async {
                         match (&mut guard, &backlog_scraper) {
-                            (Some((probe, _)), Some(scraper)) => probe.read(&config, scraper).await.map(Some),
+                            (Some((probe, engine)), Some(scraper)) => probe
+                                .read(&config, scraper, &mut engine.proof["admission_diagnostics"])
+                                .await
+                                .map(Some),
                             _ => Ok(None),
                         }
                     };

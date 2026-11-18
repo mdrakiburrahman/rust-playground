@@ -221,7 +221,7 @@ impl GuardEngine {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, serde::Serialize)]
 struct ScaleOutCollectorIdentity {
     pod: String,
     pod_uid: String,
@@ -378,7 +378,16 @@ struct PreparedGuard {
 }
 
 impl PreparedGuard {
+    #[cfg(test)]
     async fn prepare(config: &OatConfig, platform: &dyn Platform) -> Result<Self> {
+        Self::prepare_recording(config, platform, &mut json!({})).await
+    }
+
+    async fn prepare_recording(
+        config: &OatConfig,
+        platform: &dyn Platform,
+        diagnostics: &mut Value,
+    ) -> Result<Self> {
         if config.tunables.wal.is_some() {
             bail!("WAL disk-cap accounting is unavailable; this guard supports the memory-only campaign");
         }
@@ -401,6 +410,7 @@ impl PreparedGuard {
                 let [identity] = expected.as_slice() else {
                     bail!("scale-out guard requires exactly one collector identity");
                 };
+                diagnostics["selected_collector"] = sanitized_scale_out_identity(identity);
                 if log.instance_id != format!("{}/{}", identity.pod, config.dfe_container) {
                     bail!("collector startup evidence does not match the owned collector");
                 }
@@ -409,6 +419,11 @@ impl PreparedGuard {
                 None
             };
         let observed = process_configurations(&log.text)?;
+        let mut readback_diff = None;
+        let _ = verify_process_configuration_recording(config, ComponentRole::Collector, &observed, &mut readback_diff);
+        if let Some(diff) = readback_diff {
+            diagnostics["startup_readback_diff"] = diff;
+        }
         if observed["commit_telemetry"]
             != json!({"schema_version":1,
             "scope":"new_ingestion_addfiles_after_sync","clock":"system_unix_ms"})
@@ -443,13 +458,14 @@ impl PreparedGuard {
             "overlap_ms":GUARD_MAX_GAP_MS,"capability_source":"initial_complete_startup_readback"});
         let expected = prepared.probe.expected_scale_out_identity.clone();
         let (reading, backlog) = guarded_composite_observation(
-            prepared.probe.read(config, &prepared.scraper),
+            prepared.probe.read(config, &prepared.scraper, diagnostics),
             prepared.scraper.scrape(),
             verify_guard_identity(config, expected.as_deref()),
         ).await;
         prepared
             .engine
             .observe(reading?, &publication_backlog_sample(backlog?, 0, 0, 0))?;
+        prepared.engine.proof["admission_diagnostics"] = diagnostics.take();
         Ok(prepared)
     }
 }
@@ -538,7 +554,12 @@ impl GuardProbe {
         }
     }
 
-    async fn read(&mut self, config: &OatConfig, scraper: &PublicationBacklogScraper) -> Result<GuardReading> {
+    async fn read(
+        &mut self,
+        config: &OatConfig,
+        scraper: &PublicationBacklogScraper,
+        diagnostics: &mut Value,
+    ) -> Result<GuardReading> {
         let request_start_ms = unix_time_ms_u64()?;
         if let Some(expected) = &self.expected_scale_out_identity
             && scale_out_collector_snapshot(config, 1).await? != *expected
@@ -553,7 +574,11 @@ impl GuardProbe {
             "read collector cgroup memory usage and hard cap",
         );
         let logs = filtered_process_command_output(self.command(config, true)?, "read live ingestion commit evidence");
-        let pressure = scraper.read_endpoint(pressure_url.as_str());
+        let pressure = async {
+            let body = scraper.read_endpoint(pressure_url.as_str()).await?;
+            diagnostics["last_pressure"] = pressure_body_excerpt(&body);
+            Ok::<_, anyhow::Error>(body)
+        };
         let (memory, logs, pressure) = tokio::try_join!(memory, logs, pressure)?;
         let memory = String::from_utf8(memory.stdout)?;
         let container_cap = guard_container_memory(
