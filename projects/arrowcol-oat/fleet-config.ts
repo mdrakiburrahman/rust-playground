@@ -47,6 +47,7 @@ export interface FleetNode {
 }
 const MiB = 1024 ** 2;
 const GiB = 1024 ** 3;
+export const FLEET_CLIENT_RESERVATION = { cpu: 250, memory: 256 * MiB };
 const bounds = {
   collector: { dfe_workers: 256, runtime_workers: 64, blocking_workers: 256, cpu_workers: 128 },
   client: { workers: 1024, runtime_threads: 1024, connections_per_worker: 256, streams_per_worker: 1024,
@@ -89,7 +90,7 @@ function memory(value: unknown): number {
   if (!Number.isSafeInteger(result) || result <= 0) throw new Error('invalid fleet support memory request');
   return result;
 }
-function supportReservation(base: Record<string, unknown>): { cpu: number; memory: number } {
+export function supportReservation(base: Record<string, unknown>): { cpu: number; memory: number } {
   const platform = object(base.platform, 'platform');
   const resources = platform.resources === undefined ? {} : object(platform.resources, 'platform.resources');
   let reservedCpu = 4000, reservedMemory = 5 * GiB;
@@ -157,7 +158,7 @@ export function resolveFleetExperiment(
     cpu_workers: numeric(sizing.collector.cpu_workers, collectorCores, 128) };
   const existingClient = existingTunables.client === undefined ? {} : object(existingTunables.client, 'client');
   const clients = observations.filter(node => node.pool !== sizing.collector_pool).sort((a, b) => a.node.localeCompare(b.node)).map((node, index) => {
-    const placement = nodeBudget(node, { cpu: 250, memory: 256 * MiB });
+    const placement = nodeBudget(node, FLEET_CLIENT_RESERVATION);
     const cores = Math.floor(cpu(placement.resources.requests.cpu) / 1000);
     const bytes = memory(placement.resources.requests.memory);
     const maxMemory = numeric(sizing.client.max_memory_bytes, bytes / 2, Number.MAX_SAFE_INTEGER);

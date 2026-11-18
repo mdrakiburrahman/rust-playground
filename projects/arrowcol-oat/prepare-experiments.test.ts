@@ -289,8 +289,15 @@ test('offline CLI selects matching stamp capacity inputs and rejects mismatches 
       state: 'ready' as const, reason: null }));
     await writeFile(resolve(root, 'full-fleet-input.json'), JSON.stringify(fullFleet));
     await writeFile(resolve(root, 'observation.json'), JSON.stringify({ nodes, pools }));
-    await main(['--base', resolve(root, 'full-fleet-input.json'), '--fleet-observation', resolve(root, 'observation.json'),
-      '--out', resolve(root, 'full-fleet'), '--stamp-config', selectedStampPath], workspace);
+    const fleetArgs = ['--base', resolve(root, 'full-fleet-input.json'), '--fleet-observation', resolve(root, 'observation.json'),
+      '--out', resolve(root, 'full-fleet'), '--stamp-config', selectedStampPath];
+    await assert.rejects(main(fleetArgs, workspace), /requires digest-bound image architecture observations/);
+    const imageObservations = Object.values(images).map(image => ({ image, architectures: ['arm64'] }));
+    await writeFile(resolve(root, 'observation.json'), JSON.stringify({ nodes, pools, images: imageObservations }));
+    await assert.rejects(main(fleetArgs, workspace), /architecture is missing or incompatible/);
+    for (const image of imageObservations) image.architectures = ['amd64'];
+    await writeFile(resolve(root, 'observation.json'), JSON.stringify({ nodes, pools, images: imageObservations }));
+    await main(fleetArgs, workspace);
     assert.deepEqual(JSON.parse(await readFile(resolve(root, 'full-fleet/full-fleet.config.json'), 'utf8')),
       prepareFullFleetExperiment(fullFleet, { nodes, pools }));
     await writeFile(resolve(workspace, 'infra/azure/stamp.yaml'), exampleStamp.replace('stamp: 1', 'stamp: 2'));

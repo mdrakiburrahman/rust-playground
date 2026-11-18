@@ -10,6 +10,35 @@ const poolWritable = new Set(['count', 'vmSize', 'osDiskSizeGB', 'osDiskType', '
   'capacityReservationGroupID', 'tags']);
 const poolReadonly = new Set(['provisioningState', 'currentOrchestratorVersion', 'nodeImageVersion', 'status', 'eTag']);
 
+export function fleetPoolConfiguration(resource: unknown): Record<string, unknown> {
+  const selected = object(resource), properties = object(selected.properties);
+  for (const key of Object.keys(selected))
+    if (!['id', 'name', 'type', 'location', 'etag', 'eTag', 'properties', 'tags', 'systemData'].includes(key))
+      throw new Error('Unrecognized fleet pool resource configuration.');
+  for (const key of Object.keys(properties))
+    if (!poolWritable.has(key) && !poolReadonly.has(key)) throw new Error('Unrecognized fleet pool configuration.');
+  return {
+    ...(selected.location === undefined ? {} : { location: selected.location }),
+    ...(selected.tags === undefined ? {} : { tags: selected.tags }),
+    properties: Object.fromEntries(Object.entries(properties).filter(([key]) =>
+      poolWritable.has(key) && !['count', 'minCount', 'maxCount'].includes(key))),
+  };
+}
+
+export function buildFleetPoolScalePayload(resource: unknown, approved: { resourceId: string; sku: string; maxCount: number },
+  count: number): Record<string, unknown> {
+  const selected = object(resource), properties = object(selected.properties);
+  fleetPoolConfiguration(selected);
+  if (typeof selected.id !== 'string' || selected.id.toLowerCase() !== approved.resourceId.toLowerCase() ||
+      properties.mode !== 'User' || properties.osType !== 'Linux' || properties.vmSize !== approved.sku ||
+      properties.enableAutoScaling !== true || !Number.isSafeInteger(approved.maxCount) || approved.maxCount < 1 ||
+      !Number.isSafeInteger(count) || count < 0 || count > approved.maxCount)
+    throw new Error('Fleet scale requires an exact approved autoscaled Linux User pool.');
+  return { ...(selected.tags === undefined ? {} : { tags: selected.tags }),
+    properties: { ...Object.fromEntries(Object.entries(properties).filter(([key]) => poolWritable.has(key))),
+      count, minCount: count, maxCount: count === 0 ? approved.maxCount : count, enableAutoScaling: true } };
+}
+
 
 export function buildAksPoolScalePayload(resource: unknown, target: { count: number; autoscale: boolean; minimum: number | null; maximum: number | null }): Record<string, unknown> {
   const selected = object(resource), properties = object(selected.properties);

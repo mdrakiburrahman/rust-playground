@@ -1517,6 +1517,9 @@ export async function launchOat(
     }
     onProgress(status);
     while (status.state === 'queued' || status.state === 'running') {
+      if (runSignal?.aborted && (mode === 'aks' || submittedPlatform(binding.submitted_config_body) === 'aks')) {
+        throw new Error('AKS fleet execution interrupted; run remains unsettled and no local cancellation authority is inferred');
+      }
       if (!cancellationRequested || cancellationObserved) {
         let pollTimer: NodeJS.Timeout;
         const pollDelay = new Promise<'poll'>((resolvePoll) => {
@@ -1628,6 +1631,7 @@ export async function main(
   receiptRoot = launcherDeadlineReceiptRoot,
   collect: typeof collectDataFlow = collectDataFlow,
   onOwnedRun?: OatOwnedRunObserver,
+  signal?: AbortSignal,
 ): Promise<void> {
   const launcherStartedAtUnixMs = Date.now();
   const launcherStartedAtMonotonicMs = performance.now();
@@ -1758,7 +1762,7 @@ export async function main(
     try {
       try {
         const code = await reportDataFlowRun(
-          (progress) => launchOat(configPath, requestedServerUrl, pollValue, fetch, progress, mode, getDockerBridgeGateway, interrupt?.controller.signal, undefined, undefined, deadline, submission),
+          (progress) => launchOat(configPath, requestedServerUrl, pollValue, fetch, progress, mode, getDockerBridgeGateway, interrupt?.controller.signal ?? signal, undefined, undefined, deadline, submission),
           config, mode, undefined, runner, network, warnings, collect,
         );
         if (interrupt?.signal) {
@@ -1904,7 +1908,7 @@ export async function main(
         runCleanupComplete = (status.state === 'succeeded' || status.state === 'cancelled') && deadline.cleanupState === 'confirmed';
       };
       const code = await reportDataFlowRun(
-        (progress) => launchOat(configPath, server.url, pollValue, fetch, progress, mode, getDockerBridgeGateway, interrupt?.controller.signal, onRunStarted, onRunFinished, deadline, submission),
+        (progress) => launchOat(configPath, server.url, pollValue, fetch, progress, mode, getDockerBridgeGateway, interrupt?.controller.signal ?? signal, onRunStarted, onRunFinished, deadline, submission),
         config, mode, server.gitSha, runner, network, warnings, collect,
       );
       if (interrupt?.signal) {

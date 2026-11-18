@@ -608,3 +608,296 @@ test('capped campaign read cancels an unclosed body at its original deadline', a
     /original deadline/);
   assert.equal(body.wasCancelled(), true);
 });
+
+import { acquireFleetAuthority, FleetUnsettledDispatchError, type FleetBinding, type FleetPoolObservation } from './aks-fleet-custody.js';
+import type { Azure } from '../../infra/azure/bootstrap.js';
+
+class FleetBlobFake {
+  c = { checkpoints: 'checkpoints' };
+  blobs = new Map<string, { bytes: Buffer; etag: string }>();
+  revision = 0;
+  held?: string;
+  journalLease?: string;
+  beforeJournalUpdate?: () => void;
+  beforeCampaignClaim?: () => void;
+  failNextJournalWrite = false;
+  async lease(action: string, id: string) {
+    if (action === 'acquire') { if (this.held) throw new Error('lease held'); this.held = id; return; }
+    if (this.held !== id) throw new Error('stale lease');
+    if (action === 'release') this.held = undefined;
+  }
+  async blob(method: string, _container: string, name: string, query?: Record<string, string>, body?: string | Buffer | null,
+    headers: Record<string, string> = {}) {
+    if (method === 'PUT' && name === 'active.json') this.beforeCampaignClaim?.();
+    const old = this.blobs.get(name), journal = name === 'oat-fleet/active.v1.json';
+    if (query?.comp === 'lease') {
+      if (method !== 'PUT' || !journal || !old) throw new Error('lease requires existing journal blob');
+      const action = headers['x-ms-lease-action'];
+      if (action === 'acquire') {
+        if (this.journalLease || !headers['x-ms-proposed-lease-id'] || headers['if-match'] !== old.etag) throw new Error('lease held or ETag changed');
+        this.journalLease = headers['x-ms-proposed-lease-id'];
+      } else {
+        if (!this.journalLease || this.journalLease !== headers['x-ms-lease-id']) throw new Error('stale lease');
+        if (action === 'release') this.journalLease = undefined;
+        else if (action !== 'renew') throw new Error('unexpected lease operation');
+      }
+      return [null, {}] as const;
+    }
+    if (method === 'GET') return [old?.bytes ?? null, old ? { etag: old.etag } : {}] as const;
+    if (headers['if-match'] && headers['if-match'] !== old?.etag || headers['if-none-match'] === '*' && old) throw new Error('precondition failed');
+    if (method === 'DELETE') { this.blobs.delete(name); return [null, {}] as const; }
+    if (method !== 'PUT') throw new Error('unexpected operation');
+    if (journal && old) {
+      this.beforeJournalUpdate?.();
+      if (!this.journalLease || headers['x-ms-lease-id'] !== this.journalLease) throw new Error('stale journal write lease');
+    }
+    const etag = `"${++this.revision}"`;
+    this.blobs.set(name, { bytes: Buffer.from(body!), etag });
+    if (name === 'oat-fleet/active.v1.json' && this.failNextJournalWrite) {
+      this.failNextJournalWrite = false;
+      throw new Error('write outcome unknown');
+    }
+    return [null, { etag }] as const;
+  }
+  azure() { return this as unknown as Azure; }
+}
+const fleetBinding: FleetBinding = { clusterId: resourceId, server: 'https://bench.example', pools: [
+  { name: 'arrow', sku: 'Standard_D4s_v5', vcpu: 4, role: 'arrowcol', count: 1, maxCount: 3 },
+  { name: 'client', sku: 'Standard_D2s_v5', vcpu: 2, role: 'client', count: 1, maxCount: 2 },
+] };
+const fleetObservation = (name: string, count = 0, etag = '"arm-0"'): FleetPoolObservation => ({ name,
+  resourceId: resourceId + '/agentPools/' + name, sku: fleetBinding.pools.find(p => p.name === name)!.sku,
+  count, provisioningState: 'Succeeded', etag, configurationHash: 'baseline-' + name });
+const fleetBaseline = () => fleetBinding.pools.map(p => fleetObservation(p.name));
+const fleetOwner = { ownerId, resume: false };
+
+test('fleet custody excludes competing legacy campaigns and rejects nonzero baselines', async () => {
+  const fake = new FleetBlobFake();
+  const legacy = newCampaignState(campaignId, ownerId);
+  await fake.blob('PUT', 'checkpoints', 'active.json', undefined, JSON.stringify(legacy));
+  await assert.rejects(acquireFleetAuthority(fake.azure(), fleetBinding, fleetOwner), /Another campaign/);
+  assert.equal(fake.blobs.has('oat-fleet/active.v1.json'), false);
+  await fake.blob('DELETE', 'checkpoints', 'active.json');
+  const authority = await acquireFleetAuthority(fake.azure(), fleetBinding, fleetOwner);
+  assert.equal(validateCampaignState(JSON.parse(fake.blobs.get('active.json')!.bytes.toString())).mode, 'observe');
+  await assert.rejects(authority.establishBaseline([fleetObservation('arrow', 1), fleetObservation('client')]), /baseline/i);
+  await authority.establishBaseline(fleetBaseline());
+  await assert.rejects(startCampaign({
+    read: async () => ({ state: validateCampaignState(JSON.parse(fake.blobs.get('active.json')!.bytes.toString())), etag: fake.blobs.get('active.json')!.etag }),
+    write: async () => { throw new Error('unexpected legacy write'); },
+  }, campaignId, ownerId), /unfinished campaign/);
+  await authority.complete();
+  await authority.close();
+  assert.equal(fake.blobs.has('active.json'), false);
+});
+
+test('fleet custody records intent before dispatch and recovers only settled owned pools', async () => {
+  const fake = new FleetBlobFake();
+  const first = await acquireFleetAuthority(fake.azure(), fleetBinding, fleetOwner);
+  await first.establishBaseline(fleetBaseline());
+  const [id, clientId] = await Promise.all([first.beforeDispatch('arrow', 1, '"arm-0"'), first.beforeDispatch('client', 1, '"arm-0"')]);
+  const journal = JSON.parse(fake.blobs.get('oat-fleet/active.v1.json')!.bytes.toString());
+  assert.equal(journal.pools.arrow.dispatch.id, id);
+  assert.equal(journal.pools.client.dispatch.id, clientId);
+  await first.afterDispatch('arrow', id, 'uncertain');
+  await first.afterDispatch('client', clientId, 'conflict');
+  await assert.rejects(first.recordObservation(fleetObservation('arrow')), /uncertain/);
+  await first.recordObservation(fleetObservation('client'));
+  await first.close();
+  const mismatch = structuredClone(fleetBinding); mismatch.pools[0]!.maxCount++;
+  await assert.rejects(acquireFleetAuthority(fake.azure(), mismatch, { ownerId, resume: true }), /binding/);
+  const recovered = await acquireFleetAuthority(fake.azure(), fleetBinding, { ownerId, resume: true });
+  await assert.rejects(recovered.beforeDispatch('client', 1, '"arm-0"'), /not authorized/);
+  await assert.rejects(recovered.beforeDispatch('arrow', 0, '"arm-0"'), /not authorized/);
+  await recovered.recordObservation(fleetObservation('arrow', 1, '"arm-1"'));
+  const down = await recovered.beforeDispatch('arrow', 0, '"arm-1"');
+  await recovered.afterDispatch('arrow', down, 'accepted');
+  await assert.rejects(recovered.complete(), /settled/);
+  await recovered.recordObservation(fleetObservation('arrow', 0, '"arm-2"'));
+  await recovered.complete();
+  await recovered.close();
+});
+
+test('fleet custody fences stale leases and uncertain journal writes', async () => {
+  const fake = new FleetBlobFake();
+  const authority = await acquireFleetAuthority(fake.azure(), fleetBinding, fleetOwner);
+  await authority.establishBaseline(fleetBaseline());
+  fake.failNextJournalWrite = true;
+  await assert.rejects(authority.beforeDispatch('arrow', 1, '"arm-0"'), /unknown/);
+  await assert.rejects(authority.beforeDispatch('client', 1, '"arm-0"'), /uncertain/);
+  await authority.close();
+  const recovered = await acquireFleetAuthority(fake.azure(), fleetBinding, { ownerId, resume: true });
+  await assert.rejects(recovered.recordObservation(fleetObservation('arrow')), /uncertain/);
+  fake.journalLease = 'other-lease';
+  await assert.rejects(recovered.assertCurrent(), /stale lease/);
+  await assert.rejects(recovered.beforeDispatch('client', 0, '"arm-0"'), /fenced/);
+  await assert.rejects(recovered.close(), /stale lease/);
+});
+
+test('fleet custody refuses configuration drift, unknown pools and corrupt journals', async () => {
+  const fake = new FleetBlobFake();
+  const first = await acquireFleetAuthority(fake.azure(), fleetBinding, fleetOwner);
+  await first.establishBaseline(fleetBaseline());
+  await assert.rejects(first.recordObservation({ ...fleetObservation('arrow'), configurationHash: 'changed' }), /configuration/);
+  await assert.rejects(first.recordObservation({ ...fleetObservation('arrow'), name: 'unowned' }), /approved/);
+  await assert.rejects(first.beforeDispatch('arrow', 1, '"old"'), /not authorized/);
+  await first.close();
+  const blob = fake.blobs.get('oat-fleet/active.v1.json')!;
+  const value = JSON.parse(blob.bytes.toString()); value.unexpected = true;
+  blob.bytes = Buffer.from(JSON.stringify(value));
+  await assert.rejects(acquireFleetAuthority(fake.azure(), fleetBinding, { ownerId, resume: true }), /Invalid fleet journal/);
+});
+
+test('fleet custody fences a replaced legacy campaign and preserves its journal', async () => {
+  const fake = new FleetBlobFake();
+  const authority = await acquireFleetAuthority(fake.azure(), fleetBinding, fleetOwner);
+  await authority.establishBaseline(fleetBaseline());
+  await fake.blob('PUT', 'checkpoints', 'active.json', undefined, JSON.stringify(newCampaignState(campaignId, ownerId)));
+  await assert.rejects(authority.assertCurrent(), /fenced/);
+  await assert.rejects(authority.beforeDispatch('arrow', 1, '"arm-0"'), /fenced/);
+  await authority.close();
+  await assert.rejects(acquireFleetAuthority(fake.azure(), fleetBinding, { ownerId, resume: true }), /Another campaign/);
+});
+
+test('fleet custody accepts 70 and 128 unique client pools and enforces collector and client bounds', async () => {
+  const bindingFor = (clients: number): FleetBinding => ({ ...fleetBinding, pools: [fleetBinding.pools[0]!,
+    ...Array.from({ length: clients }, (_, i) => ({ name: `client${i}`, sku: 'Standard_D2s_v5', vcpu: 2,
+      role: 'client' as const, count: 1, maxCount: 2 }))] });
+  for (const count of [70, 128]) {
+    const binding = bindingFor(count), fake = new FleetBlobFake();
+    const authority = await acquireFleetAuthority(fake.azure(), binding, fleetOwner);
+    await authority.establishBaseline(binding.pools.map(pool => ({ name: pool.name, resourceId: resourceId + '/agentPools/' + pool.name,
+      sku: pool.sku, count: 0, provisioningState: 'Succeeded', etag: '"arm-0"', configurationHash: 'hash-' + pool.name })));
+    await authority.complete(); await authority.close();
+  }
+  const malformed = [bindingFor(129), bindingFor(0), { ...fleetBinding, pools: [fleetBinding.pools[1]!, fleetBinding.pools[1]!] },
+    { ...fleetBinding, pools: [{ ...fleetBinding.pools[0]!, count: 2 }, fleetBinding.pools[1]!] },
+    { ...fleetBinding, pools: [fleetBinding.pools[0]!, { ...fleetBinding.pools[1]!, count: 129, maxCount: 129 }] },
+    { ...fleetBinding, pools: [fleetBinding.pools[0]!, { ...fleetBinding.pools[0]!, name: 'arrow2' }, fleetBinding.pools[1]!] }];
+  for (const binding of malformed) await assert.rejects(acquireFleetAuthority(new FleetBlobFake().azure(), binding, fleetOwner), /fleet|pool/i);
+});
+
+test('fleet custody refuses a valid terminal unsettled legacy cleanup and unknown state', async () => {
+  const fake = new FleetBlobFake(), now = Date.now(), started = now - 300_000;
+  const base = newCampaignState(campaignId, ownerId, started), inventory = inventoryFor(base, true);
+  inventory.load_admission = 'authorized';
+  inventory.resources = inventory.resources.map(resource => ({ ...resource, state: 'removed' }));
+  inventory.fic = null; inventory.qap = null;
+  const reason = 'drain_deadline_expired_unsettled' as const;
+  const complete = { state: 'complete' as const, deadline_unix_ms: null, reason_code: null };
+  inventory.cleanup = { stop_admission: complete, bounded_drain: { state: 'uncertain', deadline_unix_ms: now - 1000, reason_code: reason },
+    evidence_capture: complete, stop_maintenance: complete, terminal_capture: complete,
+    handoff: { state: 'failed', deadline_unix_ms: null, reason_code: reason } };
+  const proof = { schemaVersion: 1 as const, campaignId, producerOwnerId: ownerId, producerFencingToken: 1,
+    actorOwnerId: ownerId, actorFencingToken: 2, orchestrationRunId: inventory.orchestration_run_id,
+    cellRunId: inventory.cell_run_id, namespaceName: inventory.namespace.name, namespaceUid: inventory.namespace.uid!,
+    deadlineUnixMs: now - 1000, observedAtUnixMs: now, reason, deltaRows: null, kustoRows: null };
+  const legacy: CampaignState = { ...base, mode: 'armed', status: 'complete_unsettled', fencingToken: 2,
+    fenceReason: 'heartbeat-expired', fencedAtMs: now - 2000, cleanupStatus: 'verified_with_unsettled', runInventory: inventory,
+    cleanupSteps: CUSTODY_CLEANUP_STEPS.map(step => ({ step, idempotencyKey: `${campaignId}:2:${step}`,
+      ...(step === 'bounded-drain' ? { status: 'unsettled' as const, unsettled: proof } : { status: 'complete' as const }) })) };
+  validateCampaignState(legacy);
+  await fake.blob('PUT', 'checkpoints', 'active.json', undefined, JSON.stringify(legacy));
+  await assert.rejects(acquireFleetAuthority(fake.azure(), fleetBinding, fleetOwner), /Another campaign/);
+  assert.equal(fake.blobs.has('oat-fleet/active.v1.json'), false);
+  await fake.blob('PUT', 'checkpoints', 'active.json', undefined, JSON.stringify({ ...legacy, status: 'unknown' }));
+  await assert.rejects(acquireFleetAuthority(fake.azure(), fleetBinding, fleetOwner), /malformed|unknown/i);
+});
+
+test('fleet custody keeps uncertain dispatch intent across Updating, Failed and old-count readback', async () => {
+  const fake = new FleetBlobFake(), authority = await acquireFleetAuthority(fake.azure(), fleetBinding, fleetOwner);
+  await authority.establishBaseline(fleetBaseline());
+  const id = await authority.beforeDispatch('arrow', 1, '"arm-0"');
+  await authority.afterDispatch('arrow', id, 'accepted');
+  for (const provisioningState of ['Updating', 'Failed', 'Succeeded']) {
+    await assert.rejects(authority.recordObservation({ ...fleetObservation('arrow'), provisioningState }), FleetUnsettledDispatchError);
+    await assert.rejects(authority.beforeDispatch('arrow', 1, '"arm-0"'), /not authorized/);
+  }
+  await assert.rejects(authority.recordObservation({ ...fleetObservation('arrow'), provisioningState: 'Updating', configurationHash: 'changed' }), /configuration/);
+  await authority.recordObservation(fleetObservation('arrow', 1, '"arm-1"'));
+  const down = await authority.beforeDispatch('arrow', 0, '"arm-1"');
+  await authority.afterDispatch('arrow', down, 'accepted');
+  await authority.recordObservation(fleetObservation('arrow', 0, '"arm-2"'));
+  await authority.complete(); await authority.close();
+});
+
+test('fleet custody repairs terminal failed scale-up at old or target count to settled zero', async () => {
+  for (const [status, count] of [['Failed', 0], ['Canceled', 1]] as const) {
+    const fake = new FleetBlobFake();
+    const initial = await acquireFleetAuthority(fake.azure(), fleetBinding, fleetOwner);
+    await initial.establishBaseline(fleetBaseline());
+    const up = await initial.beforeDispatch('arrow', 1, '"arm-0"');
+    await initial.afterDispatch('arrow', up, 'uncertain');
+    await assert.rejects(initial.recordObservation({ ...fleetObservation('arrow', 0, '"arm-0"'), provisioningState: status }), FleetUnsettledDispatchError);
+    await assert.rejects(initial.recordObservation(fleetObservation('arrow', 0, '"arm-1"')), FleetUnsettledDispatchError);
+    await assert.rejects(initial.recordObservation({ ...fleetObservation('arrow', 2, '"arm-1"'), provisioningState: status }), /count/);
+    await initial.recordObservation({ ...fleetObservation('arrow', count, '"arm-1"'), provisioningState: status });
+    await assert.rejects(initial.complete(), /settled/);
+    await assert.rejects(initial.beforeDispatch('arrow', 1, '"arm-1"'), /not authorized/);
+    await initial.close();
+    const resumed = await acquireFleetAuthority(fake.azure(), fleetBinding, { ownerId, resume: true });
+    const down = await resumed.beforeDispatch('arrow', 0, '"arm-1"');
+    await resumed.afterDispatch('arrow', down, 'accepted');
+    if (count === 0) await assert.rejects(resumed.recordObservation(fleetObservation('arrow', 0, '"arm-1"')), FleetUnsettledDispatchError);
+    await resumed.recordObservation(fleetObservation('arrow', 0, '"arm-2"'));
+    await resumed.complete(); await resumed.close();
+  }
+});
+
+test('fleet custody leaves publisher container lease independent and fences stale journal writes', async () => {
+  const fake = new FleetBlobFake(), authority = await acquireFleetAuthority(fake.azure(), fleetBinding, fleetOwner);
+  assert.ok(fake.journalLease);
+  await fake.lease('acquire', 'publisher');
+  await authority.establishBaseline(fleetBaseline());
+  await assert.rejects(acquireFleetAuthority(fake.azure(), fleetBinding, { ownerId, resume: true }), /lease held/);
+  await authority.assertCurrent();
+  await fake.lease('release', 'publisher');
+  const prior = fake.blobs.get('oat-fleet/active.v1.json');
+  fake.beforeJournalUpdate = () => { fake.journalLease = 'replacement'; };
+  await assert.rejects(authority.beforeDispatch('arrow', 1, '"arm-0"'), /stale journal write lease/);
+  assert.equal(fake.blobs.get('oat-fleet/active.v1.json'), prior);
+  await assert.rejects(authority.assertCurrent(), /fenced/);
+  await assert.rejects(authority.close(), /stale lease/);
+});
+
+test('fleet custody does not adopt a journal after unconfirmed initial creation', async () => {
+  const fake = new FleetBlobFake();
+  fake.failNextJournalWrite = true;
+  await assert.rejects(acquireFleetAuthority(fake.azure(), fleetBinding, fleetOwner), /write outcome unknown/);
+  assert.equal(fake.journalLease, undefined);
+  assert.equal(fake.blobs.has('active.json'), false);
+  await assert.rejects(acquireFleetAuthority(fake.azure(), fleetBinding, fleetOwner), /exact recovery/);
+  const recovered = await acquireFleetAuthority(fake.azure(), fleetBinding, { ownerId, resume: true });
+  await assert.rejects(recovered.beforeDispatch('arrow', 0, '"arm-0"'), /not authorized/);
+  await recovered.close();
+});
+
+test('fleet custody journal lease does not override a legacy contender that wins campaign CAS', async () => {
+  const fake = new FleetBlobFake();
+  const winner = newCampaignState(campaignId, ownerId);
+  fake.beforeCampaignClaim = () => {
+    fake.beforeCampaignClaim = undefined;
+    fake.blobs.set('active.json', { bytes: Buffer.from(JSON.stringify(winner)), etag: '"legacy-winner"' });
+  };
+  await assert.rejects(acquireFleetAuthority(fake.azure(), fleetBinding, fleetOwner), /precondition failed/);
+  assert.equal(fake.journalLease, undefined);
+  assert.deepEqual(JSON.parse(fake.blobs.get('active.json')!.bytes.toString()), winner);
+  await assert.rejects(acquireFleetAuthority(fake.azure(), fleetBinding, { ownerId, resume: true }), /Another campaign/);
+});
+
+test('fleet custody resumes an empty journal only by proving its exact zero baseline', async () => {
+  const fake = new FleetBlobFake();
+  const initial = await acquireFleetAuthority(fake.azure(), fleetBinding, fleetOwner);
+  await initial.close();
+  const resumed = await acquireFleetAuthority(fake.azure(), fleetBinding, { ownerId, resume: true });
+  assert.equal(resumed.baselineEstablished, false);
+  await assert.rejects(resumed.establishBaseline([fleetObservation('arrow', 1), fleetObservation('client')]), /must be unique, settled and zero/);
+  assert.equal(resumed.baselineEstablished, false);
+  await resumed.establishBaseline(fleetBaseline());
+  await resumed.close();
+  const established = await acquireFleetAuthority(fake.azure(), fleetBinding, { ownerId, resume: true });
+  assert.equal(established.baselineEstablished, true);
+  await assert.rejects(established.establishBaseline(fleetBaseline()), /Baseline already established/);
+  await established.complete();
+  await established.close();
+});

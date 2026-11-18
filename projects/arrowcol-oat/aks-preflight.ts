@@ -2,7 +2,9 @@ import { execFileSync } from 'node:child_process';
 import { lstat, readFile } from 'node:fs/promises';
 import { isAbsolute, relative, resolve, sep } from 'node:path';
 import { loadStampConfig } from '../../infra/azure/stamp.js';
-import { validateRuntime, type RuntimeConfig } from './runtime.js';
+import { cpuMilli, memoryBytes, validateRuntime, type RuntimeConfig } from './runtime.js';
+import { parseAksNodeInventory } from './aks-fleet.js';
+import { FLEET_CLIENT_RESERVATION, supportReservation } from './fleet-config.js';
 
 export interface PreflightCheck {
   name: string;
@@ -344,6 +346,40 @@ export async function runAksPreflight(configPath: string, options: PreflightOpti
     }
     const live = aks ?? az(['aks', 'show', '-g', resourceGroup, '-n', requireValue(clusterName, 'cluster name')]);
     const pools = records(live.agentPoolProfiles);
+    if (platform.fleet !== undefined) {
+      if (!selectedStamp) throw new Error('Fleet requires the exact selected stamp configuration.');
+      const fleet = object(platform.fleet, 'resolved fleet');
+      const collector = object(fleet.collector, 'resolved collector');
+      if (!Array.isArray(fleet.clients) || fleet.clients.length < 1) throw new Error('Resolved fleet has no clients.');
+      const placements = [{ role: 'arrowcol', placement: collector }, ...fleet.clients.map(client =>
+        ({ role: 'client', placement: object(object(client, 'fleet client').placement, 'client placement') }))];
+      if (runtime?.collectorPool !== undefined &&
+          (runtime.collectorPool !== collector.pool || runtime.collectorNode !== collector.node))
+        throw new Error('Runtime collector identity differs from resolved fleet.');
+      const inventory = parseAksNodeInventory(kube(['get', 'nodes', '-o', 'json']),
+        kube(['get', 'pods', '--all-namespaces', '-o', 'json']));
+      const seen = new Set<string>();
+      for (const { role, placement } of placements) {
+        const name = requireValue(text(placement.node), 'resolved fleet node');
+        const configured = selectedStamp.aks.userPools.find(pool => pool.name === placement.pool && pool.role === role);
+        const observedPool = pools.filter(pool => pool.name === placement.pool);
+        const node = inventory.find(node => node.node === name);
+        if (seen.has(name) || !configured || configured.vmSize !== placement.sku || observedPool.length !== 1 ||
+            observedPool[0]!.vmSize !== placement.sku || at(observedPool[0]!.nodeLabels, 'arrow-collector/role') !== role ||
+            observedPool[0]!.provisioningState !== 'Succeeded' || !node || !node.ready || !node.amd64 ||
+            !node.placementLabelsValid || node.role !== role || node.pool !== placement.pool ||
+            node.observedSku !== placement.sku || !node.skuLabelsConsistent)
+          throw new Error('Selected fleet pool/SKU/node identity or Ready architecture differs from live observations.');
+        seen.add(name);
+        const reservation = role === 'arrowcol' ? supportReservation(config) : FLEET_CLIENT_RESERVATION;
+        const resources = object(placement.resources, 'resolved fleet resources');
+        for (const values of [object(resources.requests, 'fleet requests'), object(resources.limits, 'fleet limits')]) {
+          if (cpuMilli(values.cpu) > BigInt(node.allocatable_cpu_millicores - node.requested_cpu_millicores - reservation.cpu) ||
+              memoryBytes(values.memory) > BigInt(node.allocatable_memory_bytes - node.requested_memory_bytes - reservation.memory))
+            throw new Error('Resolved fleet budget exceeds fresh unrequested node capacity after support reservation.');
+        }
+      }
+    }
     for (const role of ['arrowcol', 'client']) {
       const eligible = pools.filter((pool) => at(pool.nodeLabels, 'arrow-collector/role') === role &&
         pool.osType === 'Linux' && pool.provisioningState === 'Succeeded' &&
@@ -371,6 +407,12 @@ export async function runAksPreflight(configPath: string, options: PreflightOpti
       if (!match) throw new Error('All five images, including the DMV client, must be immutable digests in the selected stamp registry.');
       const found = az(['acr', 'repository', 'show', '-n', `arrowcollector${stamp}`, '--image', `${match[1]}@${match[2]}`]);
       if (found.digest !== match[2]) throw new Error('Registry manifest digest does not match the selected immutable image.');
+      if (platform.fleet !== undefined) {
+        const metadata = az(['acr', 'manifest', 'show-metadata', '--registry', `arrowcollector${stamp}`,
+          '--name', `${match[1]}@${match[2]}`]);
+        if (metadata.digest !== match[2] || metadata.os !== 'linux' || metadata.architecture !== 'amd64')
+          throw new Error('Fleet image digest or observed Linux/amd64 manifest architecture is unavailable or incompatible.');
+      }
     }
     return 'All four runtime images and the fifth DMV client digest exist in the selected registry.';
   });

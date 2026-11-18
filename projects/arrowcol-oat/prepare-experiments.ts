@@ -94,6 +94,26 @@ export function prepareFullFleetExperiment(
   return resolveFleetExperiment(base, base.platform.fleet, snapshot.nodes, snapshot.pools);
 }
 
+function assertFleetImageCompatibility(required: string[], nodes: FleetNodeObservation[], input: unknown): void {
+  if (!Array.isArray(input)) throw new Error('fleet observation requires digest-bound image architecture observations');
+  const images = new Map<string, string[]>();
+  for (const raw of input) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('invalid fleet image architecture observation');
+    const item = raw as Record<string, unknown>;
+    if (Object.keys(item).sort().join() !== 'architectures,image' ||
+        typeof item.image !== 'string' || images.has(item.image) ||
+        !Array.isArray(item.architectures) || item.architectures.length === 0 ||
+        item.architectures.some(value => typeof value !== 'string' || !/^[a-z0-9_]+$/.test(value)))
+      throw new Error('fleet image observations require unique pinned images and nonempty architecture lists');
+    images.set(item.image, item.architectures);
+  }
+  for (const image of new Set(required)) {
+    const architectures = images.get(image);
+    if (!architectures || nodes.some(node => !architectures.includes(node.architecture)))
+      throw new Error('fleet image architecture is missing or incompatible with a selected node');
+  }
+}
+
 function integer(value: unknown, min: number, max: number, name: string): number {
   if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < min || value > max) {
     throw new Error(`${name} must be an integer from ${min} through ${max}`);
@@ -141,7 +161,7 @@ export function prepareExperiments(
   ]));
 }
 
-async function assertSafeOutputParents(workspaceRoot: string, out: string): Promise<void> {
+export async function assertSafeOutputParents(workspaceRoot: string, out: string): Promise<void> {
   const root = resolve(workspaceRoot);
   const relativeParent = relative(root, dirname(out));
   let current = root;
@@ -203,13 +223,17 @@ export async function main(args: string[], workspaceRoot = resolve('.')): Promis
     throw new Error('generated AKS config must supply a digest-pinned DMV client image');
   }
   const tables = fixtureTables(await readFile(resolve(root, 'projects/loadtest/schemas/sqlserver.sql'), 'utf8'));
-  const configs = values['fleet-observation'] ? {
-    'full-fleet': prepareFullFleetExperiment(base, JSON.parse(await readFile(values['fleet-observation'], 'utf8'))),
-  } : prepareExperiments(base, tables, {
+  const snapshot = values['fleet-observation'] ? JSON.parse(await readFile(values['fleet-observation'], 'utf8')) : undefined;
+  const configs = snapshot === undefined ? prepareExperiments(base, tables, {
     warmupSeconds: Number(values['warmup-seconds']),
     measureSeconds: Number(values['measure-seconds']),
     higherDfeConcurrency: Number(values['higher-dfe']),
-  });
+  }) : { 'full-fleet': prepareFullFleetExperiment(base, snapshot) };
+  if (snapshot !== undefined) {
+    assertFleetImageCompatibility(
+      [...Object.values(runtime.images).filter((image): image is string => typeof image === 'string'), base.dmv_client_image],
+      snapshot.nodes, snapshot.images);
+  }
   const stampConfigPath = resolve(root, values['stamp-config'] ?? 'infra/azure/stamp.yaml');
   let stampSource: string;
   try {
