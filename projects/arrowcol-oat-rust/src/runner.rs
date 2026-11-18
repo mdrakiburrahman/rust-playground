@@ -2804,6 +2804,15 @@ async fn poll_aks_client_job(config: &OatConfig, handle: &ClientHandle) -> Resul
     })
 }
 
+// Published clients emit large prepared metrics before READY, then ACK as their
+// last pre-start line. Selecting one line keeps byte limits from hiding either.
+const AKS_CLIENT_HANDSHAKE_TAIL: &str = "--tail=1";
+
+fn aks_client_handshake_progress(output: &str) -> (bool, bool) {
+    let acknowledged = output.contains("OAT_SCHEDULE_RECEIVED ");
+    (acknowledged || output.contains("OAT_CLIENT_READY "), acknowledged)
+}
+
 async fn poll_aks_client_fleet(
     config: &OatConfig,
     platform: &AksPlatform,
@@ -2865,7 +2874,7 @@ async fn poll_aks_client_fleet(
             &selector,
             "--all-containers=true",
             "--prefix=true",
-            "--tail=64",
+            AKS_CLIENT_HANDSHAKE_TAIL,
             "--limit-bytes=16384",
             "--ignore-errors=true",
             "--max-log-requests=16",
@@ -2889,9 +2898,10 @@ async fn poll_aks_client_fleet(
         let output = aks_client_job_log_payloads(&logs, job_name)
             .collect::<Vec<_>>()
             .join("\n");
+        let (ready, schedule_received) = aks_client_handshake_progress(&output);
         progress.push(ClientProgress {
-            ready: output.contains("OAT_CLIENT_READY "),
-            schedule_received: output.contains("OAT_SCHEDULE_RECEIVED "),
+            ready,
+            schedule_received,
             completed,
             failure: failed.then(|| format!("AKS DMV client Job {job_name} failed: {output}")),
             output,
@@ -2938,6 +2948,40 @@ fn aks_fleet_log_prefix_never_credits_another_client_with_readiness_or_schedule(
             [format!("OAT_CLIENT_READY {index}")]
         );
     }
+}
+
+#[cfg(test)]
+#[test]
+fn aks_fleet_handshake_survives_large_prepared_receipts() -> Result<()> {
+    let tail: usize = AKS_CLIENT_HANDSHAKE_TAIL.trim_start_matches("--tail=").parse()?;
+    let prepared = format!(
+        "[pod/oat-run-hot-c10-abc12/client] OAT_CLIENT_METRICS {}\n",
+        "x".repeat(128 * 1024)
+    );
+    let ready = "[pod/oat-run-hot-c10-abc12/client] OAT_CLIENT_READY client_id=10\n";
+    let ack = "[pod/oat-run-hot-c10-abc12/client] OAT_SCHEDULE_RECEIVED client_id=10\n";
+    for (stream, expected) in [
+        (prepared.clone(), (false, false)),
+        (format!("{prepared}{ready}"), (true, false)),
+        (format!("{prepared}{ready}{ack}"), (true, true)),
+    ] {
+        let lines = stream.lines().collect::<Vec<_>>();
+        let selected = lines[lines.len().saturating_sub(tail)..].join("\n");
+        let bounded = &selected[..selected.len().min(16384)];
+        let output = aks_client_job_log_payloads(bounded, "oat-run-hot-c10")
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(aks_client_handshake_progress(&output), expected);
+        assert_eq!(
+            aks_client_handshake_progress(
+                &aks_client_job_log_payloads(bounded, "oat-run-hot-c1")
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+            (false, false)
+        );
+    }
+    Ok(())
 }
 
 async fn finish_aks_client_job(config: &OatConfig, handle: ClientHandle) -> Result<String> {
@@ -4547,7 +4591,7 @@ fn result_rows(
                         "client_allocatable_memory_bytes": fleet.clients.iter().map(|client| u128::from(client.placement.allocatable_memory_bytes)).sum::<u128>(),
                         "node_count": fleet.clients.len() + 1,
                         "client_pool_rows_per_second": pool_rates,
-                        "per_pool_rate_scope": "client_offered_rows_not_collector_committed_rows",
+                        "per_pool_rate_scope": "client_completed_admitted_rows_not_collector_committed_rows",
                     });
                 }
                 if exploratory {
