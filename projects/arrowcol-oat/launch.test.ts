@@ -27,6 +27,15 @@ const status = (state: OatRunStatus['state']) => ({
   state, progress: state, result_count: state === 'succeeded' ? 2 : 0, error: null,
 });
 
+async function bindLocalReceipt(deadline: OatLauncherDeadline): Promise<void> {
+  const submitted_config_body = '{"platform":{"kind":"local"}}';
+  await deadline.setSubmissionBinding({
+    submitted_config_body,
+    submitted_config_sha256: status('running').config_sha256,
+    source_config_sha256: 'a'.repeat(64),
+  });
+}
+
 test('procfs ESRCH race is treated as an exited process', { skip: process.platform !== 'linux' }, async () => {
   const error = Object.assign(new Error('process disappeared during procfs read'), { code: 'ESRCH' });
   const readProcStat = async (procPath: string): Promise<string> => {
@@ -548,6 +557,44 @@ test('AKS failure stays a benchmark failure, and only bound cleanup evidence cle
       deadline.dispose();
       await rm(directory, { recursive: true, force: true });
     }
+  }
+});
+
+test('accepted receipts with unverified platforms refuse recovery without any request', async () => {
+  const requests: string[] = [];
+  const server = createServer((request, response) => {
+    requests.push(`${request.method} ${request.url}`);
+    response.setHeader('content-type', 'application/json');
+    response.end(JSON.stringify(status('succeeded')));
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== 'string');
+  try {
+    for (const body of [null, 'not JSON', '{}', '{"platform":{"kind":"other"}}']) {
+      const directory = await mkdtemp(path.join(os.tmpdir(), 'oat-unknown-recovery-platform-'));
+      const deadline = await OatLauncherDeadline.create(undefined, performance.now(), directory);
+      try {
+        if (body !== null) {
+          await deadline.setSubmissionBinding({
+            submitted_config_body: body,
+            submitted_config_sha256: createHash('sha256').update(body).digest('hex'),
+            source_config_sha256: 'a'.repeat(64),
+          });
+        }
+        await deadline.markCreationPending(`http://127.0.0.1:${address.port}`);
+        await deadline.recordRunStarted(status('running'));
+        const original = await readFile(deadline.receiptPath, 'utf8');
+        await assert.rejects(assertNoUnsettledDeadlineReceipts(directory), /platform unverified.*operator/);
+        assert.deepEqual(requests, []);
+        assert.equal(await readFile(deadline.receiptPath, 'utf8'), original);
+      } finally {
+        deadline.dispose();
+        await rm(directory, { recursive: true, force: true });
+      }
+    }
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
   }
 });
 
@@ -1871,10 +1918,9 @@ test('lost cancel response uses only GET reconciliation while the exact run rema
 
 test('known-ID deadline receipt reconciles terminal status before allowing a next cell', async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'oat-deadline-recover-'));
-  const configPath = path.join(directory, 'config.json');
   const runId = '123e4567-e89b-42d3-a456-426614174003';
-  await writeFile(configPath, JSON.stringify({ platform: { kind: 'local' } }));
-  const deadline = await OatLauncherDeadline.create(600);
+  const deadline = await OatLauncherDeadline.create(600, performance.now(), directory);
+  await bindLocalReceipt(deadline);
   const server = createServer((request, response) => {
     response.setHeader('content-type', 'application/json');
     if (request.method === 'GET' && request.url === `/runs/${runId}`) {
@@ -1893,7 +1939,7 @@ test('known-ID deadline receipt reconciles terminal status before allowing a nex
     await deadline.markCreationPending(`http://127.0.0.1:${address.port}`);
     await deadline.recordRunStarted({ ...status('running'), id: runId });
     deadline.dispose();
-    await assertNoUnsettledDeadlineReceipts();
+    await assertNoUnsettledDeadlineReceipts(directory);
     const receipt = JSON.parse(await readFile(deadline.receiptPath, 'utf8')) as { run_state: string; cleanup_state: string };
     assert.deepEqual({ run_state: receipt.run_state, cleanup_state: receipt.cleanup_state }, { run_state: 'succeeded', cleanup_state: 'confirmed' });
   } finally {
@@ -2057,6 +2103,7 @@ test('failed terminal cleanup remains unsettled and blocks the next cell', async
 test('restoring durable cancellation intent permits GETs but never another POST', async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'oat-once-only-recovery-'));
   const deadline = await OatLauncherDeadline.create(600, performance.now(), directory);
+  await bindLocalReceipt(deadline);
   const runId = status('running').id;
   let reads = 0;
   let cancels = 0;
@@ -2177,6 +2224,7 @@ test('receipt reconciliation rejects a terminal status for a different run ID', 
   const runA = '123e4567-e89b-42d3-a456-426614174014';
   const runB = '123e4567-e89b-42d3-a456-426614174015';
   const deadline = await OatLauncherDeadline.create(600, performance.now(), directory);
+  await bindLocalReceipt(deadline);
   const server = createServer((_request, response) => {
     response.setHeader('content-type', 'application/json');
     response.end(JSON.stringify({ ...status('succeeded'), id: runB }));
@@ -2205,6 +2253,7 @@ test('expired persisted cleanup budget does not grant another cancellation allow
   const directory = await mkdtemp(path.join(os.tmpdir(), 'oat-cleanup-budget-exhausted-'));
   const runId = '123e4567-e89b-42d3-a456-426614174016';
   const deadline = await OatLauncherDeadline.create(600, performance.now(), directory);
+  await bindLocalReceipt(deadline);
   let cancelCalls = 0;
   let state: OatRunStatus['state'] = 'running';
   const server = createServer((request, response) => {
@@ -2242,6 +2291,7 @@ test('receipt write crossing cleanup deadline prevents cancellation dispatch', a
   const directory = await mkdtemp(path.join(os.tmpdir(), 'oat-cleanup-budget-write-'));
   const runId = '123e4567-e89b-42d3-a456-426614174017';
   const deadline = await OatLauncherDeadline.create(600, performance.now(), directory);
+  await bindLocalReceipt(deadline);
   let cancelCalls = 0;
   let state: OatRunStatus['state'] = 'running';
   const server = createServer((request, response) => {

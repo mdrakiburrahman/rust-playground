@@ -111,8 +111,9 @@ If the OAT server is no longer running, remove one abandoned local cell with `np
 A failed AKS benchmark remains failed even when the owned runner confirms cleanup
 for the same run and submitted configuration. Without that confirmation the launcher
 preserves the owned server and blocks another run; it does not attempt local cancellation.
-For older receipts without that evidence, retain the original receipt and exact
-run identity for operator review. Do not edit the receipt or reroute around it.
+Only receipts bound to a local submission are automatically reconciled. For an
+unresolved AKS or unverified receipt, retain the original receipt and exact run
+identity for operator review. Do not edit the receipt or reroute around it.
 
 Old Compose projects named with only the first eight UUID characters are ambiguous. Cleanup refuses them without deleting resources or state; inspect ownership and clean up those legacy projects manually.
 

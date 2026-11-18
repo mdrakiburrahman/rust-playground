@@ -247,7 +247,7 @@ export class OatLauncherDeadline {
   }
 
   get creationState(): DeadlineCreationState { return this.receipt.creation_state; }
-  get isAksRun(): boolean { return isAksSubmission(this.receipt.submitted_config_body); }
+  get submittedPlatform(): 'local' | 'aks' | undefined { return submittedPlatform(this.receipt.submitted_config_body); }
   get invocationId(): string { return this.receipt.invocation_id; }
   get cleanupState(): DeadlineCleanupState { return this.receipt.cleanup_state; }
   get runId(): string | null { return this.receipt.run_id; }
@@ -385,7 +385,7 @@ export class OatLauncherDeadline {
       this.receipt.terminal_observation = { observed_at_unix_ms: Date.now(), status: structuredClone(status) };
     }
     if (matchesOwnedRun && status.state === 'failed' && status.aks_cleanup_confirmed === true &&
-        this.isAksRun && hasConfirmedAksFailure(this.receipt.terminal_observation?.status)) {
+        this.submittedPlatform === 'aks' && hasConfirmedAksFailure(this.receipt.terminal_observation?.status)) {
       this.receipt.cleanup_state = 'confirmed';
     }
     await this.persist();
@@ -429,15 +429,17 @@ function cleanupStateFor(status: OatRunStatus): DeadlineCleanupState {
   return 'pending';
 }
 
-function isAksSubmission(body: unknown): boolean {
-  if (typeof body !== 'string') return false;
+function submittedPlatform(body: unknown): 'local' | 'aks' | undefined {
+  if (typeof body !== 'string') return undefined;
   let config: unknown;
   try {
     config = JSON.parse(body);
   } catch {
-    return false;
+    return undefined;
   }
-  return isRecord(config) && isRecord(config.platform) && config.platform.kind === 'aks';
+  if (!isRecord(config) || !isRecord(config.platform)) return undefined;
+  const kind = config.platform.kind;
+  return kind === 'local' || kind === 'aks' ? kind : undefined;
 }
 
 function hasConfirmedAksFailure(status: OatRunStatus | undefined): boolean {
@@ -488,7 +490,7 @@ function isLauncherDeadlineReceipt(value: unknown): value is LauncherDeadlineRec
     (identityFieldsAbsent || identityIsNull || (value.creation_state === 'accepted' && value.run_id !== null && value.server_url !== null)) &&
     (observationAbsent || observationIsValid) && observationMatches &&
     (value.run_state !== 'failed' || value.cleanup_state !== 'confirmed' ||
-      (bindingIsValid && isAksSubmission(value.submitted_config_body) && value.config_binding_error === null &&
+      (bindingIsValid && submittedPlatform(value.submitted_config_body) === 'aks' && value.config_binding_error === null &&
         isLauncherTerminalObservation(value.terminal_observation) &&
         hasConfirmedAksFailure(value.terminal_observation.status)));
 }
@@ -523,8 +525,11 @@ export async function assertNoUnsettledDeadlineReceipts(root = launcherDeadlineR
     const deadline = await OatLauncherDeadline.restore(path, writeReceipt);
     if (deadline.creationState !== 'pending' && deadline.creationState !== 'unknown' &&
         deadline.cleanupState !== 'pending' && deadline.cleanupState !== 'unsettled') continue;
-    if (deadline.isAksRun) {
+    if (deadline.submittedPlatform === 'aks') {
       throw new Error(`Unsettled AKS launcher receipt ${path}; refusing another run until this exact receipt is reconciled by an operator`);
+    }
+    if (deadline.submittedPlatform !== 'local') {
+      throw new Error(`Unsettled launcher deadline receipt ${path} (platform unverified); refusing another run until this exact receipt is reconciled by an operator`);
     }
     if (!deadline.runId || !deadline.serverUrl ||
         !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(deadline.runId) ||
@@ -1147,7 +1152,7 @@ export async function launchOat(
     ? signal ? AbortSignal.any([signal, deadline.signal]) : deadline.signal
     : signal;
   const requestCancellation = (): void => {
-    if (mode === 'aks' || isAksSubmission(binding.submitted_config_body) || cancellationRequested) return;
+    if (mode === 'aks' || submittedPlatform(binding.submitted_config_body) === 'aks' || cancellationRequested) return;
     cancellationRequested = true;
     resolveCancellationStarted();
     cancellationRequest = (async (): Promise<CancellationOutcome> => {
