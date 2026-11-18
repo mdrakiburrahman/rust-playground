@@ -4342,30 +4342,40 @@ fn result_rows(
     let mut rows = Vec::with_capacity(assigned_tables.len());
     for table in assigned_tables {
         let client = client_run.metrics.get(&table);
-        let reconciliation_mismatch = config.campaign_profile
-            == Some(crate::config::CampaignProfile::ScaleOutSingleTable)
-            && client_run
+        let exploratory = config.campaign_profile == Some(crate::config::CampaignProfile::ScaleOutSingleTable);
+        let reconciliation_failure = if exploratory {
+            match client_run
                 .evidence
                 .durable_commits
                 .get(&table)
                 .and_then(|commit| commit.pointer("/delta_log_reconciliation/status"))
                 .and_then(Value::as_str)
-                == Some("mismatch");
-        let table_failure = if reconciliation_mismatch {
-            Some(match failure.as_deref() {
-                Some(failure) => format!("{failure}; exploratory_delta_log_reconciliation_mismatch"),
-                None => "exploratory_delta_log_reconciliation_mismatch".to_owned(),
-            })
+            {
+                Some("matched") => None,
+                Some("mismatch") => Some((
+                    "exploratory_delta_log_reconciliation_mismatch",
+                    "exploratory_reconciliation_mismatch",
+                )),
+                _ => Some((
+                    "exploratory_delta_log_reconciliation_unavailable",
+                    "exploratory_reconciliation_unavailable",
+                )),
+            }
         } else {
-            failure.clone()
+            None
+        };
+        let table_failure = match (failure.as_deref(), reconciliation_failure) {
+            (Some(failure), Some((reason, _))) => Some(format!("{failure}; {reason}")),
+            (None, Some((reason, _))) => Some(reason.to_owned()),
+            (_, None) => failure.clone(),
         };
         if client.is_none() && table_failure.is_none() {
             bail!("DMV client did not report measurements for {table}");
         }
         let owner = client_run.pinning.owners.get(&canonical_table_key(&table));
         let mut table_tunables = tunables.clone();
-        if reconciliation_mismatch {
-            table_tunables["failure"] = json!("exploratory_reconciliation_mismatch");
+        if let Some((_, reason)) = reconciliation_failure {
+            table_tunables["failure"] = json!(reason);
         }
         table_tunables["collector_completion"] = json!({
             "evidence": if client.is_some_and(|client| client.completions.len() == config.clients_per_table) {
@@ -4413,7 +4423,7 @@ fn result_rows(
             tunables_json: serde_json::to_string(&table_tunables)?,
             evidence_json: {
                 let mut evidence = client_run.evidence.for_table(&table, client);
-                if config.campaign_profile == Some(crate::config::CampaignProfile::ScaleOutSingleTable) {
+                if exploratory {
                     let output = evidence["commit_window_output_throughput"].clone();
                     let seconds = output["window_seconds"].as_f64();
                     let input_rate = output["input_bytes_per_second"].as_f64();
@@ -4440,22 +4450,26 @@ fn result_rows(
                         "window_seconds": seconds,
                         "scope": "collector_commit_finish_window_not_client_cohort",
                     });
-                    evidence["ranking_metrics"] = json!({
-                        "committed_rows_per_second": output["rows_per_second"],
-                        "uncompressed_arrow_decimal_gb_per_second": input_rate.map(|rate| rate / 1_000_000_000.0),
-                        "uncompressed_arrow_bytes_per_second": input_rate,
-                        "parquet_bytes_per_second": parquet_rate,
-                        "compression_ratio": output["compression_ratio"],
-                        "commits_per_second": commits_per_second,
-                        "mean_parquet_file_bytes": mean_file_bytes,
-                        "per_pod_cpu_millicores": metrics.map(|metrics| metrics.cpu_millicores),
-                        "per_pod_cpu_scope": "one_collector_pod_profile_arithmetic_mean_of_measurement_window_samples",
-                    });
-                }
-                if reconciliation_mismatch {
-                    evidence["ranking_metrics"] = Value::Null;
-                    evidence["ranking_eligible"] = Value::Bool(false);
-                    evidence["ranking_ineligible_reason"] = json!("exploratory_delta_log_reconciliation_mismatch");
+                    evidence["ranking_eligible"] = json!(reconciliation_failure.is_none());
+                    evidence["ranking_metrics"] = if let Some((reason, _)) = reconciliation_failure {
+                        evidence["ranking_ineligible_reason"] = json!(reason);
+                        evidence["commit_window_output_usage"] = json!("diagnostic_only");
+                        evidence["diagnostic_client_rows_per_second"] =
+                            json!(client.map(|client| client.rows_per_second));
+                        Value::Null
+                    } else {
+                        json!({
+                            "committed_rows_per_second": output["rows_per_second"],
+                            "uncompressed_arrow_decimal_gb_per_second": input_rate.map(|rate| rate / 1_000_000_000.0),
+                            "uncompressed_arrow_bytes_per_second": input_rate,
+                            "parquet_bytes_per_second": parquet_rate,
+                            "compression_ratio": output["compression_ratio"],
+                            "commits_per_second": commits_per_second,
+                            "mean_parquet_file_bytes": mean_file_bytes,
+                            "per_pod_cpu_millicores": metrics.map(|metrics| metrics.cpu_millicores),
+                            "per_pod_cpu_scope": "one_collector_pod_profile_arithmetic_mean_of_measurement_window_samples",
+                        })
+                    };
                 }
                 if let Some(resource_evidence) = &resource_evidence {
                     evidence["aks_resources"] = resource_evidence.clone();
@@ -4467,7 +4481,7 @@ fn result_rows(
             table,
             rows: client.map(|client| client.rows),
             duration_ms: client.map(|client| client.duration_ms),
-            rows_per_second: if reconciliation_mismatch {
+            rows_per_second: if reconciliation_failure.is_some() {
                 None
             } else {
                 client.map(|client| client.rows_per_second)
@@ -16983,7 +16997,7 @@ mod tests {
     }
 
     #[test]
-    fn exploratory_delta_mismatch_fails_result_and_excludes_ranking() -> Result<()> {
+    fn exploratory_delta_ranking_requires_matched_reconciliation() -> Result<()> {
         let config: OatConfig = serde_json::from_str(include_str!(
             "../../../docs/experiments/arrowcol-oat/oat-config.aks.max-rows.json"
         ))?;
@@ -17021,35 +17035,41 @@ mod tests {
                 },
             }),
         );
-        let clients = ClientRun {
-            metrics: HashMap::from([(
-                table.clone(),
-                ClientMetrics {
-                    rows: 6,
-                    duration_ms: 1000,
-                    rows_per_second: 6.0,
-                    completions: Vec::new(),
+        let rows_for = |evidence| {
+            let clients = ClientRun {
+                metrics: HashMap::from([(
+                    table.clone(),
+                    ClientMetrics {
+                        rows: 6,
+                        duration_ms: 1000,
+                        rows_per_second: 6.0,
+                        completions: Vec::new(),
+                    },
+                )]),
+                pinning: PinningReport {
+                    owners: pinning.owners.clone(),
+                    ..PinningReport::default()
                 },
-            )]),
-            pinning,
-            qap_tables: Vec::new(),
-            failure: None,
-            evidence,
+                qap_tables: Vec::new(),
+                failure: None,
+                evidence,
+            };
+            result_rows(
+                &config,
+                "orchestration",
+                run,
+                1,
+                1,
+                CellMeasurements {
+                    clients,
+                    started_at_ms: 1,
+                    qap: QapMetrics::default(),
+                    resources: None,
+                    resource_evidence: None,
+                },
+            )
         };
-        let rows = result_rows(
-            &config,
-            "orchestration",
-            run,
-            1,
-            1,
-            CellMeasurements {
-                clients,
-                started_at_ms: 1,
-                qap: QapMetrics::default(),
-                resources: None,
-                resource_evidence: None,
-            },
-        )?;
+        let rows = rows_for(evidence.clone())?;
         assert_eq!(rows[0].status, "failed");
         assert!(
             rows[0]
@@ -17075,6 +17095,39 @@ mod tests {
         let outcome = finish_matrix_cell(&config, "orchestration", run, 1, 1, Ok(rows), Ok(()));
         assert!(outcome.error.is_some());
         assert_eq!(outcome.rows[0].status, "failed");
+        for reconciliation in [Some("unavailable"), None, Some("matched")] {
+            let mut cell = evidence.clone();
+            cell.downstream_comment = Some("query lag".to_owned());
+            let evidence = cell.durable_commits.get_mut(&table).context("commit evidence")?;
+            if let Some(status) = reconciliation {
+                evidence["delta_log_reconciliation"] = json!({"status": status});
+            } else {
+                evidence
+                    .as_object_mut()
+                    .context("commit evidence object")?
+                    .remove("delta_log_reconciliation");
+            }
+            let rows = rows_for(cell)?;
+            let row = &rows[0];
+            let result: Value = serde_json::from_str(row.evidence_json.as_deref().context("result evidence")?)?;
+            let eligible = reconciliation == Some("matched");
+            assert_eq!(result["ranking_eligible"], eligible, "{reconciliation:?}");
+            assert_eq!(result["downstream_status"], "unavailable");
+            assert_eq!(result["commit_window_output_throughput"]["rows_per_second"], 5.0);
+            assert_eq!(row.status, if eligible { "succeeded" } else { "failed" });
+            if eligible {
+                assert_eq!(result["ranking_metrics"]["committed_rows_per_second"], 5.0);
+                assert_eq!(row.rows_per_second, Some(6.0));
+            } else {
+                assert!(result["ranking_metrics"].is_null());
+                assert_eq!(
+                    result["ranking_ineligible_reason"],
+                    "exploratory_delta_log_reconciliation_unavailable"
+                );
+                assert_eq!(result["diagnostic_client_rows_per_second"], 6.0);
+                assert!(row.rows_per_second.is_none());
+            }
+        }
         Ok(())
     }
 

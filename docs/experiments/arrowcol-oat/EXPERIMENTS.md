@@ -13,6 +13,8 @@ ran. Earlier parse-only drafts with 19 `TODO` table slots and fixed 30/120-secon
 timings are historical receipts, not executable inputs. The binder reads the
 now-approved canonical fixture rather than copying or inventing table names.
 
+The `scale_out_single_table` profile reports ranked commit-window throughput only when Delta-log reconciliation is `matched`. Missing, unavailable, or mismatched reconciliation produces a failed, unranked result; raw commit-window and client observations remain diagnostic. Downstream QAP availability is reported separately.
+
 ## Local launcher deadline and recovery
 
 `--deadline-seconds <1..600>` is opt-in and valid only for a local run with `--no-viewer`; omitting it preserves the existing launcher behavior. The monotonic deadline begins when `launch.ts` starts and includes setup, server build, the run, report processing and owned-server shutdown. For example:

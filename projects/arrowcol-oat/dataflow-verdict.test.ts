@@ -185,6 +185,14 @@ test('v3 requires evidenced collector output, but known zero commits remain vali
   const evaluate = (evidence: unknown) => evaluateDataFlow(status,
     [row({ schema_version: 3, measure_seconds: 1, evidence_json: JSON.stringify(evidence) })], sha, 'aks', config);
   assert.equal(evaluate(outputEvidence()).pass, true);
+  for (const status of [undefined, 'unavailable', 'mismatch', 'matched']) {
+    const verdict = evaluate({
+      ...outputEvidence(), evidence_class: 'd53_exploratory',
+      durable_commits: status === undefined ? {} : { delta_log_reconciliation: { status } },
+    });
+    assert.equal(verdict.pass, status === 'matched');
+    if (status !== 'matched') assert.match(verdict.reasons.join(), /exploratory Delta-log reconciliation did not match/);
+  }
   const zero = outputEvidence();
   Object.assign(zero.commit_window_output_throughput, {
     rows: 0, files: 0, input_bytes: 0, parquet_bytes: 0, commits: 0, rows_per_second: 0,

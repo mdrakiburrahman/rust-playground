@@ -49,6 +49,16 @@ test('viewer derives commit-window output rather than backfilling legacy admissi
   assert.equal(metrics.compression_ratio, 2);
   assert.equal(metrics.commit_p95_ms, 200);
   assert.equal(display.peakCommitWindowRate([{ ...row(), measure_seconds: 1 }]), 20);
+  for (const status of [undefined, 'unavailable', 'mismatch', 'matched']) {
+    const exploratory = { ...row(), evidence_json: JSON.stringify({
+      ...evidence, evidence_class: 'd53_exploratory',
+      durable_commits: status === undefined ? {} : { delta_log_reconciliation: { status } },
+      downstream_status: 'unavailable',
+    }) };
+    const eligible = status === 'matched';
+    assert.equal(display.outputMetrics(exploratory).committed_rows_per_second, eligible ? 20 : undefined);
+    assert.equal(display.peakCommitWindowRate([exploratory]), eligible ? 20 : null);
+  }
   assert.equal(display.outputMetrics({ ...row(), schema_version: 2 }).committed_rows_per_second, undefined);
   assert.equal(display.outputMetrics({ ...row(), evidence_json: '{bad' }).committed_rows_per_second, undefined);
   assert.equal(display.outputMetrics({ ...row(), evidence_json: JSON.stringify({ ...evidence, processes: [] }) }).committed_rows_per_second, undefined);

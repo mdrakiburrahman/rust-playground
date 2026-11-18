@@ -57,6 +57,11 @@ function tunables(row: RecordValue): RecordValue | undefined {
 }
 
 function collectorOutputIssue(evidence: RecordValue, row: RecordValue): string | undefined {
+  const durable = evidence.durable_commits;
+  const reconciliation = record(durable) ? durable.delta_log_reconciliation : undefined;
+  if (evidence.evidence_class === 'd53_exploratory' &&
+      (evidence.ranking_eligible === false || !record(reconciliation) || reconciliation.status !== 'matched'))
+    return 'exploratory Delta-log reconciliation did not match';
   const output = evidence.commit_window_output_throughput;
   if (!record(output)) return 'missing collector commit-window output evidence';
   if (output.unavailable_reason != null) return 'collector output telemetry unavailable';
