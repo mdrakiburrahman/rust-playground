@@ -6,6 +6,63 @@ import { resolve } from 'node:path';
 import test from 'node:test';
 import { parseStampConfig } from '../../infra/azure/stamp.js';
 import { assertExperimentPoolCapacity, experimentPoolPodCount, fixtureTables, main, prepareExperiments } from './prepare-experiments.js';
+import { parseFleetSizing, resolveFleetExperiment, type FleetNodeObservation } from './fleet-config.js';
+
+const fleetSizing = () => ({
+  collector_pool: 'hugepool',
+  collector: { dfe_workers: 'auto', runtime_workers: 'auto', blocking_workers: 'auto', cpu_workers: 'auto' },
+  client: { workers: 'auto', runtime_threads: 'auto', connections_per_worker: 'auto', streams_per_worker: 'auto',
+    rows_per_table: 'auto', dmv_concurrency: 'auto', corpus_bytes: 'auto', max_memory_bytes: 'auto' },
+});
+const fleetNode = (node: string, pool: string, cores: number, gib: number): FleetNodeObservation => ({
+  node, pool, sku: `Standard_D${cores}s_v6`, architecture: 'amd64',
+  allocatableCpuMillicores: cores * 1000 - 100, allocatableMemoryBytes: gib * 1024 ** 3,
+  requestedCpuMillicores: 500, requestedMemoryBytes: 512 * 1024 ** 2,
+});
+test('full fleet auto resolves each heterogeneous node after requests and support reservations', () => {
+  const nodes = [fleetNode('collector', 'hugepool', 192, 1800),
+    fleetNode('client-small', 'smallpool', 4, 16), fleetNode('client-big', 'bigpool', 64, 256)];
+  const pools = nodes.map(node => ({ name: node.pool, sku: node.sku, vcpu: node.allocatableCpuMillicores / 1000 + 0.1,
+    state: 'ready' as const, reason: null }));
+  const source = { platform: { kind: 'aks' }, campaign_profile: 'scale_out_single_table', tables: ['hot'],
+    clients_per_table_sweep: [1, 128], tunables: { client: { corpus_rows: 123, interval_us: 0 } } };
+  const resolved = resolveFleetExperiment(source, fleetSizing(), nodes, pools);
+  const fleet = (resolved.platform as { fleet: { collector: { resources: { requests: { cpu: string; memory: string } } };
+    clients: { placement: { node: string }; tunables: { workers: number; corpus_rows?: number; corpus_bytes: number } }[] } }).fleet;
+  assert.deepEqual(resolved.dfe_worker_concurrency, [182]);
+  assert.equal(fleet.collector.resources.requests.cpu, '182400m');
+  assert.equal(Number(fleet.collector.resources.requests.memory), (1800 - 12.5) * 1024 ** 3);
+  assert.deepEqual(fleet.clients.map(client => [client.placement.node, client.tunables.workers]),
+    [['client-big', 63], ['client-small', 3]]);
+  assert.notEqual(fleet.clients[0].tunables.corpus_bytes, fleet.clients[1].tunables.corpus_bytes);
+  assert.ok(fleet.clients.every(client => client.tunables.corpus_rows === undefined));
+  assert.equal(resolved.clients_per_table, 2);
+  assert.equal(resolved.clients_per_table_sweep, undefined);
+  assert.deepEqual(source.clients_per_table_sweep, [1, 128]);
+  const overrides = fleetSizing();
+  Object.assign(overrides.collector, { dfe_workers: 20 });
+  Object.assign(overrides.client, { workers: 2, connections_per_worker: 128 });
+  const overridden = resolveFleetExperiment(source, overrides, nodes, pools);
+  assert.deepEqual(overridden.dfe_worker_concurrency, [20]);
+  assert.equal(((overridden.platform as Record<string, any>).fleet.clients[0]).tunables.connections_per_worker, 128);
+});
+test('full fleet rejects malformed sentinels, incompatible architecture, duplicates and over-budget nodes', () => {
+  for (const bad of [0, -1, 1.5, 'AUTO', '8', null, 257]) {
+    const sizing = fleetSizing();
+    Object.assign(sizing.collector, { dfe_workers: bad });
+    assert.throws(() => parseFleetSizing(sizing), /auto or a bounded positive integer/);
+  }
+  const node = fleetNode('collector', 'hugepool', 192, 1800);
+  const client = fleetNode('client', 'clientpool', 4, 16);
+  const pools = [node, client].map(node => ({ name: node.pool, sku: node.sku, vcpu: 4, state: 'ready' as const, reason: null }));
+  const base = { platform: { kind: 'aks' }, campaign_profile: 'scale_out_single_table', tables: ['hot'] };
+  assert.throws(() => resolveFleetExperiment(base, fleetSizing(), [node, { ...client, architecture: 'arm64' }], pools), /amd64/);
+  assert.throws(() => resolveFleetExperiment(base, fleetSizing(), [node, client, client], pools), /duplicate/);
+  assert.throws(() => resolveFleetExperiment(base, fleetSizing(), [node, { ...client, requestedCpuMillicores: 4000 }], pools), /insufficient/);
+  const sizing = fleetSizing();
+  Object.assign(sizing.client, { corpus_bytes: 100_000_000_000 });
+  assert.throws(() => resolveFleetExperiment(base, sizing, [node, client], pools), /exceeds/);
+});
 
 const tables = fixtureTables(await readFile('projects/loadtest/schemas/sqlserver.sql', 'utf8'));
 const base = {

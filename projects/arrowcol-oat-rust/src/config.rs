@@ -110,6 +110,141 @@ pub struct PlatformConfig {
     pub local: LocalOptions,
     #[serde(default)]
     pub resources: Option<AksResourceOverrides>,
+    #[serde(default)]
+    pub fleet: Option<FleetPlacement>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FleetPlacement {
+    pub collector: FleetNode,
+    pub clients: Vec<FleetClient>,
+    pub pools: Vec<FleetPoolOutcome>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FleetNode {
+    pub node: String,
+    pub pool: String,
+    pub sku: String,
+    pub allocatable_cpu_millicores: u64,
+    pub allocatable_memory_bytes: u64,
+    pub resources: ResourceRequirements,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FleetClient {
+    pub placement: FleetNode,
+    pub rows_per_table: usize,
+    pub dmv_concurrency: usize,
+    pub tunables: arrowcol_tunables::ClientTunables,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FleetPoolOutcome {
+    pub name: String,
+    pub sku: String,
+    pub vcpu: u32,
+    pub state: FleetPoolState,
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FleetPoolState {
+    Ready,
+    Failed,
+}
+
+impl FleetPlacement {
+    fn validate(&self, config: &OatConfig) -> Result<()> {
+        if config.platform.kind != OatMode::Aks
+            || config.campaign_profile != Some(CampaignProfile::ScaleOutSingleTable)
+            || config.tables.len() != 1
+            || config.replica_counts != [1]
+            || config.dfe_worker_concurrency.len() != 1
+            || config.clients_per_table_sweep.is_some()
+            || self.clients.len() != config.clients_per_table
+            || self.clients.is_empty()
+            || self.clients.len() > 128
+        {
+            bail!("fleet placement requires one AKS scale-out cell, one table, and one client per resolved node");
+        }
+        let valid_label = |value: &str| {
+            !value.is_empty()
+                && value.len() <= 253
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'.'))
+        };
+        let mut nodes = HashSet::new();
+        for node in std::iter::once(&self.collector).chain(self.clients.iter().map(|client| &client.placement)) {
+            if !valid_label(&node.node)
+                || !valid_label(&node.pool)
+                || node.sku.is_empty()
+                || !nodes.insert(&node.node)
+                || node.allocatable_cpu_millicores == 0
+                || node.allocatable_memory_bytes == 0
+            {
+                bail!(
+                    "fleet nodes require distinct node names, explicit pools, SKU and positive allocatable resources"
+                );
+            }
+            let mut resources = config.effective_aks_resources();
+            resources.client = node.resources.clone();
+            resources.validate(false)?;
+            if parse_cpu_millicores(node.resources.requests.cpu.as_deref().context("fleet CPU is missing")?)?
+                > node.allocatable_cpu_millicores
+                || parse_memory_bytes(&node.resources.requests.memory)? > node.allocatable_memory_bytes
+            {
+                bail!("fleet pod resources exceed node allocatable resources");
+            }
+        }
+        if serde_json::to_value(&self.collector.resources)?
+            != serde_json::to_value(config.effective_aks_resources().collector)?
+        {
+            bail!("fleet collector resources differ from platform.resources.collector");
+        }
+        for client in &self.clients {
+            if client.placement.pool == self.collector.pool
+                || !(1..=1_000_000).contains(&client.rows_per_table)
+                || !(1..=64).contains(&client.dmv_concurrency)
+            {
+                bail!("fleet clients require separate client pools and bounded numeric rows/concurrency");
+            }
+            Tunables {
+                client: Some(client.tunables.clone()),
+                ..Default::default()
+            }
+            .validate_for_oat()?;
+        }
+        let mut pools = HashSet::new();
+        for pool in &self.pools {
+            if !valid_label(&pool.name)
+                || pool.sku.is_empty()
+                || pool.vcpu == 0
+                || !pools.insert(&pool.name)
+                || pool
+                    .reason
+                    .as_ref()
+                    .is_some_and(|reason| reason.len() > 512 || reason.contains(['\n', '\r']))
+                || matches!(pool.state, FleetPoolState::Failed) && pool.reason.as_ref().is_none_or(String::is_empty)
+            {
+                bail!("fleet pool outcomes require unique identities and bounded sanitized failure reasons");
+            }
+        }
+        for node in std::iter::once(&self.collector).chain(self.clients.iter().map(|client| &client.placement)) {
+            if !self.pools.iter().any(|pool| {
+                pool.name == node.pool && pool.sku == node.sku && matches!(pool.state, FleetPoolState::Ready)
+            }) {
+                bail!("every fleet node must belong to a ready pool with the observed SKU");
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -1073,6 +1208,9 @@ impl OatConfig {
         if self.rows_per_table == 0 || self.rows_per_table > 1_000_000 || !(1..=64).contains(&self.dmv_concurrency) {
             bail!("rows_per_table must be 1..=1000000 and dmv_concurrency 1..=64");
         }
+        if let Some(fleet) = &self.platform.fleet {
+            fleet.validate(self)?;
+        }
         let max_clients_per_table = if self.campaign_profile == Some(CampaignProfile::ScaleOutSingleTable) {
             128
         } else {
@@ -1481,6 +1619,7 @@ mod tests {
                 bootstrap_env_file: Some(bootstrap_env.to_string_lossy().into_owned()),
                 local: LocalOptions::default(),
                 resources: None,
+                fleet: None,
             },
             stamp: Some("00000".to_owned()),
             warmup_seconds: 30,
@@ -1755,7 +1894,8 @@ mod tests {
         assert!(
             config
                 .validate()
-                .expect_err("insufficient grace")
+                .err()
+                .context("expected insufficient grace")?
                 .to_string()
                 .contains("at least 540")
         );
@@ -2216,11 +2356,69 @@ mod tests {
             bootstrap_env_file: None,
             local: LocalOptions::default(),
             resources: None,
+            fleet: None,
         };
         config.result_url = "file:///tmp/arrowcol-oat/results.parquet".to_owned();
         config.website_url = "file:///tmp/arrowcol-oat/site/results.parquet".to_owned();
         config.qap_database = None;
         config.validate()
+    }
+
+    #[test]
+    fn resolved_fleet_requires_distinct_nodes_numeric_tunables_and_ready_pool_binding() -> Result<()> {
+        let mut config = valid();
+        config.campaign_profile = Some(CampaignProfile::ScaleOutSingleTable);
+        config.tables.truncate(1);
+        config.replica_counts = vec![1];
+        config.dfe_worker_concurrency = vec![8];
+        config.clients_per_table = 2;
+        let node = |name: &str, pool: &str, cores: u64| FleetNode {
+            node: name.to_owned(),
+            pool: pool.to_owned(),
+            sku: format!("Standard_D{cores}s_v6"),
+            allocatable_cpu_millicores: cores * 1000,
+            allocatable_memory_bytes: cores * (1 << 30),
+            resources: ResourceRequirements::new("2", "4Gi", "2", "6Gi"),
+        };
+        let mut collector = node("collector", "bigpool", 64);
+        collector.resources = config.effective_aks_resources().collector;
+        let client = |name: &str, pool: &str, cores| FleetClient {
+            placement: node(name, pool, cores),
+            rows_per_table: 1024,
+            dmv_concurrency: 2,
+            tunables: arrowcol_tunables::ClientTunables {
+                workers: Some(2),
+                ..Default::default()
+            },
+        };
+        let mut fleet = FleetPlacement {
+            collector,
+            clients: vec![client("client1", "smallpool", 4), client("client2", "otherpool", 8)],
+            pools: vec![],
+        };
+        fleet.pools = std::iter::once(&fleet.collector)
+            .chain(fleet.clients.iter().map(|client| &client.placement))
+            .map(|node| FleetPoolOutcome {
+                name: node.pool.clone(),
+                sku: node.sku.clone(),
+                vcpu: 4,
+                state: FleetPoolState::Ready,
+                reason: None,
+            })
+            .collect();
+        fleet.validate(&config)?;
+        let encoded = serde_json::to_value(&fleet)?;
+        assert!(serde_json::from_value::<FleetPlacement>(encoded.clone()).is_ok());
+        let mut unresolved = encoded;
+        unresolved["clients"][0]["tunables"]["workers"] = serde_json::json!("auto");
+        assert!(serde_json::from_value::<FleetPlacement>(unresolved).is_err());
+        fleet.clients[1].placement.node = fleet.clients[0].placement.node.clone();
+        assert!(fleet.validate(&config).is_err());
+        fleet.clients[1].placement.node = "client2".to_owned();
+        fleet.pools[1].state = FleetPoolState::Failed;
+        fleet.pools[1].reason = Some("allocation_failed".to_owned());
+        assert!(fleet.validate(&config).is_err());
+        Ok(())
     }
 
     #[test]
@@ -2237,6 +2435,7 @@ mod tests {
             bootstrap_env_file: None,
             local: LocalOptions::default(),
             resources: None,
+            fleet: None,
         };
         config.result_url = "file:///tmp/arrowcol-oat/results.parquet".to_owned();
         config.website_url = "abfss://$web@account.dfs.core.windows.net/results.parquet".to_owned();
@@ -2311,6 +2510,7 @@ mod tests {
             bootstrap_env_file: None,
             local: LocalOptions::default(),
             resources: None,
+            fleet: None,
         };
         config.result_url = "file:///tmp/arrowcol-oat/results.parquet".to_owned();
         config.website_url = "file:///tmp/arrowcol-oat/site/results.parquet".to_owned();
