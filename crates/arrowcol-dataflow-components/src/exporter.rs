@@ -421,7 +421,11 @@ impl DeltaBackend {
             backlog_token,
             reply: Some(reply),
             #[cfg(test)]
-            submitted: self.submission_probe.lock().expect("submission probe").take(),
+            submitted: self
+                .submission_probe
+                .lock()
+                .map_err(|error| ExportFailure::Transient(format!("submission probe lock poisoned: {error}")))?
+                .take(),
             _pending_owner: pending_owner,
             _capacity: capacity,
             _backlog_capacity: Arc::clone(&self.backlog_capacity),
