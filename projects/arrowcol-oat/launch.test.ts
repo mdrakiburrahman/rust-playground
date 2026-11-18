@@ -665,7 +665,7 @@ test('legacy AKS disposition is one-time, exact, and does not rewrite the failed
       },
     };
     const bytes = JSON.stringify(manifest);
-    const approval = [{ invocationId: deadline.invocationId, receiptSha256: digest(original), evidenceSha256: digest(bytes) }];
+    const approval = [{ kind: 'legacy' as const, invocationId: deadline.invocationId, receiptSha256: digest(original), evidenceSha256: digest(bytes) }];
     await writeFile(manifestPath, bytes);
     await assert.rejects(main(['--recover-failed-aks', deadline.invocationId, manifestPath], undefined, undefined, root),
       /No reviewed legacy AKS disposition/);
@@ -708,6 +708,146 @@ test('legacy AKS disposition is one-time, exact, and does not rewrite the failed
     await assert.rejects(assertNoUnsettledDeadlineReceipts(root, undefined, approval), /Unapproved or orphaned/);
   } finally {
     if (listener.listening) await new Promise<void>((resolve) => listener.close(() => resolve()));
+    deadline.dispose();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('observed AKS disposition requires matching owned failure, writer fence and fresh scoped readbacks', {
+  skip: process.platform !== 'linux',
+}, async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'oat-observed-disposition-'));
+  const root = path.join(directory, 'receipts');
+  const deadline = await OatLauncherDeadline.create(undefined, performance.now(), root);
+  const evidencePath = path.join(directory, 'reviewed-evidence');
+  const sidecar = deadline.receiptPath + '.failed-aks-disposition';
+  const digest = (body: Buffer | string) => createHash('sha256').update(body).digest('hex');
+  const body = '{"platform":{"kind":"aks"}}';
+  const listener = createServer();
+  const closeListener = () => new Promise<void>((resolve, reject) =>
+    listener.close((error) => error ? reject(error) : resolve()));
+  try {
+    await new Promise<void>((resolve) => listener.listen(0, '127.0.0.1', resolve));
+    const address = listener.address();
+    assert.ok(address && typeof address !== 'string');
+    const serverUrl = `http://127.0.0.1:${address.port}/`;
+    const launcher = { pid: 2147483646, start_ticks: '16', executable: '/opt/example/node' };
+    const server = { pid: 2147483647, ppid: launcher.pid, start_ticks: '17', executable: '/opt/example/oat' };
+    const now = Date.now();
+    const terminal = { ...status('failed'), config_sha256: digest(body),
+      error: 'run-table initializer publisher drain was not positively confirmed',
+      started_at_unix_ms: now, finished_at_unix_ms: now };
+    await deadline.setSubmissionBinding({ submitted_config_body: body,
+      submitted_config_sha256: digest(body), source_config_sha256: digest(body) });
+    await deadline.markCreationPending(serverUrl);
+    await deadline.recordRunStarted(terminal);
+    await deadline.recordOwnedServerIdentity({ invocationId: deadline.invocationId, runId: terminal.id, serverUrl,
+      serverPid: server.pid, serverStartTicks: server.start_ticks, serverExecutable: server.executable });
+    await deadline.recordTerminal(terminal);
+    const original = await readFile(deadline.receiptPath);
+    const receipt = JSON.parse(original.toString('utf8'));
+    const observed = Date.now();
+    const cellId = 'c0bfca05-28f2-4e16-a4cc-b3f28a351fb9';
+    const raw = digest('fixture');
+    const manifest = {
+      schema_version: 1, kind: 'observed-failed-preload-aks' as const, disposition: 'failed-before-load-cleanup-verified',
+      invocation_id: deadline.invocationId, original_receipt_sha256: digest(original), server_url: serverUrl,
+      terminal_observation: receipt.terminal_observation,
+      terminal_get: terminal,
+      raw_evidence_sha256: raw, verifier_sha256: raw, runner_source_sha256: raw,
+      raw_observation_sha256: Object.fromEntries([
+        'terminal_get', 'single_cell_trace', 'process_exit', 'namespace_get', 'fic_inventory',
+        'delta_run_blobs', 'control_run_blobs', 'checkpoint_container', 'publisher_registry',
+      ].map((name) => [name, raw])),
+      cell: {
+        id: cellId, namespace: 'arrow-collector-' + cellId.replaceAll('-', ''),
+        namespace_uid: '418a9705-b6ac-4487-b08e-a0dbdd5d6e5f', namespace_absent: true, namespace_uid_absent: true,
+        namespace_absent_at_unix_ms: observed, run_fic_id: '/fake/run-fic', run_fic_absent: true,
+        native_fic_id: '/fake/native-fic', native_fic_present: true, fic_observed_at_unix_ms: observed,
+        qap: 'not-attempted', result_artifact: 'retained-unranked',
+      },
+      storage: { observed_at_unix_ms: observed, delta_run_blob_count: 0, control_run_blob_count: 0,
+        checkpoint_lease_state: 'available', checkpoint_lease_status: 'unlocked', publisher_registry_entry_count: 0 },
+      writer_fence: {
+        boot_id: (await readFile('/proc/sys/kernel/random/boot_id', 'utf8')).trim(),
+        pid_namespace: await readlink('/proc/self/ns/pid'), net_namespace: await readlink('/proc/self/ns/net'),
+        launcher, server, fenced_at_unix_ms: observed,
+      },
+    };
+    const approveFixture = async (proof: typeof manifest, receiptBytes = original) => {
+      await writeFile(deadline.receiptPath, receiptBytes);
+      const receiptSha256 = digest(receiptBytes);
+      const bytes = JSON.stringify({ ...proof, original_receipt_sha256: receiptSha256 });
+      await writeFile(evidencePath, bytes);
+      return [{ kind: manifest.kind, invocationId: deadline.invocationId, receiptSha256, evidenceSha256: digest(bytes) }];
+    };
+    const rejectFixture = async (proof: typeof manifest, error: RegExp, receiptBytes = original) =>
+      assert.rejects(recordLegacyAksDisposition(root, deadline.invocationId, evidencePath,
+        await approveFixture(proof, receiptBytes)), error);
+
+    await rejectFixture(manifest, /listener is still present/);
+    const explicitFalse = { ...terminal, aks_cleanup_confirmed: false };
+    const explicitFalseObservation = { ...manifest.terminal_observation, status: explicitFalse };
+    await rejectFixture({ ...manifest, terminal_get: explicitFalse, terminal_observation: explicitFalseObservation },
+      /listener is still present/, Buffer.from(JSON.stringify({ ...receipt, terminal_observation: explicitFalseObservation })));
+    const liveListenerApproval = await approveFixture(manifest);
+    await writeFile(sidecar, await readFile(evidencePath));
+    await assert.rejects(assertNoUnsettledDeadlineReceipts(root, undefined, liveListenerApproval), /listener is still present/);
+    await unlink(sidecar);
+    await closeListener();
+    await rejectFixture({ ...manifest, terminal_get: { ...terminal, id: cellId } }, /owned failed terminal observation/);
+    for (const change of [{ aks_cleanup_confirmed: true }, { aks_cleanup_confirmed: 'false' }, { result_count: 1 },
+      { error: 'another failure' }]) {
+      const observation = { ...manifest.terminal_observation, status: { ...terminal, ...change } };
+      await rejectFixture({ ...manifest, terminal_get: observation.status, terminal_observation: observation }, /owned failed terminal observation/,
+        Buffer.from(JSON.stringify({ ...receipt, terminal_observation: observation })));
+    }
+    await rejectFixture({ ...manifest, writer_fence: { ...manifest.writer_fence,
+      server: { ...server, start_ticks: '18' } } }, /exact recorded server and writer fence/);
+    await rejectFixture({ ...manifest, writer_fence: { ...manifest.writer_fence,
+      net_namespace: 'net:[1]' } }, /exact original Linux/);
+    for (const change of [{ namespace: 'different' }, { namespace_uid_absent: false },
+      { run_fic_absent: false }, { native_fic_present: false }]) {
+      await rejectFixture({ ...manifest, cell: { ...manifest.cell, ...change } }, /cell, FIC, or storage/);
+    }
+    for (const change of [{ delta_run_blob_count: 1 }, { control_run_blob_count: 1 },
+      { checkpoint_lease_status: 'locked' }, { publisher_registry_entry_count: 1 }]) {
+      await rejectFixture({ ...manifest, storage: { ...manifest.storage, ...change } }, /cell, FIC, or storage/);
+    }
+    const { publisher_registry: _missing, ...missingReadback } = manifest.raw_observation_sha256;
+    await rejectFixture({ ...manifest, raw_observation_sha256: missingReadback }, /cell, FIC, or storage/);
+    await rejectFixture({ ...manifest, storage: { ...manifest.storage, observed_at_unix_ms: observed + 60_000 } },
+      /absence evidence is not current/);
+    const backdate = (minutes: number) => {
+      const shift = (unixMs: number) => unixMs - minutes * 60_000;
+      const agedTerminal = { ...terminal, started_at_unix_ms: shift(now), finished_at_unix_ms: shift(now) };
+      const agedObservation = { observed_at_unix_ms: shift(receipt.terminal_observation.observed_at_unix_ms), status: agedTerminal };
+      return {
+        proof: { ...manifest, terminal_observation: agedObservation, terminal_get: agedTerminal,
+          writer_fence: { ...manifest.writer_fence, fenced_at_unix_ms: shift(observed) },
+          cell: { ...manifest.cell, namespace_absent_at_unix_ms: shift(observed), fic_observed_at_unix_ms: shift(observed) },
+          storage: { ...manifest.storage, observed_at_unix_ms: shift(observed) } },
+        receiptBytes: Buffer.from(JSON.stringify({ ...receipt, started_at_unix_ms: shift(receipt.started_at_unix_ms),
+          terminal_observation: agedObservation })),
+      };
+    };
+    const stale = backdate(241);
+    await rejectFixture(stale.proof, /absence evidence is not current/, stale.receiptBytes);
+
+    const recent = backdate(31);
+    const [approval] = await approveFixture(recent.proof, recent.receiptBytes);
+    await assert.rejects(recordLegacyAksDisposition(root, deadline.invocationId, evidencePath), /No reviewed legacy AKS disposition/);
+    await assert.rejects(recordLegacyAksDisposition(root, deadline.invocationId, evidencePath,
+      [approval!, { ...approval!, kind: 'legacy' }]), /No reviewed legacy AKS disposition/);
+    const approvals = [approval!, { ...approval!, kind: 'legacy' as const, invocationId: cellId }];
+    await assert.rejects(assertNoUnsettledDeadlineReceipts(root, undefined, approvals), /Unsettled AKS/);
+    await recordLegacyAksDisposition(root, deadline.invocationId, evidencePath, approvals);
+    await assertNoUnsettledDeadlineReceipts(root, undefined, approvals);
+    assert.deepEqual(await readFile(deadline.receiptPath), recent.receiptBytes);
+    assert.deepEqual(await readFile(sidecar), await readFile(evidencePath));
+    await assert.rejects(assertNoUnsettledDeadlineReceipts(root), /Unapproved or orphaned/);
+  } finally {
+    if (listener.listening) await closeListener();
     deadline.dispose();
     await rm(directory, { recursive: true, force: true });
   }
