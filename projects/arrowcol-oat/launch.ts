@@ -4,7 +4,8 @@ import { existsSync } from 'node:fs';
 import { lstat, mkdir, open, readFile, realpath, readdir, rename, rm, stat, unlink, writeFile } from 'node:fs/promises';
 import { createServer as createHttpServer } from 'node:http';
 import { createServer as createTcpServer, isIP } from 'node:net';
-import { dirname, extname, isAbsolute, relative, resolve, sep } from 'node:path';
+import { tmpdir } from 'node:os';
+import { basename, dirname, extname, isAbsolute, relative, resolve, sep } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { formatPreflightReport, loadAksEnvironment, runAksPreflight } from './aks-preflight.js';
@@ -54,6 +55,26 @@ interface LocalViewerConfig {
 
 const workspaceRoot = resolve(fileURLToPath(new URL('../..', import.meta.url)));
 const launcherDeadlineReceiptRoot = resolve(workspaceRoot, 'out/arrowcol-oat/deadline-receipts');
+
+async function assertTestReceiptRoot(root: string): Promise<void> {
+  if (process.env.NODE_TEST_CONTEXT === undefined) return;
+  const resolvedRoot = resolve(root);
+  if (resolvedRoot === launcherDeadlineReceiptRoot || resolvedRoot.startsWith(`${launcherDeadlineReceiptRoot}${sep}`)) {
+    throw new Error('OAT tests require an isolated temporary receipt root');
+  }
+  const physicalRoot = await realpath(resolvedRoot).catch(async (error: unknown) => {
+    if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) throw error;
+    return resolve(await realpath(dirname(resolvedRoot)), basename(resolvedRoot));
+  });
+  const tempRoot = await realpath(tmpdir());
+  const relativeToTemp = relative(tempRoot, physicalRoot);
+  const defaultRoot = resolve(await realpath(workspaceRoot), 'out/arrowcol-oat/deadline-receipts');
+  if (!relativeToTemp || relativeToTemp === '..' || relativeToTemp.startsWith(`..${sep}`) ||
+      isAbsolute(relativeToTemp) || physicalRoot === defaultRoot ||
+      physicalRoot.startsWith(`${defaultRoot}${sep}`)) {
+    throw new Error('OAT tests require an isolated temporary receipt root');
+  }
+}
 const launcherDeadlineMaxSeconds = 600;
 const localCancellationCleanupMs = 10 * 60 * 1000;
 const cliValuedOptions = new Set(['--config', '--mode', '--server', '--poll-ms', '--cleanup-local', '--stamp-config', '--deadline-seconds']);
@@ -183,6 +204,7 @@ export class OatLauncherDeadline {
   }
 
   static async create(seconds: number | undefined, startedAtMonotonicMs = performance.now(), receiptRoot = launcherDeadlineReceiptRoot, startedAtUnixMs = Date.now()): Promise<OatLauncherDeadline> {
+    await assertTestReceiptRoot(receiptRoot);
     if (seconds !== undefined && (!Number.isSafeInteger(seconds) || seconds < 1 || seconds > launcherDeadlineMaxSeconds)) {
       throw new OatCliError(`--deadline-seconds must be an integer from 1 to ${launcherDeadlineMaxSeconds}`);
     }
@@ -227,6 +249,7 @@ export class OatLauncherDeadline {
   }
 
   static async restore(path: string, writeReceipt = writeAtomicJson): Promise<OatLauncherDeadline> {
+    await assertTestReceiptRoot(dirname(path));
     const parsed: unknown = JSON.parse(await readFile(path, 'utf8'));
     if (!isLauncherDeadlineReceipt(parsed)) throw new Error(`Invalid launcher deadline receipt ${path}`);
     const restored: LauncherDeadlineReceipt = {
@@ -486,6 +509,7 @@ function isLocalOatServerUrl(value: string): boolean {
 }
 
 export async function assertNoUnsettledDeadlineReceipts(root = launcherDeadlineReceiptRoot, writeReceipt = writeAtomicJson): Promise<void> {
+  await assertTestReceiptRoot(root);
   const names = await readdir(root).catch((error: unknown) => {
     if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return [];
     throw error;

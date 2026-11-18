@@ -32,15 +32,20 @@ test('missing and unknown AKS subcommands exit with usage instead of launching a
 });
 
 test('non-AKS arguments and the injected runner pass through to the existing launcher', async () => {
-  const commands: string[][] = [];
-  await assert.rejects(main(['--mode', 'invalid']), /--mode must be local or aks/);
-  await assert.rejects(main(['--mode', 'local'], async (command) => {
-    commands.push(command);
-    return command[0] === 'git'
-      ? { returncode: 0, stdout: command[1] === 'rev-parse' ? 'a'.repeat(40) : '', stderr: '' }
-      : { returncode: 1, stdout: '', stderr: 'router test build refused' };
-  }), /router test build refused/);
-  assert.ok(commands.some((command) => command[0] === 'cargo' && command[1] === 'build'));
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'oat-cli-routing-'));
+  try {
+    const commands: string[][] = [];
+    await assert.rejects(main(['--mode', 'invalid']), /--mode must be local or aks/);
+    await assert.rejects(main(['--mode', 'local'], async (command) => {
+      commands.push(command);
+      return command[0] === 'git'
+        ? { returncode: 0, stdout: command[1] === 'rev-parse' ? 'a'.repeat(40) : '', stderr: '' }
+        : { returncode: 1, stdout: '', stderr: 'router test build refused' };
+    }, undefined, path.join(directory, 'receipts')), /router test build refused/);
+    assert.ok(commands.some((command) => command[0] === 'cargo' && command[1] === 'build'));
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test('AKS defaults prefer generated private configuration but never override explicit or local configs', async () => {

@@ -12,8 +12,9 @@ export async function main(
   argv: string[],
   runner: typeof run_tree = run_tree,
   loadCommand: CommandLoader = (subcommand) => import(`./aks-${subcommand}.js`),
+  receiptRoot?: string,
 ): Promise<void> {
-  if (argv[0] !== 'aks') return launch.main(argv, runner);
+  if (argv[0] !== 'aks') return launch.main(argv, runner, undefined, receiptRoot);
   if (argv[1] === '-h' || argv[1] === '--help') {
     console.log('Usage: arrowcol-oat aks <destroy|deploy|setup|scale> [options]');
     return;

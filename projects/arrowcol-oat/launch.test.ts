@@ -27,6 +27,13 @@ const status = (state: OatRunStatus['state']) => ({
   state, progress: state, result_count: state === 'succeeded' ? 2 : 0, error: null,
 });
 
+test('receipt entry points reject the campaign root under node:test', async () => {
+  const defaultReceipt = fileURLToPath(new URL('../../out/arrowcol-oat/deadline-receipts/example.json', import.meta.url));
+  await assert.rejects(OatLauncherDeadline.create(1), /isolated temporary receipt root/);
+  await assert.rejects(assertNoUnsettledDeadlineReceipts(), /isolated temporary receipt root/);
+  await assert.rejects(OatLauncherDeadline.restore(defaultReceipt), /isolated temporary receipt root/);
+});
+
 test('procfs ESRCH race is treated as an exited process', { skip: process.platform !== 'linux' }, async () => {
   const error = Object.assign(new Error('process disappeared during procfs read'), { code: 'ESRCH' });
   const readProcStat = async (procPath: string): Promise<string> => {
@@ -1715,8 +1722,9 @@ test('launcher never reports success when a run wins the race after the original
 test('lost POST /runs response leaves an unknown owned receipt and blocks the next cell without retrying', async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'oat-deadline-lost-create-'));
   const configPath = path.join(directory, 'config.json');
+  const receiptRoot = path.join(directory, 'receipts');
   await writeFile(configPath, JSON.stringify({ platform: { kind: 'local', local: { bind_host: '127.0.0.1', endpoint_host: '127.0.0.1' } } }));
-  const deadline = await OatLauncherDeadline.create(1);
+  const deadline = await OatLauncherDeadline.create(1, performance.now(), receiptRoot);
   let posts = 0;
   let cancels = 0;
   const server = createServer((request, response) => {
@@ -1754,7 +1762,7 @@ test('lost POST /runs response leaves an unknown owned receipt and blocks the ne
     await assert.rejects(
       main(['--deadline-seconds', '5', '--no-viewer', '--config', configPath], async () => {
         throw new Error('must not build or create a next cell');
-      }),
+      }, undefined, receiptRoot),
       /Unsettled launcher deadline receipt .*run identity UNKNOWN/,
     );
   } finally {
@@ -1818,9 +1826,10 @@ test('lost cancel response uses only GET reconciliation while the exact run rema
 test('known-ID deadline receipt reconciles terminal status before allowing a next cell', async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'oat-deadline-recover-'));
   const configPath = path.join(directory, 'config.json');
+  const receiptRoot = path.join(directory, 'receipts');
   const runId = '123e4567-e89b-42d3-a456-426614174003';
   await writeFile(configPath, JSON.stringify({ platform: { kind: 'local' } }));
-  const deadline = await OatLauncherDeadline.create(600);
+  const deadline = await OatLauncherDeadline.create(600, performance.now(), receiptRoot);
   const server = createServer((request, response) => {
     response.setHeader('content-type', 'application/json');
     if (request.method === 'GET' && request.url === `/runs/${runId}`) {
@@ -1839,7 +1848,7 @@ test('known-ID deadline receipt reconciles terminal status before allowing a nex
     await deadline.markCreationPending(`http://127.0.0.1:${address.port}`);
     await deadline.recordRunStarted({ ...status('running'), id: runId });
     deadline.dispose();
-    await assertNoUnsettledDeadlineReceipts();
+    await assertNoUnsettledDeadlineReceipts(receiptRoot);
     const receipt = JSON.parse(await readFile(deadline.receiptPath, 'utf8')) as { run_state: string; cleanup_state: string };
     assert.deepEqual({ run_state: receipt.run_state, cleanup_state: receipt.cleanup_state }, { run_state: 'succeeded', cleanup_state: 'confirmed' });
   } finally {
