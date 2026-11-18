@@ -520,7 +520,11 @@ function isLocalOatServerUrl(value: string): boolean {
 
 type LegacyAksApproval = Readonly<{ invocationId: string; receiptSha256: string; evidenceSha256: string }>;
 // Add a pin only in a separately reviewed commit, after independent verification of the private evidence.
-const approvedLegacyAksFailure: readonly LegacyAksApproval[] = [];
+const approvedLegacyAksFailure: readonly LegacyAksApproval[] = [{
+  invocationId: '03faac03-c21a-40e8-a8a1-51aaf6b33935',
+  receiptSha256: 'd97388ee46db160ba1af11ffaa78ded694331a414ba4d4fc9774bbbc7cce75d7',
+  evidenceSha256: '947d0f27d31e97b9f9dcc960a4d40bf6f1dc1d3bff2fe6e700aa1c9a1513e735',
+}];
 const legacyDispositionSuffix = '.failed-aks-disposition';
 const legacyPreloadError = 'maintenance omitted effective per-table operationTimeout before load admission';
 const legacyUuid = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/;
