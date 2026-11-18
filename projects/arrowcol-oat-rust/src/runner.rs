@@ -37,6 +37,8 @@ use url::Url;
 
 #[cfg(test)]
 include!("runner_failure_tests.rs");
+#[cfg(all(test, unix))]
+include!("runner_pin_init_tests.rs");
 include!("runner_evidence.rs");
 include!("runner_tunables.rs");
 include!("runner_process_evidence.rs");
@@ -6691,6 +6693,91 @@ async fn run_local_pin_setup(
     .map(|_| ())
 }
 
+fn run_table_initializer_cloud_env(config: &OatConfig, platform: &AksPlatform, run_id: &str) -> Result<Value> {
+    let runtime_path = platform
+        .runtime_dir
+        .as_ref()
+        .context("run-table initializer requires the validated run runtime directory")?
+        .join("runtime-config.json");
+    let runtime: Value = serde_json::from_slice(&fs::read(runtime_path)?)
+        .context("read validated run-table initializer runtime config")?;
+    let stamp = runtime["stamp"].as_str().context("run runtime has no Azure stamp")?;
+    let subscription = runtime["subscriptionId"]
+        .as_str()
+        .context("run runtime has no Azure subscription")?;
+    let subscription_id =
+        uuid::Uuid::parse_str(subscription).context("run runtime Azure subscription is not a UUID")?;
+    if subscription_id.is_nil()
+        || stamp.len() != 5
+        || !stamp.bytes().all(|byte| byte.is_ascii_digit())
+        || config.stamp.as_deref() != Some(stamp)
+    {
+        bail!("run-table initializer Azure ownership does not match the validated campaign stamp");
+    }
+    let root = platform
+        .delta_root
+        .as_deref()
+        .context("run-table initializer lost its Delta root")?;
+    if runtime["deltaRoot"].as_str() != Some(root)
+        || runtime["namespace"].as_str() != Some(config.namespace.as_str())
+        || runtime["oatRunId"].as_str() != Some(run_id)
+        || platform.run_id != run_id
+    {
+        bail!("run-table initializer runtime identity does not match the rendered collector");
+    }
+    let account = format!("arrowcollector{stamp}");
+    let url = Url::parse(root).context("parse run-table initializer Delta root")?;
+    if url.scheme() != "abfss" || url.host_str() != Some(format!("{account}.dfs.core.windows.net").as_str()) {
+        bail!("run-table initializer Delta account does not match the validated Azure stamp");
+    }
+    Ok(json!([
+        { "name": "ARROWCOL_DELTA_ROOT", "value": root },
+        { "name": "ARROWCOL_AZURE_MODE", "value": "stamped" },
+        { "name": "AZURE_SUBSCRIPTION_ID", "value": subscription },
+        { "name": "AZURE_STAMP", "value": stamp },
+        { "name": "AZURE_RESOURCE_GROUP", "value": "arrow-collector-rg" },
+        { "name": "AZURE_STORAGE_ACCOUNT", "value": account },
+        { "name": "AZURE_STORAGE_CHECKPOINT_CONTAINER", "value": "checkpoints" },
+        { "name": "ARROWCOL_RESET_GENERATION", "valueFrom": { "secretKeyRef": { "name": "arrowcol-generation", "key": "generation" } } },
+    ]))
+}
+
+fn created_pin_init_job_uid(output: &str, namespace: &str, job_name: &str, run_id: &str) -> Result<String> {
+    let mut resources = Vec::new();
+    for value in serde_json::Deserializer::from_str(output).into_iter::<Value>() {
+        let value = value.context("parse created pin initialization resources")?;
+        if value["kind"] == "List" {
+            resources.extend(
+                value["items"]
+                    .as_array()
+                    .context("created resource List has no items")?
+                    .clone(),
+            );
+        } else {
+            resources.push(value);
+        }
+    }
+    let jobs = resources
+        .iter()
+        .filter(|value| value["kind"] == "Job")
+        .collect::<Vec<_>>();
+    let [job] = jobs.as_slice() else {
+        bail!("created pin initialization output must identify exactly one Job");
+    };
+    if job["metadata"]["name"] != job_name
+        || job["metadata"]["namespace"] != namespace
+        || job["metadata"]["labels"]["arrowcol-oat-run"] != uuid::Uuid::parse_str(run_id)?.simple().to_string()
+    {
+        bail!("created pin initialization Job identity does not match this run");
+    }
+    let uid = job["metadata"]["uid"]
+        .as_str()
+        .filter(|uid| !uid.is_empty())
+        .context("created pin Job has no UID")?;
+    uuid::Uuid::parse_str(uid).context("created pin Job UID is not a UUID")?;
+    Ok(uid.to_owned())
+}
+
 async fn run_aks_pin_setup_job(
     config: &OatConfig,
     platform: &mut AksPlatform,
@@ -6751,22 +6838,7 @@ async fn run_aks_pin_setup_job(
         json!({ "labels": labels })
     };
     let pod_env = if run_table_identity {
-        let root = platform
-            .delta_root
-            .as_deref()
-            .context("run-table initializer lost its Delta root")?;
-        let url = Url::parse(root).context("parse run-table initializer Delta root")?;
-        let account = url
-            .host_str()
-            .and_then(|host| host.split('.').next())
-            .context("Delta root has no storage account")?;
-        json!([
-            { "name": "ARROWCOL_AZURE_MODE", "value": "stamped" },
-            { "name": "ARROWCOL_DELTA_ROOT", "value": root },
-            { "name": "AZURE_STORAGE_ACCOUNT", "value": account },
-            { "name": "AZURE_STORAGE_CHECKPOINT_CONTAINER", "value": "checkpoints" },
-            { "name": "ARROWCOL_RESET_GENERATION", "valueFrom": { "secretKeyRef": { "name": "arrowcol-generation", "key": "generation" } } },
-        ])
+        run_table_initializer_cloud_env(config, platform, run_id)?
     } else {
         json!([])
     };
@@ -6888,13 +6960,43 @@ async fn run_aks_pin_setup_job(
         .context("pin initialization resource list is missing")?;
     prepare_run_owned_resources(config, platform, items).await?;
     let planned_resources = items.clone();
-    kubectl(config, vec!["create", "-f", "-"], Some(serde_json::to_vec(&manifest)?))
-        .await
-        .context("create finite AKS OAT pin initialization Job")?;
+    let created = kubectl(
+        config,
+        vec!["create", "-f", "-", "-o", "json"],
+        Some(serde_json::to_vec(&manifest)?),
+    )
+    .await
+    .context("create finite AKS OAT pin initialization Job")?;
+    let job_uid = if run_table_identity {
+        let uid = created_pin_init_job_uid(&created, &config.namespace, &job_name, run_id)?;
+        let evidence_path = platform
+            .runtime_dir
+            .as_ref()
+            .context("pin Job identity requires runtime directory")?
+            .join("run-table-initializer-job.json");
+        fs::write(
+            evidence_path,
+            serde_json::to_vec_pretty(&json!({
+                "run_id":run_id,"namespace":config.namespace,"job_name":job_name,"job_uid":uid
+            }))?,
+        )?;
+        Some(uid)
+    } else {
+        None
+    };
     record_applied_resource_uids(config, platform, &planned_resources).await?;
 
     let expected_table = run_table.map(|(_, table)| table);
-    wait_for_aks_pin_setup(config, &job_name, run_id, expected_table).await?;
+    wait_for_aks_pin_setup(
+        config,
+        platform,
+        &job_name,
+        job_uid.as_deref(),
+        run_id,
+        expected_table,
+        tokio::time::Instant::now() + Duration::from_secs(200),
+    )
+    .await?;
     if run_table.is_some() {
         platform.run_table_initialization_drained = true;
     }
@@ -6999,13 +7101,136 @@ fn pin_init_job_failure_diagnostics(job: &Value, pods: &Value) -> String {
     }
 }
 
+fn failed_initializer_termination_evidence(
+    namespace: &str,
+    job_name: &str,
+    job_uid: &str,
+    job: &Value,
+    pods: &Value,
+) -> Result<Value> {
+    if job.pointer("/metadata/uid").and_then(Value::as_str) != Some(job_uid)
+        || job.pointer("/status/active").and_then(Value::as_u64) != Some(0)
+        || job.pointer("/status/ready").and_then(Value::as_u64) != Some(0)
+        || !job
+            .pointer("/status/conditions")
+            .and_then(Value::as_array)
+            .is_some_and(|conditions| {
+                conditions
+                    .iter()
+                    .any(|condition| condition["type"] == "Failed" && condition["status"] == "True")
+            })
+    {
+        bail!("initializer Job lacks UID-bound Failed=True, active=0, ready=0 termination proof");
+    }
+    let pods = pods["items"]
+        .as_array()
+        .filter(|pods| !pods.is_empty())
+        .context("initializer pod list is empty or missing")?;
+    let mut evidence = Vec::new();
+    for pod in pods {
+        let pod_uid = pod
+            .pointer("/metadata/uid")
+            .and_then(Value::as_str)
+            .filter(|uid| !uid.is_empty())
+            .context("initializer pod UID missing")?;
+        if pod.pointer("/metadata/namespace").and_then(Value::as_str) != Some(namespace)
+            || pod.pointer("/metadata/labels/controller-uid").and_then(Value::as_str) != Some(job_uid)
+            || !pod.pointer("/metadata/ownerReferences").and_then(Value::as_array).is_some_and(|owners| {
+                let controllers = owners.iter().filter(|owner| owner["controller"] == true).collect::<Vec<_>>();
+                matches!(controllers.as_slice(), [owner] if owner["kind"] == "Job" && owner["name"] == job_name && owner["uid"] == job_uid)
+            })
+            || !matches!(pod.pointer("/status/phase").and_then(Value::as_str), Some("Failed" | "Succeeded"))
+            || pod.pointer("/spec/ephemeralContainers").is_some_and(|value| value.as_array().is_none_or(|items| !items.is_empty()))
+        {
+            bail!("initializer pod {pod_uid} lacks same-controller terminal phase proof");
+        }
+        let mut containers = Vec::new();
+        for (spec_key, status_key, required) in [
+            ("containers", "containerStatuses", true),
+            ("initContainers", "initContainerStatuses", false),
+        ] {
+            let declared = match pod["spec"].get(spec_key) {
+                Some(value) => value
+                    .as_array()
+                    .context("initializer container declarations are malformed")?
+                    .as_slice(),
+                None if !required => &[],
+                None => bail!("initializer application containers are missing"),
+            };
+            if required && declared.is_empty() {
+                bail!("initializer application container list is empty");
+            }
+            let statuses = match pod["status"].get(status_key) {
+                Some(value) => value
+                    .as_array()
+                    .context("initializer container status list is malformed")?
+                    .as_slice(),
+                None if declared.is_empty() => &[],
+                None => bail!("initializer container statuses are missing"),
+            };
+            if statuses.len() != declared.len() {
+                bail!("initializer container status coverage is incomplete");
+            }
+            let mut names = BTreeSet::new();
+            for container in declared {
+                let name = container["name"]
+                    .as_str()
+                    .filter(|name| !name.is_empty())
+                    .context("initializer container name missing")?;
+                if !names.insert(name) {
+                    bail!("initializer container declarations contain duplicate names");
+                }
+                let matches = statuses
+                    .iter()
+                    .filter(|status| status["name"] == name)
+                    .collect::<Vec<_>>();
+                let [status] = matches.as_slice() else {
+                    bail!("initializer container {name} has no unique kubelet status");
+                };
+                let state = status["state"]
+                    .as_object()
+                    .context("initializer container state missing")?;
+                if state.len() != 1 || !state.contains_key("terminated") {
+                    bail!("initializer container {name} is not positively terminated");
+                }
+                let terminated = &state["terminated"];
+                let container_id = terminated["containerID"]
+                    .as_str()
+                    .filter(|id| !id.is_empty())
+                    .context("terminated initializer containerID missing")?;
+                let exit_code = terminated["exitCode"]
+                    .as_i64()
+                    .context("terminated initializer exitCode missing")?;
+                let finished_at = terminated["finishedAt"]
+                    .as_str()
+                    .context("terminated initializer finishedAt missing")?;
+                let finished =
+                    chrono::DateTime::parse_from_rfc3339(finished_at).context("initializer finishedAt is invalid")?;
+                if finished.timestamp_millis() <= 0 {
+                    bail!("initializer finishedAt is not a positive termination timestamp");
+                }
+                containers.push(
+                    json!({"name":name,"container_id":container_id,"exit_code":exit_code,"finished_at":finished_at}),
+                );
+            }
+        }
+        evidence.push(json!({"pod_uid":pod_uid,"phase":pod["status"]["phase"],"containers":containers}));
+    }
+    Ok(json!({
+        "kind":"initializer_terminated_without_receipt","namespace":namespace,
+        "job_name":job_name,"job_uid":job_uid,"job_status":job["status"],"pods":evidence
+    }))
+}
+
 async fn wait_for_aks_pin_setup(
     config: &OatConfig,
+    platform: &mut AksPlatform,
     job_name: &str,
+    job_uid: Option<&str>,
     run_id: &str,
     expected_table: Option<&str>,
+    deadline: tokio::time::Instant,
 ) -> Result<()> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(200);
     loop {
         let output = kubectl(
             config,
@@ -7015,6 +7240,9 @@ async fn wait_for_aks_pin_setup(
         .await
         .with_context(|| format!("inspect AKS OAT pin initialization Job {job_name}"))?;
         let job: Value = serde_json::from_str(&output).context("parse AKS OAT pin initialization Job")?;
+        if job_uid.is_some_and(|uid| job.pointer("/metadata/uid").and_then(Value::as_str) != Some(uid)) {
+            bail!("AKS pin initialization Job UID changed; publisher termination is unconfirmed");
+        }
         if job.pointer("/status/succeeded").and_then(Value::as_u64).unwrap_or(0) > 0 {
             break;
         }
@@ -7044,7 +7272,7 @@ async fn wait_for_aks_pin_setup(
                     "--namespace",
                     &config.namespace,
                     "--selector",
-                    &format!("job-name={job_name}"),
+                    &job_uid.map_or_else(|| format!("job-name={job_name}"), |uid| format!("controller-uid={uid}")),
                     "-o",
                     "json",
                 ],
@@ -7053,7 +7281,27 @@ async fn wait_for_aks_pin_setup(
             .await
             .and_then(|output| serde_json::from_str::<Value>(&output).context("parse pin initialization Pod status"));
             let diagnostics = match pods {
-                Ok(pods) => pin_init_job_failure_diagnostics(&job, &pods),
+                Ok(pods) => {
+                    if failed && let Some(uid) = job_uid {
+                        match failed_initializer_termination_evidence(&config.namespace, job_name, uid, &job, &pods) {
+                            Ok(mut evidence) => {
+                                evidence["run_id"] = json!(run_id);
+                                let path = platform
+                                    .runtime_dir
+                                    .as_ref()
+                                    .context("initializer termination evidence requires the run runtime directory")?
+                                    .join("run-table-initializer-termination.json");
+                                fs::write(path, serde_json::to_vec_pretty(&evidence)?)
+                                    .context("persist positive failed initializer termination evidence")?;
+                                platform.run_table_initialization_drained = true;
+                            }
+                            Err(error) => {
+                                tracing::warn!(%error, "failed initializer publisher termination remains unconfirmed");
+                            }
+                        }
+                    }
+                    pin_init_job_failure_diagnostics(&job, &pods)
+                }
                 Err(error) => format!("Pod diagnostics unavailable: {error:#}"),
             };
             let logs = if logs.trim().is_empty() {
@@ -11846,7 +12094,18 @@ fn qap_lease_sidecar_path(record_path: &Path) -> PathBuf {
 async fn apply_runtime_evidence_retention(directory: &Path, retention: RuntimeEvidenceRetention) -> Result<()> {
     match retention {
         RuntimeEvidenceRetention::PreserveAll => Ok(()),
-        RuntimeEvidenceRetention::PruneExcept(preserve) => remove_runtime_dir_except(directory, &preserve).await,
+        RuntimeEvidenceRetention::PruneExcept(mut preserve) => {
+            for name in [
+                "run-table-initializer-job.json",
+                "run-table-initializer-termination.json",
+            ] {
+                let path = directory.join(name);
+                if path.try_exists().context("inspect retained initializer evidence")? {
+                    preserve.push(path);
+                }
+            }
+            remove_runtime_dir_except(directory, &preserve).await
+        }
     }
 }
 

@@ -67,6 +67,15 @@ Failures capture bounded current/previous logs and descriptions for every
 workload role, namespace pods/services/endpoints and events before cleanup.
 Scale-out keeps exactly one collector/router and initializes the fresh canonical
 physical table in pin-init before maintenance readback and client admission.
+Pin-init uses the collector's Azure ownership environment from the validated
+run runtime config; missing subscription/stamp or a mismatched Delta account
+fails before Job creation. Its read-only root retains a bounded writable `/tmp`.
+Failed initialization remains failed. Cleanup can confirm initializer termination
+without a success receipt only with a recorded Job UID, `Failed=True`,
+`active=0`, `ready=0`, and terminal kubelet states with container IDs for every
+init/application container in every same-controller pod. The distinct
+`initializer_terminated_without_receipt` evidence never claims table initialization;
+timeouts, missing statuses and ambiguous/API failures remain unconfirmed.
 It does not send a collector startup-table selector: the strict exporter
 configuration supports `authority_timeout`, not table selection. Requested
 exporter tunables survive initial injection and reconfiguration; malformed,
