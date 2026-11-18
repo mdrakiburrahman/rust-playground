@@ -1,4 +1,4 @@
-import type { ResourceRequirements } from './runtime.js';
+import { cpuMilli, memoryBytes, type ResourceRequirements } from './runtime.js';
 
 type AutoNumber = number | 'auto';
 export interface FleetSizing {
@@ -80,17 +80,12 @@ function numeric(value: AutoNumber, automatic: number, maximum: number): number 
   return value === 'auto' ? Math.min(maximum, Math.max(1, Math.floor(automatic))) : value;
 }
 function cpu(value: unknown): number {
-  if (typeof value !== 'string' || !/^(?:\d+m|\d+(?:\.\d{1,3})?)$/.test(value)) throw new Error('invalid fleet support CPU request');
-  const result = value.endsWith('m') ? Number(value.slice(0, -1)) : Number(value) * 1000;
+  const result = Number(cpuMilli(value));
   if (!Number.isSafeInteger(result) || result <= 0) throw new Error('invalid fleet support CPU request');
   return result;
 }
 function memory(value: unknown): number {
-  if (typeof value !== 'string') throw new Error('invalid fleet support memory request');
-  const match = /^(\d+)(Ki|Mi|Gi|Ti|k|M|G|T)?$/.exec(value);
-  if (!match) throw new Error('invalid fleet support memory request');
-  const powers: Record<string, number> = { Ki: 1024, Mi: MiB, Gi: GiB, Ti: 1024 ** 4, k: 1000, M: 1e6, G: 1e9, T: 1e12 };
-  const result = Number(match[1]) * (powers[match[2] ?? ''] ?? 1);
+  const result = Number(memoryBytes(value));
   if (!Number.isSafeInteger(result) || result <= 0) throw new Error('invalid fleet support memory request');
   return result;
 }
@@ -130,6 +125,14 @@ export function resolveFleetExperiment(
   base: Record<string, unknown>, input: unknown, observations: FleetNodeObservation[], pools: FleetPoolOutcome[],
 ): Record<string, unknown> {
   const sizing = parseFleetSizing(input);
+  if (!Array.isArray(observations) || !Array.isArray(pools) ||
+      new Set(pools.map(pool => pool.name)).size !== pools.length ||
+      pools.some(pool => !/^[a-z][a-z0-9]{0,11}$/.test(pool.name) ||
+        !/^Standard_[A-Za-z0-9_]+$/.test(pool.sku) || !Number.isSafeInteger(pool.vcpu) || pool.vcpu < 1 ||
+        !['ready', 'failed'].includes(pool.state) ||
+        (pool.reason !== null && (typeof pool.reason !== 'string' || pool.reason.length > 512 || /[\r\n]/.test(pool.reason))) ||
+        pool.state === 'failed' && !pool.reason))
+    throw new Error('fleet pool outcomes require unique identities, integer vCPUs and sanitized failure reasons');
   if (base.campaign_profile !== 'scale_out_single_table' || !Array.isArray(base.tables) || base.tables.length !== 1)
     throw new Error('full fleet requires the existing scale_out_single_table single-table topology');
   const collectors = observations.filter(node => node.pool === sizing.collector_pool);

@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import test from 'node:test';
 import { parseStampConfig } from '../../infra/azure/stamp.js';
-import { assertExperimentPoolCapacity, experimentPoolPodCount, fixtureTables, main, prepareExperiments } from './prepare-experiments.js';
+import { assertExperimentPoolCapacity, experimentPoolPodCount, fixtureTables, main, prepareExperiments, prepareFullFleetExperiment } from './prepare-experiments.js';
 import { parseFleetSizing, resolveFleetExperiment, type FleetNodeObservation } from './fleet-config.js';
 
 const fleetSizing = () => ({
@@ -22,7 +22,7 @@ const fleetNode = (node: string, pool: string, cores: number, gib: number): Flee
 test('full fleet auto resolves each heterogeneous node after requests and support reservations', () => {
   const nodes = [fleetNode('collector', 'hugepool', 192, 1800),
     fleetNode('client-small', 'smallpool', 4, 16), fleetNode('client-big', 'bigpool', 64, 256)];
-  const pools = nodes.map(node => ({ name: node.pool, sku: node.sku, vcpu: node.allocatableCpuMillicores / 1000 + 0.1,
+  const pools = nodes.map(node => ({ name: node.pool, sku: node.sku, vcpu: Math.round(node.allocatableCpuMillicores / 1000),
     state: 'ready' as const, reason: null }));
   const source = { platform: { kind: 'aks' }, campaign_profile: 'scale_out_single_table', tables: ['hot'],
     clients_per_table_sweep: [1, 128], tunables: { client: { corpus_rows: 123, interval_us: 0 } } };
@@ -38,6 +38,8 @@ test('full fleet auto resolves each heterogeneous node after requests and suppor
   assert.ok(fleet.clients.every(client => client.tunables.corpus_rows === undefined));
   assert.equal(resolved.clients_per_table, 2);
   assert.equal(resolved.clients_per_table_sweep, undefined);
+  assert.deepEqual(prepareFullFleetExperiment({ ...source, platform: { ...source.platform, fleet: fleetSizing() } },
+    { nodes, pools }), resolved);
   assert.deepEqual(source.clients_per_table_sweep, [1, 128]);
   const overrides = fleetSizing();
   Object.assign(overrides.collector, { dfe_workers: 20 });
@@ -279,6 +281,18 @@ test('offline CLI selects matching stamp capacity inputs and rejects mismatches 
       if (process.platform !== 'win32') assert.equal((await stat(file)).mode & 0o777, 0o600);
     }
     await assert.rejects(main([...args, '--stamp-config', selectedStampPath], workspace), /EEXIST/);
+    const sizing = { ...fleetSizing(), collector_pool: 'benche64' };
+    const fullFleet = { ...config, campaign_profile: 'scale_out_single_table', tables: [tables[0]],
+      platform: { ...platform, fleet: sizing } };
+    const nodes = [fleetNode('collector', 'benche64', 192, 1800), fleetNode('client', 'benchd64', 4, 16)];
+    const pools = nodes.map(node => ({ name: node.pool, sku: node.sku, vcpu: Math.round(node.allocatableCpuMillicores / 1000),
+      state: 'ready' as const, reason: null }));
+    await writeFile(resolve(root, 'full-fleet-input.json'), JSON.stringify(fullFleet));
+    await writeFile(resolve(root, 'observation.json'), JSON.stringify({ nodes, pools }));
+    await main(['--base', resolve(root, 'full-fleet-input.json'), '--fleet-observation', resolve(root, 'observation.json'),
+      '--out', resolve(root, 'full-fleet'), '--stamp-config', selectedStampPath], workspace);
+    assert.deepEqual(JSON.parse(await readFile(resolve(root, 'full-fleet/full-fleet.config.json'), 'utf8')),
+      prepareFullFleetExperiment(fullFleet, { nodes, pools }));
     await writeFile(resolve(workspace, 'infra/azure/stamp.yaml'), exampleStamp.replace('stamp: 1', 'stamp: 2'));
     await assert.rejects(main([...args, '--out', resolve(root, 'default-mismatch')], workspace),
       /Selected AKS stamp config stamp 2 does not match baseline config stamp 89152/);

@@ -7112,6 +7112,11 @@ async fn run_aks_pin_setup_job(
             },
         }],
     });
+    if let Some(fleet) = &config.platform.fleet {
+        let selector = &mut payload_items["items"][1]["spec"]["template"]["spec"]["nodeSelector"];
+        selector["kubernetes.azure.com/agentpool"] = json!(fleet.collector.pool);
+        selector["kubernetes.io/hostname"] = json!(fleet.collector.node);
+    }
     if run_table_identity {
         let template = payload_items
             .pointer_mut("/items/1/spec/template")

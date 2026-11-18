@@ -187,6 +187,46 @@ The generated QAP database is `experimentqap`, distinct from the main `arrowcol`
 
 `aks destroy --stamp-config "$STAMP_CONFIG"` only prints a read-only inventory. Adding `--confirm arrow-collector-rg` deletes the entire `arrow-collector-rg` and its captured AKS-managed resource groups, including every stamp there; it is not per-run cleanup. OAT benchmark cleanup is automatic and run-scoped.
 
+## Heterogeneous AKS fleet
+
+The [full-fleet template](oat-config.aks.full-fleet.json) is a sizing input, not a
+direct Rust API request. Start from the selected stamp's private generated OAT
+configuration, retain its pinned images and identity bindings, and copy the
+template's `platform.fleet` block. Set `collector_pool` to the explicitly selected
+largest pool; the legacy collector pool is not implicitly selected or relabelled.
+
+| Setting | Resolution |
+| --- | --- |
+| `collector.*` | `auto` derives DFE, runtime, blocking and encoder/writer CPU workers from the selected Ready node's available whole cores, respecting existing consumer maxima. Positive numeric overrides remain supported. |
+| `client.*` | `auto` resolves independently for every Ready client node: worker/runtime threads, connection/stream counts, rows, concurrency and corpus/memory budgets. |
+| Pod budget | Observed node allocatable minus existing nonterminal pod requests, including DaemonSets, minus reserved runtime/support-service room. Collector reservation includes SQL, router, catalog, maintenance and setup jobs; clients retain additional headroom. |
+| Placement | One integrated collector pod plus existing support topology on the explicit collector pool/node. One DMV pod per client node, pinned by pool and hostname with the role selector/taint toleration retained. Only observed `amd64` nodes are admitted for the existing images. |
+| Evidence | Per-client offered rows/s, per-pool offered rows/s, node/pool/SKU allocation and collector/client allocatable CPU/memory totals. The ranking remains exactly `ranking_metrics.committed_rows_per_second`, reconciled from collector commits before shutdown. Missing ranking evidence stays null. |
+
+For offline reproduction from a fleet orchestration observation, prepare a
+single numeric cell without performing cloud operations:
+
+```bash
+npx --no-install tsx projects/arrowcol-oat/prepare-experiments.ts \
+  --base out/arrowcol-oat/full-fleet-input.json \
+  --fleet-observation out/arrowcol-oat/fleet-observation.json \
+  --stamp-config "$STAMP_CONFIG" --out out/arrowcol-oat/resolved-fleet
+```
+
+The observation contains `nodes` (Ready-node identity, architecture, allocatable
+CPU/memory and existing requested CPU/memory) and sanitized `pools` outcomes.
+Preparation rejects unknown sizing fields, malformed sentinels, duplicate nodes,
+incompatible architectures and insufficient budgets. It emits
+`full-fleet.config.json`, with exactly one replica/core cell and no client-count
+sweep. Do not reuse stale observations or submit unresolved `auto` fields directly
+to the Rust API. No collector, router or DMV image rebuild is required.
+
+The fleet lifecycle library requires a fenced mutation authority and adapter;
+there is no standalone production fleet scaling command. The existing campaign
+scale provider remains unchanged. Do not bypass its custody or admission gates.
+Verify pinned image manifest architectures against selected node architectures
+before accepting observations; an `amd64` node selector alone is not image proof.
+
 ## Build and rehearse
 
 Run inside the repository devcontainer. These commands create local images only:

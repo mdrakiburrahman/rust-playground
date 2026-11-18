@@ -196,9 +196,14 @@ impl FleetPlacement {
             let mut resources = config.effective_aks_resources();
             resources.client = node.resources.clone();
             resources.validate(false)?;
-            if parse_cpu_millicores(node.resources.requests.cpu.as_deref().context("fleet CPU is missing")?)?
-                > node.allocatable_cpu_millicores
-                || parse_memory_bytes(&node.resources.requests.memory)? > node.allocatable_memory_bytes
+            if parse_cpu_millicores(
+                node.resources
+                    .limits
+                    .cpu
+                    .as_deref()
+                    .context("fleet CPU limit is missing")?,
+            )? > node.allocatable_cpu_millicores
+                || parse_memory_bytes(&node.resources.limits.memory)? > node.allocatable_memory_bytes
             {
                 bail!("fleet pod resources exceed node allocatable resources");
             }
@@ -2377,7 +2382,7 @@ mod tests {
             pool: pool.to_owned(),
             sku: format!("Standard_D{cores}s_v6"),
             allocatable_cpu_millicores: cores * 1000,
-            allocatable_memory_bytes: cores * (1 << 30),
+            allocatable_memory_bytes: cores * (2 << 30),
             resources: ResourceRequirements::new("2", "4Gi", "2", "6Gi"),
         };
         let mut collector = node("collector", "bigpool", 64);

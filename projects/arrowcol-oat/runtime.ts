@@ -52,7 +52,7 @@ const defaultResources: Record<RuntimeResourceRole, ResourceRequirements | Colle
   catalog: { requests: { cpu: '500m', memory: '1Gi' }, limits: { cpu: '2', memory: '4Gi' } },
 };
 
-function cpuMilli(value: unknown): bigint {
+export function cpuMilli(value: unknown): bigint {
   if (typeof value !== 'string') throw new Error('resource cpu quantities must be strings');
   const match = /^(?:([0-9]+)m|([0-9]+)(?:[.]([0-9]{1,3}))?)$/.exec(value);
   if (!match) throw new Error('resource cpu must be a positive Kubernetes CPU quantity');
@@ -61,7 +61,7 @@ function cpuMilli(value: unknown): bigint {
   return milli;
 }
 
-function memoryBytes(value: unknown): bigint {
+export function memoryBytes(value: unknown): bigint {
   if (typeof value !== 'string') throw new Error('resource memory quantities must be strings');
   const match = /^([0-9]+)(Ei|Pi|Ti|Gi|Mi|Ki|E|P|T|G|M|k)?$/.exec(value);
   if (!match) throw new Error('resource memory must be an integer Kubernetes byte quantity');
