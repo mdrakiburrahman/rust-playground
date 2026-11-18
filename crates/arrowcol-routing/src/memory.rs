@@ -164,10 +164,13 @@ impl RoutingStore for MemoryRoutingStore {
                 "collector heartbeat timestamps are invalid",
             ));
         }
-        if !matches!(collector.state, CollectorState::Ready | CollectorState::Draining) {
+        if !matches!(collector.state, CollectorState::Ready | CollectorState::Draining)
+            || (collector.state == CollectorState::Draining
+                && heartbeat_at >= collector.registration.lease_expires_at_unix_ms)
+        {
             return Err(RoutingError::new(
                 RoutingErrorKind::Conflict,
-                "collector heartbeat was fenced: the instance is missing or terminal",
+                "collector heartbeat was fenced: the instance is missing, terminal, or expired while draining",
             ));
         }
         collector.registration.heartbeat_at_unix_ms = collector.registration.heartbeat_at_unix_ms.max(heartbeat_at);
@@ -197,7 +200,9 @@ impl RoutingStore for MemoryRoutingStore {
             ));
         }
         collector.state = new_state;
-        collector.registration.heartbeat_at_unix_ms = collector.registration.heartbeat_at_unix_ms.max(changed_at);
+        if changed_at < collector.registration.lease_expires_at_unix_ms {
+            collector.registration.heartbeat_at_unix_ms = collector.registration.heartbeat_at_unix_ms.max(changed_at);
+        }
         Ok(())
     }
 

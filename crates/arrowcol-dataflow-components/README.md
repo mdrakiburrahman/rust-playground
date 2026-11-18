@@ -28,8 +28,10 @@ controller and its drained table owners have been dropped. Closure runs on the
 main thread before metric flush. A refused close is logged, leaves its registry
 member registered, and exits nonzero without retrying unregister. Startup or
 controller errors retain the publisher registry for reconciliation.
-The receiver records `draining` during `DrainIngress`; it does not mark the
-process stopped while downstream exporters can still publish. After the
+The receiver records `draining` before waiting for admitted streams and renews
+its live registration through publisher close. This prevents crash succession
+during an orderly drain. Terminal writes do not revive expired registrations.
+The receiver does not mark the process stopped while exporters can still publish. After the
 controller and publisher close finish, the embedding main-thread hook persists
 `stopped` for every registered routing identity only on a clean drain and close.
 An unclean drain, unpublished identity, retired worker, or refused close instead persists `failed`;

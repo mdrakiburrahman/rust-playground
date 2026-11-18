@@ -12,7 +12,7 @@ use arrowcol_protocol::{
     AuthContext, AuthMethod, AuthenticatedPrincipal, CollectorInstanceId, ErrorCode, ImplementationPool,
     PositiveMeasurement, PrincipalId, PrincipalIssuer,
 };
-use arrowcol_routing::{CollectorRegistration, CollectorState, RoutingStore};
+use arrowcol_routing::{CollectorRegistration, RoutingStore};
 use async_trait::async_trait;
 use axum::extract::State;
 use axum::http::{StatusCode, header};
@@ -626,14 +626,12 @@ impl receiver::Receiver<OtapPdata> for ArrowFlightReceiver {
                         Ok(NodeControlMsg::DrainIngress { deadline, .. }) => {
                             self.metrics.set_accepting(false);
                             shutdown.cancel();
+                            begin_registration_drain(&self.routing, instance_id, &self.config).await;
                             let remaining = deadline.saturating_duration_since(Instant::now());
                             drain_streams(&drain, remaining, &mut control, &admission).await;
-                            finalize_registration(
-                                &self.routing,
-                                instance_id,
-                                CollectorState::Draining,
-                                &self.metrics,
-                            ).await;
+                            if self.metrics.publish_pressure(self.routing.as_ref()).await.is_err() {
+                                self.metrics.set_registered(false);
+                            }
                             let _ = effect_handler.notify_receiver_drained().await;
                             await_tasks(flight, admin, registration, remaining).await;
                             return Ok(TerminalState::default());
@@ -641,14 +639,12 @@ impl receiver::Receiver<OtapPdata> for ArrowFlightReceiver {
                         Ok(NodeControlMsg::Shutdown { deadline, .. }) => {
                             self.metrics.set_accepting(false);
                             shutdown.cancel();
+                            begin_registration_drain(&self.routing, instance_id, &self.config).await;
                             let remaining = deadline.saturating_duration_since(Instant::now());
                             drain_streams(&drain, remaining, &mut control, &admission).await;
-                            finalize_registration(
-                                &self.routing,
-                                instance_id,
-                                CollectorState::Draining,
-                                &self.metrics,
-                            ).await;
+                            if self.metrics.publish_pressure(self.routing.as_ref()).await.is_err() {
+                                self.metrics.set_registered(false);
+                            }
                             await_tasks(flight, admin, registration, remaining).await;
                             return Ok(TerminalState::default());
                         }
@@ -893,25 +889,22 @@ async fn registration_loop(
     }
 }
 
-async fn finalize_registration(
+async fn begin_registration_drain(
     store: &Arc<dyn RoutingStore>,
     instance_id: CollectorInstanceId,
-    state: CollectorState,
-    metrics: &Arc<RuntimeMetrics>,
+    config: &FlightReceiverConfig,
 ) {
-    let result = match now_unix_millis() {
-        Ok(now) => store
-            .set_collector_state(instance_id, state, now)
-            .await
-            .map_err(|error| error.to_string()),
-        Err(error) => Err(error),
-    };
+    let result = crate::shutdown::PROCESS_ROUTING_SHUTDOWN
+        .begin_drain(
+            Arc::clone(store),
+            instance_id,
+            config.registration.heartbeat_interval,
+            config.registration.registration_ttl,
+        )
+        .await;
     if let Err(error) = result {
         crate::shutdown::PROCESS_ROUTING_SHUTDOWN.record_failure();
         tracing::error!(%error, "dataflow could not persist ingress drain state");
-    }
-    if metrics.publish_pressure(store.as_ref()).await.is_err() {
-        metrics.set_registered(false);
     }
 }
 
