@@ -651,6 +651,7 @@ export async function recordLegacyAksDisposition(
     }
   };
   if (await checkExisting()) {
+    await assertLegacyWritersAbsent(proof);
     await syncLegacyReceiptDirectory(path);
     return;
   }
@@ -701,9 +702,10 @@ export async function assertNoUnsettledDeadlineReceipts(
     const originalName = name.slice(0, -legacyDispositionSuffix.length);
     const approval = approvals.length === 1 && originalName === approvals[0]?.invocationId + '.json' ? approvals[0] : undefined;
     if (!approval || !names.includes(originalName)) throw new Error('Unapproved or orphaned legacy AKS disposition');
-    validateLegacyAksDisposition(
+    const proof = validateLegacyAksDisposition(
       await readLegacyRegularFile(resolve(root, originalName)), await readLegacyRegularFile(resolve(root, name)), approval,
     );
+    await assertLegacyWritersAbsent(proof);
     await syncLegacyReceiptDirectory(resolve(root, name));
     admittedDispositions.add(originalName);
   }

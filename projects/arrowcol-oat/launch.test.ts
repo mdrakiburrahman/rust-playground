@@ -666,6 +666,20 @@ test('legacy AKS disposition is one-time, exact, and does not rewrite the failed
     ]), /lacks coherent single-cell/);
     await writeFile(manifestPath, bytes);
     await assert.rejects(recordLegacyAksDisposition(root, deadline.invocationId, manifestPath, approval), /listener is still present/);
+    await writeFile(dispositionPath, bytes, { flag: 'wx' });
+    await assert.rejects(assertNoUnsettledDeadlineReceipts(root, undefined, approval), /listener is still present/);
+    await assert.rejects(recordLegacyAksDisposition(root, deadline.invocationId, manifestPath, approval), /listener is still present/);
+    await unlink(dispositionPath);
+    const livePid = JSON.stringify({
+      ...manifest, writer_fence: { ...manifest.writer_fence,
+        launcher: { ...manifest.writer_fence.launcher, pid: process.pid },
+        server: { ...manifest.writer_fence.server, ppid: process.pid },
+      },
+    });
+    const livePidApproval = [{ ...approval[0]!, evidenceSha256: digest(livePid) }];
+    await writeFile(manifestPath, livePid);
+    await assert.rejects(recordLegacyAksDisposition(root, deadline.invocationId, manifestPath, livePidApproval), /exited launcher and server/);
+    await writeFile(manifestPath, bytes);
     await new Promise<void>((resolve, reject) => listener.close((error) => error ? reject(error) : resolve()));
     await Promise.all([1, 2].map(() => recordLegacyAksDisposition(root, deadline.invocationId, manifestPath, approval)));
     await assertNoUnsettledDeadlineReceipts(root, undefined, approval);
