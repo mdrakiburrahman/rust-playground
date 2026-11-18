@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use arrowcol_tunables::Tunables;
+use arrowcol_tunables::{DEFAULT_COLLECTOR_SHUTDOWN_DRAIN_TIMEOUT_SECONDS, Tunables};
 use otel_arrow_dfe_quiver::{DiskBudget, QuiverConfig};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -844,6 +844,22 @@ impl OatConfig {
         }
         if !(30..=3_600).contains(&self.collector_stop_grace_seconds) {
             bail!("collector_stop_grace_seconds must be between 30 and 3600");
+        }
+        const TERMINAL_WRITE_MARGIN_SECONDS: u64 = 60;
+        let drain_seconds = u64::from(
+            self.tunables
+                .collector
+                .as_ref()
+                .and_then(|collector| collector.shutdown_drain_timeout_seconds)
+                .unwrap_or(DEFAULT_COLLECTOR_SHUTDOWN_DRAIN_TIMEOUT_SECONDS),
+        );
+        // The global controller drains producers and then system observability,
+        // each with the configured budget. Reserve time for terminal finalization.
+        let required_grace = 2 * drain_seconds + TERMINAL_WRITE_MARGIN_SECONDS;
+        if self.collector_stop_grace_seconds < required_grace {
+            bail!(
+                "collector_stop_grace_seconds must be at least {required_grace} (two {drain_seconds}s drain phases plus {TERMINAL_WRITE_MARGIN_SECONDS}s for terminal writes)"
+            );
         }
         if !(1..=300).contains(&self.qap_timeout_seconds) {
             bail!("qap_timeout_seconds must be between 1 and 300");
@@ -1726,6 +1742,25 @@ mod tests {
         let mut config = valid();
         assert_eq!(config.collector_stop_grace_seconds, 300);
         config.collector_stop_grace_seconds = 30;
+        assert!(config.validate().is_err());
+        config.collector_stop_grace_seconds = 179;
+        assert!(config.validate().is_err());
+        config.collector_stop_grace_seconds = 180;
+        config.validate()?;
+        config.tunables.collector = Some(arrowcol_tunables::CollectorTunables {
+            shutdown_drain_timeout_seconds: Some(240),
+            ..Default::default()
+        });
+        config.collector_stop_grace_seconds = 539;
+        assert!(
+            config
+                .validate()
+                .expect_err("insufficient grace")
+                .to_string()
+                .contains("at least 540")
+        );
+        config.collector_stop_grace_seconds = 540;
+        config.run_pin_ttl_ms = 86_400_000;
         config.validate()?;
         config.collector_stop_grace_seconds = 3_600;
         config.run_pin_ttl_ms = 86_400_000;

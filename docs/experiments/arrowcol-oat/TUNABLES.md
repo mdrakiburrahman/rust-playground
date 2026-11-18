@@ -177,7 +177,8 @@ cargo test --locked --package arrowcol-oat-rust --lib \
 | --- | --- |
 | `aks_rollout_timeout_seconds` | Overall Deployment readiness deadline; defaults to 600 seconds and accepts `600..=3600`. Image-pull and container-config errors fail immediately; an unready container fails at four or more restarts. Failure details include previous logs and `kubectl describe` output. |
 | `reconciliation_settle_timeout_seconds` | Post-client Delta commit drain deadline; defaults to 120 seconds and accepts `0..=1800`. Zero performs one immediate read. Settling is outside the measurement window. Commit evidence uses appended-log offsets plus ingress timestamps at or after the cell start. A log-prefix mismatch/rotation safely falls back to ingress-time-only scope and records that choice; prior-cell tail events are excluded, while commits crossing the cell boundary are reported unavailable. |
-| `collector_stop_grace_seconds` | Collector shutdown grace, default 300 seconds, range `30..=3600`; projected to local Compose and AKS, verified against the effective runtime configuration, and included in the run-pin lifetime budget. |
+| `collector_stop_grace_seconds` | Outer stop grace for local Compose and AKS (default 300 seconds, `30..=3600`). Must also cover twice the DFE drain budget plus 60 seconds for terminal writes. Verified on the runtime and included in the run-pin lifetime budget. |
+| `tunables.collector.shutdown_drain_timeout_seconds` | DFE SIGTERM drain budget per phase. Whole JSON seconds (`1..=1500`, default `60`); applies at process startup. OAT verifies the requested value against the DFE's startup readback. |
 
 ## Quick-run measurement scopes
 

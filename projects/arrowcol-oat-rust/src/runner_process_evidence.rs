@@ -52,6 +52,7 @@ fn process_log_complete(role: &ComponentRole, text: &str) -> bool {
 fn is_process_evidence_line(line: &str) -> bool {
     [
         "arrowcol_effective_config ",
+        "df_engine_effective_config ",
         "arrowcol_router_effective_config ",
         "arrowcol_wal_effective_config ",
         "arrowcol_layout_",
@@ -309,6 +310,7 @@ fn process_configurations(text: &str) -> Result<Value> {
         }
         let value = [
             "arrowcol_effective_config ",
+            "df_engine_effective_config ",
             "arrowcol_router_effective_config ",
             "arrowcol_maintenance_effective_config ",
             "OAT_CLIENT_EFFECTIVE_CONFIG ",
@@ -531,6 +533,9 @@ fn verify_process_configuration(config: &OatConfig, role: ComponentRole, observe
             "ARROWCOL_COLLECTOR_LIMITS_CONFIG" => "/limits".to_owned(),
             "ARROWCOL_COLLECTOR_PRESSURE_CONFIG" => "/pressure".to_owned(),
             "ARROWCOL_COLLECTOR_CPU_PRESSURE" => "/cpu_pressure".to_owned(),
+            "ARROWCOL_COLLECTOR_SHUTDOWN_DRAIN_TIMEOUT_SECONDS" => {
+                "/engine/shutdown_drain_timeout_seconds".to_owned()
+            }
             "ARROWCOL_COLLECTOR_CATALOG_CONFIG" => "/catalog".to_owned(),
             "ARROWCOL_COLLECTOR_ROUTING_CONFIG" => "/routing".to_owned(),
             "ARROWCOL_COLLECTOR_EXPORTER_CONFIG" => String::new(),

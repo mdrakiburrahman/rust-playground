@@ -17,6 +17,17 @@ When `clients_per_table_sweep` is set, the Data Flow verdict requires one result
 
 The `scale_out_single_table` profile reports ranked commit-window throughput only when Delta-log reconciliation is `matched`. Missing, unavailable, or mismatched reconciliation produces a failed, unranked result; raw commit-window and client observations remain diagnostic. Downstream QAP availability is reported separately.
 
+## Collector shutdown drain
+
+For a workload that continues publishing after SIGTERM, set
+`tunables.collector.shutdown_drain_timeout_seconds` (for example `240`) and
+`collector_stop_grace_seconds` to at least twice that value plus 60 (for
+example `540`). Both local Compose and AKS use the same guard: the DFE drains
+producer pipelines before system observability, and the outer stop grace
+also reserves time for terminal routing writes. Omitted drain budgets stay at
+60 seconds. Compare the effective engine setting and the actual drain outcome
+in the cell evidence; configuring a larger budget is not proof of a clean drain.
+
 ## Local launcher deadline and recovery
 
 `--deadline-seconds <1..600>` is opt-in and valid only for a local run with `--no-viewer`; omitting it preserves the existing launcher behavior. The monotonic deadline begins when `launch.ts` starts and includes setup, server build, the run, report processing and owned-server shutdown. For example:

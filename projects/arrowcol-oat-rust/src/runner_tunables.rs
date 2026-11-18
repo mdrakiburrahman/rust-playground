@@ -36,10 +36,14 @@ fn role_environment(config: &OatConfig, role: ComponentRole) -> Result<std::coll
 fn validate_collector_pipeline_log_level(pipeline_yaml: &str) -> Result<()> {
     let pipeline: serde_yaml::Value = serde_yaml::from_str(pipeline_yaml)
         .context("parse rendered collector pipeline for logging precedence")?;
-    let engine = pipeline
+    let mut engine = pipeline
         .get("engine")
         .cloned()
         .unwrap_or_else(|| serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+    // The DFE expands the drain setting's environment placeholder before loading the profile.
+    if let Some(mapping) = engine.as_mapping_mut() {
+        mapping.remove("shutdown_drain_timeout_seconds");
+    }
     let engine: EngineConfig = serde_yaml::from_value(engine)
         .context("parse collector engine settings for logging precedence")?;
     if engine.telemetry.logs.level.is_some() {
@@ -552,6 +556,62 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
         Ok(serde_json::from_str(include_str!(
             "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
         ))?)
+    }
+
+    #[test]
+    fn collector_shutdown_drain_timeout_reaches_dfe_profiles_and_readback() -> Result<()> {
+        const CHILD: &str = "OAT_DFE_DRAIN_CHILD";
+        const ENV: &str = "ARROWCOL_COLLECTOR_SHUTDOWN_DRAIN_TIMEOUT_SECONDS";
+        let mut config = config()?;
+        config.collector_stop_grace_seconds = 540;
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+            "collector": {"shutdown_drain_timeout_seconds": 240}
+        }))?;
+        config.run_pin_ttl_ms = 86_400_000;
+        config.validate()?;
+        if std::env::var_os(CHILD).is_some() {
+            use otel_arrow_dfe_config::{engine::OtelDataflowSpec, env_substitution::substitute_env_vars};
+            for template in [
+                include_str!("../../arrowcol-dataflow-rust/config.yaml"),
+                include_str!("../../arrowcol-dataflow-rust/config.quiver.yaml"),
+            ] {
+                let value = substitute_env_vars(template)?;
+                let parsed = OtelDataflowSpec::from_yaml(&value)?;
+                assert_eq!(
+                    arrowcol_tunables::MAX_COLLECTOR_SHUTDOWN_DRAIN_TIMEOUT_SECONDS,
+                    otel_arrow_dfe_config::engine::MAX_SHUTDOWN_DRAIN_TIMEOUT_SECONDS,
+                );
+                let actual = parsed.engine.shutdown_drain_timeout_seconds.get();
+                assert_eq!(actual, 240);
+                let line = format!("df_engine_effective_config {}", json!({
+                    "engine": {"shutdown_drain_timeout_seconds": actual}
+                }));
+                let text = filter_process_evidence_text(&line)?;
+                let observed = process_configurations(&text)?;
+                verify_process_configuration(&config, ComponentRole::Collector, &observed)?;
+            }
+            for observed in [json!({}), json!({"engine":{"shutdown_drain_timeout_seconds": 60}})] {
+                assert!(verify_process_configuration(&config, ComponentRole::Collector, &observed).is_err());
+            }
+            return Ok(());
+        }
+        let compose = compose_tunables(&config)?;
+        let expected = compose["services"]["dataflow-1"]["environment"][ENV].as_str().context("missing Compose tunable")?;
+        let mut deployment = json!({"spec":{"template":{"spec":{"containers":[{"name":"dataflow"}]}}}});
+        inject_deployment_environment(&mut deployment, "dataflow", &role_environment(&config, ComponentRole::Collector)?)?;
+        assert_eq!(deployment["spec"]["template"]["spec"]["containers"][0]["env"], json!([{"name": ENV,"value":expected}]));
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .env(CHILD, "1")
+            .env(ENV, expected)
+            .args(["collector_shutdown_drain_timeout_reaches_dfe_profiles_and_readback", "--nocapture"])
+            .output()?;
+        anyhow::ensure!(
+            output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed;"),
+            "DFE drain config subprocess failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(())
     }
 
     #[test]

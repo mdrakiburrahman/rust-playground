@@ -165,6 +165,7 @@ const CAPABILITIES: &[Capability] = &[
     capability!("router.upstream_total_connection_timeout_ms", "3000"),
     capability!("router.upstream_idle_timeout_seconds", "60"),
     capability!("router.upstream_ping_interval_seconds", "15; 0 disables"),
+    capability!("collector.shutdown_drain_timeout_seconds", "60"),
     capability!("collector.batching.coalesce_publications", "false"),
     capability!("collector.batching.age_flush_policy", "immediate"),
     capability!("collector.batching.global_capacity.bytes", "2147483648"),
@@ -720,6 +721,12 @@ impl Tunables {
                 let Some(collector) = self.collector.as_ref() else {
                     bail!("collector section serialized without typed settings");
                 };
+                if let Some(seconds) = collector.shutdown_drain_timeout_seconds {
+                    output.insert(
+                        "ARROWCOL_COLLECTOR_SHUTDOWN_DRAIN_TIMEOUT_SECONDS".to_owned(),
+                        seconds.to_string(),
+                    );
+                }
                 if let Some(value) = &collector.batching {
                     let mut value = value.clone();
                     canonicalize_optional_duration(&mut value.max_age, "collector.batching.max_age")?;
@@ -1175,6 +1182,12 @@ fn validate_collector_layout(layout: Option<&LayoutTunables>) -> Result<()> {
 }
 
 fn validate_collector_controls(collector: &CollectorTunables) -> Result<()> {
+    if collector
+        .shutdown_drain_timeout_seconds
+        .is_some_and(|seconds| !(1..=MAX_COLLECTOR_SHUTDOWN_DRAIN_TIMEOUT_SECONDS).contains(&seconds))
+    {
+        bail!("collector.shutdown_drain_timeout_seconds must be in 1..={MAX_COLLECTOR_SHUTDOWN_DRAIN_TIMEOUT_SECONDS}");
+    }
     if let Some(catalog) = &collector.catalog {
         validate_millisecond_duration(
             "collector.catalog.maximum_cache_age",
@@ -2048,6 +2061,44 @@ mod tests {
                 "runtime": {"upload_limit": 256}, "upload": {"mode": "buffered_multipart"}
             }}))
             .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn collector_shutdown_drain_timeout_rejects_bad_json_and_projects_only_to_collector() -> Result<()> {
+        let name = "ARROWCOL_COLLECTOR_SHUTDOWN_DRAIN_TIMEOUT_SECONDS";
+        for bad in [
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("240"),
+            Value::Null,
+            serde_json::json!(1_501),
+            serde_json::json!(u32::MAX),
+        ] {
+            assert!(
+                Tunables::parse_oat_json(serde_json::json!({
+                    "collector": {"shutdown_drain_timeout_seconds": bad}
+                }))
+                .is_err(),
+                "{bad}"
+            );
+        }
+        for seconds in [1, 240, 1_500] {
+            let tunables = Tunables::parse_oat_json(serde_json::json!({
+                "collector": {"shutdown_drain_timeout_seconds": seconds}
+            }))?;
+            assert_eq!(
+                tunables.environment_for(ComponentRole::Collector)?[name],
+                seconds.to_string()
+            );
+            assert!(!tunables.environment_for(ComponentRole::Router)?.contains_key(name));
+        }
+        assert!(
+            !Tunables::default()
+                .environment_for(ComponentRole::Collector)?
+                .contains_key(name)
         );
         Ok(())
     }

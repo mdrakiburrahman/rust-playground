@@ -192,9 +192,24 @@ pub struct LoggingTunables {
     pub maintenance: Option<LogLevel>,
 }
 
+pub const DEFAULT_COLLECTOR_SHUTDOWN_DRAIN_TIMEOUT_SECONDS: u32 = 60;
+pub const MAX_COLLECTOR_SHUTDOWN_DRAIN_TIMEOUT_SECONDS: u32 = 1_500;
+
+fn deserialize_shutdown_drain_timeout_seconds<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    u32::deserialize(deserializer).map(Some)
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CollectorTunables {
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_shutdown_drain_timeout_seconds"
+    )]
+    pub shutdown_drain_timeout_seconds: Option<u32>,
     pub batching: Option<BatchingTunables>,
     pub catalog: Option<CatalogTunables>,
     pub commit: Option<CommitTunables>,
