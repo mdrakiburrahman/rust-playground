@@ -7843,11 +7843,11 @@ fn configure_collector_deployment(config: &OatConfig, desired: &mut Value, concu
         &config.effective_aks_resources().collector,
     )?;
     desired["spec"]["template"]["spec"]["terminationGracePeriodSeconds"] = json!(config.collector_stop_grace_seconds);
-    inject_deployment_environment(
-        desired,
-        &config.dfe_container,
-        &role_environment(config, ComponentRole::Collector)?,
-    )
+    let mut variables = role_environment(config, ComponentRole::Collector)?;
+    if config.campaign_profile == Some(crate::config::CampaignProfile::ScaleOutSingleTable) {
+        merge_startup_table_override(desired, &config.dfe_container, config, &mut variables, true)?;
+    }
+    inject_deployment_environment(desired, &config.dfe_container, &variables)
 }
 
 fn verify_aks_collector_stop_grace(deployment: &Value, expected_seconds: u64) -> Result<()> {

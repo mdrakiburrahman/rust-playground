@@ -186,7 +186,7 @@ fn inject_workload_environment(config: &OatConfig, resources: &mut [Value]) -> R
             if role == ComponentRole::Collector
                 && config.campaign_profile == Some(crate::config::CampaignProfile::ScaleOutSingleTable)
             {
-                merge_startup_table_override(resource, container, config, &mut variables)?;
+                merge_startup_table_override(resource, container, config, &mut variables, false)?;
             }
             inject_deployment_environment(resource, container, &variables)?;
         }
@@ -199,6 +199,7 @@ fn merge_startup_table_override(
     container_name: &str,
     config: &OatConfig,
     variables: &mut std::collections::BTreeMap<String, String>,
+    allow_injected: bool,
 ) -> Result<()> {
     let [table] = config.tables.as_slice() else {
         bail!("scale-out startup selector requires exactly one table");
@@ -228,9 +229,6 @@ fn merge_startup_table_override(
         bail!("rendered collector exporter override is duplicated");
     }
     let rendered: Value = serde_json::from_str(value).context("invalid rendered collector exporter override")?;
-    if rendered != json!({"startup_table": expected}) {
-        bail!("rendered collector startup selector differs from the requested hot table");
-    }
     let name = "ARROWCOL_COLLECTOR_EXPORTER_CONFIG";
     let mut effective = match variables.get(name) {
         Some(value) => serde_json::from_str::<Value>(value).context("invalid collector exporter tunable override")?,
@@ -243,6 +241,11 @@ fn merge_startup_table_override(
         bail!("collector exporter tunables conflict with the startup selector");
     }
     object.insert("startup_table".to_owned(), expected);
+    if rendered != json!({"startup_table": effective["startup_table"]})
+        && !(allow_injected && rendered == effective)
+    {
+        bail!("collector exporter override differs from the requested startup selector or tunables");
+    }
     variables.insert(name.to_owned(), serde_json::to_string(&effective)?);
     Ok(())
 }
@@ -301,6 +304,8 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
             bail!("runtime renderer failed: {}", String::from_utf8_lossy(&output.stderr));
         }
         let mut resources: Vec<Value> = serde_json::from_slice(&output.stdout)?;
+        let rendered_collector = resources.iter().find(|resource| resource["kind"] == "Deployment"
+            && resource["metadata"]["name"] == config.dfe_deployment).context("collector Deployment missing")?.clone();
         let mut tampered = resources.clone();
         let collector = tampered.iter_mut().find(|resource| resource["kind"] == "Deployment"
             && resource["metadata"]["name"] == config.dfe_deployment).context("collector Deployment missing")?;
@@ -324,6 +329,40 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
         let effective: Value = serde_json::from_str(entry["value"].as_str().context("exporter value missing")?)?;
         assert_eq!(effective["startup_table"], runtime["collectorStartupTable"]);
         assert_eq!(effective["authority_timeout"], "10s");
+        let mut fresh = rendered_collector;
+        configure_collector_deployment(&config, &mut fresh, 1)?;
+        let fresh_entries = fresh.pointer("/spec/template/spec/containers/0/env")
+            .and_then(Value::as_array).context("collector env missing")?;
+        let fresh_entry = fresh_entries.iter().find(|entry| entry["name"] == "ARROWCOL_COLLECTOR_EXPORTER_CONFIG")
+            .context("exporter override missing")?;
+        let fresh_effective: Value = serde_json::from_str(fresh_entry["value"].as_str().context("exporter value missing")?)?;
+        assert_eq!(fresh_effective, effective);
+
+        let mut configured = collector.clone();
+        configure_collector_deployment(&config, &mut configured, 1)?;
+        assert_eq!(configured, *collector);
+        for invalid in [
+            "{",
+            "{}",
+            r#"{"startup_table":{"catalog":"telemetry","schema":"sqlserver","table":"other"},"authority_timeout":"10s"}"#,
+            r#"{"startup_table":{"catalog":"telemetry","schema":"sqlserver","table":"sqlserver_availability_replica_states"},"authority_timeout":"10s","extra":true}"#,
+            r#"{"startup_table":{"catalog":"telemetry","schema":"sqlserver","table":"sqlserver_availability_replica_states"},"authority_timeout":"20s"}"#,
+        ] {
+            let mut invalid_deployment = collector.clone();
+            let entries = invalid_deployment.pointer_mut("/spec/template/spec/containers/0/env")
+                .and_then(Value::as_array_mut).context("collector env missing")?;
+            let entry = entries.iter_mut().find(|entry| entry["name"] == "ARROWCOL_COLLECTOR_EXPORTER_CONFIG")
+                .context("exporter override missing")?;
+            entry["value"] = json!(invalid);
+            assert!(configure_collector_deployment(&config, &mut invalid_deployment, 1).is_err(), "{invalid}");
+        }
+        let mut duplicated = collector.clone();
+        let entries = duplicated.pointer_mut("/spec/template/spec/containers/0/env")
+            .and_then(Value::as_array_mut).context("collector env missing")?;
+        let entry = entries.iter().find(|entry| entry["name"] == "ARROWCOL_COLLECTOR_EXPORTER_CONFIG")
+            .context("exporter override missing")?.clone();
+        entries.push(entry);
+        assert!(configure_collector_deployment(&config, &mut duplicated, 1).is_err());
         Ok(())
     }
 
