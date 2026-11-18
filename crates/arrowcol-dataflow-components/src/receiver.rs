@@ -438,6 +438,7 @@ struct ArrowFlightReceiver {
     routing: Arc<dyn RoutingStore>,
     metrics: Arc<RuntimeMetrics>,
     permits: Arc<Semaphore>,
+    direct_topology: bool,
 }
 
 fn validate_receiver_config(value: &serde_json::Value) -> Result<(), otel_arrow_dfe_config::error::Error> {
@@ -447,7 +448,7 @@ fn validate_receiver_config(value: &serde_json::Value) -> Result<(), otel_arrow_
 }
 
 fn create_receiver(
-    _pipeline: PipelineContext,
+    pipeline: PipelineContext,
     node: NodeId,
     node_config: Arc<NodeUserConfig>,
     receiver_config: &ReceiverConfig,
@@ -492,6 +493,8 @@ fn create_receiver(
     );
     Ok(ReceiverWrapper::shared(
         ArrowFlightReceiver {
+            direct_topology: crate::topology::is_direct_collector(&pipeline, &pipeline.node_id())
+                && !config.native_quiver,
             config,
             routing,
             metrics,
@@ -602,6 +605,7 @@ impl receiver::Receiver<OtapPdata> for ArrowFlightReceiver {
         let admin_state = AdminState {
             metrics: Arc::clone(&self.metrics),
             max_request_bytes: u64::try_from(limits.max_message_bytes).unwrap_or(u64::MAX),
+            direct_topology: self.direct_topology,
         };
         let mut admin = tokio::spawn(async move {
             axum::serve(admin_listener, admin_router(admin_state))
@@ -912,6 +916,7 @@ async fn begin_registration_drain(
 struct AdminState {
     metrics: Arc<RuntimeMetrics>,
     max_request_bytes: u64,
+    direct_topology: bool,
 }
 
 fn admin_router(state: AdminState) -> Router {
@@ -972,7 +977,12 @@ async fn admin_capabilities(State(state): State<AdminState>) -> impl IntoRespons
 
 async fn admin_pressure(State(state): State<AdminState>) -> Response {
     match state.metrics.pressure() {
-        Ok(pressure) => Json(pressure).into_response(),
+        Ok(mut pressure) => {
+            if state.direct_topology && state.metrics.ready() {
+                pressure.resolved_buffering_mode = "memory_only";
+            }
+            Json(pressure).into_response()
+        }
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
@@ -988,6 +998,34 @@ async fn admin_metrics(State(state): State<AdminState>) -> Response {
 #[cfg(test)]
 pub(crate) mod tests {
     #![allow(clippy::expect_used)]
+
+    #[tokio::test]
+    async fn pressure_attests_only_ready_direct_receivers() -> anyhow::Result<()> {
+        async fn mode(state: AdminState) -> anyhow::Result<serde_json::Value> {
+            let response = admin_pressure(State(state)).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024).await?;
+            Ok(serde_json::from_slice::<serde_json::Value>(&body)?["resolved_buffering_mode"].clone())
+        }
+
+        let metrics = Arc::new(RuntimeMetrics::new(CollectorInstanceId::new()));
+        let mut state = AdminState {
+            metrics: Arc::clone(&metrics),
+            max_request_bytes: 4096,
+            direct_topology: true,
+        };
+        metrics.set_healthy(true);
+        metrics.set_catalog_ready(true);
+        metrics.set_registered(true);
+        metrics.set_accepting(true);
+        assert_eq!(mode(state.clone()).await?, "memory_only");
+        metrics.set_accepting(false);
+        assert_eq!(mode(state.clone()).await?, "unknown");
+        metrics.set_accepting(true);
+        state.direct_topology = false;
+        assert_eq!(mode(state).await?, "unknown");
+        Ok(())
+    }
 
     use std::sync::Mutex;
 

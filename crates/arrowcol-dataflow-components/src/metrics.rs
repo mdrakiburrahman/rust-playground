@@ -1688,6 +1688,7 @@ impl RuntimeMetrics {
                 "ack_tracked_end_to_end"
             },
             native_quiver_enabled: native_quiver,
+            resolved_buffering_mode: "unknown",
             native_quiver_buffered_bytes: native_quiver.then_some(backlog.bytes),
             native_quiver_buffered_rows: native_quiver.then_some(backlog.rows),
             native_quiver_buffered_batches: native_quiver.then_some(backlog.batches),
@@ -1967,6 +1968,7 @@ pub struct DashboardPressure {
     dfe_channel_occupancy: u64,
     dfe_channel_occupancy_source: &'static str,
     native_quiver_enabled: bool,
+    pub(crate) resolved_buffering_mode: &'static str,
     native_quiver_buffered_bytes: Option<u64>,
     native_quiver_buffered_rows: Option<u64>,
     native_quiver_buffered_batches: Option<u64>,

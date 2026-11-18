@@ -22,6 +22,7 @@ mod metrics;
 mod receiver;
 mod routing;
 mod shutdown;
+mod topology;
 
 pub use arrow_deltalake::delta::initialize_shared_io;
 pub use config::{
@@ -44,3 +45,4 @@ pub use metrics::{
 pub use receiver::{ARROW_FLIGHT_RECEIVER, ARROW_FLIGHT_RECEIVER_URN, DfeAdmission, PdataSendError, PdataSender};
 pub use routing::{LeaseResolver, StoreLeaseResolver};
 pub use shutdown::{RoutingShutdown, finish_routing_shutdown};
+pub use topology::observe_validated_topology;

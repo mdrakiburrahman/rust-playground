@@ -239,6 +239,11 @@ plane. Use it only for a single collector that owns every table it receives.
   Prometheus snapshots; `process_instance_id` and `process_instance_key`
   expose the process identity that replay rebinding uses.
 
+`/v1/pressure` reports `resolved_buffering_mode: memory_only` only from a ready
+receiver in the SDK-validated, immutable singleton Flight-to-Delta graph.
+Other topologies report `unknown`; `native_quiver_enabled` remains separate
+delivery evidence and does not prove a direct graph.
+
 ## Validation
 
 ```bash
