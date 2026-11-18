@@ -1,3 +1,5 @@
+use arrowcol_tunables::ClientDataProfile;
+
 const OFFICIAL_MEASUREMENT_MAX_BYTES: usize = 4_194_304;
 const OFFICIAL_MEASUREMENT_SCOPE: &str = "original_official_cell_window_not_paired_scale_authorization";
 const OFFICIAL_MEASUREMENT_PUBLICATION_SECONDS: u64 = 20;
@@ -624,7 +626,8 @@ impl CellEvidence {
     fn record_client(&mut self, config: &OatConfig, table: &str, output: &str) -> Result<()> {
         let effective = process_configurations(output)?;
         verify_process_configuration(config, ComponentRole::Client, &effective)?;
-        let counters = client_phase_evidence(output)?;
+        let data_profile = config.tunables.client.as_ref().and_then(|client| client.data_profile).unwrap_or_default();
+        let counters = client_phase_evidence(output, data_profile)?;
         if let Some(window) = counters.get("measurement_window").filter(|value| !value.is_null()) {
             let report = parse_client_metrics(output)?;
             if self.measurement_window != window["start_unix_ms"].as_u64().zip(window["end_unix_ms"].as_u64())
@@ -1824,7 +1827,7 @@ mod measurement_evidence_tests {
 
 
     #[test]
-    fn legacy_client_snapshots_default_retry_counters_to_zero() -> Result<()> {
+    fn client_snapshots_validate_prepared_generation_by_data_profile() -> Result<()> {
         let worker = json!({
             "worker": 0, "attempted_rows": 5, "attempted_bytes": 25,
             "completed_rows": 5, "completed_bytes": 25, "error_rows": 0,
@@ -1844,15 +1847,35 @@ mod measurement_evidence_tests {
                 "scope": "per_stream_admission_completion_observed_in_half_open_shared_unix_window",
             },
         });
-        let snapshots = [start, end]
+        let mut snapshots = [start, end]
             .into_iter()
             .map(serde_json::from_value::<ClientCounterSnapshot>)
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        let output = client_snapshot_delta(&snapshots)?;
+        let output = client_snapshot_delta(&snapshots, ClientDataProfile::Diagnostic)?;
         assert_eq!(output["workers"][0]["rejected_rows"], 0);
         assert_eq!(output["workers"][0]["retried_streams"], 0);
         assert_eq!(output["measurement_window"]["ambiguous_rows"], 0);
         assert_eq!(output["process_cumulative"]["ambiguous_rows"], 0);
+        snapshots[1].preparation = Some(json!({
+            "corpus_rows": 65_536,
+            "memory_reservation_bytes": 1_000_000,
+            "steady_state_generation": true,
+        }));
+        let realistic = client_snapshot_delta(&snapshots, ClientDataProfile::Realistic)?;
+        assert_eq!(realistic["preparation"]["steady_state_generation"], true);
+        assert_eq!(realistic["preparation"]["corpus_rows"], 65_536);
+        assert!(client_snapshot_delta(&snapshots, ClientDataProfile::Diagnostic).is_err());
+
+        for (flag, valid_diagnostic) in [(json!(false), true), (json!("true"), false)] {
+            snapshots[1].preparation.as_mut().context("test preparation")?["steady_state_generation"] = flag;
+            assert!(client_snapshot_delta(&snapshots, ClientDataProfile::Realistic).is_err());
+            assert_eq!(client_snapshot_delta(&snapshots, ClientDataProfile::Diagnostic).is_ok(), valid_diagnostic);
+        }
+        snapshots[1].preparation = Some(json!({"corpus_rows": 65_536}));
+        assert!(client_snapshot_delta(&snapshots, ClientDataProfile::Realistic).is_err());
+        snapshots[1].preparation = None;
+        assert!(client_snapshot_delta(&snapshots, ClientDataProfile::Realistic).is_err());
+        assert!(client_snapshot_delta(&snapshots, ClientDataProfile::Diagnostic)?["preparation"].is_null());
         Ok(())
     }
 
@@ -1980,8 +2003,11 @@ struct ClientMeasurementWindow {
     scope: String,
 }
 
-fn client_preparation(value: Option<&Value>) -> Result<Value> {
+fn client_preparation(value: Option<&Value>, data_profile: ClientDataProfile) -> Result<Value> {
     let Some(value) = value else {
+        if data_profile == ClientDataProfile::Realistic {
+            bail!("missing preparation evidence for realistic client");
+        }
         return Ok(Value::Null);
     };
     let object = value.as_object().context("client preparation must be an object")?;
@@ -2016,16 +2042,21 @@ fn client_preparation(value: Option<&Value>) -> Result<Value> {
             result.insert(key.to_owned(), value.clone());
         }
     }
-    if let Some(value) = object.get("steady_state_generation") {
-        if value.as_bool() != Some(false) {
-            bail!("unexpected hot-path generation in prepared client");
+    match (data_profile, object.get("steady_state_generation")) {
+        (ClientDataProfile::Diagnostic, None) => {}
+        (ClientDataProfile::Diagnostic, Some(value)) if value.as_bool() == Some(false) => {
+            result.insert("steady_state_generation".to_owned(), value.clone());
         }
-        result.insert("steady_state_generation".to_owned(), value.clone());
+        (ClientDataProfile::Realistic, Some(value)) if value.as_bool() == Some(true) => {
+            result.insert("steady_state_generation".to_owned(), value.clone());
+        }
+        (ClientDataProfile::Diagnostic, _) => bail!("unexpected hot-path generation in prepared client"),
+        (ClientDataProfile::Realistic, _) => bail!("realistic client must report steady-state identity generation"),
     }
     Ok(Value::Object(result))
 }
 
-fn client_phase_evidence(output: &str) -> Result<Value> {
+fn client_phase_evidence(output: &str, data_profile: ClientDataProfile) -> Result<Value> {
     let snapshots = output
         .lines()
         .filter_map(|line| line.strip_prefix("OAT_CLIENT_METRICS "))
@@ -2035,7 +2066,7 @@ fn client_phase_evidence(output: &str) -> Result<Value> {
     if snapshots.is_empty() {
         return Ok(json!({ "unavailable_reason": "client_did_not_report_phase_counters" }));
     }
-    client_snapshot_delta(&snapshots)
+    client_snapshot_delta(&snapshots, data_profile)
 }
 
 #[cfg(test)]
@@ -2507,7 +2538,7 @@ mod downstream_runner_tests {
         Ok(())
     }
 }
-fn client_snapshot_delta(snapshots: &[ClientCounterSnapshot]) -> Result<Value> {
+fn client_snapshot_delta(snapshots: &[ClientCounterSnapshot], data_profile: ClientDataProfile) -> Result<Value> {
     let phase = |name| -> Result<&ClientCounterSnapshot> {
         let mut matches = snapshots.iter().filter(|snapshot| snapshot.phase == name);
         let snapshot = matches.next().context("missing client counter phase")?;
@@ -2605,7 +2636,7 @@ fn client_snapshot_delta(snapshots: &[ClientCounterSnapshot]) -> Result<Value> {
         "bytes_semantics": "sum_of_protobuf_flight_data_encoded_lengths_excluding_grpc_http2",
         "latency_scope": "process_cumulative_includes_preflight_and_warmup_not_phase_percentiles",
         "workers": deltas,
-        "preparation": client_preparation(end.preparation.as_ref())?,
+        "preparation": client_preparation(end.preparation.as_ref(), data_profile)?,
         "measurement_window": end.measurement_window,
     }))
 }
