@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import test from 'node:test';
 import { assertNoStampNetworkOverlap, defaultStampConfig, parseStampConfig } from './stamp.js';
+import { generatePools, poolName } from './sku-pools.js';
+import { stringify } from 'yaml';
 
 const example = fs.readFileSync(new URL('./stamp.example.yaml', import.meta.url), 'utf8');
 
@@ -46,10 +48,71 @@ test('validates zero-scaled benchmark user pools and rejects invalid pool config
   assert.throws(() => parseStampConfig(example.replace('role: client', 'role: system')), /role is invalid/);
   const template = fs.readFileSync(new URL('./aks.bicep', import.meta.url), 'utf8');
   assert.ok(template.includes("nodeTaints: ['arrow-collector/role=${userPool.role}:NoSchedule']"));
-  assert.ok(template.includes("nodeLabels: { type: 'benchmark', 'arrow-collector/role': userPool.role }"));
+  assert.ok(template.includes("'arrow-collector/role': userPool.role, 'arrow-collector/sku': userPool.vmSize"));
   assert.equal(parseStampConfig(example.replace('maxCount: 4', 'maxCount: 100')).aks.userPools[0]?.maxCount, 100);
   assert.throws(() => parseStampConfig(example.replaceAll('maxCount: 4', 'maxCount: 100')),
     /need 270 nodes; the node subnet fits 251 and the pod CIDR fits 256/);
+});
+
+test('generates deterministic quota-budgeted pools without modifying preserved pools', () => {
+  const config = parseStampConfig(example);
+  const sku = (vmSize: string, family: string, vcpus: number, quotaVcpus = vcpus) => ({
+    vmSize, family, vcpus, quotaVcpus, memoryGiB: vcpus * 4, networkGbps: 10,
+    zones: ['1', '2', '3'], restricted: false, aksEligible: true, architecture: 'x64',
+    familyVcpuLimit: 10000, familyVcpuUsed: 0,
+  });
+  const inventory = { schema: 'arrowcol-sku-inventory/v1', region: config.location, capturedAt: '2026-01-01T00:00:00Z',
+    regionalVcpu: { limit: 10000, used: 0 }, skus: [
+      sku('Standard_D8ds_v6', 'd', 8), sku('Standard_D64ds_v6', 'd', 64), sku('Standard_E64ds_v6', 'e', 64),
+      sku('Standard_LongSkuName128_v1', 'x', 128), { ...sku('Standard_LongSkuName128-64_v1', 'x', 64, 128), networkGbps: 20 },
+      { ...sku('Standard_Bad_v1', 'x', 32), restricted: true },
+      { ...sku('Standard_Arm_v1', 'x', 32), architecture: 'arm64' },
+    ] };
+  const result = generatePools(inventory, config);
+  assert.deepEqual(result.userPools.slice(0, 2), config.aks.userPools);
+  assert.equal(result.collector.vmSize, 'Standard_LongSkuName128_v1');
+  assert.equal(result.newPools.filter(pool => pool.role === 'arrowcol').length, 1);
+  assert.equal(result.newPools.length, 2);
+  assert.ok(result.newPools.every(pool => /^[a-z][a-z0-9]{0,11}$/.test(pool.name) && pool.initialCount === 0 && pool.minCount === 0));
+  assert.equal(new Set(result.newPools.map(pool => pool.name)).size, 2);
+  assert.equal(result.charges[1]?.quotaVcpus, 128);
+  assert.deepEqual(generatePools({ ...inventory, skus: [...inventory.skus].reverse() }, config).newPools, result.newPools);
+  assert.equal(generatePools(inventory, config, { arrowcolSku: 'Standard_LongSkuName128-64_v1' }).collector.vmSize, 'Standard_LongSkuName128-64_v1');
+  assert.throws(() => generatePools(inventory, config, { arrowcolSku: 'Standard_Arm_v1' }), /collector fits/);
+  assert.ok(result.dropped.some(entry => entry.reason === 'x64 architecture not established'));
+  assert.equal(generatePools(inventory, config, { maxPools: 3 }).newPools.length, 1);
+  assert.equal(generatePools(inventory, config, { maxPerPool: 2 }).newPools[0]?.maxCount, 2);
+  const ordered = structuredClone(inventory);
+  ordered.skus[4]!.vcpus = 128;
+  assert.equal(generatePools(ordered, config).collector.vmSize, 'Standard_LongSkuName128-64_v1');
+  const missingArchitecture = { ...ordered, skus: ordered.skus.map((s, i) => i === 4 ? { ...s, architecture: undefined } : s) };
+  assert.equal(generatePools(missingArchitecture, config).collector.vmSize, 'Standard_LongSkuName128_v1');
+  const collisionConfig = structuredClone(config);
+  collisionConfig.aks.userPools[0]!.name = poolName('Standard_LongSkuName128_v1');
+  assert.throws(() => generatePools(inventory, collisionConfig), /collision/);
+
+  const constrained = structuredClone(inventory);
+  constrained.skus.filter(s => s.family === 'x').forEach(s => { s.familyVcpuLimit = 300; });
+  assert.equal(generatePools(constrained, config).newPools.length, 1);
+  const regional = structuredClone(inventory);
+  regional.regionalVcpu.limit = 850;
+  assert.equal(generatePools(regional, config).newPools.length, 1);
+  constrained.regionalVcpu.limit = 200;
+  assert.throws(() => generatePools(constrained, config), /quota/);
+});
+
+test('accepts 99 zero-minimum pools while accounting for their upgrade surge', () => {
+  const config = parseStampConfig(example);
+  const pools = Array.from({ length: 99 }, (_, index) => ({
+    name: `p${index}`, role: index === 0 ? 'arrowcol' : 'client', vmSize: 'Standard_D8ds_v6',
+    initialCount: 0, minCount: 0, maxCount: 1, maxPods: 250, availabilityZones: [],
+  }));
+  assert.equal(parseStampConfig(stringify({ ...config, aks: { ...config.aks, userPools: pools } })).aks.userPools.length, 99);
+  pools[0]!.maxCount = 100;
+  assert.throws(() => parseStampConfig(stringify({ ...config, aks: { ...config.aks, userPools: pools } })), /upgrade surge/);
+  const template = fs.readFileSync(new URL('./sku-pools.bicep', import.meta.url), 'utf8');
+  assert.ok(template.includes("nodeTaints: ['arrow-collector/role=${pool.role}:NoSchedule']"));
+  assert.ok(template.includes("'arrow-collector/sku': pool.vmSize"));
 });
 
 test('rejects invalid stamps, resource-group scope and network overlaps', () => {

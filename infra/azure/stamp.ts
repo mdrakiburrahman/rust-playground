@@ -197,7 +197,7 @@ export function parseStampConfig(source: string): StampConfig {
   const poolRaw = object(aksRaw.systemPool, 'aks.systemPool');
   keys(poolRaw, ['name', 'vmSize', 'initialCount', 'minCount', 'maxCount', 'maxPods', 'availabilityZones'], 'aks.systemPool');
   const systemPool = { name: text(poolRaw.name, 'aks.systemPool.name', /^[a-z][a-z0-9]{0,11}$/),
-    vmSize: text(poolRaw.vmSize, 'aks.systemPool.vmSize', /^Standard_[A-Za-z0-9_]+$/),
+    vmSize: text(poolRaw.vmSize, 'aks.systemPool.vmSize', /^Standard_[A-Za-z0-9_-]+$/),
     initialCount: integer(poolRaw.initialCount, 'aks.systemPool.initialCount', 1, 100),
     minCount: integer(poolRaw.minCount, 'aks.systemPool.minCount', 1, 100),
     maxCount: integer(poolRaw.maxCount, 'aks.systemPool.maxCount', 1, 100),
@@ -218,7 +218,7 @@ export function parseStampConfig(source: string): StampConfig {
     const pool = {
       name: text(item.name, prefix + '.name', /^[a-z][a-z0-9]{0,11}$/),
       role: text(item.role, prefix + '.role', /^(arrowcol|client)$/) as PoolRole,
-      vmSize: text(item.vmSize, prefix + '.vmSize', /^Standard_[A-Za-z0-9_]+$/),
+      vmSize: text(item.vmSize, prefix + '.vmSize', /^Standard_[A-Za-z0-9_-]+$/),
       initialCount: integer(item.initialCount, prefix + '.initialCount', 0, 100),
       minCount: integer(item.minCount, prefix + '.minCount', 0, 100),
       maxCount: integer(item.maxCount, prefix + '.maxCount', 1, 100),

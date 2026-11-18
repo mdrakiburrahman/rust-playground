@@ -26,6 +26,44 @@ Each OAT cell creates a namespace from the configured prefix plus its compact ru
 
 `aks destroy --stamp-config "$STAMP_CONFIG"` only inventories resources. Adding `--confirm arrow-collector-rg` deletes the whole primary resource group and captured AKS-managed resource groups, including every stamp there; it is not per-run cleanup. Use that confirmation only for an intentional full teardown after reviewing the inventory and receipt.
 
+## Add per-SKU pools to an existing stamp
+
+The inventory must be fresh, subscription/region-specific and include `architecture` (`x64` for the retained Linux/amd64 images), `aksEligible`, and quota values from Azure. Only eligible, unrestricted x64 SKUs are considered; a missing architecture is not evidence of compatibility. `quotaVcpus` is the quota charge, including for constrained-vCPU SKUs; if absent it defaults to `vcpus`, which is safe only when active vCPUs equal the Azure quota charge. Confirm the AKS version, Azure Linux/FIPS image support and quota source for each proposed SKU before applying. Quota does not guarantee capacity.
+
+The planner preserves all existing pools, skips their SKUs, selects one *new* collector by vCPUs, known network bandwidth, then memory, and assigns the other new pools to clients. Set `--arrowcol-sku SKU` to override selection, `--max-per-pool N` (default 1), or `--max-pools N` (default 99 including preserved user pools). It reports rejected SKUs and reduced maxima, uses a shared family ledger, and reserves family/regional quota for preserved maxima and one largest upgrade surge. **Upgrade pools sequentially**; concurrent upgrades exceed this budget. Inventory `used` must include the actual live nodes; verify each existing pool's live count equals its stamp `initialCount` and its maximum is no greater than the stamp maximum before planning, or update the private stamp and recapture inventory first. Other workloads may consume quota after capture.
+
+The validator conservatively reserves 33% surge for *every* configured pool concurrently in the node and overlay CIDRs. Each overlay node uses a `/24` pod block; the shared node subnet needs one address per node plus Azure's five reserved addresses. Separate per-pool node subnets are not required for Azure CNI overlay when this capacity check passes. See [AKS IP address planning](https://learn.microsoft.com/en-us/azure/aks/concepts-network-ip-address-planning) and [node pool rolling upgrades](https://learn.microsoft.com/en-us/azure/aks/upgrade-aks-node-pools-rolling).
+
+Use the ignored private stamp, not the example. Work in a private directory; the generated scope file contains subscription/resource names. Before proceeding, inventory the live pools and confirm the stamp matches their names, SKUs, node counts, subnet, and system-pool configuration. Confirm no planned name already exists. The existing legacy collector retains its role; select the new collector by both `arrow-collector/role=arrowcol` and `arrow-collector/sku=<planned SKU>`.
+
+```bash
+umask 077
+STAMP_CONFIG=infra/azure/stamp.yaml
+INVENTORY=/path/to/private-inventory.json
+npx --no-install tsx infra/azure/sku-pools.ts --inventory "$INVENTORY" --stamp-config "$STAMP_CONFIG" > /tmp/sku-plan.json
+npx --no-install tsx -e 'import {loadStampConfig} from "./infra/azure/stamp.ts"; const c=loadStampConfig(process.argv[1]); const cluster="arrow-collector-"+c.stamp; const subnet=`/subscriptions/${c.subscription}/resourceGroups/${c.resourceGroup}/providers/Microsoft.Network/virtualNetworks/${cluster}-vnet/subnets/${c.aks.systemPool.name}`; console.log(JSON.stringify({subscription:c.subscription,group:c.resourceGroup,cluster,subnet}));' "$STAMP_CONFIG" > /tmp/sku-scope.json
+export SUB="$(jq -er .subscription /tmp/sku-scope.json)" RG="$(jq -er .group /tmp/sku-scope.json)" AKS="$(jq -er .cluster /tmp/sku-scope.json)"
+jq -n --slurpfile p /tmp/sku-plan.json --slurpfile s /tmp/sku-scope.json '{parameters:{clusterName:{value:$s[0].cluster},nodeSubnetId:{value:$s[0].subnet},userPools:{value:$p[0].newPools}}}' > /tmp/sku-parameters.json
+az deployment group what-if --subscription "$SUB" --resource-group "$RG" --template-file infra/azure/sku-pools.bicep --parameters @/tmp/sku-parameters.json --mode Incremental
+```
+
+Inspect the what-if: only **Create** of the planned new `agentPools` is acceptable; stop for any existing-pool, cluster, identity, network, API-server, deletion, unsupported or uncertain change. After approval, use the same parameters:
+
+```bash
+az deployment group create --subscription "$SUB" --resource-group "$RG" --template-file infra/azure/sku-pools.bicep --parameters @/tmp/sku-parameters.json --mode Incremental
+az aks nodepool list --subscription "$SUB" --resource-group "$RG" --cluster-name "$AKS" -o json > /tmp/sku-live.json
+jq 'length' /tmp/sku-live.json
+node -e 'const p=require("/tmp/sku-plan.json"),a=require("/tmp/sku-live.json"); for(const x of p.newPools){const y=a.find(v=>v.name===x.name); if(!y||y.count!==0||y.mode!=="User"||y.vmSize!==x.vmSize||y.nodeLabels?.["arrow-collector/role"]!==x.role||y.nodeLabels?.["arrow-collector/sku"]!==x.vmSize||!y.nodeTaints?.includes(`arrow-collector/role=${x.role}:NoSchedule`)) throw Error(`Pool verification failed: ${x.name}`)} if(a.length!==p.userPools.length+1) throw Error("Unexpected pool count"); console.log(`Verified ${p.newPools.length} new zero-node pools`);'
+```
+
+Once verified, save `userPools` from the plan into the ignored private stamp so future full-stamp operations include them; retain its existing system pool, network and identity settings. The add-only deployment declares the existing cluster and writes only new child pool resources; it does not deploy the parent cluster. The older safe-idle receipt assumes exactly the two legacy pools and will correctly report unknown until updated for the expanded fleet.
+
+**Kill switch — destructive to user-pool workloads:** the following single command disables autoscaling and scales *every* user pool to zero, then verifies their ARM counts. It leaves the system pool intact; running pods are terminated and will not automatically return. Confirm `$SUB`, `$RG` and `$AKS` from the private scope above first. Investigate any failure or nonzero count; do not assume completion.
+
+```bash
+bash -c 'set -euo pipefail; live=$(az aks nodepool list --subscription "$SUB" -g "$RG" --cluster-name "$AKS" -o json); names=$(jq -er "[.[] | select(.mode == \"User\") | .name] | if length > 0 then .[] else error(\"no user pools\") end" <<<"$live"); while IFS= read -r n; do if jq -e --arg n "$n" ".[] | select(.name == \$n) | .enableAutoScaling == true" <<<"$live" >/dev/null; then az aks nodepool update --subscription "$SUB" -g "$RG" --cluster-name "$AKS" -n "$n" --disable-cluster-autoscaler >/dev/null; fi; az aks nodepool scale --subscription "$SUB" -g "$RG" --cluster-name "$AKS" -n "$n" --node-count 0 >/dev/null; done <<<"$names"; az aks nodepool list --subscription "$SUB" -g "$RG" --cluster-name "$AKS" -o json | jq -e "[.[] | select(.mode == \"User\")] | length > 0 and all(.[]; .count == 0 and .enableAutoScaling == false)"'
+```
+
 ## Router authentication
 
 Edge HMAC is enabled on AKS with matching mounted keys and pinned router and client images; it authenticates requests to the router but does not provide TLS. Catalog Flight SQL and CES requests require signed internal identity by default. Assertions bind the RPC method and payload digest, carry a one-time nonce, and expire within 30 seconds; the replay cache is bounded at 65,536 requests per catalog replica and rejects new requests when full. The catalog and dataflow mount the `internal-hmac` key from `arrowcol-router-auth` at `/run/auth/internal-hmac`; generated direct OAT client Jobs mount that key at `/run/secrets/internal-hmac` and set `LOADTEST_INTERNAL_SECRET_FILE` to that path. `--ddl-auth-mode dev_only_allow_unsigned` bypasses catalog RPC identity checks and is for development only; do not use it on AKS. The separate data-plane Flight SQL service is unchanged. TLS/mTLS is deferred. NetworkPolicy objects are not assumed to be enforced on the default AKS dataplane, and no QAP host allowlist is added. The shared `qap_endpoint` validator checks URL shape only; AKS preflight pins it to HTTPS and the exact selected stamp and region Kusto host, with no credentials, query, fragment, or path beyond a slash. A destination allowlist beyond those checks remains a deferred policy decision.
