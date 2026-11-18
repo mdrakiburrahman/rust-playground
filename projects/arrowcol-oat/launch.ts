@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
-import { existsSync } from 'node:fs';
-import { lstat, mkdir, open, readFile, realpath, readdir, rename, rm, stat, unlink, writeFile } from 'node:fs/promises';
+import { constants, existsSync } from 'node:fs';
+import { link, lstat, mkdir, open, readFile, readlink, realpath, readdir, rename, rm, stat, unlink, writeFile } from 'node:fs/promises';
 import { createServer as createHttpServer } from 'node:http';
 import { createServer as createTcpServer, isIP } from 'node:net';
 import { dirname, extname, isAbsolute, relative, resolve, sep } from 'node:path';
@@ -20,6 +20,7 @@ export interface OatRunStatus {
   error: string | null;
   started_at_unix_ms?: number;
   finished_at_unix_ms?: number | null;
+  aks_cleanup_confirmed?: true;
   local_teardown?: {
     cell_id: string;
     schedule_unix_ms: number;
@@ -98,6 +99,8 @@ Options:
   --no-viewer          Exit after a successful local run without serving results
   --preflight-only     Run the read-only AKS preflight
   --cleanup-local <id> Remove one abandoned local Compose cell by its run UUID
+  --recover-failed-aks <invocation-id> <approved-evidence-path>
+                       Record the approved disposition for one legacy AKS failure
   -h, --help           Show this help`;
 
 type DeadlineCreationState = 'not_started' | 'pending' | 'accepted' | 'rejected' | 'unknown';
@@ -246,6 +249,7 @@ export class OatLauncherDeadline {
   }
 
   get creationState(): DeadlineCreationState { return this.receipt.creation_state; }
+  get submittedPlatform(): 'local' | 'aks' | undefined { return submittedPlatform(this.receipt.submitted_config_body); }
   get invocationId(): string { return this.receipt.invocation_id; }
   get cleanupState(): DeadlineCleanupState { return this.receipt.cleanup_state; }
   get runId(): string | null { return this.receipt.run_id; }
@@ -375,11 +379,16 @@ export class OatLauncherDeadline {
       typeof this.receipt.server_start_ticks === 'string' && this.receipt.server_start_ticks.length > 0 &&
       typeof this.receipt.server_executable === 'string' && this.receipt.server_executable.length > 0;
     const terminal = status.state === 'succeeded' || status.state === 'failed' || status.state === 'cancelled';
-    if (terminal && this.receipt.terminal_observation == null && identityBound &&
+    const matchesOwnedRun = terminal && identityBound &&
         this.receipt.creation_state === 'accepted' && this.receipt.run_id === status.id &&
         this.receipt.server_url !== null && this.receipt.submitted_config_sha256 !== null &&
-        this.receipt.config_binding_error === null && status.config_sha256 === this.receipt.submitted_config_sha256) {
+        this.receipt.config_binding_error === null && status.config_sha256 === this.receipt.submitted_config_sha256;
+    if (matchesOwnedRun && this.receipt.terminal_observation == null) {
       this.receipt.terminal_observation = { observed_at_unix_ms: Date.now(), status: structuredClone(status) };
+    }
+    if (matchesOwnedRun && status.state === 'failed' && status.aks_cleanup_confirmed === true &&
+        this.submittedPlatform === 'aks' && hasConfirmedAksFailure(this.receipt.terminal_observation?.status)) {
+      this.receipt.cleanup_state = 'confirmed';
     }
     await this.persist();
   }
@@ -422,6 +431,25 @@ function cleanupStateFor(status: OatRunStatus): DeadlineCleanupState {
   return 'pending';
 }
 
+function submittedPlatform(body: unknown): 'local' | 'aks' | undefined {
+  if (typeof body !== 'string') return undefined;
+  let config: unknown;
+  try {
+    config = JSON.parse(body);
+  } catch {
+    return undefined;
+  }
+  if (!isRecord(config) || !isRecord(config.platform)) return undefined;
+  const kind = config.platform.kind;
+  return kind === 'local' || kind === 'aks' ? kind : undefined;
+}
+
+function hasConfirmedAksFailure(status: OatRunStatus | undefined): boolean {
+  return status?.state === 'failed' && status.aks_cleanup_confirmed === true &&
+    typeof status.error === 'string' && typeof status.finished_at_unix_ms === 'number' &&
+    Number.isSafeInteger(status.finished_at_unix_ms) && status.finished_at_unix_ms > 0;
+}
+
 function isLauncherDeadlineReceipt(value: unknown): value is LauncherDeadlineReceipt {
   if (!isRecord(value)) return false;
   const noBinding = value.submitted_config_body === null && value.submitted_config_sha256 === null && value.source_config_sha256 === null;
@@ -462,7 +490,11 @@ function isLauncherDeadlineReceipt(value: unknown): value is LauncherDeadlineRec
     (value.error === null || typeof value.error === 'string') &&
     (identityFieldsAbsent || identityIsNull || identityIsValid) &&
     (identityFieldsAbsent || identityIsNull || (value.creation_state === 'accepted' && value.run_id !== null && value.server_url !== null)) &&
-    (observationAbsent || observationIsValid) && observationMatches;
+    (observationAbsent || observationIsValid) && observationMatches &&
+    (value.run_state !== 'failed' || value.cleanup_state !== 'confirmed' ||
+      (bindingIsValid && submittedPlatform(value.submitted_config_body) === 'aks' && value.config_binding_error === null &&
+        isLauncherTerminalObservation(value.terminal_observation) &&
+        hasConfirmedAksFailure(value.terminal_observation.status)));
 }
 
 function isLauncherTerminalObservation(value: unknown): value is LauncherTerminalObservation {
@@ -485,16 +517,235 @@ function isLocalOatServerUrl(value: string): boolean {
   }
 }
 
-export async function assertNoUnsettledDeadlineReceipts(root = launcherDeadlineReceiptRoot, writeReceipt = writeAtomicJson): Promise<void> {
-  const names = await readdir(root).catch((error: unknown) => {
+
+type LegacyAksApproval = Readonly<{ invocationId: string; receiptSha256: string; evidenceSha256: string }>;
+// Add a pin only in a separately reviewed commit, after independent verification of the private evidence.
+const approvedLegacyAksFailure: readonly LegacyAksApproval[] = [{
+  invocationId: '03faac03-c21a-40e8-a8a1-51aaf6b33935',
+  receiptSha256: 'd97388ee46db160ba1af11ffaa78ded694331a414ba4d4fc9774bbbc7cce75d7',
+  evidenceSha256: '947d0f27d31e97b9f9dcc960a4d40bf6f1dc1d3bff2fe6e700aa1c9a1513e735',
+}];
+const legacyDispositionSuffix = '.failed-aks-disposition';
+const legacyPreloadError = 'maintenance omitted effective per-table operationTimeout before load admission';
+const legacyUuid = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/;
+const legacySha256 = /^[a-f0-9]{64}$/;
+const sha256Bytes = (bytes: Buffer) => createHash('sha256').update(bytes).digest('hex');
+const isLegacyUuid = (value: unknown): value is string => typeof value === 'string' && legacyUuid.test(value);
+const isLegacySha = (value: unknown): value is string => typeof value === 'string' && legacySha256.test(value);
+const isLegacyTime = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
+const isLegacyIdentity = (value: unknown): value is string => typeof value === 'string' && value.trim().length > 0;
+
+async function readLegacyRegularFile(path: string): Promise<Buffer> {
+  const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    const info = await file.stat();
+    if (!info.isFile() || info.size > 1024 * 1024) throw new Error('Legacy AKS recovery requires a bounded regular file');
+    return await file.readFile();
+  } finally {
+    await file.close();
+  }
+}
+
+function validateLegacyAksDisposition(original: Buffer, evidence: Buffer, approval: LegacyAksApproval) {
+  if (sha256Bytes(original) !== approval.receiptSha256 || sha256Bytes(evidence) !== approval.evidenceSha256) {
+    throw new Error('Legacy AKS disposition does not match the reviewed receipt and evidence digests');
+  }
+  const receipt: unknown = JSON.parse(original.toString('utf8'));
+  const proof: unknown = JSON.parse(evidence.toString('utf8'));
+  if (!isLauncherDeadlineReceipt(receipt) || receipt.invocation_id !== approval.invocationId ||
+      receipt.creation_state !== 'accepted' || receipt.run_state !== 'failed' || receipt.cleanup_state !== 'unsettled' ||
+      receipt.terminal_observation !== null || receipt.config_binding_error !== null || receipt.cancellation_attempts !== 0 ||
+      receipt.last_cancel_result !== null || receipt.server_pid !== null || receipt.server_start_ticks !== null ||
+      receipt.server_executable !== null || receipt.deadline_at_unix_ms !== null || receipt.deadline_seconds !== null ||
+      receipt.submitted_config_body === null || submittedPlatform(receipt.submitted_config_body) !== 'aks' ||
+      !isLegacyUuid(receipt.run_id) || !receipt.server_url || !isLocalOatServerUrl(receipt.server_url) ||
+      !isRecord(proof) || proof.schema_version !== 1 || proof.disposition !== 'failed-before-load-cleanup-verified' ||
+      proof.invocation_id !== receipt.invocation_id || proof.original_receipt_sha256 !== approval.receiptSha256 ||
+      proof.server_url !== receipt.server_url || !isLegacySha(proof.raw_evidence_sha256) ||
+      !isLegacySha(proof.verifier_sha256) || !isLegacySha(proof.runner_source_sha256)) {
+    throw new Error('Legacy AKS disposition is not bound to the exact accepted failed invocation');
+  }
+  const config: unknown = JSON.parse(receipt.submitted_config_body);
+  const terminal = proof.terminal_get;
+  const cell = proof.cell;
+  const fence = proof.writer_fence;
+  const observationHashes = proof.raw_observation_sha256;
+  if (!isRecord(config) || !Array.isArray(config.tables) || config.tables.length !== 1 ||
+      !Array.isArray(config.replica_counts) || config.replica_counts.length !== 1 || config.replica_counts[0] !== 1 ||
+      !Array.isArray(config.dfe_worker_concurrency) || config.dfe_worker_concurrency.length !== 1 ||
+      (config.clients_per_table_sweep != null && (!Array.isArray(config.clients_per_table_sweep) ||
+        config.clients_per_table_sweep.length !== 1)) ||
+      !isRecord(terminal) || terminal.id !== receipt.run_id || terminal.config_sha256 !== receipt.submitted_config_sha256 ||
+      terminal.state !== 'failed' || terminal.error !== legacyPreloadError || terminal.result_count !== 0 ||
+      !isLegacyTime(terminal.started_at_unix_ms) || !isLegacyTime(terminal.finished_at_unix_ms) ||
+      terminal.started_at_unix_ms < receipt.started_at_unix_ms || terminal.finished_at_unix_ms < terminal.started_at_unix_ms ||
+      !isRecord(cell) || !isLegacyUuid(cell.id) || !isLegacyUuid(cell.namespace_uid) ||
+      cell.namespace !== 'arrow-collector-' + cell.id.replaceAll('-', '') ||
+      !isLegacyIdentity(cell.aks_id) || !isLegacyIdentity(cell.api_origin) || !isLegacyIdentity(cell.owner_token) ||
+      !isLegacyIdentity(cell.fic_id) || !isLegacyIdentity(cell.fic_subject) ||
+      !isRecord(observationHashes) ||
+      !['terminal_get', 'single_cell_trace', 'fic_ready', 'workload_stop_trace', 'process_exit',
+        'namespace_get', 'fic_inventory'].every((name) =>
+        isLegacySha(observationHashes[name])) ||
+      cell.qap !== 'not-attempted' || cell.result_artifact !== 'retained-unranked' ||
+      !isRecord(fence) || !isLegacyUuid(fence.boot_id) || !isLegacyIdentity(fence.pid_namespace) ||
+      !isLegacyIdentity(fence.net_namespace) ||
+      !isRecord(fence.launcher) || !isRecord(fence.server) ||
+      !isLegacyTime(fence.launcher.pid) || !isLegacyTime(fence.server.pid) ||
+      fence.launcher.pid === fence.server.pid || fence.server.ppid !== fence.launcher.pid ||
+      !isLegacyIdentity(fence.launcher.start_ticks) || !isLegacyIdentity(fence.server.start_ticks) ||
+      !/^[1-9][0-9]*$/.test(fence.server.start_ticks) ||
+      !isLegacyIdentity(fence.launcher.executable) || !isLegacyIdentity(fence.server.executable) ||
+      !isLegacyTime(fence.fenced_at_unix_ms) || fence.fenced_at_unix_ms < terminal.finished_at_unix_ms ||
+      !isLegacyTime(cell.namespace_absent_at_unix_ms) || !isLegacyTime(cell.fic_absent_at_unix_ms) ||
+      cell.namespace_absent_at_unix_ms < fence.fenced_at_unix_ms || cell.fic_absent_at_unix_ms < fence.fenced_at_unix_ms) {
+    throw new Error('Legacy AKS disposition lacks coherent single-cell, pre-load, fencing, or absence evidence');
+  }
+  return {
+    bootId: fence.boot_id, pidNamespace: fence.pid_namespace, netNamespace: fence.net_namespace,
+    launcherPid: fence.launcher.pid, serverPid: fence.server.pid, serverStartTicks: fence.server.start_ticks,
+    serverUrl: receipt.server_url, namespaceObserved: cell.namespace_absent_at_unix_ms, ficObserved: cell.fic_absent_at_unix_ms,
+  };
+}
+
+export function isExactExitedLegacyServer(stat: string, tasks: string[], pid: number, startTicks: string): boolean {
+  const commandEnd = stat.lastIndexOf(') ');
+  if (!stat.startsWith(pid + ' (') || commandEnd < 0) return false;
+  const fields = stat.slice(commandEnd + 2).trim().split(/\s+/);
+  return fields[0] === 'Z' && fields[1] === '1' && fields[19] === startTicks &&
+    tasks.length === 1 && tasks[0] === String(pid);
+}
+
+async function legacyServerHasExited(pid: number, startTicks: string): Promise<boolean> {
+  const directory = '/proc/' + pid;
+  let statText: string;
+  try {
+    statText = await readFile(directory + '/stat', 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return true;
+    throw error;
+  }
+  return isExactExitedLegacyServer(statText, await readdir(directory + '/task'), pid, startTicks);
+}
+
+async function assertLegacyWritersAbsent(proof: ReturnType<typeof validateLegacyAksDisposition>): Promise<void> {
+  const pidAbsent = async (pid: number) => {
+    try {
+      await lstat('/proc/' + pid);
+      return false;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return true;
+      throw error;
+    }
+  };
+  if (process.platform !== 'linux' || (await readFile('/proc/sys/kernel/random/boot_id', 'utf8')).trim() !== proof.bootId ||
+      await readlink('/proc/self/ns/pid') !== proof.pidNamespace || await readlink('/proc/self/ns/net') !== proof.netNamespace ||
+      !await pidAbsent(proof.launcherPid) || !await legacyServerHasExited(proof.serverPid, proof.serverStartTicks)) {
+    throw new Error('Legacy AKS disposition requires the exact original Linux boot/PID namespace and exited launcher and server');
+  }
+  const url = new URL(proof.serverUrl);
+  if (url.hostname !== '127.0.0.1' || !url.port || url.href !== url.origin + '/') {
+    throw new Error('Legacy AKS disposition requires the original dedicated loopback listener');
+  }
+  const listenerTable = await Promise.all(['/proc/net/tcp', '/proc/net/tcp6'].map((path) => readFile(path, 'utf8')));
+  const port = Number(url.port).toString(16).padStart(4, '0').toUpperCase();
+  if (listenerTable.some((table) => table.trim().split('\n').slice(1).some((row) => {
+    const fields = row.trim().split(/\s+/);
+    return fields[3] === '0A' && fields[1]?.endsWith(':' + port);
+  }))) throw new Error('Legacy AKS listener is still present');
+}
+
+export async function recordLegacyAksDisposition(
+  root: string, invocationId: string, evidencePath: string, approvals = approvedLegacyAksFailure,
+): Promise<void> {
+  const approval = approvals.length === 1 && approvals[0]?.invocationId === invocationId ? approvals[0] : undefined;
+  if (!isLegacyUuid(invocationId) || !approval) throw new Error('No reviewed legacy AKS disposition for this invocation');
+  const path = resolve(root, invocationId + '.json');
+  const disposition = path + legacyDispositionSuffix;
+  const evidence = await readLegacyRegularFile(evidencePath);
+  const original = await readLegacyRegularFile(path);
+  const proof = validateLegacyAksDisposition(original, evidence, approval);
+  const checkExisting = async () => {
+    try {
+      if (!(await readLegacyRegularFile(disposition)).equals(evidence)) throw new Error('Conflicting legacy AKS disposition');
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+      throw error;
+    }
+  };
+  if (await checkExisting()) {
+    await assertLegacyWritersAbsent(proof);
+    await syncLegacyReceiptDirectory(path);
+    return;
+  }
+  const now = Date.now();
+  if ([proof.namespaceObserved, proof.ficObserved].some((time) => time > now || now - time > 30 * 60_000)) {
+    throw new Error('Legacy AKS resource absence evidence is not current');
+  }
+  await assertLegacyWritersAbsent(proof);
+  const temporary = disposition + '.' + randomUUID() + '.tmp';
+  const output = await open(temporary, 'wx', 0o600);
+  try {
+    try {
+      await output.writeFile(evidence);
+      await output.sync();
+    } finally {
+      await output.close();
+    }
+    if (!(await readLegacyRegularFile(path)).equals(original)) throw new Error('Original legacy AKS receipt changed');
+    try {
+      await link(temporary, disposition);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST' || !await checkExisting()) throw error;
+    }
+    await syncLegacyReceiptDirectory(path);
+  } finally {
+    await unlink(temporary);
+  }
+}
+
+async function syncLegacyReceiptDirectory(path: string): Promise<void> {
+  const directory = await open(dirname(path), 'r');
+  try {
+    await directory.sync();
+  } finally {
+    await directory.close();
+  }
+}
+
+export async function assertNoUnsettledDeadlineReceipts(
+  root = launcherDeadlineReceiptRoot, writeReceipt = writeAtomicJson, approvals = approvedLegacyAksFailure,
+): Promise<void> {
+  const names: string[] = await readdir(root).catch((error: unknown) => {
     if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return [];
     throw error;
   });
+  const admittedDispositions = new Set<string>();
+  for (const name of names.filter((entry) => entry.endsWith(legacyDispositionSuffix))) {
+    const originalName = name.slice(0, -legacyDispositionSuffix.length);
+    const approval = approvals.length === 1 && originalName === approvals[0]?.invocationId + '.json' ? approvals[0] : undefined;
+    if (!approval || !names.includes(originalName)) throw new Error('Unapproved or orphaned legacy AKS disposition');
+    const proof = validateLegacyAksDisposition(
+      await readLegacyRegularFile(resolve(root, originalName)), await readLegacyRegularFile(resolve(root, name)), approval,
+    );
+    await assertLegacyWritersAbsent(proof);
+    await syncLegacyReceiptDirectory(resolve(root, name));
+    admittedDispositions.add(originalName);
+  }
   for (const name of names.filter((entry) => entry.endsWith('.json'))) {
+    if (admittedDispositions.has(name)) continue;
     const path = resolve(root, name);
     const deadline = await OatLauncherDeadline.restore(path, writeReceipt);
     if (deadline.creationState !== 'pending' && deadline.creationState !== 'unknown' &&
         deadline.cleanupState !== 'pending' && deadline.cleanupState !== 'unsettled') continue;
+    if (deadline.submittedPlatform === 'aks') {
+      throw new Error(`Unsettled AKS launcher receipt ${path}; refusing another run until this exact receipt is reconciled by an operator`);
+    }
+    if (deadline.submittedPlatform !== 'local') {
+      throw new Error(`Unsettled launcher deadline receipt ${path} (platform unverified); refusing another run until this exact receipt is reconciled by an operator`);
+    }
     if (!deadline.runId || !deadline.serverUrl ||
         !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(deadline.runId) ||
         !isLocalOatServerUrl(deadline.serverUrl)) {
@@ -1116,7 +1367,7 @@ export async function launchOat(
     ? signal ? AbortSignal.any([signal, deadline.signal]) : deadline.signal
     : signal;
   const requestCancellation = (): void => {
-    if (cancellationRequested) return;
+    if (mode === 'aks' || submittedPlatform(binding.submitted_config_body) === 'aks' || cancellationRequested) return;
     cancellationRequested = true;
     resolveCancellationStarted();
     cancellationRequest = (async (): Promise<CancellationOutcome> => {
@@ -1269,6 +1520,14 @@ export async function main(
   const launcherStartedAtMonotonicMs = performance.now();
   if (args.includes('-h') || args.includes('--help')) {
     console.log(cliUsage);
+    return;
+  }
+  if (args[0] === '--recover-failed-aks') {
+    if (args.length !== 3 || !args[1] || !args[2] || args[2].startsWith('-')) {
+      throw new OatCliError('--recover-failed-aks requires exactly an invocation ID and the reviewed evidence file');
+    }
+    await recordLegacyAksDisposition(receiptRoot, args[1], args[2]);
+    console.log('Recorded verified legacy AKS cleanup; benchmark remains failed and unranked.');
     return;
   }
   validateArguments(args);
@@ -1483,6 +1742,20 @@ export async function main(
   try {
     try {
       const localMarker = markerContext;
+      const bindAksServerIdentity = async (status: OatRunStatus): Promise<void> => {
+        const serverPid = server.child.pid;
+        if (!serverPid || server.child.exitCode !== null || server.child.signalCode !== null) return;
+        const serverStartTicks = await processStartTicks(serverPid);
+        if (!serverStartTicks || server.child.exitCode !== null || server.child.signalCode !== null) return;
+        await deadline.recordOwnedServerIdentity({
+          invocationId: deadline.invocationId,
+          runId: status.id,
+          serverUrl: new URL(server.url).href,
+          serverPid,
+          serverStartTicks,
+          serverExecutable: server.executable,
+        });
+      };
       const onRunStarted = localMarker ? async (status: OatRunStatus): Promise<void> => {
         await persistLocalRunMarker(localMarker, status, submission);
         markerWritten = true;
@@ -1512,7 +1785,7 @@ export async function main(
             diagnostic(error);
           }
         }
-      } : undefined;
+      } : mode === 'aks' ? bindAksServerIdentity : undefined;
       const onRunFinished = (status: OatRunStatus): void => {
         runCleanupComplete = (status.state === 'succeeded' || status.state === 'cancelled') && deadline.cleanupState === 'confirmed';
       };

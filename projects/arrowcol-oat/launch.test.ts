@@ -18,7 +18,7 @@ import { collectDataFlow } from './dataflow-verdict.js';
 import {
   buildOwnedServer, cleanupLocalComposeProjects, finishOwnedLocalRun, launchOat, main, OatLauncherDeadline, assertNoUnsettledDeadlineReceipts, readOatConfigForMode,
   processStartTicks, resolveCliConfigPath, resolveOatConfigPath, sendViewerFile,
-  startLocalServer, startLocalViewer, stopLocalServer, type OatRunStatus,
+  isExactExitedLegacyServer, recordLegacyAksDisposition, startLocalServer, startLocalViewer, stopLocalServer, type OatRunStatus,
 } from './launch.js';
 
 const status = (state: OatRunStatus['state']) => ({
@@ -26,6 +26,15 @@ const status = (state: OatRunStatus['state']) => ({
   config_sha256: createHash('sha256').update('{"platform":{"kind":"local"}}').digest('hex'),
   state, progress: state, result_count: state === 'succeeded' ? 2 : 0, error: null,
 });
+
+async function bindLocalReceipt(deadline: OatLauncherDeadline): Promise<void> {
+  const submitted_config_body = '{"platform":{"kind":"local"}}';
+  await deadline.setSubmissionBinding({
+    submitted_config_body,
+    submitted_config_sha256: status('running').config_sha256,
+    source_config_sha256: 'a'.repeat(64),
+  });
+}
 
 test('procfs ESRCH race is treated as an exited process', { skip: process.platform !== 'linux' }, async () => {
   const error = Object.assign(new Error('process disappeared during procfs read'), { code: 'ESRCH' });
@@ -492,6 +501,213 @@ test('failed terminal response is retained as termination evidence without confi
     assert.equal(receipt.terminal_observation?.status.state, 'failed');
     assert.equal(receipt.terminal_observation?.status.error, 'synthetic terminal failure');
   } finally {
+    deadline.dispose();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('AKS failure stays a benchmark failure, and only bound cleanup evidence clears the receipt', async () => {
+  const scenarios = [
+    { name: 'confirmed', prove: true, own: true, mismatch: false, allowed: true },
+    { name: 'no proof', prove: undefined, own: true, mismatch: false, allowed: false },
+    { name: 'malformed proof', prove: 'true', own: true, mismatch: false, allowed: false },
+    { name: 'external server', prove: true, own: false, mismatch: false, allowed: false },
+    { name: 'wrong digest', prove: true, own: true, mismatch: true, allowed: false },
+  ];
+  for (const { name, prove, own, mismatch, allowed } of scenarios) {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'oat-aks-cleanup-'));
+    const submitted_config_body = '{"platform":{"kind":"aks"}}';
+    const submitted_config_sha256 = createHash('sha256').update(submitted_config_body).digest('hex');
+    const server = 'http://127.0.0.1:8088/';
+    const deadline = await OatLauncherDeadline.create(undefined, performance.now(), directory);
+    try {
+      const accepted = { ...status('running'), config_sha256: submitted_config_sha256 };
+      const failed = {
+        ...accepted, state: 'failed', progress: 'failed', result_count: 0,
+        error: 'synthetic AKS failure', finished_at_unix_ms: Date.now(),
+        config_sha256: mismatch ? '0'.repeat(64) : submitted_config_sha256,
+        aks_cleanup_confirmed: prove,
+      };
+      const requests: string[] = [];
+      await assert.rejects(launchOat('unused.json', server, 1, async (url, init) => {
+        requests.push(`${init?.method ?? 'GET'} ${new URL(String(url)).pathname}`);
+        return Response.json(init?.method === 'POST' ? accepted : failed);
+      }, () => {}, 'aks', undefined, undefined, own ? async (started) => {
+        await deadline.recordOwnedServerIdentity({
+          invocationId: deadline.invocationId, runId: started.id, serverUrl: server,
+          serverPid: process.pid, serverStartTicks: 'fixture-start-ticks', serverExecutable: process.execPath,
+        });
+      } : undefined, undefined, deadline, {
+        submitted_config_body, submitted_config_sha256, source_config_sha256: 'a'.repeat(64),
+      }), mismatch ? /config_sha256 mismatch/ : /synthetic AKS failure/, name);
+      assert.deepEqual(requests, ['POST /runs', `GET /runs/${accepted.id}`], name);
+      const bytes = await readFile(deadline.receiptPath, 'utf8');
+      const receipt = JSON.parse(bytes);
+      assert.equal(receipt.run_state, 'failed', name);
+      assert.equal(receipt.cleanup_state, allowed ? 'confirmed' : 'unsettled', name);
+      if (allowed) {
+        assert.equal(receipt.terminal_observation?.status.aks_cleanup_confirmed, true, name);
+        assert.equal(receipt.terminal_observation?.status.error, failed.error, name);
+        await assertNoUnsettledDeadlineReceipts(directory);
+      } else {
+        await assert.rejects(assertNoUnsettledDeadlineReceipts(directory), /Unsettled AKS launcher receipt .*operator/, name);
+      }
+      assert.equal(await readFile(deadline.receiptPath, 'utf8'), bytes, name);
+    } finally {
+      deadline.dispose();
+      await rm(directory, { recursive: true, force: true });
+    }
+  }
+});
+
+test('accepted receipts with unverified platforms refuse recovery without any request', async () => {
+  const requests: string[] = [];
+  const server = createServer((request, response) => {
+    requests.push(`${request.method} ${request.url}`);
+    response.setHeader('content-type', 'application/json');
+    response.end(JSON.stringify(status('succeeded')));
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== 'string');
+  try {
+    for (const body of [null, 'not JSON', '{}', '{"platform":{"kind":"other"}}']) {
+      const directory = await mkdtemp(path.join(os.tmpdir(), 'oat-unknown-recovery-platform-'));
+      const deadline = await OatLauncherDeadline.create(undefined, performance.now(), directory);
+      try {
+        if (body !== null) {
+          await deadline.setSubmissionBinding({
+            submitted_config_body: body,
+            submitted_config_sha256: createHash('sha256').update(body).digest('hex'),
+            source_config_sha256: 'a'.repeat(64),
+          });
+        }
+        await deadline.markCreationPending(`http://127.0.0.1:${address.port}`);
+        await deadline.recordRunStarted(status('running'));
+        const original = await readFile(deadline.receiptPath, 'utf8');
+        await assert.rejects(assertNoUnsettledDeadlineReceipts(directory), /platform unverified.*operator/);
+        assert.deepEqual(requests, []);
+        assert.equal(await readFile(deadline.receiptPath, 'utf8'), original);
+      } finally {
+        deadline.dispose();
+        await rm(directory, { recursive: true, force: true });
+      }
+    }
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
+test('legacy AKS disposition recognizes only the exact exited, unreaped single-task Rust server', () => {
+  const pid = 1234;
+  const stat = (state: string, parent: number, ticks: string) =>
+    pid + ' (rust with ) chars) ' + [state, parent, ...Array(17).fill('0'), ticks].join(' ');
+  assert.ok(isExactExitedLegacyServer(stat('Z', 1, '42'), ['1234'], pid, '42'));
+  assert.equal(isExactExitedLegacyServer(stat('S', 1, '42'), ['1234'], pid, '42'), false);
+  assert.equal(isExactExitedLegacyServer(stat('Z', 1, '43'), ['1234'], pid, '42'), false);
+  assert.equal(isExactExitedLegacyServer(stat('Z', 2, '42'), ['1234'], pid, '42'), false);
+  assert.equal(isExactExitedLegacyServer(stat('Z', 1, '42'), ['1234', '1235'], pid, '42'), false);
+});
+
+test('legacy AKS disposition is one-time, exact, and does not rewrite the failed receipt', {
+  skip: process.platform !== 'linux',
+}, async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'oat-legacy-disposition-'));
+  const root = path.join(directory, 'receipts');
+  const deadline = await OatLauncherDeadline.create(undefined, performance.now(), root);
+  const manifestPath = path.join(directory, 'reviewed-evidence');
+  const dispositionPath = deadline.receiptPath + '.failed-aks-disposition';
+  const digest = (body: Buffer | string) => createHash('sha256').update(body).digest('hex');
+  const error = 'maintenance omitted effective per-table operationTimeout before load admission';
+  const body = JSON.stringify({
+    platform: { kind: 'aks' }, tables: ['test'], replica_counts: [1], dfe_worker_concurrency: [16],
+  });
+  const listener = createServer();
+  await new Promise<void>((resolve, reject) => {
+    listener.once('error', reject);
+    listener.listen(0, '127.0.0.1', resolve);
+  });
+  const address = listener.address();
+  assert.ok(address && typeof address !== 'string');
+  const serverUrl = 'http://127.0.0.1:' + address.port + '/';
+  const now = Date.now();
+  const terminal = {
+    ...status('failed'), config_sha256: digest(body), error, started_at_unix_ms: now, finished_at_unix_ms: now,
+  };
+  try {
+    await deadline.setSubmissionBinding({ submitted_config_body: body,
+      submitted_config_sha256: digest(body), source_config_sha256: digest(body) });
+    await deadline.markCreationPending(serverUrl);
+    await deadline.recordRunStarted(terminal);
+    const original = await readFile(deadline.receiptPath);
+    const cellId = 'c0bfca05-28f2-4e16-a4cc-b3f28a351fb9';
+    const raw = digest('fixture');
+    const manifest = {
+      schema_version: 1, disposition: 'failed-before-load-cleanup-verified', invocation_id: deadline.invocationId,
+      original_receipt_sha256: digest(original), server_url: serverUrl, raw_evidence_sha256: raw,
+      verifier_sha256: raw, runner_source_sha256: raw, terminal_get: terminal,
+      raw_observation_sha256: Object.fromEntries([
+        'terminal_get', 'single_cell_trace', 'fic_ready', 'workload_stop_trace', 'process_exit',
+        'namespace_get', 'fic_inventory',
+      ].map((name) => [name, raw])),
+      cell: {
+        id: cellId, namespace: 'arrow-collector-' + cellId.replaceAll('-', ''), namespace_uid: cellId,
+        aks_id: '/fake/cluster', api_origin: 'https://test.invalid', owner_token: 'fixture',
+        fic_id: '/fake/fic', fic_subject: 'fixture', qap: 'not-attempted', result_artifact: 'retained-unranked',
+        namespace_absent_at_unix_ms: now, fic_absent_at_unix_ms: now,
+      },
+      writer_fence: {
+        boot_id: (await readFile('/proc/sys/kernel/random/boot_id', 'utf8')).trim(),
+        pid_namespace: await readlink('/proc/self/ns/pid'), net_namespace: await readlink('/proc/self/ns/net'),
+        launcher: { pid: 2147483646, start_ticks: '16', executable: '/opt/example/node' },
+        server: { pid: 2147483647, ppid: 2147483646, start_ticks: '17', executable: '/opt/example/oat' },
+        fenced_at_unix_ms: now,
+      },
+    };
+    const bytes = JSON.stringify(manifest);
+    const approval = [{ invocationId: deadline.invocationId, receiptSha256: digest(original), evidenceSha256: digest(bytes) }];
+    await writeFile(manifestPath, bytes);
+    await assert.rejects(main(['--recover-failed-aks', deadline.invocationId, manifestPath], undefined, undefined, root),
+      /No reviewed legacy AKS disposition/);
+    await assert.rejects(assertNoUnsettledDeadlineReceipts(root, undefined, approval), /Unsettled AKS/);
+    const badStatus = JSON.stringify({ ...manifest, terminal_get: { ...terminal, config_sha256: '0'.repeat(64) } });
+    await writeFile(manifestPath, badStatus);
+    await assert.rejects(recordLegacyAksDisposition(root, deadline.invocationId, manifestPath, [
+      { ...approval[0]!, evidenceSha256: digest(badStatus) },
+    ]), /lacks coherent single-cell/);
+    await writeFile(manifestPath, bytes);
+    await assert.rejects(recordLegacyAksDisposition(root, deadline.invocationId, manifestPath, approval), /listener is still present/);
+    await writeFile(dispositionPath, bytes, { flag: 'wx' });
+    await assert.rejects(assertNoUnsettledDeadlineReceipts(root, undefined, approval), /listener is still present/);
+    await assert.rejects(recordLegacyAksDisposition(root, deadline.invocationId, manifestPath, approval), /listener is still present/);
+    await unlink(dispositionPath);
+    const livePid = JSON.stringify({
+      ...manifest, writer_fence: { ...manifest.writer_fence,
+        launcher: { ...manifest.writer_fence.launcher, pid: process.pid },
+        server: { ...manifest.writer_fence.server, ppid: process.pid },
+      },
+    });
+    const livePidApproval = [{ ...approval[0]!, evidenceSha256: digest(livePid) }];
+    await writeFile(manifestPath, livePid);
+    await assert.rejects(recordLegacyAksDisposition(root, deadline.invocationId, manifestPath, livePidApproval), /exited launcher and server/);
+    await writeFile(manifestPath, bytes);
+    await new Promise<void>((resolve, reject) => listener.close((error) => error ? reject(error) : resolve()));
+    await Promise.all([1, 2].map(() => recordLegacyAksDisposition(root, deadline.invocationId, manifestPath, approval)));
+    await assertNoUnsettledDeadlineReceipts(root, undefined, approval);
+    assert.deepEqual(await readFile(deadline.receiptPath), original);
+    assert.equal(await readFile(dispositionPath, 'utf8'), bytes);
+    await assert.rejects(assertNoUnsettledDeadlineReceipts(root), /Unapproved or orphaned/);
+    await writeFile(dispositionPath, bytes + '\n');
+    await assert.rejects(assertNoUnsettledDeadlineReceipts(root, undefined, approval), /reviewed receipt and evidence digests/);
+    await assert.rejects(recordLegacyAksDisposition(root, deadline.invocationId, manifestPath, approval), /Conflicting/);
+    assert.equal(await readFile(dispositionPath, 'utf8'), bytes + '\n');
+    await writeFile(dispositionPath, bytes);
+    await writeFile(deadline.receiptPath, Buffer.concat([original, Buffer.from('\n')]));
+    await assert.rejects(assertNoUnsettledDeadlineReceipts(root, undefined, approval), /reviewed receipt and evidence digests/);
+    await unlink(deadline.receiptPath);
+    await assert.rejects(assertNoUnsettledDeadlineReceipts(root, undefined, approval), /Unapproved or orphaned/);
+  } finally {
+    if (listener.listening) await new Promise<void>((resolve) => listener.close(() => resolve()));
     deadline.dispose();
     await rm(directory, { recursive: true, force: true });
   }
@@ -1817,10 +2033,9 @@ test('lost cancel response uses only GET reconciliation while the exact run rema
 
 test('known-ID deadline receipt reconciles terminal status before allowing a next cell', async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'oat-deadline-recover-'));
-  const configPath = path.join(directory, 'config.json');
   const runId = '123e4567-e89b-42d3-a456-426614174003';
-  await writeFile(configPath, JSON.stringify({ platform: { kind: 'local' } }));
-  const deadline = await OatLauncherDeadline.create(600);
+  const deadline = await OatLauncherDeadline.create(600, performance.now(), directory);
+  await bindLocalReceipt(deadline);
   const server = createServer((request, response) => {
     response.setHeader('content-type', 'application/json');
     if (request.method === 'GET' && request.url === `/runs/${runId}`) {
@@ -1839,7 +2054,7 @@ test('known-ID deadline receipt reconciles terminal status before allowing a nex
     await deadline.markCreationPending(`http://127.0.0.1:${address.port}`);
     await deadline.recordRunStarted({ ...status('running'), id: runId });
     deadline.dispose();
-    await assertNoUnsettledDeadlineReceipts();
+    await assertNoUnsettledDeadlineReceipts(directory);
     const receipt = JSON.parse(await readFile(deadline.receiptPath, 'utf8')) as { run_state: string; cleanup_state: string };
     assert.deepEqual({ run_state: receipt.run_state, cleanup_state: receipt.cleanup_state }, { run_state: 'succeeded', cleanup_state: 'confirmed' });
   } finally {
@@ -2003,6 +2218,7 @@ test('failed terminal cleanup remains unsettled and blocks the next cell', async
 test('restoring durable cancellation intent permits GETs but never another POST', async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'oat-once-only-recovery-'));
   const deadline = await OatLauncherDeadline.create(600, performance.now(), directory);
+  await bindLocalReceipt(deadline);
   const runId = status('running').id;
   let reads = 0;
   let cancels = 0;
@@ -2123,6 +2339,7 @@ test('receipt reconciliation rejects a terminal status for a different run ID', 
   const runA = '123e4567-e89b-42d3-a456-426614174014';
   const runB = '123e4567-e89b-42d3-a456-426614174015';
   const deadline = await OatLauncherDeadline.create(600, performance.now(), directory);
+  await bindLocalReceipt(deadline);
   const server = createServer((_request, response) => {
     response.setHeader('content-type', 'application/json');
     response.end(JSON.stringify({ ...status('succeeded'), id: runB }));
@@ -2151,6 +2368,7 @@ test('expired persisted cleanup budget does not grant another cancellation allow
   const directory = await mkdtemp(path.join(os.tmpdir(), 'oat-cleanup-budget-exhausted-'));
   const runId = '123e4567-e89b-42d3-a456-426614174016';
   const deadline = await OatLauncherDeadline.create(600, performance.now(), directory);
+  await bindLocalReceipt(deadline);
   let cancelCalls = 0;
   let state: OatRunStatus['state'] = 'running';
   const server = createServer((request, response) => {
@@ -2188,6 +2406,7 @@ test('receipt write crossing cleanup deadline prevents cancellation dispatch', a
   const directory = await mkdtemp(path.join(os.tmpdir(), 'oat-cleanup-budget-write-'));
   const runId = '123e4567-e89b-42d3-a456-426614174017';
   const deadline = await OatLauncherDeadline.create(600, performance.now(), directory);
+  await bindLocalReceipt(deadline);
   let cancelCalls = 0;
   let state: OatRunStatus['state'] = 'running';
   const server = createServer((request, response) => {
