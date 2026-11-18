@@ -513,7 +513,7 @@ mod catalog_registration_tests {
             }
         }
         let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let guard = Cancelled(cancelled.clone());
+        let guard = Cancelled(Arc::clone(&cancelled));
         let deadline = CatalogRegistrationDeadline(tokio::time::Instant::now() + Duration::from_millis(30));
         let result = deadline
             .run(async {
