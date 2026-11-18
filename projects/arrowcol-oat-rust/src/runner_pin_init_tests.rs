@@ -218,9 +218,9 @@ mod pin_init_tests {
 
     fn failed_job() -> Value {
         json!({"kind":"Job","metadata":{"uid":JOB_UID,
-            "name":format!("oat-pin-init-{}",uuid::Uuid::parse_str(RUN).unwrap().simple()),
-            "namespace":"oat-pin-fixture","labels":{"arrowcol-oat-run":uuid::Uuid::parse_str(RUN).unwrap().simple().to_string()}
-        },"status":{"active":0,"ready":0,"failed":1,
+            "name":format!("oat-pin-init-{}",RUN.replace('-', "")),
+            "namespace":"oat-pin-fixture","labels":{"arrowcol-oat-run":RUN.replace('-', "")}
+        },"status":{"ready":0,"failed":1,
             "conditions":[{"type":"Failed","status":"True"}]}})
     }
 
@@ -228,7 +228,7 @@ mod pin_init_tests {
         json!({"items":[{
             "metadata":{"uid":"55555555-5555-4555-8555-555555555555",
                 "namespace":"oat-pin-fixture","labels":{"controller-uid":JOB_UID},
-                "ownerReferences":[{"kind":"Job","name":format!("oat-pin-init-{}",uuid::Uuid::parse_str(RUN).unwrap().simple()),"uid":JOB_UID,"controller":true}]},
+                "ownerReferences":[{"kind":"Job","name":format!("oat-pin-init-{}",RUN.replace('-', "")),"uid":JOB_UID,"controller":true}]},
             "spec":{"containers":[{"name":"pin-init"}],"initContainers":[{"name":"identity-init"}]},
             "status":{"phase":"Failed",
                 "containerStatuses":[{"name":"pin-init","state":{"terminated":{"containerID":"containerd://app",
@@ -240,29 +240,48 @@ mod pin_init_tests {
 
     #[test]
     fn failed_initializer_termination_confirms_cleanup_without_initializing() -> Result<()> {
-        let root = std::env::temp_dir().join(format!("pin-stop-{}", uuid::Uuid::new_v4()));
-        fs::create_dir(&root)?;
-        fs::write(root.join("job.json"), serde_json::to_vec(&failed_job())?)?;
-        fs::write(root.join("created-job.json"), serde_json::to_vec(&failed_job())?)?;
-        fs::write(root.join("pods.json"), serde_json::to_vec(&terminated_pods())?)?;
-        executable(
-            &root.join("kubectl"),
-            &format!(
-                "#!/bin/sh\ncase \"$1 $2\" in create*) cat > '{0}/manifest.json'; cat '{0}/created-job.json';; 'get job') cat '{0}/job.json';; 'get pods') cat '{0}/pods.json';; logs*) printf 'initializer failed before table receipt\\n';; *) exit 44;; esac\n",
-                root.display()
-            ),
-        )?;
-        let output = child(&root, "termination")?.output()?;
-        println!(
-            "failed initializer cleanup probe: {}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        ensure!(
-            output.status.success(),
-            "terminated failed initializer was not positively resolved"
-        );
-        fs::remove_dir_all(&root)?;
+        for variant in [
+            "kubernetes-wire",
+            "ready-absent",
+            "terminating-absent",
+            "uncounted-empty",
+            "uncounted-fields-absent",
+        ] {
+            let root = std::env::temp_dir().join(format!("pin-stop-{}", uuid::Uuid::new_v4()));
+            fs::create_dir(&root)?;
+            let mut job = failed_job();
+            match variant {
+                "ready-absent" => {
+                    job["status"].as_object_mut().context("fixture status")?.remove("ready");
+                    job["status"]["terminating"] = json!(0);
+                }
+                "terminating-absent" => job["status"]["active"] = json!(0),
+                "uncounted-empty" => job["status"]["uncountedTerminatedPods"] = json!({"succeeded":[],"failed":[]}),
+                "uncounted-fields-absent" => job["status"]["uncountedTerminatedPods"] = json!({}),
+                _ => {}
+            }
+            fs::write(root.join("job.json"), serde_json::to_vec(&job)?)?;
+            fs::write(root.join("created-job.json"), serde_json::to_vec(&failed_job())?)?;
+            fs::write(root.join("pods.json"), serde_json::to_vec(&terminated_pods())?)?;
+            executable(
+                &root.join("kubectl"),
+                &format!(
+                    "#!/bin/sh\ncase \"$1 $2\" in create*) cat > '{0}/manifest.json'; cat '{0}/created-job.json';; 'get job') cat '{0}/job.json';; 'get pods') cat '{0}/pods.json';; logs*) printf 'initializer failed before table receipt\\n';; *) exit 44;; esac\n",
+                    root.display()
+                ),
+            )?;
+            let output = child(&root, "termination")?.output()?;
+            println!(
+                "failed initializer cleanup probe {variant}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            ensure!(
+                output.status.success(),
+                "terminated failed initializer was not positively resolved"
+            );
+            fs::remove_dir_all(&root)?;
+        }
         Ok(())
     }
 
@@ -271,8 +290,20 @@ mod pin_init_tests {
         let cases = [
             "active",
             "ready",
-            "missing-active",
-            "missing-ready",
+            "active-nonint",
+            "active-null",
+            "ready-nonint",
+            "ready-null",
+            "terminating-1",
+            "terminating-nonint",
+            "terminating-null",
+            "uncounted-nonempty",
+            "uncounted-failed-nonempty",
+            "uncounted-nonobject",
+            "uncounted-null",
+            "uncounted-list-null",
+            "uncounted-list-nonarray",
+            "uncounted-extra-field",
             "foreign-job",
             "no-failed-condition",
             "running-pod",
@@ -305,17 +336,28 @@ mod pin_init_tests {
             match case {
                 "active" => job["status"]["active"] = json!(1),
                 "ready" => job["status"]["ready"] = json!(1),
-                "missing-active" => {
-                    job["status"].as_object_mut().unwrap().remove("active");
-                }
-                "missing-ready" => {
-                    job["status"].as_object_mut().unwrap().remove("ready");
-                }
+                "active-nonint" => job["status"]["active"] = json!("0"),
+                "active-null" => job["status"]["active"] = Value::Null,
+                "ready-nonint" => job["status"]["ready"] = json!(0.0),
+                "ready-null" => job["status"]["ready"] = Value::Null,
+                "terminating-1" => job["status"]["terminating"] = json!(1),
+                "terminating-nonint" => job["status"]["terminating"] = json!("0"),
+                "terminating-null" => job["status"]["terminating"] = Value::Null,
+                "uncounted-nonempty" => job["status"]["uncountedTerminatedPods"] = json!({"succeeded":[RUN]}),
+                "uncounted-failed-nonempty" => job["status"]["uncountedTerminatedPods"] = json!({"failed":[RUN]}),
+                "uncounted-nonobject" => job["status"]["uncountedTerminatedPods"] = json!([]),
+                "uncounted-null" => job["status"]["uncountedTerminatedPods"] = Value::Null,
+                "uncounted-list-null" => job["status"]["uncountedTerminatedPods"] = json!({"failed":null}),
+                "uncounted-list-nonarray" => job["status"]["uncountedTerminatedPods"] = json!({"failed":""}),
+                "uncounted-extra-field" => job["status"]["uncountedTerminatedPods"] = json!({"other":[]}),
                 "foreign-job" => job["metadata"]["uid"] = json!(RUN),
                 "no-failed-condition" => job["status"]["conditions"] = json!([]),
                 "running-pod" => pods["items"][0]["status"]["phase"] = json!("Running"),
                 "missing-phase" => {
-                    pods["items"][0]["status"].as_object_mut().unwrap().remove("phase");
+                    pods["items"][0]["status"]
+                        .as_object_mut()
+                        .context("fixture pod status")?
+                        .remove("phase");
                 }
                 "foreign-label" => pods["items"][0]["metadata"]["labels"]["controller-uid"] = json!(RUN),
                 "foreign-owner" => pods["items"][0]["metadata"]["ownerReferences"][0]["uid"] = json!(RUN),
@@ -323,32 +365,32 @@ mod pin_init_tests {
                 "missing-app-status" => {
                     pods["items"][0]["status"]
                         .as_object_mut()
-                        .unwrap()
+                        .context("fixture pod status")?
                         .remove("containerStatuses");
                 }
                 "missing-init-status" => {
                     pods["items"][0]["status"]
                         .as_object_mut()
-                        .unwrap()
+                        .context("fixture pod status")?
                         .remove("initContainerStatuses");
                 }
                 "waiting" | "running" => pods["items"][0]["status"]["containerStatuses"][0]["state"] = json!({case:{}}),
                 "missing-container-id" => {
                     pods["items"][0]["status"]["containerStatuses"][0]["state"]["terminated"]
                         .as_object_mut()
-                        .unwrap()
+                        .context("fixture terminated state")?
                         .remove("containerID");
                 }
                 "missing-exit-code" => {
                     pods["items"][0]["status"]["containerStatuses"][0]["state"]["terminated"]
                         .as_object_mut()
-                        .unwrap()
+                        .context("fixture terminated state")?
                         .remove("exitCode");
                 }
                 "missing-finished-at" => {
                     pods["items"][0]["status"]["containerStatuses"][0]["state"]["terminated"]
                         .as_object_mut()
-                        .unwrap()
+                        .context("fixture terminated state")?
                         .remove("finishedAt");
                 }
                 "empty-pods" => pods["items"] = json!([]),
@@ -356,16 +398,16 @@ mod pin_init_tests {
                     let mut other = pods["items"][0].clone();
                     other["metadata"]["uid"] = json!(RUN);
                     other["status"]["phase"] = json!("Running");
-                    pods["items"].as_array_mut().unwrap().push(other);
+                    pods["items"].as_array_mut().context("fixture pods")?.push(other);
                 }
                 "second-live-container" => {
                     pods["items"][0]["spec"]["containers"]
                         .as_array_mut()
-                        .unwrap()
+                        .context("fixture containers")?
                         .push(json!({"name":"other"}));
                     pods["items"][0]["status"]["containerStatuses"]
                         .as_array_mut()
-                        .unwrap()
+                        .context("fixture statuses")?
                         .push(json!({"name":"other","state":{"running":{}}}));
                 }
                 "timeout" => {

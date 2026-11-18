@@ -7109,8 +7109,21 @@ fn failed_initializer_termination_evidence(
     pods: &Value,
 ) -> Result<Value> {
     if job.pointer("/metadata/uid").and_then(Value::as_str) != Some(job_uid)
-        || job.pointer("/status/active").and_then(Value::as_u64) != Some(0)
-        || job.pointer("/status/ready").and_then(Value::as_u64) != Some(0)
+        || ["active", "ready", "terminating"]
+            .iter()
+            .any(|key| job["status"].get(key).is_some_and(|value| value.as_u64() != Some(0)))
+        || job["status"].get("uncountedTerminatedPods").is_some_and(|value| {
+            value.as_object().is_none_or(|uncounted| {
+                uncounted
+                    .keys()
+                    .any(|key| !matches!(key.as_str(), "succeeded" | "failed"))
+                    || ["succeeded", "failed"].iter().any(|key| {
+                        uncounted
+                            .get(*key)
+                            .is_some_and(|pods| pods.as_array().is_none_or(|pods| !pods.is_empty()))
+                    })
+            })
+        })
         || !job
             .pointer("/status/conditions")
             .and_then(Value::as_array)
@@ -7120,7 +7133,9 @@ fn failed_initializer_termination_evidence(
                     .any(|condition| condition["type"] == "Failed" && condition["status"] == "True")
             })
     {
-        bail!("initializer Job lacks UID-bound Failed=True, active=0, ready=0 termination proof");
+        bail!(
+            "initializer Job lacks UID-bound Failed=True, zero active/ready/terminating and fully accounted terminal pods"
+        );
     }
     let pods = pods["items"]
         .as_array()
