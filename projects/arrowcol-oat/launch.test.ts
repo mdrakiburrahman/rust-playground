@@ -853,6 +853,27 @@ test('observed AKS disposition requires matching owned failure, writer fence and
   }
 });
 
+test('05b00915 AKS disposition pin rejects mismatched bytes through record and replay', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'oat-pin-05b00915-'));
+  const invocationId = '05b00915-2853-4c7a-b2bb-5dbb49bcd0ed';
+  const receiptPath = path.join(root, invocationId + '.json');
+  const evidencePath = path.join(root, 'unreviewed-evidence');
+  const sidecar = receiptPath + '.failed-aks-disposition';
+  const fixture = '{"fixture":"not reviewed"}\n';
+  try {
+    await writeFile(receiptPath, fixture);
+    await writeFile(evidencePath, fixture);
+    const mismatch = /Observed AKS disposition does not match the reviewed receipt and evidence digests/;
+    await assert.rejects(recordLegacyAksDisposition(root, invocationId, evidencePath), mismatch);
+    assert.deepEqual((await readdir(root)).sort(), [path.basename(receiptPath), path.basename(evidencePath)].sort());
+    await writeFile(sidecar, fixture);
+    await assert.rejects(assertNoUnsettledDeadlineReceipts(root), mismatch);
+    assert.equal(await readFile(receiptPath, 'utf8'), fixture);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('legacy deadline receipts remain readable without new terminal identity fields', async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'oat-terminal-legacy-'));
   const deadline = await OatLauncherDeadline.create(600, performance.now(), directory);
