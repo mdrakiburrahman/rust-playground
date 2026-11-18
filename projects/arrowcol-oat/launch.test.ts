@@ -497,6 +497,60 @@ test('failed terminal response is retained as termination evidence without confi
   }
 });
 
+test('AKS failure stays a benchmark failure, and only bound cleanup evidence clears the receipt', async () => {
+  const scenarios = [
+    { name: 'confirmed', prove: true, own: true, mismatch: false, allowed: true },
+    { name: 'no proof', prove: undefined, own: true, mismatch: false, allowed: false },
+    { name: 'malformed proof', prove: 'true', own: true, mismatch: false, allowed: false },
+    { name: 'external server', prove: true, own: false, mismatch: false, allowed: false },
+    { name: 'wrong digest', prove: true, own: true, mismatch: true, allowed: false },
+  ];
+  for (const { name, prove, own, mismatch, allowed } of scenarios) {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'oat-aks-cleanup-'));
+    const submitted_config_body = '{"platform":{"kind":"aks"}}';
+    const submitted_config_sha256 = createHash('sha256').update(submitted_config_body).digest('hex');
+    const server = 'http://127.0.0.1:8088/';
+    const deadline = await OatLauncherDeadline.create(undefined, performance.now(), directory);
+    try {
+      const accepted = { ...status('running'), config_sha256: submitted_config_sha256 };
+      const failed = {
+        ...accepted, state: 'failed', progress: 'failed', result_count: 0,
+        error: 'synthetic AKS failure', finished_at_unix_ms: Date.now(),
+        config_sha256: mismatch ? '0'.repeat(64) : submitted_config_sha256,
+        aks_cleanup_confirmed: prove,
+      };
+      const requests: string[] = [];
+      await assert.rejects(launchOat('unused.json', server, 1, async (url, init) => {
+        requests.push(`${init?.method ?? 'GET'} ${new URL(String(url)).pathname}`);
+        return Response.json(init?.method === 'POST' ? accepted : failed);
+      }, () => {}, 'aks', undefined, undefined, own ? async (started) => {
+        await deadline.recordOwnedServerIdentity({
+          invocationId: deadline.invocationId, runId: started.id, serverUrl: server,
+          serverPid: process.pid, serverStartTicks: 'fixture-start-ticks', serverExecutable: process.execPath,
+        });
+      } : undefined, undefined, deadline, {
+        submitted_config_body, submitted_config_sha256, source_config_sha256: 'a'.repeat(64),
+      }), mismatch ? /config_sha256 mismatch/ : /synthetic AKS failure/, name);
+      assert.deepEqual(requests, ['POST /runs', `GET /runs/${accepted.id}`], name);
+      const bytes = await readFile(deadline.receiptPath, 'utf8');
+      const receipt = JSON.parse(bytes);
+      assert.equal(receipt.run_state, 'failed', name);
+      assert.equal(receipt.cleanup_state, allowed ? 'confirmed' : 'unsettled', name);
+      if (allowed) {
+        assert.equal(receipt.terminal_observation?.status.aks_cleanup_confirmed, true, name);
+        assert.equal(receipt.terminal_observation?.status.error, failed.error, name);
+        await assertNoUnsettledDeadlineReceipts(directory);
+      } else {
+        await assert.rejects(assertNoUnsettledDeadlineReceipts(directory), /Unsettled AKS launcher receipt .*operator/, name);
+      }
+      assert.equal(await readFile(deadline.receiptPath, 'utf8'), bytes, name);
+    } finally {
+      deadline.dispose();
+      await rm(directory, { recursive: true, force: true });
+    }
+  }
+});
+
 test('legacy deadline receipts remain readable without new terminal identity fields', async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'oat-terminal-legacy-'));
   const deadline = await OatLauncherDeadline.create(600, performance.now(), directory);

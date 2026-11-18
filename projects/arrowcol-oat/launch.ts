@@ -20,6 +20,7 @@ export interface OatRunStatus {
   error: string | null;
   started_at_unix_ms?: number;
   finished_at_unix_ms?: number | null;
+  aks_cleanup_confirmed?: true;
   local_teardown?: {
     cell_id: string;
     schedule_unix_ms: number;
@@ -246,6 +247,7 @@ export class OatLauncherDeadline {
   }
 
   get creationState(): DeadlineCreationState { return this.receipt.creation_state; }
+  get isAksRun(): boolean { return isAksSubmission(this.receipt.submitted_config_body); }
   get invocationId(): string { return this.receipt.invocation_id; }
   get cleanupState(): DeadlineCleanupState { return this.receipt.cleanup_state; }
   get runId(): string | null { return this.receipt.run_id; }
@@ -375,11 +377,16 @@ export class OatLauncherDeadline {
       typeof this.receipt.server_start_ticks === 'string' && this.receipt.server_start_ticks.length > 0 &&
       typeof this.receipt.server_executable === 'string' && this.receipt.server_executable.length > 0;
     const terminal = status.state === 'succeeded' || status.state === 'failed' || status.state === 'cancelled';
-    if (terminal && this.receipt.terminal_observation == null && identityBound &&
+    const matchesOwnedRun = terminal && identityBound &&
         this.receipt.creation_state === 'accepted' && this.receipt.run_id === status.id &&
         this.receipt.server_url !== null && this.receipt.submitted_config_sha256 !== null &&
-        this.receipt.config_binding_error === null && status.config_sha256 === this.receipt.submitted_config_sha256) {
+        this.receipt.config_binding_error === null && status.config_sha256 === this.receipt.submitted_config_sha256;
+    if (matchesOwnedRun && this.receipt.terminal_observation == null) {
       this.receipt.terminal_observation = { observed_at_unix_ms: Date.now(), status: structuredClone(status) };
+    }
+    if (matchesOwnedRun && status.state === 'failed' && status.aks_cleanup_confirmed === true &&
+        this.isAksRun && hasConfirmedAksFailure(this.receipt.terminal_observation?.status)) {
+      this.receipt.cleanup_state = 'confirmed';
     }
     await this.persist();
   }
@@ -422,6 +429,23 @@ function cleanupStateFor(status: OatRunStatus): DeadlineCleanupState {
   return 'pending';
 }
 
+function isAksSubmission(body: unknown): boolean {
+  if (typeof body !== 'string') return false;
+  let config: unknown;
+  try {
+    config = JSON.parse(body);
+  } catch {
+    return false;
+  }
+  return isRecord(config) && isRecord(config.platform) && config.platform.kind === 'aks';
+}
+
+function hasConfirmedAksFailure(status: OatRunStatus | undefined): boolean {
+  return status?.state === 'failed' && status.aks_cleanup_confirmed === true &&
+    typeof status.error === 'string' && typeof status.finished_at_unix_ms === 'number' &&
+    Number.isSafeInteger(status.finished_at_unix_ms) && status.finished_at_unix_ms > 0;
+}
+
 function isLauncherDeadlineReceipt(value: unknown): value is LauncherDeadlineReceipt {
   if (!isRecord(value)) return false;
   const noBinding = value.submitted_config_body === null && value.submitted_config_sha256 === null && value.source_config_sha256 === null;
@@ -462,7 +486,11 @@ function isLauncherDeadlineReceipt(value: unknown): value is LauncherDeadlineRec
     (value.error === null || typeof value.error === 'string') &&
     (identityFieldsAbsent || identityIsNull || identityIsValid) &&
     (identityFieldsAbsent || identityIsNull || (value.creation_state === 'accepted' && value.run_id !== null && value.server_url !== null)) &&
-    (observationAbsent || observationIsValid) && observationMatches;
+    (observationAbsent || observationIsValid) && observationMatches &&
+    (value.run_state !== 'failed' || value.cleanup_state !== 'confirmed' ||
+      (bindingIsValid && isAksSubmission(value.submitted_config_body) && value.config_binding_error === null &&
+        isLauncherTerminalObservation(value.terminal_observation) &&
+        hasConfirmedAksFailure(value.terminal_observation.status)));
 }
 
 function isLauncherTerminalObservation(value: unknown): value is LauncherTerminalObservation {
@@ -495,6 +523,9 @@ export async function assertNoUnsettledDeadlineReceipts(root = launcherDeadlineR
     const deadline = await OatLauncherDeadline.restore(path, writeReceipt);
     if (deadline.creationState !== 'pending' && deadline.creationState !== 'unknown' &&
         deadline.cleanupState !== 'pending' && deadline.cleanupState !== 'unsettled') continue;
+    if (deadline.isAksRun) {
+      throw new Error(`Unsettled AKS launcher receipt ${path}; refusing another run until this exact receipt is reconciled by an operator`);
+    }
     if (!deadline.runId || !deadline.serverUrl ||
         !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(deadline.runId) ||
         !isLocalOatServerUrl(deadline.serverUrl)) {
@@ -1116,7 +1147,7 @@ export async function launchOat(
     ? signal ? AbortSignal.any([signal, deadline.signal]) : deadline.signal
     : signal;
   const requestCancellation = (): void => {
-    if (cancellationRequested) return;
+    if (mode === 'aks' || isAksSubmission(binding.submitted_config_body) || cancellationRequested) return;
     cancellationRequested = true;
     resolveCancellationStarted();
     cancellationRequest = (async (): Promise<CancellationOutcome> => {
@@ -1483,6 +1514,20 @@ export async function main(
   try {
     try {
       const localMarker = markerContext;
+      const bindAksServerIdentity = async (status: OatRunStatus): Promise<void> => {
+        const serverPid = server.child.pid;
+        if (!serverPid || server.child.exitCode !== null || server.child.signalCode !== null) return;
+        const serverStartTicks = await processStartTicks(serverPid);
+        if (!serverStartTicks || server.child.exitCode !== null || server.child.signalCode !== null) return;
+        await deadline.recordOwnedServerIdentity({
+          invocationId: deadline.invocationId,
+          runId: status.id,
+          serverUrl: new URL(server.url).href,
+          serverPid,
+          serverStartTicks,
+          serverExecutable: server.executable,
+        });
+      };
       const onRunStarted = localMarker ? async (status: OatRunStatus): Promise<void> => {
         await persistLocalRunMarker(localMarker, status, submission);
         markerWritten = true;
@@ -1512,7 +1557,7 @@ export async function main(
             diagnostic(error);
           }
         }
-      } : undefined;
+      } : mode === 'aks' ? bindAksServerIdentity : undefined;
       const onRunFinished = (status: OatRunStatus): void => {
         runCleanupComplete = (status.state === 'succeeded' || status.state === 'cancelled') && deadline.cleanupState === 'confirmed';
       };
