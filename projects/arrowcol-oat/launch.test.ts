@@ -18,7 +18,7 @@ import { collectDataFlow } from './dataflow-verdict.js';
 import {
   buildOwnedServer, cleanupLocalComposeProjects, finishOwnedLocalRun, launchOat, main, OatLauncherDeadline, assertNoUnsettledDeadlineReceipts, readOatConfigForMode,
   processStartTicks, resolveCliConfigPath, resolveOatConfigPath, sendViewerFile,
-  startLocalServer, startLocalViewer, stopLocalServer, type OatRunStatus,
+  recordLegacyAksDisposition, startLocalServer, startLocalViewer, stopLocalServer, type OatRunStatus,
 } from './launch.js';
 
 const status = (state: OatRunStatus['state']) => ({
@@ -595,6 +595,96 @@ test('accepted receipts with unverified platforms refuse recovery without any re
     }
   } finally {
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
+test('legacy AKS disposition is one-time, exact, and does not rewrite the failed receipt', {
+  skip: process.platform !== 'linux',
+}, async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'oat-legacy-disposition-'));
+  const root = path.join(directory, 'receipts');
+  const deadline = await OatLauncherDeadline.create(undefined, performance.now(), root);
+  const manifestPath = path.join(directory, 'reviewed-evidence');
+  const dispositionPath = deadline.receiptPath + '.failed-aks-disposition';
+  const digest = (body: Buffer | string) => createHash('sha256').update(body).digest('hex');
+  const error = 'maintenance omitted effective per-table operationTimeout before load admission';
+  const body = JSON.stringify({
+    platform: { kind: 'aks' }, tables: ['test'], replica_counts: [1], dfe_worker_concurrency: [16],
+  });
+  const listener = createServer();
+  await new Promise<void>((resolve, reject) => {
+    listener.once('error', reject);
+    listener.listen(0, '127.0.0.1', resolve);
+  });
+  const address = listener.address();
+  assert.ok(address && typeof address !== 'string');
+  const serverUrl = 'http://127.0.0.1:' + address.port + '/';
+  const now = Date.now();
+  const terminal = {
+    ...status('failed'), config_sha256: digest(body), error, started_at_unix_ms: now, finished_at_unix_ms: now,
+  };
+  try {
+    await deadline.setSubmissionBinding({ submitted_config_body: body,
+      submitted_config_sha256: digest(body), source_config_sha256: digest(body) });
+    await deadline.markCreationPending(serverUrl);
+    await deadline.recordRunStarted(terminal);
+    const original = await readFile(deadline.receiptPath);
+    const cellId = 'c0bfca05-28f2-4e16-a4cc-b3f28a351fb9';
+    const raw = digest('fixture');
+    const manifest = {
+      schema_version: 1, disposition: 'failed-before-load-cleanup-verified', invocation_id: deadline.invocationId,
+      original_receipt_sha256: digest(original), server_url: serverUrl, raw_evidence_sha256: raw,
+      verifier_sha256: raw, runner_source_sha256: raw, terminal_get: terminal,
+      raw_observation_sha256: Object.fromEntries([
+        'terminal_get', 'single_cell_trace', 'fic_ready', 'workload_stop_trace', 'process_exit',
+        'namespace_get', 'fic_inventory',
+      ].map((name) => [name, raw])),
+      cell: {
+        id: cellId, namespace: 'arrow-collector-' + cellId.replaceAll('-', ''), namespace_uid: cellId,
+        aks_id: '/fake/cluster', api_origin: 'https://test.invalid', owner_token: 'fixture',
+        fic_id: '/fake/fic', fic_subject: 'fixture', qap: 'not-attempted', result_artifact: 'retained-unranked',
+        namespace_absent_at_unix_ms: now, fic_absent_at_unix_ms: now,
+      },
+      writer_fence: {
+        boot_id: (await readFile('/proc/sys/kernel/random/boot_id', 'utf8')).trim(),
+        pid_namespace: await readlink('/proc/self/ns/pid'), net_namespace: await readlink('/proc/self/ns/net'),
+        launcher: { pid: 2147483646, start_ticks: '16', executable: '/opt/example/node' },
+        server: { pid: 2147483647, ppid: 2147483646, start_ticks: '17', executable: '/opt/example/oat' },
+        fenced_at_unix_ms: now,
+      },
+    };
+    const bytes = JSON.stringify(manifest);
+    const approval = [{ invocationId: deadline.invocationId, receiptSha256: digest(original), evidenceSha256: digest(bytes) }];
+    await writeFile(manifestPath, bytes);
+    await assert.rejects(main(['--recover-failed-aks', deadline.invocationId, manifestPath], undefined, undefined, root),
+      /No reviewed legacy AKS disposition/);
+    await assert.rejects(assertNoUnsettledDeadlineReceipts(root, undefined, approval), /Unsettled AKS/);
+    const badStatus = JSON.stringify({ ...manifest, terminal_get: { ...terminal, config_sha256: '0'.repeat(64) } });
+    await writeFile(manifestPath, badStatus);
+    await assert.rejects(recordLegacyAksDisposition(root, deadline.invocationId, manifestPath, [
+      { ...approval[0]!, evidenceSha256: digest(badStatus) },
+    ]), /lacks coherent single-cell/);
+    await writeFile(manifestPath, bytes);
+    await assert.rejects(recordLegacyAksDisposition(root, deadline.invocationId, manifestPath, approval), /listener is still present/);
+    await new Promise<void>((resolve, reject) => listener.close((error) => error ? reject(error) : resolve()));
+    await Promise.all([1, 2].map(() => recordLegacyAksDisposition(root, deadline.invocationId, manifestPath, approval)));
+    await assertNoUnsettledDeadlineReceipts(root, undefined, approval);
+    assert.deepEqual(await readFile(deadline.receiptPath), original);
+    assert.equal(await readFile(dispositionPath, 'utf8'), bytes);
+    await assert.rejects(assertNoUnsettledDeadlineReceipts(root), /Unapproved or orphaned/);
+    await writeFile(dispositionPath, bytes + '\n');
+    await assert.rejects(assertNoUnsettledDeadlineReceipts(root, undefined, approval), /reviewed receipt and evidence digests/);
+    await assert.rejects(recordLegacyAksDisposition(root, deadline.invocationId, manifestPath, approval), /Conflicting/);
+    assert.equal(await readFile(dispositionPath, 'utf8'), bytes + '\n');
+    await writeFile(dispositionPath, bytes);
+    await writeFile(deadline.receiptPath, Buffer.concat([original, Buffer.from('\n')]));
+    await assert.rejects(assertNoUnsettledDeadlineReceipts(root, undefined, approval), /reviewed receipt and evidence digests/);
+    await unlink(deadline.receiptPath);
+    await assert.rejects(assertNoUnsettledDeadlineReceipts(root, undefined, approval), /Unapproved or orphaned/);
+  } finally {
+    if (listener.listening) await new Promise<void>((resolve) => listener.close(() => resolve()));
+    deadline.dispose();
+    await rm(directory, { recursive: true, force: true });
   }
 });
 

@@ -114,6 +114,12 @@ preserves the owned server and blocks another run; it does not attempt local can
 Only receipts bound to a local submission are automatically reconciled. For an
 unresolved AKS or unverified receipt, retain the original receipt and exact run
 identity for operator review. Do not edit the receipt or reroute around it.
+`--recover-failed-aks <invocation-id> <approved-evidence-path>` is an offline
+disposition for one separately approved, single-cell failure before load. It
+requires the exact original receipt, independently verified current resource
+absence after fencing the old writers, and an exact evidence digest pinned in
+the reviewed launcher. The command refuses unapproved evidence and never stops
+processes, deletes resources, changes the original receipt, or ranks the run.
 
 Old Compose projects named with only the first eight UUID characters are ambiguous. Cleanup refuses them without deleting resources or state; inspect ownership and clean up those legacy projects manually.
 
