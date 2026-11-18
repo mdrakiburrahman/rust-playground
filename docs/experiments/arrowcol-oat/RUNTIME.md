@@ -67,6 +67,13 @@ Failures capture bounded current/previous logs and descriptions for every
 workload role, namespace pods/services/endpoints and events before cleanup.
 Scale-out keeps exactly one collector/router and initializes the fresh canonical
 physical table in pin-init before maintenance readback and client admission.
+An independent finite client-image registration Job then sends the production
+DMV `CREATE TABLE IF NOT EXISTS` through the router with the client edge key.
+Signed catalog snapshot readback must prove exactly that canonical schema at
+the run-scoped location. Only the existing client signing keys are mounted:
+no migrator password or storage identity. The controller verifies the receipt,
+foreground-deletes the Job and confirms its UID-selected Pods are absent before
+starting maintenance; the effective-policy/stop-budget readback gate is unchanged.
 Pin-init uses the collector's Azure ownership environment from the validated
 run runtime config; missing subscription/stamp or a mismatched Delta account
 fails before Job creation. Its read-only root retains a bounded writable `/tmp`.

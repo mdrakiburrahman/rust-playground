@@ -23,6 +23,33 @@ use crate::{
 
 const INGESTION: &str = INGESTION_PARTITION;
 
+/// Read and decode one authenticated catalog snapshot during bounded table setup.
+///
+/// # Errors
+/// Rejects invalid keys, failed or timed-out RPCs, and malformed committed schema histories.
+pub async fn catalog_snapshot(
+    endpoint: &str,
+    internal_secret_file: &Path,
+) -> Result<Vec<arrowcol_catalog_client::CachedTable>> {
+    use arrowcol_catalog_client::rpc::{Empty, schema_catalog_client::SchemaCatalogClient};
+
+    let signer = arrowcol_catalog_client::InternalRequestSigner::from_file(internal_secret_file)?;
+    let snapshot = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let mut client = SchemaCatalogClient::connect(endpoint.to_owned()).await?;
+        let mut request = tonic::Request::new(Empty {});
+        signer.sign_message(&mut request, "/arrowcol.catalog.v1.SchemaCatalog/GetSnapshot")?;
+        request.set_timeout(std::time::Duration::from_secs(30));
+        Ok::<_, anyhow::Error>(client.get_snapshot(request).await?.into_inner())
+    })
+    .await
+    .context("catalog setup snapshot readback exceeded 30 seconds")??;
+    snapshot
+        .tables
+        .into_iter()
+        .map(|table| arrowcol_catalog_client::decode_table(table).map_err(anyhow::Error::msg))
+        .collect()
+}
+
 /// Strict input allocation for one fresh table, not permission to execute cloud operations.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]

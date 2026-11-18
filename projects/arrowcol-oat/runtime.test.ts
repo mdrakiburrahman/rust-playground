@@ -67,12 +67,34 @@ test('AKS resource overrides are strict and project through to role manifests', 
 
 test('scale-out admits exactly one memory-only collector for the hot table with explicit maintenance', async () => {
   const c = scaleOutConfig();
+  c.deltaRoot = c.deltaRoot.replace('/dataflow', `/runs/${c.oatRunId}/dataflow`);
   validateRuntime(c);
   const render = async () => renderRuntime(c, 'workload');
   let objects = await render();
   const get = (name: string) => objects.find(o => o.kind === 'Deployment' && o.metadata.name === name)!;
   const collector = get('arrowcol');
   const router = get('arrowcol-router');
+  const catalogArgs = get('arrowcol-catalog').spec.template.spec.containers[0].args;
+  assert.equal(catalogArgs[catalogArgs.indexOf('--warehouse-root') + 1], c.deltaRoot);
+  assert.ok(catalogArgs.includes('--ingestion-layout'));
+  assert.equal(catalogArgs[catalogArgs.indexOf('--ddl-identity-secret-file') + 1], '/run/auth/internal-hmac');
+  assert.ok(!catalogArgs.includes('--ddl-auth-mode'));
+  const catalogSpec = get('arrowcol-catalog').spec.template.spec;
+  assert.equal(catalogSpec.volumes.find((volume: { name: string }) =>
+    volume.name === 'auth').secret.secretName, 'arrowcol-router-auth');
+  assert.equal(catalogSpec.containers[0].volumeMounts.find((mount: { name: string }) =>
+    mount.name === 'auth').mountPath, '/run/auth');
+  const routerConfig = parse(objects.find(o => o.kind === 'ConfigMap' && o.metadata.name === 'arrowcol-config')!
+    .data['router.yaml']);
+  assert.equal(routerConfig.auth.edge_secret_file, '/run/auth/edge-hmac');
+  assert.equal(routerConfig.auth.internal_signing_secret_file, '/run/auth/internal-hmac');
+  assert.equal(collector.spec.template.spec.containers[0].env.find((entry: { name: string }) =>
+    entry.name === 'ARROWCOL_DELTA_ROOT').value, c.deltaRoot);
+  for (const name of ['catalog-internal', 'router-oat-client-ingress']) {
+    const policy = objects.find(o => o.kind === 'NetworkPolicy' && o.metadata.name === name)!;
+    assert.ok(policy.spec.ingress[0].from.some((source: { podSelector: { matchLabels: { app: string } } }) =>
+      source.podSelector.matchLabels.app === 'arrowcol-oat-client'));
+  }
   assert.equal(collector.spec.replicas, 1);
   assert.equal(router.spec.replicas, 1);
   for (const deployment of [collector, router]) {

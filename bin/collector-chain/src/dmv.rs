@@ -15,7 +15,7 @@ use arrow_flight::sql::{CommandStatementUpdate, ProstMessageExt};
 use arrow_flight::{FlightData, FlightDescriptor};
 use arrow_schema::{DataType, Schema, SchemaRef, TimeUnit};
 use arrowcol_catalog::{DdlCommand, DdlParser};
-use arrowcol_flight::{DeliveryGuarantee, PutResultMetadata, decode_ddl_completion_metadata};
+use arrowcol_flight::{DdlCompletionMetadata, DeliveryGuarantee, PutResultMetadata, decode_ddl_completion_metadata};
 const OAT_RUN_ID_ENV: &str = "ARROWCOL_OAT_RUN_ID";
 const OAT_RUN_ID_HEADER: &str = "x-arrowcol-oat-run-id";
 static CLIENT_SEND_OBSERVATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -259,6 +259,37 @@ fn edge_signer_from_file(path: &std::path::Path) -> Result<EdgeRequestSigner> {
     EdgeRequestSigner::new(secret).map_err(anyhow::Error::from)
 }
 
+/// Registers one canonical DMV table through the normal trusted-edge Flight SQL route without sending rows.
+///
+/// # Errors
+/// Rejects unknown identities, invalid signing keys, transport errors and mismatched DDL completions.
+pub async fn register_table_authenticated(
+    endpoint: &str,
+    table_name: &str,
+    edge_secret_file: &std::path::Path,
+) -> Result<DdlCompletionMetadata> {
+    let table = tables()?
+        .into_iter()
+        .find(|table| table.identity.to_string() == table_name)
+        .context("registration requires a canonical embedded DMV table identity")?;
+    let signer = edge_signer_from_file(edge_secret_file)?;
+    let channel = Endpoint::from_shared(endpoint.to_owned())?
+        .connect_timeout(RPC_TIMEOUT)
+        .timeout(RPC_TIMEOUT)
+        .connect()
+        .await
+        .with_context(|| format!("connect registration endpoint {endpoint}"))?;
+    let completion = register_completion(&mut FlightServiceClient::new(channel), &table, Some(&signer)).await?;
+    if completion.catalog() != table.identity.catalog().as_str()
+        || completion.schema() != table.identity.schema().as_str()
+        || completion.table() != table.identity.table().as_str()
+        || completion.schema_fingerprint() != table.fingerprint
+    {
+        bail!("DMV registration response does not match the canonical logical ingress schema");
+    }
+    Ok(completion)
+}
+
 fn table_named(table_name: &str) -> Result<DmvTable> {
     tables()?
         .into_iter()
@@ -431,6 +462,17 @@ async fn register(
     table: &DmvTable,
     signer: Option<&EdgeRequestSigner>,
 ) -> Result<String> {
+    Ok(format!(
+        "v{}",
+        register_completion(client, table, signer).await?.schema_version()
+    ))
+}
+
+async fn register_completion(
+    client: &mut FlightServiceClient<Channel>,
+    table: &DmvTable,
+    signer: Option<&EdgeRequestSigner>,
+) -> Result<DdlCompletionMetadata> {
     let command = CommandStatementUpdate {
         query: table.ddl.replacen("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ", 1),
         transaction_id: None,
@@ -449,7 +491,7 @@ async fn register(
     let completion = decode_ddl_completion_metadata(response.metadata())?;
     let mut results = response.into_inner();
     while results.message().await?.is_some() {}
-    Ok(format!("v{}", completion.schema_version()))
+    Ok(completion)
 }
 
 async fn put(

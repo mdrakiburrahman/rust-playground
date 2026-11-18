@@ -44,6 +44,7 @@ include!("runner_tunables.rs");
 include!("runner_process_evidence.rs");
 include!("runner_commit_evidence.rs");
 include!("runner_maintenance.rs");
+include!("runner_catalog_registration.rs");
 include!("runner_wal.rs");
 include!("runner_overload.rs");
 include!("runner_fixture.rs");
@@ -1318,6 +1319,7 @@ impl Platform for AksPlatform {
             now_unix_ms,
         )
         .await?;
+        run_aks_catalog_registration_job(config, self, run_id).await?;
         start_aks_maintenance(config).await?;
         if maintenance_enabled(config) {
             let resources = config.effective_aks_resources();
@@ -4090,7 +4092,12 @@ async fn run_matrix_cell(
         .await?;
     let before_clients_ms = timing_budget
         .minimum_pin_ttl_ms
-        .saturating_sub(crate::config::PIN_INIT_SETUP_TIMEOUT_SECONDS.saturating_mul(1_000));
+        .saturating_sub(crate::config::PIN_INIT_SETUP_TIMEOUT_SECONDS.saturating_mul(1_000))
+        .saturating_sub(
+            config
+                .catalog_registration_setup_timeout_seconds()
+                .saturating_mul(1_000),
+        );
     require_lifecycle_remaining(
         lifecycle_deadline,
         Duration::from_millis(before_clients_ms),
@@ -12113,6 +12120,7 @@ async fn apply_runtime_evidence_retention(directory: &Path, retention: RuntimeEv
             for name in [
                 "run-table-initializer-job.json",
                 "run-table-initializer-termination.json",
+                "run-table-catalog-registration.json",
             ] {
                 let path = directory.join(name);
                 if path.try_exists().context("inspect retained initializer evidence")? {

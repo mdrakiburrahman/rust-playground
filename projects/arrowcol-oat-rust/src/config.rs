@@ -358,6 +358,7 @@ fn default_schedule_lead_seconds() -> u64 {
 const MAX_CLIENT_SCHEDULE_WAIT_SECONDS: u64 = 2_160;
 pub(crate) const AKS_RESOURCE_COUNTER_SNAPSHOT_TIMEOUT_MS: u64 = 5_000;
 pub(crate) const PIN_INIT_SETUP_TIMEOUT_SECONDS: u64 = 180;
+pub(crate) const CATALOG_REGISTRATION_SETUP_TIMEOUT_SECONDS: u64 = 180;
 const CLIENT_JOB_CLEANUP_GRACE_SECONDS: u64 = 300;
 const DEFAULT_WAL_RETENTION_SIZE_CAP_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
@@ -681,6 +682,14 @@ impl OatConfig {
         Ok(())
     }
 
+    pub(crate) fn catalog_registration_setup_timeout_seconds(&self) -> u64 {
+        if self.platform.kind == OatMode::Aks && self.campaign_profile == Some(CampaignProfile::ScaleOutSingleTable) {
+            CATALOG_REGISTRATION_SETUP_TIMEOUT_SECONDS
+        } else {
+            0
+        }
+    }
+
     pub(crate) fn timing_budget(&self) -> Result<RunTimingBudget> {
         if !(1..=1_800).contains(&self.schedule_lead_seconds) {
             bail!("schedule_lead_seconds must be between 1 and 1800");
@@ -702,6 +711,7 @@ impl OatConfig {
             .context("OAT client Job lifetime budget overflow")?;
         let minimum_pin_ttl_ms = client_job_lifetime_seconds
             .checked_add(PIN_INIT_SETUP_TIMEOUT_SECONDS)
+            .and_then(|seconds| seconds.checked_add(self.catalog_registration_setup_timeout_seconds()))
             .and_then(|seconds| seconds.checked_add(self.reconciliation_settle_timeout_seconds))
             .and_then(|seconds| seconds.checked_add(self.collector_stop_grace_seconds))
             .and_then(|seconds| seconds.checked_add(self.qap_timeout_seconds))

@@ -21,10 +21,35 @@ const MIGRATOR_USERNAME: &str = "arrowcol_migrator";
 
 #[derive(Debug, Parser)]
 struct Cli {
-    #[arg(long)]
-    config: PathBuf,
-    #[arg(long)]
-    migrator_password_file: PathBuf,
+    #[arg(
+        long,
+        required_unless_present = "register_only_config",
+        conflicts_with = "register_only_config"
+    )]
+    config: Option<PathBuf>,
+    #[arg(
+        long,
+        required_unless_present = "register_only_config",
+        conflicts_with = "register_only_config"
+    )]
+    migrator_password_file: Option<PathBuf>,
+    #[arg(long, requires_all = ["edge_secret_file", "internal_secret_file"])]
+    register_only_config: Option<PathBuf>,
+    #[arg(long, requires = "register_only_config")]
+    edge_secret_file: Option<PathBuf>,
+    #[arg(long, requires = "register_only_config")]
+    internal_secret_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegisterOnlyConfig {
+    schema_version: u32,
+    run_id: String,
+    table: String,
+    delta_root: String,
+    endpoint: String,
+    catalog_endpoint: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -68,8 +93,25 @@ struct SqlServerConfig {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let bytes = std::fs::read(&cli.config)
-        .with_context(|| format!("read OAT pin initialization config {}", cli.config.display()))?;
+    if let Some(path) = cli.register_only_config {
+        let config: RegisterOnlyConfig = serde_json::from_slice(
+            &std::fs::read(&path).with_context(|| format!("read catalog registration config {}", path.display()))?,
+        )
+        .context("parse catalog registration config")?;
+        let receipt = register_run_table(
+            &config,
+            &cli.edge_secret_file
+                .context("catalog registration requires the client edge signing key")?,
+            &cli.internal_secret_file
+                .context("catalog readback requires the client internal signing key")?,
+        )
+        .await?;
+        println!("{receipt}");
+        return Ok(());
+    }
+    let path = cli.config.context("pin initialization config is required")?;
+    let bytes =
+        std::fs::read(&path).with_context(|| format!("read OAT pin initialization config {}", path.display()))?;
     let config: PinInitConfig = serde_json::from_slice(&bytes).context("parse OAT pin initialization config")?;
     let expected = validate_config(&config)?;
     let actual_digest = config.expected_digest.as_str();
@@ -82,7 +124,8 @@ async fn main() -> Result<()> {
         config.sql_server.port,
         DATABASE,
         MIGRATOR_USERNAME,
-        &cli.migrator_password_file,
+        &cli.migrator_password_file
+            .context("pin initialization migrator password file is required")?,
     )?
     .trust_server_certificate(config.sql_server.trust_server_certificate)
     .with_timeouts(Duration::from_secs(15), Duration::from_secs(30));
@@ -116,6 +159,90 @@ async fn main() -> Result<()> {
         actual_digest
     );
     Ok(())
+}
+
+fn validate_register_only_config(config: &RegisterOnlyConfig) -> Result<Url> {
+    let run_id = Uuid::parse_str(&config.run_id).context("registration requires a UUID run_id")?;
+    let root = Url::parse(&config.delta_root).context("parse registration Delta root")?;
+    if config.schema_version != 1
+        || run_id.to_string() != config.run_id
+        || config.table != HOT_RUN_TABLE
+        || !matches!(root.scheme(), "abfss" | "file")
+        || root.password().is_some()
+        || root.query().is_some()
+        || root.fragment().is_some()
+        || !root.path().ends_with(&format!("/runs/{run_id}/dataflow"))
+    {
+        bail!("catalog registration requires the exact canonical hot table and run-scoped Dataflow root");
+    }
+    for endpoint in [&config.endpoint, &config.catalog_endpoint] {
+        let endpoint = Url::parse(endpoint).context("parse registration service endpoint")?;
+        if endpoint.scheme() != "http"
+            || endpoint.host_str().is_none()
+            || !endpoint.username().is_empty()
+            || endpoint.password().is_some()
+            || endpoint.query().is_some()
+            || endpoint.fragment().is_some()
+            || endpoint.path() != "/"
+        {
+            bail!("catalog registration endpoints must be plain credential-free HTTP service URLs");
+        }
+    }
+    Ok(arrowcol_loadgen::initialize::canonical_table_target(&root, &config.table)?.0)
+}
+
+async fn register_run_table(
+    config: &RegisterOnlyConfig,
+    edge_secret_file: &std::path::Path,
+    internal_secret_file: &std::path::Path,
+) -> Result<serde_json::Value> {
+    let expected_location = validate_register_only_config(config)?;
+    let completion =
+        collector_chain::dmv::register_table_authenticated(&config.endpoint, &config.table, edge_secret_file)
+            .await
+            .context("register the initialized run table through the DMV client Flight SQL route")?;
+    let snapshot = arrowcol_loadgen::initialize::catalog_snapshot(&config.catalog_endpoint, internal_secret_file)
+        .await
+        .context("read back catalog registration through signed GetSnapshot")?;
+    let [cached] = snapshot.as_slice() else {
+        bail!("catalog registration snapshot must contain exactly the canonical run table");
+    };
+    let table = &cached.snapshot;
+    let head = cached
+        .versions
+        .last()
+        .context("catalog registration snapshot has no schema history")?;
+    let actual_location = if std::path::Path::new(&table.location).is_absolute() {
+        Url::from_directory_path(&table.location).map_err(|()| anyhow::anyhow!("invalid catalog table directory"))?
+    } else {
+        Url::parse(&table.location).context("invalid catalog registration location URL")?
+    };
+    if head.identity().to_string() != config.table
+        || table.provider != "delta"
+        || actual_location.as_str().trim_end_matches('/') != expected_location.as_str().trim_end_matches('/')
+        || head.version() != completion.schema_version()
+        || head.fingerprint() != completion.schema_fingerprint()
+        || head.metadata().provider != table.provider
+        || head.metadata().location.as_deref() != Some(table.location.as_str())
+        || head
+            .metadata()
+            .properties
+            .iter()
+            .any(|(key, value)| table.properties.get(key) != Some(value))
+        || head.metadata().properties.len() != table.properties.len()
+    {
+        bail!("catalog registration readback does not prove the exact canonical schema at the run-scoped location");
+    }
+    Ok(serde_json::json!({
+        "kind": "oat_run_table_registered",
+        "run_id": config.run_id,
+        "table": head.identity().to_string(),
+        "location": table.location,
+        "provider": table.provider,
+        "schema_version": completion.schema_version().get(),
+        "schema_fingerprint": completion.schema_fingerprint().to_string(),
+        "catalog_table_count": snapshot.len(),
+    }))
 }
 
 fn validate_config(config: &PinInitConfig) -> Result<Vec<LeaseKey>> {
@@ -290,6 +417,51 @@ fn unix_time_ms() -> Result<UnixMillis> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn register_only_mode_is_run_bound_and_does_not_require_migrator_credentials() -> Result<()> {
+        let run_id = "00000000-0000-0000-0000-000000000001";
+        let mut config = RegisterOnlyConfig {
+            schema_version: 1,
+            run_id: run_id.to_owned(),
+            table: HOT_RUN_TABLE.to_owned(),
+            delta_root: format!("file:///tmp/oat/runs/{run_id}/dataflow"),
+            endpoint: "http://router:50050".to_owned(),
+            catalog_endpoint: "http://catalog:8817".to_owned(),
+        };
+        validate_register_only_config(&config)?;
+        config.endpoint = "http://user:password@router:50050".to_owned();
+        assert!(validate_register_only_config(&config).is_err());
+        config.endpoint = "http://router:50050".to_owned();
+        config.run_id = "00000000-0000-0000-0000-000000000002".to_owned();
+        assert!(validate_register_only_config(&config).is_err());
+        config.run_id = run_id.to_owned();
+        config.table = "telemetry.sqlserver.sqlserver_wait_stats".to_owned();
+        assert!(validate_register_only_config(&config).is_err());
+        let args = [
+            "pin-init",
+            "--register-only-config",
+            "register.json",
+            "--edge-secret-file",
+            "edge",
+            "--internal-secret-file",
+            "internal",
+        ];
+        assert!(Cli::try_parse_from(args)?.migrator_password_file.is_none());
+        assert!(Cli::try_parse_from(&args[..5]).is_err());
+        assert!(Cli::try_parse_from(["pin-init", "--config", "pins.json"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "pin-init",
+                "--config",
+                "pins.json",
+                "--migrator-password-file",
+                "password"
+            ])
+            .is_ok()
+        );
+        Ok(())
+    }
 
     fn config() -> Result<PinInitConfig> {
         let key = LeaseKey::new(
