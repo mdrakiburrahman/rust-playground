@@ -1856,11 +1856,31 @@ mod measurement_evidence_tests {
         assert_eq!(output["workers"][0]["retried_streams"], 0);
         assert_eq!(output["measurement_window"]["ambiguous_rows"], 0);
         assert_eq!(output["process_cumulative"]["ambiguous_rows"], 0);
-        snapshots[1].preparation = Some(json!({
+        let prepared = json!({
             "corpus_rows": 65_536,
+            "corpus_uncompressed_flight_data_bytes": 535_000,
+            "corpus_configured_ipc_compression_flight_data_bytes": 500_000,
+            "corpus_uncompressed_ipc_bytes": 535_000,
+            "corpus_encoded_bytes": 500_000,
+            "retained_encoded_bytes": 500_000,
             "memory_reservation_bytes": 1_000_000,
+            "corpus_memory_reservation_bytes": 700_000,
+            "live_identity_batch_bytes": 150_000,
+            "live_identity_batch_reservation_bytes": 300_000,
+            "configured_live_slots": 2,
+            "admitted_live_slots": 2,
+            "max_memory_bytes": 2_000_000,
+            "generation_wall_seconds": 0.1,
+            "generation_cpu_seconds": 0.05,
+            "encoding_cpu_seconds": 0.04,
+            "preparation_cpu_seconds": 0.09,
+            "generation_cpu_scope": "caller_thread_linux_schedstat_null_on_other_platforms",
+            "encoding_wall_seconds": 0.1,
+            "preparation_wall_seconds": 0.3,
+            "generator_rows_per_second": 655_360.0,
             "steady_state_generation": true,
-        }));
+        });
+        snapshots[1].preparation = Some(prepared.clone());
         let realistic = client_snapshot_delta(&snapshots, ClientDataProfile::Realistic)?;
         assert_eq!(realistic["preparation"]["steady_state_generation"], true);
         assert_eq!(realistic["preparation"]["corpus_rows"], 65_536);
@@ -1876,6 +1896,25 @@ mod measurement_evidence_tests {
         snapshots[1].preparation = None;
         assert!(client_snapshot_delta(&snapshots, ClientDataProfile::Realistic).is_err());
         assert!(client_snapshot_delta(&snapshots, ClientDataProfile::Diagnostic)?["preparation"].is_null());
+        let mut accepted = Vec::new();
+        snapshots[1].preparation = Some(json!({"steady_state_generation": true}));
+        if client_snapshot_delta(&snapshots, ClientDataProfile::Realistic).is_ok() {
+            accepted.push("flag only".to_owned());
+        }
+        for key in ["corpus_rows", "corpus_encoded_bytes", "retained_encoded_bytes", "memory_reservation_bytes"] {
+            let mut missing = prepared.clone();
+            missing.as_object_mut().context("test preparation")?.remove(key);
+            let mut zero = prepared.clone();
+            zero[key] = json!(0);
+            for (case, preparation) in [("missing", missing), ("zero", zero)] {
+                snapshots[1].preparation = Some(preparation);
+                if client_snapshot_delta(&snapshots, ClientDataProfile::Realistic).is_ok() {
+                    accepted.push(format!("{case} {key}"));
+                }
+            }
+        }
+        if client_phase_evidence("", ClientDataProfile::Realistic).is_ok() { accepted.push("no phase counters".to_owned()); }
+        assert!(accepted.is_empty(), "accepted invalid Realistic preparation: {accepted:?}");
         Ok(())
     }
 
@@ -2048,6 +2087,11 @@ fn client_preparation(value: Option<&Value>, data_profile: ClientDataProfile) ->
             result.insert("steady_state_generation".to_owned(), value.clone());
         }
         (ClientDataProfile::Realistic, Some(value)) if value.as_bool() == Some(true) => {
+            for key in ["corpus_rows", "corpus_encoded_bytes", "retained_encoded_bytes", "memory_reservation_bytes"] {
+                if result.get(key).and_then(Value::as_u64).is_none_or(|value| value == 0) {
+                    bail!("realistic client must report positive prepared-corpus {key}");
+                }
+            }
             result.insert("steady_state_generation".to_owned(), value.clone());
         }
         (ClientDataProfile::Diagnostic, _) => bail!("unexpected hot-path generation in prepared client"),
@@ -2064,6 +2108,9 @@ fn client_phase_evidence(output: &str, data_profile: ClientDataProfile) -> Resul
         .collect::<std::result::Result<Vec<_>, _>>()
         .context("invalid client counter snapshot")?;
     if snapshots.is_empty() {
+        if data_profile == ClientDataProfile::Realistic {
+            bail!("realistic client did not report prepared phase counters");
+        }
         return Ok(json!({ "unavailable_reason": "client_did_not_report_phase_counters" }));
     }
     client_snapshot_delta(&snapshots, data_profile)
