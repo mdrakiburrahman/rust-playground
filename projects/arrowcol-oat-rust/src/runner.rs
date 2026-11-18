@@ -2839,9 +2839,7 @@ async fn poll_aks_client_fleet(
             bail!("AKS client fleet poll received a non-AKS process handle");
         };
         let (completed, failed) = states.get(job_name).copied().unwrap_or_default();
-        let output = logs
-            .lines()
-            .filter(|line| line.contains(job_name))
+        let output = aks_client_job_log_payloads(&logs, job_name)
             .collect::<Vec<_>>()
             .join("\n");
         progress.push(ClientProgress {
@@ -2853,6 +2851,37 @@ async fn poll_aks_client_fleet(
         });
     }
     Ok(progress)
+}
+
+fn aks_client_job_log_payloads<'a>(logs: &'a str, job_name: &str) -> impl Iterator<Item = &'a str> {
+    let prefix = format!("[pod/{job_name}-");
+    logs.lines().filter_map(move |line| {
+        let (suffix, payload) = line.strip_prefix(&prefix)?.split_once("/client] ")?;
+        (!suffix.is_empty()
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit()))
+        .then_some(payload)
+    })
+}
+
+#[cfg(test)]
+#[test]
+fn aks_fleet_log_prefix_never_credits_another_client_with_readiness_or_schedule() {
+    let logs = concat!(
+        "[pod/oat-run-hot-c10-b4321/client] OAT_CLIENT_READY 10\n",
+        "[pod/oat-run-hot-c10-b4321/client] OAT_SCHEDULE_RECEIVED 10\n",
+        "[pod/foreign-abcde/client] oat-run-hot-c1 OAT_CLIENT_READY foreign\n",
+        "[pod/oat-run-hot-c1-a1234/client] waiting for schedule\n",
+    );
+    assert_eq!(
+        aks_client_job_log_payloads(logs, "oat-run-hot-c1").collect::<Vec<_>>(),
+        ["waiting for schedule"]
+    );
+    assert_eq!(
+        aks_client_job_log_payloads(logs, "oat-run-hot-c10").collect::<Vec<_>>(),
+        ["OAT_CLIENT_READY 10", "OAT_SCHEDULE_RECEIVED 10"]
+    );
 }
 
 async fn finish_aks_client_job(config: &OatConfig, handle: ClientHandle) -> Result<String> {
