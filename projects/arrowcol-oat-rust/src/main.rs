@@ -129,17 +129,7 @@ async fn start_run(
             .into_response()
     })?;
     let id = uuid::Uuid::new_v4().to_string();
-    let status = RunStatus {
-        id: id.clone(),
-        config_sha256,
-        state: RunState::Queued,
-        progress: "queued".to_owned(),
-        result_count: 0,
-        error: None,
-        started_at_unix_ms: unix_time_ms(),
-        finished_at_unix_ms: None,
-        local_teardown: None,
-    };
+    let status = RunStatus::queued(id.clone(), config_sha256);
     state.runs.lock().await.insert(id.clone(), status.clone());
 
     let local = config.platform.kind == OatMode::Local;
@@ -171,14 +161,7 @@ async fn start_run(
             }
             Err(error) => {
                 tracing::error!(run_id = %id, error = %error, "OAT run failed");
-                task_state
-                    .update(&id, |status| {
-                        status.state = RunState::Failed;
-                        status.progress = "failed".to_owned();
-                        status.error = Some(format!("{error:#}"));
-                        status.finished_at_unix_ms = Some(unix_time_ms());
-                    })
-                    .await;
+                task_state.finish_failed_run(&id, format!("{error:#}")).await;
             }
         }
     });

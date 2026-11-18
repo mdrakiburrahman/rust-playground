@@ -2930,7 +2930,10 @@ pub async fn execute(
 
     state
         .update(id, |status| {
-            status.progress = "writing compact Parquet results".to_owned()
+            status.progress = "writing compact Parquet results".to_owned();
+            if outcome.aks_cleanup_confirmed {
+                status.aks_cleanup_resolved = true;
+            }
         })
         .await;
     let result_count = outcome.rows.len();
@@ -2951,6 +2954,7 @@ struct MatrixOutcome {
     rows: Vec<OatResult>,
     error: Option<anyhow::Error>,
     cancelled: bool,
+    aks_cleanup_confirmed: bool,
 }
 
 async fn publish_matrix_outcome(config: &OatConfig, outcome: MatrixOutcome) -> Result<()> {
@@ -3121,6 +3125,8 @@ where
     Fut: std::future::Future<Output = MatrixOutcome>,
 {
     let mut results = Vec::new();
+    let mut saw_cell = false;
+    let mut aks_cleanup_confirmed = true;
     let cells = matrix_cell_specs(config);
     let total = cells.len();
     for (completed, (replicas, concurrency, clients, run_id)) in cells.into_iter().enumerate() {
@@ -3138,22 +3144,29 @@ where
                 cell_config.clients_per_table = clients;
                 run_cell(cell_config, run_id.clone(), replicas, concurrency).await
             }
-            Err(error) => finish_matrix_cell(
-                config,
-                orchestration_id,
-                &run_id,
-                replicas,
-                concurrency,
-                Err(error),
-                Ok(()),
-            ),
+            Err(error) => {
+                let mut cell = finish_matrix_cell(
+                    config,
+                    orchestration_id,
+                    &run_id,
+                    replicas,
+                    concurrency,
+                    Err(error),
+                    Ok(()),
+                );
+                cell.aks_cleanup_confirmed = false;
+                cell
+            }
         };
+        saw_cell = true;
+        aks_cleanup_confirmed &= cell.aks_cleanup_confirmed;
         results.append(&mut cell.rows);
         if cell.cancelled {
             return MatrixOutcome {
                 rows: results,
                 error: None,
                 cancelled: true,
+                aks_cleanup_confirmed: saw_cell && aks_cleanup_confirmed,
             };
         }
         if cell.error.is_some() {
@@ -3161,6 +3174,7 @@ where
                 rows: results,
                 error: cell.error,
                 cancelled: false,
+                aks_cleanup_confirmed: saw_cell && aks_cleanup_confirmed,
             };
         }
     }
@@ -3168,6 +3182,7 @@ where
         rows: results,
         error: None,
         cancelled: false,
+        aks_cleanup_confirmed: saw_cell && aks_cleanup_confirmed,
     }
 }
 
@@ -3286,7 +3301,7 @@ async fn run_isolated_cell(
     let mut platform = match platform_for_run(&config, &run_id) {
         Ok(platform) => platform,
         Err(error) => {
-            return finish_matrix_cell(
+            let mut outcome = finish_matrix_cell(
                 &config,
                 orchestration_id,
                 &run_id,
@@ -3295,12 +3310,14 @@ async fn run_isolated_cell(
                 Err(error),
                 Ok(()),
             );
+            outcome.aks_cleanup_confirmed = false;
+            return outcome;
         }
     };
     let timing_budget = match config.timing_budget() {
         Ok(budget) => budget,
         Err(error) => {
-            return finish_matrix_cell(
+            let mut outcome = finish_matrix_cell(
                 &config,
                 orchestration_id,
                 &run_id,
@@ -3309,6 +3326,8 @@ async fn run_isolated_cell(
                 Err(error),
                 Ok(()),
             );
+            outcome.aks_cleanup_confirmed = false;
+            return outcome;
         }
     };
     let lifecycle_started_at = tokio::time::Instant::now();
@@ -3365,11 +3384,13 @@ async fn run_isolated_cell(
     }
     let cleanup = platform.cleanup(&config).await;
     let shutdown_drain_evidence = platform.shutdown_drain_evidence();
+    let aks_cleanup_confirmed = config.platform.kind == crate::config::OatMode::Aks && cleanup.is_ok();
     if cancelled && cleanup.is_ok() {
         return MatrixOutcome {
             rows: Vec::new(),
             error: None,
             cancelled: true,
+            aks_cleanup_confirmed,
         };
     }
     let mut outcome = finish_matrix_cell(
@@ -3478,6 +3499,7 @@ fn finish_matrix_cell(
     result: Result<Vec<OatResult>>,
     cleanup: Result<()>,
 ) -> MatrixOutcome {
+    let aks_cleanup_confirmed = config.platform.kind == crate::config::OatMode::Aks && cleanup.is_ok();
     let (mut rows, mut error) = match result {
         Ok(rows) => {
             let error = rows
@@ -3558,6 +3580,7 @@ fn finish_matrix_cell(
         rows,
         error,
         cancelled: false,
+        aks_cleanup_confirmed,
     }
 }
 
@@ -6552,6 +6575,7 @@ fn pin_init_config_json(
     now_unix_ms: u64,
     sql_host: &str,
     router_yaml: &str,
+    run_table: Option<(&str, &str)>,
 ) -> Result<String> {
     let parsed = uuid::Uuid::parse_str(run_id).context("pin initialization requires a UUID run ID")?;
     if parsed.to_string() != run_id {
@@ -6595,6 +6619,10 @@ fn pin_init_config_json(
             "port": 1433,
             "trust_server_certificate": true,
         },
+        "run_table": run_table.map(|(delta_root, table)| json!({
+            "delta_root": delta_root,
+            "table": table,
+        })),
     }))?)
 }
 
@@ -6617,6 +6645,7 @@ async fn run_local_pin_setup(
         now_unix_ms,
         "sqlserver",
         &router_yaml,
+        None,
     )?;
     let config_path = platform.state_dir.join("pin-init.json");
     write_private_secret(&config_path, &pin_config).context("write private local OAT pin initialization config")?;
@@ -6668,6 +6697,23 @@ async fn run_aks_pin_setup_job(
         .router_yaml
         .as_deref()
         .context("AKS pin initialization requires the exact rendered router config")?;
+    let run_table_owned = if config.campaign_profile == Some(crate::config::CampaignProfile::ScaleOutSingleTable) {
+        let [table] = config.tables.as_slice() else {
+            bail!("scale_out_single_table pin initialization requires exactly one hot table");
+        };
+        Some((
+            platform
+                .delta_root
+                .clone()
+                .context("scale-out run-scoped Delta root is unavailable")?,
+            canonical_dmv_table_name(table)?,
+        ))
+    } else {
+        None
+    };
+    let run_table = run_table_owned
+        .as_ref()
+        .map(|(root, table)| (root.as_str(), table.as_str()));
     let pin_config = pin_init_config_json(
         run_id,
         expected_keys_json,
@@ -6675,6 +6721,7 @@ async fn run_aks_pin_setup_job(
         now_unix_ms,
         "arrowcol-sql",
         router_yaml,
+        run_table,
     )?;
     let run_suffix = uuid::Uuid::parse_str(run_id)?.simple().to_string();
     let config_map_name = format!("oat-pin-init-config-{run_suffix}");
@@ -6691,7 +6738,33 @@ async fn run_aks_pin_setup_job(
         "requests": { "cpu": "100m", "memory": "128Mi" },
         "limits": { "cpu": "500m", "memory": "512Mi" },
     });
-    let payload = serde_json::to_vec(&json!({
+    let run_table_identity = run_table.is_some();
+    let pod_labels = if run_table_identity {
+        json!({ "labels": { "app": "arrowcol-oat-pin-init", "arrowcol-oat-run": run_suffix, "azure.workload.identity/use": "true" } })
+    } else {
+        json!({ "labels": labels })
+    };
+    let pod_env = if run_table_identity {
+        let root = platform
+            .delta_root
+            .as_deref()
+            .context("run-table initializer lost its Delta root")?;
+        let url = Url::parse(root).context("parse run-table initializer Delta root")?;
+        let account = url
+            .host_str()
+            .and_then(|host| host.split('.').next())
+            .context("Delta root has no storage account")?;
+        json!([
+            { "name": "ARROWCOL_AZURE_MODE", "value": "stamped" },
+            { "name": "ARROWCOL_DELTA_ROOT", "value": root },
+            { "name": "AZURE_STORAGE_ACCOUNT", "value": account },
+            { "name": "AZURE_STORAGE_CHECKPOINT_CONTAINER", "value": "checkpoints" },
+            { "name": "ARROWCOL_RESET_GENERATION", "valueFrom": { "secretKeyRef": { "name": "arrowcol-generation", "key": "generation" } } },
+        ])
+    } else {
+        json!([])
+    };
+    let mut payload_items = json!({
         "apiVersion": "v1",
         "kind": "List",
         "items": [{
@@ -6785,7 +6858,15 @@ async fn run_aks_pin_setup_job(
                 },
             },
         }],
-    }))?;
+    });
+    if run_table_identity {
+        let template = payload_items
+            .pointer_mut("/items/1/spec/template")
+            .context("pin-init Job template is missing")?;
+        template["metadata"] = pod_labels;
+        template["spec"]["containers"][0]["env"] = pod_env;
+    }
+    let payload = serde_json::to_vec(&payload_items)?;
     let mut manifest: Value = serde_json::from_slice(&payload).context("parse pin initialization resources")?;
     let items = manifest["items"]
         .as_array_mut()
@@ -6797,7 +6878,8 @@ async fn run_aks_pin_setup_job(
         .context("create finite AKS OAT pin initialization Job")?;
     record_applied_resource_uids(config, platform, &planned_resources).await?;
 
-    wait_for_aks_pin_setup(config, &job_name, run_id).await?;
+    let expected_table = run_table.map(|(_, table)| table);
+    wait_for_aks_pin_setup(config, &job_name, run_id, expected_table).await?;
     kubectl(
         config,
         vec![
@@ -6899,7 +6981,12 @@ fn pin_init_job_failure_diagnostics(job: &Value, pods: &Value) -> String {
     }
 }
 
-async fn wait_for_aks_pin_setup(config: &OatConfig, job_name: &str, run_id: &str) -> Result<()> {
+async fn wait_for_aks_pin_setup(
+    config: &OatConfig,
+    job_name: &str,
+    run_id: &str,
+    expected_table: Option<&str>,
+) -> Result<()> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(200);
     loop {
         let output = kubectl(
@@ -6973,6 +7060,32 @@ async fn wait_for_aks_pin_setup(config: &OatConfig, job_name: &str, run_id: &str
     .with_context(|| format!("read successful AKS OAT pin initialization Job {job_name} logs"))?;
     if !logs.contains(&format!("initialized OAT pin set run_id={run_id}")) {
         bail!("AKS OAT pin initialization Job {job_name} did not confirm the requested run ID");
+    }
+    if let Some(table) = expected_table {
+        validate_run_table_init_receipt(&logs, run_id, table)?;
+    }
+    Ok(())
+}
+
+fn validate_run_table_init_receipt(logs: &str, run_id: &str, table: &str) -> Result<()> {
+    let receipt = logs.lines().find_map(|line| {
+        serde_json::from_str::<Value>(line)
+            .ok()
+            .filter(|value| value["kind"] == "oat_run_table_initialized")
+    });
+    let receipt = receipt.context("pin-init Job did not emit a run-table initialization receipt")?;
+    if receipt["run_id"] != run_id
+        || receipt["table"] != table
+        || receipt["publisher_drained"] != true
+        || receipt["delta"]["table_id"].as_str().is_none_or(str::is_empty)
+        || receipt["delta"]["version"] != 0
+        || receipt["delta"]["active_files"] != 0
+        || receipt["delta"]["partition_columns"] != json!(["__arrowcol_ingestion"])
+        || receipt["delta"]["schema_json"].as_str().is_none_or(str::is_empty)
+    {
+        bail!(
+            "pin-init Job run-table receipt does not prove the exact empty canonical Delta table was initialized and drained"
+        );
     }
     Ok(())
 }
@@ -13847,6 +13960,7 @@ mod tests {
                     rows: Vec::new(),
                     error: None,
                     cancelled: true,
+                    aks_cleanup_confirmed: false,
                 })
             },
         )
@@ -13854,6 +13968,36 @@ mod tests {
         assert!(outcome.cancelled);
         assert!(outcome.error.is_none());
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cleanup_confirmation_requires_every_attempted_matrix_cell() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        config.replica_counts = vec![1, 2];
+        config.dfe_worker_concurrency = vec![1];
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let call_counter = std::sync::Arc::clone(&calls);
+        let outcome = run_matrix_with(
+            &config,
+            "11111111-1111-4111-8111-111111111111",
+            &AppState::default(),
+            move |_, _, _, _| {
+                let cell = call_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::future::ready(MatrixOutcome {
+                    rows: Vec::new(),
+                    error: (cell == 1).then(|| anyhow::anyhow!("second cell failed")),
+                    cancelled: false,
+                    aks_cleanup_confirmed: cell == 0,
+                })
+            },
+        )
+        .await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(outcome.error.is_some());
+        assert!(!outcome.aks_cleanup_confirmed);
         Ok(())
     }
 
@@ -14939,6 +15083,8 @@ mod tests {
                 started_at_unix_ms: 1,
                 finished_at_unix_ms: None,
                 local_teardown: None,
+                aks_cleanup_confirmed: None,
+                aks_cleanup_resolved: false,
             },
         );
         fs::write(&schedule_path, format!("{}\n", scheduled + 1))?;
@@ -15382,6 +15528,7 @@ mod tests {
             10_000,
             "sqlserver",
             &router_yaml,
+            None,
         )?)?;
         assert_eq!(config["schema_version"], 1);
         assert_eq!(config["run_id"], run_id);
@@ -15395,6 +15542,46 @@ mod tests {
         assert_eq!(config["routing_policy"]["warmup_ms"], 1000);
         assert!(config.get("password").is_none());
         assert!(config.get("username").is_none());
+        let delta_root =
+            format!("abfss://tables@arrowcollector1.dfs.core.windows.net/oat-prefix/runs/{run_id}/dataflow");
+        let config: Value = serde_json::from_str(&pin_init_config_json(
+            run_id,
+            &expected,
+            20_000,
+            10_000,
+            "sqlserver",
+            &router_yaml,
+            Some((&delta_root, "telemetry.sqlserver.sqlserver_availability_replica_states")),
+        )?)?;
+        assert_eq!(config["run_table"]["delta_root"], delta_root);
+        assert_eq!(
+            config["run_table"]["table"],
+            "telemetry.sqlserver.sqlserver_availability_replica_states"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn run_table_init_receipt_is_required_before_pin_setup_succeeds() -> Result<()> {
+        let run_id = "00000000-0000-0000-0000-000000000001";
+        let table = "telemetry.sqlserver.sqlserver_availability_replica_states";
+        let receipt = json!({
+            "kind": "oat_run_table_initialized",
+            "run_id": run_id,
+            "table": table,
+            "publisher_drained": true,
+            "delta": {
+                "table_id": "canonical-table-id",
+                "version": 0,
+                "active_files": 0,
+                "partition_columns": ["__arrowcol_ingestion"],
+                "schema_json": "{}",
+            },
+        });
+        let logs = format!("{}\ninitialized OAT pin set run_id={run_id}", receipt);
+        validate_run_table_init_receipt(&logs, run_id, table)?;
+        assert!(validate_run_table_init_receipt("initialized OAT pin set", run_id, table).is_err());
+        assert!(validate_run_table_init_receipt(&logs, "00000000-0000-0000-0000-000000000002", table).is_err());
         Ok(())
     }
 
@@ -15403,7 +15590,7 @@ mod tests {
         let expected = expected_pin_keys_json(&["sqlserver_wait_stats".to_owned()])?;
         let run_id = "00000000-0000-0000-0000-000000000001";
         let router_yaml = router_yaml_for_pin_test(run_id);
-        assert!(pin_init_config_json(run_id, &expected, 10_000, 10_000, "sqlserver", &router_yaml,).is_err());
+        assert!(pin_init_config_json(run_id, &expected, 10_000, 10_000, "sqlserver", &router_yaml, None).is_err());
         assert!(pin_init_config_json(
             run_id,
             r#"{"expected_keys":[],"expected_digest":"0000000000000000000000000000000000000000000000000000000000000000"}"#,
@@ -15411,10 +15598,22 @@ mod tests {
             10_000,
             "sqlserver",
             &router_yaml,
+            None,
         )
         .is_err());
         let mismatched_run_yaml = router_yaml_for_pin_test("00000000-0000-0000-0000-000000000002");
-        assert!(pin_init_config_json(run_id, &expected, 20_000, 10_000, "sqlserver", &mismatched_run_yaml).is_err());
+        assert!(
+            pin_init_config_json(
+                run_id,
+                &expected,
+                20_000,
+                10_000,
+                "sqlserver",
+                &mismatched_run_yaml,
+                None
+            )
+            .is_err()
+        );
         Ok(())
     }
 

@@ -1,4 +1,9 @@
 use anyhow::{Context, Result, bail};
+use arrow_deltalake::delta::{
+    DeltaTable, FreshTableReceipt, FreshTableTransport, INGESTION_PARTITION, PublicationFence, PublicationFenceContext,
+    PublicationFenceError, object_store_for_url,
+};
+use arrow_deltalake::publisher::{MutationRetries, PublisherSession};
 use arrowcol_protocol::{CatalogName, ImplementationPool, SchemaName, TableIdentity, TableName, UnixMillis};
 use arrowcol_routing::{
     LeaseKey, RoutingEngine, RoutingPolicy, SqlServerRoutingConfig, SqlServerRoutingStore, run_table_pin_set_digest,
@@ -8,6 +13,7 @@ use serde::Deserialize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use url::Url;
 use uuid::Uuid;
 
 const DATABASE: &str = "arrowcol";
@@ -31,6 +37,15 @@ struct PinInitConfig {
     expected_digest: String,
     routing_policy: RoutingPolicy,
     sql_server: SqlServerConfig,
+    #[serde(default)]
+    run_table: Option<RunTableInitialization>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunTableInitialization {
+    delta_root: String,
+    table: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -75,6 +90,19 @@ async fn main() -> Result<()> {
     let engine = RoutingEngine::new(Arc::new(store), config.routing_policy)
         .map_err(anyhow::Error::msg)
         .context("construct migrator-authenticated OAT routing engine")?;
+    if let Some(run_table) = config.run_table.as_ref() {
+        let receipt = initialize_fresh_run_table(run_table).await?;
+        println!(
+            "{}",
+            serde_json::json!({
+                "kind": "oat_run_table_initialized",
+                "run_id": config.run_id,
+                "table": run_table.table,
+                "publisher_drained": true,
+                "delta": receipt,
+            })
+        );
+    }
     engine
         .initialize_run_table_pins(&config.run_id, &expected, expires, now)
         .await
@@ -153,7 +181,90 @@ fn validate_config(config: &PinInitConfig) -> Result<Vec<LeaseKey>> {
     if actual_digest != config.expected_digest {
         bail!("OAT pin initialization table-set digest does not match expected_digest");
     }
+    validate_run_table_initialization(config.run_table.as_ref(), &config.run_id)?;
     Ok(keys)
+}
+
+const HOT_RUN_TABLE: &str = "telemetry.sqlserver.sqlserver_availability_replica_states";
+
+fn validate_run_table_initialization(run_table: Option<&RunTableInitialization>, run_id: &str) -> Result<()> {
+    let Some(run_table) = run_table else {
+        return Ok(());
+    };
+    let root = Url::parse(&run_table.delta_root).context("parse run-scoped table initialization root")?;
+    let expected_suffix = format!("/runs/{run_id}/dataflow");
+    if root.scheme() != "abfss"
+        || root.username().is_empty()
+        || root.password().is_some()
+        || root.query().is_some()
+        || root.fragment().is_some()
+        || !root.path().ends_with(&expected_suffix)
+        || root.path().contains('%')
+        || root.path().contains('\\')
+        || root
+            .path()
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+    {
+        bail!("run-table initialization root must be the exact credential-free run Dataflow root");
+    }
+    if run_table.table != HOT_RUN_TABLE {
+        bail!("run-table initialization only permits the canonical OAT hot table");
+    }
+    Ok(())
+}
+
+struct RunTableInitializationFence {
+    session: Arc<PublisherSession>,
+}
+
+impl PublicationFence for RunTableInitializationFence {
+    fn check_before_commit(&self, context: &PublicationFenceContext<'_>) -> Result<(), PublicationFenceError> {
+        if context.read_version() != 0 || context.proposed_version() != 0 || context.file_count() != 0 {
+            return Err(PublicationFenceError::stale(
+                "OAT run-table initialization permits only an empty version0 schema commit",
+            ));
+        }
+        self.session.check().map_err(|error| {
+            PublicationFenceError::check_failed(format!("OAT run-table publisher authority check failed: {error:#}"))
+        })
+    }
+}
+
+async fn initialize_fresh_run_table(run_table: &RunTableInitialization) -> Result<FreshTableReceipt> {
+    let root = Url::parse(&run_table.delta_root)?;
+    let (url, schema) = arrowcol_loadgen::initialize::canonical_table_target(&root, &run_table.table)?;
+    let store = object_store_for_url(&url)?;
+    let session = PublisherSession::open_async(&url).await?;
+    let fence = Arc::new(RunTableInitializationFence {
+        session: Arc::clone(&session),
+    });
+    let init_url = url.clone();
+    let init_session = Arc::clone(&session);
+    let initialization = tokio::task::spawn_blocking(move || {
+        DeltaTable::initialize_fresh_url_with_session(
+            init_url,
+            schema,
+            vec![INGESTION_PARTITION.to_owned()],
+            init_session,
+            fence,
+            FreshTableTransport {
+                store,
+                mutation_retries: MutationRetries::Disabled,
+            },
+        )
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("join run-table schema initialization: {error}"))?;
+    let drained = session.close_after_drain_async().await;
+    match (initialization, drained) {
+        (Ok(receipt), Ok(())) => Ok(receipt),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(error.context("drain run-table initializer publisher")),
+        (Err(error), Err(drain_error)) => {
+            Err(error.context(format!("run-table initializer publisher drain failed: {drain_error:#}")))
+        }
+    }
 }
 
 fn validate_expiry(config: &PinInitConfig, now: UnixMillis) -> Result<UnixMillis> {
@@ -209,6 +320,7 @@ mod tests {
                 port: 1433,
                 trust_server_certificate: true,
             },
+            run_table: None,
         })
     }
 
@@ -216,6 +328,17 @@ mod tests {
     fn pin_init_config_requires_matching_digest_and_validated_table_identities() -> Result<()> {
         let valid = config()?;
         assert_eq!(validate_config(&valid)?.len(), 1);
+        let run_id = "00000000-0000-0000-0000-000000000001";
+        let valid_run_table = RunTableInitialization {
+            delta_root: format!(
+                "abfss://tables@arrowcollector1.dfs.core.windows.net/oat-prefix/runs/{run_id}/dataflow"
+            ),
+            table: HOT_RUN_TABLE.to_owned(),
+        };
+        validate_run_table_initialization(Some(&valid_run_table), run_id)?;
+        let mut wrong_table = valid_run_table;
+        wrong_table.table = "telemetry.sqlserver.sqlserver_wait_stats".to_owned();
+        assert!(validate_run_table_initialization(Some(&wrong_table), run_id).is_err());
         assert_eq!(
             validate_expiry(&valid, UnixMillis::new(9_000)?)?,
             UnixMillis::new(10_000)?

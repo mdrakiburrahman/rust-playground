@@ -33,6 +33,28 @@ pub struct RunStatus {
     pub finished_at_unix_ms: Option<u128>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub local_teardown: Option<LocalTeardown>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aks_cleanup_confirmed: Option<bool>,
+    #[serde(skip)]
+    pub(crate) aks_cleanup_resolved: bool,
+}
+
+impl RunStatus {
+    pub fn queued(id: String, config_sha256: String) -> Self {
+        Self {
+            id,
+            config_sha256,
+            state: RunState::Queued,
+            progress: "queued".to_owned(),
+            result_count: 0,
+            error: None,
+            started_at_unix_ms: unix_time_ms(),
+            finished_at_unix_ms: None,
+            local_teardown: None,
+            aks_cleanup_confirmed: None,
+            aks_cleanup_resolved: false,
+        }
+    }
 }
 
 pub struct AppState {
@@ -102,6 +124,17 @@ impl AppState {
             update(status);
         }
     }
+
+    pub async fn finish_failed_run(&self, id: &str, error: String) {
+        self.update(id, |status| {
+            status.state = RunState::Failed;
+            status.progress = "failed".to_owned();
+            status.error = Some(error);
+            status.aks_cleanup_confirmed = status.aks_cleanup_resolved.then_some(true);
+            status.finished_at_unix_ms = Some(unix_time_ms());
+        })
+        .await;
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -130,6 +163,54 @@ mod tests {
         drop(first);
         assert!(state.try_start_run().is_some());
     }
+
+    #[tokio::test]
+    async fn failed_run_exposes_cleanup_confirmation_only_after_positive_resolution() -> anyhow::Result<()> {
+        let state = AppState::default();
+        let confirmed = RunStatus {
+            id: "confirmed".to_owned(),
+            config_sha256: "0".repeat(64),
+            state: RunState::Queued,
+            progress: "queued".to_owned(),
+            result_count: 0,
+            error: None,
+            started_at_unix_ms: unix_time_ms(),
+            finished_at_unix_ms: None,
+            local_teardown: None,
+            aks_cleanup_confirmed: None,
+            aks_cleanup_resolved: true,
+        };
+        let unconfirmed = RunStatus {
+            id: "unconfirmed".to_owned(),
+            aks_cleanup_resolved: false,
+            ..confirmed.clone()
+        };
+        let queued = serde_json::to_value(&confirmed)?;
+        assert!(queued.get("aks_cleanup_confirmed").is_none());
+        state.runs.lock().await.insert(confirmed.id.clone(), confirmed);
+        state.runs.lock().await.insert(unconfirmed.id.clone(), unconfirmed);
+
+        state
+            .finish_failed_run("confirmed", "benchmark failed".to_owned())
+            .await;
+        state
+            .finish_failed_run("unconfirmed", "benchmark failed".to_owned())
+            .await;
+        let runs = state.runs.lock().await;
+        let confirmed = runs
+            .get("confirmed")
+            .ok_or_else(|| anyhow::anyhow!("confirmed run missing"))?;
+        assert!(matches!(confirmed.state, RunState::Failed));
+        assert_eq!(confirmed.aks_cleanup_confirmed, Some(true));
+        assert_eq!(serde_json::to_value(confirmed)?["aks_cleanup_confirmed"], true);
+        assert!(confirmed.finished_at_unix_ms.is_some());
+        let unconfirmed = runs
+            .get("unconfirmed")
+            .ok_or_else(|| anyhow::anyhow!("unconfirmed run missing"))?;
+        assert!(matches!(unconfirmed.state, RunState::Failed));
+        assert_eq!(unconfirmed.aks_cleanup_confirmed, None);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -147,6 +228,8 @@ mod cancellation_tests {
             started_at_unix_ms: unix_time_ms(),
             finished_at_unix_ms: None,
             local_teardown: None,
+            aks_cleanup_confirmed: None,
+            aks_cleanup_resolved: false,
         }
     }
 

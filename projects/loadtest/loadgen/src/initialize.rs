@@ -456,6 +456,38 @@ fn canonical_entry(statement: &SchemaStatement) -> Result<(ManifestEntry, Arc<Sc
     ))
 }
 
+/// Resolve one canonical, ingestion-partitioned table under a run-scoped Dataflow root.
+///
+/// # Errors
+/// Rejects unknown tables and roots that are not plain Dataflow directory URLs.
+pub fn canonical_table_target(dataflow_root: &Url, table: &str) -> Result<(Url, Arc<Schema>)> {
+    if !matches!(dataflow_root.scheme(), "abfs" | "abfss" | "az" | "file")
+        || dataflow_root.query().is_some()
+        || dataflow_root.fragment().is_some()
+    {
+        bail!("canonical table target requires a plain local or ADLS Dataflow root");
+    }
+    let root_path = dataflow_root.path().trim_end_matches('/');
+    if root_path.rsplit('/').next() != Some("dataflow")
+        || root_path.contains(['\\', '%'])
+        || root_path.split('/').any(|part| matches!(part, "." | ".."))
+    {
+        bail!("canonical table target root must be a safe Dataflow directory");
+    }
+    let statement = schema_statements()?
+        .into_iter()
+        .find(|statement| statement.identity.to_string() == table)
+        .context("requested table is not in the canonical schema registry")?;
+    let (entry, schema) = canonical_entry(&statement)?;
+    let relative_path = entry
+        .relative_path
+        .strip_prefix("dataflow/")
+        .context("canonical table path is not relative to Dataflow")?;
+    let mut root = dataflow_root.clone();
+    root.set_path(&format!("{}/", root_path));
+    Ok((root.join(relative_path)?, schema))
+}
+
 /// Initialize only selected, fresh local table directories; existing tables are never opened.
 pub(crate) fn initialize_fresh_local(root: &Path, selected: &[String], statements: &[SchemaStatement]) -> Result<()> {
     let requested = selected.iter().cloned().collect::<BTreeSet<_>>();
@@ -661,6 +693,30 @@ mod tests {
         assert_eq!(maintenance.version()?, version);
         assert!(initialize_fresh_local(root.path(), &[table], &fixture).is_err());
         assert_eq!(fs::read(log)?, original);
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_table_target_uses_run_scoped_root_and_registry_schema() -> Result<()> {
+        let root = Url::parse(
+            "abfss://tables@arrowcollector1.dfs.core.windows.net/oat-prefix/runs/00000000-0000-0000-0000-000000000001/dataflow",
+        )?;
+        let (target, schema) =
+            canonical_table_target(&root, "telemetry.sqlserver.sqlserver_availability_replica_states")?;
+        assert_eq!(
+            target.as_str(),
+            "abfss://tables@arrowcollector1.dfs.core.windows.net/oat-prefix/runs/00000000-0000-0000-0000-000000000001/dataflow/telemetry/sqlserver/sqlserver_availability_replica_states"
+        );
+        assert!(schema.fields().iter().any(|field| field.name() == INGESTION));
+        assert!(canonical_table_target(&root, "unknown.table.name").is_err());
+        let non_dataflow = Url::parse("abfss://tables@arrowcollector1.dfs.core.windows.net/oat-prefix/runs/run/data")?;
+        assert!(
+            canonical_table_target(
+                &non_dataflow,
+                "telemetry.sqlserver.sqlserver_availability_replica_states"
+            )
+            .is_err()
+        );
         Ok(())
     }
 
