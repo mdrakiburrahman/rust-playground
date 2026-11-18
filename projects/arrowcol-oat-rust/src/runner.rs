@@ -4304,11 +4304,31 @@ fn result_rows(
     let mut rows = Vec::with_capacity(assigned_tables.len());
     for table in assigned_tables {
         let client = client_run.metrics.get(&table);
-        if client.is_none() && failure.is_none() {
+        let reconciliation_mismatch = config.campaign_profile
+            == Some(crate::config::CampaignProfile::ScaleOutSingleTable)
+            && client_run
+                .evidence
+                .durable_commits
+                .get(&table)
+                .and_then(|commit| commit.pointer("/delta_log_reconciliation/status"))
+                .and_then(Value::as_str)
+                == Some("mismatch");
+        let table_failure = if reconciliation_mismatch {
+            Some(match failure.as_deref() {
+                Some(failure) => format!("{failure}; exploratory_delta_log_reconciliation_mismatch"),
+                None => "exploratory_delta_log_reconciliation_mismatch".to_owned(),
+            })
+        } else {
+            failure.clone()
+        };
+        if client.is_none() && table_failure.is_none() {
             bail!("DMV client did not report measurements for {table}");
         }
         let owner = client_run.pinning.owners.get(&canonical_table_key(&table));
         let mut table_tunables = tunables.clone();
+        if reconciliation_mismatch {
+            table_tunables["failure"] = json!("exploratory_reconciliation_mismatch");
+        }
         table_tunables["collector_completion"] = json!({
             "evidence": if client.is_some_and(|client| client.completions.len() == config.clients_per_table) {
                 "reported"
@@ -4339,10 +4359,10 @@ fn result_rows(
             table_owner: owner.cloned(),
             pinning_ok,
             pinning_error: client_run.pinning.violation.clone(),
-            failure: failure.clone(),
+            failure: table_failure.clone(),
             status: if client_run.pinning.violation.is_some() {
                 "pinning_violation"
-            } else if failure.is_some() {
+            } else if table_failure.is_some() {
                 "failed"
             } else {
                 "succeeded"
@@ -4394,6 +4414,11 @@ fn result_rows(
                         "per_pod_cpu_scope": "one_collector_pod_profile_arithmetic_mean_of_measurement_window_samples",
                     });
                 }
+                if reconciliation_mismatch {
+                    evidence["ranking_metrics"] = Value::Null;
+                    evidence["ranking_eligible"] = Value::Bool(false);
+                    evidence["ranking_ineligible_reason"] = json!("exploratory_delta_log_reconciliation_mismatch");
+                }
                 if let Some(resource_evidence) = &resource_evidence {
                     evidence["aks_resources"] = resource_evidence.clone();
                 }
@@ -4404,7 +4429,11 @@ fn result_rows(
             table,
             rows: client.map(|client| client.rows),
             duration_ms: client.map(|client| client.duration_ms),
-            rows_per_second: client.map(|client| client.rows_per_second),
+            rows_per_second: if reconciliation_mismatch {
+                None
+            } else {
+                client.map(|client| client.rows_per_second)
+            },
             cpu_millicores: metrics.map(|metrics| metrics.cpu_millicores),
             memory_bytes: metrics.map(|metrics| metrics.memory_bytes),
             qap,
@@ -16405,6 +16434,102 @@ mod tests {
         let result: Value = serde_json::from_str(rows[0].evidence_json.as_deref().context("evidence")?)?;
         assert_eq!(result["durable_commits"]["output_throughput"]["rows_per_second"], 123.0);
         assert_eq!(result["downstream_status"], "unavailable");
+        Ok(())
+    }
+
+    #[test]
+    fn exploratory_delta_mismatch_fails_result_and_excludes_ranking() -> Result<()> {
+        let config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.aks.max-rows.json"
+        ))?;
+        let run = "fdba69d6-ae99-49e6-9c7a-f1a1044b8241";
+        let table = config.tables[0].clone();
+        let mut pinning = PinningReport::default();
+        pinning
+            .owners
+            .insert(canonical_table_key(&table), "collector".to_owned());
+        let mut evidence = CellEvidence::default();
+        evidence.durable_commits.insert(
+            table.clone(),
+            json!({
+                "run_cumulative_output": {"rows": 5, "commits": 1, "files": 1, "parquet_bytes": 500, "settled": true},
+                "delta_log_reconciliation": {
+                    "evidence_class": "d53_exploratory",
+                    "status": "mismatch",
+                    "delta_log_committed_rows": 5,
+                    "collector_event_rows": 5,
+                    "client_acknowledged_rows": 6,
+                    "delta_vs_acknowledged_rows": -1,
+                    "per_version": [{"delta_version": 0, "matched": true}],
+                },
+                "output_throughput": {
+                    "rows_per_second": 5.0,
+                    "input_bytes_per_second": 1_000_000_000.0,
+                    "parquet_bytes_per_second": 500.0,
+                    "compression_ratio": 2.0,
+                    "commits": 1,
+                    "window_seconds": 1.0,
+                    "parquet_bytes": 500,
+                    "files": 1,
+                    "measurement_start_unix_ms": 1,
+                    "measurement_end_unix_ms": 1001,
+                },
+            }),
+        );
+        let clients = ClientRun {
+            metrics: HashMap::from([(
+                table.clone(),
+                ClientMetrics {
+                    rows: 6,
+                    duration_ms: 1000,
+                    rows_per_second: 6.0,
+                    completions: Vec::new(),
+                },
+            )]),
+            pinning,
+            qap_tables: Vec::new(),
+            failure: None,
+            evidence,
+        };
+        let rows = result_rows(
+            &config,
+            "orchestration",
+            run,
+            1,
+            1,
+            CellMeasurements {
+                clients,
+                started_at_ms: 1,
+                qap: QapMetrics::default(),
+                resources: None,
+                resource_evidence: None,
+            },
+        )?;
+        assert_eq!(rows[0].status, "failed");
+        assert!(
+            rows[0]
+                .failure
+                .as_deref()
+                .is_some_and(|failure| failure.contains("exploratory_delta_log_reconciliation_mismatch"))
+        );
+        assert_eq!(rows[0].rows, Some(6));
+        assert!(rows[0].rows_per_second.is_none());
+        let result: Value = serde_json::from_str(rows[0].evidence_json.as_deref().context("result evidence")?)?;
+        assert_eq!(result["exploratory_delta_log_reconciliation"]["status"], "mismatch");
+        assert_eq!(
+            result["exploratory_delta_log_reconciliation"]["delta_log_committed_rows"],
+            5
+        );
+        assert_eq!(
+            result["exploratory_delta_log_reconciliation"]["client_acknowledged_rows"],
+            6
+        );
+        assert!(result["exploratory_delta_log_reconciliation"]["per_version"].is_array());
+        assert!(result["ranking_metrics"].is_null());
+        assert_eq!(result["ranking_eligible"], false);
+        let outcome = finish_matrix_cell(&config, "orchestration", run, 1, 1, Ok(rows), Ok(()));
+        assert!(outcome.error.is_some());
+        assert_eq!(outcome.rows[0].status, "failed");
         Ok(())
     }
 

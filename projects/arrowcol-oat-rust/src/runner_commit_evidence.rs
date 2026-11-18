@@ -554,13 +554,45 @@ fn parse_delta_log_adds(
     Ok(())
 }
 
-fn validate_delta_log_version_history(versions: &BTreeSet<u64>, checkpoint_seen: bool) -> Result<()> {
-    ensure!(!checkpoint_seen, "Delta log history contains a checkpoint and cannot prove complete run totals");
+fn parse_delta_checkpoint_version(filename: &str) -> Result<Option<u64>> {
+    let Some((version_text, suffix)) = filename.split_once(".checkpoint.") else {
+        return Ok(None);
+    };
+    ensure!(
+        version_text.len() == 20 && version_text.bytes().all(|byte| byte.is_ascii_digit()),
+        "Delta checkpoint filename has a noncanonical version"
+    );
+    let valid_suffix = suffix == "parquet"
+        || suffix.strip_suffix(".parquet").is_some_and(|parts| {
+            let segments = parts.split('.').collect::<Vec<_>>();
+            segments.len() == 2
+                && segments.iter().all(|segment| {
+                    segment.len() == 10 && segment.bytes().all(|byte| byte.is_ascii_digit())
+                })
+        });
+    ensure!(valid_suffix, "Delta checkpoint filename is malformed");
+    Ok(Some(version_text.parse::<u64>().context("Delta checkpoint version is invalid")?))
+}
+
+fn parse_last_checkpoint_version(contents: &[u8]) -> Result<u64> {
+    let checkpoint: Value = serde_json::from_slice(contents).context("invalid Delta _last_checkpoint JSON")?;
+    checkpoint
+        .get("version")
+        .and_then(Value::as_u64)
+        .context("Delta _last_checkpoint omitted its version")
+}
+
+fn validate_delta_log_version_history(versions: &BTreeSet<u64>, checkpoint_tips: &BTreeSet<u64>) -> Result<()> {
     ensure!(!versions.is_empty(), "Delta log history contains no commit JSON files");
     ensure!(versions.first() == Some(&0), "Delta log history does not begin at run-scoped version zero");
     ensure!(
         versions.iter().enumerate().all(|(index, version)| u64::try_from(index).ok() == Some(*version)),
         "Delta log history has a missing commit version"
+    );
+    let latest = versions.last().copied().context("Delta log history has no latest version")?;
+    ensure!(
+        checkpoint_tips.iter().all(|tip| *tip <= latest),
+        "Delta checkpoint tip is newer than verified JSON history"
     );
     Ok(())
 }
@@ -583,13 +615,22 @@ async fn read_delta_log_commits(delta_root: &str, table: &str) -> Result<Value> 
     let mut adds = BTreeMap::new();
     let mut log_files = 0_usize;
     let mut versions_seen = BTreeSet::new();
-    let mut checkpoint_seen = false;
+    let mut checkpoint_tips = BTreeSet::new();
     while let Some(meta) = stream.try_next().await? {
         let Some(filename) = meta.location.filename() else {
             continue;
         };
-        if filename == "_last_checkpoint" || filename.contains(".checkpoint.") {
-            checkpoint_seen = true;
+        if filename == "_last_checkpoint" {
+            ensure!(meta.size <= 64 * 1024, "Delta _last_checkpoint exceeds the 64 KiB evidence bound");
+            let contents = store.get(&meta.location).await?.bytes().await?;
+            ensure!(contents.len() <= 64 * 1024, "Delta _last_checkpoint exceeds the 64 KiB evidence bound");
+            checkpoint_tips.insert(parse_last_checkpoint_version(&contents)?);
+            continue;
+        }
+        if filename.contains(".checkpoint") {
+            let version = parse_delta_checkpoint_version(filename)?
+                .context("Delta checkpoint filename is malformed")?;
+            checkpoint_tips.insert(version);
             continue;
         }
         let Some(version_text) = filename.strip_suffix(".json") else {
@@ -606,7 +647,7 @@ async fn read_delta_log_commits(delta_root: &str, table: &str) -> Result<Value> 
         let contents = store.get(&meta.location).await?.bytes().await?;
         parse_delta_log_adds(version, &contents, &mut adds)?;
     }
-    validate_delta_log_version_history(&versions_seen, checkpoint_seen)?;
+    validate_delta_log_version_history(&versions_seen, &checkpoint_tips)?;
     let mut versions: BTreeMap<u64, (u64, u64, u64)> = BTreeMap::new();
     for ((version, _), add) in adds {
         let totals = versions.entry(version).or_default();
@@ -679,12 +720,27 @@ mod delta_log_evidence_tests {
     }
 
     #[test]
-    fn delta_log_history_requires_complete_uncheckpointed_run_versions() -> Result<()> {
-        assert!(validate_delta_log_version_history(&BTreeSet::new(), false).is_err());
-        assert!(validate_delta_log_version_history(&BTreeSet::from([0, 1, 2]), false).is_ok());
-        assert!(validate_delta_log_version_history(&BTreeSet::from([0, 2]), false).is_err());
-        assert!(validate_delta_log_version_history(&BTreeSet::from([1]), false).is_err());
-        assert!(validate_delta_log_version_history(&BTreeSet::from([0]), true).is_err());
+    fn delta_log_history_accepts_benign_checkpoint_only_with_complete_json() -> Result<()> {
+        let complete = BTreeSet::from([0, 1, 2]);
+        assert!(validate_delta_log_version_history(&complete, &BTreeSet::new()).is_ok());
+        assert!(validate_delta_log_version_history(&complete, &BTreeSet::from([2])).is_ok());
+        assert!(validate_delta_log_version_history(&complete, &BTreeSet::from([3])).is_err());
+        assert!(validate_delta_log_version_history(&BTreeSet::new(), &BTreeSet::from([0])).is_err());
+        assert!(validate_delta_log_version_history(&BTreeSet::from([0, 2]), &BTreeSet::from([1])).is_err());
+        assert!(validate_delta_log_version_history(&BTreeSet::from([1]), &BTreeSet::from([0])).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn delta_checkpoint_markers_require_canonical_metadata() -> Result<()> {
+        assert_eq!(parse_last_checkpoint_version(br#"{"version":2,"size":3}"#)?, 2);
+        assert!(parse_last_checkpoint_version(br#"{"size":3}"#).is_err());
+        assert_eq!(
+            parse_delta_checkpoint_version("00000000000000000002.checkpoint.0000000001.0000000002.parquet")?,
+            Some(2)
+        );
+        assert!(parse_delta_checkpoint_version("not-a-checkpoint.parquet").is_ok_and(|tip| tip.is_none()));
+        assert!(parse_delta_checkpoint_version("00000000000000000002.checkpoint.bad.parquet").is_err());
         Ok(())
     }
 
