@@ -259,7 +259,9 @@ mod tunable_injection_tests {
         config.dfe_deployment = "arrowcol".to_owned();
         config.dfe_container = "dataflow".to_owned();
         config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
-            "collector":{"exporter":{"authority_timeout":"10s"}}
+            "collector":{"exporter":{"authority_timeout":"10s"}},
+            "maintenance":{"enabled":true,"apply":true,
+                "operations":["purge","optimize","vacuum","checkpoint","prune_log"]}
         }))?;
         let mut runtime = json!({
             "namespace":"arrowcol-oat", "oatRunId":"00000000-0000-0000-0000-000000000003",
