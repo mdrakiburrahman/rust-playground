@@ -567,6 +567,7 @@ http.createServer((request, response) => {
             namespace_uid: None,
             runtime_dir: None,
             qap_relative_data_root: None,
+            delta_root: None,
             router_metrics_url: None,
             router_tunnel: None,
             fic_record_path: None,

@@ -161,11 +161,13 @@ fn run_cumulative_output(
         return Ok(json!({
             "scope": "all_new_ingestion_commits_from_this_cell_including_warmup",
             "rows": null,
+            "commits_by_version": [],
             "unavailable_reason": reason,
         }));
     }
     let mut rows = 0_u64;
     let mut commits = 0_u64;
+    let mut commits_by_version = Vec::new();
     for event in events
         .values()
         .filter(|event| event.table_name.as_deref() == Some(table))
@@ -175,6 +177,7 @@ fn run_cumulative_output(
                 return Ok(json!({
                     "scope": "all_new_ingestion_commits_from_this_cell_including_warmup",
                     "rows": null,
+                    "commits_by_version": [],
                     "unavailable_reason": "cumulative_commit_ingress_boundary_unavailable",
                 }));
             };
@@ -185,6 +188,7 @@ fn run_cumulative_output(
                 return Ok(json!({
                     "scope": "all_new_ingestion_commits_from_this_cell_including_warmup",
                     "rows": null,
+                    "commits_by_version": [],
                     "unavailable_reason": "commit_crosses_cell_ingress_boundary",
                 }));
             }
@@ -193,17 +197,33 @@ fn run_cumulative_output(
             return Ok(json!({
                 "scope": "all_new_ingestion_commits_from_this_cell_including_warmup",
                 "rows": null,
+                "commits_by_version": [],
                 "unavailable_reason": "cumulative_commit_rows_unavailable",
+            }));
+        };
+        let Some(delta_version) = event.delta_version else {
+            return Ok(json!({
+                "scope": "all_new_ingestion_commits_from_this_cell_including_warmup",
+                "rows": null,
+                "commits_by_version": [],
+                "unavailable_reason": "cumulative_commit_version_unavailable",
             }));
         };
         rows = rows.checked_add(event_rows).context("cumulative commit row overflow")?;
         commits = commits.checked_add(1).context("cumulative commit count overflow")?;
+        commits_by_version.push(json!({
+            "delta_version": delta_version,
+            "rows": event_rows,
+            "files": event.files,
+            "parquet_bytes": event.parquet_bytes,
+        }));
     }
     Ok(json!({
         "scope": "all_new_ingestion_commits_from_this_cell_including_warmup",
         "rows": rows,
         "commits": commits,
         "complete_delivery_established": false,
+        "commits_by_version": commits_by_version,
     }))
 }
 
@@ -477,6 +497,273 @@ fn durable_commit_evidence_for_cell(
         )?;
     }
     Ok(result)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DeltaLogAdd {
+    rows: u64,
+    bytes: u64,
+}
+
+fn parse_delta_log_adds(
+    version: u64,
+    contents: &[u8],
+    adds: &mut BTreeMap<(u64, String), DeltaLogAdd>,
+) -> Result<()> {
+    for (line_number, line) in contents.split(|byte| *byte == b'\n').enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+        let action: Value = serde_json::from_slice(line)
+            .with_context(|| format!("invalid Delta log JSON at line {}", line_number + 1))?;
+        let Some(add) = action.get("add") else {
+            continue;
+        };
+        match add.get("dataChange") {
+            None | Some(Value::Bool(true)) => {}
+            Some(Value::Bool(false)) => continue,
+            Some(_) => bail!("Delta add dataChange must be a boolean"),
+        }
+        let path = add
+            .get("path")
+            .and_then(Value::as_str)
+            .filter(|path| !path.is_empty())
+            .context("Delta add action omitted its path")?;
+        let stats = match add.get("stats") {
+            Some(Value::String(stats)) => serde_json::from_str::<Value>(stats)
+                .context("Delta add action has invalid stats JSON")?,
+            Some(Value::Object(_)) => add["stats"].clone(),
+            _ => bail!("Delta add action omitted row statistics"),
+        };
+        let rows = stats
+            .get("numRecords")
+            .and_then(Value::as_u64)
+            .context("Delta add statistics omitted numRecords")?;
+        let bytes = add
+            .get("size")
+            .and_then(Value::as_u64)
+            .context("Delta add action omitted file size")?;
+        let identity = (version, path.to_owned());
+        let record = DeltaLogAdd { rows, bytes };
+        if let Some(previous) = adds.insert(identity, record)
+            && previous != record
+        {
+            bail!("conflicting duplicate Delta add action");
+        }
+    }
+    Ok(())
+}
+
+fn validate_delta_log_version_history(versions: &BTreeSet<u64>, checkpoint_seen: bool) -> Result<()> {
+    ensure!(!checkpoint_seen, "Delta log history contains a checkpoint and cannot prove complete run totals");
+    ensure!(!versions.is_empty(), "Delta log history contains no commit JSON files");
+    ensure!(versions.first() == Some(&0), "Delta log history does not begin at run-scoped version zero");
+    ensure!(
+        versions.iter().enumerate().all(|(index, version)| u64::try_from(index).ok() == Some(*version)),
+        "Delta log history has a missing commit version"
+    );
+    Ok(())
+}
+
+async fn read_delta_log_commits(delta_root: &str, table: &str) -> Result<Value> {
+    use futures_util::TryStreamExt;
+    use object_store::ObjectStoreExt;
+
+    ensure!(
+        !table.is_empty() && table.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'),
+        "Delta evidence table path is not a canonical DMV name"
+    );
+    let mut url = Url::parse(delta_root).context("parse run-scoped Delta root")?;
+    ensure!(url.scheme() == "abfss" && url.query().is_none() && url.fragment().is_none(), "Delta evidence requires a plain run-scoped abfss URL");
+    let log_path = format!("{}/telemetry/sqlserver/{table}/_delta_log", url.path().trim_end_matches('/'));
+    url.set_path(&log_path);
+    let prefix = ObjectPath::from_url_path(url.path())?;
+    let store = object_store_for_url(&url)?;
+    let mut stream = store.list(Some(&prefix));
+    let mut adds = BTreeMap::new();
+    let mut log_files = 0_usize;
+    let mut versions_seen = BTreeSet::new();
+    let mut checkpoint_seen = false;
+    while let Some(meta) = stream.try_next().await? {
+        let Some(filename) = meta.location.filename() else {
+            continue;
+        };
+        if filename == "_last_checkpoint" || filename.contains(".checkpoint.") {
+            checkpoint_seen = true;
+            continue;
+        }
+        let Some(version_text) = filename.strip_suffix(".json") else {
+            continue;
+        };
+        if version_text.len() != 20 || !version_text.bytes().all(|byte| byte.is_ascii_digit()) {
+            bail!("Delta log JSON filename is not a canonical version");
+        }
+        let version = version_text.parse::<u64>().context("Delta log version is invalid")?;
+        ensure!(versions_seen.insert(version), "duplicate Delta log version file");
+        ensure!(meta.size <= 16 * 1024 * 1024, "Delta log JSON exceeds the 16 MiB evidence bound");
+        log_files = log_files.checked_add(1).context("Delta log file count overflow")?;
+        ensure!(log_files <= 10_000, "Delta log exceeds the 10,000-file evidence bound");
+        let contents = store.get(&meta.location).await?.bytes().await?;
+        parse_delta_log_adds(version, &contents, &mut adds)?;
+    }
+    validate_delta_log_version_history(&versions_seen, checkpoint_seen)?;
+    let mut versions: BTreeMap<u64, (u64, u64, u64)> = BTreeMap::new();
+    for ((version, _), add) in adds {
+        let totals = versions.entry(version).or_default();
+        totals.0 = totals.0.checked_add(add.rows).context("Delta log row count overflow")?;
+        totals.1 = totals.1.checked_add(1).context("Delta log file count overflow")?;
+        totals.2 = totals.2.checked_add(add.bytes).context("Delta log byte count overflow")?;
+    }
+    let (rows, files, bytes) = versions.values().try_fold((0_u64, 0_u64, 0_u64), |(rows, files, bytes), (version_rows, version_files, version_bytes)| {
+        Some((rows.checked_add(*version_rows)?, files.checked_add(*version_files)?, bytes.checked_add(*version_bytes)?))
+    }).context("Delta log total overflow")?;
+    Ok(json!({
+        "scope": "unique_data_change_true_add_actions_in_run_scoped_table_log",
+        "rows": rows,
+        "files": files,
+        "parquet_bytes": bytes,
+        "versions": versions.iter().map(|(version, (rows, files, bytes))| json!({
+            "delta_version": version, "rows": rows, "files": files, "parquet_bytes": bytes,
+        })).collect::<Vec<_>>(),
+    }))
+}
+
+#[cfg(test)]
+mod delta_log_evidence_tests {
+    use super::*;
+
+    #[test]
+    fn delta_log_add_parser_excludes_rewrites_and_deduplicates_paths() -> Result<()> {
+        let mut adds = BTreeMap::new();
+        let commit = br#"{"add":{"path":"part-1.parquet","size":20,"dataChange":true,"stats":"{\"numRecords\":5}"}}
+{"add":{"path":"part-1.parquet","size":20,"dataChange":true,"stats":"{\"numRecords\":5}"}}
+{"add":{"path":"compact.parquet","size":30,"dataChange":false,"stats":"{\"numRecords\":5}"}}"#;
+        parse_delta_log_adds(7, commit, &mut adds)?;
+        assert_eq!(adds, BTreeMap::from([((7, "part-1.parquet".to_owned()), DeltaLogAdd { rows: 5, bytes: 20 })]));
+        Ok(())
+    }
+
+    #[test]
+    fn exploratory_reconciliation_marks_mismatches_without_hiding_counts() {
+        let delta = json!({
+            "rows": 5,
+            "versions": [{"delta_version": 7, "rows": 5, "files": 1, "parquet_bytes": 20}],
+        });
+        let events = json!({
+            "rows": 5,
+            "commits_by_version": [{"delta_version": 7, "rows": 5, "files": 1, "parquet_bytes": 20}],
+        });
+        let matched = exploratory_delta_reconciliation(Some(&delta), Some(&events), Some(5), None);
+        assert_eq!(matched["status"], "matched");
+        assert_eq!(matched["delta_log_committed_rows"], 5);
+        assert_eq!(matched["client_acknowledged_rows"], 5);
+        assert_eq!(matched["qualification"], "not_qualifying");
+
+        let mismatch = exploratory_delta_reconciliation(Some(&delta), Some(&events), Some(6), None);
+        assert_eq!(mismatch["status"], "mismatch");
+        assert_eq!(mismatch["delta_vs_acknowledged_rows"], -1);
+        assert_eq!(mismatch["delta_log_committed_rows"], 5);
+
+        let unavailable = exploratory_delta_reconciliation(None, Some(&events), Some(5), Some("delta_log_read_failed"));
+        assert_eq!(unavailable["status"], "unavailable");
+        assert!(unavailable["delta_log_committed_rows"].is_null());
+    }
+
+    #[test]
+    fn exploratory_reconciliation_detects_per_version_commit_divergence() {
+        let delta = json!({"rows": 5, "versions": [{"delta_version": 7, "rows": 5, "files": 1, "parquet_bytes": 20}]});
+        let events = json!({"rows": 5, "commits_by_version": [{"delta_version": 7, "rows": 4, "files": 1, "parquet_bytes": 20}]});
+        let result = exploratory_delta_reconciliation(Some(&delta), Some(&events), Some(5), None);
+        assert_eq!(result["status"], "mismatch");
+        assert_eq!(result["per_version"][0]["matched"], false);
+    }
+
+    #[test]
+    fn delta_log_history_requires_complete_uncheckpointed_run_versions() -> Result<()> {
+        assert!(validate_delta_log_version_history(&BTreeSet::new(), false).is_err());
+        assert!(validate_delta_log_version_history(&BTreeSet::from([0, 1, 2]), false).is_ok());
+        assert!(validate_delta_log_version_history(&BTreeSet::from([0, 2]), false).is_err());
+        assert!(validate_delta_log_version_history(&BTreeSet::from([1]), false).is_err());
+        assert!(validate_delta_log_version_history(&BTreeSet::from([0]), true).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn delta_log_add_parser_rejects_missing_row_statistics() {
+        let mut adds = BTreeMap::new();
+        assert!(parse_delta_log_adds(1, br#"{"add":{"path":"part.parquet","size":20,"dataChange":true}}"#, &mut adds).is_err());
+    }
+}
+
+fn exploratory_delta_reconciliation(
+    delta_log: Option<&Value>,
+    commit_output: Option<&Value>,
+    client_acknowledged_rows: Option<u64>,
+    unavailable_reason: Option<&str>,
+) -> Value {
+    let delta_rows = delta_log.and_then(|value| value["rows"].as_u64());
+    let event_rows = commit_output.and_then(|value| value["rows"].as_u64());
+    let delta_vs_event_rows = delta_rows.zip(event_rows).map(|(delta, event)| i128::from(delta) - i128::from(event));
+    let delta_vs_acknowledged_rows = delta_rows
+        .zip(client_acknowledged_rows)
+        .map(|(delta, acknowledged)| i128::from(delta) - i128::from(acknowledged));
+    let delta_versions = delta_log.and_then(|value| value["versions"].as_array());
+    let event_versions = commit_output.and_then(|value| value["commits_by_version"].as_array());
+    let version_comparison = delta_versions.zip(event_versions).map(|(delta, events)| {
+        let mut delta_by_version = BTreeMap::new();
+        let mut event_by_version = BTreeMap::new();
+        let valid_delta = delta.iter().all(|version| {
+            let Some(number) = version["delta_version"].as_u64() else { return false; };
+            delta_by_version.insert(number, (version["rows"].as_u64(), version["files"].as_u64(), version["parquet_bytes"].as_u64())).is_none()
+        });
+        let valid_events = events.iter().all(|event| {
+            let Some(number) = event["delta_version"].as_u64() else { return false; };
+            event_by_version.insert(number, (event["rows"].as_u64(), event["files"].as_u64(), event["parquet_bytes"].as_u64())).is_none()
+        });
+        if !valid_delta || !valid_events {
+            return (None, json!([]));
+        }
+        let numbers = delta_by_version.keys().chain(event_by_version.keys()).copied().collect::<BTreeSet<_>>();
+        let mut comparisons = Vec::new();
+        let mut matched = true;
+        for number in numbers {
+            let delta = delta_by_version.get(&number).copied();
+            let event = event_by_version.get(&number).copied();
+            let equal = delta.is_some() && delta == event && delta.is_some_and(|(rows, files, bytes)| rows.is_some() && files.is_some() && bytes.is_some());
+            matched &= equal;
+            comparisons.push(json!({
+                "delta_version": number,
+                "delta_log": delta.map(|(rows, files, bytes)| json!({"rows": rows, "files": files, "parquet_bytes": bytes})),
+                "collector_event": event.map(|(rows, files, bytes)| json!({"rows": rows, "files": files, "parquet_bytes": bytes})),
+                "matched": equal,
+            }));
+        }
+        (Some(matched), json!(comparisons))
+    });
+    let versions_match = version_comparison.as_ref().and_then(|(matched, _)| *matched);
+    let ack_matches = delta_vs_acknowledged_rows.map(|delta| delta == 0);
+    let status = if versions_match == Some(false) || ack_matches == Some(false) {
+        "mismatch"
+    } else if delta_rows.is_some() && event_rows.is_some() && client_acknowledged_rows.is_some()
+        && versions_match == Some(true) && ack_matches == Some(true)
+    {
+        "matched"
+    } else {
+        "unavailable"
+    };
+    json!({
+        "evidence_class": "d53_exploratory",
+        "status": status,
+        "qualification": "not_qualifying",
+        "unavailable_reason": (status == "unavailable").then_some(unavailable_reason.unwrap_or("required_reconciliation_evidence_unavailable")),
+        "delta_log_committed_rows": delta_rows,
+        "collector_event_committed_rows": event_rows,
+        "client_acknowledged_rows": client_acknowledged_rows,
+        "delta_vs_collector_event_rows": delta_vs_event_rows,
+        "delta_vs_acknowledged_rows": delta_vs_acknowledged_rows,
+        "per_version": version_comparison.map(|(_, comparisons)| comparisons),
+        "scope": "unique_data_change_true_delta_adds_cross_checked_against_ingestion_only_commit_events_and_whole_run_client_acknowledgments_including_drain",
+    })
 }
 
 #[cfg(test)]

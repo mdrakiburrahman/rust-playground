@@ -571,6 +571,7 @@ fn fixture_platform(input: &FixtureSetupInput) -> AksPlatform {
         namespace_uid: None,
         runtime_dir: Some(input.runtime_directory.clone()),
         qap_relative_data_root: None,
+        delta_root: None,
         router_metrics_url: None,
         router_tunnel: None,
         fic_record_path: None,

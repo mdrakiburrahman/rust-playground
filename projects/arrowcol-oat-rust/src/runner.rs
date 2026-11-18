@@ -1013,6 +1013,9 @@ struct ClientProgress {
 trait Platform: Send + Sync {
     fn kind(&self) -> crate::config::OatMode;
     fn workload_endpoint(&self, config: &OatConfig) -> String;
+    fn delta_root(&self) -> Option<&str> {
+        None
+    }
     fn router_metrics_endpoint(&self, config: &OatConfig) -> Result<String>;
     async fn ensure_router_metrics_endpoint(&mut self, config: &OatConfig) -> Result<(String, bool)> {
         Ok((self.router_metrics_endpoint(config)?, false))
@@ -1121,6 +1124,7 @@ struct AksPlatform {
     namespace_uid: Option<String>,
     runtime_dir: Option<PathBuf>,
     qap_relative_data_root: Option<String>,
+    delta_root: Option<String>,
     router_metrics_url: Option<String>,
     router_tunnel: Option<OwnedKubectlProcess>,
     fic_record_path: Option<PathBuf>,
@@ -1224,6 +1228,10 @@ struct LocalPlatform {
 
 #[async_trait::async_trait]
 impl Platform for AksPlatform {
+    fn delta_root(&self) -> Option<&str> {
+        self.delta_root.as_deref()
+    }
+
     fn resource_evidence(&self) -> Option<Value> {
         Some(json!({
             "readbacks": self.resource_readback,
@@ -3115,18 +3123,21 @@ where
     let mut results = Vec::new();
     let cells = matrix_cell_specs(config);
     let total = cells.len();
-    for (completed, (replicas, concurrency, run_id)) in cells.into_iter().enumerate() {
+    for (completed, (replicas, concurrency, clients, run_id)) in cells.into_iter().enumerate() {
         state
             .update(orchestration_id, |status| {
                 status.local_teardown = None;
                 status.progress = format!(
-                    "experiment {}/{total}: ArrowCol replicas={replicas}, DFE --num-cores={concurrency}",
+                    "experiment {}/{total}: ArrowCol replicas={replicas}, DFE --num-cores={concurrency}, clients/table={clients}",
                     completed + 1
                 );
             })
             .await;
         let mut cell = match config_for_run(config, &run_id) {
-            Ok(cell_config) => run_cell(cell_config, run_id.clone(), replicas, concurrency).await,
+            Ok(mut cell_config) => {
+                cell_config.clients_per_table = clients;
+                run_cell(cell_config, run_id.clone(), replicas, concurrency).await
+            }
             Err(error) => finish_matrix_cell(
                 config,
                 orchestration_id,
@@ -3550,24 +3561,25 @@ fn finish_matrix_cell(
     }
 }
 
-fn matrix_cell_specs(config: &OatConfig) -> Vec<(u32, u32, String)> {
-    config
-        .replica_counts
-        .iter()
-        .flat_map(|replicas| {
-            config
-                .dfe_worker_concurrency
-                .iter()
-                .map(move |concurrency| (*replicas, *concurrency, uuid::Uuid::new_v4().to_string()))
-        })
-        .collect()
+fn matrix_cell_specs(config: &OatConfig) -> Vec<(u32, u32, usize, String)> {
+    let default_clients = [config.clients_per_table];
+    let client_counts = config.clients_per_table_sweep.as_deref().unwrap_or(&default_clients);
+    let mut cells = Vec::new();
+    for replicas in &config.replica_counts {
+        for concurrency in &config.dfe_worker_concurrency {
+            for clients in client_counts {
+                cells.push((*replicas, *concurrency, *clients, uuid::Uuid::new_v4().to_string()));
+            }
+        }
+    }
+    cells
 }
 
 fn platform_for_run(config: &OatConfig, run_id: &str) -> Result<Box<dyn Platform>> {
-    if config.campaign_profile == Some(crate::config::CampaignProfile::ScaleOutSingleTable) {
-        bail!(
-            "scale_out_single_table is blocked until runtime qualification and delivery reconciliation are implemented"
-        );
+    if config.campaign_profile == Some(crate::config::CampaignProfile::ScaleOutSingleTable)
+        && config.platform.kind == crate::config::OatMode::Local
+    {
+        bail!("scale_out_single_table exploratory runs require AKS");
     }
     if config.platform.kind == crate::config::OatMode::Aks
         && config.campaign_profile == Some(crate::config::CampaignProfile::SingleHotTable)
@@ -3590,6 +3602,7 @@ fn platform_for_run(config: &OatConfig, run_id: &str) -> Result<Box<dyn Platform
             namespace_uid: None,
             runtime_dir: None,
             qap_relative_data_root: None,
+            delta_root: None,
             router_metrics_url: None,
             router_tunnel: None,
             fic_record_path: None,
@@ -3860,6 +3873,68 @@ async fn settle_cell_commit_evidence(
                     .and_then(|value| value.get_mut("output_throughput"))
                 {
                     output["cell_scope"] = json!(cell_scope);
+                }
+            }
+            if config.campaign_profile == Some(crate::config::CampaignProfile::ScaleOutSingleTable) {
+                for table in &config.tables {
+                    let output = commits
+                        .get_mut(table)
+                        .and_then(|value| value.get_mut("run_cumulative_output"));
+                    let event_rows = output.and_then(|value| value["rows"].as_u64());
+                    let acknowledged = targets.get(table).copied().flatten();
+                    let delta_result = match platform.delta_root() {
+                        Some(root) => {
+                            match tokio::time::timeout(Duration::from_secs(30), read_delta_log_commits(root, table))
+                                .await
+                            {
+                                Ok(result) => result,
+                                Err(_) => Err(anyhow::anyhow!("Delta-log scan exceeded its 30-second bound")),
+                            }
+                        }
+                        None => Err(anyhow::anyhow!("run-scoped Delta root is unavailable")),
+                    };
+                    let (delta_log, unavailable_reason) = match delta_result {
+                        Ok(delta_log) => (Some(delta_log), None),
+                        Err(error) => {
+                            tracing::warn!(table, %error, "exploratory Delta-log reconciliation evidence is unavailable");
+                            (None, Some("delta_log_read_failed"))
+                        }
+                    };
+                    let commit_output = commits.get(table).and_then(|value| value.get("run_cumulative_output"));
+                    let reconciliation = exploratory_delta_reconciliation(
+                        delta_log.as_ref(),
+                        commit_output,
+                        acknowledged,
+                        unavailable_reason,
+                    );
+                    if let Some(commit) = commits.get_mut(table) {
+                        commit["delta_log_reconciliation"] = reconciliation;
+                        if let Some(output) = commit.get_mut("run_cumulative_output") {
+                            output["collector_event_rows"] = event_rows.map_or(Value::Null, |rows| json!(rows));
+                            if let Some(delta_log) = delta_log {
+                                output["rows"] = delta_log["rows"].clone();
+                                output["delta_log_files"] = delta_log["files"].clone();
+                                output["delta_log_parquet_bytes"] = delta_log["parquet_bytes"].clone();
+                                output["delta_log_versions"] = delta_log["versions"].clone();
+                                output["source"] = delta_log["scope"].clone();
+                            } else {
+                                output["rows"] = Value::Null;
+                                output["delta_log_files"] = Value::Null;
+                                output["delta_log_parquet_bytes"] = Value::Null;
+                                output["delta_log_versions"] = Value::Null;
+                                output["unavailable_reason"] =
+                                    json!(unavailable_reason.unwrap_or("delta_log_read_failed"));
+                            }
+                            let delta_rows = output["rows"].as_u64();
+                            output["settled"] = acknowledged
+                                .zip(delta_rows)
+                                .map_or(Value::Null, |(completed, delta)| json!(delta >= completed));
+                            output["client_completed_rows"] = acknowledged.map_or(Value::Null, |rows| json!(rows));
+                            output["settle_gap_rows"] = acknowledged
+                                .zip(delta_rows)
+                                .map_or(Value::Null, |(completed, delta)| json!(completed.saturating_sub(delta)));
+                        }
+                    }
                 }
             }
             return Ok((logs, commits));
@@ -4176,7 +4251,7 @@ fn result_rows(
     } else {
         None
     };
-    let tunables = json!({
+    let mut tunables = json!({
         "arrowcols": replicas,
         "clients": client_count,
         "clients_per_table": config.clients_per_table,
@@ -4203,7 +4278,11 @@ fn result_rows(
         "requested_durability_class": config.tunables.wal.as_ref().map(|_| config.tunables.durability_class()),
         "capabilities": capability_evidence(),
     });
-    let mut details = [
+    if config.campaign_profile == Some(crate::config::CampaignProfile::ScaleOutSingleTable) {
+        tunables["evidence_class"] = json!("d53_exploratory");
+        tunables["qualification"] = json!("not_qualifying");
+    }
+    let details = [
         client_run.failure.clone(),
         client_run
             .pinning
@@ -4215,9 +4294,6 @@ fn result_rows(
     .into_iter()
     .flatten()
     .collect::<Vec<_>>();
-    if config.campaign_profile == Some(crate::config::CampaignProfile::ScaleOutSingleTable) {
-        details.push("exact_active_snapshot_identity_reconciliation_not_implemented".to_owned());
-    }
     let failure = (!details.is_empty()).then(|| details.join("; "));
     let pinning_ok = client_run.pinning.violation.is_none()
         && client_run.pinning.verification_error.is_none()
@@ -4251,7 +4327,10 @@ fn result_rows(
             .to_owned(),
             stamp: config.stamp.clone(),
             host: platform_host_label(config.platform.kind).to_owned(),
-            experiment: format!("arrowcols-{replicas}-dfe-{concurrency}"),
+            experiment: format!(
+                "arrowcols-{replicas}-dfe-{concurrency}-clients-{}",
+                config.clients_per_table
+            ),
             started_at_ms,
             measure_seconds: config.measure_seconds as f64,
             arrowcols: i32::try_from(replicas).context("ArrowCol count exceeds Parquet schema range")?,
@@ -4276,6 +4355,45 @@ fn result_rows(
             tunables_json: serde_json::to_string(&table_tunables)?,
             evidence_json: {
                 let mut evidence = client_run.evidence.for_table(&table, client);
+                if config.campaign_profile == Some(crate::config::CampaignProfile::ScaleOutSingleTable) {
+                    let output = evidence["commit_window_output_throughput"].clone();
+                    let seconds = output["window_seconds"].as_f64();
+                    let input_rate = output["input_bytes_per_second"].as_f64();
+                    let parquet_rate = output["parquet_bytes_per_second"].as_f64();
+                    let commits_per_second = output["commits"]
+                        .as_u64()
+                        .zip(seconds)
+                        .filter(|(_, seconds)| *seconds > 0.0)
+                        .map(|(commits, seconds)| commits as f64 / seconds);
+                    let mean_file_bytes = output["parquet_bytes"]
+                        .as_u64()
+                        .zip(output["files"].as_u64())
+                        .filter(|(_, files)| *files > 0)
+                        .map(|(bytes, files)| bytes as f64 / files as f64);
+                    evidence["evidence_class"] = json!("d53_exploratory");
+                    evidence["qualification"] = json!("not_qualifying");
+                    evidence["exploratory_delta_log_reconciliation"] =
+                        evidence["durable_commits"]["delta_log_reconciliation"].clone();
+                    evidence["steady_state_window"] = json!({
+                        "warmup_seconds": config.warmup_seconds,
+                        "measure_seconds": config.measure_seconds,
+                        "measurement_start_unix_ms": output["measurement_start_unix_ms"],
+                        "measurement_end_unix_ms": output["measurement_end_unix_ms"],
+                        "window_seconds": seconds,
+                        "scope": "collector_commit_finish_window_not_client_cohort",
+                    });
+                    evidence["ranking_metrics"] = json!({
+                        "committed_rows_per_second": output["rows_per_second"],
+                        "uncompressed_arrow_decimal_gb_per_second": input_rate.map(|rate| rate / 1_000_000_000.0),
+                        "uncompressed_arrow_bytes_per_second": input_rate,
+                        "parquet_bytes_per_second": parquet_rate,
+                        "compression_ratio": output["compression_ratio"],
+                        "commits_per_second": commits_per_second,
+                        "mean_parquet_file_bytes": mean_file_bytes,
+                        "per_pod_cpu_millicores": metrics.map(|metrics| metrics.cpu_millicores),
+                        "per_pod_cpu_scope": "one_collector_pod_profile_arithmetic_mean_of_measurement_window_samples",
+                    });
+                }
                 if let Some(resource_evidence) = &resource_evidence {
                     evidence["aks_resources"] = resource_evidence.clone();
                 }
@@ -9358,6 +9476,7 @@ async fn prepare_aks_platform(
         .context("deployed-stamp runtime config has no deltaRoot")?;
     let run_data_root = run_delta_root(shared_data_root, &platform.run_id)?;
     platform.qap_relative_data_root = Some(qap_relative_data_root(&run_data_root)?);
+    platform.delta_root = Some(run_data_root.clone());
     runtime_config["deltaRoot"] = json!(run_data_root);
     runtime_config["namespace"] = json!(config.namespace);
     runtime_config["oatRunId"] = json!(platform.run_id);
@@ -13665,18 +13784,19 @@ mod tests {
     }
 
     #[test]
-    fn scale_out_profile_remains_blocked_before_platform_creation() -> Result<()> {
+    fn scale_out_profile_allows_aks_and_rejects_local_before_platform_creation() -> Result<()> {
         let mut config: OatConfig = serde_json::from_str(include_str!(
             "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
         ))?;
         config.campaign_profile = Some(crate::config::CampaignProfile::ScaleOutSingleTable);
-        for kind in [crate::config::OatMode::Local, crate::config::OatMode::Aks] {
-            config.platform.kind = kind;
-            let error = platform_for_run(&config, "test-run")
-                .err()
-                .context("scale-out was admitted")?;
-            assert!(error.to_string().contains("blocked until runtime qualification"));
-        }
+        config.platform.kind = crate::config::OatMode::Local;
+        let error = platform_for_run(&config, "test-run")
+            .err()
+            .context("local scale-out was admitted")?;
+        assert!(error.to_string().contains("exploratory runs require AKS"));
+        config.platform.kind = crate::config::OatMode::Aks;
+        let platform = platform_for_run(&config, "test-run")?;
+        assert_eq!(platform.kind(), crate::config::OatMode::Aks);
         Ok(())
     }
 
@@ -14899,6 +15019,7 @@ mod tests {
             namespace_uid: Some("fixture-uid".to_owned()),
             runtime_dir: Some(runtime.clone()),
             qap_relative_data_root: None,
+            delta_root: None,
             router_metrics_url: None,
             router_tunnel: None,
             fic_record_path: None,
@@ -15182,6 +15303,21 @@ mod tests {
     }
 
     #[test]
+    fn client_sweep_expands_distinct_matrix_cells() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        config.campaign_profile = Some(crate::config::CampaignProfile::ScaleOutSingleTable);
+        config.clients_per_table_sweep = Some(vec![1, 2, 4, 8, 16, 32, 64, 128]);
+        let cells = matrix_cell_specs(&config);
+        assert_eq!(
+            cells.iter().map(|(_, _, clients, _)| *clients).collect::<Vec<_>>(),
+            vec![1, 2, 4, 8, 16, 32, 64, 128]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn matrix_cells_use_distinct_canonical_run_ids_for_multiple_combinations() -> Result<()> {
         let config: OatConfig = serde_json::from_str(include_str!(
             "../../../docs/experiments/arrowcol-oat/oat-config.example.json"
@@ -15193,9 +15329,9 @@ mod tests {
             "every matrix combination needs its own isolated run"
         );
         assert!(cells.len() > 1, "the regression must cover more than one matrix cell");
-        let ids = cells.iter().map(|(_, _, run_id)| run_id).collect::<HashSet<_>>();
+        let ids = cells.iter().map(|(_, _, _, run_id)| run_id).collect::<HashSet<_>>();
         assert_eq!(ids.len(), cells.len(), "matrix cells must not share run identities");
-        for (_, _, run_id) in &cells {
+        for (_, _, _, run_id) in &cells {
             let parsed = uuid::Uuid::parse_str(run_id)?;
             assert_eq!(parsed.to_string(), *run_id, "run IDs use canonical lowercase UUID form");
             let local_router =

@@ -6,6 +6,7 @@
 | `architecture.svg`                                | Full-width layered architecture displayed on the live page, with embedded official icons and numbered parts 1–6.                         |
 | `results.parquet`                                 | Sanitized, compact benchmark summary published by the OAT server.                                                                        |
 | `oat-config.example.json`                         | Validated configuration template with no credentials.                                                                                    |
+| `oat-config.aks.max-rows.json`                   | Exploratory one-collector AKS client sweep (1..128); replace image placeholders and use stamp-generated runtime/bootstrap inputs before launch. |
 | `architecture.drawio` / `architecture.drawio.png` | Editable source and rendered companion for the same layered architecture.                                                                |
 | `throughput-pipeline.drawio` / `.png`             | Single-writer throughput campaign dataflow and observability pipeline.                                                                   |
 | [Runtime setup](RUNTIME.md)                       | Isolated internal-only Kubernetes stack, image digests, workload identity, SQL bootstrap, secret files and local rehearsal.              |

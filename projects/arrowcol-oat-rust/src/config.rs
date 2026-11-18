@@ -63,6 +63,8 @@ pub struct OatConfig {
     pub rows_per_table: usize,
     #[serde(default = "default_clients_per_table")]
     pub clients_per_table: usize,
+    #[serde(default)]
+    pub clients_per_table_sweep: Option<Vec<usize>>,
     pub dmv_concurrency: usize,
     pub qap_endpoint: String,
     pub qap_database: Option<String>,
@@ -1060,6 +1062,18 @@ impl OatConfig {
                 "clients_per_table must be between 1 and {max_clients_per_table} and the client fleet may not exceed 128"
             );
         }
+        if let Some(client_counts) = &self.clients_per_table_sweep
+            && (self.campaign_profile != Some(CampaignProfile::ScaleOutSingleTable)
+                || client_counts.is_empty()
+                || client_counts.len() > 25
+                || client_counts.iter().any(|count| {
+                    !(1..=max_clients_per_table).contains(count)
+                        || count.checked_mul(self.tables.len()).is_none_or(|total| total > 128)
+                })
+                || client_counts.iter().copied().collect::<HashSet<_>>().len() != client_counts.len())
+        {
+            bail!("clients_per_table_sweep requires 1 to 25 distinct scale_out_single_table values from 1 through 128");
+        }
         let qap_endpoint = Url::parse(&self.qap_endpoint).context("qap_endpoint must be a URL")?;
         if !matches!(qap_endpoint.scheme(), "http" | "https")
             || qap_endpoint.host_str().is_none()
@@ -1101,7 +1115,11 @@ impl OatConfig {
             bail!("dfe_worker_concurrency must contain 1 to 16 distinct values from 1 through 256");
         }
         self.validate_wal_capacity_for_cores()?;
-        if self.replica_counts.len() * self.dfe_worker_concurrency.len() > 25 {
+        if self.replica_counts.len()
+            * self.dfe_worker_concurrency.len()
+            * self.clients_per_table_sweep.as_ref().map_or(1, Vec::len)
+            > 25
+        {
             bail!("the OAT experiment matrix may contain at most 25 combinations");
         }
         if self.tables.is_empty() || self.tables.len() > 32 {
@@ -1469,6 +1487,7 @@ mod tests {
             ],
             rows_per_table: 1000,
             clients_per_table: 1,
+            clients_per_table_sweep: None,
             dmv_concurrency: 2,
             qap_endpoint: "http://kusto:8080".to_owned(),
             qap_database: Some("experimentqap".to_owned()),
@@ -1989,7 +2008,13 @@ mod tests {
             }
         }))?;
         config.clients_per_table = 128;
+        config.clients_per_table_sweep = Some(vec![1, 2, 4, 8, 16, 32, 64, 128]);
         config.validate()?;
+        config.clients_per_table_sweep = Some(vec![1, 1]);
+        assert!(config.validate().is_err());
+        config.clients_per_table_sweep = Some(vec![129]);
+        assert!(config.validate().is_err());
+        config.clients_per_table_sweep = None;
         for replicas in [vec![2], vec![1, 2], vec![]] {
             config.replica_counts = replicas;
             let error = config
