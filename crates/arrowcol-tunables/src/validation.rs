@@ -1112,7 +1112,14 @@ fn validate_h2_window(field: &str, window: u32) -> Result<()> {
 }
 
 fn validate_duration(name: &str, value: Option<&str>, default: &str) -> Result<Duration> {
-    let value = value.unwrap_or(default);
+    parse_tunable_duration(name, value.unwrap_or(default))
+}
+
+/// Parses a positive, representable tunable duration.
+///
+/// # Errors
+/// Returns an error for malformed, zero, or out-of-range durations.
+pub fn parse_tunable_duration(name: &str, value: &str) -> Result<Duration> {
     let duration =
         humantime::parse_duration(value).with_context(|| format!("{name} must be a valid humantime duration"))?;
     if duration.is_zero() || Instant::now().checked_add(duration).is_none() {

@@ -377,6 +377,29 @@ fn contains_requested(observed: &Value, requested: &Value) -> bool {
     }
 }
 
+fn matches_collector_pressure(observed: &Value, requested: &Value) -> Result<bool> {
+    let (Some(observed), Some(requested)) = (observed.as_object(), requested.as_object()) else {
+        return Ok(false);
+    };
+    for (field, expected) in requested {
+        let Some(actual) = observed.get(field) else {
+            return Ok(false);
+        };
+        if matches!(field.as_str(), "pressure_interval" | "heartbeat_interval" | "registration_ttl") {
+            let parse = |value: &Value| {
+                let value = value.as_str().with_context(|| format!("collector pressure {field} must be a duration string"))?;
+                arrowcol_tunables::parse_tunable_duration(field, value)
+            };
+            if parse(actual)? != parse(expected)? {
+                return Ok(false);
+            }
+        } else if !contains_requested(actual, expected) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn client_sentinel_value(
     config: &OatConfig,
     variable: &str,
@@ -579,7 +602,12 @@ fn verify_process_configuration(config: &OatConfig, role: ComponentRole, observe
         let actual = observed
             .pointer(&path)
             .with_context(|| format!("{} startup readback omitted applied tunable {name}", role_name(role)))?;
-        if !contains_requested(actual, &expected) {
+        let matches = if name == "ARROWCOL_COLLECTOR_PRESSURE_CONFIG" {
+            matches_collector_pressure(actual, &expected)?
+        } else {
+            contains_requested(actual, &expected)
+        };
+        if !matches {
             bail!(
                 "{} startup readback does not match applied tunable {name}",
                 role_name(role)
@@ -1733,6 +1761,35 @@ mod startup_readback_tests {
         ))?;
         verify_process_configuration(&config, ComponentRole::Collector, &collector)?;
         Ok(())
+    }
+
+    #[test]
+    fn collector_pressure_readback_compares_only_typed_durations_semantically() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        config.tunables = serde_json::from_value(json!({"collector":{"pressure":{
+            "registration_ttl":"15m", "heartbeat_interval":"1m 5s", "pressure_interval":"1m",
+            "buffered_bytes_limit":2147483648_u64
+        }}}))?;
+        let pressure = json!({
+            "registration_ttl":"900s", "heartbeat_interval":"65s", "pressure_interval":"60s",
+            "buffered_bytes_limit":2147483648_u64
+        });
+        for (field, invalid) in [
+            ("registration_ttl", json!("899s")),
+            ("heartbeat_interval", json!("unrecognized duration")),
+            ("pressure_interval", json!(60)),
+            ("buffered_bytes_limit", json!("2147483648")),
+        ] {
+            let mut observed = json!({"pressure":pressure.clone()});
+            observed["pressure"][field] = invalid;
+            assert!(verify_process_configuration(&config, ComponentRole::Collector, &observed).is_err());
+        }
+        let mut missing = pressure.clone();
+        missing.as_object_mut().context("test pressure object")?.remove("registration_ttl");
+        assert!(verify_process_configuration(&config, ComponentRole::Collector, &json!({"pressure":missing})).is_err());
+        verify_process_configuration(&config, ComponentRole::Collector, &json!({"pressure":pressure}))
     }
 
     #[test]

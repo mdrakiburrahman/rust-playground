@@ -1,6 +1,8 @@
 mod validation;
 
-pub use validation::{ApplyBoundary, Capability, ComponentRole, DurabilityClass, capability_table};
+pub use validation::{
+    ApplyBoundary, Capability, ComponentRole, DurabilityClass, capability_table, parse_tunable_duration,
+};
 
 pub use arrow_deltalake::writer::{
     Codec as ParquetCodec, ColumnOptions as ParquetColumnOptions, ParquetWriterConfig, SortColumn as ParquetSortColumn,
