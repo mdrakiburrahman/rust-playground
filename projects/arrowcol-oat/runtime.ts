@@ -35,7 +35,6 @@ export interface RuntimeConfig {
   hotTable?: string;
   collectorReplicas?: number;
   routerReplicas?: number;
-  collectorStartupTable?: { catalog: string; schema: string; table: string };
 }
 type Resource = Record<string, any>;
 export type Phase = 'identity' | 'foundation' | 'bootstrap' | 'workload';
@@ -99,13 +98,13 @@ export function validateRuntime(input: unknown, allowUnpublishedImages = false):
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('runtime config must be an object');
   const c = input as RuntimeConfig;
   const required = ['deltaRoot', 'effective_stop_budgets', 'images', 'namespace', 'oatRunId', 'workloadIdentityClientId', 'subscriptionId', 'stamp'];
-  if (required.some((key) => !Object.hasOwn(c, key)) || Object.keys(c).some((key) => ![...required, 'serviceAccount', 'maintenance', 'quiver', 'resources', 'collectorWorkers', 'campaignProfile', 'hotTable', 'collectorReplicas', 'routerReplicas', 'collectorStartupTable'].includes(key))) {
+  if (required.some((key) => !Object.hasOwn(c, key)) || Object.keys(c).some((key) => ![...required, 'serviceAccount', 'maintenance', 'quiver', 'resources', 'collectorWorkers', 'campaignProfile', 'hotTable', 'collectorReplicas', 'routerReplicas'].includes(key))) {
     throw new Error('runtime config has missing or unknown fields');
   }
   parseEffectiveStopBudgets(c.effective_stop_budgets);
   const scaleOut = c.campaignProfile === 'scale_out_single_table';
   if (Object.hasOwn(c, 'campaignProfile') && !scaleOut) throw new Error('campaignProfile must be scale_out_single_table');
-  if (!scaleOut && ['hotTable', 'collectorReplicas', 'routerReplicas', 'collectorStartupTable'].some(key => Object.hasOwn(c, key)))
+  if (!scaleOut && ['hotTable', 'collectorReplicas', 'routerReplicas'].some(key => Object.hasOwn(c, key)))
     throw new Error('scale-out fields require campaignProfile scale_out_single_table');
   if (Object.hasOwn(c, 'quiver') && typeof c.quiver !== 'boolean') throw new Error('quiver must be an explicit boolean');
   if (Object.hasOwn(c, 'resources')) validateResources(c.resources, scaleOut);
@@ -114,13 +113,6 @@ export function validateRuntime(input: unknown, allowUnpublishedImages = false):
         c.collectorReplicas !== 1 ||
         c.routerReplicas !== c.collectorReplicas)
       throw new Error('scale-out requires the approved hot table, memory-only buffering, and exactly one collector/router replica');
-    if (Object.hasOwn(c, 'collectorStartupTable')) {
-      const table = c.collectorStartupTable;
-      if (!table || typeof table !== 'object' || Array.isArray(table) ||
-          Object.keys(table).sort().join() !== 'catalog,schema,table' ||
-          table.catalog !== 'telemetry' || table.schema !== 'sqlserver' || table.table !== c.hotTable)
-        throw new Error('collectorStartupTable must exactly match the approved hot table');
-    }
     const maintenance = c.maintenance;
     const requiredOperations = ['optimize', 'checkpoint', 'purge', 'vacuum', 'prune-log'];
     if (!maintenance || maintenance.apply !== true || !Array.isArray(maintenance.tables) ||
@@ -336,7 +328,6 @@ export async function renderRuntime(input: unknown, phase: Phase): Promise<Resou
       name: 'dataflow', image: c.images.dataflow, securityContext: security,
       args: ['--config', '/etc/oat/dataflow.yaml', '--num-cores', String(c.collectorWorkers ?? 1)],
       env: [...cloudEnv, env('ARROWCOL_SQL_HOST', 'arrowcol-sql'), env('ARROWCOL_SQL_PASSWORD_FILE', '/run/app/password'),
-        ...(c.collectorStartupTable ? [env('ARROWCOL_COLLECTOR_EXPORTER_CONFIG', JSON.stringify({ startup_table: c.collectorStartupTable }))] : []),
         env('ARROWCOL_PARTITION_GRANULARITY', c.maintenance?.granularity ?? 'hour'),
         env('ARROWCOL_SQL_TRUST_CERT', 'true'), env('ARROWCOL_CATALOG_ENDPOINT', 'http://arrowcol-catalog:8817'),
         env('ARROWCOL_CATALOG_DDL_IDENTITY_SECRET_FILE', '/run/auth/internal-hmac'),

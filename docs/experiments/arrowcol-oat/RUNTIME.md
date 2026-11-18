@@ -65,6 +65,12 @@ below four restarts, fails immediately on image-pull/container-config errors,
 and is bounded by `aks_rollout_timeout_seconds`, including stalled API calls.
 Failures capture bounded current/previous logs and descriptions for every
 workload role, namespace pods/services/endpoints and events before cleanup.
+Scale-out keeps exactly one collector/router and initializes the fresh canonical
+physical table in pin-init before maintenance readback and client admission.
+It does not send a collector startup-table selector: the strict exporter
+configuration supports `authority_timeout`, not table selection. Requested
+exporter tunables survive initial injection and reconfiguration; malformed,
+duplicate or conflicting overrides fail admission.
 Teardown logs per-Deployment stop, namespace deletion/absence and QAP/FIC cleanup
 durations; a failed cell's total elapsed time alone cannot identify its slow step.
 

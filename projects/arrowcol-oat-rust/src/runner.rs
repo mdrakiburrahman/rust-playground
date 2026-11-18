@@ -8133,9 +8133,9 @@ fn configure_collector_deployment(config: &OatConfig, desired: &mut Value, concu
         &config.effective_aks_resources().collector,
     )?;
     desired["spec"]["template"]["spec"]["terminationGracePeriodSeconds"] = json!(config.collector_stop_grace_seconds);
-    let mut variables = role_environment(config, ComponentRole::Collector)?;
+    let variables = role_environment(config, ComponentRole::Collector)?;
     if config.campaign_profile == Some(crate::config::CampaignProfile::ScaleOutSingleTable) {
-        merge_startup_table_override(desired, &config.dfe_container, config, &mut variables, true)?;
+        validate_collector_exporter_override(desired, &config.dfe_container, &variables)?;
     }
     inject_deployment_environment(desired, &config.dfe_container, &variables)
 }
@@ -9594,8 +9594,6 @@ fn project_scale_out_runtime(runtime_config: &mut Value, config: &OatConfig, rep
     set_runtime_replicas(runtime_config, replicas)?;
     runtime_config["campaignProfile"] = serde_json::to_value(config.campaign_profile)?;
     runtime_config["hotTable"] = json!(hot_table);
-    runtime_config["collectorStartupTable"] =
-        json!({"catalog": "telemetry", "schema": "sqlserver", "table": hot_table});
     Ok(())
 }
 
@@ -13954,12 +13952,6 @@ mod tests {
         project_scale_out_runtime(&mut runtime, &config, 1)?;
         assert_eq!(runtime["campaignProfile"], "scale_out_single_table");
         assert_eq!(runtime["hotTable"], config.tables[0]);
-        assert_eq!(
-            runtime["collectorStartupTable"],
-            json!({
-                "catalog": "telemetry", "schema": "sqlserver", "table": config.tables[0]
-            })
-        );
         assert_eq!(runtime["collectorReplicas"], 1);
         assert_eq!(runtime["routerReplicas"], 1);
         for cpu in [Some("2"), None] {
