@@ -85,6 +85,8 @@ impl GenericDeltaExporter {
             leases: LeaseBinder::new(store, LEASE_VIEW_TTL),
             metrics,
             tables: tokio::sync::Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            submission_probe: std::sync::Mutex::new(None),
         });
         registry.insert(config.base_path, Arc::downgrade(&backend));
         Ok(Self { backend })
@@ -140,6 +142,7 @@ impl GenericDeltaExporter {
                 draining: std::sync::atomic::AtomicBool::new(false),
                 metrics,
                 tables: tokio::sync::Mutex::new(HashMap::new()),
+                submission_probe: std::sync::Mutex::new(None),
             }),
         })
     }
@@ -224,6 +227,8 @@ struct DeltaBackend {
     backlog_capacity: Arc<crate::metrics::PublicationBacklogCapacityGuard>,
     metrics: Arc<RuntimeMetrics>,
     tables: tokio::sync::Mutex<HashMap<arrowcol_protocol::TableIdentity, Arc<TableOwner>>>,
+    #[cfg(test)]
+    submission_probe: std::sync::Mutex<Option<oneshot::Sender<()>>>,
 }
 
 impl Drop for DeltaBackend {
@@ -415,6 +420,8 @@ impl DeltaBackend {
             accepted,
             backlog_token,
             reply: Some(reply),
+            #[cfg(test)]
+            submitted: self.submission_probe.lock().expect("submission probe").take(),
             _pending_owner: pending_owner,
             _capacity: capacity,
             _backlog_capacity: Arc::clone(&self.backlog_capacity),
@@ -546,6 +553,8 @@ struct QueuedBatch {
     accepted: Instant,
     backlog_token: Option<crate::metrics::PublicationBacklogToken>,
     reply: Option<oneshot::Sender<Result<(), ExportFailure>>>,
+    #[cfg(test)]
+    submitted: Option<oneshot::Sender<()>>,
     _pending_owner: PendingOwner,
     _capacity: Vec<OwnedSemaphorePermit>,
     _backlog_capacity: Arc<crate::metrics::PublicationBacklogCapacityGuard>,
@@ -863,11 +872,7 @@ impl GroupPublisher<'_> {
     }
 
     async fn publish(&mut self, group: &mut Vec<QueuedBatch>, estimator: &mut AdaptiveFileSizeEstimator) {
-        while self
-            .in_flight
-            .front()
-            .is_some_and(|publication| publication.task.is_finished())
-        {
+        while self.in_flight.front().is_some_and(|publication| publication.task.is_finished()) {
             self.finish_one(estimator).await;
         }
         if self.pipeline_depth == 1 || self.table.is_none() {
@@ -1078,10 +1083,18 @@ impl GroupPublisher<'_> {
                     }
                     self.stage_metrics.record_submission_wait(submission_started.elapsed());
                     let commit_result = match submission {
-                        Ok(receipt) => receipt.wait().await.map_err(|error| {
-                            worker_failed = true;
-                            ExportFailure::Transient(format!("atomic group commit failed: {error:#}"))
-                        }),
+                        Ok(receipt) => {
+                            #[cfg(test)]
+                            for entry in group.iter_mut() {
+                                if let Some(submitted) = entry.submitted.take() {
+                                    let _ = submitted.send(());
+                                }
+                            }
+                            receipt.wait().await.map_err(|error| {
+                                worker_failed = true;
+                                ExportFailure::Transient(format!("atomic group commit failed: {error:#}"))
+                            })
+                        }
                         Err(error) => {
                             worker_failed = true;
                             Err(ExportFailure::Transient(format!(
@@ -1790,14 +1803,8 @@ mod tests {
             Arc::new(RuntimeMetrics::new(holder)),
         )
         .expect("exporter");
-        let first = exporter
-            .stage(envelope_pdata(envelope_for(&lease)))
-            .await
-            .expect("first");
-        let second = exporter
-            .stage(envelope_pdata(envelope_for(&lease)))
-            .await
-            .expect("second");
+        let first = exporter.stage(envelope_pdata(envelope_for(&lease))).await.expect("first");
+        let second = exporter.stage(envelope_pdata(envelope_for(&lease))).await.expect("second");
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             first.wait().await.expect("first commit");
             second.wait().await.expect("second commit");
@@ -1807,17 +1814,118 @@ mod tests {
         let root = directory.path().join("demo/generated/events");
         let log = std::fs::read_to_string(root.join("_delta_log/00000000000000000001.json")).expect("shared commit");
         assert_eq!(log.lines().filter(|line| line.contains("\"add\":")).count(), 2);
-        let third = exporter
-            .stage(envelope_pdata(envelope_for(&lease)))
-            .await
-            .expect("third");
+        let third = exporter.stage(envelope_pdata(envelope_for(&lease))).await.expect("third");
         tokio::time::timeout(std::time::Duration::from_secs(5), exporter.backend.flush_pending())
-            .await
-            .expect("flush must wake submissions prepared after the barrier")
+            .await.expect("flush must wake submissions prepared after the barrier")
             .expect("explicit barrier");
         third.wait().await.expect("barrier completed publication");
         assert_eq!(add_file_count(&root), 3);
         assert_eq!(exporter.backend.capacity.batches.available_permits(), 4096);
+    }
+
+    async fn assert_dispatched_boundary(evolve_physical_schema: bool, prior_error: bool) {
+            let directory = tempfile::tempdir().expect("directory");
+            let store = Arc::new(MemoryRoutingStore::default());
+            let holder = CollectorInstanceId::new();
+            let lease = lease(&store, holder).await;
+            let exporter = GenericDeltaExporter::with_batching(
+                directory.path().to_path_buf(),
+                Arc::clone(&store) as Arc<dyn RoutingStore>,
+                arrow_deltalake::commit::CommitOptions {
+                    batch_window: std::time::Duration::from_secs(60),
+                    ..Default::default()
+                },
+                FileBatchConfig {
+                    coalesce_publications: true,
+                    pipeline_depth: 3,
+                    max_batches_per_flush: 1,
+                    ..Default::default()
+                },
+                Arc::new(RuntimeMetrics::new(holder)),
+            ).expect("exporter");
+            let (submitted, admitted) = oneshot::channel();
+            *exporter.backend.submission_probe.lock().expect("submission probe") = Some(submitted);
+            let mut first = exporter.stage(envelope_pdata(envelope_for(&lease))).await.expect("first");
+            let root = directory.path().join("demo/generated/events");
+            tokio::time::timeout(std::time::Duration::from_secs(3), admitted)
+                .await.expect("first group reached the commit actor")
+                .expect("submission probe");
+            assert!(matches!(first.receipt.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
+            assert!(!root.join("_delta_log/00000000000000000001.json").exists());
+            let mut envelope = envelope_for(&lease);
+            if !evolve_physical_schema || prior_error {
+                envelope.target_schema_version = SchemaVersion::new(2).expect("version");
+            }
+            let mut batch = fixture_batch();
+            if evolve_physical_schema {
+                let mut fields = batch.schema().fields().to_vec();
+                fields.push(Arc::new(Field::new("new_value", DataType::Utf8, true)));
+                let mut columns = batch.columns().to_vec();
+                columns.push(Arc::new(StringArray::from(vec![Some("new"), None])));
+                batch = arrow_array::RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("evolved");
+            }
+            let second = if prior_error {
+                let owner = Arc::clone(exporter.backend.tables.lock().await.get(&table()).expect("owner"));
+                let rows = batch.num_rows() as u64;
+                let bytes = arrow_deltalake::record_batch_logical_bytes(&batch).expect("bytes");
+                let mut capacity = exporter.backend.capacity.acquire(rows, bytes).await.expect("capacity");
+                capacity.extend(owner.capacity.acquire(rows, bytes).await.expect("table capacity"));
+                let (reply, receipt) = oneshot::channel();
+                let queued = QueuedBatch {
+                    publication_id: envelope.publication_id.expect("id"),
+                    ingested_at_ms: envelope.ingested_at_ms.expect("stamp"),
+                    batch,
+                    target_schema_version: envelope.target_schema_version.get(),
+                    rows,
+                    bytes,
+                    accepted: Instant::now(),
+                    backlog_token: None,
+                    reply: Some(reply),
+                    submitted: None,
+                    _pending_owner: owner.begin(LeaseEvidence::from_envelope(&envelope)).expect("admitted"),
+                    _capacity: capacity,
+                    _backlog_capacity: Arc::clone(&exporter.backend.backlog_capacity),
+                };
+                reissue_lease(&store, &lease, CollectorInstanceId::new()).await;
+                owner.sender.send(WorkerCommand::Batch(queued)).await.expect("admitted boundary");
+                PendingDelta { receipt, release: None }
+            } else {
+                let records = encode_record_batch(envelope, batch).expect("records");
+                exporter.stage(OtapPdata::new_todo_context(
+                    otel_arrow_dfe_pdata::OtapPayload::from_pdata_arrow(records),
+                )).await.expect("second")
+            };
+            let first_result = tokio::time::timeout(std::time::Duration::from_secs(3), first.wait())
+                .await.expect("dispatched boundary flush");
+            if prior_error {
+                assert!(first_result.is_err());
+                assert!(tokio::time::timeout(std::time::Duration::from_secs(3), second.wait())
+                    .await.expect("boundary failure").is_err());
+                assert!(!root.join("_delta_log/00000000000000000001.json").exists());
+                assert_eq!(exporter.backend.capacity.batches.available_permits(), 4096);
+                return;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dispatched_version_boundary_drains() {
+            assert_dispatched_boundary(false, false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dispatched_schema_boundary_drains() {
+            assert_dispatched_boundary(true, false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dispatched_boundary_propagates_prior_error() {
+            assert_dispatched_boundary(true, true).await;
+            first_result.expect("old schema committed before evolution");
+            exporter.backend.start_draining().await;
+            tokio::time::timeout(std::time::Duration::from_secs(3), second.wait())
+                .await.expect("drain").expect("new schema committed");
+            assert_eq!(add_file_count(&root), 2);
+            assert_eq!(exporter.backend.capacity.batches.available_permits(), 4096);
+        }
     }
 
     fn coalescing_exporter(
@@ -3422,47 +3530,47 @@ mod tests {
     #[tokio::test]
     async fn schema_version_transition_splits_files() {
         for pipeline_depth in [1, 3] {
-            let directory = tempfile::tempdir().expect("directory");
-            let store = Arc::new(MemoryRoutingStore::default());
-            let holder = CollectorInstanceId::new();
-            let lease = lease(&store, holder).await;
-            let exporter = GenericDeltaExporter::with_batching(
-                directory.path().to_path_buf(),
-                store as Arc<dyn RoutingStore>,
-                arrow_deltalake::commit::CommitOptions::default(),
-                FileBatchConfig {
-                    max_age: std::time::Duration::from_secs(60),
-                    pipeline_depth,
-                    coalesce_publications: pipeline_depth > 1,
-                    ..Default::default()
-                },
-                Arc::new(RuntimeMetrics::new(holder)),
-            )
-            .expect("exporter");
-            let first = exporter.stage(pdata(&lease, lease.fencing_epoch)).await.expect("first");
-            let second = exporter
-                .stage(versioned_pdata(
-                    &lease,
-                    lease.fencing_epoch,
-                    SchemaVersion::new(2).expect("version"),
-                ))
-                .await
-                .expect("second");
-            tokio::time::timeout(std::time::Duration::from_secs(3), first.wait())
-                .await
-                .expect("schema boundary")
-                .expect("first publication");
-            exporter.backend.start_draining().await;
-            tokio::time::timeout(std::time::Duration::from_secs(3), second.wait())
-                .await
-                .expect("drain")
-                .expect("second publication");
-            let files = std::fs::read_dir(directory.path().join("demo/generated/events"))
-                .expect("files")
-                .map(|entry| entry.expect("entry").path())
-                .filter(|path| path.extension().is_some_and(|extension| extension == "parquet"))
-                .count();
-            assert_eq!(files, 2);
+        let directory = tempfile::tempdir().expect("directory");
+        let store = Arc::new(MemoryRoutingStore::default());
+        let holder = CollectorInstanceId::new();
+        let lease = lease(&store, holder).await;
+        let exporter = GenericDeltaExporter::with_batching(
+            directory.path().to_path_buf(),
+            store as Arc<dyn RoutingStore>,
+            arrow_deltalake::commit::CommitOptions::default(),
+            FileBatchConfig {
+                max_age: std::time::Duration::from_secs(60),
+                pipeline_depth,
+                coalesce_publications: pipeline_depth > 1,
+                ..Default::default()
+            },
+            Arc::new(RuntimeMetrics::new(holder)),
+        )
+        .expect("exporter");
+        let first = exporter.stage(pdata(&lease, lease.fencing_epoch)).await.expect("first");
+        let second = exporter
+            .stage(versioned_pdata(
+                &lease,
+                lease.fencing_epoch,
+                SchemaVersion::new(2).expect("version"),
+            ))
+            .await
+            .expect("second");
+        tokio::time::timeout(std::time::Duration::from_secs(3), first.wait())
+            .await
+            .expect("schema boundary")
+            .expect("first publication");
+        exporter.backend.start_draining().await;
+        tokio::time::timeout(std::time::Duration::from_secs(3), second.wait())
+            .await
+            .expect("drain")
+            .expect("second publication");
+        let files = std::fs::read_dir(directory.path().join("demo/generated/events"))
+            .expect("files")
+            .map(|entry| entry.expect("entry").path())
+            .filter(|path| path.extension().is_some_and(|extension| extension == "parquet"))
+            .count();
+        assert_eq!(files, 2);
         }
     }
 
@@ -3473,55 +3581,55 @@ mod tests {
     #[tokio::test]
     async fn grouped_publication_failure_settles_all_batches() {
         for pipeline_depth in [1, 3] {
-            let directory = tempfile::tempdir().expect("directory");
-            let store = Arc::new(MemoryRoutingStore::default());
-            let holder = CollectorInstanceId::new();
-            let lease = lease(&store, holder).await;
-            let metrics = Arc::new(RuntimeMetrics::new(holder));
-            let exporter = GenericDeltaExporter::with_batching(
-                directory.path().to_path_buf(),
-                Arc::clone(&store) as Arc<dyn RoutingStore>,
-                arrow_deltalake::commit::CommitOptions::default(),
-                FileBatchConfig {
-                    max_batches_per_flush: 3,
-                    max_age: std::time::Duration::from_secs(60),
-                    pipeline_depth,
-                    coalesce_publications: pipeline_depth > 1,
-                    ..Default::default()
-                },
-                Arc::clone(&metrics),
-            )
-            .expect("exporter");
-            let first = exporter.stage(pdata(&lease, lease.fencing_epoch)).await.expect("first");
-            let second = exporter
-                .stage(pdata(&lease, lease.fencing_epoch))
-                .await
-                .expect("second");
-            reissue_lease(&store, &lease, CollectorInstanceId::new()).await;
-            exporter.backend.flush_pending().await.expect("flush");
-            tokio::time::timeout(std::time::Duration::from_secs(3), async {
-                assert!(
-                    first
-                        .wait()
-                        .await
-                        .expect_err("first fenced")
-                        .to_string()
-                        .contains("routing lease")
-                );
-                assert!(
-                    second
-                        .wait()
-                        .await
-                        .expect_err("second fenced")
-                        .to_string()
-                        .contains("routing lease")
-                );
-            })
+        let directory = tempfile::tempdir().expect("directory");
+        let store = Arc::new(MemoryRoutingStore::default());
+        let holder = CollectorInstanceId::new();
+        let lease = lease(&store, holder).await;
+        let metrics = Arc::new(RuntimeMetrics::new(holder));
+        let exporter = GenericDeltaExporter::with_batching(
+            directory.path().to_path_buf(),
+            Arc::clone(&store) as Arc<dyn RoutingStore>,
+            arrow_deltalake::commit::CommitOptions::default(),
+            FileBatchConfig {
+                max_batches_per_flush: 3,
+                max_age: std::time::Duration::from_secs(60),
+                pipeline_depth,
+                coalesce_publications: pipeline_depth > 1,
+                ..Default::default()
+            },
+            Arc::clone(&metrics),
+        )
+        .expect("exporter");
+        let first = exporter.stage(pdata(&lease, lease.fencing_epoch)).await.expect("first");
+        let second = exporter
+            .stage(pdata(&lease, lease.fencing_epoch))
             .await
-            .expect("bounded failures");
-            assert_eq!(exporter.backend.capacity.batches.available_permits(), 4096);
-            assert!(metrics.prometheus().contains("arrowcol_delta_files_total 0\n"));
-            assert!(metrics.prometheus().contains("arrowcol_delta_failures_total 1\n"));
+            .expect("second");
+        reissue_lease(&store, &lease, CollectorInstanceId::new()).await;
+        exporter.backend.flush_pending().await.expect("flush");
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            assert!(
+                first
+                    .wait()
+                    .await
+                    .expect_err("first fenced")
+                    .to_string()
+                    .contains("routing lease")
+            );
+            assert!(
+                second
+                    .wait()
+                    .await
+                    .expect_err("second fenced")
+                    .to_string()
+                    .contains("routing lease")
+            );
+        })
+        .await
+        .expect("bounded failures");
+        assert_eq!(exporter.backend.capacity.batches.available_permits(), 4096);
+        assert!(metrics.prometheus().contains("arrowcol_delta_files_total 0\n"));
+        assert!(metrics.prometheus().contains("arrowcol_delta_failures_total 1\n"));
         }
     }
 
