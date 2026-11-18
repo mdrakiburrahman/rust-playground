@@ -138,7 +138,11 @@ fn retain_admission_diagnostics(
     }
     let mut details = guard.as_ref().and_then(|guard| guard.get("admission_diagnostics")).cloned().unwrap_or_else(|| json!({}));
     if let Some(diff) = startup_readback_diff {
-        details["startup_readback_diff"] = diff;
+        if details["startup_readback_diff"].is_null() {
+            details["startup_readback_diff"] = diff;
+        } else if details["startup_readback_diff"] != diff {
+            details["post_client_startup_readback_diff"] = diff;
+        }
     }
     if let Some(guard) = guard {
         guard["admission_diagnostics"] = details.clone();
@@ -222,6 +226,37 @@ mod admission_diagnostics_tests {
         assert_eq!(details["startup_readback_diff"]["fields"], json!([
             {"field":"registration_ttl","requested":"15m","observed":"899s"}
         ]));
+        Ok(())
+    }
+
+    #[test]
+    fn post_client_mismatch_cannot_overwrite_first_admission_diff() -> Result<()> {
+        let first = startup_mismatch(
+            ComponentRole::Collector,
+            "ARROWCOL_COLLECTOR_PRESSURE_CONFIG",
+            &json!({"registration_ttl":"15m"}),
+            Some(&json!({"registration_ttl":"899s"})),
+        );
+        let later = startup_mismatch(
+            ComponentRole::Router,
+            "ARROWCOL_ROUTER_UPSTREAM_PING_INTERVAL_SECONDS",
+            &json!(5),
+            Some(&json!(6)),
+        );
+        let mut guard = json!({"status":"unavailable","admission_diagnostics":{"startup_readback_diff":first}});
+        let run = uuid::Uuid::new_v4().to_string();
+        let cell = uuid::Uuid::new_v4().to_string();
+        let root = std::env::temp_dir().join(format!("oat-admission-{run}"));
+        retain_admission_diagnostics(&root, &run, &cell, Some(&mut guard), Some(later.clone()));
+        let path = root.join(&run).join(format!("{cell}.json"));
+        let artifact: Value = serde_json::from_str(&fs::read_to_string(&path)?)?;
+        fs::remove_file(path)?;
+        fs::remove_dir(root.join(run))?;
+        fs::remove_dir(root)?;
+        let details = &artifact["admission_diagnostics"];
+        assert_eq!(details["startup_readback_diff"], first);
+        assert_eq!(details["post_client_startup_readback_diff"], later);
+        assert_eq!(details, &guard["admission_diagnostics"]);
         Ok(())
     }
 
