@@ -607,6 +607,7 @@ async fn run_batch_worker(
     let mut bytes = 0;
     let mut closing = false;
     let mut age_ready_remaining = None;
+    let mut schema_boundary: Option<(u64, Arc<arrow_schema::Schema>)> = None;
     let stage_metrics = StageMetrics::default();
     let mut publisher = GroupPublisher {
         table: &mut table,
@@ -708,9 +709,8 @@ async fn run_batch_worker(
                 continue;
             }
         };
-        if group.first().is_some_and(|first| {
-            first.target_schema_version != next.target_schema_version
-                || first.batch.schema_ref() != next.batch.schema_ref()
+        if schema_boundary.as_ref().is_some_and(|(version, schema)| {
+            *version != next.target_schema_version || schema != next.batch.schema_ref()
         }) {
             stage_metrics.record_flush(FlushReason::SchemaChange);
             publisher.publish(&mut group, &mut estimator).await;
@@ -730,6 +730,7 @@ async fn run_batch_worker(
         }
         rows += next.rows;
         bytes += next.bytes;
+        schema_boundary = Some((next.target_schema_version, next.batch.schema()));
         group.push(next);
         let flush_reason = estimator
             .flush_trigger(bytes)
