@@ -18,7 +18,7 @@ import { collectDataFlow } from './dataflow-verdict.js';
 import {
   buildOwnedServer, cleanupLocalComposeProjects, finishOwnedLocalRun, launchOat, main, OatLauncherDeadline, assertNoUnsettledDeadlineReceipts, readOatConfigForMode,
   processStartTicks, resolveCliConfigPath, resolveOatConfigPath, sendViewerFile,
-  isExactExitedLegacyServer, recordLegacyAksDisposition, startLocalServer, startLocalViewer, stopLocalServer, type OatRunStatus,
+  assertCanonicalAksLaunchWorkspace, isExactExitedLegacyServer, recordLegacyAksDisposition, startLocalServer, startLocalViewer, stopLocalServer, type OatRunStatus,
 } from './launch.js';
 
 const status = (state: OatRunStatus['state']) => ({
@@ -850,6 +850,23 @@ test('observed AKS disposition requires matching owned failure, writer fence and
     if (listener.listening) await closeListener();
     deadline.dispose();
     await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('AKS benchmark rejects a linked worktree with an empty launcher ledger', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'oat-aks-checkout-'));
+  const canonical = path.join(root, 'canonical');
+  const linked = path.join(root, 'linked');
+  const git = (...args: string[]) => execFileSync('git', args, { stdio: 'pipe' });
+  try {
+    git('init', canonical);
+    git('-C', canonical, '-c', 'user.name=OAT fixture', '-c', 'user.email=oat@example.invalid',
+      '-c', 'commit.gpgsign=false', 'commit', '--allow-empty', '-m', 'fixture');
+    git('-C', canonical, 'worktree', 'add', '--detach', linked);
+    await assertCanonicalAksLaunchWorkspace(canonical);
+    await assert.rejects(assertCanonicalAksLaunchWorkspace(linked), /primary checkout that owns the launcher receipt ledger/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
   }
 });
 

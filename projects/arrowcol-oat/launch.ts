@@ -816,6 +816,18 @@ async function syncLegacyReceiptDirectory(path: string): Promise<void> {
   }
 }
 
+export async function assertCanonicalAksLaunchWorkspace(root: string): Promise<void> {
+  const metadata = await lstat(resolve(root, '.git')).catch((error: unknown) => {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return undefined;
+    throw error;
+  });
+  if (!metadata?.isDirectory()) {
+    throw new Error(
+      `AKS benchmark submission requires the primary checkout that owns the launcher receipt ledger; refusing workspace ${root}`,
+    );
+  }
+}
+
 export async function assertNoUnsettledDeadlineReceipts(
   root = launcherDeadlineReceiptRoot, writeReceipt = writeAtomicJson, approvals = approvedAksDispositions,
 ): Promise<void> {
@@ -1671,6 +1683,7 @@ export async function main(
   if (cleanupRunId !== undefined && (requestedMode === 'aks' || requestedServerUrl || args.includes('--poll-ms') || args.includes('--viewer-only') || args.includes('--preflight-only') || deadlineSeconds !== undefined)) {
     throw new OatCliError('--cleanup-local requires local mode and cannot be combined with server, poll, viewer, or preflight options');
   }
+  if (requestedMode === 'aks' && !preflightOnly) await assertCanonicalAksLaunchWorkspace(workspaceRoot);
   if (requestedMode === 'aks') Object.assign(process.env, await loadAksEnvironment(workspaceRoot));
   if (preflightOnly) {
     if (requestedMode !== 'aks' || viewerOnly || requestedServerUrl || args.includes('--poll-ms')) {
