@@ -140,6 +140,22 @@ test('scale-out admits exactly one memory-only collector for the hot table with 
   assert.throws(() => validateRuntime({ ...config(), collectorReplicas: 2 }), /require campaignProfile/);
 });
 
+test('startup table is projected only for the exact scale-out hot table', async () => {
+  const c = scaleOutConfig();
+  const selector = { catalog: 'telemetry', schema: 'sqlserver', table: c.hotTable! };
+  c.collectorStartupTable = selector;
+  const resources = await renderRuntime(c, 'workload');
+  const collector = resources.find(item => item.kind === 'Deployment' && item.metadata.name === 'arrowcol')!;
+  const variable = collector.spec.template.spec.containers[0].env.find((entry: { name: string }) =>
+    entry.name === 'ARROWCOL_COLLECTOR_EXPORTER_CONFIG');
+  assert.deepEqual(JSON.parse(variable.value), { startup_table: selector });
+  for (const invalid of [null, '', [], {}, { ...selector, table: 'other' },
+    { ...selector, catalog: '' }, { ...selector, schema: 1 }, { ...selector, extra: true }]) {
+    await assert.rejects(renderRuntime({ ...c, collectorStartupTable: invalid }, 'workload'), /collectorStartupTable/);
+  }
+  assert.throws(() => validateRuntime({ ...config(), collectorStartupTable: selector }), /require campaignProfile/);
+});
+
 test('only explicit Quiver topology installs the durable processor and isolated pod storage', async () => {
   for (const quiver of [false, true]) {
     const objects = await renderRuntime({ ...config(), quiver }, 'workload');
