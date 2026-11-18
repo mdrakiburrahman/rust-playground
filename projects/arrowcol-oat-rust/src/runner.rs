@@ -1132,7 +1132,10 @@ struct AksPlatform {
     fic_prepare_attempted: bool,
     qap_record_path: Option<PathBuf>,
     qap_bind_attempted: bool,
+    qap_cleanup_confirmed: bool,
     qap_outcome_unresolved: bool,
+    run_table_initialization_attempted: bool,
+    run_table_initialization_drained: bool,
     workload_stop_record_path: Option<PathBuf>,
     schedule_configmap_name: String,
     service_account: Option<String>,
@@ -3633,7 +3636,10 @@ fn platform_for_run(config: &OatConfig, run_id: &str) -> Result<Box<dyn Platform
             fic_prepare_attempted: false,
             qap_record_path: None,
             qap_bind_attempted: false,
+            qap_cleanup_confirmed: false,
             qap_outcome_unresolved: false,
+            run_table_initialization_attempted: false,
+            run_table_initialization_drained: false,
             workload_stop_record_path: None,
             schedule_configmap_name: format!(
                 "oat-schedule-{}",
@@ -6838,6 +6844,9 @@ async fn run_aks_pin_setup_job(
                                 "name": "migration-password",
                                 "mountPath": "/run/migration",
                                 "readOnly": true,
+                            }, {
+                                "name": "pin-init-tmp",
+                                "mountPath": "/tmp",
                             }],
                         }],
                         "volumes": [{
@@ -6853,6 +6862,9 @@ async fn run_aks_pin_setup_job(
                                 "defaultMode": 288,
                                 "items": [{ "key": "password", "path": "password" }],
                             },
+                        }, {
+                            "name": "pin-init-tmp",
+                            "emptyDir": { "sizeLimit": "64Mi" },
                         }],
                     },
                 },
@@ -6865,6 +6877,9 @@ async fn run_aks_pin_setup_job(
             .context("pin-init Job template is missing")?;
         template["metadata"] = pod_labels;
         template["spec"]["containers"][0]["env"] = pod_env;
+    }
+    if run_table.is_some() {
+        platform.run_table_initialization_attempted = true;
     }
     let payload = serde_json::to_vec(&payload_items)?;
     let mut manifest: Value = serde_json::from_slice(&payload).context("parse pin initialization resources")?;
@@ -6880,6 +6895,9 @@ async fn run_aks_pin_setup_job(
 
     let expected_table = run_table.map(|(_, table)| table);
     wait_for_aks_pin_setup(config, &job_name, run_id, expected_table).await?;
+    if run_table.is_some() {
+        platform.run_table_initialization_drained = true;
+    }
     kubectl(
         config,
         vec![
@@ -7074,14 +7092,26 @@ fn validate_run_table_init_receipt(logs: &str, run_id: &str, table: &str) -> Res
             .filter(|value| value["kind"] == "oat_run_table_initialized")
     });
     let receipt = receipt.context("pin-init Job did not emit a run-table initialization receipt")?;
+    let delta = receipt.get("delta").context("pin-init receipt has no Delta metadata")?;
+    let table_id = delta
+        .get("table_id")
+        .and_then(Value::as_str)
+        .context("pin-init receipt has no Delta table ID")?;
+    let parsed_table_id = uuid::Uuid::parse_str(table_id).context("pin-init Delta table ID is not a UUID")?;
+    let schema_json = delta
+        .get("schema_json")
+        .and_then(Value::as_str)
+        .context("pin-init receipt has no Delta schema JSON")?;
+    let schema: Value = serde_json::from_str(schema_json).context("pin-init Delta schema JSON is invalid")?;
+    let expected_schema = arrowcol_loadgen::initialize::canonical_table_delta_schema(table)?;
     if receipt["run_id"] != run_id
         || receipt["table"] != table
         || receipt["publisher_drained"] != true
-        || receipt["delta"]["table_id"].as_str().is_none_or(str::is_empty)
-        || receipt["delta"]["version"] != 0
-        || receipt["delta"]["active_files"] != 0
-        || receipt["delta"]["partition_columns"] != json!(["__arrowcol_ingestion"])
-        || receipt["delta"]["schema_json"].as_str().is_none_or(str::is_empty)
+        || parsed_table_id.to_string() != table_id
+        || delta["version"] != 0
+        || delta["active_files"] != 0
+        || delta["partition_columns"] != json!(["__arrowcol_ingestion"])
+        || schema != expected_schema
     {
         bail!(
             "pin-init Job run-table receipt does not prove the exact empty canonical Delta table was initialized and drained"
@@ -11560,6 +11590,16 @@ async fn stop_aks_workloads_in_order(config: &OatConfig) -> Result<Value> {
     }))
 }
 
+fn require_aks_cleanup_confirmation(platform: &AksPlatform) -> Result<()> {
+    if platform.run_table_initialization_attempted && !platform.run_table_initialization_drained {
+        bail!("run-table initializer publisher drain was not positively confirmed");
+    }
+    if platform.qap_bind_attempted && !platform.qap_cleanup_confirmed {
+        bail!("run-owned QAP cleanup was not positively confirmed");
+    }
+    Ok(())
+}
+
 async fn cleanup_aks_platform(config: &OatConfig, platform: &mut AksPlatform) -> Result<()> {
     let mut failures = Vec::new();
     let mut namespace_removed = false;
@@ -11578,7 +11618,10 @@ async fn cleanup_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
     }
     if config.campaign_profile == Some(crate::config::CampaignProfile::SingleHotTable) {
         match cleanup_campaign_aks_platform(config, platform).await {
-            Ok(evidence) => platform.shutdown_drain_evidence = Some(evidence),
+            Ok(evidence) => {
+                platform.shutdown_drain_evidence = Some(evidence);
+                platform.qap_cleanup_confirmed = true;
+            }
             Err(error) => {
                 let detail = format!("{error:#}");
                 platform.shutdown_drain_evidence = Some(json!({
@@ -11588,6 +11631,9 @@ async fn cleanup_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
                 }));
                 failures.push(format!("custody-managed AKS cleanup failed: {detail}"));
             }
+        }
+        if let Err(error) = require_aks_cleanup_confirmation(platform) {
+            failures.push(format!("AKS cleanup confirmation withheld: {error:#}"));
         }
         if let Some(runtime_dir) = platform.runtime_dir.take() {
             let retention = runtime_evidence_retention(
@@ -11689,8 +11735,9 @@ async fn cleanup_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
                                 }
                                 Err(error) => Err(error),
                             };
-                            if let Err(error) = cleanup_result {
-                                failures.push(format!("remove exact run-owned QAP bindings: {error:#}"));
+                            match cleanup_result {
+                                Ok(()) => platform.qap_cleanup_confirmed = true,
+                                Err(error) => failures.push(format!("remove exact run-owned QAP bindings: {error:#}")),
                             }
                         }
                         _ => failures.push("QAP cleanup requires both ownership and workload-stop records".to_owned()),
@@ -11731,6 +11778,9 @@ async fn cleanup_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
         } else {
             failures.push("workload identity cleanup has no durable run record path".to_owned());
         }
+    }
+    if let Err(error) = require_aks_cleanup_confirmation(platform) {
+        failures.push(format!("AKS cleanup confirmation withheld: {error:#}"));
     }
     if let Some(runtime_dir) = platform.runtime_dir.take() {
         let retention = runtime_evidence_retention(
@@ -15202,7 +15252,10 @@ mod tests {
             fic_prepare_attempted: true,
             qap_record_path: None,
             qap_bind_attempted: true,
-            qap_outcome_unresolved: false,
+            qap_cleanup_confirmed: false,
+            qap_outcome_unresolved: true,
+            run_table_initialization_attempted: false,
+            run_table_initialization_drained: false,
             workload_stop_record_path: None,
             schedule_configmap_name: String::new(),
             service_account: None,
@@ -15210,12 +15263,20 @@ mod tests {
             shutdown_drain_evidence: None,
             campaign_cli_paths: None,
         };
+        platform.run_table_initialization_attempted = true;
+        assert!(require_aks_cleanup_confirmation(&platform).is_err());
+        platform.run_table_initialization_drained = true;
+        assert!(require_aks_cleanup_confirmation(&platform).is_err());
+        platform.qap_cleanup_confirmed = true;
+        require_aks_cleanup_confirmation(&platform)?;
+        platform.qap_cleanup_confirmed = false;
         let error = cleanup_aks_platform(&config, &mut platform)
             .await
             .err()
             .context("AKS stop must fail")?;
         let error = format!("{error:#}");
         assert!(error.contains("fixture deployment stop failed"));
+        assert!(error.contains("run-owned QAP cleanup was not positively confirmed"));
         assert!(error.contains("retaining owned resources"));
         assert!(platform.namespace_created);
         assert!(fixture.join("namespace.json").exists(), "namespace must be retained");
@@ -15562,26 +15623,37 @@ mod tests {
     }
 
     #[test]
-    fn run_table_init_receipt_is_required_before_pin_setup_succeeds() -> Result<()> {
+    fn run_table_init_receipt_requires_canonical_schema_and_table_id() -> Result<()> {
         let run_id = "00000000-0000-0000-0000-000000000001";
         let table = "telemetry.sqlserver.sqlserver_availability_replica_states";
+        let schema = arrowcol_loadgen::initialize::canonical_table_delta_schema(table)?;
         let receipt = json!({
             "kind": "oat_run_table_initialized",
             "run_id": run_id,
             "table": table,
             "publisher_drained": true,
             "delta": {
-                "table_id": "canonical-table-id",
+                "table_id": "550e8400-e29b-41d4-a716-446655440000",
                 "version": 0,
                 "active_files": 0,
                 "partition_columns": ["__arrowcol_ingestion"],
-                "schema_json": "{}",
+                "schema_json": serde_json::to_string(&schema)?,
             },
         });
         let logs = format!("{}\ninitialized OAT pin set run_id={run_id}", receipt);
         validate_run_table_init_receipt(&logs, run_id, table)?;
         assert!(validate_run_table_init_receipt("initialized OAT pin set", run_id, table).is_err());
         assert!(validate_run_table_init_receipt(&logs, "00000000-0000-0000-0000-000000000002", table).is_err());
+
+        let mut invalid_schema = receipt.clone();
+        invalid_schema["delta"]["schema_json"] = Value::String("{}".to_owned());
+        let invalid_logs = format!("{}\ninitialized OAT pin set run_id={run_id}", invalid_schema);
+        assert!(validate_run_table_init_receipt(&invalid_logs, run_id, table).is_err());
+
+        let mut invalid_table_id = receipt;
+        invalid_table_id["delta"]["table_id"] = Value::String("not-a-table-id".to_owned());
+        let invalid_logs = format!("{}\ninitialized OAT pin set run_id={run_id}", invalid_table_id);
+        assert!(validate_run_table_init_receipt(&invalid_logs, run_id, table).is_err());
         Ok(())
     }
 

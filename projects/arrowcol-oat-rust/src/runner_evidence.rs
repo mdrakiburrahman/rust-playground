@@ -2047,6 +2047,7 @@ mod downstream_runner_tests {
         InitUnavailable,
         InitRequired,
         InitTimeout,
+        PinInitFailed,
         ObservationUnavailable,
         InitBindingRejected,
         ObservationBindingRejected,
@@ -2063,6 +2064,9 @@ mod downstream_runner_tests {
         endpoint: String,
         start: std::sync::atomic::AtomicU64,
         clients_started: usize,
+        pin_init_calls: usize,
+        qap_initialization_calls: usize,
+        client_fleet_prepared: bool,
         client_schedule_wait_seconds: Option<u64>,
         arm_attempts: usize,
         arm_started: Option<tokio::time::Instant>,
@@ -2108,6 +2112,10 @@ mod downstream_runner_tests {
             Ok(())
         }
         async fn initialize_run_table_pins(&mut self, _: &OatConfig, _: &str, _: &str, _: u64, _: u64) -> Result<()> {
+            self.pin_init_calls += 1;
+            if matches!(self.fault, Fault::PinInitFailed) {
+                bail!("fixture run-table initialization failed");
+            }
             Ok(())
         }
         fn qap_observation_mode(&self) -> arrowcol_loadgen::ObservationMode {
@@ -2117,6 +2125,7 @@ mod downstream_runner_tests {
             Ok("loadtest".to_owned())
         }
         async fn initialize_qap(&mut self, _: &OatConfig, _: &str, _: &[String]) -> Result<Vec<String>> {
+            self.qap_initialization_calls += 1;
             match self.fault {
                 Fault::InitRequired => bail!("required_binding_setup_failed"),
                 Fault::InitTimeout => std::future::pending().await,
@@ -2146,6 +2155,7 @@ mod downstream_runner_tests {
             self.unresolved = true;
         }
         async fn prepare_client_fleet(&mut self, _: &OatConfig, _: &str) -> Result<()> {
+            self.client_fleet_prepared = true;
             Ok(())
         }
         async fn start_client(
@@ -2285,6 +2295,9 @@ mod downstream_runner_tests {
             endpoint,
             start: std::sync::atomic::AtomicU64::new(0),
             clients_started: 0,
+            pin_init_calls: 0,
+            qap_initialization_calls: 0,
+            client_fleet_prepared: false,
             client_schedule_wait_seconds: None,
             arm_attempts: 0,
             arm_started: None,
@@ -2320,6 +2333,10 @@ mod downstream_runner_tests {
         if results.exists() {
             fs::remove_dir_all(&results)?;
         }
+        if matches!(fault, Fault::PinInitFailed) {
+            anyhow::ensure!(result.is_err(), "injected run-table initialization failure was ignored");
+            return Ok((Vec::new(), platform));
+        }
         Ok((result?, platform))
     }
 
@@ -2332,6 +2349,7 @@ mod downstream_runner_tests {
             kind: crate::config::OatMode::Local, fault: Fault::InitUnavailable,
             endpoint: "http://127.0.0.1:1".to_owned(),
             start: std::sync::atomic::AtomicU64::new(0), clients_started: 0,
+            pin_init_calls: 0, qap_initialization_calls: 0, client_fleet_prepared: false,
             client_schedule_wait_seconds: None, unresolved: false,
             arm_attempts: 0, arm_started: None,
             delivery_drop_ms: std::sync::atomic::AtomicU64::new(0),
@@ -2342,6 +2360,17 @@ mod downstream_runner_tests {
         assert!(report.failure.as_deref().is_some_and(|reason| reason.contains("protection unavailable")));
         assert_eq!(report.evidence.overload_guard.as_ref().map(|guard| &guard["status"]), Some(&json!("unavailable")));
         assert!(report.evidence.overload_stop.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_table_initialization_failure_stops_before_client_admission() -> Result<()> {
+        let (_, platform) = run_fault(Fault::PinInitFailed, crate::config::OatMode::Local).await?;
+        assert_eq!(platform.pin_init_calls, 1);
+        assert_eq!(platform.clients_started, 0);
+        assert!(!platform.client_fleet_prepared);
+        assert_eq!(platform.qap_initialization_calls, 0);
+        assert_eq!(platform.arm_attempts, 0);
         Ok(())
     }
 

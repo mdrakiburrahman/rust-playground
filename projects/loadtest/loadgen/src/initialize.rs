@@ -11,6 +11,7 @@ use arrow_deltalake::delta::{
 use arrow_deltalake::publisher::{ControlMetadata, MutationRetries, PublisherSession, SessionMode, canonical_uuid};
 use arrow_deltalake::qap_http::{StorageBridge, StorageBridgeAuthority};
 use arrowcol_catalog::{DdlCommand, DdlParser};
+use delta_kernel::engine::arrow_conversion::TryFromArrow;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};
 use url::Url;
@@ -486,6 +487,21 @@ pub fn canonical_table_target(dataflow_root: &Url, table: &str) -> Result<(Url, 
     let mut root = dataflow_root.clone();
     root.set_path(&format!("{}/", root_path));
     Ok((root.join(relative_path)?, schema))
+}
+
+/// Return the exact canonical Delta schema for a registered table, including its ingestion field.
+///
+/// # Errors
+/// Rejects unknown table identities or schemas that cannot be represented by Delta Kernel.
+pub fn canonical_table_delta_schema(table: &str) -> Result<serde_json::Value> {
+    let statement = schema_statements()?
+        .into_iter()
+        .find(|statement| statement.identity.to_string() == table)
+        .context("requested table is not in the canonical schema registry")?;
+    let (_, schema) = canonical_entry(&statement)?;
+    let normalized = arrow_deltalake::normalize::schema(&schema)?;
+    let delta_schema = delta_kernel::schema::StructType::try_from_arrow(normalized.as_ref())?;
+    Ok(serde_json::to_value(delta_schema)?)
 }
 
 /// Initialize only selected, fresh local table directories; existing tables are never opened.

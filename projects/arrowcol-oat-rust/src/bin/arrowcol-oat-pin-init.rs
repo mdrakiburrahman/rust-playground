@@ -255,7 +255,8 @@ async fn initialize_fresh_run_table(run_table: &RunTableInitialization) -> Resul
         )
     })
     .await
-    .map_err(|error| anyhow::anyhow!("join run-table schema initialization: {error}"))?;
+    .map_err(|error| anyhow::anyhow!("join run-table schema initialization: {error}"))
+    .and_then(|result| result);
     let drained = session.close_after_drain_async().await;
     match (initialization, drained) {
         (Ok(receipt), Ok(())) => Ok(receipt),
