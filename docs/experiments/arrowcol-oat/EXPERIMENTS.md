@@ -13,6 +13,8 @@ ran. Earlier parse-only drafts with 19 `TODO` table slots and fixed 30/120-secon
 timings are historical receipts, not executable inputs. The binder reads the
 now-approved canonical fixture rather than copying or inventing table names.
 
+When `clients_per_table_sweep` is set, the Data Flow verdict requires one result per table for every declared replica, DFE concurrency, and client-count combination. The rows for a combination must share its cell run UUID, and different combinations must have distinct UUIDs. Other tunables are fixed within one orchestration.
+
 The `scale_out_single_table` profile reports ranked commit-window throughput only when Delta-log reconciliation is `matched`. Missing, unavailable, or mismatched reconciliation produces a failed, unranked result; raw commit-window and client observations remain diagnostic. Downstream QAP availability is reported separately.
 
 ## Local launcher deadline and recovery

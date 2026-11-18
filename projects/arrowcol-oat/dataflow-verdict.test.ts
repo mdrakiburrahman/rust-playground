@@ -94,6 +94,26 @@ test('only the launched orchestration, exact source revision and full matrix can
   }
 });
 
+test('client sweep verifies declared coordinates and their distinct actual cell UUIDs', () => {
+  const secondCell = '33333333-3333-4333-8333-333333333333';
+  const point = (clients_per_table: number | undefined, run_id: string) => row({
+    run_id, tunables_json: JSON.stringify({ orchestration_run_id: orchestration, clients_per_table }),
+  });
+  const one = point(1, cell);
+  const two = point(2, secondCell);
+  const sweep = { ...config, clients_per_table_sweep: [1, 2] };
+  const evaluate = (rows: Record<string, unknown>[]) =>
+    evaluateDataFlow({ ...status, result_count: rows.length }, rows, sha, 'aks', sweep);
+  const covered = evaluate([two, one]);
+  assert.equal(covered.pass, true, covered.reasons.join('; '));
+  assert.match(evaluate([one]).reasons.join(), /does not cover the expected experiment matrix/);
+  assert.match(evaluate([one, point(3, secondCell)]).reasons.join(), /undeclared clients_per_table sweep coordinate/);
+  assert.match(evaluate([one, point(undefined, secondCell)]).reasons.join(), /missing or undeclared clients_per_table/);
+  assert.match(evaluate([one, point(2, cell)]).reasons.join(), /reused matrix cell run_id/);
+  assert.match(evaluate([one, point(1, secondCell)]).reasons.join(), /inconsistent matrix cell run_id/);
+  assert.equal(evaluateDataFlow(status, [two], sha, 'aks', { ...sweep, clients_per_table_sweep: [2] }).pass, true);
+});
+
 test('failed state, empty output, bad throughput and pinning fail with concrete reasons', () => {
   const failed = evaluateDataFlow({ ...status, state: 'failed', error: 'client crashed' }, [], sha, 'local', config);
   assert.equal(failed.pass, false);

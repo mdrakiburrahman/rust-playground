@@ -148,8 +148,16 @@ export function evaluateDataFlow(
   const replicas = Array.isArray(config.replica_counts) ? config.replica_counts : [];
   const concurrency = Array.isArray(config.dfe_worker_concurrency) ? config.dfe_worker_concurrency : [];
   if (!tables.length || !replicas.length || !concurrency.length) reasons.push('expected experiment matrix is missing');
+  const clientSweep = config.clients_per_table_sweep;
+  const hasClientSweep = clientSweep != null;
+  const clientCounts = !hasClientSweep ? [undefined] : Array.isArray(clientSweep) ? clientSweep.map(integer) : [];
+  if (hasClientSweep && (!clientCounts.length || clientCounts.some((count) => count === undefined || count === 0n) ||
+      new Set(clientCounts).size !== clientCounts.length)) reasons.push('invalid clients_per_table_sweep in expected experiment matrix');
+  const cellKey = (replica: unknown, worker: unknown, clients: bigint | undefined) =>
+    `${String(replica)}:${String(worker)}${hasClientSweep ? `:${String(clients)}` : ''}`;
   const expected = new Set(replicas.flatMap((replica) =>
-    concurrency.flatMap((worker) => tables.map((table) => `${replica}:${worker}:${table}`))));
+    concurrency.flatMap((worker) => clientCounts.flatMap((clients) =>
+      tables.map((table) => `${cellKey(replica, worker, clients)}:${table}`)))));
   const seen = new Set<string>();
   const cells = new Map<string, string>();
   const cellIds = new Map<string, string>();
@@ -193,10 +201,14 @@ export function evaluateDataFlow(
     if ((integer(row.rows) ?? 0n) <= 0n) reasons.push(`${label}: zero or invalid measured rows`);
     if ((integer(row.duration_ms) ?? 0n) <= 0n) reasons.push(`${label}: zero or invalid duration`);
     if (typeof row.rows_per_second !== 'number' || !Number.isFinite(row.rows_per_second) || row.rows_per_second <= 0) reasons.push(`${label}: invalid rows per second`);
-    const key = `${String(row.replicas)}:${String(row.dfe_worker_concurrency)}:${label}`;
+    const clients = hasClientSweep ? integer(tunables(row)?.clients_per_table) : undefined;
+    if (hasClientSweep && (clients === undefined || !clientCounts.includes(clients))) {
+      reasons.push(`${label}: missing or undeclared clients_per_table sweep coordinate`);
+    }
+    const cell = cellKey(row.replicas, row.dfe_worker_concurrency, clients);
+    const key = `${cell}:${label}`;
     if (!expected.has(key) || seen.has(key)) reasons.push(`${label}: unexpected or duplicate matrix result`);
-    seen.add(key);
-    const cell = `${String(row.replicas)}:${String(row.dfe_worker_concurrency)}`;
+    if (expected.has(key)) seen.add(key);
     if (cells.has(cell) && cells.get(cell) !== row.run_id) reasons.push(`${label}: inconsistent matrix cell run_id`);
     cells.set(cell, String(row.run_id));
     if (cellIds.has(String(row.run_id)) && cellIds.get(String(row.run_id)) !== cell) reasons.push(`${label}: reused matrix cell run_id`);
