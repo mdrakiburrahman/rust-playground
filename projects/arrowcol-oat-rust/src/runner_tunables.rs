@@ -267,9 +267,9 @@ mod tunable_injection_tests {
             "subscriptionId":"00000000-0000-0000-0000-000000000002", "stamp":"89152",
             "deltaRoot":"abfss://onelake@arrowcollector89152.dfs.core.windows.net/dataflow",
             "effective_stop_budgets":{"maintenance_grace_seconds":4800,"maintenance_stop_timeout_ms":5100000},
-            "images": ["sqlserver","catalog","router","dataflow","maintenance"].into_iter()
+            "images": (["sqlserver","catalog","router","dataflow","maintenance"].into_iter()
                 .map(|role| (role.to_owned(), format!("arrowcollector89152.azurecr.io/{role}@sha256:{}", "a".repeat(64))))
-                .collect::<std::collections::BTreeMap<_,_>>(),
+                .collect::<std::collections::BTreeMap<_,_>>()),
             "quiver":false,
             "maintenance":{"tables":["telemetry.sqlserver.sqlserver_availability_replica_states"],
                 "operations":["optimize","checkpoint","purge","vacuum","prune-log"],"apply":true}
