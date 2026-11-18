@@ -97,7 +97,7 @@ export function generatePools(input: unknown, config: StampConfig, options: Opti
   }
   if (regional < 0 || [...preservedFamilies].some(family => ledger.get(family)!.remaining < 0))
     throw new Failure('Insufficient quota to reserve preserved pool maxima and upgrade surge.');
-  const existing = new Set([config.aks.systemPool, ...config.aks.userPools].map(p => p.vmSize.toLowerCase()));
+  const existing = new Set(config.aks.userPools.map(p => p.vmSize.toLowerCase()));
   const dropped: Array<{ vmSize: string; reason: string }> = [];
   const candidates = inventory.skus.filter(s => {
     let reason = '';

@@ -63,7 +63,7 @@ test('generates deterministic quota-budgeted pools without modifying preserved p
   });
   const inventory = { schema: 'arrowcol-sku-inventory/v1', region: config.location, capturedAt: '2026-01-01T00:00:00Z',
     regionalVcpu: { limit: 10000, used: 0 }, skus: [
-      sku('Standard_D8ds_v6', 'd', 8), sku('Standard_D64ds_v6', 'd', 64), sku('Standard_E64ds_v6', 'e', 64),
+      { ...sku('Standard_D8ds_v6', 'd', 8), aksEligible: false }, sku('Standard_D64ds_v6', 'd', 64), sku('Standard_E64ds_v6', 'e', 64),
       sku('Standard_LongSkuName128_v1', 'x', 128), { ...sku('Standard_LongSkuName128-64_v1', 'x', 64, 128), networkGbps: 20 },
       { ...sku('Standard_Bad_v1', 'x', 32), restricted: true },
       { ...sku('Standard_Arm_v1', 'x', 32), architecture: 'arm64' },
