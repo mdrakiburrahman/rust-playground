@@ -76,6 +76,13 @@ test('generates deterministic quota-budgeted pools without modifying preserved p
   assert.ok(result.newPools.every(pool => /^[a-z][a-z0-9]{0,11}$/.test(pool.name) && pool.initialCount === 0 && pool.minCount === 0));
   assert.equal(new Set(result.newPools.map(pool => pool.name)).size, 2);
   assert.equal(result.charges[1]?.quotaVcpus, 128);
+  for (const quotaVcpus of [undefined, null, 63]) {
+    const invalid = { ...inventory, skus: inventory.skus.map((s, i) => i === 4 ? { ...s, quotaVcpus } : s) };
+    assert.throws(() => generatePools(invalid, config), /quotaVcpus must be an integer >= 64/);
+  }
+  const { quotaVcpus: _omitted, ...withoutQuota } = inventory.skus[4]!;
+  const missing = { ...inventory, skus: inventory.skus.map((s, i) => i === 4 ? withoutQuota : s) };
+  assert.throws(() => generatePools(missing, config), /quotaVcpus must be an integer >= 64/);
   assert.deepEqual(generatePools({ ...inventory, skus: [...inventory.skus].reverse() }, config).newPools, result.newPools);
   assert.equal(generatePools(inventory, config, { arrowcolSku: 'Standard_LongSkuName128-64_v1' }).collector.vmSize, 'Standard_LongSkuName128-64_v1');
   assert.throws(() => generatePools(inventory, config, { arrowcolSku: 'Standard_Arm_v1' }), /collector fits/);
@@ -93,6 +100,12 @@ test('generates deterministic quota-budgeted pools without modifying preserved p
 
   const constrained = structuredClone(inventory);
   constrained.skus.filter(s => s.family === 'x').forEach(s => { s.familyVcpuLimit = 300; });
+  assert.equal(generatePools(constrained, config).newPools.length, 1);
+  constrained.skus.filter(s => s.family === 'x').forEach(s => { s.familyVcpuLimit = 200; });
+  assert.throws(() => generatePools(constrained, config, { arrowcolSku: 'Standard_LongSkuName128-64_v1' }), /collector fits/);
+  constrained.skus.filter(s => s.family === 'x').forEach(s => { s.familyVcpuLimit = 384; });
+  assert.equal(generatePools(constrained, config).newPools.length, 2);
+  constrained.skus.filter(s => s.family === 'x').forEach(s => { s.familyVcpuLimit = 383; });
   assert.equal(generatePools(constrained, config).newPools.length, 1);
   const regional = structuredClone(inventory);
   regional.regionalVcpu.limit = 850;

@@ -41,7 +41,7 @@ function inventoryFrom(input: unknown): Inventory {
         (s.architecture !== undefined && typeof s.architecture !== 'string'))
       throw new Failure(`Invalid SKU record ${i}.`);
     const vcpus = number(s.vcpus, `${s.vmSize} vcpus`, 1);
-    return { vmSize: s.vmSize, family: s.family, vcpus, quotaVcpus: number(s.quotaVcpus ?? vcpus, `${s.vmSize} quotaVcpus`, vcpus),
+    return { vmSize: s.vmSize, family: s.family, vcpus, quotaVcpus: number(s.quotaVcpus, `${s.vmSize} quotaVcpus`, vcpus),
       memoryGiB: s.memoryGiB, networkGbps: s.networkGbps as number | null, zones: s.zones as string[],
       restricted: s.restricted, aksEligible: s.aksEligible, familyVcpuLimit: number(s.familyVcpuLimit, `${s.vmSize} family limit`),
       familyVcpuUsed: number(s.familyVcpuUsed, `${s.vmSize} family used`), architecture: s.architecture as string | undefined };
