@@ -18,7 +18,7 @@ import { collectDataFlow } from './dataflow-verdict.js';
 import {
   buildOwnedServer, cleanupLocalComposeProjects, finishOwnedLocalRun, launchOat, main, OatLauncherDeadline, assertNoUnsettledDeadlineReceipts, readOatConfigForMode,
   processStartTicks, resolveCliConfigPath, resolveOatConfigPath, sendViewerFile,
-  recordLegacyAksDisposition, startLocalServer, startLocalViewer, stopLocalServer, type OatRunStatus,
+  isExactExitedLegacyServer, recordLegacyAksDisposition, startLocalServer, startLocalViewer, stopLocalServer, type OatRunStatus,
 } from './launch.js';
 
 const status = (state: OatRunStatus['state']) => ({
@@ -596,6 +596,17 @@ test('accepted receipts with unverified platforms refuse recovery without any re
   } finally {
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
   }
+});
+
+test('legacy AKS disposition recognizes only the exact exited, unreaped single-task Rust server', () => {
+  const pid = 1234;
+  const stat = (state: string, parent: number, ticks: string) =>
+    pid + ' (rust with ) chars) ' + [state, parent, ...Array(17).fill('0'), ticks].join(' ');
+  assert.ok(isExactExitedLegacyServer(stat('Z', 1, '42'), ['1234'], pid, '42'));
+  assert.equal(isExactExitedLegacyServer(stat('S', 1, '42'), ['1234'], pid, '42'), false);
+  assert.equal(isExactExitedLegacyServer(stat('Z', 1, '43'), ['1234'], pid, '42'), false);
+  assert.equal(isExactExitedLegacyServer(stat('Z', 2, '42'), ['1234'], pid, '42'), false);
+  assert.equal(isExactExitedLegacyServer(stat('Z', 1, '42'), ['1234', '1235'], pid, '42'), false);
 });
 
 test('legacy AKS disposition is one-time, exact, and does not rewrite the failed receipt', {

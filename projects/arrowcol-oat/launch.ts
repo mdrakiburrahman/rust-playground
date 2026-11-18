@@ -591,6 +591,7 @@ function validateLegacyAksDisposition(original: Buffer, evidence: Buffer, approv
       !isLegacyTime(fence.launcher.pid) || !isLegacyTime(fence.server.pid) ||
       fence.launcher.pid === fence.server.pid || fence.server.ppid !== fence.launcher.pid ||
       !isLegacyIdentity(fence.launcher.start_ticks) || !isLegacyIdentity(fence.server.start_ticks) ||
+      !/^[1-9][0-9]*$/.test(fence.server.start_ticks) ||
       !isLegacyIdentity(fence.launcher.executable) || !isLegacyIdentity(fence.server.executable) ||
       !isLegacyTime(fence.fenced_at_unix_ms) || fence.fenced_at_unix_ms < terminal.finished_at_unix_ms ||
       !isLegacyTime(cell.namespace_absent_at_unix_ms) || !isLegacyTime(cell.fic_absent_at_unix_ms) ||
@@ -599,9 +600,29 @@ function validateLegacyAksDisposition(original: Buffer, evidence: Buffer, approv
   }
   return {
     bootId: fence.boot_id, pidNamespace: fence.pid_namespace, netNamespace: fence.net_namespace,
-    launcherPid: fence.launcher.pid, serverPid: fence.server.pid,
+    launcherPid: fence.launcher.pid, serverPid: fence.server.pid, serverStartTicks: fence.server.start_ticks,
     serverUrl: receipt.server_url, namespaceObserved: cell.namespace_absent_at_unix_ms, ficObserved: cell.fic_absent_at_unix_ms,
   };
+}
+
+export function isExactExitedLegacyServer(stat: string, tasks: string[], pid: number, startTicks: string): boolean {
+  const commandEnd = stat.lastIndexOf(') ');
+  if (!stat.startsWith(pid + ' (') || commandEnd < 0) return false;
+  const fields = stat.slice(commandEnd + 2).trim().split(/\s+/);
+  return fields[0] === 'Z' && fields[1] === '1' && fields[19] === startTicks &&
+    tasks.length === 1 && tasks[0] === String(pid);
+}
+
+async function legacyServerHasExited(pid: number, startTicks: string): Promise<boolean> {
+  const directory = '/proc/' + pid;
+  let statText: string;
+  try {
+    statText = await readFile(directory + '/stat', 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return true;
+    throw error;
+  }
+  return isExactExitedLegacyServer(statText, await readdir(directory + '/task'), pid, startTicks);
 }
 
 async function assertLegacyWritersAbsent(proof: ReturnType<typeof validateLegacyAksDisposition>): Promise<void> {
@@ -616,7 +637,7 @@ async function assertLegacyWritersAbsent(proof: ReturnType<typeof validateLegacy
   };
   if (process.platform !== 'linux' || (await readFile('/proc/sys/kernel/random/boot_id', 'utf8')).trim() !== proof.bootId ||
       await readlink('/proc/self/ns/pid') !== proof.pidNamespace || await readlink('/proc/self/ns/net') !== proof.netNamespace ||
-      !await pidAbsent(proof.launcherPid) || !await pidAbsent(proof.serverPid)) {
+      !await pidAbsent(proof.launcherPid) || !await legacyServerHasExited(proof.serverPid, proof.serverStartTicks)) {
     throw new Error('Legacy AKS disposition requires the exact original Linux boot/PID namespace and exited launcher and server');
   }
   const url = new URL(proof.serverUrl);

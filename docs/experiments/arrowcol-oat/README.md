@@ -119,9 +119,9 @@ disposition for one separately approved, single-cell failure before load. It
 requires the exact original receipt, independently verified current resource
 absence after fencing the old writers, and an exact evidence digest pinned in
 the reviewed launcher. Replay and admission also require the original Linux
-boot and namespaces with no original process IDs or listener present. The
-command never stops processes, deletes resources, changes the original receipt,
-or ranks the run.
+boot and namespaces, no original listener, and both original processes exited.
+The exact unreaped Rust server is accepted only with no other tasks. The command
+never stops processes, deletes resources, changes the receipt, or ranks the run.
 
 Old Compose projects named with only the first eight UUID characters are ambiguous. Cleanup refuses them without deleting resources or state; inspect ownership and clean up those legacy projects manually.
 
