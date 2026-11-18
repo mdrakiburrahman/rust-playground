@@ -110,10 +110,200 @@ fn verify_catalog_registration_pods_absent(output: &str) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct CatalogRegistrationDeadline(tokio::time::Instant);
+
+impl CatalogRegistrationDeadline {
+    async fn run<T>(&self, future: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+        let expired = || {
+            anyhow::anyhow!(
+                "catalog registration whole-stage deadline exceeded; maintenance and load admission are forbidden"
+            )
+        };
+        if tokio::time::Instant::now() >= self.0 {
+            return Err(expired());
+        }
+        let result = tokio::time::timeout_at(self.0, future).await.map_err(|_| expired())?;
+        if tokio::time::Instant::now() >= self.0 {
+            return Err(expired());
+        }
+        result
+    }
+
+    async fn kubectl(&self, config: &OatConfig, args: Vec<&str>, stdin: Option<Vec<u8>>) -> Result<String> {
+        self.run(kubectl(config, args, stdin)).await
+    }
+}
+
+fn registration_pod_identity(pod: &Value, namespace: &str, job_name: &str, job_uid: &str) -> Result<(String, String)> {
+    if pod["metadata"]["namespace"] != namespace
+        || !pod
+            .pointer("/metadata/ownerReferences")
+            .and_then(Value::as_array)
+            .is_some_and(|owners| {
+                owners.iter().any(|owner| {
+                    owner["kind"] == "Job"
+                        && owner["name"] == job_name
+                        && owner["uid"] == job_uid
+                        && owner["controller"] == true
+                })
+            })
+        || !pod
+            .pointer("/spec/containers")
+            .and_then(Value::as_array)
+            .is_some_and(|containers| {
+                containers
+                    .iter()
+                    .any(|container| container["name"] == "catalog-registration")
+            })
+    {
+        bail!("catalog registration Pod is not controlled by the recorded Job UID");
+    }
+    let name = pod
+        .pointer("/metadata/name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .context("catalog registration Pod name missing")?;
+    let uid = pod
+        .pointer("/metadata/uid")
+        .and_then(Value::as_str)
+        .context("catalog registration Pod UID missing")?;
+    uuid::Uuid::parse_str(uid).context("catalog registration Pod UID invalid")?;
+    Ok((name.to_owned(), uid.to_owned()))
+}
+
+async fn registration_job_logs(
+    deadline: CatalogRegistrationDeadline,
+    config: &OatConfig,
+    job_name: &str,
+    job_uid: &str,
+) -> Result<(String, String)> {
+    let selector = format!("controller-uid={job_uid}");
+    let output = deadline
+        .kubectl(
+            config,
+            vec![
+                "get",
+                "pods",
+                "--namespace",
+                &config.namespace,
+                "--selector",
+                &selector,
+                "-o",
+                "json",
+            ],
+            None,
+        )
+        .await
+        .context("select catalog registration Pod by recorded Job UID")?;
+    let list: Value = serde_json::from_str(&output).context("parse catalog registration Pod selection")?;
+    let pods = list
+        .get("items")
+        .and_then(Value::as_array)
+        .context("registration Pod list missing")?;
+    let [pod] = pods.as_slice() else {
+        bail!("catalog registration requires exactly one Pod belonging to the recorded Job UID");
+    };
+    let (name, uid) = registration_pod_identity(pod, &config.namespace, job_name, job_uid)?;
+    let logs = deadline
+        .kubectl(
+            config,
+            vec![
+                "logs",
+                "--namespace",
+                &config.namespace,
+                "--selector",
+                &selector,
+                "--container",
+                "catalog-registration",
+                "--tail=-1",
+                "--max-log-requests=1",
+            ],
+            None,
+        )
+        .await
+        .context("read UID-bound catalog registration Pod logs")?;
+    let observed = deadline
+        .kubectl(
+            config,
+            vec![
+                "get",
+                "pods",
+                "--namespace",
+                &config.namespace,
+                "--selector",
+                &selector,
+                "-o",
+                "json",
+            ],
+            None,
+        )
+        .await
+        .context("recheck catalog registration Pod identity after log read")?;
+    let observed: Value = serde_json::from_str(&observed).context("parse registration Pod identity recheck")?;
+    let remaining = observed
+        .get("items")
+        .and_then(Value::as_array)
+        .context("registration Pod recheck list missing")?;
+    let [observed] = remaining.as_slice() else {
+        bail!("catalog registration Pod selection changed during log read; receipt remains unconfirmed");
+    };
+    if registration_pod_identity(observed, &config.namespace, job_name, job_uid)? != (name, uid.clone()) {
+        bail!("catalog registration Pod was replaced during log read; receipt remains unconfirmed");
+    }
+    Ok((logs, uid))
+}
+
+async fn delete_catalog_registration_job_with_uid(
+    api_url: &str,
+    namespace: &str,
+    job_name: &str,
+    uid: &str,
+) -> Result<()> {
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .no_proxy()
+        .build()?
+        .delete(format!(
+            "{}/apis/batch/v1/namespaces/{namespace}/jobs/{job_name}",
+            api_url.trim_end_matches('/')
+        ))
+        .json(&json!({
+            "apiVersion":"v1", "kind":"DeleteOptions",
+            "propagationPolicy":"Foreground", "preconditions":{"uid":uid},
+        }))
+        .send()
+        .await
+        .context("send UID-preconditioned catalog registration Job deletion")?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response
+            .text()
+            .await
+            .context("read catalog registration deletion failure")?;
+        bail!("UID-preconditioned catalog registration Job deletion returned HTTP {status}: {body}");
+    }
+    Ok(())
+}
+
 async fn run_aks_catalog_registration_job(config: &OatConfig, platform: &mut AksPlatform, run_id: &str) -> Result<()> {
     if config.campaign_profile != Some(crate::config::CampaignProfile::ScaleOutSingleTable) {
         return Ok(());
     }
+    let deadline = CatalogRegistrationDeadline(
+        tokio::time::Instant::now() + Duration::from_secs(crate::config::CATALOG_REGISTRATION_SETUP_TIMEOUT_SECONDS),
+    );
+    deadline
+        .run(run_aks_catalog_registration_stage(config, platform, run_id, deadline))
+        .await
+}
+
+async fn run_aks_catalog_registration_stage(
+    config: &OatConfig,
+    platform: &mut AksPlatform,
+    run_id: &str,
+    deadline: CatalogRegistrationDeadline,
+) -> Result<()> {
     let [table] = config.tables.as_slice() else {
         bail!("catalog registration requires exactly one scale-out hot table");
     };
@@ -154,28 +344,32 @@ async fn run_aks_catalog_registration_job(config: &OatConfig, platform: &mut Aks
     let items = manifest["items"]
         .as_array_mut()
         .context("catalog registration resources are missing")?;
-    prepare_run_owned_resources(config, platform, items).await?;
+    deadline
+        .run(prepare_run_owned_resources(config, platform, items))
+        .await?;
     let planned = items.clone();
-    let created = kubectl(
-        config,
-        vec!["create", "-f", "-", "-o", "json"],
-        Some(serde_json::to_vec(&manifest)?),
-    )
-    .await
-    .context("create finite catalog registration Job")?;
-    let uid = created_pin_init_job_uid(&created, &config.namespace, &job_name, run_id)
-        .context("bind catalog registration Job UID")?;
-    record_applied_resource_uids(config, platform, &planned).await?;
-    let deadline =
-        tokio::time::Instant::now() + Duration::from_secs(crate::config::CATALOG_REGISTRATION_SETUP_TIMEOUT_SECONDS);
-    loop {
-        let output = kubectl(
+    let created = deadline
+        .kubectl(
             config,
-            vec!["get", "job", &job_name, "--namespace", &config.namespace, "-o", "json"],
-            None,
+            vec!["create", "-f", "-", "-o", "json"],
+            Some(serde_json::to_vec(&manifest)?),
         )
         .await
-        .context("inspect catalog registration Job")?;
+        .context("create finite catalog registration Job")?;
+    let uid = created_pin_init_job_uid(&created, &config.namespace, &job_name, run_id)
+        .context("bind catalog registration Job UID")?;
+    deadline
+        .run(record_applied_resource_uids(config, platform, &planned))
+        .await?;
+    loop {
+        let output = deadline
+            .kubectl(
+                config,
+                vec!["get", "job", &job_name, "--namespace", &config.namespace, "-o", "json"],
+                None,
+            )
+            .await
+            .context("inspect catalog registration Job")?;
         let job: Value = serde_json::from_str(&output).context("parse catalog registration Job status")?;
         if job.pointer("/metadata/uid").and_then(Value::as_str) != Some(uid.as_str()) {
             bail!("catalog registration Job UID changed; registration remains unconfirmed");
@@ -195,14 +389,8 @@ async fn run_aks_catalog_registration_job(config: &OatConfig, platform: &mut Aks
                 .and_then(Value::as_u64)
                 .is_some_and(|n| n > 0);
         let completed = condition("Complete") && job.pointer("/status/succeeded").and_then(Value::as_u64) == Some(1);
-        if failed || completed || tokio::time::Instant::now() >= deadline {
-            let logs = kubectl(
-                config,
-                vec!["logs", "--namespace", &config.namespace, &format!("job/{job_name}")],
-                None,
-            )
-            .await
-            .context("read catalog registration Job logs")?;
+        if failed || completed {
+            let (logs, pod_uid) = registration_job_logs(deadline, config, &job_name, &uid).await?;
             if failed || !completed {
                 bail!(
                     "catalog registration Job {job_name} {} before maintenance admission: {logs}",
@@ -210,56 +398,89 @@ async fn run_aks_catalog_registration_job(config: &OatConfig, platform: &mut Aks
                 );
             }
             let receipt = validate_catalog_registration_receipt(&logs, run_id, &table, &delta_root)?;
-            kubectl(
-                config,
-                vec![
-                    "delete",
-                    "job",
-                    &job_name,
-                    "--namespace",
+            let (proxy, api_url) = if FIXTURE_BOUNDARY.try_with(|_| ()).is_ok() {
+                (
+                    None,
+                    FIXTURE_BOUNDARY.with(|boundary| boundary.authority.server.clone()),
+                )
+            } else {
+                let (proxy, api_url) = deadline.run(start_kubectl_api_proxy(config)).await?;
+                (Some(proxy), api_url)
+            };
+            let deleted = deadline
+                .run(delete_catalog_registration_job_with_uid(
+                    &api_url,
                     &config.namespace,
-                    "--cascade=foreground",
-                    "--wait=true",
-                ],
-                None,
-            )
-            .await
-            .context("delete completed catalog registration Job and dependent Pods")?;
-            let remaining_job = kubectl(
-                config,
-                vec![
-                    "get",
-                    "job",
                     &job_name,
-                    "--namespace",
-                    &config.namespace,
-                    "--ignore-not-found",
-                    "-o",
-                    "json",
-                ],
-                None,
-            )
-            .await
-            .context("confirm catalog registration Job is absent")?;
-            if !remaining_job.trim().is_empty() {
-                bail!("catalog registration Job still exists; maintenance and load admission are forbidden");
+                    &uid,
+                ))
+                .await;
+            let stopped = if let Some(proxy) = proxy {
+                deadline
+                    .run(async {
+                        let stderr = stop_kubectl_process(proxy).await?;
+                        collect_kubectl_stderr(stderr).await?;
+                        Ok(())
+                    })
+                    .await
+            } else {
+                Ok(())
+            };
+            match (deleted, stopped) {
+                (Err(error), Err(stop_error)) => {
+                    return Err(error.context(format!(
+                        "also failed to stop catalog registration deletion API proxy: {stop_error:#}"
+                    )));
+                }
+                (Err(error), _) => return Err(error),
+                (Ok(()), Err(error)) => return Err(error).context("stop catalog registration deletion API proxy"),
+                (Ok(()), Ok(())) => {}
             }
-            let pods = kubectl(
-                config,
-                vec![
-                    "get",
-                    "pods",
-                    "--namespace",
-                    &config.namespace,
-                    "--selector",
-                    &format!("controller-uid={uid}"),
-                    "-o",
-                    "json",
-                ],
-                None,
-            )
-            .await
-            .context("confirm catalog registration Pods are absent before maintenance admission")?;
+            loop {
+                let remaining_job = deadline
+                    .kubectl(
+                        config,
+                        vec![
+                            "get",
+                            "job",
+                            &job_name,
+                            "--namespace",
+                            &config.namespace,
+                            "--ignore-not-found",
+                            "-o",
+                            "json",
+                        ],
+                        None,
+                    )
+                    .await
+                    .context("confirm catalog registration Job is absent")?;
+                if remaining_job.trim().is_empty() {
+                    break;
+                }
+                let remaining: Value =
+                    serde_json::from_str(&remaining_job).context("parse deleting catalog registration Job")?;
+                if remaining.pointer("/metadata/uid").and_then(Value::as_str) != Some(uid.as_str()) {
+                    bail!("catalog registration Job was replaced during deletion; admission remains forbidden");
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            let pods = deadline
+                .kubectl(
+                    config,
+                    vec![
+                        "get",
+                        "pods",
+                        "--namespace",
+                        &config.namespace,
+                        "--selector",
+                        &format!("controller-uid={uid}"),
+                        "-o",
+                        "json",
+                    ],
+                    None,
+                )
+                .await
+                .context("confirm catalog registration Pods are absent before maintenance admission")?;
             verify_catalog_registration_pods_absent(&pods)?;
             let runtime_dir = platform
                 .runtime_dir
@@ -268,24 +489,11 @@ async fn run_aks_catalog_registration_job(config: &OatConfig, platform: &mut Aks
             fs::write(
                 runtime_dir.join("run-table-catalog-registration.json"),
                 serde_json::to_vec_pretty(&json!({
-                    "receipt":receipt,"job_name":job_name,"job_uid":uid,"job_deleted":true,"remaining_pods":0
+                    "receipt":receipt,"job_name":job_name,"job_uid":uid,"pod_uid":pod_uid,
+                    "job_deleted":true,"remaining_pods":0
                 }))?,
             )
             .context("persist verified catalog registration and Pod absence receipt")?;
-            kubectl(
-                config,
-                vec![
-                    "delete",
-                    "configmap",
-                    &config_map_name,
-                    "--namespace",
-                    &config.namespace,
-                    "--wait=true",
-                ],
-                None,
-            )
-            .await
-            .context("delete completed catalog registration ConfigMap")?;
             return Ok(());
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -295,6 +503,131 @@ async fn run_aks_catalog_registration_job(config: &OatConfig, platform: &mut Aks
 #[cfg(test)]
 mod catalog_registration_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn registration_deadline_cancels_stalled_work_without_resetting_between_calls() -> Result<()> {
+        struct Cancelled(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Cancelled {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let guard = Cancelled(cancelled.clone());
+        let deadline = CatalogRegistrationDeadline(tokio::time::Instant::now() + Duration::from_millis(30));
+        let result = deadline
+            .run(async {
+                deadline.run(async { Ok(()) }).await?;
+                deadline
+                    .run(async move {
+                        let _guard = guard;
+                        std::future::pending::<Result<()>>().await
+                    })
+                    .await
+            })
+            .await;
+        let error = result.err().context("stalled registration unexpectedly completed")?;
+        assert!(format!("{error:#}").contains("whole-stage"));
+        assert!(cancelled.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(deadline.run(async { Ok(()) }).await.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registration_deadline_rejects_ready_completion_returned_after_expiry() -> Result<()> {
+        let deadline = CatalogRegistrationDeadline(tokio::time::Instant::now() + Duration::from_millis(50));
+        let result = deadline
+            .run(async {
+                std::thread::sleep(Duration::from_millis(100));
+                Ok(())
+            })
+            .await;
+        assert!(result.is_err(), "late ready completion must not authorize maintenance");
+        Ok(())
+    }
+
+    #[test]
+    fn registration_logs_require_the_recorded_controller_and_pod_identity() -> Result<()> {
+        let pod = json!({
+            "metadata": {
+                "namespace":"cell", "name":"register-pod",
+                "uid":"22222222-2222-4222-8222-222222222222",
+                "ownerReferences":[{"kind":"Job","name":"register","uid":"original","controller":true}]
+            },
+            "spec":{"containers":[{"name":"catalog-registration"}]}
+        });
+        registration_pod_identity(&pod, "cell", "register", "original")?;
+        assert!(registration_pod_identity(&pod, "cell", "register", "replacement").is_err());
+        let mut foreign = pod.clone();
+        foreign["metadata"]["ownerReferences"][0]["controller"] = json!(false);
+        assert!(registration_pod_identity(&foreign, "cell", "register", "original").is_err());
+        foreign = pod.clone();
+        foreign["spec"]["containers"][0]["name"] = json!("client");
+        assert!(registration_pod_identity(&foreign, "cell", "register", "original").is_err());
+        foreign = pod.clone();
+        foreign["metadata"]["uid"] = json!("invalid");
+        assert!(registration_pod_identity(&foreign, "cell", "register", "original").is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registration_delete_preserves_a_replacement_job_on_uid_conflict() -> Result<()> {
+        for replacement in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let address = listener.local_addr()?;
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await?;
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 2048];
+                let (header_end, length) = loop {
+                    let read = stream.read(&mut buffer).await?;
+                    if read == 0 {
+                        bail!("incomplete registration deletion request");
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..end]);
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().ok())
+                                    .flatten()
+                            })
+                            .context("registration deletion Content-Length missing")?;
+                        if request.len() >= end + 4 + length {
+                            break (end, length);
+                        }
+                    }
+                };
+                assert!(request.starts_with(b"DELETE /apis/batch/v1/namespaces/cell/jobs/register HTTP/1.1\r\n"));
+                let options: Value = serde_json::from_slice(&request[header_end + 4..header_end + 4 + length])?;
+                assert_eq!(options["preconditions"]["uid"], "original");
+                assert_eq!(options["propagationPolicy"], "Foreground");
+                let current_uid = if replacement { "replacement" } else { "original" };
+                let deleted = options["preconditions"]["uid"] == current_uid;
+                let status = if deleted { "200 OK" } else { "409 Conflict" };
+                let body = "{}";
+                stream.write_all(format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                ).as_bytes()).await?;
+                Ok::<_, anyhow::Error>(deleted)
+            });
+            let result =
+                delete_catalog_registration_job_with_uid(&format!("http://{address}"), "cell", "register", "original")
+                    .await;
+            let deleted = tokio::time::timeout(Duration::from_secs(5), server).await???;
+            assert_eq!(deleted, !replacement);
+            assert_eq!(result.is_ok(), !replacement);
+            if replacement {
+                let error = result.err().context("replacement deletion unexpectedly succeeded")?;
+                assert!(format!("{error:#}").contains("409 Conflict"));
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn registration_job_lifetime_is_reserved_in_the_scale_out_run_pin_budget() -> Result<()> {

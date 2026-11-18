@@ -74,6 +74,11 @@ the run-scoped location. Only the existing client signing keys are mounted:
 no migrator password or storage identity. The controller verifies the receipt,
 foreground-deletes the Job and confirms its UID-selected Pods are absent before
 starting maintenance; the effective-policy/stop-budget readback gate is unchanged.
+Deletion is preconditioned on the recorded Job UID. Logs use its controller-UID
+selector, with Pod ownership and identity checked before and after the read.
+One controller-side 180-second deadline includes resource creation, all RPCs and
+cleanup; late completion fails admission. The registration ConfigMap remains
+until normal run-namespace cleanup.
 Pin-init uses the collector's Azure ownership environment from the validated
 run runtime config; missing subscription/stamp or a mismatched Delta account
 fails before Job creation. Its read-only root retains a bounded writable `/tmp`.
