@@ -64,6 +64,13 @@ encoding high-cardinality output. Schema, partition, retention, fencing,
 no-overwrite and durability boundaries remain.
 Increasing a flush target alone does not coalesce publications.
 
+`batching.pipeline_depth` defaults to `1` (serialized publication). With coalescing
+enabled, `2..=64` permits bounded groups to prepare/upload using the same opened
+table while its single commit worker publishes earlier groups. The existing
+`max_concurrent_flushes`, Arrow capacities, CPU workers and upload limit still
+apply. Pipelined groups use `commit.batch_window` and `max_files_per_commit`
+rather than forcing a version per group. See the [control contracts](../experiments/arrowcol-oat/TUNABLES.md#single-table-preparation-and-commit-overlap).
+
 ## Layout readback
 
 Startup `arrowcol_effective_config <JSON>` includes a root `layout` object with

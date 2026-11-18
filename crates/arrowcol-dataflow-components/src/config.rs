@@ -94,6 +94,34 @@ mod override_tests {
             ..Default::default()
         };
         assert!(batching.validate().is_err());
+        for depth in [0, 65] {
+            assert!(
+                FileBatchConfig {
+                    pipeline_depth: depth,
+                    coalesce_publications: true,
+                    ..Default::default()
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        assert!(
+            FileBatchConfig {
+                pipeline_depth: 2,
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            FileBatchConfig {
+                pipeline_depth: 64,
+                coalesce_publications: true,
+                ..Default::default()
+            }
+            .validate()
+            .is_ok()
+        );
     }
 
     #[test]
@@ -981,6 +1009,8 @@ pub struct FileBatchConfig {
     pub max_age: Duration,
     /// Maximum simultaneous file publications.
     pub max_concurrent_flushes: usize,
+    /// Per-table publication groups allowed to encode/upload ahead of durable receipts.
+    pub pipeline_depth: usize,
     /// Compressed Parquet target and estimator limits.
     pub adaptive_file: AdaptiveFileConfig,
 }
@@ -1005,6 +1035,7 @@ impl Default for FileBatchConfig {
             max_batches_per_flush: 512,
             max_age: Duration::from_secs(30),
             max_concurrent_flushes: 4,
+            pipeline_depth: 1,
             adaptive_file: AdaptiveFileConfig::default(),
         }
     }
@@ -1036,6 +1067,8 @@ impl FileBatchConfig {
             || tokio::time::Instant::now().checked_add(self.max_age).is_none()
             || self.max_concurrent_flushes == 0
             || self.max_concurrent_flushes > tokio::sync::Semaphore::MAX_PERMITS
+            || !(1..=64).contains(&self.pipeline_depth)
+            || (self.pipeline_depth > 1 && !self.coalesce_publications)
         {
             return Err("invalid bounded Arrow file batching capacities or flush policy".to_owned());
         }
