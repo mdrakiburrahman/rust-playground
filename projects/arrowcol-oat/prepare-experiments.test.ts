@@ -282,7 +282,8 @@ test('offline CLI selects matching stamp capacity inputs and rejects mismatches 
     }
     await assert.rejects(main([...args, '--stamp-config', selectedStampPath], workspace), /EEXIST/);
     const sizing = { ...fleetSizing(), collector_pool: 'benche64' };
-    const fullFleet = { ...config, campaign_profile: 'scale_out_single_table', tables: [tables[0]],
+    const maintenanceImage = `arrowcollector89152.azurecr.io/maintenance@sha256:${'b'.repeat(64)}`;
+    const fullFleet = { ...config, campaign_profile: 'scale_out_single_table', tables: [tables[0]], maintenance_image: maintenanceImage,
       platform: { ...platform, fleet: sizing } };
     const nodes = [fleetNode('collector', 'benche64', 192, 1800), fleetNode('client', 'benchd64', 4, 16)];
     const pools = nodes.map(node => ({ name: node.pool, sku: node.sku, vcpu: Math.round(node.allocatableCpuMillicores / 1000),
@@ -296,6 +297,9 @@ test('offline CLI selects matching stamp capacity inputs and rejects mismatches 
     await writeFile(resolve(root, 'observation.json'), JSON.stringify({ nodes, pools, images: imageObservations }));
     await assert.rejects(main(fleetArgs, workspace), /architecture is missing or incompatible/);
     for (const image of imageObservations) image.architectures = ['amd64'];
+    await writeFile(resolve(root, 'observation.json'), JSON.stringify({ nodes, pools, images: imageObservations }));
+    await assert.rejects(main(fleetArgs, workspace), /architecture is missing or incompatible/);
+    imageObservations.push({ image: maintenanceImage, architectures: ['amd64'] });
     await writeFile(resolve(root, 'observation.json'), JSON.stringify({ nodes, pools, images: imageObservations }));
     await main(fleetArgs, workspace);
     assert.deepEqual(JSON.parse(await readFile(resolve(root, 'full-fleet/full-fleet.config.json'), 'utf8')),

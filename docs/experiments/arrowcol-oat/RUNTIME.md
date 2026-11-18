@@ -190,8 +190,8 @@ The generated QAP database is `experimentqap`, distinct from the main `arrowcol`
 ## Heterogeneous AKS fleet
 
 The [full-fleet template](oat-config.aks.full-fleet.json) is a sizing input, not a
-direct Rust API request. Start from the selected stamp's private generated OAT
-configuration, retain its pinned images and identity bindings, and copy the
+direct Rust API request. Start from the selected stamp's private single-table
+scale-out OAT configuration, retain its pinned images and identity bindings, and copy the
 template's `platform.fleet` block. Set `collector_pool` to the explicitly selected
 largest pool; the legacy collector pool is not implicitly selected or relabelled.
 
@@ -216,7 +216,7 @@ npx --no-install tsx projects/arrowcol-oat/prepare-experiments.ts \
 The observation contains `nodes` (Ready-node identity, architecture, allocatable
 CPU/memory and existing requested CPU/memory), sanitized `pools` outcomes and
 `images: [{ "image": "<exact digest-pinned reference>", "architectures": ["amd64"] }]`
-read from registry metadata for every runtime/client image.
+read from registry metadata for every runtime, client and maintenance image.
 Preparation rejects unknown sizing fields, malformed sentinels, duplicate nodes,
 incompatible architectures and insufficient budgets. It emits
 `full-fleet.config.json`, with exactly one replica/core cell and no client-count

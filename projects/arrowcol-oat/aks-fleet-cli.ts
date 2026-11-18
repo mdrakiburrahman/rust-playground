@@ -79,10 +79,12 @@ export async function main(
     if (!('runtime_config_file' in platform) || typeof platform.runtime_config_file !== 'string')
       throw new Error('fleet requires generated private runtime configuration');
     const runtimeConfig = validateRuntime(JSON.parse(await readFile(platform.runtime_config_file, 'utf8')));
-    if (runtimeConfig.stamp !== config.stamp || typeof source.dmv_client_image !== 'string')
-      throw new Error('fleet requires matching runtime stamp and the pinned DMV client image');
+    if (runtimeConfig.stamp !== config.stamp || typeof source.dmv_client_image !== 'string' ||
+        source.maintenance_image !== undefined && typeof source.maintenance_image !== 'string')
+      throw new Error('fleet requires matching runtime stamp and pinned client/maintenance images');
     const images = await deps.images(azure, [...Object.values(runtimeConfig.images)
-      .filter((image): image is string => typeof image === 'string'), source.dmv_client_image]);
+      .filter((image): image is string => typeof image === 'string'), source.dmv_client_image,
+      ...(typeof source.maintenance_image === 'string' ? [source.maintenance_image] : [])]);
     const out = resolve(ROOT, values.out!);
     const child = relative(resolve(ROOT, 'out/arrowcol-oat'), out);
     if (!child || child.startsWith('..') || isAbsolute(child)) throw new Error('fleet --out must be a new private out/arrowcol-oat subdirectory');

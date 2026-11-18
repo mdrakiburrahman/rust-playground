@@ -142,7 +142,7 @@ test('fleet CLI resolves cells, tears down launch failures and recovers owned or
         }));
         await writeFile(bootstrapPath, '# fake test input\n');
         const template = JSON.parse(await readFile(path.resolve(ROOT, 'docs/experiments/arrowcol-oat/oat-config.aks.full-fleet.json'), 'utf8'));
-        const source = { ...template, stamp: '00000', dmv_client_image: image('client'),
+        const source = { ...template, stamp: '00000', dmv_client_image: image('client'), maintenance_image: image('maintenance'),
           platform: { ...template.platform, runtime_config_file: runtimePath, bootstrap_env_file: bootstrapPath,
             fleet: { ...template.platform.fleet, collector_pool: collector.name } } };
         const sourcePath = path.join(root, 'source.json'), stampPath = path.join(root, 'stamp.yaml');

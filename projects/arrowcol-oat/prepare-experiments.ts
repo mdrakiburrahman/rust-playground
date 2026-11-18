@@ -230,8 +230,11 @@ export async function main(args: string[], workspaceRoot = resolve('.')): Promis
     higherDfeConcurrency: Number(values['higher-dfe']),
   }) : { 'full-fleet': prepareFullFleetExperiment(base, snapshot) };
   if (snapshot !== undefined) {
+    if (base.maintenance_image !== undefined && typeof base.maintenance_image !== 'string')
+      throw new Error('Fleet maintenance image must be an immutable image reference.');
     assertFleetImageCompatibility(
-      [...Object.values(runtime.images).filter((image): image is string => typeof image === 'string'), base.dmv_client_image],
+      [...Object.values(runtime.images).filter((image): image is string => typeof image === 'string'), base.dmv_client_image,
+        ...(base.maintenance_image === undefined ? [] : [base.maintenance_image])],
       snapshot.nodes, snapshot.images);
   }
   const stampConfigPath = resolve(root, values['stamp-config'] ?? 'infra/azure/stamp.yaml');

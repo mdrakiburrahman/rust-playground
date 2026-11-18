@@ -401,7 +401,8 @@ export async function runAksPreflight(configPath: string, options: PreflightOpti
 
   await check('Immutable ACR images', () => {
     if (!runtime) throw new Error(runtimeError);
-    const images = [...Object.values(runtime.images), config.dmv_client_image];
+    const images = [...Object.values(runtime.images), config.dmv_client_image,
+      ...(platform.fleet !== undefined && config.maintenance_image !== undefined ? [config.maintenance_image] : [])];
     for (const image of images) {
       const match = typeof image === 'string' && new RegExp(`^arrowcollector${stamp}\\.azurecr\\.io/([a-z0-9][a-z0-9/_.-]*)@(sha256:[a-f0-9]{64})$`).exec(image);
       if (!match) throw new Error('All five images, including the DMV client, must be immutable digests in the selected stamp registry.');
@@ -414,7 +415,7 @@ export async function runAksPreflight(configPath: string, options: PreflightOpti
           throw new Error('Fleet image digest or observed Linux/amd64 manifest architecture is unavailable or incompatible.');
       }
     }
-    return 'All four runtime images and the fifth DMV client digest exist in the selected registry.';
+    return 'All selected runtime, DMV client and configured fleet maintenance image digests exist in the selected registry.';
   });
 
   await check('Metrics API availability', () => {
