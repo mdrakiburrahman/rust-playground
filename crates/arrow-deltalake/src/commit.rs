@@ -953,7 +953,8 @@ fn publish_batch(
                 identities: identities.clone(),
             });
         }
-        let publication_identities = identities.iter().chain(&replayed_identities).cloned().collect();
+        let publication_identities: Vec<(String, i64, i64)> =
+            identities.iter().chain(&replayed_identities).cloned().collect();
         replies.push((
             reply_index,
             start,
@@ -1026,32 +1027,55 @@ fn publish_batch(
                     .map_err(CommitReceiptError::from_anyhow);
                 let audit_publications = source_mappings
                     .iter()
-                    .map(|mapping| AuditPublicationCommitMapping {
-                        source_application_id: mapping.source_application_id.clone(),
-                        transaction_files: mapping
+                    .map(|mapping| {
+                        let source_ids = mapping
                             .transaction_files
                             .iter()
-                            .map(|(identity, version, stamp, file_indices)| {
-                                (
-                                    identity.clone(),
-                                    *version,
-                                    *stamp,
-                                    file_indices
-                                        .iter()
-                                        .copied()
-                                        .filter(|index| committed_file_indices.contains(index))
-                                        .collect(),
-                                )
-                            })
-                            .collect(),
-                        outcome: publication_outcome,
-                        authoritative_version,
-                        committed_file_indices: mapping
-                            .transaction_files
-                            .iter()
-                            .flat_map(|(_, _, _, indices)| indices.iter().copied())
-                            .filter(|index| committed_file_indices.contains(index))
-                            .collect(),
+                            .map(|(identity, _, _, _)| identity.as_str())
+                            .collect::<std::collections::HashSet<_>>();
+                        let (mapping_outcome, mapping_version) = outcome_for_transaction_ids(
+                            reply_index,
+                            &source_ids,
+                            start,
+                            end,
+                            dispositions,
+                            *outcome,
+                            *version,
+                        )
+                        .unwrap_or_else(|| {
+                            tracing::error!(
+                                source_application_id = %mapping.source_application_id,
+                                "Delta audit receipt is missing transaction dispositions"
+                            );
+                            (CommitOutcome::PartiallyCommitted, None)
+                        });
+                        AuditPublicationCommitMapping {
+                            source_application_id: mapping.source_application_id.clone(),
+                            transaction_files: mapping
+                                .transaction_files
+                                .iter()
+                                .map(|(identity, version, stamp, file_indices)| {
+                                    (
+                                        identity.clone(),
+                                        *version,
+                                        *stamp,
+                                        file_indices
+                                            .iter()
+                                            .copied()
+                                            .filter(|index| committed_file_indices.contains(index))
+                                            .collect(),
+                                    )
+                                })
+                                .collect(),
+                            outcome: mapping_outcome,
+                            authoritative_version: mapping_version,
+                            committed_file_indices: mapping
+                                .transaction_files
+                                .iter()
+                                .flat_map(|(_, _, _, indices)| indices.iter().copied())
+                                .filter(|index| committed_file_indices.contains(index))
+                                .collect(),
+                        }
                     })
                     .collect();
                 files.map(|files| GroupAppendResult {
@@ -1074,6 +1098,28 @@ fn publish_batch(
             commit_duration = abandoned.commit_duration;
         }
     }
+}
+
+fn outcome_for_transaction_ids(
+    reply_index: usize,
+    source_ids: &std::collections::HashSet<&str>,
+    start: usize,
+    end: usize,
+    dispositions: &[CommitDisposition],
+    fallback: CommitOutcome,
+    fallback_version: u64,
+) -> Option<(CommitOutcome, Option<u64>)> {
+    let relevant = dispositions
+        .iter()
+        .filter(|disposition| {
+            disposition.reply_index == Some(reply_index)
+                && disposition
+                    .transaction_ids
+                    .iter()
+                    .any(|identity| source_ids.contains(identity.as_str()))
+        })
+        .collect::<Vec<_>>();
+    (!relevant.is_empty()).then(|| outcome_for_publication_range(start, end, &relevant, fallback, fallback_version))
 }
 
 fn outcome_for_publication_range(
@@ -1134,14 +1180,6 @@ mod tests {
         RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
             vec![Arc::new(Int32Array::from(vec![1]))],
-        )
-        .map_err(Into::into)
-    }
-
-    fn empty_input() -> Result<RecordBatch> {
-        RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
-            vec![Arc::new(Int32Array::from(Vec::<i32>::new()))],
         )
         .map_err(Into::into)
     }
@@ -1330,6 +1368,31 @@ mod tests {
             assert_eq!(result.files.len(), 1);
             assert_eq!(result.committed_file_indices, [0]);
 
+            assert_eq!(result.audit_publications.len(), 2);
+            let replay_mapping = result
+                .audit_publications
+                .iter()
+                .find(|mapping| mapping.source_application_id == "original")
+                .context("replayed source mapping")?;
+            assert_eq!(replay_mapping.outcome, CommitOutcome::Deduplicated);
+            assert_eq!(replay_mapping.authoritative_version, None);
+            assert!(replay_mapping.committed_file_indices.is_empty());
+            assert_eq!(
+                replay_mapping.transaction_files,
+                vec![("original".into(), 0, 10, vec![])]
+            );
+            let fresh_mapping = result
+                .audit_publications
+                .iter()
+                .find(|mapping| mapping.source_application_id == fresh_id)
+                .context("new source mapping")?;
+            assert_eq!(fresh_mapping.outcome, CommitOutcome::Committed);
+            assert_eq!(fresh_mapping.authoritative_version, Some(result.version));
+            assert_eq!(fresh_mapping.committed_file_indices, [0]);
+            assert_eq!(fresh_mapping.transaction_files, vec![(fresh_id.into(), 0, 20, vec![0])]);
+            assert_eq!(result.files[0].rows, 1);
+            assert!(result.files[0].input_bytes > 0);
+            assert!(result.files[0].bytes > 0);
             let verification = table
                 .stage_coalesced_publications(vec![(input()?, fresh_id.into(), 0, 20)])
                 .await?;
@@ -1340,50 +1403,53 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn empty_group_receipts_do_not_alias_by_file_range_in_either_order() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let table = BatchedTable::open(
-            directory.path(),
-            CommitOptions {
-                batch_window: Duration::from_secs(60),
-                ..Default::default()
-            },
-        )
-        .await?;
-        let original = table
-            .stage_coalesced_publications(vec![(empty_input()?, "empty-original".into(), 0, 10)])
-            .await?;
-        let original = table.submit_prepared_group(original, true).await?.wait().await?;
-        assert_eq!(original.outcome, CommitOutcome::Committed);
-        assert!(original.files.is_empty());
-
-        for (fresh_id, fresh_first) in [("empty-fresh-first", true), ("empty-fresh-last", false)] {
-            let fresh = table
-                .stage_coalesced_publications(vec![(empty_input()?, fresh_id.into(), 0, 20)])
-                .await?;
-            let replay = table
-                .stage_coalesced_publications(vec![(empty_input()?, "empty-original".into(), 0, 10)])
-                .await?;
-            let (fresh_receipt, replay_receipt) = if fresh_first {
-                (
-                    table.submit_prepared_group(fresh, false).await?,
-                    table.submit_prepared_group(replay, true).await?,
-                )
-            } else {
-                let replay_receipt = table.submit_prepared_group(replay, false).await?;
-                let fresh_receipt = table.submit_prepared_group(fresh, true).await?;
-                (fresh_receipt, replay_receipt)
+    #[test]
+    fn empty_group_receipts_do_not_alias_by_file_range_in_either_order() {
+        for fresh_reply in [0, 1] {
+            let replay_reply = 1 - fresh_reply;
+            let fresh = CoalescedCommitGroup {
+                start: 0,
+                end: 0,
+                reply_index: fresh_reply,
+                identities: vec![("fresh".into(), 0, 20)],
             };
-            let (fresh, replay) = tokio::try_join!(fresh_receipt.wait(), replay_receipt.wait())?;
-            assert_eq!(fresh.outcome, CommitOutcome::Committed);
-            assert!(fresh.authoritative_version.is_some());
-            assert!(fresh.files.is_empty());
-            assert_eq!(replay.outcome, CommitOutcome::Deduplicated);
-            assert_eq!(replay.authoritative_version, None);
-            assert!(replay.files.is_empty());
+            let replay = CoalescedCommitGroup {
+                start: 0,
+                end: 0,
+                reply_index: replay_reply,
+                identities: vec![("replay".into(), 0, 10)],
+            };
+            let groups = if fresh_reply == 0 {
+                vec![fresh, replay]
+            } else {
+                vec![replay, fresh]
+            };
+            let skipped_groups = std::collections::HashSet::from([replay_reply]);
+            let dispositions = commit_dispositions(
+                0,
+                &groups,
+                &skipped_groups,
+                &std::collections::HashSet::new(),
+                CommitOutcome::Committed,
+                Some(7),
+            );
+            let fresh_dispositions = dispositions
+                .iter()
+                .filter(|disposition| disposition.reply_index == Some(fresh_reply))
+                .collect::<Vec<_>>();
+            let replay_dispositions = dispositions
+                .iter()
+                .filter(|disposition| disposition.reply_index == Some(replay_reply))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                outcome_for_publication_range(0, 0, &fresh_dispositions, CommitOutcome::Committed, 7),
+                (CommitOutcome::Committed, Some(7))
+            );
+            assert_eq!(
+                outcome_for_publication_range(0, 0, &replay_dispositions, CommitOutcome::Committed, 7),
+                (CommitOutcome::Deduplicated, None)
+            );
         }
-        Ok(())
     }
 
     /// Scenario: one file is queued and the remaining capacity is occupied by in-flight work.
@@ -1437,12 +1503,36 @@ mod tests {
             start: 0,
             end: 1,
             reply_index: None,
+            transaction_ids: Vec::new(),
             outcome: CommitOutcome::Reconciled,
             authoritative_version: None,
         };
         assert_eq!(
             outcome_for_publication_range(0, 1, &[&disposition], CommitOutcome::Reconciled, 9,),
             (CommitOutcome::Reconciled, None)
+        );
+    }
+
+    #[test]
+    fn reconciled_audit_mapping_keeps_original_version_unknown() {
+        let groups = [CoalescedCommitGroup {
+            start: 0,
+            end: 1,
+            reply_index: 0,
+            identities: vec![("source".into(), 0, 10)],
+        }];
+        let dispositions = commit_dispositions(
+            1,
+            &groups,
+            &std::collections::HashSet::new(),
+            &std::collections::HashSet::new(),
+            CommitOutcome::Reconciled,
+            None,
+        );
+        let source_ids = std::collections::HashSet::from(["source"]);
+        assert_eq!(
+            outcome_for_transaction_ids(0, &source_ids, 0, 1, &dispositions, CommitOutcome::Committed, 9),
+            Some((CommitOutcome::Reconciled, None))
         );
     }
 

@@ -2170,11 +2170,12 @@ struct CoalescedPublicationSource {
     partition_files: std::collections::BTreeSet<(crate::partition::PartitionValues, usize)>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CommitDisposition {
     pub(crate) start: usize,
     pub(crate) end: usize,
     pub(crate) reply_index: Option<usize>,
+    pub(crate) transaction_ids: Vec<String>,
     pub(crate) outcome: crate::commit::CommitOutcome,
     pub(crate) authoritative_version: Option<u64>,
 }
@@ -2200,6 +2201,7 @@ fn commit_dispositions(
                 start: group.start,
                 end: group.end,
                 reply_index: Some(group.reply_index),
+                transaction_ids: group.identities.iter().map(|(id, _, _)| id.clone()).collect(),
                 outcome: if skipped {
                     crate::commit::CommitOutcome::Deduplicated
                 } else {
@@ -2218,6 +2220,7 @@ fn commit_dispositions(
                     start: index,
                     end: index + 1,
                     reply_index: None,
+                    transaction_ids: Vec::new(),
                     outcome: if skipped {
                         crate::commit::CommitOutcome::Deduplicated
                     } else {
