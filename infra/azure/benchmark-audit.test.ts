@@ -127,9 +127,10 @@ test('scores half-open windows conservatively across client and collector clock 
   const zero = { lowerNs: 0n, upperNs: 0n };
   const evaluate = (timestamp: string, client = zero, collector = zero, sendNs = 1_000_000_000n) => {
     const admission = sendNs / 1_000_000n;
+    const cohort = admission < 1000n ? 'warmup' : admission < 601000n ? 'measurement' : 'post_window';
     Object.assign(m.ranges[0], { first_send_unix_ns: sendNs, last_send_unix_ns: sendNs,
       first_admitted_unix_ms: admission, last_admitted_unix_ms: admission,
-      first_outcome_unix_ms: admission, last_outcome_unix_ms: admission });
+      first_outcome_unix_ms: admission, last_outcome_unix_ms: admission, cohort, first_admitted_cohort: cohort });
     const collectorAdmission = Math.min(999, Date.parse(timestamp));
     const fields = { ...event.fields, admitted_at_unix_ms: BigInt(collectorAdmission),
       transaction_files: `[("${app(3)}", 1, ${collectorAdmission}, [0])]` };
@@ -158,6 +159,8 @@ test('scores half-open windows conservatively across client and collector clock 
   const minuteEdge = await evaluate('1970-01-01T00:01:01.000000000Z', zero, uncertainty, 2_000_000_000n);
   assert.equal(minuteEdge.timed_scoring?.excluded.boundary_uncertain.rows, 2n);
   assert.equal((await evaluate('1970-01-01T00:01:01.000000000Z', zero, zero, 2_000_000_000n)).timed_scoring?.minutes[1].rows, 2n);
+  assert.equal((await evaluate('1970-01-01T00:00:01.100000000Z', behind, zero, 950_000_000n)).timed_scoring?.excluded['warmup:excluded'].rows, 2n);
+  assert.equal((await evaluate('1970-01-01T00:10:00.990000000Z', ahead, zero, 601_020_000_000n)).timed_scoring?.excluded['post_window:excluded'].rows, 2n);
   const missing = await reconcilePublications([m], [event], history([txn(), add()]), 0n, { diagnostic: true, timing: null });
   assert.equal(missing.timed_scoring, null);
 });

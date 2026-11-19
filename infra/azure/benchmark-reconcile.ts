@@ -224,10 +224,11 @@ export async function reconcilePublications(manifests: readonly unknown[], event
         const lastMinute = lastExclusive > startNs ? (lastExclusive - 1n - startNs) / 60_000_000_000n : -1n;
         const sendInside = firstSend >= startNs && lastSend < endNs;
         let destination: ReturnType<typeof totals>;
-        if (sendInside && first >= startNs && lastExclusive <= endNs && firstMinute === lastMinute)
+        if (send === 'measurement' && sendInside && first >= startNs && lastExclusive <= endNs && firstMinute === lastMinute)
           destination = timedMinutes[Number(firstMinute)];
         else {
-          const reason = lastSend < startNs || lastExclusive <= startNs ? 'before_window' :
+          const reason = send !== 'measurement' ? `${send}:excluded` :
+            lastSend < startNs || lastExclusive <= startNs ? 'before_window' :
             firstSend >= endNs || first >= endNs ? 'after_window' : 'boundary_uncertain';
           destination = timedExcluded[reason] ??= totals();
         }
