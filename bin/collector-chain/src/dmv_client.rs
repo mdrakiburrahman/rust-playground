@@ -7,6 +7,7 @@ use arrow_ipc::writer::IpcWriteOptions;
 use arrowcol_protocol::NOT_ADMITTED_METADATA_KEY;
 use clap::{Args, ValueEnum};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::sync::{
     Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -14,7 +15,7 @@ use std::sync::{
 use std::time::Instant;
 use tokio::task::JoinSet;
 
-const MAX_LOGICAL_BATCH_RECORDS: usize = 1_000_000;
+const MAX_LOGICAL_BATCH_RECORDS: usize = 1_100_000;
 const MAX_LOGICAL_MANIFEST_BYTES: usize = 1_048_576;
 const MAX_OAT_CLIENT_METRICS_LINE_BYTES: usize = 1_048_576;
 
@@ -475,6 +476,16 @@ enum ManifestOutcome {
     Failed,
 }
 
+fn measurement_cohort(observed: u64, start: u64, end: u64) -> ManifestCohort {
+    if observed < start {
+        ManifestCohort::Warmup
+    } else if observed < end {
+        ManifestCohort::Measurement
+    } else {
+        ManifestCohort::PostWindow
+    }
+}
+
 #[derive(Clone, Debug)]
 struct LogicalBatchRecord {
     table: String,
@@ -492,6 +503,145 @@ struct LogicalBatchRecord {
     first_admitted_unix_ms: Option<u64>,
     first_admitted_cohort: Option<ManifestCohort>,
     last_outcome_unix_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+struct LogicalBatchFact {
+    decoded_physical_batch_count: u64,
+    canonical_logical_bytes: Option<u64>,
+    canonical_logical_bytes_unavailable_reason: Option<String>,
+}
+
+impl From<&LogicalBatchRecord> for LogicalBatchFact {
+    fn from(record: &LogicalBatchRecord) -> Self {
+        Self {
+            decoded_physical_batch_count: record.decoded_physical_batch_count,
+            canonical_logical_bytes: record.canonical_logical_bytes,
+            canonical_logical_bytes_unavailable_reason: record.canonical_logical_bytes_unavailable_reason.clone(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct BatchFactEncoder {
+    dictionary: Vec<LogicalBatchFact>,
+    indices: Vec<u32>,
+    index_by_fact: HashMap<LogicalBatchFact, u32>,
+}
+
+impl BatchFactEncoder {
+    fn push(&mut self, fact: LogicalBatchFact) -> Result<()> {
+        let index = if let Some(index) = self.index_by_fact.get(&fact) {
+            *index
+        } else {
+            let index = u32::try_from(self.dictionary.len()).context("logical batch fact dictionary exceeds u32")?;
+            self.dictionary
+                .try_reserve(1)
+                .context("reserve batch fact dictionary entry")?;
+            self.index_by_fact
+                .try_reserve(1)
+                .context("reserve batch fact dictionary index")?;
+            self.dictionary.push(fact.clone());
+            self.index_by_fact.insert(fact, index);
+            index
+        };
+        self.indices.try_reserve(1).context("reserve batch fact index")?;
+        self.indices.push(index);
+        Ok(())
+    }
+
+    fn encode(self) -> Result<serde_json::Value> {
+        anyhow::ensure!(!self.dictionary.is_empty(), "logical batch range has no batch facts");
+        let index_bits = if self.dictionary.len() == 1 {
+            0
+        } else {
+            u8::try_from(usize::BITS - (self.dictionary.len() - 1).leading_zeros())
+                .context("logical batch fact index width exceeds u8")?
+        };
+        let packed = pack_batch_fact_indices(&self.indices, index_bits)?;
+        Ok(serde_json::json!({
+            "encoding": "dictionary_bitpack_base64url_v1",
+            "index_count": self.indices.len(),
+            "index_bits": index_bits,
+            "bit_order": "least_significant_index_bits_first",
+            "dictionary": self.dictionary,
+            "indices_base64url": base64url_no_pad(&packed),
+        }))
+    }
+}
+
+fn pack_batch_fact_indices(indices: &[u32], index_bits: u8) -> Result<Vec<u8>> {
+    if index_bits == 0 {
+        anyhow::ensure!(
+            indices.iter().all(|index| *index == 0),
+            "nonzero batch fact index has zero-width encoding"
+        );
+        return Ok(Vec::new());
+    }
+    let bit_count = indices
+        .len()
+        .checked_mul(usize::from(index_bits))
+        .context("packed batch fact bit count overflow")?;
+    let byte_capacity = bit_count.div_ceil(8);
+    let mut packed = Vec::new();
+    packed
+        .try_reserve_exact(byte_capacity)
+        .context("reserve packed batch fact indices")?;
+    let mut buffer = 0_u64;
+    let mut buffered_bits = 0_u8;
+    for index in indices {
+        if index_bits < u32::BITS as u8 {
+            anyhow::ensure!(
+                *index < (1_u32 << index_bits),
+                "batch fact index does not fit its packed width"
+            );
+        }
+        buffer |= u64::from(*index) << buffered_bits;
+        buffered_bits += index_bits;
+        while buffered_bits >= 8 {
+            packed.push(buffer as u8);
+            buffer >>= 8;
+            buffered_bits -= 8;
+        }
+    }
+    if buffered_bits > 0 {
+        packed.push(buffer as u8);
+    }
+    anyhow::ensure!(packed.len() == byte_capacity, "packed batch fact length mismatch");
+    Ok(packed)
+}
+
+fn base64url_no_pad(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut encoded = String::with_capacity(bytes.len().saturating_mul(4).div_ceil(3));
+    for chunk in bytes.chunks(3) {
+        let first = chunk[0];
+        let second = chunk.get(1).copied().unwrap_or_default();
+        let third = chunk.get(2).copied().unwrap_or_default();
+        encoded.push(ALPHABET[(first >> 2) as usize] as char);
+        encoded.push(ALPHABET[(((first & 0x03) << 4) | (second >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            encoded.push(ALPHABET[(((second & 0x0f) << 2) | (third >> 6)) as usize] as char);
+        }
+        if chunk.len() > 2 {
+            encoded.push(ALPHABET[(third & 0x3f) as usize] as char);
+        }
+    }
+    encoded
+}
+
+fn min_observation(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+fn max_observation(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    }
 }
 
 #[derive(Serialize)]
@@ -513,7 +663,10 @@ struct LogicalBatchRange {
     first_admitted_unix_ms: Option<u64>,
     first_admitted_cohort: Option<ManifestCohort>,
     last_admitted_unix_ms: Option<u64>,
+    first_outcome_unix_ms: Option<u64>,
     last_outcome_unix_ms: Option<u64>,
+    #[serde(skip_serializing)]
+    batch_facts: BatchFactEncoder,
 }
 
 struct LogicalBatch {
@@ -1159,13 +1312,7 @@ impl PreparedClient {
             record.first_send_unix_ns = Some(send_unix_ns);
             record.cohort = measurement.map_or(ManifestCohort::Unscheduled, |window| {
                 let send_unix_ms = send_unix_ns / 1_000_000;
-                if send_unix_ms < window.start_unix_ms {
-                    ManifestCohort::Warmup
-                } else if send_unix_ms < window.end_unix_ms {
-                    ManifestCohort::Measurement
-                } else {
-                    ManifestCohort::PostWindow
-                }
+                measurement_cohort(send_unix_ms, window.start_unix_ms, window.end_unix_ms)
             });
         }
         record.last_send_unix_ns = Some(send_unix_ns);
@@ -1195,18 +1342,40 @@ impl PreparedClient {
             record.first_admitted_unix_ms = observed_unix_ms;
             record.first_admitted_cohort = observed_unix_ms.map(|observed| {
                 measurement.map_or(ManifestCohort::Unscheduled, |window| {
-                    if observed < window.start_unix_ms {
-                        ManifestCohort::Warmup
-                    } else if observed < window.end_unix_ms {
-                        ManifestCohort::Measurement
-                    } else {
-                        ManifestCohort::PostWindow
-                    }
+                    measurement_cohort(observed, window.start_unix_ms, window.end_unix_ms)
                 })
             });
         }
         if observed_unix_ms.is_some() {
             record.last_outcome_unix_ms = observed_unix_ms;
+        }
+        Ok(())
+    }
+
+    fn record_result_observation(
+        &self,
+        manifest_index: Option<usize>,
+        outcome: ManifestOutcome,
+        measurement: Option<&Measurement>,
+        worker: usize,
+        rows: u64,
+        raw_arrow_bytes: u64,
+        wire_bytes: u64,
+        observed_unix_ms: Option<u64>,
+    ) -> Result<()> {
+        if let Some(index) = manifest_index {
+            self.record_manifest_outcome(index, outcome, observed_unix_ms, measurement)?;
+        }
+        if outcome == ManifestOutcome::Acknowledged {
+            if let Some(measurement) = measurement {
+                measurement.record_completion(
+                    worker,
+                    rows,
+                    raw_arrow_bytes,
+                    wire_bytes,
+                    observed_unix_ms.context("completion observation is missing")?,
+                );
+            }
         }
         Ok(())
     }
@@ -1230,9 +1399,8 @@ impl PreparedClient {
         let records = self
             .logical_batches
             .lock()
-            .map_err(|_| anyhow::anyhow!("logical batch manifest state poisoned"))?
-            .clone();
-        let mut ordered = records.clone();
+            .map_err(|_| anyhow::anyhow!("logical batch manifest state poisoned"))?;
+        let mut ordered: Vec<&LogicalBatchRecord> = records.iter().collect();
         ordered.sort_by_key(|record| (record.worker, record.sequence));
         let mut ranges: Vec<LogicalBatchRange> = Vec::new();
         for record in ordered {
@@ -1245,15 +1413,6 @@ impl PreparedClient {
                     && range.first_admitted_cohort == record.first_admitted_cohort
                     && range.attempts == record.attempts
                     && range.outcome == record.outcome
-                    && range.decoded_physical_batch_count == record.decoded_physical_batch_count
-                    && range.canonical_logical_bytes == record.canonical_logical_bytes
-                    && range.first_send_unix_ns == record.first_send_unix_ns
-                    && range.last_send_unix_ns == record.last_send_unix_ns
-                    && range.first_admitted_unix_ms == record.first_admitted_unix_ms
-                    && range.last_admitted_unix_ms == record.first_admitted_unix_ms
-                    && range.last_outcome_unix_ms == record.last_outcome_unix_ms
-                    && range.canonical_logical_bytes_unavailable_reason
-                        == record.canonical_logical_bytes_unavailable_reason
             });
             if merge {
                 let range = ranges.last_mut().context("manifest range disappeared")?;
@@ -1267,35 +1426,34 @@ impl PreparedClient {
                     .checked_add(record.decoded_physical_batch_count)
                     .context("decoded physical batch count overflow")?;
                 range.canonical_logical_bytes = match (range.canonical_logical_bytes, record.canonical_logical_bytes) {
-                    (Some(left), Some(right)) => Some(
-                        left.checked_add(right)
-                            .context("canonical logical byte range overflow")?,
-                    ),
+                    (Some(a), Some(b)) => Some(a.checked_add(b).context("canonical logical byte range overflow")?),
                     _ => None,
                 };
-                range.first_send_unix_ns = match (range.first_send_unix_ns, record.first_send_unix_ns) {
-                    (Some(left), Some(right)) => Some(left.min(right)),
-                    (left, right) => left.or(right),
+                range.canonical_logical_bytes_unavailable_reason = match (
+                    range.canonical_logical_bytes_unavailable_reason.as_deref(),
+                    record.canonical_logical_bytes_unavailable_reason.as_deref(),
+                ) {
+                    (None, None) => None,
+                    (Some(a), Some(b)) if a == b => Some(a.to_owned()),
+                    (Some(_), None) | (None, Some(_)) => {
+                        Some("batch-level metric unavailable for some records; see batch_facts".to_owned())
+                    }
+                    _ => Some("batch-level metric reasons vary; see batch_facts".to_owned()),
                 };
-                range.last_send_unix_ns = match (range.last_send_unix_ns, record.last_send_unix_ns) {
-                    (Some(left), Some(right)) => Some(left.max(right)),
-                    (left, right) => left.or(right),
-                };
-                range.first_admitted_unix_ms = match (range.first_admitted_unix_ms, record.first_admitted_unix_ms) {
-                    (Some(left), Some(right)) => Some(left.min(right)),
-                    (left, right) => left.or(right),
-                };
-                range.last_admitted_unix_ms = match (range.last_admitted_unix_ms, record.first_admitted_unix_ms) {
-                    (Some(left), Some(right)) => Some(left.max(right)),
-                    (left, right) => left.or(right),
-                };
-                range.last_outcome_unix_ms = match (range.last_outcome_unix_ms, record.last_outcome_unix_ms) {
-                    (Some(left), Some(right)) => Some(left.max(right)),
-                    (left, right) => left.or(right),
-                };
+                range.first_send_unix_ns = min_observation(range.first_send_unix_ns, record.first_send_unix_ns);
+                range.last_send_unix_ns = max_observation(range.last_send_unix_ns, record.last_send_unix_ns);
+                range.first_admitted_unix_ms =
+                    min_observation(range.first_admitted_unix_ms, record.first_admitted_unix_ms);
+                range.last_admitted_unix_ms =
+                    max_observation(range.last_admitted_unix_ms, record.first_admitted_unix_ms);
+                range.first_outcome_unix_ms = min_observation(range.first_outcome_unix_ms, record.last_outcome_unix_ms);
+                range.last_outcome_unix_ms = max_observation(range.last_outcome_unix_ms, record.last_outcome_unix_ms);
+                range.batch_facts.push(LogicalBatchFact::from(record))?;
             } else {
+                let mut facts = BatchFactEncoder::default();
+                facts.push(LogicalBatchFact::from(record))?;
                 ranges.push(LogicalBatchRange {
-                    table: record.table,
+                    table: record.table.clone(),
                     worker: record.worker,
                     first_sequence: record.sequence,
                     last_sequence: record.sequence,
@@ -1306,16 +1464,29 @@ impl PreparedClient {
                     outcome: record.outcome,
                     decoded_physical_batch_count: record.decoded_physical_batch_count,
                     canonical_logical_bytes: record.canonical_logical_bytes,
-                    canonical_logical_bytes_unavailable_reason: record.canonical_logical_bytes_unavailable_reason,
+                    canonical_logical_bytes_unavailable_reason: record
+                        .canonical_logical_bytes_unavailable_reason
+                        .clone(),
                     first_send_unix_ns: record.first_send_unix_ns,
                     last_send_unix_ns: record.last_send_unix_ns,
                     first_admitted_unix_ms: record.first_admitted_unix_ms,
                     first_admitted_cohort: record.first_admitted_cohort,
                     last_admitted_unix_ms: record.first_admitted_unix_ms,
+                    first_outcome_unix_ms: record.last_outcome_unix_ms,
                     last_outcome_unix_ms: record.last_outcome_unix_ms,
+                    batch_facts: facts,
                 });
             }
         }
+        let ranges = ranges
+            .into_iter()
+            .map(|mut range| -> Result<serde_json::Value> {
+                let facts = std::mem::take(&mut range.batch_facts).encode()?;
+                let mut value = serde_json::to_value(range)?;
+                value["batch_facts"] = facts;
+                Ok(value)
+            })
+            .collect::<Result<Vec<_>>>()?;
         let counts = records.iter().fold([0_u64; 5], |mut counts, record| {
             let index = match record.outcome {
                 ManifestOutcome::Pending => 0,
@@ -1342,28 +1513,23 @@ impl PreparedClient {
             phase == "completed" && !self.manifest_capacity_reached.load(Ordering::Relaxed) && counts[0] == 0;
         let mut manifest = if self.options.data_profile == DataProfile::Diagnostic {
             serde_json::json!({
-                "schema": "arrowcol.logical_batch_manifest.v1",
-                "identity_status": "diagnostic_only",
-                "eligible_for_identity_reconciliation": false,
-                "complete": false,
-                "truncated": false,
+                "schema": "arrowcol.logical_batch_manifest.v1", "identity_status": "diagnostic_only",
+                "eligible_for_identity_reconciliation": false, "complete": false, "truncated": false,
                 "reason": "diagnostic profile replays identity-free corpus frames",
-                "measurement_bounds": measurement_bounds,
-                "records": [],
+                "measurement_bounds": measurement_bounds, "records": [],
             })
         } else {
             serde_json::json!({
-                "schema": "arrowcol.logical_batch_manifest.v1",
-                "version": 1,
-                "identity_status": "identity_bearing",
-                "eligible_for_identity_reconciliation": true,
-                "complete": complete,
-                "truncated": false,
-                "record_count": records.len(),
+                "schema": "arrowcol.logical_batch_manifest.v1", "version": 1,
+                "identity_status": "identity_bearing", "eligible_for_identity_reconciliation": true,
+                "complete": complete, "truncated": false, "record_count": records.len(),
                 "record_cap": MAX_LOGICAL_BATCH_RECORDS,
                 "record_capacity_reached": self.manifest_capacity_reached.load(Ordering::Relaxed),
                 "measurement_bounds": measurement_bounds,
                 "cohort_rule": "first_send_unix_ms < start => warmup; start <= first_send_unix_ms < end => measurement; otherwise post_window; bounds are [start,end)",
+                "range_identity_rule": "each range covers every worker sequence from first_sequence through last_sequence; batch_facts indices are in that order",
+                "range_timestamp_semantics": "send, admission, and outcome timestamps on a range are min/max bounds, not exact per-batch times",
+                "batch_facts_encoding": "dictionary_bitpack_base64url_v1",
                 "identity_column": "endpoint_url",
                 "identity_format": "https://x.invalid/v1/{run_uuid_simple32}/{incarnation_uuid_simple32}/{worker_decimal}/{logical_batch_sequence_base36}/{row_ordinal_decimal}",
                 "publication_identity_key_format": "{run_uuid_simple32}/{incarnation_uuid_simple32}/{worker_decimal}/{logical_batch_sequence_base36}",
@@ -1371,17 +1537,12 @@ impl PreparedClient {
                 "publication_identity_key_role": "optional audit correlation only; not deduplication or fencing identity",
                 "admitted_cohort_rule": "first successful acknowledgement timestamp, using the measurement window [start,end)",
                 "canonical_logical_bytes_scope": "sum over decoded physical Flight batches before collector coalescing; excludes framing, transport, retries, and concatenation",
-                "run_uuid": self.run_id.simple().to_string(),
-                "run_uuid_source": "client_generated",
-                "oat_run_uuid": null,
-                "incarnation_uuid": self.incarnation_id.simple().to_string(),
-                "incarnation_uuid_source": "client_generated",
+                "run_uuid": self.run_id.simple().to_string(), "run_uuid_source": "client_generated", "oat_run_uuid": null,
+                "incarnation_uuid": self.incarnation_id.simple().to_string(), "incarnation_uuid_source": "client_generated",
                 "prepared_logical_batches": records.len(),
                 "attempted_logical_batches": records.iter().filter(|record| record.attempts > 0).count(),
-                "acknowledged_logical_batches": counts[1],
-                "not_admitted_logical_batches": counts[2],
-                "ambiguous_logical_batches": counts[3],
-                "failed_logical_batches": counts[4],
+                "acknowledged_logical_batches": counts[1], "not_admitted_logical_batches": counts[2],
+                "ambiguous_logical_batches": counts[3], "failed_logical_batches": counts[4],
                 "pending_logical_batches": counts[0],
                 "retry_attempts": records.iter().map(|record| u64::from(record.attempts.saturating_sub(1))).sum::<u64>(),
                 "ranges": ranges,
@@ -1396,23 +1557,14 @@ impl PreparedClient {
             self.manifest_capacity_reached.store(true, Ordering::Relaxed);
             let reason = self.remember_first_terminal_failure("serialized_manifest_exceeds_limit")?;
             return Ok(serde_json::json!({
-                "schema": "arrowcol.logical_batch_manifest.v1",
-                "version": 1,
-                "identity_status": "unavailable",
-                "eligible_for_identity_reconciliation": false,
-                "complete": false,
-                "truncated": true,
-                "terminal_failure": reason,
-                "serialized_bytes": serialized_bytes,
-                "serialized_byte_cap": MAX_LOGICAL_MANIFEST_BYTES,
-                "record_count": records.len(),
-                "record_cap": MAX_LOGICAL_BATCH_RECORDS,
+                "schema": "arrowcol.logical_batch_manifest.v1", "version": 1,
+                "identity_status": "unavailable", "eligible_for_identity_reconciliation": false,
+                "complete": false, "truncated": true, "terminal_failure": reason,
+                "serialized_bytes": serialized_bytes, "serialized_byte_cap": MAX_LOGICAL_MANIFEST_BYTES,
+                "record_count": records.len(), "record_cap": MAX_LOGICAL_BATCH_RECORDS,
                 "measurement_bounds": measurement_bounds,
-                "run_uuid": self.run_id.simple().to_string(),
-                "run_uuid_source": "client_generated",
-                "oat_run_uuid": null,
-                "incarnation_uuid": self.incarnation_id.simple().to_string(),
-                "incarnation_uuid_source": "client_generated",
+                "run_uuid": self.run_id.simple().to_string(), "run_uuid_source": "client_generated", "oat_run_uuid": null,
+                "incarnation_uuid": self.incarnation_id.simple().to_string(), "incarnation_uuid_source": "client_generated",
             }));
         }
         Ok(manifest)
@@ -1854,20 +2006,27 @@ impl PreparedClient {
         .await
         .context("DMV upload timeout")
         .and_then(std::convert::identity);
-        if let Some(index) = logical.manifest_index {
-            let outcome = match &result {
-                Ok(_) => ManifestOutcome::Acknowledged,
-                Err(error) if is_not_admitted(error) => ManifestOutcome::NotAdmitted,
-                Err(error) if is_ambiguous_continuous_error(error) => ManifestOutcome::Ambiguous,
-                Err(_) => ManifestOutcome::Failed,
-            };
-            self.record_manifest_outcome(index, outcome, Some(unix_ms()?), measurement)?;
-        }
-        let completed_unix_ms = if result.is_ok() && measurement.is_some() {
+        let outcome = match &result {
+            Ok(_) => ManifestOutcome::Acknowledged,
+            Err(error) if is_not_admitted(error) => ManifestOutcome::NotAdmitted,
+            Err(error) if is_ambiguous_continuous_error(error) => ManifestOutcome::Ambiguous,
+            Err(_) => ManifestOutcome::Failed,
+        };
+        let observed_unix_ms = if logical.manifest_index.is_some() || measurement.is_some() {
             Some(unix_ms()?)
         } else {
             None
         };
+        self.record_result_observation(
+            logical.manifest_index,
+            outcome,
+            measurement,
+            worker,
+            batch.rows,
+            batch.raw_arrow_bytes,
+            batch.encoded_bytes,
+            observed_unix_ms,
+        )?;
         attempt.finished = true;
         let micros = u64::try_from(attempt.started.elapsed().as_micros()).unwrap_or(u64::MAX);
         if let Some(measurement) = measurement {
@@ -1880,15 +2039,6 @@ impl PreparedClient {
             .map_err(|_| anyhow::anyhow!("latency histogram poisoned"))?[bucket.min(63)] += 1;
         match result {
             Ok(guarantee) => {
-                if let Some((measurement, completed_unix_ms)) = measurement.zip(completed_unix_ms) {
-                    measurement.record_completion(
-                        worker,
-                        batch.rows,
-                        batch.raw_arrow_bytes,
-                        batch.encoded_bytes,
-                        completed_unix_ms,
-                    );
-                }
                 counters.completed_rows.fetch_add(batch.rows, Ordering::Relaxed);
                 counters
                     .completed_bytes
@@ -3132,6 +3282,19 @@ mod tests {
             .resolve(100, 1)
     }
 
+    fn minimum_legacy_range_json_bytes(table: &str, rows_per_batch: u32) -> Result<usize> {
+        Ok(serde_json::to_vec(&serde_json::json!({
+            "table": table, "worker": 0, "first_sequence": 0, "last_sequence": 0,
+            "batch_count": 1, "rows_per_batch": rows_per_batch, "cohort": "measurement",
+            "attempts": 1, "outcome": "acknowledged", "decoded_physical_batch_count": 1,
+            "canonical_logical_bytes": 0, "canonical_logical_bytes_unavailable_reason": null,
+            "first_send_unix_ns": 0, "last_send_unix_ns": 0, "first_admitted_unix_ms": 0,
+            "first_admitted_cohort": "measurement", "last_admitted_unix_ms": 0,
+            "last_outcome_unix_ms": 0,
+        }))?
+        .len())
+    }
+
     fn manifest_test_client() -> Result<PreparedClient> {
         let mut options = options()?;
         options.data_profile = DataProfile::Realistic;
@@ -3233,22 +3396,37 @@ mod tests {
         );
         assert_eq!(manifest["record_count"], 2);
         assert_eq!(manifest["retry_attempts"], 2);
-        assert_eq!(manifest["ranges"].as_array().context("manifest ranges")?.len(), 2);
-        for (sequence, expected_bytes) in [(0, 10), (1, 11)] {
-            let range = manifest["ranges"]
-                .as_array()
-                .context("manifest ranges")?
-                .iter()
-                .find(|range| range["first_sequence"] == sequence)
-                .context("per-publication range")?;
-            assert_eq!(range["last_sequence"], sequence);
-            assert_eq!(range["batch_count"], 1);
-            assert_eq!(range["rows_per_batch"], 2);
-            assert_eq!(range["decoded_physical_batch_count"], 2);
-            assert_eq!(range["canonical_logical_bytes"], expected_bytes);
-            assert_eq!(range["attempts"], 2);
-            assert_eq!(range["first_admitted_cohort"], "measurement");
-        }
+        assert_eq!(manifest["ranges"].as_array().context("manifest ranges")?.len(), 1);
+        let range = &manifest["ranges"][0];
+        assert_eq!(range["first_sequence"], 0);
+        assert_eq!(range["last_sequence"], 1);
+        assert_eq!(range["batch_count"], 2);
+        assert_eq!(range["rows_per_batch"], 2);
+        assert_eq!(range["decoded_physical_batch_count"], 4);
+        assert_eq!(range["canonical_logical_bytes"], 21);
+        assert_eq!(range["attempts"], 2);
+        assert_eq!(range["first_admitted_cohort"], "measurement");
+        assert_eq!(range["first_send_unix_ns"], 1_000_000_000);
+        assert_eq!(range["last_send_unix_ns"], 1_000_001_000);
+        assert_eq!(range["first_admitted_unix_ms"], 1_000);
+        assert_eq!(range["last_admitted_unix_ms"], 1_001);
+        assert_eq!(range["first_outcome_unix_ms"], 1_000);
+        assert_eq!(range["last_outcome_unix_ms"], 1_000);
+        assert_eq!(range["batch_facts"]["index_count"], 2);
+        assert_eq!(range["batch_facts"]["index_bits"], 1);
+        assert_eq!(range["batch_facts"]["indices_base64url"], "Ag");
+        let facts = range["batch_facts"]["dictionary"]
+            .as_array()
+            .context("batch fact dictionary")?;
+        assert_eq!(facts.len(), 2);
+        assert_eq!(facts[0]["decoded_physical_batch_count"], 2);
+        assert_eq!(facts[0]["canonical_logical_bytes"], 10);
+        assert_eq!(facts[1]["decoded_physical_batch_count"], 2);
+        assert_eq!(facts[1]["canonical_logical_bytes"], 11);
+        assert_eq!(
+            manifest["range_timestamp_semantics"],
+            "send, admission, and outcome timestamps on a range are min/max bounds, not exact per-batch times"
+        );
 
         let expected_ids = (0..=1)
             .flat_map(|sequence| {
@@ -3268,6 +3446,299 @@ mod tests {
         *observed.entry(duplicate).or_default() += 1;
         assert_eq!(observed.values().sum::<u64>(), expected.values().sum::<u64>());
         assert_ne!(observed, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn completion_observation_is_shared_at_half_open_window_boundaries() -> Result<()> {
+        let start = 100;
+        let end = 200;
+        for (observed, expected_cohort, expected_rows) in [
+            (start, ManifestCohort::Measurement, 16_u64),
+            (end, ManifestCohort::PostWindow, 0_u64),
+        ] {
+            let mut client = manifest_test_client()?;
+            client.measurement = Mutex::new(Some(Measurement::new(start, end, 2)?));
+            client
+                .logical_batches
+                .lock()
+                .map_err(|_| anyhow::anyhow!("logical batch manifest state poisoned"))?
+                .push(LogicalBatchRecord {
+                    table: "sqlserver_availability_replica_states".to_owned(),
+                    worker: 0,
+                    sequence: 0,
+                    row_count: 16,
+                    cohort: ManifestCohort::Measurement,
+                    attempts: 1,
+                    outcome: ManifestOutcome::Pending,
+                    decoded_physical_batch_count: 2,
+                    canonical_logical_bytes: Some(128),
+                    canonical_logical_bytes_unavailable_reason: None,
+                    first_admitted_unix_ms: None,
+                    first_admitted_cohort: None,
+                    first_send_unix_ns: Some(start * 1_000_000),
+                    last_send_unix_ns: Some(start * 1_000_000),
+                    last_outcome_unix_ms: None,
+                });
+            let measurement_guard = client
+                .measurement
+                .lock()
+                .map_err(|_| anyhow::anyhow!("measurement state poisoned"))?;
+            let measurement = measurement_guard.as_ref().context("measurement window missing")?;
+            client.record_result_observation(
+                Some(0),
+                ManifestOutcome::Acknowledged,
+                Some(measurement),
+                0,
+                16,
+                128,
+                64,
+                Some(observed),
+            )?;
+            assert_eq!(measurement.rows.load(Ordering::Relaxed), expected_rows);
+            drop(measurement_guard);
+            let manifest = client.logical_manifest("completed")?;
+            assert_eq!(manifest["complete"], true);
+            assert_eq!(manifest["ranges"][0]["first_admitted_unix_ms"], observed);
+            assert_eq!(
+                manifest["ranges"][0]["first_admitted_cohort"],
+                serde_json::to_value(expected_cohort)?
+            );
+            let manifest_rows = if manifest["ranges"][0]["first_admitted_cohort"] == "measurement" {
+                16
+            } else {
+                0
+            };
+            assert_eq!(manifest_rows, expected_rows);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sustained_window_manifest_preserves_exact_facts_with_bounded_size() -> Result<()> {
+        let started = Instant::now();
+        const WORKERS: usize = 32;
+        const ROWS_PER_BATCH: u32 = 4_096;
+        const WINDOW_MS: u64 = 600_000;
+        const WARMUP_MS: u64 = 60_000;
+        let total_batches =
+            (6_440_000_u64 * (WINDOW_MS + WARMUP_MS) + u64::from(ROWS_PER_BATCH) - 1) / u64::from(ROWS_PER_BATCH);
+        let warmup_batches = (6_440_000_u64 * WARMUP_MS + u64::from(ROWS_PER_BATCH) - 1) / u64::from(ROWS_PER_BATCH);
+        anyhow::ensure!(
+            total_batches % WORKERS as u64 == 0,
+            "full-window batch count must divide across workers"
+        );
+        let batches_per_worker = total_batches / WORKERS as u64;
+        anyhow::ensure!(
+            total_batches <= MAX_LOGICAL_BATCH_RECORDS as u64,
+            "full-window fixture exceeds record cap"
+        );
+        const START_MS: u64 = 60_000;
+        let end_ms = START_MS + WINDOW_MS;
+        let mut client = manifest_test_client()?;
+        client.options.workers = WORKERS;
+        client.counters = (0..WORKERS).map(|_| Counters::default()).collect();
+        client.worker_next = (0..WORKERS).map(|_| AtomicU64::new(0)).collect();
+        client.worker_batch_sequence = (0..WORKERS).map(|_| AtomicU64::new(0)).collect();
+        client.measurement = Mutex::new(Some(Measurement::new(START_MS, end_ms, WORKERS)?));
+        let table = "sqlserver_availability_replica_states";
+        let mut expected_physical = 0_u64;
+        let mut expected_canonical = 0_u64;
+        let mut expected_measurement_physical = 0_u64;
+        let mut expected_measurement_canonical = 0_u64;
+        {
+            let mut records = client
+                .logical_batches
+                .lock()
+                .map_err(|_| anyhow::anyhow!("logical batch manifest state poisoned"))?;
+            records
+                .try_reserve_exact(total_batches as usize)
+                .context("reserve full-window logical records")?;
+            for worker in 0..WORKERS {
+                for sequence in 0..batches_per_worker {
+                    let global = worker as u64 * batches_per_worker + sequence;
+                    let is_warmup = global < warmup_batches;
+                    let cohort = if is_warmup {
+                        ManifestCohort::Warmup
+                    } else {
+                        ManifestCohort::Measurement
+                    };
+                    let physical = 1 + global % 4;
+                    let canonical = 1_000 + (global % 4) * 128;
+                    expected_physical += physical;
+                    expected_canonical += canonical;
+                    if !is_warmup {
+                        expected_measurement_physical += physical;
+                        expected_measurement_canonical += canonical;
+                    }
+                    let start_ns = START_MS * 1_000_000;
+                    let send_ns = if is_warmup {
+                        start_ns - 1 - global * WARMUP_MS * 1_000_000 / warmup_batches
+                    } else {
+                        start_ns + (global - warmup_batches) * WINDOW_MS * 1_000_000 / (total_batches - warmup_batches)
+                    };
+                    records.push(LogicalBatchRecord {
+                        table: table.to_owned(),
+                        worker: worker as u16,
+                        sequence,
+                        row_count: ROWS_PER_BATCH,
+                        cohort,
+                        attempts: 1,
+                        outcome: ManifestOutcome::Pending,
+                        decoded_physical_batch_count: physical,
+                        canonical_logical_bytes: Some(canonical),
+                        canonical_logical_bytes_unavailable_reason: None,
+                        first_admitted_unix_ms: None,
+                        first_admitted_cohort: None,
+                        first_send_unix_ns: Some(send_ns),
+                        last_send_unix_ns: Some(send_ns),
+                        last_outcome_unix_ms: None,
+                    });
+                }
+            }
+        }
+        let measurement_guard = client
+            .measurement
+            .lock()
+            .map_err(|_| anyhow::anyhow!("measurement state poisoned"))?;
+        let measurement = measurement_guard.as_ref().context("measurement window missing")?;
+        for index in (0..total_batches as usize).rev() {
+            let global = index as u64;
+            let is_warmup = global < warmup_batches;
+            let observed = if is_warmup {
+                START_MS.saturating_sub(1 + (global * 7 % WARMUP_MS))
+            } else {
+                START_MS + (global * 7_919 % WINDOW_MS)
+            };
+            let canonical = 1_000 + (global % 4) * 128;
+            client.record_result_observation(
+                Some(index),
+                ManifestOutcome::Acknowledged,
+                Some(measurement),
+                index / batches_per_worker as usize,
+                u64::from(ROWS_PER_BATCH),
+                canonical,
+                canonical,
+                Some(observed),
+            )?;
+        }
+        let measured_rows = measurement.rows.load(Ordering::Relaxed);
+        drop(measurement_guard);
+        let expected_measurement_rows = (total_batches - warmup_batches) * u64::from(ROWS_PER_BATCH);
+        assert_eq!(measured_rows, expected_measurement_rows);
+        let receipt = client.metrics("completed")?;
+        client.ensure_terminal_manifest_complete()?;
+        let manifest = &receipt["logical_batch_manifest"];
+        assert_eq!(manifest["complete"], true);
+        assert_eq!(manifest["record_count"], total_batches);
+        assert_eq!(manifest["record_capacity_reached"], false);
+        let ranges = manifest["ranges"].as_array().context("manifest ranges")?;
+        anyhow::ensure!(
+            ranges.len() <= WORKERS * 2,
+            "full-window evidence fragmented into too many ranges"
+        );
+        let (batches, physical, canonical, measurement_rows, measure_physical, measure_canonical) =
+            ranges.iter().try_fold(
+                (0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64),
+                |(batches, physical, canonical, rows, measure_physical, measure_canonical), range| -> Result<_> {
+                    let count = range["batch_count"].as_u64().context("missing range batch count")?;
+                    let range_physical = range["decoded_physical_batch_count"]
+                        .as_u64()
+                        .context("missing physical batch total")?;
+                    let range_canonical = range["canonical_logical_bytes"]
+                        .as_u64()
+                        .context("missing canonical byte total")?;
+                    let range_rows = range["rows_per_batch"]
+                        .as_u64()
+                        .context("missing rows per batch")?
+                        .checked_mul(count)
+                        .context("range row total overflow")?;
+                    let in_measurement = range["first_admitted_cohort"] == "measurement";
+                    Ok((
+                        batches + count,
+                        physical + range_physical,
+                        canonical + range_canonical,
+                        rows + if in_measurement { range_rows } else { 0 },
+                        measure_physical + if in_measurement { range_physical } else { 0 },
+                        measure_canonical + if in_measurement { range_canonical } else { 0 },
+                    ))
+                },
+            )?;
+        assert_eq!(batches, total_batches);
+        assert_eq!(physical, expected_physical);
+        assert_eq!(canonical, expected_canonical);
+        assert_eq!(measurement_rows, measured_rows);
+        assert_eq!(measure_physical, expected_measurement_physical);
+        assert_eq!(measure_canonical, expected_measurement_canonical);
+        for range in ranges {
+            assert_eq!(range["batch_facts"]["index_count"], range["batch_count"]);
+        }
+        let legacy_lower_bound = minimum_legacy_range_json_bytes(table, ROWS_PER_BATCH)? as u64 * total_batches;
+        anyhow::ensure!(
+            legacy_lower_bound > MAX_LOGICAL_MANIFEST_BYTES as u64,
+            "legacy expanded records do not exceed cap"
+        );
+        let manifest_bytes = serde_json::to_vec(manifest)?.len();
+        anyhow::ensure!(
+            manifest_bytes <= MAX_LOGICAL_MANIFEST_BYTES,
+            "compacted manifest exceeds cap"
+        );
+        let terminal_line = format!("OAT_CLIENT_METRICS {receipt}\n");
+        anyhow::ensure!(
+            terminal_line.len() <= MAX_OAT_CLIENT_METRICS_LINE_BYTES,
+            "terminal line exceeds cap"
+        );
+        eprintln!(
+            "L3_FULL_WINDOW_MANIFEST batches={total_batches} warmup_batches={warmup_batches} ranges={} measurement_ms={WINDOW_MS} warmup_ms={WARMUP_MS} rows={measured_rows} admitted_rows={measurement_rows} physical_batches={physical} canonical_bytes={canonical} measurement_physical_batches={measure_physical} expected_measurement_physical_batches={expected_measurement_physical} measurement_canonical_bytes={measure_canonical} expected_measurement_canonical_bytes={expected_measurement_canonical} legacy_lower_bound_bytes={legacy_lower_bound} manifest_bytes={manifest_bytes} terminal_line_bytes={} cap_bytes={} elapsed_ms={}",
+            ranges.len(),
+            terminal_line.len(),
+            MAX_OAT_CLIENT_METRICS_LINE_BYTES,
+            started.elapsed().as_millis()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn batch_fact_bitpacking_preserves_order_and_values() -> Result<()> {
+        let facts = [
+            LogicalBatchFact {
+                decoded_physical_batch_count: 1,
+                canonical_logical_bytes: Some(10),
+                canonical_logical_bytes_unavailable_reason: None,
+            },
+            LogicalBatchFact {
+                decoded_physical_batch_count: 2,
+                canonical_logical_bytes: Some(20),
+                canonical_logical_bytes_unavailable_reason: None,
+            },
+            LogicalBatchFact {
+                decoded_physical_batch_count: 3,
+                canonical_logical_bytes: None,
+                canonical_logical_bytes_unavailable_reason: Some("unsupported".to_owned()),
+            },
+        ];
+        let mut encoder = BatchFactEncoder::default();
+        for index in [0, 1, 2, 0] {
+            encoder.push(facts[index].clone())?;
+        }
+        let encoded = encoder.encode()?;
+        assert_eq!(encoded["index_count"], 4);
+        assert_eq!(encoded["index_bits"], 2);
+        assert_eq!(encoded["indices_base64url"], "JA");
+        assert_eq!(encoded["dictionary"].as_array().context("fact dictionary")?.len(), 3);
+        assert_eq!(encoded["dictionary"][0]["decoded_physical_batch_count"], 1);
+        assert_eq!(encoded["dictionary"][0]["canonical_logical_bytes"], 10);
+        assert_eq!(encoded["dictionary"][1]["decoded_physical_batch_count"], 2);
+        assert_eq!(encoded["dictionary"][1]["canonical_logical_bytes"], 20);
+        assert_eq!(encoded["dictionary"][2]["decoded_physical_batch_count"], 3);
+        assert_eq!(
+            encoded["dictionary"][2]["canonical_logical_bytes"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            encoded["dictionary"][2]["canonical_logical_bytes_unavailable_reason"],
+            "unsupported"
+        );
         Ok(())
     }
 
@@ -4749,7 +5220,7 @@ mod tests {
                 let network_tx_bytes_per_second = window["client_resources"]["network_tx_bytes_per_second"].clone();
                 let measurement_seconds = (measurement_end - measurement_start) as f64 / 1_000.0;
                 eprintln!(
-                    "L3_CLIENT_SINK_CALIBRATION scope=in_memory_sink_not_committed retry_max_attempts=1 ipc_compression={codec:?} sink_completed_rows_per_second={:.3} uncompressed_flight_data_GB_per_second={:.6} configured_ipc_compression_flight_data_GB_per_second={:.6} canonical_offered_GB_per_second={:.6} canonical_admitted_GB_per_second={:.6} offered_physical_batches={} admitted_physical_batches={} offered_rows={} admitted_rows={} cpu_core_equivalents={} network_tx_bytes_per_second={} retried_rows={retried_rows} given_up_rows={given_up_rows} ambiguous_rows={ambiguous_rows} rejected_rows={rejected_rows} workers={workers} streams_per_worker=2 tokio_runtime_threads=32 string_width={} corpus_rows=16384 batch_rows=4096 max_memory_bytes={} max_flight_data_limit_bytes=2097152 max_message_limit_bytes=16777216",
+                    "L3_CLIENT_SINK_CALIBRATION scope=in_memory_sink_not_committed retry_max_attempts=1 ipc_compression={codec:?} sink_completed_rows_per_second={:.3} uncompressed_flight_data_GB_per_second={:.6} configured_ipc_compression_flight_data_GB_per_second={:.6} canonical_offered_GB_per_second={:.6} canonical_admitted_GB_per_second={:.6} offered_physical_batches={} admitted_physical_batches={} offered_rows={} admitted_rows={} completed_rows={rows} cpu_core_equivalents={} network_tx_bytes_per_second={} retried_rows={retried_rows} given_up_rows={given_up_rows} ambiguous_rows={ambiguous_rows} rejected_rows={rejected_rows} workers={workers} streams_per_worker=2 tokio_runtime_threads=32 string_width={} corpus_rows=16384 batch_rows=4096 max_memory_bytes={} max_flight_data_limit_bytes=2097152 max_message_limit_bytes=16777216",
                     rows as f64 / measurement_seconds,
                     uncompressed_bytes as f64 / 1_000_000_000.0 / measurement_seconds,
                     configured_bytes as f64 / 1_000_000_000.0 / measurement_seconds,
@@ -4764,10 +5235,110 @@ mod tests {
                     789,
                     4_u64 * 1_024 * 1_024 * 1_024,
                 );
+                anyhow::ensure!(
+                    admitted_rows == rows,
+                    "manifest admitted rows {admitted_rows} differ from measurement completion rows {rows}"
+                );
                 assert!(rows > 0, "null Flight sink received no rows with {workers} workers");
             }
         }
 
+        let mut terminal_options = options()?;
+        terminal_options.data_profile = DataProfile::Realistic;
+        terminal_options.string_width = 789;
+        terminal_options.string_length_distribution = Some(StringLengthDistribution::Uniform);
+        terminal_options.value_variation = Some(ValueVariation::PerRow);
+        terminal_options.guid_uniqueness = Some(GuidUniqueness::PerRow);
+        terminal_options.workers = 16;
+        terminal_options.corpus_rows = 1_024;
+        terminal_options.batch_rows = 64;
+        terminal_options.streams_per_worker = 2;
+        terminal_options.interval_us = 0;
+        terminal_options.max_memory_bytes = 4_u64 * 1_024 * 1_024 * 1_024;
+        terminal_options.max_flight_data_bytes = 2 * 1_024 * 1_024;
+        terminal_options.max_message_bytes = 16 * 1_024 * 1_024;
+        terminal_options.runtime_threads = 32;
+        terminal_options.ipc_compression = IpcCompression::Zstd;
+        terminal_options.stream_retry_max_attempts = 1;
+        let terminal_client = PreparedClient::prepare(
+            &endpoint,
+            "ceiling",
+            Some("sqlserver_availability_replica_states"),
+            None,
+            terminal_options,
+        )
+        .await?;
+        let scheduled_start = unix_ms()? + 1_000;
+        let measurement_start = scheduled_start + 250;
+        let measurement_end = measurement_start + 30_000;
+        let terminal_started = Instant::now();
+        terminal_client
+            .run_continuous(scheduled_start, measurement_start, measurement_end)
+            .await?;
+        let terminal_receipt = terminal_client.metrics("completed")?;
+        terminal_client.ensure_terminal_manifest_complete()?;
+        let terminal_manifest = &terminal_receipt["logical_batch_manifest"];
+        let terminal_ranges = terminal_manifest["ranges"]
+            .as_array()
+            .context("missing stress manifest ranges")?;
+        let terminal_record_count = terminal_manifest["record_count"]
+            .as_u64()
+            .context("missing stress manifest record count")?;
+        let admitted_rows = terminal_ranges
+            .iter()
+            .filter(|range| range["first_admitted_cohort"] == "measurement")
+            .try_fold(0_u64, |sum, range| -> Result<u64> {
+                let rows = range["rows_per_batch"]
+                    .as_u64()
+                    .context("missing stress rows per batch")?;
+                let batches = range["batch_count"].as_u64().context("missing stress batch count")?;
+                sum.checked_add(
+                    rows.checked_mul(batches)
+                        .context("stress manifest row count overflow")?,
+                )
+                .context("stress admitted row total overflow")
+            })?;
+        let completed_rows = terminal_receipt["measurement_window"]["completed_rows"]
+            .as_u64()
+            .context("missing stress completed rows")?;
+        anyhow::ensure!(
+            admitted_rows == completed_rows,
+            "stress admitted rows {admitted_rows} differ from completed rows {completed_rows}"
+        );
+        let unique_send_times = terminal_client
+            .logical_batches
+            .lock()
+            .map_err(|_| anyhow::anyhow!("logical batch manifest state poisoned"))?
+            .iter()
+            .filter_map(|record| record.first_send_unix_ns)
+            .collect::<std::collections::HashSet<_>>();
+        anyhow::ensure!(
+            unique_send_times.len() as u64 == terminal_record_count,
+            "real sink stress has non-unique send timestamps; expanded legacy range lower bound is not valid"
+        );
+        let legacy_lower_bound = minimum_legacy_range_json_bytes("sqlserver_availability_replica_states", 64)? as u64
+            * terminal_record_count;
+        anyhow::ensure!(
+            legacy_lower_bound > MAX_LOGICAL_MANIFEST_BYTES as u64,
+            "real sink stress did not exceed former expanded-manifest cap: records={terminal_record_count} lower_bound={legacy_lower_bound}"
+        );
+        let manifest_bytes = serde_json::to_vec(terminal_manifest)?.len();
+        let terminal_line = format!("OAT_CLIENT_METRICS {terminal_receipt}\n");
+        anyhow::ensure!(
+            manifest_bytes <= MAX_LOGICAL_MANIFEST_BYTES,
+            "real sink stress manifest exceeds cap"
+        );
+        anyhow::ensure!(
+            terminal_line.len() <= MAX_OAT_CLIENT_METRICS_LINE_BYTES,
+            "real sink stress terminal line exceeds cap"
+        );
+        eprintln!(
+            "L3_REAL_SINK_TERMINAL_VIABILITY profile=in_memory_flight_sink measurement_ms=30000 records={terminal_record_count} ranges={} admitted_rows={admitted_rows} completed_rows={completed_rows} legacy_lower_bound_bytes={legacy_lower_bound} manifest_bytes={manifest_bytes} terminal_line_bytes={} terminal_line_cap_bytes={} elapsed_ms={}",
+            terminal_ranges.len(),
+            terminal_line.len(),
+            MAX_OAT_CLIENT_METRICS_LINE_BYTES,
+            terminal_started.elapsed().as_millis()
+        );
         shutdown
             .send(())
             .map_err(|()| anyhow::anyhow!("null sink stopped early"))?;
