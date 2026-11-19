@@ -466,6 +466,7 @@ impl DeltaBackend {
             _pending_owner: pending_owner,
             _capacity: capacity,
             _backlog_capacity: Arc::clone(&self.backlog_capacity),
+            _byte_capacity_metrics: Arc::clone(&self._byte_capacity_metrics),
         }));
         Ok(PendingDelta { receipt, release: None })
     }
@@ -613,6 +614,7 @@ struct QueuedBatch {
     _pending_owner: PendingOwner,
     _capacity: Vec<CapacityPermit>,
     _backlog_capacity: Arc<crate::metrics::PublicationBacklogCapacityGuard>,
+    _byte_capacity_metrics: Arc<DeltaExporterCapacityGuard>,
 }
 
 impl QueuedBatch {
@@ -2195,6 +2197,7 @@ mod tests {
                 _pending_owner: owner.begin(LeaseEvidence::from_envelope(&envelope)).expect("admitted"),
                 _capacity: capacity,
                 _backlog_capacity: Arc::clone(&exporter.backend.backlog_capacity),
+                _byte_capacity_metrics: Arc::clone(&exporter.backend._byte_capacity_metrics),
             };
             reissue_lease(&store, &lease, CollectorInstanceId::new()).await;
             owner
@@ -3760,6 +3763,58 @@ mod tests {
         .expect("bounded wave publication");
         assert!(delta_version_exists(directory.path(), 3));
         assert!(!delta_version_exists(directory.path(), 4));
+    }
+
+    #[tokio::test]
+    async fn byte_capacity_metrics_remain_registered_until_queued_publication_completes() {
+        let directory = tempfile::tempdir().expect("directory");
+        let store = Arc::new(MemoryRoutingStore::default());
+        let holder = CollectorInstanceId::new();
+        let lease = lease(&store, holder).await;
+        let metrics = Arc::new(RuntimeMetrics::new(holder));
+        let exporter = GenericDeltaExporter::with_batching(
+            directory.path().to_path_buf(),
+            store as Arc<dyn RoutingStore>,
+            arrow_deltalake::commit::CommitOptions {
+                batch_window: std::time::Duration::from_secs(2),
+                ..Default::default()
+            },
+            FileBatchConfig {
+                coalesce_publications: true,
+                pipeline_depth: 2,
+                max_batches_per_flush: 1,
+                ..Default::default()
+            },
+            Arc::clone(&metrics),
+        )
+        .expect("exporter");
+        let global_effective_bytes = exporter.backend.capacity.bytes.effective_limit_bytes();
+        let (submitted, admitted) = oneshot::channel();
+        *exporter.backend.submission_probe.lock().expect("submission probe") = Some(submitted);
+        let pending = exporter
+            .stage(envelope_pdata(envelope_for(&lease)))
+            .await
+            .expect("publication admitted");
+        tokio::time::timeout(std::time::Duration::from_secs(3), admitted)
+            .await
+            .expect("publication reached commit actor")
+            .expect("submission probe");
+
+        let global_capacity =
+            format!("arrowcol_delta_exporter_global_capacity_effective_bytes {global_effective_bytes}");
+        assert!(metrics.prometheus().contains(&global_capacity));
+        drop(exporter);
+        assert!(metrics.prometheus().contains(&global_capacity));
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), pending.wait())
+            .await
+            .expect("publication completed")
+            .expect("publication committed");
+        assert!(
+            metrics
+                .prometheus()
+                .contains("arrowcol_delta_exporter_global_capacity_effective_bytes 0")
+        );
     }
 
     /// Scenario: A batch exceeds the configured row capacity.
