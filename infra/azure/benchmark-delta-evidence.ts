@@ -14,6 +14,7 @@ export interface DirectDeltaBaseline {
   table_id: string;
   version: number;
   last_commit_sha256: string;
+  history_sha256: string;
 }
 
 export function directDeltaReplay() {
@@ -92,13 +93,12 @@ export function directDeltaReplay() {
   };
 }
 
-/** Call after the original writer and maintenance have positively stopped. */
-export async function captureFrozenDelta(azure: Azure, authority: RunCleanupAuthority, runId: string,
-  tableRoot: string, baseline: DirectDeltaBaseline, directory: string) {
+async function captureDirectDelta(azure: Azure, authority: RunCleanupAuthority, runId: string,
+  tableRoot: string, directory: string, baseline?: DirectDeltaBaseline) {
   const expectedPrefix = `direct-baseline-1/runs/${runId}/dataflow/`;
   requireEvidence(/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(runId) && tableRoot.startsWith(expectedPrefix) &&
     tableRoot.split('/').every(part => /^[A-Za-z0-9_.-]+$/.test(part) && part !== '.' && part !== '..') &&
-    baseline.table_root === tableRoot, 'Delta root differs from its original run/catalog binding');
+    (!baseline || baseline.table_root === tableRoot), 'Delta root differs from its original run/catalog binding');
   const dir = await lstat(directory);
   requireEvidence(dir.isDirectory() && (dir.mode & 0o077) === 0, 'Delta evidence directory is not private');
   const guard = () => authority.assertCurrent();
@@ -148,10 +148,13 @@ export async function captureFrozenDelta(azure: Azure, authority: RunCleanupAuth
     return { records, commits };
   }
   const before = await inventory();
-  requireEvidence(Number.isSafeInteger(baseline.version) && baseline.version >= 0 && before.commits.size > baseline.version + 1,
+  requireEvidence(before.commits.size > 0 && (!baseline ||
+    (Number.isSafeInteger(baseline.version) && baseline.version >= 0 && before.commits.size > baseline.version + 1)),
     'Frozen Delta history does not extend its baseline');
   const evidence: CapturedEvidence[] = [];
   const replay = directDeltaReplay();
+  const history = createHash('sha256');
+  let lastHash = '';
   let total = 0;
   for (let version = 0; version < before.commits.size; version++) {
     const name = `${String(version).padStart(20, '0')}.json`, etag = before.commits.get(name);
@@ -166,7 +169,10 @@ export async function captureFrozenDelta(azure: Azure, authority: RunCleanupAuth
     requireEvidence(total <= 256 * 1024 ** 2, 'Delta JSON evidence exceeded its custody byte limit');
     const path = join(directory, name);
     const hash = sha(data), tableId = replay.apply(data);
-    if (version === baseline.version) requireEvidence(hash === baseline.last_commit_sha256 && tableId === baseline.table_id,
+    history.update(`${name} ${hash}\n`);
+    lastHash = hash;
+    if (version === baseline?.version) requireEvidence(hash === baseline.last_commit_sha256 && tableId === baseline.table_id &&
+      history.copy().digest('hex') === baseline.history_sha256,
       'Original pre-load Delta baseline no longer matches');
     await writeFile(path, data, { mode: 0o600, flag: 'wx', flush: true });
     evidence.push({ key: `delta-${name}`, path, bytes: data.length, sha256: hash });
@@ -185,5 +191,19 @@ export async function captureFrozenDelta(azure: Azure, authority: RunCleanupAuth
     [...before.records].every(([name, version]) => after.records.get(name) === version),
     'Delta log changed during terminal capture');
   await guard();
-  return { snapshot, evidence, physical };
+  requireEvidence(snapshot.table_id, 'Original Delta table identity is unavailable');
+  const observedBaseline: DirectDeltaBaseline = { table_root: tableRoot, table_id: snapshot.table_id,
+    version: snapshot.version, last_commit_sha256: lastHash, history_sha256: history.digest('hex') };
+  return { snapshot, evidence, physical, observedBaseline };
+}
+
+/** Call before release with the source-verified catalog location. */
+export function captureDirectBaseline(azure: Azure, authority: RunCleanupAuthority, runId: string, tableRoot: string, directory: string) {
+  return captureDirectDelta(azure, authority, runId, tableRoot, directory);
+}
+
+/** Call after the original writer and maintenance have positively stopped. */
+export function captureFrozenDelta(azure: Azure, authority: RunCleanupAuthority, runId: string,
+  tableRoot: string, baseline: DirectDeltaBaseline, directory: string) {
+  return captureDirectDelta(azure, authority, runId, tableRoot, directory, baseline);
 }

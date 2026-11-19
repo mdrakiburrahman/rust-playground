@@ -290,44 +290,44 @@ export function validateArm(
   return { scheduleVersion, podUids: podUids.sort() };
 }
 
-function kubectl(context: string, args: string[]): string {
-  const result = spawnSync('kubectl', ['--context', context, '--request-timeout=15s', ...args],
+function kubectl(context: string, args: string[], server: string): string {
+  const result = spawnSync('kubectl', ['--context', context, '--server', server, '--insecure-skip-tls-verify=false',
+    '--request-timeout=15s', ...args],
     { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: 20_000 });
   if (result.error) throw result.error;
   if (result.status !== 0) throw new Error(`kubectl failed (${result.status}): ${result.stderr}`);
   return result.stdout;
 }
 
-function readJson(context: string, args: string[]): unknown {
-  return JSON.parse(kubectl(context, [...args, '-o', 'json'])) as unknown;
-}
-
-export function prepareDirectBarrier(context: string, identity: ArmIdentity) {
+export function prepareDirectBarrier(context: string, identity: ArmIdentity, server: string) {
+  if (!/^https:\/\/[a-z0-9.-]+$/.test(server)) throw new Error('Barrier preparation requires the original AKS TLS server');
   const { namespace, namespaceUid, runId } = identity;
-  const get = (kind: string, name: string) => readJson(context, ['-n', namespace, 'get', kind, name]);
+  const run = (...args: string[]) => kubectl(context, args, server);
+  const readJson = (...args: string[]) => JSON.parse(run(...args, '-o', 'json')) as unknown;
+  const get = (kind: string, name: string) => readJson('-n', namespace, 'get', kind, name);
   const readWriter = () => observeWriter(identity, get('deployment', 'arrowcol'),
-    readJson(context, ['-n', namespace, 'get', 'replicasets', '-l', 'app=arrowcol']),
-    readJson(context, ['-n', namespace, 'get', 'pods', '-l', 'app=arrowcol']));
+    readJson('-n', namespace, 'get', 'replicasets', '-l', 'app=arrowcol'),
+    readJson('-n', namespace, 'get', 'pods', '-l', 'app=arrowcol'));
   const readCapturedWriter = () => {
     const lifetime = readWriter();
     const claim = get('pvc', WRITER_CLAIM);
-    const probe = kubectl(context, ['-n', namespace, 'exec', lifetime.podName, '-c', 'dataflow', '--',
-      '/bin/sh', '-c', probeCapture, 'capture', lifetime.podUid]);
+    const probe = run('-n', namespace, 'exec', lifetime.podName, '-c', 'dataflow', '--',
+      '/bin/sh', '-c', probeCapture, 'capture', lifetime.podUid);
     return { ...lifetime, capture: observeWriterCapture(identity, claim, probe) };
   };
-  const ns = readJson(context, ['get', 'namespace', namespace]);
+  const ns = readJson('get', 'namespace', namespace);
   const job = get('job', 'direct-load-confirmwide');
   const schedule = get('configmap', 'direct-schedule-confirmwide');
   const selector = `arrowcol-oat/run-id=${runId},batch.kubernetes.io/job-name=direct-load-confirmwide`;
-  const pods = readJson(context, ['-n', namespace, 'get', 'pods', '-l', selector]);
+  const pods = readJson('-n', namespace, 'get', 'pods', '-l', selector);
   const clientLogs = (list: unknown) => new Map(array(object(list, 'pod list').items, 'pods').map(item => {
     const meta = object(object(item, 'pod').metadata, 'pod metadata'), name = text(meta.name, 'pod name');
     const uid = text(meta.uid, 'client Pod UID');
     if (!/^[a-z0-9-]+$/.test(uid)) throw new Error('Invalid client Pod UID');
     const index = object(meta.annotations, 'client Pod annotations')['batch.kubernetes.io/job-completion-index'];
     const pattern = `OAT_CLIENT_READY client_id=direct-${runId}-${index} preflight_tables=1`;
-    return [name, kubectl(context, ['-n', namespace, 'exec', name, '-c', 'generator', '--',
-      '/bin/sh', '-c', probeClientCapture, 'capture', uid, pattern])];
+    return [name, run('-n', namespace, 'exec', name, '-c', 'generator', '--',
+      '/bin/sh', '-c', probeClientCapture, 'capture', uid, pattern)];
   }));
   const clientLifetimes = (list: unknown) => JSON.stringify(array(object(list, 'client pods').items, 'pod list').map((item): ClientLifetime => {
     const pod = object(item, 'client pod'), meta = object(pod.metadata, 'client metadata'), name = text(meta.name, 'client name');
@@ -362,8 +362,8 @@ export function prepareDirectBarrier(context: string, identity: ArmIdentity) {
   const checked = validateArm(identity, ns, job, schedule, pods, logs);
   const clients = clientLifetimes(pods);
   const writer = JSON.stringify(readCapturedWriter());
-  const freshPods = readJson(context, ['-n', namespace, 'get', 'pods', '-l', selector]);
-  const fresh = validateArm(identity, readJson(context, ['get', 'namespace', namespace]),
+  const freshPods = readJson('-n', namespace, 'get', 'pods', '-l', selector);
+  const fresh = validateArm(identity, readJson('get', 'namespace', namespace),
     get('job', 'direct-load-confirmwide'), get('configmap', 'direct-schedule-confirmwide'), freshPods, clientLogs(freshPods));
   if (fresh.scheduleVersion !== checked.scheduleVersion || fresh.podUids.join(',') !== checked.podUids.join(',') ||
       clientLifetimes(freshPods) !== clients || JSON.stringify(readCapturedWriter()) !== writer) {

@@ -164,7 +164,7 @@ else process.exit(3);
     chmodSync(executable, 0o700);
     const module = new URL('./benchmark-arm.ts', import.meta.url).href;
     const run = spawnSync(process.execPath, ['--import', 'tsx', '--input-type=module', '--eval',
-      `import {prepareDirectBarrier} from ${JSON.stringify(module)}; console.log(JSON.stringify(prepareDirectBarrier('fixture', ${JSON.stringify(identity)})));`],
+      `import {prepareDirectBarrier} from ${JSON.stringify(module)}; console.log(JSON.stringify(prepareDirectBarrier('fixture', ${JSON.stringify(identity)}, 'https://fixture.example')));`],
     { encoding: 'utf8', env: { ...process.env, PATH: `${dir}${delimiter}${process.env.PATH}`,
       ARM_FIXTURE: data } });
     assert.equal(run.status, 0, run.stderr);

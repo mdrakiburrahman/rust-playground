@@ -8,7 +8,8 @@ import { acceptRouterFencePatch, planRouterFence, routerFenceObserved } from './
 import { persistDirectStopPatch } from './benchmark-stop-patch.js';
 import { observeCompletedClients } from './benchmark-client-terminal.js';
 import { persistDirectEvidence } from './benchmark-evidence-custody.js';
-import { captureFrozenDelta, directDeltaReplay } from './benchmark-delta-evidence.js';
+import { captureDirectBaseline, captureFrozenDelta, directDeltaReplay } from './benchmark-delta-evidence.js';
+import { directCatalogRoot, directClockBound, type DirectRelease } from './benchmark-direct-arm.js';
 import type { Azure } from './bootstrap.js';
 import { validateDirectTerminal, type DirectTerminalArm, type DirectTerminalObservations } from './benchmark-terminal-custody.js';
 import { positiveDirectExitEvent } from './benchmark-pod-exit.js';
@@ -24,6 +25,26 @@ const run = {
 };
 const uid = 'cdcdcdcd-1234-1234-1234-cdcdcdcdcdcd';
 const markers = { 'arrowcol-oat/run-id': run.runId, 'arrowcol-oat/owner-token': run.owner };
+test('requires a unique original catalog receipt and conservative clock brackets', () => {
+  const origin = { ...run, cloudGeneration: uid, sourceRevision: 'b'.repeat(40), fencingToken: 1 };
+  const image = `test@sha256:${'a'.repeat(64)}`;
+  const release: DirectRelease = { revision: origin.sourceRevision, schemaFingerprint: 'schema',
+    images: { writer: image, maintenance: image, sql: image, client: image } };
+  const root = `direct-baseline-1/runs/${run.runId}/dataflow/telemetry/sqlserver/sqlserver_availability_replica_states`;
+  const receipt = { kind: 'oat_run_table_registered', run_id: run.runId, provider: 'delta', schema_version: 1,
+    catalog_table_count: 1, schema_fingerprint: 'schema', table: 'telemetry.sqlserver.sqlserver_availability_replica_states',
+    location: `abfss://data@account.dfs.core.windows.net/${root}` };
+  const check = (text: string) => directCatalogRoot(text, origin, release, 'account', 'data');
+  const log = JSON.stringify(receipt);
+  assert.equal(check(log), root);
+  assert.throws(() => check(`${log}\n${log}`), /Original catalog receipt/);
+  assert.throws(() => check(log.replace('abfss://data@account', 'abfss://data@foreign')), /Original catalog receipt/);
+  assert.throws(() => check(log.replace('"schema_version":1', '"schema_version":1,"schema_version":1')), /duplicate/i);
+  const now = 1767225600000, ns = BigInt(now) * 1_000_000n;
+  assert.equal(directClockBound(now, now + 98, String(ns)).lowerNs, '-99000000');
+  assert.throws(() => directClockBound(now, now + 100, String(ns)), /uncertainty/);
+  assert.throws(() => directClockBound(now, now + 1, String(ns + 101_000_000n)), /uncertainty/);
+});
 test('requires a clean MODIFIED event for the original Pod; disappearance, restart and watch expiry fail', async () => {
   const imageId = `sha256:${'a'.repeat(64)}`, image = `test@${imageId}`, startedAt = '2026-01-01T00:00:00Z';
   const origin = { ...run, cloudGeneration: uid, sourceRevision: 'b'.repeat(40), fencingToken: 1 };
@@ -75,10 +96,43 @@ test('refuses a checkpoint beyond the available JSON before downloading any comm
   };
   try {
     await assert.rejects(() => captureFrozenDelta({ c: { data: 'data' }, blob } as Azure, { assertCurrent: async () => {} }, run.runId,
-      tableRoot, { table_root: tableRoot, table_id: uid, version: 0, last_commit_sha256: '0'.repeat(64) }, directory),
+      tableRoot, { table_root: tableRoot, table_id: uid, version: 0, last_commit_sha256: '0'.repeat(64), history_sha256: '0'.repeat(64) }, directory),
     /checkpoint extends beyond the complete JSON/);
     assert.deepEqual(calls, ['GET ']);
   } finally { await rm(directory, { recursive: true }); }
+});
+test('binds the whole pre-load Delta history, not just its last commit', async () => {
+  const baselineDirectory = await mkdtemp(join(tmpdir(), 'direct-baseline-'));
+  const frozenDirectory = await mkdtemp(join(tmpdir(), 'direct-frozen-'));
+  const tableRoot = `direct-baseline-1/runs/${run.runId}/dataflow/table`, prefix = `${tableRoot}/_delta_log/`;
+  const serialize = (...actions: unknown[]) => Buffer.from(actions.map(action => JSON.stringify(action)).join('\n') + '\n');
+  const creation = serialize({ protocol: { minReaderVersion: 1, minWriterVersion: 2 } }, { metaData: { id: uid } });
+  const commits = [creation, serialize({ commitInfo: { operation: 'WRITE' } })];
+  const blob: Azure['blob'] = async (method, _, path, query, __, headers) => {
+    assert.equal(method, 'GET');
+    if (!path) {
+      assert.equal(query?.prefix, prefix);
+      const objects = commits.map((_, v) => `<Blob><Name>${prefix}${String(v).padStart(20, '0')}.json</Name>` +
+        `<Properties><Etag>"v${v}"</Etag></Properties></Blob>`).join('');
+      return [Buffer.from(`<EnumerationResults><Prefix>${prefix}</Prefix><Blobs>${objects}</Blobs><NextMarker /></EnumerationResults>`),
+        { ':status': '200', 'x-ms-request-id': 'read' }];
+    }
+    const v = Number(path.slice(prefix.length, -5));
+    assert.equal(headers?.['If-Match'], `"v${v}"`);
+    return [commits[v], { ':status': '200', etag: `"v${v}"` }];
+  };
+  const azure = { c: { data: 'data' }, blob } as Azure, authority = { assertCurrent: async () => {} };
+  try {
+    const { observedBaseline } = await captureDirectBaseline(azure, authority, run.runId, tableRoot, baselineDirectory);
+    assert.equal(observedBaseline.version, 1);
+    commits[0] = Buffer.concat([creation, serialize({ commitInfo: { operation: 'ALTER' } })]);
+    commits.push(serialize({ commitInfo: { operation: 'WRITE' } }));
+    await assert.rejects(() => captureFrozenDelta(azure, authority, run.runId, tableRoot, observedBaseline, frozenDirectory),
+      /pre-load Delta baseline no longer matches/);
+  } finally {
+    await rm(baselineDirectory, { recursive: true });
+    await rm(frozenDirectory, { recursive: true });
+  }
 });
 test('seals only read-back-verified original bytes and refuses an altered input', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'bench-custody-'));
@@ -205,9 +259,10 @@ test('direct terminal gate blocks reordered stop receipts before consuming termi
     image: `test@sha256:${'a'.repeat(64)}`, imageId: `sha256:${'a'.repeat(64)}`, containerId: 'original', startedAt: '2026-01-01T00:00:00Z',
   };
   const arm: DirectTerminalArm = {
-    origin, startMs: endMs - 60000, endMs, clients: [], writer: original, maintenance: original, sql: original, routerUid: uid,
+    origin, startMs: endMs - 60000, endMs, clients: [], writer: original, maintenance: original, sql: original, routerUid: uid, provenance: {},
     writerClaim: { claimUid: run.owner, volumeName: 'pv' }, baseline: {
       table_id: uid, table_root: `direct-baseline-1/runs/${run.runId}/dataflow/table`, version: 1, last_commit_sha256: '0'.repeat(64),
+      history_sha256: '0'.repeat(64),
     }, registration: { instance_id: uid, instance_key: '', implementation_pool: 'dataflow', flight_endpoint: '',
       state: 'ready', started_at_utc: original.startedAt, row_version: '0x0000000000000001' },
   };

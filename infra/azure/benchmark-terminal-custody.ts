@@ -34,6 +34,7 @@ export type DirectTerminalArm = {
   sql: WriterLifetime;
   registration: WriterRegistration;
   routerUid: string;
+  provenance: object;
 };
 export type DirectTerminalObservations = {
   job: unknown;
@@ -171,7 +172,9 @@ export function validateDirectTerminal(arm: DirectTerminalArm, t: DirectTerminal
   return { clients, writer, maintenance, sql };
 }
 
-type DirectRunAuthority = RunCleanupAuthority & { runId: string; owner: string; fencingToken: number };
+export type DirectRunAuthority = RunCleanupAuthority & { runId: string; owner: string; fencingToken: number };
+export const directArmRecordPath = (origin: DirectStopOrigin) =>
+  `_arrowcol-custody/direct/${origin.runId}/${origin.namespaceUid}/original-arm.json`;
 
 /** Finish a loaded direct run with live, origin-bound reads, not OAT's no-load handoff. */
 export async function finishDirectTerminalCustody(azure: Azure, authority: DirectRunAuthority, arm: DirectTerminalArm,
@@ -188,7 +191,7 @@ export async function finishDirectTerminalCustody(azure: Azure, authority: Direc
     fic.namespaceOwner === origin.owner && fic.phase === 'ready', 'Run FIC does not identify this original namespace');
   const identity: RunNamespaceIdentity = { version: 1, runId: fic.runId, namespace: fic.namespace, namespaceUid: fic.namespaceUid,
     namespaceOwner: fic.namespaceOwner, aksId: fic.aksId, server: fic.server };
-  const armRecordPath = `_arrowcol-custody/direct/${origin.runId}/${origin.namespaceUid}/original-arm.json`;
+  const armRecordPath = directArmRecordPath(origin);
   const armBytes = Buffer.from(canonical_json(arm));
   const checkArm = async () => {
     await authority.assertCurrent();

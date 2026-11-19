@@ -1525,7 +1525,11 @@ metadata:
   namespace: arrow-collector-BENCHRUNHEX
   labels:
     arrowcol-oat/run-id: BENCHRUNUUID
+    arrowcol-oat/owner-token: BENCHOWNER
     benchmark-stage: registration
+  annotations:
+    arrowcol-oat/run-id: BENCHRUNUUID
+    arrowcol-oat/owner-token: BENCHOWNER
 spec:
   suspend: false
   backoffLimit: 0
@@ -1536,7 +1540,11 @@ spec:
     metadata:
       labels:
         arrowcol-oat/run-id: BENCHRUNUUID
+        arrowcol-oat/owner-token: BENCHOWNER
         app: arrowcol-oat-client
+      annotations:
+        arrowcol-oat/run-id: BENCHRUNUUID
+        arrowcol-oat/owner-token: BENCHOWNER
     spec:
       restartPolicy: Never
       automountServiceAccountToken: false
@@ -1611,6 +1619,9 @@ metadata:
     arrowcol-oat/run-id: BENCHRUNUUID
     arrowcol-oat/owner-token: BENCHOWNER
     benchmark-stage: load
+  annotations:
+    arrowcol-oat/run-id: BENCHRUNUUID
+    arrowcol-oat/owner-token: BENCHOWNER
 data:
   start: pending
   writerLifetime: pending
