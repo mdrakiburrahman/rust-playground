@@ -2341,6 +2341,31 @@ mod downstream_runner_tests {
         run_fault_with_lead(fault, kind, None).await
     }
 
+    #[test]
+    #[ignore = "subprocess fixture for default Tokio worker stack"]
+    fn matrix_default_worker_stack_child() -> Result<()> {
+        let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build()?;
+        runtime.block_on(async {
+            tokio::spawn(async {
+                let future = run_fault(Fault::PinInitFailed, crate::config::OatMode::Aks);
+                eprintln!("matrix fixture future bytes: {}", std::mem::size_of_val(&future));
+                let (_, platform) = future.await?;
+                anyhow::ensure!(platform.pin_init_calls == 1, "matrix did not reach run-table initialization");
+                Ok::<_, anyhow::Error>(())
+            }).await?
+        })
+    }
+
+    #[test]
+    fn matrix_runs_on_default_tokio_worker_stack() -> Result<()> {
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args(["--exact", "runner::downstream_runner_tests::matrix_default_worker_stack_child", "--ignored", "--nocapture"])
+            .env_remove("RUST_MIN_STACK")
+            .output()?;
+        anyhow::ensure!(output.status.success(), "matrix worker subprocess failed: {}", String::from_utf8_lossy(&output.stderr));
+        Ok(())
+    }
+
     async fn run_fault_with_lead(
         fault: Fault,
         kind: crate::config::OatMode,
