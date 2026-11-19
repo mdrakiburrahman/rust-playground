@@ -1,8 +1,11 @@
 import assert from 'node:assert/strict';
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { delimiter, join } from 'node:path';
 import test from 'node:test';
 import { acceptRouterFencePatch, planRouterFence, routerFenceObserved } from './benchmark-router-fence.js';
 import { persistDirectStopPatch } from './benchmark-stop-patch.js';
-import { writerLogExportPod } from './benchmark-writer-export.js';
+import { exportWriterLogs, writerLogExportPod } from './benchmark-writer-export.js';
 import { observeStoppedWriterRegistration, pinWriterRegistration } from './benchmark-writer-sql.js';
 
 const run = {
@@ -123,3 +126,42 @@ test('exports the original writer directory on the original node with no writeab
   assert.deepEqual(spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchFields[0].values,
     [writer.nodeName]);
 });
+
+  test('streams both writer files unchanged and fails on helper replacement or a checksum discrepancy', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'direct-export-'));
+    const savedPath = process.env.PATH;
+    const fixture = join(dir, 'kubectl');
+    try {
+      await writeFile(fixture, `#!/usr/bin/env node
+  const args=process.argv.slice(2);
+  const [exe,,path]=args.slice(args.indexOf('--')+1);
+  const bytes=path.endsWith('stdout')?Buffer.from([0,13,10,255]):Buffer.from('stderr');
+  const sha=require('node:crypto').createHash('sha256').update(bytes).digest('hex');
+  if(exe.endsWith('sha256sum')) console.log((process.env.CORRUPT_EXPORT === 'yes'?'a'.repeat(64):sha)+'  '+path);
+  else process.stdout.write(bytes);
+  `);
+      await chmod(fixture, 0o700);
+      process.env.PATH = `${dir}${delimiter}${savedPath}`;
+      const observed = { podUid: uid, containerId: 'original-instance' };
+      const guard = { assertCurrent: async () => {} };
+      const execute = (directory: string, helper = async () => observed) =>
+        exportWriterLogs(guard, run, 'https://test.example', 'none', directory, helper);
+      const { files } = await execute(dir);
+      assert.deepEqual(await readFile(files[0].local), Buffer.from([0, 13, 10, 255]));
+      assert.deepEqual(await readFile(files[1].local), Buffer.from('stderr'));
+      let seen = false;
+      await assert.rejects(execute(dir, async () => {
+        if (seen) return { ...observed, podUid: 'replacement' };
+        seen = true;
+        return observed;
+      }), /helper was replaced/);
+      const corrupt = join(dir, 'corrupt');
+      await mkdir(corrupt, { mode: 0o700 });
+      process.env.CORRUPT_EXPORT = 'yes';
+      await assert.rejects(execute(corrupt), /changed during export/);
+    } finally {
+      process.env.PATH = savedPath;
+      delete process.env.CORRUPT_EXPORT;
+      await rm(dir, { recursive: true, force: true });
+    }
+  });

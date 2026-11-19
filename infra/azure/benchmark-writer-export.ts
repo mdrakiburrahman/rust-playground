@@ -1,7 +1,16 @@
+import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { createWriteStream } from 'node:fs';
+import { lstat } from 'node:fs/promises';
+import { join } from 'node:path';
+import { Transform } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import { observeWriterClaim, WRITER_CLAIM, type ArmIdentity, type observeWriterExit } from './benchmark-arm.js';
+import type { RunCleanupAuthority } from './run_fic.js';
 
 type Capture = ReturnType<typeof observeWriterClaim>;
 type WriterExit = ReturnType<typeof observeWriterExit>;
+const maxStreamBytes = 4 * 1024 ** 3;
 
 /** Render after positive terminal evidence; the helper cannot modify the retained claim. */
 export function writerLogExportPod(run: ArmIdentity, writer: WriterExit, pinnedClaim: Capture, observedClaim: unknown) {
@@ -12,6 +21,74 @@ export function writerLogExportPod(run: ArmIdentity, writer: WriterExit, pinnedC
       !/^.+@sha256:[0-9a-f]{64}$/.test(writer.image) || !writer.terminalPodResourceVersion) {
     throw new Error('Cannot export from an unverified original writer claim, node or lifetime');
   }
+  return renderExportPod(run, writer, cap);
+}
+
+export async function exportWriterLogs(authority: RunCleanupAuthority, run: ArmIdentity, server: string, context: string,
+    directory: string, observeHelper: () => Promise<{ podUid: string; containerId: string }>) {
+    const stat = await lstat(directory);
+    if (!stat.isDirectory() || (stat.mode & 0o077) !== 0 || !/^https:\/\/[a-z0-9.-]+$/.test(server)) {
+      throw new Error('Writer export needs a private evidence directory and exact TLS AKS server');
+    }
+    await authority.assertCurrent();
+    const pin = await observeHelper();
+    if (!pin.podUid || !pin.containerId) throw new Error('Writer export helper identity is unknown');
+    async function checkCurrent() {
+      await authority.assertCurrent();
+      const now = await observeHelper();
+      if (now.podUid !== pin.podUid || now.containerId !== pin.containerId) throw new Error('Writer export helper was replaced');
+    }
+    async function exec(command: string[], transfer: (stdout: NodeJS.ReadableStream) => Promise<void>) {
+      await checkCurrent();
+      const child = spawn('kubectl', ['--context', context, '--server', server, '--insecure-skip-tls-verify=false',
+        '--request-timeout=900s', '-n', run.namespace, 'exec', 'direct-writer-log-export', '-c', 'export', '--', ...command],
+      { stdio: ['ignore', 'pipe', 'ignore'], timeout: 900_000 });
+      const done = new Promise<void>((resolve, reject) => {
+        child.once('error', reject);
+        child.once('close', (status, signal) => status === 0 && signal === null ? resolve() : reject(new Error('Writer export transport failed')));
+      });
+      try { await Promise.all([done, transfer(child.stdout)]); }
+      catch (error) { child.kill(); throw error; }
+      await checkCurrent();
+    }
+    async function fingerprint(file: string) {
+      const parts: Buffer[] = [];
+      let bytes = 0;
+      await exec(['/usr/bin/sha256sum', '--', file], async stdout => {
+        for await (const chunk of stdout) {
+          const part = Buffer.from(chunk);
+          bytes += part.length;
+          if (bytes > 256) throw new Error('Writer export fingerprint is oversized');
+          parts.push(part);
+        }
+      });
+      const match = /^([a-f0-9]{64}) [ *]\/evidence\/(?:stdout|stderr)\n$/.exec(Buffer.concat(parts).toString('ascii'));
+      if (!match) throw new Error('Writer export checksum response is invalid');
+      return match[1];
+    }
+    const files = [];
+    for (const stream of ['stdout', 'stderr']) {
+      const remote = `/evidence/${stream}`, local = join(directory, `writer-${stream}.raw`);
+      const before = await fingerprint(remote);
+      const sha = createHash('sha256');
+      let bytes = 0;
+      const hash = new Transform({ transform(chunk: Buffer, _encoding, done) {
+        bytes += chunk.length;
+        if (bytes >= maxStreamBytes) return done(new Error('Writer log reached its capture capacity'));
+        sha.update(chunk);
+        done(null, chunk);
+      } });
+      await exec(['/bin/cat', '--', remote], async stdout => {
+        await pipeline(stdout, hash, createWriteStream(local, { flags: 'wx', mode: 0o600, flush: true }));
+      });
+      const sha256 = sha.digest('hex');
+      if (before !== sha256 || await fingerprint(remote) !== sha256) throw new Error('Original writer log changed during export');
+      files.push({ stream, local, bytes, sha256 });
+    }
+    return { helper: pin, files };
+}
+
+function renderExportPod(run: ArmIdentity, writer: WriterExit, cap: Capture) {
   const markers = { 'arrowcol-oat/run-id': run.runId, 'arrowcol-oat/owner-token': run.owner };
   return {
     apiVersion: 'v1', kind: 'Pod',
