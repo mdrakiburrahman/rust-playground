@@ -18,7 +18,7 @@ import { collectDataFlow } from './dataflow-verdict.js';
 import {
   buildOwnedServer, cleanupLocalComposeProjects, finishOwnedLocalRun, launchOat, main, OatLauncherDeadline, assertNoUnsettledDeadlineReceipts, readOatConfigForMode,
   processStartTicks, resolveCliConfigPath, resolveOatConfigPath, sendViewerFile,
-  assertCanonicalAksLaunchWorkspace, isExactExitedLegacyServer, recordLegacyAksDisposition, startLocalServer, startLocalViewer, stopLocalServer, type OatRunStatus,
+  aksDispositionMessage, assertCanonicalAksLaunchWorkspace, isExactExitedLegacyServer, recordLegacyAksDisposition, startLocalServer, startLocalViewer, stopLocalServer, type OatRunStatus,
 } from './launch.js';
 
 const status = (state: OatRunStatus['state']) => ({
@@ -1096,7 +1096,10 @@ test('owned controller crash requires exact current custody without inventing te
     await new Promise<void>((resolve, reject) => listener.close((error) => error ? reject(error) : resolve()));
     const positiveApproval = await approveFixture(manifest);
     await assert.rejects(assertNoUnsettledDeadlineReceipts(root, undefined, positiveApproval), /Unsettled AKS/);
-    await recordLegacyAksDisposition(root, deadline.invocationId, evidencePath, positiveApproval);
+    const recordedKind = await recordLegacyAksDisposition(root, deadline.invocationId, evidencePath, positiveApproval);
+    assert.equal(recordedKind, 'owned-controller-crash-aks');
+    assert.match(aksDispositionMessage(recordedKind), /original run state is unchanged and no ranking is authorized/);
+    assert.match(aksDispositionMessage('aborted-post-load-aks'), /benchmark remains failed and unranked/);
     await assertNoUnsettledDeadlineReceipts(root, undefined, positiveApproval);
     assert.deepEqual(await readFile(deadline.receiptPath), original);
     await unlink(sidecar);

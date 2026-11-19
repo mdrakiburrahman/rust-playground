@@ -1005,7 +1005,7 @@ async function assertDispositionWritersAbsent(proof: ReturnType<typeof validateA
 
 export async function recordLegacyAksDisposition(
   root: string, invocationId: string, evidencePath: string, approvals = approvedAksDispositions,
-): Promise<void> {
+): Promise<AksDispositionApproval['kind']> {
   const approval = findAksDispositionApproval(approvals, invocationId);
   if (!approval) throw new Error('No reviewed legacy AKS disposition for this invocation');
   const path = resolve(root, invocationId + '.json');
@@ -1030,7 +1030,7 @@ export async function recordLegacyAksDisposition(
   if (await checkExisting()) {
     await assertDispositionWritersAbsent(proof);
     await syncLegacyReceiptDirectory(path);
-    return;
+    return proof.kind;
   }
   const now = Date.now();
   const current = proof.kind === 'aborted-post-load-aks' || proof.kind === 'owned-controller-crash-aks'
@@ -1062,6 +1062,13 @@ export async function recordLegacyAksDisposition(
   } finally {
     await unlink(temporary);
   }
+  return proof.kind;
+}
+
+export function aksDispositionMessage(kind: AksDispositionApproval['kind']): string {
+  return kind === 'owned-controller-crash-aks'
+    ? 'Recorded verified AKS cleanup disposition; original run state is unchanged and no ranking is authorized.'
+    : 'Recorded verified AKS cleanup disposition; benchmark remains failed and unranked.';
 }
 
 async function syncLegacyReceiptDirectory(path: string): Promise<void> {
@@ -1900,8 +1907,8 @@ export async function main(
     if (args.length !== 3 || !args[1] || !args[2] || args[2].startsWith('-')) {
       throw new OatCliError('--recover-failed-aks requires exactly an invocation ID and the reviewed evidence file');
     }
-    await recordLegacyAksDisposition(receiptRoot, args[1], args[2]);
-    console.log('Recorded verified AKS cleanup disposition; benchmark remains failed and unranked.');
+    const kind = await recordLegacyAksDisposition(receiptRoot, args[1], args[2]);
+    console.log(aksDispositionMessage(kind));
     return;
   }
   validateArguments(args);
