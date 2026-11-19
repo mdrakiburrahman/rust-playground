@@ -1226,7 +1226,7 @@ fn validate_collector_controls(collector: &CollectorTunables) -> Result<()> {
 
 fn effective_queue_capacity_bytes(name: &str, configured_bytes: u64) -> Result<u64> {
     const LARGE_QUANTUM_BYTES: u64 = 1024;
-    let max_units = u64::from(u32::MAX).min(tokio::sync::Semaphore::MAX_PERMITS as u64);
+    let max_units = u64::from(u32::MAX).min((usize::MAX >> 3) as u64);
     let max_bytes = max_units * LARGE_QUANTUM_BYTES;
     if configured_bytes == 0 {
         bail!("{name} must be positive");
