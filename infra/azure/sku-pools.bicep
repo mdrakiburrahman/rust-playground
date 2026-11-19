@@ -6,6 +6,17 @@ resource cluster 'Microsoft.ContainerService/managedClusters@2026-05-01' existin
   name: clusterName
 }
 
+resource containerStorage 'Microsoft.KubernetesConfiguration/extensions@2025-03-01' = {
+  scope: cluster
+  name: 'acstor'
+  properties: {
+    autoUpgradeMinorVersion: true
+    extensionType: 'microsoft.azurecontainerstoragev2'
+    releaseTrain: 'Stable'
+    scope: { cluster: { releaseNamespace: 'kube-system' } }
+  }
+}
+
 @batchSize(1)
 resource pools 'Microsoft.ContainerService/managedClusters/agentPools@2026-05-01' = [for pool in userPools: {
   parent: cluster
