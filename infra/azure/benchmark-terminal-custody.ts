@@ -13,10 +13,11 @@ import { persistDirectEvidence, type CapturedEvidence } from './benchmark-eviden
 import { evidenceList, evidenceObject, evidenceText, requireEvidence } from './benchmark-evidence-json.js';
 import { readDirectPodExit, stopDirectPodWithExit } from './benchmark-pod-exit.js';
 import { acceptRouterFencePatch, routerFenceObserved } from './benchmark-router-fence.js';
+import { directProducerAuthority, type DirectCampaignScope } from './benchmark-run-authority.js';
 import { persistDirectStopPatch, type DirectStopOrigin } from './benchmark-stop-patch.js';
 import { observeStoppedWriterRegistration, readWriterRegistrations, type WriterRegistration } from './benchmark-writer-sql.js';
 import { clientLogExportPod, exportClientLogs, exportWriterLogs, writerLogExportPod } from './benchmark-writer-export.js';
-import { canonical_json, type Azure } from './bootstrap.js';
+import { canonical_json, Failure, type Azure } from './bootstrap.js';
 import { FENCED, READY, PublisherControl } from './publisher_control.js';
 import { cleanup_run_fic, delete_owned_namespace, read_run_fic_record, type RunCleanupAuthority, type RunNamespaceIdentity } from './run_fic.js';
 
@@ -177,11 +178,10 @@ export const directArmRecordPath = (origin: DirectStopOrigin) =>
   `_arrowcol-custody/direct/${origin.runId}/${origin.namespaceUid}/original-arm.json`;
 
 /** Finish a loaded direct run with live, origin-bound reads, not OAT's no-load handoff. */
-export async function finishDirectTerminalCustody(azure: Azure, authority: DirectRunAuthority, arm: DirectTerminalArm,
+export async function finishDirectTerminalCustody(azure: Azure, campaign: DirectCampaignScope, arm: DirectTerminalArm,
   context: string, directory: string, deltaDirectory: string, ficRecordPath: string) {
   const { origin } = arm;
-  requireEvidence(authority.runId === origin.runId && authority.owner === origin.owner &&
-    authority.fencingToken === origin.fencingToken, 'Terminal custody authority does not identify this original run');
+  const authority = directProducerAuthority(campaign, origin);
   const dir = await lstat(directory);
   requireEvidence(dir.isDirectory() && (dir.mode & 0o077) === 0, 'Terminal custody directory is not private');
   requireEvidence(Number.isSafeInteger(arm.startMs) && Number.isSafeInteger(arm.endMs) &&
@@ -335,12 +335,31 @@ export async function finishDirectTerminalCustody(azure: Azure, authority: Direc
   const final = await fresh();
   requireEvidence(final.exitVersions.every((etag, index) => etag === proof.exitVersions[index]),
     'Original terminal Pod evidence changed after sealing');
-  const [stored, headers] = await azure.blob('GET', azure.c.checkpoints, seal.path, undefined, undefined, { 'If-Match': seal.etag });
-  requireEvidence(headers.etag === seal.etag && stored && sha(stored) === seal.sha256, 'Terminal evidence seal changed');
-  const journal = create_namespace_deletion_journal(azure, identity, authority);
-  const receipt = await delete_owned_namespace(azure, identity, join(directory, 'namespace-stopped.json'), authority, journal);
+  const cleanupAuthority: RunCleanupAuthority = { async assertCurrent() {
+    await checkArm();
+    const [metadata, registry] = await control.read();
+    requireEvidence(metadata.resetgeneration === origin.cloudGeneration && metadata.resetstate === FENCED &&
+      Object.keys(registry).length === 0, 'Original publisher fence changed during cleanup');
+    const [stored, headers] = await azure.blob('GET', azure.c.checkpoints, seal.path, undefined, undefined, { 'If-Match': seal.etag });
+    requireEvidence(headers.etag === seal.etag && stored && sha(stored) === seal.sha256, 'Terminal evidence seal changed');
+  } };
+  const journal = create_namespace_deletion_journal(azure, identity, cleanupAuthority);
+  const deleteUntil = Date.now() + 300_000;
+  const receiptPath = join(directory, 'namespace-stopped.json');
+  let receipt: Awaited<ReturnType<typeof delete_owned_namespace>>;
+  for (;;) {
+    try {
+      receipt = await delete_owned_namespace(azure, identity, receiptPath, cleanupAuthority, journal);
+      break;
+    } catch (error) {
+      // This exact failure is emitted only after the positive original DELETE response was journaled.
+      if (!(error instanceof Failure) || error.message !== 'Original namespace deletion is still pending; receipt not complete.' ||
+          Date.now() >= deleteUntil) throw error;
+      await delay(2000);
+    }
+  }
   await journal.complete(receipt);
   await journal.stopped();
-  await cleanup_run_fic(azure, origin.runId, ficRecordPath, authority);
+  await cleanup_run_fic(azure, origin.runId, ficRecordPath, cleanupAuthority);
   return { seal, receipt, qualification: report.qualification };
 }

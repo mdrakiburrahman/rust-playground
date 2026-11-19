@@ -10,6 +10,8 @@ import { observeCompletedClients } from './benchmark-client-terminal.js';
 import { persistDirectEvidence } from './benchmark-evidence-custody.js';
 import { captureDirectBaseline, captureFrozenDelta, directDeltaReplay } from './benchmark-delta-evidence.js';
 import { directCatalogRoot, directClockBound, type DirectRelease } from './benchmark-direct-arm.js';
+import { directProducerAuthority } from './benchmark-run-authority.js';
+import type { CampaignStore, StoredCampaign } from '../../projects/arrowcol-oat/aks-campaign.js';
 import type { Azure } from './bootstrap.js';
 import { validateDirectTerminal, type DirectTerminalArm, type DirectTerminalObservations } from './benchmark-terminal-custody.js';
 import { positiveDirectExitEvent } from './benchmark-pod-exit.js';
@@ -25,6 +27,23 @@ const run = {
 };
 const uid = 'cdcdcdcd-1234-1234-1234-cdcdcdcdcdcd';
 const markers = { 'arrowcol-oat/run-id': run.runId, 'arrowcol-oat/owner-token': run.owner };
+test('requires a current conditional campaign owner and exact direct-run inventory', async () => {
+  const origin = { ...run, cloudGeneration: uid, sourceRevision: 'b'.repeat(40), fencingToken: 1 };
+  const now = Date.now();
+  const state = { status: 'active', campaignId: uid, ownerId: run.owner, fencingToken: 1, heartbeatAtMs: now - 1,
+    expiresAtMs: now + 60_000, runInventory: { campaign_id: uid, owner_id: run.owner, cell_run_id: run.runId, fencing_token: 1,
+      namespace: { name: run.namespace, uid: run.namespaceUid, owner_token: run.owner }, load_admission: 'authorized',
+      fic: { state: 'observed' }, qap: null, cleanup: { handoff: { state: 'pending' } } } };
+  const store: CampaignStore = { read: async () => ({ state, etag: '"1"' } as StoredCampaign),
+    write: async () => { throw new Error('Authority checks must not upgrade or rewrite the campaign'); } };
+  const authority = directProducerAuthority({ store, campaignId: uid, ownerId: run.owner }, origin);
+  await authority.assertCurrent();
+  state.runInventory.namespace.uid = 'replacement';
+  await assert.rejects(() => authority.assertCurrent(), /does not own/);
+  state.runInventory.namespace.uid = run.namespaceUid;
+  state.fencingToken = 2;
+  await assert.rejects(() => authority.assertCurrent(), /fenced/);
+});
 test('requires a unique original catalog receipt and conservative clock brackets', () => {
   const origin = { ...run, cloudGeneration: uid, sourceRevision: 'b'.repeat(40), fencingToken: 1 };
   const image = `test@sha256:${'a'.repeat(64)}`;

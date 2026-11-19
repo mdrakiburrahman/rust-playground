@@ -3,8 +3,9 @@ import { promisify } from 'node:util';
 import { observeWriter, prepareDirectBarrier } from './benchmark-arm.js';
 import { captureDirectBaseline } from './benchmark-delta-evidence.js';
 import { evidenceList, evidenceObject, evidenceText, parseEvidence, requireEvidence } from './benchmark-evidence-json.js';
+import { directProducerAuthority, type DirectCampaignScope } from './benchmark-run-authority.js';
 import type { DirectStopOrigin } from './benchmark-stop-patch.js';
-import { directArmRecordPath, type DirectRunAuthority, type DirectTerminalArm } from './benchmark-terminal-custody.js';
+import { directArmRecordPath, type DirectTerminalArm } from './benchmark-terminal-custody.js';
 import { pinWriterRegistration, readWriterRegistrations } from './benchmark-writer-sql.js';
 import { canonical_json, type Azure } from './bootstrap.js';
 import { PublisherControl, READY } from './publisher_control.js';
@@ -43,10 +44,10 @@ export function directClockBound(beforeMs: number, afterMs: number, observedNs: 
 }
 
 /** Call only with the approved immutable release pins and an existing exclusive run authority. */
-export async function armDirectBenchmark(azure: Azure, authority: DirectRunAuthority, origin: DirectStopOrigin,
+export async function armDirectBenchmark(azure: Azure, campaign: DirectCampaignScope, origin: DirectStopOrigin,
   release: DirectRelease, context: string, ficRecordPath: string, baselineDirectory: string): Promise<DirectTerminalArm> {
-  requireEvidence(authority.runId === origin.runId && authority.owner === origin.owner && authority.fencingToken === origin.fencingToken &&
-    [origin.runId, origin.namespaceUid, origin.owner, origin.cloudGeneration].every(id => uuid.test(id)) &&
+  const authority = directProducerAuthority(campaign, origin);
+  requireEvidence([origin.runId, origin.namespaceUid, origin.owner, origin.cloudGeneration].every(id => uuid.test(id)) &&
     Number.isSafeInteger(origin.fencingToken) && origin.fencingToken > 0 && /^[a-z0-9-]+$/.test(origin.namespace) &&
     Number.isInteger(origin.clients) && origin.clients >= 1 && origin.clients <= 8 && /^[a-f0-9]{40}$/.test(release.revision) &&
     release.revision === origin.sourceRevision && release.schemaFingerprint.length > 0 && release.schemaFingerprint.length < 129 &&
