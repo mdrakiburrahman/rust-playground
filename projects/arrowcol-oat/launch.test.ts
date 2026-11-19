@@ -1093,6 +1093,14 @@ test('owned controller crash requires exact current custody without inventing te
       assert.rejects(recordLegacyAksDisposition(root, deadline.invocationId, evidencePath,
         await approveFixture(proof, receiptBytes)), error);
 
+    await new Promise<void>((resolve, reject) => listener.close((error) => error ? reject(error) : resolve()));
+    const positiveApproval = await approveFixture(manifest);
+    await assert.rejects(assertNoUnsettledDeadlineReceipts(root, undefined, positiveApproval), /Unsettled AKS/);
+    await recordLegacyAksDisposition(root, deadline.invocationId, evidencePath, positiveApproval);
+    await assertNoUnsettledDeadlineReceipts(root, undefined, positiveApproval);
+    assert.deepEqual(await readFile(deadline.receiptPath), original);
+    await unlink(sidecar);
+    await new Promise<void>((resolve) => listener.listen(address.port, '127.0.0.1', resolve));
     await rejectFixture(manifest, /listener is still present/);
     await new Promise<void>((resolve, reject) => listener.close((error) => error ? reject(error) : resolve()));
     await rejectFixture({ ...manifest, historical_admission: 'not-started' }, /exact unsettled invocation/);
