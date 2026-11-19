@@ -11,6 +11,7 @@ import { observeCompletedClients } from './benchmark-client-terminal.js';
 import { captureFrozenDelta, type DirectDeltaBaseline } from './benchmark-delta-evidence.js';
 import { persistDirectEvidence, type CapturedEvidence } from './benchmark-evidence-custody.js';
 import { evidenceList, evidenceObject, evidenceText, requireEvidence } from './benchmark-evidence-json.js';
+import { readDirectPodExit } from './benchmark-pod-exit.js';
 import { acceptRouterFencePatch, routerFenceObserved } from './benchmark-router-fence.js';
 import type { persistDirectStopPatch, DirectStopOrigin } from './benchmark-stop-patch.js';
 import { observeStoppedWriterRegistration, type WriterRegistration } from './benchmark-writer-sql.js';
@@ -174,7 +175,7 @@ export function validateDirectTerminal(arm: DirectTerminalArm, t: DirectTerminal
  * Kubernetes adapter supplies raw observations and captured bytes, never PASS flags.
  */
 export async function finishDirectTerminalCustody(azure: Azure, authority: RunCleanupAuthority, arm: DirectTerminalArm,
-  observeTerminal: () => Promise<DirectTerminalObservations>, context: string, directory: string,
+  observeTerminal: () => Promise<Omit<DirectTerminalObservations, 'writer' | 'maintenance'>>, context: string, directory: string,
   deltaDirectory: string, ficRecordPath: string) {
   const { origin } = arm;
   const dir = await lstat(directory);
@@ -193,7 +194,10 @@ export async function finishDirectTerminalCustody(azure: Azure, authority: RunCl
     const [durableArm, armHeaders] = await azure.blob('GET', azure.c.checkpoints, armRecordPath, undefined, undefined, {}, false, true);
     requireEvidence(armHeaders[':status'] === '200' && armHeaders.etag && !armHeaders.etag.startsWith('W/') &&
       durableArm?.equals(armBytes), 'Original off-node arm record is missing or changed');
-    const t = await observeTerminal();
+    const observed = await observeTerminal();
+    const writer = await readDirectPodExit(azure, authority, origin, 'arrowcol', arm.writer, observed.stops.writer);
+    const maintenance = await readDirectPodExit(azure, authority, origin, 'delta-maintenance', arm.maintenance, observed.stops.maintenance);
+    const t = { ...observed, writer: writer.pod, maintenance: maintenance.pod };
     const proved = validateDirectTerminal(arm, t);
     for (const receipt of Object.values(t.stops)) {
       const [bytes, headers] = await azure.blob('GET', azure.c.checkpoints, receipt.path, undefined, undefined, { 'If-Match': receipt.version });
@@ -203,7 +207,7 @@ export async function finishDirectTerminalCustody(azure: Azure, authority: RunCl
     const [metadata, registry] = await new PublisherControl(azure).read();
     requireEvidence(metadata.resetgeneration === origin.cloudGeneration && metadata.resetstate === FENCED &&
       Object.keys(registry).length === 0, 'Original generation is not fenced and free of active or uncertain publishers');
-    return { t, proved };
+    return { t, proved, exitVersions: [writer.etag, maintenance.etag] };
   };
   const proof = await fresh();
   const capturedLogs: CapturedEvidence[] = [];
@@ -247,7 +251,9 @@ export async function finishDirectTerminalCustody(azure: Azure, authority: RunCl
   const seal = await persistDirectEvidence(azure, authority, origin, [...capturedLogs, ...delta.evidence,
     { key: 'direct-terminal.json', path, bytes: record.length, sha256: sha(record) }]);
   // Repeat the independent scope/authority checks after the potentially long upload.
-  await fresh();
+  const final = await fresh();
+  requireEvidence(final.exitVersions.every((etag, index) => etag === proof.exitVersions[index]),
+    'Original terminal Pod evidence changed after sealing');
   const [stored, headers] = await azure.blob('GET', azure.c.checkpoints, seal.path, undefined, undefined, { 'If-Match': seal.etag });
   requireEvidence(headers.etag === seal.etag && stored && sha(stored) === seal.sha256, 'Terminal evidence seal changed');
   const journal = create_namespace_deletion_journal(azure, identity, authority);

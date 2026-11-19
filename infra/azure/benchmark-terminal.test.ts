@@ -11,6 +11,7 @@ import { persistDirectEvidence } from './benchmark-evidence-custody.js';
 import { captureFrozenDelta, directDeltaReplay } from './benchmark-delta-evidence.js';
 import type { Azure } from './bootstrap.js';
 import { validateDirectTerminal, type DirectTerminalArm, type DirectTerminalObservations } from './benchmark-terminal-custody.js';
+import { positiveDirectExitEvent } from './benchmark-pod-exit.js';
 import { clientLogExportPod, exportWriterLogs, writerLogExportPod } from './benchmark-writer-export.js';
 import { observeStoppedWriterRegistration, pinWriterRegistration } from './benchmark-writer-sql.js';
 
@@ -23,6 +24,28 @@ const run = {
 };
 const uid = 'cdcdcdcd-1234-1234-1234-cdcdcdcdcdcd';
 const markers = { 'arrowcol-oat/run-id': run.runId, 'arrowcol-oat/owner-token': run.owner };
+test('requires a clean MODIFIED event for the original Pod; disappearance, restart and watch expiry fail', async () => {
+  const imageId = `sha256:${'a'.repeat(64)}`, image = `test@${imageId}`, startedAt = '2026-01-01T00:00:00Z';
+  const origin = { ...run, cloudGeneration: uid, sourceRevision: 'b'.repeat(40), fencingToken: 1 };
+  const original = { deploymentUid: uid, replicaSetUid: uid, podName: 'pod', podUid: uid, podIp: '10.0.0.1',
+    nodeName: 'node', image, imageId, containerId: 'original', startedAt };
+  const status = { name: 'dataflow', imageID: imageId, restartCount: 0, containerID: 'original',
+    state: { terminated: { startedAt, finishedAt: '2026-01-01T00:01:01Z', containerID: 'original', exitCode: 0, reason: 'Completed' } } };
+  const pod = { apiVersion: 'v1', kind: 'Pod', metadata: { uid, name: 'pod', namespace: run.namespace, resourceVersion: '8',
+    labels: markers, annotations: markers, ownerReferences: [{ kind: 'ReplicaSet', uid, controller: true }] },
+  spec: { nodeName: 'node', containers: [{ name: 'dataflow', image }] }, status: { containerStatuses: [status] } };
+  async function* watch(...events: unknown[]) {
+    for (const event of events) yield JSON.stringify(event);
+  }
+  const verify = (...events: unknown[]) => positiveDirectExitEvent(watch(...events), origin, 'arrowcol', original,
+    Date.parse('2026-01-01T00:01:00Z'));
+  assert.deepEqual(await verify({ type: 'MODIFIED', object: pod }), pod);
+  await assert.rejects(verify({ type: 'DELETED', object: pod }), /positive status event/);
+  await assert.rejects(verify({ type: 'ERROR', object: { code: 410 } }), /positive status event/);
+  await assert.rejects(verify(), /ended without positive terminal evidence/);
+  status.restartCount = 1;
+  await assert.rejects(verify({ type: 'MODIFIED', object: pod }), /lifetime changed/);
+});
 test('replays the direct invariants protocol and rejects deletion vectors and unknown actions', () => {
   const replay = directDeltaReplay();
   const commit = (...actions: unknown[]) => Buffer.from(actions.map(value => JSON.stringify(value)).join('\n') + '\n');
