@@ -73,7 +73,9 @@ apply. Pipelined groups use `commit.batch_window` and `max_files_per_commit`
 rather than forcing a version per group. See the [control contracts](../experiments/arrowcol-oat/TUNABLES.md#single-table-preparation-and-commit-overlap).
 
 `commit.file_encode_concurrency` (`1..=256`, default `1`) bounds concurrent files
-within each coalesced group. Metadata preparation uses bounded blocking I/O;
+within each coalesced group. Metadata preparation uses a separate bounded worker
+queue with `min(runtime_workers, blocking_workers-1)` workers and the same number
+of queue slots. It does not occupy CPU workers or the shared I/O blocking pool;
 encoding uses the process-wide CPU pool, then releases that worker before remote
 upload. The existing `ARROWCOL_COLLECTOR_UPLOAD_LIMIT` (`1..=512`, default `32`)
 separately bounds uploads. Local Parquet writes and synchronization can still

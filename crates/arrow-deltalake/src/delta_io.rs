@@ -221,26 +221,42 @@ pub fn runtime_config() -> Result<&'static DeltaRuntimeConfig> {
         .map_err(|error| anyhow::anyhow!("{error}"))
 }
 
-type CpuJob = Box<dyn FnOnce() + Send + 'static>;
+type WorkerJob = Box<dyn FnOnce() + Send + 'static>;
 
-struct CpuPool {
-    sender: tokio::sync::mpsc::Sender<CpuJob>,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WorkerKind {
+    Cpu,
+    Metadata,
+}
+
+impl WorkerKind {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Cpu => "delta-cpu",
+            Self::Metadata => "delta-metadata",
+        }
+    }
+}
+
+struct WorkerPool {
+    sender: tokio::sync::mpsc::Sender<WorkerJob>,
+    kind: WorkerKind,
 }
 
 thread_local! {
-    static CPU_WORKER: Cell<bool> = const { Cell::new(false) };
+    static WORKER_KIND: Cell<Option<WorkerKind>> = const { Cell::new(None) };
 }
 
-impl CpuPool {
-    fn new(workers: usize) -> Result<Self> {
-        let (sender, receiver) = tokio::sync::mpsc::channel::<CpuJob>(workers);
+impl WorkerPool {
+    fn new(workers: usize, kind: WorkerKind) -> Result<Self> {
+        let (sender, receiver) = tokio::sync::mpsc::channel::<WorkerJob>(workers);
         let receiver = Arc::new(Mutex::new(receiver));
         for index in 0..workers {
             let receiver = Arc::clone(&receiver);
             std::thread::Builder::new()
-                .name(format!("delta-cpu-{index}"))
+                .name(format!("{}-{index}", kind.name()))
                 .spawn(move || {
-                    CPU_WORKER.set(true);
+                    WORKER_KIND.set(Some(kind));
                     loop {
                         let job = receiver
                             .lock()
@@ -252,9 +268,9 @@ impl CpuPool {
                         }
                     }
                 })
-                .context("create Delta CPU worker")?;
+                .with_context(|| format!("create {} worker", kind.name()))?;
         }
-        Ok(Self { sender })
+        Ok(Self { sender, kind })
     }
 
     #[cfg(test)]
@@ -264,7 +280,7 @@ impl CpuPool {
         T: Send + 'static,
     {
         // Recursive offloads run inline: no CPU worker may wait for its own pool.
-        if CPU_WORKER.get() {
+        if WORKER_KIND.get() == Some(self.kind) {
             return Ok(task());
         }
         futures::executor::block_on(self.run_async(task))
@@ -275,7 +291,7 @@ impl CpuPool {
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
     {
-        if CPU_WORKER.get() {
+        if WORKER_KIND.get() == Some(self.kind) {
             return Ok(task());
         }
         let (sender, receiver) = tokio::sync::oneshot::channel();
@@ -285,22 +301,45 @@ impl CpuPool {
                 let _ = sender.send(result);
             }))
             .await
-            .map_err(|_| anyhow::anyhow!("Delta CPU pool stopped"))?;
-        match receiver.await.context("Delta CPU worker stopped")? {
+            .map_err(|_| anyhow::anyhow!("{} pool stopped", self.kind.name()))?;
+        match receiver
+            .await
+            .with_context(|| format!("{} worker stopped", self.kind.name()))?
+        {
             Ok(output) => Ok(output),
             Err(panic) => std::panic::resume_unwind(panic),
         }
     }
 }
 
-static CPU_POOL: OnceLock<std::result::Result<CpuPool, String>> = OnceLock::new();
+static CPU_POOL: OnceLock<std::result::Result<WorkerPool, String>> = OnceLock::new();
+static METADATA_POOL: OnceLock<std::result::Result<WorkerPool, String>> = OnceLock::new();
 
-fn cpu_pool() -> Result<&'static CpuPool> {
+fn cpu_pool() -> Result<&'static WorkerPool> {
     let workers = runtime_config()?.cpu_workers;
-    match CPU_POOL.get_or_init(|| CpuPool::new(workers).map_err(|error| format!("{error:#}"))) {
+    match CPU_POOL.get_or_init(|| WorkerPool::new(workers, WorkerKind::Cpu).map_err(|error| format!("{error:#}"))) {
         Ok(pool) => Ok(pool),
         Err(error) => anyhow::bail!("{error}"),
     }
+}
+
+pub(crate) async fn run_metadata_async<F, T>(task: F) -> Result<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let config = runtime_config()?;
+    let workers = config.runtime_workers.min(config.blocking_workers - 1);
+    let pool = METADATA_POOL
+        .get_or_init(|| WorkerPool::new(workers, WorkerKind::Metadata).map_err(|error| format!("{error:#}")))
+        .as_ref()
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    pool.run_async(move || {
+        let executor = shared_executor()?;
+        let _guard = executor.enter();
+        Ok::<_, anyhow::Error>(task())
+    })
+    .await?
 }
 
 /// Run owned sorting/encoding work on a bounded, dedicated process-wide CPU pool.
@@ -773,7 +812,7 @@ mod tests {
 
     #[test]
     fn cpu_jobs_keep_panics_nested_calls_and_io_independent() -> Result<()> {
-        let pool = Arc::new(CpuPool::new(1)?);
+        let pool = Arc::new(WorkerPool::new(1, WorkerKind::Cpu)?);
         let nested_pool = Arc::clone(&pool);
         let caller = std::thread::current().id();
         let (worker, answer) = pool.run(move || {
@@ -799,7 +838,7 @@ mod tests {
 
     #[test]
     fn cpu_queue_and_execution_are_bounded() -> Result<()> {
-        let pool = Arc::new(CpuPool::new(1)?);
+        let pool = Arc::new(WorkerPool::new(1, WorkerKind::Cpu)?);
         let (started, wait_started) = mpsc::sync_channel(1);
         let (release, wait_release) = mpsc::sync_channel(1);
         let active_pool = Arc::clone(&pool);
@@ -826,7 +865,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn cpu_async_admission_does_not_block_the_caller_runtime() -> Result<()> {
-        let pool = Arc::new(CpuPool::new(1)?);
+        let pool = Arc::new(WorkerPool::new(1, WorkerKind::Cpu)?);
         let (started, wait_started) = mpsc::sync_channel(1);
         let (release, wait_release) = mpsc::sync_channel(1);
         let active_pool = Arc::clone(&pool);
@@ -854,7 +893,7 @@ mod tests {
     async fn cpu_future_keeps_encoding_on_cpu_threads_and_drives_io() -> Result<()> {
         let caller = std::thread::current().id();
         let answer = run_cpu_future(async move {
-            assert!(CPU_WORKER.get());
+            assert!(WORKER_KIND.get() == Some(WorkerKind::Cpu));
             let worker = std::thread::current().id();
             assert_ne!(worker, caller);
             tokio::time::sleep(Duration::from_millis(1)).await;

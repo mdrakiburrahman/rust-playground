@@ -1439,7 +1439,13 @@ mod io_tests {
             let mut releases = Vec::new();
             tokio::time::timeout(Duration::from_secs(10), async {
                 for _ in 0..concurrency {
-                    releases.push(entered.recv().await.context("missing coalesced upload")?);
+                    tokio::select! {
+                        result = &mut task => {
+                            result??;
+                            bail!("group finished before reaching its upload gates");
+                        }
+                        release = entered.recv() => releases.push(release.context("missing coalesced upload")?),
+                    }
                 }
                 Ok::<_, anyhow::Error>(())
             })
@@ -4558,19 +4564,18 @@ impl DeltaTable {
     ) -> Result<CoalescedStageResult> {
         anyhow::ensure!((1..=256).contains(&concurrency), "invalid coalesced file concurrency");
         let table = Arc::clone(self);
-        let prepared = shared_executor()?
-            .spawn_blocking(move || {
-                #[cfg(test)]
-                {
-                    crate::partition::MATERIALIZATIONS.set(0);
-                    let result = table.prepare_coalesced_publications(entries, max_files);
-                    (result, crate::partition::MATERIALIZATIONS.get())
-                }
-                #[cfg(not(test))]
-                table.prepare_coalesced_publications(entries, max_files)
-            })
-            .await
-            .context("coalesced preparation worker failed")?;
+        let prepared = crate::delta_io::run_metadata_async(move || {
+            #[cfg(test)]
+            {
+                crate::partition::MATERIALIZATIONS.set(0);
+                let result = table.prepare_coalesced_publications(entries, max_files);
+                (result, crate::partition::MATERIALIZATIONS.get())
+            }
+            #[cfg(not(test))]
+            table.prepare_coalesced_publications(entries, max_files)
+        })
+        .await
+        .context("coalesced preparation worker failed")?;
         #[cfg(test)]
         let prepared = {
             // Preserve the actual materialization counter across the blocking boundary.
@@ -4605,7 +4610,8 @@ impl DeltaTable {
         }
         let staged = staged.into_values().collect::<Vec<_>>();
         if let Some(error) = failure {
-            self.reclaim_unsubmitted(&staged);
+            let table = Arc::clone(self);
+            crate::delta_io::run_metadata_async(move || table.reclaim_unsubmitted(&staged)).await?;
             return Err(error);
         }
         Ok((
@@ -4625,34 +4631,33 @@ impl DeltaTable {
     ) -> (usize, Result<StagedAppend>) {
         let index = plan.index;
         let result = async {
-            let (mut writer, batches) = shared_executor()?
-                .spawn_blocking(move || {
-                    let properties = context
-                        .layout
-                        .as_ref()
-                        .map(|policy| policy.writer_properties(&physical_writer_schema(&context.schema, &plan.values)))
-                        .transpose()?;
-                    let mut writer = self.new_file_bound(Arc::clone(&context.schema), plan.values, properties, true)?;
-                    if writer.table_properties != context.table_properties {
-                        writer.discard_empty()?;
-                        bail!("table properties changed while preparing coalesced publication; retry");
-                    }
-                    if let Some(policy) = &context.layout {
-                        let physical = Arc::new(writer.context.physical_data_schema().as_ref().try_into_arrow()?);
-                        writer.sorter = Some(crate::layout::FileSortBuffer::new(physical, policy.clone())?);
-                    }
-                    if index == 0 {
-                        self.record_layout_readback(
-                            Arc::new(writer.context.physical_data_schema().as_ref().try_into_arrow()?),
-                            &context.resolved,
-                            &context.table_properties,
-                            context.layout.is_some(),
-                        )?;
-                    }
-                    Ok::<_, anyhow::Error>((writer, plan.batches))
-                })
-                .await
-                .context("coalesced file preparation worker failed")??;
+            let (mut writer, batches) = crate::delta_io::run_metadata_async(move || {
+                let properties = context
+                    .layout
+                    .as_ref()
+                    .map(|policy| policy.writer_properties(&physical_writer_schema(&context.schema, &plan.values)))
+                    .transpose()?;
+                let mut writer = self.new_file_bound(Arc::clone(&context.schema), plan.values, properties, true)?;
+                if writer.table_properties != context.table_properties {
+                    writer.discard_empty()?;
+                    bail!("table properties changed while preparing coalesced publication; retry");
+                }
+                if let Some(policy) = &context.layout {
+                    let physical = Arc::new(writer.context.physical_data_schema().as_ref().try_into_arrow()?);
+                    writer.sorter = Some(crate::layout::FileSortBuffer::new(physical, policy.clone())?);
+                }
+                if index == 0 {
+                    self.record_layout_readback(
+                        Arc::new(writer.context.physical_data_schema().as_ref().try_into_arrow()?),
+                        &context.resolved,
+                        &context.table_properties,
+                        context.layout.is_some(),
+                    )?;
+                }
+                Ok::<_, anyhow::Error>((writer, plan.batches))
+            })
+            .await
+            .context("coalesced file preparation worker failed")??;
             let encoded = crate::delta_io::run_cpu_async(move || {
                 let executor = shared_executor()?;
                 let _guard = executor.enter();
