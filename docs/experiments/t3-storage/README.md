@@ -48,6 +48,22 @@ The block path stages a block and commits the cumulative block list with lease a
 
 The race test requires one lease winner, rejects the other writer, and reads back the accepted content. These checks cover primitive fencing. They leave WAL integration, release semantics, recovery, and Windows runtime qualification to the actual backend implementation.
 
+## Existing benchmark fixture
+
+At runtime revision `abcaf1a7883dfbe57371988478b237cf687ef51b`, the existing `ingest` Criterion fixture allocates 64 MiB of segment headroom but requests a 100 MiB segment, so it compiles and then fails with `InvalidConfig`. The automatic `phase-a` job runs the checked-out fixture and stops on that failure; bootstrap does not apply a correction.
+
+The passing rerun used a separate checkout at that exact runtime revision, overlaying only the following supplied fixture:
+
+| Item | Value |
+| --- | --- |
+| Source repository | `ethanmoffat/otel-arrow` |
+| Fixture commit | `2774dd35c2c7a47a9a4ccb77bc266d32764be831` |
+| Original upstream correction | `1a4623a881c70a5f403e19a233cac1ed6e178d5a` |
+| File | `rust/otap-dataflow/crates/quiver/benches/ingest.rs` |
+| SHA-256 | `6092dce22ed7152ac5b1580c5b092276f4a7808f8e6218ba8aa7f27d154dd269` |
+
+For reproduction, prepare that isolated checkout after bootstrap, verify its HEAD, the fixture digest and a one-file diff, then use it as the guest's `/var/lib/storage-spike/otel-arrow` source for Phase A. Put both `TMPDIR` and the benchmark's temporary `HOME` on the target filesystem, as the runner does. Keep the driver, engine and dependency pin unchanged; the fixture commit's complete tree is outside this rerun's runtime qualification. Preserve the original failing log separately from the corrected run.
+
 ## Private evidence
 
 The lab's configuration and investigation output belong in an ignored directory. Public documentation contains the method and generic code only. Resource inventories and full findings stay with the investigator. Deallocation stops owned VMs and retains the lab for another iteration; deleting resources is a separate operation.
