@@ -93,7 +93,10 @@
 # Each indexed client's managed-csi claim persists while its original completed Pod is retained.
 # Do not suspend or delete the completed Job until its original claims and logs have been exported.
 # Do not use kubectl logs for writer evidence. Export both original files from the exact retained
-# writer PVC after positive terminal status and before any cleanup; audit stdout, preserve stderr too.
+# writer PVC after positive terminal status and before any cleanup. Publication receipts are in
+# writer-stderr.raw; preserve both writer streams. Client terminal manifests are in client stdout.
+# The writer's 4 GiB prlimit --fsize is process-wide. Validate that all selected Parquet and local
+# staging file limits fit below it before load; it is not an isolated log quota.
 # Do not pass --timestamps on API log captures: the extractor requires raw line framing.
 # Its readline implementation buffers each complete line before applying the 8-MiB line cap.
 # Check every command exit and preserve the original logs.

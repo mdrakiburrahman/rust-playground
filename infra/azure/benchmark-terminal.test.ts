@@ -1,11 +1,13 @@
 import assert from 'node:assert/strict';
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { delimiter, join } from 'node:path';
 import test from 'node:test';
 import { acceptRouterFencePatch, planRouterFence, routerFenceObserved } from './benchmark-router-fence.js';
 import { persistDirectStopPatch } from './benchmark-stop-patch.js';
 import { observeCompletedClients } from './benchmark-client-terminal.js';
+import { persistDirectEvidence } from './benchmark-evidence-custody.js';
 import { clientLogExportPod, exportWriterLogs, writerLogExportPod } from './benchmark-writer-export.js';
 import { observeStoppedWriterRegistration, pinWriterRegistration } from './benchmark-writer-sql.js';
 
@@ -18,6 +20,45 @@ const run = {
 };
 const uid = 'cdcdcdcd-1234-1234-1234-cdcdcdcdcdcd';
 const markers = { 'arrowcol-oat/run-id': run.runId, 'arrowcol-oat/owner-token': run.owner };
+test('seals only read-back-verified original bytes and refuses an altered input', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'bench-custody-'));
+  try {
+    const raw = Buffer.alloc(4 * 1024 ** 2 + 3, 0xab);
+    raw.set([0, 0xff, 10], raw.length - 3);
+    const path = join(directory, 'raw');
+    await writeFile(path, raw);
+    const origin = { ...run, cloudGeneration: uid, sourceRevision: 'b'.repeat(40), fencingToken: 1 };
+    const sha256 = createHash('sha256').update(raw).digest('hex');
+    for (const failure of ['readback', 'source', 'none']) {
+      const blobs = new Map<string, { bytes: Buffer; etag: string }>();
+      const azure = {
+        c: { checkpoints: 'checkpoint' }, blob: async (method: string, _container: string, name: string, _query: unknown,
+          body: Buffer | undefined, headers: Record<string, string>) => {
+          if (method === 'PUT') {
+            assert.equal(headers['If-None-Match'], '*');
+            assert.ok(!blobs.has(name));
+            const etag = `"${blobs.size}"`;
+            blobs.set(name, { bytes: Buffer.from(body!), etag });
+            return [null, { ':status': '201', etag }];
+          }
+          const entry = blobs.get(name)!;
+          assert.equal(headers['If-Match'], entry.etag);
+          return [failure === 'readback' ? Buffer.from('not the original') : entry.bytes, { etag: entry.etag }];
+        },
+      } as unknown as Parameters<typeof persistDirectEvidence>[0];
+      const result = persistDirectEvidence(azure, { assertCurrent: async () => {} }, origin,
+        [{ key: 'writer-stderr.raw', bytes: raw.length, sha256: failure === 'source' ? '0'.repeat(64) : sha256, path }]);
+      if (failure === 'none') {
+        assert.match((await result).path, /\/seal\.json$/);
+        const [first, second] = [...blobs.values()];
+        assert.deepEqual(Buffer.concat([first.bytes, second.bytes]), raw);
+      } else {
+        await assert.rejects(result, /readback mismatch|changed during durable transfer/);
+        assert.ok(![...blobs.keys()].some(name => name.endsWith('/seal.json')));
+      }
+    }
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
 test('requires a clean original indexed client lifetime and its exact retained claim', () => {
   const c = { index: 0, name: 'client', uid, jobUid: run.owner, nodeName: 'client-node', image: `test@sha256:${'a'.repeat(64)}`,
     imageId: `sha256:${'a'.repeat(64)}`, containerId: 'original', startedAt: '2026-01-01T00:00:00Z',
