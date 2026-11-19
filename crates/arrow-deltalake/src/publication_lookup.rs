@@ -145,8 +145,11 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use anyhow::Result;
+    use arrow::array::{ArrayRef, RecordBatch, StringArray};
+    use delta_kernel::actions::{LOG_METADATA_SCHEMA, LOG_PROTOCOL_SCHEMA};
+    use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
     use delta_kernel::expressions::PredicateRef;
-    use delta_kernel::schema::SchemaRef;
+    use delta_kernel::schema::{SchemaRef, StructType};
     use delta_kernel::snapshot::IncrementalReplay;
     use delta_kernel::{
         DeltaResultIterator, EngineData, EvaluationHandler, FileDataReadResultIterator, FileMeta, FileSize,
@@ -380,11 +383,33 @@ mod tests {
     #[test]
     fn checkpoint_backed_history_matches_kernel() -> Result<()> {
         let fixture = Fixture::new(false)?;
-        fixture.append(1, &[txn("alpha", 99, Some(999)), txn("checkpoint-only", 7, None)])?;
-        fixture.snapshot()?.checkpoint(&fixture.engine, None)?;
-        for version in 0..=1 {
-            fs::remove_file(fixture.log.join(format!("{version:020}.json")))?;
-        }
+        let actions = [
+            json!({"protocol": fixture.protocol}),
+            json!({"metaData": fixture.metadata}),
+            txn("alpha", 99, Some(999)),
+            txn("checkpoint-only", 7, None),
+        ];
+        let schema = Arc::new(StructType::try_new(
+            [&*LOG_PROTOCOL_SCHEMA, &*LOG_METADATA_SCHEMA, &*LOG_TXN_SCHEMA]
+                .into_iter()
+                .flat_map(|schema| schema.fields().cloned()),
+        )?);
+        let strings = Arc::new(StringArray::from_iter_values(actions.iter().map(Value::to_string))) as ArrayRef;
+        let data = RecordBatch::try_from_iter([("json", strings)])?;
+        let checkpoint = fixture
+            .engine
+            .json_handler()
+            .parse_json(Box::new(ArrowEngineData::new(data)), schema)?
+            .try_into_record_batch()?;
+        let mut writer = parquet::arrow::ArrowWriter::try_new(
+            fs::File::create(fixture.log.join("00000000000000000001.checkpoint.parquet"))?,
+            checkpoint.schema(),
+            None,
+        )?;
+        writer.write(&checkpoint)?;
+        writer.close()?;
+        fs::write(fixture.log.join("_last_checkpoint"), r#"{"version":1,"size":4}"#)?;
+        fs::remove_file(fixture.log.join("00000000000000000000.json"))?;
         fixture.append(2, &[txn("alpha", 2, Some(1))])?;
         let snapshot = fixture.snapshot()?;
         assert_matches_kernel(&snapshot, &fixture.engine, &["alpha", "checkpoint-only", "missing"])?;
@@ -486,8 +511,11 @@ mod tests {
         let snapshot = fixture.snapshot()?;
         let batch_error = get_app_id_versions(&snapshot, &engine, ["broken"]).err();
         let kernel_error = snapshot.get_app_id_version("broken", &engine).err();
-        assert!(matches!(batch_error, Some(Error::MissingData(_))));
-        assert!(matches!(kernel_error, Some(Error::MissingData(_))));
+        assert!(batch_error.is_some());
+        assert_eq!(
+            batch_error.map(|error| error.to_string()),
+            kernel_error.map(|error| error.to_string())
+        );
         Ok(())
     }
 }
