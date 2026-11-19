@@ -1,9 +1,21 @@
 param clusterName string
 param nodeSubnetId string
 param userPools array
+param enableContainerStorage bool = false
 
 resource cluster 'Microsoft.ContainerService/managedClusters@2026-05-01' existing = {
   name: clusterName
+}
+
+resource containerStorage 'Microsoft.KubernetesConfiguration/extensions@2025-03-01' = if (enableContainerStorage) {
+  scope: cluster
+  name: 'acstor'
+  properties: {
+    autoUpgradeMinorVersion: true
+    extensionType: 'microsoft.azurecontainerstoragev2'
+    releaseTrain: 'Stable'
+    scope: { cluster: { releaseNamespace: 'kube-system' } }
+  }
 }
 
 @batchSize(1)
