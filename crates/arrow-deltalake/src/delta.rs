@@ -2270,6 +2270,63 @@ impl Display for CoalescedGroupCapacityExceeded {
 
 impl Error for CoalescedGroupCapacityExceeded {}
 
+fn preflight_and_materialize_coalesced_groups<T>(
+    groups: impl IntoIterator<Item = (usize, crate::partition::PartitionValues, bool)>,
+    max_files: usize,
+    mut materialize: impl FnMut(usize) -> Result<T>,
+) -> Result<HashMap<usize, T>> {
+    let groups = groups.into_iter().collect::<Vec<_>>();
+    let pending_partitions = groups
+        .iter()
+        .filter(|(_, _, pending)| *pending)
+        .map(|(_, values, _)| values.clone())
+        .collect::<std::collections::HashSet<_>>();
+    let required_files = pending_partitions.len();
+    if required_files > max_files {
+        return Err(anyhow::Error::new(CoalescedGroupCapacityExceeded {
+            required_files,
+            max_files,
+        }));
+    }
+    groups
+        .into_iter()
+        .filter(|(_, _, pending)| *pending)
+        .map(|(index, _, _)| Ok((index, materialize(index)?)))
+        .collect()
+}
+
+#[cfg(test)]
+mod coalesced_capacity_tests {
+    use super::*;
+
+    #[test]
+    fn rejected_partition_fanout_does_not_materialize_groups() {
+        let partition = |name: &str| BTreeMap::from([("region".to_owned(), Some(name.to_owned()))]);
+        let groups = vec![(0, partition("north"), true), (1, partition("south"), true)];
+        let mut materializations = 0;
+        let error = preflight_and_materialize_coalesced_groups(groups, 1, |_| {
+            materializations += 1;
+            Ok(())
+        })
+        .expect_err("fanout exceeds the commit capacity");
+        let capacity = error
+            .downcast_ref::<CoalescedGroupCapacityExceeded>()
+            .expect("capacity error");
+        assert_eq!(capacity.required_files, 2);
+        assert_eq!(capacity.max_files, 1);
+        assert_eq!(materializations, 0);
+
+        let replay_only = vec![(0, partition("north"), false), (1, partition("south"), false)];
+        let materialized = preflight_and_materialize_coalesced_groups(replay_only, 1, |_| {
+            materializations += 1;
+            Ok(())
+        })
+        .expect("replay-only fanout does not consume output file capacity");
+        assert!(materialized.is_empty());
+        assert_eq!(materializations, 0);
+    }
+}
+
 struct CoalescedPartitionOutput {
     values: BTreeMap<String, Option<String>>,
     files: Vec<Vec<RecordBatch>>,
@@ -3871,61 +3928,90 @@ impl DeltaTable {
                 schema = Some(batch.schema());
             }
             let batch_rows = batch.num_rows();
-            let mut partition_identities = BTreeMap::new();
-            let splits = {
-                let mut register_partition = |values: &crate::partition::PartitionValues| -> Result<()> {
-                    if let Some(expected) = &expected_ingestion
-                        && values.get(INGESTION_PARTITION).and_then(Option::as_deref) != Some(expected.as_str())
-                    {
-                        bail!("coalesced input ingestion partition does not match its admission stamp");
-                    }
-                    let identity = if partitions.is_empty() || partitions == [INGESTION_PARTITION] || snapshot.is_none()
-                    {
+            let mut register_partition = |values: &crate::partition::PartitionValues| -> Result<String> {
+                if let Some(expected) = &expected_ingestion
+                    && values.get(INGESTION_PARTITION).and_then(Option::as_deref) != Some(expected.as_str())
+                {
+                    bail!("coalesced input ingestion partition does not match its admission stamp");
+                }
+                Ok(
+                    if partitions.is_empty() || partitions == [INGESTION_PARTITION] || snapshot.is_none() {
                         app_id.clone()
                     } else {
                         crate::partition::publication_id(&app_id, values, identity_schema.as_ref())?
-                    };
-                    partition_identities.insert(values.clone(), identity);
-                    Ok(())
-                };
-                if partitions.is_empty() {
-                    let values = BTreeMap::new();
-                    register_partition(&values)?;
-                    vec![(batch, values)]
-                } else {
-                    crate::partition::split_with_new_partition(&batch, &partitions, &mut register_partition)?
-                }
+                    },
+                )
             };
-            if splits.is_empty() && batch_rows == 0 && !partitions.is_empty() {
+            let groups = if partitions.is_empty() {
+                let values = BTreeMap::new();
+                let identity = register_partition(&values)?;
+                let rows = (0..batch_rows).map(u64::try_from).collect::<Result<Vec<_>>>()?;
+                vec![(crate::partition::PartitionGroup { values, rows }, identity)]
+            } else {
+                crate::partition::group_rows(&batch, &partitions)?
+                    .into_iter()
+                    .map(|group| {
+                        let identity = register_partition(&group.values)?;
+                        Ok((group, identity))
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            };
+            if groups.is_empty() && batch_rows == 0 && !partitions.is_empty() {
                 bail!("empty custom-partitioned publications must use the existing progress path");
             }
-            let splits = splits
-                .into_iter()
-                .map(|(batch, values)| {
-                    let identity = partition_identities
-                        .remove(&values)
-                        .context("coalesced partition identity was not prepared")?;
-                    requested_ids.push(identity.clone());
-                    Ok((batch, values, identity))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            prepared_entries.push((source_application_id, version, stamp, splits));
+            requested_ids.extend(groups.iter().map(|(_, identity)| identity.clone()));
+            prepared_entries.push((source_application_id, version, stamp, batch, groups));
         }
         let previous_by_id = if let Some(snapshot) = snapshot.as_ref() {
             self.lookup_app_id_versions(snapshot, requested_ids.iter().map(String::as_str))?
         } else {
             HashMap::new()
         };
+        let mut group_sources = Vec::new();
+        let mut group_plans = Vec::new();
+        for (_, version, _, batch, groups) in &prepared_entries {
+            for (group, identity) in groups {
+                let previous = previous_by_id.get(identity).copied().flatten();
+                if let Some(previous) = previous
+                    && previous > *version
+                {
+                    bail!("publication transaction fenced by newer application version");
+                }
+                let index = group_sources.len();
+                group_sources.push((batch, group));
+                group_plans.push((
+                    index,
+                    group.values.clone(),
+                    previous != Some(*version) && !group.rows.is_empty(),
+                ));
+            }
+        }
+        let mut materialized_groups = preflight_and_materialize_coalesced_groups(group_plans, max_files, |index| {
+            let (batch, group) = group_sources
+                .get(index)
+                .context("coalesced partition group was not prepared")?;
+            if partitions.is_empty() {
+                Ok((*batch).clone())
+            } else {
+                crate::partition::materialize_group(batch, group).map(|(batch, _)| batch)
+            }
+        })?;
         let mut identities = Vec::with_capacity(prepared_entries.len());
         let mut committed_identities = Vec::with_capacity(prepared_entries.len());
         let mut output: BTreeMap<crate::partition::PartitionValues, CoalescedPartitionOutput> = BTreeMap::new();
         let mut planned_files = 0_usize;
         let mut pending_input_rows = 0_usize;
         let mut source_mappings = Vec::with_capacity(prepared_entries.len());
-        for (source_application_id, version, stamp, splits) in prepared_entries {
+        let mut next_group_index = 0_usize;
+        for (source_application_id, version, stamp, _source_batch, splits) in prepared_entries {
             let mut source_transactions = Vec::new();
             let mut source_partition_files = std::collections::BTreeSet::new();
-            for (batch, values, identity) in splits {
+            for (group, identity) in splits {
+                let group_index = next_group_index;
+                next_group_index = next_group_index
+                    .checked_add(1)
+                    .context("coalesced group index overflow")?;
+                let values = group.values.clone();
                 let previous = previous_by_id.get(&identity).copied().flatten();
                 if let Some(previous) = previous
                     && previous > version
@@ -3952,6 +4038,12 @@ impl DeltaTable {
                     continue;
                 }
                 identities.push(transaction_identity);
+                if group.rows.is_empty() {
+                    continue;
+                }
+                let batch = materialized_groups
+                    .remove(&group_index)
+                    .context("pending coalesced partition was not materialized")?;
                 pending_input_rows = pending_input_rows
                     .checked_add(batch.num_rows())
                     .context("coalesced input row count overflow")?;

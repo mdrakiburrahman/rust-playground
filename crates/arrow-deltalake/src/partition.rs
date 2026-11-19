@@ -8,6 +8,11 @@ use sha2::{Digest, Sha256};
 
 pub(crate) type PartitionValues = BTreeMap<String, Option<String>>;
 
+pub(crate) struct PartitionGroup {
+    pub(crate) values: PartitionValues,
+    pub(crate) rows: Vec<u64>,
+}
+
 pub(crate) fn split(batch: &RecordBatch, names: &[String]) -> Result<Vec<(RecordBatch, PartitionValues)>> {
     split_with_new_partition(batch, names, |_| Ok(()))
 }
@@ -17,6 +22,16 @@ pub(crate) fn split_with_new_partition(
     names: &[String],
     mut on_new_partition: impl FnMut(&PartitionValues) -> Result<()>,
 ) -> Result<Vec<(RecordBatch, PartitionValues)>> {
+    let groups = group_rows(batch, names)?;
+    let mut result = Vec::with_capacity(groups.len());
+    for group in groups {
+        on_new_partition(&group.values)?;
+        result.push(materialize_group(batch, group)?);
+    }
+    Ok(result)
+}
+
+pub(crate) fn group_rows(batch: &RecordBatch, names: &[String]) -> Result<Vec<PartitionGroup>> {
     let columns = names
         .iter()
         .map(|name| {
@@ -32,23 +47,22 @@ pub(crate) fn split_with_new_partition(
         for (name, column) in names.iter().zip(&columns) {
             values.insert(name.clone(), value(batch.column(*column).as_ref(), row)?);
         }
-        if !groups.contains_key(&values) {
-            on_new_partition(&values)?;
-        }
         groups.entry(values).or_default().push(u64::try_from(row)?);
     }
     groups
         .into_iter()
-        .map(|(values, rows)| {
-            let rows = UInt64Array::from(rows);
-            let arrays = batch
-                .columns()
-                .iter()
-                .map(|column| arrow::compute::take(column.as_ref(), &rows, None).map_err(Into::into))
-                .collect::<Result<Vec<_>>>()?;
-            Ok((RecordBatch::try_new(batch.schema(), arrays)?, values))
-        })
+        .map(|(values, rows)| Ok(PartitionGroup { values, rows }))
         .collect()
+}
+
+pub(crate) fn materialize_group(batch: &RecordBatch, group: &PartitionGroup) -> Result<(RecordBatch, PartitionValues)> {
+    let rows = UInt64Array::from(group.rows.clone());
+    let arrays = batch
+        .columns()
+        .iter()
+        .map(|column| arrow::compute::take(column.as_ref(), &rows, None).map_err(Into::into))
+        .collect::<Result<Vec<_>>>()?;
+    Ok((RecordBatch::try_new(batch.schema(), arrays)?, group.values.clone()))
 }
 
 pub(crate) fn value(array: &dyn arrow::array::Array, row: usize) -> Result<Option<String>> {
