@@ -892,7 +892,7 @@ test('post-load failure requires reviewed current custody proof and remains fail
       original_receipt_sha256: digest(original), source_config_sha256: receipt.source_config_sha256,
       submitted_config_sha256: receipt.submitted_config_sha256, original_error: receipt.error,
       server_url: serverUrl, proof_kind: 'fresh_census_absence', historical_process_identity_proven: false,
-      job_id: 'abcdef123456', load_started: true, result_artifact: 'retained-unranked',
+      job_id: 'abcdef123456', client_pod_ran: true, result_artifact: 'diagnostics-retained-unranked',
       ranking: null as number | null, throughput_claim: null,
       verifier_sha256: raw, runner_source_sha256: raw,
       raw_observation_sha256: Object.fromEntries([
@@ -938,7 +938,7 @@ test('post-load failure requires reviewed current custody proof and remains fail
 
     await rejectFixture(manifest, /listener is still present/);
     await closeListener();
-    await rejectFixture({ ...manifest, load_started: false }, /exact failed invocation/);
+    await rejectFixture({ ...manifest, client_pod_ran: false }, /exact failed invocation/);
     await rejectFixture({ ...manifest, historical_process_identity_proven: true }, /exact failed invocation/);
     await rejectFixture({ ...manifest, ranking: 1 }, /exact failed invocation/);
     await rejectFixture({ ...manifest, original_error: 'another error' }, /exact failed invocation/);
@@ -956,8 +956,8 @@ test('post-load failure requires reviewed current custody proof and remains fail
       { ...manifest.pools, all_user_pools_inventoried: false },
       { ...manifest.pools, stamp_user_pool_names: ['pool-a', 'other'] },
       { ...manifest.pools, user_pools: [] },
-      { ...manifest.pools, user_pools: [{ ...manifest.pools.user_pools[0]!, arm_count: 1 }] },
-      { ...manifest.pools, user_pools: [{ ...manifest.pools.user_pools[0]!, kubernetes_node_count: 1 }] },
+      { ...manifest.pools, user_pools: [{ ...manifest.pools.user_pools[0]!, arm_count: 1 }, manifest.pools.user_pools[1]!] },
+      { ...manifest.pools, user_pools: [{ ...manifest.pools.user_pools[0]!, kubernetes_node_count: 1 }, manifest.pools.user_pools[1]!] },
       { ...manifest.pools, user_pools: [{ ...manifest.pools.user_pools[0]!, arm_max_count: 2 }, manifest.pools.user_pools[1]!] },
     ]) await rejectFixture({ ...manifest, pools }, /custody evidence/);
     const { qap_cleanup: _missing, ...missingReadback } = manifest.raw_observation_sha256;

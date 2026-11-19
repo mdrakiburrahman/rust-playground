@@ -718,7 +718,7 @@ function validateAbortedPostLoadAksDisposition(original: Buffer, evidence: Buffe
       proof.original_error !== receipt.error || proof.server_url !== receipt.server_url ||
       proof.proof_kind !== 'fresh_census_absence' || proof.historical_process_identity_proven !== false ||
       !isLegacyIdentity(proof.job_id) || !/^[a-f0-9]{12}$/.test(proof.job_id) ||
-      proof.load_started !== true || proof.result_artifact !== 'retained-unranked' ||
+      proof.client_pod_ran !== true || proof.result_artifact !== 'diagnostics-retained-unranked' ||
       proof.ranking !== null || proof.throughput_claim !== null ||
       !isLegacySha(proof.verifier_sha256) || !isLegacySha(proof.runner_source_sha256)) {
     throw new Error('Post-load AKS disposition is not bound to the exact failed invocation and original evidence');
