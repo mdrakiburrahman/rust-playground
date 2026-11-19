@@ -1286,6 +1286,7 @@ impl ResourceSampler {
                     };
                     let expected_identity = guard.as_ref()
                         .and_then(|(probe, _)| probe.expected_scale_out_identity.clone());
+                    let guard_api = guard.as_ref().and_then(|(probe, _)| probe.api.clone());
                     let deadline = request_anchor + Duration::from_millis(other_timeout_ms);
                     let guard_reading = async {
                         match (&mut guard, &backlog_scraper) {
@@ -1302,7 +1303,7 @@ impl ResourceSampler {
                             guard_reading,
                             bounded_publication_backlog_scrape(backlog_scraper.as_ref(),
                                 request_anchor + Duration::from_millis(timeout_ms)),
-                            async { verify_guard_identity(&config, expected_identity.as_ref()).await },
+                            async { verify_guard_identity(&config, expected_identity.as_ref(), guard_api.as_deref()).await },
                             deadline,
                         ),
                     );

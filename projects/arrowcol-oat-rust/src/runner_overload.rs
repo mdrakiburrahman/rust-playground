@@ -465,8 +465,115 @@ struct GuardProbe {
     buffer_cap: u64,
     collector_instance: Option<arrowcol_protocol::CollectorInstanceId>,
     expected_scale_out_identity: Option<GuardCollectorBinding>,
+    api: Option<Arc<GuardApi>>,
     local: bool,
     since_ms: u64,
+}
+
+struct GuardApi {
+    child: tokio::sync::Mutex<Child>,
+    client: reqwest::Client,
+    base: String,
+    namespace: String,
+    deployment: String,
+    pod: String,
+}
+
+impl GuardApi {
+    async fn start(config: &OatConfig, pod: &str) -> Result<Self> {
+        Self::start_with(config, pod, Command::new("kubectl")).await
+    }
+
+    async fn start_with(config: &OatConfig, pod: &str, mut command: Command) -> Result<Self> {
+        let valid_name = |name: &str| {
+            !name.is_empty() && name.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-' || c == b'.')
+        };
+        if !valid_name(&config.namespace) || !valid_name(&config.dfe_deployment) || !valid_name(pod) {
+            bail!("guard API resource name is invalid");
+        }
+        let escape = |name: &str| name.replace('.', r"\.");
+        let namespace = escape(&config.namespace);
+        let deployment = escape(&config.dfe_deployment);
+        let pod_path = escape(pod);
+        let paths = format!(
+            "^/apis/apps/v1/namespaces/{namespace}/deployments/{deployment}$,\
+             ^/apis/apps/v1/namespaces/{namespace}/replicasets$,\
+             ^/api/v1/namespaces/{namespace}/pods$,\
+             ^/api/v1/namespaces/{namespace}/pods/{pod_path}/log$"
+        );
+        if let Some(context) = &config.kubectl_context {
+            command.args(["--context", context]);
+        }
+        command.args([
+            "proxy", "--address=127.0.0.1", "--port=0",
+            "--reject-methods=^([^G].*|G[^E].*|GE[^T].*|GET.+|G|GE|)$",
+            "--accept-paths", &paths,
+        ]).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true);
+        let mut child = command.spawn().context("start restricted guard API proxy")?;
+        let stdout = child.stdout.take().context("guard proxy stdout unavailable")?;
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(10), BufReader::new(stdout).read_line(&mut line)).await??;
+        let address = line.trim().strip_prefix("Starting to serve on ")
+            .context("guard proxy did not report its listening address")?;
+        let address: std::net::SocketAddr = address.parse()?;
+        if address.ip() != std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST) || address.port() == 0 {
+            bail!("guard proxy did not bind loopback");
+        }
+        let api = Self {
+            child: tokio::sync::Mutex::new(child),
+            client: reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).build()?,
+            base: format!("http://{address}"),
+            namespace: config.namespace.clone(),
+            deployment: config.dfe_deployment.clone(),
+            pod: pod.to_owned(),
+        };
+        tokio::time::timeout(Duration::from_secs(10), api.get(&api.deployment_path(), &[])).await??;
+        Ok(api)
+    }
+
+    fn deployment_path(&self) -> String {
+        format!("/apis/apps/v1/namespaces/{}/deployments/{}", self.namespace, self.deployment)
+    }
+
+    async fn get(&self, path: &str, query: &[(&str, &str)]) -> Result<String> {
+        self.ensure_alive().await?;
+        let mut response = self.client.get(format!("{}{path}", self.base))
+            .query(query).send().await?.error_for_status()?;
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            if body.len().saturating_add(chunk.len()) > MAX_RETAINED_PROCESS_LOG_BYTES {
+                bail!("guard API response exceeds byte bound");
+            }
+            body.extend_from_slice(&chunk);
+        }
+        self.ensure_alive().await?;
+        Ok(String::from_utf8(body)?)
+    }
+
+    async fn ensure_alive(&self) -> Result<()> {
+        if self.child.lock().await.try_wait()?.is_some() {
+            bail!("guard API proxy exited");
+        }
+        Ok(())
+    }
+
+    async fn logs(&self, container: &str, since_ms: u64) -> Result<FilteredProcessOutput> {
+        let since = DateTime::from_timestamp_millis(i64::try_from(since_ms)?)
+            .context("guard log cursor timestamp is invalid")?
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let path = format!("/api/v1/namespaces/{}/pods/{}/log", self.namespace, self.pod);
+        let text = self.get(&path, &[("container", container), ("sinceTime", &since)]).await?;
+        let mut stdout = String::new();
+        let mut retained = 0;
+        for record in text.split_inclusive('\n') {
+            append_process_record(record.as_bytes(), &mut stdout, &mut retained, "read live ingestion commit evidence")?;
+        }
+        Ok(FilteredProcessOutput {
+            stdout, stderr: String::new(),
+            raw_log_bytes: text.len() as u64,
+            raw_log_lines: text.split_inclusive('\n').count() as u64,
+        })
+    }
 }
 
 async fn guard_snapshot_inventory(
@@ -515,9 +622,17 @@ async fn scale_out_collector_snapshot(
     ).await
 }
 
-async fn verify_guard_identity(config: &OatConfig, expected: Option<&GuardCollectorBinding>) -> Result<()> {
+async fn verify_guard_identity(config: &OatConfig, expected: Option<&GuardCollectorBinding>, api: Option<&GuardApi>) -> Result<()> {
     if let Some(expected) = expected
-        && scale_out_collector_snapshot(config, 1, Some(&expected.selector)).await?.identities != expected.identities
+        && match api {
+            Some(api) => guard_snapshot_inventory(
+                config, 1, &expected.selector,
+                async { Ok(serde_json::from_str(&api.get(&api.deployment_path(), &[]).await?)?) },
+                api.get(&format!("/apis/apps/v1/namespaces/{}/replicasets", api.namespace), &[]),
+                api.get(&format!("/api/v1/namespaces/{}/pods", api.namespace), &[("labelSelector", &expected.selector)]),
+            ).await?,
+            None => scale_out_collector_snapshot(config, 1, Some(&expected.selector)).await?,
+        }.identities != expected.identities
     {
         bail!("collector identity changed during composite observation");
     }
@@ -607,6 +722,10 @@ impl PreparedGuard {
         {
             bail!("ingestion-only producer capability unavailable");
         }
+        let api = match expected_scale_out_identity.as_ref() {
+            Some(binding) => Some(Arc::new(GuardApi::start(config, &binding.identities[0].pod).await?)),
+            None => None,
+        };
         let mut prepared = Self {
             scraper: PublicationBacklogScraper::start(&source, config).await?,
             probe: GuardProbe {
@@ -623,6 +742,7 @@ impl PreparedGuard {
                     .context("buffer hard-cap readback missing")?,
                 collector_instance: None,
                 expected_scale_out_identity,
+                api,
                 local: platform.kind() == crate::config::OatMode::Local,
                 since_ms: unix_time_ms_u64()?.saturating_sub(GUARD_MAX_GAP_MS),
             },
@@ -634,11 +754,12 @@ impl PreparedGuard {
         prepared.engine.proof["commit_log_sampling"] = json!({"mode":"incremental_since_with_dedupe",
             "overlap_ms":GUARD_MAX_GAP_MS,"capability_source":"initial_complete_startup_readback"});
         let expected = prepared.probe.expected_scale_out_identity.clone();
+        let api = prepared.probe.api.clone();
         let deadline = tokio::time::Instant::now() + GUARD_READ_TIMEOUT;
         let (reading, backlog, identity) = guarded_composite_observation(
             prepared.probe.read(config, &prepared.scraper, diagnostics, deadline),
             prepared.scraper.scrape(),
-            verify_guard_identity(config, expected.as_ref()),
+            verify_guard_identity(config, expected.as_ref(), api.as_deref()),
             deadline,
         ).await;
         record_guard_read_leg(diagnostics, "collector_identity_after_backlog", &identity);
@@ -758,7 +879,7 @@ impl GuardProbe {
             "legs":{},
         });
         let identity_before = if self.expected_scale_out_identity.is_some() {
-            guard_read_leg(deadline, verify_guard_identity(config, self.expected_scale_out_identity.as_ref())).await
+            guard_read_leg(deadline, verify_guard_identity(config, self.expected_scale_out_identity.as_ref(), self.api.as_deref())).await
         } else {
             GuardReadLeg::not_applicable()
         };
@@ -772,7 +893,10 @@ impl GuardProbe {
                 guard_cgroup_output(self.command(config, false)?).await
             }),
             guard_read_leg(deadline, async {
-                filtered_process_command_output(self.command(config, true)?, "read live ingestion commit evidence").await
+                match &self.api {
+                    Some(api) => api.logs(&config.dfe_container, self.since_ms).await,
+                    None => filtered_process_command_output(self.command(config, true)?, "read live ingestion commit evidence").await,
+                }
             }),
             guard_read_leg(deadline, async {
                 scraper.read_endpoint(pressure_url.as_str()).await
@@ -892,6 +1016,123 @@ enum GuardSignal {
 #[cfg(test)]
 mod overload_guard_tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires kubectl, node and openssl on PATH"]
+    async fn guard_proxy_enforces_boundary_and_reuses_authenticated_reads() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let (mut config, deployment, sets, pods) = identity_inventory_fixture()?;
+        config.namespace = "run".to_owned();
+        config.dfe_deployment = "collector".to_owned();
+        config.kubectl_context = None;
+        let inventory = Arc::new(tokio::sync::Mutex::new((deployment, sets, pods)));
+        let requests = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let app = axum::Router::new().fallback({
+            let inventory = inventory.clone();
+            let requests = requests.clone();
+            move |request: axum::extract::Request| {
+                let inventory = inventory.clone();
+                let requests = requests.clone();
+                async move {
+                    assert_eq!(request.headers().get("authorization").and_then(|value| value.to_str().ok()), Some("Bearer fixture-token"));
+                    requests.lock().await.push(request.uri().to_string());
+                    let values = inventory.lock().await;
+                    match request.uri().path() {
+                        "/apis/apps/v1/namespaces/run/deployments/collector" => values.0.to_string(),
+                        "/apis/apps/v1/namespaces/run/replicasets" => values.1.to_string(),
+                        "/api/v1/namespaces/run/pods" => values.2.to_string(),
+                        "/api/v1/namespaces/run/pods/pod/log" => "arrowcol_data_commit {}\n".to_owned(),
+                        _ => "unexpected".to_owned(),
+                    }
+                }
+            }
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let root = std::env::temp_dir().join(format!("oat-guard-proxy-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root)?;
+        let certificate = root.join("certificate.pem");
+        let key = root.join("key.pem");
+        let status = Command::new("openssl").args(["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+            "-subj", "/CN=localhost", "-keyout"]).arg(&key).arg("-out").arg(&certificate)
+            .stdout(Stdio::null()).stderr(Stdio::null()).status().await?;
+        anyhow::ensure!(status.success(), "fixture certificate generation failed");
+        let mut tls = Command::new("node").args(["-e",
+            r#"const tls=require('tls'),net=require('net'),fs=require('fs');const s=tls.createServer({key:fs.readFileSync(process.argv[1]),cert:fs.readFileSync(process.argv[2])},c=>{const u=net.connect(+process.argv[3],'127.0.0.1');c.pipe(u).pipe(c)});s.listen(0,'127.0.0.1',()=>console.log(s.address().port));"#])
+            .arg(&key).arg(&certificate).arg(address.port().to_string())
+            .stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true).spawn()?;
+        let mut tls_port = String::new();
+        tokio::time::timeout(Duration::from_secs(5), BufReader::new(tls.stdout.take().context("TLS fixture stdout")?).read_line(&mut tls_port)).await??;
+        let tls_port: u16 = tls_port.trim().parse()?;
+        let kubeconfig = root.join("config");
+        let plugin = root.join("credential-plugin");
+        let calls = root.join("calls");
+        fs::write(&plugin, format!(
+            "#!/bin/sh\nprintf x >> '{}'\nprintf '%s\\n' '{{\"apiVersion\":\"client.authentication.k8s.io/v1beta1\",\"kind\":\"ExecCredential\",\"status\":{{\"token\":\"fixture-token\",\"expirationTimestamp\":\"2099-01-01T00:00:00Z\"}}}}'\n",
+            calls.display()
+        ))?;
+        fs::set_permissions(&plugin, fs::Permissions::from_mode(0o700))?;
+        fs::write(&kubeconfig, format!(
+            "apiVersion: v1\nkind: Config\nclusters:\n- name: test\n  cluster:\n    server: https://127.0.0.1:{tls_port}\n    insecure-skip-tls-verify: true\ncontexts:\n- name: test\n  context:\n    cluster: test\n    user: test\ncurrent-context: test\nusers:\n- name: test\n  user:\n    exec:\n      apiVersion: client.authentication.k8s.io/v1beta1\n      command: '{}'\n      interactiveMode: Never\n",
+            plugin.display()
+        ))?;
+        let mut command = Command::new("kubectl");
+        command.arg("--kubeconfig").arg(&kubeconfig);
+        let api = GuardApi::start_with(&config, "pod", command).await?;
+        let pid = api.child.lock().await.id().context("proxy PID missing")?;
+        let expected = {
+            let values = inventory.lock().await;
+            scale_out_collector_identities("run", &config.dfe_container, 1, &values.0, &values.1, &values.2)?
+        };
+        let binding = GuardCollectorBinding { identities: expected, selector: "app=collector".to_owned() };
+        verify_guard_identity(&config, Some(&binding), Some(&api)).await?;
+        verify_guard_identity(&config, Some(&binding), Some(&api)).await?;
+        assert!(api.logs(&config.dfe_container, 1_000).await?.stdout.contains("arrowcol_data_commit"));
+        assert_eq!(fs::read_to_string(&calls)?, "x");
+        let count = requests.lock().await.len();
+        let client = reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).build()?;
+        for (method, path) in [
+            (reqwest::Method::POST, api.deployment_path()),
+            (reqwest::Method::HEAD, api.deployment_path()),
+            (reqwest::Method::GET, "/api/v1/namespaces/run/pods/pod/exec".to_owned()),
+            (reqwest::Method::GET, "/api/v1/namespaces/run/pods/pod/attach".to_owned()),
+            (reqwest::Method::GET, "/api/v1/namespaces/run/pods/pod/portforward".to_owned()),
+            (reqwest::Method::GET, "/api/v1/namespaces/other/pods".to_owned()),
+            (reqwest::Method::GET, "/api/v1/namespaces/run/secrets".to_owned()),
+        ] {
+            assert!(!client.request(method, format!("{}{path}", api.base)).send().await?.status().is_success());
+        }
+        assert_eq!(requests.lock().await.len(), count);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let (reading, _, fence) = guarded_composite_observation(
+            async { Ok(reading(0, 100)) },
+            async {
+                inventory.lock().await.2["items"][0]["status"]["containerStatuses"][0]["containerID"] = json!("replacement");
+                pending(0, 0)
+            },
+            verify_guard_identity(&config, Some(&binding), Some(&api)),
+            deadline,
+        ).await;
+        assert!(reading.is_ok());
+        assert!(fence.into_result().is_err());
+        drop(api);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while Path::new(&format!("/proc/{pid}")).exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.context("guard proxy was not reaped after drop")?;
+        server.abort();
+        tls.kill().await?;
+        fs::remove_file(calls)?;
+        fs::remove_file(plugin)?;
+        fs::remove_file(certificate)?;
+        fs::remove_file(key)?;
+        fs::remove_file(kubeconfig)?;
+        fs::remove_dir(root)?;
+        Ok(())
+    }
 
     #[test]
     fn scale_out_collector_set_requires_complete_owned_unrestarted_pods() -> Result<()> {
@@ -1106,7 +1347,7 @@ mod overload_guard_tests {
                     assert!(backlog_complete.get(), "identity fence ran before backlog completed");
                     FIXTURE_BOUNDARY.scope(
                         boundary(deployment, sets.clone(), pods),
-                        verify_guard_identity(&config, Some(&result)),
+                        verify_guard_identity(&config, Some(&result), None),
                     ).await
                 },
                 deadline,
@@ -1133,6 +1374,7 @@ mod overload_guard_tests {
             buffer_cap: 1000,
             collector_instance: None,
             expected_scale_out_identity: None,
+            api: None,
             local: true,
             since_ms: 595_000,
         };
