@@ -1041,7 +1041,7 @@ impl GroupPublisher<'_> {
         for source_application_id in source_application_ids {
             let receipts = receipts_by_source
                 .get(&source_application_id)
-                .map_or(&[], Vec::as_slice);
+                .map_or(&[][..], Vec::as_slice);
             self.record_audit_file_receipts(group, &source_application_id, receipts);
         }
     }
@@ -1419,7 +1419,7 @@ impl GroupPublisher<'_> {
                 let source_application_id = format!("arrowcol.publication.{publication_id}");
                 let file_receipts = audit_file_receipts
                     .get(&source_application_id)
-                    .map_or(&[], Vec::as_slice);
+                    .map_or(&[][..], Vec::as_slice);
                 self.record_audit_file_receipts(group, &source_application_id, file_receipts);
             }
             if let Some(error) = receipt_error {
