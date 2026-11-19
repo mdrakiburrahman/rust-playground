@@ -536,9 +536,7 @@ impl GuardApi {
     }
 
     async fn get(&self, path: &str, query: &[(&str, &str)]) -> Result<String> {
-        self.ensure_alive().await?;
-        let mut response = self.client.get(format!("{}{path}", self.base))
-            .query(query).send().await?.error_for_status()?;
+        let mut response = self.request(path, query).await?;
         let mut body = Vec::new();
         while let Some(chunk) = response.chunk().await? {
             if body.len().saturating_add(chunk.len()) > MAX_RETAINED_PROCESS_LOG_BYTES {
@@ -548,6 +546,11 @@ impl GuardApi {
         }
         self.ensure_alive().await?;
         Ok(String::from_utf8(body)?)
+    }
+
+    async fn request(&self, path: &str, query: &[(&str, &str)]) -> Result<reqwest::Response> {
+        self.ensure_alive().await?;
+        Ok(self.client.get(format!("{}{path}", self.base)).query(query).send().await?.error_for_status()?)
     }
 
     async fn ensure_alive(&self) -> Result<()> {
@@ -562,16 +565,55 @@ impl GuardApi {
             .context("guard log cursor timestamp is invalid")?
             .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         let path = format!("/api/v1/namespaces/{}/pods/{}/log", self.namespace, self.pod);
-        let text = self.get(&path, &[("container", container), ("sinceTime", &since)]).await?;
-        let mut stdout = String::new();
-        let mut retained = 0;
-        for record in text.split_inclusive('\n') {
-            append_process_record(record.as_bytes(), &mut stdout, &mut retained, "read live ingestion commit evidence")?;
+        let mut response = self.request(&path, &[("container", container), ("sinceTime", &since)]).await?;
+        let mut filter = GuardLogFilter::default();
+        while let Some(chunk) = response.chunk().await? {
+            filter.push(&chunk)?;
+        }
+        self.ensure_alive().await?;
+        filter.finish()
+    }
+}
+
+#[derive(Default)]
+struct GuardLogFilter {
+    pending: Vec<u8>,
+    stdout: String,
+    retained: usize,
+    raw_bytes: u64,
+    raw_lines: u64,
+}
+
+impl GuardLogFilter {
+    fn push(&mut self, mut chunk: &[u8]) -> Result<()> {
+        self.raw_bytes = self.raw_bytes.checked_add(u64::try_from(chunk.len())?).context("raw log byte count overflow")?;
+        while !chunk.is_empty() {
+            let end = chunk.iter().position(|byte| *byte == b'\n').map_or(chunk.len(), |index| index + 1);
+            if self.pending.len().saturating_add(end) > MAX_RETAINED_PROCESS_LOG_BYTES {
+                bail!("guard log record exceeds byte bound");
+            }
+            self.pending.extend_from_slice(&chunk[..end]);
+            chunk = &chunk[end..];
+            if self.pending.ends_with(b"\n") {
+                self.record()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn record(&mut self) -> Result<()> {
+        self.raw_lines = self.raw_lines.checked_add(1).context("raw log line count overflow")?;
+        append_process_record(&self.pending, &mut self.stdout, &mut self.retained, "read live ingestion commit evidence")?;
+        self.pending.clear();
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<FilteredProcessOutput> {
+        if !self.pending.is_empty() {
+            self.record()?;
         }
         Ok(FilteredProcessOutput {
-            stdout, stderr: String::new(),
-            raw_log_bytes: text.len() as u64,
-            raw_log_lines: text.split_inclusive('\n').count() as u64,
+            stdout: self.stdout, stderr: String::new(), raw_log_bytes: self.raw_bytes, raw_log_lines: self.raw_lines,
         })
     }
 }
@@ -1016,6 +1058,20 @@ enum GuardSignal {
 #[cfg(test)]
 mod overload_guard_tests {
     use super::*;
+
+    #[test]
+    fn guard_http_log_filter_handles_chunk_boundaries_and_partial_records() -> Result<()> {
+        let chunks: &[&[u8]] = &[b"ignored\narrowcol_", b"data_commit {}\narrowcol_data_", b"commit {\"a\":1}"];
+        let mut filter = GuardLogFilter::default();
+        for chunk in chunks {
+            filter.push(chunk)?;
+        }
+        let output = filter.finish()?;
+        assert_eq!(output.stdout, "arrowcol_data_commit {}\narrowcol_data_commit {\"a\":1}");
+        assert_eq!(output.raw_log_lines, 3);
+        assert_eq!(output.raw_log_bytes, chunks.iter().map(|chunk| chunk.len() as u64).sum::<u64>());
+        Ok(())
+    }
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
