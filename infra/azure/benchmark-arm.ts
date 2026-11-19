@@ -62,7 +62,8 @@ function controller(metadata: Json, kind: string): Json {
   return controllers[0];
 }
 
-const directContainers = { arrowcol: 'dataflow', 'delta-maintenance': 'maintenance', 'arrowcol-sql': 'sqlserver' } as const;
+const directContainers = { arrowcol: 'dataflow', 'delta-maintenance': 'maintenance', 'arrowcol-sql': 'sqlserver',
+  'arrowcol-catalog': 'catalog' } as const;
 export function observeWriter(identity: ArmIdentity, deployment: unknown, replicaSets: unknown, pods: unknown,
   role: keyof typeof directContainers = 'arrowcol') {
   const workload = object(deployment, 'writer Deployment');

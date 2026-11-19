@@ -7,7 +7,7 @@ import { parseArgs } from 'node:util';
 import { evidenceObject, parseEvidence, requireEvidence, uint } from './benchmark-evidence-json.js';
 import { collectorReceipt, terminalManifest } from './benchmark-extract.js';
 import { auditManifest, MAX_MANIFEST_BYTES } from './benchmark-manifest-audit.js';
-import { reconcilePublications } from './benchmark-reconcile.js';
+import { reconcilePublications, type DirectReconciliationTiming } from './benchmark-reconcile.js';
 
 const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
 const MAX_LINE_BYTES = 8 * 1024 * 1024;
@@ -90,7 +90,7 @@ async function readRawClient(path: string, hashes: Hashes) {
 }
 
 export async function auditEvidenceFiles(manifests: string[], collector: string, deltaDirectory: string, baseline: bigint,
-  raw?: { expectedFinalVersion: bigint }) {
+  raw?: { expectedFinalVersion: bigint; timing?: DirectReconciliationTiming | null }) {
   requireEvidence((await lstat(deltaDirectory)).isDirectory(), 'Expected a non-symlink Delta directory');
   const hashes: Hashes = Object.create(null);
   const inputs = [];
@@ -108,7 +108,8 @@ export async function auditEvidenceFiles(manifests: string[], collector: string,
   }
   if (raw) requireEvidence(delta.size > 0 && BigInt(delta.size - 1) === raw.expectedFinalVersion,
     'Downloaded Delta history differs from the frozen final version');
-  const report = await reconcilePublications(inputs, jsonLines(collector, hashes, raw !== undefined), delta, baseline);
+  const report = await reconcilePublications(inputs, jsonLines(collector, hashes, raw !== undefined), delta, baseline,
+    raw ? { diagnostic: true, timing: raw.timing ?? null } : undefined);
   return { ...report, ...(raw ? { client_log_sha256: manifestHashes } : { client_manifest_sha256: manifestHashes }), evidence_sha256: hashes };
 }
 

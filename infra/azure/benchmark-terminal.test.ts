@@ -4,12 +4,13 @@ import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { delimiter, join } from 'node:path';
 import test from 'node:test';
-import { acceptRouterFencePatch, planRouterFence, routerFenceObserved } from './benchmark-router-fence.js';
+import { acceptRouterFencePatch, observeRouterLifetimes, planRouterFence, routerFenceObserved } from './benchmark-router-fence.js';
 import { persistDirectStopPatch } from './benchmark-stop-patch.js';
 import { observeCompletedClients } from './benchmark-client-terminal.js';
 import { persistDirectEvidence } from './benchmark-evidence-custody.js';
 import { captureDirectBaseline, captureFrozenDelta, directDeltaReplay } from './benchmark-delta-evidence.js';
-import { directCatalogRoot, directClockBound, type DirectRelease } from './benchmark-direct-arm.js';
+import { directCatalogRoot, directClientTransport, directParquetConfig, directReceiverTransport, directRouterTransport, type DirectRelease } from './benchmark-direct-arm.js';
+import { checkDirectClocks, directClockBound, directClockOffsets } from './benchmark-clock.js';
 import { directProducerAuthority } from './benchmark-run-authority.js';
 import type { CampaignStore, StoredCampaign } from '../../projects/arrowcol-oat/aks-campaign.js';
 import type { Azure } from './bootstrap.js';
@@ -48,7 +49,7 @@ test('requires a unique original catalog receipt and conservative clock brackets
   const origin = { ...run, cloudGeneration: uid, sourceRevision: 'b'.repeat(40), fencingToken: 1 };
   const image = `test@sha256:${'a'.repeat(64)}`;
   const release: DirectRelease = { revision: origin.sourceRevision, schemaFingerprint: 'schema',
-    images: { writer: image, maintenance: image, sql: image, client: image } };
+    images: { writer: image, maintenance: image, sql: image, client: image, router: image, catalog: image } };
   const root = `direct-baseline-1/runs/${run.runId}/dataflow/telemetry/sqlserver/sqlserver_availability_replica_states`;
   const receipt = { kind: 'oat_run_table_registered', run_id: run.runId, provider: 'delta', schema_version: 1,
     catalog_table_count: 1, schema_fingerprint: 'schema', table: 'telemetry.sqlserver.sqlserver_availability_replica_states',
@@ -63,6 +64,38 @@ test('requires a unique original catalog receipt and conservative clock brackets
   assert.equal(directClockBound(now, now + 98, String(ns)).lowerNs, '-99000000');
   assert.throws(() => directClockBound(now, now + 100, String(ns)), /uncertainty/);
   assert.throws(() => directClockBound(now, now + 1, String(ns + 101_000_000n)), /uncertainty/);
+  const before = [{ node: 'n', podUid: 'original', beforeMs: now, afterMs: now, observedNs: String(ns), timeNamespace: 'time:[1]' }];
+  const after = [{ node: 'n', podUid: 'router', beforeMs: now + 10_000, afterMs: now + 10_000,
+    observedNs: String(ns + 10_000_000_000n), timeNamespace: 'time:[1]' }];
+  const nodes = new Map([['n', { before: 'original', after: 'router' }]]);
+  checkDirectClocks(nodes, now + 100, now + 10_000, before, after);
+  assert.throws(() => checkDirectClocks(nodes, now + 100, now + 10_000, before, []), /coverage/);
+  assert.throws(() => checkDirectClocks(nodes, now + 100, now + 10_000, before,
+    [{ ...after[0], podUid: 'replacement' }]), /bracket/);
+  assert.throws(() => checkDirectClocks(nodes, now + 100, now + 10_000, before,
+    [{ ...after[0], timeNamespace: 'time:[2]' }]), /time namespace/);
+  assert.throws(() => checkDirectClocks(nodes, now + 100, now + 10_001, before, after), /bracket/);
+  assert.deepEqual(directClockOffsets(nodes, now + 100, now + 10_000, before, after).get('n'),
+    { lowerNs: -1_000_000n, upperNs: 0n });
+});
+test('requires original effective transport readbacks without duplicates or drift', () => {
+  const client = 'OAT_CLIENT_EFFECTIVE_CONFIG {"stream_window_bytes":1048576,"connection_window_bytes":16777216,"adaptive_window":false,"tcp_nodelay":true}';
+  const router = 'arrowcol_router_effective_config {"downstream_h2":{"stream_window_bytes":1048576,"connection_window_bytes":16777216},"upstream":{"stream_window_bytes":1048576,"connection_window_bytes":16777216}}';
+  const receiver = 'arrowcol_effective_config {"component":"receiver","config":{"transport":{"initial_stream_window_size":1048576,"initial_connection_window_size":16777216,"adaptive_window":false,"tcp_nodelay":true}}}';
+  const parquet = 'arrowcol_effective_config {"parquet_writer":{"defaults":{"compression":"zstd","compression_level":2}}}';
+  assert.equal(directClientTransport(client).tcp_nodelay, true);
+  assert.equal(directRouterTransport(router).upstream.connection_window_bytes, 16777216);
+  assert.equal(directReceiverTransport(receiver).tcp_nodelay, true);
+  assert.equal(directParquetConfig(parquet).compression_level, 2);
+  assert.throws(() => directClientTransport(`${client}\n${client}`), /duplicate/);
+  assert.throws(() => directClientTransport(client.replace('16777216', '65535')), /differs/);
+  assert.throws(() => directRouterTransport(router.replace('16777216', '65535')), /differs/);
+  assert.throws(() => directRouterTransport(''), /Missing/);
+  assert.throws(() => directReceiverTransport(`${receiver}\n${receiver}`), /duplicate/);
+  assert.throws(() => directReceiverTransport(receiver.replace('16777216', '65535')), /differs/);
+  assert.throws(() => directReceiverTransport(''), /Missing/);
+  assert.throws(() => directParquetConfig(`${parquet}\n${parquet}`), /duplicate/);
+  assert.throws(() => directParquetConfig(parquet.replace('"compression_level":2', '"compression_level":1')), /differs/);
 });
 test('requires a clean MODIFIED event for the original Pod; disappearance, restart and watch expiry fail', async () => {
   const imageId = `sha256:${'a'.repeat(64)}`, image = `test@${imageId}`, startedAt = '2026-01-01T00:00:00Z';
@@ -323,6 +356,24 @@ test('requires a positive original router fence, controller convergence and no p
   assert.equal(routerFenceObserved(run, uid, generation, stopped, emptyPods, coverage), true);
 });
 
+test('pins original ready router pod lifetimes to the six-role image', () => {
+  const image = `registry/router@sha256:${'a'.repeat(64)}`;
+  const daemon = { ...router, status: { observedGeneration: 1, desiredNumberScheduled: 1, currentNumberScheduled: 1, numberReady: 1 },
+    spec: { template: { spec: { containers: [{ name: 'router', image }] } } } };
+  const status = { name: 'router', ready: true, restartCount: 0, imageID: `sha256:${'a'.repeat(64)}`,
+    containerID: 'container', state: { running: { startedAt: '2026-01-01T00:00:00Z' } } };
+  const pod = { kind: 'Pod', apiVersion: 'v1', metadata: { uid, name: 'router-pod', namespace: run.namespace,
+    labels: markers, annotations: markers, ownerReferences: [{ kind: 'DaemonSet', uid, controller: true }] },
+    spec: { nodeName: 'node', containers: [{ name: 'router', image }] }, status: { phase: 'Running', containerStatuses: [status] } };
+  const pods = { kind: 'PodList', items: [pod] };
+  assert.equal(observeRouterLifetimes(run, uid, image, daemon, pods)[0].containerId, 'container');
+  status.imageID = `sha256:${'b'.repeat(64)}`;
+  assert.throws(() => observeRouterLifetimes(run, uid, image, daemon, pods), /lifetime/);
+  status.imageID = `sha256:${'a'.repeat(64)}`;
+  status.restartCount = 1;
+  assert.throws(() => observeRouterLifetimes(run, uid, image, daemon, pods), /lifetime/);
+});
+
 test('binds SQL stop to one original run generation, endpoint and registration lifetime', () => {
   const generation = '98765432-89ab-cdef-0123-456789abcdef';
   const writer = { deploymentUid: 'deployment', replicaSetUid: 'replica', podName: 'pod', podUid: uid,
@@ -349,7 +400,9 @@ test('direct terminal gate blocks reordered stop receipts before consuming termi
     image: `test@sha256:${'a'.repeat(64)}`, imageId: `sha256:${'a'.repeat(64)}`, containerId: 'original', startedAt: '2026-01-01T00:00:00Z',
   };
   const arm: DirectTerminalArm = {
-    origin, startMs: endMs - 60000, endMs, clients: [], writer: original, maintenance: original, sql: original, routerUid: uid, provenance: {},
+    origin, startMs: endMs - 60000, endMs, clients: [], writer: original, maintenance: original, sql: original,
+    catalogLifetime: original, routers: [], routerUid: uid,
+    provenance: { clocks: [], release: {}, catalog: {}, catalogLog: '', schedule: [], transport: { clients: [], routers: [], receiver: {} }, parquet: {} },
     writerClaim: { claimUid: run.owner, volumeName: 'pv' }, baseline: {
       table_id: uid, table_root: `direct-baseline-1/runs/${run.runId}/dataflow/table`, version: 1, last_commit_sha256: '0'.repeat(64),
       history_sha256: '0'.repeat(64),

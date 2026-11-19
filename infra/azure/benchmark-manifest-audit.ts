@@ -110,7 +110,8 @@ export function* decodedRecords(value: unknown) {
     for (const { fragments, canonical } of decodeFacts(item.batch_facts, small(item.batch_count, 'batch count'))) {
       fragmentSum += fragments;
       byteSum += canonical;
-      yield { id: `${run}/${incarnation}/${item.worker}/${(sequence++).toString(36)}`, table, rows, fragments, canonical, send, admission };
+      yield { id: `${run}/${incarnation}/${item.worker}/${(sequence++).toString(36)}`, table, rows, fragments, canonical,
+        send, admission, firstSend, lastSend };
     }
     requireEvidence(fragmentSum === item.decoded_physical_batch_count && byteSum === item.canonical_logical_bytes &&
       item.canonical_logical_bytes_unavailable_reason === null, 'Range fact totals differ or unavailable');

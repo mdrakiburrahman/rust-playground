@@ -1,9 +1,11 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { observeWriter, prepareDirectBarrier } from './benchmark-arm.js';
+import { directClockBound } from './benchmark-clock.js';
 import { captureDirectBaseline } from './benchmark-delta-evidence.js';
 import { evidenceList, evidenceObject, evidenceText, parseEvidence, requireEvidence } from './benchmark-evidence-json.js';
 import { directProducerAuthority, type DirectCampaignScope } from './benchmark-run-authority.js';
+import { observeRouterLifetimes } from './benchmark-router-fence.js';
 import type { DirectStopOrigin } from './benchmark-stop-patch.js';
 import { directArmRecordPath, type DirectTerminalArm } from './benchmark-terminal-custody.js';
 import { pinWriterRegistration, readWriterRegistrations } from './benchmark-writer-sql.js';
@@ -16,10 +18,11 @@ const digest = /^[^\s@]+@sha256:[a-f0-9]{64}$/;
 const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
 const table = 'telemetry.sqlserver.sqlserver_availability_replica_states';
 const registration = 'direct-catalog-verified';
+const streamWindow = 1_048_576n, connectionWindow = 16_777_216n;
 export type DirectRelease = {
   revision: string;
   schemaFingerprint: string;
-  images: Record<'writer' | 'client' | 'maintenance' | 'sql', string>;
+  images: Record<'writer' | 'client' | 'maintenance' | 'sql' | 'router' | 'catalog', string>;
 };
 
 export function directCatalogRoot(log: string, origin: DirectStopOrigin, release: DirectRelease, account: string, data: string) {
@@ -34,13 +37,56 @@ export function directCatalogRoot(log: string, origin: DirectStopOrigin, release
   return relative;
 }
 
-export function directClockBound(beforeMs: number, afterMs: number, observedNs: string) {
-  requireEvidence(Number.isSafeInteger(beforeMs) && Number.isSafeInteger(afterMs) && beforeMs > 0 && afterMs >= beforeMs &&
-    /^[1-9]\d{17,18}$/.test(observedNs), 'Original clock sample is invalid');
-  const epoch = BigInt(observedNs), lower = epoch - (BigInt(afterMs) + 1n) * 1_000_000n,
-    upper = epoch - BigInt(beforeMs) * 1_000_000n;
-  requireEvidence(lower >= -100_000_000n && upper <= 100_000_000n, 'Original clock uncertainty exceeds 100 ms');
-  return { beforeMs, afterMs, observedNs, lowerNs: String(lower), upperNs: String(upper) };
+function effectiveConfig(log: string, marker: string) {
+  const lines = log.split(/\r?\n/).filter(line => line.startsWith(marker));
+  requireEvidence(lines.length === 1, `Missing or duplicate ${marker.trim()} readback`);
+  return { raw: lines[0], config: evidenceObject(parseEvidence(lines[0].slice(marker.length))) };
+}
+
+export function directClientTransport(log: string) {
+  const { config, raw } = effectiveConfig(log, 'OAT_CLIENT_EFFECTIVE_CONFIG ');
+  requireEvidence(config.stream_window_bytes === streamWindow && config.connection_window_bytes === connectionWindow &&
+    config.adaptive_window === false && config.tcp_nodelay === true, 'Client effective transport differs from the approved settings');
+  return { raw, stream_window_bytes: Number(config.stream_window_bytes), connection_window_bytes: Number(config.connection_window_bytes),
+    adaptive_window: config.adaptive_window, tcp_nodelay: config.tcp_nodelay };
+}
+
+export function directRouterTransport(log: string) {
+  const { config, raw } = effectiveConfig(log, 'arrowcol_router_effective_config ');
+  const downstream = evidenceObject(config.downstream_h2), upstream = evidenceObject(config.upstream);
+  requireEvidence([downstream, upstream].every(part => part.stream_window_bytes === streamWindow &&
+    part.connection_window_bytes === connectionWindow), 'Router effective transport differs from the approved settings');
+  return { raw, downstream: { stream_window_bytes: Number(downstream.stream_window_bytes), connection_window_bytes: Number(downstream.connection_window_bytes) },
+    upstream: { stream_window_bytes: Number(upstream.stream_window_bytes), connection_window_bytes: Number(upstream.connection_window_bytes) } };
+}
+
+export function directReceiverTransport(log: string) {
+  const marker = 'arrowcol_effective_config ';
+  const entries = log.split(/\r?\n/).filter(line => line.startsWith(marker))
+    .map(raw => ({ raw, event: evidenceObject(parseEvidence(raw.slice(marker.length))) }))
+    .filter(({ event }) => event.component === 'receiver');
+  requireEvidence(entries.length === 1, 'Missing or duplicate receiver effective transport readback');
+  const { raw, event } = entries[0];
+  const transport = evidenceObject(evidenceObject(event.config).transport);
+  requireEvidence(transport.initial_stream_window_size === streamWindow &&
+    transport.initial_connection_window_size === connectionWindow && transport.adaptive_window === false &&
+    transport.tcp_nodelay === true, 'Receiver effective transport differs from the approved settings');
+  return { raw, stream_window_bytes: Number(transport.initial_stream_window_size),
+    connection_window_bytes: Number(transport.initial_connection_window_size), adaptive_window: transport.adaptive_window,
+    tcp_nodelay: transport.tcp_nodelay };
+}
+
+export function directParquetConfig(log: string) {
+  const marker = 'arrowcol_effective_config ';
+  const entries = log.split(/\r?\n/).filter(line => line.startsWith(marker))
+    .map(raw => ({ raw, event: evidenceObject(parseEvidence(raw.slice(marker.length))) }))
+    .filter(({ event }) => event.parquet_writer !== undefined);
+  requireEvidence(entries.length === 1, 'Missing or duplicate Parquet startup policy readback');
+  const { raw, event } = entries[0];
+  const defaults = evidenceObject(evidenceObject(event.parquet_writer).defaults);
+  requireEvidence(defaults.compression === 'zstd' && defaults.compression_level === 2n,
+    'Parquet startup policy differs from the approved settings');
+  return { raw, compression: defaults.compression, compression_level: Number(defaults.compression_level) };
 }
 
 /** Call only with the approved immutable release pins and an existing exclusive run authority. */
@@ -51,7 +97,8 @@ export async function armDirectBenchmark(azure: Azure, campaign: DirectCampaignS
     Number.isSafeInteger(origin.fencingToken) && origin.fencingToken > 0 && /^[a-z0-9-]+$/.test(origin.namespace) &&
     Number.isInteger(origin.clients) && origin.clients >= 1 && origin.clients <= 8 && /^[a-f0-9]{40}$/.test(release.revision) &&
     release.revision === origin.sourceRevision && release.schemaFingerprint.length > 0 && release.schemaFingerprint.length < 129 &&
-    Object.values(release.images).every(image => digest.test(image)), 'Direct arm lacks original authority, source or release pins');
+    (['writer', 'client', 'maintenance', 'sql', 'router', 'catalog'] as const).every(role =>
+      typeof release.images[role] === 'string' && digest.test(release.images[role])), 'Direct arm lacks original authority, source or release pins');
   const fic = read_run_fic_record(ficRecordPath, azure.c);
   requireEvidence(fic.runId === origin.runId && fic.namespaceUid === origin.namespaceUid && fic.namespace === origin.namespace &&
     fic.namespaceOwner === origin.owner && fic.phase === 'ready' && /^https:\/\/[a-z0-9.-]+$/.test(fic.server), 'Original run FIC is not ready');
@@ -74,11 +121,12 @@ export async function armDirectBenchmark(azure: Azure, campaign: DirectCampaignS
     }
     return { obj, metadata };
   };
-  const workload = async (role: 'arrowcol-sql' | 'delta-maintenance') => {
+  const workload = async (role: 'arrowcol-sql' | 'delta-maintenance' | 'arrowcol-catalog') => {
     const [deployment, sets, pods] = await Promise.all([get('deployment', role), get('replicasets', '-l', `app=${role}`),
       get('pods', '-l', `app=${role}`)]);
     const result = observeWriter(origin, deployment, sets, pods, role);
-    requireEvidence(result.image === release.images[role === 'arrowcol-sql' ? 'sql' : 'maintenance'],
+    const key = role === 'arrowcol-sql' ? 'sql' : role === 'arrowcol-catalog' ? 'catalog' : 'maintenance';
+    requireEvidence(result.image === release.images[key],
       `Original ${role} image differs from the approved release pin`);
     return result;
   };
@@ -119,14 +167,28 @@ export async function armDirectBenchmark(azure: Azure, campaign: DirectCampaignS
   requireEvidence(canonical_json(catalog) === canonical_json(await readRegistrationPod()), 'Original catalog registration was replaced');
   const root = directCatalogRoot(catalogLog, origin, release, azure.c.account, azure.c.data);
   const { observedBaseline: baseline } = await captureDirectBaseline(azure, authority, origin.runId, root, baselineDirectory);
-  const [router, maintenance, sql] = await Promise.all([
-    get('daemonset', 'arrowcol-router').then(value => owned(value, 'DaemonSet', 'arrowcol-router')), workload('delta-maintenance'), workload('arrowcol-sql')]);
+  const [router, routerPods, maintenance, sql, catalogLifetime] = await Promise.all([
+    get('daemonset', 'arrowcol-router').then(value => owned(value, 'DaemonSet', 'arrowcol-router')),
+    get('pods', '-l', 'app=arrowcol-router'), workload('delta-maintenance'), workload('arrowcol-sql'), workload('arrowcol-catalog')]);
+  const routerUid = evidenceText(router.metadata.uid);
+  const routers = observeRouterLifetimes(origin, routerUid, release.images.router, router.obj, routerPods);
   const assertSql = async () => requireEvidence(canonical_json(sql) === canonical_json(await workload('arrowcol-sql')), 'Original SQL lifetime changed');
   await guard();
   const prepared = prepareDirectBarrier(context, origin, fic.server);
   const { capture: writerClaim, ...writer } = prepared.writer;
   requireEvidence(writer.image === release.images.writer && prepared.clients.every(client => client.image === release.images.client),
     'Original writer or clients differ from the approved release pins');
+  requireEvidence(prepared.clients.every(client => routers.some(route => route.nodeName === client.nodeName)),
+    'Original client node has no pinned local router');
+  const [clientTransport, routerTransport, writerConfig] = await Promise.all([
+    Promise.all(prepared.clients.map(async client => ({ podUid: client.uid, config: directClientTransport(
+      await run('exec', client.name, '-c', 'generator', '--', '/bin/cat', `/evidence/${client.uid}/stdout`)) }))),
+    Promise.all(routers.map(async router => ({ podUid: router.uid, config: directRouterTransport(
+      await run('logs', router.name, '-c', 'router')) }))),
+    run('exec', writer.podName, '-c', 'dataflow', '--', '/bin/cat',
+      `/var/lib/arrowcol/staging/benchmark-logs/${writer.podUid}/stderr`),
+  ]);
+  const receiverTransport = directReceiverTransport(writerConfig), parquetConfig = directParquetConfig(writerConfig);
   const ready = pinWriterRegistration(origin, origin.cloudGeneration, writer,
     await readWriterRegistrations(authority, origin, origin.cloudGeneration, context, fic.server,
       { name: sql.podName, uid: sql.podUid }, assertSql));
@@ -134,14 +196,23 @@ export async function armDirectBenchmark(azure: Azure, campaign: DirectCampaignS
   for (const c of prepared.clients) nodePods.set(c.nodeName, { name: c.name, uid: c.uid, container: 'generator' });
   nodePods.set(writer.nodeName, { name: writer.podName, uid: writer.podUid, container: 'dataflow' });
   const clocks = await Promise.all([...nodePods].map(async ([node, pod]) => {
+    const timeNamespace = (await run('exec', pod.name, '-c', pod.container, '--', 'readlink', '/proc/self/ns/time')).trim();
+    requireEvidence(/^time:\[\d+\]$/.test(timeNamespace), 'Original clock observer time namespace is unavailable');
     const before = Date.now();
     const clock = (await run('exec', pod.name, '-c', pod.container, '--', 'date', '-u', '+%s%N')).trim();
-    return { node, podUid: pod.uid, ...directClockBound(before, Date.now(), clock) };
+    return { node, podUid: pod.uid, timeNamespace, ...directClockBound(before, Date.now(), clock) };
+  }));
+  await Promise.all(prepared.clients.map(async client => {
+    const timeNamespace = (await run('exec', client.name, '-c', 'generator', '--', 'readlink', '/proc/self/ns/time')).trim();
+    requireEvidence(timeNamespace === clocks.find(clock => clock.node === client.nodeName)?.timeNamespace,
+      'Original clients on a node do not share the sampled time namespace');
   }));
   const arm: DirectTerminalArm = {
     origin, baseline, startMs: prepared.measurementStartUnixMs, endMs: prepared.measurementEndUnixMs,
-    clients: prepared.clients, writer, writerClaim, maintenance, sql, registration: ready,
-    routerUid: evidenceText(router.metadata.uid), provenance: { release, catalog, catalogLog, clocks, schedule: prepared.patch },
+    clients: prepared.clients, writer, writerClaim, maintenance, sql, catalogLifetime, routers, registration: ready,
+    routerUid, provenance: { release, catalog, catalogLog, clocks, schedule: prepared.patch,
+      transport: { clients: clientTransport, routers: routerTransport, receiver: { podUid: writer.podUid, config: receiverTransport } },
+      parquet: { podUid: writer.podUid, config: parquetConfig } },
   };
   const path = directArmRecordPath(origin);
   const raw = Buffer.from(canonical_json(arm));
@@ -156,6 +227,11 @@ export async function armDirectBenchmark(azure: Azure, campaign: DirectCampaignS
   const fresh = prepareDirectBarrier(context, origin, fic.server);
   requireEvidence(canonical_json(fresh.writer) === canonical_json(prepared.writer) &&
     canonical_json(fresh.clients) === canonical_json(prepared.clients) && fresh.patch[0].value === prepared.patch[0].value &&
+    canonical_json(await workload('delta-maintenance')) === canonical_json(maintenance) &&
+    canonical_json(await workload('arrowcol-sql')) === canonical_json(sql) &&
+    canonical_json(await workload('arrowcol-catalog')) === canonical_json(catalogLifetime) &&
+    canonical_json(observeRouterLifetimes(origin, routerUid, release.images.router,
+      await get('daemonset', 'arrowcol-router'), await get('pods', '-l', 'app=arrowcol-router'))) === canonical_json(routers) &&
     Date.now() <= prepared.runStartUnixMs - 30_000, 'Original lifetimes, pending schedule or release lead time changed');
   await checkPublisher();
   const response = evidenceObject(JSON.parse(await run('patch', 'configmap', 'direct-schedule-confirmwide', '--type=json',
