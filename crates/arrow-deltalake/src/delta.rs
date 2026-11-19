@@ -44,6 +44,7 @@ type TimedCommitResult = Result<(
     Option<Duration>,
     FileCommitObservations,
     crate::commit::CommitOutcome,
+    Vec<CommitDisposition>,
 )>;
 
 fn process_writer_properties(schema: &SchemaRef) -> Result<BTreeMap<String, String>> {
@@ -2156,6 +2157,76 @@ pub(crate) struct CoalescedCommitGroup {
     pub(crate) identities: Vec<(String, i64, i64)>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CoalescedPublicationMapping {
+    pub(crate) source_application_id: String,
+    pub(crate) transaction_files: Vec<(String, i64, i64, Vec<usize>)>,
+}
+
+struct CoalescedPublicationSource {
+    application_id: String,
+    transactions: Vec<(crate::partition::PartitionValues, (String, i64, i64))>,
+    partition_files: std::collections::BTreeSet<(crate::partition::PartitionValues, usize)>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CommitDisposition {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+    pub(crate) outcome: crate::commit::CommitOutcome,
+    pub(crate) authoritative_version: Option<u64>,
+}
+
+fn commit_dispositions(
+    files_len: usize,
+    groups: &[CoalescedCommitGroup],
+    skipped_groups: &std::collections::HashSet<usize>,
+    skipped_files: &std::collections::HashSet<usize>,
+    outcome: crate::commit::CommitOutcome,
+    authoritative_version: Option<u64>,
+) -> Vec<CommitDisposition> {
+    let grouped_files = groups
+        .iter()
+        .flat_map(|group| group.start..group.end)
+        .collect::<std::collections::HashSet<_>>();
+    let mut dispositions = groups
+        .iter()
+        .enumerate()
+        .map(|(index, group)| {
+            let skipped = skipped_groups.contains(&index);
+            CommitDisposition {
+                start: group.start,
+                end: group.end,
+                outcome: if skipped {
+                    crate::commit::CommitOutcome::Deduplicated
+                } else {
+                    outcome
+                },
+                authoritative_version: (!skipped).then_some(authoritative_version).flatten(),
+            }
+        })
+        .collect::<Vec<_>>();
+    dispositions.extend(
+        (0..files_len)
+            .filter(|index| !grouped_files.contains(index))
+            .map(|index| {
+                let skipped = skipped_files.contains(&index);
+                CommitDisposition {
+                    start: index,
+                    end: index + 1,
+                    outcome: if skipped {
+                        crate::commit::CommitOutcome::Deduplicated
+                    } else {
+                        outcome
+                    },
+                    authoritative_version: (!skipped).then_some(authoritative_version).flatten(),
+                }
+            }),
+    );
+    dispositions.sort_by_key(|disposition| (disposition.start, disposition.end));
+    dispositions
+}
+
 #[derive(Debug)]
 pub(crate) struct PartialPublicationGroup {
     pub(crate) committed: usize,
@@ -3653,6 +3724,7 @@ impl DeltaTable {
         Vec<StagedAppend>,
         Vec<(String, i64, i64)>,
         Vec<(String, i64, i64)>,
+        Vec<CoalescedPublicationMapping>,
         Duration,
         Duration,
     )> {
@@ -3694,7 +3766,11 @@ impl DeltaTable {
         let mut output: BTreeMap<crate::partition::PartitionValues, CoalescedPartitionOutput> = BTreeMap::new();
         let mut planned_files = 0_usize;
         let mut pending_input_rows = 0_usize;
+        let mut source_mappings = Vec::with_capacity(entries.len());
         for (mut batch, app_id, version, stamp) in entries {
+            let source_application_id = app_id.clone();
+            let mut source_transactions = Vec::new();
+            let mut source_partition_files = std::collections::BTreeSet::new();
             validate_transaction_id(&app_id, version)?;
             if stamp < 0 || !unique.insert(app_id.clone()) {
                 bail!("invalid or duplicate coalesced publication identity");
@@ -3788,13 +3864,15 @@ impl DeltaTable {
                 let (identity, previous) = partition_identities
                     .remove(&values)
                     .context("coalesced partition identity was not prepared")?;
+                let transaction_identity = (identity.clone(), version, stamp);
+                source_transactions.push((values.clone(), transaction_identity.clone()));
                 if let Some(previous) = previous
                     && previous == version
                 {
-                    committed_identities.push((identity, version, stamp));
+                    committed_identities.push(transaction_identity);
                     continue;
                 }
-                identities.push((identity, version, stamp));
+                identities.push(transaction_identity);
                 pending_input_rows = pending_input_rows
                     .checked_add(batch.num_rows())
                     .context("coalesced input row count overflow")?;
@@ -3831,6 +3909,7 @@ impl DeltaTable {
                     partition.file_rows[0] = partition.file_rows[0]
                         .checked_add(rows)
                         .context("coalesced partition row count overflow")?;
+                    source_partition_files.insert((values.clone(), 0));
                     continue;
                 }
                 let policy = layout.as_ref().context("missing layout policy")?;
@@ -3888,9 +3967,15 @@ impl DeltaTable {
                         .checked_add(bytes)
                         .context("coalesced partition memory count overflow")?;
                     partition.files[file].push(chunk);
+                    source_partition_files.insert((values.clone(), file));
                     start += rows;
                 }
             }
+            source_mappings.push(CoalescedPublicationSource {
+                application_id: source_application_id,
+                transactions: source_transactions,
+                partition_files: source_partition_files,
+            });
         }
         let schema = schema.context("coalesced publication has no input schema")?;
         let counted_files = output
@@ -3914,6 +3999,40 @@ impl DeltaTable {
         if planned_rows != pending_input_rows {
             bail!("coalesced partition preparation did not preserve every input row");
         }
+        let mut partition_file_offsets = BTreeMap::new();
+        let mut next_file_index = 0_usize;
+        for (values, partition) in &output {
+            partition_file_offsets.insert(values.clone(), next_file_index);
+            next_file_index = next_file_index
+                .checked_add(partition.files.len())
+                .context("coalesced output file index overflow")?;
+        }
+        let source_mappings = source_mappings
+            .into_iter()
+            .map(|source| {
+                let transaction_files = source
+                    .transactions
+                    .into_iter()
+                    .map(|(values, (identity, version, stamp))| {
+                        let mut file_indices = source
+                            .partition_files
+                            .iter()
+                            .filter(|(partition, _)| partition == &values)
+                            .filter_map(|(partition, index)| {
+                                partition_file_offsets.get(partition).map(|base| base + index)
+                            })
+                            .collect::<Vec<_>>();
+                        file_indices.sort_unstable();
+                        file_indices.dedup();
+                        (identity, version, stamp, file_indices)
+                    })
+                    .collect();
+                CoalescedPublicationMapping {
+                    source_application_id: source.application_id,
+                    transaction_files,
+                }
+            })
+            .collect::<Vec<_>>();
         if identities.is_empty() && committed_identities.is_empty() {
             bail!("coalesced publications produced no replay identities");
         }
@@ -3963,6 +4082,7 @@ impl DeltaTable {
             staged,
             identities,
             committed_identities,
+            source_mappings,
             preparation_build,
             preparation_sort,
         ))
@@ -4121,7 +4241,7 @@ impl DeltaTable {
 
     #[cfg(test)]
     pub(crate) fn commit_files(&self, files: &[StagedAppend]) -> Result<u64> {
-        self.commit_files_timed(files).map(|(version, _, _, _)| version)
+        self.commit_files_timed(files).map(|(version, _, _, _, _)| version)
     }
 
     pub(crate) fn commit_files_timed(&self, files: &[StagedAppend]) -> TimedCommitResult {
@@ -4158,7 +4278,7 @@ impl DeltaTable {
         groups: &[CoalescedCommitGroup],
     ) -> Result<u64> {
         self.commit_files_inner_timed(files, identity, groups)
-            .map(|(version, _, _, _)| version)
+            .map(|(version, _, _, _, _)| version)
     }
 
     fn commit_files_inner_timed(
@@ -4167,9 +4287,10 @@ impl DeltaTable {
         identity: Option<(&str, i64)>,
         groups: &[CoalescedCommitGroup],
     ) -> TimedCommitResult {
-        let (version, commit_duration, file_observations, outcome) = self.publish_files(files, identity, groups)?;
+        let (version, commit_duration, file_observations, outcome, dispositions) =
+            self.publish_files(files, identity, groups)?;
         self.reclaim_unsubmitted(files);
-        Ok((version, commit_duration, file_observations, outcome))
+        Ok((version, commit_duration, file_observations, outcome, dispositions))
     }
 
     /// After a successful publication call, delete staged files that no commit attempt
@@ -4249,11 +4370,21 @@ impl DeltaTable {
                 if previous == version {
                     self.sync_replayed_local_state(snapshot.version())?;
                     observation.finish("deduplicated");
+                    let skipped_groups = (0..groups.len()).collect();
+                    let skipped_files = (0..files.len()).collect();
                     return Ok((
                         snapshot.version(),
                         None,
                         Vec::new(),
                         crate::commit::CommitOutcome::Deduplicated,
+                        commit_dispositions(
+                            files.len(),
+                            groups,
+                            &skipped_groups,
+                            &skipped_files,
+                            crate::commit::CommitOutcome::Deduplicated,
+                            None,
+                        ),
                     ));
                 }
             }
@@ -4261,11 +4392,12 @@ impl DeltaTable {
             let mut pending_indices = Vec::new();
             let mut identities = std::collections::HashSet::new();
             let mut skipped = std::collections::HashSet::new();
+            let mut skipped_groups = std::collections::HashSet::new();
             let mut group_pending_indices = std::collections::HashSet::new();
             let mut group_transaction_ids = Vec::new();
             let purge_before = snapshot.get_app_id_version(PURGE_WATERMARK, &self.engine)?;
             let mut previous_end = 0;
-            for group in groups {
+            for (group_index, group) in groups.iter().enumerate() {
                 if group.start < previous_end
                     || group.start > group.end
                     || group.end > files.len()
@@ -4298,6 +4430,7 @@ impl DeltaTable {
                 }
                 if committed == group.identities.len() {
                     skipped.extend(group.start..group.end);
+                    skipped_groups.insert(group_index);
                     continue;
                 }
                 for (_, _, stamp) in &group.identities {
@@ -4349,7 +4482,13 @@ impl DeltaTable {
                     crate::commit::CommitOutcome::Deduplicated
                 };
                 observation.finish(if skipped.is_empty() { "noop" } else { "deduplicated" });
-                return Ok((snapshot.version(), None, Vec::new(), outcome));
+                return Ok((
+                    snapshot.version(),
+                    None,
+                    Vec::new(),
+                    outcome,
+                    commit_dispositions(files.len(), groups, &skipped_groups, &skipped, outcome, None),
+                ));
             }
             // Claim before touching the file or any check that can stall, so a concurrent
             // reclaim of the same borrowed stage either already won (refused here) or
@@ -4521,11 +4660,20 @@ impl DeltaTable {
                         table_name.as_deref(),
                     );
                     observation.finish("committed");
+                    let commit_version = commit.commit_version();
                     return Ok((
-                        commit.commit_version(),
+                        commit_version,
                         Some(started.elapsed()),
                         committed_file_observations,
                         crate::commit::CommitOutcome::Committed,
+                        commit_dispositions(
+                            files.len(),
+                            groups,
+                            &skipped_groups,
+                            &skipped,
+                            crate::commit::CommitOutcome::Committed,
+                            Some(commit_version),
+                        ),
                     ));
                 }
                 Ok(CommitResult::Conflicted(_)) => observation.event("conflict"),
@@ -4541,8 +4689,16 @@ impl DeltaTable {
                         return Ok((
                             version,
                             Some(started.elapsed()),
-                            committed_file_observations,
+                            Vec::new(),
                             crate::commit::CommitOutcome::Reconciled,
+                            commit_dispositions(
+                                files.len(),
+                                groups,
+                                &skipped_groups,
+                                &skipped,
+                                crate::commit::CommitOutcome::Reconciled,
+                                None,
+                            ),
                         ));
                     }
                 }
@@ -4554,8 +4710,16 @@ impl DeltaTable {
                         return Ok((
                             version,
                             Some(started.elapsed()),
-                            committed_file_observations,
+                            Vec::new(),
                             crate::commit::CommitOutcome::Reconciled,
+                            commit_dispositions(
+                                files.len(),
+                                groups,
+                                &skipped_groups,
+                                &skipped,
+                                crate::commit::CommitOutcome::Reconciled,
+                                None,
+                            ),
                         ));
                     }
                     return Err(error.into());
@@ -4622,7 +4786,11 @@ fn cleanup_failure_class(error: &anyhow::Error) -> &'static str {
 pub struct AppendResult {
     pub version: u64,
     pub outcome: crate::commit::CommitOutcome,
+    /// Delta version known to contain this publication; absent for replay or reconciliation.
+    pub authoritative_version: Option<u64>,
     pub file: CompletedFile,
+    /// Indices into `file`-group outputs that are newly committed by this receipt.
+    pub committed_file_indices: Vec<usize>,
     pub commit_duration: Option<Duration>,
     pub file_observations: Vec<crate::CompletedFileObservation>,
 }
@@ -5113,12 +5281,15 @@ impl DeltaFileWriter {
         // Kernel is synchronous. This offload is bounded by the caller's open files;
         // the collector uses the dedicated, bounded coordinator instead.
         tokio::task::spawn_blocking(move || {
-            let (version, commit_duration, file_observations, outcome) =
+            let (version, commit_duration, file_observations, outcome, _) =
                 append.table.commit_files_timed(std::slice::from_ref(&append))?;
+            let committed_file_indices = file_observations.iter().map(|(index, _)| *index).collect();
             Ok(AppendResult {
                 version,
                 outcome,
+                authoritative_version: (outcome == crate::commit::CommitOutcome::Committed).then_some(version),
                 file: append.file,
+                committed_file_indices,
                 commit_duration,
                 file_observations: file_observations
                     .into_iter()

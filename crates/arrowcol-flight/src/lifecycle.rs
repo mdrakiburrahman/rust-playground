@@ -29,6 +29,7 @@ pub struct StreamContext {
     actual_fingerprint: SchemaFingerprint,
     deadline: Option<Instant>,
     trusted_client_send_observation: Option<(String, u64)>,
+    audit_logical_publication_id: Option<String>,
 }
 
 impl StreamContext {
@@ -43,6 +44,7 @@ impl StreamContext {
         actual_fingerprint: SchemaFingerprint,
         deadline: Option<Instant>,
         trusted_client_send_observation: Option<(String, u64)>,
+        audit_logical_publication_id: Option<String>,
     ) -> Self {
         Self {
             metadata,
@@ -54,6 +56,7 @@ impl StreamContext {
             actual_fingerprint,
             deadline,
             trusted_client_send_observation,
+            audit_logical_publication_id,
         }
     }
 
@@ -105,6 +108,12 @@ impl StreamContext {
         self.trusted_client_send_observation
             .as_ref()
             .map(|(id, timestamp)| (id.as_str(), *timestamp))
+    }
+
+    /// Returns the optional untrusted benchmark correlation key.
+    #[must_use]
+    pub fn audit_logical_publication_id(&self) -> Option<&str> {
+        self.audit_logical_publication_id.as_deref()
     }
 
     /// Returns the effective stream deadline.

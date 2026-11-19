@@ -48,6 +48,8 @@ type InboundFlightStream = Pin<Box<dyn Stream<Item = Result<FlightData, Status>>
 const CLIENT_SEND_OBSERVATION_ID_HEADER: &str = "x-arrowcol-client-observation-id";
 const CLIENT_SEND_UNIX_NS_HEADER: &str = "x-arrowcol-client-send-unix-ns";
 const MAX_CLIENT_SEND_OBSERVATION_ID_BYTES: usize = 128;
+const LOGICAL_PUBLICATION_ID_HEADER: &str = "x-arrowcol-logical-publication-id";
+const MAX_LOGICAL_PUBLICATION_ID_BYTES: usize = 100;
 
 fn invalid_client_send_observation() -> RuntimeError {
     RuntimeError::new(
@@ -110,6 +112,49 @@ fn trusted_client_send_observation(
 ) -> RuntimeResult<Option<(String, u64)>> {
     let observation = parse_client_send_observation(metadata)?;
     Ok(if trusted_forwarder { observation } else { None })
+}
+
+fn parse_logical_publication_id(metadata: &MetadataMap) -> Option<String> {
+    let mut values = metadata.get_all(LOGICAL_PUBLICATION_ID_HEADER).iter();
+    let value = values.next()?.to_str().ok()?;
+    if values.next().is_some() || !is_valid_logical_publication_id(value) {
+        return None;
+    }
+    Some(value.to_owned())
+}
+
+fn is_valid_logical_publication_id(value: &str) -> bool {
+    if value.len() > MAX_LOGICAL_PUBLICATION_ID_BYTES {
+        return false;
+    }
+    let mut parts = value.split('/');
+    let Some(run_uuid) = parts.next() else { return false };
+    let Some(incarnation_uuid) = parts.next() else {
+        return false;
+    };
+    let Some(worker) = parts.next() else { return false };
+    let Some(sequence) = parts.next() else { return false };
+    if parts.next().is_some() {
+        return false;
+    }
+    let is_simple_uuid = |part: &str| {
+        part.len() == 32
+            && part
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
+    if !is_simple_uuid(run_uuid) || !is_simple_uuid(incarnation_uuid) {
+        return false;
+    }
+    if parse_canonical_u64(worker).is_none() {
+        return false;
+    }
+    !sequence.is_empty()
+        && (sequence.len() == 1 || !sequence.starts_with('0'))
+        && sequence
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'z').contains(&byte))
+        && u64::from_str_radix(sequence, 36).is_ok()
 }
 
 /// Shared Arrow Flight service for direct and dataflow collector binaries.
@@ -283,6 +328,7 @@ impl ArrowColFlightService {
         let metadata = request.metadata().clone();
         let trusted_identity = run_until(deadline, self.trusted_identity_validator.validate(&metadata)).await?;
         let trusted_client_send_observation = trusted_client_send_observation(&metadata, trusted_identity.is_some())?;
+        let audit_logical_publication_id = parse_logical_publication_id(&metadata);
         let authentication = run_until(
             deadline,
             self.authenticator
@@ -313,6 +359,7 @@ impl ArrowColFlightService {
                     deadline,
                     permit,
                     trusted_client_send_observation,
+                    audit_logical_publication_id,
                 )
                 .await
             }
@@ -330,6 +377,7 @@ impl ArrowColFlightService {
         deadline: Instant,
         permit: DrainPermit,
         trusted_client_send_observation: Option<(String, u64)>,
+        audit_logical_publication_id: Option<String>,
     ) -> RuntimeResult<Response<FlightResponseStream<PutResult>>> {
         let descriptor_version = validate_ingest_descriptor(first.flight_descriptor.as_ref(), &metadata)?;
         let received_schema = decode_first_schema(&first, self.limits.max_schema_bytes)?;
@@ -369,6 +417,7 @@ impl ArrowColFlightService {
             actual_fingerprint,
             Some(deadline),
             trusted_client_send_observation,
+            audit_logical_publication_id,
         );
         let (result_sender, result_receiver) = mpsc::channel(self.limits.put_result_channel_capacity);
         let force_stop = self.drain.force_stop_token();
@@ -1310,6 +1359,32 @@ mod tests {
             "124-8-1700000000000000000".parse().expect("duplicate id"),
         );
         assert!(trusted_client_send_observation(&duplicate, true).is_err());
+    }
+
+    #[test]
+    fn logical_publication_id_is_optional_and_invalid_values_are_ignored() {
+        let value = "0123456789abcdef0123456789abcdef/abcdef0123456789abcdef0123456789/42/9ix";
+        let mut metadata = MetadataMap::new();
+        assert_eq!(parse_logical_publication_id(&metadata), None);
+        metadata.insert(LOGICAL_PUBLICATION_ID_HEADER, value.parse().expect("audit id"));
+        assert_eq!(parse_logical_publication_id(&metadata).as_deref(), Some(value));
+        for invalid in [
+            "0123456789ABCDEF0123456789ABCDEF/abcdef0123456789abcdef0123456789/42/9ix",
+            "0123456789abcdef0123456789abcdef/abcdef0123456789abcdef0123456789/042/9ix",
+            "0123456789abcdef0123456789abcdef/abcdef0123456789abcdef0123456789/42/9IX",
+        ] {
+            metadata.insert(
+                LOGICAL_PUBLICATION_ID_HEADER,
+                invalid.parse().expect("invalid audit id"),
+            );
+            assert_eq!(parse_logical_publication_id(&metadata), None);
+        }
+        metadata.insert(LOGICAL_PUBLICATION_ID_HEADER, value.parse().expect("valid audit id"));
+        metadata.append(
+            LOGICAL_PUBLICATION_ID_HEADER,
+            value.parse().expect("duplicate audit id"),
+        );
+        assert_eq!(parse_logical_publication_id(&metadata), None);
     }
 
     /// Scenario: IPC decoding retains many column slices from one shared FlightData body.

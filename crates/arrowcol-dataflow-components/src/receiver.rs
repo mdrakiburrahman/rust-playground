@@ -213,6 +213,7 @@ impl BatchAdmission for DfeAdmission {
         let client_send_observation = context
             .trusted_client_send_observation()
             .map(|(id, timestamp)| (id.to_owned(), timestamp));
+        let audit_logical_publication_id = context.audit_logical_publication_id().map(str::to_owned);
         let envelope = ArrowcolBatchEnvelope {
             publication_id: None,
             ingested_at_ms: None,
@@ -231,6 +232,8 @@ impl BatchAdmission for DfeAdmission {
             metrics: Arc::clone(&self.metrics),
             envelope,
             client_send_observation,
+            audit_logical_publication_id,
+            next_fragment_ordinal: 0,
             permit: Some(permit),
             finished: false,
             durable: self.durable_timeout.map(DurableAdmission::new),
@@ -299,6 +302,8 @@ struct DfeStreamLifecycle {
     metrics: Arc<RuntimeMetrics>,
     envelope: ArrowcolBatchEnvelope,
     client_send_observation: Option<(String, u64)>,
+    audit_logical_publication_id: Option<String>,
+    next_fragment_ordinal: u64,
     permit: Option<OwnedSemaphorePermit>,
     finished: bool,
     durable: Option<DurableAdmission>,
@@ -368,10 +373,28 @@ impl StreamLifecycle for DfeStreamLifecycle {
         let publication_id = arrowcol_protocol::PublicationId::new();
         envelope.publication_id = Some(publication_id);
         envelope.ingested_at_ms = Some(ingested_at_ms);
-        let records = crate::envelope::encode_record_batch_with_trusted_client_observation(
+        let audit_logical_publication = self
+            .audit_logical_publication_id
+            .as_ref()
+            .map(|id| (id.clone(), self.next_fragment_ordinal));
+        let audit_enabled = audit_logical_publication.is_some();
+        let canonical_logical_bytes = if audit_enabled {
+            match arrowcol_flight::canonical_record_batch_logical_bytes(&batch) {
+                Ok(bytes) => Some(bytes),
+                Err(error) => {
+                    tracing::warn!(error = %error, "canonical logical-byte qualification unavailable");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let records = crate::envelope::encode_record_batch_with_audit_correlation(
             envelope,
             batch,
             self.client_send_observation.clone(),
+            audit_logical_publication,
+            canonical_logical_bytes,
         )
         .map_err(|_| RuntimeError::internal())?;
         let correlation_id = self
@@ -411,7 +434,15 @@ impl StreamLifecycle for DfeStreamLifecycle {
                         "DFE downstream admission is unavailable",
                     ),
                 }
-            })
+            })?;
+        if audit_enabled {
+            if self.next_fragment_ordinal == u64::MAX {
+                self.audit_logical_publication_id = None;
+            } else {
+                self.next_fragment_ordinal += 1;
+            }
+        }
+        Ok(())
     }
 
     async fn complete(&mut self, _summary: StreamSummary) -> RuntimeResult<StreamCompletion> {
@@ -1274,6 +1305,8 @@ pub(crate) mod tests {
             metrics: Arc::clone(&metrics),
             envelope,
             client_send_observation: None,
+            audit_logical_publication_id: None,
+            next_fragment_ordinal: 0,
             permit: Some(permit),
             finished: false,
             durable: None,
@@ -1300,6 +1333,8 @@ pub(crate) mod tests {
             metrics,
             envelope,
             client_send_observation: None,
+            audit_logical_publication_id: None,
+            next_fragment_ordinal: 0,
             permit: Some(permit),
             finished: false,
             durable: None,
@@ -1331,6 +1366,8 @@ pub(crate) mod tests {
             metrics: Arc::clone(&metrics),
             envelope,
             client_send_observation: None,
+            audit_logical_publication_id: None,
+            next_fragment_ordinal: 0,
             permit: Some(permit),
             finished: false,
             durable: None,
@@ -1363,6 +1400,8 @@ pub(crate) mod tests {
             metrics: Arc::clone(&metrics),
             envelope,
             client_send_observation: None,
+            audit_logical_publication_id: None,
+            next_fragment_ordinal: 0,
             permit: Some(permit),
             finished: false,
             durable: None,
@@ -1574,6 +1613,8 @@ pub(crate) mod tests {
             metrics: Arc::clone(metrics),
             envelope,
             client_send_observation: None,
+            audit_logical_publication_id: None,
+            next_fragment_ordinal: 0,
             permit: Some(permit),
             finished: false,
             durable: timeout.map(DurableAdmission::new),

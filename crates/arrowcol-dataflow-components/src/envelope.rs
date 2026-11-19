@@ -15,11 +15,12 @@ use serde::{Deserialize, Serialize};
 
 /// Stable representation ID emitted by the Arrow Flight receiver.
 pub const ARROWCOL_FLIGHT_REPRESENTATION_ID: &str = "arrowcol.flight";
-/// Current representation contract version (`arrowcol.flight@1.2`).
+/// Current representation contract version (`arrowcol.flight@1.3`).
 ///
 /// Version 1.1 added the stable collector instance key. Version 1.2 adds
-/// trusted client-send correlation metadata while continuing to decode 1.1.
-pub const ARROWCOL_FLIGHT_REPRESENTATION_VERSION: RepresentationVersion = RepresentationVersion::new(1, 2);
+/// trusted client-send correlation metadata. Version 1.3 adds optional
+/// logical-publication correlation while continuing to decode 1.1 and 1.2.
+pub const ARROWCOL_FLIGHT_REPRESENTATION_VERSION: RepresentationVersion = RepresentationVersion::new(1, 3);
 
 const SCHEMA_ID_PREFIX: &str = "arrowcol.flight.v1:";
 const ROOT_TABLE_ID: u32 = 0;
@@ -73,6 +74,25 @@ struct ArrowcolBatchEnvelopeV1_2 {
     client_send_observation: Option<ClientSendObservation>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct AuditLogicalPublication {
+    id: String,
+    fragment_ordinal: u64,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ArrowcolBatchEnvelopeV1_3 {
+    envelope: ArrowcolBatchEnvelope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    client_send_observation: Option<ClientSendObservation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    audit_logical_publication: Option<AuditLogicalPublication>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    canonical_logical_bytes: Option<u64>,
+}
+
 impl ArrowcolBatchEnvelope {
     /// Validates relationships that are independent of the routing store.
     ///
@@ -105,6 +125,8 @@ pub struct DecodedArrowBatch {
     /// Owned Arrow batch.
     pub batch: RecordBatch,
     client_send_observation: Option<ClientSendObservation>,
+    audit_logical_publication: Option<AuditLogicalPublication>,
+    canonical_logical_bytes: Option<u64>,
 }
 
 impl DecodedArrowBatch {
@@ -119,15 +141,30 @@ impl DecodedArrowBatch {
             )
         })
     }
+
+    /// Returns the optional client correlation and physical fragment ordinal.
+    #[must_use]
+    pub fn audit_logical_publication(&self) -> Option<(&str, u64)> {
+        self.audit_logical_publication
+            .as_ref()
+            .map(|publication| (publication.id.as_str(), publication.fragment_ordinal))
+    }
+
+    /// Returns canonical logical bytes for qualification, when supported.
+    #[must_use]
+    pub const fn canonical_logical_bytes(&self) -> Option<u64> {
+        self.canonical_logical_bytes
+    }
 }
 
 /// Builds the fixed representation identity.
 #[must_use]
 pub fn arrowcol_flight_representation() -> PdataRepresentation {
-    PdataRepresentation::new(
-        PdataRepresentationId::new(ARROWCOL_FLIGHT_REPRESENTATION_ID),
-        ARROWCOL_FLIGHT_REPRESENTATION_VERSION,
-    )
+    representation_for_version(ARROWCOL_FLIGHT_REPRESENTATION_VERSION)
+}
+
+fn representation_for_version(version: RepresentationVersion) -> PdataRepresentation {
+    PdataRepresentation::new(PdataRepresentationId::new(ARROWCOL_FLIGHT_REPRESENTATION_ID), version)
 }
 
 /// Moves one validated Arrow batch into owned pluggable pdata.
@@ -150,10 +187,35 @@ pub(crate) fn encode_record_batch_with_trusted_client_observation(
     batch: RecordBatch,
     observation: Option<(String, u64)>,
 ) -> Result<PdataArrowRecordSet, EnvelopeError> {
+    encode_record_batch_with_audit_correlation(envelope, batch, observation, None, None)
+}
+
+pub(crate) fn encode_record_batch_with_audit_correlation(
+    envelope: ArrowcolBatchEnvelope,
+    batch: RecordBatch,
+    observation: Option<(String, u64)>,
+    audit_logical_publication: Option<(String, u64)>,
+    canonical_logical_bytes: Option<u64>,
+) -> Result<PdataArrowRecordSet, EnvelopeError> {
     envelope.validate()?;
     let rows = batch.num_rows();
     let fingerprint = fingerprint_schema(batch.schema_ref().as_ref());
-    let schema_id = encode_schema_id_v1_2(envelope, observation)?;
+    let (schema_id, representation_version) = if let Some((id, fragment_ordinal)) = audit_logical_publication {
+        (
+            encode_schema_id_v1_3(
+                envelope,
+                observation,
+                Some(AuditLogicalPublication { id, fragment_ordinal }),
+                canonical_logical_bytes,
+            )?,
+            ARROWCOL_FLIGHT_REPRESENTATION_VERSION,
+        )
+    } else {
+        (
+            encode_schema_id_v1_2(envelope, observation)?,
+            RepresentationVersion::new(1, 2),
+        )
+    };
     let table = PdataArrowTable::new(
         ROOT_TABLE_ID,
         schema_id.into(),
@@ -161,8 +223,13 @@ pub(crate) fn encode_record_batch_with_trusted_client_observation(
         batch,
     )
     .map_err(|error| EnvelopeError::Pdata(error.to_string()))?;
-    PdataArrowRecordSet::new(arrowcol_flight_representation(), SignalType::Logs, rows, [table])
-        .map_err(|error| EnvelopeError::Pdata(error.to_string()))
+    PdataArrowRecordSet::new(
+        representation_for_version(representation_version),
+        SignalType::Logs,
+        rows,
+        [table],
+    )
+    .map_err(|error| EnvelopeError::Pdata(error.to_string()))
 }
 
 /// Consumes and validates an Arrowcol pluggable record set.
@@ -176,10 +243,15 @@ pub fn decode_record_set(records: PdataArrowRecordSet) -> Result<Vec<DecodedArro
         PdataRepresentationId::new(ARROWCOL_FLIGHT_REPRESENTATION_ID),
         RepresentationVersion::new(1, 1),
     );
-    if representation != &arrowcol_flight_representation() && representation != &previous_representation {
+    let version_two_representation = representation_for_version(RepresentationVersion::new(1, 2));
+    if representation != &arrowcol_flight_representation()
+        && representation != &version_two_representation
+        && representation != &previous_representation
+    {
         return Err(EnvelopeError::UnsupportedRepresentation(representation.to_string()));
     }
     let legacy_representation = representation == &previous_representation;
+    let version_two_representation = representation == &version_two_representation;
     let (_, _, _, tables) = records.into_parts();
     if tables.is_empty() {
         return Err(EnvelopeError::EmptyRecordSet);
@@ -188,11 +260,15 @@ pub fn decode_record_set(records: PdataArrowRecordSet) -> Result<Vec<DecodedArro
         .into_iter()
         .map(|table| {
             let (table_id, schema_id, expected_fingerprint, batch) = table.into_parts();
-            let (envelope, client_send_observation) = if legacy_representation {
-                (decode_schema_id(&schema_id)?, None)
-            } else {
-                decode_schema_id_v1_2(&schema_id)?
-            };
+            let (envelope, client_send_observation, audit_logical_publication, canonical_logical_bytes) =
+                if legacy_representation {
+                    (decode_schema_id(&schema_id)?, None, None, None)
+                } else if version_two_representation {
+                    let (envelope, observation) = decode_schema_id_v1_2(&schema_id)?;
+                    (envelope, observation, None, None)
+                } else {
+                    decode_schema_id_v1_3(&schema_id)?
+                };
             envelope.validate()?;
             let actual = fingerprint_schema(batch.schema_ref().as_ref());
             if expected_fingerprint.as_bytes() != actual.as_bytes() {
@@ -206,6 +282,8 @@ pub fn decode_record_set(records: PdataArrowRecordSet) -> Result<Vec<DecodedArro
                 envelope,
                 batch,
                 client_send_observation,
+                audit_logical_publication,
+                canonical_logical_bytes,
             })
         })
         .collect()
@@ -233,6 +311,57 @@ fn encode_schema_id_v1_2(
     })
     .map_err(|error| EnvelopeError::InvalidSchemaIdentity(error.to_string()))?;
     Ok(format!("{SCHEMA_ID_PREFIX}{}", URL_SAFE_NO_PAD.encode(encoded)))
+}
+
+fn encode_schema_id_v1_3(
+    envelope: ArrowcolBatchEnvelope,
+    observation: Option<(String, u64)>,
+    audit_logical_publication: Option<AuditLogicalPublication>,
+    canonical_logical_bytes: Option<u64>,
+) -> Result<String, EnvelopeError> {
+    let client_send_observation = observation.map(|(id, send_unix_ns)| ClientSendObservation {
+        id,
+        send_unix_ns,
+        clock_uncertainty_ns: None,
+    });
+    let encoded = serde_json::to_vec(&ArrowcolBatchEnvelopeV1_3 {
+        envelope,
+        client_send_observation,
+        audit_logical_publication,
+        canonical_logical_bytes,
+    })
+    .map_err(|error| EnvelopeError::InvalidSchemaIdentity(error.to_string()))?;
+    Ok(format!("{SCHEMA_ID_PREFIX}{}", URL_SAFE_NO_PAD.encode(encoded)))
+}
+
+fn decode_schema_id_v1_3(
+    schema_id: &PdataSchemaId,
+) -> Result<
+    (
+        ArrowcolBatchEnvelope,
+        Option<ClientSendObservation>,
+        Option<AuditLogicalPublication>,
+        Option<u64>,
+    ),
+    EnvelopeError,
+> {
+    let encoded = schema_id
+        .as_str()
+        .strip_prefix(SCHEMA_ID_PREFIX)
+        .ok_or(EnvelopeError::InvalidSchemaIdentity(
+            "missing Arrowcol schema identity prefix".to_owned(),
+        ))?;
+    let bytes = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|error| EnvelopeError::InvalidSchemaIdentity(error.to_string()))?;
+    let decoded: ArrowcolBatchEnvelopeV1_3 =
+        serde_json::from_slice(&bytes).map_err(|error| EnvelopeError::InvalidSchemaIdentity(error.to_string()))?;
+    Ok((
+        decoded.envelope,
+        decoded.client_send_observation,
+        decoded.audit_logical_publication,
+        decoded.canonical_logical_bytes,
+    ))
 }
 
 fn decode_schema_id_v1_2(
@@ -338,6 +467,8 @@ mod tests {
         let fingerprint = fingerprint_schema(schema.as_ref());
         let schema_id = if version == RepresentationVersion::new(1, 1) {
             encode_schema_id(&envelope())
+        } else if version == RepresentationVersion::new(1, 3) {
+            encode_schema_id_v1_3(envelope(), None, None, None)
         } else {
             encode_schema_id_v1_2(envelope(), None)
         }
@@ -359,10 +490,10 @@ mod tests {
     }
 
     /// Scenario: The receiver labels pdata with the current Arrowcol representation identity.
-    /// Guarantees: The exact wire label is `arrowcol.flight@1.2`, with 1.1 retained as a readable legacy version.
+    /// Guarantees: The latest wire label is `arrowcol.flight@1.3`, with 1.1 and 1.2 retained as readable versions.
     #[test]
-    fn representation_is_version_one_two() {
-        assert_eq!(arrowcol_flight_representation().to_string(), "arrowcol.flight@1.2");
+    fn representation_is_version_one_three() {
+        assert_eq!(arrowcol_flight_representation().to_string(), "arrowcol.flight@1.3");
     }
 
     /// Scenario: An arbitrary generated schema is moved into and out of Arrowcol pdata.
@@ -420,6 +551,34 @@ mod tests {
         assert_eq!(legacy[0].trusted_client_send_observation(), None);
     }
 
+    #[test]
+    fn audit_publication_correlation_round_trips_only_in_v13() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::UInt64, false)]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(UInt64Array::from(vec![1]))]).expect("batch");
+        let key = "0123456789abcdef0123456789abcdef/abcdef0123456789abcdef0123456789/42/9ix";
+        let audited = encode_record_batch_with_audit_correlation(
+            envelope(),
+            batch.clone(),
+            None,
+            Some((key.to_owned(), 3)),
+            Some(12),
+        )
+        .expect("encode audited");
+        assert_eq!(
+            audited.representation(),
+            &representation_for_version(RepresentationVersion::new(1, 3))
+        );
+        let decoded = decode_record_set(audited).expect("decode audited");
+        assert_eq!(decoded[0].audit_logical_publication(), Some((key, 3)));
+        assert_eq!(decoded[0].canonical_logical_bytes(), Some(12));
+
+        let ordinary = encode_record_batch(envelope(), batch).expect("encode ordinary");
+        assert_eq!(
+            ordinary.representation(),
+            &representation_for_version(RepresentationVersion::new(1, 2))
+        );
+    }
+
     /// Scenario: A batch schema changes after an adapter-supplied fingerprint is created.
     /// Guarantees: The exporter rejects the mismatch before any Delta side effect.
     #[test]
@@ -429,7 +588,9 @@ mod tests {
             RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(UInt64Array::from(vec![1]))]).expect("batch");
         let table = PdataArrowTable::new(
             ROOT_TABLE_ID,
-            encode_schema_id_v1_2(envelope(), None).expect("schema id").into(),
+            encode_schema_id_v1_3(envelope(), None, None, None)
+                .expect("schema id")
+                .into(),
             SchemaFingerprint::new([0xAA; 32]),
             batch,
         )
@@ -459,8 +620,14 @@ mod tests {
             1
         );
         assert_eq!(
+            decode_record_set(records_with_version(RepresentationVersion::new(1, 2)))
+                .expect("legacy 1.2")
+                .len(),
+            1
+        );
+        assert_eq!(
             decode_record_set(records_with_version(ARROWCOL_FLIGHT_REPRESENTATION_VERSION))
-                .expect("current 1.2")
+                .expect("current 1.3")
                 .len(),
             1
         );

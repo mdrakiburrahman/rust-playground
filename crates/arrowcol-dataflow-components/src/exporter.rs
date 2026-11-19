@@ -379,6 +379,10 @@ impl DeltaBackend {
             .envelope
             .ingested_at_ms
             .ok_or_else(|| ExportFailure::Transient("ingestion timestamp missing".to_owned()))?;
+        let audit_logical_publication = decoded
+            .audit_logical_publication()
+            .map(|(id, fragment_ordinal)| (id.to_owned(), fragment_ordinal));
+        let canonical_logical_bytes = decoded.canonical_logical_bytes();
         self.metrics.observe_schema_versions(
             &decoded.envelope.table,
             decoded.envelope.source_schema_version,
@@ -413,6 +417,8 @@ impl DeltaBackend {
         queue_permit.send(WorkerCommand::Batch(QueuedBatch {
             publication_id,
             ingested_at_ms,
+            audit_logical_publication,
+            canonical_logical_bytes,
             batch: decoded.batch,
             target_schema_version: decoded.envelope.target_schema_version.get(),
             rows,
@@ -550,6 +556,8 @@ enum WorkerCommand {
 struct QueuedBatch {
     publication_id: arrowcol_protocol::PublicationId,
     ingested_at_ms: arrowcol_protocol::UnixMillis,
+    audit_logical_publication: Option<(String, u64)>,
+    canonical_logical_bytes: Option<u64>,
     batch: arrow_array::RecordBatch,
     target_schema_version: u64,
     rows: u64,
@@ -876,6 +884,64 @@ impl GroupPublisher<'_> {
         }
     }
 
+    fn record_audit_publications(&self, group: &[QueuedBatch], receipt: &arrow_deltalake::commit::GroupAppendResult) {
+        for mapping in &receipt.audit_publications {
+            let Some(entry) = group.iter().find(|entry| {
+                format!("arrowcol.publication.{}", entry.publication_id) == mapping.source_application_id
+            }) else {
+                tracing::error!(
+                    source_application_id = %mapping.source_application_id,
+                    "Delta audit receipt could not be joined to its physical input"
+                );
+                continue;
+            };
+            let Some((logical_publication_id, fragment_ordinal)) = &entry.audit_logical_publication else {
+                continue;
+            };
+            let committed_files = mapping
+                .committed_file_indices
+                .iter()
+                .filter_map(|index| {
+                    receipt.files.get(*index).map(|file| {
+                        let name = file
+                            .path
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        format!("{index}:{name}")
+                    })
+                })
+                .collect::<Vec<_>>();
+            let qualification_state = match (
+                mapping.outcome,
+                mapping.authoritative_version,
+                entry.canonical_logical_bytes,
+            ) {
+                (arrow_deltalake::commit::CommitOutcome::Committed, Some(_), Some(_)) => "committed",
+                (arrow_deltalake::commit::CommitOutcome::Committed, Some(_), None) => "canonical_bytes_unavailable",
+                (arrow_deltalake::commit::CommitOutcome::Deduplicated, _, _) => "deduplicated",
+                (arrow_deltalake::commit::CommitOutcome::Reconciled, _, _) => "unresolved_reconciliation",
+                (arrow_deltalake::commit::CommitOutcome::PartiallyCommitted, _, _) => "partial_commit",
+                (arrow_deltalake::commit::CommitOutcome::Noop, _, _) => "noop",
+                _ => "unresolved",
+            };
+            tracing::info!(
+                logical_publication_id = %logical_publication_id,
+                fragment_ordinal = *fragment_ordinal,
+                physical_publication_id = %entry.publication_id,
+                input_rows = entry.rows,
+                canonical_logical_bytes = ?entry.canonical_logical_bytes,
+                admitted_at_unix_ms = entry.ingested_at_ms.get(),
+                qualification_state,
+                delta_outcome = ?mapping.outcome,
+                authoritative_delta_version = ?mapping.authoritative_version,
+                transaction_files = ?mapping.transaction_files,
+                committed_files = ?committed_files,
+                "Delta logical publication audit receipt"
+            );
+        }
+    }
+
     async fn publish(&mut self, group: &mut Vec<QueuedBatch>, estimator: &mut AdaptiveFileSizeEstimator) {
         while self
             .in_flight
@@ -1112,6 +1178,7 @@ impl GroupPublisher<'_> {
                         }
                     };
                     let committed = commit_result?;
+                    self.record_audit_publications(group, &committed);
                     if let Some(duration) = committed.commit_duration {
                         self.stage_metrics.record(PipelineStage::Commit, duration);
                     }
@@ -1901,6 +1968,8 @@ mod tests {
             let queued = QueuedBatch {
                 publication_id: envelope.publication_id.expect("id"),
                 ingested_at_ms: envelope.ingested_at_ms.expect("stamp"),
+                audit_logical_publication: None,
+                canonical_logical_bytes: None,
                 batch,
                 target_schema_version: envelope.target_schema_version.get(),
                 rows,
