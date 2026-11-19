@@ -2669,7 +2669,9 @@ async fn canonical_publication_accounting(
     messages: &[FlightData],
     expected_rows: u64,
 ) -> Result<CanonicalPublicationAccounting> {
-    let batches = FlightRecordBatchStream::new_from_flight_data(stream::iter(messages.iter().cloned().map(Ok)))
+    #[allow(clippy::unnecessary_to_owned)] // The decoder requires an owned 'static FlightData stream.
+    let owned_messages = messages.to_vec();
+    let batches = FlightRecordBatchStream::new_from_flight_data(stream::iter(owned_messages.into_iter().map(Ok)))
         .try_collect::<Vec<_>>()
         .await?;
     let decoded_rows = batches.iter().try_fold(0_u64, |total, batch| {
