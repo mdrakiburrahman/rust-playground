@@ -2315,6 +2315,7 @@ pub struct DeltaTable {
     snapshot_cache: Mutex<Option<CachedSnapshot>>,
     layout_readback: Mutex<Option<LayoutReadback>>,
     reuse_snapshots: bool,
+    publication_lookup_mode: crate::commit::PublicationLookupMode,
     publication_fence: Option<Arc<dyn PublicationFence>>,
 }
 
@@ -2831,6 +2832,31 @@ impl DeltaTable {
         }
     }
 
+    /// Open a local table with the selected transaction lookup implementation.
+    pub(crate) fn open_with_lookup_mode(
+        root: impl AsRef<Path>,
+        mode: crate::commit::PublicationLookupMode,
+    ) -> Result<Arc<Self>> {
+        let mut table = Self::open(root)?;
+        Arc::get_mut(&mut table)
+            .context("new Delta writer unexpectedly shared")?
+            .publication_lookup_mode = mode;
+        Ok(table)
+    }
+
+    /// Open a local or ADLS table with the selected transaction lookup implementation.
+    pub(crate) fn open_uri_with_fence_and_lookup_mode(
+        root: &str,
+        publication_fence: Arc<dyn PublicationFence>,
+        mode: crate::commit::PublicationLookupMode,
+    ) -> Result<Arc<Self>> {
+        let mut table = Self::open_uri_with_fence(root, publication_fence)?;
+        Arc::get_mut(&mut table)
+            .context("new Delta writer unexpectedly shared")?
+            .publication_lookup_mode = mode;
+        Ok(table)
+    }
+
     pub(crate) fn open_connection(
         url: Url,
         partition_columns: Vec<String>,
@@ -2904,6 +2930,7 @@ impl DeltaTable {
             snapshot_cache: Mutex::new(None),
             layout_readback: Mutex::new(None),
             reuse_snapshots: false,
+            publication_lookup_mode: crate::commit::PublicationLookupMode::default(),
             publication_fence,
             session,
             bootstrap_only,
@@ -2931,6 +2958,32 @@ impl DeltaTable {
         Ok(())
     }
 
+    pub(crate) fn lookup_app_id_versions(
+        &self,
+        snapshot: &Snapshot,
+        application_ids: impl IntoIterator<Item = &str>,
+    ) -> Result<HashMap<String, Option<i64>>> {
+        let mut seen = std::collections::HashSet::new();
+        let ids = application_ids
+            .into_iter()
+            .filter(|id| seen.insert(*id))
+            .collect::<Vec<_>>();
+        match self.publication_lookup_mode {
+            crate::commit::PublicationLookupMode::Batched => {
+                Ok(
+                    crate::publication_lookup::get_app_id_versions(&snapshot, &self.engine, ids)?
+                        .into_iter()
+                        .map(|(id, version)| (id.to_owned(), version))
+                        .collect(),
+                )
+            }
+            crate::commit::PublicationLookupMode::Scalar => ids
+                .into_iter()
+                .map(|id| Ok((id.to_owned(), snapshot.get_app_id_version(id, &self.engine)?)))
+                .collect(),
+        }
+    }
+
     /// Resolve an application transaction from Kernel replay, including checkpoints.
     ///
     /// # Errors
@@ -2938,7 +2991,11 @@ impl DeltaTable {
     pub fn lookup_txn(&self, app_id: &str) -> Result<Option<i64>> {
         let snapshot = self.snapshot()?;
         Self::validate_retention(&snapshot)?;
-        Ok(snapshot.get_app_id_version(app_id, &self.engine)?)
+        Ok(self
+            .lookup_app_id_versions(&snapshot, [app_id])?
+            .get(app_id)
+            .copied()
+            .flatten())
     }
 
     /// Return whether each exact logical publication ID/version is already committed.
@@ -2955,11 +3012,8 @@ impl DeltaTable {
                 bail!("duplicate application identity in publication lookup");
             }
         }
-        let versions = crate::publication_lookup::get_app_id_versions(
-            &snapshot,
-            &self.engine,
-            publications.iter().map(|(app_id, _)| app_id.as_str()),
-        )?;
+        let versions =
+            self.lookup_app_id_versions(&snapshot, publications.iter().map(|(app_id, _)| app_id.as_str()))?;
         publications
             .iter()
             .map(|(app_id, version)| {
@@ -3203,6 +3257,7 @@ impl DeltaTable {
             snapshot_cache: Mutex::new(None),
             layout_readback: Mutex::new(None),
             reuse_snapshots,
+            publication_lookup_mode: crate::commit::PublicationLookupMode::default(),
             publication_fence,
             session: None,
             bootstrap_only: false,
@@ -3293,9 +3348,7 @@ impl DeltaTable {
         // still cover all history; a newly appearing checkpoint forces full loading.
         // No pinned version or connector-supplied freshness is used.
         let snapshot = match &base {
-            Some(base) => Snapshot::builder_from(Arc::clone(&base.snapshot))
-                .skip_new_checkpoints()
-                .build(&self.engine)?,
+            Some(base) => Snapshot::builder_from(Arc::clone(&base.snapshot)).build(&self.engine)?,
             None => full_build()?,
         };
         let after = self.log_fingerprints()?;
@@ -3777,18 +3830,12 @@ impl DeltaTable {
         }
         let granularity = resolved.text("arrowcol.partition.granularity")?.to_owned();
         let partitioned_ingestion = partitions.iter().any(|name| name == INGESTION_PARTITION);
-        let mut identities = Vec::with_capacity(entries.len());
-        let mut committed_identities = Vec::with_capacity(entries.len());
         let mut unique = std::collections::HashSet::with_capacity(entries.len());
         let mut schema: Option<SchemaRef> = None;
-        let mut output: BTreeMap<crate::partition::PartitionValues, CoalescedPartitionOutput> = BTreeMap::new();
-        let mut planned_files = 0_usize;
-        let mut pending_input_rows = 0_usize;
-        let mut source_mappings = Vec::with_capacity(entries.len());
+        let mut prepared_entries = Vec::with_capacity(entries.len());
+        let mut requested_ids = Vec::new();
         for (mut batch, app_id, version, stamp) in entries {
             let source_application_id = app_id.clone();
-            let mut source_transactions = Vec::new();
-            let mut source_partition_files = std::collections::BTreeSet::new();
             validate_transaction_id(&app_id, version)?;
             if stamp < 0 || !unique.insert(app_id.clone()) {
                 bail!("invalid or duplicate coalesced publication identity");
@@ -3825,7 +3872,6 @@ impl DeltaTable {
             }
             let batch_rows = batch.num_rows();
             let mut partition_identities = BTreeMap::new();
-            let mut new_partition_files = 0_usize;
             let splits = {
                 let mut register_partition = |values: &crate::partition::PartitionValues| -> Result<()> {
                     if let Some(expected) = &expected_ingestion
@@ -3839,32 +3885,7 @@ impl DeltaTable {
                     } else {
                         crate::partition::publication_id(&app_id, values, identity_schema.as_ref())?
                     };
-                    let previous = snapshot
-                        .as_ref()
-                        .map(|snapshot| snapshot.get_app_id_version(&identity, &self.engine))
-                        .transpose()?
-                        .flatten();
-                    if let Some(previous) = previous
-                        && previous > version
-                    {
-                        bail!("publication transaction fenced by newer application version");
-                    }
-                    if previous != Some(version) && !output.contains_key(values) {
-                        let required_files = planned_files
-                            .checked_add(new_partition_files)
-                            .and_then(|files| files.checked_add(1))
-                            .context("coalesced output file count overflow")?;
-                        if required_files > max_files {
-                            return Err(anyhow::Error::new(CoalescedGroupCapacityExceeded {
-                                required_files,
-                                max_files,
-                            }));
-                        }
-                        new_partition_files = new_partition_files
-                            .checked_add(1)
-                            .context("coalesced output file count overflow")?;
-                    }
-                    partition_identities.insert(values.clone(), (identity, previous));
+                    partition_identities.insert(values.clone(), identity);
                     Ok(())
                 };
                 if partitions.is_empty() {
@@ -3878,10 +3899,79 @@ impl DeltaTable {
             if splits.is_empty() && batch_rows == 0 && !partitions.is_empty() {
                 bail!("empty custom-partitioned publications must use the existing progress path");
             }
-            for (batch, values) in splits {
-                let (identity, previous) = partition_identities
-                    .remove(&values)
-                    .context("coalesced partition identity was not prepared")?;
+            let splits = splits
+                .into_iter()
+                .map(|(batch, values)| {
+                    let identity = partition_identities
+                        .remove(&values)
+                        .context("coalesced partition identity was not prepared")?;
+                    requested_ids.push(identity.clone());
+                    Ok((batch, values, identity))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            prepared_entries.push((source_application_id, version, stamp, batch_rows, splits));
+        }
+        let previous_by_id = if let Some(snapshot) = snapshot.as_ref() {
+            self.lookup_app_id_versions(snapshot, requested_ids)?
+        } else {
+            HashMap::new()
+        };
+        let mut identities = Vec::with_capacity(prepared_entries.len());
+        let mut committed_identities = Vec::with_capacity(prepared_entries.len());
+        let mut output: BTreeMap<crate::partition::PartitionValues, CoalescedPartitionOutput> = BTreeMap::new();
+        let mut planned_files = 0_usize;
+        let mut pending_input_rows = 0_usize;
+        let mut source_mappings = Vec::with_capacity(prepared_entries.len());
+        for (source_application_id, version, stamp, batch_rows, splits) in prepared_entries {
+            let mut source_transactions = Vec::new();
+            let mut source_partition_files = std::collections::BTreeSet::new();
+            let mut new_partition_files = 0_usize;
+            for (batch, values, identity) in splits {
+                let previous = previous_by_id.get(&identity).copied().flatten();
+                if let Some(previous) = previous
+                    && previous > version
+                {
+                    bail!("publication transaction fenced by newer application version");
+                }
+                if previous != Some(version) && !output.contains_key(&values) {
+                    let required_files = planned_files
+                        .checked_add(new_partition_files)
+                        .and_then(|files| files.checked_add(1))
+                        .context("coalesced output file count overflow")?;
+                    if required_files > max_files {
+                        return Err(anyhow::Error::new(CoalescedGroupCapacityExceeded {
+                            required_files,
+                            max_files,
+                        }));
+                    }
+                    new_partition_files = new_partition_files
+                        .checked_add(1)
+                        .context("coalesced output file count overflow")?;
+                }
+                let transaction_identity = (identity.clone(), version, stamp);
+                source_transactions.push((values.clone(), transaction_identity.clone()));
+                if let Some(previous) = previous
+                    && previous == version
+                {
+                    committed_identities.push(transaction_identity);
+                    continue;
+                }
+                identities.push(transaction_identity);
+                pending_input_rows = pending_input_rows
+                    .checked_add(batch.num_rows())
+                    .context("coalesced input row count overflow")?;
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+                let partition = output
+                    .entry(values.clone())
+                    .or_insert_with(|| CoalescedPartitionOutput {
+                        values: values.clone(),
+                        files: Vec::new(),
+                        file_rows: Vec::new(),
+                        file_bytes: Vec::new(),
+                    });
+
                 let transaction_identity = (identity.clone(), version, stamp);
                 source_transactions.push((values.clone(), transaction_identity.clone()));
                 if let Some(previous) = previous
@@ -4379,8 +4469,23 @@ impl DeltaTable {
             self.check_publication()?;
             let snapshot = self.snapshot()?;
             Self::validate_retention(&snapshot)?;
+            let mut requested_ids = vec![PURGE_WATERMARK];
+            if let Some((app_id, _)) = identity {
+                requested_ids.push(app_id);
+            }
+            requested_ids.extend(
+                groups
+                    .iter()
+                    .flat_map(|group| group.identities.iter().map(|(app_id, _, _)| app_id.as_str())),
+            );
+            requested_ids.extend(
+                files
+                    .iter()
+                    .filter_map(|append| append.publication.as_ref().map(|(app_id, _)| app_id.as_str())),
+            );
+            let previous_by_id = self.lookup_app_id_versions(&snapshot, requested_ids)?;
             if let Some((app_id, version)) = identity
-                && let Some(previous) = snapshot.get_app_id_version(app_id, &self.engine)?
+                && let Some(previous) = previous_by_id.get(app_id).copied().flatten()
             {
                 if previous > version {
                     bail!("publication transaction fenced by newer application version");
@@ -4413,7 +4518,7 @@ impl DeltaTable {
             let mut skipped_groups = std::collections::HashSet::new();
             let mut group_pending_indices = std::collections::HashSet::new();
             let mut group_transaction_ids = Vec::new();
-            let purge_before = snapshot.get_app_id_version(PURGE_WATERMARK, &self.engine)?;
+            let purge_before = previous_by_id.get(PURGE_WATERMARK).copied().flatten();
             let mut previous_end = 0;
             for (group_index, group) in groups.iter().enumerate() {
                 if group.start < previous_end
@@ -4431,7 +4536,7 @@ impl DeltaTable {
                     if *stamp < 0 || !group_ids.insert(app_id.as_str()) {
                         bail!("invalid or duplicate coalesced publication identity");
                     }
-                    if let Some(previous) = snapshot.get_app_id_version(app_id, &self.engine)? {
+                    if let Some(previous) = previous_by_id.get(app_id).copied().flatten() {
                         if previous > *version {
                             bail!("publication transaction fenced by newer application version");
                         }
@@ -4474,7 +4579,7 @@ impl DeltaTable {
                     if !identities.insert(app_id.as_str()) {
                         bail!("duplicate application identity in commit");
                     }
-                    if let Some(previous) = snapshot.get_app_id_version(app_id, &self.engine)? {
+                    if let Some(previous) = previous_by_id.get(app_id).copied().flatten() {
                         if previous > *version {
                             bail!("publication transaction fenced by newer application version");
                         }
@@ -4627,11 +4732,12 @@ impl DeltaTable {
                 if let Some(id) = identity {
                     ids.push((id.0, id.1, false));
                 }
+                let latest_versions = self.lookup_app_id_versions(&latest, ids.iter().map(|(id, _, _)| *id))?;
                 let mut group_committed = 0;
                 let group_total = group_transaction_ids.len();
                 let mut all_committed = true;
                 for (id, version, is_group) in ids {
-                    match latest.get_app_id_version(id, &self.engine)? {
+                    match latest_versions.get(id).copied().flatten() {
                         Some(previous) if previous > version => {
                             bail!("publication transaction fenced by newer application version")
                         }

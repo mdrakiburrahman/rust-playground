@@ -742,12 +742,13 @@ fn run_worker(
     publication_fence: Option<Arc<dyn PublicationFence>>,
 ) {
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build();
+    let lookup_mode = options.publication_lookup_mode;
     let table = publication_fence.map_or_else(
-        || DeltaTable::open(root),
+        || DeltaTable::open_with_lookup_mode(root, lookup_mode),
         |publication_fence| {
             root.to_str()
                 .context("invalid table URI")
-                .and_then(|root| DeltaTable::open_uri_with_fence(root, publication_fence))
+                .and_then(|root| DeltaTable::open_uri_with_fence_and_lookup_mode(root, publication_fence, lookup_mode))
         },
     );
     let mut failure = table
