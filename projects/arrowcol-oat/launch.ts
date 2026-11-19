@@ -520,7 +520,7 @@ function isLocalOatServerUrl(value: string): boolean {
 
 
 type AksDispositionApproval = Readonly<{
-  kind: 'legacy' | 'observed-failed-preload-aks';
+  kind: 'legacy' | 'observed-failed-preload-aks' | 'aborted-post-load-aks';
   invocationId: string;
   receiptSha256: string;
   evidenceSha256: string;
@@ -693,6 +693,80 @@ function validateObservedAksDisposition(original: Buffer, evidence: Buffer, appr
   };
 }
 
+function validateAbortedPostLoadAksDisposition(original: Buffer, evidence: Buffer, approval: AksDispositionApproval) {
+  if (sha256Bytes(original) !== approval.receiptSha256 || sha256Bytes(evidence) !== approval.evidenceSha256) {
+    throw new Error('Post-load AKS disposition does not match the reviewed receipt and evidence digests');
+  }
+  const receipt: unknown = JSON.parse(original.toString('utf8'));
+  const proof: unknown = JSON.parse(evidence.toString('utf8'));
+  if (!isLauncherDeadlineReceipt(receipt) || receipt.invocation_id !== approval.invocationId ||
+      receipt.creation_state !== 'accepted' || receipt.run_state !== 'failed' || receipt.cleanup_state !== 'unsettled' ||
+      receipt.config_binding_error !== null || receipt.terminal_observation != null ||
+      receipt.server_pid != null || receipt.server_start_ticks != null || receipt.server_executable != null ||
+      submittedPlatform(receipt.submitted_config_body) !== 'aks' || !isLegacyUuid(receipt.run_id) ||
+      !receipt.server_url || !isLocalOatServerUrl(receipt.server_url) ||
+      !isLegacyIdentity(receipt.error) || !isLegacyTime(receipt.started_at_unix_ms) ||
+      !isRecord(proof) || proof.schema_version !== 1 || proof.kind !== approval.kind ||
+      proof.disposition !== 'aborted-post-load-cleanup-verified-unranked' ||
+      proof.invocation_id !== receipt.invocation_id || proof.controller_run_id !== receipt.run_id ||
+      proof.original_receipt_sha256 !== approval.receiptSha256 ||
+      proof.source_config_sha256 !== receipt.source_config_sha256 ||
+      proof.submitted_config_sha256 !== receipt.submitted_config_sha256 ||
+      proof.original_error !== receipt.error || proof.server_url !== receipt.server_url ||
+      proof.load_started !== true || proof.result_artifact !== 'retained-unranked' ||
+      !isLegacySha(proof.verifier_sha256) || !isLegacySha(proof.runner_source_sha256)) {
+    throw new Error('Post-load AKS disposition is not bound to the exact failed invocation and original evidence');
+  }
+  const fence = proof.writer_fence;
+  const cell = proof.cell;
+  const pools = proof.pools;
+  const cluster = proof.cluster;
+  const hashes = proof.raw_observation_sha256;
+  const userPools: unknown[] = isRecord(pools) && Array.isArray(pools.user_pools) ? pools.user_pools : [];
+  if (!isRecord(fence) || !isLegacyUuid(fence.boot_id) || !isLegacyIdentity(fence.pid_namespace) ||
+      !isLegacyIdentity(fence.net_namespace) || !isRecord(fence.launcher) || !isRecord(fence.server) ||
+      !isLegacyTime(fence.launcher.pid) || !isLegacyTime(fence.server.pid) ||
+      fence.launcher.pid === fence.server.pid || !isLegacyIdentity(fence.server.start_ticks) ||
+      !/^[1-9][0-9]*$/.test(fence.server.start_ticks) ||
+      !isLegacyIdentity(fence.launcher.executable) || !isLegacyIdentity(fence.server.executable) ||
+      !isLegacyTime(fence.fenced_at_unix_ms) || fence.fenced_at_unix_ms < receipt.started_at_unix_ms ||
+      !isRecord(cell) || !isLegacyUuid(cell.id) || !isLegacyUuid(cell.namespace_uid) ||
+      cell.namespace !== 'arrow-collector-' + cell.id.replaceAll('-', '') ||
+      cell.namespace_absent !== true || cell.namespace_uid_absent !== true ||
+      cell.workload_delete_succeeded !== true || cell.qap !== 'cleaned' ||
+      cell.run_fic_id !== 'arrowcol-run-' + cell.id || cell.run_fic_absent !== true ||
+      !isLegacyIdentity(cell.native_fic_id) || cell.native_fic_id === cell.run_fic_id || cell.native_fic_present !== true ||
+      !isLegacyTime(cell.namespace_observed_at_unix_ms) || cell.namespace_observed_at_unix_ms < fence.fenced_at_unix_ms ||
+      !isLegacyTime(cell.fic_observed_at_unix_ms) || cell.fic_observed_at_unix_ms < fence.fenced_at_unix_ms ||
+      !isLegacyTime(cell.qap_observed_at_unix_ms) || cell.qap_observed_at_unix_ms < receipt.started_at_unix_ms ||
+      !isRecord(cluster) || !isLegacySha(cluster.stamp_config_sha256) ||
+      !isLegacyIdentity(cluster.stock_aks_id) || cluster.arm_aks_id !== cluster.stock_aks_id ||
+      !isLegacyIdentity(cluster.stock_api_server) || cluster.current_api_server !== cluster.stock_api_server ||
+      !isRecord(pools) || pools.all_user_pools_inventoried !== true || !Array.isArray(pools.user_pools) ||
+      !Array.isArray(pools.stamp_user_pool_names) || pools.stamp_user_pool_names.length !== pools.user_pools.length ||
+      !pools.stamp_user_pool_names.every(isLegacyIdentity) ||
+      pools.user_pools.length === 0 || !isLegacyTime(pools.observed_at_unix_ms) ||
+      pools.observed_at_unix_ms < fence.fenced_at_unix_ms ||
+      !userPools.every((pool: unknown) => isRecord(pool) && isLegacyIdentity(pool.name) &&
+        pool.arm_count === 0 && pool.arm_min_count === 0 && pool.kubernetes_node_count === 0) ||
+      new Set(userPools.map((pool) => isRecord(pool) && typeof pool.name === 'string' ? pool.name.toLowerCase() : '')).size !== pools.user_pools.length ||
+      new Set(pools.stamp_user_pool_names.map((name: string) => name.toLowerCase())).size !== pools.user_pools.length ||
+      !pools.stamp_user_pool_names.every((name: string) => userPools.some(
+        (pool) => isRecord(pool) && typeof pool.name === 'string' && pool.name.toLowerCase() === name.toLowerCase())) ||
+      !isRecord(hashes) || !['load_trace', 'controller_identity', 'process_exit', 'workload_stop',
+        'namespace_get', 'qap_cleanup', 'fic_cleanup', 'fic_inventory', 'cluster_inventory', 'pool_inventory', 'node_inventory']
+        .every((name) => isLegacySha(hashes[name]))) {
+    throw new Error('Post-load AKS disposition lacks coherent writer, cell, QAP, FIC, or pool custody evidence');
+  }
+  return {
+    bootId: fence.boot_id, pidNamespace: fence.pid_namespace, netNamespace: fence.net_namespace,
+    launcherPid: fence.launcher.pid, serverPid: fence.server.pid, serverStartTicks: fence.server.start_ticks,
+    serverUrl: receipt.server_url, namespaceObserved: cell.namespace_observed_at_unix_ms,
+    ficObserved: cell.fic_observed_at_unix_ms, poolObserved: pools.observed_at_unix_ms,
+    fencedAt: fence.fenced_at_unix_ms,
+  };
+}
+
 function findAksDispositionApproval(approvals: readonly AksDispositionApproval[], invocationId: string) {
   if (!isLegacyUuid(invocationId)) return undefined;
   const matching = approvals.filter((approval) => approval.invocationId === invocationId);
@@ -703,6 +777,7 @@ function validateAksDisposition(original: Buffer, evidence: Buffer, approval: Ak
   switch (approval.kind) {
     case 'legacy': return { kind: approval.kind, ...validateLegacyAksDisposition(original, evidence, approval) } as const;
     case 'observed-failed-preload-aks': return { kind: approval.kind, ...validateObservedAksDisposition(original, evidence, approval) } as const;
+    case 'aborted-post-load-aks': return { kind: approval.kind, ...validateAbortedPostLoadAksDisposition(original, evidence, approval) } as const;
     default: throw new Error('Unrecognized AKS disposition kind');
   }
 }
@@ -779,7 +854,10 @@ export async function recordLegacyAksDisposition(
     return;
   }
   const now = Date.now();
-  const current = proof.kind === 'observed-failed-preload-aks'
+  const current = proof.kind === 'aborted-post-load-aks'
+    ? [proof.fencedAt, proof.namespaceObserved, proof.ficObserved, proof.poolObserved]
+      .every((time) => time <= now && now - time <= 30 * 60_000)
+    : proof.kind === 'observed-failed-preload-aks'
     ? now - proof.fencedAt <= 4 * 60 * 60_000 && Math.max(proof.namespaceObserved, proof.ficObserved, proof.storageObserved) <= now
     : [proof.namespaceObserved, proof.ficObserved].every((time) => time <= now && now - time <= 30 * 60_000);
   if (!current) {
