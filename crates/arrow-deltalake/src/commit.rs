@@ -7,7 +7,6 @@ use crate::delta::{
 use anyhow::{Context, Result, bail};
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
-use delta_kernel_default_engine::executor::TaskExecutor;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};

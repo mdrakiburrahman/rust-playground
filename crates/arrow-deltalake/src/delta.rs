@@ -1063,6 +1063,7 @@ mod io_tests {
         lose_commit_response: bool,
         fail_commit_reads: bool,
         commit_written: std::sync::atomic::AtomicBool,
+        coalesced_gate: Option<tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<bool>>>,
     }
 
     impl std::fmt::Display for PausedStagePut {
@@ -1079,6 +1080,32 @@ mod io_tests {
             payload: object_store::PutPayload,
             options: object_store::PutOptions,
         ) -> object_store::Result<object_store::PutResult> {
+            if let Some(gate) = &self.coalesced_gate {
+                if path.as_ref().ends_with(".parquet") {
+                    let (finish, outcome) = tokio::sync::oneshot::channel();
+                    gate.send(finish).map_err(|error| object_store::Error::Generic {
+                        store: "coalesced upload admission",
+                        source: error.into(),
+                    })?;
+                    let permitted = tokio::time::timeout(Duration::from_secs(30), outcome)
+                        .await
+                        .map_err(|error| object_store::Error::Generic {
+                            store: "coalesced upload deadline",
+                            source: error.into(),
+                        })?
+                        .map_err(|error| object_store::Error::Generic {
+                            store: "coalesced upload cancellation",
+                            source: error.into(),
+                        })?;
+                    if !permitted {
+                        return Err(object_store::Error::PermissionDenied {
+                            path: path.to_string(),
+                            source: "injected coalesced upload failure".into(),
+                        });
+                    }
+                }
+                return self.inner.put_opts(path, payload, options).await;
+            }
             if self.lose_commit_response {
                 let result = self.inner.put_opts(path, payload, options).await?;
                 if path.as_ref().ends_with("00000000000000000001.json") {
@@ -1359,6 +1386,159 @@ mod io_tests {
 
         assert!(format!("{error:#}").contains("start completed Parquet multipart upload"));
         assert_eq!(store.multipart_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn coalesced_files_release_cpu_preserve_order_and_drain_failed_groups() -> Result<()> {
+        use futures::TryStreamExt;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let _fixture = CLOUD_STAGE_FIXTURE.lock().await;
+        for fail in [false, true] {
+            let (gate, mut entered) = tokio::sync::mpsc::unbounded_channel();
+            let store = Arc::new(PausedStagePut {
+                coalesced_gate: Some(gate),
+                ..Default::default()
+            });
+            let (table, _) = remote_snapshot_fixture_with_store(None, Arc::<PausedStagePut>::clone(&store)).await?;
+            let properties = [
+                ("arrowcol.layout.enabled", "true"),
+                ("arrowcol.layout.maxRows", "1"),
+                ("arrowcol.layout.rowGroupRows", "1"),
+                ("arrowcol.layout.pageRows", "1"),
+                ("arrowcol.layout.sortColumns", "id"),
+            ]
+            .into_iter()
+            .map(|(key, value)| (key.to_owned(), value.to_owned()))
+            .collect();
+            table.commit_catalog(
+                Some(table.version()?),
+                input_batch()?.schema(),
+                Vec::new(),
+                properties,
+                None,
+            )?;
+            let version = table.version()?;
+            let entries = (0..4)
+                .map(|index| {
+                    Ok((
+                        RecordBatch::try_new(
+                            input_batch()?.schema(),
+                            vec![Arc::new(arrow::array::Int32Array::from(vec![index]))],
+                        )?,
+                        format!("file-{index}"),
+                        0,
+                        10,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let staging = Arc::clone(&table);
+            let concurrency = if fail { 2 } else { 4 };
+            let mut task =
+                tokio::spawn(async move { staging.stage_coalesced_publications(entries, 4, concurrency).await });
+            let mut releases = Vec::new();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                for _ in 0..concurrency {
+                    releases.push(entered.recv().await.context("missing coalesced upload")?);
+                }
+                Ok::<_, anyhow::Error>(())
+            })
+            .await
+            .context("files did not reach independent uploads")??;
+            if fail {
+                releases
+                    .pop()
+                    .context("missing failing upload")?
+                    .send(false)
+                    .map_err(|_| anyhow::anyhow!("failing upload exited before its release"))?;
+                tokio::select! {
+                    _ = &mut task => bail!("group returned before draining its other upload"),
+                    () = tokio::time::sleep(Duration::from_millis(25)) => {}
+                }
+            } else {
+                let workers = runtime_config()?.cpu_workers;
+                let active = Arc::new(AtomicUsize::new(0));
+                let release = Arc::new(AtomicBool::new(false));
+                let probes = tokio::spawn(futures::future::join_all((0..workers).map(|_| {
+                    let active = Arc::clone(&active);
+                    let release = Arc::clone(&release);
+                    crate::delta_io::run_cpu_async(move || {
+                        active.fetch_add(1, Ordering::SeqCst);
+                        let deadline = Instant::now() + Duration::from_secs(10);
+                        while !release.load(Ordering::SeqCst) && Instant::now() < deadline {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                    })
+                })));
+                let available = tokio::time::timeout(Duration::from_secs(5), async {
+                    while active.load(Ordering::SeqCst) != workers {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                })
+                .await;
+                release.store(true, Ordering::SeqCst);
+                for probe in probes.await? {
+                    probe?;
+                }
+                available.context("pending uploads retained encoding workers")?;
+            }
+            for release in releases.into_iter().rev() {
+                release
+                    .send(true)
+                    .map_err(|_| anyhow::anyhow!("upload exited before its release"))?;
+            }
+            let result = tokio::time::timeout(Duration::from_secs(10), task).await??;
+            if fail {
+                let error = result.err().context("failed group succeeded")?;
+                assert!(format!("{error:#}").contains("injected coalesced upload failure"));
+                assert!(entered.try_recv().is_err(), "new files started after the first failure");
+                assert_eq!(table.version()?, version);
+                assert!(
+                    store
+                        .inner
+                        .list(None)
+                        .try_collect::<Vec<_>>()
+                        .await?
+                        .iter()
+                        .all(|object| !object.location.as_ref().ends_with(".parquet")),
+                    "successful unsubmitted uploads were not reclaimed"
+                );
+            } else {
+                let (files, identities, replay, mappings, _, _) = result?;
+                assert!(replay.is_empty());
+                assert_eq!(files.len(), 4);
+                for (index, file) in files.iter().enumerate() {
+                    let mut reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+                        File::open(&file.file.path)?,
+                    )?
+                    .build()?;
+                    let batch = reader.next().context("missing file row")??;
+                    let ids = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<arrow::array::Int32Array>()
+                        .context("id array")?;
+                    assert_eq!(ids.values().as_ref(), &[i32::try_from(index)?]);
+                    assert_eq!(mappings[index].transaction_files[0].3, [index]);
+                }
+                let committed = table.commit_files_with_groups_timed(
+                    &files,
+                    &[CoalescedCommitGroup {
+                        start: 0,
+                        end: files.len(),
+                        reply_index: 0,
+                        identities,
+                    }],
+                )?;
+                assert_eq!(committed.0, version + 1);
+            }
+            table
+                .session
+                .as_ref()
+                .context("fixture publisher")?
+                .close_after_drain_async()
+                .await?;
+        }
         Ok(())
     }
 
@@ -4379,9 +4559,25 @@ impl DeltaTable {
         anyhow::ensure!((1..=256).contains(&concurrency), "invalid coalesced file concurrency");
         let table = Arc::clone(self);
         let prepared = shared_executor()?
-            .spawn_blocking(move || table.prepare_coalesced_publications(entries, max_files))
+            .spawn_blocking(move || {
+                #[cfg(test)]
+                {
+                    crate::partition::MATERIALIZATIONS.set(0);
+                    let result = table.prepare_coalesced_publications(entries, max_files);
+                    (result, crate::partition::MATERIALIZATIONS.get())
+                }
+                #[cfg(not(test))]
+                table.prepare_coalesced_publications(entries, max_files)
+            })
             .await
-            .context("coalesced preparation worker failed")??;
+            .context("coalesced preparation worker failed")?;
+        #[cfg(test)]
+        let prepared = {
+            // Preserve the actual materialization counter across the blocking boundary.
+            crate::partition::MATERIALIZATIONS.set(crate::partition::MATERIALIZATIONS.get() + prepared.1);
+            prepared.0
+        };
+        let prepared = prepared?;
         let mut files = prepared.files.into_iter();
         let mut pending = FuturesUnordered::new();
         for file in files.by_ref().take(concurrency) {

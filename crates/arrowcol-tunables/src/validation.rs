@@ -2152,14 +2152,14 @@ mod tests {
     #[test]
     fn pipeline_depth_is_bounded_and_projects_without_a_second_source() -> Result<()> {
         let valid = serde_json::json!({"collector":{"batching":{
-            "coalesce_publications":true,"pipeline_depth":4
+            "coalesce_publications":true,"pipeline_depth":256
         }}});
         let env = Tunables::parse_oat_json(valid.clone())?.environment_for(ComponentRole::Collector)?;
         let batching: Value = serde_json::from_str(&env["ARROWCOL_COLLECTOR_BATCHING_CONFIG"])?;
-        assert_eq!(batching["pipeline_depth"], 4);
+        assert_eq!(batching["pipeline_depth"], 256);
         for value in [
             serde_json::json!(0),
-            serde_json::json!(65),
+            serde_json::json!(257),
             serde_json::json!(1.5),
             serde_json::json!("4"),
         ] {

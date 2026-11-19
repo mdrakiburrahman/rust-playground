@@ -469,6 +469,7 @@ mod tests {
         assert!(shared.get("commit_options").is_none());
         assert_eq!(options.batch_window, Duration::from_secs(10));
         assert_eq!(options.max_files_per_commit, 8);
+        assert_eq!(options.file_encode_concurrency, 1);
         assert_eq!(
             options.publication_lookup_mode,
             arrow_deltalake::commit::PublicationLookupMode::Scalar
@@ -477,9 +478,11 @@ mod tests {
         let mut enabled = value.clone();
         enabled["commit_options"]["remote_snapshot_reuse"] = serde_json::json!(true);
         enabled["commit_options"]["remote_snapshot_max_metadata_objects"] = serde_json::json!(16);
+        enabled["commit_options"]["file_encode_concurrency"] = serde_json::json!(256);
         let (_, _, enabled) = parse_config(&enabled)?;
         assert!(enabled.remote_snapshot_reuse);
         assert_eq!(enabled.remote_snapshot_max_metadata_objects, 16);
+        assert_eq!(enabled.file_encode_concurrency, 256);
         for invalid in [
             serde_json::json!({"batch_window": "0s"}),
             serde_json::json!({"max_files_per_commit": 0}),
@@ -488,6 +491,9 @@ mod tests {
             serde_json::json!({"remote_snapshot_reuse": "true"}),
             serde_json::json!({"remote_snapshot_max_metadata_objects": 0}),
             serde_json::json!({"remote_snapshot_max_metadata_objects": 4097}),
+            serde_json::json!({"file_encode_concurrency": 0}),
+            serde_json::json!({"file_encode_concurrency": 257}),
+            serde_json::json!({"file_encode_concurrency": "2"}),
             serde_json::json!({"batch_windows": "1s"}),
         ] {
             let mut value = value.clone();

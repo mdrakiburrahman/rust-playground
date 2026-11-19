@@ -85,11 +85,14 @@ mod override_tests {
     }
 
     #[test]
-    fn remote_snapshot_controls_project_and_reject_invalid_bounds() -> Result<(), String> {
+    fn commit_controls_project_and_reject_invalid_bounds() -> Result<(), String> {
         assert!(!CommitConfig::default().build()?.remote_snapshot_reuse);
+        assert_eq!(CommitConfig::default().build()?.file_encode_concurrency, 1);
         for reuse in [false, true] {
+            let concurrency = if reuse { 256 } else { 1 };
             let tunables = arrowcol_tunables::Tunables::parse_oat_json(serde_json::json!({
-                "collector":{"commit":{"remote_snapshot_reuse":reuse,"remote_snapshot_max_metadata_objects":16}}
+                "collector":{"commit":{"remote_snapshot_reuse":reuse,"remote_snapshot_max_metadata_objects":16,
+                    "file_encode_concurrency":concurrency}}
             }))
             .map_err(|error| error.to_string())?;
             let environment = tunables
@@ -103,9 +106,31 @@ mod override_tests {
             let options = config.build()?;
             assert_eq!(options.remote_snapshot_reuse, reuse);
             assert_eq!(options.remote_snapshot_max_metadata_objects, 16);
+            assert_eq!(options.file_encode_concurrency, concurrency);
             let effective = serde_json::to_value(config).map_err(|error| error.to_string())?;
             assert_eq!(effective["remote_snapshot_reuse"], reuse);
             assert_eq!(effective["remote_snapshot_max_metadata_objects"], 16);
+            assert_eq!(effective["file_encode_concurrency"], concurrency);
+        }
+        for invalid in [
+            serde_json::json!(0),
+            serde_json::json!(257),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("2"),
+        ] {
+            let value = serde_json::json!({"file_encode_concurrency":invalid});
+            assert!(
+                arrowcol_tunables::Tunables::parse_oat_json(serde_json::json!({
+                    "collector":{"commit":value}
+                }))
+                .is_err()
+            );
+            assert!(
+                merge_config(&CommitConfig::default(), &value.to_string(), None)
+                    .and_then(|config| config.build())
+                    .is_err()
+            );
         }
         for invalid in [
             serde_json::json!(0),
@@ -208,7 +233,7 @@ mod override_tests {
             ..Default::default()
         };
         assert!(batching.validate().is_err());
-        for depth in [0, 65] {
+        for depth in [0, 257] {
             assert!(
                 FileBatchConfig {
                     pipeline_depth: depth,
@@ -229,7 +254,7 @@ mod override_tests {
         );
         assert!(
             FileBatchConfig {
-                pipeline_depth: 64,
+                pipeline_depth: 256,
                 coalesce_publications: true,
                 ..Default::default()
             }

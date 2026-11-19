@@ -664,24 +664,22 @@ mod tests {
         for (knob, minimum, maximum) in [
             ("RUNTIME_WORKERS", 1, 64),
             ("BLOCKING_WORKERS", 2, 256),
-            ("UPLOAD_LIMIT", 1, 256),
+            ("UPLOAD_LIMIT", 1, 512),
             ("UPLOAD_BUFFER_CAPACITY_BYTES", 1024 * 1024, 64 * 1024 * 1024),
             ("UPLOAD_REQUEST_CONCURRENCY", 1, 16),
             ("TASK_LIMIT", 2, 1024),
             ("READ_AHEAD", 1, 128),
             ("BATCH_ROWS", 1, 262_144),
-            ("CPU_WORKERS", 1, 128),
+            ("CPU_WORKERS", 1, 256),
         ] {
             let knob = format!("ARROWCOL_COLLECTOR_{knob}");
             let companion_value = |name: &str| -> Option<&'static str> {
                 match (knob.as_str(), name) {
-                    ("ARROWCOL_COLLECTOR_UPLOAD_LIMIT", "ARROWCOL_COLLECTOR_UPLOAD_BUFFER_CAPACITY_BYTES")
-                    | (
+                    (
                         "ARROWCOL_COLLECTOR_UPLOAD_REQUEST_CONCURRENCY",
                         "ARROWCOL_COLLECTOR_UPLOAD_BUFFER_CAPACITY_BYTES",
                     ) => Some("1048576"),
-                    ("ARROWCOL_COLLECTOR_UPLOAD_LIMIT", "ARROWCOL_COLLECTOR_UPLOAD_REQUEST_CONCURRENCY")
-                    | (
+                    (
                         "ARROWCOL_COLLECTOR_UPLOAD_BUFFER_CAPACITY_BYTES",
                         "ARROWCOL_COLLECTOR_UPLOAD_REQUEST_CONCURRENCY",
                     ) => Some("1"),
@@ -692,9 +690,7 @@ mod tests {
             };
             let upload_knob = matches!(
                 knob.as_str(),
-                "ARROWCOL_COLLECTOR_UPLOAD_LIMIT"
-                    | "ARROWCOL_COLLECTOR_UPLOAD_BUFFER_CAPACITY_BYTES"
-                    | "ARROWCOL_COLLECTOR_UPLOAD_REQUEST_CONCURRENCY"
+                "ARROWCOL_COLLECTOR_UPLOAD_BUFFER_CAPACITY_BYTES" | "ARROWCOL_COLLECTOR_UPLOAD_REQUEST_CONCURRENCY"
             );
             let read = |name: &str, value: &str| {
                 if name == knob {
