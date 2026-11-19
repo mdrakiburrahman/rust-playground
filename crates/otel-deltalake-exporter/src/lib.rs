@@ -252,6 +252,7 @@ fn parse_config(
         batch_window: commit.batch_window,
         max_files_per_commit: commit.max_files_per_commit,
         max_pending_files: commit.max_pending_files,
+        publication_lookup_mode: Default::default(),
     };
     options.validate().map_err(|error| InvalidUserConfig {
         error: error.to_string(),

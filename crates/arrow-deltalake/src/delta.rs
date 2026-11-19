@@ -3909,7 +3909,7 @@ impl DeltaTable {
                     Ok((batch, values, identity))
                 })
                 .collect::<Result<Vec<_>>>()?;
-            prepared_entries.push((source_application_id, version, stamp, batch_rows, splits));
+            prepared_entries.push((source_application_id, version, stamp, splits));
         }
         let previous_by_id = if let Some(snapshot) = snapshot.as_ref() {
             self.lookup_app_id_versions(snapshot, requested_ids.iter().map(String::as_str))?
@@ -3922,7 +3922,7 @@ impl DeltaTable {
         let mut planned_files = 0_usize;
         let mut pending_input_rows = 0_usize;
         let mut source_mappings = Vec::with_capacity(prepared_entries.len());
-        for (source_application_id, version, stamp, batch_rows, splits) in prepared_entries {
+        for (source_application_id, version, stamp, splits) in prepared_entries {
             let mut source_transactions = Vec::new();
             let mut source_partition_files = std::collections::BTreeSet::new();
             let mut new_partition_files = 0_usize;
@@ -3948,30 +3948,6 @@ impl DeltaTable {
                         .checked_add(1)
                         .context("coalesced output file count overflow")?;
                 }
-                let transaction_identity = (identity.clone(), version, stamp);
-                source_transactions.push((values.clone(), transaction_identity.clone()));
-                if let Some(previous) = previous
-                    && previous == version
-                {
-                    committed_identities.push(transaction_identity);
-                    continue;
-                }
-                identities.push(transaction_identity);
-                pending_input_rows = pending_input_rows
-                    .checked_add(batch.num_rows())
-                    .context("coalesced input row count overflow")?;
-                if batch.num_rows() == 0 {
-                    continue;
-                }
-                let partition = output
-                    .entry(values.clone())
-                    .or_insert_with(|| CoalescedPartitionOutput {
-                        values: values.clone(),
-                        files: Vec::new(),
-                        file_rows: Vec::new(),
-                        file_bytes: Vec::new(),
-                    });
-
                 let transaction_identity = (identity.clone(), version, stamp);
                 source_transactions.push((values.clone(), transaction_identity.clone()));
                 if let Some(previous) = previous
