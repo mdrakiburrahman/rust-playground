@@ -578,6 +578,141 @@ mod io_tests {
         }
     }
 
+    async fn remote_snapshot_fixture(
+        fence: Option<Arc<dyn PublicationFence>>,
+    ) -> Result<(Arc<DeltaTable>, Arc<object_store::memory::InMemory>, Arc<StageControl>)> {
+        let control = Arc::new(StageControl(Mutex::new(crate::publisher::MetadataSnapshot {
+            etag: "0".into(),
+            metadata: [
+                ("sandboxid", "0123456789ab"),
+                ("resetstate", "ready-v1"),
+                ("resetgeneration", "00000000-0000-4000-8000-000000000001"),
+                ("publisherregistryversion", "1"),
+                ("publishers", "{}"),
+                ("occupancy", "released"),
+            ]
+            .into_iter()
+            .map(|(key, value)| (key.to_owned(), value.to_owned()))
+            .collect(),
+        })));
+        let session = PublisherSession::open_with_control(
+            Arc::<StageControl>::clone(&control),
+            "0123456789ab",
+            "fixture",
+            SessionMode::Publisher,
+            Some("00000000-0000-4000-8000-000000000001"),
+        )
+        .await?;
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let table = DeltaTable::open_connection_with_store(
+            Url::parse("abfss://data@fixture.dfs.core.windows.net/table/")?,
+            Vec::new(),
+            fence,
+            Some(session),
+            Some(Arc::<object_store::memory::InMemory>::clone(&store)),
+        )?;
+        table.ensure_schema(input_batch()?.schema())?;
+        Ok((table, store, control))
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn remote_snapshot_refreshes_schema_checkpoint_and_purged_history() -> Result<()> {
+        let fence = Arc::new(RecordingFence::default());
+        let (table, store, _) = remote_snapshot_fixture(Some(Arc::<RecordingFence>::clone(&fence))).await?;
+        let input = input_batch()?;
+        let mut file = table.new_file(input.schema())?;
+        file.write(&input).await?;
+        file.finish().await?;
+        let base = table.snapshot()?;
+        assert!(Arc::ptr_eq(&base, &table.snapshot()?));
+        let transaction = base
+            .alter_table()
+            .add_column(delta_kernel::schema::StructField::new(
+                "remote_extra",
+                delta_kernel::schema::DataType::STRING,
+                true,
+            ))
+            .build(&table.engine, Box::new(FileSystemCommitter::new()))?;
+        assert_eq!(committed(transaction.commit(&table.engine)?)?, 2);
+        assert!(table.snapshot()?.schema().field("remote_extra").is_some());
+        assert_eq!(table.checkpoint()?, 2);
+        let checkpoint = table.snapshot()?;
+        assert_eq!(checkpoint.version(), 2);
+        for version in 0..2 {
+            store
+                .delete(&table.object_path(&format!("_delta_log/{version:020}.json"))?)
+                .await?;
+        }
+        let purged = table.snapshot()?;
+        assert_eq!(purged.version(), 2);
+        assert!(!Arc::ptr_eq(&checkpoint, &purged));
+        let mut file = table.new_file(input.schema())?;
+        file.write(&input).await?;
+        assert_eq!(file.finish().await?.version, 3);
+        assert_eq!(
+            *fence.0.lock().map_err(|error| anyhow::anyhow!("{error}"))?,
+            vec![(0, 1), (2, 3)]
+        );
+        table
+            .session
+            .as_ref()
+            .context("session")?
+            .close_after_drain_async()
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn remote_snapshot_rejects_replaced_history_and_authority_transitions() -> Result<()> {
+        let (table, store, _) = remote_snapshot_fixture(None).await?;
+        let base = table.snapshot()?;
+        assert!(Arc::ptr_eq(&base, &table.snapshot()?));
+        store
+            .put(
+                &table.object_path("_delta_log/00000000000000000000.json")?,
+                bytes::Bytes::from_static(b"invalid").into(),
+            )
+            .await?;
+        assert!(table.snapshot().is_err());
+        assert!(
+            table
+                .remote_snapshot_cache
+                .lock()
+                .map_err(|error| anyhow::anyhow!("{error}"))?
+                .is_none()
+        );
+        table
+            .session
+            .as_ref()
+            .context("session")?
+            .close_after_drain_async()
+            .await?;
+
+        for (key, value) in [
+            ("resetstate", "fenced-v1"),
+            ("resetgeneration", "00000000-0000-4000-8000-000000000002"),
+        ] {
+            let (table, _, control) = remote_snapshot_fixture(None).await?;
+            table.snapshot()?;
+            {
+                let mut metadata = control.0.lock().map_err(|error| anyhow::anyhow!("{error}"))?;
+                metadata.metadata.insert(key.into(), value.into());
+                if key == "resetgeneration" {
+                    metadata.metadata.insert("publishers".into(), "{}".into());
+                }
+            }
+            assert!(table.snapshot().is_err());
+            assert!(
+                table
+                    .remote_snapshot_cache
+                    .lock()
+                    .map_err(|error| anyhow::anyhow!("{error}"))?
+                    .is_none()
+            );
+        }
+        Ok(())
+    }
+
     /// Scenario: a registered publisher stages through an injected cloud-shaped data store.
     /// Guarantees: authority checks work off the caller runtime without synchronous I/O-worker re-entry.
     #[tokio::test(flavor = "current_thread")]
@@ -2370,6 +2505,7 @@ pub struct DeltaTable {
     session: Option<Arc<PublisherSession>>,
     bootstrap_only: bool,
     snapshot_cache: Mutex<Option<CachedSnapshot>>,
+    remote_snapshot_cache: Mutex<Option<CachedRemoteSnapshot>>,
     layout_readback: Mutex<Option<LayoutReadback>>,
     reuse_snapshots: bool,
     publication_lookup_mode: crate::commit::PublicationLookupMode,
@@ -2471,6 +2607,11 @@ type LogFingerprints = BTreeMap<u64, LogFingerprint>;
 struct CachedSnapshot {
     snapshot: SnapshotRef,
     files: LogFingerprints,
+}
+
+struct CachedRemoteSnapshot {
+    snapshot: SnapshotRef,
+    files: BTreeMap<object_store::path::Path, object_store::ObjectMeta>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -2985,6 +3126,7 @@ impl DeltaTable {
             _lock: None,
             commit_lock: Mutex::new(()),
             snapshot_cache: Mutex::new(None),
+            remote_snapshot_cache: Mutex::new(None),
             layout_readback: Mutex::new(None),
             reuse_snapshots: false,
             publication_lookup_mode: crate::commit::PublicationLookupMode::default(),
@@ -3312,6 +3454,7 @@ impl DeltaTable {
             },
             commit_lock: Mutex::new(()),
             snapshot_cache: Mutex::new(None),
+            remote_snapshot_cache: Mutex::new(None),
             layout_readback: Mutex::new(None),
             reuse_snapshots,
             publication_lookup_mode: crate::commit::PublicationLookupMode::default(),
@@ -3378,6 +3521,9 @@ impl DeltaTable {
     }
 
     pub(crate) fn snapshot(&self) -> Result<SnapshotRef> {
+        if self.url.scheme() != "file" {
+            return self.remote_snapshot();
+        }
         let full_build = || {
             Snapshot::builder_for(self.url.as_str())
                 .build(&self.engine)
@@ -3425,6 +3571,77 @@ impl DeltaTable {
             return full_build();
         }
         Ok(snapshot)
+    }
+
+    fn remote_snapshot(&self) -> Result<SnapshotRef> {
+        let mut cache = self
+            .remote_snapshot_cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("remote Delta snapshot cache lock poisoned"))?;
+        let previous = cache.take();
+        let session = self
+            .session
+            .as_ref()
+            .context("remote snapshot requires a publisher session")?;
+        session.check()?;
+        let before = self.remote_log_fingerprints()?;
+        let base = previous.filter(|previous| {
+            before.as_ref().is_some_and(|files| {
+                previous.files.iter().all(|(path, meta)| files.get(path) == Some(meta))
+                    && files
+                        .keys()
+                        .filter(|path| !previous.files.contains_key(*path))
+                        .all(|path| {
+                            path.filename()
+                                .and_then(|name| name.strip_suffix(".json"))
+                                .filter(|name| name.len() == 20 && name.bytes().all(|byte| byte.is_ascii_digit()))
+                                .and_then(|name| name.parse::<u64>().ok())
+                                .is_some_and(|version| version > previous.snapshot.version())
+                        })
+            })
+        });
+        let full_build = || Snapshot::builder_for(self.url.as_str()).build(&self.engine);
+        let snapshot = match &base {
+            Some(base) => Snapshot::builder_from(Arc::clone(&base.snapshot)).build(&self.engine)?,
+            None => full_build()?,
+        };
+        let after = self.remote_log_fingerprints()?;
+        session.check()?;
+        if let (Some(before), Some(after)) = (before, after) {
+            if before == after {
+                *cache = Some(CachedRemoteSnapshot {
+                    snapshot: Arc::clone(&snapshot),
+                    files: after,
+                });
+                return Ok(snapshot);
+            }
+        }
+        if base.is_some() {
+            tracing::debug!("remote Delta log changed during incremental refresh; rebuilding without cached state");
+            let snapshot = full_build()?;
+            session.check()?;
+            return Ok(snapshot);
+        }
+        Ok(snapshot)
+    }
+
+    fn remote_log_fingerprints(&self) -> Result<Option<BTreeMap<object_store::path::Path, object_store::ObjectMeta>>> {
+        let store = Arc::clone(&self.store);
+        let prefix = self.object_path("_delta_log/")?;
+        shared_executor()?.block_on(async move {
+            use futures::TryStreamExt;
+            let mut entries = store.list(Some(&prefix));
+            let mut files = BTreeMap::new();
+            while let Some(meta) = entries.try_next().await? {
+                // A missing object identity or oversized retained log disables reuse,
+                // never freshness checks. Checkpoints, purges and CRC changes rebuild.
+                if files.len() == 4096 || (meta.e_tag.is_none() && meta.version.is_none()) {
+                    return Ok(None);
+                }
+                files.insert(meta.location.clone(), meta);
+            }
+            Ok(Some(files))
+        })
     }
 
     fn log_fingerprints(&self) -> Result<Option<LogFingerprints>> {
