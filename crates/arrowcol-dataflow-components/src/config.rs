@@ -925,6 +925,9 @@ pub struct CommitConfig {
     pub max_files_per_commit: usize,
     /// Maximum queued and committing files per table.
     pub max_pending_files: usize,
+    /// Transaction lookup implementation; scalar by default, batched for explicit comparison.
+    #[serde(default)]
+    pub publication_lookup_mode: arrow_deltalake::commit::PublicationLookupMode,
 }
 
 impl Default for CommitConfig {
@@ -934,6 +937,7 @@ impl Default for CommitConfig {
             batch_window: options.batch_window,
             max_files_per_commit: options.max_files_per_commit,
             max_pending_files: options.max_pending_files,
+            publication_lookup_mode: options.publication_lookup_mode,
         }
     }
 }
@@ -944,6 +948,7 @@ impl CommitConfig {
             batch_window: self.batch_window,
             max_files_per_commit: self.max_files_per_commit,
             max_pending_files: self.max_pending_files,
+            publication_lookup_mode: self.publication_lookup_mode,
         };
         options.validate().map_err(|error| error.to_string())?;
         Ok(options)

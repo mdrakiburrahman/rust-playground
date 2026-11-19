@@ -59,6 +59,7 @@ Sources: [Ddsv6 sizes](https://learn.microsoft.com/azure/virtual-machines/sizes/
 | `collector.commit.max_files_per_commit` | Existing maximum add actions per version (default `64`). A coalesced group remains indivisible; separate groups may share a version only when their identities do not overlap and their combined file count fits. |
 | `collector.commit.batch_window` | Existing maximum collection interval (default `10s`), starting at the first ready group. Depth `1` preserves immediate forced group commits; pipelined groups use this interval or the file cap. Explicit flush, schema transitions and shutdown wait for all prior groups. |
 | `collector.commit.max_pending_files` | Existing file admission bound (default `256`), held through terminal commit results. |
+| `collector.commit.publication_lookup_mode` | Typed `scalar` (default) or `batched` transaction-identity lookup; use `batched` explicitly for the no-CRC benchmark profile. No automatic CRC/cardinality threshold is used. |
 | `collector.runtime.cpu_workers` / `upload_limit` | Existing CPU pool and upload admission bounds. These do not imply that more file groups are active; pipeline depth, flush slots and Arrow queue capacities must also permit overlap. |
 
 Coalesced preparation uses the same opened table as the single Delta commit worker,

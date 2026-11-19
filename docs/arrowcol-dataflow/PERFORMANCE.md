@@ -4,7 +4,7 @@
 | --- | --- | --- |
 | `ARROWCOL_PARQUET_CONFIG` | Strict `arrow_deltalake::writer::ParquetWriterConfig` JSON: global/per-physical-column codecs, levels, encoding, dictionary, statistics/page indexes, offset index, Bloom filters, pages, row groups, sorting metadata | Startup |
 | `ARROWCOL_COLLECTOR_BATCHING_CONFIG` | Deep JSON override of exporter `batching`: byte/row/batch capacities and flush limits, age, flush concurrency, adaptive sizing, `coalesce_publications` | Startup |
-| `ARROWCOL_COLLECTOR_COMMIT_CONFIG` | Deep JSON override of exporter `commit`: `batch_window`, `max_files_per_commit`, `max_pending_files` | Startup |
+| `ARROWCOL_COLLECTOR_COMMIT_CONFIG` | Deep JSON override of exporter `commit`: `batch_window`, `max_files_per_commit`, `max_pending_files`, and `publication_lookup_mode` (`scalar` default; `batched` is explicit) | Startup |
 | `ARROWCOL_COLLECTOR_LIMITS_CONFIG` | Deep JSON override of receiver `limits`: Flight sizes, channels and deadlines | Startup |
 | `ARROWCOL_COLLECTOR_PRESSURE_CONFIG` | Stream/RSS/buffered limits, pressure/heartbeat intervals and registration TTL; no identities/endpoints | Startup |
 | `ARROWCOL_COLLECTOR_CATALOG_CONFIG` | Remote catalog `maximum_cache_age`; rejects memory catalog | Startup |

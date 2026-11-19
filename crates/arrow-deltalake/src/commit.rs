@@ -18,12 +18,24 @@ use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use tokio::time::Instant;
 
+/// Select the transaction lookup implementation for release comparisons.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicationLookupMode {
+    /// Resolve all requested transaction IDs through one Kernel action replay.
+    Batched,
+    /// Resolve each ID through Kernel independently as a reference/fallback.
+    #[default]
+    Scalar,
+}
+
 /// Limits for eligible files awaiting a shared transaction.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommitOptions {
     pub batch_window: Duration,
     pub max_files_per_commit: usize,
     pub max_pending_files: usize,
+    pub publication_lookup_mode: PublicationLookupMode,
 }
 
 impl Default for CommitOptions {
@@ -32,6 +44,7 @@ impl Default for CommitOptions {
             batch_window: Duration::from_secs(10),
             max_files_per_commit: 64,
             max_pending_files: 256,
+            publication_lookup_mode: PublicationLookupMode::default(),
         }
     }
 }
@@ -729,12 +742,13 @@ fn run_worker(
     publication_fence: Option<Arc<dyn PublicationFence>>,
 ) {
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build();
+    let lookup_mode = options.publication_lookup_mode;
     let table = publication_fence.map_or_else(
-        || DeltaTable::open(root),
+        || DeltaTable::open_with_lookup_mode(root, lookup_mode),
         |publication_fence| {
             root.to_str()
                 .context("invalid table URI")
-                .and_then(|root| DeltaTable::open_uri_with_fence(root, publication_fence))
+                .and_then(|root| DeltaTable::open_uri_with_fence_and_lookup_mode(root, publication_fence, lookup_mode))
         },
     );
     let mut failure = table
@@ -1258,6 +1272,7 @@ mod tests {
                 batch_window: Duration::from_secs(60),
                 max_files_per_commit: 2,
                 max_pending_files: 4,
+                publication_lookup_mode: PublicationLookupMode::default(),
             },
         )
         .await?;
@@ -1309,6 +1324,7 @@ mod tests {
                 batch_window: Duration::from_secs(60),
                 max_files_per_commit: 2,
                 max_pending_files: 4,
+                publication_lookup_mode: PublicationLookupMode::default(),
             },
         )
         .await?;
