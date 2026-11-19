@@ -62,7 +62,7 @@ pub(crate) fn group_rows(batch: &RecordBatch, names: &[String]) -> Result<Vec<Pa
 
 pub(crate) fn materialize_group(batch: &RecordBatch, group: &PartitionGroup) -> Result<(RecordBatch, PartitionValues)> {
     #[cfg(test)]
-    MATERIALIZATIONS.update(|count| count + 1);
+    MATERIALIZATIONS.set(MATERIALIZATIONS.get() + 1);
     let rows = UInt64Array::from(group.rows.clone());
     let arrays = batch
         .columns()

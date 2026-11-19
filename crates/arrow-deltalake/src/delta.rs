@@ -3928,7 +3928,7 @@ impl DeltaTable {
                 schema = Some(batch.schema());
             }
             let batch_rows = batch.num_rows();
-            let mut register_partition = |values: &crate::partition::PartitionValues| -> Result<String> {
+            let register_partition = |values: &crate::partition::PartitionValues| -> Result<String> {
                 if let Some(expected) = &expected_ingestion
                     && values.get(INGESTION_PARTITION).and_then(Option::as_deref) != Some(expected.as_str())
                 {
