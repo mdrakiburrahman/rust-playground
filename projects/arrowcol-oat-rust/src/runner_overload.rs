@@ -1,5 +1,87 @@
 const GUARD_WINDOW_MS: u64 = 30_000;
 const GUARD_MAX_GAP_MS: u64 = 5_000;
+const GUARD_READ_ERROR_MAX_BYTES: usize = 256;
+const GUARD_READ_TIMEOUT: Duration = Duration::from_secs(3);
+
+struct GuardReadLeg<T> {
+    result: Result<T>,
+    status: &'static str,
+    elapsed_ms: u64,
+    cancelled: bool,
+    error: Option<String>,
+}
+
+impl<T> GuardReadLeg<T> {
+    fn evidence(&self) -> Value {
+        json!({
+            "status":self.status,
+            "elapsed_ms":self.elapsed_ms,
+            "cancelled":self.cancelled,
+            "error":self.error.as_deref(),
+        })
+    }
+
+    fn into_result(self) -> Result<T> {
+        self.result
+    }
+}
+
+impl GuardReadLeg<()> {
+    fn not_applicable() -> Self {
+        Self {
+            result: Ok(()),
+            status: "not_applicable",
+            elapsed_ms: 0,
+            cancelled: false,
+            error: None,
+        }
+    }
+
+    fn not_run() -> Self {
+        Self {
+            result: Err(anyhow::anyhow!("collector identity fence skipped after guard read failure")),
+            status: "not_run",
+            elapsed_ms: 0,
+            cancelled: false,
+            error: None,
+        }
+    }
+}
+
+fn bounded_guard_error(error: &anyhow::Error) -> String {
+    let rendered = error.to_string();
+    let mut excerpt = String::new();
+    for character in rendered.chars().filter(|character| !character.is_control()) {
+        if excerpt.len() + character.len_utf8() > GUARD_READ_ERROR_MAX_BYTES {
+            break;
+        }
+        excerpt.push(character);
+    }
+    excerpt
+}
+
+async fn guard_read_leg<T>(
+    deadline: tokio::time::Instant,
+    future: impl std::future::Future<Output = Result<T>>,
+) -> GuardReadLeg<T> {
+    let started = tokio::time::Instant::now();
+    let (result, status, cancelled) = match tokio::time::timeout_at(deadline, future).await {
+        Ok(Ok(value)) => (Ok(value), "ok", false),
+        Ok(Err(error)) => (Err(error), "error", false),
+        Err(_) => (
+            Err(anyhow::anyhow!("guard read deadline exceeded; operation cancelled")),
+            "timeout",
+            true,
+        ),
+    };
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    let error = result.as_ref().err().map(bounded_guard_error);
+    GuardReadLeg { result, status, elapsed_ms, cancelled, error }
+}
+
+fn record_guard_read_leg<T>(diagnostics: &mut Value, name: &str, leg: &GuardReadLeg<T>) {
+    diagnostics["last_guard_read"]["legs"][name] = leg.evidence();
+}
 
 #[derive(Clone, Debug, serde::Serialize)]
 struct GuardCap {
@@ -361,14 +443,15 @@ async fn guarded_composite_observation<T, B>(
     reading: impl std::future::Future<Output = Result<T>>,
     backlog: impl std::future::Future<Output = B>,
     fence: impl std::future::Future<Output = Result<()>>,
-) -> (Result<T>, B) {
+    deadline: tokio::time::Instant,
+) -> (Result<T>, B, GuardReadLeg<()>) {
     let (reading, backlog) = tokio::join!(reading, backlog);
-    let reading = async {
-        let reading = reading?;
-        fence.await?;
-        Ok(reading)
-    }.await;
-    (reading, backlog)
+    let fence = if reading.is_ok() {
+        guard_read_leg(deadline, fence).await
+    } else {
+        GuardReadLeg::not_run()
+    };
+    (reading, backlog, fence)
 }
 
 struct PreparedGuard {
@@ -457,14 +540,26 @@ impl PreparedGuard {
         prepared.engine.proof["commit_log_sampling"] = json!({"mode":"incremental_since_with_dedupe",
             "overlap_ms":GUARD_MAX_GAP_MS,"capability_source":"initial_complete_startup_readback"});
         let expected = prepared.probe.expected_scale_out_identity.clone();
-        let (reading, backlog) = guarded_composite_observation(
-            prepared.probe.read(config, &prepared.scraper, diagnostics),
+        let deadline = tokio::time::Instant::now() + GUARD_READ_TIMEOUT;
+        let (reading, backlog, identity) = guarded_composite_observation(
+            prepared.probe.read(config, &prepared.scraper, diagnostics, deadline),
             prepared.scraper.scrape(),
             verify_guard_identity(config, expected.as_deref()),
+            deadline,
         ).await;
-        prepared
-            .engine
-            .observe(reading?, &publication_backlog_sample(backlog?, 0, 0, 0))?;
+        record_guard_read_leg(diagnostics, "collector_identity_after_backlog", &identity);
+        let reading = match reading {
+            Ok(reading) => reading,
+            Err(error) => {
+                record_guard_read_error(diagnostics, &error);
+                return Err(error);
+            }
+        };
+        if let Err(error) = identity.into_result() {
+            record_guard_read_error(diagnostics, &error);
+            return Err(error);
+        }
+        prepared.engine.observe(reading, &publication_backlog_sample(backlog?, 0, 0, 0))?;
         prepared.engine.proof["admission_diagnostics"] = diagnostics.take();
         Ok(prepared)
     }
@@ -559,27 +654,51 @@ impl GuardProbe {
         config: &OatConfig,
         scraper: &PublicationBacklogScraper,
         diagnostics: &mut Value,
+        deadline: tokio::time::Instant,
     ) -> Result<GuardReading> {
         let request_start_ms = unix_time_ms_u64()?;
-        if let Some(expected) = &self.expected_scale_out_identity
-            && scale_out_collector_snapshot(config, 1).await? != *expected
-        {
-            bail!("collector identity changed before observation");
-        }
+        diagnostics["last_guard_read"] = json!({
+            "started_at_ms":request_start_ms,
+            "remaining_budget_ms":deadline.saturating_duration_since(tokio::time::Instant::now()).as_millis() as u64,
+            "status":"running",
+            "legs":{},
+        });
+        let identity_before = if let Some(expected) = &self.expected_scale_out_identity {
+            guard_read_leg(deadline, async {
+                if scale_out_collector_snapshot(config, 1).await? != *expected {
+                    bail!("collector identity changed before observation");
+                }
+                Ok(())
+            }).await
+        } else {
+            GuardReadLeg::not_applicable()
+        };
+        record_guard_read_leg(diagnostics, "collector_identity_before", &identity_before);
+        identity_before.into_result()?;
         let mut pressure_url = Url::parse(&scraper.endpoint)?;
         pressure_url.set_path("/v1/pressure");
         pressure_url.set_query(None);
-        let memory = run_command(
-            self.command(config, false)?,
-            "read collector cgroup memory usage and hard cap",
+        let (memory, logs, pressure) = tokio::join!(
+            guard_read_leg(deadline, async {
+                run_command(self.command(config, false)?, "read collector cgroup memory usage and hard cap").await
+            }),
+            guard_read_leg(deadline, async {
+                filtered_process_command_output(self.command(config, true)?, "read live ingestion commit evidence").await
+            }),
+            guard_read_leg(deadline, async {
+                scraper.read_endpoint(pressure_url.as_str()).await
+            }),
         );
-        let logs = filtered_process_command_output(self.command(config, true)?, "read live ingestion commit evidence");
-        let pressure = async {
-            let body = scraper.read_endpoint(pressure_url.as_str()).await?;
-            diagnostics["last_pressure"] = pressure_body_excerpt(&body);
-            Ok::<_, anyhow::Error>(body)
-        };
-        let (memory, logs, pressure) = tokio::try_join!(memory, logs, pressure)?;
+        record_guard_read_leg(diagnostics, "cgroup_memory", &memory);
+        record_guard_read_leg(diagnostics, "collector_logs", &logs);
+        record_guard_read_leg(diagnostics, "pressure_http", &pressure);
+        if let Ok(body) = &pressure.result {
+            diagnostics["last_pressure"] = pressure_body_excerpt(body);
+        }
+        diagnostics["last_guard_read"]["status"] = json!("legs_complete");
+        let memory = memory.into_result().context("cgroup memory leg failed")?;
+        let logs = logs.into_result().context("collector log leg failed")?;
+        let pressure = pressure.into_result().context("pressure HTTP leg failed")?;
         let memory = String::from_utf8(memory.stdout)?;
         let container_cap = guard_container_memory(
             &memory,
@@ -648,11 +767,19 @@ impl GuardProbe {
                 bail!("live ingestion commit table identity mismatched");
             }
         }
-        if let Some(expected) = &self.expected_scale_out_identity
-            && scale_out_collector_snapshot(config, 1).await? != *expected
-        {
-            bail!("collector identity changed during observation");
-        }
+        let identity_after_read = if let Some(expected) = &self.expected_scale_out_identity {
+            guard_read_leg(deadline, async {
+                if scale_out_collector_snapshot(config, 1).await? != *expected {
+                    bail!("collector identity changed during observation");
+                }
+                Ok(())
+            }).await
+        } else {
+            GuardReadLeg::not_applicable()
+        };
+        record_guard_read_leg(diagnostics, "collector_identity_after_read", &identity_after_read);
+        identity_after_read.into_result()?;
+        diagnostics["last_guard_read"]["status"] = json!("complete");
         self.since_ms = request_start_ms.saturating_sub(GUARD_MAX_GAP_MS);
         Ok(GuardReading {
             request_start_ms,
@@ -1360,6 +1487,43 @@ mod overload_guard_tests {
     }
 
     #[tokio::test]
+    async fn concurrent_guard_legs_share_the_three_second_absolute_deadline() -> Result<()> {
+        let deadline = tokio::time::Instant::now() + GUARD_READ_TIMEOUT;
+        let (cgroup, logs, pressure) = tokio::join!(
+            guard_read_leg(deadline, async {
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+                Ok::<_, anyhow::Error>(())
+            }),
+            guard_read_leg(deadline, async {
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+                Ok::<_, anyhow::Error>(())
+            }),
+            guard_read_leg(deadline, async {
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+                Ok::<_, anyhow::Error>(())
+            }),
+        );
+        for leg in [&cgroup, &logs, &pressure] {
+            assert_eq!(leg.status, "ok");
+            assert!(leg.elapsed_ms < GUARD_READ_TIMEOUT.as_millis() as u64);
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(20);
+        let timed_out = guard_read_leg(deadline, std::future::pending::<Result<()>>()).await;
+        assert_eq!(timed_out.status, "timeout");
+        assert!(timed_out.cancelled);
+        assert!(timed_out.error.as_deref().is_some_and(|error| error.len() <= GUARD_READ_ERROR_MAX_BYTES));
+        Ok(())
+    }
+
+    #[test]
+    fn guard_read_error_excerpt_is_bounded_and_control_free() {
+        let error = anyhow::anyhow!("{}\n", "x".repeat(GUARD_READ_ERROR_MAX_BYTES * 2));
+        let excerpt = bounded_guard_error(&error);
+        assert!(excerpt.len() <= GUARD_READ_ERROR_MAX_BYTES);
+        assert!(excerpt.chars().all(|character| !character.is_control()));
+    }
+
+    #[tokio::test]
     async fn composite_guard_fences_late_backlog_before_startup_and_final_sample() -> Result<()> {
         use std::sync::atomic::{AtomicU8, Ordering};
         for (mode, startup) in (0..4).flat_map(|mode| [(mode, true), (mode, false)]) {
@@ -1367,6 +1531,7 @@ mod overload_guard_tests {
             let observed = Arc::clone(&identity);
             let (probe_done, wait_probe) = tokio::sync::oneshot::channel();
             let (release_backlog, backlog_gate) = tokio::sync::oneshot::channel();
+            let deadline = tokio::time::Instant::now() + GUARD_READ_TIMEOUT;
             let task = tokio::spawn(async move {
                 guarded_composite_observation(
                     async {
@@ -1388,13 +1553,15 @@ mod overload_guard_tests {
                             ).await.context("collector identity fence deadline exceeded")?,
                         }
                     },
+                    deadline,
                 ).await
             });
             wait_probe.await.context("probe did not complete")?;
             identity.store(mode, Ordering::SeqCst);
             release_backlog.send(()).map_err(|_| anyhow::anyhow!("backlog waiter dropped"))?;
-            let (result, backlog) = task.await.context("composite task failed")?;
+            let (result, backlog, identity) = task.await.context("composite task failed")?;
             let backlog = backlog?;
+            let result = result.and_then(|reading| identity.into_result().map(|_| reading));
             let mut engine = GuardEngine::new(Default::default());
             if startup {
                 let accepted = result.and_then(|reading| engine.observe(reading, &backlog));
@@ -1548,4 +1715,9 @@ mod overload_guard_tests {
         }
         Ok(())
     }
+}
+
+fn record_guard_read_error(diagnostics: &mut Value, error: &anyhow::Error) {
+    diagnostics["last_guard_read"]["status"] = json!("error");
+    diagnostics["last_guard_read"]["error"] = json!(bounded_guard_error(error));
 }
