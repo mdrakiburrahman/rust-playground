@@ -14,7 +14,7 @@ import { directProducerAuthority } from './benchmark-run-authority.js';
 import type { CampaignStore, StoredCampaign } from '../../projects/arrowcol-oat/aks-campaign.js';
 import type { Azure } from './bootstrap.js';
 import { validateDirectTerminal, type DirectTerminalArm, type DirectTerminalObservations } from './benchmark-terminal-custody.js';
-import { positiveDirectExitEvent } from './benchmark-pod-exit.js';
+import { positiveDirectExitEvent, readDirectPodExit, stopDirectPodWithExit } from './benchmark-pod-exit.js';
 import { clientLogExportPod, exportWriterLogs, writerLogExportPod } from './benchmark-writer-export.js';
 import { observeStoppedWriterRegistration, pinWriterRegistration } from './benchmark-writer-sql.js';
 
@@ -85,6 +85,77 @@ test('requires a clean MODIFIED event for the original Pod; disappearance, resta
   await assert.rejects(verify(), /ended without positive terminal evidence/);
   status.restartCount = 1;
   await assert.rejects(verify({ type: 'MODIFIED', object: pod }), /lifetime changed/);
+});
+test('real stop adapter consumes a fenced PATCH and durably replays an exact pre-PATCH Pod watch', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'direct-stop-kubectl-'));
+  const oldPath = process.env.PATH;
+  const trace = join(dir, 'trace');
+  const fake = join(dir, 'kubectl');
+  const imageId = `sha256:${'a'.repeat(64)}`, image = `test@${imageId}`, startedAt = new Date(Date.now() - 10_000).toISOString();
+  const origin = { ...run, cloudGeneration: uid, sourceRevision: 'b'.repeat(40), fencingToken: 1 };
+  const original = { deploymentUid: uid, replicaSetUid: uid, podName: 'pod', podUid: uid, podIp: '10.0.0.1',
+    nodeName: 'node', image, imageId, containerId: 'original', startedAt };
+  const meta = { uid, name: 'pod', namespace: run.namespace, resourceVersion: '17', labels: markers, annotations: markers,
+    ownerReferences: [{ kind: 'ReplicaSet', uid, controller: true }] };
+  const live = { apiVersion: 'v1', kind: 'Pod', metadata: meta,
+    spec: { terminationGracePeriodSeconds: 30, nodeName: 'node', containers: [{ name: 'dataflow', image }] },
+    status: { containerStatuses: [{ name: 'dataflow', imageID: imageId, restartCount: 0, containerID: 'original',
+      state: { running: { startedAt } } }] } };
+  const deployment = { apiVersion: 'apps/v1', kind: 'Deployment', metadata: { ...meta, name: 'arrowcol', generation: 1, resourceVersion: '27' },
+    spec: { replicas: 1 } };
+  const objects = new Map<string, { bytes: Buffer; etag: string }>();
+  const blob: Azure['blob'] = async (method, _, path, __, data, headers) => {
+    assert.ok(path);
+    const current = objects.get(path);
+    if (method === 'PUT') {
+      assert.equal(current?.etag, headers?.['If-Match']);
+      if (!current) assert.equal(headers?.['If-None-Match'], '*');
+      const body = Buffer.isBuffer(data) ? data : Buffer.from(String(data));
+      const etag = `"${createHash('sha256').update(body).digest('hex')}"`;
+      objects.set(path, { bytes: body, etag });
+      return [null, { ':status': '201', etag }];
+    }
+    assert.equal(method, 'GET');
+    assert.ok(current);
+    return [current.bytes, { ':status': '200', etag: current.etag }];
+  };
+  try {
+    await writeFile(fake, `#!${process.execPath}
+const fs=require('node:fs');
+const a=process.argv.slice(2);
+const assert=require('node:assert/strict');
+const live=${JSON.stringify(live)};
+const deployment=${JSON.stringify(deployment)};
+const trace=${JSON.stringify(trace)};
+assert.equal(a[a.indexOf('--server')+1],'https://fixture.example');
+if(a.includes('--raw')){
+ const url=new URL(a.at(-1),'https://fixture.example');
+ assert.equal(url.searchParams.get('resourceVersion'),'17');
+ assert.equal(url.searchParams.get('fieldSelector'),'metadata.name=pod');
+ assert.equal(fs.readFileSync(trace,'utf8'),'patched');
+ live.metadata.resourceVersion='28';
+ live.status.containerStatuses[0].state={terminated:{startedAt:${JSON.stringify(startedAt)},finishedAt:new Date().toISOString(),
+   containerID:'original',exitCode:0,reason:'Completed'}};
+ console.log(JSON.stringify({type:'MODIFIED',object:live}));
+}else if(a.includes('patch')){
+ const ops=JSON.parse(a[a.indexOf('--patch')+1]);
+ assert.deepEqual(ops.map(v=>v.value),[${JSON.stringify(uid)},'27',0]);
+ fs.writeFileSync(trace,'patched',{flag:'wx'});
+ deployment.metadata.resourceVersion='28';deployment.metadata.generation=2;deployment.spec.replicas=0;
+ console.log(JSON.stringify(deployment));
+}else console.log(JSON.stringify(a.includes('deployment')?deployment:live));`);
+    await chmod(fake, 0o700);
+    process.env.PATH = `${dir}${delimiter}${oldPath}`;
+    const azure = { c: { checkpoints: 'checkpoint' }, blob } as Azure, authority = { assertCurrent: async () => {} };
+    const stop = await stopDirectPodWithExit(azure, authority, 'fixture', 'https://fixture.example', origin, 'arrowcol', original);
+    const readback = await readDirectPodExit(azure, authority, origin, 'arrowcol', original, stop);
+    assert.match(readback.bytes.toString(), /"podResourceVersionBeforeStop":"17"/);
+    assert.match(readback.bytes.toString(), /"exitCode":0/);
+    assert.equal(objects.size, 2);
+  } finally {
+    process.env.PATH = oldPath;
+    await rm(dir, { recursive: true });
+  }
 });
 test('replays the direct invariants protocol and rejects deletion vectors and unknown actions', () => {
   const replay = directDeltaReplay();
