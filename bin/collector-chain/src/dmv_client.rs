@@ -2875,22 +2875,19 @@ async fn canonical_publication_accounting(
 ) -> Result<CanonicalPublicationAccounting> {
     #[allow(clippy::unnecessary_to_owned)] // The decoder requires an owned 'static FlightData stream.
     let owned_messages = messages.to_vec();
-    let batches = FlightRecordBatchStream::new_from_flight_data(stream::iter(owned_messages.into_iter().map(Ok)))
-        .try_collect::<Vec<_>>()
-        .await?;
-    let decoded_rows = batches.iter().try_fold(0_u64, |total, batch| {
-        total
-            .checked_add(u64::try_from(batch.num_rows())?)
-            .context("decoded Flight row count overflow")
-    })?;
-    anyhow::ensure!(
-        decoded_rows == expected_rows,
-        "Flight decoding changed the publication row count"
-    );
+    let mut batches = FlightRecordBatchStream::new_from_flight_data(stream::iter(owned_messages.into_iter().map(Ok)));
+    let mut decoded_rows = 0_u64;
+    let mut decoded_physical_batch_count = 0_u64;
     let mut canonical_logical_bytes = Some(0_u64);
     let mut unavailable_reason = None;
-    for batch in &batches {
-        match canonical_record_batch_logical_bytes(batch) {
+    while let Some(batch) = batches.try_next().await? {
+        decoded_rows = decoded_rows
+            .checked_add(u64::try_from(batch.num_rows())?)
+            .context("decoded Flight row count overflow")?;
+        decoded_physical_batch_count = decoded_physical_batch_count
+            .checked_add(1)
+            .context("decoded physical batch count overflow")?;
+        match canonical_record_batch_logical_bytes(&batch) {
             Ok(bytes) => {
                 let Some(total) = canonical_logical_bytes else {
                     continue;
@@ -2909,8 +2906,12 @@ async fn canonical_publication_accounting(
             }
         }
     }
+    anyhow::ensure!(
+        decoded_rows == expected_rows,
+        "Flight decoding changed the publication row count"
+    );
     Ok(CanonicalPublicationAccounting {
-        decoded_physical_batch_count: u64::try_from(batches.len())?,
+        decoded_physical_batch_count,
         canonical_logical_bytes,
         unavailable_reason,
     })
