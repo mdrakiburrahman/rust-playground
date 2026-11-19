@@ -2127,6 +2127,7 @@ mod downstream_runner_tests {
         InitRequired,
         InitTimeout,
         PinInitFailed,
+        GuardUnavailable,
         ObservationUnavailable,
         InitBindingRejected,
         ObservationBindingRejected,
@@ -2183,6 +2184,13 @@ mod downstream_runner_tests {
         }
         fn qap_endpoint(&self, _: &OatConfig) -> String {
             self.endpoint.clone()
+        }
+        fn resource_sampler_source(&self) -> Option<ResourceSamplerSource> {
+            matches!(self.fault, Fault::GuardUnavailable).then(|| ResourceSamplerSource::Local {
+                run_id: "stack-fixture".to_owned(),
+                environment: HashMap::new(),
+                collector_metrics_url: Some(format!("{}/metrics", self.endpoint)),
+            })
         }
         async fn ensure_stack(&mut self, _: &OatConfig, _: &str, _: u32) -> Result<()> {
             Ok(())
@@ -2332,6 +2340,21 @@ mod downstream_runner_tests {
                 text: "arrowcol_router_effective_config {\"log_filter\":\"warn,tiberius=error\"}\n".to_owned(),
             }])
         }
+        async fn process_logs_for_role(&self, _: &OatConfig, role: ComponentRole) -> Result<Vec<ProcessLog>> {
+            if matches!(self.fault, Fault::GuardUnavailable) && role == ComponentRole::Collector {
+                let text = concat!(
+                    "arrowcol_effective_config ",
+                    "{\"commit_telemetry\":{\"schema_version\":1,\"scope\":\"new_ingestion_addfiles_after_sync\",",
+                    "\"clock\":\"system_unix_ms\"},\"pressure\":{\"rss_limit_bytes\":1000,\"buffered_bytes_limit\":1000}}\n"
+                ).to_owned();
+                return Ok(vec![ProcessLog {
+                    role, instance_id: "pod/collector".to_owned(), image: None, image_id: None,
+                    source_revision: None, complete: true, raw_log_bytes: text.len() as u64,
+                    raw_log_lines: 1, stdout: text.clone(), stderr: String::new(), text,
+                }]);
+            }
+            Ok(Vec::new())
+        }
         async fn cleanup(&mut self, _: &OatConfig) -> Result<()> {
             Ok(())
         }
@@ -2341,28 +2364,82 @@ mod downstream_runner_tests {
         run_fault_with_lead(fault, kind, None).await
     }
 
+    #[cfg(unix)]
     #[test]
     #[ignore = "subprocess fixture for default Tokio worker stack"]
     fn matrix_default_worker_stack_child() -> Result<()> {
+        anyhow::ensure!(std::env::var_os("OAT_STACK_FIXTURE_CHILD").is_some(), "run the parent stack fixture");
         let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build()?;
         runtime.block_on(async {
             tokio::spawn(async {
-                let future = run_fault(Fault::PinInitFailed, crate::config::OatMode::Aks);
-                eprintln!("matrix fixture future bytes: {}", std::mem::size_of_val(&future));
-                let (_, platform) = future.await?;
-                anyhow::ensure!(platform.pin_init_calls == 1, "matrix did not reach run-table initialization");
+                let listener = TcpListener::bind("127.0.0.1:0").await?;
+                let endpoint = format!("http://{}", listener.local_addr()?);
+                let server = tokio::spawn(async move {
+                    axum::serve(listener, axum::Router::new().fallback(|| async { axum::http::StatusCode::SERVICE_UNAVAILABLE })).await
+                });
+                let platform = FaultPlatform {
+                    kind: crate::config::OatMode::Aks, fault: Fault::GuardUnavailable, endpoint,
+                    start: std::sync::atomic::AtomicU64::new(0), clients_started: 0,
+                    pin_init_calls: 0, qap_initialization_calls: 0, client_fleet_prepared: false,
+                    client_schedule_wait_seconds: None, arm_attempts: 0, arm_started: None,
+                    delivery_drop_ms: std::sync::atomic::AtomicU64::new(0),
+                    cancellations: std::sync::Mutex::new(Vec::new()), unresolved: false,
+                };
+                let mut config: OatConfig = serde_json::from_str(include_str!(
+                    "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+                ))?;
+                config.platform.kind = crate::config::OatMode::Aks;
+                config.platform.compose_file = None;
+                config.platform.compose_override_file = None;
+                config.platform.compose_project = None;
+                config.platform.compose_state_root = None;
+                std::fs::write("runtime.json", "")?;
+                std::fs::write("bootstrap.env", "")?;
+                config.platform.runtime_config_file = Some("runtime.json".to_owned());
+                config.platform.bootstrap_env_file = Some("bootstrap.env".to_owned());
+                config.stamp = Some("00000".to_owned());
+                config.edge_secret_name = "arrowcol-router-auth".to_owned();
+                config.dmv_client_image = "fixture.invalid/client:fixture".to_owned();
+                config.result_url = "abfss://experiments@fixture.dfs.core.windows.net/results.parquet".to_owned();
+                config.website_url = "abfss://$web@fixture.dfs.core.windows.net/results.parquet".to_owned();
+                config.overload_guard.enabled = true;
+                config.replica_counts = vec![1];
+                config.dfe_worker_concurrency = vec![1];
+                let state = Arc::new(AppState::default());
+                let (_cancel, cancellation) = watch::channel(false);
+                let outcome = STACK_TEST_PLATFORM.scope(
+                    std::sync::Mutex::new(Some(Box::new(platform))),
+                    run_matrix(&config, "stack-fixture", state, cancellation),
+                ).await;
+                server.abort();
+                let error = outcome.error.context("matrix unexpectedly admitted the unprotected fixture")?;
+                anyhow::ensure!(error.to_string().contains("overload_guard required protection unavailable before admission"), "unexpected matrix outcome: {error:#}");
+                anyhow::ensure!(outcome.aks_cleanup_confirmed, "fixture platform cleanup did not complete");
                 Ok::<_, anyhow::Error>(())
             }).await?
         })
     }
 
+    #[cfg(unix)]
     #[test]
     fn matrix_runs_on_default_tokio_worker_stack() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("oat-stack-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root)?;
+        let kubectl = root.join("kubectl");
+        fs::write(&kubectl, "#!/bin/sh\nprintf x > \"$0.hit\"\nexit 23\n")?;
+        fs::set_permissions(&kubectl, fs::Permissions::from_mode(0o700))?;
         let output = std::process::Command::new(std::env::current_exe()?)
             .args(["--exact", "runner::downstream_runner_tests::matrix_default_worker_stack_child", "--ignored", "--nocapture"])
             .env_remove("RUST_MIN_STACK")
+            .env("OAT_STACK_FIXTURE_CHILD", "1")
+            .env("PATH", &root)
+            .current_dir(&root)
             .output()?;
-        anyhow::ensure!(output.status.success(), "matrix worker subprocess failed: {}", String::from_utf8_lossy(&output.stderr));
+        let reached_guard = root.join("kubectl.hit").is_file();
+        fs::remove_dir_all(&root)?;
+        anyhow::ensure!(output.status.success(), "matrix worker subprocess failed:\n{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        anyhow::ensure!(reached_guard, "guard did not reach its live readback commands");
         Ok(())
     }
 
@@ -2413,7 +2490,6 @@ mod downstream_runner_tests {
             "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
         ))?;
         config.platform.kind = kind;
-        config.overload_guard.enabled = false;
         config.qap_timeout_seconds = if matches!(fault, Fault::InitTimeout) { 1 } else { 10 };
         if let Some(lead) = lead {
             config.schedule_lead_seconds = lead;

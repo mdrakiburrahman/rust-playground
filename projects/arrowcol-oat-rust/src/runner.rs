@@ -3236,7 +3236,8 @@ async fn run_matrix(
         orchestration_id,
         &state,
         move |cell_config, run_id, replicas, concurrency| {
-            run_isolated_cell(
+            // Keep cell lifecycle state out of the matrix poll frames on debug Tokio workers.
+            Box::pin(run_isolated_cell(
                 cell_config,
                 orchestration_id,
                 run_id,
@@ -3244,7 +3245,7 @@ async fn run_matrix(
                 cancellation.clone(),
                 submitted_config.clone(),
                 Arc::clone(&cell_state),
-            )
+            ))
         },
     )
     .await
@@ -3483,7 +3484,7 @@ async fn run_isolated_cell(
                 "ArrowCol scale",
             )?;
             match tokio::time::timeout_at(lifecycle_deadline, async {
-                let mut rows = run_matrix_cell(
+                let mut rows = Box::pin(run_matrix_cell(
                     &config,
                     orchestration_id,
                     &run_id,
@@ -3491,7 +3492,7 @@ async fn run_isolated_cell(
                     concurrency,
                     platform.as_mut(),
                     lifecycle_deadline,
-                ).await?;
+                )).await?;
                 if let Err(error) = platform.publish_official_measurement(
                     &config, &rows, submitted_config.as_ref(), lifecycle_deadline,
                 ).await {
@@ -3734,7 +3735,22 @@ fn matrix_cell_specs(config: &OatConfig) -> Vec<(u32, u32, usize, String)> {
     cells
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    static STACK_TEST_PLATFORM: std::sync::Mutex<Option<Box<dyn Platform>>>;
+}
+
 fn platform_for_run(config: &OatConfig, run_id: &str) -> Result<Box<dyn Platform>> {
+    #[cfg(test)]
+    if let Ok(platform) = STACK_TEST_PLATFORM.try_with(|platform| {
+        platform
+            .lock()
+            .map_err(|error| anyhow::anyhow!("stack test platform lock failed: {error}"))?
+            .take()
+            .context("stack test platform already consumed")
+    }) {
+        return platform;
+    }
     if config.campaign_profile == Some(crate::config::CampaignProfile::ScaleOutSingleTable)
         && config.platform.kind == crate::config::OatMode::Local
     {
