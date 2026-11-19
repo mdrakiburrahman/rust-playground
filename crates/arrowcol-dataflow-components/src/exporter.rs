@@ -2340,7 +2340,7 @@ mod tests {
             !error.permanent(),
             "terminal capacity errors must not reject durable input"
         );
-        assert!(error.to_string().contains("at least 2 files"), "{error}");
+        assert!(error.to_string().contains("at least 256 files"), "{error}");
         assert_eq!(add_file_count(&root), 0, "preflight rejection must write no output");
     }
 
