@@ -8,6 +8,9 @@ import { acceptRouterFencePatch, planRouterFence, routerFenceObserved } from './
 import { persistDirectStopPatch } from './benchmark-stop-patch.js';
 import { observeCompletedClients } from './benchmark-client-terminal.js';
 import { persistDirectEvidence } from './benchmark-evidence-custody.js';
+import { captureFrozenDelta, directDeltaReplay } from './benchmark-delta-evidence.js';
+import type { Azure } from './bootstrap.js';
+import { validateDirectTerminal, type DirectTerminalArm, type DirectTerminalObservations } from './benchmark-terminal-custody.js';
 import { clientLogExportPod, exportWriterLogs, writerLogExportPod } from './benchmark-writer-export.js';
 import { observeStoppedWriterRegistration, pinWriterRegistration } from './benchmark-writer-sql.js';
 
@@ -20,6 +23,40 @@ const run = {
 };
 const uid = 'cdcdcdcd-1234-1234-1234-cdcdcdcdcdcd';
 const markers = { 'arrowcol-oat/run-id': run.runId, 'arrowcol-oat/owner-token': run.owner };
+test('replays the direct invariants protocol and rejects deletion vectors and unknown actions', () => {
+  const replay = directDeltaReplay();
+  const commit = (...actions: unknown[]) => Buffer.from(actions.map(value => JSON.stringify(value)).join('\n') + '\n');
+  replay.apply(commit({ protocol: { minReaderVersion: 3, minWriterVersion: 7, readerFeatures: [], writerFeatures: ['invariants'] } },
+    { metaData: { id: uid } }, { add: { path: 'hour=00/first.parquet', size: 237 } }));
+  replay.apply(commit({ remove: { path: 'hour=00/first.parquet', dataChange: false } },
+    { add: { path: 'hour=00/optimized.parquet', size: 67, dataChange: false } }));
+  assert.deepEqual(replay.snapshot, { table_id: uid, version: 1, active_files: [{ path: 'hour=00/optimized.parquet', size: 67n }] });
+  assert.throws(() => replay.apply(commit({ add: { path: 'bad.parquet', size: 10, deletionVector: {} } })), /unsupported Delta add/);
+  assert.throws(() => replay.apply(commit({ cdc: { path: 'bad.parquet' } })), /Unsupported direct Delta action/);
+  assert.equal(replay.snapshot.version, 1, 'a rejected commit must not advance the replay');
+  assert.throws(() => directDeltaReplay().apply(commit({ protocol: { minReaderVersion: 3, minWriterVersion: 7,
+    readerFeatures: ['deletionVectors'], writerFeatures: ['invariants'] } })), /Unsupported or changed direct Delta protocol/);
+});
+test('refuses a checkpoint beyond the available JSON before downloading any commits', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'direct-checkpoint-'));
+  const tableRoot = `direct-baseline-1/runs/${run.runId}/dataflow/table`;
+  const calls: string[] = [];
+  const blob: Azure['blob'] = async (method, _, path, query) => {
+    calls.push(`${method} ${path}`);
+    const prefix = `${tableRoot}/_delta_log/`;
+    assert.equal(query?.prefix, prefix);
+    const names = ['00000000000000000000.json', '00000000000000000001.json', '00000000000000000009.checkpoint.parquet'];
+    const objects = names.map(name => `<Blob><Name>${prefix}${name}</Name><Properties><Etag>"original"</Etag></Properties></Blob>`).join('');
+    return [Buffer.from(`<EnumerationResults><Prefix>${prefix}</Prefix><Blobs>${objects}</Blobs><NextMarker /></EnumerationResults>`),
+      { ':status': '200', 'x-ms-request-id': 'read' }];
+  };
+  try {
+    await assert.rejects(() => captureFrozenDelta({ c: { data: 'data' }, blob } as Azure, { assertCurrent: async () => {} }, run.runId,
+      tableRoot, { table_root: tableRoot, table_id: uid, version: 0, last_commit_sha256: '0'.repeat(64) }, directory),
+    /checkpoint extends beyond the complete JSON/);
+    assert.deepEqual(calls, ['GET ']);
+  } finally { await rm(directory, { recursive: true }); }
+});
 test('seals only read-back-verified original bytes and refuses an altered input', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'bench-custody-'));
   try {
@@ -135,6 +172,37 @@ test('binds SQL stop to one original run generation, endpoint and registration l
     assert.throws(() => observeStoppedWriterRegistration(run, generation, writer, pin, [bad]), /newer SQL stopped observation/);
   }
   assert.deepEqual(observeStoppedWriterRegistration(run, generation, writer, pin, [stopped]), stopped);
+});
+
+test('direct terminal gate blocks reordered stop receipts before consuming terminal observations', () => {
+  const endMs = Date.parse('2026-01-01T00:02:00Z');
+  const origin = { ...run, cloudGeneration: uid, sourceRevision: 'b'.repeat(40), fencingToken: 1 };
+  const original = {
+    deploymentUid: uid, replicaSetUid: uid, podName: 'pod', podUid: uid, podIp: '10.0.0.1', nodeName: 'node',
+    image: `test@sha256:${'a'.repeat(64)}`, imageId: `sha256:${'a'.repeat(64)}`, containerId: 'original', startedAt: '2026-01-01T00:00:00Z',
+  };
+  const arm: DirectTerminalArm = {
+    origin, startMs: endMs - 60000, endMs, clients: [], writer: original, maintenance: original, routerUid: uid,
+    writerClaim: { claimUid: run.owner, volumeName: 'pv' }, baseline: {
+      table_id: uid, table_root: `direct-baseline-1/runs/${run.runId}/dataflow/table`, version: 1, last_commit_sha256: '0'.repeat(64),
+    }, registration: { instance_id: uid, instance_key: '', implementation_pool: 'dataflow', flight_endpoint: '',
+      state: 'ready', started_at_utc: original.startedAt, row_version: '0x0000000000000001' },
+  };
+  const make = (role: 'arrowcol-router' | 'arrowcol' | 'delta-maintenance', at: number) => ({
+    path: `_arrowcol-custody/direct/${origin.runId}/${origin.namespaceUid}/stop-${role}.json`, version: '"1"',
+    receipt: { phase: 'responded', intent: { schema_version: 1, origin, role, uid, ops: [], observed_generation: 1, intent_at_ms: at },
+      response: '{}', response_sha256: createHash('sha256').update('{}').digest('hex') },
+  });
+  const observation: DirectTerminalObservations = {
+    stops: { router: make('arrowcol-router', endMs + 2), writer: make('arrowcol', endMs + 1), maintenance: make('delta-maintenance', endMs + 3) },
+    job: null, clients: null, claims: new Map(), router: null, routerPods: null,
+    routerEndpoints: { 'arrowcol-router': null, 'arrowcol-router-node-local': null },
+    writer: null, writerClaim: null, writerDeployment: null, writerPods: null,
+    maintenance: null, maintenanceDeployment: null, maintenancePods: null, sql: [],
+  };
+  assert.throws(() => validateDirectTerminal(arm, observation), /sequence is out of order/);
+  observation.stops.writer.receipt.response = '{"wrong":true}';
+  assert.throws(() => validateDirectTerminal(arm, observation), /original response/);
 });
 
 test('never replays an unknown PATCH and only persists the exact original positive response', async () => {

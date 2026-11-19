@@ -170,7 +170,8 @@ function matchesImageDigest(image: string, imageId: string): boolean {
 }
 
 /** Call on a positive Pod API observation; absence is never terminal evidence. */
-export function observeWriterExit(identity: ArmIdentity, original: WriterLifetime, value: unknown, drainStartedMs: number) {
+export function observeWriterExit(identity: ArmIdentity, original: WriterLifetime, value: unknown, drainStartedMs: number,
+  containerName: 'dataflow' | 'maintenance' = 'dataflow') {
   const pod = object(value, 'terminal writer Pod');
   const pm = object(pod.metadata, 'terminal writer metadata');
   ownership(pm, identity);
@@ -189,8 +190,8 @@ export function observeWriterExit(identity: ArmIdentity, original: WriterLifetim
   const startedAt = text(ended.startedAt, 'writer termination start');
   const finishedAt = text(ended.finishedAt, 'writer termination finish');
   const finishMs = Date.parse(finishedAt);
-  if (container.name !== 'dataflow' || container.image !== original.image ||
-      status.name !== 'dataflow' || status.restartCount !== 0 || status.imageID !== original.imageId ||
+  if (container.name !== containerName || container.image !== original.image ||
+      status.name !== containerName || status.restartCount !== 0 || status.imageID !== original.imageId ||
       !matchesImageDigest(original.image, original.imageId) ||
       status.containerID !== original.containerId || ended.containerID !== original.containerId ||
       Object.keys(state).length !== 1 || startedAt !== original.startedAt || !Number.isFinite(Date.parse(startedAt)) ||

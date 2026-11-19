@@ -101,8 +101,8 @@
 # Its readline implementation buffers each complete line before applying the 8-MiB line cap.
 # Check every command exit and preserve the original logs.
 # kubectl logs only returns the latest rotated file; do not use it as original evidence.
-# npx --no-install tsx infra/azure/benchmark-extract.ts manifest "$EVIDENCE/client-$INDEX.log" "$EVIDENCE/client-$INDEX-manifest.json"
-# npx --no-install tsx infra/azure/benchmark-extract.ts collector "$EVIDENCE/collector.log" "$EVIDENCE/collector-receipts.jsonl"
+# npx --no-install tsx infra/azure/benchmark-extract.ts manifest "$EVIDENCE/client-$INDEX-stdout.raw" "$EVIDENCE/client-$INDEX-manifest.json"
+# npx --no-install tsx infra/azure/benchmark-extract.ts collector "$EVIDENCE/writer-stderr.raw" "$EVIDENCE/collector-receipts.jsonl"
 # Extractor writes new files only; any error leaves an incomplete output that must not be used.
 # Resolve the exact table's _delta_log prefix from the run's catalog/initializer receipt. After drain,
 # download all its JSON blobs:

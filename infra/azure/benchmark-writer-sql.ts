@@ -1,10 +1,15 @@
 import { isIP } from 'node:net';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import type { ArmIdentity, WriterLifetime, observeWriterExit } from './benchmark-arm.js';
+import { evidenceList, evidenceObject, evidenceText, parseEvidence } from './benchmark-evidence-json.js';
+import type { RunCleanupAuthority } from './run_fic.js';
 
 type Writer = WriterLifetime;
 type WriterExit = ReturnType<typeof observeWriterExit>;
 const uuid = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/;
 const sqlUtc = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{7}Z$/;
+const exec = promisify(execFile);
 
 export interface WriterRegistration {
   instance_id: string;
@@ -14,6 +19,39 @@ export interface WriterRegistration {
   state: string;
   started_at_utc: string;
   row_version: string;
+}
+
+export async function readWriterRegistrations(authority: RunCleanupAuthority, run: ArmIdentity, generation: string,
+  context: string, server: string, sqlPod: { name: string; uid: string }, assertSqlLifetime: () => Promise<void>): Promise<WriterRegistration[]> {
+  if (!uuid.test(run.runId) || !uuid.test(generation) || !uuid.test(sqlPod.uid) ||
+      !/^arrowcol-sql-[a-z0-9-]+$/.test(sqlPod.name) || !/^https:\/\/[a-z0-9.-]+$/.test(server)) {
+    throw new Error('SQL observation does not identify the original run and TLS server');
+  }
+  const key = `direct-single-writer-${run.runId}|cloud=${generation}`;
+  const query = `SET NOCOUNT ON;
+    SELECT CAST((SELECT TOP (2)
+      LOWER(CONVERT(char(36), instance_id)) AS instance_id, instance_key, implementation_pool, flight_endpoint, state,
+      CONCAT(FORMAT(started_at_utc, 'yyyy-MM-ddTHH:mm:ss.fffffff', 'en-US'), 'Z') AS started_at_utc,
+      CONVERT(varchar(18), row_version, 1) AS row_version
+      FROM arrowcol.routing_collectors WHERE instance_key = '${key}' FOR JSON PATH) AS nvarchar(2000));`;
+  await authority.assertCurrent();
+  await assertSqlLifetime();
+  const args = ['--context', context, '--server', server, '--insecure-skip-tls-verify=false', '--request-timeout=16s',
+    '-n', run.namespace, 'exec', sqlPod.name, '-c', 'sqlserver', '--', '/usr/local/bin/sqlcmd-secret', '-S', 'localhost,1433',
+    '-U', 'sa', '-d', 'arrowcol', '-Q', query, '-b', '-h', '-1', '-W', '-w', '4096', '-l', '5', '-t', '6'];
+  let stdout: string;
+  try { ({ stdout } = await exec('kubectl', args, { timeout: 20_000, maxBuffer: 8_192 })); }
+  catch { throw new Error('Original SQL collector observation failed; terminal state is unknown'); }
+  await authority.assertCurrent();
+  await assertSqlLifetime();
+  return evidenceList(parseEvidence(stdout)).map(value => {
+    const row = evidenceObject(value);
+    return {
+      instance_id: evidenceText(row.instance_id), instance_key: evidenceText(row.instance_key),
+      implementation_pool: evidenceText(row.implementation_pool), flight_endpoint: evidenceText(row.flight_endpoint),
+      state: evidenceText(row.state), started_at_utc: evidenceText(row.started_at_utc), row_version: evidenceText(row.row_version),
+    };
+  });
 }
 
 function originalRegistration(run: ArmIdentity, generation: string, writer: Writer,
