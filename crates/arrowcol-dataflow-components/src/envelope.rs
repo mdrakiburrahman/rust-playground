@@ -334,17 +334,14 @@ fn encode_schema_id_v1_3(
     Ok(format!("{SCHEMA_ID_PREFIX}{}", URL_SAFE_NO_PAD.encode(encoded)))
 }
 
-fn decode_schema_id_v1_3(
-    schema_id: &PdataSchemaId,
-) -> Result<
-    (
-        ArrowcolBatchEnvelope,
-        Option<ClientSendObservation>,
-        Option<AuditLogicalPublication>,
-        Option<u64>,
-    ),
-    EnvelopeError,
-> {
+type DecodedSchemaV1_3 = (
+    ArrowcolBatchEnvelope,
+    Option<ClientSendObservation>,
+    Option<AuditLogicalPublication>,
+    Option<u64>,
+);
+
+fn decode_schema_id_v1_3(schema_id: &PdataSchemaId) -> Result<DecodedSchemaV1_3, EnvelopeError> {
     let encoded = schema_id
         .as_str()
         .strip_prefix(SCHEMA_ID_PREFIX)

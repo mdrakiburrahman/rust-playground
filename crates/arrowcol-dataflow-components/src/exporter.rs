@@ -592,6 +592,10 @@ impl Capacity {
     }
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The bounded queue owns batches inline to avoid a per-publication allocation."
+)]
 enum WorkerCommand {
     Batch(QueuedBatch),
     Flush(oneshot::Sender<()>),
