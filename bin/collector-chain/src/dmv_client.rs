@@ -1798,17 +1798,27 @@ impl PreparedClient {
         {
             return Ok(None);
         }
-        let logical = self.prepare_logical_batch(worker, template).await?;
-        self.send_encoded_one(worker, channel, &logical, measurement).await
+        let mut logical = self.prepare_logical_batch(worker, template).await?;
+        self.send_encoded_one(worker, channel, &mut logical, measurement, true)
+            .await
     }
 
     async fn send_encoded_one(
         &self,
         worker: usize,
         channel: Channel,
-        logical: &LogicalBatch,
+        logical: &mut LogicalBatch,
         measurement: Option<&Measurement>,
+        consume_encoded_data: bool,
     ) -> Result<Option<(DeliveryGuarantee, u64)>> {
+        let data = if consume_encoded_data {
+            match Arc::get_mut(&mut logical.batch.data) {
+                Some(data) => std::mem::take(data),
+                None => logical.batch.data.as_ref().clone(),
+            }
+        } else {
+            logical.batch.data.as_ref().clone()
+        };
         let batch = &logical.batch;
         let counters = &self.counters[worker];
         counters.attempted_rows.fetch_add(batch.rows, Ordering::Relaxed);
@@ -1824,7 +1834,7 @@ impl PreparedClient {
             finished: false,
         };
         let observation = SendObservation::fresh()?;
-        let mut request = Request::new(stream::iter(batch.data.as_ref().clone()));
+        let mut request = Request::new(stream::iter(data));
         let timeout = Duration::from_millis(self.options.request_timeout_ms);
         let result = tokio::time::timeout(timeout, async {
             request_metadata(
@@ -1953,12 +1963,19 @@ impl PreparedClient {
         E: std::future::Future<Output = Result<()>>,
         W: FnMut() -> Result<bool>,
     {
-        let Some(logical) = self.prepare_continuous_logical_batch(worker, batch, admission).await? else {
+        let Some(mut logical) = self.prepare_continuous_logical_batch(worker, batch, admission).await? else {
             return Ok(false);
         };
         for attempt in 1..=self.options.stream_retry_max_attempts {
+            let consume_encoded_data = attempt == self.options.stream_retry_max_attempts;
             match self
-                .send_encoded_one(worker, channel.clone(), &logical, Some(measurement))
+                .send_encoded_one(
+                    worker,
+                    channel.clone(),
+                    &mut logical,
+                    Some(measurement),
+                    consume_encoded_data,
+                )
                 .await
             {
                 Ok(Some(_)) => return Ok(true),
