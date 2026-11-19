@@ -125,9 +125,17 @@ test('scores half-open windows conservatively across client and collector clock 
   const event = receipt(3, 'a.parquet', 0n, 1, '1970-01-01T00:00:01.000000000Z');
   Object.assign(event.fields, { admitted_at_unix_ms: 999n, transaction_files: `[("${app(3)}", 1, 999, [0])]` });
   const zero = { lowerNs: 0n, upperNs: 0n };
-  const evaluate = (timestamp: string, client = zero, collector = zero) => reconcilePublications(
-    [m], [{ ...event, timestamp }], history([txn(), add()]), 0n,
-    { diagnostic: true, timing: { clients: [client], collector } });
+  const evaluate = (timestamp: string, client = zero, collector = zero, sendNs = 1_000_000_000n) => {
+    const admission = sendNs / 1_000_000n;
+    Object.assign(m.ranges[0], { first_send_unix_ns: sendNs, last_send_unix_ns: sendNs,
+      first_admitted_unix_ms: admission, last_admitted_unix_ms: admission,
+      first_outcome_unix_ms: admission, last_outcome_unix_ms: admission });
+    const collectorAdmission = Math.min(999, Date.parse(timestamp));
+    const fields = { ...event.fields, admitted_at_unix_ms: BigInt(collectorAdmission),
+      transaction_files: `[("${app(3)}", 1, ${collectorAdmission}, [0])]` };
+    return reconcilePublications([m], [{ ...event, timestamp, fields }], history([txn(), add()]), 0n,
+      { diagnostic: true, timing: { clients: [client], collector } });
+  };
   const exactStart = await evaluate('1970-01-01T00:00:01.000000000Z');
   assert.equal(exactStart.diagnostic_clock_inconsistencies, 1);
   assert.equal(exactStart.timed_scoring?.scored_rows, 2n);
@@ -142,15 +150,25 @@ test('scores half-open windows conservatively across client and collector clock 
   assert.equal(nearEnd.timed_scoring?.excluded.boundary_uncertain.rows, 2n);
   const ahead = { lowerNs: 50_000_000n, upperNs: 50_000_000n };
   const behind = { lowerNs: -50_000_000n, upperNs: -50_000_000n };
-  assert.equal((await evaluate('1970-01-01T00:00:01.050000000Z', ahead, behind)).timed_scoring?.scored_rows, 2n);
-  assert.equal((await evaluate('1970-01-01T00:00:01.050000000Z', behind, ahead)).timed_scoring?.excluded.before_window.rows, 2n);
+  assert.equal((await evaluate('1970-01-01T00:00:01.050000000Z', ahead, behind)).timed_scoring?.excluded.before_window.rows, 2n);
+  assert.equal((await evaluate('1970-01-01T00:00:01.050000000Z', behind, ahead)).timed_scoring?.scored_rows, 2n);
+  assert.equal((await evaluate('1970-01-01T00:00:00.990000000Z', { lowerNs: 80_000_000n, upperNs: 80_000_000n })).timed_scoring?.excluded.before_window.rows, 2n);
+  assert.equal((await evaluate('1970-01-01T00:00:02.000000000Z', behind, zero)).timed_scoring?.scored_rows, 2n);
+  assert.equal((await evaluate('1970-01-01T00:10:00.999000000Z', behind, zero, 600_999_950_000n)).timed_scoring?.excluded.after_window.rows, 2n);
+  const minuteEdge = await evaluate('1970-01-01T00:01:01.000000000Z', zero, uncertainty, 2_000_000_000n);
+  assert.equal(minuteEdge.timed_scoring?.excluded.boundary_uncertain.rows, 2n);
+  assert.equal((await evaluate('1970-01-01T00:01:01.000000000Z', zero, zero, 2_000_000_000n)).timed_scoring?.minutes[1].rows, 2n);
   const missing = await reconcilePublications([m], [event], history([txn(), add()]), 0n, { diagnostic: true, timing: null });
   assert.equal(missing.timed_scoring, null);
 });
 test('excludes only boundary-uncertain work while retaining other scored commits', async () => {
   const m = manifest(2n);
-  Object.assign(m.ranges[0], { last_sequence: 1n, first_send_unix_ns: 1_000_000_000n,
-    last_send_unix_ns: 1_000_000_000n, ...fact(2n, 40n) });
+  Object.assign(m.ranges[0], { last_sequence: 0n, batch_count: 1n, first_send_unix_ns: 1_000_000_000n,
+    last_send_unix_ns: 1_000_000_000n, first_admitted_unix_ms: 1000n, last_admitted_unix_ms: 1000n,
+    first_outcome_unix_ms: 1000n, last_outcome_unix_ms: 1000n, ...fact(1n, 20n), batch_facts: facts(1n) });
+  m.ranges.push({ ...m.ranges[0], first_sequence: 1n, last_sequence: 1n, first_send_unix_ns: 2_000_000_000n,
+    last_send_unix_ns: 2_000_000_000n, first_admitted_unix_ms: 2000n, last_admitted_unix_ms: 2000n,
+    first_outcome_unix_ms: 2000n, last_outcome_unix_ms: 2000n });
   const edge = receipt(3, 'a.parquet', 0n, 1, '1970-01-01T00:00:01.050000000Z');
   Object.assign(edge.fields, { admitted_at_unix_ms: 999n, transaction_files: `[("${app(3)}", 1, 999, [0])]` });
   const inside = receipt(4, 'b.parquet', 0n, 2, '1970-01-01T00:00:03.000000000Z');

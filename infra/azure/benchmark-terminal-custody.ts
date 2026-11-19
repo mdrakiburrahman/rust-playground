@@ -39,7 +39,8 @@ export type DirectTerminalArm = {
   routers: ReturnType<typeof observeRouterLifetimes>;
   registration: WriterRegistration;
   routerUid: string;
-  provenance: { clocks: DirectClockReading[]; release: unknown; catalog: unknown; catalogLog: string; schedule: unknown };
+  provenance: { clocks: DirectClockReading[]; release: unknown; catalog: unknown; catalogLog: string; schedule: unknown;
+    transport: { clients: unknown; routers: unknown; receiver: unknown }; parquet: unknown };
 };
 export type DirectTerminalObservations = {
   job: unknown;

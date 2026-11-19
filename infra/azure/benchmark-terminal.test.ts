@@ -9,7 +9,7 @@ import { persistDirectStopPatch } from './benchmark-stop-patch.js';
 import { observeCompletedClients } from './benchmark-client-terminal.js';
 import { persistDirectEvidence } from './benchmark-evidence-custody.js';
 import { captureDirectBaseline, captureFrozenDelta, directDeltaReplay } from './benchmark-delta-evidence.js';
-import { directCatalogRoot, type DirectRelease } from './benchmark-direct-arm.js';
+import { directCatalogRoot, directClientTransport, directParquetConfig, directReceiverTransport, directRouterTransport, type DirectRelease } from './benchmark-direct-arm.js';
 import { checkDirectClocks, directClockBound, directClockOffsets } from './benchmark-clock.js';
 import { directProducerAuthority } from './benchmark-run-authority.js';
 import type { CampaignStore, StoredCampaign } from '../../projects/arrowcol-oat/aks-campaign.js';
@@ -77,6 +77,25 @@ test('requires a unique original catalog receipt and conservative clock brackets
   assert.throws(() => checkDirectClocks(nodes, now + 100, now + 10_001, before, after), /bracket/);
   assert.deepEqual(directClockOffsets(nodes, now + 100, now + 10_000, before, after).get('n'),
     { lowerNs: -1_000_000n, upperNs: 0n });
+});
+test('requires original effective transport readbacks without duplicates or drift', () => {
+  const client = 'OAT_CLIENT_EFFECTIVE_CONFIG {"stream_window_bytes":1048576,"connection_window_bytes":16777216,"adaptive_window":false,"tcp_nodelay":true}';
+  const router = 'arrowcol_router_effective_config {"downstream_h2":{"stream_window_bytes":1048576,"connection_window_bytes":16777216},"upstream":{"stream_window_bytes":1048576,"connection_window_bytes":16777216}}';
+  const receiver = 'arrowcol_effective_config {"component":"receiver","config":{"transport":{"initial_stream_window_size":1048576,"initial_connection_window_size":16777216,"adaptive_window":false,"tcp_nodelay":true}}}';
+  const parquet = 'arrowcol_effective_config {"parquet_writer":{"defaults":{"compression":"zstd","compression_level":2}}}';
+  assert.equal(directClientTransport(client).tcp_nodelay, true);
+  assert.equal(directRouterTransport(router).upstream.connection_window_bytes, 16777216);
+  assert.equal(directReceiverTransport(receiver).tcp_nodelay, true);
+  assert.equal(directParquetConfig(parquet).compression_level, 2);
+  assert.throws(() => directClientTransport(`${client}\n${client}`), /duplicate/);
+  assert.throws(() => directClientTransport(client.replace('16777216', '65535')), /differs/);
+  assert.throws(() => directRouterTransport(router.replace('16777216', '65535')), /differs/);
+  assert.throws(() => directRouterTransport(''), /Missing/);
+  assert.throws(() => directReceiverTransport(`${receiver}\n${receiver}`), /duplicate/);
+  assert.throws(() => directReceiverTransport(receiver.replace('16777216', '65535')), /differs/);
+  assert.throws(() => directReceiverTransport(''), /Missing/);
+  assert.throws(() => directParquetConfig(`${parquet}\n${parquet}`), /duplicate/);
+  assert.throws(() => directParquetConfig(parquet.replace('"compression_level":2', '"compression_level":1')), /differs/);
 });
 test('requires a clean MODIFIED event for the original Pod; disappearance, restart and watch expiry fail', async () => {
   const imageId = `sha256:${'a'.repeat(64)}`, image = `test@${imageId}`, startedAt = '2026-01-01T00:00:00Z';
@@ -383,7 +402,7 @@ test('direct terminal gate blocks reordered stop receipts before consuming termi
   const arm: DirectTerminalArm = {
     origin, startMs: endMs - 60000, endMs, clients: [], writer: original, maintenance: original, sql: original,
     catalogLifetime: original, routers: [], routerUid: uid,
-    provenance: { clocks: [], release: {}, catalog: {}, catalogLog: '', schedule: [] },
+    provenance: { clocks: [], release: {}, catalog: {}, catalogLog: '', schedule: [], transport: { clients: [], routers: [], receiver: {} }, parquet: {} },
     writerClaim: { claimUid: run.owner, volumeName: 'pv' }, baseline: {
       table_id: uid, table_root: `direct-baseline-1/runs/${run.runId}/dataflow/table`, version: 1, last_commit_sha256: '0'.repeat(64),
       history_sha256: '0'.repeat(64),

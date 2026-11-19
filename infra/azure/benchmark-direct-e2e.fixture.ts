@@ -37,7 +37,14 @@ export function fakeKubectl() {
     assert.ok(object, 'unhandled fake Kubernetes GET ' + kind + '/' + name);
     return emit(object);
   }
-  if (verb === 'logs') return emit(s.catalogLog);
+  if (verb === 'logs') {
+    if (kind === 'catalog-register') return emit(s.catalogLog);
+    const window = s.fault === 'router-transport' ? 65535 : 16777216;
+    return emit('arrowcol_router_effective_config ' + JSON.stringify({
+      downstream_h2: { stream_window_bytes: 1048576, connection_window_bytes: window },
+      upstream: { stream_window_bytes: 1048576, connection_window_bytes: 16777216 },
+    }) + '\n');
+  }
   if (verb === 'create') {
     const pod = JSON.parse(fs.readFileSync(0, 'utf8'));
     assert.ok(pod.metadata.name.endsWith('-log-export'));
@@ -111,6 +118,20 @@ export function fakeKubectl() {
   if (cmd[0] === '/bin/sh') {
     if (kind === s.roles.arrowcol) return emit('writer-capture-active\n');
     return emit('OAT_CLIENT_READY client_id=direct-' + s.runId + '-0 preflight_tables=1\n');
+  }
+  if (cmd[0] === '/bin/cat' && kind === 'client-0') {
+    return emit('OAT_CLIENT_EFFECTIVE_CONFIG ' + JSON.stringify({
+      stream_window_bytes: 1048576, connection_window_bytes: 16777216,
+      adaptive_window: false, tcp_nodelay: s.fault !== 'client-transport',
+    }) + '\n');
+  }
+  if (cmd[0] === '/bin/cat' && kind === s.roles.arrowcol) {
+    return emit('arrowcol_effective_config ' + JSON.stringify({ component: 'receiver', config: { transport: {
+      initial_stream_window_size: 1048576, initial_connection_window_size: 16777216,
+      adaptive_window: false, tcp_nodelay: s.fault !== 'receiver-transport',
+    } } }) + '\narrowcol_effective_config ' + JSON.stringify({
+      parquet_writer: { defaults: { compression: 'zstd', compression_level: s.fault === 'parquet-config' ? 1 : 2 } },
+    }) + '\n');
   }
   const stream = cmd.at(-1)!.split('/').at(-1);
   const owner = kind === 'direct-writer-log-export' ? 'writer' : 'client';

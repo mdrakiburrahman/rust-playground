@@ -215,19 +215,20 @@ export async function reconcilePublications(manifests: readonly unknown[], event
       bucket.canonical_bytes += receipt.canonical;
       if (timing) {
         const client = timing.clients[parent.client], collector = timing.collector;
-        const first = observedStartNs - collector.upperNs + client.lowerNs;
-        const lastExclusive = observedEndNs - collector.lowerNs + client.upperNs;
+        const first = observedStartNs - collector.upperNs;
+        const lastExclusive = observedEndNs - collector.lowerNs;
+        const firstSend = parent.firstSend - client.upperNs;
+        const lastSend = parent.lastSend - client.lowerNs;
         const startNs = start * 1_000_000n, endNs = end * 1_000_000n;
         const firstMinute = first >= startNs ? (first - startNs) / 60_000_000_000n : -1n;
         const lastMinute = lastExclusive > startNs ? (lastExclusive - 1n - startNs) / 60_000_000_000n : -1n;
-        const sendInside = parent.firstSend >= startNs && parent.lastSend < endNs;
+        const sendInside = firstSend >= startNs && lastSend < endNs;
         let destination: ReturnType<typeof totals>;
         if (sendInside && first >= startNs && lastExclusive <= endNs && firstMinute === lastMinute)
           destination = timedMinutes[Number(firstMinute)];
         else {
-          const reason = send !== 'measurement' ? `${send}:excluded` :
-            first < endNs && lastExclusive > startNs ? 'boundary_uncertain' :
-            lastExclusive <= startNs ? 'before_window' : 'after_window';
+          const reason = lastSend < startNs || lastExclusive <= startNs ? 'before_window' :
+            firstSend >= endNs || first >= endNs ? 'after_window' : 'boundary_uncertain';
           destination = timedExcluded[reason] ??= totals();
         }
         destination.rows += receipt.rows;

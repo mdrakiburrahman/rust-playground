@@ -18,6 +18,7 @@ const digest = /^[^\s@]+@sha256:[a-f0-9]{64}$/;
 const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
 const table = 'telemetry.sqlserver.sqlserver_availability_replica_states';
 const registration = 'direct-catalog-verified';
+const streamWindow = 1_048_576n, connectionWindow = 16_777_216n;
 export type DirectRelease = {
   revision: string;
   schemaFingerprint: string;
@@ -34,6 +35,58 @@ export function directCatalogRoot(log: string, origin: DirectStopOrigin, release
     receipt.provider === 'delta' && receipt.schema_version === 1n && receipt.catalog_table_count === 1n &&
     receipt.schema_fingerprint === release.schemaFingerprint, 'Original catalog receipt does not prove the configured table, path and schema');
   return relative;
+}
+
+function effectiveConfig(log: string, marker: string) {
+  const lines = log.split(/\r?\n/).filter(line => line.startsWith(marker));
+  requireEvidence(lines.length === 1, `Missing or duplicate ${marker.trim()} readback`);
+  return { raw: lines[0], config: evidenceObject(parseEvidence(lines[0].slice(marker.length))) };
+}
+
+export function directClientTransport(log: string) {
+  const { config, raw } = effectiveConfig(log, 'OAT_CLIENT_EFFECTIVE_CONFIG ');
+  requireEvidence(config.stream_window_bytes === streamWindow && config.connection_window_bytes === connectionWindow &&
+    config.adaptive_window === false && config.tcp_nodelay === true, 'Client effective transport differs from the approved settings');
+  return { raw, stream_window_bytes: Number(config.stream_window_bytes), connection_window_bytes: Number(config.connection_window_bytes),
+    adaptive_window: config.adaptive_window, tcp_nodelay: config.tcp_nodelay };
+}
+
+export function directRouterTransport(log: string) {
+  const { config, raw } = effectiveConfig(log, 'arrowcol_router_effective_config ');
+  const downstream = evidenceObject(config.downstream_h2), upstream = evidenceObject(config.upstream);
+  requireEvidence([downstream, upstream].every(part => part.stream_window_bytes === streamWindow &&
+    part.connection_window_bytes === connectionWindow), 'Router effective transport differs from the approved settings');
+  return { raw, downstream: { stream_window_bytes: Number(downstream.stream_window_bytes), connection_window_bytes: Number(downstream.connection_window_bytes) },
+    upstream: { stream_window_bytes: Number(upstream.stream_window_bytes), connection_window_bytes: Number(upstream.connection_window_bytes) } };
+}
+
+export function directReceiverTransport(log: string) {
+  const marker = 'arrowcol_effective_config ';
+  const entries = log.split(/\r?\n/).filter(line => line.startsWith(marker))
+    .map(raw => ({ raw, event: evidenceObject(parseEvidence(raw.slice(marker.length))) }))
+    .filter(({ event }) => event.component === 'receiver');
+  requireEvidence(entries.length === 1, 'Missing or duplicate receiver effective transport readback');
+  const { raw, event } = entries[0];
+  const transport = evidenceObject(evidenceObject(event.config).transport);
+  requireEvidence(transport.initial_stream_window_size === streamWindow &&
+    transport.initial_connection_window_size === connectionWindow && transport.adaptive_window === false &&
+    transport.tcp_nodelay === true, 'Receiver effective transport differs from the approved settings');
+  return { raw, stream_window_bytes: Number(transport.initial_stream_window_size),
+    connection_window_bytes: Number(transport.initial_connection_window_size), adaptive_window: transport.adaptive_window,
+    tcp_nodelay: transport.tcp_nodelay };
+}
+
+export function directParquetConfig(log: string) {
+  const marker = 'arrowcol_effective_config ';
+  const entries = log.split(/\r?\n/).filter(line => line.startsWith(marker))
+    .map(raw => ({ raw, event: evidenceObject(parseEvidence(raw.slice(marker.length))) }))
+    .filter(({ event }) => event.parquet_writer !== undefined);
+  requireEvidence(entries.length === 1, 'Missing or duplicate Parquet startup policy readback');
+  const { raw, event } = entries[0];
+  const defaults = evidenceObject(evidenceObject(event.parquet_writer).defaults);
+  requireEvidence(defaults.compression === 'zstd' && defaults.compression_level === 2n,
+    'Parquet startup policy differs from the approved settings');
+  return { raw, compression: defaults.compression, compression_level: Number(defaults.compression_level) };
 }
 
 /** Call only with the approved immutable release pins and an existing exclusive run authority. */
@@ -127,6 +180,15 @@ export async function armDirectBenchmark(azure: Azure, campaign: DirectCampaignS
     'Original writer or clients differ from the approved release pins');
   requireEvidence(prepared.clients.every(client => routers.some(route => route.nodeName === client.nodeName)),
     'Original client node has no pinned local router');
+  const [clientTransport, routerTransport, writerConfig] = await Promise.all([
+    Promise.all(prepared.clients.map(async client => ({ podUid: client.uid, config: directClientTransport(
+      await run('exec', client.name, '-c', 'generator', '--', '/bin/cat', `/evidence/${client.uid}/stdout`)) }))),
+    Promise.all(routers.map(async router => ({ podUid: router.uid, config: directRouterTransport(
+      await run('logs', router.name, '-c', 'router')) }))),
+    run('exec', writer.podName, '-c', 'dataflow', '--', '/bin/cat',
+      `/var/lib/arrowcol/staging/benchmark-logs/${writer.podUid}/stderr`),
+  ]);
+  const receiverTransport = directReceiverTransport(writerConfig), parquetConfig = directParquetConfig(writerConfig);
   const ready = pinWriterRegistration(origin, origin.cloudGeneration, writer,
     await readWriterRegistrations(authority, origin, origin.cloudGeneration, context, fic.server,
       { name: sql.podName, uid: sql.podUid }, assertSql));
@@ -148,7 +210,9 @@ export async function armDirectBenchmark(azure: Azure, campaign: DirectCampaignS
   const arm: DirectTerminalArm = {
     origin, baseline, startMs: prepared.measurementStartUnixMs, endMs: prepared.measurementEndUnixMs,
     clients: prepared.clients, writer, writerClaim, maintenance, sql, catalogLifetime, routers, registration: ready,
-    routerUid, provenance: { release, catalog, catalogLog, clocks, schedule: prepared.patch },
+    routerUid, provenance: { release, catalog, catalogLog, clocks, schedule: prepared.patch,
+      transport: { clients: clientTransport, routers: routerTransport, receiver: { podUid: writer.podUid, config: receiverTransport } },
+      parquet: { podUid: writer.podUid, config: parquetConfig } },
   };
   const path = directArmRecordPath(origin);
   const raw = Buffer.from(canonical_json(arm));

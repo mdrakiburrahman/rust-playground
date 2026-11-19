@@ -28,7 +28,8 @@ type ObjectValue = Record<string, any>;
 type Fault = 'none' | 'arm-write-unknown' | 'arm-readback' | 'release-unknown' | 'release-replaced' |
   'arm-replaced' | 'client-replaced' | 'stop-unknown' | 'exit-unknown' | 'audit-invalid' | 'seal-unknown' |
   'seal-readback' | 'seal-replaced' | 'namespace-unknown' | 'namespace-replaced' | 'namespace-present' |
-  'fic-replaced' | 'fic-unknown' | 'clock-skew' | 'clock-missing' | 'clock-boundary' | 'clock-namespace';
+  'fic-replaced' | 'fic-unknown' | 'clock-skew' | 'clock-missing' | 'clock-boundary' | 'clock-namespace' |
+  'client-transport' | 'router-transport' | 'receiver-transport' | 'parquet-config';
 
 function kubeObjects(now: number) {
   const objects: Record<string, ObjectValue> = {};
@@ -111,8 +112,9 @@ function loadEvidence(start: number, end: number, receiptAt = start + 2000) {
     input_rows: 2, canonical_logical_bytes: 'Some(20)', admitted_at_unix_ms: admitted, qualification_state: 'committed',
     delta_outcome: 'Committed', authoritative_delta_version: 'Some(1)', committed_files: '["0:a.parquet"]',
     transaction_files: `[("${app}", 1, ${admitted}, [0])]` } };
-  return { logs: { 'writer-stdout': '', 'writer-stderr': JSON.stringify(receipt) + '\n', 'client-stderr': '',
-    'client-stdout': 'OAT_CLIENT_METRICS ' + JSON.stringify({ phase: 'completed', logical_batch_manifest: manifest })
+  return { logs: { 'writer-stdout': '', 'writer-stderr': 'arrowcol_effective_config {"parquet_writer":{"defaults":{"compression":"zstd","compression_level":2}}}\narrowcol_effective_config {"component":"receiver","config":{"transport":{"initial_stream_window_size":1048576,"initial_connection_window_size":16777216,"adaptive_window":false,"tcp_nodelay":true}}}\n' + JSON.stringify(receipt) + '\n', 'client-stderr': '',
+    'client-stdout': 'OAT_CLIENT_EFFECTIVE_CONFIG {"stream_window_bytes":1048576,"connection_window_bytes":16777216,"adaptive_window":false,"tcp_nodelay":true}\n' +
+      'OAT_CLIENT_METRICS ' + JSON.stringify({ phase: 'completed', logical_batch_manifest: manifest })
       .replaceAll('"SEND_NS"', String(BigInt(admitted) * 1_000_000n)) + '\n' },
     commit: lines({ txn: { appId: app, version: 1, lastUpdated: admitted } },
       { add: { path: 'hour=0/a.parquet', size: 40, dataChange: true, stats: '{"numRecords":2}' } }) };
@@ -358,6 +360,10 @@ for (const fault of ['none', 'clock-boundary', 'clock-skew', 'clock-missing', 'c
   assert.equal(terminal.timing.failures.length, fault === 'clock-missing' ? 2 : 0);
   assert.equal(terminal.timing.after.length, fault === 'clock-missing' ? 0 : 2);
   assert.equal(terminal.arm.provenance.clocks.length, 2);
+  assert.equal(terminal.arm.provenance.transport.clients[0].config.tcp_nodelay, true);
+  assert.equal(terminal.arm.provenance.transport.routers[0].config.upstream.connection_window_bytes, 16777216n);
+  assert.equal(terminal.arm.provenance.transport.receiver.config.tcp_nodelay, true);
+  assert.equal(terminal.arm.provenance.parquet.config.compression_level, 2n);
   assert.ok(terminal.arm.provenance.clocks.every((clock: any) => clock.timeNamespace === 'time:[1]'));
   assert.ok(terminal.timing.after.every((clock: any) => clock.timeNamespace ===
     (fault === 'clock-namespace' ? 'time:[2]' : 'time:[1]')));
@@ -385,6 +391,10 @@ for (const fault of ['none', 'clock-boundary', 'clock-skew', 'clock-missing', 'c
 const failures: [Fault, RegExp, 'arm' | 'terminal', boolean, boolean][] = [
   ['arm-write-unknown', /arm write response lost/, 'arm', false, false],
   ['arm-readback', /arm record readback mismatch/, 'arm', false, false],
+  ['client-transport', /Client effective transport differs/, 'arm', false, false],
+  ['router-transport', /Router effective transport differs/, 'arm', false, false],
+  ['receiver-transport', /Receiver effective transport differs/, 'arm', false, false],
+  ['parquet-config', /Parquet startup policy differs/, 'arm', false, false],
   ['release-unknown', /Command failed/, 'arm', false, false],
   ['release-replaced', /schedule identity changed/, 'arm', false, false],
   ['arm-replaced', /arm record is missing or changed/, 'terminal', false, false],
@@ -408,7 +418,7 @@ for (const [fault, message, phase, namespaceDelete, ficDelete] of failures) test
   const events = f.events();
   assert.equal(events.some(e => e.event === 'namespace-delete'), namespaceDelete);
   assert.equal(events.some(e => e.event === 'fic-delete'), ficDelete);
-  if (fault.startsWith('arm-') && phase === 'arm') {
+  if ((fault.startsWith('arm-') || fault.endsWith('-transport') || fault === 'parquet-config') && phase === 'arm') {
     assert.equal(events.some(e => e.event === 'release'), false);
     assert.equal(events.some(e => e.event === 'barrier-attempt'), false);
   }

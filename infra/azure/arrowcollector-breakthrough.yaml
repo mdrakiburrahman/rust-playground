@@ -11,6 +11,8 @@
 # Render BENCHRUNUUID as a fresh lowercase UUID and BENCHRUNHEX as its 32 lowercase hex digits.
 # Render BENCHCLIENTCOUNT as 1, 2, 4, or 8 for a bounded indexed client Job; never exceed ready client nodes.
 # Render BENCHOWNER as the approved custody owner in both identity annotations and labels.
+# Render BENCHDATAPROFILE, BENCHDATAMODE, BENCHSTRINGWIDTH, BENCHSTRINGLENGTHDISTRIBUTION,
+# BENCHVALUEVARIATION and BENCHGUIDUNIQUENESS from the approved client profile and source pin.
 # 9876543210000 is a placeholder, not a usable expiry. Immediately before applying
 # the initializer stage, replace it in rendered.yaml with current UTC Unix ms + 2700000
 # (45 minutes; within the configured 1-hour maximum). Do not compute it at initial
@@ -28,8 +30,8 @@
 # require a separately authorized deployment and fresh what-if that excludes existing benchd64.
 # Preserve benchd64; any later autoscaler-only 1/2/4/8 ramp requires its own gate and authorization.
 # Never apply an older ceiling parameter file containing an existing benchd64 pool update.
-# The workload identity must have sanctioned access. The calibrated realistic client below is a
-# diagnostic starting profile, not a D64 supply guarantee or a demonstrated fastest setting.
+# The workload identity must have sanctioned access. A diagnostic starting render is realistic /
+# shared / 789 / uniform / per_row / per_row, not a D64 supply guarantee or a demonstrated fastest setting.
 # It reuses one prepared corpus per client while generating identity-bearing sends. Capture its
 # requested/resolved concurrency, memory and per-parent/physical-batch metrics. Profile and
 # queue capacities are editable experimental inputs, not finalized or automatically safe settings.
@@ -45,8 +47,12 @@
 # Twelve 4-GiB/2M-row flushes consume at most 48 GiB/24M rows, within the table candidate.
 # CPU workers are explicitly 32; active pipeline stages are bounded by min(depth 8,
 # concurrent flushes 12, CPU workers 32) = 8, not by the 160 requested DFE cores.
-# Receiver candidate (source 75f16c57): 1 MiB stream / 16 MiB connection window, adaptive off,
-# TCP_NODELAY on. Unset wire defaults measured at that source are 1 MiB / 1 MiB, not 65535.
+# Client, router downstream/upstream and receiver use 1 MiB stream / 16 MiB connection windows.
+# Client and receiver explicitly disable adaptive windows and enable TCP_NODELAY. At reviewed source
+# 1777aaec, locked pingora-core 0.9.0 sets TCP_NODELAY on both accepted and upstream TCP connections;
+# this is dependency behavior, not an exposed router setting or proof of a live socket.
+# Writer Parquet Zstd level 2 is a provisional locally measured candidate, not cloud qualification.
+# Retain and compare the original effective-config readbacks against these values before load.
 # The 160 DFE / 176 CPU candidate is staged only; verify actual E192 allocatable CPU before applying.
 # Pre-SC gate: verify a Ready collector node has label kubernetes.azure.com/agentpool=arrowe192 and
 # inventory every StorageClass with provisioner localdisk.csi.acstor.io read-only. Do not mutate others.
@@ -631,7 +637,7 @@ data:
       h2:
         max_concurrent_streams: 512
         stream_window_bytes: 1048576
-        connection_window_bytes: 33554432
+        connection_window_bytes: 16777216
         idle_timeout_seconds: 60
     sql_server:
       host: arrowcol-sql
@@ -665,7 +671,7 @@ data:
       sni: ""
       max_h2_streams: 1
       stream_window_bytes: 1048576
-      connection_window_bytes: 33554432
+      connection_window_bytes: 16777216
       connection_timeout_ms: 1000
       total_connection_timeout_ms: 3000
       idle_timeout_seconds: 0
@@ -1328,6 +1334,8 @@ spec:
               value: "134217728"
             - name: ARROWCOL_COLLECTOR_RECEIVER_TRANSPORT_CONFIG
               value: '{"initial_stream_window_size":1048576,"initial_connection_window_size":16777216,"adaptive_window":false,"tcp_nodelay":true}'
+            - name: ARROWCOL_PARQUET_CONFIG
+              value: '{"defaults":{"compression":"zstd","compression_level":2}}'
             - name: ARROWCOL_COLLECTOR_CPU_WORKERS
               value: "32"
             - name: ARROWCOL_PUBLICATION_AUDIT_JSON
@@ -1744,20 +1752,28 @@ spec:
             - "2"
             - --runtime-threads
             - "16"
+            - --stream-window-bytes
+            - "1048576"
+            - --connection-window-bytes
+            - "16777216"
+            - --adaptive-window
+            - "false"
+            - --tcp-nodelay
+            - "true"
             - --pod-ordinal
             - $(CLIENT_INDEX)
             - --data-profile
-            - realistic
+            - BENCHDATAPROFILE
             - --data-mode
-            - shared
+            - BENCHDATAMODE
             - --string-width
-            - "789"
+            - BENCHSTRINGWIDTH
             - --string-length-distribution
-            - uniform
+            - BENCHSTRINGLENGTHDISTRIBUTION
             - --value-variation
-            - per_row
+            - BENCHVALUEVARIATION
             - --guid-uniqueness
-            - per_row
+            - BENCHGUIDUNIQUENESS
             - --stream-retry-max-attempts
             - "1"
             - --ipc-compression
