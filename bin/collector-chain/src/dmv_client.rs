@@ -479,6 +479,8 @@ struct LogicalBatchRecord {
     attempts: u16,
     outcome: ManifestOutcome,
     first_send_unix_ns: Option<u64>,
+    last_send_unix_ns: Option<u64>,
+    first_admitted_unix_ms: Option<u64>,
     last_outcome_unix_ms: Option<u64>,
 }
 
@@ -494,6 +496,9 @@ struct LogicalBatchRange {
     attempts: u16,
     outcome: ManifestOutcome,
     first_send_unix_ns: Option<u64>,
+    last_send_unix_ns: Option<u64>,
+    first_admitted_unix_ms: Option<u64>,
+    last_admitted_unix_ms: Option<u64>,
     last_outcome_unix_ms: Option<u64>,
 }
 
@@ -1105,6 +1110,8 @@ impl PreparedClient {
             attempts: 0,
             outcome: ManifestOutcome::Pending,
             first_send_unix_ns: None,
+            last_send_unix_ns: None,
+            first_admitted_unix_ms: None,
             last_outcome_unix_ms: None,
         });
         Ok(index)
@@ -1136,6 +1143,7 @@ impl PreparedClient {
                 }
             });
         }
+        record.last_send_unix_ns = Some(send_unix_ns);
         record.attempts = record
             .attempts
             .checked_add(1)
@@ -1157,6 +1165,9 @@ impl PreparedClient {
             .get_mut(index)
             .context("logical batch manifest index is out of range")?;
         record.outcome = outcome;
+        if outcome == ManifestOutcome::Acknowledged && record.first_admitted_unix_ms.is_none() {
+            record.first_admitted_unix_ms = observed_unix_ms;
+        }
         if observed_unix_ms.is_some() {
             record.last_outcome_unix_ms = observed_unix_ms;
         }
@@ -1208,6 +1219,18 @@ impl PreparedClient {
                     (Some(left), Some(right)) => Some(left.min(right)),
                     (left, right) => left.or(right),
                 };
+                range.last_send_unix_ns = match (range.last_send_unix_ns, record.last_send_unix_ns) {
+                    (Some(left), Some(right)) => Some(left.max(right)),
+                    (left, right) => left.or(right),
+                };
+                range.first_admitted_unix_ms = match (range.first_admitted_unix_ms, record.first_admitted_unix_ms) {
+                    (Some(left), Some(right)) => Some(left.min(right)),
+                    (left, right) => left.or(right),
+                };
+                range.last_admitted_unix_ms = match (range.last_admitted_unix_ms, record.first_admitted_unix_ms) {
+                    (Some(left), Some(right)) => Some(left.max(right)),
+                    (left, right) => left.or(right),
+                };
                 range.last_outcome_unix_ms = match (range.last_outcome_unix_ms, record.last_outcome_unix_ms) {
                     (Some(left), Some(right)) => Some(left.max(right)),
                     (left, right) => left.or(right),
@@ -1224,6 +1247,9 @@ impl PreparedClient {
                     attempts: record.attempts,
                     outcome: record.outcome,
                     first_send_unix_ns: record.first_send_unix_ns,
+                    last_send_unix_ns: record.last_send_unix_ns,
+                    first_admitted_unix_ms: record.first_admitted_unix_ms,
+                    last_admitted_unix_ms: record.first_admitted_unix_ms,
                     last_outcome_unix_ms: record.last_outcome_unix_ms,
                 });
             }
@@ -1278,6 +1304,7 @@ impl PreparedClient {
                 "cohort_rule": "first_send_unix_ms < start => warmup; start <= first_send_unix_ms < end => measurement; otherwise post_window; bounds are [start,end)",
                 "identity_column": "endpoint_url",
                 "identity_format": "https://x.invalid/v1/{run_uuid_simple32}/{incarnation_uuid_simple32}/{worker_decimal}/{logical_batch_sequence_base36}/{row_ordinal_decimal}",
+                "publication_identity_key_format": "{run_uuid_simple32}/{incarnation_uuid_simple32}/{worker_decimal}/{logical_batch_sequence_base36}",
                 "run_uuid": self.run_id.simple().to_string(),
                 "run_uuid_source": "client_generated",
                 "oat_run_uuid": null,
@@ -3031,6 +3058,8 @@ mod tests {
                 attempts: 2,
                 outcome: ManifestOutcome::Acknowledged,
                 first_send_unix_ns: Some(1_000_000_000),
+                last_send_unix_ns: Some(1_000_000_000 + sequence * 1_000),
+                first_admitted_unix_ms: Some(1_000 + sequence),
                 last_outcome_unix_ms: Some(1_000),
             });
         }
@@ -3095,6 +3124,8 @@ mod tests {
                 attempts: 1,
                 outcome: ManifestOutcome::Acknowledged,
                 first_send_unix_ns: Some(1_000_000_000 + index),
+                last_send_unix_ns: Some(1_000_000_000 + index),
+                first_admitted_unix_ms: Some(1_000),
                 last_outcome_unix_ms: Some(1_000),
             });
         }
@@ -3159,6 +3190,8 @@ mod tests {
                 attempts: 1,
                 outcome: ManifestOutcome::Acknowledged,
                 first_send_unix_ns: Some(1_000_000_000 + index),
+                last_send_unix_ns: Some(1_000_000_000 + index),
+                first_admitted_unix_ms: Some(1_000),
                 last_outcome_unix_ms: Some(1_000),
             });
         }
@@ -4327,6 +4360,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     #[ignore = "explicit client-ceiling measurement against an in-memory Flight sink"]
     async fn null_flight_sink_client_ceiling_across_worker_counts() -> Result<()> {
+        use arrow_flight::decode::FlightRecordBatchStream;
         use arrowcol_catalog::{CatalogControlPlane, CatalogStore, MemoryCatalogStore};
         use arrowcol_flight::{AllowAllAuthenticator, ArrowColFlightService, RuntimeLimits};
         use arrowcol_protocol::{AuthContext, AuthMethod, AuthenticatedPrincipal, PrincipalId, PrincipalIssuer};
@@ -4362,46 +4396,93 @@ mod tests {
                 .await
         });
 
-        for workers in [1, 2, 4, 8, 16, 32] {
-            let mut options = options()?;
-            options.data_profile = DataProfile::Realistic;
-            options.workers = workers;
-            options.corpus_rows = 4_096;
-            options.batch_rows = 4_096;
-            options.streams_per_worker = 2;
-            options.interval_us = 0;
-            let client = PreparedClient::prepare(
-                &endpoint,
-                "ceiling",
-                Some("sqlserver_availability_replica_states"),
-                None,
-                options,
-            )
-            .await?;
-            let scheduled_start = unix_ms()? + 100;
-            let measurement_start = scheduled_start + 50;
-            let measurement_end = measurement_start + 1_000;
-            client
-                .run_continuous(scheduled_start, measurement_start, measurement_end)
+        let table = table_named("sqlserver_availability_replica_states")?;
+        for codec in [IpcCompression::None, IpcCompression::Lz4Frame, IpcCompression::Zstd] {
+            let mut probe_options = options()?;
+            probe_options.data_profile = DataProfile::Realistic;
+            probe_options.string_width = 785;
+            probe_options.batch_rows = 1_024;
+            probe_options.corpus_rows = 16_384;
+            probe_options.workers = 16;
+            probe_options.streams_per_worker = 2;
+            probe_options.max_memory_bytes = 2_u64 * 1_024 * 1_024 * 1_024;
+            probe_options.ipc_compression = codec;
+            let source = synthetic_batch(&table, "ceiling", 1_024, 0, 0, &probe_options)?;
+            let identified = batch_with_logical_identity(&source, uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), 0, 0)?;
+            let messages = encode(&table, "v1", identified, &probe_options).await?;
+            let message_count = messages.len();
+            let payload_fragments = messages.iter().filter(|message| !message.data_body.is_empty()).count();
+            let max_flight_data_bytes = messages
+                .iter()
+                .map(|message| message.encoded_len())
+                .max()
+                .context("encoded probe emitted no FlightData messages")?;
+            let decoded = FlightRecordBatchStream::new_from_flight_data(stream::iter(messages.into_iter().map(Ok)))
+                .try_collect::<Vec<_>>()
                 .await?;
-            let snapshot = client.metrics("completed")?;
-            client.ensure_terminal_manifest_complete()?;
-            let window = &snapshot["measurement_window"];
-            let rows = window["completed_rows"].as_u64().context("missing completed rows")?;
-            let uncompressed_bytes = window["completed_flight_data_bytes_uncompressed"]
-                .as_u64()
-                .context("missing uncompressed FlightData bytes")?;
-            let configured_bytes = window["completed_flight_data_bytes_configured_ipc_compression"]
-                .as_u64()
-                .context("missing configured-compression FlightData bytes")?;
-            let measurement_seconds = (measurement_end - measurement_start) as f64 / 1000.0;
-            eprintln!(
-                "W2_CLIENT_SINK_PROBE tokio_runtime_threads=8 workers={workers} aggregate_rows_per_second={:.3} uncompressed_flight_data_GB_per_second={:.6} configured_ipc_compression_flight_data_GB_per_second={:.6}",
-                rows as f64 / measurement_seconds,
-                uncompressed_bytes as f64 / 1_000_000_000.0 / measurement_seconds,
-                configured_bytes as f64 / 1_000_000_000.0 / measurement_seconds,
+            let decoded_rows = decoded.iter().map(RecordBatch::num_rows).sum::<usize>();
+            anyhow::ensure!(
+                decoded_rows == 1_024,
+                "Flight fragmentation changed the probe row count"
             );
-            assert!(rows > 0, "null Flight sink received no rows with {workers} workers");
+            eprintln!(
+                "L3_FLIGHT_FRAGMENTATION string_width={} logical_batch_rows=1024 ipc_compression={codec:?} flight_data_messages={message_count} payload_fragments={payload_fragments} max_flight_data_protobuf_bytes={max_flight_data_bytes} decoder_output_batches={}",
+                probe_options.string_width,
+                decoded.len(),
+            );
+
+            for workers in [1, 2, 4, 8, 16, 32] {
+                let mut options = options()?;
+                options.data_profile = DataProfile::Realistic;
+                options.string_width = 785;
+                options.workers = workers;
+                options.corpus_rows = 16_384;
+                options.batch_rows = 1_024;
+                options.streams_per_worker = 2;
+                options.interval_us = 0;
+                options.max_memory_bytes = 2_u64 * 1_024 * 1_024 * 1_024;
+                options.ipc_compression = codec;
+                let client = PreparedClient::prepare(
+                    &endpoint,
+                    "ceiling",
+                    Some("sqlserver_availability_replica_states"),
+                    None,
+                    options,
+                )
+                .await?;
+                let scheduled_start = unix_ms()? + 100;
+                let measurement_start = scheduled_start + 50;
+                let measurement_end = measurement_start + 1_000;
+                client
+                    .run_continuous(scheduled_start, measurement_start, measurement_end)
+                    .await?;
+                let snapshot = client.metrics("completed")?;
+                client.ensure_terminal_manifest_complete()?;
+                let window = &snapshot["measurement_window"];
+                let rows = window["completed_rows"].as_u64().context("missing completed rows")?;
+                let uncompressed_bytes = window["completed_flight_data_bytes_uncompressed"]
+                    .as_u64()
+                    .context("missing uncompressed FlightData bytes")?;
+                let configured_bytes = window["completed_flight_data_bytes_configured_ipc_compression"]
+                    .as_u64()
+                    .context("missing configured-compression FlightData bytes")?;
+                let retried_rows = window["retried_rows"].as_u64().context("missing retried rows")?;
+                let given_up_rows = window["given_up_rows"].as_u64().context("missing given-up rows")?;
+                let cpu_core_equivalents = window["client_resources"]["cpu_core_equivalents"].clone();
+                let network_tx_bytes_per_second = window["client_resources"]["network_tx_bytes_per_second"].clone();
+                let measurement_seconds = (measurement_end - measurement_start) as f64 / 1_000.0;
+                eprintln!(
+                    "L3_CLIENT_SINK_CALIBRATION sink_completed_rows_per_second={:.3} uncompressed_flight_data_GB_per_second={:.6} configured_ipc_compression_flight_data_GB_per_second={:.6} cpu_core_equivalents={} network_tx_bytes_per_second={} retried_rows={retried_rows} given_up_rows={given_up_rows} workers={workers} streams_per_worker=2 tokio_runtime_threads=8 string_width={} corpus_rows=16384 batch_rows=1024 max_memory_bytes={}",
+                    rows as f64 / measurement_seconds,
+                    uncompressed_bytes as f64 / 1_000_000_000.0 / measurement_seconds,
+                    configured_bytes as f64 / 1_000_000_000.0 / measurement_seconds,
+                    cpu_core_equivalents,
+                    network_tx_bytes_per_second,
+                    785,
+                    2_u64 * 1_024 * 1_024 * 1_024,
+                );
+                assert!(rows > 0, "null Flight sink received no rows with {workers} workers");
+            }
         }
 
         shutdown
