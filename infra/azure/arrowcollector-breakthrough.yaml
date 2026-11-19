@@ -1,6 +1,6 @@
 # NOT RUN-READY: diagnostic candidate, not an approved deployment or qualification recipe.
-# This successor requires source-reviewed, source-bound immutable image digests, final receiver
-# h2/TCP and remote-snapshot reuse/cap settings, effective config readback, local fixture and
+# This successor requires source-reviewed, source-bound immutable image digests, final approved
+# receiver h2/TCP and remote-snapshot reuse/cap settings, effective config readback, local fixture and
 # separately authorized live preflight. UNRESOLVED_* images deliberately cannot be pulled.
 # Reviewed successor exposes commit.remote_snapshot_reuse and
 # commit.remote_snapshot_max_metadata_objects (1..4096); values are not yet approved here.
@@ -30,6 +30,20 @@
 # It reuses one prepared corpus per client while generating identity-bearing sends. Capture its
 # requested/resolved concurrency, memory and per-parent/physical-batch metrics. Profile and
 # queue capacities are editable experimental inputs, not finalized or automatically safe settings.
+# This 16-worker/16-runtime-thread/32-GiB profile is a local calibration baseline, not a D64
+# supply guarantee: measure actual admitted slots and client CPU/RSS; ramp concurrency, threads
+# and memory only within verified allocatable node headroom and retain bounded backpressure.
+# Capacity planning only: assume an unmeasured 8 s p99 admission-to-durable-release residence
+# and 1.5x headroom. At 6.44M rows/s and 17.4 GB/s, rate x 8 x 1.5 needs 77.28M rows and
+# 208.8 GB. The 100M-row/256-GiB single-table and registration candidates exceed these numbers.
+# Measure actual p99 and amplification; exceedance invalidates this sizing assumption, not the run.
+# The 352-GiB RSS pressure threshold is below the 384-GiB pod limit; 96 GiB above the 256-GiB
+# in-flight cap is candidate encode/upload/runtime overhead, not a measured memory reservation.
+# Twelve 4-GiB/2M-row flushes consume at most 48 GiB/24M rows, within the table candidate.
+# CPU workers are explicitly 32; active pipeline stages are bounded by min(depth 8,
+# concurrent flushes 12, CPU workers 32) = 8, not by the 160 requested DFE cores.
+# Receiver candidate (source 75f16c57): 1 MiB stream / 16 MiB connection window, adaptive off,
+# TCP_NODELAY on. Unset wire defaults measured at that source are 1 MiB / 1 MiB, not 65535.
 # The 160 DFE / 176 CPU candidate is staged only; verify actual E192 allocatable CPU before applying.
 # Pre-SC gate: verify a Ready collector node has label kubernetes.azure.com/agentpool=arrowe192 and
 # inventory every StorageClass with provisioner localdisk.csi.acstor.io read-only. Do not mutate others.
@@ -58,7 +72,14 @@
 # After separate authorization:
 # npx --no-install tsx infra/azure/benchmark-arm.ts "$CONTEXT" "$NS" "$NAMESPACE_UID" "$UUID" "$OWNER" "$CLIENTS" --confirm-authorized
 # Capture its output. If patch outcome or readback is ambiguous, inspect the ConfigMap; never blindly retry.
-# Independently check clock synchronization; client/pod failure after arming invalidates the window.
+# Before and after each window, capture a clock-offset bound for every distinct client node and the
+# collector node against the operator. For a pod sharing each node's clock, record operator Unix ns
+# immediately before (t0) and after (t1) `kubectl exec POD -- date -u +%s%N` and the pod timestamp;
+# the offset lies in [pod-t1, pod-t0]. Use signed 64-bit or lossless arithmetic.
+# Invalidate if either end of any offset interval exceeds +/-100 ms, if clock sharing is unverified,
+# if `date` with nanosecond output is unavailable, or if any sample is missing. Clock checks do not
+# replace exact manifest and receipt reconciliation.
+# Client/pod failure after arming invalidates the window.
 # Monitor the same writer pod UID/restart count throughout; stop load if the writer becomes unhealthy.
 # Capture 60 s warmup, 600 s timed commits, then drain. The Job has a hard deadline.
 # Each scored 600 s window needs a fresh run UUID, namespace, FIC and independent initialization; this
@@ -72,6 +93,8 @@
 # Then, for each recorded
 # client pod, kubectl --context "$CONTEXT" -n "$NS" logs "$POD" -c generator > "$EVIDENCE/client-$INDEX.log".
 # kubectl --context "$CONTEXT" -n "$NS" logs "$WRITER" -c dataflow > "$EVIDENCE/collector.log"
+# Do not pass --timestamps: the extractor requires collector JSON lines to begin with `{`.
+# Its readline implementation buffers each complete line before applying the 8-MiB line cap.
 # Check every command exit and preserve the original logs.
 # npx --no-install tsx infra/azure/benchmark-extract.ts manifest "$EVIDENCE/client-$INDEX.log" "$EVIDENCE/client-$INDEX-manifest.json"
 # npx --no-install tsx infra/azure/benchmark-extract.ts collector "$EVIDENCE/collector.log" "$EVIDENCE/collector-receipts.jsonl"
@@ -514,9 +537,9 @@ data:
                     heartbeat_interval: 5s
                     pressure_interval: 2s
                     registration_ttl: 30s
-                    rss_limit_bytes: 343597383680
-                    buffered_bytes_limit: 34359738368
-                    buffered_rows_limit: 25000000
+                    rss_limit_bytes: 377957122048
+                    buffered_bytes_limit: 274877906944
+                    buffered_rows_limit: 100000000
                     buffered_batches_limit: 16384
                   limits:
                     max_metadata_bytes: 16384
@@ -548,12 +571,12 @@ data:
                     max_pending_files: 512
                   batching:
                     global_capacity:
-                      bytes: 68719476736
-                      rows: 25000000
+                      bytes: 274877906944
+                      rows: 100000000
                       batches: 16384
                     per_table_capacity:
-                      bytes: 34359738368
-                      rows: 12000000
+                      bytes: 274877906944
+                      rows: 100000000
                       batches: 8192
                     max_arrow_memory_per_flush: 4294967296
                     max_rows_per_flush: 2000000
@@ -1220,6 +1243,10 @@ spec:
               value: "2000000"
             - name: ARROWCOL_MAX_MESSAGE_BYTES
               value: "134217728"
+            - name: ARROWCOL_COLLECTOR_RECEIVER_TRANSPORT_CONFIG
+              value: '{"initial_stream_window_size":1048576,"initial_connection_window_size":16777216,"adaptive_window":false,"tcp_nodelay":true}'
+            - name: ARROWCOL_COLLECTOR_CPU_WORKERS
+              value: "32"
             - name: ARROWCOL_PUBLICATION_AUDIT_JSON
               value: "true"
             - name: TMPDIR
