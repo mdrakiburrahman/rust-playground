@@ -1010,6 +1010,140 @@ test('post-load failure requires reviewed current custody proof and remains fail
   }
 });
 
+test('owned controller crash requires exact current custody without inventing terminal or admission', {
+  skip: process.platform !== 'linux',
+}, async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'oat-owned-crash-'));
+  const root = path.join(directory, 'receipts');
+  const deadline = await OatLauncherDeadline.create(undefined, performance.now(), root);
+  const evidencePath = path.join(directory, 'evidence');
+  const sidecar = deadline.receiptPath + '.failed-aks-disposition';
+  const digest = (body: Buffer | string) => createHash('sha256').update(body).digest('hex');
+  const body = '{"platform":{"kind":"aks"}}';
+  const cellId = 'c0bfca05-28f2-4e16-a4cc-b3f28a351fb9';
+  const listener = createServer();
+  try {
+    await new Promise<void>((resolve) => listener.listen(0, '127.0.0.1', resolve));
+    const address = listener.address();
+    assert.ok(address && typeof address !== 'string');
+    const serverUrl = `http://127.0.0.1:${address.port}/`;
+    await deadline.setSubmissionBinding({ submitted_config_body: body,
+      submitted_config_sha256: digest(body), source_config_sha256: digest('source') });
+    await deadline.markCreationPending(serverUrl);
+    await deadline.recordRunStarted({ ...status('queued'), config_sha256: digest(body) });
+    const serverPid = 2147483647;
+    await deadline.recordOwnedServerIdentity({ invocationId: deadline.invocationId, runId: status('queued').id,
+      serverUrl, serverPid, serverStartTicks: '12345', serverExecutable: '/opt/example/oat' });
+    await deadline.markUnsettled(new Error('fetch failed'));
+    const original = await readFile(deadline.receiptPath);
+    const receipt = JSON.parse(original.toString('utf8'));
+    const now = Date.now();
+    const raw = digest('fixture');
+    const uid = '418a9705-b6ac-4487-b08e-a0dbdd5d6e5f';
+    const ports = [address.port, address.port === 1 ? 2 : 1, address.port === 3 ? 4 : 3];
+    const manifest = {
+      schema_version: 1, kind: 'owned-controller-crash-aks' as const,
+      disposition: 'controller-crash-cleanup-verified-unranked',
+      invocation_id: deadline.invocationId, controller_run_id: receipt.run_id,
+      original_receipt_sha256: digest(original), source_config_sha256: receipt.source_config_sha256,
+      submitted_config_sha256: receipt.submitted_config_sha256, server_url: serverUrl,
+      controller_running_observed: true, crash_kind: 'tokio-worker-stack-overflow',
+      historical_admission: 'unknown', historical_process_namespace_proven: false,
+      terminal_observation: null, ranking: null as number | null, throughput_claim: null,
+      verifier_sha256: raw, runner_source_sha256: raw,
+      raw_observation_sha256: Object.fromEntries(['admission', 'launcher_log', 'namespace_binding', 'delete_intent',
+        'delete_options', 'delete_response', 'workload_stop', 'namespace_get', 'fic_cleanup',
+        'fic_delete_receipt', 'fic_postcondition', 'fic_inventory', 'process_census', 'process_raw',
+        'lease', 'cluster_inventory', 'pool_inventory', 'node_inventory'].map((name) => [name, raw])),
+      census: {
+        boot_id: (await readFile('/proc/sys/kernel/random/boot_id', 'utf8')).trim(),
+        pid_namespace: await readlink('/proc/self/ns/pid'), net_namespace: await readlink('/proc/self/ns/net'),
+        host_target: 'dev/example_devcontainer', lease_id: 'ls-123456', lease_active: true,
+        controller_pid: serverPid, controller_start_ticks: '12345', controller_executable: '/opt/example/oat',
+        controller_state: 'absent', launcher_match_count: 0, controller_match_count: 0, helper_match_count: 0,
+        helpers: [{ pid: 2147483646, start_ticks: '45678', executable: '/opt/example/kubectl', state: 'zombie' }],
+        closed_ports: ports, observed_at_unix_ms: now,
+      },
+      cell: {
+        id: cellId, namespace: 'arrow-collector-' + cellId.replaceAll('-', ''), namespace_uid: uid,
+        delete_precondition_uid: uid, delete_response_uid: uid, delete_succeeded: true,
+        namespace_absent: true, namespace_uid_absent: true, controller_pod_count: 0,
+        namespace_observed_at_unix_ms: now, run_fic_id: 'arrowcol-run-' + cellId, run_fic_deleted: true,
+        run_fic_absent: true, native_fic_id: 'native-fic', native_fic_present: true,
+        fic_inventory_count: 1, fic_observed_at_unix_ms: now,
+      },
+      cluster: { stamp_config_sha256: raw, stock_aks_id: '/fake/cluster', arm_aks_id: '/fake/cluster',
+        stock_api_server: 'https://fake.example.invalid', current_api_server: 'https://fake.example.invalid' },
+      pools: {
+        all_user_pools_inventoried: true, observed_at_unix_ms: now, stamp_user_pool_names: ['pool-a', 'pool-b'],
+        stamp_system_pool_name: 'system', arm_pool_names: ['system', 'pool-a', 'pool-b'],
+        user_pools: [{ name: 'pool-a', arm_count: 0, arm_min_count: 0, arm_max_count: 1, provisioning_state: 'Succeeded', kubernetes_node_count: 0 },
+          { name: 'pool-b', arm_count: 0, arm_min_count: 0, arm_max_count: 1, provisioning_state: 'Succeeded', kubernetes_node_count: 0 }],
+      },
+    };
+    const approveFixture = async (proof: typeof manifest, receiptBytes = original) => {
+      await writeFile(deadline.receiptPath, receiptBytes);
+      const receiptSha256 = digest(receiptBytes);
+      const bytes = JSON.stringify({ ...proof, original_receipt_sha256: receiptSha256 });
+      await writeFile(evidencePath, bytes);
+      return [{ kind: manifest.kind, invocationIdSha256: digest(deadline.invocationId),
+        receiptSha256, evidenceSha256: digest(bytes) }];
+    };
+    const rejectFixture = async (proof: typeof manifest, error: RegExp, receiptBytes = original) =>
+      assert.rejects(recordLegacyAksDisposition(root, deadline.invocationId, evidencePath,
+        await approveFixture(proof, receiptBytes)), error);
+
+    await rejectFixture(manifest, /listener is still present/);
+    await new Promise<void>((resolve, reject) => listener.close((error) => error ? reject(error) : resolve()));
+    await rejectFixture({ ...manifest, historical_admission: 'not-started' }, /exact unsettled invocation/);
+    await rejectFixture({ ...manifest, historical_process_namespace_proven: true }, /exact unsettled invocation/);
+    await rejectFixture({ ...manifest, ranking: 1 }, /exact unsettled invocation/);
+    await rejectFixture({ ...manifest, crash_kind: 'unknown' }, /exact unsettled invocation/);
+    await rejectFixture({ ...manifest, controller_running_observed: false }, /exact unsettled invocation/);
+    await rejectFixture({ ...manifest, submitted_config_sha256: raw }, /exact unsettled invocation/);
+    await rejectFixture(manifest, /exact unsettled invocation/, Buffer.from(JSON.stringify({ ...receipt, run_state: 'failed' })));
+    await rejectFixture(manifest, /custody evidence/, Buffer.from(JSON.stringify({ ...receipt, server_start_ticks: '999' })));
+    for (const change of [{ delete_precondition_uid: 'different' }, { delete_response_uid: 'different' },
+      { delete_succeeded: false }, { namespace_absent: false }, { namespace_uid_absent: false },
+      { run_fic_deleted: false }, { run_fic_absent: false }, { fic_inventory_count: 2 }, { controller_pod_count: 1 }]) {
+      await rejectFixture({ ...manifest, cell: { ...manifest.cell, ...change } }, /custody evidence/);
+    }
+    for (const change of [{ controller_start_ticks: '999' }, { lease_active: false }, { helper_match_count: 1 },
+      { controller_state: 'running' }, { closed_ports: [address.port] }]) {
+      await rejectFixture({ ...manifest, census: { ...manifest.census, ...change } }, /custody evidence/);
+    }
+    await rejectFixture({ ...manifest, census: { ...manifest.census, helpers: [
+      { ...manifest.census.helpers[0]!, pid: process.pid },
+    ] } }, /live, reused, or not demonstrably exited/);
+    await rejectFixture({ ...manifest, census: { ...manifest.census, net_namespace: 'net:[1]' } }, /same Linux boot/);
+    const { delete_response: _missingDeleteResponse, ...missingReadback } = manifest.raw_observation_sha256;
+    await rejectFixture({ ...manifest, raw_observation_sha256: missingReadback }, /custody evidence/);
+    await rejectFixture({ ...manifest, cluster: { ...manifest.cluster, arm_aks_id: '/fake/other' } }, /custody evidence/);
+    await rejectFixture({ ...manifest, pools: { ...manifest.pools, user_pools: [
+      { ...manifest.pools.user_pools[0]!, arm_count: 1 }, manifest.pools.user_pools[1]!,
+    ] } }, /custody evidence/);
+    await rejectFixture({ ...manifest, pools: { ...manifest.pools, stamp_user_pool_names: ['pool-a', 'other'] } }, /custody evidence/);
+    await rejectFixture({ ...manifest, pools: { ...manifest.pools, arm_pool_names: ['system', 'pool-a', 'unowned'] } }, /custody evidence/);
+    const agedReceipt = Buffer.from(JSON.stringify({ ...receipt, started_at_unix_ms: now - 62 * 60_000 }));
+    await rejectFixture({ ...manifest, census: { ...manifest.census, observed_at_unix_ms: now - 61 * 60_000 } },
+      /absence evidence is not current/, agedReceipt);
+    const approval = await approveFixture(manifest);
+    await assert.rejects(assertNoUnsettledDeadlineReceipts(root, undefined, approval), /Unsettled AKS/);
+    await assert.rejects(recordLegacyAksDisposition(root, deadline.invocationId, evidencePath), /No reviewed legacy AKS disposition/);
+    await writeFile(deadline.receiptPath, Buffer.concat([original, Buffer.from('\n')]));
+    await assert.rejects(recordLegacyAksDisposition(root, deadline.invocationId, evidencePath, approval), /reviewed receipt and evidence digests/);
+    await writeFile(deadline.receiptPath, original);
+    await recordLegacyAksDisposition(root, deadline.invocationId, evidencePath, approval);
+    await assertNoUnsettledDeadlineReceipts(root, undefined, approval);
+    assert.deepEqual(await readFile(deadline.receiptPath), original);
+    assert.deepEqual(await readFile(sidecar), await readFile(evidencePath));
+  } finally {
+    if (listener.listening) await new Promise<void>((resolve, reject) => listener.close((error) => error ? reject(error) : resolve()));
+    deadline.dispose();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test('AKS benchmark rejects a linked worktree with an empty launcher ledger', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'oat-aks-checkout-'));
   const canonical = path.join(root, 'canonical');

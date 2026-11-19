@@ -103,6 +103,8 @@ Options:
   --recover-failed-aks <invocation-id> <approved-evidence-path>
                        Record the reviewed disposition for an approved AKS failure
                        Post-load evidence must be no more than 60 minutes old.
+                       Owned-controller crash evidence has the same freshness limit;
+                       it does not establish historical admission or a terminal result.
                        Keep one original-host lease from census through post-record recheck;
                        recheck writers and resource custody before a new run; stop if unsafe.
   -h, --help           Show this help`;
@@ -523,7 +525,7 @@ function isLocalOatServerUrl(value: string): boolean {
 
 
 type AksDispositionApproval = Readonly<{
-  kind: 'legacy' | 'observed-failed-preload-aks' | 'aborted-post-load-aks';
+  kind: 'legacy' | 'observed-failed-preload-aks' | 'aborted-post-load-aks' | 'owned-controller-crash-aks';
   invocationId?: string;
   invocationIdSha256?: string;
   receiptSha256: string;
@@ -788,10 +790,112 @@ function validateAbortedPostLoadAksDisposition(original: Buffer, evidence: Buffe
   };
 }
 
+function validateOwnedControllerCrashDisposition(original: Buffer, evidence: Buffer, approval: AksDispositionApproval) {
+  if (sha256Bytes(original) !== approval.receiptSha256 || sha256Bytes(evidence) !== approval.evidenceSha256) {
+    throw new Error('Owned controller crash disposition does not match the reviewed receipt and evidence digests');
+  }
+  const receipt: unknown = JSON.parse(original.toString('utf8'));
+  const proof: unknown = JSON.parse(evidence.toString('utf8'));
+  if (!isLauncherDeadlineReceipt(receipt) ||
+      !(receipt.invocation_id === approval.invocationId ||
+        sha256Bytes(Buffer.from(receipt.invocation_id)) === approval.invocationIdSha256) ||
+      receipt.creation_state !== 'accepted' || receipt.run_state !== 'queued' || receipt.cleanup_state !== 'unsettled' ||
+      receipt.terminal_observation !== null || receipt.config_binding_error !== null || receipt.error !== 'fetch failed' ||
+      !isLegacyTime(receipt.started_at_unix_ms) || !isLegacyUuid(receipt.run_id) ||
+      !isLegacyTime(receipt.server_pid) || !isLegacyIdentity(receipt.server_start_ticks) ||
+      !/^[1-9][0-9]*$/.test(receipt.server_start_ticks) || !isLegacyIdentity(receipt.server_executable) ||
+      !receipt.server_url || !isLocalOatServerUrl(receipt.server_url) ||
+      submittedPlatform(receipt.submitted_config_body) !== 'aks' ||
+      !isRecord(proof) || proof.schema_version !== 1 || proof.kind !== approval.kind ||
+      proof.disposition !== 'controller-crash-cleanup-verified-unranked' ||
+      proof.invocation_id !== receipt.invocation_id || proof.controller_run_id !== receipt.run_id ||
+      proof.original_receipt_sha256 !== approval.receiptSha256 ||
+      proof.source_config_sha256 !== receipt.source_config_sha256 ||
+      proof.submitted_config_sha256 !== receipt.submitted_config_sha256 || proof.server_url !== receipt.server_url ||
+      proof.controller_running_observed !== true || proof.crash_kind !== 'tokio-worker-stack-overflow' ||
+      proof.historical_admission !== 'unknown' || proof.historical_process_namespace_proven !== false ||
+      proof.terminal_observation !== null || proof.ranking !== null || proof.throughput_claim !== null ||
+      !isLegacySha(proof.verifier_sha256) || !isLegacySha(proof.runner_source_sha256)) {
+    throw new Error('Owned controller crash disposition is not bound to the exact unsettled invocation');
+  }
+  const census = proof.census;
+  const cell = proof.cell;
+  const cluster = proof.cluster;
+  const pools = proof.pools;
+  const hashes = proof.raw_observation_sha256;
+  const userPools: unknown[] = isRecord(pools) && Array.isArray(pools.user_pools) ? pools.user_pools : [];
+  const systemPool = isRecord(pools) ? pools.stamp_system_pool_name : undefined;
+  const armPoolNames: unknown = isRecord(pools) ? pools.arm_pool_names : undefined;
+  const serverUrl = new URL(receipt.server_url);
+  if (serverUrl.hostname !== '127.0.0.1' || !serverUrl.port || serverUrl.href !== serverUrl.origin + '/' ||
+      !isRecord(census) || !isLegacyUuid(census.boot_id) || !isLegacyIdentity(census.pid_namespace) ||
+      !isLegacyIdentity(census.net_namespace) || !isLegacyIdentity(census.host_target) ||
+      !isLegacyIdentity(census.lease_id) || !/^ls-[a-f0-9]+$/.test(census.lease_id) || census.lease_active !== true ||
+      census.controller_pid !== receipt.server_pid || census.controller_start_ticks !== receipt.server_start_ticks ||
+      census.controller_executable !== receipt.server_executable ||
+      !['absent', 'zombie'].includes(String(census.controller_state)) ||
+      census.launcher_match_count !== 0 || census.controller_match_count !== 0 || census.helper_match_count !== 0 ||
+      !Array.isArray(census.helpers) || census.helpers.length === 0 ||
+      !census.helpers.every((helper: unknown) => isRecord(helper) && isLegacyTime(helper.pid) &&
+        helper.pid !== receipt.server_pid && isLegacyIdentity(helper.start_ticks) && /^[1-9][0-9]*$/.test(helper.start_ticks) &&
+        isLegacyIdentity(helper.executable) && (helper.state === 'absent' || helper.state === 'zombie')) ||
+      new Set(census.helpers.map((helper: { pid: number }) => helper.pid)).size !== census.helpers.length ||
+      !Array.isArray(census.closed_ports) || !census.closed_ports.includes(Number(new URL(receipt.server_url).port)) ||
+      census.closed_ports.length !== 3 || !census.closed_ports.every((port: unknown) =>
+        typeof port === 'number' && Number.isInteger(port) && port > 0 && port <= 65535) ||
+      new Set(census.closed_ports).size !== census.closed_ports.length ||
+      !isLegacyTime(census.observed_at_unix_ms) || census.observed_at_unix_ms < receipt.started_at_unix_ms ||
+      !isRecord(cell) || !isLegacyUuid(cell.id) || !isLegacyUuid(cell.namespace_uid) ||
+      cell.namespace !== 'arrow-collector-' + cell.id.replaceAll('-', '') ||
+      cell.delete_precondition_uid !== cell.namespace_uid || cell.delete_response_uid !== cell.namespace_uid ||
+      cell.delete_succeeded !== true || cell.namespace_absent !== true || cell.namespace_uid_absent !== true ||
+      cell.controller_pod_count !== 0 || cell.run_fic_id !== 'arrowcol-run-' + cell.id ||
+      cell.run_fic_deleted !== true || cell.run_fic_absent !== true ||
+      !isLegacyIdentity(cell.native_fic_id) || cell.native_fic_id === cell.run_fic_id ||
+      cell.native_fic_present !== true || cell.fic_inventory_count !== 1 ||
+      !isLegacyTime(cell.namespace_observed_at_unix_ms) || cell.namespace_observed_at_unix_ms < receipt.started_at_unix_ms ||
+      !isLegacyTime(cell.fic_observed_at_unix_ms) || cell.fic_observed_at_unix_ms < receipt.started_at_unix_ms ||
+      !isRecord(cluster) || !isLegacySha(cluster.stamp_config_sha256) ||
+      !isLegacyIdentity(cluster.stock_aks_id) || cluster.arm_aks_id !== cluster.stock_aks_id ||
+      !isLegacyIdentity(cluster.stock_api_server) || cluster.current_api_server !== cluster.stock_api_server ||
+      !isRecord(pools) || pools.all_user_pools_inventoried !== true || !Array.isArray(pools.user_pools) ||
+      !Array.isArray(pools.stamp_user_pool_names) || pools.stamp_user_pool_names.length !== pools.user_pools.length ||
+      !pools.stamp_user_pool_names.every(isLegacyIdentity) || pools.user_pools.length === 0 ||
+      !isLegacyIdentity(systemPool) || !Array.isArray(armPoolNames) ||
+      armPoolNames.length !== pools.user_pools.length + 1 || !armPoolNames.every(isLegacyIdentity) ||
+      new Set(armPoolNames.map((name: string) => name.toLowerCase())).size !== armPoolNames.length ||
+      !armPoolNames.some((name: string) => name.toLowerCase() === systemPool.toLowerCase()) ||
+      pools.stamp_user_pool_names.some((name: string) => name.toLowerCase() === systemPool.toLowerCase()) ||
+      !pools.stamp_user_pool_names.every((name: string) =>
+        armPoolNames.some((armName: string) => armName.toLowerCase() === name.toLowerCase())) ||
+      !isLegacyTime(pools.observed_at_unix_ms) || pools.observed_at_unix_ms < receipt.started_at_unix_ms ||
+      !userPools.every((pool: unknown) => isRecord(pool) && isLegacyIdentity(pool.name) &&
+        pool.arm_count === 0 && pool.arm_min_count === 0 && pool.arm_max_count === 1 &&
+        pool.provisioning_state === 'Succeeded' && pool.kubernetes_node_count === 0) ||
+      new Set(userPools.map((pool) => isRecord(pool) && typeof pool.name === 'string' ? pool.name.toLowerCase() : '')).size !== pools.user_pools.length ||
+      new Set(pools.stamp_user_pool_names.map((name: string) => name.toLowerCase())).size !== pools.user_pools.length ||
+      !pools.stamp_user_pool_names.every((name: string) => userPools.some(
+        (pool) => isRecord(pool) && typeof pool.name === 'string' && pool.name.toLowerCase() === name.toLowerCase())) ||
+      !isRecord(hashes) || !['admission', 'launcher_log', 'namespace_binding', 'delete_intent', 'delete_options', 'delete_response',
+        'workload_stop', 'namespace_get', 'fic_cleanup', 'fic_delete_receipt', 'fic_postcondition', 'fic_inventory',
+        'process_census', 'process_raw', 'lease', 'cluster_inventory', 'pool_inventory', 'node_inventory']
+        .every((name) => isLegacySha(hashes[name]))) {
+    throw new Error('Owned controller crash disposition lacks coherent process, namespace, FIC, or pool custody evidence');
+  }
+  return {
+    bootId: census.boot_id, pidNamespace: census.pid_namespace, netNamespace: census.net_namespace,
+    serverPid: receipt.server_pid, serverStartTicks: receipt.server_start_ticks,
+    helpers: census.helpers as { pid: number; start_ticks: string }[], closedPorts: census.closed_ports as number[],
+    namespaceObserved: cell.namespace_observed_at_unix_ms, ficObserved: cell.fic_observed_at_unix_ms,
+    poolObserved: pools.observed_at_unix_ms, censusObserved: census.observed_at_unix_ms,
+  };
+}
+
 function findAksDispositionApproval(approvals: readonly AksDispositionApproval[], invocationId: string) {
   if (!isLegacyUuid(invocationId)) return undefined;
   const matching = approvals.filter((approval) => approval.invocationId === invocationId ||
-    (approval.kind === 'aborted-post-load-aks' && approval.invocationIdSha256 === sha256Bytes(Buffer.from(invocationId))));
+    ((approval.kind === 'aborted-post-load-aks' || approval.kind === 'owned-controller-crash-aks') &&
+      approval.invocationIdSha256 === sha256Bytes(Buffer.from(invocationId))));
   return matching.length === 1 ? matching[0] : undefined;
 }
 
@@ -800,6 +904,7 @@ function validateAksDisposition(original: Buffer, evidence: Buffer, approval: Ak
     case 'legacy': return { kind: approval.kind, ...validateLegacyAksDisposition(original, evidence, approval) } as const;
     case 'observed-failed-preload-aks': return { kind: approval.kind, ...validateObservedAksDisposition(original, evidence, approval) } as const;
     case 'aborted-post-load-aks': return { kind: approval.kind, ...validateAbortedPostLoadAksDisposition(original, evidence, approval) } as const;
+    case 'owned-controller-crash-aks': return { kind: approval.kind, ...validateOwnedControllerCrashDisposition(original, evidence, approval) } as const;
     default: throw new Error('Unrecognized AKS disposition kind');
   }
 }
@@ -874,8 +979,27 @@ async function assertCensusWritersAbsent(proof: ReturnType<typeof validateAborte
   }))) throw new Error('Post-load AKS census listener is still present');
 }
 
+async function assertOwnedCrashWritersAbsent(proof: ReturnType<typeof validateOwnedControllerCrashDisposition>): Promise<void> {
+  if (process.platform !== 'linux' || (await readFile('/proc/sys/kernel/random/boot_id', 'utf8')).trim() !== proof.bootId ||
+      await readlink('/proc/self/ns/pid') !== proof.pidNamespace || await readlink('/proc/self/ns/net') !== proof.netNamespace) {
+    throw new Error('Owned controller crash census requires the same Linux boot and namespaces as the reviewed census');
+  }
+  for (const processIdentity of [{ pid: proof.serverPid, start_ticks: proof.serverStartTicks }, ...proof.helpers]) {
+    if (!await legacyServerHasExited(processIdentity.pid, processIdentity.start_ticks)) {
+      throw new Error('Owned controller crash process is live, reused, or not demonstrably exited');
+    }
+  }
+  const listenerTable = await Promise.all(['/proc/net/tcp', '/proc/net/tcp6'].map((path) => readFile(path, 'utf8')));
+  const ports = new Set(proof.closedPorts.map((port) => port.toString(16).padStart(4, '0').toUpperCase()));
+  if (listenerTable.some((table) => table.trim().split('\n').slice(1).some((row) => {
+    const fields = row.trim().split(/\s+/);
+    return fields[3] === '0A' && ports.has(fields[1]?.split(':').at(-1) ?? '');
+  }))) throw new Error('Owned controller crash listener is still present');
+}
+
 async function assertDispositionWritersAbsent(proof: ReturnType<typeof validateAksDisposition>): Promise<void> {
   if (proof.kind === 'aborted-post-load-aks') return assertCensusWritersAbsent(proof);
+  if (proof.kind === 'owned-controller-crash-aks') return assertOwnedCrashWritersAbsent(proof);
   return assertLegacyWritersAbsent(proof);
 }
 
@@ -889,7 +1013,7 @@ export async function recordLegacyAksDisposition(
   const evidence = await readLegacyRegularFile(evidencePath);
   const original = await readLegacyRegularFile(path);
   const proof = validateAksDisposition(original, evidence, approval);
-  if (proof.kind === 'aborted-post-load-aks' &&
+  if ((proof.kind === 'aborted-post-load-aks' || proof.kind === 'owned-controller-crash-aks') &&
       ![proof.censusObserved, proof.namespaceObserved, proof.ficObserved, proof.poolObserved]
         .every((time) => time <= Date.now() && Date.now() - time <= 60 * 60_000)) {
     throw new Error('Legacy AKS resource absence evidence is not current');
@@ -909,7 +1033,7 @@ export async function recordLegacyAksDisposition(
     return;
   }
   const now = Date.now();
-  const current = proof.kind === 'aborted-post-load-aks'
+  const current = proof.kind === 'aborted-post-load-aks' || proof.kind === 'owned-controller-crash-aks'
     ? [proof.censusObserved, proof.namespaceObserved, proof.ficObserved, proof.poolObserved]
       .every((time) => time <= now && now - time <= 60 * 60_000)
     : proof.kind === 'observed-failed-preload-aks'
