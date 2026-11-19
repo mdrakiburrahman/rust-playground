@@ -26,7 +26,7 @@ use fs2::FileExt;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode};
 use parquet::file::properties::WriterProperties;
 use sha2::Digest;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::fs::{self, File, OpenOptions};
@@ -2958,10 +2958,10 @@ impl DeltaTable {
         Ok(())
     }
 
-    pub(crate) fn lookup_app_id_versions(
+    pub(crate) fn lookup_app_id_versions<'a>(
         &self,
         snapshot: &Snapshot,
-        application_ids: impl IntoIterator<Item = &str>,
+        application_ids: impl IntoIterator<Item = &'a str>,
     ) -> Result<HashMap<String, Option<i64>>> {
         let mut seen = std::collections::HashSet::new();
         let ids = application_ids
@@ -3912,7 +3912,7 @@ impl DeltaTable {
             prepared_entries.push((source_application_id, version, stamp, batch_rows, splits));
         }
         let previous_by_id = if let Some(snapshot) = snapshot.as_ref() {
-            self.lookup_app_id_versions(snapshot, requested_ids)?
+            self.lookup_app_id_versions(snapshot, requested_ids.iter().map(String::as_str))?
         } else {
             HashMap::new()
         };

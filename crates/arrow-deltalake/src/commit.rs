@@ -1272,6 +1272,7 @@ mod tests {
                 batch_window: Duration::from_secs(60),
                 max_files_per_commit: 2,
                 max_pending_files: 4,
+                publication_lookup_mode: PublicationLookupMode::default(),
             },
         )
         .await?;
@@ -1323,6 +1324,7 @@ mod tests {
                 batch_window: Duration::from_secs(60),
                 max_files_per_commit: 2,
                 max_pending_files: 4,
+                publication_lookup_mode: PublicationLookupMode::default(),
             },
         )
         .await?;
