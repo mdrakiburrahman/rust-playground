@@ -92,11 +92,12 @@
 # kubectl --context "$CONTEXT" -n "$NS" get pods -l "arrowcol-oat/run-id=$UUID,batch.kubernetes.io/job-name=direct-load-confirmwide" -o json > "$EVIDENCE/pods.json"
 # Then, for each recorded
 # client pod, kubectl --context "$CONTEXT" -n "$NS" logs "$POD" -c generator > "$EVIDENCE/client-$INDEX.log".
-# kubectl --context "$CONTEXT" -n "$NS" logs "$WRITER" -c dataflow > "$EVIDENCE/collector.log"
-# Do not pass --timestamps: the extractor requires collector JSON lines to begin with `{`.
+# Do not use kubectl logs for writer evidence. Export both original files from the exact retained
+# writer PVC after positive terminal status and before any cleanup; audit stdout, preserve stderr too.
+# Do not pass --timestamps on API log captures: the extractor requires raw line framing.
 # Its readline implementation buffers each complete line before applying the 8-MiB line cap.
 # Check every command exit and preserve the original logs.
-# kubectl logs only returns the latest rotated file; it is not complete-log custody at load.
+# kubectl logs only returns the latest rotated file; client log custody still needs a nonrotating source.
 # npx --no-install tsx infra/azure/benchmark-extract.ts manifest "$EVIDENCE/client-$INDEX.log" "$EVIDENCE/client-$INDEX-manifest.json"
 # npx --no-install tsx infra/azure/benchmark-extract.ts collector "$EVIDENCE/collector.log" "$EVIDENCE/collector-receipts.jsonl"
 # Extractor writes new files only; any error leaves an incomplete output that must not be used.
@@ -1213,6 +1214,24 @@ spec:
       containers:
         - name: dataflow
           image: UNRESOLVED_COLLECTOR_IMAGE
+          command:
+            - /usr/bin/tini
+            - --
+            - /bin/sh
+            - -ec
+            - |
+              set -u
+              umask 077
+              dir="/var/lib/arrowcol/staging/benchmark-logs/$BENCH_POD_UID"
+              mkdir -p /var/lib/arrowcol/staging/benchmark-logs
+              mkdir "$dir"
+              : > "$dir/stdout"
+              : > "$dir/stderr"
+              fallocate --keep-size -l 4GiB "$dir/stdout"
+              fallocate --keep-size -l 4GiB "$dir/stderr"
+              printf '%s\n' "$$" > "$dir/pid"
+              exec prlimit --fsize=4294967296:4294967296 -- /usr/local/bin/arrowcol-dataflow-rust "$@" >> "$dir/stdout" 2>> "$dir/stderr"
+            - capture
           securityContext:
             runAsNonRoot: true
             runAsUser: 10001
@@ -1227,6 +1246,10 @@ spec:
             - --num-cores
             - "160"
           env:
+            - name: BENCH_POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
             - name: ARROWCOL_DELTA_ROOT
               value: abfss://arrowcol@arrowcollector68590.dfs.core.windows.net/direct-baseline-1/runs/BENCHRUNUUID/dataflow
             - name: ARROWCOL_AZURE_MODE
@@ -1339,19 +1362,29 @@ spec:
             secretName: arrowcol-router-auth
             defaultMode: 288
         - name: staging
-          ephemeral:
-            volumeClaimTemplate:
-              metadata:
-                labels:
-                  app.kubernetes.io/part-of: arrowcol-oat
-                  benchmark-stage: writer
-              spec:
-                accessModes:
-                  - ReadWriteOnce
-                storageClassName: arrowcol-BENCHRUNHEX-local-csi
-                resources:
-                  requests:
-                    storage: 256Gi
+          persistentVolumeClaim:
+            claimName: arrowcol-writer-staging
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: arrowcol-writer-staging
+  namespace: arrow-collector-BENCHRUNHEX
+  labels:
+    app.kubernetes.io/part-of: arrowcol-oat
+    benchmark-stage: writer
+    arrowcol-oat/run-id: BENCHRUNUUID
+    arrowcol-oat/owner-token: BENCHOWNER
+  annotations:
+    arrowcol-oat/run-id: BENCHRUNUUID
+    arrowcol-oat/owner-token: BENCHOWNER
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: arrowcol-BENCHRUNHEX-local-csi
+  resources:
+    requests:
+      storage: 256Gi
 ---
 apiVersion: v1
 kind: ConfigMap

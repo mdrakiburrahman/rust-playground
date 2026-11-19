@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { acceptRouterFencePatch, planRouterFence, routerFenceObserved } from './benchmark-router-fence.js';
+import { persistDirectStopPatch } from './benchmark-stop-patch.js';
+import { writerLogExportPod } from './benchmark-writer-export.js';
 import { observeStoppedWriterRegistration, pinWriterRegistration } from './benchmark-writer-sql.js';
 
 const run = {
@@ -48,7 +50,7 @@ test('requires a positive original router fence, controller convergence and no p
 test('binds SQL stop to one original run generation, endpoint and registration lifetime', () => {
   const generation = '98765432-89ab-cdef-0123-456789abcdef';
   const writer = { deploymentUid: 'deployment', replicaSetUid: 'replica', podName: 'pod', podUid: uid,
-    podIp: '10.0.0.47', image: 'pinned', imageId: 'image-id', containerId: 'container',
+    podIp: '10.0.0.47', nodeName: 'writer-node', image: 'pinned', imageId: 'image-id', containerId: 'container',
     startedAt: '2026-01-01T00:00:00Z', finishedAt: '2026-01-01T00:10:01Z', terminalPodResourceVersion: '21' };
   const ready = { instance_id: uid, instance_key: `direct-single-writer-${run.runId}|cloud=${generation}`,
     implementation_pool: 'dataflow', flight_endpoint: '10.0.0.47:32010', state: 'ready',
@@ -61,4 +63,63 @@ test('binds SQL stop to one original run generation, endpoint and registration l
     assert.throws(() => observeStoppedWriterRegistration(run, generation, writer, pin, [bad]), /newer SQL stopped observation/);
   }
   assert.deepEqual(observeStoppedWriterRegistration(run, generation, writer, pin, [stopped]), stopped);
+});
+
+test('never replays an unknown PATCH and only persists the exact original positive response', async () => {
+  const origin = { ...run, cloudGeneration: uid, sourceRevision: 'a'.repeat(40), fencingToken: 1 };
+  const original = { ...router, kind: 'Deployment', metadata: { ...router.metadata, name: 'arrowcol' }, spec: { replicas: 1 } };
+  const response = JSON.stringify({ ...original, metadata: { ...original.metadata, resourceVersion: '43', generation: 2 },
+    spec: { replicas: 0 } });
+  let dispatches = 0;
+  for (const [mode, expected] of [['unknown', /connection lost/], ['wrong-uid', /identity changed/], ['success', null]] as const) {
+    let bytes: Buffer | undefined;
+    let version = '"0"';
+    const azure = {
+      c: { checkpoints: 'checkpoint' },
+      blob: async (method: string, _container: string, _path: string, _query: unknown, body: string | undefined,
+        headers: Record<string, string>) => {
+        if (method === 'GET') return [bytes, { etag: version }];
+        if (headers['If-None-Match'] === '*' && bytes) throw new Error('Already has an intent');
+        if (bytes) assert.equal(headers['If-Match'], version);
+        bytes = Buffer.from(body!);
+        version = bytes.includes('"responded"') ? '"2"' : '"1"';
+        return [null, { ':status': '201', etag: version }];
+      },
+    } as unknown as Parameters<typeof persistDirectStopPatch>[0];
+    const invoke = () => persistDirectStopPatch(azure, { assertCurrent: async () => {} }, origin, 'arrowcol', uid,
+      original, async ops => {
+        dispatches++;
+        assert.match(bytes!.toString(), /"phase":"intent"/);
+        assert.deepEqual(ops.slice(0, 2).map(op => op.value), [uid, '42']);
+        if (mode === 'unknown') throw new Error('connection lost');
+        return mode === 'wrong-uid' ? response.replace(uid, run.owner) : response;
+      });
+    if (expected) await assert.rejects(invoke, expected);
+    else {
+      const observed = await invoke();
+      assert.equal(observed.receipt.response, response);
+      assert.equal(observed.version, '"2"');
+    }
+    await assert.rejects(invoke, /Already has an intent/);
+  }
+  assert.equal(dispatches, 3);
+});
+
+test('exports the original writer directory on the original node with no writeable claim mount', () => {
+  const capture = { claimUid: run.owner, volumeName: 'bound-pv' };
+  const claim = { kind: 'PersistentVolumeClaim', apiVersion: 'v1',
+    metadata: { name: 'arrowcol-writer-staging', namespace: run.namespace, uid: capture.claimUid, labels: markers, annotations: markers },
+    spec: { volumeName: capture.volumeName, storageClassName: `arrowcol-${run.runId.replaceAll('-', '')}-local-csi` },
+    status: { phase: 'Bound' } };
+  const writer = { deploymentUid: 'deployment', replicaSetUid: 'replica', podName: 'pod', podUid: uid,
+    podIp: '10.0.0.47', nodeName: 'original-node', image: `example/writer@sha256:${'a'.repeat(64)}`, imageId: 'image-id', containerId: 'container',
+    startedAt: '2026-01-01T00:00:00Z', finishedAt: '2026-01-01T00:10:01Z', terminalPodResourceVersion: '21' };
+  assert.throws(() => writerLogExportPod(run, writer, capture, { ...claim, metadata: { ...claim.metadata, uid } }), /unverified original/);
+  const { spec } = writerLogExportPod(run, writer, capture, claim);
+  assert.equal(spec.volumes[0].persistentVolumeClaim.readOnly, true);
+  assert.deepEqual(spec.containers[0].volumeMounts[0], {
+    name: 'writer-logs', mountPath: '/evidence', readOnly: true, subPath: `benchmark-logs/${uid}`,
+  });
+  assert.deepEqual(spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchFields[0].values,
+    [writer.nodeName]);
 });

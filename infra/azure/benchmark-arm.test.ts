@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { delimiter, join } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { observeWriter, observeWriterExit, validateArm, type ArmIdentity } from './benchmark-arm.js';
+import { observeWriter, observeWriterCapture, observeWriterExit, validateArm, type ArmIdentity } from './benchmark-arm.js';
 
 const identity: ArmIdentity = {
   runId: '01234567-89ab-cdef-0123-456789abcdef',
@@ -40,13 +40,27 @@ function fixture() {
   const writerPods = { items: [{ apiVersion: 'v1', kind: 'Pod',
     metadata: { ...writerMeta, name: 'writer-pod', uid: 'writer-pod-uid',
       ownerReferences: [{ kind: 'ReplicaSet', name: 'writer-rs', uid: 'writer-rs-uid', controller: true }] },
-    spec: { containers: [{ name: 'dataflow', image: `example/writer@sha256:${'b'.repeat(64)}` }] },
+    spec: { nodeName: 'writer-node', volumes: [{ name: 'staging', persistentVolumeClaim: { claimName: 'arrowcol-writer-staging' } }],
+      containers: [{ name: 'dataflow', image: `example/writer@sha256:${'b'.repeat(64)}`,
+        volumeMounts: [{ name: 'staging', mountPath: '/var/lib/arrowcol/staging' }] }] },
     status: { phase: 'Running', podIP: '10.0.0.47', containerStatuses: [{ name: 'dataflow', ready: true, restartCount: 0,
       imageID: `example/writer@sha256:${'b'.repeat(64)}`, containerID: 'containerd://original',
       state: { running: { startedAt: '2026-01-01T00:00:00Z' } } }] },
   }] };
-  return { namespace, job, schedule, pods, logs, deployment, replicaSets, writerPods };
+  const pvc = { apiVersion: 'v1', kind: 'PersistentVolumeClaim', metadata: { ...writerMeta, name: 'arrowcol-writer-staging',
+    uid: 'original-claim' }, spec: { volumeName: 'bound-pv',
+      storageClassName: `arrowcol-${identity.runId.replaceAll('-', '')}-local-csi` }, status: { phase: 'Bound' } };
+  return { namespace, job, schedule, pods, logs, deployment, replicaSets, writerPods, pvc };
 }
+
+test('requires a run-owned retained PVC and a positive live writer redirection probe', () => {
+  const { pvc } = fixture();
+  assert.throws(() => observeWriterCapture(identity, pvc, ''), /not confirmed/);
+  assert.throws(() => observeWriterCapture(identity, {
+    ...pvc, metadata: { ...pvc.metadata, ownerReferences: [{ kind: 'Pod' }] },
+  }, 'writer-capture-active\n'), /not confirmed/);
+  assert.equal(observeWriterCapture(identity, pvc, 'writer-capture-active\n').volumeName, 'bound-pv');
+});
 
 test('pins the exact running writer and refuses a restarted or foreign replacement', () => {
   const f = fixture();
@@ -126,6 +140,8 @@ const fs=require('node:fs');
 const d=JSON.parse(fs.readFileSync(process.env.ARM_FIXTURE,'utf8'));
 const a=process.argv.slice(2);
 if(a.includes('logs')) { process.stdout.write(d.logs[a[a.indexOf('logs')+1]]); }
+else if(a.includes('exec')) { process.stdout.write('writer-capture-active\\n'); }
+else if(a.includes('pvc')) { process.stdout.write(JSON.stringify(d.pvc)); }
 else if(a.includes('patch')) {
   const p=JSON.parse(a[a.indexOf('--patch')+1]);
   if(p[0].value!=='17'||p[1].value!=='pending'||p[2].path!=='/data/start'||
@@ -157,6 +173,7 @@ else process.exit(3);
     const ops = JSON.parse(readFileSync(patch, 'utf8')) as Array<{ value: string }>;
     assert.equal(Number(ops[2].value), output.runStartUnixMs);
     assert.equal(JSON.parse(ops[4].value).podUid, 'writer-pod-uid');
+    assert.equal(JSON.parse(ops[4].value).capture.claimUid, 'original-claim');
     assert.equal(output.measurementStartUnixMs, output.runStartUnixMs + 60_000);
     assert.equal(output.measurementEndUnixMs, output.runStartUnixMs + 660_000);
   } finally {

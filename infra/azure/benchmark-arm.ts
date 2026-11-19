@@ -87,11 +87,53 @@ export function observeWriter(identity: ArmIdentity, deployment: unknown, replic
     throw new Error('Writer container is not the original healthy lifetime');
   }
   const podIp = text(status.podIP, 'writer pod IP');
+  const nodeName = text(spec.nodeName, 'writer node name');
+  const staging = array(spec.volumes, 'writer volumes').map(v => object(v, 'writer volume')).filter(v => v.name === 'staging');
+  const mounts = array(container.volumeMounts, 'writer mounts').map(v => object(v, 'writer mount')).filter(v => v.name === 'staging');
+  if (staging.length !== 1 || object(staging[0].persistentVolumeClaim, 'writer claim').claimName !== WRITER_CLAIM ||
+      mounts.length !== 1 || mounts[0].mountPath !== '/var/lib/arrowcol/staging' || mounts[0].subPath !== undefined ||
+      mounts[0].subPathExpr !== undefined) throw new Error('Writer pod is not using the retained staging PVC');
   return { deploymentUid, replicaSetUid: text(replica.uid, 'writer ReplicaSet UID'),
-    podName: text(pm.name, 'writer pod name'), podUid: text(pm.uid, 'writer pod UID'), podIp, image, imageId, containerId, startedAt };
+    podName: text(pm.name, 'writer pod name'), podUid: text(pm.uid, 'writer pod UID'), podIp, nodeName, image, imageId, containerId, startedAt };
 }
 
 export type WriterLifetime = ReturnType<typeof observeWriter>;
+
+export const WRITER_CLAIM = 'arrowcol-writer-staging';
+export const WRITER_CAPTURE = '/var/lib/arrowcol/staging/benchmark-logs';
+export function observeWriterClaim(identity: ArmIdentity, value: unknown) {
+  const claim = object(value, 'writer staging PVC'), metadata = object(claim.metadata, 'writer staging PVC metadata');
+  ownership(metadata, identity);
+  const spec = object(claim.spec, 'writer staging PVC spec'), status = object(claim.status, 'writer staging PVC status');
+  if (claim.apiVersion !== 'v1' || claim.kind !== 'PersistentVolumeClaim' || metadata.deletionTimestamp ||
+      metadata.name !== WRITER_CLAIM || metadata.namespace !== identity.namespace ||
+      (metadata.ownerReferences !== undefined && array(metadata.ownerReferences, 'PVC owner references').length > 0) ||
+      spec.storageClassName !== `arrowcol-${identity.runId.replaceAll('-', '')}-local-csi` || status.phase !== 'Bound') {
+    throw new Error('Writer capture PVC is not confirmed');
+  }
+  return { claimUid: text(metadata.uid, 'writer claim UID'), volumeName: text(spec.volumeName, 'writer PV name') };
+}
+
+export function observeWriterCapture(identity: ArmIdentity, value: unknown, probe: string) {
+  if (probe !== 'writer-capture-active\n') throw new Error('Writer live stdout/stderr redirection is not confirmed');
+  return observeWriterClaim(identity, value);
+}
+
+const probeCapture = `
+set -eu
+d="${WRITER_CAPTURE}/$1"
+p=$(cat "$d/pid")
+case "$p" in ''|*[!0-9]*) exit 1 ;; esac
+test "$(readlink "/proc/$p/exe")" = /usr/local/bin/arrowcol-dataflow-rust
+test "$(readlink "/proc/$p/fd/1")" = "$d/stdout"
+test "$(readlink "/proc/$p/fd/2")" = "$d/stderr"
+for f in stdout stderr; do
+  test -f "$d/$f"
+  test "$(stat -c %b "$d/$f")" -ge 8388608
+  test "$(stat -c %s "$d/$f")" -lt 4294967296
+done
+printf 'writer-capture-active\\n'
+`;
 
 function matchesImageDigest(image: string, imageId: string): boolean {
   const expected = /@(sha256:[0-9a-f]{64})$/.exec(image)?.[1];
@@ -107,6 +149,7 @@ export function observeWriterExit(identity: ArmIdentity, original: WriterLifetim
       pm.name !== original.podName || pm.uid !== original.podUid ||
       controller(pm, 'ReplicaSet').uid !== original.replicaSetUid) throw new Error('Original writer pod was replaced');
   const spec = object(pod.spec, 'terminal writer spec');
+  if (spec.nodeName !== original.nodeName) throw new Error('Original writer node changed');
   const containers = array(spec.containers, 'terminal writer containers');
   const statuses = array(object(pod.status, 'terminal writer status').containerStatuses, 'terminal writer container statuses');
   if (containers.length !== 1 || statuses.length !== 1) throw new Error('Terminal writer coverage changed');
@@ -235,6 +278,13 @@ function main(): void {
   const readWriter = () => observeWriter(identity, get('deployment', 'arrowcol'),
     readJson(context, ['-n', namespace, 'get', 'replicasets', '-l', 'app=arrowcol']),
     readJson(context, ['-n', namespace, 'get', 'pods', '-l', 'app=arrowcol']));
+  const readCapturedWriter = () => {
+    const lifetime = readWriter();
+    const claim = get('pvc', WRITER_CLAIM);
+    const probe = kubectl(context, ['-n', namespace, 'exec', lifetime.podName, '-c', 'dataflow', '--',
+      '/bin/sh', '-c', probeCapture, 'capture', lifetime.podUid]);
+    return { ...lifetime, capture: observeWriterCapture(identity, claim, probe) };
+  };
   const ns = readJson(context, ['get', 'namespace', namespace]);
   const job = get('job', 'direct-load-confirmwide');
   const schedule = get('configmap', 'direct-schedule-confirmwide');
@@ -244,12 +294,12 @@ function main(): void {
     text(object(object(item, 'pod').metadata, 'pod metadata').name, 'pod name'));
   const logs = new Map(names.map(name => [name, kubectl(context, ['-n', namespace, 'logs', name, '-c', 'generator'])]));
   const checked = validateArm(identity, ns, job, schedule, pods, logs);
-  const writer = JSON.stringify(readWriter());
+  const writer = JSON.stringify(readCapturedWriter());
   const freshPods = readJson(context, ['-n', namespace, 'get', 'pods', '-l', selector]);
   const fresh = validateArm(identity, readJson(context, ['get', 'namespace', namespace]),
     get('job', 'direct-load-confirmwide'), get('configmap', 'direct-schedule-confirmwide'), freshPods, logs);
   if (fresh.scheduleVersion !== checked.scheduleVersion || fresh.podUids.join(',') !== checked.podUids.join(',') ||
-      JSON.stringify(readWriter()) !== writer) {
+      JSON.stringify(readCapturedWriter()) !== writer) {
     throw new Error('Client fleet, writer lifetime, or schedule changed before arming');
   }
   const now = Date.now();
