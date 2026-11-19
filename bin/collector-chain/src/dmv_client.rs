@@ -1,6 +1,7 @@
 //! Bounded, startup-prepared DMV workload and persistent Flight senders.
 
 use super::*;
+use arrow_flight::decode::FlightRecordBatchStream;
 use arrow_flight::encode::DictionaryHandling;
 use arrow_ipc::writer::IpcWriteOptions;
 use arrowcol_protocol::NOT_ADMITTED_METADATA_KEY;
@@ -449,6 +450,11 @@ struct EncodedBatch {
     raw_arrow_bytes: u64,
     encoded_bytes: u64,
 }
+struct CanonicalPublicationAccounting {
+    decoded_physical_batch_count: u64,
+    canonical_logical_bytes: Option<u64>,
+    unavailable_reason: Option<String>,
+}
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -478,9 +484,13 @@ struct LogicalBatchRecord {
     cohort: ManifestCohort,
     attempts: u16,
     outcome: ManifestOutcome,
+    decoded_physical_batch_count: u64,
+    canonical_logical_bytes: Option<u64>,
+    canonical_logical_bytes_unavailable_reason: Option<String>,
     first_send_unix_ns: Option<u64>,
     last_send_unix_ns: Option<u64>,
     first_admitted_unix_ms: Option<u64>,
+    first_admitted_cohort: Option<ManifestCohort>,
     last_outcome_unix_ms: Option<u64>,
 }
 
@@ -495,9 +505,13 @@ struct LogicalBatchRange {
     cohort: ManifestCohort,
     attempts: u16,
     outcome: ManifestOutcome,
+    decoded_physical_batch_count: u64,
+    canonical_logical_bytes: Option<u64>,
+    canonical_logical_bytes_unavailable_reason: Option<String>,
     first_send_unix_ns: Option<u64>,
     last_send_unix_ns: Option<u64>,
     first_admitted_unix_ms: Option<u64>,
+    first_admitted_cohort: Option<ManifestCohort>,
     last_admitted_unix_ms: Option<u64>,
     last_outcome_unix_ms: Option<u64>,
 }
@@ -506,6 +520,7 @@ struct LogicalBatch {
     batch: EncodedBatch,
     manifest_index: Option<usize>,
     _live_batch_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    publication_identity_key: Option<String>,
 }
 
 struct ContinuousAdmission<P, E, W> {
@@ -1086,7 +1101,13 @@ impl PreparedClient {
         Ok(sequence)
     }
 
-    fn reserve_manifest_record(&self, batch: &EncodedBatch, worker: usize, sequence: u64) -> Result<usize> {
+    fn reserve_manifest_record(
+        &self,
+        batch: &EncodedBatch,
+        worker: usize,
+        sequence: u64,
+        accounting: CanonicalPublicationAccounting,
+    ) -> Result<usize> {
         let mut records = self
             .logical_batches
             .lock()
@@ -1109,9 +1130,13 @@ impl PreparedClient {
             cohort: ManifestCohort::Unscheduled,
             attempts: 0,
             outcome: ManifestOutcome::Pending,
+            decoded_physical_batch_count: accounting.decoded_physical_batch_count,
+            canonical_logical_bytes: accounting.canonical_logical_bytes,
+            canonical_logical_bytes_unavailable_reason: accounting.unavailable_reason,
             first_send_unix_ns: None,
             last_send_unix_ns: None,
             first_admitted_unix_ms: None,
+            first_admitted_cohort: None,
             last_outcome_unix_ms: None,
         });
         Ok(index)
@@ -1156,6 +1181,7 @@ impl PreparedClient {
         index: usize,
         outcome: ManifestOutcome,
         observed_unix_ms: Option<u64>,
+        measurement: Option<&Measurement>,
     ) -> Result<()> {
         let mut records = self
             .logical_batches
@@ -1167,6 +1193,17 @@ impl PreparedClient {
         record.outcome = outcome;
         if outcome == ManifestOutcome::Acknowledged && record.first_admitted_unix_ms.is_none() {
             record.first_admitted_unix_ms = observed_unix_ms;
+            record.first_admitted_cohort = observed_unix_ms.map(|observed| {
+                measurement.map_or(ManifestCohort::Unscheduled, |window| {
+                    if observed < window.start_unix_ms {
+                        ManifestCohort::Warmup
+                    } else if observed < window.end_unix_ms {
+                        ManifestCohort::Measurement
+                    } else {
+                        ManifestCohort::PostWindow
+                    }
+                })
+            });
         }
         if observed_unix_ms.is_some() {
             record.last_outcome_unix_ms = observed_unix_ms;
@@ -1205,8 +1242,11 @@ impl PreparedClient {
                     && range.last_sequence.checked_add(1) == Some(record.sequence)
                     && range.rows_per_batch == record.row_count
                     && range.cohort == record.cohort
+                    && range.first_admitted_cohort == record.first_admitted_cohort
                     && range.attempts == record.attempts
                     && range.outcome == record.outcome
+                    && range.canonical_logical_bytes_unavailable_reason
+                        == record.canonical_logical_bytes_unavailable_reason
             });
             if merge {
                 let range = ranges.last_mut().context("manifest range disappeared")?;
@@ -1215,6 +1255,17 @@ impl PreparedClient {
                     .batch_count
                     .checked_add(1)
                     .context("logical batch range count overflow")?;
+                range.decoded_physical_batch_count = range
+                    .decoded_physical_batch_count
+                    .checked_add(record.decoded_physical_batch_count)
+                    .context("decoded physical batch count overflow")?;
+                range.canonical_logical_bytes = match (range.canonical_logical_bytes, record.canonical_logical_bytes) {
+                    (Some(left), Some(right)) => Some(
+                        left.checked_add(right)
+                            .context("canonical logical byte range overflow")?,
+                    ),
+                    _ => None,
+                };
                 range.first_send_unix_ns = match (range.first_send_unix_ns, record.first_send_unix_ns) {
                     (Some(left), Some(right)) => Some(left.min(right)),
                     (left, right) => left.or(right),
@@ -1246,9 +1297,13 @@ impl PreparedClient {
                     cohort: record.cohort,
                     attempts: record.attempts,
                     outcome: record.outcome,
+                    decoded_physical_batch_count: record.decoded_physical_batch_count,
+                    canonical_logical_bytes: record.canonical_logical_bytes,
+                    canonical_logical_bytes_unavailable_reason: record.canonical_logical_bytes_unavailable_reason,
                     first_send_unix_ns: record.first_send_unix_ns,
                     last_send_unix_ns: record.last_send_unix_ns,
                     first_admitted_unix_ms: record.first_admitted_unix_ms,
+                    first_admitted_cohort: record.first_admitted_cohort,
                     last_admitted_unix_ms: record.first_admitted_unix_ms,
                     last_outcome_unix_ms: record.last_outcome_unix_ms,
                 });
@@ -1305,6 +1360,10 @@ impl PreparedClient {
                 "identity_column": "endpoint_url",
                 "identity_format": "https://x.invalid/v1/{run_uuid_simple32}/{incarnation_uuid_simple32}/{worker_decimal}/{logical_batch_sequence_base36}/{row_ordinal_decimal}",
                 "publication_identity_key_format": "{run_uuid_simple32}/{incarnation_uuid_simple32}/{worker_decimal}/{logical_batch_sequence_base36}",
+                "publication_identity_header": "x-arrowcol-logical-publication-id",
+                "publication_identity_key_role": "optional audit correlation only; not deduplication or fencing identity",
+                "admitted_cohort_rule": "first successful acknowledgement timestamp, using the measurement window [start,end)",
+                "canonical_logical_bytes_scope": "sum over decoded physical Flight batches before collector coalescing; excludes framing, transport, retries, and concatenation",
                 "run_uuid": self.run_id.simple().to_string(),
                 "run_uuid_source": "client_generated",
                 "oat_run_uuid": null,
@@ -1454,15 +1513,24 @@ impl PreparedClient {
             return Ok(LogicalBatch {
                 batch: template.clone(),
                 manifest_index: None,
+                publication_identity_key: None,
                 _live_batch_permit: None,
             });
         }
         let live_batch_permit = live_batch_permit.context("realistic logical batch requires a memory reservation")?;
         let sequence = self.next_logical_batch_sequence(worker)?;
+        let publication_identity_key = format!(
+            "{}/{}/{}/{}",
+            self.run_id.simple(),
+            self.incarnation_id.simple(),
+            worker,
+            base36(sequence)
+        );
         let batch =
             batch_with_logical_identity(&template.template, self.run_id, self.incarnation_id, worker, sequence)?;
         let (data, raw_arrow_bytes, encoded_bytes) =
             encode_with_sizes(&template.table, &template.version, batch.clone(), &self.options).await?;
+        let accounting = canonical_publication_accounting(&data, template.rows).await?;
         anyhow::ensure!(
             data.iter()
                 .all(|message| message.encoded_len() <= self.options.max_message_bytes),
@@ -1477,10 +1545,11 @@ impl PreparedClient {
             raw_arrow_bytes,
             encoded_bytes,
         };
-        let manifest_index = self.reserve_manifest_record(&prepared, worker, sequence)?;
+        let manifest_index = self.reserve_manifest_record(&prepared, worker, sequence, accounting)?;
         Ok(LogicalBatch {
             batch: prepared,
             manifest_index: Some(manifest_index),
+            publication_identity_key: Some(publication_identity_key),
             _live_batch_permit: Some(live_batch_permit),
         })
     }
@@ -1751,7 +1820,13 @@ impl PreparedClient {
         let mut request = Request::new(stream::iter(batch.data.as_ref().clone()));
         let timeout = Duration::from_millis(self.options.request_timeout_ms);
         let result = tokio::time::timeout(timeout, async {
-            request_metadata(&mut request, &batch.table, self.signer.as_ref(), Some(&observation))?;
+            request_metadata(
+                &mut request,
+                &batch.table,
+                self.signer.as_ref(),
+                Some(&observation),
+                logical.publication_identity_key.as_deref(),
+            )?;
             request.set_timeout(timeout);
             if let Some(index) = logical.manifest_index {
                 self.record_manifest_attempt(index, observation.send_unix_ns, measurement)?;
@@ -1769,7 +1844,7 @@ impl PreparedClient {
                 Err(error) if is_ambiguous_continuous_error(error) => ManifestOutcome::Ambiguous,
                 Err(_) => ManifestOutcome::Failed,
             };
-            self.record_manifest_outcome(index, outcome, Some(unix_ms()?))?;
+            self.record_manifest_outcome(index, outcome, Some(unix_ms()?), measurement)?;
         }
         let completed_unix_ms = if result.is_ok() && measurement.is_some() {
             Some(unix_ms()?)
@@ -2566,6 +2641,50 @@ fn flight_data_bytes(messages: &[FlightData]) -> Result<u64> {
             .context("encoded Arrow IPC size overflow")
     })
 }
+async fn canonical_publication_accounting(
+    messages: &[FlightData],
+    expected_rows: u64,
+) -> Result<CanonicalPublicationAccounting> {
+    let batches = FlightRecordBatchStream::new_from_flight_data(stream::iter(messages.to_vec().into_iter().map(Ok)))
+        .try_collect::<Vec<_>>()
+        .await?;
+    let decoded_rows = batches.iter().try_fold(0_u64, |total, batch| {
+        total
+            .checked_add(u64::try_from(batch.num_rows())?)
+            .context("decoded Flight row count overflow")
+    })?;
+    anyhow::ensure!(
+        decoded_rows == expected_rows,
+        "Flight decoding changed the publication row count"
+    );
+    let mut canonical_logical_bytes = Some(0_u64);
+    let mut unavailable_reason = None;
+    for batch in &batches {
+        match canonical_record_batch_logical_bytes(batch) {
+            Ok(bytes) => {
+                let Some(total) = canonical_logical_bytes else {
+                    continue;
+                };
+                match total.checked_add(bytes) {
+                    Some(total) => canonical_logical_bytes = Some(total),
+                    None => {
+                        canonical_logical_bytes = None;
+                        unavailable_reason = Some("canonical logical byte total overflowed u64".to_owned());
+                    }
+                }
+            }
+            Err(error) => {
+                canonical_logical_bytes = None;
+                unavailable_reason = Some(error.to_string());
+            }
+        }
+    }
+    Ok(CanonicalPublicationAccounting {
+        decoded_physical_batch_count: u64::try_from(batches.len())?,
+        canonical_logical_bytes,
+        unavailable_reason,
+    })
+}
 
 async fn encode_with_sizes(
     table: &DmvTable,
@@ -3057,6 +3176,10 @@ mod tests {
                 cohort: ManifestCohort::Measurement,
                 attempts: 2,
                 outcome: ManifestOutcome::Acknowledged,
+                decoded_physical_batch_count: 2,
+                canonical_logical_bytes: Some(10 + sequence),
+                canonical_logical_bytes_unavailable_reason: None,
+                first_admitted_cohort: Some(ManifestCohort::Measurement),
                 first_send_unix_ns: Some(1_000_000_000),
                 last_send_unix_ns: Some(1_000_000_000 + sequence * 1_000),
                 first_admitted_unix_ms: Some(1_000 + sequence),
@@ -3092,6 +3215,9 @@ mod tests {
         assert_eq!(range["first_send_unix_ns"], 1_000_000_000);
         assert_eq!(range["last_send_unix_ns"], 1_000_001_000);
         assert_eq!(range["first_admitted_unix_ms"], 1_000);
+        assert_eq!(range["decoded_physical_batch_count"], 4);
+        assert_eq!(range["canonical_logical_bytes"], 21);
+        assert_eq!(range["first_admitted_cohort"], "measurement");
         assert_eq!(range["last_admitted_unix_ms"], 1_001);
 
         let expected_ids = (0..=1)
@@ -3130,6 +3256,10 @@ mod tests {
                 cohort: ManifestCohort::Unscheduled,
                 attempts: 0,
                 outcome: ManifestOutcome::Pending,
+                decoded_physical_batch_count: 4,
+                canonical_logical_bytes: Some(2_764_000),
+                canonical_logical_bytes_unavailable_reason: None,
+                first_admitted_cohort: None,
                 first_send_unix_ns: None,
                 last_send_unix_ns: None,
                 first_admitted_unix_ms: None,
@@ -3137,9 +3267,9 @@ mod tests {
             });
 
         client.record_manifest_attempt(0, 1_000_000_000, None)?;
-        client.record_manifest_outcome(0, ManifestOutcome::NotAdmitted, Some(1_001))?;
+        client.record_manifest_outcome(0, ManifestOutcome::NotAdmitted, Some(1_001), None)?;
         client.record_manifest_attempt(0, 2_000_000_000, None)?;
-        client.record_manifest_outcome(0, ManifestOutcome::Acknowledged, Some(2_002))?;
+        client.record_manifest_outcome(0, ManifestOutcome::Acknowledged, Some(2_002), None)?;
 
         let manifest = client.logical_manifest("completed")?;
         let range = manifest["ranges"][0].as_object().context("manifest range")?;
@@ -3150,6 +3280,9 @@ mod tests {
         assert_eq!(range["first_admitted_unix_ms"], 2_002);
         assert_eq!(range["last_admitted_unix_ms"], 2_002);
         assert_eq!(range["last_outcome_unix_ms"], 2_002);
+        assert_eq!(range["decoded_physical_batch_count"], 4);
+        assert_eq!(range["canonical_logical_bytes"], 2_764_000);
+        assert_eq!(range["first_admitted_cohort"], "unscheduled");
         Ok(())
     }
 
@@ -3169,6 +3302,10 @@ mod tests {
                 cohort: ManifestCohort::Measurement,
                 attempts: 1,
                 outcome: ManifestOutcome::Acknowledged,
+                decoded_physical_batch_count: 1,
+                canonical_logical_bytes: Some(0),
+                canonical_logical_bytes_unavailable_reason: None,
+                first_admitted_cohort: None,
                 first_send_unix_ns: Some(1_000_000_000 + index),
                 last_send_unix_ns: Some(1_000_000_000 + index),
                 first_admitted_unix_ms: Some(1_000),
@@ -3235,6 +3372,10 @@ mod tests {
                 cohort: ManifestCohort::Measurement,
                 attempts: 1,
                 outcome: ManifestOutcome::Acknowledged,
+                decoded_physical_batch_count: 1,
+                canonical_logical_bytes: Some(0),
+                canonical_logical_bytes_unavailable_reason: None,
+                first_admitted_cohort: None,
                 first_send_unix_ns: Some(1_000_000_000 + index),
                 last_send_unix_ns: Some(1_000_000_000 + index),
                 first_admitted_unix_ms: Some(1_000),
@@ -4405,7 +4546,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     #[ignore = "explicit client-ceiling measurement against an in-memory Flight sink"]
-    async fn null_flight_sink_client_ceiling_across_worker_counts() -> Result<()> {
+    async fn null_flight_sink_realistic_direct_profile_ceiling() -> Result<()> {
         use arrow_flight::decode::FlightRecordBatchStream;
         use arrowcol_catalog::{CatalogControlPlane, CatalogStore, MemoryCatalogStore};
         use arrowcol_flight::{AllowAllAuthenticator, ArrowColFlightService, RuntimeLimits};
@@ -4443,17 +4584,22 @@ mod tests {
         });
 
         let table = table_named("sqlserver_availability_replica_states")?;
-        for codec in [IpcCompression::None, IpcCompression::Lz4Frame, IpcCompression::Zstd] {
+        for codec in [IpcCompression::Zstd] {
             let mut probe_options = options()?;
             probe_options.data_profile = DataProfile::Realistic;
-            probe_options.string_width = 785;
-            probe_options.batch_rows = 1_024;
+            probe_options.string_width = 789;
+            probe_options.string_length_distribution = Some(StringLengthDistribution::Uniform);
+            probe_options.value_variation = Some(ValueVariation::PerRow);
+            probe_options.guid_uniqueness = Some(GuidUniqueness::PerRow);
+            probe_options.batch_rows = 4_096;
             probe_options.corpus_rows = 16_384;
-            probe_options.workers = 16;
+            probe_options.workers = 2;
             probe_options.streams_per_worker = 2;
-            probe_options.max_memory_bytes = 2_u64 * 1_024 * 1_024 * 1_024;
+            probe_options.max_memory_bytes = 512_u64 * 1_024 * 1_024;
+            probe_options.max_flight_data_bytes = 2 * 1_024 * 1_024;
+            probe_options.max_message_bytes = 16 * 1_024 * 1_024;
             probe_options.ipc_compression = codec;
-            let source = synthetic_batch(&table, "ceiling", 1_024, 0, 0, &probe_options)?;
+            let source = synthetic_batch(&table, "ceiling", 4_096, 0, 0, &probe_options)?;
             let identified = batch_with_logical_identity(&source, uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), 0, 0)?;
             let messages = encode(&table, "v1", identified, &probe_options).await?;
             let message_count = messages.len();
@@ -4468,25 +4614,31 @@ mod tests {
                 .await?;
             let decoded_rows = decoded.iter().map(RecordBatch::num_rows).sum::<usize>();
             anyhow::ensure!(
-                decoded_rows == 1_024,
+                decoded_rows == 4_096,
                 "Flight fragmentation changed the probe row count"
             );
             eprintln!(
-                "L3_FLIGHT_FRAGMENTATION string_width={} logical_batch_rows=1024 ipc_compression={codec:?} flight_data_messages={message_count} payload_fragments={payload_fragments} max_flight_data_protobuf_bytes={max_flight_data_bytes} decoder_output_batches={}",
+                "L3_FLIGHT_FRAGMENTATION string_width={} logical_batch_rows=4096 ipc_compression={codec:?} flight_data_messages={message_count} payload_fragments={payload_fragments} max_flight_data_protobuf_bytes={max_flight_data_bytes} decoder_output_batches={}",
                 probe_options.string_width,
                 decoded.len(),
             );
 
-            for workers in [1, 2, 4, 8, 16, 32] {
+            for workers in [2] {
                 let mut options = options()?;
                 options.data_profile = DataProfile::Realistic;
-                options.string_width = 785;
+                options.string_width = 789;
+                options.string_length_distribution = Some(StringLengthDistribution::Uniform);
+                options.value_variation = Some(ValueVariation::PerRow);
+                options.guid_uniqueness = Some(GuidUniqueness::PerRow);
                 options.workers = workers;
                 options.corpus_rows = 16_384;
-                options.batch_rows = 1_024;
+                options.batch_rows = 4_096;
                 options.streams_per_worker = 2;
                 options.interval_us = 0;
-                options.max_memory_bytes = 2_u64 * 1_024 * 1_024 * 1_024;
+                options.max_memory_bytes = 512_u64 * 1_024 * 1_024;
+                options.max_flight_data_bytes = 2 * 1_024 * 1_024;
+                options.max_message_bytes = 16 * 1_024 * 1_024;
+                options.runtime_threads = 8;
                 options.ipc_compression = codec;
                 let client = PreparedClient::prepare(
                     &endpoint,
@@ -4504,6 +4656,40 @@ mod tests {
                     .await?;
                 let snapshot = client.metrics("completed")?;
                 client.ensure_terminal_manifest_complete()?;
+                let ranges = snapshot["logical_batch_manifest"]["ranges"]
+                    .as_array()
+                    .context("missing logical batch manifest ranges")?;
+                let measurement_totals = |cohort_field: &str| -> Result<(u64, u64, u64)> {
+                    ranges
+                        .iter()
+                        .filter(|range| range[cohort_field] == "measurement")
+                        .try_fold((0_u64, 0_u64, 0_u64), |(bytes, physical_batches, rows), range| {
+                            let range_bytes = range["canonical_logical_bytes"]
+                                .as_u64()
+                                .context("canonical logical byte metric unavailable")?;
+                            let range_physical_batches = range["decoded_physical_batch_count"]
+                                .as_u64()
+                                .context("missing decoded physical batch count")?;
+                            let range_rows = range["rows_per_batch"]
+                                .as_u64()
+                                .context("missing manifest rows per batch")?
+                                .checked_mul(range["batch_count"].as_u64().context("missing manifest batch count")?)
+                                .context("manifest cohort row count overflow")?;
+                            Ok((
+                                bytes
+                                    .checked_add(range_bytes)
+                                    .context("canonical cohort byte sum overflow")?,
+                                physical_batches
+                                    .checked_add(range_physical_batches)
+                                    .context("physical cohort count overflow")?,
+                                rows.checked_add(range_rows)
+                                    .context("manifest cohort row sum overflow")?,
+                            ))
+                        })
+                };
+                let (offered_canonical_bytes, offered_physical_batches, offered_rows) = measurement_totals("cohort")?;
+                let (admitted_canonical_bytes, admitted_physical_batches, admitted_rows) =
+                    measurement_totals("first_admitted_cohort")?;
                 let window = &snapshot["measurement_window"];
                 let rows = window["completed_rows"].as_u64().context("missing completed rows")?;
                 let uncompressed_bytes = window["completed_flight_data_bytes_uncompressed"]
@@ -4518,14 +4704,20 @@ mod tests {
                 let network_tx_bytes_per_second = window["client_resources"]["network_tx_bytes_per_second"].clone();
                 let measurement_seconds = (measurement_end - measurement_start) as f64 / 1_000.0;
                 eprintln!(
-                    "L3_CLIENT_SINK_CALIBRATION sink_completed_rows_per_second={:.3} uncompressed_flight_data_GB_per_second={:.6} configured_ipc_compression_flight_data_GB_per_second={:.6} cpu_core_equivalents={} network_tx_bytes_per_second={} retried_rows={retried_rows} given_up_rows={given_up_rows} workers={workers} streams_per_worker=2 tokio_runtime_threads=8 string_width={} corpus_rows=16384 batch_rows=1024 max_memory_bytes={}",
+                    "L3_CLIENT_SINK_CALIBRATION scope=in_memory_sink_not_committed sink_completed_rows_per_second={:.3} uncompressed_flight_data_GB_per_second={:.6} configured_ipc_compression_flight_data_GB_per_second={:.6} canonical_offered_GB_per_second={:.6} canonical_admitted_GB_per_second={:.6} offered_physical_batches={} admitted_physical_batches={} offered_rows={} admitted_rows={} cpu_core_equivalents={} network_tx_bytes_per_second={} retried_rows={retried_rows} given_up_rows={given_up_rows} workers={workers} streams_per_worker=2 tokio_runtime_threads=8 string_width={} corpus_rows=16384 batch_rows=4096 max_memory_bytes={}",
                     rows as f64 / measurement_seconds,
                     uncompressed_bytes as f64 / 1_000_000_000.0 / measurement_seconds,
                     configured_bytes as f64 / 1_000_000_000.0 / measurement_seconds,
+                    offered_canonical_bytes as f64 / 1_000_000_000.0 / measurement_seconds,
+                    admitted_canonical_bytes as f64 / 1_000_000_000.0 / measurement_seconds,
+                    offered_physical_batches,
+                    admitted_physical_batches,
+                    offered_rows,
+                    admitted_rows,
                     cpu_core_equivalents,
                     network_tx_bytes_per_second,
-                    785,
-                    2_u64 * 1_024 * 1_024 * 1_024,
+                    789,
+                    512_u64 * 1_024 * 1_024,
                 );
                 assert!(rows > 0, "null Flight sink received no rows with {workers} workers");
             }
@@ -4535,6 +4727,58 @@ mod tests {
             .send(())
             .map_err(|()| anyhow::anyhow!("null sink stopped early"))?;
         tokio::time::timeout(Duration::from_secs(2), server).await???;
+        Ok(())
+    }
+    #[tokio::test]
+    async fn realistic_fragment_accounting_uses_decoded_physical_batches() -> Result<()> {
+        let mut options = Cli::try_parse_from([
+            "test",
+            "--data-profile",
+            "realistic",
+            "--string-length-distribution",
+            "uniform",
+            "--value-variation",
+            "per_row",
+            "--guid-uniqueness",
+            "per_row",
+        ])?
+        .options
+        .resolve(1_024, 1)?;
+        options.string_width = 789;
+        options.max_flight_data_bytes = 2 * 1_024 * 1_024;
+        options.max_message_bytes = 16 * 1_024 * 1_024;
+        options.ipc_compression = IpcCompression::None;
+
+        let table = table_named("sqlserver_availability_replica_states")?;
+        let source = synthetic_batch(&table, "client", 1_024, 0, 0, &options)?;
+        let identified = batch_with_logical_identity(&source, uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), 0, 0)?;
+        let messages = encode(&table, "v1", identified, &options).await?;
+        let accounting = canonical_publication_accounting(&messages, 1_024).await?;
+        let canonical_bytes = accounting
+            .canonical_logical_bytes
+            .context("canonical byte metric unavailable for public DMV fixture")?;
+        let decoded = FlightRecordBatchStream::new_from_flight_data(stream::iter(messages.clone().into_iter().map(Ok)))
+            .try_collect::<Vec<_>>()
+            .await?;
+        let independently_counted = decoded.iter().try_fold(0_u64, |total, batch| {
+            total
+                .checked_add(canonical_record_batch_logical_bytes(batch)?)
+                .context("independent canonical byte total overflow")
+        })?;
+        assert!(accounting.decoded_physical_batch_count > 1);
+        assert_eq!(accounting.decoded_physical_batch_count, u64::try_from(decoded.len())?);
+        assert_eq!(Some(independently_counted), accounting.canonical_logical_bytes);
+        assert_eq!(decoded.iter().map(RecordBatch::num_rows).sum::<usize>(), 1_024);
+        assert!((2_702 * 1_024..=2_707 * 1_024).contains(&canonical_bytes));
+        eprintln!(
+            "L3_CANONICAL_FRAGMENTATION string_width={} logical_rows=1024 decoded_physical_batches={} canonical_logical_bytes={} canonical_bytes_per_row={:.3} max_flight_data_bytes={} max_message_bytes={}",
+            options.string_width,
+            accounting.decoded_physical_batch_count,
+            canonical_bytes,
+            canonical_bytes as f64 / 1_024.0,
+            options.max_flight_data_bytes,
+            options.max_message_bytes,
+        );
         Ok(())
     }
 }
