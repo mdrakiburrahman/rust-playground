@@ -4,17 +4,9 @@ using './sku-pools.bicep'
 param clusterName = 'arrow-collector-68590'
 param enableContainerStorage = true
 param nodeSubnetId = '/subscriptions/68fa0545-661c-4152-93f2-fc8ae1c231b8/resourceGroups/arrow-collector-rg/providers/Microsoft.Network/virtualNetworks/arrow-collector-68590-vnet/subnets/systempool'
+// Existing benchd64 is preserved; it is omitted from this sparse pool PUT.
+// A later autoscaler-only benchd64 ramp (1/2/4/8) is separate and gated.
 param userPools = [
-  {
-    name: 'benchd64'
-    role: 'client'
-    vmSize: 'Standard_D64ds_v6'
-    initialCount: 0
-    minCount: 0
-    maxCount: 8
-    maxPods: 250
-    availabilityZones: []
-  }
   {
     name: 'supportd64'
     role: 'support'
