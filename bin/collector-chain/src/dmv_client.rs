@@ -3069,6 +3069,10 @@ mod tests {
         assert_eq!(manifest["run_uuid_source"], "client_generated");
         assert_eq!(manifest["oat_run_uuid"], serde_json::Value::Null);
         assert_eq!(manifest["incarnation_uuid_source"], "client_generated");
+        assert_eq!(
+            manifest["publication_identity_key_format"],
+            "{run_uuid_simple32}/{incarnation_uuid_simple32}/{worker_decimal}/{logical_batch_sequence_base36}"
+        );
         let metrics = client.metrics("failed")?;
         assert_eq!(
             metrics["bytes_semantics"]["uncompressed_flight_data_bytes"],
@@ -3085,6 +3089,10 @@ mod tests {
         assert_eq!(range["last_sequence"], 1);
         assert_eq!(range["batch_count"], 2);
         assert_eq!(range["rows_per_batch"], 2);
+        assert_eq!(range["first_send_unix_ns"], 1_000_000_000);
+        assert_eq!(range["last_send_unix_ns"], 1_000_001_000);
+        assert_eq!(range["first_admitted_unix_ms"], 1_000);
+        assert_eq!(range["last_admitted_unix_ms"], 1_001);
 
         let expected_ids = (0..=1)
             .flat_map(|sequence| {
@@ -3104,6 +3112,44 @@ mod tests {
         *observed.entry(duplicate).or_default() += 1;
         assert_eq!(observed.values().sum::<u64>(), expected.values().sum::<u64>());
         assert_ne!(observed, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn manifest_keeps_first_offer_and_admission_across_retry() -> Result<()> {
+        let client = manifest_test_client()?;
+        client
+            .logical_batches
+            .lock()
+            .map_err(|_| anyhow::anyhow!("logical batch manifest state poisoned"))?
+            .push(LogicalBatchRecord {
+                table: "sqlserver_availability_replica_states".to_owned(),
+                worker: 0,
+                sequence: 7,
+                row_count: 1_024,
+                cohort: ManifestCohort::Unscheduled,
+                attempts: 0,
+                outcome: ManifestOutcome::Pending,
+                first_send_unix_ns: None,
+                last_send_unix_ns: None,
+                first_admitted_unix_ms: None,
+                last_outcome_unix_ms: None,
+            });
+
+        client.record_manifest_attempt(0, 1_000_000_000, None)?;
+        client.record_manifest_outcome(0, ManifestOutcome::NotAdmitted, Some(1_001))?;
+        client.record_manifest_attempt(0, 2_000_000_000, None)?;
+        client.record_manifest_outcome(0, ManifestOutcome::Acknowledged, Some(2_002))?;
+
+        let manifest = client.logical_manifest("completed")?;
+        let range = manifest["ranges"][0].as_object().context("manifest range")?;
+        assert_eq!(manifest["retry_attempts"], 1);
+        assert_eq!(range["first_send_unix_ns"], 1_000_000_000);
+        assert_eq!(range["last_send_unix_ns"], 2_000_000_000);
+        assert_eq!(range["cohort"], "unscheduled");
+        assert_eq!(range["first_admitted_unix_ms"], 2_002);
+        assert_eq!(range["last_admitted_unix_ms"], 2_002);
+        assert_eq!(range["last_outcome_unix_ms"], 2_002);
         Ok(())
     }
 
