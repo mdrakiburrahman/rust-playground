@@ -36,7 +36,7 @@ An abrupt-reboot case leaves the writer behind the barrier, so its independent r
 
 ## Filesystem options
 
-The predefined cache profiles retain server-side locks: defaults, `lookupcache=none`, `lookupcache=positive,actimeo=1`, and `actimeo=30`. The runner rejects effective options containing `nolock`, `local_lock=flock`, or `local_lock=all`. Transport starts with AzNFS TLS; a plain-NFS comparison is a separate, isolated run if required.
+The predefined cache profiles retain server-side locks: defaults, `lookupcache=none`, `lookupcache=positive,actimeo=1`, and `actimeo=30`. The runner rejects effective options containing `nolock`, `local_lock=flock`, or `local_lock=all`. The runner uses AzNFS with TLS and provisions storage accounts with secure transfer required. Plaintext NFS and disabling secure transfer are outside this experiment.
 
 Record the effective mount rather than just the requested options, the AzNFS package version, kernel, read mode, machine size, and exact image version. Standard segment reads are the default, with mmap explicitly selectable.
 
