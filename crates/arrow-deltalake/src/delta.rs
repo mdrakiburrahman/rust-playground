@@ -23,6 +23,7 @@ use delta_kernel_default_engine::parquet::DataFileMetadata;
 use delta_kernel_default_engine::stats::FileStatsAccumulator;
 use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder, build_add_file_metadata};
 use fs2::FileExt;
+use futures::{StreamExt, stream::FuturesUnordered};
 use object_store::{ObjectStore, ObjectStoreExt, PutMode};
 use parquet::file::properties::WriterProperties;
 use sha2::Digest;
@@ -1062,6 +1063,7 @@ mod io_tests {
         lose_commit_response: bool,
         fail_commit_reads: bool,
         commit_written: std::sync::atomic::AtomicBool,
+        coalesced_gate: Option<tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<bool>>>,
     }
 
     impl std::fmt::Display for PausedStagePut {
@@ -1078,6 +1080,32 @@ mod io_tests {
             payload: object_store::PutPayload,
             options: object_store::PutOptions,
         ) -> object_store::Result<object_store::PutResult> {
+            if let Some(gate) = &self.coalesced_gate {
+                if path.as_ref().ends_with(".parquet") {
+                    let (finish, outcome) = tokio::sync::oneshot::channel();
+                    gate.send(finish).map_err(|error| object_store::Error::Generic {
+                        store: "coalesced upload admission",
+                        source: error.into(),
+                    })?;
+                    let permitted = tokio::time::timeout(Duration::from_secs(30), outcome)
+                        .await
+                        .map_err(|error| object_store::Error::Generic {
+                            store: "coalesced upload deadline",
+                            source: error.into(),
+                        })?
+                        .map_err(|error| object_store::Error::Generic {
+                            store: "coalesced upload cancellation",
+                            source: error.into(),
+                        })?;
+                    if !permitted {
+                        return Err(object_store::Error::PermissionDenied {
+                            path: path.to_string(),
+                            source: "injected coalesced upload failure".into(),
+                        });
+                    }
+                }
+                return self.inner.put_opts(path, payload, options).await;
+            }
             if self.lose_commit_response {
                 let result = self.inner.put_opts(path, payload, options).await?;
                 if path.as_ref().ends_with("00000000000000000001.json") {
@@ -1358,6 +1386,166 @@ mod io_tests {
 
         assert!(format!("{error:#}").contains("start completed Parquet multipart upload"));
         assert_eq!(store.multipart_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn coalesced_files_release_cpu_preserve_order_and_drain_failed_groups() -> Result<()> {
+        use futures::TryStreamExt;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let _fixture = CLOUD_STAGE_FIXTURE.lock().await;
+        for fail in [false, true] {
+            let (gate, mut entered) = tokio::sync::mpsc::unbounded_channel();
+            let store = Arc::new(PausedStagePut {
+                coalesced_gate: Some(gate),
+                ..Default::default()
+            });
+            let (table, _) = remote_snapshot_fixture_with_store(None, Arc::<PausedStagePut>::clone(&store)).await?;
+            let properties = [
+                ("arrowcol.layout.enabled", "true"),
+                ("arrowcol.layout.maxRows", "1"),
+                ("arrowcol.layout.rowGroupRows", "1"),
+                ("arrowcol.layout.pageRows", "1"),
+                ("arrowcol.layout.sortColumns", "id"),
+                ("arrowcol.layout.bloomColumns", "id"),
+            ]
+            .into_iter()
+            .map(|(key, value)| (key.to_owned(), value.to_owned()))
+            .collect();
+            table.commit_catalog(
+                Some(table.version()?),
+                input_batch()?.schema(),
+                Vec::new(),
+                properties,
+                None,
+            )?;
+            let version = table.version()?;
+            let entries = (0..4)
+                .map(|index| {
+                    Ok((
+                        RecordBatch::try_new(
+                            input_batch()?.schema(),
+                            vec![Arc::new(arrow::array::Int32Array::from(vec![index]))],
+                        )?,
+                        format!("file-{index}"),
+                        0,
+                        10,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let staging = Arc::clone(&table);
+            let concurrency = if fail { 2 } else { 4 };
+            let mut task =
+                tokio::spawn(async move { staging.stage_coalesced_publications(entries, 4, concurrency).await });
+            let mut releases = Vec::new();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                for _ in 0..concurrency {
+                    tokio::select! {
+                        result = &mut task => {
+                            result??;
+                            bail!("group finished before reaching its upload gates");
+                        }
+                        release = entered.recv() => releases.push(release.context("missing coalesced upload")?),
+                    }
+                }
+                Ok::<_, anyhow::Error>(())
+            })
+            .await
+            .context("files did not reach independent uploads")??;
+            if fail {
+                releases
+                    .pop()
+                    .context("missing failing upload")?
+                    .send(false)
+                    .map_err(|_| anyhow::anyhow!("failing upload exited before its release"))?;
+                tokio::select! {
+                    _ = &mut task => bail!("group returned before draining its other upload"),
+                    () = tokio::time::sleep(Duration::from_millis(25)) => {}
+                }
+            } else {
+                let workers = runtime_config()?.cpu_workers;
+                let active = Arc::new(AtomicUsize::new(0));
+                let release = Arc::new(AtomicBool::new(false));
+                let probes = tokio::spawn(futures::future::join_all((0..workers).map(|_| {
+                    let active = Arc::clone(&active);
+                    let release = Arc::clone(&release);
+                    crate::delta_io::run_cpu_async(move || {
+                        active.fetch_add(1, Ordering::SeqCst);
+                        let deadline = Instant::now() + Duration::from_secs(10);
+                        while !release.load(Ordering::SeqCst) && Instant::now() < deadline {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                    })
+                })));
+                let available = tokio::time::timeout(Duration::from_secs(5), async {
+                    while active.load(Ordering::SeqCst) != workers {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                })
+                .await;
+                release.store(true, Ordering::SeqCst);
+                for probe in probes.await? {
+                    probe?;
+                }
+                available.context("pending uploads retained encoding workers")?;
+            }
+            for release in releases.into_iter().rev() {
+                release
+                    .send(true)
+                    .map_err(|_| anyhow::anyhow!("upload exited before its release"))?;
+            }
+            let result = tokio::time::timeout(Duration::from_secs(10), task).await??;
+            if fail {
+                let error = result.err().context("failed group succeeded")?;
+                assert!(format!("{error:#}").contains("injected coalesced upload failure"));
+                assert!(entered.try_recv().is_err(), "new files started after the first failure");
+                assert_eq!(table.version()?, version);
+                assert!(
+                    store
+                        .inner
+                        .list(None)
+                        .try_collect::<Vec<_>>()
+                        .await?
+                        .iter()
+                        .all(|object| !object.location.as_ref().ends_with(".parquet")),
+                    "successful unsubmitted uploads were not reclaimed"
+                );
+            } else {
+                let (files, identities, replay, mappings, _, _) = result?;
+                assert!(replay.is_empty());
+                assert_eq!(files.len(), 4);
+                for (index, file) in files.iter().enumerate() {
+                    let mut reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+                        File::open(&file.file.path)?,
+                    )?
+                    .build()?;
+                    let batch = reader.next().context("missing file row")??;
+                    let ids = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<arrow::array::Int32Array>()
+                        .context("id array")?;
+                    assert_eq!(ids.values().as_ref(), &[i32::try_from(index)?]);
+                    assert_eq!(mappings[index].transaction_files[0].3, [index]);
+                }
+                let committed = table.commit_files_with_groups_timed(
+                    &files,
+                    &[CoalescedCommitGroup {
+                        start: 0,
+                        end: files.len(),
+                        reply_index: 0,
+                        identities,
+                    }],
+                )?;
+                assert_eq!(committed.0, version + 1);
+            }
+            table
+                .session
+                .as_ref()
+                .context("fixture publisher")?
+                .close_after_drain_async()
+                .await?;
+        }
         Ok(())
     }
 
@@ -2553,6 +2741,38 @@ struct CoalescedPublicationSource {
     application_id: String,
     transactions: Vec<(crate::partition::PartitionValues, (String, i64, i64))>,
     partition_files: std::collections::BTreeSet<(crate::partition::PartitionValues, usize)>,
+}
+
+type CoalescedStageResult = (
+    Vec<StagedAppend>,
+    Vec<(String, i64, i64)>,
+    Vec<(String, i64, i64)>,
+    Vec<CoalescedPublicationMapping>,
+    Duration,
+    Duration,
+);
+
+struct CoalescedFileContext {
+    schema: SchemaRef,
+    table_properties: BTreeMap<String, String>,
+    resolved: arrowcol_props::ResolvedProps,
+    layout: Option<crate::layout::LayoutPolicy>,
+}
+
+struct CoalescedFilePlan {
+    index: usize,
+    values: crate::partition::PartitionValues,
+    batches: Vec<RecordBatch>,
+}
+
+struct CoalescedPreparation {
+    files: Vec<CoalescedFilePlan>,
+    context: Arc<CoalescedFileContext>,
+    identities: Vec<(String, i64, i64)>,
+    committed_identities: Vec<(String, i64, i64)>,
+    source_mappings: Vec<CoalescedPublicationMapping>,
+    build: Duration,
+    sort: Duration,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4341,14 +4561,126 @@ impl DeltaTable {
         self: &Arc<Self>,
         entries: Vec<(RecordBatch, String, i64, i64)>,
         max_files: usize,
-    ) -> Result<(
-        Vec<StagedAppend>,
-        Vec<(String, i64, i64)>,
-        Vec<(String, i64, i64)>,
-        Vec<CoalescedPublicationMapping>,
-        Duration,
-        Duration,
-    )> {
+        concurrency: usize,
+    ) -> Result<CoalescedStageResult> {
+        anyhow::ensure!((1..=256).contains(&concurrency), "invalid coalesced file concurrency");
+        let table = Arc::clone(self);
+        let prepared = crate::delta_io::run_metadata_async(move || {
+            #[cfg(test)]
+            {
+                crate::partition::MATERIALIZATIONS.set(0);
+                let result = table.prepare_coalesced_publications(entries, max_files);
+                (result, crate::partition::MATERIALIZATIONS.get())
+            }
+            #[cfg(not(test))]
+            table.prepare_coalesced_publications(entries, max_files)
+        })
+        .await
+        .context("coalesced preparation worker failed")?;
+        #[cfg(test)]
+        let prepared = {
+            // Preserve the actual materialization counter across the blocking boundary.
+            crate::partition::MATERIALIZATIONS.set(crate::partition::MATERIALIZATIONS.get() + prepared.1);
+            prepared.0
+        };
+        let prepared = prepared?;
+        let mut files = prepared.files.into_iter();
+        let mut pending = FuturesUnordered::new();
+        for file in files.by_ref().take(concurrency) {
+            pending.push(Arc::clone(self).stage_coalesced_file(file, Arc::clone(&prepared.context)));
+        }
+        let mut staged = BTreeMap::new();
+        let mut failure: Option<anyhow::Error> = None;
+        while let Some((index, result)) = pending.next().await {
+            match result {
+                Ok(append) => {
+                    staged.insert(index, append);
+                }
+                Err(error) => {
+                    failure = Some(match failure {
+                        None => error,
+                        Some(previous) => previous.context(format!("additional coalesced file failure: {error:#}")),
+                    });
+                }
+            }
+            if failure.is_none()
+                && let Some(file) = files.next()
+            {
+                pending.push(Arc::clone(self).stage_coalesced_file(file, Arc::clone(&prepared.context)));
+            }
+        }
+        let staged = staged.into_values().collect::<Vec<_>>();
+        if let Some(error) = failure {
+            let table = Arc::clone(self);
+            crate::delta_io::run_metadata_async(move || table.reclaim_unsubmitted(&staged)).await?;
+            return Err(error);
+        }
+        Ok((
+            staged,
+            prepared.identities,
+            prepared.committed_identities,
+            prepared.source_mappings,
+            prepared.build,
+            prepared.sort,
+        ))
+    }
+
+    async fn stage_coalesced_file(
+        self: Arc<Self>,
+        plan: CoalescedFilePlan,
+        context: Arc<CoalescedFileContext>,
+    ) -> (usize, Result<StagedAppend>) {
+        let index = plan.index;
+        let result = async {
+            let (mut writer, batches) = crate::delta_io::run_metadata_async(move || {
+                let properties = context
+                    .layout
+                    .as_ref()
+                    .map(|policy| policy.writer_properties(&physical_writer_schema(&context.schema, &plan.values)))
+                    .transpose()?;
+                let mut writer = self.new_file_bound(Arc::clone(&context.schema), plan.values, properties, true)?;
+                if writer.table_properties != context.table_properties {
+                    writer.discard_empty()?;
+                    bail!("table properties changed while preparing coalesced publication; retry");
+                }
+                if let Some(policy) = &context.layout {
+                    let physical = Arc::new(writer.context.physical_data_schema().as_ref().try_into_arrow()?);
+                    writer.sorter = Some(crate::layout::FileSortBuffer::new(physical, policy.clone())?);
+                }
+                if index == 0 {
+                    self.record_layout_readback(
+                        Arc::new(writer.context.physical_data_schema().as_ref().try_into_arrow()?),
+                        &context.resolved,
+                        &context.table_properties,
+                        context.layout.is_some(),
+                    )?;
+                }
+                Ok::<_, anyhow::Error>((writer, plan.batches))
+            })
+            .await
+            .context("coalesced file preparation worker failed")??;
+            let encoded = crate::delta_io::run_cpu_async(move || {
+                let executor = shared_executor()?;
+                let _guard = executor.enter();
+                tokio::runtime::Handle::current().block_on(async move {
+                    for batch in &batches {
+                        writer.write(batch).await?;
+                    }
+                    writer.finish_encoding().await
+                })
+            })
+            .await??;
+            encoded.upload().await
+        }
+        .await;
+        (index, result)
+    }
+
+    fn prepare_coalesced_publications(
+        self: &Arc<Self>,
+        entries: Vec<(RecordBatch, String, i64, i64)>,
+        max_files: usize,
+    ) -> Result<CoalescedPreparation> {
         let preparation_started = Instant::now();
         let mut preparation_sort = Duration::ZERO;
         let Some((first_batch, _, _, _)) = entries.first() else {
@@ -4703,55 +5035,30 @@ impl DeltaTable {
             bail!("coalesced publications produced no replay identities");
         }
         let preparation_build = preparation_started.elapsed().saturating_sub(preparation_sort);
-        let mut staged = Vec::with_capacity(planned_files);
+        let mut files = Vec::with_capacity(planned_files);
         for partition in output.into_values() {
             for batches in partition.files {
-                let properties = layout
-                    .as_ref()
-                    .map(|policy| policy.writer_properties(&physical_writer_schema(&schema, &partition.values)))
-                    .transpose()?;
-                let result = async {
-                    let mut writer =
-                        self.new_file_bound(Arc::clone(&schema), partition.values.clone(), properties, true)?;
-                    if writer.table_properties != table_properties {
-                        writer.discard_empty()?;
-                        bail!("table properties changed while preparing coalesced publication; retry");
-                    }
-                    if let Some(policy) = &layout {
-                        let physical = Arc::new(writer.context.physical_data_schema().as_ref().try_into_arrow()?);
-                        writer.sorter = Some(crate::layout::FileSortBuffer::new(physical, policy.clone())?);
-                    }
-                    if staged.is_empty() {
-                        self.record_layout_readback(
-                            Arc::new(writer.context.physical_data_schema().as_ref().try_into_arrow()?),
-                            &resolved,
-                            &table_properties,
-                            layout.is_some(),
-                        )?;
-                    }
-                    for batch in &batches {
-                        writer.write(batch).await?;
-                    }
-                    writer.stage().await
-                }
-                .await;
-                match result {
-                    Ok(append) => staged.push(append),
-                    Err(error) => {
-                        self.reclaim_unsubmitted(&staged);
-                        return Err(error);
-                    }
-                }
+                files.push(CoalescedFilePlan {
+                    index: files.len(),
+                    values: partition.values.clone(),
+                    batches,
+                });
             }
         }
-        Ok((
-            staged,
+        Ok(CoalescedPreparation {
+            files,
+            context: Arc::new(CoalescedFileContext {
+                schema,
+                table_properties,
+                resolved,
+                layout,
+            }),
             identities,
             committed_identities,
             source_mappings,
-            preparation_build,
-            preparation_sort,
-        ))
+            build: preparation_build,
+            sort: preparation_sort,
+        })
     }
 
     /// Bind one file to explicit string-valued Hive partitions.
@@ -5881,7 +6188,11 @@ impl DeltaFileWriter {
     ///
     /// # Errors
     /// Returns close, synchronization, or statistics errors.
-    pub async fn stage(mut self) -> Result<StagedAppend> {
+    pub async fn stage(self) -> Result<StagedAppend> {
+        self.finish_encoding().await?.upload().await
+    }
+
+    async fn finish_encoding(mut self) -> Result<EncodedDeltaFile> {
         if self.failed {
             bail!("Delta file previously failed; refusing to commit its partial data");
         }
@@ -5903,53 +6214,7 @@ impl DeltaFileWriter {
         self.stage_timings.encode += encode_started.elapsed();
         let file = file_result?;
         let stats = self.stats.finish()?.context("cannot commit an empty Delta file")?;
-        let executor = shared_executor()?;
-        self.table.check_publication_async().await?;
-        let upload_slot = if self.table.url.scheme() == "file" {
-            None
-        } else {
-            Some(executor.upload_slot().await?)
-        };
-        let table = Arc::clone(&self.table);
-        let (file, prepared, upload_slot) = executor
-            .spawn_blocking(move || {
-                let prepared = table.prepare_upload(&file);
-                (file, prepared, upload_slot)
-            })
-            .await
-            .context("stage upload preparation worker failed")?;
-        if let Some(path) = prepared? {
-            self.table.check_publication_async().await?;
-            let config = runtime_config()?;
-            let upload_mode = config.upload_mode;
-            let upload_buffer_capacity = config.upload_buffer_capacity_bytes;
-            let upload_request_concurrency = config.upload_request_concurrency;
-            let table = Arc::clone(&self.table);
-            let store = Arc::clone(&table.store);
-            let source_path = file.path.clone();
-            let expected_bytes = file.bytes;
-            let upload_duration = spawn_shared_io(async move {
-                let _table = table;
-                let _upload_slot = upload_slot.context("remote staging has no upload admission slot")?;
-                upload_staged_output(
-                    store,
-                    path,
-                    source_path,
-                    expected_bytes,
-                    upload_mode,
-                    upload_buffer_capacity,
-                    upload_request_concurrency,
-                )
-                .await
-            })
-            .context("start stage upload task")?
-            .await
-            .context("stage upload task failed")?
-            .context("stage upload failed")?;
-            self.stage_timings.upload = Some(upload_duration);
-        }
-        self.table.check_publication_async().await?;
-        Ok(StagedAppend {
+        Ok(EncodedDeltaFile(StagedAppend {
             table: self.table,
             schema: self.schema,
             context: self.context,
@@ -5959,7 +6224,7 @@ impl DeltaFileWriter {
             ingested_at_ms: self.ingested_at_ms,
             stage_timings: self.stage_timings,
             stage_state: std::sync::atomic::AtomicU8::new(STAGE_FRESH),
-        })
+        }))
     }
 
     /// Immediately publish this file, without an exporter batching delay.
@@ -5988,6 +6253,63 @@ impl DeltaFileWriter {
             })
         })
         .await?
+    }
+}
+
+struct EncodedDeltaFile(StagedAppend);
+
+impl EncodedDeltaFile {
+    async fn upload(self) -> Result<StagedAppend> {
+        let mut append = self.0;
+        let executor = shared_executor()?;
+        append.table.check_publication_async().await?;
+        let upload_slot = if append.table.url.scheme() == "file" {
+            None
+        } else {
+            Some(executor.upload_slot().await?)
+        };
+        let table = Arc::clone(&append.table);
+        let file = append.file;
+        let (file, prepared, upload_slot) = executor
+            .spawn_blocking(move || {
+                let prepared = table.prepare_upload(&file);
+                (file, prepared, upload_slot)
+            })
+            .await
+            .context("stage upload preparation worker failed")?;
+        append.file = file;
+        if let Some(path) = prepared? {
+            append.table.check_publication_async().await?;
+            let config = runtime_config()?;
+            let upload_mode = config.upload_mode;
+            let upload_buffer_capacity = config.upload_buffer_capacity_bytes;
+            let upload_request_concurrency = config.upload_request_concurrency;
+            let table = Arc::clone(&append.table);
+            let store = Arc::clone(&table.store);
+            let source_path = append.file.path.clone();
+            let expected_bytes = append.file.bytes;
+            let upload_duration = spawn_shared_io(async move {
+                let _table = table;
+                let _upload_slot = upload_slot.context("remote staging has no upload admission slot")?;
+                upload_staged_output(
+                    store,
+                    path,
+                    source_path,
+                    expected_bytes,
+                    upload_mode,
+                    upload_buffer_capacity,
+                    upload_request_concurrency,
+                )
+                .await
+            })
+            .context("start stage upload task")?
+            .await
+            .context("stage upload task failed")?
+            .context("stage upload failed")?;
+            append.stage_timings.upload = Some(upload_duration);
+        }
+        append.table.check_publication_async().await?;
+        Ok(append)
     }
 }
 
@@ -6124,7 +6446,7 @@ mod layout_readback_tests {
             let entry = || (input.clone(), "original".to_owned(), 0, 10);
             crate::partition::MATERIALIZATIONS.set(0);
             let error = table
-                .stage_coalesced_publications(vec![entry()], 1)
+                .stage_coalesced_publications(vec![entry()], 1, 1)
                 .await
                 .err()
                 .context("fanout accepted")?;
@@ -6132,7 +6454,7 @@ mod layout_readback_tests {
             assert_eq!(crate::partition::MATERIALIZATIONS.get(), 0);
             assert_eq!(table.version()?, 0);
 
-            let (files, identities, _, _, _, _) = table.stage_coalesced_publications(vec![entry()], 2).await?;
+            let (files, identities, _, _, _, _) = table.stage_coalesced_publications(vec![entry()], 2, 1).await?;
             assert_eq!(files.len(), 2);
             table.commit_files_with_groups_timed(
                 &files,
@@ -6144,14 +6466,14 @@ mod layout_readback_tests {
                 }],
             )?;
             crate::partition::MATERIALIZATIONS.set(0);
-            let (files, new, replay, _, _, _) = table.stage_coalesced_publications(vec![entry()], 1).await?;
+            let (files, new, replay, _, _, _) = table.stage_coalesced_publications(vec![entry()], 1, 1).await?;
             assert!(files.is_empty() && new.is_empty());
             assert_eq!(replay.len(), 2);
             assert_eq!(crate::partition::MATERIALIZATIONS.get(), 0);
 
             let fresh = (input.slice(0, 1), "fresh".to_owned(), 0, 20);
             let (files, new, replay, mappings, _, _) =
-                table.stage_coalesced_publications(vec![entry(), fresh], 1).await?;
+                table.stage_coalesced_publications(vec![entry(), fresh], 1, 1).await?;
             assert_eq!(files.len(), 1);
             assert_eq!(new.len(), 1);
             assert_eq!(replay.len(), 2);

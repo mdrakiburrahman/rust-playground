@@ -47,7 +47,7 @@ pub struct DeltaRuntimeConfig {
     /// Blocking I/O workers: default cores * 2, clamped to 32..=128; allowed 2..=256.
     /// One worker is reserved for Tokio's filesystem handoffs.
     pub blocking_workers: usize,
-    /// Concurrent uploads: default 32 independent of CPU count; allowed 1..=256.
+    /// Concurrent uploads: default 32 independent of CPU count; allowed 1..=512.
     pub upload_limit: usize,
     /// Upload strategy: default `put_create`; `buffered_multipart` is opt-in and uses UUID paths only.
     pub upload_mode: UploadMode,
@@ -62,7 +62,7 @@ pub struct DeltaRuntimeConfig {
     /// Rows per Kernel batch: default cores * 1024, clamped to 4096..=32768;
     /// allowed 1..=262144.
     pub batch_rows: usize,
-    /// Dedicated CPU workers: default cores - 1, clamped to 1..=32; allowed 1..=128.
+    /// Dedicated CPU workers: default cores - 1, clamped to 1..=32; allowed 1..=256.
     /// The waiting queue holds at most this many additional jobs.
     pub cpu_workers: usize,
 }
@@ -157,11 +157,11 @@ impl DeltaRuntimeConfig {
         for (name, value, min, max) in [
             ("RUNTIME_WORKERS", self.runtime_workers, 1, 64),
             ("BLOCKING_WORKERS", self.blocking_workers, 2, 256),
-            ("UPLOAD_LIMIT", self.upload_limit, 1, 256),
+            ("UPLOAD_LIMIT", self.upload_limit, 1, 512),
             ("TASK_LIMIT", self.task_limit, 2, 1024),
             ("READ_AHEAD", self.read_ahead, 1, 128),
             ("BATCH_ROWS", self.batch_rows, 1, 262_144),
-            ("CPU_WORKERS", self.cpu_workers, 1, 128),
+            ("CPU_WORKERS", self.cpu_workers, 1, 256),
         ] {
             anyhow::ensure!(
                 (min..=max).contains(&value),
@@ -221,26 +221,42 @@ pub fn runtime_config() -> Result<&'static DeltaRuntimeConfig> {
         .map_err(|error| anyhow::anyhow!("{error}"))
 }
 
-type CpuJob = Box<dyn FnOnce() + Send + 'static>;
+type WorkerJob = Box<dyn FnOnce() + Send + 'static>;
 
-struct CpuPool {
-    sender: tokio::sync::mpsc::Sender<CpuJob>,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WorkerKind {
+    Cpu,
+    Metadata,
+}
+
+impl WorkerKind {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Cpu => "delta-cpu",
+            Self::Metadata => "delta-metadata",
+        }
+    }
+}
+
+struct WorkerPool {
+    sender: tokio::sync::mpsc::Sender<WorkerJob>,
+    kind: WorkerKind,
 }
 
 thread_local! {
-    static CPU_WORKER: Cell<bool> = const { Cell::new(false) };
+    static WORKER_KIND: Cell<Option<WorkerKind>> = const { Cell::new(None) };
 }
 
-impl CpuPool {
-    fn new(workers: usize) -> Result<Self> {
-        let (sender, receiver) = tokio::sync::mpsc::channel::<CpuJob>(workers);
+impl WorkerPool {
+    fn new(workers: usize, kind: WorkerKind) -> Result<Self> {
+        let (sender, receiver) = tokio::sync::mpsc::channel::<WorkerJob>(workers);
         let receiver = Arc::new(Mutex::new(receiver));
         for index in 0..workers {
             let receiver = Arc::clone(&receiver);
             std::thread::Builder::new()
-                .name(format!("delta-cpu-{index}"))
+                .name(format!("{}-{index}", kind.name()))
                 .spawn(move || {
-                    CPU_WORKER.set(true);
+                    WORKER_KIND.set(Some(kind));
                     loop {
                         let job = receiver
                             .lock()
@@ -252,9 +268,9 @@ impl CpuPool {
                         }
                     }
                 })
-                .context("create Delta CPU worker")?;
+                .with_context(|| format!("create {} worker", kind.name()))?;
         }
-        Ok(Self { sender })
+        Ok(Self { sender, kind })
     }
 
     #[cfg(test)]
@@ -264,7 +280,7 @@ impl CpuPool {
         T: Send + 'static,
     {
         // Recursive offloads run inline: no CPU worker may wait for its own pool.
-        if CPU_WORKER.get() {
+        if WORKER_KIND.get() == Some(self.kind) {
             return Ok(task());
         }
         futures::executor::block_on(self.run_async(task))
@@ -275,7 +291,7 @@ impl CpuPool {
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
     {
-        if CPU_WORKER.get() {
+        if WORKER_KIND.get() == Some(self.kind) {
             return Ok(task());
         }
         let (sender, receiver) = tokio::sync::oneshot::channel();
@@ -285,22 +301,45 @@ impl CpuPool {
                 let _ = sender.send(result);
             }))
             .await
-            .map_err(|_| anyhow::anyhow!("Delta CPU pool stopped"))?;
-        match receiver.await.context("Delta CPU worker stopped")? {
+            .map_err(|_| anyhow::anyhow!("{} pool stopped", self.kind.name()))?;
+        match receiver
+            .await
+            .with_context(|| format!("{} worker stopped", self.kind.name()))?
+        {
             Ok(output) => Ok(output),
             Err(panic) => std::panic::resume_unwind(panic),
         }
     }
 }
 
-static CPU_POOL: OnceLock<std::result::Result<CpuPool, String>> = OnceLock::new();
+static CPU_POOL: OnceLock<std::result::Result<WorkerPool, String>> = OnceLock::new();
+static METADATA_POOL: OnceLock<std::result::Result<WorkerPool, String>> = OnceLock::new();
 
-fn cpu_pool() -> Result<&'static CpuPool> {
+fn cpu_pool() -> Result<&'static WorkerPool> {
     let workers = runtime_config()?.cpu_workers;
-    match CPU_POOL.get_or_init(|| CpuPool::new(workers).map_err(|error| format!("{error:#}"))) {
+    match CPU_POOL.get_or_init(|| WorkerPool::new(workers, WorkerKind::Cpu).map_err(|error| format!("{error:#}"))) {
         Ok(pool) => Ok(pool),
         Err(error) => anyhow::bail!("{error}"),
     }
+}
+
+pub(crate) async fn run_metadata_async<F, T>(task: F) -> Result<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let config = runtime_config()?;
+    let workers = config.runtime_workers.min(config.blocking_workers - 1);
+    let pool = METADATA_POOL
+        .get_or_init(|| WorkerPool::new(workers, WorkerKind::Metadata).map_err(|error| format!("{error:#}")))
+        .as_ref()
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    pool.run_async(move || {
+        let executor = shared_executor()?;
+        let _guard = executor.enter();
+        Ok::<_, anyhow::Error>(task())
+    })
+    .await?
 }
 
 /// Run owned sorting/encoding work on a bounded, dedicated process-wide CPU pool.
@@ -344,7 +383,8 @@ where
 /// Unlike spawning the future onto Tokio, its synchronous encoding work stays
 /// on the CPU pool. I/O drivers run independently, so waiting for uploads cannot
 /// exhaust the I/O runtime's blocking pool. A worker remains occupied until the
-/// future completes: upload concurrency is also bounded by the CPU worker count.
+/// future completes. Use this only for encoding/local-file futures, not remote
+/// upload or metadata work; coalesced staging releases the worker before upload.
 /// Move the writer and batch into an `async move` block and return the writer
 /// to continue writing. For a fallible future use `run_cpu_future(future).await??`.
 ///
@@ -663,24 +703,22 @@ mod tests {
         for (knob, minimum, maximum) in [
             ("RUNTIME_WORKERS", 1, 64),
             ("BLOCKING_WORKERS", 2, 256),
-            ("UPLOAD_LIMIT", 1, 256),
+            ("UPLOAD_LIMIT", 1, 512),
             ("UPLOAD_BUFFER_CAPACITY_BYTES", 1024 * 1024, 64 * 1024 * 1024),
             ("UPLOAD_REQUEST_CONCURRENCY", 1, 16),
             ("TASK_LIMIT", 2, 1024),
             ("READ_AHEAD", 1, 128),
             ("BATCH_ROWS", 1, 262_144),
-            ("CPU_WORKERS", 1, 128),
+            ("CPU_WORKERS", 1, 256),
         ] {
             let knob = format!("ARROWCOL_COLLECTOR_{knob}");
             let companion_value = |name: &str| -> Option<&'static str> {
                 match (knob.as_str(), name) {
-                    ("ARROWCOL_COLLECTOR_UPLOAD_LIMIT", "ARROWCOL_COLLECTOR_UPLOAD_BUFFER_CAPACITY_BYTES")
-                    | (
+                    (
                         "ARROWCOL_COLLECTOR_UPLOAD_REQUEST_CONCURRENCY",
                         "ARROWCOL_COLLECTOR_UPLOAD_BUFFER_CAPACITY_BYTES",
                     ) => Some("1048576"),
-                    ("ARROWCOL_COLLECTOR_UPLOAD_LIMIT", "ARROWCOL_COLLECTOR_UPLOAD_REQUEST_CONCURRENCY")
-                    | (
+                    (
                         "ARROWCOL_COLLECTOR_UPLOAD_BUFFER_CAPACITY_BYTES",
                         "ARROWCOL_COLLECTOR_UPLOAD_REQUEST_CONCURRENCY",
                     ) => Some("1"),
@@ -691,9 +729,7 @@ mod tests {
             };
             let upload_knob = matches!(
                 knob.as_str(),
-                "ARROWCOL_COLLECTOR_UPLOAD_LIMIT"
-                    | "ARROWCOL_COLLECTOR_UPLOAD_BUFFER_CAPACITY_BYTES"
-                    | "ARROWCOL_COLLECTOR_UPLOAD_REQUEST_CONCURRENCY"
+                "ARROWCOL_COLLECTOR_UPLOAD_BUFFER_CAPACITY_BYTES" | "ARROWCOL_COLLECTOR_UPLOAD_REQUEST_CONCURRENCY"
             );
             let read = |name: &str, value: &str| {
                 if name == knob {
@@ -776,7 +812,7 @@ mod tests {
 
     #[test]
     fn cpu_jobs_keep_panics_nested_calls_and_io_independent() -> Result<()> {
-        let pool = Arc::new(CpuPool::new(1)?);
+        let pool = Arc::new(WorkerPool::new(1, WorkerKind::Cpu)?);
         let nested_pool = Arc::clone(&pool);
         let caller = std::thread::current().id();
         let (worker, answer) = pool.run(move || {
@@ -802,7 +838,7 @@ mod tests {
 
     #[test]
     fn cpu_queue_and_execution_are_bounded() -> Result<()> {
-        let pool = Arc::new(CpuPool::new(1)?);
+        let pool = Arc::new(WorkerPool::new(1, WorkerKind::Cpu)?);
         let (started, wait_started) = mpsc::sync_channel(1);
         let (release, wait_release) = mpsc::sync_channel(1);
         let active_pool = Arc::clone(&pool);
@@ -829,7 +865,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn cpu_async_admission_does_not_block_the_caller_runtime() -> Result<()> {
-        let pool = Arc::new(CpuPool::new(1)?);
+        let pool = Arc::new(WorkerPool::new(1, WorkerKind::Cpu)?);
         let (started, wait_started) = mpsc::sync_channel(1);
         let (release, wait_release) = mpsc::sync_channel(1);
         let active_pool = Arc::clone(&pool);
@@ -857,7 +893,7 @@ mod tests {
     async fn cpu_future_keeps_encoding_on_cpu_threads_and_drives_io() -> Result<()> {
         let caller = std::thread::current().id();
         let answer = run_cpu_future(async move {
-            assert!(CPU_WORKER.get());
+            assert!(WORKER_KIND.get() == Some(WorkerKind::Cpu));
             let worker = std::thread::current().id();
             assert_ne!(worker, caller);
             tokio::time::sleep(Duration::from_millis(1)).await;

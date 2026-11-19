@@ -209,6 +209,7 @@ const CAPABILITIES: &[Capability] = &[
     capability!("collector.layout.page_rows", "2048"),
     capability!("collector.commit.batch_window", "10s"),
     capability!("collector.commit.max_files_per_commit", "64"),
+    capability!("collector.commit.file_encode_concurrency", "1"),
     capability!("collector.commit.max_pending_files", "256"),
     capability!("collector.commit.publication_lookup_mode", "scalar"),
     capability!("collector.commit.remote_snapshot_reuse", "false"),
@@ -1337,8 +1338,8 @@ fn validate_batching(batching: Option<&BatchingTunables>) -> Result<()> {
         bail!("collector.batching.max_concurrent_flushes exceeds Semaphore::MAX_PERMITS");
     }
     let depth = batching.pipeline_depth.unwrap_or(1);
-    if !(1..=64).contains(&depth) {
-        bail!("collector.batching.pipeline_depth must be in 1..=64");
+    if !(1..=256).contains(&depth) {
+        bail!("collector.batching.pipeline_depth must be in 1..=256");
     }
     if depth > 1 && batching.coalesce_publications != Some(true) {
         bail!("collector.batching.pipeline_depth > 1 requires coalesce_publications=true");
@@ -1386,6 +1387,9 @@ fn validate_batching(batching: Option<&BatchingTunables>) -> Result<()> {
 
 fn validate_commit(commit: Option<&CommitTunables>) -> Result<()> {
     let commit = commit.cloned().unwrap_or_default();
+    if !(1..=256).contains(&commit.file_encode_concurrency.unwrap_or(1)) {
+        bail!("collector.commit.file_encode_concurrency must be between 1 and 256");
+    }
     let remote_limit = commit
         .remote_snapshot_max_metadata_objects
         .unwrap_or(arrow_deltalake::commit::MAX_REMOTE_SNAPSHOT_METADATA_OBJECTS);
@@ -1595,11 +1599,11 @@ fn validate_runtime(runtime: Option<&RuntimeTunables>) -> Result<()> {
     for (name, value, minimum, maximum) in [
         ("workers", runtime.workers, 1, 64),
         ("blocking_workers", runtime.blocking_workers, 2, 256),
-        ("upload_limit", runtime.upload_limit, 1, 256),
+        ("upload_limit", runtime.upload_limit, 1, 512),
         ("task_limit", runtime.task_limit, 2, 1_024),
         ("read_ahead", runtime.read_ahead, 1, 128),
         ("batch_rows", runtime.batch_rows, 1, 262_144),
-        ("cpu_workers", runtime.cpu_workers, 1, 128),
+        ("cpu_workers", runtime.cpu_workers, 1, 256),
     ] {
         if value.is_some_and(|value| !(minimum..=maximum).contains(&value)) {
             bail!("collector.runtime.{name} must be between {minimum} and {maximum}");
@@ -2148,14 +2152,14 @@ mod tests {
     #[test]
     fn pipeline_depth_is_bounded_and_projects_without_a_second_source() -> Result<()> {
         let valid = serde_json::json!({"collector":{"batching":{
-            "coalesce_publications":true,"pipeline_depth":4
+            "coalesce_publications":true,"pipeline_depth":256
         }}});
         let env = Tunables::parse_oat_json(valid.clone())?.environment_for(ComponentRole::Collector)?;
         let batching: Value = serde_json::from_str(&env["ARROWCOL_COLLECTOR_BATCHING_CONFIG"])?;
-        assert_eq!(batching["pipeline_depth"], 4);
+        assert_eq!(batching["pipeline_depth"], 256);
         for value in [
             serde_json::json!(0),
-            serde_json::json!(65),
+            serde_json::json!(257),
             serde_json::json!(1.5),
             serde_json::json!("4"),
         ] {
