@@ -77,6 +77,7 @@ pub struct BatchedTable {
 struct Publication {
     appends: Vec<StagedAppend>,
     identities: Vec<(String, i64, i64)>,
+    replayed_identities: Vec<(String, i64, i64)>,
     source_mappings: Vec<crate::delta::CoalescedPublicationMapping>,
     reply: oneshot::Sender<std::result::Result<GroupAppendResult, CommitReceiptError>>,
     _slot: OwnedSemaphorePermit,
@@ -85,11 +86,15 @@ struct Publication {
 
 impl Publication {
     fn identity_names(&self) -> impl Iterator<Item = &str> {
-        self.identities.iter().map(|(id, _, _)| id.as_str()).chain(
-            self.appends
-                .iter()
-                .filter_map(|append| append.publication.as_ref().map(|(id, _)| id.as_str())),
-        )
+        self.identities
+            .iter()
+            .chain(&self.replayed_identities)
+            .map(|(id, _, _)| id.as_str())
+            .chain(
+                self.appends
+                    .iter()
+                    .filter_map(|append| append.publication.as_ref().map(|(id, _)| id.as_str())),
+            )
     }
 }
 
@@ -593,7 +598,7 @@ impl BatchedTable {
     /// Returns admission/worker errors. The receipt separately reports publication errors.
     pub async fn submit(&self, append: StagedAppend, force: bool) -> Result<CommitReceipt> {
         let receive = self
-            .submit_publication(vec![append], Vec::new(), Vec::new(), force)
+            .submit_publication(vec![append], Vec::new(), Vec::new(), Vec::new(), force)
             .await?;
         Ok(CommitReceipt(receive))
     }
@@ -611,7 +616,7 @@ impl BatchedTable {
         identities: Vec<(String, i64, i64)>,
         force: bool,
     ) -> Result<GroupCommitReceipt> {
-        self.submit_group_with_mappings(appends, identities, Vec::new(), force)
+        self.submit_group_with_mappings(appends, identities, Vec::new(), Vec::new(), force)
             .await
     }
 
@@ -619,10 +624,11 @@ impl BatchedTable {
         &self,
         appends: Vec<StagedAppend>,
         identities: Vec<(String, i64, i64)>,
+        replayed_identities: Vec<(String, i64, i64)>,
         source_mappings: Vec<crate::delta::CoalescedPublicationMapping>,
         force: bool,
     ) -> Result<GroupCommitReceipt> {
-        if identities.is_empty() {
+        if identities.is_empty() && replayed_identities.is_empty() {
             bail!("coalesced publication group requires logical identities");
         }
         if appends.len() > self.options.max_files_per_commit || appends.len() > self.options.max_pending_files {
@@ -634,15 +640,15 @@ impl BatchedTable {
         if appends.iter().any(|append| append.publication.is_some()) {
             bail!("coalesced physical files must not carry per-file publication identities");
         }
-        let mut unique = std::collections::HashSet::with_capacity(identities.len());
-        for (app_id, version, stamp) in &identities {
+        let mut unique = std::collections::HashSet::with_capacity(identities.len() + replayed_identities.len());
+        for (app_id, version, stamp) in identities.iter().chain(&replayed_identities) {
             crate::delta::validate_transaction_id(app_id, *version)?;
             if *stamp < 0 || !unique.insert(app_id.as_str()) {
                 bail!("invalid or duplicate coalesced publication identity");
             }
         }
         let receive = self
-            .submit_publication(appends, identities, source_mappings, force)
+            .submit_publication(appends, identities, replayed_identities, source_mappings, force)
             .await?;
         Ok(GroupCommitReceipt(receive))
     }
@@ -658,13 +664,12 @@ impl BatchedTable {
     ) -> Result<GroupCommitReceipt> {
         let PreparedPublicationGroup {
             appends,
-            mut identities,
+            identities,
             committed_identities,
             source_mappings,
             ..
         } = group;
-        identities.extend(committed_identities);
-        self.submit_group_with_mappings(appends, identities, source_mappings, force)
+        self.submit_group_with_mappings(appends, identities, committed_identities, source_mappings, force)
             .await
     }
 
@@ -672,6 +677,7 @@ impl BatchedTable {
         &self,
         appends: Vec<StagedAppend>,
         identities: Vec<(String, i64, i64)>,
+        replayed_identities: Vec<(String, i64, i64)>,
         source_mappings: Vec<crate::delta::CoalescedPublicationMapping>,
         force: bool,
     ) -> Result<oneshot::Receiver<std::result::Result<GroupAppendResult, CommitReceiptError>>> {
@@ -682,6 +688,7 @@ impl BatchedTable {
             .send(Request::Publish(Box::new(Publication {
                 appends,
                 identities,
+                replayed_identities,
                 source_mappings,
                 reply,
                 _slot: slot,
@@ -922,26 +929,40 @@ fn publish_batch(
     let mut appends = Vec::new();
     let mut groups = Vec::new();
     let mut replies = Vec::with_capacity(publications.len());
-    for publication in publications {
+    for (reply_index, publication) in publications.into_iter().enumerate() {
         let start = appends.len();
         appends.extend(publication.appends);
         let end = appends.len();
         let identities = publication.identities;
+        let replayed_identities = publication.replayed_identities;
         let source_mappings = publication.source_mappings;
+        let grouped = !identities.is_empty() || !replayed_identities.is_empty();
+        if !replayed_identities.is_empty() {
+            groups.push(CoalescedCommitGroup {
+                start,
+                end: start,
+                reply_index,
+                identities: replayed_identities.clone(),
+            });
+        }
         if !identities.is_empty() {
             groups.push(CoalescedCommitGroup {
                 start,
                 end,
+                reply_index,
                 identities: identities.clone(),
             });
         }
+        let publication_identities = identities.iter().chain(&replayed_identities).cloned().collect();
         replies.push((
+            reply_index,
             start,
             end,
             publication.reply,
             publication._slot,
-            identities,
+            publication_identities,
             source_mappings,
+            grouped,
         ));
     }
     let result = match (table, failure.as_ref()) {
@@ -962,7 +983,7 @@ fn publish_batch(
     }
     let mut files = appends.into_iter().map(|append| Some(append.file)).collect::<Vec<_>>();
     let mut commit_duration = result.as_ref().ok().and_then(|(_, duration, _, _, _)| *duration);
-    for (start, end, reply, _slot, publication_identities, source_mappings) in replies {
+    for (reply_index, start, end, reply, _slot, publication_identities, source_mappings, grouped) in replies {
         let delivered = match result.as_ref() {
             Ok((version, _, observations, outcome, dispositions)) => {
                 let file_observations = observations
@@ -975,18 +996,25 @@ fn publish_batch(
                     .filter(|(index, _)| (start..end).contains(index))
                     .map(|(index, _)| index - start)
                     .collect::<Vec<_>>();
-                let exact_disposition = dispositions
-                    .iter()
-                    .find(|disposition| disposition.start == start && disposition.end == end);
+                let exact_disposition = dispositions.iter().find(|disposition| {
+                    disposition.reply_index.is_none() && disposition.start == start && disposition.end == end
+                });
                 let relevant_dispositions = dispositions
                     .iter()
                     .filter(|disposition| {
-                        disposition.start >= start
-                            && disposition.end <= end
-                            && (disposition.start < disposition.end || start == end)
+                        if grouped {
+                            disposition.reply_index == Some(reply_index)
+                        } else {
+                            disposition.reply_index.is_none()
+                                && disposition.start >= start
+                                && disposition.end <= end
+                                && (disposition.start < disposition.end || start == end)
+                        }
                     })
                     .collect::<Vec<_>>();
-                let (publication_outcome, authoritative_version) = if let Some(disposition) = exact_disposition {
+                let (publication_outcome, authoritative_version) = if grouped {
+                    outcome_for_publication_range(start, end, &relevant_dispositions, *outcome, *version)
+                } else if let Some(disposition) = exact_disposition {
                     (disposition.outcome, disposition.authoritative_version)
                 } else {
                     outcome_for_publication_range(start, end, &relevant_dispositions, *outcome, *version)
@@ -1106,6 +1134,14 @@ mod tests {
         RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
             vec![Arc::new(Int32Array::from(vec![1]))],
+        )
+        .map_err(Into::into)
+    }
+
+    fn empty_input() -> Result<RecordBatch> {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
+            vec![Arc::new(Int32Array::from(Vec::<i32>::new()))],
         )
         .map_err(Into::into)
     }
@@ -1263,6 +1299,93 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn mixed_replay_and_new_identity_commits_only_the_pending_group_in_both_orders() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let table = BatchedTable::open(directory.path(), CommitOptions::default()).await?;
+        let original = table
+            .stage_coalesced_publications(vec![(input()?, "original".into(), 0, 10)])
+            .await?;
+        assert_eq!(
+            table.submit_prepared_group(original, true).await?.wait().await?.outcome,
+            CommitOutcome::Committed
+        );
+
+        for (fresh_id, fresh_first) in [("fresh-first", true), ("fresh-last", false)] {
+            let fresh = (input()?, fresh_id.to_owned(), 0, 20);
+            let replay = (input()?, "original".to_owned(), 0, 10);
+            let entries = if fresh_first {
+                vec![fresh, replay]
+            } else {
+                vec![replay, fresh]
+            };
+            let prepared = table.stage_coalesced_publications(entries).await?;
+            assert_eq!(prepared.identities.len(), 1);
+            assert_eq!(prepared.committed_identities.len(), 1);
+            assert_eq!(prepared.appends.len(), 1);
+
+            let result = table.submit_prepared_group(prepared, true).await?.wait().await?;
+            assert_eq!(result.outcome, CommitOutcome::PartiallyCommitted);
+            assert_eq!(result.authoritative_version, None);
+            assert_eq!(result.files.len(), 1);
+            assert_eq!(result.committed_file_indices, [0]);
+
+            let verification = table
+                .stage_coalesced_publications(vec![(input()?, fresh_id.into(), 0, 20)])
+                .await?;
+            assert!(verification.identities.is_empty());
+            assert_eq!(verification.committed_identities.len(), 1);
+            assert!(verification.appends.is_empty());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn empty_group_receipts_do_not_alias_by_file_range_in_either_order() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let table = BatchedTable::open(
+            directory.path(),
+            CommitOptions {
+                batch_window: Duration::from_secs(60),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let original = table
+            .stage_coalesced_publications(vec![(empty_input()?, "empty-original".into(), 0, 10)])
+            .await?;
+        let original = table.submit_prepared_group(original, true).await?.wait().await?;
+        assert_eq!(original.outcome, CommitOutcome::Committed);
+        assert!(original.files.is_empty());
+
+        for (fresh_id, fresh_first) in [("empty-fresh-first", true), ("empty-fresh-last", false)] {
+            let fresh = table
+                .stage_coalesced_publications(vec![(empty_input()?, fresh_id.into(), 0, 20)])
+                .await?;
+            let replay = table
+                .stage_coalesced_publications(vec![(empty_input()?, "empty-original".into(), 0, 10)])
+                .await?;
+            let (fresh_receipt, replay_receipt) = if fresh_first {
+                (
+                    table.submit_prepared_group(fresh, false).await?,
+                    table.submit_prepared_group(replay, true).await?,
+                )
+            } else {
+                let replay_receipt = table.submit_prepared_group(replay, false).await?;
+                let fresh_receipt = table.submit_prepared_group(fresh, true).await?;
+                (fresh_receipt, replay_receipt)
+            };
+            let (fresh, replay) = tokio::try_join!(fresh_receipt.wait(), replay_receipt.wait())?;
+            assert_eq!(fresh.outcome, CommitOutcome::Committed);
+            assert!(fresh.authoritative_version.is_some());
+            assert!(fresh.files.is_empty());
+            assert_eq!(replay.outcome, CommitOutcome::Deduplicated);
+            assert_eq!(replay.authoritative_version, None);
+            assert!(replay.files.is_empty());
+        }
+        Ok(())
+    }
+
     /// Scenario: one file is queued and the remaining capacity is occupied by in-flight work.
     /// Guarantees: another submission remains asynchronous and cannot enter until capacity is released.
     #[tokio::test]
@@ -1313,6 +1436,7 @@ mod tests {
         let disposition = CommitDisposition {
             start: 0,
             end: 1,
+            reply_index: None,
             outcome: CommitOutcome::Reconciled,
             authoritative_version: None,
         };

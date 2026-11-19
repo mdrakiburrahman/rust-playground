@@ -2154,6 +2154,7 @@ pub trait PublicationFence: Send + Sync + 'static {
 pub(crate) struct CoalescedCommitGroup {
     pub(crate) start: usize,
     pub(crate) end: usize,
+    pub(crate) reply_index: usize,
     pub(crate) identities: Vec<(String, i64, i64)>,
 }
 
@@ -2173,6 +2174,7 @@ struct CoalescedPublicationSource {
 pub(crate) struct CommitDisposition {
     pub(crate) start: usize,
     pub(crate) end: usize,
+    pub(crate) reply_index: Option<usize>,
     pub(crate) outcome: crate::commit::CommitOutcome,
     pub(crate) authoritative_version: Option<u64>,
 }
@@ -2197,6 +2199,7 @@ fn commit_dispositions(
             CommitDisposition {
                 start: group.start,
                 end: group.end,
+                reply_index: Some(group.reply_index),
                 outcome: if skipped {
                     crate::commit::CommitOutcome::Deduplicated
                 } else {
@@ -2214,6 +2217,7 @@ fn commit_dispositions(
                 CommitDisposition {
                     start: index,
                     end: index + 1,
+                    reply_index: None,
                     outcome: if skipped {
                         crate::commit::CommitOutcome::Deduplicated
                     } else {
@@ -2223,7 +2227,7 @@ fn commit_dispositions(
                 }
             }),
     );
-    dispositions.sort_by_key(|disposition| (disposition.start, disposition.end));
+    dispositions.sort_by_key(|disposition| (disposition.start, disposition.end, disposition.reply_index));
     dispositions
 }
 
