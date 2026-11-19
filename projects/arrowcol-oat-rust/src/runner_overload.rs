@@ -550,7 +550,11 @@ impl GuardApi {
 
     async fn request(&self, path: &str, query: &[(&str, &str)]) -> Result<reqwest::Response> {
         self.ensure_alive().await?;
-        Ok(self.client.get(format!("{}{path}", self.base)).query(query).send().await?.error_for_status()?)
+        let response = self.client.get(format!("{}{path}", self.base)).query(query).send().await?;
+        if !response.status().is_success() {
+            bail!("guard API returned HTTP {}", response.status());
+        }
+        Ok(response)
     }
 
     async fn ensure_alive(&self) -> Result<()> {
@@ -1084,23 +1088,29 @@ mod overload_guard_tests {
         config.kubectl_context = None;
         let inventory = Arc::new(tokio::sync::Mutex::new((deployment, sets, pods)));
         let requests = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let redirect = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let app = axum::Router::new().fallback({
             let inventory = Arc::clone(&inventory);
             let requests = Arc::clone(&requests);
+            let redirect = Arc::clone(&redirect);
             move |request: axum::extract::Request| {
                 let inventory = Arc::clone(&inventory);
                 let requests = Arc::clone(&requests);
+                let redirect = Arc::clone(&redirect);
                 async move {
                     assert_eq!(request.headers().get("authorization").and_then(|value| value.to_str().ok()), Some("Bearer fixture-token"));
                     requests.lock().await.push(request.uri().to_string());
+                    let is_redirect = request.uri().path().ends_with("/log") && redirect.load(std::sync::atomic::Ordering::SeqCst);
                     let values = inventory.lock().await;
-                    match request.uri().path() {
+                    let body = match request.uri().path() {
                         "/apis/apps/v1/namespaces/run/deployments/collector" => values.0.to_string(),
                         "/apis/apps/v1/namespaces/run/replicasets" => values.1.to_string(),
                         "/api/v1/namespaces/run/pods" => values.2.to_string(),
                         "/api/v1/namespaces/run/pods/pod/log" => "arrowcol_data_commit {}\n".to_owned(),
                         _ => "unexpected".to_owned(),
-                    }
+                    };
+                    (if is_redirect { axum::http::StatusCode::TEMPORARY_REDIRECT } else { axum::http::StatusCode::OK },
+                        [(axum::http::header::LOCATION, "/api/v1/namespaces/run/secrets")], body)
                 }
             }
         });
@@ -1152,15 +1162,23 @@ mod overload_guard_tests {
         for (method, path) in [
             (reqwest::Method::POST, api.deployment_path()),
             (reqwest::Method::HEAD, api.deployment_path()),
+            (reqwest::Method::from_bytes(b"GETS")?, api.deployment_path()),
             (reqwest::Method::GET, "/api/v1/namespaces/run/pods/pod/exec".to_owned()),
             (reqwest::Method::GET, "/api/v1/namespaces/run/pods/pod/attach".to_owned()),
             (reqwest::Method::GET, "/api/v1/namespaces/run/pods/pod/portforward".to_owned()),
             (reqwest::Method::GET, "/api/v1/namespaces/other/pods".to_owned()),
             (reqwest::Method::GET, "/api/v1/namespaces/run/secrets".to_owned()),
+            (reqwest::Method::GET, "/api/v1/namespaces/run/pods%2Fpod%2Fexec".to_owned()),
+            (reqwest::Method::GET, "/api/v1/namespaces/run/pods/pod/log%2F..%2Fexec".to_owned()),
+            (reqwest::Method::GET, "/api/v1/namespaces/run/pods/%70od/exec".to_owned()),
         ] {
             assert!(!client.request(method, format!("{}{path}", api.base)).send().await?.status().is_success());
         }
         assert_eq!(requests.lock().await.len(), count);
+        redirect.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(api.logs(&config.dfe_container, 1_000).await.is_err(), "redirect must fail closed");
+        assert_eq!(requests.lock().await.len(), count + 1);
+        redirect.store(false, std::sync::atomic::Ordering::SeqCst);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         let (reading, _, fence) = guarded_composite_observation(
             async { Ok(reading(0, 100)) },
