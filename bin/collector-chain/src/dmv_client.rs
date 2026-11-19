@@ -3543,6 +3543,7 @@ fn resource_report(start: Option<ResourceSample>, end: Option<ResourceSample>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_array::Array;
     use arrowcol_flight::{
         BatchAdmission, PutResultEmitter, RuntimeError, RuntimeResult, StreamAbortReason, StreamCompletion,
         StreamContext, StreamLifecycle, StreamSummary,
@@ -4827,11 +4828,8 @@ mod tests {
             ],
             vec!["--data-profile", "synthetic_telemetry", "--entropy", "0.9"],
         ] {
-            assert!(
-                Cli::try_parse_from(std::iter::once("test").chain(args))
-                    .and_then(|cli| cli.options.resolve(1024, 1))
-                    .is_err()
-            );
+            let parsed = Cli::try_parse_from(std::iter::once("test").chain(args));
+            assert!(parsed.map(|cli| cli.options.resolve(1024, 1).is_err()).unwrap_or(true));
         }
         Ok(())
     }
