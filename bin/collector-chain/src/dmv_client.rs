@@ -808,6 +808,36 @@ struct Measurement {
     ambiguous_rows: AtomicU64,
 }
 
+#[cfg(test)]
+#[derive(Default)]
+struct HotPathStage {
+    calls: AtomicU64,
+    elapsed_ns: AtomicU64,
+}
+#[cfg(test)]
+impl HotPathStage {
+    fn record(&self, elapsed: std::time::Duration) {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.elapsed_ns
+            .fetch_add(u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX), Ordering::Relaxed);
+    }
+    fn snapshot(&self) -> serde_json::Value {
+        let calls = self.calls.load(Ordering::Relaxed);
+        let elapsed_ns = self.elapsed_ns.load(Ordering::Relaxed);
+        serde_json::json!({"calls": calls, "aggregate_elapsed_ns": elapsed_ns, "mean_elapsed_us": (calls > 0).then_some(elapsed_ns as f64 / calls as f64 / 1_000.0)})
+    }
+}
+#[cfg(test)]
+#[derive(Default)]
+struct HotPathTimings {
+    identity_replacement: HotPathStage,
+    ipc_encoding: HotPathStage,
+    canonical_accounting: HotPathStage,
+    transport_and_ack: HotPathStage,
+}
+#[cfg(test)]
+static HOT_PATH_TIMINGS: std::sync::OnceLock<HotPathTimings> = std::sync::OnceLock::new();
+
 fn latency_percentiles(latency: &[u64; 64]) -> serde_json::Value {
     let count = latency.iter().sum::<u64>();
     let percentile = |numerator: u64| {
@@ -1685,11 +1715,29 @@ impl PreparedClient {
             worker,
             base36(sequence)
         );
+        #[cfg(test)]
+        let identity_started = Instant::now();
         let batch =
             batch_with_logical_identity(&template.template, self.run_id, self.incarnation_id, worker, sequence)?;
+        #[cfg(test)]
+        if let Some(timings) = HOT_PATH_TIMINGS.get() {
+            timings.identity_replacement.record(identity_started.elapsed());
+        }
+        #[cfg(test)]
+        let encoding_started = Instant::now();
         let (data, raw_arrow_bytes, encoded_bytes) =
             encode_with_sizes(&template.table, &template.version, batch.clone(), &self.options).await?;
+        #[cfg(test)]
+        if let Some(timings) = HOT_PATH_TIMINGS.get() {
+            timings.ipc_encoding.record(encoding_started.elapsed());
+        }
+        #[cfg(test)]
+        let accounting_started = Instant::now();
         let accounting = canonical_publication_accounting(&data, template.rows).await?;
+        #[cfg(test)]
+        if let Some(timings) = HOT_PATH_TIMINGS.get() {
+            timings.canonical_accounting.record(accounting_started.elapsed());
+        }
         anyhow::ensure!(
             data.iter()
                 .all(|message| message.encoded_len() <= self.options.max_message_bytes),
@@ -1988,6 +2036,8 @@ impl PreparedClient {
         let observation = SendObservation::fresh()?;
         let mut request = Request::new(stream::iter(data));
         let timeout = Duration::from_millis(self.options.request_timeout_ms);
+        #[cfg(test)]
+        let transport_started = Instant::now();
         let result = tokio::time::timeout(timeout, async {
             request_metadata(
                 &mut request,
@@ -2006,6 +2056,10 @@ impl PreparedClient {
         .await
         .context("DMV upload timeout")
         .and_then(std::convert::identity);
+        #[cfg(test)]
+        if let Some(timings) = HOT_PATH_TIMINGS.get() {
+            timings.transport_and_ack.record(transport_started.elapsed());
+        }
         let outcome = match &result {
             Ok(_) => ManifestOutcome::Acknowledged,
             Err(error) if is_not_admitted(error) => ManifestOutcome::NotAdmitted,
@@ -2821,22 +2875,19 @@ async fn canonical_publication_accounting(
 ) -> Result<CanonicalPublicationAccounting> {
     #[allow(clippy::unnecessary_to_owned)] // The decoder requires an owned 'static FlightData stream.
     let owned_messages = messages.to_vec();
-    let batches = FlightRecordBatchStream::new_from_flight_data(stream::iter(owned_messages.into_iter().map(Ok)))
-        .try_collect::<Vec<_>>()
-        .await?;
-    let decoded_rows = batches.iter().try_fold(0_u64, |total, batch| {
-        total
-            .checked_add(u64::try_from(batch.num_rows())?)
-            .context("decoded Flight row count overflow")
-    })?;
-    anyhow::ensure!(
-        decoded_rows == expected_rows,
-        "Flight decoding changed the publication row count"
-    );
+    let mut batches = FlightRecordBatchStream::new_from_flight_data(stream::iter(owned_messages.into_iter().map(Ok)));
+    let mut decoded_rows = 0_u64;
+    let mut decoded_physical_batch_count = 0_u64;
     let mut canonical_logical_bytes = Some(0_u64);
     let mut unavailable_reason = None;
-    for batch in &batches {
-        match canonical_record_batch_logical_bytes(batch) {
+    while let Some(batch) = batches.try_next().await? {
+        decoded_rows = decoded_rows
+            .checked_add(u64::try_from(batch.num_rows())?)
+            .context("decoded Flight row count overflow")?;
+        decoded_physical_batch_count = decoded_physical_batch_count
+            .checked_add(1)
+            .context("decoded physical batch count overflow")?;
+        match canonical_record_batch_logical_bytes(&batch) {
             Ok(bytes) => {
                 let Some(total) = canonical_logical_bytes else {
                     continue;
@@ -2855,8 +2906,12 @@ async fn canonical_publication_accounting(
             }
         }
     }
+    anyhow::ensure!(
+        decoded_rows == expected_rows,
+        "Flight decoding changed the publication row count"
+    );
     Ok(CanonicalPublicationAccounting {
-        decoded_physical_batch_count: u64::try_from(batches.len())?,
+        decoded_physical_batch_count,
         canonical_logical_bytes,
         unavailable_reason,
     })
@@ -3377,6 +3432,246 @@ mod tests {
         }
     }
 
+    fn decode_base64url_sextet(value: u8) -> Result<u8> {
+        Ok(match value {
+            b'A'..=b'Z' => value - b'A',
+            b'a'..=b'z' => value - b'a' + 26,
+            b'0'..=b'9' => value - b'0' + 52,
+            b'-' => 62,
+            b'_' => 63,
+            _ => anyhow::bail!("invalid base64url byte {value}"),
+        })
+    }
+
+    fn decode_base64url_no_pad(value: &str) -> Result<Vec<u8>> {
+        let encoded = value.as_bytes();
+        anyhow::ensure!(encoded.len() % 4 != 1, "invalid unpadded base64url length");
+        let mut decoded = Vec::with_capacity(encoded.len().saturating_mul(3) / 4);
+        for chunk in encoded.chunks(4) {
+            anyhow::ensure!(chunk.len() >= 2, "incomplete base64url chunk");
+            let first = decode_base64url_sextet(chunk[0])?;
+            let second = decode_base64url_sextet(chunk[1])?;
+            decoded.push((first << 2) | (second >> 4));
+            if chunk.len() >= 3 {
+                let third = decode_base64url_sextet(chunk[2])?;
+                decoded.push((second << 4) | (third >> 2));
+                if chunk.len() == 4 {
+                    let fourth = decode_base64url_sextet(chunk[3])?;
+                    decoded.push((third << 6) | fourth);
+                } else {
+                    anyhow::ensure!(third & 0b11 == 0, "nonzero unused base64url bits");
+                }
+            } else {
+                anyhow::ensure!(second & 0b1111 == 0, "nonzero unused base64url bits");
+            }
+        }
+        Ok(decoded)
+    }
+
+    fn decode_manifest_batch_facts(range: &serde_json::Value) -> Result<Vec<(u64, Option<u64>, Option<String>)>> {
+        let batch_count = range["batch_count"].as_u64().context("missing manifest batch count")?;
+        let facts = &range["batch_facts"];
+        let index_count = facts["index_count"]
+            .as_u64()
+            .context("missing batch fact index count")?;
+        anyhow::ensure!(
+            index_count == batch_count,
+            "batch fact count does not match range count"
+        );
+        let index_count = usize::try_from(index_count).context("batch fact index count exceeds address space")?;
+        let index_bits = u8::try_from(facts["index_bits"].as_u64().context("missing batch fact index width")?)
+            .context("batch fact index width exceeds u8")?;
+        anyhow::ensure!(index_bits <= u32::BITS as u8, "batch fact index width exceeds u32");
+        let dictionary = facts["dictionary"]
+            .as_array()
+            .context("missing batch fact dictionary")?;
+        anyhow::ensure!(!dictionary.is_empty(), "batch fact dictionary is empty");
+        let packed = decode_base64url_no_pad(
+            facts["indices_base64url"]
+                .as_str()
+                .context("missing packed batch fact indices")?,
+        )?;
+        let packed_bits = index_count
+            .checked_mul(usize::from(index_bits))
+            .context("batch fact packed-bit count overflow")?;
+        anyhow::ensure!(
+            packed.len() == packed_bits.div_ceil(8),
+            "packed batch fact byte count mismatch"
+        );
+        anyhow::ensure!(
+            index_bits != 0 || dictionary.len() == 1,
+            "zero-width indices require one fact"
+        );
+
+        let mut decoded = Vec::with_capacity(index_count);
+        for item in 0..index_count {
+            let mut index = 0_u64;
+            let bit_offset = item
+                .checked_mul(usize::from(index_bits))
+                .context("batch fact bit offset overflow")?;
+            for bit in 0..usize::from(index_bits) {
+                let offset = bit_offset + bit;
+                if packed[offset / 8] & (1 << (offset % 8)) != 0 {
+                    index |= 1_u64 << bit;
+                }
+            }
+            let index = usize::try_from(index).context("batch fact dictionary index exceeds address space")?;
+            let fact = dictionary
+                .get(index)
+                .context("batch fact index is outside the dictionary")?;
+            let physical = fact["decoded_physical_batch_count"]
+                .as_u64()
+                .context("missing physical Flight fragment count")?;
+            let canonical = if fact["canonical_logical_bytes"].is_null() {
+                None
+            } else {
+                Some(
+                    fact["canonical_logical_bytes"]
+                        .as_u64()
+                        .context("invalid canonical logical byte count")?,
+                )
+            };
+            let reason = if fact["canonical_logical_bytes_unavailable_reason"].is_null() {
+                None
+            } else {
+                Some(
+                    fact["canonical_logical_bytes_unavailable_reason"]
+                        .as_str()
+                        .context("invalid canonical byte unavailability reason")?
+                        .to_owned(),
+                )
+            };
+            decoded.push((physical, canonical, reason));
+        }
+        Ok(decoded)
+    }
+
+    fn validate_manifest_identity_ranges(manifest: &serde_json::Value) -> Result<(u64, u64, u64, u64, usize)> {
+        let ranges = manifest["ranges"].as_array().context("missing manifest ranges")?;
+        let mut next_sequence = std::collections::HashMap::<u64, u64>::new();
+        let mut identities = std::collections::HashSet::<(u64, u64)>::new();
+        let mut distinct_facts = std::collections::BTreeSet::<(u64, Option<u64>, Option<String>)>::new();
+        let mut parents = 0_u64;
+        let mut rows = 0_u64;
+        let mut physical_batches = 0_u64;
+        let mut canonical_bytes = 0_u64;
+        for range in ranges {
+            let worker = range["worker"].as_u64().context("missing manifest worker")?;
+            let first = range["first_sequence"].as_u64().context("missing first sequence")?;
+            let last = range["last_sequence"].as_u64().context("missing last sequence")?;
+            let count = range["batch_count"].as_u64().context("missing manifest batch count")?;
+            anyhow::ensure!(
+                last >= first && last - first + 1 == count,
+                "manifest range sequence span is invalid"
+            );
+            let expected = next_sequence.get(&worker).copied().unwrap_or(0);
+            anyhow::ensure!(
+                first == expected,
+                "manifest identities overlap or have a sequence gap for worker {worker}: expected {expected}, got {first}"
+            );
+            for sequence in first..=last {
+                anyhow::ensure!(
+                    identities.insert((worker, sequence)),
+                    "overlapping manifest logical identity"
+                );
+            }
+            next_sequence.insert(worker, last.checked_add(1).context("logical sequence overflow")?);
+            let rows_per_batch = range["rows_per_batch"].as_u64().context("missing rows per batch")?;
+            rows = rows
+                .checked_add(
+                    rows_per_batch
+                        .checked_mul(count)
+                        .context("manifest row total overflow")?,
+                )
+                .context("manifest row total overflow")?;
+            let decoded_facts = decode_manifest_batch_facts(range)?;
+            anyhow::ensure!(
+                decoded_facts.len() as u64 == count,
+                "decoded fact count differs from range count"
+            );
+            let mut range_physical = 0_u64;
+            let mut range_canonical = 0_u64;
+            for (physical, canonical, reason) in decoded_facts {
+                let canonical = canonical.context("canonical logical byte fact is unavailable")?;
+                anyhow::ensure!(reason.is_none(), "canonical byte fact has an unavailable reason");
+                range_physical = range_physical
+                    .checked_add(physical)
+                    .context("range physical total overflow")?;
+                range_canonical = range_canonical
+                    .checked_add(canonical)
+                    .context("range canonical total overflow")?;
+                distinct_facts.insert((physical, Some(canonical), reason));
+            }
+            anyhow::ensure!(
+                range_physical
+                    == range["decoded_physical_batch_count"]
+                        .as_u64()
+                        .context("missing range physical total")?,
+                "decoded fragments differ from range total"
+            );
+            anyhow::ensure!(
+                range_canonical
+                    == range["canonical_logical_bytes"]
+                        .as_u64()
+                        .context("missing range canonical total")?,
+                "decoded canonical bytes differ from range total"
+            );
+            parents = parents.checked_add(count).context("manifest parent count overflow")?;
+            physical_batches = physical_batches
+                .checked_add(range_physical)
+                .context("manifest fragment total overflow")?;
+            canonical_bytes = canonical_bytes
+                .checked_add(range_canonical)
+                .context("manifest byte total overflow")?;
+        }
+        let record_count = manifest["record_count"]
+            .as_u64()
+            .context("missing manifest record count")?;
+        anyhow::ensure!(
+            identities.len() as u64 == record_count,
+            "unique identities differ from manifest record count"
+        );
+        anyhow::ensure!(
+            parents == record_count,
+            "manifest parent total differs from record count"
+        );
+        Ok((parents, rows, physical_batches, canonical_bytes, distinct_facts.len()))
+    }
+
+    fn write_evidence_json(variable: &str, value: &serde_json::Value) -> Result<String> {
+        let path = std::env::var_os(variable).with_context(|| format!("{variable} must be set for the diagnostic"))?;
+        let path = std::path::PathBuf::from(path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create evidence directory {}", parent.display()))?;
+        }
+        let bytes = serde_json::to_vec(value)?;
+        std::fs::write(&path, &bytes).with_context(|| format!("write evidence JSON {}", path.display()))?;
+        Ok(format!("{}:{}", path.display(), bytes.len()))
+    }
+
+    fn process_rss_bytes() -> Result<u64> {
+        let status = std::fs::read_to_string("/proc/self/status").context("read process RSS from /proc")?;
+        let kib = status
+            .lines()
+            .find_map(|line| line.strip_prefix("VmRSS:"))
+            .context("missing VmRSS in /proc/self/status")?
+            .split_whitespace()
+            .next()
+            .context("missing VmRSS value")?
+            .parse::<u64>()?;
+        kib.checked_mul(1024).context("process RSS byte count overflow")
+    }
+
+    fn joined_run_result(
+        result: std::result::Result<Result<ContinuousReport>, tokio::task::JoinError>,
+    ) -> Result<ContinuousReport> {
+        match result {
+            Ok(result) => result,
+            Err(error) => Err(error.into()),
+        }
+    }
+
     fn legacy_range_count(records: &[LogicalBatchRecord]) -> Result<usize> {
         let mut ordered: Vec<&LogicalBatchRecord> = records.iter().collect();
         ordered.sort_by_key(|record| (record.worker, record.sequence));
@@ -3420,6 +3715,61 @@ mod tests {
             started: Instant::now(),
             options,
         })
+    }
+
+    fn eligible_measurement_send_ack(
+        cohort: ManifestCohort,
+        outcome: ManifestOutcome,
+        acknowledged_unix_ms: Option<u64>,
+        start_unix_ms: u64,
+        end_unix_ms: u64,
+    ) -> bool {
+        cohort == ManifestCohort::Measurement
+            && outcome == ManifestOutcome::Acknowledged
+            && acknowledged_unix_ms.is_some_and(|observed| observed >= start_unix_ms && observed < end_unix_ms)
+    }
+
+    #[test]
+    fn measurement_send_ack_eligibility_uses_half_open_bounds() {
+        let start = 1_000;
+        let end = 2_000;
+        let eligible =
+            |cohort, outcome, acknowledged| eligible_measurement_send_ack(cohort, outcome, acknowledged, start, end);
+        assert!(eligible(
+            ManifestCohort::Measurement,
+            ManifestOutcome::Acknowledged,
+            Some(start)
+        ));
+        assert!(eligible(
+            ManifestCohort::Measurement,
+            ManifestOutcome::Acknowledged,
+            Some(end - 1)
+        ));
+        assert!(!eligible(
+            ManifestCohort::Measurement,
+            ManifestOutcome::Acknowledged,
+            Some(end)
+        ));
+        assert!(!eligible(
+            ManifestCohort::Measurement,
+            ManifestOutcome::Acknowledged,
+            Some(start - 1)
+        ));
+        assert!(!eligible(
+            ManifestCohort::Measurement,
+            ManifestOutcome::Acknowledged,
+            None
+        ));
+        assert!(!eligible(
+            ManifestCohort::Warmup,
+            ManifestOutcome::Acknowledged,
+            Some(start)
+        ));
+        assert!(!eligible(
+            ManifestCohort::Measurement,
+            ManifestOutcome::Failed,
+            Some(start)
+        ));
     }
 
     #[test]
@@ -5452,6 +5802,859 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), server).await???;
         Ok(())
     }
+    #[test]
+    fn manifest_validation_decoder_rejects_overlapping_identities() -> Result<()> {
+        let client = manifest_test_client()?;
+        {
+            let mut records = client
+                .logical_batches
+                .lock()
+                .map_err(|_| anyhow::anyhow!("logical batch manifest state poisoned"))?;
+            for _ in 0..2 {
+                records.push(LogicalBatchRecord {
+                    table: "sqlserver_availability_replica_states".to_owned(),
+                    worker: 0,
+                    sequence: 0,
+                    row_count: 1,
+                    cohort: ManifestCohort::Measurement,
+                    attempts: 1,
+                    outcome: ManifestOutcome::Acknowledged,
+                    decoded_physical_batch_count: 1,
+                    canonical_logical_bytes: Some(8),
+                    canonical_logical_bytes_unavailable_reason: None,
+                    first_send_unix_ns: Some(1),
+                    last_send_unix_ns: Some(1),
+                    first_admitted_unix_ms: Some(1),
+                    first_admitted_cohort: Some(ManifestCohort::Measurement),
+                    last_outcome_unix_ms: Some(1),
+                });
+            }
+        }
+        let manifest = client.logical_manifest("completed")?;
+        anyhow::ensure!(
+            validate_manifest_identity_ranges(&manifest).is_err(),
+            "overlapping worker/sequence identities must be rejected"
+        );
+        Ok(())
+    }
+
+    fn current_linux_tid() -> Result<u32> {
+        #[cfg(target_os = "linux")]
+        {
+            let target = std::fs::read_link("/proc/thread-self").context("read current Linux thread id")?;
+            target
+                .file_name()
+                .and_then(|name| name.to_str())
+                .context("current thread path has no numeric id")?
+                .parse()
+                .context("parse current Linux thread id")
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            anyhow::bail!("attributable sink CPU diagnostics require Linux /proc")
+        }
+    }
+
+    fn process_thread_cpu_ns(thread_id: u32) -> Result<u64> {
+        #[cfg(target_os = "linux")]
+        {
+            let path = format!("/proc/self/task/{thread_id}/schedstat");
+            let contents = std::fs::read_to_string(&path)
+                .with_context(|| format!("read sink thread CPU accounting for tid {thread_id}"))?;
+            contents
+                .split_whitespace()
+                .next()
+                .context("sink thread schedstat is missing CPU accounting")?
+                .parse()
+                .context("parse sink thread CPU accounting")
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = thread_id;
+            anyhow::bail!("attributable sink CPU diagnostics require Linux /proc")
+        }
+    }
+
+    fn sum_process_thread_cpu_ns(thread_ids: &[u32]) -> Result<u64> {
+        anyhow::ensure!(!thread_ids.is_empty(), "sink runtime has no attributable threads");
+        thread_ids.iter().try_fold(0_u64, |total, thread_id| {
+            total
+                .checked_add(process_thread_cpu_ns(*thread_id)?)
+                .context("sink runtime thread CPU total overflow")
+        })
+    }
+
+    struct SinkServerGuard {
+        shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+        thread: Option<std::thread::JoinHandle<Result<()>>>,
+    }
+
+    impl SinkServerGuard {
+        fn stop_and_join(&mut self) -> Result<()> {
+            if let Some(shutdown) = self.shutdown.take() {
+                shutdown
+                    .send(())
+                    .map_err(|()| anyhow::anyhow!("sink shutdown channel closed before stop"))?;
+            }
+            if let Some(thread) = self.thread.take() {
+                thread
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("sink server thread panicked"))??;
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for SinkServerGuard {
+        fn drop(&mut self) {
+            if let Some(shutdown) = self.shutdown.take()
+                && shutdown.send(()).is_err()
+            {
+                eprintln!("sink server shutdown channel was already closed during cleanup");
+            }
+            if let Some(thread) = self.thread.take() {
+                match thread.join() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => eprintln!("sink server cleanup failed: {error:#}"),
+                    Err(_) => eprintln!("sink server thread panicked during cleanup"),
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+    #[ignore = "10-minute realistic in-memory Flight sink and target-volume diagnostic; requires evidence paths"]
+    async fn null_flight_sink_realistic_sustained_profile() -> Result<()> {
+        use arrowcol_catalog::{CatalogControlPlane, CatalogStore, MemoryCatalogStore};
+        use arrowcol_flight::{AllowAllAuthenticator, ArrowColFlightService, RuntimeLimits};
+        use arrowcol_protocol::{AuthContext, AuthMethod, AuthenticatedPrincipal, PrincipalId, PrincipalIssuer};
+
+        const WORKERS: usize = 16;
+        const STREAMS_PER_WORKER: usize = 2;
+        const ROWS_PER_BATCH: usize = 65_536;
+        const CORPUS_BATCHES: usize = 16;
+        const DEFAULT_WARMUP_MS: u64 = 60_000;
+        const DEFAULT_MEASUREMENT_MS: u64 = 600_000;
+        fn perf69_env_u64(name: &str, default: u64) -> Result<u64> {
+            match std::env::var(name) {
+                Ok(value) => value
+                    .parse()
+                    .map_err(|error| anyhow::anyhow!("{name} must be an unsigned integer: {error}")),
+                Err(std::env::VarError::NotPresent) => Ok(default),
+                Err(error) => Err(anyhow::anyhow!("{name} must be valid Unicode: {error}")),
+            }
+        }
+        fn perf69_env_u32(name: &str, default: u32) -> Result<u32> {
+            match std::env::var(name) {
+                Ok(value) => value
+                    .parse()
+                    .map_err(|error| anyhow::anyhow!("{name} must be a u32: {error}")),
+                Err(std::env::VarError::NotPresent) => Ok(default),
+                Err(error) => Err(anyhow::anyhow!("{name} must be valid Unicode: {error}")),
+            }
+        }
+        let warmup_ms = perf69_env_u64("PERF69_WARMUP_MS", DEFAULT_WARMUP_MS)?;
+        let measurement_ms = perf69_env_u64("PERF69_MEASUREMENT_MS", DEFAULT_MEASUREMENT_MS)?;
+        let sample_interval_ms = perf69_env_u64("PERF69_SAMPLE_INTERVAL_MS", 60_000)?;
+        let server_stream_window_bytes = perf69_env_u32("PERF69_SERVER_STREAM_WINDOW_BYTES", 65_535)?;
+        let server_connection_window_bytes = perf69_env_u32("PERF69_SERVER_CONNECTION_WINDOW_BYTES", 65_535)?;
+        anyhow::ensure!(
+            warmup_ms > 0 && measurement_ms > 0 && sample_interval_ms > 0,
+            "diagnostic durations must be positive"
+        );
+        anyhow::ensure!(
+            server_stream_window_bytes > 0 && server_stream_window_bytes <= i32::MAX as u32,
+            "server stream window must be 1..=2147483647 bytes"
+        );
+        anyhow::ensure!(
+            server_connection_window_bytes > 0 && server_connection_window_bytes <= i32::MAX as u32,
+            "server connection window must be 1..=2147483647 bytes"
+        );
+        HOT_PATH_TIMINGS
+            .set(HotPathTimings::default())
+            .map_err(|_| anyhow::anyhow!("hot-path timing state was already initialized"))?;
+        const TARGET_ROWS_PER_SECOND: u64 = 805_000;
+        const MAX_MEMORY_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+        const FLIGHT_DATA_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+        const CLIENT_MESSAGE_LIMIT_BYTES: usize = 128 * 1024 * 1024;
+        const SINK_RUNTIME_THREADS: usize = 16;
+
+        let store: Arc<dyn CatalogStore> = Arc::new(MemoryCatalogStore::new());
+        let principal = AuthenticatedPrincipal::new(
+            PrincipalId::new("sustained-ceiling")?,
+            PrincipalIssuer::new("sustained-ceiling")?,
+            Default::default(),
+        )?;
+        let auth = AuthContext::new(principal, AuthMethod::WorkloadIdentity, UnixMillis::new(1)?, None)?;
+        let state = Arc::new(SmokeState::default());
+        let service = ArrowColFlightService::new(
+            ImplementationPool::Dataflow,
+            Arc::clone(&store),
+            Arc::new(AllowAllAuthenticator::new(auth)),
+            Arc::new(SmokeAdmission(Arc::clone(&state))),
+            RuntimeLimits {
+                max_message_bytes: CLIENT_MESSAGE_LIMIT_BYTES,
+                ..RuntimeLimits::default()
+            },
+        )?
+        .with_ddl_handler(Arc::new(CatalogControlPlane::new(DdlParser::default(), store)))
+        .into_tonic_service();
+        anyhow::ensure!(
+            cfg!(target_os = "linux"),
+            "attributable sink CPU diagnostics require Linux /proc"
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
+        let sink_runtime_thread_ids = Arc::new(Mutex::new(Vec::new()));
+        let sink_runtime_thread_id_error = Arc::new(Mutex::new(None::<String>));
+        let runtime_thread_ids = Arc::clone(&sink_runtime_thread_ids);
+        let runtime_thread_id_error = Arc::clone(&sink_runtime_thread_id_error);
+        let server_thread = std::thread::Builder::new()
+            .name("perf69-flight-sink-root".to_owned())
+            .spawn(move || {
+                let root_thread_id = current_linux_tid()?;
+                runtime_thread_ids
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(root_thread_id);
+                let worker_thread_ids = Arc::clone(&runtime_thread_ids);
+                let worker_thread_id_error = Arc::clone(&runtime_thread_id_error);
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(SINK_RUNTIME_THREADS)
+                    .thread_name("perf69-flight-sink-worker")
+                    .on_thread_start(move || match current_linux_tid() {
+                        Ok(thread_id) => worker_thread_ids
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push(thread_id),
+                        Err(error) => {
+                            *worker_thread_id_error
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(format!("{error:#}"));
+                        }
+                    })
+                    .enable_all()
+                    .build()
+                    .context("build isolated sink runtime")?;
+                runtime.block_on(async move {
+                    let listener = tokio::net::TcpListener::from_std(listener)
+                        .context("register sink listener on isolated runtime")?;
+                    let incoming = stream::unfold(listener, |listener| async {
+                        Some((listener.accept().await.map(|(socket, _)| socket), listener))
+                    });
+                    tonic::transport::Server::builder()
+                        .initial_stream_window_size(server_stream_window_bytes)
+                        .initial_connection_window_size(server_connection_window_bytes)
+                        .add_service(service)
+                        .serve_with_incoming_shutdown(incoming, async {
+                            let _ = shutdown_rx.await;
+                        })
+                        .await
+                        .context("serve isolated local Flight sink")
+                })
+            })
+            .context("spawn isolated sink runtime thread")?;
+        let mut server = SinkServerGuard {
+            shutdown: Some(shutdown),
+            thread: Some(server_thread),
+        };
+
+        let mut run_options = options()?;
+        run_options.data_profile = DataProfile::Realistic;
+        run_options.data_mode = DataMode::Shared;
+        run_options.string_width = 789;
+        run_options.string_length_distribution = Some(StringLengthDistribution::Uniform);
+        run_options.value_variation = Some(ValueVariation::PerRow);
+        run_options.guid_uniqueness = Some(GuidUniqueness::PerRow);
+        run_options.workers = WORKERS;
+        run_options.streams_per_worker = STREAMS_PER_WORKER;
+        run_options.connections_per_worker = 1;
+        run_options.runtime_threads = 16;
+        run_options.batch_rows = ROWS_PER_BATCH;
+        run_options.corpus_rows = ROWS_PER_BATCH * CORPUS_BATCHES;
+        run_options.max_memory_bytes = MAX_MEMORY_BYTES;
+        run_options.interval_us = 0;
+        run_options.stream_retry_max_attempts = 1;
+        run_options.connect_retries = 0;
+        run_options.ipc_compression = IpcCompression::None;
+        run_options.max_flight_data_bytes = FLIGHT_DATA_LIMIT_BYTES;
+        run_options.max_message_bytes = CLIENT_MESSAGE_LIMIT_BYTES;
+        run_options = run_options.resolve(ROWS_PER_BATCH, STREAMS_PER_WORKER)?;
+        anyhow::ensure!(
+            std::thread::available_parallelism()?.get() >= WORKERS,
+            "diagnostic requests {WORKERS} workers but fewer CPU cores are available"
+        );
+        let client = PreparedClient::prepare(
+            &endpoint,
+            "sustained-ceiling",
+            Some("sqlserver_availability_replica_states"),
+            None,
+            run_options,
+        )
+        .await?;
+        let sink_thread_startup_deadline = Instant::now() + Duration::from_secs(10);
+        let sink_runtime_thread_ids = loop {
+            if let Some(error) = sink_runtime_thread_id_error
+                .lock()
+                .map_err(|_| anyhow::anyhow!("sink runtime thread-id error state poisoned"))?
+                .clone()
+            {
+                anyhow::bail!("could not attribute sink runtime thread CPU: {error}");
+            }
+            let mut thread_ids = sink_runtime_thread_ids
+                .lock()
+                .map_err(|_| anyhow::anyhow!("sink runtime thread-id state poisoned"))?
+                .clone();
+            thread_ids.sort_unstable();
+            thread_ids.dedup();
+            if thread_ids.len() == SINK_RUNTIME_THREADS + 1 {
+                break thread_ids;
+            }
+            anyhow::ensure!(
+                Instant::now() < sink_thread_startup_deadline,
+                "expected {} sink runtime threads, observed {}",
+                SINK_RUNTIME_THREADS + 1,
+                thread_ids.len()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        anyhow::ensure!(
+            client.corpus.len() == 1,
+            "shared profile should prepare one shared corpus"
+        );
+        anyhow::ensure!(
+            client.corpus[0].len() == CORPUS_BATCHES,
+            "prepared corpus should contain the configured full-batch variation"
+        );
+        eprintln!(
+            "L3_SUSTAINED_PROFILE server_receive_stream_window_bytes={server_stream_window_bytes} server_receive_connection_window_bytes={server_connection_window_bytes} client_receive_stream_window_bytes={} client_receive_connection_window_bytes={} sink_runtime_worker_threads={SINK_RUNTIME_THREADS} sink_runtime_os_threads={} options={} preparation={}",
+            client.options.stream_window_bytes,
+            client.options.connection_window_bytes,
+            sink_runtime_thread_ids.len(),
+            serde_json::to_string(&client.options)?,
+            serde_json::to_string(&client.preparation)?
+        );
+
+        let mut template_facts = Vec::with_capacity(CORPUS_BATCHES);
+        let mut distinct_template_facts = std::collections::BTreeSet::new();
+        for (index, template) in client.corpus[0].iter().enumerate() {
+            let accounting = canonical_publication_accounting(&template.data, template.rows).await?;
+            let canonical = accounting
+                .canonical_logical_bytes
+                .context("prepared realistic corpus has unavailable canonical bytes")?;
+            anyhow::ensure!(
+                accounting.unavailable_reason.is_none(),
+                "prepared corpus reports a canonical-byte failure reason"
+            );
+            distinct_template_facts.insert((accounting.decoded_physical_batch_count, canonical));
+            eprintln!(
+                "L3_CORPUS_FACT template={index} rows={} decoded_physical_fragments={} canonical_logical_bytes={} raw_flight_data_bytes={} configured_flight_data_bytes={}",
+                template.rows,
+                accounting.decoded_physical_batch_count,
+                canonical,
+                template.raw_arrow_bytes,
+                template.encoded_bytes
+            );
+            template_facts.push((
+                accounting.decoded_physical_batch_count,
+                canonical,
+                template.raw_arrow_bytes,
+                template.encoded_bytes,
+            ));
+        }
+        anyhow::ensure!(
+            distinct_template_facts.len() > 1,
+            "realistic prepared corpus did not produce varied physical/canonical facts"
+        );
+
+        let measurement_target_rows = TARGET_ROWS_PER_SECOND
+            .checked_mul(measurement_ms / 1_000)
+            .context("target measurement row count overflow")?;
+        let target_measurement_parents = measurement_target_rows.div_ceil(ROWS_PER_BATCH as u64);
+        let warmup_target_rows = TARGET_ROWS_PER_SECOND
+            .checked_mul(warmup_ms / 1_000)
+            .context("target warmup row count overflow")?;
+        let target_warmup_parents = warmup_target_rows.div_ceil(ROWS_PER_BATCH as u64);
+        let target_total_parents = target_measurement_parents
+            .checked_add(target_warmup_parents)
+            .context("target parent count overflow")?;
+        anyhow::ensure!(
+            target_total_parents <= MAX_LOGICAL_BATCH_RECORDS as u64,
+            "deployment target evidence exceeds the existing record cap"
+        );
+
+        let mut projection = manifest_test_client()?;
+        projection.options = client.options.clone();
+        projection.options.workers = 1;
+        projection.options.streams_per_worker = 1;
+        projection.counters = vec![Counters::default()];
+        projection.worker_next = vec![AtomicU64::new(0)];
+        projection.worker_batch_sequence = vec![AtomicU64::new(0)];
+        let projection_start = 1_000_000_u64;
+        let projection_end = projection_start + measurement_ms;
+        let projection_measurement = Arc::new(Measurement::new(projection_start, projection_end, 1)?);
+        *projection
+            .measurement
+            .lock()
+            .map_err(|_| anyhow::anyhow!("measurement state poisoned"))? = Some(Arc::clone(&projection_measurement));
+        let warmup_start = projection_start - warmup_ms;
+        for sequence in 0..target_total_parents {
+            let warmup = sequence < target_warmup_parents;
+            let (send_ms, fact_index) = if warmup {
+                (
+                    warmup_start + sequence * warmup_ms / target_warmup_parents,
+                    usize::try_from(sequence).context("warmup fact index exceeds address space")?,
+                )
+            } else {
+                let measurement_sequence = sequence - target_warmup_parents;
+                (
+                    projection_start + measurement_sequence * measurement_ms / target_measurement_parents,
+                    usize::try_from(measurement_sequence).context("measurement fact index exceeds address space")?,
+                )
+            };
+            let (physical, canonical, raw_bytes, wire_bytes) = template_facts[fact_index % template_facts.len()];
+            let index = {
+                let mut records = projection
+                    .logical_batches
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("logical batch manifest state poisoned"))?;
+                let index = records.len();
+                records.push(LogicalBatchRecord {
+                    table: "sqlserver_availability_replica_states".to_owned(),
+                    worker: 0,
+                    sequence,
+                    row_count: ROWS_PER_BATCH as u32,
+                    cohort: ManifestCohort::Unscheduled,
+                    attempts: 0,
+                    outcome: ManifestOutcome::Pending,
+                    decoded_physical_batch_count: physical,
+                    canonical_logical_bytes: Some(canonical),
+                    canonical_logical_bytes_unavailable_reason: None,
+                    first_send_unix_ns: None,
+                    last_send_unix_ns: None,
+                    first_admitted_unix_ms: None,
+                    first_admitted_cohort: None,
+                    last_outcome_unix_ms: None,
+                });
+                index
+            };
+            projection.record_manifest_attempt(
+                index,
+                send_ms
+                    .checked_mul(1_000_000)
+                    .context("projection send timestamp overflow")?,
+                Some(&projection_measurement),
+            )?;
+            projection.record_result_observation(
+                Some(index),
+                ManifestOutcome::Acknowledged,
+                Some(&projection_measurement),
+                0,
+                ROWS_PER_BATCH as u64,
+                raw_bytes,
+                wire_bytes,
+                Some(send_ms),
+            )?;
+        }
+        let target_projection = projection.metrics("completed")?;
+        projection.ensure_terminal_manifest_complete()?;
+        let target_manifest = &target_projection["logical_batch_manifest"];
+        let (projection_parents, projection_rows, projection_fragments, projection_bytes, projection_facts) =
+            validate_manifest_identity_ranges(target_manifest)?;
+        let projection_manifest_bytes = serde_json::to_vec(target_manifest)?.len();
+        let projection_line_bytes = oat_client_metrics_line_bytes(&target_projection)?;
+        let projection_path = write_evidence_json("PERF69_TARGET_VOLUME_MANIFEST_PATH", &target_projection)?;
+        eprintln!(
+            "L3_TARGET_VOLUME_PROJECTION scope=prepared_corpus_fact_projection_not_sent target_rows_per_second={TARGET_ROWS_PER_SECOND} measurement_ms={measurement_ms} warmup_ms={warmup_ms} warmup_parents={target_warmup_parents} measurement_parents={target_measurement_parents} total_parents={projection_parents} rows={projection_rows} physical_fragments={projection_fragments} canonical_bytes={projection_bytes} distinct_template_facts={} distinct_manifest_facts={projection_facts} manifest_bytes={projection_manifest_bytes} terminal_line_bytes={projection_line_bytes} cap_bytes={MAX_OAT_CLIENT_METRICS_LINE_BYTES} path={projection_path}",
+            distinct_template_facts.len()
+        );
+        anyhow::ensure!(
+            projection_parents == target_total_parents,
+            "target projection parent count mismatch"
+        );
+        anyhow::ensure!(
+            projection_rows == target_total_parents * ROWS_PER_BATCH as u64,
+            "target projection row count mismatch"
+        );
+        anyhow::ensure!(projection_facts > 1, "target projection collapsed to one batch fact");
+        anyhow::ensure!(
+            projection_manifest_bytes <= MAX_LOGICAL_MANIFEST_BYTES,
+            "target projection manifest exceeds cap"
+        );
+        anyhow::ensure!(
+            projection_line_bytes <= MAX_OAT_CLIENT_METRICS_LINE_BYTES,
+            "target projection terminal line exceeds cap"
+        );
+
+        let scheduled_start = unix_ms()?.checked_add(1_000).context("scheduled start overflow")?;
+        let measurement_start = scheduled_start
+            .checked_add(warmup_ms)
+            .context("measurement start overflow")?;
+        let measurement_end = measurement_start
+            .checked_add(measurement_ms)
+            .context("measurement end overflow")?;
+        eprintln!(
+            "L3_SUSTAINED_SCHEDULE scheduled_start_unix_ms={scheduled_start} warmup_ms={warmup_ms} measurement_start_unix_ms={measurement_start} measurement_end_unix_ms={measurement_end} measurement_ms={measurement_ms} target_rows_per_second={TARGET_ROWS_PER_SECOND} target_parents={target_measurement_parents}"
+        );
+        let run_client = Arc::clone(&client);
+        let mut run_task = tokio::spawn(async move {
+            run_client
+                .run_continuous(scheduled_start, measurement_start, measurement_end)
+                .await
+        });
+        let measurement = loop {
+            if let Some(measurement) = client
+                .measurement
+                .lock()
+                .map_err(|_| anyhow::anyhow!("measurement state poisoned"))?
+                .as_ref()
+                .cloned()
+            {
+                break measurement;
+            }
+            tokio::task::yield_now().await;
+        };
+        let mut run_result = None;
+        let until_measurement = measurement_start.saturating_sub(unix_ms()?);
+        tokio::select! {
+            () = tokio::time::sleep(Duration::from_millis(until_measurement)) => {}
+            joined = &mut run_task => run_result = Some(joined_run_result(joined)),
+        }
+        let mut cpu_attribution_start = None;
+        if run_result.is_none() {
+            let cpu_window_started = Instant::now();
+            let mut previous_cpu = process_cpu_ns()?.context("process CPU accounting unavailable")?;
+            let mut previous_sink_cpu_ns = sum_process_thread_cpu_ns(&sink_runtime_thread_ids)?;
+            cpu_attribution_start = Some((previous_cpu, previous_sink_cpu_ns, cpu_window_started));
+            let monitor_start = tokio::time::Instant::now();
+            let mut previous_time = monitor_start;
+            let mut previous_rows = measurement.rows.load(Ordering::Relaxed);
+            let mut sampled_peak_rss = process_rss_bytes()?;
+            let sample_count = measurement_ms.div_ceil(sample_interval_ms).saturating_add(2);
+            for sample_index in 1..=sample_count {
+                let deadline = monitor_start + Duration::from_millis(sample_interval_ms.saturating_mul(sample_index));
+                tokio::select! {
+                    () = tokio::time::sleep_until(deadline) => {
+                        let sink_cpu_ns = sum_process_thread_cpu_ns(&sink_runtime_thread_ids)?;
+                        let cpu = process_cpu_ns()?.context("process CPU accounting unavailable")?;
+                        let now = tokio::time::Instant::now();
+                        let rows = measurement.rows.load(Ordering::Relaxed);
+                        let elapsed = now.duration_since(previous_time).as_secs_f64();
+                        let process_cpu_delta = cpu.saturating_sub(previous_cpu);
+                        let sink_cpu_delta = sink_cpu_ns.saturating_sub(previous_sink_cpu_ns);
+                        let process_cpu_core_equivalents = process_cpu_delta as f64 / elapsed / 1e9;
+                        let sink_cpu_core_equivalents = sink_cpu_delta as f64 / elapsed / 1e9;
+                        let client_and_harness_cpu_core_equivalents =
+                            process_cpu_delta.saturating_sub(sink_cpu_delta) as f64 / elapsed / 1e9;
+                        let rss = process_rss_bytes()?;
+                        sampled_peak_rss = sampled_peak_rss.max(rss);
+                        let row_delta = rows.saturating_sub(previous_rows);
+                        eprintln!("L3_SUSTAINED_SAMPLE sample={sample_index} interval_ms={sample_interval_ms} elapsed_seconds={elapsed:.3} completed_rows={row_delta} completed_rows_per_second={:.3} completed_parents_estimate={:.3} process_cpu_core_equivalents={process_cpu_core_equivalents:.3} sink_cpu_core_equivalents={sink_cpu_core_equivalents:.3} client_and_harness_cpu_core_equivalents={client_and_harness_cpu_core_equivalents:.3} sampled_rss_bytes={rss} sampled_peak_rss_bytes={sampled_peak_rss}",
+                            row_delta as f64 / elapsed, row_delta as f64 / ROWS_PER_BATCH as f64);
+                        previous_time = now;
+                        previous_rows = rows;
+                        previous_cpu = cpu;
+                        previous_sink_cpu_ns = sink_cpu_ns;
+                    }
+                    joined = &mut run_task => {
+                        run_result = Some(joined_run_result(joined));
+                        break;
+                    }
+                }
+            }
+        }
+        if run_result.is_none() {
+            run_result = Some(joined_run_result(run_task.await));
+        }
+        let run_result = run_result.context("sustained client task produced no result")?;
+        if let Some((process_cpu_start_ns, sink_cpu_start_ns, cpu_window_started)) = cpu_attribution_start {
+            let sink_cpu_end_ns = sum_process_thread_cpu_ns(&sink_runtime_thread_ids)?;
+            let process_cpu_end_ns = process_cpu_ns()?.context("process CPU accounting unavailable")?;
+            let process_cpu_delta_ns = process_cpu_end_ns.saturating_sub(process_cpu_start_ns);
+            let sink_cpu_delta_ns = sink_cpu_end_ns.saturating_sub(sink_cpu_start_ns);
+            anyhow::ensure!(
+                sink_cpu_delta_ns <= process_cpu_delta_ns,
+                "sink thread CPU accounting exceeds process CPU accounting"
+            );
+            let client_and_harness_cpu_delta_ns = process_cpu_delta_ns - sink_cpu_delta_ns;
+            let elapsed_seconds = cpu_window_started.elapsed().as_secs_f64();
+            eprintln!(
+                "L3_CPU_ATTRIBUTION method=process_stat_minus_dedicated_sink_runtime_worker_schedstat scope=measurement_start_through_client_terminal_completion_including_ack_drain sink_runtime_os_threads={} elapsed_seconds={elapsed_seconds:.3} process_cpu_ns={process_cpu_delta_ns} sink_cpu_ns={sink_cpu_delta_ns} client_and_harness_cpu_ns={client_and_harness_cpu_delta_ns} process_core_equivalents={:.3} sink_core_equivalents={:.3} client_and_harness_core_equivalents={:.3}",
+                sink_runtime_thread_ids.len(),
+                process_cpu_delta_ns as f64 / elapsed_seconds / 1e9,
+                sink_cpu_delta_ns as f64 / elapsed_seconds / 1e9,
+                client_and_harness_cpu_delta_ns as f64 / elapsed_seconds / 1e9
+            );
+        } else {
+            anyhow::ensure!(
+                run_result.is_err(),
+                "successful run is missing attributable CPU samples"
+            );
+        }
+        let phase = if run_result.is_ok() { "completed" } else { "failed" };
+        let terminal_receipt = client.metrics(phase)?;
+        let terminal_manifest = &terminal_receipt["logical_batch_manifest"];
+        let terminal_manifest_bytes = serde_json::to_vec(terminal_manifest)?.len();
+        let terminal_line_bytes = oat_client_metrics_line_bytes(&terminal_receipt)?;
+        let terminal_path = write_evidence_json("PERF69_TERMINAL_RECEIPT_PATH", &terminal_receipt)?;
+        eprintln!(
+            "L3_SUSTAINED_TERMINAL phase={phase} manifest_bytes={terminal_manifest_bytes} manifest_cap_bytes={MAX_LOGICAL_MANIFEST_BYTES} terminal_line_bytes={terminal_line_bytes} terminal_line_cap_bytes={MAX_OAT_CLIENT_METRICS_LINE_BYTES} path={terminal_path}"
+        );
+        if let Err(error) = run_result {
+            server.stop_and_join()?;
+            return Err(error);
+        }
+        client.ensure_terminal_manifest_complete()?;
+        anyhow::ensure!(
+            terminal_manifest_bytes <= MAX_LOGICAL_MANIFEST_BYTES,
+            "real terminal manifest exceeds cap"
+        );
+        anyhow::ensure!(
+            terminal_line_bytes <= MAX_OAT_CLIENT_METRICS_LINE_BYTES,
+            "real terminal line exceeds cap"
+        );
+        anyhow::ensure!(
+            terminal_manifest["complete"] == true,
+            "real terminal manifest is incomplete"
+        );
+        anyhow::ensure!(
+            terminal_manifest["record_capacity_reached"] == false,
+            "real terminal manifest reached its record cap"
+        );
+        let (record_count, total_rows, physical_fragments, canonical_bytes, distinct_facts) =
+            validate_manifest_identity_ranges(terminal_manifest)?;
+        let measurement_start_unix_ms = terminal_receipt["measurement_window"]["start_unix_ms"]
+            .as_u64()
+            .context("missing measurement start timestamp")?;
+        let measurement_end_unix_ms = terminal_receipt["measurement_window"]["end_unix_ms"]
+            .as_u64()
+            .context("missing measurement end timestamp")?;
+        anyhow::ensure!(
+            measurement_start_unix_ms < measurement_end_unix_ms,
+            "measurement window has invalid bounds"
+        );
+        let (
+            offered_measurement_parents,
+            offered_measurement_rows,
+            admitted_measurement_parents,
+            admitted_measurement_rows,
+            late_measurement_parents,
+            warmup_sent_parents,
+            warmup_completed_parents,
+            acknowledged_parents,
+            retried_parents,
+            failed_parents,
+            ambiguous_parents,
+            measurement_acknowledged_parents,
+            measurement_acknowledged_rows,
+            measurement_acknowledged_bytes,
+            eligible_measurement_acknowledged_parents,
+            eligible_measurement_acknowledged_rows,
+            eligible_measurement_acknowledged_bytes,
+        ) = {
+            let records = client
+                .logical_batches
+                .lock()
+                .map_err(|_| anyhow::anyhow!("logical batch manifest state poisoned"))?;
+            let (
+                mut offered,
+                mut offered_rows,
+                mut admitted,
+                mut admitted_rows,
+                mut late,
+                mut warmup_sent,
+                mut warmup_completed,
+                mut acknowledged,
+                mut retried,
+                mut failed,
+                mut ambiguous,
+                mut measurement_acknowledged,
+                mut measurement_acknowledged_rows,
+                mut measurement_acknowledged_bytes,
+                mut eligible_measurement_acknowledged,
+                mut eligible_measurement_acknowledged_rows,
+                mut eligible_measurement_acknowledged_bytes,
+            ) = (
+                0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64,
+                0_u64, 0_u64, 0_u64,
+            );
+            for record in records.iter() {
+                if record.cohort == ManifestCohort::Warmup {
+                    warmup_sent += 1;
+                }
+                if record.first_admitted_cohort == Some(ManifestCohort::Warmup) {
+                    warmup_completed += 1;
+                }
+                if record.first_admitted_cohort == Some(ManifestCohort::Measurement) {
+                    admitted += 1;
+                    admitted_rows = admitted_rows
+                        .checked_add(u64::from(record.row_count))
+                        .context("admitted measurement row count overflow")?;
+                }
+                if record.cohort == ManifestCohort::Measurement {
+                    offered += 1;
+                    offered_rows = offered_rows
+                        .checked_add(u64::from(record.row_count))
+                        .context("offered row count overflow")?;
+                    if record.first_admitted_cohort == Some(ManifestCohort::PostWindow) {
+                        late += 1;
+                    }
+                }
+                if record.cohort == ManifestCohort::Measurement && record.outcome == ManifestOutcome::Acknowledged {
+                    measurement_acknowledged += 1;
+                    measurement_acknowledged_rows = measurement_acknowledged_rows
+                        .checked_add(u64::from(record.row_count))
+                        .context("measurement-send acknowledgment row count overflow")?;
+                    measurement_acknowledged_bytes = measurement_acknowledged_bytes
+                        .checked_add(
+                            record
+                                .canonical_logical_bytes
+                                .context("missing acknowledged canonical bytes")?,
+                        )
+                        .context("measurement-send acknowledgment byte count overflow")?;
+                    if eligible_measurement_send_ack(
+                        record.cohort,
+                        record.outcome,
+                        record.first_admitted_unix_ms,
+                        measurement_start_unix_ms,
+                        measurement_end_unix_ms,
+                    ) {
+                        eligible_measurement_acknowledged += 1;
+                        eligible_measurement_acknowledged_rows = eligible_measurement_acknowledged_rows
+                            .checked_add(u64::from(record.row_count))
+                            .context("eligible measurement acknowledgment row count overflow")?;
+                        eligible_measurement_acknowledged_bytes = eligible_measurement_acknowledged_bytes
+                            .checked_add(
+                                record
+                                    .canonical_logical_bytes
+                                    .context("missing eligible acknowledged canonical bytes")?,
+                            )
+                            .context("eligible measurement acknowledgment byte count overflow")?;
+                    }
+                }
+                if record.outcome == ManifestOutcome::Acknowledged {
+                    acknowledged += 1;
+                }
+                if record.attempts > 1 {
+                    retried += u64::from(record.attempts - 1);
+                }
+                if matches!(record.outcome, ManifestOutcome::NotAdmitted | ManifestOutcome::Failed) {
+                    failed += 1;
+                }
+                if record.outcome == ManifestOutcome::Ambiguous {
+                    ambiguous += 1;
+                }
+                anyhow::ensure!(
+                    record.attempts == 1,
+                    "qualification run contains a non-single-attempt parent"
+                );
+                anyhow::ensure!(
+                    record.outcome == ManifestOutcome::Acknowledged,
+                    "qualification run contains a failed or ambiguous logical parent"
+                );
+            }
+            (
+                offered,
+                offered_rows,
+                admitted,
+                admitted_rows,
+                late,
+                warmup_sent,
+                warmup_completed,
+                acknowledged,
+                retried,
+                failed,
+                ambiguous,
+                measurement_acknowledged,
+                measurement_acknowledged_rows,
+                measurement_acknowledged_bytes,
+                eligible_measurement_acknowledged,
+                eligible_measurement_acknowledged_rows,
+                eligible_measurement_acknowledged_bytes,
+            )
+        };
+        let window = &terminal_receipt["measurement_window"];
+        let completed_rows = window["completed_rows"].as_u64().context("missing completed rows")?;
+        let rejected_rows = window["rejected_rows"].as_u64().context("missing rejected rows")?;
+        let retried_rows = window["retried_rows"].as_u64().context("missing retried rows")?;
+        let given_up_rows = window["given_up_rows"].as_u64().context("missing given-up rows")?;
+        let ambiguous_rows = window["ambiguous_rows"].as_u64().context("missing ambiguous rows")?;
+        anyhow::ensure!(
+            admitted_measurement_rows == completed_rows,
+            "manifest admitted rows differ from measurement completion rows"
+        );
+        anyhow::ensure!(
+            record_count == acknowledged_parents,
+            "manifest parent count differs from acknowledgments"
+        );
+        anyhow::ensure!(
+            rejected_rows == 0
+                && retried_rows == 0
+                && given_up_rows == 0
+                && ambiguous_rows == 0
+                && retried_parents == 0
+                && failed_parents == 0
+                && ambiguous_parents == 0,
+            "single-attempt qualification observed loss/retry/ambiguity: rejected={rejected_rows}, retried={retried_rows}, given_up={given_up_rows}, ambiguous={ambiguous_rows}"
+        );
+        anyhow::ensure!(
+            distinct_facts > 1,
+            "real sustained run produced only one distinct batch fact"
+        );
+        anyhow::ensure!(
+            physical_fragments > record_count,
+            "wide profile did not exercise physical Flight fragmentation"
+        );
+        let target_met = eligible_measurement_acknowledged_rows >= measurement_target_rows;
+        let completion_observed_rows_per_second = completed_rows as f64 / (measurement_ms as f64 / 1_000.0);
+        let measurement_send_acknowledged_rows_per_second =
+            measurement_acknowledged_rows as f64 / (measurement_ms as f64 / 1_000.0);
+        let eligible_measurement_send_ack_rows_per_second =
+            eligible_measurement_acknowledged_rows as f64 / (measurement_ms as f64 / 1_000.0);
+        eprintln!(
+            "L3_REAL_SUSTAINED_SINK scope=local_in_memory_flight_not_delta_or_kusto table=sqlserver_availability_replica_states profile=realistic string_width=789 string_lengths=uniform value_variation=per_row guid_uniqueness=per_row rows_per_parent={ROWS_PER_BATCH} corpus_batches={CORPUS_BATCHES} workers={WORKERS} streams_per_worker={STREAMS_PER_WORKER} runtime_threads=16 max_memory_bytes={MAX_MEMORY_BYTES} flight_data_limit_bytes={FLIGHT_DATA_LIMIT_BYTES} client_message_limit_bytes={CLIENT_MESSAGE_LIMIT_BYTES} ipc_compression=None retry_max_attempts=1 warmup_ms={warmup_ms} warmup_sent_parents={warmup_sent_parents} warmup_completed_parents={warmup_completed_parents} measurement_ms={measurement_ms} target_rows_per_second={TARGET_ROWS_PER_SECOND} target_parents={target_measurement_parents} offered_measurement_parents={offered_measurement_parents} offered_measurement_rows={offered_measurement_rows} admitted_measurement_parents={admitted_measurement_parents} admitted_measurement_rows={admitted_measurement_rows} late_measurement_parents={late_measurement_parents} completion_observed_rows={completed_rows} completion_observed_rows_per_second={completion_observed_rows_per_second:.3} measurement_send_acknowledged_parents={measurement_acknowledged_parents} measurement_send_acknowledged_rows={measurement_acknowledged_rows} measurement_send_acknowledged_canonical_bytes={measurement_acknowledged_bytes} measurement_send_acknowledged_rows_per_second={measurement_send_acknowledged_rows_per_second:.3} target_met={target_met} all_parents={record_count} acknowledged_parents={acknowledged_parents} failed_parents={failed_parents} retried_parents={retried_parents} ambiguous_parents={ambiguous_parents} rejected_rows={rejected_rows} retried_rows={retried_rows} given_up_rows={given_up_rows} ambiguous_rows={ambiguous_rows} total_rows={total_rows} decoded_physical_fragments={physical_fragments} distinct_facts={distinct_facts} canonical_logical_bytes={canonical_bytes} manifest_bytes={terminal_manifest_bytes} terminal_line_bytes={terminal_line_bytes}"
+        );
+        eprintln!(
+            "L3_ELIGIBLE_SEND_ACK measurement_start_unix_ms={measurement_start_unix_ms} measurement_end_unix_ms={measurement_end_unix_ms} measurement_window_semantics=[start,end) eligible_parents={eligible_measurement_acknowledged_parents} eligible_rows={eligible_measurement_acknowledged_rows} eligible_canonical_bytes={eligible_measurement_acknowledged_bytes} eligible_rows_per_second={eligible_measurement_send_ack_rows_per_second:.3} measurement_send_cohort_ack_drain_parents={measurement_acknowledged_parents} post_window_acknowledged_parents={} target_met={target_met}",
+            measurement_acknowledged_parents - eligible_measurement_acknowledged_parents
+        );
+        for (minute, windows) in window["windows"]
+            .as_array()
+            .context("missing 30-second measurement windows")?
+            .chunks(2)
+            .enumerate()
+        {
+            let rows = windows.iter().try_fold(0_u64, |sum, item| {
+                sum.checked_add(item["completed_rows"].as_u64().context("missing pilot rows")?)
+                    .context("minute row count overflow")
+            })?;
+            let seconds = windows.iter().try_fold(0_u64, |sum, item| {
+                let start = item["start_unix_ms"].as_u64().context("missing pilot start")?;
+                let end = item["end_unix_ms"].as_u64().context("missing pilot end")?;
+                sum.checked_add(end.saturating_sub(start) / 1_000)
+                    .context("minute duration overflow")
+            })?;
+            eprintln!(
+                "L3_SUSTAINED_FINAL_MINUTE minute={} duration_seconds={seconds} completed_rows={rows} completed_parents={:.3} rows_per_second={:.3}",
+                minute + 1,
+                rows as f64 / ROWS_PER_BATCH as f64,
+                rows as f64 / seconds.max(1) as f64
+            );
+        }
+        let timings = HOT_PATH_TIMINGS.get().context("missing hot-path timing state")?;
+        eprintln!(
+            "L3_HOTPATH_TIMING semantics=sum_wall_time_across_concurrent_calls_including_warmup_and_measurement identity_replacement={} ipc_encoding={} canonical_accounting={} transport_and_ack={}",
+            serde_json::to_string(&timings.identity_replacement.snapshot())?,
+            serde_json::to_string(&timings.ipc_encoding.snapshot())?,
+            serde_json::to_string(&timings.canonical_accounting.snapshot())?,
+            serde_json::to_string(&timings.transport_and_ack.snapshot())?
+        );
+        server.stop_and_join()?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn realistic_fragment_accounting_uses_decoded_physical_batches() -> Result<()> {
         let mut options = Cli::try_parse_from([
