@@ -808,6 +808,36 @@ struct Measurement {
     ambiguous_rows: AtomicU64,
 }
 
+#[cfg(test)]
+#[derive(Default)]
+struct HotPathStage {
+    calls: AtomicU64,
+    elapsed_ns: AtomicU64,
+}
+#[cfg(test)]
+impl HotPathStage {
+    fn record(&self, elapsed: std::time::Duration) {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.elapsed_ns
+            .fetch_add(u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX), Ordering::Relaxed);
+    }
+    fn snapshot(&self) -> serde_json::Value {
+        let calls = self.calls.load(Ordering::Relaxed);
+        let elapsed_ns = self.elapsed_ns.load(Ordering::Relaxed);
+        serde_json::json!({"calls": calls, "aggregate_elapsed_ns": elapsed_ns, "mean_elapsed_us": (calls > 0).then_some(elapsed_ns as f64 / calls as f64 / 1_000.0)})
+    }
+}
+#[cfg(test)]
+#[derive(Default)]
+struct HotPathTimings {
+    identity_replacement: HotPathStage,
+    ipc_encoding: HotPathStage,
+    canonical_accounting: HotPathStage,
+    transport_and_ack: HotPathStage,
+}
+#[cfg(test)]
+static HOT_PATH_TIMINGS: std::sync::OnceLock<HotPathTimings> = std::sync::OnceLock::new();
+
 fn latency_percentiles(latency: &[u64; 64]) -> serde_json::Value {
     let count = latency.iter().sum::<u64>();
     let percentile = |numerator: u64| {
@@ -1685,11 +1715,29 @@ impl PreparedClient {
             worker,
             base36(sequence)
         );
+        #[cfg(test)]
+        let identity_started = Instant::now();
         let batch =
             batch_with_logical_identity(&template.template, self.run_id, self.incarnation_id, worker, sequence)?;
+        #[cfg(test)]
+        if let Some(timings) = HOT_PATH_TIMINGS.get() {
+            timings.identity_replacement.record(identity_started.elapsed());
+        }
+        #[cfg(test)]
+        let encoding_started = Instant::now();
         let (data, raw_arrow_bytes, encoded_bytes) =
             encode_with_sizes(&template.table, &template.version, batch.clone(), &self.options).await?;
+        #[cfg(test)]
+        if let Some(timings) = HOT_PATH_TIMINGS.get() {
+            timings.ipc_encoding.record(encoding_started.elapsed());
+        }
+        #[cfg(test)]
+        let accounting_started = Instant::now();
         let accounting = canonical_publication_accounting(&data, template.rows).await?;
+        #[cfg(test)]
+        if let Some(timings) = HOT_PATH_TIMINGS.get() {
+            timings.canonical_accounting.record(accounting_started.elapsed());
+        }
         anyhow::ensure!(
             data.iter()
                 .all(|message| message.encoded_len() <= self.options.max_message_bytes),
@@ -1988,6 +2036,8 @@ impl PreparedClient {
         let observation = SendObservation::fresh()?;
         let mut request = Request::new(stream::iter(data));
         let timeout = Duration::from_millis(self.options.request_timeout_ms);
+        #[cfg(test)]
+        let transport_started = Instant::now();
         let result = tokio::time::timeout(timeout, async {
             request_metadata(
                 &mut request,
@@ -2006,6 +2056,10 @@ impl PreparedClient {
         .await
         .context("DMV upload timeout")
         .and_then(std::convert::identity);
+        #[cfg(test)]
+        if let Some(timings) = HOT_PATH_TIMINGS.get() {
+            timings.transport_and_ack.record(transport_started.elapsed());
+        }
         let outcome = match &result {
             Ok(_) => ManifestOutcome::Acknowledged,
             Err(error) if is_not_admitted(error) => ManifestOutcome::NotAdmitted,
@@ -5739,8 +5793,46 @@ mod tests {
         const STREAMS_PER_WORKER: usize = 2;
         const ROWS_PER_BATCH: usize = 65_536;
         const CORPUS_BATCHES: usize = 16;
-        const WARMUP_MS: u64 = 60_000;
-        const MEASUREMENT_MS: u64 = 600_000;
+        const DEFAULT_WARMUP_MS: u64 = 60_000;
+        const DEFAULT_MEASUREMENT_MS: u64 = 600_000;
+        fn perf69_env_u64(name: &str, default: u64) -> Result<u64> {
+            match std::env::var(name) {
+                Ok(value) => value
+                    .parse()
+                    .map_err(|error| anyhow::anyhow!("{name} must be an unsigned integer: {error}")),
+                Err(std::env::VarError::NotPresent) => Ok(default),
+                Err(error) => Err(anyhow::anyhow!("{name} must be valid Unicode: {error}")),
+            }
+        }
+        fn perf69_env_u32(name: &str, default: u32) -> Result<u32> {
+            match std::env::var(name) {
+                Ok(value) => value
+                    .parse()
+                    .map_err(|error| anyhow::anyhow!("{name} must be a u32: {error}")),
+                Err(std::env::VarError::NotPresent) => Ok(default),
+                Err(error) => Err(anyhow::anyhow!("{name} must be valid Unicode: {error}")),
+            }
+        }
+        let warmup_ms = perf69_env_u64("PERF69_WARMUP_MS", DEFAULT_WARMUP_MS)?;
+        let measurement_ms = perf69_env_u64("PERF69_MEASUREMENT_MS", DEFAULT_MEASUREMENT_MS)?;
+        let sample_interval_ms = perf69_env_u64("PERF69_SAMPLE_INTERVAL_MS", 60_000)?;
+        let server_stream_window_bytes = perf69_env_u32("PERF69_SERVER_STREAM_WINDOW_BYTES", 65_535)?;
+        let server_connection_window_bytes = perf69_env_u32("PERF69_SERVER_CONNECTION_WINDOW_BYTES", 65_535)?;
+        anyhow::ensure!(
+            warmup_ms > 0 && measurement_ms > 0 && sample_interval_ms > 0,
+            "diagnostic durations must be positive"
+        );
+        anyhow::ensure!(
+            server_stream_window_bytes > 0 && server_stream_window_bytes <= i32::MAX as u32,
+            "server stream window must be 1..=2147483647 bytes"
+        );
+        anyhow::ensure!(
+            server_connection_window_bytes > 0 && server_connection_window_bytes <= i32::MAX as u32,
+            "server connection window must be 1..=2147483647 bytes"
+        );
+        HOT_PATH_TIMINGS
+            .set(HotPathTimings::default())
+            .map_err(|_| anyhow::anyhow!("hot-path timing state was already initialized"))?;
         const TARGET_ROWS_PER_SECOND: u64 = 805_000;
         const MAX_MEMORY_BYTES: u64 = 32 * 1024 * 1024 * 1024;
         const FLIGHT_DATA_LIMIT_BYTES: usize = 64 * 1024 * 1024;
@@ -5774,6 +5866,8 @@ mod tests {
         let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
             tonic::transport::Server::builder()
+                .initial_stream_window_size(server_stream_window_bytes)
+                .initial_connection_window_size(server_connection_window_bytes)
                 .add_service(service)
                 .serve_with_incoming_shutdown(incoming, async {
                     let _ = shutdown_rx.await;
@@ -5823,7 +5917,9 @@ mod tests {
             "prepared corpus should contain the configured full-batch variation"
         );
         eprintln!(
-            "L3_SUSTAINED_PROFILE options={} preparation={}",
+            "L3_SUSTAINED_PROFILE server_receive_stream_window_bytes={server_stream_window_bytes} server_receive_connection_window_bytes={server_connection_window_bytes} client_receive_stream_window_bytes={} client_receive_connection_window_bytes={} options={} preparation={}",
+            client.options.stream_window_bytes,
+            client.options.connection_window_bytes,
             serde_json::to_string(&client.options)?,
             serde_json::to_string(&client.preparation)?
         );
@@ -5861,11 +5957,11 @@ mod tests {
         );
 
         let measurement_target_rows = TARGET_ROWS_PER_SECOND
-            .checked_mul(MEASUREMENT_MS / 1_000)
+            .checked_mul(measurement_ms / 1_000)
             .context("target measurement row count overflow")?;
         let target_measurement_parents = measurement_target_rows.div_ceil(ROWS_PER_BATCH as u64);
         let warmup_target_rows = TARGET_ROWS_PER_SECOND
-            .checked_mul(WARMUP_MS / 1_000)
+            .checked_mul(warmup_ms / 1_000)
             .context("target warmup row count overflow")?;
         let target_warmup_parents = warmup_target_rows.div_ceil(ROWS_PER_BATCH as u64);
         let target_total_parents = target_measurement_parents
@@ -5884,24 +5980,24 @@ mod tests {
         projection.worker_next = vec![AtomicU64::new(0)];
         projection.worker_batch_sequence = vec![AtomicU64::new(0)];
         let projection_start = 1_000_000_u64;
-        let projection_end = projection_start + MEASUREMENT_MS;
+        let projection_end = projection_start + measurement_ms;
         let projection_measurement = Arc::new(Measurement::new(projection_start, projection_end, 1)?);
         *projection
             .measurement
             .lock()
             .map_err(|_| anyhow::anyhow!("measurement state poisoned"))? = Some(Arc::clone(&projection_measurement));
-        let warmup_start = projection_start - WARMUP_MS;
+        let warmup_start = projection_start - warmup_ms;
         for sequence in 0..target_total_parents {
             let warmup = sequence < target_warmup_parents;
             let (send_ms, fact_index) = if warmup {
                 (
-                    warmup_start + sequence * WARMUP_MS / target_warmup_parents,
+                    warmup_start + sequence * warmup_ms / target_warmup_parents,
                     usize::try_from(sequence).context("warmup fact index exceeds address space")?,
                 )
             } else {
                 let measurement_sequence = sequence - target_warmup_parents;
                 (
-                    projection_start + measurement_sequence * MEASUREMENT_MS / target_measurement_parents,
+                    projection_start + measurement_sequence * measurement_ms / target_measurement_parents,
                     usize::try_from(measurement_sequence).context("measurement fact index exceeds address space")?,
                 )
             };
@@ -5958,7 +6054,7 @@ mod tests {
         let projection_line_bytes = oat_client_metrics_line_bytes(&target_projection)?;
         let projection_path = write_evidence_json("PERF69_TARGET_VOLUME_MANIFEST_PATH", &target_projection)?;
         eprintln!(
-            "L3_TARGET_VOLUME_PROJECTION scope=prepared_corpus_fact_projection_not_sent target_rows_per_second={TARGET_ROWS_PER_SECOND} measurement_ms={MEASUREMENT_MS} warmup_ms={WARMUP_MS} warmup_parents={target_warmup_parents} measurement_parents={target_measurement_parents} total_parents={projection_parents} rows={projection_rows} physical_fragments={projection_fragments} canonical_bytes={projection_bytes} distinct_template_facts={} distinct_manifest_facts={projection_facts} manifest_bytes={projection_manifest_bytes} terminal_line_bytes={projection_line_bytes} cap_bytes={MAX_OAT_CLIENT_METRICS_LINE_BYTES} path={projection_path}",
+            "L3_TARGET_VOLUME_PROJECTION scope=prepared_corpus_fact_projection_not_sent target_rows_per_second={TARGET_ROWS_PER_SECOND} measurement_ms={measurement_ms} warmup_ms={warmup_ms} warmup_parents={target_warmup_parents} measurement_parents={target_measurement_parents} total_parents={projection_parents} rows={projection_rows} physical_fragments={projection_fragments} canonical_bytes={projection_bytes} distinct_template_facts={} distinct_manifest_facts={projection_facts} manifest_bytes={projection_manifest_bytes} terminal_line_bytes={projection_line_bytes} cap_bytes={MAX_OAT_CLIENT_METRICS_LINE_BYTES} path={projection_path}",
             distinct_template_facts.len()
         );
         anyhow::ensure!(
@@ -5981,13 +6077,13 @@ mod tests {
 
         let scheduled_start = unix_ms()?.checked_add(1_000).context("scheduled start overflow")?;
         let measurement_start = scheduled_start
-            .checked_add(WARMUP_MS)
+            .checked_add(warmup_ms)
             .context("measurement start overflow")?;
         let measurement_end = measurement_start
-            .checked_add(MEASUREMENT_MS)
+            .checked_add(measurement_ms)
             .context("measurement end overflow")?;
         eprintln!(
-            "L3_SUSTAINED_SCHEDULE scheduled_start_unix_ms={scheduled_start} warmup_ms={WARMUP_MS} measurement_start_unix_ms={measurement_start} measurement_end_unix_ms={measurement_end} measurement_ms={MEASUREMENT_MS} target_rows_per_second={TARGET_ROWS_PER_SECOND} target_parents={target_measurement_parents}"
+            "L3_SUSTAINED_SCHEDULE scheduled_start_unix_ms={scheduled_start} warmup_ms={warmup_ms} measurement_start_unix_ms={measurement_start} measurement_end_unix_ms={measurement_end} measurement_ms={measurement_ms} target_rows_per_second={TARGET_ROWS_PER_SECOND} target_parents={target_measurement_parents}"
         );
         let run_client = Arc::clone(&client);
         let mut run_task = tokio::spawn(async move {
@@ -6019,8 +6115,9 @@ mod tests {
             let mut previous_rows = measurement.rows.load(Ordering::Relaxed);
             let mut previous_cpu = process_cpu_ns()?;
             let mut sampled_peak_rss = process_rss_bytes()?;
-            for minute in 1..=10_u64 {
-                let deadline = monitor_start + Duration::from_secs(minute * 60);
+            let sample_count = measurement_ms.div_ceil(sample_interval_ms).saturating_add(2);
+            for sample_index in 1..=sample_count {
+                let deadline = monitor_start + Duration::from_millis(sample_interval_ms.saturating_mul(sample_index));
                 tokio::select! {
                     () = tokio::time::sleep_until(deadline) => {
                         let now = tokio::time::Instant::now();
@@ -6032,7 +6129,7 @@ mod tests {
                         let rss = process_rss_bytes()?;
                         sampled_peak_rss = sampled_peak_rss.max(rss);
                         let row_delta = rows.saturating_sub(previous_rows);
-                        eprintln!("L3_SUSTAINED_MINUTE minute={minute} elapsed_seconds={elapsed:.3} completed_rows={row_delta} completed_rows_per_second={:.3} completed_parents_estimate={:.3} process_cpu_core_equivalents={cpu_core_equivalents:?} sampled_rss_bytes={rss} sampled_peak_rss_bytes={sampled_peak_rss}",
+                        eprintln!("L3_SUSTAINED_SAMPLE sample={sample_index} interval_ms={sample_interval_ms} elapsed_seconds={elapsed:.3} completed_rows={row_delta} completed_rows_per_second={:.3} completed_parents_estimate={:.3} process_cpu_core_equivalents={cpu_core_equivalents:?} sampled_rss_bytes={rss} sampled_peak_rss_bytes={sampled_peak_rss}",
                             row_delta as f64 / elapsed, row_delta as f64 / ROWS_PER_BATCH as f64);
                         previous_time = now;
                         previous_rows = rows;
@@ -6096,6 +6193,9 @@ mod tests {
             retried_parents,
             failed_parents,
             ambiguous_parents,
+            measurement_acknowledged_parents,
+            measurement_acknowledged_rows,
+            measurement_acknowledged_bytes,
         ) = {
             let records = client
                 .logical_batches
@@ -6113,8 +6213,11 @@ mod tests {
                 mut retried,
                 mut failed,
                 mut ambiguous,
+                mut measurement_acknowledged,
+                mut measurement_acknowledged_rows,
+                mut measurement_acknowledged_bytes,
             ) = (
-                0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64,
+                0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64,
             );
             for record in records.iter() {
                 if record.cohort == ManifestCohort::Warmup {
@@ -6137,6 +6240,19 @@ mod tests {
                     if record.first_admitted_cohort == Some(ManifestCohort::PostWindow) {
                         late += 1;
                     }
+                }
+                if record.cohort == ManifestCohort::Measurement && record.outcome == ManifestOutcome::Acknowledged {
+                    measurement_acknowledged += 1;
+                    measurement_acknowledged_rows = measurement_acknowledged_rows
+                        .checked_add(u64::from(record.row_count))
+                        .context("measurement-send acknowledgment row count overflow")?;
+                    measurement_acknowledged_bytes = measurement_acknowledged_bytes
+                        .checked_add(
+                            record
+                                .canonical_logical_bytes
+                                .context("missing acknowledged canonical bytes")?,
+                        )
+                        .context("measurement-send acknowledgment byte count overflow")?;
                 }
                 if record.outcome == ManifestOutcome::Acknowledged {
                     acknowledged += 1;
@@ -6171,6 +6287,9 @@ mod tests {
                 retried,
                 failed,
                 ambiguous,
+                measurement_acknowledged,
+                measurement_acknowledged_rows,
+                measurement_acknowledged_bytes,
             )
         };
         let window = &terminal_receipt["measurement_window"];
@@ -6205,10 +6324,12 @@ mod tests {
             physical_fragments > record_count,
             "wide profile did not exercise physical Flight fragmentation"
         );
-        let target_met = completed_rows >= measurement_target_rows;
+        let target_met = measurement_acknowledged_rows >= measurement_target_rows;
+        let completion_observed_rows_per_second = completed_rows as f64 / (measurement_ms as f64 / 1_000.0);
+        let measurement_send_acknowledged_rows_per_second =
+            measurement_acknowledged_rows as f64 / (measurement_ms as f64 / 1_000.0);
         eprintln!(
-            "L3_REAL_SUSTAINED_SINK scope=local_in_memory_flight_not_delta_or_kusto table=sqlserver_availability_replica_states profile=realistic string_width=789 string_lengths=uniform value_variation=per_row guid_uniqueness=per_row rows_per_parent={ROWS_PER_BATCH} corpus_batches={CORPUS_BATCHES} workers={WORKERS} streams_per_worker={STREAMS_PER_WORKER} runtime_threads=16 max_memory_bytes={MAX_MEMORY_BYTES} flight_data_limit_bytes={FLIGHT_DATA_LIMIT_BYTES} client_message_limit_bytes={CLIENT_MESSAGE_LIMIT_BYTES} ipc_compression=None retry_max_attempts=1 warmup_ms={WARMUP_MS} warmup_sent_parents={warmup_sent_parents} warmup_completed_parents={warmup_completed_parents} measurement_ms={MEASUREMENT_MS} target_rows_per_second={TARGET_ROWS_PER_SECOND} target_parents={target_measurement_parents} offered_measurement_parents={offered_measurement_parents} offered_measurement_rows={offered_measurement_rows} admitted_measurement_parents={admitted_measurement_parents} admitted_measurement_rows={admitted_measurement_rows} late_measurement_parents={late_measurement_parents} completed_rows={completed_rows} achieved_rows_per_second={:.3} target_met={target_met} all_parents={record_count} acknowledged_parents={acknowledged_parents} failed_parents={failed_parents} retried_parents={retried_parents} ambiguous_parents={ambiguous_parents} rejected_rows={rejected_rows} retried_rows={retried_rows} given_up_rows={given_up_rows} ambiguous_rows={ambiguous_rows} total_rows={total_rows} decoded_physical_fragments={physical_fragments} distinct_facts={distinct_facts} canonical_logical_bytes={canonical_bytes} manifest_bytes={terminal_manifest_bytes} terminal_line_bytes={terminal_line_bytes}",
-            completed_rows as f64 / (MEASUREMENT_MS as f64 / 1_000.0)
+            "L3_REAL_SUSTAINED_SINK scope=local_in_memory_flight_not_delta_or_kusto table=sqlserver_availability_replica_states profile=realistic string_width=789 string_lengths=uniform value_variation=per_row guid_uniqueness=per_row rows_per_parent={ROWS_PER_BATCH} corpus_batches={CORPUS_BATCHES} workers={WORKERS} streams_per_worker={STREAMS_PER_WORKER} runtime_threads=16 max_memory_bytes={MAX_MEMORY_BYTES} flight_data_limit_bytes={FLIGHT_DATA_LIMIT_BYTES} client_message_limit_bytes={CLIENT_MESSAGE_LIMIT_BYTES} ipc_compression=None retry_max_attempts=1 warmup_ms={warmup_ms} warmup_sent_parents={warmup_sent_parents} warmup_completed_parents={warmup_completed_parents} measurement_ms={measurement_ms} target_rows_per_second={TARGET_ROWS_PER_SECOND} target_parents={target_measurement_parents} offered_measurement_parents={offered_measurement_parents} offered_measurement_rows={offered_measurement_rows} admitted_measurement_parents={admitted_measurement_parents} admitted_measurement_rows={admitted_measurement_rows} late_measurement_parents={late_measurement_parents} completion_observed_rows={completed_rows} completion_observed_rows_per_second={completion_observed_rows_per_second:.3} measurement_send_acknowledged_parents={measurement_acknowledged_parents} measurement_send_acknowledged_rows={measurement_acknowledged_rows} measurement_send_acknowledged_canonical_bytes={measurement_acknowledged_bytes} measurement_send_acknowledged_rows_per_second={measurement_send_acknowledged_rows_per_second:.3} target_met={target_met} all_parents={record_count} acknowledged_parents={acknowledged_parents} failed_parents={failed_parents} retried_parents={retried_parents} ambiguous_parents={ambiguous_parents} rejected_rows={rejected_rows} retried_rows={retried_rows} given_up_rows={given_up_rows} ambiguous_rows={ambiguous_rows} total_rows={total_rows} decoded_physical_fragments={physical_fragments} distinct_facts={distinct_facts} canonical_logical_bytes={canonical_bytes} manifest_bytes={terminal_manifest_bytes} terminal_line_bytes={terminal_line_bytes}"
         );
         for (minute, windows) in window["windows"]
             .as_array()
@@ -6233,6 +6354,14 @@ mod tests {
                 rows as f64 / seconds.max(1) as f64
             );
         }
+        let timings = HOT_PATH_TIMINGS.get().context("missing hot-path timing state")?;
+        eprintln!(
+            "L3_HOTPATH_TIMING semantics=sum_wall_time_across_concurrent_calls_including_warmup_and_measurement identity_replacement={} ipc_encoding={} canonical_accounting={} transport_and_ack={}",
+            serde_json::to_string(&timings.identity_replacement.snapshot())?,
+            serde_json::to_string(&timings.ipc_encoding.snapshot())?,
+            serde_json::to_string(&timings.canonical_accounting.snapshot())?,
+            serde_json::to_string(&timings.transport_and_ack.snapshot())?
+        );
         shutdown
             .send(())
             .map_err(|()| anyhow::anyhow!("null sink stopped early"))?;
