@@ -354,6 +354,7 @@ pub struct CommitTunables {
     pub batch_window: Option<String>,
     pub max_files_per_commit: Option<usize>,
     pub max_pending_files: Option<usize>,
+    pub file_encode_concurrency: Option<usize>,
     pub publication_lookup_mode: Option<arrow_deltalake::commit::PublicationLookupMode>,
     pub remote_snapshot_reuse: Option<bool>,
     pub remote_snapshot_max_metadata_objects: Option<usize>,

@@ -38,6 +38,7 @@ pub struct CommitOptions {
     pub batch_window: Duration,
     pub max_files_per_commit: usize,
     pub max_pending_files: usize,
+    pub file_encode_concurrency: usize,
     pub publication_lookup_mode: PublicationLookupMode,
     pub remote_snapshot_reuse: bool,
     pub remote_snapshot_max_metadata_objects: usize,
@@ -49,6 +50,7 @@ impl Default for CommitOptions {
             batch_window: Duration::from_secs(10),
             max_files_per_commit: 64,
             max_pending_files: 256,
+            file_encode_concurrency: 1,
             publication_lookup_mode: PublicationLookupMode::default(),
             remote_snapshot_reuse: false,
             remote_snapshot_max_metadata_objects: MAX_REMOTE_SNAPSHOT_METADATA_OBJECTS,
@@ -62,6 +64,10 @@ impl CommitOptions {
     /// # Errors
     /// Rejects zero, inconsistent, or unrepresentable capacities/windows.
     pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            (1..=256).contains(&self.file_encode_concurrency),
+            "file_encode_concurrency must be between 1 and 256"
+        );
         if !(1..=MAX_REMOTE_SNAPSHOT_METADATA_OBJECTS).contains(&self.remote_snapshot_max_metadata_objects) {
             bail!("remote_snapshot_max_metadata_objects must be between 1 and {MAX_REMOTE_SNAPSHOT_METADATA_OBJECTS}");
         }
@@ -581,38 +587,35 @@ impl BatchedTable {
     ) -> Result<PreparedPublicationGroup> {
         let table = Arc::clone(self.preparation.get().context("Delta owner is not initialized")?);
         let max_files = self.options.max_files_per_commit;
-        crate::delta_io::run_cpu_async(move || {
-            let executor = crate::delta_io::shared_executor()?;
-            let _guard = executor.enter();
-            // Kernel's synchronous snapshot reads use futures::block_on themselves.
-            tokio::runtime::Handle::current().block_on(async move {
-                table
-                    .stage_coalesced_publications(entries, max_files)
-                    .await
-                    .map(
-                        |(
+        let concurrency = self.options.file_encode_concurrency;
+        crate::delta_io::spawn_shared_io(async move {
+            table
+                .stage_coalesced_publications(entries, max_files, concurrency)
+                .await
+                .map(
+                    |(
+                        appends,
+                        identities,
+                        committed_identities,
+                        source_mappings,
+                        preparation_build,
+                        preparation_sort,
+                    )| {
+                        PreparedPublicationGroup {
                             appends,
                             identities,
                             committed_identities,
                             source_mappings,
                             preparation_build,
                             preparation_sort,
-                        )| {
-                            PreparedPublicationGroup {
-                                appends,
-                                identities,
-                                committed_identities,
-                                source_mappings,
-                                preparation_build,
-                                preparation_sort,
-                            }
-                        },
-                    )
-                    .map_err(CommitReceiptError::from_anyhow)
-                    .map_err(anyhow::Error::new)
-            })
-        })
-        .await?
+                        }
+                    },
+                )
+                .map_err(CommitReceiptError::from_anyhow)
+                .map_err(anyhow::Error::new)
+        })?
+        .await
+        .context("coalesced staging owner failed")?
     }
 
     /// Admit one eligible durable file, waiting asynchronously when capacity is full.

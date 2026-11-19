@@ -1048,6 +1048,8 @@ pub struct CommitConfig {
     pub max_files_per_commit: usize,
     /// Maximum queued and committing files per table.
     pub max_pending_files: usize,
+    /// Concurrent file preparations/encodes/uploads within one atomic group.
+    pub file_encode_concurrency: usize,
     /// Transaction lookup implementation; scalar by default, batched for explicit comparison.
     #[serde(default)]
     pub publication_lookup_mode: arrow_deltalake::commit::PublicationLookupMode,
@@ -1064,6 +1066,7 @@ impl Default for CommitConfig {
             batch_window: options.batch_window,
             max_files_per_commit: options.max_files_per_commit,
             max_pending_files: options.max_pending_files,
+            file_encode_concurrency: options.file_encode_concurrency,
             publication_lookup_mode: options.publication_lookup_mode,
             remote_snapshot_reuse: options.remote_snapshot_reuse,
             remote_snapshot_max_metadata_objects: options.remote_snapshot_max_metadata_objects,
@@ -1077,6 +1080,7 @@ impl CommitConfig {
             batch_window: self.batch_window,
             max_files_per_commit: self.max_files_per_commit,
             max_pending_files: self.max_pending_files,
+            file_encode_concurrency: self.file_encode_concurrency,
             publication_lookup_mode: self.publication_lookup_mode,
             remote_snapshot_reuse: self.remote_snapshot_reuse,
             remote_snapshot_max_metadata_objects: self.remote_snapshot_max_metadata_objects,
@@ -1253,7 +1257,7 @@ impl FileBatchConfig {
             || tokio::time::Instant::now().checked_add(self.max_age).is_none()
             || self.max_concurrent_flushes == 0
             || self.max_concurrent_flushes > tokio::sync::Semaphore::MAX_PERMITS
-            || !(1..=64).contains(&self.pipeline_depth)
+            || !(1..=256).contains(&self.pipeline_depth)
             || (self.pipeline_depth > 1 && !self.coalesce_publications)
         {
             return Err("invalid bounded Arrow file batching capacities or flush policy".to_owned());

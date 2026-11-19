@@ -47,7 +47,7 @@ pub struct DeltaRuntimeConfig {
     /// Blocking I/O workers: default cores * 2, clamped to 32..=128; allowed 2..=256.
     /// One worker is reserved for Tokio's filesystem handoffs.
     pub blocking_workers: usize,
-    /// Concurrent uploads: default 32 independent of CPU count; allowed 1..=256.
+    /// Concurrent uploads: default 32 independent of CPU count; allowed 1..=512.
     pub upload_limit: usize,
     /// Upload strategy: default `put_create`; `buffered_multipart` is opt-in and uses UUID paths only.
     pub upload_mode: UploadMode,
@@ -62,7 +62,7 @@ pub struct DeltaRuntimeConfig {
     /// Rows per Kernel batch: default cores * 1024, clamped to 4096..=32768;
     /// allowed 1..=262144.
     pub batch_rows: usize,
-    /// Dedicated CPU workers: default cores - 1, clamped to 1..=32; allowed 1..=128.
+    /// Dedicated CPU workers: default cores - 1, clamped to 1..=32; allowed 1..=256.
     /// The waiting queue holds at most this many additional jobs.
     pub cpu_workers: usize,
 }
@@ -157,11 +157,11 @@ impl DeltaRuntimeConfig {
         for (name, value, min, max) in [
             ("RUNTIME_WORKERS", self.runtime_workers, 1, 64),
             ("BLOCKING_WORKERS", self.blocking_workers, 2, 256),
-            ("UPLOAD_LIMIT", self.upload_limit, 1, 256),
+            ("UPLOAD_LIMIT", self.upload_limit, 1, 512),
             ("TASK_LIMIT", self.task_limit, 2, 1024),
             ("READ_AHEAD", self.read_ahead, 1, 128),
             ("BATCH_ROWS", self.batch_rows, 1, 262_144),
-            ("CPU_WORKERS", self.cpu_workers, 1, 128),
+            ("CPU_WORKERS", self.cpu_workers, 1, 256),
         ] {
             anyhow::ensure!(
                 (min..=max).contains(&value),
@@ -344,7 +344,8 @@ where
 /// Unlike spawning the future onto Tokio, its synchronous encoding work stays
 /// on the CPU pool. I/O drivers run independently, so waiting for uploads cannot
 /// exhaust the I/O runtime's blocking pool. A worker remains occupied until the
-/// future completes: upload concurrency is also bounded by the CPU worker count.
+/// future completes. Use this only for encoding/local-file futures, not remote
+/// upload or metadata work; coalesced staging releases the worker before upload.
 /// Move the writer and batch into an `async move` block and return the writer
 /// to continue writing. For a fallible future use `run_cpu_future(future).await??`.
 ///

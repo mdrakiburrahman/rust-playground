@@ -219,6 +219,7 @@ struct CommitConfig {
     batch_window: Duration,
     max_files_per_commit: usize,
     max_pending_files: usize,
+    file_encode_concurrency: usize,
     #[serde(default)]
     publication_lookup_mode: arrow_deltalake::commit::PublicationLookupMode,
     remote_snapshot_reuse: bool,
@@ -232,6 +233,7 @@ impl Default for CommitConfig {
             batch_window: options.batch_window,
             max_files_per_commit: options.max_files_per_commit,
             max_pending_files: options.max_pending_files,
+            file_encode_concurrency: options.file_encode_concurrency,
             publication_lookup_mode: options.publication_lookup_mode,
             remote_snapshot_reuse: options.remote_snapshot_reuse,
             remote_snapshot_max_metadata_objects: options.remote_snapshot_max_metadata_objects,
@@ -259,6 +261,7 @@ fn parse_config(
         batch_window: commit.batch_window,
         max_files_per_commit: commit.max_files_per_commit,
         max_pending_files: commit.max_pending_files,
+        file_encode_concurrency: commit.file_encode_concurrency,
         publication_lookup_mode: commit.publication_lookup_mode,
         remote_snapshot_reuse: commit.remote_snapshot_reuse,
         remote_snapshot_max_metadata_objects: commit.remote_snapshot_max_metadata_objects,

@@ -77,7 +77,8 @@ and router upstream settings do not configure the collector's receive windows.
 
 | Setting | Contract |
 | --- | --- |
-| `collector.batching.pipeline_depth` | Integer `1..=64`, default `1`. Bounds in-flight preparation/publication groups per logical table through durable receipts. Values above `1` require `coalesce_publications: true`. Projected unchanged inside `ARROWCOL_COLLECTOR_BATCHING_CONFIG`; exporter startup readback reports the resolved value. |
+| `collector.batching.pipeline_depth` | Integer `1..=256`, default `1`. Bounds in-flight preparation/publication groups per logical table through durable receipts. Values above `1` require `coalesce_publications: true`. Projected unchanged inside `ARROWCOL_COLLECTOR_BATCHING_CONFIG`; exporter startup readback reports the resolved value. |
+| `collector.commit.file_encode_concurrency` | Integer `1..=256`, default `1`. Bounds active file preparation/encoding/upload tasks inside each coalesced group. Projects through `ARROWCOL_COLLECTOR_COMMIT_CONFIG` and optional exporter `commit_options`; effective commit readback reports the resolved value. CPU workers are released before remote upload; actual encoder concurrency is also bounded by available files and the process CPU pool. Atomic group submission, stable file indices, and existing checked byte budgets remain. |
 | `collector.batching.max_concurrent_flushes` | Existing exporter-backend semaphore, shared across cores using the same root. Bounds active file groups including their commit wait; independent of the per-table pipeline depth. |
 | `collector.commit.max_files_per_commit` | Existing maximum add actions per version (default `64`). A coalesced group remains indivisible; separate groups may share a version only when their identities do not overlap and their combined file count fits. |
 | `collector.commit.batch_window` | Existing maximum collection interval (default `10s`), starting at the first ready group. Depth `1` preserves immediate forced group commits; pipelined groups use this interval or the file cap. Explicit flush, schema transitions and shutdown wait for all prior groups. |
@@ -85,7 +86,7 @@ and router upstream settings do not configure the collector's receive windows.
 | `collector.commit.publication_lookup_mode` | Typed `scalar` (default) or `batched` transaction-identity lookup; use `batched` explicitly for the no-CRC benchmark profile. No automatic CRC/cardinality threshold is used. |
 | `collector.commit.remote_snapshot_reuse` | Boolean, default `false` (uncached compatibility behavior). Opts into Kernel incremental remote refresh only after before/after object-identity and authority checks; never enables the filesystem cache for ADLS. |
 | `collector.commit.remote_snapshot_max_metadata_objects` | Integer `1..=4096`, default `4096`. Larger retained logs or missing ETag/version identities disable reuse. Checkpoint/CRC changes, replacement, removal, schema/retention and final publication fencing remain authoritative. Both controls project through the commit JSON override and appear in effective collector readback. |
-| `collector.runtime.cpu_workers` / `upload_limit` | Existing CPU pool and upload admission bounds. These do not imply that more file groups are active; pipeline depth, flush slots and Arrow queue capacities must also permit overlap. |
+| `collector.runtime.cpu_workers` / `upload_limit` | CPU workers accept `1..=256`; uploads accept `1..=512`. Defaults remain `clamp(cores-1,1,32)` and `32`. Project to `ARROWCOL_COLLECTOR_CPU_WORKERS` / `ARROWCOL_COLLECTOR_UPLOAD_LIMIT`; runtime readback reports resolved values. Multipart buffering still obeys its separate checked 1 GiB aggregate cap. Configured bounds are not observed concurrency; file count, pipeline depth, flush slots and Arrow capacities also constrain overlap. |
 
 Coalesced preparation uses the same opened table as the single Delta commit worker,
 without acquiring another writer. Arrow reservations remain charged until terminal
@@ -226,7 +227,7 @@ evaluating sustained durable output, and report the changed duration explicitly.
 
 | Setting | Contract |
 | --- | --- |
-| `collector.runtime.upload_limit` | Defaults to 32 on every host, matching main's fixed upload capacity; OAT still accepts `1..=256`. |
+| `collector.runtime.upload_limit` | Defaults to 32 on every host, matching main's fixed upload capacity; accepts `1..=512`. |
 | `collector.runtime.read_ahead` | CPU-scaled default clamped to `8..=16`, preserving main's floor of 8. |
 | `collector.runtime.batch_rows` | CPU-scaled default clamped to `4096..=32768`; this deliberately differs from main's fixed 256. Set 256 for main-equivalent runs. |
 | `collector.runtime.cpu_workers` | Adds a dedicated CPU pool; main has no separate CPU-worker setting, so no value reproduces its runtime. |

@@ -66,11 +66,26 @@ no-overwrite and durability boundaries remain.
 Increasing a flush target alone does not coalesce publications.
 
 `batching.pipeline_depth` defaults to `1` (serialized publication). With coalescing
-enabled, `2..=64` permits bounded groups to prepare/upload using the same opened
+enabled, `2..=256` permits bounded groups to prepare/upload using the same opened
 table while its single commit worker publishes earlier groups. The existing
 `max_concurrent_flushes`, Arrow capacities, CPU workers and upload limit still
 apply. Pipelined groups use `commit.batch_window` and `max_files_per_commit`
 rather than forcing a version per group. See the [control contracts](../experiments/arrowcol-oat/TUNABLES.md#single-table-preparation-and-commit-overlap).
+
+`commit.file_encode_concurrency` (`1..=256`, default `1`) bounds concurrent files
+within each coalesced group. Metadata preparation uses bounded blocking I/O;
+encoding uses the process-wide CPU pool, then releases that worker before remote
+upload. The existing `ARROWCOL_COLLECTOR_UPLOAD_LIMIT` (`1..=512`, default `32`)
+separately bounds uploads. Local Parquet writes and synchronization can still
+occupy an encoding worker; this is not an asynchronous disk-encoding claim.
+CPU workers allow `1..=256` with the existing default unchanged. Flush slots
+already allow positive values through `Semaphore::MAX_PERMITS`; neither file nor
+group concurrency multiplies the shared Arrow byte budget. Group reservations
+remain held through durable receipts, and sorting/encoding require proportional
+working memory in addition to retained Arrow inputs. Results retain planned file
+indices regardless of completion order. Any file error stops new admissions,
+drains already-started files and reclaims their unsubmitted outputs; the ordered
+committer never receives a partial group.
 
 ## Remote snapshot refresh
 
