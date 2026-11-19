@@ -1245,6 +1245,13 @@ impl PreparedClient {
                     && range.first_admitted_cohort == record.first_admitted_cohort
                     && range.attempts == record.attempts
                     && range.outcome == record.outcome
+                    && range.decoded_physical_batch_count == record.decoded_physical_batch_count
+                    && range.canonical_logical_bytes == record.canonical_logical_bytes
+                    && range.first_send_unix_ns == record.first_send_unix_ns
+                    && range.last_send_unix_ns == record.last_send_unix_ns
+                    && range.first_admitted_unix_ms == record.first_admitted_unix_ms
+                    && range.last_admitted_unix_ms == record.first_admitted_unix_ms
+                    && range.last_outcome_unix_ms == record.last_outcome_unix_ms
                     && range.canonical_logical_bytes_unavailable_reason
                         == record.canonical_logical_bytes_unavailable_reason
             });
@@ -3207,18 +3214,22 @@ mod tests {
         );
         assert_eq!(manifest["record_count"], 2);
         assert_eq!(manifest["retry_attempts"], 2);
-        let range = manifest["ranges"][0].as_object().context("manifest range")?;
-        assert_eq!(range["first_sequence"], 0);
-        assert_eq!(range["last_sequence"], 1);
-        assert_eq!(range["batch_count"], 2);
-        assert_eq!(range["rows_per_batch"], 2);
-        assert_eq!(range["first_send_unix_ns"], 1_000_000_000);
-        assert_eq!(range["last_send_unix_ns"], 1_000_001_000);
-        assert_eq!(range["first_admitted_unix_ms"], 1_000);
-        assert_eq!(range["decoded_physical_batch_count"], 4);
-        assert_eq!(range["canonical_logical_bytes"], 21);
-        assert_eq!(range["first_admitted_cohort"], "measurement");
-        assert_eq!(range["last_admitted_unix_ms"], 1_001);
+        assert_eq!(manifest["ranges"].as_array().context("manifest ranges")?.len(), 2);
+        for (sequence, expected_bytes) in [(0, 10), (1, 11)] {
+            let range = manifest["ranges"]
+                .as_array()
+                .context("manifest ranges")?
+                .iter()
+                .find(|range| range["first_sequence"] == sequence)
+                .context("per-publication range")?;
+            assert_eq!(range["last_sequence"], sequence);
+            assert_eq!(range["batch_count"], 1);
+            assert_eq!(range["rows_per_batch"], 2);
+            assert_eq!(range["decoded_physical_batch_count"], 2);
+            assert_eq!(range["canonical_logical_bytes"], expected_bytes);
+            assert_eq!(range["attempts"], 2);
+            assert_eq!(range["first_admitted_cohort"], "measurement");
+        }
 
         let expected_ids = (0..=1)
             .flat_map(|sequence| {
@@ -4640,6 +4651,7 @@ mod tests {
                 options.max_message_bytes = 16 * 1_024 * 1_024;
                 options.runtime_threads = 8;
                 options.ipc_compression = codec;
+                options.stream_retry_max_attempts = 1;
                 let client = PreparedClient::prepare(
                     &endpoint,
                     "ceiling",
@@ -4700,11 +4712,23 @@ mod tests {
                     .context("missing configured-compression FlightData bytes")?;
                 let retried_rows = window["retried_rows"].as_u64().context("missing retried rows")?;
                 let given_up_rows = window["given_up_rows"].as_u64().context("missing given-up rows")?;
+                let ambiguous_rows = window["ambiguous_rows"].as_u64().context("missing ambiguous rows")?;
+                let rejected_rows = window["rejected_rows"].as_u64().context("missing rejected rows")?;
+                anyhow::ensure!(
+                    retried_rows == 0 && given_up_rows == 0 && ambiguous_rows == 0 && rejected_rows == 0,
+                    "qualification window had retry/rejection/ambiguous rows: retried={retried_rows}, given_up={given_up_rows}, ambiguous={ambiguous_rows}, rejected={rejected_rows}"
+                );
+                for range in ranges.iter().filter(|range| range["cohort"] == "measurement") {
+                    anyhow::ensure!(
+                        range["attempts"] == 1 && range["outcome"] == "acknowledged",
+                        "qualification window includes a logical publication without one acknowledged attempt"
+                    );
+                }
                 let cpu_core_equivalents = window["client_resources"]["cpu_core_equivalents"].clone();
                 let network_tx_bytes_per_second = window["client_resources"]["network_tx_bytes_per_second"].clone();
                 let measurement_seconds = (measurement_end - measurement_start) as f64 / 1_000.0;
                 eprintln!(
-                    "L3_CLIENT_SINK_CALIBRATION scope=in_memory_sink_not_committed sink_completed_rows_per_second={:.3} uncompressed_flight_data_GB_per_second={:.6} configured_ipc_compression_flight_data_GB_per_second={:.6} canonical_offered_GB_per_second={:.6} canonical_admitted_GB_per_second={:.6} offered_physical_batches={} admitted_physical_batches={} offered_rows={} admitted_rows={} cpu_core_equivalents={} network_tx_bytes_per_second={} retried_rows={retried_rows} given_up_rows={given_up_rows} workers={workers} streams_per_worker=2 tokio_runtime_threads=8 string_width={} corpus_rows=16384 batch_rows=4096 max_memory_bytes={}",
+                    "L3_CLIENT_SINK_CALIBRATION scope=in_memory_sink_not_committed retry_max_attempts=1 sink_completed_rows_per_second={:.3} uncompressed_flight_data_GB_per_second={:.6} configured_ipc_compression_flight_data_GB_per_second={:.6} canonical_offered_GB_per_second={:.6} canonical_admitted_GB_per_second={:.6} offered_physical_batches={} admitted_physical_batches={} offered_rows={} admitted_rows={} cpu_core_equivalents={} network_tx_bytes_per_second={} retried_rows={retried_rows} given_up_rows={given_up_rows} ambiguous_rows={ambiguous_rows} rejected_rows={rejected_rows} workers={workers} streams_per_worker=2 tokio_runtime_threads=8 string_width={} corpus_rows=16384 batch_rows=4096 max_memory_bytes={}",
                     rows as f64 / measurement_seconds,
                     uncompressed_bytes as f64 / 1_000_000_000.0 / measurement_seconds,
                     configured_bytes as f64 / 1_000_000_000.0 / measurement_seconds,
