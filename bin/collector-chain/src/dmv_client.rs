@@ -4646,8 +4646,10 @@ mod tests {
                 "Flight fragmentation changed the probe row count"
             );
             eprintln!(
-                "L3_FLIGHT_FRAGMENTATION string_width={} logical_batch_rows=4096 ipc_compression={codec:?} flight_data_messages={message_count} payload_fragments={payload_fragments} max_flight_data_protobuf_bytes={max_flight_data_bytes} decoder_output_batches={}",
+                "L3_FLIGHT_FRAGMENTATION string_width={} logical_batch_rows=4096 ipc_compression={codec:?} flight_data_messages={message_count} payload_fragments={payload_fragments} max_flight_data_limit_bytes={} max_message_limit_bytes={} max_flight_data_protobuf_bytes={max_flight_data_bytes} decoder_output_batches={}",
                 probe_options.string_width,
+                probe_options.max_flight_data_bytes,
+                probe_options.max_message_bytes,
                 decoded.len(),
             );
 
@@ -4745,7 +4747,7 @@ mod tests {
                 let network_tx_bytes_per_second = window["client_resources"]["network_tx_bytes_per_second"].clone();
                 let measurement_seconds = (measurement_end - measurement_start) as f64 / 1_000.0;
                 eprintln!(
-                    "L3_CLIENT_SINK_CALIBRATION scope=in_memory_sink_not_committed retry_max_attempts=1 sink_completed_rows_per_second={:.3} uncompressed_flight_data_GB_per_second={:.6} configured_ipc_compression_flight_data_GB_per_second={:.6} canonical_offered_GB_per_second={:.6} canonical_admitted_GB_per_second={:.6} offered_physical_batches={} admitted_physical_batches={} offered_rows={} admitted_rows={} cpu_core_equivalents={} network_tx_bytes_per_second={} retried_rows={retried_rows} given_up_rows={given_up_rows} ambiguous_rows={ambiguous_rows} rejected_rows={rejected_rows} workers={workers} streams_per_worker=2 tokio_runtime_threads=32 string_width={} corpus_rows=16384 batch_rows=4096 max_memory_bytes={}",
+                    "L3_CLIENT_SINK_CALIBRATION scope=in_memory_sink_not_committed retry_max_attempts=1 ipc_compression={codec:?} sink_completed_rows_per_second={:.3} uncompressed_flight_data_GB_per_second={:.6} configured_ipc_compression_flight_data_GB_per_second={:.6} canonical_offered_GB_per_second={:.6} canonical_admitted_GB_per_second={:.6} offered_physical_batches={} admitted_physical_batches={} offered_rows={} admitted_rows={} cpu_core_equivalents={} network_tx_bytes_per_second={} retried_rows={retried_rows} given_up_rows={given_up_rows} ambiguous_rows={ambiguous_rows} rejected_rows={rejected_rows} workers={workers} streams_per_worker=2 tokio_runtime_threads=32 string_width={} corpus_rows=16384 batch_rows=4096 max_memory_bytes={} max_flight_data_limit_bytes=2097152 max_message_limit_bytes=16777216",
                     rows as f64 / measurement_seconds,
                     uncompressed_bytes as f64 / 1_000_000_000.0 / measurement_seconds,
                     configured_bytes as f64 / 1_000_000_000.0 / measurement_seconds,
