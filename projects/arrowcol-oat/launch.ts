@@ -547,6 +547,11 @@ const approvedAksDispositions: readonly AksDispositionApproval[] = [{
   invocationIdSha256: '937f85c5f98a516c812a15ec65f6e38f78553bc90ed4704f416ff1696490a5f1',
   receiptSha256: '484d3debc9d9b57e2d33f41a4e79454bcc50e33eb917d3bdb55fc775813343a3',
   evidenceSha256: '5fdb534cf2eab9fb3500c4910c6f57914257a90243aea11387ac0e2cd87c0c49',
+}, {
+  kind: 'owned-controller-crash-aks',
+  invocationIdSha256: 'a2482cf617dcb1b29962adedf52fc739d541d65394492f37e988e5ee2d57b4fe',
+  receiptSha256: '823468abd4110b76b3a459bc755781a974a38979925b6259b6960aff3e379ed3',
+  evidenceSha256: '8076867c8c69bca002e114ef2e1d5be4de3cd14f665a2354a8931ff7bf920783',
 }];
 const legacyDispositionSuffix = '.failed-aks-disposition';
 const legacyPreloadError = 'maintenance omitted effective per-table operationTimeout before load admission';
