@@ -597,6 +597,9 @@ data:
                     batch_window: 2s
                     max_files_per_commit: 128
                     max_pending_files: 512
+                    # Eight files gave the best local Zstd1 median; not an E192 optimum.
+                    # CPU workers, pipeline depth and flush slots remain separate staged bounds.
+                    file_encode_concurrency: 8
                   batching:
                     global_capacity:
                       bytes: 274877906944
@@ -1763,7 +1766,7 @@ spec:
             - --pod-ordinal
             - $(CLIENT_INDEX)
             - --data-profile
-            - BENCHDATAPROFILE
+            - realistic
             - --data-mode
             - BENCHDATAMODE
             - --string-width
@@ -1791,6 +1794,21 @@ spec:
             - --max-memory-bytes
             - "34359738368"
           env:
+            # Opt-in calibration variant, NOT the qualification default.
+            # Remove the explicit --data-profile/realistic args before enabling:
+            # CLI values override environment values. Other rendered corpus args stay unchanged.
+            # - name: ARROWCOL_CLIENT_DATA_PROFILE
+            #   value: synthetic_telemetry
+            # - name: ARROWCOL_CLIENT_CARDINALITY
+            #   value: "1024"
+            # - name: ARROWCOL_CLIENT_SKEW
+            #   value: "0"
+            # - name: ARROWCOL_CLIENT_ENTROPY
+            #   value: "1"
+            # - name: ARROWCOL_CLIENT_NULL_FRACTION
+            #   value: "0"
+            # - name: ARROWCOL_CLIENT_SEED
+            #   value: "20260923"
             - name: BENCH_POD_UID
               valueFrom:
                 fieldRef:
