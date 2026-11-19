@@ -1475,10 +1475,33 @@ mod tests {
         assert_eq!(group.identities.len(), 2);
         assert_eq!(group.identities[0].2, 10);
         assert_eq!(group.identities[1].2, 20);
+        assert_eq!(group.source_mappings.len(), 2);
+        assert_eq!(group.source_mappings[0].source_application_id, "logical-a");
+        assert_eq!(
+            group.source_mappings[0].transaction_files,
+            vec![("logical-a".into(), 0, 10, vec![0])]
+        );
+        assert_eq!(group.source_mappings[1].source_application_id, "logical-b");
+        assert_eq!(
+            group.source_mappings[1].transaction_files,
+            vec![("logical-b".into(), 0, 20, vec![0])]
+        );
         assert!(!group.preparation_build.is_zero());
         let result = table.submit_prepared_group(group, true).await?.wait().await?;
         assert_eq!(result.version, 1);
         assert_eq!(result.files.len(), 1);
+        assert_eq!(result.audit_publications.len(), 2);
+        assert_eq!(result.audit_publications[0].outcome, CommitOutcome::Committed);
+        assert_eq!(result.audit_publications[0].authoritative_version, Some(1));
+        assert_eq!(result.audit_publications[0].committed_file_indices, [0]);
+        assert_eq!(
+            result.audit_publications[0].transaction_files,
+            vec![("logical-a".into(), 0, 10, vec![0])]
+        );
+        assert_eq!(
+            result.audit_publications[1].transaction_files,
+            vec![("logical-b".into(), 0, 20, vec![0])]
+        );
         assert_eq!(
             table
                 .lookup_publications(vec![("logical-a".into(), 0), ("logical-b".into(), 0)])

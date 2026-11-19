@@ -4891,6 +4891,14 @@ impl StagedAppend {
     pub const fn observation(&self) -> CompletedFileObservation {
         self.file.observation()
     }
+
+    /// Return the Delta transaction identity assigned to this staged file.
+    #[must_use]
+    pub fn transaction_identity(&self) -> Option<(&str, i64)> {
+        self.publication
+            .as_ref()
+            .map(|(app_id, version)| (app_id.as_str(), *version))
+    }
 }
 
 async fn upload_staged_output(

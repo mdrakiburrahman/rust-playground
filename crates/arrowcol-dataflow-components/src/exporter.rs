@@ -815,6 +815,14 @@ struct PipelinePublication {
     flush: Arc<std::sync::atomic::AtomicBool>,
 }
 
+#[derive(Debug)]
+struct AuditTransactionFileReceipt {
+    transaction_identity: Option<(String, i64)>,
+    outcome: Option<arrow_deltalake::commit::CommitOutcome>,
+    authoritative_version: Option<u64>,
+    committed_file: Option<(usize, String)>,
+}
+
 struct GroupPublisher<'a> {
     table: &'a mut Option<Arc<BatchedTable>>,
     retired: &'a Arc<std::sync::atomic::AtomicBool>,
@@ -939,6 +947,102 @@ impl GroupPublisher<'_> {
                 committed_files = ?committed_files,
                 "Delta logical publication audit receipt"
             );
+        }
+    }
+
+    fn record_audit_file_receipts(
+        &self,
+        group: &[QueuedBatch],
+        source_application_id: &str,
+        receipts: &[AuditTransactionFileReceipt],
+    ) {
+        let Some(entry) = group
+            .iter()
+            .find(|entry| format!("arrowcol.publication.{}", entry.publication_id) == source_application_id)
+        else {
+            tracing::error!(
+                source_application_id,
+                "Delta audit receipt could not be joined to its physical input"
+            );
+            return;
+        };
+        let Some((logical_publication_id, fragment_ordinal)) = &entry.audit_logical_publication else {
+            return;
+        };
+        let all_committed = !receipts.is_empty()
+            && receipts.iter().all(|receipt| {
+                receipt.outcome == Some(arrow_deltalake::commit::CommitOutcome::Committed)
+                    && receipt.authoritative_version.is_some()
+            });
+        let all_deduplicated = !receipts.is_empty()
+            && receipts
+                .iter()
+                .all(|receipt| receipt.outcome == Some(arrow_deltalake::commit::CommitOutcome::Deduplicated));
+        let any_committed = receipts.iter().any(|receipt| {
+            matches!(
+                receipt.outcome,
+                Some(
+                    arrow_deltalake::commit::CommitOutcome::Committed
+                        | arrow_deltalake::commit::CommitOutcome::PartiallyCommitted
+                )
+            )
+        });
+        let authoritative_delta_version = if all_committed {
+            let mut versions = receipts.iter().filter_map(|receipt| receipt.authoritative_version);
+            let version = versions.next();
+            version.filter(|version| versions.all(|candidate| candidate == *version))
+        } else {
+            None
+        };
+        let qualification_state = match (
+            all_committed,
+            all_deduplicated,
+            any_committed,
+            entry.canonical_logical_bytes,
+        ) {
+            (true, _, _, Some(_)) => "committed",
+            (true, _, _, None) => "canonical_bytes_unavailable",
+            (_, true, _, _) => "deduplicated",
+            (_, _, true, _) => "partial_commit",
+            (_, _, _, _)
+                if receipts
+                    .iter()
+                    .any(|receipt| receipt.outcome == Some(arrow_deltalake::commit::CommitOutcome::Reconciled)) =>
+            {
+                "unresolved_reconciliation"
+            }
+            _ => "unresolved",
+        };
+        let committed_files = receipts
+            .iter()
+            .filter_map(|receipt| receipt.committed_file.as_ref())
+            .collect::<Vec<_>>();
+        tracing::info!(
+            logical_publication_id = %logical_publication_id,
+            fragment_ordinal = *fragment_ordinal,
+            physical_publication_id = %entry.publication_id,
+            input_rows = entry.rows,
+            canonical_logical_bytes = ?entry.canonical_logical_bytes,
+            admitted_at_unix_ms = entry.ingested_at_ms.get(),
+            qualification_state,
+            authoritative_delta_version = ?authoritative_delta_version,
+            transaction_files = ?receipts,
+            committed_files = ?committed_files,
+            "Delta logical publication audit receipt"
+        );
+    }
+
+    fn record_audit_file_receipts_for_sources(
+        &self,
+        group: &[QueuedBatch],
+        source_application_ids: impl IntoIterator<Item = String>,
+        receipts_by_source: &HashMap<String, Vec<AuditTransactionFileReceipt>>,
+    ) {
+        for source_application_id in source_application_ids {
+            let receipts = receipts_by_source
+                .get(&source_application_id)
+                .map_or(&[], Vec::as_slice);
+            self.record_audit_file_receipts(group, &source_application_id, receipts);
         }
     }
 
@@ -1087,6 +1191,8 @@ impl GroupPublisher<'_> {
                 .await
                 .map_err(|error| ExportFailure::Transient(error.to_string()))?;
             let mut staged = Vec::with_capacity(group.len());
+            let mut staged_audit_sources = Vec::with_capacity(group.len());
+            let mut audit_file_receipts = HashMap::<String, Vec<AuditTransactionFileReceipt>>::new();
             let mut updated_estimator = estimator.clone();
             let mut publications = HashMap::with_capacity(group.len());
             if self.coalesce_publications {
@@ -1177,7 +1283,17 @@ impl GroupPublisher<'_> {
                             )))
                         }
                     };
-                    let committed = commit_result?;
+                    let committed = match commit_result {
+                        Ok(committed) => committed,
+                        Err(error) => {
+                            self.record_audit_file_receipts_for_sources(
+                                group,
+                                inputs.iter().map(|(_, source, _, _)| source.clone()),
+                                &audit_file_receipts,
+                            );
+                            return Err(error);
+                        }
+                    };
                     self.record_audit_publications(group, &committed);
                     if let Some(duration) = committed.commit_duration {
                         self.stage_metrics.record(PipelineStage::Commit, duration);
@@ -1200,11 +1316,12 @@ impl GroupPublisher<'_> {
                 }
                 let stamp = i64::try_from(entry.ingested_at_ms.get())
                     .map_err(|error| ExportFailure::Transient(error.to_string()))?;
+                let source_application_id = format!("arrowcol.publication.{}", entry.publication_id);
                 let build_started = Instant::now();
                 let files_result = table
                     .new_partitioned_publication_files(
                         entry.batch.clone(),
-                        format!("arrowcol.publication.{}", entry.publication_id),
+                        source_application_id.clone(),
                         0,
                         stamp,
                     )
@@ -1228,6 +1345,10 @@ impl GroupPublisher<'_> {
                     updated_estimator.observe(append.observation()).map_err(|error| {
                         ExportFailure::Permanent(format!("file sizing observation failed: {error}"))
                     })?;
+                    staged_audit_sources.push((
+                        source_application_id.clone(),
+                        append.transaction_identity().map(|(app_id, version)| (app_id.to_owned(), version)),
+                    ));
                     staged.push(append);
                 }
             }
@@ -1248,16 +1369,61 @@ impl GroupPublisher<'_> {
                 })?);
             }
             let mut version = 0;
-            for receipt in receipts {
-                let committed = receipt.wait_typed().await.map_err(|error| {
-                    worker_failed = true;
-                    map_receipt_error(error)
-                })?;
+            let mut receipt_error = None;
+            for (file_index, receipt) in receipts.into_iter().enumerate() {
+                let committed = match receipt.wait_typed().await {
+                    Ok(committed) => committed,
+                    Err(error) => {
+                        worker_failed = true;
+                        let (source_application_id, transaction_identity) = &staged_audit_sources[file_index];
+                        audit_file_receipts
+                            .entry(source_application_id.clone())
+                            .or_default()
+                            .push(AuditTransactionFileReceipt {
+                                transaction_identity: transaction_identity.clone(),
+                                outcome: None,
+                                authoritative_version: None,
+                                committed_file: None,
+                            });
+                        receipt_error.get_or_insert(error);
+                        continue;
+                    }
+                };
                 if let Some(duration) = committed.commit_duration {
                     self.stage_metrics.record(PipelineStage::Commit, duration);
                 }
+                let (source_application_id, transaction_identity) = &staged_audit_sources[file_index];
+                let committed_file = if committed.authoritative_version.is_some()
+                    && committed.committed_file_indices.contains(&0)
+                {
+                    Some((
+                        file_index,
+                        committed.file.path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default(),
+                    ))
+                } else {
+                    None
+                };
+                audit_file_receipts
+                    .entry(source_application_id.clone())
+                    .or_default()
+                    .push(AuditTransactionFileReceipt {
+                        transaction_identity: transaction_identity.clone(),
+                        outcome: Some(committed.outcome),
+                        authoritative_version: committed.authoritative_version,
+                        committed_file,
+                    });
                 self.record_published_files(committed.file_observations);
                 version = version.max(committed.version);
+            }
+            for publication_id in publications.keys() {
+                let source_application_id = format!("arrowcol.publication.{publication_id}");
+                let file_receipts = audit_file_receipts
+                    .get(&source_application_id)
+                    .map_or(&[], Vec::as_slice);
+                self.record_audit_file_receipts(group, &source_application_id, file_receipts);
+            }
+            if let Some(error) = receipt_error {
+                return Err(map_receipt_error(error));
             }
             *estimator = updated_estimator;
             Ok::<_, ExportFailure>(version)
