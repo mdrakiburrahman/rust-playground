@@ -1,0 +1,1817 @@
+# NOT RUN-READY: diagnostic candidate, not an approved deployment or qualification recipe.
+# This successor requires source-reviewed, source-bound immutable image digests, final approved
+# receiver h2/TCP and remote-snapshot reuse/cap settings, effective config readback, local fixture and
+# separately authorized live preflight. UNRESOLVED_* images deliberately cannot be pulled.
+# Reviewed successor exposes commit.remote_snapshot_reuse and
+# commit.remote_snapshot_max_metadata_objects (1..4096); values are not yet approved here.
+# Direct ArrowCollector benchmark for AKS context arrow-collector-68590.
+# A staged deployment, not a single apply. Use only a new isolated benchmark namespace.
+# Render BENCHRUNUUID as a fresh lowercase UUID and BENCHRUNHEX as its 32 lowercase hex digits.
+# Render BENCHCLIENTCOUNT as 1, 2, 4, or 8 for a bounded indexed client Job; never exceed ready client nodes.
+# Render BENCHOWNER as the approved custody owner in both identity annotations and labels.
+# 9876543210000 is a placeholder, not a usable expiry. Immediately before applying
+# the initializer stage, replace it in rendered.yaml with current UTC Unix ms + 2700000
+# (45 minutes; within the configured 1-hour maximum). Do not compute it at initial
+# render if identity/SQL startup will consume that budget. Wait for initializer completion.
+# Validate the selected Delta root is empty; never reuse an old run UUID or delete its data.
+# Before workload apply, use the sanctioned run-FIC prepare/probe in docs/operations/OAT_RUN_AUTHORITY.md
+# for this exact namespace UID and arrow-collector ServiceAccount; cleanup removes that FIC.
+# From the repo root, set UUID to the rendered run ID and NS to arrow-collector-<UUID without hyphens>.
+# Set BOOTSTRAP_ENV and STAMP_CONFIG to approved private input files for this stamp.
+# Set FIC_RECORD to a durable private path unique to this run (retain it through cleanup).
+# npx --no-install tsx infra/azure/bootstrap.ts prepare-run-fic --mode stamped --env-file "$BOOTSTRAP_ENV" --stamp-config "$STAMP_CONFIG" --run-id "$UUID" --namespace "$NS" --service-account arrow-collector --record "$FIC_RECORD"
+# npx --no-install tsx infra/azure/bootstrap.ts probe-run-fic --mode stamped --env-file "$BOOTSTRAP_ENV" --stamp-config "$STAMP_CONFIG" --run-id "$UUID" --namespace "$NS" --service-account arrow-collector --record "$FIC_RECORD" --wait-seconds 300
+# Do not use the unrelated native namespace or copy its credentials. The stamp workload identity
+# client/tenant IDs below are identifiers, not credentials. Review sku-pools-breakthrough.bicepparam
+# with a fresh Bicep what-if before any separately authorized deployment. It stages up to eight D64
+# clients, one D64 support node, one E192 collector node, and the explicitly enabled ACS v2 installer.
+# The workload identity must have sanctioned access. The calibrated realistic client below is a
+# diagnostic starting profile, not a D64 supply guarantee or a demonstrated fastest setting.
+# It reuses one prepared corpus per client while generating identity-bearing sends. Capture its
+# requested/resolved concurrency, memory and per-parent/physical-batch metrics. Profile and
+# queue capacities are editable experimental inputs, not finalized or automatically safe settings.
+# This 16-worker/16-runtime-thread/32-GiB profile is a local calibration baseline, not a D64
+# supply guarantee: measure actual admitted slots and client CPU/RSS; ramp concurrency, threads
+# and memory only within verified allocatable node headroom and retain bounded backpressure.
+# Capacity planning only: assume an unmeasured 8 s p99 admission-to-durable-release residence
+# and 1.5x headroom. At 6.44M rows/s and 17.4 GB/s, rate x 8 x 1.5 needs 77.28M rows and
+# 208.8 GB. The 100M-row/256-GiB single-table and registration candidates exceed these numbers.
+# Measure actual p99 and amplification; exceedance invalidates this sizing assumption, not the run.
+# The 352-GiB RSS pressure threshold is below the 384-GiB pod limit; 96 GiB above the 256-GiB
+# in-flight cap is candidate encode/upload/runtime overhead, not a measured memory reservation.
+# Twelve 4-GiB/2M-row flushes consume at most 48 GiB/24M rows, within the table candidate.
+# CPU workers are explicitly 32; active pipeline stages are bounded by min(depth 8,
+# concurrent flushes 12, CPU workers 32) = 8, not by the 160 requested DFE cores.
+# Receiver candidate (source 75f16c57): 1 MiB stream / 16 MiB connection window, adaptive off,
+# TCP_NODELAY on. Unset wire defaults measured at that source are 1 MiB / 1 MiB, not 65535.
+# The 160 DFE / 176 CPU candidate is staged only; verify actual E192 allocatable CPU before applying.
+# Pre-SC gate: verify a Ready collector node has label kubernetes.azure.com/agentpool=arrowe192 and
+# inventory every StorageClass with provisioner localdisk.csi.acstor.io read-only. Do not mutate others.
+# Any unannotated class or affinity admitting nodes outside arrowe192 blocks this run because it can
+# widen CSI placement. Reuse an existing same-name run class read-only only if run-id, owner-token,
+# provisioner, and affinity exactly match; otherwise abort, never overwrite/adopt another owner.
+# ACS v2 defers CSI installation until this run-specific StorageClass exists. After creating it,
+# before any local-csi test PVC or writer, verify driver pod placement and collector NoSchedule-taint
+# tolerance, actual extension/driver versions, and usable NVMe capacity. Record versions before/after
+# each scored window; ACS minor/patch pinning is unsupported. What-if cannot validate any of this.
+# Supply Secrets in this namespace from your approved secret source (no values in this file):
+# arrowcol-generation[generation] (current stamp authority generation), arrowcol-router-auth
+# [edge-hmac,internal-hmac], arrowcol-sql-{admin,migration,runtime}[password] (fresh generated SQL credentials).
+# Apply with: kubectl --context arrow-collector-68590 apply --server-side -f rendered.yaml -l benchmark-stage=STAGE
+# Stages, in order (wait for success; abort on failure):
+# identity -> prepare/probe FIC and install Secrets -> storage (create the unique run-scoped cluster StorageClass only if absent;
+# exact own match may be reused read-only; run the storage checks above before any local-csi PVC/writer)
+# -> sql (wait deploy/arrowcol-sql) -> migration
+# (wait job/arrowcol-migrate-v11-fresh) -> catalog (wait catalog/router/maintenance deployments)
+# -> writer (one ready pod and stable restart count) -> initializer (wait job/direct-pin-live)
+# -> registration (wait job/direct-catalog-verified and verify signed one-table receipt)
+# -> load (the Job is suspended by default; only unsuspend after all gates and separate approval).
+# Keep the Job suspended until the source-owned armer records the original run off-node before
+# releasing the shared ConfigMap. The standalone benchmark-arm.ts command cannot bypass this gate.
+# The eventual release must verify one READY client per index and identical bounds [start+60000,start+660000).
+# If a release outcome is ambiguous, inspect the original ConfigMap; do not retry blindly.
+# Before and after each window, capture a clock-offset bound for every distinct client node and the
+# collector node against the operator. For a pod sharing each node's clock, record operator Unix ns
+# immediately before (t0) and after (t1) `kubectl exec POD -- date -u +%s%N` and the pod timestamp;
+# the offset lies in [pod-t1, pod-t0]. Use signed 64-bit or lossless arithmetic.
+# Invalidate if either end of any offset interval exceeds +/-100 ms, if clock sharing is unverified,
+# if `date` with nanosecond output is unavailable, or if any sample is missing. Clock checks do not
+# replace exact manifest and receipt reconciliation.
+# Client/pod failure after arming invalidates the window.
+# Monitor the same writer pod UID/restart count throughout; stop load if the writer becomes unhealthy.
+# Capture 60 s warmup, 600 s timed commits, then drain. The Job has a hard deadline.
+# Each scored 600 s window needs a fresh run UUID, namespace, FIC and independent initialization; this
+# one rendered run is not two-window qualification. Repeat only after source/image readiness and approval.
+# Each admitted external push_batch receives a new PublicationId: scored clients must use L3's verified
+# single-attempt/no-resubmission path; any failed or ambiguous logical send invalidates the entire scored window (no partial credit).
+# Preserve original full client stdout/stderr and collector stdout/stderr byte-for-byte before cleanup;
+# terminal OAT_CLIENT_METRICS lines contain nanosecond u64 values that JavaScript Number cannot represent.
+# Capture each exact indexed pod and the stable writer UID/status:
+# kubectl --context "$CONTEXT" -n "$NS" get pods -l "arrowcol-oat/run-id=$UUID,batch.kubernetes.io/job-name=direct-load-confirmwide" -o json > "$EVIDENCE/pods.json"
+# Each indexed client's managed-csi claim persists while its original completed Pod is retained.
+# Do not suspend or delete the completed Job until its original claims and logs have been exported.
+# Do not use kubectl logs for writer evidence. Export both original files from the exact retained
+# writer PVC after positive terminal status and before any cleanup. Publication receipts are in
+# writer-stderr.raw; preserve both writer streams. Client terminal manifests are in client stdout.
+# The writer's 4 GiB prlimit --fsize is process-wide. Validate that all selected Parquet and local
+# staging file limits fit below it before load; it is not an isolated log quota.
+# Do not pass --timestamps on API log captures: the extractor requires raw line framing.
+# Its readline implementation buffers each complete line before applying the 8-MiB line cap.
+# Check every command exit and preserve the original logs.
+# kubectl logs only returns the latest rotated file; do not use it as original evidence.
+# npx --no-install tsx infra/azure/benchmark-extract.ts manifest "$EVIDENCE/client-$INDEX-stdout.raw" "$EVIDENCE/client-$INDEX-manifest.json"
+# npx --no-install tsx infra/azure/benchmark-extract.ts collector "$EVIDENCE/writer-stderr.raw" "$EVIDENCE/collector-receipts.jsonl"
+# Extractor writes new files only; any error leaves an incomplete output that must not be used.
+# Resolve the exact table's _delta_log prefix from the run's catalog/initializer receipt. After drain,
+# download all its JSON blobs:
+# az storage blob download-batch --auth-mode login --account-name "$ACCOUNT" --source "$CONTAINER" --destination "$EVIDENCE/delta-download" --pattern "$LOG_PREFIX/*.json"
+# Verify every version from zero through the independently recorded post-drain end version is present.
+# npx --no-install tsx infra/azure/benchmark-audit.ts --manifest "$EVIDENCE/client-0-manifest.json" --collector-jsonl "$EVIDENCE/collector-receipts.jsonl" --delta-json-dir "$DELTA_JSON_DIR" --baseline-version "$PRE_LOAD_DELTA_VERSION"
+# Repeat --manifest for every client. This checks accounting only and does not authorize deletion.
+# Preserve original terminal manifests and collector JSON receipts without numeric round-tripping.
+# Reconcile all clients against identical bounds, physical publications and files; missing/truncated
+# logs, unresolved/ambiguous sends or incomplete Delta history invalidate the entire scored window.
+# Prove load stopped, collector drained and the fenced owner/namespace UID match before cleanup; keep
+# the run-FIC record. Existing run_fic.ts delete_run_namespace uses a durable authority and UID-fenced
+# deletion journal, but no reviewed direct-kubectl adapter or definitive drain proof is supplied here.
+# Those are blockers: do not substitute bare namespace deletion or assume empty gauges prove drain.
+# After proven namespace absence, the existing cleanup-run-fic command can remove only the recorded FIC:
+# npx --no-install tsx infra/azure/bootstrap.ts cleanup-run-fic --mode stamped --env-file "$BOOTSTRAP_ENV" --stamp-config "$STAMP_CONFIG" --run-id "$UUID" --record "$FIC_RECORD"
+# Local NVMe is a bounded 256 Gi staging area via TMPDIR, not durable storage or an acknowledgment.
+# No QAP/Kusto consumer is deployed here. Keep cluster-scoped cleanup separate from namespace/FIC cleanup.
+# After drain, remove the StorageClass only if exact run-id and owner-token labels match and no PVC/PV uses it. Never remove the shared ACS extension as routine run cleanup. Preserve Delta objects and verify pools physically return to zero.
+# Isolated development benchmark only, not a production deployment or authentication recipe.
+# HMAC-authenticated internal traffic is not TLS; retain the supplied workload identity,
+# Secrets and network policies. native_quiver is false (memory-only buffering).
+# Synthetic DMV data is not production telemetry; do not claim unique delivery without reconciliation.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: arrow-collector-BENCHRUNHEX
+  labels:
+    app.kubernetes.io/part-of: arrowcol-oat
+    arrowcol-oat/run-id: BENCHRUNUUID
+    arrowcol-oat/owner-token: BENCHOWNER
+    benchmark-stage: identity
+  annotations:
+    arrowcol-oat/run-id: BENCHRUNUUID
+    arrowcol-oat/owner-token: BENCHOWNER
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: arrowcol-BENCHRUNHEX-local-csi
+  labels:
+    app.kubernetes.io/part-of: arrowcol-oat
+    benchmark-stage: storage
+    arrowcol-oat/run-id: BENCHRUNUUID
+    arrowcol-oat/owner-token: BENCHOWNER
+  annotations:
+    storageoperator.acstor.io/nodeAffinity: |
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: kubernetes.azure.com/agentpool
+            operator: In
+            values: [arrowe192]
+provisioner: localdisk.csi.acstor.io
+reclaimPolicy: Delete
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: arrow-collector
+  namespace: arrow-collector-BENCHRUNHEX
+  annotations:
+    azure.workload.identity/client-id: 1aec6cf9-f7f4-4c14-a3da-5e4bae1de278
+    arrowcol-oat/run-id: BENCHRUNUUID
+    arrowcol-oat/owner-token: BENCHOWNER
+  labels:
+    arrowcol-oat/run-id: BENCHRUNUUID
+    arrowcol-oat/owner-token: BENCHOWNER
+    benchmark-stage: identity
+automountServiceAccountToken: false
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: arrow-collector-BENCHRUNHEX
+  labels:
+    app.kubernetes.io/part-of: arrowcol-oat
+    benchmark-stage: sql
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: sql-internal
+  namespace: arrow-collector-BENCHRUNHEX
+  labels:
+    app.kubernetes.io/part-of: arrowcol-oat
+    benchmark-stage: sql
+spec:
+  podSelector:
+    matchLabels:
+      app: arrowcol-sql
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: arrowcol
+        - podSelector:
+            matchLabels:
+              app: arrowcol-router
+        - podSelector:
+            matchLabels:
+              app: arrowcol-migrate
+        - podSelector:
+            matchLabels:
+              app: arrowcol-oat-pin-init
+      ports:
+        - protocol: TCP
+          port: 1433
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: arrowcol-sql
+  namespace: arrow-collector-BENCHRUNHEX
+  labels:
+    app.kubernetes.io/part-of: arrowcol-oat
+    benchmark-stage: sql
+spec:
+  type: ClusterIP
+  selector:
+    app: arrowcol-sql
+  ports:
+    - port: 1433
+      targetPort: 1433
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: arrowcol-sql-fresh
+  namespace: arrow-collector-BENCHRUNHEX
+  labels:
+    app.kubernetes.io/part-of: arrowcol-oat
+    benchmark-stage: sql
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: managed-csi
+  resources:
+    requests:
+      storage: 32Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: arrowcol-catalog-fresh
+  namespace: arrow-collector-BENCHRUNHEX
+  labels:
+    app.kubernetes.io/part-of: arrowcol-oat
+    benchmark-stage: sql
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: managed-csi
+  resources:
+    requests:
+      storage: 16Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: arrowcol-sql
+  namespace: arrow-collector-BENCHRUNHEX
+  labels:
+    app.kubernetes.io/part-of: arrowcol-oat
+    benchmark-stage: sql
+    arrowcol-oat/run-id: BENCHRUNUUID
+    arrowcol-oat/owner-token: BENCHOWNER
+  annotations:
+    arrowcol-oat/run-id: BENCHRUNUUID
+    arrowcol-oat/owner-token: BENCHOWNER
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: arrowcol-sql
+  template:
+    metadata:
+      labels:
+        app: arrowcol-sql
+        app.kubernetes.io/part-of: arrowcol-oat
+        arrowcol-oat/run-id: BENCHRUNUUID
+        arrowcol-oat/owner-token: BENCHOWNER
+      annotations:
+        arrowcol-oat/run-id: BENCHRUNUUID
+        arrowcol-oat/owner-token: BENCHOWNER
+    spec:
+      serviceAccountName: arrow-collector
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      nodeSelector:
+        arrow-collector/role: support
+        kubernetes.io/arch: amd64
+      tolerations:
+        - key: arrow-collector/role
+          operator: Equal
+          value: support
+          effect: NoSchedule
+      securityContext:
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      terminationGracePeriodSeconds: 360
+      containers:
+        - name: sqlserver
+          image: UNRESOLVED_SQL_IMAGE
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+              add:
+                - NET_BIND_SERVICE
+          env:
+            - name: ACCEPT_EULA
+              value: "Y"
+            - name: MSSQL_PID
+              value: Developer
+            - name: MSSQL_MEMORY_LIMIT_MB
+              value: "2048"
+            - name: MSSQL_SA_PASSWORD_FILE
+              value: /run/sa/password
+          ports:
+            - containerPort: 1433
+          resources:
+            requests:
+              cpu: "1"
+              memory: 3Gi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+          startupProbe:
+            exec:
+              command:
+                - /usr/local/bin/sqlserver-healthcheck
+            timeoutSeconds: 8
+            periodSeconds: 10
+            failureThreshold: 60
+          readinessProbe:
+            exec:
+              command:
+                - /usr/local/bin/sqlserver-healthcheck
+            timeoutSeconds: 8
+            periodSeconds: 10
+            failureThreshold: 6
+          volumeMounts:
+            - name: data
+              mountPath: /var/opt/mssql
+              readOnly: false
+            - name: sa
+              mountPath: /run/sa
+              readOnly: true
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: arrowcol-sql-fresh
+        - name: sa
+          secret:
+            secretName: arrowcol-sql-admin
+            defaultMode: 288
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: arrowcol-migrate-v11-fresh
+  namespace: arrow-collector-BENCHRUNHEX
+  labels:
+    app.kubernetes.io/part-of: arrowcol-oat
+    benchmark-stage: migration
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 600
+  template:
+    metadata:
+      labels:
+        app: arrowcol-migrate
+        app.kubernetes.io/part-of: arrowcol-oat
+    spec:
+      serviceAccountName: arrow-collector
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      nodeSelector:
+        arrow-collector/role: support
+        kubernetes.io/arch: amd64
+      tolerations:
+        - key: arrow-collector/role
+          operator: Equal
+          value: support
+          effect: NoSchedule
+      securityContext:
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      terminationGracePeriodSeconds: 360
+      containers:
+        - name: migrate
+          image: UNRESOLVED_SQL_IMAGE
+          command:
+            - /usr/local/bin/arrowcol-migrate
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          env:
+            - name: SQLSERVER_HOST
+              value: arrowcol-sql
+            - name: ARROWCOL_MIGRATOR_PASSWORD_FILE
+              value: /run/migration/password
+          volumeMounts:
+            - name: migration
+              mountPath: /run/migration
+              readOnly: true
+      volumes:
+        - name: sa
+          secret:
+            secretName: arrowcol-sql-admin
+            defaultMode: 288
+        - name: app
+          secret:
+            secretName: arrowcol-sql-runtime
+            defaultMode: 288
+        - name: migration
+          secret:
+            secretName: arrowcol-sql-migration
+            defaultMode: 288
+      restartPolicy: Never
+      initContainers:
+        - name: bootstrap
+          image: UNRESOLVED_SQL_IMAGE
+          command:
+            - /usr/local/bin/database-bootstrap
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          env:
+            - name: SQLSERVER_HOST
+              value: arrowcol-sql
+            - name: SQLSERVER_SA_PASSWORD_FILE
+              value: /run/sa/password
+            - name: ARROWCOL_APP_PASSWORD_FILE
+              value: /run/app/password
+            - name: ARROWCOL_MIGRATOR_PASSWORD_FILE
+              value: /run/migration/password
+          volumeMounts:
+            - name: sa
+              mountPath: /run/sa
+              readOnly: true
+            - name: app
+              mountPath: /run/app
+              readOnly: true
+            - name: migration
+              mountPath: /run/migration
+              readOnly: true
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: arrowcol-config
+  namespace: arrow-collector-BENCHRUNHEX
+  labels:
+    app.kubernetes.io/part-of: arrowcol-oat
+    benchmark-stage: catalog
+data:
+  dataflow.yaml: |
+    version: otel_dataflow/v1
+    engine:
+      shutdown_drain_timeout_seconds: ${env:ARROWCOL_COLLECTOR_SHUTDOWN_DRAIN_TIMEOUT_SECONDS:-60}
+    policies:
+      resources:
+        core_allocation:
+          type: core_count
+          count: 160
+    groups:
+      arrowcol:
+        pipelines:
+          ingest:
+            policies:
+              channel_capacity:
+                control:
+                  node: 64
+                  pipeline: 64
+                pdata: 32
+            nodes:
+              flight:
+                type: receiver:arrow_flight
+                config:
+                  listening_addr: ${env:ARROWCOL_FLIGHT_LISTEN:-0.0.0.0:32010}
+                  admin_listening_addr: ${env:ARROWCOL_ADMIN_LISTEN:-0.0.0.0:32011}
+                  native_quiver: false
+                  catalog:
+                    type: remote
+                    endpoint: ${env:ARROWCOL_CATALOG_ENDPOINT:-http://arrowcol-catalog:8817}
+                    maximum_cache_age: 10s
+                  routing:
+                    type: sql_server
+                    connection:
+                      host: ${env:ARROWCOL_SQL_HOST:-sqlserver}
+                      port: ${env:ARROWCOL_SQL_PORT:-1433}
+                      database: ${env:ARROWCOL_SQL_DATABASE:-arrowcol}
+                      username: ${env:ARROWCOL_SQL_USERNAME:-arrowcol_app}
+                      password_file: ${env:ARROWCOL_SQL_PASSWORD_FILE:-/run/secrets/arrowcol-app-password}
+                      trust_server_certificate: ${env:ARROWCOL_SQL_TRUST_CERT:-true}
+                      connect_timeout: 15s
+                      command_timeout: 30s
+                  registration:
+                    instance_key: ${env:ARROWCOL_INSTANCE_KEY:-arrowcol-dataflow-local}
+                    flight_endpoint: ${env:ARROWCOL_ADVERTISED_FLIGHT_ENDPOINT:-127.0.0.1:32010}
+                    max_concurrent_streams: 256
+                    heartbeat_interval: 5s
+                    pressure_interval: 2s
+                    registration_ttl: 30s
+                    rss_limit_bytes: 377957122048
+                    buffered_bytes_limit: 274877906944
+                    buffered_rows_limit: 100000000
+                    buffered_batches_limit: 16384
+                  limits:
+                    max_metadata_bytes: 16384
+                    max_schema_bytes: 1048576
+                    max_message_bytes: ${env:ARROWCOL_MAX_MESSAGE_BYTES:-16777216}
+                    batch_channel_capacity: 4
+                    put_result_channel_capacity: 16
+                    max_stream_duration: 5m
+                    admission_timeout: 30s
+                    max_ddl_bytes: 65536
+              delta:
+                type: exporter:arrow_deltalake
+                config:
+                  base_path: ${env:ARROWCOL_DELTA_ROOT:-/onelake}
+                  routing:
+                    type: sql_server
+                    connection:
+                      host: ${env:ARROWCOL_SQL_HOST:-sqlserver}
+                      port: ${env:ARROWCOL_SQL_PORT:-1433}
+                      database: ${env:ARROWCOL_SQL_DATABASE:-arrowcol}
+                      username: ${env:ARROWCOL_SQL_USERNAME:-arrowcol_app}
+                      password_file: ${env:ARROWCOL_SQL_PASSWORD_FILE:-/run/secrets/arrowcol-app-password}
+                      trust_server_certificate: ${env:ARROWCOL_SQL_TRUST_CERT:-true}
+                      connect_timeout: 15s
+                      command_timeout: 30s
+                  commit:
+                    batch_window: 2s
+                    max_files_per_commit: 128
+                    max_pending_files: 512
+                  batching:
+                    global_capacity:
+                      bytes: 274877906944
+                      rows: 100000000
+                      batches: 16384
+                    per_table_capacity:
+                      bytes: 274877906944
+                      rows: 100000000
+                      batches: 8192
+                    max_arrow_memory_per_flush: 4294967296
+                    max_rows_per_flush: 2000000
+                    max_batches_per_flush: 2048
+                    max_age: 60s
+                    max_concurrent_flushes: 12
+                    adaptive_file:
+                      target_parquet_bytes: 134217728
+                      min_input_bytes: 1048576
+                      max_input_bytes: 4294967296
+                      cold_start_parquet_ratio: 0.25
+                      ewma_weight: 0.2
+                      min_parquet_ratio: 0.015625
+                      max_parquet_ratio: 4
+                    coalesce_publications: true
+                    age_flush_policy: drain_ready
+                    pipeline_depth: 8
+                  authority_timeout: 10s
+            connections:
+              - from: flight
+                to: delta
+  router.yaml: |
+    server:
+      listen: 0.0.0.0:50050
+      threads: 4
+      listener_tasks_per_fd: 1
+      grace_period_seconds: 10
+      graceful_shutdown_timeout_seconds: 300
+      state_directory: /var/run/arrowcol-router
+      h2:
+        max_concurrent_streams: 512
+        stream_window_bytes: 1048576
+        connection_window_bytes: 33554432
+        idle_timeout_seconds: 60
+    sql_server:
+      host: arrowcol-sql
+      port: 1433
+      database: arrowcol
+      username: arrowcol_app
+      password_file: /run/app/password
+      trust_server_certificate: true
+      connect_timeout_ms: 5000
+      command_timeout_ms: 15000
+    routing:
+      refresh_interval_ms: 1000
+      max_snapshot_age_ms: 15000
+      max_future_skew_ms: 2000
+      max_table_entries: 256
+      max_oldest_buffer_age_ms: 86400000
+      hard_pressure_bps: 9500
+      warmup_ms: 1000
+      minimum_warmup_bps: 1000
+      lease_ttl_ms: 3600000
+      readiness_max_staleness_ms: 30000
+      distinct_table_owners: false
+    auth:
+      authenticator: dev_only_allow_all
+      edge_secret_file: /run/auth/edge-hmac
+      internal_signing_secret_file: /run/auth/internal-hmac
+      edge_signature_max_age_ms: 30000
+      internal_identity_ttl_ms: 30000
+    upstream:
+      tls: false
+      sni: ""
+      max_h2_streams: 1
+      stream_window_bytes: 1048576
+      connection_window_bytes: 33554432
+      connection_timeout_ms: 1000
+      total_connection_timeout_ms: 3000
+      idle_timeout_seconds: 0
+      ping_interval_seconds: 15
+    telemetry:
+      log_filter: info,arrowcol_router_rust=debug
+      json_logs: true
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: arrowcol-catalog
+  namespace: arrow-collector-BENCHRUNHEX
+  labels:
+    app.kubernetes.io/part-of: arrowcol-oat
+    benchmark-stage: catalog
+spec:
+  type: ClusterIP
+  selector:
+    app: arrowcol-catalog
+  ports:
+    - port: 8817
+      targetPort: 8817
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: arrowcol-router
+  namespace: arrow-collector-BENCHRUNHEX
+  labels:
+    app.kubernetes.io/part-of: arrowcol-oat
+    benchmark-stage: catalog
+spec:
+  type: ClusterIP
+  selector:
+    app: arrowcol-router
+  ports:
+    - port: 50050
+      targetPort: 50050
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: arrowcol-router-node-local
+  namespace: arrow-collector-BENCHRUNHEX
+  labels:
+    app.kubernetes.io/part-of: arrowcol-oat
+    benchmark-stage: catalog
+spec:
+  type: ClusterIP
+  internalTrafficPolicy: Local
+  selector:
+    app: arrowcol-router
+  ports:
+    - name: node-local
+      protocol: TCP
+      port: 30550
+      targetPort: 50050
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: arrowcol-catalog
+  namespace: arrow-collector-BENCHRUNHEX
+  labels:
+    app.kubernetes.io/part-of: arrowcol-oat
+    benchmark-stage: catalog
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: arrowcol-catalog
+  template:
+    metadata:
+      labels:
+        app: arrowcol-catalog
+        app.kubernetes.io/part-of: arrowcol-oat
+        azure.workload.identity/use: "true"
+    spec:
+      serviceAccountName: arrow-collector
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      nodeSelector:
+        arrow-collector/role: support
+        kubernetes.io/arch: amd64
+      tolerations:
+        - key: arrow-collector/role
+          operator: Equal
+          value: support
+          effect: NoSchedule
+      securityContext:
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      terminationGracePeriodSeconds: 360
+      containers:
+        - name: catalog
+          image: UNRESOLVED_CATALOG_IMAGE
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          args:
+            - --warehouse-root
+            - abfss://arrowcol@arrowcollector68590.dfs.core.windows.net/direct-baseline-1/runs/BENCHRUNUUID/dataflow
+            - --state-dir
+            - /data/catalog
+            - --ingestion-layout
+            - --ddl-identity-secret-file
+            - /run/auth/internal-hmac
+          env:
+            - name: ARROWCOL_DELTA_ROOT
+              value: abfss://arrowcol@arrowcollector68590.dfs.core.windows.net/direct-baseline-1/runs/BENCHRUNUUID/dataflow
+            - name: ARROWCOL_AZURE_MODE
+              value: stamped
+            - name: AZURE_SUBSCRIPTION_ID
+              value: 68fa0545-661c-4152-93f2-fc8ae1c231b8
+            - name: AZURE_STAMP
+              value: "68590"
+            - name: AZURE_RESOURCE_GROUP
+              value: arrow-collector-rg
+            - name: AZURE_STORAGE_ACCOUNT
+              value: arrowcollector68590
+            - name: AZURE_STORAGE_CHECKPOINT_CONTAINER
+              value: checkpoints
+            - name: ARROWCOL_RESET_GENERATION
+              valueFrom:
+                secretKeyRef:
+                  name: arrowcol-generation
+                  key: generation
+            - name: ARROWCOL_CATALOG_DDL_IDENTITY_SECRET_FILE
+              value: /run/auth/internal-hmac
+          ports:
+            - containerPort: 8817
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+          startupProbe:
+            exec:
+              command:
+                - /usr/local/bin/arrowcol-catalog-rust
+                - --healthcheck
+            timeoutSeconds: 8
+            periodSeconds: 10
+            failureThreshold: 60
+          readinessProbe:
+            exec:
+              command:
+                - /usr/local/bin/arrowcol-catalog-rust
+                - --healthcheck
+            timeoutSeconds: 8
+            periodSeconds: 10
+            failureThreshold: 6
+          volumeMounts:
+            - name: state
+              mountPath: /data
+              readOnly: false
+            - name: auth
+              mountPath: /run/auth
+              readOnly: true
+      volumes:
+        - name: state
+          persistentVolumeClaim:
+            claimName: arrowcol-catalog-fresh
+        - name: auth
+          secret:
+            secretName: arrowcol-router-auth
+            defaultMode: 288
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: arrowcol-router
+  namespace: arrow-collector-BENCHRUNHEX
+  labels:
+    app.kubernetes.io/part-of: arrowcol-oat
+    benchmark-stage: catalog
+    arrowcol-oat/run-id: BENCHRUNUUID
+    arrowcol-oat/owner-token: BENCHOWNER
+  annotations:
+    arrowcol-oat/run-id: BENCHRUNUUID
+    arrowcol-oat/owner-token: BENCHOWNER
+spec:
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: arrowcol-router
+  template:
+    metadata:
+      labels:
+        app: arrowcol-router
+        app.kubernetes.io/part-of: arrowcol-oat
+        arrowcol-oat/run-id: BENCHRUNUUID
+        arrowcol-oat/owner-token: BENCHOWNER
+      annotations:
+        arrowcol-oat/run-id: BENCHRUNUUID
+        arrowcol-oat/owner-token: BENCHOWNER
+    spec:
+      serviceAccountName: arrow-collector
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      nodeSelector:
+        arrow-collector/role: client
+        kubernetes.io/arch: amd64
+      tolerations:
+        - key: arrow-collector/role
+          operator: Equal
+          value: client
+          effect: NoSchedule
+      securityContext:
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      terminationGracePeriodSeconds: 360
+      containers:
+        - name: router
+          image: UNRESOLVED_ROUTER_IMAGE
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          args:
+            - --config
+            - /etc/oat/router.yaml
+          ports:
+            - containerPort: 50050
+          resources:
+            requests:
+              cpu: "2"
+              memory: 1Gi
+            limits:
+              cpu: "8"
+              memory: 4Gi
+          startupProbe:
+            httpGet:
+              path: /readyz
+              port: 50050
+            timeoutSeconds: 3
+            periodSeconds: 5
+            failureThreshold: 120
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 50050
+            timeoutSeconds: 3
+            periodSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 50050
+            timeoutSeconds: 3
+            periodSeconds: 5
+            failureThreshold: 6
+          volumeMounts:
+            - name: config
+              mountPath: /etc/oat
+              readOnly: true
+            - name: app
+              mountPath: /run/app
+              readOnly: true
+            - name: auth
+              mountPath: /run/auth
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: arrowcol-config
+        - name: app
+          secret:
+            secretName: arrowcol-sql-runtime
+            defaultMode: 288
+        - name: auth
+          secret:
+            secretName: arrowcol-router-auth
+            defaultMode: 288
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: catalog-internal
+  namespace: arrow-collector-BENCHRUNHEX
+  labels:
+    app.kubernetes.io/part-of: arrowcol-oat
+    benchmark-stage: catalog
+spec:
+  podSelector:
+    matchLabels:
+      app: arrowcol-catalog
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: arrowcol
+        - podSelector:
+            matchLabels:
+              app: arrowcol-oat-client
+        - podSelector:
+            matchLabels:
+              app: delta-maintenance
+      ports:
+        - protocol: TCP
+          port: 8817
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: flight-router-only
+  namespace: arrow-collector-BENCHRUNHEX
+  labels:
+    app.kubernetes.io/part-of: arrowcol-oat
+    benchmark-stage: catalog
+spec:
+  podSelector:
+    matchLabels:
+      app: arrowcol
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: arrowcol-router
+      ports:
+        - protocol: TCP
+          port: 32010
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: router-oat-client-ingress
+  namespace: arrow-collector-BENCHRUNHEX
+  labels:
+    app.kubernetes.io/part-of: arrowcol-oat
+    benchmark-stage: catalog
+spec:
+  podSelector:
+    matchLabels:
+      app: arrowcol-router
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: arrowcol-oat-client
+      ports:
+        - protocol: TCP
+          port: 50050
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: delta-maintenance
+  namespace: arrow-collector-BENCHRUNHEX
+  labels:
+    app.kubernetes.io/part-of: arrowcol-oat
+    benchmark-stage: catalog
+    arrowcol-oat/run-id: BENCHRUNUUID
+    arrowcol-oat/owner-token: BENCHOWNER
+  annotations:
+    arrowcol-oat/run-id: BENCHRUNUUID
+    arrowcol-oat/owner-token: BENCHOWNER
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: delta-maintenance
+  template:
+    metadata:
+      labels:
+        app: delta-maintenance
+        app.kubernetes.io/part-of: arrowcol-oat
+        azure.workload.identity/use: "true"
+        arrowcol-oat/run-id: BENCHRUNUUID
+        arrowcol-oat/owner-token: BENCHOWNER
+      annotations:
+        arrowcol-oat/run-id: BENCHRUNUUID
+        arrowcol-oat/owner-token: BENCHOWNER
+    spec:
+      serviceAccountName: arrow-collector
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      nodeSelector:
+        arrow-collector/role: support
+        kubernetes.io/arch: amd64
+      tolerations:
+        - key: arrow-collector/role
+          operator: Equal
+          value: support
+          effect: NoSchedule
+      securityContext:
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      terminationGracePeriodSeconds: 4800
+      containers:
+        - name: maintenance
+          image: UNRESOLVED_MAINTENANCE_IMAGE
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          args:
+            - --catalog-endpoint
+            - http://arrowcol-catalog:8817
+            - --interval-secs
+            - "60"
+            - --listen
+            - 0.0.0.0:9467
+            - --table
+            - telemetry.sqlserver.sqlserver_availability_replica_states
+            - --operation
+            - purge
+            - --operation
+            - optimize
+            - --operation
+            - vacuum
+            - --operation
+            - checkpoint
+            - --operation
+            - prune-log
+            - --apply
+          env:
+            - name: ARROWCOL_DELTA_ROOT
+              value: abfss://arrowcol@arrowcollector68590.dfs.core.windows.net/direct-baseline-1/runs/BENCHRUNUUID/dataflow
+            - name: ARROWCOL_AZURE_MODE
+              value: stamped
+            - name: AZURE_SUBSCRIPTION_ID
+              value: 68fa0545-661c-4152-93f2-fc8ae1c231b8
+            - name: AZURE_STAMP
+              value: "68590"
+            - name: AZURE_RESOURCE_GROUP
+              value: arrow-collector-rg
+            - name: AZURE_STORAGE_ACCOUNT
+              value: arrowcollector68590
+            - name: AZURE_STORAGE_CHECKPOINT_CONTAINER
+              value: checkpoints
+            - name: ARROWCOL_RESET_GENERATION
+              valueFrom:
+                secretKeyRef:
+                  name: arrowcol-generation
+                  key: generation
+            - name: ARROWCOL_CATALOG_DDL_IDENTITY_SECRET_FILE
+              value: /run/auth/internal-hmac
+          ports:
+            - containerPort: 9467
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 2Gi
+          startupProbe:
+            httpGet:
+              path: /metrics
+              port: 9467
+            timeoutSeconds: 3
+            periodSeconds: 5
+            failureThreshold: 120
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: 9467
+            timeoutSeconds: 3
+            periodSeconds: 5
+            failureThreshold: 6
+          volumeMounts:
+            - name: auth
+              mountPath: /run/auth
+              readOnly: true
+      volumes:
+        - name: auth
+          secret:
+            secretName: arrowcol-router-auth
+            defaultMode: 288
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: arrowcol
+  namespace: arrow-collector-BENCHRUNHEX
+  labels:
+    app.kubernetes.io/part-of: arrowcol-oat
+    benchmark-stage: writer
+    arrowcol-oat/run-id: BENCHRUNUUID
+    arrowcol-oat/owner-token: BENCHOWNER
+  annotations:
+    arrowcol-oat/run-id: BENCHRUNUUID
+    arrowcol-oat/owner-token: BENCHOWNER
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: arrowcol
+  template:
+    metadata:
+      labels:
+        app: arrowcol
+        app.kubernetes.io/part-of: arrowcol-oat
+        azure.workload.identity/use: "true"
+        arrowcol-oat/run-id: BENCHRUNUUID
+        arrowcol-oat/owner-token: BENCHOWNER
+      annotations:
+        arrowcol-oat/run-id: BENCHRUNUUID
+        arrowcol-oat/owner-token: BENCHOWNER
+        benchmark.arrowcol/tuning: e64-size-layout-wide-v4
+    spec:
+      serviceAccountName: arrow-collector
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      nodeSelector:
+        arrow-collector/role: arrowcol
+        arrow-collector/sku: Standard_E192ids_v6
+        kubernetes.io/arch: amd64
+      tolerations:
+        - key: arrow-collector/role
+          operator: Equal
+          value: arrowcol
+          effect: NoSchedule
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: arrowcol
+              topologyKey: kubernetes.io/hostname
+      securityContext:
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      terminationGracePeriodSeconds: 360
+      containers:
+        - name: dataflow
+          image: UNRESOLVED_COLLECTOR_IMAGE
+          command:
+            - /usr/bin/tini
+            - --
+            - /bin/sh
+            - -ec
+            - |
+              set -u
+              umask 077
+              dir="/var/lib/arrowcol/staging/benchmark-logs/$BENCH_POD_UID"
+              mkdir -p /var/lib/arrowcol/staging/benchmark-logs
+              mkdir "$dir"
+              : > "$dir/stdout"
+              : > "$dir/stderr"
+              fallocate --keep-size -l 4GiB "$dir/stdout"
+              fallocate --keep-size -l 4GiB "$dir/stderr"
+              printf '%s\n' "$$" > "$dir/pid"
+              exec prlimit --fsize=4294967296:4294967296 -- /usr/local/bin/arrowcol-dataflow-rust "$@" >> "$dir/stdout" 2>> "$dir/stderr"
+            - capture
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          args:
+            - --config
+            - /etc/oat/dataflow.yaml
+            - --num-cores
+            - "160"
+          env:
+            - name: BENCH_POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+            - name: ARROWCOL_DELTA_ROOT
+              value: abfss://arrowcol@arrowcollector68590.dfs.core.windows.net/direct-baseline-1/runs/BENCHRUNUUID/dataflow
+            - name: ARROWCOL_AZURE_MODE
+              value: stamped
+            - name: AZURE_SUBSCRIPTION_ID
+              value: 68fa0545-661c-4152-93f2-fc8ae1c231b8
+            - name: AZURE_STAMP
+              value: "68590"
+            - name: AZURE_RESOURCE_GROUP
+              value: arrow-collector-rg
+            - name: AZURE_STORAGE_ACCOUNT
+              value: arrowcollector68590
+            - name: AZURE_STORAGE_CHECKPOINT_CONTAINER
+              value: checkpoints
+            - name: ARROWCOL_RESET_GENERATION
+              valueFrom:
+                secretKeyRef:
+                  name: arrowcol-generation
+                  key: generation
+            - name: ARROWCOL_SQL_HOST
+              value: arrowcol-sql
+            - name: ARROWCOL_SQL_PASSWORD_FILE
+              value: /run/app/password
+            - name: ARROWCOL_PARTITION_GRANULARITY
+              value: hour
+            - name: ARROWCOL_SQL_TRUST_CERT
+              value: "true"
+            - name: ARROWCOL_CATALOG_ENDPOINT
+              value: http://arrowcol-catalog:8817
+            - name: ARROWCOL_CATALOG_DDL_IDENTITY_SECRET_FILE
+              value: /run/auth/internal-hmac
+            - name: ARROWCOL_INSTANCE_KEY
+              value: direct-single-writer-BENCHRUNUUID
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: ARROWCOL_ADVERTISED_FLIGHT_ENDPOINT
+              value: $(POD_IP):32010
+            - name: ARROWCOL_LAYOUT_ROW_GROUP_ROWS
+              value: "262144"
+            - name: ARROWCOL_LAYOUT_MAX_INPUT_BYTES
+              value: "4294967296"
+            - name: ARROWCOL_LAYOUT_MAX_ROWS
+              value: "2000000"
+            - name: ARROWCOL_MAX_MESSAGE_BYTES
+              value: "134217728"
+            - name: ARROWCOL_COLLECTOR_RECEIVER_TRANSPORT_CONFIG
+              value: '{"initial_stream_window_size":1048576,"initial_connection_window_size":16777216,"adaptive_window":false,"tcp_nodelay":true}'
+            - name: ARROWCOL_COLLECTOR_CPU_WORKERS
+              value: "32"
+            - name: ARROWCOL_PUBLICATION_AUDIT_JSON
+              value: "true"
+            - name: TMPDIR
+              value: /var/lib/arrowcol/staging
+          ports:
+            - containerPort: 32010
+            - containerPort: 32011
+          resources:
+            requests:
+              cpu: "176"
+              memory: 384Gi
+            limits:
+              memory: 384Gi
+              cpu: "176"
+          startupProbe:
+            httpGet:
+              path: /readyz
+              port: 32011
+            timeoutSeconds: 3
+            periodSeconds: 5
+            failureThreshold: 120
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 32011
+            timeoutSeconds: 3
+            periodSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 32011
+            timeoutSeconds: 3
+            periodSeconds: 5
+            failureThreshold: 6
+          volumeMounts:
+            - name: config
+              mountPath: /etc/oat
+              readOnly: true
+            - name: app
+              mountPath: /run/app
+              readOnly: true
+            - name: auth
+              mountPath: /run/auth
+              readOnly: true
+            - name: staging
+              mountPath: /var/lib/arrowcol/staging
+              readOnly: false
+      volumes:
+        - name: config
+          configMap:
+            name: arrowcol-config
+        - name: app
+          secret:
+            secretName: arrowcol-sql-runtime
+            defaultMode: 288
+        - name: auth
+          secret:
+            secretName: arrowcol-router-auth
+            defaultMode: 288
+        - name: staging
+          persistentVolumeClaim:
+            claimName: arrowcol-writer-staging
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: arrowcol-writer-staging
+  namespace: arrow-collector-BENCHRUNHEX
+  labels:
+    app.kubernetes.io/part-of: arrowcol-oat
+    benchmark-stage: writer
+    arrowcol-oat/run-id: BENCHRUNUUID
+    arrowcol-oat/owner-token: BENCHOWNER
+  annotations:
+    arrowcol-oat/run-id: BENCHRUNUUID
+    arrowcol-oat/owner-token: BENCHOWNER
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: arrowcol-BENCHRUNHEX-local-csi
+  resources:
+    requests:
+      storage: 256Gi
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: direct-pin-live
+  namespace: arrow-collector-BENCHRUNHEX
+  labels:
+    arrowcol-oat/run-id: BENCHRUNUUID
+    benchmark-stage: initializer
+data:
+  pin-init.json: '{"schema_version":1,"run_id":"BENCHRUNUUID","expires_at_unix_ms":9876543210000,"expected_keys":[{"implementation_pool":"dataflow","catalog_name":"telemetry","schema_name":"sqlserver","table_name":"sqlserver_availability_replica_states"}],"expected_digest":"ef5de097fa343878db791383dd61c17440ada9ce8cacd58259e84466173d67ae","routing_policy":{"pressure":{"max_snapshot_age_ms":15000,"max_future_skew_ms":2000,"max_table_entries":256,"max_oldest_buffer_age_ms":86400000},"excluded_admission_gauges":[],"oat_run_pin_ttl_ms":3600000,"hard_pressure_bps":9500,"warmup_ms":1000,"minimum_warmup_bps":1000,"lease_ttl_ms":3600000,"readiness_max_staleness_ms":30000,"distinct_table_owners":false,"oat_run_id":"BENCHRUNUUID"},"sql_server":{"host":"arrowcol-sql","port":1433,"trust_server_certificate":true},"run_table":{"delta_root":"abfss://arrowcol@arrowcollector68590.dfs.core.windows.net/direct-baseline-1/runs/BENCHRUNUUID/dataflow","table":"telemetry.sqlserver.sqlserver_availability_replica_states"}}'
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: direct-pin-live
+  namespace: arrow-collector-BENCHRUNHEX
+  labels:
+    arrowcol-oat/run-id: BENCHRUNUUID
+    benchmark-stage: initializer
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 140
+  template:
+    metadata:
+      labels:
+        arrowcol-oat/run-id: BENCHRUNUUID
+        app: arrowcol-oat-pin-init
+        azure.workload.identity/use: "true"
+    spec:
+      nodeSelector:
+        arrow-collector/role: support
+        kubernetes.io/arch: amd64
+      tolerations:
+        - key: arrow-collector/role
+          operator: Equal
+          value: support
+          effect: NoSchedule
+      serviceAccountName: arrow-collector
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      restartPolicy: Never
+      containers:
+        - name: pin-init
+          image: UNRESOLVED_CLIENT_IMAGE
+          command:
+            - /usr/local/bin/arrowcol-oat-pin-init
+          args:
+            - --config
+            - /run/arrowcol-oat/pin-init.json
+            - --migrator-password-file
+            - /run/migration/password
+          env:
+            - name: ARROWCOL_DELTA_ROOT
+              value: abfss://arrowcol@arrowcollector68590.dfs.core.windows.net/direct-baseline-1/runs/BENCHRUNUUID/dataflow
+            - name: ARROWCOL_AZURE_MODE
+              value: stamped
+            - name: AZURE_SUBSCRIPTION_ID
+              value: 68fa0545-661c-4152-93f2-fc8ae1c231b8
+            - name: AZURE_STAMP
+              value: "68590"
+            - name: AZURE_RESOURCE_GROUP
+              value: arrow-collector-rg
+            - name: AZURE_STORAGE_ACCOUNT
+              value: arrowcollector68590
+            - name: AZURE_STORAGE_CHECKPOINT_CONTAINER
+              value: checkpoints
+            - name: ARROWCOL_RESET_GENERATION
+              valueFrom:
+                secretKeyRef:
+                  name: arrowcol-generation
+                  key: generation
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: pin-config
+              mountPath: /run/arrowcol-oat
+              readOnly: true
+            - name: migration-password
+              mountPath: /run/migration
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: pin-config
+          configMap:
+            name: direct-pin-live
+        - name: migration-password
+          secret:
+            secretName: arrowcol-sql-migration
+            defaultMode: 288
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: direct-catalog-registration
+  namespace: arrow-collector-BENCHRUNHEX
+  labels:
+    benchmark-stage: registration
+data:
+  register.json: '{"schema_version":1,"run_id":"BENCHRUNUUID","delta_root":"abfss://arrowcol@arrowcollector68590.dfs.core.windows.net/direct-baseline-1/runs/BENCHRUNUUID/dataflow","table":"telemetry.sqlserver.sqlserver_availability_replica_states","endpoint":"http://arrowcol-router:50050","catalog_endpoint":"http://arrowcol-catalog:8817"}'
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: direct-catalog-verified
+  namespace: arrow-collector-BENCHRUNHEX
+  labels:
+    arrowcol-oat/run-id: BENCHRUNUUID
+    arrowcol-oat/owner-token: BENCHOWNER
+    benchmark-stage: registration
+  annotations:
+    arrowcol-oat/run-id: BENCHRUNUUID
+    arrowcol-oat/owner-token: BENCHOWNER
+spec:
+  suspend: false
+  backoffLimit: 0
+  activeDeadlineSeconds: 180
+  parallelism: 1
+  completions: 1
+  template:
+    metadata:
+      labels:
+        arrowcol-oat/run-id: BENCHRUNUUID
+        arrowcol-oat/owner-token: BENCHOWNER
+        app: arrowcol-oat-client
+      annotations:
+        arrowcol-oat/run-id: BENCHRUNUUID
+        arrowcol-oat/owner-token: BENCHOWNER
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      nodeSelector:
+        arrow-collector/role: support
+        kubernetes.io/arch: amd64
+      tolerations:
+        - key: arrow-collector/role
+          operator: Equal
+          value: support
+          effect: NoSchedule
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: register
+          image: UNRESOLVED_CLIENT_IMAGE
+          args:
+            - --register-only-config
+            - /run/arrowcol-oat/register.json
+            - --edge-secret-file
+            - /run/secrets/edge-hmac
+            - --internal-secret-file
+            - /run/secrets/internal-hmac
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: edge
+              mountPath: /run/secrets
+              readOnly: true
+            - name: registration-config
+              mountPath: /run/arrowcol-oat
+              readOnly: true
+          command:
+            - /usr/local/bin/arrowcol-oat-pin-init
+      volumes:
+        - name: edge
+          secret:
+            secretName: arrowcol-router-auth
+            defaultMode: 288
+            items:
+              - key: edge-hmac
+                path: edge-hmac
+              - key: internal-hmac
+                path: internal-hmac
+        - name: registration-config
+          configMap:
+            name: direct-catalog-registration
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: direct-schedule-confirmwide
+  namespace: arrow-collector-BENCHRUNHEX
+  labels:
+    arrowcol-oat/run-id: BENCHRUNUUID
+    arrowcol-oat/owner-token: BENCHOWNER
+    benchmark-stage: load
+  annotations:
+    arrowcol-oat/run-id: BENCHRUNUUID
+    arrowcol-oat/owner-token: BENCHOWNER
+data:
+  start: pending
+  writerLifetime: pending
+  clientLifetimes: pending
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: direct-load-confirmwide
+  namespace: arrow-collector-BENCHRUNHEX
+  labels:
+    arrowcol-oat/run-id: BENCHRUNUUID
+    arrowcol-oat/owner-token: BENCHOWNER
+    benchmark-stage: load
+  annotations:
+    arrowcol-oat/run-id: BENCHRUNUUID
+    arrowcol-oat/owner-token: BENCHOWNER
+spec:
+  suspend: true
+  backoffLimit: 0
+  activeDeadlineSeconds: 1320
+  completionMode: Indexed
+  parallelism: BENCHCLIENTCOUNT
+  completions: BENCHCLIENTCOUNT
+  template:
+    metadata:
+      labels:
+        arrowcol-oat/run-id: BENCHRUNUUID
+        arrowcol-oat/owner-token: BENCHOWNER
+        app: arrowcol-oat-client
+      annotations:
+        arrowcol-oat/run-id: BENCHRUNUUID
+        arrowcol-oat/owner-token: BENCHOWNER
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      nodeSelector:
+        arrow-collector/role: client
+        kubernetes.io/arch: amd64
+      tolerations:
+        - key: arrow-collector/role
+          operator: Equal
+          value: client
+          effect: NoSchedule
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: arrowcol-oat-client
+              topologyKey: kubernetes.io/hostname
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: generator
+          image: UNRESOLVED_CLIENT_IMAGE
+          command:
+            - /bin/sh
+            - -ec
+            - |
+              set -u
+              umask 077
+              dir="/evidence/$BENCH_POD_UID"
+              mkdir "$dir"
+              : > "$dir/stdout"
+              : > "$dir/stderr"
+              fallocate --keep-size -l 128MiB "$dir/stdout"
+              fallocate --keep-size -l 128MiB "$dir/stderr"
+              printf '%s\n' "$$" > "$dir/pid"
+              exec prlimit --fsize=134217728:134217728 -- /usr/local/bin/arrowcol-dmv "$@" >> "$dir/stdout" 2>> "$dir/stderr"
+            - capture
+          args:
+            - --endpoint
+            - http://arrowcol-router-node-local:30550
+            - --client-id
+            - direct-BENCHRUNUUID-$(CLIENT_INDEX)
+            - --table
+            - sqlserver_availability_replica_states
+            - --rows
+            - "65536"
+            - --concurrency
+            - "32"
+            - --edge-secret-file
+            - /run/secrets/edge-hmac
+            - --warmup-secs
+            - "60"
+            - --duration-secs
+            - "600"
+            - --schedule-file
+            - /schedule/start
+            - --schedule-timeout-secs
+            - "350"
+            - --workers
+            - "16"
+            - --streams-per-worker
+            - "2"
+            - --runtime-threads
+            - "16"
+            - --pod-ordinal
+            - $(CLIENT_INDEX)
+            - --data-profile
+            - realistic
+            - --data-mode
+            - shared
+            - --string-width
+            - "789"
+            - --string-length-distribution
+            - uniform
+            - --value-variation
+            - per_row
+            - --guid-uniqueness
+            - per_row
+            - --stream-retry-max-attempts
+            - "1"
+            - --ipc-compression
+            - none
+            - --interval-us
+            - "0"
+            - --batch-rows
+            - "65536"
+            - --corpus-rows
+            - "1048576"
+            - --max-flight-data-bytes
+            - "67108864"
+            - --max-message-bytes
+            - "134217728"
+            - --max-memory-bytes
+            - "34359738368"
+          env:
+            - name: BENCH_POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+            - name: CLIENT_INDEX
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
+          resources:
+            requests:
+              cpu: "32"
+              memory: 32Gi
+            limits:
+              cpu: "48"
+              memory: 48Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: edge
+              mountPath: /run/secrets
+              readOnly: true
+            - name: schedule
+              mountPath: /schedule
+              readOnly: true
+            - name: evidence
+              mountPath: /evidence
+      volumes:
+        - name: edge
+          secret:
+            secretName: arrowcol-router-auth
+            defaultMode: 288
+            items:
+              - key: edge-hmac
+                path: edge-hmac
+        - name: schedule
+          configMap:
+            name: direct-schedule-confirmwide
+        - name: evidence
+          ephemeral:
+            volumeClaimTemplate:
+              metadata:
+                labels:
+                  arrowcol-oat/run-id: BENCHRUNUUID
+                  arrowcol-oat/owner-token: BENCHOWNER
+                annotations:
+                  arrowcol-oat/run-id: BENCHRUNUUID
+                  arrowcol-oat/owner-token: BENCHOWNER
+              spec:
+                storageClassName: managed-csi
+                accessModes:
+                  - ReadWriteOnce
+                resources:
+                  requests:
+                    storage: 1Gi
