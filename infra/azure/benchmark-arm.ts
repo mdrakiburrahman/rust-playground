@@ -62,11 +62,13 @@ function controller(metadata: Json, kind: string): Json {
   return controllers[0];
 }
 
-export function observeWriter(identity: ArmIdentity, deployment: unknown, replicaSets: unknown, pods: unknown) {
+const directContainers = { arrowcol: 'dataflow', 'delta-maintenance': 'maintenance', 'arrowcol-sql': 'sqlserver' } as const;
+export function observeWriter(identity: ArmIdentity, deployment: unknown, replicaSets: unknown, pods: unknown,
+  role: keyof typeof directContainers = 'arrowcol') {
   const workload = object(deployment, 'writer Deployment');
   const dm = object(workload.metadata, 'writer metadata');
   ownership(dm, identity);
-  if (workload.apiVersion !== 'apps/v1' || workload.kind !== 'Deployment' || dm.name !== 'arrowcol' ||
+  if (workload.apiVersion !== 'apps/v1' || workload.kind !== 'Deployment' || dm.name !== role ||
       dm.namespace !== identity.namespace || dm.deletionTimestamp ||
       object(workload.spec, 'writer spec').replicas !== 1) throw new Error('Writer Deployment is not the expected single replica');
   const deploymentUid = text(dm.uid, 'writer Deployment UID');
@@ -87,7 +89,7 @@ export function observeWriter(identity: ArmIdentity, deployment: unknown, replic
   if (containers.length !== 1) throw new Error('Expected exactly one writer container');
   const container = object(containers[0], 'writer container');
   const image = text(container.image, 'writer image');
-  if (container.name !== 'dataflow' || !/^.+@sha256:[0-9a-f]{64}$/.test(image)) throw new Error('Writer image is not digest-pinned');
+  if (container.name !== directContainers[role] || !/^.+@sha256:[0-9a-f]{64}$/.test(image)) throw new Error('Workload image is not digest-pinned');
   const status = object(pod.status, 'writer pod status');
   const statuses = array(status.containerStatuses, 'writer container statuses');
   if (statuses.length !== 1) throw new Error('Expected exactly one writer container status');
@@ -96,17 +98,19 @@ export function observeWriter(identity: ArmIdentity, deployment: unknown, replic
   const imageId = text(active.imageID, 'writer runtime image');
   const containerId = text(active.containerID, 'writer runtime container');
   if (!matchesImageDigest(image, imageId)) throw new Error('Writer runtime digest differs from its pinned image');
-  if (status.phase !== 'Running' || active.name !== 'dataflow' || active.ready !== true || active.restartCount !== 0 ||
+  if (status.phase !== 'Running' || active.name !== directContainers[role] || active.ready !== true || active.restartCount !== 0 ||
       !Number.isFinite(Date.parse(startedAt))) {
     throw new Error('Writer container is not the original healthy lifetime');
   }
   const podIp = text(status.podIP, 'writer pod IP');
   const nodeName = text(spec.nodeName, 'writer node name');
-  const staging = array(spec.volumes, 'writer volumes').map(v => object(v, 'writer volume')).filter(v => v.name === 'staging');
-  const mounts = array(container.volumeMounts, 'writer mounts').map(v => object(v, 'writer mount')).filter(v => v.name === 'staging');
-  if (staging.length !== 1 || object(staging[0].persistentVolumeClaim, 'writer claim').claimName !== WRITER_CLAIM ||
+  if (role === 'arrowcol') {
+    const staging = array(spec.volumes, 'writer volumes').map(v => object(v, 'writer volume')).filter(v => v.name === 'staging');
+    const mounts = array(container.volumeMounts, 'writer mounts').map(v => object(v, 'writer mount')).filter(v => v.name === 'staging');
+    if (staging.length !== 1 || object(staging[0].persistentVolumeClaim, 'writer claim').claimName !== WRITER_CLAIM ||
       mounts.length !== 1 || mounts[0].mountPath !== '/var/lib/arrowcol/staging' || mounts[0].subPath !== undefined ||
       mounts[0].subPathExpr !== undefined) throw new Error('Writer pod is not using the retained staging PVC');
+  }
   return { deploymentUid, replicaSetUid: text(replica.uid, 'writer ReplicaSet UID'),
     podName: text(pm.name, 'writer pod name'), podUid: text(pm.uid, 'writer pod UID'), podIp, nodeName, image, imageId, containerId, startedAt };
 }
@@ -298,13 +302,8 @@ function readJson(context: string, args: string[]): unknown {
   return JSON.parse(kubectl(context, [...args, '-o', 'json'])) as unknown;
 }
 
-function main(): void {
-  const [context, namespace, namespaceUid, runId, owner, count, confirmation, ...extra] = process.argv.slice(2);
-  if (extra.length || !context || !namespace || !namespaceUid || !runId || !owner ||
-      !/^[1-8]$/.test(count ?? '') || confirmation !== '--confirm-authorized') {
-    throw new Error('Usage: tsx benchmark-arm.ts CONTEXT NAMESPACE NAMESPACE_UID RUN_UUID OWNER CLIENTS --confirm-authorized');
-  }
-  const identity = { namespace, namespaceUid, runId, owner, clients: Number(count) };
+export function prepareDirectBarrier(context: string, identity: ArmIdentity) {
+  const { namespace, namespaceUid, runId } = identity;
   const get = (kind: string, name: string) => readJson(context, ['-n', namespace, 'get', kind, name]);
   const readWriter = () => observeWriter(identity, get('deployment', 'arrowcol'),
     readJson(context, ['-n', namespace, 'get', 'replicasets', '-l', 'app=arrowcol']),
@@ -343,6 +342,7 @@ function main(): void {
     if (!volume?.ephemeral || mount?.mountPath !== '/evidence' || mount.subPath !== undefined || mount.subPathExpr !== undefined) {
       throw new Error('Client evidence mount does not use its generic ephemeral PVC');
     }
+
     const image = text(container.image, 'client image'), imageId = text(active.imageID, 'client runtime image');
     if (!matchesImageDigest(image, imageId)) throw new Error('Client runtime digest differs from its pinned image');
     const claim = object(get('pvc', `${name}-evidence`), 'client evidence PVC');
@@ -380,13 +380,10 @@ function main(): void {
     { op: 'test', path: '/data/clientLifetimes', value: 'pending' },
     { op: 'replace', path: '/data/clientLifetimes', value: clients },
   ];
-  kubectl(context, ['-n', namespace, 'patch', 'configmap', 'direct-schedule-confirmwide',
-    '--type=json', '--patch', JSON.stringify(patch)]);
-  const observed = object(object(get('configmap', 'direct-schedule-confirmwide'), 'schedule').data, 'schedule data');
-  if (observed.start !== String(start) || observed.writerLifetime !== writer || observed.clientLifetimes !== clients)
-    throw new Error('Schedule patch readback mismatch');
-  console.log(JSON.stringify({ runId, namespaceUid, podUids: checked.podUids, writer: JSON.parse(writer), runStartUnixMs: start,
-    measurementStartUnixMs: start + 60_000, measurementEndUnixMs: start + 660_000 }));
+  return { runId, namespaceUid, podUids: checked.podUids, writer: JSON.parse(writer) as ReturnType<typeof readCapturedWriter>,
+    clients: JSON.parse(clients) as ClientLifetime[], runStartUnixMs: start,
+    measurementStartUnixMs: start + 60_000, measurementEndUnixMs: start + 660_000, patch };
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) main();
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href)
+  throw new Error('Direct load is disabled until the original arm record can be sealed off-node before barrier release');

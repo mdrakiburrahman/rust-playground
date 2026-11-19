@@ -66,12 +66,10 @@
 # -> writer (one ready pod and stable restart count) -> initializer (wait job/direct-pin-live)
 # -> registration (wait job/direct-catalog-verified and verify signed one-table receipt)
 # -> load (the Job is suspended by default; only unsuspend after all gates and separate approval).
-# Wait for one READY client with a distinct index for every expected completion. Arm the shared
-# pending ConfigMap using the ownership-checked benchmark-arm.ts tool; verify each client received the identical timestamp
-# and terminal measurement bounds [start+60000,start+660000); otherwise invalidate the window.
-# After separate authorization:
-# npx --no-install tsx infra/azure/benchmark-arm.ts "$CONTEXT" "$NS" "$NAMESPACE_UID" "$UUID" "$OWNER" "$CLIENTS" --confirm-authorized
-# Capture its output. If patch outcome or readback is ambiguous, inspect the ConfigMap; never blindly retry.
+# Keep the Job suspended until the source-owned armer records the original run off-node before
+# releasing the shared ConfigMap. The standalone benchmark-arm.ts command cannot bypass this gate.
+# The eventual release must verify one READY client per index and identical bounds [start+60000,start+660000).
+# If a release outcome is ambiguous, inspect the original ConfigMap; do not retry blindly.
 # Before and after each window, capture a clock-offset bound for every distinct client node and the
 # collector node against the operator. For a pod sharing each node's clock, record operator Unix ns
 # immediately before (t0) and after (t1) `kubectl exec POD -- date -u +%s%N` and the pod timestamp;
@@ -278,6 +276,11 @@ metadata:
   labels:
     app.kubernetes.io/part-of: arrowcol-oat
     benchmark-stage: sql
+    arrowcol-oat/run-id: BENCHRUNUUID
+    arrowcol-oat/owner-token: BENCHOWNER
+  annotations:
+    arrowcol-oat/run-id: BENCHRUNUUID
+    arrowcol-oat/owner-token: BENCHOWNER
 spec:
   replicas: 1
   strategy:
@@ -290,6 +293,11 @@ spec:
       labels:
         app: arrowcol-sql
         app.kubernetes.io/part-of: arrowcol-oat
+        arrowcol-oat/run-id: BENCHRUNUUID
+        arrowcol-oat/owner-token: BENCHOWNER
+      annotations:
+        arrowcol-oat/run-id: BENCHRUNUUID
+        arrowcol-oat/owner-token: BENCHOWNER
     spec:
       serviceAccountName: arrow-collector
       automountServiceAccountToken: false

@@ -205,7 +205,7 @@ test('direct terminal gate blocks reordered stop receipts before consuming termi
     image: `test@sha256:${'a'.repeat(64)}`, imageId: `sha256:${'a'.repeat(64)}`, containerId: 'original', startedAt: '2026-01-01T00:00:00Z',
   };
   const arm: DirectTerminalArm = {
-    origin, startMs: endMs - 60000, endMs, clients: [], writer: original, maintenance: original, routerUid: uid,
+    origin, startMs: endMs - 60000, endMs, clients: [], writer: original, maintenance: original, sql: original, routerUid: uid,
     writerClaim: { claimUid: run.owner, volumeName: 'pv' }, baseline: {
       table_id: uid, table_root: `direct-baseline-1/runs/${run.runId}/dataflow/table`, version: 1, last_commit_sha256: '0'.repeat(64),
     }, registration: { instance_id: uid, instance_key: '', implementation_pool: 'dataflow', flight_endpoint: '',

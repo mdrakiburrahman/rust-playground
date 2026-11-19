@@ -1,10 +1,9 @@
 import { strict as assert } from 'node:assert';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { delimiter, join } from 'node:path';
 import { test } from 'node:test';
-import { fileURLToPath } from 'node:url';
 import { observeWriter, observeWriterCapture, observeWriterExit, validateArm, type ArmIdentity } from './benchmark-arm.js';
 
 const identity: ArmIdentity = {
@@ -136,12 +135,11 @@ test('refuses missing readiness and pods owned by a different job', () => {
   assert.throws(() => validateArm(identity, f.namespace, f.job, f.schedule, f.pods, f.logs), /not owned/);
 });
 
-test('arms one shared timestamp with an atomic pending/version precondition', () => {
+test('prepares one shared timestamp and atomic pending/version preconditions without arming', () => {
   const dir = mkdtempSync(join(tmpdir(), 'benchmark-arm-fixture-'));
   try {
     const f = fixture();
     const data = join(dir, 'fixture.json');
-    const patch = join(dir, 'patch.json');
     writeFileSync(data, JSON.stringify({ ...f, logs: Object.fromEntries(f.logs) }));
     const executable = join(dir, 'kubectl');
     writeFileSync(executable, `#!/usr/bin/env node
@@ -154,36 +152,28 @@ else if(a.includes('exec')) {
   process.stdout.write(pod==='writer-pod'?'writer-capture-active\\n':d.logs[pod]);
 }
 else if(a.includes('pvc')) { process.stdout.write(JSON.stringify(d.claims[a[a.indexOf('pvc')+1]] ?? d.pvc)); }
-else if(a.includes('patch')) {
-  const p=JSON.parse(a[a.indexOf('--patch')+1]);
-  if(p[0].value!=='17'||p[1].value!=='pending'||p[2].path!=='/data/start'||
-     p[3].path!=='/data/writerLifetime'||p[3].value!=='pending'||p[4].path!=='/data/writerLifetime') process.exit(2);
-  fs.writeFileSync(process.env.ARM_PATCH,JSON.stringify(p));
-  process.stdout.write('{}');
-} else if(a.includes('namespace')&&!a.includes('pods')) { process.stdout.write(JSON.stringify(d.namespace)); }
+else if(a.includes('patch')) { process.exit(2); }
+else if(a.includes('namespace')&&!a.includes('pods')) { process.stdout.write(JSON.stringify(d.namespace)); }
 else if(a.includes('job')) { process.stdout.write(JSON.stringify(d.job)); }
-else if(a.includes('configmap')) {
-  if(fs.existsSync(process.env.ARM_PATCH)) {
-    const ops=JSON.parse(fs.readFileSync(process.env.ARM_PATCH,'utf8'));
-    d.schedule.data.start=ops[2].value;
-    d.schedule.data.writerLifetime=ops[4].value;
-    d.schedule.data.clientLifetimes=ops[6].value;
-  }
-  process.stdout.write(JSON.stringify(d.schedule));
-} else if(a.includes('deployment')) { process.stdout.write(JSON.stringify(d.deployment)); }
+else if(a.includes('configmap')) { process.stdout.write(JSON.stringify(d.schedule)); }
+else if(a.includes('deployment')) { process.stdout.write(JSON.stringify(d.deployment)); }
 else if(a.includes('replicasets')) { process.stdout.write(JSON.stringify(d.replicaSets)); }
 else if(a.includes('pods')) { process.stdout.write(JSON.stringify(a.includes('app=arrowcol') ? d.writerPods : d.pods)); }
 else process.exit(3);
 `);
     chmodSync(executable, 0o700);
-    const run = spawnSync(process.execPath, ['--import', 'tsx',
-      fileURLToPath(new URL('./benchmark-arm.ts', import.meta.url)), 'fixture', identity.namespace,
-      identity.namespaceUid, identity.runId, identity.owner, '2', '--confirm-authorized'],
+    const module = new URL('./benchmark-arm.ts', import.meta.url).href;
+    const run = spawnSync(process.execPath, ['--import', 'tsx', '--input-type=module', '--eval',
+      `import {prepareDirectBarrier} from ${JSON.stringify(module)}; console.log(JSON.stringify(prepareDirectBarrier('fixture', ${JSON.stringify(identity)})));`],
     { encoding: 'utf8', env: { ...process.env, PATH: `${dir}${delimiter}${process.env.PATH}`,
-      ARM_FIXTURE: data, ARM_PATCH: patch } });
+      ARM_FIXTURE: data } });
     assert.equal(run.status, 0, run.stderr);
-    const output = JSON.parse(run.stdout) as { runStartUnixMs: number; measurementStartUnixMs: number; measurementEndUnixMs: number };
-    const ops = JSON.parse(readFileSync(patch, 'utf8')) as Array<{ value: string }>;
+    const output = JSON.parse(run.stdout) as { runStartUnixMs: number; measurementStartUnixMs: number; measurementEndUnixMs: number;
+      patch: Array<{ op: string; path: string; value: string }> };
+    const ops = output.patch;
+    assert.deepEqual(ops.filter(op => op.op === 'test').map(({ path, value }) => [path, value]), [
+      ['/metadata/resourceVersion', '17'], ['/data/start', 'pending'], ['/data/writerLifetime', 'pending'],
+      ['/data/clientLifetimes', 'pending']]);
     assert.equal(Number(ops[2].value), output.runStartUnixMs);
     assert.equal(JSON.parse(ops[4].value).podUid, 'writer-pod-uid');
     assert.equal(JSON.parse(ops[4].value).capture.claimUid, 'original-claim');

@@ -5,19 +5,19 @@ import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
 import { create_namespace_deletion_journal } from './aks-namespace-custody.js';
-import { observeWriterClaim, observeWriterExit, type ClientLifetime, type WriterLifetime } from './benchmark-arm.js';
+import { observeWriter, observeWriterClaim, observeWriterExit, WRITER_CLAIM, type ClientLifetime, type WriterLifetime } from './benchmark-arm.js';
 import { auditEvidenceFiles, evidenceJson } from './benchmark-audit.js';
 import { observeCompletedClients } from './benchmark-client-terminal.js';
 import { captureFrozenDelta, type DirectDeltaBaseline } from './benchmark-delta-evidence.js';
 import { persistDirectEvidence, type CapturedEvidence } from './benchmark-evidence-custody.js';
 import { evidenceList, evidenceObject, evidenceText, requireEvidence } from './benchmark-evidence-json.js';
-import { readDirectPodExit } from './benchmark-pod-exit.js';
+import { readDirectPodExit, stopDirectPodWithExit } from './benchmark-pod-exit.js';
 import { acceptRouterFencePatch, routerFenceObserved } from './benchmark-router-fence.js';
-import type { persistDirectStopPatch, DirectStopOrigin } from './benchmark-stop-patch.js';
-import { observeStoppedWriterRegistration, type WriterRegistration } from './benchmark-writer-sql.js';
+import { persistDirectStopPatch, type DirectStopOrigin } from './benchmark-stop-patch.js';
+import { observeStoppedWriterRegistration, readWriterRegistrations, type WriterRegistration } from './benchmark-writer-sql.js';
 import { clientLogExportPod, exportClientLogs, exportWriterLogs, writerLogExportPod } from './benchmark-writer-export.js';
 import { canonical_json, type Azure } from './bootstrap.js';
-import { FENCED, PublisherControl } from './publisher_control.js';
+import { FENCED, READY, PublisherControl } from './publisher_control.js';
 import { cleanup_run_fic, delete_owned_namespace, read_run_fic_record, type RunCleanupAuthority, type RunNamespaceIdentity } from './run_fic.js';
 
 type Stop = Awaited<ReturnType<typeof persistDirectStopPatch>>;
@@ -31,6 +31,7 @@ export type DirectTerminalArm = {
   writer: WriterLifetime;
   writerClaim: ReturnType<typeof observeWriterClaim>;
   maintenance: WriterLifetime;
+  sql: WriterLifetime;
   registration: WriterRegistration;
   routerUid: string;
 };
@@ -170,14 +171,14 @@ export function validateDirectTerminal(arm: DirectTerminalArm, t: DirectTerminal
   return { clients, writer, maintenance, sql };
 }
 
-/**
- * Finish a loaded direct run, not an OAT no-load handoff. The source-owned
- * Kubernetes adapter supplies raw observations and captured bytes, never PASS flags.
- */
-export async function finishDirectTerminalCustody(azure: Azure, authority: RunCleanupAuthority, arm: DirectTerminalArm,
-  observeTerminal: () => Promise<Omit<DirectTerminalObservations, 'writer' | 'maintenance'>>, context: string, directory: string,
-  deltaDirectory: string, ficRecordPath: string) {
+type DirectRunAuthority = RunCleanupAuthority & { runId: string; owner: string; fencingToken: number };
+
+/** Finish a loaded direct run with live, origin-bound reads, not OAT's no-load handoff. */
+export async function finishDirectTerminalCustody(azure: Azure, authority: DirectRunAuthority, arm: DirectTerminalArm,
+  context: string, directory: string, deltaDirectory: string, ficRecordPath: string) {
   const { origin } = arm;
+  requireEvidence(authority.runId === origin.runId && authority.owner === origin.owner &&
+    authority.fencingToken === origin.fencingToken, 'Terminal custody authority does not identify this original run');
   const dir = await lstat(directory);
   requireEvidence(dir.isDirectory() && (dir.mode & 0o077) === 0, 'Terminal custody directory is not private');
   requireEvidence(Number.isSafeInteger(arm.startMs) && Number.isSafeInteger(arm.endMs) &&
@@ -189,15 +190,92 @@ export async function finishDirectTerminalCustody(azure: Azure, authority: RunCl
     namespaceOwner: fic.namespaceOwner, aksId: fic.aksId, server: fic.server };
   const armRecordPath = `_arrowcol-custody/direct/${origin.runId}/${origin.namespaceUid}/original-arm.json`;
   const armBytes = Buffer.from(canonical_json(arm));
-  const fresh = async () => {
+  const checkArm = async () => {
     await authority.assertCurrent();
     const [durableArm, armHeaders] = await azure.blob('GET', azure.c.checkpoints, armRecordPath, undefined, undefined, {}, false, true);
     requireEvidence(armHeaders[':status'] === '200' && armHeaders.etag && !armHeaders.etag.startsWith('W/') &&
       durableArm?.equals(armBytes), 'Original off-node arm record is missing or changed');
-    const observed = await observeTerminal();
-    const writer = await readDirectPodExit(azure, authority, origin, 'arrowcol', arm.writer, observed.stops.writer);
-    const maintenance = await readDirectPodExit(azure, authority, origin, 'delta-maintenance', arm.maintenance, observed.stops.maintenance);
-    const t = { ...observed, writer: writer.pod, maintenance: maintenance.pod };
+  };
+  requireEvidence(/^https:\/\/[a-z0-9.-]+$/.test(fic.server), 'Invalid original AKS server');
+  const run = async (...args: string[]) => {
+    await authority.assertCurrent();
+    const { stdout } = await exec('kubectl', ['--context', context, '--server', fic.server, '--insecure-skip-tls-verify=false',
+      '--request-timeout=15s', '-n', origin.namespace, ...args], { timeout: 20_000, maxBuffer: 8_388_608 });
+    return stdout;
+  };
+  const get = async (...args: string[]) => JSON.parse(await run('get', ...args, '-o', 'json')) as unknown;
+  const pods = (role: string) => get('pods', '-l', `app=${role}`);
+  const ns = async () => {
+    const n = evidenceObject(await get('namespace', origin.namespace)), meta = evidenceObject(n.metadata);
+    requireEvidence(n.kind === 'Namespace' && meta.uid === origin.namespaceUid && meta.name === origin.namespace &&
+      !meta.deletionTimestamp, 'Original run namespace is no longer active');
+    for (const field of ['annotations', 'labels']) {
+      const owner = evidenceObject(meta[field]);
+      requireEvidence(owner['arrowcol-oat/run-id'] === origin.runId && owner['arrowcol-oat/owner-token'] === origin.owner,
+        'Original namespace ownership changed');
+    }
+  };
+  const assertSqlLifetime = async () => {
+    const [deployment, sets, running] = await Promise.all([
+      get('deployment', 'arrowcol-sql'), get('replicasets', '-l', 'app=arrowcol-sql'), pods('arrowcol-sql')]);
+    requireEvidence(canonical_json(observeWriter(origin, deployment, sets, running, 'arrowcol-sql')) === canonical_json(arm.sql),
+      'Original SQL Pod lifetime changed');
+  };
+  const sql = () => readWriterRegistrations(authority, origin, origin.cloudGeneration, context, fic.server,
+    { name: arm.sql.podName, uid: arm.sql.podUid }, assertSqlLifetime);
+  const clients = async () => {
+    const [job, clients, ...claimObjects] = await Promise.all([get('job', 'direct-load-confirmwide'),
+      get('pods', '-l', `batch.kubernetes.io/job-name=direct-load-confirmwide`),
+      ...arm.clients.map(client => get('pvc', client.claimName))]);
+    const claims = new Map(arm.clients.map((client, i) => [client.claimName, claimObjects[i]]));
+    observeCompletedClients(origin, arm.clients, job, clients, claims, arm.endMs);
+    return { job, clients, claims };
+  };
+  const router = async () => {
+    const [router, routerPods, service, local] = await Promise.all([get('daemonset', 'arrowcol-router'), pods('arrowcol-router'),
+      get('endpointslices', '-l', 'kubernetes.io/service-name=arrowcol-router'),
+      get('endpointslices', '-l', 'kubernetes.io/service-name=arrowcol-router-node-local')]);
+    return { router, routerPods, routerEndpoints: { 'arrowcol-router': service, 'arrowcol-router-node-local': local } };
+  };
+  await checkArm();
+  await ns();
+  await clients();
+  await assertSqlLifetime();
+  const control = new PublisherControl(azure);
+  const [authorityBefore] = await control.read();
+  requireEvidence(authorityBefore.resetgeneration === origin.cloudGeneration && authorityBefore.occupancy === 'released' &&
+    authorityBefore.resetstate === READY, 'Original exclusive-publisher sandbox cannot be fenced by this run');
+  const routerStop = await persistDirectStopPatch(azure, authority, origin, 'arrowcol-router', arm.routerUid,
+    await get('daemonset', 'arrowcol-router'),
+    ops => run('patch', 'daemonset', 'arrowcol-router', '--type=json', '--patch', JSON.stringify(ops), '-o', 'json'));
+  const routerGeneration = acceptRouterFencePatch(origin, arm.routerUid, routerStop.receipt.intent.observed_generation,
+    JSON.parse(routerStop.receipt.response));
+  const routerDeadline = Date.now() + 420_000;
+  for (;;) {
+    const t = await router();
+    if (routerFenceObserved(origin, arm.routerUid, routerGeneration, t.router, t.routerPods, t.routerEndpoints)) break;
+    requireEvidence(Date.now() < routerDeadline, 'Original router fence did not converge');
+    await delay(1000);
+  }
+  const writerStop = await stopDirectPodWithExit(azure, authority, context, fic.server, origin, 'arrowcol', arm.writer);
+  const writerExit = await readDirectPodExit(azure, authority, origin, 'arrowcol', arm.writer, writerStop);
+  observeStoppedWriterRegistration(origin, origin.cloudGeneration,
+    observeWriterExit(origin, arm.writer, writerExit.pod, writerStop.receipt.intent.intent_at_ms), arm.registration, await sql());
+  const maintenanceStop = await stopDirectPodWithExit(azure, authority, context, fic.server, origin, 'delta-maintenance', arm.maintenance);
+  await authority.assertCurrent();
+  await control.fence(origin.cloudGeneration);
+  const stops = { router: routerStop, writer: writerStop, maintenance: maintenanceStop };
+  const fresh = async () => {
+    await checkArm();
+    await ns();
+    const [clientState, routerState, writer, maintenance, writerClaim, writerDeployment, writerPods,
+      maintenanceDeployment, maintenancePods, sqlState] = await Promise.all([clients(), router(),
+      readDirectPodExit(azure, authority, origin, 'arrowcol', arm.writer, stops.writer),
+      readDirectPodExit(azure, authority, origin, 'delta-maintenance', arm.maintenance, stops.maintenance),
+      get('pvc', WRITER_CLAIM), get('deployment', 'arrowcol'), pods('arrowcol'), get('deployment', 'delta-maintenance'),
+      pods('delta-maintenance'), sql()]);
+    const t = { ...clientState, ...routerState, stops, writer: writer.pod, maintenance: maintenance.pod,
+      writerClaim, writerDeployment, writerPods, maintenanceDeployment, maintenancePods, sql: sqlState };
     const proved = validateDirectTerminal(arm, t);
     for (const receipt of Object.values(t.stops)) {
       const [bytes, headers] = await azure.blob('GET', azure.c.checkpoints, receipt.path, undefined, undefined, { 'If-Match': receipt.version });

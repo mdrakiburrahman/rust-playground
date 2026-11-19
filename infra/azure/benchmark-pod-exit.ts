@@ -68,6 +68,9 @@ export async function stopDirectPodWithExit(azure: Azure, authority: RunCleanupA
   const pod = evidenceObject(JSON.parse(await run(['get', 'pod', original.podName, '-o', 'json'])));
   const meta = evidenceObject(pod.metadata), status = evidenceObject(evidenceList(evidenceObject(pod.status).containerStatuses)[0]);
   const rv = evidenceText(meta.resourceVersion);
+  const grace = evidenceObject(pod.spec).terminationGracePeriodSeconds;
+  requireEvidence(typeof grace === 'number' && Number.isSafeInteger(grace) &&
+    grace >= 1 && grace <= (role === 'arrowcol' ? 360 : 4800), 'Original Pod has an unsupported termination grace period');
   requireEvidence(meta.uid === original.podUid && meta.name === original.podName && meta.namespace === origin.namespace &&
     !meta.deletionTimestamp && /^[0-9]+$/.test(rv) && status.containerID === original.containerId &&
     status.imageID === original.imageId && status.restartCount === 0 &&
@@ -75,11 +78,12 @@ export async function stopDirectPodWithExit(azure: Azure, authority: RunCleanupA
   'Original Pod must still be running before the stop intent');
   const stop = await persistDirectStopPatch(azure, authority, origin, role, original.deploymentUid, deployment,
     ops => run(['patch', 'deployment', role, '--type=json', '--patch', JSON.stringify(ops), '-o', 'json']));
-  const query = new URLSearchParams({ watch: 'true', resourceVersion: rv, timeoutSeconds: '240',
+  const watchSeconds = grace + 60;
+  const query = new URLSearchParams({ watch: 'true', resourceVersion: rv, timeoutSeconds: String(watchSeconds),
     fieldSelector: `metadata.name=${original.podName}` });
   await authority.assertCurrent();
-  const child = spawn('kubectl', [...kubectl, '--request-timeout=250s', 'get', '--raw',
-    `/api/v1/namespaces/${origin.namespace}/pods?${query}`], { timeout: 255_000, stdio: ['ignore', 'pipe', 'ignore'] });
+  const child = spawn('kubectl', [...kubectl, `--request-timeout=${watchSeconds + 10}s`, 'get', '--raw',
+    `/api/v1/namespaces/${origin.namespace}/pods?${query}`], { timeout: (watchSeconds + 15) * 1000, stdio: ['ignore', 'pipe', 'ignore'] });
   const done = new Promise<never>((_, reject) => child.once('error', reject));
   let observed: Awaited<ReturnType<typeof positiveDirectExitEvent>>;
   try {
