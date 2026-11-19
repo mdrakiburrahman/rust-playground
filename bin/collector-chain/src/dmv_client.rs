@@ -276,13 +276,11 @@ impl Options {
         }
         if self.data_profile.is_synthetic_telemetry() {
             anyhow::ensure!(
-                self.value_variation
-                    .map_or(true, |value| value == ValueVariation::PerRow),
+                self.value_variation.is_none_or(|value| value == ValueVariation::PerRow),
                 "synthetic_telemetry requires value-variation=per_row"
             );
             anyhow::ensure!(
-                self.guid_uniqueness
-                    .map_or(true, |value| value == GuidUniqueness::PerRow),
+                self.guid_uniqueness.is_none_or(|value| value == GuidUniqueness::PerRow),
                 "synthetic_telemetry requires guid-uniqueness=per_row"
             );
         }
