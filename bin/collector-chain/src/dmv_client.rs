@@ -6088,8 +6088,10 @@ mod tests {
             offered_measurement_parents,
             offered_measurement_rows,
             admitted_measurement_parents,
+            admitted_measurement_rows,
             late_measurement_parents,
-            warmup_parents,
+            warmup_sent_parents,
+            warmup_completed_parents,
             acknowledged_parents,
             retried_parents,
             failed_parents,
@@ -6103,25 +6105,35 @@ mod tests {
                 mut offered,
                 mut offered_rows,
                 mut admitted,
+                mut admitted_rows,
                 mut late,
-                mut warmup,
+                mut warmup_sent,
+                mut warmup_completed,
                 mut acknowledged,
                 mut retried,
                 mut failed,
                 mut ambiguous,
-            ) = (0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64);
+            ) = (
+                0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64,
+            );
             for record in records.iter() {
                 if record.cohort == ManifestCohort::Warmup {
-                    warmup += 1;
+                    warmup_sent += 1;
+                }
+                if record.first_admitted_cohort == Some(ManifestCohort::Warmup) {
+                    warmup_completed += 1;
+                }
+                if record.first_admitted_cohort == Some(ManifestCohort::Measurement) {
+                    admitted += 1;
+                    admitted_rows = admitted_rows
+                        .checked_add(u64::from(record.row_count))
+                        .context("admitted measurement row count overflow")?;
                 }
                 if record.cohort == ManifestCohort::Measurement {
                     offered += 1;
                     offered_rows = offered_rows
                         .checked_add(u64::from(record.row_count))
                         .context("offered row count overflow")?;
-                    if record.first_admitted_cohort == Some(ManifestCohort::Measurement) {
-                        admitted += 1;
-                    }
                     if record.first_admitted_cohort == Some(ManifestCohort::PostWindow) {
                         late += 1;
                     }
@@ -6151,8 +6163,10 @@ mod tests {
                 offered,
                 offered_rows,
                 admitted,
+                admitted_rows,
                 late,
-                warmup,
+                warmup_sent,
+                warmup_completed,
                 acknowledged,
                 retried,
                 failed,
@@ -6165,9 +6179,6 @@ mod tests {
         let retried_rows = window["retried_rows"].as_u64().context("missing retried rows")?;
         let given_up_rows = window["given_up_rows"].as_u64().context("missing given-up rows")?;
         let ambiguous_rows = window["ambiguous_rows"].as_u64().context("missing ambiguous rows")?;
-        let admitted_rows = admitted_measurement_parents
-            .checked_mul(ROWS_PER_BATCH as u64)
-            .context("admitted measurement row count overflow")?;
         anyhow::ensure!(
             admitted_rows == completed_rows,
             "manifest admitted rows differ from measurement completion rows"
@@ -6196,7 +6207,7 @@ mod tests {
         );
         let target_met = completed_rows >= measurement_target_rows;
         eprintln!(
-            "L3_REAL_SUSTAINED_SINK scope=local_in_memory_flight_not_delta_or_kusto table=sqlserver_availability_replica_states profile=realistic string_width=789 string_lengths=uniform value_variation=per_row guid_uniqueness=per_row rows_per_parent={ROWS_PER_BATCH} corpus_batches={CORPUS_BATCHES} workers={WORKERS} streams_per_worker={STREAMS_PER_WORKER} runtime_threads=16 max_memory_bytes={MAX_MEMORY_BYTES} flight_data_limit_bytes={FLIGHT_DATA_LIMIT_BYTES} client_message_limit_bytes={CLIENT_MESSAGE_LIMIT_BYTES} ipc_compression=None retry_max_attempts=1 warmup_ms={WARMUP_MS} warmup_parents={warmup_parents} measurement_ms={MEASUREMENT_MS} target_rows_per_second={TARGET_ROWS_PER_SECOND} target_parents={target_measurement_parents} offered_measurement_parents={offered_measurement_parents} offered_measurement_rows={offered_measurement_rows} admitted_measurement_parents={admitted_measurement_parents} admitted_measurement_rows={admitted_rows} late_measurement_parents={late_measurement_parents} completed_rows={completed_rows} achieved_rows_per_second={:.3} target_met={target_met} all_parents={record_count} acknowledged_parents={acknowledged_parents} failed_parents={failed_parents} retried_parents={retried_parents} ambiguous_parents={ambiguous_parents} rejected_rows={rejected_rows} retried_rows={retried_rows} given_up_rows={given_up_rows} ambiguous_rows={ambiguous_rows} total_rows={total_rows} decoded_physical_fragments={physical_fragments} distinct_facts={distinct_facts} canonical_logical_bytes={canonical_bytes} manifest_bytes={terminal_manifest_bytes} terminal_line_bytes={terminal_line_bytes}",
+            "L3_REAL_SUSTAINED_SINK scope=local_in_memory_flight_not_delta_or_kusto table=sqlserver_availability_replica_states profile=realistic string_width=789 string_lengths=uniform value_variation=per_row guid_uniqueness=per_row rows_per_parent={ROWS_PER_BATCH} corpus_batches={CORPUS_BATCHES} workers={WORKERS} streams_per_worker={STREAMS_PER_WORKER} runtime_threads=16 max_memory_bytes={MAX_MEMORY_BYTES} flight_data_limit_bytes={FLIGHT_DATA_LIMIT_BYTES} client_message_limit_bytes={CLIENT_MESSAGE_LIMIT_BYTES} ipc_compression=None retry_max_attempts=1 warmup_ms={WARMUP_MS} warmup_sent_parents={warmup_sent_parents} warmup_completed_parents={warmup_completed_parents} measurement_ms={MEASUREMENT_MS} target_rows_per_second={TARGET_ROWS_PER_SECOND} target_parents={target_measurement_parents} offered_measurement_parents={offered_measurement_parents} offered_measurement_rows={offered_measurement_rows} admitted_measurement_parents={admitted_measurement_parents} admitted_measurement_rows={admitted_rows} late_measurement_parents={late_measurement_parents} completed_rows={completed_rows} achieved_rows_per_second={:.3} target_met={target_met} all_parents={record_count} acknowledged_parents={acknowledged_parents} failed_parents={failed_parents} retried_parents={retried_parents} ambiguous_parents={ambiguous_parents} rejected_rows={rejected_rows} retried_rows={retried_rows} given_up_rows={given_up_rows} ambiguous_rows={ambiguous_rows} total_rows={total_rows} decoded_physical_fragments={physical_fragments} distinct_facts={distinct_facts} canonical_logical_bytes={canonical_bytes} manifest_bytes={terminal_manifest_bytes} terminal_line_bytes={terminal_line_bytes}",
             completed_rows as f64 / (MEASUREMENT_MS as f64 / 1_000.0)
         );
         for (minute, windows) in window["windows"]
