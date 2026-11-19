@@ -1067,23 +1067,54 @@ mod overload_guard_tests {
 
         let (mut config, deployment, sets, pods) = identity_inventory_fixture()?;
         config.dfe_deployment = "collector".to_owned();
-        let boundary = FixtureBoundary {
+        let fixture_deadline = unix_time_ms_u64()? + 30_000;
+        let boundary = |deployment, sets, pods| FixtureBoundary {
             authority: FixtureAuthority {
                 campaign_id: "test".to_owned(), cell_run_id: "test".to_owned(), owner_id: "test".to_owned(),
                 fencing_token: 1, namespace: "run".to_owned(), server: "https://offline.invalid".to_owned(),
                 context: "offline".to_owned(),
             },
-            deadline_unix_ms: unix_time_ms_u64()? + 5_000,
+            deadline_unix_ms: fixture_deadline,
             sequence: std::sync::atomic::AtomicU64::new(1),
             transport: Arc::new(InventoryTransport { barrier: tokio::sync::Barrier::new(3), deployment, sets, pods }),
             responses: tokio::sync::Mutex::new(Vec::new()),
         };
         let result = tokio::time::timeout(
             Duration::from_secs(2),
-            FIXTURE_BOUNDARY.scope(boundary, scale_out_collector_snapshot(&config, 1, Some("app=collector"))),
+            FIXTURE_BOUNDARY.scope(boundary(deployment.clone(), sets.clone(), pods.clone()), scale_out_collector_snapshot(&config, 1, Some("app=collector"))),
         ).await.context("identity inventory did not dispatch concurrently")??;
         assert_eq!(result.identities[0].pod_uid, "pod-uid");
         assert_eq!(result.identities[0].container_id, "container-id");
+        let mut changed_selector = deployment.clone();
+        changed_selector["spec"]["selector"]["matchLabels"]["app"] = json!("replacement");
+        let mut foreign_owner = pods.clone();
+        foreign_owner["items"][0]["metadata"]["ownerReferences"][0]["uid"] = json!("foreign");
+        let mut changed_container = pods.clone();
+        changed_container["items"][0]["status"]["containerStatuses"][0]["containerID"] = json!("replacement");
+        for (deployment, pods, valid) in [
+            (deployment.clone(), pods.clone(), true),
+            (changed_selector, pods.clone(), false),
+            (deployment.clone(), foreign_owner, false),
+            (deployment.clone(), changed_container, false),
+        ] {
+            let backlog_complete = std::cell::Cell::new(false);
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            let (reading, backlog, fence) = guarded_composite_observation(
+                async { Ok(reading(0, 100)) },
+                async { backlog_complete.set(true); pending(0, 0) },
+                async {
+                    assert!(backlog_complete.get(), "identity fence ran before backlog completed");
+                    FIXTURE_BOUNDARY.scope(
+                        boundary(deployment, sets.clone(), pods),
+                        verify_guard_identity(&config, Some(&result)),
+                    ).await
+                },
+                deadline,
+            ).await;
+            let mut engine = GuardEngine::new(Default::default());
+            engine.record(reading.and_then(|reading| fence.into_result().map(|()| reading)), &backlog);
+            assert_eq!(engine.failure().is_none(), valid);
+        }
         Ok(())
     }
 
