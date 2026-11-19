@@ -90,6 +90,7 @@ mod tests {
     use std::io::Cursor;
     use std::sync::Arc;
 
+    use anyhow::Context;
     use arrow_array::{ArrayRef, BooleanArray, Int32Array};
     use arrow_ipc::{reader::StreamReader, writer::StreamWriter};
     use arrow_schema::{Field, Schema};
@@ -97,7 +98,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sliced_columns_match_their_ipc_round_trip() {
+    fn sliced_columns_match_their_ipc_round_trip() -> anyhow::Result<()> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("text", DataType::Utf8, true),
             Field::new("number", DataType::Int32, true),
@@ -111,33 +112,34 @@ mod tests {
                 Arc::new(BooleanArray::from(vec![Some(false), Some(true), None, Some(false)])),
             ],
         )
-        .expect("record batch");
+        .context("record batch")?;
         let sliced = batch.slice(1, 2);
-        let measured = canonical_record_batch_logical_bytes(&sliced).expect("canonical bytes");
+        let measured = canonical_record_batch_logical_bytes(&sliced).context("canonical bytes")?;
         assert_eq!(measured, 25);
 
         let mut encoded = Vec::new();
         {
-            let mut writer = StreamWriter::try_new(&mut encoded, sliced.schema().as_ref()).expect("writer");
-            writer.write(&sliced).expect("write batch");
-            writer.finish().expect("finish stream");
+            let mut writer = StreamWriter::try_new(&mut encoded, sliced.schema().as_ref()).context("writer")?;
+            writer.write(&sliced).context("write batch")?;
+            writer.finish().context("finish stream")?;
         }
         let decoded = StreamReader::try_new(Cursor::new(encoded), None)
-            .expect("reader")
+            .context("reader")?
             .next()
-            .expect("batch present")
-            .expect("decode batch");
+            .context("batch present")?
+            .context("decode batch")?;
         assert_eq!(canonical_record_batch_logical_bytes(&decoded), Ok(measured));
+        Ok(())
     }
 
     #[test]
-    fn validity_is_counted_only_when_nulls_exist_and_empty_utf8_has_one_offset() {
+    fn validity_is_counted_only_when_nulls_exist_and_empty_utf8_has_one_offset() -> anyhow::Result<()> {
         let values = Int32Array::from(vec![Some(1), None, Some(3)]);
         let all_valid_with_bitmap = values.slice(0, 1);
         let all_valid_array = all_valid_with_bitmap
             .as_any()
             .downcast_ref::<Int32Array>()
-            .expect("int32 slice");
+            .context("int32 slice")?;
         assert_eq!(all_valid_array.null_count(), 0);
         assert!(all_valid_array.nulls().is_some());
 
@@ -145,33 +147,34 @@ mod tests {
             Arc::new(Schema::new(vec![Field::new("empty_text", DataType::Utf8, false)])),
             vec![Arc::new(StringArray::from(Vec::<&str>::new())) as ArrayRef],
         )
-        .expect("empty record batch");
+        .context("empty record batch")?;
         assert_eq!(canonical_record_batch_logical_bytes(&empty_text), Ok(4));
 
         let all_valid = RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new("all_valid", DataType::Int32, false)])),
             vec![Arc::new(all_valid_with_bitmap)],
         )
-        .expect("all-valid record batch");
+        .context("all-valid record batch")?;
         assert_eq!(canonical_record_batch_logical_bytes(&all_valid), Ok(4));
+        Ok(())
     }
 
     #[test]
-    fn canonical_flat_byte_vectors_include_only_logical_payload_and_present_nulls() {
+    fn canonical_flat_byte_vectors_include_only_logical_payload_and_present_nulls() -> anyhow::Result<()> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("text", DataType::Utf8, true),
             Field::new("number", DataType::Int32, true),
             Field::new("flag", DataType::Boolean, true),
         ]));
         let non_null = RecordBatch::try_new(
-            schema.clone(),
+            Arc::clone(&schema),
             vec![
                 Arc::new(StringArray::from(vec!["a", "bb", "ccc"])) as ArrayRef,
                 Arc::new(Int32Array::from(vec![1, 2, 3])),
                 Arc::new(BooleanArray::from(vec![true, false, true])),
             ],
         )
-        .expect("non-null record batch");
+        .context("non-null record batch")?;
         assert_eq!(canonical_record_batch_logical_bytes(&non_null), Ok(35));
 
         let nullable = RecordBatch::try_new(
@@ -182,22 +185,24 @@ mod tests {
                 Arc::new(BooleanArray::from(vec![Some(true), None, Some(false)])),
             ],
         )
-        .expect("nullable record batch");
+        .context("nullable record batch")?;
         assert_eq!(canonical_record_batch_logical_bytes(&nullable), Ok(36));
+        Ok(())
     }
 
     #[test]
-    fn unsupported_nested_or_binary_columns_fail_measurement() {
+    fn unsupported_nested_or_binary_columns_fail_measurement() -> anyhow::Result<()> {
         let schema = Arc::new(Schema::new(vec![Field::new("binary", DataType::Binary, false)]));
         let batch = RecordBatch::try_new(
             schema,
             vec![Arc::new(arrow_array::BinaryArray::from(vec![&b"value"[..]])) as ArrayRef],
         )
-        .expect("record batch");
+        .context("record batch")?;
         assert!(matches!(
             canonical_record_batch_logical_bytes(&batch),
             Err(CanonicalLogicalBytesError::UnsupportedDataType(_))
         ));
+        Ok(())
     }
 
     #[test]
