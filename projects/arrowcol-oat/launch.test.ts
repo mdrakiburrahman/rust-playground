@@ -805,6 +805,8 @@ test('observed AKS disposition requires matching owned failure, writer fence and
     await rejectFixture({ ...manifest, writer_fence: { ...manifest.writer_fence,
       server: { ...server, start_ticks: '18' } } }, /exact recorded server and writer fence/);
     await rejectFixture({ ...manifest, writer_fence: { ...manifest.writer_fence,
+      server: { ...server, start_ticks: '' } } }, /exact recorded server and writer fence/);
+    await rejectFixture({ ...manifest, writer_fence: { ...manifest.writer_fence,
       net_namespace: 'net:[1]' } }, /exact original Linux/);
     for (const change of [{ namespace: 'different' }, { namespace_uid_absent: false },
       { run_fic_absent: false }, { native_fic_present: false }]) {
@@ -846,6 +848,161 @@ test('observed AKS disposition requires matching owned failure, writer fence and
     assert.deepEqual(await readFile(deadline.receiptPath), recent.receiptBytes);
     assert.deepEqual(await readFile(sidecar), await readFile(evidencePath));
     await assert.rejects(assertNoUnsettledDeadlineReceipts(root), /Unapproved or orphaned/);
+  } finally {
+    if (listener.listening) await closeListener();
+    deadline.dispose();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('post-load failure requires reviewed current custody proof and remains failed and unranked', {
+  skip: process.platform !== 'linux',
+}, async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'oat-post-load-disposition-'));
+  const root = path.join(directory, 'receipts');
+  const deadline = await OatLauncherDeadline.create(undefined, performance.now(), root);
+  const evidencePath = path.join(directory, 'evidence');
+  const sidecar = deadline.receiptPath + '.failed-aks-disposition';
+  const digest = (body: Buffer | string) => createHash('sha256').update(body).digest('hex');
+  const body = '{"platform":{"kind":"aks"}}';
+  const cellId = 'c0bfca05-28f2-4e16-a4cc-b3f28a351fb9';
+  const listener = createServer();
+  const closeListener = () => new Promise<void>((resolve, reject) =>
+    listener.close((error) => error ? reject(error) : resolve()));
+  try {
+    await new Promise<void>((resolve) => listener.listen(0, '127.0.0.1', resolve));
+    const address = listener.address();
+    assert.ok(address && typeof address !== 'string');
+    const serverUrl = `http://127.0.0.1:${address.port}/`;
+    await deadline.setSubmissionBinding({ submitted_config_body: body,
+      submitted_config_sha256: digest(body), source_config_sha256: digest('source') });
+    await deadline.markCreationPending(serverUrl);
+    await deadline.recordRunStarted({ ...status('running'), config_sha256: digest(body) });
+    await deadline.recordTerminal({ ...status('failed'), config_sha256: digest(body),
+      error: 'synthetic post-load publisher failure' });
+    const original = await readFile(deadline.receiptPath);
+    const receipt = JSON.parse(original.toString('utf8'));
+    assert.equal(receipt.terminal_observation, null);
+    const now = Date.now();
+    const raw = digest('fixture');
+    const manifest = {
+      schema_version: 1, kind: 'aborted-post-load-aks' as const,
+      disposition: 'aborted-post-load-cleanup-verified-unranked',
+      invocation_id: deadline.invocationId, controller_run_id: receipt.run_id,
+      original_receipt_sha256: digest(original), source_config_sha256: receipt.source_config_sha256,
+      submitted_config_sha256: receipt.submitted_config_sha256, original_error: receipt.error,
+      server_url: serverUrl, proof_kind: 'fresh_census_absence', historical_process_identity_proven: false,
+      job_id: 'abcdef123456', client_pod_ran: true, result_artifact: 'diagnostics-retained-unranked',
+      ranking: null as number | null, throughput_claim: null,
+      verifier_sha256: raw, runner_source_sha256: raw,
+      raw_observation_sha256: Object.fromEntries([
+        'load_trace', 'controller_identity', 'owning_job_terminal', 'lease', 'census', 'workload_stop', 'namespace_get',
+        'qap_cleanup', 'fic_cleanup', 'fic_inventory', 'cluster_inventory', 'pool_inventory', 'node_inventory',
+      ].map((name) => [name, raw])),
+      census: {
+        boot_id: (await readFile('/proc/sys/kernel/random/boot_id', 'utf8')).trim(),
+        pid_namespace: await readlink('/proc/self/ns/pid'), net_namespace: await readlink('/proc/self/ns/net'),
+        host_target: 'dev/example_devcontainer', lease_id: 'ls-123456', lease_active: true,
+        controller_pid: 2147483647, controller_executable: '/opt/example/oat', controller_port: address.port,
+        controller_pid_allocated: false, launcher_match_count: 0, controller_match_count: 0, listener_count: 0,
+        boot_started_at_unix_ms: receipt.started_at_unix_ms - 1000,
+        container_started_at_unix_ms: receipt.started_at_unix_ms - 500, observed_at_unix_ms: now,
+      },
+      cell: {
+        id: cellId, namespace: 'arrow-collector-' + cellId.replaceAll('-', ''),
+        namespace_uid: '418a9705-b6ac-4487-b08e-a0dbdd5d6e5f', namespace_absent: true,
+        namespace_uid_absent: true, controller_pod_count: 0, workload_delete_succeeded: true,
+        namespace_observed_at_unix_ms: now, qap: 'cleaned', qap_observed_at_unix_ms: now,
+        run_fic_id: 'arrowcol-run-' + cellId, run_fic_absent: true,
+        native_fic_id: 'native-fic', native_fic_present: true, fic_inventory_count: 1, fic_observed_at_unix_ms: now,
+      },
+      cluster: { stamp_config_sha256: raw, stock_aks_id: '/fake/cluster', arm_aks_id: '/fake/cluster',
+        stock_api_server: 'https://fake.example.invalid', current_api_server: 'https://fake.example.invalid' },
+      pools: {
+        all_user_pools_inventoried: true, observed_at_unix_ms: now,
+        stamp_user_pool_names: ['pool-a', 'pool-b'],
+        user_pools: [{ name: 'pool-a', arm_count: 0, arm_min_count: 0, arm_max_count: 1, provisioning_state: 'Succeeded', kubernetes_node_count: 0 },
+          { name: 'pool-b', arm_count: 0, arm_min_count: 0, arm_max_count: 1, provisioning_state: 'Succeeded', kubernetes_node_count: 0 }],
+      },
+    };
+    const approveFixture = async (proof: typeof manifest, receiptBytes = original) => {
+      await writeFile(deadline.receiptPath, receiptBytes);
+      const receiptSha256 = digest(receiptBytes);
+      const bytes = JSON.stringify({ ...proof, original_receipt_sha256: receiptSha256 });
+      await writeFile(evidencePath, bytes);
+      return [{ kind: manifest.kind, invocationId: deadline.invocationId, receiptSha256, evidenceSha256: digest(bytes) }];
+    };
+    const rejectFixture = async (proof: typeof manifest, error: RegExp, receiptBytes = original) =>
+      assert.rejects(recordLegacyAksDisposition(root, deadline.invocationId, evidencePath,
+        await approveFixture(proof, receiptBytes)), error);
+
+    await rejectFixture(manifest, /listener is still present/);
+    await closeListener();
+    await rejectFixture({ ...manifest, client_pod_ran: false }, /exact failed invocation/);
+    await rejectFixture({ ...manifest, historical_process_identity_proven: true }, /exact failed invocation/);
+    await rejectFixture({ ...manifest, ranking: 1 }, /exact failed invocation/);
+    await rejectFixture({ ...manifest, original_error: 'another error' }, /exact failed invocation/);
+    await rejectFixture({ ...manifest, submitted_config_sha256: raw }, /exact failed invocation/);
+    await rejectFixture(manifest, /exact failed invocation/, Buffer.from(JSON.stringify({ ...receipt, run_state: 'succeeded' })));
+    await rejectFixture(manifest, /exact failed invocation/, Buffer.from(JSON.stringify({ ...receipt, cleanup_state: 'confirmed' })));
+    for (const change of [{ namespace_uid_absent: false }, { workload_delete_succeeded: false },
+      { run_fic_absent: false }, { qap: 'not-attempted' }, { id: 'invalid' }, { controller_pod_count: 1 },
+      { fic_inventory_count: 2 }]) {
+      await rejectFixture({ ...manifest, cell: { ...manifest.cell, ...change } }, /custody evidence/);
+    }
+    await rejectFixture({ ...manifest, cluster: { ...manifest.cluster, arm_aks_id: '/fake/other' } }, /custody evidence/);
+    await rejectFixture({ ...manifest, cluster: { ...manifest.cluster, current_api_server: 'https://other.invalid' } }, /custody evidence/);
+    for (const pools of [
+      { ...manifest.pools, all_user_pools_inventoried: false },
+      { ...manifest.pools, stamp_user_pool_names: ['pool-a', 'other'] },
+      { ...manifest.pools, user_pools: [] },
+      { ...manifest.pools, user_pools: [{ ...manifest.pools.user_pools[0]!, arm_count: 1 }, manifest.pools.user_pools[1]!] },
+      { ...manifest.pools, user_pools: [{ ...manifest.pools.user_pools[0]!, kubernetes_node_count: 1 }, manifest.pools.user_pools[1]!] },
+      { ...manifest.pools, user_pools: [{ ...manifest.pools.user_pools[0]!, arm_max_count: 2 }, manifest.pools.user_pools[1]!] },
+    ]) await rejectFixture({ ...manifest, pools }, /custody evidence/);
+    const { qap_cleanup: _missing, ...missingReadback } = manifest.raw_observation_sha256;
+    await rejectFixture({ ...manifest, raw_observation_sha256: missingReadback }, /custody evidence/);
+    await rejectFixture({ ...manifest, census: { ...manifest.census, net_namespace: 'net:[1]' } }, /same Linux boot/);
+    await rejectFixture({ ...manifest, census: { ...manifest.census, controller_pid: process.pid } }, /controller PID is allocated/);
+    for (const change of [{ launcher_match_count: 1 }, { controller_match_count: 1 }, { listener_count: 1 },
+      { lease_active: false }, { container_started_at_unix_ms: receipt.started_at_unix_ms + 1 }]) {
+      await rejectFixture({ ...manifest, census: { ...manifest.census, ...change } }, /custody evidence/);
+    }
+    await rejectFixture({ ...manifest, pools: { ...manifest.pools, observed_at_unix_ms: now + 60_000 } },
+      /absence evidence is not current/);
+    const aged = (minutes: number) => {
+      const observed = now - minutes * 60_000;
+      return {
+        proof: { ...manifest, census: { ...manifest.census, observed_at_unix_ms: observed,
+          boot_started_at_unix_ms: observed - 3000, container_started_at_unix_ms: observed - 2000 },
+        cell: { ...manifest.cell, namespace_observed_at_unix_ms: observed, fic_observed_at_unix_ms: observed,
+          qap_observed_at_unix_ms: observed },
+        pools: { ...manifest.pools, observed_at_unix_ms: observed } },
+        receiptBytes: Buffer.from(JSON.stringify({ ...receipt, started_at_unix_ms: observed - 1 })),
+      };
+    };
+    const stale = aged(61);
+    await rejectFixture(stale.proof, /absence evidence is not current/, stale.receiptBytes);
+    const recent = aged(59);
+    const recentApproval = await approveFixture(recent.proof, recent.receiptBytes);
+    await recordLegacyAksDisposition(root, deadline.invocationId, evidencePath, recentApproval);
+    assert.deepEqual(await readFile(deadline.receiptPath), recent.receiptBytes);
+    await unlink(sidecar);
+    const [reviewed] = await approveFixture(manifest);
+    const approval = [{ ...reviewed!, invocationId: undefined, invocationIdSha256: digest(deadline.invocationId) }];
+    await assert.rejects(assertNoUnsettledDeadlineReceipts(root, undefined, approval), /Unsettled AKS/);
+    await assert.rejects(recordLegacyAksDisposition(root, deadline.invocationId, evidencePath), /No reviewed legacy AKS disposition/);
+    await writeFile(deadline.receiptPath, Buffer.concat([original, Buffer.from('\n')]));
+    await assert.rejects(recordLegacyAksDisposition(root, deadline.invocationId, evidencePath, approval),
+      /reviewed receipt and evidence digests/);
+    await writeFile(deadline.receiptPath, original);
+    await recordLegacyAksDisposition(root, deadline.invocationId, evidencePath, approval);
+    await assertNoUnsettledDeadlineReceipts(root, undefined, approval);
+    assert.deepEqual(await readFile(deadline.receiptPath), original);
+    assert.deepEqual(await readFile(sidecar), await readFile(evidencePath));
+    await writeFile(evidencePath, (await readFile(evidencePath, 'utf8')) + '\n');
+    await assert.rejects(recordLegacyAksDisposition(root, deadline.invocationId, evidencePath, approval),
+      /reviewed receipt and evidence digests/);
   } finally {
     if (listener.listening) await closeListener();
     deadline.dispose();
@@ -1540,6 +1697,9 @@ test('CLI help is available and unknown options fail as usage errors', async () 
   }
   assert.match(messages.join('\n'), /Usage:.*arrowcol-oat/s);
   assert.match(messages.join('\n'), /--no-viewer/);
+  assert.match(messages.join('\n'), /Post-load evidence must be no more than 60 minutes old/);
+  assert.match(messages.join('\n'), /one original-host lease from census through post-record recheck/);
+  assert.match(messages.join('\n'), /recheck writers and resource custody before a new run; stop if unsafe/);
   await assert.rejects(
     main(['--not-a-real-option', '--config', '/missing-oat-config.json']),
     (error: unknown) => error instanceof Error && error.message === 'Unknown option: --not-a-real-option' && 'exitCode' in error && error.exitCode === 2,

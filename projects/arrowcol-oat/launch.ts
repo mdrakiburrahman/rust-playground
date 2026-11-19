@@ -102,6 +102,9 @@ Options:
   --cleanup-local <id> Remove one abandoned local Compose cell by its run UUID
   --recover-failed-aks <invocation-id> <approved-evidence-path>
                        Record the reviewed disposition for an approved AKS failure
+                       Post-load evidence must be no more than 60 minutes old.
+                       Keep one original-host lease from census through post-record recheck;
+                       recheck writers and resource custody before a new run; stop if unsafe.
   -h, --help           Show this help`;
 
 type DeadlineCreationState = 'not_started' | 'pending' | 'accepted' | 'rejected' | 'unknown';
@@ -520,8 +523,9 @@ function isLocalOatServerUrl(value: string): boolean {
 
 
 type AksDispositionApproval = Readonly<{
-  kind: 'legacy' | 'observed-failed-preload-aks';
-  invocationId: string;
+  kind: 'legacy' | 'observed-failed-preload-aks' | 'aborted-post-load-aks';
+  invocationId?: string;
+  invocationIdSha256?: string;
   receiptSha256: string;
   evidenceSha256: string;
 }>;
@@ -536,6 +540,11 @@ const approvedAksDispositions: readonly AksDispositionApproval[] = [{
   invocationId: '05b00915-2853-4c7a-b2bb-5dbb49bcd0ed',
   receiptSha256: '4767d66381b97fbb6d3bc612190bd939a9dd73c23af46f72d0e0b3fed7246fb1',
   evidenceSha256: '0f2833b1a3a17194d3265abdccd64b4160c776ed9d342125f41f5222619112eb',
+}, {
+  kind: 'aborted-post-load-aks',
+  invocationIdSha256: '937f85c5f98a516c812a15ec65f6e38f78553bc90ed4704f416ff1696490a5f1',
+  receiptSha256: '484d3debc9d9b57e2d33f41a4e79454bcc50e33eb917d3bdb55fc775813343a3',
+  evidenceSha256: '5fdb534cf2eab9fb3500c4910c6f57914257a90243aea11387ac0e2cd87c0c49',
 }];
 const legacyDispositionSuffix = '.failed-aks-disposition';
 const legacyPreloadError = 'maintenance omitted effective per-table operationTimeout before load admission';
@@ -693,9 +702,96 @@ function validateObservedAksDisposition(original: Buffer, evidence: Buffer, appr
   };
 }
 
+function validateAbortedPostLoadAksDisposition(original: Buffer, evidence: Buffer, approval: AksDispositionApproval) {
+  if (sha256Bytes(original) !== approval.receiptSha256 || sha256Bytes(evidence) !== approval.evidenceSha256) {
+    throw new Error('Post-load AKS disposition does not match the reviewed receipt and evidence digests');
+  }
+  const receipt: unknown = JSON.parse(original.toString('utf8'));
+  const proof: unknown = JSON.parse(evidence.toString('utf8'));
+  if (!isLauncherDeadlineReceipt(receipt) ||
+      !(receipt.invocation_id === approval.invocationId ||
+        sha256Bytes(Buffer.from(receipt.invocation_id)) === approval.invocationIdSha256) ||
+      receipt.creation_state !== 'accepted' || receipt.run_state !== 'failed' || receipt.cleanup_state !== 'unsettled' ||
+      receipt.config_binding_error !== null || receipt.terminal_observation != null ||
+      receipt.server_pid != null || receipt.server_start_ticks != null || receipt.server_executable != null ||
+      submittedPlatform(receipt.submitted_config_body) !== 'aks' || !isLegacyUuid(receipt.run_id) ||
+      !receipt.server_url || !isLocalOatServerUrl(receipt.server_url) ||
+      !isLegacyIdentity(receipt.error) || !isLegacyTime(receipt.started_at_unix_ms) ||
+      !isRecord(proof) || proof.schema_version !== 1 || proof.kind !== approval.kind ||
+      proof.disposition !== 'aborted-post-load-cleanup-verified-unranked' ||
+      proof.invocation_id !== receipt.invocation_id || proof.controller_run_id !== receipt.run_id ||
+      proof.original_receipt_sha256 !== approval.receiptSha256 ||
+      proof.source_config_sha256 !== receipt.source_config_sha256 ||
+      proof.submitted_config_sha256 !== receipt.submitted_config_sha256 ||
+      proof.original_error !== receipt.error || proof.server_url !== receipt.server_url ||
+      proof.proof_kind !== 'fresh_census_absence' || proof.historical_process_identity_proven !== false ||
+      !isLegacyIdentity(proof.job_id) || !/^[a-f0-9]{12}$/.test(proof.job_id) ||
+      proof.client_pod_ran !== true || proof.result_artifact !== 'diagnostics-retained-unranked' ||
+      proof.ranking !== null || proof.throughput_claim !== null ||
+      !isLegacySha(proof.verifier_sha256) || !isLegacySha(proof.runner_source_sha256)) {
+    throw new Error('Post-load AKS disposition is not bound to the exact failed invocation and original evidence');
+  }
+  const census = proof.census;
+  const cell = proof.cell;
+  const pools = proof.pools;
+  const cluster = proof.cluster;
+  const hashes = proof.raw_observation_sha256;
+  const userPools: unknown[] = isRecord(pools) && Array.isArray(pools.user_pools) ? pools.user_pools : [];
+  if (!isRecord(census) || !isLegacyUuid(census.boot_id) || !isLegacyIdentity(census.pid_namespace) ||
+      !isLegacyIdentity(census.net_namespace) || !isLegacyIdentity(census.host_target) ||
+      !isLegacyIdentity(census.lease_id) || !/^ls-[a-f0-9]+$/.test(census.lease_id) || census.lease_active !== true ||
+      !isLegacyTime(census.controller_pid) || !isLegacyIdentity(census.controller_executable) ||
+      census.controller_port !== Number(new URL(receipt.server_url).port) ||
+      census.controller_pid_allocated !== false || census.launcher_match_count !== 0 ||
+      census.controller_match_count !== 0 || census.listener_count !== 0 ||
+      !isLegacyTime(census.boot_started_at_unix_ms) || census.boot_started_at_unix_ms >= receipt.started_at_unix_ms ||
+      !isLegacyTime(census.container_started_at_unix_ms) ||
+      census.container_started_at_unix_ms >= receipt.started_at_unix_ms ||
+      !isLegacyTime(census.observed_at_unix_ms) || census.observed_at_unix_ms < receipt.started_at_unix_ms ||
+      !isRecord(cell) || !isLegacyUuid(cell.id) || !isLegacyUuid(cell.namespace_uid) ||
+      cell.namespace !== 'arrow-collector-' + cell.id.replaceAll('-', '') ||
+      cell.namespace_absent !== true || cell.namespace_uid_absent !== true ||
+      cell.controller_pod_count !== 0 ||
+      cell.workload_delete_succeeded !== true || cell.qap !== 'cleaned' ||
+      cell.run_fic_id !== 'arrowcol-run-' + cell.id || cell.run_fic_absent !== true ||
+      !isLegacyIdentity(cell.native_fic_id) || cell.native_fic_id === cell.run_fic_id || cell.native_fic_present !== true ||
+      !isLegacyTime(cell.namespace_observed_at_unix_ms) || cell.namespace_observed_at_unix_ms < receipt.started_at_unix_ms ||
+      !isLegacyTime(cell.fic_observed_at_unix_ms) || cell.fic_observed_at_unix_ms < receipt.started_at_unix_ms ||
+      !isLegacyTime(cell.qap_observed_at_unix_ms) || cell.qap_observed_at_unix_ms < receipt.started_at_unix_ms ||
+      cell.fic_inventory_count !== 1 ||
+      !isRecord(cluster) || !isLegacySha(cluster.stamp_config_sha256) ||
+      !isLegacyIdentity(cluster.stock_aks_id) || cluster.arm_aks_id !== cluster.stock_aks_id ||
+      !isLegacyIdentity(cluster.stock_api_server) || cluster.current_api_server !== cluster.stock_api_server ||
+      !isRecord(pools) || pools.all_user_pools_inventoried !== true || !Array.isArray(pools.user_pools) ||
+      !Array.isArray(pools.stamp_user_pool_names) || pools.stamp_user_pool_names.length !== pools.user_pools.length ||
+      !pools.stamp_user_pool_names.every(isLegacyIdentity) ||
+      pools.user_pools.length === 0 || !isLegacyTime(pools.observed_at_unix_ms) ||
+      pools.observed_at_unix_ms < receipt.started_at_unix_ms ||
+      !userPools.every((pool: unknown) => isRecord(pool) && isLegacyIdentity(pool.name) &&
+        pool.arm_count === 0 && pool.arm_min_count === 0 && pool.arm_max_count === 1 &&
+        pool.provisioning_state === 'Succeeded' && pool.kubernetes_node_count === 0) ||
+      new Set(userPools.map((pool) => isRecord(pool) && typeof pool.name === 'string' ? pool.name.toLowerCase() : '')).size !== pools.user_pools.length ||
+      new Set(pools.stamp_user_pool_names.map((name: string) => name.toLowerCase())).size !== pools.user_pools.length ||
+      !pools.stamp_user_pool_names.every((name: string) => userPools.some(
+        (pool) => isRecord(pool) && typeof pool.name === 'string' && pool.name.toLowerCase() === name.toLowerCase())) ||
+      !isRecord(hashes) || !['load_trace', 'controller_identity', 'owning_job_terminal', 'lease', 'census', 'workload_stop',
+        'namespace_get', 'qap_cleanup', 'fic_cleanup', 'fic_inventory', 'cluster_inventory', 'pool_inventory', 'node_inventory']
+        .every((name) => isLegacySha(hashes[name]))) {
+    throw new Error('Post-load AKS disposition lacks coherent writer, cell, QAP, FIC, or pool custody evidence');
+  }
+  return {
+    bootId: census.boot_id, pidNamespace: census.pid_namespace, netNamespace: census.net_namespace,
+    serverPid: census.controller_pid,
+    serverUrl: receipt.server_url, namespaceObserved: cell.namespace_observed_at_unix_ms,
+    ficObserved: cell.fic_observed_at_unix_ms, poolObserved: pools.observed_at_unix_ms,
+    censusObserved: census.observed_at_unix_ms,
+  };
+}
+
 function findAksDispositionApproval(approvals: readonly AksDispositionApproval[], invocationId: string) {
   if (!isLegacyUuid(invocationId)) return undefined;
-  const matching = approvals.filter((approval) => approval.invocationId === invocationId);
+  const matching = approvals.filter((approval) => approval.invocationId === invocationId ||
+    (approval.kind === 'aborted-post-load-aks' && approval.invocationIdSha256 === sha256Bytes(Buffer.from(invocationId))));
   return matching.length === 1 ? matching[0] : undefined;
 }
 
@@ -703,6 +799,7 @@ function validateAksDisposition(original: Buffer, evidence: Buffer, approval: Ak
   switch (approval.kind) {
     case 'legacy': return { kind: approval.kind, ...validateLegacyAksDisposition(original, evidence, approval) } as const;
     case 'observed-failed-preload-aks': return { kind: approval.kind, ...validateObservedAksDisposition(original, evidence, approval) } as const;
+    case 'aborted-post-load-aks': return { kind: approval.kind, ...validateAbortedPostLoadAksDisposition(original, evidence, approval) } as const;
     default: throw new Error('Unrecognized AKS disposition kind');
   }
 }
@@ -754,6 +851,34 @@ async function assertLegacyWritersAbsent(proof: ReturnType<typeof validateLegacy
   }))) throw new Error('Legacy AKS listener is still present');
 }
 
+async function assertCensusWritersAbsent(proof: ReturnType<typeof validateAbortedPostLoadAksDisposition>): Promise<void> {
+  if (process.platform !== 'linux' || (await readFile('/proc/sys/kernel/random/boot_id', 'utf8')).trim() !== proof.bootId ||
+      await readlink('/proc/self/ns/pid') !== proof.pidNamespace || await readlink('/proc/self/ns/net') !== proof.netNamespace) {
+    throw new Error('Post-load AKS census requires the same Linux boot and namespaces as the reviewed census');
+  }
+  try {
+    await lstat('/proc/' + proof.serverPid);
+    throw new Error('Post-load AKS census controller PID is allocated');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  const url = new URL(proof.serverUrl);
+  if (url.hostname !== '127.0.0.1' || !url.port || url.href !== url.origin + '/') {
+    throw new Error('Post-load AKS census requires the recorded loopback listener');
+  }
+  const listenerTable = await Promise.all(['/proc/net/tcp', '/proc/net/tcp6'].map((path) => readFile(path, 'utf8')));
+  const port = Number(url.port).toString(16).padStart(4, '0').toUpperCase();
+  if (listenerTable.some((table) => table.trim().split('\n').slice(1).some((row) => {
+    const fields = row.trim().split(/\s+/);
+    return fields[3] === '0A' && fields[1]?.endsWith(':' + port);
+  }))) throw new Error('Post-load AKS census listener is still present');
+}
+
+async function assertDispositionWritersAbsent(proof: ReturnType<typeof validateAksDisposition>): Promise<void> {
+  if (proof.kind === 'aborted-post-load-aks') return assertCensusWritersAbsent(proof);
+  return assertLegacyWritersAbsent(proof);
+}
+
 export async function recordLegacyAksDisposition(
   root: string, invocationId: string, evidencePath: string, approvals = approvedAksDispositions,
 ): Promise<void> {
@@ -764,6 +889,11 @@ export async function recordLegacyAksDisposition(
   const evidence = await readLegacyRegularFile(evidencePath);
   const original = await readLegacyRegularFile(path);
   const proof = validateAksDisposition(original, evidence, approval);
+  if (proof.kind === 'aborted-post-load-aks' &&
+      ![proof.censusObserved, proof.namespaceObserved, proof.ficObserved, proof.poolObserved]
+        .every((time) => time <= Date.now() && Date.now() - time <= 60 * 60_000)) {
+    throw new Error('Legacy AKS resource absence evidence is not current');
+  }
   const checkExisting = async () => {
     try {
       if (!(await readLegacyRegularFile(disposition)).equals(evidence)) throw new Error('Conflicting legacy AKS disposition');
@@ -774,18 +904,21 @@ export async function recordLegacyAksDisposition(
     }
   };
   if (await checkExisting()) {
-    await assertLegacyWritersAbsent(proof);
+    await assertDispositionWritersAbsent(proof);
     await syncLegacyReceiptDirectory(path);
     return;
   }
   const now = Date.now();
-  const current = proof.kind === 'observed-failed-preload-aks'
+  const current = proof.kind === 'aborted-post-load-aks'
+    ? [proof.censusObserved, proof.namespaceObserved, proof.ficObserved, proof.poolObserved]
+      .every((time) => time <= now && now - time <= 60 * 60_000)
+    : proof.kind === 'observed-failed-preload-aks'
     ? now - proof.fencedAt <= 4 * 60 * 60_000 && Math.max(proof.namespaceObserved, proof.ficObserved, proof.storageObserved) <= now
     : [proof.namespaceObserved, proof.ficObserved].every((time) => time <= now && now - time <= 30 * 60_000);
   if (!current) {
     throw new Error('Legacy AKS resource absence evidence is not current');
   }
-  await assertLegacyWritersAbsent(proof);
+  await assertDispositionWritersAbsent(proof);
   const temporary = disposition + '.' + randomUUID() + '.tmp';
   const output = await open(temporary, 'wx', 0o600);
   try {
@@ -843,7 +976,7 @@ export async function assertNoUnsettledDeadlineReceipts(
     const proof = validateAksDisposition(
       await readLegacyRegularFile(resolve(root, originalName)), await readLegacyRegularFile(resolve(root, name)), approval,
     );
-    await assertLegacyWritersAbsent(proof);
+    await assertDispositionWritersAbsent(proof);
     await syncLegacyReceiptDirectory(resolve(root, name));
     admittedDispositions.add(originalName);
   }
@@ -1644,7 +1777,7 @@ export async function main(
       throw new OatCliError('--recover-failed-aks requires exactly an invocation ID and the reviewed evidence file');
     }
     await recordLegacyAksDisposition(receiptRoot, args[1], args[2]);
-    console.log('Recorded verified legacy AKS cleanup; benchmark remains failed and unranked.');
+    console.log('Recorded verified AKS cleanup disposition; benchmark remains failed and unranked.');
     return;
   }
   validateArguments(args);
