@@ -1029,11 +1029,11 @@ mod overload_guard_tests {
         let inventory = Arc::new(tokio::sync::Mutex::new((deployment, sets, pods)));
         let requests = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let app = axum::Router::new().fallback({
-            let inventory = inventory.clone();
-            let requests = requests.clone();
+            let inventory = Arc::clone(&inventory);
+            let requests = Arc::clone(&requests);
             move |request: axum::extract::Request| {
-                let inventory = inventory.clone();
-                let requests = requests.clone();
+                let inventory = Arc::clone(&inventory);
+                let requests = Arc::clone(&requests);
                 async move {
                     assert_eq!(request.headers().get("authorization").and_then(|value| value.to_str().ok()), Some("Bearer fixture-token"));
                     requests.lock().await.push(request.uri().to_string());
