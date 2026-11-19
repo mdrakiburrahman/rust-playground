@@ -3285,14 +3285,114 @@ mod tests {
     fn minimum_legacy_range_json_bytes(table: &str, rows_per_batch: u32) -> Result<usize> {
         Ok(serde_json::to_vec(&serde_json::json!({
             "table": table, "worker": 0, "first_sequence": 0, "last_sequence": 0,
-            "batch_count": 1, "rows_per_batch": rows_per_batch, "cohort": "measurement",
+            "batch_count": 1, "rows_per_batch": rows_per_batch, "cohort": "warmup",
             "attempts": 1, "outcome": "acknowledged", "decoded_physical_batch_count": 1,
             "canonical_logical_bytes": 0, "canonical_logical_bytes_unavailable_reason": null,
             "first_send_unix_ns": 0, "last_send_unix_ns": 0, "first_admitted_unix_ms": 0,
-            "first_admitted_cohort": "measurement", "last_admitted_unix_ms": 0,
+            "first_admitted_cohort": "warmup", "last_admitted_unix_ms": 0,
             "last_outcome_unix_ms": 0,
         }))?
         .len())
+    }
+
+    struct LegacyRangeWitness {
+        table: String,
+        worker: u16,
+        last_sequence: u64,
+        batch_count: u64,
+        rows_per_batch: u32,
+        cohort: ManifestCohort,
+        attempts: u16,
+        outcome: ManifestOutcome,
+        decoded_physical_batch_count: u64,
+        canonical_logical_bytes: Option<u64>,
+        canonical_logical_bytes_unavailable_reason: Option<String>,
+        first_send_unix_ns: Option<u64>,
+        last_send_unix_ns: Option<u64>,
+        first_admitted_unix_ms: Option<u64>,
+        first_admitted_cohort: Option<ManifestCohort>,
+        last_admitted_unix_ms: Option<u64>,
+        last_outcome_unix_ms: Option<u64>,
+    }
+
+    impl LegacyRangeWitness {
+        fn from_record(record: &LogicalBatchRecord) -> Self {
+            Self {
+                table: record.table.clone(),
+                worker: record.worker,
+                last_sequence: record.sequence,
+                batch_count: 1,
+                rows_per_batch: record.row_count,
+                cohort: record.cohort,
+                attempts: record.attempts,
+                outcome: record.outcome,
+                decoded_physical_batch_count: record.decoded_physical_batch_count,
+                canonical_logical_bytes: record.canonical_logical_bytes,
+                canonical_logical_bytes_unavailable_reason: record.canonical_logical_bytes_unavailable_reason.clone(),
+                first_send_unix_ns: record.first_send_unix_ns,
+                last_send_unix_ns: record.last_send_unix_ns,
+                first_admitted_unix_ms: record.first_admitted_unix_ms,
+                first_admitted_cohort: record.first_admitted_cohort,
+                last_admitted_unix_ms: record.first_admitted_unix_ms,
+                last_outcome_unix_ms: record.last_outcome_unix_ms,
+            }
+        }
+
+        fn can_merge(&self, record: &LogicalBatchRecord) -> bool {
+            self.table == record.table
+                && self.worker == record.worker
+                && self.last_sequence.checked_add(1) == Some(record.sequence)
+                && self.rows_per_batch == record.row_count
+                && self.cohort == record.cohort
+                && self.first_admitted_cohort == record.first_admitted_cohort
+                && self.attempts == record.attempts
+                && self.outcome == record.outcome
+                && self.decoded_physical_batch_count == record.decoded_physical_batch_count
+                && self.canonical_logical_bytes == record.canonical_logical_bytes
+                && self.first_send_unix_ns == record.first_send_unix_ns
+                && self.last_send_unix_ns == record.last_send_unix_ns
+                && self.first_admitted_unix_ms == record.first_admitted_unix_ms
+                && self.last_admitted_unix_ms == record.first_admitted_unix_ms
+                && self.last_outcome_unix_ms == record.last_outcome_unix_ms
+                && self.canonical_logical_bytes_unavailable_reason == record.canonical_logical_bytes_unavailable_reason
+        }
+
+        fn append(&mut self, record: &LogicalBatchRecord) -> Result<()> {
+            self.last_sequence = record.sequence;
+            self.batch_count = self.batch_count.checked_add(1).context("legacy range count overflow")?;
+            self.decoded_physical_batch_count = self
+                .decoded_physical_batch_count
+                .checked_add(record.decoded_physical_batch_count)
+                .context("legacy fragment count overflow")?;
+            self.canonical_logical_bytes = match (self.canonical_logical_bytes, record.canonical_logical_bytes) {
+                (Some(left), Some(right)) => Some(left.checked_add(right).context("legacy byte total overflow")?),
+                _ => None,
+            };
+            self.first_send_unix_ns = min_observation(self.first_send_unix_ns, record.first_send_unix_ns);
+            self.last_send_unix_ns = max_observation(self.last_send_unix_ns, record.last_send_unix_ns);
+            self.first_admitted_unix_ms = min_observation(self.first_admitted_unix_ms, record.first_admitted_unix_ms);
+            self.last_admitted_unix_ms = max_observation(self.last_admitted_unix_ms, record.first_admitted_unix_ms);
+            self.last_outcome_unix_ms = max_observation(self.last_outcome_unix_ms, record.last_outcome_unix_ms);
+            Ok(())
+        }
+    }
+
+    fn legacy_range_count(records: &[LogicalBatchRecord]) -> Result<usize> {
+        let mut ordered: Vec<&LogicalBatchRecord> = records.iter().collect();
+        ordered.sort_by_key(|record| (record.worker, record.sequence));
+        let mut current: Option<LegacyRangeWitness> = None;
+        let mut count = 0_usize;
+        for record in ordered {
+            if let Some(range) = current.as_mut() {
+                if range.can_merge(record) {
+                    range.append(record)?;
+                    continue;
+                }
+            }
+            count = count.checked_add(1).context("legacy range count overflow")?;
+            current = Some(LegacyRangeWitness::from_record(record));
+        }
+        Ok(count)
     }
 
     fn manifest_test_client() -> Result<PreparedClient> {
@@ -3674,7 +3774,14 @@ mod tests {
         for range in ranges {
             assert_eq!(range["batch_facts"]["index_count"], range["batch_count"]);
         }
-        let legacy_lower_bound = minimum_legacy_range_json_bytes(table, ROWS_PER_BATCH)? as u64 * total_batches;
+        let records = client
+            .logical_batches
+            .lock()
+            .map_err(|_| anyhow::anyhow!("logical batch manifest state poisoned"))?;
+        let legacy_ranges = legacy_range_count(&records)?;
+        assert_eq!(legacy_ranges as u64, total_batches);
+        drop(records);
+        let legacy_lower_bound = minimum_legacy_range_json_bytes(table, ROWS_PER_BATCH)? as u64 * legacy_ranges as u64;
         anyhow::ensure!(
             legacy_lower_bound > MAX_LOGICAL_MANIFEST_BYTES as u64,
             "legacy expanded records do not exceed cap"
@@ -3690,7 +3797,7 @@ mod tests {
             "terminal line exceeds cap"
         );
         eprintln!(
-            "L3_FULL_WINDOW_MANIFEST batches={total_batches} warmup_batches={warmup_batches} ranges={} measurement_ms={WINDOW_MS} warmup_ms={WARMUP_MS} rows={measured_rows} admitted_rows={measurement_rows} physical_batches={physical} canonical_bytes={canonical} measurement_physical_batches={measure_physical} expected_measurement_physical_batches={expected_measurement_physical} measurement_canonical_bytes={measure_canonical} expected_measurement_canonical_bytes={expected_measurement_canonical} legacy_lower_bound_bytes={legacy_lower_bound} manifest_bytes={manifest_bytes} terminal_line_bytes={} cap_bytes={} elapsed_ms={}",
+            "L3_FULL_WINDOW_MANIFEST batches={total_batches} warmup_batches={warmup_batches} ranges={} measurement_ms={WINDOW_MS} warmup_ms={WARMUP_MS} rows={measured_rows} admitted_rows={measurement_rows} physical_batches={physical} canonical_bytes={canonical} measurement_physical_batches={measure_physical} expected_measurement_physical_batches={expected_measurement_physical} measurement_canonical_bytes={measure_canonical} expected_measurement_canonical_bytes={expected_measurement_canonical} legacy_ranges={legacy_ranges} legacy_lower_bound_bytes={legacy_lower_bound} manifest_bytes={manifest_bytes} terminal_line_bytes={} cap_bytes={} elapsed_ms={}",
             ranges.len(),
             terminal_line.len(),
             MAX_OAT_CLIENT_METRICS_LINE_BYTES,
@@ -5306,19 +5413,18 @@ mod tests {
             admitted_rows == completed_rows,
             "stress admitted rows {admitted_rows} differ from completed rows {completed_rows}"
         );
-        let unique_send_times = terminal_client
+        let records = terminal_client
             .logical_batches
             .lock()
-            .map_err(|_| anyhow::anyhow!("logical batch manifest state poisoned"))?
-            .iter()
-            .filter_map(|record| record.first_send_unix_ns)
-            .collect::<std::collections::HashSet<_>>();
+            .map_err(|_| anyhow::anyhow!("logical batch manifest state poisoned"))?;
         anyhow::ensure!(
-            unique_send_times.len() as u64 == terminal_record_count,
-            "real sink stress has non-unique send timestamps; expanded legacy range lower bound is not valid"
+            records.len() as u64 == terminal_record_count,
+            "terminal record count differs from client state"
         );
-        let legacy_lower_bound = minimum_legacy_range_json_bytes("sqlserver_availability_replica_states", 64)? as u64
-            * terminal_record_count;
+        let legacy_ranges = legacy_range_count(&records)?;
+        drop(records);
+        let legacy_lower_bound =
+            minimum_legacy_range_json_bytes("sqlserver_availability_replica_states", 64)? as u64 * legacy_ranges as u64;
         anyhow::ensure!(
             legacy_lower_bound > MAX_LOGICAL_MANIFEST_BYTES as u64,
             "real sink stress did not exceed former expanded-manifest cap: records={terminal_record_count} lower_bound={legacy_lower_bound}"
@@ -5334,7 +5440,7 @@ mod tests {
             "real sink stress terminal line exceeds cap"
         );
         eprintln!(
-            "L3_REAL_SINK_TERMINAL_VIABILITY profile=in_memory_flight_sink measurement_ms=30000 records={terminal_record_count} ranges={} admitted_rows={admitted_rows} completed_rows={completed_rows} legacy_lower_bound_bytes={legacy_lower_bound} manifest_bytes={manifest_bytes} terminal_line_bytes={} terminal_line_cap_bytes={} elapsed_ms={}",
+            "L3_REAL_SINK_TERMINAL_VIABILITY profile=in_memory_flight_sink measurement_ms=30000 records={terminal_record_count} legacy_ranges={legacy_ranges} ranges={} admitted_rows={admitted_rows} completed_rows={completed_rows} legacy_lower_bound_bytes={legacy_lower_bound} manifest_bytes={manifest_bytes} terminal_line_bytes={} terminal_line_cap_bytes={} elapsed_ms={}",
             terminal_ranges.len(),
             terminal_line.len(),
             MAX_OAT_CLIENT_METRICS_LINE_BYTES,
