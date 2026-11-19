@@ -30,6 +30,7 @@ tokio-util = "0.7"
 tonic = { version = "0.14", features = ["gzip", "zstd"] }
 
 [dev-dependencies]
+arrow-buffer = { version = "58.3", default-features = false }
 anyhow.workspace = true
 tracing-subscriber.workspace = true
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }

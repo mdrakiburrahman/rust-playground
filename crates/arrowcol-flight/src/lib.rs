@@ -15,6 +15,7 @@ mod error;
 mod flight_sql;
 mod ingest;
 mod lifecycle;
+mod logical_bytes;
 mod put_result;
 mod service;
 
@@ -39,5 +40,6 @@ pub use lifecycle::{
     BatchAdmission, DrainController, DrainOutcome, NoopPressureHooks, PressureEvent, PressureHooks, PutResultEmitter,
     ShutdownCoordinator, StreamAbortReason, StreamContext, StreamLifecycle, StreamOutcome, StreamSummary,
 };
+pub use logical_bytes::{CanonicalLogicalBytesError, canonical_record_batch_logical_bytes};
 pub use put_result::{CompletionMode, DeliveryGuarantee, PUT_RESULT_WIRE_VERSION, PutResultMetadata, StreamCompletion};
 pub use service::{ArrowColFlightService, FlightResponseStream};
