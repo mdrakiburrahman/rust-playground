@@ -81,7 +81,7 @@ test('aks scale is reachable through the shared OAT CLI', async () => {
 });
 
 test('fleet CLI resolves cells, tears down launch failures and recovers owned or unstarted kills', async () => {
-    for (const scenario of ['success', 'launch-failure', 'kill', 'kill-unstarted']) {
+    for (const scenario of ['success', 'source-only-maintenance', 'launch-failure', 'kill', 'kill-unstarted']) {
       const recovering = scenario.startsWith('kill');
       const root = await mkdtemp(path.join(os.tmpdir(), 'oat-fleet-cli-'));
       const out = path.resolve(ROOT, 'out/arrowcol-oat', `test-fleet-${randomUUID()}`);
@@ -138,7 +138,8 @@ test('fleet CLI resolves cells, tears down launch failures and recovers owned or
           namespace: 'arrowcol-oat', oatRunId: randomUUID(), workloadIdentityClientId: randomUUID(),
           subscriptionId: subscription, stamp: '00000', deltaRoot: 'abfss://arrowcol@arrowcollector00000.dfs.core.windows.net/dataflow',
           effective_stop_budgets: { maintenance_grace_seconds: 4_800, maintenance_stop_timeout_ms: 5_100_000 },
-          images: Object.fromEntries(['sqlserver', 'catalog', 'router', 'dataflow'].map(role => [role, image(role)])),
+          images: Object.fromEntries(['sqlserver', 'catalog', 'router', 'dataflow',
+            ...(scenario === 'source-only-maintenance' ? [] : ['maintenance'])].map(role => [role, image(role)])),
         }));
         await writeFile(bootstrapPath, '# fake test input\n');
         const template = JSON.parse(await readFile(path.resolve(ROOT, 'docs/experiments/arrowcol-oat/oat-config.aks.full-fleet.json'), 'utf8'));
@@ -155,7 +156,11 @@ test('fleet CLI resolves cells, tears down launch failures and recovers owned or
           binding: async () => binding,
           acquire: async (_azure, _binding, options) => { assert.equal(options.resume, recovering); return authority; },
           adapter: () => adapter,
-          images: async (_azure, images) => images.map(image => ({ image, architectures: ['amd64'] })),
+          images: async (_azure, images) => {
+            assert.equal(new Set(images).size, images.length);
+            assert.equal(images.filter(value => value === image('maintenance')).length, 1);
+            return images.map(image => ({ image, architectures: ['amd64'] }));
+          },
           launch: async (args, _runner, _cleanup, _receipts, _collect, _owned, signal) => {
             assert.ok(signal);
             const numeric = JSON.parse(await readFile(args[args.indexOf('--config') + 1]!, 'utf8'));

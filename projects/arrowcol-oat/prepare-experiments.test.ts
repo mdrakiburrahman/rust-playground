@@ -48,6 +48,19 @@ test('full fleet auto resolves each heterogeneous node after requests and suppor
   assert.deepEqual(overridden.dfe_worker_concurrency, [20]);
   assert.equal(((overridden.platform as Record<string, any>).fleet.clients[0]).tunables.connections_per_worker, 128);
 });
+test('full fleet retains ready and failed constrained SKU identities from the approved stamp grammar', () => {
+  const nodes = [fleetNode('collector', 'hugepool', 192, 1800),
+    { ...fleetNode('client-constrained', 'clientpool', 32, 256), sku: 'Standard_E128-32ds_v6' }];
+  const pools = nodes.map(node => ({ name: node.pool, sku: node.sku, vcpu: Math.round(node.allocatableCpuMillicores / 1000),
+    state: 'ready' as const, reason: null as string | null }));
+  const failed = { name: 'failedpool', sku: 'Standard_E64-16ds_v6', vcpu: 16, state: 'failed' as const, reason: 'quota_exceeded' };
+  const resolved = resolveFleetExperiment({ platform: { kind: 'aks' }, campaign_profile: 'scale_out_single_table', tables: ['hot'] },
+    fleetSizing(), nodes, [...pools, failed]);
+  const fleet = (resolved.platform as { fleet: { clients: { placement: { sku: string } }[]; pools: unknown[] } }).fleet;
+  assert.equal(fleet.clients[0]!.placement.sku, 'Standard_E128-32ds_v6');
+  assert.deepEqual(fleet.pools, [...pools, failed]);
+});
+
 test('full fleet rejects malformed sentinels, incompatible architecture, duplicates and over-budget nodes', () => {
   for (const bad of [0, -1, 1.5, 'AUTO', '8', null, 257]) {
     const sizing = fleetSizing();
@@ -300,6 +313,10 @@ test('offline CLI selects matching stamp capacity inputs and rejects mismatches 
     await writeFile(resolve(root, 'observation.json'), JSON.stringify({ nodes, pools, images: imageObservations }));
     await assert.rejects(main(fleetArgs, workspace), /architecture is missing or incompatible/);
     imageObservations.push({ image: maintenanceImage, architectures: ['amd64'] });
+    for (const duplicate of [imageObservations[0], { ...imageObservations[0], architectures: ['arm64'] }]) {
+      await writeFile(resolve(root, 'observation.json'), JSON.stringify({ nodes, pools, images: [...imageObservations, duplicate] }));
+      await assert.rejects(main(fleetArgs, workspace), /unique pinned images/);
+    }
     await writeFile(resolve(root, 'observation.json'), JSON.stringify({ nodes, pools, images: imageObservations }));
     await main(fleetArgs, workspace);
     assert.deepEqual(JSON.parse(await readFile(resolve(root, 'full-fleet/full-fleet.config.json'), 'utf8')),

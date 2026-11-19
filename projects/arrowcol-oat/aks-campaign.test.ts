@@ -718,6 +718,37 @@ test('fleet custody records intent before dispatch and recovers only settled own
   await recovered.close();
 });
 
+test('fleet custody requires the retained journal and campaign owner before any recovery mutation', async () => {
+  const fake = new FleetBlobFake();
+  const first = await acquireFleetAuthority(fake.azure(), fleetBinding, fleetOwner);
+  await first.establishBaseline(fleetBaseline());
+  await first.close();
+  const journal = fake.blobs.get('oat-fleet/active.v1.json'), campaign = fake.blobs.get('active.json')!;
+  let revision = fake.revision;
+  await assert.rejects(acquireFleetAuthority(fake.azure(), fleetBinding, { ownerId: campaignId, resume: true }), /retained owner/);
+  assert.equal(fake.revision, revision);
+  assert.equal(fake.blobs.get('oat-fleet/active.v1.json'), journal);
+  assert.equal(fake.blobs.get('active.json'), campaign);
+  assert.equal(fake.journalLease, undefined);
+  await fake.blob('PUT', 'checkpoints', 'active.json', undefined,
+    JSON.stringify({ ...JSON.parse(campaign.bytes.toString()), ownerId: campaignId }));
+  const replaced = fake.blobs.get('active.json');
+  revision = fake.revision;
+  await assert.rejects(acquireFleetAuthority(fake.azure(), fleetBinding, { ownerId, resume: true }), /Another campaign/);
+  assert.equal(fake.revision, revision);
+  assert.equal(fake.blobs.get('oat-fleet/active.v1.json'), journal);
+  assert.equal(fake.blobs.get('active.json'), replaced);
+  assert.equal(fake.journalLease, undefined);
+  await fake.blob('PUT', 'checkpoints', 'active.json', undefined, campaign.bytes);
+  const recovered = await acquireFleetAuthority(fake.azure(), fleetBinding, { ownerId, resume: true });
+  assert.ok(recovered.fencingToken > first.fencingToken);
+  await recovered.complete(); await recovered.close();
+  const fresh = await acquireFleetAuthority(fake.azure(), fleetBinding, { ownerId: campaignId, resume: false });
+  assert.equal(fresh.ownerId, campaignId);
+  await fresh.establishBaseline(fleetBaseline());
+  await fresh.complete(); await fresh.close();
+});
+
 test('fleet custody fences stale leases and uncertain journal writes', async () => {
   const fake = new FleetBlobFake();
   const authority = await acquireFleetAuthority(fake.azure(), fleetBinding, fleetOwner);

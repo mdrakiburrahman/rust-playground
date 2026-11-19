@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test, type TestContext } from 'node:test';
 import { Azure, Config } from '../../infra/azure/bootstrap.js';
+import { defaultStampConfig } from '../../infra/azure/stamp.js';
 import { CampaignConflictError, CUSTODY_CLEANUP_STEPS, armCampaign, publishRunInventory, startCampaign, validateCampaignState,
   type CampaignState, type CampaignStore, type RunInventory, type StoredCampaign, type ScaleTrialReceipt } from './aks-campaign.js';
 import { assertWriterBoundary, createDefaultScaleAdapter, restoreCampaignScaleTrials } from './aks-scale-provider.js';
@@ -11,6 +12,7 @@ import type { CleanupMutationAuthority } from './aks-cleanup-executor.js';
 import type { CustodyCommandRunner } from './aks-setup-cleanup.js';
 import { HttpFailure, TAGS, type HttpReceipt } from '../../infra/azure/bootstrap.js';
 import { createFleetAdapter, observeFleetBinding, observeFleetImageArchitectures } from './aks-fleet-provider.js';
+import { cleanupAksFleet } from './aks-fleet.js';
 import { acquireFleetAuthority, FleetUnsettledDispatchError, type FleetBinding, type FleetIntentAuthority, type FleetPoolObservation } from './aks-fleet-custody.js';
 
 const campaignId = 'c0ffee00-0000-4000-8000-000000000001';
@@ -697,8 +699,13 @@ test('default terminal recovery refuses an expired persisted deadline before res
   assert.ok(store.current!.state.scaleTrials![0]!.restore_deadline_at_ms > deadline + 1);
 });
 
-async function fleetProviderFixture(t: TestContext, beforePut?: (name: string, count: number, etag: string) => void) {
-  const azure = new Azure(new Config({ AZURE_SUBSCRIPTION_ID: campaignId }));
+async function fleetProviderFixture(t: TestContext, beforePut?: (name: string, count: number, etag: string) => void,
+  collectorPool = 'benche64') {
+  const values = { AZURE_SUBSCRIPTION_ID: campaignId }, stamp = structuredClone(defaultStampConfig(values));
+  if (collectorPool !== 'benche64') stamp.aks.userPools.push({
+    ...structuredClone(stamp.aks.userPools.find(p => p.name === 'benche64')!), name: collectorPool,
+  });
+  const azure = new Azure(new Config(values, stamp));
   const id = azure.c.base + '/providers/Microsoft.ContainerService/managedClusters/' + azure.c.cluster;
   const events: string[] = [], pools = new Map<string, Record<string, any>>();
   for (const p of azure.c.stampConfig.aks.userPools) pools.set(p.name, {
@@ -708,6 +715,13 @@ async function fleetProviderFixture(t: TestContext, beforePut?: (name: string, c
       nodeLabels: { type: 'benchmark', 'arrow-collector/role': p.role, 'arrow-collector/sku': p.vmSize },
       nodeTaints: ['arrow-collector/role=' + p.role + ':NoSchedule'], enableFIPS: true,
       upgradeSettings: { maxSurge: '33%' }, securityProfile: { sshAccess: 'Disabled' } },
+  });
+  const system = azure.c.stampConfig.aks.systemPool;
+  pools.set(system.name, {
+    id: id + '/agentPools/' + system.name, name: system.name, type: 'Microsoft.ContainerService/managedClusters/agentPools', etag: '"v1"',
+    properties: { mode: 'System', osType: 'Linux', vmSize: system.vmSize, count: system.initialCount,
+      enableAutoScaling: true, minCount: system.minCount, maxCount: system.maxCount,
+      provisioningState: 'Succeeded', nodeLabels: { type: 'system' } },
   });
   let response = 'accepted', puts = 0;
   let nodeItems: unknown[] = [];
@@ -756,7 +770,7 @@ async function fleetProviderFixture(t: TestContext, beforePut?: (name: string, c
     if (status >= 400) throw new Error('HTTP private diagnostic');
     return [null, { ':status': String(status) }];
   });
-  const binding = await observeFleetBinding(azure, 'benche64');
+  const binding = await observeFleetBinding(azure, collectorPool);
   const observations = new Map<string, FleetPoolObservation>(), hashes = new Map<string, string>();
   const pending = new Map<string, { count: number; state: string; etag: string }>();
   const authority: FleetIntentAuthority = {
@@ -944,9 +958,10 @@ test('fleet provider fences after durable intent and preserves only the reviewed
   } finally { configured.name = 'benchd64'; }
 });
 
-test('fleet provider baseline rejects bounds, physical nodes and overlapping unselected User pools', async t => {
-  for (const fault of ['bounds', 'nodes', 'unselected', 'missing', 'system']) {
-    const f = await fleetProviderFixture(t);
+test('fleet provider requires full stamp membership and preserved zero User policy without adopting unselected pools', async t => {
+  for (const fault of ['bounds', 'nodes', 'unselected', 'undeclared-zero', 'missing', 'system', 'missing-legacy',
+    'missing-system', 'legacy-disabled', 'legacy-min', 'legacy-max', 'legacy-failed', 'legacy-nonzero', 'legacy-nodes']) {
+    const f = await fleetProviderFixture(t, undefined, 'hugepool');
     if (fault === 'bounds') f.pools.get('benche64')!.properties.maxCount++;
     if (fault === 'nodes') f.setNodes([{ metadata: { labels: { agentpool: 'benche64' } } }]);
     if (fault === 'unselected') {
@@ -954,18 +969,63 @@ test('fleet provider baseline rejects bounds, physical nodes and overlapping uns
       extra.name = 'unselected'; extra.id = f.binding.clusterId + '/agentPools/unselected'; extra.properties.count = 1;
       f.pools.set('unselected', extra);
     }
+    if (fault === 'undeclared-zero') {
+      const extra = structuredClone(f.pools.get('benchd64')!);
+      extra.name = 'unapproved'; extra.id = f.binding.clusterId + '/agentPools/unapproved';
+      f.pools.set('unapproved', extra);
+    }
     if (fault === 'missing') f.pools.delete('benchd64');
     if (fault === 'system') f.pools.get('benchd64')!.properties.mode = 'System';
+    if (fault === 'missing-legacy') f.pools.delete('benche64');
+    if (fault === 'missing-system') f.pools.delete(f.azure.c.stampConfig.aks.systemPool.name);
+    if (fault === 'legacy-disabled') f.pools.get('benche64')!.properties.enableAutoScaling = false;
+    if (fault === 'legacy-min') f.pools.get('benche64')!.properties.minCount = 1;
+    if (fault === 'legacy-max') f.pools.get('benche64')!.properties.maxCount++;
+    if (fault === 'legacy-failed') f.pools.get('benche64')!.properties.provisioningState = 'Failed';
+    if (fault === 'legacy-nonzero') f.pools.get('benche64')!.properties.count = 1;
+    if (fault === 'legacy-nodes') f.setNodes([{ metadata: { labels: { agentpool: 'benche64' } } }]);
     await assert.rejects(f.adapter.establishBaseline());
     assert.ok(!f.events.includes('baseline'));
     assert.equal(f.puts, 0);
   }
-  const f = await fleetProviderFixture(t);
-  const extra = structuredClone(f.pools.get('benchd64')!);
-  extra.name = 'unapproved'; extra.id = f.binding.clusterId + '/agentPools/unapproved';
-  f.pools.set('unapproved', extra);
+  const f = await fleetProviderFixture(t, undefined, 'hugepool');
   await f.adapter.establishBaseline();
   assert.deepEqual(await f.adapter.listUserPools(f.authority), f.binding.pools.map(p => p.name));
+  assert.ok(!f.binding.pools.some(p => p.name === 'benche64'));
+  await assert.rejects(f.adapter.scalePool('benche64', 1, f.authority), /not an approved User pool/);
+  assert.equal(f.puts, 0);
+});
+
+test('fleet cleanup rechecks full stamp membership after selected pools reach zero', async t => {
+  for (const fault of ['missing-legacy', 'extra-zero', 'legacy-disabled', 'selected-nonzero', 'legacy-nodes']) {
+    const f = await fleetProviderFixture(t, undefined, 'hugepool');
+    await f.adapter.establishBaseline();
+    await f.adapter.scalePool('hugepool', 1, f.authority);
+    let nodeReads = 0;
+    const listNodes = f.adapter.listNodes;
+    t.mock.method(f.adapter, 'listNodes', async (authority: CleanupMutationAuthority) => {
+      const nodes = await listNodes(authority);
+      if (++nodeReads === f.binding.pools.length) {
+        if (fault === 'missing-legacy') f.pools.delete('benche64');
+        if (fault === 'legacy-disabled') f.pools.get('benche64')!.properties.enableAutoScaling = false;
+        if (fault === 'selected-nonzero') Object.assign(f.pools.get('hugepool')!.properties, { count: 1, minCount: 1, maxCount: 1 });
+        if (fault === 'legacy-nodes') f.setNodes([{ metadata: { labels: { agentpool: 'benche64' } } }]);
+        if (fault === 'extra-zero') {
+          const extra = structuredClone(f.pools.get('benchd64')!);
+          extra.name = 'unapproved'; extra.id = f.binding.clusterId + '/agentPools/unapproved';
+          f.pools.set(extra.name, extra);
+        }
+      }
+      return nodes;
+    });
+    const result = await cleanupAksFleet(f.adapter, f.authority,
+      { deadlineAtMs: Date.now() + 1000, includePoolNames: f.binding.pools.map(p => p.name) });
+    assert.equal(result.verified, false);
+    assert.ok(result.failed.includes('final-user-pool-discovery'));
+    if (fault !== 'selected-nonzero') assert.ok(f.binding.pools.every(p => f.pools.get(p.name)!.properties.count === 0));
+    assert.equal(f.puts, 2);
+    assert.ok(!f.events.includes('PUT:benche64'));
+  }
 });
 
 test('fleet provider polls only exact GETs within the original deadline and does not swallow authority/config drift', async t => {
@@ -1002,13 +1062,17 @@ test('fleet Kubernetes observations reject command failures and oversized output
 test('fleet image observations require exact stamp digest and explicit Linux manifest architecture', async t => {
   const f = await fleetProviderFixture(t);
   const digest = 'sha256:' + 'a'.repeat(64), image = f.azure.c.registryLoginServer + '/arrowcol@' + digest;
-  let metadata: unknown = { digest, os: 'linux', architecture: 'arm64' };
+  let metadata: unknown = { digest, os: 'linux', architecture: 'arm64' }, observations = 0;
   t.mock.method(f.azure, 'cli', async (...args: string[]) => {
     assert.deepEqual(args.slice(0, 3), ['acr', 'manifest', 'show-metadata']);
     assert.equal(args[args.indexOf('--name') + 1], 'arrowcol@' + digest);
+    observations++;
     return metadata;
   });
   assert.deepEqual(await observeFleetImageArchitectures(f.azure, [image]), [{ image, architectures: ['arm64'] }]);
+  observations = 0;
+  assert.deepEqual(await observeFleetImageArchitectures(f.azure, [image, image]), [{ image, architectures: ['arm64'] }]);
+  assert.equal(observations, 1);
   metadata = { digest, manifests: [{ platform: { os: 'linux', architecture: 'amd64' } }, { platform: { os: 'linux', architecture: 'arm64' } }] };
   assert.deepEqual((await observeFleetImageArchitectures(f.azure, [image]))[0]!.architectures, ['amd64', 'arm64']);
   for (const bad of [{ digest: 'sha256:' + 'b'.repeat(64), os: 'linux', architecture: 'amd64' },
@@ -1090,7 +1154,11 @@ test('real fleet custody and provider scale, resume with blob-scoped fencing, re
   await first.close();
   assert.equal(lease, undefined); assert.ok(blobs.has('active.json'));
   const resumedBinding = await observeFleetBinding(f.azure, 'benche64');
-  const resumed = await acquireFleetAuthority(f.azure, resumedBinding, { ownerId: cellId, resume: true });
+  const journalBefore = blobs.get(journalPath), campaignBefore = blobs.get('active.json');
+  await assert.rejects(acquireFleetAuthority(f.azure, resumedBinding, { ownerId: cellId, resume: true }), /retained owner/);
+  assert.equal(blobs.get(journalPath), journalBefore); assert.equal(blobs.get('active.json'), campaignBefore);
+  assert.equal(f.puts, binding.pools.length);
+  const resumed = await acquireFleetAuthority(f.azure, resumedBinding, { ownerId, resume: true });
   authorities.push(resumed);
   assert.ok(resumed.fencingToken > first.fencingToken);
   await assert.rejects(first.assertCurrent(), /closed|fenced/);

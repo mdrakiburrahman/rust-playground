@@ -173,9 +173,14 @@ export async function acquireFleetAuthority(azure: Azure, input: FleetBinding, o
     const old = existing && parseJournal(existing.value);
     if (options.resume && !old || !options.resume && old && old.status !== 'complete') throw new Error('Fleet journal requires exact recovery.');
     if (options.resume && canonical_json(old!.binding) !== canonical_json(binding)) throw new Error('Fleet recovery binding differs.');
+    if (options.resume && old!.ownerId !== options.ownerId) throw new Error('Fleet recovery requires the retained owner.');
     const campaign = await store.read();
+    if (options.resume && campaign &&
+        (campaign.state.campaignId !== old!.campaignId || campaign.state.ownerId !== old!.ownerId))
+      throw new Error('Another campaign or owner holds fleet recovery.');
     if (campaign && !(campaign.state.status === 'complete' && campaign.state.cleanupStatus === 'verified') &&
-        !(options.resume && campaign.state.campaignId === old!.campaignId && campaign.state.mode === 'observe' &&
+        !(options.resume && campaign.state.campaignId === old!.campaignId && campaign.state.ownerId === old!.ownerId &&
+          campaign.state.mode === 'observe' &&
           campaign.state.status === 'active' && !campaign.state.runInventory && !campaign.state.operations.length && !campaign.state.scaleTrials?.length))
       throw new Error('Another campaign owns the stamp.');
     const id = options.resume ? old!.campaignId : randomUUID();

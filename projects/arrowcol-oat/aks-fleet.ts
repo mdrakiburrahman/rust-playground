@@ -44,7 +44,7 @@ export type FleetScaleResult =
   | { state: 'uncertain' };
 
 export interface AksFleetAdapter {
-  listUserPools(authority: CleanupMutationAuthority): Promise<string[]>;
+  listUserPools(authority: CleanupMutationAuthority, requireIdle?: boolean): Promise<string[]>;
   readPool(name: string, authority: CleanupMutationAuthority): Promise<FleetPoolSnapshot>;
   scalePool(name: string, count: number, authority: CleanupMutationAuthority): Promise<FleetScaleResult>;
   waitForPool(name: string, count: number, deadlineAtMs: number,
@@ -580,6 +580,15 @@ export async function cleanupAksFleet(adapter: AksFleetAdapter, authority: Clean
       await assertAuthority(authority);
       failed.push(name);
     }
+  }
+  try {
+    await assertAuthority(authority);
+    const finalNames = await adapter.listUserPools(authority, true);
+    if (finalNames.length !== names.size || finalNames.some(name => !names.has(name)))
+      failed.push('final-user-pool-membership');
+  } catch {
+    await assertAuthority(authority);
+    failed.push('final-user-pool-discovery');
   }
   return { verified: failed.length === 0, failed };
 }

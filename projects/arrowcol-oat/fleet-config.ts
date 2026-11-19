@@ -107,7 +107,7 @@ export function supportReservation(base: Record<string, unknown>): { cpu: number
 }
 function nodeBudget(observed: FleetNodeObservation, reserved: { cpu: number; memory: number }): FleetNode {
   if (!/^[a-z0-9][a-z0-9.-]{0,252}$/.test(observed.node) || !/^[a-z][a-z0-9]{0,11}$/.test(observed.pool) ||
-      !/^Standard_[A-Za-z0-9_]+$/.test(observed.sku) || observed.architecture !== 'amd64')
+      !/^Standard_[A-Za-z0-9_-]+$/.test(observed.sku) || observed.architecture !== 'amd64')
     throw new Error('fleet nodes require observed identities and amd64 architecture for the published images');
   for (const value of [observed.allocatableCpuMillicores, observed.allocatableMemoryBytes,
     observed.requestedCpuMillicores, observed.requestedMemoryBytes]) {
@@ -129,7 +129,7 @@ export function resolveFleetExperiment(
   if (!Array.isArray(observations) || !Array.isArray(pools) ||
       new Set(pools.map(pool => pool.name)).size !== pools.length ||
       pools.some(pool => !/^[a-z][a-z0-9]{0,11}$/.test(pool.name) ||
-        !/^Standard_[A-Za-z0-9_]+$/.test(pool.sku) || !Number.isSafeInteger(pool.vcpu) || pool.vcpu < 1 ||
+        !/^Standard_[A-Za-z0-9_-]+$/.test(pool.sku) || !Number.isSafeInteger(pool.vcpu) || pool.vcpu < 1 ||
         !['ready', 'failed'].includes(pool.state) ||
         (pool.reason !== null && (typeof pool.reason !== 'string' || pool.reason.length > 512 || /[\r\n]/.test(pool.reason))) ||
         pool.state === 'failed' && !pool.reason))

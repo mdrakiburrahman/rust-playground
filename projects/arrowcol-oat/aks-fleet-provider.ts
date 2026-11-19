@@ -122,6 +122,8 @@ export function createFleetAdapter(azure: Azure, suppliedBinding: FleetBinding, 
   runCommand: CustodyCommandRunner = runtime.run_tree): AksFleetAdapter & { establishBaseline(): Promise<void> } {
   const binding = structuredClone(suppliedBinding);
   validateBinding(azure, binding);
+  const reviewed = structuredClone(azure.c.stampConfig.aks);
+  const reviewedUsers = new Map(reviewed.userPools.map(p => [p.name, p]));
   if (!authority || !same(authority.binding, binding) ||
       ['assertCurrent', 'establishBaseline', 'recordObservation', 'beforeDispatch', 'afterDispatch'].some(k =>
         typeof (authority as unknown as Record<string, unknown>)[k] !== 'function'))
@@ -144,7 +146,7 @@ export function createFleetAdapter(azure: Azure, suppliedBinding: FleetBinding, 
         terminalFailure(p.provisioningState) && (!idle && !pinned || p.count !== 0 && p.count !== approved.count))
       throw new Error('Fleet autoscaler bounds differ from approved idle or pinned scale state.');
   };
-  const membership = async () => {
+  const membership = async (requireIdle = false) => {
     await check(authority);
     if (!same(await observeCluster(azure), { clusterId: binding.clusterId, server: binding.server }))
       throw new Error('Exact fleet cluster/server binding drifted.');
@@ -158,12 +160,37 @@ export function createFleetAdapter(azure: Azure, suppliedBinding: FleetBinding, 
           typeof p.mode !== 'string' || !['User', 'System'].includes(p.mode) || !integer(p.count))
         throw new Error('Fleet live pool membership identity is UNKNOWN.');
       names.add(m.name);
+      if (typeof m.type !== 'string' || m.type.toLowerCase() !== 'microsoft.containerservice/managedclusters/agentpools')
+        throw new Error('Fleet live pool membership type is UNKNOWN.');
+      if (m.name === reviewed.systemPool.name) {
+        const system = reviewed.systemPool;
+        if (p.mode !== 'System' || p.vmSize !== system.vmSize || p.osType !== 'Linux' ||
+            p.provisioningState !== 'Succeeded' || p.enableAutoScaling !== true ||
+            p.minCount !== system.minCount || p.maxCount !== system.maxCount ||
+            p.count < system.minCount || p.count > system.maxCount)
+          throw new Error('Reviewed System pool identity or autoscaler policy drifted.');
+        continue;
+      }
+      const configured = reviewedUsers.get(m.name);
+      if (!configured) throw new Error('An undeclared pool is present in fleet membership.');
       const selected = binding.pools.find(p => p.name === m.name);
-      if (selected) validateBounds(validatePool(m, binding.clusterId, selected).properties, selected);
-      else if (p.mode === 'User' && p.count !== 0)
-        throw new Error('Non-selected User pool is nonzero; overlapping fleet custody is forbidden.');
+      if (selected) {
+        const observed = validatePool(m, binding.clusterId, selected).properties;
+        validateBounds(observed, selected);
+        if (requireIdle && (observed.count !== 0 || observed.provisioningState !== 'Succeeded'))
+          throw new Error('Selected User pool is not settled at zero during final idle verification.');
+      }
+      else {
+        const preserved = validatePool(m, binding.clusterId,
+          { name: configured.name, sku: configured.vmSize, role: configured.role }).properties;
+        if (preserved.count !== 0 || preserved.provisioningState !== 'Succeeded' ||
+            preserved.minCount !== configured.minCount || configured.minCount !== 0 ||
+            preserved.maxCount !== configured.maxCount)
+          throw new Error('Non-selected User pool must retain its approved settled-zero idle policy.');
+      }
     }
-    if (binding.pools.some(p => !names.has(p.name))) throw new Error('An approved fleet User pool is missing.');
+    if (!names.has(reviewed.systemPool.name) || reviewed.userPools.some(p => !names.has(p.name)))
+      throw new Error('An approved fleet System or User pool is missing.');
   };
   const read = async (name: string) => {
     await check(authority);
@@ -195,6 +222,18 @@ export function createFleetAdapter(azure: Azure, suppliedBinding: FleetBinding, 
     await check(supplied);
     return { ...value, items: value.items as unknown[] };
   };
+  const validateNodeMembership = (nodes: unknown[], requireIdle = false) => {
+    for (const node of nodes) {
+      const labels = object(object(object(node).metadata).labels);
+      const a = labels.agentpool, b = labels['kubernetes.azure.com/agentpool'];
+      if (a !== undefined && b !== undefined && a !== b) throw new Error('Fleet node pool labels disagree.');
+      const name = b ?? a;
+      if (typeof name !== 'string' || name !== reviewed.systemPool.name && !reviewedUsers.has(name))
+        throw new Error('Fleet node pool membership is UNKNOWN.');
+      if (reviewedUsers.has(name) && (requireIdle || !binding.pools.some(p => p.name === name)))
+        throw new Error('A User pool required to be idle still has physical nodes.');
+    }
+  };
   const adapter: AksFleetAdapter & { establishBaseline(): Promise<void> } = {
     async establishBaseline() {
       await membership();
@@ -207,6 +246,7 @@ export function createFleetAdapter(azure: Azure, suppliedBinding: FleetBinding, 
         observations.push(observation);
       }
       const nodes = await kubernetes(['nodes'], authority);
+      validateNodeMembership(nodes.items);
       if (nodes.items.some(node => {
         const labels = object(object(object(node).metadata).labels);
         const a = labels.agentpool, b = labels['kubernetes.azure.com/agentpool'];
@@ -217,9 +257,14 @@ export function createFleetAdapter(azure: Azure, suppliedBinding: FleetBinding, 
       await check(authority);
       await authority.establishBaseline(observations);
     },
-    async listUserPools(supplied) {
-      await check(supplied); await membership();
-      for (const p of binding.pools) await read(p.name);
+    async listUserPools(supplied, requireIdle = false) {
+      await check(supplied); await membership(requireIdle);
+      for (const p of binding.pools) {
+        const { observation } = await read(p.name);
+        if (requireIdle && (observation.count !== 0 || observation.provisioningState !== 'Succeeded'))
+          throw new Error('Selected User pool changed during final idle verification.');
+      }
+      validateNodeMembership((await kubernetes(['nodes'], supplied)).items, requireIdle);
       return binding.pools.map(p => p.name);
     },
     async readPool(name, supplied) {
@@ -302,7 +347,7 @@ export async function observeFleetImageArchitectures(azure: Azure, images: strin
   const observations: Array<{ image: string; architectures: string[] }> = [];
   const server = azure.c.registryLoginServer;
   if (server !== azure.c.registry + '.azurecr.io') throw new Error('Fleet image registry is not the exact stamp ACR.');
-  for (const image of images) {
+  for (const image of new Set(images)) {
     const reference = /^([^/]+)\/([a-z0-9]+(?:[._/-][a-z0-9]+)*)@(sha256:[a-f0-9]{64})$/.exec(image);
     if (!reference || reference[1] !== server) throw new Error('Fleet image must be digest-pinned in the stamp ACR.');
     const metadata = object(await azure.cli('acr', 'manifest', 'show-metadata', '--registry', azure.c.registry,

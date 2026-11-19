@@ -230,10 +230,10 @@ selected node architecture; an `amd64` node selector alone is not image proof.
 
 | Requirement | Contract |
 | --- | --- |
-| Reviewed stamp | Use the heterogeneous pool declarations with zero minimums. Select one collector explicitly; all reviewed client pools participate. Other collector pools remain unowned and unchanged. |
+| Reviewed stamp | Complete System/User pool membership must match the reviewed stamp. Select one collector explicitly; all reviewed client pools participate. Nonselected User pools remain unowned at settled zero with their approved enabled autoscaler/minimum/maximum policy; unknown or missing pools prevent verified cleanup. |
 | Private custody environment | `--env-file` supplies `ARM_SUBSCRIPTION_ID`, `CAMPAIGN_STORAGE_ACCOUNT` and `CAMPAIGN_STATE_CONTAINER`, exactly matching the selected stamp's subscription, existing account and checkpoints container. Existing operator credentials are reused. |
 | Fresh observations | The production adapter observes ARM identities/policies, Ready nodes, requested resources and digest-bound Linux/amd64 image metadata. Preflight rechecks exact collector/client pool/SKU/node identities and remaining budgets. Supplied offline JSON is not production acceptance evidence. |
-| Ownership | A versioned journal in the existing checkpoints container, journal-blob lease and legacy observe-only campaign claim exclude competing custody. Every selected pool must begin at zero with no physical nodes. Intent and ETag are persisted before conditional ARM dispatch. Legacy campaign qualification is unchanged. |
+| Ownership | A versioned journal in the existing checkpoints container, journal-blob lease and legacy observe-only campaign claim exclude competing custody. Every selected pool must begin at zero with no physical nodes. Intent and ETag are persisted before conditional ARM dispatch. Recovery requires the retained owner UUID; implicit takeover is forbidden. Legacy campaign qualification is unchanged. |
 | Scaling and idle | ARM operations serialize where required while Ready waits overlap. Run counts pin autoscaler minimum/maximum to the approved count. Cleanup restores zero, enabled autoscaling, minimum zero and each approved original maximum, then verifies zero selected nodes. Unknown outcomes stop rather than replay. |
 
 Use the reviewed `sku-pools.ts` output's `userPools` in the private stamp,

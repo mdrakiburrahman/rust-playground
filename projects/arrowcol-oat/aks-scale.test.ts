@@ -588,7 +588,7 @@ test('fleet callback failure still discovers and cleans late user pools', async 
   };
   await assert.rejects(runAksFleet(fleetFixture({ clients: fleetFixture().clients.slice(0, 1) }),
     state.adapter, state.authority, async () => { throw new Error('callback failed'); }), /callback failed/);
-  assert.equal(discoveryCalls, 2);
+  assert.equal(discoveryCalls, 3);
   assert.equal(state.pools.get('latepool')?.count, 0);
 });
 
