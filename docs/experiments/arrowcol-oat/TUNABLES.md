@@ -60,6 +60,8 @@ Sources: [Ddsv6 sizes](https://learn.microsoft.com/azure/virtual-machines/sizes/
 | `collector.commit.batch_window` | Existing maximum collection interval (default `10s`), starting at the first ready group. Depth `1` preserves immediate forced group commits; pipelined groups use this interval or the file cap. Explicit flush, schema transitions and shutdown wait for all prior groups. |
 | `collector.commit.max_pending_files` | Existing file admission bound (default `256`), held through terminal commit results. |
 | `collector.commit.publication_lookup_mode` | Typed `scalar` (default) or `batched` transaction-identity lookup; use `batched` explicitly for the no-CRC benchmark profile. No automatic CRC/cardinality threshold is used. |
+| `collector.commit.remote_snapshot_reuse` | Boolean, default `false` (uncached compatibility behavior). Opts into Kernel incremental remote refresh only after before/after object-identity and authority checks; never enables the filesystem cache for ADLS. |
+| `collector.commit.remote_snapshot_max_metadata_objects` | Integer `1..=4096`, default `4096`. Larger retained logs or missing ETag/version identities disable reuse. Checkpoint/CRC changes, replacement, removal, schema/retention and final publication fencing remain authoritative. Both controls project through the commit JSON override and appear in effective collector readback. |
 | `collector.runtime.cpu_workers` / `upload_limit` | Existing CPU pool and upload admission bounds. These do not imply that more file groups are active; pipeline depth, flush slots and Arrow queue capacities must also permit overlap. |
 
 Coalesced preparation uses the same opened table as the single Delta commit worker,

@@ -4,7 +4,7 @@
 | --- | --- | --- |
 | `ARROWCOL_PARQUET_CONFIG` | Strict `arrow_deltalake::writer::ParquetWriterConfig` JSON: global/per-physical-column codecs, levels, encoding, dictionary, statistics/page indexes, offset index, Bloom filters, pages, row groups, sorting metadata | Startup |
 | `ARROWCOL_COLLECTOR_BATCHING_CONFIG` | Deep JSON override of exporter `batching`: byte/row/batch capacities and flush limits, age, flush concurrency, adaptive sizing, `coalesce_publications` | Startup |
-| `ARROWCOL_COLLECTOR_COMMIT_CONFIG` | Deep JSON override of exporter `commit`: `batch_window`, `max_files_per_commit`, `max_pending_files`, and `publication_lookup_mode` (`scalar` default; `batched` is explicit) | Startup |
+| `ARROWCOL_COLLECTOR_COMMIT_CONFIG` | Deep JSON override of exporter `commit`: batching limits, `publication_lookup_mode` (`scalar` default), `remote_snapshot_reuse` (`false` default), `remote_snapshot_max_metadata_objects` (`4096` default, `1..=4096`) | Startup |
 | `ARROWCOL_COLLECTOR_LIMITS_CONFIG` | Deep JSON override of receiver `limits`: Flight sizes, channels and deadlines | Startup |
 | `ARROWCOL_COLLECTOR_PRESSURE_CONFIG` | Stream/RSS/buffered limits, pressure/heartbeat intervals and registration TTL; no identities/endpoints | Startup |
 | `ARROWCOL_COLLECTOR_CATALOG_CONFIG` | Remote catalog `maximum_cache_age`; rejects memory catalog | Startup |
@@ -79,11 +79,20 @@ stderr. The default is `false`; other values fail startup. Keep mixed stderr
 unchanged and extract JSON lines without rewriting receipt fields. This logging
 option does not enable auditing, change publication identity or establish delivery.
 
-ADLS snapshots use Kernel's incremental builder only after validating the retained
+Set `commit.remote_snapshot_reuse: true` to opt in to remote incremental refresh;
+`false` preserves uncached Kernel loading with authority checks. The strictly
+validated `commit.remote_snapshot_max_metadata_objects` limit is `1..=4096`
+(default `4096`); lowering it bounds the retained identity inventory without
+weakening freshness. Both controls flow through typed collector tunables,
+`ARROWCOL_COLLECTOR_COMMIT_CONFIG`, and optional exporter `commit_options`,
+and appear in the collector's effective commit configuration.
+
+With reuse enabled, ADLS snapshots use Kernel's incremental builder only after validating the retained
 log's object identities. Each refresh still lists metadata before and after the
 build and checks publisher authority; this reduces replay work, not listing cost.
 Checkpoint/CRC changes, replacement or removal of retained objects force a fresh
-build. Missing ETags/version IDs or more than 4,096 log objects disable reuse.
+build. Missing ETags/version IDs or more than the configured metadata-object
+limit disable reuse, not publication or freshness checks.
 The filesystem cache is not used for ADLS. Schema and retention checks and the
 final publication fence remain unchanged. Read-only reconciliation after a lost
 write response does not clear uncertainty or admit another mutation.

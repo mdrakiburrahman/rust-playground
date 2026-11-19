@@ -29,6 +29,9 @@ pub enum PublicationLookupMode {
     Scalar,
 }
 
+/// Conservative upper bound for remote snapshot identity inventories.
+pub const MAX_REMOTE_SNAPSHOT_METADATA_OBJECTS: usize = 4096;
+
 /// Limits for eligible files awaiting a shared transaction.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommitOptions {
@@ -36,6 +39,8 @@ pub struct CommitOptions {
     pub max_files_per_commit: usize,
     pub max_pending_files: usize,
     pub publication_lookup_mode: PublicationLookupMode,
+    pub remote_snapshot_reuse: bool,
+    pub remote_snapshot_max_metadata_objects: usize,
 }
 
 impl Default for CommitOptions {
@@ -45,6 +50,8 @@ impl Default for CommitOptions {
             max_files_per_commit: 64,
             max_pending_files: 256,
             publication_lookup_mode: PublicationLookupMode::default(),
+            remote_snapshot_reuse: false,
+            remote_snapshot_max_metadata_objects: MAX_REMOTE_SNAPSHOT_METADATA_OBJECTS,
         }
     }
 }
@@ -55,6 +62,9 @@ impl CommitOptions {
     /// # Errors
     /// Rejects zero, inconsistent, or unrepresentable capacities/windows.
     pub fn validate(&self) -> Result<()> {
+        if !(1..=MAX_REMOTE_SNAPSHOT_METADATA_OBJECTS).contains(&self.remote_snapshot_max_metadata_objects) {
+            bail!("remote_snapshot_max_metadata_objects must be between 1 and {MAX_REMOTE_SNAPSHOT_METADATA_OBJECTS}");
+        }
         if self.batch_window.is_zero()
             || Instant::now().checked_add(self.batch_window).is_none()
             || self.max_files_per_commit == 0
@@ -742,13 +752,12 @@ fn run_worker(
     publication_fence: Option<Arc<dyn PublicationFence>>,
 ) {
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build();
-    let lookup_mode = options.publication_lookup_mode;
     let table = publication_fence.map_or_else(
-        || DeltaTable::open_with_lookup_mode(root, lookup_mode),
+        || DeltaTable::open_with_commit_options(root, &options),
         |publication_fence| {
             root.to_str()
                 .context("invalid table URI")
-                .and_then(|root| DeltaTable::open_uri_with_fence_and_lookup_mode(root, publication_fence, lookup_mode))
+                .and_then(|root| DeltaTable::open_uri_with_fence_and_commit_options(root, publication_fence, &options))
         },
     );
     let mut failure = table
@@ -1273,6 +1282,7 @@ mod tests {
                 max_files_per_commit: 2,
                 max_pending_files: 4,
                 publication_lookup_mode: PublicationLookupMode::default(),
+                ..CommitOptions::default()
             },
         )
         .await?;
@@ -1325,6 +1335,7 @@ mod tests {
                 max_files_per_commit: 2,
                 max_pending_files: 4,
                 publication_lookup_mode: PublicationLookupMode::default(),
+                ..CommitOptions::default()
             },
         )
         .await?;

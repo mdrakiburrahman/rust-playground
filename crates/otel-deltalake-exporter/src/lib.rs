@@ -221,6 +221,8 @@ struct CommitConfig {
     max_pending_files: usize,
     #[serde(default)]
     publication_lookup_mode: arrow_deltalake::commit::PublicationLookupMode,
+    remote_snapshot_reuse: bool,
+    remote_snapshot_max_metadata_objects: usize,
 }
 
 impl Default for CommitConfig {
@@ -231,6 +233,8 @@ impl Default for CommitConfig {
             max_files_per_commit: options.max_files_per_commit,
             max_pending_files: options.max_pending_files,
             publication_lookup_mode: options.publication_lookup_mode,
+            remote_snapshot_reuse: options.remote_snapshot_reuse,
+            remote_snapshot_max_metadata_objects: options.remote_snapshot_max_metadata_objects,
         }
     }
 }
@@ -256,6 +260,8 @@ fn parse_config(
         max_files_per_commit: commit.max_files_per_commit,
         max_pending_files: commit.max_pending_files,
         publication_lookup_mode: commit.publication_lookup_mode,
+        remote_snapshot_reuse: commit.remote_snapshot_reuse,
+        remote_snapshot_max_metadata_objects: commit.remote_snapshot_max_metadata_objects,
     };
     options.validate().map_err(|error| InvalidUserConfig {
         error: error.to_string(),
@@ -464,11 +470,21 @@ mod tests {
             options.publication_lookup_mode,
             arrow_deltalake::commit::PublicationLookupMode::Scalar
         );
+        assert!(!options.remote_snapshot_reuse);
+        let mut enabled = value.clone();
+        enabled["commit_options"]["remote_snapshot_reuse"] = serde_json::json!(true);
+        enabled["commit_options"]["remote_snapshot_max_metadata_objects"] = serde_json::json!(16);
+        let (_, _, enabled) = parse_config(&enabled)?;
+        assert!(enabled.remote_snapshot_reuse);
+        assert_eq!(enabled.remote_snapshot_max_metadata_objects, 16);
         for invalid in [
             serde_json::json!({"batch_window": "0s"}),
             serde_json::json!({"max_files_per_commit": 0}),
             serde_json::json!({"max_pending_files": 1}),
             serde_json::json!({"publication_lookup_mode": "automatic"}),
+            serde_json::json!({"remote_snapshot_reuse": "true"}),
+            serde_json::json!({"remote_snapshot_max_metadata_objects": 0}),
+            serde_json::json!({"remote_snapshot_max_metadata_objects": 4097}),
             serde_json::json!({"batch_windows": "1s"}),
         ] {
             let mut value = value.clone();

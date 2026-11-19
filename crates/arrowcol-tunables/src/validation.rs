@@ -211,6 +211,8 @@ const CAPABILITIES: &[Capability] = &[
     capability!("collector.commit.max_files_per_commit", "64"),
     capability!("collector.commit.max_pending_files", "256"),
     capability!("collector.commit.publication_lookup_mode", "scalar"),
+    capability!("collector.commit.remote_snapshot_reuse", "false"),
+    capability!("collector.commit.remote_snapshot_max_metadata_objects", "4096"),
     capability!("collector.limits.max_metadata_bytes", "16384"),
     capability!("collector.limits.grpc_accept_compression", "none"),
     capability!("collector.limits.grpc_send_compression", "none"),
@@ -1339,6 +1341,12 @@ fn validate_batching(batching: Option<&BatchingTunables>) -> Result<()> {
 
 fn validate_commit(commit: Option<&CommitTunables>) -> Result<()> {
     let commit = commit.cloned().unwrap_or_default();
+    let remote_limit = commit
+        .remote_snapshot_max_metadata_objects
+        .unwrap_or(arrow_deltalake::commit::MAX_REMOTE_SNAPSHOT_METADATA_OBJECTS);
+    if !(1..=arrow_deltalake::commit::MAX_REMOTE_SNAPSHOT_METADATA_OBJECTS).contains(&remote_limit) {
+        bail!("collector.commit.remote_snapshot_max_metadata_objects must be between 1 and 4096");
+    }
     validate_duration("collector.commit.batch_window", commit.batch_window.as_deref(), "10s")?;
     let files = commit.max_files_per_commit.unwrap_or(64);
     let pending = commit.max_pending_files.unwrap_or(256);

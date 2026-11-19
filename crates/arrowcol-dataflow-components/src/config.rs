@@ -18,6 +18,52 @@ mod override_tests {
     use super::*;
 
     #[test]
+    fn remote_snapshot_controls_project_and_reject_invalid_bounds() -> Result<(), String> {
+        assert!(!CommitConfig::default().build()?.remote_snapshot_reuse);
+        for reuse in [false, true] {
+            let tunables = arrowcol_tunables::Tunables::parse_oat_json(serde_json::json!({
+                "collector":{"commit":{"remote_snapshot_reuse":reuse,"remote_snapshot_max_metadata_objects":16}}
+            }))
+            .map_err(|error| error.to_string())?;
+            let environment = tunables
+                .environment_for(arrowcol_tunables::ComponentRole::Collector)
+                .map_err(|error| error.to_string())?;
+            let config = merge_config(
+                &CommitConfig::default(),
+                &environment["ARROWCOL_COLLECTOR_COMMIT_CONFIG"],
+                None,
+            )?;
+            let options = config.build()?;
+            assert_eq!(options.remote_snapshot_reuse, reuse);
+            assert_eq!(options.remote_snapshot_max_metadata_objects, 16);
+            let effective = serde_json::to_value(config).map_err(|error| error.to_string())?;
+            assert_eq!(effective["remote_snapshot_reuse"], reuse);
+            assert_eq!(effective["remote_snapshot_max_metadata_objects"], 16);
+        }
+        for invalid in [
+            serde_json::json!(0),
+            serde_json::json!(4097),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+        ] {
+            let value = serde_json::json!({"remote_snapshot_max_metadata_objects":invalid});
+            assert!(
+                arrowcol_tunables::Tunables::parse_oat_json(serde_json::json!({
+                    "collector":{"commit":value}
+                }))
+                .is_err()
+            );
+            assert!(
+                merge_config(&CommitConfig::default(), &value.to_string(), None)
+                    .and_then(|config| config.build())
+                    .is_err()
+            );
+        }
+        assert!(merge_config(&CommitConfig::default(), r#"{"remote_snapshot_reuse":"true"}"#, None).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn receiver_compression_projects_typed_oat_json_into_actual_runtime_limits() -> Result<(), String> {
         let defaults = RuntimeLimitsConfig::default()
             .build()
@@ -928,6 +974,10 @@ pub struct CommitConfig {
     /// Transaction lookup implementation; scalar by default, batched for explicit comparison.
     #[serde(default)]
     pub publication_lookup_mode: arrow_deltalake::commit::PublicationLookupMode,
+    /// Opt in to freshness-checked remote Kernel snapshot reuse.
+    pub remote_snapshot_reuse: bool,
+    /// Maximum retained remote object identities, between 1 and 4096.
+    pub remote_snapshot_max_metadata_objects: usize,
 }
 
 impl Default for CommitConfig {
@@ -938,6 +988,8 @@ impl Default for CommitConfig {
             max_files_per_commit: options.max_files_per_commit,
             max_pending_files: options.max_pending_files,
             publication_lookup_mode: options.publication_lookup_mode,
+            remote_snapshot_reuse: options.remote_snapshot_reuse,
+            remote_snapshot_max_metadata_objects: options.remote_snapshot_max_metadata_objects,
         }
     }
 }
@@ -949,6 +1001,8 @@ impl CommitConfig {
             max_files_per_commit: self.max_files_per_commit,
             max_pending_files: self.max_pending_files,
             publication_lookup_mode: self.publication_lookup_mode,
+            remote_snapshot_reuse: self.remote_snapshot_reuse,
+            remote_snapshot_max_metadata_objects: self.remote_snapshot_max_metadata_objects,
         };
         options.validate().map_err(|error| error.to_string())?;
         Ok(options)

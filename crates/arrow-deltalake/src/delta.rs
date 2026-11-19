@@ -613,13 +613,16 @@ mod io_tests {
             Some("00000000-0000-4000-8000-000000000001"),
         )
         .await?;
-        let table = DeltaTable::open_connection_with_store(
+        let mut table = DeltaTable::open_connection_with_store(
             Url::parse("abfss://data@fixture.dfs.core.windows.net/table/")?,
             Vec::new(),
             fence,
             Some(session),
             Some(store),
         )?;
+        Arc::get_mut(&mut table)
+            .context("new fixture unexpectedly shared")?
+            .remote_snapshot_reuse = true;
         table.ensure_schema(input_batch()?.schema())?;
         Ok((table, control))
     }
@@ -889,9 +892,30 @@ mod io_tests {
             .close_after_drain_async()
             .await?;
 
-        let (table, store, _) = remote_snapshot_fixture(None).await?;
+        let (mut table, store, _) = remote_snapshot_fixture(None).await?;
+        Arc::get_mut(&mut table)
+            .context("fixture shared")?
+            .remote_snapshot_reuse = false;
         table.snapshot()?;
-        for index in 0..4096 {
+        assert!(
+            table
+                .remote_snapshot_cache
+                .lock()
+                .map_err(|error| anyhow::anyhow!("{error}"))?
+                .is_none()
+        );
+        let writer = Arc::get_mut(&mut table).context("fixture shared")?;
+        writer.remote_snapshot_reuse = true;
+        writer.remote_snapshot_max_metadata_objects = 4;
+        table.snapshot()?;
+        assert!(
+            table
+                .remote_snapshot_cache
+                .lock()
+                .map_err(|error| anyhow::anyhow!("{error}"))?
+                .is_some()
+        );
+        for index in 0..4 {
             store
                 .put(
                     &table.object_path(&format!("_delta_log/observer-{index}"))?,
@@ -2734,6 +2758,8 @@ pub struct DeltaTable {
     bootstrap_only: bool,
     snapshot_cache: Mutex<Option<CachedSnapshot>>,
     remote_snapshot_cache: Mutex<Option<CachedRemoteSnapshot>>,
+    remote_snapshot_reuse: bool,
+    remote_snapshot_max_metadata_objects: usize,
     layout_readback: Mutex<Option<LayoutReadback>>,
     reuse_snapshots: bool,
     publication_lookup_mode: crate::commit::PublicationLookupMode,
@@ -3259,27 +3285,31 @@ impl DeltaTable {
     }
 
     /// Open a local table with the selected transaction lookup implementation.
-    pub(crate) fn open_with_lookup_mode(
+    pub(crate) fn open_with_commit_options(
         root: impl AsRef<Path>,
-        mode: crate::commit::PublicationLookupMode,
+        options: &crate::commit::CommitOptions,
     ) -> Result<Arc<Self>> {
+        options.validate()?;
         let mut table = Self::open(root)?;
-        Arc::get_mut(&mut table)
-            .context("new Delta writer unexpectedly shared")?
-            .publication_lookup_mode = mode;
+        let writer = Arc::get_mut(&mut table).context("new Delta writer unexpectedly shared")?;
+        writer.publication_lookup_mode = options.publication_lookup_mode;
+        writer.remote_snapshot_reuse = options.remote_snapshot_reuse;
+        writer.remote_snapshot_max_metadata_objects = options.remote_snapshot_max_metadata_objects;
         Ok(table)
     }
 
     /// Open a local or ADLS table with the selected transaction lookup implementation.
-    pub(crate) fn open_uri_with_fence_and_lookup_mode(
+    pub(crate) fn open_uri_with_fence_and_commit_options(
         root: &str,
         publication_fence: Arc<dyn PublicationFence>,
-        mode: crate::commit::PublicationLookupMode,
+        options: &crate::commit::CommitOptions,
     ) -> Result<Arc<Self>> {
+        options.validate()?;
         let mut table = Self::open_uri_with_fence(root, publication_fence)?;
-        Arc::get_mut(&mut table)
-            .context("new Delta writer unexpectedly shared")?
-            .publication_lookup_mode = mode;
+        let writer = Arc::get_mut(&mut table).context("new Delta writer unexpectedly shared")?;
+        writer.publication_lookup_mode = options.publication_lookup_mode;
+        writer.remote_snapshot_reuse = options.remote_snapshot_reuse;
+        writer.remote_snapshot_max_metadata_objects = options.remote_snapshot_max_metadata_objects;
         Ok(table)
     }
 
@@ -3355,6 +3385,8 @@ impl DeltaTable {
             commit_lock: Mutex::new(()),
             snapshot_cache: Mutex::new(None),
             remote_snapshot_cache: Mutex::new(None),
+            remote_snapshot_reuse: false,
+            remote_snapshot_max_metadata_objects: crate::commit::MAX_REMOTE_SNAPSHOT_METADATA_OBJECTS,
             layout_readback: Mutex::new(None),
             reuse_snapshots: false,
             publication_lookup_mode: crate::commit::PublicationLookupMode::default(),
@@ -3683,6 +3715,8 @@ impl DeltaTable {
             commit_lock: Mutex::new(()),
             snapshot_cache: Mutex::new(None),
             remote_snapshot_cache: Mutex::new(None),
+            remote_snapshot_reuse: false,
+            remote_snapshot_max_metadata_objects: crate::commit::MAX_REMOTE_SNAPSHOT_METADATA_OBJECTS,
             layout_readback: Mutex::new(None),
             reuse_snapshots,
             publication_lookup_mode: crate::commit::PublicationLookupMode::default(),
@@ -3820,6 +3854,11 @@ impl DeltaTable {
             .as_ref()
             .context("remote snapshot requires a publisher session")?;
         session.check_snapshot()?;
+        if !self.remote_snapshot_reuse {
+            let snapshot = Snapshot::builder_for(self.url.as_str()).build(&self.engine)?;
+            session.check_snapshot()?;
+            return Ok(snapshot);
+        }
         let before = self.remote_log_fingerprints()?;
         let base = previous.filter(|previous| {
             before.as_ref().is_some_and(|files| {
@@ -3863,6 +3902,7 @@ impl DeltaTable {
 
     fn remote_log_fingerprints(&self) -> Result<Option<BTreeMap<object_store::path::Path, object_store::ObjectMeta>>> {
         let store = Arc::clone(&self.store);
+        let max_objects = self.remote_snapshot_max_metadata_objects;
         let prefix = self.object_path("_delta_log/")?;
         shared_executor()?.block_on(async move {
             use futures::TryStreamExt;
@@ -3871,7 +3911,7 @@ impl DeltaTable {
             while let Some(meta) = entries.try_next().await? {
                 // A missing object identity or oversized retained log disables reuse,
                 // never freshness checks. Checkpoints, purges and CRC changes rebuild.
-                if files.len() == 4096 || (meta.e_tag.is_none() && meta.version.is_none()) {
+                if files.len() == max_objects || (meta.e_tag.is_none() && meta.version.is_none()) {
                     return Ok(None);
                 }
                 files.insert(meta.location.clone(), meta);

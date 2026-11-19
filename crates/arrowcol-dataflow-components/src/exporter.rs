@@ -2089,6 +2089,7 @@ mod tests {
                 max_files_per_commit: 2,
                 max_pending_files: 4,
                 publication_lookup_mode: arrow_deltalake::commit::PublicationLookupMode::default(),
+                ..Default::default()
             },
             FileBatchConfig {
                 coalesce_publications: true,
@@ -3152,6 +3153,7 @@ mod tests {
                 max_files_per_commit: 2,
                 max_pending_files: 2,
                 publication_lookup_mode: arrow_deltalake::commit::PublicationLookupMode::default(),
+                ..Default::default()
             },
             Arc::new(RuntimeMetrics::new(holder)),
         )
@@ -3748,6 +3750,7 @@ mod tests {
                 max_files_per_commit: 2,
                 max_pending_files: 2,
                 publication_lookup_mode: arrow_deltalake::commit::PublicationLookupMode::default(),
+                ..Default::default()
             },
             FileBatchConfig {
                 max_age: std::time::Duration::from_secs(60),
