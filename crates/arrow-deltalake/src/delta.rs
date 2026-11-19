@@ -2942,14 +2942,25 @@ impl DeltaTable {
         let snapshot = self.snapshot()?;
         Self::validate_retention(&snapshot)?;
         let mut unique = std::collections::HashSet::with_capacity(publications.len());
+        for (app_id, version) in publications {
+            validate_transaction_id(app_id, *version)?;
+            if !unique.insert(app_id.as_str()) {
+                bail!("duplicate application identity in publication lookup");
+            }
+        }
+        let versions = crate::publication_lookup::get_app_id_versions(
+            &snapshot,
+            &self.engine,
+            publications.iter().map(|(app_id, _)| app_id.as_str()),
+        )?;
         publications
             .iter()
             .map(|(app_id, version)| {
-                validate_transaction_id(app_id, *version)?;
-                if !unique.insert(app_id.as_str()) {
-                    bail!("duplicate application identity in publication lookup");
-                }
-                match snapshot.get_app_id_version(app_id, &self.engine)? {
+                let previous = versions
+                    .get(app_id.as_str())
+                    .copied()
+                    .context("batch transaction lookup omitted a requested application ID")?;
+                match previous {
                     Some(previous) if previous > *version => {
                         bail!("publication transaction fenced by newer application version")
                     }
