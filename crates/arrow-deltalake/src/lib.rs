@@ -35,6 +35,8 @@ pub mod normalize;
 #[cfg(feature = "delta")]
 mod partition;
 #[cfg(feature = "delta")]
+mod publication_lookup;
+#[cfg(feature = "delta")]
 pub mod publisher;
 #[cfg(feature = "delta")]
 pub mod qap_http;
