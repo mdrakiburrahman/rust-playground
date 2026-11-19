@@ -6,13 +6,15 @@ import { promisify } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
 import { create_namespace_deletion_journal } from './aks-namespace-custody.js';
 import { observeWriter, observeWriterClaim, observeWriterExit, WRITER_CLAIM, type ClientLifetime, type WriterLifetime } from './benchmark-arm.js';
+import { ClockEvidenceError, directClockOffsets, type DirectClockReading } from './benchmark-clock.js';
 import { auditEvidenceFiles, evidenceJson } from './benchmark-audit.js';
 import { observeCompletedClients } from './benchmark-client-terminal.js';
 import { captureFrozenDelta, type DirectDeltaBaseline } from './benchmark-delta-evidence.js';
 import { persistDirectEvidence, type CapturedEvidence } from './benchmark-evidence-custody.js';
 import { evidenceList, evidenceObject, evidenceText, requireEvidence } from './benchmark-evidence-json.js';
 import { readDirectPodExit, stopDirectPodWithExit } from './benchmark-pod-exit.js';
-import { acceptRouterFencePatch, routerFenceObserved } from './benchmark-router-fence.js';
+import { acceptRouterFencePatch, observeRouterLifetimes, routerFenceObserved } from './benchmark-router-fence.js';
+import type { DirectReconciliationTiming } from './benchmark-reconcile.js';
 import { directProducerAuthority, type DirectCampaignScope } from './benchmark-run-authority.js';
 import { persistDirectStopPatch, type DirectStopOrigin } from './benchmark-stop-patch.js';
 import { observeStoppedWriterRegistration, readWriterRegistrations, type WriterRegistration } from './benchmark-writer-sql.js';
@@ -33,9 +35,11 @@ export type DirectTerminalArm = {
   writerClaim: ReturnType<typeof observeWriterClaim>;
   maintenance: WriterLifetime;
   sql: WriterLifetime;
+  catalogLifetime: WriterLifetime;
+  routers: ReturnType<typeof observeRouterLifetimes>;
   registration: WriterRegistration;
   routerUid: string;
-  provenance: object;
+  provenance: { clocks: DirectClockReading[]; release: unknown; catalog: unknown; catalogLog: string; schedule: unknown };
 };
 export type DirectTerminalObservations = {
   job: unknown;
@@ -244,6 +248,43 @@ export async function finishDirectTerminalCustody(azure: Azure, campaign: Direct
   await ns();
   await clients();
   await assertSqlLifetime();
+  const [catalog, catalogSets, catalogPods, liveRouter, liveRouterPods] = await Promise.all([
+    get('deployment', 'arrowcol-catalog'), get('replicasets', '-l', 'app=arrowcol-catalog'), pods('arrowcol-catalog'),
+    get('daemonset', 'arrowcol-router'), pods('arrowcol-router')]);
+  requireEvidence(canonical_json(observeWriter(origin, catalog, catalogSets, catalogPods, 'arrowcol-catalog')) ===
+    canonical_json(arm.catalogLifetime) && arm.routers.length > 0 &&
+    canonical_json(observeRouterLifetimes(origin, arm.routerUid, arm.routers[0].image, liveRouter, liveRouterPods)) === canonical_json(arm.routers),
+  'Original catalog or router lifetimes changed during the run');
+  const clocksAfter: DirectClockReading[] = [];
+  const clockFailures: { node: string; reason: string }[] = [];
+  const clockNodes = new Map(arm.clients.map(client => [client.nodeName, {
+    before: client.uid, after: arm.routers.find(router => router.nodeName === client.nodeName)?.uid ?? '',
+  }]));
+  clockNodes.set(arm.writer.nodeName, { before: arm.writer.podUid, after: arm.writer.podUid });
+  for (const node of clockNodes.keys()) {
+    const route = arm.routers.find(router => router.nodeName === node);
+    const observer = node === arm.writer.nodeName
+      ? { name: arm.writer.podName, uid: arm.writer.podUid, container: 'dataflow' }
+      : route && { name: route.name, uid: route.uid, container: 'router' };
+    requireEvidence(observer, 'Original post-window clock observer is missing');
+    await authority.assertCurrent();
+    const beforeMs = Date.now();
+    try {
+      const observedNs = (await run('exec', observer.name, '-c', observer.container, '--', 'date', '-u', '+%s%N')).trim();
+      const afterMs = Date.now();
+      const timeNamespace = (await run('exec', observer.name, '-c', observer.container, '--', 'readlink', '/proc/self/ns/time')).trim();
+      clocksAfter.push({ node, podUid: observer.uid, beforeMs, afterMs, observedNs, timeNamespace });
+    } catch (error) {
+      if (!(error instanceof Error)) throw error;
+      clockFailures.push({ node, reason: error.message });
+    }
+  }
+  const [writerDeployment, writerSets, writerPods, clockRouter, clockRouterPods] = await Promise.all([
+    get('deployment', 'arrowcol'), get('replicasets', '-l', 'app=arrowcol'), pods('arrowcol'),
+    get('daemonset', 'arrowcol-router'), pods('arrowcol-router')]);
+  requireEvidence(canonical_json(observeWriter(origin, writerDeployment, writerSets, writerPods)) === canonical_json(arm.writer) &&
+    canonical_json(observeRouterLifetimes(origin, arm.routerUid, arm.routers[0].image, clockRouter, clockRouterPods)) === canonical_json(arm.routers),
+  'Original clock observer lifetime changed');
   const control = new PublisherControl(azure);
   const [authorityBefore] = await control.read();
   requireEvidence(authorityBefore.resetgeneration === origin.cloudGeneration && authorityBefore.occupancy === 'released' &&
@@ -313,20 +354,35 @@ export async function finishDirectTerminalCustody(azure: Azure, campaign: Direct
     expected.every(key => byKey.has(key)) && new Set(capturedLogs.map(log => log.path)).size === expected.length,
   'Raw log custody has missing, duplicated or foreign streams');
   const delta = await captureFrozenDelta(azure, authority, origin.runId, arm.baseline.table_root, arm.baseline, deltaDirectory);
+  let timing: DirectReconciliationTiming | null = null, timingFailure: string | null = null;
+  try {
+    const offsets = directClockOffsets(clockNodes, arm.startMs, arm.endMs, arm.provenance.clocks, clocksAfter);
+    timing = { clients: proof.proved.clients.map(client => offsets.get(client.nodeName)!),
+      collector: offsets.get(arm.writer.nodeName)! };
+  } catch (error) {
+    if (!(error instanceof ClockEvidenceError)) throw error;
+    timingFailure = error.message;
+  }
   const report = await auditEvidenceFiles(proof.proved.clients.map(client => byKey.get(`client-${client.index}-stdout.raw`)!.path),
-    byKey.get('writer-stderr.raw')!.path, deltaDirectory, BigInt(arm.baseline.version), { expectedFinalVersion: BigInt(delta.snapshot.version) });
+    byKey.get('writer-stderr.raw')!.path, deltaDirectory, BigInt(arm.baseline.version),
+    { expectedFinalVersion: BigInt(delta.snapshot.version), timing });
   requireEvidence(report.measurement_start_unix_ms === BigInt(arm.startMs) && report.measurement_end_unix_ms === BigInt(arm.endMs) &&
     report.clients === origin.clients && [...delta.evidence,
       ...capturedLogs.filter(file => file.key === 'writer-stderr.raw' || /^client-\d+-stdout\.raw$/.test(file.key))]
       .every(input => report.evidence_sha256[input.path] === input.sha256),
   'Audited bytes or measurement bounds differ from the original capture');
+  const { timed_scoring: timedScoring, ...diagnostic } = report;
+  const scoring = { status: timing ? 'sampled-clock-bounds-valid' : 'invalid', reason: timingFailure,
+    scored: timedScoring ?? null };
   const record = Buffer.from(evidenceJson({ arm, proof: proof.proved, raw: { stops: proof.t.stops,
     writerDeployment: proof.t.writerDeployment, writerPods: proof.t.writerPods, writerClaim: proof.t.writerClaim,
     maintenanceDeployment: proof.t.maintenanceDeployment, maintenancePods: proof.t.maintenancePods, sql: proof.t.sql,
     clientClaims: [...proof.t.claims], writer: proof.t.writer,
     maintenance: proof.t.maintenance, clients: proof.t.clients, job: proof.t.job, router: proof.t.router,
     routerPods: proof.t.routerPods, routerEndpoints: proof.t.routerEndpoints },
-    delta: { snapshot: delta.snapshot, physical: delta.physical }, report }));
+    delta: { snapshot: delta.snapshot, physical: delta.physical }, timing: { after: clocksAfter, failures: clockFailures },
+    diagnostic_reconciliation: diagnostic, scoring,
+    qualification: { status: 'not-qualified', reason: 'Independent throughput qualification is not established by custody and clock evidence' } }));
   const path = join(directory, 'direct-terminal.json');
   await writeFile(path, record, { flag: 'wx', mode: 0o600, flush: true });
   const seal = await persistDirectEvidence(azure, authority, origin, [...capturedLogs, ...delta.evidence,

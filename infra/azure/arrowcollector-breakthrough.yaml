@@ -22,9 +22,10 @@
 # npx --no-install tsx infra/azure/bootstrap.ts prepare-run-fic --mode stamped --env-file "$BOOTSTRAP_ENV" --stamp-config "$STAMP_CONFIG" --run-id "$UUID" --namespace "$NS" --service-account arrow-collector --record "$FIC_RECORD"
 # npx --no-install tsx infra/azure/bootstrap.ts probe-run-fic --mode stamped --env-file "$BOOTSTRAP_ENV" --stamp-config "$STAMP_CONFIG" --run-id "$UUID" --namespace "$NS" --service-account arrow-collector --record "$FIC_RECORD" --wait-seconds 300
 # Do not use the unrelated native namespace or copy its credentials. The stamp workload identity
-# client/tenant IDs below are identifiers, not credentials. Review sku-pools-breakthrough.bicepparam
-# with a fresh Bicep what-if before any separately authorized deployment. It stages up to eight D64
-# clients, one D64 support node, one E192 collector node, and the explicitly enabled ACS v2 installer.
+# client/tenant IDs below are identifiers, not credentials. New support/collector pools and ACS
+# require a separately authorized deployment and fresh what-if that excludes existing benchd64.
+# Preserve benchd64; any later autoscaler-only 1/2/4/8 ramp requires its own gate and authorization.
+# Never apply an older ceiling parameter file containing an existing benchd64 pool update.
 # The workload identity must have sanctioned access. The calibrated realistic client below is a
 # diagnostic starting profile, not a D64 supply guarantee or a demonstrated fastest setting.
 # It reuses one prepared corpus per client while generating identity-bearing sends. Capture its
@@ -74,9 +75,14 @@
 # collector node against the operator. For a pod sharing each node's clock, record operator Unix ns
 # immediately before (t0) and after (t1) `kubectl exec POD -- date -u +%s%N` and the pod timestamp;
 # the offset lies in [pod-t1, pod-t0]. Use signed 64-bit or lossless arithmetic.
-# Invalidate if either end of any offset interval exceeds +/-100 ms, if clock sharing is unverified,
-# if `date` with nanosecond output is unavailable, or if any sample is missing. Clock checks do not
-# replace exact manifest and receipt reconciliation.
+# Use the original pinned client/writer Pods before the window and the original pinned router/writer
+# Pods after it, before stopping them; completed clients cannot be exec'd. Each sampled node's
+# clients and its original observer must report the same /proc/self/ns/time identity via readlink.
+# Invalidate scoring if either
+# end of any offset interval exceeds +/-100 ms, if clock sharing is unverified, if nanosecond `date`
+# is unavailable, or if a sample is missing. Exclude boundary-uncertain work using client/collector
+# offset bounds; raw untimed accounting is diagnostic only. Endpoint samples do not prove continuous
+# clock behavior or replace independent throughput qualification.
 # Client/pod failure after arming invalidates the window.
 # Monitor the same writer pod UID/restart count throughout; stop load if the writer becomes unhealthy.
 # Capture 60 s warmup, 600 s timed commits, then drain. The Job has a hard deadline.
@@ -725,6 +731,11 @@ metadata:
   labels:
     app.kubernetes.io/part-of: arrowcol-oat
     benchmark-stage: catalog
+    arrowcol-oat/run-id: BENCHRUNUUID
+    arrowcol-oat/owner-token: BENCHOWNER
+  annotations:
+    arrowcol-oat/run-id: BENCHRUNUUID
+    arrowcol-oat/owner-token: BENCHOWNER
 spec:
   replicas: 1
   strategy:
@@ -738,6 +749,11 @@ spec:
         app: arrowcol-catalog
         app.kubernetes.io/part-of: arrowcol-oat
         azure.workload.identity/use: "true"
+        arrowcol-oat/run-id: BENCHRUNUUID
+        arrowcol-oat/owner-token: BENCHOWNER
+      annotations:
+        arrowcol-oat/run-id: BENCHRUNUUID
+        arrowcol-oat/owner-token: BENCHOWNER
     spec:
       serviceAccountName: arrow-collector
       automountServiceAccountToken: false

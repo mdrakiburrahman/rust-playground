@@ -27,10 +27,13 @@ export function debugList(value: unknown) {
 }
 function receivedAt(value: unknown) {
   const text = evidenceText(value);
-  requireEvidence(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,9})?Z$/.test(text), 'Receipt timestamp is not UTC RFC3339');
+  const match = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.(\d{1,9}))?Z$/.exec(text);
+  requireEvidence(match, 'Receipt timestamp is not UTC RFC3339');
   const millis = Date.parse(text);
   requireEvidence(Number.isFinite(millis) && new Date(millis).toISOString().slice(0, 19) === text.slice(0, 19), 'Invalid receipt timestamp');
-  return BigInt(millis);
+  const fraction = match[1] ?? '';
+  const startNs = BigInt(Date.parse(`${text.slice(0, 19)}Z`)) * 1_000_000n + BigInt(fraction.padEnd(9, '0') || '0');
+  return { millis: BigInt(millis), startNs, endNs: startNs + 10n ** BigInt(9 - fraction.length) };
 }
 function parseReceipt(event: Record<string, unknown>, fields: Record<string, unknown>) {
   requireEvidence(fields.qualification_state === 'committed' && fields.delta_outcome === 'Committed', 'Publication unresolved or not new');
@@ -72,31 +75,41 @@ function parseReceipt(event: Record<string, unknown>, fields: Record<string, unk
   requireEvidence(references.size === files.size, 'File/transaction membership mismatch');
   const rows = uint(fields.input_rows, 'input rows'), canonical = someUint(fields.canonical_logical_bytes, 'canonical logical bytes');
   requireEvidence(rows > 0n && canonical > 0n, 'Empty input publication');
-  const observed = receivedAt(event.timestamp);
+  const timestamp = receivedAt(event.timestamp), observed = timestamp.millis;
   requireEvidence(observed >= admitted, 'Receipt observation precedes admission');
   return { logical: evidenceText(fields.logical_publication_id), physical: physical.replaceAll('-', ''),
     ordinal: uint(fields.fragment_ordinal, 'fragment ordinal'), version: someUint(fields.authoritative_delta_version, 'authoritative Delta version'),
-    rows, canonical, files: fileNames, transactions, admitted, observed };
+    rows, canonical, files: fileNames, transactions, admitted, observed, observedStartNs: timestamp.startNs, observedEndNs: timestamp.endNs };
 }
 
 type Receipt = ReturnType<typeof parseReceipt>;
 type Parent = ReturnType<typeof decodedRecords> extends Generator<infer T> ? T : never;
+export type ClockOffset = { lowerNs: bigint; upperNs: bigint };
+export type DirectReconciliationTiming = { clients: readonly ClockOffset[]; collector: ClockOffset };
+type Options = { diagnostic: true; timing: DirectReconciliationTiming | null };
 type File = { rows: bigint; bytes: bigint };
 const totals = () => ({ rows: 0n, canonical_bytes: 0n });
 function rate(total: bigint, duration: bigint) { return Number(total * 1000n) / Number(duration); }
 
 export async function reconcilePublications(manifests: readonly unknown[], events: AsyncIterable<unknown> | Iterable<unknown>,
-  delta: ReadonlyMap<bigint, AsyncIterable<unknown> | Iterable<unknown>>, baseline: bigint) {
+  delta: ReadonlyMap<bigint, AsyncIterable<unknown> | Iterable<unknown>>, baseline: bigint, options?: Options) {
   uint(baseline, 'baseline Delta version');
   requireEvidence(manifests.length > 0, 'No client manifests');
   const { start, end } = manifestBounds(manifests[0]), duration = end - start;
-  const expected = new Map<string, Parent>(), tables = new Set<string>();
-  for (const manifest of manifests) {
+  const expected = new Map<string, Parent & { client: number }>(), tables = new Set<string>();
+  const timing = options?.timing;
+  if (timing) {
+    requireEvidence(timing.clients.length === manifests.length, 'Clock evidence does not cover every manifest');
+    for (const offset of [...timing.clients, timing.collector])
+      requireEvidence(offset.lowerNs >= -100_000_000n && offset.upperNs <= 100_000_000n &&
+        offset.lowerNs <= offset.upperNs, 'Invalid clock offset interval');
+  }
+  for (const [client, manifest] of manifests.entries()) {
     const bounds = manifestBounds(manifest);
     requireEvidence(bounds.start === start && bounds.end === end, 'Clients do not share exact measurement bounds');
     for (const record of decodedRecords(manifest)) {
       requireEvidence(!expected.has(record.id), 'Duplicate logical identity across manifests');
-      expected.set(record.id, record);
+      expected.set(record.id, { ...record, client });
       tables.add(record.table);
     }
   }
@@ -133,6 +146,7 @@ export async function reconcilePublications(manifests: readonly unknown[], event
   }
   const parents = new Map<string, Receipt[]>(), commits = new Map<bigint, Receipt[]>();
   const physical = new Set<string>(), fragments = new Set<string>(), mapped = new Set<string>();
+  let diagnosticClockInconsistencies = 0;
   for await (const event of events) {
     const object = evidenceObject(event), fields = evidenceObject(object.fields);
     if (fields.message !== message) continue;
@@ -152,7 +166,10 @@ export async function reconcilePublications(manifests: readonly unknown[], event
         'Transaction is missing, replayed or bound to the wrong Delta version');
       mapped.add(app);
     }
-    requireEvidence(parent.send !== 'measurement' || item.admitted >= start, 'Measurement input predates its clock boundary');
+    if (parent.send === 'measurement' && item.admitted < start) {
+      if (!options?.diagnostic) requireEvidence(false, 'Measurement input predates its clock boundary');
+      diagnosticClockInconsistencies++;
+    }
     append(parents, item.logical, item);
     append(commits, item.version, item);
   }
@@ -182,16 +199,40 @@ export async function reconcilePublications(manifests: readonly unknown[], event
     minute: i + 1, duration_ms: i + 1 === Number(count) ? duration - BigInt(i) * 60_000n : 60_000n, ...totals(),
   }));
   const excluded: Record<string, ReturnType<typeof totals>> = {};
+  const timedMinutes = minutes.map(minute => ({ ...minute }));
+  const timedExcluded: Record<string, ReturnType<typeof totals>> = {};
   for (const receipts of commits.values()) {
     // One atomic commit gets one observation time, even with multiple receipt lines.
     const observed = receipts.reduce((latest, item) => item.observed > latest ? item.observed : latest, receipts[0].observed);
     const window = observed < start ? 'before_window' : observed < end ? 'in_window' : 'after_window';
+    const observedStartNs = receipts.reduce((latest, item) => item.observedStartNs > latest ? item.observedStartNs : latest, receipts[0].observedStartNs);
+    const observedEndNs = receipts.reduce((latest, item) => item.observedEndNs > latest ? item.observedEndNs : latest, receipts[0].observedEndNs);
     for (const receipt of receipts) {
-      const send = expected.get(receipt.logical)!.send;
+      const parent = expected.get(receipt.logical)!, send = parent.send;
       const bucket = send === 'measurement' && window === 'in_window' ? minutes[Number((observed - start) / 60_000n)] :
         (excluded[`${send}:${window}`] ??= totals());
       bucket.rows += receipt.rows;
       bucket.canonical_bytes += receipt.canonical;
+      if (timing) {
+        const client = timing.clients[parent.client], collector = timing.collector;
+        const first = observedStartNs - collector.upperNs + client.lowerNs;
+        const lastExclusive = observedEndNs - collector.lowerNs + client.upperNs;
+        const startNs = start * 1_000_000n, endNs = end * 1_000_000n;
+        const firstMinute = first >= startNs ? (first - startNs) / 60_000_000_000n : -1n;
+        const lastMinute = lastExclusive > startNs ? (lastExclusive - 1n - startNs) / 60_000_000_000n : -1n;
+        const sendInside = parent.firstSend >= startNs && parent.lastSend < endNs;
+        let destination: ReturnType<typeof totals>;
+        if (sendInside && first >= startNs && lastExclusive <= endNs && firstMinute === lastMinute)
+          destination = timedMinutes[Number(firstMinute)];
+        else {
+          const reason = send !== 'measurement' ? `${send}:excluded` :
+            first < endNs && lastExclusive > startNs ? 'boundary_uncertain' :
+            lastExclusive <= startNs ? 'before_window' : 'after_window';
+          destination = timedExcluded[reason] ??= totals();
+        }
+        destination.rows += receipt.rows;
+        destination.canonical_bytes += receipt.canonical;
+      }
     }
   }
   const rows = sum(minutes, m => m.rows), canonical = sum(minutes, m => m.canonical_bytes);
@@ -209,5 +250,15 @@ export async function reconcilePublications(manifests: readonly unknown[], event
     rows_per_second: rate(rows, duration), canonical_bytes_per_second: rate(canonical, duration),
     minutes: minutes.map(m => ({ ...m, rows_per_second: rate(m.rows, m.duration_ms), canonical_bytes_per_second: rate(m.canonical_bytes, m.duration_ms) })),
     excluded, all_run_physical_bytes: physicalBytes,
+    ...(options?.diagnostic ? { diagnostic_clock_inconsistencies: diagnosticClockInconsistencies,
+      timed_scoring: timing ? {
+        scored_rows: sum(timedMinutes, m => m.rows), scored_canonical_bytes: sum(timedMinutes, m => m.canonical_bytes),
+        rows_per_second: rate(sum(timedMinutes, m => m.rows), duration),
+        canonical_bytes_per_second: rate(sum(timedMinutes, m => m.canonical_bytes), duration),
+        minutes: timedMinutes.map(m => ({ ...m, rows_per_second: rate(m.rows, m.duration_ms),
+          canonical_bytes_per_second: rate(m.canonical_bytes, m.duration_ms) })),
+        excluded: timedExcluded,
+        limit: 'Clock intervals cover sampled endpoints only; continuous clock behavior and throughput qualification are not established.',
+      } : null } : {}),
   };
 }
