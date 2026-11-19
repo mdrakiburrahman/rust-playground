@@ -476,6 +476,15 @@ enum ManifestOutcome {
     Failed,
 }
 
+struct ResultObservation {
+    outcome: ManifestOutcome,
+    worker: usize,
+    rows: u64,
+    raw_arrow_bytes: u64,
+    wire_bytes: u64,
+    observed_unix_ms: Option<u64>,
+}
+
 fn measurement_cohort(observed: u64, start: u64, end: u64) -> ManifestCohort {
     if observed < start {
         ManifestCohort::Warmup
@@ -1385,27 +1394,30 @@ impl PreparedClient {
     fn record_result_observation(
         &self,
         manifest_index: Option<usize>,
-        outcome: ManifestOutcome,
         measurement: Option<&Measurement>,
-        worker: usize,
-        rows: u64,
-        raw_arrow_bytes: u64,
-        wire_bytes: u64,
-        observed_unix_ms: Option<u64>,
+        observation: ResultObservation,
     ) -> Result<()> {
+        let ResultObservation {
+            outcome,
+            worker,
+            rows,
+            raw_arrow_bytes,
+            wire_bytes,
+            observed_unix_ms,
+        } = observation;
         if let Some(index) = manifest_index {
             self.record_manifest_outcome(index, outcome, observed_unix_ms, measurement)?;
         }
-        if outcome == ManifestOutcome::Acknowledged {
-            if let Some(measurement) = measurement {
-                measurement.record_completion(
-                    worker,
-                    rows,
-                    raw_arrow_bytes,
-                    wire_bytes,
-                    observed_unix_ms.context("completion observation is missing")?,
-                );
-            }
+        if outcome == ManifestOutcome::Acknowledged
+            && let Some(measurement) = measurement
+        {
+            measurement.record_completion(
+                worker,
+                rows,
+                raw_arrow_bytes,
+                wire_bytes,
+                observed_unix_ms.context("completion observation is missing")?,
+            );
         }
         Ok(())
     }
@@ -2073,13 +2085,15 @@ impl PreparedClient {
         };
         self.record_result_observation(
             logical.manifest_index,
-            outcome,
             measurement,
-            worker,
-            batch.rows,
-            batch.raw_arrow_bytes,
-            batch.encoded_bytes,
-            observed_unix_ms,
+            ResultObservation {
+                outcome,
+                worker,
+                rows: batch.rows,
+                raw_arrow_bytes: batch.raw_arrow_bytes,
+                wire_bytes: batch.encoded_bytes,
+                observed_unix_ms,
+            },
         )?;
         attempt.finished = true;
         let micros = u64::try_from(attempt.started.elapsed().as_micros()).unwrap_or(u64::MAX);
@@ -3468,7 +3482,7 @@ mod tests {
         Ok(decoded)
     }
 
-    fn decode_manifest_batch_facts(range: &serde_json::Value) -> Result<Vec<(u64, Option<u64>, Option<String>)>> {
+    fn decode_manifest_batch_facts(range: &serde_json::Value) -> Result<Vec<LogicalBatchFact>> {
         let batch_count = range["batch_count"].as_u64().context("missing manifest batch count")?;
         let facts = &range["batch_facts"];
         let index_count = facts["index_count"]
@@ -3541,7 +3555,11 @@ mod tests {
                         .to_owned(),
                 )
             };
-            decoded.push((physical, canonical, reason));
+            decoded.push(LogicalBatchFact {
+                decoded_physical_batch_count: physical,
+                canonical_logical_bytes: canonical,
+                canonical_logical_bytes_unavailable_reason: reason,
+            });
         }
         Ok(decoded)
     }
@@ -3591,7 +3609,12 @@ mod tests {
             );
             let mut range_physical = 0_u64;
             let mut range_canonical = 0_u64;
-            for (physical, canonical, reason) in decoded_facts {
+            for LogicalBatchFact {
+                decoded_physical_batch_count: physical,
+                canonical_logical_bytes: canonical,
+                canonical_logical_bytes_unavailable_reason: reason,
+            } in decoded_facts
+            {
                 let canonical = canonical.context("canonical logical byte fact is unavailable")?;
                 anyhow::ensure!(reason.is_none(), "canonical byte fact has an unavailable reason");
                 range_physical = range_physical
@@ -3678,11 +3701,11 @@ mod tests {
         let mut current: Option<LegacyRangeWitness> = None;
         let mut count = 0_usize;
         for record in ordered {
-            if let Some(range) = current.as_mut() {
-                if range.can_merge(record) {
-                    range.append(record)?;
-                    continue;
-                }
+            if let Some(range) = current.as_mut()
+                && range.can_merge(record)
+            {
+                range.append(record)?;
+                continue;
             }
             count = count.checked_add(1).context("legacy range count overflow")?;
             current = Some(LegacyRangeWitness::from_record(record));
@@ -3937,13 +3960,15 @@ mod tests {
             let measurement = measurement_guard.as_ref().context("measurement window missing")?;
             client.record_result_observation(
                 Some(0),
-                ManifestOutcome::Acknowledged,
                 Some(measurement),
-                0,
-                16,
-                128,
-                64,
-                Some(observed),
+                ResultObservation {
+                    outcome: ManifestOutcome::Acknowledged,
+                    worker: 0,
+                    rows: 16,
+                    raw_arrow_bytes: 128,
+                    wire_bytes: 64,
+                    observed_unix_ms: Some(observed),
+                },
             )?;
             assert_eq!(measurement.rows.load(Ordering::Relaxed), expected_rows);
             drop(measurement_guard);
@@ -3971,12 +3996,10 @@ mod tests {
         const ROWS_PER_BATCH: u32 = 4_096;
         const WINDOW_MS: u64 = 600_000;
         const WARMUP_MS: u64 = 60_000;
-        let total_batches = (6_440_000_u64 * ((WINDOW_MS + WARMUP_MS) / 1_000) + u64::from(ROWS_PER_BATCH) - 1)
-            / u64::from(ROWS_PER_BATCH);
-        let warmup_batches =
-            (6_440_000_u64 * (WARMUP_MS / 1_000) + u64::from(ROWS_PER_BATCH) - 1) / u64::from(ROWS_PER_BATCH);
+        let total_batches = (6_440_000_u64 * ((WINDOW_MS + WARMUP_MS) / 1_000)).div_ceil(u64::from(ROWS_PER_BATCH));
+        let warmup_batches = (6_440_000_u64 * (WARMUP_MS / 1_000)).div_ceil(u64::from(ROWS_PER_BATCH));
         anyhow::ensure!(
-            total_batches % WORKERS as u64 == 0,
+            total_batches.is_multiple_of(WORKERS as u64),
             "full-window batch count must divide across workers"
         );
         let batches_per_worker = total_batches / WORKERS as u64;
@@ -4064,13 +4087,15 @@ mod tests {
             let canonical = 1_000 + (global % 4) * 128;
             client.record_result_observation(
                 Some(index),
-                ManifestOutcome::Acknowledged,
                 Some(measurement),
-                index / batches_per_worker as usize,
-                u64::from(ROWS_PER_BATCH),
-                canonical,
-                canonical,
-                Some(observed),
+                ResultObservation {
+                    outcome: ManifestOutcome::Acknowledged,
+                    worker: index / batches_per_worker as usize,
+                    rows: u64::from(ROWS_PER_BATCH),
+                    raw_arrow_bytes: canonical,
+                    wire_bytes: canonical,
+                    observed_unix_ms: Some(observed),
+                },
             )?;
         }
         let measured_rows = measurement.rows.load(Ordering::Relaxed);
@@ -5763,16 +5788,17 @@ mod tests {
             admitted_rows == completed_rows,
             "stress admitted rows {admitted_rows} differ from completed rows {completed_rows}"
         );
-        let records = terminal_client
-            .logical_batches
-            .lock()
-            .map_err(|_| anyhow::anyhow!("logical batch manifest state poisoned"))?;
-        anyhow::ensure!(
-            records.len() as u64 == terminal_record_count,
-            "terminal record count differs from client state"
-        );
-        let legacy_ranges = legacy_range_count(&records)?;
-        drop(records);
+        let legacy_ranges = {
+            let records = terminal_client
+                .logical_batches
+                .lock()
+                .map_err(|_| anyhow::anyhow!("logical batch manifest state poisoned"))?;
+            anyhow::ensure!(
+                records.len() as u64 == terminal_record_count,
+                "terminal record count differs from client state"
+            );
+            legacy_range_count(&records)?
+        };
         let legacy_lower_bound =
             minimum_legacy_range_json_bytes("sqlserver_availability_replica_states", 64)? as u64 * legacy_ranges as u64;
         anyhow::ensure!(
@@ -6249,13 +6275,15 @@ mod tests {
             )?;
             projection.record_result_observation(
                 Some(index),
-                ManifestOutcome::Acknowledged,
                 Some(&projection_measurement),
-                0,
-                ROWS_PER_BATCH as u64,
-                raw_bytes,
-                wire_bytes,
-                Some(send_ms),
+                ResultObservation {
+                    outcome: ManifestOutcome::Acknowledged,
+                    worker: 0,
+                    rows: ROWS_PER_BATCH as u64,
+                    raw_arrow_bytes: raw_bytes,
+                    wire_bytes,
+                    observed_unix_ms: Some(send_ms),
+                },
             )?;
         }
         let target_projection = projection.metrics("completed")?;
