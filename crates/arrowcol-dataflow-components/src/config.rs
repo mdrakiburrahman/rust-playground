@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::Duration;
 
+use crate::byte_capacity::ByteCapacity;
 use arrowcol_catalog::{CatalogControlPlane, CatalogStore, DdlParser, FlightSqlDdlHandler, MemoryCatalogStore};
 use arrowcol_flight::{RuntimeLimits, RuntimeResult};
 use arrowcol_protocol::{PositiveMeasurement, UnixMillis};
@@ -198,6 +199,37 @@ mod override_tests {
     }
 
     #[test]
+    fn large_exporter_capacity_readback_reports_effective_limits() -> Result<(), String> {
+        let gib = 1_u64 << 30;
+        let mut config = DeltaExporterConfig {
+            base_path: std::env::temp_dir(),
+            routing: RoutingStoreConfig::Standalone,
+            commit: CommitConfig::default(),
+            batching: FileBatchConfig::default(),
+            authority_timeout: Duration::from_secs(10),
+        };
+        config.batching.global_capacity.bytes = 8 * gib + 1;
+        config.batching.per_table_capacity.bytes = 4 * gib + 1;
+        config.batching.max_arrow_memory_per_flush = 4 * gib;
+        config.validate()?;
+        let effective = config.effective_config_json()?;
+        assert_eq!(effective["batching"]["effective_capacity"]["global_bytes"], 8 * gib);
+        assert_eq!(
+            effective["batching"]["effective_capacity"]["global_quantum_bytes"],
+            1024
+        );
+        assert_eq!(effective["batching"]["effective_capacity"]["per_table_bytes"], 4 * gib);
+        assert_eq!(
+            effective["batching"]["effective_capacity"]["per_table_quantum_bytes"],
+            1024
+        );
+
+        config.batching.max_arrow_memory_per_flush += 1;
+        assert!(config.validate().is_err());
+        Ok(())
+    }
+
+    #[test]
     fn exporter_authority_override_is_bounded_and_read_back_without_paths() -> Result<(), String> {
         let mut config = DeltaExporterConfig {
             base_path: std::env::temp_dir(),
@@ -212,18 +244,18 @@ mod override_tests {
         let resolved = merge_config(&current, r#"{"authority_timeout":"250ms"}"#, None)?;
         config.authority_timeout = resolved.authority_timeout;
         config.validate()?;
-        assert_eq!(config.effective_config_json()["authority_timeout"], "250ms");
+        assert_eq!(config.effective_config_json()?["authority_timeout"], "250ms");
         assert_eq!(
-            config.effective_config_json()["batching"]["age_flush_policy"],
+            config.effective_config_json()?["batching"]["age_flush_policy"],
             "immediate"
         );
         config.batching = merge_config(&config.batching, r#"{"age_flush_policy":"drain_ready"}"#, None)?;
         config.validate()?;
         assert_eq!(
-            config.effective_config_json()["batching"]["age_flush_policy"],
+            config.effective_config_json()?["batching"]["age_flush_policy"],
             "drain_ready"
         );
-        assert!(config.effective_config_json().get("base_path").is_none());
+        assert!(config.effective_config_json()?.get("base_path").is_none());
         assert!(merge_config(&current, r#"{"base_path":"replacement"}"#, None).is_err());
         config.authority_timeout = Duration::MAX;
         assert!(config.validate().is_err());
@@ -950,13 +982,28 @@ impl DeltaExporterConfig {
         Ok(())
     }
 
-    pub(crate) fn effective_config_json(&self) -> serde_json::Value {
-        serde_json::json!({
-            "batching": self.batching,
+    pub(crate) fn effective_config_json(&self) -> Result<serde_json::Value, String> {
+        let global = ByteCapacity::new(self.batching.global_capacity.bytes).map_err(|error| error.to_string())?;
+        let per_table = ByteCapacity::new(self.batching.per_table_capacity.bytes).map_err(|error| error.to_string())?;
+        let mut batching = serde_json::to_value(&self.batching).map_err(|error| error.to_string())?;
+        let batching_object = batching
+            .as_object_mut()
+            .ok_or_else(|| "effective batching configuration was not an object".to_owned())?;
+        batching_object.insert(
+            "effective_capacity".to_owned(),
+            serde_json::json!({
+                "global_bytes": global.effective_limit_bytes(),
+                "global_quantum_bytes": global.quantum_bytes(),
+                "per_table_bytes": per_table.effective_limit_bytes(),
+                "per_table_quantum_bytes": per_table.quantum_bytes()
+            }),
+        );
+        Ok(serde_json::json!({
+            "batching": batching,
             "commit": self.commit,
             "routing": self.routing.effective_config_json(),
             "authority_timeout": format!("{:?}", self.authority_timeout)
-        })
+        }))
     }
 
     pub(crate) fn validate(&self) -> Result<(), String> {
@@ -979,7 +1026,7 @@ impl DeltaExporterConfig {
 #[serde(deny_unknown_fields)]
 pub struct BatchCapacity {
     /// Logical Arrow bytes.
-    pub bytes: u32,
+    pub bytes: u64,
     /// Rows.
     pub rows: u32,
     /// Batches.
@@ -1045,20 +1092,23 @@ impl FileBatchConfig {
     pub(crate) fn validate(&self) -> Result<(), String> {
         let global = self.global_capacity;
         let table = self.per_table_capacity;
+        let global_byte_capacity = ByteCapacity::new(global.bytes).map_err(|error| error.to_string())?;
+        let table_byte_capacity = ByteCapacity::new(table.bytes).map_err(|error| error.to_string())?;
         if [
             global.bytes,
-            global.rows,
-            global.batches,
+            u64::from(global.rows),
+            u64::from(global.batches),
             table.bytes,
-            table.rows,
-            table.batches,
+            u64::from(table.rows),
+            u64::from(table.batches),
         ]
         .contains(&0)
             || table.bytes > global.bytes
+            || table_byte_capacity.effective_limit_bytes() > global_byte_capacity.effective_limit_bytes()
             || table.rows > global.rows
             || table.batches > global.batches
             || self.max_arrow_memory_per_flush == 0
-            || self.max_arrow_memory_per_flush > u64::from(table.bytes)
+            || self.max_arrow_memory_per_flush > table_byte_capacity.effective_limit_bytes()
             || self.max_rows_per_flush == 0
             || self.max_rows_per_flush > u64::from(table.rows)
             || self.max_batches_per_flush == 0

@@ -1224,6 +1224,24 @@ fn validate_collector_controls(collector: &CollectorTunables) -> Result<()> {
     Ok(())
 }
 
+fn effective_queue_capacity_bytes(name: &str, configured_bytes: u64) -> Result<u64> {
+    const LARGE_QUANTUM_BYTES: u64 = 1024;
+    let max_units = u64::from(u32::MAX).min((usize::MAX >> 3) as u64);
+    let max_bytes = max_units * LARGE_QUANTUM_BYTES;
+    if configured_bytes == 0 {
+        bail!("{name} must be positive");
+    }
+    if configured_bytes > max_bytes {
+        bail!("{name} exceeds the supported byte capacity of {max_bytes} bytes");
+    }
+    let quantum = if configured_bytes <= max_units {
+        1
+    } else {
+        LARGE_QUANTUM_BYTES
+    };
+    Ok(configured_bytes - configured_bytes % quantum)
+}
+
 fn validate_batching(batching: Option<&BatchingTunables>) -> Result<()> {
     let batching = batching.cloned().unwrap_or_default();
     let global = batching.global_capacity.unwrap_or_default();
@@ -1234,17 +1252,28 @@ fn validate_batching(batching: Option<&BatchingTunables>) -> Result<()> {
     let table_bytes = per_table.bytes.unwrap_or(536_870_912);
     let table_rows = per_table.rows.unwrap_or(2_000_000);
     let table_batches = per_table.batches.unwrap_or(1_024);
+    let effective_global_bytes =
+        effective_queue_capacity_bytes("collector.batching.global_capacity.bytes", global_bytes)?;
+    let effective_table_bytes =
+        effective_queue_capacity_bytes("collector.batching.per_table_capacity.bytes", table_bytes)?;
     for (name, value) in [
         ("collector.batching.global_capacity.bytes", global_bytes),
-        ("collector.batching.global_capacity.rows", global_rows),
-        ("collector.batching.global_capacity.batches", global_batches),
+        ("collector.batching.global_capacity.rows", u64::from(global_rows)),
+        ("collector.batching.global_capacity.batches", u64::from(global_batches)),
         ("collector.batching.per_table_capacity.bytes", table_bytes),
-        ("collector.batching.per_table_capacity.rows", table_rows),
-        ("collector.batching.per_table_capacity.batches", table_batches),
+        ("collector.batching.per_table_capacity.rows", u64::from(table_rows)),
+        (
+            "collector.batching.per_table_capacity.batches",
+            u64::from(table_batches),
+        ),
     ] {
         positive(name, Some(value))?;
     }
-    if table_bytes > global_bytes || table_rows > global_rows || table_batches > global_batches {
+    if table_bytes > global_bytes
+        || effective_table_bytes > effective_global_bytes
+        || table_rows > global_rows
+        || table_batches > global_batches
+    {
         bail!("collector.batching per_table_capacity must not exceed global_capacity");
     }
 
@@ -1267,11 +1296,11 @@ fn validate_batching(batching: Option<&BatchingTunables>) -> Result<()> {
         bail!("collector.batching.pipeline_depth > 1 requires coalesce_publications=true");
     }
     validate_duration("collector.batching.max_age", batching.max_age.as_deref(), "30s")?;
-    if flush_bytes > u64::from(table_bytes)
+    if flush_bytes > effective_table_bytes
         || flush_rows > u64::from(table_rows)
         || flush_batches > u64::from(table_batches)
     {
-        bail!("collector.batching flush limits must not exceed per_table_capacity");
+        bail!("collector.batching flush limits must not exceed the effective per_table_capacity");
     }
 
     let adaptive = batching.adaptive_file.unwrap_or_default();
@@ -2825,6 +2854,36 @@ mod tests {
         supported.validate_for_oat()?;
         let env = supported.environment_for(ComponentRole::Maintenance)?;
         assert!(env.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn queue_byte_capacities_accept_u64_and_validate_effective_limits() -> Result<()> {
+        let gib = 1_u64 << 30;
+        let valid = Tunables::parse_oat_json(serde_json::json!({"collector":{"batching":{
+            "global_capacity":{"bytes":8 * gib + 1},
+            "per_table_capacity":{"bytes":4 * gib + 1},
+            "max_arrow_memory_per_flush":4 * gib
+        }}}))?;
+        let env = valid.environment_for(ComponentRole::Collector)?;
+        let batching: Value = serde_json::from_str(&env["ARROWCOL_COLLECTOR_BATCHING_CONFIG"])?;
+        assert_eq!(batching["global_capacity"]["bytes"], 8 * gib + 1);
+        assert_eq!(batching["per_table_capacity"]["bytes"], 4 * gib + 1);
+
+        assert!(
+            Tunables::parse_oat_json(serde_json::json!({"collector":{"batching":{
+                "global_capacity":{"bytes":8 * gib + 1},
+                "per_table_capacity":{"bytes":4 * gib + 1},
+                "max_arrow_memory_per_flush":4 * gib + 1
+            }}}))
+            .is_err()
+        );
+        assert!(
+            Tunables::parse_oat_json(serde_json::json!({"collector":{"batching":{
+                "global_capacity":{"bytes":u64::MAX}
+            }}}))
+            .is_err()
+        );
         Ok(())
     }
 
