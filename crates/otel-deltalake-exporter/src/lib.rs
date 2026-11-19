@@ -219,6 +219,8 @@ struct CommitConfig {
     batch_window: Duration,
     max_files_per_commit: usize,
     max_pending_files: usize,
+    #[serde(default)]
+    publication_lookup_mode: arrow_deltalake::commit::PublicationLookupMode,
 }
 
 impl Default for CommitConfig {
@@ -228,6 +230,7 @@ impl Default for CommitConfig {
             batch_window: options.batch_window,
             max_files_per_commit: options.max_files_per_commit,
             max_pending_files: options.max_pending_files,
+            publication_lookup_mode: options.publication_lookup_mode,
         }
     }
 }
@@ -252,7 +255,7 @@ fn parse_config(
         batch_window: commit.batch_window,
         max_files_per_commit: commit.max_files_per_commit,
         max_pending_files: commit.max_pending_files,
-        publication_lookup_mode: Default::default(),
+        publication_lookup_mode: commit.publication_lookup_mode,
     };
     options.validate().map_err(|error| InvalidUserConfig {
         error: error.to_string(),
@@ -457,10 +460,15 @@ mod tests {
         assert!(shared.get("commit_options").is_none());
         assert_eq!(options.batch_window, Duration::from_secs(10));
         assert_eq!(options.max_files_per_commit, 8);
+        assert_eq!(
+            options.publication_lookup_mode,
+            arrow_deltalake::commit::PublicationLookupMode::Scalar
+        );
         for invalid in [
             serde_json::json!({"batch_window": "0s"}),
             serde_json::json!({"max_files_per_commit": 0}),
             serde_json::json!({"max_pending_files": 1}),
+            serde_json::json!({"publication_lookup_mode": "automatic"}),
             serde_json::json!({"batch_windows": "1s"}),
         ] {
             let mut value = value.clone();

@@ -23,9 +23,9 @@ use tokio::time::Instant;
 #[serde(rename_all = "snake_case")]
 pub enum PublicationLookupMode {
     /// Resolve all requested transaction IDs through one Kernel action replay.
-    #[default]
     Batched,
     /// Resolve each ID through Kernel independently as a reference/fallback.
+    #[default]
     Scalar,
 }
 

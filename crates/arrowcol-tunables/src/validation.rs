@@ -210,7 +210,7 @@ const CAPABILITIES: &[Capability] = &[
     capability!("collector.commit.batch_window", "10s"),
     capability!("collector.commit.max_files_per_commit", "64"),
     capability!("collector.commit.max_pending_files", "256"),
-    capability!("collector.commit.publication_lookup_mode", "batched"),
+    capability!("collector.commit.publication_lookup_mode", "scalar"),
     capability!("collector.limits.max_metadata_bytes", "16384"),
     capability!("collector.limits.grpc_accept_compression", "none"),
     capability!("collector.limits.grpc_send_compression", "none"),

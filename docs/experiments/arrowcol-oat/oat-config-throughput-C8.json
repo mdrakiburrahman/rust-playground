@@ -99,6 +99,9 @@
         "max_age": "1s",
         "max_concurrent_flushes": 2
       },
+      "commit": {
+        "publication_lookup_mode": "batched"
+      },
       "runtime": {
         "workers": 4,
         "blocking_workers": 64,

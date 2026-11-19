@@ -925,7 +925,7 @@ pub struct CommitConfig {
     pub max_files_per_commit: usize,
     /// Maximum queued and committing files per table.
     pub max_pending_files: usize,
-    /// Transaction lookup implementation; batched by default, scalar for comparison.
+    /// Transaction lookup implementation; scalar by default, batched for explicit comparison.
     #[serde(default)]
     pub publication_lookup_mode: arrow_deltalake::commit::PublicationLookupMode,
 }
