@@ -4660,8 +4660,8 @@ mod tests {
                     options,
                 )
                 .await?;
-                let scheduled_start = unix_ms()? + 100;
-                let measurement_start = scheduled_start + 50;
+                let scheduled_start = unix_ms()? + 1_000;
+                let measurement_start = scheduled_start + 250;
                 let measurement_end = measurement_start + 1_000;
                 client
                     .run_continuous(scheduled_start, measurement_start, measurement_end)
