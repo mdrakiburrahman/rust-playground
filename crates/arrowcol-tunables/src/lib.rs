@@ -218,6 +218,7 @@ pub struct CollectorTunables {
     pub exporter: Option<ExporterTunables>,
     pub layout: Option<LayoutTunables>,
     pub limits: Option<LimitsTunables>,
+    pub receiver_transport: Option<ReceiverTransportTunables>,
     pub pressure: Option<PressureTunables>,
     pub routing: Option<RoutingTunables>,
     pub runtime: Option<RuntimeTunables>,
@@ -231,6 +232,55 @@ pub struct CollectorUploadTunables {
     pub mode: Option<CollectorUploadMode>,
     pub buffer_capacity_bytes: Option<usize>,
     pub request_concurrency: Option<usize>,
+}
+
+/// Pinned Hyper defaults beneath tonic's supplied-listener server.
+pub const DEFAULT_RECEIVER_H2_WINDOW: u32 = 1_048_576;
+
+/// Startup-only Flight server controls; absent values preserve the existing server.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReceiverTransportTunables {
+    pub initial_stream_window_size: Option<u32>,
+    pub initial_connection_window_size: Option<u32>,
+    pub adaptive_window: Option<bool>,
+    pub max_frame_size: Option<u32>,
+    pub max_concurrent_streams: Option<u32>,
+    pub concurrency_limit_per_connection: Option<usize>,
+    pub h2_keepalive_interval: Option<String>,
+    pub h2_keepalive_timeout: Option<String>,
+    pub tcp_nodelay: Option<bool>,
+    pub tcp_keepalive: Option<String>,
+    pub max_header_list_size: Option<u32>,
+}
+
+impl ReceiverTransportTunables {
+    /// Validate supported wire and runtime limits.
+    ///
+    /// # Errors
+    /// Rejects invalid windows, capacities, frames and durations before binding.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        validation::validate_receiver_transport(self)
+    }
+
+    pub fn effective_config_json(&self) -> serde_json::Value {
+        let adaptive = self.adaptive_window.unwrap_or(false);
+        serde_json::json!({
+            "configured": self,
+            "initial_stream_window_size": if adaptive { 65_535 } else { self.initial_stream_window_size.unwrap_or(DEFAULT_RECEIVER_H2_WINDOW) },
+            "initial_connection_window_size": if adaptive { 65_535 } else { self.initial_connection_window_size.unwrap_or(DEFAULT_RECEIVER_H2_WINDOW) },
+            "adaptive_window": adaptive,
+            "max_frame_size": self.max_frame_size.unwrap_or(16_384),
+            "max_concurrent_streams": self.max_concurrent_streams,
+            "concurrency_limit_per_connection": self.concurrency_limit_per_connection,
+            "h2_keepalive_interval": self.h2_keepalive_interval,
+            "h2_keepalive_timeout": self.h2_keepalive_timeout.as_deref().unwrap_or("20s"),
+            "tcp_nodelay": self.tcp_nodelay,
+            "tcp_keepalive": self.tcp_keepalive,
+            "unset_socket_policy": "preserve inherited listener/system options",
+            "max_header_list_size": self.max_header_list_size.unwrap_or(16_384)
+        })
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

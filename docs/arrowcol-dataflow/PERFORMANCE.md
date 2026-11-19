@@ -6,6 +6,7 @@
 | `ARROWCOL_COLLECTOR_BATCHING_CONFIG` | Deep JSON override of exporter `batching`: byte/row/batch capacities and flush limits, age, flush concurrency, adaptive sizing, `coalesce_publications` | Startup |
 | `ARROWCOL_COLLECTOR_COMMIT_CONFIG` | Deep JSON override of exporter `commit`: batching limits, `publication_lookup_mode` (`scalar` default), `remote_snapshot_reuse` (`false` default), `remote_snapshot_max_metadata_objects` (`4096` default, `1..=4096`) | Startup |
 | `ARROWCOL_COLLECTOR_LIMITS_CONFIG` | Deep JSON override of receiver `limits`: Flight sizes, channels and deadlines | Startup |
+| `ARROWCOL_COLLECTOR_RECEIVER_TRANSPORT_CONFIG` | Deep JSON override of receiver `transport`: HTTP/2 windows, frames, stream/request concurrency, keepalive, headers and accepted-socket options; unset preserves the pinned server | Startup |
 | `ARROWCOL_COLLECTOR_PRESSURE_CONFIG` | Stream/RSS/buffered limits, pressure/heartbeat intervals and registration TTL; no identities/endpoints | Startup |
 | `ARROWCOL_COLLECTOR_CATALOG_CONFIG` | Remote catalog `maximum_cache_age`; rejects memory catalog | Startup |
 | `ARROWCOL_COLLECTOR_ROUTING_CONFIG` | SQL routing `connect_timeout` and `command_timeout` for receiver/exporter; rejects other backends | Startup |

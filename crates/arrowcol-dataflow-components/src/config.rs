@@ -18,6 +18,73 @@ mod override_tests {
     use super::*;
 
     #[test]
+    fn receiver_transport_projects_strictly_without_changing_unset_fields() -> Result<(), String> {
+        let value = serde_json::json!({
+            "initial_stream_window_size": 1048576,
+            "initial_connection_window_size": 16777216,
+            "adaptive_window": false,
+            "max_frame_size": 32768,
+            "max_concurrent_streams": 17,
+            "concurrency_limit_per_connection": 3,
+            "h2_keepalive_interval": "10s",
+            "h2_keepalive_timeout": "2s",
+            "tcp_nodelay": true,
+            "tcp_keepalive": "30s",
+            "max_header_list_size": 32768
+        });
+        let tunables = arrowcol_tunables::Tunables::parse_oat_json(serde_json::json!({
+            "collector":{"receiver_transport":value}
+        }))
+        .map_err(|error| error.to_string())?;
+        let environment = tunables
+            .environment_for(arrowcol_tunables::ComponentRole::Collector)
+            .map_err(|error| error.to_string())?;
+        let defaults = arrowcol_tunables::ReceiverTransportTunables::default();
+        let config = merge_config(
+            &defaults,
+            &environment["ARROWCOL_COLLECTOR_RECEIVER_TRANSPORT_CONFIG"],
+            None,
+        )?;
+        config.validate().map_err(|error| error.to_string())?;
+        assert_eq!(serde_json::to_value(&config).map_err(|error| error.to_string())?, value);
+        let partial = merge_config(&defaults, r#"{"tcp_nodelay":false}"#, None)?;
+        assert_eq!(partial.tcp_nodelay, Some(false));
+        assert_eq!(partial.initial_stream_window_size, None);
+        for (field, invalid) in [
+            ("initial_stream_window_size", serde_json::json!(0)),
+            ("initial_connection_window_size", serde_json::json!(2147483648u64)),
+            ("initial_connection_window_size", serde_json::json!(65535)),
+            ("max_frame_size", serde_json::json!(16383)),
+            ("max_frame_size", serde_json::json!(16777216)),
+            ("max_concurrent_streams", serde_json::json!(0)),
+            ("concurrency_limit_per_connection", serde_json::json!(0)),
+            ("max_header_list_size", serde_json::json!(0)),
+            ("h2_keepalive_interval", serde_json::json!("0s")),
+            ("h2_keepalive_timeout", serde_json::json!("invalid")),
+            ("tcp_keepalive", serde_json::json!("1ms")),
+            ("adaptive_window", serde_json::json!("true")),
+            ("tcp_nodelay", serde_json::json!(1)),
+            ("unknown", serde_json::json!(true)),
+        ] {
+            let value = serde_json::json!({field:invalid});
+            assert!(
+                arrowcol_tunables::Tunables::parse_oat_json(serde_json::json!({
+                    "collector":{"receiver_transport":value}
+                }))
+                .is_err(),
+                "{field}"
+            );
+            assert!(
+                merge_config(&defaults, &value.to_string(), None)
+                    .and_then(|config| config.validate().map_err(|error| error.to_string()))
+                    .is_err(),
+                "{field}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn remote_snapshot_controls_project_and_reject_invalid_bounds() -> Result<(), String> {
         assert!(!CommitConfig::default().build()?.remote_snapshot_reuse);
         for reuse in [false, true] {
@@ -880,6 +947,9 @@ pub struct FlightReceiverConfig {
     /// Flight resource limits.
     #[serde(default)]
     pub limits: RuntimeLimitsConfig,
+    /// Flight HTTP/2 and accepted-socket settings, independent of the admin listener.
+    #[serde(default)]
+    pub transport: arrowcol_tunables::ReceiverTransportTunables,
     /// Enables durable admission through native Quiver persistence.
     ///
     /// The topology must route this receiver into a `processor:durable_buffer`
@@ -909,6 +979,11 @@ impl FlightReceiverConfig {
         }
         apply_json_environment(&mut self.limits, "ARROWCOL_COLLECTOR_LIMITS_CONFIG", None)?;
         apply_json_environment(
+            &mut self.transport,
+            "ARROWCOL_COLLECTOR_RECEIVER_TRANSPORT_CONFIG",
+            None,
+        )?;
+        apply_json_environment(
             &mut self.registration,
             "ARROWCOL_COLLECTOR_PRESSURE_CONFIG",
             Some(&[
@@ -930,6 +1005,7 @@ impl FlightReceiverConfig {
         serde_json::json!({
             "cpu_pressure": self.cpu_pressure,
             "limits": self.limits,
+            "transport": self.transport.effective_config_json(),
             "pressure": {
                 "max_concurrent_streams": self.registration.max_concurrent_streams,
                 "rss_limit_bytes": self.registration.rss_limit_bytes,
@@ -956,6 +1032,7 @@ impl FlightReceiverConfig {
         self.routing.validate()?;
         self.registration.validate()?;
         self.limits.build().map_err(|error| error.to_string())?;
+        self.transport.validate().map_err(|error| error.to_string())?;
         Ok(())
     }
 }

@@ -37,7 +37,6 @@ use otel_arrow_dfe_otap::pdata::OtapPdata;
 use otel_arrow_dfe_pdata::OtapPayload;
 use serde::Serialize;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
 
@@ -49,6 +48,37 @@ use crate::routing::{LeaseResolver, StoreLeaseResolver};
 
 /// DFE URN for arbitrary Arrow Flight ingress.
 pub const ARROW_FLIGHT_RECEIVER_URN: &str = "urn:otel:receiver:arrow_flight";
+
+fn flight_transport(
+    config: &arrowcol_tunables::ReceiverTransportTunables,
+    listener: tokio::net::TcpListener,
+) -> anyhow::Result<(Server, tonic::transport::server::TcpIncoming)> {
+    config.validate()?;
+    let duration = |name, value: &Option<String>| {
+        value
+            .as_deref()
+            .map(|value| arrowcol_tunables::parse_tunable_duration(name, value))
+            .transpose()
+    };
+    let keepalive = duration("tcp_keepalive", &config.tcp_keepalive)?;
+    let mut server = Server::builder()
+        .initial_stream_window_size(config.initial_stream_window_size)
+        .initial_connection_window_size(config.initial_connection_window_size)
+        .http2_adaptive_window(config.adaptive_window)
+        .max_frame_size(config.max_frame_size)
+        .max_concurrent_streams(config.max_concurrent_streams)
+        .http2_keepalive_interval(duration("h2_keepalive_interval", &config.h2_keepalive_interval)?)
+        .http2_keepalive_timeout(duration("h2_keepalive_timeout", &config.h2_keepalive_timeout)?)
+        .http2_max_header_list_size(config.max_header_list_size);
+    if let Some(limit) = config.concurrency_limit_per_connection {
+        server = server.concurrency_limit_per_connection(limit);
+    }
+    // Supplied listeners bypass tonic's builder socket settings.
+    let incoming = tonic::transport::server::TcpIncoming::from(listener)
+        .with_nodelay(config.tcp_nodelay)
+        .with_keepalive(keepalive);
+    Ok((server, incoming))
+}
 
 /// Abstracts DFE message admission for focused zero-copy and backpressure tests.
 #[async_trait]
@@ -613,6 +643,8 @@ impl receiver::Receiver<OtapPdata> for ArrowFlightReceiver {
 
         let flight_listener = effect_handler.tcp_listener(self.config.listening_addr)?;
         let admin_listener = effect_handler.tcp_listener(self.config.admin_listening_addr)?;
+        let (mut flight_server, flight_incoming) = flight_transport(&self.config.transport, flight_listener)
+            .map_err(|error| receiver_error(&effect_handler, ReceiverErrorKind::Configuration, error.to_string()))?;
         let shutdown = CancellationToken::new();
         let registration_shutdown = shutdown.child_token();
         let registration = tokio::spawn(registration_loop(
@@ -624,12 +656,9 @@ impl receiver::Receiver<OtapPdata> for ArrowFlightReceiver {
         ));
         let flight_shutdown = shutdown.child_token();
         let mut flight = tokio::spawn(async move {
-            Server::builder()
+            flight_server
                 .add_service(service.into_tonic_service())
-                .serve_with_incoming_shutdown(
-                    TcpListenerStream::new(flight_listener),
-                    flight_shutdown.cancelled_owned(),
-                )
+                .serve_with_incoming_shutdown(flight_incoming, flight_shutdown.cancelled_owned())
                 .await
         });
         let admin_shutdown = shutdown.child_token();
@@ -1029,6 +1058,98 @@ async fn admin_metrics(State(state): State<AdminState>) -> Response {
 #[cfg(test)]
 pub(crate) mod tests {
     #![allow(clippy::expect_used)]
+
+    #[tokio::test]
+    async fn receiver_transport_is_applied_to_wire_settings_and_accepted_sockets() -> anyhow::Result<()> {
+        use futures::StreamExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for configured in [false, true] {
+            let config = if configured {
+                arrowcol_tunables::ReceiverTransportTunables {
+                    initial_stream_window_size: Some(1_048_576),
+                    initial_connection_window_size: Some(16_777_216),
+                    max_frame_size: Some(32_768),
+                    max_concurrent_streams: Some(17),
+                    concurrency_limit_per_connection: Some(3),
+                    max_header_list_size: Some(32_768),
+                    tcp_nodelay: Some(true),
+                    tcp_keepalive: Some("30s".into()),
+                    ..Default::default()
+                }
+            } else {
+                Default::default()
+            };
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let address = listener.local_addr()?;
+            let (mut server, incoming) = flight_transport(&config, listener)?;
+            let (socket_tx, mut socket_rx) = tokio::sync::mpsc::unbounded_channel();
+            let incoming = incoming.map(move |connection| {
+                if let Ok(stream) = &connection {
+                    let _ = socket_tx.send(stream.nodelay());
+                }
+                connection
+            });
+            let shutdown = CancellationToken::new();
+            let stop = shutdown.clone();
+            let task = tokio::spawn(async move {
+                server
+                    .add_routes(tonic::service::Routes::default())
+                    .serve_with_incoming_shutdown(incoming, stop.cancelled_owned())
+                    .await
+            });
+            let observed = tokio::time::timeout(Duration::from_secs(10), async {
+                let mut stream = tokio::net::TcpStream::connect(address).await?;
+                stream.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").await?;
+                stream.write_all(&[0, 0, 0, 4, 0, 0, 0, 0, 0]).await?;
+                let mut settings = std::collections::BTreeMap::new();
+                let mut connection_window = None;
+                let mut got_settings = false;
+                while !got_settings || connection_window.is_none() {
+                    let mut header = [0; 9];
+                    stream.read_exact(&mut header).await?;
+                    let length = usize::from(header[0]) << 16 | usize::from(header[1]) << 8 | usize::from(header[2]);
+                    anyhow::ensure!(length <= 65_536, "unexpected probe frame size");
+                    let mut payload = vec![0; length];
+                    stream.read_exact(&mut payload).await?;
+                    if header[3] == 4 && header[4] & 1 == 0 {
+                        anyhow::ensure!(length % 6 == 0, "invalid SETTINGS frame");
+                        for setting in payload.chunks_exact(6) {
+                            settings.insert(
+                                u16::from_be_bytes(setting[..2].try_into()?),
+                                u32::from_be_bytes(setting[2..].try_into()?),
+                            );
+                        }
+                        got_settings = true;
+                        stream.write_all(&[0, 0, 0, 4, 1, 0, 0, 0, 0]).await?;
+                    } else if header[3] == 8 && header[5..] == [0, 0, 0, 0] {
+                        connection_window =
+                            Some(65_535 + (u32::from_be_bytes(payload.as_slice().try_into()?) & 0x7fff_ffff));
+                    }
+                }
+                let nodelay = socket_rx
+                    .recv()
+                    .await
+                    .ok_or_else(|| anyhow::anyhow!("missing accepted socket"))??;
+                Ok::<_, anyhow::Error>((settings, connection_window, nodelay))
+            })
+            .await;
+            shutdown.cancel();
+            task.await??;
+            let (settings, connection_window, nodelay) = observed??;
+            assert_eq!(settings.get(&4), Some(&1_048_576));
+            assert_eq!(connection_window, Some(if configured { 16_777_216 } else { 1_048_576 }));
+            assert_eq!(settings.get(&5), Some(&if configured { 32_768 } else { 16_384 }));
+            assert_eq!(settings.get(&6), Some(&if configured { 32_768 } else { 16_384 }));
+            if configured {
+                assert_eq!(settings.get(&3), Some(&17));
+                assert!(nodelay);
+            } else {
+                assert!(!settings.contains_key(&3));
+            }
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     async fn pressure_attests_only_ready_direct_receivers() -> anyhow::Result<()> {

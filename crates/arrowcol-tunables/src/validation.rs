@@ -218,6 +218,32 @@ const CAPABILITIES: &[Capability] = &[
     capability!("collector.limits.grpc_send_compression", "none"),
     capability!("collector.limits.max_schema_bytes", "1048576"),
     capability!("collector.limits.max_message_bytes", "16777216"),
+    capability!(
+        "collector.receiver_transport.initial_stream_window_size",
+        "1048576; pinned Hyper default"
+    ),
+    capability!(
+        "collector.receiver_transport.initial_connection_window_size",
+        "1048576; pinned Hyper default"
+    ),
+    capability!("collector.receiver_transport.adaptive_window", "false"),
+    capability!("collector.receiver_transport.max_frame_size", "16384"),
+    capability!("collector.receiver_transport.max_concurrent_streams", "unlimited"),
+    capability!(
+        "collector.receiver_transport.concurrency_limit_per_connection",
+        "unlimited"
+    ),
+    capability!("collector.receiver_transport.h2_keepalive_interval", "disabled"),
+    capability!("collector.receiver_transport.h2_keepalive_timeout", "20s"),
+    capability!(
+        "collector.receiver_transport.tcp_nodelay",
+        "inherited listener/system option"
+    ),
+    capability!(
+        "collector.receiver_transport.tcp_keepalive",
+        "inherited listener/system option"
+    ),
+    capability!("collector.receiver_transport.max_header_list_size", "16384"),
     capability!("collector.limits.batch_channel_capacity", "4"),
     capability!("collector.limits.put_result_channel_capacity", "8"),
     capability!("collector.limits.max_stream_duration", "300s"),
@@ -597,6 +623,9 @@ impl Tunables {
             validate_batching(collector.batching.as_ref())?;
             validate_commit(collector.commit.as_ref())?;
             validate_limits(collector.limits.as_ref())?;
+            if let Some(transport) = &collector.receiver_transport {
+                transport.validate()?;
+            }
             validate_pressure(collector.pressure.as_ref())?;
             validate_runtime(collector.runtime.as_ref())?;
             validate_collector_upload(collector)?;
@@ -764,6 +793,22 @@ impl Tunables {
                     )?;
                     canonicalize_optional_duration(&mut value.admission_timeout, "collector.limits.admission_timeout")?;
                     insert_json_config("ARROWCOL_COLLECTOR_LIMITS_CONFIG", &value, &mut output)?;
+                }
+                if let Some(value) = &collector.receiver_transport {
+                    let mut value = value.clone();
+                    canonicalize_optional_duration(
+                        &mut value.h2_keepalive_interval,
+                        "collector.receiver_transport.h2_keepalive_interval",
+                    )?;
+                    canonicalize_optional_duration(
+                        &mut value.h2_keepalive_timeout,
+                        "collector.receiver_transport.h2_keepalive_timeout",
+                    )?;
+                    canonicalize_optional_duration(
+                        &mut value.tcp_keepalive,
+                        "collector.receiver_transport.tcp_keepalive",
+                    )?;
+                    insert_json_config("ARROWCOL_COLLECTOR_RECEIVER_TRANSPORT_CONFIG", &value, &mut output)?;
                 }
                 if let Some(value) = &collector.pressure {
                     let mut value = value.clone();
@@ -1375,6 +1420,60 @@ fn validate_limits(limits: Option<&LimitsTunables>) -> Result<()> {
         ("max_ddl_bytes", limits.max_ddl_bytes.unwrap_or(65_536)),
     ] {
         positive(&format!("collector.limits.{name}"), Some(value))?;
+    }
+
+    pub(crate) fn validate_receiver_transport(value: &ReceiverTransportTunables) -> Result<()> {
+        let stream = value.initial_stream_window_size.unwrap_or(DEFAULT_RECEIVER_H2_WINDOW);
+        let connection = value
+            .initial_connection_window_size
+            .unwrap_or(DEFAULT_RECEIVER_H2_WINDOW);
+        validate_h2_window("collector.receiver_transport.initial_stream_window_size", stream)?;
+        validate_h2_window(
+            "collector.receiver_transport.initial_connection_window_size",
+            connection,
+        )?;
+        if connection < stream {
+            bail!("collector.receiver_transport connection window must be >= stream window");
+        }
+        if value
+            .max_frame_size
+            .is_some_and(|size| !(16_384..=16_777_215).contains(&size))
+        {
+            bail!("collector.receiver_transport.max_frame_size must be between 16384 and 16777215");
+        }
+        positive(
+            "collector.receiver_transport.max_concurrent_streams",
+            value.max_concurrent_streams,
+        )?;
+        positive(
+            "collector.receiver_transport.max_header_list_size",
+            value.max_header_list_size,
+        )?;
+        positive(
+            "collector.receiver_transport.concurrency_limit_per_connection",
+            value.concurrency_limit_per_connection,
+        )?;
+        if value
+            .concurrency_limit_per_connection
+            .is_some_and(|limit| limit > (usize::MAX >> 3))
+        {
+            bail!("collector.receiver_transport.concurrency_limit_per_connection exceeds semaphore bounds");
+        }
+        for (name, duration) in [
+            ("h2_keepalive_interval", &value.h2_keepalive_interval),
+            ("h2_keepalive_timeout", &value.h2_keepalive_timeout),
+            ("tcp_keepalive", &value.tcp_keepalive),
+        ] {
+            if let Some(duration) = duration {
+                let duration = parse_tunable_duration(&format!("collector.receiver_transport.{name}"), duration)?;
+                if name == "tcp_keepalive"
+                    && (duration.as_secs() == 0 || duration.as_secs() > 32767 || duration.subsec_nanos() != 0)
+                {
+                    bail!("collector.receiver_transport.tcp_keepalive must be whole seconds between 1s and 32767s");
+                }
+            }
+        }
+        Ok(())
     }
     if schema > message {
         bail!("collector.limits.max_schema_bytes must not exceed max_message_bytes");

@@ -50,6 +50,29 @@ The target 17.4 GB/s is 139.2 Gbps of uncompressed Arrow payload. D53 requires l
 
 Sources: [Ddsv6 sizes](https://learn.microsoft.com/azure/virtual-machines/sizes/general-purpose/ddsv6-series), [Edsv6 sizes](https://learn.microsoft.com/azure/virtual-machines/sizes/memory-optimized/edsv6-series), [Ensv6 sizes](https://learn.microsoft.com/azure/virtual-machines/sizes/memory-optimized/ensv6-series), [VM network bandwidth](https://learn.microsoft.com/azure/virtual-network/virtual-machine-network-throughput), and [standard storage scalability targets](https://learn.microsoft.com/azure/storage/common/scalability-targets-standard-account).
 
+## Collector Flight transport
+
+`collector.receiver_transport` projects to
+`ARROWCOL_COLLECTOR_RECEIVER_TRANSPORT_CONFIG` and the receiver YAML `transport`
+object. It configures Flight only, not admin HTTP. Unknown keys and invalid values
+fail startup. Unset fields preserve the existing server; effective receiver
+readback includes both configured and effective values.
+
+| Field | Bound and unset behavior |
+| --- | --- |
+| `initial_stream_window_size`, `initial_connection_window_size` | `1..=2147483647` bytes; connection must be at least stream. Pinned Hyper defaults are **1 MiB / 1 MiB**, despite tonic's 65,535-byte API documentation; wire tests verify SETTINGS and connection WINDOW_UPDATE. |
+| `adaptive_window` | Boolean, default false. True makes Hyper start at 65,535 bytes and adapt, overriding both configured windows; readback reports this explicitly. |
+| `max_frame_size` | `16384..=16777215` bytes; default 16384. |
+| `max_concurrent_streams` | Positive u32 HTTP/2 stream limit; unset unlimited. Separate from receiver admission/registration stream limits. |
+| `concurrency_limit_per_connection` | Positive integer within semaphore bounds; unset unlimited concurrent requests. |
+| `h2_keepalive_interval`, `h2_keepalive_timeout` | Positive, clock-representable durations; interval unset disables pings, timeout defaults to 20s. |
+| `tcp_nodelay`, `tcp_keepalive` | Boolean and whole-second duration `1s..=32767s`; unset preserves inherited listener/system socket options. Applied through tonic `TcpIncoming` because builder socket settings do not affect supplied listeners. |
+| `max_header_list_size` | Positive u32 byte limit; pinned default 16384. |
+
+For an explicit fixed-window comparison, set stream/connection to
+`1048576`/`16777216` and `adaptive_window: false`. Client-side receive windows
+and router upstream settings do not configure the collector's receive windows.
+
 ## Single-table preparation and commit overlap
 
 | Setting | Contract |
