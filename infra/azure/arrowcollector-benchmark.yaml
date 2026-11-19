@@ -24,16 +24,23 @@
 # The pinned images still retain pre-integration capacity limits; do not qualify until L1b/L3
 # provide source-matched images and the bounded capacity/message settings are read back.
 # The 160 DFE / 176 CPU candidate is staged only; verify actual E192 allocatable CPU before applying.
-# ACS v2 has no supported minor/patch pin: record extension and CSI driver versions before and after each window.
-# What-if does not validate local NVMe discovery/provisioning, usable capacity, or CSI scheduling.
-# Verify the actual agentpool label and that ACS CSI pods tolerate the collector NoSchedule taint before storage apply.
+# Pre-SC gate: verify a Ready collector node has label kubernetes.azure.com/agentpool=arrowe192 and
+# inventory every StorageClass with provisioner localdisk.csi.acstor.io read-only. Do not mutate others.
+# Any unannotated class or affinity admitting nodes outside arrowe192 blocks this run because it can
+# widen CSI placement. Reuse an existing same-name run class read-only only if run-id, owner-token,
+# provisioner, and affinity exactly match; otherwise abort, never overwrite/adopt another owner.
+# ACS v2 defers CSI installation until this run-specific StorageClass exists. After creating it,
+# before any local-csi test PVC or writer, verify driver pod placement and collector NoSchedule-taint
+# tolerance, actual extension/driver versions, and usable NVMe capacity. Record versions before/after
+# each scored window; ACS minor/patch pinning is unsupported. What-if cannot validate any of this.
 # Supply Secrets in this namespace from your approved secret source (no values in this file):
 # arrowcol-generation[generation] (current stamp authority generation), arrowcol-router-auth
 # [edge-hmac,internal-hmac], arrowcol-sql-{admin,migration,runtime}[password] (fresh generated SQL credentials).
 # Apply with: kubectl --context arrow-collector-68590 apply --server-side -f rendered.yaml -l benchmark-stage=STAGE
 # Stages, in order (wait for success; abort on failure):
-# identity -> prepare/probe FIC and install Secrets -> storage (the StorageClass is run-scoped but cluster-scoped:
-# verify exact run-id/owner-token, provisioner, and affinity; reuse read-only only if all match, otherwise create only when absent. Never overwrite/adopt another owner class; wait for ACS and the collector-pool driver) -> sql (wait deploy/arrowcol-sql) -> migration
+# identity -> prepare/probe FIC and install Secrets -> storage (create the unique run-scoped cluster StorageClass only if absent;
+# exact own match may be reused read-only; run the storage checks above before any local-csi PVC/writer)
+# -> sql (wait deploy/arrowcol-sql) -> migration
 # (wait job/arrowcol-migrate-v11-fresh) -> catalog (wait catalog/router/maintenance deployments)
 # -> writer (one ready pod and stable restart count) -> initializer (wait job/direct-pin-live)
 # -> registration (wait job/direct-catalog-verified and verify signed one-table receipt)
