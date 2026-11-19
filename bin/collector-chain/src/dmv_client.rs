@@ -3458,7 +3458,7 @@ mod tests {
             (end, ManifestCohort::PostWindow, 0_u64),
         ] {
             let mut client = manifest_test_client()?;
-            client.measurement = Mutex::new(Some(Measurement::new(start, end, 2)?));
+            client.measurement = Mutex::new(Some(Arc::new(Measurement::new(start, end, 2)?)));
             client
                 .logical_batches
                 .lock()
@@ -3540,7 +3540,7 @@ mod tests {
         client.counters = (0..WORKERS).map(|_| Counters::default()).collect();
         client.worker_next = (0..WORKERS).map(|_| AtomicU64::new(0)).collect();
         client.worker_batch_sequence = (0..WORKERS).map(|_| AtomicU64::new(0)).collect();
-        client.measurement = Mutex::new(Some(Measurement::new(START_MS, end_ms, WORKERS)?));
+        client.measurement = Mutex::new(Some(Arc::new(Measurement::new(START_MS, end_ms, WORKERS)?)));
         let table = "sqlserver_availability_replica_states";
         let mut expected_physical = 0_u64;
         let mut expected_canonical = 0_u64;
