@@ -2669,7 +2669,7 @@ async fn canonical_publication_accounting(
     messages: &[FlightData],
     expected_rows: u64,
 ) -> Result<CanonicalPublicationAccounting> {
-    let batches = FlightRecordBatchStream::new_from_flight_data(stream::iter(messages.to_vec().into_iter().map(Ok)))
+    let batches = FlightRecordBatchStream::new_from_flight_data(stream::iter(messages.iter().cloned().map(Ok)))
         .try_collect::<Vec<_>>()
         .await?;
     let decoded_rows = batches.iter().try_fold(0_u64, |total, batch| {
