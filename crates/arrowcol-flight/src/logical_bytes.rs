@@ -58,13 +58,12 @@ pub fn canonical_record_batch_logical_bytes(batch: &RecordBatch) -> Result<u64, 
                     .ok_or(CanonicalLogicalBytesError::Overflow)?
             }
             data_type => {
-                let bit_width = data_type
-                    .bit_width()
-                    .ok_or_else(|| CanonicalLogicalBytesError::UnsupportedDataType(data_type.to_string()))?;
-                if bit_width % 8 != 0 {
-                    return Err(CanonicalLogicalBytesError::UnsupportedDataType(data_type.to_string()));
+                let byte_width = match data_type {
+                    DataType::FixedSizeBinary(width) => usize::try_from(*width).ok(),
+                    _ => data_type.primitive_width(),
                 }
-                len.checked_mul(u64::try_from(bit_width / 8).map_err(|_| CanonicalLogicalBytesError::Overflow)?)
+                .ok_or_else(|| CanonicalLogicalBytesError::UnsupportedDataType(data_type.to_string()))?;
+                len.checked_mul(u64::try_from(byte_width).map_err(|_| CanonicalLogicalBytesError::Overflow)?)
                     .ok_or(CanonicalLogicalBytesError::Overflow)?
             }
         };
@@ -138,19 +137,49 @@ mod tests {
         let all_valid_with_bitmap = Int32Array::new(values.values().clone(), Some(NullBuffer::new_valid(3)));
         assert_eq!(all_valid_with_bitmap.null_count(), 0);
 
+        let empty_text = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("empty_text", DataType::Utf8, false)])),
+            vec![Arc::new(StringArray::from(Vec::<&str>::new())) as ArrayRef],
+        )
+        .expect("empty record batch");
+        assert_eq!(canonical_record_batch_logical_bytes(&empty_text), Ok(4));
+
+        let all_valid = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("all_valid", DataType::Int32, false)])),
+            vec![Arc::new(all_valid_with_bitmap)],
+        )
+        .expect("all-valid record batch");
+        assert_eq!(canonical_record_batch_logical_bytes(&all_valid), Ok(12));
+    }
+
+    #[test]
+    fn canonical_flat_byte_vectors_include_only_logical_payload_and_present_nulls() {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("empty_text", DataType::Utf8, false),
-            Field::new("all_valid", DataType::Int32, false),
+            Field::new("text", DataType::Utf8, true),
+            Field::new("number", DataType::Int32, true),
+            Field::new("flag", DataType::Boolean, true),
         ]));
-        let batch = RecordBatch::try_new(
-            schema,
+        let non_null = RecordBatch::try_new(
+            schema.clone(),
             vec![
-                Arc::new(StringArray::from(Vec::<&str>::new())) as ArrayRef,
-                Arc::new(all_valid_with_bitmap),
+                Arc::new(StringArray::from(vec!["a", "bb", "ccc"])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(BooleanArray::from(vec![true, false, true])),
             ],
         )
-        .expect("record batch");
-        assert_eq!(canonical_record_batch_logical_bytes(&batch), Ok(16));
+        .expect("non-null record batch");
+        assert_eq!(canonical_record_batch_logical_bytes(&non_null), Ok(35));
+
+        let nullable = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![Some("a"), None, Some("ccc")])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![Some(1), None, Some(3)])),
+                Arc::new(BooleanArray::from(vec![Some(true), None, Some(false)])),
+            ],
+        )
+        .expect("nullable record batch");
+        assert_eq!(canonical_record_batch_logical_bytes(&nullable), Ok(36));
     }
 
     #[test]
