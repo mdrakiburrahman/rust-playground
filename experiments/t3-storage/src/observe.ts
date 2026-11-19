@@ -2,9 +2,15 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createHash } from 'node:crypto';
-import { gunzipSync } from 'node:zlib';
+import { brotliDecompressSync } from 'node:zlib';
 import { Lab, privateDirectory, shellQuote } from './lab.js';
 import type { Request } from './job.js';
+
+const chunkSize = 2560;
+
+export function evidenceArchiveScript(root: string, files: string[]): string {
+  return `const fs=require('node:fs'),z=require('node:zlib'),c=require('node:crypto');const root=${JSON.stringify(root)},files=${JSON.stringify(files)},data={},unavailable=[];for(const name of files){try{data[name]=fs.readFileSync(root+'/'+name).toString('base64')}catch(e){if(e.code!=='ENOENT')throw e;unavailable.push(name)}}const b=z.brotliCompressSync(Buffer.from(JSON.stringify({data,unavailable})));fs.writeFileSync(root+'/collected.json.br',b);console.log('STORAGE_SPIKE_ARCHIVE:'+JSON.stringify({count:Math.ceil(b.length/${chunkSize}),total:b.length,sha256:c.createHash('sha256').update(b).digest('hex'),part:b.subarray(0,${chunkSize}).toString('base64')}));`;
+}
 
 export async function blobJson(lab: Lab, name: string): Promise<unknown | null> {
   if (!/^[a-zA-Z0-9_./-]+$/u.test(name) || name.includes('..')) throw new Error('Invalid evidence blob name.');
@@ -25,8 +31,9 @@ export async function collectJob(lab: Lab, request: Request): Promise<void> {
   await mkdir(dir, { recursive: true, mode: 0o700 });
   const files = ['environment.json', 'status.json'];
   if (request.mode === 'smoke') files.push('raw.jsonl', 'write.jsonl', 'recover.jsonl', 'oracle.jsonl', 'observed.json');
-  if (request.mode === 'fault-a') files.push('engine.jsonl', 'oracle.jsonl');
+  if (request.mode === 'fault-a') files.push('engine.jsonl', 'oracle.jsonl', 'segments-after-writer.json');
   if (request.mode === 'fault-b') files.push('engine.jsonl', 'oracle.jsonl', 'observed.json', 'verification.jsonl', 'takeover.json', 'control-ready.json', 'control-fault.json', 'original-writer-finished.json');
+  if (request.mode === 'fault-b' && request.restartBeforeDrain) files.push('pre-drain.jsonl', 'restart.json', 'segments-before-restart.json', ...(request.trace ? ['pre-drain-syscalls.log'] : []));
   if (request.trace) files.push('syscalls.log');
   if (request.mode === 'performance') {
     for (const mib of request.sizesMiB ?? [1, 2, 4, 8, 16]) {
@@ -41,11 +48,10 @@ export async function collectJob(lab: Lab, request: Request): Promise<void> {
     for (const mib of request.sizesMiB ?? [1, 2, 4, 8, 16]) files.push(`blob-${mib}.jsonl`);
     files.push('blob-fence.jsonl');
   }
-  if (request.mode === 'phase-a') files.push('quiver-tests.log', 'durable-buffer-tests.log');
+  if (request.mode === 'phase-a') files.push('quiver-tests.log', 'durable-buffer-tests.log', 'df-engine-build.log', 'df-engine.yaml', 'df-engine-validation.log', 'df-engine-smoke.log', 'ingest-bench-build.log', 'ingest-bench.log');
   const guest = `/var/lib/storage-spike-oracle/jobs/${request.id}`;
-  const archive = `${guest}/collected.json.gz`;
-  const chunkSize = 2048;
-  const build = `const fs=require('node:fs'),z=require('node:zlib'),c=require('node:crypto');const root=${JSON.stringify(guest)},files=${JSON.stringify(files)},data={},unavailable=[];for(const name of files){try{data[name]=fs.readFileSync(root+'/'+name).toString('base64')}catch(e){if(e.code!=='ENOENT')throw e;unavailable.push(name)}}const b=z.gzipSync(Buffer.from(JSON.stringify({data,unavailable})));fs.writeFileSync(${JSON.stringify(archive)},b);console.log('STORAGE_SPIKE_ARCHIVE:'+JSON.stringify({count:Math.ceil(b.length/${chunkSize}),total:b.length,sha256:c.createHash('sha256').update(b).digest('hex'),part:b.subarray(0,${chunkSize}).toString('base64')}));`;
+  const archive = `${guest}/collected.json.br`;
+  const build = evidenceArchiveScript(guest, files);
   const parse = (message: string): { count: number; total: number; sha256: string; part: string } => {
     const line = message.split(/\r?\n/u).find(s => s.startsWith('STORAGE_SPIKE_ARCHIVE:'));
     if (!line) throw new Error('Missing complete archive response.');
@@ -61,12 +67,12 @@ export async function collectJob(lab: Lab, request: Request): Promise<void> {
   }
   const compressed = Buffer.concat(parts);
   if (compressed.length !== first.total || createHash('sha256').update(compressed).digest('hex') !== first.sha256) throw new Error('Evidence archive digest mismatch.');
-  const contents = JSON.parse(gunzipSync(compressed).toString()) as { data: Record<string, string>; unavailable: string[] };
+  const contents = JSON.parse(brotliDecompressSync(compressed).toString()) as { data: Record<string, string>; unavailable: string[] };
   for (const [file, value] of Object.entries(contents.data)) {
     if (!files.includes(file)) throw new Error('Unexpected archive member.');
     await writeFile(path.join(dir, file), Buffer.from(value, 'base64'), { mode: 0o600 });
   }
-  await writeFile(path.join(dir, 'collection.json'), JSON.stringify({ files, unavailable: contents.unavailable, sha256: first.sha256 }, null, 2));
+  await writeFile(path.join(dir, 'collection.json'), JSON.stringify({ files, unavailable: contents.unavailable, sha256: first.sha256, compression: 'brotli', chunks: first.count }, null, 2));
 }
 
 export async function waitJob(lab: Lab, request: Request, timeoutMs = 3 * 60 * 60_000): Promise<Record<string, unknown>> {

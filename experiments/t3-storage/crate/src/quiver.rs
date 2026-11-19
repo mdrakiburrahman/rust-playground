@@ -182,6 +182,10 @@ async fn wait_at_barrier(path: &Path) -> Result<()> {
         "barrier paths must be new"
     );
     std::fs::write(path.with_extension("ready"), b"paused\n")?;
+    println!(
+        "{}",
+        json!({"kind":"barrier", "path":path, "pid":std::process::id(), "at_unix_ms":SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_secs_f64() * 1000.0})
+    );
     while !path.exists() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -338,8 +342,12 @@ pub struct RecoverArgs {
     pub observed: PathBuf,
     #[arg(long, default_value_t = 120)]
     pub retry_seconds: u64,
+    #[arg(long, default_value_t = 5)]
+    pub interval_ms: u64,
     #[arg(long)]
     pub mmap: bool,
+    #[arg(long)]
+    pub pause_before_drain: Option<PathBuf>,
     #[arg(long, default_value_t = 0)]
     pub hold_open_seconds: u64,
     #[arg(long)]
@@ -348,11 +356,12 @@ pub struct RecoverArgs {
 
 pub async fn recover(args: RecoverArgs) -> Result<()> {
     ensure!(args.dir.is_dir(), "recovery directory does not exist");
+    ensure!(args.interval_ms <= 1000, "invalid WAL interval");
     let receipts = read_receipts(&std::fs::read(&args.oracle)?)?;
     let start = Instant::now();
     let engine = open(
         &args.dir,
-        5,
+        args.interval_ms,
         137_438_953_472,
         args.mmap,
         Duration::from_secs(args.retry_seconds),
@@ -363,6 +372,9 @@ pub async fn recover(args: RecoverArgs) -> Result<()> {
         "{}",
         json!({"kind":"claim", "run":args.run, "open_retry_ms":claim_ms, "at_unix_ms":SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_secs_f64() * 1000.0})
     );
+    if let Some(path) = &args.pause_before_drain {
+        wait_at_barrier(path).await?;
+    }
     let subscriber = subscribe(&engine)?;
     engine.flush().await?;
     let mut ids = Vec::new();
@@ -390,4 +402,54 @@ pub async fn recover(args: RecoverArgs) -> Result<()> {
     }
     engine.shutdown().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn recovery_gate_prevents_drain_until_released() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let dir = root.path().join("data");
+        let oracle_path = root.path().join("oracle.jsonl");
+        let observed = root.path().join("observed.json");
+        let gate = root.path().join("continue");
+        let engine = open(&dir, 5, 137_438_953_472, false, Duration::ZERO).await?;
+        let _subscriber = subscribe(&engine)?;
+        let payload = Arc::new(BinaryArray::from_iter_values([vec![0x5a; 32]]));
+        for id in 0..3 {
+            engine.ingest(&Bundle::new(id, payload.clone())?).await?;
+        }
+        engine.sync_wal().await?;
+        Oracle::create(&oracle_path, "gate".into())?.record(vec![0, 1, 2])?;
+        engine.shutdown().await?;
+        drop(engine);
+        let args = RecoverArgs {
+            dir,
+            run: "gate".into(),
+            oracle: oracle_path,
+            observed: observed.clone(),
+            retry_seconds: 0,
+            interval_ms: 5,
+            mmap: false,
+            pause_before_drain: Some(gate.clone()),
+            hold_open_seconds: 0,
+            hold_open_until: None,
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(recover(args), async {
+                while !gate.with_extension("ready").exists() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                assert!(!observed.exists(), "recovery drained before the gate was released");
+                std::fs::write(&gate, b"continue\n").unwrap();
+            })
+        })
+        .await?;
+        result?;
+        let ids: Vec<i64> = serde_json::from_slice(&std::fs::read(observed)?)?;
+        assert_eq!(ids, vec![0, 1, 2]);
+        Ok(())
+    }
 }

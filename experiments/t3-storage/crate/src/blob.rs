@@ -110,28 +110,29 @@ impl Blob {
             Mode::Append => "AppendBlob",
         };
         let response = blob
-            .request(Method::PUT, &[])
+            .empty_put(&[])
             .header("x-ms-blob-type", kind)
             .header("If-None-Match", "*")
-            .body(Vec::new())
             .send()
             .await?;
         blob.etag = checked(response, StatusCode::CREATED)
-            .await?
+            .await
+            .context("create blob")?
             .headers()
             .get("etag")
             .context("missing ETag")?
             .to_str()?
             .into();
         let response = blob
-            .request(Method::PUT, &[("comp", "lease")])
+            .empty_put(&[("comp", "lease")])
             .header("x-ms-lease-action", "acquire")
             .header("x-ms-lease-duration", "60")
             .header("x-ms-proposed-lease-id", &blob.lease)
-            .body(Vec::new())
             .send()
             .await?;
-        checked(response, StatusCode::CREATED).await?;
+        checked(response, StatusCode::CREATED)
+            .await
+            .context("acquire blob lease")?;
         blob.requests = 2;
         Ok(blob)
     }
@@ -145,16 +146,21 @@ impl Blob {
             .header("x-ms-date", httpdate::fmt_http_date(SystemTime::now()))
     }
 
+    fn empty_put(&self, query: &[(&str, &str)]) -> reqwest::RequestBuilder {
+        self.request(Method::PUT, query)
+            .header(reqwest::header::CONTENT_LENGTH, "0")
+            .body(Vec::new())
+    }
+
     async fn renew(&mut self) -> Result<()> {
         if self.last_renewal.elapsed() >= Duration::from_secs(15) {
             let response = self
-                .request(Method::PUT, &[("comp", "lease")])
+                .empty_put(&[("comp", "lease")])
                 .header("x-ms-lease-id", &self.lease)
                 .header("x-ms-lease-action", "renew")
-                .body(Vec::new())
                 .send()
                 .await?;
-            checked(response, StatusCode::OK).await?;
+            checked(response, StatusCode::OK).await.context("renew blob lease")?;
             self.last_renewal = Instant::now();
             self.requests += 1;
         }
@@ -215,13 +221,12 @@ impl Blob {
 
     async fn release(&self) -> Result<()> {
         let response = self
-            .request(Method::PUT, &[("comp", "lease")])
+            .empty_put(&[("comp", "lease")])
             .header("x-ms-lease-action", "release")
             .header("x-ms-lease-id", &self.lease)
-            .body(Vec::new())
             .send()
             .await?;
-        checked(response, StatusCode::OK).await?;
+        checked(response, StatusCode::OK).await.context("release blob lease")?;
         Ok(())
     }
 }
@@ -328,11 +333,10 @@ async fn fence(blob: &mut Blob, mode: Mode) -> Result<()> {
     let contenders = [uuid::Uuid::new_v4().to_string(), uuid::Uuid::new_v4().to_string()];
     blob.release().await?;
     let acquire = |id: &str| {
-        blob.request(Method::PUT, &[("comp", "lease")])
+        blob.empty_put(&[("comp", "lease")])
             .header("x-ms-lease-action", "acquire")
             .header("x-ms-lease-duration", "60")
             .header("x-ms-proposed-lease-id", id)
-            .body(Vec::new())
             .send()
     };
     let (a, b) = tokio::join!(acquire(&contenders[0]), acquire(&contenders[1]));
@@ -381,6 +385,41 @@ async fn fence(blob: &mut Blob, mode: Mode) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn empty_azure_puts_have_explicit_length_without_changing_payload_puts() {
+        let blob = Blob {
+            client: Client::new(),
+            token: "test-token".into(),
+            url: Url::parse("https://example.invalid/spike/test").unwrap(),
+            lease: "test-lease".into(),
+            etag: String::new(),
+            offset: 0,
+            blocks: Vec::new(),
+            last_renewal: Instant::now(),
+            requests: 0,
+        };
+        for version in [reqwest::Version::HTTP_11, reqwest::Version::HTTP_2] {
+            for query in [Vec::new(), vec![("comp", "lease")]] {
+                let request = blob.empty_put(&query).version(version).build().unwrap();
+                assert_eq!(request.headers()[reqwest::header::CONTENT_LENGTH], "0");
+                assert_eq!(request.body().unwrap().as_bytes(), Some(&[][..]));
+            }
+        }
+        let request = blob
+            .request(Method::PUT, &[("comp", "block")])
+            .body(b"accepted".to_vec())
+            .build()
+            .unwrap();
+        assert_ne!(
+            request
+                .headers()
+                .get(reqwest::header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok()),
+            Some("0")
+        );
+        assert_eq!(request.body().unwrap().as_bytes(), Some(b"accepted".as_slice()));
+    }
 
     #[test]
     fn cumulative_list_retains_old_blocks_and_has_uniform_ids() {

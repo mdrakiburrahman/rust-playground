@@ -5,11 +5,15 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { Lab, execute, privateDirectory, shellQuote } from './lab.js';
 import type { Request } from './job.js';
 
-export interface Artifact { name: string; sha256: string; binarySha256: string; transport?: 'blob' | 'arm' | 'source-arm'; localFile?: string }
+export interface Artifact { name: string; sha256: string; binarySha256: string; quiverCommit: string; transport?: 'blob' | 'arm' | 'source-arm'; localFile?: string }
 
 export async function publishArtifact(lab: Lab): Promise<Artifact> {
   const inventory = await lab.inventory();
   const directory = await privateDirectory(lab.config.outDir);
+  const manifest = await readFile('experiments/t3-storage/crate/Cargo.toml', 'utf8');
+  const quiverCommit = manifest.match(/otel-arrow-dfe-quiver = .*rev = "([0-9a-f]{40})"/u)?.[1];
+  const lock = await readFile('experiments/t3-storage/crate/Cargo.lock', 'utf8');
+  if (!quiverCommit || !lock.includes(`?rev=${quiverCommit}#${quiverCommit}"`)) throw new Error('Manifest and lockfile must pin the same exact Quiver revision.');
   const stage = path.join(directory, 'artifact-stage');
   await mkdir(stage, { recursive: true, mode: 0o700 });
   await execute('docker', ['exec', lab.config.buildContainer, 'cargo', 'build', '--locked', '--release', '--manifest-path', 'experiments/t3-storage/crate/Cargo.toml', '--target-dir', 'target/storage-spike'], 15 * 60_000);
@@ -17,7 +21,7 @@ export async function publishArtifact(lab: Lab): Promise<Artifact> {
   const binarySha256 = createHash('sha256').update(await readFile(path.join(stage, 'storage-spike'))).digest('hex');
   await writeFile(path.join(stage, 'job.ts'), await readFile('experiments/t3-storage/src/job.ts'));
   await writeFile(path.join(stage, 'package.json'), '{"type":"module"}\n');
-  await writeFile(path.join(stage, 'provenance.json'), JSON.stringify({ binarySha256, quiverCommit: 'a152f5e8256160d4ad8fe756f4cab0a5055ae7ac' }));
+  await writeFile(path.join(stage, 'provenance.json'), JSON.stringify({ binarySha256, quiverCommit }));
   const file = path.join(directory, 'artifact.tgz');
   await execute('tar', ['-czf', file, '-C', stage, 'storage-spike', 'job.ts', 'package.json', 'provenance.json']);
   const sha256 = createHash('sha256').update(await readFile(file)).digest('hex');
@@ -42,15 +46,26 @@ export async function publishArtifact(lab: Lab): Promise<Artifact> {
     }
   }
   if (!published) throw new Error('Artifact upload did not complete.');
-  let artifact: Artifact = { name, sha256, binarySha256, transport };
+  let artifact: Artifact = { name, sha256, binarySha256, quiverCommit, transport };
   if (transport === 'arm') {
     const sourceFile = path.join(directory, 'artifact-source.tgz');
     await execute('tar', ['-czf', sourceFile, '-C', 'experiments/t3-storage', 'crate/Cargo.toml', 'crate/Cargo.lock', 'crate/src', 'src/job.ts']);
     const sourceSha256 = createHash('sha256').update(await readFile(sourceFile)).digest('hex');
-    artifact = { name: `artifacts/${sourceSha256}/source.tgz`, sha256: sourceSha256, binarySha256, transport: 'source-arm', localFile: sourceFile };
+    artifact = { name: `artifacts/${sourceSha256}/source.tgz`, sha256: sourceSha256, binarySha256, quiverCommit, transport: 'source-arm', localFile: sourceFile };
   }
   await lab.save('artifact.json', artifact);
   return artifact;
+}
+
+function phaseSourceScript(commit: string): string {
+  if (!/^[0-9a-f]{40}$/u.test(commit)) throw new Error('Invalid Quiver revision.');
+  return `SOURCE=$(find /home/spike/.cargo/git/checkouts -mindepth 2 -maxdepth 2 -type d -name ${commit.slice(0, 7)})
+test -n "$SOURCE"
+test "$(runuser -u spike -- git -C "$SOURCE" rev-parse HEAD)" = ${commit}
+PHASE=/var/lib/storage-spike/phase-a-${commit}
+if ! test -d "$PHASE/.git"; then runuser -u spike -- git clone --shared "$SOURCE" "$PHASE"; fi
+test "$(runuser -u spike -- git -C "$PHASE" rev-parse HEAD)" = ${commit}
+ln -sfn "$PHASE" /var/lib/storage-spike/otel-arrow`;
 }
 
 export function bootstrapScript(artifact: Artifact, endpoint: string): string {
@@ -99,14 +114,13 @@ chown -R spike:spike crate
 runuser -u spike -- env CARGO_TARGET_DIR=/var/lib/storage-spike/driver-target /home/spike/.cargo/bin/cargo clean --release --package storage-spike --manifest-path /var/lib/storage-spike/crate/Cargo.toml
 runuser -u spike -- env CARGO_TARGET_DIR=/var/lib/storage-spike/driver-target /home/spike/.cargo/bin/cargo build --locked --release --manifest-path /var/lib/storage-spike/crate/Cargo.toml
 install -m 755 driver-target/release/storage-spike storage-spike
-SOURCE=$(find /home/spike/.cargo/git/checkouts -mindepth 2 -maxdepth 2 -type d -name a152f5e)
-test "$(git -C "$SOURCE" rev-parse HEAD)" = a152f5e8256160d4ad8fe756f4cab0a5055ae7ac
-ln -sfn "$SOURCE" /var/lib/storage-spike/otel-arrow` : ''}
+${phaseSourceScript(artifact.quiverCommit)}` : ''}
 chmod 755 storage-spike
 ${artifact.transport === 'source-arm' ? '' : `printf '%s  storage-spike\\n' ${shellQuote(artifact.binarySha256)} | sha256sum --check`}
 node --version
 ./storage-spike --help
 ./storage-spike write --help | grep -q -- --barrier-before-ingest
+./storage-spike recover --help | grep -q -- --pause-before-drain
 dpkg-query -W aznfs
 timedatectl show -p NTPSynchronized
 printf 'GUEST_BINARY_SHA256:'
@@ -133,7 +147,9 @@ runuser -u spike -- env CARGO_TARGET_DIR=/var/lib/storage-spike/driver-target /h
 install -m 755 driver-target/release/storage-spike storage-spike.new
 mv storage-spike.new storage-spike
 cp ${shellQuote(`${source}/src/job.ts`)} job.ts
+${phaseSourceScript(artifact.quiverCommit)}
 ./storage-spike write --help | grep -q -- --barrier-before-ingest
+./storage-spike recover --help | grep -q -- --pause-before-drain
 printf 'GUEST_BINARY_SHA256:'
 sha256sum storage-spike | cut -d ' ' -f 1
 echo STORAGE_SPIKE_OK
@@ -172,15 +188,15 @@ export async function startJob(lab: Lab, vm: string, input: Pick<Request, 'mode'
   if (!/^[0-9a-f]{64}$/u.test(digests[vm] ?? '')) throw new Error('Guest binary provenance is missing.');
   const id = input.id ?? `job-${randomUUID()}`;
   if (!/^[a-z0-9-]{1,100}$/u.test(id)) throw new Error('Invalid job ID.');
-  const request: Request = { ...input, id, vm, nfsSource: inventory.nfsSource, stagingEndpoint: inventory.storageEndpoints[3].blob!, binarySha256: digests[vm], sourceArchiveSha256: artifact.sha256 };
+  const request: Request = { ...input, id, vm, nfsSource: inventory.nfsSource, stagingEndpoint: inventory.storageEndpoints[3].blob!, binarySha256: digests[vm], sourceArchiveSha256: artifact.sha256, quiverCommit: artifact.quiverCommit };
   await lab.save(`${id}-request.json`, request);
   const encoded = Buffer.from(JSON.stringify(request)).toString('base64');
   const script = `set -eu
 install -d -o spike -g spike -m 700 /var/lib/storage-spike/requests
 printf '%s' ${shellQuote(encoded)} | base64 -d > /var/lib/storage-spike/requests/${id}.json
 chown spike:spike /var/lib/storage-spike/requests/${id}.json
-systemd-run --unit storage-spike-${id} --property=User=spike --property=WorkingDirectory=/var/lib/storage-spike --property=RuntimeMaxSec=10800 --property=StandardOutput=journal --property=StandardError=journal /usr/local/bin/node --experimental-strip-types /var/lib/storage-spike/job.ts --request /var/lib/storage-spike/requests/${id}.json
-systemctl show storage-spike-${id} -p ActiveState -p ExecMainStatus
+systemd-run --unit storage-spike-${id} ${input.mode === 'phase-a' ? '--setenv=CARGO_BUILD_JOBS=2 --setenv=CARGO_PROFILE_DEV_DEBUG=0 --setenv=CARGO_PROFILE_TEST_DEBUG=0' : ''} --property=User=spike --property=PrivateMounts=yes --property=WorkingDirectory=/var/lib/storage-spike --property=RuntimeMaxSec=10800 --property=StandardOutput=journal --property=StandardError=journal /usr/local/bin/node --experimental-strip-types /var/lib/storage-spike/job.ts --request /var/lib/storage-spike/requests/${id}.json
+systemctl show storage-spike-${id} -p ActiveState -p ExecMainStatus -p Environment
 echo STORAGE_SPIKE_OK
 `;
   await lab.remote(vm, script, `start-${id}`);
