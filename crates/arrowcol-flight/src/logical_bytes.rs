@@ -150,7 +150,7 @@ mod tests {
 
         let all_valid = RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new("all_valid", DataType::Int32, false)])),
-            vec![all_valid_with_bitmap],
+            vec![Arc::new(all_valid_with_bitmap)],
         )
         .expect("all-valid record batch");
         assert_eq!(canonical_record_batch_logical_bytes(&all_valid), Ok(4));
