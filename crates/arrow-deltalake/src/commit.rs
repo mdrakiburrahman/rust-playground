@@ -1019,9 +1019,9 @@ fn publish_batch(
                         outcome: publication_outcome,
                         authoritative_version,
                         committed_file_indices: mapping
-                            .file_indices
+                            .transaction_files
                             .iter()
-                            .copied()
+                            .flat_map(|(_, _, _, indices)| indices.iter().copied())
                             .filter(|index| committed_file_indices.contains(index))
                             .collect(),
                     })
