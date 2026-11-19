@@ -15,7 +15,10 @@ use arrow_flight::sql::{CommandStatementUpdate, ProstMessageExt};
 use arrow_flight::{FlightData, FlightDescriptor};
 use arrow_schema::{DataType, Schema, SchemaRef, TimeUnit};
 use arrowcol_catalog::{DdlCommand, DdlParser};
-use arrowcol_flight::{DdlCompletionMetadata, DeliveryGuarantee, PutResultMetadata, decode_ddl_completion_metadata};
+use arrowcol_flight::{
+    DdlCompletionMetadata, DeliveryGuarantee, PutResultMetadata, canonical_record_batch_logical_bytes,
+    decode_ddl_completion_metadata,
+};
 const OAT_RUN_ID_ENV: &str = "ARROWCOL_OAT_RUN_ID";
 const OAT_RUN_ID_HEADER: &str = "x-arrowcol-oat-run-id";
 static CLIENT_SEND_OBSERVATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -58,6 +61,7 @@ pub mod client;
 
 const SCHEMA_DDL: &str = include_str!("../../../projects/loadtest/schemas/sqlserver.sql");
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
+const LOGICAL_PUBLICATION_ID_HEADER: &str = "x-arrowcol-logical-publication-id";
 
 pub struct DmvTable {
     ddl: String,
@@ -392,6 +396,7 @@ fn request_metadata<T>(
     table: &DmvTable,
     signer: Option<&EdgeRequestSigner>,
     observation: Option<&SendObservation>,
+    logical_publication_id: Option<&str>,
 ) -> Result<()> {
     let metadata = IngestMetadata::new(
         ProtocolVersion::CURRENT,
@@ -422,6 +427,12 @@ fn request_metadata<T>(
         headers.insert(
             http::header::HeaderName::from_static(CLIENT_SEND_UNIX_NS_HEADER),
             http::HeaderValue::try_from(observation.send_unix_ns.to_string())?,
+        );
+    }
+    if let Some(logical_publication_id) = logical_publication_id {
+        headers.insert(
+            http::header::HeaderName::from_static(LOGICAL_PUBLICATION_ID_HEADER),
+            http::HeaderValue::try_from(logical_publication_id)?,
         );
     }
     // Tonic sets this exact content type on the wire, after constructing the request.
@@ -486,7 +497,7 @@ async fn register_completion(
         flight_descriptor: Some(descriptor),
         ..FlightData::default()
     }]));
-    request_metadata(&mut request, table, signer, None)?;
+    request_metadata(&mut request, table, signer, None, None)?;
     let response = client.do_put(request).await?;
     let completion = decode_ddl_completion_metadata(response.metadata())?;
     let mut results = response.into_inner();
@@ -519,7 +530,7 @@ async fn put(
         .try_collect::<Vec<_>>()
         .await?;
     let mut request = Request::new(stream::iter(encoded));
-    request_metadata(&mut request, table, signer, None)?;
+    request_metadata(&mut request, table, signer, None, None)?;
     completed_admission(client.do_put(request).await?.into_inner()).await
 }
 
@@ -593,9 +604,11 @@ mod tests {
         let verifier = arrowcol_router_rust::EdgeVerifier::new(key, 30_000)?;
         for _ in 0..2 {
             let mut request = Request::new(());
-            request_metadata(&mut request, &table, Some(&signer), None)?;
+            let logical_publication_id = "11111111111111111111111111111111/22222222222222222222222222222222/3/7";
+            request_metadata(&mut request, &table, Some(&signer), None, Some(logical_publication_id))?;
             let headers = request.metadata().clone().into_headers();
             assert!(!headers.contains_key("x-arrowcol-shard"));
+            assert_eq!(headers[LOGICAL_PUBLICATION_ID_HEADER], logical_publication_id);
             let now = UnixMillis::new(u64::try_from(
                 SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
             )?)?;
@@ -626,7 +639,7 @@ mod tests {
         std::fs::remove_dir_all(&directory)?;
         let verifier = arrowcol_router_rust::EdgeVerifier::new(router_key?, 30_000)?;
         let mut request = Request::new(());
-        request_metadata(&mut request, &table, Some(&signer?), None)?;
+        request_metadata(&mut request, &table, Some(&signer?), None, None)?;
         assert!(!request.metadata().contains_key("x-arrowcol-shard"));
         let now = UnixMillis::new(u64::try_from(
             SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
