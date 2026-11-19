@@ -26,7 +26,7 @@ pub(crate) fn split_with_new_partition(
     let mut result = Vec::with_capacity(groups.len());
     for group in groups {
         on_new_partition(&group.values)?;
-        result.push(materialize_group(batch, group)?);
+        result.push(materialize_group(batch, &group)?);
     }
     Ok(result)
 }
