@@ -138,6 +138,10 @@ fn non_expired_version(version: i64, last_updated: Option<i64>, expiration_times
 
 #[cfg(test)]
 mod tests {
+    mod release_diagnostic {
+        include!("lookup_release_diagnostic.rs");
+    }
+
     use super::*;
     use std::fs;
     use std::path::PathBuf;
