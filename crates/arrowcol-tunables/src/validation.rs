@@ -1258,11 +1258,14 @@ fn validate_batching(batching: Option<&BatchingTunables>) -> Result<()> {
         effective_queue_capacity_bytes("collector.batching.per_table_capacity.bytes", table_bytes)?;
     for (name, value) in [
         ("collector.batching.global_capacity.bytes", global_bytes),
-        ("collector.batching.global_capacity.rows", global_rows),
-        ("collector.batching.global_capacity.batches", global_batches),
+        ("collector.batching.global_capacity.rows", u64::from(global_rows)),
+        ("collector.batching.global_capacity.batches", u64::from(global_batches)),
         ("collector.batching.per_table_capacity.bytes", table_bytes),
-        ("collector.batching.per_table_capacity.rows", table_rows),
-        ("collector.batching.per_table_capacity.batches", table_batches),
+        ("collector.batching.per_table_capacity.rows", u64::from(table_rows)),
+        (
+            "collector.batching.per_table_capacity.batches",
+            u64::from(table_batches),
+        ),
     ] {
         positive(name, Some(value))?;
     }
