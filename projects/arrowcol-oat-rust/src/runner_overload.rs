@@ -1029,6 +1029,64 @@ mod overload_guard_tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn guard_snapshot_dispatches_kubectl_inventory_concurrently() -> Result<()> {
+        struct InventoryTransport {
+            barrier: tokio::sync::Barrier,
+            deployment: Value,
+            sets: Value,
+            pods: Value,
+        }
+
+        #[async_trait::async_trait]
+        impl FixtureCommandTransport for InventoryTransport {
+            async fn exchange(&self, request: &FixtureCommandRequest) -> Result<FixtureCommandResponse> {
+                let stdout = if request.argv.iter().any(|arg| arg == "deployment") {
+                    &self.deployment
+                } else if request.argv.iter().any(|arg| arg == "replicasets") {
+                    &self.sets
+                } else if request.argv.iter().any(|arg| arg == "pods") {
+                    assert!(request.argv.iter().any(|arg| arg == "app=collector"));
+                    &self.pods
+                } else {
+                    bail!("unexpected inventory request");
+                };
+                self.barrier.wait().await;
+                Ok(FixtureCommandResponse {
+                    schema_version: 1,
+                    kind: "command_response".to_owned(),
+                    request_id: request.request_id,
+                    request_sha256: request.request_sha256.clone(),
+                    exit_code: 0,
+                    stdout: stdout.to_string(),
+                    stderr: String::new(),
+                    truncated: false,
+                })
+            }
+        }
+
+        let (mut config, deployment, sets, pods) = identity_inventory_fixture()?;
+        config.dfe_deployment = "collector".to_owned();
+        let boundary = FixtureBoundary {
+            authority: FixtureAuthority {
+                campaign_id: "test".to_owned(), cell_run_id: "test".to_owned(), owner_id: "test".to_owned(),
+                fencing_token: 1, namespace: "run".to_owned(), server: "https://offline.invalid".to_owned(),
+                context: "offline".to_owned(),
+            },
+            deadline_unix_ms: unix_time_ms_u64()? + 5_000,
+            sequence: std::sync::atomic::AtomicU64::new(1),
+            transport: Arc::new(InventoryTransport { barrier: tokio::sync::Barrier::new(3), deployment, sets, pods }),
+            responses: tokio::sync::Mutex::new(Vec::new()),
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            FIXTURE_BOUNDARY.scope(boundary, scale_out_collector_snapshot(&config, 1, Some("app=collector"))),
+        ).await.context("identity inventory did not dispatch concurrently")??;
+        assert_eq!(result.identities[0].pod_uid, "pod-uid");
+        assert_eq!(result.identities[0].container_id, "container-id");
+        Ok(())
+    }
+
     #[test]
     fn overload_cgroup_accounting_and_incremental_cursor_refuse_invented_limits() -> Result<()> {
         assert_eq!(guard_container_memory("0::/\n100\n1000\n", Some(1000))?.cap, 1000);
