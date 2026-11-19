@@ -747,6 +747,111 @@ impl PublicationBacklogSnapshot {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+struct DeltaExporterCapacity {
+    global_configured_bytes: u64,
+    global_effective_bytes: u64,
+    global_quantum_bytes: u64,
+    per_table_configured_bytes: u64,
+    per_table_effective_bytes: u64,
+    per_table_quantum_bytes: u64,
+}
+
+#[derive(Default)]
+struct DeltaExporterCapacityRegistry {
+    next_id: u64,
+    entries: HashMap<u64, DeltaExporterCapacity>,
+}
+
+impl DeltaExporterCapacityRegistry {
+    fn register(&mut self, capacity: DeltaExporterCapacity) -> Result<u64, String> {
+        if capacity.global_effective_bytes == 0
+            || capacity.per_table_effective_bytes == 0
+            || capacity.global_quantum_bytes == 0
+            || capacity.per_table_quantum_bytes == 0
+        {
+            return Err("Delta exporter byte capacity metrics must be positive".to_owned());
+        }
+        let id = self
+            .next_id
+            .checked_add(1)
+            .ok_or_else(|| "Delta exporter capacity registration overflow".to_owned())?;
+        self.next_id = id;
+        self.entries.insert(id, capacity);
+        Ok(id)
+    }
+
+    fn snapshot(&self) -> DeltaExporterCapacity {
+        self.entries
+            .values()
+            .copied()
+            .fold(DeltaExporterCapacity::default(), |mut max, current| {
+                max.global_configured_bytes = max.global_configured_bytes.max(current.global_configured_bytes);
+                max.global_effective_bytes = max.global_effective_bytes.max(current.global_effective_bytes);
+                max.global_quantum_bytes = max.global_quantum_bytes.max(current.global_quantum_bytes);
+                max.per_table_configured_bytes = max.per_table_configured_bytes.max(current.per_table_configured_bytes);
+                max.per_table_effective_bytes = max.per_table_effective_bytes.max(current.per_table_effective_bytes);
+                max.per_table_quantum_bytes = max.per_table_quantum_bytes.max(current.per_table_quantum_bytes);
+                max
+            })
+    }
+}
+
+impl DeltaExporterCapacity {
+    fn write(&self, output: &mut String) {
+        for (name, help, value) in [
+            (
+                "arrowcol_delta_exporter_global_capacity_configured_bytes",
+                "Largest configured global Arrow byte capacity among active Delta exporters.",
+                self.global_configured_bytes,
+            ),
+            (
+                "arrowcol_delta_exporter_global_capacity_effective_bytes",
+                "Largest effective global Arrow byte capacity among active Delta exporters.",
+                self.global_effective_bytes,
+            ),
+            (
+                "arrowcol_delta_exporter_global_capacity_quantum_bytes",
+                "Largest byte-admission quantum among active global Delta exporter capacities.",
+                self.global_quantum_bytes,
+            ),
+            (
+                "arrowcol_delta_exporter_per_table_capacity_configured_bytes",
+                "Largest configured per-table Arrow byte capacity among active Delta exporters.",
+                self.per_table_configured_bytes,
+            ),
+            (
+                "arrowcol_delta_exporter_per_table_capacity_effective_bytes",
+                "Largest effective per-table Arrow byte capacity among active Delta exporters.",
+                self.per_table_effective_bytes,
+            ),
+            (
+                "arrowcol_delta_exporter_per_table_capacity_quantum_bytes",
+                "Largest byte-admission quantum among active per-table Delta exporter capacities.",
+                self.per_table_quantum_bytes,
+            ),
+        ] {
+            let _ = writeln!(output, "# HELP {name} {help}");
+            let _ = writeln!(output, "# TYPE {name} gauge");
+            let _ = writeln!(output, "{name} {value}");
+        }
+    }
+}
+
+#[must_use = "keep the capacity registration alive while its exporter is active"]
+pub(crate) struct DeltaExporterCapacityGuard {
+    metrics: Weak<RuntimeMetrics>,
+    registration_id: u64,
+}
+
+impl Drop for DeltaExporterCapacityGuard {
+    fn drop(&mut self) {
+        if let Some(metrics) = self.metrics.upgrade() {
+            metrics.delta_exporter_capacity().entries.remove(&self.registration_id);
+        }
+    }
+}
+
 #[derive(Clone)]
 struct PublicationBacklogEntry {
     token: PublicationBacklogToken,
@@ -1028,6 +1133,7 @@ pub struct RuntimeMetrics {
     buffered_batches: AtomicU64,
     pending_commits: AtomicU64,
     publication_backlog: Mutex<PublicationBacklog>,
+    delta_exporter_capacity: Mutex<DeltaExporterCapacityRegistry>,
     admitted_streams: AtomicU64,
     aborted_streams: AtomicU64,
     downstream_acks: AtomicU64,
@@ -1080,6 +1186,7 @@ impl RuntimeMetrics {
             buffered_batches: AtomicU64::new(0),
             pending_commits: AtomicU64::new(0),
             publication_backlog: Mutex::new(PublicationBacklog::default()),
+            delta_exporter_capacity: Mutex::new(DeltaExporterCapacityRegistry::default()),
             admitted_streams: AtomicU64::new(0),
             aborted_streams: AtomicU64::new(0),
             downstream_acks: AtomicU64::new(0),
@@ -1120,6 +1227,12 @@ impl RuntimeMetrics {
         })
     }
 
+    fn delta_exporter_capacity(&self) -> std::sync::MutexGuard<'_, DeltaExporterCapacityRegistry> {
+        self.delta_exporter_capacity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Registers one backend's admission capacity in the process-wide tracking bound.
     ///
     /// Retain the returned guard for the backend and its in-flight publications. Multiple
@@ -1134,6 +1247,30 @@ impl RuntimeMetrics {
     ) -> Result<Arc<PublicationBacklogCapacityGuard>, String> {
         let registration_id = self.publication_backlog().register_capacity(max_publications)?;
         Ok(Arc::new(PublicationBacklogCapacityGuard {
+            metrics: Arc::downgrade(self),
+            registration_id,
+        }))
+    }
+
+    pub(crate) fn register_delta_exporter_capacity(
+        self: &Arc<Self>,
+        global_configured_bytes: u64,
+        global_effective_bytes: u64,
+        global_quantum_bytes: u64,
+        per_table_configured_bytes: u64,
+        per_table_effective_bytes: u64,
+        per_table_quantum_bytes: u64,
+    ) -> Result<Arc<DeltaExporterCapacityGuard>, String> {
+        let capacity = DeltaExporterCapacity {
+            global_configured_bytes,
+            global_effective_bytes,
+            global_quantum_bytes,
+            per_table_configured_bytes,
+            per_table_effective_bytes,
+            per_table_quantum_bytes,
+        };
+        let registration_id = self.delta_exporter_capacity().register(capacity)?;
+        Ok(Arc::new(DeltaExporterCapacityGuard {
             metrics: Arc::downgrade(self),
             registration_id,
         }))
@@ -1770,6 +1907,7 @@ impl RuntimeMetrics {
     pub fn prometheus(&self) -> String {
         let mut output = String::new();
         self.publication_backlog_snapshot().write(&mut output);
+        self.delta_exporter_capacity().snapshot().write(&mut output);
         self.otel.record_pressure(
             self.buffered_rows.load(Ordering::Acquire),
             self.buffered_batches.load(Ordering::Acquire),
@@ -2700,6 +2838,24 @@ mod tests {
         assert!(exposition.lines().any(|line| {
             line.starts_with("arrowcol_pipeline_submission_wait_seconds_sum{") && line.ends_with(" 0.012")
         }));
+    }
+
+    #[test]
+    fn prometheus_reports_active_effective_delta_capacity_and_unregisters() {
+        let metrics = Arc::new(RuntimeMetrics::new(CollectorInstanceId::new()));
+        let guard = metrics
+            .register_delta_exporter_capacity(4097, 4096, 1024, 2049, 2048, 1024)
+            .expect("capacity registration");
+        let output = metrics.prometheus();
+        assert!(output.contains("arrowcol_delta_exporter_global_capacity_configured_bytes 4097"));
+        assert!(output.contains("arrowcol_delta_exporter_global_capacity_effective_bytes 4096"));
+        assert!(output.contains("arrowcol_delta_exporter_per_table_capacity_effective_bytes 2048"));
+        assert!(output.contains("arrowcol_delta_exporter_per_table_capacity_quantum_bytes 1024"));
+
+        drop(guard);
+        let output = metrics.prometheus();
+        assert!(output.contains("arrowcol_delta_exporter_global_capacity_effective_bytes 0"));
+        assert!(output.contains("arrowcol_delta_exporter_per_table_capacity_effective_bytes 0"));
     }
 
     #[test]

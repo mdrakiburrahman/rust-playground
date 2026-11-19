@@ -29,7 +29,9 @@ use crate::DeltaExporterConfig;
 use crate::byte_capacity::{ByteCapacity, BytePermit};
 use crate::config::{BatchCapacity, FileBatchConfig, config_error, parse_config, table_path};
 use crate::envelope::{ArrowcolBatchEnvelope, DecodedArrowBatch, EnvelopeError, decode_record_set};
-use crate::metrics::{FlushReason, PipelineStage, RuntimeMetrics, StageMetrics, global_metrics};
+use crate::metrics::{
+    DeltaExporterCapacityGuard, FlushReason, PipelineStage, RuntimeMetrics, StageMetrics, global_metrics,
+};
 use crate::routing::{
     AuthorityClient, ExportingProcess, LEASE_VIEW_TTL, LeaseBinder, LeaseBinding, LeaseEvidence,
     RoutingPublicationFence,
@@ -71,12 +73,18 @@ impl GenericDeltaExporter {
         let backlog_capacity = metrics
             .register_publication_backlog_capacity(config.batching.global_capacity.batches)
             .map_err(|error| format!("configure durable publication backlog: {error}"))?;
+        let byte_capacity_metrics = register_delta_byte_capacity_metrics(
+            &metrics,
+            config.batching.global_capacity,
+            config.batching.per_table_capacity,
+        )?;
         let authority =
             AuthorityClient::start(Arc::clone(&store), config.authority_timeout, options.max_pending_files)?;
         let backend = Arc::new(DeltaBackend {
             configuration: Some(config.clone()),
             base_path: config.base_path.clone(),
             options,
+            byte_capacity_metrics,
             batching: config.batching.clone(),
             capacity: Capacity::new(config.batching.global_capacity).map_err(|error| error.to_string())?,
             flush_slots: Arc::new(Semaphore::new(config.batching.max_concurrent_flushes)),
@@ -125,6 +133,8 @@ impl GenericDeltaExporter {
         let backlog_capacity = metrics
             .register_publication_backlog_capacity(batching.global_capacity.batches)
             .map_err(|error| format!("configure durable publication backlog: {error}"))?;
+        let byte_capacity_metrics =
+            register_delta_byte_capacity_metrics(&metrics, batching.global_capacity, batching.per_table_capacity)?;
         Ok(Self {
             backend: Arc::new(DeltaBackend {
                 configuration: None,
@@ -136,6 +146,7 @@ impl GenericDeltaExporter {
                 )?,
                 leases: LeaseBinder::new(store, LEASE_VIEW_TTL),
                 options,
+                byte_capacity_metrics,
                 capacity: Capacity::new(batching.global_capacity)?,
                 flush_slots: Arc::new(Semaphore::new(batching.max_concurrent_flushes)),
                 batching,
@@ -215,6 +226,23 @@ impl GenericDeltaExporter {
     }
 }
 
+fn register_delta_byte_capacity_metrics(
+    metrics: &Arc<RuntimeMetrics>,
+    global: BatchCapacity,
+    per_table: BatchCapacity,
+) -> Result<Arc<DeltaExporterCapacityGuard>, String> {
+    let global_bytes = ByteCapacity::new(global.bytes).map_err(|error| error.to_string())?;
+    let per_table_bytes = ByteCapacity::new(per_table.bytes).map_err(|error| error.to_string())?;
+    metrics.register_delta_exporter_capacity(
+        global.bytes,
+        global_bytes.effective_limit_bytes(),
+        global_bytes.quantum_bytes(),
+        per_table.bytes,
+        per_table_bytes.effective_limit_bytes(),
+        per_table_bytes.quantum_bytes(),
+    )
+}
+
 struct DeltaBackend {
     configuration: Option<DeltaExporterConfig>,
     base_path: PathBuf,
@@ -226,6 +254,7 @@ struct DeltaBackend {
     authority: AuthorityClient,
     leases: LeaseBinder,
     backlog_capacity: Arc<crate::metrics::PublicationBacklogCapacityGuard>,
+    byte_capacity_metrics: Arc<DeltaExporterCapacityGuard>,
     metrics: Arc<RuntimeMetrics>,
     tables: tokio::sync::Mutex<HashMap<arrowcol_protocol::TableIdentity, Arc<TableOwner>>>,
     #[cfg(test)]

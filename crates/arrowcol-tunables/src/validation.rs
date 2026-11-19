@@ -2858,6 +2858,36 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn queue_byte_capacities_accept_u64_and_validate_effective_limits() -> Result<()> {
+        let gib = 1_u64 << 30;
+        let valid = Tunables::parse_oat_json(serde_json::json!({"collector":{"batching":{
+            "global_capacity":{"bytes":8 * gib + 1},
+            "per_table_capacity":{"bytes":4 * gib + 1},
+            "max_arrow_memory_per_flush":4 * gib
+        }}}))?;
+        let env = valid.environment_for(ComponentRole::Collector)?;
+        let batching: Value = serde_json::from_str(&env["ARROWCOL_COLLECTOR_BATCHING_CONFIG"])?;
+        assert_eq!(batching["global_capacity"]["bytes"], 8 * gib + 1);
+        assert_eq!(batching["per_table_capacity"]["bytes"], 4 * gib + 1);
+
+        assert!(
+            Tunables::parse_oat_json(serde_json::json!({"collector":{"batching":{
+                "global_capacity":{"bytes":8 * gib + 1},
+                "per_table_capacity":{"bytes":4 * gib + 1},
+                "max_arrow_memory_per_flush":4 * gib + 1
+            }}}))
+            .is_err()
+        );
+        assert!(
+            Tunables::parse_oat_json(serde_json::json!({"collector":{"batching":{
+                "global_capacity":{"bytes":u64::MAX}
+            }}}))
+            .is_err()
+        );
+        Ok(())
+    }
+
     fn collector_projection_uses_consumer_config_blobs_and_runtime_names() -> Result<()> {
         let tunables = Tunables {
             collector: Some(CollectorTunables {
