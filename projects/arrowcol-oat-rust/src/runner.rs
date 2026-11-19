@@ -2465,6 +2465,36 @@ fn write_private_secret(path: &Path, contents: &str) -> Result<()> {
     }
 }
 
+fn resolved_fleet_client_config(config: &OatConfig, index: usize) -> Result<OatConfig> {
+    let mut resolved = config.clone();
+    if let Some(fleet) = &config.platform.fleet {
+        let client = fleet.clients.get(index).context("fleet client placement is missing")?;
+        resolved.rows_per_table = client.rows_per_table;
+        resolved.dmv_concurrency = client.dmv_concurrency;
+        resolved.tunables.client = Some(client.tunables.clone());
+        resolved.platform.resources.get_or_insert_with(Default::default).client =
+            Some(client.placement.resources.clone());
+    }
+    Ok(resolved)
+}
+
+fn configure_fleet_client_placement(job: &mut Value, config: &OatConfig, index: usize) -> Result<()> {
+    if let Some(fleet) = &config.platform.fleet {
+        let client = fleet.clients.get(index).context("fleet client placement is missing")?;
+        job["spec"]["template"]["spec"]["nodeSelector"] = json!({
+            "arrow-collector/role": "client",
+            "kubernetes.azure.com/agentpool": client.placement.pool,
+            "kubernetes.io/hostname": client.placement.node,
+            "kubernetes.io/arch": "amd64",
+        });
+        job["spec"]["template"]["spec"]
+            .as_object_mut()
+            .context("client pod spec is missing")?
+            .remove("topologySpreadConstraints");
+    }
+    Ok(())
+}
+
 async fn start_aks_client_job(
     config: &OatConfig,
     platform: &mut AksPlatform,
@@ -2493,6 +2523,11 @@ async fn start_aks_client_job(
         args,
         run_seconds,
     });
+    configure_fleet_client_placement(
+        &mut job,
+        config,
+        client_index.checked_sub(1).context("client index must be positive")?,
+    )?;
     let client_resources = config.effective_aks_resources().client;
     configure_client_job_resources(&mut job, &client_resources)?;
     inject_container_environment(
@@ -2524,6 +2559,15 @@ async fn start_aks_client_job(
         .context("applied AKS client Job has no containers")?;
     let job_resources = verify_container_resources(job_containers, "client", "client", &client_resources)?;
     let pod = wait_for_aks_client_pod_resource_readback(config, &job_name, &client_resources).await?;
+    if let Some(fleet) = &config.platform.fleet {
+        let client = fleet
+            .clients
+            .get(client_index - 1)
+            .context("fleet client placement is missing")?;
+        if pod["node"].as_str() != Some(client.placement.node.as_str()) {
+            bail!("fleet client was scheduled on a node other than its resolved placement");
+        }
+    }
     platform.resource_readback.push(json!({
         "role": "client",
         "job": job_name,
@@ -2584,7 +2628,7 @@ fn build_aks_client_job(spec: AksClientJobSpec<'_>) -> Value {
                     "restartPolicy": "Never",
                     "terminationGracePeriodSeconds": 10,
                     "automountServiceAccountToken": false,
-                    "nodeSelector": { "arrow-collector/role": "client" },
+                    "nodeSelector": { "arrow-collector/role": "client", "kubernetes.io/arch": "amd64" },
                     "tolerations": [{
                         "key": "arrow-collector/role",
                         "operator": "Equal",
@@ -2760,6 +2804,15 @@ async fn poll_aks_client_job(config: &OatConfig, handle: &ClientHandle) -> Resul
     })
 }
 
+// Published clients emit large prepared metrics before READY, then ACK as their
+// last pre-start line. Selecting one line keeps byte limits from hiding either.
+const AKS_CLIENT_HANDSHAKE_TAIL: &str = "--tail=1";
+
+fn aks_client_handshake_progress(output: &str) -> (bool, bool) {
+    let acknowledged = output.contains("OAT_SCHEDULE_RECEIVED ");
+    (acknowledged || output.contains("OAT_CLIENT_READY "), acknowledged)
+}
+
 async fn poll_aks_client_fleet(
     config: &OatConfig,
     platform: &AksPlatform,
@@ -2821,8 +2874,10 @@ async fn poll_aks_client_fleet(
             &selector,
             "--all-containers=true",
             "--prefix=true",
-            "--tail=-1",
+            AKS_CLIENT_HANDSHAKE_TAIL,
+            "--limit-bytes=16384",
             "--ignore-errors=true",
+            "--max-log-requests=16",
         ],
         None,
     )
@@ -2843,9 +2898,10 @@ async fn poll_aks_client_fleet(
         let output = aks_client_job_log_payloads(&logs, job_name)
             .collect::<Vec<_>>()
             .join("\n");
+        let (ready, schedule_received) = aks_client_handshake_progress(&output);
         progress.push(ClientProgress {
-            ready: output.contains("OAT_CLIENT_READY "),
-            schedule_received: output.contains("OAT_SCHEDULE_RECEIVED "),
+            ready,
+            schedule_received,
             completed,
             failure: failed.then(|| format!("AKS DMV client Job {job_name} failed: {output}")),
             output,
@@ -2883,6 +2939,49 @@ fn aks_fleet_log_prefix_never_credits_another_client_with_readiness_or_schedule(
         aks_client_job_log_payloads(logs, "oat-run-hot-c10").collect::<Vec<_>>(),
         ["OAT_CLIENT_READY 10", "OAT_SCHEDULE_RECEIVED 10"]
     );
+    let logs = (1..=128)
+        .map(|index| format!("[pod/oat-run-hot-c{index}-abc12/client] OAT_CLIENT_READY {index}\n"))
+        .collect::<String>();
+    for index in 1..=128 {
+        assert_eq!(
+            aks_client_job_log_payloads(&logs, &format!("oat-run-hot-c{index}")).collect::<Vec<_>>(),
+            [format!("OAT_CLIENT_READY {index}")]
+        );
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn aks_fleet_handshake_survives_large_prepared_receipts() -> Result<()> {
+    let tail: usize = AKS_CLIENT_HANDSHAKE_TAIL.trim_start_matches("--tail=").parse()?;
+    let prepared = format!(
+        "[pod/oat-run-hot-c10-abc12/client] OAT_CLIENT_METRICS {}\n",
+        "x".repeat(128 * 1024)
+    );
+    let ready = "[pod/oat-run-hot-c10-abc12/client] OAT_CLIENT_READY client_id=10\n";
+    let ack = "[pod/oat-run-hot-c10-abc12/client] OAT_SCHEDULE_RECEIVED client_id=10\n";
+    for (stream, expected) in [
+        (prepared.clone(), (false, false)),
+        (format!("{prepared}{ready}"), (true, false)),
+        (format!("{prepared}{ready}{ack}"), (true, true)),
+    ] {
+        let lines = stream.lines().collect::<Vec<_>>();
+        let selected = lines[lines.len().saturating_sub(tail)..].join("\n");
+        let bounded = &selected[..selected.len().min(16384)];
+        let output = aks_client_job_log_payloads(bounded, "oat-run-hot-c10")
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(aks_client_handshake_progress(&output), expected);
+        assert_eq!(
+            aks_client_handshake_progress(
+                &aks_client_job_log_payloads(bounded, "oat-run-hot-c1")
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+            (false, false)
+        );
+    }
+    Ok(())
 }
 
 async fn finish_aks_client_job(config: &OatConfig, handle: ClientHandle) -> Result<String> {
@@ -4476,6 +4575,25 @@ fn result_rows(
             tunables_json: serde_json::to_string(&table_tunables)?,
             evidence_json: {
                 let mut evidence = client_run.evidence.for_table(&table, client);
+                if let Some(fleet) = &config.platform.fleet {
+                    let mut pool_rates = BTreeMap::<String, f64>::new();
+                    for report in client_run.evidence.client_reports.get(&table).into_iter().flatten() {
+                        if let Some((pool, rate)) = report.pointer("/placement/pool").and_then(Value::as_str)
+                            .zip(report["rows_per_second"].as_f64()) {
+                            *pool_rates.entry(pool.to_owned()).or_default() += rate;
+                        }
+                    }
+                    evidence["fleet"] = json!({
+                        "placement": fleet,
+                        "collector_allocatable_cores": fleet.collector.allocatable_cpu_millicores as f64 / 1000.0,
+                        "collector_allocatable_memory_bytes": fleet.collector.allocatable_memory_bytes,
+                        "client_allocatable_cores": fleet.clients.iter().map(|client| client.placement.allocatable_cpu_millicores as f64 / 1000.0).sum::<f64>(),
+                        "client_allocatable_memory_bytes": fleet.clients.iter().map(|client| u128::from(client.placement.allocatable_memory_bytes)).sum::<u128>(),
+                        "node_count": fleet.clients.len() + 1,
+                        "client_pool_rows_per_second": pool_rates,
+                        "per_pool_rate_scope": "client_completed_admitted_rows_not_collector_committed_rows",
+                    });
+                }
                 if exploratory {
                     let output = evidence["commit_window_output_throughput"].clone();
                     let seconds = output["window_seconds"].as_f64();
@@ -4758,15 +4876,16 @@ async fn run_clients_inner(
     let mut handles = Vec::with_capacity(tables.len().saturating_mul(config.clients_per_table));
     for table in tables {
         for client_index in 0..config.clients_per_table {
+            let client_config = resolved_fleet_client_config(config, client_index)?;
             let mut arguments = vec![
                 "--endpoint".to_owned(),
                 platform.workload_endpoint(config),
                 "--client-id".to_owned(),
-                format!("oat-{project_run_id}-{table}-c{client_index}"),
+                format!("oat-{project_run_id}-{table}-c{}", client_index + 1),
                 "--rows".to_owned(),
-                config.rows_per_table.to_string(),
+                client_config.rows_per_table.to_string(),
                 "--concurrency".to_owned(),
-                config.dmv_concurrency.to_string(),
+                client_config.dmv_concurrency.to_string(),
                 "--table".to_owned(),
                 table.clone(),
                 "--edge-secret-file".to_owned(),
@@ -4788,7 +4907,7 @@ async fn run_clients_inner(
                 arguments.push("--pilot".to_owned());
             }
             match platform
-                .start_client(config, project_run_id, table, client_index + 1, &arguments)
+                .start_client(&client_config, project_run_id, table, client_index + 1, &arguments)
                 .await
             {
                 Ok(handle) => handles.push(handle),
@@ -5113,7 +5232,8 @@ async fn run_clients_inner(
                         };
                     }
                 };
-                if let Err(error) = evidence.record_client(config, &handle.table, &output) {
+                let effective_client_config = resolved_fleet_client_config(config, index % config.clients_per_table)?;
+                if let Err(error) = evidence.record_client(&effective_client_config, &handle.table, &output) {
                     let cleanup = cancel_active_clients(platform, config, &handles, &active_clients).await;
                     return match cleanup {
                         Ok(()) => Err(error),
@@ -5121,6 +5241,18 @@ async fn run_clients_inner(
                             "cancelling clients after invalid effective-config evidence failed: {cleanup_error:#}"
                         ))),
                     };
+                }
+                if let Some(report) = evidence
+                    .client_reports
+                    .get_mut(&handle.table)
+                    .and_then(|reports| reports.last_mut())
+                {
+                    report["client_id"] = json!(handle.client_id);
+                    report["rows_per_second"] = json!(measurement.metrics.rows_per_second);
+                    report["rows"] = json!(measurement.metrics.rows);
+                    if let Some(fleet) = &config.platform.fleet {
+                        report["placement"] = serde_json::to_value(&fleet.clients[index].placement)?;
+                    }
                 }
                 client_metrics
                     .entry(handle.table.clone())
@@ -7024,6 +7156,11 @@ async fn run_aks_pin_setup_job(
             },
         }],
     });
+    if let Some(fleet) = &config.platform.fleet {
+        let selector = &mut payload_items["items"][1]["spec"]["template"]["spec"]["nodeSelector"];
+        selector["kubernetes.azure.com/agentpool"] = json!(fleet.collector.pool);
+        selector["kubernetes.io/hostname"] = json!(fleet.collector.node);
+    }
     if run_table_identity {
         let template = payload_items
             .pointer_mut("/items/1/spec/template")
@@ -9998,6 +10135,10 @@ async fn prepare_aks_platform(
     runtime_config["effective_stop_budgets"] = serde_json::to_value(config.maintenance_stop_budget()?)?;
     runtime_config["resources"] = serde_json::to_value(config.effective_aks_resources())?;
     project_scale_out_runtime(&mut runtime_config, config, replicas)?;
+    if let Some(fleet) = &config.platform.fleet {
+        runtime_config["collectorPool"] = json!(fleet.collector.pool);
+        runtime_config["collectorNode"] = json!(fleet.collector.node);
+    }
     runtime_config["collectorWorkers"] = json!(
         config
             .dfe_worker_concurrency
@@ -17442,6 +17583,56 @@ mod tests {
 #[cfg(test)]
 mod aks_resource_readback_tests {
     use super::*;
+
+    #[test]
+    fn heterogeneous_clients_keep_per_node_resources_tunables_and_exact_placement() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        let placement = |node: &str, cores: u64| {
+            json!({
+                "node": node, "pool": "clientpool", "sku": "Standard_D8s_v6",
+                "allocatable_cpu_millicores": cores * 1000, "allocatable_memory_bytes": cores * (1_u64 << 30),
+                "resources": { "requests": { "cpu": cores.to_string(), "memory": "1Gi" },
+                    "limits": { "cpu": cores.to_string(), "memory": "1Gi" } }
+            })
+        };
+        config.platform.fleet = Some(serde_json::from_value(json!({
+            "collector": placement("collector", 64),
+            "clients": [
+                {"placement": placement("node-small", 4), "rows_per_table": 4096, "dmv_concurrency": 4,
+                    "tunables": {"workers": 3, "runtime_threads": 3}},
+                {"placement": placement("node-large", 8), "rows_per_table": 8192, "dmv_concurrency": 8,
+                    "tunables": {"workers": 7, "runtime_threads": 7}}
+            ],
+            "pools": []
+        }))?);
+        for (index, node, rows, workers, cores) in [(0, "node-small", 4096, 3, "4"), (1, "node-large", 8192, 7, "8")] {
+            let resolved = resolved_fleet_client_config(&config, index)?;
+            assert_eq!(resolved.rows_per_table, rows);
+            assert_eq!(
+                resolved.tunables.client.as_ref().and_then(|client| client.workers),
+                Some(workers)
+            );
+            assert_eq!(
+                resolved.effective_aks_resources().client.requests.cpu.as_deref(),
+                Some(cores)
+            );
+            let mut job = json!({"spec":{"template":{"spec":{"topologySpreadConstraints":[]}}}});
+            configure_fleet_client_placement(&mut job, &resolved, index)?;
+            assert_eq!(
+                job["spec"]["template"]["spec"]["nodeSelector"]["kubernetes.io/hostname"],
+                node
+            );
+            assert_eq!(
+                job["spec"]["template"]["spec"]["nodeSelector"]["kubernetes.azure.com/agentpool"],
+                "clientpool"
+            );
+            assert!(job.pointer("/spec/template/spec/topologySpreadConstraints").is_none());
+        }
+        assert!(resolved_fleet_client_config(&config, 2).is_err());
+        Ok(())
+    }
 
     fn requirements() -> ResourceRequirements {
         ResourceRequirements {

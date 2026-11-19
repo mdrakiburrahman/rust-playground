@@ -35,6 +35,8 @@ export interface RuntimeConfig {
   hotTable?: string;
   collectorReplicas?: number;
   routerReplicas?: number;
+  collectorPool?: string;
+  collectorNode?: string;
 }
 type Resource = Record<string, any>;
 export type Phase = 'identity' | 'foundation' | 'bootstrap' | 'workload';
@@ -50,7 +52,7 @@ const defaultResources: Record<RuntimeResourceRole, ResourceRequirements | Colle
   catalog: { requests: { cpu: '500m', memory: '1Gi' }, limits: { cpu: '2', memory: '4Gi' } },
 };
 
-function cpuMilli(value: unknown): bigint {
+export function cpuMilli(value: unknown): bigint {
   if (typeof value !== 'string') throw new Error('resource cpu quantities must be strings');
   const match = /^(?:([0-9]+)m|([0-9]+)(?:[.]([0-9]{1,3}))?)$/.exec(value);
   if (!match) throw new Error('resource cpu must be a positive Kubernetes CPU quantity');
@@ -59,7 +61,7 @@ function cpuMilli(value: unknown): bigint {
   return milli;
 }
 
-function memoryBytes(value: unknown): bigint {
+export function memoryBytes(value: unknown): bigint {
   if (typeof value !== 'string') throw new Error('resource memory quantities must be strings');
   const match = /^([0-9]+)(Ei|Pi|Ti|Gi|Mi|Ki|E|P|T|G|M|k)?$/.exec(value);
   if (!match) throw new Error('resource memory must be an integer Kubernetes byte quantity');
@@ -98,11 +100,16 @@ export function validateRuntime(input: unknown, allowUnpublishedImages = false):
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('runtime config must be an object');
   const c = input as RuntimeConfig;
   const required = ['deltaRoot', 'effective_stop_budgets', 'images', 'namespace', 'oatRunId', 'workloadIdentityClientId', 'subscriptionId', 'stamp'];
-  if (required.some((key) => !Object.hasOwn(c, key)) || Object.keys(c).some((key) => ![...required, 'serviceAccount', 'maintenance', 'quiver', 'resources', 'collectorWorkers', 'campaignProfile', 'hotTable', 'collectorReplicas', 'routerReplicas'].includes(key))) {
+  if (required.some((key) => !Object.hasOwn(c, key)) || Object.keys(c).some((key) => ![...required, 'serviceAccount', 'maintenance', 'quiver', 'resources', 'collectorWorkers', 'campaignProfile', 'hotTable', 'collectorReplicas', 'routerReplicas', 'collectorPool', 'collectorNode'].includes(key))) {
     throw new Error('runtime config has missing or unknown fields');
   }
   parseEffectiveStopBudgets(c.effective_stop_budgets);
   const scaleOut = c.campaignProfile === 'scale_out_single_table';
+  if (Object.hasOwn(c, 'collectorPool') || Object.hasOwn(c, 'collectorNode')) {
+    if (!scaleOut || typeof c.collectorPool !== 'string' || !/^[a-z][a-z0-9]{0,11}$/.test(c.collectorPool) ||
+        typeof c.collectorNode !== 'string' || !/^[a-z0-9][a-z0-9.-]{0,252}$/.test(c.collectorNode))
+      throw new Error('fleet runtime requires explicit collectorPool and collectorNode in a scale-out cell');
+  }
   if (Object.hasOwn(c, 'campaignProfile') && !scaleOut) throw new Error('campaignProfile must be scale_out_single_table');
   if (!scaleOut && ['hotTable', 'collectorReplicas', 'routerReplicas'].some(key => Object.hasOwn(c, key)))
     throw new Error('scale-out fields require campaignProfile scale_out_single_table');
@@ -217,7 +224,8 @@ export async function renderRuntime(input: unknown, phase: Phase): Promise<Resou
     spec: {
       serviceAccountName: serviceAccount, automountServiceAccountToken: false,
       enableServiceLinks: false,
-      nodeSelector: { 'arrow-collector/role': 'arrowcol', 'kubernetes.io/arch': 'amd64' },
+      nodeSelector: { 'arrow-collector/role': 'arrowcol', 'kubernetes.io/arch': 'amd64',
+        ...(c.collectorPool ? { 'kubernetes.azure.com/agentpool': c.collectorPool, 'kubernetes.io/hostname': c.collectorNode } : {}) },
       tolerations: [{
         key: 'arrow-collector/role', operator: 'Equal', value: 'arrowcol', effect: 'NoSchedule',
       }],

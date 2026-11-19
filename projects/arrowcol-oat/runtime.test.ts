@@ -29,6 +29,21 @@ const scaleOutConfig = (): RuntimeConfig => {
   return c;
 };
 
+test('fleet runtime pins the collector and support topology to the explicitly selected node and pool', async () => {
+  const c = { ...scaleOutConfig(), collectorPool: 'hugepool', collectorNode: 'aks-hugepool-123-vmss000000' };
+  for (const phase of ['foundation', 'bootstrap', 'workload'] as const) {
+    const objects = await renderRuntime(c, phase);
+    for (const object of objects.filter(resource => resource.kind === 'Deployment' || resource.kind === 'Job')) {
+      assert.deepEqual(object.spec.template.spec.nodeSelector, {
+        'arrow-collector/role': 'arrowcol', 'kubernetes.io/arch': 'amd64',
+        'kubernetes.azure.com/agentpool': c.collectorPool, 'kubernetes.io/hostname': c.collectorNode,
+      });
+    }
+  }
+  assert.throws(() => validateRuntime({ ...c, collectorNode: undefined }), /explicit/);
+  assert.throws(() => validateRuntime({ ...config(), collectorPool: c.collectorPool, collectorNode: c.collectorNode }), /explicit/);
+});
+
 
 test('rejects mutable images, QAP namespace, wrong stamp and unknown fields', () => {
   assert.throws(() => validateRuntime({ ...config(), namespace: 'azure-qap' }));

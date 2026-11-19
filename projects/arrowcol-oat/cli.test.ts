@@ -1,14 +1,21 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { main } from './cli.js';
 import { resolveOatConfigPath } from './launch.js';
+import { main as fleetMain } from './aks-fleet-cli.js';
+import { Config, ROOT } from '../../infra/azure/bootstrap.js';
+import { defaultStampConfig } from '../../infra/azure/stamp.js';
+import { stringify } from 'yaml';
+import type { FleetBinding, FleetIntentAuthority } from './aks-fleet-custody.js';
+import type { createFleetAdapter } from './aks-fleet-provider.js';
 
 test('AKS subcommands lazily dispatch only the selected module with its arguments and runner', async () => {
-  for (const subcommand of ['destroy', 'deploy', 'setup']) {
+  for (const subcommand of ['destroy', 'deploy', 'setup', 'scale', 'fleet']) {
     const calls: string[] = [];
     const runner = async () => { throw new Error('routing must not invoke a command'); };
     await main(['aks', subcommand, '--stamp', '12345'], runner, async (selected) => {
@@ -26,7 +33,7 @@ test('missing and unknown AKS subcommands exit with usage instead of launching a
   for (const args of [['aks'], ['aks', 'unknown']]) {
     const result = spawnSync(process.execPath, ['projects/arrowcol-oat/cli.mjs', ...args], { encoding: 'utf8' });
     assert.equal(result.status, 2);
-    assert.match(result.stderr, /Usage: arrowcol-oat aks <destroy\|deploy\|setup\|scale>/);
+    assert.match(result.stderr, /Usage: arrowcol-oat aks <destroy\|deploy\|setup\|scale\|fleet>/);
     assert.equal(result.stdout, '');
   }
 });
@@ -71,4 +78,108 @@ test('aks scale is reachable through the shared OAT CLI', async () => {
   });
   assert.equal(selected, 'scale');
   assert.deepEqual(passed, ['owner', '2']);
+});
+
+test('fleet CLI resolves cells, tears down launch failures and recovers owned or unstarted kills', async () => {
+    for (const scenario of ['success', 'source-only-maintenance', 'launch-failure', 'kill', 'kill-unstarted']) {
+      const recovering = scenario.startsWith('kill');
+      const root = await mkdtemp(path.join(os.tmpdir(), 'oat-fleet-cli-'));
+      const out = path.resolve(ROOT, 'out/arrowcol-oat', `test-fleet-${randomUUID()}`);
+      const subscription = '10000000-0000-4000-8000-000000000001';
+      const stamp = defaultStampConfig({ AZURE_STAMP: '00000', AZURE_SUBSCRIPTION_ID: subscription });
+      const config = new Config({ AZURE_SUBSCRIPTION_ID: subscription }, stamp);
+      const collector = stamp.aks.userPools.find(pool => pool.role === 'arrowcol')!;
+      const binding: FleetBinding = {
+        clusterId: config.base + '/providers/Microsoft.ContainerService/managedClusters/' + config.cluster,
+        server: 'https://fleet.example.test',
+        pools: stamp.aks.userPools.map(pool => ({
+          name: pool.name, sku: pool.vmSize, role: pool.role, vcpu: 64, count: 1, maxCount: pool.maxCount,
+        })),
+      };
+      const counts = new Map(binding.pools.map(pool => [pool.name, scenario === 'kill' ? 1 : 0]));
+      const events: string[] = [];
+      let baselineEstablished = scenario === 'kill';
+      const observation = (name: string) => {
+        const pool = binding.pools.find(pool => pool.name === name)!;
+        return { name, sku: pool.sku, vcpu: pool.vcpu, count: counts.get(name)!, provisioningState: 'Succeeded' };
+      };
+      const authority: FleetIntentAuthority = {
+        binding, campaignId: randomUUID(), ownerId: randomUUID(), fencingToken: 1,
+        get baselineEstablished() { return baselineEstablished; },
+        assertCurrent: async () => {},
+        establishBaseline: async () => { baselineEstablished = true; events.push('baseline'); },
+        recordObservation: async () => {},
+        beforeDispatch: async () => randomUUID(), afterDispatch: async () => {},
+        complete: async () => { assert.ok([...counts.values()].every(count => count === 0)); events.push('complete'); },
+        close: async () => { events.push('close'); },
+      };
+      const adapter: ReturnType<typeof createFleetAdapter> = {
+        establishBaseline: () => authority.establishBaseline([]),
+        listUserPools: async () => binding.pools.map(pool => pool.name),
+        readPool: async name => observation(name),
+        scalePool: async (name, count) => { counts.set(name, count); events.push(`scale:${count}`); return { state: 'accepted' }; },
+        waitForPool: async name => observation(name),
+        listNodes: async () => ({ items: binding.pools.filter(pool => counts.get(pool.name)).map(pool => ({
+          metadata: { name: `${pool.name}-node`, labels: {
+            'kubernetes.azure.com/agentpool': pool.name, 'arrow-collector/role': pool.role,
+            'kubernetes.io/hostname': `${pool.name}-node`, 'kubernetes.io/arch': 'amd64',
+            'node.kubernetes.io/instance-type': pool.sku,
+          } },
+          status: { nodeInfo: { architecture: 'amd64' }, allocatable: { cpu: '64', memory: '128Gi' },
+            conditions: [{ type: 'Ready', status: 'True' }] },
+        })) }),
+        listPods: async () => ({ items: [] }),
+      };
+      try {
+        const image = (name: string) => `arrowcollector00000.azurecr.io/${name}@sha256:${'a'.repeat(64)}`;
+        const runtimePath = path.join(root, 'runtime.json');
+        const bootstrapPath = path.join(root, 'bootstrap.env');
+        await writeFile(runtimePath, JSON.stringify({
+          namespace: 'arrowcol-oat', oatRunId: randomUUID(), workloadIdentityClientId: randomUUID(),
+          subscriptionId: subscription, stamp: '00000', deltaRoot: 'abfss://arrowcol@arrowcollector00000.dfs.core.windows.net/dataflow',
+          effective_stop_budgets: { maintenance_grace_seconds: 4_800, maintenance_stop_timeout_ms: 5_100_000 },
+          images: Object.fromEntries(['sqlserver', 'catalog', 'router', 'dataflow',
+            ...(scenario === 'source-only-maintenance' ? [] : ['maintenance'])].map(role => [role, image(role)])),
+        }));
+        await writeFile(bootstrapPath, '# fake test input\n');
+        const template = JSON.parse(await readFile(path.resolve(ROOT, 'docs/experiments/arrowcol-oat/oat-config.aks.full-fleet.json'), 'utf8'));
+        const source = { ...template, stamp: '00000', dmv_client_image: image('client'), maintenance_image: image('maintenance'),
+          platform: { ...template.platform, runtime_config_file: runtimePath, bootstrap_env_file: bootstrapPath,
+            fleet: { ...template.platform.fleet, collector_pool: collector.name } } };
+        const sourcePath = path.join(root, 'source.json'), stampPath = path.join(root, 'stamp.yaml');
+        await writeFile(sourcePath, JSON.stringify(source));
+        await writeFile(stampPath, stringify(stamp));
+        const invoke = () => fleetMain([recovering ? 'kill' : 'run', '--env-file', 'unused-test.env',
+          '--stamp-config', stampPath, '--owner-id', authority.ownerId, '--collector-pool', collector.name,
+          '--config', sourcePath, '--out', out], async () => { throw new Error('No external commands in CLI fixture'); }, {
+          custody: () => ({ config, env: {}, positionals: [], once: false }),
+          binding: async () => binding,
+          acquire: async (_azure, _binding, options) => { assert.equal(options.resume, recovering); return authority; },
+          adapter: () => adapter,
+          images: async (_azure, images) => {
+            assert.equal(new Set(images).size, images.length);
+            assert.equal(images.filter(value => value === image('maintenance')).length, 1);
+            return images.map(image => ({ image, architectures: ['amd64'] }));
+          },
+          launch: async (args, _runner, _cleanup, _receipts, _collect, _owned, signal) => {
+            assert.ok(signal);
+            const numeric = JSON.parse(await readFile(args[args.indexOf('--config') + 1]!, 'utf8'));
+            assert.equal(numeric.platform.fleet.collector.pool, collector.name);
+            assert.equal(numeric.platform.fleet.clients.length, 1);
+            events.push('launch');
+            if (scenario === 'launch-failure') throw new Error('fixture launch failure');
+          },
+        });
+        if (scenario === 'launch-failure') await assert.rejects(invoke(), /fixture launch failure/);
+        else await invoke();
+        assert.ok([...counts.values()].every(count => count === 0));
+        assert.equal(events.at(-1), 'close');
+        assert.equal(events.includes('baseline'), scenario !== 'kill');
+        assert.equal(events.includes('launch'), !recovering);
+        if (scenario !== 'launch-failure') assert.ok(events.includes('complete'));
+      } finally {
+        await rm(out, { recursive: true, force: true });
+        await rm(root, { recursive: true, force: true });
+      }
+    }
 });

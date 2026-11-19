@@ -109,6 +109,7 @@ async function fixture() {
       if (args.includes('--raw=/version')) return output({ major: '1' });
       if (args.includes('can-i')) return output('yes');
       if (args.includes('nodes')) return output({ items: state.nodes });
+      if (args.includes('pods')) return output({ items: [] });
       if (args.includes('ns') && args.includes('arrow-collector')) return output({ status: { phase: 'Active' } });
       if (args.includes('ns')) return output({ items: state.namespaces });
       if (args.includes('sa')) return output({ metadata: { annotations: { 'azure.workload.identity/client-id': clientId } } });
@@ -124,7 +125,8 @@ async function fixture() {
       });
       if (args[0] === 'identity' && args[1] === 'show') return output({ clientId, principalId, id: identityId });
       if (args.includes('federated-credential')) return output(state.credentials);
-      if (args[0] === 'acr') return output({ digest: state.wrongDigest ? `sha256:${'b'.repeat(64)}` : args[args.indexOf('--image') + 1]!.split('@')[1] });
+      if (args[0] === 'acr') return output({ architecture: 'amd64', os: 'linux',
+        digest: state.wrongDigest ? `sha256:${'b'.repeat(64)}` : args[args.indexOf(args.includes('--image') ? '--image' : '--name') + 1]!.split('@')[1] });
       if (args[0] === 'storage' && args[1] === 'account') return output({ id: storageId });
       if (args[0] === 'storage' && args[1] === 'container') return output({});
       if (args.includes('service-properties')) return output({ staticWebsite: { enabled: true } });
@@ -162,6 +164,46 @@ async function fixture() {
     saveConfig: () => writeFile(path.join(root, 'oat.json'), JSON.stringify(config)),
     cleanup: () => rm(root, { recursive: true, force: true }) };
 }
+
+test('fleet preflight binds selected collector rather than legacy role peer and rechecks node budgets', async () => {
+  const f = await fixture();
+  try {
+    const stamp = testStampConfig();
+    const oldCollector = stamp.aks.userPools.find(pool => pool.role === 'arrowcol')!;
+    const client = stamp.aks.userPools.find(pool => pool.role === 'client')!;
+    const selected = { ...oldCollector, name: 'fleetcol' };
+    stamp.aks.userPools.push(selected);
+    await writeFile(path.join(f.root, 'infra/azure/stamp.yaml'), stringify(stamp));
+    f.state.pools = [oldCollector, client, selected].map(pool => ({
+      name: pool.name, nodeLabels: { 'arrow-collector/role': pool.role }, osType: 'Linux', provisioningState: 'Succeeded',
+      count: 1, enableAutoScaling: true, maxCount: 1, vmSize: pool.vmSize,
+    }));
+    f.state.nodes = [selected, client].map(pool => ({
+      metadata: { name: `${pool.name}-node`, labels: {
+        'kubernetes.azure.com/agentpool': pool.name, 'arrow-collector/role': pool.role,
+        'kubernetes.io/hostname': `${pool.name}-node`, 'kubernetes.io/arch': 'amd64',
+        'node.kubernetes.io/instance-type': pool.vmSize,
+      } },
+      status: { nodeInfo: { architecture: 'amd64' }, allocatable: { cpu: '64', memory: '128Gi' },
+        conditions: [{ type: 'Ready', status: 'True' }] },
+    }));
+    const placement = (pool: typeof selected) => ({ node: `${pool.name}-node`, pool: pool.name, sku: pool.vmSize,
+      resources: { requests: { cpu: '1', memory: '1Gi' }, limits: { cpu: '1', memory: '1Gi' } } });
+    const collector = placement(selected);
+    Object.assign(f.config.platform, { fleet: { collector, clients: [{ placement: placement(client) }] } });
+    await f.saveConfig();
+    assert.equal((await f.run()).ready, true);
+    collector.sku = client.vmSize;
+    await f.saveConfig();
+    assert.equal((await f.run()).checks.find(check => check.name === 'Namespace permissions and planned pool capacity')?.ready, false);
+    collector.sku = selected.vmSize;
+    collector.resources.requests.cpu = '64';
+    await f.saveConfig();
+    const budget = (await f.run()).checks.find(check => check.name === 'Namespace permissions and planned pool capacity');
+    assert.equal(budget?.ready, false);
+    assert.match(budget!.detail, /fresh unrequested node capacity/);
+  } finally { await f.cleanup(); }
+});
 
 test('preflight uses the stamp config selected by setup for QAP hostname validation', async () => {
   const f = await fixture();

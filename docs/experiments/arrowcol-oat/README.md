@@ -1,17 +1,18 @@
 # ArrowCol OAT benchmark results
 
-| File                                              | Purpose                                                                                                                                  |
-| ------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| `index.html`                                      | Static, Excel-like heatmap viewer using Hyparquet in the browser, with a live numbered architecture diagram and config-to-stack mapping. |
-| `architecture.svg`                                | Full-width layered architecture displayed on the live page, with embedded official icons and numbered parts 1–6.                         |
-| `results.parquet`                                 | Sanitized, compact benchmark summary published by the OAT server.                                                                        |
-| `oat-config.example.json`                         | Validated configuration template with no credentials.                                                                                    |
-| `oat-config.aks.max-rows.json`                   | Exploratory one-collector AKS client sweep (1..128); replace image placeholders and use stamp-generated runtime/bootstrap inputs before launch. |
-| `architecture.drawio` / `architecture.drawio.png` | Editable source and rendered companion for the same layered architecture.                                                                |
-| `throughput-pipeline.drawio` / `.png`             | Single-writer throughput campaign dataflow and observability pipeline.                                                                   |
-| [Runtime setup](RUNTIME.md)                       | Isolated internal-only Kubernetes stack, image digests, workload identity, SQL bootstrap, secret files and local rehearsal.              |
-| [E1-E5 input preparation](EXPERIMENTS.md)         | Offline binding of private AKS settings and reviewed pilot windows into five comparable 32-table runs.                                   |
-| [Throughput campaign](THROUGHPUT-CAMPAIGN.md)     | C1-C8 manifests, stability and stop gates, campaign verdict policy, and SVG result pictures.                                             |
+| File                                              | Purpose                                                                                                                                                                  |
+| ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `index.html`                                      | Static, Excel-like heatmap viewer using Hyparquet in the browser, with a live numbered architecture diagram and config-to-stack mapping.                                 |
+| `architecture.svg`                                | Full-width layered architecture displayed on the live page, with embedded official icons and numbered parts 1–6.                                                         |
+| `results.parquet`                                 | Sanitized, compact benchmark summary published by the OAT server.                                                                                                        |
+| `oat-config.example.json`                         | Validated configuration template with no credentials.                                                                                                                    |
+| `oat-config.aks.max-rows.json`                    | Exploratory one-collector AKS client sweep (1..128); replace image placeholders and use stamp-generated runtime/bootstrap inputs before launch.                          |
+| `oat-config.aks.full-fleet.json`                  | Full-fleet sizing template: one explicit collector pool and one node-pinned DMV client per Ready client node; see [fleet operation](RUNTIME.md#heterogeneous-aks-fleet). |
+| `architecture.drawio` / `architecture.drawio.png` | Editable source and rendered companion for the same layered architecture.                                                                                                |
+| `throughput-pipeline.drawio` / `.png`             | Single-writer throughput campaign dataflow and observability pipeline.                                                                                                   |
+| [Runtime setup](RUNTIME.md)                       | Isolated internal-only Kubernetes stack, image digests, workload identity, SQL bootstrap, secret files and local rehearsal.                                              |
+| [E1-E5 input preparation](EXPERIMENTS.md)         | Offline binding of private AKS settings and reviewed pilot windows into five comparable 32-table runs.                                                                   |
+| [Throughput campaign](THROUGHPUT-CAMPAIGN.md)     | C1-C8 manifests, stability and stop gates, campaign verdict policy, and SVG result pictures.                                                                             |
 
 The viewer's six numbered stack parts match the diagram badges. Their numbers appear beside every OAT JSON field and Parquet result column that they affect. Preserve these IDs and titles when updating the diagram, configuration reference, or heatmap.
 

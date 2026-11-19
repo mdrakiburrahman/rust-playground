@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test, type TestContext } from 'node:test';
 import { Azure, Config } from '../../infra/azure/bootstrap.js';
+import { defaultStampConfig } from '../../infra/azure/stamp.js';
 import { CampaignConflictError, CUSTODY_CLEANUP_STEPS, armCampaign, publishRunInventory, startCampaign, validateCampaignState,
   type CampaignState, type CampaignStore, type RunInventory, type StoredCampaign, type ScaleTrialReceipt } from './aks-campaign.js';
 import { assertWriterBoundary, createDefaultScaleAdapter, restoreCampaignScaleTrials } from './aks-scale-provider.js';
@@ -9,6 +10,10 @@ import { createExternalCleanupExecutor, type ExternalCleanupActions } from './ak
 import { newScaleTrialReceipt, persistScaleTrial, type ScaleStep, type ScaleTarget } from './aks-scale.js';
 import type { CleanupMutationAuthority } from './aks-cleanup-executor.js';
 import type { CustodyCommandRunner } from './aks-setup-cleanup.js';
+import { HttpFailure, TAGS, type HttpReceipt } from '../../infra/azure/bootstrap.js';
+import { createFleetAdapter, observeFleetBinding, observeFleetImageArchitectures } from './aks-fleet-provider.js';
+import { cleanupAksFleet } from './aks-fleet.js';
+import { acquireFleetAuthority, FleetUnsettledDispatchError, type FleetBinding, type FleetIntentAuthority, type FleetPoolObservation } from './aks-fleet-custody.js';
 
 const campaignId = 'c0ffee00-0000-4000-8000-000000000001';
 const ownerId = 'c0ffee00-0000-4000-8000-000000000002';
@@ -692,4 +697,484 @@ test('default terminal recovery refuses an expired persisted deadline before res
   assert.deepEqual({ refused: outcome instanceof Error && outcome.message.includes('Cleanup stop deadline expired'), reads: api.reads, forwards: api.forwards },
     { refused: true, reads: 0, forwards: 0 });
   assert.ok(store.current!.state.scaleTrials![0]!.restore_deadline_at_ms > deadline + 1);
+});
+
+async function fleetProviderFixture(t: TestContext, beforePut?: (name: string, count: number, etag: string) => void,
+  collectorPool = 'benche64') {
+  const values = { AZURE_SUBSCRIPTION_ID: campaignId }, stamp = structuredClone(defaultStampConfig(values));
+  if (collectorPool !== 'benche64') stamp.aks.userPools.push({
+    ...structuredClone(stamp.aks.userPools.find(p => p.name === 'benche64')!), name: collectorPool,
+  });
+  const azure = new Azure(new Config(values, stamp));
+  const id = azure.c.base + '/providers/Microsoft.ContainerService/managedClusters/' + azure.c.cluster;
+  const events: string[] = [], pools = new Map<string, Record<string, any>>();
+  for (const p of azure.c.stampConfig.aks.userPools) pools.set(p.name, {
+    id: id + '/agentPools/' + p.name, name: p.name, type: 'Microsoft.ContainerService/managedClusters/agentPools', etag: '"v1"',
+    properties: { mode: 'User', osType: 'Linux', osSKU: 'AzureLinux', vmSize: p.vmSize, count: 0,
+      enableAutoScaling: true, minCount: 0, maxCount: p.maxCount, provisioningState: 'Succeeded',
+      nodeLabels: { type: 'benchmark', 'arrow-collector/role': p.role, 'arrow-collector/sku': p.vmSize },
+      nodeTaints: ['arrow-collector/role=' + p.role + ':NoSchedule'], enableFIPS: true,
+      upgradeSettings: { maxSurge: '33%' }, securityProfile: { sshAccess: 'Disabled' } },
+  });
+  const system = azure.c.stampConfig.aks.systemPool;
+  pools.set(system.name, {
+    id: id + '/agentPools/' + system.name, name: system.name, type: 'Microsoft.ContainerService/managedClusters/agentPools', etag: '"v1"',
+    properties: { mode: 'System', osType: 'Linux', vmSize: system.vmSize, count: system.initialCount,
+      enableAutoScaling: true, minCount: system.minCount, maxCount: system.maxCount,
+      provisioningState: 'Succeeded', nodeLabels: { type: 'system' } },
+  });
+  let response = 'accepted', puts = 0;
+  let nodeItems: unknown[] = [];
+  t.mock.method(azure, 'arm', async (method: string, resourceId: string) => {
+    assert.equal(method, 'GET'); assert.equal(resourceId, id);
+    return { id, type: 'Microsoft.ContainerService/managedClusters', tags: { ...TAGS, sandboxId: azure.c.sandbox },
+      properties: { fqdn: 'fleet.azmk8s.io' } };
+  });
+  t.mock.method(azure, 'collection', async (resourceId: string) => {
+    assert.equal(resourceId, id + '/agentPools');
+    return structuredClone([...pools.values()]);
+  });
+  t.mock.method(azure, 'cli', async (...args: string[]) => {
+    assert.deepEqual(args.slice(0, 2), ['vm', 'list-skus']);
+    return [{ name: args[args.indexOf('--size') + 1], resourceType: 'virtualMachines',
+      capabilities: [{ name: 'vCPUs', value: '16' }] }];
+  });
+  t.mock.method(azure, 'request', async (method: string, url: string, _resource: string, body?: string | Buffer | null,
+    headers: Record<string, string> = {}, missingOk?: boolean, idempotent?: boolean, capture?: (r: HttpReceipt) => void) => {
+    const name = new URL(url).pathname.split('/').at(-1)!;
+    const resource = pools.get(name);
+    assert.ok(resource, 'No request may address a pool outside fake ARM inventory.');
+    events.push(method + ':' + name);
+    if (method === 'GET') {
+      if (response === 'readback-timeout' && puts > 0) throw new Error('ARM readback timed out');
+      return [Buffer.from(JSON.stringify(resource)), { etag: resource.etag, ':status': '200' }];
+    }
+    assert.equal(method, 'PUT'); puts++;
+    const parsed = JSON.parse(String(body));
+    if (beforePut) beforePut(name, parsed.properties.count, headers['If-Match']!);
+    else assert.equal(events.at(-2), 'assert');
+    assert.equal(headers['If-Match'], resource.etag);
+    assert.equal(idempotent, false); assert.equal(missingOk, false);
+    if (response === 'timeout') throw new Error('transport timeout: private diagnostic');
+    const status = response === 'conflict' || response === 'other409' ? 409 : response === 'quota' ? 400 : 202;
+    const code = response === 'conflict' ? 'OperationNotAllowed' : response === 'quota' ? 'QuotaExceeded' : 'OtherConflict';
+    if (status === 202) {
+      resource.properties = parsed.properties;
+      resource.properties.provisioningState = response === 'updating' ? 'Updating' :
+        response === 'failed' ? 'Failed' : response === 'canceled' ? 'Canceled' : 'Succeeded';
+      if (response === 'failed' || response === 'canceled') resource.properties.count = 0;
+      resource.etag = '"v' + (puts + 1) + '"';
+    }
+    if (response === 'lost') throw new Error('connection lost after accepted write');
+    capture?.({ status, bodyBase64: Buffer.from(JSON.stringify({ error: { code, message: 'private resource ID' } })).toString('base64'), headers: {} });
+    if (status >= 400) throw new Error('HTTP private diagnostic');
+    return [null, { ':status': String(status) }];
+  });
+  const binding = await observeFleetBinding(azure, collectorPool);
+  const observations = new Map<string, FleetPoolObservation>(), hashes = new Map<string, string>();
+  const pending = new Map<string, { count: number; state: string; etag: string }>();
+  const authority: FleetIntentAuthority = {
+    campaignId, ownerId, fencingToken: 1, binding, mode: 'producer',
+    async assertCurrent() { events.push('assert'); },
+    async establishBaseline(values) {
+      events.push('baseline');
+      for (const o of values) { hashes.set(o.name, o.configurationHash); observations.set(o.name, o); }
+    },
+    async recordObservation(o) {
+      if (hashes.get(o.name) !== o.configurationHash) throw new Error('configuration hash drift');
+      const d = pending.get(o.name);
+      const terminal = ['Failed', 'Canceled'].includes(o.provisioningState);
+      if (terminal) {
+        if (d && (!['conflict', 'rejected'].includes(d.state) && o.etag === d.etag ||
+            o.count !== d.count && o.count !== observations.get(o.name)?.count))
+          throw new FleetUnsettledDispatchError();
+        if (!d) assert.equal(o.count, observations.get(o.name)?.count);
+      } else if (o.provisioningState !== 'Succeeded' ||
+          d && !['conflict', 'rejected'].includes(d.state) && (d.count !== o.count || o.etag === d.etag))
+        throw new FleetUnsettledDispatchError();
+      events.push('observation:' + o.name); observations.set(o.name, o); pending.delete(o.name);
+    },
+    async beforeDispatch(name, count, etag) {
+      assert.equal(etag, observations.get(name)?.etag); assert.equal(pending.has(name), false);
+      if (['Failed', 'Canceled'].includes(observations.get(name)!.provisioningState)) assert.equal(count, 0);
+      events.push('intent:' + name);
+      pending.set(name, { count, state: 'intent', etag }); return 'dispatch';
+    },
+    async afterDispatch(name, _id, state) { events.push('outcome:' + state); pending.get(name)!.state = state; },
+    async complete() {
+      assert.equal(pending.size, 0);
+      assert.ok([...observations.values()].every(o => o.count === 0 && o.provisioningState === 'Succeeded'));
+    },
+    async close() {},
+  };
+  const runCommand: CustodyCommandRunner = async (args, timeout, _env, _stdin, _signal, cap) => {
+    assert.deepEqual(args.slice(0, 5), ['kubectl', '--server', binding.server, '--insecure-skip-tls-verify=false', '--request-timeout']);
+    assert.ok(timeout! <= 20); assert.equal(cap, 4_194_304);
+    if (args.includes('pods')) assert.ok(args.includes('--all-namespaces'));
+    return { returncode: 0, stdout: JSON.stringify({ items: args.includes('nodes') ? nodeItems : [] }), stderr: '' };
+  };
+  const adapter = createFleetAdapter(azure, binding, authority, runCommand);
+  return { azure, binding, authority, adapter, pools, events, observations, pending, runCommand,
+    get puts() { return puts; }, setResponse(value: string) { response = value; }, setNodes(value: unknown[]) { nodeItems = value; } };
+}
+
+test('fleet provider binds observed vCPU inventory and persists intent before exact conditional single-shot scaling', async t => {
+  const f = await fleetProviderFixture(t);
+  assert.ok(f.binding.pools.every(p => p.vcpu === 16));
+  await f.adapter.establishBaseline();
+  const original = structuredClone(f.pools.get('benche64')!.properties);
+  assert.deepEqual(await f.adapter.scalePool('benche64', 1, f.authority), { state: 'accepted' });
+  const properties = f.pools.get('benche64')!.properties;
+  assert.deepEqual(properties, { ...original, count: 1, minCount: 1, maxCount: 1 });
+  assert.ok(f.events.indexOf('intent:benche64') < f.events.indexOf('PUT:benche64'));
+  assert.ok(f.events.indexOf('PUT:benche64') < f.events.indexOf('outcome:accepted'));
+  const resumed = createFleetAdapter(f.azure, f.binding, f.authority, f.runCommand);
+  assert.deepEqual(await resumed.scalePool('benche64', 0, f.authority), { state: 'accepted' });
+  assert.equal(f.pools.get('benche64')!.properties.maxCount, f.binding.pools.find(p => p.name === 'benche64')!.maxCount);
+  assert.equal(f.pools.get('benche64')!.properties.minCount, 0);
+  assert.equal(f.pools.get('benche64')!.properties.enableAutoScaling, true);
+  await resumed.listPods(f.authority);
+});
+
+test('fleet binding discovery permits owned pending and failed pools for kill recovery without admitting a fresh baseline', async t => {
+  for (const provisioningState of ['Updating', 'Failed']) {
+    const f = await fleetProviderFixture(t), properties = f.pools.get('benche64')!.properties;
+    Object.assign(properties, { provisioningState, count: 1, minCount: 1, maxCount: 1 });
+    assert.deepEqual(await observeFleetBinding(f.azure, 'benche64'), f.binding);
+    await assert.rejects(f.adapter.establishBaseline(), /baseline/);
+    assert.equal(f.puts, 0);
+  }
+  const f = await fleetProviderFixture(t);
+  t.mock.method(f.azure, 'cli', async (...args: string[]) => [{
+    name: args[args.indexOf('--size') + 1], resourceType: 'virtualMachines', capabilities: [{ name: 'vCPUs', value: true }],
+  }]);
+  await assert.rejects(observeFleetBinding(f.azure, 'benche64'), /vCPU count is UNKNOWN/);
+});
+
+test('fleet provider never retries uncertain dispatch and reconciles a committed lost response before cleanup', async t => {
+  const f = await fleetProviderFixture(t);
+  await f.adapter.establishBaseline();
+  f.setResponse('timeout');
+  assert.deepEqual(await f.adapter.scalePool('benche64', 1, f.authority), { state: 'uncertain' });
+  const resumed = createFleetAdapter(f.azure, f.binding, f.authority, f.runCommand);
+  await assert.rejects(resumed.scalePool('benche64', 1, f.authority), FleetUnsettledDispatchError);
+  assert.equal(f.puts, 1);
+  const g = await fleetProviderFixture(t);
+  await g.adapter.establishBaseline();
+  g.setResponse('lost');
+  assert.deepEqual(await g.adapter.scalePool('benche64', 1, g.authority), { state: 'uncertain' });
+  assert.equal((await g.adapter.waitForPool('benche64', 1, Date.now() + 100, g.authority)).count, 1);
+  g.setResponse('accepted');
+  await createFleetAdapter(g.azure, g.binding, g.authority, g.runCommand).scalePool('benche64', 0, g.authority);
+  assert.equal(g.puts, 2);
+  const h = await fleetProviderFixture(t);
+  await h.adapter.establishBaseline(); h.setResponse('readback-timeout');
+  assert.deepEqual(await h.adapter.scalePool('benche64', 1, h.authority), { state: 'uncertain' });
+  assert.equal(h.puts, 1);
+  h.setResponse('accepted');
+  assert.equal((await h.adapter.waitForPool('benche64', 1, Date.now() + 100, h.authority)).count, 1);
+});
+
+test('fleet provider surfaces owned terminal failures and repairs Failed/Canceled zero-count pools without claiming idle', async t => {
+  for (const response of ['failed', 'canceled']) {
+    const f = await fleetProviderFixture(t);
+    await f.adapter.establishBaseline(); f.setResponse(response);
+    assert.deepEqual(await f.adapter.scalePool('benche64', 1, f.authority), { state: 'accepted' });
+    const terminal = await f.adapter.waitForPool('benche64', 1, Date.now() + 100, f.authority);
+    assert.equal(terminal.count, 0);
+    assert.equal(terminal.provisioningState, response === 'failed' ? 'Failed' : 'Canceled');
+    await assert.rejects(f.authority.complete());
+    const resumed = createFleetAdapter(f.azure, f.binding, f.authority, f.runCommand);
+    await assert.rejects(resumed.scalePool('benche64', 1, f.authority), /only an owned repair to zero/);
+    const properties = f.pools.get('benche64')!.properties, approvedMaximum = f.binding.pools.find(p => p.name === 'benche64')!.maxCount;
+    properties.maxCount = approvedMaximum + 1;
+    await assert.rejects(resumed.listUserPools(f.authority), /autoscaler bounds/);
+    await assert.rejects(resumed.scalePool('benche64', 0, f.authority), /autoscaler bounds/);
+    properties.minCount = 0; properties.maxCount = approvedMaximum;
+    assert.ok((await resumed.listUserPools(f.authority)).includes('benche64'));
+    properties.minCount = 1; properties.maxCount = 1;
+    f.setResponse('accepted');
+    assert.deepEqual(await resumed.scalePool('benche64', 0, f.authority), { state: 'accepted' });
+    const repaired = await resumed.waitForPool('benche64', 0, Date.now() + 100, f.authority);
+    assert.equal(repaired.provisioningState, 'Succeeded'); assert.equal(repaired.count, 0);
+    const restored = f.pools.get('benche64')!.properties;
+    assert.equal(restored.enableAutoScaling, true); assert.equal(restored.minCount, 0);
+    assert.equal(restored.maxCount, approvedMaximum);
+    assert.equal(f.puts, 2);
+    await f.authority.complete();
+  }
+});
+
+test('fleet provider only classifies exact ARM OperationNotAllowed 409 and sanitizes definite rejections', async t => {
+  for (const [response, expected] of [
+    ['conflict', { state: 'conflict', status: 409, code: 'OperationNotAllowed' }],
+    ['quota', { state: 'rejected', reason: 'quota_exceeded' }],
+    ['other409', { state: 'rejected', reason: 'request_rejected' }],
+  ] as const) {
+    const f = await fleetProviderFixture(t);
+    await f.adapter.establishBaseline(); f.setResponse(response);
+    assert.deepEqual(await f.adapter.scalePool('benche64', 1, f.authority), expected);
+    assert.equal(f.puts, 1);
+  }
+});
+
+test('fleet provider refuses forbidden pool, ETag, writable drift and unknown writable settings before dispatch', async t => {
+  for (const fault of ['system', 'etag', 'drift', 'unknown', 'role', 'sku', 'taint', 'bounds']) {
+    const f = await fleetProviderFixture(t);
+    await f.adapter.establishBaseline();
+    const resource = f.pools.get('benche64')!;
+    if (fault === 'etag') resource.etag = '*';
+    if (fault === 'drift') resource.properties.enableFIPS = false;
+    if (fault === 'unknown') resource.properties.futureWritableSetting = true;
+    if (fault === 'role') resource.properties.nodeLabels['arrow-collector/role'] = 'client';
+    if (fault === 'sku') resource.properties.nodeLabels['arrow-collector/sku'] = 'Standard_Fake';
+    if (fault === 'taint') resource.properties.nodeTaints = [];
+    if (fault === 'bounds') resource.properties.minCount = 1;
+    await assert.rejects(f.adapter.scalePool(fault === 'system' ? 'systempool' : 'benche64', 1, f.authority));
+    assert.equal(f.puts, 0);
+  }
+});
+
+test('fleet provider fences after durable intent and preserves only the reviewed legacy pool label fallbacks', async t => {
+  const f = await fleetProviderFixture(t);
+  delete f.pools.get('benche64')!.properties.nodeLabels['arrow-collector/sku'];
+  delete f.pools.get('benchd64')!.properties.nodeLabels['arrow-collector/sku'];
+  await f.adapter.establishBaseline();
+  t.mock.method(f.authority, 'assertCurrent', async () => {
+    f.events.push('assert');
+    if (f.events.includes('intent:benche64')) throw new Error('fenced');
+  });
+  await assert.rejects(f.adapter.scalePool('benche64', 1, f.authority), /fenced/);
+  assert.equal(f.puts, 0);
+  const g = await fleetProviderFixture(t);
+  const configured = g.azure.c.stampConfig.aks.userPools.find(p => p.name === 'benchd64')!;
+  const resource = g.pools.get('benchd64')!;
+  try {
+    configured.name = 'p123456789ab';
+    resource.name = configured.name; resource.id = g.binding.clusterId + '/agentPools/' + configured.name;
+    delete resource.properties.nodeLabels['arrow-collector/sku'];
+    g.pools.delete('benchd64'); g.pools.set(configured.name, resource);
+    await assert.rejects(observeFleetBinding(g.azure, 'benche64'), /identity|SKU/);
+  } finally { configured.name = 'benchd64'; }
+});
+
+test('fleet provider requires full stamp membership and preserved zero User policy without adopting unselected pools', async t => {
+  for (const fault of ['bounds', 'nodes', 'unselected', 'undeclared-zero', 'missing', 'system', 'missing-legacy',
+    'missing-system', 'legacy-disabled', 'legacy-min', 'legacy-max', 'legacy-failed', 'legacy-nonzero', 'legacy-nodes']) {
+    const f = await fleetProviderFixture(t, undefined, 'hugepool');
+    if (fault === 'bounds') f.pools.get('benche64')!.properties.maxCount++;
+    if (fault === 'nodes') f.setNodes([{ metadata: { labels: { agentpool: 'benche64' } } }]);
+    if (fault === 'unselected') {
+      const extra = structuredClone(f.pools.get('benchd64')!);
+      extra.name = 'unselected'; extra.id = f.binding.clusterId + '/agentPools/unselected'; extra.properties.count = 1;
+      f.pools.set('unselected', extra);
+    }
+    if (fault === 'undeclared-zero') {
+      const extra = structuredClone(f.pools.get('benchd64')!);
+      extra.name = 'unapproved'; extra.id = f.binding.clusterId + '/agentPools/unapproved';
+      f.pools.set('unapproved', extra);
+    }
+    if (fault === 'missing') f.pools.delete('benchd64');
+    if (fault === 'system') f.pools.get('benchd64')!.properties.mode = 'System';
+    if (fault === 'missing-legacy') f.pools.delete('benche64');
+    if (fault === 'missing-system') f.pools.delete(f.azure.c.stampConfig.aks.systemPool.name);
+    if (fault === 'legacy-disabled') f.pools.get('benche64')!.properties.enableAutoScaling = false;
+    if (fault === 'legacy-min') f.pools.get('benche64')!.properties.minCount = 1;
+    if (fault === 'legacy-max') f.pools.get('benche64')!.properties.maxCount++;
+    if (fault === 'legacy-failed') f.pools.get('benche64')!.properties.provisioningState = 'Failed';
+    if (fault === 'legacy-nonzero') f.pools.get('benche64')!.properties.count = 1;
+    if (fault === 'legacy-nodes') f.setNodes([{ metadata: { labels: { agentpool: 'benche64' } } }]);
+    await assert.rejects(f.adapter.establishBaseline());
+    assert.ok(!f.events.includes('baseline'));
+    assert.equal(f.puts, 0);
+  }
+  const f = await fleetProviderFixture(t, undefined, 'hugepool');
+  await f.adapter.establishBaseline();
+  assert.deepEqual(await f.adapter.listUserPools(f.authority), f.binding.pools.map(p => p.name));
+  assert.ok(!f.binding.pools.some(p => p.name === 'benche64'));
+  await assert.rejects(f.adapter.scalePool('benche64', 1, f.authority), /not an approved User pool/);
+  assert.equal(f.puts, 0);
+});
+
+test('fleet cleanup rechecks full stamp membership after selected pools reach zero', async t => {
+  for (const fault of ['missing-legacy', 'extra-zero', 'legacy-disabled', 'selected-nonzero', 'legacy-nodes']) {
+    const f = await fleetProviderFixture(t, undefined, 'hugepool');
+    await f.adapter.establishBaseline();
+    await f.adapter.scalePool('hugepool', 1, f.authority);
+    let nodeReads = 0;
+    const listNodes = f.adapter.listNodes;
+    t.mock.method(f.adapter, 'listNodes', async (authority: CleanupMutationAuthority) => {
+      const nodes = await listNodes(authority);
+      if (++nodeReads === f.binding.pools.length) {
+        if (fault === 'missing-legacy') f.pools.delete('benche64');
+        if (fault === 'legacy-disabled') f.pools.get('benche64')!.properties.enableAutoScaling = false;
+        if (fault === 'selected-nonzero') Object.assign(f.pools.get('hugepool')!.properties, { count: 1, minCount: 1, maxCount: 1 });
+        if (fault === 'legacy-nodes') f.setNodes([{ metadata: { labels: { agentpool: 'benche64' } } }]);
+        if (fault === 'extra-zero') {
+          const extra = structuredClone(f.pools.get('benchd64')!);
+          extra.name = 'unapproved'; extra.id = f.binding.clusterId + '/agentPools/unapproved';
+          f.pools.set(extra.name, extra);
+        }
+      }
+      return nodes;
+    });
+    const result = await cleanupAksFleet(f.adapter, f.authority,
+      { deadlineAtMs: Date.now() + 1000, includePoolNames: f.binding.pools.map(p => p.name) });
+    assert.equal(result.verified, false);
+    assert.ok(result.failed.includes('final-user-pool-discovery'));
+    if (fault !== 'selected-nonzero') assert.ok(f.binding.pools.every(p => f.pools.get(p.name)!.properties.count === 0));
+    assert.equal(f.puts, 2);
+    assert.ok(!f.events.includes('PUT:benche64'));
+  }
+});
+
+test('fleet provider polls only exact GETs within the original deadline and does not swallow authority/config drift', async t => {
+  const f = await fleetProviderFixture(t);
+  await f.adapter.establishBaseline();
+  f.pools.get('benche64')!.properties.provisioningState = 'Updating';
+  await assert.rejects(f.adapter.waitForPool('benche64', 1, Date.now() + 10, f.authority), /original deadline/);
+  assert.equal(f.puts, 0);
+  f.pools.get('benche64')!.properties.provisioningState = 'Succeeded';
+  f.pools.get('benche64')!.properties.securityProfile = { sshAccess: 'Enabled' };
+  await assert.rejects(f.adapter.waitForPool('benche64', 0, Date.now() + 100, f.authority), /hash drift/);
+});
+
+test('fleet provider exposes pending snapshots to lifecycle polling but never treats them as mutation authority', async t => {
+  const f = await fleetProviderFixture(t);
+  await f.adapter.establishBaseline(); f.setResponse('updating');
+  assert.deepEqual(await f.adapter.scalePool('benche64', 1, f.authority), { state: 'accepted' });
+  assert.equal((await f.adapter.readPool('benche64', f.authority)).provisioningState, 'Updating');
+  await assert.rejects(f.adapter.scalePool('benche64', 0, f.authority), FleetUnsettledDispatchError);
+  assert.equal(f.puts, 1);
+  f.pools.get('benche64')!.properties.enableFIPS = false;
+  await assert.rejects(f.adapter.waitForPool('benche64', 1, Date.now() + 100, f.authority), /hash drift/);
+});
+
+test('fleet Kubernetes observations reject command failures and oversized output instead of treating errors as absence', async t => {
+  const f = await fleetProviderFixture(t);
+  for (const result of [{ returncode: 1, stdout: '', stderr: 'private permission diagnostic' },
+    { returncode: 0, stdout: '{"items":[]}', stderr: 'x'.repeat(4_194_305) }]) {
+    const adapter = createFleetAdapter(f.azure, f.binding, f.authority, async () => result);
+    await assert.rejects(adapter.listPods(f.authority), /Kubernetes observation failed/);
+  }
+});
+
+test('fleet image observations require exact stamp digest and explicit Linux manifest architecture', async t => {
+  const f = await fleetProviderFixture(t);
+  const digest = 'sha256:' + 'a'.repeat(64), image = f.azure.c.registryLoginServer + '/arrowcol@' + digest;
+  let metadata: unknown = { digest, os: 'linux', architecture: 'arm64' }, observations = 0;
+  t.mock.method(f.azure, 'cli', async (...args: string[]) => {
+    assert.deepEqual(args.slice(0, 3), ['acr', 'manifest', 'show-metadata']);
+    assert.equal(args[args.indexOf('--name') + 1], 'arrowcol@' + digest);
+    observations++;
+    return metadata;
+  });
+  assert.deepEqual(await observeFleetImageArchitectures(f.azure, [image]), [{ image, architectures: ['arm64'] }]);
+  observations = 0;
+  assert.deepEqual(await observeFleetImageArchitectures(f.azure, [image, image]), [{ image, architectures: ['arm64'] }]);
+  assert.equal(observations, 1);
+  metadata = { digest, manifests: [{ platform: { os: 'linux', architecture: 'amd64' } }, { platform: { os: 'linux', architecture: 'arm64' } }] };
+  assert.deepEqual((await observeFleetImageArchitectures(f.azure, [image]))[0]!.architectures, ['amd64', 'arm64']);
+  for (const bad of [{ digest: 'sha256:' + 'b'.repeat(64), os: 'linux', architecture: 'amd64' },
+    { digest }, { digest, os: 'windows', architecture: 'amd64' }, { digest, os: 'linux', architecture: 'UNKNOWN' }]) {
+    metadata = bad;
+    await assert.rejects(observeFleetImageArchitectures(f.azure, [image]));
+  }
+  await assert.rejects(observeFleetImageArchitectures(f.azure, ['other.azurecr.io/arrowcol@' + digest]));
+  await assert.rejects(observeFleetImageArchitectures(f.azure, [f.azure.c.registryLoginServer + '/arrowcol:latest']));
+});
+
+test('real fleet custody and provider scale, resume with blob-scoped fencing, restore every pool and complete', async t => {
+  const journalPath = 'oat-fleet/active.v1.json';
+  const blobs = new Map<string, { bytes: Buffer; etag: string }>();
+  const f = await fleetProviderFixture(t, (name, count, etag) => {
+    const journal = JSON.parse(blobs.get(journalPath)!.bytes.toString());
+    assert.equal(journal.status, 'active');
+    assert.equal(journal.pools[name].dispatch.state, 'intent');
+    assert.equal(journal.pools[name].dispatch.count, count);
+    assert.equal(journal.pools[name].dispatch.etag, etag);
+  });
+  let revision = 0, acquisitions = 0;
+  let lease: { id: string; seconds: number; expiresAt: number } | undefined;
+  t.mock.method(f.azure, 'lease', async () => { throw new Error('Container leases would block native publisher control.'); });
+  t.mock.method(f.azure, 'blob', async (method: string, container: string, name = '', query?: Record<string, string>,
+    body?: string | Buffer | null, headers: Record<string, string> = {}, missingOk = false) => {
+    assert.equal(container, f.azure.c.checkpoints);
+    if (lease && Date.now() >= lease.expiresAt) lease = undefined;
+    const old = blobs.get(name);
+    if (query?.comp === 'lease') {
+      assert.equal(method, 'PUT'); assert.equal(name, journalPath); assert.ok(old);
+      if (headers['x-ms-lease-action'] === 'acquire') {
+        assert.equal(lease, undefined); assert.equal(headers['if-match'], old.etag);
+        const seconds = Number(headers['x-ms-lease-duration']), id = headers['x-ms-proposed-lease-id'];
+        assert.ok(seconds >= 15 && seconds <= 60); assert.match(id!, /^[a-f0-9-]{36}$/);
+        lease = { id: id!, seconds, expiresAt: Date.now() + seconds * 1000 }; acquisitions++;
+      } else {
+        assert.ok(lease); assert.equal(headers['x-ms-lease-id'], lease.id);
+        if (headers['x-ms-lease-action'] === 'release') lease = undefined;
+        else {
+          assert.equal(headers['x-ms-lease-action'], 'renew');
+          lease.expiresAt = Date.now() + lease.seconds * 1000;
+        }
+      }
+      return [null, { ':status': '200' }];
+    }
+    if (method === 'GET') {
+      if (!old && !missingOk) throw new HttpFailure(404, 'missing fake blob');
+      return [old?.bytes ?? null, old ? { etag: old.etag, ':status': '200' } : {}];
+    }
+    if (headers['if-match'] !== undefined && headers['if-match'] !== old?.etag ||
+        headers['if-none-match'] === '*' && old) throw new HttpFailure(412, 'fake ETag conflict');
+    assert.ok(headers['if-match'] || headers['if-none-match'] === '*', 'All durable writes must be conditional.');
+    if (name === journalPath && old) {
+      assert.ok(lease); assert.equal(headers['x-ms-lease-id'], lease.id);
+    } else assert.equal(headers['x-ms-lease-id'], undefined);
+    if (method === 'DELETE') {
+      assert.equal(name, 'active.json'); blobs.delete(name);
+      return [null, { ':status': '202' }];
+    }
+    assert.equal(method, 'PUT');
+    const etag = `"blob-${++revision}"`;
+    blobs.set(name, { bytes: Buffer.from(body!), etag });
+    return [null, { etag, ':status': '201' }];
+  });
+  for (const resource of f.pools.values()) delete resource.properties.nodeLabels['arrow-collector/sku'];
+  const binding = await observeFleetBinding(f.azure, 'benche64');
+  const authorities: FleetIntentAuthority[] = [];
+  t.after(async () => { for (const authority of authorities) await authority.close(); });
+  const first = await acquireFleetAuthority(f.azure, binding, { ownerId, resume: false });
+  authorities.push(first);
+  const adapter = createFleetAdapter(f.azure, binding, first, f.runCommand);
+  await adapter.establishBaseline();
+  for (const pool of binding.pools) {
+    assert.deepEqual(await adapter.scalePool(pool.name, pool.count, first), { state: 'accepted' });
+    assert.equal((await adapter.waitForPool(pool.name, pool.count, Date.now() + 1000, first)).provisioningState, 'Succeeded');
+    assert.equal((await adapter.readPool(pool.name, first)).count, pool.count);
+  }
+  await first.close();
+  assert.equal(lease, undefined); assert.ok(blobs.has('active.json'));
+  const resumedBinding = await observeFleetBinding(f.azure, 'benche64');
+  const journalBefore = blobs.get(journalPath), campaignBefore = blobs.get('active.json');
+  await assert.rejects(acquireFleetAuthority(f.azure, resumedBinding, { ownerId: cellId, resume: true }), /retained owner/);
+  assert.equal(blobs.get(journalPath), journalBefore); assert.equal(blobs.get('active.json'), campaignBefore);
+  assert.equal(f.puts, binding.pools.length);
+  const resumed = await acquireFleetAuthority(f.azure, resumedBinding, { ownerId, resume: true });
+  authorities.push(resumed);
+  assert.ok(resumed.fencingToken > first.fencingToken);
+  await assert.rejects(first.assertCurrent(), /closed|fenced/);
+  const recoveredAdapter = createFleetAdapter(f.azure, resumedBinding, resumed, f.runCommand);
+  for (const pool of resumedBinding.pools) {
+    assert.deepEqual(await recoveredAdapter.scalePool(pool.name, 0, resumed), { state: 'accepted' });
+    const observed = await recoveredAdapter.waitForPool(pool.name, 0, Date.now() + 1000, resumed);
+    assert.equal(observed.count, 0); assert.equal(observed.provisioningState, 'Succeeded');
+    const properties = f.pools.get(pool.name)!.properties;
+    assert.equal(properties.enableAutoScaling, true);
+    assert.equal(properties.minCount, 0); assert.equal(properties.maxCount, pool.maxCount);
+  }
+  assert.deepEqual(await recoveredAdapter.listNodes(resumed), { items: [] });
+  await resumed.complete(); await resumed.close();
+  assert.equal(blobs.has('active.json'), false);
+  assert.equal(JSON.parse(blobs.get(journalPath)!.bytes.toString()).status, 'complete');
+  assert.equal(lease, undefined); assert.equal(acquisitions, 2);
+  assert.equal(f.puts, binding.pools.length * 2);
 });

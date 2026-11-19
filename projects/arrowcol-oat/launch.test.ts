@@ -1238,6 +1238,23 @@ test('posts the JSON config and polls until the server publishes results', async
   }
 });
 
+test('fleet abort stops AKS polling without borrowing local cancellation authority', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'oat-fleet-abort-'));
+  const configPath = path.join(directory, 'oat.json');
+  await writeFile(configPath, JSON.stringify({ platform: { kind: 'aks' } }));
+  const abort = new AbortController();
+  const calls: string[] = [];
+  try {
+    await assert.rejects(launchOat(configPath, 'http://127.0.0.1:8088', 1, async (url) => {
+      calls.push(String(url));
+      abort.abort();
+      return Response.json(status('running'), { status: 202 });
+    }, () => {}, undefined, undefined, abort.signal), /AKS fleet execution interrupted/);
+    assert.equal(calls.length, 1);
+    assert.equal(calls.some(url => url.endsWith('/cancel')), false);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
 test('build progress streams before process exit while preserving captured diagnostics', async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'oat-build-progress-'));
   const gate = path.join(directory, 'progress-seen');

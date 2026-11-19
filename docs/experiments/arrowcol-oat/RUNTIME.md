@@ -187,6 +187,88 @@ The generated QAP database is `experimentqap`, distinct from the main `arrowcol`
 
 `aks destroy --stamp-config "$STAMP_CONFIG"` only prints a read-only inventory. Adding `--confirm arrow-collector-rg` deletes the entire `arrow-collector-rg` and its captured AKS-managed resource groups, including every stamp there; it is not per-run cleanup. OAT benchmark cleanup is automatic and run-scoped.
 
+## Heterogeneous AKS fleet
+
+The [full-fleet template](oat-config.aks.full-fleet.json) is a sizing input, not a
+direct Rust API request. Start from the selected stamp's private single-table
+scale-out OAT configuration, retain its pinned images and identity bindings, and copy the
+template's `platform.fleet` block. Set `collector_pool` to the explicitly selected
+largest pool; the legacy collector pool is not implicitly selected or relabelled.
+
+| Setting | Resolution |
+| --- | --- |
+| `collector.*` | `auto` derives DFE, runtime, blocking and encoder/writer CPU workers from the selected Ready node's available whole cores, respecting existing consumer maxima. Positive numeric overrides remain supported. |
+| `client.*` | `auto` resolves independently for every Ready client node: worker/runtime threads, connection/stream counts, rows, concurrency and corpus/memory budgets. |
+| Pod budget | Observed node allocatable minus existing nonterminal pod requests, including DaemonSets, minus reserved runtime/support-service room. Collector reservation includes SQL, router, catalog, maintenance and setup jobs; clients retain additional headroom. |
+| Placement | One integrated collector pod plus existing support topology on the explicit collector pool/node. One DMV pod per client node, pinned by pool and hostname with the role selector/taint toleration retained. Only observed `amd64` nodes are admitted for the existing images. |
+| Evidence | Per-client and per-pool completed/admitted rows/s, node/pool/SKU allocation and collector/client allocatable CPU/memory totals. Client completion rates are neither attempted/offered rates nor collector-committed rates. The ranking remains exactly `ranking_metrics.committed_rows_per_second`, reconciled from collector commits before shutdown. Missing ranking evidence stays null. |
+
+For offline reproduction from a fleet orchestration observation, prepare a
+single numeric cell without performing cloud operations:
+
+```bash
+npx --no-install tsx projects/arrowcol-oat/prepare-experiments.ts \
+  --base out/arrowcol-oat/full-fleet-input.json \
+  --fleet-observation out/arrowcol-oat/fleet-observation.json \
+  --stamp-config "$STAMP_CONFIG" --out out/arrowcol-oat/resolved-fleet
+```
+
+The observation contains `nodes` (Ready-node identity, architecture, allocatable
+CPU/memory and existing requested CPU/memory), sanitized `pools` outcomes and
+`images: [{ "image": "<exact digest-pinned reference>", "architectures": ["amd64"] }]`
+read from registry metadata for every runtime, client and maintenance image.
+Preparation rejects unknown sizing fields, malformed sentinels, duplicate nodes,
+incompatible architectures and insufficient budgets. It emits
+`full-fleet.config.json`, with exactly one replica/core cell and no client-count
+sweep. Do not reuse stale observations or submit unresolved `auto` fields directly
+to the Rust API. No collector, router or DMV image rebuild is required.
+
+Preparation requires image observations matching every pinned reference and
+selected node architecture; an `amd64` node selector alone is not image proof.
+
+### Custodied fleet execution and kill
+
+| Requirement | Contract |
+| --- | --- |
+| Reviewed stamp | Complete System/User pool membership must match the reviewed stamp. Select one collector explicitly; all reviewed client pools participate. Nonselected User pools remain unowned at settled zero with their approved enabled autoscaler/minimum/maximum policy; unknown or missing pools prevent verified cleanup. |
+| Private custody environment | `--env-file` supplies `ARM_SUBSCRIPTION_ID`, `CAMPAIGN_STORAGE_ACCOUNT` and `CAMPAIGN_STATE_CONTAINER`, exactly matching the selected stamp's subscription, existing account and checkpoints container. Existing operator credentials are reused. |
+| Fresh observations | The production adapter observes ARM identities/policies, Ready nodes, requested resources and digest-bound Linux/amd64 image metadata. Preflight rechecks exact collector/client pool/SKU/node identities and remaining budgets. Supplied offline JSON is not production acceptance evidence. |
+| Ownership | A versioned journal in the existing checkpoints container, journal-blob lease and legacy observe-only campaign claim exclude competing custody. Every selected pool must begin at zero with no physical nodes. Intent and ETag are persisted before conditional ARM dispatch. Recovery requires the retained owner UUID; implicit takeover is forbidden. Legacy campaign qualification is unchanged. |
+| Scaling and idle | ARM operations serialize where required while Ready waits overlap. Run counts pin autoscaler minimum/maximum to the approved count. Cleanup restores zero, enabled autoscaling, minimum zero and each approved original maximum, then verifies zero selected nodes. Unknown outcomes stop rather than replay. |
+
+Use the reviewed `sku-pools.ts` output's `userPools` in the private stamp,
+and select its `collector.name` (with `collector.vmSize` matching that pool),
+not the first `arrowcol` role. After copying the sizing block into the selected
+stamp's private config, retain the owner UUID and run:
+
+```bash
+OWNER_ID="$(node -p "require('node:crypto').randomUUID()")"
+COLLECTOR_POOL="$(node -p "JSON.parse(require('node:fs').readFileSync(process.argv[1], 'utf8')).collector.name" out/arrowcol-oat/reviewed-pools.json)"
+npx --no-install arrowcol-oat aks fleet run \
+  --env-file out/arrowcol-oat/custody.env --stamp-config "$STAMP_CONFIG" \
+  --collector-pool "$COLLECTOR_POOL" --owner-id "$OWNER_ID" \
+  --config out/arrowcol-oat/full-fleet-input.json --out "out/arrowcol-oat/fleet-$OWNER_ID"
+```
+
+Default scale/run/cleanup budgets are 7200/7200/3600 seconds and must fit six
+hours together. The output retains observed fleet/image metadata, resolved
+numeric input and a fleet result; native OAT publication remains the only source
+of committed ranking evidence. A failed native launch retains active custody
+even after successful pool teardown; use the recovery command to independently
+verify idle and release it.
+
+**Destructive recovery:** the following kill entry point resumes only the exact
+durably owned selected user pools after process death. It removes their compute,
+never system or unowned pools. It does not claim a graceful drain, a successful
+benchmark, native run-resource cleanup or a resolved launcher disposition; retain
+and reconcile those original receipts before another benchmark.
+
+```bash
+npx --no-install arrowcol-oat aks fleet kill \
+  --env-file out/arrowcol-oat/custody.env --stamp-config "$STAMP_CONFIG" \
+  --collector-pool "$COLLECTOR_POOL" --owner-id "$OWNER_ID"
+```
+
 ## Build and rehearse
 
 Run inside the repository devcontainer. These commands create local images only:
