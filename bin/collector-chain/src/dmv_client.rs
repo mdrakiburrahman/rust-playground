@@ -4572,7 +4572,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 32)]
     #[ignore = "explicit client-ceiling measurement against an in-memory Flight sink"]
     async fn null_flight_sink_realistic_direct_profile_ceiling() -> Result<()> {
         use arrow_flight::decode::FlightRecordBatchStream;
