@@ -970,13 +970,24 @@ test('post-load failure requires reviewed current custody proof and remains fail
     }
     await rejectFixture({ ...manifest, pools: { ...manifest.pools, observed_at_unix_ms: now + 60_000 } },
       /absence evidence is not current/);
-    const old = now - 11 * 60_000;
-    await rejectFixture({ ...manifest, census: { ...manifest.census, observed_at_unix_ms: old,
-      boot_started_at_unix_ms: old - 3000, container_started_at_unix_ms: old - 2000 },
-      cell: { ...manifest.cell, namespace_observed_at_unix_ms: old, fic_observed_at_unix_ms: old,
-        qap_observed_at_unix_ms: old },
-      pools: { ...manifest.pools, observed_at_unix_ms: old } }, /absence evidence is not current/,
-    Buffer.from(JSON.stringify({ ...receipt, started_at_unix_ms: old - 1 })));
+    const aged = (minutes: number) => {
+      const observed = now - minutes * 60_000;
+      return {
+        proof: { ...manifest, census: { ...manifest.census, observed_at_unix_ms: observed,
+          boot_started_at_unix_ms: observed - 3000, container_started_at_unix_ms: observed - 2000 },
+        cell: { ...manifest.cell, namespace_observed_at_unix_ms: observed, fic_observed_at_unix_ms: observed,
+          qap_observed_at_unix_ms: observed },
+        pools: { ...manifest.pools, observed_at_unix_ms: observed } },
+        receiptBytes: Buffer.from(JSON.stringify({ ...receipt, started_at_unix_ms: observed - 1 })),
+      };
+    };
+    const stale = aged(61);
+    await rejectFixture(stale.proof, /absence evidence is not current/, stale.receiptBytes);
+    const recent = aged(59);
+    const recentApproval = await approveFixture(recent.proof, recent.receiptBytes);
+    await recordLegacyAksDisposition(root, deadline.invocationId, evidencePath, recentApproval);
+    assert.deepEqual(await readFile(deadline.receiptPath), recent.receiptBytes);
+    await unlink(sidecar);
     const [reviewed] = await approveFixture(manifest);
     const approval = [{ ...reviewed!, invocationId: undefined, invocationIdSha256: digest(deadline.invocationId) }];
     await assert.rejects(assertNoUnsettledDeadlineReceipts(root, undefined, approval), /Unsettled AKS/);
@@ -1686,6 +1697,9 @@ test('CLI help is available and unknown options fail as usage errors', async () 
   }
   assert.match(messages.join('\n'), /Usage:.*arrowcol-oat/s);
   assert.match(messages.join('\n'), /--no-viewer/);
+  assert.match(messages.join('\n'), /Post-load evidence must be no more than 60 minutes old/);
+  assert.match(messages.join('\n'), /one original-host lease from census through post-record recheck/);
+  assert.match(messages.join('\n'), /recheck writers and resource custody before a new run; stop if unsafe/);
   await assert.rejects(
     main(['--not-a-real-option', '--config', '/missing-oat-config.json']),
     (error: unknown) => error instanceof Error && error.message === 'Unknown option: --not-a-real-option' && 'exitCode' in error && error.exitCode === 2,

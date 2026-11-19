@@ -102,6 +102,9 @@ Options:
   --cleanup-local <id> Remove one abandoned local Compose cell by its run UUID
   --recover-failed-aks <invocation-id> <approved-evidence-path>
                        Record the reviewed disposition for an approved AKS failure
+                       Post-load evidence must be no more than 60 minutes old.
+                       Keep one original-host lease from census through post-record recheck;
+                       recheck writers and resource custody before a new run; stop if unsafe.
   -h, --help           Show this help`;
 
 type DeadlineCreationState = 'not_started' | 'pending' | 'accepted' | 'rejected' | 'unknown';
@@ -883,7 +886,7 @@ export async function recordLegacyAksDisposition(
   const proof = validateAksDisposition(original, evidence, approval);
   if (proof.kind === 'aborted-post-load-aks' &&
       ![proof.censusObserved, proof.namespaceObserved, proof.ficObserved, proof.poolObserved]
-        .every((time) => time <= Date.now() && Date.now() - time <= 10 * 60_000)) {
+        .every((time) => time <= Date.now() && Date.now() - time <= 60 * 60_000)) {
     throw new Error('Legacy AKS resource absence evidence is not current');
   }
   const checkExisting = async () => {
@@ -903,7 +906,7 @@ export async function recordLegacyAksDisposition(
   const now = Date.now();
   const current = proof.kind === 'aborted-post-load-aks'
     ? [proof.censusObserved, proof.namespaceObserved, proof.ficObserved, proof.poolObserved]
-      .every((time) => time <= now && now - time <= 10 * 60_000)
+      .every((time) => time <= now && now - time <= 60 * 60_000)
     : proof.kind === 'observed-failed-preload-aks'
     ? now - proof.fencedAt <= 4 * 60 * 60_000 && Math.max(proof.namespaceObserved, proof.ficObserved, proof.storageObserved) <= now
     : [proof.namespaceObserved, proof.ficObserved].every((time) => time <= now && now - time <= 30 * 60_000);
@@ -1769,7 +1772,7 @@ export async function main(
       throw new OatCliError('--recover-failed-aks requires exactly an invocation ID and the reviewed evidence file');
     }
     await recordLegacyAksDisposition(receiptRoot, args[1], args[2]);
-    console.log('Recorded verified legacy AKS cleanup; benchmark remains failed and unranked.');
+    console.log('Recorded verified AKS cleanup disposition; benchmark remains failed and unranked.');
     return;
   }
   validateArguments(args);
