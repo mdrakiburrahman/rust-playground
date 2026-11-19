@@ -210,6 +210,7 @@ const CAPABILITIES: &[Capability] = &[
     capability!("collector.commit.batch_window", "10s"),
     capability!("collector.commit.max_files_per_commit", "64"),
     capability!("collector.commit.max_pending_files", "256"),
+    capability!("collector.commit.publication_lookup_mode", "batched"),
     capability!("collector.limits.max_metadata_bytes", "16384"),
     capability!("collector.limits.grpc_accept_compression", "none"),
     capability!("collector.limits.grpc_send_compression", "none"),
@@ -2902,6 +2903,7 @@ mod tests {
                 }),
                 commit: Some(CommitTunables {
                     batch_window: Some("1s".to_owned()),
+                    publication_lookup_mode: Some(arrow_deltalake::commit::PublicationLookupMode::Scalar),
                     ..Default::default()
                 }),
                 limits: Some(LimitsTunables {
@@ -2933,7 +2935,16 @@ mod tests {
         assert_eq!(batching["max_age"], "250ms");
         assert_eq!(batching["age_flush_policy"], "drain_ready");
         assert_eq!(batching["global_capacity"]["rows"], 20_000_000);
-        assert_eq!(env["ARROWCOL_COLLECTOR_COMMIT_CONFIG"], r#"{"batch_window":"1s"}"#);
+        assert_eq!(
+            env["ARROWCOL_COLLECTOR_COMMIT_CONFIG"],
+            r#"{"batch_window":"1s","publication_lookup_mode":"scalar"}"#
+        );
+        assert!(
+            Tunables::parse_oat_json(
+                serde_json::json!({"collector":{"commit":{"publication_lookup_mode":"automatic"}}})
+            )
+            .is_err()
+        );
         assert_eq!(env["ARROWCOL_COLLECTOR_LIMITS_CONFIG"], r#"{"admission_timeout":"5s"}"#);
         assert_eq!(
             env["ARROWCOL_COLLECTOR_PRESSURE_CONFIG"],

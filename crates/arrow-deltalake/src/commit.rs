@@ -18,12 +18,24 @@ use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use tokio::time::Instant;
 
+/// Select the transaction lookup implementation for release comparisons.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicationLookupMode {
+    /// Resolve all requested transaction IDs through one Kernel action replay.
+    #[default]
+    Batched,
+    /// Resolve each ID through Kernel independently as a reference/fallback.
+    Scalar,
+}
+
 /// Limits for eligible files awaiting a shared transaction.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommitOptions {
     pub batch_window: Duration,
     pub max_files_per_commit: usize,
     pub max_pending_files: usize,
+    pub publication_lookup_mode: PublicationLookupMode,
 }
 
 impl Default for CommitOptions {
@@ -32,6 +44,7 @@ impl Default for CommitOptions {
             batch_window: Duration::from_secs(10),
             max_files_per_commit: 64,
             max_pending_files: 256,
+            publication_lookup_mode: PublicationLookupMode::default(),
         }
     }
 }
