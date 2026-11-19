@@ -3925,7 +3925,6 @@ impl DeltaTable {
         for (source_application_id, version, stamp, splits) in prepared_entries {
             let mut source_transactions = Vec::new();
             let mut source_partition_files = std::collections::BTreeSet::new();
-            let mut new_partition_files = 0_usize;
             for (batch, values, identity) in splits {
                 let previous = previous_by_id.get(&identity).copied().flatten();
                 if let Some(previous) = previous
@@ -3935,8 +3934,7 @@ impl DeltaTable {
                 }
                 if previous != Some(version) && !output.contains_key(&values) {
                     let required_files = planned_files
-                        .checked_add(new_partition_files)
-                        .and_then(|files| files.checked_add(1))
+                        .checked_add(1)
                         .context("coalesced output file count overflow")?;
                     if required_files > max_files {
                         return Err(anyhow::Error::new(CoalescedGroupCapacityExceeded {
@@ -3944,9 +3942,6 @@ impl DeltaTable {
                             max_files,
                         }));
                     }
-                    new_partition_files = new_partition_files
-                        .checked_add(1)
-                        .context("coalesced output file count overflow")?;
                 }
                 let transaction_identity = (identity.clone(), version, stamp);
                 source_transactions.push((values.clone(), transaction_identity.clone()));
