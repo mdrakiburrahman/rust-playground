@@ -5759,7 +5759,10 @@ mod tests {
             Arc::clone(&store),
             Arc::new(AllowAllAuthenticator::new(auth)),
             Arc::new(SmokeAdmission(Arc::clone(&state))),
-            RuntimeLimits::default(),
+            RuntimeLimits {
+                max_message_bytes: CLIENT_MESSAGE_LIMIT_BYTES,
+                ..RuntimeLimits::default()
+            },
         )?
         .with_ddl_handler(Arc::new(CatalogControlPlane::new(DdlParser::default(), store)))
         .into_tonic_service();
