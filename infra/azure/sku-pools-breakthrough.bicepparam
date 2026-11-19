@@ -2,6 +2,7 @@
 using './sku-pools.bicep'
 
 param clusterName = 'arrow-collector-68590'
+param enableContainerStorage = true
 param nodeSubnetId = '/subscriptions/68fa0545-661c-4152-93f2-fc8ae1c231b8/resourceGroups/arrow-collector-rg/providers/Microsoft.Network/virtualNetworks/arrow-collector-68590-vnet/subnets/systempool'
 param userPools = [
   {

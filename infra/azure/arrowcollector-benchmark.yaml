@@ -18,19 +18,22 @@
 # Do not use the unrelated native namespace or copy its credentials. The stamp workload identity
 # client/tenant IDs below are identifiers, not credentials. Review sku-pools-breakthrough.bicepparam
 # with a fresh Bicep what-if before any separately authorized deployment. It stages up to eight D64
-# clients, one D64 support node, one E192 collector node, and the Azure Container Storage extension.
+# clients, one D64 support node, one E192 collector node, and the explicitly enabled ACS v2 installer.
 # The workload identity must have sanctioned access. Existing client/profile args below remain
 # diagnostic shared replay; do not score them until L3 supplies the realistic calibrated profile.
 # The pinned images still retain pre-integration capacity limits; do not qualify until L1b/L3
 # provide source-matched images and the bounded capacity/message settings are read back.
 # The 160 DFE / 176 CPU candidate is staged only; verify actual E192 allocatable CPU before applying.
+# ACS v2 has no supported minor/patch pin: record extension and CSI driver versions before and after each window.
+# What-if does not validate local NVMe discovery/provisioning, usable capacity, or CSI scheduling.
+# Verify the actual agentpool label and that ACS CSI pods tolerate the collector NoSchedule taint before storage apply.
 # Supply Secrets in this namespace from your approved secret source (no values in this file):
 # arrowcol-generation[generation] (current stamp authority generation), arrowcol-router-auth
 # [edge-hmac,internal-hmac], arrowcol-sql-{admin,migration,runtime}[password] (fresh generated SQL credentials).
 # Apply with: kubectl --context arrow-collector-68590 apply --server-side -f rendered.yaml -l benchmark-stage=STAGE
 # Stages, in order (wait for success; abort on failure):
-# identity -> prepare/probe FIC and install Secrets -> storage (apply the cluster-scoped StorageClass
-# after the acstor extension is Succeeded; wait for local-csi and its driver) -> sql (wait deploy/arrowcol-sql) -> migration
+# identity -> prepare/probe FIC and install Secrets -> storage (the StorageClass is run-scoped but cluster-scoped:
+# verify exact run-id/owner-token, provisioner, and affinity; reuse read-only only if all match, otherwise create only when absent. Never overwrite/adopt another owner class; wait for ACS and the collector-pool driver) -> sql (wait deploy/arrowcol-sql) -> migration
 # (wait job/arrowcol-migrate-v11-fresh) -> catalog (wait catalog/router/maintenance deployments)
 # -> writer (one ready pod and stable restart count) -> initializer (wait job/direct-pin-live)
 # -> registration (wait job/direct-catalog-verified and verify signed one-table receipt)
@@ -41,10 +44,10 @@
 # Each scored 600 s window needs a fresh run UUID, namespace, FIC and independent initialization; this
 # one rendered run is not two-window qualification. Repeat only after source/image readiness and approval.
 # Each admitted external push_batch receives a new PublicationId: scored clients must use L3's verified
-# single-attempt/no-resubmission path and exclude failed or ambiguous sends from credit.
+# single-attempt/no-resubmission path; any failed or ambiguous logical send invalidates the entire scored window (no partial credit).
 # Local NVMe is a bounded 256 Gi staging area via TMPDIR, not durable storage or an acknowledgment.
-# No QAP/Kusto consumer is deployed here. Use owned UID-bound namespace and FIC cleanup after
-# stopping load, preserving all Delta objects; verify workload pools physically return to zero.
+# No QAP/Kusto consumer is deployed here. Keep cluster-scoped cleanup separate from namespace/FIC cleanup.
+# After drain, remove the StorageClass only if exact run-id and owner-token labels match and no PVC/PV uses it. Never remove the shared ACS extension as routine run cleanup. Preserve Delta objects and verify pools physically return to zero.
 # Isolated development benchmark only, not a production deployment or authentication recipe.
 # HMAC-authenticated internal traffic is not TLS; retain the supplied workload identity,
 # Secrets and network policies. native_quiver is false (memory-only buffering).
@@ -66,10 +69,12 @@ metadata:
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
-  name: local-csi
+  name: arrowcol-BENCHRUNHEX-local-csi
   labels:
     app.kubernetes.io/part-of: arrowcol-oat
     benchmark-stage: storage
+    arrowcol-oat/run-id: BENCHRUNUUID
+    arrowcol-oat/owner-token: BENCHOWNER
   annotations:
     storageoperator.acstor.io/nodeAffinity: |
       requiredDuringSchedulingIgnoredDuringExecution:
@@ -620,8 +625,7 @@ metadata:
     app.kubernetes.io/part-of: arrowcol-oat
     benchmark-stage: catalog
 spec:
-  type: NodePort
-  externalTrafficPolicy: Local
+  type: ClusterIP
   internalTrafficPolicy: Local
   selector:
     app: arrowcol-router
@@ -630,7 +634,6 @@ spec:
       protocol: TCP
       port: 30550
       targetPort: 50050
-      nodePort: 30550
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -1240,7 +1243,7 @@ spec:
               spec:
                 accessModes:
                   - ReadWriteOnce
-                storageClassName: local-csi
+                storageClassName: arrowcol-BENCHRUNHEX-local-csi
                 resources:
                   requests:
                     storage: 256Gi
@@ -1511,7 +1514,7 @@ spec:
           image: arrowcollector68590.azurecr.io/arrowcol-oat-client@sha256:29666c4b093393a27bf24c142153491ec320eb43ee9883c76b7d89cdfcfb4e30
           args:
             - --endpoint
-            - http://$(NODE_IP):30550
+            - http://arrowcol-router-node-local:30550
             - --client-id
             - direct-BENCHRUNUUID-$(CLIENT_INDEX)
             - --table
@@ -1553,10 +1556,6 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
-            - name: NODE_IP
-              valueFrom:
-                fieldRef:
-                  fieldPath: status.hostIP
           resources:
             requests:
               cpu: "32"
