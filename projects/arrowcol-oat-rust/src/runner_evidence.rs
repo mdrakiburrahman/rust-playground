@@ -1286,42 +1286,39 @@ impl ResourceSampler {
                     };
                     let expected_identity = guard.as_ref()
                         .and_then(|(probe, _)| probe.expected_scale_out_identity.clone());
+                    let deadline = request_anchor + Duration::from_millis(other_timeout_ms);
                     let guard_reading = async {
                         match (&mut guard, &backlog_scraper) {
                             (Some((probe, engine)), Some(scraper)) => probe
-                                .read(&config, scraper, &mut engine.proof["admission_diagnostics"])
+                                .read(&config, scraper, &mut engine.proof["admission_diagnostics"], deadline)
                                 .await
                                 .map(Some),
                             _ => Ok(None),
                         }
                     };
-                    let deadline = request_anchor + Duration::from_millis(other_timeout_ms);
-                    let (resource_result, (guard_result, backlog_result)) = tokio::join!(
+                    let (resource_result, (guard_result, backlog_result, identity)) = tokio::join!(
                         tokio::time::timeout(Duration::from_millis(other_timeout_ms), sample),
                         guarded_composite_observation(
-                            async {
-                                tokio::time::timeout(Duration::from_millis(other_timeout_ms), guard_reading)
-                                    .await.context("live cap or ingestion commit readback deadline exceeded")?
-                            },
+                            guard_reading,
                             bounded_publication_backlog_scrape(backlog_scraper.as_ref(),
                                 request_anchor + Duration::from_millis(timeout_ms)),
-                            async {
-                                if expected_identity.is_some() {
-                                    if tokio::time::Instant::now() >= deadline {
-                                        bail!("collector identity fence deadline exceeded");
-                                    }
-                                    tokio::time::timeout_at(
-                                        deadline,
-                                        verify_guard_identity(&config, expected_identity.as_deref()),
-                                    ).await.context("collector identity fence deadline exceeded")??;
-                                    if tokio::time::Instant::now() >= deadline {
-                                        bail!("collector identity fence deadline exceeded");
-                                    }
-                                }
-                                Ok(())
-                            },
+                            async { verify_guard_identity(&config, expected_identity.as_deref()).await },
+                            deadline,
                         ),
                     );
+                    if let Some((_, engine)) = &mut guard {
+                        record_guard_read_leg(&mut engine.proof["admission_diagnostics"], "collector_identity_after_backlog", &identity);
+                    }
+                    let guard_result = match guard_result {
+                        Ok(Some(reading)) => identity.into_result().map(|_| Some(reading)),
+                        Ok(None) => Ok(None),
+                        Err(error) => Err(error),
+                    };
+                    if let Err(error) = &guard_result
+                        && let Some((_, engine)) = &mut guard
+                    {
+                        record_guard_read_error(&mut engine.proof["admission_diagnostics"], error);
+                    }
                     match resource_result {
                         Ok(Ok(Some(metrics))) => {
                             let sampled_at_unix_ms = unix_time_ms_u64()?;
