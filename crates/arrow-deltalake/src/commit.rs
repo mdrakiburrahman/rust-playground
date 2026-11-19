@@ -1407,47 +1407,36 @@ mod tests {
     fn empty_group_receipts_do_not_alias_by_file_range_in_either_order() {
         for fresh_reply in [0, 1] {
             let replay_reply = 1 - fresh_reply;
-            let fresh = CoalescedCommitGroup {
+            let fresh = CommitDisposition {
                 start: 0,
                 end: 0,
-                reply_index: fresh_reply,
-                identities: vec![("fresh".into(), 0, 20)],
+                reply_index: Some(fresh_reply),
+                transaction_ids: vec!["fresh".into()],
+                outcome: CommitOutcome::Committed,
+                authoritative_version: Some(7),
             };
-            let replay = CoalescedCommitGroup {
+            let replay = CommitDisposition {
                 start: 0,
                 end: 0,
-                reply_index: replay_reply,
-                identities: vec![("replay".into(), 0, 10)],
+                reply_index: Some(replay_reply),
+                transaction_ids: vec!["replay".into()],
+                outcome: CommitOutcome::Deduplicated,
+                authoritative_version: None,
             };
-            let groups = if fresh_reply == 0 {
+            let dispositions = if fresh_reply == 0 {
                 vec![fresh, replay]
             } else {
                 vec![replay, fresh]
             };
-            let skipped_groups = std::collections::HashSet::from([replay_reply]);
-            let dispositions = commit_dispositions(
-                0,
-                &groups,
-                &skipped_groups,
-                &std::collections::HashSet::new(),
-                CommitOutcome::Committed,
-                Some(7),
-            );
-            let fresh_dispositions = dispositions
-                .iter()
-                .filter(|disposition| disposition.reply_index == Some(fresh_reply))
-                .collect::<Vec<_>>();
-            let replay_dispositions = dispositions
-                .iter()
-                .filter(|disposition| disposition.reply_index == Some(replay_reply))
-                .collect::<Vec<_>>();
+            let fresh_ids = std::collections::HashSet::from(["fresh"]);
+            let replay_ids = std::collections::HashSet::from(["replay"]);
             assert_eq!(
-                outcome_for_publication_range(0, 0, &fresh_dispositions, CommitOutcome::Committed, 7),
-                (CommitOutcome::Committed, Some(7))
+                outcome_for_transaction_ids(fresh_reply, &fresh_ids, 0, 0, &dispositions, CommitOutcome::Noop, 7,),
+                Some((CommitOutcome::Committed, Some(7)))
             );
             assert_eq!(
-                outcome_for_publication_range(0, 0, &replay_dispositions, CommitOutcome::Committed, 7),
-                (CommitOutcome::Deduplicated, None)
+                outcome_for_transaction_ids(replay_reply, &replay_ids, 0, 0, &dispositions, CommitOutcome::Noop, 7,),
+                Some((CommitOutcome::Deduplicated, None))
             );
         }
     }
@@ -1515,20 +1504,14 @@ mod tests {
 
     #[test]
     fn reconciled_audit_mapping_keeps_original_version_unknown() {
-        let groups = [CoalescedCommitGroup {
+        let dispositions = [CommitDisposition {
             start: 0,
             end: 1,
-            reply_index: 0,
-            identities: vec![("source".into(), 0, 10)],
+            reply_index: Some(0),
+            transaction_ids: vec!["source".into()],
+            outcome: CommitOutcome::Reconciled,
+            authoritative_version: None,
         }];
-        let dispositions = commit_dispositions(
-            1,
-            &groups,
-            &std::collections::HashSet::new(),
-            &std::collections::HashSet::new(),
-            CommitOutcome::Reconciled,
-            None,
-        );
         let source_ids = std::collections::HashSet::from(["source"]);
         assert_eq!(
             outcome_for_transaction_ids(0, &source_ids, 0, 1, &dispositions, CommitOutcome::Committed, 9),
