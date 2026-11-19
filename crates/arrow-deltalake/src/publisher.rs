@@ -1320,6 +1320,25 @@ impl PublisherSession {
     /// # Errors
     /// Returns revocation, fencing, local refusal or read failures.
     pub async fn check_async(&self) -> Result<()> {
+        self.check_authority_async().await?;
+        self.shared.admitting()?;
+        Ok(())
+    }
+
+    // Read-only reconciliation must remain possible after a lost write response.
+    // This does not clear uncertainty or permit another mutation.
+    pub(crate) fn check_snapshot(self: &Arc<Self>) -> Result<()> {
+        let session = Arc::clone(self);
+        block_on_shared(async move {
+            session.check_authority_async().await?;
+            if session.shared.lock().phase != Phase::Open {
+                bail!("publisher session is not open for snapshot refresh");
+            }
+            Ok(())
+        })
+    }
+
+    async fn check_authority_async(&self) -> Result<()> {
         if let Some(registration) = &self.registration {
             let snapshot = registration.control.read().await?;
             let registry = Registry::parse(&snapshot.metadata, &registration.sandbox_id)?;
@@ -1346,7 +1365,6 @@ impl PublisherSession {
                 bail!("publisher authority is not admitting: {reason}");
             }
         }
-        self.shared.admitting()?;
         Ok(())
     }
 

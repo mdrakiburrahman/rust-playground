@@ -581,6 +581,16 @@ mod io_tests {
     async fn remote_snapshot_fixture(
         fence: Option<Arc<dyn PublicationFence>>,
     ) -> Result<(Arc<DeltaTable>, Arc<object_store::memory::InMemory>, Arc<StageControl>)> {
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let (table, control) =
+            remote_snapshot_fixture_with_store(fence, Arc::<object_store::memory::InMemory>::clone(&store)).await?;
+        Ok((table, store, control))
+    }
+
+    async fn remote_snapshot_fixture_with_store(
+        fence: Option<Arc<dyn PublicationFence>>,
+        store: Arc<dyn ObjectStore>,
+    ) -> Result<(Arc<DeltaTable>, Arc<StageControl>)> {
         let control = Arc::new(StageControl(Mutex::new(crate::publisher::MetadataSnapshot {
             etag: "0".into(),
             metadata: [
@@ -603,16 +613,137 @@ mod io_tests {
             Some("00000000-0000-4000-8000-000000000001"),
         )
         .await?;
-        let store = Arc::new(object_store::memory::InMemory::new());
         let table = DeltaTable::open_connection_with_store(
             Url::parse("abfss://data@fixture.dfs.core.windows.net/table/")?,
             Vec::new(),
             fence,
             Some(session),
-            Some(Arc::<object_store::memory::InMemory>::clone(&store)),
+            Some(store),
         )?;
         table.ensure_schema(input_batch()?.schema())?;
-        Ok((table, store, control))
+        Ok((table, control))
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn remote_snapshot_reconciles_unknown_commit_without_reopening_mutations() -> Result<()> {
+        for fail_commit_reads in [false, true] {
+            let store = Arc::new(PausedStagePut {
+                lose_commit_response: true,
+                fail_commit_reads,
+                ..Default::default()
+            });
+            let (table, _) = remote_snapshot_fixture_with_store(None, Arc::<PausedStagePut>::clone(&store)).await?;
+            let base = table.snapshot()?;
+            assert!(Arc::ptr_eq(&base, &table.snapshot()?));
+            let input = input_batch()?;
+            let mut file = table
+                .new_file(input.schema())?
+                .with_transaction("remote-unknown".into(), 0)?;
+            file.write(&input).await?;
+            let result = file.finish().await;
+            assert_eq!(result.is_ok(), !fail_commit_reads, "{result:?}");
+            let published = store
+                .inner
+                .get(&table.object_path("_delta_log/00000000000000000001.json")?)
+                .await?
+                .bytes()
+                .await?;
+            assert_eq!(
+                std::str::from_utf8(&published)?
+                    .lines()
+                    .filter(|line| line.contains("\"add\":"))
+                    .count(),
+                1
+            );
+            assert!(
+                store
+                    .inner
+                    .head(&table.object_path("_delta_log/00000000000000000002.json")?)
+                    .await
+                    .is_err()
+            );
+            let session = table.session.as_ref().context("session")?;
+            assert!(session.status().uncertain.is_some());
+            assert!(session.check().is_err());
+            assert!(session.close_after_drain_async().await.is_err());
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn remote_snapshot_preserves_external_conflict_and_replay() -> Result<()> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct ExternalFence {
+            store: Arc<object_store::memory::InMemory>,
+            armed: AtomicBool,
+        }
+        impl PublicationFence for ExternalFence {
+            fn check_before_commit(
+                &self,
+                context: &PublicationFenceContext<'_>,
+            ) -> std::result::Result<(), PublicationFenceError> {
+                if self.armed.swap(false, Ordering::SeqCst) {
+                    let store = Arc::clone(&self.store);
+                    let read = context.read_version();
+                    let next = context.proposed_version();
+                    let append = || -> Result<()> {
+                        shared_executor()?.block_on(async move {
+                            let root = object_store::path::Path::from("table/_delta_log");
+                            let bytes = store
+                                .get(&root.child(format!("{read:020}.json")))
+                                .await?
+                                .bytes()
+                                .await?;
+                            store
+                                .put_opts(
+                                    &root.child(format!("{next:020}.json")),
+                                    bytes.into(),
+                                    PutMode::Create.into(),
+                                )
+                                .await?;
+                            Ok(())
+                        })
+                    };
+                    append().map_err(|error| PublicationFenceError::check_failed(error.to_string()))?;
+                }
+                Ok(())
+            }
+        }
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let fence = Arc::new(ExternalFence {
+            store: Arc::clone(&store),
+            armed: AtomicBool::new(false),
+        });
+        let (table, _) = remote_snapshot_fixture_with_store(
+            Some(Arc::<ExternalFence>::clone(&fence)),
+            Arc::<object_store::memory::InMemory>::clone(&store),
+        )
+        .await?;
+        let input = input_batch()?;
+        let mut first = table.new_file(input.schema())?;
+        first.write(&input).await?;
+        assert_eq!(first.finish().await?.version, 1);
+        table.snapshot()?;
+        let mut file = table
+            .new_file(input.schema())?
+            .with_transaction("remote-replay".into(), 0)?;
+        file.write(&input).await?;
+        fence.armed.store(true, Ordering::SeqCst);
+        assert_eq!(file.finish().await?.version, 3);
+        assert_eq!(table.checkpoint()?, 3);
+        let mut replay = table
+            .new_file(input.schema())?
+            .with_transaction("remote-replay".into(), 0)?;
+        replay.write(&input).await?;
+        assert_eq!(replay.finish().await?.version, 3);
+        assert_eq!(table.lookup_txn("remote-replay")?, Some(0));
+        table
+            .session
+            .as_ref()
+            .context("session")?
+            .close_after_drain_async()
+            .await?;
+        Ok(())
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -832,6 +963,9 @@ mod io_tests {
         fail_complete: bool,
         fail_abort: bool,
         abort_calls: Arc<std::sync::atomic::AtomicUsize>,
+        lose_commit_response: bool,
+        fail_commit_reads: bool,
+        commit_written: std::sync::atomic::AtomicBool,
     }
 
     impl std::fmt::Display for PausedStagePut {
@@ -848,6 +982,17 @@ mod io_tests {
             payload: object_store::PutPayload,
             options: object_store::PutOptions,
         ) -> object_store::Result<object_store::PutResult> {
+            if self.lose_commit_response {
+                let result = self.inner.put_opts(path, payload, options).await?;
+                if path.as_ref().ends_with("00000000000000000001.json") {
+                    self.commit_written.store(true, std::sync::atomic::Ordering::SeqCst);
+                    return Err(object_store::Error::Generic {
+                        store: "lost commit response",
+                        source: Box::new(std::io::Error::other("published then disconnected")),
+                    });
+                }
+                return Ok(result);
+            }
             if let Some(nested) = &self.nested {
                 use std::sync::atomic::Ordering;
                 nested.entered.fetch_add(1, Ordering::SeqCst);
@@ -913,6 +1058,15 @@ mod io_tests {
             path: &object_store::path::Path,
             options: object_store::GetOptions,
         ) -> object_store::Result<object_store::GetResult> {
+            if self.fail_commit_reads
+                && self.commit_written.load(std::sync::atomic::Ordering::SeqCst)
+                && path.as_ref().ends_with("00000000000000000001.json")
+            {
+                return Err(object_store::Error::Generic {
+                    store: "unreadable committed log",
+                    source: Box::new(std::io::Error::other("reconciliation read unavailable")),
+                });
+            }
             self.inner.get_opts(path, options).await
         }
 
@@ -3583,7 +3737,7 @@ impl DeltaTable {
             .session
             .as_ref()
             .context("remote snapshot requires a publisher session")?;
-        session.check()?;
+        session.check_snapshot()?;
         let before = self.remote_log_fingerprints()?;
         let base = previous.filter(|previous| {
             before.as_ref().is_some_and(|files| {
@@ -3606,7 +3760,7 @@ impl DeltaTable {
             None => full_build()?,
         };
         let after = self.remote_log_fingerprints()?;
-        session.check()?;
+        session.check_snapshot()?;
         if let (Some(before), Some(after)) = (before, after) {
             if before == after {
                 *cache = Some(CachedRemoteSnapshot {
@@ -3619,7 +3773,7 @@ impl DeltaTable {
         if base.is_some() {
             tracing::debug!("remote Delta log changed during incremental refresh; rebuilding without cached state");
             let snapshot = full_build()?;
-            session.check()?;
+            session.check_snapshot()?;
             return Ok(snapshot);
         }
         Ok(snapshot)

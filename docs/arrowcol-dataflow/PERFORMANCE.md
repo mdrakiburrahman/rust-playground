@@ -71,6 +71,17 @@ table while its single commit worker publishes earlier groups. The existing
 apply. Pipelined groups use `commit.batch_window` and `max_files_per_commit`
 rather than forcing a version per group. See the [control contracts](../experiments/arrowcol-oat/TUNABLES.md#single-table-preparation-and-commit-overlap).
 
+## Remote snapshot refresh
+
+ADLS snapshots use Kernel's incremental builder only after validating the retained
+log's object identities. Each refresh still lists metadata before and after the
+build and checks publisher authority; this reduces replay work, not listing cost.
+Checkpoint/CRC changes, replacement or removal of retained objects force a fresh
+build. Missing ETags/version IDs or more than 4,096 log objects disable reuse.
+The filesystem cache is not used for ADLS. Schema and retention checks and the
+final publication fence remain unchanged. Read-only reconciliation after a lost
+write response does not clear uncertainty or admit another mutation.
+
 ## Layout readback
 
 Startup `arrowcol_effective_config <JSON>` includes a root `layout` object with
