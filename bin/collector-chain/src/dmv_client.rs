@@ -3521,9 +3521,10 @@ mod tests {
         const ROWS_PER_BATCH: u32 = 4_096;
         const WINDOW_MS: u64 = 600_000;
         const WARMUP_MS: u64 = 60_000;
-        let total_batches =
-            (6_440_000_u64 * (WINDOW_MS + WARMUP_MS) + u64::from(ROWS_PER_BATCH) - 1) / u64::from(ROWS_PER_BATCH);
-        let warmup_batches = (6_440_000_u64 * WARMUP_MS + u64::from(ROWS_PER_BATCH) - 1) / u64::from(ROWS_PER_BATCH);
+        let total_batches = (6_440_000_u64 * ((WINDOW_MS + WARMUP_MS) / 1_000) + u64::from(ROWS_PER_BATCH) - 1)
+            / u64::from(ROWS_PER_BATCH);
+        let warmup_batches =
+            (6_440_000_u64 * (WARMUP_MS / 1_000) + u64::from(ROWS_PER_BATCH) - 1) / u64::from(ROWS_PER_BATCH);
         anyhow::ensure!(
             total_batches % WORKERS as u64 == 0,
             "full-window batch count must divide across workers"
