@@ -690,13 +690,13 @@ mod io_tests {
                         shared_executor()?.block_on(async move {
                             let root = object_store::path::Path::from("table/_delta_log");
                             let bytes = store
-                                .get(&root.child(format!("{read:020}.json")))
+                                .get(&root.clone().join(format!("{read:020}.json")))
                                 .await?
                                 .bytes()
                                 .await?;
                             store
                                 .put_opts(
-                                    &root.child(format!("{next:020}.json")),
+                                    &root.join(format!("{next:020}.json")),
                                     bytes.into(),
                                     PutMode::Create.into(),
                                 )
@@ -841,6 +841,77 @@ mod io_tests {
                     .is_none()
             );
         }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn remote_snapshot_observes_retention_changes_and_bounds_cached_metadata() -> Result<()> {
+        let (table, store, _) = remote_snapshot_fixture(None).await?;
+        table.snapshot()?;
+        let original = store
+            .get(&table.object_path("_delta_log/00000000000000000000.json")?)
+            .await?
+            .bytes()
+            .await?;
+        let mut actions = std::str::from_utf8(&original)?
+            .lines()
+            .map(serde_json::from_str::<serde_json::Value>)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let metadata = actions
+            .iter_mut()
+            .find_map(|action| action.get_mut("metaData"))
+            .context("metadata")?;
+        metadata["configuration"]["delta.setTransactionRetentionDuration"] = serde_json::json!("interval 1 day");
+        let changed = actions
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .join("\n");
+        store
+            .put(
+                &table.object_path("_delta_log/00000000000000000001.json")?,
+                bytes::Bytes::from(changed).into(),
+            )
+            .await?;
+        assert_eq!(table.snapshot()?.version(), 1);
+        assert!(
+            table
+                .lookup_txn("expired")
+                .unwrap_err()
+                .to_string()
+                .contains("retention")
+        );
+        table
+            .session
+            .as_ref()
+            .context("session")?
+            .close_after_drain_async()
+            .await?;
+
+        let (table, store, _) = remote_snapshot_fixture(None).await?;
+        table.snapshot()?;
+        for index in 0..4096 {
+            store
+                .put(
+                    &table.object_path(&format!("_delta_log/observer-{index}"))?,
+                    bytes::Bytes::new().into(),
+                )
+                .await?;
+        }
+        assert_eq!(table.snapshot()?.version(), 0);
+        assert!(
+            table
+                .remote_snapshot_cache
+                .lock()
+                .map_err(|error| anyhow::anyhow!("{error}"))?
+                .is_none()
+        );
+        table
+            .session
+            .as_ref()
+            .context("session")?
+            .close_after_drain_async()
+            .await?;
         Ok(())
     }
 
