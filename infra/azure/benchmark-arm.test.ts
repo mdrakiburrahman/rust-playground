@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { delimiter, join } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { observeWriter, validateArm, type ArmIdentity } from './benchmark-arm.js';
+import { observeWriter, observeWriterExit, validateArm, type ArmIdentity } from './benchmark-arm.js';
 
 const identity: ArmIdentity = {
   runId: '01234567-89ab-cdef-0123-456789abcdef',
@@ -41,8 +41,8 @@ function fixture() {
     metadata: { ...writerMeta, name: 'writer-pod', uid: 'writer-pod-uid',
       ownerReferences: [{ kind: 'ReplicaSet', name: 'writer-rs', uid: 'writer-rs-uid', controller: true }] },
     spec: { containers: [{ name: 'dataflow', image: `example/writer@sha256:${'b'.repeat(64)}` }] },
-    status: { phase: 'Running', containerStatuses: [{ name: 'dataflow', ready: true, restartCount: 0,
-      imageID: `sha256:${'c'.repeat(64)}`, containerID: 'containerd://original',
+    status: { phase: 'Running', podIP: '10.0.0.47', containerStatuses: [{ name: 'dataflow', ready: true, restartCount: 0,
+      imageID: `example/writer@sha256:${'b'.repeat(64)}`, containerID: 'containerd://original',
       state: { running: { startedAt: '2026-01-01T00:00:00Z' } } }] },
   }] };
   return { namespace, job, schedule, pods, logs, deployment, replicaSets, writerPods };
@@ -55,8 +55,32 @@ test('pins the exact running writer and refuses a restarted or foreign replaceme
   f.writerPods.items[0].status.containerStatuses[0].restartCount = 1;
   assert.throws(observe, /not the original healthy lifetime/);
   f.writerPods.items[0].status.containerStatuses[0].restartCount = 0;
+  const imageId = f.writerPods.items[0].status.containerStatuses[0].imageID;
+  f.writerPods.items[0].status.containerStatuses[0].imageID = `sha256:${'c'.repeat(64)}`;
+  assert.throws(observe, /runtime digest differs/);
+  f.writerPods.items[0].status.containerStatuses[0].imageID = imageId;
   f.replicaSets.items[0].metadata.ownerReferences[0].uid = 'different-deployment';
   assert.throws(observe, /not owned by the exact Deployment/);
+});
+
+test('requires a clean terminal observation of the original container, not absence or a substitute', () => {
+  const f = fixture();
+  const original = observeWriter(identity, f.deployment, f.replicaSets, f.writerPods);
+  const pod = f.writerPods.items[0];
+  const startedAt = original.startedAt, finishedAt = '2026-01-01T00:01:02Z';
+  const terminated = { containerID: original.containerId, startedAt, finishedAt, exitCode: 0, reason: 'Completed' };
+  const end = { ...pod, metadata: { ...pod.metadata, resourceVersion: '21' }, status: { containerStatuses: [
+    { ...pod.status.containerStatuses[0], state: { terminated } },
+  ] } };
+  const begin = Date.parse('2026-01-01T00:01:01.789Z');
+  assert.equal(observeWriterExit(identity, original, end, begin).finishedAt, finishedAt);
+  assert.throws(() => observeWriterExit(identity, original, undefined, begin), /terminal writer Pod/);
+  assert.throws(() => observeWriterExit(identity, original, { ...end, metadata: { ...end.metadata, uid: 'replacement' } }, begin), /replaced/);
+  terminated.containerID = 'containerd://other-lifetime';
+  assert.throws(() => observeWriterExit(identity, original, end, begin), /exact clean exit/);
+  terminated.containerID = original.containerId;
+  terminated.exitCode = 137;
+  assert.throws(() => observeWriterExit(identity, original, end, begin), /exact clean exit/);
 });
 
 test('requires every distinct, owned, healthy indexed client before arming', () => {

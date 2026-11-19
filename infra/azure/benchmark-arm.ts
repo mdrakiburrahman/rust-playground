@@ -81,12 +81,53 @@ export function observeWriter(identity: ArmIdentity, deployment: unknown, replic
   const startedAt = text(object(object(active.state, 'writer state').running, 'running writer').startedAt, 'writer start');
   const imageId = text(active.imageID, 'writer runtime image');
   const containerId = text(active.containerID, 'writer runtime container');
+  if (!matchesImageDigest(image, imageId)) throw new Error('Writer runtime digest differs from its pinned image');
   if (status.phase !== 'Running' || active.name !== 'dataflow' || active.ready !== true || active.restartCount !== 0 ||
-      !Number.isFinite(Date.parse(startedAt)) || !/sha256:[0-9a-f]{64}$/.test(imageId)) {
+      !Number.isFinite(Date.parse(startedAt))) {
     throw new Error('Writer container is not the original healthy lifetime');
   }
+  const podIp = text(status.podIP, 'writer pod IP');
   return { deploymentUid, replicaSetUid: text(replica.uid, 'writer ReplicaSet UID'),
-    podName: text(pm.name, 'writer pod name'), podUid: text(pm.uid, 'writer pod UID'), image, imageId, containerId, startedAt };
+    podName: text(pm.name, 'writer pod name'), podUid: text(pm.uid, 'writer pod UID'), podIp, image, imageId, containerId, startedAt };
+}
+
+export type WriterLifetime = ReturnType<typeof observeWriter>;
+
+function matchesImageDigest(image: string, imageId: string): boolean {
+  const expected = /@(sha256:[0-9a-f]{64})$/.exec(image)?.[1];
+  return expected !== undefined && /(?:^|[@/])(sha256:[0-9a-f]{64})$/.exec(imageId)?.[1] === expected;
+}
+
+/** Call on a positive Pod API observation; absence is never terminal evidence. */
+export function observeWriterExit(identity: ArmIdentity, original: WriterLifetime, value: unknown, drainStartedMs: number) {
+  const pod = object(value, 'terminal writer Pod');
+  const pm = object(pod.metadata, 'terminal writer metadata');
+  ownership(pm, identity);
+  if (pod.apiVersion !== 'v1' || pod.kind !== 'Pod' || pm.namespace !== identity.namespace ||
+      pm.name !== original.podName || pm.uid !== original.podUid ||
+      controller(pm, 'ReplicaSet').uid !== original.replicaSetUid) throw new Error('Original writer pod was replaced');
+  const spec = object(pod.spec, 'terminal writer spec');
+  const containers = array(spec.containers, 'terminal writer containers');
+  const statuses = array(object(pod.status, 'terminal writer status').containerStatuses, 'terminal writer container statuses');
+  if (containers.length !== 1 || statuses.length !== 1) throw new Error('Terminal writer coverage changed');
+  const container = object(containers[0], 'terminal writer container');
+  const status = object(statuses[0], 'terminal writer container status');
+  const state = object(status.state, 'terminal writer state');
+  const ended = object(state.terminated, 'writer termination');
+  const startedAt = text(ended.startedAt, 'writer termination start');
+  const finishedAt = text(ended.finishedAt, 'writer termination finish');
+  const finishMs = Date.parse(finishedAt);
+  if (container.name !== 'dataflow' || container.image !== original.image ||
+      status.name !== 'dataflow' || status.restartCount !== 0 || status.imageID !== original.imageId ||
+      !matchesImageDigest(original.image, original.imageId) ||
+      status.containerID !== original.containerId || ended.containerID !== original.containerId ||
+      Object.keys(state).length !== 1 || startedAt !== original.startedAt || !Number.isFinite(Date.parse(startedAt)) ||
+      !Number.isSafeInteger(drainStartedMs) || drainStartedMs < Date.parse(startedAt) ||
+      !Number.isFinite(finishMs) || finishMs < Math.floor(drainStartedMs / 1000) * 1000 ||
+      ended.exitCode !== 0 || (ended.signal !== undefined && ended.signal !== 0) || ended.reason !== 'Completed') {
+    throw new Error('Original writer did not produce an exact clean exit after drain began');
+  }
+  return { ...original, finishedAt, terminalPodResourceVersion: text(pm.resourceVersion, 'terminal pod resourceVersion') };
 }
 
 export function validateArm(

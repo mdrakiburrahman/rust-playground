@@ -96,14 +96,16 @@
 # Do not pass --timestamps: the extractor requires collector JSON lines to begin with `{`.
 # Its readline implementation buffers each complete line before applying the 8-MiB line cap.
 # Check every command exit and preserve the original logs.
+# kubectl logs only returns the latest rotated file; it is not complete-log custody at load.
 # npx --no-install tsx infra/azure/benchmark-extract.ts manifest "$EVIDENCE/client-$INDEX.log" "$EVIDENCE/client-$INDEX-manifest.json"
 # npx --no-install tsx infra/azure/benchmark-extract.ts collector "$EVIDENCE/collector.log" "$EVIDENCE/collector-receipts.jsonl"
 # Extractor writes new files only; any error leaves an incomplete output that must not be used.
 # Resolve the exact table's _delta_log prefix from the run's catalog/initializer receipt. After drain,
 # download all its JSON blobs:
 # az storage blob download-batch --auth-mode login --account-name "$ACCOUNT" --source "$CONTAINER" --destination "$EVIDENCE/delta-download" --pattern "$LOG_PREFIX/*.json"
-# Use the version-directory as --delta-json-dir for the reviewed reconciler; verify all versions from
-# zero through the recorded post-drain end version are present, including maintenance commits.
+# Verify every version from zero through the independently recorded post-drain end version is present.
+# npx --no-install tsx infra/azure/benchmark-audit.ts --manifest "$EVIDENCE/client-0-manifest.json" --collector-jsonl "$EVIDENCE/collector-receipts.jsonl" --delta-json-dir "$DELTA_JSON_DIR" --baseline-version "$PRE_LOAD_DELTA_VERSION"
+# Repeat --manifest for every client. This checks accounting only and does not authorize deletion.
 # Preserve original terminal manifests and collector JSON receipts without numeric round-tripping.
 # Reconcile all clients against identical bounds, physical publications and files; missing/truncated
 # logs, unresolved/ambiguous sends or incomplete Delta history invalidate the entire scored window.
