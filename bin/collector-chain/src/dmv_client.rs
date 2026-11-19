@@ -3716,6 +3716,61 @@ mod tests {
         })
     }
 
+    fn eligible_measurement_send_ack(
+        cohort: ManifestCohort,
+        outcome: ManifestOutcome,
+        acknowledged_unix_ms: Option<u64>,
+        start_unix_ms: u64,
+        end_unix_ms: u64,
+    ) -> bool {
+        cohort == ManifestCohort::Measurement
+            && outcome == ManifestOutcome::Acknowledged
+            && acknowledged_unix_ms.is_some_and(|observed| observed >= start_unix_ms && observed < end_unix_ms)
+    }
+
+    #[test]
+    fn measurement_send_ack_eligibility_uses_half_open_bounds() {
+        let start = 1_000;
+        let end = 2_000;
+        let eligible =
+            |cohort, outcome, acknowledged| eligible_measurement_send_ack(cohort, outcome, acknowledged, start, end);
+        assert!(eligible(
+            ManifestCohort::Measurement,
+            ManifestOutcome::Acknowledged,
+            Some(start)
+        ));
+        assert!(eligible(
+            ManifestCohort::Measurement,
+            ManifestOutcome::Acknowledged,
+            Some(end - 1)
+        ));
+        assert!(!eligible(
+            ManifestCohort::Measurement,
+            ManifestOutcome::Acknowledged,
+            Some(end)
+        ));
+        assert!(!eligible(
+            ManifestCohort::Measurement,
+            ManifestOutcome::Acknowledged,
+            Some(start - 1)
+        ));
+        assert!(!eligible(
+            ManifestCohort::Measurement,
+            ManifestOutcome::Acknowledged,
+            None
+        ));
+        assert!(!eligible(
+            ManifestCohort::Warmup,
+            ManifestOutcome::Acknowledged,
+            Some(start)
+        ));
+        assert!(!eligible(
+            ManifestCohort::Measurement,
+            ManifestOutcome::Failed,
+            Some(start)
+        ));
+    }
+
     #[test]
     fn logical_identity_namespaces_are_injective_and_checked() -> Result<()> {
         let run = uuid::Uuid::from_u128(1);
@@ -6181,6 +6236,16 @@ mod tests {
         );
         let (record_count, total_rows, physical_fragments, canonical_bytes, distinct_facts) =
             validate_manifest_identity_ranges(terminal_manifest)?;
+        let measurement_start_unix_ms = terminal_receipt["measurement_window"]["start_unix_ms"]
+            .as_u64()
+            .context("missing measurement start timestamp")?;
+        let measurement_end_unix_ms = terminal_receipt["measurement_window"]["end_unix_ms"]
+            .as_u64()
+            .context("missing measurement end timestamp")?;
+        anyhow::ensure!(
+            measurement_start_unix_ms < measurement_end_unix_ms,
+            "measurement window has invalid bounds"
+        );
         let (
             offered_measurement_parents,
             offered_measurement_rows,
@@ -6196,6 +6261,9 @@ mod tests {
             measurement_acknowledged_parents,
             measurement_acknowledged_rows,
             measurement_acknowledged_bytes,
+            eligible_measurement_acknowledged_parents,
+            eligible_measurement_acknowledged_rows,
+            eligible_measurement_acknowledged_bytes,
         ) = {
             let records = client
                 .logical_batches
@@ -6216,8 +6284,12 @@ mod tests {
                 mut measurement_acknowledged,
                 mut measurement_acknowledged_rows,
                 mut measurement_acknowledged_bytes,
+                mut eligible_measurement_acknowledged,
+                mut eligible_measurement_acknowledged_rows,
+                mut eligible_measurement_acknowledged_bytes,
             ) = (
                 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64,
+                0_u64, 0_u64, 0_u64,
             );
             for record in records.iter() {
                 if record.cohort == ManifestCohort::Warmup {
@@ -6253,6 +6325,25 @@ mod tests {
                                 .context("missing acknowledged canonical bytes")?,
                         )
                         .context("measurement-send acknowledgment byte count overflow")?;
+                    if eligible_measurement_send_ack(
+                        record.cohort,
+                        record.outcome,
+                        record.first_admitted_unix_ms,
+                        measurement_start_unix_ms,
+                        measurement_end_unix_ms,
+                    ) {
+                        eligible_measurement_acknowledged += 1;
+                        eligible_measurement_acknowledged_rows = eligible_measurement_acknowledged_rows
+                            .checked_add(u64::from(record.row_count))
+                            .context("eligible measurement acknowledgment row count overflow")?;
+                        eligible_measurement_acknowledged_bytes = eligible_measurement_acknowledged_bytes
+                            .checked_add(
+                                record
+                                    .canonical_logical_bytes
+                                    .context("missing eligible acknowledged canonical bytes")?,
+                            )
+                            .context("eligible measurement acknowledgment byte count overflow")?;
+                    }
                 }
                 if record.outcome == ManifestOutcome::Acknowledged {
                     acknowledged += 1;
@@ -6290,6 +6381,9 @@ mod tests {
                 measurement_acknowledged,
                 measurement_acknowledged_rows,
                 measurement_acknowledged_bytes,
+                eligible_measurement_acknowledged,
+                eligible_measurement_acknowledged_rows,
+                eligible_measurement_acknowledged_bytes,
             )
         };
         let window = &terminal_receipt["measurement_window"];
@@ -6324,12 +6418,18 @@ mod tests {
             physical_fragments > record_count,
             "wide profile did not exercise physical Flight fragmentation"
         );
-        let target_met = measurement_acknowledged_rows >= measurement_target_rows;
+        let target_met = eligible_measurement_acknowledged_rows >= measurement_target_rows;
         let completion_observed_rows_per_second = completed_rows as f64 / (measurement_ms as f64 / 1_000.0);
         let measurement_send_acknowledged_rows_per_second =
             measurement_acknowledged_rows as f64 / (measurement_ms as f64 / 1_000.0);
+        let eligible_measurement_send_ack_rows_per_second =
+            eligible_measurement_acknowledged_rows as f64 / (measurement_ms as f64 / 1_000.0);
         eprintln!(
             "L3_REAL_SUSTAINED_SINK scope=local_in_memory_flight_not_delta_or_kusto table=sqlserver_availability_replica_states profile=realistic string_width=789 string_lengths=uniform value_variation=per_row guid_uniqueness=per_row rows_per_parent={ROWS_PER_BATCH} corpus_batches={CORPUS_BATCHES} workers={WORKERS} streams_per_worker={STREAMS_PER_WORKER} runtime_threads=16 max_memory_bytes={MAX_MEMORY_BYTES} flight_data_limit_bytes={FLIGHT_DATA_LIMIT_BYTES} client_message_limit_bytes={CLIENT_MESSAGE_LIMIT_BYTES} ipc_compression=None retry_max_attempts=1 warmup_ms={warmup_ms} warmup_sent_parents={warmup_sent_parents} warmup_completed_parents={warmup_completed_parents} measurement_ms={measurement_ms} target_rows_per_second={TARGET_ROWS_PER_SECOND} target_parents={target_measurement_parents} offered_measurement_parents={offered_measurement_parents} offered_measurement_rows={offered_measurement_rows} admitted_measurement_parents={admitted_measurement_parents} admitted_measurement_rows={admitted_measurement_rows} late_measurement_parents={late_measurement_parents} completion_observed_rows={completed_rows} completion_observed_rows_per_second={completion_observed_rows_per_second:.3} measurement_send_acknowledged_parents={measurement_acknowledged_parents} measurement_send_acknowledged_rows={measurement_acknowledged_rows} measurement_send_acknowledged_canonical_bytes={measurement_acknowledged_bytes} measurement_send_acknowledged_rows_per_second={measurement_send_acknowledged_rows_per_second:.3} target_met={target_met} all_parents={record_count} acknowledged_parents={acknowledged_parents} failed_parents={failed_parents} retried_parents={retried_parents} ambiguous_parents={ambiguous_parents} rejected_rows={rejected_rows} retried_rows={retried_rows} given_up_rows={given_up_rows} ambiguous_rows={ambiguous_rows} total_rows={total_rows} decoded_physical_fragments={physical_fragments} distinct_facts={distinct_facts} canonical_logical_bytes={canonical_bytes} manifest_bytes={terminal_manifest_bytes} terminal_line_bytes={terminal_line_bytes}"
+        );
+        eprintln!(
+            "L3_ELIGIBLE_SEND_ACK measurement_start_unix_ms={measurement_start_unix_ms} measurement_end_unix_ms={measurement_end_unix_ms} measurement_window_semantics=[start,end) eligible_parents={eligible_measurement_acknowledged_parents} eligible_rows={eligible_measurement_acknowledged_rows} eligible_canonical_bytes={eligible_measurement_acknowledged_bytes} eligible_rows_per_second={eligible_measurement_send_ack_rows_per_second:.3} measurement_send_cohort_ack_drain_parents={measurement_acknowledged_parents} post_window_acknowledged_parents={} target_met={target_met}",
+            measurement_acknowledged_parents - eligible_measurement_acknowledged_parents
         );
         for (minute, windows) in window["windows"]
             .as_array()
