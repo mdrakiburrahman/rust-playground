@@ -1403,6 +1403,60 @@ fn validate_commit(commit: Option<&CommitTunables>) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn validate_receiver_transport(value: &ReceiverTransportTunables) -> Result<()> {
+    let stream = value.initial_stream_window_size.unwrap_or(DEFAULT_RECEIVER_H2_WINDOW);
+    let connection = value
+        .initial_connection_window_size
+        .unwrap_or(DEFAULT_RECEIVER_H2_WINDOW);
+    validate_h2_window("collector.receiver_transport.initial_stream_window_size", stream)?;
+    validate_h2_window(
+        "collector.receiver_transport.initial_connection_window_size",
+        connection,
+    )?;
+    if connection < stream {
+        bail!("collector.receiver_transport connection window must be >= stream window");
+    }
+    if value
+        .max_frame_size
+        .is_some_and(|size| !(16_384..=16_777_215).contains(&size))
+    {
+        bail!("collector.receiver_transport.max_frame_size must be between 16384 and 16777215");
+    }
+    positive(
+        "collector.receiver_transport.max_concurrent_streams",
+        value.max_concurrent_streams,
+    )?;
+    positive(
+        "collector.receiver_transport.max_header_list_size",
+        value.max_header_list_size,
+    )?;
+    positive(
+        "collector.receiver_transport.concurrency_limit_per_connection",
+        value.concurrency_limit_per_connection,
+    )?;
+    if value
+        .concurrency_limit_per_connection
+        .is_some_and(|limit| limit > (usize::MAX >> 3))
+    {
+        bail!("collector.receiver_transport.concurrency_limit_per_connection exceeds semaphore bounds");
+    }
+    for (name, duration) in [
+        ("h2_keepalive_interval", &value.h2_keepalive_interval),
+        ("h2_keepalive_timeout", &value.h2_keepalive_timeout),
+        ("tcp_keepalive", &value.tcp_keepalive),
+    ] {
+        if let Some(duration) = duration {
+            let duration = parse_tunable_duration(&format!("collector.receiver_transport.{name}"), duration)?;
+            if name == "tcp_keepalive"
+                && (duration.as_secs() == 0 || duration.as_secs() > 32767 || duration.subsec_nanos() != 0)
+            {
+                bail!("collector.receiver_transport.tcp_keepalive must be whole seconds between 1s and 32767s");
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_limits(limits: Option<&LimitsTunables>) -> Result<()> {
     let limits = limits.cloned().unwrap_or_default();
     let metadata = limits.max_metadata_bytes.unwrap_or(16_384);
@@ -1420,60 +1474,6 @@ fn validate_limits(limits: Option<&LimitsTunables>) -> Result<()> {
         ("max_ddl_bytes", limits.max_ddl_bytes.unwrap_or(65_536)),
     ] {
         positive(&format!("collector.limits.{name}"), Some(value))?;
-    }
-
-    pub(crate) fn validate_receiver_transport(value: &ReceiverTransportTunables) -> Result<()> {
-        let stream = value.initial_stream_window_size.unwrap_or(DEFAULT_RECEIVER_H2_WINDOW);
-        let connection = value
-            .initial_connection_window_size
-            .unwrap_or(DEFAULT_RECEIVER_H2_WINDOW);
-        validate_h2_window("collector.receiver_transport.initial_stream_window_size", stream)?;
-        validate_h2_window(
-            "collector.receiver_transport.initial_connection_window_size",
-            connection,
-        )?;
-        if connection < stream {
-            bail!("collector.receiver_transport connection window must be >= stream window");
-        }
-        if value
-            .max_frame_size
-            .is_some_and(|size| !(16_384..=16_777_215).contains(&size))
-        {
-            bail!("collector.receiver_transport.max_frame_size must be between 16384 and 16777215");
-        }
-        positive(
-            "collector.receiver_transport.max_concurrent_streams",
-            value.max_concurrent_streams,
-        )?;
-        positive(
-            "collector.receiver_transport.max_header_list_size",
-            value.max_header_list_size,
-        )?;
-        positive(
-            "collector.receiver_transport.concurrency_limit_per_connection",
-            value.concurrency_limit_per_connection,
-        )?;
-        if value
-            .concurrency_limit_per_connection
-            .is_some_and(|limit| limit > (usize::MAX >> 3))
-        {
-            bail!("collector.receiver_transport.concurrency_limit_per_connection exceeds semaphore bounds");
-        }
-        for (name, duration) in [
-            ("h2_keepalive_interval", &value.h2_keepalive_interval),
-            ("h2_keepalive_timeout", &value.h2_keepalive_timeout),
-            ("tcp_keepalive", &value.tcp_keepalive),
-        ] {
-            if let Some(duration) = duration {
-                let duration = parse_tunable_duration(&format!("collector.receiver_transport.{name}"), duration)?;
-                if name == "tcp_keepalive"
-                    && (duration.as_secs() == 0 || duration.as_secs() > 32767 || duration.subsec_nanos() != 0)
-                {
-                    bail!("collector.receiver_transport.tcp_keepalive must be whole seconds between 1s and 32767s");
-                }
-            }
-        }
-        Ok(())
     }
     if schema > message {
         bail!("collector.limits.max_schema_bytes must not exceed max_message_bytes");
