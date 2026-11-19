@@ -2,6 +2,8 @@
 # This successor requires source-reviewed, source-bound immutable image digests, final receiver
 # h2/TCP and remote-snapshot reuse/cap settings, effective config readback, local fixture and
 # separately authorized live preflight. UNRESOLVED_* images deliberately cannot be pulled.
+# Reviewed successor exposes commit.remote_snapshot_reuse and
+# commit.remote_snapshot_max_metadata_objects (1..4096); values are not yet approved here.
 # Direct ArrowCollector benchmark for AKS context arrow-collector-68590.
 # A staged deployment, not a single apply. Use only a new isolated benchmark namespace.
 # Render BENCHRUNUUID as a fresh lowercase UUID and BENCHRUNHEX as its 32 lowercase hex digits.
@@ -83,7 +85,11 @@
 # Reconcile all clients against identical bounds, physical publications and files; missing/truncated
 # logs, unresolved/ambiguous sends or incomplete Delta history invalidate the entire scored window.
 # Prove load stopped, collector drained and the fenced owner/namespace UID match before cleanup; keep
-# the run-FIC record and follow the existing ownership-checked namespace/FIC and StorageClass cleanup.
+# the run-FIC record. Existing run_fic.ts delete_run_namespace uses a durable authority and UID-fenced
+# deletion journal, but no reviewed direct-kubectl adapter or definitive drain proof is supplied here.
+# Those are blockers: do not substitute bare namespace deletion or assume empty gauges prove drain.
+# After proven namespace absence, the existing cleanup-run-fic command can remove only the recorded FIC:
+# npx --no-install tsx infra/azure/bootstrap.ts cleanup-run-fic --mode stamped --env-file "$BOOTSTRAP_ENV" --stamp-config "$STAMP_CONFIG" --run-id "$UUID" --record "$FIC_RECORD"
 # Local NVMe is a bounded 256 Gi staging area via TMPDIR, not durable storage or an acknowledgment.
 # No QAP/Kusto consumer is deployed here. Keep cluster-scoped cleanup separate from namespace/FIC cleanup.
 # After drain, remove the StorageClass only if exact run-id and owner-token labels match and no PVC/PV uses it. Never remove the shared ACS extension as routine run cleanup. Preserve Delta objects and verify pools physically return to zero.

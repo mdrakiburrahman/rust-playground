@@ -40,11 +40,16 @@ export function validateArm(
   if (!/^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(identity.runId) ||
       identity.namespace !== `arrow-collector-${identity.runId.replaceAll('-', '')}` ||
       !/^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(identity.namespaceUid) ||
-      !/^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$/.test(identity.owner) ||
+      !/^[A-Za-z0-9][A-Za-z0-9_-]{14,61}[A-Za-z0-9]$/.test(identity.owner) ||
       ![1, 2, 4, 8].includes(identity.clients)) throw new Error('Invalid run identity');
   const ns = object(object(namespace, 'namespace').metadata, 'namespace metadata');
   if (ns.name !== identity.namespace || ns.uid !== identity.namespaceUid) throw new Error('Namespace UID mismatch');
   labels(ns, identity);
+  const annotations = object(ns.annotations, 'namespace annotations');
+  if (annotations['arrowcol-oat/run-id'] !== identity.runId ||
+      annotations['arrowcol-oat/owner-token'] !== identity.owner || ns.deletionTimestamp) {
+    throw new Error('Namespace annotation or deletion state mismatch');
+  }
   const jobObject = object(job, 'job');
   const jm = object(jobObject.metadata, 'job metadata');
   labels(jm, identity);
