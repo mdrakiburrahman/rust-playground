@@ -2858,7 +2858,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn queue_byte_capacities_accept_u64_and_validate_effective_limits() -> Result<()> {
         let gib = 1_u64 << 30;
         let valid = Tunables::parse_oat_json(serde_json::json!({"collector":{"batching":{
@@ -2888,6 +2887,7 @@ mod tests {
         Ok(())
     }
 
+    #[test]
     fn collector_projection_uses_consumer_config_blobs_and_runtime_names() -> Result<()> {
         let tunables = Tunables {
             collector: Some(CollectorTunables {

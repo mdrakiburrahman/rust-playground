@@ -73,7 +73,7 @@ impl GenericDeltaExporter {
         let backlog_capacity = metrics
             .register_publication_backlog_capacity(config.batching.global_capacity.batches)
             .map_err(|error| format!("configure durable publication backlog: {error}"))?;
-        let byte_capacity_metrics = register_delta_byte_capacity_metrics(
+        let _byte_capacity_metrics = register_delta_byte_capacity_metrics(
             &metrics,
             config.batching.global_capacity,
             config.batching.per_table_capacity,
@@ -84,7 +84,7 @@ impl GenericDeltaExporter {
             configuration: Some(config.clone()),
             base_path: config.base_path.clone(),
             options,
-            byte_capacity_metrics,
+            _byte_capacity_metrics,
             batching: config.batching.clone(),
             capacity: Capacity::new(config.batching.global_capacity).map_err(|error| error.to_string())?,
             flush_slots: Arc::new(Semaphore::new(config.batching.max_concurrent_flushes)),
@@ -133,7 +133,7 @@ impl GenericDeltaExporter {
         let backlog_capacity = metrics
             .register_publication_backlog_capacity(batching.global_capacity.batches)
             .map_err(|error| format!("configure durable publication backlog: {error}"))?;
-        let byte_capacity_metrics =
+        let _byte_capacity_metrics =
             register_delta_byte_capacity_metrics(&metrics, batching.global_capacity, batching.per_table_capacity)?;
         Ok(Self {
             backend: Arc::new(DeltaBackend {
@@ -146,7 +146,7 @@ impl GenericDeltaExporter {
                 )?,
                 leases: LeaseBinder::new(store, LEASE_VIEW_TTL),
                 options,
-                byte_capacity_metrics,
+                _byte_capacity_metrics,
                 capacity: Capacity::new(batching.global_capacity)?,
                 flush_slots: Arc::new(Semaphore::new(batching.max_concurrent_flushes)),
                 batching,
@@ -254,7 +254,7 @@ struct DeltaBackend {
     authority: AuthorityClient,
     leases: LeaseBinder,
     backlog_capacity: Arc<crate::metrics::PublicationBacklogCapacityGuard>,
-    byte_capacity_metrics: Arc<DeltaExporterCapacityGuard>,
+    _byte_capacity_metrics: Arc<DeltaExporterCapacityGuard>,
     metrics: Arc<RuntimeMetrics>,
     tables: tokio::sync::Mutex<HashMap<arrowcol_protocol::TableIdentity, Arc<TableOwner>>>,
     #[cfg(test)]
@@ -1056,6 +1056,10 @@ impl GroupPublisher<'_> {
             }
             _ => "unresolved",
         };
+        let transaction_identities = receipts
+            .iter()
+            .filter_map(|receipt| receipt.transaction_identity.as_ref())
+            .collect::<Vec<_>>();
         let committed_files = receipts
             .iter()
             .filter_map(|receipt| receipt.committed_file.as_ref())
@@ -1070,6 +1074,7 @@ impl GroupPublisher<'_> {
             qualification_state,
             authoritative_delta_version = ?authoritative_delta_version,
             transaction_files = ?receipts,
+            transaction_identities = ?transaction_identities,
             committed_files = ?committed_files,
             "Delta logical publication audit receipt"
         );
@@ -3779,10 +3784,13 @@ mod tests {
         .expect("exporter");
         let result = exporter.stage(pdata(&lease, lease.fencing_epoch)).await;
         assert!(matches!(result, Err(ExportFailure::Transient(message)) if message.contains("capacity exhausted")));
-        assert_eq!(
-            exporter.backend.capacity.bytes.available_permits(),
-            policy.global_capacity.bytes as usize
-        );
+        let _byte_permit = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            exporter.backend.capacity.bytes.acquire(policy.global_capacity.bytes),
+        )
+        .await
+        .expect("failed stage should refund byte capacity")
+        .expect("byte capacity remains available");
         assert!(!directory.path().join("demo/generated/events/_delta_log").exists());
     }
 
