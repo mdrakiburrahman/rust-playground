@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { delimiter, join } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { validateArm, type ArmIdentity } from './benchmark-arm.js';
+import { observeWriter, validateArm, type ArmIdentity } from './benchmark-arm.js';
 
 const identity: ArmIdentity = {
   runId: '01234567-89ab-cdef-0123-456789abcdef',
@@ -21,7 +21,7 @@ function fixture() {
   const job = { metadata: { name: 'direct-load-confirmwide', namespace: identity.namespace, uid: 'job-uid', labels },
     spec: { suspend: false, completionMode: 'Indexed', parallelism: 2, completions: 2 }, status: {} };
   const schedule = { metadata: { name: 'direct-schedule-confirmwide', namespace: identity.namespace,
-    resourceVersion: '17', labels }, data: { start: 'pending' } };
+    resourceVersion: '17', labels }, data: { start: 'pending', writerLifetime: 'pending' } };
   const pods = { items: [0, 1].map(index => ({
     metadata: { name: `pod-${index}`, uid: `uid-${index}`, namespace: identity.namespace, labels,
       annotations: { 'batch.kubernetes.io/job-completion-index': String(index) },
@@ -32,8 +32,32 @@ function fixture() {
   })) };
   const logs = new Map([0, 1].map(index =>
     [`pod-${index}`, `OAT_CLIENT_READY client_id=direct-${identity.runId}-${index} preflight_tables=1\n`]));
-  return { namespace, job, schedule, pods, logs };
+  const writerMeta = { namespace: identity.namespace, labels, annotations: labels };
+  const deployment = { apiVersion: 'apps/v1', kind: 'Deployment',
+    metadata: { ...writerMeta, name: 'arrowcol', uid: 'writer-deployment' }, spec: { replicas: 1 } };
+  const replicaSets = { items: [{ metadata: { ...writerMeta, name: 'writer-rs', uid: 'writer-rs-uid',
+    ownerReferences: [{ kind: 'Deployment', uid: 'writer-deployment', controller: true }] } }] };
+  const writerPods = { items: [{ apiVersion: 'v1', kind: 'Pod',
+    metadata: { ...writerMeta, name: 'writer-pod', uid: 'writer-pod-uid',
+      ownerReferences: [{ kind: 'ReplicaSet', name: 'writer-rs', uid: 'writer-rs-uid', controller: true }] },
+    spec: { containers: [{ name: 'dataflow', image: `example/writer@sha256:${'b'.repeat(64)}` }] },
+    status: { phase: 'Running', containerStatuses: [{ name: 'dataflow', ready: true, restartCount: 0,
+      imageID: `sha256:${'c'.repeat(64)}`, containerID: 'containerd://original',
+      state: { running: { startedAt: '2026-01-01T00:00:00Z' } } }] },
+  }] };
+  return { namespace, job, schedule, pods, logs, deployment, replicaSets, writerPods };
 }
+
+test('pins the exact running writer and refuses a restarted or foreign replacement', () => {
+  const f = fixture();
+  const observe = () => observeWriter(identity, f.deployment, f.replicaSets, f.writerPods);
+  assert.equal(observe().containerId, 'containerd://original');
+  f.writerPods.items[0].status.containerStatuses[0].restartCount = 1;
+  assert.throws(observe, /not the original healthy lifetime/);
+  f.writerPods.items[0].status.containerStatuses[0].restartCount = 0;
+  f.replicaSets.items[0].metadata.ownerReferences[0].uid = 'different-deployment';
+  assert.throws(observe, /not owned by the exact Deployment/);
+});
 
 test('requires every distinct, owned, healthy indexed client before arming', () => {
   const f = fixture();
@@ -80,15 +104,22 @@ const a=process.argv.slice(2);
 if(a.includes('logs')) { process.stdout.write(d.logs[a[a.indexOf('logs')+1]]); }
 else if(a.includes('patch')) {
   const p=JSON.parse(a[a.indexOf('--patch')+1]);
-  if(p[0].value!=='17'||p[1].value!=='pending'||p[2].path!=='/data/start') process.exit(2);
+  if(p[0].value!=='17'||p[1].value!=='pending'||p[2].path!=='/data/start'||
+     p[3].path!=='/data/writerLifetime'||p[3].value!=='pending'||p[4].path!=='/data/writerLifetime') process.exit(2);
   fs.writeFileSync(process.env.ARM_PATCH,JSON.stringify(p));
   process.stdout.write('{}');
 } else if(a.includes('namespace')&&!a.includes('pods')) { process.stdout.write(JSON.stringify(d.namespace)); }
 else if(a.includes('job')) { process.stdout.write(JSON.stringify(d.job)); }
 else if(a.includes('configmap')) {
-  if(fs.existsSync(process.env.ARM_PATCH)) d.schedule.data.start=JSON.parse(fs.readFileSync(process.env.ARM_PATCH,'utf8'))[2].value;
+  if(fs.existsSync(process.env.ARM_PATCH)) {
+    const ops=JSON.parse(fs.readFileSync(process.env.ARM_PATCH,'utf8'));
+    d.schedule.data.start=ops[2].value;
+    d.schedule.data.writerLifetime=ops[4].value;
+  }
   process.stdout.write(JSON.stringify(d.schedule));
-} else if(a.includes('pods')) { process.stdout.write(JSON.stringify(d.pods)); }
+} else if(a.includes('deployment')) { process.stdout.write(JSON.stringify(d.deployment)); }
+else if(a.includes('replicasets')) { process.stdout.write(JSON.stringify(d.replicaSets)); }
+else if(a.includes('pods')) { process.stdout.write(JSON.stringify(a.includes('app=arrowcol') ? d.writerPods : d.pods)); }
 else process.exit(3);
 `);
     chmodSync(executable, 0o700);
@@ -101,6 +132,7 @@ else process.exit(3);
     const output = JSON.parse(run.stdout) as { runStartUnixMs: number; measurementStartUnixMs: number; measurementEndUnixMs: number };
     const ops = JSON.parse(readFileSync(patch, 'utf8')) as Array<{ value: string }>;
     assert.equal(Number(ops[2].value), output.runStartUnixMs);
+    assert.equal(JSON.parse(ops[4].value).podUid, 'writer-pod-uid');
     assert.equal(output.measurementStartUnixMs, output.runStartUnixMs + 60_000);
     assert.equal(output.measurementEndUnixMs, output.runStartUnixMs + 660_000);
   } finally {

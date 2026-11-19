@@ -33,6 +33,62 @@ function labels(metadata: Json, identity: ArmIdentity): void {
   }
 }
 
+function ownership(metadata: Json, identity: ArmIdentity): void {
+  labels(metadata, identity);
+  const found = object(metadata.annotations, 'annotations');
+  if (found['arrowcol-oat/run-id'] !== identity.runId || found['arrowcol-oat/owner-token'] !== identity.owner) {
+    throw new Error('Run or owner annotation mismatch');
+  }
+}
+
+function controller(metadata: Json, kind: string): Json {
+  const owners = array(metadata.ownerReferences, 'controller references').map(value => object(value, 'owner'));
+  const controllers = owners.filter(value => value.controller === true);
+  if (controllers.length !== 1 || controllers[0].kind !== kind) throw new Error(`Missing exact ${kind} controller`);
+  return controllers[0];
+}
+
+export function observeWriter(identity: ArmIdentity, deployment: unknown, replicaSets: unknown, pods: unknown) {
+  const workload = object(deployment, 'writer Deployment');
+  const dm = object(workload.metadata, 'writer metadata');
+  ownership(dm, identity);
+  if (workload.apiVersion !== 'apps/v1' || workload.kind !== 'Deployment' || dm.name !== 'arrowcol' ||
+      dm.namespace !== identity.namespace || dm.deletionTimestamp ||
+      object(workload.spec, 'writer spec').replicas !== 1) throw new Error('Writer Deployment is not the expected single replica');
+  const deploymentUid = text(dm.uid, 'writer Deployment UID');
+  const items = array(object(pods, 'writer pods').items, 'writer pod list');
+  if (items.length !== 1) throw new Error('Expected exactly one writer pod');
+  const pod = object(items[0], 'writer pod');
+  const pm = object(pod.metadata, 'writer pod metadata');
+  ownership(pm, identity);
+  const replica = controller(pm, 'ReplicaSet');
+  const sets = array(object(replicaSets, 'writer ReplicaSets').items, 'writer ReplicaSet list')
+    .map(value => object(object(value, 'writer ReplicaSet').metadata, 'writer ReplicaSet metadata'))
+    .filter(value => value.uid === replica.uid && value.name === replica.name);
+  if (pod.apiVersion !== 'v1' || pod.kind !== 'Pod' || pm.namespace !== identity.namespace || pm.deletionTimestamp ||
+      sets.length !== 1 || sets[0].namespace !== identity.namespace || sets[0].deletionTimestamp ||
+      controller(sets[0], 'Deployment').uid !== deploymentUid) throw new Error('Writer pod is not owned by the exact Deployment');
+  const spec = object(pod.spec, 'writer pod spec');
+  const containers = array(spec.containers, 'writer containers');
+  if (containers.length !== 1) throw new Error('Expected exactly one writer container');
+  const container = object(containers[0], 'writer container');
+  const image = text(container.image, 'writer image');
+  if (container.name !== 'dataflow' || !/^.+@sha256:[0-9a-f]{64}$/.test(image)) throw new Error('Writer image is not digest-pinned');
+  const status = object(pod.status, 'writer pod status');
+  const statuses = array(status.containerStatuses, 'writer container statuses');
+  if (statuses.length !== 1) throw new Error('Expected exactly one writer container status');
+  const active = object(statuses[0], 'writer container status');
+  const startedAt = text(object(object(active.state, 'writer state').running, 'running writer').startedAt, 'writer start');
+  const imageId = text(active.imageID, 'writer runtime image');
+  const containerId = text(active.containerID, 'writer runtime container');
+  if (status.phase !== 'Running' || active.name !== 'dataflow' || active.ready !== true || active.restartCount !== 0 ||
+      !Number.isFinite(Date.parse(startedAt)) || !/sha256:[0-9a-f]{64}$/.test(imageId)) {
+    throw new Error('Writer container is not the original healthy lifetime');
+  }
+  return { deploymentUid, replicaSetUid: text(replica.uid, 'writer ReplicaSet UID'),
+    podName: text(pm.name, 'writer pod name'), podUid: text(pm.uid, 'writer pod UID'), image, imageId, containerId, startedAt };
+}
+
 export function validateArm(
   identity: ArmIdentity, namespace: unknown, job: unknown, schedule: unknown,
   pods: unknown, logs: ReadonlyMap<string, string>,
@@ -64,8 +120,9 @@ export function validateArm(
   const cm = object(schedule, 'schedule');
   const metadata = object(cm.metadata, 'schedule metadata');
   labels(metadata, identity);
+  const data = object(cm.data, 'schedule data');
   if (metadata.name !== 'direct-schedule-confirmwide' || metadata.namespace !== identity.namespace ||
-      object(cm.data, 'schedule data').start !== 'pending') throw new Error('Schedule is not the expected pending object');
+      data.start !== 'pending' || data.writerLifetime !== 'pending') throw new Error('Schedule is not the expected pending object');
   const scheduleVersion = text(metadata.resourceVersion, 'schedule resourceVersion');
   const items = array(object(pods, 'pod list').items, 'pods');
   if (items.length !== identity.clients || logs.size !== identity.clients) throw new Error('Wrong client pod count');
@@ -115,7 +172,8 @@ export function validateArm(
 }
 
 function kubectl(context: string, args: string[]): string {
-  const result = spawnSync('kubectl', ['--context', context, ...args], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 });
+  const result = spawnSync('kubectl', ['--context', context, '--request-timeout=15s', ...args],
+    { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: 20_000 });
   if (result.error) throw result.error;
   if (result.status !== 0) throw new Error(`kubectl failed (${result.status}): ${result.stderr}`);
   return result.stdout;
@@ -133,6 +191,9 @@ function main(): void {
   }
   const identity = { namespace, namespaceUid, runId, owner, clients: Number(count) };
   const get = (kind: string, name: string) => readJson(context, ['-n', namespace, 'get', kind, name]);
+  const readWriter = () => observeWriter(identity, get('deployment', 'arrowcol'),
+    readJson(context, ['-n', namespace, 'get', 'replicasets', '-l', 'app=arrowcol']),
+    readJson(context, ['-n', namespace, 'get', 'pods', '-l', 'app=arrowcol']));
   const ns = readJson(context, ['get', 'namespace', namespace]);
   const job = get('job', 'direct-load-confirmwide');
   const schedule = get('configmap', 'direct-schedule-confirmwide');
@@ -142,11 +203,13 @@ function main(): void {
     text(object(object(item, 'pod').metadata, 'pod metadata').name, 'pod name'));
   const logs = new Map(names.map(name => [name, kubectl(context, ['-n', namespace, 'logs', name, '-c', 'generator'])]));
   const checked = validateArm(identity, ns, job, schedule, pods, logs);
+  const writer = JSON.stringify(readWriter());
   const freshPods = readJson(context, ['-n', namespace, 'get', 'pods', '-l', selector]);
   const fresh = validateArm(identity, readJson(context, ['get', 'namespace', namespace]),
     get('job', 'direct-load-confirmwide'), get('configmap', 'direct-schedule-confirmwide'), freshPods, logs);
-  if (fresh.scheduleVersion !== checked.scheduleVersion || fresh.podUids.join(',') !== checked.podUids.join(',')) {
-    throw new Error('Client fleet or schedule changed before arming');
+  if (fresh.scheduleVersion !== checked.scheduleVersion || fresh.podUids.join(',') !== checked.podUids.join(',') ||
+      JSON.stringify(readWriter()) !== writer) {
+    throw new Error('Client fleet, writer lifetime, or schedule changed before arming');
   }
   const now = Date.now();
   const start = now + 150_000;
@@ -154,12 +217,14 @@ function main(): void {
     { op: 'test', path: '/metadata/resourceVersion', value: checked.scheduleVersion },
     { op: 'test', path: '/data/start', value: 'pending' },
     { op: 'replace', path: '/data/start', value: String(start) },
+    { op: 'test', path: '/data/writerLifetime', value: 'pending' },
+    { op: 'replace', path: '/data/writerLifetime', value: writer },
   ];
   kubectl(context, ['-n', namespace, 'patch', 'configmap', 'direct-schedule-confirmwide',
     '--type=json', '--patch', JSON.stringify(patch)]);
   const observed = object(object(get('configmap', 'direct-schedule-confirmwide'), 'schedule').data, 'schedule data');
-  if (observed.start !== String(start)) throw new Error('Schedule patch readback mismatch');
-  console.log(JSON.stringify({ runId, namespaceUid, podUids: checked.podUids, runStartUnixMs: start,
+  if (observed.start !== String(start) || observed.writerLifetime !== writer) throw new Error('Schedule patch readback mismatch');
+  console.log(JSON.stringify({ runId, namespaceUid, podUids: checked.podUids, writer: JSON.parse(writer), runStartUnixMs: start,
     measurementStartUnixMs: start + 60_000, measurementEndUnixMs: start + 660_000 }));
 }
 
