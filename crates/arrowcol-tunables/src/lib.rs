@@ -255,7 +255,7 @@ pub struct ExporterTunables {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct QueueCapacityTunables {
-    pub bytes: Option<u32>,
+    pub bytes: Option<u64>,
     pub rows: Option<u32>,
     pub batches: Option<u32>,
 }
