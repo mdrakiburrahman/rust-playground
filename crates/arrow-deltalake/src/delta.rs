@@ -1407,6 +1407,7 @@ mod io_tests {
                 ("arrowcol.layout.rowGroupRows", "1"),
                 ("arrowcol.layout.pageRows", "1"),
                 ("arrowcol.layout.sortColumns", "id"),
+                ("arrowcol.layout.bloomColumns", "id"),
             ]
             .into_iter()
             .map(|(key, value)| (key.to_owned(), value.to_owned()))
