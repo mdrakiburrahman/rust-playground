@@ -13,6 +13,7 @@
 
 #![deny(unsafe_code)]
 
+mod byte_capacity;
 mod catalogs;
 mod config;
 mod envelope;
