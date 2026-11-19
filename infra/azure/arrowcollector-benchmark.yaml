@@ -70,6 +70,14 @@ metadata:
   labels:
     app.kubernetes.io/part-of: arrowcol-oat
     benchmark-stage: storage
+  annotations:
+    storageoperator.acstor.io/nodeAffinity: |
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: kubernetes.azure.com/agentpool
+            operator: In
+            values: [arrowe192]
 provisioner: localdisk.csi.acstor.io
 reclaimPolicy: Delete
 volumeBindingMode: WaitForFirstConsumer
