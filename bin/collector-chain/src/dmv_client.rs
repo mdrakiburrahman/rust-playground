@@ -4612,7 +4612,7 @@ mod tests {
         });
 
         let table = table_named("sqlserver_availability_replica_states")?;
-        for codec in [IpcCompression::Zstd] {
+        for codec in [IpcCompression::None, IpcCompression::Zstd] {
             let mut probe_options = options()?;
             probe_options.data_profile = DataProfile::Realistic;
             probe_options.string_width = 789;
