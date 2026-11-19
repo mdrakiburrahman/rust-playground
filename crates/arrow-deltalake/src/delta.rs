@@ -4599,7 +4599,7 @@ impl DeltaTable {
                 Err(error) => {
                     failure = Some(match failure {
                         None => error,
-                        Some(previous) => error.context(format!("earlier coalesced file failure: {previous:#}")),
+                        Some(previous) => previous.context(format!("additional coalesced file failure: {error:#}")),
                     });
                 }
             }
