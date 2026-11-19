@@ -3747,7 +3747,15 @@ impl DeltaTable {
 
     pub(crate) fn snapshot(&self) -> Result<SnapshotRef> {
         if self.url.scheme() != "file" {
-            return self.remote_snapshot();
+            return if self.session.is_some() {
+                self.remote_snapshot()
+            } else {
+                // Sessionless injected readers retain uncached Kernel loading.
+                // Normal ADLS opens always establish a publisher session.
+                Snapshot::builder_for(self.url.as_str())
+                    .build(&self.engine)
+                    .map_err(Into::into)
+            };
         }
         let full_build = || {
             Snapshot::builder_for(self.url.as_str())
