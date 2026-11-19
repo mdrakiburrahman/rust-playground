@@ -381,7 +381,11 @@ export async function finishDirectTerminalCustody(azure: Azure, campaign: Direct
     maintenance: proof.t.maintenance, clients: proof.t.clients, job: proof.t.job, router: proof.t.router,
     routerPods: proof.t.routerPods, routerEndpoints: proof.t.routerEndpoints },
     delta: { snapshot: delta.snapshot, physical: delta.physical }, timing: { after: clocksAfter, failures: clockFailures },
-    diagnostic_reconciliation: diagnostic, scoring,
+    diagnostic_reconciliation: diagnostic, scoring, limitations: [
+      'This custody adapter does not establish NetworkPolicy enforcement or network isolation.',
+      ...(fic.aksId.toLowerCase().endsWith('/managedclusters/arrow-collector-68590')
+        ? ['Last read-only arrow-collector-68590 preflight: NetworkPolicy not enforced (dataplane policy=none).'] : []),
+    ],
     qualification: { status: 'not-qualified', reason: 'Independent throughput qualification is not established by custody and clock evidence' } }));
   const path = join(directory, 'direct-terminal.json');
   await writeFile(path, record, { flag: 'wx', mode: 0o600, flush: true });

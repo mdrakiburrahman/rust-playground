@@ -134,7 +134,7 @@ async function fixture(t: TestContext, fault: Fault) {
     logs: {} as Record<string, string>, catalogLog: '', registration: { instance_id: uuid(90),
       instance_key: `direct-single-writer-${origin.runId}|cloud=${origin.cloudGeneration}`, implementation_pool: 'dataflow',
       flight_endpoint: '10.0.0.47:32010', started_at_utc: new Date(now - 60_000).toISOString().replace('.000Z', '.0000000Z') } };
-  const c = new Config({ AZURE_SUBSCRIPTION_ID: uuid(80) }), azure = new Azure(c);
+  const c = new Config({ AZURE_SUBSCRIPTION_ID: uuid(80), AZURE_STAMP: '68590' }), azure = new Azure(c);
   state.catalogLog = JSON.stringify({ kind: 'oat_run_table_registered', run_id: origin.runId, table, provider: 'delta',
     location: `abfss://${c.data}@${c.account}.dfs.core.windows.net/${root}`, schema_version: 1,
     catalog_table_count: 1, schema_fingerprint: release.schemaFingerprint });
@@ -341,7 +341,7 @@ for (const fault of ['none', 'clock-boundary', 'clock-skew', 'clock-missing', 'c
     ['seal-readback', 'namespace-delete'], ['namespace-positive', 'namespace-absence'], ['namespace-absence', 'fic-delete']])
     assert.ok(index(before) >= 0 && index(before) < index(after), `${before} must precede ${after}`);
   assert.deepEqual(events.filter(e => e.event === 'stop').map(e => e.name), ['arrowcol-router', 'arrowcol', 'delta-maintenance']);
-  assert.equal(f.credential(), null); assert.equal(read_run_fic_record(f.ficPath, new Config({ AZURE_SUBSCRIPTION_ID: uuid(80) })).phase, 'deleted');
+  assert.equal(f.credential(), null); assert.equal(read_run_fic_record(f.ficPath, new Config({ AZURE_SUBSCRIPTION_ID: uuid(80), AZURE_STAMP: '68590' })).phase, 'deleted');
   assert.equal(result.receipt.namespace_record.namespaceUid, origin.namespaceUid);
   const seal = JSON.parse(f.stored.get(result.seal.path)!.bytes.toString());
   const terminal = parseEvidence(fs.readFileSync(join(f.terminal, 'direct-terminal.json'), 'utf8')) as any;
@@ -353,6 +353,8 @@ for (const fault of ['none', 'clock-boundary', 'clock-skew', 'clock-missing', 'c
     assert.equal(terminal.scoring.scored.scored_canonical_bytes, 0n);
   }
   assert.equal(terminal.qualification.status, 'not-qualified');
+  assert.ok(terminal.limitations.some((value: string) => value.includes('does not establish NetworkPolicy enforcement')));
+  assert.ok(terminal.limitations.some((value: string) => value.includes('NetworkPolicy not enforced (dataplane policy=none)')));
   assert.equal(terminal.timing.failures.length, fault === 'clock-missing' ? 2 : 0);
   assert.equal(terminal.timing.after.length, fault === 'clock-missing' ? 0 : 2);
   assert.equal(terminal.arm.provenance.clocks.length, 2);
@@ -423,6 +425,6 @@ for (const [fault, message, phase, namespaceDelete, ficDelete] of failures) test
   }
   assert.equal(events.filter(e => e.event === 'namespace-delete').length, namespaceDelete ? 1 : 0, 'unknown namespace mutation must never replay');
   assert.equal(events.filter(e => e.event === 'fic-delete').length, ficDelete ? 1 : 0, 'unknown FIC mutation must never replay');
-  assert.equal(read_run_fic_record(f.ficPath, new Config({ AZURE_SUBSCRIPTION_ID: uuid(80) })).phase,
+  assert.equal(read_run_fic_record(f.ficPath, new Config({ AZURE_SUBSCRIPTION_ID: uuid(80), AZURE_STAMP: '68590' })).phase,
     ficDelete ? 'delete-submitted' : 'ready');
 });

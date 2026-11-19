@@ -5,7 +5,9 @@
 # Reviewed successor exposes commit.remote_snapshot_reuse and
 # commit.remote_snapshot_max_metadata_objects (1..4096); values are not yet approved here.
 # Direct ArrowCollector benchmark for AKS context arrow-collector-68590.
-# A staged deployment, not a single apply. Use only a new isolated benchmark namespace.
+# A staged deployment, not a single apply. Use only a new run-scoped benchmark namespace.
+# Latest stamp preflight: NetworkPolicy not enforced (dataplane policy=none). Record this limitation;
+# the staged NetworkPolicy objects do not provide isolation on that dataplane.
 # Render BENCHRUNUUID as a fresh lowercase UUID and BENCHRUNHEX as its 32 lowercase hex digits.
 # Render BENCHCLIENTCOUNT as 1, 2, 4, or 8 for a bounded indexed client Job; never exceed ready client nodes.
 # Render BENCHOWNER as the approved custody owner in both identity annotations and labels.
