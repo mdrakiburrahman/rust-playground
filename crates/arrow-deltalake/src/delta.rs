@@ -39,7 +39,12 @@ use url::Url;
 
 type LocalEngine = DefaultEngine<SharedExecutor>;
 type FileCommitObservations = Vec<(usize, CompletedFileObservation)>;
-type TimedCommitResult = Result<(u64, Option<Duration>, FileCommitObservations)>;
+type TimedCommitResult = Result<(
+    u64,
+    Option<Duration>,
+    FileCommitObservations,
+    crate::commit::CommitOutcome,
+)>;
 
 fn process_writer_properties(schema: &SchemaRef) -> Result<BTreeMap<String, String>> {
     read_process_writer_properties(Some(schema))
@@ -4116,7 +4121,7 @@ impl DeltaTable {
 
     #[cfg(test)]
     pub(crate) fn commit_files(&self, files: &[StagedAppend]) -> Result<u64> {
-        self.commit_files_timed(files).map(|(version, _, _)| version)
+        self.commit_files_timed(files).map(|(version, _, _, _)| version)
     }
 
     pub(crate) fn commit_files_timed(&self, files: &[StagedAppend]) -> TimedCommitResult {
@@ -4153,7 +4158,7 @@ impl DeltaTable {
         groups: &[CoalescedCommitGroup],
     ) -> Result<u64> {
         self.commit_files_inner_timed(files, identity, groups)
-            .map(|(version, _, _)| version)
+            .map(|(version, _, _, _)| version)
     }
 
     fn commit_files_inner_timed(
@@ -4162,9 +4167,9 @@ impl DeltaTable {
         identity: Option<(&str, i64)>,
         groups: &[CoalescedCommitGroup],
     ) -> TimedCommitResult {
-        let (version, commit_duration, file_observations) = self.publish_files(files, identity, groups)?;
+        let (version, commit_duration, file_observations, outcome) = self.publish_files(files, identity, groups)?;
         self.reclaim_unsubmitted(files);
-        Ok((version, commit_duration, file_observations))
+        Ok((version, commit_duration, file_observations, outcome))
     }
 
     /// After a successful publication call, delete staged files that no commit attempt
@@ -4244,7 +4249,12 @@ impl DeltaTable {
                 if previous == version {
                     self.sync_replayed_local_state(snapshot.version())?;
                     observation.finish("deduplicated");
-                    return Ok((snapshot.version(), None, Vec::new()));
+                    return Ok((
+                        snapshot.version(),
+                        None,
+                        Vec::new(),
+                        crate::commit::CommitOutcome::Deduplicated,
+                    ));
                 }
             }
             let mut pending = Vec::new();
@@ -4318,6 +4328,7 @@ impl DeltaTable {
                             bail!("publication transaction fenced by newer application version");
                         }
                         if previous == *version {
+                            skipped.insert(index);
                             continue;
                         }
                     }
@@ -4332,8 +4343,13 @@ impl DeltaTable {
             }
             if pending.is_empty() && group_transaction_ids.is_empty() && identity.is_none() {
                 self.sync_replayed_local_state(snapshot.version())?;
-                observation.finish("deduplicated");
-                return Ok((snapshot.version(), None, Vec::new()));
+                let outcome = if skipped.is_empty() {
+                    crate::commit::CommitOutcome::Noop
+                } else {
+                    crate::commit::CommitOutcome::Deduplicated
+                };
+                observation.finish(if skipped.is_empty() { "noop" } else { "deduplicated" });
+                return Ok((snapshot.version(), None, Vec::new(), outcome));
             }
             // Claim before touching the file or any check that can stall, so a concurrent
             // reclaim of the same borrowed stage either already won (refused here) or
@@ -4509,6 +4525,7 @@ impl DeltaTable {
                         commit.commit_version(),
                         Some(started.elapsed()),
                         committed_file_observations,
+                        crate::commit::CommitOutcome::Committed,
                     ));
                 }
                 Ok(CommitResult::Conflicted(_)) => observation.event("conflict"),
@@ -4521,7 +4538,12 @@ impl DeltaTable {
                     }
                     if let Some(version) = reconcile()? {
                         observation.finish("reconciled");
-                        return Ok((version, Some(started.elapsed()), committed_file_observations));
+                        return Ok((
+                            version,
+                            Some(started.elapsed()),
+                            committed_file_observations,
+                            crate::commit::CommitOutcome::Reconciled,
+                        ));
                     }
                 }
                 Err(error) => {
@@ -4529,7 +4551,12 @@ impl DeltaTable {
                     // A proven transaction is success; an unreadable outcome stays an error.
                     if identifiable && let Some(version) = reconcile()? {
                         observation.finish("reconciled");
-                        return Ok((version, Some(started.elapsed()), committed_file_observations));
+                        return Ok((
+                            version,
+                            Some(started.elapsed()),
+                            committed_file_observations,
+                            crate::commit::CommitOutcome::Reconciled,
+                        ));
                     }
                     return Err(error.into());
                 }
@@ -4594,6 +4621,7 @@ fn cleanup_failure_class(error: &anyhow::Error) -> &'static str {
 #[derive(Debug)]
 pub struct AppendResult {
     pub version: u64,
+    pub outcome: crate::commit::CommitOutcome,
     pub file: CompletedFile,
     pub commit_duration: Option<Duration>,
     pub file_observations: Vec<crate::CompletedFileObservation>,
@@ -4632,6 +4660,14 @@ const STAGE_SUBMITTED: u8 = 1;
 const STAGE_RECLAIMED: u8 = 2;
 
 impl StagedAppend {
+    /// Returns the exact Delta application transaction identity attached to this staged file.
+    #[must_use]
+    pub fn publication_identity(&self) -> Option<(&str, i64)> {
+        self.publication
+            .as_ref()
+            .map(|(app_id, version)| (app_id.as_str(), *version))
+    }
+
     #[must_use]
     pub const fn stage_timings(&self) -> FileStageTimings {
         self.stage_timings
@@ -5077,10 +5113,11 @@ impl DeltaFileWriter {
         // Kernel is synchronous. This offload is bounded by the caller's open files;
         // the collector uses the dedicated, bounded coordinator instead.
         tokio::task::spawn_blocking(move || {
-            let (version, commit_duration, file_observations) =
+            let (version, commit_duration, file_observations, outcome) =
                 append.table.commit_files_timed(std::slice::from_ref(&append))?;
             Ok(AppendResult {
                 version,
+                outcome,
                 file: append.file,
                 commit_duration,
                 file_observations: file_observations

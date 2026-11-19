@@ -125,10 +125,24 @@ pub struct CommitReceipt(oneshot::Receiver<std::result::Result<GroupAppendResult
 /// One atomic coalesced publication's durable Delta version and output files.
 pub struct GroupCommitReceipt(oneshot::Receiver<std::result::Result<GroupAppendResult, CommitReceiptError>>);
 
+/// Outcome classification for a Delta publication receipt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommitOutcome {
+    /// The commit response confirms the returned Delta version.
+    Committed,
+    /// An uncertain commit was reconciled; the original transaction version may be unavailable.
+    Reconciled,
+    /// The publication identity was already committed before this attempt.
+    Deduplicated,
+    /// No transaction or output file needed publication.
+    Noop,
+}
+
 /// Successful result for every physical file in one atomic publication group.
 #[derive(Debug)]
 pub struct GroupAppendResult {
     pub version: u64,
+    pub outcome: CommitOutcome,
     pub files: Vec<crate::CompletedFile>,
     pub commit_duration: Option<Duration>,
     pub file_observations: Vec<crate::CompletedFileObservation>,
@@ -252,6 +266,7 @@ impl CommitReceipt {
         }
         Ok(AppendResult {
             version: result.version,
+            outcome: result.outcome,
             file,
             commit_duration: result.commit_duration,
             file_observations: result.file_observations,
@@ -881,15 +896,16 @@ fn publish_batch(
         *failure = Some(error.clone());
     }
     let mut files = appends.into_iter().map(|append| Some(append.file)).collect::<Vec<_>>();
-    let mut commit_duration = result.as_ref().ok().and_then(|(_, duration, _)| *duration);
+    let mut commit_duration = result.as_ref().ok().and_then(|(_, duration, _, _)| *duration);
     for (start, end, reply, _slot) in replies {
         let delivered = match result.as_ref() {
-            Ok((version, _, observations)) => files[start..end]
+            Ok((version, _, observations, outcome)) => files[start..end]
                 .iter_mut()
                 .map(|file| file.take().context("Delta worker lost staged output file"))
                 .collect::<Result<Vec<_>>>()
                 .map(|files| GroupAppendResult {
                     version: *version,
+                    outcome: *outcome,
                     files,
                     commit_duration: commit_duration.take(),
                     file_observations: observations

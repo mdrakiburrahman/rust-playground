@@ -6,6 +6,7 @@
 use anyhow::{Context, Result};
 use arrow::array::{Int32Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow_deltalake::commit::CommitOutcome;
 use arrow_deltalake::delta::{
     DeltaTable, PublicationFence, PublicationFenceContext, PublicationFenceError, StagedAppend,
 };
@@ -129,6 +130,8 @@ fn new_delivery_replay_reclaims_unsubmitted_stage() -> Result<()> {
     let published = deliver()?;
     let replay = deliver()?;
     assert_eq!((published.version, replay.version), (1, 1));
+    assert_eq!(published.outcome, CommitOutcome::Committed);
+    assert_eq!(replay.outcome, CommitOutcome::Deduplicated);
     assert!(published.file.path.exists());
     assert!(
         !replay.file.path.exists(),
@@ -161,6 +164,9 @@ fn replay_reports_observed_snapshot_version_not_original_commit() -> Result<()> 
     let second = deliver("second", 2)?;
     let replay = deliver("first", 1)?;
     assert_eq!((first.version, second.version, replay.version), (1, 2, 2));
+    assert_eq!(first.outcome, CommitOutcome::Committed);
+    assert_eq!(second.outcome, CommitOutcome::Committed);
+    assert_eq!(replay.outcome, CommitOutcome::Deduplicated);
     assert_eq!(table.version()?, 2);
     assert!(!replay.file.path.exists());
     assert_eq!(parquet_files(root.path())?, 2);
