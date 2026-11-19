@@ -940,10 +940,10 @@ mod overload_guard_tests {
         Ok(())
     }
 
-    fn identity_inventory_fixture() -> (OatConfig, Value, Value, Value) {
+    fn identity_inventory_fixture() -> Result<(OatConfig, Value, Value, Value)> {
         let mut config: OatConfig = serde_json::from_str(include_str!(
             "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
-        )).unwrap_or_else(|error| panic!("invalid OAT fixture: {error}"));
+        ))?;
         config.namespace = "run".to_owned();
         config.dfe_container = "dataflow".to_owned();
         let deployment = json!({
@@ -957,7 +957,7 @@ mod overload_guard_tests {
             "labels":{"app":"collector"},"ownerReferences":[{"kind":"ReplicaSet","name":"rs","uid":"rs-uid","controller":true}]},
             "status":{"containerStatuses":[{"name":"dataflow","ready":true,"restartCount":0,
                 "containerID":"container-id","state":{"running":{}}}]}}]});
-        (config, deployment, sets, pods)
+        Ok((config, deployment, sets, pods))
     }
 
     async fn delayed_guard_inventory(
@@ -974,7 +974,7 @@ mod overload_guard_tests {
 
     #[tokio::test]
     async fn guard_parallel_inventory_fits_shared_budget_and_fences_composite() -> Result<()> {
-        let (config, deployment, sets, pods) = identity_inventory_fixture();
+        let (config, deployment, sets, pods) = identity_inventory_fixture()?;
         let identity_delay = Duration::from_millis(120);
         let deadline = tokio::time::Instant::now() + Duration::from_millis(600);
         let before = delayed_guard_inventory(&config, deployment.clone(), sets.clone(), pods.clone(), identity_delay);
@@ -995,12 +995,25 @@ mod overload_guard_tests {
         let mut engine = GuardEngine::new(Default::default());
         engine.observe(reading, &backlog)?;
         assert_eq!(engine.proof["sample_count"], 1);
+        let old_deadline = tokio::time::Instant::now() + Duration::from_millis(600);
+        let old = guard_read_leg(old_deadline, async {
+            // Former snapshot waited for deployment before launching the other inventories.
+            tokio::time::sleep(identity_delay).await;
+            tokio::time::sleep(identity_delay).await;
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            tokio::time::sleep(identity_delay).await;
+            tokio::time::sleep(identity_delay).await;
+            Ok(())
+        }).await;
+        assert_eq!(old.status, "timeout");
+        assert!(old.cancelled);
+        assert!(old.into_result().is_err());
         Ok(())
     }
 
     #[tokio::test]
     async fn guard_inventory_requires_fresh_matching_selector_and_ownership() -> Result<()> {
-        let (config, deployment, sets, pods) = identity_inventory_fixture();
+        let (config, deployment, sets, pods) = identity_inventory_fixture()?;
         let binding = delayed_guard_inventory(&config, deployment.clone(), sets.clone(), pods.clone(), Duration::ZERO).await?;
         assert_eq!(binding.identities[0].pod_uid, "pod-uid");
         let mut changed = deployment.clone();
