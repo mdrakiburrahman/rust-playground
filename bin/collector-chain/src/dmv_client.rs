@@ -5837,6 +5837,90 @@ mod tests {
         Ok(())
     }
 
+    fn current_linux_tid() -> Result<u32> {
+        #[cfg(target_os = "linux")]
+        {
+            let target = std::fs::read_link("/proc/thread-self").context("read current Linux thread id")?;
+            target
+                .file_name()
+                .and_then(|name| name.to_str())
+                .context("current thread path has no numeric id")?
+                .parse()
+                .context("parse current Linux thread id")
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            anyhow::bail!("attributable sink CPU diagnostics require Linux /proc")
+        }
+    }
+
+    fn process_thread_cpu_ns(thread_id: u32) -> Result<u64> {
+        #[cfg(target_os = "linux")]
+        {
+            let path = format!("/proc/self/task/{thread_id}/schedstat");
+            let contents = std::fs::read_to_string(&path)
+                .with_context(|| format!("read sink thread CPU accounting for tid {thread_id}"))?;
+            contents
+                .split_whitespace()
+                .next()
+                .context("sink thread schedstat is missing CPU accounting")?
+                .parse()
+                .context("parse sink thread CPU accounting")
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = thread_id;
+            anyhow::bail!("attributable sink CPU diagnostics require Linux /proc")
+        }
+    }
+
+    fn sum_process_thread_cpu_ns(thread_ids: &[u32]) -> Result<u64> {
+        anyhow::ensure!(!thread_ids.is_empty(), "sink runtime has no attributable threads");
+        thread_ids.iter().try_fold(0_u64, |total, thread_id| {
+            total
+                .checked_add(process_thread_cpu_ns(*thread_id)?)
+                .context("sink runtime thread CPU total overflow")
+        })
+    }
+
+    struct SinkServerGuard {
+        shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+        thread: Option<std::thread::JoinHandle<Result<()>>>,
+    }
+
+    impl SinkServerGuard {
+        fn stop_and_join(&mut self) -> Result<()> {
+            if let Some(shutdown) = self.shutdown.take() {
+                shutdown
+                    .send(())
+                    .map_err(|()| anyhow::anyhow!("sink shutdown channel closed before stop"))?;
+            }
+            if let Some(thread) = self.thread.take() {
+                thread
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("sink server thread panicked"))??;
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for SinkServerGuard {
+        fn drop(&mut self) {
+            if let Some(shutdown) = self.shutdown.take()
+                && shutdown.send(()).is_err()
+            {
+                eprintln!("sink server shutdown channel was already closed during cleanup");
+            }
+            if let Some(thread) = self.thread.take() {
+                match thread.join() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => eprintln!("sink server cleanup failed: {error:#}"),
+                    Err(_) => eprintln!("sink server thread panicked during cleanup"),
+                }
+            }
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
     #[ignore = "10-minute realistic in-memory Flight sink and target-volume diagnostic; requires evidence paths"]
     async fn null_flight_sink_realistic_sustained_profile() -> Result<()> {
@@ -5892,6 +5976,7 @@ mod tests {
         const MAX_MEMORY_BYTES: u64 = 32 * 1024 * 1024 * 1024;
         const FLIGHT_DATA_LIMIT_BYTES: usize = 64 * 1024 * 1024;
         const CLIENT_MESSAGE_LIMIT_BYTES: usize = 128 * 1024 * 1024;
+        const SINK_RUNTIME_THREADS: usize = 16;
 
         let store: Arc<dyn CatalogStore> = Arc::new(MemoryCatalogStore::new());
         let principal = AuthenticatedPrincipal::new(
@@ -5913,22 +5998,67 @@ mod tests {
         )?
         .with_ddl_handler(Arc::new(CatalogControlPlane::new(DdlParser::default(), store)))
         .into_tonic_service();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        anyhow::ensure!(
+            cfg!(target_os = "linux"),
+            "attributable sink CPU diagnostics require Linux /proc"
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
         let endpoint = format!("http://{}", listener.local_addr()?);
-        let incoming = stream::unfold(listener, |listener| async {
-            Some((listener.accept().await.map(|(socket, _)| socket), listener))
-        });
         let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
-        let server = tokio::spawn(async move {
-            tonic::transport::Server::builder()
-                .initial_stream_window_size(server_stream_window_bytes)
-                .initial_connection_window_size(server_connection_window_bytes)
-                .add_service(service)
-                .serve_with_incoming_shutdown(incoming, async {
-                    let _ = shutdown_rx.await;
+        let sink_runtime_thread_ids = Arc::new(Mutex::new(Vec::new()));
+        let sink_runtime_thread_id_error = Arc::new(Mutex::new(None::<String>));
+        let runtime_thread_ids = Arc::clone(&sink_runtime_thread_ids);
+        let runtime_thread_id_error = Arc::clone(&sink_runtime_thread_id_error);
+        let server_thread = std::thread::Builder::new()
+            .name("perf69-flight-sink-root".to_owned())
+            .spawn(move || {
+                let root_thread_id = current_linux_tid()?;
+                runtime_thread_ids
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(root_thread_id);
+                let worker_thread_ids = Arc::clone(&runtime_thread_ids);
+                let worker_thread_id_error = Arc::clone(&runtime_thread_id_error);
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(SINK_RUNTIME_THREADS)
+                    .thread_name("perf69-flight-sink-worker")
+                    .on_thread_start(move || match current_linux_tid() {
+                        Ok(thread_id) => worker_thread_ids
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push(thread_id),
+                        Err(error) => {
+                            *worker_thread_id_error
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(format!("{error:#}"));
+                        }
+                    })
+                    .enable_all()
+                    .build()
+                    .context("build isolated sink runtime")?;
+                runtime.block_on(async move {
+                    let listener = tokio::net::TcpListener::from_std(listener)
+                        .context("register sink listener on isolated runtime")?;
+                    let incoming = stream::unfold(listener, |listener| async {
+                        Some((listener.accept().await.map(|(socket, _)| socket), listener))
+                    });
+                    tonic::transport::Server::builder()
+                        .initial_stream_window_size(server_stream_window_bytes)
+                        .initial_connection_window_size(server_connection_window_bytes)
+                        .add_service(service)
+                        .serve_with_incoming_shutdown(incoming, async {
+                            let _ = shutdown_rx.await;
+                        })
+                        .await
+                        .context("serve isolated local Flight sink")
                 })
-                .await
-        });
+            })
+            .context("spawn isolated sink runtime thread")?;
+        let mut server = SinkServerGuard {
+            shutdown: Some(shutdown),
+            thread: Some(server_thread),
+        };
 
         let mut run_options = options()?;
         run_options.data_profile = DataProfile::Realistic;
@@ -5963,6 +6093,32 @@ mod tests {
             run_options,
         )
         .await?;
+        let sink_thread_startup_deadline = Instant::now() + Duration::from_secs(10);
+        let sink_runtime_thread_ids = loop {
+            if let Some(error) = sink_runtime_thread_id_error
+                .lock()
+                .map_err(|_| anyhow::anyhow!("sink runtime thread-id error state poisoned"))?
+                .clone()
+            {
+                anyhow::bail!("could not attribute sink runtime thread CPU: {error}");
+            }
+            let mut thread_ids = sink_runtime_thread_ids
+                .lock()
+                .map_err(|_| anyhow::anyhow!("sink runtime thread-id state poisoned"))?
+                .clone();
+            thread_ids.sort_unstable();
+            thread_ids.dedup();
+            if thread_ids.len() == SINK_RUNTIME_THREADS + 1 {
+                break thread_ids;
+            }
+            anyhow::ensure!(
+                Instant::now() < sink_thread_startup_deadline,
+                "expected {} sink runtime threads, observed {}",
+                SINK_RUNTIME_THREADS + 1,
+                thread_ids.len()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
         anyhow::ensure!(
             client.corpus.len() == 1,
             "shared profile should prepare one shared corpus"
@@ -5972,9 +6128,10 @@ mod tests {
             "prepared corpus should contain the configured full-batch variation"
         );
         eprintln!(
-            "L3_SUSTAINED_PROFILE server_receive_stream_window_bytes={server_stream_window_bytes} server_receive_connection_window_bytes={server_connection_window_bytes} client_receive_stream_window_bytes={} client_receive_connection_window_bytes={} options={} preparation={}",
+            "L3_SUSTAINED_PROFILE server_receive_stream_window_bytes={server_stream_window_bytes} server_receive_connection_window_bytes={server_connection_window_bytes} client_receive_stream_window_bytes={} client_receive_connection_window_bytes={} sink_runtime_worker_threads={SINK_RUNTIME_THREADS} sink_runtime_os_threads={} options={} preparation={}",
             client.options.stream_window_bytes,
             client.options.connection_window_bytes,
+            sink_runtime_thread_ids.len(),
             serde_json::to_string(&client.options)?,
             serde_json::to_string(&client.preparation)?
         );
@@ -6164,31 +6321,41 @@ mod tests {
             () = tokio::time::sleep(Duration::from_millis(until_measurement)) => {}
             joined = &mut run_task => run_result = Some(joined_run_result(joined)),
         }
+        let mut cpu_attribution_start = None;
         if run_result.is_none() {
+            let cpu_window_started = Instant::now();
+            let mut previous_cpu = process_cpu_ns()?.context("process CPU accounting unavailable")?;
+            let mut previous_sink_cpu_ns = sum_process_thread_cpu_ns(&sink_runtime_thread_ids)?;
+            cpu_attribution_start = Some((previous_cpu, previous_sink_cpu_ns, cpu_window_started));
             let monitor_start = tokio::time::Instant::now();
             let mut previous_time = monitor_start;
             let mut previous_rows = measurement.rows.load(Ordering::Relaxed);
-            let mut previous_cpu = process_cpu_ns()?;
             let mut sampled_peak_rss = process_rss_bytes()?;
             let sample_count = measurement_ms.div_ceil(sample_interval_ms).saturating_add(2);
             for sample_index in 1..=sample_count {
                 let deadline = monitor_start + Duration::from_millis(sample_interval_ms.saturating_mul(sample_index));
                 tokio::select! {
                     () = tokio::time::sleep_until(deadline) => {
+                        let sink_cpu_ns = sum_process_thread_cpu_ns(&sink_runtime_thread_ids)?;
+                        let cpu = process_cpu_ns()?.context("process CPU accounting unavailable")?;
                         let now = tokio::time::Instant::now();
                         let rows = measurement.rows.load(Ordering::Relaxed);
                         let elapsed = now.duration_since(previous_time).as_secs_f64();
-                        let cpu = process_cpu_ns()?;
-                        let cpu_core_equivalents = cpu.zip(previous_cpu)
-                            .map(|(current, previous)| current.saturating_sub(previous) as f64 / elapsed / 1e9);
+                        let process_cpu_delta = cpu.saturating_sub(previous_cpu);
+                        let sink_cpu_delta = sink_cpu_ns.saturating_sub(previous_sink_cpu_ns);
+                        let process_cpu_core_equivalents = process_cpu_delta as f64 / elapsed / 1e9;
+                        let sink_cpu_core_equivalents = sink_cpu_delta as f64 / elapsed / 1e9;
+                        let client_and_harness_cpu_core_equivalents =
+                            process_cpu_delta.saturating_sub(sink_cpu_delta) as f64 / elapsed / 1e9;
                         let rss = process_rss_bytes()?;
                         sampled_peak_rss = sampled_peak_rss.max(rss);
                         let row_delta = rows.saturating_sub(previous_rows);
-                        eprintln!("L3_SUSTAINED_SAMPLE sample={sample_index} interval_ms={sample_interval_ms} elapsed_seconds={elapsed:.3} completed_rows={row_delta} completed_rows_per_second={:.3} completed_parents_estimate={:.3} process_cpu_core_equivalents={cpu_core_equivalents:?} sampled_rss_bytes={rss} sampled_peak_rss_bytes={sampled_peak_rss}",
+                        eprintln!("L3_SUSTAINED_SAMPLE sample={sample_index} interval_ms={sample_interval_ms} elapsed_seconds={elapsed:.3} completed_rows={row_delta} completed_rows_per_second={:.3} completed_parents_estimate={:.3} process_cpu_core_equivalents={process_cpu_core_equivalents:.3} sink_cpu_core_equivalents={sink_cpu_core_equivalents:.3} client_and_harness_cpu_core_equivalents={client_and_harness_cpu_core_equivalents:.3} sampled_rss_bytes={rss} sampled_peak_rss_bytes={sampled_peak_rss}",
                             row_delta as f64 / elapsed, row_delta as f64 / ROWS_PER_BATCH as f64);
                         previous_time = now;
                         previous_rows = rows;
                         previous_cpu = cpu;
+                        previous_sink_cpu_ns = sink_cpu_ns;
                     }
                     joined = &mut run_task => {
                         run_result = Some(joined_run_result(joined));
@@ -6201,6 +6368,30 @@ mod tests {
             run_result = Some(joined_run_result(run_task.await));
         }
         let run_result = run_result.context("sustained client task produced no result")?;
+        if let Some((process_cpu_start_ns, sink_cpu_start_ns, cpu_window_started)) = cpu_attribution_start {
+            let sink_cpu_end_ns = sum_process_thread_cpu_ns(&sink_runtime_thread_ids)?;
+            let process_cpu_end_ns = process_cpu_ns()?.context("process CPU accounting unavailable")?;
+            let process_cpu_delta_ns = process_cpu_end_ns.saturating_sub(process_cpu_start_ns);
+            let sink_cpu_delta_ns = sink_cpu_end_ns.saturating_sub(sink_cpu_start_ns);
+            anyhow::ensure!(
+                sink_cpu_delta_ns <= process_cpu_delta_ns,
+                "sink thread CPU accounting exceeds process CPU accounting"
+            );
+            let client_and_harness_cpu_delta_ns = process_cpu_delta_ns - sink_cpu_delta_ns;
+            let elapsed_seconds = cpu_window_started.elapsed().as_secs_f64();
+            eprintln!(
+                "L3_CPU_ATTRIBUTION method=process_stat_minus_dedicated_sink_runtime_worker_schedstat scope=measurement_start_through_client_terminal_completion_including_ack_drain sink_runtime_os_threads={} elapsed_seconds={elapsed_seconds:.3} process_cpu_ns={process_cpu_delta_ns} sink_cpu_ns={sink_cpu_delta_ns} client_and_harness_cpu_ns={client_and_harness_cpu_delta_ns} process_core_equivalents={:.3} sink_core_equivalents={:.3} client_and_harness_core_equivalents={:.3}",
+                sink_runtime_thread_ids.len(),
+                process_cpu_delta_ns as f64 / elapsed_seconds / 1e9,
+                sink_cpu_delta_ns as f64 / elapsed_seconds / 1e9,
+                client_and_harness_cpu_delta_ns as f64 / elapsed_seconds / 1e9
+            );
+        } else {
+            anyhow::ensure!(
+                run_result.is_err(),
+                "successful run is missing attributable CPU samples"
+            );
+        }
         let phase = if run_result.is_ok() { "completed" } else { "failed" };
         let terminal_receipt = client.metrics(phase)?;
         let terminal_manifest = &terminal_receipt["logical_batch_manifest"];
@@ -6211,10 +6402,7 @@ mod tests {
             "L3_SUSTAINED_TERMINAL phase={phase} manifest_bytes={terminal_manifest_bytes} manifest_cap_bytes={MAX_LOGICAL_MANIFEST_BYTES} terminal_line_bytes={terminal_line_bytes} terminal_line_cap_bytes={MAX_OAT_CLIENT_METRICS_LINE_BYTES} path={terminal_path}"
         );
         if let Err(error) = run_result {
-            shutdown
-                .send(())
-                .map_err(|()| anyhow::anyhow!("null sink stopped early"))?;
-            tokio::time::timeout(Duration::from_secs(2), server).await???;
+            server.stop_and_join()?;
             return Err(error);
         }
         client.ensure_terminal_manifest_complete()?;
@@ -6462,10 +6650,7 @@ mod tests {
             serde_json::to_string(&timings.canonical_accounting.snapshot())?,
             serde_json::to_string(&timings.transport_and_ack.snapshot())?
         );
-        shutdown
-            .send(())
-            .map_err(|()| anyhow::anyhow!("null sink stopped early"))?;
-        tokio::time::timeout(Duration::from_secs(2), server).await???;
+        server.stop_and_join()?;
         Ok(())
     }
 
