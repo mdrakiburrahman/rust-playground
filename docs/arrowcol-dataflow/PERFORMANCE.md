@@ -73,6 +73,12 @@ rather than forcing a version per group. See the [control contracts](../experime
 
 ## Remote snapshot refresh
 
+For reconciliation fixtures, `ARROWCOL_PUBLICATION_AUDIT_JSON=true` additionally
+emits the actual exporter publication receipt events as standard tracing JSON on
+stderr. The default is `false`; other values fail startup. Keep mixed stderr
+unchanged and extract JSON lines without rewriting receipt fields. This logging
+option does not enable auditing, change publication identity or establish delivery.
+
 ADLS snapshots use Kernel's incremental builder only after validating the retained
 log's object identities. Each refresh still lists metadata before and after the
 build and checks publisher authority; this reduces replay work, not listing cost.

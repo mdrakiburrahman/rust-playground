@@ -877,7 +877,8 @@ mod io_tests {
         assert!(
             table
                 .lookup_txn("expired")
-                .unwrap_err()
+                .err()
+                .context("retention was accepted")?
                 .to_string()
                 .contains("retention")
         );
@@ -2660,7 +2661,7 @@ mod coalesced_capacity_tests {
     use super::*;
 
     #[test]
-    fn rejected_partition_fanout_does_not_materialize_groups() {
+    fn rejected_partition_fanout_does_not_materialize_groups() -> Result<()> {
         let partition = |name: &str| BTreeMap::from([("region".to_owned(), Some(name.to_owned()))]);
         let groups = vec![(0, partition("north"), true), (1, partition("south"), true)];
         let mut materializations = 0;
@@ -2668,10 +2669,11 @@ mod coalesced_capacity_tests {
             materializations += 1;
             Ok(())
         })
-        .expect_err("fanout exceeds the commit capacity");
+        .err()
+        .context("fanout exceeds the commit capacity")?;
         let capacity = error
             .downcast_ref::<CoalescedGroupCapacityExceeded>()
-            .expect("capacity error");
+            .context("capacity error")?;
         assert_eq!(capacity.required_files, 2);
         assert_eq!(capacity.max_files, 1);
         assert_eq!(materializations, 0);
@@ -2681,9 +2683,10 @@ mod coalesced_capacity_tests {
             materializations += 1;
             Ok(())
         })
-        .expect("replay-only fanout does not consume output file capacity");
+        .context("replay-only fanout does not consume output file capacity")?;
         assert!(materialized.is_empty());
         assert_eq!(materializations, 0);
+        Ok(())
     }
 }
 
@@ -3395,7 +3398,7 @@ impl DeltaTable {
         match self.publication_lookup_mode {
             crate::commit::PublicationLookupMode::Batched => {
                 Ok(
-                    crate::publication_lookup::get_app_id_versions(&snapshot, &self.engine, ids)?
+                    crate::publication_lookup::get_app_id_versions(snapshot, &self.engine, ids)?
                         .into_iter()
                         .map(|(id, version)| (id.to_owned(), version))
                         .collect(),
@@ -3840,14 +3843,14 @@ impl DeltaTable {
         };
         let after = self.remote_log_fingerprints()?;
         session.check_snapshot()?;
-        if let (Some(before), Some(after)) = (before, after) {
-            if before == after {
-                *cache = Some(CachedRemoteSnapshot {
-                    snapshot: Arc::clone(&snapshot),
-                    files: after,
-                });
-                return Ok(snapshot);
-            }
+        if let (Some(before), Some(after)) = (before, after)
+            && before == after
+        {
+            *cache = Some(CachedRemoteSnapshot {
+                snapshot: Arc::clone(&snapshot),
+                files: after,
+            });
+            return Ok(snapshot);
         }
         if base.is_some() {
             tracing::debug!("remote Delta log changed during incremental refresh; rebuilding without cached state");

@@ -153,7 +153,7 @@ fn is_valid_logical_publication_id(value: &str) -> bool {
         && (sequence.len() == 1 || !sequence.starts_with('0'))
         && sequence
             .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'z').contains(&byte))
+            .all(|byte| byte.is_ascii_digit() || byte.is_ascii_lowercase())
         && u64::from_str_radix(sequence, 36).is_ok()
 }
 

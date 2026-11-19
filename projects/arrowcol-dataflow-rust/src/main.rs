@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::rc::Rc;
+use tracing_subscriber::Layer;
 
 use arrowcol_dataflow_components as _;
 
@@ -26,10 +27,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("arrowcol_effective_config {build_config}");
     otel_arrow_dfe::initialize_crypto_provider()?;
     let metrics = arrowcol_buffer::MetricsGuard::install("arrowcol-dataflow-rust")?;
-    otel_arrow_dfe_telemetry::tracing_init::install_auxiliary_layer_factory(|| {
-        Box::new(delta_kernel::metrics::ReportGeneratorLayer::new(
-            arrow_deltalake::telemetry::kernel_metrics_reporter(),
-        ))
+    let audit_json = match std::env::var("ARROWCOL_PUBLICATION_AUDIT_JSON") {
+        Ok(value) if value == "true" => true,
+        Ok(value) if value == "false" => false,
+        Err(std::env::VarError::NotPresent) => false,
+        _ => return Err("ARROWCOL_PUBLICATION_AUDIT_JSON must be true or false".into()),
+    };
+    otel_arrow_dfe_telemetry::tracing_init::install_auxiliary_layer_factory(if audit_json {
+        || {
+            Box::new(
+                delta_kernel::metrics::ReportGeneratorLayer::new(arrow_deltalake::telemetry::kernel_metrics_reporter())
+                    .and_then(
+                        tracing_subscriber::fmt::layer()
+                            .json()
+                            .with_current_span(false)
+                            .with_span_list(false)
+                            .with_writer(std::io::stderr)
+                            .with_filter(tracing_subscriber::filter::filter_fn(|metadata| {
+                                metadata.target() == "arrowcol_dataflow_components::exporter"
+                                    && metadata.fields().field("qualification_state").is_some()
+                            })),
+                    ),
+            )
+        }
+    } else {
+        || {
+            Box::new(delta_kernel::metrics::ReportGeneratorLayer::new(
+                arrow_deltalake::telemetry::kernel_metrics_reporter(),
+            ))
+        }
     })
     .map_err(|_| "DFE metrics layer factory already installed")?;
     otel_arrow_dfe_telemetry::tracing_init::init_global_auxiliary_subscriber()?;
