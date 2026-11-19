@@ -91,7 +91,6 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::{ArrayRef, BooleanArray, Int32Array};
-    use arrow_buffer::NullBuffer;
     use arrow_ipc::{reader::StreamReader, writer::StreamWriter};
     use arrow_schema::{Field, Schema};
 
@@ -133,9 +132,14 @@ mod tests {
 
     #[test]
     fn validity_is_counted_only_when_nulls_exist_and_empty_utf8_has_one_offset() {
-        let values = Int32Array::from(vec![1, 2, 3]);
-        let all_valid_with_bitmap = Int32Array::new(values.values().clone(), Some(NullBuffer::new_valid(3)));
-        assert_eq!(all_valid_with_bitmap.null_count(), 0);
+        let values = Int32Array::from(vec![Some(1), None, Some(3)]);
+        let all_valid_with_bitmap = values.slice(0, 1);
+        let all_valid_array = all_valid_with_bitmap
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("int32 slice");
+        assert_eq!(all_valid_array.null_count(), 0);
+        assert!(all_valid_array.nulls().is_some());
 
         let empty_text = RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new("empty_text", DataType::Utf8, false)])),
@@ -146,10 +150,10 @@ mod tests {
 
         let all_valid = RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new("all_valid", DataType::Int32, false)])),
-            vec![Arc::new(all_valid_with_bitmap)],
+            vec![all_valid_with_bitmap],
         )
         .expect("all-valid record batch");
-        assert_eq!(canonical_record_batch_logical_bytes(&all_valid), Ok(12));
+        assert_eq!(canonical_record_batch_logical_bytes(&all_valid), Ok(4));
     }
 
     #[test]
