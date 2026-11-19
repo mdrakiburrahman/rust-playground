@@ -4590,7 +4590,7 @@ impl DeltaTable {
             pending.push(Arc::clone(self).stage_coalesced_file(file, Arc::clone(&prepared.context)));
         }
         let mut staged = BTreeMap::new();
-        let mut failure = None;
+        let mut failure: Option<anyhow::Error> = None;
         while let Some((index, result)) = pending.next().await {
             match result {
                 Ok(append) => {
