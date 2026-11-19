@@ -5,7 +5,8 @@ import { delimiter, join } from 'node:path';
 import test from 'node:test';
 import { acceptRouterFencePatch, planRouterFence, routerFenceObserved } from './benchmark-router-fence.js';
 import { persistDirectStopPatch } from './benchmark-stop-patch.js';
-import { exportWriterLogs, writerLogExportPod } from './benchmark-writer-export.js';
+import { observeCompletedClients } from './benchmark-client-terminal.js';
+import { clientLogExportPod, exportWriterLogs, writerLogExportPod } from './benchmark-writer-export.js';
 import { observeStoppedWriterRegistration, pinWriterRegistration } from './benchmark-writer-sql.js';
 
 const run = {
@@ -17,6 +18,33 @@ const run = {
 };
 const uid = 'cdcdcdcd-1234-1234-1234-cdcdcdcdcdcd';
 const markers = { 'arrowcol-oat/run-id': run.runId, 'arrowcol-oat/owner-token': run.owner };
+test('requires a clean original indexed client lifetime and its exact retained claim', () => {
+  const c = { index: 0, name: 'client', uid, jobUid: run.owner, nodeName: 'client-node', image: `test@sha256:${'a'.repeat(64)}`,
+    imageId: `sha256:${'a'.repeat(64)}`, containerId: 'original', startedAt: '2026-01-01T00:00:00Z',
+    claimName: 'client-evidence', claimUid: run.namespaceUid, volumeName: 'client-pv' };
+  const metadata = { namespace: run.namespace, labels: markers, annotations: markers };
+  const job = { kind: 'Job', apiVersion: 'batch/v1', metadata: { ...metadata, uid: c.jobUid, name: 'direct-load-confirmwide' },
+    spec: { completionMode: 'Indexed', completions: 1 }, status: { succeeded: 1, conditions: [{ type: 'Complete', status: 'True' }] } };
+  const terminated = { containerID: c.containerId, startedAt: c.startedAt, finishedAt: '2026-01-01T00:02:01Z', exitCode: 0, reason: 'Completed' };
+  const pod = { kind: 'Pod', apiVersion: 'v1', metadata: { ...metadata, uid, name: c.name, resourceVersion: '31',
+    annotations: { ...markers, 'batch.kubernetes.io/job-completion-index': '0' },
+    ownerReferences: [{ kind: 'Job', controller: true, uid: c.jobUid }] },
+    spec: { nodeName: c.nodeName, containers: [{ name: 'generator', image: c.image }] },
+    status: { phase: 'Succeeded', containerStatuses: [{ name: 'generator', imageID: c.imageId, containerID: c.containerId,
+      restartCount: 0, state: { terminated } }] } };
+  const claim = { kind: 'PersistentVolumeClaim', apiVersion: 'v1', metadata: { ...metadata, uid: c.claimUid, name: c.claimName,
+    ownerReferences: [{ kind: 'Pod', controller: true, uid }] }, spec: { storageClassName: 'managed-csi', volumeName: c.volumeName },
+    status: { phase: 'Bound' } };
+  const finish = () => observeCompletedClients(run, [c], job, { kind: 'PodList', items: [pod] },
+    new Map([[c.claimName, claim]]), Date.parse('2026-01-01T00:02:00Z'))[0];
+  const helper = clientLogExportPod(run, finish());
+  assert.equal(helper.spec.volumes[0].persistentVolumeClaim.claimName, c.claimName);
+  claim.metadata.uid = 'another-claim';
+  assert.throws(finish, /claim changed/);
+  claim.metadata.uid = c.claimUid;
+  terminated.exitCode = 137;
+  assert.throws(finish, /exact clean exit/);
+});
 const router = {
   apiVersion: 'apps/v1', kind: 'DaemonSet',
   metadata: { uid, name: 'arrowcol-router', namespace: run.namespace, resourceVersion: '42', generation: 1,

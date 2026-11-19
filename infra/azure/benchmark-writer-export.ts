@@ -7,6 +7,7 @@ import { Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { observeWriterClaim, WRITER_CLAIM, type ArmIdentity, type observeWriterExit } from './benchmark-arm.js';
 import type { RunCleanupAuthority } from './run_fic.js';
+import type { observeCompletedClients } from './benchmark-client-terminal.js';
 
 type Capture = ReturnType<typeof observeWriterClaim>;
 type WriterExit = ReturnType<typeof observeWriterExit>;
@@ -21,11 +22,32 @@ export function writerLogExportPod(run: ArmIdentity, writer: WriterExit, pinnedC
       !/^.+@sha256:[0-9a-f]{64}$/.test(writer.image) || !writer.terminalPodResourceVersion) {
     throw new Error('Cannot export from an unverified original writer claim, node or lifetime');
   }
-  return renderExportPod(run, writer, cap);
+  return renderExportPod(run, { ...writer, originalUid: writer.podUid, claimName: WRITER_CLAIM, claimUid: cap.claimUid,
+    subPath: `benchmark-logs/${writer.podUid}`, helperName: 'direct-writer-log-export', role: 'arrowcol' });
 }
 
+export function clientLogExportPod(run: ArmIdentity, client: ReturnType<typeof observeCompletedClients>[number]) {
+  if (!Number.isInteger(client.index) || client.index < 0 || client.index >= run.clients ||
+      !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(client.uid) ||
+      !/^.+@sha256:[0-9a-f]{64}$/.test(client.image) || client.claimName !== `${client.name}-evidence` || !client.podVersion) {
+    throw new Error('Cannot export from an unverified original client claim, node or lifetime');
+  }
+  return renderExportPod(run, { ...client, originalUid: client.uid, subPath: client.uid,
+    helperName: `direct-client-${client.index}-log-export`, role: 'client' });
+}
 export async function exportWriterLogs(authority: RunCleanupAuthority, run: ArmIdentity, server: string, context: string,
     directory: string, observeHelper: () => Promise<{ podUid: string; containerId: string }>) {
+  return exportLogs(authority, run, server, context, directory, observeHelper, 'writer', maxStreamBytes);
+}
+
+export async function exportClientLogs(authority: RunCleanupAuthority, run: ArmIdentity, server: string, context: string,
+  directory: string, index: number, observeHelper: () => Promise<{ podUid: string; containerId: string }>) {
+  if (!Number.isInteger(index) || index < 0 || index >= run.clients) throw new Error('Invalid original client export index');
+  return exportLogs(authority, run, server, context, directory, observeHelper, `client-${index}`, 128 * 1024 ** 2);
+}
+
+async function exportLogs(authority: RunCleanupAuthority, run: ArmIdentity, server: string, context: string,
+  directory: string, observeHelper: () => Promise<{ podUid: string; containerId: string }>, streamOwner: string, byteLimit: number) {
     const stat = await lstat(directory);
     if (!stat.isDirectory() || (stat.mode & 0o077) !== 0 || !/^https:\/\/[a-z0-9.-]+$/.test(server)) {
       throw new Error('Writer export needs a private evidence directory and exact TLS AKS server');
@@ -41,7 +63,7 @@ export async function exportWriterLogs(authority: RunCleanupAuthority, run: ArmI
     async function exec(command: string[], transfer: (stdout: NodeJS.ReadableStream) => Promise<void>) {
       await checkCurrent();
       const child = spawn('kubectl', ['--context', context, '--server', server, '--insecure-skip-tls-verify=false',
-        '--request-timeout=900s', '-n', run.namespace, 'exec', 'direct-writer-log-export', '-c', 'export', '--', ...command],
+        '--request-timeout=900s', '-n', run.namespace, 'exec', `direct-${streamOwner}-log-export`, '-c', 'export', '--', ...command],
       { stdio: ['ignore', 'pipe', 'ignore'], timeout: 900_000 });
       const done = new Promise<void>((resolve, reject) => {
         child.once('error', reject);
@@ -68,13 +90,13 @@ export async function exportWriterLogs(authority: RunCleanupAuthority, run: ArmI
     }
     const files = [];
     for (const stream of ['stdout', 'stderr']) {
-      const remote = `/evidence/${stream}`, local = join(directory, `writer-${stream}.raw`);
+      const remote = `/evidence/${stream}`, local = join(directory, `${streamOwner}-${stream}.raw`);
       const before = await fingerprint(remote);
       const sha = createHash('sha256');
       let bytes = 0;
       const hash = new Transform({ transform(chunk: Buffer, _encoding, done) {
         bytes += chunk.length;
-        if (bytes >= maxStreamBytes) return done(new Error('Writer log reached its capture capacity'));
+        if (bytes >= byteLimit) return done(new Error('Original log reached its capture capacity'));
         sha.update(chunk);
         done(null, chunk);
       } });
@@ -88,26 +110,29 @@ export async function exportWriterLogs(authority: RunCleanupAuthority, run: ArmI
     return { helper: pin, files };
 }
 
-function renderExportPod(run: ArmIdentity, writer: WriterExit, cap: Capture) {
+function renderExportPod(run: ArmIdentity, origin: {
+  originalUid: string; nodeName: string; image: string; claimName: string; claimUid: string;
+  subPath: string; helperName: string; role: 'arrowcol' | 'client';
+}) {
   const markers = { 'arrowcol-oat/run-id': run.runId, 'arrowcol-oat/owner-token': run.owner };
   return {
     apiVersion: 'v1', kind: 'Pod',
-    metadata: { namespace: run.namespace, name: 'direct-writer-log-export', labels: markers,
-      annotations: { ...markers, 'arrowcol-oat/original-writer-pod-uid': writer.podUid, 'arrowcol-oat/original-claim-uid': cap.claimUid } },
+    metadata: { namespace: run.namespace, name: origin.helperName, labels: markers,
+      annotations: { ...markers, 'arrowcol-oat/original-pod-uid': origin.originalUid, 'arrowcol-oat/original-claim-uid': origin.claimUid } },
     spec: {
       restartPolicy: 'Never', activeDeadlineSeconds: 1800, automountServiceAccountToken: false, enableServiceLinks: false,
       affinity: { nodeAffinity: { requiredDuringSchedulingIgnoredDuringExecution: {
-        nodeSelectorTerms: [{ matchFields: [{ key: 'metadata.name', operator: 'In', values: [writer.nodeName] }] }],
+        nodeSelectorTerms: [{ matchFields: [{ key: 'metadata.name', operator: 'In', values: [origin.nodeName] }] }],
       } } },
-      tolerations: [{ key: 'arrow-collector/role', operator: 'Equal', value: 'arrowcol', effect: 'NoSchedule' }],
+      tolerations: [{ key: 'arrow-collector/role', operator: 'Equal', value: origin.role, effect: 'NoSchedule' }],
       securityContext: { runAsNonRoot: true, runAsUser: 10001, runAsGroup: 10001, seccompProfile: { type: 'RuntimeDefault' } },
       containers: [{
-        name: 'export', image: writer.image, command: ['/bin/sleep', '1800'],
+        name: 'export', image: origin.image, command: ['/bin/sleep', '1800'],
         resources: { requests: { cpu: '100m', memory: '32Mi' }, limits: { cpu: '1', memory: '128Mi' } },
         securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ['ALL'] } },
-        volumeMounts: [{ name: 'writer-logs', mountPath: '/evidence', readOnly: true, subPath: `benchmark-logs/${writer.podUid}` }],
+        volumeMounts: [{ name: 'writer-logs', mountPath: '/evidence', readOnly: true, subPath: origin.subPath }],
       }],
-      volumes: [{ name: 'writer-logs', persistentVolumeClaim: { claimName: WRITER_CLAIM, readOnly: true } }],
+      volumes: [{ name: 'writer-logs', persistentVolumeClaim: { claimName: origin.claimName, readOnly: true } }],
     },
   };
 }

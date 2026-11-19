@@ -25,6 +25,20 @@ export interface ArmIdentity {
   owner: string;
   clients: number;
 }
+export interface ClientLifetime {
+  index: number;
+  name: string;
+  uid: string;
+  jobUid: string;
+  nodeName: string;
+  image: string;
+  imageId: string;
+  containerId: string;
+  startedAt: string;
+  claimName: string;
+  claimUid: string;
+  volumeName: string;
+}
 
 function labels(metadata: Json, identity: ArmIdentity): void {
   const found = object(metadata.labels, 'labels');
@@ -315,7 +329,7 @@ function main(): void {
     return [name, kubectl(context, ['-n', namespace, 'exec', name, '-c', 'generator', '--',
       '/bin/sh', '-c', probeClientCapture, 'capture', uid, pattern])];
   }));
-  const clientLifetimes = (list: unknown) => JSON.stringify(array(object(list, 'client pods').items, 'pod list').map(item => {
+  const clientLifetimes = (list: unknown) => JSON.stringify(array(object(list, 'client pods').items, 'pod list').map((item): ClientLifetime => {
     const pod = object(item, 'client pod'), meta = object(pod.metadata, 'client metadata'), name = text(meta.name, 'client name');
     const uid = text(meta.uid, 'client UID'), spec = object(pod.spec, 'client spec');
     const index = Number(object(meta.annotations, 'client annotations')['batch.kubernetes.io/job-completion-index']);
@@ -338,10 +352,10 @@ function main(): void {
         cs.storageClassName !== 'managed-csi' || object(claim.status, 'client PVC status').phase !== 'Bound') {
       throw new Error('Client evidence claim does not belong to its original Pod');
     }
-    return { index, name, uid, jobUid: controller(meta, 'Job').uid, nodeName: text(spec.nodeName, 'client node'), image, imageId,
+    return { index, name, uid, jobUid: text(controller(meta, 'Job').uid, 'client Job UID'), nodeName: text(spec.nodeName, 'client node'), image, imageId,
       containerId: text(active.containerID, 'client container ID'),
       startedAt: text(object(object(active.state, 'client state').running, 'client running').startedAt, 'client start'),
-      claimName: cm.name, claimUid: text(cm.uid, 'client claim UID'), volumeName: text(cs.volumeName, 'client PV name') };
+      claimName: text(cm.name, 'client claim name'), claimUid: text(cm.uid, 'client claim UID'), volumeName: text(cs.volumeName, 'client PV name') };
   }).sort((a, b) => a.index - b.index));
   const logs = clientLogs(pods);
   const checked = validateArm(identity, ns, job, schedule, pods, logs);
