@@ -1302,7 +1302,7 @@ impl ResourceSampler {
                             guard_reading,
                             bounded_publication_backlog_scrape(backlog_scraper.as_ref(),
                                 request_anchor + Duration::from_millis(timeout_ms)),
-                            async { verify_guard_identity(&config, expected_identity.as_deref()).await },
+                            async { verify_guard_identity(&config, expected_identity.as_ref()).await },
                             deadline,
                         ),
                     );

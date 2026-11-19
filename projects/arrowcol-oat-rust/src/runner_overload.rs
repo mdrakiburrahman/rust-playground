@@ -453,32 +453,71 @@ fn scale_out_collector_identities(
     Ok(identities)
 }
 
+#[derive(Clone)]
+struct GuardCollectorBinding {
+    identities: Vec<ScaleOutCollectorIdentity>,
+    selector: String,
+}
+
 struct GuardProbe {
     instance_id: String,
     rss_cap: u64,
     buffer_cap: u64,
     collector_instance: Option<arrowcol_protocol::CollectorInstanceId>,
-    expected_scale_out_identity: Option<Vec<ScaleOutCollectorIdentity>>,
+    expected_scale_out_identity: Option<GuardCollectorBinding>,
     local: bool,
     since_ms: u64,
 }
 
-async fn scale_out_collector_snapshot(config: &OatConfig, replicas: u32) -> Result<Vec<ScaleOutCollectorIdentity>> {
-    let deployment = deployment(config, &config.dfe_deployment).await?;
-    let selector = deployment_selector(&deployment)?;
-    let (sets, pods) = tokio::try_join!(
-        kubectl(config, vec!["get", "replicasets", "--namespace", &config.namespace, "-o", "json"], None),
-        kubectl(config, vec!["get", "pods", "--namespace", &config.namespace, "--selector", &selector, "-o", "json"], None),
-    )?;
-    scale_out_collector_identities(
-        &config.namespace, &config.dfe_container, replicas, &deployment,
-        &serde_json::from_str(&sets)?, &serde_json::from_str(&pods)?,
-    )
+async fn guard_snapshot_inventory(
+    config: &OatConfig,
+    replicas: u32,
+    selector: &str,
+    deployment_read: impl std::future::Future<Output = Result<Value>>,
+    sets_read: impl std::future::Future<Output = Result<String>>,
+    pods_read: impl std::future::Future<Output = Result<String>>,
+) -> Result<GuardCollectorBinding> {
+    let (deployment, sets, pods) = tokio::try_join!(deployment_read, sets_read, pods_read)?;
+    if deployment_selector(&deployment)? != selector {
+        bail!("collector deployment selector changed during observation");
+    }
+    Ok(GuardCollectorBinding {
+        identities: scale_out_collector_identities(
+            &config.namespace, &config.dfe_container, replicas, &deployment,
+            &serde_json::from_str(&sets)?, &serde_json::from_str(&pods)?,
+        )?,
+        selector: selector.to_owned(),
+    })
 }
 
-async fn verify_guard_identity(config: &OatConfig, expected: Option<&[ScaleOutCollectorIdentity]>) -> Result<()> {
+async fn scale_out_collector_snapshot(
+    config: &OatConfig, replicas: u32, known_selector: Option<&str>,
+) -> Result<GuardCollectorBinding> {
+    let initial = if known_selector.is_none() {
+        Some(deployment(config, &config.dfe_deployment).await?)
+    } else {
+        None
+    };
+    let selector = match known_selector {
+        Some(selector) => selector.to_owned(),
+        None => deployment_selector(initial.as_ref().context("initial deployment missing")?)?,
+    };
+    guard_snapshot_inventory(
+        config, replicas, &selector,
+        async {
+            match initial {
+                Some(deployment) => Ok(deployment),
+                None => deployment(config, &config.dfe_deployment).await,
+            }
+        },
+        kubectl(config, vec!["get", "replicasets", "--namespace", &config.namespace, "-o", "json"], None),
+        kubectl(config, vec!["get", "pods", "--namespace", &config.namespace, "--selector", &selector, "-o", "json"], None),
+    ).await
+}
+
+async fn verify_guard_identity(config: &OatConfig, expected: Option<&GuardCollectorBinding>) -> Result<()> {
     if let Some(expected) = expected
-        && scale_out_collector_snapshot(config, 1).await? != expected
+        && scale_out_collector_snapshot(config, 1, Some(&expected.selector)).await?.identities != expected.identities
     {
         bail!("collector identity changed during composite observation");
     }
@@ -544,8 +583,8 @@ impl PreparedGuard {
                 if platform.kind() != crate::config::OatMode::Aks {
                     bail!("scale-out guard requires an AKS collector");
                 }
-                let expected = scale_out_collector_snapshot(config, 1).await?;
-                let [identity] = expected.as_slice() else {
+                let expected = scale_out_collector_snapshot(config, 1, None).await?;
+                let [identity] = expected.identities.as_slice() else {
                     bail!("scale-out guard requires exactly one collector identity");
                 };
                 diagnostics["selected_collector"] = sanitized_scale_out_identity(identity);
@@ -599,7 +638,7 @@ impl PreparedGuard {
         let (reading, backlog, identity) = guarded_composite_observation(
             prepared.probe.read(config, &prepared.scraper, diagnostics, deadline),
             prepared.scraper.scrape(),
-            verify_guard_identity(config, expected.as_deref()),
+            verify_guard_identity(config, expected.as_ref()),
             deadline,
         ).await;
         record_guard_read_leg(diagnostics, "collector_identity_after_backlog", &identity);
@@ -718,13 +757,8 @@ impl GuardProbe {
             "status":"running",
             "legs":{},
         });
-        let identity_before = if let Some(expected) = &self.expected_scale_out_identity {
-            guard_read_leg(deadline, async {
-                if scale_out_collector_snapshot(config, 1).await? != *expected {
-                    bail!("collector identity changed before observation");
-                }
-                Ok(())
-            }).await
+        let identity_before = if self.expected_scale_out_identity.is_some() {
+            guard_read_leg(deadline, verify_guard_identity(config, self.expected_scale_out_identity.as_ref())).await
         } else {
             GuardReadLeg::not_applicable()
         };
@@ -822,18 +856,6 @@ impl GuardProbe {
                 bail!("live ingestion commit table identity mismatched");
             }
         }
-        let identity_after_read = if let Some(expected) = &self.expected_scale_out_identity {
-            guard_read_leg(deadline, async {
-                if scale_out_collector_snapshot(config, 1).await? != *expected {
-                    bail!("collector identity changed during observation");
-                }
-                Ok(())
-            }).await
-        } else {
-            GuardReadLeg::not_applicable()
-        };
-        record_guard_read_leg(diagnostics, "collector_identity_after_read", &identity_after_read);
-        identity_after_read.into_result()?;
         diagnostics["last_guard_read"]["status"] = json!("complete");
         self.since_ms = request_start_ms.saturating_sub(GUARD_MAX_GAP_MS);
         Ok(GuardReading {
@@ -915,6 +937,82 @@ mod overload_guard_tests {
         let mut restarted = pods.clone();
         restarted["items"][0]["status"]["containerStatuses"][0]["containerID"] = json!("replacement");
         assert_ne!(identities, scale_out_collector_identities("run", "dataflow", 1, &deployment, &replica_sets, &restarted)?);
+        Ok(())
+    }
+
+    fn identity_inventory_fixture() -> (OatConfig, Value, Value, Value) {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        )).unwrap_or_else(|error| panic!("invalid OAT fixture: {error}"));
+        config.namespace = "run".to_owned();
+        config.dfe_container = "dataflow".to_owned();
+        let deployment = json!({
+            "metadata":{"name":"collector","namespace":"run","uid":"deployment","generation":1},
+            "spec":{"replicas":1,"selector":{"matchLabels":{"app":"collector"}}},
+            "status":{"observedGeneration":1,"updatedReplicas":1,"replicas":1,"availableReplicas":1}
+        });
+        let sets = json!({"items":[{"metadata":{"name":"rs","namespace":"run","uid":"rs-uid",
+            "ownerReferences":[{"kind":"Deployment","name":"collector","uid":"deployment","controller":true}]}}]});
+        let pods = json!({"items":[{"metadata":{"name":"pod","namespace":"run","uid":"pod-uid",
+            "labels":{"app":"collector"},"ownerReferences":[{"kind":"ReplicaSet","name":"rs","uid":"rs-uid","controller":true}]},
+            "status":{"containerStatuses":[{"name":"dataflow","ready":true,"restartCount":0,
+                "containerID":"container-id","state":{"running":{}}}]}}]});
+        (config, deployment, sets, pods)
+    }
+
+    async fn delayed_guard_inventory(
+        config: &OatConfig, deployment: Value, sets: Value, pods: Value, delay: Duration,
+    ) -> Result<GuardCollectorBinding> {
+        let wait = || tokio::time::sleep(delay);
+        guard_snapshot_inventory(
+            config, 1, "app=collector",
+            async { wait().await; Ok(deployment) },
+            async { wait().await; Ok(sets.to_string()) },
+            async { wait().await; Ok(pods.to_string()) },
+        ).await
+    }
+
+    #[tokio::test]
+    async fn guard_parallel_inventory_fits_shared_budget_and_fences_composite() -> Result<()> {
+        let (config, deployment, sets, pods) = identity_inventory_fixture();
+        let identity_delay = Duration::from_millis(120);
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(600);
+        let before = delayed_guard_inventory(&config, deployment.clone(), sets.clone(), pods.clone(), identity_delay);
+        let after = delayed_guard_inventory(&config, deployment, sets, pods, identity_delay);
+        let (reading, backlog, fence) = guarded_composite_observation(
+            async {
+                let binding = guard_read_leg(deadline, before).await.into_result()?;
+                assert_eq!(binding.identities[0].pod_uid, "pod-uid");
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                Ok(reading(0, 100))
+            },
+            async { pending(0, 0) },
+            async { after.await.map(|_| ()) },
+            deadline,
+        ).await;
+        let reading = reading?;
+        fence.into_result()?;
+        let mut engine = GuardEngine::new(Default::default());
+        engine.observe(reading, &backlog)?;
+        assert_eq!(engine.proof["sample_count"], 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn guard_inventory_requires_fresh_matching_selector_and_ownership() -> Result<()> {
+        let (config, deployment, sets, pods) = identity_inventory_fixture();
+        let binding = delayed_guard_inventory(&config, deployment.clone(), sets.clone(), pods.clone(), Duration::ZERO).await?;
+        assert_eq!(binding.identities[0].pod_uid, "pod-uid");
+        let mut changed = deployment.clone();
+        changed["spec"]["selector"]["matchLabels"]["app"] = json!("replacement");
+        assert!(delayed_guard_inventory(&config, changed, sets.clone(), pods.clone(), Duration::ZERO).await.is_err());
+        let mut foreign = pods.clone();
+        foreign["items"][0]["metadata"]["ownerReferences"][0]["uid"] = json!("foreign");
+        assert!(delayed_guard_inventory(&config, deployment.clone(), sets.clone(), foreign, Duration::ZERO).await.is_err());
+        let mut replaced = pods;
+        replaced["items"][0]["status"]["containerStatuses"][0]["containerID"] = json!("replacement");
+        let replacement = delayed_guard_inventory(&config, deployment, sets, replaced, Duration::ZERO).await?;
+        assert_ne!(binding.identities, replacement.identities);
         Ok(())
     }
 
