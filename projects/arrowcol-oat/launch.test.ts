@@ -805,6 +805,8 @@ test('observed AKS disposition requires matching owned failure, writer fence and
     await rejectFixture({ ...manifest, writer_fence: { ...manifest.writer_fence,
       server: { ...server, start_ticks: '18' } } }, /exact recorded server and writer fence/);
     await rejectFixture({ ...manifest, writer_fence: { ...manifest.writer_fence,
+      server: { ...server, start_ticks: '' } } }, /exact recorded server and writer fence/);
+    await rejectFixture({ ...manifest, writer_fence: { ...manifest.writer_fence,
       net_namespace: 'net:[1]' } }, /exact original Linux/);
     for (const change of [{ namespace: 'different' }, { namespace_uid_absent: false },
       { run_fic_absent: false }, { native_fic_present: false }]) {
@@ -889,34 +891,38 @@ test('post-load failure requires reviewed current custody proof and remains fail
       invocation_id: deadline.invocationId, controller_run_id: receipt.run_id,
       original_receipt_sha256: digest(original), source_config_sha256: receipt.source_config_sha256,
       submitted_config_sha256: receipt.submitted_config_sha256, original_error: receipt.error,
-      server_url: serverUrl, load_started: true, result_artifact: 'retained-unranked',
+      server_url: serverUrl, proof_kind: 'fresh_census_absence', historical_process_identity_proven: false,
+      job_id: 'abcdef123456', load_started: true, result_artifact: 'retained-unranked',
+      ranking: null as number | null, throughput_claim: null,
       verifier_sha256: raw, runner_source_sha256: raw,
       raw_observation_sha256: Object.fromEntries([
-        'load_trace', 'controller_identity', 'process_exit', 'workload_stop', 'namespace_get',
+        'load_trace', 'controller_identity', 'owning_job_terminal', 'lease', 'census', 'workload_stop', 'namespace_get',
         'qap_cleanup', 'fic_cleanup', 'fic_inventory', 'cluster_inventory', 'pool_inventory', 'node_inventory',
       ].map((name) => [name, raw])),
-      writer_fence: {
+      census: {
         boot_id: (await readFile('/proc/sys/kernel/random/boot_id', 'utf8')).trim(),
         pid_namespace: await readlink('/proc/self/ns/pid'), net_namespace: await readlink('/proc/self/ns/net'),
-        launcher: { pid: 2147483646, executable: '/opt/example/node' },
-        server: { pid: 2147483647, start_ticks: '17', executable: '/opt/example/oat' },
-        fenced_at_unix_ms: now,
+        host_target: 'dev/example_devcontainer', lease_id: 'ls-123456', lease_active: true,
+        controller_pid: 2147483647, controller_executable: '/opt/example/oat', controller_port: address.port,
+        controller_pid_allocated: false, launcher_match_count: 0, controller_match_count: 0, listener_count: 0,
+        boot_started_at_unix_ms: receipt.started_at_unix_ms - 1000,
+        container_started_at_unix_ms: receipt.started_at_unix_ms - 500, observed_at_unix_ms: now,
       },
       cell: {
         id: cellId, namespace: 'arrow-collector-' + cellId.replaceAll('-', ''),
         namespace_uid: '418a9705-b6ac-4487-b08e-a0dbdd5d6e5f', namespace_absent: true,
-        namespace_uid_absent: true, workload_delete_succeeded: true,
+        namespace_uid_absent: true, controller_pod_count: 0, workload_delete_succeeded: true,
         namespace_observed_at_unix_ms: now, qap: 'cleaned', qap_observed_at_unix_ms: now,
         run_fic_id: 'arrowcol-run-' + cellId, run_fic_absent: true,
-        native_fic_id: 'native-fic', native_fic_present: true, fic_observed_at_unix_ms: now,
+        native_fic_id: 'native-fic', native_fic_present: true, fic_inventory_count: 1, fic_observed_at_unix_ms: now,
       },
       cluster: { stamp_config_sha256: raw, stock_aks_id: '/fake/cluster', arm_aks_id: '/fake/cluster',
         stock_api_server: 'https://fake.example.invalid', current_api_server: 'https://fake.example.invalid' },
       pools: {
         all_user_pools_inventoried: true, observed_at_unix_ms: now,
         stamp_user_pool_names: ['pool-a', 'pool-b'],
-        user_pools: [{ name: 'pool-a', arm_count: 0, arm_min_count: 0, kubernetes_node_count: 0 },
-          { name: 'pool-b', arm_count: 0, arm_min_count: 0, kubernetes_node_count: 0 }],
+        user_pools: [{ name: 'pool-a', arm_count: 0, arm_min_count: 0, arm_max_count: 1, provisioning_state: 'Succeeded', kubernetes_node_count: 0 },
+          { name: 'pool-b', arm_count: 0, arm_min_count: 0, arm_max_count: 1, provisioning_state: 'Succeeded', kubernetes_node_count: 0 }],
       },
     };
     const approveFixture = async (proof: typeof manifest, receiptBytes = original) => {
@@ -933,12 +939,15 @@ test('post-load failure requires reviewed current custody proof and remains fail
     await rejectFixture(manifest, /listener is still present/);
     await closeListener();
     await rejectFixture({ ...manifest, load_started: false }, /exact failed invocation/);
+    await rejectFixture({ ...manifest, historical_process_identity_proven: true }, /exact failed invocation/);
+    await rejectFixture({ ...manifest, ranking: 1 }, /exact failed invocation/);
     await rejectFixture({ ...manifest, original_error: 'another error' }, /exact failed invocation/);
     await rejectFixture({ ...manifest, submitted_config_sha256: raw }, /exact failed invocation/);
     await rejectFixture(manifest, /exact failed invocation/, Buffer.from(JSON.stringify({ ...receipt, run_state: 'succeeded' })));
     await rejectFixture(manifest, /exact failed invocation/, Buffer.from(JSON.stringify({ ...receipt, cleanup_state: 'confirmed' })));
     for (const change of [{ namespace_uid_absent: false }, { workload_delete_succeeded: false },
-      { run_fic_absent: false }, { qap: 'not-attempted' }, { id: 'invalid' }]) {
+      { run_fic_absent: false }, { qap: 'not-attempted' }, { id: 'invalid' }, { controller_pod_count: 1 },
+      { fic_inventory_count: 2 }]) {
       await rejectFixture({ ...manifest, cell: { ...manifest.cell, ...change } }, /custody evidence/);
     }
     await rejectFixture({ ...manifest, cluster: { ...manifest.cluster, arm_aks_id: '/fake/other' } }, /custody evidence/);
@@ -949,24 +958,33 @@ test('post-load failure requires reviewed current custody proof and remains fail
       { ...manifest.pools, user_pools: [] },
       { ...manifest.pools, user_pools: [{ ...manifest.pools.user_pools[0]!, arm_count: 1 }] },
       { ...manifest.pools, user_pools: [{ ...manifest.pools.user_pools[0]!, kubernetes_node_count: 1 }] },
+      { ...manifest.pools, user_pools: [{ ...manifest.pools.user_pools[0]!, arm_max_count: 2 }, manifest.pools.user_pools[1]!] },
     ]) await rejectFixture({ ...manifest, pools }, /custody evidence/);
     const { qap_cleanup: _missing, ...missingReadback } = manifest.raw_observation_sha256;
     await rejectFixture({ ...manifest, raw_observation_sha256: missingReadback }, /custody evidence/);
-    await rejectFixture({ ...manifest, writer_fence: { ...manifest.writer_fence,
-      net_namespace: 'net:[1]' } }, /exact original Linux/);
-    await rejectFixture({ ...manifest, writer_fence: { ...manifest.writer_fence,
-      launcher: { ...manifest.writer_fence.launcher, pid: process.pid } } }, /exited launcher and server/);
+    await rejectFixture({ ...manifest, census: { ...manifest.census, net_namespace: 'net:[1]' } }, /same Linux boot/);
+    await rejectFixture({ ...manifest, census: { ...manifest.census, controller_pid: process.pid } }, /controller PID is allocated/);
+    for (const change of [{ launcher_match_count: 1 }, { controller_match_count: 1 }, { listener_count: 1 },
+      { lease_active: false }, { container_started_at_unix_ms: receipt.started_at_unix_ms + 1 }]) {
+      await rejectFixture({ ...manifest, census: { ...manifest.census, ...change } }, /custody evidence/);
+    }
     await rejectFixture({ ...manifest, pools: { ...manifest.pools, observed_at_unix_ms: now + 60_000 } },
       /absence evidence is not current/);
-    const old = now - 31 * 60_000;
-    await rejectFixture({ ...manifest, writer_fence: { ...manifest.writer_fence, fenced_at_unix_ms: old },
+    const old = now - 11 * 60_000;
+    await rejectFixture({ ...manifest, census: { ...manifest.census, observed_at_unix_ms: old,
+      boot_started_at_unix_ms: old - 3000, container_started_at_unix_ms: old - 2000 },
       cell: { ...manifest.cell, namespace_observed_at_unix_ms: old, fic_observed_at_unix_ms: old,
         qap_observed_at_unix_ms: old },
       pools: { ...manifest.pools, observed_at_unix_ms: old } }, /absence evidence is not current/,
     Buffer.from(JSON.stringify({ ...receipt, started_at_unix_ms: old - 1 })));
-    const approval = await approveFixture(manifest);
+    const [reviewed] = await approveFixture(manifest);
+    const approval = [{ ...reviewed!, invocationId: undefined, invocationIdSha256: digest(deadline.invocationId) }];
     await assert.rejects(assertNoUnsettledDeadlineReceipts(root, undefined, approval), /Unsettled AKS/);
     await assert.rejects(recordLegacyAksDisposition(root, deadline.invocationId, evidencePath), /No reviewed legacy AKS disposition/);
+    await writeFile(deadline.receiptPath, Buffer.concat([original, Buffer.from('\n')]));
+    await assert.rejects(recordLegacyAksDisposition(root, deadline.invocationId, evidencePath, approval),
+      /reviewed receipt and evidence digests/);
+    await writeFile(deadline.receiptPath, original);
     await recordLegacyAksDisposition(root, deadline.invocationId, evidencePath, approval);
     await assertNoUnsettledDeadlineReceipts(root, undefined, approval);
     assert.deepEqual(await readFile(deadline.receiptPath), original);
