@@ -60,6 +60,22 @@ pub enum DataProfile {
     #[default]
     Diagnostic,
     Realistic,
+    #[value(name = "synthetic_telemetry")]
+    SyntheticTelemetry,
+}
+
+impl DataProfile {
+    fn requires_identity(self) -> bool {
+        !matches!(self, Self::Diagnostic)
+    }
+
+    fn uses_semantic_values(self) -> bool {
+        matches!(self, Self::Realistic | Self::SyntheticTelemetry)
+    }
+
+    fn is_synthetic_telemetry(self) -> bool {
+        matches!(self, Self::SyntheticTelemetry)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, ValueEnum, PartialEq, Eq)]
@@ -258,20 +274,36 @@ impl Options {
         if self.streams_per_worker == 0 {
             self.streams_per_worker = concurrency;
         }
+        if self.data_profile.is_synthetic_telemetry() {
+            anyhow::ensure!(
+                self.value_variation
+                    .map_or(true, |value| value == ValueVariation::PerRow),
+                "synthetic_telemetry requires value-variation=per_row"
+            );
+            anyhow::ensure!(
+                self.guid_uniqueness
+                    .map_or(true, |value| value == GuidUniqueness::PerRow),
+                "synthetic_telemetry requires guid-uniqueness=per_row"
+            );
+        }
         self.string_length_distribution.get_or_insert(match self.data_profile {
             DataProfile::Diagnostic => StringLengthDistribution::Fixed,
-            DataProfile::Realistic => StringLengthDistribution::Uniform,
+            DataProfile::Realistic | DataProfile::SyntheticTelemetry => StringLengthDistribution::Uniform,
         });
         self.value_variation.get_or_insert(match self.data_profile {
             DataProfile::Diagnostic => ValueVariation::Cardinality,
-            DataProfile::Realistic => ValueVariation::PerRow,
+            DataProfile::Realistic | DataProfile::SyntheticTelemetry => ValueVariation::PerRow,
         });
         self.guid_uniqueness.get_or_insert(match self.data_profile {
             DataProfile::Diagnostic => GuidUniqueness::Cardinality,
-            DataProfile::Realistic => GuidUniqueness::PerRow,
+            DataProfile::Realistic | DataProfile::SyntheticTelemetry => GuidUniqueness::PerRow,
         });
-        if self.data_profile == DataProfile::Realistic && self.string_width == 0 {
-            self.string_width = 96;
+        if self.string_width == 0 {
+            self.string_width = match self.data_profile {
+                DataProfile::Diagnostic => 0,
+                DataProfile::Realistic => 96,
+                DataProfile::SyntheticTelemetry => 789,
+            };
         }
         anyhow::ensure!((1..=1024).contains(&self.workers), "workers must resolve to 1..=1024");
         anyhow::ensure!(
@@ -297,6 +329,10 @@ impl Options {
                 "{name} must be finite and in 0..=1"
             );
         }
+        anyhow::ensure!(
+            !self.data_profile.is_synthetic_telemetry() || self.entropy == 1.0,
+            "synthetic_telemetry requires entropy=1 to avoid constant-character padding"
+        );
         anyhow::ensure!(
             self.max_memory_bytes > 0 && self.max_memory_bytes <= isize::MAX as u64,
             "max-memory-bytes must be positive and fit the address space"
@@ -1109,6 +1145,8 @@ impl PreparedClient {
             None => tables()?,
         };
         anyhow::ensure!(!tables.is_empty(), "corpus requires at least one table");
+        validate_null_fraction(&tables, &options)?;
+        let eligible_nullable_columns = eligible_nullable_column_count(&tables);
         let row_bytes: u64 = tables
             .iter()
             .map(|table| estimated_row_bytes(table, client_id, &options))
@@ -1166,6 +1204,8 @@ impl PreparedClient {
         let mut encoded_bytes = 0_u64;
         let mut generation_seconds = 0.0;
         let mut encoding_seconds = 0.0;
+        let mut generated_nullable_value_slots = 0_u64;
+        let mut generated_null_values = 0_u64;
         let mut generation_cpu_seconds = cpu_started.map(|_| 0.0);
         let mut encoding_cpu_seconds = cpu_started.map(|_| 0.0);
         for copy in 0..copies {
@@ -1176,6 +1216,16 @@ impl PreparedClient {
                     let generation_start = Instant::now();
                     let cpu_start = thread_cpu_seconds()?;
                     let batch = synthetic_batch(table, client_id, length, offset, copy, &options)?;
+                    for (column, field) in table.schema.fields().iter().enumerate() {
+                        if is_eligible_nullable_field(field) {
+                            generated_nullable_value_slots = generated_nullable_value_slots
+                                .checked_add(length as u64)
+                                .context("nullable value slot count overflow")?;
+                            generated_null_values = generated_null_values
+                                .checked_add(batch.column(column).null_count() as u64)
+                                .context("synthetic null count overflow")?;
+                        }
+                    }
                     generation_seconds += generation_start.elapsed().as_secs_f64();
                     if let Some((total, (end, start))) = generation_cpu_seconds
                         .as_mut()
@@ -1226,6 +1276,15 @@ impl PreparedClient {
         }
         let preparation = serde_json::json!({
             "corpus_rows": rows as u64 * table_count as u64 * copies as u64,
+            "eligible_nullable_columns": eligible_nullable_columns,
+            "nullable_value_slots": generated_nullable_value_slots,
+            "synthetic_null_values": generated_null_values,
+            "requested_null_fraction": options.null_fraction,
+            "effective_null_fraction": if generated_nullable_value_slots == 0 {
+                0.0
+            } else {
+                generated_null_values as f64 / generated_nullable_value_slots as f64
+            },
             "corpus_uncompressed_flight_data_bytes": raw_arrow_bytes_total,
             "corpus_configured_ipc_compression_flight_data_bytes": encoded_bytes,
             "corpus_uncompressed_ipc_bytes": raw_arrow_bytes_total,
@@ -1246,7 +1305,7 @@ impl PreparedClient {
             "encoding_wall_seconds": encoding_seconds,
             "preparation_wall_seconds": started.elapsed().as_secs_f64(),
             "generator_rows_per_second": rows as f64 * table_count as f64 * copies as f64 / generation_seconds.max(f64::MIN_POSITIVE),
-            "steady_state_generation": options.data_profile == DataProfile::Realistic,
+            "steady_state_generation": options.data_profile.requires_identity(),
         });
         Ok(Arc::new(Self {
             counters: (0..options.workers).map(|_| Counters::default()).collect(),
@@ -2406,6 +2465,27 @@ where
     }
 }
 
+fn is_eligible_nullable_field(field: &arrow_schema::Field) -> bool {
+    field.is_nullable() && field.name() != "customer_id"
+}
+
+fn eligible_nullable_column_count(tables: &[DmvTable]) -> usize {
+    tables
+        .iter()
+        .flat_map(|table| table.schema.fields())
+        .filter(|field| is_eligible_nullable_field(field))
+        .count()
+}
+
+fn validate_null_fraction(tables: &[DmvTable], options: &Options) -> Result<()> {
+    let eligible_columns = eligible_nullable_column_count(tables);
+    anyhow::ensure!(
+        options.null_fraction == 0.0 || eligible_columns > 0,
+        "null-fraction is nonzero but the selected DMV schema has no nullable columns"
+    );
+    Ok(())
+}
+
 fn estimated_row_bytes(table: &DmvTable, client_id: &str, options: &Options) -> u64 {
     table
         .schema
@@ -2414,7 +2494,7 @@ fn estimated_row_bytes(table: &DmvTable, client_id: &str, options: &Options) -> 
         .map(|field| match field.data_type() {
             DataType::Utf8 if field.name() == "customer_id" => client_id.len() as u64 + 5,
             DataType::Utf8 => {
-                let category_width = if options.data_profile == DataProfile::Realistic {
+                let category_width = if options.data_profile.uses_semantic_values() {
                     realistic_category_max_width(field.name())
                 } else {
                     None
@@ -2471,7 +2551,7 @@ fn memory_budget(
         admitted_live_slots: 0,
         total_bytes: corpus_bytes,
     };
-    if options.data_profile == DataProfile::Realistic {
+    if options.data_profile.requires_identity() {
         let identity_row_bytes = tables
             .iter()
             .map(|table| estimated_identity_row_bytes(table, client_id, options))
@@ -2636,6 +2716,145 @@ fn realistic_name_parts(field_name: &str, key: u64) -> Option<(String, &'static 
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ColumnCardinality {
+    NearConstant,
+    Low,
+    Medium,
+    High,
+    UniquePerRow,
+}
+
+impl ColumnCardinality {
+    fn cardinality(self, maximum: usize) -> usize {
+        let preferred = match self {
+            Self::NearConstant => 4,
+            Self::Low => 16,
+            Self::Medium => 128,
+            Self::High | Self::UniquePerRow => maximum,
+        };
+        preferred.min(maximum).max(1)
+    }
+
+    fn zipf_exponent(self) -> f64 {
+        match self {
+            Self::NearConstant => 1.5,
+            Self::Low => 1.25,
+            Self::Medium => 1.1,
+            Self::High | Self::UniquePerRow => 1.0,
+        }
+    }
+}
+
+struct ZipfSampler {
+    cumulative: Vec<f64>,
+}
+
+impl ZipfSampler {
+    fn new(cardinality: usize, exponent: f64) -> Self {
+        let weights = (1..=cardinality)
+            .map(|rank| 1.0 / (rank as f64).powf(exponent))
+            .collect::<Vec<_>>();
+        let total = weights.iter().sum::<f64>();
+        let mut cumulative_weight = 0.0;
+        let mut cumulative = weights
+            .into_iter()
+            .map(|weight| {
+                cumulative_weight += weight / total;
+                cumulative_weight
+            })
+            .collect::<Vec<_>>();
+        if let Some(last) = cumulative.last_mut() {
+            *last = 1.0;
+        }
+        Self { cumulative }
+    }
+
+    fn sample(&self, random: u64) -> u64 {
+        let index = self
+            .cumulative
+            .partition_point(|threshold| *threshold < unit(random))
+            .min(self.cumulative.len().saturating_sub(1));
+        index as u64
+    }
+}
+
+fn is_monotonic_counter_field(name: &str) -> bool {
+    name.starts_with("total_")
+        || [
+            "_count",
+            "_size",
+            "_rate",
+            "_bytes",
+            "_reads",
+            "_writes",
+            "_pages",
+            "_requests",
+            "_transactions",
+            "_ms",
+        ]
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
+}
+
+fn synthetic_telemetry_class(field_name: &str, data_type: &DataType) -> ColumnCardinality {
+    if matches!(data_type, DataType::Utf8) && is_guid_field(field_name) {
+        return ColumnCardinality::UniquePerRow;
+    }
+    if matches!(data_type, DataType::Boolean)
+        || realistic_category_values(field_name).is_some()
+        || field_name.contains("error")
+        || ["_desc", "_mode", "_state", "_status", "_type", "_role"]
+            .iter()
+            .any(|suffix| field_name.ends_with(suffix))
+    {
+        return ColumnCardinality::NearConstant;
+    }
+    if matches!(data_type, DataType::Timestamp(_, _)) || is_monotonic_counter_field(field_name) {
+        return ColumnCardinality::High;
+    }
+    if [
+        "sql_server_instance_name",
+        "availability_group_name",
+        "database_name",
+        "program_name",
+        "client_interface_name",
+    ]
+    .contains(&field_name)
+    {
+        return ColumnCardinality::Low;
+    }
+    if [
+        "machine_name",
+        "replica_server_name",
+        "host_name",
+        "login_name",
+        "application_name",
+        "endpoint_url",
+    ]
+    .contains(&field_name)
+        || field_name.ends_with("_id")
+        || matches!(data_type, DataType::Int16 | DataType::UInt8)
+    {
+        return ColumnCardinality::Medium;
+    }
+    ColumnCardinality::High
+}
+
+fn monotonic_counter_value(offset: usize, row: usize, random: u64) -> u64 {
+    (offset.saturating_add(row) as u64)
+        .saturating_mul(100)
+        .saturating_add(random % 50)
+}
+
+fn monotonic_timestamp_value(offset: usize, row: usize, random: u64) -> i64 {
+    let sequence = offset.saturating_add(row) as i64;
+    let jitter = (random % 250_001) as i64 - 125_000;
+    1_790_000_000_000_000_i64
+        .saturating_add(sequence.saturating_mul(1_000_000))
+        .saturating_add(jitter)
+}
+
 fn synthetic_guid(seed: u64, pod_ordinal: u32, worker: usize, column: usize, row: usize) -> String {
     let identity = (u64::from(pod_ordinal) << 32) | ((worker as u64) << 16) | column as u64;
     let high = mix(seed ^ identity) as u128;
@@ -2659,9 +2878,27 @@ fn synthetic_batch(
         .map(|(column, field)| -> Result<ArrayRef> {
             let random =
                 |row: usize| mix(options.seed ^ mix((offset + row) as u64) ^ mix(column as u64) ^ mix(worker as u64));
+            let telemetry_class = options
+                .data_profile
+                .is_synthetic_telemetry()
+                .then(|| synthetic_telemetry_class(field.name(), field.data_type()));
+            let telemetry_cardinality = telemetry_class.map(|class| {
+                realistic_category_values(field.name())
+                    .map(|values| values.len().min(options.cardinality).max(1))
+                    .unwrap_or_else(|| class.cardinality(options.cardinality))
+            });
+            let telemetry_sampler = telemetry_class
+                .zip(telemetry_cardinality)
+                .map(|(class, cardinality)| ZipfSampler::new(cardinality, class.zipf_exponent()));
             let string_key = |row: usize| {
                 let value = random(row);
-                if unit(mix(value)) < options.skew {
+                if let Some(sampler) = &telemetry_sampler {
+                    if unit(mix(value)) < options.skew {
+                        0
+                    } else {
+                        sampler.sample(value)
+                    }
+                } else if unit(mix(value)) < options.skew {
                     0
                 } else {
                     value % options.cardinality as u64
@@ -2669,7 +2906,21 @@ fn synthetic_batch(
             };
             let value_key = |row: usize| {
                 let value = random(row);
-                if unit(mix(value)) < options.skew {
+                if options.data_profile.is_synthetic_telemetry() {
+                    if is_monotonic_counter_field(field.name()) {
+                        monotonic_counter_value(offset, row, value)
+                    } else if unit(mix(value)) < options.skew {
+                        0
+                    } else if telemetry_class == Some(ColumnCardinality::High)
+                        && options.value_variation == Some(ValueVariation::PerRow)
+                    {
+                        value
+                    } else {
+                        telemetry_sampler
+                            .as_ref()
+                            .map_or(value % options.cardinality as u64, |sampler| sampler.sample(value))
+                    }
+                } else if unit(mix(value)) < options.skew {
                     0
                 } else {
                     match options.value_variation.unwrap_or(ValueVariation::Cardinality) {
@@ -2700,7 +2951,9 @@ fn synthetic_batch(
                             && options.guid_uniqueness.unwrap_or(GuidUniqueness::Cardinality) == GuidUniqueness::PerRow
                         {
                             synthetic_guid(options.seed, options.pod_ordinal, worker, column, offset + row)
-                        } else if let Some(value) = (options.data_profile == DataProfile::Realistic)
+                        } else if let Some(value) = options
+                            .data_profile
+                            .uses_semantic_values()
                             .then(|| realistic_category_values(field.name()))
                             .flatten()
                             .map(|values| values[(string_key(row) % values.len() as u64) as usize])
@@ -2726,10 +2979,15 @@ fn synthetic_batch(
                                 StringLengthDistribution::Fixed => maximum_width,
                                 StringLengthDistribution::Uniform => {
                                     let minimum = maximum_width.div_ceil(2);
-                                    minimum + (random(row) % (maximum_width - minimum + 1) as u64) as usize
+                                    let length_key = if options.data_profile.is_synthetic_telemetry() {
+                                        mix(options.seed ^ key ^ mix(column as u64))
+                                    } else {
+                                        random(row)
+                                    };
+                                    minimum + (length_key % (maximum_width - minimum + 1) as u64) as usize
                                 }
                             };
-                            let (prefix, suffix) = if options.data_profile == DataProfile::Realistic {
+                            let (prefix, suffix) = if options.data_profile.uses_semantic_values() {
                                 realistic_name_parts(field.name(), key).unwrap_or_default()
                             } else {
                                 (String::new(), "")
@@ -2757,14 +3015,44 @@ fn synthetic_batch(
                     })
                 }))),
                 DataType::Boolean => primitive!(BooleanArray, |row| value_key(row).is_multiple_of(2)),
-                DataType::UInt8 => primitive!(UInt8Array, |row| (value_key(row) % 255) as u8),
-                DataType::Int16 => primitive!(Int16Array, |row| (value_key(row) % 32767) as i16),
-                DataType::Int32 => primitive!(Int32Array, |row| (value_key(row) % i32::MAX as u64) as i32),
-                DataType::Int64 => primitive!(Int64Array, |row| (value_key(row) & i64::MAX as u64) as i64),
+                DataType::UInt8 => primitive!(UInt8Array, |row| {
+                    if options.data_profile.is_synthetic_telemetry() && is_monotonic_counter_field(field.name()) {
+                        value_key(row).min(u8::MAX as u64) as u8
+                    } else {
+                        (value_key(row) % 255) as u8
+                    }
+                }),
+                DataType::Int16 => primitive!(Int16Array, |row| {
+                    if options.data_profile.is_synthetic_telemetry() && is_monotonic_counter_field(field.name()) {
+                        value_key(row).min(i16::MAX as u64) as i16
+                    } else {
+                        (value_key(row) % 32767) as i16
+                    }
+                }),
+                DataType::Int32 => primitive!(Int32Array, |row| {
+                    if options.data_profile.is_synthetic_telemetry() && is_monotonic_counter_field(field.name()) {
+                        value_key(row).min(i32::MAX as u64) as i32
+                    } else {
+                        (value_key(row) % i32::MAX as u64) as i32
+                    }
+                }),
+                DataType::Int64 => primitive!(Int64Array, |row| {
+                    if options.data_profile.is_synthetic_telemetry() && is_monotonic_counter_field(field.name()) {
+                        value_key(row).min(i64::MAX as u64) as i64
+                    } else {
+                        (value_key(row) & i64::MAX as u64) as i64
+                    }
+                }),
                 DataType::Float64 => primitive!(Float64Array, |row| value_key(row) as f64 / 10.0),
                 DataType::Timestamp(TimeUnit::Microsecond, timezone) => Arc::new(
                     TimestampMicrosecondArray::from_iter((0..rows).map(|row| {
-                        valid(row).then(|| 1_790_000_000_000_000_i64 + (value_key(row) % 1_000_000) as i64)
+                        valid(row).then(|| {
+                            if options.data_profile.is_synthetic_telemetry() {
+                                monotonic_timestamp_value(offset, row, random(row))
+                            } else {
+                                1_790_000_000_000_000_i64 + (value_key(row) % 1_000_000) as i64
+                            }
+                        })
                     }))
                     .with_timezone_opt(timezone.clone()),
                 ),
@@ -3349,6 +3637,26 @@ mod tests {
         Cli::try_parse_from(["test", "--workers", "2", "--data-profile", "diagnostic"])?
             .options
             .resolve(100, 1)
+    }
+
+    fn make_field_nullable(table: &mut DmvTable, field_name: &str) -> Result<()> {
+        let mut found = false;
+        let fields = table
+            .schema
+            .fields()
+            .iter()
+            .map(|field| {
+                if field.name() == field_name {
+                    found = true;
+                    Arc::new(field.as_ref().clone().with_nullable(true))
+                } else {
+                    Arc::clone(field)
+                }
+            })
+            .collect::<Vec<_>>();
+        anyhow::ensure!(found, "test field {field_name} was not found");
+        table.schema = Arc::new(arrow_schema::Schema::new(fields));
+        Ok(())
     }
 
     fn minimum_legacy_range_json_bytes(table: &str, rows_per_batch: u32) -> Result<usize> {
@@ -4468,7 +4776,7 @@ mod tests {
     }
 
     #[test]
-    fn profile_defaults_preserve_diagnostic_and_expand_realistic_row_variation() -> Result<()> {
+    fn profile_defaults_preserve_existing_profiles_and_resolve_telemetry_profile() -> Result<()> {
         let diagnostic = Cli::try_parse_from(["test", "--workers", "2"])?
             .options
             .resolve(1024, 1)?;
@@ -4491,6 +4799,165 @@ mod tests {
         );
         assert_eq!(realistic.value_variation, Some(ValueVariation::PerRow));
         assert_eq!(realistic.guid_uniqueness, Some(GuidUniqueness::PerRow));
+
+        let telemetry = Cli::try_parse_from(["test", "--data-profile", "synthetic_telemetry"])?
+            .options
+            .resolve(1024, 1)?;
+        assert_eq!(telemetry.data_profile, DataProfile::SyntheticTelemetry);
+        assert_eq!(telemetry.string_width, 789);
+        assert_eq!(
+            telemetry.string_length_distribution,
+            Some(StringLengthDistribution::Uniform)
+        );
+        assert_eq!(telemetry.value_variation, Some(ValueVariation::PerRow));
+        assert_eq!(telemetry.guid_uniqueness, Some(GuidUniqueness::PerRow));
+        assert!(Cli::try_parse_from(["test", "--data-profile", "unknown"]).is_err());
+        for args in [
+            vec![
+                "--data-profile",
+                "synthetic_telemetry",
+                "--guid-uniqueness",
+                "cardinality",
+            ],
+            vec![
+                "--data-profile",
+                "synthetic_telemetry",
+                "--value-variation",
+                "cardinality",
+            ],
+            vec!["--data-profile", "synthetic_telemetry", "--entropy", "0.9"],
+        ] {
+            assert!(
+                Cli::try_parse_from(std::iter::once("test").chain(args))
+                    .and_then(|cli| cli.options.resolve(1024, 1))
+                    .is_err()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn synthetic_telemetry_has_column_classes_zipf_unique_ids_and_ordered_time() -> Result<()> {
+        let options = Cli::try_parse_from(["test", "--data-profile", "synthetic_telemetry"])?
+            .options
+            .resolve(4096, 1)?;
+        let table = table_named("sqlserver_availability_replica_states")?;
+        let batch = synthetic_batch(&table, "client", 4096, 0, 0, &options)?;
+
+        let instance_names = batch
+            .column_by_name("sql_server_instance_name")
+            .context("sql_server_instance_name missing")?
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .context("sql_server_instance_name is not a string array")?;
+        let distinct_instances = instance_names
+            .iter()
+            .flatten()
+            .collect::<std::collections::HashSet<_>>();
+        assert!(distinct_instances.len() <= 16);
+        assert!(distinct_instances.len() > 1);
+        let instance_lengths = instance_names
+            .iter()
+            .flatten()
+            .map(str::len)
+            .collect::<std::collections::HashSet<_>>();
+        assert!(
+            instance_lengths.len() > 1,
+            "uniform string lengths should vary by value"
+        );
+        assert!(instance_lengths.iter().all(|length| (395..=789).contains(length)));
+
+        let machine_names = batch
+            .column_by_name("machine_name")
+            .context("machine_name missing")?
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .context("machine_name is not a string array")?;
+        let distinct_machines = machine_names.iter().flatten().collect::<std::collections::HashSet<_>>();
+        assert!(distinct_machines.len() <= 128);
+        assert!(distinct_machines.len() > 16);
+
+        let id_values = batch
+            .column_by_name("availability_group_id")
+            .context("availability_group_id missing")?
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .context("availability_group_id is not a string array")?;
+        assert_eq!(
+            id_values
+                .iter()
+                .flatten()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            4096
+        );
+
+        let roles = batch
+            .column_by_name("replica_role")
+            .context("replica_role missing")?
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .context("replica_role is not a string array")?;
+        let role_counts = realistic_category_values("replica_role")
+            .context("replica_role category values missing")?
+            .iter()
+            .map(|role| roles.iter().flatten().filter(|value| *value == *role).count())
+            .collect::<Vec<_>>();
+        assert!(role_counts[0] > role_counts[1] && role_counts[1] > role_counts[2]);
+
+        let timestamps = batch
+            .column_by_name("sample_time_utc")
+            .context("sample_time_utc missing")?
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .context("sample_time_utc is not a timestamp array")?;
+        assert!(timestamps.values().windows(2).all(|pair| pair[0] < pair[1]));
+
+        let connection_table = table_named("sqlserver_client_connections")?;
+        let connections = synthetic_batch(&connection_table, "client", 4096, 0, 0, &options)?;
+        for field_name in ["total_writes", "total_reads"] {
+            let counters = connections
+                .column_by_name(field_name)
+                .context("counter missing")?
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .context("counter is not Int64")?;
+            assert!(counters.values().windows(2).all(|pair| pair[0] <= pair[1]));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn requested_nulls_fail_on_public_schemas_and_work_on_nullable_schema() -> Result<()> {
+        let mut options = Cli::try_parse_from([
+            "test",
+            "--data-profile",
+            "synthetic_telemetry",
+            "--null-fraction",
+            "0.25",
+        ])?
+        .options
+        .resolve(1024, 1)?;
+        let table = table_named("sqlserver_availability_replica_states")?;
+        assert_eq!(eligible_nullable_column_count(std::slice::from_ref(&table)), 0);
+        assert!(validate_null_fraction(std::slice::from_ref(&table), &options).is_err());
+
+        let mut nullable_table = table_named("sqlserver_availability_replica_states")?;
+        make_field_nullable(&mut nullable_table, "replica_role")?;
+        assert_eq!(eligible_nullable_column_count(std::slice::from_ref(&nullable_table)), 1);
+        validate_null_fraction(std::slice::from_ref(&nullable_table), &options)?;
+        let batch = synthetic_batch(&nullable_table, "client", 4096, 0, 0, &options)?;
+        let roles = batch
+            .column_by_name("replica_role")
+            .context("nullable replica_role missing")?
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .context("nullable replica_role is not a string array")?;
+        assert!(roles.null_count() > 0);
+        assert!(roles.null_count() < 4096);
+
+        options.null_fraction = 0.0;
+        validate_null_fraction(std::slice::from_ref(&table), &options)?;
         Ok(())
     }
 

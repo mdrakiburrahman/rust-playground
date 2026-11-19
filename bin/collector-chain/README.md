@@ -38,6 +38,27 @@ explicit CLI values win. Run `arrowcol-dmv --help` for the complete reference.
 | `--connect-retries`, `--retry-backoff-ms` | Only retry connection establishment. Ambiguous `DoPut` uploads are never automatically retried; doing so could duplicate admitted rows. |
 | `--duration-secs`, `--warmup-secs` | Zero duration uploads the corpus once. A positive duration requires a shared future `--run-start-unix-ms` or OAT-armed `--schedule-file`; pilot mode preserves 30-second windows. |
 
+### Opt-in synthetic telemetry profile
+
+`--data-profile synthetic_telemetry` adds schema-aware distributions without changing
+`diagnostic`, `realistic`, or their defaults. It defaults to width `789`, uniform
+string lengths, per-row values/GUIDs, cardinality `1024`, skew `0`, entropy `1`,
+and null fraction `0`.
+
+| Column class | Generator behavior |
+| --- | --- |
+| Near-constant / low / medium / high | Zipf exponents `1.5` / `1.25` / `1.1` / `1.0`, with cardinalities `4` / `16` / `128` / `--cardinality`; recognized DMV categories use their declared values. |
+| String IDs, including `*_id` except `customer_id` | Unique GUID per corpus row; `customer_id` remains constant per client. |
+| Timestamps and named counters | Strictly increasing synthetic timestamps and nondecreasing counters with bounded deterministic jitter. |
+| Strings | Uniform lengths are stable per dictionary value; content remains seed-derived, with no constant-character padding. |
+| Nullable fields | Nulls are generated only for schema-declared nullable fields. Nonzero `--null-fraction` fails if the selected schema has none. |
+
+The embedded public DMV fixture currently has zero eligible nullable columns, so its
+effective null count and fraction are zero. This synthetic profile is for workload
+calibration only; matching a compression ratio does not establish production
+equivalence. Use `ARROWCOL_CLIENT_DATA_PROFILE=synthetic_telemetry` to opt in.
+
+
 `OAT_CLIENT_RESOLUTION` records requested sentinel values, legacy row/concurrency
 inputs, resolved values and the actual single CPU-availability observation before
 runtime creation or network activity. Byte-target row sizing is explicitly
