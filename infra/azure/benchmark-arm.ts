@@ -134,6 +134,21 @@ for f in stdout stderr; do
 done
 printf 'writer-capture-active\\n'
 `;
+const probeClientCapture = `
+set -eu
+d="/evidence/$1"
+p=$(cat "$d/pid")
+test "$p" = 1
+test "$(readlink "/proc/$p/exe")" = /usr/local/bin/arrowcol-dmv
+test "$(readlink "/proc/$p/fd/1")" = "$d/stdout"
+test "$(readlink "/proc/$p/fd/2")" = "$d/stderr"
+for f in stdout stderr; do
+  test -f "$d/$f"
+  test "$(stat -c %b "$d/$f")" -ge 262144
+  test "$(stat -c %s "$d/$f")" -lt 134217728
+done
+grep -F -x -- "$2" "$d/stdout"
+`;
 
 function matchesImageDigest(image: string, imageId: string): boolean {
   const expected = /@(sha256:[0-9a-f]{64})$/.exec(image)?.[1];
@@ -206,7 +221,8 @@ export function validateArm(
   labels(metadata, identity);
   const data = object(cm.data, 'schedule data');
   if (metadata.name !== 'direct-schedule-confirmwide' || metadata.namespace !== identity.namespace ||
-      data.start !== 'pending' || data.writerLifetime !== 'pending') throw new Error('Schedule is not the expected pending object');
+      data.start !== 'pending' || data.writerLifetime !== 'pending' || data.clientLifetimes !== 'pending')
+    throw new Error('Schedule is not the expected pending object');
   const scheduleVersion = text(metadata.resourceVersion, 'schedule resourceVersion');
   const items = array(object(pods, 'pod list').items, 'pods');
   if (items.length !== identity.clients || logs.size !== identity.clients) throw new Error('Wrong client pod count');
@@ -290,16 +306,52 @@ function main(): void {
   const schedule = get('configmap', 'direct-schedule-confirmwide');
   const selector = `arrowcol-oat/run-id=${runId},batch.kubernetes.io/job-name=direct-load-confirmwide`;
   const pods = readJson(context, ['-n', namespace, 'get', 'pods', '-l', selector]);
-  const names = array(object(pods, 'pod list').items, 'pods').map(item =>
-    text(object(object(item, 'pod').metadata, 'pod metadata').name, 'pod name'));
-  const logs = new Map(names.map(name => [name, kubectl(context, ['-n', namespace, 'logs', name, '-c', 'generator'])]));
+  const clientLogs = (list: unknown) => new Map(array(object(list, 'pod list').items, 'pods').map(item => {
+    const meta = object(object(item, 'pod').metadata, 'pod metadata'), name = text(meta.name, 'pod name');
+    const uid = text(meta.uid, 'client Pod UID');
+    if (!/^[a-z0-9-]+$/.test(uid)) throw new Error('Invalid client Pod UID');
+    const index = object(meta.annotations, 'client Pod annotations')['batch.kubernetes.io/job-completion-index'];
+    const pattern = `OAT_CLIENT_READY client_id=direct-${runId}-${index} preflight_tables=1`;
+    return [name, kubectl(context, ['-n', namespace, 'exec', name, '-c', 'generator', '--',
+      '/bin/sh', '-c', probeClientCapture, 'capture', uid, pattern])];
+  }));
+  const clientLifetimes = (list: unknown) => JSON.stringify(array(object(list, 'client pods').items, 'pod list').map(item => {
+    const pod = object(item, 'client pod'), meta = object(pod.metadata, 'client metadata'), name = text(meta.name, 'client name');
+    const uid = text(meta.uid, 'client UID'), spec = object(pod.spec, 'client spec');
+    const index = Number(object(meta.annotations, 'client annotations')['batch.kubernetes.io/job-completion-index']);
+    const containers = array(spec.containers, 'client containers'), status = object(pod.status, 'client status');
+    const statuses = array(status.containerStatuses, 'client statuses');
+    if (containers.length !== 1 || statuses.length !== 1) throw new Error('Client has unexpected container coverage');
+    const container = object(containers[0], 'client container'), active = object(statuses[0], 'client runtime');
+    const volume = array(spec.volumes, 'client volumes').map(v => object(v, 'client volume')).find(v => v.name === 'evidence');
+    const mount = array(container.volumeMounts, 'client mounts').map(v => object(v, 'client mount')).find(v => v.name === 'evidence');
+    if (!volume?.ephemeral || mount?.mountPath !== '/evidence' || mount.subPath !== undefined || mount.subPathExpr !== undefined) {
+      throw new Error('Client evidence mount does not use its generic ephemeral PVC');
+    }
+    const image = text(container.image, 'client image'), imageId = text(active.imageID, 'client runtime image');
+    if (!matchesImageDigest(image, imageId)) throw new Error('Client runtime digest differs from its pinned image');
+    const claim = object(get('pvc', `${name}-evidence`), 'client evidence PVC');
+    const cm = object(claim.metadata, 'client claim metadata'), cs = object(claim.spec, 'client claim spec');
+    ownership(cm, identity);
+    if (claim.kind !== 'PersistentVolumeClaim' || claim.apiVersion !== 'v1' || cm.deletionTimestamp ||
+        cm.namespace !== namespace || cm.name !== `${name}-evidence` || controller(cm, 'Pod').uid !== uid ||
+        cs.storageClassName !== 'managed-csi' || object(claim.status, 'client PVC status').phase !== 'Bound') {
+      throw new Error('Client evidence claim does not belong to its original Pod');
+    }
+    return { index, name, uid, jobUid: controller(meta, 'Job').uid, nodeName: text(spec.nodeName, 'client node'), image, imageId,
+      containerId: text(active.containerID, 'client container ID'),
+      startedAt: text(object(object(active.state, 'client state').running, 'client running').startedAt, 'client start'),
+      claimName: cm.name, claimUid: text(cm.uid, 'client claim UID'), volumeName: text(cs.volumeName, 'client PV name') };
+  }).sort((a, b) => a.index - b.index));
+  const logs = clientLogs(pods);
   const checked = validateArm(identity, ns, job, schedule, pods, logs);
+  const clients = clientLifetimes(pods);
   const writer = JSON.stringify(readCapturedWriter());
   const freshPods = readJson(context, ['-n', namespace, 'get', 'pods', '-l', selector]);
   const fresh = validateArm(identity, readJson(context, ['get', 'namespace', namespace]),
-    get('job', 'direct-load-confirmwide'), get('configmap', 'direct-schedule-confirmwide'), freshPods, logs);
+    get('job', 'direct-load-confirmwide'), get('configmap', 'direct-schedule-confirmwide'), freshPods, clientLogs(freshPods));
   if (fresh.scheduleVersion !== checked.scheduleVersion || fresh.podUids.join(',') !== checked.podUids.join(',') ||
-      JSON.stringify(readCapturedWriter()) !== writer) {
+      clientLifetimes(freshPods) !== clients || JSON.stringify(readCapturedWriter()) !== writer) {
     throw new Error('Client fleet, writer lifetime, or schedule changed before arming');
   }
   const now = Date.now();
@@ -310,11 +362,14 @@ function main(): void {
     { op: 'replace', path: '/data/start', value: String(start) },
     { op: 'test', path: '/data/writerLifetime', value: 'pending' },
     { op: 'replace', path: '/data/writerLifetime', value: writer },
+    { op: 'test', path: '/data/clientLifetimes', value: 'pending' },
+    { op: 'replace', path: '/data/clientLifetimes', value: clients },
   ];
   kubectl(context, ['-n', namespace, 'patch', 'configmap', 'direct-schedule-confirmwide',
     '--type=json', '--patch', JSON.stringify(patch)]);
   const observed = object(object(get('configmap', 'direct-schedule-confirmwide'), 'schedule').data, 'schedule data');
-  if (observed.start !== String(start) || observed.writerLifetime !== writer) throw new Error('Schedule patch readback mismatch');
+  if (observed.start !== String(start) || observed.writerLifetime !== writer || observed.clientLifetimes !== clients)
+    throw new Error('Schedule patch readback mismatch');
   console.log(JSON.stringify({ runId, namespaceUid, podUids: checked.podUids, writer: JSON.parse(writer), runStartUnixMs: start,
     measurementStartUnixMs: start + 60_000, measurementEndUnixMs: start + 660_000 }));
 }

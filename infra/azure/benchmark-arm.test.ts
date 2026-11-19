@@ -21,14 +21,17 @@ function fixture() {
   const job = { metadata: { name: 'direct-load-confirmwide', namespace: identity.namespace, uid: 'job-uid', labels },
     spec: { suspend: false, completionMode: 'Indexed', parallelism: 2, completions: 2 }, status: {} };
   const schedule = { metadata: { name: 'direct-schedule-confirmwide', namespace: identity.namespace,
-    resourceVersion: '17', labels }, data: { start: 'pending', writerLifetime: 'pending' } };
+    resourceVersion: '17', labels }, data: { start: 'pending', writerLifetime: 'pending', clientLifetimes: 'pending' } };
   const pods = { items: [0, 1].map(index => ({
     metadata: { name: `pod-${index}`, uid: `uid-${index}`, namespace: identity.namespace, labels,
       annotations: { 'batch.kubernetes.io/job-completion-index': String(index) },
       ownerReferences: [{ kind: 'Job', uid: 'job-uid', controller: true }] },
-    spec: { containers: [{ name: 'generator', image: `example/client@sha256:${'a'.repeat(64)}` }] },
+    spec: { nodeName: `node-${index}`, volumes: [{ name: 'evidence', ephemeral: {} }],
+      containers: [{ name: 'generator', image: `example/client@sha256:${'a'.repeat(64)}`,
+        volumeMounts: [{ name: 'evidence', mountPath: '/evidence' }] }] },
     status: { phase: 'Running', conditions: [{ type: 'Ready', status: 'True' }],
-      containerStatuses: [{ name: 'generator', ready: true, restartCount: 0, state: { running: {} } }] },
+      containerStatuses: [{ name: 'generator', ready: true, restartCount: 0, imageID: `sha256:${'a'.repeat(64)}`,
+        containerID: `containerd://client-${index}`, state: { running: { startedAt: '2026-01-01T00:00:00Z' } } }] },
   })) };
   const logs = new Map([0, 1].map(index =>
     [`pod-${index}`, `OAT_CLIENT_READY client_id=direct-${identity.runId}-${index} preflight_tables=1\n`]));
@@ -50,7 +53,13 @@ function fixture() {
   const pvc = { apiVersion: 'v1', kind: 'PersistentVolumeClaim', metadata: { ...writerMeta, name: 'arrowcol-writer-staging',
     uid: 'original-claim' }, spec: { volumeName: 'bound-pv',
       storageClassName: `arrowcol-${identity.runId.replaceAll('-', '')}-local-csi` }, status: { phase: 'Bound' } };
-  return { namespace, job, schedule, pods, logs, deployment, replicaSets, writerPods, pvc };
+  const claims = Object.fromEntries(pods.items.map(pod => {
+    const name = `${pod.metadata.name}-evidence`;
+    return [name, { ...pvc, metadata: { ...pvc.metadata, name, uid: `claim-${pod.metadata.uid}`,
+      ownerReferences: [{ kind: 'Pod', uid: pod.metadata.uid, controller: true }] },
+    spec: { ...pvc.spec, storageClassName: 'managed-csi' } }];
+  }));
+  return { namespace, job, schedule, pods, logs, deployment, replicaSets, writerPods, pvc, claims };
 }
 
 test('requires a run-owned retained PVC and a positive live writer redirection probe', () => {
@@ -140,8 +149,11 @@ const fs=require('node:fs');
 const d=JSON.parse(fs.readFileSync(process.env.ARM_FIXTURE,'utf8'));
 const a=process.argv.slice(2);
 if(a.includes('logs')) { process.stdout.write(d.logs[a[a.indexOf('logs')+1]]); }
-else if(a.includes('exec')) { process.stdout.write('writer-capture-active\\n'); }
-else if(a.includes('pvc')) { process.stdout.write(JSON.stringify(d.pvc)); }
+else if(a.includes('exec')) {
+  const pod=a[a.indexOf('exec')+1];
+  process.stdout.write(pod==='writer-pod'?'writer-capture-active\\n':d.logs[pod]);
+}
+else if(a.includes('pvc')) { process.stdout.write(JSON.stringify(d.claims[a[a.indexOf('pvc')+1]] ?? d.pvc)); }
 else if(a.includes('patch')) {
   const p=JSON.parse(a[a.indexOf('--patch')+1]);
   if(p[0].value!=='17'||p[1].value!=='pending'||p[2].path!=='/data/start'||
@@ -155,6 +167,7 @@ else if(a.includes('configmap')) {
     const ops=JSON.parse(fs.readFileSync(process.env.ARM_PATCH,'utf8'));
     d.schedule.data.start=ops[2].value;
     d.schedule.data.writerLifetime=ops[4].value;
+    d.schedule.data.clientLifetimes=ops[6].value;
   }
   process.stdout.write(JSON.stringify(d.schedule));
 } else if(a.includes('deployment')) { process.stdout.write(JSON.stringify(d.deployment)); }
@@ -174,6 +187,8 @@ else process.exit(3);
     assert.equal(Number(ops[2].value), output.runStartUnixMs);
     assert.equal(JSON.parse(ops[4].value).podUid, 'writer-pod-uid');
     assert.equal(JSON.parse(ops[4].value).capture.claimUid, 'original-claim');
+    const pinnedClients: Array<{ claimUid: string }> = JSON.parse(ops[6].value);
+    assert.deepEqual(pinnedClients.map(client => client.claimUid), ['claim-uid-0', 'claim-uid-1']);
     assert.equal(output.measurementStartUnixMs, output.runStartUnixMs + 60_000);
     assert.equal(output.measurementEndUnixMs, output.runStartUnixMs + 660_000);
   } finally {
