@@ -4634,7 +4634,7 @@ mod tests {
                 decoded.len(),
             );
 
-            for workers in [2] {
+            for workers in [2, 8, 16, 32] {
                 let mut options = options()?;
                 options.data_profile = DataProfile::Realistic;
                 options.string_width = 789;
@@ -4646,10 +4646,10 @@ mod tests {
                 options.batch_rows = 4_096;
                 options.streams_per_worker = 2;
                 options.interval_us = 0;
-                options.max_memory_bytes = 512_u64 * 1_024 * 1_024;
+                options.max_memory_bytes = 4_u64 * 1_024 * 1_024 * 1_024;
                 options.max_flight_data_bytes = 2 * 1_024 * 1_024;
                 options.max_message_bytes = 16 * 1_024 * 1_024;
-                options.runtime_threads = 8;
+                options.runtime_threads = 32;
                 options.ipc_compression = codec;
                 options.stream_retry_max_attempts = 1;
                 let client = PreparedClient::prepare(
@@ -4728,7 +4728,7 @@ mod tests {
                 let network_tx_bytes_per_second = window["client_resources"]["network_tx_bytes_per_second"].clone();
                 let measurement_seconds = (measurement_end - measurement_start) as f64 / 1_000.0;
                 eprintln!(
-                    "L3_CLIENT_SINK_CALIBRATION scope=in_memory_sink_not_committed retry_max_attempts=1 sink_completed_rows_per_second={:.3} uncompressed_flight_data_GB_per_second={:.6} configured_ipc_compression_flight_data_GB_per_second={:.6} canonical_offered_GB_per_second={:.6} canonical_admitted_GB_per_second={:.6} offered_physical_batches={} admitted_physical_batches={} offered_rows={} admitted_rows={} cpu_core_equivalents={} network_tx_bytes_per_second={} retried_rows={retried_rows} given_up_rows={given_up_rows} ambiguous_rows={ambiguous_rows} rejected_rows={rejected_rows} workers={workers} streams_per_worker=2 tokio_runtime_threads=8 string_width={} corpus_rows=16384 batch_rows=4096 max_memory_bytes={}",
+                    "L3_CLIENT_SINK_CALIBRATION scope=in_memory_sink_not_committed retry_max_attempts=1 sink_completed_rows_per_second={:.3} uncompressed_flight_data_GB_per_second={:.6} configured_ipc_compression_flight_data_GB_per_second={:.6} canonical_offered_GB_per_second={:.6} canonical_admitted_GB_per_second={:.6} offered_physical_batches={} admitted_physical_batches={} offered_rows={} admitted_rows={} cpu_core_equivalents={} network_tx_bytes_per_second={} retried_rows={retried_rows} given_up_rows={given_up_rows} ambiguous_rows={ambiguous_rows} rejected_rows={rejected_rows} workers={workers} streams_per_worker=2 tokio_runtime_threads=32 string_width={} corpus_rows=16384 batch_rows=4096 max_memory_bytes={}",
                     rows as f64 / measurement_seconds,
                     uncompressed_bytes as f64 / 1_000_000_000.0 / measurement_seconds,
                     configured_bytes as f64 / 1_000_000_000.0 / measurement_seconds,
@@ -4741,7 +4741,7 @@ mod tests {
                     cpu_core_equivalents,
                     network_tx_bytes_per_second,
                     789,
-                    512_u64 * 1_024 * 1_024,
+                    4_u64 * 1_024 * 1_024 * 1_024,
                 );
                 assert!(rows > 0, "null Flight sink received no rows with {workers} workers");
             }
