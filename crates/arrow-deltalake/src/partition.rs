@@ -8,6 +8,11 @@ use sha2::{Digest, Sha256};
 
 pub(crate) type PartitionValues = BTreeMap<String, Option<String>>;
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static MATERIALIZATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub(crate) struct PartitionGroup {
     pub(crate) values: PartitionValues,
     pub(crate) rows: Vec<u64>,
@@ -56,6 +61,8 @@ pub(crate) fn group_rows(batch: &RecordBatch, names: &[String]) -> Result<Vec<Pa
 }
 
 pub(crate) fn materialize_group(batch: &RecordBatch, group: &PartitionGroup) -> Result<(RecordBatch, PartitionValues)> {
+    #[cfg(test)]
+    MATERIALIZATIONS.update(|count| count + 1);
     let rows = UInt64Array::from(group.rows.clone());
     let arrays = batch
         .columns()

@@ -3945,7 +3945,9 @@ impl DeltaTable {
             let groups = if partitions.is_empty() {
                 let values = BTreeMap::new();
                 let identity = register_partition(&values)?;
-                let rows = (0..batch_rows).map(u64::try_from).collect::<Result<Vec<_>>>()?;
+                let rows = (0..batch_rows)
+                    .map(u64::try_from)
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
                 vec![(crate::partition::PartitionGroup { values, rows }, identity)]
             } else {
                 crate::partition::group_rows(&batch, &partitions)?
@@ -5596,6 +5598,82 @@ impl DeltaTableWriter {
 #[cfg(test)]
 mod layout_readback_tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pipeline_preflights_new_partitions_but_not_replays() -> Result<()> {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        for mode in [
+            crate::commit::PublicationLookupMode::Scalar,
+            crate::commit::PublicationLookupMode::Batched,
+        ] {
+            let directory = tempfile::tempdir()?;
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("region", DataType::Utf8, false),
+                Field::new("value", DataType::Int64, false),
+            ]));
+            let input = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(StringArray::from(vec!["north", "south"])),
+                    Arc::new(Int64Array::from(vec![1, 2])),
+                ],
+            )?;
+            let mut table = DeltaTable::open_url(
+                Url::from_directory_path(directory.path()).map_err(|()| anyhow::anyhow!("table URL"))?,
+                schema,
+                vec!["region".into()],
+            )?;
+            Arc::get_mut(&mut table)
+                .context("unique table")?
+                .publication_lookup_mode = mode;
+            let entry = || (input.clone(), "original".to_owned(), 0, 10);
+            crate::partition::MATERIALIZATIONS.set(0);
+            let error = table
+                .stage_coalesced_publications(vec![entry()], 1)
+                .await
+                .err()
+                .context("fanout accepted")?;
+            assert!(error.downcast_ref::<CoalescedGroupCapacityExceeded>().is_some());
+            assert_eq!(crate::partition::MATERIALIZATIONS.get(), 0);
+            assert_eq!(table.version()?, 0);
+
+            let (files, identities, _, _, _, _) = table.stage_coalesced_publications(vec![entry()], 2).await?;
+            assert_eq!(files.len(), 2);
+            table.commit_files_with_groups_timed(
+                &files,
+                &[CoalescedCommitGroup {
+                    start: 0,
+                    end: files.len(),
+                    reply_index: 0,
+                    identities,
+                }],
+            )?;
+            crate::partition::MATERIALIZATIONS.set(0);
+            let (files, new, replay, _, _, _) = table.stage_coalesced_publications(vec![entry()], 1).await?;
+            assert!(files.is_empty() && new.is_empty());
+            assert_eq!(replay.len(), 2);
+            assert_eq!(crate::partition::MATERIALIZATIONS.get(), 0);
+
+            let fresh = (input.slice(0, 1), "fresh".to_owned(), 0, 20);
+            let (files, new, replay, mappings, _, _) =
+                table.stage_coalesced_publications(vec![entry(), fresh], 1).await?;
+            assert_eq!(files.len(), 1);
+            assert_eq!(new.len(), 1);
+            assert_eq!(replay.len(), 2);
+            assert_eq!(crate::partition::MATERIALIZATIONS.get(), 1);
+            assert!(
+                mappings[0]
+                    .transaction_files
+                    .iter()
+                    .all(|(_, _, _, files)| files.is_empty())
+            );
+            assert_eq!(mappings[1].transaction_files[0].3, [0]);
+            assert_eq!(files[0].file.rows, 1);
+        }
+        Ok(())
+    }
 
     #[test]
     fn layout_readback_resolves_both_aliases_and_preserves_schema_auto() -> Result<()> {
