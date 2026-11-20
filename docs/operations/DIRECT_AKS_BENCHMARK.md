@@ -6,7 +6,7 @@
 | Workload | Pinned-digest images; 60-second warmup, 600-second timed load, and drain. Images were built from `683081d9`. |
 | Isolation | Fresh UUID, owned namespace and run-scoped FIC; the run-scoped Delta data is retained. |
 | Measurement | Reconcile timestamped Delta `Add` actions against the final active snapshot; report committed rows/s and Delta versions. |
-| Cleanup | Remove only the run's UID-verified namespace and FIC; wait for `benche64` and `benchd64` to reach zero nodes. |
+| Cleanup | Remove only the run's UID-verified namespace and FIC; scale each empty workload pool to zero, then restore autoscaling min 0/max 1. |
 
 ## Prerequisites
 
@@ -31,4 +31,4 @@ npx --no-install tsx projects/arrowcol-oat/aks-direct-benchmark.ts run \
 
 ## Cleanup
 
-Cleanup is automatic on success and failure after owned resources are created. The entrypoint deletes only the namespace whose labels, annotations, and UID still match this run, removes only its run-scoped FIC after namespace absence, and waits for both workload pools to scale to zero. It never removes Delta data, the shared identity, the stamp, other namespaces, or other FICs. If ownership verification, namespace deletion, FIC cleanup, or scale-down fails, the command exits nonzero and preserves the private receipt/report for recovery; do not broaden cleanup to shared resources.
+Cleanup is automatic on success and failure after owned resources are created. The entrypoint deletes only the namespace whose labels, annotations, and UID still match this run and removes only its run-scoped FIC after namespace absence. For each workload pool, it verifies that no non-DaemonSet pods remain, temporarily disables autoscaling, scales the empty pool to zero, and restores autoscaling min 0/max 1. It never removes Delta data, the shared identity, the stamp, other namespaces, or other FICs. If ownership verification, namespace deletion, FIC cleanup, a remaining workload pod, scale-down, or autoscaler restoration fails, the command exits nonzero and preserves the private receipt/report for recovery; do not broaden cleanup to shared resources.

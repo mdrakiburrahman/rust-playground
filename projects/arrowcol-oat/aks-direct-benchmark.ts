@@ -132,8 +132,69 @@ async function requirePoolsAtZero(config: Config): Promise<void> {
   }
 }
 
+async function assertNoWorkloadPodsOnPool(config: Config, pool: string): Promise<void> {
+  const nodeOutput = await kubectl(config, ['get', 'nodes', '-l', `kubernetes.azure.com/agentpool=${pool}`, '-o', 'json'],
+    `Read ${pool} nodes before scale-down`);
+  const nodeList = requireRecord(parseJson(nodeOutput, `${pool} nodes`), `${pool} nodes`);
+  if (!Array.isArray(nodeList.items)) throw new Error(`${pool} node inventory is invalid.`);
+  for (const rawNode of nodeList.items) {
+    const node = requireRecord(rawNode, `${pool} node`);
+    const metadata = requireRecord(node.metadata, `${pool} node metadata`);
+    if (typeof metadata.name !== 'string') throw new Error(`${pool} node name is invalid.`);
+    const podOutput = await kubectl(config, ['get', 'pods', '--all-namespaces', '--field-selector',
+      `spec.nodeName=${metadata.name}`, '-o', 'json'], `Read pods on ${pool} node`);
+    const podList = requireRecord(parseJson(podOutput, `${pool} pods`), `${pool} pods`);
+    if (!Array.isArray(podList.items)) throw new Error(`${pool} pod inventory is invalid.`);
+    const hasWorkloadPod = podList.items.some(rawPod => {
+      if (!isRecord(rawPod)) return true;
+      const podMetadata = isRecord(rawPod.metadata) ? rawPod.metadata : {};
+      const owners = Array.isArray(podMetadata.ownerReferences) ? podMetadata.ownerReferences : [];
+      return !owners.some(owner => isRecord(owner) && owner.kind === 'DaemonSet');
+    });
+    if (hasWorkloadPod) throw new Error(`Non-DaemonSet pods remain on ${pool}; refusing to scale down.`);
+  }
+}
+
+async function scalePoolToZero(config: Config, pool: string): Promise<void> {
+  const current = await readPool(config, pool);
+  if (current.enableAutoScaling !== true || current.minCount !== 0 || current.maxCount !== 1) {
+    throw new Error(`Workload pool ${pool} must retain autoscaling min 0/max 1; refusing to change shared pool configuration.`);
+  }
+  if ((await poolNodeCount(config, pool)) === 0 && current.count === 0) return;
+  await assertNoWorkloadPodsOnPool(config, pool);
+  await command(['az', 'aks', 'nodepool', 'update', '--subscription', config.subscription,
+    '--resource-group', config.group, '--cluster-name', config.cluster, '--name', pool,
+    '--disable-cluster-autoscaler', '--only-show-errors', '--output', 'none'],
+  `Temporarily disable ${pool} autoscaling`, 600);
+
+  let scaleError: Error | undefined;
+  try {
+    await assertNoWorkloadPodsOnPool(config, pool);
+    await command(['az', 'aks', 'nodepool', 'scale', '--subscription', config.subscription,
+      '--resource-group', config.group, '--cluster-name', config.cluster, '--name', pool,
+      '--node-count', '0', '--only-show-errors', '--output', 'none'], `Scale ${pool} to zero`, 600);
+  } catch (error) {
+    scaleError = error instanceof Error ? error : new Error(String(error));
+  }
+
+  let restoreError: Error | undefined;
+  try {
+    await command(['az', 'aks', 'nodepool', 'update', '--subscription', config.subscription,
+      '--resource-group', config.group, '--cluster-name', config.cluster, '--name', pool,
+      '--enable-cluster-autoscaler', '--min-count', '0', '--max-count', '1',
+      '--only-show-errors', '--output', 'none'], `Restore ${pool} autoscaling min 0/max 1`, 600);
+  } catch (error) {
+    restoreError = error instanceof Error ? error : new Error(String(error));
+  }
+
+  if (scaleError && restoreError) throw new AggregateError([scaleError, restoreError], `${pool} scale-down and autoscaler restoration both failed.`);
+  if (restoreError) throw restoreError;
+  if (scaleError) throw scaleError;
+}
+
 async function waitPoolsAtZero(config: Config): Promise<void> {
   for (const pool of workloadPools) {
+    await scalePoolToZero(config, pool);
     await waitUntil(`${pool} node pool scale-down`, 30 * 60_000, async () => {
       const nodes = await poolNodeCount(config, pool);
       const configuration = await readPool(config, pool);
