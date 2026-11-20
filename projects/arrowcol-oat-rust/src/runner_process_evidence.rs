@@ -564,6 +564,7 @@ fn verify_process_configuration_recording(
             "ARROWCOL_COLLECTOR_BATCHING_CONFIG" => "/batching".to_owned(),
             "ARROWCOL_COLLECTOR_COMMIT_CONFIG" => "/commit".to_owned(),
             "ARROWCOL_COLLECTOR_LIMITS_CONFIG" => "/limits".to_owned(),
+            "ARROWCOL_COLLECTOR_RECEIVER_TRANSPORT_CONFIG" => "/transport/configured".to_owned(),
             "ARROWCOL_COLLECTOR_PRESSURE_CONFIG" => "/pressure".to_owned(),
             "ARROWCOL_COLLECTOR_CPU_PRESSURE" => "/cpu_pressure".to_owned(),
             "ARROWCOL_COLLECTOR_SHUTDOWN_DRAIN_TIMEOUT_SECONDS" => {
@@ -626,6 +627,20 @@ fn verify_process_configuration_recording(
                 "{} startup readback does not match applied tunable {name}",
                 role_name(role)
             );
+        }
+        if name == "ARROWCOL_COLLECTOR_RECEIVER_TRANSPORT_CONFIG" {
+            let transport = &observed["transport"];
+            let adaptive = transport["adaptive_window"]
+                .as_bool()
+                .context("receiver transport readback omitted effective adaptive window mode")?;
+            if adaptive {
+                expected["initial_stream_window_size"] = json!(65_535);
+                expected["initial_connection_window_size"] = json!(65_535);
+            }
+            if !contains_requested(transport, &expected) {
+                *diff = Some(startup_mismatch(role, &name, &expected, Some(transport)));
+                bail!("collector effective receiver transport does not match applied tunables");
+            }
         }
     }
     if matches!(role, ComponentRole::Router)
@@ -1510,6 +1525,40 @@ mod startup_readback_tests {
             assert_eq!(maintenance_exit_classification(&log, Some(0)), "no_operation_failures");
             assert_eq!(maintenance_exit_classification(&log, Some(1)), "nonzero_health_exit",
                 "limit {limit}: recovery or a benign retry cannot prove terminal health");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn receiver_transport_requires_configured_and_effective_startup_readback() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        for adaptive in [false, true] {
+            config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+                "collector":{"receiver_transport":{
+                    "initial_stream_window_size":1_048_576,
+                    "initial_connection_window_size":16_777_216,
+                    "adaptive_window":adaptive,"max_frame_size":32_768,
+                    "h2_keepalive_interval":"1000ms","tcp_nodelay":false
+                }}
+            }))?;
+            let environment = role_environment(&config, ComponentRole::Collector)?;
+            let transport: arrowcol_tunables::ReceiverTransportTunables =
+                serde_json::from_str(&environment["ARROWCOL_COLLECTOR_RECEIVER_TRANSPORT_CONFIG"])?;
+            let startup = format!("arrowcol_effective_config {}\n", json!({
+                "component":"receiver","config":{"transport":transport.effective_config_json()}
+            }));
+            let observed = process_configurations(&startup)?;
+            verify_process_configuration(&config, ComponentRole::Collector, &observed)?;
+            assert_eq!(observed["transport"]["initial_connection_window_size"],
+                if adaptive { 65_535 } else { 16_777_216 });
+            let mut wrong = observed.clone();
+            wrong["transport"]["configured"]["initial_connection_window_size"] = json!(1_048_576);
+            assert!(verify_process_configuration(&config, ComponentRole::Collector, &wrong).is_err());
+            let mut wrong = observed;
+            wrong["transport"]["max_frame_size"] = json!(16_384);
+            assert!(verify_process_configuration(&config, ComponentRole::Collector, &wrong).is_err());
         }
         Ok(())
     }
