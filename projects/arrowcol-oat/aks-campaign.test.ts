@@ -7,6 +7,7 @@ import path from 'node:path';
 import { test } from 'node:test';
 import { createHash } from 'node:crypto';
 import type { Config } from '../../infra/azure/bootstrap.js';
+import type { RunFicRecord } from '../../infra/azure/run_fic.js';
 import { CampaignConflictError, CUSTODY_CLEANUP_STEPS, MAX_CAMPAIGN_LIFETIME_MS, KNOWN_LIFECYCLE_CLEANUP_RESERVE_MS, assessCellLifetimeBudget,
   MISSED_HEARTBEAT_LIMIT, HEARTBEAT_INTERVAL_MS,
   createBlobCampaignStore,
@@ -59,7 +60,8 @@ const seed = async (now = 1_000_000) => {
   await startCampaign(store, campaignId, ownerId, now);
   return store;
 };
-function directSetupFixture(fault: 'none' | 'lost-pool-ack' | 'lost-intent-write' | 'lost-start-ack' | 'original-operation') {
+function directSetupFixture(fault: 'none' | 'lost-pool-ack' | 'lost-intent-write' | 'lost-start-ack' | 'original-operation' |
+  'lost-namespace-ack' | 'lost-fic-ack' | 'lost-reversal-ack') {
   const store = new MemoryStore(), inventory = inventoryFor(newCampaignState(campaignId, ownerId));
   const { cell_run_id: runId, namespace } = inventory;
   const base = `/subscriptions/${subscriptionId}/resourceGroups/perf69`, identityId = `${base}/providers/Microsoft.ManagedIdentity/userAssignedIdentities/arrow-collector`;
@@ -78,29 +80,42 @@ function directSetupFixture(fault: 'none' | 'lost-pool-ack' | 'lost-intent-write
     checkpoints: 'checkpoints' } as Config;
   const calls: string[] = [];
   const operation = `https://management.azure.com/subscriptions/${subscriptionId}/providers/Microsoft.ContainerService/locations/westus/operations/original?api-version=2024-10-01`;
+  const reverseOperation = operation.replace('/original?', '/reversal?');
+  const namespaceUid = 'c0ffee00-0000-4000-8000-000000000031', serviceAccountUid = 'c0ffee00-0000-4000-8000-000000000032';
+  let properties = { mode: 'User', vmSize: 'Standard_E192ids_v6', count: 0, enableAutoScaling: true,
+    minCount: 0, maxCount: 1, provisioningState: 'Succeeded', tags: { existing: 'retain' } };
+  let poolEtag = '"pool-before"', ns: unknown = null, sa: unknown = null, fic: RunFicRecord | undefined;
+  const effects: string[] = [];
+  let attachment = false, workloadDrift = false;
   const request: Azure['request'] = async (method, url, _resource, body, headers, _missingOk, idempotent) => {
-    if (url === operation) {
+    if (url === operation || url === reverseOperation) {
       assert.equal(method, 'GET');
-      calls.push('GET original operation');
+      calls.push(url === operation ? 'GET original operation' : 'GET reversal operation');
       return [Buffer.from('{"status":"Succeeded"}'), { ':status': '200' }];
     }
     calls.push(method);
     const id = resourceId + '/agentPools/arrowe192';
     assert.equal(url, `https://management.azure.com${id}?api-version=2024-10-01`);
-    if (method === 'GET') return [Buffer.from(JSON.stringify({ id: id.replace('/resourceGroups/', '/resourcegroups/'), properties: { mode: 'User', vmSize: 'Standard_E192ids_v6',
-      count: 0, enableAutoScaling: true, minCount: 0, maxCount: 1, provisioningState: 'Succeeded' } })),
-    { ':status': '200', etag: '"pool-before"' }];
+    if (method === 'GET') return [Buffer.from(JSON.stringify({ id: id.replace('/resourceGroups/', '/resourcegroups/'), properties })),
+      { ':status': '200', etag: poolEtag }];
     assert.equal(method, 'PUT');
     assert.equal(idempotent, false);
-    const intent = (await store.read())?.state.directSetup?.firstPool;
+    const setup = (await store.read())?.state.directSetup, reversing = !!setup?.reversal;
+    const intent = reversing ? setup.reversal : setup?.firstPool;
     assert.ok(intent && intent.response === null);
     assert.equal(headers?.['If-Match'], intent.expectedEtag);
     assert.equal(headers?.['x-ms-client-request-id'], intent.requestId);
     assert.equal(createHash('sha256').update(body!).digest('hex'), intent.bodySha256);
-    assert.equal(JSON.parse(body!.toString()).properties.minCount, 1);
+    const updated = JSON.parse(body!.toString()).properties;
+    assert.equal(updated.minCount, reversing ? 0 : 1);
+    assert.equal(headers?.['If-Match'], poolEtag);
+    properties = { ...updated, provisioningState: 'Succeeded' };
+    poolEtag = reversing ? '"pool-restored"' : '"pool-owned"';
     if (fault === 'lost-pool-ack') throw new Error('injected unknown pool effect');
+    if (reversing && fault === 'lost-reversal-ack') throw new Error('injected unknown reversal effect');
     return [null, { ':status': '202', 'x-ms-request-id': 'fixture-pool-ack',
-      ...(fault === 'original-operation' ? { 'azure-asyncoperation': operation } : {}) }];
+      ...(!['none', 'lost-pool-ack', 'lost-intent-write', 'lost-start-ack'].includes(fault) ?
+        { 'azure-asyncoperation': reversing ? reverseOperation : operation } : {}) }];
   };
   const azure = { c: config, request } as Azure;
   const write = store.write.bind(store);
@@ -111,11 +126,74 @@ function directSetupFixture(fault: 'none' | 'lost-pool-ack' | 'lost-intent-write
     return written;
   };
   const env = { CAMPAIGN_ID: campaignId, CAMPAIGN_OWNER_ID: ownerId, CAMPAIGN_FENCING_TOKEN: '1' };
+  const observed: RunInventory = { ...inventory, namespace: { ...inventory.namespace, uid: namespaceUid },
+    fic: { ...inventory.fic, state: 'observed' }, resources: inventory.resources.map(resource =>
+      ({ ...resource, state: 'observed', uid: serviceAccountUid })) };
   const cli = (action: string, ...args: string[]) => campaignMain([action, ...args], { store, azure, env,
-    loadConfig: positionals => ({ config, env, positionals, once: false }), runInventoryInput: inventory,
+    loadConfig: positionals => ({ config, env, positionals, once: false }),
+    runInventoryInput: action === 'publish-direct-held-inventory' ? observed : inventory,
     directSetupBaseline: async (_azure, state) => ({ status: 'captured', campaign_id: campaignId, owner_id: ownerId,
-      fencing_token: 1, etag: '"original-baseline"', blob: 'fixture-baseline', captured_at_unix_ms: state.startedAtMs }) });
-  return { cli, store, calls };
+      fencing_token: 1, etag: '"original-baseline"', blob: 'fixture-baseline', captured_at_unix_ms: state.startedAtMs }),
+    directSetupNamespace: {
+      plan: async () => inventory.fic!.plan!,
+      find: async (_azure, _plan, authority) => { await authority.assertCurrent(); return fic; },
+      create: async (_server, _path, body) => {
+        const object = JSON.parse(body), isNamespace = object.kind === 'Namespace';
+        const attempt = (await store.read())!.state.directSetup?.[isNamespace ? 'namespaceAttempt' : 'accountAttempt'];
+        assert.ok(attempt && attempt.uid === null);
+        assert.equal(attempt.bodySha256, createHash('sha256').update(body).digest('hex'));
+        const result = { ...object, metadata: { ...object.metadata, uid: isNamespace ? namespaceUid : serviceAccountUid } };
+        effects.push(object.kind);
+        if (isNamespace) {
+          ns = result;
+          if (fault === 'lost-namespace-ack') throw new Error('injected unknown namespace effect');
+        } else sa = result;
+        return result;
+      },
+      prepare: async (_azure, _runId, _namespace, _sa, _file, _plan, beforeDispatch) => {
+        assert.equal((await store.read())!.state.directSetup?.ficAttempt, true);
+        const { resourceId: _, ...plan } = inventory.fic!.plan!;
+        const record = { ...plan, namespaceUid, namespaceOwner: ownerId, serviceAccountUid, ownershipNonce: ownerId, phase: 'ready' } as const;
+        await beforeDispatch?.(record);
+        effects.push('FIC');
+        if (fault === 'lost-fic-ack') throw new Error('injected unknown FIC effect');
+        fic = record;
+      },
+      removeNamespace: async (_azure, identity, _path, authority) => {
+        await authority.assertCurrent();
+        assert.equal(identity.namespaceUid, namespaceUid);
+        assert.equal((await store.read())!.state.directSetup?.namespaceCleanup, 'started');
+        effects.push('DELETE original Namespace');
+        ns = null;
+      },
+      removeFic: async (_azure, record, _path, authority) => {
+        await authority.assertCurrent();
+        assert.equal(ns, null);
+        assert.equal(record.namespaceUid, namespaceUid);
+        effects.push('DELETE original FIC');
+        fic = { ...record, phase: 'deleted' };
+      },
+    },
+    directSetupKubernetes: async (_server, args) => {
+      const [, resource, name] = args;
+      if (resource === 'namespace') return ns;
+      if (resource === 'serviceaccount') return sa;
+      const resourceKinds: Record<string, string> = { pods: 'Pod', persistentvolumeclaims: 'PersistentVolumeClaim',
+        deployments: 'Deployment', replicasets: 'ReplicaSet', statefulsets: 'StatefulSet', daemonsets: 'DaemonSet',
+        jobs: 'Job', cronjobs: 'CronJob', replicationcontrollers: 'ReplicationController', nodes: 'Node',
+        volumeattachments: 'VolumeAttachment', persistentvolumes: 'PersistentVolume' };
+      if (!resourceKinds[resource!]) {
+        const target = observed.resources.find(item => item.kind === resource && item.name === name);
+        assert.ok(target, args.join(' '));
+        const markers = { 'arrowcol-oat/run-id': runId, 'arrowcol-oat/owner-token': ownerId };
+        return { apiVersion: target.api_version, kind: target.kind, metadata: {
+          name, namespace: namespace.name, uid: workloadDrift ? namespaceUid : target.uid, labels: markers, annotations: markers } };
+      }
+      return { kind: resourceKinds[resource!] + 'List', metadata: {},
+        items: resource === 'volumeattachments' && attachment ? [{ metadata: { name: 'still-attached' } }] : [] };
+    } });
+  return { cli, store, calls, effects, pool: () => properties,
+    attach: () => { attachment = true; }, drift: () => { workloadDrift = true; } };
 }
 
 test('direct setup CLI inspects only the exact persisted original provider operation and never treats it as restoration', async () => {
@@ -183,6 +261,80 @@ for (const fault of ['lost-pool-ack', 'lost-intent-write'] as const) test(`direc
     assert.equal(state.directSetup?.firstPool, null);
     assert.deepEqual(calls, ['GET']);
   }
+});
+
+test('direct setup CLI cancels before workload staging and restores exactly the original pool once', async () => {
+  const { cli, store, calls, effects, pool } = directSetupFixture('original-operation');
+  await cli('start-direct-setup', campaignId, ownerId);
+  await cli('dispatch-direct-first-pool', ownerId, '1');
+  await cli('provision-direct-namespace', ownerId, '1');
+  const staged = (await store.read())!.state;
+  assert.equal(staged.runInventory?.namespace.uid, null);
+  assert.equal(staged.runInventory?.load_admission, 'not_authorized');
+  await cli('settle-direct-setup', ownerId, '1');
+  assert.equal((await store.read())!.state.status, 'active');
+  await cli('settle-direct-setup', ownerId, '1');
+  const result = (await store.read())!.state;
+  assert.equal(result.status, 'setup_retired');
+  assert.equal(result.directSetup?.reversalVerified, true);
+  assert.equal(result.runInventory?.load_admission, 'not_authorized');
+  assert.deepEqual(effects, ['Namespace', 'ServiceAccount', 'FIC', 'DELETE original Namespace', 'DELETE original FIC']);
+  assert.equal(calls.filter(action => action === 'PUT').length, 2);
+  assert.equal(pool().minCount, 0);
+  assert.deepEqual(pool().tags, { existing: 'retain' });
+});
+
+for (const fault of ['lost-namespace-ack', 'lost-fic-ack', 'lost-reversal-ack'] as const) {
+  test(`direct setup CLI retains unknown ${fault} without replay or retirement`, async () => {
+    const { cli, store, calls, effects } = directSetupFixture(fault);
+    await cli('start-direct-setup', campaignId, ownerId);
+    await cli('dispatch-direct-first-pool', ownerId, '1');
+    if (fault === 'lost-reversal-ack') {
+      await assert.rejects(cli('settle-direct-setup', ownerId, '1'), /unknown reversal effect/);
+      await assert.rejects(cli('settle-direct-setup', ownerId, '1'), /reversal outcome is unresolved/);
+      assert.equal(calls.filter(action => action === 'PUT').length, 2);
+    } else {
+      await assert.rejects(cli('provision-direct-namespace', ownerId, '1'), /unknown .* effect/);
+      await assert.rejects(cli('provision-direct-namespace', ownerId, '1'), /Never replay/);
+      await assert.rejects(cli('settle-direct-setup', ownerId, '1'), /unresolved|matching settled ledger proof/);
+      assert.ok(effects.every(action => !action.startsWith('DELETE')));
+      assert.equal(calls.filter(action => action === 'PUT').length, 1);
+    }
+    assert.equal((await store.read())!.state.status, 'active');
+  });
+}
+
+test('direct setup CLI rejects floor reversal while storage attachment inventory is unresolved', async () => {
+  const { cli, store, calls, attach } = directSetupFixture('original-operation');
+  await cli('start-direct-setup', campaignId, ownerId);
+  await cli('dispatch-direct-first-pool', ownerId, '1');
+  attach();
+  await assert.rejects(cli('settle-direct-setup', ownerId, '1'), /storage attachments/);
+  assert.equal((await store.read())!.state.directSetup?.reversal, undefined);
+  assert.equal(calls.filter(action => action === 'PUT').length, 1);
+});
+
+test('direct setup CLI publishes only original FIC and observed held identities without authorizing or cleaning staged work', async () => {
+  const { cli, store } = directSetupFixture('original-operation');
+  await cli('start-direct-setup', campaignId, ownerId);
+  await cli('dispatch-direct-first-pool', ownerId, '1');
+  await cli('provision-direct-namespace', ownerId, '1');
+  await cli('stage-direct-held', ownerId, '1');
+  await assert.rejects(cli('settle-direct-setup', ownerId, '1'), /unresolved|retain custody/);
+  await cli('publish-direct-held-inventory', ownerId, '1');
+  assert.equal((await store.read())!.state.mode, 'armed');
+  assert.equal((await store.read())!.state.runInventory?.load_admission, 'not_authorized');
+});
+
+test('direct setup CLI refuses a replaced staged workload before publishing inventory', async () => {
+  const { cli, store, drift } = directSetupFixture('original-operation');
+  await cli('start-direct-setup', campaignId, ownerId);
+  await cli('dispatch-direct-first-pool', ownerId, '1');
+  await cli('provision-direct-namespace', ownerId, '1');
+  await cli('stage-direct-held', ownerId, '1');
+  drift();
+  await assert.rejects(cli('publish-direct-held-inventory', ownerId, '1'), /UID or ownership changed/);
+  assert.equal((await store.read())!.state.mode, 'observe');
 });
 
 const inventoryFor = (state: CampaignState, observed = false): RunInventory => {

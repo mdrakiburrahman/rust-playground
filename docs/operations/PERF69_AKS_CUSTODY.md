@@ -154,31 +154,31 @@ pending; do not infer historical non-release from pending text, rerun
 Pre-arm or unverified partial setup without exact namespace/FIC and Delta
 proof is not verified cleanup. Keep these cases pending for reconciliation.
 
-The bounded setup-cancellation candidate is **offline-only**, not a
-rehearsal procedure. `start-direct-setup CAMPAIGN OWNER` takes the original
-planned `RunInventory` on stdin and creates the initial observe record and
-setup intent in one conditional write. The ordinary `capture-baseline
-OWNER 1` still captures immutable idle capacity. The first permitted
-provisioning action in this candidate is `dispatch-direct-first-pool OWNER
-1`: it validates the baseline and the versioned idle `arrowe192` pool,
-persists the conditional PUT intent and exact body hash, then submits once.
-Do not supplement this entrypoint with manual floor, namespace, or FIC
-commands. The candidate does not authorize or implement those later stages.
+The bounded setup CLI is **offline-tested only; do not run it live without
+separate clearance**. Commands below are subcommands of
+`npx --no-install tsx projects/arrowcol-oat/aks-campaign.ts`; pass the same
+explicit `--env-file "$ENV" --stamp-config "$STAMP"` to each command. Use the
+original campaign environment and sole operator. Do not use manual pool,
+namespace, or FIC writes around these entrypoints.
 
-`cancel-direct-setup OWNER 1` retires only an original setup record with no
-dispatched intent; the same record remains as `setup_retired`, not verified
-workload or data cleanup. An ambiguous floor response leaves the original
-request ID, precondition and payload hash durable. Neither an unchanged
-readback nor a matching floor later proves the operation settled. Do not
-repeat it, retire the campaign, or restore a floor on that evidence alone.
+| Phase | Command and required evidence |
+| --- | --- |
+| Before provisioning | `start-direct-setup CAMPAIGN OWNER` with planned `RunInventory` on stdin, then `capture-baseline OWNER 1`. If still untouched, `cancel-direct-setup OWNER 1` retains `setup_retired`. |
+| Original floor | `dispatch-direct-first-pool OWNER 1` against versioned idle `arrowe192` at `0/0/1`. It saves the original configuration hash, conditional PUT intent and unique pool ownership tag before one dispatch. `inspect-direct-first-pool OWNER 1` reads only the original operation URL. `unknown`, pending, or failed is not permission to change the floor. |
+| Namespace and FIC only | `provision-direct-namespace OWNER 1` writes the namespace, ServiceAccount and FIC attempt records before dispatch. It binds the original Kubernetes UIDs and accepts only definitive shared FIC ledger proof. `export-direct-fic OWNER 1 "$NEW_PRIVATE_FIC"` exports that exact record. No workloads or admission yet. |
+| Cancel before workload staging | `settle-direct-setup OWNER 1` requires the original positively settled floor operation and exact namespace/FIC identities. It refuses to delete a namespace containing workloads or storage, reuses the namespace deletion journal and FIC ledger, then submits one conditional floor reversal. A subsequent call can verify the retained reversal operation, baseline config, zero nodes and no attachments, then retain `setup_retired`. |
+| Held preparation | `stage-direct-held OWNER 1` verifies namespace/FIC and durably pins the boundary **before** the separately reviewed held manifests are applied. Exclude Namespace and ServiceAccount objects from that apply; use the existing scoped identities. `publish-direct-held-inventory OWNER 1` takes the observed inventory on stdin and rechecks every planned object UID and owner, namespace, and FIC ledger before publication. Use direct `prepare`, never ordinary `arm` or scored `finish`. |
+| After selected interrupted preservation | With the original fenced campaign and token `2`, `settle-direct-held OWNER 2 CONTEXT "$RELEASE"` reopens the existing interrupted seal, Delta proof, namespace journal and completed FIC removal **read-only**. Only then can it conditionally reverse the original floor. A subsequent call verifies the original reversal and physical floor idle before `setup_retired`. |
 
-`inspect-direct-first-pool OWNER 1` is read-only. It queries only the
-original AKS `azure-asyncoperation` URL captured from the matching PUT
-response. No intent yields `not_dispatched`; no original operation URL
-or an indeterminate response yields `unknown`. A terminal operation
-status is not floor restoration or verified idle. This version does not
-reconcile a lost ACK without a durable provider operation URL and has
-no guarded namespace/FIC provisioning or capacity reversal entrypoint.
+Neither a missing ACK nor a current `GET` of the expected pool proves
+settlement. If an original ARM reference or namespace UID receipt is missing,
+the ledger is incomplete, a replacement appears, or the provider cannot
+honor the ownership tag and `If-Match`, retain the campaign and original
+receipts; do not replay, retime, or restore based on inference. A staged
+workload without a genuine, recoverable held arm has no automatic retirement
+path. It must not be deleted under the earlier no-workload cancellation path.
+This scope reverses only `arrowe192`; it does not change `benchd64`, support
+pools, Kusto, or shared identity configuration.
 
 Generate a candidate allocation offline from private exports of the original
 armed `active.json`, the ready run record independently read from the FIC

@@ -211,8 +211,21 @@ export interface DirectSetup {
   schemaVersion: 1;
   runId: string;
   baselineEtag: string | null;
-  firstPool: null | { resourceId: string; expectedEtag: string; bodySha256: string; requestId: string;
-    response: null | { status: 200 | 201 | 202; requestId: string; operationUrl?: string } };
+  firstPool: DirectSetupPoolAttempt | null;
+  originalPoolBodySha256?: string;
+  originalPoolHasTags?: boolean;
+  reversal?: DirectSetupPoolAttempt;
+  reversalVerified?: true;
+  namespaceAttempt?: DirectSetupObjectAttempt;
+  accountAttempt?: DirectSetupObjectAttempt;
+  ficAttempt?: true;
+  namespaceCleanup?: 'started' | 'complete';
+  heldStaging?: true;
+}
+export interface DirectSetupObjectAttempt { nonce: string; bodySha256: string; uid: string | null }
+export interface DirectSetupPoolAttempt {
+  resourceId: string; expectedEtag: string; bodySha256: string; requestId: string;
+  response: null | { status: 200 | 201 | 202; requestId: string; operationUrl?: string };
 }
 export interface StoredCampaign { state: CampaignState; etag: string; }
 export interface CampaignStoreReadOptions { maxResponseBodyBytes?: number; deadlineUnixMs?: number; }
@@ -624,7 +637,7 @@ export function validateCampaignState(value: unknown): CampaignState {
       state.fenceReason !== undefined && !['heartbeat-expired', 'max-lifetime'].includes(state.fenceReason)) {
     throw new Error('Campaign evaluation receipt is malformed.');
   }
-  const unfenced = state.status === 'active' || state.status === 'setup_retired';
+  const unfenced = state.status === 'active' || state.status === 'setup_retired' && state.mode === 'observe';
   const expectedCleanupSteps = unfenced ? [] : [...CUSTODY_CLEANUP_STEPS];
   if (state.cleanupSteps.length !== expectedCleanupSteps.length || state.cleanupSteps.some((receipt, index) => !record(receipt) ||
       receipt.step !== expectedCleanupSteps[index] || receipt.idempotencyKey !== state.campaignId + ":" + state.fencingToken + ":" + receipt.step ||
@@ -705,22 +718,48 @@ export function validateCampaignState(value: unknown): CampaignState {
     throw new Error('Campaign cannot finalize while ARM operations remain unresolved.');
   if (state.directSetup !== undefined) {
     const setup = state.directSetup, inv = state.runInventory;
-    if (!exactRecord(setup, ['schemaVersion', 'runId', 'baselineEtag', 'firstPool']))
+    if (!optionalRecord(setup, ['schemaVersion', 'runId', 'baselineEtag', 'firstPool'],
+      ['reversal', 'reversalVerified', 'originalPoolBodySha256', 'originalPoolHasTags',
+        'namespaceAttempt', 'accountAttempt', 'ficAttempt', 'namespaceCleanup', 'heldStaging']))
       throw new Error('Invalid bounded direct setup custody record.');
-    const pool = setup.firstPool;
+    const pool = setup.firstPool, reversal = setup.reversal;
+    const validObjectAttempt = (attempt: DirectSetupObjectAttempt) =>
+      exactRecord(attempt, ['nonce', 'bodySha256', 'uid']) && canonicalUuid(attempt.nonce) &&
+      /^[a-f0-9]{64}$/.test(attempt.bodySha256) && (attempt.uid === null || canonicalUuid(attempt.uid));
+    const validAttempt = (attempt: DirectSetupPoolAttempt) =>
+      exactRecord(attempt, ['resourceId', 'expectedEtag', 'bodySha256', 'requestId', 'response']) &&
+      !!setup.baselineEtag && attempt.resourceId === inv?.fic?.plan?.aksId + '/agentPools/arrowe192' &&
+      strongSetupEtag(attempt.expectedEtag) && /^[a-f0-9]{64}$/.test(attempt.bodySha256) && canonicalUuid(attempt.requestId) &&
+      (attempt.response === null || (optionalRecord(attempt.response, ['status', 'requestId'], ['operationUrl']) &&
+        [200, 201, 202].includes(attempt.response.status) && nonempty(attempt.response.requestId) &&
+        (attempt.response.operationUrl === undefined || directPoolOperationUrl(attempt.response.operationUrl, attempt.resourceId))));
     if (setup.schemaVersion !== 1 ||
         !inv?.fic?.plan || inv.cell_run_id !== setup.runId || inv.qap !== null || inv.official_measurement ||
-        inv.load_admission !== 'not_authorized' || state.mode !== 'observe' || state.operations.length ||
-        (state.scaleTrials?.length ?? 0) || !isInitialRunInventory(inv) ||
-        !['active', 'setup_retired'].includes(state.status) ||
+        state.operations.length || (state.scaleTrials?.length ?? 0) ||
+        (state.mode === 'observe' ? inv.load_admission !== 'not_authorized' || !isInitialRunInventory(inv) ||
+          !['active', 'setup_retired'].includes(state.status) :
+          setup.heldStaging !== true || inv.namespace.uid !== setup.namespaceAttempt?.uid ||
+          !['not_authorized', 'authorized'].includes(inv.load_admission) ||
+          inv.fic.state !== 'observed' || inv.resources.some(resource => resource.state !== 'observed' || !resource.uid) ||
+          !['active', 'fenced', 'setup_retired'].includes(state.status)) ||
         (setup.baselineEtag !== null && !strongSetupEtag(setup.baselineEtag)) ||
-        (pool !== null && (!exactRecord(pool, ['resourceId', 'expectedEtag', 'bodySha256', 'requestId', 'response']) ||
-          !setup.baselineEtag || pool.resourceId !== inv.fic.plan.aksId + '/agentPools/arrowe192' ||
-          !strongSetupEtag(pool.expectedEtag) || !/^[a-f0-9]{64}$/.test(pool.bodySha256) || !canonicalUuid(pool.requestId) ||
-          (pool.response !== null && (!optionalRecord(pool.response, ['status', 'requestId'], ['operationUrl']) ||
-            ![200, 201, 202].includes(pool.response.status) || !nonempty(pool.response.requestId) ||
-            (pool.response.operationUrl !== undefined && !directPoolOperationUrl(pool.response.operationUrl, pool.resourceId)))))) ||
-        (state.status === 'setup_retired' && pool !== null))
+        (pool !== null && !validAttempt(pool)) ||
+        (setup.originalPoolBodySha256 !== undefined && (!pool || !/^[a-f0-9]{64}$/.test(setup.originalPoolBodySha256) ||
+          typeof setup.originalPoolHasTags !== 'boolean')) ||
+        (setup.originalPoolHasTags !== undefined && setup.originalPoolBodySha256 === undefined) ||
+        (setup.namespaceAttempt !== undefined && (!pool?.response?.operationUrl || !validObjectAttempt(setup.namespaceAttempt))) ||
+        (setup.accountAttempt !== undefined && (!setup.namespaceAttempt?.uid || !validObjectAttempt(setup.accountAttempt))) ||
+        (setup.ficAttempt !== undefined && (setup.ficAttempt !== true || !setup.accountAttempt?.uid)) ||
+        (setup.heldStaging !== undefined && (setup.heldStaging !== true || !setup.ficAttempt || setup.namespaceCleanup ||
+          reversal && state.mode !== 'armed')) ||
+        (setup.namespaceCleanup !== undefined && (!setup.namespaceAttempt?.uid || !['started', 'complete'].includes(setup.namespaceCleanup))) ||
+        (reversal !== undefined && (!pool?.response?.operationUrl || !validAttempt(reversal) ||
+          reversal.expectedEtag === pool.expectedEtag || reversal.requestId === pool.requestId ||
+          reversal.bodySha256 !== setup.originalPoolBodySha256 ||
+          setup.namespaceAttempt !== undefined && (state.mode === 'observe' ? setup.namespaceCleanup !== 'complete' :
+            !['fenced', 'setup_retired'].includes(state.status)))) ||
+        (setup.reversalVerified !== undefined && (setup.reversalVerified !== true || !reversal?.response?.operationUrl)) ||
+        (state.status === 'setup_retired' && pool !== null && setup.reversalVerified !== true))
       throw new Error('Invalid bounded direct setup custody record.');
   } else if (state.status === 'setup_retired') throw new Error('Retirement requires original bounded direct setup custody.');
   return state;
@@ -1107,6 +1146,7 @@ export async function publishRunInventory(store: CampaignStore, value: unknown, 
     const current = await store.read();
     if (!current) throw new Error('No active campaign state exists.');
     if (current.state.status !== 'active') throw new CampaignFencedError('Producer inventory updates are blocked after campaign fencing.');
+    if (current.state.directSetup) throw new Error('Bounded direct setup needs explicit held inventory publication.');
     const inventory = validateRunInventory(value, current.state);
     requireOwner(current.state, inventory.owner_id, inventory.fencing_token, now);
     const merged = mergeRunInventory(current.state.runInventory, inventory);
@@ -1133,6 +1173,25 @@ export async function publishRunInventory(store: CampaignStore, value: unknown, 
       status: assessment.status, lower_bound_required_ms: assessment.required_ms, uncovered_steps: UNBOUNDED_CLEANUP_RESERVE_STEPS }));
   }
   throw new CampaignConflictError();
+}
+
+async function publishHeldSetupInventory(store: CampaignStore, azure: import('../../infra/azure/bootstrap.js').Azure,
+  current: StoredCampaign, input: unknown, providers?: Partial<typeof import('./aks-direct-setup.js').setupNamespaceProviders>,
+  read?: typeof import('./aks-direct-setup.js').readSetupKubernetes): Promise<StoredCampaign> {
+  const { state } = current, original = state.runInventory, setup = state.directSetup;
+  if (!setup?.heldStaging || state.mode !== 'observe' || !original || !isInitialRunInventory(original))
+    throw new Error('Original held workload staging is not pinned, or its inventory is already published.');
+  const after = validateRunInventory(input, state);
+  const merged = mergeRunInventory(original, after);
+  if (after.namespace.uid !== setup.namespaceAttempt?.uid || after.qap !== null || after.official_measurement ||
+      after.load_admission !== 'not_authorized' || after.fic?.state !== 'observed' ||
+      merged.resources.length !== original.resources.length || after.resources.length !== original.resources.length ||
+      merged.resources.some(resource => resource.state !== 'observed' || !resource.uid) ||
+      Object.values(merged.cleanup).some(step => step.state !== 'not_started' || step.deadline_unix_ms !== null || step.reason_code !== null))
+    throw new Error('Held setup publication requires exactly the inventoried namespace, FIC, and observed planned workload UIDs.');
+  const { verifySetupHeldInventory } = await import('./aks-direct-setup.js');
+  await verifySetupHeldInventory(store, azure, current, merged, providers, read);
+  return writeDirectSetupOnce(store, current, { ...state, mode: 'armed', runInventory: merged });
 }
 
 /** Controller-only inventory writes retain the producer's immutable origin token and require the current cleanup fence. */
@@ -1247,6 +1306,8 @@ async function readRunInventoryStdin(): Promise<unknown> {
 export async function campaignMain(args: string[], dependencies: {
   store?: CampaignStore; azure?: import('../../infra/azure/bootstrap.js').Azure; env?: NodeJS.ProcessEnv; cleanupEnvelope?: unknown;
   runInventoryInput?: unknown; directSetupBaseline?: typeof import('./aks-default-providers.js').readCleanupBaseline;
+  directSetupKubernetes?: typeof import('./aks-direct-setup.js').readSetupKubernetes;
+  directSetupNamespace?: Partial<typeof import('./aks-direct-setup.js').setupNamespaceProviders>;
   loadConfig?: typeof loadCustodyConfig;
 } = {}): Promise<void> {
   if (args[0] === 'cleanup-step') {
@@ -1273,7 +1334,27 @@ export async function campaignMain(args: string[], dependencies: {
       throw new Error('Direct setup plan does not match the configured stamp identity.');
     const result = await startDirectSetup(store, campaignId!, args[2]!, inventory);
     console.log(JSON.stringify({ ok: true, receipt: campaignStartReceipt(result.state) }));
-  } else if (['dispatch-direct-first-pool', 'inspect-direct-first-pool', 'cancel-direct-setup'].includes(action ?? '') &&
+  } else if (action === 'settle-direct-held' && args.length === 5 && /^\d+$/.test(fencingTokenText!)) {
+    const scope = await store.read(), [, , , context, release] = args;
+    if (!scope?.state.directSetup?.heldStaging || scope.state.status !== 'fenced' || scope.state.ownerId !== campaignId ||
+        scope.state.fencingToken !== Number(fencingTokenText) || !/^[a-zA-Z0-9._-]{1,253}$/.test(context!))
+      throw new CampaignFencedError();
+    assertCampaignEnvironment(env, scope.state);
+    const { settleFirstDirectPool, verifyHeldSetupSettlement } = await import('./aks-direct-setup.js');
+    const status = await settleFirstDirectPool(store, azure, scope, dependencies.directSetupBaseline, dependencies.directSetupKubernetes,
+      () => verifyHeldSetupSettlement(store, azure, scope, context!, release!));
+    console.log(JSON.stringify({ ok: true, status, campaignId: scope.state.campaignId }));
+  } else if (action === 'export-direct-fic' && args.length === 4 && /^\d+$/.test(fencingTokenText!)) {
+    const scope = await store.read();
+    if (!scope?.state.directSetup || scope.state.ownerId !== campaignId || scope.state.fencingToken !== Number(fencingTokenText))
+      throw new CampaignFencedError();
+    assertCampaignEnvironment(env, scope.state);
+    const { resolveSetupFic } = await import('./aks-direct-setup.js');
+    const { publish_private } = await import('../../infra/azure/bootstrap.js');
+    publish_private(args[3]!, await resolveSetupFic(store, azure, scope, dependencies.directSetupNamespace, dependencies.directSetupKubernetes));
+    console.log(JSON.stringify({ ok: true, status: 'original_fic_exported' }));
+  } else if (['dispatch-direct-first-pool', 'inspect-direct-first-pool', 'cancel-direct-setup', 'settle-direct-setup',
+    'provision-direct-namespace', 'stage-direct-held', 'publish-direct-held-inventory'].includes(action ?? '') &&
       args.length === 3 && /^\d+$/.test(fencingTokenText!)) {
     const scope = await store.read();
     if (!scope?.state.directSetup || scope.state.ownerId !== campaignId || scope.state.fencingToken !== Number(fencingTokenText))
@@ -1286,6 +1367,28 @@ export async function campaignMain(args: string[], dependencies: {
       const { inspectFirstDirectPool } = await import('./aks-direct-setup.js');
       console.log(JSON.stringify({ ok: true, campaignId: scope.state.campaignId,
         status: await inspectFirstDirectPool(store, azure, scope) }));
+    } else if (action === 'settle-direct-setup') {
+      const { cancelSetupNamespace, settleFirstDirectPool } = await import('./aks-direct-setup.js');
+      const settledNamespace = await cancelSetupNamespace(store, azure, scope,
+        dependencies.directSetupNamespace, dependencies.directSetupKubernetes);
+      const status = await settleFirstDirectPool(store, azure, settledNamespace,
+        dependencies.directSetupBaseline, dependencies.directSetupKubernetes);
+      console.log(JSON.stringify({ ok: true, status, campaignId: scope.state.campaignId }));
+    } else if (action === 'provision-direct-namespace') {
+      requireOwner(scope.state, campaignId!, Number(fencingTokenText), Date.now());
+      const { provisionSetupNamespace } = await import('./aks-direct-setup.js');
+      const status = await provisionSetupNamespace(store, azure, scope, dependencies.directSetupNamespace, dependencies.directSetupKubernetes);
+      console.log(JSON.stringify({ ok: true, status, campaignId: scope.state.campaignId }));
+    } else if (action === 'stage-direct-held') {
+      requireOwner(scope.state, campaignId!, Number(fencingTokenText), Date.now());
+      const { stageHeldSetup } = await import('./aks-direct-setup.js');
+      await stageHeldSetup(store, azure, scope, dependencies.directSetupNamespace, dependencies.directSetupKubernetes);
+      console.log(JSON.stringify({ ok: true, status: 'held_staging_pinned_not_admitted', campaignId: scope.state.campaignId }));
+    } else if (action === 'publish-direct-held-inventory') {
+      requireOwner(scope.state, campaignId!, Number(fencingTokenText), Date.now());
+      const input = dependencies.runInventoryInput ?? await readRunInventoryStdin();
+      const result = await publishHeldSetupInventory(store, azure, scope, input, dependencies.directSetupNamespace, dependencies.directSetupKubernetes);
+      console.log(JSON.stringify({ ok: true, receipt: runInventoryPublishReceipt(result) }));
     } else {
       requireOwner(scope.state, campaignId!, Number(fencingTokenText), Date.now());
       const { dispatchFirstDirectPool } = await import('./aks-direct-setup.js');
@@ -1385,7 +1488,7 @@ export async function campaignMain(args: string[], dependencies: {
     }
     console.log(JSON.stringify({ ok: true, receipt }));
   } else {
-    throw new Error('Usage: aks-campaign.ts <start|start-direct-setup|dispatch-direct-first-pool|inspect-direct-first-pool|cancel-direct-setup|heartbeat|capture-baseline|arm|publish-inventory|assert-ready|read-inventory|capture-cell-baseline|cleanup-step|status> [arguments] --env-file PATH --stamp-config YAML');
+    throw new Error('Usage: aks-campaign.ts <start|start-direct-setup|dispatch-direct-first-pool|inspect-direct-first-pool|cancel-direct-setup|provision-direct-namespace|settle-direct-setup|settle-direct-held|stage-direct-held|publish-direct-held-inventory|export-direct-fic|heartbeat|capture-baseline|arm|publish-inventory|assert-ready|read-inventory|capture-cell-baseline|cleanup-step|status> [arguments] --env-file PATH --stamp-config YAML');
   }
 }
 if (process.argv[1] && ['aks-campaign.ts', 'aks-campaign.js'].includes(path.basename(process.argv[1])) && import.meta.url === pathToFileURL(process.argv[1]).href) {

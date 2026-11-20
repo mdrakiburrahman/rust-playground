@@ -41,7 +41,7 @@ export function buildFleetPoolScalePayload(resource: unknown, approved: { resour
 
 
 export function buildAksPoolScalePayload(resource: unknown, target: { count: number; autoscale: boolean; minimum: number | null; maximum: number | null },
-  scope?: 'direct-first-floor'): Record<string, unknown> {
+  scope?: 'direct-first-floor' | 'direct-restore-floor'): Record<string, unknown> {
   const selected = object(resource), properties = object(selected.properties);
   for (const key of Object.keys(properties)) if (!poolWritable.has(key) && !poolReadonly.has(key))
     throw new Error('Unrecognized pool configuration cannot be safely preserved during scale: ' + key);
@@ -50,12 +50,12 @@ export function buildAksPoolScalePayload(resource: unknown, target: { count: num
     throw new Error('Pool identity/configuration is incomplete for safe scale.');
   const name = typeof selected.id === 'string' ? selected.id.split('/').at(-1) : undefined;
   if (target.autoscale !== (preserved.mode === 'User') ||
-      (scope === 'direct-first-floor' ? name !== 'arrowe192' || !target.autoscale || target.count !== 0 ||
-        target.minimum !== 1 || target.maximum !== 1 :
+      (scope ? name?.toLowerCase() !== 'arrowe192' || !target.autoscale || target.count !== 0 ||
+        target.minimum !== (scope === 'direct-first-floor' ? 1 : 0) || target.maximum !== 1 :
         target.autoscale ? !['benchd64', 'benche64'].includes(String(name)) : name !== 'systempool'))
     throw new Error('Scale pool mode differs from the exact selected target.');
   if (!target.autoscale) { delete preserved.minCount; delete preserved.maxCount; }
-  return { ...(scope === 'direct-first-floor' && selected.tags !== undefined ? { tags: selected.tags } : {}),
+  return { ...(scope && selected.tags !== undefined ? { tags: selected.tags } : {}),
     properties: { ...preserved, count: target.count, enableAutoScaling: target.autoscale,
     ...(target.autoscale ? { minCount: target.minimum, maxCount: target.maximum } : {}) } };
 }

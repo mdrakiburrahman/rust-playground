@@ -23,7 +23,7 @@ const sha = (data: Buffer) => createHash('sha256').update(data).digest('hex');
 const strong = (value: string | undefined) => !!value && /^"[^"\r\n]+"$/.test(value);
 
 export async function recoverInterruptedDirectRun(azure: Azure, binding: Bound, context: string,
-  workDirectory: string, signal: AbortSignal) {
+  workDirectory: string, signal: AbortSignal, verifyOnly = false) {
   const { arm, fic, authority, seal: producerSeal } = binding;
   const { origin } = arm;
   requireEvidence(!producerSeal, 'Interrupted recovery may not replace an original producer terminal seal');
@@ -145,6 +145,8 @@ export async function recoverInterruptedDirectRun(azure: Azure, binding: Bound, 
   };
   const original = { origin, armHash: sha(Buffer.from(canonical_json(arm))), schema_version: 1, result: 'interrupted_not_scored' };
   let sealed = await read(path, true);
+  if (verifyOnly) requireEvidence(sealed && fic.phase === 'deleted',
+    'Held floor restoration needs the original interrupted seal and settled FIC removal.');
   if (!sealed) {
     requireEvidence(fic.phase === 'ready', 'Original cleanup has no interrupted evidence seal');
     if (binding.preAdmission) {

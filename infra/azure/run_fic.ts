@@ -839,7 +839,7 @@ async function new_record(azure: Azure, runId: string, namespace: string, servic
     namespaceOwner: owner, serviceAccountUid: sa.uid, phase: 'create-submitted' }, azure.c);
 }
 export async function prepare_run_fic(azure: Azure, runId: string, namespace: string, serviceAccount: string,
-  recordPath: string, plannedIdentity?: unknown): Promise<void> {
+  recordPath: string, plannedIdentity?: unknown, beforeDispatch?: (record: RunFicRecord) => Promise<void>): Promise<void> {
   validate_run_identity(runId, namespace, serviceAccount);
   await reset_lock(recordPath, async () => {
     if (fs.existsSync(recordPath)) {
@@ -861,6 +861,7 @@ export async function prepare_run_fic(azure: Azure, runId: string, namespace: st
       ledger.entries[runId] = entry;
       await save();
       publish_private(recordPath + '.create-intent.json', { record, intent: createIntent });
+      await beforeDispatch?.(record);
       const receipt = await arm_mutation(azure, record, 'create', createIntent, recordPath);
       if (receipt.status !== 201)
         throw new Failure('ARM did not return create-only status 201; retain custody and reconcile without replay.');

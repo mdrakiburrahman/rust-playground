@@ -196,6 +196,8 @@ async function resolveProducer(options: Options, selected: LoadedConfig, azure: 
   const current = await store.read();
   if (!current) throw new Error('No active campaign state exists.');
   const state = validateCampaignState(current.state), inventory = state.runInventory;
+  if (state.directSetup && options.action !== 'prepare')
+    throw new Error('Bounded direct setup permits only held preparation; release and scored finish are prohibited.');
   if (state.status !== 'active' || state.mode !== 'armed' || !inventory || state.campaignId !== inventory.campaign_id ||
       state.ownerId !== inventory.owner_id || state.fencingToken !== inventory.fencing_token ||
       inventory.load_admission !== (options.action === 'prepare' ? 'not_authorized' : 'authorized') ||
@@ -210,6 +212,8 @@ async function resolveProducer(options: Options, selected: LoadedConfig, azure: 
     fic.namespaceUid === inventory.namespace.uid && fic.namespaceOwner === inventory.namespace.owner_token &&
     (fic.phase === 'ready' || options.action === 'finish' && fic.phase === 'deleted'),
   'Run FIC record does not match the durable producer inventory');
+  if (state.directSetup) requireEvidence(fic.namespaceUid === state.directSetup.namespaceAttempt?.uid &&
+    fic.serviceAccountUid === state.directSetup.accountAttempt?.uid, 'Run FIC differs from original setup UID receipts');
   assertDirectInventory(azure, inventory, fic, options.action === 'finish' ? 'finish' : 'arm');
   const [publisher] = await new PublisherControl(azure).read();
   requireEvidence(typeof publisher.resetgeneration === 'string' && uuid.test(publisher.resetgeneration),
@@ -245,7 +249,7 @@ export async function runDirectBenchmarkCli(args: string[], dependencies: Direct
       const observed = options.action === 'prepare' ? await store.read() : undefined;
       if (options.action === 'prepare') {
         requireEvidence(observed?.state.runInventory, 'Original held setup has no observed inventory');
-        await (dependencies.readBaseline ?? readCleanupBaseline)(azure, observed.state);
+        await (dependencies.readBaseline ?? readCleanupBaseline)(azure, observed.state, observed.state.directSetup?.baselineEtag ?? undefined);
       }
       const arm = await armDirectBenchmark(azure, campaign, origin, release, options.context, options['fic-record'],
         privateDirectory(options['baseline-directory'], 'Baseline directory'), async record => {

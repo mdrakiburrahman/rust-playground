@@ -16,8 +16,9 @@ import { inspectDirectRecovery } from './benchmark-direct-recovery.js';
 import { ENCODING, MAX_RECORDS } from './benchmark-manifest-audit.js';
 import { parseEvidence } from './benchmark-evidence-json.js';
 import { fakeKubectl } from './benchmark-direct-e2e.fixture.js';
-import { CampaignConflictError, newCampaignState, publishRunInventory, validateCampaignState,
+import { CampaignConflictError, campaignMain, newCampaignState, publishRunInventory, validateCampaignState,
   type CampaignStore, type InventoryStep, type RunInventory } from '../../projects/arrowcol-oat/aks-campaign.js';
+import { buildAksPoolScalePayload } from '../../projects/arrowcol-oat/aks-arm-pool.js';
 
 const uuid = (n: number) => `00000000-0000-0000-0000-${String(n).padStart(12, '0')}`;
 const origin = { runId: uuid(1), owner: uuid(2), namespaceUid: uuid(3), cloudGeneration: uuid(4),
@@ -543,11 +544,32 @@ test('selected watchdog waits for original FIC, fences authorized null-QAP produ
   assert.equal(writes, 2);
 });
 
-for (const scenario of ['admitted', 'pre-admission', 'pre-admission drift'] as const) test(`offline CLI handles genuine held arm: ${scenario}`, async t => {
-  const loseAdmission = scenario !== 'admitted', drift = scenario === 'pre-admission drift';
+for (const scenario of ['admitted', 'pre-admission', 'pre-admission drift', 'setup settlement'] as const) test(`offline CLI handles genuine held arm: ${scenario}`, async t => {
+  const settle = scenario === 'setup settlement', loseAdmission = scenario.startsWith('pre-admission'), drift = scenario === 'pre-admission drift';
   const f = await fixture(t, 'arm-write-unknown', true);
+  const original = (await f.store.read())!, ficRecord = read_run_fic_record(f.ficPath, f.c);
+  const poolId = ficRecord.aksId + '/agentPools/arrowe192';
+  const armEndpoint = 'https://management.azure.com';
+  const armOperation = (suffix: string) => `${armEndpoint}/subscriptions/${f.c.subscription}/providers/Microsoft.ContainerService/locations/westus/operations/${suffix}?api-version=2024-10-01`;
+  const putUrl = `${armEndpoint}${poolId}?api-version=2024-10-01`, firstRequest = uuid(87);
+  const idlePool = { id: poolId, properties: { mode: 'User', vmSize: 'Standard_E192ids_v6', count: 0,
+    minCount: 0, maxCount: 1, enableAutoScaling: true, provisioningState: 'Succeeded' } };
+  const raisedPool = { ...idlePool, properties: { ...idlePool.properties, minCount: 1,
+    tags: { 'arrowcol-direct-setup-attempt': firstRequest } } };
+  if (settle) {
+    const body = (source: object, minimum: 0 | 1) => canonical_json(buildAksPoolScalePayload(source,
+      { count: 0, autoscale: true, minimum, maximum: 1 }, minimum === 0 ? 'direct-restore-floor' : 'direct-first-floor'));
+    await f.store.write({ ...original.state, directSetup: { schemaVersion: 1, runId: origin.runId,
+      baselineEtag: '"fixture-baseline"', firstPool: { resourceId: poolId, expectedEtag: '"idle-before"',
+        bodySha256: sha(body(raisedPool, 1)), requestId: firstRequest,
+        response: { status: 202, requestId: 'original-ack', operationUrl: armOperation('raise') } },
+      originalPoolBodySha256: sha(body(idlePool, 0)), originalPoolHasTags: false,
+      namespaceAttempt: { nonce: uuid(83), bodySha256: 'a'.repeat(64), uid: origin.namespaceUid },
+      accountAttempt: { nonce: uuid(84), bodySha256: 'b'.repeat(64), uid: ficRecord.serviceAccountUid },
+      ficAttempt: true, heldStaging: true } }, original.etag);
+  }
   assert.equal((await f.store.read())!.state.runInventory?.load_admission, 'not_authorized');
-  await assert.rejects(f.runCli('arm'), /does not authorize/);
+  await assert.rejects(f.runCli('arm'), settle ? /only held preparation/ : /does not authorize/);
   const path = directArmRecordPath(origin);
   if (loseAdmission) {
     await assert.rejects(f.runCli('prepare', { read: f.store.read.bind(f.store), async write() {
@@ -566,7 +588,7 @@ for (const scenario of ['admitted', 'pre-admission', 'pre-admission drift'] as c
   assert.deepEqual(f.scheduleData(), { start: 'pending', writerLifetime: 'pending', clientLifetimes: 'pending' });
   assert.deepEqual(f.events().filter(event => ['arm-write', 'arm-readback', 'barrier-attempt', 'release'].includes(event.event))
     .map(event => event.event), ['arm-write', 'arm-readback']);
-  await assert.rejects(f.runCli('finish'), loseAdmission ? /does not authorize/ : /never released the schedule/);
+  await assert.rejects(f.runCli('finish'), settle ? /only held preparation/ : loseAdmission ? /does not authorize/ : /never released the schedule/);
   const { subscription, account, checkpoints } = f.c;
   const saved = (name: string, value: string) => {
     const file = join(f.directory, name);
@@ -656,6 +678,40 @@ for (const scenario of ['admitted', 'pre-admission', 'pre-admission drift'] as c
   if (drift) assert.equal(seal, undefined);
   else assert.equal(JSON.parse(seal!.bytes.toString()).result, 'interrupted_not_scored');
   assert.equal((await f.store.read())!.state.runInventory?.load_admission, loseAdmission ? 'not_authorized' : 'authorized');
+  if (settle) {
+    const originalRequest = f.azure.request.bind(f.azure);
+    let reversals = 0;
+    t.mock.method(f.azure, 'request', (async (method, url, resource, body, headers, missing, idempotent, capture) => {
+      if (url === armOperation('raise') || url === armOperation('restore')) {
+        assert.equal(method, 'GET');
+        return [Buffer.from('{"status":"Succeeded"}'), { ':status': '200' }];
+      }
+      if (url === putUrl) {
+        if (method === 'GET') return [Buffer.from(JSON.stringify(reversals ? idlePool : raisedPool)),
+          { ':status': '200', etag: reversals ? '"idle-after"' : '"raised-live"' }];
+        assert.equal(method, 'PUT');
+        const reversal = (await f.store.read())!.state.directSetup!.reversal!;
+        assert.equal(headers?.['If-Match'], '"raised-live"');
+        assert.equal(headers?.['x-ms-client-request-id'], reversal.requestId);
+        assert.equal(sha(body!), reversal.bodySha256);
+        assert.equal(reversals++, 0);
+        return [null, { ':status': '202', 'x-ms-request-id': 'settlement-ack', 'azure-asyncoperation': armOperation('restore') }];
+      }
+      return originalRequest(method, url, resource, body, headers, missing, idempotent, capture);
+    }) satisfies Azure['request']);
+    const env = { CAMPAIGN_ID: uuid(5), CAMPAIGN_OWNER_ID: origin.owner, CAMPAIGN_FENCING_TOKEN: '2' };
+    const settleHeld = () => campaignMain(['settle-direct-held', origin.owner, '2', 'fixture', f.releaseFile], {
+      azure: f.azure, store: f.store, env, loadConfig: positionals => ({ config: f.c, env, positionals, once: false }),
+      directSetupBaseline: async () => ({ status: 'captured', campaign_id: uuid(5), owner_id: origin.owner,
+        fencing_token: 1, blob: 'fixture-baseline', etag: '"fixture-baseline"', captured_at_unix_ms: original.state.startedAtMs }),
+      directSetupKubernetes: async (_server, args) => args[1] === 'namespace' ? null : { kind: 'List', metadata: {}, items: [] },
+    });
+    await settleHeld();
+    assert.equal((await f.store.read())!.state.status, 'fenced');
+    await settleHeld();
+    assert.equal((await f.store.read())!.state.status, 'setup_retired');
+    assert.equal(reversals, 1);
+  }
 });
 
 for (const [fault, reason] of [
