@@ -47,7 +47,7 @@ collector results only if the same run-owned process and read-only Delta mounts
 were verified running before and after the atomic client schedule rename. No
 cross-host timestamp comparison can substitute for that observation. Teardown
 still requires a known exit and unchanged stopped identity and storage.
-shutdown evidence retains the actual exit code and
+The shutdown evidence retains the actual exit code and
 `local_qap_observer_exited_after_arm`; unavailable downstream measurements
 remain null. Required roles, startup failures, and AKS checks are unchanged.
 
