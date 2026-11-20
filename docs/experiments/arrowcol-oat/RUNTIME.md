@@ -42,6 +42,14 @@ For AKS prerequisites, continue below. Local runs use the following independent 
 | Stop/export/cleanup | Stop owned ingress first, then stop and wait for `delta-maintenance`, record its sanitized outcome, and only then SIGTERM collectors; stop catalog and dependencies afterward. `collector_stop_grace_seconds` (30..=3600, default 300) is applied to local collectors and AKS `terminationGracePeriodSeconds` and is read back before measurement. Other local stop phases retain a 300 s ceiling; the overall local deadline includes collector grace, all three other phase ceilings, and 120 s margin. Each collector records SIGTERM-to-exit seconds, committed rows/commits completed after SIGTERM, Quiver bundles drained/force-dropped, log completeness, and exit code. A zero drained count derived only from matched shutdown start/complete records is labelled `inferred`, not `observed`. Maintenance uses the retained pre-client baseline through drain: typed `stale_plan` retries and sanitized operation failures are separate. Raw exit 1 is preserved but never alone establishes `maintenance_operation_failure`; missing records or an unproved exit cause remain UNKNOWN. Exit 0 and intentional SIGTERM/143 for a previously running writer remain accepted; exit 2, 137, OOM and every other nonzero exit still fail. An AKS terminated state missed before pod deletion yields `exit_outcome.status=unavailable` and a null exit code, never an assumed success. Stop failure retains owned resources for recovery rather than attempting destructive cleanup. In snapshot mode, copy/verify/sync snapshot and provenance before owned stack/volume/state deletion. |
 | Snapshot meaning | Last committed stopped data, **not** proof every admitted row was flushed. No measurement, pinning, unknown-count or QAP acceptance gate is relaxed. |
 
+In local mode, a Kustainer that initialized QAP and was verified as the running,
+run-owned read-only Delta observer at client arm may exit before teardown without
+invalidating collector results. This requires the same stopped container and
+process instance with a known exit and no storage or stop uncertainty. The
+shutdown evidence retains the actual exit code and
+`local_qap_observer_exited_after_arm`; unavailable downstream measurements
+remain null. Required roles, startup failures, and AKS checks are unchanged.
+
 Local teardown includes the maintenance Compose profile only when maintenance
 was enabled for the cell; other profiles remain excluded.
 After a successful measurement, `local_teardown` identifies the cell and its

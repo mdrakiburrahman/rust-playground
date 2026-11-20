@@ -1228,6 +1228,8 @@ struct LocalPlatform {
     router_metrics_url: Option<String>,
     collector_metrics_url: Option<String>,
     qap_url: Option<String>,
+    qap_initialized: bool,
+    armed_local_observer: Option<ArmedLocalObserver>,
     daemon_endpoint: Option<String>,
     shutdown_drain_evidence: Option<Value>,
     maintenance_cell_baseline: Vec<ProcessLog>,
@@ -1914,6 +1916,7 @@ impl Platform for LocalPlatform {
         .await
         .map_err(classify_local_qap_error)
         .context("initialize run-local Kusto QAP tables and policies")?;
+        self.qap_initialized = true;
         Ok(bindings.iter().map(|binding| binding.external_table.clone()).collect())
     }
 
@@ -1942,14 +1945,32 @@ impl Platform for LocalPlatform {
         poll_local_client_fleet(handles, &self.client_progress).await
     }
 
-    async fn arm_clients(&mut self, _config: &OatConfig, _run_id: &str, run_start_unix_ms: u64) -> Result<()> {
+    async fn arm_clients(&mut self, config: &OatConfig, _run_id: &str, run_start_unix_ms: u64) -> Result<()> {
+        let observer = if self.qap_initialized {
+            match capture_local_observer(config, self).await {
+                Ok(observer) => Some(observer),
+                Err(_) => {
+                    tracing::warn!(
+                        "local Kustainer identity or read-only storage could not be attested at arm; strict stop checks remain in force"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let temporary = self.control_dir.join("schedule.tmp");
         tokio::fs::write(&temporary, format!("{run_start_unix_ms}\n"))
             .await
             .context("write local OAT measurement schedule")?;
         tokio::fs::rename(&temporary, self.control_dir.join("schedule"))
             .await
-            .context("atomically arm local OAT measurement schedule")
+            .context("atomically arm local OAT measurement schedule")?;
+        if let Some(mut observer) = observer {
+            observer.armed_at = chrono::Utc::now();
+            self.armed_local_observer = Some(observer);
+        }
+        Ok(())
     }
 
     async fn finish_client(&self, _config: &OatConfig, handle: ClientHandle) -> Result<String> {
@@ -2052,6 +2073,8 @@ impl LocalPlatform {
             router_metrics_url: None,
             collector_metrics_url: None,
             qap_url: None,
+            qap_initialized: false,
+            armed_local_observer: None,
             daemon_endpoint: None,
             shutdown_drain_evidence: None,
             maintenance_cell_baseline: Vec::new(),
@@ -8007,6 +8030,93 @@ async fn verify_local_bind_mount(config: &OatConfig, platform: &LocalPlatform) -
     Ok(())
 }
 
+struct ArmedLocalObserver {
+    id: String,
+    started_at: String,
+    mounts: Value,
+    armed_at: chrono::DateTime<chrono::Utc>,
+}
+
+async fn capture_local_observer(config: &OatConfig, platform: &LocalPlatform) -> Result<ArmedLocalObserver> {
+    let project = scoped_compose_project(
+        config
+            .platform
+            .compose_project
+            .as_deref()
+            .context("missing local project")?,
+        &platform.run_id,
+    );
+    let mut list = Command::new("docker");
+    list.args([
+        "ps",
+        "--all",
+        "--quiet",
+        "--no-trunc",
+        "--filter",
+        &format!("label=com.docker.compose.project={project}"),
+        "--filter",
+        "label=com.docker.compose.service=kusto",
+    ]);
+    let ids = String::from_utf8(run_command(list, "list local Kustainer at arm").await?.stdout)?;
+    let ids = ids.split_whitespace().collect::<Vec<_>>();
+    let [id] = ids.as_slice() else {
+        bail!("local Kustainer identity missing or ambiguous at arm");
+    };
+    let mut inspect = Command::new("docker");
+    inspect.args(["inspect", id]);
+    let containers: Vec<Value> =
+        serde_json::from_slice(&run_command(inspect, "inspect local Kustainer at arm").await?.stdout)?;
+    let [container] = containers.as_slice() else {
+        bail!("local Kustainer inspection missing or ambiguous at arm");
+    };
+    validate_owned_local_containers(&containers, &project)?;
+    let state = &container["State"];
+    if container["Id"] != *id
+        || container
+            .pointer("/Config/Labels/com.docker.compose.service")
+            .and_then(Value::as_str)
+            != Some("kusto")
+        || state["Running"] != true
+        || state["Paused"] != false
+        || state["Status"] != "running"
+        || state["Error"] != ""
+        || state["OOMKilled"] != false
+    {
+        bail!("local Kustainer is not a running owned observer at arm");
+    }
+    let mounts = container["Mounts"]
+        .as_array()
+        .context("local Kustainer mounts missing")?;
+    let dataflow = platform.state_dir.join("dataflow");
+    let dataflow = dataflow.to_str().context("invalid local Delta path")?;
+    let volume = format!("{project}_kusto-data");
+    if mounts.len() != 2
+        || !mounts.iter().any(|mount| {
+            mount["Destination"] == "/delta/dataflow"
+                && mount["Type"] == "bind"
+                && mount["Source"] == dataflow
+                && mount["RW"] == false
+        })
+        || !mounts
+            .iter()
+            .any(|mount| mount["Destination"] == "/kustodata" && mount["Type"] == "volume" && mount["Name"] == volume)
+    {
+        bail!("local Kustainer is not attached as a read-only Delta observer");
+    }
+    let started_at = state["StartedAt"]
+        .as_str()
+        .context("local Kustainer start time missing")?;
+    if chrono::DateTime::parse_from_rfc3339(started_at)?.timestamp() <= 0 {
+        bail!("local Kustainer start time invalid");
+    }
+    Ok(ArmedLocalObserver {
+        id: (*id).to_owned(),
+        started_at: started_at.to_owned(),
+        mounts: container["Mounts"].clone(),
+        armed_at: chrono::Utc::now(),
+    })
+}
+
 async fn stop_local_snapshot_writers(config: &OatConfig, platform: &LocalPlatform) -> Result<Vec<Value>> {
     let project = scoped_compose_project(
         config
@@ -8123,7 +8233,7 @@ async fn stop_local_snapshot_writers(config: &OatConfig, platform: &LocalPlatfor
     if listed.split_whitespace().collect::<HashSet<_>>() != ids.iter().map(String::as_str).collect::<HashSet<_>>() {
         bail!("owned local container set changed while stopping; preserving state");
     }
-    let mut outcomes = snapshot_container_outcomes(&before, &after, &project)?;
+    let mut outcomes = snapshot_container_outcomes(&before, &after, &project, platform.armed_local_observer.as_ref())?;
     for outcome in &mut outcomes {
         let service = outcome["service"]
             .as_str()
@@ -8187,7 +8297,12 @@ async fn stop_local_snapshot_writers(config: &OatConfig, platform: &LocalPlatfor
     }
     Ok(outcomes)
 }
-fn snapshot_container_outcomes(before: &[Value], after: &[Value], project: &str) -> Result<Vec<Value>> {
+fn snapshot_container_outcomes(
+    before: &[Value],
+    after: &[Value],
+    project: &str,
+    armed_observer: Option<&ArmedLocalObserver>,
+) -> Result<Vec<Value>> {
     validate_owned_local_containers(before, project)?;
     validate_owned_local_containers(after, project)?;
     let before_by_id = before
@@ -8251,27 +8366,51 @@ fn snapshot_container_outcomes(before: &[Value], after: &[Value], project: &str)
         } else {
             ComponentRole::Collector
         };
-        shutdown_exit_outcome(
-            role,
-            was_running,
-            Some(exit),
-            state.get("OOMKilled").and_then(Value::as_bool) != Some(false),
-        )
-        .with_context(|| format!("owned container {service} failed while stopping"))?;
         let finished_at = state
             .get("FinishedAt")
             .and_then(Value::as_str)
             .context("container finish time missing")?;
-        if chrono::DateTime::parse_from_rfc3339(finished_at)?.timestamp() <= 0 {
+        let finished = chrono::DateTime::parse_from_rfc3339(finished_at)?;
+        if finished.timestamp() <= 0 {
             bail!("owned container has no definite finish time");
+        }
+        let observer_exit = service == "kusto"
+            && exit > 0
+            && !was_running
+            && state["OOMKilled"] == false
+            && state["Restarting"] == false
+            && state["Pid"] == 0
+            && original["State"] == *state
+            && armed_observer.is_some_and(|observer| {
+                observer.id == id
+                    && state["StartedAt"] == observer.started_at
+                    && container["Mounts"] == observer.mounts
+                    && original["Mounts"] == observer.mounts
+                    && finished >= observer.armed_at
+            });
+        if !observer_exit {
+            shutdown_exit_outcome(
+                role,
+                was_running,
+                Some(exit),
+                state.get("OOMKilled").and_then(Value::as_bool) != Some(false),
+            )
+            .with_context(|| format!("owned container {service} failed while stopping"))?;
+        }
+        if observer_exit {
+            tracing::warn!(
+                exit_code = exit,
+                reason = "local_qap_observer_exited_after_arm",
+                "owned local Kustainer was already stopped; preserving collector results"
+            );
         }
         writers.push(json!({
             "id": id, "service": service, "was_running": was_running, "exit_code": exit,
             "finished_at": finished_at, "oom_killed": state["OOMKilled"],
             "maintenance_operation_failure": null,
-            "comment": (service == "delta-maintenance" && exit == 1).then_some(
+            "comment": if observer_exit { Some("local_qap_observer_exited_after_arm") } else { (service == "delta-maintenance" && exit == 1).then_some(
                 "Cumulative maintenance health exit retained; cell records and health diagnostics determine failure, retry-only, or UNKNOWN.",
-            ),
+            ) },
         }));
     }
     Ok(writers)
@@ -8345,6 +8484,7 @@ fn build_shutdown_drain_evidence(containers: &[Value]) -> Value {
             "container_id": container["id"],
             "drain": container["shutdown_drain"],
         })).collect::<Vec<_>>(),
+        "optional_observer": containers.iter().find(|container| container["comment"] == "local_qap_observer_exited_after_arm"),
         "maintenance": containers.iter().filter(|container| container["service"] == "delta-maintenance").map(|container| json!({
             "container_id": container["id"],
             "outcomes": container["maintenance_outcomes"],
@@ -14601,6 +14741,64 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_stop_accepts_only_the_attested_post_arm_kustainer_exit() -> Result<()> {
+        let project = "owned-run";
+        let mounts = json!([{"Destination":"/delta/dataflow","RW":false}]);
+        let make = |id, service| {
+            json!({
+                "Id":id, "Mounts":mounts,
+                "Config":{"Labels":{"com.docker.compose.project":project,"com.docker.compose.service":service}},
+                "State":{"Running":false,"Paused":false,"Dead":false,"Status":"exited","Error":"",
+                    "OOMKilled":false,"Restarting":false,"Pid":0,"ExitCode":143,"StartedAt":"2026-01-01T00:00:00Z",
+                    "FinishedAt":"2026-01-01T00:01:00Z"},
+            })
+        };
+        let observer = ArmedLocalObserver {
+            id: "kusto-id".to_owned(),
+            started_at: "2026-01-01T00:00:00Z".to_owned(),
+            mounts,
+            armed_at: chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:10Z")?.to_utc(),
+        };
+        let mut before = vec![make("kusto-id", "kusto"), make("collector-id", "dataflow-1")];
+        let mut after = before.clone();
+        before[1]["State"]["Running"] = json!(true);
+        after[1]["State"]["ExitCode"] = json!(0);
+        let outcomes = snapshot_container_outcomes(&before, &after, project, Some(&observer))?;
+        assert_eq!(outcomes[0]["exit_code"], 143);
+        assert_eq!(outcomes[0]["comment"], "local_qap_observer_exited_after_arm");
+        assert_eq!(
+            build_shutdown_drain_evidence(&outcomes)["optional_observer"]["exit_code"],
+            143
+        );
+        assert!(snapshot_container_outcomes(&before, &after, project, None).is_err());
+        for (field, value) in [
+            ("ExitCode", Value::Null),
+            ("OOMKilled", json!(true)),
+            ("Pid", json!(872)),
+            ("Restarting", json!(true)),
+            ("FinishedAt", json!("2026-01-01T00:00:09Z")),
+            ("StartedAt", json!("2026-01-01T00:00:20Z")),
+        ] {
+            let mut a = after.clone();
+            let mut b = before.clone();
+            a[0]["State"][field] = value.clone();
+            b[0]["State"][field] = value;
+            assert!(
+                snapshot_container_outcomes(&b, &a, project, Some(&observer)).is_err(),
+                "{field}"
+            );
+        }
+        let mut replacement = after.clone();
+        replacement[0]["Id"] = json!("replacement-id");
+        let mut replacement_before = before.clone();
+        replacement_before[0]["Id"] = json!("replacement-id");
+        assert!(snapshot_container_outcomes(&replacement_before, &replacement, project, Some(&observer)).is_err());
+        after[1]["State"]["ExitCode"] = json!(137);
+        assert!(snapshot_container_outcomes(&before, &after, project, Some(&observer)).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn snapshot_stop_keeps_writer_dependencies_alive_and_rejects_uncertain_custody() -> Result<()> {
         let project = "owned-run";
         let services = ["sqlserver", "arrowcol-catalog", "dataflow-1", "router", "oat-client"];
@@ -14627,24 +14825,24 @@ mod tests {
         }
         after[2]["State"]["ExitCode"] = json!(143);
         assert_eq!(
-            snapshot_container_outcomes(&before, &after, project)?.len(),
+            snapshot_container_outcomes(&before, &after, project, None)?.len(),
             services.len()
         );
         let mut invalid = after.clone();
         invalid[2]["State"]["ExitCode"] = json!(137);
-        assert!(snapshot_container_outcomes(&before, &invalid, project).is_err());
+        assert!(snapshot_container_outcomes(&before, &invalid, project, None).is_err());
         invalid = after.clone();
         invalid[2]["State"]["OOMKilled"] = json!(true);
-        assert!(snapshot_container_outcomes(&before, &invalid, project).is_err());
+        assert!(snapshot_container_outcomes(&before, &invalid, project, None).is_err());
         invalid = after.clone();
         invalid[2]["Id"] = json!("replacement");
-        assert!(snapshot_container_outcomes(&before, &invalid, project).is_err());
+        assert!(snapshot_container_outcomes(&before, &invalid, project, None).is_err());
         invalid = after.clone();
         invalid[2]["Config"]["Labels"]["com.docker.compose.project"] = json!("other-run");
-        assert!(snapshot_container_outcomes(&before, &invalid, project).is_err());
+        assert!(snapshot_container_outcomes(&before, &invalid, project, None).is_err());
         let mut already_failed = before;
         already_failed[2]["State"]["Running"] = json!(false);
-        assert!(snapshot_container_outcomes(&already_failed, &after, project).is_err());
+        assert!(snapshot_container_outcomes(&already_failed, &after, project, None).is_err());
         Ok(())
     }
     #[test]
@@ -15527,6 +15725,8 @@ mod tests {
             router_metrics_url: None,
             collector_metrics_url: None,
             qap_url: None,
+            qap_initialized: false,
+            armed_local_observer: None,
             daemon_endpoint: None,
             shutdown_drain_evidence: None,
             maintenance_cell_baseline: Vec::new(),
@@ -16001,21 +16201,21 @@ mod tests {
         }
 
         after[0]["State"]["ExitCode"] = json!(1);
-        let outcomes = snapshot_container_outcomes(&before, &after, project)?;
+        let outcomes = snapshot_container_outcomes(&before, &after, project, None)?;
         assert!(outcomes[0]["maintenance_operation_failure"].is_null());
         assert!(outcomes[0]["comment"].as_str().is_some());
 
         for exit in [2, 137] {
             let mut invalid = after.clone();
             invalid[0]["State"]["ExitCode"] = json!(exit);
-            assert!(snapshot_container_outcomes(&before, &invalid, project).is_err());
+            assert!(snapshot_container_outcomes(&before, &invalid, project, None).is_err());
         }
         let mut invalid = after.clone();
         invalid[0]["State"]["OOMKilled"] = json!(true);
-        assert!(snapshot_container_outcomes(&before, &invalid, project).is_err());
+        assert!(snapshot_container_outcomes(&before, &invalid, project, None).is_err());
         invalid = after.clone();
         invalid[3]["State"]["ExitCode"] = json!(1);
-        assert!(snapshot_container_outcomes(&before, &invalid, project).is_err());
+        assert!(snapshot_container_outcomes(&before, &invalid, project, None).is_err());
         Ok(())
     }
 

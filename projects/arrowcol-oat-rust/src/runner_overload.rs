@@ -1521,6 +1521,8 @@ mod overload_guard_tests {
                 router_metrics_url: None,
                 collector_metrics_url: None,
                 qap_url: None,
+                qap_initialized: false,
+                armed_local_observer: None,
                 daemon_endpoint: Some("unix:///var/run/docker.sock".to_owned()),
                 shutdown_drain_evidence: None,
                 maintenance_cell_baseline: Vec::new(),
