@@ -162,13 +162,12 @@ async function scalePoolToZero(config: Config, pool: string): Promise<void> {
   }
   if ((await poolNodeCount(config, pool)) === 0 && current.count === 0) return;
   await assertNoWorkloadPodsOnPool(config, pool);
-  await command(['az', 'aks', 'nodepool', 'update', '--subscription', config.subscription,
-    '--resource-group', config.group, '--cluster-name', config.cluster, '--name', pool,
-    '--disable-cluster-autoscaler', '--only-show-errors', '--output', 'none'],
-  `Temporarily disable ${pool} autoscaling`, 600);
-
   let scaleError: Error | undefined;
   try {
+    await command(['az', 'aks', 'nodepool', 'update', '--subscription', config.subscription,
+      '--resource-group', config.group, '--cluster-name', config.cluster, '--name', pool,
+      '--disable-cluster-autoscaler', '--only-show-errors', '--output', 'none'],
+    `Temporarily disable ${pool} autoscaling`, 600);
     await assertNoWorkloadPodsOnPool(config, pool);
     await command(['az', 'aks', 'nodepool', 'scale', '--subscription', config.subscription,
       '--resource-group', config.group, '--cluster-name', config.cluster, '--name', pool,
