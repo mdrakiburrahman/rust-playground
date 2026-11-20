@@ -14756,7 +14756,7 @@ mod tests {
         let observer = ArmedLocalObserver {
             id: "kusto-id".to_owned(),
             started_at: "2026-01-01T00:00:00Z".to_owned(),
-            mounts,
+            mounts: mounts.clone(),
             armed_at: chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:10Z")?.to_utc(),
         };
         let mut before = vec![make("kusto-id", "kusto"), make("collector-id", "dataflow-1")];
