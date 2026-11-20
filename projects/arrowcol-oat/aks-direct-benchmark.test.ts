@@ -10,26 +10,38 @@ function record(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
-test('SQL Server EULA remains a string for YAML 1.1 consumers', async () => {
+test('rendered Kubernetes env values remain strings for YAML 1.1 consumers', async () => {
   const manifestPath = resolve(ROOT, 'experiments/aks-direct-benchmark/arrowcollector-aks-benchmark.yaml');
-  const documents = parseAllDocuments(await readFile(manifestPath, 'utf8'), { version: '1.1' });
-  const values: unknown[] = [];
+  const manifest = await readFile(manifestPath, 'utf8');
+  const rendered = manifest.replaceAll('BENCHSTAMP', '68590');
+  const documents = parseAllDocuments(rendered, { version: '1.1' });
+  const nonStringValues: string[] = [];
+  const eulaValues: unknown[] = [];
 
   for (const document of documents) {
     const resource = record(document.toJSON());
     if (resource.kind !== 'Deployment') continue;
 
+    const metadata = record(resource.metadata ?? {});
+    const resourceName = typeof metadata.name === 'string' ? metadata.name : '(unnamed)';
     const podSpec = record(record(record(resource.spec ?? {}).template ?? {}).spec ?? {});
     if (!Array.isArray(podSpec.containers)) continue;
     for (const container of podSpec.containers) {
-      const env = record(container).env;
+      const containerRecord = record(container);
+      const containerName = typeof containerRecord.name === 'string' ? containerRecord.name : '(unnamed)';
+      const env = containerRecord.env;
       if (!Array.isArray(env)) continue;
       for (const entry of env) {
         const variable = record(entry);
-        if (variable.name === 'ACCEPT_EULA') values.push(variable.value);
+        const variableName = typeof variable.name === 'string' ? variable.name : '(unnamed)';
+        if (variable.value !== undefined && typeof variable.value !== 'string') {
+          nonStringValues.push(`${resourceName}/${containerName}/${variableName}`);
+        }
+        if (variableName === 'ACCEPT_EULA') eulaValues.push(variable.value);
       }
     }
   }
 
-  assert.deepEqual(values, ['Y']);
+  assert.deepEqual(nonStringValues, []);
+  assert.deepEqual(eulaValues, ['Y']);
 });

@@ -645,7 +645,7 @@ spec:
             - name: AZURE_SUBSCRIPTION_ID
               value: BENCHSUBSCRIPTION
             - name: AZURE_STAMP
-              value: BENCHSTAMP
+              value: "BENCHSTAMP"
             - name: AZURE_RESOURCE_GROUP
               value: BENCHRESOURCEGROUP
             - name: AZURE_STORAGE_ACCOUNT
@@ -965,7 +965,7 @@ spec:
             - name: AZURE_SUBSCRIPTION_ID
               value: BENCHSUBSCRIPTION
             - name: AZURE_STAMP
-              value: BENCHSTAMP
+              value: "BENCHSTAMP"
             - name: AZURE_RESOURCE_GROUP
               value: BENCHRESOURCEGROUP
             - name: AZURE_STORAGE_ACCOUNT
@@ -1084,7 +1084,7 @@ spec:
             - name: AZURE_SUBSCRIPTION_ID
               value: BENCHSUBSCRIPTION
             - name: AZURE_STAMP
-              value: BENCHSTAMP
+              value: "BENCHSTAMP"
             - name: AZURE_RESOURCE_GROUP
               value: BENCHRESOURCEGROUP
             - name: AZURE_STORAGE_ACCOUNT
@@ -1243,7 +1243,7 @@ spec:
             - name: AZURE_SUBSCRIPTION_ID
               value: BENCHSUBSCRIPTION
             - name: AZURE_STAMP
-              value: BENCHSTAMP
+              value: "BENCHSTAMP"
             - name: AZURE_RESOURCE_GROUP
               value: BENCHRESOURCEGROUP
             - name: AZURE_STORAGE_ACCOUNT
