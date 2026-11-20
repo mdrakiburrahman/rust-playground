@@ -2,12 +2,59 @@ import { createHash } from 'node:crypto';
 import { constants } from 'node:fs';
 import { open } from 'node:fs/promises';
 import { canonical_json, type Azure } from './bootstrap.js';
-import { requireEvidence } from './benchmark-evidence-json.js';
+import { evidenceList, evidenceObject, requireEvidence } from './benchmark-evidence-json.js';
 import type { DirectStopOrigin } from './benchmark-stop-patch.js';
 import type { RunCleanupAuthority } from './run_fic.js';
 
 const CHUNK_BYTES = 4 * 1024 ** 2;
 const sha256 = (bytes: Buffer) => createHash('sha256').update(bytes).digest('hex');
+export const directEvidencePrefix = (origin: Pick<DirectStopOrigin, 'runId' | 'namespaceUid'>) =>
+  `_arrowcol-custody/direct/${origin.runId}/${origin.namespaceUid}/evidence`;
+
+export interface DirectEvidenceSeal { path: string; etag: string; bytes: number; sha256: string }
+
+export async function readDirectEvidenceSeal(azure: Azure, authority: RunCleanupAuthority, origin: DirectStopOrigin,
+  expected?: DirectEvidenceSeal): Promise<DirectEvidenceSeal | undefined> {
+  const path = `${directEvidencePrefix(origin)}/seal.json`;
+  await authority.assertCurrent();
+  const [bytes, headers] = await azure.blob('GET', azure.c.checkpoints, path, undefined, undefined,
+    expected ? { 'If-Match': expected.etag } : {}, !expected, true);
+  if (!expected && bytes === null && Object.keys(headers).length === 0) return undefined; // Azure.blob missing_ok maps only 404 to this pair.
+  requireEvidence(bytes && bytes.length <= 8 * 1024 ** 2 && headers[':status'] === '200' &&
+    headers.etag && /^"[^"\r\n]+"$/.test(headers.etag), 'Terminal evidence seal read outcome is unknown');
+  const seal = { path, etag: headers.etag, bytes: bytes.length, sha256: sha256(bytes) };
+  if (expected) {
+    requireEvidence(canonical_json(seal) === canonical_json(expected), 'Terminal evidence seal changed');
+    return seal;
+  }
+  const manifest: unknown = JSON.parse(bytes.toString('utf8'));
+  const body = evidenceObject(manifest);
+  requireEvidence(body.schema_version === 2 && canonical_json(body.origin) === canonical_json(origin) &&
+    bytes.equals(Buffer.from(canonical_json(body))), 'No verified seal for the original direct run');
+  const files = evidenceList(body.files).map(evidenceObject);
+  for (const file of files) {
+    requireEvidence(typeof file.key === 'string' && /^[a-z0-9][a-z0-9_.-]{0,127}$/.test(file.key) &&
+      typeof file.bytes === 'number' && Number.isSafeInteger(file.bytes) && file.bytes >= 0 &&
+      file.bytes < 4 * 1024 ** 3 && typeof file.sha256 === 'string' && /^[a-f0-9]{64}$/.test(file.sha256),
+    'Invalid sealed evidence file identity');
+    const chunks = evidenceList(file.chunks).map(evidenceObject);
+    requireEvidence(chunks.length === Math.max(1, Math.ceil(file.bytes / CHUNK_BYTES)) &&
+      chunks.every((chunk, index) =>
+        chunk.path === `${directEvidencePrefix(origin)}/${file.key}/${String(index).padStart(6, '0')}` &&
+        chunk.bytes === Math.min(CHUNK_BYTES, (file.bytes as number) - index * CHUNK_BYTES) &&
+        typeof chunk.etag === 'string' && /^"[^"\r\n]+"$/.test(chunk.etag) &&
+        typeof chunk.sha256 === 'string' && /^[a-f0-9]{64}$/.test(chunk.sha256)),
+    'Invalid sealed evidence chunk identities');
+  }
+  const keys = new Set(files.map(file => file.key));
+  requireEvidence(keys.size === files.length && keys.has('direct-terminal.json') && keys.has('writer-stdout.raw') &&
+    keys.has('writer-stderr.raw') && Array.from({ length: origin.clients }, (_, index) => index)
+      .every(index => keys.has(`client-${index}-stdout.raw`) && keys.has(`client-${index}-stderr.raw`)),
+  'The original seal does not identify all required evidence streams');
+  await authority.assertCurrent();
+  return seal;
+}
+
 export interface CapturedEvidence {
   key: string;
   path: string;
@@ -20,13 +67,13 @@ export interface CapturedEvidence {
  * immutable unsealed evidence; it never creates a successful bundle.
  */
 export async function persistDirectEvidence(azure: Azure, authority: RunCleanupAuthority,
-  origin: DirectStopOrigin, files: readonly CapturedEvidence[]) {
+  origin: DirectStopOrigin, files: readonly CapturedEvidence[], verifyTerminal: () => Promise<void>) {
   const uuid = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/;
   requireEvidence([origin.runId, origin.namespaceUid, origin.owner, origin.cloudGeneration].every(s => uuid.test(s)) &&
     Number.isSafeInteger(origin.fencingToken) && origin.fencingToken > 0 && /^[a-f0-9]{40}$/.test(origin.sourceRevision),
   'Direct evidence custody has no exact run origin');
   requireEvidence(files.length > 0 && new Set(files.map(item => item.key)).size === files.length, 'Direct evidence keys are incomplete or duplicated');
-  const prefix = `_arrowcol-custody/direct/${origin.runId}/${origin.namespaceUid}/evidence`;
+  const prefix = directEvidencePrefix(origin);
   const writeVerified = async (path: string, bytes: Buffer) => {
     await authority.assertCurrent();
     const [, response] = await azure.blob('PUT', azure.c.checkpoints, path, undefined, bytes,
@@ -68,7 +115,8 @@ export async function persistDirectEvidence(azure: Azure, authority: RunCleanupA
       preserved.push({ key: input.key, bytes: input.bytes, sha256: input.sha256, chunks });
     } finally { await reader.close(); }
   }
-  const content = Buffer.from(canonical_json({ schema_version: 1, origin, files: preserved }));
+  const content = Buffer.from(canonical_json({ schema_version: 2, origin, files: preserved }));
   requireEvidence(content.length <= 8 * 1024 ** 2, 'Evidence directory is too large to seal');
+  await verifyTerminal();
   return writeVerified(`${prefix}/seal.json`, content);
 }

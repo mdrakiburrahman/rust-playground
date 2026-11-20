@@ -91,7 +91,8 @@ export function directParquetConfig(log: string) {
 
 /** Call only with the approved immutable release pins and an existing exclusive run authority. */
 export async function armDirectBenchmark(azure: Azure, campaign: DirectCampaignScope, origin: DirectStopOrigin,
-  release: DirectRelease, context: string, ficRecordPath: string, baselineDirectory: string): Promise<DirectTerminalArm> {
+  release: DirectRelease, context: string, ficRecordPath: string, baselineDirectory: string,
+  assertInventory?: (arm: DirectTerminalArm) => Promise<void>): Promise<DirectTerminalArm> {
   const authority = directProducerAuthority(campaign, origin);
   requireEvidence([origin.runId, origin.namespaceUid, origin.owner, origin.cloudGeneration].every(id => uuid.test(id)) &&
     Number.isSafeInteger(origin.fencingToken) && origin.fencingToken > 0 && /^[a-z0-9-]+$/.test(origin.namespace) &&
@@ -217,6 +218,7 @@ export async function armDirectBenchmark(azure: Azure, campaign: DirectCampaignS
   const path = directArmRecordPath(origin);
   const raw = Buffer.from(canonical_json(arm));
   await guard();
+  await assertInventory?.(arm);
   const [, stored] = await azure.blob('PUT', azure.c.checkpoints, path, undefined, raw,
     { 'If-None-Match': '*', 'x-ms-blob-type': 'BlockBlob' }, false, true);
   requireEvidence(stored[':status'] === '201' && stored.etag && /^"[^"\r\n]+"$/.test(stored.etag),
@@ -233,6 +235,7 @@ export async function armDirectBenchmark(azure: Azure, campaign: DirectCampaignS
     canonical_json(observeRouterLifetimes(origin, routerUid, release.images.router,
       await get('daemonset', 'arrowcol-router'), await get('pods', '-l', 'app=arrowcol-router'))) === canonical_json(routers) &&
     Date.now() <= prepared.runStartUnixMs - 30_000, 'Original lifetimes, pending schedule or release lead time changed');
+  await assertInventory?.(arm);
   await checkPublisher();
   const response = evidenceObject(JSON.parse(await run('patch', 'configmap', 'direct-schedule-confirmwide', '--type=json',
     '--patch', JSON.stringify(prepared.patch), '-o', 'json')));

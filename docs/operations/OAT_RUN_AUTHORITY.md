@@ -204,6 +204,38 @@ replay, rebinding or destructive repair.
 
 The direct runner is a production entrypoint, not an OAT measurement engine or a readiness waiver. It requires the existing private bootstrap environment and ARM-hydrated stamp, the durable active/armed campaign and RunInventory, the exact ready run-FIC record, a private kubeconfig, and a private release file with six immutable image references. All private files must be regular files without group/other permissions; output directories must already exist with mode 0700. The explicit kubeconfig must agree with any configured process/environment value. No secrets are emitted.
 
+Use the stock campaign custody CLI for setup; do not start the OAT measurement engine. The
+following commands are **only** for an independently cleared live run. Keep the existing
+authorized campaign heartbeat fresh throughout the run and cleanup. For a new campaign:
+
+```bash
+campaign() {
+  npx --no-install tsx projects/arrowcol-oat/aks-campaign.ts "$@" \
+    --env-file "$BOOTSTRAP_ENV" --stamp-config "$STAMP_CONFIG"
+}
+campaign start "$CAMPAIGN_ID" "$CAMPAIGN_OWNER_ID"
+# Use the actual start receipt's ID/owner/token as CAMPAIGN_ID, CAMPAIGN_OWNER_ID,
+# CAMPAIGN_FENCING_TOKEN in the private environment.
+campaign publish-inventory < "$INITIAL_INVENTORY"
+campaign capture-baseline "$CAMPAIGN_OWNER_ID" "$CAMPAIGN_FENCING_TOKEN"
+campaign arm "$CAMPAIGN_OWNER_ID" "$CAMPAIGN_FENCING_TOKEN"
+```
+
+Publish the initial `not_authorized` inventory with planned duration and maintenance stop
+budgets, no namespace UID, and no completed cleanup steps. Record the original plan from
+`bootstrap.ts plan-run-fic` before creating the namespace. Follow the
+[staged YAML runbook](../../infra/azure/arrowcollector-breakthrough.yaml) for setup and the
+exact FIC token probe, leaving the schedule barrier closed. After the staged readiness checks,
+publish `authorization_pending`, then separately publish `authorized` after actual operator
+admission, using `campaign publish-inventory < "$INVENTORY_FILE"` each time. Bind the three
+observed objects and their original UIDs: `apps/v1 Deployment/arrowcol` (`collector`),
+`apps/v1 Deployment/delta-maintenance` (`maintenance`), and
+`batch/v1 Job/direct-load-confirmwide` (`client`). Keep `qap: null`, no official OAT
+measurement reference, and bind the actual namespace UID, original FIC and checkpoints
+destination `_arrowcol-custody/direct/<run-id>/<namespace-uid>/evidence`.
+The direct armer proves the live identities before release; stock `assert-ready` is for
+QAP-bound OAT cells, not this direct run.
+
 The release file has exactly this shape (all six references must be `repository@sha256:<64 lowercase hex>`; `revision` identifies the workload-image build source, not the successor controller commit):
 
 ```json
@@ -231,19 +263,33 @@ npx --no-install tsx infra/azure/benchmark-direct-cli.ts arm \
 
 `--clients` is an explicit workload-shape expectation; the existing armer re-reads the live Job, Pods and lifetimes and refuses a mismatch. The direct armer checks the durable campaign fence and FIC, release digests, startup config, transport and clock evidence, then writes the original arm record conditionally and verifies exact off-node bytes/ETag before any barrier release. A lost or ambiguous write/release is an error, not permission to retry.
 
-After the original measurement interval has ended, run the terminal path exactly once with the same authority, FIC, release, kubeconfig and context:
+After the original measurement interval has ended, run the terminal path with the original
+run ID and the same authority, private evidence directories, FIC, release, kubeconfig and context:
 
 ```bash
 npx --no-install tsx infra/azure/benchmark-direct-cli.ts finish \
   --env-file "$BOOTSTRAP_ENV" --stamp-config "$STAMP_CONFIG" \
   --fic-record "$FIC_RECORD" --release-file "$DIRECT_RELEASE" \
   --kubeconfig "$KUBECONFIG" --context "$KUBE_CONTEXT" \
-  --terminal-directory "$TERMINAL_DIR" --delta-directory "$DELTA_DIR"
+  --run-id "$RUN_ID" --terminal-directory "$TERMINAL_DIR" --delta-directory "$DELTA_DIR"
 ```
 
-`finish` reloads the immutable arm record from off-node custody, binds it to the current durable campaign and release, then uses the existing terminal-custody path to read original-run state, stop/fence workloads, capture raw logs and Delta history, reconcile terminal state, seal evidence, delete only the matching namespace UID, and remove only its recorded FIC. It does not create workload resources or mark throughput qualified. If any mutation outcome is unknown, stop and inspect the durable journal plus live state before any recovery action; never replay a command, delete by namespace name alone, or treat empty gauges as drain proof. The actual live run still requires separate execution clearance and all YAML `NOT RUN-READY` gates.
+`finish` reloads the immutable arm record, proves original-run stop and drain, seals raw
+logs and Delta evidence, deletes only the matching namespace UID, then removes only its
+recorded FIC. It reconciles the ordered cleanup milestones through the existing cell-step
+journal and CampaignStore compare-and-swap and returns `handoffEtag` only after durable
+`RunInventory.cleanup.handoff=complete`. This is a per-cell handoff, not a campaign-wide
+safe-idle or throughput qualification claim. Before another cell, complete the independent
+publisher-generation, cluster-scoped StorageClass, data preservation, and safe-idle
+checks in the staged runbook; never delete Delta data.
 
-The direct CLI does not rewrite CampaignStore cleanup milestones or mark RunInventory handoff complete. The authorized OAT controller must still reconcile the existing cleanup-step sequence with its durable cleanup envelope; do not fabricate a caller-supplied PASS or skip that handoff.
+Never run two `finish` processes for the same cell. After an interruption inspect the
+original durable journals and current fence before resuming the same explicit run ID.
+A verified seal, positive UID-fenced namespace response and completed FIC transaction
+allow reconciliation without redispatch. Intent-only or otherwise ambiguous effects,
+including an unresolved FIC transaction, still block; never infer success from absence,
+delete by name, or substitute empty gauges for drain evidence. The live run still requires
+separate execution clearance and all YAML `NOT RUN-READY` gates.
 
 ## Qualification
 

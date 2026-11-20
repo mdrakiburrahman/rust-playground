@@ -912,6 +912,31 @@ export async function find_run_fic_record(azure: Azure, plan: RunFicPlan, author
     throw new Failure('A successor FIC exists after recorded deletion; never adopt it.');
   return entry.record;
 }
+export async function assert_owned_namespace_absent(record: RunNamespaceIdentity, authority: RunCleanupAuthority): Promise<void> {
+  await authority.assertCurrent();
+  const remaining = await kubectl(record, ['get', 'namespace', record.namespace, '--ignore-not-found', '--output', 'name']);
+  if (remaining) throw new Failure('A namespace exists after the positive original deletion; retain cleanup custody.');
+  await authority.assertCurrent();
+}
+
+/** Verify the completed original ARM deletion and absence, not merely a missing credential. */
+export async function observe_run_fic_cleanup(azure: Azure, original: RunFicRecord,
+  authority: RunCleanupAuthority): Promise<'ready' | 'deleted'> {
+  await authority.assertCurrent();
+  const snapshot = await read_ledger(azure), entry = snapshot?.value.entries[original.runId];
+  if (snapshot?.value.transaction?.phase !== 'complete' || !entry ||
+      (entry.record.phase !== 'ready' && entry.record.phase !== 'deleted') ||
+      canonical_json({ ...entry.record, phase: original.phase }) !== canonical_json(original))
+    throw new Failure('Exact original FIC transaction is unresolved; never replay a DELETE.');
+  assert_owned_entry(entry, entry.record);
+  if (entry.record.phase === 'deleted' &&
+      await azure.arm('GET', original.identityId + '/federatedIdentityCredentials/' + original.credentialName,
+        undefined, true, ARM_API) !== null)
+    throw new Failure('A credential exists after confirmed cleanup; never adopt or delete a successor.');
+  await authority.assertCurrent();
+  return entry.record.phase;
+}
+
 export async function cleanup_run_fic(azure: Azure, runId: string, recordPath: string,
   authority?: RunCleanupAuthority): Promise<void> {
   uuid(runId);

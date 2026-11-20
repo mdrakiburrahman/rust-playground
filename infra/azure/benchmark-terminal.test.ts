@@ -284,7 +284,7 @@ test('seals only read-back-verified original bytes and refuses an altered input'
         },
       } as unknown as Parameters<typeof persistDirectEvidence>[0];
       const result = persistDirectEvidence(azure, { assertCurrent: async () => {} }, origin,
-        [{ key: 'writer-stderr.raw', bytes: raw.length, sha256: failure === 'source' ? '0'.repeat(64) : sha256, path }]);
+        [{ key: 'writer-stderr.raw', bytes: raw.length, sha256: failure === 'source' ? '0'.repeat(64) : sha256, path }], async () => {});
       if (failure === 'none') {
         assert.match((await result).path, /\/seal\.json$/);
         const [first, second] = [...blobs.values()];

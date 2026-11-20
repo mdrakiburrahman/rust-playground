@@ -53,6 +53,8 @@ export function create_namespace_deletion_journal(azure: Azure, input: RunNamesp
     const prior = await read(), rank = { intent: 0, responded: 1, complete: 2 };
     if (canonical_json(value.intent) !== canonical_json(intent)) throw new Failure('Namespace journal write identity changed.');
     if (prior && rank[prior.value.phase] >= rank[value.phase]) {
+      if (value.phase === 'intent')
+        throw new Failure('Namespace DELETE intent already exists; never dispatch it twice.');
       if (value.response !== null && canonical_json(value.response) !== canonical_json(prior.value.response) ||
           value.receipt !== null && canonical_json(value.receipt) !== canonical_json(prior.value.receipt))
         throw new Failure('Namespace journal proof is immutable.');

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import { delimiter, join } from 'node:path';
@@ -6,12 +7,14 @@ import test, { type TestContext } from 'node:test';
 import { Azure, Config, Failure, HttpFailure, TAGS, canonical_json, runtime, type HttpReceipt } from './bootstrap.js';
 import { armDirectBenchmark, type DirectRelease } from './benchmark-direct-arm.js';
 import { runDirectBenchmarkCli } from './benchmark-direct-cli.js';
+import { directEvidencePrefix } from './benchmark-evidence-custody.js';
 import { directArmRecordPath, finishDirectTerminalCustody } from './benchmark-terminal-custody.js';
 import { prepare_run_fic, read_run_fic_record, run_fic_ledger_path } from './run_fic.js';
 import { ENCODING, MAX_RECORDS } from './benchmark-manifest-audit.js';
 import { parseEvidence } from './benchmark-evidence-json.js';
 import { fakeKubectl } from './benchmark-direct-e2e.fixture.js';
-import type { CampaignStore, StoredCampaign } from '../../projects/arrowcol-oat/aks-campaign.js';
+import { CampaignConflictError, newCampaignState, publishRunInventory, validateCampaignState,
+  type CampaignStore, type InventoryStep, type RunInventory } from '../../projects/arrowcol-oat/aks-campaign.js';
 
 const uuid = (n: number) => `00000000-0000-0000-0000-${String(n).padStart(12, '0')}`;
 const origin = { runId: uuid(1), owner: uuid(2), namespaceUid: uuid(3), cloudGeneration: uuid(4),
@@ -172,6 +175,7 @@ async function fixture(t: TestContext, fault: Fault) {
     throw new Error('Unhandled fake ARM read ' + resource);
   });
   t.mock.method(azure, 'collection', async () => [native, ...(credential ? [structuredClone(credential)] : [])]);
+  let loseNamespaceReceipt = false;
   const blob: Azure['blob'] = async (method, container, path = '', query, body, headers = {}, _missing, _idempotent, capture): ReturnType<Azure['blob']> => {
     record('blob', { method, container, path });
     if (container === c.data) {
@@ -231,6 +235,11 @@ async function fixture(t: TestContext, fault: Fault) {
     stored.set(path, { bytes, etag });
     if (path === directArmRecordPath(origin)) { record('arm-write'); if (fault === 'arm-write-unknown') throw new Failure('Injected arm write response lost'); }
     if (path.endsWith('/seal.json')) { record('seal-write'); if (fault === 'seal-unknown') throw new Failure('Injected seal response lost'); }
+    if (loseNamespaceReceipt && path.startsWith('_arrowcol-custody/namespaces/') &&
+        JSON.parse(bytes.toString()).phase === 'complete') {
+      loseNamespaceReceipt = false;
+      throw new Failure('Injected completed namespace journal acknowledgement lost');
+    }
     const receipt = { status: 201, bodyBase64: '', headers: { etag, 'x-ms-request-id': 'fixture-put' } };
     capture?.(receipt); return [null, { ':status': '201', ...receipt.headers }];
   };
@@ -303,13 +312,43 @@ async function fixture(t: TestContext, fault: Fault) {
       annotations: { 'azure.workload.identity/client-id': uuid(80) } } }), stderr: '' };
   });
   await prepare_run_fic(azure, origin.runId, origin.namespace, 'arrowcol-oat', ficPath);
-  const campaignState = { status: 'active', mode: 'armed', campaignId: uuid(5), ownerId: origin.owner, fencingToken: 1,
-    heartbeatAtMs: now - 1, expiresAtMs: now + 3_600_000, runInventory: { campaign_id: uuid(5), owner_id: origin.owner,
-      cell_run_id: origin.runId, fencing_token: 1, namespace: { name: origin.namespace, uid: origin.namespaceUid, owner_token: origin.owner },
-      load_admission: 'authorized', fic: { state: 'observed' }, qap: null, cleanup: { handoff: { state: 'pending' } } } };
-  const store: CampaignStore = { read: async () => { campaignState.heartbeatAtMs = now - 1;
-    return { state: campaignState, etag: '"campaign"' } as StoredCampaign; },
-    write: async () => { throw new Error('Rehearsal must not rewrite producer authority'); } };
+  let campaignState = newCampaignState(uuid(5), origin.owner, now - 1000), campaignVersion = 0;
+  campaignState.mode = 'armed';
+  let loseBookkeeping = false, fenced = false;
+  const campaignEtag = () => `"campaign-${campaignVersion}"`;
+  const store: CampaignStore = { read: async () => ({ state: structuredClone(campaignState), etag: campaignEtag() }),
+    write: async (next, expected) => {
+      if (expected !== campaignEtag()) throw new CampaignConflictError();
+      campaignState = structuredClone(validateCampaignState(next));
+      const etag = `"campaign-${++campaignVersion}"`;
+      if (loseBookkeeping && next.runInventory?.fic?.state === 'removed') {
+        loseBookkeeping = false;
+        throw new Error('Injected campaign bookkeeping response loss after FIC removal');
+      }
+      return etag;
+    } };
+  const untouched = (): InventoryStep => ({ state: 'not_started', deadline_unix_ms: null, reason_code: null });
+  const recordFic = read_run_fic_record(ficPath, c);
+  const resources: RunInventory['resources'] = [
+    { api_version: 'apps/v1', kind: 'Deployment', name: 'arrowcol', role: 'collector' },
+    { api_version: 'apps/v1', kind: 'Deployment', name: 'delta-maintenance', role: 'maintenance' },
+    { api_version: 'batch/v1', kind: 'Job', name: 'direct-load-confirmwide', role: 'client' },
+  ].map(resource => ({ ...resource, role: resource.role as RunInventory['resources'][number]['role'],
+    namespace: origin.namespace, uid: null, absence: null, state: 'planned' }));
+  const initial: RunInventory = { schema_version: 1, campaign_id: uuid(5), owner_id: origin.owner, orchestration_run_id: uuid(6),
+    cell_run_id: origin.runId, fencing_token: 1, namespace: { name: origin.namespace, uid: null, owner_token: origin.owner },
+    load_admission: 'not_authorized', resources, fic: { state: 'planned', resource_id: null, name: null, absence: null }, qap: null,
+    cleanup: { stop_admission: untouched(), bounded_drain: untouched(), evidence_capture: untouched(),
+      stop_maintenance: untouched(), terminal_capture: untouched(), handoff: untouched() },
+    planned_cell_duration_ms: 600_000, effective_stop_budgets: { maintenance_grace_seconds: 90, maintenance_stop_timeout_ms: 390_000 } };
+  await publishRunInventory(store, initial);
+  const observed: RunInventory = { ...initial, namespace: { ...initial.namespace, uid: origin.namespaceUid },
+    resources: resources.map(resource => ({ ...resource, state: 'observed', uid: state.objects[`${resource.kind.toLowerCase()}/${resource.name}`].metadata.uid })),
+    evidence_destination: { account: c.account, container: c.checkpoints, blob_prefix: directEvidencePrefix(origin) },
+    fic: { state: 'observed', resource_id: `${recordFic.identityId}/federatedIdentityCredentials/${recordFic.credentialName}`,
+      name: recordFic.credentialName, absence: null }, load_admission: 'authorization_pending' };
+  await publishRunInventory(store, observed);
+  await publishRunInventory(store, { ...observed, load_admission: 'authorized' });
   const campaign = { store, campaignId: uuid(5), ownerId: origin.owner };
   const cliEnvironment = { ...process.env, CAMPAIGN_ID: uuid(5), CAMPAIGN_OWNER_ID: origin.owner, CAMPAIGN_FENCING_TOKEN: '1' };
   const envFile = join(directory, 'bootstrap.env'), stampFile = join(directory, 'stamp.yaml');
@@ -320,7 +359,7 @@ async function fixture(t: TestContext, fault: Fault) {
   const cliArgs = (action: 'arm' | 'finish' = 'arm') => [action, '--env-file', envFile, '--stamp-config', stampFile,
     '--fic-record', ficPath, '--release-file', releaseFile, '--kubeconfig', kubeconfig, '--context', 'fixture',
     ...(action === 'arm' ? ['--clients', '1', '--baseline-directory', baseline] :
-      ['--terminal-directory', terminal, '--delta-directory', delta])];
+      ['--run-id', origin.runId, '--terminal-directory', terminal, '--delta-directory', delta])];
   const runCli = (action: 'arm' | 'finish' = 'arm', selectedStore: CampaignStore = store, extraArgs: string[] = []) => {
     const args = cliArgs(action);
     for (let index = 0; index < extraArgs.length; index += 2) {
@@ -335,6 +374,7 @@ async function fixture(t: TestContext, fault: Fault) {
     assert.equal(current.objects['configmap/direct-schedule-confirmwide'].data.start, String(armed.startMs - 60_000));
     Object.assign(state, current);
     now = armed.endMs + 1000; state.now = now; state.loaded = true;
+    campaignState.heartbeatAtMs = now - 1;
     const generated = loadEvidence(armed.startMs, armed.endMs, fault === 'clock-boundary' ? armed.endMs - 50 : undefined); state.logs = generated.logs; commits.push(generated.commit);
     const p = state.objects['pod/client-0'], cs = p.status.containerStatuses[0];
     cs.state = { terminated: { startedAt: cs.state.running.startedAt, finishedAt: new Date(now).toISOString(),
@@ -346,7 +386,11 @@ async function fixture(t: TestContext, fault: Fault) {
     if (fault === 'fic-replaced') credential!.systemData.createdAt = new Date(initialNow + 1000).toISOString();
     save(); record('load');
   };
-  return { arm, runCli, releaseFile, load, finish: (armed: Awaited<ReturnType<typeof arm>>) =>
+  return { arm, runCli, cliArgs, releaseFile, load, store, loseBookkeeping: () => { loseBookkeeping = true; },
+    loseNamespaceReceipt: () => { loseNamespaceReceipt = true; },
+    staleAuthority: (expired: boolean) => { if (!fenced && expired) campaignState.heartbeatAtMs = now - 180_000;
+      else if (fenced && !expired) campaignState.heartbeatAtMs = now - 1; fenced = expired; },
+    finish: (armed: Awaited<ReturnType<typeof arm>>) =>
     finishDirectTerminalCustody(azure, campaign, armed, 'fixture', terminal, delta, ficPath), events, stored, terminal, ficPath,
     namespaceAbsent: () => namespaceAbsent, credential: () => credential, control: () => control };
 }
@@ -358,10 +402,56 @@ test('production direct CLI preserves durable arm readback before barrier releas
   f.load(armed.arm);
   const finished = await f.runCli('finish');
   assert.equal(finished.action, 'finish');
+  const completed = (await f.store.read())!;
+  assert.equal(completed.etag, finished.handoffEtag);
+  assert.ok(Object.values(completed.state.runInventory!.cleanup).every(step => step.state === 'complete'));
+  assert.ok(completed.state.runInventory!.resources.every(resource => resource.state === 'removed'));
+  assert.equal(completed.state.runInventory!.fic?.state, 'removed');
+  assert.equal(JSON.parse(f.stored.get(`_arrowcol-custody/campaigns/${uuid(5)}/cells/${origin.runId}/handoff.json`)!.bytes.toString()).phase, 'complete');
   const events = f.events(), index = (name: string) => events.findIndex(e => e.event === name);
   assert.ok(index('arm-readback') >= 0 && index('arm-readback') < index('release'));
   assert.ok(index('seal-readback') < index('namespace-delete'));
   assert.ok(index('namespace-positive') < index('namespace-absence') && index('namespace-absence') < index('fic-delete'));
+});
+
+test('real direct executable rejects malformed arguments and private config with nonzero exit', async t => {
+  const f = await fixture(t, 'none');
+  const executable = join(process.cwd(), 'node_modules', 'tsx', 'dist', 'cli.mjs');
+  const invoke = (...args: string[]) => spawnSync(process.execPath, [executable, 'infra/azure/benchmark-direct-cli.ts', ...args],
+    { encoding: 'utf8', timeout: 15_000, env: Object.fromEntries(Object.entries(process.env).filter(([key]) => key !== 'KUBECONFIG')) });
+  for (const [args, expected] of [[['finish'], /missing a required option/], [f.cliArgs('arm'), /configuration|stamp/i]] as const) {
+    const output = invoke(...args);
+    assert.ifError(output.error);
+    assert.equal(output.status, 1, output.stderr);
+    assert.match(output.stderr, expected);
+    assert.equal(output.stdout, '');
+  }
+});
+
+test('direct finish reconciles a committed seal and FIC bookkeeping interruption without mutation replay', async t => {
+  const f = await fixture(t, 'seal-unknown');
+  const armed = await f.runCli();
+  assert.equal(armed.action, 'arm');
+  f.load(armed.arm);
+  await assert.rejects(f.runCli('finish'), /seal response lost/);
+  assert.equal(f.namespaceAbsent(), false);
+  f.loseNamespaceReceipt();
+  await assert.rejects(f.runCli('finish'), /namespace journal acknowledgement lost/);
+  assert.equal(f.namespaceAbsent(), true);
+  assert.notEqual(f.credential(), null);
+  f.loseBookkeeping();
+  await assert.rejects(f.runCli('finish'), /unknown/i);
+  assert.equal(f.namespaceAbsent(), true);
+  assert.equal(f.credential(), null);
+  f.staleAuthority(true);
+  await assert.rejects(f.runCli('finish'), /fenced/i);
+  f.staleAuthority(false);
+  await assert.rejects(f.runCli('finish', f.store, ['--run-id', uuid(99)]), /does not authorize/);
+  const completed = await f.runCli('finish');
+  assert.equal(completed.action, 'finish');
+  assert.equal((await f.store.read())!.state.runInventory!.cleanup.handoff.state, 'complete');
+  for (const event of ['seal-write', 'namespace-delete', 'fic-delete'])
+    assert.equal(f.events().filter(record => record.event === event).length, 1, event);
 });
 
 test('production direct CLI rejects missing authority and bad pins before mutation', async t => {

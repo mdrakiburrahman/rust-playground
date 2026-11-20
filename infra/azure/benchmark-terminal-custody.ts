@@ -10,8 +10,9 @@ import { ClockEvidenceError, directClockOffsets, type DirectClockReading } from 
 import { auditEvidenceFiles, evidenceJson } from './benchmark-audit.js';
 import { observeCompletedClients } from './benchmark-client-terminal.js';
 import { captureFrozenDelta, type DirectDeltaBaseline } from './benchmark-delta-evidence.js';
-import { persistDirectEvidence, type CapturedEvidence } from './benchmark-evidence-custody.js';
+import { persistDirectEvidence, readDirectEvidenceSeal, type CapturedEvidence, type DirectEvidenceSeal } from './benchmark-evidence-custody.js';
 import { evidenceList, evidenceObject, evidenceText, requireEvidence } from './benchmark-evidence-json.js';
+import { NOT_QUALIFIED } from './benchmark-manifest-audit.js';
 import { readDirectPodExit, stopDirectPodWithExit } from './benchmark-pod-exit.js';
 import { acceptRouterFencePatch, observeRouterLifetimes, routerFenceObserved } from './benchmark-router-fence.js';
 import type { DirectReconciliationTiming } from './benchmark-reconcile.js';
@@ -21,7 +22,8 @@ import { observeStoppedWriterRegistration, readWriterRegistrations, type WriterR
 import { clientLogExportPod, exportClientLogs, exportWriterLogs, writerLogExportPod } from './benchmark-writer-export.js';
 import { canonical_json, Failure, type Azure } from './bootstrap.js';
 import { FENCED, READY, PublisherControl } from './publisher_control.js';
-import { cleanup_run_fic, delete_owned_namespace, read_run_fic_record, type RunCleanupAuthority, type RunNamespaceIdentity } from './run_fic.js';
+import { assert_owned_namespace_absent, cleanup_run_fic, delete_owned_namespace, observe_run_fic_cleanup, read_run_fic_record,
+  type RunCleanupAuthority, type RunNamespaceIdentity } from './run_fic.js';
 
 type Stop = Awaited<ReturnType<typeof persistDirectStopPatch>>;
 type RouterEndpoints = Parameters<typeof routerFenceObserved>[5];
@@ -186,14 +188,14 @@ export const directArmRecordPath = (origin: DirectStopOrigin) =>
 export async function finishDirectTerminalCustody(azure: Azure, campaign: DirectCampaignScope, arm: DirectTerminalArm,
   context: string, directory: string, deltaDirectory: string, ficRecordPath: string) {
   const { origin } = arm;
-  const authority = directProducerAuthority(campaign, origin);
+  const authority = directProducerAuthority(campaign, origin, 'finish');
   const dir = await lstat(directory);
   requireEvidence(dir.isDirectory() && (dir.mode & 0o077) === 0, 'Terminal custody directory is not private');
   requireEvidence(Number.isSafeInteger(arm.startMs) && Number.isSafeInteger(arm.endMs) &&
     arm.startMs > 0 && arm.endMs > arm.startMs && arm.endMs <= Date.now(), 'Direct measurement clock bounds are invalid');
   const fic = read_run_fic_record(ficRecordPath, azure.c);
   requireEvidence(fic.runId === origin.runId && fic.namespace === origin.namespace && fic.namespaceUid === origin.namespaceUid &&
-    fic.namespaceOwner === origin.owner && fic.phase === 'ready', 'Run FIC does not identify this original namespace');
+    fic.namespaceOwner === origin.owner && (fic.phase === 'ready' || fic.phase === 'deleted'), 'Run FIC does not identify this original namespace');
   const identity: RunNamespaceIdentity = { version: 1, runId: fic.runId, namespace: fic.namespace, namespaceUid: fic.namespaceUid,
     namespaceOwner: fic.namespaceOwner, aksId: fic.aksId, server: fic.server };
   const armRecordPath = directArmRecordPath(origin);
@@ -246,6 +248,9 @@ export async function finishDirectTerminalCustody(azure: Azure, campaign: Direct
     return { router, routerPods, routerEndpoints: { 'arrowcol-router': service, 'arrowcol-router-node-local': local } };
   };
   await checkArm();
+  const existingSeal = await readDirectEvidenceSeal(azure, authority, origin);
+  if (existingSeal) return finishSealed(existingSeal);
+  requireEvidence(fic.phase === 'ready', 'An original positive terminal seal is required after FIC deletion');
   await ns();
   await clients();
   await assertSqlLifetime();
@@ -391,36 +396,52 @@ export async function finishDirectTerminalCustody(azure: Azure, campaign: Direct
   const path = join(directory, 'direct-terminal.json');
   await writeFile(path, record, { flag: 'wx', mode: 0o600, flush: true });
   const seal = await persistDirectEvidence(azure, authority, origin, [...capturedLogs, ...delta.evidence,
-    { key: 'direct-terminal.json', path, bytes: record.length, sha256: sha(record) }]);
-  // Repeat the independent scope/authority checks after the potentially long upload.
-  const final = await fresh();
-  requireEvidence(final.exitVersions.every((etag, index) => etag === proof.exitVersions[index]),
-    'Original terminal Pod evidence changed after sealing');
-  const cleanupAuthority: RunCleanupAuthority = { async assertCurrent() {
-    await checkArm();
-    const [metadata, registry] = await control.read();
-    requireEvidence(metadata.resetgeneration === origin.cloudGeneration && metadata.resetstate === FENCED &&
-      Object.keys(registry).length === 0, 'Original publisher fence changed during cleanup');
-    const [stored, headers] = await azure.blob('GET', azure.c.checkpoints, seal.path, undefined, undefined, { 'If-Match': seal.etag });
-    requireEvidence(headers.etag === seal.etag && stored && sha(stored) === seal.sha256, 'Terminal evidence seal changed');
-  } };
-  const journal = create_namespace_deletion_journal(azure, identity, cleanupAuthority);
-  const deleteUntil = Date.now() + 300_000;
-  const receiptPath = join(directory, 'namespace-stopped.json');
-  let receipt: Awaited<ReturnType<typeof delete_owned_namespace>>;
-  for (;;) {
-    try {
-      receipt = await delete_owned_namespace(azure, identity, receiptPath, cleanupAuthority, journal);
-      break;
-    } catch (error) {
-      // This exact failure is emitted only after the positive original DELETE response was journaled.
-      if (!(error instanceof Failure) || error.message !== 'Original namespace deletion is still pending; receipt not complete.' ||
-          Date.now() >= deleteUntil) throw error;
-      await delay(2000);
+    { key: 'direct-terminal.json', path, bytes: record.length, sha256: sha(record) }], async () => {
+      // Seal publication is the durable commit point, after all uploads and fresh terminal checks.
+      const final = await fresh();
+      requireEvidence(final.exitVersions.every((etag, index) => etag === proof.exitVersions[index]),
+        'Original terminal Pod evidence changed before sealing');
+    });
+  return finishSealed(seal);
+
+  async function finishSealed(seal: DirectEvidenceSeal) {
+    const control = new PublisherControl(azure);
+    const cleanupAuthority: RunCleanupAuthority = { async assertCurrent() {
+      await checkArm();
+      const [metadata, registry] = await control.read();
+      requireEvidence(metadata.resetgeneration === origin.cloudGeneration && metadata.resetstate === FENCED &&
+        Object.keys(registry).length === 0, 'Original publisher fence changed during cleanup');
+      await readDirectEvidenceSeal(azure, authority, origin, seal);
+    } };
+    const journal = create_namespace_deletion_journal(azure, identity, cleanupAuthority);
+    const deleteUntil = Date.now() + 300_000;
+    const receiptPath = join(directory, 'namespace-stopped.json');
+    let receipt: Awaited<ReturnType<typeof delete_owned_namespace>>;
+    for (;;) {
+      try {
+        receipt = await delete_owned_namespace(azure, identity, receiptPath, cleanupAuthority, journal);
+        break;
+      } catch (error) {
+        // This exact failure requires a positive original DELETE response.
+        if (!(error instanceof Failure) || error.message !== 'Original namespace deletion is still pending; receipt not complete.' ||
+            Date.now() >= deleteUntil) throw error;
+        await delay(2000);
+      }
     }
+    await journal.complete(receipt);
+    await journal.stopped();
+    if (await observe_run_fic_cleanup(azure, fic, cleanupAuthority) === 'ready') {
+      requireEvidence(fic.phase === 'ready', 'Local FIC phase differs from the original ledger');
+      await cleanup_run_fic(azure, origin.runId, ficRecordPath, cleanupAuthority);
+    }
+    requireEvidence(await observe_run_fic_cleanup(azure, fic, cleanupAuthority) === 'deleted',
+      'Original FIC deletion was not verified');
+    const assertTerminalCurrent = async () => {
+      const originalStop = await journal.stopped();
+      requireEvidence(canonical_json(originalStop) === canonical_json(receipt), 'Original namespace stop receipt changed');
+      await assert_owned_namespace_absent(identity, cleanupAuthority);
+      requireEvidence(await observe_run_fic_cleanup(azure, fic, cleanupAuthority) === 'deleted', 'Original FIC deletion changed');
+    };
+    return { seal, receipt, qualification: NOT_QUALIFIED, assertSealCurrent: cleanupAuthority.assertCurrent, assertTerminalCurrent };
   }
-  await journal.complete(receipt);
-  await journal.stopped();
-  await cleanup_run_fic(azure, origin.runId, ficRecordPath, cleanupAuthority);
-  return { seal, receipt, qualification: report.qualification };
 }

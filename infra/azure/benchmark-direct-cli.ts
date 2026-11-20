@@ -1,9 +1,10 @@
 import fs from 'node:fs';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { assertCampaignEnvironment, createBlobCampaignStore, type CampaignStore } from '../../projects/arrowcol-oat/aks-campaign.js';
+import { assertCampaignEnvironment, createBlobCampaignStore, validateCampaignState, type CampaignStore } from '../../projects/arrowcol-oat/aks-campaign.js';
 import { loadCustodyConfig } from '../../projects/arrowcol-oat/aks-custody-config.js';
 import { armDirectBenchmark, type DirectRelease } from './benchmark-direct-arm.js';
+import { assertDirectInventory, publishDirectHandoff } from './benchmark-direct-handoff.js';
 import { evidenceObject, requireEvidence } from './benchmark-evidence-json.js';
 import { directProducerAuthority, type DirectCampaignScope } from './benchmark-run-authority.js';
 import type { DirectStopOrigin } from './benchmark-stop-patch.js';
@@ -27,6 +28,7 @@ type Options = {
   kubeconfig: string;
   context: string;
   clients?: number;
+  'run-id'?: string;
   'baseline-directory'?: string;
   'terminal-directory'?: string;
   'delta-directory'?: string;
@@ -40,12 +42,14 @@ export interface DirectCliDependencies {
 }
 export type DirectCliResult =
   | { action: 'arm'; arm: DirectTerminalArm }
-  | { action: 'finish'; qualification: unknown; sealPath: string };
+  | { action: 'finish'; qualification: unknown; sealPath: string; handoffEtag: string };
 
 function parseOptions(args: string[]): Options {
   const action = args[0];
   if (action !== 'arm' && action !== 'finish') throw new Error('Select exactly one direct command: arm or finish.');
-  const allowed = new Set<string>([...common, ...(action === 'arm' ? ['clients', 'baseline-directory'] : ['terminal-directory', 'delta-directory'])]);
+  const required = [...common, ...(action === 'arm' ? ['clients', 'baseline-directory'] :
+    ['run-id', 'terminal-directory', 'delta-directory'])];
+  const allowed = new Set<string>(required);
   const values = new Map<string, string>();
   for (let index = 1; index < args.length; index++) {
     const token = args[index]!;
@@ -58,10 +62,10 @@ function parseOptions(args: string[]): Options {
       throw new Error('Direct command option requires one non-empty value.');
     values.set(name, value);
   }
-  const required = [...common, ...(action === 'arm' ? ['clients', 'baseline-directory'] : ['terminal-directory', 'delta-directory'])];
   if (required.some(name => !values.has(name))) throw new Error('Direct command is missing a required option.');
   const clientsText = values.get('clients');
   if (action === 'arm' && !/^[1-8]$/.test(clientsText ?? '')) throw new Error('--clients must be an integer from 1 through 8.');
+  if (action === 'finish' && !uuid.test(values.get('run-id') ?? '')) throw new Error('--run-id must identify the original direct run.');
   const context = values.get('context')!;
   if (context.length > 512 || !context.trim() || context !== context.trim()) throw new Error('--context is invalid.');
   return {
@@ -73,7 +77,8 @@ function parseOptions(args: string[]): Options {
     kubeconfig: values.get('kubeconfig')!,
     context,
     ...(action === 'arm' ? { clients: Number(clientsText), 'baseline-directory': values.get('baseline-directory')! } : {
-      'terminal-directory': values.get('terminal-directory')!, 'delta-directory': values.get('delta-directory')!,
+      'run-id': values.get('run-id')!, 'terminal-directory': values.get('terminal-directory')!,
+      'delta-directory': values.get('delta-directory')!,
     }),
   };
 }
@@ -174,19 +179,21 @@ async function resolveProducer(options: Options, selected: LoadedConfig, azure: 
   release: DirectRelease): Promise<{ campaign: DirectCampaignScope; base: Omit<DirectStopOrigin, 'clients'> }> {
   const current = await store.read();
   if (!current) throw new Error('No active campaign state exists.');
-  const state = current.state, inventory = state.runInventory;
+  const state = validateCampaignState(current.state), inventory = state.runInventory;
   if (state.status !== 'active' || state.mode !== 'armed' || !inventory || state.campaignId !== inventory.campaign_id ||
       state.ownerId !== inventory.owner_id || state.fencingToken !== inventory.fencing_token ||
-      inventory.load_admission !== 'authorized' || inventory.fic?.state !== 'observed' ||
-      inventory.cleanup.handoff.state === 'complete' || inventory.namespace.uid === null || !inventory.namespace.uid ||
+      inventory.load_admission !== 'authorized' || (options.action === 'finish' && options['run-id'] !== inventory.cell_run_id) ||
+      !inventory.namespace.uid ||
       inventory.namespace.owner_token !== state.ownerId || !uuid.test(inventory.cell_run_id) ||
       !uuid.test(inventory.namespace.uid) || !uuid.test(state.campaignId) || !uuid.test(state.ownerId))
     throw new Error('Durable campaign state does not authorize this direct producer run.');
   assertCampaignEnvironment(selected.env, state);
   const fic = read_run_fic_record(options['fic-record'], selected.config);
   requireEvidence(fic.runId === inventory.cell_run_id && fic.namespace === inventory.namespace.name &&
-    fic.namespaceUid === inventory.namespace.uid && fic.namespaceOwner === inventory.namespace.owner_token && fic.phase === 'ready',
+    fic.namespaceUid === inventory.namespace.uid && fic.namespaceOwner === inventory.namespace.owner_token &&
+    (fic.phase === 'ready' || options.action === 'finish' && fic.phase === 'deleted'),
   'Run FIC record does not match the durable producer inventory');
+  assertDirectInventory(azure, inventory, fic, options.action);
   const [publisher] = await new PublisherControl(azure).read();
   requireEvidence(typeof publisher.resetgeneration === 'string' && uuid.test(publisher.resetgeneration),
     'Publisher generation is unavailable');
@@ -218,21 +225,30 @@ export async function runDirectBenchmarkCli(args: string[], dependencies: Direct
       const origin: DirectStopOrigin = { ...base, clients: options.clients };
       await directProducerAuthority(campaign, origin).assertCurrent();
       const arm = await armDirectBenchmark(azure, campaign, origin, release, options.context, options['fic-record'],
-        privateDirectory(options['baseline-directory'], 'Baseline directory'));
+        privateDirectory(options['baseline-directory'], 'Baseline directory'), async record => {
+          await directProducerAuthority(campaign, origin).assertCurrent();
+          const current = await store.read();
+          requireEvidence(current?.state.runInventory, 'Original direct inventory is missing at arm');
+          assertDirectInventory(azure, current.state.runInventory, read_run_fic_record(options['fic-record'], selected.config), 'arm', record);
+        });
       (dependencies.log ?? console.log)(JSON.stringify({ ok: true, action: 'arm', runId: origin.runId,
         startMs: arm.startMs, endMs: arm.endMs, armRecord: directArmRecordPath(origin) }));
       return { action: 'arm', arm };
     }
     const arm = await loadDurableArm(azure, base, release);
-    await directProducerAuthority(campaign, arm.origin).assertCurrent();
+    await directProducerAuthority(campaign, arm.origin, 'finish').assertCurrent();
+    const fresh = await store.read();
+    requireEvidence(fresh?.state.runInventory, 'Original direct inventory is missing at finish');
+    assertDirectInventory(azure, fresh.state.runInventory, read_run_fic_record(options['fic-record'], selected.config), 'finish', arm);
     if (options['terminal-directory'] === undefined || options['delta-directory'] === undefined)
       throw new Error('Finish command is missing an evidence directory.');
     const result = await finishDirectTerminalCustody(azure, campaign, arm, options.context,
       privateDirectory(options['terminal-directory'], 'Terminal evidence directory'),
       privateDirectory(options['delta-directory'], 'Delta evidence directory'), options['fic-record']);
+    const handoffEtag = await publishDirectHandoff(azure, campaign, arm.origin, result);
     (dependencies.log ?? console.log)(JSON.stringify({ ok: true, action: 'finish', runId: arm.origin.runId,
-      qualification: result.qualification, seal: result.seal.path }));
-    return { action: 'finish', qualification: result.qualification, sealPath: result.seal.path };
+      qualification: result.qualification, seal: result.seal.path, handoffEtag }));
+    return { action: 'finish', qualification: result.qualification, sealPath: result.seal.path, handoffEtag };
   } finally {
     if (previousKubeconfig === undefined) delete process.env.KUBECONFIG;
     else process.env.KUBECONFIG = previousKubeconfig;
