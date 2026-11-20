@@ -74,7 +74,7 @@ async function requireCurrentState(stamp: LiveStamp, directory: string): Promise
   }
 }
 
-async function capturedGeneration(config: Config, runner: typeof run_tree): Promise<string> {
+export async function capturedGeneration(config: Config, runner: typeof run_tree): Promise<string> {
   const authority = new PublisherControl({
     c: { sandbox: config.sandbox },
     async head_control(): Promise<[Metadata, string]> {

@@ -409,6 +409,75 @@ export async function readDeltaReference(azure: Azure, relativePath: string,
   return (await capture(azure, relativePath, assertCurrent)).reference;
 }
 
+export interface DeltaAddWindow {
+  total_rows: number;
+  total_files: number;
+  total_bytes: number;
+  total_commits: number;
+  window_rows: number;
+  window_files: number;
+  window_bytes: number;
+  window_commits: number;
+  first_version: number | null;
+  last_version: number | null;
+}
+
+export function reconcileDeltaAdds(commits: Map<number, Json[]>, startUnixMs: number, endUnixMs: number): DeltaAddWindow {
+  requireThat(Number.isSafeInteger(startUnixMs) && Number.isSafeInteger(endUnixMs) && startUnixMs < endUnixMs,
+    'invalid Delta measurement window');
+  const result: DeltaAddWindow = { total_rows: 0, total_files: 0, total_bytes: 0, total_commits: 0,
+    window_rows: 0, window_files: 0, window_bytes: 0, window_commits: 0, first_version: null, last_version: null };
+  for (const [version, actions] of [...commits].sort(([a], [b]) => a - b)) {
+    const records = (key: string): Json[] => actions.flatMap(action => {
+      const value = action[key];
+      return value !== null && typeof value === 'object' && !Array.isArray(value) ? [value as Json] : [];
+    });
+    const infos = records('commitInfo');
+    const adds = records('add');
+    const removes = records('remove');
+    requireThat(infos.length <= 1, 'Delta commit has duplicate commitInfo actions');
+    if (removes.some(action => action.dataChange === true))
+      throw new ReplayError('Data-changing Delta removals are outside the append-only benchmark contract');
+    if (!adds.length) continue;
+    requireThat(infos.length === 1, 'Delta adds lack a single commit timestamp');
+    const timestamp = integer(infos[0]!.timestamp, 'Delta commit timestamp');
+    let rows = 0, files = 0, bytes = 0;
+    for (const action of adds) {
+      const file = addFile(action);
+      if (action.dataChange !== true) continue;
+      requireThat(file.num_records !== null, 'Delta Add lacks numRecords statistics');
+      rows = sum([rows, file.num_records], 'commit rows');
+      files = sum([files, 1], 'commit files');
+      bytes = sum([bytes, file.size], 'commit bytes');
+    }
+    if (!files) continue;
+    result.total_rows = sum([result.total_rows, rows], 'total Delta Add rows');
+    result.total_files = sum([result.total_files, files], 'total Delta Add files');
+    result.total_bytes = sum([result.total_bytes, bytes], 'total Delta Add bytes');
+    result.total_commits = sum([result.total_commits, 1], 'total Delta Add commits');
+    if (timestamp >= startUnixMs && timestamp < endUnixMs) {
+      result.window_rows = sum([result.window_rows, rows], 'measured Delta Add rows');
+      result.window_files = sum([result.window_files, files], 'measured Delta Add files');
+      result.window_bytes = sum([result.window_bytes, bytes], 'measured Delta Add bytes');
+      result.window_commits = sum([result.window_commits, 1], 'measured Delta Add commits');
+      result.first_version ??= version;
+      result.last_version = version;
+    }
+  }
+  return result;
+}
+
+export async function readDeltaAddWindow(azure: Azure, relativePath: string, startUnixMs: number, endUnixMs: number,
+  assertCurrent: () => Promise<void>): Promise<DeltaAddWindow & { delta_version: number; active_rows: number }> {
+  const { reference, commits } = await capture(azure, relativePath, assertCurrent, -1);
+  if (reference.observation !== 'table' || reference.row_count === null)
+    throw new ReplayError('Delta table or complete active-file row statistics are unavailable');
+  const adds = reconcileDeltaAdds(commits, startUnixMs, endUnixMs);
+  if (adds.total_rows !== reference.row_count)
+    throw new ReplayError('Delta Add row totals do not reconcile with the final active-file snapshot');
+  return { ...adds, delta_version: reference.version, active_rows: reference.row_count };
+}
+
 export function parseDeltaReplayReference(input: unknown, azure: Azure, relativePath: string): DeltaReplayReference {
   const r = object(input, 'Delta reference');
   exact(r, ['schema_version', 'observation', 'account', 'container', 'table_root', 'table_id', 'version', 'protocol', 'active_files',
