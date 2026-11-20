@@ -9,7 +9,8 @@ import { armDirectBenchmark, type DirectRelease } from './benchmark-direct-arm.j
 import { runDirectBenchmarkCli } from './benchmark-direct-cli.js';
 import { directEvidencePrefix } from './benchmark-evidence-custody.js';
 import { directArmRecordPath, finishDirectTerminalCustody } from './benchmark-terminal-custody.js';
-import { prepare_run_fic, read_run_fic_record, run_fic_ledger_path } from './run_fic.js';
+import { plan_run_fic, prepare_run_fic, read_run_fic_record, run_fic_ledger_path } from './run_fic.js';
+import { watchSelectedRun } from '../../projects/arrowcol-oat/aks-scoped-watchdog.js';
 import { ENCODING, MAX_RECORDS } from './benchmark-manifest-audit.js';
 import { parseEvidence } from './benchmark-evidence-json.js';
 import { fakeKubectl } from './benchmark-direct-e2e.fixture.js';
@@ -342,11 +343,12 @@ async function fixture(t: TestContext, fault: Fault) {
       stop_maintenance: untouched(), terminal_capture: untouched(), handoff: untouched() },
     planned_cell_duration_ms: 600_000, effective_stop_budgets: { maintenance_grace_seconds: 90, maintenance_stop_timeout_ms: 390_000 } };
   await publishRunInventory(store, initial);
+  const ficPlan = await plan_run_fic(azure, origin.runId, origin.namespace, 'arrowcol-oat');
   const observed: RunInventory = { ...initial, namespace: { ...initial.namespace, uid: origin.namespaceUid },
     resources: resources.map(resource => ({ ...resource, state: 'observed', uid: state.objects[`${resource.kind.toLowerCase()}/${resource.name}`].metadata.uid })),
     evidence_destination: { account: c.account, container: c.checkpoints, blob_prefix: directEvidencePrefix(origin) },
     fic: { state: 'observed', resource_id: `${recordFic.identityId}/federatedIdentityCredentials/${recordFic.credentialName}`,
-      name: recordFic.credentialName, absence: null }, load_admission: 'authorization_pending' };
+      name: recordFic.credentialName, absence: null, plan: ficPlan }, load_admission: 'authorization_pending' };
   await publishRunInventory(store, observed);
   await publishRunInventory(store, { ...observed, load_admission: 'authorized' });
   const campaign = { store, campaignId: uuid(5), ownerId: origin.owner };
@@ -387,13 +389,112 @@ async function fixture(t: TestContext, fault: Fault) {
     save(); record('load');
   };
   return { arm, runCli, cliArgs, releaseFile, load, store, loseBookkeeping: () => { loseBookkeeping = true; },
-    loseNamespaceReceipt: () => { loseNamespaceReceipt = true; },
+    c, directory, loseNamespaceReceipt: () => { loseNamespaceReceipt = true; },
     staleAuthority: (expired: boolean) => { if (!fenced && expired) campaignState.heartbeatAtMs = now - 180_000;
       else if (fenced && !expired) campaignState.heartbeatAtMs = now - 1; fenced = expired; },
     finish: (armed: Awaited<ReturnType<typeof arm>>) =>
     finishDirectTerminalCustody(azure, campaign, armed, 'fixture', terminal, delta, ficPath), events, stored, terminal, ficPath,
     namespaceAbsent: () => namespaceAbsent, credential: () => credential, control: () => control };
 }
+
+test('selected watchdog waits for original FIC, fences authorized null-QAP producer loss, and does not replay a lost response', async t => {
+  const f = await fixture(t, "none");
+  const armed = await f.arm();
+  f.load(armed);
+  const planPath = join(f.directory, 'watch-envelope.json'), stateDir = join(f.directory, 'watch-state');
+  const ficPath = join(f.directory, 'watch-fic.json');
+  fs.mkdirSync(stateDir, { mode: 0o700 });
+  const { subscription, group, account, checkpoints } = f.c;
+  const target = `https://${account}.blob.core.windows.net/${checkpoints}`;
+  const blobPath = `/${checkpoints}/active.json`;
+  fs.writeFileSync(planPath, JSON.stringify({ schema_version: 1, campaign_id: uuid(5), run_id: origin.runId,
+    subscription_id: subscription, resource_group: group, storage_account: account, state_container: checkpoints, effects: [
+      { id: 'get', transport: 'campaign-blob', method: 'GET', resource: target, path: blobPath, max_calls: 25 },
+      { id: 'put', transport: 'campaign-blob', method: 'PUT', resource: target, path: blobPath, max_calls: 1 },
+      { id: 'token', transport: 'process', method: 'AZURE_ACCOUNT_GET-ACCESS-TOKEN', resource: 'az', max_calls: 25,
+        path: JSON.stringify(['account', 'get-access-token', '--subscription', subscription, '--resource',
+          'https://storage.azure.com/', '--query', 'accessToken', '--output', 'tsv', '--only-show-errors']) },
+    ] }), { mode: 0o600 });
+  const args = ['--env-file', 'fixture.env', '--stamp-config', 'fixture.yaml', '--effect-envelope', planPath,
+    '--state-dir', stateDir, '--fic-record', ficPath, '--owner-id', origin.owner, '--namespace', origin.namespace,
+    '--namespace-owner', origin.owner, '--expires-at', new Date(Date.now() + 300_000).toISOString()];
+  let exists = false, writes = 0, replaceBetweenCheckAndPut = false, dropResponse = false;
+  const fetcher: typeof fetch = async (input, init) => {
+    assert.equal(String(input), `${target}/active.json`);
+    const current = (await f.store.read())!;
+    if (init?.method !== 'PUT') return exists ?
+      new Response(JSON.stringify(current.state), { headers: { etag: current.etag } }) : new Response(null, { status: 404 });
+    writes++;
+    const etag = new Headers(init.headers).get('if-match');
+    assert.equal(etag, current.etag);
+    if (replaceBetweenCheckAndPut) {
+      const replacement = newCampaignState(uuid(90), origin.owner, Date.now());
+      await f.store.write(replacement, current.etag);
+      return new Response(null, { status: 412 });
+    }
+    const next = JSON.parse(String(init.body));
+    const nextEtag = await f.store.write(next, current.etag);
+    if (dropResponse) throw new Error('injected conditional PUT response loss');
+    return new Response(null, { status: 201, headers: { etag: nextEtag } });
+  };
+  const watch = (verify: (tick: () => Promise<Record<string, unknown>>) => Promise<void>, selected = stateDir) =>
+    watchSelectedRun(args.map(arg => arg === stateDir ? selected : arg), new AbortController().signal,
+      async (_signal, tick) => { await verify(tick); return 0; },
+      { config: f.c, fetcher, token: async () => 'fixture-token' });
+  await watch(async tick => {
+    assert.equal((await tick()).scopeStatus, 'waiting_campaign');
+    exists = true;
+    assert.equal((await tick()).scopeStatus, 'waiting_binding');
+    fs.copyFileSync(f.ficPath, ficPath);
+    assert.equal((await tick()).scopeStatus, 'bound_fence_only');
+    assert.equal(writes, 0);
+    f.staleAuthority(true);
+    dropResponse = true;
+    await assert.rejects(tick, /conditional PUT response loss/);
+  });
+  assert.equal(writes, 1);
+  const fenced = (await f.store.read())!;
+  assert.equal(fenced.state.status, 'fenced');
+  assert.equal(fenced.state.runInventory?.load_admission, 'authorized');
+  assert.equal(fenced.state.runInventory?.qap, null);
+  assert.equal(fenced.state.cleanupSteps[0]?.status, 'pending');
+  assert.ok(fs.readFileSync(join(stateDir, 'effects.jsonl'), 'utf8').includes('unknown_after_forward'));
+  const previous = f.events.length;
+  await watch(async tick => assert.equal((await tick()).scopeStatus, 'fenced_cleanup_blocked'));
+  assert.equal(writes, 1);
+  await assert.rejects(f.runCli('finish'), /does not authorize/i);
+  assert.equal(f.events.length, previous);
+  assert.equal(f.namespaceAbsent(), false);
+  assert.ok(f.credential());
+
+  const successor = newCampaignState(uuid(89), origin.owner, Date.now());
+  await f.store.write(successor, fenced.etag);
+  await assert.rejects(watch(async tick => { await tick(); }), /refusing adoption/);
+  assert.equal(writes, 1);
+
+  const raceDir = join(f.directory, 'race-state');
+  fs.mkdirSync(raceDir, { mode: 0o700 });
+  await f.store.write({ ...fenced.state, status: 'active', fencingToken: 1, cleanupStatus: 'not-started', cleanupSteps: [],
+    fenceReason: undefined, fencedAtMs: undefined }, (await f.store.read())!.etag);
+  replaceBetweenCheckAndPut = true;
+  await assert.rejects(watch(async tick => { await tick(); }, raceDir), /conflict/i);
+  assert.equal(writes, 2, 'never retry a losing conditional fence');
+  const replacement = (await f.store.read())!;
+  assert.equal(replacement.state.campaignId, uuid(90));
+  assert.equal(replacement.state.status, 'active');
+  await f.store.write(fenced.state, replacement.etag);
+  await watch(async tick => assert.equal((await tick()).scopeStatus, 'fenced_cleanup_blocked'), raceDir);
+  assert.equal(writes, 2);
+});
+
+test('real selected-watchdog entrypoint rejects incomplete invocation before accessing the control plane', () => {
+  const child = spawnSync(process.execPath, ['--import', 'tsx', 'projects/arrowcol-oat/aks-watchdog.ts',
+    '--watch-selected-run', '--owner-id', origin.owner], { encoding: 'utf8', timeout: 5_000 });
+  assert.ifError(child.error);
+  assert.equal(child.status, 1);
+  assert.match(child.stderr, /Scoped watchdog requires the exact owner/);
+  assert.equal(child.stdout, '');
+});
 
 test('production direct CLI preserves durable arm readback before barrier release', async t => {
   const f = await fixture(t, 'none');

@@ -384,6 +384,10 @@ export class EffectBoundary {
     }
   }
 
+  hasDispatched(effectId: string): boolean {
+    return (this.counts.get(effectId) ?? 0) > 0;
+  }
+
   async dispatch<T>(request: ExternalEffect, forward: () => Promise<T>): Promise<T> {
     if (this.poisoned) throw new Error('Effect boundary journal is not durable; refusing all further dispatch.');
     const method = request.method.toUpperCase();

@@ -59,7 +59,7 @@ export async function reconcileArmOperation(operation: ArmOperationReceipt, read
   return { ...operation, status: 'indeterminate', lastCheckedAtMs: now };
 }
 
-export async function reconcileOnce(store: CampaignStore, now = Date.now()): Promise<{
+export async function reconcileOnce(store: CampaignStore, now = Date.now(), fenceOnly = false): Promise<{
   status: 'idle' | 'observed' | 'fenced' | 'terminal'; campaignId?: string; missedHeartbeats?: number; fenceReason?: FenceReason;
 }> {
   const stored = await store.read();
@@ -67,7 +67,7 @@ export async function reconcileOnce(store: CampaignStore, now = Date.now()): Pro
   const evaluation = evaluateCustody(stored.state, now);
   if (stored.state.status !== 'active') return { status: 'terminal', campaignId: stored.state.campaignId };
   if (!evaluation.wouldFence || stored.state.mode === 'observe') {
-    await mutateCampaign(store, current => {
+    if (!fenceOnly) await mutateCampaign(store, current => {
       if (!current || current.campaignId !== stored.state.campaignId || current.fencingToken !== stored.state.fencingToken || current.status !== 'active') {
         throw new Error('Campaign changed while the controller was observing it.');
       }
@@ -81,11 +81,14 @@ export async function reconcileOnce(store: CampaignStore, now = Date.now()): Pro
       throw new Error('Campaign changed while the controller was fencing its owner.');
     }
     const currentEvaluation = evaluateCustody(current, now);
-    if (!currentEvaluation.fenceReason) return { ...current, lastEvaluatedAtMs: now, lastMissedHeartbeatCount: currentEvaluation.missedHeartbeats };
+    if (!currentEvaluation.fenceReason) {
+      if (fenceOnly) throw new Error('Heartbeat recovered before the scoped fence; no write was issued.');
+      return { ...current, lastEvaluatedAtMs: now, lastMissedHeartbeatCount: currentEvaluation.missedHeartbeats };
+    }
     return { ...current, status: 'fenced', fencingToken: current.fencingToken + 1, fenceReason: currentEvaluation.fenceReason,
       fencedAtMs: now, lastEvaluatedAtMs: now, lastMissedHeartbeatCount: currentEvaluation.missedHeartbeats, cleanupStatus: "pending",
       cleanupSteps: CUSTODY_CLEANUP_STEPS.map(step => ({ step, idempotencyKey: current.campaignId + ":" + (current.fencingToken + 1) + ":" + step, status: "pending" })) };
-  });
+  }, fenceOnly ? 1 : undefined);
   return result.state.status === 'fenced'
     ? { status: 'fenced', campaignId: result.state.campaignId, missedHeartbeats: result.state.lastMissedHeartbeatCount,
       fenceReason: result.state.fenceReason }

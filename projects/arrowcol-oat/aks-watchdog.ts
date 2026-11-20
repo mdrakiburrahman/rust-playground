@@ -65,23 +65,26 @@ export async function watchdogOnce(env: NodeJS.ProcessEnv = process.env, execute
     observedAtMs: Date.now() };
 }
 
-export async function runWatchdog(signal: AbortSignal, evaluate: () => Promise<Record<string, unknown>> = () => watchdogOnce()):
-  Promise<'aborted' | 'complete_unsettled'> {
+export async function runWatchdog(signal: AbortSignal, evaluate: () => Promise<Record<string, unknown>> = () => watchdogOnce(),
+  policy?: { stop: (evaluation: Record<string, unknown>) => boolean; intervalMs?: number }):
+  Promise<'aborted' | 'complete_unsettled' | 'selected_stop'> {
   let consecutiveFailures = 0;
   while (!signal.aborted) {
     const started = Date.now();
     try {
       const result = await evaluate();
       console.log(JSON.stringify(result));
+      if (policy?.stop(result)) return 'selected_stop';
       if (result.cleanupProgress === 'complete_unsettled') return 'complete_unsettled';
       consecutiveFailures = 0;
     } catch (error) {
+      if (policy) throw error;
       consecutiveFailures++;
       console.error(JSON.stringify({ event: 'campaign_custody_watchdog_failure', observedAtMs: Date.now(),
         consecutiveFailures, error: error instanceof Error ? error.message : 'Unexpected watchdog failure' }));
     }
     try {
-      await delay(Math.max(0, WATCHDOG_INTERVAL_MS - (Date.now() - started)), undefined, { signal });
+      await delay(Math.max(0, (policy?.intervalMs ?? WATCHDOG_INTERVAL_MS) - (Date.now() - started)), undefined, { signal });
     } catch (error) {
       if (!signal.aborted && error instanceof Error && error.name !== 'AbortError') throw error;
     }
@@ -90,6 +93,25 @@ export async function runWatchdog(signal: AbortSignal, evaluate: () => Promise<R
 }
 
 async function main(args: string[]): Promise<void> {
+  if (args[0] === '--watch-selected-run') {
+    const { watchSelectedRun } = await import('./aks-scoped-watchdog.js');
+    const controller = new AbortController();
+    const stop = () => controller.abort();
+    process.on('SIGINT', stop);
+    process.on('SIGTERM', stop);
+    try {
+      process.exitCode = await watchSelectedRun(args.slice(1), controller.signal, async (signal, evaluate) => {
+        let exit = 0;
+        await runWatchdog(signal, evaluate, { stop: result => {
+          if (result.scopeStatus === 'selected_complete') return true;
+          if (!['fenced_cleanup_blocked', 'fence_budget_blocked', 'selected_complete_unsettled'].includes(String(result.scopeStatus))) return false;
+          exit = 2; return true;
+        } });
+        return exit;
+      });
+    } finally { process.off('SIGINT', stop); process.off('SIGTERM', stop); }
+    return;
+  }
   const selected = loadCustodyConfig(args, true), azure = new Azure(selected.config);
   const evaluate = () => watchdogOnce(selected.env, undefined, undefined, azure);
   if (selected.once) {
