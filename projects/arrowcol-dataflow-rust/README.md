@@ -13,11 +13,20 @@ config.quiver.yaml  Arrow Flight -> processor:durable_buffer (Quiver) -> generic
 after the durable buffer persisted every batch (see
 [Delivery guarantee](#delivery-guarantee)).
 
-The process is pinned to one DFE core in both YAML policy and the documented
-command. Delta table ownership is process-shared, but a single pipeline core
-also keeps Flight registration and admin lifecycle unambiguous.
+The checked-in defaults use one DFE core. `--num-cores 2` overrides the top-level
+core policy and starts two integrated receiver/exporter workers; do not add
+group/pipeline resource overrides that shadow this CLI setting. Flight and admin
+listeners use SO_REUSEPORT, while registration, pressure and Delta ownership are
+process-shared. Concurrent HTTP/2 streams on one connection stay on one listener;
+use independent client and upstream proxy connections to exercise multiple workers. The isolated
+[OAT runtime](../../docs/experiments/arrowcol-oat/RUNTIME.md) holds CPU limits
+constant and varies replicas and `--num-cores`, not an unused side deployment.
 
 ## Build and validate
+
+| Reference | Contents |
+| --- | --- |
+| [Performance controls](../../docs/arrowcol-dataflow/PERFORMANCE.md) | Parquet, runtime, bounded batching and rebuild-only allocator/CPU settings |
 
 ```bash
 npx --no-install nx run arrowcol-dataflow-rust:build
@@ -38,7 +47,10 @@ and capability claim, sends `SIGTERM`, and requires bounded graceful shutdown.
 Both scripts use `$CARGO_TARGET_DIR` when it is set.
 After ingress enters `draining`, the main-thread shutdown hook waits for the
 controller's final publication and shared publisher close before writing the
-terminal routing state. Only a clean drain and close with no unpublished identity or retired worker
+terminal routing state. The hook also attempts the guarded publisher close after
+startup or controller failure, releasing only owned registrations with definite
+mutation outcomes; in-flight, uncertain, or revoked sessions remain registered.
+Only a clean drain and close with no unpublished identity or retired worker
 becomes `stopped`; otherwise it becomes `failed`. A refused close or failed
 terminal write is logged and exits nonzero. A startup or validation error
 (for example `IncompatiblePdataWiring`) still records `failed` but is returned
@@ -55,7 +67,7 @@ npx --no-install nx run arrowcol-infra:bootstrap
 npx --no-install nx run arrowcol-infra:up
 ARROWCOL_CATALOG_STATE_DIR="$PWD/onelake/catalog-state" \
 ARROWCOL_CATALOG_WAREHOUSE_ROOT="$PWD/onelake/arrowcol-dataflow" \
-npx --no-install nx run arrowcol-catalog-rust:run
+npx --no-install nx run arrowcol-catalog-rust:run -- --ingestion-layout
 ```
 
 Keep the catalog process running in a separate terminal with writable catalog
@@ -70,18 +82,20 @@ ARROWCOL_SQL_PORT=14333 \
 ARROWCOL_SQL_PASSWORD_FILE=projects/arrowcol-infra/secrets/arrowcol-app-password.txt \
 ARROWCOL_CATALOG_ENDPOINT=http://127.0.0.1:8817 \
 ARROWCOL_DELTA_ROOT="$PWD/onelake/arrowcol-dataflow" \
+ARROWCOL_PARTITION_GRANULARITY=hour \
 npx --no-install nx run arrowcol-dataflow-rust:run
 ```
 
 For the durable topology, add a writable Quiver directory and use `run-quiver`:
 
 ```bash
-ARROWCOL_QUIVER_PATH="$PWD/onelake/arrowcol-dataflow-quiver" \
+ARROWCOL_WAL_PATH="$PWD/onelake/arrowcol-dataflow-quiver" \
 ARROWCOL_SQL_HOST=127.0.0.1 \
 ARROWCOL_SQL_PORT=14333 \
 ARROWCOL_SQL_PASSWORD_FILE=projects/arrowcol-infra/secrets/arrowcol-app-password.txt \
 ARROWCOL_CATALOG_ENDPOINT=http://127.0.0.1:8817 \
 ARROWCOL_DELTA_ROOT="$PWD/onelake/arrowcol-dataflow" \
+ARROWCOL_PARTITION_GRANULARITY=hour \
 npx --no-install nx run arrowcol-dataflow-rust:run-quiver
 ```
 
@@ -156,15 +170,24 @@ Delta batches, publishes final pressure, and then relinquishes registration.
 and the exporter. The buffer persists `arrowcol.flight@1.1` record sets
 unchanged and replays unacknowledged ones after a restart. Its settings:
 
-| Setting | Value | Purpose |
-| --- | --- | --- |
-| `path` | `${ARROWCOL_QUIVER_PATH:-/var/lib/arrowcol/quiver}` | Per-core WAL and segment storage; must persist across restarts |
-| `wal_flush_interval` | `0s` | Fsync before every acknowledgement |
-| `retention_size_cap` | `${ARROWCOL_QUIVER_CAPACITY:-4 GiB}` | Disk budget; each core needs at least 192 MiB |
-| `size_cap_policy` | `backpressure` | Refuse new data instead of dropping old data |
-| `max_segment_open_duration` | `1s` | Upper bound on the delay before replay-visible segments |
-| `poll_interval` | `100ms` | Downstream forwarding cadence |
-| `initial_retry_interval`, `max_retry_interval` | `250ms`, `2s` | Backoff for transiently refused batches |
+| Setting | Environment variable | Profile default | Runtime effect |
+| --- | --- | --- | --- |
+| `path` | `ARROWCOL_WAL_PATH` | `/var/lib/arrowcol/quiver` | Startup-only; per-core persistent WAL and segment directory |
+| `wal_flush_interval` | `ARROWCOL_WAL_FLUSH_INTERVAL` | `0s` | Startup-only; fsync cadence before acknowledging data |
+| `retention_size_cap` | `ARROWCOL_WAL_RETENTION_SIZE_CAP` | `4 GiB` | Startup-only; total disk budget, divided evenly across cores |
+| `max_age` | `ARROWCOL_WAL_MAX_AGE` | unset | Startup-only; expiry can delete unconsumed segments |
+| `size_cap_policy` | `ARROWCOL_WAL_SIZE_CAP_POLICY` | `backpressure` | Startup-only; `backpressure` or lossy `drop_oldest` |
+| `max_segment_open_duration` | `ARROWCOL_WAL_MAX_SEGMENT_OPEN_DURATION` | `1s` | Startup-only; delay before replay-visible segments |
+| `poll_interval` | `ARROWCOL_WAL_POLL_INTERVAL` | `100ms` | Startup-only; downstream forwarding cadence |
+| `initial_retry_interval` | `ARROWCOL_WAL_INITIAL_RETRY_INTERVAL` | `250ms` | Startup-only; retry backoff base |
+| `max_retry_interval` | `ARROWCOL_WAL_MAX_RETRY_INTERVAL` | `2s` | Startup-only; retry backoff ceiling |
+| `retry_multiplier` | `ARROWCOL_WAL_RETRY_MULTIPLIER` | `2.0` | Startup-only; exponential retry multiplier |
+| `max_in_flight` | `ARROWCOL_WAL_MAX_IN_FLIGHT` | `1000` | Startup-only; maximum downstream bundles in flight |
+| `otlp_handling` | `ARROWCOL_WAL_OTLP_HANDLING` | `pass_through` | Startup-only; `pass_through` or `convert_to_arrow` |
+
+The effective config is emitted to stderr as one compact `arrowcol_wal_effective_config <JSON>` line. It omits the storage path. `durability_class` is derived as `lossy_eviction` when `max_age` is set or `size_cap_policy=drop_oldest`; otherwise a nonzero flush interval is `fsync_batched`, and zero is `durable`. The defaults above retain the durable behavior. A nonzero flush interval can lose acknowledged data not yet fsynced; expiry and `drop_oldest` can discard unconsumed data.
+
+The processor does not expose Quiver engine settings for WAL max size, rotated-file count, rotation target, segment target size, or segment stream count. These remain unsupported rather than parsed-but-unused. The processor's supported `max_segment_open_duration` controls time-based finalization, not segment size.
 
 Restart recovery depends on a stable identity: run the restarted process with
 the same `registration.instance_key` (`ARROWCOL_INSTANCE_KEY`) and the same

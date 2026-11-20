@@ -196,6 +196,9 @@ impl MetricsReporter for KernelReporter {
 struct PublicationMetrics {
     events: Counter<u64>,
     duration: Histogram<f64>,
+    committed_rows: Counter<u64>,
+    committed_files: Counter<u64>,
+    committed_bytes: Counter<u64>,
 }
 
 fn publications() -> &'static PublicationMetrics {
@@ -205,7 +208,77 @@ fn publications() -> &'static PublicationMetrics {
         PublicationMetrics {
             events: meter.u64_counter("delta.publication.events").build(),
             duration: meter.f64_histogram("delta.publication.duration").with_unit("s").build(),
+            committed_rows: meter.u64_counter("delta.commit.rows").build(),
+            committed_files: meter.u64_counter("delta.commit.files").build(),
+            committed_bytes: meter.u64_counter("delta.commit.parquet_bytes").with_unit("By").build(),
         }
+    })
+}
+
+/// Counts only newly committed AddFiles after the local durability barrier.
+/// These process counters are not a per-cell measurement without boundary evidence.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn data_commit(
+    version: u64,
+    rows: u64,
+    input_bytes: u64,
+    parquet_bytes: u64,
+    files: u64,
+    min_ingested_at_ms: Option<i64>,
+    max_ingested_at_ms: Option<i64>,
+    elapsed: Duration,
+    table_id: &str,
+    table_name: Option<&str>,
+) {
+    let metrics = publications();
+    metrics.committed_rows.add(rows, &[]);
+    metrics.committed_files.add(files, &[]);
+    metrics.committed_bytes.add(parquet_bytes, &[]);
+    let event = serde_json::json!({
+        "schema_version": 1,
+        "outcome": "committed",
+        "table_id": table_id,
+        "table_name": table_name,
+        "delta_version": version,
+        "rows": rows,
+        "files": files,
+        "input_bytes": input_bytes,
+        "parquet_bytes": parquet_bytes,
+        "min_ingested_at_ms": min_ingested_at_ms,
+        "max_ingested_at_ms": max_ingested_at_ms,
+        "finished_at_unix_ms": chrono::Utc::now().timestamp_millis(),
+        "elapsed_seconds": elapsed.as_secs_f64()
+    });
+    eprintln!("arrowcol_data_commit {event}");
+    tracing::info!(commit = %event, "arrowcol_data_commit");
+}
+
+pub(crate) fn ambiguous_commit_reconciled(table_id: &str, table_name: Option<&str>, elapsed: Duration) {
+    publication_event("commit_attribution_uncertain");
+    let event = ambiguous_commit_event(table_id, table_name, elapsed);
+    eprintln!("arrowcol_data_commit {event}");
+    tracing::warn!(
+        commit = %event,
+        "arrowcol_data_commit"
+    );
+}
+
+fn ambiguous_commit_event(table_id: &str, table_name: Option<&str>, elapsed: Duration) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": 1,
+        "outcome": "reconciled",
+        "table_id": table_id,
+        "table_name": table_name,
+        "delta_version": null,
+        "rows": null,
+        "files": null,
+        "input_bytes": null,
+        "parquet_bytes": null,
+        "min_ingested_at_ms": null,
+        "max_ingested_at_ms": null,
+        "finished_at_unix_ms": chrono::Utc::now().timestamp_millis(),
+        "elapsed_seconds": elapsed.as_secs_f64(),
+        "reason": "uncertain_commit_version_attribution"
     })
 }
 
@@ -244,5 +317,32 @@ impl Drop for PublicationObservation {
             self.started.elapsed().as_secs_f64(),
             &[KeyValue::new("outcome", self.outcome)],
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ambiguous_commit_event_has_table_boundary_and_null_attribution() {
+        let event = ambiguous_commit_event("sha256-id", Some("catalog.schema.table"), Duration::from_secs(2));
+        assert_eq!(event["table_id"], "sha256-id");
+        assert_eq!(event["table_name"], "catalog.schema.table");
+        assert_eq!(event["outcome"], "reconciled");
+        assert_eq!(event["reason"], "uncertain_commit_version_attribution");
+        for field in [
+            "delta_version",
+            "rows",
+            "files",
+            "input_bytes",
+            "parquet_bytes",
+            "min_ingested_at_ms",
+            "max_ingested_at_ms",
+        ] {
+            assert!(event[field].is_null(), "{field}");
+        }
+        assert!(event["finished_at_unix_ms"].as_i64().is_some());
+        assert_eq!(event["elapsed_seconds"], 2.0);
     }
 }

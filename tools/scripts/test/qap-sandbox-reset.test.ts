@@ -3,7 +3,7 @@ import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
-import { azCommand, capturedManagedGroups } from '../src/qap-sandbox-reset.js';
+import { azCommand, capturedManagedGroups, resetTimeoutMinutes } from '../src/qap-sandbox-reset.js';
 
 const subscription = '11111111-2222-3333-4444-555555555555';
 const id = `/subscriptions/${subscription}/resourceGroups/arrow-collector-rg/providers/Microsoft.ContainerService/managedClusters/arrow-collector-42`;
@@ -24,6 +24,20 @@ test('only accepts managed groups captured from the scoped AKS inventory', () =>
   assert.throws(() => capturedManagedGroups([{ ...cluster, nodeResourceGroup: 'rust-playground' }], subscription));
   assert.throws(() => capturedManagedGroups({}, subscription));
   assert.throws(() => capturedManagedGroups(Array(21).fill(cluster), subscription));
+});
+
+test('legacy 00000 stamp is accepted without weakening cluster and managed-group guards', () => {
+  const legacy = { ...cluster, name: 'arrow-collector-00000', id: id.replace('arrow-collector-42', 'arrow-collector-00000') };
+  assert.deepEqual(capturedManagedGroups([legacy], subscription), [cluster.nodeResourceGroup]);
+  for (const name of ['arrow-collector-0', 'arrow-collector-00001', 'arrow-collector-000000', 'arrow-collector-1000000'])
+    assert.throws(() => capturedManagedGroups([{ ...legacy, name, id: legacy.id.replace(legacy.name, name) }], subscription));
+});
+
+test('reset timeout defaults to 45 minutes and rejects unsafe timer values', () => {
+  assert.equal(resetTimeoutMinutes(undefined), 45);
+  assert.equal(resetTimeoutMinutes('2'), 2);
+  for (const value of ['invalid', '', 0, -1, 1.5, Infinity, 100000])
+    assert.throws(() => resetTimeoutMinutes(value), /Timeout/);
 });
 
 test('CLI fails closed, deletes only the sandbox, and waits only for inventoried managed groups', { skip: process.platform === 'win32' }, () => {
@@ -55,13 +69,15 @@ else process.exit(20);
   try {
     assert.notEqual(run(args.slice(0, 2)).status, 0);
     assert.equal(fs.existsSync(log), false);
+    assert.notEqual(run([...args, '--timeout-minutes', '0']).status, 0);
+    assert.equal(fs.existsSync(log), false);
     assert.notEqual(run([...args.slice(0, 3), 'rust-playground', ...args.slice(4)]).status, 0);
     assert.equal(fs.existsSync(log), false);
     assert.notEqual(run([...args.slice(0, -1), path.join(checkout, 'receipt.json')]).status, 0);
     assert.equal(fs.existsSync(log), false);
     assert.notEqual(run([...args.slice(0, -1), `${fixture}/../receipt.json`]).status, 0);
     assert.equal(fs.existsSync(log), false);
-    const success = run(args);
+    const success = run([...args, '--timeout-minutes', '1']);
     assert.equal(success.status, 0, success.stderr);
     const commands = fs.readFileSync(log, 'utf8').trim().split('\n').map(line => JSON.parse(line) as string[]);
     const deletions = commands.filter(command => command[0] === 'group' && command[1] === 'delete');

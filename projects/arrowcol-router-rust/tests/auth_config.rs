@@ -106,6 +106,7 @@ fn strict_yaml_rejects_unknown_fields_and_accepts_the_checked_in_config() {
         valid.as_slice(),
         include_bytes!("../config.docker.yaml").as_slice(),
         include_bytes!("../config.smoke.yaml").as_slice(),
+        include_bytes!("../../loadtest/config/router.yaml").as_slice(),
     ] {
         RouterConfig::from_yaml(config).unwrap_or_else(|error| panic!("checked-in config is invalid: {error}"));
     }
@@ -119,4 +120,78 @@ fn strict_yaml_rejects_unknown_fields_and_accepts_the_checked_in_config() {
         String::from_utf8(valid.to_vec()).unwrap_or_else(|error| panic!("checked-in config is not UTF-8: {error}"));
     unknown.push_str("\nunknown_router_option: true\n");
     assert!(RouterConfig::from_yaml(unknown.as_bytes()).is_err());
+}
+
+#[test]
+fn startup_requires_explicit_development_authentication_mode() {
+    let valid = std::str::from_utf8(include_bytes!("../config.yaml"))
+        .unwrap_or_else(|error| panic!("checked-in config is not UTF-8: {error}"));
+    for mode in ["allow_all", "production", ""] {
+        let invalid = valid.replace("authenticator: dev_only_allow_all", &format!("authenticator: {mode}"));
+        assert!(
+            RouterConfig::from_yaml(invalid.as_bytes()).is_err(),
+            "accepted mode {mode:?}"
+        );
+    }
+    let missing = valid.replace("  authenticator: dev_only_allow_all\n", "");
+    assert!(RouterConfig::from_yaml(missing.as_bytes()).is_err());
+}
+
+#[test]
+fn replay_capacity_configuration_is_bounded_and_preserves_the_default() -> anyhow::Result<()> {
+    let valid = std::str::from_utf8(include_bytes!("../config.yaml"))?;
+    assert_eq!(
+        RouterConfig::from_yaml(valid.as_bytes())?.auth.edge_replay_max_nonces,
+        65_536
+    );
+    for capacity in [1, 1_048_576] {
+        let configured = valid.replace("auth:\n", &format!("auth:\n  edge_replay_max_nonces: {capacity}\n"));
+        assert_eq!(
+            RouterConfig::from_yaml(configured.as_bytes())?
+                .auth
+                .edge_replay_max_nonces,
+            capacity
+        );
+    }
+    for capacity in [0, 1_048_577] {
+        let configured = valid.replace("auth:\n", &format!("auth:\n  edge_replay_max_nonces: {capacity}\n"));
+        assert!(RouterConfig::from_yaml(configured.as_bytes()).is_err());
+    }
+    Ok(())
+}
+
+#[test]
+fn oat_run_id_cannot_be_added_removed_or_changed_after_edge_signing() {
+    let signer = EdgeRequestSigner::new(vec![7_u8; 32]).unwrap_or_else(|error| panic!("create edge signer: {error}"));
+    let path = "/arrow.flight.protocol.FlightService/DoPut";
+    for (original, tampered) in [
+        (None, Some("00000000-0000-0000-0000-000000000001")),
+        (Some("00000000-0000-0000-0000-000000000001"), None),
+        (
+            Some("00000000-0000-0000-0000-000000000001"),
+            Some("00000000-0000-0000-0000-000000000002"),
+        ),
+    ] {
+        let verifier =
+            EdgeVerifier::new(vec![7_u8; 32], 30_000).unwrap_or_else(|error| panic!("create edge verifier: {error}"));
+        let mut headers = request_headers();
+        if let Some(run_id) = original {
+            headers.insert("x-arrowcol-oat-run-id", HeaderValue::from_static(run_id));
+        }
+        insert_edge_signature_headers(&mut headers, &signer, &Method::POST, path, now(100_000), "run-id")
+            .unwrap_or_else(|error| panic!("sign edge request: {error}"));
+        let signed = headers.clone();
+        headers.remove("x-arrowcol-oat-run-id");
+        if let Some(run_id) = tampered {
+            headers.insert("x-arrowcol-oat-run-id", HeaderValue::from_static(run_id));
+        }
+        let Err(failure) = verifier.verify(&Method::POST, path, &headers, now(100_001)) else {
+            panic!("unsigned OAT run-ID change must fail");
+        };
+        assert_eq!(failure.kind(), AuthFailureKind::Invalid);
+        assert_eq!(failure.message(), "edge signature verification failed");
+        verifier
+            .verify(&Method::POST, path, &signed, now(100_001))
+            .unwrap_or_else(|error| panic!("unchanged signed run ID must pass: {error}"));
+    }
 }

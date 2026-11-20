@@ -71,6 +71,7 @@ impl StoreLeaseResolver {
                 now_unix_ms: now,
                 expires_at_unix_ms: expires,
                 minimum_snapshot_at_unix_ms: UnixMillis::new(0).map_err(|_| RuntimeError::internal())?,
+                distinct_table_owners: false,
             })
             .await
             .map_err(|_| unverified())?;
@@ -517,6 +518,7 @@ mod tests {
                 now_unix_ms: now,
                 expires_at_unix_ms: UnixMillis::new(now.get() + 60_000).expect("expiry"),
                 minimum_snapshot_at_unix_ms: time(0),
+                distinct_table_owners: false,
             })
             .await
             .expect("claim");

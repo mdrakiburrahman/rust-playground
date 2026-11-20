@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 const SCHEMA_DDL: &str = include_str!("../../schemas/sqlserver.sql");
 
 /// Exact number of public synthetic SQL Server tables.
-pub const TABLE_COUNT: usize = 13;
+pub const TABLE_COUNT: usize = 32;
 
 /// One strict Flight SQL schema registration request.
 #[derive(Clone, Debug)]
@@ -114,24 +114,43 @@ mod tests {
         assert_eq!(
             summary,
             vec![
+                ("sqlserver_active_requests".to_owned(), 22),
                 ("sqlserver_active_sessions".to_owned(), 9),
                 ("sqlserver_availability_group_states".to_owned(), 13),
                 ("sqlserver_availability_replica_states".to_owned(), 22),
+                ("sqlserver_blocking_sessions".to_owned(), 15),
                 ("sqlserver_client_connections".to_owned(), 14),
                 ("sqlserver_cpu_utilization".to_owned(), 8),
+                ("sqlserver_database_file_stats".to_owned(), 16),
+                ("sqlserver_database_index_operational_stats".to_owned(), 20),
+                ("sqlserver_database_index_usage".to_owned(), 16),
+                ("sqlserver_database_log_stats".to_owned(), 17),
+                ("sqlserver_database_partition_stats".to_owned(), 14),
                 ("sqlserver_database_properties".to_owned(), 44),
                 ("sqlserver_database_replica_states".to_owned(), 37),
                 ("sqlserver_database_storage_utilization".to_owned(), 16),
+                ("sqlserver_latch_stats".to_owned(), 9),
+                ("sqlserver_lock_waits".to_owned(), 13),
+                ("sqlserver_locks".to_owned(), 15),
+                ("sqlserver_memory_clerks".to_owned(), 13),
                 ("sqlserver_memory_utilization".to_owned(), 8),
+                ("sqlserver_missing_indexes".to_owned(), 17),
                 ("sqlserver_performance_counters_common".to_owned(), 11),
                 ("sqlserver_performance_counters_detailed".to_owned(), 11),
+                ("sqlserver_query_memory_grants".to_owned(), 22),
+                ("sqlserver_query_stats".to_owned(), 25),
+                ("sqlserver_resource_semaphores".to_owned(), 16),
+                ("sqlserver_scheduler_stats".to_owned(), 19),
+                ("sqlserver_session_transactions".to_owned(), 13),
                 ("sqlserver_storage_io".to_owned(), 19),
+                ("sqlserver_tempdb_space_usage".to_owned(), 13),
+                ("sqlserver_transaction_stats".to_owned(), 14),
                 ("sqlserver_wait_stats".to_owned(), 11),
             ]
         );
         assert_eq!(
             format!("sha256:{}", hex::encode(Sha256::digest(schema_ddl().as_bytes()))),
-            "sha256:14e42581710f1b44776f456b66e983f3832e47c3d3233364a3ae41778fcb5545"
+            "sha256:1cd6ef49b860566f0a4ac74afb079d12f1a62ee73fca02392ec9c15ead8882bf"
         );
         Ok(())
     }

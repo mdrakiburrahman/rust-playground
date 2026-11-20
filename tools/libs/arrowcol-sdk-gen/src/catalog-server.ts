@@ -199,6 +199,7 @@ try {
     const binary = resolve(workspace, 'target/debug', process.platform === 'win32' ? 'arrowcol-catalog-rust.exe' : 'arrowcol-catalog-rust');
     const child = spawn(binary, [
       '--listen', new URL(registry.endpoint).host,
+      '--ddl-auth-mode', 'dev_only_allow_unsigned',
       '--state-dir', resolve(workspace, root, 'state'),
       '--warehouse-root', resolve(workspace, root, 'warehouse'),
     ], { cwd: workspace, stdio: ['ignore', output, output], shell: false });
@@ -215,7 +216,8 @@ try {
       if (spawnError) throw spawnError;
       if (child.exitCode !== null || child.signalCode !== null) throw new Error(`${registry.label} exited; see ${root}/service.log`);
       try {
-        await execute(binary, ['--healthcheck', '--listen', new URL(registry.endpoint).host]);
+        await execute(binary, ['--healthcheck', '--listen', new URL(registry.endpoint).host,
+          '--ddl-auth-mode', 'dev_only_allow_unsigned']);
         ready = true;
         break;
       } catch (error) { lastError = errorMessage(error); await delay(500); }

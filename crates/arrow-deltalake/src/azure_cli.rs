@@ -52,14 +52,68 @@ impl std::fmt::Debug for BoundedAzureCli {
     }
 }
 
-fn failure(message: &'static str) -> Error {
+fn failure(message: impl Into<String>) -> Error {
     Error::Generic {
         store: "bounded_azure_cli",
-        source: Box::new(std::io::Error::other(message)),
+        source: Box::new(std::io::Error::other(message.into())),
     }
 }
 
 const STORAGE_SCOPE: &str = "https://storage.azure.com/.default";
+const OAUTH_ERROR_BODY_LIMIT: usize = 16_384;
+
+fn token_exchange_failure(status: reqwest::StatusCode, body: &[u8]) -> Error {
+    let mut message = format!("workload identity token exchange failed (HTTP {})", status.as_u16());
+    if body.len() <= OAUTH_ERROR_BODY_LIMIT
+        && let Ok(value) = serde_json::from_slice::<serde_json::Value>(body)
+    {
+        // Only protocol error names and numeric AAD codes are safe to echo.
+        if let Some(error) = value.get("error").and_then(serde_json::Value::as_str)
+            && matches!(
+                error,
+                "invalid_request"
+                    | "invalid_client"
+                    | "invalid_grant"
+                    | "unauthorized_client"
+                    | "unsupported_grant_type"
+                    | "invalid_scope"
+                    | "access_denied"
+                    | "server_error"
+                    | "temporarily_unavailable"
+                    | "interaction_required"
+                    | "login_required"
+                    | "consent_required"
+            )
+        {
+            message.push_str(&format!("; error={error}"));
+        }
+        if let Some(codes) = value.get("error_codes").and_then(serde_json::Value::as_array) {
+            let codes: Vec<String> = codes
+                .iter()
+                .take(8)
+                .filter_map(serde_json::Value::as_u64)
+                .filter_map(|code| u32::try_from(code).ok())
+                .map(|code| code.to_string())
+                .collect();
+            if !codes.is_empty() {
+                message.push_str(&format!("; error_codes={}", codes.join(",")));
+            }
+        }
+    }
+    failure(message)
+}
+
+async fn token_exchange_response_failure(mut response: reqwest::Response) -> Error {
+    let status = response.status();
+    let mut body = Vec::new();
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) if chunk.len() <= OAUTH_ERROR_BODY_LIMIT - body.len() => body.extend_from_slice(&chunk),
+            Ok(None) => return token_exchange_failure(status, &body),
+            _ => return token_exchange_failure(status, &[]),
+        }
+    }
+}
 
 impl Default for BoundedAzureCli {
     fn default() -> Self {
@@ -124,7 +178,7 @@ impl BoundedAzureCli {
             .await
             .map_err(|_| failure("workload identity token exchange request failed"))?;
         if !response.status().is_success() {
-            return Err(failure("workload identity token exchange failed"));
+            return Err(token_exchange_response_failure(response).await);
         }
         let bytes = response
             .bytes()
@@ -332,6 +386,7 @@ impl AzureCliTokenProvider {
     ///
     /// # Errors
     /// Returns bounded acquisition, process or token-metadata failures without CLI output.
+    /// Failed workload exchanges include only HTTP status, known OAuth error names and bounded numeric AAD codes.
     pub async fn token(&self) -> anyhow::Result<String> {
         match self.0.get_credential().await?.as_ref() {
             AzureCredential::BearerToken(token) => Ok(token.clone()),
@@ -343,6 +398,67 @@ impl AzureCliTokenProvider {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workload_identity_failure_reports_only_oauth_error_and_aad_codes() {
+        let body = br#"{
+            "error": "invalid_client",
+            "error_codes": [70021, 700213],
+            "error_description": "arbitrary private diagnostic message",
+            "access_token": "secret-access-token",
+            "client_assertion": "secret-client-assertion",
+            "refresh_token": "secret-refresh-token",
+            "headers": {"Authorization": "secret-authorization"}
+        }"#;
+        let error = token_exchange_failure(reqwest::StatusCode::UNAUTHORIZED, body);
+        for output in [error.to_string(), format!("{error:?}")] {
+            assert!(output.contains("HTTP 401"));
+            assert!(output.contains("error=invalid_client"));
+            assert!(output.contains("error_codes=70021,700213"));
+            for private in [
+                "arbitrary private diagnostic message",
+                "secret-",
+                "access_token",
+                "client_assertion",
+                "refresh_token",
+                "headers",
+                "Authorization",
+            ] {
+                assert!(!output.contains(private), "{output}");
+            }
+        }
+    }
+
+    #[test]
+    fn workload_identity_failure_uses_status_only_for_malformed_or_oversized_body() {
+        for body in [
+            b"secret-token arbitrary response text".as_slice(),
+            br#"{"error":"invalid_client","error_codes":[70021],"access_token":"secret"#,
+            &[b'x'; OAUTH_ERROR_BODY_LIMIT + 1],
+            &[],
+        ] {
+            let output = token_exchange_failure(reqwest::StatusCode::BAD_REQUEST, body).to_string();
+            assert!(output.ends_with("workload identity token exchange failed (HTTP 400)"));
+            assert!(!output.contains("secret"));
+            assert!(!output.contains("invalid_client"));
+        }
+    }
+
+    #[test]
+    fn workload_identity_failure_rejects_arbitrary_error_values_and_bounds_codes() {
+        let body = serde_json::json!({
+            "error": "secret-arbitrary-error",
+            "error_codes": [
+                "secret-code", -1, 4_294_967_296_u64, 70021, 1, 2, 3, 4, 987654321
+            ],
+            "message": "arbitrary private message"
+        });
+        let output = token_exchange_failure(reqwest::StatusCode::FORBIDDEN, body.to_string().as_bytes()).to_string();
+        assert!(output.ends_with("workload identity token exchange failed (HTTP 403); error_codes=70021,1,2,3,4"));
+        assert!(!output.contains("secret"));
+        assert!(!output.contains("arbitrary"));
+        assert!(!output.contains("987654321"));
+    }
 
     /// Scenario: the actual CLI shape is a shell wrapper with a Python descendant.
     /// Guarantees: acquisition timeout kills descendant work, not only the wrapper.

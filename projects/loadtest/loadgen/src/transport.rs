@@ -15,6 +15,11 @@ use arrow_flight::{
     flight_service_client::FlightServiceClient,
     sql::{CommandStatementUpdate, ProstMessageExt},
 };
+use arrowcol_catalog_client::{
+    INTERNAL_AUTH_CONTEXT_HEADER, INTERNAL_AUTH_EXPIRES_HEADER, INTERNAL_AUTH_METHOD_HEADER,
+    INTERNAL_AUTH_NONCE_HEADER, INTERNAL_AUTH_PAYLOAD_DIGEST_HEADER, INTERNAL_AUTH_SIGNATURE_HEADER,
+    MAX_INTERNAL_AUTH_TTL_MS, payload_digest,
+};
 use arrowcol_flight::{DdlCompletionMetadata, DeliveryGuarantee, PutResultMetadata, decode_ddl_completion_metadata};
 use arrowcol_protocol::{
     AuthContext, AuthMethod, AuthenticatedPrincipal, ImplementationPool, PrincipalId, PrincipalIssuer, PrincipalScope,
@@ -28,11 +33,7 @@ use prost::Message;
 use reqwest::{Client as HttpClient, Url};
 use serde::Serialize;
 use sha2::Sha256;
-use tonic::{
-    Request,
-    metadata::MetadataValue,
-    transport::{Channel, Endpoint},
-};
+use tonic::{Request, metadata::MetadataValue, transport::Channel};
 use uuid::Uuid;
 
 use crate::sdk::GeneratedTable;
@@ -41,9 +42,6 @@ const DO_PUT_PATH: &str = "/arrow.flight.protocol.FlightService/DoPut";
 const EDGE_TIMESTAMP_HEADER: &str = "x-arrowcol-edge-timestamp";
 const EDGE_NONCE_HEADER: &str = "x-arrowcol-edge-nonce";
 const EDGE_SIGNATURE_HEADER: &str = "x-arrowcol-edge-signature";
-const INTERNAL_AUTH_CONTEXT_HEADER: &str = "x-arrowcol-internal-auth-context";
-const INTERNAL_AUTH_EXPIRES_HEADER: &str = "x-arrowcol-internal-auth-expires";
-const INTERNAL_AUTH_SIGNATURE_HEADER: &str = "x-arrowcol-internal-auth-signature";
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -64,7 +62,11 @@ pub struct CapabilityEvidence {
 /// Shared Flight/HTTP clients and trusted-edge request signer.
 #[derive(Clone)]
 pub struct FlightTransport {
-    channel: Channel,
+    channels: Arc<Vec<Channel>>,
+    next_channel: Arc<AtomicU64>,
+    channel_offset: usize,
+    channel_count: usize,
+    tuning: crate::tuning::ClientTuning,
     catalog_channel: Channel,
     http: HttpClient,
     signer: EdgeSigner,
@@ -84,28 +86,78 @@ impl FlightTransport {
         internal_secret_file: &Path,
         timeout: Duration,
     ) -> Result<Self> {
-        let endpoint = Endpoint::from_shared(flight_endpoint.to_owned())?
-            .connect_timeout(timeout)
-            .timeout(timeout)
-            .http2_keep_alive_interval(Duration::from_secs(10))
-            .keep_alive_while_idle(true);
-        let channel = endpoint.connect().await?;
-        let catalog_channel = Endpoint::from_shared(catalog_endpoint.to_owned())?
-            .connect_timeout(timeout)
-            .timeout(timeout)
-            .connect()
-            .await?;
+        Self::connect_tuned(
+            flight_endpoint,
+            catalog_endpoint,
+            edge_secret_file,
+            internal_secret_file,
+            timeout,
+            crate::tuning::ClientTuning::default(),
+            1,
+        )
+        .await
+    }
+
+    /// Connects a bounded persistent channel pool using validated client settings.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid capacity and propagates signing or connection failures.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn connect_tuned(
+        flight_endpoint: &str,
+        catalog_endpoint: &str,
+        edge_secret_file: &Path,
+        internal_secret_file: &Path,
+        timeout: Duration,
+        tuning: crate::tuning::ClientTuning,
+        channel_count: usize,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            (1..=4096).contains(&channel_count),
+            "Flight channel count must be 1..=4096"
+        );
+        let endpoint = tuning.endpoint(flight_endpoint, timeout)?;
+        let mut channels = Vec::with_capacity(channel_count);
+        for _ in 0..channel_count {
+            channels.push(endpoint.connect().await?);
+        }
+        let catalog_channel = tuning.endpoint(catalog_endpoint, timeout)?.connect().await?;
         let http = HttpClient::builder()
             .connect_timeout(timeout)
             .timeout(timeout)
             .build()?;
         Ok(Self {
-            channel,
+            channels: Arc::new(channels),
+            next_channel: Arc::new(AtomicU64::new(0)),
+            channel_offset: 0,
+            channel_count,
+            tuning,
             catalog_channel,
             http,
             signer: EdgeSigner::from_file(edge_secret_file)?,
             internal_signer: InternalSigner::from_file(internal_secret_file)?,
         })
+    }
+
+    pub(crate) fn for_lane(&self, lane: usize) -> Result<Self> {
+        let mut transport = self.clone();
+        let count = self.tuning.connections_per_worker;
+        let offset = lane.checked_mul(count).context("lane channel offset overflow")?;
+        anyhow::ensure!(
+            offset + count <= self.channels.len(),
+            "lane exceeds prepared channel pool"
+        );
+        transport.channel_offset = offset;
+        transport.channel_count = count;
+        transport.next_channel = Arc::new(AtomicU64::new(0));
+        Ok(transport)
+    }
+
+    fn client(&self, channel: Channel) -> FlightServiceClient<Channel> {
+        FlightServiceClient::new(channel)
+            .max_encoding_message_size(self.tuning.max_message_bytes)
+            .max_decoding_message_size(self.tuning.max_message_bytes)
     }
 
     /// Registers one strict `CREATE TABLE` through Flight SQL `DoPut`.
@@ -128,14 +180,16 @@ impl FlightTransport {
             cmd: command.as_any().encode_to_vec().into(),
             path: Vec::new(),
         };
+        let ddl_payload = descriptor.cmd.to_vec();
         let outbound = stream::iter(vec![FlightData {
             flight_descriptor: Some(descriptor),
             ..FlightData::default()
         }]);
         let mut request = Request::new(outbound);
-        self.internal_signer.decorate_catalog_request(&mut request)?;
+        self.internal_signer
+            .decorate_catalog_request(&mut request, DO_PUT_PATH, &ddl_payload)?;
         request.set_timeout(timeout);
-        let mut client = FlightServiceClient::new(self.catalog_channel.clone());
+        let mut client = self.client(self.catalog_channel.clone());
         let response = tokio::time::timeout(timeout, client.do_put(request))
             .await
             .context("Flight SQL registration timed out")??;
@@ -175,7 +229,9 @@ impl FlightTransport {
         ];
         self.decorate_request(&mut request, DO_PUT_PATH, &pairs)?;
         request.set_timeout(timeout);
-        let mut client = FlightServiceClient::new(self.channel.clone());
+        let index =
+            self.channel_offset + self.next_channel.fetch_add(1, Ordering::Relaxed) as usize % self.channel_count;
+        let mut client = self.client(self.channels[index].clone());
         let response = tokio::time::timeout(timeout, client.do_put(request))
             .await
             .context("Arrow Flight DoPut timed out before response")??;
@@ -288,7 +344,7 @@ impl InternalSigner {
         Ok(Self { secret: bytes.into() })
     }
 
-    fn decorate_catalog_request<T>(&self, request: &mut Request<T>) -> Result<()> {
+    fn decorate_catalog_request<T>(&self, request: &mut Request<T>, method: &str, payload: &[u8]) -> Result<()> {
         let now = UnixMillis::new(now_unix_millis())?;
         let mut scopes = BTreeSet::new();
         scopes.insert(PrincipalScope::new("arrowcol/catalog")?);
@@ -301,15 +357,21 @@ impl InternalSigner {
         let encoded_context = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&context)?);
         let expiry = now
             .get()
-            .checked_add(30_000)
+            .checked_add(MAX_INTERNAL_AUTH_TTL_MS)
             .context("internal identity expiry overflow")?;
-        let canonical = format!("{encoded_context}\n{expiry}");
+        let expiry = expiry.to_string();
+        let nonce = Uuid::new_v4().simple().to_string();
+        let digest = payload_digest(payload);
+        let canonical = format!("{encoded_context}\n{expiry}\n{method}\n{digest}\n{nonce}");
         let mut mac = HmacSha256::new_from_slice(&self.secret).context("initialize internal HMAC")?;
         mac.update(canonical.as_bytes());
         let signature = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
         for (key, value) in [
             (INTERNAL_AUTH_CONTEXT_HEADER, encoded_context),
-            (INTERNAL_AUTH_EXPIRES_HEADER, expiry.to_string()),
+            (INTERNAL_AUTH_EXPIRES_HEADER, expiry),
+            (INTERNAL_AUTH_METHOD_HEADER, method.to_owned()),
+            (INTERNAL_AUTH_NONCE_HEADER, nonce),
+            (INTERNAL_AUTH_PAYLOAD_DIGEST_HEADER, digest),
             (INTERNAL_AUTH_SIGNATURE_HEADER, signature),
         ] {
             request.metadata_mut().insert(key, MetadataValue::from_str(&value)?);
@@ -356,7 +418,7 @@ fn canonical_edge_request(
     timestamp: u64,
     nonce: &str,
 ) -> Result<String> {
-    const SIGNED_HEADERS: [&str; 8] = [
+    const SIGNED_HEADERS: [&str; 9] = [
         "x-arrowcol-protocol-version",
         "x-arrowcol-implementation-pool",
         "x-arrowcol-catalog",
@@ -364,6 +426,7 @@ fn canonical_edge_request(
         "x-arrowcol-table",
         "x-arrowcol-schema-fingerprint",
         "x-arrowcol-control-operation",
+        "x-arrowcol-oat-run-id",
         "content-type",
     ];
     if path.is_empty()
@@ -425,6 +488,82 @@ fn bounded_error(value: &str) -> String {
 #[cfg(test)]
 mod error_diagnostics_tests {
     use super::*;
+
+    #[test]
+    fn canonical_edge_request_matches_wire_golden_vector() -> Result<()> {
+        let mut headers = HeaderMap::new();
+        for (key, value) in [
+            ("x-arrowcol-protocol-version", "1"),
+            ("x-arrowcol-implementation-pool", "dataflow"),
+            ("x-arrowcol-catalog", "telemetry"),
+            ("x-arrowcol-schema", "prod"),
+            ("x-arrowcol-table", "traces"),
+            ("x-arrowcol-schema-fingerprint", "sha256:0123456789abcdef"),
+            ("x-arrowcol-oat-run-id", "00000000-0000-0000-0000-000000000001"),
+            ("content-type", "application/grpc"),
+        ] {
+            headers.insert(key, HeaderValue::from_static(value));
+        }
+        let expected = concat!(
+            "100000\nwire-golden-1\nPOST\n/arrow.flight.protocol.FlightService/DoPut\n",
+            "x-arrowcol-protocol-version:1\n",
+            "x-arrowcol-implementation-pool:dataflow\n",
+            "x-arrowcol-catalog:telemetry\n",
+            "x-arrowcol-schema:prod\n",
+            "x-arrowcol-table:traces\n",
+            "x-arrowcol-schema-fingerprint:sha256:0123456789abcdef\n",
+            "x-arrowcol-control-operation:\n",
+            "x-arrowcol-oat-run-id:00000000-0000-0000-0000-000000000001\n",
+            "content-type:application/grpc\n",
+        );
+        assert_eq!(
+            canonical_edge_request(
+                &Method::POST,
+                "/arrow.flight.protocol.FlightService/DoPut",
+                &headers,
+                100_000,
+                "wire-golden-1",
+            )?,
+            expected
+        );
+        headers.remove("x-arrowcol-oat-run-id");
+        let absent_expected = concat!(
+            "100000\nwire-golden-1\nPOST\n/arrow.flight.protocol.FlightService/DoPut\n",
+            "x-arrowcol-protocol-version:1\n",
+            "x-arrowcol-implementation-pool:dataflow\n",
+            "x-arrowcol-catalog:telemetry\n",
+            "x-arrowcol-schema:prod\n",
+            "x-arrowcol-table:traces\n",
+            "x-arrowcol-schema-fingerprint:sha256:0123456789abcdef\n",
+            "x-arrowcol-control-operation:\n",
+            "x-arrowcol-oat-run-id:\n",
+            "content-type:application/grpc\n",
+        );
+        assert_eq!(
+            canonical_edge_request(
+                &Method::POST,
+                "/arrow.flight.protocol.FlightService/DoPut",
+                &headers,
+                100_000,
+                "wire-golden-1",
+            )?,
+            absent_expected
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn edge_signer_covers_oat_run_id_even_when_absent() -> Result<()> {
+        let run_id = "00000000-0000-0000-0000-000000000001";
+        let mut headers = HeaderMap::new();
+        let absent = canonical_edge_request(&Method::POST, DO_PUT_PATH, &headers, 100_000, "nonce")?;
+        assert!(absent.contains("\nx-arrowcol-oat-run-id:\n"));
+        headers.insert("x-arrowcol-oat-run-id", HeaderValue::from_static(run_id));
+        let present = canonical_edge_request(&Method::POST, DO_PUT_PATH, &headers, 100_000, "nonce")?;
+        assert!(present.contains(&format!("\nx-arrowcol-oat-run-id:{run_id}\n")));
+        assert_ne!(absent, present);
+        Ok(())
+    }
 
     #[test]
     fn status_fields_keep_error_code_and_redact_private_values() {

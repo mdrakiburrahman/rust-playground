@@ -300,6 +300,32 @@ fn sealed_final_optimize_two_passes_with_more_than_64_small_files() -> Result<()
     Ok(())
 }
 
+#[test]
+fn unsorted_optimize_respects_output_row_group_limit() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let table = create(root.path())?;
+    append(&table, 0, 0..7)?;
+    append(&table, 0, 7..14)?;
+    append(&table, 1, 14..15)?;
+    let maintenance = DeltaTable::open_for_maintenance(&url_of(root.path())?)?;
+    let config = OptimizeConfig {
+        use_default_layout: false,
+        output_row_group_rows: 3,
+        ..optimize_config()
+    };
+    let before = rows(root.path())?;
+    let plan = maintenance.plan_optimize(&config)?;
+    let report = maintenance.apply_optimize(&plan, &config, &control())?;
+    assert_eq!(report.outcome, Outcome::Committed);
+    assert_eq!(rows(root.path())?, before);
+    let reader =
+        ParquetRecordBatchReaderBuilder::try_new(fs::File::open(data_path(root.path(), &report.outputs[0])?)?)?;
+    let groups = reader.metadata().row_groups();
+    assert_eq!(groups.len(), 5);
+    assert!(groups.iter().all(|group| group.num_rows() <= 3));
+    Ok(())
+}
+
 /// Scenario: four minute partitions of two small files each, latest-2 OPTIMIZE.
 /// Guarantees: the newest partition is protected, only the latest two closed partitions
 /// are rewritten from real Parquet with identical rows/schema in one dataChange=false

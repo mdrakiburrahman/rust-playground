@@ -137,6 +137,9 @@ requires a session token and JSON for mutations, and exposes only structured
 workflow requests, not shell commands. It refuses to adopt a process already
 listening on an owned registry port. Shutdown drains admitted builds before
 terminating only the registry children it started.
+Owned loopback demo registries explicitly use `dev_only_allow_unsigned`; the
+upstream deployed catalogue defaults to signed identity. This local setting
+does not disable authentication on external catalogues.
 
 ### Failure and recovery
 

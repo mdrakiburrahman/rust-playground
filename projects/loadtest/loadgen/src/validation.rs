@@ -17,6 +17,7 @@ use crate::{
         AckOutcome, CAPABILITY_EVIDENCE_FILE, ROUTING_EVIDENCE_FILE, SCHEMA_CONTRACT_FILE, SEND_MANIFEST_FILE,
         SchemaContract, SendManifestEntry, VALIDATION_FILE,
     },
+    schema::TABLE_COUNT,
 };
 
 /// Wait for real publication queues while their admin endpoints are still alive.
@@ -147,6 +148,18 @@ impl Budget {
     }
 }
 
+fn validate_send_run_ids(run_id: &str, sends: &[SendManifestEntry]) -> Result<()> {
+    ensure!(!run_id.trim().is_empty(), "missing validation run identity");
+    for send in sends {
+        ensure!(
+            send.run_id == run_id,
+            "send manifest record for {} belongs to a different run",
+            send.logical_batch_id
+        );
+    }
+    Ok(())
+}
+
 fn check_drain_evidence(metadata: &Value, publication: &Value, mutators: &Value) -> Result<()> {
     let run_id = metadata["run_id"].as_str().context("missing validation run identity")?;
     anyhow::ensure!(
@@ -181,15 +194,20 @@ pub async fn validate(arguments: ValidateArgs) -> Result<()> {
     };
     let inputs = budget
         .within(ValidatePhase::Inputs, async {
-            Ok::<_, anyhow::Error>((
-                read_json_lines::<SendManifestEntry>(&arguments.results.join(SEND_MANIFEST_FILE)).await?,
-                read_json::<Vec<SchemaContract>>(&arguments.results.join(SCHEMA_CONTRACT_FILE)).await?,
-                read_json::<RoutingEvidence>(&arguments.results.join(ROUTING_EVIDENCE_FILE)).await?,
-                read_json::<Value>(&arguments.results.join(CAPABILITY_EVIDENCE_FILE)).await?,
-            ))
+            let sends = read_json_lines::<SendManifestEntry>(&arguments.results.join(SEND_MANIFEST_FILE)).await?;
+            let contracts = read_json::<Vec<SchemaContract>>(&arguments.results.join(SCHEMA_CONTRACT_FILE)).await?;
+            let routing = read_json::<RoutingEvidence>(&arguments.results.join(ROUTING_EVIDENCE_FILE)).await?;
+            let capabilities = read_json::<Value>(&arguments.results.join(CAPABILITY_EVIDENCE_FILE)).await?;
+            let metadata = read_json::<Value>(&arguments.results.join("run-metadata.json")).await?;
+            let run_id = metadata["run_id"]
+                .as_str()
+                .filter(|run_id| !run_id.trim().is_empty())
+                .context("missing validation run identity")?;
+            validate_send_run_ids(run_id, &sends)?;
+            Ok::<_, anyhow::Error>((sends, contracts, routing, capabilities, metadata))
         })
         .await;
-    let (sends, contracts, routing, capabilities) = match inputs {
+    let (sends, contracts, routing, capabilities, metadata) = match inputs {
         Ok(inputs) => inputs,
         Err(error) => return fail_early(&arguments, Some(&budget), ValidatePhase::Inputs, error).await,
     };
@@ -204,7 +222,6 @@ pub async fn validate(arguments: ValidateArgs) -> Result<()> {
     let kusto_settle = if arguments.collectors_drained {
         let drained = budget
             .within(ValidatePhase::DrainPublication, async {
-                let metadata = read_json(&arguments.results.join("run-metadata.json")).await?;
                 let publication = read_json(&arguments.results.join("publication-drain.json")).await?;
                 let mutators = read_json(&arguments.results.join("mutator-drain.json")).await?;
                 check_drain_evidence(&metadata, &publication, &mutators)
@@ -236,8 +253,8 @@ pub async fn validate(arguments: ValidateArgs) -> Result<()> {
     };
     check(!sends.is_empty(), "send manifest is empty", &mut failures);
     check(
-        contracts.len() == 13,
-        "schema contract does not contain 13 tables",
+        contracts.len() == TABLE_COUNT,
+        "schema contract does not contain 32 tables",
         &mut failures,
     );
     let contract_map = contracts
@@ -289,6 +306,7 @@ pub async fn validate(arguments: ValidateArgs) -> Result<()> {
 
     let mut admitted_rows = BTreeMap::<String, BTreeMap<String, u64>>::new();
     let mut required_rows = BTreeMap::<String, BTreeMap<String, u64>>::new();
+    let mut required_row_hashes = BTreeMap::<String, BTreeMap<String, BTreeMap<String, u64>>>::new();
     let mut expected_tables = BTreeMap::<String, BTreeSet<String>>::new();
     for ((pool, logical_id), values) in &attempts {
         let successes = values
@@ -311,6 +329,7 @@ pub async fn validate(arguments: ValidateArgs) -> Result<()> {
                     && entry.rows == first.rows
                     && entry.payload_sha256 == first.payload_sha256
                     && entry.schema_fingerprint == first.schema_fingerprint
+                    && entry.row_hashes == first.row_hashes
             }),
             &format!("{pool} logical batch {logical_id} changed across retries"),
             &mut failures,
@@ -331,6 +350,18 @@ pub async fn validate(arguments: ValidateArgs) -> Result<()> {
             // guarantees that the table received a published copy.
             if arguments.quiver {
                 *required += rows;
+                if first.outcome == AckOutcome::DurableAdmission {
+                    let expected = required_row_hashes
+                        .entry(pool.clone())
+                        .or_default()
+                        .entry(first.table.clone())
+                        .or_default();
+                    if let Err(error) = merge_row_hashes(expected, &first.row_hashes, first.rows) {
+                        failures.push(format!(
+                            "{pool} logical batch {logical_id} has invalid durable row hashes: {error:#}"
+                        ));
+                    }
+                }
             } else if *required == 0 || rows < *required {
                 *required = rows;
             }
@@ -434,6 +465,7 @@ pub async fn validate(arguments: ValidateArgs) -> Result<()> {
             snapshot,
             &contract_map,
             required_rows.get("dataflow"),
+            required_row_hashes.get("dataflow"),
             &mut failures,
         );
     }
@@ -519,7 +551,7 @@ pub async fn validate(arguments: ValidateArgs) -> Result<()> {
         );
     }
     println!(
-        "PASS: 13 schemas, Dataflow rows, routing, capabilities, and {} Delta files",
+        "PASS: {TABLE_COUNT} schemas, Dataflow rows, routing, capabilities, and {} Delta files",
         report.dataflow.as_ref().map_or(0, |snapshot| snapshot.files)
     );
     Ok(())
@@ -530,6 +562,7 @@ fn validate_snapshot(
     snapshot: &SnapshotSummary,
     contracts: &BTreeMap<String, &SchemaContract>,
     expected_rows: Option<&BTreeMap<String, u64>>,
+    expected_row_hashes: Option<&BTreeMap<String, BTreeMap<String, u64>>>,
     failures: &mut Vec<String>,
 ) {
     let Some(expected_rows) = expected_rows else {
@@ -554,6 +587,9 @@ fn validate_snapshot(
             ),
             failures,
         );
+        if let Some(expected) = expected_row_hashes.and_then(|tables| tables.get(table)) {
+            validate_row_multiset(pool, table, expected, &actual.row_hashes, failures);
+        }
         validate_table_storage(pool, table, actual, failures);
         if let Some(contract) = contracts.get(table) {
             validate_delta_schema(pool, table, actual, contract, failures);
@@ -563,6 +599,48 @@ fn validate_snapshot(
         check(
             contracts.contains_key(table),
             &format!("{pool} Delta root contains cross-table output {table}"),
+            failures,
+        );
+    }
+}
+
+fn merge_row_hashes(target: &mut BTreeMap<String, u64>, rows: &[(String, u64)], expected_rows: usize) -> Result<()> {
+    ensure!(!rows.is_empty(), "durable acknowledgement has no expected row hashes");
+    let mut seen = BTreeSet::new();
+    let total = rows.iter().try_fold(0_u64, |total, (hash, count)| {
+        ensure!(hash.starts_with("sha256:"), "invalid expected row hash");
+        ensure!(*count > 0, "expected row hash has zero multiplicity");
+        ensure!(seen.insert(hash), "expected row hash appears more than once");
+        total.checked_add(*count).context("expected row count overflow")
+    })?;
+    ensure!(
+        total == u64::try_from(expected_rows).context("expected row count conversion")?,
+        "expected row hashes account for {total} rows, not {expected_rows}"
+    );
+    for (hash, count) in rows {
+        let current = target.entry(hash.clone()).or_default();
+        *current = current
+            .checked_add(*count)
+            .context("durable row multiplicity overflow")?;
+    }
+    Ok(())
+}
+
+fn validate_row_multiset(
+    pool: &str,
+    table: &str,
+    expected: &BTreeMap<String, u64>,
+    actual: &BTreeMap<String, u64>,
+    failures: &mut Vec<String>,
+) {
+    for (hash, count) in expected {
+        let observed = actual.get(hash).copied().unwrap_or_default();
+        check(
+            observed >= *count,
+            &format!(
+                "{pool} {table} is missing {} durably acknowledged row(s) with hash {hash}",
+                count.saturating_sub(observed)
+            ),
             failures,
         );
     }
@@ -1174,7 +1252,10 @@ mod tests {
     async fn late_kusto_failure_reports_survive_missing_metadata_and_corrupt_status() -> Result<()> {
         let deadline = unix_now_ms()? + 570_000;
         let arguments = [UNREACHABLE_KUSTO[0], UNREACHABLE_KUSTO[1], "--collectors-drained"];
-        for (test, corrupt_status) in [("late-kusto-metadata", None), ("late-kusto-status", Some("{corrupt"))] {
+        for (test, corrupt_status, phase) in [
+            ("late-kusto-metadata", None, "inputs"),
+            ("late-kusto-status", Some("{corrupt"), "drain-publication"),
+        ] {
             let results = results_directory(test)?;
             for (file, contents) in [
                 (SEND_MANIFEST_FILE, ""),
@@ -1193,7 +1274,7 @@ mod tests {
             }
             let error = validate(validate_arguments(&results.0, deadline, &arguments)?).await;
             assert!(error.is_err());
-            assert_kusto_diagnostics(&results.0, "drain-publication", corrupt_status).await?;
+            assert_kusto_diagnostics(&results.0, phase, corrupt_status).await?;
         }
         Ok(())
     }
@@ -1331,5 +1412,132 @@ mod tests {
             failures,
             ["dataflow collector delivery guarantee did not match best-effort admission"]
         );
+    }
+
+    #[tokio::test]
+    async fn validation_requires_run_metadata_even_without_kusto() -> Result<()> {
+        let results = results_directory("missing-run-metadata")?;
+        for (file, contents) in [
+            (SEND_MANIFEST_FILE, ""),
+            (SCHEMA_CONTRACT_FILE, "[]"),
+            (
+                ROUTING_EVIDENCE_FILE,
+                r#"{"loaded_at_unix_ms":0,"collectors":[],"leases":[]}"#,
+            ),
+            (CAPABILITY_EVIDENCE_FILE, "{}"),
+        ] {
+            std::fs::write(results.0.join(file), contents)?;
+        }
+
+        let error = validate(validate_arguments(&results.0, unix_now_ms()? + 570_000, &[])?)
+            .await
+            .err()
+            .context("validation without run metadata must fail")?;
+        let report: Value = read_json(&results.0.join(VALIDATION_FILE)).await?;
+        assert_eq!(report["failed_phase"], "inputs", "{error:#}");
+        assert_eq!(report["failures"].as_array().map(Vec::len), Some(1));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn validation_rejects_stale_send_records_before_accounting() -> Result<()> {
+        let results = results_directory("stale-send-run-id")?;
+        for (file, contents) in [
+            ("run-metadata.json", r#"{"run_id":"current-run"}"#),
+            (
+                SEND_MANIFEST_FILE,
+                r#"{"run_id":"stale-run","scenario":"dataflow","phase":"load","logical_batch_id":"stale-run:dataflow:load:0","ordinal":0,"table_batch_ordinal":0,"table":"telemetry.sqlserver.sqlserver_wait_stats","schema_version":1,"schema_fingerprint":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","rows":1,"arrow_bytes":1,"payload_sha256":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","row_sha256":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","row_hashes":[],"lane":0,"pool":"dataflow","attempt":1,"sent_at_unix_ms":1,"acknowledged_at_unix_ms":1,"outcome":"error","error_code":"unavailable","error":"failed"}"#,
+            ),
+            (SCHEMA_CONTRACT_FILE, "[]"),
+            (
+                ROUTING_EVIDENCE_FILE,
+                r#"{"loaded_at_unix_ms":0,"collectors":[],"leases":[]}"#,
+            ),
+            (CAPABILITY_EVIDENCE_FILE, "{}"),
+        ] {
+            std::fs::write(results.0.join(file), contents)?;
+        }
+
+        let error = validate(validate_arguments(&results.0, unix_now_ms()? + 570_000, &[])?)
+            .await
+            .err()
+            .context("a stale send record must fail validation")?;
+        let report: Value = read_json(&results.0.join(VALIDATION_FILE)).await?;
+        assert_eq!(report["failed_phase"], "inputs", "{error:#}");
+        assert!(
+            report["failures"][0]
+                .as_str()
+                .is_some_and(|failure| failure.contains("different run")),
+            "{}",
+            report["failures"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn durable_row_multiset_rejects_duplicates_substituting_for_missing_payloads() {
+        let expected = BTreeMap::from([("batch-a-row".to_owned(), 1), ("batch-b-row".to_owned(), 1)]);
+        let duplicated_a = BTreeMap::from([("batch-a-row".to_owned(), 2)]);
+        let mut failures = Vec::new();
+        validate_row_multiset("dataflow", "table", &expected, &duplicated_a, &mut failures);
+        assert_eq!(failures.len(), 1);
+
+        let extra_rows = BTreeMap::from([
+            ("batch-a-row".to_owned(), 2),
+            ("batch-b-row".to_owned(), 1),
+            ("unacknowledged-row".to_owned(), 3),
+        ]);
+        failures.clear();
+        validate_row_multiset("dataflow", "table", &expected, &extra_rows, &mut failures);
+        assert!(failures.is_empty(), "{failures:?}");
+    }
+
+    #[tokio::test]
+    async fn default_seed_durable_hashes_validate_against_independent_delta_rows() -> Result<()> {
+        use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+        use arrowcol_protocol::{CatalogName, SchemaName, TableIdentity, TableName};
+        use std::sync::Arc;
+
+        let table = Arc::new(crate::sdk::GeneratedTable {
+            identity: TableIdentity::new(
+                CatalogName::new("telemetry")?,
+                SchemaName::new("sqlserver")?,
+                TableName::new("sqlserver_active_requests")?,
+            ),
+            schema_version: 1,
+            fingerprint: format!("sha256:{}", "a".repeat(64)),
+            descriptor_path: vec![
+                "telemetry".into(),
+                "sqlserver".into(),
+                "sqlserver_active_requests".into(),
+                "v1".into(),
+            ],
+            schema: Arc::new(Schema::new(vec![
+                Field::new("customer_id", DataType::Utf8, false),
+                Field::new(
+                    "sample_time_utc",
+                    DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                    false,
+                ),
+            ])),
+            generated_root: "target/generated".into(),
+        });
+        let batch = crate::generator::build_logical_batch(table, 1_024, 20_260_923).await?;
+        let directory = tempfile::tempdir()?;
+        let identity = batch.table.identity.to_string();
+        let mut writer = arrow_deltalake::delta::DeltaTableWriter::open(directory.path().join(&identity))?;
+        writer.write(&batch.record_batch).await?;
+        writer.close().await?;
+        let snapshot = delta_inspect::summarize(directory.path()).await?;
+        let mut expected = BTreeMap::new();
+        merge_row_hashes(&mut expected, &batch.row_hashes, batch.rows)?;
+        let mut actual = snapshot.tables[&identity].row_hashes.clone();
+        let mut failures = Vec::new();
+        validate_row_multiset("dataflow", &identity, &expected, &actual, &mut failures);
+        assert!(failures.is_empty(), "{failures:?}");
+        actual.pop_first();
+        validate_row_multiset("dataflow", &identity, &expected, &actual, &mut failures);
+        assert_eq!(failures.len(), 1, "missing durable rows must still fail validation");
+        Ok(())
     }
 }

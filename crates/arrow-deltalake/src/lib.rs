@@ -25,6 +25,8 @@ pub mod commit;
 pub mod delta;
 #[cfg(feature = "delta")]
 mod delta_io;
+#[cfg(feature = "delta")]
+pub use delta_io::{DeltaRuntimeConfig, runtime_config};
 pub mod layout;
 #[cfg(feature = "delta")]
 pub mod maintenance;
@@ -39,6 +41,7 @@ pub mod qap_http;
 pub mod sizing;
 #[cfg(feature = "delta")]
 pub mod telemetry;
+pub mod writer;
 
 /// Stable size and row counters for one completed Parquet file.
 ///
@@ -80,7 +83,7 @@ impl CompletedFile {
 
 /// Streaming Parquet file writer. Dropping it does not finish the file.
 pub struct ParquetFileWriter {
-    writer: AsyncArrowWriter<tokio::fs::File>,
+    writer: Option<AsyncArrowWriter<tokio::fs::File>>,
     durable_handle: File,
     path: PathBuf,
     rows: usize,
@@ -105,6 +108,11 @@ impl ParquetFileWriter {
         schema: SchemaRef,
         properties: Option<WriterProperties>,
     ) -> Result<Self> {
+        let properties = writer::process_config()?.writer_properties(
+            &schema,
+            properties.clone(),
+            &writer::sorting_from_properties(&schema, properties.as_ref())?,
+        )?;
         let path = path.as_ref().to_path_buf();
         let durable_handle = OpenOptions::new()
             .write(true)
@@ -112,9 +120,9 @@ impl ParquetFileWriter {
             .open(&path)
             .with_context(|| format!("create Parquet {}", path.display()))?;
         let output = tokio::fs::File::from_std(durable_handle.try_clone()?);
-        let writer = AsyncArrowWriter::try_new(output, schema, properties)?;
+        let writer = AsyncArrowWriter::try_new(output, schema, Some(properties))?;
         Ok(Self {
-            writer,
+            writer: Some(writer),
             durable_handle,
             path,
             rows: 0,
@@ -149,7 +157,27 @@ impl ParquetFileWriter {
             .input_bytes
             .checked_add(input_bytes)
             .context("input Arrow byte count overflow")?;
-        self.writer.write(batch).await?;
+        #[cfg(feature = "delta")]
+        {
+            let mut writer = self
+                .writer
+                .take()
+                .context("Parquet writer unavailable after interrupted write")?;
+            let batch = batch.clone();
+            let (writer, result) = delta_io::run_cpu_future(async move {
+                let result = writer.write(&batch).await;
+                (writer, result)
+            })
+            .await?;
+            self.writer = Some(writer);
+            result?;
+        }
+        #[cfg(not(feature = "delta"))]
+        self.writer
+            .as_mut()
+            .context("Parquet writer unavailable")?
+            .write(batch)
+            .await?;
         self.rows = rows;
         self.input_bytes = input_bytes;
         Ok(())
@@ -160,7 +188,13 @@ impl ParquetFileWriter {
     /// # Errors
     /// Returns close, metadata, or synchronization errors.
     pub async fn finish(self) -> Result<CompletedFile> {
-        self.writer.close().await?;
+        let writer = self
+            .writer
+            .context("Parquet writer unavailable after interrupted write")?;
+        #[cfg(feature = "delta")]
+        delta_io::run_cpu_future(async move { writer.close().await }).await??;
+        #[cfg(not(feature = "delta"))]
+        writer.close().await?;
         let durable_handle = tokio::fs::File::from_std(self.durable_handle);
         durable_handle.sync_all().await?;
         let bytes = durable_handle.metadata().await?.len();

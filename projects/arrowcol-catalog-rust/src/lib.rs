@@ -3,5 +3,7 @@
 
 mod flight;
 pub use flight::CatalogFlightService;
+mod identity;
+pub use identity::{DdlIdentityPolicy, DdlIdentityVerifier};
 mod service;
-pub use service::{CatalogConfig, CatalogService};
+pub use service::{CatalogCesService, CatalogConfig, CatalogService};

@@ -345,6 +345,8 @@ mod tests {
         });
         let metrics = Arc::new(RuntimeMetrics::new(instance_id));
         metrics.configure_receiver(2, 1_000_000_000, 1_000_000, 10_000, 16, 2);
+        metrics.set_catalog_ready(true);
+        metrics.set_registered(true);
         let resolver = StoreLeaseResolver::new(Arc::clone(&routing) as Arc<dyn RoutingStore>, instance_id)
             .claiming(Duration::from_secs(60));
         let admission = Arc::new(DfeAdmission::new(

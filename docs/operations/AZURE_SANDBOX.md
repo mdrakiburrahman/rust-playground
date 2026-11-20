@@ -12,6 +12,11 @@ deployment or cleanup target. Follow [AKS QAP operations](AKS_QAP.md) for its
 stamp, shared identity, preflight gate and Kubernetes runtime. Do not use this
 legacy sandbox guide to delete or reset the AKS stamp.
 
+The unqualified `bootstrap.ts` examples below do not target the historical
+`rust-playground` resource group: the current CLI defaults to stamped mode and
+uses the private `infra/azure/stamp.yaml` for `arrow-collector-rg`. Only explicit
+schema-evolution mode targets its dedicated sandbox; see its runbook below.
+
 Local disk and local Kusto remain the loadtest default. `--mode azure` (or
 `ARROWCOL_MODE=azure`) switches storage and Kusto together. Azure writers and the
 bootstrap use the existing signed-in Azure CLI identity; Kusto reads Delta using
@@ -34,12 +39,19 @@ Copy the root `.env.example` into repo-bootstrapper's private
 `sync/rust-playground/.env`, fill in the authorized subscription, and let
 repo-bootstrapper distribute it. Never commit or print the filled file.
 
-Run all following commands inside the repository Linux devcontainer:
+The commands below run inside the Linux devcontainer. They target the current
+stamped AKS environment, not the historical sandbox: `config` and `preflight`
+inspect that stamp, and `provision` can create or update resources in
+`arrow-collector-rg`. For current QAP deployment, follow [AKS QAP operations](AKS_QAP.md).
+To target the dedicated schema-evolution sandbox, pass
+`--mode schema-evolution --env-file .env.schema-evo.private` to every bootstrap
+command and follow the [schema-evolution runbook](../../experiments/schema-evolution/README.md).
 
 ```bash
-npx --no-install tsx infra/azure/bootstrap.ts config
-npx --no-install tsx infra/azure/bootstrap.ts preflight
-npx --no-install tsx infra/azure/bootstrap.ts provision
+STAMP_CONFIG=infra/azure/stamp.yaml
+npx --no-install tsx infra/azure/bootstrap.ts config --stamp-config "$STAMP_CONFIG"
+npx --no-install tsx infra/azure/bootstrap.ts preflight --stamp-config "$STAMP_CONFIG"
+npx --no-install tsx infra/azure/bootstrap.ts provision --stamp-config "$STAMP_CONFIG" --preview-before-create
 ```
 
 The orchestration and offline tests are native TypeScript on the repository's
@@ -74,8 +86,10 @@ minimal approved synced-input projection and pre-pass reset sequence.
 For the isolated sandbox, keep resource overrides absent and
 do not reuse the existing table/checkpoint roots. Use a separate `--output`
 file when provisioning; generated configuration preserves the selected group.
-**Reset and stop act on the selected stamp.** Check the resource group before
-using either destructive command.
+Reset and stop act on the selected mode's target. Unqualified commands select
+the stamped environment in `arrow-collector-rg`, not the historical sandbox.
+Check the selected resource group before using either destructive command and
+pass the explicit schema-evolution mode flags when using that dedicated sandbox.
 
 Optional private knobs include region, supported Standard Kusto SKU, QAP hot
 days, identity/database/container names, and autoscaling bounds. Defaults are
@@ -154,9 +168,11 @@ removes them. Storage charges continue until deletion.
 
 ## Cloud occupancy and reset
 
-**Data-plane reset is enabled for this disposable, single-operator sandbox.**
 `reset` previews; `reset --execute` runs the fenced custody sequence below;
 `reset --resume` continues an interrupted cleanup from its custody record.
+These commands explicitly select the private stamp in `infra/azure/stamp.yaml`
+under `arrow-collector-rg`, not the historical `rust-playground` sandbox. Confirm
+that exact stamp and resource group before any execution.
 It refuses unless occupancy is released, the publisher registry is empty and
 authority is `ready-v1`/`fenced-v1`. Known limitation: safety relies on every
 mutating process participating in the publisher registry; processes outside the
@@ -294,10 +310,11 @@ live process will ever clean-release; `release`, `provision` and `reset` then
 refuse. The explicit operator escape hatch is:
 
 ```bash
-npx --no-install tsx infra/azure/bootstrap.ts recover            # preview
-npx --no-install tsx infra/azure/bootstrap.ts recover --execute  # stop local writers, fence, rotate
-npx --no-install tsx infra/azure/bootstrap.ts reset --execute    # data written by the failed run is untrusted
-npx --no-install tsx infra/azure/bootstrap.ts provision          # back to ready-v1
+STAMP_CONFIG=infra/azure/stamp.yaml
+npx --no-install tsx infra/azure/bootstrap.ts recover --stamp-config "$STAMP_CONFIG"
+npx --no-install tsx infra/azure/bootstrap.ts recover --stamp-config "$STAMP_CONFIG" --execute
+npx --no-install tsx infra/azure/bootstrap.ts reset --stamp-config "$STAMP_CONFIG" --execute  # destructive; failed-run data is untrusted
+npx --no-install tsx infra/azure/bootstrap.ts provision --stamp-config "$STAMP_CONFIG" --preview-before-create
 ```
 
 `recover --execute` requires the generation-bound local stop receipt, waits the
@@ -356,15 +373,15 @@ it from a run/occupancy UUID.
 Azure reads.
 
 ```bash
-# Preview only: no mutation.
-npx --no-install tsx infra/azure/bootstrap.ts reset
-# Fence, stop the local loadtest, quiesce 60s, delete the sandbox database,
-# empty the experiment database and delete all blobs in the three containers.
-npx --no-install tsx infra/azure/bootstrap.ts reset --execute
-# Continue an interrupted cleanup from .env.azure.reset.json.
-npx --no-install tsx infra/azure/bootstrap.ts reset --resume
-# Restore the declared baseline (ready-v1).
-npx --no-install tsx infra/azure/bootstrap.ts provision
+STAMP_CONFIG=infra/azure/stamp.yaml
+# Preview only; explicitly selects this private stamp.
+npx --no-install tsx infra/azure/bootstrap.ts reset --stamp-config "$STAMP_CONFIG"
+# Destructive: first stop all publishers and verify the selected group/stamp.
+npx --no-install tsx infra/azure/bootstrap.ts reset --stamp-config "$STAMP_CONFIG" --execute
+# Continue that selected stamp's interrupted cleanup.
+npx --no-install tsx infra/azure/bootstrap.ts reset --stamp-config "$STAMP_CONFIG" --resume
+# Restore the declared baseline (ready-v1) with ARM preview.
+npx --no-install tsx infra/azure/bootstrap.ts provision --stamp-config "$STAMP_CONFIG" --preview-before-create
 ```
 
 Execution verifies exact ownership, HNS, disabled retention, the exact database

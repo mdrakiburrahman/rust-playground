@@ -2,7 +2,7 @@
 
 | Component | Purpose |
 | --- | --- |
-| SQL Server 2022 | Router registrations, pressure snapshots, and routing/fencing leases in the arrowcol database |
+| SQL Server 2022 | Router registrations, pressure snapshots, routing/fencing leases and immutable OAT run ownership in the arrowcol database |
 | Remote Schema Catalog | Authoritative schemas and schema events; runs separately as arrowcol-catalog-rust |
 | Retired | SQL catalog persistence, Java Hive/Thrift sidecar, and client delivery-receipt storage/APIs |
 
@@ -27,8 +27,8 @@ Bootstrap copies .env.example to ignored .env and creates three independent mode
 
 | Database | Principal | Local role |
 | --- | --- | --- |
-| arrowcol | arrowcol_app | db_datareader, db_datawriter for routing state |
-| arrowcol | arrowcol_migrator | db_owner for migrations |
+| arrowcol | arrowcol_app | db_datareader, db_datawriter for ordinary routing state; explicit write DENYs on the three OAT authority tables |
+| arrowcol | arrowcol_migrator | db_owner for migrations and finite trusted OAT pin setup |
 | master | sa | Local bootstrap/administration |
 
 The wrapper reads the Docker secret immediately before launching SQL Server. File permissions are part of the local secret boundary. Production requires platform secret management, trusted TLS certificates, and separately scoped runtime/migration principals.
@@ -39,7 +39,7 @@ The wrapper reads the Docker secret immediately before launching SQL Server. Fil
 | --- | --- |
 | npx --no-install nx run arrowcol-infra:logs | Follow project logs |
 | npx --no-install nx run arrowcol-infra:down | Remove project containers/network; preserve SQL volume |
-| npx --no-install nx run arrowcol-infra:reset | **Delete this project's SQL volume and routing state** |
+| npx --no-install nx run arrowcol-infra:reset | **Delete this project's SQL volume and routing state, including OAT ownership tombstones** |
 | npx --no-install nx run arrowcol-infra:clean | **Delete project SQL volume and locally built images**; preserve secret files |
 
 No command performs a global Docker prune. SQLSERVER_PORT defaults to 14333 and is configurable in .env. SQL readiness executes SELECT 1 through sqlcmd; Compose waits for SQL health and initialization jobs. Initialization fails on the first error; shutdown is bounded by STACK_STOP_SECONDS (default 30s).
@@ -50,9 +50,17 @@ No command performs a global Docker prune. SQLSERVER_PORT defaults to 14333 and 
 | --- | --- |
 | Migration application | Sorted V*.sql under an exclusive SQL application lock; transactional checksum ledger |
 | Reapplication | Identical recorded checksum skips; changed applied file fails |
-| Current state | Routing registrations, pressure history, and routing/fencing leases only; retirement migration removes SQL catalog and delivery tables |
+| Current state | Routing registrations, pressure history, routing/fencing leases and V0011 immutable OAT authority; retirement migration removes SQL catalog and delivery tables |
+| OAT authority | Immutable expected set/digest/expiry, pending-to-bound initialization markers and immutable table-owner pins; expiry does not permit owner recreation |
+| OAT privileges | App SELECT and exact digest-function EXECUTE only; authority-table INSERT/UPDATE/DELETE DENYs override inherited db_datawriter |
 | Payloads | No Arrow payload bytes in SQL |
-| Integration verification | SQL health, routing tables/indexes/constraints, migration checksums, retired-table absence, then idempotent bootstrap/migration rerun |
+| Integration verification | SQL health, routing tables/indexes/constraints/triggers, eleven migration checksums, expected-set/digest integrity, app permissions and actual app digest invocation, retired-table absence, then idempotent bootstrap/migration rerun |
+
+Finite OAT setup uses the dedicated migrator credential and the actual router's
+selection policy to bind every expected pin before admitting the client fleet.
+Creating only the expected set is not readiness, and runtime app pods must
+never receive that credential. See [OAT run authority](../../docs/operations/OAT_RUN_AUTHORITY.md)
+for the digest, trusted binding, secret mounts and retention contract.
 
 Historical migration files remain immutable; they do not describe the current supported topology. Verification stops the stack on exit without deleting its durable volume.
 

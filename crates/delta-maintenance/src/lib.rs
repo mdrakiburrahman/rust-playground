@@ -11,7 +11,7 @@ use arrow_deltalake::maintenance::{
     NegativeProbeConfig, OptimizeConfig, OptimizePlan, Outcome, ProbeOperation, PruneConfig, PurgeConfig, VacuumConfig,
     error_details, now_ms,
 };
-use arrowcol_props::{ResolvedProps, resolve};
+use arrowcol_props::{PropValue, ResolvedProps, resolve};
 use serde::Serialize;
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Write as _;
@@ -27,6 +27,7 @@ pub const MAX_TABLES: usize = 256;
 /// Maximum concurrently maintained tables.
 pub const MAX_CONCURRENT_TABLES: usize = 16;
 const MAX_HTTP_REQUEST: usize = 8 * 1024;
+const MAX_STALE_DISCOVERY_RETRIES: usize = 2;
 
 /// Maintenance operation, run one at a time per table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, clap::ValueEnum)]
@@ -61,6 +62,38 @@ impl Operation {
     }
 }
 
+/// Process-level bounds for existing non-OPTIMIZE operations.
+#[derive(Clone, Debug, Serialize)]
+pub struct OperationLimits {
+    pub purge_max_files_per_commit: usize,
+    pub purge_max_plan_bytes: usize,
+    pub vacuum_delete_chunk: usize,
+    pub vacuum_max_plan_bytes: usize,
+    pub replay_max_log_files: usize,
+    pub replay_max_log_file_bytes: u64,
+    pub replay_max_checkpoint_bytes: u64,
+    pub operation_max_active_files: usize,
+    pub discovery_max_log_files: usize,
+    pub discovery_max_log_file_bytes: u64,
+}
+
+impl Default for OperationLimits {
+    fn default() -> Self {
+        Self {
+            purge_max_files_per_commit: 10_000,
+            purge_max_plan_bytes: 4 * 1024 * 1024,
+            vacuum_delete_chunk: 256,
+            vacuum_max_plan_bytes: 8 * 1024 * 1024,
+            replay_max_log_files: 100_000,
+            replay_max_log_file_bytes: 64 * 1024 * 1024,
+            replay_max_checkpoint_bytes: 256 * 1024 * 1024,
+            operation_max_active_files: 1_000_000,
+            discovery_max_log_files: 100_000,
+            discovery_max_log_file_bytes: 64 * 1024 * 1024,
+        }
+    }
+}
+
 /// Validated service settings.
 #[derive(Clone, Debug)]
 pub struct Settings {
@@ -72,7 +105,12 @@ pub struct Settings {
     pub max_idle_backoff: Duration,
     pub max_cycles: Option<u64>,
     pub max_concurrent_tables: usize,
+    /// Optional aggregate budget for per-bin decoded-byte limits, not an RSS cap.
+    pub max_concurrent_decoded_bytes: Option<u64>,
     pub operation_timeout: Duration,
+    pub commit_attempts: u32,
+    pub commit_budget: Duration,
+    pub catalog_options: catalog::CatalogOptions,
     pub granularity: Option<Granularity>,
     pub purge_retention_ms: Option<i64>,
     pub anchor_ms: Option<i64>,
@@ -81,6 +119,8 @@ pub struct Settings {
     pub allow_short_vacuum_retention: bool,
     pub unsafe_short_vacuum_for_tests: bool,
     pub optimize: OptimizeConfig,
+    /// Explicit process defaults for registered table properties.
+    pub process_properties: BTreeMap<String, String>,
     /// Minimum commits after the hinted checkpoint before `checkpoint` writes one.
     pub checkpoint_every_commits: u64,
     /// `prune-log` commit-age retention; `None` uses `delta.logRetentionDuration`
@@ -88,6 +128,7 @@ pub struct Settings {
     pub log_retention_ms: Option<i64>,
     /// Maximum log objects one `prune-log` apply deletes.
     pub max_prune_files: usize,
+    pub operation_limits: OperationLimits,
 }
 
 impl Settings {
@@ -125,6 +166,20 @@ impl Settings {
         if self.max_prune_files == 0 {
             bail!("--max-prune-files must be nonzero");
         }
+        let limits = &self.operation_limits;
+        if limits.purge_max_files_per_commit == 0
+            || limits.purge_max_plan_bytes < 1024
+            || limits.vacuum_delete_chunk == 0
+            || limits.vacuum_max_plan_bytes < 1024
+            || limits.replay_max_log_files == 0
+            || limits.replay_max_log_file_bytes == 0
+            || limits.replay_max_checkpoint_bytes == 0
+            || limits.operation_max_active_files == 0
+            || limits.discovery_max_log_files == 0
+            || limits.discovery_max_log_file_bytes == 0
+        {
+            bail!("operation limits must be positive; plan byte limits must be at least 1024");
+        }
         if self.log_retention_ms.is_some_and(|retention| retention < 0) {
             bail!("log retention must not be negative");
         }
@@ -151,7 +206,25 @@ impl Settings {
         if self.vacuum_retention_ms < 0 {
             bail!("VACUUM retention must not be negative");
         }
-        self.optimize.validate()
+        self.optimize.validate()?;
+        self.catalog_options.validate()?;
+        self.validate_decoded_budget(self.optimize.max_decoded_bytes_per_bin)?;
+        MaintenanceControl::default().with_commit_retry_limits(self.commit_attempts, self.commit_budget)?;
+        resolve(&BTreeMap::new(), &process_defaults(self))?;
+        Ok(())
+    }
+
+    fn validate_decoded_budget(&self, per_bin: u64) -> Result<()> {
+        if let Some(budget) = self.max_concurrent_decoded_bytes {
+            let concurrency = u64::try_from(self.max_concurrent_tables)?;
+            let total = per_bin
+                .checked_mul(concurrency)
+                .context("concurrent decode budget overflow")?;
+            if budget == 0 || total > budget {
+                bail!("per-bin decoded limit times concurrent tables exceeds the aggregate decode budget");
+            }
+        }
+        Ok(())
     }
 }
 
@@ -179,6 +252,14 @@ pub trait TableDiscovery: Sync {
     /// # Errors
     /// Returns missing-table, corrupt metadata or authority failures.
     fn table(&self, name: &str) -> Result<DiscoveredTable>;
+
+    /// Return allowlisted tables that are not ready for maintenance yet.
+    ///
+    /// # Errors
+    /// Returns pending-state access failures.
+    fn pending_tables(&self) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
 }
 
 type PropertyCache = BTreeMap<String, (String, BTreeMap<String, String>)>;
@@ -189,6 +270,9 @@ pub struct FilesystemDiscovery {
     root: Url,
     allowlist: Vec<String>,
     cache: Mutex<PropertyCache>,
+    pending_tables: Mutex<Vec<String>>,
+    max_log_files: usize,
+    max_log_file_bytes: u64,
 }
 
 impl FilesystemDiscovery {
@@ -198,7 +282,17 @@ impl FilesystemDiscovery {
             root,
             allowlist,
             cache: Mutex::new(BTreeMap::new()),
+            pending_tables: Mutex::new(Vec::new()),
+            max_log_files: 100_000,
+            max_log_file_bytes: 64 * 1024 * 1024,
         }
+    }
+
+    #[must_use]
+    pub fn with_log_limits(mut self, max_log_files: usize, max_log_file_bytes: u64) -> Self {
+        self.max_log_files = max_log_files;
+        self.max_log_file_bytes = max_log_file_bytes;
+        self
     }
 
     fn url(&self, name: &str) -> Result<Url> {
@@ -206,14 +300,59 @@ impl FilesystemDiscovery {
         if !root.path().ends_with('/') {
             root.set_path(&format!("{}/", root.path()));
         }
-        Ok(root.join(&format!("{name}/"))?)
+        let components = name.split('.').collect::<Vec<_>>();
+        let relative = if components.len() == 3 && components.iter().all(|component| !component.is_empty()) {
+            components.join("/")
+        } else {
+            name.to_owned()
+        };
+        Ok(root.join(&format!("{relative}/"))?)
     }
 }
 
 impl TableDiscovery for FilesystemDiscovery {
     fn tables(&self) -> Result<Vec<String>> {
         if !self.allowlist.is_empty() {
-            return Ok(self.allowlist.clone());
+            if self.root.scheme() != "file" {
+                return Ok(self.allowlist.clone());
+            }
+            let mut names = Vec::new();
+            let mut pending = Vec::new();
+            for name in &self.allowlist {
+                let table = self.url(name)?;
+                let table_path = table
+                    .to_file_path()
+                    .map_err(|()| anyhow::anyhow!("local table URL is not a filesystem path"))?;
+                let log_path = table_path.join("_delta_log");
+                if !log_path.is_dir() {
+                    pending.push(name.clone());
+                    continue;
+                }
+                let mut entries = std::fs::read_dir(log_path)?;
+                let mut has_delta_state = false;
+                for entry in &mut entries {
+                    let path = entry?.path();
+                    if path
+                        .extension()
+                        .is_some_and(|extension| extension == "json" || extension == "parquet")
+                    {
+                        has_delta_state = true;
+                        break;
+                    }
+                }
+                if has_delta_state {
+                    names.push(name.clone());
+                } else {
+                    pending.push(name.clone());
+                }
+            }
+            pending.sort();
+            pending.dedup();
+            *self
+                .pending_tables
+                .lock()
+                .map_err(|error| anyhow::anyhow!("pending tables mutex poisoned: {error}"))? = pending;
+            return Ok(names);
         }
         let root = self
             .root
@@ -238,31 +377,41 @@ impl TableDiscovery for FilesystemDiscovery {
         Ok(names)
     }
 
-    fn table(&self, name: &str) -> Result<DiscoveredTable> {
-        let url = self.url(name)?;
-        let probe = DeltaTable::open_for_maintenance_probe(&url)?;
-        let token = probe.probe_log_token(100_000)?;
-        let mut cache = self
-            .cache
+    fn pending_tables(&self) -> Result<Vec<String>> {
+        self.pending_tables
             .lock()
-            .map_err(|_| anyhow::anyhow!("property cache poisoned"))?;
-        let properties = match cache.get(name) {
-            Some((cached_token, properties)) if *cached_token == token => properties.clone(),
-            _ => {
-                let properties = probe.maintenance_properties()?;
-                ensure_property_token_unchanged(&token, &probe.probe_log_token(100_000)?)?;
-                if cache.len() >= MAX_TABLES && !cache.contains_key(name) {
-                    cache.clear();
+            .map(|pending| pending.clone())
+            .map_err(|error| anyhow::anyhow!("pending tables mutex poisoned: {error}"))
+    }
+
+    fn table(&self, name: &str) -> Result<DiscoveredTable> {
+        retry_stale_table_discovery(name, || {
+            let url = self.url(name)?;
+            let probe = DeltaTable::open_for_maintenance_probe_with_limit(&url, self.max_log_files)?;
+            let token = probe.probe_log_token(self.max_log_files)?;
+            let mut cache = self
+                .cache
+                .lock()
+                .map_err(|_| anyhow::anyhow!("property cache poisoned"))?;
+            let properties = match cache.get(name) {
+                Some((cached_token, properties)) if *cached_token == token => properties.clone(),
+                _ => {
+                    let properties =
+                        probe.maintenance_properties_with_limits(self.max_log_files, self.max_log_file_bytes)?;
+                    ensure_property_token_unchanged(&token, &probe.probe_log_token(self.max_log_files)?)?;
+                    if cache.len() >= MAX_TABLES && !cache.contains_key(name) {
+                        cache.clear();
+                    }
+                    cache.insert(name.into(), (token.clone(), properties.clone()));
+                    properties
                 }
-                cache.insert(name.into(), (token.clone(), properties.clone()));
-                properties
-            }
-        };
-        Ok(DiscoveredTable {
-            name: name.into(),
-            url,
-            properties,
-            log_token: Some(token),
+            };
+            Ok(DiscoveredTable {
+                name: name.into(),
+                url,
+                properties,
+                log_token: Some(token),
+            })
         })
     }
 }
@@ -284,6 +433,37 @@ mod property_discovery_tests {
     use super::*;
 
     #[test]
+    fn allowlisted_local_tables_are_discovered_after_their_delta_log_is_created() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let name = "telemetry.sqlserver.sqlserver_active_sessions";
+        let url = Url::from_directory_path(root.path())
+            .map_err(|()| anyhow::anyhow!("temporary root is not a filesystem URL"))?;
+        let discovery = FilesystemDiscovery::new(url, vec![name.to_owned()]);
+        assert!(discovery.tables()?.is_empty());
+        let table_path = root
+            .path()
+            .join("telemetry/sqlserver/sqlserver_active_sessions/_delta_log");
+        std::fs::create_dir_all(&table_path)?;
+        std::fs::write(table_path.join("00000000000000000000.json"), "{}")?;
+        assert_eq!(discovery.tables()?, vec![name]);
+        Ok(())
+    }
+
+    #[test]
+    fn filesystem_discovery_resolves_qualified_table_identities_as_nested_paths() -> Result<()> {
+        let discovery = FilesystemDiscovery::new(Url::parse("file:///tmp/arrowcol/dataflow")?, Vec::new());
+        assert_eq!(
+            discovery.url("telemetry.sqlserver.sqlserver_active_sessions")?.as_str(),
+            "file:///tmp/arrowcol/dataflow/telemetry/sqlserver/sqlserver_active_sessions/"
+        );
+        assert_eq!(
+            discovery.url("legacy_table")?.as_str(),
+            "file:///tmp/arrowcol/dataflow/legacy_table/"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn token_change_is_stale_plan_not_a_successful_probe() -> Result<()> {
         ensure_property_token_unchanged("version-1", "version-1")?;
         let Err(error) = ensure_property_token_unchanged("version-1", "version-2") else {
@@ -293,6 +473,61 @@ mod property_discovery_tests {
             error_details(&error).map(|detail| detail.kind),
             Some(MaintenanceErrorKind::StalePlan)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn stale_negative_probe_falls_back_to_full_planner() -> Result<()> {
+        let error = MaintenanceError {
+            kind: MaintenanceErrorKind::StalePlan,
+            message: "table advanced during negative probe; retry".into(),
+            report: None,
+        };
+        let (report, stale) = negative_probe_result::<()>(Err(error.into()))?;
+        assert!(report.is_none());
+        assert!(stale);
+
+        let (report, stale) = negative_probe_result(Ok(Some(7)))?;
+        assert_eq!(report, Some(7));
+        assert!(!stale);
+
+        let error = MaintenanceError {
+            kind: MaintenanceErrorKind::MetadataChanged,
+            message: "table metadata changed".into(),
+            report: None,
+        };
+        assert!(negative_probe_result::<()>(Err(error.into())).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn stale_table_discovery_retries_only_typed_stale_plan() -> Result<()> {
+        let attempts = std::cell::Cell::new(0);
+        let value = retry_stale_table_discovery("test_table", || {
+            attempts.set(attempts.get() + 1);
+            if attempts.get() == 1 {
+                Err(MaintenanceError {
+                    kind: MaintenanceErrorKind::StalePlan,
+                    message: "table advanced during property discovery".into(),
+                    report: None,
+                }
+                .into())
+            } else {
+                Ok(attempts.get())
+            }
+        })?;
+        assert_eq!(value, 2);
+        assert_eq!(attempts.get(), 2);
+
+        let attempts = std::cell::Cell::new(0);
+        let Err(error) = retry_stale_table_discovery::<()>("test_table", || {
+            attempts.set(attempts.get() + 1);
+            Err(anyhow::anyhow!("invalid configuration"))
+        }) else {
+            bail!("non-stale discovery error was swallowed");
+        };
+        assert!(error.to_string().contains("invalid configuration"));
+        assert_eq!(attempts.get(), 1);
         Ok(())
     }
 }
@@ -425,6 +660,7 @@ fn process_defaults(settings: &Settings) -> BTreeMap<String, String> {
             props.insert(key.into(), value);
         }
     }
+    props.extend(settings.process_properties.clone());
     props
 }
 
@@ -432,6 +668,9 @@ fn effective_settings(settings: &Settings, properties: &BTreeMap<String, String>
     let mut defaults = process_defaults(settings);
     if (properties.contains_key("arrowcol.optimize.targetFileSize") || properties.contains_key("delta.targetFileSize"))
         && !properties.contains_key("arrowcol.optimize.smallFileSize")
+        && !settings
+            .process_properties
+            .contains_key("arrowcol.optimize.smallFileSize")
     {
         // The CLI small-file default is derived from its target, not an
         // independently supplied policy. Re-derive it from a table target.
@@ -479,6 +718,7 @@ fn effective_settings(settings: &Settings, properties: &BTreeMap<String, String>
         usize::try_from(props.unsigned("arrowcol.optimize.maxActionsPerCommit")?)?;
     effective.optimize.max_plan_bytes = usize::try_from(props.unsigned("arrowcol.optimize.maxPlanSize")?)?;
     effective.optimize.max_decoded_bytes_per_bin = props.unsigned("arrowcol.optimize.maxDecodedSizePerBin")?;
+    effective.validate_decoded_budget(effective.optimize.max_decoded_bytes_per_bin)?;
     effective.optimize.max_output_file_bytes = props.unsigned("arrowcol.optimize.maxOutputFileSize")?;
     effective.optimize.max_active_files = usize::try_from(props.unsigned("arrowcol.optimize.maxActiveFiles")?)?;
     effective.optimize.max_row_group_bytes = props.unsigned("arrowcol.optimize.maxRowGroupSize")?;
@@ -492,8 +732,96 @@ fn effective_settings(settings: &Settings, properties: &BTreeMap<String, String>
     } else {
         None
     };
+    if properties.contains_key("arrowcol.layout.enabled")
+        || settings.process_properties.contains_key("arrowcol.layout.enabled")
+    {
+        effective.optimize.use_default_layout = false;
+    }
     effective.optimize.validate()?;
     Ok((effective, props))
+}
+
+fn configuration_evidence(startup: &Settings, settings: &Settings, props: &ResolvedProps) -> Result<serde_json::Value> {
+    let mut policy = serde_json::Map::new();
+    for key in arrowcol_props::REGISTRY {
+        let name = key.name;
+        if !(name.starts_with("arrowcol.maintenance.")
+            || name.starts_with("arrowcol.optimize.")
+            || name.starts_with("arrowcol.layout.")
+            || name.starts_with("arrowcol.vacuum.")
+            || name.starts_with("arrowcol.purge.")
+            || name.starts_with("arrowcol.partition.")
+            || matches!(
+                name,
+                "delta.targetFileSize"
+                    | "delta.deletedFileRetentionDuration"
+                    | "delta.logRetentionDuration"
+                    | "delta.checkpointInterval"
+            ))
+        {
+            continue;
+        }
+        let value = match props
+            .get(name)
+            .with_context(|| format!("resolved property missing: {name}"))?
+        {
+            PropValue::Bool(value) => serde_json::json!(value),
+            PropValue::Unsigned(value) => serde_json::json!(value),
+            PropValue::Float(value) => serde_json::json!(value),
+            PropValue::Text(value) => serde_json::json!(value),
+            PropValue::StringList(value) => serde_json::json!(value),
+        };
+        policy.insert(name.to_owned(), value);
+    }
+    let enabled = props.boolean("arrowcol.maintenance.enabled")?;
+    let layout_mode = if settings.optimize.layout.is_some() {
+        "explicit"
+    } else if settings.optimize.use_default_layout {
+        "automatic"
+    } else {
+        "disabled"
+    };
+    Ok(serde_json::json!({
+        "startup": {
+            "apply": startup.apply,
+            "anchor_ms": startup.anchor_ms,
+            "operations": startup.operations,
+            "interval_secs": startup.interval.map(|value| value.as_secs()),
+            "max_idle_backoff_secs": startup.max_idle_backoff.as_secs(),
+            "max_cycles": startup.max_cycles,
+            "max_concurrent_tables": startup.max_concurrent_tables,
+            "max_concurrent_decoded_bytes": startup.max_concurrent_decoded_bytes,
+            "commit_attempts": startup.commit_attempts,
+            "commit_budget_secs": startup.commit_budget.as_secs(),
+            "catalog_runtime_threads": startup.catalog_options.runtime_threads,
+            "catalog_rpc_timeout_secs": startup.catalog_options.rpc_timeout.as_secs(),
+            "catalog_max_decoding_message_bytes": startup.catalog_options.max_decoding_message_bytes,
+            "max_prune_files": startup.max_prune_files,
+            "output_row_group_rows": startup.optimize.output_row_group_rows,
+            "input_read_strategy": startup.optimize.input_read_strategy,
+            "operation_limits": startup.operation_limits,
+        },
+        "table_policy": policy,
+        "parquet_writer_overrides": arrow_deltalake::writer::process_config()?,
+        "active": enabled,
+        "operation_settings": enabled.then(|| serde_json::json!({
+            "layout_mode": layout_mode,
+            "vacuum_retention_ms": settings.vacuum_retention_ms,
+            "log_retention_ms": settings.log_retention_ms,
+            "allow_short_vacuum_retention": settings.allow_short_vacuum_retention,
+            "unsafe_short_vacuum_for_tests": settings.unsafe_short_vacuum_for_tests,
+        })),
+    }))
+}
+
+/// Validated startup defaults, before any table-level overrides.
+///
+/// # Errors
+/// Returns invalid setting or property errors.
+pub fn startup_configuration(settings: &Settings) -> Result<serde_json::Value> {
+    settings.validate()?;
+    let (effective, props) = effective_settings(settings, &BTreeMap::new())?;
+    configuration_evidence(settings, &effective, &props)
 }
 
 fn policy_matches(settings: &Settings, actual: &BTreeMap<String, String>, expected: &ResolvedProps) -> Result<bool> {
@@ -580,6 +908,8 @@ impl OptimizeEvidence {
                 "max_row_group_bytes": config.max_row_group_bytes,
                 "max_batch_bytes": config.max_batch_bytes,
                 "batch_rows": config.batch_rows,
+                "output_row_group_rows": config.output_row_group_rows,
+                "use_default_layout": config.use_default_layout,
                 "max_output_file_bytes": config.max_output_file_bytes,
                 "max_active_files": config.max_active_files,
                 "layout": config.layout.as_ref().map(|layout| serde_json::json!({
@@ -620,6 +950,7 @@ struct Instruments {
     runs: opentelemetry::metrics::Counter<u64>,
     totals: opentelemetry::metrics::Counter<u64>,
     backlog: opentelemetry::metrics::Gauge<u64>,
+    pending_tables: opentelemetry::metrics::Gauge<u64>,
     cutoff: opentelemetry::metrics::Gauge<i64>,
     cycles: opentelemetry::metrics::Counter<u64>,
 }
@@ -631,6 +962,7 @@ impl Instruments {
             runs: meter.u64_counter("delta_maintenance.runs").build(),
             totals: meter.u64_counter("delta_maintenance.items").build(),
             backlog: meter.u64_gauge("delta_maintenance.backlog_files").build(),
+            pending_tables: meter.u64_gauge("delta_maintenance.pending_tables").build(),
             cutoff: meter
                 .i64_gauge("delta_maintenance.retention_cutoff")
                 .with_unit("ms")
@@ -645,6 +977,7 @@ struct Counters {
     runs: BTreeMap<(&'static str, &'static str), u64>,
     totals: BTreeMap<(&'static str, &'static str), u64>,
     gauges: BTreeMap<(&'static str, &'static str), i64>,
+    pending_tables: u64,
     heartbeat_ms: i64,
     cycles: u64,
 }
@@ -680,6 +1013,12 @@ impl Metrics {
             counters.cycles += 1;
         });
         self.1.cycles.add(1, &[]);
+    }
+
+    fn pending_tables(&self, count: usize) {
+        let count = u64::try_from(count).unwrap_or(u64::MAX);
+        self.1.pending_tables.record(count, &[]);
+        self.with(|counters| counters.pending_tables = count);
     }
 
     fn record(&self, result: &OperationResult) {
@@ -767,6 +1106,8 @@ impl Metrics {
             let _ = writeln!(text, "# TYPE delta_maintenance_{name} gauge");
             let _ = writeln!(text, "delta_maintenance_{name}{{operation=\"{operation}\"}} {value}");
         }
+        let _ = writeln!(text, "# TYPE delta_maintenance_pending_tables gauge");
+        let _ = writeln!(text, "delta_maintenance_pending_tables {}", counters.pending_tables);
         let _ = writeln!(text, "# TYPE delta_maintenance_heartbeat_timestamp_ms gauge");
         let _ = writeln!(
             text,
@@ -867,6 +1208,10 @@ fn run_operation(
                 log_retention_ms: settings.log_retention_ms,
                 unsafe_allow_short_retention_for_tests: settings.unsafe_short_vacuum_for_tests,
                 max_prune_files: settings.max_prune_files,
+                max_log_files: settings.operation_limits.replay_max_log_files,
+                max_log_file_bytes: settings.operation_limits.replay_max_log_file_bytes,
+                max_checkpoint_bytes: settings.operation_limits.replay_max_checkpoint_bytes,
+                max_active_files: settings.operation_limits.operation_max_active_files,
                 ..PruneConfig::new(anchor)
             };
             let plan = table.plan_prune_log(&config)?;
@@ -893,7 +1238,12 @@ fn run_operation(
         Operation::Purge => {
             let granularity = settings.granularity.context("purge granularity")?;
             let retention = settings.purge_retention_ms.context("purge retention")?;
-            let config = PurgeConfig::new(retention, anchor, granularity);
+            let config = PurgeConfig {
+                max_files_per_commit: settings.operation_limits.purge_max_files_per_commit,
+                max_plan_bytes: settings.operation_limits.purge_max_plan_bytes,
+                max_active_files: settings.operation_limits.operation_max_active_files,
+                ..PurgeConfig::new(retention, anchor, granularity)
+            };
             let prepared = table.prepare_purge(&config)?;
             if settings.apply {
                 return table.apply_prepared_purge(&prepared, &config, control);
@@ -905,6 +1255,12 @@ fn run_operation(
             config.allow_short_vacuum_retention = settings.allow_short_vacuum_retention;
             config.unsafe_allow_short_retention_for_tests = settings.unsafe_short_vacuum_for_tests;
             config.max_deletes = usize::try_from(props.unsigned("arrowcol.vacuum.maxDeletes")?)?;
+            config.delete_chunk = settings.operation_limits.vacuum_delete_chunk;
+            config.max_plan_bytes = settings.operation_limits.vacuum_max_plan_bytes;
+            config.max_log_files = settings.operation_limits.replay_max_log_files;
+            config.max_log_file_bytes = settings.operation_limits.replay_max_log_file_bytes;
+            config.max_checkpoint_bytes = settings.operation_limits.replay_max_checkpoint_bytes;
+            config.max_active_files = settings.operation_limits.operation_max_active_files;
             return table.vacuum_once(&config, settings.apply, control);
         }
     };
@@ -914,6 +1270,31 @@ fn run_operation(
         report.outcome = Outcome::Noop;
     }
     Ok(report)
+}
+
+fn negative_probe_result<T>(result: Result<Option<T>>) -> Result<(Option<T>, bool)> {
+    match result {
+        Ok(report) => Ok((report, false)),
+        Err(error) if is_stale_plan(&error) => Ok((None, true)),
+        Err(error) => Err(error),
+    }
+}
+
+fn is_stale_plan(error: &anyhow::Error) -> bool {
+    error_details(error).is_some_and(|details| details.kind == MaintenanceErrorKind::StalePlan)
+}
+
+fn retry_stale_table_discovery<T>(table: &str, mut discover: impl FnMut() -> Result<T>) -> Result<T> {
+    let mut retries = 0;
+    loop {
+        match discover() {
+            Err(error) if retries < MAX_STALE_DISCOVERY_RETRIES && is_stale_plan(&error) => {
+                retries += 1;
+                eprintln!("delta-maintenance table discovery became stale; retrying table={table} attempt={retries}");
+            }
+            result => return result,
+        }
+    }
 }
 
 fn maintain_table(
@@ -949,14 +1330,27 @@ fn maintain_table(
             }
             schedule.insert(name.into(), (now, policy));
         }
-        let probe = DeltaTable::open_for_maintenance_probe(&discovered.url)?;
-        let token = probe.probe_log_token(100_000)?;
+        let limits = &settings.operation_limits;
+        let probe = DeltaTable::open_for_maintenance_probe_with_limit(&discovered.url, limits.discovery_max_log_files)?;
+        let token = probe.probe_log_token(limits.discovery_max_log_files)?;
         if discovered.log_token.as_ref().is_none_or(|previous| *previous != token)
-            && !policy_matches(settings, &probe.maintenance_properties()?, &props)?
+            && !policy_matches(
+                settings,
+                &probe.maintenance_properties_with_limits(
+                    limits.discovery_max_log_files,
+                    limits.discovery_max_log_file_bytes,
+                )?,
+                &props,
+            )?
         {
             bail!("table properties changed after discovery; retry");
         }
         discovered.log_token = Some(token);
+        let config = configuration_evidence(settings, &effective, &props)?;
+        eprintln!(
+            "arrowcol_maintenance_table_config {}",
+            serde_json::json!({ "table": name, "config": config })
+        );
         Ok(Some((discovered, effective, props, probe, gate)))
     })();
     if matches!(&setup, Ok(None)) {
@@ -985,12 +1379,20 @@ fn maintain_table(
             Ok(Some((_, effective, _, _, _))) => effective,
             _ => settings,
         };
-        let control = MaintenanceControl::new(Arc::clone(cancel), Some(started + effective.operation_timeout));
         let outcome = match &setup {
             Ok(Some((discovered, effective, props, probe, _))) => (|| {
-                let token = probe.probe_log_token(100_000)?;
+                let control = MaintenanceControl::new(Arc::clone(cancel), Some(started + effective.operation_timeout))
+                    .with_commit_retry_limits(effective.commit_attempts, effective.commit_budget)?;
+                let token = probe.probe_log_token(settings.operation_limits.discovery_max_log_files)?;
                 if observed_token.as_ref().is_some_and(|previous| *previous != token)
-                    && !policy_matches(settings, &probe.maintenance_properties()?, props)?
+                    && !policy_matches(
+                        settings,
+                        &probe.maintenance_properties_with_limits(
+                            settings.operation_limits.discovery_max_log_files,
+                            settings.operation_limits.discovery_max_log_file_bytes,
+                        )?,
+                        props,
+                    )?
                 {
                     bail!("table properties changed during the maintenance pass; retry discovery");
                 }
@@ -1024,9 +1426,19 @@ fn maintain_table(
                         && effective.log_retention_ms.is_some_and(|retention| {
                             retention < arrow_deltalake::maintenance::MIN_VACUUM_RETENTION_MS
                         }));
-                if !full_validation && let Some(report) = probe.probe_no_work(probe_operation, &config, &control)? {
-                    negative_probe = true;
-                    return Ok(report);
+                if !full_validation {
+                    let (report, stale) =
+                        negative_probe_result(probe.probe_no_work(probe_operation, &config, &control))?;
+                    if stale {
+                        eprintln!(
+                            "delta-maintenance negative probe became stale; using full planner table={name} operation={}",
+                            operation.label()
+                        );
+                    }
+                    if let Some(report) = report {
+                        negative_probe = true;
+                        return Ok(report);
+                    }
                 }
                 if table.is_none() {
                     table = Some(DeltaTable::open_for_maintenance(&discovered.url)?);
@@ -1094,7 +1506,10 @@ fn maintain_table(
 /// Run one maintenance cycle over every allowlisted table with bounded concurrency.
 #[must_use]
 pub fn run_cycle(settings: &Settings, metrics: &Metrics, cancel: &Arc<AtomicBool>) -> Vec<OperationResult> {
-    let source = FilesystemDiscovery::new(settings.root.clone(), settings.tables.clone());
+    let source = FilesystemDiscovery::new(settings.root.clone(), settings.tables.clone()).with_log_limits(
+        settings.operation_limits.discovery_max_log_files,
+        settings.operation_limits.discovery_max_log_file_bytes,
+    );
     match cycle_with_discovery(settings, &source, metrics, cancel, None) {
         Ok(results) => results,
         Err(error) => {
@@ -1141,6 +1556,23 @@ fn cycle_with_discovery(
     schedule: Option<&Mutex<ScheduledTables>>,
 ) -> Result<Vec<OperationResult>> {
     let names = discovery.tables()?;
+    if settings.interval.is_none() && !settings.tables.is_empty() {
+        let missing = settings
+            .tables
+            .iter()
+            .filter(|requested| {
+                names
+                    .iter()
+                    .filter(|name| *name == *requested || name.rsplit('.').next() == Some(requested.as_str()))
+                    .count()
+                    != 1
+            })
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            bail!("allowlisted tables were missing or ambiguous: {}", missing.join(", "));
+        }
+    }
     if names.len() > MAX_TABLES {
         bail!("catalog discovery exceeds {MAX_TABLES} tables");
     }
@@ -1186,8 +1618,18 @@ fn cycle_with_discovery(
 /// Returns `false` if any operation failed.
 #[must_use]
 pub fn run(settings: &Settings, metrics: &Metrics, cancel: &Arc<AtomicBool>) -> bool {
-    let source = FilesystemDiscovery::new(settings.root.clone(), settings.tables.clone());
+    let source = FilesystemDiscovery::new(settings.root.clone(), settings.tables.clone()).with_log_limits(
+        settings.operation_limits.discovery_max_log_files,
+        settings.operation_limits.discovery_max_log_file_bytes,
+    );
     run_with_discovery(settings, &source, metrics, cancel)
+}
+
+fn cycle_results_are_healthy(results: &[OperationResult], signal_cancellation_requested: bool) -> bool {
+    results.iter().all(|result| {
+        result.error_kind.is_none()
+            || (signal_cancellation_requested && result.error_kind == Some(MaintenanceErrorKind::Cancelled.label()))
+    })
 }
 
 /// Run the same bounded scheduler over catalog-client discovery.
@@ -1202,6 +1644,7 @@ pub fn run_with_discovery(
     let schedule = Mutex::new(BTreeMap::new());
     let mut delay = settings.interval;
     let mut cycles = 0_u64;
+    let mut previous_pending = Some(Vec::new());
     loop {
         let results = match cycle_with_discovery(settings, discovery, metrics, cancel, Some(&schedule)) {
             Ok(results) => results,
@@ -1216,7 +1659,29 @@ pub fn run_with_discovery(
             }
         };
         cycles += 1;
-        healthy &= results.iter().all(|result| result.error_kind.is_none());
+        healthy &= cycle_results_are_healthy(&results, cancel.load(Ordering::SeqCst));
+        let pending_count = match discovery.pending_tables() {
+            Ok(mut pending) => {
+                pending.sort();
+                pending.dedup();
+                if previous_pending.as_ref() != Some(&pending) {
+                    let names = if pending.is_empty() {
+                        "<none>".to_owned()
+                    } else {
+                        pending.join(",")
+                    };
+                    eprintln!("delta-maintenance pending tables={names}");
+                    previous_pending = Some(pending.clone());
+                }
+                metrics.pending_tables(pending.len());
+                Some(pending.len())
+            }
+            Err(error) => {
+                healthy = false;
+                eprintln!("delta-maintenance pending-table status failed: {error:#}");
+                None
+            }
+        };
         let Some(interval) = settings.interval else { break };
         if settings.max_cycles.is_some_and(|max| cycles >= max) || cancel.load(Ordering::SeqCst) {
             break;
@@ -1225,7 +1690,8 @@ pub fn run_with_discovery(
             results.iter().all(|result| result.error_kind.is_none()) && !results.iter().any(OperationResult::did_work);
         let current = if idle { delay.unwrap_or(interval) } else { interval };
         eprintln!(
-            "delta-maintenance heartbeat cycle={cycles} idle={idle} next_in_ms={}",
+            "delta-maintenance heartbeat cycle={cycles} idle={idle} pending_tables={} next_in_ms={}",
+            pending_count.map_or_else(|| "unknown".to_owned(), |count| count.to_string()),
             current.as_millis()
         );
         delay = Some(if idle {
@@ -1242,4 +1708,34 @@ pub fn run_with_discovery(
         }
     }
     healthy
+}
+
+#[cfg(test)]
+mod signal_cancellation_tests {
+    use super::*;
+
+    fn result_with_error_kind(error_kind: Option<&'static str>) -> OperationResult {
+        OperationResult {
+            table: "test_table".to_owned(),
+            operation: Operation::Optimize,
+            applied: false,
+            negative_probe: false,
+            report: None,
+            optimize: None,
+            vacuum: None,
+            error_kind,
+            error: error_kind.map(|_| "operation failed".to_owned()),
+            duration_ms: 0,
+        }
+    }
+
+    #[test]
+    fn signal_cancellation_is_healthy_without_masking_operation_failures() {
+        let cancelled = result_with_error_kind(Some(MaintenanceErrorKind::Cancelled.label()));
+        assert!(cycle_results_are_healthy(std::slice::from_ref(&cancelled), true));
+        assert!(!cycle_results_are_healthy(std::slice::from_ref(&cancelled), false));
+
+        let failed = result_with_error_kind(Some("commit_budget_exhausted"));
+        assert!(!cycle_results_are_healthy(std::slice::from_ref(&failed), true));
+    }
 }

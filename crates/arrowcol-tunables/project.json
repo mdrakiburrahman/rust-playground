@@ -1,0 +1,15 @@
+{
+  "name": "arrowcol-tunables",
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "projectType": "library",
+  "sourceRoot": "crates/arrowcol-tunables/src",
+  "targets": {
+    "format": {"executor": "nx:run-commands", "options": {"command": "cargo fmt --package arrowcol-tunables"}},
+    "format-check": {"executor": "nx:run-commands", "options": {"command": "cargo fmt --package arrowcol-tunables -- --check"}},
+    "lint": {"executor": "nx:run-commands", "options": {"command": "cargo clippy --locked --package arrowcol-tunables --all-targets -- -D warnings"}},
+    "build": {"executor": "nx:run-commands", "cache": false, "options": {"command": "cargo build --locked --package arrowcol-tunables"}},
+    "test": {"executor": "nx:run-commands", "options": {"command": "cargo test --locked --package arrowcol-tunables"}},
+    "verify": {"executor": "nx:run-commands", "dependsOn": ["format-check", "lint", "build", "test"], "options": {"commands": []}}
+  },
+  "tags": ["scope:rust", "type:library"]
+}

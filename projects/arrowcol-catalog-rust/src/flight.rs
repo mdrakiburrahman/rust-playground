@@ -12,17 +12,49 @@ use futures::StreamExt;
 use prost::Message;
 use tonic::{Request, Response, Status, Streaming};
 
-use crate::CatalogService;
+use crate::{CatalogService, DdlIdentityPolicy, identity::now_unix_millis};
+
+const FLIGHT_DO_PUT_PATH: &str = "/arrow.flight.protocol.FlightService/DoPut";
 
 /// Flight SQL transport retaining the committed Arrowcol DDL completion headers.
 #[derive(Clone)]
-pub struct CatalogFlightService(CatalogService);
+pub struct CatalogFlightService {
+    catalog: CatalogService,
+    ddl_identity_policy: DdlIdentityPolicy,
+}
+
+impl CatalogFlightService {
+    fn verify_message<T: Message>(&self, request: &Request<T>, method: &str) -> Result<(), Status> {
+        self.ddl_identity_policy.verify_request(
+            request.metadata(),
+            method,
+            &request.get_ref().encode_to_vec(),
+            now_unix_millis(),
+        )
+    }
+
+    fn verify_empty(&self, metadata: &tonic::metadata::MetadataMap, method: &str) -> Result<(), Status> {
+        self.ddl_identity_policy
+            .verify_request(metadata, method, &[], now_unix_millis())
+    }
+}
 
 impl CatalogService {
     /// Creates the Flight endpoint, preserving standard SQL queries and DDL metadata.
+    ///
+    /// DDL is rejected unless a caller explicitly installs an authentication policy.
     #[must_use]
     pub fn flight_service(&self) -> CatalogFlightService {
-        CatalogFlightService(self.clone())
+        self.flight_service_with_ddl_identity(DdlIdentityPolicy::reject())
+    }
+
+    /// Creates the Flight endpoint with an explicit catalog-DDL identity policy.
+    #[must_use]
+    pub fn flight_service_with_ddl_identity(&self, ddl_identity_policy: DdlIdentityPolicy) -> CatalogFlightService {
+        CatalogFlightService {
+            catalog: self.clone(),
+            ddl_identity_policy,
+        }
     }
 }
 
@@ -40,27 +72,33 @@ impl FlightService for CatalogFlightService {
         &self,
         request: Request<Streaming<HandshakeRequest>>,
     ) -> Result<Response<Self::HandshakeStream>, Status> {
-        self.0.handshake(request).await
+        self.verify_empty(request.metadata(), "/arrow.flight.protocol.FlightService/Handshake")?;
+        self.catalog.handshake(request).await
     }
 
     async fn list_flights(&self, request: Request<Criteria>) -> Result<Response<Self::ListFlightsStream>, Status> {
-        self.0.list_flights(request).await
+        self.verify_message(&request, "/arrow.flight.protocol.FlightService/ListFlights")?;
+        self.catalog.list_flights(request).await
     }
 
     async fn get_flight_info(&self, request: Request<FlightDescriptor>) -> Result<Response<FlightInfo>, Status> {
-        self.0.get_flight_info(request).await
+        self.verify_message(&request, "/arrow.flight.protocol.FlightService/GetFlightInfo")?;
+        self.catalog.get_flight_info(request).await
     }
 
     async fn poll_flight_info(&self, request: Request<FlightDescriptor>) -> Result<Response<PollInfo>, Status> {
-        self.0.poll_flight_info(request).await
+        self.verify_message(&request, "/arrow.flight.protocol.FlightService/PollFlightInfo")?;
+        self.catalog.poll_flight_info(request).await
     }
 
     async fn get_schema(&self, request: Request<FlightDescriptor>) -> Result<Response<SchemaResult>, Status> {
-        self.0.get_schema(request).await
+        self.verify_message(&request, "/arrow.flight.protocol.FlightService/GetSchema")?;
+        self.catalog.get_schema(request).await
     }
 
     async fn do_get(&self, request: Request<Ticket>) -> Result<Response<Self::DoGetStream>, Status> {
-        self.0.do_get(request).await
+        self.verify_message(&request, "/arrow.flight.protocol.FlightService/DoGet")?;
+        self.catalog.do_get(request).await
     }
 
     async fn do_put(&self, request: Request<Streaming<FlightData>>) -> Result<Response<Self::DoPutStream>, Status> {
@@ -76,6 +114,12 @@ impl FlightService for CatalogFlightService {
         if descriptor.r#type != arrow_flight::flight_descriptor::DescriptorType::Cmd as i32 {
             return Err(Status::invalid_argument("catalog DDL requires a command descriptor"));
         }
+        self.ddl_identity_policy.verify_request(
+            request.metadata(),
+            FLIGHT_DO_PUT_PATH,
+            &descriptor.cmd,
+            now_unix_millis(),
+        )?;
         let any = Any::decode(descriptor.cmd)
             .map_err(|error| Status::invalid_argument(format!("invalid catalog DDL command: {error}")))?;
         let command = Command::try_from(any)
@@ -83,7 +127,7 @@ impl FlightService for CatalogFlightService {
         let Command::CommandStatementUpdate(command) = command else {
             return Err(Status::unimplemented("catalog DoPut supports statement updates only"));
         };
-        let completion = self.0.apply_statement_update(command, request).await?;
+        let completion = self.catalog.apply_statement_update(command, request).await?;
         let (result, metadata) = match completion {
             Some(completion) => {
                 let encoded = encode_ddl_completion_response(&completion).map_err(|error| error.into_status())?;
@@ -107,14 +151,17 @@ impl FlightService for CatalogFlightService {
         &self,
         request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoExchangeStream>, Status> {
-        self.0.do_exchange(request).await
+        self.verify_empty(request.metadata(), "/arrow.flight.protocol.FlightService/DoExchange")?;
+        self.catalog.do_exchange(request).await
     }
 
     async fn do_action(&self, request: Request<Action>) -> Result<Response<Self::DoActionStream>, Status> {
-        self.0.do_action(request).await
+        self.verify_message(&request, "/arrow.flight.protocol.FlightService/DoAction")?;
+        self.catalog.do_action(request).await
     }
 
     async fn list_actions(&self, request: Request<Empty>) -> Result<Response<Self::ListActionsStream>, Status> {
-        self.0.list_actions(request).await
+        self.verify_message(&request, "/arrow.flight.protocol.FlightService/ListActions")?;
+        self.catalog.list_actions(request).await
     }
 }

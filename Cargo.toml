@@ -5,6 +5,7 @@ members = [
     "projects/arrowcol-catalog-rust",
     "projects/arrowcol-router-rust",
     "projects/arrowcol-dataflow-rust",
+    "projects/arrowcol-oat-rust",
     "projects/kusto-explorer",
     "projects/kusto-explorer/api",
     "projects/kusto-explorer/ui",

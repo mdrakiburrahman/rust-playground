@@ -18,8 +18,8 @@ while IFS= read -r script; do
 done < <(find "$PROJECT_ROOT/scripts" "$PROJECT_ROOT/docker" -type f -name '*.sh' -print | sort)
 
 mapfile -t migrations < <(find "$PROJECT_ROOT/migrations" -maxdepth 1 -type f -name 'V*.sql' -print | sort)
-if [[ "${#migrations[@]}" -ne 10 ]]; then
-  echo "Expected exactly 10 versioned migrations, found ${#migrations[@]}" >&2
+if [[ "${#migrations[@]}" -ne 11 ]]; then
+  echo "Expected exactly 11 versioned migrations, found ${#migrations[@]}" >&2
   exit 1
 fi
 
@@ -34,11 +34,14 @@ for migration in "${migrations[@]}"; do
   expected_version=$((expected_version + 1))
 done
 
-if grep -RniE '(^|[^[:alnum:]_])(varbinary[[:space:]]*\([[:space:]]*max[[:space:]]*\)|image)([^[:alnum:]_]|$)' \
-  "$PROJECT_ROOT/migrations"; then
-  echo "Application migrations must not define Arrow payload byte storage" >&2
-  exit 1
-fi
+for migration in "${migrations[@]}"; do
+  # Scalar digest conversions are not binary storage declarations.
+  if sed -E 's/\bCONVERT[[:space:]]*\([[:space:]]*varbinary[[:space:]]*\([[:space:]]*max[[:space:]]*\)[[:space:]]*,/CONVERT_SCALAR(/Ig' "$migration" |
+    grep -niE '(^|[^[:alnum:]_])(varbinary[[:space:]]*\([[:space:]]*max[[:space:]]*\)|image)([^[:alnum:]_]|$)'; then
+    echo "Application migrations must not define Arrow payload byte storage: $migration" >&2
+    exit 1
+  fi
+done
 
 if grep -nE '^[A-Z0-9_]*PASSWORD=' "$EXAMPLE_ENV_FILE"; then
   echo ".env.example must contain secret file paths, not passwords" >&2

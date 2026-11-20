@@ -1,0 +1,154 @@
+{
+  "changes": [
+    {
+      "after": {
+        "apiVersion": "2024-03-01",
+        "id": "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/arrow-collector-rg",
+        "location": "eastus2",
+        "name": "arrow-collector-rg",
+        "tags": {
+          "project": "rust-playground",
+          "purpose": "disposable-arrowcol-sandbox",
+          "sandboxId": "stamp-89150"
+        },
+        "type": "Microsoft.Resources/resourceGroups"
+      },
+      "before": {
+        "apiVersion": "2024-03-01",
+        "id": "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/arrow-collector-rg",
+        "location": "eastus2",
+        "name": "arrow-collector-rg",
+        "tags": {
+          "project": "rust-playground",
+          "purpose": "disposable-arrowcol-sandbox",
+          "sandboxId": "stamp-89150"
+        },
+        "type": "Microsoft.Resources/resourceGroups"
+      },
+      "changeType": "NoChange",
+      "delta": [],
+      "deploymentId": null,
+      "extension": null,
+      "identifiers": null,
+      "resourceId": "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/arrow-collector-rg",
+      "symbolicName": null,
+      "unsupportedReason": null
+    },
+    {
+      "after": {
+        "apiVersion": "2023-01-31",
+        "id": "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/arrow-collector-rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/arrow-collector",
+        "location": "canadacentral",
+        "name": "arrow-collector",
+        "resourceGroup": "arrow-collector-rg",
+        "tags": {
+          "project": "rust-playground",
+          "purpose": "disposable-arrowcol-sandbox",
+          "sandboxId": "stamp-89150"
+        },
+        "type": "Microsoft.ManagedIdentity/userAssignedIdentities"
+      },
+      "before": {
+        "apiVersion": "2023-01-31",
+        "id": "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/arrow-collector-rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/arrow-collector",
+        "location": "canadacentral",
+        "name": "arrow-collector",
+        "resourceGroup": "arrow-collector-rg",
+        "tags": {
+          "project": "rust-playground",
+          "purpose": "disposable-arrowcol-sandbox",
+          "sandboxId": "stamp-89150"
+        },
+        "type": "Microsoft.ManagedIdentity/userAssignedIdentities"
+      },
+      "changeType": "NoChange",
+      "delta": [],
+      "deploymentId": null,
+      "extension": null,
+      "identifiers": null,
+      "resourceId": "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/arrow-collector-rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/arrow-collector",
+      "symbolicName": null,
+      "unsupportedReason": null
+    },
+    {
+      "after": {
+        "apiVersion": "2022-04-01",
+        "id": "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/arrow-collector-rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/arrow-collector/providers/Microsoft.Authorization/roleAssignments/50588b19-1be5-5ffc-b4a3-e08f30ce7ee0",
+        "name": "50588b19-1be5-5ffc-b4a3-e08f30ce7ee0",
+        "properties": {
+          "principalId": "[reference('/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/arrow-collector-rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/arrow-collector', '2023-01-31').principalId]",
+          "roleDefinitionId": "/subscriptions/00000000-0000-0000-0000-000000000001/providers/Microsoft.Authorization/roleDefinitions/f1a07417-d97a-45cb-824c-7a7467783830"
+        },
+        "resourceGroup": "arrow-collector-rg",
+        "type": "Microsoft.Authorization/roleAssignments"
+      },
+      "before": {
+        "apiVersion": "2022-04-01",
+        "id": "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/arrow-collector-rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/arrow-collector/providers/Microsoft.Authorization/roleAssignments/50588b19-1be5-5ffc-b4a3-e08f30ce7ee0",
+        "name": "50588b19-1be5-5ffc-b4a3-e08f30ce7ee0",
+        "properties": {
+          "principalId": "00000000-0000-0000-0000-000000000004",
+          "roleDefinitionId": "/subscriptions/00000000-0000-0000-0000-000000000001/providers/Microsoft.Authorization/roleDefinitions/f1a07417-d97a-45cb-824c-7a7467783830"
+        },
+        "resourceGroup": "arrow-collector-rg",
+        "type": "Microsoft.Authorization/roleAssignments"
+      },
+      "changeType": "Modify",
+      "delta": [
+        {
+          "after": "[reference('/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/arrow-collector-rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/arrow-collector', '2023-01-31').principalId]",
+          "before": "00000000-0000-0000-0000-000000000004",
+          "children": null,
+          "path": "properties.principalId",
+          "propertyChangeType": "Modify"
+        },
+        {
+          "after": "ServicePrincipal",
+          "before": null,
+          "children": null,
+          "path": "properties.principalType",
+          "propertyChangeType": "NoEffect"
+        }
+      ],
+      "deploymentId": null,
+      "extension": null,
+      "identifiers": null,
+      "resourceId": "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/arrow-collector-rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/arrow-collector/providers/Microsoft.Authorization/roleAssignments/50588b19-1be5-5ffc-b4a3-e08f30ce7ee0",
+      "symbolicName": null,
+      "unsupportedReason": null
+    },
+    {
+      "after": {
+        "apiVersion": "2021-05-01-preview",
+        "id": "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/arrow-collector-rg/providers/Microsoft.Storage/storageAccounts/arrowcollector89152/blobServices/default/providers/Microsoft.Insights/diagnosticSettings/arrowcol-storage-reads",
+        "name": "arrowcol-storage-reads",
+        "properties": {
+          "logAnalyticsDestinationType": "Dedicated",
+          "logs": [
+            {
+              "category": "StorageRead",
+              "enabled": true
+            }
+          ],
+          "storageAccountId": "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/arrow-collector-rg/providers/Microsoft.Storage/storageAccounts/arrowreadlogs89152",
+          "workspaceId": "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/arrow-collector-rg/providers/Microsoft.OperationalInsights/workspaces/arrow-collector-89152"
+        },
+        "resourceGroup": "arrow-collector-rg",
+        "type": "Microsoft.Insights/diagnosticSettings"
+      },
+      "before": null,
+      "changeType": "Create",
+      "delta": null,
+      "deploymentId": null,
+      "extension": null,
+      "identifiers": null,
+      "resourceId": "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/arrow-collector-rg/providers/Microsoft.Storage/storageAccounts/arrowcollector89152/blobServices/default/providers/Microsoft.Insights/diagnosticSettings/arrowcol-storage-reads",
+      "symbolicName": null,
+      "unsupportedReason": null
+    }
+  ],
+  "diagnostics": null,
+  "error": null,
+  "potentialChanges": null,
+  "status": "Succeeded"
+}

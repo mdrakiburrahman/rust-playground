@@ -174,6 +174,7 @@ pub async fn write_manifest(args: InitializeAzureArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::TABLE_COUNT;
 
     #[test]
     fn actual_bootstrap_preserves_existing_logs_and_normalizes_timestamp_companions_once() -> Result<()> {
@@ -223,12 +224,12 @@ mod tests {
     #[test]
     fn dataflow_uses_raw_registry_and_required_partition() -> Result<()> {
         let entries = entries()?;
-        assert_eq!(entries.len(), 13);
+        assert_eq!(entries.len(), TABLE_COUNT);
         let names = entries
             .iter()
             .map(|(entry, _)| &entry.name)
             .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(names.len(), 13);
+        assert_eq!(names.len(), TABLE_COUNT);
         for (index, (entry, schema)) in entries.into_iter().enumerate() {
             assert!(entry.relative_path.starts_with("dataflow/telemetry/sqlserver/"));
             assert_eq!(schema.field(0).name(), "customer_id");

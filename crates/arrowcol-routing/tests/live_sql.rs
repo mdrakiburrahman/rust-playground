@@ -17,6 +17,481 @@ use uuid::Uuid;
 
 static LIVE_ROUTING_CASE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+#[derive(Clone, Copy)]
+enum LiveOatPinCase {
+    RetryAndPermissions,
+    MissingLease,
+    DifferentValidOwner,
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the live arrowcol-infra SQL Server and migrator credential"]
+async fn live_sql_trusted_oat_initializer_preserves_set_expiry_and_app_permissions() -> anyhow::Result<()> {
+    live_oat_pin_case(LiveOatPinCase::RetryAndPermissions).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the live arrowcol-infra SQL Server and migrator credential"]
+async fn live_sql_immutable_oat_routing_rejects_missing_bound_lease() -> anyhow::Result<()> {
+    live_oat_pin_case(LiveOatPinCase::MissingLease).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the live arrowcol-infra SQL Server and migrator credential"]
+async fn live_sql_immutable_oat_routing_rejects_different_valid_lease_owner() -> anyhow::Result<()> {
+    live_oat_pin_case(LiveOatPinCase::DifferentValidOwner).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires the local arrowcol-infra SQL Server integration harness"]
+async fn live_sql_pressure_publication_preserves_newest_timestamp_under_concurrent_writers() -> anyhow::Result<()> {
+    if std::env::var("ARROWCOL_SQLSERVER_TEST").as_deref() != Ok("1") {
+        return Ok(());
+    }
+    let _isolation = LIVE_ROUTING_CASE.lock().await;
+    let store = Arc::new(SqlServerRoutingStore::new(sql_config()?));
+    let started = now()?;
+    let instances = [CollectorInstanceId::new(), CollectorInstanceId::new()];
+    let fixture_table = TableIdentity::new(
+        CatalogName::new("telemetry")?,
+        SchemaName::new("live")?,
+        TableName::new(format!("pressure_{}", Uuid::new_v4().simple()))?,
+    );
+    let mut result: anyhow::Result<()> = async {
+        for (instance, port) in instances.iter().copied().zip([51_013, 51_014]) {
+            store
+                .register_collector(&live_registration(
+                    instance,
+                    format!("live-pressure-{}", Uuid::new_v4().simple()),
+                    port,
+                    subtract(started, 1_000)?,
+                    add(started, 600_000)?,
+                )?)
+                .await?;
+        }
+        store
+            .publish_pressure(&snapshot(instances[0], subtract(started, 10_000)?, 500, 0, None)?)
+            .await?;
+        publish_concurrent_pressure_writers(&store, instances[0], started).await?;
+        publish_concurrent_pressure_writers(&store, instances[1], started).await?;
+        Ok(())
+    }
+    .await;
+    result = finish_fixture(&store, result, &instances, &fixture_table, now()?).await;
+    result
+}
+
+async fn publish_concurrent_pressure_writers(
+    store: &Arc<SqlServerRoutingStore>,
+    instance_id: CollectorInstanceId,
+    started: UnixMillis,
+) -> anyhow::Result<()> {
+    const WRITERS: usize = 32;
+    let barrier = Arc::new(tokio::sync::Barrier::new(WRITERS));
+    let mut writers = Vec::with_capacity(WRITERS);
+    for offset in (1..=WRITERS).rev() {
+        let store = Arc::clone(store);
+        let barrier = Arc::clone(&barrier);
+        let pressure = snapshot(instance_id, subtract(started, 1_000 - offset as u64)?, 500, 0, None)?;
+        writers.push(tokio::spawn(async move {
+            barrier.wait().await;
+            store.publish_pressure(&pressure).await
+        }));
+    }
+    for writer in writers {
+        if let Err(error) = writer.await? {
+            anyhow::ensure!(
+                error.kind() == RoutingErrorKind::Conflict
+                    || error.to_string().contains("routing pressure timestamp did not advance"),
+                "pressure writer failed unexpectedly: {error}"
+            );
+        }
+    }
+    let view = store.load_view(now()?).await?;
+    let actual = view
+        .collectors
+        .get(&instance_id)
+        .and_then(|record| record.pressure.as_ref())
+        .map(|pressure| pressure.observed_at_unix_ms)
+        .ok_or_else(|| anyhow::anyhow!("concurrent pressure writers left no latest snapshot"))?;
+    let expected = subtract(started, 1_000 - WRITERS as u64)?;
+    anyhow::ensure!(
+        actual == expected,
+        "latest pressure timestamp regressed: expected {expected:?}, found {actual:?}"
+    );
+    Ok(())
+}
+
+async fn live_oat_pin_case(case: LiveOatPinCase) -> anyhow::Result<()> {
+    if std::env::var("ARROWCOL_SQLSERVER_TEST").as_deref() != Ok("1") {
+        return Ok(());
+    }
+    let _isolation = LIVE_ROUTING_CASE.lock().await;
+    let store = Arc::new(SqlServerRoutingStore::new(sql_config()?));
+    let migrator_config = SqlServerRoutingConfig::with_password_file(
+        std::env::var("ARROWCOL_SQLSERVER_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
+        std::env::var("ARROWCOL_SQLSERVER_PORT")
+            .ok()
+            .map(|value| value.parse())
+            .transpose()?
+            .unwrap_or(14_333),
+        "arrowcol",
+        "arrowcol_migrator",
+        migrator_secret_path(),
+    )?
+    .trust_server_certificate(true)
+    .with_timeouts(Duration::from_secs(5), Duration::from_secs(15));
+    let migrator: Arc<dyn RoutingStore> = Arc::new(SqlServerRoutingStore::new(migrator_config));
+    let started = now()?;
+    let expires_at = add(started, 240_000)?;
+    let run_id = Uuid::new_v4().to_string();
+    let instances = [CollectorInstanceId::new(), CollectorInstanceId::new()];
+    let mut keys = ["a", "b"]
+        .into_iter()
+        .map(|suffix| {
+            Ok(LeaseKey::new(
+                ImplementationPool::Dataflow,
+                TableIdentity::new(
+                    CatalogName::new("telemetry")?,
+                    SchemaName::new("live")?,
+                    TableName::new(format!("oat_{}_{}", Uuid::new_v4().simple(), suffix))?,
+                ),
+            ))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    keys.sort();
+    let policy = RoutingPolicy {
+        warmup_ms: 0,
+        lease_ttl_ms: 300_000,
+        oat_run_id: Some(run_id.clone()),
+        ..RoutingPolicy::default()
+    };
+    let setup = RoutingEngine::new(migrator, policy.clone())?;
+    let mut result: anyhow::Result<()> = async {
+        for (instance, port) in instances.into_iter().zip([51_011, 51_012]) {
+            store
+                .register_collector(&live_registration(
+                    instance,
+                    format!("live-oat-{}", Uuid::new_v4().simple()),
+                    port,
+                    subtract(started, 1_000)?,
+                    add(started, 600_000)?,
+                )?)
+                .await?;
+            store
+                .publish_pressure(&snapshot(instance, started, 500, 0, None)?)
+                .await?;
+        }
+        assert_app_pin_permissions().await?;
+        let pins = setup
+            .initialize_run_table_pins(&run_id, &keys, expires_at, now()?)
+            .await?;
+        anyhow::ensure!(pins.len() == keys.len(), "trusted setup did not bind the full set");
+        let app_store: Arc<dyn RoutingStore> = Arc::<SqlServerRoutingStore>::clone(&store);
+        let app = RoutingEngine::new(app_store, policy.clone())?;
+        let mut selected = Vec::with_capacity(keys.len());
+        for (key, pin) in keys.iter().zip(&pins) {
+            anyhow::ensure!(
+                pin.key == *key && pin.expires_at_unix_ms == expires_at,
+                "setup changed key or expiry"
+            );
+            anyhow::ensure!(
+                instances.contains(&pin.holder_instance_id),
+                "setup selected a foreign collector"
+            );
+            anyhow::ensure!(
+                store.get_run_table_pin(&run_id, key, now()?).await?.as_ref() == Some(pin),
+                "application credential could not read the immutable pin"
+            );
+            let route = app
+                .route_ingest_for_run(&oat_metadata(key), &run_id, expires_at, now()?)
+                .await?;
+            let lease = route
+                .lease
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("OAT route has no lease"))?;
+            anyhow::ensure!(
+                route.instance_id == pin.holder_instance_id
+                    && lease.lease_id == pin.lease_id
+                    && lease.fencing_epoch == pin.fencing_epoch,
+                "application routing did not use the trusted immutable binding"
+            );
+            let revalidated = app.revalidate_run_assignment(&run_id, &route, now()?).await?;
+            anyhow::ensure!(
+                revalidated.instance_id == route.instance_id && revalidated.flight_endpoint == route.flight_endpoint,
+                "forwarding revalidation changed the selected collector"
+            );
+            selected.push(route);
+        }
+        let authority = pin_authority_snapshot(&run_id).await?;
+        match case {
+            LiveOatPinCase::RetryAndPermissions => {
+                let retry = setup
+                    .initialize_run_table_pins(&run_id, &keys, expires_at, now()?)
+                    .await?;
+                anyhow::ensure!(retry == pins, "same-set retry changed immutable pins");
+                for changed_expiry in [subtract(expires_at, 1)?, add(expires_at, 1)?] {
+                    let changed = setup
+                        .initialize_run_table_pins(&run_id, &keys, changed_expiry, now()?)
+                        .await;
+                    anyhow::ensure!(
+                        matches!(changed, Err(error) if error.kind() == RoutingErrorKind::Conflict),
+                        "trusted retry accepted a different immutable expiry"
+                    );
+                }
+                let changed_set = setup
+                    .initialize_run_table_pins(&run_id, &keys[..1], expires_at, now()?)
+                    .await;
+                anyhow::ensure!(
+                    matches!(changed_set, Err(error) if error.kind() == RoutingErrorKind::Conflict),
+                    "trusted retry accepted a different immutable table set"
+                );
+                let mut changed_keys = keys.clone();
+                changed_keys[0].table = TableIdentity::new(
+                    CatalogName::new("telemetry")?,
+                    SchemaName::new("live")?,
+                    TableName::new(format!("oat_changed_{}", Uuid::new_v4().simple()))?,
+                );
+                changed_keys.sort();
+                let changed_digest = setup
+                    .initialize_run_table_pins(&run_id, &changed_keys, expires_at, now()?)
+                    .await;
+                anyhow::ensure!(
+                    matches!(changed_digest, Err(error) if error.kind() == RoutingErrorKind::Conflict),
+                    "trusted retry accepted different identities with the same table count"
+                );
+                let denied_run = Uuid::new_v4().to_string();
+                let denied_store: Arc<dyn RoutingStore> = Arc::<SqlServerRoutingStore>::clone(&store);
+                let denied_setup = RoutingEngine::new(
+                    denied_store,
+                    RoutingPolicy {
+                        oat_run_id: Some(denied_run.clone()),
+                        ..policy.clone()
+                    },
+                )?;
+                let denied = denied_setup
+                    .initialize_run_table_pins(&denied_run, &keys, expires_at, now()?)
+                    .await;
+                let Err(error) = denied else {
+                    anyhow::bail!("application credential initialized a new immutable run");
+                };
+                anyhow::ensure!(
+                    error.kind() == RoutingErrorKind::Database
+                        && error.to_string().to_ascii_lowercase().contains("permission"),
+                    "application initialization did not fail on SQL permission denial: {error}"
+                );
+                assert_pin_authority_absent(&denied_run).await?;
+                let expired = store.get_run_table_pin(&run_id, &keys[0], expires_at).await;
+                anyhow::ensure!(
+                    matches!(expired, Err(error) if error.kind() == RoutingErrorKind::Conflict),
+                    "application read accepted an expired immutable run"
+                );
+                let expired_route = app
+                    .route_ingest_for_run(&oat_metadata(&keys[0]), &run_id, expires_at, expires_at)
+                    .await;
+                anyhow::ensure!(
+                    matches!(expired_route, Err(error) if error.kind() == RoutingErrorKind::InvalidConfiguration),
+                    "application router accepted a request at the immutable expiry"
+                );
+                let expired_forward = app.revalidate_run_assignment(&run_id, &selected[0], expires_at).await;
+                anyhow::ensure!(
+                    matches!(expired_forward, Err(error) if error.kind() == RoutingErrorKind::Conflict),
+                    "application router forwarded an earlier assignment after immutable expiry"
+                );
+            }
+            LiveOatPinCase::MissingLease | LiveOatPinCase::DifferentValidOwner => {
+                let key = &keys[0];
+                let pin = &pins[0];
+                if matches!(case, LiveOatPinCase::MissingLease) {
+                    delete_fixture_lease(&key.table).await?;
+                } else {
+                    let replacement = if pin.holder_instance_id == instances[0] {
+                        instances[1]
+                    } else {
+                        instances[0]
+                    };
+                    replace_fixture_lease_owner(&key.table, replacement, pin.lease_id.as_uuid()).await?;
+                }
+                let route_at = now()?;
+                let before_route = store.load_view(route_at).await?;
+                if matches!(case, LiveOatPinCase::MissingLease) {
+                    anyhow::ensure!(!before_route.leases.contains_key(key), "fixture lease was not deleted");
+                } else {
+                    let replacement = before_route
+                        .leases
+                        .get(key)
+                        .ok_or_else(|| anyhow::anyhow!("replacement lease is missing"))?;
+                    let ranked = arrowcol_routing::rank_collectors(&before_route, key, route_at, &policy, false);
+                    anyhow::ensure!(
+                        replacement.is_routable_at(route_at)
+                            && replacement.holder_instance_id != pin.holder_instance_id
+                            && replacement.lease_id != pin.lease_id
+                            && replacement.fencing_epoch > pin.fencing_epoch
+                            && ranked.contains(&replacement.holder_instance_id),
+                        "replacement is not a genuinely valid different owner at routing time"
+                    );
+                }
+                let fresh_store: Arc<dyn RoutingStore> = Arc::<SqlServerRoutingStore>::clone(&store);
+                let fresh = RoutingEngine::new(fresh_store, policy.clone())?;
+                let rejected = fresh
+                    .route_ingest_for_run(&oat_metadata(key), &run_id, expires_at, route_at)
+                    .await;
+                anyhow::ensure!(
+                    matches!(rejected, Err(error) if error.kind() == RoutingErrorKind::Conflict),
+                    "fresh application router accepted missing or replaced bound lease"
+                );
+                let rejected_forward = app.revalidate_run_assignment(&run_id, &selected[0], route_at).await;
+                anyhow::ensure!(
+                    matches!(rejected_forward, Err(error) if error.kind() == RoutingErrorKind::Conflict),
+                    "application router forwarded a cached assignment after lease loss or owner replacement"
+                );
+                anyhow::ensure!(
+                    store.load_view(route_at).await?.leases == before_route.leases,
+                    "failed immutable route created or rewrote a lease"
+                );
+            }
+        }
+        anyhow::ensure!(
+            pin_authority_snapshot(&run_id).await? == authority,
+            "retry, rejected route or expiry check changed immutable authority"
+        );
+        Ok(())
+    }
+    .await;
+    // V0011 authority tombstones deliberately survive ordinary fixture cleanup.
+    for key in &keys {
+        result = finish_fixture(&store, result, &instances, &key.table, now()?).await;
+    }
+    result
+}
+
+fn oat_metadata(key: &LeaseKey) -> IngestMetadata {
+    IngestMetadata::new(
+        ProtocolVersion::CURRENT,
+        ImplementationPool::Dataflow,
+        key.table.clone(),
+        ClaimedSchemaFingerprint::new(SchemaFingerprint::from_bytes([19; 32])),
+    )
+}
+
+async fn assert_app_pin_permissions() -> anyhow::Result<()> {
+    let mut connection = SqlConnection::connect(&sql_connection_config()?).await?;
+    let row = connection
+        .query(
+            "SELECT USER_NAME() AS principal, \
+         SUM(CONVERT(int, HAS_PERMS_BY_NAME(objects.name, 'OBJECT', actions.name))) AS writes, \
+         COUNT(HAS_PERMS_BY_NAME(objects.name, 'OBJECT', actions.name)) AS evaluated \
+         FROM (VALUES ('arrowcol.routing_run_pin_sets'), ('arrowcol.routing_run_table_initializations'), \
+                      ('arrowcol.routing_run_table_pins')) objects(name) \
+         CROSS JOIN (VALUES ('INSERT'), ('UPDATE'), ('DELETE')) actions(name);",
+            &[],
+        )
+        .await?
+        .into_row()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("missing application permission result"))?;
+    anyhow::ensure!(
+        row.try_get::<&str, _>("principal")? == Some("arrowcol_app"),
+        "wrong application SQL identity"
+    );
+    anyhow::ensure!(
+        row.try_get::<i32, _>("evaluated")? == Some(9),
+        "SQL did not evaluate all authority write permissions"
+    );
+    anyhow::ensure!(
+        row.try_get::<i32, _>("writes")? == Some(0),
+        "application has immutable-authority write privilege"
+    );
+    connection.finish().await?;
+    Ok(())
+}
+
+async fn assert_pin_authority_absent(run_id: &str) -> anyhow::Result<()> {
+    let mut connection = SqlConnection::connect(&sql_connection_config()?).await?;
+    let run_id = Uuid::parse_str(run_id)?;
+    let row = connection
+        .query(
+            "SELECT \
+             (SELECT COUNT_BIG(*) FROM arrowcol.routing_run_pin_sets WHERE run_id=@P1) AS sets, \
+             (SELECT COUNT_BIG(*) FROM arrowcol.routing_run_table_initializations WHERE run_id=@P1) AS markers, \
+             (SELECT COUNT_BIG(*) FROM arrowcol.routing_run_table_pins WHERE run_id=@P1) AS pins;",
+            &[&run_id],
+        )
+        .await?
+        .into_row()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("missing denied-run authority counts"))?;
+    for field in ["sets", "markers", "pins"] {
+        let count = row
+            .try_get::<i64, _>(field)?
+            .ok_or_else(|| anyhow::anyhow!("NULL denied-run {field} count"))?;
+        anyhow::ensure!(count == 0, "denied setup left {count} authority rows in {field}");
+    }
+    connection.finish().await?;
+    Ok(())
+}
+
+async fn pin_authority_snapshot(run_id: &str) -> anyhow::Result<String> {
+    let mut connection = SqlConnection::connect(&sql_connection_config()?).await?;
+    let run_id = Uuid::parse_str(run_id)?;
+    let row = connection
+        .query(
+            "SELECT (SELECT s.*, \
+         JSON_QUERY((SELECT m.* FROM arrowcol.routing_run_table_initializations m WHERE m.run_id=s.run_id \
+                     ORDER BY implementation_pool,catalog_name,schema_name,table_name FOR JSON PATH)) AS markers, \
+         JSON_QUERY((SELECT p.* FROM arrowcol.routing_run_table_pins p WHERE p.run_id=s.run_id \
+                     ORDER BY implementation_pool,catalog_name,schema_name,table_name FOR JSON PATH)) AS pins \
+         FROM arrowcol.routing_run_pin_sets s WHERE s.run_id=@P1 FOR JSON PATH) AS authority;",
+            &[&run_id],
+        )
+        .await?
+        .into_row()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("missing immutable authority snapshot"))?;
+    let value = row
+        .try_get::<&str, _>("authority")?
+        .ok_or_else(|| anyhow::anyhow!("NULL immutable authority snapshot"))?
+        .to_owned();
+    connection.finish().await?;
+    Ok(value)
+}
+
+async fn replace_fixture_lease_owner(
+    table: &TableIdentity,
+    replacement: CollectorInstanceId,
+    original_lease_id: Uuid,
+) -> anyhow::Result<()> {
+    // Model out-of-band lease corruption without rewriting immutable authority.
+    let mut connection = SqlConnection::connect(&sql_connection_config()?).await?;
+    connection
+        .execute(
+            "UPDATE arrowcol.routing_table_leases SET holder_instance_id=@P4, lease_id=NEWID(), \
+         fencing_epoch=fencing_epoch+1, lease_version=lease_version+1 \
+         WHERE implementation_pool='dataflow' AND catalog_name=@P1 AND schema_name=@P2 \
+           AND table_name=@P3 AND lease_id=@P5;",
+            &[
+                &table.catalog().as_str(),
+                &table.schema().as_str(),
+                &table.table().as_str(),
+                &replacement.as_uuid(),
+                &original_lease_id,
+            ],
+        )
+        .await?;
+    connection.finish().await?;
+    Ok(())
+}
+
+fn migrator_secret_path() -> PathBuf {
+    std::env::var_os("ARROWCOL_MIGRATOR_PASSWORD_FILE").map_or_else(
+        || {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../projects/arrowcol-infra/secrets/arrowcol-migrator-password.txt")
+        },
+        PathBuf::from,
+    )
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires the live arrowcol-infra SQL Server"]
 async fn live_sql_coordinates_router_races_and_fenced_drain_transfer() -> anyhow::Result<()> {
@@ -254,6 +729,7 @@ async fn live_sql_hands_crashed_holder_lease_to_same_key_restart() -> anyhow::Re
                 now_unix_ms: subtract(now, 9_000)?,
                 expires_at_unix_ms: add(now, 60_000)?,
                 minimum_snapshot_at_unix_ms: subtract(now, 24_000)?,
+                distinct_table_owners: false,
             })
             .await?;
         anyhow::ensure!(
@@ -290,6 +766,7 @@ async fn live_sql_hands_crashed_holder_lease_to_same_key_restart() -> anyhow::Re
                 now_unix_ms: at,
                 expires_at_unix_ms: add(at, 60_000)?,
                 minimum_snapshot_at_unix_ms: subtract(at, 15_000)?,
+                distinct_table_owners: false,
             })
         };
 

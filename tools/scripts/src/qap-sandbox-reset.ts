@@ -7,6 +7,13 @@ import { fileURLToPath } from 'node:url';
 const GROUP = 'arrow-collector-rg';
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+export function resetTimeoutMinutes(value: string | number | undefined): number {
+  const minutes = Number(value ?? 45);
+  if (!Number.isSafeInteger(minutes) || minutes < 1 || minutes * 60_000 > 2_147_483_647)
+    throw new Error('Timeout must be a positive whole number of minutes within the Node timer limit.');
+  return minutes;
+}
+
 export function azCommand(args: string[], platform: NodeJS.Platform): { executable: string; args: string[] } {
   if (platform !== 'win32') return { executable: 'az', args };
   if (args.some(arg => !/^[A-Za-z0-9_.():/-]+$/.test(arg))) throw new Error('Unsafe Azure CLI argument.');
@@ -20,7 +27,7 @@ export function capturedManagedGroups(value: unknown, subscription: string): str
   for (const cluster of value) {
     if (!cluster || typeof cluster !== 'object') throw new Error('Invalid AKS inventory entry.');
     const { id, name, nodeResourceGroup } = cluster as Record<string, unknown>;
-    if (typeof id !== 'string' || typeof name !== 'string' || !/^arrow-collector-[1-9][0-9]{0,5}$/.test(name) ||
+    if (typeof id !== 'string' || typeof name !== 'string' || !/^arrow-collector-(00000|[1-9][0-9]{0,5})$/.test(name) ||
         id.toLowerCase() !== prefix + name.toLowerCase() ||
         typeof nodeResourceGroup !== 'string' || !/^MC_[A-Za-z0-9_.()-]{1,80}$/i.test(nodeResourceGroup) ||
         nodeResourceGroup.toLowerCase() === GROUP.toLowerCase()) {
@@ -52,7 +59,9 @@ async function main(): Promise<void> {
     subscription: { type: 'string' },
     'confirm-reset': { type: 'string' },
     receipt: { type: 'string' },
+    'timeout-minutes': { type: 'string' },
   } });
+  const deadline = Date.now() + resetTimeoutMinutes(values['timeout-minutes']) * 60_000;
   const subscription = values.subscription;
   if (!subscription || !UUID.test(subscription) || values['confirm-reset'] !== GROUP)
     throw new Error('Require --subscription <UUID> --confirm-reset arrow-collector-rg.');
@@ -100,7 +109,6 @@ async function main(): Promise<void> {
       az(['group', 'delete', '--subscription', subscription, '--name', GROUP, '--yes', '--no-wait']);
     }
     evidence.stage = 'wait'; save();
-    const deadline = Date.now() + 45 * 60_000;
     let remaining = groupExists ? [GROUP, ...managedGroups] : [];
     while (remaining.length) {
       if (Date.now() >= deadline) throw new Error('Timed out waiting for captured resource groups.');

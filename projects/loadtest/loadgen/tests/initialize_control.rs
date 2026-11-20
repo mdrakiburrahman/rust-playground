@@ -1,4 +1,4 @@
-//! Offline proof of the shared `initialize-azure` body (`initialize_tables_with`): all 13
+//! Offline proof of the shared `initialize-azure` body (`initialize_tables_with`): all 32
 //! Dataflow canonical tables go through the real bootstrap initializer over injected control metadata and a
 //! disposable local store, and the manifest is published only after every table drains. Uses the
 //! dev-only `arrow-deltalake/test-control` seam; no Azure endpoint, token or process environment.
@@ -37,7 +37,7 @@ const CONTAINER: &str = "tables";
 const ROOT: &str = "abfss://tables@acct.dfs.core.windows.net/sandbox";
 const GENERATION: &str = "00000000-0000-4000-8000-000000000001";
 const ROTATED: &str = "00000000-0000-4000-8000-000000000002";
-const TABLES: usize = 13;
+const TABLES: usize = 32;
 
 #[derive(Default)]
 struct Memory(Mutex<(BTreeMap<String, String>, u64)>);
@@ -726,7 +726,7 @@ fn supervision_faults_always_kill_reap_and_propagate() -> Result<()> {
 
 /// Guarantees: the environment the real TypeScript parent composes for the child satisfies every
 /// precondition of `initialize-delta.sh`; the script's exact argv parses through the real CLI;
-/// the shared env parser and 13-table body then initialize every table over the guarded store
+/// the shared env parser and 32-table body then initialize every table over the guarded store
 /// and drain; and the parent's real manifest/Delta-log validation accepts that manifest and
 /// those logs, reaching its first ARM call with no Kusto command. Removing one log makes the
 /// parent report NotReady without Kusto.

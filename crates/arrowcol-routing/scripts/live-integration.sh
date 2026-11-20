@@ -44,6 +44,7 @@ ARROWCOL_SQLSERVER_TEST=1 \
 ARROWCOL_SQLSERVER_HOST="$sql_host" \
 ARROWCOL_SQLSERVER_PORT="$sql_port" \
 ARROWCOL_APP_PASSWORD_FILE="$(resolve_project_path "${ARROWCOL_APP_PASSWORD_FILE:-./secrets/arrowcol-app-password.txt}")" \
+ARROWCOL_MIGRATOR_PASSWORD_FILE="$(resolve_project_path "${ARROWCOL_MIGRATOR_PASSWORD_FILE:-./secrets/arrowcol-migrator-password.txt}")" \
   cargo test --locked --package arrowcol-routing --test live_sql -- --ignored --test-threads=1
 
 echo "Arrowcol routing SQL Server live integration passed"

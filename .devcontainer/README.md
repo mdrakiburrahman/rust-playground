@@ -50,3 +50,20 @@ discover it without a per-user installation or a mounted Azure CLI cache. Verify
 the source configuration with `nx run devcontainer:test-source`; `nx run
 devcontainer:build` builds the Dockerfile image but does not by itself prove
 that the Dev Container Features were applied.
+
+Source builds retain APT signature and hash verification, and apply this policy
+before the first package update so subsequent Features inherit it:
+
+| Setting | Source-build policy |
+| --- | --- |
+| Ubuntu archive/security transport | `azure.archive.ubuntu.com` HTTPS; other repositories unchanged |
+| Transport retries | Two retries |
+| HTTP/HTTPS inactivity timeout | 30 seconds, not a whole-build deadline |
+| Index update errors | Any failed index makes the update fail |
+
+The mirror changes transport only; packages and indexes still require the
+existing Ubuntu archive trust keys. The Azure Archive endpoint replaces the
+Kernel Archives mirror after its observed connection failure; no DNS override
+or weaker APT verification is used. It does not repair inconsistent upstream
+indexes or add freshness guarantees beyond normal APT verification.
+The CI environment build still has its existing 30-minute deadline.

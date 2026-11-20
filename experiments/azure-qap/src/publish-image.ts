@@ -1,5 +1,4 @@
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
@@ -34,7 +33,18 @@ function ensure(name: string, result: { returncode: number; stdout: string; stde
   return result.stdout.trim();
 }
 
-export async function publishRuntimeImage(options: ImageOptions, runner: typeof run_tree = run_tree): Promise<string> {
+export interface PublisherSession {
+  run: typeof run_tree;
+  clean: (name: string, result: Awaited<ReturnType<typeof run_tree>>) => string;
+  revision: string;
+  loginServer: string;
+  subscription: string;
+}
+
+export async function withPublisherIdentity<T>(
+  options: ImageOptions, publish: (session: PublisherSession) => Promise<T>,
+  runner: typeof run_tree = run_tree, existingIdentityOnly = false,
+): Promise<T> {
   const environment = { ...load_env(path.resolve(ROOT, options.env)), ...process.env } as Record<string, string>;
   const generated = load_env(path.resolve(ROOT, options.azureEnv));
   const stamp = loadStampConfig(options.stampConfig);
@@ -70,27 +80,39 @@ export async function publishRuntimeImage(options: ImageOptions, runner: typeof 
         '--query', 'tenantId', '--output', 'tsv'], 60));
       if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(tenant))
         throw new Failure('Azure CLI returned an invalid tenant ID.');
-      temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'azure-qap-publisher-'));
-      const manifests = ['namespace.yaml', 'service-account.yaml'].map(filename => {
-        const document = parseDocument(fs.readFileSync(path.join(ROOT, 'infra/kubernetes/base', filename), 'utf8'));
-        if (document.errors.length) throw new Failure(`Invalid identity template ${filename}.`);
-        document.setIn(['metadata', 'name'], filename === 'namespace.yaml' ? stamp.aks.namespace : stamp.aks.serviceAccount);
-        if (filename === 'service-account.yaml') {
-          document.setIn(['metadata', 'namespace'], stamp.aks.namespace);
-          document.setIn(['metadata', 'annotations', 'azure.workload.identity/client-id'], identityClientId);
+      const scratch = path.join(ROOT, 'out', 'image-publisher');
+      fs.mkdirSync(scratch, { recursive: true, mode: 0o700 });
+      temporary = fs.mkdtempSync(path.join(scratch, 'session-'));
+      if (existingIdentityOnly) {
+        const account = JSON.parse(clean('kubectl get publisher identity', await run(['kubectl', 'get', 'serviceaccount',
+          stamp.aks.serviceAccount, '--namespace', stamp.aks.namespace, '--output', 'json'], 30)));
+        if (account.metadata?.name !== stamp.aks.serviceAccount || account.metadata?.namespace !== stamp.aks.namespace ||
+            account.metadata?.annotations?.['azure.workload.identity/client-id']?.toLowerCase() !== identityClientId.toLowerCase()) {
+          throw new Failure('The existing publisher ServiceAccount must match the stamped namespace, name and UAMI.');
         }
-        return document.toString();
-      });
-      const manifest = path.join(temporary, 'identity.yaml');
-      fs.writeFileSync(manifest, manifests.join('---\n'), { mode: 0o600 });
-      clean('kubectl apply publisher identity', await run(['kubectl', 'apply', '--filename', manifest], 120));
+      } else {
+        const manifests = ['namespace.yaml', 'service-account.yaml'].map(filename => {
+          const document = parseDocument(fs.readFileSync(path.join(ROOT, 'infra/kubernetes/base', filename), 'utf8'));
+          if (document.errors.length) throw new Failure(`Invalid identity template ${filename}.`);
+          document.setIn(['metadata', 'name'], filename === 'namespace.yaml' ? stamp.aks.namespace : stamp.aks.serviceAccount);
+          if (filename === 'service-account.yaml') {
+            document.setIn(['metadata', 'namespace'], stamp.aks.namespace);
+            document.setIn(['metadata', 'annotations', 'azure.workload.identity/client-id'], identityClientId);
+          }
+          return document.toString();
+        });
+        const manifest = path.join(temporary, 'identity.yaml');
+        fs.writeFileSync(manifest, manifests.join('---\n'), { mode: 0o600 });
+        clean('kubectl apply publisher identity', await run(['kubectl', 'apply', '--filename', manifest], 120));
+      }
       const assertion = clean('kubectl create publisher token', await run(['kubectl', 'create', 'token',
         stamp.aks.serviceAccount, '--namespace', stamp.aks.namespace, '--audience', 'api://AzureADTokenExchange',
         '--duration', '1h'], 60));
       secrets.push(assertion);
       if (assertion.length > 16_384 || !/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(assertion))
         throw new Failure('Kubernetes returned an invalid publisher federation assertion.');
-      commandEnvironment = { ...environment, AZURE_CONFIG_DIR: path.join(temporary, 'azure') };
+      commandEnvironment = { ...environment, AZURE_CONFIG_DIR: path.join(temporary, 'azure'),
+        ...(existingIdentityOnly ? { DOCKER_CONFIG: path.join(temporary, 'docker') } : {}) };
       clean('az federated publisher login', await run(['az', 'login', '--service-principal', '--username', identityClientId,
         '--tenant', tenant, '--federated-token', assertion, '--output', 'none'], 120));
     }
@@ -99,7 +121,6 @@ export async function publishRuntimeImage(options: ImageOptions, runner: typeof 
     ], 60));
     if (authenticatedClientId.toLowerCase() !== identityClientId.toLowerCase())
       throw new Failure('Azure CLI must be authenticated as the single arrow-collector UAMI before publishing.');
-    const tag = options.tag ?? `qap-${revision}`;
     const loginServer = clean('az acr show', await run([
       'az', 'acr', 'show', '--name', options.registry, '--subscription', subscription, '--query', 'loginServer', '--output', 'tsv',
     ], 60));
@@ -108,6 +129,15 @@ export async function publishRuntimeImage(options: ImageOptions, runner: typeof 
     clean('az acr login', await run([
       'az', 'acr', 'login', '--name', options.registry, '--subscription', subscription,
     ], 120));
+    return await publish({ run, clean, revision, loginServer, subscription });
+  } finally {
+    if (temporary) fs.rmSync(temporary, { recursive: true, force: true });
+  }
+}
+
+export async function publishRuntimeImage(options: ImageOptions, runner: typeof run_tree = run_tree): Promise<string> {
+  return withPublisherIdentity(options, async ({ run, clean, revision, loginServer, subscription }) => {
+    const tag = options.tag ?? `qap-${revision}`;
     const tagRef = `${loginServer}/${IMAGE_NAME}:${tag}`;
     clean('docker buildx build', await run([
       'docker', 'buildx', 'build', '--pull', '--platform', 'linux/amd64', '--push', '--tag', tagRef,
@@ -121,9 +151,7 @@ export async function publishRuntimeImage(options: ImageOptions, runner: typeof 
     const image = `${loginServer}/${IMAGE_NAME}@${digest}`;
     console.log(`Digest-pinned runtime image: ${image}`);
     return image;
-  } finally {
-    if (temporary) fs.rmSync(temporary, { recursive: true, force: true });
-  }
+  }, runner);
 }
 
 async function main(argv: readonly string[]): Promise<number> {

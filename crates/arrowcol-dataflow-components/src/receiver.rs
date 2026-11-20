@@ -192,6 +192,9 @@ impl BatchAdmission for DfeAdmission {
         context: StreamContext,
         _emitter: Arc<dyn PutResultEmitter>,
     ) -> RuntimeResult<Box<dyn StreamLifecycle>> {
+        if !self.metrics.ready() {
+            return Err(RuntimeError::draining());
+        }
         let lease = self.leases.resolve(context.metadata().table()).await?;
         if lease.holder_instance_id != self.instance_id {
             return Err(RuntimeError::new(
@@ -199,6 +202,9 @@ impl BatchAdmission for DfeAdmission {
                 tonic::Code::FailedPrecondition,
                 "collector does not own the table lease",
             ));
+        }
+        if !self.metrics.ready() {
+            return Err(RuntimeError::draining());
         }
         let permit = Arc::clone(&self.permits)
             .acquire_owned()
@@ -379,7 +385,11 @@ impl StreamLifecycle for DfeStreamLifecycle {
                 Ok(())
             }
             Err(error) => Err(match error {
-                PdataSendError::Closed => RuntimeError::draining(),
+                PdataSendError::Closed => RuntimeError::new(
+                    ErrorCode::PoolUnavailable,
+                    tonic::Code::Unavailable,
+                    "DFE downstream route closed after admission",
+                ),
                 PdataSendError::Unavailable => RuntimeError::new(
                     ErrorCode::CapacityExhausted,
                     tonic::Code::Unavailable,
@@ -416,7 +426,8 @@ struct ArrowFlightReceiver {
 }
 
 fn validate_receiver_config(value: &serde_json::Value) -> Result<(), otel_arrow_dfe_config::error::Error> {
-    let config: FlightReceiverConfig = parse_config(value)?;
+    let mut config: FlightReceiverConfig = parse_config(value)?;
+    config.apply_environment().map_err(config_error)?;
     config.validate().map_err(config_error)
 }
 
@@ -428,12 +439,28 @@ fn create_receiver(
     _capabilities: &otel_arrow_dfe_engine::capability::registry::Capabilities,
 ) -> Result<ReceiverWrapper<OtapPdata>, otel_arrow_dfe_config::error::Error> {
     let mut config: FlightReceiverConfig = parse_config(&node_config.config)?;
+    config.apply_environment().map_err(config_error)?;
     if let Some(generation) = crate::config::process_cloud_generation() {
         config.registration.instance_key = format!("{}|cloud={generation}", config.registration.instance_key);
     }
     config.validate().map_err(config_error)?;
-    let routing = config.routing.build().map_err(config_error)?;
     let metrics = global_metrics();
+    metrics
+        .configure_cpu_pressure(config.cpu_pressure)
+        .map_err(config_error)?;
+    eprintln!(
+        "arrowcol_effective_config {}",
+        serde_json::json!({
+            "component": "receiver",
+            "config": config.effective_config_json()
+        })
+    );
+    tracing::info!(
+        component = "receiver",
+        effective_config = %config.effective_config_json(),
+        "arrowcol_effective_config"
+    );
+    let routing = config.routing.build().map_err(config_error)?;
     metrics
         .configure_admission(&config.registration.instance_key, config.native_quiver)
         .map_err(config_error)?;
@@ -966,8 +993,8 @@ pub(crate) mod tests {
     use arrowcol_catalog::{CatalogControlPlane, CatalogStore, DdlParser, FlightSqlDdlHandler, MemoryCatalogStore};
     use arrowcol_flight::{DeliveryGuarantee, PutResultMetadata};
     use arrowcol_protocol::{
-        BasisPoints, CatalogName, ClaimedSchemaFingerprint, IngestMetadata, Measurement, PressureGauge,
-        ProtocolVersion, SchemaName, TableName, UnixMillis, fingerprint_schema,
+        BasisPoints, CatalogName, ClaimedSchemaFingerprint, IngestMetadata, Measurement, NOT_ADMITTED_METADATA_KEY,
+        PressureGauge, ProtocolVersion, SchemaName, TableName, UnixMillis, fingerprint_schema,
     };
     use arrowcol_routing::{
         CollectorRegistration, LeaseClaim, LeaseKey, MemoryRoutingStore, RichPressureSnapshot, RoutingStore,
@@ -1001,12 +1028,12 @@ pub(crate) mod tests {
         }
     }
 
-    struct FailingSender;
+    struct FailingSender(PdataSendError);
 
     #[async_trait]
     impl PdataSender for FailingSender {
         async fn send(&self, _correlation_id: u64, _pdata: OtapPdata) -> Result<(), PdataSendError> {
-            Err(PdataSendError::Unavailable)
+            Err(self.0)
         }
     }
 
@@ -1083,6 +1110,7 @@ pub(crate) mod tests {
                 now_unix_ms: now,
                 expires_at_unix_ms: UnixMillis::new(now.get() + 60_000)?,
                 minimum_snapshot_at_unix_ms: now,
+                distinct_table_owners: false,
             })
             .await?;
         Ok(())
@@ -1195,7 +1223,7 @@ pub(crate) mod tests {
         let envelope = envelope();
         metrics.stream_started(&envelope.table);
         let mut lifecycle = DfeStreamLifecycle {
-            sender: Arc::new(FailingSender),
+            sender: Arc::new(FailingSender(PdataSendError::Unavailable)),
             pending,
             metrics: Arc::clone(&metrics),
             envelope,
@@ -1208,6 +1236,30 @@ pub(crate) mod tests {
         assert_eq!(error.code(), ErrorCode::CapacityExhausted);
         let pressure = metrics.pressure().expect("pressure");
         assert_eq!(pressure.rich.buffered_batches.current().get(), 0);
+    }
+
+    #[tokio::test]
+    async fn closed_downstream_route_is_not_marked_not_admitted() {
+        let metrics = Arc::new(RuntimeMetrics::new(CollectorInstanceId::new()));
+        metrics.configure_receiver(1, 1_000_000, 1_000_000, 100, 10, 1);
+        let pending = Arc::new(PendingTracker::new(Arc::clone(&metrics)));
+        let semaphore = Arc::new(Semaphore::new(1));
+        let permit = Arc::clone(&semaphore).acquire_owned().await.expect("permit");
+        let envelope = envelope();
+        metrics.stream_started(&envelope.table);
+        let mut lifecycle = DfeStreamLifecycle {
+            sender: Arc::new(FailingSender(PdataSendError::Closed)),
+            pending,
+            metrics,
+            envelope,
+            permit: Some(permit),
+            finished: false,
+            durable: None,
+        };
+
+        let error = lifecycle.push_batch(batch()).await.expect_err("closed route");
+        assert_eq!(error.code(), ErrorCode::PoolUnavailable);
+        assert!(error.into_status().metadata().get(NOT_ADMITTED_METADATA_KEY).is_none());
     }
 
     /// Scenario: Flight admission is cancelled while a bounded DFE route is backpressured.
@@ -1314,7 +1366,7 @@ pub(crate) mod tests {
             instance_id,
             "dfe-flight-test",
             2,
-            metrics,
+            Arc::clone(&metrics),
         ));
         let service = ArrowColFlightService::new(
             ImplementationPool::Dataflow,
@@ -1323,6 +1375,31 @@ pub(crate) mod tests {
             admission as Arc<dyn BatchAdmission>,
             arrowcol_flight::RuntimeLimits::default(),
         )?;
+        let status = match service
+            .handle_do_put(
+                flight_request(
+                    ddl.identity(),
+                    current.version(),
+                    Arc::clone(&schema),
+                    vec![input.clone()],
+                )
+                .await?,
+            )
+            .await
+        {
+            Ok(_) => return Err(anyhow::anyhow!("unready collector accepted a delivery")),
+            Err(status) => status,
+        };
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert_eq!(
+            status
+                .metadata()
+                .get(NOT_ADMITTED_METADATA_KEY)
+                .and_then(|value| value.to_str().ok()),
+            Some("true")
+        );
+        metrics.set_catalog_ready(true);
+        metrics.set_registered(true);
         let results = service
             .handle_do_put(flight_request(ddl.identity(), current.version(), Arc::clone(&schema), vec![input]).await?)
             .await?
@@ -1763,6 +1840,8 @@ pub(crate) mod tests {
         });
         let metrics = Arc::new(RuntimeMetrics::new(instance_id));
         metrics.configure_receiver(2, u64::MAX / 4, 1_000_000, 10_000, 16, 2);
+        metrics.set_catalog_ready(true);
+        metrics.set_registered(true);
         metrics
             .configure_admission("dfe-flight-test", true)
             .map_err(anyhow::Error::msg)?;

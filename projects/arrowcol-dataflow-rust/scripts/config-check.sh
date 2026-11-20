@@ -19,7 +19,7 @@ done
 # -> exporter:arrow_deltalake and must enable native Quiver on the receiver.
 grep -F 'native_quiver: true' "$project/config.quiver.yaml" >/dev/null
 grep -F 'type: processor:durable_buffer' "$project/config.quiver.yaml" >/dev/null
-grep -F 'wal_flush_interval: 0s' "$project/config.quiver.yaml" >/dev/null
+grep -F 'wal_flush_interval: "${env:ARROWCOL_WAL_FLUSH_INTERVAL:-0s}"' "$project/config.quiver.yaml" >/dev/null
 
 # A STANDARD-only processor (processor:batch accepts only OTAP/OTLP pdata) must be
 # rejected by DFE wiring contracts when it receives Arrowcol pluggable Arrow pdata.

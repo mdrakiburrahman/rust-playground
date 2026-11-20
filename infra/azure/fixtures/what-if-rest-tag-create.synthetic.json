@@ -1,0 +1,28 @@
+{
+  "changeType": "Modify",
+  "resourceId": "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/arrow-collector-rg",
+  "before": {
+    "apiVersion": "2024-03-01",
+    "id": "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/arrow-collector-rg",
+    "name": "arrow-collector-rg",
+    "type": "Microsoft.Resources/resourceGroups",
+    "location": "canadacentral"
+  },
+  "after": {
+    "apiVersion": "2024-03-01",
+    "id": "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/arrow-collector-rg",
+    "name": "arrow-collector-rg",
+    "type": "Microsoft.Resources/resourceGroups",
+    "location": "canadacentral",
+    "tags": {
+      "owner": "current"
+    }
+  },
+  "delta": [
+    {
+      "path": "tags.owner",
+      "propertyChangeType": "Create",
+      "after": "current"
+    }
+  ]
+}

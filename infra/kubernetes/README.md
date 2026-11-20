@@ -1,5 +1,9 @@
 # Azure QAP Kubernetes runtime
 
+The separate [ArrowCol OAT runtime](../../docs/experiments/arrowcol-oat/RUNTIME.md)
+renders its own dedicated namespace, SQL/catalog state and integrated DFE/router
+Deployments. It does not reuse or change this bounded QAP Job overlay.
+
 The Kustomize base and Azure QAP overlay run the complete experiment runtime in
 one bounded Kubernetes Job. The devcontainer runtime remains the default; AKS is
 opt-in with `--kubernetes`.

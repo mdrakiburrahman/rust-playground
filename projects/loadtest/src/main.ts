@@ -461,16 +461,12 @@ async function runLocalLoadgen(
   );
 }
 
-export function portainerAccess(port: string, passwordFile: string): string {
-  // Portainer trims exactly one trailing newline from --admin-password-file.
-  const password = readFileSync(passwordFile, 'utf8').replace(/\n$/u, '');
-  return `Portainer: https://localhost:${port} (port ${port}, username admin, password ${password}; self-signed TLS)`;
+export function portainerAccess(port: string, credentialFile: string): string {
+  return `Portainer: https://localhost:${port} (port ${port}, username admin, credential file ${credentialFile}; self-signed TLS)`;
 }
 
-export function sqlserverAccess(port: string, passwordFile: string): string {
-  const password = readFileSync(passwordFile, 'utf8').replace(/\n+$/u, '');
-  assert(password.length > 0 && !/[\r\n]/u.test(password), 'SQL Server password secret must be non-empty and single-line');
-  return `SQL Server: localhost,${port} (host port ${port} -> container port 1433, username sa, password ${password})`;
+export function sqlserverAccess(port: string, credentialFile: string): string {
+  return `SQL Server: localhost,${port} (host port ${port} -> container port 1433, username sa, credential file ${credentialFile})`;
 }
 
 export function quiverLocations(directory: string): string {
@@ -565,7 +561,7 @@ async function benchmark(
   let failure: unknown;
   let phase = 'compose-validation';
   let stopSampler: (() => Promise<void>) | undefined;
-  let stopQapObserver: (() => Promise<void>) | undefined;
+  let stopQapObserver: ReturnType<typeof startQapObserver> | undefined;
   let stoppedMutators: StoppedMutator[] | undefined;
   let stackSql: SqlIdentity | undefined;
   const resultsDirectory = path.relative(workspace, path.join(directory, 'results'));
@@ -637,11 +633,11 @@ async function benchmark(
     );
     step(portainerAccess(
       process.env.PORTAINER_PORT ?? '9444',
-      path.join(workspace, 'projects/arrowcol-infra/secrets/sqlserver-sa-password.txt'),
+      'projects/arrowcol-infra/secrets/sqlserver-sa-password.txt',
     ));
     step(sqlserverAccess(
       process.env.SQLSERVER_PORT ?? '14333',
-      path.join(workspace, 'projects/arrowcol-infra/secrets/sqlserver-sa-password.txt'),
+      'projects/arrowcol-infra/secrets/sqlserver-sa-password.txt',
     ));
     step(azure ? 'Delta storage: isolated ADLS run roots (locations retained only in private runtime configuration)' : deltaTableLocations(directory));
     if (options.quiver) step(quiverLocations(directory));
@@ -722,6 +718,10 @@ async function benchmark(
     }
     if (crash) step(`Quiver crash recovery evidence: ${resultsDirectory}/${QUIVER_RECOVERY_FILE}`);
     if (options.validate) {
+      phase = 'qap-observer-quiesce';
+      assert(stopQapObserver, 'Validated benchmark requires its live QAP observer');
+      step('Finishing live QAP observation before exclusive output qualification');
+      await stopQapObserver();
       phase = 'publication-drain';
       step('Draining publication while collector admin endpoints remain available');
       await runLocalLoadgen(context, 'drain', path.join(directory, 'results'), controller);
@@ -780,6 +780,9 @@ async function benchmark(
       });
       step(`kusto-explorer UI gate passed: ${gate.tables} tables and ${gate.rows} rows matched through the UI`);
       }
+      phase = 'final-qap-observation';
+      step('Recording final QAP observation after output qualification');
+      await stopQapObserver.sampleFinal();
     }
     if (stressOutcome.status === 'rejected') {
       phase = 'fixed-window-stress';

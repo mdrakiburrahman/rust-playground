@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { test } from 'node:test';
+import timers from 'node:timers/promises';
 import { parseStressPlan, runStressDriver, stressInputBudget, type StressPlan } from '../src/stress-driver.js';
 import { parseBenchmarkOptions } from '../src/cli.js';
 import { evaluateStress } from '../src/stress-criteria.js';
@@ -102,6 +103,72 @@ test('actual clock controller executes exactly the declared waves and persists m
   assert(samples.at(-1).timestamp >= window.criteria.end);
   assert.equal(window.criteria.end - window.criteria.start, 9000);
   assert.equal(evaluateStress(samples, window.criteria).status, 'passed');
+});
+
+test('early timer wakes wait only the remaining boundary time without sampling a shortened window', async t => {
+  const results = fixture(t);
+  const start = 1_000_000;
+  let now = start;
+  t.mock.method(Date, 'now', () => now);
+  const waits: number[] = [];
+  t.mock.method(timers, 'setTimeout', async (milliseconds: number) => {
+    waits.push(milliseconds);
+    assert(waits.length <= 6, 'each early wake needs only its actual remaining millisecond');
+    now += waits.length % 2 === 1 ? milliseconds - 1 : milliseconds;
+  });
+  const operations: number[] = [];
+  const timestamps: number[] = [];
+  const verdict = await runStressDriver({
+    plan, results, loadEnded: new AbortController().signal, checkRunning: () => {},
+    waitForInput: async () => ({ runId: 'early-wake-fixture', inputDeadline: start + 60_000 }),
+    operate: async (wave, deadline) => { assert(Date.now() < deadline); operations.push(wave); },
+    sample: async wave => {
+      const timestamp = Date.now();
+      timestamps.push(timestamp);
+      return { timestamp, wave, phase: 'wave-boundary', driverRows: wave * 100,
+        rssBytes: 100, physicalBytes: 200, backlog: 1, restarts: 0, oomEvents: 0, exhaustedRetries: 0 };
+    },
+  });
+  assert.equal(verdict.status, 'passed');
+  assert.deepEqual(operations, [1, 2, 3]);
+  assert.deepEqual(waits, [3000, 1, 3000, 1, 3000, 1]);
+  assert.deepEqual(timestamps, [start, start + 3000, start + 6000, start + 9000]);
+  const window = JSON.parse(readFileSync(path.join(results, 'stress-window.json'), 'utf8'));
+  const samples = readFileSync(path.join(results, 'stress-samples.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
+  assert.equal(window.criteria.start, start);
+  assert.equal(window.criteria.end, start + 9000);
+  assert.deepEqual(samples.map(sample => sample.timestamp), timestamps);
+  assert.equal(evaluateStress(samples, window.criteria).status, 'passed');
+});
+
+test('scheduler lateness beyond declared coverage remains insufficient evidence without replay', async t => {
+  const results = fixture(t);
+  const start = 1_000_000;
+  let now = start;
+  t.mock.method(Date, 'now', () => now);
+  let waits = 0;
+  t.mock.method(timers, 'setTimeout', async (milliseconds: number) => {
+    waits++;
+    assert(waits <= 3, 'a late terminal sample must not trigger extra waves or resampling');
+    now += milliseconds + (waits === 3 ? plan.sampleTimeoutSeconds * 1000 + 1 : 0);
+  });
+  const operations: number[] = [];
+  await assert.rejects(runStressDriver({
+    plan, results, loadEnded: new AbortController().signal, checkRunning: () => {},
+    waitForInput: async () => ({ runId: 'late-wake-fixture', inputDeadline: start + 60_000 }),
+    operate: async (wave, deadline) => { assert(Date.now() < deadline); operations.push(wave); },
+    sample: async wave => ({ timestamp: Date.now(), wave, phase: 'wave-boundary', driverRows: wave * 100,
+      rssBytes: 100, physicalBytes: 200, backlog: 1, restarts: 0, oomEvents: 0, exhaustedRetries: 0 }),
+  }), /Stress insufficient-evidence:.*fixed-window coverage/u);
+  assert.deepEqual(operations, [1, 2, 3]);
+  assert.equal(waits, 3);
+  const window = JSON.parse(readFileSync(path.join(results, 'stress-window.json'), 'utf8'));
+  const samples = readFileSync(path.join(results, 'stress-samples.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
+  assert.equal(window.criteria.end, start + 9000);
+  assert.equal(samples.length, 4);
+  assert.equal(samples.at(-1).timestamp, start + 10_001);
+  assert.equal(evaluateStress(samples, window.criteria).status, 'insufficient-evidence');
+  assert.equal(JSON.parse(readFileSync(path.join(results, 'stress-verdict.json'), 'utf8')).status, 'insufficient-evidence');
 });
 
 test('actual operation failure is persisted once and never retried until green', async t => {

@@ -1206,10 +1206,11 @@ footer { color: var(--muted); font-size: 12.5px; text-align: center; padding: 10
 </section>
 
 <section id="infra">
-<h2>Azure setup</h2>
+<h2>Historical Azure sandbox setup</h2>
+<p>This topology describes the original devcontainer runs, not the current AKS stamp. The current template declares one <code>arrow-collector</code> UAMI in the primary resource group; mandatory platform extensions may create separate identities in the AKS-managed resource group. See <a href="../../operations/AKS_QAP.md#tenant-enforced-identities">AKS identity qualification</a>.</p>
 <figure class="fig"><svg xmlns="http://www.w3.org/2000/svg" width="1000" height="930" viewBox="0 0 1000 930" role="img" aria-labelledby="infra-title infra-desc" font-family="-apple-system, Segoe UI, Helvetica, Arial, sans-serif">
-<title id="infra-title">Azure resources used by the QAP experiment</title>
-<desc id="infra-desc">The devcontainer runs nx targets against one resource group, rust-playground. It holds the managed identity arrowcol-kusto-reader, the Kusto cluster arrowcol-&lt;sandboxId&gt; with databases arrowcol and the new experimentqap, the storage account arrowcol&lt;sandboxId&gt; with containers arrowcol, checkpoints and the new experimentqap, a new StorageRead diagnostic setting, and a new Log Analytics workspace arrowcol-&lt;sandboxId&gt;. Three new role assignments let the identity read the container and view the database, and let the operator read the logs.</desc>
+<title id="infra-title">Historical Azure resources used by the QAP experiment</title>
+<desc id="infra-desc">Historical topology for recorded devcontainer runs in the legacy rust-playground resource group, not the current AKS stamp. It shows the former arrowcol-kusto-reader identity, Kusto and storage resources, experimentqap database and container, StorageRead diagnostic setting, Log Analytics workspace and three historical role assignments.</desc>
 <defs>
 <marker id="infra-ar-ink" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" refX="11" refY="6" orient="auto-start-reverse"><path d="M0,0 L12,6 L0,12 z" fill="#526278"/></marker>
 <marker id="infra-ar-red" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" refX="11" refY="6" orient="auto-start-reverse"><path d="M0,0 L12,6 L0,12 z" fill="#c8283c"/></marker>
@@ -1219,13 +1220,13 @@ footer { color: var(--muted); font-size: 12.5px; text-align: center; padding: 10
 <marker id="infra-ar-purple" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" refX="11" refY="6" orient="auto-start-reverse"><path d="M0,0 L12,6 L0,12 z" fill="#6b3fb5"/></marker>
 </defs>
 <rect x="1" y="1" width="998" height="928" rx="16" fill="#ffffff" stroke="#d5dfea" stroke-width="1.5"/>
-<text x="28" y="46" font-size="25" font-weight="700" fill="#18263a">Azure resources for the experiment</text>
-<text x="28" y="74" font-size="15" fill="#526278">One shared sandbox. Green boxes are NEW for this experiment; grey ones were already there.</text>
+<text x="28" y="46" font-size="25" font-weight="700" fill="#18263a">Historical Azure resources</text>
+<text x="28" y="74" font-size="15" fill="#526278">Original rust-playground sandbox; not the current AKS stamp.</text>
 <rect x="20" y="96" width="232" height="352" rx="14" fill="#e9eff9" stroke="#185abd" stroke-width="2"/>
 <text x="36" y="128" font-size="19" font-weight="700" fill="#185abd">Devcontainer</text>
 <text x="36" y="150" font-size="13" fill="#526278">your az login (operator)</text>
 <rect x="34" y="166" width="204" height="58" rx="8" fill="#ffffff" stroke="#185abd" stroke-width="1.8"/>
-<text x="46" y="190" font-size="13.5" font-weight="700" fill="#18263a" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">azure-infra:provision</text>
+<text x="46" y="190" font-size="13.5" font-weight="700" fill="#18263a" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">historical provision</text>
 <text x="46" y="210" font-size="12.5" fill="#526278">deploys main.bicep (ARM)</text>
 <rect x="34" y="234" width="204" height="58" rx="8" fill="#ffffff" stroke="#185abd" stroke-width="1.8"/>
 <text x="46" y="258" font-size="13.5" font-weight="700" fill="#18263a">loadtest (Azure mode)</text>
@@ -1234,13 +1235,13 @@ footer { color: var(--muted); font-size: 12.5px; text-align: center; padding: 10
 <text x="46" y="326" font-size="13.5" font-weight="700" fill="#18263a" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">azure-qap-experiment:run</text>
 <text x="46" y="346" font-size="12.5" fill="#526278">this experiment</text>
 <rect x="34" y="370" width="204" height="58" rx="8" fill="#ffffff" stroke="#185abd" stroke-width="1.8"/>
-<text x="46" y="394" font-size="13.5" font-weight="700" fill="#18263a" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">azure-infra:reset</text>
+<text x="46" y="394" font-size="13.5" font-weight="700" fill="#18263a" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">historical reset</text>
 <text x="46" y="414" font-size="12.5" fill="#526278">wipes data (with --execute)</text>
 <rect x="272" y="86" width="708" height="820" rx="18" fill="#fcfdff" stroke="#8fa3bc" stroke-width="2" stroke-dasharray="8 6"/>
-<text x="292" y="116" font-size="18" font-weight="700" fill="#18263a">Resource group: rust-playground</text>
+<text x="292" y="116" font-size="18" font-weight="700" fill="#18263a">Historical resource group: rust-playground</text>
 <text x="292" y="136" font-size="12.5" fill="#526278">one Bicep deployment · names follow arrowcol-&lt;sandboxId&gt;</text>
 <rect x="292" y="154" width="300" height="70" rx="12" fill="#f4f6f9" stroke="#8fa3bc" stroke-width="1.8"/>
-<text x="308" y="180" font-size="15" font-weight="700" fill="#18263a">Managed identity</text>
+<text x="308" y="180" font-size="15" font-weight="700" fill="#18263a">Former managed identity</text>
 <text x="308" y="200" font-size="12.5" fill="#18263a" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">arrowcol-kusto-reader</text>
 <text x="308" y="216" font-size="12" fill="#526278">Kusto reads storage as this identity</text>
 <rect x="292" y="252" width="316" height="312" rx="14" fill="#f4f6f9" stroke="#8fa3bc" stroke-width="2"/>
@@ -1317,17 +1318,19 @@ footer { color: var(--muted); font-size: 12.5px; text-align: center; padding: 10
 <path d="M648,668 H136 V452" fill="none" stroke="#1f7a45" stroke-width="2" stroke-dasharray="6 5" stroke-linejoin="round" marker-end="url(#infra-ar-green)"/>
 <text x="300" y="660" font-size="12" fill="#1f7a45">reads StorageBlobLogs: which files Kusto reread</text>
 </svg>
-<figcaption>One shared sandbox. The experiment adds a container, a Kusto database, a diagnostic setting, a Log Analytics workspace and three role assignments.</figcaption></figure>
+<figcaption>Historical snapshot of the original rust-playground sandbox, including former identity and role assignments; not the current AKS stamp.</figcaption></figure>
 </section>
 
 <section id="run">
 <h2>Run it</h2>
 <p class="note">The defaults below were exercised against Azure on 2026-10-31. <code>npx nx run azure-qap-experiment:run -- --help</code> and the experiment README in <code>experiments/azure-qap/</code> describe the current CLI contract.</p>
-<h3>Quick demo (about 5 minutes plus a bounded log wait)</h3>
-<p>The defaults run each operation once, on the small 6-file table with 1 MiB files, four trials at a time.</p>
-<pre data-lang="bash"><code>npx nx run azure-infra:provision
-npx nx run azure-qap-experiment:run</code></pre>
-<p><strong>Measured on 2026-10-31:</strong> about <strong>5m13s</strong> to finish the observation windows, then about <strong>4m42s</strong> waiting for logs; <strong>9m58s total</strong> including cleanup. Provisioning and first-time builds are separate. Azure warm-up and log ingestion latency affect these timings.</p>
+<h3>Quick demo (historical sandbox results; about 5 minutes plus a bounded log wait)</h3>
+<p>The recorded sandbox defaults ran each operation once, on the small 6-file table with 1 MiB files, four trials at a time. The current AKS command follows.</p>
+<p>The provisioning command in the recorded runs is historical. For a current AKS run, qualify the selected stamp and publish a digest-pinned image using <a href="../../operations/AKS_QAP.md">AKS QAP operations</a>, then configure and run the Kustomize overlay:</p>
+<pre data-lang="bash"><code>cp infra/kubernetes/azure-qap.example.yaml infra/kubernetes/azure-qap.yaml
+# Replace the sample image with the digest published for the selected stamp.
+npx nx run azure-qap-experiment:run -- --kubernetes --kubernetes-config infra/kubernetes/azure-qap.yaml</code></pre>
+<p><strong>Historical sandbox measurement on 2026-10-31 (not AKS qualification):</strong> about <strong>5m13s</strong> to finish the observation windows, then about <strong>4m42s</strong> waiting for logs; <strong>9m58s total</strong> including cleanup. Provisioning and first-time builds are separate. Azure warm-up and log ingestion latency affect these timings.</p>
 <table><thead><tr><th>Quick-run check</th><th>Result</th></tr></thead><tbody>
 <tr><td>OPTIMIZE / PURGE / isolated VACUUM</td><td>Each observed 0/4 unchanged files reread in the short window.</td></tr>
 <tr><td>Reload control</td><td>Detected 6/6 unchanged files reread.</td></tr>
@@ -1374,14 +1377,7 @@ npx nx run azure-qap-experiment:run</code></pre>
 </tbody></table>
 <p class="note">The reload control is why a missing reread is a failure, not a pass: if the logs never show the reload's rereads, they could not have shown any other reread either, so the run's zeros prove nothing. Missing telemetry never means “no rereads”.</p>
 <h3>Clean up</h3>
-<pre data-lang="bash"><code>npx nx run azure-infra:reset</code></pre>
-<p><code>reset</code> on its own only previews. With <code>--execute</code> it:</p>
-<ul>
-<li>deletes the main <code>arrowcol</code> Kusto database; <code>provision</code> recreates it;</li>
-<li>empties the <code>experimentqap</code> database, dropping every table, external table, function and materialized view, but keeps the database and its managed identity policy;</li>
-<li>deletes every blob in the <code>arrowcol</code>, <code>checkpoints</code> and <code>experimentqap</code> containers, but keeps the containers.</li>
-</ul>
-<p>It keeps the account, cluster, managed identity and Log Analytics workspace, and the logs already in the workspace. Run <code>npx nx run azure-infra:provision</code> after a reset.</p>
+<p class="note">Do not run a reset command from this historical experiment guide. The old unqualified command now targets the selected stamp in <code>arrow-collector-rg</code>, not the original <code>rust-playground</code> sandbox. For a deliberate current-stamp reset, follow <a href="../../operations/AZURE_SANDBOX.md#cloud-occupancy-and-reset">the operations guide</a> and pass the intended private <code>--stamp-config</code> explicitly.</p>
 </section>
 
 <section id="debug">
@@ -1435,7 +1431,7 @@ npx nx run azure-qap-experiment:run</code></pre>
 | extend LagMinutes = (ingestion_time() - TimeGenerated) / 1m
 | summarize p50 = percentile(LagMinutes, 50), p95 = percentile(LagMinutes, 95), Max = max(LagMinutes)</code></pre>
 <h3>Rerun the log queries after cleanup</h3>
-<p>The Log Analytics queries keep working after the run has cleaned up, and after <code>azure-infra:reset</code>. The rows live in the workspace, not in the tables or blobs, and stay until the workspace's retention expires.</p>
+<p>The Log Analytics queries remain available after fixture cleanup and a current-stamp data reset. The rows live in the workspace, not in the tables or blobs, and stay until the workspace's retention expires.</p>
 <p>The run saves two queries per trial in its <code>--out</code> folder, by default <code>.temp/experiments/azure-qap/&lt;runId&gt;/queries/</code>:</p>
 <ul>
 <li><code>&lt;trial&gt;.kql</code> groups reads by file and <code>Phase</code>. Rows with <code>Phase</code> set to <code>after-mutation</code> and a <code>GetBlob</code> or <code>ReadFile</code> on a file the mutation did not touch are rereads. <code>late</code> rows arrived after the watch window ended.</li>

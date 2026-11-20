@@ -7,17 +7,32 @@ use std::{
     time::{Duration, Instant},
 };
 
+use arrow_flight::{
+    FlightData, FlightDescriptor,
+    flight_descriptor::DescriptorType,
+    flight_service_client::FlightServiceClient,
+    sql::{CommandStatementUpdate, ProstMessageExt},
+};
 use arrowcol_catalog::{
-    CatalogError, CatalogErrorCode, CatalogResult, CatalogSchemaVersion, CatalogStore, ChangeReservation,
-    DdlCompletion, DdlCompletionDisposition, DdlParser, DescriptorArtifacts, FlightSqlDdlHandler, FlightSqlDdlRequest,
-    RequestHash, ReserveOutcome, SagaId, SagaRecord, SagaStep, SchemaVersion,
+    CatalogError, CatalogErrorCode, CatalogErrorOrigin, CatalogResult, CatalogSchemaVersion, CatalogStore,
+    ChangeReservation, DdlCompletion, DdlCompletionDisposition, DdlParser, DescriptorArtifacts, FlightSqlDdlHandler,
+    FlightSqlDdlRequest, RequestHash, ReserveOutcome, SagaId, SagaRecord, SagaStep, SchemaVersion,
 };
 use arrowcol_protocol::{SchemaFingerprint, TableIdentity};
 use async_trait::async_trait;
+use futures::stream;
+use prost::Message;
 use tokio::sync::Mutex;
+use tonic::Request;
 use tonic::transport::{Channel, Endpoint};
 
-use crate::{CachedTable, CatalogClient, rpc};
+use crate::{CachedTable, CatalogClient, InternalRequestSigner, rpc};
+
+const CES_CURRENT_PATH: &str = "/arrowcol.catalog.v1.SchemaCatalog/GetCurrentEventId";
+const CES_WATCH_PATH: &str = "/arrowcol.catalog.v1.SchemaCatalog/Watch";
+const CES_TABLE_PATH: &str = "/arrowcol.catalog.v1.SchemaCatalog/GetTable";
+const CES_SNAPSHOT_PATH: &str = "/arrowcol.catalog.v1.SchemaCatalog/GetSnapshot";
+const FLIGHT_DO_PUT_PATH: &str = "/arrow.flight.protocol.FlightService/DoPut";
 
 type RpcClient = rpc::schema_catalog_client::SchemaCatalogClient<Channel>;
 
@@ -27,6 +42,52 @@ struct Cache {
     position: Option<rpc::EventPosition>,
     healthy_at: Option<Instant>,
     generation: u64,
+    snapshot_generation: u64,
+    table_generations: BTreeMap<TableIdentity, u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TableFetchToken {
+    snapshot_generation: u64,
+    table_generation: u64,
+}
+
+impl Cache {
+    fn table_fetch_token(&self, identity: &TableIdentity) -> TableFetchToken {
+        TableFetchToken {
+            snapshot_generation: self.snapshot_generation,
+            table_generation: self.table_generations.get(identity).copied().unwrap_or_default(),
+        }
+    }
+
+    fn table_fetch_token_is_current(&self, identity: &TableIdentity, token: TableFetchToken) -> bool {
+        self.snapshot_generation == token.snapshot_generation
+            && self.table_generations.get(identity).copied().unwrap_or_default() == token.table_generation
+    }
+
+    fn invalidate_table(&mut self, identity: &TableIdentity) {
+        self.tables.remove(identity);
+        let generation = self.table_generations.entry(identity.clone()).or_default();
+        *generation = generation.wrapping_add(1);
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    fn invalidate_all(&mut self) {
+        self.tables.clear();
+        self.table_generations.clear();
+        self.healthy_at = None;
+        self.snapshot_generation = self.snapshot_generation.wrapping_add(1);
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    fn replace_snapshot(&mut self, tables: BTreeMap<TableIdentity, CachedTable>, position: rpc::EventPosition) {
+        self.tables = tables;
+        self.position = Some(position);
+        self.healthy_at = Some(Instant::now());
+        self.table_generations.clear();
+        self.snapshot_generation = self.snapshot_generation.wrapping_add(1);
+        self.generation = self.generation.wrapping_add(1);
+    }
 }
 
 /// Actual catalog calls and local cache operations, independent of latency.
@@ -56,6 +117,7 @@ pub struct RemoteCatalogClient {
     rpc: RpcClient,
     cache: Mutex<Cache>,
     maximum_age: Duration,
+    signer: InternalRequestSigner,
     counters: Counters,
 }
 
@@ -65,6 +127,23 @@ impl RemoteCatalogClient {
     /// # Errors
     /// Rejects an invalid endpoint, zero maximum age, unavailable catalog or corrupt snapshot.
     pub async fn connect(endpoint: &str, maximum_age: Duration) -> CatalogResult<Arc<Self>> {
+        let secret_file = std::env::var_os("ARROWCOL_CATALOG_DDL_IDENTITY_SECRET_FILE")
+            .or_else(|| std::env::var_os("LOADTEST_INTERNAL_SECRET_FILE"))
+            .ok_or_else(|| failure("catalog internal identity secret file is not configured"))?;
+        let signer = InternalRequestSigner::from_file(secret_file)
+            .map_err(|error| failure(format!("load catalog internal identity signer: {error}")))?;
+        Self::connect_with_signer(endpoint, maximum_age, signer).await
+    }
+
+    /// Connects with an explicitly provided internal request signer.
+    ///
+    /// # Errors
+    /// Rejects an invalid endpoint, zero maximum age, unavailable catalog or corrupt snapshot.
+    pub async fn connect_with_signer(
+        endpoint: &str,
+        maximum_age: Duration,
+        signer: InternalRequestSigner,
+    ) -> CatalogResult<Arc<Self>> {
         if maximum_age.is_zero() {
             return Err(failure("catalog maximum cache age must be positive"));
         }
@@ -80,6 +159,7 @@ impl RemoteCatalogClient {
             channel,
             cache: Mutex::new(Cache::default()),
             maximum_age,
+            signer,
             counters: Counters::default(),
         });
         client.reconcile().await?;
@@ -109,11 +189,15 @@ impl RemoteCatalogClient {
     /// Returns transport, epoch or invalid committed-history errors.
     pub async fn reconcile(&self) -> CatalogResult<()> {
         let generation = self.cache.lock().await.generation;
+        let mut request = Request::new(rpc::Empty {});
+        self.signer
+            .sign_message(&mut request, CES_SNAPSHOT_PATH)
+            .map_err(|error| failure(format!("catalog request signing failed: {error}")))?;
         let snapshot = self
             .rpc_call()
-            .get_snapshot(rpc::Empty {})
+            .get_snapshot(request)
             .await
-            .map_err(rpc_error)?
+            .map_err(|status| rpc_error("get_snapshot", status))?
             .into_inner();
         let position = snapshot
             .position
@@ -138,10 +222,7 @@ impl RemoteCatalogClient {
                 "catalog changed during reconciliation; retry from a fresh snapshot",
             ));
         }
-        cache.tables = tables;
-        cache.position = Some(position);
-        cache.healthy_at = Some(Instant::now());
-        cache.generation = cache.generation.wrapping_add(1);
+        cache.replace_snapshot(tables, position);
         Ok(())
     }
 
@@ -151,11 +232,16 @@ impl RemoteCatalogClient {
                 return;
             };
             if let Err(error) = client.watch_once().await {
-                tracing::warn!(%error, "catalog CES disconnected; reconciling before reconnect");
+                tracing::warn!(
+                    catalog_error_code = error.code().as_str(),
+                    catalog_error_origin = error.origin().as_str(),
+                    catalog_error_operation = error.operation().unwrap_or("unclassified"),
+                    catalog_grpc_status = error.grpc_status().unwrap_or("none"),
+                    catalog_failure_id = error.failure_id().unwrap_or("none"),
+                    "catalog CES disconnected; reconciling before reconnect"
+                );
                 let mut cache = client.cache.lock().await;
-                cache.tables.clear();
-                cache.healthy_at = None;
-                cache.generation = cache.generation.wrapping_add(1);
+                cache.invalidate_all();
                 drop(cache);
             }
             drop(client);
@@ -164,18 +250,29 @@ impl RemoteCatalogClient {
                 return;
             };
             if let Err(error) = client.reconcile().await {
-                tracing::warn!(%error, "catalog reconciliation failed");
+                tracing::warn!(
+                    catalog_error_code = error.code().as_str(),
+                    catalog_error_origin = error.origin().as_str(),
+                    catalog_error_operation = error.operation().unwrap_or("unclassified"),
+                    catalog_grpc_status = error.grpc_status().unwrap_or("none"),
+                    catalog_failure_id = error.failure_id().unwrap_or("none"),
+                    "catalog reconciliation failed"
+                );
             }
         }
     }
 
     async fn watch_once(&self) -> CatalogResult<()> {
         let from = self.cache.lock().await.position.clone();
+        let mut request = Request::new(rpc::EventsRequest { from });
+        self.signer
+            .sign_message(&mut request, CES_WATCH_PATH)
+            .map_err(|error| failure(format!("catalog request signing failed: {error}")))?;
         let mut stream = self
             .rpc_call()
-            .watch(rpc::EventsRequest { from })
+            .watch(request)
             .await
-            .map_err(rpc_error)?
+            .map_err(|status| rpc_error("watch", status))?
             .into_inner();
         let mut reconcile_tick = tokio::time::interval(Duration::from_secs(5));
         let lifetime = tokio::time::sleep(Duration::from_secs(30));
@@ -184,30 +281,38 @@ impl RemoteCatalogClient {
             tokio::select! {
                 _ = &mut lifetime => return Ok(()),
                 event = stream.message() => {
-                    let event = event.map_err(rpc_error)?.ok_or_else(|| failure("catalog CES ended"))?;
+                    let event = event
+                        .map_err(|status| rpc_error("watch_message", status))?
+                        .ok_or_else(|| failure("catalog CES ended"))?;
                     let position = event.position.ok_or_else(|| failure("CES event has no position"))?;
                     let identity = identity_from_request(&event.table.ok_or_else(|| failure("CES event has no table"))?)?;
                     let mut cache = self.cache.lock().await;
                     let previous = cache.position.as_ref().ok_or_else(|| failure("CES cache has no position"))?;
-                    if position.epoch != previous.epoch || position.event_id != previous.event_id.checked_add(1).ok_or_else(|| failure("CES event ID exhausted"))? {
-                        return Err(failure("CES epoch changed or retained event gap detected"));
+                    if position.epoch != previous.epoch || position.event_id != previous.event_id.checked_add(1).ok_or_else(|| failure_at("catalog_ces_event_id_exhausted", "CES event ID exhausted"))? {
+                        return Err(failure_at("catalog_ces_epoch_or_gap_detected", "CES epoch changed or retained event gap detected"));
                     }
-                    cache.tables.remove(&identity);
+                    cache.invalidate_table(&identity);
                     cache.position = Some(position);
-                    cache.generation = cache.generation.wrapping_add(1);
                     self.counters.invalidations.fetch_add(1, Ordering::Relaxed);
                 }
                 _ = reconcile_tick.tick() => {
-                    let remote = self.rpc_call().get_current_event_id(rpc::Empty {}).await.map_err(rpc_error)?.into_inner();
+                    let mut request = Request::new(rpc::Empty {});
+                    self.signer.sign_message(&mut request, CES_CURRENT_PATH).map_err(|error| failure(format!("catalog request signing failed: {error}")))?;
+                    let remote = self
+                        .rpc_call()
+                        .get_current_event_id(request)
+                        .await
+                        .map_err(|status| rpc_error("get_current_event_id", status))?
+                        .into_inner();
                     let mut cache = self.cache.lock().await;
                     let local = cache.position.as_ref().ok_or_else(|| failure("CES cache has no position"))?;
                     if remote.epoch != local.epoch || remote.event_id < local.event_id {
-                        return Err(failure("catalog restart detected during reconciliation"));
+                        return Err(failure_at("catalog_restart_during_reconciliation", "catalog restart detected during reconciliation"));
                     }
                     if remote == *local {
                         cache.healthy_at = Some(Instant::now());
                     } else if cache.healthy_at.is_none_or(|time| time.elapsed() > self.maximum_age) {
-                        return Err(failure("CES failed to catch up within maximum cache age"));
+                        return Err(failure_at("catalog_ces_reconcile_maximum_age_exceeded", "CES failed to catch up within maximum cache age"));
                     }
                 }
             }
@@ -220,12 +325,32 @@ impl FlightSqlDdlHandler for RemoteCatalogClient {
     async fn execute_ddl(&self, request: FlightSqlDdlRequest) -> CatalogResult<DdlCompletion> {
         let command = DdlParser::default().parse(request.command())?;
         let identity = command.identity().clone();
-        let mut client = arrow_flight::sql::client::FlightSqlServiceClient::new(self.channel.clone());
+        let command = CommandStatementUpdate {
+            query: request.command().to_owned(),
+            transaction_id: None,
+        };
+        let payload = command.as_any().encode_to_vec();
+        let mut flight_request = Request::new(stream::iter([FlightData {
+            flight_descriptor: Some(FlightDescriptor {
+                r#type: DescriptorType::Cmd as i32,
+                cmd: payload.clone().into(),
+                path: Vec::new(),
+            }),
+            ..FlightData::default()
+        }]));
+        self.signer
+            .sign_payload(&mut flight_request, FLIGHT_DO_PUT_PATH, &payload)
+            .map_err(|error| failure(format!("catalog request signing failed: {error}")))?;
         self.counters.calls.fetch_add(1, Ordering::Relaxed);
-        client
-            .execute_update(request.command().to_owned(), None)
+        let response = FlightServiceClient::new(self.channel.clone())
+            .do_put(flight_request)
             .await
-            .map_err(|error| failure(format!("catalog Flight SQL failed: {error}")))?;
+            .map_err(|status| flight_rpc_error("flight_do_put", status))?;
+        let mut completion = response.into_inner();
+        completion
+            .message()
+            .await
+            .map_err(|status| flight_rpc_error("flight_do_put_completion", status))?;
         self.invalidate(&identity).await;
         let table = self.table(&identity).await?;
         let schema = table
@@ -306,7 +431,7 @@ pub fn decode_table(snapshot: rpc::TableSnapshot) -> CatalogResult<CachedTable> 
 impl CatalogClient for RemoteCatalogClient {
     async fn table(&self, identity: &TableIdentity) -> CatalogResult<CachedTable> {
         for _ in 0..3 {
-            let generation = {
+            let fetch_token = {
                 let cache = self.cache.lock().await;
                 if cache.healthy_at.is_some_and(|time| time.elapsed() <= self.maximum_age)
                     && let Some(table) = cache.tables.get(identity)
@@ -314,21 +439,25 @@ impl CatalogClient for RemoteCatalogClient {
                     self.counters.hits.fetch_add(1, Ordering::Relaxed);
                     return Ok(table.clone());
                 }
-                cache.generation
+                cache.table_fetch_token(identity)
             };
             self.counters.misses.fetch_add(1, Ordering::Relaxed);
+            let mut request = Request::new(table_request(identity));
+            self.signer
+                .sign_message(&mut request, CES_TABLE_PATH)
+                .map_err(|error| failure(format!("catalog request signing failed: {error}")))?;
             let response = self
                 .rpc_call()
-                .get_table(table_request(identity))
+                .get_table(request)
                 .await
-                .map_err(rpc_error)?
+                .map_err(|status| rpc_error("get_table", status))?
                 .into_inner();
             let table = decode_table(response)?;
             if table.versions[0].identity() != identity {
                 return Err(failure("catalog returned a different table"));
             }
             let mut cache = self.cache.lock().await;
-            if cache.generation != generation {
+            if !cache.table_fetch_token_is_current(identity, fetch_token) {
                 continue;
             }
             if cache
@@ -336,37 +465,79 @@ impl CatalogClient for RemoteCatalogClient {
                 .as_ref()
                 .is_some_and(|position| position.epoch != table.position.epoch)
             {
-                cache.tables.clear();
-                cache.healthy_at = None;
-                return Err(failure("catalog restarted; reconcile before serving cached schemas"));
+                if cache.healthy_at.is_some() {
+                    cache.invalidate_all();
+                }
+                return Err(failure_at(
+                    "catalog_restart_during_table_fetch",
+                    "catalog restarted; reconcile before serving cached schemas",
+                ));
             }
             cache.tables.insert(identity.clone(), table.clone());
             // A fresh table RPC validates this table, not all older cached tables.
             return Ok(table);
         }
-        Err(failure("catalog changed repeatedly during table fetch"))
+        Err(failure_at(
+            "catalog_table_fetch_retries_exhausted",
+            "catalog changed repeatedly during table fetch",
+        ))
     }
 
     async fn invalidate(&self, identity: &TableIdentity) {
         let mut cache = self.cache.lock().await;
-        cache.tables.remove(identity);
-        cache.generation = cache.generation.wrapping_add(1);
+        cache.invalidate_table(identity);
     }
 }
 
 fn failure(message: impl Into<String>) -> CatalogError {
-    CatalogError::new(CatalogErrorCode::ReconciliationFailed, message)
+    failure_at("remote_catalog_client_failure", message)
 }
 
-fn rpc_error(status: tonic::Status) -> CatalogError {
+fn failure_at(failure_id: &'static str, message: impl Into<String>) -> CatalogError {
+    CatalogError::new(CatalogErrorCode::ReconciliationFailed, message)
+        .with_origin(CatalogErrorOrigin::RemoteClient)
+        .with_diagnostic_context("remote_catalog_client", None, Some(failure_id))
+}
+
+fn rpc_error(operation: &'static str, status: tonic::Status) -> CatalogError {
     CatalogError::new(
         if status.code() == tonic::Code::NotFound {
             CatalogErrorCode::TableNotFound
         } else {
             CatalogErrorCode::ReconciliationFailed
         },
-        format!("catalog RPC {}: {}", status.code(), status.message()),
+        "remote catalog RPC failed",
     )
+    .with_origin(CatalogErrorOrigin::RemoteGrpc)
+    .with_diagnostic_context(operation, Some(grpc_status_name(status.code())), None)
+}
+
+fn flight_rpc_error(operation: &'static str, status: tonic::Status) -> CatalogError {
+    CatalogError::new(CatalogErrorCode::ReconciliationFailed, "remote Flight SQL RPC failed")
+        .with_origin(CatalogErrorOrigin::RemoteGrpc)
+        .with_diagnostic_context(operation, Some(grpc_status_name(status.code())), None)
+}
+
+const fn grpc_status_name(code: tonic::Code) -> &'static str {
+    match code {
+        tonic::Code::Ok => "ok",
+        tonic::Code::Cancelled => "cancelled",
+        tonic::Code::Unknown => "unknown",
+        tonic::Code::InvalidArgument => "invalid_argument",
+        tonic::Code::DeadlineExceeded => "deadline_exceeded",
+        tonic::Code::NotFound => "not_found",
+        tonic::Code::AlreadyExists => "already_exists",
+        tonic::Code::PermissionDenied => "permission_denied",
+        tonic::Code::ResourceExhausted => "resource_exhausted",
+        tonic::Code::FailedPrecondition => "failed_precondition",
+        tonic::Code::Aborted => "aborted",
+        tonic::Code::OutOfRange => "out_of_range",
+        tonic::Code::Unimplemented => "unimplemented",
+        tonic::Code::Internal => "internal",
+        tonic::Code::Unavailable => "unavailable",
+        tonic::Code::DataLoss => "data_loss",
+        tonic::Code::Unauthenticated => "unauthenticated",
+    }
 }
 
 fn read_only() -> CatalogError {
@@ -425,5 +596,118 @@ impl CatalogStore for RemoteCatalogClient {
     }
     async fn incomplete_sagas(&self) -> CatalogResult<Vec<SagaRecord>> {
         Err(read_only())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        Cache, failure, failure_at, flight_rpc_error, grpc_status_name, identity_from_request, rpc, rpc_error,
+    };
+    use arrowcol_catalog::{CatalogErrorCode, CatalogErrorOrigin, CatalogResult};
+    use arrowcol_protocol::TableIdentity;
+    use tonic::Status;
+
+    fn test_identity(table: &str) -> CatalogResult<TableIdentity> {
+        identity_from_request(&rpc::TableRequest {
+            catalog: "catalog".to_owned(),
+            database: "database".to_owned(),
+            table: table.to_owned(),
+        })
+    }
+
+    #[test]
+    fn unrelated_table_invalidations_do_not_stale_a_fetch() -> CatalogResult<()> {
+        let requested = test_identity("requested")?;
+        let unrelated = test_identity("unrelated")?;
+        let mut cache = Cache::default();
+        let token = cache.table_fetch_token(&requested);
+        let initial_generation = cache.generation;
+
+        for _ in 0..3 {
+            cache.invalidate_table(&unrelated);
+            assert!(cache.table_fetch_token_is_current(&requested, token));
+        }
+
+        assert_ne!(cache.generation, initial_generation);
+        Ok(())
+    }
+
+    #[test]
+    fn same_table_invalidation_stales_a_fetch() -> CatalogResult<()> {
+        let requested = test_identity("requested")?;
+        let mut cache = Cache::default();
+        let token = cache.table_fetch_token(&requested);
+
+        cache.invalidate_table(&requested);
+
+        assert!(!cache.table_fetch_token_is_current(&requested, token));
+        Ok(())
+    }
+
+    #[test]
+    fn full_cache_reset_and_snapshot_replacement_stale_fetches() -> CatalogResult<()> {
+        let requested = test_identity("requested")?;
+        let mut cache = Cache::default();
+        let reset_token = cache.table_fetch_token(&requested);
+        cache.invalidate_all();
+        assert!(!cache.table_fetch_token_is_current(&requested, reset_token));
+
+        let snapshot_token = cache.table_fetch_token(&requested);
+        cache.replace_snapshot(
+            std::collections::BTreeMap::new(),
+            rpc::EventPosition {
+                epoch: String::new(),
+                event_id: 0,
+            },
+        );
+        assert!(!cache.table_fetch_token_is_current(&requested, snapshot_token));
+        Ok(())
+    }
+
+    #[test]
+    fn remote_catalog_errors_preserve_their_origin_and_code() {
+        let client_error = failure("local client failure");
+        assert_eq!(client_error.code(), CatalogErrorCode::ReconciliationFailed);
+        assert_eq!(client_error.origin(), CatalogErrorOrigin::RemoteClient);
+        assert_eq!(client_error.failure_id(), Some("remote_catalog_client_failure"));
+
+        let epoch_error = failure_at("catalog_ces_epoch_or_gap_detected", "dynamic detail omitted");
+        let exhausted_error = failure_at("catalog_table_fetch_retries_exhausted", "dynamic detail omitted");
+        assert_ne!(epoch_error.failure_id(), exhausted_error.failure_id());
+        assert_eq!(epoch_error.failure_id(), Some("catalog_ces_epoch_or_gap_detected"));
+        assert_eq!(
+            exhausted_error.failure_id(),
+            Some("catalog_table_fetch_retries_exhausted")
+        );
+
+        let grpc_error = rpc_error("get_table", Status::internal("remote service failure"));
+        assert_eq!(grpc_error.code(), CatalogErrorCode::ReconciliationFailed);
+        assert_eq!(grpc_error.origin(), CatalogErrorOrigin::RemoteGrpc);
+        assert_eq!(grpc_error.operation(), Some("get_table"));
+        assert_eq!(grpc_error.grpc_status(), Some("internal"));
+
+        let missing_table = rpc_error("get_table", Status::not_found("missing table"));
+        assert_eq!(missing_table.code(), CatalogErrorCode::TableNotFound);
+        assert_eq!(missing_table.origin(), CatalogErrorOrigin::RemoteGrpc);
+        assert_eq!(missing_table.grpc_status(), Some("not_found"));
+
+        let put_error = flight_rpc_error("flight_do_put", Status::not_found("remote service failure"));
+        assert_eq!(put_error.code(), CatalogErrorCode::ReconciliationFailed);
+        assert_eq!(put_error.origin(), CatalogErrorOrigin::RemoteGrpc);
+        assert_eq!(put_error.operation(), Some("flight_do_put"));
+        assert_eq!(put_error.grpc_status(), Some("not_found"));
+        let completion_error = flight_rpc_error(
+            "flight_do_put_completion",
+            Status::unavailable("remote service failure"),
+        );
+        assert_eq!(completion_error.code(), CatalogErrorCode::ReconciliationFailed);
+        assert_eq!(completion_error.origin(), CatalogErrorOrigin::RemoteGrpc);
+        assert_eq!(completion_error.operation(), Some("flight_do_put_completion"));
+        assert_eq!(completion_error.grpc_status(), Some("unavailable"));
+        assert_eq!(
+            grpc_status_name(Status::deadline_exceeded("").code()),
+            "deadline_exceeded"
+        );
     }
 }

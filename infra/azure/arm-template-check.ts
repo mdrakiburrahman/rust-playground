@@ -5,12 +5,14 @@ import { Config, SCHEMA_EVOLUTION_GROUP } from './bootstrap.js';
 interface ArmResource {
   type: string;
   name: string;
+  scope?: string;
   dependsOn?: unknown[];
   condition?: string;
   properties?: Record<string, unknown>;
 }
 interface ArmTemplate {
   resources?: ArmResource[];
+  variables?: Record<string, unknown>;
   outputs?: Record<string, { value?: unknown }>;
 }
 
@@ -73,4 +75,24 @@ const evaluateStorageAccountId = (config: Config): string | null => config.readL
 assert.equal(evaluateStorageAccountId(isolated), null, 'isolated mode must not evaluate an empty Storage name');
 assert.equal(evaluateStorageAccountId(stamped),
   `${stamped.base}/providers/Microsoft.Storage/storageAccounts/${stamped.readLogAccount}`);
-console.log('Compiled Azure template Storage module evaluation passed.');
+const aksModule = resources.find(resource => resource.type === 'Microsoft.Resources/deployments' &&
+  String(resource.name).includes('arrowcol-aks-'));
+assert.ok(aksModule, 'compiled sandbox must contain the AKS module');
+const aksTemplate = aksModule.properties?.template as ArmTemplate;
+const userAssignedIdentities = resources.filter(resource =>
+  resource.type === 'Microsoft.ManagedIdentity/userAssignedIdentities');
+assert.equal(userAssignedIdentities.length, 1,
+  'compiled sandbox must contain exactly one user-assigned identity');
+assert.equal(userAssignedIdentities[0]?.name, "[parameters('identityName')]",
+  'the single UAMI must use the configured identity name');
+const ficContributorRoleId = "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '7e559ce2-48d7-4b27-9128-fa1b247f1308')]";
+const runFederationRole = (aksTemplate.resources ?? []).find(resource =>
+  resource.type === 'Microsoft.Authorization/roleAssignments' &&
+  (String(resource.name).includes('run-federation-contributor') ||
+    resource.properties?.roleDefinitionId === ficContributorRoleId ||
+    Object.entries(aksTemplate.variables ?? {}).some(([name, value]) =>
+      value === ficContributorRoleId && resource.properties?.roleDefinitionId === `[variables('${name}')]`)));
+assert.equal(runFederationRole, undefined, 'runtime UAMI must not manage federated credentials on itself');
+assert.equal(stamped.identity, 'arrow-collector',
+  'stamped configuration must keep the single arrow-collector UAMI');
+console.log('Compiled Azure template Storage module and single-identity, no-self-FIC-role evaluation passed.');

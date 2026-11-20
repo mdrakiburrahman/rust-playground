@@ -3,23 +3,31 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use arrow::{
     array::{
-        ArrayRef, BooleanArray, Float64Array, Int16Array, Int32Array, Int64Array, RecordBatch, StringArray,
+        Array, ArrayRef, BooleanArray, Float64Array, Int16Array, Int32Array, Int64Array, RecordBatch, StringArray,
         TimestampMicrosecondArray, UInt8Array,
     },
     datatypes::{DataType, TimeUnit},
 };
 use arrow_flight::{FlightData, encode::FlightDataEncoderBuilder, error::FlightError};
 use futures::{TryStreamExt, stream};
+use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::sdk::GeneratedTable;
 
-const MAX_FLIGHT_DATA_BYTES: usize = 31 * 1024 * 1024;
 /// Interleaved tenants deliberately provide an unsorted input for layout tests.
 pub const CUSTOMER_COUNT: usize = 16;
+
+pub(crate) fn scheduled_batch_seed(seed: u64, table_batch_ordinal: u64) -> Result<u64> {
+    let variants = u64::try_from(delta_inspect::MAX_CHUNK_DISTINCT_ROWS / CUSTOMER_COUNT)
+        .context("logical batch seed variant count exceeds evidence bounds")?;
+    ensure!(variants > 0, "row validation limit permits no logical batch variants");
+    seed.checked_add(table_batch_ordinal % variants)
+        .context("logical batch seed overflow")
+}
 
 /// One immutable logical batch reused by paired pool sends and retries.
 #[derive(Clone)]
@@ -31,6 +39,7 @@ pub struct LogicalBatch {
     pub arrow_bytes: u64,
     pub payload_sha256: String,
     pub row_sha256: String,
+    pub row_hashes: Vec<(String, u64)>,
 }
 
 /// Global deterministic table scheduler shared by all lanes.
@@ -92,6 +101,20 @@ pub struct ScheduledTable {
 ///
 /// Rejects unsupported or nullable generated schema fields and Arrow/IPC errors.
 pub async fn build_logical_batch(table: Arc<GeneratedTable>, rows: usize, seed: u64) -> Result<LogicalBatch> {
+    build_logical_batch_with_tuning(table, rows, seed, &crate::tuning::ClientTuning::default()).await
+}
+
+/// Builds the same proof-compatible seed cycle with explicit IPC and string-size settings.
+///
+/// # Errors
+///
+/// Propagates schema, numeric, hashing, and encoding errors.
+pub async fn build_logical_batch_with_tuning(
+    table: Arc<GeneratedTable>,
+    rows: usize,
+    seed: u64,
+    tuning: &crate::tuning::ClientTuning,
+) -> Result<LogicalBatch> {
     if rows == 0 {
         bail!("batch row count must be positive");
     }
@@ -116,12 +139,14 @@ pub async fn build_logical_batch(table: Arc<GeneratedTable>, rows: usize, seed: 
             seed,
             offset,
             &mut row_hasher,
+            tuning,
         )?;
         columns.push(column);
     }
     let record_batch = RecordBatch::try_new(Arc::clone(&table.schema), columns)?;
+    let row_hashes = row_hash_multiset(&record_batch)?;
     let arrow_bytes = u64::try_from(record_batch.get_array_memory_size()).context("Arrow byte count overflow")?;
-    let (encoded, payload_sha256) = encode_record_batch(&table, &record_batch).await?;
+    let (encoded, payload_sha256) = encode_record_batch_with_tuning(&table, &record_batch, tuning).await?;
     Ok(LogicalBatch {
         table,
         record_batch,
@@ -130,7 +155,114 @@ pub async fn build_logical_batch(table: Arc<GeneratedTable>, rows: usize, seed: 
         arrow_bytes,
         payload_sha256,
         row_sha256: format!("sha256:{}", hex::encode(row_hasher.finalize())),
+        row_hashes,
     })
+}
+
+fn row_hash_multiset(batch: &RecordBatch) -> Result<Vec<(String, u64)>> {
+    let mut counts = std::collections::BTreeMap::<String, u64>::new();
+    for row in 0..batch.num_rows() {
+        let mut values = Map::new();
+        for (field, array) in batch.schema().fields().iter().zip(batch.columns()) {
+            let value = if array.is_null(row) {
+                Value::Null
+            } else {
+                match field.data_type() {
+                    DataType::Boolean => json!(
+                        array
+                            .as_any()
+                            .downcast_ref::<BooleanArray>()
+                            .context("boolean row array")?
+                            .value(row)
+                    ),
+                    DataType::UInt8 => json!(
+                        array
+                            .as_any()
+                            .downcast_ref::<UInt8Array>()
+                            .context("uint8 row array")?
+                            .value(row)
+                    ),
+                    DataType::Int16 => json!(
+                        array
+                            .as_any()
+                            .downcast_ref::<Int16Array>()
+                            .context("int16 row array")?
+                            .value(row)
+                    ),
+                    DataType::Int32 => json!(
+                        array
+                            .as_any()
+                            .downcast_ref::<Int32Array>()
+                            .context("int32 row array")?
+                            .value(row)
+                    ),
+                    DataType::Int64 => persisted_long_value(
+                        array
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .context("int64 row array")?
+                            .value(row),
+                    ),
+                    DataType::Float64 => json!(
+                        array
+                            .as_any()
+                            .downcast_ref::<Float64Array>()
+                            .context("float64 row array")?
+                            .value(row)
+                    ),
+                    DataType::Utf8 => json!(
+                        array
+                            .as_any()
+                            .downcast_ref::<StringArray>()
+                            .context("UTF-8 row array")?
+                            .value(row)
+                    ),
+                    DataType::Timestamp(TimeUnit::Microsecond, _) => json!(
+                        parquet::record::Field::TimestampMicros(
+                            array
+                                .as_any()
+                                .downcast_ref::<TimestampMicrosecondArray>()
+                                .context("timestamp row array")?
+                                .value(row)
+                        )
+                        .to_string()
+                    ),
+                    other => bail!("unsupported synthetic generated type {other} for row hash"),
+                }
+            };
+            if let DataType::Timestamp(TimeUnit::Microsecond, _) = field.data_type() {
+                let nanoseconds = if array.is_null(row) {
+                    Value::Null
+                } else {
+                    let timestamp = array
+                        .as_any()
+                        .downcast_ref::<TimestampMicrosecondArray>()
+                        .context("timestamp row array")?
+                        .value(row);
+                    persisted_long_value(
+                        timestamp
+                            .checked_mul(1_000)
+                            .context("timestamp nanosecond companion overflow")?,
+                    )
+                };
+                values.insert(format!("{}__unix_nanos", field.name()), nanoseconds);
+            }
+            values.insert(field.name().clone(), value);
+        }
+        let encoded = serde_json::to_string(&Value::Object(values))?;
+        let hash = format!("sha256:{}", hex::encode(Sha256::digest(encoded.as_bytes())));
+        let count = counts.entry(hash).or_default();
+        *count = count.checked_add(1).context("row hash multiplicity overflow")?;
+    }
+    Ok(counts.into_iter().collect())
+}
+
+fn persisted_long_value(value: i64) -> Value {
+    if value.unsigned_abs() > 9_007_199_254_740_991 {
+        json!(value.to_string())
+    } else {
+        json!(value)
+    }
 }
 
 /// Encodes a batch with the generated SDK manifest's descriptor path.
@@ -142,16 +274,35 @@ pub async fn encode_record_batch(
     table: &GeneratedTable,
     record_batch: &RecordBatch,
 ) -> Result<(Vec<FlightData>, String)> {
+    encode_record_batch_with_tuning(table, record_batch, &crate::tuning::ClientTuning::default()).await
+}
+
+async fn encode_record_batch_with_tuning(
+    table: &GeneratedTable,
+    record_batch: &RecordBatch,
+    tuning: &crate::tuning::ClientTuning,
+) -> Result<(Vec<FlightData>, String)> {
+    use crate::tuning::IpcCompression;
+    let compression = match tuning.ipc_compression {
+        IpcCompression::None => None,
+        IpcCompression::Lz4Frame => Some(arrow_ipc::CompressionType::LZ4_FRAME),
+        IpcCompression::Zstd => Some(arrow_ipc::CompressionType::ZSTD),
+    };
     let descriptor = arrow_flight::FlightDescriptor::new_path(table.descriptor_path.clone());
     let encoded = FlightDataEncoderBuilder::new()
         .with_schema(record_batch.schema())
         .with_flight_descriptor(Some(descriptor))
-        .with_max_flight_data_size(MAX_FLIGHT_DATA_BYTES)
+        .with_max_flight_data_size(tuning.max_flight_data_bytes)
+        .with_options(arrow_ipc::writer::IpcWriteOptions::default().try_with_compression(compression)?)
         .build(stream::iter(vec![Ok::<_, FlightError>(record_batch.clone())]))
         .try_collect::<Vec<_>>()
         .await?;
     let mut payload_hasher = Sha256::new();
     for message in &encoded {
+        ensure!(
+            prost::Message::encoded_len(message) <= tuning.max_message_bytes,
+            "encoded FlightData exceeds max-message-bytes"
+        );
         hash_bytes(&mut payload_hasher, &message.data_header);
         hash_bytes(&mut payload_hasher, &message.data_body);
         hash_bytes(&mut payload_hasher, &message.app_metadata);
@@ -168,6 +319,7 @@ fn deterministic_column(
     seed: i64,
     offset: i64,
     row_hasher: &mut Sha256,
+    tuning: &crate::tuning::ClientTuning,
 ) -> Result<ArrayRef> {
     row_hasher.update(name.as_bytes());
     row_hasher.update(data_type.to_string().as_bytes());
@@ -194,6 +346,17 @@ fn deterministic_column(
         DataType::Utf8 => {
             let value = if is_guid(table, name) {
                 deterministic_guid(table, name, seed)
+            } else if tuning.string_width > 0 {
+                let digest = Sha256::digest(format!("{table}:{name}:{seed}").as_bytes());
+                (0..tuning.string_width)
+                    .map(|index| {
+                        if (index as f64 / tuning.string_width as f64) < tuning.entropy {
+                            (b'a' + digest[index % digest.len()] % 26) as char
+                        } else {
+                            'a'
+                        }
+                    })
+                    .collect()
             } else {
                 format!("{table}:{name}:fallback:{seed}")
             };
@@ -288,7 +451,7 @@ fn hash_bytes(hasher: &mut Sha256, value: &[u8]) {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{collections::BTreeSet, sync::Arc};
 
     use anyhow::Result;
     use arrow::array::Array;
@@ -332,6 +495,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn row_hashes_include_delta_timestamp_nanosecond_companions() -> Result<()> {
+        let table = Arc::new(GeneratedTable {
+            identity: TableIdentity::new(
+                CatalogName::new("telemetry")?,
+                SchemaName::new("sqlserver")?,
+                TableName::new("sqlserver_active_sessions")?,
+            ),
+            schema_version: 1,
+            fingerprint: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            descriptor_path: vec![
+                "telemetry".to_owned(),
+                "sqlserver".to_owned(),
+                "sqlserver_active_sessions".to_owned(),
+                "v1".to_owned(),
+            ],
+            schema: Arc::new(Schema::new(vec![Field::new(
+                "sample_time_utc",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                false,
+            )])),
+            generated_root: "target/generated".into(),
+        });
+        let batch = build_logical_batch(table, 1, 7).await?;
+        let expected = serde_json::json!({
+            "sample_time_utc": "1970-01-01 00:00:08.000000 +00:00",
+            "sample_time_utc__unix_nanos": 8_000_000_000_i64,
+        });
+        let hash = format!(
+            "sha256:{}",
+            hex::encode(Sha256::digest(serde_json::to_string(&expected)?.as_bytes()))
+        );
+        assert_eq!(batch.row_hashes, vec![(hash, 1)]);
+        let directory = tempfile::tempdir()?;
+        let mut writer =
+            arrow_deltalake::delta::DeltaTableWriter::open(directory.path().join(batch.table.identity.to_string()))?;
+        writer.write(&batch.record_batch).await?;
+        writer.close().await?;
+        let snapshot = delta_inspect::summarize(directory.path()).await?;
+        assert_eq!(
+            snapshot.tables[&batch.table.identity.to_string()].row_hashes,
+            batch.row_hashes.iter().cloned().collect(),
+            "durable acknowledgement hashes must match independently decoded Delta rows"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn identical_seed_and_schema_produce_identical_batches() -> Result<()> {
         let table = generated_table()?;
         let first = build_logical_batch(Arc::clone(&table), 4, 7).await?;
@@ -339,6 +549,144 @@ mod tests {
         assert_eq!(first.record_batch, second.record_batch);
         assert_eq!(first.payload_sha256, second.payload_sha256);
         assert_eq!(first.row_sha256, second.row_sha256);
+        assert_eq!(first.row_hashes, second.row_hashes);
+        let different_seed = build_logical_batch(generated_table()?, 4, 8).await?;
+        assert_ne!(first.row_hashes, different_seed.row_hashes);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn precomputed_codecs_preserve_proofs_and_complete_seed_cycle() -> Result<()> {
+        use crate::{
+            corpus::PreparedCorpus,
+            tuning::{ClientTuning, DataMode, IpcCompression},
+        };
+        use arrow_flight::decode::FlightRecordBatchStream;
+
+        let mut table = generated_table()?;
+        let mut fields = table.schema.fields().to_vec();
+        fields.push(Arc::new(Field::new("workload_label", DataType::Utf8, false)));
+        Arc::get_mut(&mut table).context("unique test table")?.schema = Arc::new(Schema::new(fields));
+        for codec in [IpcCompression::None, IpcCompression::Lz4Frame, IpcCompression::Zstd] {
+            for mode in [DataMode::Shared, DataMode::Independent] {
+                let tuning = ClientTuning {
+                    precompute_batches_per_table: 16,
+                    data_mode: mode,
+                    ipc_compression: codec,
+                    string_width: 257,
+                    entropy: 0.5,
+                    max_flight_data_bytes: 1024,
+                    ..ClientTuning::default()
+                };
+                let cache = PreparedCorpus::prepare(&[Arc::clone(&table)], CUSTOMER_COUNT, 7, 2, &tuning).await?;
+                let mut hashes = BTreeSet::new();
+                for ordinal in 0..32 {
+                    let cached = cache
+                        .get(&table.identity.to_string(), 0, ordinal)
+                        .context("cached variant")?;
+                    let expected = build_logical_batch_with_tuning(
+                        Arc::clone(&table),
+                        CUSTOMER_COUNT,
+                        scheduled_batch_seed(7, ordinal)?,
+                        &tuning,
+                    )
+                    .await?;
+                    assert_eq!(cached.payload_sha256, expected.payload_sha256);
+                    assert_eq!(cached.row_hashes, expected.row_hashes);
+                    assert_eq!(cached.row_sha256, expected.row_sha256);
+                    let other_lane = cache
+                        .get(&table.identity.to_string(), 1, ordinal)
+                        .context("second lane")?;
+                    assert_eq!(other_lane.payload_sha256, expected.payload_sha256);
+                    assert_eq!(Arc::ptr_eq(&cached, &other_lane), matches!(mode, DataMode::Shared));
+                    hashes.extend(cached.row_hashes.iter().map(|(hash, _)| hash.clone()));
+                    if ordinal == 0 {
+                        let decoded = FlightRecordBatchStream::new_from_flight_data(stream::iter(
+                            cached.encoded.as_ref().clone().into_iter().map(Ok),
+                        ))
+                        .try_collect::<Vec<_>>()
+                        .await?;
+                        assert!(
+                            decoded.len() > 1,
+                            "small split target must change Flight batch encoding"
+                        );
+                        let concatenated = arrow::compute::concat_batches(&table.schema, &decoded)?;
+                        assert_eq!(concatenated, expected.record_batch);
+                        let label = concatenated
+                            .column(4)
+                            .as_any()
+                            .downcast_ref::<StringArray>()
+                            .context("label array")?;
+                        assert_eq!(label.value(0).len(), 257);
+                        let directory = tempfile::tempdir()?;
+                        let mut writer = arrow_deltalake::delta::DeltaTableWriter::open(
+                            directory.path().join(table.identity.to_string()),
+                        )?;
+                        writer.write(&concatenated).await?;
+                        writer.close().await?;
+                        let snapshot = delta_inspect::summarize(directory.path()).await?;
+                        assert_eq!(
+                            snapshot.tables[&table.identity.to_string()].row_hashes,
+                            expected.row_hashes.into_iter().collect()
+                        );
+                    }
+                }
+                assert_eq!(hashes.len(), delta_inspect::MAX_CHUNK_DISTINCT_ROWS);
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn partial_precompute_never_changes_variant_selection_and_checks_memory_first() -> Result<()> {
+        use crate::{corpus::PreparedCorpus, tuning::ClientTuning};
+        let table = generated_table()?;
+        let mut tuning = ClientTuning {
+            precompute_batches_per_table: 1,
+            ..ClientTuning::default()
+        };
+        let cache = PreparedCorpus::prepare(&[Arc::clone(&table)], CUSTOMER_COUNT, 7, 1, &tuning).await?;
+        assert!(cache.get(&table.identity.to_string(), 0, 0).is_some());
+        assert!(cache.get(&table.identity.to_string(), 0, 1).is_none());
+        assert!(cache.get(&table.identity.to_string(), 0, 16).is_some());
+        tuning.max_memory_bytes = 1;
+        let error = PreparedCorpus::prepare(&[table], CUSTOMER_COUNT, 7, 1, &tuning)
+            .await
+            .err()
+            .context("memory rejection")?;
+        assert!(error.to_string().contains("exceeding max-memory-bytes"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scheduled_batch_seeds_fit_the_reader_distinct_row_limit() -> Result<()> {
+        let variants = delta_inspect::MAX_CHUNK_DISTINCT_ROWS / CUSTOMER_COUNT;
+        let mut hashes = BTreeSet::new();
+        let mut first = None;
+        let mut previous = None;
+        for variant in 0..variants {
+            let seed = scheduled_batch_seed(7, u64::try_from(variant)?)?;
+            if let Some(previous) = previous {
+                assert_ne!(seed, previous);
+            }
+            let batch = build_logical_batch(generated_table()?, CUSTOMER_COUNT, seed).await?;
+            if let Some(first) = &first {
+                assert_ne!(batch.row_hashes, *first);
+            } else {
+                first = Some(batch.row_hashes.clone());
+            }
+            hashes.extend(batch.row_hashes.iter().map(|(hash, _)| hash.clone()));
+            previous = Some(seed);
+        }
+        assert_eq!(hashes.len(), delta_inspect::MAX_CHUNK_DISTINCT_ROWS);
+
+        let repeated = build_logical_batch(
+            generated_table()?,
+            CUSTOMER_COUNT,
+            scheduled_batch_seed(7, u64::try_from(variants)?)?,
+        )
+        .await?;
+        assert_eq!(Some(repeated.row_hashes), first);
         Ok(())
     }
 
@@ -358,6 +706,50 @@ mod tests {
         let shorter = build_logical_batch(generated_table()?, CUSTOMER_COUNT, 7).await?;
         assert_ne!(batch.payload_sha256, shorter.payload_sha256);
         assert_ne!(batch.row_sha256, shorter.row_sha256);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn row_hashes_preserve_wide_integer_boundaries_through_delta() -> Result<()> {
+        let batch = RecordBatch::try_from_iter(vec![
+            (
+                "value",
+                Arc::new(Int64Array::from(vec![
+                    i64::MIN,
+                    -9_007_199_254_740_992,
+                    -9_007_199_254_740_991,
+                    9_007_199_254_740_991,
+                    9_007_199_254_740_992,
+                    i64::MAX,
+                ])) as ArrayRef,
+            ),
+            (
+                "sample_time_utc",
+                Arc::new(
+                    TimestampMicrosecondArray::from(vec![
+                        -9_007_199_254_741,
+                        -9_007_199_254_740,
+                        0,
+                        9_007_199_254_740,
+                        9_007_199_254_741,
+                        20_260_923_000_000,
+                    ])
+                    .with_timezone("UTC"),
+                ) as ArrayRef,
+            ),
+        ])?;
+        let expected = row_hash_multiset(&batch)?;
+        let directory = tempfile::tempdir()?;
+        let table = "telemetry.sqlserver.wide_integer_boundaries";
+        let mut writer = arrow_deltalake::delta::DeltaTableWriter::open(directory.path().join(table))?;
+        writer.write(&batch).await?;
+        writer.close().await?;
+        let snapshot = delta_inspect::summarize(directory.path()).await?;
+        assert_eq!(
+            snapshot.tables[table].row_hashes,
+            expected.into_iter().collect(),
+            "safe-integer boundaries must match the independent reader without losing precision"
+        );
         Ok(())
     }
 
@@ -390,7 +782,7 @@ mod tests {
                 schema,
                 generated_root: "target/generated".into(),
             });
-            let batch = build_logical_batch(table, 8_192, 7).await?;
+            let batch = build_logical_batch(table, 8_192, 20_260_923).await?;
 
             for offset in (CUSTOMER_COUNT..batch.rows).step_by(CUSTOMER_COUNT) {
                 assert_eq!(
@@ -430,6 +822,18 @@ mod tests {
             assert!(
                 decoded_bytes <= LOADTEST_MAX_MESSAGE_BYTES as u64,
                 "{} decoded to {decoded_bytes} logical bytes",
+                statement.identity
+            );
+            let directory = tempfile::tempdir()?;
+            let mut writer =
+                arrow_deltalake::delta::DeltaTableWriter::open(directory.path().join(statement.identity.to_string()))?;
+            writer.write(&decoded[0]).await?;
+            writer.close().await?;
+            let snapshot = delta_inspect::summarize(directory.path()).await?;
+            assert_eq!(
+                snapshot.tables[&statement.identity.to_string()].row_hashes,
+                batch.row_hashes.iter().cloned().collect(),
+                "{} durable row hashes must match the independent Delta snapshot",
                 statement.identity
             );
         }

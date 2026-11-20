@@ -32,7 +32,13 @@ async fn signal_shutdown(signal: &str) -> Result<()> {
     drop(listener);
     let mut process = Process(
         Command::new(env!("CARGO_BIN_EXE_arrowcol-catalog-rust"))
-            .args(["--listen", &address.to_string(), "--warehouse-root"])
+            .args([
+                "--listen",
+                &address.to_string(),
+                "--ddl-auth-mode",
+                "dev_only_allow_unsigned",
+                "--warehouse-root",
+            ])
             .arg(root.path().join("warehouse"))
             .arg("--state-dir")
             .arg(root.path().join("state"))
@@ -48,6 +54,7 @@ async fn signal_shutdown(signal: &str) -> Result<()> {
             if let Some(status) = process.0.try_wait()? {
                 bail!("catalog exited before readiness: {status}");
             }
+
             if let Ok(mut client) = SchemaCatalogClient::connect(endpoint.clone()).await
                 && client.get_current_event_id(rpc::Empty {}).await.is_ok()
             {
@@ -79,6 +86,20 @@ async fn signal_shutdown(signal: &str) -> Result<()> {
     .context("catalog failed to drain an active CES watch")??;
     assert!(status.success(), "catalog did not cleanly drain: {status}");
     assert!(watch.message().await?.is_none(), "watch must end at shutdown");
+    Ok(())
+}
+
+#[test]
+fn startup_requires_a_mounted_identity_key_by_default() -> Result<()> {
+    let output = Command::new(env!("CARGO_BIN_EXE_arrowcol-catalog-rust"))
+        .env_remove("ARROWCOL_CATALOG_DDL_AUTH_MODE")
+        .env_remove("ARROWCOL_CATALOG_DDL_IDENTITY_SECRET_FILE")
+        .output()?;
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("ARROWCOL_CATALOG_DDL_IDENTITY_SECRET_FILE or --ddl-identity-secret-file is required")
+    );
     Ok(())
 }
 

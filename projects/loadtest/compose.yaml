@@ -13,7 +13,7 @@ services:
     secrets:
       - sqlserver_sa_password
     ports:
-      - "127.0.0.1:${SQLSERVER_PORT:-14333}:1433"
+      - "${LOADTEST_BIND_HOST:-127.0.0.1}:${SQLSERVER_PORT:-14333}:1433"
     volumes:
       - sqlserver-data:/var/opt/mssql
     healthcheck:
@@ -76,10 +76,15 @@ services:
     pull_policy: never
     init: true
     user: "${LOADTEST_UID:?Run through Nx}:${LOADTEST_GID:?Run through Nx}"
-    command: ["--listen", "0.0.0.0:8817", "--warehouse-root", "${LOADTEST_DATAFLOW_DELTA_ROOT:-/delta/dataflow}", "--state-dir", "/state"]
+    command: ["--listen", "0.0.0.0:8817", "--warehouse-root", "${LOADTEST_DATAFLOW_DELTA_ROOT:-/delta/dataflow}",
+      "--state-dir", "/state", "--ddl-identity-secret-file", "/run/secrets/internal-hmac"]
+    secrets:
+      - source: internal_hmac
+        target: internal-hmac
     ports:
-      - "127.0.0.1:${LOADTEST_CATALOG_PORT:-18817}:8817"
+      - "${LOADTEST_BIND_HOST:-127.0.0.1}:${LOADTEST_CATALOG_PORT:-18817}:8817"
     environment:
+      ARROWCOL_CATALOG_DDL_IDENTITY_SECRET_FILE: /run/secrets/internal-hmac
       OTEL_EXPORTER_OTLP_ENDPOINT: ${LOADTEST_TRACES_ENDPOINT:-http://lgtm:4318}
       OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
     volumes:
@@ -113,6 +118,7 @@ services:
       ARROWCOL_LAYOUT_ROW_GROUP_ROWS: ${ARROWCOL_LAYOUT_ROW_GROUP_ROWS:-16384}
       ARROWCOL_LAYOUT_PAGE_ROWS: ${ARROWCOL_LAYOUT_PAGE_ROWS:-2048}
       ARROWCOL_MAX_MESSAGE_BYTES: "33554432"
+      ARROWCOL_CATALOG_DDL_IDENTITY_SECRET_FILE: /run/secrets/internal-hmac
       OTEL_EXPORTER_OTLP_ENDPOINT: ${LOADTEST_TRACES_ENDPOINT:-http://lgtm:4318}
       OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
       OTEL_METRIC_EXPORT_INTERVAL: "2000"
@@ -125,6 +131,8 @@ services:
     secrets:
       - source: arrowcol_app_password
         target: arrowcol-app-password
+      - source: internal_hmac
+        target: internal-hmac
     depends_on:
       arrowcol-catalog:
         condition: service_healthy
@@ -135,9 +143,61 @@ services:
         ipv4_address: ${LOADTEST_DATAFLOW_1_IP:-10.89.0.31}
     stop_grace_period: 5m
 
+  oat-client:
+    profiles: ["oat"]
+    build:
+      context: ../..
+      dockerfile: projects/arrowcol-oat-rust/Dockerfile.client
+    image: arrowcol-oat-client:local
+    pull_policy: never
+    init: true
+    user: "${LOADTEST_UID:?Run through Nx}:${LOADTEST_GID:?Run through Nx}"
+    environment:
+      LOADTEST_INTERNAL_SECRET_FILE: /run/secrets/internal-hmac
+      ARROWCOL_CATALOG_DDL_IDENTITY_SECRET_FILE: /run/secrets/internal-hmac
+    secrets:
+      - source: edge_hmac
+        target: edge-hmac
+      - source: internal_hmac
+        target: internal-hmac
+    volumes:
+      - type: bind
+        source: ${OAT_CONTROL_HOST_PATH:-/dev/null}
+        target: /oat-control
+        bind:
+          create_host_path: false
+
+  oat-pin-init:
+    profiles: ["oat"]
+    image: arrowcol-oat-client:local
+    pull_policy: never
+    init: true
+    user: "${LOADTEST_UID:?Run through Nx}:${LOADTEST_GID:?Run through Nx}"
+    entrypoint: ["/usr/local/bin/arrowcol-oat-pin-init"]
+    command:
+      - "--config"
+      - "/run/arrowcol-oat/pin-init.json"
+      - "--migrator-password-file"
+      - "/run/secrets/arrowcol_migrator_password"
+    secrets:
+      - source: arrowcol_migrator_password
+        target: arrowcol_migrator_password
+    volumes:
+      - type: bind
+        source: ${OAT_PIN_INIT_CONFIG_HOST_PATH:-/dev/null}
+        target: /run/arrowcol-oat/pin-init.json
+        read_only: true
+        bind:
+          create_host_path: false
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+
   kusto:
     profiles: ["benchmark"]
     image: mcr.microsoft.com/azuredataexplorer/kustainer-linux@sha256:51e2250da2faf292de903f871a073eb37d3f2641cf63381b183879d21ebb1013
+    # /start-kusto.sh runs Kusto without exec; as PID 1 that bash ignores SIGTERM, so stops end in SIGKILL.
+    init: true
     # Serial validation retained a 3.855 GiB baseline and reached the 4 GiB ceiling.
     # Attempt-7 simultaneous benchmark peak 7.811 GiB + 2 GiB = 9.811 GiB.
     # Public ubuntu-24.04 CI has 16 GB RAM and no development workspace container.
@@ -145,7 +205,7 @@ services:
     environment:
       ACCEPT_EULA: "Y"
     ports:
-      - "127.0.0.1:${KUSTO_PORT:-8080}:8080"
+      - "${LOADTEST_BIND_HOST:-127.0.0.1}:${KUSTO_PORT:-8080}:8080"
     volumes:
       - kusto-data:/kustodata
       - type: bind
@@ -200,7 +260,7 @@ services:
       default:
         ipv4_address: ${LOADTEST_LGTM_IP:-10.89.0.40}
     ports:
-      - "127.0.0.1:${GRAFANA_PORT:-3000}:3000"
+      - "${LOADTEST_BIND_HOST:-127.0.0.1}:${GRAFANA_PORT:-3000}:3000"
     volumes:
       - ./observability/prometheus.yaml:/otel-lgtm/prometheus.yaml:ro
       - ./observability/dashboards.yaml:/otel-lgtm/grafana/conf/provisioning/dashboards/arrowcol.yaml:ro
@@ -264,7 +324,7 @@ services:
     user: "${LOADTEST_UID:?Run through Nx}:${LOADTEST_GID:?Run through Nx}"
     command: ["--config", "/state/config.yaml"]
     ports:
-      - "127.0.0.1:${LOADTEST_ROUTER_PORT:-15050}:50050"
+      - "${LOADTEST_BIND_HOST:-127.0.0.1}:${LOADTEST_ROUTER_PORT:-15050}:50050"
     environment:
       OTEL_EXPORTER_OTLP_ENDPOINT: ${LOADTEST_TRACES_ENDPOINT:-http://lgtm:4318}
       OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
@@ -318,9 +378,13 @@ services:
       - --listen
       - "0.0.0.0:9467"
     environment:
+      ARROWCOL_CATALOG_DDL_IDENTITY_SECRET_FILE: /run/secrets/internal-hmac
       OTEL_EXPORTER_OTLP_ENDPOINT: ${LOADTEST_TRACES_ENDPOINT:-http://lgtm:4318}
       OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
       OTEL_METRIC_EXPORT_INTERVAL: "2000"
+    secrets:
+      - source: internal_hmac
+        target: internal-hmac
     volumes:
       - type: bind
         source: ${ONELAKE_HOST_PATH:?Run through Nx}/dataflow

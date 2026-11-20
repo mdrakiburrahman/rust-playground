@@ -3,12 +3,25 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import * as path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
 import * as b from './bootstrap.js';
 import { FakeAzure, SUB, WORKSPACE_CUSTOMER } from './test_support.js';
 import { PublisherControl, READY, FENCED, CLEANING, UnknownTransition } from './publisher_control.js';
 
 let azure: FakeAzure, directory: string, recordPath: string, manifest: string, output: string, stampPath: string, generation: string;
 let elapsed = 0;
+const aksIssuer = 'https://canadacentral.oic.prod-aks.azure.com/tenant/cluster/';
+const nativeCredential = (c: b.Config) => ({
+  name: `azure-qap-${c.cluster}`, properties: { issuer: aksIssuer,
+    subject: `system:serviceaccount:${c.kubernetesNamespace}:${c.kubernetesServiceAccount}`,
+    audiences: ['api://AzureADTokenExchange'] },
+});
+const nativeCluster = (c: b.Config) => ({
+  tags: { ...b.TAGS, sandboxId: c.sandbox }, properties: {
+    oidcIssuerProfile: { enabled: true, issuerURL: aksIssuer },
+    securityProfile: { workloadIdentity: { enabled: true } },
+  },
+});
 const realRun = b.run_tree;
 const parentEnvironment = process.env;
 const receipt = (generation: string) => JSON.stringify({ ...b.RECEIPT_FIELDS, resetGeneration: generation }) + '\n';
@@ -145,6 +158,8 @@ test('isolated deploy parameters retain hash ownership and suppress only stamped
     assert.equal(params.azureMode.value, 'schema-evolution');
     assert.equal(params.resourceGroupName.value, b.SCHEMA_EVOLUTION_GROUP);
     assert.equal(params.sandboxId.value, '582e3df61d82');
+    assert.deepEqual(params.resourceGroupTags.value, { ...b.TAGS, sandboxId: c.sandbox });
+    assert.deepEqual(params.identityTags.value, { ...b.TAGS, sandboxId: c.sandbox });
     assert.equal(params.storageAccountName.value, 'arrowcol582e3df61d82');
     assert.equal(params.registryName.value, '');
     assert.deepEqual(params.aksConfig.value, {});
@@ -157,8 +172,70 @@ test('isolated deploy parameters retain hash ownership and suppress only stamped
   const sandbox = fs.readFileSync(path.join(b.ROOT, 'infra/azure/sandbox.bicep'), 'utf8');
   assert.match(main, /param azureMode string = 'stamped'/);
   assert.match(sandbox, /module aks '\.\/aks\.bicep' = if \(azureMode == 'stamped'\)/);
-  for (const name of ['runtimeExperimentWriter', 'runtimeControlWriter', 'runtimeExperimentAdmin', 'runtimeClusterReader', 'runtimeReadLogs'])
+  for (const name of ['runtimeDataWriter', 'runtimeExperimentWriter', 'runtimeControlWriter', 'runtimeExperimentAdmin', 'runtimeClusterReader', 'runtimeReadLogs'])
     assert.match(sandbox, new RegExp(`resource ${name} '[^']+' = if \\(azureMode == 'stamped'\\)`));
+});
+test('QAP CLI refuses omitted custody inputs before any helper or Azure operation', async () => {
+  const input = path.join(directory, '.env.qap-cli');
+  b.write_private(input, { AZURE_SUBSCRIPTION_ID: SUB });
+  prepareStamp();
+  const errors: string[] = [];
+  let externalCalls = 0;
+  mock.method(console, 'error', (message: string) => { errors.push(message); });
+  mock.method(b.Azure.prototype, 'request', async () => { externalCalls++; throw new Error('unexpected Azure request'); });
+  mock.method(b.runtime, 'run_tree', async () => { externalCalls++; throw new Error('unexpected external command'); });
+  const cases: { command: string; required: Record<string, string>; message: RegExp }[] = [
+    { command: 'bind-oat-qap', required: { '--run-id': SUB, '--manifest': manifest, '--record': recordPath,
+      '--workload-record': path.join(directory, 'fic.json') }, message: /QAP binding requires/ },
+    { command: 'verify-oat-qap', required: { '--record': recordPath }, message: /QAP verification requires/ },
+    { command: 'cleanup-oat-qap', required: { '--record': recordPath,
+      '--workload-stop-record': path.join(directory, 'stopped.json') }, message: /QAP cleanup requires/ },
+  ];
+  for (const item of cases) for (const missing of Object.keys(item.required)) {
+    const options = Object.entries(item.required).flatMap(([flag, value]) => flag === missing ? [] : [flag, value]);
+    assert.equal(await b.main([item.command, '--env-file', input, '--stamp-config', stampPath, ...options]), 1);
+    assert.match(errors.at(-1)!, item.message);
+    assert.equal(externalCalls, 0, `missing ${missing} must not reach a helper or external operation`);
+  }
+});
+test('real CLI entrypoint evaluates both helper imports and exits on local validation, not a TLA cycle', () => {
+  const input = path.join(directory, '.env.entrypoint'), guard = path.join(directory, 'deny-external-io.mjs');
+  b.write_private(input, { AZURE_SUBSCRIPTION_ID: SUB });
+  prepareStamp();
+  fs.writeFileSync(manifest, JSON.stringify({ schema_version: 1, run_id: SUB, database: 'experimentqap', tables: [] }), { mode: 0o600 });
+  fs.writeFileSync(guard, `
+import childProcess from 'node:child_process';
+import path from 'node:path';
+import { syncBuiltinESMExports } from 'node:module';
+const deny = () => { throw new Error('EXTERNAL_IO_FORBIDDEN'); };
+globalThis.fetch = async () => deny();
+const spawn = childProcess.spawn;
+childProcess.spawn = (command, ...args) => {
+  if (['az', 'kubectl', 'docker'].includes(path.basename(String(command)).replace(/\\.(exe|cmd)$/i, ''))) deny();
+  return spawn(command, ...args);
+};
+syncBuiltinESMExports();
+`, { mode: 0o600 });
+  const cases = [
+    { args: ['prepare-run-fic', '--run-id', 'not-a-uuid', '--namespace', 'invalid',
+      '--service-account', 'arrowcol-oat', '--record', recordPath],
+    expected: /Run FIC identifiers must be nonzero canonical lowercase UUIDs/ },
+    { args: ['bind-oat-qap', '--run-id', SUB, '--manifest', manifest, '--record', recordPath,
+      '--workload-record', path.join(directory, 'not-read.json')],
+    expected: /Manifest version, run or tables mismatch/ },
+  ];
+  for (const item of cases) {
+    const child = spawnSync(process.execPath, ['--import', 'tsx', '--import', pathToFileURL(guard).href,
+      path.join(b.ROOT, 'infra/azure/bootstrap.ts'), ...item.args, '--env-file', input, '--stamp-config', stampPath],
+    { cwd: b.ROOT, env: { ...process.env, NODE_OPTIONS: '' }, encoding: 'utf8',
+      timeout: 15_000, killSignal: 'SIGKILL', maxBuffer: 1_048_576 });
+    assert.equal(child.error, undefined, 'real entrypoint must terminate before the deadline');
+    assert.equal(child.signal, null);
+    assert.equal(child.status, 1, child.stderr);
+    assert.match(child.stderr, item.expected, 'must evaluate the requested helper and reach its local validation');
+    assert.doesNotMatch(child.stderr, /EXTERNAL_IO_FORBIDDEN|unsettled top-level await/i);
+    assert.equal(fs.existsSync(recordPath), false, 'invalid inputs must not create custody or submit work');
+  }
 });
 test('isolated initializer projection rejects ambient identity and carries explicit mode', () => {
   const c = new b.Config({ AZURE_SUBSCRIPTION_ID: SUB, AZURE_RESOURCE_GROUP: b.SCHEMA_EVOLUTION_GROUP }, 'schema-evolution');
@@ -241,6 +318,7 @@ for (const state of ['missing', 'empty', 'legacy', 'identity', 'denied'] as cons
     });
     let inventories = 0;
     mock.method(azure, 'arm', async (method: string, resourcePath: string, _body: unknown, missing: boolean, api: string) => {
+      if (resourcePath.includes('/providers/Microsoft.ContainerService/managedClusters/')) return null;
       assert.deepEqual([method, resourcePath, missing, api], ['GET', c.base, true, '2022-09-01']);
       if (state === 'denied') throw new b.HttpFailure(403, 'Resource group metadata denied');
       return state === 'missing' ? null : { tags: azure.tags };
@@ -252,10 +330,14 @@ for (const state of ['missing', 'empty', 'legacy', 'identity', 'denied'] as cons
         case 'aks get-versions': return {
           values: [{ version: aks.version.split('.').slice(0, 2).join('.'), patchVersions: { [aks.version]: {} } }],
         };
-        case 'vm list-skus': return [{
-          name: aks.systemPool.vmSize, family: 'testFamily', capabilities: [{ name: 'vCPUs', value: '1' }],
-        }];
-        case 'vm list-usage': return [{ name: { value: 'testFamily' }, currentValue: 0, limit: 100 }];
+        case 'vm list-skus': {
+          const vmSize = args[args.indexOf('--size') + 1];
+          return [{ name: vmSize, family: 'testFamily', capabilities: [{ name: 'vCPUs', value: '1' }] }];
+        }
+        case 'vm list-usage': return [
+          { name: { value: 'testFamily' }, currentValue: 0, limit: 100 },
+          { name: { value: 'cores' }, currentValue: 0, limit: 1000 },
+        ];
         case 'feature show': return { properties: { state: 'Registered' } };
         case 'network vnet': return [];
         case 'resource list':
@@ -271,6 +353,221 @@ for (const state of ['missing', 'empty', 'legacy', 'identity', 'denied'] as cons
     else await b.preflight(azure);
     assert.equal(inventories, state === 'missing' || state === 'denied' ? 0 : 1);
   });
+test('preflight reserves quota for the system-pool autoscale maximum', async () => {
+  const c = azure.c;
+  c.operator = SUB;
+  c.stampConfig.publisherFederatedCredentials.push({
+    name: 'publisher', issuer: 'https://token.actions.githubusercontent.com', subject: 'repo:example/repo:environment:publish',
+  });
+  mock.method(azure, 'arm', async (_method: string, resourcePath: string) =>
+    resourcePath.includes('/providers/Microsoft.ContainerService/managedClusters/') ? null : ({ tags: azure.tags }));
+  mock.method(azure, 'cli', async (...args: string[]) => {
+    switch (args.slice(0, 2).join(' ')) {
+      case 'account show': return { id: c.subscription };
+      case 'provider show': return { registrationState: 'Registered' };
+      case 'aks get-versions': return {
+        values: [{ version: c.stampConfig.aks.version.split('.').slice(0, 2).join('.'),
+          patchVersions: { [c.stampConfig.aks.version]: {} } }],
+      };
+      case 'vm list-skus': {
+        const vmSize = args[args.indexOf('--size') + 1];
+        return [{ name: vmSize, family: 'testFamily', capabilities: [{ name: 'vCPUs', value: '1' }] }];
+      }
+      case 'vm list-usage': return [
+        { name: { value: 'testFamily' }, currentValue: 0, limit: 4 },
+        { name: { value: 'cores' }, currentValue: 0, limit: 1000 },
+      ];
+      case 'feature show': return { properties: { state: 'Registered' } };
+      case 'network vnet': return [];
+      default: assert.fail('Unexpected Azure mutation or CLI command: ' + args.join(' '));
+    }
+  });
+  await assert.rejects(b.preflight(azure), /quota is insufficient/);
+});
+test('preflight rejects AKS pool maxima that exceed regional vCPU quota', async () => {
+  const c = azure.c;
+  c.operator = SUB;
+  c.stampConfig.publisherFederatedCredentials.push({
+    name: 'publisher', issuer: 'https://token.actions.githubusercontent.com', subject: 'repo:example/repo:environment:publish',
+  });
+  mock.method(azure, 'arm', async (_method: string, resourcePath: string) =>
+    resourcePath.includes('/providers/Microsoft.ContainerService/managedClusters/') ? null : ({ tags: azure.tags }));
+  mock.method(azure, 'cli', async (...args: string[]) => {
+    switch (args.slice(0, 2).join(' ')) {
+      case 'account show': return { id: c.subscription };
+      case 'provider show': return { registrationState: 'Registered' };
+      case 'aks get-versions': return {
+        values: [{ version: c.stampConfig.aks.version.split('.').slice(0, 2).join('.'),
+          patchVersions: { [c.stampConfig.aks.version]: {} } }],
+      };
+      case 'vm list-skus': {
+        const vmSize = args[args.indexOf('--size') + 1];
+        return [{ name: vmSize, family: 'testFamily', capabilities: [{ name: 'vCPUs', value: '1' }] }];
+      }
+      case 'vm list-usage': return [
+        { name: { value: 'testFamily' }, currentValue: 0, limit: 100 },
+        { name: { value: 'cores' }, currentValue: 0, limit: 4 },
+      ];
+      case 'feature show': return { properties: { state: 'Registered' } };
+      case 'network vnet': return [];
+      default: assert.fail('Unexpected Azure mutation or CLI command: ' + args.join(' '));
+    }
+  });
+  await assert.rejects(b.preflight(azure), /regional vCPU quota is insufficient/);
+});
+test('preflight reserves only additional quota for existing AKS pools', async () => {
+  const c = azure.c;
+  c.operator = SUB;
+  c.stampConfig.publisherFederatedCredentials.push({
+    name: 'publisher', issuer: 'https://token.actions.githubusercontent.com', subject: 'repo:example/repo:environment:publish',
+  });
+  const profiles = [c.stampConfig.aks.systemPool, ...c.stampConfig.aks.userPools].map(pool => ({
+    name: pool.name, vmSize: pool.vmSize, count: pool.initialCount,
+  }));
+  mock.method(azure, 'arm', async (_method: string, resourcePath: string) => resourcePath.includes('/providers/Microsoft.ContainerService/managedClusters/')
+    ? { tags: azure.tags, properties: { agentPoolProfiles: profiles } } : ({ tags: azure.tags }));
+  mock.method(azure, 'cli', async (...args: string[]) => {
+    switch (args.slice(0, 2).join(' ')) {
+      case 'account show': return { id: c.subscription };
+      case 'provider show': return { registrationState: 'Registered' };
+      case 'aks get-versions': return {
+        values: [{ version: c.stampConfig.aks.version.split('.').slice(0, 2).join('.'),
+          patchVersions: { [c.stampConfig.aks.version]: {} } }],
+      };
+      case 'vm list-skus': {
+        const vmSize = args[args.indexOf('--size') + 1];
+        return [{ name: vmSize, family: 'testFamily', capabilities: [{ name: 'vCPUs', value: '1' }] }];
+      }
+      case 'vm list-usage': return [
+        { name: { value: 'testFamily' }, currentValue: 0, limit: 2 },
+        { name: { value: 'cores' }, currentValue: 0, limit: 2 },
+      ];
+      case 'feature show': return { properties: { state: 'Registered' } };
+      case 'network vnet': return [];
+      case 'resource list': return [];
+      default: assert.fail('Unexpected Azure mutation or CLI command: ' + args.join(' '));
+    }
+  });
+  await b.preflight(azure);
+});
+test('shared stamped identity can be reused without replacing other stamp consumers', async () => {
+  const c = new b.Config({ AZURE_SUBSCRIPTION_ID: SUB, AZURE_STAMP: '89151' });
+  azure.c = c;
+  c.stampConfig.publisherFederatedCredentials.push({
+    name: 'publisher', issuer: 'https://token.actions.githubusercontent.com', subject: 'repo:example/repo:environment:publish',
+  });
+  mock.method(azure, 'arm', async (_method: string, resourcePath: string) => resourcePath === c.identity_id
+    ? { tags: { ...b.TAGS, sandboxId: 'stamp-89150' } } : null);
+  const publisherCredentials = c.stampConfig.publisherFederatedCredentials.map(({ name, issuer, subject }) => ({
+    name, properties: { issuer, subject, audiences: ['api://AzureADTokenExchange'] },
+  }));
+  mock.method(azure, 'collection', async () => publisherCredentials);
+  await b.guard_existing(azure);
+});
+for (const existing of [false, true])
+test(`Canada stamp preserves existing RG/UAMI locations and trust (existing=${existing})`, async () => {
+  const c = new b.Config({ AZURE_SUBSCRIPTION_ID: SUB, AZURE_STAMP: '89152', AZURE_LOCATION: 'canadacentral' });
+  azure.c = c;
+  c.stampConfig.publisherFederatedCredentials.push({
+    name: 'publisher', issuer: 'https://token.actions.githubusercontent.com', subject: 'repo:example/repo:environment:publish',
+  });
+  const groupTags = { ...b.TAGS, sandboxId: 'stamp-89150' };
+  const identityTags = { ...b.TAGS, sandboxId: 'stamp-89149' };
+  const publisherCredentials = c.stampConfig.publisherFederatedCredentials.map(({ name, issuer, subject }) => ({
+    name, properties: { issuer, subject, audiences: ['api://AzureADTokenExchange'] },
+  }));
+  let deployed = false;
+  mock.method(azure, 'arm', async (_method: string, resourcePath: string) => {
+    if (resourcePath === c.base && existing) return { location: 'eastus2', tags: groupTags };
+    if (resourcePath === c.identity_id && (existing || deployed))
+      return { location: existing ? 'eastus2' : 'canadacentral', tags: identityTags, properties: { clientId: SUB, principalId: SUB } };
+    if (resourcePath === c.cluster_id && deployed) return { properties: { uri: 'https://cluster.example' } };
+    if (resourcePath === c.base + '/providers/Microsoft.ContainerService/managedClusters/' + c.cluster && deployed)
+      return nativeCluster(c);
+    return null;
+  });
+  mock.method(azure, 'collection', async () => [...publisherCredentials, ...deployed ? [nativeCredential(c)] : []]);
+  let parameters: any;
+  mock.method(azure, 'cli', async (...args: string[]) => {
+    assert.deepEqual(args.slice(0, 3), ['deployment', 'sub', 'create']);
+    assert.equal(args[args.indexOf('--name') + 1], 'arrowcol-sandbox-stamp-89152');
+    assert.equal(args[args.indexOf('--location') + 1], 'canadacentral');
+    parameters = JSON.parse(fs.readFileSync(args.at(-1)!.slice(1), 'utf8')).parameters;
+    deployed = true;
+    return {};
+  });
+  await b.deploy(azure);
+  const newTags = { ...b.TAGS, sandboxId: c.sandbox };
+  assert.equal(parameters.location.value, 'canadacentral');
+  assert.equal(parameters.resourceGroupLocation.value, existing ? 'eastus2' : 'canadacentral');
+  assert.equal(parameters.identityLocation.value, existing ? 'eastus2' : 'canadacentral');
+  assert.deepEqual(parameters.resourceGroupTags.value, existing ? groupTags : newTags);
+  assert.deepEqual(parameters.identityTags.value, existing ? identityTags : newTags);
+  assert.deepEqual(parameters.publisherFederatedCredentials.value, existing ? [] : c.stampConfig.publisherFederatedCredentials);
+  assert.equal(new b.Config({ AZURE_SUBSCRIPTION_ID: SUB, ...c.generated() }, c.stampConfig).location, 'canadacentral');
+  const main = fs.readFileSync(path.join(b.ROOT, 'infra/azure/main.bicep'), 'utf8');
+  const sandbox = fs.readFileSync(path.join(b.ROOT, 'infra/azure/sandbox.bicep'), 'utf8');
+  assert.match(main, /name: resourceGroupName\n  location: resourceGroupLocation/);
+  assert.match(main, /identityLocation: identityLocation/);
+  assert.match(sandbox, /name: identityName\n  location: identityLocation/);
+});
+for (const key of ['base', 'identity_id'] as const)
+test(`deployment rejects missing existing ${key} location before any ARM write`, async () => {
+  const original = azure.arm.bind(azure);
+  mock.method(azure, 'arm', async (method: string, resourcePath: string) => {
+    const resource = await original(method, resourcePath);
+    return resourcePath === azure.c[key] ? { ...resource, location: undefined } : resource;
+  });
+  mock.method(azure, 'cli', async () => { assert.fail('deployment must not begin with unknown existing location'); });
+  await assert.rejects(b.deploy(azure), /location is missing or invalid; refusing relocation/);
+});
+test('stamped deployment refuses missing shared publisher FICs', async () => {
+  const c = new b.Config({ AZURE_SUBSCRIPTION_ID: SUB, AZURE_STAMP: '89151' });
+  azure.c = c;
+  c.stampConfig.publisherFederatedCredentials.push({
+    name: 'publisher', issuer: 'https://token.actions.githubusercontent.com', subject: 'repo:example/repo:environment:publish',
+  });
+  mock.method(azure, 'arm', async (_method: string, resourcePath: string) => resourcePath === c.identity_id
+    ? { tags: { ...b.TAGS, sandboxId: 'stamp-89150' } } : null);
+  mock.method(azure, 'collection', async () => []);
+  await assert.rejects(b.guard_existing(azure), /publisher federated credentials do not match/);
+});
+test('empty external publisher list still requires the exact native AKS trust', async () => {
+  const c = azure.c;
+  assert.deepEqual(c.stampConfig.publisherFederatedCredentials, []);
+  const identity = await azure.arm('GET', c.identity_id);
+  mock.method(azure, 'collection', async () => [nativeCredential(c)]);
+  await b.verify_aks_native_credential(azure, nativeCluster(c), identity);
+  mock.method(azure, 'collection', async () => []);
+  await assert.rejects(b.verify_aks_native_credential(azure, nativeCluster(c), identity), /required AKS-native/);
+});
+for (const mismatch of ['name', 'issuer', 'subject', 'audience', 'duplicate'] as const)
+test(`native AKS trust rejects ${mismatch} mismatch without external publishers`, async () => {
+  const c = azure.c, credential = nativeCredential(c);
+  if (mismatch === 'name') credential.name = 'azure-qap';
+  if (mismatch === 'issuer') credential.properties.issuer += 'other/';
+  if (mismatch === 'subject') credential.properties.subject += '-other';
+  if (mismatch === 'audience') credential.properties.audiences.push('unexpected');
+  mock.method(azure, 'collection', async () => mismatch === 'duplicate' ? [credential, credential] : [credential]);
+  await assert.rejects(b.verify_aks_native_credential(azure, nativeCluster(c), await azure.arm('GET', c.identity_id)),
+    /required AKS-native/);
+});
+test('native AKS trust rejects disabled federation and a different configured UAMI', async () => {
+  const c = azure.c, cluster = nativeCluster(c), identity = await azure.arm('GET', c.identity_id);
+  mock.method(azure, 'collection', async () => [nativeCredential(c)]);
+  cluster.properties.securityProfile.workloadIdentity.enabled = false;
+  await assert.rejects(b.verify_aks_native_credential(azure, cluster, identity), /must both be enabled/);
+  cluster.properties.securityProfile.workloadIdentity.enabled = true;
+  c.identity_client_id = '00000000-0000-0000-0000-000000000002';
+  await assert.rejects(b.verify_aks_native_credential(azure, cluster, identity), /client ID differs/);
+});
+test('shared stamped identity rejects an unrelated or malformed ownership tag', async () => {
+  const c = new b.Config({ AZURE_SUBSCRIPTION_ID: SUB, AZURE_STAMP: '89151' });
+  azure.c = c;
+  mock.method(azure, 'arm', async (_method: string, resourcePath: string) => resourcePath === c.identity_id
+    ? { tags: { ...b.TAGS, sandboxId: 'foreign' } } : null);
+  await assert.rejects(b.guard_existing(azure), /shared ArrowCol identity ownership tags/);
+});
 for (const values of [
   { AZURE_RESOURCE_GROUP: 'production' }, { AZURE_RESOURCE_GROUP: '' }, { AZURE_SUBSCRIPTION_ID: 'default' },
   { AZURE_SUBSCRIPTION_ID: '{{00000000-0000-0000-0000-000000000001}}' },
@@ -420,6 +717,10 @@ for (const [label, change] of [
   ['missing container', (a: FakeAzure) => { a.containers.pop(); }],
   ['container ownership', (a: FakeAzure) => { a.data_metadata.sandboxid = 'foreign'; }],
   ['experiment container ownership', (a: FakeAzure) => { a.with_experiment().experiment_metadata.sandboxid = 'foreign'; }],
+  ['website container ownership', (a: FakeAzure) => { a.with_website().website_metadata.sandboxid = 'foreign'; }],
+  ['unmarked website container', (a: FakeAzure) => { a.with_website().website_metadata = {}; }],
+  ['benchmark results container ownership', (a: FakeAzure) => { a.with_results().results_metadata.sandboxid = 'foreign'; }],
+  ['unmarked benchmark results container', (a: FakeAzure) => { a.with_results().results_metadata = {}; }],
   ['database beside the experiment database', (a: FakeAzure) => { a.with_experiment().databases.push({ name: 'foreign' }); }],
   ['soft-deleted objects', (a: FakeAzure) => { a.items[a.c.data][0].deleted = true; }],
 ] as const) test(`inventory rejects ${label} without mutation`, async () => {
@@ -434,6 +735,40 @@ test('inventory accepts the optional experiment database and container beside sa
   assert.equal(experiment, true); assert.deepEqual(databases.map(item => item.name), [c.database]);
   assert.deepEqual(Object.keys(inventory), [c.data, c.checkpoints, c.experimentContainer]);
   assert.equal(inventory[c.experimentContainer].length, 5); assert.deepEqual(azure.events, []);
+});
+test('stamped inventory includes the owned static website without mutation', async () => {
+  azure.with_website();
+  const [, inventory] = await b.reset_inventory(azure);
+  assert.deepEqual(Object.keys(inventory), [azure.c.data, azure.c.checkpoints, '$web']);
+  assert.equal(inventory.$web[0].name, 'results.parquet');
+  assert.deepEqual(azure.events, []);
+});
+test('isolated inventory does not admit a static website container', async () => {
+  azure.c = new b.Config({ AZURE_SUBSCRIPTION_ID: SUB, AZURE_RESOURCE_GROUP: b.SCHEMA_EVOLUTION_GROUP }, 'schema-evolution');
+  azure.tags.sandboxId = azure.c.sandbox;
+  azure.with_website();
+  await assert.rejects(() => b.reset_inventory(azure), /Unexpected or missing container/);
+  assert.deepEqual(azure.events, []);
+});
+test('stamped inventory includes owned benchmark results without mutation', async () => {
+  azure.with_results();
+  const [, inventory] = await b.reset_inventory(azure);
+  assert.deepEqual(Object.keys(inventory), [azure.c.data, azure.c.checkpoints, 'experiments']);
+  assert.equal(inventory.experiments[0].name, 'arrowcol-oat/results.parquet');
+  assert.deepEqual(azure.events, []);
+});
+test('isolated inventory does not admit the stamped benchmark results container', async () => {
+  azure.c = new b.Config({ AZURE_SUBSCRIPTION_ID: SUB, AZURE_RESOURCE_GROUP: b.SCHEMA_EVOLUTION_GROUP }, 'schema-evolution');
+  azure.tags.sandboxId = azure.c.sandbox;
+  azure.with_results();
+  await assert.rejects(() => b.reset_inventory(azure), /Unexpected or missing container/);
+  assert.deepEqual(azure.events, []);
+});
+test('owned website objects participate in the existing fenced physical cleanup', async () => {
+  azure.with_website();
+  await execute();
+  assert.deepEqual(azure.items.$web, []);
+  assert.ok(azure.events.some(event => event[0] === 'DELETE' && event[1] === 'results.parquet'));
 });
 for (const settings of [{ isVersioningEnabled: true }, { deleteRetentionPolicy: { enabled: true } },
   { containerDeleteRetentionPolicy: { enabled: true } }, { restorePolicy: { enabled: true } }])
@@ -967,6 +1302,58 @@ test('GET/HEAD transient failures retry boundedly; writes/nontransient reads rem
     assert.equal(calls, ['GET', 'HEAD'].includes(method) && code !== 403 ? b.READ_ATTEMPTS : 1);
   }
 });
+test('HTTP capture persists the original response before failure handling and suppresses retries', async () => {
+  for (const [method, status] of [['PUT', 201], ['PUT', 503], ['GET', 503]] as const) {
+    const real = new b.Azure(azure.c), captured: b.HttpReceipt[] = [];
+    let calls = 0;
+    const original = JSON.stringify({ fixture: 'original response', status });
+    const filename = path.join(directory, `${method}-${status}-receipt.json`);
+    real.token = async () => 'fixture-token';
+    mock.method(globalThis, 'fetch', async () => {
+      calls++;
+      return new Response(original, { status, headers: {
+        'x-ms-request-id': 'fixture-request', 'x-ms-correlation-request-id': 'fixture-correlation',
+        'set-cookie': 'not-part-of-receipt',
+      } });
+    });
+    const pending = real.request(method, 'https://unused.invalid/credential', 'https://management.azure.com/',
+      undefined, {}, false, true, response => {
+        b.publish_private(filename, response);
+        captured.push(response);
+      });
+    if (status === 201) assert.equal((await pending)[0]!.toString(), original);
+    else await assert.rejects(pending, error => {
+      assert.equal(captured.length, 1, 'capture must precede the HTTP error');
+      assert.ok(fs.existsSync(filename), 'the failure receipt must already be durable');
+      return error instanceof b.HttpFailure && error.code === status;
+    });
+    assert.equal(calls, 1, 'capture is single-shot even for GET or explicitly idempotent writes');
+    assert.deepEqual(captured, [{ status, bodyBase64: Buffer.from(original).toString('base64'),
+      headers: { 'x-ms-request-id': 'fixture-request', 'x-ms-correlation-request-id': 'fixture-correlation' } }]);
+    assert.deepEqual(JSON.parse(fs.readFileSync(filename, 'utf8')), captured[0]);
+  }
+});
+test('receipt persistence and response-body failures remain ambiguous and never retry', async () => {
+  for (const failurePoint of ['body', 'capture']) {
+    const real = new b.Azure(azure.c);
+    let requests = 0, captures = 0;
+    real.token = async () => 'fixture-token';
+    mock.method(globalThis, 'fetch', async () => {
+      requests++;
+      const response = new Response('original', { status: 201 });
+      if (failurePoint === 'body')
+        mock.method(response, 'arrayBuffer', async () => { throw new Error('injected body read loss'); });
+      return response;
+    });
+    await assert.rejects(real.request('PUT', 'https://unused.invalid/credential', 'https://management.azure.com/',
+      undefined, {}, false, true, () => {
+        captures++;
+        throw new Error('injected receipt persistence failure');
+      }), /injected/);
+    assert.equal(requests, 1);
+    assert.equal(captures, failurePoint === 'body' ? 0 : 1);
+  }
+});
 test('read retries gateway timeout then succeeds and network retry trail stays bounded', async () => {
   const real = new b.Azure(azure.c); let calls = 0;
   real._request_once = async () => {
@@ -1139,6 +1526,11 @@ test('Bicep serializes AKS subnet writes on the shared VNet', () => {
   assert.match(section('apiServerSubnet'), /dependsOn:\s*\[\s*nodeSubnet\s*\]/);
   assert.doesNotMatch(section('nodeSubnet'), /dependsOn:[\s\S]*apiServerSubnet/);
 });
+test('each AKS stamp gets a distinct QAP identity trust entry', () => {
+  const source = fs.readFileSync(path.join(b.ROOT, 'infra/azure/aks.bicep'), 'utf8');
+  const section = source.split('resource qapFederatedCredential ')[1].split('\nresource ')[0];
+  assert.match(section, /name: 'azure-qap-\$\{clusterName\}'/);
+});
 test('Bicep separates Kusto client application identity from storage object principal and preserves live authority', () => {
   const source = fs.readFileSync(path.join(b.ROOT, 'infra/azure/sandbox.bicep'), 'utf8');
   assert.match(source.split('resource reader ')[1], /principalId: identity\.properties\.clientId/);
@@ -1152,6 +1544,13 @@ test('Bicep adds experiment container, database, workspace and StorageRead diagn
   const section = (name: string) => source.split(`resource ${name} `)[1].split('\nresource ')[0].split('\noutput ')[0];
   const logSection = (name: string) => readLogSource.split(`resource ${name} `)[1].split('\nresource ')[0].split('\noutput ')[0];
   assert.match(section('experiment'), /parent: blobs[\s\S]*name: experimentContainer[\s\S]*sandboxid: ownership\.sandboxId/);
+  assert.match(section('blobs'), /staticWebsite: \{[\s\S]*enabled: azureMode == 'stamped'[\s\S]*indexDocument: 'index\.html'/);
+  assert.match(section('website'), /= if \(azureMode == 'stamped'\)[\s\S]*name: '\$web'[\s\S]*sandboxid: ownership\.sandboxId/);
+  assert.match(section('storage'), /isHnsEnabled: true[\s\S]*allowBlobPublicAccess: false/);
+  assert.match(section('runtimeWebsiteWriter'), /scope: website[\s\S]*ba92f5b4-2d11-453d-a403-e96b0029c9fe/);
+  assert.match(source, /var createBenchmarkResults = azureMode == 'stamped' && !contains\(\[dataContainer, checkpointContainer, experimentContainer\], 'experiments'\)/);
+  assert.match(section('benchmarkResults'), /= if \(createBenchmarkResults\)[\s\S]*name: 'experiments'[\s\S]*publicAccess: 'None'[\s\S]*sandboxid: ownership\.sandboxId/);
+  assert.match(section('runtimeBenchmarkWriter'), /= if \(createBenchmarkResults\)[\s\S]*scope: benchmarkResults[\s\S]*ba92f5b4-2d11-453d-a403-e96b0029c9fe[\s\S]*principalId: identity\.properties\.principalId/);
   assert.deepEqual([...source.matchAll(/resource (\w+) 'Microsoft\.Storage\/storageAccounts@/g)].map(match => match[1]),
     ['storage']);
   assert.match(source, /module readLogStorage '\.\/read-log-storage\.bicep' = if \(!empty\(readLogStorageAccountName\)\)/);
@@ -1174,6 +1573,14 @@ test('Bicep adds experiment container, database, workspace and StorageRead diagn
   }
   assert.match(section('readExperiment'), /scope: experiment\n/);
   assert.match(section('readExperiment'), /2a2b9908-6ea1-4ae2-8e65-a410df84e7d1[\s\S]*principalId: identity\.properties\.principalId/);
+  const dataWriter = section('runtimeDataWriter');
+  assert.match(dataWriter, /name: guid\(data\.id, identity\.id, 'runtime-data-contributor'\)/);
+  assert.match(dataWriter, /scope: data\n/);
+  assert.match(dataWriter, /ba92f5b4-2d11-453d-a403-e96b0029c9fe[\s\S]*principalId: identity\.properties\.principalId[\s\S]*principalType: 'ServicePrincipal'/);
+  assert.match(section('checkpointContainerScope'), /parent: blobs[\s\S]*name: checkpointContainer/);
+  const controlWriter = section('runtimeControlWriter');
+  assert.match(controlWriter, /name: guid\(checkpointContainerScope\.id, identity\.id, 'runtime-control-contributor'\)[\s\S]*scope: checkpointContainerScope[\s\S]*dependsOn: \[checkpoints\]/);
+  assert.doesNotMatch(controlWriter, /scope: checkpoints!/);
   assert.match(section('experimentDb'), /name: experimentDatabase[\s\S]*softDeletePeriod: 'P7D'[\s\S]*hotCachePeriod: 'P1D'/);
   assert.match(section('experimentReader'), /parent: experimentDb[\s\S]*principalId: identity\.properties\.clientId[\s\S]*role: 'Viewer'/);
   assert.match(section('workspace'), /name: logAnalyticsWorkspaceName[\s\S]*tags: ownership[\s\S]*'PerGB2018'[\s\S]*retentionInDays: 30/);
@@ -1202,7 +1609,7 @@ for (const group of ['arrow-collector-rg', 'rust-playground-schema-evo'])
     await b.deploy(azure);
     const invocation = azure.events.find(event => event[0] === 'cli' && event[1] === 'deployment');
     assert.ok(invocation);
-    const expected = group === 'arrow-collector-rg' ? 'arrowcol-sandbox' : 'arrowcol-sandbox-' + azure.c.sandbox;
+    const expected = 'arrowcol-sandbox-' + azure.c.sandbox;
     assert.equal(invocation[invocation.indexOf('--name') + 1], expected);
   });
 function coordinateProvision(initializer?: (command: string[], env: NodeJS.ProcessEnv) => Promise<{

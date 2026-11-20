@@ -1,0 +1,206 @@
+# ArrowCol OAT benchmark results
+
+| File                                              | Purpose                                                                                                                                  |
+| ------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `index.html`                                      | Static, Excel-like heatmap viewer using Hyparquet in the browser, with a live numbered architecture diagram and config-to-stack mapping. |
+| `architecture.svg`                                | Full-width layered architecture displayed on the live page, with embedded official icons and numbered parts 1–6.                         |
+| `results.parquet`                                 | Sanitized, compact benchmark summary published by the OAT server.                                                                        |
+| `oat-config.example.json`                         | Validated configuration template with no credentials.                                                                                    |
+| `architecture.drawio` / `architecture.drawio.png` | Editable source and rendered companion for the same layered architecture.                                                                |
+| [Runtime setup](RUNTIME.md)                       | Isolated internal-only Kubernetes stack, image digests, workload identity, SQL bootstrap, secret files and local rehearsal.              |
+| [E1-E5 input preparation](EXPERIMENTS.md)         | Offline binding of private AKS settings and reviewed pilot windows into five comparable 32-table runs.                                   |
+
+The viewer's six numbered stack parts match the diagram badges. Their numbers appear beside every OAT JSON field and Parquet result column that they affect. Preserve these IDs and titles when updating the diagram, configuration reference, or heatmap.
+
+## Parquet contract
+
+Schema version 3 preserves the existing 31 columns and appends nullable
+`evidence_json`. It records consumer startup readback, execution image identities,
+phase-scoped counters, observed commit evidence and bounded resource samples.
+See [tunable and measurement semantics](TUNABLES.md).
+`started_at` is an Arrow `timestamp[ms, tz=UTC]`; unavailable measurements are null,
+never synthetic zeroes.
+
+The failure-evidence amendment makes `rows`, `duration_ms` and
+`rows_per_second` nullable without changing their names, order or logical types.
+Uncompleted measurements are null; completed measurements and historical zero
+values remain values, never retroactively inferred as missing. The producer
+accepts the exact prior 31-column v2 schema (including field/schema metadata)
+only by widening these three fields from required to nullable during append.
+All other schema differences are rejected. Historical rows retain
+`schema_version: 2` and receive null `evidence_json`; new rows use version 3.
+This is an explicit nullability amendment, not the unchanged original strict
+schema. Readers must accept null measurements, including failed-cell records.
+
+Completed earlier matrix cells are published even when a later cell or cleanup
+fails, and the overall run still fails. Failed cells retain their run/table
+identity and fixed failure categories in `tunables_json`; incomplete cell
+measurements remain null. Cleanup failures after completed measurement retain
+those values and set `cleanup_failed: true`. Original diagnostic errors remain
+in the overall failed-run error chain/receipt, not the public Parquet mirror:
+arbitrary command output must not be published as sanitized benchmark data.
+`status` is `succeeded`, `failed` or `pinning_violation`. A failed ownership
+observation is unverified (`failed`, `pinning_ok: false`), not proof of an
+ownership violation; only observed invariant loss or an explicit router
+pinning rejection warrants `pinning_violation`. The viewer labels these states
+separately and continues displaying null metrics as a dash, not zero.
+
+| Column            | Type                          | Nullability | Meaning                                                                                                                                           |
+| ----------------- | ----------------------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `schema_version`  | 32-bit signed integer         | Required    | Contract version; new rows use `3`, historical `2` remains readable.                                                                              |
+| `mode`            | UTF-8 string                  | Required    | `local` or `aks`.                                                                                                                                 |
+| `stamp`           | UTF-8 string                  | Nullable    | Deployment stamp, when available.                                                                                                                 |
+| `host`            | UTF-8 string                  | Required    | Host running the OAT workload.                                                                                                                    |
+| `experiment`      | UTF-8 string                  | Required    | Named tunable combination.                                                                                                                        |
+| `started_at`      | Timestamp (milliseconds, UTC) | Required    | Experiment start time.                                                                                                                            |
+| `measure_seconds` | 64-bit float                  | Required    | Steady-state measurement window.                                                                                                                  |
+| `arrowcols`       | 32-bit signed integer         | Required    | ArrowCol replica count.                                                                                                                           |
+| `clients`         | 32-bit signed integer         | Required    | Client fleet size.                                                                                                                                |
+| `tables`          | 32-bit signed integer         | Required    | Number of selected tables.                                                                                                                        |
+| `table_owner`     | UTF-8 string                  | Nullable    | Stable ArrowCol owner for this table.                                                                                                             |
+| `pinning_ok`      | Boolean                       | Required    | True only when the owner remains valid and unchanged for the full experiment.                                                                     |
+| `status`          | UTF-8 string                  | Required    | Result status; pinning violations use `pinning_violation`.                                                                                        |
+| `git_sha`         | UTF-8 string                  | Required    | Owned-server build revision from a clean, unchanged Git checkout; `unknown` for uncommitted source. External servers retain their own provenance. |
+| `tunables_json`   | UTF-8 string                  | Required    | JSON object containing the experiment tunables.                                                                                                   |
+
+The producer retains these original result columns:
+
+| Column                     | Type                             | Meaning                                                                                                         |
+| -------------------------- | -------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `run_id`                   | UTF-8 string                     | Benchmark run identifier.                                                                                       |
+| `replicas`                 | 64-bit unsigned integer          | ArrowCol replica count.                                                                                         |
+| `dfe_worker_concurrency`   | 64-bit unsigned integer          | DFE `--num-cores` setting.                                                                                      |
+| `table`                    | UTF-8 string                     | DMV table used as the table-scoped routing key.                                                                 |
+| `rows`                     | Nullable 64-bit unsigned integer | Client admission completions in the shared measurement window; not Delta commits or unique delivery.            |
+| `duration_ms`              | Nullable 64-bit unsigned integer | Shared fleet measurement duration; excludes preflight and warm-up; null if unmeasured.                          |
+| `rows_per_second`          | Nullable 64-bit float            | Total table rows completed during the shared window divided by its duration; null if unmeasured.                |
+| `cpu_millicores`           | Nullable 64-bit float            | Mean of observed collector-fleet samples inside measurement; not an end-of-run snapshot.                        |
+| `memory_bytes`             | Nullable 64-bit unsigned integer | Maximum observed collector-fleet sample; not an asserted peak RSS.                                              |
+| `qap_observation_complete` | 64-bit unsigned integer          | 1 only when all expected QAP tables and required fields were measured; otherwise 0.                             |
+| `qap_observed_tables`      | 64-bit unsigned integer          | Number of expected QAP tables observed.                                                                         |
+| `qap_completion_percent`   | Nullable 64-bit float            | Minimum reported completion percentage across the selected tables.                                              |
+| `qap_pending_artifacts`    | Nullable 64-bit unsigned integer | Sum of pending artifacts across selected tables.                                                                |
+| `qap_cached_bytes`         | Nullable 64-bit unsigned integer | Sum of QAP `HotSize` bytes across selected tables.                                                              |
+| `qap_unhealthy_catalogs`   | Nullable 64-bit unsigned integer | Sum of unhealthy catalog counts across selected tables.                                                         |
+| `qap_lag_seconds`          | Nullable 64-bit float            | Maximum reported QAP lag across selected tables.                                                                |
+| `evidence_json`            | Nullable UTF-8 string            | Versioned sanitized configuration, provenance, counters, commit and resource evidence; null on historical rows. |
+
+The viewer reads `results.parquet` from the same origin using HTTP range requests; it does not need CORS configuration. Azure Storage static website hosting on the HNS-enabled account serves `$web` anonymously, even when account-level blob public access is disabled. The AKS defaults target `abfss://experiments@arrowcollector<stamp>.dfs.core.windows.net/arrowcol-oat/results.parquet` and the root `results.parquet` in that stamp's `$web`; explicit destinations may override them. `aks setup` publishes the checked-in viewer and its architecture SVG to `$web/index.html` and `$web/architecture.svg` through the federated `arrow-collector` identity so the static-site root can render the diagram and load same-origin results. The producer uses conditional ETag updates, deduplicates every write by `(run_id, table)` (last row wins), and verifies the website copy matches the authoritative results object before success. Local writers serialize read/merge/rename through a cross-process file lock with a 15-second timeout. Empty results files preserve the full schema and accept later appends. Publish only approved nonsensitive summary metrics there—never credentials, raw payloads, or sensitive identifiers.
+
+## Running the OAT matrix
+
+Complete [runtime setup](RUNTIME.md) first for AKS runs. The OAT executable starts its local Rust API server automatically; Rust/Cargo and the npm workspace dependencies must be available. The supported AKS topology uses **one integrated `arrowcol` Deployment**, container `dataflow`, for both receiver and exporter. Set both deployment/container/selector pairs identically. The server applies replicas and `--num-cores` together, observes and restores each unique Deployment once, and counts each pod once. It writes one compact Parquet file to both configured ADLS Gen2 destinations. The web destination must be the root of `$web` (for example, `abfss://$web@account.dfs.core.windows.net/results.parquet`).
+
+Run the local OAT from the repository root with `npx arrowcol-oat --config docs/experiments/arrowcol-oat/oat-config.example.json`. For bridged Docker hosts, isolated smoke settings and opt-in stopped Delta exports, see [local runtime and snapshots](RUNTIME.md#local-smoke-and-stopped-delta-snapshots). The executable starts the Rust API server, builds the local Compose images, creates run-scoped local credentials and state, submits the configuration, polls the run, then stops the stack and API server. It then serves the local results page on loopback with HTTP range support and keeps the command open until Ctrl+C. Compose assigns ephemeral host ports for the local router and Kusto; the sample endpoint values are placeholders. Rust/Cargo, Docker Compose, and npm workspace dependencies must be available. The included sample writes both result files under `/tmp`; set ADLS Gen2 URLs when publishing results to storage. Add `--server <URL>` to use an already-running OAT API server instead.
+
+### CLI options and local cleanup
+
+Use `--no-viewer` with local benchmark runs to exit after cleanup without starting the loopback results viewer; default behavior is unchanged.
+
+Run `npx --no-install arrowcol-oat --help` for the supported options. Unknown options fail before startup with exit code 2. Failed or rejected runs exit without opening the viewer; use `--viewer-only` to inspect any previously published results, including partial failure evidence. If the local ownership marker cannot be written (for example, disk full), the CLI cancels the accepted run and waits for cleanup before reporting the write failure. In local mode, SIGINT, SIGTERM and SIGHUP request cancellation and wait for the local Compose cleanup; a second signal forces a fast exit. If only the CLI process is killed, the next local run checks its ownership marker and asks the still-running OAT server to cancel and clean up.
+
+If the OAT server is no longer running, remove one abandoned local cell with `npx --no-install arrowcol-oat --cleanup-local <cell-run-uuid> --config <config-path>`. Get the cell UUID from its directory under `platform.compose_state_root`; relative state roots resolve from the repository root, matching the owned Rust server, even when invoking the CLI from another directory. This command is local-only and removes only that cell's Compose resources and state; it does not operate on AKS.
+
+Old Compose projects named with only the first eight UUID characters are ambiguous. Cleanup refuses them without deleting resources or state; inspect ownership and clean up those legacy projects manually.
+
+For a functional demo, use `oat-config.quick.json`: one table, one replica/worker cell, 10 seconds of warm-up and a 30-second measurement, with results under `/tmp/arrowcol-oat-quick`; builds, stack startup and scheduling still apply, and bridged devcontainers require the local host settings above. `oat-config.aks.quick.json` uses the same warm-up and measurement. Local quick allows 300 seconds of post-client reconciliation and a 60-second QAP timeout; AKS quick allows 600 and 180 seconds respectively. These observe continuing backlog commits and QAP progress, not a throughput optimization, collector-policy change or relaxed verdict; generic defaults remain 120 and 60 seconds. These windows span the shipped OAT collector's 5-second flush age and 2-second commit batching; size-triggered flushes can happen earlier. Short admission/smoke experiments remain valid. The viewer shows separate admission and exact-window commit-output headlines; observed zero output remains zero with an explanation, while unavailable output is a dash. Whole-cell settled commits include warm-up and are never substituted for window throughput. See [measurement scopes](TUNABLES.md#quick-run-measurement-scopes). After a successful run, reopen the results without rerunning the benchmark with `npx --no-install arrowcol-oat --mode local --viewer-only`. This serves the checked-in quick configuration's existing `website_url` results file on loopback without starting Rust, Docker Compose, a benchmark run, or Azure operations; it reports an error if the configured result file is missing.
+
+The AKS launcher prefers existing generated `out/arrowcol-oat/oat-config.aks.json` over the quick template; template updates do not rewrite it. To adopt these budgets, regenerate with `npx --no-install arrowcol-oat aks setup --skip-images --stamp-config "$STAMP_CONFIG"` using the same stamp configuration, or explicitly update the generated input's two timeout fields. Validate that actual input with `--validate-config` before submission.
+
+AKS runs require a working Kubernetes context and metrics API, `dmv_client_image`, a namespace secret named by `edge_secret_name` with an `edge-hmac` key, and the **real provisioned QAP endpoint**. An optional `platform.kustomize_overlay` points to a local Kustomize directory for pod sizing; the rendered overlay is restricted to the configured ArrowCol/DFE Deployments, which the runner snapshots and restores. Each client is a Kubernetes Job pinned to `arrow-collector/role=client` with its matching NoSchedule toleration; Jobs use topology spread across `kubernetes.azure.com/agentpool`. ArrowCol, DFE, router and catalog runtime pods select the `arrowcol` role pool and tolerate its matching taint. AKS requires a five-digit `stamp`; if result destinations are omitted, the producer uses that stamp's `experiments` container and `$web`. Local runs use the Compose stack and local client/ArrowCol/Kusto endpoints; only the configured Parquet results sink may use Azure. Set local `qap_database` to `null` to use Kustainer's default `loadtest` database. Each DDL/upload is HMAC-signed; each concurrent upload uses a separate connection so SO_REUSEPORT can distribute work across DFE cores. Client timing reports steady-window throughput rather than admission latency.
+
+Each matrix cell initializes and binds its complete immutable SQL run-table pin set before launching clients, through the existing routing engine's collector refresh/ranking and SQL lease-CAS path. The finite setup process is authenticated as `arrowcol_migrator`, never with router/app credentials, and receives only the routing-selection policy projected from that platform's exact rendered router config. Local Compose uses its dedicated migrator password file; AKS mounts the existing `arrowcol-sql-migration` Secret only into finite SQL migration and pin-init Jobs at `/run/migration/password`, never into router, client, or collector pods. The runtime bootstrap and pin setup must use the same migrator password source.
+
+Set `clients_per_table` from 1 to 4 to multiply the client fleet (maximum 128 client jobs/containers); each table remains a single routing target and can still be owned by one ArrowCol. `client_ready_timeout_seconds` bounds client image startup, DMV preflight, and whole-fleet readiness (30–1,800 seconds; default 600). Each client schedule wait is separately bounded to readiness + `qap_timeout_seconds` + 180 seconds for final schedule delivery; QAP preparation itself is bounded by `qap_timeout_seconds` (1–300 seconds). A QAP deadline failure is returned without retry; if a helper was interrupted, its outcome may be indeterminate and remains subject to the existing ownership-record rules. The parent permits at most 180 seconds from schedule arming to the common start, and fails if any client misses that window rather than accepting a partial fleet. AKS Job `activeDeadlineSeconds` covers the composed startup budget, warm-up, measurement, and a 300-second completion margin. Pin initialization is separately bounded to 180 seconds on either platform. Because immutable run-pin expiry starts before pin initialization, `run_pin_ttl_ms` must cover that setup bound, the complete client Job lifetime, reconciliation and collector shutdown grace; it is never extended to compensate for delayed preparation. The shared measurement timestamp is chosen only after every client is ready and QAP setup has completed. `dmv_concurrency` is bounded to 64 per client, `rows_per_table` to 1,000,000 per upload, and one matrix to 25 combinations. Set `pilot_mode: true` with a `measure_seconds` value that is a 30-second multiple from 60–600; warm-up plus measurement may not exceed ten minutes. The pilot emits per-table rows/s for each full 30-second window and reports the earliest cumulative horizon whose observed window rates vary by no more than 5%. Use those windows to select the shortest stable measurement duration for subsequent comparison runs.
+
+Each matrix cell receives a canonical UUID and an isolated platform stack, run-scoped immutable table pins and router configuration. `run_pin_ttl_ms` defaults to 3,600,000 ms and is bounded to 86,400,000 ms; validation requires it to cover the 180-second pin-setup bound, configured readiness and QAP preparation, schedule delivery, workload, Job cleanup, reconciliation and collector shutdown budgets. The owner lease TTL is one hour so it cannot expire during a valid run.
+
+For AKS, copy the example and set `platform.kind` to `aks`, remove the local Compose settings, and configure the AKS endpoints, secret path, context, namespace, and result destinations described above. Local configurations use the configured `compose_project` as a prefix and append the unique OAT run ID, isolating the network, containers, and volumes; `compose_state_root` contains generated local credentials and bind-mounted state for that run.
+
+The server never creates, deletes, or scales AKS node pools. Run `cargo run --locked --package arrowcol-oat-rust -- --validate-config docs/experiments/arrowcol-oat/oat-config.example.json` before submission to validate the shape without changing cluster state; placeholders still need replacing. The `az://container/object` URL form is also accepted when Azure account authentication is already configured for the process.
+
+## Known limitations
+
+- An all-core 16-worker × 16-stream, zero-interval blast can produce client
+  `pinning_violation` failures. The router evaluates lease-holder eligibility
+  using the request-start time after SQL pin and view reads. A candidate
+  decision-clock fix is on the separate
+  `wip/arrowcol-router-decision-clock` branch, not in this PR.
+- Under that backlog, collector shutdown can exit 1 with
+  `dataflow drain incomplete: N unpublished identities`. This is fail-closed;
+  the count alone does not establish data loss. Category diagnostics are also
+  on the separate scratch branch, not in this PR.
+- The tested operating point is lower concurrency, such as 8 workers × 16
+  streams.
+
+## Mode-based quick bug bash
+
+From the repository root. Local needs Docker Compose, Rust/Cargo and the npm dependencies.
+
+### Local
+
+```bash
+npx --no-install arrowcol-oat --mode local               # run one quick cell, serve results on loopback until Ctrl+C
+npx --no-install arrowcol-oat --mode local --viewer-only # reopen the last results; no rebuild, Docker or rerun
+```
+
+- The terminal streams the server URL/PID, Cargo and Compose builds, health checks, migrations, pin setup and cleanup, each with a phase label and elapsed time. With `--server`, server logs stay in the server's terminal.
+- Shared-start and warm-up waits follow wall-clock corrections; clients still fail if they miss the shared measurement window.
+- `--viewer-only` is local-only and errors if the results file is missing.
+
+### AKS create
+
+```bash
+az login --use-device-code
+cp -n infra/azure/stamp.example.yaml infra/azure/stamp.yaml  # -n: never clobber; then set subscription and non-overlapping network ranges
+export STAMP_CONFIG=infra/azure/stamp.yaml
+
+npx --no-install arrowcol-oat aks deploy --stamp-config "$STAMP_CONFIG"
+npx --no-install arrowcol-oat --mode aks --stamp-config "$STAMP_CONFIG" --config out/arrowcol-oat/oat-config.aks.json
+```
+
+- `deploy` picks a fresh five-digit stamp, rewrites `stamp:` in the YAML, provisions, then runs `aks setup` (writes `out/arrowcol-oat/*`) and must end preflight READY.
+- It refuses if a live or partial stamp or stale generated state exists: [destroy](#aks-destroy) first.
+- Flags: `--what-if` read-only preview; `--network cilium` enforces NetworkPolicy (the default Azure dataplane prints `network: NOT ENFORCED`); `--stamp NNNNN` pins the stamp.
+- The run repeats preflight and refuses to start unless READY; `--preflight-only` runs just that read-only check. Setup's host assertion lasts one hour: re-run `aks setup --stamp-config "$STAMP_CONFIG"` if the run starts later.
+- Pass: `DATA FLOW: PASS` and no run-scoped namespaces or federated credentials left.
+
+### AKS run
+
+```bash
+export SUB=68fa0545-661c-4152-93f2-fc8ae1c231b8
+export STAMP_NUM="68590"
+mkdir -p .temp
+export STAMP_CONFIG=".temp/stamp-${STAMP_NUM}.yaml"
+
+az deployment group show \
+  --subscription "$SUB" \
+  --resource-group arrow-collector-rg \
+  --name "arrowcol-sandbox-stamp-${STAMP_NUM}" \
+  --query "{
+    subscription:'$SUB',
+    stamp:'${STAMP_NUM}',
+    resourceGroup:'arrow-collector-rg',
+    location:properties.parameters.location.value,
+    aks:properties.parameters.aksConfig.value,
+    storageReadLogDestination:properties.parameters.readLogStorageAccountName.value && 'storage' || 'log-analytics',
+    publisherFederatedCredentials:properties.parameters.publisherFederatedCredentials.value
+  }" \
+  --output yaml --only-show-errors > "$STAMP_CONFIG"
+
+npx --no-install arrowcol-oat aks setup --stamp ${STAMP_NUM} --stamp-config "$STAMP_CONFIG"
+npx --no-install arrowcol-oat --mode aks --stamp-config "$STAMP_CONFIG" --config out/arrowcol-oat/oat-config.aks.json
+```
+
+### AKS destroy
+
+**Destructive:** `--confirm` deletes all of `arrow-collector-rg` and its AKS-managed resource groups, every stamp included. It is not per-run cleanup.
+
+```bash
+npx --no-install arrowcol-oat aks destroy --stamp-config "$STAMP_CONFIG"                                # read-only inventory
+npx --no-install arrowcol-oat aks destroy --stamp-config "$STAMP_CONFIG" --confirm arrow-collector-rg   # delete
+```
+
+Also clears the generated local state (`.env.azure*`, `out/arrowcol-oat` inputs); the receipt is written outside the checkout. Then [AKS create](#aks-create) again.
+
+More: [AKS QAP operations](../../operations/AKS_QAP.md), [runtime setup](RUNTIME.md).

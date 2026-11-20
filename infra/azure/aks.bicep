@@ -120,6 +120,27 @@ resource registryReaderRole 'Microsoft.Authorization/roleAssignments@2022-04-01'
   properties: { roleDefinitionId: readerRole, principalId: sharedIdentity.properties.principalId, principalType: 'ServicePrincipal' }
 }
 
+var userAgentPoolProfiles = [for userPool in aksConfig.userPools: {
+  name: userPool.name
+  osDiskSizeGB: 100
+  enableAutoScaling: true
+  count: userPool.initialCount
+  minCount: userPool.minCount
+  maxCount: userPool.maxCount
+  maxPods: userPool.maxPods
+  vmSize: userPool.vmSize
+  osType: 'Linux'
+  mode: 'User'
+  vnetSubnetID: nodeSubnet.id
+  enableFIPS: true
+  osSKU: 'AzureLinux'
+  availabilityZones: userPool.availabilityZones
+  nodeTaints: ['arrow-collector/role=${userPool.role}:NoSchedule']
+  nodeLabels: { type: 'benchmark', 'arrow-collector/role': userPool.role }
+  upgradeSettings: { maxSurge: '33%' }
+  securityProfile: { sshAccess: 'Disabled' }
+}]
+
 resource aks 'Microsoft.ContainerService/managedClusters@2026-05-01' = {
   name: clusterName
   location: location
@@ -134,7 +155,7 @@ resource aks 'Microsoft.ContainerService/managedClusters@2026-05-01' = {
     supportPlan: aksConfig.skuTier == 'Premium' ? 'AKSLongTermSupport' : 'KubernetesOfficial'
     kubernetesVersion: aksConfig.version
     dnsPrefix: '${clusterName}-dns'
-    agentPoolProfiles: [{
+    agentPoolProfiles: concat([{
       name: pool.name
       osDiskSizeGB: 100
       enableAutoScaling: true
@@ -153,13 +174,15 @@ resource aks 'Microsoft.ContainerService/managedClusters@2026-05-01' = {
       nodeLabels: { type: 'general' }
       upgradeSettings: { maxSurge: '33%' }
       securityProfile: { sshAccess: 'Disabled' }
-    }]
+    }], userAgentPoolProfiles)
     aadProfile: { managed: true, enableAzureRBAC: true }
     oidcIssuerProfile: { enabled: true }
     securityProfile: { workloadIdentity: { enabled: true } }
     networkProfile: {
       networkPlugin: 'azure'
       networkPluginMode: 'overlay'
+      networkDataplane: aksConfig.?networkDataplane ?? 'azure'
+      networkPolicy: (aksConfig.?networkDataplane ?? 'azure') == 'cilium' ? 'cilium' : 'none'
       outboundType: 'loadBalancer'
       loadBalancerSku: 'Standard'
       loadBalancerProfile: { outboundIPPrefixes: { publicIPPrefixes: [{ id: egressIpv4Prefix.id }, { id: egressIpv6Prefix.id }] } }
@@ -198,7 +221,7 @@ resource operatorClusterAdminRole 'Microsoft.Authorization/roleAssignments@2022-
 
 resource qapFederatedCredential 'Microsoft.ManagedIdentity/userAssignedIdentities/federatedIdentityCredentials@2023-01-31' = {
   parent: sharedIdentity
-  name: 'azure-qap'
+  name: 'azure-qap-${clusterName}'
   dependsOn: [publisherFederatedCredentialsResource]
   properties: {
     audiences: ['api://AzureADTokenExchange']

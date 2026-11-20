@@ -21,9 +21,11 @@ arrowcol-catalog-client = { path = "../arrowcol-catalog-client" }
 arrowcol-flight = { path = "../arrowcol-flight" }
 arrowcol-protocol = { path = "../arrowcol-protocol" }
 arrowcol-routing = { path = "../arrowcol-routing" }
+arrowcol-tunables = { path = "../arrowcol-tunables" }
 async-trait = "0.1"
 axum = "0.8"
 base64 = "0.22"
+cpu-time = "1.0"
 futures = "0.3"
 humantime-serde = "1"
 linkme = "0.3"
@@ -43,6 +45,8 @@ tonic = "0.14"
 tracing.workspace = true
 
 [dev-dependencies]
+otel-arrow-dfe-core-nodes = { path = "../../submodules/otel-arrow/rust/otap-dataflow/crates/core-nodes", default-features = false, features = ["durable-buffer"] }
+otel-arrow-dfe-engine = { path = "../../submodules/otel-arrow/rust/otap-dataflow/crates/engine", features = ["test-utils"] }
 parquet = { version = "58.3", default-features = false, features = ["arrow"] }
 tempfile = "3"
 uuid = { version = "1", features = ["v5"] }

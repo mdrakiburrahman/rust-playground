@@ -123,11 +123,20 @@ export async function exportQapPoints(endpoint: string, observed: number, points
   }
 }
 
-/** The helper is read-only and allowed to finish its fixed deadline when stopping. */
+export interface QapObserver {
+  (): Promise<void>;
+  sampleFinal(): Promise<void>;
+}
+
+/** Stopping drains the read-only helper; final sampling remains explicit and fail-closed. */
 export function startQapObserver(options: {
   binary: string; cwd: string; env: NodeJS.ProcessEnv; results: string;
   endpoint: string; otlpEndpoint: string; intervalMs?: number;
-}): () => Promise<void> {
+}, dependencies: {
+  runHelper?: typeof runOwnedProcess; publish?: typeof exportQapPoints;
+} = {}): QapObserver {
+  const runHelper = dependencies.runHelper ?? runOwnedProcess;
+  const publish = dependencies.publish ?? exportQapPoints;
   const intervalMs = options.intervalMs ?? 10_000;
   if (!Number.isSafeInteger(intervalMs) || intervalMs <= 0) throw new Error('QAP observation interval must be positive');
   const stop = new AbortController();
@@ -136,37 +145,32 @@ export function startQapObserver(options: {
   let sequence = -1;
   let started = Date.now();
   let provenance: string | undefined;
-  const completed = (async () => {
-    const observations = path.join(options.results, 'qap-observations');
-    await mkdir(observations, { recursive: true });
-    while (!stop.signal.aborted) {
-      started = Date.now();
-      phase = 'artifact';
-      provenance = path.join(observations, String(++sequence));
-      await mkdir(provenance);
-      const output = path.join(provenance, 'observation.json');
-      phase = 'helper';
-      await runOwnedProcess(options.binary, ['observe-qap', '--endpoint', options.endpoint,
-        '--results', provenance, '--output', output, '--timeout', '30s'],
-      { cwd: options.cwd, env: options.env, timeoutMs: 40_000, forwardInterrupts: false });
-      phase = 'output';
-      const observation = qapPoints(JSON.parse(await readFile(output, 'utf8')) as unknown);
-      phase = 'export';
-      await exportQapPoints(options.otlpEndpoint, observation.observed, observation.points);
-      phase = 'artifact';
-      await appendFile(path.join(options.results, 'qap-observer.jsonl'), `${JSON.stringify({
-        observed_unix_ms: observation.observed, artifact: path.relative(options.results, output),
-        queries: path.relative(options.results, path.join(provenance, 'kusto-queries.jsonl')),
-        complete: observation.points.filter(point => point.name === 'qap_observation_complete'),
-        exported: true,
-      })}\n`);
-      try {
-        await delay(Math.max(0, intervalMs - (Date.now() - started)), undefined, { signal: stop.signal });
-      } catch (error) {
-        if (!(stop.signal.aborted && error instanceof Error && error.name === 'AbortError')) throw error;
-      }
-    }
-  })().catch(async error => {
+  let final = false;
+  const observations = path.join(options.results, 'qap-observations');
+  const observe = async (finalSample = false) => {
+    final = finalSample;
+    started = Date.now();
+    phase = 'artifact';
+    provenance = path.join(observations, String(++sequence));
+    await mkdir(provenance);
+    const output = path.join(provenance, 'observation.json');
+    phase = 'helper';
+    await runHelper(options.binary, ['observe-qap', '--endpoint', options.endpoint,
+      '--results', provenance, '--output', output, '--timeout', '30s'],
+    { cwd: options.cwd, env: options.env, timeoutMs: 40_000, forwardInterrupts: false });
+    phase = 'output';
+    const observation = qapPoints(JSON.parse(await readFile(output, 'utf8')) as unknown);
+    phase = 'export';
+    await publish(options.otlpEndpoint, observation.observed, observation.points);
+    phase = 'artifact';
+    await appendFile(path.join(options.results, 'qap-observer.jsonl'), `${JSON.stringify({
+      observed_unix_ms: observation.observed, artifact: path.relative(options.results, output),
+      queries: path.relative(options.results, path.join(provenance, 'kusto-queries.jsonl')),
+      complete: observation.points.filter(point => point.name === 'qap_observation_complete'),
+      exported: true, final,
+    })}\n`);
+  };
+  const reportFailure = async (error: unknown) => {
     failure = error;
     const observed = Date.now();
     let diagnostic: HelperDiagnostic | null = null;
@@ -180,21 +184,49 @@ export function startQapObserver(options: {
     }
     await appendFile(path.join(options.results, 'qap-observer.jsonl'), `${JSON.stringify({
       observed_unix_ms: observed, exported: false, error: 'QAP observation or OTLP export failed',
-      code: `${phase}_failed`, phase, sequence, elapsed_ms: Math.max(0, observed - started),
+      code: `${phase}_failed`, phase, sequence, final, elapsed_ms: Math.max(0, observed - started),
       helper_code: diagnostic?.code ?? null, queries_completed: diagnostic?.queries_completed ?? null,
       helper_elapsed_ms: diagnostic?.elapsed_ms ?? null, diagnostic_invalid: diagnosticInvalid,
       process: error instanceof OwnedProcessError ? error.outcome : null,
       supervisor_timed_out: error instanceof OwnedProcessError ? error.supervisor_timed_out : null,
     })}\n`);
-    await exportQapPoints(options.otlpEndpoint, observed, ['dataflow'].map(pool => ({
+    await publish(options.otlpEndpoint, observed, ['dataflow'].map(pool => ({
       name: 'qap_observation_complete', pool: pool as Pool, value: 0,
     })));
-  }).catch(error => {
-    failure = new AggregateError([failure, error], 'QAP failure reporting also failed');
-  });
-  return async () => {
-    stop.abort();
-    await completed;
+  };
+  const fail = async (error: unknown) => {
+    try {
+      await reportFailure(error);
+    } catch (reportError) {
+      failure = new AggregateError([failure, reportError], 'QAP failure reporting also failed');
+    }
+  };
+  const completed = (async () => {
+    await mkdir(observations, { recursive: true });
+    while (!stop.signal.aborted) {
+      await observe();
+      try {
+        await delay(Math.max(0, intervalMs - (Date.now() - started)), undefined, { signal: stop.signal });
+      } catch (error) {
+        if (!(stop.signal.aborted && error instanceof Error && error.name === 'AbortError')) throw error;
+      }
+    }
+  })().catch(fail);
+  const requireHealthy = () => {
     if (failure) throw new Error('Live QAP observation/export failed; qualification is incomplete', { cause: failure });
   };
+  let finalSample: Promise<void> | undefined;
+  const stopObserver = async () => {
+    stop.abort();
+    await completed;
+    await finalSample;
+    requireHealthy();
+  };
+  return Object.assign(stopObserver, {
+    async sampleFinal() {
+      await stopObserver();
+      finalSample ??= observe(true).catch(fail).then(requireHealthy);
+      await finalSample;
+    },
+  });
 }
