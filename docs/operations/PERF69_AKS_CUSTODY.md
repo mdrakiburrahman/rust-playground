@@ -166,8 +166,8 @@ namespace, or FIC writes around these entrypoints.
 | Before provisioning | `start-direct-setup CAMPAIGN OWNER` with planned `RunInventory` on stdin, then `capture-baseline OWNER 1`. If still untouched, `cancel-direct-setup OWNER 1` retains `setup_retired`. |
 | Original floor | `dispatch-direct-first-pool OWNER 1` against versioned idle `arrowe192` at `0/0/1`. It saves the original configuration hash, conditional PUT intent and unique pool ownership tag before one dispatch. `inspect-direct-first-pool OWNER 1` reads only the original operation URL. `unknown`, pending, or failed is not permission to change the floor. |
 | Namespace and FIC only | `provision-direct-namespace OWNER 1` writes the namespace, ServiceAccount and FIC attempt records before dispatch. It binds the original Kubernetes UIDs and accepts only definitive shared FIC ledger proof. `export-direct-fic OWNER 1 "$NEW_PRIVATE_FIC"` exports that exact record. No workloads or admission yet. |
-| Cancel before workload staging | `settle-direct-setup OWNER 1` requires the original positively settled floor operation and exact namespace/FIC identities. It refuses to delete a namespace containing workloads or storage, reuses the namespace deletion journal and FIC ledger, then submits one conditional floor reversal. A subsequent call can verify the retained reversal operation, baseline config, zero nodes and no attachments, then retain `setup_retired`. |
-| Held preparation | `stage-direct-held OWNER 1` verifies namespace/FIC and durably pins the boundary **before** the separately reviewed held manifests are applied. Exclude Namespace and ServiceAccount objects from that apply; use the existing scoped identities. `publish-direct-held-inventory OWNER 1` takes the observed inventory on stdin and rechecks every planned object UID and owner, namespace, and FIC ledger before publication. Use direct `prepare`, never ordinary `arm` or scored `finish`. |
+| Cancel before workload dispatch | `settle-direct-setup OWNER 1` requires the original settled floor operation and exact namespace/FIC identities. Before a fresh namespace DELETE it rechecks the current original ServiceAccount UID, creation nonce, and client ID, and refuses unknown namespace contents or storage. It reuses the UID-conditional namespace deletion journal and FIC ledger; a completed original deletion needs no live ServiceAccount. It then submits one conditional floor reversal. A subsequent call verifies the reversal operation, baseline config, zero nodes and no attachments, then retains `setup_retired`. |
+| Held preflight, not dispatch | `stage-direct-held OWNER 1` is read-only and reports `held_preflight_only_apply_blocked`. Stop here or cancel; do not apply manifests or try to publish new held inventory. A prior staging marker remains ambiguous and must not be cleared or used as cancellation evidence. Existing genuinely held arms still use the original recovery path. |
 | After selected interrupted preservation | With the original fenced campaign and token `2`, `settle-direct-held OWNER 2 CONTEXT "$RELEASE"` reopens the existing interrupted seal, Delta proof, namespace journal and completed FIC removal **read-only**. Only then can it conditionally reverse the original floor. A subsequent call verifies the original reversal and physical floor idle before `setup_retired`. |
 
 Neither a missing ACK nor a current `GET` of the expected pool proves
@@ -176,7 +176,11 @@ the ledger is incomplete, a replacement appears, or the provider cannot
 honor the ownership tag and `If-Match`, retain the campaign and original
 receipts; do not replay, retime, or restore based on inference. A staged
 workload without a genuine, recoverable held arm has no automatic retirement
-path. It must not be deleted under the earlier no-workload cancellation path.
+path. The new setup path stops before workload apply until the original
+dispatch and any already-created workloads can be settled without losing
+preservation evidence.
+Keep exclusive control of the namespace through deletion. Kubernetes applies
+the UID precondition to the namespace, not to the separate ServiceAccount.
 This scope reverses only `arrowe192`; it does not change `benchd64`, support
 pools, Kusto, or shared identity configuration.
 

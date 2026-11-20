@@ -86,7 +86,12 @@ function directSetupFixture(fault: 'none' | 'lost-pool-ack' | 'lost-intent-write
     minCount: 0, maxCount: 1, provisioningState: 'Succeeded', tags: { existing: 'retain' } };
   let poolEtag = '"pool-before"', ns: unknown = null, sa: unknown = null, fic: RunFicRecord | undefined;
   const effects: string[] = [];
-  let attachment = false, workloadDrift = false;
+  let attachment = false, workloadDrift = false, unknownContents = false, changedAccountAtDispatch = false, loseDeleteAck = false;
+  function changeAccount(field: 'uid' | 'nonce' | 'client-id') {
+    const metadata = (sa as { metadata: { uid: string; annotations: Record<string, string> } }).metadata;
+    if (field === 'uid') metadata.uid = 'c0ffee00-0000-4000-8000-000000000099';
+    else metadata.annotations[field === 'nonce' ? 'arrowcol-oat/setup-attempt' : 'azure.workload.identity/client-id'] = 'changed';
+  }
   const request: Azure['request'] = async (method, url, _resource, body, headers, _missingOk, idempotent) => {
     if (url === operation || url === reverseOperation) {
       assert.equal(method, 'GET');
@@ -159,12 +164,20 @@ function directSetupFixture(fault: 'none' | 'lost-pool-ack' | 'lost-intent-write
         if (fault === 'lost-fic-ack') throw new Error('injected unknown FIC effect');
         fic = record;
       },
-      removeNamespace: async (_azure, identity, _path, authority) => {
+      removeNamespace: async (_azure, identity, _path, authority, beforeDispatch) => {
         await authority.assertCurrent();
         assert.equal(identity.namespaceUid, namespaceUid);
         assert.equal((await store.read())!.state.directSetup?.namespaceCleanup, 'started');
+        if (ns === null) {
+          assert.ok(effects.includes('DELETE original Namespace'));
+          return;
+        }
+        if (changedAccountAtDispatch) changeAccount('uid');
+        await beforeDispatch();
         effects.push('DELETE original Namespace');
         ns = null;
+        sa = null;
+        if (loseDeleteAck) throw new Error('injected loss after durable namespace deletion');
       },
       removeFic: async (_azure, record, _path, authority) => {
         await authority.assertCurrent();
@@ -175,7 +188,10 @@ function directSetupFixture(fault: 'none' | 'lost-pool-ack' | 'lost-intent-write
       },
     },
     directSetupKubernetes: async (_server, args) => {
+      if (args[0] === 'api-resources') return ['pods', 'persistentvolumeclaims', 'configmaps', 'serviceaccounts', 'deployments.apps', 'jobs.batch'];
       const [, resource, name] = args;
+      if (resource?.includes(',')) return { kind: 'List', metadata: {}, items: unknownContents ?
+        [{ apiVersion: 'v1', kind: 'Secret', metadata: { name: 'foreign', namespace: namespace.name } }] : [] };
       if (resource === 'namespace') return ns;
       if (resource === 'serviceaccount') return sa;
       const resourceKinds: Record<string, string> = { pods: 'Pod', persistentvolumeclaims: 'PersistentVolumeClaim',
@@ -192,7 +208,13 @@ function directSetupFixture(fault: 'none' | 'lost-pool-ack' | 'lost-intent-write
       return { kind: resourceKinds[resource!] + 'List', metadata: {},
         items: resource === 'volumeattachments' && attachment ? [{ metadata: { name: 'still-attached' } }] : [] };
     } });
-  return { cli, store, calls, effects, pool: () => properties,
+  const seedLegacyStaging = async () => {
+    const current = (await store.read())!;
+    await store.write({ ...current.state, directSetup: { ...current.state.directSetup!, heldStaging: true } }, current.etag);
+  };
+  return { cli, store, calls, effects, pool: () => properties, changeAccount, seedLegacyStaging,
+    changeAccountBeforeDispatch: () => { changedAccountAtDispatch = true; },
+    loseDeleteCompletion: () => { loseDeleteAck = true; }, addUnknownContents: () => { unknownContents = true; },
     attach: () => { attachment = true; }, drift: () => { workloadDrift = true; } };
 }
 
@@ -314,12 +336,62 @@ test('direct setup CLI rejects floor reversal while storage attachment inventory
   assert.equal(calls.filter(action => action === 'PUT').length, 1);
 });
 
-test('direct setup CLI publishes only original FIC and observed held identities without authorizing or cleaning staged work', async () => {
-  const { cli, store } = directSetupFixture('original-operation');
+test('held preflight has no dispatch marker; cancellation remains available after producer expiry', async () => {
+  const { cli, store, calls, effects } = directSetupFixture('original-operation');
   await cli('start-direct-setup', campaignId, ownerId);
   await cli('dispatch-direct-first-pool', ownerId, '1');
   await cli('provision-direct-namespace', ownerId, '1');
+  const before = await store.read();
   await cli('stage-direct-held', ownerId, '1');
+  assert.deepEqual(await store.read(), before);
+  await assert.rejects(cli('publish-direct-held-inventory', ownerId, '1'), /dispatch-bound/);
+  const realNow = Date.now;
+  const now = before!.state.expiresAtMs + 1;
+  Date.now = () => now;
+  try {
+    await cli('settle-direct-setup', ownerId, '1');
+    await cli('settle-direct-setup', ownerId, '1');
+  } finally { Date.now = realNow; }
+  assert.equal((await store.read())!.state.status, 'setup_retired');
+  assert.equal(calls.filter(action => action === 'PUT').length, 2);
+  assert.deepEqual(effects.slice(-2), ['DELETE original Namespace', 'DELETE original FIC']);
+});
+
+for (const drift of ['uid', 'nonce', 'client-id', 'pre-dispatch', 'unknown-contents'] as const) {
+  test(`direct setup refuses namespace deletion on ${drift} drift`, async () => {
+    const { cli, store, calls, effects, changeAccount, changeAccountBeforeDispatch, addUnknownContents } = directSetupFixture('original-operation');
+    await cli('start-direct-setup', campaignId, ownerId);
+    await cli('dispatch-direct-first-pool', ownerId, '1');
+    await cli('provision-direct-namespace', ownerId, '1');
+    if (drift === 'pre-dispatch') changeAccountBeforeDispatch();
+    else if (drift === 'unknown-contents') addUnknownContents();
+    else changeAccount(drift);
+    await assert.rejects(cli('settle-direct-setup', ownerId, '1'), /ServiceAccount UID changed|object identity or attempt changed|unknown contents/);
+    assert.equal((await store.read())!.state.status, 'active');
+    assert.equal(calls.filter(action => action === 'PUT').length, 1);
+    assert.ok(effects.every(action => !action.startsWith('DELETE')));
+  });
+}
+
+test('direct setup consumes original completed deletion without requiring the removed ServiceAccount', async () => {
+  const { cli, store, effects, loseDeleteCompletion } = directSetupFixture('original-operation');
+  await cli('start-direct-setup', campaignId, ownerId);
+  await cli('dispatch-direct-first-pool', ownerId, '1');
+  await cli('provision-direct-namespace', ownerId, '1');
+  loseDeleteCompletion();
+  await assert.rejects(cli('settle-direct-setup', ownerId, '1'), /after durable namespace deletion/);
+  await cli('settle-direct-setup', ownerId, '1');
+  await cli('settle-direct-setup', ownerId, '1');
+  assert.equal(effects.filter(effect => effect === 'DELETE original Namespace').length, 1);
+  assert.equal((await store.read())!.state.status, 'setup_retired');
+});
+
+test('direct setup retains an ambiguous legacy staging marker and still supports its original inventory publication', async () => {
+  const { cli, store, seedLegacyStaging } = directSetupFixture('original-operation');
+  await cli('start-direct-setup', campaignId, ownerId);
+  await cli('dispatch-direct-first-pool', ownerId, '1');
+  await cli('provision-direct-namespace', ownerId, '1');
+  await seedLegacyStaging();
   await assert.rejects(cli('settle-direct-setup', ownerId, '1'), /unresolved|retain custody/);
   await cli('publish-direct-held-inventory', ownerId, '1');
   assert.equal((await store.read())!.state.mode, 'armed');
@@ -327,11 +399,11 @@ test('direct setup CLI publishes only original FIC and observed held identities 
 });
 
 test('direct setup CLI refuses a replaced staged workload before publishing inventory', async () => {
-  const { cli, store, drift } = directSetupFixture('original-operation');
+  const { cli, store, drift, seedLegacyStaging } = directSetupFixture('original-operation');
   await cli('start-direct-setup', campaignId, ownerId);
   await cli('dispatch-direct-first-pool', ownerId, '1');
   await cli('provision-direct-namespace', ownerId, '1');
-  await cli('stage-direct-held', ownerId, '1');
+  await seedLegacyStaging();
   drift();
   await assert.rejects(cli('publish-direct-held-inventory', ownerId, '1'), /UID or ownership changed/);
   assert.equal((await store.read())!.state.mode, 'observe');

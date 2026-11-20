@@ -125,15 +125,16 @@ export async function delete_run_namespace(azure: Azure, input: RunFicRecord, re
   return deleteNamespace(azure, record, receiptPath, authority, stopReceipt, journal);
 }
 export async function delete_owned_namespace(azure: Azure, input: RunNamespaceIdentity, receiptPath: string,
-  authority: RunCleanupAuthority, journal: NamespaceDeletionJournal<RunNamespaceIdentity, NamespaceStopReceipt>, bindBody = false): Promise<NamespaceStopReceipt> {
+  authority: RunCleanupAuthority, journal: NamespaceDeletionJournal<RunNamespaceIdentity, NamespaceStopReceipt>,
+  bindBody = false, beforeDispatch?: () => Promise<void>): Promise<NamespaceStopReceipt> {
   const record = parse_run_namespace_identity(input, azure.c);
   return deleteNamespace(azure, record, receiptPath, authority, (identity, observedAt) => ({
     schema_version: 1, namespace_record: identity, delete_succeeded: true, absence_confirmed: true, observed_at_unix_ms: observedAt,
-  }), journal, bindBody);
+  }), journal, bindBody, beforeDispatch);
 }
 async function deleteNamespace<T extends RunNamespaceIdentity, R extends { observed_at_unix_ms: number }>(azure: Azure,
   record: T, receiptPath: string, authority: RunCleanupAuthority, receiptFor: (record: T, observedAt: number) => R,
-  journal?: NamespaceDeletionJournal<T, R>, bindBody = false): Promise<R> {
+  journal?: NamespaceDeletionJournal<T, R>, bindBody = false, beforeDispatch?: () => Promise<void>): Promise<R> {
   return reset_lock(receiptPath, async () => {
     await authority.assertCurrent();
     const cluster = await azure.arm('GET', record.aksId, undefined, false, AKS_API);
@@ -171,6 +172,7 @@ async function deleteNamespace<T extends RunNamespaceIdentity, R extends { obser
       if (!bindBody) publish_private(requestPath, deletion);
       publish_private(intentPath, intent);
       await journal?.persist(intent, null);
+      await beforeDispatch?.();
       await authority.assertCurrent();
       const args = ['delete', '--raw', '/api/v1/namespaces/' + record.namespace, '-f'];
       const response = bindBody ? await run_tree_with_input(['kubectl', '--server', record.server, '--insecure-skip-tls-verify=false',

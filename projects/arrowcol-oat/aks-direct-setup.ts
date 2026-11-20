@@ -110,9 +110,11 @@ Promise<'not_dispatched' | 'unknown' | 'original_operation_pending' | 'original_
 }
 
 export async function readSetupKubernetes(server: string, args: string[]): Promise<unknown> {
+  const discovery = args[0] === 'api-resources';
   const response = await runtime.run_tree(['kubectl', '--server', server, '--insecure-skip-tls-verify=false',
-    '--request-timeout=15s', ...args, '--chunk-size=0', '-o', 'json'], 15);
-  if (response.returncode !== 0) throw new Error('Setup Kubernetes read is unresolved.');
+    '--request-timeout=15s', ...args, ...(discovery ? ['-o', 'name'] : ['--chunk-size=0', '-o', 'json'])], 15);
+  if (response.returncode !== 0 || response.stderr.trim()) throw new Error('Setup Kubernetes read is unresolved.');
+  if (discovery) return response.stdout.trim().split(/\r?\n/);
   return JSON.parse(response.stdout.trim() || 'null');
 }
 
@@ -124,9 +126,9 @@ async function createSetupObject(server: string, path: string, body: string): Pr
 }
 
 async function removeSetupNamespace(azure: Azure, identity: RunNamespaceIdentity, path: string,
-  authority: RunCleanupAuthority): Promise<void> {
+  authority: RunCleanupAuthority, beforeDispatch: () => Promise<void>): Promise<void> {
   const journal = create_namespace_deletion_journal(azure, identity, authority);
-  const receipt = await delete_owned_namespace(azure, identity, path, authority, journal, true);
+  const receipt = await delete_owned_namespace(azure, identity, path, authority, journal, true, beforeDispatch);
   await journal.complete(receipt);
   await journal.stopped();
 }
@@ -250,31 +252,44 @@ export async function cancelSetupNamespace(store: CampaignStore, azure: Azure, e
       !(fic.phase === 'deleted' && setup.namespaceCleanup === 'started') : fic !== undefined)
     throw new Error('Original FIC attempt has no matching settled ledger proof; never replay or adopt.');
   const assertUnused = async () => {
-    const check = [
-      ['pods', 'PodList'], ['persistentvolumeclaims', 'PersistentVolumeClaimList'],
-      ['deployments', 'DeploymentList'], ['replicasets', 'ReplicaSetList'], ['statefulsets', 'StatefulSetList'],
-      ['daemonsets', 'DaemonSetList'], ['jobs', 'JobList'], ['cronjobs', 'CronJobList'],
-      ['replicationcontrollers', 'ReplicationControllerList'],
-    ];
-    for (const [resource, kind] of check)
-      if (list(await read(plan.server, ['get', resource, '-n', plan.namespace]), kind).length)
-        throw new Error('Namespace has workloads or storage; use existing sealed held-arm recovery, not setup cancellation.');
+    const kinds = await read(plan.server, ['api-resources', '--namespaced=true', '--verbs=list', '--cached=false']);
+    if (!Array.isArray(kinds) || kinds.length > 256 || !kinds.every(kind => typeof kind === 'string' && /^[a-z0-9][a-z0-9.-]{0,252}$/.test(kind)) ||
+        !['pods', 'persistentvolumeclaims', 'configmaps', 'serviceaccounts', 'deployments.apps', 'jobs.batch'].every(kind => kinds.includes(kind)))
+      throw new Error('Original namespace contents cannot be fully listed.');
+    const all = await read(plan.server, ['get', [...new Set(kinds)].join(','), '-n', plan.namespace]);
+    if (!all || typeof all !== 'object' || !('kind' in all) || all.kind !== 'List' || !('items' in all) || !Array.isArray(all.items) ||
+        !('metadata' in all) || !all.metadata || typeof all.metadata !== 'object' || 'continue' in all.metadata && all.metadata.continue ||
+        all.items.some(item => item?.apiVersion !== 'v1' || item.metadata?.namespace !== plan.namespace ||
+          !(item.kind === 'ServiceAccount' && (item.metadata.name === 'default' ||
+            item.metadata.name === plan.serviceAccount && item.metadata.uid === setup.accountAttempt?.uid) ||
+            item.kind === 'ConfigMap' && item.metadata.name === 'kube-root-ca.crt')))
+      throw new Error('Namespace has unknown contents, workloads, or storage; no setup deletion is authorized.');
     if (list(await read(plan.server, ['get', 'persistentvolumes']), 'PersistentVolumeList')
       .some(volume => volume.spec?.claimRef?.namespace === plan.namespace))
       throw new Error('Original namespace has persistent storage; setup cancellation will not remove it.');
   };
-  if (setup.namespaceCleanup !== 'started') {
+  const assertOriginalObjects = async () => {
     if (responseUid(await read(plan.server, ['get', 'namespace', plan.namespace]), 'Namespace', plan.namespace,
         plan.runId, state.ownerId, attempt.nonce) !== attempt.uid)
       throw new Error('Original namespace UID changed.');
+    const account = setup.accountAttempt;
+    const observed = await read(plan.server, ['get', 'serviceaccount', plan.serviceAccount, '-n', plan.namespace, '--ignore-not-found']);
+    if (account ? responseUid(observed, 'ServiceAccount', plan.serviceAccount, plan.runId, state.ownerId, account.nonce,
+        { namespace: plan.namespace, clientId: plan.clientId }) !== account.uid : observed !== null)
+      throw new Error('Original ServiceAccount UID changed or ownership was not established.');
+  };
+  if (setup.namespaceCleanup !== 'started') {
     await assertUnused();
+    await assertOriginalObjects();
     current = await writeDirectSetupOnce(store, current, { ...current.state, directSetup: { ...setup, namespaceCleanup: 'started' } });
   }
-  if (await read(plan.server, ['get', 'namespace', plan.namespace, '--ignore-not-found']) !== null) await assertUnused();
   const identity: RunNamespaceIdentity = { version: 1, runId: plan.runId, namespace: plan.namespace,
     namespaceUid: attempt.uid, namespaceOwner: state.ownerId, aksId: plan.aksId, server: plan.server };
   await withPrivatePath(async dir => {
-    await provider.removeNamespace(azure, identity, join(dir, 'namespace.json'), authority);
+    await provider.removeNamespace(azure, identity, join(dir, 'namespace.json'), authority, async () => {
+      await assertUnused();
+      await assertOriginalObjects();
+    });
     if (fic) await provider.removeFic(azure, fic, join(dir, 'fic.json'), authority);
   });
   await authority.assertCurrent();
@@ -308,10 +323,10 @@ export async function stageHeldSetup(store: CampaignStore, azure: Azure, expecte
   const { state } = expected;
   if (!state.directSetup || state.directSetup.heldStaging || state.mode !== 'observe' ||
       await inspectFirstDirectPool(store, azure, expected) !== 'original_operation_succeeded')
-    throw new Error('Held workload staging is already pinned or the original pool is unsettled.');
+    throw new Error('Held workload dispatch is already possible or the original pool is unsettled.');
   await readOwnedFloor(azure, state.directSetup.firstPool!);
   await resolveSetupFic(store, azure, expected, injected, read);
-  await writeDirectSetupOnce(store, expected, { ...state, directSetup: { ...state.directSetup, heldStaging: true } });
+  await assertVersion(store, expected, true);
 }
 
 export async function verifySetupHeldInventory(store: CampaignStore, azure: Azure, expected: StoredCampaign, inv: RunInventory,

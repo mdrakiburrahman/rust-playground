@@ -1180,7 +1180,7 @@ async function publishHeldSetupInventory(store: CampaignStore, azure: import('..
   read?: typeof import('./aks-direct-setup.js').readSetupKubernetes): Promise<StoredCampaign> {
   const { state } = current, original = state.runInventory, setup = state.directSetup;
   if (!setup?.heldStaging || state.mode !== 'observe' || !original || !isInitialRunInventory(original))
-    throw new Error('Original held workload staging is not pinned, or its inventory is already published.');
+    throw new Error('No original dispatch-bound held setup to publish, or its inventory is already published. Do not apply workloads after preflight.');
   const after = validateRunInventory(input, state);
   const merged = mergeRunInventory(original, after);
   if (after.namespace.uid !== setup.namespaceAttempt?.uid || after.qap !== null || after.official_measurement ||
@@ -1383,7 +1383,7 @@ export async function campaignMain(args: string[], dependencies: {
       requireOwner(scope.state, campaignId!, Number(fencingTokenText), Date.now());
       const { stageHeldSetup } = await import('./aks-direct-setup.js');
       await stageHeldSetup(store, azure, scope, dependencies.directSetupNamespace, dependencies.directSetupKubernetes);
-      console.log(JSON.stringify({ ok: true, status: 'held_staging_pinned_not_admitted', campaignId: scope.state.campaignId }));
+      console.log(JSON.stringify({ ok: true, status: 'held_preflight_only_apply_blocked', campaignId: scope.state.campaignId }));
     } else if (action === 'publish-direct-held-inventory') {
       requireOwner(scope.state, campaignId!, Number(fencingTokenText), Date.now());
       const input = dependencies.runInventoryInput ?? await readRunInventoryStdin();
