@@ -200,6 +200,51 @@ writers; they do not supply Kusto CAS or fence unrelated administrators.
 Unknown mutation receipts and changed live bindings must stop without
 replay, rebinding or destructive repair.
 
+## Direct immutable AKS run
+
+The direct runner is a production entrypoint, not an OAT measurement engine or a readiness waiver. It requires the existing private bootstrap environment and ARM-hydrated stamp, the durable active/armed campaign and RunInventory, the exact ready run-FIC record, a private kubeconfig, and a private release file with six immutable image references. All private files must be regular files without group/other permissions; output directories must already exist with mode 0700. The explicit kubeconfig must agree with any configured process/environment value. No secrets are emitted.
+
+The release file has exactly this shape (all six references must be `repository@sha256:<64 lowercase hex>`; `revision` identifies the workload-image build source, not the successor controller commit):
+
+```json
+{
+  "revision": "<40-hex-image-source-commit>",
+  "schemaFingerprint": "<reviewed-schema-fingerprint>",
+  "images": {
+    "writer": "<repository>@sha256:<digest>",
+    "client": "<repository>@sha256:<digest>",
+    "maintenance": "<repository>@sha256:<digest>",
+    "sql": "<repository>@sha256:<digest>",
+    "router": "<repository>@sha256:<digest>",
+    "catalog": "<repository>@sha256:<digest>"
+  }
+}
+```
+
+```bash
+npx --no-install tsx infra/azure/benchmark-direct-cli.ts arm \
+  --env-file "$BOOTSTRAP_ENV" --stamp-config "$STAMP_CONFIG" \
+  --fic-record "$FIC_RECORD" --release-file "$DIRECT_RELEASE" \
+  --kubeconfig "$KUBECONFIG" --context "$KUBE_CONTEXT" --clients 1 \
+  --baseline-directory "$BASELINE_DIR"
+```
+
+`--clients` is an explicit workload-shape expectation; the existing armer re-reads the live Job, Pods and lifetimes and refuses a mismatch. The direct armer checks the durable campaign fence and FIC, release digests, startup config, transport and clock evidence, then writes the original arm record conditionally and verifies exact off-node bytes/ETag before any barrier release. A lost or ambiguous write/release is an error, not permission to retry.
+
+After the original measurement interval has ended, run the terminal path exactly once with the same authority, FIC, release, kubeconfig and context:
+
+```bash
+npx --no-install tsx infra/azure/benchmark-direct-cli.ts finish \
+  --env-file "$BOOTSTRAP_ENV" --stamp-config "$STAMP_CONFIG" \
+  --fic-record "$FIC_RECORD" --release-file "$DIRECT_RELEASE" \
+  --kubeconfig "$KUBECONFIG" --context "$KUBE_CONTEXT" \
+  --terminal-directory "$TERMINAL_DIR" --delta-directory "$DELTA_DIR"
+```
+
+`finish` reloads the immutable arm record from off-node custody, binds it to the current durable campaign and release, then uses the existing terminal-custody path to read original-run state, stop/fence workloads, capture raw logs and Delta history, reconcile terminal state, seal evidence, delete only the matching namespace UID, and remove only its recorded FIC. It does not create workload resources or mark throughput qualified. If any mutation outcome is unknown, stop and inspect the durable journal plus live state before any recovery action; never replay a command, delete by namespace name alone, or treat empty gauges as drain proof. The actual live run still requires separate execution clearance and all YAML `NOT RUN-READY` gates.
+
+The direct CLI does not rewrite CampaignStore cleanup milestones or mark RunInventory handoff complete. The authorized OAT controller must still reconcile the existing cleanup-step sequence with its durable cleanup envelope; do not fabricate a caller-supplied PASS or skip that handoff.
+
 ## Qualification
 
 Source-only review is not sufficient. After clearance, run the existing

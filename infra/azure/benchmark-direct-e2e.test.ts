@@ -5,6 +5,7 @@ import { delimiter, join } from 'node:path';
 import test, { type TestContext } from 'node:test';
 import { Azure, Config, Failure, HttpFailure, TAGS, canonical_json, runtime, type HttpReceipt } from './bootstrap.js';
 import { armDirectBenchmark, type DirectRelease } from './benchmark-direct-arm.js';
+import { runDirectBenchmarkCli } from './benchmark-direct-cli.js';
 import { directArmRecordPath, finishDirectTerminalCustody } from './benchmark-terminal-custody.js';
 import { prepare_run_fic, read_run_fic_record, run_fic_ledger_path } from './run_fic.js';
 import { ENCODING, MAX_RECORDS } from './benchmark-manifest-audit.js';
@@ -302,7 +303,7 @@ async function fixture(t: TestContext, fault: Fault) {
       annotations: { 'azure.workload.identity/client-id': uuid(80) } } }), stderr: '' };
   });
   await prepare_run_fic(azure, origin.runId, origin.namespace, 'arrowcol-oat', ficPath);
-  const campaignState = { status: 'active', campaignId: uuid(5), ownerId: origin.owner, fencingToken: 1,
+  const campaignState = { status: 'active', mode: 'armed', campaignId: uuid(5), ownerId: origin.owner, fencingToken: 1,
     heartbeatAtMs: now - 1, expiresAtMs: now + 3_600_000, runInventory: { campaign_id: uuid(5), owner_id: origin.owner,
       cell_run_id: origin.runId, fencing_token: 1, namespace: { name: origin.namespace, uid: origin.namespaceUid, owner_token: origin.owner },
       load_admission: 'authorized', fic: { state: 'observed' }, qap: null, cleanup: { handoff: { state: 'pending' } } } };
@@ -310,6 +311,24 @@ async function fixture(t: TestContext, fault: Fault) {
     return { state: campaignState, etag: '"campaign"' } as StoredCampaign; },
     write: async () => { throw new Error('Rehearsal must not rewrite producer authority'); } };
   const campaign = { store, campaignId: uuid(5), ownerId: origin.owner };
+  const cliEnvironment = { ...process.env, CAMPAIGN_ID: uuid(5), CAMPAIGN_OWNER_ID: origin.owner, CAMPAIGN_FENCING_TOKEN: '1' };
+  const envFile = join(directory, 'bootstrap.env'), stampFile = join(directory, 'stamp.yaml');
+  const releaseFile = join(directory, 'release.json'), kubeconfig = join(directory, 'kubeconfig');
+  fs.writeFileSync(envFile, '', { mode: 0o600 }); fs.writeFileSync(stampFile, 'fixture: true\n', { mode: 0o600 });
+  fs.writeFileSync(releaseFile, JSON.stringify(release), { mode: 0o600 }); fs.writeFileSync(kubeconfig, 'fixture', { mode: 0o600 });
+  const loadConfig = () => ({ config: c, env: cliEnvironment, positionals: [], once: false });
+  const cliArgs = (action: 'arm' | 'finish' = 'arm') => [action, '--env-file', envFile, '--stamp-config', stampFile,
+    '--fic-record', ficPath, '--release-file', releaseFile, '--kubeconfig', kubeconfig, '--context', 'fixture',
+    ...(action === 'arm' ? ['--clients', '1', '--baseline-directory', baseline] :
+      ['--terminal-directory', terminal, '--delta-directory', delta])];
+  const runCli = (action: 'arm' | 'finish' = 'arm', selectedStore: CampaignStore = store, extraArgs: string[] = []) => {
+    const args = cliArgs(action);
+    for (let index = 0; index < extraArgs.length; index += 2) {
+      const existing = args.indexOf(extraArgs[index]!);
+      if (existing >= 0) args.splice(existing, 2);
+    }
+    return runDirectBenchmarkCli([...args, ...extraArgs], { azure, store: selectedStore, loadConfig, log: () => {} });
+  };
   const arm = () => armDirectBenchmark(azure, campaign, origin, release, 'fixture', ficPath, baseline);
   const load = (armed: Awaited<ReturnType<typeof arm>>) => {
     const current = JSON.parse(fs.readFileSync(statePath, 'utf8'));
@@ -327,10 +346,35 @@ async function fixture(t: TestContext, fault: Fault) {
     if (fault === 'fic-replaced') credential!.systemData.createdAt = new Date(initialNow + 1000).toISOString();
     save(); record('load');
   };
-  return { arm, load, finish: (armed: Awaited<ReturnType<typeof arm>>) =>
+  return { arm, runCli, releaseFile, load, finish: (armed: Awaited<ReturnType<typeof arm>>) =>
     finishDirectTerminalCustody(azure, campaign, armed, 'fixture', terminal, delta, ficPath), events, stored, terminal, ficPath,
     namespaceAbsent: () => namespaceAbsent, credential: () => credential, control: () => control };
 }
+
+test('production direct CLI preserves durable arm readback before barrier release', async t => {
+  const f = await fixture(t, 'none');
+  const armed = await f.runCli();
+  assert.equal(armed.action, 'arm');
+  f.load(armed.arm);
+  const finished = await f.runCli('finish');
+  assert.equal(finished.action, 'finish');
+  const events = f.events(), index = (name: string) => events.findIndex(e => e.event === name);
+  assert.ok(index('arm-readback') >= 0 && index('arm-readback') < index('release'));
+  assert.ok(index('seal-readback') < index('namespace-delete'));
+  assert.ok(index('namespace-positive') < index('namespace-absence') && index('namespace-absence') < index('fic-delete'));
+});
+
+test('production direct CLI rejects missing authority and bad pins before mutation', async t => {
+  const f = await fixture(t, 'none');
+  await assert.rejects(f.runCli('arm', undefined, ['--unknown', 'value']), /unknown or inapplicable option/);
+  await assert.rejects(f.runCli('arm', undefined, ['--clients', '0']), /--clients must be an integer/);
+  const missing: CampaignStore = { read: async () => undefined, write: async () => { throw new Error('unexpected write'); } };
+  await assert.rejects(f.runCli('arm', missing), /No active campaign state exists/);
+  assert.equal(f.events().some(event => ['arm-write', 'release', 'barrier-attempt'].includes(event.event)), false);
+  fs.writeFileSync(f.releaseFile, JSON.stringify({ ...release, images: { ...release.images, router: 'mutable:tag' } }), { mode: 0o600 });
+  await assert.rejects(f.runCli(), /image digest is invalid/);
+  assert.equal(f.events().some(event => ['arm-write', 'release', 'barrier-attempt'].includes(event.event)), false);
+});
 
 for (const fault of ['none', 'clock-boundary', 'clock-skew', 'clock-missing', 'clock-namespace'] as const) test(`real direct custody lane: ${fault}`, async t => {
   const f = await fixture(t, fault), arm = await f.arm();

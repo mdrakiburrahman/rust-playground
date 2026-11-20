@@ -126,11 +126,13 @@
 # Reconcile all clients against identical bounds, physical publications and files; missing/truncated
 # logs, unresolved/ambiguous sends or incomplete Delta history invalidate the entire scored window.
 # Prove load stopped, collector drained and the fenced owner/namespace UID match before cleanup; keep
-# the run-FIC record. Existing run_fic.ts delete_run_namespace uses a durable authority and UID-fenced
-# deletion journal, but no reviewed direct-kubectl adapter or definitive drain proof is supplied here.
-# Those are blockers: do not substitute bare namespace deletion or assume empty gauges prove drain.
-# After proven namespace absence, the existing cleanup-run-fic command can remove only the recorded FIC:
-# npx --no-install tsx infra/azure/bootstrap.ts cleanup-run-fic --mode stamped --env-file "$BOOTSTRAP_ENV" --stamp-config "$STAMP_CONFIG" --run-id "$UUID" --record "$FIC_RECORD"
+# the run-FIC record. The production benchmark-direct-cli.ts `arm` path validates durable producer
+# authority, the ready FIC, immutable pins, startup transport/clock evidence and off-node arm readback
+# before releasing the barrier. Its `finish` path uses benchmark-terminal-custody.ts for original-run
+# capture, terminal/drain reconciliation, evidence sealing, UID/owner-fenced namespace deletion and
+# removal of only the recorded FIC. Follow docs/operations/OAT_RUN_AUTHORITY.md for exact commands.
+# This wiring does not waive any NOT RUN-READY gates or authorize a live run. On unknown mutation
+# outcomes stop and reconcile durable/live evidence; never replay, bare-delete or infer drain from gauges.
 # Local NVMe is a bounded 256 Gi staging area via TMPDIR, not durable storage or an acknowledgment.
 # No QAP/Kusto consumer is deployed here. Keep cluster-scoped cleanup separate from namespace/FIC cleanup.
 # After drain, remove the StorageClass only if exact run-id and owner-token labels match and no PVC/PV uses it. Never remove the shared ACS extension as routine run cleanup. Preserve Delta objects and verify pools physically return to zero.
