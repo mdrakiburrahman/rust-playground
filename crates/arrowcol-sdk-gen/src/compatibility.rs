@@ -105,7 +105,9 @@ fn verify_wire_json(previous: &FileDescriptorSet, current: &FileDescriptorSet) -
 
 fn descriptor_messages(descriptors: &FileDescriptorSet) -> SdkGenResult<BTreeMap<String, DescriptorProto>> {
     let mut output = BTreeMap::new();
-    for file in &descriptors.file {
+    // The pinned option/WKT imports are validated byte-for-byte on bundle load.
+    // Compatibility policy concerns the table, not the descriptor metamodel.
+    for file in descriptors.file.iter().filter(|file| file.name() == "schema.proto") {
         validate_file(file)?;
         let package = file.package.as_deref().unwrap_or_default();
         for message in &file.message_type {
@@ -116,7 +118,7 @@ fn descriptor_messages(descriptors: &FileDescriptorSet) -> SdkGenResult<BTreeMap
 }
 
 fn validate_file(file: &FileDescriptorProto) -> SdkGenResult<()> {
-    if file.syntax.as_deref() != Some("proto2") {
+    if file.syntax.as_deref().is_some_and(|syntax| syntax != "proto2") {
         return Err(SdkGenError::Artifact(format!(
             "generated descriptor {} must use proto2 syntax",
             file.name.as_deref().unwrap_or("<unnamed>")

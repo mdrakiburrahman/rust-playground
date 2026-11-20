@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Arrowcol | Catalogue Explorer</title>
+  <link rel="stylesheet" href="/style.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <header><span class="brand">A<span class="brand-dot">.</span></span><strong>Arrowcol</strong><span class="header-divider"></span><span>Developer workspace</span><span class="local-badge">LOCAL PREVIEW</span></header>
+  <div class="workspace">
+    <aside class="rail"><span class="rail-icon active">C</span><span class="rail-caption">Catalog</span><span class="rail-icon">W</span><span class="rail-caption">Workflows</span></aside>
+    <aside class="sidebar">
+      <div class="sidebar-title">Catalog Explorer</div>
+      <label for="registry">REGISTRY</label><select id="registry" aria-label="Registry"></select>
+      <p id="registry-note" class="muted small"></p>
+      <input id="filter" type="search" placeholder="Find tables..." aria-label="Find tables">
+      <div class="tree-heading"><span>Catalogues</span><button id="refresh" class="text-button" title="Refresh catalogue">Refresh</button></div>
+      <nav id="tree" aria-label="Catalogue tree"></nav>
+      <div class="sidebar-footer">One contract. Two SDKs.<br><span class="muted">Rust + TypeScript / Arrow Flight</span></div>
+    </aside>
+    <main>
+      <div class="page-heading"><div><div class="eyebrow">DATA &amp; CONTRACTS</div><h1>Catalogue Explorer</h1><p class="muted">Browse committed schemas and build versioned client SDKs.</p></div><button id="add-table" class="primary" disabled>+ Add table</button></div>
+      <div id="notice" role="status" hidden></div>
+      <nav class="tabs" aria-label="Explorer views"><button id="catalog-tab" class="selected">Overview</button><button id="runs-tab">Workflow runs <span id="run-count">0</span></button></nav>
+      <section id="catalog-view"><div id="detail"></div></section>
+      <section id="runs-view" hidden><div class="section-title"><h2>Contract builds</h2><span class="muted">Durable history / all registries</span></div><div id="runs"></div><pre id="logs" hidden aria-label="Workflow logs"></pre></section>
+    </main>
+  </div>
+  <dialog id="create-dialog">
+    <form id="create-form">
+      <div class="dialog-heading"><div><div class="eyebrow">NEW CONTRACT</div><h2>Create a table</h2></div><button type="button" id="close-dialog" class="text-button">Close</button></div>
+      <p id="create-registry" class="muted"></p>
+      <div class="identity-fields">
+        <label>Catalogue<input id="catalog-name" value="telemetry" pattern="[A-Za-z_][A-Za-z0-9_]*" required></label>
+        <label>Schema<input id="schema-name" value="prod" pattern="[A-Za-z_][A-Za-z0-9_]*" required></label>
+        <label>Table<input id="table-name" value="events" pattern="[A-Za-z_][A-Za-z0-9_]*" required></label>
+      </div>
+      <div class="section-title"><h3>Columns</h3><button type="button" id="add-column" class="text-button">+ Add column</button></div>
+      <table class="editor-table"><thead><tr><th>Name</th><th>Type</th><th>Nullable</th><th></th></tr></thead><tbody id="column-rows"></tbody></table>
+      <div class="section-title"><h3>Table properties</h3><button type="button" id="add-property" class="text-button">+ Add property</button></div>
+      <label for="property-kind">Property to add</label><select id="property-kind"></select>
+      <p class="small muted" id="property-source"></p>
+      <div id="property-rows"></div>
+      <label for="ddl">Generated DDL preview</label>
+      <textarea id="ddl" rows="7" spellcheck="false" readonly aria-label="DDL preview"></textarea>
+      <p class="muted small">The Rust catalogue parser validates this definition. Preparation freezes identities, schema, properties and managed location without registering a table. Policy metadata does not add enforcement.</p>
+      <div class="pipeline"><span>Prepare</span><span>Generate</span><span>Verify</span><span>Stage</span><span>Register exact candidate</span><span>Publish</span></div>
+      <p id="form-error" role="alert"></p>
+      <div class="dialog-footer"><span class="muted small">Registers only after both SDKs pass verification.</span><button id="create-submit" class="primary" type="submit">Create and build</button></div>
+    </form>
+  </dialog>
+</body>
+</html>

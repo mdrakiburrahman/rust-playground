@@ -1,0 +1,36 @@
+syntax = "proto2";
+package arrowcol.codegen.v1;
+
+import "google/protobuf/descriptor.proto";
+
+enum Operation {
+  OPERATION_UNSPECIFIED = 0;
+  ARROW_FLIGHT_DO_PUT = 1;
+}
+
+message MetadataBinding {
+  required string key = 1;
+  required string value = 2;
+}
+
+message ApiBinding {
+  required Operation operation = 1;
+  required string grpc_path = 2;
+  repeated string descriptor_path = 3;
+  repeated MetadataBinding metadata = 4;
+}
+
+// The existing canonical artifact_manifest_version=1 JSON is the versioned
+// lossless catalogue IR. Carrying it here avoids inferring Arrow types, nullability
+// or stable identities from lossy protobuf row types, or reading ambient files.
+// The plugin validates the IR against every row/option/dependency descriptor.
+message CompilerContract {
+  required uint32 format_version = 1;
+  required bytes catalog_manifest_json = 2;
+  required ApiBinding api = 3;
+  required string option_definitions_sha256 = 4;
+}
+
+extend google.protobuf.FileOptions {
+  optional CompilerContract compiler = 51000;
+}

@@ -15,6 +15,6 @@ pub use artifact::{ArtifactBundle, ArtifactPaths};
 pub use catalog::{bundle_from_snapshot, catalog_artifacts, hydrate_catalog};
 pub use compatibility::{CompatibilityReport, verify_compatibility};
 pub use error::{SdkGenError, SdkGenResult};
-pub use generate::{GenerationResult, check_generated_sdk, generate_sdk, write_artifact_bundle};
+pub use generate::{GenerationResult, check_generated_sdk, generate_sdk, render_sdk_files, write_artifact_bundle};
 pub use package::{PackageResult, package_generated_sdk};
 pub use path::SafeOutputPath;

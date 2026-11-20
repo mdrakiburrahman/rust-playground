@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
 };
@@ -46,6 +47,7 @@ pub struct ArtifactBundle {
     arrow_schema: Vec<u8>,
     protobuf_descriptor: Vec<u8>,
     protobuf_source: Vec<u8>,
+    protobuf_imports: BTreeMap<String, Vec<u8>>,
     descriptors: FileDescriptorSet,
 }
 
@@ -72,6 +74,7 @@ impl ArtifactBundle {
         let protobuf_descriptor = read_regular_file(&paths.protobuf_descriptor)?;
         let protobuf_source = read_regular_file(&paths.protobuf_source)?;
         let decoded: ArtifactManifest = serde_json::from_slice(&manifest)?;
+        validate_properties(&decoded.schema)?;
         if decoded.artifact_manifest_version != 1 {
             return Err(SdkGenError::Artifact(format!(
                 "unsupported artifact manifest version {}",
@@ -96,6 +99,35 @@ impl ArtifactBundle {
 
         let expected =
             generate_descriptor_artifacts(&decoded.schema).map_err(|error| SdkGenError::Artifact(error.to_string()))?;
+        let protobuf_imports = imports(&expected)?;
+        let source_directory = paths
+            .protobuf_source
+            .parent()
+            .ok_or_else(|| SdkGenError::Artifact("protobuf source must have a parent directory".to_owned()))?;
+        for (relative, expected_bytes) in &protobuf_imports {
+            let path = source_directory.join(relative);
+            // These fixed import paths can traverse directories, unlike the
+            // original flat bundle. Do not follow symlinked import directories.
+            let mut parent = path.parent();
+            while let Some(directory) = parent {
+                if directory == source_directory {
+                    break;
+                }
+                let metadata = fs::symlink_metadata(directory).map_err(|error| SdkGenError::io(directory, error))?;
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(SdkGenError::Artifact(format!(
+                        "protobuf import parent must be a real directory: {}",
+                        directory.display()
+                    )));
+                }
+                parent = directory.parent();
+            }
+            if read_regular_file(&path)? != *expected_bytes {
+                return Err(SdkGenError::Artifact(format!(
+                    "protobuf import {relative} is not the canonical catalog artifact"
+                )));
+            }
+        }
         if expected.manifest() != manifest {
             return Err(SdkGenError::Artifact(
                 "manifest bytes are not the canonical catalog artifact".to_owned(),
@@ -141,6 +173,7 @@ impl ArtifactBundle {
             arrow_schema,
             protobuf_descriptor,
             protobuf_source,
+            protobuf_imports,
             descriptors,
         })
     }
@@ -151,6 +184,7 @@ impl ArtifactBundle {
     ///
     /// Returns an error when catalog descriptor generation fails.
     pub fn from_schema(schema: CatalogSchemaVersion) -> SdkGenResult<Self> {
+        validate_properties(&schema)?;
         let rebuilt = CatalogSchemaVersion::new(
             schema.table_id(),
             schema.identity().clone(),
@@ -168,6 +202,7 @@ impl ArtifactBundle {
         let generated =
             generate_descriptor_artifacts(&schema).map_err(|error| SdkGenError::Artifact(error.to_string()))?;
         let descriptors = FileDescriptorSet::decode(generated.protobuf_descriptor())?;
+        let protobuf_imports = imports(&generated)?;
         Ok(Self {
             schema,
             manifest: generated.manifest().to_vec(),
@@ -178,6 +213,7 @@ impl ArtifactBundle {
                 .map_err(|error| SdkGenError::Artifact(error.to_string()))?
                 .into_bytes(),
             descriptors,
+            protobuf_imports,
         })
     }
 
@@ -211,11 +247,36 @@ impl ArtifactBundle {
         &self.protobuf_source
     }
 
-    /// Returns the decoded protobuf descriptor set.
+    /// Returns all source imports required beside `schema.proto`, by relative path.
+    #[must_use]
+    pub const fn protobuf_imports(&self) -> &BTreeMap<String, Vec<u8>> {
+        &self.protobuf_imports
+    }
+
+    /// Returns the decoded protobuf descriptor set for structural code generation.
+    ///
+    /// `prost_types` does not retain custom option values. Use the original
+    /// `protobuf_descriptor` bytes and `arrowcol_catalog::protobuf_table_metadata`
+    /// to recover metadata, rather than re-encoding this structural view.
     #[must_use]
     pub const fn descriptors(&self) -> &FileDescriptorSet {
         &self.descriptors
     }
+}
+
+fn validate_properties(schema: &CatalogSchemaVersion) -> SdkGenResult<()> {
+    arrowcol_props::validate_table_properties(&schema.metadata().properties)
+        .map_err(|error| SdkGenError::Artifact(error.to_string()))
+}
+
+fn imports(artifacts: &arrowcol_catalog::DescriptorArtifacts) -> SdkGenResult<BTreeMap<String, Vec<u8>>> {
+    Ok(artifacts
+        .protobuf_sources()
+        .map_err(|error| SdkGenError::Artifact(error.to_string()))?
+        .into_iter()
+        .filter(|(path, _)| path != "schema.proto")
+        .map(|(path, source)| (path, source.into_bytes()))
+        .collect())
 }
 
 #[derive(Deserialize)]

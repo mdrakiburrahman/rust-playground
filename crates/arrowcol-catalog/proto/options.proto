@@ -1,0 +1,47 @@
+syntax = "proto2";
+
+package arrowcol.metadata.v1;
+
+import "google/protobuf/descriptor.proto";
+
+// Lossless table metadata, independent of manifest.json and the Arrow schema.
+// Properties retain their original spelling and values, in sorted key order.
+// Reserved properties are validated centrally by arrowcol-props before export.
+// Other properties are inert annotations, not runtime policy or forwarding rules.
+message TableMetadata {
+  optional string provider = 1;
+  optional string location = 2;
+  optional string comment = 3;
+  repeated string partition_columns = 4;
+  repeated TableProperty properties = 5;
+}
+
+message TableProperty {
+  optional string key = 1;
+  optional string value = 2;
+}
+
+// Demonstration metadata only. No collector, writer or routing behavior is
+// selected by this value. Add vocabulary here, never in a Rust/TypeScript list.
+enum IngestTier {
+  INGEST_TIER_STANDARD = 0;
+  INGEST_TIER_BULK = 1;
+  INGEST_TIER_PRIORITY = 2;
+}
+
+// Optional scalar/enum MessageOptions become table DDL properties under
+// protobuf.<fully-qualified-extension-name>. Native proto2 defaults are
+// materialized at admission and options apply only to the root row message.
+extend google.protobuf.MessageOptions {
+  optional IngestTier ingest_tier = 50001 [default = INGEST_TIER_STANDARD];
+}
+
+// Applies to the one table represented by a schema contract file.
+// Example: option (arrowcol.metadata.v1.table) = {
+//   provider: "delta"
+//   properties: { key: "team.owner" value: "telemetry" }
+// };
+// Presence is significant: absent and explicitly empty location/comment differ.
+extend google.protobuf.FileOptions {
+  optional TableMetadata table = 50000;
+}

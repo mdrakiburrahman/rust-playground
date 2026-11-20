@@ -29,7 +29,13 @@ fn every_spark_decimal_mapping_agrees_with_manifest_and_real_proto_contract() ->
     let descriptor = FileDescriptorSet::decode(artifacts.protobuf_descriptor())?;
     let manifest: serde_json::Value = serde_json::from_slice(artifacts.manifest())?;
     let source = artifacts.protobuf_source()?;
-    let fields = &descriptor.file[0].message_type[0].field;
+    let fields = &descriptor
+        .file
+        .iter()
+        .find(|file| file.name() == "schema.proto")
+        .ok_or_else(|| anyhow::anyhow!("missing schema contract"))?
+        .message_type[0]
+        .field;
     assert_eq!(fields.len(), columns.len());
     for (index, field) in schema.fields().iter().enumerate() {
         assert_eq!(field.mapping().protobuf(), ProtobufType::String, "{}", field.name());

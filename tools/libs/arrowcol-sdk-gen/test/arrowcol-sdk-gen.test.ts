@@ -50,8 +50,8 @@ test('compatibility compares consecutive versions and runs the real Buf WIRE_JSO
   assert.deepEqual(runner.calls[1], {
     command: 'npx',
     args: [
-      '--no-install', 'buf', 'breaking', `${evolvedFixtureArtifacts}/schema.proto`,
-      '--against', `${fixtureArtifacts}/schema.proto`, '--config', 'buf.yaml',
+      '--no-install', 'buf', 'breaking', `${evolvedFixtureArtifacts}/descriptor.pb#format=binpb`,
+      '--against', `${fixtureArtifacts}/descriptor.pb#format=binpb`, '--config', 'buf.yaml',
     ],
   });
 });

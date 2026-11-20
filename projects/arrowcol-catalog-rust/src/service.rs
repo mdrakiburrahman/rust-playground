@@ -18,7 +18,8 @@ use arrow_flight::{
 use arrowcol_catalog::{
     CatalogError, CatalogErrorCode, CatalogResult, CatalogSchemaVersion, DdlCommand, DdlCompletion,
     DdlCompletionDisposition, DdlParser, FlightSqlDdlHandler, FlightSqlDdlRequest, MemoryCatalogStore, SchemaVersion,
-    SparkStatement, deterministic_table_id, generate_descriptor_artifacts, next_protobuf_field_number,
+    SparkStatement, deterministic_table_id, generate_descriptor_artifacts, materialize_protobuf_properties,
+    next_protobuf_field_number,
 };
 use arrowcol_catalog_client::{identity_from_request, rpc, table_request};
 use arrowcol_protocol::TableIdentity;
@@ -365,7 +366,50 @@ impl CatalogService {
         })
     }
 
+    fn prepared_schema(&self, sql: &str) -> Result<CatalogSchemaVersion> {
+        let DdlCommand::CreateTable(create) = self.parser.parse(sql)? else {
+            bail!("candidate requires exactly one CREATE TABLE");
+        };
+        if create.if_not_exists() || create.metadata().location.is_some() {
+            bail!("candidate requires a new managed table without IF NOT EXISTS or LOCATION");
+        }
+        reject_internal(create.metadata().properties.keys())?;
+        arrowcol_props::validate_table_properties(&create.metadata().properties)?;
+        let mut metadata = create.metadata().clone();
+        metadata.properties = materialize_protobuf_properties(&metadata.properties)?;
+        let normalized = CatalogSchemaVersion::new(
+            deterministic_table_id(create.identity()),
+            create.identity().clone(),
+            SchemaVersion::FIRST,
+            create.fields().to_vec(),
+            create.canonical_ddl(),
+        )?
+        .with_metadata(metadata)?
+        .to_spark_sql()?;
+        let DdlCommand::CreateTable(create) = self.parser.parse(&normalized)? else {
+            bail!("normalized candidate is not CREATE TABLE");
+        };
+        let mut metadata = create.metadata().clone();
+        metadata.location = Some(self.default_location(create.identity()));
+        Ok(CatalogSchemaVersion::new(
+            deterministic_table_id(create.identity()),
+            create.identity().clone(),
+            SchemaVersion::FIRST,
+            create.fields().to_vec(),
+            create.canonical_ddl(),
+        )?
+        .with_metadata(metadata)?)
+    }
+
     async fn apply_sql(&self, sql: &str) -> Result<Option<DdlCompletion>> {
+        self.apply_sql_candidate(sql, None).await
+    }
+
+    async fn apply_sql_candidate(
+        &self,
+        sql: &str,
+        candidate: Option<&CatalogSchemaVersion>,
+    ) -> Result<Option<DdlCompletion>> {
         let statement = self.parser.parse_statement(sql)?;
         let _ddl = self.ddl_lock.lock().await;
         if let SparkStatement::CreateNamespace(namespace) = &statement {
@@ -401,6 +445,15 @@ impl CatalogService {
                     arrowcol_props::validate_table_properties(&create_ast.metadata.properties)?;
                     if let Some(current) = &current {
                         let schema = current.history.last().context("empty catalog history")?;
+                        if let Some(candidate) = candidate {
+                            if current.history.first() == Some(candidate) {
+                                return Ok(Some(DdlCompletion::from_committed(
+                                    candidate,
+                                    DdlCompletionDisposition::AlreadyApplied,
+                                )));
+                            }
+                            bail!("candidate conflicts with the registered table identity, schema or policy");
+                        }
                         let DdlCommand::CreateTable(create) = self.parser.parse(sql)? else {
                             bail!("invalid CREATE");
                         };
@@ -438,6 +491,9 @@ impl CatalogService {
                         create.canonical_ddl(),
                     )?
                     .with_metadata(metadata)?;
+                    if candidate.is_some_and(|candidate| candidate != &schema) {
+                        bail!("candidate differs from the exact schema and policy to be committed");
+                    }
                     (
                         vec![schema],
                         location,
@@ -825,6 +881,82 @@ type EventStream = Pin<Box<dyn Stream<Item = Result<rpc::ChangeEvent, Status>> +
 #[async_trait]
 impl rpc::schema_catalog_server::SchemaCatalog for CatalogService {
     type WatchStream = EventStream;
+
+    async fn prepare_table(
+        &self,
+        request: Request<rpc::PrepareTableRequest>,
+    ) -> Result<Response<rpc::TableSnapshot>, Status> {
+        let schema = self
+            .prepared_schema(&request.into_inner().ddl)
+            .map_err(|error| Status::invalid_argument(format!("{error:#}")))?;
+        let _ddl = self.ddl_lock.lock().await;
+        if self.state.lock().await.tables.contains_key(schema.identity()) {
+            return Err(Status::already_exists(
+                "table already exists; rebuild a committed version",
+            ));
+        }
+        let location = schema
+            .metadata()
+            .location
+            .clone()
+            .ok_or_else(|| Status::internal("prepared schema lacks a managed location"))?;
+        if read_delta(&location)
+            .await
+            .map_err(|error| Status::internal(format!("{error:#}")))?
+            .is_some()
+        {
+            return Err(Status::already_exists(
+                "managed location already contains Delta history",
+            ));
+        }
+        let table = Table {
+            history: vec![schema],
+            location,
+            delta_version: 0,
+        };
+        let mut snapshot = table_snapshot(&table, &position(&*self.state.lock().await))?;
+        snapshot.position = None;
+        Ok(Response::new(snapshot))
+    }
+
+    async fn promote_table(
+        &self,
+        request: Request<rpc::PromoteTableRequest>,
+    ) -> Result<Response<rpc::TableSnapshot>, Status> {
+        let candidate = request
+            .into_inner()
+            .candidate
+            .ok_or_else(|| Status::invalid_argument("missing candidate"))?;
+        let history: Vec<CatalogSchemaVersion> = serde_json::from_slice(&candidate.schema_history_json)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let [schema] = history.as_slice() else {
+            return Err(Status::invalid_argument("candidate must contain exactly version 1"));
+        };
+        let expected = self
+            .prepared_schema(schema.canonical_ddl())
+            .map_err(|error| Status::invalid_argument(format!("{error:#}")))?;
+        if schema != &expected {
+            return Err(Status::invalid_argument(
+                "candidate IDs, schema or policy differ from authoritative preparation",
+            ));
+        }
+        let table = Table {
+            history: vec![expected],
+            location: self.default_location(schema.identity()),
+            delta_version: 0,
+        };
+        let mut snapshot = table_snapshot(&table, &position(&*self.state.lock().await))?;
+        snapshot.position = None;
+        if candidate != snapshot {
+            return Err(Status::invalid_argument(
+                "candidate artifacts or metadata are inconsistent",
+            ));
+        }
+        self.apply_sql_candidate(schema.canonical_ddl(), Some(schema))
+            .await
+            .map_err(|error| Status::failed_precondition(format!("{error:#}")))?;
+        self.get_table(Request::new(table_request(schema.identity()))).await
+    }
 
     async fn get_current_event_id(&self, _: Request<rpc::Empty>) -> Result<Response<rpc::EventPosition>, Status> {
         Ok(Response::new(position(&*self.state.lock().await)))

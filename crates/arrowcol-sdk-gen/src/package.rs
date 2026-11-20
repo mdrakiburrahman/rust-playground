@@ -86,6 +86,7 @@ pub fn package_generated_sdk(input: &SafeOutputPath, archive: &SafeOutputPath) -
     let mut file = encoder.finish().map_err(|error| SdkGenError::io(&staging, error))?;
     file.flush().map_err(|error| SdkGenError::io(&staging, error))?;
     file.sync_all().map_err(|error| SdkGenError::io(&staging, error))?;
+    drop(file);
 
     if fs::symlink_metadata(archive_path).is_ok() {
         let archive_metadata =

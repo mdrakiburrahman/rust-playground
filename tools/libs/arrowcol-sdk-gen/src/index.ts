@@ -115,8 +115,8 @@ export class SdkGenerationTool {
         ]),
         this.#command('npx', [
           '--no-install', 'buf', 'breaking',
-          `${evolvedFixtureArtifacts}/schema.proto`,
-          '--against', `${fixtureArtifacts}/schema.proto`,
+          `${evolvedFixtureArtifacts}/descriptor.pb#format=binpb`,
+          '--against', `${fixtureArtifacts}/descriptor.pb#format=binpb`,
           '--config', 'buf.yaml',
         ]),
       ],

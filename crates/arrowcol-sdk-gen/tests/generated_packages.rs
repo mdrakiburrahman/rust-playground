@@ -2,7 +2,7 @@ mod common;
 
 use std::{fs, process::Stdio};
 
-use arrowcol_sdk_gen::generate_sdk;
+use arrowcol_sdk_gen::{ArtifactBundle, generate_sdk};
 
 use common::{assert_success, bundle, command, reset, safe, workspace};
 
@@ -10,7 +10,17 @@ use common::{assert_success, bundle, command, reset, safe, workspace};
 fn generated_rust_compiles_and_typescript_typechecks_and_executes() {
     let output = safe("target/arrowcol-sdk-gen-tests/generated-packages");
     reset(&output);
-    generate_sdk(&bundle(), &output).unwrap_or_else(|error| panic!("generated package creation failed: {error}"));
+    let schema = bundle().schema().clone();
+    let mut metadata = schema.metadata().clone();
+    metadata.properties = arrowcol_catalog::materialize_protobuf_properties(&metadata.properties)
+        .unwrap_or_else(|error| panic!("native defaults: {error}"));
+    let bundle = ArtifactBundle::from_schema(
+        schema
+            .with_metadata(metadata)
+            .unwrap_or_else(|error| panic!("metadata: {error}")),
+    )
+    .unwrap_or_else(|error| panic!("native option artifacts: {error}"));
+    generate_sdk(&bundle, &output).unwrap_or_else(|error| panic!("generated package creation failed: {error}"));
 
     let rust_manifest = output.absolute().join("rust/Cargo.toml");
     let cargo_target = workspace().join("target/arrowcol-sdk-gen-tests/generated-cargo-target");

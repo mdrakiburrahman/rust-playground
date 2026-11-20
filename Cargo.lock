@@ -939,6 +939,20 @@ name = "arrowcol-props"
 version = "0.1.0"
 
 [[package]]
+name = "arrowcol-protoc"
+version = "0.1.0"
+dependencies = [
+ "arrowcol-catalog",
+ "arrowcol-sdk-gen",
+ "clap",
+ "prost 0.14.4",
+ "prost-build 0.14.4",
+ "prost-types 0.14.4",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "arrowcol-protocol"
 version = "0.1.0"
 dependencies = [
@@ -1011,6 +1025,7 @@ dependencies = [
  "arrow-schema 58.4.0",
  "arrowcol-catalog",
  "arrowcol-catalog-client",
+ "arrowcol-props",
  "arrowcol-protocol",
  "clap",
  "flate2",

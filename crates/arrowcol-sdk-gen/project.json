@@ -15,6 +15,51 @@
     ]
   },
   "targets": {
+    "contract-properties": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "cargo run --locked --quiet --package arrowcol-sdk-gen -- catalog properties",
+        "cwd": "{workspaceRoot}",
+        "forwardAllArgs": false
+      }
+    },
+    "build-contract": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "commands": [
+          {
+            "command": "cargo build --locked --package arrowcol-sdk-gen",
+            "forwardAllArgs": false
+          },
+          {
+            "command": "npx --no-install tsx tools/libs/arrowcol-sdk-gen/src/contract-cli.ts",
+            "forwardAllArgs": true
+          }
+        ],
+        "parallel": false,
+        "cwd": "{workspaceRoot}"
+      }
+    },
+    "catalog-ui": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "npx --no-install tsx tools/libs/arrowcol-sdk-gen/src/catalog-server.ts",
+        "cwd": "{workspaceRoot}",
+        "forwardAllArgs": false
+      }
+    },
+    "catalog-ui-e2e": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "npx --no-install tsx tools/libs/arrowcol-sdk-gen/test/catalog-ui.e2e.ts",
+        "cwd": "{workspaceRoot}",
+        "forwardAllArgs": false
+      }
+    },
     "clean": {
       "executor": "nx:run-commands",
       "cache": false,

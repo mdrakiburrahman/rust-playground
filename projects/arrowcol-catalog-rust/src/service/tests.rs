@@ -21,6 +21,157 @@ fn config(root: &Path) -> CatalogConfig {
 const CREATE: &str = "CREATE TABLE arrowcol.default.events (id BIGINT NOT NULL, day STRING) USING DELTA PARTITIONED BY (day) COMMENT 'catalog test' TBLPROPERTIES ('vendor.setting' = 'original')";
 
 #[tokio::test]
+async fn prepared_contract_is_read_only_and_promotion_preserves_every_byte() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let service = CatalogService::open(config(root.path())).await?;
+    let candidate = service
+        .prepare_table(Request::new(rpc::PrepareTableRequest { ddl: CREATE.into() }))
+        .await?
+        .into_inner();
+    assert!(service.state.lock().await.tables.is_empty());
+    assert_eq!(service.state.lock().await.event_id, 0);
+    assert!(!Path::new(&candidate.location).join("_delta_log").exists());
+    let definitions = arrowcol_catalog::protobuf_option_definitions()?;
+    let declared = definitions
+        .options
+        .iter()
+        .find(|option| option.declared_default.is_some())
+        .context("native default")?;
+    let prepared: Vec<CatalogSchemaVersion> = serde_json::from_slice(&candidate.schema_history_json)?;
+    assert_eq!(
+        prepared[0].metadata().properties.get(&declared.key),
+        declared.declared_default.as_ref()
+    );
+    assert!(
+        prepared[0].canonical_ddl().contains(&declared.key),
+        "freeze the effective default explicitly in DDL"
+    );
+    let mut tampered = candidate.clone();
+    tampered.properties.insert("vendor.setting".into(), "tampered".into());
+    assert!(
+        service
+            .promote_table(Request::new(rpc::PromoteTableRequest {
+                candidate: Some(tampered)
+            }))
+            .await
+            .is_err()
+    );
+    let mut wrong_identity = candidate.clone();
+    let mut history: serde_json::Value = serde_json::from_slice(&wrong_identity.schema_history_json)?;
+    history[0]["table_id"] = serde_json::Value::String(uuid::Uuid::new_v4().to_string());
+    wrong_identity.schema_history_json = serde_json::to_vec(&history)?;
+    assert!(
+        service
+            .promote_table(Request::new(rpc::PromoteTableRequest {
+                candidate: Some(wrong_identity),
+            }))
+            .await
+            .is_err(),
+        "matching schema bytes cannot substitute a different table identity"
+    );
+    assert!(service.state.lock().await.tables.is_empty());
+    let mut registered = service
+        .promote_table(Request::new(rpc::PromoteTableRequest {
+            candidate: Some(candidate.clone()),
+        }))
+        .await?
+        .into_inner();
+    registered.position = None;
+    assert_eq!(registered, candidate);
+    assert_eq!(service.state.lock().await.event_id, 1);
+    service
+        .promote_table(Request::new(rpc::PromoteTableRequest {
+            candidate: Some(candidate.clone()),
+        }))
+        .await?;
+    assert_eq!(
+        service.state.lock().await.event_id,
+        1,
+        "an exact promotion retry emits no duplicate event"
+    );
+    let restarted = CatalogService::open(config(root.path())).await?;
+    let mut after_restart = restarted
+        .promote_table(Request::new(rpc::PromoteTableRequest {
+            candidate: Some(candidate.clone()),
+        }))
+        .await?
+        .into_inner();
+    after_restart.position = None;
+    assert_eq!(after_restart, candidate);
+    Ok(())
+}
+
+#[tokio::test]
+async fn promotion_conflicts_on_policy_even_with_the_same_schema_fingerprint() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let service = CatalogService::open(config(root.path())).await?;
+    let candidate = service
+        .prepare_table(Request::new(rpc::PrepareTableRequest { ddl: CREATE.into() }))
+        .await?
+        .into_inner();
+    let competing = service
+        .prepare_table(Request::new(rpc::PrepareTableRequest {
+            ddl: CREATE.replace("'original'", "'competing'"),
+        }))
+        .await?
+        .into_inner();
+    let first: Vec<CatalogSchemaVersion> = serde_json::from_slice(&candidate.schema_history_json)?;
+    let second: Vec<CatalogSchemaVersion> = serde_json::from_slice(&competing.schema_history_json)?;
+    assert_eq!(first[0].fingerprint(), second[0].fingerprint());
+    assert_ne!(first[0], second[0]);
+    service
+        .promote_table(Request::new(rpc::PromoteTableRequest {
+            candidate: Some(competing.clone()),
+        }))
+        .await?;
+    assert!(
+        service
+            .promote_table(Request::new(rpc::PromoteTableRequest {
+                candidate: Some(candidate)
+            }))
+            .await
+            .is_err()
+    );
+    let mut actual = service
+        .get_table(Request::new(competing.table.clone().context("table")?))
+        .await?
+        .into_inner();
+    actual.position = None;
+    assert_eq!(actual, competing);
+    Ok(())
+}
+
+#[tokio::test]
+async fn promotion_reconciles_a_commit_before_publication_failure() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let service = CatalogService::open(config(root.path())).await?;
+    let candidate = service
+        .prepare_table(Request::new(rpc::PrepareTableRequest { ddl: CREATE.into() }))
+        .await?
+        .into_inner();
+    service.fail_after_commit.store(true, Ordering::SeqCst);
+    assert!(
+        service
+            .promote_table(Request::new(rpc::PromoteTableRequest {
+                candidate: Some(candidate.clone())
+            }))
+            .await
+            .is_err()
+    );
+    assert_eq!(service.state.lock().await.event_id, 0);
+    let mut actual = service
+        .promote_table(Request::new(rpc::PromoteTableRequest {
+            candidate: Some(candidate.clone()),
+        }))
+        .await?
+        .into_inner();
+    actual.position = None;
+    assert_eq!(actual, candidate);
+    assert_eq!(service.state.lock().await.event_id, 1);
+    Ok(())
+}
+
+#[tokio::test]
 async fn committed_delta_restart_and_concurrent_evolution() -> Result<()> {
     const CHILD: &str = "ARROWCOL_CATALOG_PUBLICATION_CHILD";
     if std::env::var_os(CHILD).is_none() {

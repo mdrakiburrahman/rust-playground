@@ -32,8 +32,13 @@ fn descriptor_artifacts_are_deterministic_and_round_trip() -> anyhow::Result<()>
         schema.arrow_schema()?
     );
     let descriptors = FileDescriptorSet::decode(first.protobuf_descriptor())?;
-    assert_eq!(descriptors.file.len(), 1);
-    assert!(descriptors.file[0].message_type.len() >= 3);
+    assert_eq!(descriptors.file.len(), 3);
+    assert!(
+        descriptors
+            .file
+            .iter()
+            .any(|file| file.name() == "schema.proto" && file.message_type.len() >= 3)
+    );
     let manifest: serde_json::Value = serde_json::from_slice(first.manifest())?;
     assert_eq!(manifest["artifact_manifest_version"], 1);
     assert_eq!(manifest["schema"]["version"], 1);

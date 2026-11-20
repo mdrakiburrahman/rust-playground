@@ -53,6 +53,9 @@ pub(crate) fn render_sdk(bundle: &ArtifactBundle) -> SdkGenResult<RenderedSdk> {
         .descriptors()
         .file
         .iter()
+        // Imports describe custom options, not table row types. prost cannot
+        // generate extension accessors and must not emit google.protobuf here.
+        .filter(|file| file.name() == "schema.proto")
         .map(|file| {
             (
                 prost_build::Module::from_protobuf_package_name(file.package()),
@@ -86,6 +89,12 @@ pub(crate) fn render_sdk(bundle: &ArtifactBundle) -> SdkGenResult<RenderedSdk> {
     files.insert(
         PathBuf::from("descriptors/schema.proto"),
         bundle.protobuf_source().to_vec(),
+    );
+    files.extend(
+        bundle
+            .protobuf_imports()
+            .iter()
+            .map(|(path, bytes)| (PathBuf::from("descriptors").join(path), bytes.clone())),
     );
     files.insert(PathBuf::from("README.md"), generated_root_readme(&context).into_bytes());
 
