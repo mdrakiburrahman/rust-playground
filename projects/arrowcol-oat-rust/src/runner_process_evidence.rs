@@ -630,15 +630,20 @@ fn verify_process_configuration_recording(
         }
         if name == "ARROWCOL_COLLECTOR_RECEIVER_TRANSPORT_CONFIG" {
             let transport = &observed["transport"];
-            let adaptive = transport["adaptive_window"]
-                .as_bool()
-                .context("receiver transport readback omitted effective adaptive window mode")?;
-            if adaptive {
-                expected["initial_stream_window_size"] = json!(65_535);
-                expected["initial_connection_window_size"] = json!(65_535);
-            }
-            if !contains_requested(transport, &expected) {
-                *diff = Some(startup_mismatch(role, &name, &expected, Some(transport)));
+            let configured: arrowcol_tunables::ReceiverTransportTunables =
+                serde_json::from_value(actual.clone())
+                    .context("invalid configured receiver transport readback")?;
+            let mut effective = configured.effective_config_json();
+            effective.as_object_mut().context("invalid resolved receiver transport")?
+                .retain(|field, _| {
+                    expected.get(field).is_some()
+                        || matches!(
+                            field.as_str(),
+                            "adaptive_window" | "initial_stream_window_size" | "initial_connection_window_size"
+                        )
+                });
+            if !contains_requested(transport, &effective) {
+                *diff = Some(startup_mismatch(role, &name, &effective, Some(transport)));
                 bail!("collector effective receiver transport does not match applied tunables");
             }
         }
@@ -1560,6 +1565,33 @@ mod startup_readback_tests {
             wrong["transport"]["max_frame_size"] = json!(16_384);
             assert!(verify_process_configuration(&config, ComponentRole::Collector, &wrong).is_err());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn receiver_transport_uses_merged_adaptive_setting_for_partial_overrides() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        let windows = json!({
+            "initial_stream_window_size": 1_048_576,
+            "initial_connection_window_size": 16_777_216
+        });
+        config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+            "collector":{"receiver_transport":windows}
+        }))?;
+        let mut merged: arrowcol_tunables::ReceiverTransportTunables =
+            serde_json::from_value(windows)?;
+        let fixed = json!({"transport": merged.effective_config_json()});
+        verify_process_configuration(&config, ComponentRole::Collector, &fixed)?;
+
+        merged.adaptive_window = Some(true);
+        let inherited = json!({"transport": merged.effective_config_json()});
+        verify_process_configuration(&config, ComponentRole::Collector, &inherited)?;
+
+        let mut contradictory = inherited;
+        contradictory["transport"]["configured"] = fixed["transport"]["configured"].clone();
+        assert!(verify_process_configuration(&config, ComponentRole::Collector, &contradictory).is_err());
         Ok(())
     }
 

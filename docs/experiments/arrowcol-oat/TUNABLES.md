@@ -56,9 +56,9 @@ Sources: [Ddsv6 sizes](https://learn.microsoft.com/azure/virtual-machines/sizes/
 `ARROWCOL_COLLECTOR_RECEIVER_TRANSPORT_CONFIG` and the receiver YAML `transport`
 object. It configures Flight only, not admin HTTP. Unknown keys and invalid values
 fail startup. Unset fields preserve the existing server. OAT verifies explicit
-overrides against `transport.configured` and checks their resolved values
-against the receiver's effective transport readback, including the adaptive
-window override.
+overrides against `transport.configured` and derives the expected adaptive
+mode and window sizes from that merged configuration, including inherited
+profile settings. Contradictory effective transport readback fails.
 
 | Field | Bound and unset behavior |
 | --- | --- |
