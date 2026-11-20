@@ -8033,8 +8033,20 @@ async fn verify_local_bind_mount(config: &OatConfig, platform: &LocalPlatform) -
 struct ArmedLocalObserver {
     id: String,
     started_at: String,
-    mounts: Value,
+    mounts: BTreeMap<String, Value>,
     armed_at: chrono::DateTime<chrono::Utc>,
+}
+
+fn local_observer_mounts(container: &Value) -> Option<BTreeMap<String, Value>> {
+    // Docker can reorder the same mounts between inspections.
+    let mut by_destination = BTreeMap::new();
+    for mount in container["Mounts"].as_array()? {
+        let destination = mount["Destination"].as_str()?.to_owned();
+        if by_destination.insert(destination, mount.clone()).is_some() {
+            return None;
+        }
+    }
+    Some(by_destination)
 }
 
 async fn capture_local_observer(config: &OatConfig, platform: &LocalPlatform) -> Result<ArmedLocalObserver> {
@@ -8112,7 +8124,7 @@ async fn capture_local_observer(config: &OatConfig, platform: &LocalPlatform) ->
     Ok(ArmedLocalObserver {
         id: (*id).to_owned(),
         started_at: started_at.to_owned(),
-        mounts: container["Mounts"].clone(),
+        mounts: local_observer_mounts(container).context("invalid local Kustainer mount identities")?,
         armed_at: chrono::Utc::now(),
     })
 }
@@ -8384,8 +8396,8 @@ fn snapshot_container_outcomes(
             && armed_observer.is_some_and(|observer| {
                 observer.id == id
                     && state["StartedAt"] == observer.started_at
-                    && container["Mounts"] == observer.mounts
-                    && original["Mounts"] == observer.mounts
+                    && local_observer_mounts(container).as_ref() == Some(&observer.mounts)
+                    && local_observer_mounts(original).as_ref() == Some(&observer.mounts)
                     && finished >= observer.armed_at
             });
         if !observer_exit {
@@ -14743,7 +14755,10 @@ mod tests {
     #[test]
     fn snapshot_stop_accepts_only_the_attested_post_arm_kustainer_exit() -> Result<()> {
         let project = "owned-run";
-        let mounts = json!([{"Destination":"/delta/dataflow","RW":false}]);
+        let mounts = json!([
+            {"Destination":"/delta/dataflow","RW":false},
+            {"Destination":"/kustodata","RW":true},
+        ]);
         let make = |id, service| {
             json!({
                 "Id":id, "Mounts":mounts,
@@ -14756,14 +14771,24 @@ mod tests {
         let observer = ArmedLocalObserver {
             id: "kusto-id".to_owned(),
             started_at: "2026-01-01T00:00:00Z".to_owned(),
-            mounts: mounts.clone(),
+            mounts: local_observer_mounts(&make("kusto-id", "kusto")).context("test mounts")?,
             armed_at: chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:10Z")?.to_utc(),
         };
         let mut before = vec![make("kusto-id", "kusto"), make("collector-id", "dataflow-1")];
         let mut after = before.clone();
         before[1]["State"]["Running"] = json!(true);
         after[1]["State"]["ExitCode"] = json!(0);
+        after[0]["Mounts"] = json!([mounts[1], mounts[0]]);
         let outcomes = snapshot_container_outcomes(&before, &after, project, Some(&observer))?;
+        let mut changed = after.clone();
+        changed[0]["Mounts"][1]["RW"] = json!(true);
+        assert!(snapshot_container_outcomes(&before, &changed, project, Some(&observer)).is_err());
+        let mut duplicate_mounts = after.clone();
+        duplicate_mounts[0]["Mounts"] = json!([mounts[0], mounts[0]]);
+        assert!(snapshot_container_outcomes(&before, &duplicate_mounts, project, Some(&observer)).is_err());
+        let mut changed = after.clone();
+        changed[0]["State"]["FinishedAt"] = json!("2026-01-01T00:01:01Z");
+        assert!(snapshot_container_outcomes(&before, &changed, project, Some(&observer)).is_err());
         assert_eq!(outcomes[0]["exit_code"], 143);
         assert_eq!(outcomes[0]["comment"], "local_qap_observer_exited_after_arm");
         assert_eq!(
