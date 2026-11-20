@@ -1946,16 +1946,9 @@ impl Platform for LocalPlatform {
     }
 
     async fn arm_clients(&mut self, config: &OatConfig, _run_id: &str, run_start_unix_ms: u64) -> Result<()> {
-        let observer = if self.qap_initialized {
-            match capture_local_observer(config, self).await {
-                Ok(observer) => Some(observer),
-                Err(_) => {
-                    tracing::warn!(
-                        "local Kustainer identity or read-only storage could not be attested at arm; strict stop checks remain in force"
-                    );
-                    None
-                }
-            }
+        self.armed_local_observer = None;
+        let original = if self.qap_initialized {
+            capture_local_observer(config, self).await.ok()
         } else {
             None
         };
@@ -1966,9 +1959,15 @@ impl Platform for LocalPlatform {
         tokio::fs::rename(&temporary, self.control_dir.join("schedule"))
             .await
             .context("atomically arm local OAT measurement schedule")?;
-        if let Some(mut observer) = observer {
-            observer.armed_at = chrono::Utc::now();
-            self.armed_local_observer = Some(observer);
+        if let Some(original) = original {
+            // Docker's clock need not agree with the runner's. Inspect again only after publication.
+            self.armed_local_observer =
+                confirm_local_observer_after_arm(original, capture_local_observer(config, self).await.ok());
+        }
+        if self.qap_initialized && self.armed_local_observer.is_none() {
+            tracing::warn!(
+                "local Kustainer did not attest the same running process and read-only storage across schedule arming; strict stop checks remain in force"
+            );
         }
         Ok(())
     }
@@ -8030,11 +8029,22 @@ async fn verify_local_bind_mount(config: &OatConfig, platform: &LocalPlatform) -
     Ok(())
 }
 
-struct ArmedLocalObserver {
+#[derive(PartialEq)]
+struct LocalObserverIdentity {
     id: String,
     started_at: String,
     mounts: BTreeMap<String, Value>,
-    armed_at: chrono::DateTime<chrono::Utc>,
+}
+
+struct ArmedLocalObserver(LocalObserverIdentity);
+
+fn confirm_local_observer_after_arm(
+    original: LocalObserverIdentity,
+    observed_running: Option<LocalObserverIdentity>,
+) -> Option<ArmedLocalObserver> {
+    observed_running
+        .filter(|observed| *observed == original)
+        .map(ArmedLocalObserver)
 }
 
 fn local_observer_mounts(container: &Value) -> Option<BTreeMap<String, Value>> {
@@ -8049,7 +8059,7 @@ fn local_observer_mounts(container: &Value) -> Option<BTreeMap<String, Value>> {
     Some(by_destination)
 }
 
-async fn capture_local_observer(config: &OatConfig, platform: &LocalPlatform) -> Result<ArmedLocalObserver> {
+async fn capture_local_observer(config: &OatConfig, platform: &LocalPlatform) -> Result<LocalObserverIdentity> {
     let project = scoped_compose_project(
         config
             .platform
@@ -8081,9 +8091,18 @@ async fn capture_local_observer(config: &OatConfig, platform: &LocalPlatform) ->
     let [container] = containers.as_slice() else {
         bail!("local Kustainer inspection missing or ambiguous at arm");
     };
-    validate_owned_local_containers(&containers, &project)?;
+    local_running_observer_identity(container, id, &project, &platform.state_dir.join("dataflow"))
+}
+
+fn local_running_observer_identity(
+    container: &Value,
+    id: &str,
+    project: &str,
+    dataflow: &Path,
+) -> Result<LocalObserverIdentity> {
+    validate_owned_local_containers(std::slice::from_ref(container), project)?;
     let state = &container["State"];
-    if container["Id"] != *id
+    if container["Id"] != id
         || container
             .pointer("/Config/Labels/com.docker.compose.service")
             .and_then(Value::as_str)
@@ -8093,13 +8112,15 @@ async fn capture_local_observer(config: &OatConfig, platform: &LocalPlatform) ->
         || state["Status"] != "running"
         || state["Error"] != ""
         || state["OOMKilled"] != false
+        || state["Dead"] != false
+        || state["Restarting"] != false
+        || !state["Pid"].as_u64().is_some_and(|pid| pid > 0)
     {
         bail!("local Kustainer is not a running owned observer at arm");
     }
     let mounts = container["Mounts"]
         .as_array()
         .context("local Kustainer mounts missing")?;
-    let dataflow = platform.state_dir.join("dataflow");
     let dataflow = dataflow.to_str().context("invalid local Delta path")?;
     let volume = format!("{project}_kusto-data");
     if mounts.len() != 2
@@ -8121,11 +8142,10 @@ async fn capture_local_observer(config: &OatConfig, platform: &LocalPlatform) ->
     if chrono::DateTime::parse_from_rfc3339(started_at)?.timestamp() <= 0 {
         bail!("local Kustainer start time invalid");
     }
-    Ok(ArmedLocalObserver {
-        id: (*id).to_owned(),
+    Ok(LocalObserverIdentity {
+        id: id.to_owned(),
         started_at: started_at.to_owned(),
         mounts: local_observer_mounts(container).context("invalid local Kustainer mount identities")?,
-        armed_at: chrono::Utc::now(),
     })
 }
 
@@ -8393,12 +8413,11 @@ fn snapshot_container_outcomes(
             && state["Restarting"] == false
             && state["Pid"] == 0
             && original["State"] == *state
-            && armed_observer.is_some_and(|observer| {
+            && armed_observer.is_some_and(|ArmedLocalObserver(observer)| {
                 observer.id == id
                     && state["StartedAt"] == observer.started_at
                     && local_observer_mounts(container).as_ref() == Some(&observer.mounts)
                     && local_observer_mounts(original).as_ref() == Some(&observer.mounts)
-                    && finished >= observer.armed_at
             });
         if !observer_exit {
             shutdown_exit_outcome(
@@ -14768,12 +14787,11 @@ mod tests {
                     "FinishedAt":"2026-01-01T00:01:00Z"},
             })
         };
-        let observer = ArmedLocalObserver {
+        let observer = ArmedLocalObserver(LocalObserverIdentity {
             id: "kusto-id".to_owned(),
             started_at: "2026-01-01T00:00:00Z".to_owned(),
             mounts: local_observer_mounts(&make("kusto-id", "kusto")).context("test mounts")?,
-            armed_at: chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:10Z")?.to_utc(),
-        };
+        });
         let mut before = vec![make("kusto-id", "kusto"), make("collector-id", "dataflow-1")];
         let mut after = before.clone();
         before[1]["State"]["Running"] = json!(true);
@@ -14801,7 +14819,7 @@ mod tests {
             ("OOMKilled", json!(true)),
             ("Pid", json!(872)),
             ("Restarting", json!(true)),
-            ("FinishedAt", json!("2026-01-01T00:00:09Z")),
+            ("FinishedAt", json!("0001-01-01T00:00:00Z")),
             ("StartedAt", json!("2026-01-01T00:00:20Z")),
         ] {
             let mut a = after.clone();
@@ -14820,6 +14838,60 @@ mod tests {
         assert!(snapshot_container_outcomes(&replacement_before, &replacement, project, Some(&observer)).is_err());
         after[1]["State"]["ExitCode"] = json!(137);
         assert!(snapshot_container_outcomes(&before, &after, project, Some(&observer)).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_stop_requires_running_observer_after_rename_despite_clock_skew() -> Result<()> {
+        let project = "owned-run";
+        let dataflow = Path::new("/test/cell/dataflow");
+        let inspect =
+            |sample: &Value| local_running_observer_identity(sample, sample["Id"].as_str().unwrap(), project, dataflow);
+        let running = json!({
+            "Id":"kusto-id",
+            "Config":{"Labels":{"com.docker.compose.project":project,"com.docker.compose.service":"kusto"}},
+            "Mounts":[
+                {"Type":"bind","Source":dataflow,"Destination":"/delta/dataflow","RW":false},
+                {"Type":"volume","Name":"owned-run_kusto-data","Destination":"/kustodata","RW":true},
+            ],
+            "State":{"Running":true,"Paused":false,"Dead":false,"Status":"running","Error":"",
+                "OOMKilled":false,"Restarting":false,"Pid":42,"ExitCode":0,
+                "StartedAt":"2026-01-01T00:01:40Z"},
+        });
+        // The observer exited at runner time 100.020, before rename at 100.050.
+        // The Docker clock leads by five seconds, so FinishedAt alone would have passed.
+        let mut stopped = running.clone();
+        stopped["State"] = json!({
+            "Running":false,"Paused":false,"Dead":false,"Status":"exited","Error":"",
+            "OOMKilled":false,"Restarting":false,"Pid":0,"ExitCode":143,
+            "StartedAt":"2026-01-01T00:01:40Z","FinishedAt":"2026-01-01T00:01:45.020Z",
+        });
+        let original = inspect(&running)?;
+        assert!(inspect(&stopped).is_err());
+        let attestation = confirm_local_observer_after_arm(original, inspect(&stopped).ok());
+        assert!(attestation.is_none());
+        let stopped = std::slice::from_ref(&stopped);
+        assert!(snapshot_container_outcomes(stopped, stopped, project, attestation.as_ref()).is_err());
+
+        for (path, value) in [
+            ("/Id", json!("replacement")),
+            ("/State/StartedAt", json!("2026-01-01T00:01:45Z")),
+            ("/Mounts/0/Source", json!("/test/other/dataflow")),
+            ("/Mounts/0/RW", json!(true)),
+            ("/State/Pid", Value::Null),
+        ] {
+            let mut changed = running.clone();
+            *changed.pointer_mut(path).unwrap() = value;
+            assert!(
+                confirm_local_observer_after_arm(inspect(&running)?, inspect(&changed).ok()).is_none(),
+                "{path}"
+            );
+        }
+        let mut reordered = running.clone();
+        reordered["Mounts"].as_array_mut().unwrap().reverse();
+        let attestation = confirm_local_observer_after_arm(inspect(&running)?, inspect(&reordered).ok());
+        let outcomes = snapshot_container_outcomes(stopped, stopped, project, attestation.as_ref())?;
+        assert_eq!(outcomes[0]["comment"], "local_qap_observer_exited_after_arm");
         Ok(())
     }
 
