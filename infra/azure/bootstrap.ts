@@ -10,7 +10,7 @@ import { Failure, HttpFailure, ControlConflict, NotReady, DeploymentFailed, cano
   canonical_json, publisher_registry, require_released, uuid, type Metadata } from './authority.js';
 import { PublisherControl, READY, FENCED, CLEANING, UnknownTransition } from './publisher_control.js';
 import { assertNoStampNetworkOverlap, defaultStampConfig, loadStampConfig, type StampConfig } from './stamp.js';
-import { dispatchExternalEffect, EffectBoundaryRefused, processEffectRequest } from './effect-boundary.js';
+import { dispatchExternalEffect, EffectBoundaryRefused, effectSignal, processEffectRequest } from './effect-boundary.js';
 export * from './authority.js';
 
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
@@ -265,12 +265,26 @@ export function write_private(filename: string, values: Record<string, string>):
   try { fs.renameSync(temporary, filename); } finally { if (fs.existsSync(temporary)) fs.unlinkSync(temporary); }
 }
 export interface ProcessResult { returncode: number; stdout: string; stderr: string }
+export async function run_tree_with_input(command: string[], input: Buffer, timeout: number,
+  maxOutputBytes: number, signal?: AbortSignal): Promise<ProcessResult> {
+  if (!Number.isFinite(timeout) || timeout <= 0 || !Number.isSafeInteger(maxOutputBytes) || maxOutputBytes <= 0)
+    throw new Failure('Invalid stdin command budget.');
+  const argv = [...command], body = Buffer.from(input);
+  return dispatchExternalEffect({ ...processEffectRequest(argv), body }, async () => {
+    signal?.throwIfAborted();
+    return run_tree(argv, timeout, undefined, undefined, undefined, maxOutputBytes, body, signal ?? effectSignal());
+  });
+}
+
 export async function run_tree(command: string[], timeout: number, cwd?: string,
-  env?: NodeJS.ProcessEnv, onStderr?: (chunk: string) => void, maxOutputBytes?: number): Promise<ProcessResult> {
+  env?: NodeJS.ProcessEnv, onStderr?: (chunk: string) => void, maxOutputBytes?: number,
+  input?: Buffer, signal?: AbortSignal): Promise<ProcessResult> {
   if (maxOutputBytes !== undefined && (!Number.isSafeInteger(maxOutputBytes) || maxOutputBytes < 1))
     throw new Failure('maxOutputBytes must be a positive safe integer before command admission.');
   return new Promise((resolve, reject) => {
-    const child = spawn(command[0], command.slice(1), { detached: true, cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
+    const stop = signal ?? effectSignal();
+    stop?.throwIfAborted();
+    const child = spawn(command[0], command.slice(1), { detached: true, cwd, env, stdio: [input ? 'pipe' : 'ignore', 'pipe', 'pipe'] });
     let stdout = '', stderr = '', failure: Failure | undefined, outputBytes = 0, overflow = false;
     const kill = (message: string) => {
       if (failure) return;
@@ -282,6 +296,11 @@ export async function run_tree(command: string[], timeout: number, cwd?: string,
     const interrupt = () => kill('Command interrupted; outcome unknown and process group killed. Authority stays blocking; no automatic clear.');
     const timer = setTimeout(() => kill('Command timed out; outcome unknown and process group killed. Authority stays blocking; no automatic clear.'), timeout * 1000);
     process.on('SIGINT', interrupt); process.on('SIGTERM', interrupt);
+    stop?.addEventListener('abort', interrupt, { once: true });
+    if (input) {
+      child.stdin!.on('error', () => kill('Command stdin failed; external outcome is unknown.'));
+      child.stdin!.end(input);
+    }
     const accept = (data: Buffer): boolean => {
       if (overflow) return false;
       if (maxOutputBytes !== undefined && data.byteLength > maxOutputBytes - outputBytes) {
@@ -292,14 +311,17 @@ export async function run_tree(command: string[], timeout: number, cwd?: string,
       outputBytes += data.byteLength;
       return true;
     };
-    child.stdout.on('data', (data: Buffer) => { if (accept(data)) stdout += data.toString(); });
-    child.stderr.on('data', data => {
+    child.stdout!.on('data', (data: Buffer) => { if (accept(data)) stdout += data.toString(); });
+    child.stderr!.on('data', data => {
       if (!accept(data)) return;
       const chunk = data.toString();
       stderr += chunk;
       onStderr?.(chunk);
     });
-    const cleanup = () => { clearTimeout(timer); process.off('SIGINT', interrupt); process.off('SIGTERM', interrupt); };
+    const cleanup = () => {
+      clearTimeout(timer); process.off('SIGINT', interrupt); process.off('SIGTERM', interrupt);
+      stop?.removeEventListener('abort', interrupt);
+    };
     child.once('error', error => { cleanup(); reject(new Failure('Command could not start.', { cause: error })); });
     child.once('close', code => { cleanup(); if (failure) reject(failure); else resolve({ returncode: code ?? -1, stdout, stderr }); });
   });
@@ -370,7 +392,8 @@ export class Azure {
       const response = await dispatchExternalEffect({ transport: 'azure-rest', method, resource: parsedUrl.origin + '|' + resource,
         path: parsedUrl.pathname + parsedUrl.search, body }, async () => {
         const received = await fetch(url, { method, body: body == null ? undefined : body as BodyInit,
-          signal: AbortSignal.timeout(30_000), redirect: 'error',
+          signal: AbortSignal.any([AbortSignal.timeout(30_000), ...(effectSignal() ? [effectSignal()!] : [])]),
+          redirect: 'error',
           headers: { Authorization: 'Bearer ' + token, ...(resource === 'https://storage.azure.com/' ?
             { 'x-ms-date': new Date().toUTCString() } : {}), ...headers } });
         const bytes = Buffer.from(await received.arrayBuffer());

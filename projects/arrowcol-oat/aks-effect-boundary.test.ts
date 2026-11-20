@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import { createServer } from 'node:http';
 import { mkdtempSync, readFileSync, rmSync, chmodSync, writeFileSync, writeSync } from 'node:fs';
@@ -6,7 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 import { stringify } from 'yaml';
-import { Azure, Config, exchange_workload_identity_assertion, runtime } from '../../infra/azure/bootstrap.js';
+import { Azure, Config, exchange_workload_identity_assertion, run_tree_with_input, runtime } from '../../infra/azure/bootstrap.js';
 import { defaultStampConfig } from '../../infra/azure/stamp.js';
 import { EffectBoundary, EffectBoundaryRefused, ResponseWithholdingSupervisor, dispatchExternalEffect, withEffectBoundary,
   type EffectEnvelope, type EffectRule } from '../../infra/azure/effect-boundary.js';
@@ -33,6 +34,30 @@ function rule(id: string, transport: EffectRule['transport'], method: string, re
   max_calls = 1): EffectRule {
   return { id, transport, method, resource, path: pathValue, max_calls };
 }
+test('stdin mutations require the exact allocated bytes and cannot start after shutdown', async t => {
+  const dir = tempDir();
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const executable = path.join(dir, 'kubectl');
+  const dispatched = path.join(dir, 'forwarded');
+  writeFileSync(executable, `#!/bin/sh\ncat > '${dispatched}'\n`, { mode: 0o700 });
+  const argv = [executable, 'create', '-f', '-'];
+  const input = Buffer.from('{"kind":"Pod","spec":{"automountServiceAccountToken":false}}');
+  const allocation = rule('manifest', 'process', 'KUBECTL_CREATE', executable, JSON.stringify(argv.slice(1)));
+  const argvOnly = new EffectBoundary(envelope([allocation]), path.join(dir, 'argv.jsonl'));
+  const invoke = (body: Buffer) => run_tree_with_input(argv, body, 2, 1024);
+  await assert.rejects(() => withEffectBoundary(argvOnly, () => invoke(input)), EffectBoundaryRefused);
+  const exact = new EffectBoundary(envelope([{ ...allocation, body_sha256: createHash('sha256').update(input).digest('hex') }]),
+    path.join(dir, 'exact.jsonl'));
+  await assert.rejects(() => withEffectBoundary(exact, () => invoke(Buffer.from('{}'))), EffectBoundaryRefused);
+  const interrupted = AbortSignal.abort(new Error('test shutdown'));
+  await assert.rejects(() => withEffectBoundary(exact, () => invoke(input), undefined, interrupted), /test shutdown/);
+  assert.throws(() => readFileSync(dispatched), { code: 'ENOENT' });
+  const result = await withEffectBoundary(exact, () => invoke(input));
+  assert.equal(result.returncode, 0);
+  assert.deepEqual(readFileSync(dispatched), input);
+  await assert.rejects(() => withEffectBoundary(exact, () => invoke(input)), EffectBoundaryRefused);
+});
+
 
 function inMemoryCampaignStore(initial: CampaignState): CampaignStore {
   let state = initial;

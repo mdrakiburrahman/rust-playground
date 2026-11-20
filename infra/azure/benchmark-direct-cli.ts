@@ -102,7 +102,7 @@ function exactKeys(value: Record<string, unknown>, expected: readonly string[]):
   return actual.length === sorted.length && actual.every((key, index) => key === sorted[index]);
 }
 
-function readRelease(filename: string): DirectRelease {
+export function readRelease(filename: string): DirectRelease {
   const path = privateFile(filename, 'Immutable release file', 16_384);
   let value: unknown;
   try { value = JSON.parse(fs.readFileSync(path, 'utf8')); }
@@ -153,10 +153,10 @@ function isDirectTerminalArm(value: unknown, base: Omit<DirectStopOrigin, 'clien
   } catch { return false; }
 }
 
-async function loadDurableArm(azure: Azure, base: Omit<DirectStopOrigin, 'clients'>, release: DirectRelease): Promise<DirectTerminalArm> {
+export async function loadDurableArm(azure: Azure, base: Omit<DirectStopOrigin, 'clients'>, release: DirectRelease): Promise<DirectTerminalArm> {
   const path = directArmRecordPath({ ...base, clients: 1 });
   const [bytes, headers] = await azure.blob('GET', azure.c.checkpoints, path, undefined, undefined, {}, false, true);
-  requireEvidence(headers[':status'] === '200' && typeof headers.etag === 'string' && /^"[^"\r\n]+"$/.test(headers.etag) && bytes,
+  requireEvidence(headers[':status'] === '200' && typeof headers.etag === 'string' && /^"[^"\r\n]+"$/.test(headers.etag) && bytes && bytes.length <= 8 * 1024 ** 2,
     'Original off-node arm record is missing or its read outcome is unknown');
   let value: unknown;
   try { value = JSON.parse(bytes.toString('utf8')); }

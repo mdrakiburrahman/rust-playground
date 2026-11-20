@@ -11,6 +11,7 @@ import { directEvidencePrefix } from './benchmark-evidence-custody.js';
 import { directArmRecordPath, finishDirectTerminalCustody } from './benchmark-terminal-custody.js';
 import { plan_run_fic, prepare_run_fic, read_run_fic_record, run_fic_ledger_path } from './run_fic.js';
 import { watchSelectedRun } from '../../projects/arrowcol-oat/aks-scoped-watchdog.js';
+import { inspectDirectRecovery } from './benchmark-direct-recovery.js';
 import { ENCODING, MAX_RECORDS } from './benchmark-manifest-audit.js';
 import { parseEvidence } from './benchmark-evidence-json.js';
 import { fakeKubectl } from './benchmark-direct-e2e.fixture.js';
@@ -177,6 +178,7 @@ async function fixture(t: TestContext, fault: Fault) {
   });
   t.mock.method(azure, 'collection', async () => [native, ...(credential ? [structuredClone(credential)] : [])]);
   let loseNamespaceReceipt = false;
+  let physicalEtag = '"physical"';
   const blob: Azure['blob'] = async (method, container, path = '', query, body, headers = {}, _missing, _idempotent, capture): ReturnType<Azure['blob']> => {
     record('blob', { method, container, path });
     if (container === c.data) {
@@ -187,7 +189,7 @@ async function fixture(t: TestContext, fault: Fault) {
           { ':status': '200', 'x-ms-request-id': 'fixture-list' }];
       }
       if (method === 'HEAD') { assert.equal(path, root + '/hour=0/a.parquet');
-        return [null, { ':status': '200', 'x-ms-request-id': 'fixture-head', etag: '"physical"', 'content-length': '40' }]; }
+        return [null, { ':status': '200', 'x-ms-request-id': 'fixture-head', etag: physicalEtag, 'content-length': '40' }]; }
       assert.equal(method, 'GET');
       const v = Number(path.split('/').at(-1)!.slice(0, -5));
       assert.equal(headers['If-Match'], `"v${v}"`); assert.ok(commits[v]);
@@ -389,7 +391,8 @@ async function fixture(t: TestContext, fault: Fault) {
     save(); record('load');
   };
   return { arm, runCli, cliArgs, releaseFile, load, store, loseBookkeeping: () => { loseBookkeeping = true; },
-    c, directory, loseNamespaceReceipt: () => { loseNamespaceReceipt = true; },
+    c, azure, directory, loseNamespaceReceipt: () => { loseNamespaceReceipt = true; },
+    replacePhysical: () => { physicalEtag = '"replacement-physical"'; },
     staleAuthority: (expired: boolean) => { if (!fenced && expired) campaignState.heartbeatAtMs = now - 180_000;
       else if (fenced && !expired) campaignState.heartbeatAtMs = now - 1; fenced = expired; },
     finish: (armed: Awaited<ReturnType<typeof arm>>) =>
@@ -437,10 +440,11 @@ test('selected watchdog waits for original FIC, fences authorized null-QAP produ
     if (dropResponse) throw new Error('injected conditional PUT response loss');
     return new Response(null, { status: 201, headers: { etag: nextEtag } });
   };
-  const watch = (verify: (tick: () => Promise<Record<string, unknown>>) => Promise<void>, selected = stateDir) =>
-    watchSelectedRun(args.map(arg => arg === stateDir ? selected : arg), new AbortController().signal,
+  const watch = (verify: (tick: () => Promise<Record<string, unknown>>) => Promise<void>, selected = stateDir,
+    extra: string[] = [], signal = new AbortController().signal) =>
+    watchSelectedRun([...args.map(arg => arg === stateDir ? selected : arg), ...extra], signal,
       async (_signal, tick) => { await verify(tick); return 0; },
-      { config: f.c, fetcher, token: async () => 'fixture-token' });
+      { config: f.c, fetcher, token: async () => 'fixture-token', azure: f.azure });
   await watch(async tick => {
     assert.equal((await tick()).scopeStatus, 'waiting_campaign');
     exists = true;
@@ -466,6 +470,27 @@ test('selected watchdog waits for original FIC, fences authorized null-QAP produ
   assert.equal(f.events.length, previous);
   assert.equal(f.namespaceAbsent(), false);
   assert.ok(f.credential());
+
+  const recoveryDir = join(f.directory, 'recovery-state');
+  fs.mkdirSync(recoveryDir, { mode: 0o700 });
+  fs.unlinkSync(ficPath);
+  const options = ['--release-file', f.releaseFile];
+  await watch(async tick => assert.equal((await tick()).scopeStatus, 'direct_recovery_unsealed'), recoveryDir, options);
+  assert.equal(writes, 1, 'inspection must not attempt a second campaign write or destructive custody');
+  assert.equal(f.namespaceAbsent(), false);
+  assert.ok(f.credential());
+  const armPath = directArmRecordPath(armed.origin), originalArm = f.stored.get(armPath)!;
+  f.stored.set(armPath, { ...originalArm, bytes: Buffer.from('{}') });
+  await assert.rejects(watch(async tick => { await tick(); }, recoveryDir, options), /arm record does not match/);
+  f.stored.set(armPath, originalArm);
+  const shutdown = AbortSignal.abort(new Error('offline supervisor shutdown'));
+  await assert.rejects(watch(async tick => { await tick(); }, recoveryDir, options, shutdown), /offline supervisor shutdown/);
+  assert.equal(writes, 1);
+  const expiration = args.indexOf('--expires-at') + 1, until = args[expiration];
+  args[expiration] = new Date(Date.now() - 1).toISOString();
+  await assert.rejects(watch(async tick => { await tick(); }, recoveryDir, options), /expiry must be/);
+  args[expiration] = until;
+  fs.copyFileSync(f.ficPath, ficPath);
 
   const successor = newCampaignState(uuid(89), origin.owner, Date.now());
   await f.store.write(successor, fenced.etag);
@@ -508,6 +533,17 @@ test('production direct CLI preserves durable arm readback before barrier releas
   assert.ok(Object.values(completed.state.runInventory!.cleanup).every(step => step.state === 'complete'));
   assert.ok(completed.state.runInventory!.resources.every(resource => resource.state === 'removed'));
   assert.equal(completed.state.runInventory!.fic?.state, 'removed');
+  const recoverySnapshot = { ...completed, state: { ...completed.state, status: 'fenced' as const, fencingToken: 2 } };
+  // Assert only independent readback here: the original positive seal and removal were produced by the existing finish fixture.
+  const readOnly: CampaignStore = { read: async () => recoverySnapshot,
+    write: async () => { throw new Error('Independent inspection cannot write'); } };
+  const inspect = () => inspectDirectRecovery(f.azure, readOnly, recoverySnapshot, release, new AbortController().signal, f.directory);
+  assert.ok((await inspect()).seal);
+  f.replacePhysical();
+  await assert.rejects(inspect, /physical file versions changed/);
+  const sealPath = `${directEvidencePrefix(armed.arm.origin)}/seal.json`;
+  f.stored.delete(sealPath);
+  await assert.rejects(inspect, /deletion has no original terminal seal/);
   assert.equal(JSON.parse(f.stored.get(`_arrowcol-custody/campaigns/${uuid(5)}/cells/${origin.runId}/handoff.json`)!.bytes.toString()).phase, 'complete');
   const events = f.events(), index = (name: string) => events.findIndex(e => e.event === name);
   assert.ok(index('arm-readback') >= 0 && index('arm-readback') < index('release'));

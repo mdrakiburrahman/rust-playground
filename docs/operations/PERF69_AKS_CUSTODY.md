@@ -87,16 +87,29 @@ or bound identity stops the process. A CAS conflict or unknown write returns
 nonzero. `fenced_cleanup_blocked` and `fence_budget_blocked` also exit nonzero;
 neither implies runtime stop, preservation or safe idle.
 
-**Direct producer-loss recovery remains blocked.** The direct terminal/seal
-path currently asserts the original active producer, which is invalid after
+**Direct producer-loss recovery remains blocked.** The selected watchdog
+cannot yet perform the interrupted run's stop, drain, or removal.
+For source-tested, read-only inspection after a fence, include
+`--release-file "$ORIGINAL_RELEASE"` from the initial invocation and add the
+exact read rules for the original FIC/AKS, publisher generation, arm and seal.
+For a sealed run, allocate its exact Delta listing, transaction and active
+file reads; if the FIC was removed, also allocate the original namespace
+journal and absence reads. The inspector binds the original off-node FIC
+ledger directly; it does not need the producer's local FIC receipt after the
+fence. `direct_recovery_unsealed` and `direct_recovery_seal_observed` both exit
+nonzero: neither authorizes deletion, certifies full recovery or scores a run.
+The producer terminal path asserts the original active producer, invalid after
 takeover. Stock terminal freeze and final independent preservation each reject
 `authorized` with null QAP; their null-QAP case is restricted to fenced,
 `not_authorized` setup. A direct recovery adapter must re-read the original
 arm/seal and reconcile positive writer stop/drain under the current controller
 fence, then prove original Delta preservation against the baseline after exact
-namespace/FIC removal. Existing process effects describe exact argv, not the
-body of a `kubectl create -f` manifest; allowing that command by a temporary file
-path would not pin the dynamic export Pod. No such effect is authorized here.
+namespace/FIC removal. The fence-only allocation cannot express a bounded
+stop whose exact UID/resourceVersion JSON Patch is determined after takeover.
+A stop without a positive durable response must remain unresolved.
+Export helper creation now dispatches the same buffered
+stdin bytes hashed by the effect allowlist, not a path to a manifest. The scoped
+inspector does not allocate any export helper or deletion effects.
 An unqualified scoring window is not a data-loss result, and neither can be
 inferred from fencing. Keep destructive cleanup and all workload/readiness
 gates held until the adapter and independent supervision are qualified.

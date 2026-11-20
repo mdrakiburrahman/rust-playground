@@ -104,7 +104,8 @@ async function main(args: string[]): Promise<void> {
         let exit = 0;
         await runWatchdog(signal, evaluate, { stop: result => {
           if (result.scopeStatus === 'selected_complete') return true;
-          if (!['fenced_cleanup_blocked', 'fence_budget_blocked', 'selected_complete_unsettled'].includes(String(result.scopeStatus))) return false;
+          if (!['fenced_cleanup_blocked', 'fence_budget_blocked', 'selected_complete_unsettled',
+            'direct_recovery_unsealed', 'direct_recovery_seal_observed'].includes(String(result.scopeStatus))) return false;
           exit = 2; return true;
         } });
         return exit;

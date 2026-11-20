@@ -39,6 +39,7 @@ interface BoundaryContext {
   boundary: EffectBoundary;
   forwarding: Set<string>;
   responseWithholding?: ResponseWithholdingSupervisor;
+  signal?: AbortSignal;
 }
 const active = new AsyncLocalStorage<BoundaryContext>();
 
@@ -392,6 +393,9 @@ export class EffectBoundary {
     if (this.poisoned) throw new Error('Effect boundary journal is not durable; refusing all further dispatch.');
     const method = request.method.toUpperCase();
     const bodyHash = hash(request.body);
+    if (request.transport === 'process' && !readMethods.has(method) && request.body != null &&
+        this.envelope.effects.some(effect => effect.transport === 'process' && effect.method === method &&
+          effect.resource === request.resource && effect.path === request.path && effect.body_sha256 === undefined)) throw new EffectBoundaryRefused();
     const rule = this.envelope.effects.find(effect => effect.transport === request.transport && effect.method === method &&
       effect.resource === request.resource && effect.path === request.path &&
       (effect.body_sha256 === undefined || effect.body_sha256 === bodyHash));
@@ -474,14 +478,17 @@ export function isEffectBoundaryActive(): boolean { return active.getStore() !==
 export function dispatchExternalEffect<T>(request: ExternalEffect, forward: () => Promise<T>): Promise<T> {
   const context = active.getStore();
   if (!context) return forward();
+  context.signal?.throwIfAborted();
   const signature = [request.transport, request.method.toUpperCase(), request.resource, request.path, hash(request.body) ?? ''].join('\0');
   if (context.forwarding.has(signature)) return forward();
   return context.boundary.dispatch(request, () => active.run({ boundary: context.boundary,
-    forwarding: new Set([...context.forwarding, signature]), responseWithholding: context.responseWithholding },
+    forwarding: new Set([...context.forwarding, signature]), responseWithholding: context.responseWithholding, signal: context.signal },
     () => context.responseWithholding ? context.responseWithholding.forward(request, forward) : forward()));
 }
 
 export function withEffectBoundary<T>(boundary: EffectBoundary, work: () => Promise<T>,
-  responseWithholding?: ResponseWithholdingSupervisor): Promise<T> {
-  return active.run({ boundary, forwarding: new Set(), responseWithholding }, work);
+  responseWithholding?: ResponseWithholdingSupervisor, signal?: AbortSignal): Promise<T> {
+  return active.run({ boundary, forwarding: new Set(), responseWithholding, signal }, work);
 }
+
+export const effectSignal = () => active.getStore()?.signal;

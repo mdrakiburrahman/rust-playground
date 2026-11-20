@@ -1,4 +1,4 @@
-import { execFile, spawn } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { lstat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -20,7 +20,7 @@ import { directProducerAuthority, type DirectCampaignScope } from './benchmark-r
 import { persistDirectStopPatch, type DirectStopOrigin } from './benchmark-stop-patch.js';
 import { observeStoppedWriterRegistration, readWriterRegistrations, type WriterRegistration } from './benchmark-writer-sql.js';
 import { clientLogExportPod, exportClientLogs, exportWriterLogs, writerLogExportPod } from './benchmark-writer-export.js';
-import { canonical_json, Failure, type Azure } from './bootstrap.js';
+import { canonical_json, Failure, run_tree_with_input, type Azure } from './bootstrap.js';
 import { FENCED, READY, PublisherControl } from './publisher_control.js';
 import { assert_owned_namespace_absent, cleanup_run_fic, delete_owned_namespace, observe_run_fic_cleanup, read_run_fic_record,
   type RunCleanupAuthority, type RunNamespaceIdentity } from './run_fic.js';
@@ -98,26 +98,11 @@ async function observeExactExportPod(context: string, server: string, expected: 
 }
 async function startExactExportPod(authority: RunCleanupAuthority, context: string, server: string, expected: ExportPod) {
   await authority.assertCurrent();
-  const child = spawn('kubectl', [...exportArgs(context, server, expected), 'create', '-f', '-', '-o', 'json'],
-    { timeout: 20_000, stdio: ['pipe', 'pipe', 'ignore'] });
-  const complete = new Promise<void>((resolve, reject) => {
-    child.once('error', reject);
-    child.once('close', code => code === 0 ? resolve() : reject(new Error('Export helper CREATE outcome is unknown')));
-    child.stdin.once('error', reject);
-  });
-  child.stdin.end(JSON.stringify(expected));
-  const body = async () => {
-    let text = '';
-    child.stdout.setEncoding('utf8');
-    for await (const part of child.stdout) {
-      text += part;
-      if (text.length > 1_048_576) throw new Error('Export helper CREATE response is oversized');
-    }
-    return text;
-  };
-  let raw: string;
-  try { [raw] = await Promise.all([body(), complete]); } catch (error) { child.kill(); throw error; }
-  const response = evidenceObject(JSON.parse(raw)), meta = evidenceObject(response.metadata);
+  const input = Buffer.from(JSON.stringify(expected));
+  const result = await run_tree_with_input(['kubectl', ...exportArgs(context, server, expected), 'create', '-f', '-', '-o', 'json'],
+    input, 20, 1_048_576);
+  requireEvidence(result.returncode === 0, 'Export helper CREATE outcome is unknown');
+  const response = evidenceObject(JSON.parse(result.stdout)), meta = evidenceObject(response.metadata);
   const uid = evidenceText(meta.uid);
   requireEvidence(response.kind === 'Pod' && meta.namespace === expected.metadata.namespace &&
     meta.name === expected.metadata.name && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(uid),

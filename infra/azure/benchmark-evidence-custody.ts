@@ -55,6 +55,34 @@ export async function readDirectEvidenceSeal(azure: Azure, authority: RunCleanup
   return seal;
 }
 
+export async function readSealedDirectTerminal(azure: Azure, authority: RunCleanupAuthority,
+  origin: DirectStopOrigin, seal: DirectEvidenceSeal) {
+  await authority.assertCurrent();
+  const [manifest, headers] = await azure.blob('GET', azure.c.checkpoints, seal.path, undefined, undefined, { 'If-Match': seal.etag });
+  requireEvidence(seal.path === `${directEvidencePrefix(origin)}/seal.json` && manifest &&
+    headers.etag === seal.etag && manifest.length === seal.bytes && sha256(manifest) === seal.sha256,
+  'Original terminal seal changed before reading its proof.');
+  const files = evidenceList(evidenceObject(JSON.parse(manifest.toString('utf8'))).files).map(evidenceObject);
+  const terminal = files.find(file => file.key === 'direct-terminal.json');
+  requireEvidence(terminal && typeof terminal.bytes === 'number' && terminal.bytes > 0 && terminal.bytes <= 32 * 1024 ** 2,
+    'Original terminal proof is missing or oversized.');
+  const parts: Buffer[] = [];
+  for (const [index, raw] of evidenceList(terminal.chunks).entries()) {
+    const chunk = evidenceObject(raw);
+    const key = `${directEvidencePrefix(origin)}/direct-terminal.json/${String(index).padStart(6, '0')}`;
+    requireEvidence(chunk.path === key && typeof chunk.etag === 'string', 'Original terminal proof chunk identity changed.');
+    await authority.assertCurrent();
+    const [bytes, version] = await azure.blob('GET', azure.c.checkpoints, key, undefined, undefined, { 'If-Match': chunk.etag });
+    requireEvidence(bytes && version.etag === chunk.etag && bytes.length === chunk.bytes && sha256(bytes) === chunk.sha256,
+      'Original terminal proof chunk is missing or changed.');
+    parts.push(bytes);
+  }
+  const bytes = Buffer.concat(parts);
+  requireEvidence(bytes.length === terminal.bytes && sha256(bytes) === terminal.sha256, 'Original terminal proof content changed.');
+  await authority.assertCurrent();
+  return { raw: bytes.toString('utf8'), terminal: evidenceObject(JSON.parse(bytes.toString('utf8'))), delta: files.filter(file => /^delta-\d{20}\.json$/.test(String(file.key))) };
+}
+
 export interface CapturedEvidence {
   key: string;
   path: string;
