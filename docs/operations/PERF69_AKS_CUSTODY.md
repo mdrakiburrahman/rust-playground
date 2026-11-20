@@ -10,11 +10,20 @@ Custody therefore runs as a watchdog on a dedicated, separately leased devbox, n
 | Lifetime | Six-hour hard maximum; heartbeats never extend expiry |
 | Ownership | Compare-and-swap ETags plus monotonic fencing tokens reject stale owners |
 | ARM operations | Poll and reconcile operation URLs only on `management.azure.com` and the selected subscription; uncertain operations remain unsettled |
-| Safe idle | Fixed system pool (autoscale explicitly off) 2×D8ds_v6, falling back to baseline 3×D8ds_v6 if any pod is unschedulable or a PDB blocks drain; bench pools 0 nodes with autoscale 0..1; Kusto at least Standard_E4ads_v5 ×2, autoscale 2..4, auto-stop on, never stopped |
+| Safe idle (legacy stamps) | Fixed system pool (autoscale explicitly off) 2×D8ds_v6, falling back to baseline 3×D8ds_v6 if any pod is unschedulable or a PDB blocks drain; bench pools 0 nodes with autoscale 0..1; Kusto at least Standard_E4ads_v5 ×2, autoscale 2..4, auto-stop on, never stopped |
 | Cleanup state machine | Fencing persists ordered, stable idempotency receipts; retries resume the same step, and completion requires every step to verify |
 | Cleanup adapter | Source/mocked only. Default CLI/watchdog providers install exact discovery, bounded lifecycle/journal recovery, namespace/QAP/FIC custody, ARM rollback and independent Delta/non-run Kusto preservation. External rehearsal remains mandatory; keep custody unarmed. |
 
 The helper APIs below expose the original QAP Blob custody without replacing its full ownership snapshot or positive workload-stop checks. E1 must persist the credential-free reference before load. `createDefaultCleanupProviders` installs concrete lifecycle/recovery and full-data observation by default; injection is optional for tests. External adapter rehearsal and independent watchdog lease renewal remain gates. Keep the campaign unarmed.
+
+For the Canada Central breakthrough stamp (68590), capacity-idle requires exactly
+five pools: the existing system pool at 3×D8ds_v6 with autoscaling pinned at
+3..3, and benchd64, benche64, supportd64 and arrowe192 at zero with autoscaling
+0..1. Kusto must independently meet the same idle requirements. The campaign
+baseline binds a separate ARM receipt to each pool. Fallback restoration for
+this profile is observation-only; drift remains pending for separately authorized
+reconciliation rather than writing to any pool or Kusto. Capacity-idle is not
+proof of workload or data safety.
 
 Before campaign load, exercise heartbeat expiry, stale-owner rejection, repeated cleanup, and a safe-idle no-op on the watchdog box. Confirm the final ARM state and preserve the evidence before handing the lease back. A cleanup operation that is pending or uncertain is never reported as complete.
 
