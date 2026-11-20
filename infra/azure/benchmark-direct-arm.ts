@@ -184,7 +184,7 @@ export async function armDirectBenchmark(azure: Azure, campaign: DirectCampaignS
       pending.metadata.resourceVersion === prepared.patch[0].value &&
       data.start === 'pending' && data.writerLifetime === 'pending' && data.clientLifetimes === 'pending',
     'Original schedule no longer matches the pending barrier');
-    return pending.metadata.uid;
+    return evidenceText(pending.metadata.uid);
   };
   const pendingUid = disposition === 'hold' ? await assertPending() : undefined;
   const { capture: writerClaim, ...writer } = prepared.writer;
@@ -220,7 +220,8 @@ export async function armDirectBenchmark(azure: Azure, campaign: DirectCampaignS
       'Original clients on a node do not share the sampled time namespace');
   }));
   const arm: DirectTerminalArm = {
-    ...(disposition === 'hold' ? { scheduleDisposition: 'held' as const } : {}),
+    ...(pendingUid ? { scheduleDisposition: 'held' as const,
+      heldBarrier: { uid: pendingUid, resourceVersion: evidenceText(prepared.patch[0].value) } } : {}),
     origin, baseline, startMs: prepared.measurementStartUnixMs, endMs: prepared.measurementEndUnixMs,
     clients: prepared.clients, writer, writerClaim, maintenance, sql, catalogLifetime, routers, registration: ready,
     routerUid, provenance: { release, catalog, catalogLog, clocks, schedule: prepared.patch,

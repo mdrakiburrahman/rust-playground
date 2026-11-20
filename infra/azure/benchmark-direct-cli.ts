@@ -139,9 +139,15 @@ function isDirectTerminalArm(value: unknown, base: Omit<DirectStopOrigin, 'clien
       try { evidenceObject(item); return true; } catch { return false; }
     });
     const held = Object.hasOwn(arm, 'scheduleDisposition');
+    const barrier = Object.hasOwn(arm, 'heldBarrier') ? evidenceObject(arm.heldBarrier) : undefined;
+    const schedule = Array.isArray(provenance.schedule) && provenance.schedule.length > 0 ? evidenceObject(provenance.schedule[0]) : undefined;
+    if (barrier && (!held || !exactKeys(barrier, ['uid', 'resourceVersion']) || typeof barrier.uid !== 'string' ||
+        !uuid.test(barrier.uid) || typeof barrier.resourceVersion !== 'string' || !/^[0-9]+$/.test(barrier.resourceVersion) ||
+        schedule?.op !== 'test' || schedule.path !== '/metadata/resourceVersion' || schedule.value !== barrier.resourceVersion)) return false;
     if (held && arm.scheduleDisposition !== 'held' ||
         !exactKeys(arm, ['origin', 'startMs', 'endMs', 'baseline', 'clients', 'writer', 'writerClaim', 'maintenance',
-        'sql', 'catalogLifetime', 'routers', 'registration', 'routerUid', 'provenance', ...(held ? ['scheduleDisposition'] : [])]) ||
+        'sql', 'catalogLifetime', 'routers', 'registration', 'routerUid', 'provenance', ...(held ? ['scheduleDisposition'] : []),
+        ...(barrier ? ['heldBarrier'] : [])]) ||
         !exactKeys(provenance, ['clocks', 'release', 'catalog', 'catalogLog', 'schedule', 'transport', 'parquet'])) return false;
     const armOrigin = evidenceObject(arm.origin), clients = armOrigin.clients;
     if (typeof clients !== 'number' || !Number.isInteger(clients) || clients < 1 || clients > 8) return false;

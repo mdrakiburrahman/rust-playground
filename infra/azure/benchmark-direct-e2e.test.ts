@@ -411,6 +411,11 @@ async function fixture(t: TestContext, fault: Fault, held = false) {
   };
   return { arm, runCli, cliArgs, releaseFile, load, store, loseBookkeeping: () => { loseBookkeeping = true; },
     scheduleData: () => JSON.parse(fs.readFileSync(statePath, 'utf8')).objects['configmap/direct-schedule-confirmwide'].data,
+    driftScheduleVersion: () => {
+      const live = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+      live.objects['configmap/direct-schedule-confirmwide'].metadata.resourceVersion = '34';
+      fs.writeFileSync(statePath, JSON.stringify(live));
+    },
     c, azure, directory, advanceClock: (ms: number) => {
       now += ms;
       state.now = now;
@@ -538,22 +543,30 @@ test('selected watchdog waits for original FIC, fences authorized null-QAP produ
   assert.equal(writes, 2);
 });
 
-test('offline CLI prepares a pending arm and recovers it without client input', async t => {
+for (const scenario of ['admitted', 'pre-admission', 'pre-admission drift'] as const) test(`offline CLI handles genuine held arm: ${scenario}`, async t => {
+  const loseAdmission = scenario !== 'admitted', drift = scenario === 'pre-admission drift';
   const f = await fixture(t, 'arm-write-unknown', true);
   assert.equal((await f.store.read())!.state.runInventory?.load_admission, 'not_authorized');
   await assert.rejects(f.runCli('arm'), /does not authorize/);
-  const prepared = await f.runCli('prepare');
-  assert.equal((await f.store.read())!.state.runInventory?.load_admission, 'authorized');
-  assert.equal(prepared.action, 'prepare');
-  if (prepared.action !== 'prepare') throw new Error('Pending arm result expected');
-  assert.equal(prepared.status, 'prepared_not_released');
-  const { arm } = prepared;
+  const path = directArmRecordPath(origin);
+  if (loseAdmission) {
+    await assert.rejects(f.runCli('prepare', { read: f.store.read.bind(f.store), async write() {
+      throw new Error('fixture producer stopped before admission CAS');
+    } }), /readback/);
+  } else {
+    const prepared = await f.runCli('prepare');
+    assert.equal(prepared.action, 'prepare');
+    if (prepared.action !== 'prepare') throw new Error('Pending arm result expected');
+    assert.equal(prepared.status, 'prepared_not_released');
+  }
+  assert.equal((await f.store.read())!.state.runInventory?.load_admission, loseAdmission ? 'not_authorized' : 'authorized');
+  const arm = JSON.parse(f.stored.get(path)!.bytes.toString());
   assert.equal(arm.origin.clients, 1);
   assert.equal(arm.clients.length, 1);
   assert.deepEqual(f.scheduleData(), { start: 'pending', writerLifetime: 'pending', clientLifetimes: 'pending' });
   assert.deepEqual(f.events().filter(event => ['arm-write', 'arm-readback', 'barrier-attempt', 'release'].includes(event.event))
     .map(event => event.event), ['arm-write', 'arm-readback']);
-  await assert.rejects(f.runCli('finish'), /never released the schedule/);
+  await assert.rejects(f.runCli('finish'), loseAdmission ? /does not authorize/ : /never released the schedule/);
   const { subscription, account, checkpoints } = f.c;
   const saved = (name: string, value: string) => {
     const file = join(f.directory, name);
@@ -608,6 +621,7 @@ test('offline CLI prepares a pending arm and recovers it without client input', 
 
   f.advanceClock(181_000);
   f.staleAuthority(true);
+  if (drift) f.driftScheduleVersion();
   const stateDir = join(f.directory, 'generated-envelope');
   fs.mkdirSync(stateDir, { mode: 0o700 });
   const envelopePath = saved('generated-recovery.json', recovery.stdout);
@@ -618,7 +632,8 @@ test('offline CLI prepares a pending arm and recovers it without client input', 
     '--expires-at', new Date(Date.now() + 300_000).toISOString(),
     '--release-file', f.releaseFile, '--recover-interrupted-context', 'fixture'],
   new AbortController().signal, async (_signal, tick) => {
-    assert.equal((await tick()).scopeStatus, 'direct_recovery_preserved_not_scored');
+    if (drift) await assert.rejects(tick(), /Original pre-admission pending barrier changed/);
+    else assert.equal((await tick()).scopeStatus, 'direct_recovery_preserved_not_scored');
     return 0;
   },
   { config: f.c, azure: f.azure, token: async () => 'fixture-token', fetcher: async (_input, init) => {
@@ -631,13 +646,16 @@ test('offline CLI prepares a pending arm and recovers it without client input', 
     }
     return new Response(JSON.stringify(current.state), { headers: { etag: current.etag } });
   } });
-  assert.equal(f.namespaceAbsent(), true);
-  assert.equal(f.credential(), null);
+  assert.equal(f.namespaceAbsent(), !drift);
+  if (drift) assert.ok(f.credential());
+  else assert.equal(f.credential(), null);
   assert.equal(fences, 1);
   assert.equal(f.scheduleData().start, 'pending');
   assert.ok(!f.events().some(event => ['barrier-attempt', 'release', 'load'].includes(event.event)));
   const seal = [...f.stored.entries()].find(([key]) => key.endsWith('/interrupted/seal.json'))?.[1];
-  assert.equal(JSON.parse(seal!.bytes.toString()).result, 'interrupted_not_scored');
+  if (drift) assert.equal(seal, undefined);
+  else assert.equal(JSON.parse(seal!.bytes.toString()).result, 'interrupted_not_scored');
+  assert.equal((await f.store.read())!.state.runInventory?.load_admission, loseAdmission ? 'not_authorized' : 'authorized');
 });
 
 for (const [fault, reason] of [

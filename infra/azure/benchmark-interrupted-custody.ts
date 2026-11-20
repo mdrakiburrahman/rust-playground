@@ -147,6 +147,20 @@ export async function recoverInterruptedDirectRun(azure: Azure, binding: Bound, 
   let sealed = await read(path, true);
   if (!sealed) {
     requireEvidence(fic.phase === 'ready', 'Original cleanup has no interrupted evidence seal');
+    if (binding.preAdmission) {
+      await assertNamespace();
+      const cm = evidenceObject(await get('configmap', 'direct-schedule-confirmwide'));
+      const meta = evidenceObject(cm.metadata), fields = evidenceObject(cm.data);
+      requireEvidence(cm.kind === 'ConfigMap' && meta.namespace === origin.namespace && meta.name === 'direct-schedule-confirmwide' &&
+        !meta.deletionTimestamp && meta.uid === arm.heldBarrier?.uid && meta.resourceVersion === arm.heldBarrier?.resourceVersion &&
+        fields.start === 'pending' && fields.writerLifetime === 'pending' && fields.clientLifetimes === 'pending',
+      'Original pre-admission pending barrier changed; no stop authorized.');
+      for (const field of ['annotations', 'labels']) {
+        const owner = evidenceObject(meta[field]);
+        requireEvidence(owner['arrowcol-oat/run-id'] === origin.runId && owner['arrowcol-oat/owner-token'] === origin.owner,
+          'Original pre-admission pending barrier ownership changed.');
+      }
+    }
     const drain = await freeze();
     const delta = await capture();
     for (const file of delta.bytes) await persist(`${prefix}/${file.key}`, file.content);

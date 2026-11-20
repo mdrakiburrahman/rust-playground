@@ -133,6 +133,11 @@ function generate(config: Config, campaignRecord: unknown, ficRecord: unknown, c
   };
   const observe = (id: string, args: string[], count = 12) => get(id, [...selected, 'get', ...args, '-o', 'json'], count);
   observe('namespace-read', ['namespace', namespace]);
+  if (inventory.load_admission === 'not_authorized') {
+    requireEvidence(arm.scheduleDisposition === 'held' && arm.heldBarrier,
+      'Pre-admission allocation requires the original held barrier proof');
+    observe('pending-barrier-read', ['configmap', 'direct-schedule-confirmwide']);
+  }
   observe('router-read', ['daemonset', 'arrowcol-router'], 450);
   observe('router-pods', ['pods', '-l', 'app=arrowcol-router'], 450);
   for (const service of ['arrowcol-router', 'arrowcol-router-node-local'])

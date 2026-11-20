@@ -211,7 +211,8 @@ export interface DirectSetup {
   schemaVersion: 1;
   runId: string;
   baselineEtag: string | null;
-  firstPool: null | { resourceId: string; expectedEtag: string; bodySha256: string; requestId: string; response: null | { status: 200 | 201 | 202; requestId: string } };
+  firstPool: null | { resourceId: string; expectedEtag: string; bodySha256: string; requestId: string;
+    response: null | { status: 200 | 201 | 202; requestId: string; operationUrl?: string } };
 }
 export interface StoredCampaign { state: CampaignState; etag: string; }
 export interface CampaignStoreReadOptions { maxResponseBodyBytes?: number; deadlineUnixMs?: number; }
@@ -716,8 +717,9 @@ export function validateCampaignState(value: unknown): CampaignState {
         (pool !== null && (!exactRecord(pool, ['resourceId', 'expectedEtag', 'bodySha256', 'requestId', 'response']) ||
           !setup.baselineEtag || pool.resourceId !== inv.fic.plan.aksId + '/agentPools/arrowe192' ||
           !strongSetupEtag(pool.expectedEtag) || !/^[a-f0-9]{64}$/.test(pool.bodySha256) || !canonicalUuid(pool.requestId) ||
-          (pool.response !== null && (!exactRecord(pool.response, ['status', 'requestId']) ||
-            ![200, 201, 202].includes(pool.response.status) || !nonempty(pool.response.requestId))))) ||
+          (pool.response !== null && (!optionalRecord(pool.response, ['status', 'requestId'], ['operationUrl']) ||
+            ![200, 201, 202].includes(pool.response.status) || !nonempty(pool.response.requestId) ||
+            (pool.response.operationUrl !== undefined && !directPoolOperationUrl(pool.response.operationUrl, pool.resourceId)))))) ||
         (state.status === 'setup_retired' && pool !== null))
       throw new Error('Invalid bounded direct setup custody record.');
   } else if (state.status === 'setup_retired') throw new Error('Retirement requires original bounded direct setup custody.');
@@ -725,6 +727,13 @@ export function validateCampaignState(value: unknown): CampaignState {
 }
 
 function strongSetupEtag(etag: unknown): etag is string { return typeof etag === 'string' && /^"[^"\r\n]+"$/.test(etag); }
+
+export function directPoolOperationUrl(value: unknown, poolResourceId: string): value is string {
+  const subscription = /^\/subscriptions\/([a-f0-9-]{36})\//i.exec(poolResourceId)?.[1];
+  if (!subscription || typeof value !== 'string' || value.length > 1024) return false;
+  const match = /^https:\/\/management\.azure\.com\/subscriptions\/([a-f0-9-]{36})\/providers\/Microsoft\.ContainerService\/locations\/[a-z0-9-]+\/(?:operations|operationResults)\/([a-z0-9_-]+)\?api-version=2024-10-01$/i.exec(value);
+  return match?.[1]?.toLowerCase() === subscription.toLowerCase();
+}
 
 export function newCampaignState(campaignId: string, ownerId: string, now = Date.now()): CampaignState {
   if (!uuid.test(campaignId) || !uuid.test(ownerId) || !nonnegative(now) || !Number.isSafeInteger(now + MAX_CAMPAIGN_LIFETIME_MS))
@@ -1264,7 +1273,8 @@ export async function campaignMain(args: string[], dependencies: {
       throw new Error('Direct setup plan does not match the configured stamp identity.');
     const result = await startDirectSetup(store, campaignId!, args[2]!, inventory);
     console.log(JSON.stringify({ ok: true, receipt: campaignStartReceipt(result.state) }));
-  } else if (['dispatch-direct-first-pool', 'cancel-direct-setup'].includes(action ?? '') && args.length === 3 && /^\d+$/.test(fencingTokenText!)) {
+  } else if (['dispatch-direct-first-pool', 'inspect-direct-first-pool', 'cancel-direct-setup'].includes(action ?? '') &&
+      args.length === 3 && /^\d+$/.test(fencingTokenText!)) {
     const scope = await store.read();
     if (!scope?.state.directSetup || scope.state.ownerId !== campaignId || scope.state.fencingToken !== Number(fencingTokenText))
       throw new CampaignFencedError();
@@ -1272,6 +1282,10 @@ export async function campaignMain(args: string[], dependencies: {
     if (action === 'cancel-direct-setup') {
       const retired = await retireUntouchedDirectSetup(store, scope);
       console.log(JSON.stringify({ ok: true, status: retired.state.status, campaignId: retired.state.campaignId }));
+    } else if (action === 'inspect-direct-first-pool') {
+      const { inspectFirstDirectPool } = await import('./aks-direct-setup.js');
+      console.log(JSON.stringify({ ok: true, campaignId: scope.state.campaignId,
+        status: await inspectFirstDirectPool(store, azure, scope) }));
     } else {
       requireOwner(scope.state, campaignId!, Number(fencingTokenText), Date.now());
       const { dispatchFirstDirectPool } = await import('./aks-direct-setup.js');
@@ -1371,7 +1385,7 @@ export async function campaignMain(args: string[], dependencies: {
     }
     console.log(JSON.stringify({ ok: true, receipt }));
   } else {
-    throw new Error('Usage: aks-campaign.ts <start|start-direct-setup|dispatch-direct-first-pool|cancel-direct-setup|heartbeat|capture-baseline|arm|publish-inventory|assert-ready|read-inventory|capture-cell-baseline|cleanup-step|status> [arguments] --env-file PATH --stamp-config YAML');
+    throw new Error('Usage: aks-campaign.ts <start|start-direct-setup|dispatch-direct-first-pool|inspect-direct-first-pool|cancel-direct-setup|heartbeat|capture-baseline|arm|publish-inventory|assert-ready|read-inventory|capture-cell-baseline|cleanup-step|status> [arguments] --env-file PATH --stamp-config YAML');
   }
 }
 if (process.argv[1] && ['aks-campaign.ts', 'aks-campaign.js'].includes(path.basename(process.argv[1])) && import.meta.url === pathToFileURL(process.argv[1]).href) {

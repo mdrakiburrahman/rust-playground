@@ -140,13 +140,19 @@ does not require a live client. If the review cannot fit, hold; only a separatel
 reviewed bounded startup timeout set before client creation could extend it.
 Do not retime, restart or replace a READY client.
 
-This boundary does not settle every partial setup. If the producer exits
-before the final CAS, preserve the original inventory and any original arm.
-The selected direct recovery grant requires `authorized`; do not rerun
-`prepare`, manually promote admission, or infer historical non-release from
-pending fields. An observe record is not proof of no outside effects, and
-partial setup without exact namespace/FIC and Delta proof is not verified
-cleanup. Keep these cases pending for reconciliation.
+If the producer exits before the final admission CAS, retain the original
+inventory and arm. Selected interrupted recovery can use a genuinely held
+arm while the inventory is still `not_authorized` only if that original
+arm captured the schedule ConfigMap UID and resourceVersion before writing
+the arm. Generate the single original recovery grant from those records.
+Before stopping anything, the controller rechecks exact namespace and
+ConfigMap ownership, UID, resourceVersion, and all three pending fields.
+An older held arm without the versioned binding or a changed ConfigMap is
+pending; do not infer historical non-release from pending text, rerun
+`prepare`, promote admission, or allocate a replacement grant.
+
+Pre-arm or unverified partial setup without exact namespace/FIC and Delta
+proof is not verified cleanup. Keep these cases pending for reconciliation.
 
 The bounded setup-cancellation candidate is **offline-only**, not a
 rehearsal procedure. `start-direct-setup CAMPAIGN OWNER` takes the original
@@ -165,6 +171,14 @@ workload or data cleanup. An ambiguous floor response leaves the original
 request ID, precondition and payload hash durable. Neither an unchanged
 readback nor a matching floor later proves the operation settled. Do not
 repeat it, retire the campaign, or restore a floor on that evidence alone.
+
+`inspect-direct-first-pool OWNER 1` is read-only. It queries only the
+original AKS `azure-asyncoperation` URL captured from the matching PUT
+response. No intent yields `not_dispatched`; no original operation URL
+or an indeterminate response yields `unknown`. A terminal operation
+status is not floor restoration or verified idle. This version does not
+reconcile a lost ACK without a durable provider operation URL and has
+no guarded namespace/FIC provisioning or capacity reversal entrypoint.
 
 Generate a candidate allocation offline from private exports of the original
 armed `active.json`, the ready run record independently read from the FIC

@@ -59,7 +59,7 @@ const seed = async (now = 1_000_000) => {
   await startCampaign(store, campaignId, ownerId, now);
   return store;
 };
-function directSetupFixture(fault: 'none' | 'lost-pool-ack' | 'lost-intent-write' | 'lost-start-ack') {
+function directSetupFixture(fault: 'none' | 'lost-pool-ack' | 'lost-intent-write' | 'lost-start-ack' | 'original-operation') {
   const store = new MemoryStore(), inventory = inventoryFor(newCampaignState(campaignId, ownerId));
   const { cell_run_id: runId, namespace } = inventory;
   const base = `/subscriptions/${subscriptionId}/resourceGroups/perf69`, identityId = `${base}/providers/Microsoft.ManagedIdentity/userAssignedIdentities/arrow-collector`;
@@ -77,7 +77,13 @@ function directSetupFixture(fault: 'none' | 'lost-pool-ack' | 'lost-intent-write
   const config = { base, cluster: 'bench', identity_id: identityId, subscription: subscriptionId, account: 'fixtureaccount',
     checkpoints: 'checkpoints' } as Config;
   const calls: string[] = [];
+  const operation = `https://management.azure.com/subscriptions/${subscriptionId}/providers/Microsoft.ContainerService/locations/westus/operations/original?api-version=2024-10-01`;
   const request: Azure['request'] = async (method, url, _resource, body, headers, _missingOk, idempotent) => {
+    if (url === operation) {
+      assert.equal(method, 'GET');
+      calls.push('GET original operation');
+      return [Buffer.from('{"status":"Succeeded"}'), { ':status': '200' }];
+    }
     calls.push(method);
     const id = resourceId + '/agentPools/arrowe192';
     assert.equal(url, `https://management.azure.com${id}?api-version=2024-10-01`);
@@ -93,7 +99,8 @@ function directSetupFixture(fault: 'none' | 'lost-pool-ack' | 'lost-intent-write
     assert.equal(createHash('sha256').update(body!).digest('hex'), intent.bodySha256);
     assert.equal(JSON.parse(body!.toString()).properties.minCount, 1);
     if (fault === 'lost-pool-ack') throw new Error('injected unknown pool effect');
-    return [null, { ':status': '202', 'x-ms-request-id': 'fixture-pool-ack' }];
+    return [null, { ':status': '202', 'x-ms-request-id': 'fixture-pool-ack',
+      ...(fault === 'original-operation' ? { 'azure-asyncoperation': operation } : {}) }];
   };
   const azure = { c: config, request } as Azure;
   const write = store.write.bind(store);
@@ -110,6 +117,19 @@ function directSetupFixture(fault: 'none' | 'lost-pool-ack' | 'lost-intent-write
       fencing_token: 1, etag: '"original-baseline"', blob: 'fixture-baseline', captured_at_unix_ms: state.startedAtMs }) });
   return { cli, store, calls };
 }
+
+test('direct setup CLI inspects only the exact persisted original provider operation and never treats it as restoration', async () => {
+  const { cli, store, calls } = directSetupFixture('original-operation');
+  await cli('start-direct-setup', campaignId, ownerId);
+  await cli('inspect-direct-first-pool', ownerId, '1');
+  assert.deepEqual(calls, []);
+  await cli('dispatch-direct-first-pool', ownerId, '1');
+  const before = await store.read();
+  await cli('inspect-direct-first-pool', ownerId, '1');
+  assert.deepEqual(calls, ['GET', 'PUT', 'GET original operation']);
+  assert.deepEqual(await store.read(), before);
+  await assert.rejects(cli('cancel-direct-setup', ownerId, '1'), /zero provisioning dispatch/);
+});
 
 test('direct setup CLI retires original start-only loss without claiming cleanup or touching outside resources', async () => {
   const { cli, store, calls } = directSetupFixture('lost-start-ack');
@@ -157,6 +177,7 @@ for (const fault of ['lost-pool-ack', 'lost-intent-write'] as const) test(`direc
     assert.equal(state.directSetup?.firstPool?.response, null);
     await assert.rejects(cli('dispatch-direct-first-pool', ownerId, '1'), /do not replay/);
     await assert.rejects(cli('cancel-direct-setup', ownerId, '1'), /zero provisioning dispatch/);
+    await cli('inspect-direct-first-pool', ownerId, '1');
     assert.deepEqual(calls, ['GET', 'PUT']);
   } else {
     assert.equal(state.directSetup?.firstPool, null);

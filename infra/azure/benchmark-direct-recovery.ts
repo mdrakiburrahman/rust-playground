@@ -18,10 +18,11 @@ export async function inspectDirectRecovery(azure: Azure, store: CampaignStore, 
   release: DirectRelease, signal: AbortSignal, workDirectory: string, interrupted = false) {
   const { state, etag } = selected;
   const inventory = state.runInventory;
+  const preAdmission = interrupted && inventory?.load_admission === 'not_authorized';
   requireEvidence(inventory && /^"[^"\r\n]+"$/.test(etag) && state.mode === 'armed' &&
     (state.status === 'fenced' || state.status === 'cleaning') &&
     state.campaignId === inventory.campaign_id && state.ownerId === inventory.owner_id &&
-    state.fencingToken === inventory.fencing_token + 1 && inventory.load_admission === 'authorized' &&
+    state.fencingToken === inventory.fencing_token + 1 && (inventory.load_admission === 'authorized' || preAdmission) &&
     inventory.qap === null && inventory.namespace.uid && inventory.namespace.owner_token === state.ownerId &&
     inventory.fic?.plan, 'Direct recovery requires the exact fenced authorized inventory and original FIC plan.');
   const assertCurrent = async () => {
@@ -47,6 +48,8 @@ export async function inspectDirectRecovery(azure: Azure, store: CampaignStore, 
   const arm = await loadDurableArm(azure, { runId: inventory.cell_run_id, namespace: inventory.namespace.name,
     owner: inventory.namespace.owner_token, namespaceUid: inventory.namespace.uid, sourceRevision: release.revision,
     cloudGeneration: publisher.resetgeneration, fencingToken: inventory.fencing_token }, release);
+  requireEvidence(!preAdmission || arm.scheduleDisposition === 'held' && arm.heldBarrier,
+    'Pre-admission recovery needs an original held arm with versioned barrier proof.');
   assertDirectInventory(azure, inventory, fic, 'finish', arm);
   const seal = await readDirectEvidenceSeal(azure, authority, arm.origin);
   requireEvidence(interrupted || fic.phase === 'ready' || !!seal, 'FIC deletion has no original terminal seal.');
@@ -79,5 +82,5 @@ export async function inspectDirectRecovery(azure: Azure, store: CampaignStore, 
   requireEvidence(afterEtag === publisherEtag && canonical_json(after) === canonical_json(publisher) &&
     canonical_json(afterRegistry) === canonical_json(registry), 'Publisher authority changed during direct recovery inspection.');
   await assertCurrent();
-  return { arm, fic, seal, authority };
+  return { arm, fic, seal, authority, preAdmission };
 }

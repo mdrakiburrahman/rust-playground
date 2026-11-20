@@ -29,6 +29,7 @@ type Stop = Awaited<ReturnType<typeof persistDirectStopPatch>>;
 type RouterEndpoints = Parameters<typeof routerFenceObserved>[5];
 export type DirectTerminalArm = {
   scheduleDisposition?: 'held';
+  heldBarrier?: { uid: string; resourceVersion: string };
   origin: DirectStopOrigin;
   startMs: number;
   endMs: number;
