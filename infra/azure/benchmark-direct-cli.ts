@@ -153,6 +153,11 @@ function isDirectTerminalArm(value: unknown, base: Omit<DirectStopOrigin, 'clien
   } catch { return false; }
 }
 
+export function validateDurableArm(value: unknown, base: Omit<DirectStopOrigin, 'clients'>, release: DirectRelease): DirectTerminalArm {
+  if (!isDirectTerminalArm(value, base, release)) throw new Error('Original off-node arm record does not match the authorized run and immutable release.');
+  return value;
+}
+
 export async function loadDurableArm(azure: Azure, base: Omit<DirectStopOrigin, 'clients'>, release: DirectRelease): Promise<DirectTerminalArm> {
   const path = directArmRecordPath({ ...base, clients: 1 });
   const [bytes, headers] = await azure.blob('GET', azure.c.checkpoints, path, undefined, undefined, {}, false, true);
@@ -161,8 +166,7 @@ export async function loadDurableArm(azure: Azure, base: Omit<DirectStopOrigin, 
   let value: unknown;
   try { value = JSON.parse(bytes.toString('utf8')); }
   catch { throw new Error('Original off-node arm record is not readable JSON.'); }
-  if (!isDirectTerminalArm(value, base, release)) throw new Error('Original off-node arm record does not match the authorized run and immutable release.');
-  return value;
+  return validateDurableArm(value, base, release);
 }
 
 function resolveOptionsConfig(options: Options, loadConfig: DirectCliDependencies['loadConfig']): LoadedConfig {

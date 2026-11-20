@@ -107,6 +107,44 @@ fresh server-tested UID/resourceVersion preconditions and durable exact-body
 intent/readback. Namespace DELETE sends the allocated UID precondition bytes
 through stdin; no temporary pathname grants mutation authority.
 
+Generate a candidate allocation offline from private exports of the original
+armed `active.json`, the ready run record independently read from the FIC
+ledger, and the explicit stamp configuration. No Azure or Kubernetes calls
+are made by the generator. Use a new private output path:
+
+```bash
+set -o noclobber
+umask 077
+args=(--env-file "$ENV" --stamp-config "$STAMP"
+  --campaign-record "$ORIGINAL_CAMPAIGN" --fic-record "$ORIGINAL_FIC"
+  --campaign-reads "$REVIEWED_CAMPAIGN_READ_BUDGET")
+npx --no-install tsx projects/arrowcol-oat/aks-watchdog-envelope.ts \
+  "${args[@]}" --mode fence > "$FENCE_ENVELOPE"
+npx --no-install tsx projects/arrowcol-oat/aks-watchdog-envelope.ts \
+  "${args[@]}" --mode recovery --arm-record "$ORIGINAL_ARM" \
+  --release-file "$ORIGINAL_RELEASE" --context "$ORIGINAL_KUBE_CONTEXT" \
+  --delta-read-set "$DELTA_READ_SET" > "$RECOVERY_ENVELOPE"
+```
+
+The recovery read set is private JSON with `schema_version: 1`,
+`arm_sha256` (SHA-256 of the repository's canonical JSON for the durable
+arm), `max_delta_version` (inclusive bound), `parquet_paths` (exact paths
+relative to the arm's table root), and `delta_markers` (exact nonempty
+continuation tokens from the original Delta log listing). Use independently
+reviewed durable inventory evidence for these lists. The first list page is
+always allocated. Recovery enumerates JSON versions from zero and refuses
+allocations exceeding the 512-rule transport limit. The arm cannot predict
+future commit versions, physical files or pagination. Any unallocated
+target holds recovery; do not extend a running, pinned allocation. This
+allocation covers interrupted recovery without a producer seal, not
+arbitrary producer evidence chunks or paged ARM responses.
+
+Review the candidate and the finite budgets against the approved expiry and
+drain window. These outputs are alternatives for initial selection, not
+successive grants on one journal: do not swap a fence allocation for recovery
+or reset the journal after any effect. Generation is not live transport,
+credential, or watchdog readiness qualification.
+
 `direct_recovery_preserved_not_scored` means both original exits, sealed
 interrupted Delta evidence, exact namespace/FIC removal and independent
 post-removal Delta verification were observed. It does not settle the shared

@@ -10,7 +10,8 @@ import { runDirectBenchmarkCli } from './benchmark-direct-cli.js';
 import { directEvidencePrefix } from './benchmark-evidence-custody.js';
 import { directArmRecordPath, finishDirectTerminalCustody } from './benchmark-terminal-custody.js';
 import { plan_run_fic, prepare_run_fic, read_run_fic_record, run_fic_ledger_path } from './run_fic.js';
-import { watchSelectedRun } from '../../projects/arrowcol-oat/aks-scoped-watchdog.js';
+import { validateEffects, validateRecoveryTargets, watchSelectedRun } from '../../projects/arrowcol-oat/aks-scoped-watchdog.js';
+import { parseEnvelope } from './effect-boundary.js';
 import { inspectDirectRecovery } from './benchmark-direct-recovery.js';
 import { ENCODING, MAX_RECORDS } from './benchmark-manifest-audit.js';
 import { parseEvidence } from './benchmark-evidence-json.js';
@@ -522,6 +523,89 @@ test('selected watchdog waits for original FIC, fences authorized null-QAP produ
   await f.store.write(fenced.state, replacement.etag);
   await watch(async tick => assert.equal((await tick()).scopeStatus, 'fenced_cleanup_blocked'), raceDir);
   assert.equal(writes, 2);
+});
+
+test('offline CLI derives deterministic allocations from durable direct custody records', async t => {
+  const f = await fixture(t, 'none');
+  const arm = await f.arm();
+  const { subscription, account, checkpoints } = f.c;
+  const saved = (name: string, value: string) => {
+    const file = join(f.directory, name);
+    fs.writeFileSync(file, value, { mode: 0o600 });
+    return file;
+  };
+  const cli = ['--import', 'tsx', 'projects/arrowcol-oat/aks-watchdog-envelope.ts',
+    '--env-file', saved('allocation.env', [
+      `AZURE_SUBSCRIPTION_ID=${subscription}`, `ARM_SUBSCRIPTION_ID=${subscription}`,
+      `CAMPAIGN_STORAGE_ACCOUNT=${account}`, `CAMPAIGN_STATE_CONTAINER=${checkpoints}`,
+    ].join('\n') + '\n'),
+    '--stamp-config', saved('allocation.yaml', JSON.stringify(f.c.stampConfig)),
+    '--campaign-record', saved('campaign.json', JSON.stringify((await f.store.read())!.state)),
+    '--fic-record', f.ficPath, '--campaign-reads', '600'];
+  const armBytes = f.stored.get(directArmRecordPath(arm.origin))!.bytes.toString();
+  const savedArm = JSON.parse(armBytes);
+  const readSet = { schema_version: 1, arm_sha256: createHash('sha256').update(canonical_json(savedArm)).digest('hex'),
+    max_delta_version: 1, parquet_paths: ['hour=0/a.parquet'], delta_markers: [] };
+  const readsPath = saved('reads.json', JSON.stringify(readSet));
+  const run = (...args: string[]) => spawnSync(process.execPath, [...cli, ...args], { encoding: 'utf8' });
+  const fence = run('--mode', 'fence');
+  assert.equal(fence.status, 0, fence.stderr);
+  const fenceEnvelope = parseEnvelope(JSON.parse(fence.stdout));
+  assert.equal(validateEffects(fenceEnvelope, false, false), 'campaign-fence');
+  assert.throws(() => validateEffects({ ...fenceEnvelope, effects: fenceEnvelope.effects.map(rule =>
+    rule.id === 'campaign-fence' ? { ...rule, max_calls: 2 } : rule) }, false, false), /one conditional PUT/);
+
+  const recoveryArgs = ['--mode', 'recovery', '--context', 'fixture', '--release-file', f.releaseFile,
+    '--arm-record', saved('durable-arm.json', armBytes), '--delta-read-set', readsPath];
+  const recovery = run(...recoveryArgs);
+  assert.equal(recovery.status, 0, recovery.stderr);
+  assert.equal(run(...recoveryArgs).stdout, recovery.stdout);
+  const envelope = parseEnvelope(JSON.parse(recovery.stdout));
+  assert.equal(validateEffects(envelope, true, true), 'campaign-fence');
+  const fic = read_run_fic_record(f.ficPath, f.c);
+  validateRecoveryTargets(envelope, f.c, savedArm, fic, 'fixture');
+  for (const [id, mutate, reason] of [
+    ['namespace-delete', { body_sha256: '0'.repeat(64) }, /exact original namespace UID/],
+    ['stop-arrowcol', { path: '{}' }, /exact conditional stop/],
+    ['fic-delete', { path: `${fic.identityId}/another?api-version=2023-01-31` }, /exact original FIC/],
+  ] as const) {
+    const changed = parseEnvelope({ ...envelope, effects: envelope.effects.map(rule => rule.id === id ? { ...rule, ...mutate } : rule) });
+    assert.throws(() => validateRecoveryTargets(changed, f.c, savedArm, fic, 'fixture'), reason);
+  }
+  const file = envelope.effects.find(rule => rule.id === 'delta-file-0');
+  assert.equal(file?.path, `/${f.c.data}/${savedArm.baseline.table_root}/hour%3D0/a.parquet`);
+  assert.ok(envelope.effects.some(rule => rule.method === 'PUT' && rule.path.endsWith('/interrupted/delta-00000000000000000000.json')));
+  assert.ok(envelope.effects.some(rule => rule.method === 'PUT' && rule.path.endsWith('/interrupted/delta-00000000000000000001.json')));
+  saved('reads.json', JSON.stringify({ ...readSet, arm_sha256: '0'.repeat(64) }));
+  const mismatch = run(...recoveryArgs);
+  assert.equal(mismatch.status, 1);
+  assert.equal(mismatch.stdout, '');
+  assert.match(mismatch.stderr, /original arm hash/);
+
+  f.addInterruptedCommit(arm.startMs, arm.endMs);
+  f.advanceClock(181_000);
+  f.staleAuthority(true);
+  const { reconcileOnce } = await import('../../projects/arrowcol-oat/aks-reconcile.js');
+  await reconcileOnce(f.store, Date.now(), true);
+  const stateDir = join(f.directory, 'generated-envelope');
+  fs.mkdirSync(stateDir, { mode: 0o700 });
+  const envelopePath = saved('generated-recovery.json', recovery.stdout);
+  await watchSelectedRun(['--env-file', 'fixture.env', '--stamp-config', 'fixture.yaml',
+    '--effect-envelope', envelopePath, '--state-dir', stateDir, '--fic-record', f.ficPath,
+    '--owner-id', origin.owner, '--namespace', origin.namespace, '--namespace-owner', origin.owner,
+    '--expires-at', new Date(Date.now() + 300_000).toISOString(),
+    '--release-file', f.releaseFile, '--recover-interrupted-context', 'fixture'],
+  new AbortController().signal, async (_signal, tick) => {
+    assert.equal((await tick()).scopeStatus, 'direct_recovery_preserved_not_scored');
+    return 0;
+  },
+  { config: f.c, azure: f.azure, token: async () => 'fixture-token', fetcher: async (_input, init) => {
+    assert.notEqual(init?.method, 'PUT');
+    const current = (await f.store.read())!;
+    return new Response(JSON.stringify(current.state), { headers: { etag: current.etag } });
+  } });
+  assert.equal(f.namespaceAbsent(), true);
+  assert.equal(f.credential(), null);
 });
 
 for (const fault of ['none', 'stop-unknown', 'exit-unknown'] as const) test(

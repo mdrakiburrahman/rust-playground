@@ -15,7 +15,7 @@ const workload = [
   { api_version: 'batch/v1', kind: 'Job', name: 'direct-load-confirmwide', role: 'client' },
 ] as const;
 
-export function assertDirectInventory(azure: Azure, inventory: RunInventory, fic: RunFicRecord, action: 'arm' | 'finish',
+export function assertDirectInventory(azure: Pick<Azure, 'c'>, inventory: RunInventory, fic: RunFicRecord, action: 'arm' | 'finish',
   arm?: DirectTerminalArm): void {
   const prefix = directEvidencePrefix({ runId: fic.runId, namespaceUid: fic.namespaceUid });
   requireEvidence(inventory.qap === null && !inventory.official_measurement &&

@@ -47,7 +47,7 @@ type ScopedEvent = 'waiting_campaign' | 'waiting_inventory' | 'waiting_binding' 
   'bound_fence_only' | 'fenced_cleanup_blocked' | 'selected_complete' | 'selected_complete_unsettled' |
   'direct_recovery_unsealed' | 'direct_recovery_seal_observed' | 'direct_recovery_preserved_not_scored';
 
-function validateEffects(envelope: EffectEnvelope, inspect: boolean, recover: boolean) {
+export function validateEffects(envelope: EffectEnvelope, inspect: boolean, recover: boolean) {
   const origin = `https://${envelope.storage_account}.blob.core.windows.net/${envelope.state_container}`;
   const blobPath = `/${envelope.state_container}/${ACTIVE_RECORD}`;
   const tokenPath = JSON.stringify(['account', 'get-access-token', '--subscription', envelope.subscription_id,
@@ -273,43 +273,48 @@ export async function watchSelectedRun(args: string[], signal: AbortSignal,
       const { arm, fic } = inspected;
       pin(path.join(stateDir, 'direct-recovery-origin.json'), { arm, aks: fic.aksId, server: fic.server,
         identity: fic.identityId, credential: fic.credentialName, ownershipNonce: fic.ownershipNonce });
-      for (const [role, uid] of [['arrowcol-router', arm.routerUid], ['arrowcol', arm.writer.deploymentUid],
-        ['delta-maintenance', arm.maintenance.deploymentUid]] as const) {
-        const argv = directConditionalStopArgv(recoveryContext, fic.server, arm.origin, role);
-        if (!envelope.effects.some(rule => rule.transport === 'process' && rule.method === 'KUBECTL_DIRECT_STOP' &&
-            rule.resource === 'kubectl' && rule.path === JSON.stringify({ argv, uid }) && rule.max_calls === 1))
-          throw new Error('Missing exact conditional stop allocation for the original workload.');
-      }
-      const checkpointPath = '/' + config.checkpoints;
-      const storage = 'https://' + config.account + '.blob.core.windows.net|https://storage.azure.com/';
-      const direct = checkpointPath + '/_arrowcol-custody/direct/' + arm.origin.runId + '/' + arm.origin.namespaceUid;
-      const ledger = checkpointPath + '/' + run_fic_ledger_path(config);
-      const namespaceJournal = checkpointPath + '/_arrowcol-custody/namespaces/' + arm.origin.runId + '/' + arm.origin.namespaceUid + '.json';
-      const ficPath = fic.identityId + '/federatedIdentityCredentials/' + fic.credentialName + '?api-version=2023-01-31';
-      const namespaceDelete = JSON.stringify(['--server', fic.server, '--insecure-skip-tls-verify=false',
-        '--request-timeout', '15s', 'delete', '--raw', '/api/v1/namespaces/' + fic.namespace, '-f', '-']);
-      const namespaceDigest = createHash('sha256').update(canonical_json({ apiVersion: 'v1', kind: 'DeleteOptions',
-        preconditions: { uid: fic.namespaceUid } })).digest('hex');
-      for (const rule of envelope.effects) {
-        if (rule.transport === 'azure-rest' && rule.method === 'DELETE' &&
-            (rule.resource !== 'https://management.azure.com|https://management.azure.com/' || rule.path !== ficPath || rule.max_calls !== 1))
-          throw new Error('Recovery DELETE allocation is not the exact original FIC.');
-        if (rule.transport === 'process' && rule.method === 'KUBECTL_DELETE' &&
-            (rule.path !== namespaceDelete || rule.body_sha256 !== namespaceDigest))
-          throw new Error('Recovery DELETE allocation is not the exact original namespace UID.');
-        if (rule.transport !== 'azure-rest' || rule.method !== 'PUT') continue;
-        const fixed = [ledger, ledger + '?comp=lease', namespaceJournal, checkpointPath + '?comp=lease&restype=container',
-          checkpointPath + '?restype=container&comp=metadata', direct + '/interrupted/seal.json',
-          ...['arrowcol-router', 'arrowcol', 'delta-maintenance'].map(role => direct + '/stop-' + role + '.json'),
-          ...['arrowcol', 'delta-maintenance'].map(role => direct + '/exit-' + role + '.json')];
-        const commit = rule.path.startsWith(direct + '/interrupted/') && /^delta-[0-9]{20}[.]json$/.test(rule.path.slice((direct + '/interrupted/').length));
-        if (rule.resource !== storage || (!fixed.includes(rule.path) && !commit))
-          throw new Error('Recovery PUT allocation is outside the original custody targets.');
-      }
+      validateRecoveryTargets(envelope, config, arm, fic, recoveryContext);
       return recoverInterruptedDirectRun(azure, inspected, recoveryContext, stateDir, stop);
     } : undefined);
     const result = await supervise(stop, () => withEffectBoundary(boundary, tick, undefined, stop));
     if (expires.aborted) throw new Error('Scoped watchdog allocation expired.');
     return result;
   } finally { fs.rmdirSync(lock); }
+}
+
+export function validateRecoveryTargets(envelope: EffectEnvelope, config: Config,
+  arm: Awaited<ReturnType<typeof inspectDirectRecovery>>['arm'], fic: RunFicRecord, recoveryContext: string) {
+  for (const [role, uid] of [['arrowcol-router', arm.routerUid], ['arrowcol', arm.writer.deploymentUid],
+    ['delta-maintenance', arm.maintenance.deploymentUid]] as const) {
+    const argv = directConditionalStopArgv(recoveryContext, fic.server, arm.origin, role);
+    if (!envelope.effects.some(rule => rule.transport === 'process' && rule.method === 'KUBECTL_DIRECT_STOP' &&
+        rule.resource === 'kubectl' && rule.path === JSON.stringify({ argv, uid }) && rule.max_calls === 1))
+      throw new Error('Missing exact conditional stop allocation for the original workload.');
+  }
+  const checkpointPath = '/' + config.checkpoints;
+  const storage = 'https://' + config.account + '.blob.core.windows.net|https://storage.azure.com/';
+  const direct = checkpointPath + '/_arrowcol-custody/direct/' + arm.origin.runId + '/' + arm.origin.namespaceUid;
+  const ledger = checkpointPath + '/' + run_fic_ledger_path(config);
+  const namespaceJournal = checkpointPath + '/_arrowcol-custody/namespaces/' + arm.origin.runId + '/' + arm.origin.namespaceUid + '.json';
+  const ficPath = fic.identityId + '/federatedIdentityCredentials/' + fic.credentialName + '?api-version=2023-01-31';
+  const namespaceDelete = JSON.stringify(['--server', fic.server, '--insecure-skip-tls-verify=false',
+    '--request-timeout', '15s', 'delete', '--raw', '/api/v1/namespaces/' + fic.namespace, '-f', '-']);
+  const namespaceDigest = createHash('sha256').update(canonical_json({ apiVersion: 'v1', kind: 'DeleteOptions',
+    preconditions: { uid: fic.namespaceUid } })).digest('hex');
+  for (const rule of envelope.effects) {
+    if (rule.transport === 'azure-rest' && rule.method === 'DELETE' &&
+        (rule.resource !== 'https://management.azure.com|https://management.azure.com/' || rule.path !== ficPath || rule.max_calls !== 1))
+      throw new Error('Recovery DELETE allocation is not the exact original FIC.');
+    if (rule.transport === 'process' && rule.method === 'KUBECTL_DELETE' &&
+        (rule.path !== namespaceDelete || rule.body_sha256 !== namespaceDigest))
+      throw new Error('Recovery DELETE allocation is not the exact original namespace UID.');
+    if (rule.transport !== 'azure-rest' || rule.method !== 'PUT') continue;
+    const fixed = [ledger, ledger + '?comp=lease', namespaceJournal, checkpointPath + '?comp=lease&restype=container',
+      checkpointPath + '?restype=container&comp=metadata', direct + '/interrupted/seal.json',
+      ...['arrowcol-router', 'arrowcol', 'delta-maintenance'].map(role => direct + '/stop-' + role + '.json'),
+      ...['arrowcol', 'delta-maintenance'].map(role => direct + '/exit-' + role + '.json')];
+    const commit = rule.path.startsWith(direct + '/interrupted/') && /^delta-[0-9]{20}[.]json$/.test(rule.path.slice((direct + '/interrupted/').length));
+    if (rule.resource !== storage || (!fixed.includes(rule.path) && !commit))
+      throw new Error('Recovery PUT allocation is outside the original custody targets.');
+  }
 }

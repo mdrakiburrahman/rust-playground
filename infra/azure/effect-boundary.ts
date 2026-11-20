@@ -63,7 +63,7 @@ function hash(value: string | Buffer | null | undefined): string | undefined {
   if (value == null) return undefined;
   return createHash('sha256').update(value).digest('hex');
 }
-function parseEnvelope(input: unknown): EffectEnvelope {
+export function parseEnvelope(input: unknown): EffectEnvelope {
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('Effect envelope must be an object.');
   const value = input as Record<string, unknown>;
   if (!exactKeys(value, ['schema_version', 'campaign_id', 'run_id', 'subscription_id', 'resource_group',
