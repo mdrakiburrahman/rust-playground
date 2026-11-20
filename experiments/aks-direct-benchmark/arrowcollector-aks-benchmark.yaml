@@ -211,7 +211,7 @@ spec:
                 - NET_BIND_SERVICE
           env:
             - name: ACCEPT_EULA
-              value: Y
+              value: "Y"
             - name: MSSQL_PID
               value: Developer
             - name: MSSQL_MEMORY_LIMIT_MB
