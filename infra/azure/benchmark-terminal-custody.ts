@@ -122,7 +122,7 @@ async function startExactExportPod(authority: RunCleanupAuthority, context: stri
   }
   throw new Error('Original read-only export helper did not become ready');
 }
-function deploymentStopped(origin: DirectStopOrigin, stop: Stop, deployment: unknown, pods: unknown, originalPodUid: string) {
+export function deploymentStopped(origin: DirectStopOrigin, stop: Stop, deployment: unknown, pods: unknown, originalPodUid: string) {
   const resolved = evidenceObject(JSON.parse(stop.receipt.response)), response = evidenceObject(resolved.metadata);
   const current = evidenceObject(deployment), meta = evidenceObject(current.metadata), status = evidenceObject(current.status);
   const items = evidenceObject(pods), podList = evidenceList(items.items).map(evidenceObject);

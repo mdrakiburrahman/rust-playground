@@ -87,32 +87,34 @@ or bound identity stops the process. A CAS conflict or unknown write returns
 nonzero. `fenced_cleanup_blocked` and `fence_budget_blocked` also exit nonzero;
 neither implies runtime stop, preservation or safe idle.
 
-**Direct producer-loss recovery remains blocked.** The selected watchdog
-cannot yet perform the interrupted run's stop, drain, or removal.
-For source-tested, read-only inspection after a fence, include
-`--release-file "$ORIGINAL_RELEASE"` from the initial invocation and add the
-exact read rules for the original FIC/AKS, publisher generation, arm and seal.
-For a sealed run, allocate its exact Delta listing, transaction and active
-file reads; if the FIC was removed, also allocate the original namespace
-journal and absence reads. The inspector binds the original off-node FIC
-ledger directly; it does not need the producer's local FIC receipt after the
-fence. `direct_recovery_unsealed` and `direct_recovery_seal_observed` both exit
-nonzero: neither authorizes deletion, certifies full recovery or scores a run.
-The producer terminal path asserts the original active producer, invalid after
-takeover. Stock terminal freeze and final independent preservation each reject
-`authorized` with null QAP; their null-QAP case is restricted to fenced,
-`not_authorized` setup. A direct recovery adapter must re-read the original
-arm/seal and reconcile positive writer stop/drain under the current controller
-fence, then prove original Delta preservation against the baseline after exact
-namespace/FIC removal. The fence-only allocation cannot express a bounded
-stop whose exact UID/resourceVersion JSON Patch is determined after takeover.
-A stop without a positive durable response must remain unresolved.
-Export helper creation now dispatches the same buffered
-stdin bytes hashed by the effect allowlist, not a path to a manifest. The scoped
-inspector does not allocate any export helper or deletion effects.
-An unqualified scoring window is not a data-loss result, and neither can be
-inferred from fencing. Keep destructive cleanup and all workload/readiness
-gates held until the adapter and independent supervision are qualified.
+**Direct producer-loss recovery is offline-tested only.** Use the same
+selected command with `--release-file "$ORIGINAL_RELEASE"` for read-only
+inspection. To select the interrupted-run path, also pass
+`--recover-interrupted-context "$ORIGINAL_KUBE_CONTEXT"`. Do not run it
+against live resources without separate approval and allocation review.
+
+The recovery selection keeps the original campaign fence and only acts on
+the durable original arm and FIC. Its pinned envelope must include the
+original stamp reads, three single-use `KUBECTL_DIRECT_STOP` rules (each
+path is the JSON object `{argv,uid}` for its exact workload), original Pod
+watches and SQL read, exact custody writes, and just the original namespace
+UID and FIC deletion. The original arm must publish a digest of its active
+physical Delta files. Recovery refuses older arms without that digest and
+holds cleanup when an original active file no longer matches, including
+when a rewrite makes direct physical preservation unverifiable.
+The stop commands dispatch a fixed JSON Patch with
+fresh server-tested UID/resourceVersion preconditions and durable exact-body
+intent/readback. Namespace DELETE sends the allocated UID precondition bytes
+through stdin; no temporary pathname grants mutation authority.
+
+`direct_recovery_preserved_not_scored` means both original exits, sealed
+interrupted Delta evidence, exact namespace/FIC removal and independent
+post-removal Delta verification were observed. It does not settle the shared
+campaign record, verify stamp-wide safe idle, or qualify a throughput window.
+Missing or uncertain stop, seal, deletion, or file evidence is not success;
+retain the pinned local state and off-node journals, and never retry an
+unknown effect with a fresh allocation. The ordinary no-load and QAP-only
+cleanup guards are unchanged.
 
 | Action (append both configuration flags) | Requirement/result |
 | --- | --- |

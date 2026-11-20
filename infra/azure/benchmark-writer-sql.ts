@@ -3,6 +3,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import type { ArmIdentity, WriterLifetime, observeWriterExit } from './benchmark-arm.js';
 import { evidenceList, evidenceObject, evidenceText, parseEvidence } from './benchmark-evidence-json.js';
+import { dispatchExternalEffect, effectSignal, processEffectRequest } from './effect-boundary.js';
 import type { RunCleanupAuthority } from './run_fic.js';
 
 type Writer = WriterLifetime;
@@ -22,7 +23,8 @@ export interface WriterRegistration {
 }
 
 export async function readWriterRegistrations(authority: RunCleanupAuthority, run: ArmIdentity, generation: string,
-  context: string, server: string, sqlPod: { name: string; uid: string }, assertSqlLifetime: () => Promise<void>): Promise<WriterRegistration[]> {
+  context: string, server: string, sqlPod: { name: string; uid: string }, assertSqlLifetime: () => Promise<void>,
+  recovery = false): Promise<WriterRegistration[]> {
   if (!uuid.test(run.runId) || !uuid.test(generation) || !uuid.test(sqlPod.uid) ||
       !/^arrowcol-sql-[a-z0-9-]+$/.test(sqlPod.name) || !/^https:\/\/[a-z0-9.-]+$/.test(server)) {
     throw new Error('SQL observation does not identify the original run and TLS server');
@@ -40,7 +42,10 @@ export async function readWriterRegistrations(authority: RunCleanupAuthority, ru
     '-n', run.namespace, 'exec', sqlPod.name, '-c', 'sqlserver', '--', '/usr/local/bin/sqlcmd-secret', '-S', 'localhost,1433',
     '-U', 'sa', '-d', 'arrowcol', '-Q', query, '-b', '-h', '-1', '-W', '-w', '4096', '-l', '5', '-t', '6'];
   let stdout: string;
-  try { ({ stdout } = await exec('kubectl', args, { timeout: 20_000, maxBuffer: 8_192 })); }
+  const forward = () => exec('kubectl', args, { timeout: 20_000, maxBuffer: 8_192, signal: effectSignal() });
+  try { ({ stdout } = recovery ? await dispatchExternalEffect({ ...processEffectRequest(['kubectl', ...args]),
+    method: 'KUBECTL_DIRECT_SQL_READ', path: JSON.stringify({ context, server, namespace: run.namespace,
+      pod: sqlPod.name, uid: sqlPod.uid, run: run.runId, generation }) }, forward) : await forward()); }
   catch { throw new Error('Original SQL collector observation failed; terminal state is unknown'); }
   await authority.assertCurrent();
   await assertSqlLifetime();

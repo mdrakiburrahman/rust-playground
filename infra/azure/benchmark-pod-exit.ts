@@ -2,7 +2,8 @@ import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { observeWriterExit, type WriterLifetime } from './benchmark-arm.js';
 import { evidenceList, evidenceObject, evidenceText, requireEvidence } from './benchmark-evidence-json.js';
-import { persistDirectStopPatch, type DirectStopOrigin } from './benchmark-stop-patch.js';
+import { persistDirectStopPatch, readDirectStopPatch, stopOriginalWorkload, type DirectStopOrigin } from './benchmark-stop-patch.js';
+import { dispatchExternalEffect, effectSignal, processEffectRequest } from './effect-boundary.js';
 import { canonical_json, type Azure } from './bootstrap.js';
 import type { RunCleanupAuthority } from './run_fic.js';
 
@@ -54,14 +55,20 @@ async function* eventLines(chunks: AsyncIterable<Buffer>) {
 
 /** Replays from this Pod's fresh pre-PATCH resourceVersion, not a Deployment's version or a later GET. */
 export async function stopDirectPodWithExit(azure: Azure, authority: RunCleanupAuthority, context: string, server: string,
-  origin: DirectStopOrigin, role: Role, original: WriterLifetime) {
+  origin: DirectStopOrigin, role: Role, original: WriterLifetime, recovery = false) {
+  if (recovery) {
+    const prior = await readDirectStopPatch(azure, authority, origin, role, original.deploymentUid);
+    if (prior) return prior; // Caller must still require the positive original exit journal.
+  }
   requireEvidence(/^https:\/\/[a-z0-9.-]+$/.test(server) && dns.test(origin.namespace) && dns.test(original.podName),
     'Original Pod watch target is invalid');
   const kubectl = ['--context', context, '--server', server, '--insecure-skip-tls-verify=false'];
   const run = async (args: string[]) => {
     await authority.assertCurrent();
-    const { stdout } = await exec('kubectl', [...kubectl, '--request-timeout=15s', '-n', origin.namespace, ...args],
-      { timeout: 20_000, maxBuffer: MAX_EVENT_BYTES });
+    const command = ['kubectl', ...kubectl, '--request-timeout=15s', '-n', origin.namespace, ...args];
+    const forward = () => exec('kubectl', command.slice(1),
+      { timeout: 20_000, maxBuffer: MAX_EVENT_BYTES, signal: effectSignal() });
+    const { stdout } = recovery ? await dispatchExternalEffect(processEffectRequest(command), forward) : await forward();
     return stdout;
   };
   const deployment = JSON.parse(await run(['get', 'deployment', role, '-o', 'json']));
@@ -76,20 +83,27 @@ export async function stopDirectPodWithExit(azure: Azure, authority: RunCleanupA
     status.imageID === original.imageId && status.restartCount === 0 &&
     evidenceObject(evidenceObject(status.state).running).startedAt === original.startedAt,
   'Original Pod must still be running before the stop intent');
-  const stop = await persistDirectStopPatch(azure, authority, origin, role, original.deploymentUid, deployment,
+  const stop = recovery ? await stopOriginalWorkload(azure, authority, context, server, origin, role, original.deploymentUid, deployment) :
+    await persistDirectStopPatch(azure, authority, origin, role, original.deploymentUid, deployment,
     ops => run(['patch', 'deployment', role, '--type=json', '--patch', JSON.stringify(ops), '-o', 'json']));
   const watchSeconds = grace + 60;
   const query = new URLSearchParams({ watch: 'true', resourceVersion: rv, timeoutSeconds: String(watchSeconds),
     fieldSelector: `metadata.name=${original.podName}` });
   await authority.assertCurrent();
-  const child = spawn('kubectl', [...kubectl, `--request-timeout=${watchSeconds + 10}s`, 'get', '--raw',
-    `/api/v1/namespaces/${origin.namespace}/pods?${query}`], { timeout: (watchSeconds + 15) * 1000, stdio: ['ignore', 'pipe', 'ignore'] });
-  const done = new Promise<never>((_, reject) => child.once('error', reject));
-  let observed: Awaited<ReturnType<typeof positiveDirectExitEvent>>;
-  try {
-    observed = await Promise.race([done,
+  const command = ['kubectl', ...kubectl, `--request-timeout=${watchSeconds + 10}s`, 'get', '--raw',
+    `/api/v1/namespaces/${origin.namespace}/pods?${query}`];
+  const watch = async () => {
+    const child = spawn('kubectl', command.slice(1), { timeout: (watchSeconds + 15) * 1000,
+      signal: effectSignal(), stdio: ['ignore', 'pipe', 'ignore'] });
+    const done = new Promise<never>((_, reject) => child.once('error', reject));
+    try {
+      return await Promise.race([done,
       positiveDirectExitEvent(eventLines(child.stdout), origin, role, original, stop.receipt.intent.intent_at_ms)]);
-  } finally { child.kill(); }
+    } finally { child.kill(); }
+  };
+  const observed = recovery ? await dispatchExternalEffect({ ...processEffectRequest(command),
+    method: 'KUBECTL_DIRECT_EXIT_WATCH', path: JSON.stringify({ context, server, namespace: origin.namespace, pod: original.podName,
+      uid: original.podUid }) }, watch) : await watch();
   const bytes = Buffer.from(canonical_json({ origin, role, podResourceVersionBeforeStop: rv, stop, pod: observed }));
   const path = journalPath(origin, role);
   await authority.assertCurrent();

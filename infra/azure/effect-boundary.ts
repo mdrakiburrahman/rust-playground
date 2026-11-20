@@ -34,7 +34,8 @@ export interface ExternalEffect {
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const name = /^[a-z][a-z0-9-]{1,62}$/;
 const transports = new Set<EffectTransport>(['azure-rest', 'azure-auth', 'campaign-blob', 'process']);
-const readMethods = new Set(['GET', 'HEAD', 'AZURE_ACCOUNT_GET-ACCESS-TOKEN', 'KUBECTL_GET', 'KUBECTL_LOGS']);
+const readMethods = new Set(['GET', 'HEAD', 'AZURE_ACCOUNT_GET-ACCESS-TOKEN', 'KUBECTL_GET', 'KUBECTL_LOGS',
+  'KUBECTL_DIRECT_EXIT_WATCH', 'KUBECTL_DIRECT_SQL_READ']);
 interface BoundaryContext {
   boundary: EffectBoundary;
   forwarding: Set<string>;
@@ -256,7 +257,8 @@ export class ResponseWithholdingSupervisor {
 }
 
 function receiptMatchesRule(request: ReceiptRequest, rule: EffectRule): boolean {
-  return request.transport === rule.transport && request.method === rule.method && request.resource === rule.resource &&
+  return (rule.method !== 'KUBECTL_DIRECT_STOP' || !!request.body_sha256) &&
+    request.transport === rule.transport && request.method === rule.method && request.resource === rule.resource &&
     request.path === rule.path && (rule.body_sha256 === undefined || request.body_sha256 === rule.body_sha256);
 }
 function sameReceiptRequest(left: ReceiptRequest, right: ReceiptRequest): boolean {
@@ -393,8 +395,9 @@ export class EffectBoundary {
     if (this.poisoned) throw new Error('Effect boundary journal is not durable; refusing all further dispatch.');
     const method = request.method.toUpperCase();
     const bodyHash = hash(request.body);
+    if (method === 'KUBECTL_DIRECT_STOP' && !bodyHash) throw new EffectBoundaryRefused();
     if (request.transport === 'process' && !readMethods.has(method) && request.body != null &&
-        this.envelope.effects.some(effect => effect.transport === 'process' && effect.method === method &&
+        method !== 'KUBECTL_DIRECT_STOP' && this.envelope.effects.some(effect => effect.transport === 'process' && effect.method === method &&
           effect.resource === request.resource && effect.path === request.path && effect.body_sha256 === undefined)) throw new EffectBoundaryRefused();
     const rule = this.envelope.effects.find(effect => effect.transport === request.transport && effect.method === method &&
       effect.resource === request.resource && effect.path === request.path &&

@@ -285,7 +285,13 @@ async function fixture(t: TestContext, fault: Fault) {
   t.mock.method(azure, 'set_control', async (metadata: Record<string, string>, etag: string) => {
     assert.equal(etag, controlVersion); control = structuredClone(metadata); controlVersion = '"control-1"'; record('publisher-fence');
   });
+  const originalProcess = runtime.run_tree;
   t.mock.method(runtime, 'run_tree', async (args: string[]) => {
+    if (args.includes('--context')) return originalProcess(args, 20);
+    if (events().some(e => e.event === 'recovery-namespace-delete') && !namespaceAbsent) {
+      namespaceAbsent = true;
+      record('namespace-positive');
+    }
     assert.equal(args[0], 'kubectl'); assert.ok(args.includes('--insecure-skip-tls-verify=false'));
     if (args.includes('delete')) {
       record('namespace-delete');
@@ -391,7 +397,13 @@ async function fixture(t: TestContext, fault: Fault) {
     save(); record('load');
   };
   return { arm, runCli, cliArgs, releaseFile, load, store, loseBookkeeping: () => { loseBookkeeping = true; },
-    c, azure, directory, loseNamespaceReceipt: () => { loseNamespaceReceipt = true; },
+    c, azure, directory, advanceClock: (ms: number) => {
+      now += ms;
+      state.now = now;
+      const live = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+      live.now = now;
+      fs.writeFileSync(statePath, JSON.stringify(live));
+    }, addInterruptedCommit: (start: number, end: number) => { commits.push(loadEvidence(start, end).commit); }, loseNamespaceReceipt: () => { loseNamespaceReceipt = true; },
     replacePhysical: () => { physicalEtag = '"replacement-physical"'; },
     staleAuthority: (expired: boolean) => { if (!fenced && expired) campaignState.heartbeatAtMs = now - 180_000;
       else if (fenced && !expired) campaignState.heartbeatAtMs = now - 1; fenced = expired; },
@@ -463,11 +475,11 @@ test('selected watchdog waits for original FIC, fences authorized null-QAP produ
   assert.equal(fenced.state.runInventory?.qap, null);
   assert.equal(fenced.state.cleanupSteps[0]?.status, 'pending');
   assert.ok(fs.readFileSync(join(stateDir, 'effects.jsonl'), 'utf8').includes('unknown_after_forward'));
-  const previous = f.events.length;
+  const previous = f.events().length;
   await watch(async tick => assert.equal((await tick()).scopeStatus, 'fenced_cleanup_blocked'));
   assert.equal(writes, 1);
   await assert.rejects(f.runCli('finish'), /does not authorize/i);
-  assert.equal(f.events.length, previous);
+  assert.equal(f.events().length, previous);
   assert.equal(f.namespaceAbsent(), false);
   assert.ok(f.credential());
 
@@ -510,6 +522,110 @@ test('selected watchdog waits for original FIC, fences authorized null-QAP produ
   await f.store.write(fenced.state, replacement.etag);
   await watch(async tick => assert.equal((await tick()).scopeStatus, 'fenced_cleanup_blocked'), raceDir);
   assert.equal(writes, 2);
+});
+
+for (const fault of ['none', 'stop-unknown', 'exit-unknown'] as const) test(
+  'selected recovery of the original unsealed run: ' + fault, async t => {
+  const f = await fixture(t, fault);
+  const arm = await f.arm();
+  f.advanceClock(181_000);
+  f.addInterruptedCommit(arm.startMs, arm.endMs);
+  f.staleAuthority(true);
+  const before = (await f.store.read())!;
+  const { reconcileOnce } = await import('../../projects/arrowcol-oat/aks-reconcile.js');
+  await reconcileOnce(f.store, Date.now(), true);
+  assert.notEqual((await f.store.read())!.etag, before.etag);
+  fs.unlinkSync(f.ficPath);
+  const { subscription, group, account, checkpoints } = f.c;
+  const resource = `https://${account}.blob.core.windows.net/${checkpoints}`;
+  const path = `/${checkpoints}/active.json`;
+  const stateDir = join(f.directory, 'selected-recovery'), envelope = join(f.directory, 'selected.json');
+  fs.mkdirSync(stateDir, { mode: 0o700 });
+  const scope = ['--context', 'fixture', '--server', 'https://fixture.azmk8s.io', '--insecure-skip-tls-verify=false'];
+  const route = [...scope, '--request-timeout=15s', '-n', origin.namespace];
+  const rules = [
+    { id: 'get', transport: 'campaign-blob', method: 'GET', resource, path, max_calls: 600 },
+    { id: 'put', transport: 'campaign-blob', method: 'PUT', resource, path, max_calls: 1 },
+    { id: 'token', transport: 'process', method: 'AZURE_ACCOUNT_GET-ACCESS-TOKEN', resource: 'az', max_calls: 25,
+      path: JSON.stringify(['account', 'get-access-token', '--subscription', subscription, '--resource',
+        'https://storage.azure.com/', '--query', 'accessToken', '--output', 'tsv', '--only-show-errors']) },
+  ];
+  const add = (id: string, method: string, target: string, max_calls = 20, digest?: string) =>
+    rules.push({ id, transport: 'process', method, resource: 'kubectl', path: target, max_calls,
+      ...(digest ? { body_sha256: digest } : {}) });
+  const gets = [['namespace', origin.namespace], ['daemonset', 'arrowcol-router'], ['pods', '-l', 'app=arrowcol-router'],
+    ['endpointslices', '-l', 'kubernetes.io/service-name=arrowcol-router'],
+    ['endpointslices', '-l', 'kubernetes.io/service-name=arrowcol-router-node-local'],
+    ['deployment', 'arrowcol-sql'], ['replicasets', '-l', 'app=arrowcol-sql'], ['pods', '-l', 'app=arrowcol-sql']];
+  for (const [role, uid] of [['arrowcol-router', arm.routerUid], ['arrowcol', arm.writer.deploymentUid],
+    ['delta-maintenance', arm.maintenance.deploymentUid]] as const) {
+    add('stop-' + role, 'KUBECTL_DIRECT_STOP', JSON.stringify({ argv: [...route, 'patch',
+      role === 'arrowcol-router' ? 'daemonset' : 'deployment', role, '--type=json', '--patch-file=/dev/stdin', '-o', 'json'], uid }), 1);
+    if (role !== 'arrowcol-router') {
+      const pod = role === 'arrowcol' ? arm.writer : arm.maintenance;
+      gets.push(['deployment', role], ['pod', pod.podName], ['pods', '-l', 'app=' + role]);
+      add('exit-' + role, 'KUBECTL_DIRECT_EXIT_WATCH', JSON.stringify({ context: 'fixture', server: 'https://fixture.azmk8s.io',
+        namespace: origin.namespace, pod: pod.podName, uid: pod.podUid }));
+    }
+  }
+  gets.forEach((args, index) => add('observe-' + index, 'KUBECTL_GET', JSON.stringify([...route, 'get', ...args, '-o', 'json'])));
+  const namespaceBody = Buffer.from(canonical_json({ apiVersion: 'v1', kind: 'DeleteOptions', preconditions: { uid: origin.namespaceUid } }));
+  const { createHash } = await import('node:crypto');
+  add('namespace-delete', 'KUBECTL_DELETE', JSON.stringify(scope.slice(2).concat('--request-timeout', '15s',
+    'delete', '--raw', '/api/v1/namespaces/' + origin.namespace, '-f', '-')), 1,
+  createHash('sha256').update(namespaceBody).digest('hex'));
+  add('sql-read', 'KUBECTL_DIRECT_SQL_READ', JSON.stringify({ context: 'fixture', server: 'https://fixture.azmk8s.io',
+    namespace: origin.namespace, pod: arm.sql.podName, uid: arm.sql.podUid, run: origin.runId, generation: origin.cloudGeneration }));
+  fs.writeFileSync(envelope, JSON.stringify({ schema_version: 1, campaign_id: uuid(5), run_id: origin.runId,
+    subscription_id: subscription, resource_group: group, storage_account: account, state_container: checkpoints, effects: rules }), { mode: 0o600 });
+  const args = ['--env-file', 'fixture.env', '--stamp-config', 'fixture.yaml', '--effect-envelope', envelope, '--state-dir', stateDir,
+    '--fic-record', f.ficPath, '--owner-id', origin.owner, '--namespace', origin.namespace, '--namespace-owner', origin.owner,
+    '--expires-at', new Date(Date.now() + 300_000).toISOString(), '--release-file', f.releaseFile, '--recover-interrupted-context', 'fixture'];
+  const run = (signal = new AbortController().signal) => watchSelectedRun(args, signal, async (_signal, tick) => {
+    assert.equal((await tick()).scopeStatus, 'direct_recovery_preserved_not_scored');
+    return 0;
+  }, { config: f.c, azure: f.azure, token: async () => 'fixture-token', fetcher: async (_input, init) => {
+    assert.notEqual(init?.method, 'PUT');
+    const current = (await f.store.read())!;
+    return new Response(JSON.stringify(current.state), { headers: { etag: current.etag } });
+  } });
+  await assert.rejects(run(AbortSignal.abort(new Error('supervisor cancelled'))), /supervisor cancelled/);
+  if (fault !== 'none') {
+    await assert.rejects(run(), fault === 'stop-unknown' ? /stop outcome UNKNOWN/ : /positive status event/);
+    const patches = f.events().filter(event => event.event === 'stop').length;
+    await assert.rejects(run(), fault === 'stop-unknown' ? /no PATCH replay/ : /terminal Pod evidence is unavailable/);
+    assert.equal(f.events().filter(event => event.event === 'stop').length, patches);
+    assert.equal(f.namespaceAbsent(), false);
+    assert.ok(f.credential());
+    assert.ok(![...f.stored.keys()].some(key => key.endsWith('/interrupted/seal.json')));
+    return;
+  }
+  await run();
+  assert.equal(f.namespaceAbsent(), true);
+  assert.equal(f.credential(), null);
+  assert.equal(f.events().filter(e => e.event === 'exit-watch').length, 2);
+  assert.ok(f.events().findIndex(e => e.event === 'fic-delete') <
+    f.events().map(e => e.event === 'blob' && e.container === f.c.data).lastIndexOf(true));
+  await run();
+  assert.equal(f.events().filter(e => e.event === 'fic-delete').length, 1);
+  const receipt = fs.readFileSync(join(stateDir, 'effects.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
+  const stops = receipt.filter(row => row.event === 'dispatch' && row.method === 'KUBECTL_DIRECT_STOP');
+  assert.equal(stops.length, 3);
+  assert.ok(stops.every(row => /^[a-f0-9]{64}$/.test(row.body_sha256)));
+  const interruptedSeal = [...f.stored.keys()].find(key => key.endsWith('/interrupted/seal.json'))!;
+  const originalSeal = f.stored.get(interruptedSeal)!;
+  f.stored.delete(interruptedSeal);
+  await assert.rejects(run, /no interrupted evidence seal/);
+  f.stored.set(interruptedSeal, originalSeal);
+  const originalCommit = [...f.stored.keys()].find(key => key.endsWith('/interrupted/delta-00000000000000000001.json'))!;
+  assert.ok(originalCommit, 'custody must preserve a committed transaction even though the client never completed');
+  const originalCopy = f.stored.get(originalCommit)!;
+  f.stored.set(originalCommit, { ...originalCopy, bytes: Buffer.from('different') });
+  await assert.rejects(run, /Delta commit copy is missing or changed/);
+  f.stored.set(originalCommit, originalCopy);
+  f.replacePhysical();
+  await assert.rejects(run, /Delta history or physical files changed/);
+  assert.equal(f.events().filter(e => e.event === 'fic-delete').length, 1);
 });
 
 test('real selected-watchdog entrypoint rejects incomplete invocation before accessing the control plane', () => {

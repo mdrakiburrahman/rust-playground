@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import { Azure, Config, Failure, WorkloadIdentityPropagationPending, exchange_workload_identity_assertion,
-  runtime, verify_aks_native_credential, canonical_json, owned, publish_private, reset_lock, HttpFailure,
+  runtime, run_tree_with_input, verify_aks_native_credential, canonical_json, owned, publish_private, reset_lock, HttpFailure,
   type HttpReceipt } from './bootstrap.js';
 
 const ARM_API = '2023-01-31';
@@ -125,15 +125,15 @@ export async function delete_run_namespace(azure: Azure, input: RunFicRecord, re
   return deleteNamespace(azure, record, receiptPath, authority, stopReceipt, journal);
 }
 export async function delete_owned_namespace(azure: Azure, input: RunNamespaceIdentity, receiptPath: string,
-  authority: RunCleanupAuthority, journal: NamespaceDeletionJournal<RunNamespaceIdentity, NamespaceStopReceipt>): Promise<NamespaceStopReceipt> {
+  authority: RunCleanupAuthority, journal: NamespaceDeletionJournal<RunNamespaceIdentity, NamespaceStopReceipt>, bindBody = false): Promise<NamespaceStopReceipt> {
   const record = parse_run_namespace_identity(input, azure.c);
   return deleteNamespace(azure, record, receiptPath, authority, (identity, observedAt) => ({
     schema_version: 1, namespace_record: identity, delete_succeeded: true, absence_confirmed: true, observed_at_unix_ms: observedAt,
-  }), journal);
+  }), journal, bindBody);
 }
 async function deleteNamespace<T extends RunNamespaceIdentity, R extends { observed_at_unix_ms: number }>(azure: Azure,
   record: T, receiptPath: string, authority: RunCleanupAuthority, receiptFor: (record: T, observedAt: number) => R,
-  journal?: NamespaceDeletionJournal<T, R>): Promise<R> {
+  journal?: NamespaceDeletionJournal<T, R>, bindBody = false): Promise<R> {
   return reset_lock(receiptPath, async () => {
     await authority.assertCurrent();
     const cluster = await azure.arm('GET', record.aksId, undefined, false, AKS_API);
@@ -168,11 +168,16 @@ async function deleteNamespace<T extends RunNamespaceIdentity, R extends { obser
           labels[OWNER_LABEL] !== record.namespaceOwner || annotations[OWNER_LABEL] !== record.namespaceOwner)
         throw new Failure('Namespace UID or original ownership changed; refusing deletion.');
       const requestPath = receiptPath + '.delete-options';
-      publish_private(requestPath, deletion);
+      if (!bindBody) publish_private(requestPath, deletion);
       publish_private(intentPath, intent);
       await journal?.persist(intent, null);
       await authority.assertCurrent();
-      const response = await kubectl(record, ['delete', '--raw', '/api/v1/namespaces/' + record.namespace, '-f', requestPath]);
+      const args = ['delete', '--raw', '/api/v1/namespaces/' + record.namespace, '-f'];
+      const response = bindBody ? await run_tree_with_input(['kubectl', '--server', record.server, '--insecure-skip-tls-verify=false',
+        '--request-timeout', '15s', ...args, '-'], Buffer.from(canonical_json(deletion)), 15, 65_536).then(result => {
+        if (result.returncode !== 0) throw new Failure('Exact namespace DELETE outcome UNKNOWN.');
+        return result.stdout;
+      }) : await kubectl(record, [...args, requestPath]);
       let value: unknown;
       try { value = JSON.parse(response); } catch { throw new Failure('Namespace DELETE lacks a typed response; outcome uncertain.'); }
       publish_private(responsePath, value);

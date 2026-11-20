@@ -15,7 +15,7 @@ import { assert_owned_namespace_absent, find_run_fic_record } from './run_fic.js
 import type { CampaignStore, StoredCampaign } from '../../projects/arrowcol-oat/aks-campaign.js';
 
 export async function inspectDirectRecovery(azure: Azure, store: CampaignStore, selected: StoredCampaign,
-  release: DirectRelease, signal: AbortSignal, workDirectory: string) {
+  release: DirectRelease, signal: AbortSignal, workDirectory: string, interrupted = false) {
   const { state, etag } = selected;
   const inventory = state.runInventory;
   requireEvidence(inventory && /^"[^"\r\n]+"$/.test(etag) && state.mode === 'armed' &&
@@ -49,7 +49,7 @@ export async function inspectDirectRecovery(azure: Azure, store: CampaignStore, 
     cloudGeneration: publisher.resetgeneration, fencingToken: inventory.fencing_token }, release);
   assertDirectInventory(azure, inventory, fic, 'finish', arm);
   const seal = await readDirectEvidenceSeal(azure, authority, arm.origin);
-  requireEvidence(fic.phase === 'ready' || !!seal, 'FIC deletion has no original terminal seal.');
+  requireEvidence(interrupted || fic.phase === 'ready' || !!seal, 'FIC deletion has no original terminal seal.');
   if (seal) {
     requireEvidence(publisher.resetstate === FENCED, 'Original terminal seal requires a fenced publisher generation.');
     const sealed = await readSealedDirectTerminal(azure, authority, arm.origin, seal);
@@ -69,7 +69,7 @@ export async function inspectDirectRecovery(azure: Azure, store: CampaignStore, 
     } finally { await rm(directory, { recursive: true, force: true }); }
     await readDirectEvidenceSeal(azure, authority, arm.origin, seal);
   }
-  if (fic.phase === 'deleted') {
+  if (fic.phase === 'deleted' && seal) {
     const identity = { version: 1 as const, runId: fic.runId, namespace: fic.namespace, namespaceUid: fic.namespaceUid,
       namespaceOwner: fic.namespaceOwner, aksId: fic.aksId, server: fic.server };
     await create_namespace_deletion_journal(azure, identity, authority).stopped();

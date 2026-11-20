@@ -81,9 +81,13 @@ function router(value: unknown, run: ArmIdentity, uid: string) {
 export function planRouterFence(run: ArmIdentity, uid: string, value: unknown) {
   const { metadata, podSpec } = router(value, run, uid);
   if (podSpec.affinity !== undefined) throw new Error('Unexpected original router affinity; do not overwrite or replay fence');
+  return routerStopPatch(uid, String(metadata.resourceVersion));
+}
+
+export function routerStopPatch(uid: string, resourceVersion: string) {
   return [
     { op: 'test', path: '/metadata/uid', value: uid },
-    { op: 'test', path: '/metadata/resourceVersion', value: metadata.resourceVersion },
+    { op: 'test', path: '/metadata/resourceVersion', value: resourceVersion },
     { op: 'add', path: '/spec/template/spec/affinity', value: noEligibleNode },
   ];
 }

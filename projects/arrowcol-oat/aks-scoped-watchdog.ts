@@ -5,8 +5,10 @@ import { parseArgs } from 'node:util';
 import { Azure, canonical_json, type Config } from '../../infra/azure/bootstrap.js';
 import { readRelease } from '../../infra/azure/benchmark-direct-cli.js';
 import { inspectDirectRecovery } from '../../infra/azure/benchmark-direct-recovery.js';
+import { recoverInterruptedDirectRun } from '../../infra/azure/benchmark-interrupted-custody.js';
+import { directConditionalStopArgv } from '../../infra/azure/benchmark-stop-patch.js';
 import { EffectBoundary, readEffectEnvelope, withEffectBoundary, type EffectEnvelope } from '../../infra/azure/effect-boundary.js';
-import { assert_run_fic_plan, read_run_fic_record, type RunFicRecord } from '../../infra/azure/run_fic.js';
+import { assert_run_fic_plan, read_run_fic_record, run_fic_ledger_path, type RunFicRecord } from '../../infra/azure/run_fic.js';
 import { createBlobCampaignStore, getAccessToken, MAX_CAMPAIGN_LIFETIME_MS,
   type CampaignStore, type StoredCampaign, type Fetcher, type TokenProvider } from './aks-campaign.js';
 import { loadCustodyConfig } from './aks-custody-config.js';
@@ -43,9 +45,9 @@ function pin(filename: string, value: unknown) {
 type Selection = { ownerId: string; namespace: string; namespaceOwner: string; expiresAtMs: number };
 type ScopedEvent = 'waiting_campaign' | 'waiting_inventory' | 'waiting_binding' | 'bound_observe_only' | 'fence_budget_blocked' |
   'bound_fence_only' | 'fenced_cleanup_blocked' | 'selected_complete' | 'selected_complete_unsettled' |
-  'direct_recovery_unsealed' | 'direct_recovery_seal_observed';
+  'direct_recovery_unsealed' | 'direct_recovery_seal_observed' | 'direct_recovery_preserved_not_scored';
 
-function validateEffects(envelope: EffectEnvelope, inspect: boolean) {
+function validateEffects(envelope: EffectEnvelope, inspect: boolean, recover: boolean) {
   const origin = `https://${envelope.storage_account}.blob.core.windows.net/${envelope.state_container}`;
   const blobPath = `/${envelope.state_container}/${ACTIVE_RECORD}`;
   const tokenPath = JSON.stringify(['account', 'get-access-token', '--subscription', envelope.subscription_id,
@@ -61,19 +63,25 @@ function validateEffects(envelope: EffectEnvelope, inspect: boolean) {
     effect.transport === 'azure-rest' && ['GET', 'HEAD'].includes(effect.method) ||
     effect.transport === 'process' && effect.method === 'KUBECTL_GET' && effect.resource === 'kubectl' ||
     effect.transport === 'process' && effect.method === 'AZURE_ACCOUNT_GET-ACCESS-TOKEN' && effect.resource === 'az';
-  if ((!inspect && extra.length > 0) || extra.some(effect => !permittedRead(effect)) ||
+  const recoverable = (effect: (typeof extra)[number]) =>
+    effect.transport === 'azure-rest' && ['PUT', 'DELETE'].includes(effect.method) ||
+    effect.transport === 'process' && effect.resource === 'kubectl' &&
+      (effect.method === 'KUBECTL_DIRECT_STOP' && effect.max_calls === 1 ||
+        effect.method === 'KUBECTL_DELETE' && effect.max_calls === 1 && !!effect.body_sha256 ||
+        ['KUBECTL_DIRECT_EXIT_WATCH', 'KUBECTL_DIRECT_SQL_READ'].includes(effect.method));
+  if ((!inspect && extra.length > 0) || extra.some(effect => !permittedRead(effect) && !(recover && recoverable(effect))) ||
       !baseGet || put?.max_calls !== 1 ||
       !one('process', 'AZURE_ACCOUNT_GET-ACCESS-TOKEN', 'az', tokenPath))
     throw new Error('Allocate only the exact active record GET, one conditional PUT, and the stock storage token request.');
   return put.id;
 }
 
-// The only mutable target in this mode is the selected campaign's own ETag-conditional record.
-// Kubernetes, FIC, publisher, and shared capacity effects are not reachable.
+// The fence phase may mutate only the selected campaign record. Recovery is an explicit,
+// separately allocated action on the original workload after the durable fence.
 function scopedFenceTick(store: CampaignStore, scope: Selection, envelope: EffectEnvelope,
   record: () => RunFicRecord | undefined, pinIdentity: (name: string, value: unknown) => void,
   hasPin: (name: string) => boolean, canFence: () => boolean, signal: AbortSignal,
-  inspect?: (current: StoredCampaign, scopedRead: CampaignStore['read']) => Promise<boolean>) {
+  inspect?: (current: StoredCampaign, scopedRead: CampaignStore['read']) => Promise<ScopedEvent>) {
   const event = (scopeStatus: ScopedEvent, now: number) => ({ event: 'scoped_campaign_custody_evaluation',
     scopeStatus, campaignId: envelope.campaign_id, runId: envelope.run_id, observedAtMs: now });
   const deadline = () => {
@@ -117,12 +125,12 @@ function scopedFenceTick(store: CampaignStore, scope: Selection, envelope: Effec
     };
     const inventory = assertInventory(current);
     if (inspect && ['fenced', 'cleaning'].includes(current.state.status)) {
-      const observedSeal = await inspect(current, async () => {
+      const observedStatus = await inspect(current, async () => {
         const observed = await read();
         if (observed) assertInventory(observed);
         return observed;
       });
-      return event(observedSeal ? 'direct_recovery_seal_observed' : 'direct_recovery_unsealed', now);
+      return event(observedStatus, now);
     }
     const fic = record();
     if (!fic || !inventory.namespace.uid || !inventory.fic?.plan) {
@@ -179,6 +187,13 @@ function scopedFenceTick(store: CampaignStore, scope: Selection, envelope: Effec
     if (wrote || outcome.status === 'terminal') {
       const after = await fencedStore.read();
       if (!after || after.state.status === 'active') throw new Error('Conditional fence or terminal state was not confirmed by durable readback.');
+      if (inspect && after.state.status === 'fenced') {
+        return event(await inspect(after, async () => {
+          const observed = await read();
+          if (observed) assertInventory(observed);
+          return observed;
+        }), now);
+      }
       return event(status(after.state)!, now);
     }
     return event('bound_fence_only', now);
@@ -191,7 +206,7 @@ export async function watchSelectedRun(args: string[], signal: AbortSignal,
   const { values, tokens } = parseArgs({ args, allowPositionals: false, tokens: true, options: {
     'env-file': { type: 'string' }, 'stamp-config': { type: 'string' }, 'effect-envelope': { type: 'string' },
     'state-dir': { type: 'string' }, 'owner-id': { type: 'string' }, namespace: { type: 'string' },
-    'namespace-owner': { type: 'string' }, 'expires-at': { type: 'string' }, 'fic-record': { type: 'string' }, 'release-file': { type: 'string' },
+    'namespace-owner': { type: 'string' }, 'expires-at': { type: 'string' }, 'fic-record': { type: 'string' }, 'release-file': { type: 'string' }, 'recover-interrupted-context': { type: 'string' },
   } });
   if (new Set(tokens.map(token => token.kind === 'option' ? token.name : '')).size !== tokens.length)
     throw new Error('Duplicate scoped watchdog option.');
@@ -212,7 +227,10 @@ export async function watchSelectedRun(args: string[], signal: AbortSignal,
       envelope.storage_account !== config.account || envelope.state_container !== config.checkpoints)
     throw new Error('Scoped effect allocation does not match the explicitly selected stamp.');
   const release = values['release-file'] ? readRelease(values['release-file']) : undefined;
-  const fenceEffectId = validateEffects(envelope, !!release);
+  const recoveryContext = values['recover-interrupted-context'];
+  if (recoveryContext !== undefined && (!release || !/^[A-Za-z0-9._:-]{1,128}$/.test(recoveryContext)))
+    throw new Error('Interrupted recovery requires an original release and exact Kubernetes context.');
+  const fenceEffectId = validateEffects(envelope, !!release, !!recoveryContext);
   const stat = fs.lstatSync(stateDir);
   if (!stat.isDirectory() || (stat.mode & 0o077) !== 0 || fs.realpathSync(stateDir) !== stateDir)
     throw new Error('Scoped watchdog requires a private canonical local state directory.');
@@ -230,7 +248,7 @@ export async function watchSelectedRun(args: string[], signal: AbortSignal,
       try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
     }
     pin(scopePath, { ...scope, envelopeHash: createHash('sha256').update(canonical_json(envelope)).digest('hex'),
-      ficPath, cluster: config.cluster, ...(release ? { release } : {}) });
+      ficPath, cluster: config.cluster, ...(release ? { release } : {}), ...(recoveryContext ? { recoveryContext } : {}) });
     const boundary = new EffectBoundary(envelope, journal);
     const store = createBlobCampaignStore({ account: config.account, container: config.checkpoints,
       subscriptionId: config.subscription, recordPath: ACTIVE_RECORD }, (input, init) => {
@@ -246,10 +264,49 @@ export async function watchSelectedRun(args: string[], signal: AbortSignal,
       return read_run_fic_record(ficPath, config);
     }, (name, value) => pin(path.join(stateDir, name), value), hasPin, () => !boundary.hasDispatched(fenceEffectId), stop,
     release ? async (current, read) => {
-      const inspected = await inspectDirectRecovery(fixture?.azure ?? new Azure(config),
-        { read, async write() { throw new Error('Direct recovery inspection may not write campaign state.'); } },
-        current, release, stop, stateDir);
-      return !!inspected.seal;
+      const azure = fixture?.azure ?? new Azure(config);
+      const inspected = await inspectDirectRecovery(azure,
+        { read, async write() { throw new Error('Direct recovery may not write campaign state.'); } },
+        current, release, stop, stateDir, !!recoveryContext);
+      if (!recoveryContext || inspected.seal)
+        return inspected.seal ? 'direct_recovery_seal_observed' : 'direct_recovery_unsealed';
+      const { arm, fic } = inspected;
+      pin(path.join(stateDir, 'direct-recovery-origin.json'), { arm, aks: fic.aksId, server: fic.server,
+        identity: fic.identityId, credential: fic.credentialName, ownershipNonce: fic.ownershipNonce });
+      for (const [role, uid] of [['arrowcol-router', arm.routerUid], ['arrowcol', arm.writer.deploymentUid],
+        ['delta-maintenance', arm.maintenance.deploymentUid]] as const) {
+        const argv = directConditionalStopArgv(recoveryContext, fic.server, arm.origin, role);
+        if (!envelope.effects.some(rule => rule.transport === 'process' && rule.method === 'KUBECTL_DIRECT_STOP' &&
+            rule.resource === 'kubectl' && rule.path === JSON.stringify({ argv, uid }) && rule.max_calls === 1))
+          throw new Error('Missing exact conditional stop allocation for the original workload.');
+      }
+      const checkpointPath = '/' + config.checkpoints;
+      const storage = 'https://' + config.account + '.blob.core.windows.net|https://storage.azure.com/';
+      const direct = checkpointPath + '/_arrowcol-custody/direct/' + arm.origin.runId + '/' + arm.origin.namespaceUid;
+      const ledger = checkpointPath + '/' + run_fic_ledger_path(config);
+      const namespaceJournal = checkpointPath + '/_arrowcol-custody/namespaces/' + arm.origin.runId + '/' + arm.origin.namespaceUid + '.json';
+      const ficPath = fic.identityId + '/federatedIdentityCredentials/' + fic.credentialName + '?api-version=2023-01-31';
+      const namespaceDelete = JSON.stringify(['--server', fic.server, '--insecure-skip-tls-verify=false',
+        '--request-timeout', '15s', 'delete', '--raw', '/api/v1/namespaces/' + fic.namespace, '-f', '-']);
+      const namespaceDigest = createHash('sha256').update(canonical_json({ apiVersion: 'v1', kind: 'DeleteOptions',
+        preconditions: { uid: fic.namespaceUid } })).digest('hex');
+      for (const rule of envelope.effects) {
+        if (rule.transport === 'azure-rest' && rule.method === 'DELETE' &&
+            (rule.resource !== 'https://management.azure.com|https://management.azure.com/' || rule.path !== ficPath || rule.max_calls !== 1))
+          throw new Error('Recovery DELETE allocation is not the exact original FIC.');
+        if (rule.transport === 'process' && rule.method === 'KUBECTL_DELETE' &&
+            (rule.path !== namespaceDelete || rule.body_sha256 !== namespaceDigest))
+          throw new Error('Recovery DELETE allocation is not the exact original namespace UID.');
+        if (rule.transport !== 'azure-rest' || rule.method !== 'PUT') continue;
+        const fixed = [ledger, ledger + '?comp=lease', namespaceJournal, checkpointPath + '?comp=lease&restype=container',
+          checkpointPath + '?restype=container&comp=metadata', direct + '/interrupted/seal.json',
+          ...['arrowcol-router', 'arrowcol', 'delta-maintenance'].map(role => direct + '/stop-' + role + '.json'),
+          ...['arrowcol', 'delta-maintenance'].map(role => direct + '/exit-' + role + '.json')];
+        const commit = rule.path.startsWith(direct + '/interrupted/') && /^delta-[0-9]{20}[.]json$/.test(rule.path.slice((direct + '/interrupted/').length));
+        if (rule.resource !== storage || (!fixed.includes(rule.path) && !commit))
+          throw new Error('Recovery PUT allocation is outside the original custody targets.');
+      }
+      return recoverInterruptedDirectRun(azure, inspected, recoveryContext, stateDir, stop);
     } : undefined);
     const result = await supervise(stop, () => withEffectBoundary(boundary, tick, undefined, stop));
     if (expires.aborted) throw new Error('Scoped watchdog allocation expired.');

@@ -11,9 +11,18 @@ export function fakeKubectl() {
   const emit = (value: unknown) => process.stdout.write(typeof value === 'string' ? value : JSON.stringify(value));
   assert.equal(a[a.indexOf('--server') + 1], 'https://fixture.azmk8s.io');
   assert.ok(a.includes('--insecure-skip-tls-verify=false'));
-  const verb = a.find(v => ['get', 'patch', 'exec', 'logs', 'create'].includes(v))!;
+  const verb = a.find(v => ['get', 'patch', 'exec', 'logs', 'create', 'delete'].includes(v))!;
   const at = a.indexOf(verb), kind = a[at + 1], name = a[at + 2];
   event('kubectl', { verb, kind, name });
+  if (verb === 'delete') {
+    const body = JSON.parse(fs.readFileSync(0, 'utf8'));
+    const raw = a[a.indexOf('--raw') + 1], namespace = raw.split('/').at(-1);
+    const object = s.objects['namespace/' + namespace];
+    assert.equal(body.preconditions.uid, object.metadata.uid);
+    delete s.objects['namespace/' + namespace];
+    save(); event('recovery-namespace-delete');
+    return emit({ kind: 'Status', status: 'Success', code: 200, details: { name: namespace, uid: object.metadata.uid } });
+  }
   if (a.includes('--raw')) {
     const url = new URL(a.at(-1)!, 'https://fixture.azmk8s.io');
     const pod = s.objects['pod/' + url.searchParams.get('fieldSelector')!.split('=')[1]];
@@ -56,7 +65,7 @@ export function fakeKubectl() {
     save(); event('export-create', { name: pod.metadata.name }); return emit(pod);
   }
   if (verb === 'patch') {
-    const ops = JSON.parse(a[a.indexOf('--patch') + 1]);
+    const ops = JSON.parse(a.includes('--patch-file=/dev/stdin') ? fs.readFileSync(0, 'utf8') : a[a.indexOf('--patch') + 1]);
     const object = s.objects[kind + '/' + name];
     if (kind === 'configmap') {
       event('barrier-attempt');

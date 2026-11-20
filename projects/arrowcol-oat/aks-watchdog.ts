@@ -102,13 +102,13 @@ async function main(args: string[]): Promise<void> {
     try {
       process.exitCode = await watchSelectedRun(args.slice(1), controller.signal, async (signal, evaluate) => {
         let exit = 0;
-        await runWatchdog(signal, evaluate, { stop: result => {
-          if (result.scopeStatus === 'selected_complete') return true;
+        const outcome = await runWatchdog(signal, evaluate, { stop: result => {
+          if (result.scopeStatus === 'selected_complete' || result.scopeStatus === 'direct_recovery_preserved_not_scored') return true;
           if (!['fenced_cleanup_blocked', 'fence_budget_blocked', 'selected_complete_unsettled',
             'direct_recovery_unsealed', 'direct_recovery_seal_observed'].includes(String(result.scopeStatus))) return false;
           exit = 2; return true;
         } });
-        return exit;
+        return outcome === 'aborted' ? 2 : exit;
       });
     } finally { process.off('SIGINT', stop); process.off('SIGTERM', stop); }
     return;

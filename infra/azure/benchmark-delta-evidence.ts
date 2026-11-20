@@ -15,6 +15,7 @@ export interface DirectDeltaBaseline {
   version: number;
   last_commit_sha256: string;
   history_sha256: string;
+  active_files_sha256?: string;
 }
 
 export function directDeltaReplay() {
@@ -94,7 +95,7 @@ export function directDeltaReplay() {
 }
 
 async function captureDirectDelta(azure: Azure, authority: RunCleanupAuthority, runId: string,
-  tableRoot: string, directory: string, baseline?: DirectDeltaBaseline) {
+  tableRoot: string, directory: string, baseline?: DirectDeltaBaseline, allowUnchanged = false) {
   const expectedPrefix = `direct-baseline-1/runs/${runId}/dataflow/`;
   requireEvidence(/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(runId) && tableRoot.startsWith(expectedPrefix) &&
     tableRoot.split('/').every(part => /^[A-Za-z0-9_.-]+$/.test(part) && part !== '.' && part !== '..') &&
@@ -149,12 +150,13 @@ async function captureDirectDelta(azure: Azure, authority: RunCleanupAuthority, 
   }
   const before = await inventory();
   requireEvidence(before.commits.size > 0 && (!baseline ||
-    (Number.isSafeInteger(baseline.version) && baseline.version >= 0 && before.commits.size > baseline.version + 1)),
+    (Number.isSafeInteger(baseline.version) && baseline.version >= 0 && before.commits.size > baseline.version + (allowUnchanged ? 0 : 1))),
     'Frozen Delta history does not extend its baseline');
   const evidence: CapturedEvidence[] = [];
   const replay = directDeltaReplay();
   const history = createHash('sha256');
   let lastHash = '';
+  let baselinePaths: Set<string> | undefined;
   let total = 0;
   for (let version = 0; version < before.commits.size; version++) {
     const name = `${String(version).padStart(20, '0')}.json`, etag = before.commits.get(name);
@@ -167,6 +169,8 @@ async function captureDirectDelta(azure: Azure, authority: RunCleanupAuthority, 
     'Original Delta JSON could not be downloaded completely');
     total += data.length;
     requireEvidence(total <= 256 * 1024 ** 2, 'Delta JSON evidence exceeded its custody byte limit');
+    if (version === baseline?.version)
+      baselinePaths = new Set(replay.snapshot.active_files.map(file => file.path));
     const path = join(directory, name);
     const hash = sha(data), tableId = replay.apply(data);
     history.update(`${name} ${hash}\n`);
@@ -178,13 +182,21 @@ async function captureDirectDelta(azure: Azure, authority: RunCleanupAuthority, 
     evidence.push({ key: `delta-${name}`, path, bytes: data.length, sha256: hash });
   }
   const snapshot = replay.snapshot;
-  const physical = [];
+  const physical: { path: string; size: bigint; etag: string }[] = [];
   for (const file of snapshot.active_files) {
     await guard();
     const [, headers] = await azure.blob('HEAD', azure.c.data, `${tableRoot}/${file.path}`, undefined, undefined, {}, false, true);
     requireEvidence(headers[':status'] === '200' && headers['x-ms-request-id'] && strong(headers.etag) &&
       headers['content-length'] === String(file.size), 'A physical active Delta file is missing or differs in size');
     physical.push({ path: file.path, size: file.size, etag: headers.etag });
+  }
+  const physicalDigest = (files: typeof physical) => sha(Buffer.from(JSON.stringify(
+    files.map(file => ({ ...file, size: String(file.size) })).sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0))));
+  if (allowUnchanged) {
+    requireEvidence(baselinePaths && baseline?.active_files_sha256, 'Original physical baseline was not published with the arm');
+    const original = physical.filter(file => baselinePaths.has(file.path));
+    requireEvidence(original.length === baselinePaths.size && physicalDigest(original) === baseline.active_files_sha256,
+      'Original pre-load Delta active files are no longer independently provable');
   }
   const after = await inventory();
   requireEvidence(before.records.size === after.records.size &&
@@ -193,7 +205,7 @@ async function captureDirectDelta(azure: Azure, authority: RunCleanupAuthority, 
   await guard();
   requireEvidence(snapshot.table_id, 'Original Delta table identity is unavailable');
   const observedBaseline: DirectDeltaBaseline = { table_root: tableRoot, table_id: snapshot.table_id,
-    version: snapshot.version, last_commit_sha256: lastHash, history_sha256: history.digest('hex') };
+    version: snapshot.version, last_commit_sha256: lastHash, history_sha256: history.digest('hex'), active_files_sha256: physicalDigest(physical) };
   return { snapshot, evidence, physical, observedBaseline };
 }
 
@@ -206,4 +218,9 @@ export function captureDirectBaseline(azure: Azure, authority: RunCleanupAuthori
 export function captureFrozenDelta(azure: Azure, authority: RunCleanupAuthority, runId: string,
   tableRoot: string, baseline: DirectDeltaBaseline, directory: string) {
   return captureDirectDelta(azure, authority, runId, tableRoot, directory, baseline);
+}
+
+export function captureInterruptedDelta(azure: Azure, authority: RunCleanupAuthority, runId: string,
+  tableRoot: string, baseline: DirectDeltaBaseline, directory: string) {
+  return captureDirectDelta(azure, authority, runId, tableRoot, directory, baseline, true);
 }
