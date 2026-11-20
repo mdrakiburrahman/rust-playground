@@ -32,7 +32,7 @@ const sha = (bytes: string | Buffer) => createHash('sha256').update(bytes).diges
 const lines = (...actions: unknown[]) => Buffer.from(actions.map(a => JSON.stringify(a)).join('\n') + '\n');
 type Event = { event: string; [key: string]: any };
 type ObjectValue = Record<string, any>;
-type Fault = 'none' | 'arm-write-unknown' | 'arm-readback' | 'release-unknown' | 'release-replaced' |
+type Fault = 'none' | 'arm-write-unknown' | 'arm-write-not-observed' | 'arm-readback' | 'held-schedule-drift' | 'release-unknown' | 'release-replaced' |
   'arm-replaced' | 'client-replaced' | 'stop-unknown' | 'exit-unknown' | 'audit-invalid' | 'seal-unknown' |
   'seal-readback' | 'seal-replaced' | 'namespace-unknown' | 'namespace-replaced' | 'namespace-present' |
   'fic-replaced' | 'fic-unknown' | 'clock-skew' | 'clock-missing' | 'clock-boundary' | 'clock-namespace' |
@@ -127,7 +127,7 @@ function loadEvidence(start: number, end: number, receiptAt = start + 2000) {
       { add: { path: 'hour=0/a.parquet', size: 40, dataChange: true, stats: '{"numRecords":2}' } }) };
 }
 
-async function fixture(t: TestContext, fault: Fault) {
+async function fixture(t: TestContext, fault: Fault, held = false) {
   const directory = fs.mkdtempSync(join(process.cwd(), 'infra/azure/.direct-e2e-'));
   fs.chmodSync(directory, 0o700);
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
@@ -217,6 +217,11 @@ async function fixture(t: TestContext, fault: Fault) {
       if (headers['If-Match'] && current?.etag !== headers['If-Match']) throw new HttpFailure(412, 'fixture stale read');
       if (path === directArmRecordPath(origin) && current) {
         if (fault === 'arm-readback') return [Buffer.from('changed'), { ':status': '200', etag: current.etag }];
+        if (fault === 'held-schedule-drift') {
+          const live = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+          live.objects['configmap/direct-schedule-confirmwide'].metadata.resourceVersion = '18';
+          fs.writeFileSync(statePath, JSON.stringify(live));
+        }
         record('arm-readback');
       }
       if (path.endsWith('/seal.json') && current) {
@@ -236,8 +241,12 @@ async function fixture(t: TestContext, fault: Fault) {
     if (path === ledgerPath && lease) assert.equal(headers['x-ms-lease-id'], lease);
     const bytes = Buffer.isBuffer(body) ? Buffer.from(body) : Buffer.from(String(body));
     const etag = `"object-${++revision}"`;
+    if (path === directArmRecordPath(origin)) {
+      record('arm-write');
+      if (fault === 'arm-write-not-observed') throw new Failure('Injected arm write response lost without storage effect');
+    }
     stored.set(path, { bytes, etag });
-    if (path === directArmRecordPath(origin)) { record('arm-write'); if (fault === 'arm-write-unknown') throw new Failure('Injected arm write response lost'); }
+    if (path === directArmRecordPath(origin) && fault === 'arm-write-unknown') throw new Failure('Injected arm write response lost');
     if (path.endsWith('/seal.json')) { record('seal-write'); if (fault === 'seal-unknown') throw new Failure('Injected seal response lost'); }
     if (loseNamespaceReceipt && path.startsWith('_arrowcol-custody/namespaces/') &&
         JSON.parse(bytes.toString()).phase === 'complete') {
@@ -357,9 +366,9 @@ async function fixture(t: TestContext, fault: Fault) {
     resources: resources.map(resource => ({ ...resource, state: 'observed', uid: state.objects[`${resource.kind.toLowerCase()}/${resource.name}`].metadata.uid })),
     evidence_destination: { account: c.account, container: c.checkpoints, blob_prefix: directEvidencePrefix(origin) },
     fic: { state: 'observed', resource_id: `${recordFic.identityId}/federatedIdentityCredentials/${recordFic.credentialName}`,
-      name: recordFic.credentialName, absence: null, plan: ficPlan }, load_admission: 'authorization_pending' };
+      name: recordFic.credentialName, absence: null, plan: ficPlan }, load_admission: held ? 'not_authorized' : 'authorization_pending' };
   await publishRunInventory(store, observed);
-  await publishRunInventory(store, { ...observed, load_admission: 'authorized' });
+  if (!held) await publishRunInventory(store, { ...observed, load_admission: 'authorized' });
   const campaign = { store, campaignId: uuid(5), ownerId: origin.owner };
   const cliEnvironment = { ...process.env, CAMPAIGN_ID: uuid(5), CAMPAIGN_OWNER_ID: origin.owner, CAMPAIGN_FENCING_TOKEN: '1' };
   const envFile = join(directory, 'bootstrap.env'), stampFile = join(directory, 'stamp.yaml');
@@ -377,7 +386,10 @@ async function fixture(t: TestContext, fault: Fault) {
       const existing = args.indexOf(extraArgs[index]!);
       if (existing >= 0) args.splice(existing, 2);
     }
-    return runDirectBenchmarkCli([...args, ...extraArgs], { azure, store: selectedStore, loadConfig, log: () => {} });
+    return runDirectBenchmarkCli([...args, ...extraArgs], { azure, store: selectedStore, loadConfig,
+      readBaseline: async (_azure, state) => ({ status: 'captured', campaign_id: state.campaignId,
+        owner_id: state.ownerId, fencing_token: state.fencingToken, blob: 'fixture-baseline', etag: '"fixture-baseline"',
+        captured_at_unix_ms: state.startedAtMs }), log: () => {} });
   };
   const arm = () => armDirectBenchmark(azure, campaign, origin, release, 'fixture', ficPath, baseline);
   const load = (armed: Awaited<ReturnType<typeof arm>>) => {
@@ -527,8 +539,11 @@ test('selected watchdog waits for original FIC, fences authorized null-QAP produ
 });
 
 test('offline CLI prepares a pending arm and recovers it without client input', async t => {
-  const f = await fixture(t, 'none');
+  const f = await fixture(t, 'arm-write-unknown', true);
+  assert.equal((await f.store.read())!.state.runInventory?.load_admission, 'not_authorized');
+  await assert.rejects(f.runCli('arm'), /does not authorize/);
   const prepared = await f.runCli('prepare');
+  assert.equal((await f.store.read())!.state.runInventory?.load_admission, 'authorized');
   assert.equal(prepared.action, 'prepare');
   if (prepared.action !== 'prepare') throw new Error('Pending arm result expected');
   assert.equal(prepared.status, 'prepared_not_released');
@@ -625,11 +640,17 @@ test('offline CLI prepares a pending arm and recovers it without client input', 
   assert.equal(JSON.parse(seal!.bytes.toString()).result, 'interrupted_not_scored');
 });
 
-for (const [fault, reason] of [['arm-write-unknown', /arm write response lost/], ['arm-readback', /readback mismatch/]] as const) {
+for (const [fault, reason] of [
+  ['arm-readback', /readback mismatch/],
+  ['arm-write-not-observed', /outcome UNKNOWN/],
+  ['held-schedule-drift', /changed|no longer matches/],
+] as const) {
   test('preparation never releases after ' + fault, async t => {
-    const f = await fixture(t, fault);
+    const f = await fixture(t, fault, true);
     await assert.rejects(f.runCli('prepare'), reason);
+    assert.equal((await f.store.read())!.state.runInventory?.load_admission, 'not_authorized');
     assert.equal(f.scheduleData().start, 'pending');
+    assert.equal(f.events().filter(event => event.event === 'arm-write').length, 1);
     assert.ok(!f.events().some(event => ['barrier-attempt', 'release'].includes(event.event)));
   });
 }

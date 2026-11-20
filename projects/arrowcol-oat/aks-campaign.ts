@@ -1004,6 +1004,35 @@ function runInventoryReady(inventory: RunInventory | undefined): inventory is Ru
     inventory.fic !== null && inventory.fic.state === 'observed' && inventory.qap !== null && inventory.qap.state === 'observed' && inventory.qap.bindings.length > 0 &&
     inventory.cleanup.handoff.state !== 'complete');
 }
+/** Only the direct hold producer calls this after definitive immutable arm readback and final barrier checks. */
+export async function admitPreparedDirectRun(store: CampaignStore, expected: StoredCampaign): Promise<StoredCampaign> {
+  const { state } = expected, original = state.runInventory;
+  if (!original || state.mode !== 'armed' || original.load_admission !== 'not_authorized' ||
+      original.qap !== null || original.official_measurement || !original.namespace.uid ||
+      original.fic?.state !== 'observed' || original.resources.some(resource => resource.state !== 'observed' || !resource.uid) ||
+      Object.values(original.cleanup).some(step => step.state !== 'not_started'))
+    throw new Error('Atomic held admission requires the original observed, non-authorized direct inventory.');
+  requireOwner(state, original.owner_id, original.fencing_token, Date.now());
+  const stop = original.effective_stop_budgets?.maintenance_stop_timeout_ms, duration = original.planned_cell_duration_ms;
+  if (stop === undefined || duration === undefined) throw new Error('Held admission requires persisted duration and maintenance stop budgets.');
+  const assessment = assessCellLifetimeBudget(state.expiresAtMs - Date.now(), duration, stop);
+  if (assessment.status === 'invalid' || assessment.status === 'insufficient')
+    throw new Error('Campaign lifetime cannot cover the held run and its cleanup reserve.');
+  const inventory: RunInventory = { ...original, load_admission: 'authorized' };
+  const next = validateCampaignState({ ...state, runInventory: inventory });
+  const strong = (value: string | undefined) => /^"[^"\r\n]+"$/.test(value ?? '');
+  if (!strong(expected.etag)) throw new CampaignConflictError();
+  let etag: string | undefined;
+  try { etag = await store.write(next, expected.etag); }
+  catch (error) { if (error instanceof CampaignConflictError) throw error; }
+  let written: StoredCampaign | undefined;
+  try { written = await store.read(); } catch { throw new CampaignWriteOutcomeUnknownError(); }
+  if (!written || !strong(written.etag) || written.etag === expected.etag ||
+      (etag !== undefined && (!strong(etag) || written.etag !== etag)) ||
+      JSON.stringify(written.state) !== JSON.stringify(next)) throw new CampaignWriteOutcomeUnknownError();
+  return written;
+}
+
 export async function publishRunInventory(store: CampaignStore, value: unknown, now = Date.now()): Promise<StoredCampaign> {
   for (let attempt = 0; attempt < 5; attempt++) {
     const current = await store.read();

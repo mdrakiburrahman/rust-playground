@@ -94,7 +94,7 @@ export async function armDirectBenchmark(azure: Azure, campaign: DirectCampaignS
   release: DirectRelease, context: string, ficRecordPath: string, baselineDirectory: string,
   assertInventory?: (arm: DirectTerminalArm) => Promise<void>, disposition: 'release' | 'hold' = 'release'): Promise<DirectTerminalArm> {
   requireEvidence(disposition === 'release' || disposition === 'hold', 'Unknown direct schedule disposition');
-  const authority = directProducerAuthority(campaign, origin);
+  const authority = directProducerAuthority(campaign, origin, disposition === 'hold' ? 'prepare' : 'arm');
   requireEvidence([origin.runId, origin.namespaceUid, origin.owner, origin.cloudGeneration].every(id => uuid.test(id)) &&
     Number.isSafeInteger(origin.fencingToken) && origin.fencingToken > 0 && /^[a-z0-9-]+$/.test(origin.namespace) &&
     Number.isInteger(origin.clients) && origin.clients >= 1 && origin.clients <= 8 && /^[a-f0-9]{40}$/.test(release.revision) &&
@@ -177,6 +177,16 @@ export async function armDirectBenchmark(azure: Azure, campaign: DirectCampaignS
   const assertSql = async () => requireEvidence(canonical_json(sql) === canonical_json(await workload('arrowcol-sql')), 'Original SQL lifetime changed');
   await guard();
   const prepared = prepareDirectBarrier(context, origin, fic.server);
+  const assertPending = async (uid?: unknown) => {
+    const pending = owned(await get('configmap', 'direct-schedule-confirmwide'), 'ConfigMap', 'direct-schedule-confirmwide');
+    const data = evidenceObject(pending.obj.data);
+    requireEvidence((uid === undefined || pending.metadata.uid === uid) &&
+      pending.metadata.resourceVersion === prepared.patch[0].value &&
+      data.start === 'pending' && data.writerLifetime === 'pending' && data.clientLifetimes === 'pending',
+    'Original schedule no longer matches the pending barrier');
+    return pending.metadata.uid;
+  };
+  const pendingUid = disposition === 'hold' ? await assertPending() : undefined;
   const { capture: writerClaim, ...writer } = prepared.writer;
   requireEvidence(writer.image === release.images.writer && prepared.clients.every(client => client.image === release.images.client),
     'Original writer or clients differ from the approved release pins');
@@ -221,13 +231,22 @@ export async function armDirectBenchmark(azure: Azure, campaign: DirectCampaignS
   const raw = Buffer.from(canonical_json(arm));
   await guard();
   await assertInventory?.(arm);
-  const [, stored] = await azure.blob('PUT', azure.c.checkpoints, path, undefined, raw,
-    { 'If-None-Match': '*', 'x-ms-blob-type': 'BlockBlob' }, false, true);
-  requireEvidence(stored[':status'] === '201' && stored.etag && /^"[^"\r\n]+"$/.test(stored.etag),
-    'Original arm record write outcome UNKNOWN');
+  let writeEtag: string | undefined;
+  try {
+    const [, stored] = await azure.blob('PUT', azure.c.checkpoints, path, undefined, raw,
+      { 'If-None-Match': '*', 'x-ms-blob-type': 'BlockBlob' }, false, disposition === 'release');
+    requireEvidence(stored[':status'] === '201' && stored.etag && /^"[^"\r\n]+"$/.test(stored.etag),
+      'Original arm record write outcome UNKNOWN');
+    writeEtag = stored.etag;
+  } catch (error) {
+    if (disposition === 'release') throw error;
+    // The attempted bytes are still available in this invocation; never repeat the PUT.
+  }
   await guard();
-  const [read, headers] = await azure.blob('GET', azure.c.checkpoints, path, undefined, undefined, { 'If-Match': stored.etag }, false, true);
-  requireEvidence(headers[':status'] === '200' && headers.etag === stored.etag && read?.equals(raw), 'Original arm record readback mismatch');
+  const [read, headers] = await azure.blob('GET', azure.c.checkpoints, path, undefined, undefined,
+    writeEtag ? { 'If-Match': writeEtag } : {}, false, true);
+  requireEvidence(headers[':status'] === '200' && /^"[^"\r\n]+"$/.test(headers.etag ?? '') &&
+    (!writeEtag || headers.etag === writeEtag) && read?.equals(raw), 'Original arm record readback mismatch or outcome UNKNOWN');
   const fresh = prepareDirectBarrier(context, origin, fic.server);
   requireEvidence(canonical_json(fresh.writer) === canonical_json(prepared.writer) &&
     canonical_json(fresh.clients) === canonical_json(prepared.clients) && fresh.patch[0].value === prepared.patch[0].value &&
@@ -240,11 +259,7 @@ export async function armDirectBenchmark(azure: Azure, campaign: DirectCampaignS
   await assertInventory?.(arm);
   await checkPublisher();
   if (disposition === 'hold') {
-    const pending = owned(await get('configmap', 'direct-schedule-confirmwide'), 'ConfigMap', 'direct-schedule-confirmwide');
-    const data = evidenceObject(pending.obj.data);
-    requireEvidence(pending.metadata.resourceVersion === prepared.patch[0].value &&
-      data.start === 'pending' && data.writerLifetime === 'pending' && data.clientLifetimes === 'pending',
-    'Original schedule no longer matches the pending barrier');
+    await assertPending(pendingUid);
     await guard();
     return arm;
   }

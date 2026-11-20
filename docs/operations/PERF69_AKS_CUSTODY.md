@@ -108,8 +108,9 @@ intent/readback. Namespace DELETE sends the allocated UID precondition bytes
 through stdin; no temporary pathname grants mutation authority.
 
 For a separately approved interrupted-custody rehearsal, use `prepare`
-instead of `arm` with the same ready, indexed 1–8 client Pods and authorized
-direct inventory. Do not separately release the ConfigMap:
+instead of `arm` with the same ready, indexed 1–8 client Pods and fully observed
+direct inventory still at `not_authorized`. Do not publish `authorization_pending`
+or `authorized` independently and do not release the ConfigMap:
 
 ```bash
 npx --no-install tsx infra/azure/benchmark-direct-cli.ts prepare \
@@ -119,14 +120,33 @@ npx --no-install tsx infra/azure/benchmark-direct-cli.ts prepare \
   --baseline-directory "$BASELINE_DIR"
 ```
 
-`prepared_not_released` confirms the durable original arm readback and the
-unchanged pending barrier. It is not a started or scored run. Ordinary
+`prepared_not_released` confirms the immutable arm readback, unchanged pending
+barrier, and the final admission CAS. If the arm PUT acknowledgement is lost,
+the original invocation may use an exact strong-ETag byte readback; it does not
+repeat the PUT. Inconclusive readback or changed identity leaves setup
+unadmitted. It is not a started or scored run. Ordinary
 `arm` still releases the schedule. A held arm cannot be finished, resumed,
 retimed, or replaced; preserve it for selected interrupted recovery. Keep
 the producer heartbeat until S0 has independently reviewed the exports and
 the complete original recovery allocation. Only then, under separate
 authorization, begin selected supervision with that allocation from its
 first tick and exercise producer loss. Never swap grants or reset receipts.
+
+Pre-stage the review material before the pinned client emits `READY`: its
+350-second monotonic schedule wait starts immediately afterward, independently
+of the 1320-second Job deadline and the 45-minute pin. Check remaining client,
+Job, pin and lease time with margin before activation. Post-admission drain
+does not require a live client. If the review cannot fit, hold; only a separately
+reviewed bounded startup timeout set before client creation could extend it.
+Do not retime, restart or replace a READY client.
+
+This boundary does not settle every partial setup. If the producer exits
+before the final CAS, preserve the original inventory and any original arm.
+The selected direct recovery grant requires `authorized`; do not rerun
+`prepare`, manually promote admission, or infer historical non-release from
+pending fields. An observe record is not proof of no outside effects, and
+partial setup without exact namespace/FIC and Delta proof is not verified
+cleanup. Keep these cases pending for reconciliation.
 
 Generate a candidate allocation offline from private exports of the original
 armed `active.json`, the ready run record independently read from the FIC

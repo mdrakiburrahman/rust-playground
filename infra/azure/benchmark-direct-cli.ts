@@ -1,7 +1,8 @@
 import fs from 'node:fs';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { assertCampaignEnvironment, createBlobCampaignStore, validateCampaignState, type CampaignStore } from '../../projects/arrowcol-oat/aks-campaign.js';
+import { admitPreparedDirectRun, assertCampaignEnvironment, createBlobCampaignStore, validateCampaignState, type CampaignStore } from '../../projects/arrowcol-oat/aks-campaign.js';
+import { readCleanupBaseline } from '../../projects/arrowcol-oat/aks-default-providers.js';
 import { loadCustodyConfig } from '../../projects/arrowcol-oat/aks-custody-config.js';
 import { armDirectBenchmark, type DirectRelease } from './benchmark-direct-arm.js';
 import { assertDirectInventory, publishDirectHandoff } from './benchmark-direct-handoff.js';
@@ -38,6 +39,7 @@ export interface DirectCliDependencies {
   loadConfig?: (args: string[], ambient: NodeJS.ProcessEnv) => LoadedConfig;
   azure?: Azure;
   store?: CampaignStore;
+  readBaseline?: typeof readCleanupBaseline;
   log?: (value: string) => void;
 }
 export type DirectCliResult =
@@ -190,7 +192,8 @@ async function resolveProducer(options: Options, selected: LoadedConfig, azure: 
   const state = validateCampaignState(current.state), inventory = state.runInventory;
   if (state.status !== 'active' || state.mode !== 'armed' || !inventory || state.campaignId !== inventory.campaign_id ||
       state.ownerId !== inventory.owner_id || state.fencingToken !== inventory.fencing_token ||
-      inventory.load_admission !== 'authorized' || (options.action === 'finish' && options['run-id'] !== inventory.cell_run_id) ||
+      inventory.load_admission !== (options.action === 'prepare' ? 'not_authorized' : 'authorized') ||
+      (options.action === 'finish' && options['run-id'] !== inventory.cell_run_id) ||
       !inventory.namespace.uid ||
       inventory.namespace.owner_token !== state.ownerId || !uuid.test(inventory.cell_run_id) ||
       !uuid.test(inventory.namespace.uid) || !uuid.test(state.campaignId) || !uuid.test(state.ownerId))
@@ -231,15 +234,26 @@ export async function runDirectBenchmarkCli(args: string[], dependencies: Direct
       if (options.clients === undefined || options['baseline-directory'] === undefined)
         throw new Error('Arm command is missing its workload shape or baseline directory.');
       const origin: DirectStopOrigin = { ...base, clients: options.clients };
-      await directProducerAuthority(campaign, origin).assertCurrent();
+      const authority = directProducerAuthority(campaign, origin, options.action);
+      await authority.assertCurrent();
+      const observed = options.action === 'prepare' ? await store.read() : undefined;
+      if (options.action === 'prepare') {
+        requireEvidence(observed?.state.runInventory, 'Original held setup has no observed inventory');
+        await (dependencies.readBaseline ?? readCleanupBaseline)(azure, observed.state);
+      }
       const arm = await armDirectBenchmark(azure, campaign, origin, release, options.context, options['fic-record'],
         privateDirectory(options['baseline-directory'], 'Baseline directory'), async record => {
-          await directProducerAuthority(campaign, origin).assertCurrent();
+          await authority.assertCurrent();
           const current = await store.read();
           requireEvidence(current?.state.runInventory, 'Original direct inventory is missing at arm');
           assertDirectInventory(azure, current.state.runInventory, read_run_fic_record(options['fic-record'], selected.config), 'arm', record);
         }, options.action === 'prepare' ? 'hold' : 'release');
       if (options.action === 'prepare') {
+        const current = await store.read();
+        requireEvidence(current && observed && canonical_json(current.state.runInventory) === canonical_json(observed.state.runInventory),
+          'Original held setup inventory changed before admission');
+        await authority.assertCurrent();
+        await admitPreparedDirectRun(store, current);
         const status = 'prepared_not_released' as const;
         (dependencies.log ?? console.log)(JSON.stringify({ ok: true, action: 'prepare', status, runId: origin.runId,
           armRecord: directArmRecordPath(origin) }));
