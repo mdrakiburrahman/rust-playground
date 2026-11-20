@@ -148,6 +148,24 @@ pending fields. An observe record is not proof of no outside effects, and
 partial setup without exact namespace/FIC and Delta proof is not verified
 cleanup. Keep these cases pending for reconciliation.
 
+The bounded setup-cancellation candidate is **offline-only**, not a
+rehearsal procedure. `start-direct-setup CAMPAIGN OWNER` takes the original
+planned `RunInventory` on stdin and creates the initial observe record and
+setup intent in one conditional write. The ordinary `capture-baseline
+OWNER 1` still captures immutable idle capacity. The first permitted
+provisioning action in this candidate is `dispatch-direct-first-pool OWNER
+1`: it validates the baseline and the versioned idle `arrowe192` pool,
+persists the conditional PUT intent and exact body hash, then submits once.
+Do not supplement this entrypoint with manual floor, namespace, or FIC
+commands. The candidate does not authorize or implement those later stages.
+
+`cancel-direct-setup OWNER 1` retires only an original setup record with no
+dispatched intent; the same record remains as `setup_retired`, not verified
+workload or data cleanup. An ambiguous floor response leaves the original
+request ID, precondition and payload hash durable. Neither an unchanged
+readback nor a matching floor later proves the operation settled. Do not
+repeat it, retire the campaign, or restore a floor on that evidence alone.
+
 Generate a candidate allocation offline from private exports of the original
 armed `active.json`, the ready run record independently read from the FIC
 ledger, and the explicit stamp configuration. No Azure or Kubernetes calls

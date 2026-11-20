@@ -5,12 +5,14 @@ import { chmodSync, mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
+import { createHash } from 'node:crypto';
+import type { Config } from '../../infra/azure/bootstrap.js';
 import { CampaignConflictError, CUSTODY_CLEANUP_STEPS, MAX_CAMPAIGN_LIFETIME_MS, KNOWN_LIFECYCLE_CLEANUP_RESERVE_MS, assessCellLifetimeBudget,
   MISSED_HEARTBEAT_LIMIT, HEARTBEAT_INTERVAL_MS,
   createBlobCampaignStore,
   armCampaign, assertCampaignEnvironment, assertRunInventoryReady, campaignStartReceipt, heartbeatCampaign, mutateCampaign, newCampaignState, publishCleanupRunInventory, publishRunInventory, runInventoryPublishReceipt, startCampaign,
   validateCampaignState, type CampaignState, type CampaignStore, type RunInventory, type StoredCampaign,
-  CampaignWriteOutcomeUnknownError, recordArmOperation } from './aks-campaign.js';
+  CampaignWriteOutcomeUnknownError, campaignMain, recordArmOperation } from './aks-campaign.js';
 import { evaluateCustody, reconcileArmOperation, reconcileCleanupOnce, reconcileOnce, reconcilePendingArmOperations } from './aks-reconcile.js';
 import { newScaleTrialReceipt, SCALE_RESTORE_TIMEOUT_MS, type ScaleStep } from './aks-scale.js';
 
@@ -46,7 +48,7 @@ class MemoryStore implements CampaignStore {
   async read() { return this.current ? structuredClone(this.current) : undefined; }
   async write(state: CampaignState, etag?: string) {
     if (etag !== this.current?.etag) throw new CampaignConflictError();
-    const next = `etag-${++this.revision}`;
+    const next = `"etag-${++this.revision}"`;
     this.current = { state: structuredClone(validateCampaignState(state)), etag: next };
     return next;
   }
@@ -57,6 +59,110 @@ const seed = async (now = 1_000_000) => {
   await startCampaign(store, campaignId, ownerId, now);
   return store;
 };
+function directSetupFixture(fault: 'none' | 'lost-pool-ack' | 'lost-intent-write' | 'lost-start-ack') {
+  const store = new MemoryStore(), inventory = inventoryFor(newCampaignState(campaignId, ownerId));
+  const { cell_run_id: runId, namespace } = inventory;
+  const base = `/subscriptions/${subscriptionId}/resourceGroups/perf69`, identityId = `${base}/providers/Microsoft.ManagedIdentity/userAssignedIdentities/arrow-collector`;
+  const credentialName = `arrowcol-run-${runId}`;
+  const ficId = `${identityId}/federatedIdentityCredentials/${credentialName}`;
+  inventory.qap = null;
+  inventory.fic = { resource_id: ficId, name: credentialName, state: 'planned', absence: null, plan: {
+    version: 1, runId, namespace: namespace.name, serviceAccount: 'arrow-collector', identityId, resourceId: ficId,
+    clientId: campaignId, tenantId: ownerId, aksId: resourceId, server: 'https://bench.example.com',
+    credentialName, issuer: 'https://issuer.example.com/', subject: `system:serviceaccount:${namespace.name}:arrow-collector`,
+    audience: 'api://AzureADTokenExchange',
+  } };
+  inventory.resources = inventory.resources.map(resource => resource.role === 'client' ?
+    { ...resource, api_version: 'batch/v1', kind: 'Job', name: 'direct-load-confirmwide' } : resource);
+  const config = { base, cluster: 'bench', identity_id: identityId, subscription: subscriptionId, account: 'fixtureaccount',
+    checkpoints: 'checkpoints' } as Config;
+  const calls: string[] = [];
+  const request: Azure['request'] = async (method, url, _resource, body, headers, _missingOk, idempotent) => {
+    calls.push(method);
+    const id = resourceId + '/agentPools/arrowe192';
+    assert.equal(url, `https://management.azure.com${id}?api-version=2024-10-01`);
+    if (method === 'GET') return [Buffer.from(JSON.stringify({ id: id.replace('/resourceGroups/', '/resourcegroups/'), properties: { mode: 'User', vmSize: 'Standard_E192ids_v6',
+      count: 0, enableAutoScaling: true, minCount: 0, maxCount: 1, provisioningState: 'Succeeded' } })),
+    { ':status': '200', etag: '"pool-before"' }];
+    assert.equal(method, 'PUT');
+    assert.equal(idempotent, false);
+    const intent = (await store.read())?.state.directSetup?.firstPool;
+    assert.ok(intent && intent.response === null);
+    assert.equal(headers?.['If-Match'], intent.expectedEtag);
+    assert.equal(headers?.['x-ms-client-request-id'], intent.requestId);
+    assert.equal(createHash('sha256').update(body!).digest('hex'), intent.bodySha256);
+    assert.equal(JSON.parse(body!.toString()).properties.minCount, 1);
+    if (fault === 'lost-pool-ack') throw new Error('injected unknown pool effect');
+    return [null, { ':status': '202', 'x-ms-request-id': 'fixture-pool-ack' }];
+  };
+  const azure = { c: config, request } as Azure;
+  const write = store.write.bind(store);
+  store.write = async (state, etag) => {
+    if (fault === 'lost-intent-write' && state.directSetup?.firstPool) throw new Error('injected unknown intent write without commit');
+    const written = await write(state, etag);
+    if (fault === 'lost-start-ack' && !etag) throw new Error('injected lost start acknowledgment after commit');
+    return written;
+  };
+  const env = { CAMPAIGN_ID: campaignId, CAMPAIGN_OWNER_ID: ownerId, CAMPAIGN_FENCING_TOKEN: '1' };
+  const cli = (action: string, ...args: string[]) => campaignMain([action, ...args], { store, azure, env,
+    loadConfig: positionals => ({ config, env, positionals, once: false }), runInventoryInput: inventory,
+    directSetupBaseline: async (_azure, state) => ({ status: 'captured', campaign_id: campaignId, owner_id: ownerId,
+      fencing_token: 1, etag: '"original-baseline"', blob: 'fixture-baseline', captured_at_unix_ms: state.startedAtMs }) });
+  return { cli, store, calls };
+}
+
+test('direct setup CLI retires original start-only loss without claiming cleanup or touching outside resources', async () => {
+  const { cli, store, calls } = directSetupFixture('lost-start-ack');
+  await cli('start-direct-setup', campaignId, ownerId);
+  await cli('cancel-direct-setup', ownerId, '1');
+  const retired = (await store.read())!.state;
+  assert.equal(retired.status, 'setup_retired');
+  assert.equal(retired.campaignId, campaignId);
+  assert.equal(retired.runInventory?.load_admission, 'not_authorized');
+  assert.equal(retired.cleanupStatus, 'not-started');
+  assert.deepEqual(retired.cleanupSteps, []);
+  await assert.rejects(cli('dispatch-direct-first-pool', ownerId, '1'), /fenced|stale/);
+  await assert.rejects(cli('start-direct-setup', campaignId, ownerId), /original campaign/);
+  await assert.rejects(cli('start', campaignId, ownerId), /reuse a retired/);
+  assert.deepEqual(calls, []);
+});
+
+test('direct setup CLI refuses a legacy observe record and does not infer non-dispatch from an empty journal', async () => {
+  const { cli, store, calls } = directSetupFixture('none');
+  await startCampaign(store, campaignId, ownerId);
+  await assert.rejects(cli('cancel-direct-setup', ownerId, '1'), /fenced|stale/);
+  assert.equal((await store.read())!.state.status, 'active');
+  assert.deepEqual(calls, []);
+});
+
+test('direct setup CLI preserves the pool acknowledgement without admitting load or permitting another dispatch', async () => {
+  const { cli, store, calls } = directSetupFixture('none');
+  await cli('start-direct-setup', campaignId, ownerId);
+  await cli('dispatch-direct-first-pool', ownerId, '1');
+  const state = (await store.read())!.state;
+  assert.deepEqual(state.directSetup?.firstPool?.response, { status: 202, requestId: 'fixture-pool-ack' });
+  assert.equal(state.runInventory?.load_admission, 'not_authorized');
+  await assert.rejects(armCampaign(store, ownerId, 1), /cannot continue/);
+  await assert.rejects(cli('dispatch-direct-first-pool', ownerId, '1'), /do not replay/);
+  assert.deepEqual(calls, ['GET', 'PUT']);
+});
+
+for (const fault of ['lost-pool-ack', 'lost-intent-write'] as const) test(`direct setup CLI handles ${fault} without replaying a dispatched pool`, async () => {
+  const { cli, store, calls } = directSetupFixture(fault);
+  await cli('start-direct-setup', campaignId, ownerId);
+  await assert.rejects(cli('dispatch-direct-first-pool', ownerId, '1'), fault === 'lost-pool-ack' ? /unknown pool effect/ : /readback/);
+  const state = (await store.read())!.state;
+  assert.equal(state.runInventory?.load_admission, 'not_authorized');
+  if (fault === 'lost-pool-ack') {
+    assert.equal(state.directSetup?.firstPool?.response, null);
+    await assert.rejects(cli('dispatch-direct-first-pool', ownerId, '1'), /do not replay/);
+    await assert.rejects(cli('cancel-direct-setup', ownerId, '1'), /zero provisioning dispatch/);
+    assert.deepEqual(calls, ['GET', 'PUT']);
+  } else {
+    assert.equal(state.directSetup?.firstPool, null);
+    assert.deepEqual(calls, ['GET']);
+  }
+});
 
 const inventoryFor = (state: CampaignState, observed = false): RunInventory => {
   const cellRunId = 'c0ffee00-0000-4000-8000-000000000004';

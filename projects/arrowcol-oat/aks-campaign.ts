@@ -49,7 +49,7 @@ const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const storageName = /^[a-z0-9]{3,24}$/;
 const containerName = /^[a-z0-9](?:[a-z0-9-]{1,61}[a-z0-9])?$/;
 export type CampaignMode = 'observe' | 'armed';
-export type CampaignStatus = 'active' | 'fenced' | 'cleaning' | 'complete' | 'complete_unsettled';
+export type CampaignStatus = 'active' | 'fenced' | 'cleaning' | 'complete' | 'complete_unsettled' | 'setup_retired';
 export type ArmOperationStatus = 'pending' | 'succeeded' | 'failed' | 'indeterminate';
 export type CleanupArmTarget =
   { kind: 'aks-pool'; count: number; autoscale: boolean; minimum: number | null; maximum: number | null } |
@@ -205,6 +205,13 @@ export interface CampaignState {
   lastMissedHeartbeatCount?: number; fenceReason?: 'heartbeat-expired' | 'max-lifetime'; fencedAtMs?: number;
   cleanupStatus: 'not-started' | 'pending' | 'running' | 'verified' | 'verified_with_unsettled'; cleanupSteps: CleanupReceipt[];
   runInventory?: RunInventory; operations: ArmOperationReceipt[]; scaleTrials?: ScaleTrialReceipt[];
+  directSetup?: DirectSetup;
+}
+export interface DirectSetup {
+  schemaVersion: 1;
+  runId: string;
+  baselineEtag: string | null;
+  firstPool: null | { resourceId: string; expectedEtag: string; bodySha256: string; requestId: string; response: null | { status: 200 | 201 | 202; requestId: string } };
 }
 export interface StoredCampaign { state: CampaignState; etag: string; }
 export interface CampaignStoreReadOptions { maxResponseBodyBytes?: number; deadlineUnixMs?: number; }
@@ -596,12 +603,12 @@ export function validateCampaignState(value: unknown): CampaignState {
   if (!record(value) || Object.keys(value).some(key => ![
     'schemaVersion', 'campaignId', 'ownerId', 'fencingToken', 'mode', 'status', 'startedAtMs', 'heartbeatAtMs',
     'heartbeatSequence', 'expiresAtMs', 'lastEvaluatedAtMs', 'lastMissedHeartbeatCount', 'fenceReason', 'fencedAtMs',
-    'cleanupStatus', 'cleanupSteps', 'runInventory', 'operations', 'scaleTrials',
+    'cleanupStatus', 'cleanupSteps', 'runInventory', 'operations', 'scaleTrials', 'directSetup',
   ].includes(key))) throw new Error('Campaign state has unknown fields or is not an object.');
   const state = value as unknown as CampaignState;
   if (state.schemaVersion !== 1 || !uuid.test(state.campaignId) || !uuid.test(state.ownerId) ||
       !Number.isSafeInteger(state.fencingToken) || state.fencingToken < 1 ||
-      !['observe', 'armed'].includes(state.mode) || !['active', 'fenced', 'cleaning', 'complete', 'complete_unsettled'].includes(state.status) ||
+      !['observe', 'armed'].includes(state.mode) || !['active', 'fenced', 'cleaning', 'complete', 'complete_unsettled', 'setup_retired'].includes(state.status) ||
       !nonnegative(state.startedAtMs) || !nonnegative(state.heartbeatAtMs) || state.heartbeatAtMs < state.startedAtMs ||
       !Number.isSafeInteger(state.heartbeatSequence) || state.heartbeatSequence < 0 ||
       state.expiresAtMs !== state.startedAtMs + MAX_CAMPAIGN_LIFETIME_MS ||
@@ -616,13 +623,14 @@ export function validateCampaignState(value: unknown): CampaignState {
       state.fenceReason !== undefined && !['heartbeat-expired', 'max-lifetime'].includes(state.fenceReason)) {
     throw new Error('Campaign evaluation receipt is malformed.');
   }
-  const expectedCleanupSteps = state.status === "active" ? [] : [...CUSTODY_CLEANUP_STEPS];
+  const unfenced = state.status === 'active' || state.status === 'setup_retired';
+  const expectedCleanupSteps = unfenced ? [] : [...CUSTODY_CLEANUP_STEPS];
   if (state.cleanupSteps.length !== expectedCleanupSteps.length || state.cleanupSteps.some((receipt, index) => !record(receipt) ||
       receipt.step !== expectedCleanupSteps[index] || receipt.idempotencyKey !== state.campaignId + ":" + state.fencingToken + ":" + receipt.step ||
       !["pending", "running", "complete", "unsettled"].includes(receipt.status) ||
       !exactRecord(receipt, receipt.status === 'unsettled' ? ['step', 'idempotencyKey', 'status', 'unsettled'] :
         ['step', 'idempotencyKey', 'status']))) throw new Error("Campaign cleanup receipts are malformed.");
-  if (state.status === "active" && state.cleanupStatus !== "not-started" || state.status === "fenced" && state.cleanupStatus !== "pending" ||
+  if (unfenced && state.cleanupStatus !== "not-started" || state.status === "fenced" && state.cleanupStatus !== "pending" ||
       state.status === "cleaning" && state.cleanupStatus !== "running" || state.status === "complete" &&
       (state.cleanupStatus !== "verified" || state.cleanupSteps.some(receipt => receipt.status !== "complete"))) {
     throw new Error("Campaign cleanup state does not match its durable receipts.");
@@ -639,8 +647,8 @@ export function validateCampaignState(value: unknown): CampaignState {
   }
   if (state.runInventory !== undefined) {
     validateRunInventory(state.runInventory, state);
-    if (state.status === 'active' && state.runInventory.fencing_token !== state.fencingToken ||
-        state.status !== 'active' && state.runInventory.fencing_token >= state.fencingToken) {
+    if (unfenced && state.runInventory.fencing_token !== state.fencingToken ||
+        !unfenced && state.runInventory.fencing_token >= state.fencingToken) {
       throw new Error('RunInventory producer fencing identity does not match the campaign lifecycle.');
     }
   }
@@ -674,8 +682,8 @@ export function validateCampaignState(value: unknown): CampaignState {
     httpsManagementUrl(operation.operationUrl, operationSubscription);
     ids.add(operation.id);
   }
-  if (state.status === 'active' && state.fenceReason !== undefined ||
-      state.status !== 'active' && (!state.fenceReason || state.fencedAtMs === undefined || state.fencingToken < 2)) {
+  if (unfenced && (state.fenceReason !== undefined || state.fencedAtMs !== undefined) ||
+      !unfenced && (!state.fenceReason || state.fencedAtMs === undefined || state.fencingToken < 2)) {
     throw new Error('Campaign terminal state is missing its fencing receipt.');
   }
   if (state.status === 'complete' && state.cleanupStatus !== 'verified') throw new Error('Campaign cannot complete before cleanup verification.');
@@ -694,8 +702,29 @@ export function validateCampaignState(value: unknown): CampaignState {
   if (['complete', 'complete_unsettled'].includes(state.status) &&
       state.operations.some(operation => ['pending', 'indeterminate'].includes(operation.status)))
     throw new Error('Campaign cannot finalize while ARM operations remain unresolved.');
+  if (state.directSetup !== undefined) {
+    const setup = state.directSetup, inv = state.runInventory;
+    if (!exactRecord(setup, ['schemaVersion', 'runId', 'baselineEtag', 'firstPool']))
+      throw new Error('Invalid bounded direct setup custody record.');
+    const pool = setup.firstPool;
+    if (setup.schemaVersion !== 1 ||
+        !inv?.fic?.plan || inv.cell_run_id !== setup.runId || inv.qap !== null || inv.official_measurement ||
+        inv.load_admission !== 'not_authorized' || state.mode !== 'observe' || state.operations.length ||
+        (state.scaleTrials?.length ?? 0) || !isInitialRunInventory(inv) ||
+        !['active', 'setup_retired'].includes(state.status) ||
+        (setup.baselineEtag !== null && !strongSetupEtag(setup.baselineEtag)) ||
+        (pool !== null && (!exactRecord(pool, ['resourceId', 'expectedEtag', 'bodySha256', 'requestId', 'response']) ||
+          !setup.baselineEtag || pool.resourceId !== inv.fic.plan.aksId + '/agentPools/arrowe192' ||
+          !strongSetupEtag(pool.expectedEtag) || !/^[a-f0-9]{64}$/.test(pool.bodySha256) || !canonicalUuid(pool.requestId) ||
+          (pool.response !== null && (!exactRecord(pool.response, ['status', 'requestId']) ||
+            ![200, 201, 202].includes(pool.response.status) || !nonempty(pool.response.requestId))))) ||
+        (state.status === 'setup_retired' && pool !== null))
+      throw new Error('Invalid bounded direct setup custody record.');
+  } else if (state.status === 'setup_retired') throw new Error('Retirement requires original bounded direct setup custody.');
   return state;
 }
+
+function strongSetupEtag(etag: unknown): etag is string { return typeof etag === 'string' && /^"[^"\r\n]+"$/.test(etag); }
 
 export function newCampaignState(campaignId: string, ownerId: string, now = Date.now()): CampaignState {
   if (!uuid.test(campaignId) || !uuid.test(ownerId) || !nonnegative(now) || !Number.isSafeInteger(now + MAX_CAMPAIGN_LIFETIME_MS))
@@ -952,9 +981,40 @@ function requireOwner(state: CampaignState | undefined, ownerId: string, fencing
 }
 export async function startCampaign(store: CampaignStore, campaignId: string, ownerId = campaignId, now = Date.now()): Promise<StoredCampaign> {
   return mutateCampaign(store, current => {
-    if (current && !['complete', 'complete_unsettled'].includes(current.status)) throw new Error('An unfinished campaign still owns the stamp.');
+    if (current?.status === 'setup_retired' && current.campaignId === campaignId)
+      throw new Error('Cannot reuse a retired direct setup campaign ID.');
+    if (current && !['complete', 'complete_unsettled', 'setup_retired'].includes(current.status)) throw new Error('An unfinished campaign still owns the stamp.');
     return newCampaignState(campaignId, ownerId, now);
   });
+}
+export async function writeDirectSetupOnce(store: CampaignStore, previous: StoredCampaign | undefined, next: CampaignState): Promise<StoredCampaign> {
+  validateCampaignState(next);
+  if (previous && !strongSetupEtag(previous.etag)) throw new CampaignConflictError();
+  let written: string | undefined;
+  try { written = await store.write(next, previous?.etag); }
+  catch (error) { if (error instanceof CampaignConflictError) throw error; }
+  let current: StoredCampaign | undefined;
+  try { current = await store.read(); } catch { throw new CampaignWriteOutcomeUnknownError(); }
+  if (!current || !strongSetupEtag(current.etag) || current.etag === previous?.etag ||
+      written !== undefined && written !== current.etag || JSON.stringify(current.state) !== JSON.stringify(next))
+    throw new CampaignWriteOutcomeUnknownError();
+  return current;
+}
+
+export async function startDirectSetup(store: CampaignStore, campaignId: string, ownerId: string, input: unknown): Promise<StoredCampaign> {
+  const inventory = validateInitialRunInventory(input, campaignId, ownerId);
+  const previous = await store.read();
+  if (previous && (!['complete', 'complete_unsettled', 'setup_retired'].includes(previous.state.status) ||
+      previous.state.campaignId === campaignId)) throw new Error('An original campaign already owns this setup.');
+  return writeDirectSetupOnce(store, previous, { ...newCampaignState(campaignId, ownerId), runInventory: inventory,
+    directSetup: { schemaVersion: 1, runId: inventory.cell_run_id, baselineEtag: null, firstPool: null } });
+}
+
+export async function retireUntouchedDirectSetup(store: CampaignStore, expected: StoredCampaign): Promise<StoredCampaign> {
+  const { state } = expected;
+  if (state.status !== 'active' || !state.directSetup || state.directSetup.firstPool !== null)
+    throw new Error('No positive proof of zero provisioning dispatch; retain original setup custody.');
+  return writeDirectSetupOnce(store, expected, { ...state, status: 'setup_retired' });
 }
 export class CampaignFencedError extends Error {
   constructor(message = 'Campaign owner is fenced, stale or does not match the durable fencing token.') { super(message); this.name = 'CampaignFencedError'; }
@@ -1118,6 +1178,7 @@ export async function heartbeatCampaign(store: CampaignStore, ownerId: string, f
 export async function armCampaign(store: CampaignStore, ownerId: string, fencingToken: number, now = Date.now()): Promise<StoredCampaign> {
   return mutateCampaign(store, current => {
     const state = requireOwner(current, ownerId, fencingToken, now);
+    if (state.directSetup) throw new Error('Bounded direct setup cannot continue through ordinary arm.');
     if (state.mode !== 'observe') throw new Error('Campaign is already armed.');
     if (!state.runInventory) throw new Error('RunInventory must be persisted before arming.');
     if (!nonnegative(state.runInventory.planned_cell_duration_ms) || !state.runInventory.effective_stop_budgets)
@@ -1176,13 +1237,14 @@ async function readRunInventoryStdin(): Promise<unknown> {
 
 export async function campaignMain(args: string[], dependencies: {
   store?: CampaignStore; azure?: import('../../infra/azure/bootstrap.js').Azure; env?: NodeJS.ProcessEnv; cleanupEnvelope?: unknown;
-  runInventoryInput?: unknown;
+  runInventoryInput?: unknown; directSetupBaseline?: typeof import('./aks-default-providers.js').readCleanupBaseline;
+  loadConfig?: typeof loadCustodyConfig;
 } = {}): Promise<void> {
   if (args[0] === 'cleanup-step') {
     const cell = await import('./aks-cell-cleanup.js');
     if (args[1] && !cell.isCellCleanupSelector(args[1])) throw new Error('Unknown cleanup-step selector.');
   }
-  const selected = loadCustodyConfig(args, false, dependencies.env);
+  const selected = (dependencies.loadConfig ?? loadCustodyConfig)(args, false, dependencies.env);
   args = selected.positionals;
   const [action, campaignId, fencingTokenText] = args;
   const subscriptionId = selected.config.subscription, env = selected.env;
@@ -1195,7 +1257,28 @@ export async function campaignMain(args: string[], dependencies: {
     await readCleanupBaseline(azure, current.state);
     if ((await store.read())?.etag !== current.etag) throw new CampaignConflictError();
   };
-  if (action === 'start' && (args.length === 2 || args.length === 3)) {
+  if (action === 'start-direct-setup' && args.length === 3) {
+    const inventory = validateInitialRunInventory(dependencies.runInventoryInput ?? await readRunInventoryStdin(), campaignId!, args[2]!);
+    if (!inventory.fic?.plan || inventory.fic.plan.aksId !== selected.config.base + '/providers/Microsoft.ContainerService/managedClusters/' + selected.config.cluster ||
+        inventory.fic.plan.identityId !== selected.config.identity_id || inventory.fic.plan.serviceAccount !== 'arrow-collector')
+      throw new Error('Direct setup plan does not match the configured stamp identity.');
+    const result = await startDirectSetup(store, campaignId!, args[2]!, inventory);
+    console.log(JSON.stringify({ ok: true, receipt: campaignStartReceipt(result.state) }));
+  } else if (['dispatch-direct-first-pool', 'cancel-direct-setup'].includes(action ?? '') && args.length === 3 && /^\d+$/.test(fencingTokenText!)) {
+    const scope = await store.read();
+    if (!scope?.state.directSetup || scope.state.ownerId !== campaignId || scope.state.fencingToken !== Number(fencingTokenText))
+      throw new CampaignFencedError();
+    assertCampaignEnvironment(env, scope.state);
+    if (action === 'cancel-direct-setup') {
+      const retired = await retireUntouchedDirectSetup(store, scope);
+      console.log(JSON.stringify({ ok: true, status: retired.state.status, campaignId: retired.state.campaignId }));
+    } else {
+      requireOwner(scope.state, campaignId!, Number(fencingTokenText), Date.now());
+      const { dispatchFirstDirectPool } = await import('./aks-direct-setup.js');
+      const result = await dispatchFirstDirectPool(store, azure, scope, dependencies.directSetupBaseline);
+      console.log(JSON.stringify({ ok: true, status: 'pool_request_acknowledged_not_verified', campaignId: result.state.campaignId }));
+    }
+  } else if (action === 'start' && (args.length === 2 || args.length === 3)) {
     const result = await startCampaign(store, campaignId!, args[2] ?? campaignId!);
     console.log(JSON.stringify({ ok: true, receipt: campaignStartReceipt(result.state) }));
   } else if (action === 'heartbeat' && args.length === 3 && /^\d+$/.test(fencingTokenText!)) {
@@ -1288,7 +1371,7 @@ export async function campaignMain(args: string[], dependencies: {
     }
     console.log(JSON.stringify({ ok: true, receipt }));
   } else {
-    throw new Error('Usage: aks-campaign.ts <start|heartbeat|capture-baseline|arm|publish-inventory|assert-ready|read-inventory|capture-cell-baseline|cleanup-step|status> [arguments] --env-file PATH --stamp-config YAML');
+    throw new Error('Usage: aks-campaign.ts <start|start-direct-setup|dispatch-direct-first-pool|cancel-direct-setup|heartbeat|capture-baseline|arm|publish-inventory|assert-ready|read-inventory|capture-cell-baseline|cleanup-step|status> [arguments] --env-file PATH --stamp-config YAML');
   }
 }
 if (process.argv[1] && ['aks-campaign.ts', 'aks-campaign.js'].includes(path.basename(process.argv[1])) && import.meta.url === pathToFileURL(process.argv[1]).href) {
