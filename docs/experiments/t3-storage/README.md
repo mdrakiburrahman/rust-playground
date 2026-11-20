@@ -48,6 +48,8 @@ The block path stages a block and commits the cumulative block list with lease a
 
 The race test requires one lease winner, rejects the other writer, and reads back the accepted content. These checks cover primitive fencing. They leave WAL integration, release semantics, recovery, and Windows runtime qualification to the actual backend implementation.
 
+Initial blob creation, lease acquisition and warmup happen before the throughput timer. In-run renewal, rotation and creation of replacement blobs count toward elapsed time; final read-back and lease release happen after the timer. Commit histograms cover each payload/commit operation and exclude that housekeeping.
+
 ## Existing benchmark fixture
 
 At runtime revision `abcaf1a7883dfbe57371988478b237cf687ef51b`, the existing `ingest` Criterion fixture allocates 64 MiB of segment headroom but requests a 100 MiB segment, so it compiles and then fails with `InvalidConfig`. The automatic `phase-a` job runs the checked-out fixture and stops on that failure; bootstrap does not apply a correction.
