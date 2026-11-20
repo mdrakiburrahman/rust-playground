@@ -28,6 +28,7 @@ import { assert_owned_namespace_absent, cleanup_run_fic, delete_owned_namespace,
 type Stop = Awaited<ReturnType<typeof persistDirectStopPatch>>;
 type RouterEndpoints = Parameters<typeof routerFenceObserved>[5];
 export type DirectTerminalArm = {
+  scheduleDisposition?: 'held';
   origin: DirectStopOrigin;
   startMs: number;
   endMs: number;
@@ -172,6 +173,7 @@ export const directArmRecordPath = (origin: DirectStopOrigin) =>
 /** Finish a loaded direct run with live, origin-bound reads, not OAT's no-load handoff. */
 export async function finishDirectTerminalCustody(azure: Azure, campaign: DirectCampaignScope, arm: DirectTerminalArm,
   context: string, directory: string, deltaDirectory: string, ficRecordPath: string) {
+  requireEvidence(arm.scheduleDisposition === undefined, 'Prepared direct arm never released the schedule; use interrupted recovery');
   const { origin } = arm;
   const authority = directProducerAuthority(campaign, origin, 'finish');
   const dir = await lstat(directory);

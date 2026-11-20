@@ -367,11 +367,11 @@ async function fixture(t: TestContext, fault: Fault) {
   fs.writeFileSync(envFile, '', { mode: 0o600 }); fs.writeFileSync(stampFile, 'fixture: true\n', { mode: 0o600 });
   fs.writeFileSync(releaseFile, JSON.stringify(release), { mode: 0o600 }); fs.writeFileSync(kubeconfig, 'fixture', { mode: 0o600 });
   const loadConfig = () => ({ config: c, env: cliEnvironment, positionals: [], once: false });
-  const cliArgs = (action: 'arm' | 'finish' = 'arm') => [action, '--env-file', envFile, '--stamp-config', stampFile,
+  const cliArgs = (action: 'arm' | 'prepare' | 'finish' = 'arm') => [action, '--env-file', envFile, '--stamp-config', stampFile,
     '--fic-record', ficPath, '--release-file', releaseFile, '--kubeconfig', kubeconfig, '--context', 'fixture',
-    ...(action === 'arm' ? ['--clients', '1', '--baseline-directory', baseline] :
+    ...(action !== 'finish' ? ['--clients', '1', '--baseline-directory', baseline] :
       ['--run-id', origin.runId, '--terminal-directory', terminal, '--delta-directory', delta])];
-  const runCli = (action: 'arm' | 'finish' = 'arm', selectedStore: CampaignStore = store, extraArgs: string[] = []) => {
+  const runCli = (action: 'arm' | 'prepare' | 'finish' = 'arm', selectedStore: CampaignStore = store, extraArgs: string[] = []) => {
     const args = cliArgs(action);
     for (let index = 0; index < extraArgs.length; index += 2) {
       const existing = args.indexOf(extraArgs[index]!);
@@ -398,6 +398,7 @@ async function fixture(t: TestContext, fault: Fault) {
     save(); record('load');
   };
   return { arm, runCli, cliArgs, releaseFile, load, store, loseBookkeeping: () => { loseBookkeeping = true; },
+    scheduleData: () => JSON.parse(fs.readFileSync(statePath, 'utf8')).objects['configmap/direct-schedule-confirmwide'].data,
     c, azure, directory, advanceClock: (ms: number) => {
       now += ms;
       state.now = now;
@@ -525,9 +526,19 @@ test('selected watchdog waits for original FIC, fences authorized null-QAP produ
   assert.equal(writes, 2);
 });
 
-test('offline CLI derives deterministic allocations from durable direct custody records', async t => {
+test('offline CLI prepares a pending arm and recovers it without client input', async t => {
   const f = await fixture(t, 'none');
-  const arm = await f.arm();
+  const prepared = await f.runCli('prepare');
+  assert.equal(prepared.action, 'prepare');
+  if (prepared.action !== 'prepare') throw new Error('Pending arm result expected');
+  assert.equal(prepared.status, 'prepared_not_released');
+  const { arm } = prepared;
+  assert.equal(arm.origin.clients, 1);
+  assert.equal(arm.clients.length, 1);
+  assert.deepEqual(f.scheduleData(), { start: 'pending', writerLifetime: 'pending', clientLifetimes: 'pending' });
+  assert.deepEqual(f.events().filter(event => ['arm-write', 'arm-readback', 'barrier-attempt', 'release'].includes(event.event))
+    .map(event => event.event), ['arm-write', 'arm-readback']);
+  await assert.rejects(f.runCli('finish'), /never released the schedule/);
   const { subscription, account, checkpoints } = f.c;
   const saved = (name: string, value: string) => {
     const file = join(f.directory, name);
@@ -545,7 +556,7 @@ test('offline CLI derives deterministic allocations from durable direct custody 
   const armBytes = f.stored.get(directArmRecordPath(arm.origin))!.bytes.toString();
   const savedArm = JSON.parse(armBytes);
   const readSet = { schema_version: 1, arm_sha256: createHash('sha256').update(canonical_json(savedArm)).digest('hex'),
-    max_delta_version: 1, parquet_paths: ['hour=0/a.parquet'], delta_markers: [] };
+    max_delta_version: 0, parquet_paths: [], delta_markers: [] };
   const readsPath = saved('reads.json', JSON.stringify(readSet));
   const run = (...args: string[]) => spawnSync(process.execPath, [...cli, ...args], { encoding: 'utf8' });
   const fence = run('--mode', 'fence');
@@ -572,24 +583,20 @@ test('offline CLI derives deterministic allocations from durable direct custody 
     const changed = parseEnvelope({ ...envelope, effects: envelope.effects.map(rule => rule.id === id ? { ...rule, ...mutate } : rule) });
     assert.throws(() => validateRecoveryTargets(changed, f.c, savedArm, fic, 'fixture'), reason);
   }
-  const file = envelope.effects.find(rule => rule.id === 'delta-file-0');
-  assert.equal(file?.path, `/${f.c.data}/${savedArm.baseline.table_root}/hour%3D0/a.parquet`);
   assert.ok(envelope.effects.some(rule => rule.method === 'PUT' && rule.path.endsWith('/interrupted/delta-00000000000000000000.json')));
-  assert.ok(envelope.effects.some(rule => rule.method === 'PUT' && rule.path.endsWith('/interrupted/delta-00000000000000000001.json')));
+  assert.ok(!envelope.effects.some(rule => rule.id === 'delta-commit-1' || rule.id.startsWith('delta-file-')));
   saved('reads.json', JSON.stringify({ ...readSet, arm_sha256: '0'.repeat(64) }));
   const mismatch = run(...recoveryArgs);
   assert.equal(mismatch.status, 1);
   assert.equal(mismatch.stdout, '');
   assert.match(mismatch.stderr, /original arm hash/);
 
-  f.addInterruptedCommit(arm.startMs, arm.endMs);
   f.advanceClock(181_000);
   f.staleAuthority(true);
-  const { reconcileOnce } = await import('../../projects/arrowcol-oat/aks-reconcile.js');
-  await reconcileOnce(f.store, Date.now(), true);
   const stateDir = join(f.directory, 'generated-envelope');
   fs.mkdirSync(stateDir, { mode: 0o700 });
   const envelopePath = saved('generated-recovery.json', recovery.stdout);
+  let fences = 0;
   await watchSelectedRun(['--env-file', 'fixture.env', '--stamp-config', 'fixture.yaml',
     '--effect-envelope', envelopePath, '--state-dir', stateDir, '--fic-record', f.ficPath,
     '--owner-id', origin.owner, '--namespace', origin.namespace, '--namespace-owner', origin.owner,
@@ -600,13 +607,32 @@ test('offline CLI derives deterministic allocations from durable direct custody 
     return 0;
   },
   { config: f.c, azure: f.azure, token: async () => 'fixture-token', fetcher: async (_input, init) => {
-    assert.notEqual(init?.method, 'PUT');
     const current = (await f.store.read())!;
+    if (init?.method === 'PUT') {
+      assert.equal(new Headers(init.headers).get('if-match'), current.etag);
+      assert.equal(fences++, 0);
+      const etag = await f.store.write(JSON.parse(String(init.body)), current.etag);
+      return new Response(null, { status: 201, headers: { etag } });
+    }
     return new Response(JSON.stringify(current.state), { headers: { etag: current.etag } });
   } });
   assert.equal(f.namespaceAbsent(), true);
   assert.equal(f.credential(), null);
+  assert.equal(fences, 1);
+  assert.equal(f.scheduleData().start, 'pending');
+  assert.ok(!f.events().some(event => ['barrier-attempt', 'release', 'load'].includes(event.event)));
+  const seal = [...f.stored.entries()].find(([key]) => key.endsWith('/interrupted/seal.json'))?.[1];
+  assert.equal(JSON.parse(seal!.bytes.toString()).result, 'interrupted_not_scored');
 });
+
+for (const [fault, reason] of [['arm-write-unknown', /arm write response lost/], ['arm-readback', /readback mismatch/]] as const) {
+  test('preparation never releases after ' + fault, async t => {
+    const f = await fixture(t, fault);
+    await assert.rejects(f.runCli('prepare'), reason);
+    assert.equal(f.scheduleData().start, 'pending');
+    assert.ok(!f.events().some(event => ['barrier-attempt', 'release'].includes(event.event)));
+  });
+}
 
 for (const fault of ['none', 'stop-unknown', 'exit-unknown'] as const) test(
   'selected recovery of the original unsealed run: ' + fault, async t => {

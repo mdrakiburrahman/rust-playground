@@ -92,7 +92,8 @@ export function directParquetConfig(log: string) {
 /** Call only with the approved immutable release pins and an existing exclusive run authority. */
 export async function armDirectBenchmark(azure: Azure, campaign: DirectCampaignScope, origin: DirectStopOrigin,
   release: DirectRelease, context: string, ficRecordPath: string, baselineDirectory: string,
-  assertInventory?: (arm: DirectTerminalArm) => Promise<void>): Promise<DirectTerminalArm> {
+  assertInventory?: (arm: DirectTerminalArm) => Promise<void>, disposition: 'release' | 'hold' = 'release'): Promise<DirectTerminalArm> {
+  requireEvidence(disposition === 'release' || disposition === 'hold', 'Unknown direct schedule disposition');
   const authority = directProducerAuthority(campaign, origin);
   requireEvidence([origin.runId, origin.namespaceUid, origin.owner, origin.cloudGeneration].every(id => uuid.test(id)) &&
     Number.isSafeInteger(origin.fencingToken) && origin.fencingToken > 0 && /^[a-z0-9-]+$/.test(origin.namespace) &&
@@ -209,6 +210,7 @@ export async function armDirectBenchmark(azure: Azure, campaign: DirectCampaignS
       'Original clients on a node do not share the sampled time namespace');
   }));
   const arm: DirectTerminalArm = {
+    ...(disposition === 'hold' ? { scheduleDisposition: 'held' as const } : {}),
     origin, baseline, startMs: prepared.measurementStartUnixMs, endMs: prepared.measurementEndUnixMs,
     clients: prepared.clients, writer, writerClaim, maintenance, sql, catalogLifetime, routers, registration: ready,
     routerUid, provenance: { release, catalog, catalogLog, clocks, schedule: prepared.patch,
@@ -237,6 +239,15 @@ export async function armDirectBenchmark(azure: Azure, campaign: DirectCampaignS
     Date.now() <= prepared.runStartUnixMs - 30_000, 'Original lifetimes, pending schedule or release lead time changed');
   await assertInventory?.(arm);
   await checkPublisher();
+  if (disposition === 'hold') {
+    const pending = owned(await get('configmap', 'direct-schedule-confirmwide'), 'ConfigMap', 'direct-schedule-confirmwide');
+    const data = evidenceObject(pending.obj.data);
+    requireEvidence(pending.metadata.resourceVersion === prepared.patch[0].value &&
+      data.start === 'pending' && data.writerLifetime === 'pending' && data.clientLifetimes === 'pending',
+    'Original schedule no longer matches the pending barrier');
+    await guard();
+    return arm;
+  }
   const response = evidenceObject(JSON.parse(await run('patch', 'configmap', 'direct-schedule-confirmwide', '--type=json',
     '--patch', JSON.stringify(prepared.patch), '-o', 'json')));
   const verify = (value: unknown) => {

@@ -107,6 +107,27 @@ fresh server-tested UID/resourceVersion preconditions and durable exact-body
 intent/readback. Namespace DELETE sends the allocated UID precondition bytes
 through stdin; no temporary pathname grants mutation authority.
 
+For a separately approved interrupted-custody rehearsal, use `prepare`
+instead of `arm` with the same ready, indexed 1–8 client Pods and authorized
+direct inventory. Do not separately release the ConfigMap:
+
+```bash
+npx --no-install tsx infra/azure/benchmark-direct-cli.ts prepare \
+  --env-file "$ENV" --stamp-config "$STAMP" --fic-record "$ORIGINAL_FIC" \
+  --release-file "$ORIGINAL_RELEASE" --kubeconfig "$KUBECONFIG" \
+  --context "$ORIGINAL_KUBE_CONTEXT" --clients "$CLIENTS" \
+  --baseline-directory "$BASELINE_DIR"
+```
+
+`prepared_not_released` confirms the durable original arm readback and the
+unchanged pending barrier. It is not a started or scored run. Ordinary
+`arm` still releases the schedule. A held arm cannot be finished, resumed,
+retimed, or replaced; preserve it for selected interrupted recovery. Keep
+the producer heartbeat until S0 has independently reviewed the exports and
+the complete original recovery allocation. Only then, under separate
+authorization, begin selected supervision with that allocation from its
+first tick and exercise producer loss. Never swap grants or reset receipts.
+
 Generate a candidate allocation offline from private exports of the original
 armed `active.json`, the ready run record independently read from the FIC
 ledger, and the explicit stamp configuration. No Azure or Kubernetes calls

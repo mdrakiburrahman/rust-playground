@@ -18,7 +18,7 @@ const digest = /^[^\s@]+@sha256:[a-f0-9]{64}$/;
 const roles = ['writer', 'client', 'maintenance', 'sql', 'router', 'catalog'] as const;
 const common = ['env-file', 'stamp-config', 'fic-record', 'release-file', 'kubeconfig', 'context'] as const;
 
-type Action = 'arm' | 'finish';
+type Action = 'arm' | 'prepare' | 'finish';
 type Options = {
   action: Action;
   'env-file': string;
@@ -42,12 +42,14 @@ export interface DirectCliDependencies {
 }
 export type DirectCliResult =
   | { action: 'arm'; arm: DirectTerminalArm }
+  | { action: 'prepare'; status: 'prepared_not_released'; arm: DirectTerminalArm }
   | { action: 'finish'; qualification: unknown; sealPath: string; handoffEtag: string };
 
 function parseOptions(args: string[]): Options {
   const action = args[0];
-  if (action !== 'arm' && action !== 'finish') throw new Error('Select exactly one direct command: arm or finish.');
-  const required = [...common, ...(action === 'arm' ? ['clients', 'baseline-directory'] :
+  if (action !== 'arm' && action !== 'prepare' && action !== 'finish')
+    throw new Error('Select exactly one direct command: arm, prepare or finish.');
+  const required = [...common, ...(action !== 'finish' ? ['clients', 'baseline-directory'] :
     ['run-id', 'terminal-directory', 'delta-directory'])];
   const allowed = new Set<string>(required);
   const values = new Map<string, string>();
@@ -64,7 +66,7 @@ function parseOptions(args: string[]): Options {
   }
   if (required.some(name => !values.has(name))) throw new Error('Direct command is missing a required option.');
   const clientsText = values.get('clients');
-  if (action === 'arm' && !/^[1-8]$/.test(clientsText ?? '')) throw new Error('--clients must be an integer from 1 through 8.');
+  if (action !== 'finish' && !/^[1-8]$/.test(clientsText ?? '')) throw new Error('--clients must be an integer from 1 through 8.');
   if (action === 'finish' && !uuid.test(values.get('run-id') ?? '')) throw new Error('--run-id must identify the original direct run.');
   const context = values.get('context')!;
   if (context.length > 512 || !context.trim() || context !== context.trim()) throw new Error('--context is invalid.');
@@ -76,7 +78,7 @@ function parseOptions(args: string[]): Options {
     'release-file': values.get('release-file')!,
     kubeconfig: values.get('kubeconfig')!,
     context,
-    ...(action === 'arm' ? { clients: Number(clientsText), 'baseline-directory': values.get('baseline-directory')! } : {
+    ...(action !== 'finish' ? { clients: Number(clientsText), 'baseline-directory': values.get('baseline-directory')! } : {
       'run-id': values.get('run-id')!, 'terminal-directory': values.get('terminal-directory')!,
       'delta-directory': values.get('delta-directory')!,
     }),
@@ -134,8 +136,10 @@ function isDirectTerminalArm(value: unknown, base: Omit<DirectStopOrigin, 'clien
     const records = (items: unknown): items is unknown[] => Array.isArray(items) && items.every(item => {
       try { evidenceObject(item); return true; } catch { return false; }
     });
-    if (!exactKeys(arm, ['origin', 'startMs', 'endMs', 'baseline', 'clients', 'writer', 'writerClaim', 'maintenance',
-        'sql', 'catalogLifetime', 'routers', 'registration', 'routerUid', 'provenance']) ||
+    const held = Object.hasOwn(arm, 'scheduleDisposition');
+    if (held && arm.scheduleDisposition !== 'held' ||
+        !exactKeys(arm, ['origin', 'startMs', 'endMs', 'baseline', 'clients', 'writer', 'writerClaim', 'maintenance',
+        'sql', 'catalogLifetime', 'routers', 'registration', 'routerUid', 'provenance', ...(held ? ['scheduleDisposition'] : [])]) ||
         !exactKeys(provenance, ['clocks', 'release', 'catalog', 'catalogLog', 'schedule', 'transport', 'parquet'])) return false;
     const armOrigin = evidenceObject(arm.origin), clients = armOrigin.clients;
     if (typeof clients !== 'number' || !Number.isInteger(clients) || clients < 1 || clients > 8) return false;
@@ -197,7 +201,7 @@ async function resolveProducer(options: Options, selected: LoadedConfig, azure: 
     fic.namespaceUid === inventory.namespace.uid && fic.namespaceOwner === inventory.namespace.owner_token &&
     (fic.phase === 'ready' || options.action === 'finish' && fic.phase === 'deleted'),
   'Run FIC record does not match the durable producer inventory');
-  assertDirectInventory(azure, inventory, fic, options.action);
+  assertDirectInventory(azure, inventory, fic, options.action === 'finish' ? 'finish' : 'arm');
   const [publisher] = await new PublisherControl(azure).read();
   requireEvidence(typeof publisher.resetgeneration === 'string' && uuid.test(publisher.resetgeneration),
     'Publisher generation is unavailable');
@@ -223,7 +227,7 @@ export async function runDirectBenchmarkCli(args: string[], dependencies: Direct
   process.env.KUBECONFIG = expectedKubeconfig;
   try {
     const { campaign, base } = await resolveProducer(options, selected, azure, store, release);
-    if (options.action === 'arm') {
+    if (options.action !== 'finish') {
       if (options.clients === undefined || options['baseline-directory'] === undefined)
         throw new Error('Arm command is missing its workload shape or baseline directory.');
       const origin: DirectStopOrigin = { ...base, clients: options.clients };
@@ -234,7 +238,13 @@ export async function runDirectBenchmarkCli(args: string[], dependencies: Direct
           const current = await store.read();
           requireEvidence(current?.state.runInventory, 'Original direct inventory is missing at arm');
           assertDirectInventory(azure, current.state.runInventory, read_run_fic_record(options['fic-record'], selected.config), 'arm', record);
-        });
+        }, options.action === 'prepare' ? 'hold' : 'release');
+      if (options.action === 'prepare') {
+        const status = 'prepared_not_released' as const;
+        (dependencies.log ?? console.log)(JSON.stringify({ ok: true, action: 'prepare', status, runId: origin.runId,
+          armRecord: directArmRecordPath(origin) }));
+        return { action: 'prepare', status, arm };
+      }
       (dependencies.log ?? console.log)(JSON.stringify({ ok: true, action: 'arm', runId: origin.runId,
         startMs: arm.startMs, endMs: arm.endMs, armRecord: directArmRecordPath(origin) }));
       return { action: 'arm', arm };
