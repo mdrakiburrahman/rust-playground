@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { canonical_json, type Azure } from '../../infra/azure/bootstrap.js';
-import { observe_custody_idle_capacity } from '../../infra/azure/aks-safe-idle.js';
+import { custodyIdleSystemMatches, custodyIdleTopology, custodyIdleUserMatches, observe_custody_idle_capacity } from '../../infra/azure/aks-safe-idle.js';
 import { plan_run_fic } from '../../infra/azure/run_fic.js';
 import { CampaignConflictError, CampaignFencedError, CampaignWriteOutcomeUnknownError, isInitialRunInventory, recordCleanupArmOperation, type CampaignState, type CampaignStore, type CleanupArmTarget } from './aks-campaign.js';
 import { createOwnedRunCleanupActions, type CleanupMutationAuthority, type ExternalCleanupActions } from './aks-cleanup-executor.js';
@@ -98,15 +98,22 @@ async function validatedCleanupBaseline(azure: Azure, state: CampaignState, expe
   const value = object(JSON.parse(bytes.toString()) as unknown), capacity = object(value.capacity);
   const system = object(capacity.system_pool), kusto = object(capacity.kusto);
   const aksId = azure.c.base + '/providers/Microsoft.ContainerService/managedClusters/' + azure.c.cluster;
-  const expectedIds = [aksId, ...['systempool', 'benchd64', 'benche64'].map(name => aksId + '/agentPools/' + name), azure.c.cluster_id].sort();
+  const topology = custodyIdleTopology(azure.c);
+  const expectedIds = [aksId, ...topology.names.map(name => aksId + '/agentPools/' + name), azure.c.cluster_id].sort();
+  const expandedUsers = topology.breakthrough && Array.isArray(capacity.user_pools) ? capacity.user_pools.map(object) : [];
+  const expandedIdle = capacity.schema_version === 1 && capacity.workload_and_data_verification === 'unknown' &&
+    Array.isArray(capacity.failures) && capacity.failures.length === 0 && capacity.aks_provisioning_state === 'Succeeded' &&
+    system.name === 'systempool' && system.provisioning_state === 'Succeeded' && kusto.provisioning_state === 'Succeeded' &&
+    kusto.state === 'Running' && expandedUsers.length === topology.users.length && topology.users.every(expected =>
+      expandedUsers.filter(pool => pool.name === expected.name && pool.vm_size === expected.vmSize && pool.role === expected.role &&
+        pool.provisioning_state === 'Succeeded' && custodyIdleUserMatches(pool)).length === 1);
   if (value.schema_version !== 1 || value.campaign_id !== state.campaignId || value.owner_id !== state.ownerId ||
       value.producer_fencing_token !== state.runInventory?.fencing_token || value.started_at_unix_ms !== state.startedAtMs ||
       typeof value.captured_at_unix_ms !== 'number' || !Number.isSafeInteger(value.captured_at_unix_ms) ||
       value.captured_at_unix_ms < state.startedAtMs || value.captured_at_unix_ms > (state.fencedAtMs ?? Date.now()) ||
       state.operations.some(operation => operation.submittedAtMs < Number(value.captured_at_unix_ms)) ||
       capacity.scope !== 'arm_capacity_only' || capacity.status !== 'capacity_idle' ||
-      ![2, 3].includes(integer(system.count)) || system.vm_size !== 'Standard_D8ds_v6' ||
-      system.autoscale_enabled !== false || system.autoscale_min !== null || system.autoscale_max !== null ||
+      !custodyIdleSystemMatches(system, topology.breakthrough) || (topology.breakthrough && !expandedIdle) ||
       kusto.sku !== 'Standard_E4ads_v5' || kusto.capacity !== 2 || kusto.autoscale_min !== 2 || kusto.autoscale_max !== 4 ||
       kusto.autoscale_enabled !== true || kusto.auto_stop_enabled !== true || !Array.isArray(capacity.receipts))
     throw new Error('Original pre-campaign baseline does not authorize the safe-idle rollback target.');
@@ -115,7 +122,10 @@ async function validatedCleanupBaseline(azure: Azure, state: CampaignState, expe
     if (receipt.http_status !== 200 || !text(receipt.request_id) || !/^[a-f0-9]{64}$/.test(text(receipt.body_sha256)) ||
         observedAt < state.startedAtMs || observedAt > Number(value.captured_at_unix_ms))
       throw new Error('Original pre-campaign baseline lacks positive, timely resource receipts.');
-    return text(receipt.resource_id);
+    const id = text(receipt.resource_id);
+    if (topology.breakthrough && receipt.api_version !== (id === azure.c.cluster_id ? '2024-04-13' : '2024-10-01'))
+      throw new Error('Original pre-campaign baseline lacks the expected ARM receipt API version.');
+    return id;
   }).sort();
   if (canonical_json(ids) !== canonical_json(expectedIds)) throw new Error('Original baseline targets another stamp or has incomplete ARM receipts.');
   validateStampKustoBaseline(value.non_run_kusto, azure, state, value.captured_at_unix_ms);
@@ -311,6 +321,11 @@ export function createDefaultCleanupProviders(store: CampaignStore, options: Def
       if (observed.aks_provisioning_state !== 'Succeeded' || observed.system_pool.provisioning_state !== 'Succeeded' ||
           observed.user_pools.some(pool => pool.provisioning_state !== 'Succeeded') || observed.kusto.provisioning_state !== 'Succeeded')
         return 'pending';
+      // The expanded topology changes verification, not the legacy rollback write set.
+      if (custodyIdleTopology(azure.c).breakthrough) {
+        await authority.assertCurrent();
+        return observed.status === 'capacity_idle' ? 'complete' : 'pending';
+      }
       if (observed.system_pool.vm_size !== 'Standard_D8ds_v6') throw new Error('System-pool SKU drift requires its explicit recorded restore plan.');
       const aksId = azure.c.base + '/providers/Microsoft.ContainerService/managedClusters/' + azure.c.cluster;
       for (const pool of observed.user_pools) if (pool.count !== 0 || !pool.autoscale_enabled || pool.autoscale_min !== 0 || pool.autoscale_max !== 1) {
@@ -340,6 +355,7 @@ export function createDefaultCleanupProviders(store: CampaignStore, options: Def
       const authority = authorityFor(state);
       await assertCleaningActor(store, authority);
       await authority.assertCurrent();
+      if (custodyIdleTopology(azure.c).breakthrough) await readCleanupBaseline(azure, state);
       const capacity = await observe_custody_idle_capacity(azure), health = await readHealth(azure, state, authority, options.runCommand);
       if (capacity.status !== 'capacity_idle') return 'pending';
       const data = await readDataSafety(state, authority);
