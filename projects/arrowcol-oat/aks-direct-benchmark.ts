@@ -517,7 +517,8 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
     const causes = [primaryError, ...cleanupErrors].filter((error): error is Error => error instanceof Error);
     if (!report) causes.push(new Error('No measured benchmark report was produced.'));
     if (!namespaceRemoved || !ficRemoved || !poolsAtZero) causes.push(new Error('Owned-resource cleanup or workload-pool scale-down is incomplete.'));
-    throw new AggregateError(causes, `AKS benchmark run ${runId} did not complete successfully; retain private evidence in ${runDir}.`);
+    const detail = causes.map(error => config.redact(error.message)).filter(Boolean).join(' | ').slice(0, 2000);
+    throw new AggregateError(causes, `AKS benchmark run ${runId} did not complete successfully${detail ? `: ${detail}` : ''}; retain private evidence in ${runDir}.`);
   }
   return report;
 }
