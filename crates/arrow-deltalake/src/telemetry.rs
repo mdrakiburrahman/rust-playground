@@ -198,6 +198,7 @@ struct PublicationMetrics {
     duration: Histogram<f64>,
     committed_rows: Counter<u64>,
     committed_files: Counter<u64>,
+    committed_input_bytes: Counter<u64>,
     committed_bytes: Counter<u64>,
 }
 
@@ -210,6 +211,7 @@ fn publications() -> &'static PublicationMetrics {
             duration: meter.f64_histogram("delta.publication.duration").with_unit("s").build(),
             committed_rows: meter.u64_counter("delta.commit.rows").build(),
             committed_files: meter.u64_counter("delta.commit.files").build(),
+            committed_input_bytes: meter.u64_counter("delta.commit.input_bytes").with_unit("By").build(),
             committed_bytes: meter.u64_counter("delta.commit.parquet_bytes").with_unit("By").build(),
         }
     })
@@ -233,6 +235,7 @@ pub(crate) fn data_commit(
     let metrics = publications();
     metrics.committed_rows.add(rows, &[]);
     metrics.committed_files.add(files, &[]);
+    metrics.committed_input_bytes.add(input_bytes, &[]);
     metrics.committed_bytes.add(parquet_bytes, &[]);
     let event = serde_json::json!({
         "schema_version": 1,

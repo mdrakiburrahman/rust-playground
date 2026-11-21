@@ -9,6 +9,7 @@ COPY Cargo.toml Cargo.lock rust-toolchain.toml rustfmt.toml /workspace/
 COPY crates /workspace/crates
 COPY bin /workspace/bin
 COPY projects /workspace/projects
+COPY docs/experiments/arrowcol-oat/oat-config.quick.json /workspace/docs/experiments/arrowcol-oat/oat-config.quick.json
 COPY submodules/otel-arrow /workspace/submodules/otel-arrow
 RUN --mount=type=cache,id=rust-playground-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=rust-playground-cargo-git,target=/usr/local/cargo/git,sharing=locked \

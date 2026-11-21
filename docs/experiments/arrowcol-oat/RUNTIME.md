@@ -39,8 +39,14 @@ For AKS prerequisites, continue below. Local runs use the following independent 
 | Docker filesystem | Unix runner and daemon must see the **same absolute generated-state path**. A no-network, read-only nonce bind probe verifies actual bytes before SQL starts. Remote path remapping is unsupported, not silently approximated. |
 | Local inputs | New per-cell project/network/SQL and Kusto volumes, private app/migrator/HMAC files; no retained SQL volume or Azure environment file is used. Compose auto `.env` loading is disabled. Images/build cache and host resources remain shared. |
 | `platform.local.snapshot_root` | Optional absolute directory, outside generated state and not its ancestor. Opt-in export; default `null` retains automatic cleanup without exporting. Never point it at public website storage: snapshots contain real payloads. |
-| Stop/export/cleanup | Stop owned ingress first, then stop and wait for `delta-maintenance`, record its sanitized outcome, and only then SIGTERM collectors; stop catalog and dependencies afterward. `collector_stop_grace_seconds` (30..=3600, default 300) is applied to local collectors and AKS `terminationGracePeriodSeconds` and is read back before measurement. Other local stop phases retain a 300 s ceiling; the overall local deadline includes collector grace, all three other phase ceilings, and 120 s margin. Each collector records SIGTERM-to-exit seconds, committed rows/commits completed after SIGTERM, Quiver bundles drained/force-dropped, log completeness, and exit code. A zero drained count derived only from matched shutdown start/complete records is labelled `inferred`, not `observed`. A `delta-maintenance` exit 1 is recorded as `maintenance_operation_failure` with sanitized per-cell `error_kind` counts and a comment; exit 0 and intentional SIGTERM/143 for a previously running writer remain accepted. On both platforms, exit 2, 137, OOM and every other nonzero exit still fail. An AKS terminated state missed before pod deletion yields `exit_outcome.status=unavailable` and a null exit code, never an assumed success. Without snapshots, a local stop failure still attempts owned stack/volume/state destruction and retains both errors; an AKS stop failure still attempts UID-preconditioned namespace deletion, absence confirmation and authorized QAP/FIC cleanup. **Only snapshot mode** preserves source data on stop/export failure: copy/verify/sync snapshot and provenance before owned stack/volume/state deletion. |
+| Stop/export/cleanup | Stop owned ingress first, then stop and wait for `delta-maintenance`, record its sanitized outcome, and only then SIGTERM collectors; stop catalog and dependencies afterward. `collector_stop_grace_seconds` (30..=3600, default 300) is applied to local collectors and AKS `terminationGracePeriodSeconds` and is read back before measurement. Other local stop phases retain a 300 s ceiling; the overall local deadline includes collector grace, all three other phase ceilings, and 120 s margin. Each collector records SIGTERM-to-exit seconds, committed rows/commits completed after SIGTERM, Quiver bundles drained/force-dropped, log completeness, and exit code. A zero drained count derived only from matched shutdown start/complete records is labelled `inferred`, not `observed`. Maintenance uses the retained pre-client baseline through drain: typed `stale_plan` retries and sanitized operation failures are separate. Raw exit 1 is preserved but never alone establishes `maintenance_operation_failure`; missing records or an unproved exit cause remain UNKNOWN. Exit 0 and intentional SIGTERM/143 for a previously running writer remain accepted; exit 2, 137, OOM and every other nonzero exit still fail. An AKS terminated state missed before pod deletion yields `exit_outcome.status=unavailable` and a null exit code, never an assumed success. Stop failure retains owned resources for recovery rather than attempting destructive cleanup. In snapshot mode, copy/verify/sync snapshot and provenance before owned stack/volume/state deletion. |
 | Snapshot meaning | Last committed stopped data, **not** proof every admitted row was flushed. No measurement, pinning, unknown-count or QAP acceptance gate is relaxed. |
+
+Local teardown includes the maintenance Compose profile only when maintenance
+was enabled for the cell; other profiles remain excluded.
+After a successful measurement, `local_teardown` identifies the cell and its
+completed schedule while cleanup is running. It is not terminal success or proof
+of drain.
 
 Collector routing-store SQL remains unpooled; unlike the router's per-request
 authoritative OAT pin reads, its heartbeat/pressure operations are periodic.
@@ -59,6 +65,34 @@ below four restarts, fails immediately on image-pull/container-config errors,
 and is bounded by `aks_rollout_timeout_seconds`, including stalled API calls.
 Failures capture bounded current/previous logs and descriptions for every
 workload role, namespace pods/services/endpoints and events before cleanup.
+Scale-out keeps exactly one collector/router and initializes the fresh canonical
+physical table in pin-init before maintenance readback and client admission.
+An independent finite client-image registration Job then sends the production
+DMV `CREATE TABLE IF NOT EXISTS` through the router with the client edge key.
+Signed catalog snapshot readback must prove exactly that canonical schema at
+the run-scoped location. Only the existing client signing keys are mounted:
+no migrator password or storage identity. The controller verifies the receipt,
+foreground-deletes the Job and confirms its UID-selected Pods are absent before
+starting maintenance; the effective-policy/stop-budget readback gate is unchanged.
+Deletion is preconditioned on the recorded Job UID. Logs use its controller-UID
+selector, with Pod ownership and identity checked before and after the read.
+One controller-side 180-second deadline includes resource creation, all RPCs and
+cleanup; late completion fails admission. The registration ConfigMap remains
+until normal run-namespace cleanup.
+Pin-init uses the collector's Azure ownership environment from the validated
+run runtime config; missing subscription/stamp or a mismatched Delta account
+fails before Job creation. Its read-only root retains a bounded writable `/tmp`.
+Failed initialization remains failed. Cleanup can confirm initializer termination
+without a success receipt only with a recorded Job UID, `Failed=True`,
+absent-or-integer-zero `active`/`ready`/`terminating`, no uncounted terminated
+pods, and terminal kubelet states with container IDs for every
+init/application container in every same-controller pod. The distinct
+`initializer_terminated_without_receipt` evidence never claims table initialization;
+timeouts, missing kubelet statuses and ambiguous/API failures remain unconfirmed.
+It does not send a collector startup-table selector: the strict exporter
+configuration supports `authority_timeout`, not table selection. Requested
+exporter tunables survive initial injection and reconfiguration; malformed,
+duplicate or conflicting overrides fail admission.
 Teardown logs per-Deployment stop, namespace deletion/absence and QAP/FIC cleanup
 durations; a failed cell's total elapsed time alone cannot identify its slow step.
 
@@ -96,12 +130,19 @@ npx --no-install arrowcol-oat --config "$OAT_SMOKE_ROOT/config.json" --mode loca
 ```
 
 The one-second measurement still follows image/stack startup, trusted immutable
-pin initialization, whole-fleet preflight/QAP setup and a fixed 60-second schedule
-lead. The viewer stays open after completion until Ctrl+C. A successful smoke
+pin initialization, whole-fleet preflight/QAP setup and the schedule lead.
+The viewer stays open after completion until Ctrl+C. A successful smoke
 must have real positive committed rows in the exported dataset, not merely an
 upload acknowledgement. Parquet summary schema v2 remains unchanged: missing QAP
 measurements stay null; a completed pinning violation is published as failed
 pinning, while preparation/client/cleanup errors can abort before Parquet exists.
+
+| Scheduling setting / evidence | Contract |
+| --- | --- |
+| Top-level `schedule_lead_seconds` | Integer `1..=1800`, default `180` when omitted. This is the common lead from schedule creation to warm-up start and the **same original absolute timeout** for arming and full-fleet acknowledgment. Short leads are unqualified controls, not guaranteed deliverable schedules. |
+| Client compatibility | `client_ready_timeout_seconds + qap_timeout_seconds + schedule_lead_seconds` must fit the pinned `arrowcol-dmv --schedule-timeout-secs` ceiling of `2160`; invalid totals fail before effects. Client Job lifetime, minimum pin TTL and planned cell duration use that same selected lead with their unchanged margins. `run_pin_ttl_ms` must still cover the resulting minimum. |
+| Requested/effective proof | `tunables_json.schedule_lead_seconds` records the selected input (including its omitted-field default). `evidence_json.client_schedule` records requested/effective lead, actual assigned absolute phase boundaries, full-fleet acknowledgment time and derived lifetime budgets. It remains null without verified acknowledgment; missing/late delivery fails, is cancelled and is never replayed or relabelled ready. |
+| Scope | No existing C3 JSON/hash is changed. Reducing the lead does not shorten warm-up/measurement, maintenance, reconciliation, collector drain or the agreed stability/600-second pilot protocol, and does not qualify a shorter lead for that protocol. |
 
 | Retained output | Evidence / limits |
 | --- | --- |
@@ -109,6 +150,7 @@ pinning, while preparation/client/cleanup errors can abort before Parquet exists
 | `snapshots/<cell-run-UUID>/sqlserver_active_sessions/table/` | Unchanged genuine Delta JSON log and payload bytes; only the empty writer lock file is omitted. Checkpoint Parquet sidecars and `_last_checkpoint` are preserved byte-for-byte; checkpoints do not bridge gaps in the required contiguous JSON history from version zero. Symlinks/nonregular files, deletion vectors, external paths, history gaps or missing historical Add payloads are rejected. |
 | Sibling `manifest.json` | Version 1 `schema_version`, `run_id`, `table`, `latestVersion`, positive `rowCount`, original `schemaString`, `files[{path,size,sha256}]`, stopped `writers` and semantics. Paths are relative to `table/`; active rows are independently decoded and checked against Parquet footer counts, never inferred from Add statistics. |
 | `results.parquet`, `site/results.parquet` | Local summary/mirror outside generated state. Not the Delta dataset and not a provider qualification receipt. |
+| `out/arrowcol-oat/admission-diagnostics/<run-id>/<cell-id>.json` | Private controller-side receipt for successful or failed cells that captured admission evidence. It retains the selected collector identity, a bounded allowlisted excerpt and digest of the last received pressure body, and the first rejected startup values when available. A different post-client mismatch is recorded separately. It survives workload cleanup and does not qualify a cell or prove that a failed identity fence passed. |
 
 For a separately authorized later provider probe, select exactly one completed
 table directory and bind its raw manifest hash, run ID and table identity. Replay
@@ -144,6 +186,88 @@ The template declares one `arrow-collector` UAMI in the primary resource group. 
 The generated QAP database is `experimentqap`, distinct from the main `arrowcol` database and from the OAT results destination. The operator also needs the selected cluster context, image-pull readiness, metrics API access, and write access to the configured `experiments` and root `$web` destinations. The fixture container is not the results container.
 
 `aks destroy --stamp-config "$STAMP_CONFIG"` only prints a read-only inventory. Adding `--confirm arrow-collector-rg` deletes the entire `arrow-collector-rg` and its captured AKS-managed resource groups, including every stamp there; it is not per-run cleanup. OAT benchmark cleanup is automatic and run-scoped.
+
+## Heterogeneous AKS fleet
+
+The [full-fleet template](oat-config.aks.full-fleet.json) is a sizing input, not a
+direct Rust API request. Start from the selected stamp's private single-table
+scale-out OAT configuration, retain its pinned images and identity bindings, and copy the
+template's `platform.fleet` block. Set `collector_pool` to the explicitly selected
+largest pool; the legacy collector pool is not implicitly selected or relabelled.
+
+| Setting | Resolution |
+| --- | --- |
+| `collector.*` | `auto` derives DFE, runtime, blocking and encoder/writer CPU workers from the selected Ready node's available whole cores, respecting existing consumer maxima. Positive numeric overrides remain supported. |
+| `client.*` | `auto` resolves independently for every Ready client node: worker/runtime threads, connection/stream counts, rows, concurrency and corpus/memory budgets. |
+| Pod budget | Observed node allocatable minus existing nonterminal pod requests, including DaemonSets, minus reserved runtime/support-service room. Collector reservation includes SQL, router, catalog, maintenance and setup jobs; clients retain additional headroom. |
+| Placement | One integrated collector pod plus existing support topology on the explicit collector pool/node. One DMV pod per client node, pinned by pool and hostname with the role selector/taint toleration retained. Only observed `amd64` nodes are admitted for the existing images. |
+| Evidence | Per-client and per-pool completed/admitted rows/s, node/pool/SKU allocation and collector/client allocatable CPU/memory totals. Client completion rates are neither attempted/offered rates nor collector-committed rates. The ranking remains exactly `ranking_metrics.committed_rows_per_second`, reconciled from collector commits before shutdown. Missing ranking evidence stays null. |
+
+For offline reproduction from a fleet orchestration observation, prepare a
+single numeric cell without performing cloud operations:
+
+```bash
+npx --no-install tsx projects/arrowcol-oat/prepare-experiments.ts \
+  --base out/arrowcol-oat/full-fleet-input.json \
+  --fleet-observation out/arrowcol-oat/fleet-observation.json \
+  --stamp-config "$STAMP_CONFIG" --out out/arrowcol-oat/resolved-fleet
+```
+
+The observation contains `nodes` (Ready-node identity, architecture, allocatable
+CPU/memory and existing requested CPU/memory), sanitized `pools` outcomes and
+`images: [{ "image": "<exact digest-pinned reference>", "architectures": ["amd64"] }]`
+read from registry metadata for every runtime, client and maintenance image.
+Preparation rejects unknown sizing fields, malformed sentinels, duplicate nodes,
+incompatible architectures and insufficient budgets. It emits
+`full-fleet.config.json`, with exactly one replica/core cell and no client-count
+sweep. Do not reuse stale observations or submit unresolved `auto` fields directly
+to the Rust API. No collector, router or DMV image rebuild is required.
+
+Preparation requires image observations matching every pinned reference and
+selected node architecture; an `amd64` node selector alone is not image proof.
+
+### Custodied fleet execution and kill
+
+| Requirement | Contract |
+| --- | --- |
+| Reviewed stamp | Complete System/User pool membership must match the reviewed stamp. Select one collector explicitly; all reviewed client pools participate. Nonselected User pools remain unowned at settled zero with their approved enabled autoscaler/minimum/maximum policy; unknown or missing pools prevent verified cleanup. |
+| Private custody environment | `--env-file` supplies `ARM_SUBSCRIPTION_ID`, `CAMPAIGN_STORAGE_ACCOUNT` and `CAMPAIGN_STATE_CONTAINER`, exactly matching the selected stamp's subscription, existing account and checkpoints container. Existing operator credentials are reused. |
+| Fresh observations | The production adapter observes ARM identities/policies, Ready nodes, requested resources and digest-bound Linux/amd64 image metadata. Preflight rechecks exact collector/client pool/SKU/node identities and remaining budgets. Supplied offline JSON is not production acceptance evidence. |
+| Ownership | A versioned journal in the existing checkpoints container, journal-blob lease and legacy observe-only campaign claim exclude competing custody. Every selected pool must begin at zero with no physical nodes. Intent and ETag are persisted before conditional ARM dispatch. Recovery requires the retained owner UUID; implicit takeover is forbidden. Legacy campaign qualification is unchanged. |
+| Scaling and idle | ARM operations serialize where required while Ready waits overlap. Run counts pin autoscaler minimum/maximum to the approved count. Cleanup restores zero, enabled autoscaling, minimum zero and each approved original maximum, then verifies zero selected nodes. Unknown outcomes stop rather than replay. |
+
+Use the reviewed `sku-pools.ts` output's `userPools` in the private stamp,
+and select its `collector.name` (with `collector.vmSize` matching that pool),
+not the first `arrowcol` role. After copying the sizing block into the selected
+stamp's private config, retain the owner UUID and run:
+
+```bash
+OWNER_ID="$(node -p "require('node:crypto').randomUUID()")"
+COLLECTOR_POOL="$(node -p "JSON.parse(require('node:fs').readFileSync(process.argv[1], 'utf8')).collector.name" out/arrowcol-oat/reviewed-pools.json)"
+npx --no-install arrowcol-oat aks fleet run \
+  --env-file out/arrowcol-oat/custody.env --stamp-config "$STAMP_CONFIG" \
+  --collector-pool "$COLLECTOR_POOL" --owner-id "$OWNER_ID" \
+  --config out/arrowcol-oat/full-fleet-input.json --out "out/arrowcol-oat/fleet-$OWNER_ID"
+```
+
+Default scale/run/cleanup budgets are 7200/7200/3600 seconds and must fit six
+hours together. The output retains observed fleet/image metadata, resolved
+numeric input and a fleet result; native OAT publication remains the only source
+of committed ranking evidence. A failed native launch retains active custody
+even after successful pool teardown; use the recovery command to independently
+verify idle and release it.
+
+**Destructive recovery:** the following kill entry point resumes only the exact
+durably owned selected user pools after process death. It removes their compute,
+never system or unowned pools. It does not claim a graceful drain, a successful
+benchmark, native run-resource cleanup or a resolved launcher disposition; retain
+and reconcile those original receipts before another benchmark.
+
+```bash
+npx --no-install arrowcol-oat aks fleet kill \
+  --env-file out/arrowcol-oat/custody.env --stamp-config "$STAMP_CONFIG" \
+  --collector-pool "$COLLECTOR_POOL" --owner-id "$OWNER_ID"
+```
 
 ## Build and rehearse
 

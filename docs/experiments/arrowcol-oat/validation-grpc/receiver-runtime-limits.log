@@ -1,0 +1,285 @@
+COMMAND: cargo test --locked -p arrowcol-dataflow-components receiver_compression_projects_typed_oat_json_into_actual_runtime_limits
+   Compiling proc-macro2 v1.0.107
+   Compiling unicode-ident v1.0.26
+   Compiling mio v1.2.4
+   Compiling ahash v0.8.12
+   Compiling arrow-schema v58.4.0
+   Compiling typenum v1.20.1
+   Compiling rustls-webpki v0.103.15
+   Compiling flate2 v1.1.10
+   Compiling zstd-safe v7.3.0
+   Compiling regex-automata v0.4.18
+   Compiling zstd-safe v8.1.0
+   Compiling compression-core v0.4.33
+   Compiling simdutf8 v0.1.5
+   Compiling unicode-segmentation v1.13.3
+   Compiling uuid v1.28.0
+   Compiling parking_lot v0.12.5
+   Compiling foldhash v0.1.5
+   Compiling hashbrown v0.15.5
+   Compiling datafusion-doc v54.1.0
+   Compiling heck v0.5.0
+   Compiling zstd v0.13.3
+   Compiling zstd v0.14.2
+   Compiling quote v1.0.47
+   Compiling rustls v0.23.45
+   Compiling comfy-table v7.2.2
+   Compiling compression-codecs v0.4.45
+   Compiling syn v3.0.6
+   Compiling syn v2.0.119
+   Compiling generic-array v0.14.7
+   Compiling petgraph v0.8.3
+   Compiling indexmap v2.14.2
+   Compiling pulldown-cmark v0.13.4
+   Compiling encoding_rs v0.8.42
+   Compiling glob v0.3.4
+   Compiling multimap v0.10.1
+   Compiling block-buffer v0.10.4
+   Compiling crypto-common v0.1.7
+   Compiling digest v0.10.7
+   Compiling hybrid-array v0.4.15
+   Compiling md-5 v0.10.6
+   Compiling arrayvec v0.7.8
+   Compiling toml_edit v0.25.17+spec-1.1.0
+   Compiling nix v0.31.3
+   Compiling pulldown-cmark-to-cmark v22.0.3
+   Compiling proc-macro-crate v3.5.0
+   Compiling rust_decimal v1.43.0
+   Compiling regex v1.13.1
+   Compiling matchers v0.2.0
+   Compiling block-buffer v0.12.1
+   Compiling crypto-common v0.2.2
+   Compiling ciborium-io v0.2.2
+   Compiling const-oid v0.10.2
+   Compiling sha2 v0.10.9
+   Compiling prettyplease v0.2.37
+   Compiling synstructure v0.14.0
+   Compiling rustls-platform-verifier v0.7.1
+   Compiling tonic-build v0.14.6
+   Compiling serde_derive_internals v0.30.0
+   Compiling digest v0.11.3
+   Compiling half v1.8.3
+   Compiling yansi v1.0.1
+   Compiling diff v0.1.13
+   Compiling pretty_assertions v1.4.1
+   Compiling sha2 v0.11.0
+   Compiling itertools v0.15.0
+   Compiling opentelemetry v0.33.1
+   Compiling otel-arrow-dfe-pdata-views v0.54.1 (/workspaces/rust-playground/submodules/otel-arrow/rust/otap-dataflow/crates/pdata-views)
+   Compiling replace_with v0.1.8
+   Compiling opentelemetry_sdk v0.33.1
+   Compiling spin v0.9.9
+   Compiling opentelemetry-semantic-conventions v0.33.1
+   Compiling opentelemetry-resource-detectors v0.13.0
+   Compiling flume v0.12.0
+   Compiling slotmap v1.1.1
+   Compiling arc-swap v1.9.2
+   Compiling otel-arrow-dfe-expohisto v0.61.0 (/workspaces/rust-playground/submodules/otel-arrow/rust/otap-dataflow/crates/expohisto)
+   Compiling inotify-sys v0.1.8
+   Compiling otel-arrow-dfe-component-inventory-syntax v0.61.0 (/workspaces/rust-playground/submodules/otel-arrow/rust/otap-dataflow/crates/component-inventory-syntax)
+   Compiling inotify v0.11.5
+   Compiling memory-stats v1.2.0
+   Compiling cpu-time v1.0.0
+   Compiling notify-types v2.1.0
+   Compiling data-encoding v2.11.1
+   Compiling hmac v0.12.1
+   Compiling memmap2 v0.9.11
+   Compiling constant_time_eq v0.4.2
+   Compiling xxhash-rust v0.8.19
+   Compiling notify v8.2.0
+   Compiling blake3 v1.8.7
+   Compiling zerocopy-derive v0.8.62
+   Compiling tracing-attributes v0.1.31
+   Compiling pin-project-internal v1.1.13
+   Compiling serde_derive v1.0.229
+   Compiling tokio-macros v2.7.2
+   Compiling futures-macro v0.3.34
+   Compiling zerofrom-derive v0.1.8
+   Compiling yoke-derive v0.8.4
+   Compiling zerovec-derive v0.11.6
+   Compiling displaydoc v0.2.7
+   Compiling thiserror-impl v2.0.21
+   Compiling tokio v1.53.2
+   Compiling async-trait v0.1.92
+   Compiling prost-derive v0.14.4
+   Compiling pin-project v1.1.13
+   Compiling datafusion-macros v54.1.0
+   Compiling tracing v0.1.44
+   Compiling futures-util v0.3.34
+   Compiling axum-core v0.5.6
+   Compiling tracing-subscriber v0.3.23
+   Compiling ref-cast-impl v1.0.27
+   Compiling schemars_derive v1.2.2
+   Compiling zerocopy v0.8.62
+   Compiling miette-derive v7.6.0
+   Compiling ref-cast v1.0.27
+   Compiling num_enum_derive v0.7.6
+   Compiling async-stream-impl v0.3.6
+   Compiling serde v1.0.229
+   Compiling tokio-util v0.7.20
+   Compiling tokio-rustls v0.26.6
+   Compiling zerofrom v0.1.8
+   Compiling chrono v0.4.45
+   Compiling serde_urlencoded v0.7.1
+   Compiling async-compression v0.4.50
+   Compiling yoke v0.8.3
+   Compiling quick-xml v0.39.4
+   Compiling zerovec v0.11.8
+   Compiling h2 v0.4.20
+   Compiling thiserror v2.0.21
+   Compiling zerotrie v0.2.5
+   Compiling tower v0.5.3
+   Compiling half v2.7.1
+   Compiling tinystr v0.8.4
+   Compiling potential_utf v0.1.6
+   Compiling icu_locale_core v2.3.0
+   Compiling arrow-buffer v58.4.0
+   Compiling chrono-tz v0.10.4
+   Compiling icu_collections v2.3.0
+   Compiling futures-executor v0.3.34
+   Compiling arrow-data v58.4.0
+   Compiling icu_provider v2.3.1
+   Compiling futures v0.3.34
+   Compiling ppv-lite86 v0.2.21
+   Compiling hashbrown v0.14.5
+   Compiling datafusion-common-runtime v54.1.0
+   Compiling icu_properties v2.3.0
+   Compiling icu_normalizer v2.3.0
+   Compiling rand_chacha v0.9.0
+   Compiling prost v0.14.4
+   Compiling rand v0.9.5
+   Compiling dashmap v6.2.1
+   Compiling tokio-stream v0.1.19
+   Compiling prost-types v0.14.4
+   Compiling icu_locale_fallback v2.3.0
+   Compiling idna_adapter v1.2.2
+   Compiling idna v1.1.0
+   Compiling hyper v1.12.0
+   Compiling icu_segmenter v2.3.0
+   Compiling ciborium-ll v0.2.2
+   Compiling url v2.5.8
+   Compiling humantime-serde v1.1.1
+   Compiling serde_yaml v0.9.34+deprecated
+   Compiling byte-unit v5.2.6
+   Compiling tower-http v0.6.11
+   Compiling prost-build v0.14.4
+   Compiling hyper-util v0.1.21
+   Compiling tonic-prost-build v0.14.6
+   Compiling arrow-array v58.4.0
+   Compiling textwrap v0.16.4
+   Compiling otel-arrow-dfe-pdata-otlp-model v0.61.0 (/workspaces/rust-playground/submodules/otel-arrow/rust/otap-dataflow/crates/pdata/src/otlp/model)
+   Compiling miette v7.6.0
+   Compiling schemars v1.2.2
+   Compiling hyper-rustls v0.27.10
+   Compiling reqwest v0.12.28
+   Compiling hyper-timeout v0.5.2
+   Compiling axum v0.8.9
+   Compiling reqwest v0.13.5
+   Compiling arrow-select v58.4.0
+   Compiling arrow-row v58.4.0
+   Compiling arrow-arith v58.4.0
+   Compiling ciborium v0.2.2
+   Compiling num_enum v0.7.6
+   Compiling opentelemetry v0.31.0
+   Compiling serde_cbor v0.11.2
+   Compiling object_store v0.13.2
+   Compiling otel-arrow-dfe-config v0.61.0 (/workspaces/rust-playground/submodules/otel-arrow/rust/otap-dataflow/crates/config)
+   Compiling arrow-ord v58.4.0
+   Compiling arrow-ipc v58.4.0
+   Compiling arrow-string v58.4.0
+   Compiling arrow-cast v58.4.0
+   Compiling tonic v0.14.6
+   Compiling otel-arrow-dfe-pdata-otlp-macros v0.61.0 (/workspaces/rust-playground/submodules/otel-arrow/rust/otap-dataflow/crates/pdata/src/otlp/macros)
+   Compiling secrecy v0.10.3
+   Compiling derive_more-impl v2.1.1
+   Compiling strum_macros v0.28.0
+   Compiling arrow-json v58.4.0
+   Compiling arrow-csv v58.4.0
+   Compiling arrow v58.4.0
+   Compiling datafusion-common v54.1.0
+   Compiling tonic-prost v0.14.6
+   Compiling derive_more v2.1.1
+   Compiling parquet v58.4.0
+   Compiling async-stream v0.3.6
+   Compiling arrowcol-protocol v0.1.0 (/workspaces/rust-playground/crates/arrowcol-protocol)
+   Compiling strum v0.28.0
+   Compiling linkme-impl v0.3.37
+   Compiling datafusion-expr-common v54.1.0
+   Compiling datafusion-physical-expr-common v54.1.0
+   Compiling enumflags2_derive v0.7.12
+   Compiling datafusion-functions-aggregate-common v54.1.0
+   Compiling datafusion-functions-window-common v54.1.0
+   Compiling delta_kernel_derive v0.29.0
+   Compiling datafusion-expr v54.1.0
+   Compiling otel-arrow-dfe-telemetry-macros v0.61.0 (/workspaces/rust-playground/submodules/otel-arrow/rust/otap-dataflow/crates/telemetry-macros)
+   Compiling delta_kernel v0.29.0
+   Compiling enumflags2 v0.7.12
+   Compiling linkme v0.3.37
+   Compiling chumsky v0.9.3
+   Compiling deadpool-runtime v0.1.4
+   Compiling asynchronous-codec v0.7.0
+   Compiling tiberius-macros v0.1.0
+   Compiling deadpool v0.12.3
+   Compiling opentelemetry_sdk v0.31.0
+   Compiling arrowcol-sparksql v0.1.0 (/workspaces/rust-playground/crates/arrowcol-sparksql)
+   Compiling otel-arrow-dfe-channel v0.61.0 (/workspaces/rust-playground/submodules/otel-arrow/rust/otap-dataflow/crates/channel)
+   Compiling tiberius v0.13.0
+   Compiling datafusion-physical-expr v54.1.0
+   Compiling datafusion-execution v54.1.0
+   Compiling datafusion-functions v54.1.0
+   Compiling datafusion-functions-window v54.1.0
+   Compiling datafusion-optimizer v54.1.0
+   Compiling datafusion-functions-aggregate v54.1.0
+   Compiling datafusion-physical-plan v54.1.0
+   Compiling datafusion-physical-expr-adapter v54.1.0
+   Compiling delta_kernel_default_engine v0.29.0
+   Compiling otel-arrow-dfe-engine-macros v0.61.0 (/workspaces/rust-playground/submodules/otel-arrow/rust/otap-dataflow/crates/engine-macros)
+   Compiling arrow-deltalake v0.1.0 (/workspaces/rust-playground/crates/arrow-deltalake)
+   Compiling arrowcol-sql-server v0.1.0 (/workspaces/rust-playground/crates/arrowcol-sql-server)
+   Compiling opentelemetry-proto v0.31.0
+   Compiling datafusion-session v54.1.0
+   Compiling datafusion-datasource v54.1.0
+   Compiling datafusion-catalog v54.1.0
+   Compiling datafusion-pruning v54.1.0
+   Compiling datafusion-datasource-arrow v54.1.0
+   Compiling datafusion-physical-optimizer v54.1.0
+   Compiling datafusion-datasource-csv v54.1.0
+   Compiling datafusion-datasource-json v54.1.0
+   Compiling datafusion-catalog-listing v54.1.0
+   Compiling datafusion-functions-table v54.1.0
+   Compiling arrowcol-catalog v0.1.0 (/workspaces/rust-playground/crates/arrowcol-catalog)
+   Compiling arrow-flight v58.4.0
+   Compiling datafusion v54.1.0
+   Compiling tonic-middleware v0.4.1
+   Compiling arrowcol-catalog-client v0.1.0 (/workspaces/rust-playground/crates/arrowcol-catalog-client)
+   Compiling opentelemetry-http v0.31.0
+   Compiling opentelemetry-otlp v0.31.1
+   Compiling arrowcol-routing v0.1.0 (/workspaces/rust-playground/crates/arrowcol-routing)
+   Compiling arrowcol-buffer v0.1.0 (/workspaces/rust-playground/crates/arrowcol-buffer)
+   Compiling arrowcol-flight v0.1.0 (/workspaces/rust-playground/crates/arrowcol-flight)
+   Compiling otel-arrow-dfe-quiver v0.61.0 (/workspaces/rust-playground/submodules/otel-arrow/rust/otap-dataflow/crates/quiver)
+   Compiling arrowcol-tunables v0.1.0 (/workspaces/rust-playground/crates/arrowcol-tunables)
+   Compiling otel-arrow-dfe-pdata v0.61.0 (/workspaces/rust-playground/submodules/otel-arrow/rust/otap-dataflow/crates/pdata)
+   Compiling otel-arrow-dfe-telemetry v0.61.0 (/workspaces/rust-playground/submodules/otel-arrow/rust/otap-dataflow/crates/telemetry)
+   Compiling otel-arrow-dfe-pdata-codec v0.61.0 (/workspaces/rust-playground/submodules/otel-arrow/rust/otap-dataflow/crates/pdata-codec)
+   Compiling otel-arrow-dfe-state v0.61.0 (/workspaces/rust-playground/submodules/otel-arrow/rust/otap-dataflow/crates/state)
+   Compiling otel-arrow-dfe-engine v0.61.0 (/workspaces/rust-playground/submodules/otel-arrow/rust/otap-dataflow/crates/engine)
+   Compiling otel-arrow-dfe-otap v0.61.0 (/workspaces/rust-playground/submodules/otel-arrow/rust/otap-dataflow/crates/otap)
+   Compiling otel-arrow-dfe-core-nodes v0.61.0 (/workspaces/rust-playground/submodules/otel-arrow/rust/otap-dataflow/crates/core-nodes)
+   Compiling arrowcol-dataflow-components v0.1.0 (/workspaces/rust-playground/crates/arrowcol-dataflow-components)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5m 54s
+     Running unittests src/lib.rs (target/debug/deps/arrowcol_dataflow_components-8e80c7a367646f9d)
+
+running 1 test
+test config::override_tests::receiver_compression_projects_typed_oat_json_into_actual_runtime_limits ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 91 filtered out; finished in 0.00s
+
+     Running tests/routing_shutdown.rs (target/debug/deps/routing_shutdown-41f71400f7f90666)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.00s
+
+
+EXIT=0

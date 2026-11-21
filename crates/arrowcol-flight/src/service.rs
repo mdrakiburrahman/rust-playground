@@ -18,7 +18,7 @@ use arrow_ipc::MessageHeader;
 use arrow_schema::{Schema, SchemaRef};
 use arrowcol_catalog::{CatalogStore, DdlParser, FlightSqlDdlHandler, SchemaValidator, SchemaVersion};
 use arrowcol_protocol::{
-    CATALOG_METADATA_KEY, CLAIMED_SCHEMA_FINGERPRINT_METADATA_KEY, IMPLEMENTATION_POOL_METADATA_KEY,
+    CATALOG_METADATA_KEY, CLAIMED_SCHEMA_FINGERPRINT_METADATA_KEY, ErrorCode, IMPLEMENTATION_POOL_METADATA_KEY,
     ImplementationPool, IngestMetadata, PROTOCOL_VERSION_METADATA_KEY, RawGrpcMetadata, SCHEMA_METADATA_KEY,
     TABLE_METADATA_KEY, fingerprint_schema,
 };
@@ -44,6 +44,73 @@ use crate::{
 pub type FlightResponseStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
 
 type InboundFlightStream = Pin<Box<dyn Stream<Item = Result<FlightData, Status>> + Send + 'static>>;
+
+const CLIENT_SEND_OBSERVATION_ID_HEADER: &str = "x-arrowcol-client-observation-id";
+const CLIENT_SEND_UNIX_NS_HEADER: &str = "x-arrowcol-client-send-unix-ns";
+const MAX_CLIENT_SEND_OBSERVATION_ID_BYTES: usize = 128;
+
+fn invalid_client_send_observation() -> RuntimeError {
+    RuntimeError::new(
+        ErrorCode::RoutingMetadataInvalid,
+        Code::InvalidArgument,
+        "invalid client send observation metadata",
+    )
+}
+
+fn single_ascii_header(metadata: &MetadataMap, key: &'static str) -> RuntimeResult<Option<String>> {
+    let mut values = metadata.get_all(key).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(invalid_client_send_observation());
+    }
+    value
+        .to_str()
+        .map(str::to_owned)
+        .map(Some)
+        .map_err(|_| invalid_client_send_observation())
+}
+
+fn parse_canonical_u64(value: &str) -> Option<u64> {
+    if value.is_empty()
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+        || (value.len() > 1 && value.starts_with('0'))
+    {
+        return None;
+    }
+    value.parse().ok()
+}
+
+fn parse_client_send_observation(metadata: &MetadataMap) -> RuntimeResult<Option<(String, u64)>> {
+    let id = single_ascii_header(metadata, CLIENT_SEND_OBSERVATION_ID_HEADER)?;
+    let send_unix_ns = single_ascii_header(metadata, CLIENT_SEND_UNIX_NS_HEADER)?;
+    let (id, send_unix_ns) = match (id, send_unix_ns) {
+        (None, None) => return Ok(None),
+        (Some(id), Some(send_unix_ns)) => (id, send_unix_ns),
+        _ => return Err(invalid_client_send_observation()),
+    };
+    if id.len() > MAX_CLIENT_SEND_OBSERVATION_ID_BYTES {
+        return Err(invalid_client_send_observation());
+    }
+    let send_unix_ns = parse_canonical_u64(&send_unix_ns).ok_or_else(invalid_client_send_observation)?;
+    let mut parts = id.split('-');
+    let process_id = parts.next().and_then(parse_canonical_u64);
+    let sequence = parts.next().and_then(parse_canonical_u64);
+    let id_timestamp = parts.next().and_then(parse_canonical_u64);
+    if process_id.is_none() || sequence.is_none() || id_timestamp != Some(send_unix_ns) || parts.next().is_some() {
+        return Err(invalid_client_send_observation());
+    }
+    Ok(Some((id, send_unix_ns)))
+}
+
+fn trusted_client_send_observation(
+    metadata: &MetadataMap,
+    trusted_forwarder: bool,
+) -> RuntimeResult<Option<(String, u64)>> {
+    let observation = parse_client_send_observation(metadata)?;
+    Ok(if trusted_forwarder { observation } else { None })
+}
 
 /// Shared Arrow Flight service for direct and dataflow collector binaries.
 #[derive(Clone)]
@@ -120,13 +187,56 @@ impl ArrowColFlightService {
         &self.drain
     }
 
-    /// Builds a tonic service with the runtime message-size limit.
+    /// Builds a tonic service with configured compression and message-size limits.
     #[must_use]
-    pub fn into_tonic_service(self) -> FlightServiceServer<Self> {
+    pub fn into_tonic_service(
+        self,
+    ) -> tonic::service::interceptor::InterceptedService<
+        FlightServiceServer<Self>,
+        impl tonic::service::Interceptor + Clone,
+    > {
         let maximum = self.limits.max_message_bytes;
-        FlightServiceServer::new(self)
+        let maximum_metadata = self.limits.max_metadata_bytes;
+        let accept = self.limits.grpc_accept_compression;
+        let send = self.limits.grpc_send_compression;
+        let mut service = FlightServiceServer::new(self)
             .max_decoding_message_size(maximum)
-            .max_encoding_message_size(maximum)
+            .max_encoding_message_size(maximum);
+        if let Some(encoding) = accept {
+            service = service.accept_compressed(encoding);
+        }
+        if let Some(encoding) = send {
+            service = service.send_compressed(encoding);
+        }
+        tonic::service::interceptor::InterceptedService::new(service, move |mut request: Request<()>| {
+            if send.is_none() {
+                return Ok(request);
+            }
+            validate_metadata_size(request.metadata(), maximum_metadata).map_err(RuntimeError::into_status)?;
+            // Tonic 0.14 selects any compiled codec once response compression is enabled.
+            let configured = send.map(|encoding| match encoding {
+                tonic::codec::CompressionEncoding::Gzip => "gzip",
+                tonic::codec::CompressionEncoding::Zstd => "zstd",
+                _ => "unsupported",
+            });
+            let advertised = configured.is_some_and(|configured| {
+                request
+                    .metadata()
+                    .get_all("grpc-accept-encoding")
+                    .iter()
+                    .filter_map(|value| value.to_str().ok())
+                    .flat_map(|value| value.split(','))
+                    .any(|value| value.trim() == configured)
+            });
+            request.metadata_mut().remove("grpc-accept-encoding");
+            if let Some(encoding) = configured.filter(|_| advertised) {
+                request.metadata_mut().insert(
+                    "grpc-accept-encoding",
+                    tonic::metadata::MetadataValue::from_static(encoding),
+                );
+            }
+            Ok(request)
+        })
     }
 
     /// Handles a generic `FlightData` stream, enabling focused tests without a
@@ -172,6 +282,7 @@ impl ArrowColFlightService {
         let deadline = effective_deadline(grpc_deadline(request.metadata())?, self.limits.max_stream_duration);
         let metadata = request.metadata().clone();
         let trusted_identity = run_until(deadline, self.trusted_identity_validator.validate(&metadata)).await?;
+        let trusted_client_send_observation = trusted_client_send_observation(&metadata, trusted_identity.is_some())?;
         let authentication = run_until(
             deadline,
             self.authenticator
@@ -194,8 +305,16 @@ impl ArrowColFlightService {
         }
         match ingest_metadata {
             Some(ingest_metadata) => {
-                self.start_ingest(ingest_metadata, authentication, first, stream, deadline, permit)
-                    .await
+                self.start_ingest(
+                    ingest_metadata,
+                    authentication,
+                    first,
+                    stream,
+                    deadline,
+                    permit,
+                    trusted_client_send_observation,
+                )
+                .await
             }
             None => self.execute_ddl(first, stream, deadline, permit, None).await,
         }
@@ -210,6 +329,7 @@ impl ArrowColFlightService {
         stream: InboundFlightStream,
         deadline: Instant,
         permit: DrainPermit,
+        trusted_client_send_observation: Option<(String, u64)>,
     ) -> RuntimeResult<Response<FlightResponseStream<PutResult>>> {
         let descriptor_version = validate_ingest_descriptor(first.flight_descriptor.as_ref(), &metadata)?;
         let received_schema = decode_first_schema(&first, self.limits.max_schema_bytes)?;
@@ -248,6 +368,7 @@ impl ArrowColFlightService {
             validated.alignment().clone(),
             actual_fingerprint,
             Some(deadline),
+            trusted_client_send_observation,
         );
         let (result_sender, result_receiver) = mpsc::channel(self.limits.put_result_channel_capacity);
         let force_stop = self.drain.force_stop_token();
@@ -1137,6 +1258,59 @@ mod tests {
     use futures::{TryStreamExt, stream};
 
     use super::*;
+
+    fn client_observation_metadata(id: Option<&str>, timestamp: Option<&str>) -> MetadataMap {
+        let mut metadata = MetadataMap::new();
+        if let Some(id) = id {
+            metadata.insert(CLIENT_SEND_OBSERVATION_ID_HEADER, id.parse().expect("observation id"));
+        }
+        if let Some(timestamp) = timestamp {
+            metadata.insert(CLIENT_SEND_UNIX_NS_HEADER, timestamp.parse().expect("send timestamp"));
+        }
+        metadata
+    }
+
+    #[test]
+    fn client_observation_requires_complete_canonical_pair_and_trusted_forwarder() {
+        let id = "123-7-1700000000000000000";
+        let timestamp = "1700000000000000000";
+        assert_eq!(
+            trusted_client_send_observation(&MetadataMap::new(), true).expect("absent"),
+            None
+        );
+        assert_eq!(
+            trusted_client_send_observation(&client_observation_metadata(Some(id), Some(timestamp)), false)
+                .expect("untrusted header"),
+            None
+        );
+        assert_eq!(
+            trusted_client_send_observation(&client_observation_metadata(Some(id), Some(timestamp)), true)
+                .expect("trusted observation"),
+            Some((id.to_owned(), timestamp.parse().expect("timestamp")))
+        );
+        assert!(trusted_client_send_observation(&client_observation_metadata(Some(id), None), true).is_err());
+        assert!(
+            trusted_client_send_observation(
+                &client_observation_metadata(Some("123-7-1700000000000000001"), Some(timestamp)),
+                true
+            )
+            .is_err()
+        );
+        assert!(
+            trusted_client_send_observation(
+                &client_observation_metadata(Some("123-7-1700000000000000000"), Some("01700000000000000000")),
+                true
+            )
+            .is_err()
+        );
+
+        let mut duplicate = client_observation_metadata(Some(id), Some(timestamp));
+        duplicate.append(
+            CLIENT_SEND_OBSERVATION_ID_HEADER,
+            "124-8-1700000000000000000".parse().expect("duplicate id"),
+        );
+        assert!(trusted_client_send_observation(&duplicate, true).is_err());
+    }
 
     /// Scenario: IPC decoding retains many column slices from one shared FlightData body.
     /// Guarantees: Admission limits use logical Arrow bytes rather than multiplying the shared body allocation.

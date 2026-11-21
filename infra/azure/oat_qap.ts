@@ -2,7 +2,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { type Azure, type HttpReceipt, Failure, NotReady, canonical_json, publish_private, reset_lock, uuid, owned, runtime } from './bootstrap.js';
-import { read_run_fic_record, parse_run_fic_record, verify_run_fic, type RunFicRecord } from './run_fic.js';
+import { assert_namespace_delete_response, delete_run_namespace, read_run_fic_record, parse_run_fic_record, verify_run_fic,
+  type NamespaceDeletionIntent, type RunFicRecord, type RunWorkloadStopReceipt } from './run_fic.js';
 
 export interface OatManifest {
   schema_version: 1;
@@ -28,6 +29,7 @@ interface OatQapOperations {
   /** Serialize cooperating OAT writers across hosts; arbitrary Kusto/admin writers are NOT fenced by Blob custody. */
   exclusive<T>(runId: string, work: () => Promise<T>): Promise<T>;
   assertHeld(runId: string): Promise<void>;
+  persistCustody(runId: string): Promise<void>;
   /** Positive owning-workload stop receipt; absence from a workload listing alone is not proof. */
   assertWorkloadStopped(runId: string): Promise<void>;
   /** Inspect regular-name collisions too; malformed/unavailable provider results must throw, not return absent. */
@@ -236,7 +238,11 @@ function privateJson(filename: string): unknown {
     throw new Failure('QAP custody/input must be a bounded private regular file.');
   return parse(fs.readFileSync(filename), 'QAP private input');
 }
-function operations(azure: Azure, filename: string, stopPath?: string): OatQapOperations {
+export interface OatCleanupAuthority {
+  mode?: 'producer' | 'controller';
+  assertCurrent(): Promise<void>;
+}
+function operations(azure: Azure, filename: string, stopPath?: string, authority?: OatCleanupAuthority): OatQapOperations {
   let activeRun: string | undefined;
   let lease: { id: string; stage: 'acquire-intent' | 'held' | 'release-intent' | 'released'; run_id: string;
     acquireReceipt?: Record<string, string>; releaseReceipt?: Record<string, string>;
@@ -252,6 +258,7 @@ function operations(azure: Azure, filename: string, stopPath?: string): OatQapOp
     lease = next;
   };
   async function publishShared(runId: string): Promise<void> {
+    await authority?.assertCurrent();
     if (!lease) throw new Failure('No durable proposed lease identity.');
     if (shared) {
       const [current, currentHeaders] = await azure.blob('GET', azure.c.data, sharedPath(runId), undefined, undefined, {}, false, true);
@@ -266,6 +273,7 @@ function operations(azure: Azure, filename: string, stopPath?: string): OatQapOp
       }
     }
     const record = readRecord(azure, filename);
+    assertCredentialFree(record);
     const value = { schema_version: 1, owner: record.rootMarker.value, lease, custody: record };
     const receiptPath = filename + '.metadata-receipt';
     const previous = fs.existsSync(receiptPath) ? privateJson(receiptPath) : undefined;
@@ -280,6 +288,7 @@ function operations(azure: Azure, filename: string, stopPath?: string): OatQapOp
     };
     let headers: Record<string, string>;
     try {
+      await authority?.assertCurrent();
       [, headers] = await azure.blob('PUT', azure.c.data, sharedPath(runId), undefined, canonical_json(value),
         { 'x-ms-blob-type': 'BlockBlob', ...(shared ? { 'If-Match': shared.etag } : { 'If-None-Match': '*' }) }, false, false, capture);
     } catch (cause) {
@@ -297,6 +306,7 @@ function operations(azure: Azure, filename: string, stopPath?: string): OatQapOp
     shared = { value, etag: headers.etag };
   }
   async function assertHeld(runId: string): Promise<void> {
+    await authority?.assertCurrent();
     if (activeRun !== runId) throw new Failure('No matching cooperating-writer custody scope.');
     const [marker, markerHeaders] = await azure.blob('GET', azure.c.data, markerPath(runId), undefined, undefined, {}, true, true);
     // Before conditional marker initialization, there is no provider mutation except create-if-absent.
@@ -317,20 +327,38 @@ function operations(azure: Azure, filename: string, stopPath?: string): OatQapOp
         exactKeys(prior, ['schema_version', 'owner', 'lease', 'custody'], 'Shared custody ledger');
         const priorLease = object(prior.lease, 'Shared lease state');
         const acquire = object(priorLease.acquireReceipt, 'Prior acquisition receipt');
-        const release = object(priorLease.releaseReceipt, 'Prior release receipt');
         const originalAcquire = object(priorLease.originalAcquire, 'Original acquisition response');
-        const originalRelease = object(priorLease.originalRelease, 'Original release response');
+        const heldRecovery = authority !== undefined && authority.mode !== 'producer' && priorLease.stage === 'held';
         if (prior.schema_version !== 1 || canonical_json(prior.owner) !== canonical_json(record.rootMarker.value) ||
-            priorLease.stage !== 'released' || priorLease.run_id !== runId ||
+            (!heldRecovery && priorLease.stage !== 'released') || priorLease.run_id !== runId ||
             acquire[':status'] !== '201' || acquire['x-ms-lease-id'] !== priorLease.id ||
-            release[':status'] !== '200' || originalAcquire.status !== 201 || originalRelease.status !== 200 ||
-            typeof originalAcquire.bodyBase64 !== 'string' || typeof originalRelease.bodyBase64 !== 'string' ||
+            originalAcquire.status !== 201 || typeof originalAcquire.bodyBase64 !== 'string' ||
             object(originalAcquire.headers, 'Original acquisition headers')['x-ms-lease-id'] !== priorLease.id ||
             !sharedHeaders.etag || record.intent !== null ||
-            !['ready', 'cleaned'].includes(record.state) ||
+            !(['ready', 'cleaned'].includes(record.state) || (authority && authority.mode !== 'producer' && resumableCleaning(record))) ||
             canonical_json(prior.custody) !== canonical_json(record)) throw new Failure('Prior shared custody/history unresolved; no reservation overwrite.');
         canonicalRun(text(priorLease.id, 'Prior lease ID'));
+        if (heldRecovery) {
+          await authority.assertCurrent();
+          lease = { id: String(priorLease.id), stage: 'held', run_id: runId,
+            acquireReceipt: stringHeaders(acquire), originalAcquire: { status: 201,
+              bodyBase64: String(originalAcquire.bodyBase64), headers: stringHeaders(originalAcquire.headers) } };
+          publish_private(ledgerPath, lease, fs.existsSync(ledgerPath) ? privateJson(ledgerPath) : undefined);
+        } else {
+          const release = object(priorLease.releaseReceipt, 'Prior release receipt');
+          const originalRelease = object(priorLease.originalRelease, 'Original release response');
+          if (release[':status'] !== '200' || originalRelease.status !== 200 ||
+              typeof originalRelease.bodyBase64 !== 'string')
+            throw new Failure('Prior shared lease release is unresolved.');
+        }
         shared = { value: prior, etag: sharedHeaders.etag };
+      }
+      if (lease) {
+        const [, headers] = await azure.blob('HEAD', azure.c.data, markerPath(runId), undefined, undefined,
+          { 'x-ms-lease-id': lease.id }, false, true);
+        if (headers['x-ms-lease-status'] !== 'locked' || headers['x-ms-lease-state'] !== 'leased')
+          throw new Failure('Recovered root lease is not held.');
+        return;
       }
       if (fs.existsSync(ledgerPath)) {
         const prior = object(privateJson(ledgerPath), 'lease ledger');
@@ -345,6 +373,7 @@ function operations(azure: Azure, filename: string, stopPath?: string): OatQapOp
       }
       await publishShared(runId);
       if (!markerHeaders.etag) throw new Failure('Marker version missing before lease acquisition; intent retained.');
+      await authority?.assertCurrent();
       const [, headers] = await azure.blob('PUT', azure.c.data, markerPath(runId), { comp: 'lease' }, Buffer.alloc(0),
         { 'If-Match': markerHeaders.etag, 'x-ms-lease-action': 'acquire', 'x-ms-lease-duration': '-1', 'x-ms-proposed-lease-id': lease.id }, false, false,
         originalAcquire => {
@@ -377,6 +406,7 @@ function operations(azure: Azure, filename: string, stopPath?: string): OatQapOp
       if (lease) {
         saveLease('release-intent');
         await publishShared(runId);
+        await authority?.assertCurrent();
         const [, headers] = await azure.blob('PUT', azure.c.data, markerPath(runId), { comp: 'lease' }, Buffer.alloc(0),
           { 'x-ms-lease-action': 'release', 'x-ms-lease-id': lease.id }, false, false,
           originalRelease => {
@@ -397,6 +427,7 @@ function operations(azure: Azure, filename: string, stopPath?: string): OatQapOp
       // On ANY thrown/ambiguous mutation, keep the infinite lease and durable ledger; no automatic break/release.
     },
     assertHeld,
+    persistCustody: publishShared,
     async assertEnvironment() {
       const c = azure.c;
       const storage = object(await azure.arm('GET', c.storage_id, undefined, false, '2023-05-01'), 'Storage account');
@@ -501,17 +532,10 @@ function operations(azure: Azure, filename: string, stopPath?: string): OatQapOp
     },
     async assertWorkloadStopped(runId) {
       if (!stopPath) throw new Failure('No positive owning-workload stop input.');
-      const record = readRecord(azure, filename), stop = object(privateJson(stopPath), 'Workload stop receipt');
-      exactKeys(stop, ['schema_version', 'workload_record', 'run_id', 'namespace', 'namespace_uid', 'namespace_run_id',
-        'namespace_owner_token', 'aks_id', 'kubectl_server', 'delete_succeeded', 'absence_confirmed', 'observed_at_unix_ms'], 'Workload stop receipt');
+      const record = readRecord(azure, filename);
+      validate_oat_workload_stop(record, privateJson(stopPath));
       const original = record.workload;
-      if (stop.schema_version !== 1 || stop.run_id !== runId || stop.namespace_run_id !== runId ||
-          stop.namespace !== original.namespace || stop.namespace_uid !== original.namespaceUid ||
-          stop.namespace_owner_token !== original.namespaceOwner || stop.aks_id !== original.aksId ||
-          stop.kubectl_server !== original.server || stop.delete_succeeded !== true || stop.absence_confirmed !== true ||
-          canonical_json(stop.workload_record) !== canonical_json(original) ||
-          !Number.isSafeInteger(stop.observed_at_unix_ms) || Number(stop.observed_at_unix_ms) < record.bound_at_unix_ms ||
-          Number(stop.observed_at_unix_ms) > Date.now()) throw new Failure('Stop receipt is not affirmative for the originally bound workload.');
+      if (runId !== original.runId) throw new Failure('Stopped workload differs from the active run.');
       const cluster = object(await azure.arm('GET', original.aksId, undefined, false, '2024-10-01'), 'AKS cluster');
       owned(cluster, azure.c);
       if (`https://${object(cluster.properties, 'AKS properties').fqdn}` !== original.server) throw new Failure('Original AKS server changed.');
@@ -569,7 +593,7 @@ type Entry = {
   snapshot: OatSnapshot | null;
 };
 type Intent = { operation: 'marker' | 'create' | 'policy' | 'drop'; name: string; id: string };
-interface RecordV1 {
+export interface RecordV1 {
   schema_version: 1; run_id: string; nonce: string; manifest: OatManifest; manifest_sha256: string;
   environment: { account: string; container: string; database: string; tablePrefix: string; sandbox: string; clusterId: string; storageId: string };
   identity: string; policy: { IsEnabled: true; Hot: string; ManagedIdentity: string };
@@ -592,7 +616,11 @@ function commit(filename: string, record: RecordV1, change: (next: RecordV1) => 
   return next;
 }
 function readRecord(azure: Azure, filename: string): RecordV1 {
-  const raw = object(privateJson(filename), 'OAT ownership record');
+  return parse_oat_qap_record(azure, privateJson(filename));
+}
+export function parse_oat_qap_record(azure: Azure, value: unknown): RecordV1 {
+  assertCredentialFree(value);
+  const raw = object(value, 'OAT ownership record');
   exactKeys(raw, ['schema_version', 'run_id', 'nonce', 'manifest', 'manifest_sha256', 'environment', 'identity', 'policy', 'rootMarker', 'entries', 'intent', 'receipts', 'state', 'workload', 'bound_at_unix_ms'], 'OAT ownership record');
   const workload = parse_run_fic_record(raw.workload, azure.c);
   if (workload.phase !== 'ready' || workload.runId !== raw.run_id ||
@@ -629,6 +657,9 @@ function readRecord(azure: Azure, filename: string): RecordV1 {
           saved.docString !== `arrowcol-oat:${runId}:${raw.nonce}:${raw.manifest_sha256}` ||
           !saved.schema || !saved.definition) throw new Failure('Saved ownership snapshot malformed.');
       object(saved.schema, 'Saved schema'); object(saved.definition, 'Saved definition');
+      const definition = parseQualifiedDeltaDefinition(saved.definition, expected.external_table);
+      assertExactConnectionStrings(definition.connectionStrings, String(entry.connection));
+      if (definition.docString !== saved.docString) throw new Failure('Saved definition owner differs from its snapshot.');
       snapshot = { kind: 'delta', name: expected.external_table, connectionStrings: [String(entry.connection)],
         docString: text(saved.docString, 'Saved owner'), schema: saved.schema, qapPolicy: saved.qapPolicy, definition: saved.definition };
     }
@@ -655,15 +686,17 @@ function readRecord(azure: Azure, filename: string): RecordV1 {
   }
   const state = raw.state;
   if (state !== 'binding' && state !== 'ready' && state !== 'cleaning' && state !== 'cleaned') throw new Failure('Invalid custody state.');
-  if (state === 'ready' || state === 'cleaned') {
-    if (marker.verified !== true || intent !== null) throw new Failure('Completion lacks verified marker or has unresolved intent.');
+  if (state === 'ready' || state === 'cleaned' || state === 'cleaning') {
+    if (marker.verified !== true || (state !== 'cleaning' && intent !== null))
+      throw new Failure('Completion lacks verified marker or has unresolved intent.');
     if (!receipts.filter(receipt => receipt.operation === 'marker' && receipt.name === marker.path && receipt.evidence.startsWith('{'))
       .some(receipt => {
         const response = object(parse(receipt.evidence, 'Original marker receipt'), 'Original marker receipt');
         return response.status === 201 && typeof object(response.headers, 'Marker receipt headers').etag === 'string';
       })) throw new Failure('Completion lacks original conditional root-marker creation receipt.');
     for (const entry of entries) {
-      const required = state === 'ready' ? ['create', 'policy'] : entry.snapshot ? ['create', 'drop'] : [];
+      const required = entry.state === 'ready' ? ['create', 'policy'] :
+        entry.state === 'dropped' && entry.snapshot ? ['create', 'drop'] : [];
       if (entry.snapshot === null && receipts.some(receipt => receipt.name === entry.name && receipt.operation === 'create'))
         throw new Failure('Never-created tombstone contradicts creation history.');
       for (const operation of required) {
@@ -692,6 +725,235 @@ function readRecord(azure: Azure, filename: string): RecordV1 {
 }
 const connection = (azure: Azure, storagePath: string, identity: string): string =>
   `abfss://${azure.c.data}@${azure.c.account}.dfs.core.windows.net/${storagePath};managed_identity=${identity}`;
+
+function assertCredentialFree(value: unknown): void {
+  if (typeof value === 'string') {
+    if (/(?:[?&](?:sig|sv|se|sp)=|accountkey\s*=|sharedaccesssignature|bearer\s+[a-z0-9._-]+)/i.test(value))
+      throw new Failure('QAP custody contains credential-bearing data; refusing durable publication or recovery.');
+    if (/^\s*[{[]/.test(value)) {
+      let nested: unknown;
+      try { nested = JSON.parse(value) as unknown; } catch (error) {
+        if (!(error instanceof SyntaxError)) throw error;
+      }
+      if (nested !== undefined) assertCredentialFree(nested);
+    }
+  } else if (Array.isArray(value)) {
+    value.forEach(assertCredentialFree);
+  } else if (value !== null && typeof value === 'object') {
+    for (const [key, item] of Object.entries(value)) {
+      if (/^(?:authorization|password|access_token|client_secret)$/i.test(key))
+        throw new Failure('QAP custody contains a secret field.');
+      if (key === 'bodyBase64' && typeof item === 'string') assertCredentialFree(Buffer.from(item, 'base64').toString('utf8'));
+      else assertCredentialFree(item);
+    }
+  }
+}
+function stringHeaders(value: unknown): Record<string, string> {
+  const headers = object(value, 'Receipt headers');
+  return Object.fromEntries(Object.entries(headers).map(([key, item]) => {
+    if (typeof item !== 'string') throw new Failure('Receipt header value must be a string.');
+    return [key, item];
+  }));
+}
+export interface OatQapReference {
+  schema_version: 1;
+  account: string;
+  container: string;
+  blob: string;
+  run_id: string;
+  nonce: string;
+  manifest_sha256: string;
+  namespace_uid: string;
+  namespace_owner_token: string;
+}
+export function parse_oat_qap_reference(value: unknown): OatQapReference {
+  const raw = object(value, 'QAP durable reference');
+  exactKeys(raw, ['schema_version', 'account', 'container', 'blob', 'run_id', 'nonce', 'manifest_sha256',
+    'namespace_uid', 'namespace_owner_token'], 'QAP durable reference');
+  if (raw.schema_version !== 1 || !/^[a-f0-9]{64}$/.test(String(raw.manifest_sha256)) ||
+      !/^[A-Za-z0-9_-]{16,128}$/.test(String(raw.namespace_owner_token)))
+    throw new Failure('QAP durable reference identity is invalid.');
+  return { schema_version: 1, account: text(raw.account, 'reference account'), container: text(raw.container, 'reference container'),
+    blob: text(raw.blob, 'reference blob'), run_id: canonicalRun(text(raw.run_id, 'reference run ID')),
+    nonce: canonicalRun(text(raw.nonce, 'reference nonce')), manifest_sha256: String(raw.manifest_sha256),
+    namespace_uid: canonicalRun(text(raw.namespace_uid, 'reference namespace UID')), namespace_owner_token: String(raw.namespace_owner_token) };
+}
+export function read_oat_qap_reference(filename: string): OatQapReference {
+  return parse_oat_qap_reference(privateJson(filename));
+}
+function referenceFor(azure: Azure, record: RecordV1): OatQapReference {
+  return { schema_version: 1, account: azure.c.account, container: azure.c.data,
+    blob: `${prefixFor(azure)}/${record.run_id}/_arrowcol-oat-qap-custody.json`, run_id: record.run_id,
+    nonce: record.nonce, manifest_sha256: record.manifest_sha256, namespace_uid: record.workload.namespaceUid,
+    namespace_owner_token: record.workload.namespaceOwner };
+}
+function resumableCleaning(record: RecordV1): boolean {
+  return record.state === 'cleaning' && record.intent === null &&
+    record.entries.every(entry => entry.snapshot !== null && (entry.state === 'ready' || entry.state === 'dropped'));
+}
+async function sharedRecord(azure: Azure, reference: OatQapReference, authority?: OatCleanupAuthority): Promise<RecordV1> {
+  await authority?.assertCurrent();
+  reference = parse_oat_qap_reference(reference);
+  const runId = canonicalRun(reference.run_id);
+  if (reference.account !== azure.c.account || reference.container !== azure.c.data ||
+      reference.blob !== `${prefixFor(azure)}/${runId}/_arrowcol-oat-qap-custody.json`)
+    throw new Failure('QAP durable reference is outside the configured run scope.');
+  const [bytes, headers] = await azure.blob('GET', azure.c.data, reference.blob, undefined, undefined, {}, false, true);
+  if (bytes === null || bytes.length > 4_194_304 || !headers.etag) throw new Failure('QAP shared custody is missing, unversioned or too large.');
+  const shared = object(parse(bytes, 'Shared QAP custody'), 'Shared QAP custody');
+  exactKeys(shared, ['schema_version', 'owner', 'lease', 'custody'], 'Shared QAP custody');
+  const record = parse_oat_qap_record(azure, shared.custody);
+  if (shared.schema_version !== 1 || canonical_json(reference) !== canonical_json(referenceFor(azure, record)) ||
+      canonical_json(shared.owner) !== canonical_json(record.rootMarker.value) || record.intent !== null ||
+      !(['ready', 'cleaned'].includes(record.state) || (authority && authority.mode !== 'producer' && resumableCleaning(record))))
+    throw new Failure('QAP original ownership reference or mutation outcome is unresolved.');
+  const lease = object(shared.lease, 'Shared QAP lease');
+  if (lease.stage === 'held' && authority?.mode === 'producer')
+    throw new Failure('Held QAP custody recovery requires current controller authority.');
+  if (!['held', 'released'].includes(String(lease.stage)) || lease.run_id !== record.run_id)
+    throw new Failure('QAP root lease operation remains unresolved.');
+  canonicalRun(text(lease.id, 'QAP root lease ID'));
+  const acquire = object(lease.acquireReceipt, 'QAP lease acquisition receipt');
+  const originalAcquire = object(lease.originalAcquire, 'Original QAP lease acquisition');
+  if (acquire[':status'] !== '201' || acquire['x-ms-lease-id'] !== lease.id ||
+      originalAcquire.status !== 201 || typeof originalAcquire.bodyBase64 !== 'string' ||
+      object(originalAcquire.headers, 'QAP original acquisition headers')['x-ms-lease-id'] !== lease.id)
+    throw new Failure('QAP root lease lacks its original acquisition proof.');
+  if (lease.stage === 'released') {
+    const release = object(lease.releaseReceipt, 'QAP root lease release receipt');
+    const originalRelease = object(lease.originalRelease, 'Original QAP root lease release');
+    if (release[':status'] !== '200' || originalRelease.status !== 200 || typeof originalRelease.bodyBase64 !== 'string')
+      throw new Failure('QAP root lease release is not definitive.');
+  }
+  await requireMarker(azure, record);
+  return record;
+}
+export async function oat_qap_reference(azure: Azure, recordPath: string): Promise<OatQapReference> {
+  const record = readRecord(azure, recordPath), reference = referenceFor(azure, record);
+  if (canonical_json(await sharedRecord(azure, reference)) !== canonical_json(record))
+    throw new Failure('QAP local record is not the durably published original snapshot.');
+  return reference;
+}
+export async function recover_oat_qap_record(azure: Azure, reference: OatQapReference, recordPath: string,
+  authority?: OatCleanupAuthority): Promise<RecordV1> {
+  const record = await sharedRecord(azure, reference, authority);
+  await reset_lock(recordPath, async () => {
+    if (fs.existsSync(recordPath)) {
+      if (canonical_json(readRecord(azure, recordPath)) !== canonical_json(record))
+        throw new Failure('Local QAP recovery record differs; never overwrite unresolved custody.');
+    } else publish_private(recordPath, record);
+  });
+  return record;
+}
+export function validate_oat_workload_stop(record: RecordV1, value: unknown): RunWorkloadStopReceipt {
+  const stop = object(value, 'Workload stop receipt'), original = record.workload;
+  exactKeys(stop, ['schema_version', 'workload_record', 'run_id', 'namespace', 'namespace_uid', 'namespace_run_id',
+    'namespace_owner_token', 'aks_id', 'kubectl_server', 'delete_succeeded', 'absence_confirmed', 'observed_at_unix_ms'], 'Workload stop receipt');
+  if (stop.schema_version !== 1 || stop.run_id !== original.runId || stop.namespace_run_id !== original.runId ||
+      stop.namespace !== original.namespace || stop.namespace_uid !== original.namespaceUid ||
+      stop.namespace_owner_token !== original.namespaceOwner || stop.aks_id !== original.aksId ||
+      stop.kubectl_server !== original.server || stop.delete_succeeded !== true || stop.absence_confirmed !== true ||
+      canonical_json(stop.workload_record) !== canonical_json(original) ||
+      !Number.isSafeInteger(stop.observed_at_unix_ms) || Number(stop.observed_at_unix_ms) < record.bound_at_unix_ms ||
+      Number(stop.observed_at_unix_ms) > Date.now())
+    throw new Failure('Stop receipt is not affirmative for the originally bound workload.');
+  return { schema_version: 1, workload_record: original, run_id: original.runId, namespace: original.namespace,
+    namespace_uid: original.namespaceUid, namespace_run_id: original.runId, namespace_owner_token: original.namespaceOwner,
+    aks_id: original.aksId, kubectl_server: original.server, delete_succeeded: true, absence_confirmed: true,
+    observed_at_unix_ms: Number(stop.observed_at_unix_ms) };
+}
+const stopBlob = (reference: OatQapReference): string => reference.blob.replace(/_arrowcol-oat-qap-custody\.json$/, '_arrowcol-oat-workload-stop.json');
+
+interface DurableStopPhase {
+  schema_version: 1;
+  reference: OatQapReference;
+  phase: 'intent' | 'responded' | 'complete';
+  receipt: RunWorkloadStopReceipt | null;
+  deletion: { intent: NamespaceDeletionIntent; response: unknown | null };
+}
+async function loadStopPhase(azure: Azure, reference: OatQapReference, record: RecordV1): Promise<{ value: DurableStopPhase; etag: string } | undefined> {
+  const [bytes, headers] = await azure.blob('GET', azure.c.data, stopBlob(reference), undefined, undefined, {}, true, true);
+  if (bytes === null) return undefined;
+  if (bytes.length > 65_536 || !headers.etag) throw new Failure('Durable stop evidence is oversized or unversioned.');
+  const raw = object(parse(bytes, 'Durable workload stop'), 'Durable workload stop');
+  exactKeys(raw, ['schema_version', 'reference', 'phase', 'receipt', 'deletion'], 'Durable workload stop');
+  assertCredentialFree(raw);
+  if (raw.schema_version !== 1 || canonical_json(raw.reference) !== canonical_json(reference) ||
+      !['intent', 'responded', 'complete'].includes(String(raw.phase)))
+    throw new Failure('Durable workload stop has a different owner reference or phase.');
+  const deletion = object(raw.deletion, 'Namespace deletion proof');
+  exactKeys(deletion, ['intent', 'response'], 'Namespace deletion proof');
+  const intent: NamespaceDeletionIntent = { workload_record: record.workload,
+    deletion: { apiVersion: 'v1', kind: 'DeleteOptions', preconditions: { uid: record.workload.namespaceUid } } };
+  if (canonical_json(deletion.intent) !== canonical_json(intent)) throw new Failure('Durable deletion intent differs from the original UID.');
+  if (raw.phase === 'intent') {
+    if (deletion.response !== null || raw.receipt !== null) throw new Failure('Intent phase contains unexpected completion proof.');
+    return { value: { schema_version: 1, reference, phase: 'intent', receipt: null, deletion: { intent, response: null } }, etag: headers.etag };
+  }
+  assert_namespace_delete_response(deletion.response, record.workload);
+  if (raw.phase === 'responded' && raw.receipt !== null) throw new Failure('Response phase cannot claim confirmed absence.');
+  return { value: { schema_version: 1, reference, phase: raw.phase === 'complete' ? 'complete' : 'responded',
+    receipt: raw.phase === 'complete' ? validate_oat_workload_stop(record, raw.receipt) : null,
+    deletion: { intent, response: deletion.response } }, etag: headers.etag };
+}
+async function saveStopPhase(azure: Azure, reference: OatQapReference, record: RecordV1, value: DurableStopPhase,
+  authority: OatCleanupAuthority): Promise<void> {
+  const previous = await loadStopPhase(azure, reference, record);
+  const ranks = { intent: 0, responded: 1, complete: 2 };
+  if (previous && ranks[previous.value.phase] >= ranks[value.phase]) {
+    if (canonical_json(previous.value.deletion.intent) !== canonical_json(value.deletion.intent) ||
+        (value.deletion.response !== null && canonical_json(previous.value.deletion.response) !== canonical_json(value.deletion.response)) ||
+        (value.receipt !== null && canonical_json(previous.value.receipt) !== canonical_json(value.receipt)))
+      throw new Failure('Durable deletion proof changed; never overwrite it.');
+    return;
+  }
+  assertCredentialFree(value);
+  await authority.assertCurrent();
+  let originalReceipt: HttpReceipt | undefined;
+  const [, headers] = await azure.blob('PUT', azure.c.data, stopBlob(reference), undefined, canonical_json(value),
+    { 'x-ms-blob-type': 'BlockBlob', ...(previous ? { 'If-Match': previous.etag } : { 'If-None-Match': '*' }) },
+    false, false, response => { originalReceipt = response; });
+  if (headers[':status'] !== '201' || !headers.etag || originalReceipt?.status !== 201)
+    throw new Failure('Durable workload-stop phase write outcome is unknown.');
+  const confirmed = await loadStopPhase(azure, reference, record);
+  if (!confirmed || confirmed.etag !== headers.etag || canonical_json(confirmed.value) !== canonical_json(value))
+    throw new Failure('Durable workload stop phase postcondition is uncertain.');
+}
+export async function delete_oat_qap_workload(azure: Azure, reference: OatQapReference, recordPath: string,
+  stopPath: string, authority: OatCleanupAuthority): Promise<void> {
+  const original = await sharedRecord(azure, reference, authority);
+  if (canonical_json(readRecord(azure, recordPath)) !== canonical_json(original))
+    throw new Failure('Recovered QAP workload differs from its original shared snapshot.');
+  await authority.assertCurrent();
+  let deletion: DurableStopPhase['deletion'] | undefined;
+  const receipt = validate_oat_workload_stop(original, await delete_run_namespace(azure, original.workload, stopPath, authority, {
+    load: async () => {
+      const saved = await loadStopPhase(azure, reference, original);
+      if (!saved) return undefined;
+      deletion = saved.value.deletion;
+      return { ...deletion, ...(saved.value.receipt ? { receipt: saved.value.receipt } : {}) };
+    },
+    persist: async (intent, response) => {
+      deletion = { intent, response };
+      await saveStopPhase(azure, reference, original, { schema_version: 1, reference,
+        phase: response === null ? 'intent' : 'responded', receipt: null, deletion }, authority);
+    },
+  }));
+  if (!deletion) throw new Failure('Namespace stop has no durable deletion journal.');
+  await saveStopPhase(azure, reference, original, { schema_version: 1, reference, phase: 'complete', receipt, deletion }, authority);
+}
+export async function recover_oat_workload_stop(azure: Azure, reference: OatQapReference, stopPath: string,
+  authority?: OatCleanupAuthority): Promise<void> {
+  const record = await sharedRecord(azure, reference, authority);
+  const saved = await loadStopPhase(azure, reference, record);
+  if (!saved || saved.value.phase !== 'complete' || !saved.value.receipt) throw new Failure('Durable workload absence is not confirmed.');
+  const receipt = saved.value.receipt;
+  await reset_lock(stopPath, async () => {
+    if (fs.existsSync(stopPath)) {
+      if (canonical_json(privateJson(stopPath)) !== canonical_json(receipt)) throw new Failure('Local stop evidence differs.');
+    } else publish_private(stopPath, receipt);
+  });
+}
 async function requireMarker(azure: Azure, record: RecordV1): Promise<void> {
   const [bytes] = await azure.blob('GET', azure.c.data, record.rootMarker.path, undefined, undefined, {}, true, true);
   if (bytes === null || canonical_json(parse(bytes, 'run marker')) !== canonical_json(record.rootMarker.value)) throw new Failure('Immutable run owner marker is absent or changed; no mutation allowed.');
@@ -717,8 +979,10 @@ async function mutate(azure: Azure, guard: OatQapOperations, filename: string, r
   await guard.assertHeld(record.run_id);
   await requireMarker(azure, record);
   record = commit(filename, record, next => { next.intent = { operation, name: entry.name, id: uuid() }; });
+  await guard.persistCustody(record.run_id);
   // Any throw after the durable intent retains it. No retry, adoption, or absence-based reconciliation.
   let original: HttpReceipt | undefined;
+  await guard.assertHeld(record.run_id);
   const [responseBytes] = await azure.request('POST', azure.c.uri + '/v1/rest/mgmt', 'https://kusto.kusto.windows.net',
     canonical_json({ db: record.environment.database, csl: command }),
     { 'Content-Type': 'application/json', 'x-ms-client-request-id': record.intent?.id ?? '' }, false, false,
@@ -727,6 +991,7 @@ async function mutate(azure: Azure, guard: OatQapOperations, filename: string, r
       record = commit(filename, record, next => { next.receipts.push({ operation, name: entry.name, evidence: canonical_json(receipt) }); });
     });
   if (!original || original.status !== 200 || responseBytes === null) throw new Failure('Mutation has no original HTTP200 receipt; intent retained.');
+  await guard.persistCustody(record.run_id);
   const response = parse(responseBytes, 'Kusto mutation response');
   const evidence = guard.requireReceipt(operation, entry.name, response);
   text(evidence, 'provider mutation receipt');
@@ -748,12 +1013,16 @@ async function mutate(azure: Azure, guard: OatQapOperations, filename: string, r
       next.entries[entryIndex].snapshot = observed; next.intent = null;
     });
   }
+  await guard.persistCustody(record.run_id);
   return record;
 }
-async function withRecord<T>(azure: Azure, filename: string, stopPath: string | undefined, work: (guard: OatQapOperations, record: RecordV1) => Promise<T>): Promise<T> {
-  const guard = operations(azure, filename, stopPath);
+async function withRecord<T>(azure: Azure, filename: string, stopPath: string | undefined,
+  work: (guard: OatQapOperations, record: RecordV1) => Promise<T>, authority?: OatCleanupAuthority): Promise<T> {
+  const guard = operations(azure, filename, stopPath, authority);
   return reset_lock(filename, async () => {
     const record = readRecord(azure, filename);
+    if (record.state === 'cleaning' && (!authority || authority.mode === 'producer' || !resumableCleaning(record)))
+      throw new Failure('Cleaning continuation requires current controller authority and fully evidenced entries.');
     if (record.intent !== null) throw new Failure('Prior OAT mutation intent is unresolved; no automatic replay.');
     return guard.exclusive(record.run_id, async () => {
       await guard.assertEnvironment(); await guard.assertHeld(record.run_id);
@@ -849,7 +1118,8 @@ export async function verify_oat_qap(azure: Azure, recordPath: string): Promise<
     await guard.assertHeld(record.run_id);
   });
 }
-export async function cleanup_oat_qap(azure: Azure, recordPath: string, workloadStopRecordPath: string): Promise<void> {
+export async function cleanup_oat_qap(azure: Azure, recordPath: string, workloadStopRecordPath: string,
+  authority?: OatCleanupAuthority): Promise<void> {
   if (!workloadStopRecordPath) throw new Failure('Positive workload stop record is required.');
   await withRecord(azure, recordPath, workloadStopRecordPath, async (guard, record) => {
     await guard.assertWorkloadStopped(record.run_id);
@@ -876,5 +1146,5 @@ export async function cleanup_oat_qap(azure: Azure, recordPath: string, workload
     }
     commit(recordPath, record, next => { next.state = 'cleaned'; });
     // Ownership marker, durable tombstone and all Delta blobs/run roots are retained.
-  });
+  }, authority);
 }

@@ -23,6 +23,7 @@ async function fixture(t: test.TestContext): Promise<PrivateInputs> {
     workloadIdentityClientId: '00000000-0000-0000-0000-000000000002',
     subscriptionId: '00000000-0000-0000-0000-000000000001', stamp: '89152',
     deltaRoot: 'abfss://arrowcol@arrowcollector89152.dfs.core.windows.net/dataflow',
+    effective_stop_budgets: { maintenance_grace_seconds: 4_800, maintenance_stop_timeout_ms: 5_100_000 },
     images: {
       sqlserver: `${registry}/arrowcol-sqlserver@sha256:${digest}`,
       catalog: `${registry}/arrowcol-catalog-rust@sha256:${digest}`,

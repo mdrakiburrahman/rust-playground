@@ -1,4 +1,12 @@
 version: otel_dataflow/v1
+policies:
+  resources:
+    memory_limiter:
+      mode: enforce
+      source: auto
+      check_interval: 1s
+      retry_after_secs: 5
+      fail_readiness_on_hard: true
 engine: {}
 groups:
   default:
@@ -13,6 +21,15 @@ groups:
                   listening_addr: "0.0.0.0:4318"
                 grpc:
                   listening_addr: "0.0.0.0:4317"
+          batch:
+            type: processor:batch
+            config:
+              format: otlp
+              max_batch_duration: 200ms
+              otlp:
+                min_size: 1048576
+                max_size: 8388608
+                sizer: bytes
           deltalake:
             type: exporter:deltalake
             config:
@@ -28,4 +45,6 @@ groups:
                 max_pending_files: 256
         connections:
           - from: otlp
+            to: batch
+          - from: batch
             to: deltalake

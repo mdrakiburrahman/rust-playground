@@ -9,8 +9,10 @@ use arrow_deltalake::delta::{
 };
 use arrow_deltalake::layout::LayoutPolicy;
 use arrow_deltalake::maintenance::{
-    DISPOSABLE_TEST_MARKER, Granularity, LogFloor, MaintenanceControl, MaintenanceErrorKind, MaintenancePlan,
-    OptimizeConfig, Outcome, PruneConfig, PurgeConfig, VacuumConfig, error_kind, now_ms,
+    CompactionDebtSource, DISPOSABLE_TEST_MARKER, Granularity, LogFloor, MaintenanceControl,
+    MaintenanceDueWorkCompleteness, MaintenanceDueWorkIncompleteReason, MaintenanceErrorKind, MaintenancePlan,
+    NegativeProbeConfig, OptimizeConfig, Outcome, PassProbeInventory, ProbeOperation, PruneConfig, PurgeConfig,
+    VacuumConfig, error_kind, now_ms,
 };
 use async_trait::async_trait;
 use delta_kernel::object_store::{
@@ -26,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use url::Url;
 
 const BASE: i64 = 1_704_067_200_000;
@@ -111,6 +113,397 @@ fn optimize_config() -> OptimizeConfig {
     }
 }
 
+#[test]
+fn optimize_decode_limit_diagnostic_identifies_failed_bound() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let table = create(root.path())?;
+    append(&table, 0, 0..3)?;
+    append(&table, 0, 3..6)?;
+    append(&table, 1, 6..9)?;
+    let maintenance = DeltaTable::open_for_maintenance(&url_of(root.path())?)?;
+    for bound in ["max_batch_bytes", "max_decoded_bytes_per_bin"] {
+        let config = OptimizeConfig {
+            max_batch_bytes: if bound == "max_batch_bytes" { 1 } else { usize::MAX },
+            max_decoded_bytes_per_bin: if bound == "max_decoded_bytes_per_bin" {
+                1
+            } else {
+                u64::MAX
+            },
+            ..optimize_config()
+        };
+        let plan = maintenance.plan_optimize(&config)?;
+        assert!(!plan.bins.is_empty());
+        let error = maintenance
+            .apply_optimize(&plan, &config, &control())
+            .err()
+            .context("decoded input must exceed the selected one-byte bound")?;
+        assert_eq!(error_kind(&error), Some(MaintenanceErrorKind::ResourceLimit));
+        let diagnostic = format!("{error:#}");
+        let prefix = format!("decoded Arrow input exceeds {bound}: measured_bytes=");
+        let measured = diagnostic
+            .split_once(&prefix)
+            .context("diagnostic identifies the failed bound")?
+            .1
+            .split_once(", allowed_bytes=1")
+            .context("diagnostic identifies allowed bytes")?
+            .0
+            .parse::<u64>()?;
+        assert!(measured > 1, "diagnostic reports actual decoded bytes");
+    }
+    Ok(())
+}
+
+#[test]
+fn compaction_debt_evidence_distinguishes_zero_from_bounded_backlog() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let table = create(root.path())?;
+    append(&table, 0, 0..3)?;
+    append(&table, 1, 100..103)?;
+    let maintenance = DeltaTable::open_for_maintenance(&url_of(root.path())?)?;
+    let anchor = BASE + 60 * MINUTE;
+    let probe = NegativeProbeConfig {
+        now_ms: anchor,
+        granularity: Granularity::Minute,
+        purge_retention_ms: 2_592_000_000,
+        vacuum_retention_ms: 604_800_000,
+        log_retention_ms: 2_592_000_000,
+        checkpoint_interval: 100,
+        optimize_small_file_bytes: 64 * 1024 * 1024,
+        optimize_target_file_bytes: 128 * 1024 * 1024,
+        optimize_min_files: 2,
+        sealed_partitions_only: false,
+        max_listed_files: 1000,
+    };
+    let zero = maintenance
+        .probe_no_work(ProbeOperation::Optimize, &probe, &control())?
+        .context("complete bounded inventory proves no eligible compaction")?;
+    let zero_debt = zero.compaction_debt.context("available zero-debt evidence")?;
+    assert_eq!(zero_debt.source, CompactionDebtSource::BoundedPhysicalInventory);
+    assert_eq!(zero_debt.observed_at_ms, anchor);
+    assert_eq!((zero_debt.eligible_files, zero_debt.eligible_bytes), (0, 0));
+
+    for batch in 1..4 {
+        append(&table, 0, batch * 10..batch * 10 + 3)?;
+    }
+    let config = OptimizeConfig {
+        max_files_per_bin: 2,
+        max_bins_per_commit: 1,
+        now_ms: Some(anchor),
+        ..optimize_config()
+    };
+    let plan = maintenance.plan_optimize(&config)?;
+    assert_eq!(plan.bins.len(), 1);
+    assert_eq!(plan.compaction_debt.source, CompactionDebtSource::SnapshotActiveFiles);
+    assert_eq!(plan.compaction_debt.observed_at_ms, anchor);
+    assert_eq!(plan.compaction_debt.eligible_files, 4);
+    assert!(plan.compaction_debt.eligible_bytes > 0);
+    assert_eq!(plan.compaction_debt.backlog_files, 2);
+    assert!(plan.compaction_debt.backlog_bytes > 0);
+    assert_eq!(plan.compaction_debt.oldest_eligible_partition_start_ms, Some(BASE));
+    let report = maintenance.apply_optimize(&plan, &config, &control())?;
+    assert_eq!(report.compaction_debt.as_ref(), Some(&plan.compaction_debt));
+    let evidence = report
+        .maintenance_due_work
+        .as_ref()
+        .context("OPTIMIZE due-work evidence")?;
+    assert_eq!(evidence.due, Some(true));
+    assert_eq!(evidence.eligible_count, Some(4));
+    assert_eq!(evidence.backlog_count, Some(2));
+    Ok(())
+}
+
+#[test]
+fn optimize_protected_partition_backlog_tracks_subtarget_active_inputs() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let table = create(root.path())?;
+    append(&table, 0, 0..3)?;
+    append(&table, 0, 3..6)?;
+    let active = active_files(root.path())?;
+    let bytes = active.keys().try_fold(0_u64, |total, path| {
+        Ok::<_, anyhow::Error>(total + fs::metadata(root.path().join(path))?.len())
+    })?;
+    let path = active.keys().next().context("active input")?;
+    fs::copy(
+        root.path().join(path),
+        root.path()
+            .join(format!("{INGESTION_PARTITION}={}/orphan.parquet", minute(0))),
+    )?;
+    let maintenance = DeltaTable::open_for_maintenance(&url_of(root.path())?)?;
+    let anchor = BASE + MINUTE / 2;
+    let probe = NegativeProbeConfig {
+        now_ms: anchor,
+        granularity: Granularity::Minute,
+        purge_retention_ms: 2_592_000_000,
+        vacuum_retention_ms: 604_800_000,
+        log_retention_ms: 2_592_000_000,
+        checkpoint_interval: 100,
+        optimize_small_file_bytes: 1,
+        optimize_target_file_bytes: 128 * 1024 * 1024,
+        optimize_min_files: 3,
+        sealed_partitions_only: true,
+        max_listed_files: 1000,
+    };
+    assert!(
+        maintenance
+            .probe_no_work(ProbeOperation::Optimize, &probe, &control())?
+            .is_none()
+    );
+    let config = OptimizeConfig {
+        small_file_bytes: probe.optimize_small_file_bytes,
+        min_files_per_bin: probe.optimize_min_files,
+        now_ms: Some(anchor),
+        ..optimize_config()
+    };
+    let plan = maintenance.plan_optimize(&config)?;
+    assert!(plan.bins.is_empty());
+    let version = maintenance.version()?;
+    let report = maintenance.apply_optimize(&plan, &config, &control())?;
+    let evidence = report.maintenance_due_work.context("complete eligibility evidence")?;
+    assert_eq!(evidence.completeness, MaintenanceDueWorkCompleteness::Complete);
+    assert_eq!(evidence.due, Some(false));
+    assert_eq!(evidence.eligible_count, Some(0));
+    let debt = report.compaction_debt.context("protected compaction backlog")?;
+    assert_eq!(debt.observed_at_ms, anchor);
+    assert_eq!(debt.source, CompactionDebtSource::SnapshotActiveFiles);
+    let protected = debt
+        .protected_partition_backlog
+        .context("authoritative protected inputs")?;
+    assert_eq!((protected.files, protected.bytes), (2, bytes));
+    assert_eq!(protected.oldest_partition_start_ms, Some(BASE));
+    assert_eq!(maintenance.version()?, version);
+    assert_eq!(active_files(root.path())?, active);
+    assert_eq!(rows(root.path())?, sorted(expected(0..6, &minute(0))));
+    Ok(())
+}
+
+#[test]
+fn optimize_probe_does_not_infer_active_frontier_from_newer_orphan() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let table = create(root.path())?;
+    append(&table, 0, 0..3)?;
+    let active = active_files(root.path())?;
+    let path = active.keys().next().context("active input")?;
+    let bytes = fs::metadata(root.path().join(path))?.len();
+    let target = bytes + 1;
+    let orphan_dir = root.path().join(format!("{INGESTION_PARTITION}={}", minute(1)));
+    fs::create_dir(&orphan_dir)?;
+    fs::File::create(orphan_dir.join("orphan.parquet"))?.set_len(target)?;
+    let maintenance = DeltaTable::open_for_maintenance(&url_of(root.path())?)?;
+    let probe = NegativeProbeConfig {
+        now_ms: BASE + 60 * MINUTE,
+        granularity: Granularity::Minute,
+        purge_retention_ms: 2_592_000_000,
+        vacuum_retention_ms: 604_800_000,
+        log_retention_ms: 2_592_000_000,
+        checkpoint_interval: 100,
+        optimize_small_file_bytes: 1,
+        optimize_target_file_bytes: target,
+        optimize_min_files: 3,
+        sealed_partitions_only: true,
+        max_listed_files: 1000,
+    };
+    assert!(
+        maintenance
+            .probe_no_work(ProbeOperation::Optimize, &probe, &control())?
+            .is_none()
+    );
+    let plan = maintenance.plan_optimize(&OptimizeConfig {
+        now_ms: Some(probe.now_ms),
+        target_file_bytes: target,
+        small_file_bytes: probe.optimize_small_file_bytes,
+        min_files_per_bin: probe.optimize_min_files,
+        ..optimize_config()
+    })?;
+    assert!(plan.bins.is_empty());
+    let protected = plan
+        .compaction_debt
+        .protected_partition_backlog
+        .context("active protected frontier")?;
+    assert_eq!((protected.files, protected.bytes), (1, bytes));
+    assert_eq!(protected.oldest_partition_start_ms, Some(BASE));
+    assert_eq!(active_files(root.path())?, active);
+    Ok(())
+}
+
+#[test]
+fn optimize_final_debt_fields_are_included_in_plan_size_bound() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let table = create(root.path())?;
+    for batch in 0..4 {
+        append(&table, 0, batch * 10..batch * 10 + 3)?;
+    }
+    append(&table, 1, 100..103)?;
+    append(&table, 1, 110..113)?;
+    let maintenance = DeltaTable::open_for_maintenance(&url_of(root.path())?)?;
+    let anchor = BASE + 60 * MINUTE;
+    let base_config = OptimizeConfig {
+        max_files_per_bin: 2,
+        max_bins_per_commit: 1,
+        now_ms: Some(anchor),
+        ..optimize_config()
+    };
+    let unbounded = maintenance.prepare_optimize(&base_config)?;
+    assert_eq!(unbounded.plan.bins.len(), 1);
+    assert!(unbounded.plan.compaction_debt.backlog_files > 0);
+    assert!(unbounded.plan.compaction_debt.backlog_bytes > 0);
+
+    let mut preliminary = unbounded.plan.clone();
+    preliminary.backlog_files = 0;
+    preliminary.compaction_debt.backlog_files = 0;
+    preliminary.compaction_debt.backlog_bytes = 0;
+    let max_plan_bytes = serde_json::to_vec(&preliminary)?.len();
+    let config = OptimizeConfig {
+        max_plan_bytes,
+        ..base_config
+    };
+    let prepared = maintenance.prepare_optimize(&config)?;
+    let encoded = serde_json::to_vec(&prepared.plan)?;
+    assert!(encoded.len() <= max_plan_bytes);
+    assert_eq!(
+        prepared.plan.bins.len(),
+        0,
+        "final backlog fields require trimming the bin"
+    );
+    assert_eq!(
+        prepared.plan.backlog_files,
+        prepared.plan.compaction_debt.eligible_files
+    );
+    assert_eq!(
+        prepared.plan.compaction_debt.backlog_bytes,
+        prepared.plan.compaction_debt.eligible_bytes
+    );
+    let version = maintenance.version()?;
+    let report = maintenance.apply_prepared_optimize(&prepared, &config, &control())?;
+    assert_eq!(report.outcome, Outcome::Noop);
+    assert_eq!(maintenance.version()?, version, "empty bounded plan must not commit");
+    Ok(())
+}
+
+#[test]
+fn pass_inventory_bounds_counted_io_for_all_idle_probes() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let table = create(root.path())?;
+    drop(table);
+
+    let counts = Arc::new(StorageCounts::default());
+    let store = Arc::new(UncertainStore {
+        inner: LocalFileSystem::new(),
+        target: "no-uncertain-commit-in-this-test".to_owned(),
+        unreadable: AtomicBool::new(false),
+        attempts: AtomicUsize::new(0),
+        read_barrier: None,
+        counts: Some(Arc::clone(&counts)),
+    });
+    let maintenance = DeltaTable::open_with_store(root.path(), Arc::clone(&store) as Arc<dyn ObjectStore>)?;
+    counts.reads.store(0, Ordering::SeqCst);
+    counts.lists.store(0, Ordering::SeqCst);
+    counts.writes.store(0, Ordering::SeqCst);
+
+    let config = NegativeProbeConfig {
+        now_ms: BASE + 60 * MINUTE,
+        granularity: Granularity::Minute,
+        purge_retention_ms: 2_592_000_000,
+        vacuum_retention_ms: 604_800_000,
+        log_retention_ms: 2_592_000_000,
+        checkpoint_interval: 100,
+        optimize_small_file_bytes: 64 * 1024 * 1024,
+        optimize_target_file_bytes: 128 * 1024 * 1024,
+        optimize_min_files: 2,
+        sealed_partitions_only: false,
+        max_listed_files: 1000,
+    };
+    let mut inventory = PassProbeInventory::default();
+    for operation in [
+        ProbeOperation::Purge,
+        ProbeOperation::Optimize,
+        ProbeOperation::Vacuum,
+        ProbeOperation::Checkpoint,
+        ProbeOperation::PruneLog,
+    ] {
+        maintenance.probe_no_work_with_inventory(operation, &config, &control(), &mut inventory)?;
+    }
+
+    assert_eq!(counts.writes.load(Ordering::SeqCst), 0);
+    assert!(counts.lists.load(Ordering::SeqCst) <= 7, "bounded pass listings");
+    assert!(counts.reads.load(Ordering::SeqCst) <= 12, "bounded pass reads");
+    Ok(())
+}
+
+#[test]
+fn vacuum_probe_defers_to_bounded_tombstone_replay() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let table = create(root.path())?;
+    append(&table, 0, 0..3)?;
+    drop(table);
+    let old_modified = SystemTime::now()
+        .checked_sub(Duration::from_secs(8 * 24 * 60 * 60))
+        .context("old file timestamp")?;
+    let partition_dir = fs::read_dir(root.path())?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<Vec<_>>>()?
+        .into_iter()
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("__arrowcol_ingestion="))
+        })
+        .context("ingestion partition directory")?;
+    let file = fs::read_dir(partition_dir)?.next().context("partition file")??;
+    fs::File::open(file.path())?.set_modified(old_modified)?;
+
+    let counts = Arc::new(StorageCounts::default());
+    let store = Arc::new(UncertainStore {
+        inner: LocalFileSystem::new(),
+        target: "no-uncertain-commit-in-this-test".to_owned(),
+        unreadable: AtomicBool::new(false),
+        attempts: AtomicUsize::new(0),
+        read_barrier: None,
+        counts: Some(Arc::clone(&counts)),
+    });
+    let maintenance = DeltaTable::open_with_store(root.path(), Arc::clone(&store) as Arc<dyn ObjectStore>)?;
+    counts.reads.store(0, Ordering::SeqCst);
+    counts.lists.store(0, Ordering::SeqCst);
+    counts.writes.store(0, Ordering::SeqCst);
+
+    let now = now_ms()?;
+    let anchor = now
+        .checked_sub(2 * 24 * 60 * 60 * 1000)
+        .context("initial anchor underflow")?;
+    let config = NegativeProbeConfig {
+        now_ms: anchor,
+        granularity: Granularity::Minute,
+        purge_retention_ms: 2_592_000_000,
+        vacuum_retention_ms: 604_800_000,
+        log_retention_ms: 2_592_000_000,
+        checkpoint_interval: 100,
+        optimize_small_file_bytes: 64 * 1024 * 1024,
+        optimize_target_file_bytes: 128 * 1024 * 1024,
+        optimize_min_files: 2,
+        sealed_partitions_only: false,
+        max_listed_files: 1000,
+    };
+    let mut inventory = PassProbeInventory::default();
+    assert!(
+        maintenance
+            .probe_no_work_with_inventory(ProbeOperation::Vacuum, &config, &control(), &mut inventory)?
+            .is_none(),
+        "physical timestamps cannot establish VACUUM LITE tombstone eligibility"
+    );
+    let due_config = NegativeProbeConfig { now_ms: now, ..config };
+    assert!(
+        maintenance
+            .probe_no_work_with_inventory(ProbeOperation::Vacuum, &due_config, &control(), &mut inventory)?
+            .is_none(),
+        "each anchor must reach the bounded tombstone planner"
+    );
+    let report = maintenance.vacuum_once(&VacuumConfig::new(604_800_000, now), false, &control())?;
+    let evidence = report.maintenance_due_work.context("bounded tombstone evidence")?;
+    assert_eq!(evidence.observed_at_ms, now);
+    assert_eq!(evidence.completeness, MaintenanceDueWorkCompleteness::Complete);
+    assert_eq!(evidence.due, Some(false));
+    assert_eq!(evidence.eligible_count, Some(0));
+    assert_eq!(counts.writes.load(Ordering::SeqCst), 0);
+    Ok(())
+}
 fn purge_config() -> PurgeConfig {
     // cutoff = floor(00:03:30 - 90s) = 00:02, so minutes 00 and 01 expire.
     PurgeConfig::new(90_000, BASE + 3 * MINUTE + 30_000, Granularity::Minute)
@@ -155,6 +548,13 @@ fn data_path(root: &Path, relative: &str) -> Result<PathBuf> {
         .join(relative)?
         .to_file_path()
         .map_err(|()| anyhow!("path"))
+}
+
+fn parquet_compression(path: &Path) -> Result<parquet::basic::Compression> {
+    let reader = ParquetRecordBatchReaderBuilder::try_new(fs::File::open(path)?)?;
+    let group = reader.metadata().row_groups().first().context("Parquet row group")?;
+    let column = group.columns().first().context("Parquet column")?;
+    Ok(column.compression())
 }
 
 /// Sorted row multiset read from the actual active Parquet files.
@@ -308,14 +708,39 @@ fn unsorted_optimize_respects_output_row_group_limit() -> Result<()> {
     append(&table, 0, 7..14)?;
     append(&table, 1, 14..15)?;
     let maintenance = DeltaTable::open_for_maintenance(&url_of(root.path())?)?;
+    let input_files = active_files(root.path())?;
+    let input_compressions = input_files
+        .keys()
+        .map(|relative| parquet_compression(&data_path(root.path(), relative)?))
+        .collect::<Result<Vec<_>>>()?;
+    let input_compression = *input_compressions.first().context("input Parquet file")?;
+    assert!(
+        input_compressions
+            .iter()
+            .all(|compression| *compression == input_compression)
+    );
+    let override_codec = if matches!(input_compression, parquet::basic::Compression::ZSTD(_)) {
+        "snappy"
+    } else {
+        "zstd"
+    };
+    let writer_override: arrow_deltalake::writer::ParquetWriterConfig = serde_json::from_value(serde_json::json!({
+        "defaults": {"compression": override_codec}
+    }))?;
     let config = OptimizeConfig {
         use_default_layout: false,
         output_row_group_rows: 3,
         ..optimize_config()
     };
     let before = rows(root.path())?;
-    let plan = maintenance.plan_optimize(&config)?;
-    let report = maintenance.apply_optimize(&plan, &config, &control())?;
+    let prepared = maintenance.prepare_optimize_with_writer_config(&config, &writer_override)?;
+    let report = maintenance.apply_prepared_optimize_with_writer_config(
+        &prepared,
+        &config,
+        &control(),
+        None,
+        &writer_override,
+    )?;
     assert_eq!(report.outcome, Outcome::Committed);
     assert_eq!(rows(root.path())?, before);
     let reader =
@@ -323,6 +748,23 @@ fn unsorted_optimize_respects_output_row_group_limit() -> Result<()> {
     let groups = reader.metadata().row_groups();
     assert_eq!(groups.len(), 5);
     assert!(groups.iter().all(|group| group.num_rows() <= 3));
+    let output_compression = parquet_compression(&data_path(root.path(), &report.outputs[0])?)?;
+    if matches!(input_compression, parquet::basic::Compression::ZSTD(_)) {
+        assert_eq!(output_compression, parquet::basic::Compression::SNAPPY);
+    } else {
+        assert!(matches!(output_compression, parquet::basic::Compression::ZSTD(_)));
+    }
+
+    let active_after_optimize: BTreeSet<_> = active_files(root.path())?.into_keys().collect();
+    append(&table, 2, 15..18)?;
+    let new_ingestion_file = active_files(root.path())?
+        .into_keys()
+        .find(|path| !active_after_optimize.contains(path))
+        .context("new ingestion file")?;
+    assert_eq!(
+        parquet_compression(&data_path(root.path(), &new_ingestion_file)?)?,
+        input_compression
+    );
     Ok(())
 }
 
@@ -449,6 +891,138 @@ fn optimize_rejects_stale_and_metadata_changed_plans() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn optimize_probe_defers_below_threshold_malformed_partition() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let table = create(root.path())?;
+    append_value(&table, "not-a-time", BASE, 0..3)?;
+    let maintenance = DeltaTable::open_for_maintenance(&url_of(root.path())?)?;
+    let config = NegativeProbeConfig {
+        now_ms: BASE + 60 * MINUTE,
+        granularity: Granularity::Minute,
+        purge_retention_ms: 2_592_000_000,
+        vacuum_retention_ms: 604_800_000,
+        log_retention_ms: 2_592_000_000,
+        checkpoint_interval: 100,
+        optimize_small_file_bytes: 64 * 1024 * 1024,
+        optimize_target_file_bytes: 128 * 1024 * 1024,
+        optimize_min_files: 2,
+        sealed_partitions_only: true,
+        max_listed_files: 1000,
+    };
+    assert!(
+        maintenance
+            .probe_no_work(ProbeOperation::Optimize, &config, &control())?
+            .is_none()
+    );
+    let report = MaintenancePlan::Optimize(maintenance.plan_optimize(&optimize_config())?).report();
+    let evidence = report.maintenance_due_work.context("malformed partition evidence")?;
+    assert_eq!(evidence.completeness, MaintenanceDueWorkCompleteness::Incomplete);
+    assert_eq!(
+        evidence.incomplete_reason,
+        Some(MaintenanceDueWorkIncompleteReason::MalformedPartition)
+    );
+    assert_eq!(evidence.due, None);
+    assert_eq!(evidence.eligible_count, None);
+    Ok(())
+}
+
+#[test]
+fn purge_probe_defers_malformed_or_mismatched_partition() -> Result<()> {
+    for (value, granularity) in [
+        ("2026-11-16-14-35", Granularity::Hour),
+        ("not-a-time", Granularity::Minute),
+        ("2026-11-16-14-35-00", Granularity::Minute),
+        ("2026-02-30-14-35", Granularity::Minute),
+    ] {
+        let root = tempfile::tempdir()?;
+        let table = create(root.path())?;
+        append_value(&table, value, BASE, 0..3)?;
+        let maintenance = DeltaTable::open_for_maintenance(&url_of(root.path())?)?;
+        let version = maintenance.version()?;
+        let files = active_files(root.path())?;
+        let probe = NegativeProbeConfig {
+            now_ms: now_ms()?,
+            granularity,
+            purge_retention_ms: 2_592_000_000,
+            vacuum_retention_ms: 604_800_000,
+            log_retention_ms: 2_592_000_000,
+            checkpoint_interval: 100,
+            optimize_small_file_bytes: 64 * 1024 * 1024,
+            optimize_target_file_bytes: 128 * 1024 * 1024,
+            optimize_min_files: 2,
+            sealed_partitions_only: true,
+            max_listed_files: 1000,
+        };
+        assert!(
+            maintenance
+                .probe_no_work(ProbeOperation::Purge, &probe, &control())?
+                .is_none(),
+            "{value}: probe must defer instead of failing or proving zero debt"
+        );
+        let config = PurgeConfig::new(probe.purge_retention_ms, probe.now_ms, granularity);
+        let plan = maintenance.plan_purge(&config)?;
+        assert_eq!(plan.skipped_partitions, 1);
+        assert!(plan.partitions.is_empty());
+        let report = maintenance.apply_purge(&plan, &config, &control())?;
+        let evidence = report.maintenance_due_work.context("skipped partition evidence")?;
+        assert_eq!(evidence.completeness, MaintenanceDueWorkCompleteness::Incomplete);
+        assert_eq!(
+            evidence.incomplete_reason,
+            Some(MaintenanceDueWorkIncompleteReason::MalformedPartition)
+        );
+        assert_eq!(evidence.due, None);
+        assert_eq!(evidence.eligible_count, None);
+        assert_eq!(maintenance.version()?, version);
+        assert_eq!(maintenance.lookup_txn(PURGE_WATERMARK)?, None);
+        assert_eq!(active_files(root.path())?, files);
+        assert_eq!(rows(root.path())?, sorted(expected(0..3, value)));
+    }
+    Ok(())
+}
+
+#[test]
+fn purge_actual_writer_partition_retention_boundary() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let table = create(root.path())?;
+    let start = Granularity::Minute.parse_partition("2026-11-16-14-35")?;
+    for index in 0..3 {
+        let value = Granularity::Minute.format_ms(start + index * MINUTE)?;
+        append_value(&table, &value, start + index * MINUTE, index * 10..index * 10 + 3)?;
+    }
+    append_value(&table, "2026-11-16-14-35", start, 30..33)?;
+    let maintenance = DeltaTable::open_for_maintenance(&url_of(root.path())?)?;
+    let boundary = PurgeConfig::new(2 * MINUTE, start + 3 * MINUTE, Granularity::Minute);
+    let before = PurgeConfig::new(boundary.retention_ms, boundary.anchor_ms - 1, Granularity::Minute);
+    assert!(maintenance.plan_purge(&before)?.partitions.is_empty());
+    let plan = maintenance.plan_purge(&boundary)?;
+    assert_eq!(plan.skipped_partitions, 0);
+    assert_eq!(plan.cutoff_ms, start + MINUTE);
+    assert_eq!(plan.partitions.len(), 1);
+    let partition = plan.partitions.first().context("whole expired minute partition")?;
+    assert_eq!(partition.value, "2026-11-16-14-35");
+    assert_eq!(partition.end_ms, plan.cutoff_ms);
+    assert_eq!(partition.files.len(), 2);
+    let files = active_files(root.path())?;
+    let version = maintenance.version()?;
+    assert_eq!(
+        kind(maintenance.apply_purge(&plan, &before, &control())),
+        Some(MaintenanceErrorKind::StalePlan)
+    );
+    assert_eq!(active_files(root.path())?, files);
+    assert_eq!(maintenance.version()?, version);
+    assert_eq!(maintenance.lookup_txn(PURGE_WATERMARK)?, None);
+    let report = maintenance.apply_purge(&plan, &boundary, &control())?;
+    assert_eq!((report.outcome, report.files_removed), (Outcome::Committed, 2));
+    assert_eq!(maintenance.lookup_txn(PURGE_WATERMARK)?, Some(start + MINUTE));
+    let kept: BTreeSet<_> = active_files(root.path())?.into_values().collect();
+    assert_eq!(
+        kept,
+        BTreeSet::from(["2026-11-16-14-36".to_owned(), "2026-11-16-14-37".to_owned()])
+    );
+    Ok(())
+}
+
 /// Scenario: a malformed partition directory coexists with valid ingestion partitions.
 /// Guarantees: malformed values never authorize rewrite or deletion.
 #[test]
@@ -498,6 +1072,12 @@ fn purge_removes_expired_partitions_and_fences_replay() -> Result<()> {
     assert_eq!(plan.cutoff_ms, BASE + 2 * MINUTE);
     assert_eq!(plan.watermark_ms, Some(BASE + 2 * MINUTE));
     let report = maintenance.apply_purge(&plan, &purge_config(), &control())?;
+    let evidence = report
+        .maintenance_due_work
+        .as_ref()
+        .context("PURGE due-work evidence")?;
+    assert_eq!(evidence.due, Some(true));
+    assert_eq!(evidence.eligible_count, Some(2));
     assert_eq!(
         (report.outcome, report.files_removed, report.rows_removed),
         (Outcome::Committed, 2, 8)
@@ -609,6 +1189,7 @@ fn sealed_final_optimize_revalidates_inputs_after_concurrent_append() -> Result<
         unreadable: AtomicBool::new(false),
         attempts: AtomicUsize::new(0),
         read_barrier: Some(barrier),
+        counts: None,
     });
     let table = DeltaTable::open_with_store(root.path(), store)?;
     let config = OptimizeConfig {
@@ -853,6 +1434,12 @@ fn vacuum_lite_deletes_only_expired_tombstones() -> Result<()> {
         Some(MaintenanceErrorKind::UnsafeRequest)
     );
     let plan = maintenance.plan_vacuum(&short)?;
+    let due_evidence = MaintenancePlan::Vacuum(plan.clone())
+        .report()
+        .maintenance_due_work
+        .context("VACUUM due-work evidence")?;
+    assert_eq!(due_evidence.due, Some(true));
+    assert_eq!(due_evidence.eligible_count, Some(6));
     let unacknowledged = VacuumConfig::new(0, now);
     assert_eq!(
         kind(maintenance.apply_vacuum(&plan, &unacknowledged, &control())),
@@ -1281,6 +1868,624 @@ fn optimize_default_layout_preserves_whole_file_customer_order() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn optimize_does_not_rewrite_budget_full_layout_outputs_again() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let table = DeltaTable::open_url(
+        url_of(root.path())?,
+        customer_schema(),
+        vec![INGESTION_PARTITION.into()],
+    )?;
+    for (index, customer) in ["c4", "c1", "c3", "c0"].into_iter().enumerate() {
+        append_customers(&table, 0, &[customer], index as i64)?;
+    }
+    append_customers(&table, 1, &["frontier"], 10)?;
+    let maintenance = DeltaTable::open_for_maintenance(&url_of(root.path())?)?;
+    let layout = LayoutPolicy {
+        sort_columns: vec!["customer_id".into()],
+        max_rows: 2,
+        max_input_bytes: 1024 * 1024,
+        row_group_rows: 2,
+        page_rows: 1,
+        bloom_columns: vec!["customer_id".into()],
+    };
+    let config = OptimizeConfig {
+        layout: Some(layout.clone()),
+        sealed_final: true,
+        ..optimize_config()
+    };
+
+    let first = maintenance.plan_optimize(&config)?;
+    assert_eq!(first.bins.iter().map(|bin| bin.files.len()).sum::<usize>(), 4);
+    let first_report = maintenance.apply_optimize(&first, &config, &control())?;
+    assert_eq!(
+        (
+            first_report.outcome,
+            first_report.files_removed,
+            first_report.files_added,
+            first_report.rows_removed,
+            first_report.rows_added,
+        ),
+        (Outcome::Committed, 4, 2, 4, 4)
+    );
+
+    drop(maintenance);
+    let maintenance = DeltaTable::open_for_maintenance(&url_of(root.path())?)?;
+    let second = maintenance.plan_optimize(&config)?;
+    assert!(
+        second.bins.is_empty(),
+        "budget-full outputs under the same policy must not be reselected"
+    );
+    let second_report = maintenance.apply_optimize(&second, &config, &control())?;
+    assert_eq!(second_report.outcome, Outcome::Noop);
+
+    let changed_policy = OptimizeConfig {
+        layout: Some(LayoutPolicy { max_rows: 3, ..layout }),
+        ..config
+    };
+    assert!(
+        !maintenance.plan_optimize(&changed_policy)?.bins.is_empty(),
+        "a changed layout policy must make prior outputs eligible for re-layout"
+    );
+    let mut actual_rows = Vec::new();
+    for (path, _) in active_files(root.path())? {
+        let reader =
+            ParquetRecordBatchReaderBuilder::try_new(fs::File::open(data_path(root.path(), &path)?)?)?.build()?;
+        for batch in reader {
+            let batch = batch?;
+            let customers = arrow::compute::cast(
+                batch.column_by_name("customer_id").context("customer")?,
+                &DataType::Utf8,
+            )?;
+            let customers = customers.as_any().downcast_ref::<StringArray>().context("customers")?;
+            let ids = arrow::compute::cast(batch.column_by_name("id").context("id")?, &DataType::Int64)?;
+            let ids = ids.as_any().downcast_ref::<Int64Array>().context("ids")?;
+            for row in 0..batch.num_rows() {
+                actual_rows.push((customers.value(row).to_owned(), ids.value(row)));
+            }
+        }
+    }
+    actual_rows.sort();
+    assert_eq!(
+        actual_rows,
+        [
+            ("c0".into(), 3),
+            ("c1".into(), 1),
+            ("c3".into(), 2),
+            ("c4".into(), 0),
+            ("frontier".into(), 10)
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn optimize_reconsiders_partial_outputs_after_reopen_and_new_arrival() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let table = DeltaTable::open_url(
+        url_of(root.path())?,
+        customer_schema(),
+        vec![INGESTION_PARTITION.into()],
+    )?;
+    append_customers(&table, 0, &["c0", "c1", "c2"], 0)?;
+    append_customers(&table, 0, &["c3", "c4", "c5"], 3)?;
+    append_customers(&table, 0, &["c6", "c7", "c8"], 6)?;
+    append_customers(&table, 0, &["c9", "c10", "c11", "c12", "c13"], 9)?;
+    let layout = LayoutPolicy {
+        max_rows: 10,
+        max_input_bytes: 1024 * 1024,
+        row_group_rows: 10,
+        page_rows: 2,
+        ..LayoutPolicy::default()
+    };
+    let config = OptimizeConfig {
+        layout: Some(layout),
+        sealed_final: true,
+        ..optimize_config()
+    };
+    let maintenance = DeltaTable::open_for_maintenance(&url_of(root.path())?)?;
+    let first = maintenance.plan_optimize(&config)?;
+    assert_eq!(first.bins.iter().flat_map(|bin| &bin.files).count(), 4);
+    let first_report = maintenance.apply_optimize(&first, &config, &control())?;
+    assert_eq!(
+        (
+            first_report.files_removed,
+            first_report.files_added,
+            first_report.rows_removed,
+            first_report.rows_added,
+        ),
+        (4, 2, 14, 14)
+    );
+    let first_outputs = active_files(root.path())?;
+    assert_eq!(first_outputs.len(), 2);
+    assert!(
+        first_outputs.keys().all(|path| !path.contains("full-")),
+        "partial outputs must not carry a reusable full-capacity marker"
+    );
+
+    drop(maintenance);
+    drop(table);
+    let reopened = DeltaTable::open_url(
+        url_of(root.path())?,
+        customer_schema(),
+        vec![INGESTION_PARTITION.into()],
+    )?;
+    // A one-row arrival fits either partial output regardless of UUID path order.
+    append_customers(&reopened, 0, &["c14"], 14)?;
+    drop(reopened);
+    let maintenance = DeltaTable::open_for_maintenance(&url_of(root.path())?)?;
+    let second = maintenance.plan_optimize(&config)?;
+    assert_eq!(
+        second.bins.iter().flat_map(|bin| &bin.files).count(),
+        3,
+        "reopened planning must reconsider both partial outputs with the later arrival"
+    );
+    let second_report = maintenance.apply_optimize(&second, &config, &control())?;
+    assert_eq!(
+        (
+            second_report.outcome,
+            second_report.files_removed,
+            second_report.files_added,
+            second_report.rows_removed,
+            second_report.rows_added,
+        ),
+        (Outcome::Committed, 3, 2, 15, 15)
+    );
+
+    let mut actual_rows = Vec::new();
+    for path in active_files(root.path())?.keys() {
+        let reader =
+            ParquetRecordBatchReaderBuilder::try_new(fs::File::open(data_path(root.path(), path)?)?)?.build()?;
+        let mut file_customers = Vec::new();
+        for batch in reader {
+            let batch = batch?;
+            let customers = batch
+                .column_by_name("customer_id")
+                .context("customer_id")?
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .context("customers")?;
+            let ids = batch
+                .column_by_name("id")
+                .context("id")?
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .context("ids")?;
+            for row in 0..batch.num_rows() {
+                file_customers.push(customers.value(row).to_owned());
+                actual_rows.push((customers.value(row).to_owned(), ids.value(row)));
+            }
+        }
+        assert!(file_customers.windows(2).all(|pair| pair[0] <= pair[1]));
+    }
+    actual_rows.sort();
+    let mut expected_rows: Vec<_> = (0..15).map(|id| (format!("c{id}"), id)).collect();
+    expected_rows.sort();
+    assert_eq!(actual_rows, expected_rows);
+    Ok(())
+}
+
+#[test]
+fn optimize_d42_residual_batch_rows_change_invalidates_no_benefit_proof() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let table = DeltaTable::open_url(
+        url_of(root.path())?,
+        customer_schema(),
+        vec![INGESTION_PARTITION.into()],
+    )?;
+    append_customers(&table, 0, &["c0", "c1", "c2", "c3", "c4", "c5"], 0)?;
+    append_customers(&table, 0, &["c6", "c7", "c8", "c9", "c10", "c11"], 6)?;
+    append_customers(&table, 0, &["c12", "c13", "c14", "c15", "c16", "c17"], 12)?;
+    let layout = LayoutPolicy {
+        max_rows: 10,
+        max_input_bytes: 1024 * 1024,
+        row_group_rows: 10,
+        page_rows: 2,
+        ..LayoutPolicy::default()
+    };
+    let six_row_batches = OptimizeConfig {
+        layout: Some(layout),
+        sealed_final: true,
+        batch_rows: 6,
+        ..optimize_config()
+    };
+    let maintenance = DeltaTable::open_for_maintenance(&url_of(root.path())?)?;
+    let plan = maintenance.plan_optimize(&six_row_batches)?;
+    assert_eq!(plan.bins.iter().flat_map(|bin| &bin.files).count(), 3);
+    let first = maintenance.apply_optimize(&plan, &six_row_batches, &control())?;
+    assert_eq!(first.outcome, Outcome::Noop);
+    assert_eq!(first.nonbeneficial_bins, 1);
+
+    drop(maintenance);
+    drop(table);
+    let reopened = DeltaTable::open_for_maintenance(&url_of(root.path())?)?;
+    let two_row_batches = OptimizeConfig {
+        batch_rows: 2,
+        ..six_row_batches
+    };
+    let changed = reopened.plan_optimize(&two_row_batches)?;
+    assert_eq!(changed.bins.iter().flat_map(|bin| &bin.files).count(), 3);
+    let report = reopened.apply_optimize(&changed, &two_row_batches, &control())?;
+    assert_eq!(
+        (
+            report.outcome,
+            report.files_removed,
+            report.files_added,
+            report.rows_removed,
+            report.rows_added,
+        ),
+        (Outcome::Committed, 3, 2, 18, 18)
+    );
+    assert_eq!(active_files(root.path())?.len(), 2);
+    Ok(())
+}
+
+#[test]
+fn optimize_d42_residual_proof_write_failure_discards_prior_bin_outputs() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let table = DeltaTable::open_url(
+        url_of(root.path())?,
+        customer_schema(),
+        vec![INGESTION_PARTITION.into()],
+    )?;
+    append_customers(&table, 1, &["c0", "c1", "c2"], 0)?;
+    append_customers(&table, 1, &["c3", "c4", "c5"], 3)?;
+    append_customers(&table, 0, &["c6", "c7", "c8", "c9", "c10", "c11"], 6)?;
+    append_customers(&table, 0, &["c12", "c13", "c14", "c15", "c16", "c17"], 12)?;
+    let config = OptimizeConfig {
+        layout: Some(LayoutPolicy {
+            max_rows: 10,
+            max_input_bytes: 1024 * 1024,
+            row_group_rows: 10,
+            page_rows: 2,
+            ..LayoutPolicy::default()
+        }),
+        sealed_final: true,
+        batch_rows: 6,
+        ..optimize_config()
+    };
+    let maintenance = DeltaTable::open_for_maintenance(&url_of(root.path())?)?;
+    let plan = maintenance.plan_optimize(&config)?;
+    assert_eq!(plan.bins.len(), 2);
+    let newest = minute(1);
+    assert_eq!(
+        plan.bins[0]
+            .partition_values
+            .get(INGESTION_PARTITION)
+            .and_then(Option::as_deref),
+        Some(newest.as_str())
+    );
+    let version = maintenance.version()?;
+    let record_dir = root.path().join("_arrowcol_maintenance");
+    fs::create_dir_all(&record_dir)?;
+    fs::create_dir(record_dir.join(".lock"))?;
+
+    let error = maintenance
+        .apply_optimize(&plan, &config, &control())
+        .err()
+        .context("no-benefit proof persistence failure must surface")?;
+    assert!(format!("{error:#}").contains("Is a directory"), "{error:#}");
+    assert_eq!(
+        maintenance.version()?,
+        version,
+        "the failed proof write must not commit"
+    );
+    assert_eq!(active_files(root.path())?.len(), 4);
+    assert_eq!(
+        parquet_files(root.path(), &newest)?,
+        2,
+        "earlier bin output must be discarded"
+    );
+    assert_eq!(parquet_files(root.path(), &minute(0))?, 2);
+    Ok(())
+}
+
+#[test]
+fn optimize_byte_limited_partial_outputs_do_not_churn_until_candidates_change() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let table = DeltaTable::open_url(
+        url_of(root.path())?,
+        customer_schema(),
+        vec![INGESTION_PARTITION.into()],
+    )?;
+    let wide_values: Vec<String> = (0..4).map(|index| format!("{index}{}", "x".repeat(299_999))).collect();
+    let sample = RecordBatch::try_new(
+        customer_schema(),
+        vec![
+            Arc::new(StringArray::from(vec![wide_values[0].as_str()])),
+            Arc::new(Int64Array::from(vec![0])),
+            Arc::new(StringArray::from(vec![minute(0)])),
+        ],
+    )?;
+    let row_bytes = sample.get_array_memory_size();
+    let input_cap = row_bytes.checked_mul(5).context("byte budget overflow")? / 2;
+    assert!(row_bytes < input_cap);
+    for (index, customer) in wide_values.iter().enumerate() {
+        append_customers(&table, 0, &[customer], index as i64)?;
+    }
+    append_customers(&table, 1, &["frontier"], 10)?;
+
+    let layout = LayoutPolicy {
+        max_rows: 16,
+        max_input_bytes: input_cap,
+        row_group_rows: 16,
+        page_rows: 4,
+        ..LayoutPolicy::default()
+    };
+    let config = OptimizeConfig {
+        layout: Some(layout),
+        sealed_final: true,
+        ..optimize_config()
+    };
+    let maintenance = DeltaTable::open_for_maintenance(&url_of(root.path())?)?;
+    let initial = maintenance.plan_optimize(&config)?;
+    assert_eq!(initial.bins.iter().flat_map(|bin| &bin.files).count(), 4);
+    let initial_report = maintenance.apply_optimize(&initial, &config, &control())?;
+    assert_eq!(
+        (
+            initial_report.outcome,
+            initial_report.files_removed,
+            initial_report.files_added,
+            initial_report.rows_removed,
+            initial_report.rows_added,
+        ),
+        (Outcome::Committed, 4, 2, 4, 4)
+    );
+
+    let partial_outputs: Vec<String> = active_files(root.path())?
+        .into_iter()
+        .filter(|(_, partition)| *partition == minute(0))
+        .map(|(path, _)| path)
+        .collect();
+    assert_eq!(partial_outputs.len(), 2);
+    let mut output_batch_bytes = Vec::new();
+    for path in &partial_outputs {
+        let reader = ParquetRecordBatchReaderBuilder::try_new(fs::File::open(data_path(root.path(), path)?)?)?;
+        for batch in reader.build()? {
+            output_batch_bytes.push(batch?.get_array_memory_size());
+        }
+    }
+    assert_eq!(output_batch_bytes.len(), 2);
+    assert!(
+        output_batch_bytes
+            .iter()
+            .all(|bytes| *bytes > input_cap / 2 && *bytes < input_cap),
+        "observed output Arrow bytes {output_batch_bytes:?}, cap {input_cap}"
+    );
+
+    let first_repeat = maintenance.plan_optimize(&config)?;
+    assert_eq!(first_repeat.bins.iter().flat_map(|bin| &bin.files).count(), 2);
+    let first_repeat_report = maintenance.apply_optimize(&first_repeat, &config, &control())?;
+    assert_eq!(first_repeat_report.outcome, Outcome::Noop);
+    assert_eq!(first_repeat_report.nonbeneficial_bins, 1);
+    let partition_dir = data_path(root.path(), &partial_outputs[0])?
+        .parent()
+        .context("partition directory")?
+        .to_path_buf();
+    let after_proof = fs::metadata(&partition_dir)?.modified()?;
+
+    let unchanged = maintenance.plan_optimize(&config)?;
+    assert_eq!(unchanged.bins.iter().flat_map(|bin| &bin.files).count(), 2);
+    let unchanged_report = maintenance.apply_optimize(&unchanged, &config, &control())?;
+    assert_eq!(unchanged_report.outcome, Outcome::Noop);
+    assert_eq!(unchanged_report.nonbeneficial_bins, 1);
+    assert_eq!(
+        fs::metadata(&partition_dir)?.modified()?,
+        after_proof,
+        "a repeated no-benefit plan must not create or delete Parquet outputs"
+    );
+
+    drop(maintenance);
+    let reopened = DeltaTable::open_for_maintenance(&url_of(root.path())?)?;
+    let after_reopen_plan = reopened.plan_optimize(&config)?;
+    assert_eq!(after_reopen_plan.bins.iter().flat_map(|bin| &bin.files).count(), 2);
+    let after_reopen_report = reopened.apply_optimize(&after_reopen_plan, &config, &control())?;
+    assert_eq!(after_reopen_report.outcome, Outcome::Noop);
+    assert_eq!(after_reopen_report.nonbeneficial_bins, 1);
+    assert_eq!(
+        fs::metadata(&partition_dir)?.modified()?,
+        after_proof,
+        "the no-benefit proof must survive reopening without output churn"
+    );
+
+    drop(reopened);
+    let writer = DeltaTable::open_url(
+        url_of(root.path())?,
+        customer_schema(),
+        vec![INGESTION_PARTITION.into()],
+    )?;
+    append_customers(&writer, 0, &["zz"], 11)?;
+    drop(writer);
+    let changed = DeltaTable::open_for_maintenance(&url_of(root.path())?)?;
+    let changed_plan = changed.plan_optimize(&config)?;
+    assert_eq!(changed_plan.bins.iter().flat_map(|bin| &bin.files).count(), 3);
+    let changed_report = changed.apply_optimize(&changed_plan, &config, &control())?;
+    assert_eq!(
+        (
+            changed_report.outcome,
+            changed_report.files_removed,
+            changed_report.files_added,
+            changed_report.rows_removed,
+            changed_report.rows_added,
+        ),
+        (Outcome::Committed, 3, 2, 5, 5)
+    );
+    Ok(())
+}
+#[test]
+fn optimize_rejects_writer_config_drift_before_effects() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let table = DeltaTable::open_url(
+        url_of(root.path())?,
+        customer_schema(),
+        vec![INGESTION_PARTITION.into()],
+    )?;
+    append_customers(&table, 0, &["c2", "c1", "c0"], 0)?;
+    append_customers(&table, 0, &["c5", "c4", "c3"], 3)?;
+    let maintenance = DeltaTable::open_for_maintenance(&url_of(root.path())?)?;
+    let config = OptimizeConfig {
+        layout: Some(LayoutPolicy {
+            max_rows: 10,
+            max_input_bytes: 1024 * 1024,
+            row_group_rows: 10,
+            page_rows: 2,
+            ..LayoutPolicy::default()
+        }),
+        sealed_final: true,
+        ..optimize_config()
+    };
+    let prepared = maintenance.prepare_optimize(&config)?;
+    let version = maintenance.version()?;
+    let original_writer = arrow_deltalake::writer::process_config()?.clone();
+    let mut changed_writer = original_writer.clone();
+    changed_writer.max_row_group_rows = Some(if original_writer.max_row_group_rows == Some(1) {
+        2
+    } else {
+        1
+    });
+    let error = match maintenance.apply_prepared_optimize_with_writer_config(
+        &prepared,
+        &config,
+        &control(),
+        None,
+        &changed_writer,
+    ) {
+        Err(error) => error,
+        Ok(_) => bail!("writer policy drift must be rejected before writing outputs"),
+    };
+    assert_eq!(error_kind(&error), Some(MaintenanceErrorKind::InvalidPlan));
+    assert_eq!(maintenance.version()?, version);
+    assert_eq!(active_files(root.path())?.len(), 2);
+    Ok(())
+}
+
+#[test]
+fn optimize_relayouts_marked_files_when_writer_policy_changes_after_reopen() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let table = DeltaTable::open_url(
+        url_of(root.path())?,
+        customer_schema(),
+        vec![INGESTION_PARTITION.into()],
+    )?;
+    append_customers(&table, 0, &["c0", "c1", "c2", "c3", "c4"], 0)?;
+    append_customers(&table, 0, &["c5", "c6", "c7", "c8", "c9"], 5)?;
+    let config = OptimizeConfig {
+        layout: Some(LayoutPolicy {
+            max_rows: 10,
+            max_input_bytes: 1024 * 1024,
+            row_group_rows: 10,
+            page_rows: 2,
+            ..LayoutPolicy::default()
+        }),
+        sealed_final: true,
+        ..optimize_config()
+    };
+    let original_writer = arrow_deltalake::writer::ParquetWriterConfig::default();
+    let maintenance = DeltaTable::open_for_maintenance(&url_of(root.path())?)?;
+    let first = maintenance.prepare_optimize_with_writer_config(&config, &original_writer)?;
+    let first_report =
+        maintenance.apply_prepared_optimize_with_writer_config(&first, &config, &control(), None, &original_writer)?;
+    assert_eq!(
+        (
+            first_report.files_removed,
+            first_report.files_added,
+            first_report.rows_removed,
+            first_report.rows_added,
+        ),
+        (2, 1, 10, 10)
+    );
+    let first_output = active_files(root.path())?;
+    assert_eq!(first_output.len(), 1);
+    assert!(
+        first_output
+            .keys()
+            .any(|path| path.contains("output-v2-") && path.contains("full-"))
+    );
+
+    drop(maintenance);
+    drop(table);
+    let reopened = DeltaTable::open_url(
+        url_of(root.path())?,
+        customer_schema(),
+        vec![INGESTION_PARTITION.into()],
+    )?;
+    append_customers(&reopened, 0, &["c10", "c11", "c12"], 10)?;
+    append_customers(&reopened, 0, &["c13", "c14", "c15"], 13)?;
+    append_customers(&reopened, 0, &["c16", "c17", "c18"], 16)?;
+    append_customers(&reopened, 0, &["c19", "c20", "c21"], 19)?;
+    drop(reopened);
+
+    let maintenance = DeltaTable::open_for_maintenance(&url_of(root.path())?)?;
+    let changed_writer: arrow_deltalake::writer::ParquetWriterConfig = serde_json::from_value(serde_json::json!({
+        "defaults": {"compression": "snappy"}
+    }))?;
+    let stale = maintenance.prepare_optimize_with_writer_config(&config, &original_writer)?;
+    let version = maintenance.version()?;
+    let error = match maintenance.apply_prepared_optimize_with_writer_config(
+        &stale,
+        &config,
+        &control(),
+        None,
+        &changed_writer,
+    ) {
+        Err(error) => error,
+        Ok(_) => bail!("writer policy drift must be rejected before writing outputs"),
+    };
+    assert_eq!(error_kind(&error), Some(MaintenanceErrorKind::InvalidPlan));
+    assert_eq!(maintenance.version()?, version);
+    assert_eq!(active_files(root.path())?.len(), 5);
+
+    let changed = maintenance.prepare_optimize_with_writer_config(&config, &changed_writer)?;
+    assert_eq!(changed.plan.bins.iter().flat_map(|bin| &bin.files).count(), 5);
+    let report =
+        maintenance.apply_prepared_optimize_with_writer_config(&changed, &config, &control(), None, &changed_writer)?;
+    assert_eq!(
+        (
+            report.outcome,
+            report.files_removed,
+            report.files_added,
+            report.rows_removed,
+            report.rows_added,
+        ),
+        (Outcome::Committed, 5, 3, 22, 22),
+        "unexpected OPTIMIZE report: {report:#?}"
+    );
+    let active = active_files(root.path())?;
+    assert_eq!(active.len(), 3);
+    let mut actual_rows = Vec::new();
+    for path in active.keys() {
+        let file_path = data_path(root.path(), path)?;
+        assert_eq!(parquet_compression(&file_path)?, parquet::basic::Compression::SNAPPY);
+        let reader = ParquetRecordBatchReaderBuilder::try_new(fs::File::open(file_path)?)?.build()?;
+        let mut file_customers = Vec::new();
+        for batch in reader {
+            let batch = batch?;
+            let customers = batch
+                .column_by_name("customer_id")
+                .context("customer_id")?
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .context("customers")?;
+            let ids = batch
+                .column_by_name("id")
+                .context("id")?
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .context("ids")?;
+            for row in 0..batch.num_rows() {
+                file_customers.push(customers.value(row).to_owned());
+                actual_rows.push((customers.value(row).to_owned(), ids.value(row)));
+            }
+        }
+        assert!(file_customers.windows(2).all(|pair| pair[0] <= pair[1]));
+    }
+    actual_rows.sort();
+    let mut expected_rows: Vec<_> = (0..22).map(|id| (format!("c{id}"), id)).collect();
+    expected_rows.sort();
+    assert_eq!(actual_rows, expected_rows);
+    Ok(())
+}
+
 /// Commit-log fault injection for maintenance publication.
 #[derive(Debug)]
 struct UncertainStore {
@@ -1289,6 +2494,24 @@ struct UncertainStore {
     unreadable: AtomicBool,
     attempts: AtomicUsize,
     read_barrier: Option<Arc<BarrierFence>>,
+    counts: Option<Arc<StorageCounts>>,
+}
+
+#[derive(Debug, Default)]
+struct StorageCounts {
+    reads: AtomicUsize,
+    lists: AtomicUsize,
+    writes: AtomicUsize,
+}
+
+impl StorageCounts {
+    fn read(&self) {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn write(&self) {
+        self.writes.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 impl std::fmt::Display for UncertainStore {
@@ -1305,6 +2528,9 @@ impl ObjectStore for UncertainStore {
         payload: PutPayload,
         options: PutOptions,
     ) -> object_store::Result<PutResult> {
+        if let Some(counts) = &self.counts {
+            counts.write();
+        }
         if path.as_ref().ends_with(&self.target) {
             self.attempts.fetch_add(1, Ordering::SeqCst);
             self.inner.put_opts(path, payload, options).await?;
@@ -1321,10 +2547,16 @@ impl ObjectStore for UncertainStore {
         path: &object_store::path::Path,
         options: PutMultipartOptions,
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        if let Some(counts) = &self.counts {
+            counts.write();
+        }
         self.inner.put_multipart_opts(path, options).await
     }
 
     async fn get_opts(&self, path: &object_store::path::Path, options: GetOptions) -> object_store::Result<GetResult> {
+        if let Some(counts) = &self.counts {
+            counts.read();
+        }
         if path.as_ref().ends_with(".parquet")
             && let Some(barrier) = &self.read_barrier
         {
@@ -1349,14 +2581,25 @@ impl ObjectStore for UncertainStore {
         &self,
         paths: BoxStream<'static, object_store::Result<object_store::path::Path>>,
     ) -> BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        if let Some(counts) = &self.counts {
+            counts.write();
+        }
         self.inner.delete_stream(paths)
     }
 
     fn list(&self, prefix: Option<&object_store::path::Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        if let Some(counts) = &self.counts {
+            counts.read();
+            counts.lists.fetch_add(1, Ordering::SeqCst);
+        }
         self.inner.list(prefix)
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&object_store::path::Path>) -> object_store::Result<ListResult> {
+        if let Some(counts) = &self.counts {
+            counts.read();
+            counts.lists.fetch_add(1, Ordering::SeqCst);
+        }
         self.inner.list_with_delimiter(prefix).await
     }
 
@@ -1366,6 +2609,9 @@ impl ObjectStore for UncertainStore {
         to: &object_store::path::Path,
         options: CopyOptions,
     ) -> object_store::Result<()> {
+        if let Some(counts) = &self.counts {
+            counts.write();
+        }
         self.inner.copy_opts(from, to, options).await
     }
 
@@ -1375,6 +2621,9 @@ impl ObjectStore for UncertainStore {
         to: &object_store::path::Path,
         options: RenameOptions,
     ) -> object_store::Result<()> {
+        if let Some(counts) = &self.counts {
+            counts.write();
+        }
         self.inner.rename_opts(from, to, options).await
     }
 }
@@ -1402,6 +2651,7 @@ fn optimize_uncertain_commit_never_discards_outputs() -> Result<()> {
             unreadable: AtomicBool::new(unreadable),
             attempts: AtomicUsize::new(0),
             read_barrier: None,
+            counts: None,
         });
         let maintenance = DeltaTable::open_with_store(root.path(), Arc::clone(&store) as Arc<dyn ObjectStore>)?;
         let plan = maintenance.plan_optimize(&optimize_config())?;
@@ -1614,6 +2864,11 @@ fn prune_log_deletes_proven_history_and_keeps_table_state() -> Result<()> {
     assert_eq!(maintenance.log_floor()?, None, "dry run writes no floor");
 
     let report = maintenance.apply_prune_log(&plan, &config, &control())?;
+    assert_eq!(report.maintenance_due_work, dry.maintenance_due_work);
+    let evidence = report.maintenance_due_work.as_ref().context("applied prune evidence")?;
+    assert_eq!(evidence.completeness, MaintenanceDueWorkCompleteness::Complete);
+    assert_eq!(evidence.due, Some(true));
+    assert_eq!(evidence.eligible_count, Some(checkpoint));
     assert_eq!(
         (report.outcome, report.files_deleted, report.version),
         (Outcome::Pruned, checkpoint, checkpoint)
@@ -1690,10 +2945,17 @@ fn prune_log_waits_for_vacuum_progress() -> Result<()> {
     let config = short_prune(now_ms()? + 1_000);
     let plan = maintenance.plan_prune_log(&config)?;
     assert_eq!((plan.checkpoint_version, plan.report().outcome), (None, Outcome::Noop));
+    let evidence = plan.report().maintenance_due_work.context("PRUNE_LOG evidence")?;
+    assert_eq!(evidence.completeness, MaintenanceDueWorkCompleteness::Incomplete);
     assert_eq!(
-        maintenance.apply_prune_log(&plan, &config, &control())?.outcome,
-        Outcome::Noop
+        evidence.incomplete_reason,
+        Some(MaintenanceDueWorkIncompleteReason::MissingCheckpointProof)
     );
+    assert_eq!(evidence.due, None);
+    assert_eq!(evidence.eligible_count, None);
+    let applied = maintenance.apply_prune_log(&plan, &config, &control())?;
+    assert_eq!(applied.outcome, Outcome::Noop);
+    assert_eq!(applied.maintenance_due_work, plan.report().maintenance_due_work);
     assert_eq!(log_files(no_progress.path())?, before);
 
     let stale = tempfile::tempdir()?;

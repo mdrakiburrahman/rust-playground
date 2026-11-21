@@ -41,7 +41,7 @@ serde_json = "1"
 sha2 = "0.10"
 thiserror.workspace = true
 tiberius = { version = "0.13", default-features = false }
-tokio = { version = "1", features = ["fs", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["fs", "io-std", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = "0.1"
 tokio-util = "0.7"
 tonic = "0.14"
@@ -49,6 +49,7 @@ url = "2"
 uuid = { version = "1", features = ["serde", "v4"] }
 
 [dev-dependencies]
+arrowcol-catalog-rust = { path = "../../arrowcol-catalog-rust" }
 # Dev-only: enables the offline bootstrap control seam for tests/initialize_control.rs.
 arrow-deltalake = { path = "../../../crates/arrow-deltalake", features = ["test-control"] }
 assert_cmd.workspace = true

@@ -1,6 +1,9 @@
-use crate::config::OatConfig;
+use crate::config::{
+    AKS_RESOURCE_COUNTER_SNAPSHOT_TIMEOUT_MS, EffectiveStopBudgets, OatConfig, ResourceRequirements, ResourceValues,
+    parse_cpu_millicores as parse_resource_cpu_millicores, parse_memory_bytes as parse_resource_memory_bytes,
+};
 use crate::model::{AppState, RunState, unix_time_ms};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
     TimestampMillisecondArray, UInt64Array,
@@ -34,12 +37,906 @@ use url::Url;
 
 #[cfg(test)]
 include!("runner_failure_tests.rs");
+#[cfg(all(test, unix))]
+include!("runner_pin_init_tests.rs");
 include!("runner_evidence.rs");
 include!("runner_tunables.rs");
 include!("runner_process_evidence.rs");
 include!("runner_commit_evidence.rs");
 include!("runner_maintenance.rs");
+include!("runner_catalog_registration.rs");
 include!("runner_wal.rs");
+include!("runner_overload.rs");
+include!("runner_admission_diagnostics.rs");
+include!("runner_fixture.rs");
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CampaignIdentity {
+    campaign_id: String,
+    owner_id: String,
+    fencing_token: u64,
+}
+
+impl CampaignIdentity {
+    fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Result<Self> {
+        let campaign_id = lookup("CAMPAIGN_ID").context("CAMPAIGN_ID is required for AKS campaign custody")?;
+        let owner_id = lookup("CAMPAIGN_OWNER_ID").context("CAMPAIGN_OWNER_ID is required for AKS campaign custody")?;
+        let raw_token =
+            lookup("CAMPAIGN_FENCING_TOKEN").context("CAMPAIGN_FENCING_TOKEN is required for AKS campaign custody")?;
+        for value in [&campaign_id, &owner_id] {
+            let id = uuid::Uuid::parse_str(value).context("campaign custody identity must be a canonical UUID")?;
+            if id.is_nil() || id.to_string() != *value {
+                bail!("campaign custody identity must be a nonzero canonical UUID");
+            }
+        }
+        if raw_token.is_empty() || !raw_token.bytes().all(|byte| byte.is_ascii_digit()) {
+            bail!("CAMPAIGN_FENCING_TOKEN must be a positive decimal integer");
+        }
+        let fencing_token = raw_token
+            .parse::<u64>()
+            .context("CAMPAIGN_FENCING_TOKEN is out of range")?;
+        if fencing_token == 0 || fencing_token > 9_007_199_254_740_991 {
+            bail!("CAMPAIGN_FENCING_TOKEN must be a positive JSON-safe integer");
+        }
+        Ok(Self {
+            campaign_id,
+            owner_id,
+            fencing_token,
+        })
+    }
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RunInventory {
+    pub schema_version: u32,
+    pub campaign_id: String,
+    pub owner_id: String,
+    pub fencing_token: u64,
+    pub orchestration_run_id: String,
+    pub cell_run_id: String,
+    pub load_admission: InventoryLoadAdmission,
+    pub namespace: InventoryNamespace,
+    pub resources: Vec<InventoryResource>,
+    pub fic: Option<InventoryFic>,
+    pub qap: Option<InventoryQap>,
+    #[serde(default)]
+    pub evidence_destination: Option<InventoryEvidenceDestination>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub official_measurement: Option<InventoryOfficialMeasurement>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_stop_budgets: Option<EffectiveStopBudgets>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planned_cell_duration_ms: Option<u64>,
+    pub cleanup: InventoryCleanup,
+}
+
+#[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InventoryLoadAdmission {
+    NotAuthorized,
+    AuthorizationPending,
+    Authorized,
+}
+
+impl InventoryLoadAdmission {
+    fn can_advance_to(self, next: Self) -> bool {
+        self == next
+            || matches!(
+                (self, next),
+                (Self::NotAuthorized, Self::AuthorizationPending) | (Self::AuthorizationPending, Self::Authorized)
+            )
+    }
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InventoryNamespace {
+    pub name: String,
+    pub uid: Option<String>,
+    pub owner_token: String,
+}
+
+#[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InventoryResourceState {
+    Planned,
+    Observed,
+    Removed,
+    Absent,
+    Uncertain,
+}
+
+impl InventoryResourceState {
+    fn can_advance_to(self, next: Self) -> bool {
+        match self {
+            Self::Planned => true,
+            Self::Observed | Self::Uncertain => next != Self::Planned,
+            Self::Removed | Self::Absent => next == self,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InventoryResourceRole {
+    Collector,
+    Client,
+    Maintenance,
+    Router,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InventoryResource {
+    pub api_version: String,
+    pub kind: String,
+    pub namespace: String,
+    pub name: String,
+    pub uid: Option<String>,
+    pub role: InventoryResourceRole,
+    pub state: InventoryResourceState,
+    #[serde(default)]
+    pub absence: Option<InventoryAbsenceReceipt>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InventoryAbsenceReceipt {
+    pub api_version: String,
+    pub kind: String,
+    pub namespace: String,
+    pub namespace_uid: Option<String>,
+    pub name: String,
+    pub observed_at_unix_ms: u64,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InventoryFic {
+    pub resource_id: Option<String>,
+    pub name: Option<String>,
+    pub state: InventoryResourceState,
+    #[serde(default)]
+    pub absence: Option<InventoryFicAbsenceReceipt>,
+    #[serde(default)]
+    pub plan: Option<InventoryFicPlan>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct InventoryFicPlan {
+    pub version: u32,
+    pub run_id: String,
+    pub namespace: String,
+    pub service_account: String,
+    pub identity_id: String,
+    pub resource_id: String,
+    pub client_id: String,
+    pub tenant_id: String,
+    pub aks_id: String,
+    pub server: String,
+    pub credential_name: String,
+    pub issuer: String,
+    pub subject: String,
+    pub audience: String,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InventoryFicAbsenceReceipt {
+    pub resource_id: String,
+    pub name: String,
+    pub observed_at_unix_ms: u64,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InventoryQapBinding {
+    pub external_table: String,
+    pub relative_path: String,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InventoryQap {
+    pub database: String,
+    pub bindings: Vec<InventoryQapBinding>,
+    pub state: InventoryResourceState,
+    #[serde(default)]
+    pub absence: Vec<InventoryQapAbsenceReceipt>,
+    #[serde(default)]
+    pub reference: Option<InventoryQapReference>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InventoryQapReference {
+    pub schema_version: u32,
+    pub account: String,
+    pub container: String,
+    pub blob: String,
+    pub run_id: String,
+    pub nonce: String,
+    pub manifest_sha256: String,
+    pub namespace_uid: String,
+    pub namespace_owner_token: String,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InventoryEvidenceDestination {
+    pub account: String,
+    pub container: String,
+    pub blob_prefix: String,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InventoryOfficialMeasurement {
+    pub schema_version: u32,
+    pub blob: String,
+    pub etag: String,
+    pub version: Option<String>,
+    pub sha256: String,
+    pub byte_length: u64,
+    pub effective_config_sha256: String,
+    pub submitted_config_sha256: Option<String>,
+    pub source_revision: Option<String>,
+    pub measurement_start_unix_ms: Option<u64>,
+    pub measurement_end_unix_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InventoryQapAbsenceReceipt {
+    pub database: String,
+    pub external_table: String,
+    pub relative_path: String,
+    pub observed_at_unix_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InventoryStepState {
+    NotStarted,
+    Pending,
+    Running,
+    Complete,
+    Failed,
+    Uncertain,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InventoryStep {
+    pub state: InventoryStepState,
+    pub deadline_unix_ms: Option<u64>,
+    pub reason_code: Option<String>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InventoryCleanup {
+    pub stop_admission: InventoryStep,
+    pub bounded_drain: InventoryStep,
+    pub evidence_capture: InventoryStep,
+    pub stop_maintenance: InventoryStep,
+    pub terminal_capture: InventoryStep,
+    pub handoff: InventoryStep,
+}
+
+fn valid_storage_account(value: &str) -> bool {
+    (3..=24).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+}
+
+fn valid_storage_container(value: &str) -> bool {
+    (3..=63).contains(&value.len())
+        && !value.starts_with('-')
+        && !value.ends_with('-')
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+fn valid_blob_path(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 1_024
+        && !value.starts_with('/')
+        && !value.contains(['?', '#', '@', '\\'])
+        && value
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
+}
+
+impl RunInventory {
+    /// Validate identities before publishing to the fenced external custody store.
+    ///
+    /// # Errors
+    /// Rejects malformed, ambiguous or success-shaped incomplete identities.
+    pub fn validate(&self) -> Result<()> {
+        if self.schema_version != 1 || self.fencing_token == 0 {
+            bail!("invalid custody inventory version or fencing token");
+        }
+        validate_official_measurement_reference(self)?;
+        if let Some(budgets) = self.effective_stop_budgets {
+            budgets.validate()?;
+        }
+        if let Some(duration_ms) = self.planned_cell_duration_ms {
+            let no_row_rehearsal = duration_ms == 0 && self.load_admission == InventoryLoadAdmission::NotAuthorized;
+            if duration_ms > 9_007_199_254_740_991 || (duration_ms == 0 && !no_row_rehearsal) {
+                bail!(
+                    "planned_cell_duration_ms must be a positive JSON-safe integer except for not-authorized no-row rehearsal inventories"
+                );
+            }
+        }
+        for value in [
+            &self.campaign_id,
+            &self.owner_id,
+            &self.orchestration_run_id,
+            &self.cell_run_id,
+            &self.namespace.owner_token,
+        ] {
+            let id = uuid::Uuid::parse_str(value).context("invalid custody inventory UUID")?;
+            if id.is_nil() || id.to_string() != *value {
+                bail!("custody inventory UUID must be nonzero and canonical");
+            }
+        }
+        if self.namespace.owner_token != self.owner_id {
+            bail!("custody namespace owner token must be the immutable producer owner");
+        }
+        let suffix = format!("-{}", self.cell_run_id.replace('-', ""));
+        if !self.namespace.name.ends_with(&suffix)
+            || self.namespace.name.len() <= suffix.len()
+            || self.namespace.name.len() > 63
+            || !self
+                .namespace
+                .name
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        {
+            bail!("custody namespace must contain the exact cell identity");
+        }
+        let valid_uid =
+            |uid: &str| uuid::Uuid::parse_str(uid).is_ok_and(|parsed| !parsed.is_nil() && parsed.to_string() == uid);
+        if self.namespace.uid.as_deref().is_some_and(|uid| !valid_uid(uid)) {
+            bail!("custody namespace UID must be a nonzero canonical UUID");
+        }
+        if let Some(destination) = &self.evidence_destination
+            && (!valid_storage_account(&destination.account)
+                || !valid_storage_container(&destination.container)
+                || !valid_blob_path(&destination.blob_prefix))
+        {
+            bail!("invalid credential-free custody evidence destination");
+        }
+        let mut keys = BTreeSet::new();
+        for resource in &self.resources {
+            if resource.namespace != self.namespace.name
+                || resource.name.is_empty()
+                || resource.name.len() > 253
+                || !resource
+                    .name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'.')
+                || !matches!(
+                    (resource.api_version.as_str(), resource.kind.as_str()),
+                    ("apps/v1", "Deployment" | "StatefulSet" | "DaemonSet")
+                        | ("batch/v1", "Job")
+                        | (
+                            "v1",
+                            "Pod" | "Service" | "ConfigMap" | "ServiceAccount" | "PersistentVolumeClaim" | "Secret",
+                        )
+                )
+                || !keys.insert((&resource.api_version, &resource.kind, &resource.name))
+            {
+                bail!("invalid or duplicate custody Kubernetes resource");
+            }
+            if resource.uid.as_deref().is_some_and(|uid| !valid_uid(uid))
+                || matches!(
+                    resource.state,
+                    InventoryResourceState::Observed | InventoryResourceState::Removed
+                ) && (resource.uid.is_none() || self.namespace.uid.is_none())
+            {
+                bail!("observed or removed custody resource requires exact resource and namespace UIDs");
+            }
+            if resource.state == InventoryResourceState::Absent {
+                let receipt = resource
+                    .absence
+                    .as_ref()
+                    .context("absent resource requires a not-found receipt")?;
+                if resource.uid.is_some()
+                    || receipt.api_version != resource.api_version
+                    || receipt.kind != resource.kind
+                    || receipt.namespace != resource.namespace
+                    || receipt.namespace_uid != self.namespace.uid
+                    || receipt.name != resource.name
+                    || receipt.observed_at_unix_ms == 0
+                {
+                    bail!("absent resource receipt must match its exact identity and observation time");
+                }
+            } else if resource.absence.is_some() {
+                bail!("not-found receipt requires absent resource state");
+            }
+        }
+        if let Some(fic) = &self.fic {
+            if let Some(plan) = &fic.plan {
+                let valid_text = |value: &str, limit: usize| {
+                    !value.is_empty() && value.len() <= limit && !value.bytes().any(|byte| byte.is_ascii_control())
+                };
+                let valid_resource_id =
+                    |value: &str| value.starts_with("/subscriptions/") && !value.contains(['?', '#']);
+                let valid_uuid = |value: &str| {
+                    uuid::Uuid::parse_str(value).is_ok_and(|parsed| !parsed.is_nil() && parsed.to_string() == value)
+                };
+                let valid_service_account = |value: &str| {
+                    (1..=63).contains(&value.len())
+                        && value
+                            .bytes()
+                            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+                        && value.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric)
+                        && value.as_bytes().last().is_some_and(u8::is_ascii_alphanumeric)
+                };
+                if plan.version != 1
+                    || plan.run_id != self.cell_run_id
+                    || plan.namespace != self.namespace.name
+                    || !valid_service_account(&plan.service_account)
+                    || !valid_resource_id(&plan.identity_id)
+                    || !valid_resource_id(&plan.resource_id)
+                    || !valid_resource_id(&plan.aks_id)
+                    || !valid_uuid(&plan.client_id)
+                    || !valid_uuid(&plan.tenant_id)
+                    || !valid_text(&plan.server, 2_048)
+                    || !valid_text(&plan.issuer, 2_048)
+                    || !valid_text(&plan.subject, 512)
+                    || !valid_text(&plan.audience, 2_048)
+                    || !valid_text(&plan.credential_name, 120)
+                    || !plan
+                        .resource_id
+                        .ends_with(&format!("/federatedIdentityCredentials/{}", plan.credential_name))
+                    || plan.subject != format!("system:serviceaccount:{}:{}", plan.namespace, plan.service_account)
+                    || fic.resource_id.as_ref().is_some_and(|value| value != &plan.resource_id)
+                    || fic.name.as_ref().is_some_and(|value| value != &plan.credential_name)
+                {
+                    bail!(
+                        "FIC plan must match the exact cell, namespace, service account and recorded credential identity"
+                    );
+                }
+            }
+            if fic.state == InventoryResourceState::Absent {
+                let receipt = fic
+                    .absence
+                    .as_ref()
+                    .context("absent FIC requires a not-found receipt")?;
+                if fic.resource_id.as_deref() != Some(receipt.resource_id.as_str())
+                    || fic.name.as_deref() != Some(receipt.name.as_str())
+                    || receipt.observed_at_unix_ms == 0
+                {
+                    bail!("FIC absence receipt must match its exact identity and observation time");
+                }
+            } else if fic.absence.is_some() {
+                bail!("FIC not-found receipt requires absent state");
+            }
+            if fic.resource_id.is_some()
+                || matches!(
+                    fic.state,
+                    InventoryResourceState::Observed | InventoryResourceState::Removed
+                )
+            {
+                let name = fic
+                    .name
+                    .as_deref()
+                    .filter(|name| !name.is_empty())
+                    .context("FIC name is unknown")?;
+                let id = fic.resource_id.as_deref().context("FIC resource ID is unknown")?;
+                if !id.starts_with("/subscriptions/")
+                    || !id.ends_with(&format!("/federatedIdentityCredentials/{name}"))
+                    || id.contains(['?', '#'])
+                {
+                    bail!("FIC resource ID does not match the exact credential name");
+                }
+            }
+        }
+        if let Some(qap) = &self.qap {
+            let mut seen = BTreeSet::new();
+            if qap.absence.iter().any(|receipt| {
+                receipt.database != qap.database
+                    || receipt.observed_at_unix_ms == 0
+                    || !qap.bindings.iter().any(|binding| {
+                        binding.external_table == receipt.external_table
+                            && binding.relative_path == receipt.relative_path
+                    })
+                    || !seen.insert((&receipt.external_table, &receipt.relative_path))
+            }) || (qap.state == InventoryResourceState::Absent
+                && (qap.bindings.is_empty() || qap.absence.len() != qap.bindings.len()))
+                || (qap.state == InventoryResourceState::Planned && !qap.absence.is_empty())
+            {
+                bail!("QAP absence requires exact, unique not-found receipts for the planned bindings");
+            }
+            if let Some(reference) = &qap.reference {
+                let valid_nonce = |value: &str| {
+                    (1..=128).contains(&value.len())
+                        && value.bytes().all(|byte| {
+                            byte.is_ascii_lowercase()
+                                || byte.is_ascii_uppercase()
+                                || byte.is_ascii_digit()
+                                || byte == b'-'
+                        })
+                };
+                if reference.schema_version != 1
+                    || reference.run_id != self.cell_run_id
+                    || self.namespace.uid.as_deref() != Some(reference.namespace_uid.as_str())
+                    || reference.namespace_owner_token != self.namespace.owner_token
+                    || !valid_storage_account(&reference.account)
+                    || !valid_storage_container(&reference.container)
+                    || !valid_blob_path(&reference.blob)
+                    || !valid_nonce(&reference.nonce)
+                    || reference.manifest_sha256.len() != 64
+                    || !reference
+                        .manifest_sha256
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                    || !valid_uid(&reference.namespace_uid)
+                {
+                    bail!(
+                        "QAP reference must match the exact run, namespace UID, immutable owner and safe blob identity"
+                    );
+                }
+            }
+            let safe_identifier = |value: &str| {
+                !value.is_empty()
+                    && value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            };
+            let mut binding_keys = BTreeSet::new();
+            if !safe_identifier(&qap.database)
+                || matches!(
+                    qap.state,
+                    InventoryResourceState::Observed | InventoryResourceState::Removed
+                ) && qap.bindings.is_empty()
+                || qap.bindings.iter().any(|binding| {
+                    !safe_identifier(&binding.external_table)
+                        || !binding_keys.insert((&binding.external_table, &binding.relative_path))
+                        || binding.relative_path.is_empty()
+                        || binding.relative_path.contains(['?', '#', '@', '\\', ':'])
+                        || binding.relative_path.starts_with('/')
+                        || binding
+                            .relative_path
+                            .split('/')
+                            .any(|part| part.is_empty() || part == "." || part == "..")
+                })
+            {
+                bail!("invalid custody QAP binding identity");
+            }
+        }
+        for step in [
+            &self.cleanup.stop_admission,
+            &self.cleanup.bounded_drain,
+            &self.cleanup.evidence_capture,
+            &self.cleanup.stop_maintenance,
+            &self.cleanup.terminal_capture,
+            &self.cleanup.handoff,
+        ] {
+            if step.reason_code.as_ref().is_some_and(|reason| {
+                reason.is_empty()
+                    || reason.len() > 64
+                    || !reason
+                        .bytes()
+                        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+            }) {
+                bail!("custody failure reason must be a bounded public reason code");
+            }
+            if matches!(step.state, InventoryStepState::Failed | InventoryStepState::Uncertain)
+                && step.reason_code.is_none()
+            {
+                bail!("failed or uncertain custody step requires a reason");
+            }
+        }
+        if self.cleanup.stop_admission.state == InventoryStepState::Running
+            && self
+                .cleanup
+                .stop_admission
+                .deadline_unix_ms
+                .is_none_or(|deadline| deadline == 0)
+        {
+            bail!("running admission stop requires a bounded deadline");
+        }
+        if self.cleanup.bounded_drain.state == InventoryStepState::Running
+            && self
+                .cleanup
+                .bounded_drain
+                .deadline_unix_ms
+                .is_none_or(|deadline| deadline == 0)
+        {
+            bail!("running drain requires a bounded deadline");
+        }
+        if self.cleanup.stop_maintenance.state == InventoryStepState::Running
+            && self
+                .cleanup
+                .stop_maintenance
+                .deadline_unix_ms
+                .is_none_or(|deadline| deadline == 0)
+        {
+            bail!("running maintenance stop requires a bounded deadline");
+        }
+        if self.cleanup.handoff.state == InventoryStepState::Complete
+            && ([
+                &self.cleanup.stop_admission,
+                &self.cleanup.bounded_drain,
+                &self.cleanup.evidence_capture,
+                &self.cleanup.stop_maintenance,
+                &self.cleanup.terminal_capture,
+            ]
+            .iter()
+            .any(|step| step.state != InventoryStepState::Complete)
+                || self.resources.iter().any(|resource| {
+                    !matches!(
+                        resource.state,
+                        InventoryResourceState::Removed | InventoryResourceState::Absent
+                    )
+                })
+                || self.fic.as_ref().is_some_and(|fic| {
+                    !matches!(
+                        fic.state,
+                        InventoryResourceState::Removed | InventoryResourceState::Absent
+                    )
+                })
+                || self.qap.as_ref().is_some_and(|qap| {
+                    !matches!(
+                        qap.state,
+                        InventoryResourceState::Removed | InventoryResourceState::Absent
+                    )
+                }))
+        {
+            bail!("custody handoff cannot complete with unresolved steps or resources");
+        }
+        Ok(())
+    }
+
+    /// Validate that an active owner never changes or forgets established resource identity.
+    ///
+    /// # Errors
+    /// Rejects ownership, UID and binding changes or incomplete updates.
+    pub fn validate_successor(&self, next: &Self) -> Result<()> {
+        self.validate()?;
+        next.validate()?;
+        if self
+            .official_measurement
+            .as_ref()
+            .is_some_and(|value| next.official_measurement.as_ref() != Some(value))
+        {
+            bail!("original official cell measurement binding is immutable");
+        }
+        if self.campaign_id != next.campaign_id
+            || self.owner_id != next.owner_id
+            || self.fencing_token != next.fencing_token
+            || self.orchestration_run_id != next.orchestration_run_id
+            || self.cell_run_id != next.cell_run_id
+            || !self.load_admission.can_advance_to(next.load_admission)
+            || self.effective_stop_budgets != next.effective_stop_budgets
+            || self.planned_cell_duration_ms != next.planned_cell_duration_ms
+            || self.namespace.name != next.namespace.name
+            || self.namespace.owner_token != next.namespace.owner_token
+            || self
+                .namespace
+                .uid
+                .as_ref()
+                .is_some_and(|uid| next.namespace.uid.as_ref() != Some(uid))
+        {
+            bail!("custody ownership or established namespace UID changed");
+        }
+        for resource in &self.resources {
+            let updated = next
+                .resources
+                .iter()
+                .find(|candidate| {
+                    candidate.api_version == resource.api_version
+                        && candidate.kind == resource.kind
+                        && candidate.name == resource.name
+                })
+                .context("custody update dropped a recorded resource")?;
+            if updated.role != resource.role
+                || resource
+                    .uid
+                    .as_ref()
+                    .is_some_and(|uid| updated.uid.as_ref() != Some(uid))
+                || !resource.state.can_advance_to(updated.state)
+                || resource
+                    .absence
+                    .as_ref()
+                    .is_some_and(|receipt| updated.absence.as_ref() != Some(receipt))
+            {
+                bail!("custody update changed an established resource identity");
+            }
+        }
+        if self
+            .evidence_destination
+            .as_ref()
+            .is_some_and(|value| next.evidence_destination.as_ref() != Some(value))
+        {
+            bail!("custody update changed its evidence destination");
+        }
+        if let Some(old) = &self.fic {
+            let new = next.fic.as_ref().context("custody update dropped the FIC")?;
+            if old.plan.as_ref().is_some_and(|plan| new.plan.as_ref() != Some(plan)) {
+                bail!("custody update changed an established FIC plan");
+            }
+            if old.name.as_ref().is_some_and(|value| new.name.as_ref() != Some(value))
+                || old
+                    .resource_id
+                    .as_ref()
+                    .is_some_and(|value| new.resource_id.as_ref() != Some(value))
+                || !old.state.can_advance_to(new.state)
+                || old
+                    .absence
+                    .as_ref()
+                    .is_some_and(|receipt| new.absence.as_ref() != Some(receipt))
+            {
+                bail!("custody update changed an established FIC identity");
+            }
+        }
+        if let Some(old) = &self.qap {
+            let new = next.qap.as_ref().context("custody update dropped QAP bindings")?;
+            if old.database != new.database
+                || old.bindings.iter().any(|binding| !new.bindings.contains(binding))
+                || !old.state.can_advance_to(new.state)
+                || old.absence.iter().any(|receipt| !new.absence.contains(receipt))
+                || old
+                    .reference
+                    .as_ref()
+                    .is_some_and(|reference| new.reference.as_ref() != Some(reference))
+            {
+                bail!("custody update changed an established QAP identity or reference");
+            }
+        }
+        for (old, new) in [
+            (&self.cleanup.stop_admission, &next.cleanup.stop_admission),
+            (&self.cleanup.bounded_drain, &next.cleanup.bounded_drain),
+            (&self.cleanup.evidence_capture, &next.cleanup.evidence_capture),
+            (&self.cleanup.stop_maintenance, &next.cleanup.stop_maintenance),
+            (&self.cleanup.terminal_capture, &next.cleanup.terminal_capture),
+            (&self.cleanup.handoff, &next.cleanup.handoff),
+        ] {
+            if old.state == InventoryStepState::Complete && new.state != InventoryStepState::Complete {
+                bail!("custody update regressed a completed cleanup receipt");
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_custody_receipt(&self, output: &[u8], ready: bool) -> Result<Option<String>> {
+        let response: Value = serde_json::from_slice(output).context("invalid custody receipt JSON")?;
+        if response["ok"] != true {
+            let code = match response["code"].as_str() {
+                Some("campaign_fenced") => "campaign_fenced",
+                Some("write_outcome_unknown") => "write_outcome_unknown",
+                Some("invalid_or_storage_error") => "invalid_or_storage_error",
+                _ => "invalid_response",
+            };
+            bail!("custody command failed: {code}");
+        }
+        let receipt = response["receipt"].as_object().context("missing custody receipt")?;
+        let status = if ready { "ready" } else { "persisted" };
+        if receipt.get("status").and_then(Value::as_str) != Some(status)
+            || receipt.get("campaign_id").and_then(Value::as_str) != Some(self.campaign_id.as_str())
+            || receipt.get("owner_id").and_then(Value::as_str) != Some(self.owner_id.as_str())
+            || receipt.get("fencing_token").and_then(Value::as_u64) != Some(self.fencing_token)
+            || receipt.get("orchestration_run_id").and_then(Value::as_str) != Some(self.orchestration_run_id.as_str())
+            || receipt.get("cell_run_id").and_then(Value::as_str) != Some(self.cell_run_id.as_str())
+            || receipt.get("namespace_uid") != Some(&json!(self.namespace.uid))
+        {
+            bail!("custody receipt does not match exact campaign, cell, fence and namespace identity");
+        }
+        if ready && self.namespace.uid.is_none() {
+            bail!("custody readiness requires an observed namespace UID");
+        }
+        if !ready
+            && (receipt.get("resource_count").and_then(Value::as_u64) != Some(self.resources.len() as u64)
+                || receipt.get("fic_state") != Some(&json!(self.fic.as_ref().map(|fic| fic.state)))
+                || receipt.get("qap_state") != Some(&json!(self.qap.as_ref().map(|qap| qap.state)))
+                || receipt.get("etag").and_then(Value::as_str).is_none_or(str::is_empty))
+        {
+            bail!("custody persistence receipt is incomplete or does not match inventory");
+        }
+        let etag = if ready {
+            None
+        } else {
+            Some(
+                receipt
+                    .get("etag")
+                    .and_then(Value::as_str)
+                    .context("custody persistence receipt omitted ETag")?
+                    .to_owned(),
+            )
+        };
+        Ok(etag)
+    }
+
+    /// Publish this inventory and require the fenced store's matching persistence receipt.
+    ///
+    /// # Errors
+    /// Refuses unconfirmed writes and mismatched or fenced receipts without retrying.
+    pub(crate) async fn publish_to_custody(&self, config_paths: AksHelperConfigPaths<'_>) -> Result<String> {
+        self.custody_command(false, config_paths)
+            .await?
+            .context("custody publisher did not return an ETag")
+    }
+
+    /// Verify that the fenced store has armed this exact cell before load starts.
+    ///
+    /// # Errors
+    /// Refuses an unready or mismatched receipt.
+    pub(crate) async fn assert_custody_ready(&self, config_paths: AksHelperConfigPaths<'_>) -> Result<()> {
+        self.custody_command(true, config_paths).await.map(|_| ())
+    }
+
+    #[cfg(unix)]
+    async fn custody_command(&self, ready: bool, config_paths: AksHelperConfigPaths<'_>) -> Result<Option<String>> {
+        self.validate()?;
+        let payload = if ready {
+            None
+        } else {
+            let bytes = serde_json::to_vec(self).context("serialize custody inventory")?;
+            if bytes.len() > 1024 * 1024 {
+                bail!("custody inventory exceeds publisher input limit");
+            }
+            Some(bytes)
+        };
+        let action = if ready { "assert-ready" } else { "publish-inventory" };
+        let action_args = if ready {
+            vec![self.owner_id.clone(), self.fencing_token.to_string()]
+        } else {
+            Vec::new()
+        };
+        let mut command = aks_campaign_cli_command(config_paths, action, &action_args)?;
+        if let Some((code, stdout)) = fixture_command_output(&command, payload.as_deref()).await? {
+            if code != 0 {
+                bail!("fixture custody command failed; outcome may be unknown and must not be replayed");
+            }
+            return self.validate_custody_receipt(stdout.as_bytes(), ready);
+        }
+        command
+            .stdin(if ready { Stdio::null() } else { Stdio::piped() })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(Duration::from_secs(60), async {
+            let mut child = command.spawn().context("start fenced custody command")?;
+            let pid = i32::try_from(child.id().context("custody command PID unavailable")?)
+                .context("custody command PID invalid")?;
+            let _group =
+                OwnedQapHelperGroup(rustix::process::Pid::from_raw(pid).context("custody command PID invalid")?);
+            if let Some(payload) = payload {
+                let mut stdin = child.stdin.take().context("custody publisher stdin unavailable")?;
+                stdin.write_all(&payload).await.context("write custody inventory")?;
+                drop(stdin);
+            }
+            child
+                .wait_with_output()
+                .await
+                .context("wait for fenced custody command")
+        })
+        .await
+        .context("custody command timed out; write outcome may be unknown and must not be retried")??;
+        if !output.status.success() {
+            return self.validate_custody_receipt(&output.stdout, ready).and_then(|_| {
+                Err(anyhow::anyhow!(
+                    "custody command exited unsuccessfully despite a success-shaped receipt"
+                ))
+            });
+        }
+        self.validate_custody_receipt(&output.stdout, ready)
+    }
+
+    #[cfg(not(unix))]
+    async fn custody_command(&self, _ready: bool, _config_paths: AksHelperConfigPaths<'_>) -> Result<Option<String>> {
+        bail!("fenced custody requires Unix process-group cancellation")
+    }
+}
 
 #[derive(Clone, Debug)]
 struct OatResult {
@@ -120,15 +1017,18 @@ struct ClientProgress {
 trait Platform: Send + Sync {
     fn kind(&self) -> crate::config::OatMode;
     fn workload_endpoint(&self, config: &OatConfig) -> String;
+    fn delta_root(&self) -> Option<&str> {
+        None
+    }
     fn router_metrics_endpoint(&self, config: &OatConfig) -> Result<String>;
     async fn ensure_router_metrics_endpoint(&mut self, config: &OatConfig) -> Result<(String, bool)> {
         Ok((self.router_metrics_endpoint(config)?, false))
     }
     fn qap_endpoint(&self, config: &OatConfig) -> String;
-    async fn ensure_stack(&mut self, config: &OatConfig) -> Result<()>;
+    async fn ensure_stack(&mut self, config: &OatConfig, orchestration_run_id: &str, replicas: u32) -> Result<()>;
     async fn scale_arrowcols(&mut self, config: &OatConfig, replicas: u32, concurrency: u32) -> Result<()>;
     async fn initialize_run_table_pins(
-        &self,
+        &mut self,
         config: &OatConfig,
         run_id: &str,
         expected_keys_json: &str,
@@ -138,10 +1038,35 @@ trait Platform: Send + Sync {
     fn qap_observation_mode(&self) -> arrowcol_loadgen::ObservationMode;
     fn qap_database(&self, config: &OatConfig) -> Result<String>;
     async fn initialize_qap(&mut self, config: &OatConfig, run_id: &str, tables: &[String]) -> Result<Vec<String>>;
+    async fn prepare_campaign_load_admission(
+        &mut self,
+        _config: &OatConfig,
+        _run_id: &str,
+        _tables: &[String],
+    ) -> Result<()> {
+        Ok(())
+    }
+    async fn finalize_campaign_load_admission(
+        &mut self,
+        _config: &OatConfig,
+        _run_id: &str,
+        _tables: &[String],
+    ) -> Result<()> {
+        Ok(())
+    }
+    async fn publish_official_measurement(
+        &mut self,
+        _config: &OatConfig,
+        _rows: &[OatResult],
+        _submitted: Option<&SubmittedConfigIdentity>,
+        _deadline: tokio::time::Instant,
+    ) -> Result<()> {
+        Ok(())
+    }
     fn mark_qap_outcome_unresolved(&mut self) {}
-    async fn prepare_client_fleet(&self, config: &OatConfig, run_id: &str) -> Result<()>;
+    async fn prepare_client_fleet(&mut self, config: &OatConfig, run_id: &str) -> Result<()>;
     async fn start_client(
-        &self,
+        &mut self,
         config: &OatConfig,
         run_id: &str,
         table: &str,
@@ -155,15 +1080,23 @@ trait Platform: Send + Sync {
             .into_iter()
             .collect()
     }
-    async fn arm_clients(&self, config: &OatConfig, run_id: &str, run_start_unix_ms: u64) -> Result<()>;
+    async fn arm_clients(&mut self, config: &OatConfig, run_id: &str, run_start_unix_ms: u64) -> Result<()>;
     async fn finish_client(&self, config: &OatConfig, handle: ClientHandle) -> Result<String>;
     async fn cancel_client(&self, config: &OatConfig, handle: &ClientHandle) -> Result<()>;
     fn resource_sampler_source(&self) -> Option<ResourceSamplerSource> {
         None
     }
+    async fn native_telemetry_source(
+        &self,
+        _config: &OatConfig,
+        _qap_tables: &[String],
+    ) -> Result<Option<NativeTelemetrySource>> {
+        Ok(None)
+    }
     async fn process_logs(&self, _config: &OatConfig) -> Result<Vec<ProcessLog>> {
         Ok(Vec::new())
     }
+    fn retain_cell_process_baseline(&mut self, _logs: &[ProcessLog]) {}
     async fn process_logs_for_role(&self, config: &OatConfig, role: ComponentRole) -> Result<Vec<ProcessLog>> {
         Ok(self
             .process_logs(config)
@@ -175,17 +1108,27 @@ trait Platform: Send + Sync {
     fn shutdown_drain_evidence(&self) -> Option<Value> {
         None
     }
+    fn resource_evidence(&self) -> Option<Value> {
+        None
+    }
+    async fn finish_resource_measurement(&mut self, _config: &OatConfig) -> Result<()> {
+        Ok(())
+    }
     async fn cleanup(&mut self, config: &OatConfig) -> Result<()>;
 }
 
 struct AksPlatform {
     run_id: String,
+    resource_readback: Vec<Value>,
+    cpu_throttling_start: Option<Vec<CpuThrottleSample>>,
+    cpu_throttling_evidence: Option<Value>,
     namespace_created: bool,
     namespace_create_attempted: bool,
     namespace_owner_token: String,
     namespace_uid: Option<String>,
     runtime_dir: Option<PathBuf>,
     qap_relative_data_root: Option<String>,
+    delta_root: Option<String>,
     router_metrics_url: Option<String>,
     router_tunnel: Option<OwnedKubectlProcess>,
     fic_record_path: Option<PathBuf>,
@@ -193,17 +1136,87 @@ struct AksPlatform {
     fic_prepare_attempted: bool,
     qap_record_path: Option<PathBuf>,
     qap_bind_attempted: bool,
+    qap_cleanup_confirmed: bool,
     qap_outcome_unresolved: bool,
+    run_table_initialization_attempted: bool,
+    run_table_initialization_drained: bool,
     workload_stop_record_path: Option<PathBuf>,
     schedule_configmap_name: String,
     service_account: Option<String>,
     router_yaml: Option<String>,
     shutdown_drain_evidence: Option<Value>,
+    campaign_cli_paths: Option<OwnedAksCampaignConfigPaths>,
 }
 
 struct OwnedKubectlProcess {
     child: Child,
     stderr: JoinHandle<std::io::Result<Vec<u8>>>,
+}
+
+struct PublicationBacklogScraper {
+    endpoint: String,
+    _tunnel: Option<OwnedKubectlProcess>,
+    client: reqwest::Client,
+}
+
+impl PublicationBacklogScraper {
+    async fn start(source: &ResourceSamplerSource, config: &OatConfig) -> Result<Self> {
+        let (endpoint, tunnel) = match source {
+            ResourceSamplerSource::Aks | ResourceSamplerSource::AksNative(_) => {
+                let (endpoint, tunnel) = start_aks_collector_metrics_tunnel(config).await?;
+                (endpoint, Some(tunnel))
+            }
+            ResourceSamplerSource::Local {
+                collector_metrics_url, ..
+            } => (
+                collector_metrics_url
+                    .clone()
+                    .context("local collector metrics endpoint is unavailable")?,
+                None,
+            ),
+        };
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .context("build publication backlog metrics client")?;
+        Ok(Self {
+            endpoint,
+            _tunnel: tunnel,
+            client,
+        })
+    }
+
+    async fn scrape(&self) -> Result<PublicationBacklogMetrics> {
+        parse_publication_backlog_metrics(&self.read_endpoint(&self.endpoint).await?)
+    }
+
+    async fn read_endpoint(&self, endpoint: &str) -> Result<String> {
+        const MAX_METRICS_BYTES: u64 = 1_048_576;
+        let response = self
+            .client
+            .get(endpoint)
+            .send()
+            .await
+            .context("request collector admin metrics")?;
+        if !response.status().is_success() {
+            bail!("collector admin metrics returned HTTP {}", response.status());
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_METRICS_BYTES)
+        {
+            bail!("collector admin metrics exceeded the evidence size limit");
+        }
+        let mut response = response;
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.context("read collector admin metrics")? {
+            if body.len().saturating_add(chunk.len()) > MAX_METRICS_BYTES as usize {
+                bail!("collector admin metrics exceeded the evidence size limit");
+            }
+            body.extend_from_slice(&chunk);
+        }
+        String::from_utf8(body).context("collector admin metrics are not UTF-8")
+    }
 }
 
 struct LocalPlatform {
@@ -213,13 +1226,35 @@ struct LocalPlatform {
     control_dir: PathBuf,
     client_progress: std::sync::Mutex<HashMap<String, ClientProgress>>,
     router_metrics_url: Option<String>,
+    collector_metrics_url: Option<String>,
     qap_url: Option<String>,
     daemon_endpoint: Option<String>,
     shutdown_drain_evidence: Option<Value>,
+    maintenance_cell_baseline: Vec<ProcessLog>,
 }
 
 #[async_trait::async_trait]
 impl Platform for AksPlatform {
+    fn delta_root(&self) -> Option<&str> {
+        self.delta_root.as_deref()
+    }
+
+    fn resource_evidence(&self) -> Option<Value> {
+        Some(json!({
+            "readbacks": self.resource_readback,
+            "cpu_throttling": self.cpu_throttling_evidence,
+        }))
+    }
+
+    async fn finish_resource_measurement(&mut self, config: &OatConfig) -> Result<()> {
+        let end = capture_aks_cpu_throttling(config, &self.resource_readback).await?;
+        self.cpu_throttling_evidence = Some(compare_cpu_throttling(
+            self.cpu_throttling_start.take().as_deref().unwrap_or_default(),
+            &end,
+        ));
+        Ok(())
+    }
+
     fn kind(&self) -> crate::config::OatMode {
         crate::config::OatMode::Aks
     }
@@ -251,10 +1286,10 @@ impl Platform for AksPlatform {
         config.qap_endpoint.clone()
     }
 
-    async fn ensure_stack(&mut self, config: &OatConfig) -> Result<()> {
-        prepare_aks_platform(config, self).await?;
+    async fn ensure_stack(&mut self, config: &OatConfig, orchestration_run_id: &str, replicas: u32) -> Result<()> {
+        prepare_aks_platform(config, self, orchestration_run_id, replicas).await?;
         if let Some(overlay) = config.platform.kustomize_overlay.as_deref() {
-            apply_aks_overlay(config, overlay).await?;
+            apply_aks_overlay(config, overlay, self).await?;
         }
         Ok(())
     }
@@ -264,11 +1299,12 @@ impl Platform for AksPlatform {
         for name in config.deployment_names() {
             rollout(config, name).await?;
         }
+        self.resource_readback = aks_deployment_resource_evidence(config).await?;
         Ok(())
     }
 
     async fn initialize_run_table_pins(
-        &self,
+        &mut self,
         config: &OatConfig,
         run_id: &str,
         expected_keys_json: &str,
@@ -284,7 +1320,22 @@ impl Platform for AksPlatform {
             now_unix_ms,
         )
         .await?;
-        start_aks_maintenance(config).await
+        run_aks_catalog_registration_job(config, self, run_id).await?;
+        start_aks_maintenance(config).await?;
+        if maintenance_enabled(config) {
+            let resources = config.effective_aks_resources();
+            self.resource_readback.push(
+                aks_deployment_resource_readback(
+                    config,
+                    "maintenance",
+                    "delta-maintenance",
+                    "maintenance",
+                    &resources.maintenance,
+                )
+                .await?,
+            );
+        }
+        verify_maintenance_stop_budget_before_admission(config, self).await
     }
 
     fn qap_observation_mode(&self) -> arrowcol_loadgen::ObservationMode {
@@ -300,32 +1351,51 @@ impl Platform for AksPlatform {
     }
 
     async fn initialize_qap(&mut self, config: &OatConfig, run_id: &str, tables: &[String]) -> Result<Vec<String>> {
-        let bindings = qap_bindings(run_id, tables)?;
         let database = self.qap_database(config)?;
-        let bootstrap_env_file = configured_bootstrap_env_file(config)?;
+        let relative_root = self
+            .qap_relative_data_root
+            .as_deref()
+            .context("AKS run-scoped data root is missing")?;
+        let (manifest, inventory_bindings) = campaign_qap_manifest(run_id, &database, relative_root, tables)?;
         let runtime_dir = self
             .runtime_dir
             .as_deref()
             .context("AKS runtime directory is not available")?;
         let manifest_path = runtime_dir.join("oat-qap-manifest.json");
         let record_path = runtime_dir.join("oat-qap-record.json");
-        let manifest = json!({
-            "schema_version": 1,
-            "run_id": run_id,
-            "database": database,
-            "tables": bindings.iter().map(|binding| Ok(json!({
-                "external_table": binding.external_table,
-                "relative_path": aks_qap_relative_path(
-                    self.qap_relative_data_root.as_deref().context("AKS run-scoped data root is missing")?,
-                    &binding.logical_table,
-                )?,
-            }))).collect::<Result<Vec<_>>>()?,
-        });
-        tokio::fs::write(&manifest_path, serde_json::to_vec(&manifest)?)
-            .await
-            .with_context(|| format!("write run-owned AKS QAP manifest {}", manifest_path.display()))?;
+        if config.campaign_profile == Some(crate::config::CampaignProfile::SingleHotTable) {
+            let saved_manifest: Value = serde_json::from_slice(
+                &tokio::fs::read(&manifest_path)
+                    .await
+                    .context("read pre-admission QAP manifest")?,
+            )
+            .context("parse pre-admission QAP manifest")?;
+            if saved_manifest != manifest {
+                bail!("QAP manifest changed after its exact planned bindings were persisted");
+            }
+            let inventory = campaign_inventory_for_setup(self).await?;
+            let qap = inventory
+                .qap
+                .as_ref()
+                .context("campaign QAP bindings were not planned before admission")?;
+            if qap.database != database
+                || qap.bindings != inventory_bindings
+                || qap.state != InventoryResourceState::Planned
+                || qap.reference.is_some()
+            {
+                bail!("campaign inventory does not contain the exact planned QAP manifest");
+            }
+            let mut uncertain = qap.clone();
+            uncertain.state = InventoryResourceState::Uncertain;
+            update_campaign_qap_inventory(self, uncertain).await?;
+        } else {
+            tokio::fs::write(&manifest_path, serde_json::to_vec(&manifest)?)
+                .await
+                .with_context(|| format!("write run-owned AKS QAP manifest {}", manifest_path.display()))?;
+        }
         self.qap_record_path = Some(record_path.clone());
         self.qap_bind_attempted = true;
+        let bootstrap_env_file = configured_bootstrap_env_file(config)?;
         let workload_record = self
             .fic_ready_snapshot_path
             .as_deref()
@@ -353,15 +1423,224 @@ impl Platform for AksPlatform {
         )
         .await
         .context("verify run-owned AKS QAP bindings")?;
-        Ok(bindings.iter().map(|binding| binding.external_table.clone()).collect())
+        if config.campaign_profile == Some(crate::config::CampaignProfile::SingleHotTable) {
+            let reference = run_oat_qap_reference(&record_path, bootstrap_env_file).await?;
+            let mut observed = campaign_inventory_for_setup(self)
+                .await?
+                .qap
+                .context("campaign QAP bindings disappeared after verification")?;
+            observed.state = InventoryResourceState::Observed;
+            observed.reference = Some(reference);
+            update_campaign_qap_inventory(self, observed).await?;
+        }
+        Ok(inventory_bindings
+            .into_iter()
+            .map(|binding| binding.external_table)
+            .collect())
+    }
+
+    async fn prepare_campaign_load_admission(
+        &mut self,
+        config: &OatConfig,
+        run_id: &str,
+        tables: &[String],
+    ) -> Result<()> {
+        if config.campaign_profile == Some(crate::config::CampaignProfile::ScaleOutSingleTable) {
+            return verify_maintenance_stop_budget_before_admission(config, self).await;
+        }
+        if config.campaign_profile != Some(crate::config::CampaignProfile::SingleHotTable) {
+            return Ok(());
+        }
+        let [hot_table] = tables else {
+            bail!("campaign load admission requires exactly one frozen hot table");
+        };
+        let database = self.qap_database(config)?;
+        let relative_root = self
+            .qap_relative_data_root
+            .as_deref()
+            .context("AKS run-scoped data root is missing")?;
+        let (manifest, bindings) = campaign_qap_manifest(run_id, &database, relative_root, tables)?;
+        let hot_path = aks_qap_relative_path(relative_root, hot_table)?;
+        let matching_bindings = bindings
+            .iter()
+            .filter(|binding| binding.relative_path == hot_path)
+            .count();
+        if matching_bindings != 1 {
+            bail!("campaign hot Delta path must match exactly one persisted QAP binding");
+        }
+        let runtime_dir = self
+            .runtime_dir
+            .as_deref()
+            .context("campaign runtime directory is not available")?;
+        let manifest_path = runtime_dir.join("oat-qap-manifest.json");
+        tokio::fs::write(&manifest_path, serde_json::to_vec(&manifest)?)
+            .await
+            .with_context(|| format!("write pre-admission AKS QAP manifest {}", manifest_path.display()))?;
+        let mut inventory = campaign_inventory_for_setup(self).await?;
+        if inventory.load_admission != InventoryLoadAdmission::NotAuthorized
+            || inventory.namespace.uid.is_none()
+            || inventory.qap.is_some()
+        {
+            bail!("campaign load admission is not in its initial pre-provisioned state");
+        }
+        update_campaign_qap_inventory(
+            self,
+            InventoryQap {
+                database,
+                bindings: bindings.clone(),
+                state: InventoryResourceState::Planned,
+                absence: Vec::new(),
+                reference: None,
+            },
+        )
+        .await?;
+        inventory = campaign_inventory_for_setup(self).await?;
+        if inventory.load_admission != InventoryLoadAdmission::NotAuthorized {
+            bail!("campaign baseline can only be captured before load authorization");
+        }
+        let expected_etag = tokio::fs::read_to_string(runtime_dir.join("campaign-inventory-etag"))
+            .await
+            .context("read current campaign inventory ETag before baseline capture")?;
+        validate_campaign_etag(expected_etag.trim())?;
+        let identity = CampaignIdentity::from_lookup(|name| std::env::var(name).ok())?;
+        let actor = CampaignCleanupActor {
+            mode: CampaignActorMode::Producer,
+            owner_id: identity.owner_id.clone(),
+            fencing_token: identity.fencing_token,
+        };
+        let request = CampaignCellBaselineRequest {
+            schema_version: 1,
+            campaign_id: &identity.campaign_id,
+            orchestration_run_id: &inventory.orchestration_run_id,
+            cell_run_id: run_id,
+            expected_etag: expected_etag.trim(),
+            hot_delta_relative_path: &hot_path,
+            actor: &actor,
+        };
+        let output =
+            run_campaign_custody_json(self, "capture-cell-baseline", None, &request, Duration::from_secs(90)).await?;
+        let response: CampaignCellBaselineResponse =
+            serde_json::from_slice(&output).context("parse immutable cell baseline receipt")?;
+        if !response.ok {
+            let code = response
+                .code
+                .as_deref()
+                .filter(|code| {
+                    matches!(
+                        *code,
+                        "campaign_fenced" | "stale_version" | "write_outcome_unknown" | "invalid_or_storage_error"
+                    )
+                })
+                .context("cell baseline failure returned no recognized error code")?;
+            if response.message.is_none() {
+                bail!("cell baseline failure omitted its required diagnostic message");
+            }
+            bail!("cell baseline capture failed: {code}");
+        }
+        if response.code.is_some() || response.message.is_some() {
+            bail!("successful cell baseline response included error fields");
+        }
+        let receipt = response.receipt.context("cell baseline capture returned no receipt")?;
+        validate_campaign_cell_baseline(&receipt, &inventory, &identity, run_id, &hot_path)?;
+        tokio::fs::write(
+            runtime_dir.join("campaign-cell-baseline.json"),
+            serde_json::to_vec(&receipt)?,
+        )
+        .await
+        .context("persist immutable cell baseline receipt")?;
+
+        let mut pending = inventory.clone();
+        pending.load_admission = InventoryLoadAdmission::AuthorizationPending;
+        inventory.validate_successor(&pending)?;
+        persist_campaign_inventory(self, &pending).await?;
+        let (confirmed, etag) = read_authoritative_campaign_inventory(
+            self,
+            &identity,
+            &inventory.orchestration_run_id,
+            Duration::from_secs(60),
+        )
+        .await?;
+        if confirmed.load_admission != InventoryLoadAdmission::AuthorizationPending
+            || confirmed
+                .qap
+                .as_ref()
+                .is_none_or(|qap| qap.state != InventoryResourceState::Planned || qap.bindings != bindings)
+        {
+            bail!("authoritative campaign inventory did not confirm the pending load authorization");
+        }
+        pending.validate_successor(&confirmed)?;
+        persist_campaign_inventory_snapshot(self, &confirmed, &etag).await?;
+        Ok(())
+    }
+
+    async fn finalize_campaign_load_admission(
+        &mut self,
+        config: &OatConfig,
+        run_id: &str,
+        tables: &[String],
+    ) -> Result<()> {
+        if config.campaign_profile != Some(crate::config::CampaignProfile::SingleHotTable) {
+            return Ok(());
+        }
+        let [_hot_table] = tables else {
+            bail!("campaign load admission requires exactly one frozen hot table");
+        };
+        let database = self.qap_database(config)?;
+        let relative_root = self
+            .qap_relative_data_root
+            .as_deref()
+            .context("AKS run-scoped data root is missing")?;
+        let (_, expected_bindings) = campaign_qap_manifest(run_id, &database, relative_root, tables)?;
+        let identity = CampaignIdentity::from_lookup(|name| std::env::var(name).ok())?;
+        let cached = campaign_inventory_for_setup(self).await?;
+        let orchestration_run_id = cached.orchestration_run_id.clone();
+        let (pending, _) =
+            read_authoritative_campaign_inventory(self, &identity, &orchestration_run_id, Duration::from_secs(60))
+                .await?;
+        validate_campaign_inventory_load_admission(
+            &pending,
+            InventoryLoadAdmission::AuthorizationPending,
+            &database,
+            &expected_bindings,
+        )?;
+        let mut authorized = pending.clone();
+        authorized.load_admission = InventoryLoadAdmission::Authorized;
+        pending.validate_successor(&authorized)?;
+        persist_campaign_inventory(self, &authorized).await?;
+        let (final_inventory, final_etag) =
+            read_authoritative_campaign_inventory(self, &identity, &orchestration_run_id, Duration::from_secs(60))
+                .await?;
+        if final_inventory.load_admission != InventoryLoadAdmission::Authorized {
+            bail!("authoritative campaign inventory did not positively confirm load authorization");
+        }
+        validate_campaign_inventory_load_admission(
+            &final_inventory,
+            InventoryLoadAdmission::Authorized,
+            &database,
+            &expected_bindings,
+        )?;
+        authorized.validate_successor(&final_inventory)?;
+        persist_campaign_inventory_snapshot(self, &final_inventory, &final_etag).await?;
+        final_inventory.assert_custody_ready(self.campaign_cli_paths()?).await?;
+        Ok(())
+    }
+
+    async fn publish_official_measurement(
+        &mut self,
+        config: &OatConfig,
+        rows: &[OatResult],
+        submitted: Option<&SubmittedConfigIdentity>,
+        deadline: tokio::time::Instant,
+    ) -> Result<()> {
+        publish_campaign_official_measurement(self, config, rows, submitted, deadline).await
     }
 
     fn mark_qap_outcome_unresolved(&mut self) {
         self.qap_outcome_unresolved = true;
     }
 
-    async fn prepare_client_fleet(&self, config: &OatConfig, _run_id: &str) -> Result<()> {
-        let payload = serde_json::to_vec(&json!({
+    async fn prepare_client_fleet(&mut self, config: &OatConfig, _run_id: &str) -> Result<()> {
+        let mut configmap = json!({
             "apiVersion": "v1",
             "kind": "ConfigMap",
             "metadata": {
@@ -376,15 +1655,17 @@ impl Platform for AksPlatform {
                 },
             },
             "data": { "schedule": "pending" },
-        }))?;
+        });
+        prepare_run_owned_resources(config, self, std::slice::from_mut(&mut configmap)).await?;
+        let payload = serde_json::to_vec(&configmap)?;
         kubectl(config, vec!["create", "-f", "-"], Some(payload))
             .await
-            .context("create unique AKS client schedule ConfigMap")
-            .map(|_| ())
+            .context("create unique AKS client schedule ConfigMap")?;
+        record_applied_resource_uids(config, self, std::slice::from_ref(&configmap)).await
     }
 
     async fn start_client(
-        &self,
+        &mut self,
         config: &OatConfig,
         run_id: &str,
         table: &str,
@@ -402,8 +1683,9 @@ impl Platform for AksPlatform {
         poll_aks_client_fleet(config, self, handles).await
     }
 
-    async fn arm_clients(&self, config: &OatConfig, _run_id: &str, run_start_unix_ms: u64) -> Result<()> {
-        let payload = serde_json::to_vec(&json!({
+    async fn arm_clients(&mut self, config: &OatConfig, _run_id: &str, run_start_unix_ms: u64) -> Result<()> {
+        self.cpu_throttling_start = Some(capture_aks_cpu_throttling(config, &self.resource_readback).await?);
+        let mut configmap = json!({
             "apiVersion": "v1",
             "kind": "ConfigMap",
             "metadata": {
@@ -418,15 +1700,17 @@ impl Platform for AksPlatform {
                 },
             },
             "data": { "schedule": run_start_unix_ms.to_string() },
-        }))?;
+        });
+        prepare_run_owned_resources(config, self, std::slice::from_mut(&mut configmap)).await?;
+        let payload = serde_json::to_vec(&configmap)?;
         kubectl(
             config,
             vec!["apply", "--namespace", &config.namespace, "-f", "-"],
             Some(payload),
         )
         .await
-        .context("arm the common AKS client measurement schedule")
-        .map(|_| ())
+        .context("arm the common AKS client measurement schedule")?;
+        record_applied_resource_uids(config, self, std::slice::from_ref(&configmap)).await
     }
 
     async fn finish_client(&self, config: &OatConfig, handle: ClientHandle) -> Result<String> {
@@ -439,6 +1723,71 @@ impl Platform for AksPlatform {
 
     fn resource_sampler_source(&self) -> Option<ResourceSamplerSource> {
         Some(ResourceSamplerSource::Aks)
+    }
+
+    async fn native_telemetry_source(
+        &self,
+        config: &OatConfig,
+        qap_tables: &[String],
+    ) -> Result<Option<NativeTelemetrySource>> {
+        if self.campaign_cli_paths.is_none() {
+            return Ok(None);
+        }
+        anyhow::ensure!(
+            FIXTURE_BOUNDARY.try_with(|_| ()).is_err(),
+            "fixture boundary has no authenticated native telemetry transport"
+        );
+        let inventory = campaign_inventory_for_setup(self).await?;
+        let plan = inventory
+            .fic
+            .as_ref()
+            .and_then(|fic| fic.plan.as_ref())
+            .context("native telemetry has no exact API-server binding")?;
+        let database = self.qap_database(config)?;
+        let qap = inventory
+            .qap
+            .as_ref()
+            .context("native telemetry has no admitted QAP table bindings")?;
+        let expected = qap
+            .bindings
+            .iter()
+            .map(|binding| binding.external_table.clone())
+            .collect::<BTreeSet<_>>();
+        anyhow::ensure!(
+            inventory.load_admission == InventoryLoadAdmission::Authorized
+                && inventory.namespace.name == config.namespace
+                && qap.database == database
+                && expected == qap_tables.iter().cloned().collect()
+                && expected.len() == qap_tables.len()
+                && !expected.is_empty(),
+            "native telemetry differs from the admitted original cell and QAP tables"
+        );
+        let targets = aks_resource_pod_targets(&self.resource_readback)?;
+        anyhow::ensure!(
+            !targets.is_empty() && targets.len() <= 64,
+            "native telemetry pod identity set is unavailable or oversized"
+        );
+        Ok(Some(NativeTelemetrySource {
+            server: plan.server.clone(),
+            context: config.kubectl_context.clone(),
+            targets,
+            qap_endpoint: self.qap_endpoint(config),
+            qap_database: database,
+            qap_tables: qap_tables.to_vec(),
+            results: self
+                .runtime_dir
+                .as_ref()
+                .context("native telemetry runtime directory unavailable")?
+                .join("measurement-qap"),
+            binding: json!({
+                "campaign_id": inventory.campaign_id, "owner_id": inventory.owner_id,
+                "fencing_token": inventory.fencing_token, "cell_run_id": inventory.cell_run_id,
+                "namespace_uid": inventory.namespace.uid, "namespace": inventory.namespace.name,
+                "server": plan.server, "kube_context": config.kubectl_context,
+                "qap_database": qap.database, "qap_bindings": qap.bindings,
+                "qap_reference": qap.reference, "qap_endpoint": self.qap_endpoint(config),
+            }),
+        }))
     }
 
     async fn cleanup(&mut self, config: &OatConfig) -> Result<()> {
@@ -457,6 +1806,14 @@ impl Platform for AksPlatform {
 
 #[async_trait::async_trait]
 impl Platform for LocalPlatform {
+    fn retain_cell_process_baseline(&mut self, logs: &[ProcessLog]) {
+        self.maintenance_cell_baseline = logs
+            .iter()
+            .filter(|log| log.role == ComponentRole::Maintenance)
+            .cloned()
+            .collect();
+    }
+
     fn kind(&self) -> crate::config::OatMode {
         crate::config::OatMode::Local
     }
@@ -483,23 +1840,19 @@ impl Platform for LocalPlatform {
         self.qap_url.clone().unwrap_or_else(|| config.qap_endpoint.clone())
     }
 
-    async fn ensure_stack(&mut self, config: &OatConfig) -> Result<()> {
+    async fn ensure_stack(&mut self, config: &OatConfig, _orchestration_run_id: &str, _replicas: u32) -> Result<()> {
         self.daemon_endpoint = Some(local_docker_daemon().await?);
         prepare_local_platform(config, self).await?;
-        self.router_metrics_url = Some(local_compose_endpoint(config, self, "router", "50050", "/metrics").await?);
-        match local_compose_endpoint(config, self, "kusto", "8080", "").await {
-            Ok(endpoint) => self.qap_url = Some(endpoint),
-            Err(_) => tracing::warn!("local downstream unavailable; collector-only measurement remains enabled"),
-        }
-        Ok(())
+        self.refresh_endpoints(config).await
     }
 
     async fn scale_arrowcols(&mut self, config: &OatConfig, replicas: u32, concurrency: u32) -> Result<()> {
-        scale_local_arrowcols(config, self, replicas, concurrency).await
+        scale_local_arrowcols(config, self, replicas, concurrency).await?;
+        self.refresh_endpoints(config).await
     }
 
     async fn initialize_run_table_pins(
-        &self,
+        &mut self,
         config: &OatConfig,
         run_id: &str,
         expected_keys_json: &str,
@@ -516,6 +1869,16 @@ impl Platform for LocalPlatform {
         )
         .await?;
         start_local_maintenance(config, self).await
+    }
+
+    async fn prepare_campaign_load_admission(
+        &mut self,
+        config: &OatConfig,
+        _run_id: &str,
+        tables: &[String],
+    ) -> Result<()> {
+        verify_maintenance_stop_budget_before_admission(config, self).await?;
+        verify_local_partition_policy_before_admission(config, self, tables).await
     }
 
     fn qap_observation_mode(&self) -> arrowcol_loadgen::ObservationMode {
@@ -554,14 +1917,14 @@ impl Platform for LocalPlatform {
         Ok(bindings.iter().map(|binding| binding.external_table.clone()).collect())
     }
 
-    async fn prepare_client_fleet(&self, _config: &OatConfig, _run_id: &str) -> Result<()> {
+    async fn prepare_client_fleet(&mut self, _config: &OatConfig, _run_id: &str) -> Result<()> {
         tokio::fs::write(self.control_dir.join("schedule"), "pending\n")
             .await
             .context("reset local OAT client schedule barrier")
     }
 
     async fn start_client(
-        &self,
+        &mut self,
         config: &OatConfig,
         run_id: &str,
         table: &str,
@@ -579,7 +1942,7 @@ impl Platform for LocalPlatform {
         poll_local_client_fleet(handles, &self.client_progress).await
     }
 
-    async fn arm_clients(&self, _config: &OatConfig, _run_id: &str, run_start_unix_ms: u64) -> Result<()> {
+    async fn arm_clients(&mut self, _config: &OatConfig, _run_id: &str, run_start_unix_ms: u64) -> Result<()> {
         let temporary = self.control_dir.join("schedule.tmp");
         tokio::fs::write(&temporary, format!("{run_start_unix_ms}\n"))
             .await
@@ -601,6 +1964,7 @@ impl Platform for LocalPlatform {
         Some(ResourceSamplerSource::Local {
             run_id: self.run_id.clone(),
             environment: self.environment.clone(),
+            collector_metrics_url: self.collector_metrics_url.clone(),
         })
     }
 
@@ -623,6 +1987,26 @@ impl Platform for LocalPlatform {
 }
 
 impl LocalPlatform {
+    async fn refresh_endpoints(&mut self, config: &OatConfig) -> Result<()> {
+        self.router_metrics_url = None;
+        self.collector_metrics_url = None;
+        self.qap_url = None;
+        self.router_metrics_url = Some(local_compose_endpoint(config, self, "router", "50050", "/metrics").await?);
+        match local_compose_endpoint(config, self, "dataflow-1", "32011", "/metrics").await {
+            Ok(endpoint) => self.collector_metrics_url = Some(endpoint),
+            Err(error) => {
+                tracing::warn!(%error, "local collector metrics endpoint unavailable; publication backlog evidence remains unknown");
+            }
+        }
+        match local_compose_endpoint(config, self, "kusto", "8080", "").await {
+            Ok(endpoint) => self.qap_url = Some(endpoint),
+            Err(error) => {
+                tracing::warn!(%error, "local downstream unavailable; collector-only measurement remains enabled")
+            }
+        }
+        Ok(())
+    }
+
     fn new(config: &OatConfig, run_id: &str) -> Result<Self> {
         let state_root = config
             .platform
@@ -666,9 +2050,11 @@ impl LocalPlatform {
             control_dir,
             client_progress: std::sync::Mutex::new(HashMap::new()),
             router_metrics_url: None,
+            collector_metrics_url: None,
             qap_url: None,
             daemon_endpoint: None,
             shutdown_drain_evidence: None,
+            maintenance_cell_baseline: Vec::new(),
         })
     }
 
@@ -1079,9 +2465,39 @@ fn write_private_secret(path: &Path, contents: &str) -> Result<()> {
     }
 }
 
+fn resolved_fleet_client_config(config: &OatConfig, index: usize) -> Result<OatConfig> {
+    let mut resolved = config.clone();
+    if let Some(fleet) = &config.platform.fleet {
+        let client = fleet.clients.get(index).context("fleet client placement is missing")?;
+        resolved.rows_per_table = client.rows_per_table;
+        resolved.dmv_concurrency = client.dmv_concurrency;
+        resolved.tunables.client = Some(client.tunables.clone());
+        resolved.platform.resources.get_or_insert_with(Default::default).client =
+            Some(client.placement.resources.clone());
+    }
+    Ok(resolved)
+}
+
+fn configure_fleet_client_placement(job: &mut Value, config: &OatConfig, index: usize) -> Result<()> {
+    if let Some(fleet) = &config.platform.fleet {
+        let client = fleet.clients.get(index).context("fleet client placement is missing")?;
+        job["spec"]["template"]["spec"]["nodeSelector"] = json!({
+            "arrow-collector/role": "client",
+            "kubernetes.azure.com/agentpool": client.placement.pool,
+            "kubernetes.io/hostname": client.placement.node,
+            "kubernetes.io/arch": "amd64",
+        });
+        job["spec"]["template"]["spec"]
+            .as_object_mut()
+            .context("client pod spec is missing")?
+            .remove("topologySpreadConstraints");
+    }
+    Ok(())
+}
+
 async fn start_aks_client_job(
     config: &OatConfig,
-    platform: &AksPlatform,
+    platform: &mut AksPlatform,
     run_id: &str,
     table: &str,
     client_index: usize,
@@ -1107,11 +2523,19 @@ async fn start_aks_client_job(
         args,
         run_seconds,
     });
+    configure_fleet_client_placement(
+        &mut job,
+        config,
+        client_index.checked_sub(1).context("client index must be positive")?,
+    )?;
+    let client_resources = config.effective_aks_resources().client;
+    configure_client_job_resources(&mut job, &client_resources)?;
     inject_container_environment(
         job.pointer_mut("/spec/template/spec/containers/0")
             .context("AKS client container is missing")?,
         &role_environment(config, ComponentRole::Client)?,
     )?;
+    prepare_run_owned_resources(config, platform, std::slice::from_mut(&mut job)).await?;
     let payload = serde_json::to_vec(&job)?;
     kubectl(
         config,
@@ -1120,6 +2544,38 @@ async fn start_aks_client_job(
     )
     .await
     .with_context(|| format!("create AKS DMV client Job {job_name}"))?;
+    record_applied_resource_uids(config, platform, std::slice::from_ref(&job)).await?;
+    let applied_job_json = kubectl(
+        config,
+        vec!["get", "job", &job_name, "--namespace", &config.namespace, "-o", "json"],
+        None,
+    )
+    .await
+    .context("read applied AKS client Job resource spec")?;
+    let applied_job: Value = serde_json::from_str(&applied_job_json).context("parse applied AKS client Job")?;
+    let job_containers = applied_job
+        .pointer("/spec/template/spec/containers")
+        .and_then(Value::as_array)
+        .context("applied AKS client Job has no containers")?;
+    let job_resources = verify_container_resources(job_containers, "client", "client", &client_resources)?;
+    let pod = wait_for_aks_client_pod_resource_readback(config, &job_name, &client_resources).await?;
+    if let Some(fleet) = &config.platform.fleet {
+        let client = fleet
+            .clients
+            .get(client_index - 1)
+            .context("fleet client placement is missing")?;
+        if pod["node"].as_str() != Some(client.placement.node.as_str()) {
+            bail!("fleet client was scheduled on a node other than its resolved placement");
+        }
+    }
+    platform.resource_readback.push(json!({
+        "role": "client",
+        "job": job_name,
+        "requested": client_resources,
+        "effective": {"job_template": job_resources["effective"], "pod": pod["resources"]},
+        "scheduled_pod": {"name": pod["name"], "uid": pod["uid"], "node": pod["node"],
+            "container": "client", "container_id": pod["container_id"]},
+    }));
     Ok(ClientHandle {
         client_id: format!("{run_id}:{table}:{client_index}"),
         table: table.to_owned(),
@@ -1172,7 +2628,7 @@ fn build_aks_client_job(spec: AksClientJobSpec<'_>) -> Value {
                     "restartPolicy": "Never",
                     "terminationGracePeriodSeconds": 10,
                     "automountServiceAccountToken": false,
-                    "nodeSelector": { "arrow-collector/role": "client" },
+                    "nodeSelector": { "arrow-collector/role": "client", "kubernetes.io/arch": "amd64" },
                     "tolerations": [{
                         "key": "arrow-collector/role",
                         "operator": "Equal",
@@ -1239,6 +2695,67 @@ fn build_aks_client_job(spec: AksClientJobSpec<'_>) -> Value {
     })
 }
 
+async fn wait_for_aks_client_pod_resource_readback(
+    config: &OatConfig,
+    job_name: &str,
+    expected: &ResourceRequirements,
+) -> Result<Value> {
+    tokio::time::timeout(Duration::from_secs(config.client_ready_timeout_seconds), async {
+        loop {
+            let pod_json = kubectl(
+                config,
+                vec![
+                    "get",
+                    "pods",
+                    "--namespace",
+                    &config.namespace,
+                    "--selector",
+                    &format!("job-name={job_name}"),
+                    "-o",
+                    "json",
+                ],
+                None,
+            )
+            .await
+            .context("read AKS client pod placement and resource spec")?;
+            let pod_list: Value = serde_json::from_str(&pod_json).context("parse AKS client pod list")?;
+            let pods = pod_list
+                .get("items")
+                .and_then(Value::as_array)
+                .context("AKS client pod list omitted items")?;
+            for pod in pods {
+                let phase = pod.pointer("/status/phase").and_then(Value::as_str);
+                if phase == Some("Failed") {
+                    bail!("AKS client Job pod failed before load authorization");
+                }
+                let Some(node) = pod
+                    .pointer("/spec/nodeName")
+                    .and_then(Value::as_str)
+                    .filter(|node| !node.is_empty())
+                else {
+                    continue;
+                };
+                let metadata = pod.get("metadata").context("AKS client pod metadata is missing")?;
+                let containers = pod
+                    .pointer("/spec/containers")
+                    .and_then(Value::as_array)
+                    .context("AKS client pod has no containers")?;
+                let resources = verify_container_resources(containers, "client", "client", expected)?;
+                return Ok(json!({
+                    "name": metadata.get("name"),
+                    "uid": metadata.get("uid"),
+                    "node": node,
+                    "container_id": native_container_id(pod, "client"),
+                    "resources": resources["effective"],
+                }));
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    })
+    .await
+    .context("AKS client pod did not schedule before the configured readiness deadline")?
+}
+
 async fn poll_aks_client_job(config: &OatConfig, handle: &ClientHandle) -> Result<ClientProgress> {
     let ClientProcess::Aks { job_name } = &handle.process else {
         bail!("AKS client poll received a non-AKS process handle");
@@ -1285,6 +2802,15 @@ async fn poll_aks_client_job(config: &OatConfig, handle: &ClientHandle) -> Resul
         failure,
         output,
     })
+}
+
+// Published clients emit large prepared metrics before READY, then ACK as their
+// last pre-start line. Selecting one line keeps byte limits from hiding either.
+const AKS_CLIENT_HANDSHAKE_TAIL: &str = "--tail=1";
+
+fn aks_client_handshake_progress(output: &str) -> (bool, bool) {
+    let acknowledged = output.contains("OAT_SCHEDULE_RECEIVED ");
+    (acknowledged || output.contains("OAT_CLIENT_READY "), acknowledged)
 }
 
 async fn poll_aks_client_fleet(
@@ -1348,8 +2874,10 @@ async fn poll_aks_client_fleet(
             &selector,
             "--all-containers=true",
             "--prefix=true",
-            "--tail=-1",
+            AKS_CLIENT_HANDSHAKE_TAIL,
+            "--limit-bytes=16384",
             "--ignore-errors=true",
+            "--max-log-requests=16",
         ],
         None,
     )
@@ -1367,20 +2895,93 @@ async fn poll_aks_client_fleet(
             bail!("AKS client fleet poll received a non-AKS process handle");
         };
         let (completed, failed) = states.get(job_name).copied().unwrap_or_default();
-        let output = logs
-            .lines()
-            .filter(|line| line.contains(job_name))
+        let output = aks_client_job_log_payloads(&logs, job_name)
             .collect::<Vec<_>>()
             .join("\n");
+        let (ready, schedule_received) = aks_client_handshake_progress(&output);
         progress.push(ClientProgress {
-            ready: output.contains("OAT_CLIENT_READY "),
-            schedule_received: output.contains("OAT_SCHEDULE_RECEIVED "),
+            ready,
+            schedule_received,
             completed,
             failure: failed.then(|| format!("AKS DMV client Job {job_name} failed: {output}")),
             output,
         });
     }
     Ok(progress)
+}
+
+fn aks_client_job_log_payloads<'a>(logs: &'a str, job_name: &str) -> impl Iterator<Item = &'a str> {
+    let prefix = format!("[pod/{job_name}-");
+    logs.lines().filter_map(move |line| {
+        let (suffix, payload) = line.strip_prefix(&prefix)?.split_once("/client] ")?;
+        (!suffix.is_empty()
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit()))
+        .then_some(payload)
+    })
+}
+
+#[cfg(test)]
+#[test]
+fn aks_fleet_log_prefix_never_credits_another_client_with_readiness_or_schedule() {
+    let logs = concat!(
+        "[pod/oat-run-hot-c10-b4321/client] OAT_CLIENT_READY 10\n",
+        "[pod/oat-run-hot-c10-b4321/client] OAT_SCHEDULE_RECEIVED 10\n",
+        "[pod/foreign-abcde/client] oat-run-hot-c1 OAT_CLIENT_READY foreign\n",
+        "[pod/oat-run-hot-c1-a1234/client] waiting for schedule\n",
+    );
+    assert_eq!(
+        aks_client_job_log_payloads(logs, "oat-run-hot-c1").collect::<Vec<_>>(),
+        ["waiting for schedule"]
+    );
+    assert_eq!(
+        aks_client_job_log_payloads(logs, "oat-run-hot-c10").collect::<Vec<_>>(),
+        ["OAT_CLIENT_READY 10", "OAT_SCHEDULE_RECEIVED 10"]
+    );
+    let logs = (1..=128)
+        .map(|index| format!("[pod/oat-run-hot-c{index}-abc12/client] OAT_CLIENT_READY {index}\n"))
+        .collect::<String>();
+    for index in 1..=128 {
+        assert_eq!(
+            aks_client_job_log_payloads(&logs, &format!("oat-run-hot-c{index}")).collect::<Vec<_>>(),
+            [format!("OAT_CLIENT_READY {index}")]
+        );
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn aks_fleet_handshake_survives_large_prepared_receipts() -> Result<()> {
+    let tail: usize = AKS_CLIENT_HANDSHAKE_TAIL.trim_start_matches("--tail=").parse()?;
+    let prepared = format!(
+        "[pod/oat-run-hot-c10-abc12/client] OAT_CLIENT_METRICS {}\n",
+        "x".repeat(128 * 1024)
+    );
+    let ready = "[pod/oat-run-hot-c10-abc12/client] OAT_CLIENT_READY client_id=10\n";
+    let ack = "[pod/oat-run-hot-c10-abc12/client] OAT_SCHEDULE_RECEIVED client_id=10\n";
+    for (stream, expected) in [
+        (prepared.clone(), (false, false)),
+        (format!("{prepared}{ready}"), (true, false)),
+        (format!("{prepared}{ready}{ack}"), (true, true)),
+    ] {
+        let lines = stream.lines().collect::<Vec<_>>();
+        let selected = lines[lines.len().saturating_sub(tail)..].join("\n");
+        let bounded = &selected[..selected.len().min(16384)];
+        let output = aks_client_job_log_payloads(bounded, "oat-run-hot-c10")
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(aks_client_handshake_progress(&output), expected);
+        assert_eq!(
+            aks_client_handshake_progress(
+                &aks_client_job_log_payloads(bounded, "oat-run-hot-c1")
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+            (false, false)
+        );
+    }
+    Ok(())
 }
 
 async fn finish_aks_client_job(config: &OatConfig, handle: ClientHandle) -> Result<String> {
@@ -1465,7 +3066,10 @@ pub async fn execute(
 
     state
         .update(id, |status| {
-            status.progress = "writing compact Parquet results".to_owned()
+            status.progress = "writing compact Parquet results".to_owned();
+            if outcome.aks_cleanup_confirmed {
+                status.aks_cleanup_resolved = true;
+            }
         })
         .await;
     let result_count = outcome.rows.len();
@@ -1486,6 +3090,7 @@ struct MatrixOutcome {
     rows: Vec<OatResult>,
     error: Option<anyhow::Error>,
     cancelled: bool,
+    aks_cleanup_confirmed: bool,
 }
 
 async fn publish_matrix_outcome(config: &OatConfig, outcome: MatrixOutcome) -> Result<()> {
@@ -1624,6 +3229,8 @@ async fn run_matrix(
     state: Arc<AppState>,
     cancellation: watch::Receiver<bool>,
 ) -> MatrixOutcome {
+    let submitted_config = capture_submitted_config_identity(&state, orchestration_id).await;
+    let cell_state = Arc::clone(&state);
     run_matrix_with(
         config,
         orchestration_id,
@@ -1633,9 +3240,10 @@ async fn run_matrix(
                 cell_config,
                 orchestration_id,
                 run_id,
-                replicas,
-                concurrency,
+                (replicas, concurrency),
                 cancellation.clone(),
+                submitted_config.clone(),
+                Arc::clone(&cell_state),
             )
         },
     )
@@ -1653,35 +3261,48 @@ where
     Fut: std::future::Future<Output = MatrixOutcome>,
 {
     let mut results = Vec::new();
+    let mut saw_cell = false;
+    let mut aks_cleanup_confirmed = true;
     let cells = matrix_cell_specs(config);
     let total = cells.len();
-    for (completed, (replicas, concurrency, run_id)) in cells.into_iter().enumerate() {
+    for (completed, (replicas, concurrency, clients, run_id)) in cells.into_iter().enumerate() {
         state
             .update(orchestration_id, |status| {
+                status.local_teardown = None;
                 status.progress = format!(
-                    "experiment {}/{total}: ArrowCol replicas={replicas}, DFE --num-cores={concurrency}",
+                    "experiment {}/{total}: ArrowCol replicas={replicas}, DFE --num-cores={concurrency}, clients/table={clients}",
                     completed + 1
                 );
             })
             .await;
         let mut cell = match config_for_run(config, &run_id) {
-            Ok(cell_config) => run_cell(cell_config, run_id.clone(), replicas, concurrency).await,
-            Err(error) => finish_matrix_cell(
-                config,
-                orchestration_id,
-                &run_id,
-                replicas,
-                concurrency,
-                Err(error),
-                Ok(()),
-            ),
+            Ok(mut cell_config) => {
+                cell_config.clients_per_table = clients;
+                run_cell(cell_config, run_id.clone(), replicas, concurrency).await
+            }
+            Err(error) => {
+                let mut cell = finish_matrix_cell(
+                    config,
+                    orchestration_id,
+                    &run_id,
+                    replicas,
+                    concurrency,
+                    Err(error),
+                    Ok(()),
+                );
+                cell.aks_cleanup_confirmed = false;
+                cell
+            }
         };
+        saw_cell = true;
+        aks_cleanup_confirmed &= cell.aks_cleanup_confirmed;
         results.append(&mut cell.rows);
         if cell.cancelled {
             return MatrixOutcome {
                 rows: results,
                 error: None,
                 cancelled: true,
+                aks_cleanup_confirmed: saw_cell && aks_cleanup_confirmed,
             };
         }
         if cell.error.is_some() {
@@ -1689,6 +3310,7 @@ where
                 rows: results,
                 error: cell.error,
                 cancelled: false,
+                aks_cleanup_confirmed: saw_cell && aks_cleanup_confirmed,
             };
         }
     }
@@ -1696,6 +3318,109 @@ where
         rows: results,
         error: None,
         cancelled: false,
+        aks_cleanup_confirmed: saw_cell && aks_cleanup_confirmed,
+    }
+}
+
+fn local_teardown_transition(
+    config: &OatConfig,
+    cell_id: &str,
+    rows: &[OatResult],
+) -> Result<Option<crate::model::LocalTeardown>> {
+    if rows.is_empty()
+        || rows
+            .iter()
+            .any(|row| row.run_id != cell_id || row.status != "succeeded")
+    {
+        return Ok(None);
+    }
+    let mut schedule = None;
+    for row in rows {
+        let evidence: Value = serde_json::from_str(row.evidence_json.as_deref().context("missing cell evidence")?)?;
+        let published = &evidence["client_schedule"];
+        ensure!(
+            published["scope"] == "orchestrator_assigned_schedule_with_observed_full_fleet_acknowledgement",
+            "missing acknowledged cell schedule"
+        );
+        let start = published["effective"]["run_start_unix_ms"]
+            .as_u64()
+            .context("missing schedule start")?;
+        let acknowledged = published["effective"]["acknowledged_at_unix_ms"]
+            .as_u64()
+            .context("missing schedule acknowledgement")?;
+        let measurement_start = published["effective"]["measurement_start_unix_ms"]
+            .as_u64()
+            .context("missing measurement start")?;
+        let end = published["effective"]["measurement_end_unix_ms"]
+            .as_u64()
+            .context("missing measurement end")?;
+        let expected_start = start
+            .checked_add(config.warmup_seconds.checked_mul(1_000).context("warmup overflow")?)
+            .context("measurement start overflow")?;
+        let expected_end = start
+            .checked_add(
+                config
+                    .warmup_seconds
+                    .checked_add(config.measure_seconds)
+                    .context("duration overflow")?
+                    .checked_mul(1_000)
+                    .context("duration milliseconds overflow")?,
+            )
+            .context("measurement end overflow")?;
+        ensure!(
+            start > 0 && acknowledged < start && measurement_start == expected_start && end == expected_end,
+            "measurement window identity mismatch"
+        );
+        ensure!(
+            schedule.is_none_or(|previous| previous == (start, end)),
+            "cell schedules differ"
+        );
+        schedule = Some((start, end));
+    }
+    let (start, end) = schedule.context("missing cell schedule")?;
+    let root = config
+        .platform
+        .compose_state_root
+        .as_deref()
+        .context("local state root missing")?;
+    let path = std::env::current_dir()?
+        .join(root)
+        .join(cell_id)
+        .join("control/schedule");
+    let raw = fs::read_to_string(path).context("read authoritative schedule before local teardown")?;
+    ensure!(
+        raw == format!("{start}\n"),
+        "authoritative schedule changed before local teardown"
+    );
+    let now = unix_time_ms_u64()?;
+    ensure!(now >= end, "measurement window has not ended");
+    Ok(Some(crate::model::LocalTeardown {
+        cell_id: cell_id.to_owned(),
+        schedule_unix_ms: start,
+        measurement_end_unix_ms: end,
+        started_at_unix_ms: now,
+    }))
+}
+
+async fn publish_local_teardown(
+    state: &AppState,
+    orchestration_id: &str,
+    config: &OatConfig,
+    run_id: &str,
+    rows: &[OatResult],
+) {
+    match local_teardown_transition(config, run_id, rows) {
+        Ok(Some(transition)) => {
+            state
+                .update(orchestration_id, |status| {
+                    if matches!(status.state, crate::model::RunState::Running) {
+                        status.local_teardown = Some(transition);
+                    }
+                })
+                .await
+        }
+        Ok(None) => {}
+        Err(error) => tracing::warn!(%error, "local teardown transition unavailable"),
     }
 }
 
@@ -1703,14 +3428,16 @@ async fn run_isolated_cell(
     config: OatConfig,
     orchestration_id: &str,
     run_id: String,
-    replicas: u32,
-    concurrency: u32,
+    dimensions: (u32, u32),
     mut cancellation: watch::Receiver<bool>,
+    submitted_config: Option<SubmittedConfigIdentity>,
+    state: Arc<AppState>,
 ) -> MatrixOutcome {
+    let (replicas, concurrency) = dimensions;
     let mut platform = match platform_for_run(&config, &run_id) {
         Ok(platform) => platform,
         Err(error) => {
-            return finish_matrix_cell(
+            let mut outcome = finish_matrix_cell(
                 &config,
                 orchestration_id,
                 &run_id,
@@ -1719,34 +3446,87 @@ async fn run_isolated_cell(
                 Err(error),
                 Ok(()),
             );
+            outcome.aks_cleanup_confirmed = false;
+            return outcome;
         }
     };
+    let timing_budget = match config.timing_budget() {
+        Ok(budget) => budget,
+        Err(error) => {
+            let mut outcome = finish_matrix_cell(
+                &config,
+                orchestration_id,
+                &run_id,
+                replicas,
+                concurrency,
+                Err(error),
+                Ok(()),
+            );
+            outcome.aks_cleanup_confirmed = false;
+            return outcome;
+        }
+    };
+    let lifecycle_started_at = tokio::time::Instant::now();
+    let lifecycle_deadline = lifecycle_started_at + Duration::from_millis(timing_budget.planned_cell_duration_ms);
+    let setup_deadline = lifecycle_started_at + Duration::from_millis(timing_budget.pre_cell_setup_timeout_ms);
     let (result, cancelled) = tokio::select! {
         result = async {
-            match platform.ensure_stack(&config).await {
-                Ok(()) => {
-                    run_matrix_cell(
-                        &config,
-                        orchestration_id,
-                        &run_id,
-                        replicas,
-                        concurrency,
-                        platform.as_mut(),
-                    )
-                    .await
+            match tokio::time::timeout_at(setup_deadline, platform.ensure_stack(&config, orchestration_id, replicas)).await {
+                Ok(result) => result.context("prepare isolated OAT matrix-cell platform")?,
+                Err(_) => bail!("planned pre-cell setup deadline expired; normal platform cleanup follows"),
+            }
+            let timing = config.timing_budget()?;
+            require_lifecycle_remaining_at(
+                tokio::time::Instant::now(),
+                lifecycle_deadline,
+                Duration::from_millis(timing.after_setup_budget_ms),
+                "ArrowCol scale",
+            )?;
+            match tokio::time::timeout_at(lifecycle_deadline, async {
+                let mut rows = run_matrix_cell(
+                    &config,
+                    orchestration_id,
+                    &run_id,
+                    replicas,
+                    concurrency,
+                    platform.as_mut(),
+                    lifecycle_deadline,
+                ).await?;
+                if let Err(error) = platform.publish_official_measurement(
+                    &config, &rows, submitted_config.as_ref(), lifecycle_deadline,
+                ).await {
+                    tracing::error!(%error, "official cell measurement publication failed; retaining original rows for normal cleanup");
+                    for row in &mut rows {
+                        row.status = "failed".to_owned();
+                        row.failure = Some(match row.failure.take() {
+                            Some(prior) => format!("{prior}; official_measurement_publication_failed"),
+                            None => "official_measurement_publication_failed".to_owned(),
+                        });
+                    }
                 }
-                Err(error) => Err(error).context("prepare isolated OAT matrix-cell platform"),
+                Ok(rows)
+            }).await {
+                Ok(result) => result,
+                Err(_) => Err(anyhow::anyhow!("planned cell lifecycle duration expired; normal platform cleanup follows")),
             }
         } => (result, false),
         _ = wait_for_cancellation(&mut cancellation) => (Err(anyhow::anyhow!("local OAT run cancelled")), true),
     };
+    if !cancelled
+        && config.platform.kind == crate::config::OatMode::Local
+        && let Ok(rows) = &result
+    {
+        publish_local_teardown(&state, orchestration_id, &config, &run_id, rows).await;
+    }
     let cleanup = platform.cleanup(&config).await;
     let shutdown_drain_evidence = platform.shutdown_drain_evidence();
+    let aks_cleanup_confirmed = config.platform.kind == crate::config::OatMode::Aks && cleanup.is_ok();
     if cancelled && cleanup.is_ok() {
         return MatrixOutcome {
             rows: Vec::new(),
             error: None,
             cancelled: true,
+            aks_cleanup_confirmed,
         };
     }
     let mut outcome = finish_matrix_cell(
@@ -1782,11 +3562,57 @@ fn attach_shutdown_drain_evidence(outcome: &mut MatrixOutcome, shutdown_drain: V
         let evidence_json = row.evidence_json.as_deref().context("cell evidence is missing")?;
         let mut evidence: Value =
             serde_json::from_str(evidence_json).context("parse cell evidence before shutdown update")?;
+        evidence["kusto_snapshot_coverage"] = kusto_snapshot_coverage(
+            &row.run_id,
+            &row.table,
+            &evidence["qap_observation"],
+            &shutdown_drain["stopped_delta_snapshots"],
+        )?;
         evidence["shutdown_drain"] = shutdown_drain.clone();
         row.evidence_json =
             Some(serde_json::to_string(&evidence).context("serialize cell evidence with shutdown drain")?);
     }
     Ok(())
+}
+
+fn kusto_snapshot_coverage(run_id: &str, table: &str, observation: &Value, snapshots: &Value) -> Result<Value> {
+    let binding = qap_bindings(run_id, &[table.to_owned()])?.remove(0);
+    let snapshot = &snapshots[table];
+    let observed = &observation["tables"][&binding.external_table];
+    let identity_matches = observation["run_id"] == run_id
+        && observation["observed_unix_ms"].as_u64().is_some_and(|time| time > 0)
+        && observation["expected_tables"]
+            .as_array()
+            .is_some_and(|tables| tables.contains(&json!(binding.external_table)))
+        && snapshot["run_id"] == run_id
+        && snapshot["table"] == table
+        && snapshot["source"] == "verified_stopped_snapshot_manifest"
+        && snapshot["manifest"] == format!("{run_id}/{table}/manifest.json")
+        && snapshot["manifest_sha256"]
+            .as_str()
+            .is_some_and(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    let counts = snapshot["row_count"]
+        .as_u64()
+        .zip(snapshot["table_version"].as_u64())
+        .zip(observed["row_count"].as_u64().zip(observed["table_version"].as_u64()));
+    let status = match counts {
+        Some((delta, kusto)) if identity_matches && observed["available"] == true => {
+            if delta == kusto {
+                "matched"
+            } else {
+                "mismatch"
+            }
+        }
+        _ => "unknown",
+    };
+    Ok(json!({
+        "status": status, "run_id": run_id, "table": table, "external_table": binding.external_table,
+        "delta_snapshot": snapshot, "observed_row_count": observed["row_count"],
+        "observed_table_version": observed["table_version"], "observed_unix_ms": observation["observed_unix_ms"],
+        "scope": "exact_stopped_snapshot_count_and_version_coverage_only",
+        "unique_payload_delivery": "unknown", "queryable_delivery": "unknown", "delivery_latency": null,
+        "comment": "Matching counts/version establish snapshot coverage, not unique payload delivery or per-row queryability/latency.",
+    }))
 }
 
 async fn wait_for_cancellation(cancellation: &mut watch::Receiver<bool>) {
@@ -1809,6 +3635,7 @@ fn finish_matrix_cell(
     result: Result<Vec<OatResult>>,
     cleanup: Result<()>,
 ) -> MatrixOutcome {
+    let aks_cleanup_confirmed = config.platform.kind == crate::config::OatMode::Aks && cleanup.is_ok();
     let (mut rows, mut error) = match result {
         Ok(rows) => {
             let error = rows
@@ -1838,6 +3665,7 @@ fn finish_matrix_cell(
                         started_at_ms,
                         qap: QapMetrics::default(),
                         resources: None,
+                        resource_evidence: None,
                     },
                 )
             })();
@@ -1888,33 +3716,52 @@ fn finish_matrix_cell(
         rows,
         error,
         cancelled: false,
+        aks_cleanup_confirmed,
     }
 }
 
-fn matrix_cell_specs(config: &OatConfig) -> Vec<(u32, u32, String)> {
-    config
-        .replica_counts
-        .iter()
-        .flat_map(|replicas| {
-            config
-                .dfe_worker_concurrency
-                .iter()
-                .map(move |concurrency| (*replicas, *concurrency, uuid::Uuid::new_v4().to_string()))
-        })
-        .collect()
+fn matrix_cell_specs(config: &OatConfig) -> Vec<(u32, u32, usize, String)> {
+    let default_clients = [config.clients_per_table];
+    let client_counts = config.clients_per_table_sweep.as_deref().unwrap_or(&default_clients);
+    let mut cells = Vec::new();
+    for replicas in &config.replica_counts {
+        for concurrency in &config.dfe_worker_concurrency {
+            for clients in client_counts {
+                cells.push((*replicas, *concurrency, *clients, uuid::Uuid::new_v4().to_string()));
+            }
+        }
+    }
+    cells
 }
 
 fn platform_for_run(config: &OatConfig, run_id: &str) -> Result<Box<dyn Platform>> {
+    if config.campaign_profile == Some(crate::config::CampaignProfile::ScaleOutSingleTable)
+        && config.platform.kind == crate::config::OatMode::Local
+    {
+        bail!("scale_out_single_table exploratory runs require AKS");
+    }
+    if config.platform.kind == crate::config::OatMode::Aks
+        && config.campaign_profile == Some(crate::config::CampaignProfile::SingleHotTable)
+    {
+        CampaignIdentity::from_lookup(|name| std::env::var(name).ok())?;
+        bail!(
+            "AKS campaign is blocked pending end-to-end runtime qualification, including custody lifecycle and collector-visible shared storage"
+        );
+    }
     match config.platform.kind {
         crate::config::OatMode::Local => Ok(Box::new(LocalPlatform::new(config, run_id)?)),
         crate::config::OatMode::Aks => Ok(Box::new(AksPlatform {
             run_id: run_id.to_owned(),
+            resource_readback: Vec::new(),
+            cpu_throttling_start: None,
+            cpu_throttling_evidence: None,
             namespace_created: false,
             namespace_create_attempted: false,
             namespace_owner_token: uuid::Uuid::new_v4().to_string(),
             namespace_uid: None,
             runtime_dir: None,
             qap_relative_data_root: None,
+            delta_root: None,
             router_metrics_url: None,
             router_tunnel: None,
             fic_record_path: None,
@@ -1922,7 +3769,10 @@ fn platform_for_run(config: &OatConfig, run_id: &str) -> Result<Box<dyn Platform
             fic_prepare_attempted: false,
             qap_record_path: None,
             qap_bind_attempted: false,
+            qap_cleanup_confirmed: false,
             qap_outcome_unresolved: false,
+            run_table_initialization_attempted: false,
+            run_table_initialization_drained: false,
             workload_stop_record_path: None,
             schedule_configmap_name: format!(
                 "oat-schedule-{}",
@@ -1935,6 +3785,7 @@ fn platform_for_run(config: &OatConfig, run_id: &str) -> Result<Box<dyn Platform
             service_account: None,
             router_yaml: None,
             shutdown_drain_evidence: None,
+            campaign_cli_paths: None,
         })),
     }
 }
@@ -2186,10 +4037,129 @@ async fn settle_cell_commit_evidence(
                     output["cell_scope"] = json!(cell_scope);
                 }
             }
+            if config.campaign_profile == Some(crate::config::CampaignProfile::ScaleOutSingleTable) {
+                for table in &config.tables {
+                    let output = commits
+                        .get_mut(table)
+                        .and_then(|value| value.get_mut("run_cumulative_output"));
+                    let event_rows = output.and_then(|value| value["rows"].as_u64());
+                    let acknowledged = targets.get(table).copied().flatten();
+                    let delta_result = match platform.delta_root() {
+                        Some(root) => {
+                            match tokio::time::timeout(Duration::from_secs(30), read_delta_log_commits(root, table))
+                                .await
+                            {
+                                Ok(result) => result,
+                                Err(_) => Err(anyhow::anyhow!("Delta-log scan exceeded its 30-second bound")),
+                            }
+                        }
+                        None => Err(anyhow::anyhow!("run-scoped Delta root is unavailable")),
+                    };
+                    let (delta_log, unavailable_reason) = match delta_result {
+                        Ok(delta_log) => (Some(delta_log), None),
+                        Err(error) => {
+                            tracing::warn!(table, %error, "exploratory Delta-log reconciliation evidence is unavailable");
+                            (None, Some("delta_log_read_failed"))
+                        }
+                    };
+                    let commit_output = commits.get(table).and_then(|value| value.get("run_cumulative_output"));
+                    let reconciliation = exploratory_delta_reconciliation(
+                        delta_log.as_ref(),
+                        commit_output,
+                        acknowledged,
+                        unavailable_reason,
+                    );
+                    if let Some(commit) = commits.get_mut(table) {
+                        commit["delta_log_reconciliation"] = reconciliation;
+                        if let Some(output) = commit.get_mut("run_cumulative_output") {
+                            output["collector_event_rows"] = event_rows.map_or(Value::Null, |rows| json!(rows));
+                            if let Some(delta_log) = delta_log {
+                                output["rows"] = delta_log["rows"].clone();
+                                output["delta_log_files"] = delta_log["files"].clone();
+                                output["delta_log_parquet_bytes"] = delta_log["parquet_bytes"].clone();
+                                output["delta_log_versions"] = delta_log["versions"].clone();
+                                output["source"] = delta_log["scope"].clone();
+                            } else {
+                                output["rows"] = Value::Null;
+                                output["delta_log_files"] = Value::Null;
+                                output["delta_log_parquet_bytes"] = Value::Null;
+                                output["delta_log_versions"] = Value::Null;
+                                output["unavailable_reason"] =
+                                    json!(unavailable_reason.unwrap_or("delta_log_read_failed"));
+                            }
+                            let delta_rows = output["rows"].as_u64();
+                            output["settled"] = acknowledged
+                                .zip(delta_rows)
+                                .map_or(Value::Null, |(completed, delta)| json!(delta >= completed));
+                            output["client_completed_rows"] = acknowledged.map_or(Value::Null, |rows| json!(rows));
+                            output["settle_gap_rows"] = acknowledged
+                                .zip(delta_rows)
+                                .map_or(Value::Null, |(completed, delta)| json!(completed.saturating_sub(delta)));
+                        }
+                    }
+                }
+            }
             return Ok((logs, commits));
         }
         tokio::time::sleep(Duration::from_millis(250).min(timeout.saturating_sub(elapsed))).await;
     }
+}
+
+#[cfg(test)]
+#[test]
+fn local_lifecycle_budget_allows_positive_setup_elapsed_and_rejects_exhaustion() -> Result<()> {
+    let mut config: OatConfig = serde_json::from_str(include_str!(
+        "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+    ))?;
+    config.platform.kind = crate::config::OatMode::Local;
+    let budget = config.timing_budget()?;
+    assert_eq!(budget.after_setup_budget_ms, budget.minimum_pin_ttl_ms);
+    assert_eq!(
+        budget.planned_cell_duration_ms,
+        budget.pre_cell_setup_timeout_ms + budget.after_setup_budget_ms
+    );
+
+    let started = tokio::time::Instant::now();
+    let setup_elapsed = Duration::from_secs(30);
+    let deadline = started + Duration::from_millis(budget.planned_cell_duration_ms);
+    let post_setup_now = started + setup_elapsed;
+    assert!(
+        require_lifecycle_remaining_at(
+            post_setup_now,
+            deadline,
+            Duration::from_millis(budget.after_setup_budget_ms),
+            "Local admission"
+        )
+        .is_ok()
+    );
+
+    let exhausted_now = deadline - Duration::from_millis(budget.after_setup_budget_ms) + Duration::from_millis(1);
+    assert!(
+        require_lifecycle_remaining_at(
+            exhausted_now,
+            deadline,
+            Duration::from_millis(budget.after_setup_budget_ms),
+            "Local admission"
+        )
+        .is_err()
+    );
+    Ok(())
+}
+
+fn require_lifecycle_remaining_at(
+    now: tokio::time::Instant,
+    deadline: tokio::time::Instant,
+    required: Duration,
+    next_stage: &str,
+) -> Result<()> {
+    if deadline.saturating_duration_since(now) < required {
+        bail!("planned cell lifecycle deadline would expire before {next_stage}");
+    }
+    Ok(())
+}
+
+fn require_lifecycle_remaining(deadline: tokio::time::Instant, required: Duration, next_stage: &str) -> Result<()> {
+    require_lifecycle_remaining_at(tokio::time::Instant::now(), deadline, required, next_stage)
 }
 
 async fn run_matrix_cell(
@@ -2199,8 +4169,41 @@ async fn run_matrix_cell(
     replicas: u32,
     concurrency: u32,
     platform: &mut dyn Platform,
+    lifecycle_deadline: tokio::time::Instant,
 ) -> Result<Vec<OatResult>> {
+    let timing_budget = config.timing_budget()?;
+    let rollout_ms = if config.platform.kind == crate::config::OatMode::Aks {
+        config
+            .aks_rollout_timeout_seconds
+            .checked_mul(1_000)
+            .context("AKS rollout deadline overflow")?
+    } else {
+        0
+    };
+    let scale_rollout_ms = rollout_ms
+        .checked_mul(u64::try_from(config.deployment_names().len())?)
+        .context("AKS scale rollout deadline overflow")?;
+    let maintenance_rollout_ms = if config.platform.kind == crate::config::OatMode::Aks && maintenance_enabled(config) {
+        rollout_ms
+    } else {
+        0
+    };
+    let pre_scale_budget = timing_budget
+        .minimum_pin_ttl_ms
+        .checked_add(scale_rollout_ms)
+        .and_then(|value| value.checked_add(maintenance_rollout_ms))
+        .context("post-setup lifecycle budget overflow")?;
+    require_lifecycle_remaining(
+        lifecycle_deadline,
+        Duration::from_millis(pre_scale_budget),
+        "ArrowCol scale",
+    )?;
     platform.scale_arrowcols(config, replicas, concurrency).await?;
+    require_lifecycle_remaining(
+        lifecycle_deadline,
+        Duration::from_millis(timing_budget.minimum_pin_ttl_ms.saturating_add(maintenance_rollout_ms)),
+        "run table-pin and maintenance initialization",
+    )?;
     let assigned_tables = config.tables.clone();
     let expected_keys_json = expected_pin_keys_json(&assigned_tables)?;
     let pin_now_unix_ms = unix_time_ms_u64()?;
@@ -2216,22 +4219,96 @@ async fn run_matrix_cell(
             pin_now_unix_ms,
         )
         .await?;
+    let before_clients_ms = timing_budget
+        .minimum_pin_ttl_ms
+        .saturating_sub(crate::config::PIN_INIT_SETUP_TIMEOUT_SECONDS.saturating_mul(1_000))
+        .saturating_sub(
+            config
+                .catalog_registration_setup_timeout_seconds()
+                .saturating_mul(1_000),
+        );
+    require_lifecycle_remaining(
+        lifecycle_deadline,
+        Duration::from_millis(before_clients_ms),
+        "client admission",
+    )?;
     let cell_start_unix_ms = unix_time_ms_u64()?;
     let started_at_ms =
         i64::try_from(cell_start_unix_ms).context("run start timestamp exceeds Arrow timestamp range")?;
     let baseline_logs = platform.process_logs(config).await?;
-    let mut client_run = run_clients(config, run_id, &assigned_tables, platform).await?;
-    let (_collector_logs, durable_commits) = settle_cell_commit_evidence(
-        config,
-        platform,
-        &baseline_logs,
-        &client_run.evidence,
-        cell_start_unix_ms,
-    )
-    .await?;
-    let process_logs = platform.process_logs(config).await?;
-    client_run.evidence.processes = Some(process_evidence_for_cell(config, &process_logs, &baseline_logs)?);
-    client_run.evidence.durable_commits = durable_commits;
+    platform.retain_cell_process_baseline(&baseline_logs);
+    let mut client_run = run_clients(config, run_id, &assigned_tables, platform, replicas).await?;
+    let diagnostics_root = Path::new("out/arrowcol-oat/admission-diagnostics");
+    if let Err(error) = platform.finish_resource_measurement(config).await {
+        retain_admission_diagnostics(
+            diagnostics_root,
+            orchestration_id,
+            run_id,
+            client_run.evidence.overload_guard.as_mut(),
+            None,
+        );
+        return Err(error);
+    }
+    let guard_stopped = client_run.evidence.overload_stop.is_some()
+        || client_run
+            .evidence
+            .overload_guard
+            .as_ref()
+            .is_some_and(|guard| guard["status"] == "unavailable");
+    let mut startup_readback_diff = None;
+    let capture = async {
+        let post_client_ms = config
+            .reconciliation_settle_timeout_seconds
+            .checked_add(config.qap_timeout_seconds)
+            .and_then(|seconds| seconds.checked_mul(1_000))
+            .context("post-client lifecycle deadline overflow")?;
+        require_lifecycle_remaining(
+            lifecycle_deadline,
+            Duration::from_millis(post_client_ms),
+            "commit reconciliation",
+        )?;
+        let (_collector_logs, durable_commits) = settle_cell_commit_evidence(
+            config,
+            platform,
+            &baseline_logs,
+            &client_run.evidence,
+            cell_start_unix_ms,
+        )
+        .await?;
+        client_run.evidence.durable_commits = durable_commits;
+        let process_logs = platform.process_logs(config).await?;
+        client_run.evidence.processes = Some(process_evidence_for_cell(
+            config,
+            &process_logs,
+            &baseline_logs,
+            &mut startup_readback_diff,
+        )?);
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    retain_admission_diagnostics(
+        diagnostics_root,
+        orchestration_id,
+        run_id,
+        client_run.evidence.overload_guard.as_mut(),
+        startup_readback_diff,
+    );
+    if let Err(error) = capture {
+        if !guard_stopped {
+            return Err(error);
+        }
+        tracing::error!(%error, "post-overload output/process capture failed; retaining stop evidence for cleanup");
+        client_run.failure = Some(format!(
+            "{}; post_overload_stop_capture_unavailable",
+            client_run
+                .failure
+                .as_deref()
+                .unwrap_or("overload_guard stopped the cell")
+        ));
+        if let Some(guard) = &mut client_run.evidence.overload_guard {
+            guard["post_stop_capture"] = json!("unavailable");
+        }
+    }
     let pinning_ok = client_run.pinning.violation.is_none()
         && client_run.pinning.verification_error.is_none()
         && client_run.failure.is_none();
@@ -2243,7 +4320,12 @@ async fn run_matrix_cell(
             if client_run.qap_tables.is_empty() {
                 return Err(anyhow::anyhow!(LocalDownstreamUnavailable));
             }
-            qap = observe_qap(
+            require_lifecycle_remaining(
+                lifecycle_deadline,
+                Duration::from_secs(config.qap_timeout_seconds),
+                "final QAP observation",
+            )?;
+            let (metrics, observation) = observe_qap(
                 &platform.qap_endpoint(config),
                 &platform.qap_observation_mode(),
                 &platform.qap_database(config)?,
@@ -2252,7 +4334,8 @@ async fn run_matrix_cell(
                 config.qap_timeout_seconds,
             )
             .await?;
-            if qap.observation_complete != 1 {
+            qap = apply_qap_observation(platform.kind(), metrics, observation, &mut client_run.evidence);
+            if qap.observation_complete != 1 && client_run.evidence.downstream_comment.is_none() {
                 bail!("QAP observation omitted required table statistics");
             }
             Ok::<_, anyhow::Error>(())
@@ -2279,6 +4362,7 @@ async fn run_matrix_cell(
             started_at_ms,
             qap,
             resources: metrics,
+            resource_evidence: platform.resource_evidence(),
         },
     )
 }
@@ -2288,6 +4372,7 @@ struct CellMeasurements {
     started_at_ms: i64,
     qap: QapMetrics,
     resources: Option<ResourceMetrics>,
+    resource_evidence: Option<Value>,
 }
 
 fn result_rows(
@@ -2303,6 +4388,7 @@ fn result_rows(
         started_at_ms,
         qap,
         resources: metrics,
+        resource_evidence,
     } = measurements;
     let assigned_tables = config.tables.clone();
     let client_count = config
@@ -2310,7 +4396,52 @@ fn result_rows(
         .checked_mul(assigned_tables.len())
         .context("OAT client count overflow")?;
     let observed_owners = client_run.pinning.owners.values().collect::<HashSet<_>>().len();
-    let tunables = json!({
+    let cpu_quota_evidence = if config.platform.kind == crate::config::OatMode::Aks {
+        let requested = config.effective_aks_resources();
+        let collector_limit_millicores = requested
+            .collector
+            .limits
+            .cpu
+            .as_deref()
+            .map(parse_resource_cpu_millicores)
+            .transpose()?;
+        let client_limit_millicores = parse_resource_cpu_millicores(
+            requested
+                .client
+                .limits
+                .cpu
+                .as_deref()
+                .context("client CPU limit is missing")?,
+        )?;
+        let throttling = resource_evidence
+            .as_ref()
+            .and_then(|evidence| evidence.get("cpu_throttling"))
+            .cloned()
+            .unwrap_or_else(|| {
+                json!({
+                    "status": "unavailable",
+                    "reason": "AKS cAdvisor throttling evidence is unavailable"
+                })
+            });
+        Some(json!({
+            "collector": {
+                "requested_workers": concurrency,
+                "limit_cpu": requested.collector.limits.cpu,
+                "limit_millicores": collector_limit_millicores,
+                "workers_per_cpu_core": collector_limit_millicores.map(|limit| f64::from(concurrency) * 1_000.0 / limit as f64),
+            },
+            "client": {
+                "requested_concurrency_per_process": config.dmv_concurrency,
+                "limit_cpu": requested.client.limits.cpu,
+                "limit_millicores": client_limit_millicores,
+                "concurrency_per_cpu_core": config.dmv_concurrency as f64 * 1_000.0 / client_limit_millicores as f64,
+            },
+            "throttling": throttling,
+        }))
+    } else {
+        None
+    };
+    let mut tunables = json!({
         "arrowcols": replicas,
         "clients": client_count,
         "clients_per_table": config.clients_per_table,
@@ -2318,6 +4449,7 @@ fn result_rows(
         "dmv_concurrency": config.dmv_concurrency,
         "idle_arrowcols": replicas.saturating_sub(observed_owners as u32),
         "measure_seconds": config.measure_seconds,
+        "schedule_lead_seconds": config.schedule_lead_seconds,
         "orchestration_run_id": orchestration_id,
         "pilot_mode": config.pilot_mode,
         "run_pin_ttl_ms": config.run_pin_ttl_ms,
@@ -2328,10 +4460,18 @@ fn result_rows(
         "pinning_violation": client_run.pinning.violation.is_some(),
         "pinning_verification_error": client_run.pinning.verification_error.as_ref().map(|_| "ownership_verification_failed"),
         "delta_delivery": "not_established",
+        "effective_stop_budgets": config.maintenance_stop_budget()?,
+        "planned_cell_duration_ms": config.timing_budget()?.planned_cell_duration_ms,
         "requested_tunables": serde_json::from_str::<Value>(&config.tunables.canonical_json()?)?,
+        "requested_aks_resources": if config.platform.kind == crate::config::OatMode::Aks { Some(config.effective_aks_resources()) } else { None },
+        "cpu_quota": cpu_quota_evidence,
         "requested_durability_class": config.tunables.wal.as_ref().map(|_| config.tunables.durability_class()),
         "capabilities": capability_evidence(),
     });
+    if config.campaign_profile == Some(crate::config::CampaignProfile::ScaleOutSingleTable) {
+        tunables["evidence_class"] = json!("d53_exploratory");
+        tunables["qualification"] = json!("not_qualifying");
+    }
     let details = [
         client_run.failure.clone(),
         client_run
@@ -2354,11 +4494,41 @@ fn result_rows(
     let mut rows = Vec::with_capacity(assigned_tables.len());
     for table in assigned_tables {
         let client = client_run.metrics.get(&table);
-        if client.is_none() && failure.is_none() {
+        let exploratory = config.campaign_profile == Some(crate::config::CampaignProfile::ScaleOutSingleTable);
+        let reconciliation_failure = if exploratory {
+            match client_run
+                .evidence
+                .durable_commits
+                .get(&table)
+                .and_then(|commit| commit.pointer("/delta_log_reconciliation/status"))
+                .and_then(Value::as_str)
+            {
+                Some("matched") => None,
+                Some("mismatch") => Some((
+                    "exploratory_delta_log_reconciliation_mismatch",
+                    "exploratory_reconciliation_mismatch",
+                )),
+                _ => Some((
+                    "exploratory_delta_log_reconciliation_unavailable",
+                    "exploratory_reconciliation_unavailable",
+                )),
+            }
+        } else {
+            None
+        };
+        let table_failure = match (failure.as_deref(), reconciliation_failure) {
+            (Some(failure), Some((reason, _))) => Some(format!("{failure}; {reason}")),
+            (None, Some((reason, _))) => Some(reason.to_owned()),
+            (_, None) => failure.clone(),
+        };
+        if client.is_none() && table_failure.is_none() {
             bail!("DMV client did not report measurements for {table}");
         }
         let owner = client_run.pinning.owners.get(&canonical_table_key(&table));
         let mut table_tunables = tunables.clone();
+        if let Some((_, reason)) = reconciliation_failure {
+            table_tunables["failure"] = json!(reason);
+        }
         table_tunables["collector_completion"] = json!({
             "evidence": if client.is_some_and(|client| client.completions.len() == config.clients_per_table) {
                 "reported"
@@ -2377,7 +4547,10 @@ fn result_rows(
             .to_owned(),
             stamp: config.stamp.clone(),
             host: platform_host_label(config.platform.kind).to_owned(),
-            experiment: format!("arrowcols-{replicas}-dfe-{concurrency}"),
+            experiment: format!(
+                "arrowcols-{replicas}-dfe-{concurrency}-clients-{}",
+                config.clients_per_table
+            ),
             started_at_ms,
             measure_seconds: config.measure_seconds as f64,
             arrowcols: i32::try_from(replicas).context("ArrowCol count exceeds Parquet schema range")?,
@@ -2386,10 +4559,10 @@ fn result_rows(
             table_owner: owner.cloned(),
             pinning_ok,
             pinning_error: client_run.pinning.violation.clone(),
-            failure: failure.clone(),
+            failure: table_failure.clone(),
             status: if client_run.pinning.violation.is_some() {
                 "pinning_violation"
-            } else if failure.is_some() {
+            } else if table_failure.is_some() {
                 "failed"
             } else {
                 "succeeded"
@@ -2400,13 +4573,90 @@ fn result_rows(
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or_else(|| "unknown".to_owned()),
             tunables_json: serde_json::to_string(&table_tunables)?,
-            evidence_json: Some(serde_json::to_string(&client_run.evidence.for_table(&table, client))?),
+            evidence_json: {
+                let mut evidence = client_run.evidence.for_table(&table, client);
+                if let Some(fleet) = &config.platform.fleet {
+                    let mut pool_rates = BTreeMap::<String, f64>::new();
+                    for report in client_run.evidence.client_reports.get(&table).into_iter().flatten() {
+                        if let Some((pool, rate)) = report.pointer("/placement/pool").and_then(Value::as_str)
+                            .zip(report["rows_per_second"].as_f64()) {
+                            *pool_rates.entry(pool.to_owned()).or_default() += rate;
+                        }
+                    }
+                    evidence["fleet"] = json!({
+                        "placement": fleet,
+                        "collector_allocatable_cores": fleet.collector.allocatable_cpu_millicores as f64 / 1000.0,
+                        "collector_allocatable_memory_bytes": fleet.collector.allocatable_memory_bytes,
+                        "client_allocatable_cores": fleet.clients.iter().map(|client| client.placement.allocatable_cpu_millicores as f64 / 1000.0).sum::<f64>(),
+                        "client_allocatable_memory_bytes": fleet.clients.iter().map(|client| u128::from(client.placement.allocatable_memory_bytes)).sum::<u128>(),
+                        "node_count": fleet.clients.len() + 1,
+                        "client_pool_rows_per_second": pool_rates,
+                        "per_pool_rate_scope": "client_completed_admitted_rows_not_collector_committed_rows",
+                    });
+                }
+                if exploratory {
+                    let output = evidence["commit_window_output_throughput"].clone();
+                    let seconds = output["window_seconds"].as_f64();
+                    let input_rate = output["input_bytes_per_second"].as_f64();
+                    let parquet_rate = output["parquet_bytes_per_second"].as_f64();
+                    let commits_per_second = output["commits"]
+                        .as_u64()
+                        .zip(seconds)
+                        .filter(|(_, seconds)| *seconds > 0.0)
+                        .map(|(commits, seconds)| commits as f64 / seconds);
+                    let mean_file_bytes = output["parquet_bytes"]
+                        .as_u64()
+                        .zip(output["files"].as_u64())
+                        .filter(|(_, files)| *files > 0)
+                        .map(|(bytes, files)| bytes as f64 / files as f64);
+                    evidence["evidence_class"] = json!("d53_exploratory");
+                    evidence["qualification"] = json!("not_qualifying");
+                    evidence["exploratory_delta_log_reconciliation"] =
+                        evidence["durable_commits"]["delta_log_reconciliation"].clone();
+                    evidence["steady_state_window"] = json!({
+                        "warmup_seconds": config.warmup_seconds,
+                        "measure_seconds": config.measure_seconds,
+                        "measurement_start_unix_ms": output["measurement_start_unix_ms"],
+                        "measurement_end_unix_ms": output["measurement_end_unix_ms"],
+                        "window_seconds": seconds,
+                        "scope": "collector_commit_finish_window_not_client_cohort",
+                    });
+                    evidence["ranking_eligible"] = json!(reconciliation_failure.is_none());
+                    evidence["ranking_metrics"] = if let Some((reason, _)) = reconciliation_failure {
+                        evidence["ranking_ineligible_reason"] = json!(reason);
+                        evidence["commit_window_output_usage"] = json!("diagnostic_only");
+                        evidence["diagnostic_client_rows_per_second"] =
+                            json!(client.map(|client| client.rows_per_second));
+                        Value::Null
+                    } else {
+                        json!({
+                            "committed_rows_per_second": output["rows_per_second"],
+                            "uncompressed_arrow_decimal_gb_per_second": input_rate.map(|rate| rate / 1_000_000_000.0),
+                            "uncompressed_arrow_bytes_per_second": input_rate,
+                            "parquet_bytes_per_second": parquet_rate,
+                            "compression_ratio": output["compression_ratio"],
+                            "commits_per_second": commits_per_second,
+                            "mean_parquet_file_bytes": mean_file_bytes,
+                            "per_pod_cpu_millicores": metrics.map(|metrics| metrics.cpu_millicores),
+                            "per_pod_cpu_scope": "one_collector_pod_profile_arithmetic_mean_of_measurement_window_samples",
+                        })
+                    };
+                }
+                if let Some(resource_evidence) = &resource_evidence {
+                    evidence["aks_resources"] = resource_evidence.clone();
+                }
+                Some(serde_json::to_string(&evidence)?)
+            },
             replicas: u64::from(replicas),
             dfe_worker_concurrency: u64::from(concurrency),
             table,
             rows: client.map(|client| client.rows),
             duration_ms: client.map(|client| client.duration_ms),
-            rows_per_second: client.map(|client| client.rows_per_second),
+            rows_per_second: if reconciliation_failure.is_some() {
+                None
+            } else {
+                client.map(|client| client.rows_per_second)
+            },
             cpu_millicores: metrics.map(|metrics| metrics.cpu_millicores),
             memory_bytes: metrics.map(|metrics| metrics.memory_bytes),
             qap,
@@ -2464,9 +4714,10 @@ async fn run_clients(
     project_run_id: &str,
     tables: &[String],
     platform: &mut dyn Platform,
+    replicas: u32,
 ) -> Result<ClientRun> {
     let mut pinning = PinningReport::default();
-    match run_clients_inner(config, project_run_id, tables, platform, &mut pinning).await {
+    match run_clients_inner(config, project_run_id, tables, platform, &mut pinning, replicas).await {
         Ok(report) => Ok(report),
         Err(error) => {
             let sample = async {
@@ -2542,7 +4793,67 @@ async fn run_clients_inner(
     tables: &[String],
     platform: &mut dyn Platform,
     pinning: &mut PinningReport,
+    replicas: u32,
 ) -> Result<ClientRun> {
+    require_single_scale_out_collector(config, replicas)?;
+    let mut evidence = CellEvidence::default();
+    let mut prepared_guard = if config.overload_guard.enabled {
+        let timeout = if config.campaign_profile == Some(crate::config::CampaignProfile::ScaleOutSingleTable) {
+            Duration::from_secs(30)
+        } else {
+            Duration::from_secs(5)
+        };
+        let mut diagnostics = json!({});
+        match tokio::time::timeout(
+            timeout,
+            PreparedGuard::prepare_recording(config, platform, &mut diagnostics),
+        )
+        .await
+        {
+            Ok(Ok(prepared)) => Some(prepared),
+            result => {
+                let error = match result {
+                    Ok(Err(error)) => format!("{error:#}"),
+                    Err(error) => error.to_string(),
+                    Ok(Ok(_)) => unreachable!("successful guard preparation returned above"),
+                };
+                tracing::error!(%error, "overload hard-cap/readback protection unavailable before admission");
+                evidence.overload_guard = Some(json!({
+                    "status":"unavailable","settings":config.overload_guard,
+                    "unavailable_reason":"pre_admission_cap_backlog_or_commit_readback_unavailable",
+                    "requested_container_memory_limit_bytes":config.platform.local.collector_memory_limit_bytes,
+                    "error":error,
+                    "admission_diagnostics":diagnostics,
+                }));
+                return Ok(ClientRun {
+                    metrics: HashMap::new(),
+                    pinning: std::mem::take(pinning),
+                    qap_tables: Vec::new(),
+                    failure: Some("overload_guard required protection unavailable before admission".to_owned()),
+                    evidence,
+                });
+            }
+        }
+    } else {
+        evidence.overload_guard = Some(json!({"status":"disabled","settings":config.overload_guard}));
+        None
+    };
+    if let Some(prepared) = &prepared_guard {
+        evidence.overload_guard = Some(prepared.engine.proof.clone());
+        evidence.overload_stop = prepared.engine.stop.clone();
+        if let Some(reason) = prepared.engine.failure() {
+            return Ok(ClientRun {
+                metrics: HashMap::new(),
+                pinning: std::mem::take(pinning),
+                qap_tables: Vec::new(),
+                failure: Some(reason),
+                evidence,
+            });
+        }
+    }
+    platform
+        .prepare_campaign_load_admission(config, project_run_id, tables)
+        .await?;
     let timing_budget = config.timing_budget()?;
     local_progress(
         config,
@@ -2565,15 +4876,16 @@ async fn run_clients_inner(
     let mut handles = Vec::with_capacity(tables.len().saturating_mul(config.clients_per_table));
     for table in tables {
         for client_index in 0..config.clients_per_table {
+            let client_config = resolved_fleet_client_config(config, client_index)?;
             let mut arguments = vec![
                 "--endpoint".to_owned(),
                 platform.workload_endpoint(config),
                 "--client-id".to_owned(),
-                format!("oat-{project_run_id}-{table}-c{client_index}"),
+                format!("oat-{project_run_id}-{table}-c{}", client_index + 1),
                 "--rows".to_owned(),
-                config.rows_per_table.to_string(),
+                client_config.rows_per_table.to_string(),
                 "--concurrency".to_owned(),
-                config.dmv_concurrency.to_string(),
+                client_config.dmv_concurrency.to_string(),
                 "--table".to_owned(),
                 table.clone(),
                 "--edge-secret-file".to_owned(),
@@ -2595,7 +4907,7 @@ async fn run_clients_inner(
                 arguments.push("--pilot".to_owned());
             }
             match platform
-                .start_client(config, project_run_id, table, client_index + 1, &arguments)
+                .start_client(&client_config, project_run_id, table, client_index + 1, &arguments)
                 .await
             {
                 Ok(handle) => handles.push(handle),
@@ -2668,7 +4980,6 @@ async fn run_clients_inner(
             "run-scoped QAP preparation exceeded qap_timeout_seconds; operation outcome may be indeterminate and is not retried"
         )),
     };
-    let mut evidence = CellEvidence::default();
     let qap_tables = match qap_result {
         Ok(qap_tables) => qap_tables,
         Err(error) if local_downstream_optional(platform.kind()) && error.is::<LocalDownstreamUnavailable>() => {
@@ -2687,91 +4998,127 @@ async fn run_clients_inner(
             };
         }
     };
-    let schedule_deadline =
-        tokio::time::Instant::now() + Duration::from_secs(crate::config::SCHEDULE_DELIVERY_TIMEOUT_SECONDS);
-    let run_start_unix_ms = unix_time_ms_u64()?
-        .checked_add(crate::config::SCHEDULE_DELIVERY_TIMEOUT_SECONDS.saturating_mul(1_000))
+    platform
+        .finalize_campaign_load_admission(config, project_run_id, tables)
+        .await?;
+    let schedule_deadline = tokio::time::Instant::now() + Duration::from_secs(config.schedule_lead_seconds);
+    let schedule_created_at_unix_ms = unix_time_ms_u64()?;
+    let run_start_unix_ms = schedule_created_at_unix_ms
+        .checked_add(
+            config
+                .schedule_lead_seconds
+                .checked_mul(1_000)
+                .context("OAT schedule lead overflow")?,
+        )
         .context("shared OAT run start timestamp overflow")?;
-    if let Err(error) = platform.arm_clients(config, project_run_id, run_start_unix_ms).await {
-        let cleanup = cancel_clients(platform, config, &handles).await;
-        return match cleanup {
-            Ok(()) => Err(error).context("arm common OAT client schedule"),
-            Err(cleanup_error) => Err(error.context(format!(
-                "cancelling clients after schedule-arm failure also failed: {cleanup_error:#}"
-            ))),
-        };
-    }
-    local_progress(
-        config,
-        &format!(
-            "clients armed; schedule lead {}s, warm-up {}s, measurement {}s",
-            crate::config::SCHEDULE_DELIVERY_TIMEOUT_SECONDS,
-            config.warmup_seconds,
-            config.measure_seconds
-        ),
-    );
-
-    let mut schedule_acknowledged = false;
-    while tokio::time::Instant::now() < schedule_deadline {
-        let progress = match poll_clients(platform, config, &handles).await {
-            Ok(progress) => progress,
-            Err(error) => {
-                let cleanup = cancel_clients(platform, config, &handles).await;
-                return match cleanup {
-                    Ok(()) => Err(error),
-                    Err(cleanup_error) => Err(error.context(format!(
-                        "cancelling clients after schedule polling failed also failed: {cleanup_error:#}"
-                    ))),
-                };
-            }
-        };
-        match validate_client_schedule(&progress, unix_time_ms_u64()?, run_start_unix_ms) {
-            Ok(true) => {
-                schedule_acknowledged = true;
-                break;
-            }
-            Ok(false) => {}
-            Err(error) => {
-                let cleanup = cancel_clients(platform, config, &handles).await;
-                return match cleanup {
-                    Ok(()) => Err(error),
-                    Err(cleanup_error) => Err(error.context(format!(
-                        "cancelling clients after schedule failure also failed: {cleanup_error:#}"
-                    ))),
-                };
-            }
-        }
-        record_owner_observation(
-            pinning,
-            sample_router_table_owners(platform, config, &metrics_client, tables).await,
-            tables,
-            false,
-        );
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-    if !schedule_acknowledged {
-        let error =
-            anyhow::anyhow!("OAT client schedule acknowledgement timed out or the final armed window was missed");
-        let cleanup = cancel_clients(platform, config, &handles).await;
-        return match cleanup {
-            Ok(()) => Err(error),
-            Err(cleanup_error) => Err(error.context(format!(
-                "cancelling clients after schedule acknowledgement failure also failed: {cleanup_error:#}"
-            ))),
-        };
-    }
     let measurement_start_unix_ms = run_start_unix_ms
-        .checked_add(config.warmup_seconds.saturating_mul(1_000))
+        .checked_add(
+            config
+                .warmup_seconds
+                .checked_mul(1_000)
+                .context("OAT warm-up duration overflow")?,
+        )
         .context("shared OAT measurement start timestamp overflow")?;
     let measurement_end_unix_ms = measurement_start_unix_ms
-        .checked_add(config.measure_seconds.saturating_mul(1_000))
+        .checked_add(
+            config
+                .measure_seconds
+                .checked_mul(1_000)
+                .context("OAT measurement duration overflow")?,
+        )
         .context("shared OAT measurement end timestamp overflow")?;
+    let delivery = tokio::time::timeout_at(schedule_deadline, async {
+        platform
+            .arm_clients(config, project_run_id, run_start_unix_ms)
+            .await
+            .context("arm common OAT client schedule")?;
+        local_progress(
+            config,
+            &format!(
+                "clients armed; schedule lead {}s, warm-up {}s, measurement {}s",
+                config.schedule_lead_seconds, config.warmup_seconds, config.measure_seconds
+            ),
+        );
+        loop {
+            let progress = poll_clients(platform, config, &handles)
+                .await
+                .context("poll OAT client schedule acknowledgement")?;
+            let observed_at = unix_time_ms_u64()?;
+            let acknowledged = validate_client_schedule(&progress, observed_at, run_start_unix_ms)?;
+            anyhow::ensure!(
+                tokio::time::Instant::now() < schedule_deadline,
+                "OAT client schedule acknowledgement exceeded the original delivery deadline"
+            );
+            if acknowledged {
+                break Ok::<_, anyhow::Error>(observed_at);
+            }
+            record_owner_observation(
+                pinning,
+                sample_router_table_owners(platform, config, &metrics_client, tables).await,
+                tables,
+                false,
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    })
+    .await;
+    let delivery = delivery.unwrap_or_else(|_| Err(anyhow::anyhow!(
+        "OAT client schedule delivery/acknowledgement timed out; the arm outcome may be indeterminate and is not retried"
+    )));
+    let acknowledged_at_unix_ms = match delivery {
+        Ok(observed_at) => observed_at,
+        Err(error) => {
+            let cleanup = cancel_clients(platform, config, &handles).await;
+            return match cleanup {
+                Ok(()) => Err(error),
+                Err(cleanup_error) => Err(error.context(format!(
+                    "cancelling clients after schedule delivery failure also failed: {cleanup_error:#}"
+                ))),
+            };
+        }
+    };
+    evidence.client_schedule = Some(json!({
+        "requested": {"schedule_lead_seconds": config.schedule_lead_seconds},
+        "effective": {
+            "schedule_lead_seconds": (run_start_unix_ms - schedule_created_at_unix_ms) / 1_000,
+            "schedule_created_at_unix_ms": schedule_created_at_unix_ms,
+            "run_start_unix_ms": run_start_unix_ms,
+            "measurement_start_unix_ms": measurement_start_unix_ms,
+            "measurement_end_unix_ms": measurement_end_unix_ms,
+            "acknowledged_at_unix_ms": acknowledged_at_unix_ms,
+            "schedule_wait_seconds": timing_budget.schedule_wait_seconds,
+            "client_job_lifetime_seconds": timing_budget.client_job_lifetime_seconds,
+            "minimum_pin_ttl_ms": timing_budget.minimum_pin_ttl_ms,
+            "planned_cell_duration_ms": timing_budget.planned_cell_duration_ms,
+        },
+        "scope": "orchestrator_assigned_schedule_with_observed_full_fleet_acknowledgement",
+    }));
     evidence.measurement_window = Some((measurement_start_unix_ms, measurement_end_unix_ms));
-    let sampler = ResourceSampler::start(
-        platform.resource_sampler_source(),
+    if let Some(prepared) = &mut prepared_guard {
+        prepared.engine.arm(run_start_unix_ms, measurement_end_unix_ms);
+        prepared.engine.proof["run_id"] = json!(project_run_id);
+        prepared.probe.since_ms = unix_time_ms_u64()?.saturating_sub(GUARD_MAX_GAP_MS);
+    }
+    let native = match platform.native_telemetry_source(config, &qap_tables).await {
+        Ok(source) => source,
+        Err(_) => {
+            evidence.native_telemetry = Some(json!({
+                "schema_version": 1, "unavailable_reason": "original_cell_native_source_binding_unavailable",
+                "samples": [],
+            }));
+            None
+        }
+    };
+    let sampler_source = match native {
+        Some(native) => Some(ResourceSamplerSource::AksNative(Arc::new(native))),
+        None => platform.resource_sampler_source(),
+    };
+    let mut sampler = ResourceSampler::start(
+        sampler_source,
         config.clone(),
         measurement_start_unix_ms,
         measurement_end_unix_ms,
+        prepared_guard,
     );
     let mut client_metrics = HashMap::<String, Vec<ClientMeasurement>>::with_capacity(tables.len());
     let mut completed_clients = HashSet::new();
@@ -2790,7 +5137,29 @@ async fn run_clients_inner(
             .iter()
             .map(|index| handles[*index].clone())
             .collect::<Vec<_>>();
-        let progress = match poll_clients(platform, config, &pending_handles).await {
+        let progress = tokio::select! {
+            biased;
+            reason = sampler.wait_for_overload_stop() => {
+                let cancellation = cancel_active_clients(platform, config, &handles, &active_clients).await;
+                let capture = sampler.finish_early(&mut evidence).await;
+                let mut failure = reason;
+                if let Err(error) = cancellation {
+                    failure.push_str(&format!("; client cancellation failed: {error:#}"));
+                }
+                if let Err(error) = capture {
+                    tracing::error!(%error, "overload stop sampler evidence unavailable");
+                    evidence.overload_guard = Some(json!({"status":"unavailable",
+                        "unavailable_reason":"monitor_terminal_capture_failed","settings":config.overload_guard}));
+                    failure.push_str("; terminal guard capture failed");
+                }
+                return Ok(ClientRun {
+                    metrics: HashMap::new(), pinning: std::mem::take(pinning), qap_tables,
+                    failure: Some(failure), evidence,
+                });
+            }
+            progress = poll_clients(platform, config, &pending_handles) => progress,
+        };
+        let progress = match progress {
             Ok(progress) => progress,
             Err(error) => {
                 let cleanup = cancel_active_clients(platform, config, &handles, &active_clients).await;
@@ -2863,7 +5232,8 @@ async fn run_clients_inner(
                         };
                     }
                 };
-                if let Err(error) = evidence.record_client(config, &handle.table, &output) {
+                let effective_client_config = resolved_fleet_client_config(config, index % config.clients_per_table)?;
+                if let Err(error) = evidence.record_client(&effective_client_config, &handle.table, &output) {
                     let cleanup = cancel_active_clients(platform, config, &handles, &active_clients).await;
                     return match cleanup {
                         Ok(()) => Err(error),
@@ -2871,6 +5241,18 @@ async fn run_clients_inner(
                             "cancelling clients after invalid effective-config evidence failed: {cleanup_error:#}"
                         ))),
                     };
+                }
+                if let Some(report) = evidence
+                    .client_reports
+                    .get_mut(&handle.table)
+                    .and_then(|reports| reports.last_mut())
+                {
+                    report["client_id"] = json!(handle.client_id);
+                    report["rows_per_second"] = json!(measurement.metrics.rows_per_second);
+                    report["rows"] = json!(measurement.metrics.rows);
+                    if let Some(fleet) = &config.platform.fleet {
+                        report["placement"] = serde_json::to_value(&fleet.clients[index].placement)?;
+                    }
                 }
                 client_metrics
                     .entry(handle.table.clone())
@@ -2923,6 +5305,20 @@ async fn run_clients_inner(
     ));
     let mut metrics = HashMap::with_capacity(tables.len());
     sampler.finish(&mut evidence).await?;
+    if evidence.overload_stop.is_some()
+        || evidence
+            .overload_guard
+            .as_ref()
+            .is_some_and(|guard| guard["status"] == "unavailable")
+    {
+        return Ok(ClientRun {
+            metrics: HashMap::new(),
+            pinning: std::mem::take(pinning),
+            qap_tables,
+            failure: Some("above_ceiling or overload_guard protection unavailable at terminal observation".to_owned()),
+            evidence,
+        });
+    }
     for table in tables {
         let reports = client_metrics
             .remove(table)
@@ -4076,7 +6472,7 @@ async fn observe_qap(
     run_id: &str,
     qap_tables: &[String],
     timeout_seconds: u64,
-) -> Result<QapMetrics> {
+) -> Result<(QapMetrics, Value)> {
     let results = std::path::PathBuf::from("out/arrowcol-oat/qap").join(run_id);
     let endpoint = endpoint.to_owned();
     let database = database.to_owned();
@@ -4121,7 +6517,54 @@ async fn observe_qap(
             bail!("QAP table metadata/statistics observation failed; not a temporary service-availability failure");
         }
     }
-    aggregate_qap(&observation, qap_tables)
+    let metrics = aggregate_qap(&observation, qap_tables)?;
+    let tables = qap_tables
+        .iter()
+        .map(|name| {
+            (
+                name.clone(),
+                json!({
+                    "available": observation["tables"][name]["available"],
+                    "row_count": observation["tables"][name]["state"]["RowCount"],
+                    "table_version": observation["tables"][name]["state"]["TableVersion"],
+                    "completion_percent": observation["tables"][name]["statistics"]["AccelerationCompletePercentage"],
+                    "pending_files": observation["tables"][name]["statistics"]["AccelerationPendingDataFilesCount"],
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    Ok((
+        metrics,
+        json!({
+            "run_id": run_id, "expected_tables": qap_tables,
+            "observed_unix_ms": observation["observed_unix_ms"],
+            "catch_up_status": observation["catch_up_status"], "tables": tables,
+        }),
+    ))
+}
+
+fn apply_qap_observation(
+    mode: crate::config::OatMode,
+    metrics: QapMetrics,
+    observation: Value,
+    evidence: &mut CellEvidence,
+) -> QapMetrics {
+    if local_downstream_optional(mode) && observation["catch_up_status"] == "deadline_incomplete" {
+        evidence.downstream_unavailable(format!(
+            "Local QAP catch-up deadline expired: observed completion {}%, pending files {}. \
+             Derived Kusto/QAP metrics are null; Delta commit measurements are unchanged.",
+            metrics
+                .completion_percent
+                .map_or_else(|| "unknown".to_owned(), |value| value.to_string()),
+            metrics
+                .pending_artifacts
+                .map_or_else(|| "unknown".to_owned(), |value| value.to_string()),
+        ));
+        evidence.qap_observation = Some(observation);
+        return QapMetrics::default();
+    }
+    evidence.qap_observation = Some(observation);
+    metrics
 }
 
 fn parse_qap_timestamp(value: &str) -> Option<i64> {
@@ -4353,6 +6796,7 @@ fn pin_init_config_json(
     now_unix_ms: u64,
     sql_host: &str,
     router_yaml: &str,
+    run_table: Option<(&str, &str)>,
 ) -> Result<String> {
     let parsed = uuid::Uuid::parse_str(run_id).context("pin initialization requires a UUID run ID")?;
     if parsed.to_string() != run_id {
@@ -4396,6 +6840,10 @@ fn pin_init_config_json(
             "port": 1433,
             "trust_server_certificate": true,
         },
+        "run_table": run_table.map(|(delta_root, table)| json!({
+            "delta_root": delta_root,
+            "table": table,
+        })),
     }))?)
 }
 
@@ -4418,6 +6866,7 @@ async fn run_local_pin_setup(
         now_unix_ms,
         "sqlserver",
         &router_yaml,
+        None,
     )?;
     let config_path = platform.state_dir.join("pin-init.json");
     write_private_secret(&config_path, &pin_config).context("write private local OAT pin initialization config")?;
@@ -4457,9 +6906,94 @@ async fn run_local_pin_setup(
     .map(|_| ())
 }
 
+fn run_table_initializer_cloud_env(config: &OatConfig, platform: &AksPlatform, run_id: &str) -> Result<Value> {
+    let runtime_path = platform
+        .runtime_dir
+        .as_ref()
+        .context("run-table initializer requires the validated run runtime directory")?
+        .join("runtime-config.json");
+    let runtime: Value = serde_json::from_slice(&fs::read(runtime_path)?)
+        .context("read validated run-table initializer runtime config")?;
+    let stamp = runtime["stamp"].as_str().context("run runtime has no Azure stamp")?;
+    let subscription = runtime["subscriptionId"]
+        .as_str()
+        .context("run runtime has no Azure subscription")?;
+    let subscription_id =
+        uuid::Uuid::parse_str(subscription).context("run runtime Azure subscription is not a UUID")?;
+    if subscription_id.is_nil()
+        || stamp.len() != 5
+        || !stamp.bytes().all(|byte| byte.is_ascii_digit())
+        || config.stamp.as_deref() != Some(stamp)
+    {
+        bail!("run-table initializer Azure ownership does not match the validated campaign stamp");
+    }
+    let root = platform
+        .delta_root
+        .as_deref()
+        .context("run-table initializer lost its Delta root")?;
+    if runtime["deltaRoot"].as_str() != Some(root)
+        || runtime["namespace"].as_str() != Some(config.namespace.as_str())
+        || runtime["oatRunId"].as_str() != Some(run_id)
+        || platform.run_id != run_id
+    {
+        bail!("run-table initializer runtime identity does not match the rendered collector");
+    }
+    let account = format!("arrowcollector{stamp}");
+    let url = Url::parse(root).context("parse run-table initializer Delta root")?;
+    if url.scheme() != "abfss" || url.host_str() != Some(format!("{account}.dfs.core.windows.net").as_str()) {
+        bail!("run-table initializer Delta account does not match the validated Azure stamp");
+    }
+    Ok(json!([
+        { "name": "ARROWCOL_DELTA_ROOT", "value": root },
+        { "name": "ARROWCOL_AZURE_MODE", "value": "stamped" },
+        { "name": "AZURE_SUBSCRIPTION_ID", "value": subscription },
+        { "name": "AZURE_STAMP", "value": stamp },
+        { "name": "AZURE_RESOURCE_GROUP", "value": "arrow-collector-rg" },
+        { "name": "AZURE_STORAGE_ACCOUNT", "value": account },
+        { "name": "AZURE_STORAGE_CHECKPOINT_CONTAINER", "value": "checkpoints" },
+        { "name": "ARROWCOL_RESET_GENERATION", "valueFrom": { "secretKeyRef": { "name": "arrowcol-generation", "key": "generation" } } },
+    ]))
+}
+
+fn created_pin_init_job_uid(output: &str, namespace: &str, job_name: &str, run_id: &str) -> Result<String> {
+    let mut resources = Vec::new();
+    for value in serde_json::Deserializer::from_str(output).into_iter::<Value>() {
+        let value = value.context("parse created pin initialization resources")?;
+        if value["kind"] == "List" {
+            resources.extend(
+                value["items"]
+                    .as_array()
+                    .context("created resource List has no items")?
+                    .clone(),
+            );
+        } else {
+            resources.push(value);
+        }
+    }
+    let jobs = resources
+        .iter()
+        .filter(|value| value["kind"] == "Job")
+        .collect::<Vec<_>>();
+    let [job] = jobs.as_slice() else {
+        bail!("created pin initialization output must identify exactly one Job");
+    };
+    if job["metadata"]["name"] != job_name
+        || job["metadata"]["namespace"] != namespace
+        || job["metadata"]["labels"]["arrowcol-oat-run"] != uuid::Uuid::parse_str(run_id)?.simple().to_string()
+    {
+        bail!("created pin initialization Job identity does not match this run");
+    }
+    let uid = job["metadata"]["uid"]
+        .as_str()
+        .filter(|uid| !uid.is_empty())
+        .context("created pin Job has no UID")?;
+    uuid::Uuid::parse_str(uid).context("created pin Job UID is not a UUID")?;
+    Ok(uid.to_owned())
+}
+
 async fn run_aks_pin_setup_job(
     config: &OatConfig,
-    platform: &AksPlatform,
+    platform: &mut AksPlatform,
     run_id: &str,
     expected_keys_json: &str,
     expires_at_unix_ms: u64,
@@ -4469,6 +7003,23 @@ async fn run_aks_pin_setup_job(
         .router_yaml
         .as_deref()
         .context("AKS pin initialization requires the exact rendered router config")?;
+    let run_table_owned = if config.campaign_profile == Some(crate::config::CampaignProfile::ScaleOutSingleTable) {
+        let [table] = config.tables.as_slice() else {
+            bail!("scale_out_single_table pin initialization requires exactly one hot table");
+        };
+        Some((
+            platform
+                .delta_root
+                .clone()
+                .context("scale-out run-scoped Delta root is unavailable")?,
+            canonical_dmv_table_name(table)?,
+        ))
+    } else {
+        None
+    };
+    let run_table = run_table_owned
+        .as_ref()
+        .map(|(root, table)| (root.as_str(), table.as_str()));
     let pin_config = pin_init_config_json(
         run_id,
         expected_keys_json,
@@ -4476,6 +7027,7 @@ async fn run_aks_pin_setup_job(
         now_unix_ms,
         "arrowcol-sql",
         router_yaml,
+        run_table,
     )?;
     let run_suffix = uuid::Uuid::parse_str(run_id)?.simple().to_string();
     let config_map_name = format!("oat-pin-init-config-{run_suffix}");
@@ -4492,7 +7044,18 @@ async fn run_aks_pin_setup_job(
         "requests": { "cpu": "100m", "memory": "128Mi" },
         "limits": { "cpu": "500m", "memory": "512Mi" },
     });
-    let payload = serde_json::to_vec(&json!({
+    let run_table_identity = run_table.is_some();
+    let pod_labels = if run_table_identity {
+        json!({ "labels": { "app": "arrowcol-oat-pin-init", "arrowcol-oat-run": run_suffix, "azure.workload.identity/use": "true" } })
+    } else {
+        json!({ "labels": labels })
+    };
+    let pod_env = if run_table_identity {
+        run_table_initializer_cloud_env(config, platform, run_id)?
+    } else {
+        json!([])
+    };
+    let mut payload_items = json!({
         "apiVersion": "v1",
         "kind": "List",
         "items": [{
@@ -4566,6 +7129,9 @@ async fn run_aks_pin_setup_job(
                                 "name": "migration-password",
                                 "mountPath": "/run/migration",
                                 "readOnly": true,
+                            }, {
+                                "name": "pin-init-tmp",
+                                "mountPath": "/tmp",
                             }],
                         }],
                         "volumes": [{
@@ -4581,17 +7147,77 @@ async fn run_aks_pin_setup_job(
                                 "defaultMode": 288,
                                 "items": [{ "key": "password", "path": "password" }],
                             },
+                        }, {
+                            "name": "pin-init-tmp",
+                            "emptyDir": { "sizeLimit": "64Mi" },
                         }],
                     },
                 },
             },
         }],
-    }))?;
-    kubectl(config, vec!["create", "-f", "-"], Some(payload))
-        .await
-        .context("create finite AKS OAT pin initialization Job")?;
+    });
+    if let Some(fleet) = &config.platform.fleet {
+        let selector = &mut payload_items["items"][1]["spec"]["template"]["spec"]["nodeSelector"];
+        selector["kubernetes.azure.com/agentpool"] = json!(fleet.collector.pool);
+        selector["kubernetes.io/hostname"] = json!(fleet.collector.node);
+    }
+    if run_table_identity {
+        let template = payload_items
+            .pointer_mut("/items/1/spec/template")
+            .context("pin-init Job template is missing")?;
+        template["metadata"] = pod_labels;
+        template["spec"]["containers"][0]["env"] = pod_env;
+    }
+    if run_table.is_some() {
+        platform.run_table_initialization_attempted = true;
+    }
+    let payload = serde_json::to_vec(&payload_items)?;
+    let mut manifest: Value = serde_json::from_slice(&payload).context("parse pin initialization resources")?;
+    let items = manifest["items"]
+        .as_array_mut()
+        .context("pin initialization resource list is missing")?;
+    prepare_run_owned_resources(config, platform, items).await?;
+    let planned_resources = items.clone();
+    let created = kubectl(
+        config,
+        vec!["create", "-f", "-", "-o", "json"],
+        Some(serde_json::to_vec(&manifest)?),
+    )
+    .await
+    .context("create finite AKS OAT pin initialization Job")?;
+    let job_uid = if run_table_identity {
+        let uid = created_pin_init_job_uid(&created, &config.namespace, &job_name, run_id)?;
+        let evidence_path = platform
+            .runtime_dir
+            .as_ref()
+            .context("pin Job identity requires runtime directory")?
+            .join("run-table-initializer-job.json");
+        fs::write(
+            evidence_path,
+            serde_json::to_vec_pretty(&json!({
+                "run_id":run_id,"namespace":config.namespace,"job_name":job_name,"job_uid":uid
+            }))?,
+        )?;
+        Some(uid)
+    } else {
+        None
+    };
+    record_applied_resource_uids(config, platform, &planned_resources).await?;
 
-    wait_for_aks_pin_setup(config, &job_name, run_id).await?;
+    let expected_table = run_table.map(|(_, table)| table);
+    wait_for_aks_pin_setup(
+        config,
+        platform,
+        &job_name,
+        job_uid.as_deref(),
+        run_id,
+        expected_table,
+        tokio::time::Instant::now() + Duration::from_secs(200),
+    )
+    .await?;
+    if run_table.is_some() {
+        platform.run_table_initialization_drained = true;
+    }
     kubectl(
         config,
         vec![
@@ -4693,8 +7319,151 @@ fn pin_init_job_failure_diagnostics(job: &Value, pods: &Value) -> String {
     }
 }
 
-async fn wait_for_aks_pin_setup(config: &OatConfig, job_name: &str, run_id: &str) -> Result<()> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(200);
+fn failed_initializer_termination_evidence(
+    namespace: &str,
+    job_name: &str,
+    job_uid: &str,
+    job: &Value,
+    pods: &Value,
+) -> Result<Value> {
+    if job.pointer("/metadata/uid").and_then(Value::as_str) != Some(job_uid)
+        || ["active", "ready", "terminating"]
+            .iter()
+            .any(|key| job["status"].get(key).is_some_and(|value| value.as_u64() != Some(0)))
+        || job["status"].get("uncountedTerminatedPods").is_some_and(|value| {
+            value.as_object().is_none_or(|uncounted| {
+                uncounted
+                    .keys()
+                    .any(|key| !matches!(key.as_str(), "succeeded" | "failed"))
+                    || ["succeeded", "failed"].iter().any(|key| {
+                        uncounted
+                            .get(*key)
+                            .is_some_and(|pods| pods.as_array().is_none_or(|pods| !pods.is_empty()))
+                    })
+            })
+        })
+        || !job
+            .pointer("/status/conditions")
+            .and_then(Value::as_array)
+            .is_some_and(|conditions| {
+                conditions
+                    .iter()
+                    .any(|condition| condition["type"] == "Failed" && condition["status"] == "True")
+            })
+    {
+        bail!(
+            "initializer Job lacks UID-bound Failed=True, zero active/ready/terminating and fully accounted terminal pods"
+        );
+    }
+    let pods = pods["items"]
+        .as_array()
+        .filter(|pods| !pods.is_empty())
+        .context("initializer pod list is empty or missing")?;
+    let mut evidence = Vec::new();
+    for pod in pods {
+        let pod_uid = pod
+            .pointer("/metadata/uid")
+            .and_then(Value::as_str)
+            .filter(|uid| !uid.is_empty())
+            .context("initializer pod UID missing")?;
+        if pod.pointer("/metadata/namespace").and_then(Value::as_str) != Some(namespace)
+            || pod.pointer("/metadata/labels/controller-uid").and_then(Value::as_str) != Some(job_uid)
+            || !pod.pointer("/metadata/ownerReferences").and_then(Value::as_array).is_some_and(|owners| {
+                let controllers = owners.iter().filter(|owner| owner["controller"] == true).collect::<Vec<_>>();
+                matches!(controllers.as_slice(), [owner] if owner["kind"] == "Job" && owner["name"] == job_name && owner["uid"] == job_uid)
+            })
+            || !matches!(pod.pointer("/status/phase").and_then(Value::as_str), Some("Failed" | "Succeeded"))
+            || pod.pointer("/spec/ephemeralContainers").is_some_and(|value| value.as_array().is_none_or(|items| !items.is_empty()))
+        {
+            bail!("initializer pod {pod_uid} lacks same-controller terminal phase proof");
+        }
+        let mut containers = Vec::new();
+        for (spec_key, status_key, required) in [
+            ("containers", "containerStatuses", true),
+            ("initContainers", "initContainerStatuses", false),
+        ] {
+            let declared = match pod["spec"].get(spec_key) {
+                Some(value) => value
+                    .as_array()
+                    .context("initializer container declarations are malformed")?
+                    .as_slice(),
+                None if !required => &[],
+                None => bail!("initializer application containers are missing"),
+            };
+            if required && declared.is_empty() {
+                bail!("initializer application container list is empty");
+            }
+            let statuses = match pod["status"].get(status_key) {
+                Some(value) => value
+                    .as_array()
+                    .context("initializer container status list is malformed")?
+                    .as_slice(),
+                None if declared.is_empty() => &[],
+                None => bail!("initializer container statuses are missing"),
+            };
+            if statuses.len() != declared.len() {
+                bail!("initializer container status coverage is incomplete");
+            }
+            let mut names = BTreeSet::new();
+            for container in declared {
+                let name = container["name"]
+                    .as_str()
+                    .filter(|name| !name.is_empty())
+                    .context("initializer container name missing")?;
+                if !names.insert(name) {
+                    bail!("initializer container declarations contain duplicate names");
+                }
+                let matches = statuses
+                    .iter()
+                    .filter(|status| status["name"] == name)
+                    .collect::<Vec<_>>();
+                let [status] = matches.as_slice() else {
+                    bail!("initializer container {name} has no unique kubelet status");
+                };
+                let state = status["state"]
+                    .as_object()
+                    .context("initializer container state missing")?;
+                if state.len() != 1 || !state.contains_key("terminated") {
+                    bail!("initializer container {name} is not positively terminated");
+                }
+                let terminated = &state["terminated"];
+                let container_id = terminated["containerID"]
+                    .as_str()
+                    .filter(|id| !id.is_empty())
+                    .context("terminated initializer containerID missing")?;
+                let exit_code = terminated["exitCode"]
+                    .as_i64()
+                    .context("terminated initializer exitCode missing")?;
+                let finished_at = terminated["finishedAt"]
+                    .as_str()
+                    .context("terminated initializer finishedAt missing")?;
+                let finished =
+                    chrono::DateTime::parse_from_rfc3339(finished_at).context("initializer finishedAt is invalid")?;
+                if finished.timestamp_millis() <= 0 {
+                    bail!("initializer finishedAt is not a positive termination timestamp");
+                }
+                containers.push(
+                    json!({"name":name,"container_id":container_id,"exit_code":exit_code,"finished_at":finished_at}),
+                );
+            }
+        }
+        evidence.push(json!({"pod_uid":pod_uid,"phase":pod["status"]["phase"],"containers":containers}));
+    }
+    Ok(json!({
+        "kind":"initializer_terminated_without_receipt","namespace":namespace,
+        "job_name":job_name,"job_uid":job_uid,"job_status":job["status"],"pods":evidence
+    }))
+}
+
+async fn wait_for_aks_pin_setup(
+    config: &OatConfig,
+    platform: &mut AksPlatform,
+    job_name: &str,
+    job_uid: Option<&str>,
+    run_id: &str,
+    expected_table: Option<&str>,
+    deadline: tokio::time::Instant,
+) -> Result<()> {
     loop {
         let output = kubectl(
             config,
@@ -4704,6 +7473,9 @@ async fn wait_for_aks_pin_setup(config: &OatConfig, job_name: &str, run_id: &str
         .await
         .with_context(|| format!("inspect AKS OAT pin initialization Job {job_name}"))?;
         let job: Value = serde_json::from_str(&output).context("parse AKS OAT pin initialization Job")?;
+        if job_uid.is_some_and(|uid| job.pointer("/metadata/uid").and_then(Value::as_str) != Some(uid)) {
+            bail!("AKS pin initialization Job UID changed; publisher termination is unconfirmed");
+        }
         if job.pointer("/status/succeeded").and_then(Value::as_u64).unwrap_or(0) > 0 {
             break;
         }
@@ -4733,7 +7505,7 @@ async fn wait_for_aks_pin_setup(config: &OatConfig, job_name: &str, run_id: &str
                     "--namespace",
                     &config.namespace,
                     "--selector",
-                    &format!("job-name={job_name}"),
+                    &job_uid.map_or_else(|| format!("job-name={job_name}"), |uid| format!("controller-uid={uid}")),
                     "-o",
                     "json",
                 ],
@@ -4742,7 +7514,27 @@ async fn wait_for_aks_pin_setup(config: &OatConfig, job_name: &str, run_id: &str
             .await
             .and_then(|output| serde_json::from_str::<Value>(&output).context("parse pin initialization Pod status"));
             let diagnostics = match pods {
-                Ok(pods) => pin_init_job_failure_diagnostics(&job, &pods),
+                Ok(pods) => {
+                    if failed && let Some(uid) = job_uid {
+                        match failed_initializer_termination_evidence(&config.namespace, job_name, uid, &job, &pods) {
+                            Ok(mut evidence) => {
+                                evidence["run_id"] = json!(run_id);
+                                let path = platform
+                                    .runtime_dir
+                                    .as_ref()
+                                    .context("initializer termination evidence requires the run runtime directory")?
+                                    .join("run-table-initializer-termination.json");
+                                fs::write(path, serde_json::to_vec_pretty(&evidence)?)
+                                    .context("persist positive failed initializer termination evidence")?;
+                                platform.run_table_initialization_drained = true;
+                            }
+                            Err(error) => {
+                                tracing::warn!(%error, "failed initializer publisher termination remains unconfirmed");
+                            }
+                        }
+                    }
+                    pin_init_job_failure_diagnostics(&job, &pods)
+                }
                 Err(error) => format!("Pod diagnostics unavailable: {error:#}"),
             };
             let logs = if logs.trim().is_empty() {
@@ -4768,7 +7560,96 @@ async fn wait_for_aks_pin_setup(config: &OatConfig, job_name: &str, run_id: &str
     if !logs.contains(&format!("initialized OAT pin set run_id={run_id}")) {
         bail!("AKS OAT pin initialization Job {job_name} did not confirm the requested run ID");
     }
+    if let Some(table) = expected_table {
+        validate_run_table_init_receipt(&logs, run_id, table)?;
+    }
     Ok(())
+}
+
+fn validate_run_table_init_receipt(logs: &str, run_id: &str, table: &str) -> Result<()> {
+    let receipt = logs.lines().find_map(|line| {
+        serde_json::from_str::<Value>(line)
+            .ok()
+            .filter(|value| value["kind"] == "oat_run_table_initialized")
+    });
+    let receipt = receipt.context("pin-init Job did not emit a run-table initialization receipt")?;
+    let delta = receipt.get("delta").context("pin-init receipt has no Delta metadata")?;
+    let table_id = delta
+        .get("table_id")
+        .and_then(Value::as_str)
+        .context("pin-init receipt has no Delta table ID")?;
+    let parsed_table_id = uuid::Uuid::parse_str(table_id).context("pin-init Delta table ID is not a UUID")?;
+    let schema_json = delta
+        .get("schema_json")
+        .and_then(Value::as_str)
+        .context("pin-init receipt has no Delta schema JSON")?;
+    let schema: Value = serde_json::from_str(schema_json).context("pin-init Delta schema JSON is invalid")?;
+    let expected_schema = arrowcol_loadgen::initialize::canonical_table_delta_schema(table)?;
+    if receipt["run_id"] != run_id
+        || receipt["table"] != table
+        || receipt["publisher_drained"] != true
+        || parsed_table_id.to_string() != table_id
+        || delta["version"] != 0
+        || delta["active_files"] != 0
+        || delta["partition_columns"] != json!(["__arrowcol_ingestion"])
+        || schema != expected_schema
+    {
+        bail!(
+            "pin-init Job run-table receipt does not prove the exact empty canonical Delta table was initialized and drained"
+        );
+    }
+    Ok(())
+}
+
+fn local_partition_initializer_args(table: &str, dataflow_root: &Path) -> Result<Vec<String>> {
+    if !dataflow_root.is_absolute() || !dataflow_root.is_dir() {
+        bail!("local partition initialization requires an existing absolute run-owned Dataflow directory");
+    }
+    let canonical_table = canonical_dmv_table_name(table)?;
+    if canonical_table != "telemetry.sqlserver.sqlserver_availability_replica_states" {
+        bail!("local partition initialization only supports the campaign hot table");
+    }
+    let dataflow_root = dataflow_root
+        .to_str()
+        .context("local run-owned Dataflow directory is not valid UTF-8")?;
+    Ok(vec![
+        "initialize-local".to_owned(),
+        "--partition-by-ingestion-date".to_owned(),
+        "--table".to_owned(),
+        canonical_table,
+        "--dataflow-root".to_owned(),
+        dataflow_root.to_owned(),
+    ])
+}
+
+async fn initialize_local_partitioned_campaign_table(config: &OatConfig, platform: &LocalPlatform) -> Result<()> {
+    if config.campaign_profile != Some(crate::config::CampaignProfile::SingleHotTable) {
+        return Ok(());
+    }
+    let [table] = config.tables.as_slice() else {
+        bail!("local partition initialization requires exactly one campaign table");
+    };
+    let dataflow_root = platform.state_dir.join("dataflow");
+    let arguments = local_partition_initializer_args(table, &dataflow_root)?;
+    let workspace = std::env::current_dir()?;
+    let mut build = Command::new("cargo");
+    build.args([
+        "build",
+        "--locked",
+        "--package",
+        "arrowcol-loadgen",
+        "--bin",
+        "arrowcol-loadgen",
+    ]);
+    build.current_dir(&workspace);
+    run_streaming_command(build, "build setup-only local partition initializer").await?;
+
+    let mut initialize = Command::new(workspace.join("target/debug/arrowcol-loadgen"));
+    initialize.args(arguments);
+    initialize.current_dir(workspace);
+    run_streaming_command(initialize, "initialize the fresh local campaign Delta table")
+        .await
+        .context("setup local partitioned table before starting Dataflow or any DMV client")
 }
 
 async fn prepare_local_platform(config: &OatConfig, platform: &LocalPlatform) -> Result<()> {
@@ -4786,6 +7667,7 @@ async fn prepare_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
     )
     .await
     .context("render run-owned dataflow profile before starting local workloads")?;
+    initialize_local_partitioned_campaign_table(config, platform).await?;
     let base_project = config
         .platform
         .compose_project
@@ -5008,7 +7890,69 @@ async fn local_docker_daemon() -> Result<String> {
     Ok(endpoint)
 }
 
+fn local_client_image(rendered: &Value) -> Result<&str> {
+    rendered
+        .pointer("/services/oat-client/image")
+        .and_then(Value::as_str)
+        .filter(|image| !image.is_empty() && !image.chars().any(char::is_whitespace))
+        .context("effective local OAT client image missing or invalid")
+}
+
+fn local_client_image_id(image: &str) -> Result<&str> {
+    let image = image.trim();
+    if !image
+        .strip_prefix("sha256:")
+        .is_some_and(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
+        bail!("local OAT client image did not resolve to an immutable Docker content ID");
+    }
+    Ok(image)
+}
+
+async fn resolve_local_client_image(config: &OatConfig, platform: &LocalPlatform) -> Result<String> {
+    let compose_file = config
+        .platform
+        .compose_file
+        .as_deref()
+        .context("local compose file is missing")?;
+    let base_project = config
+        .platform
+        .compose_project
+        .as_deref()
+        .context("local project is missing")?;
+    let project = scoped_compose_project(base_project, &platform.run_id);
+    let mut render = compose_command(
+        compose_file,
+        config.platform.compose_override_file.as_deref(),
+        &project,
+        "oat",
+    );
+    platform.add_compose_environment(&mut render);
+    render.args(["config", "--format", "json"]);
+    let rendered: Value = serde_json::from_slice(
+        &run_command(render, "read effective local OAT client image")
+            .await?
+            .stdout,
+    )
+    .context("parse effective local OAT client image")?;
+    let mut inspect = Command::new("docker");
+    inspect.args([
+        "image",
+        "inspect",
+        "--format",
+        "{{.Id}}",
+        local_client_image(&rendered)?,
+    ]);
+    let image = String::from_utf8(
+        run_command(inspect, "resolve local OAT client image content identity")
+            .await?
+            .stdout,
+    )?;
+    Ok(local_client_image_id(&image)?.to_owned())
+}
+
 async fn verify_local_bind_mount(config: &OatConfig, platform: &LocalPlatform) -> Result<()> {
+    let image = resolve_local_client_image(config, platform).await?;
     let nonce = uuid::Uuid::new_v4().to_string();
     let probe = platform.state_dir.join("control/daemon-bind-probe");
     fs::write(&probe, &nonce)?;
@@ -5050,11 +7994,11 @@ async fn verify_local_bind_mount(config: &OatConfig, platform: &LocalPlatform) -
     let user = format!("{uid}:{gid}");
     let mut command = Command::new("docker");
     command.args([
-        "run", "--rm", "--network", "none", "--read-only",
+        "run", "--rm", "--pull", "never", "--network", "none", "--read-only",
         "--user", &user,
         "--mount", &format!("type=bind,source={state},target=/oat-bind,readonly"),
         "--mount", &format!("type=bind,source={source},target=/oat-observability,readonly"),
-        "--entrypoint", "/bin/sh", "arrowcol-oat-client:local", "-ec",
+        "--entrypoint", "/bin/sh", &image, "-ec",
         "test \"$(cat /oat-bind/control/daemon-bind-probe)\" = \"$1\" && test -f /oat-bind/router-state/config.yaml && printf '%s' \"$2\" | sha256sum -c -",
         "oat-bind-probe", &nonce, &checksums,
     ]);
@@ -5099,23 +8043,12 @@ async fn stop_local_snapshot_writers(config: &OatConfig, platform: &LocalPlatfor
     } else {
         validate_owned_local_containers(&before, &project)?;
     }
-    let has_maintenance = before.iter().any(|container| {
-        container
-            .pointer("/Config/Labels/com.docker.compose.service")
-            .and_then(Value::as_str)
-            == Some("delta-maintenance")
-    });
     let has_collector = before.iter().any(|container| {
         container
             .pointer("/Config/Labels/com.docker.compose.service")
             .and_then(Value::as_str)
             == Some("dataflow-1")
     });
-    let maintenance_baseline = if has_maintenance {
-        local_process_logs_for_role(config, platform, Some(ComponentRole::Maintenance)).await?
-    } else {
-        Vec::new()
-    };
     let phases = snapshot_stop_phases(&before)?;
     let mut maintenance_logs = None;
     let mut collector_sigterm_at_unix_ms = None;
@@ -5125,8 +8058,10 @@ async fn stop_local_snapshot_writers(config: &OatConfig, platform: &LocalPlatfor
         }
         if !phase.is_empty() {
             let mut stop = Command::new("docker");
+            let stop_budgets = config.maintenance_stop_budget()?;
             stop.args(local_phase_stop_args(
                 phase_index,
+                stop_budgets.maintenance_grace_seconds,
                 config.collector_stop_grace_seconds,
                 phase,
             ));
@@ -5243,7 +8178,11 @@ async fn stop_local_snapshot_writers(config: &OatConfig, platform: &LocalPlatfor
                 .iter()
                 .find(|log| log.instance_id == id)
                 .unwrap_or(&incomplete_log);
-            outcome["maintenance_outcomes"] = maintenance_cell_outcome_evidence(log, &maintenance_baseline);
+            let evidence = maintenance_cell_outcome_evidence(log, &platform.maintenance_cell_baseline);
+            outcome["maintenance_operation_failure"] = evidence["operation_failure"].clone();
+            outcome["maintenance_exit_classification"] =
+                maintenance_exit_classification(log, outcome["exit_code"].as_i64());
+            outcome["maintenance_outcomes"] = evidence;
         }
     }
     Ok(outcomes)
@@ -5307,7 +8246,6 @@ fn snapshot_container_outcomes(before: &[Value], after: &[Value], project: &str)
             .get("ExitCode")
             .and_then(Value::as_i64)
             .context("container exit code missing")?;
-        let maintenance_operation_failure = service == "delta-maintenance" && exit == 1;
         let role = if service == "delta-maintenance" {
             ComponentRole::Maintenance
         } else {
@@ -5330,8 +8268,10 @@ fn snapshot_container_outcomes(before: &[Value], after: &[Value], project: &str)
         writers.push(json!({
             "id": id, "service": service, "was_running": was_running, "exit_code": exit,
             "finished_at": finished_at, "oom_killed": state["OOMKilled"],
-            "maintenance_operation_failure": maintenance_operation_failure,
-            "comment": maintenance_operation_failure.then_some("Maintenance operation errors are retained by error_kind in the cell evidence; raw error text is omitted."),
+            "maintenance_operation_failure": null,
+            "comment": (service == "delta-maintenance" && exit == 1).then_some(
+                "Cumulative maintenance health exit retained; cell records and health diagnostics determine failure, retry-only, or UNKNOWN.",
+            ),
         }));
     }
     Ok(writers)
@@ -5409,39 +8349,50 @@ fn build_shutdown_drain_evidence(containers: &[Value]) -> Value {
             "container_id": container["id"],
             "outcomes": container["maintenance_outcomes"],
             "exit_code": container["exit_code"],
+            "exit_classification": container["maintenance_exit_classification"],
         })).collect::<Vec<_>>(),
     })
 }
 
-fn local_phase_stop_args(phase: usize, collector_grace: u64, containers: Vec<String>) -> Vec<String> {
-    let grace = if phase == 2 { collector_grace } else { 300 };
+fn local_phase_stop_args(
+    phase: usize,
+    maintenance_grace: u64,
+    collector_grace: u64,
+    containers: Vec<String>,
+) -> Vec<String> {
+    let grace = match phase {
+        1 => maintenance_grace,
+        2 => collector_grace,
+        _ => 300,
+    };
     let mut args = vec!["stop".to_owned(), "--time".to_owned(), grace.to_string()];
     args.extend(containers);
     args
 }
 
-fn local_stop_deadline(collector_grace: u64) -> Duration {
-    Duration::from_secs(collector_grace + 3 * 300 + 120)
+fn local_stop_deadline(collector_grace: u64, maintenance_timeout_ms: u64) -> Duration {
+    Duration::from_millis(maintenance_timeout_ms) + Duration::from_secs(collector_grace + 2 * 300 + 120)
 }
 
 async fn stop_then_destroy<T>(
     stop: impl std::future::Future<Output = Result<T>>,
     destroy: impl std::future::Future<Output = Result<()>>,
 ) -> Result<T> {
-    let stopped = stop.await;
-    let destroyed = destroy.await;
-    match (stopped, destroyed) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Err(stop), Ok(())) => Err(stop),
-        (Ok(_), Err(destroy)) => Err(destroy),
-        (Err(stop), Err(destroy)) => Err(anyhow::anyhow!("stop failed: {stop:#}; cleanup failed: {destroy:#}")),
-    }
+    let stopped = stop.await.context(
+        "stop failed or drain is uncertain; retaining owned resources for recovery, operator intervention required",
+    )?;
+    destroy.await?;
+    Ok(stopped)
 }
 
 async fn cleanup_local_platform(config: &OatConfig, platform: &LocalPlatform) -> Result<Value> {
+    let stop_budgets = config.maintenance_stop_budget()?;
     let stop = async {
         tokio::time::timeout(
-            local_stop_deadline(config.collector_stop_grace_seconds),
+            local_stop_deadline(
+                config.collector_stop_grace_seconds,
+                stop_budgets.maintenance_stop_timeout_ms,
+            ),
             stop_local_snapshot_writers(config, platform),
         )
         .await
@@ -5463,7 +8414,12 @@ async fn cleanup_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
     } else {
         stop_then_destroy(stop, destroy_local_platform(config, platform)).await?
     };
-    Ok(build_shutdown_drain_evidence(&containers))
+    let mut evidence = build_shutdown_drain_evidence(&containers);
+    if let Some(destination) = &config.platform.local.snapshot_root {
+        evidence["stopped_delta_snapshots"] =
+            crate::local::stopped_snapshot_references(Path::new(destination), &platform.run_id, &config.tables)?;
+    }
+    Ok(evidence)
 }
 
 fn local_oat_client_list_args(project: &str) -> Vec<String> {
@@ -5524,6 +8480,9 @@ async fn destroy_local_platform(config: &OatConfig, platform: &LocalPlatform) ->
             &project,
             "benchmark",
         );
+        if maintenance_enabled(config) {
+            down.args(["--profile", "maintenance"]);
+        }
         down.envs(&platform.environment);
         down.args(["down", "--volumes", "--remove-orphans"]);
         run_streaming_command(down, "clean up local OAT stack").await?;
@@ -5626,22 +8585,40 @@ async fn configure_deployments(config: &OatConfig, replicas: u32, concurrency: u
             desired["spec"]["replicas"] = json!(replicas);
         }
         if name == config.dfe_deployment {
-            configure_workers(&mut desired, &config.dfe_container, concurrency)?;
-            desired["spec"]["template"]["spec"]["terminationGracePeriodSeconds"] =
-                json!(config.collector_stop_grace_seconds);
-            inject_deployment_environment(
-                &mut desired,
-                &config.dfe_container,
-                &role_environment(config, ComponentRole::Collector)?,
-            )?;
+            configure_collector_deployment(config, &mut desired, concurrency)?;
         }
         apply_deployment(config, desired).await?;
         if name == config.dfe_deployment {
             let applied = deployment(config, name).await?;
             verify_aks_collector_stop_grace(&applied, config.collector_stop_grace_seconds)?;
+            let containers = applied
+                .pointer("/spec/template/spec/containers")
+                .and_then(Value::as_array)
+                .context("applied collector Deployment has no containers")?;
+            verify_container_resources(
+                containers,
+                &config.dfe_container,
+                "collector",
+                &config.effective_aks_resources().collector,
+            )?;
         }
     }
     Ok(())
+}
+
+fn configure_collector_deployment(config: &OatConfig, desired: &mut Value, concurrency: u32) -> Result<()> {
+    configure_workers(desired, &config.dfe_container, concurrency)?;
+    configure_deployment_container_resources(
+        desired,
+        &config.dfe_container,
+        &config.effective_aks_resources().collector,
+    )?;
+    desired["spec"]["template"]["spec"]["terminationGracePeriodSeconds"] = json!(config.collector_stop_grace_seconds);
+    let variables = role_environment(config, ComponentRole::Collector)?;
+    if config.campaign_profile == Some(crate::config::CampaignProfile::ScaleOutSingleTable) {
+        validate_collector_exporter_override(desired, &config.dfe_container, &variables)?;
+    }
+    inject_deployment_environment(desired, &config.dfe_container, &variables)
 }
 
 fn verify_aks_collector_stop_grace(deployment: &Value, expected_seconds: u64) -> Result<()> {
@@ -5715,7 +8692,7 @@ async fn deployment(config: &OatConfig, name: &str) -> Result<Value> {
     serde_json::from_str(&output).with_context(|| format!("parse Deployment {name} JSON"))
 }
 
-async fn apply_aks_overlay(config: &OatConfig, overlay: &str) -> Result<()> {
+async fn apply_aks_overlay(config: &OatConfig, overlay: &str, platform: &mut AksPlatform) -> Result<()> {
     let rendered = kubectl(config, vec!["kustomize", overlay], None)
         .await
         .context("render configured AKS Kustomize overlay")?;
@@ -5750,14 +8727,18 @@ async fn apply_aks_overlay(config: &OatConfig, overlay: &str) -> Result<()> {
     }
     let allowed_names = config.deployment_names().into_iter().map(str::to_owned).collect();
     validate_aks_overlay_resources(&resources, &allowed_names, &config.namespace)?;
+    prepare_run_owned_resources(config, platform, &mut resources).await?;
 
     kubectl(
         config,
         vec!["apply", "--namespace", &config.namespace, "-f", "-"],
-        Some(rendered.into_bytes()),
+        Some(serde_json::to_vec(
+            &json!({"apiVersion":"v1", "kind":"List", "items":resources}),
+        )?),
     )
     .await
     .context("apply configured AKS Kustomize overlay")?;
+    record_applied_resource_uids(config, platform, &resources).await?;
     Ok(())
 }
 
@@ -5871,6 +8852,31 @@ fn qap_bindings(run_id: &str, tables: &[String]) -> Result<Vec<QapBinding>> {
         .collect()
 }
 
+fn campaign_qap_manifest(
+    run_id: &str,
+    database: &str,
+    run_root: &str,
+    tables: &[String],
+) -> Result<(Value, Vec<InventoryQapBinding>)> {
+    let bindings = qap_bindings(run_id, tables)?;
+    let inventory_bindings = bindings
+        .iter()
+        .map(|binding| {
+            Ok(InventoryQapBinding {
+                external_table: binding.external_table.clone(),
+                relative_path: aks_qap_relative_path(run_root, &binding.logical_table)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let manifest = json!({
+        "schema_version": 1,
+        "run_id": run_id,
+        "database": database,
+        "tables": inventory_bindings,
+    });
+    Ok((manifest, inventory_bindings))
+}
+
 fn aks_qap_relative_path(run_root: &str, table: &str) -> Result<String> {
     if !table.starts_with("sqlserver_") || !table.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_') {
         bail!("OAT QAP table path has an invalid table identity");
@@ -5928,7 +8934,1157 @@ fn namespace_uid_for_cleanup(namespace: &Value, expected_uid: Option<&str>) -> R
     Ok(uid.to_owned())
 }
 
-async fn prepare_aks_platform(config: &OatConfig, platform: &mut AksPlatform) -> Result<()> {
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum CampaignCleanupAction {
+    StopAdmission,
+    BoundedDrain,
+    EvidenceCapture,
+    StopMaintenance,
+    TerminalCapture,
+    RemoveNamespace,
+    RemoveQap,
+    RemoveFic,
+    Handoff,
+}
+
+impl CampaignCleanupAction {
+    fn selector(&self) -> &'static str {
+        match self {
+            Self::StopAdmission => "stop_admission",
+            Self::BoundedDrain => "bounded_drain",
+            Self::EvidenceCapture => "evidence_capture",
+            Self::StopMaintenance => "stop_maintenance",
+            Self::TerminalCapture => "terminal_capture",
+            Self::RemoveNamespace => "remove_namespace",
+            Self::RemoveQap => "remove_qap",
+            Self::RemoveFic => "remove_fic",
+            Self::Handoff => "handoff",
+        }
+    }
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum CampaignActorMode {
+    Producer,
+    Controller,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct CampaignCleanupActor {
+    mode: CampaignActorMode,
+    owner_id: String,
+    fencing_token: u64,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct CampaignInventoryReadRequest<'a> {
+    schema_version: u8,
+    campaign_id: &'a str,
+    orchestration_run_id: &'a str,
+    cell_run_id: &'a str,
+    actor: &'a CampaignCleanupActor,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct CampaignCleanupRequest<'a> {
+    schema_version: u8,
+    inventory: &'a RunInventory,
+    expected_etag: &'a str,
+    actor: &'a CampaignCleanupActor,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct CampaignCellBaselineRequest<'a> {
+    schema_version: u8,
+    campaign_id: &'a str,
+    orchestration_run_id: &'a str,
+    cell_run_id: &'a str,
+    expected_etag: &'a str,
+    hot_delta_relative_path: &'a str,
+    actor: &'a CampaignCleanupActor,
+}
+
+#[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum CampaignDeltaState {
+    Table,
+    ObservedAbsent,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct CampaignCellBaselineReceipt {
+    status: String,
+    campaign_id: String,
+    owner_id: String,
+    fencing_token: u64,
+    orchestration_run_id: String,
+    cell_run_id: String,
+    namespace_uid: String,
+    hot_delta_relative_path: String,
+    blob: String,
+    etag: String,
+    delta_state: CampaignDeltaState,
+    table_id: Option<String>,
+    delta_version: Option<u64>,
+    rows: Option<u64>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CampaignCellBaselineResponse {
+    ok: bool,
+    receipt: Option<CampaignCellBaselineReceipt>,
+    code: Option<String>,
+    message: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct CampaignBaselineReceipt {
+    status: String,
+    campaign_id: String,
+    owner_id: String,
+    fencing_token: u64,
+    blob: String,
+    etag: String,
+    captured_at_unix_ms: u64,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CampaignBaselineResponse {
+    ok: bool,
+    receipt: Option<CampaignBaselineReceipt>,
+    code: Option<String>,
+    message: Option<String>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CampaignInventoryReadResponse {
+    ok: bool,
+    inventory: RunInventory,
+    etag: String,
+}
+
+fn deserialize_present_campaign_option<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    <Option<T> as serde::Deserialize>::deserialize(deserializer)
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct CampaignCleanupReceipt {
+    status: String,
+    step: String,
+    campaign_id: String,
+    owner_id: String,
+    fencing_token: u64,
+    orchestration_run_id: String,
+    cell_run_id: String,
+    #[serde(deserialize_with = "deserialize_present_campaign_option")]
+    namespace_uid: Option<String>,
+    actor: CampaignCleanupActor,
+    completed_at_unix_ms: u64,
+    etag: String,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CampaignCleanupResponse {
+    ok: bool,
+    receipt: CampaignCleanupReceipt,
+}
+
+fn validate_campaign_etag(etag: &str) -> Result<()> {
+    if etag.is_empty()
+        || etag.len() > 512
+        || etag == "*"
+        || etag.starts_with("W/")
+        || etag.bytes().any(|byte| byte.is_ascii_control())
+    {
+        bail!("campaign inventory requires a strong nonempty ETag");
+    }
+    Ok(())
+}
+
+const MAX_CAMPAIGN_CLEANUP_ATTEMPTS: usize = 3;
+
+#[derive(Debug)]
+struct StaleCampaignVersionError {
+    action: String,
+}
+
+impl std::fmt::Display for StaleCampaignVersionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "campaign cleanup {} rejected a stale version before effects",
+            self.action
+        )
+    }
+}
+
+impl std::error::Error for StaleCampaignVersionError {}
+
+fn campaign_custody_helper_failure(action: &str, stdout: &[u8]) -> anyhow::Error {
+    let code = serde_json::from_slice::<Value>(stdout)
+        .ok()
+        .and_then(|response| response.get("code").and_then(Value::as_str).map(str::to_owned))
+        .filter(|code| {
+            matches!(
+                code.as_str(),
+                "campaign_fenced" | "stale_version" | "write_outcome_unknown" | "invalid_or_storage_error"
+            )
+        })
+        .unwrap_or_else(|| "invalid_response".to_owned());
+    if action == "cleanup-step" && code == "stale_version" {
+        anyhow::Error::new(StaleCampaignVersionError {
+            action: action.to_owned(),
+        })
+    } else {
+        anyhow::anyhow!("campaign custody helper {action} failed: {code}")
+    }
+}
+
+#[cfg(unix)]
+async fn run_campaign_custody_json<T: serde::Serialize>(
+    platform: &AksPlatform,
+    action: &str,
+    selector: Option<&str>,
+    request: &T,
+    timeout: Duration,
+) -> Result<Vec<u8>> {
+    let payload = serde_json::to_vec(request)?;
+    if payload.len() > 1024 * 1024 {
+        bail!("campaign custody request exceeds the helper input limit");
+    }
+    let action_args = selector.map(|value| vec![value.to_owned()]).unwrap_or_default();
+    let mut command = aks_campaign_cli_command(platform.campaign_cli_paths()?, action, &action_args)?;
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .kill_on_drop(true);
+    let output = match tokio::time::timeout(timeout, async {
+        let mut child = command.spawn().context("start campaign custody helper")?;
+        let pid = i32::try_from(child.id().context("campaign custody helper PID unavailable")?)
+            .context("campaign custody helper PID invalid")?;
+        let _group =
+            OwnedQapHelperGroup(rustix::process::Pid::from_raw(pid).context("campaign custody helper PID invalid")?);
+        let mut stdin = child.stdin.take().context("open campaign custody helper input")?;
+        stdin
+            .write_all(&payload)
+            .await
+            .context("write campaign custody request")?;
+        drop(stdin);
+        child
+            .wait_with_output()
+            .await
+            .context("wait for campaign custody helper")
+    })
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) if matches!(action, "cleanup-step" | "capture-cell-baseline" | "capture-baseline") => {
+            bail!("campaign {action} helper timed out; effect outcome is UNKNOWN and must not be replayed")
+        }
+        Err(_) => bail!("campaign inventory helper timed out; no authoritative readback was obtained"),
+    };
+    if !output.status.success() {
+        return Err(campaign_custody_helper_failure(action, &output.stdout));
+    }
+    Ok(output.stdout)
+}
+
+#[cfg(not(unix))]
+async fn run_campaign_custody_json<T: serde::Serialize>(
+    _platform: &AksPlatform,
+    _action: &str,
+    _selector: Option<&str>,
+    _request: &T,
+    _timeout: Duration,
+) -> Result<Vec<u8>> {
+    bail!("campaign custody requires Unix process-group cancellation")
+}
+
+fn parse_campaign_baseline_response(output: &[u8], identity: &CampaignIdentity) -> Result<CampaignBaselineReceipt> {
+    let response: CampaignBaselineResponse =
+        serde_json::from_slice(output).context("parse immutable campaign baseline receipt")?;
+    if !response.ok {
+        let code = response
+            .code
+            .as_deref()
+            .filter(|code| !code.is_empty())
+            .context("campaign baseline failure returned no error code")?;
+        bail!("campaign baseline capture failed: {code}");
+    }
+    if response.code.is_some() || response.message.is_some() {
+        bail!("successful campaign baseline response included error fields");
+    }
+    let receipt = response
+        .receipt
+        .context("campaign baseline response omitted its receipt")?;
+    validate_campaign_baseline_receipt(&receipt, identity)?;
+    Ok(receipt)
+}
+
+async fn load_campaign_baseline_receipt(
+    platform: &AksPlatform,
+    identity: &CampaignIdentity,
+) -> Result<Option<CampaignBaselineReceipt>> {
+    let runtime_dir = platform
+        .runtime_dir
+        .as_deref()
+        .context("campaign runtime directory is not available")?;
+    let path = runtime_dir.join("campaign-baseline.json");
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("read campaign baseline receipt {}", path.display())),
+    };
+    let receipt: CampaignBaselineReceipt =
+        serde_json::from_slice(&bytes).context("parse persisted immutable campaign baseline receipt")?;
+    validate_campaign_baseline_receipt(&receipt, identity)?;
+    Ok(Some(receipt))
+}
+
+#[cfg(unix)]
+async fn capture_campaign_baseline(
+    platform: &AksPlatform,
+    identity: &CampaignIdentity,
+) -> Result<CampaignBaselineReceipt> {
+    if let Some(receipt) = load_campaign_baseline_receipt(platform, identity).await? {
+        return Ok(receipt);
+    }
+    let action_args = vec![identity.owner_id.clone(), identity.fencing_token.to_string()];
+    let mut command = aks_campaign_cli_command(platform.campaign_cli_paths()?, "capture-baseline", &action_args)?;
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(Duration::from_secs(90), async {
+        let child = command.spawn().context("start campaign baseline capture")?;
+        let pid = i32::try_from(child.id().context("campaign baseline helper PID unavailable")?)
+            .context("campaign baseline helper PID invalid")?;
+        let _group =
+            OwnedQapHelperGroup(rustix::process::Pid::from_raw(pid).context("campaign baseline helper PID invalid")?);
+        child
+            .wait_with_output()
+            .await
+            .context("wait for campaign baseline helper")
+    })
+    .await
+    .context("campaign baseline capture timed out; outcome is UNKNOWN and must not be replayed")??;
+    if !output.status.success() {
+        return Err(campaign_custody_helper_failure("capture-baseline", &output.stdout));
+    }
+    let receipt = parse_campaign_baseline_response(&output.stdout, identity)?;
+    if let Some(existing) = load_campaign_baseline_receipt(platform, identity).await? {
+        if existing != receipt {
+            bail!("persisted campaign baseline proof changed; refusing to replace the original receipt");
+        }
+        return Ok(existing);
+    }
+    let runtime_dir = platform
+        .runtime_dir
+        .as_deref()
+        .context("campaign runtime directory is not available")?;
+    tokio::fs::write(
+        runtime_dir.join("campaign-baseline.json"),
+        serde_json::to_vec(&receipt)?,
+    )
+    .await
+    .context("persist immutable campaign baseline receipt")?;
+    Ok(receipt)
+}
+
+#[cfg(not(unix))]
+async fn capture_campaign_baseline(
+    _platform: &AksPlatform,
+    _identity: &CampaignIdentity,
+) -> Result<CampaignBaselineReceipt> {
+    bail!("campaign custody requires Unix process-group cancellation")
+}
+
+fn validate_campaign_cell_baseline(
+    receipt: &CampaignCellBaselineReceipt,
+    inventory: &RunInventory,
+    identity: &CampaignIdentity,
+    run_id: &str,
+    hot_delta_relative_path: &str,
+) -> Result<()> {
+    validate_campaign_etag(&receipt.etag)?;
+    let expected_blob = format!(
+        "_arrowcol-custody/campaigns/{}/runs/{}/cells/{}/delta-before.json",
+        inventory.campaign_id, inventory.orchestration_run_id, run_id
+    );
+    let planned_binding_count = inventory
+        .qap
+        .as_ref()
+        .filter(|qap| qap.state == InventoryResourceState::Planned)
+        .map(|qap| {
+            qap.bindings
+                .iter()
+                .filter(|binding| binding.relative_path == hot_delta_relative_path)
+                .count()
+        })
+        .unwrap_or(0);
+    if inventory.load_admission != InventoryLoadAdmission::NotAuthorized
+        || planned_binding_count != 1
+        || receipt.status != "captured"
+        || receipt.campaign_id != identity.campaign_id
+        || receipt.owner_id != identity.owner_id
+        || receipt.fencing_token != identity.fencing_token
+        || receipt.orchestration_run_id != inventory.orchestration_run_id
+        || receipt.cell_run_id != run_id
+        || receipt.namespace_uid != inventory.namespace.uid.as_deref().unwrap_or_default()
+        || receipt.hot_delta_relative_path != hot_delta_relative_path
+        || receipt.blob != expected_blob
+        || !valid_blob_path(&receipt.blob)
+    {
+        bail!("cell baseline receipt does not match the exact campaign, cell, namespace and hot Delta path");
+    }
+    match receipt.delta_state {
+        CampaignDeltaState::Table => {
+            if receipt.table_id.as_deref().is_none_or(str::is_empty)
+                || receipt.delta_version.is_none()
+                || receipt.rows.is_none()
+            {
+                bail!("existing-table baseline requires its exact Delta table ID, version and row count");
+            }
+        }
+        CampaignDeltaState::ObservedAbsent => {
+            if receipt.table_id.is_some() || receipt.delta_version.is_some() || receipt.rows.is_some() {
+                bail!("observed-absent baseline must not invent table identity, version or row count");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_campaign_inventory_identity(
+    inventory: &RunInventory,
+    campaign_id: &str,
+    owner_id: &str,
+    fencing_token: u64,
+    orchestration_run_id: &str,
+    cell_run_id: &str,
+) -> Result<()> {
+    inventory.validate()?;
+    if inventory.campaign_id != campaign_id
+        || inventory.owner_id != owner_id
+        || inventory.fencing_token != fencing_token
+        || inventory.orchestration_run_id != orchestration_run_id
+        || inventory.cell_run_id != cell_run_id
+    {
+        bail!("authoritative campaign inventory identity does not match this OAT cell");
+    }
+    Ok(())
+}
+
+fn campaign_baseline_blob(campaign_id: &str) -> String {
+    format!("_arrowcol-custody/campaigns/{campaign_id}/baseline.json")
+}
+
+fn validate_campaign_baseline_receipt(receipt: &CampaignBaselineReceipt, identity: &CampaignIdentity) -> Result<()> {
+    validate_campaign_etag(&receipt.etag)?;
+    let expected_blob = campaign_baseline_blob(&identity.campaign_id);
+    if receipt.status != "captured"
+        || receipt.campaign_id != identity.campaign_id
+        || receipt.owner_id != identity.owner_id
+        || receipt.fencing_token != identity.fencing_token
+        || receipt.blob != expected_blob
+        || !valid_blob_path(&receipt.blob)
+        || receipt.captured_at_unix_ms == 0
+    {
+        bail!("campaign baseline receipt does not match the exact campaign, producer fence, and immutable blob");
+    }
+    Ok(())
+}
+
+fn validate_campaign_baseline_capture_inventory(inventory: &RunInventory, identity: &CampaignIdentity) -> Result<()> {
+    validate_campaign_inventory_identity(
+        inventory,
+        &identity.campaign_id,
+        &identity.owner_id,
+        identity.fencing_token,
+        &inventory.orchestration_run_id,
+        &inventory.cell_run_id,
+    )?;
+    if inventory.load_admission != InventoryLoadAdmission::NotAuthorized
+        || inventory.namespace.uid.is_some()
+        || !inventory.resources.is_empty()
+        || inventory.fic.is_some()
+        || inventory.qap.is_some()
+    {
+        bail!("campaign baseline capture requires the initial not_authorized inventory");
+    }
+    Ok(())
+}
+
+async fn read_authoritative_campaign_inventory(
+    platform: &AksPlatform,
+    identity: &CampaignIdentity,
+    orchestration_run_id: &str,
+    timeout: Duration,
+) -> Result<(RunInventory, String)> {
+    let actor = CampaignCleanupActor {
+        mode: CampaignActorMode::Producer,
+        owner_id: identity.owner_id.clone(),
+        fencing_token: identity.fencing_token,
+    };
+    let request = CampaignInventoryReadRequest {
+        schema_version: 1,
+        campaign_id: &identity.campaign_id,
+        orchestration_run_id,
+        cell_run_id: &platform.run_id,
+        actor: &actor,
+    };
+    let output = run_campaign_custody_json(platform, "read-inventory", None, &request, timeout).await?;
+    let response: CampaignInventoryReadResponse =
+        serde_json::from_slice(&output).context("parse authoritative campaign inventory")?;
+    if !response.ok {
+        bail!("campaign inventory read was not positively confirmed");
+    }
+    validate_campaign_etag(&response.etag)?;
+    validate_campaign_inventory_identity(
+        &response.inventory,
+        &identity.campaign_id,
+        &identity.owner_id,
+        identity.fencing_token,
+        orchestration_run_id,
+        &platform.run_id,
+    )?;
+    Ok((response.inventory, response.etag))
+}
+
+fn campaign_cleanup_step<'a>(action: &CampaignCleanupAction, inventory: &'a RunInventory) -> Option<&'a InventoryStep> {
+    match action {
+        CampaignCleanupAction::StopAdmission => Some(&inventory.cleanup.stop_admission),
+        CampaignCleanupAction::BoundedDrain => Some(&inventory.cleanup.bounded_drain),
+        CampaignCleanupAction::EvidenceCapture => Some(&inventory.cleanup.evidence_capture),
+        CampaignCleanupAction::StopMaintenance => Some(&inventory.cleanup.stop_maintenance),
+        CampaignCleanupAction::TerminalCapture => Some(&inventory.cleanup.terminal_capture),
+        CampaignCleanupAction::Handoff => Some(&inventory.cleanup.handoff),
+        CampaignCleanupAction::RemoveNamespace
+        | CampaignCleanupAction::RemoveQap
+        | CampaignCleanupAction::RemoveFic => None,
+    }
+}
+
+fn campaign_cleanup_step_complete(action: &CampaignCleanupAction, inventory: &RunInventory) -> Result<()> {
+    let complete = match action {
+        CampaignCleanupAction::StopAdmission => inventory.cleanup.stop_admission.state == InventoryStepState::Complete,
+        CampaignCleanupAction::BoundedDrain => inventory.cleanup.bounded_drain.state == InventoryStepState::Complete,
+        CampaignCleanupAction::EvidenceCapture => {
+            inventory.cleanup.evidence_capture.state == InventoryStepState::Complete
+        }
+        CampaignCleanupAction::StopMaintenance => {
+            inventory.cleanup.stop_maintenance.state == InventoryStepState::Complete
+        }
+        CampaignCleanupAction::TerminalCapture => {
+            inventory.cleanup.terminal_capture.state == InventoryStepState::Complete
+        }
+        CampaignCleanupAction::RemoveNamespace => inventory.resources.iter().all(|resource| {
+            matches!(
+                resource.state,
+                InventoryResourceState::Removed | InventoryResourceState::Absent
+            )
+        }),
+        CampaignCleanupAction::RemoveQap => inventory.qap.as_ref().is_none_or(|qap| {
+            matches!(
+                qap.state,
+                InventoryResourceState::Removed | InventoryResourceState::Absent
+            )
+        }),
+        CampaignCleanupAction::RemoveFic => inventory.fic.as_ref().is_none_or(|fic| {
+            matches!(
+                fic.state,
+                InventoryResourceState::Removed | InventoryResourceState::Absent
+            )
+        }),
+        CampaignCleanupAction::Handoff => inventory.cleanup.handoff.state == InventoryStepState::Complete,
+    };
+    if !complete {
+        bail!(
+            "campaign cleanup {} lacks authoritative durable completion",
+            action.selector()
+        );
+    }
+    Ok(())
+}
+
+fn campaign_cleanup_action_needs_execution(action: &CampaignCleanupAction, inventory: &RunInventory) -> Result<bool> {
+    if campaign_cleanup_step_complete(action, inventory).is_ok() {
+        return Ok(false);
+    }
+    if let Some(step) = campaign_cleanup_step(action, inventory) {
+        match step.state {
+            InventoryStepState::NotStarted => {}
+            InventoryStepState::Complete => {
+                bail!(
+                    "campaign cleanup {} has incomplete completion evidence",
+                    action.selector()
+                );
+            }
+            InventoryStepState::Pending
+            | InventoryStepState::Running
+            | InventoryStepState::Failed
+            | InventoryStepState::Uncertain => {
+                bail!(
+                    "campaign cleanup {} is already running or unresolved; refusing replay",
+                    action.selector()
+                );
+            }
+        }
+    }
+    let uncertain_resource = match action {
+        CampaignCleanupAction::RemoveNamespace => inventory
+            .resources
+            .iter()
+            .any(|resource| resource.state == InventoryResourceState::Uncertain),
+        CampaignCleanupAction::RemoveQap => inventory
+            .qap
+            .as_ref()
+            .is_some_and(|qap| qap.state == InventoryResourceState::Uncertain),
+        CampaignCleanupAction::RemoveFic => inventory
+            .fic
+            .as_ref()
+            .is_some_and(|fic| fic.state == InventoryResourceState::Uncertain),
+        _ => false,
+    };
+    if uncertain_resource {
+        bail!(
+            "campaign cleanup {} has uncertain resource state; refusing replay",
+            action.selector()
+        );
+    }
+    Ok(true)
+}
+
+const CAMPAIGN_CLEANUP_DEFAULT_TIMEOUT_MS: u64 = 60_000;
+
+fn campaign_cleanup_operation_deadline_ms(
+    action: &CampaignCleanupAction,
+    inventory: &RunInventory,
+    now_unix_ms: u64,
+) -> Result<u64> {
+    let deadline =
+        if let Some(deadline) = campaign_cleanup_step(action, inventory).and_then(|step| step.deadline_unix_ms) {
+            deadline
+        } else {
+            let timeout_ms = match action {
+                CampaignCleanupAction::StopAdmission => 60_000,
+                CampaignCleanupAction::BoundedDrain => 120_000,
+                CampaignCleanupAction::StopMaintenance => {
+                    inventory
+                        .effective_stop_budgets
+                        .context("new campaign inventory omitted effective maintenance stop budgets")?
+                        .validate()?
+                        .maintenance_stop_timeout_ms
+                }
+                _ => CAMPAIGN_CLEANUP_DEFAULT_TIMEOUT_MS,
+            };
+            now_unix_ms
+                .checked_add(timeout_ms)
+                .context("campaign cleanup deadline overflow")?
+        };
+    if deadline <= now_unix_ms {
+        bail!("campaign cleanup {} operation deadline has expired", action.selector());
+    }
+    Ok(deadline)
+}
+
+fn campaign_cleanup_remaining_budget(
+    deadline: tokio::time::Instant,
+    action: &CampaignCleanupAction,
+) -> Result<Duration> {
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        bail!("campaign cleanup {} operation deadline has expired", action.selector());
+    }
+    Ok(remaining)
+}
+
+async fn execute_campaign_cleanup_action(
+    platform: &AksPlatform,
+    identity: &CampaignIdentity,
+    orchestration_run_id: &str,
+    action: &CampaignCleanupAction,
+    inventory: &RunInventory,
+    etag: &str,
+) -> Result<(RunInventory, String, Option<CampaignCleanupReceipt>)> {
+    let mut current_inventory = inventory.clone();
+    let mut current_etag = etag.to_owned();
+    let now_unix_ms = unix_time_ms_u64()?;
+    let deadline_unix_ms = campaign_cleanup_operation_deadline_ms(action, &current_inventory, now_unix_ms)?;
+    let operation_deadline = tokio::time::Instant::now() + Duration::from_millis(deadline_unix_ms - now_unix_ms);
+    let actor = CampaignCleanupActor {
+        mode: CampaignActorMode::Producer,
+        owner_id: identity.owner_id.clone(),
+        fencing_token: identity.fencing_token,
+    };
+    for attempt in 0..MAX_CAMPAIGN_CLEANUP_ATTEMPTS {
+        if !campaign_cleanup_action_needs_execution(action, &current_inventory)? {
+            return Ok((current_inventory, current_etag, None));
+        }
+        validate_campaign_etag(&current_etag)?;
+        let output = {
+            let request = CampaignCleanupRequest {
+                schema_version: 1,
+                inventory: &current_inventory,
+                expected_etag: &current_etag,
+                actor: &actor,
+            };
+            let timeout = campaign_cleanup_remaining_budget(operation_deadline, action)?;
+            run_campaign_custody_json(platform, "cleanup-step", Some(action.selector()), &request, timeout).await
+        };
+        let output = match output {
+            Ok(output) => output,
+            Err(error) if error.downcast_ref::<StaleCampaignVersionError>().is_some() => {
+                let timeout = campaign_cleanup_remaining_budget(operation_deadline, action)?;
+                let (refreshed_inventory, refreshed_etag) =
+                    read_authoritative_campaign_inventory(platform, identity, orchestration_run_id, timeout).await?;
+                current_inventory.validate_successor(&refreshed_inventory)?;
+                if refreshed_etag == current_etag {
+                    bail!(
+                        "campaign cleanup {} stale-version refresh returned the unchanged ETag; refusing retry",
+                        action.selector()
+                    );
+                }
+                persist_campaign_inventory_snapshot(platform, &refreshed_inventory, &refreshed_etag).await?;
+                current_inventory = refreshed_inventory;
+                current_etag = refreshed_etag;
+                if !campaign_cleanup_action_needs_execution(action, &current_inventory)? {
+                    return Ok((current_inventory, current_etag, None));
+                }
+                if attempt + 1 == MAX_CAMPAIGN_CLEANUP_ATTEMPTS {
+                    bail!(
+                        "campaign cleanup {} exhausted {} attempts after stale inventory versions",
+                        action.selector(),
+                        MAX_CAMPAIGN_CLEANUP_ATTEMPTS
+                    );
+                }
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let response: CampaignCleanupResponse =
+            serde_json::from_slice(&output).context("parse campaign cleanup receipt")?;
+        if !response.ok {
+            bail!("campaign cleanup {} was not positively confirmed", action.selector());
+        }
+        let receipt = response.receipt;
+        validate_campaign_etag(&receipt.etag)?;
+        if receipt.status != "complete"
+            || receipt.step != action.selector()
+            || receipt.campaign_id != current_inventory.campaign_id
+            || receipt.owner_id != current_inventory.owner_id
+            || receipt.fencing_token != current_inventory.fencing_token
+            || receipt.orchestration_run_id != current_inventory.orchestration_run_id
+            || receipt.cell_run_id != current_inventory.cell_run_id
+            || receipt.namespace_uid != current_inventory.namespace.uid
+            || receipt.actor != actor
+            || receipt.completed_at_unix_ms == 0
+        {
+            bail!(
+                "campaign cleanup {} returned a mismatched or incomplete receipt",
+                action.selector()
+            );
+        }
+        let timeout = campaign_cleanup_remaining_budget(operation_deadline, action)?;
+        let (next_inventory, next_etag) =
+            read_authoritative_campaign_inventory(platform, identity, orchestration_run_id, timeout).await?;
+        if next_etag != receipt.etag {
+            bail!("campaign cleanup receipt ETag does not match authoritative inventory readback");
+        }
+        current_inventory.validate_successor(&next_inventory)?;
+        campaign_cleanup_step_complete(action, &next_inventory)?;
+        persist_campaign_inventory_snapshot(platform, &next_inventory, &next_etag).await?;
+        return Ok((next_inventory, next_etag, Some(receipt)));
+    }
+    bail!(
+        "campaign cleanup {} exhausted {} attempts",
+        action.selector(),
+        MAX_CAMPAIGN_CLEANUP_ATTEMPTS
+    )
+}
+
+async fn persist_campaign_inventory_snapshot(
+    platform: &AksPlatform,
+    inventory: &RunInventory,
+    etag: &str,
+) -> Result<()> {
+    let runtime_dir = platform
+        .runtime_dir
+        .as_deref()
+        .context("campaign runtime directory is not available")?;
+    validate_campaign_etag(etag)?;
+    tokio::fs::write(
+        runtime_dir.join("campaign-inventory.json"),
+        serde_json::to_vec(inventory)?,
+    )
+    .await
+    .context("persist authoritative campaign inventory snapshot")?;
+    tokio::fs::write(runtime_dir.join("campaign-inventory-etag"), etag.as_bytes())
+        .await
+        .context("persist authoritative campaign inventory ETag")?;
+    Ok(())
+}
+
+async fn cleanup_campaign_aks_platform(config: &OatConfig, platform: &AksPlatform) -> Result<Value> {
+    let identity = CampaignIdentity::from_lookup(|name| std::env::var(name).ok())?;
+    let campaign_baseline = load_campaign_baseline_receipt(platform, &identity).await?;
+    let runtime_dir = platform
+        .runtime_dir
+        .as_deref()
+        .context("campaign runtime directory is not available")?;
+    let cached: RunInventory = serde_json::from_slice(
+        &tokio::fs::read(runtime_dir.join("campaign-inventory.json"))
+            .await
+            .context("read persisted campaign inventory")?,
+    )
+    .context("parse persisted campaign inventory")?;
+    let cached_etag = tokio::fs::read_to_string(runtime_dir.join("campaign-inventory-etag"))
+        .await
+        .context("read persisted campaign inventory ETag")?;
+    validate_campaign_etag(cached_etag.trim())?;
+    let orchestration_run_id = cached.orchestration_run_id.clone();
+    validate_campaign_inventory_identity(
+        &cached,
+        &identity.campaign_id,
+        &identity.owner_id,
+        identity.fencing_token,
+        &orchestration_run_id,
+        &platform.run_id,
+    )?;
+    if cached.namespace.name != config.namespace || cached.namespace.owner_token != platform.namespace_owner_token {
+        bail!("persisted campaign inventory does not match the OAT namespace origin");
+    }
+    let (mut inventory, mut etag) =
+        read_authoritative_campaign_inventory(platform, &identity, &orchestration_run_id, Duration::from_secs(60))
+            .await?;
+    cached.validate_successor(&inventory)?;
+    persist_campaign_inventory_snapshot(platform, &inventory, &etag).await?;
+    let actions = [
+        CampaignCleanupAction::StopAdmission,
+        CampaignCleanupAction::BoundedDrain,
+        CampaignCleanupAction::EvidenceCapture,
+        CampaignCleanupAction::StopMaintenance,
+        CampaignCleanupAction::TerminalCapture,
+        CampaignCleanupAction::RemoveNamespace,
+        CampaignCleanupAction::RemoveQap,
+        CampaignCleanupAction::RemoveFic,
+        CampaignCleanupAction::Handoff,
+    ];
+    let mut receipts = Vec::with_capacity(actions.len());
+    for action in actions {
+        if !campaign_cleanup_action_needs_execution(&action, &inventory)? {
+            receipts.push(
+                json!({"step": action.selector(), "status": "already_complete", "source": "authoritative_inventory"}),
+            );
+            continue;
+        }
+        let (next_inventory, next_etag, receipt) =
+            execute_campaign_cleanup_action(platform, &identity, &orchestration_run_id, &action, &inventory, &etag)
+                .await
+                .with_context(|| format!("execute custody cleanup {}", action.selector()))?;
+        inventory = next_inventory;
+        etag = next_etag;
+        if let Some(receipt) = receipt {
+            receipts.push(serde_json::to_value(receipt)?);
+        } else {
+            receipts.push(
+                json!({"step": action.selector(), "status": "already_complete", "source": "authoritative_inventory"}),
+            );
+        }
+    }
+    Ok(json!({"status":"observed", "campaign_baseline":campaign_baseline, "cleanup_receipts":receipts}))
+}
+
+async fn campaign_inventory_for_setup(platform: &AksPlatform) -> Result<RunInventory> {
+    let runtime_dir = platform
+        .runtime_dir
+        .as_deref()
+        .context("campaign runtime directory is not available")?;
+    let inventory: RunInventory = serde_json::from_slice(
+        &read_native_file(
+            &runtime_dir.join("campaign-inventory.json"),
+            OFFICIAL_MEASUREMENT_MAX_BYTES,
+        )
+        .await
+        .context("read persisted campaign inventory for setup")?,
+    )
+    .context("parse persisted campaign inventory for setup")?;
+    let etag = String::from_utf8(
+        read_native_file(&runtime_dir.join("campaign-inventory-etag"), 4096)
+            .await
+            .context("read persisted campaign inventory ETag for setup")?,
+    )?;
+    validate_campaign_etag(etag.trim())?;
+    let identity = CampaignIdentity::from_lookup(|name| std::env::var(name).ok())?;
+    validate_campaign_inventory_identity(
+        &inventory,
+        &identity.campaign_id,
+        &identity.owner_id,
+        identity.fencing_token,
+        &inventory.orchestration_run_id,
+        &platform.run_id,
+    )?;
+    if inventory.namespace.owner_token != platform.namespace_owner_token
+        || inventory.namespace.uid != platform.namespace_uid
+    {
+        bail!("campaign setup inventory does not match the exact namespace owner and UID");
+    }
+    Ok(inventory)
+}
+
+fn validate_campaign_inventory_load_admission(
+    inventory: &RunInventory,
+    expected_admission: InventoryLoadAdmission,
+    expected_database: &str,
+    expected_bindings: &[InventoryQapBinding],
+) -> Result<()> {
+    let qap_is_observed = inventory.qap.as_ref().is_some_and(|qap| {
+        qap.database == expected_database
+            && qap.bindings.as_slice() == expected_bindings
+            && !qap.bindings.is_empty()
+            && qap.state == InventoryResourceState::Observed
+            && qap.absence.is_empty()
+            && qap.reference.is_some()
+    });
+    let resources_are_observed = !inventory.resources.is_empty()
+        && inventory
+            .resources
+            .iter()
+            .all(|resource| resource.state == InventoryResourceState::Observed && resource.uid.is_some());
+    let fic_is_observed = inventory
+        .fic
+        .as_ref()
+        .is_some_and(|fic| fic.state == InventoryResourceState::Observed);
+    if inventory.load_admission != expected_admission
+        || (expected_admission != InventoryLoadAdmission::NotAuthorized
+            && (inventory.planned_cell_duration_ms.is_none_or(|duration| duration == 0)
+                || inventory.effective_stop_budgets.is_none()))
+        || inventory.namespace.uid.is_none()
+        || !resources_are_observed
+        || !fic_is_observed
+        || !qap_is_observed
+        || inventory.cleanup.handoff.state == InventoryStepState::Complete
+    {
+        bail!("campaign load admission requires complete observed namespace, resources, FIC and exact QAP proof");
+    }
+    inventory.validate()
+}
+
+async fn update_campaign_fic_inventory(platform: &AksPlatform, fic: InventoryFic) -> Result<()> {
+    let current = campaign_inventory_for_setup(platform).await?;
+    let mut next = current.clone();
+    next.fic = Some(fic);
+    current.validate_successor(&next)?;
+    persist_campaign_inventory(platform, &next).await
+}
+
+async fn update_campaign_qap_inventory(platform: &AksPlatform, qap: InventoryQap) -> Result<()> {
+    let current = campaign_inventory_for_setup(platform).await?;
+    let mut next = current.clone();
+    next.qap = Some(qap);
+    current.validate_successor(&next)?;
+    persist_campaign_inventory(platform, &next).await
+}
+
+async fn persist_campaign_inventory(platform: &AksPlatform, inventory: &RunInventory) -> Result<()> {
+    let runtime_dir = platform
+        .runtime_dir
+        .as_deref()
+        .context("campaign runtime directory is not available")?;
+    let etag = inventory.publish_to_custody(platform.campaign_cli_paths()?).await?;
+    tokio::fs::write(
+        runtime_dir.join("campaign-inventory.json"),
+        serde_json::to_vec(inventory)?,
+    )
+    .await
+    .context("persist confirmed campaign inventory")?;
+    tokio::fs::write(runtime_dir.join("campaign-inventory-etag"), etag.as_bytes())
+        .await
+        .context("persist confirmed campaign inventory ETag")?;
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct CampaignCellBudget {
+    effective_stop_budgets: EffectiveStopBudgets,
+    planned_cell_duration_ms: u64,
+}
+
+fn initial_campaign_inventory(
+    identity: &CampaignIdentity,
+    orchestration_run_id: &str,
+    cell_run_id: &str,
+    namespace: &str,
+    account: &str,
+    container: &str,
+    budget: CampaignCellBudget,
+) -> Result<RunInventory> {
+    let step = || InventoryStep {
+        state: InventoryStepState::NotStarted,
+        deadline_unix_ms: None,
+        reason_code: None,
+    };
+    let inventory = RunInventory {
+        schema_version: 1,
+        campaign_id: identity.campaign_id.clone(),
+        owner_id: identity.owner_id.clone(),
+        fencing_token: identity.fencing_token,
+        orchestration_run_id: orchestration_run_id.to_owned(),
+        cell_run_id: cell_run_id.to_owned(),
+        load_admission: InventoryLoadAdmission::NotAuthorized,
+        namespace: InventoryNamespace {
+            name: namespace.to_owned(),
+            uid: None,
+            owner_token: identity.owner_id.clone(),
+        },
+        resources: Vec::new(),
+        fic: None,
+        qap: None,
+        evidence_destination: Some(InventoryEvidenceDestination {
+            account: account.to_owned(),
+            container: container.to_owned(),
+            blob_prefix: format!("campaigns/{}/cells/{}/evidence", identity.campaign_id, cell_run_id),
+        }),
+        official_measurement: None,
+        effective_stop_budgets: Some(budget.effective_stop_budgets.validate()?),
+        planned_cell_duration_ms: Some(budget.planned_cell_duration_ms),
+        cleanup: InventoryCleanup {
+            stop_admission: step(),
+            bounded_drain: step(),
+            evidence_capture: step(),
+            stop_maintenance: step(),
+            terminal_capture: step(),
+            handoff: step(),
+        },
+    };
+    inventory.validate()?;
+    Ok(inventory)
+}
+
+async fn initialize_campaign_inventory(
+    config: &OatConfig,
+    platform: &mut AksPlatform,
+    orchestration_run_id: &str,
+) -> Result<()> {
+    let identity = CampaignIdentity::from_lookup(|name| std::env::var(name).ok())?;
+    platform.namespace_owner_token = identity.owner_id.clone();
+    let account = std::env::var("CAMPAIGN_STORAGE_ACCOUNT")
+        .context("CAMPAIGN_STORAGE_ACCOUNT is required for campaign evidence custody")?;
+    let container = std::env::var("CAMPAIGN_STATE_CONTAINER")
+        .context("CAMPAIGN_STATE_CONTAINER is required for campaign evidence custody")?;
+    let inventory = initial_campaign_inventory(
+        &identity,
+        orchestration_run_id,
+        &platform.run_id,
+        &config.namespace,
+        &account,
+        &container,
+        CampaignCellBudget {
+            effective_stop_budgets: config.maintenance_stop_budget()?,
+            planned_cell_duration_ms: config.timing_budget()?.planned_cell_duration_ms,
+        },
+    )?;
+    persist_campaign_inventory(platform, &inventory).await?;
+    validate_campaign_baseline_capture_inventory(&inventory, &identity)?;
+    capture_campaign_baseline(platform, &identity).await?;
+    Ok(())
+}
+
+async fn record_campaign_namespace_uid(config: &OatConfig, platform: &AksPlatform) -> Result<()> {
+    if config.campaign_profile != Some(crate::config::CampaignProfile::SingleHotTable) {
+        return Ok(());
+    }
+    let runtime_dir = platform
+        .runtime_dir
+        .as_deref()
+        .context("campaign runtime directory is not available")?;
+    let path = runtime_dir.join("campaign-inventory.json");
+    let current: RunInventory = serde_json::from_slice(
+        &tokio::fs::read(&path)
+            .await
+            .context("read last confirmed campaign inventory")?,
+    )
+    .context("parse last confirmed campaign inventory")?;
+    let uid = platform
+        .namespace_uid
+        .as_deref()
+        .context("created campaign namespace has no UID")?;
+    if current.namespace.name != config.namespace || current.namespace.owner_token != platform.namespace_owner_token {
+        bail!("campaign inventory does not match the created namespace ownership");
+    }
+    if current.namespace.uid.as_deref().is_some_and(|existing| existing != uid) {
+        bail!("campaign namespace UID changed after inventory publication");
+    }
+    let mut next = current.clone();
+    next.namespace.uid = Some(uid.to_owned());
+    current.validate_successor(&next)?;
+    persist_campaign_inventory(platform, &next).await
+}
+
+fn set_runtime_replicas(runtime_config: &mut Value, replicas: u32) -> Result<()> {
+    if !(1..=16).contains(&replicas) {
+        bail!("AKS cell replicas must be between 1 and 16");
+    }
+    let object = runtime_config
+        .as_object_mut()
+        .context("runtime config must be an object")?;
+    object.insert("collectorReplicas".to_owned(), json!(replicas));
+    object.insert("routerReplicas".to_owned(), json!(replicas));
+    Ok(())
+}
+
+fn require_single_scale_out_collector(config: &OatConfig, replicas: u32) -> Result<()> {
+    if config.campaign_profile == Some(crate::config::CampaignProfile::ScaleOutSingleTable) && replicas != 1 {
+        bail!("scale_out_single_table runtime requires exactly one collector replica");
+    }
+    Ok(())
+}
+
+fn project_scale_out_runtime(runtime_config: &mut Value, config: &OatConfig, replicas: u32) -> Result<()> {
+    if config.campaign_profile != Some(crate::config::CampaignProfile::ScaleOutSingleTable) {
+        return Ok(());
+    }
+    require_single_scale_out_collector(config, replicas)?;
+    let [hot_table] = config.tables.as_slice() else {
+        bail!("scale_out_single_table runtime requires exactly one hot table");
+    };
+    if hot_table != "sqlserver_availability_replica_states" {
+        bail!("scale_out_single_table runtime hot table is invalid");
+    }
+    set_runtime_replicas(runtime_config, replicas)?;
+    runtime_config["campaignProfile"] = serde_json::to_value(config.campaign_profile)?;
+    runtime_config["hotTable"] = json!(hot_table);
+    Ok(())
+}
+
+async fn prepare_aks_platform(
+    config: &OatConfig,
+    platform: &mut AksPlatform,
+    orchestration_run_id: &str,
+    replicas: u32,
+) -> Result<()> {
+    require_single_scale_out_collector(config, replicas)?;
     let parent = std::env::temp_dir().join("arrowcol-oat");
     tokio::fs::create_dir_all(&parent)
         .await
@@ -5945,6 +10101,10 @@ async fn prepare_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
             .context("restrict run-specific AKS runtime directory permissions")?;
     }
     platform.runtime_dir = Some(runtime_dir.clone());
+    if config.campaign_profile == Some(crate::config::CampaignProfile::SingleHotTable) {
+        platform.campaign_cli_paths = Some(OwnedAksCampaignConfigPaths::from_config(config)?);
+        initialize_campaign_inventory(config, platform, orchestration_run_id).await?;
+    }
 
     let runtime_config_path = PathBuf::from(
         config
@@ -5967,10 +10127,26 @@ async fn prepare_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
         .context("deployed-stamp runtime config has no deltaRoot")?;
     let run_data_root = run_delta_root(shared_data_root, &platform.run_id)?;
     platform.qap_relative_data_root = Some(qap_relative_data_root(&run_data_root)?);
+    platform.delta_root = Some(run_data_root.clone());
     runtime_config["deltaRoot"] = json!(run_data_root);
     runtime_config["namespace"] = json!(config.namespace);
     runtime_config["oatRunId"] = json!(platform.run_id);
     runtime_config["quiver"] = json!(config.tunables.wal.is_some());
+    runtime_config["effective_stop_budgets"] = serde_json::to_value(config.maintenance_stop_budget()?)?;
+    runtime_config["resources"] = serde_json::to_value(config.effective_aks_resources())?;
+    project_scale_out_runtime(&mut runtime_config, config, replicas)?;
+    if let Some(fleet) = &config.platform.fleet {
+        runtime_config["collectorPool"] = json!(fleet.collector.pool);
+        runtime_config["collectorNode"] = json!(fleet.collector.node);
+    }
+    runtime_config["collectorWorkers"] = json!(
+        config
+            .dfe_worker_concurrency
+            .iter()
+            .copied()
+            .max()
+            .context("empty worker concurrency sweep")?
+    );
     if let Some(maintenance) = maintenance_runtime(config)? {
         runtime_config["maintenance"] = maintenance;
         runtime_config["images"]["maintenance"] = json!(
@@ -6047,6 +10223,7 @@ async fn prepare_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
         bail!("created AKS namespace is missing this run's ownership label");
     }
     platform.namespace_uid = Some(uid.to_owned());
+    record_campaign_namespace_uid(config, platform).await?;
 
     let service_accounts = identity
         .into_iter()
@@ -6062,7 +10239,41 @@ async fn prepare_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
         .context("rendered workload identity ServiceAccount has no name")?
         .to_owned();
     platform.service_account = Some(service_account.clone());
-    apply_runtime_resources(config, service_accounts).await?;
+    apply_runtime_resources(config, platform, service_accounts).await?;
+    let fic_plan = run_run_fic_plan(
+        &platform.run_id,
+        &config.namespace,
+        &service_account,
+        bootstrap_env_file,
+    )
+    .await?;
+    let fic_plan_path = runtime_dir.join(format!("run-fic-{}-identity-plan.json", platform.run_id));
+    write_private_secret(&fic_plan_path, &serde_json::to_string(&fic_plan)?)
+        .context("persist immutable run-owned workload identity plan")?;
+    if config.campaign_profile == Some(crate::config::CampaignProfile::SingleHotTable) {
+        update_campaign_fic_inventory(
+            platform,
+            InventoryFic {
+                resource_id: Some(fic_plan.resource_id.clone()),
+                name: Some(fic_plan.credential_name.clone()),
+                state: InventoryResourceState::Planned,
+                absence: None,
+                plan: Some(fic_plan.clone()),
+            },
+        )
+        .await?;
+        update_campaign_fic_inventory(
+            platform,
+            InventoryFic {
+                resource_id: Some(fic_plan.resource_id.clone()),
+                name: Some(fic_plan.credential_name.clone()),
+                state: InventoryResourceState::Uncertain,
+                absence: None,
+                plan: Some(fic_plan.clone()),
+            },
+        )
+        .await?;
+    }
     let fic_record = runtime_dir.join(format!("run-fic-{}.json", platform.run_id));
     platform.fic_record_path = Some(fic_record.clone());
     platform.fic_prepare_attempted = true;
@@ -6072,7 +10283,10 @@ async fn prepare_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
         Some(&config.namespace),
         Some(&service_account),
         &fic_record,
-        None,
+        FicHelperOptions {
+            wait_seconds: None,
+            identity_plan_path: Some(&fic_plan_path),
+        },
         bootstrap_env_file,
     )
     .await
@@ -6084,7 +10298,10 @@ async fn prepare_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
         Some(&config.namespace),
         Some(&service_account),
         &fic_record,
-        Some("300"),
+        FicHelperOptions {
+            wait_seconds: Some("300"),
+            identity_plan_path: None,
+        },
         bootstrap_env_file,
     )
     .await
@@ -6096,14 +10313,27 @@ async fn prepare_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
     write_private_secret(&ready_snapshot, &ready_record)
         .context("persist immutable ready run-owned workload identity snapshot")?;
     platform.fic_ready_snapshot_path = Some(ready_snapshot);
-    create_runtime_secrets(config, &secrets_dir).await?;
+    if config.campaign_profile == Some(crate::config::CampaignProfile::SingleHotTable) {
+        update_campaign_fic_inventory(
+            platform,
+            InventoryFic {
+                resource_id: Some(fic_plan.resource_id.clone()),
+                name: Some(fic_plan.credential_name.clone()),
+                state: InventoryResourceState::Observed,
+                absence: None,
+                plan: Some(fic_plan),
+            },
+        )
+        .await?;
+    }
+    create_runtime_secrets(config, platform, &secrets_dir).await?;
 
     let foundation = render_runtime_phase(&runtime_script, &generated_config, "foundation", &runtime_dir).await?;
-    apply_runtime_resources(config, without_identity_resources(foundation)).await?;
+    apply_runtime_resources(config, platform, without_identity_resources(foundation)).await?;
     rollout(config, "arrowcol-sql").await?;
 
     let bootstrap = render_runtime_phase(&runtime_script, &generated_config, "bootstrap", &runtime_dir).await?;
-    apply_runtime_resources(config, without_identity_resources(bootstrap)).await?;
+    apply_runtime_resources(config, platform, without_identity_resources(bootstrap)).await?;
     kubectl(
         config,
         vec![
@@ -6141,9 +10371,9 @@ async fn prepare_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
         .context("validate rendered router YAML with the router config validator")?;
     platform.router_yaml = Some(router_yaml);
     let (catalog, data_plane) = partition_aks_workload_resources(without_identity_resources(workload))?;
-    apply_runtime_resources(config, catalog).await?;
+    apply_runtime_resources(config, platform, catalog).await?;
     rollout(config, "arrowcol-catalog").await?;
-    apply_runtime_resources(config, data_plane).await?;
+    apply_runtime_resources(config, platform, data_plane).await?;
     for name in ["arrowcol", "arrowcol-router"] {
         rollout(config, name).await?;
     }
@@ -6214,9 +10444,110 @@ fn configured_bootstrap_env_file(config: &OatConfig) -> Result<&Path> {
 }
 
 #[derive(Clone, Copy)]
-struct AksHelperConfigPaths<'a> {
+pub(crate) struct AksHelperConfigPaths<'a> {
     stamp_config_path: &'a Path,
     bootstrap_env_file: &'a Path,
+}
+
+#[derive(Clone, Debug)]
+struct OwnedAksCampaignConfigPaths {
+    stamp_config_path: PathBuf,
+    bootstrap_env_file: PathBuf,
+}
+
+impl OwnedAksCampaignConfigPaths {
+    fn from_config(config: &OatConfig) -> Result<Self> {
+        let workspace = std::env::current_dir().context("resolve workspace for campaign custody config")?;
+        let stamp_config_path = selected_aks_stamp_config_path(&workspace)?;
+        let env_path = configured_bootstrap_env_file(config)?;
+        let bootstrap_env_file = if env_path.is_absolute() {
+            env_path.to_path_buf()
+        } else {
+            workspace.join(env_path)
+        }
+        .canonicalize()
+        .context("resolve selected private campaign environment file")?;
+        Ok(Self {
+            stamp_config_path,
+            bootstrap_env_file,
+        })
+    }
+
+    fn as_borrowed(&self) -> AksHelperConfigPaths<'_> {
+        AksHelperConfigPaths {
+            stamp_config_path: &self.stamp_config_path,
+            bootstrap_env_file: &self.bootstrap_env_file,
+        }
+    }
+}
+
+impl AksPlatform {
+    fn campaign_cli_paths(&self) -> Result<AksHelperConfigPaths<'_>> {
+        self.campaign_cli_paths
+            .as_ref()
+            .map(OwnedAksCampaignConfigPaths::as_borrowed)
+            .context("campaign custody CLI paths were not initialized before use")
+    }
+}
+
+fn aks_campaign_cli_command(
+    config_paths: AksHelperConfigPaths<'_>,
+    action: &str,
+    action_args: &[String],
+) -> Result<Command> {
+    let workspace = std::env::current_dir().context("resolve repository root for campaign custody helper")?;
+    let mut command = Command::new("npx");
+    command
+        .current_dir(workspace)
+        .args(["--no-install", "tsx", "projects/arrowcol-oat/aks-campaign.ts", action])
+        .args(action_args)
+        .arg("--env-file")
+        .arg(config_paths.bootstrap_env_file)
+        .arg("--stamp-config")
+        .arg(config_paths.stamp_config_path)
+        .kill_on_drop(true);
+    Ok(command)
+}
+
+#[derive(Clone, Copy)]
+struct FicHelperOptions<'a> {
+    wait_seconds: Option<&'a str>,
+    identity_plan_path: Option<&'a Path>,
+}
+
+async fn run_run_fic_plan(
+    run_id: &str,
+    namespace: &str,
+    service_account: &str,
+    bootstrap_env_file: &Path,
+) -> Result<InventoryFicPlan> {
+    let workspace = std::env::current_dir()?;
+    let script = workspace.join("infra/azure/bootstrap.ts");
+    let stamp_config_path = selected_aks_stamp_config_path(&workspace)?;
+    let mut command = oat_qap_helper_launcher(&script)?;
+    command.args([
+        "plan-run-fic",
+        "--read-only",
+        "--run-id",
+        run_id,
+        "--namespace",
+        namespace,
+        "--service-account",
+        service_account,
+    ]);
+    command.arg("--env-file").arg(bootstrap_env_file);
+    command.arg("--stamp-config").arg(&stamp_config_path);
+    let output = tokio::time::timeout(Duration::from_secs(60), run_oat_qap_helper_output(command))
+        .await
+        .context("run FIC planning exceeded its read-only deadline")??;
+    if !output.status.success() {
+        bail!(
+            "plan-run-fic helper failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    serde_json::from_slice(&output.stdout).context("parse authoritative run FIC plan")
 }
 
 fn run_fic_helper_command(
@@ -6225,7 +10556,7 @@ fn run_fic_helper_command(
     namespace: Option<&str>,
     service_account: Option<&str>,
     record_path: &Path,
-    wait_seconds: Option<&str>,
+    options: FicHelperOptions<'_>,
     config_paths: AksHelperConfigPaths<'_>,
 ) -> Result<Command> {
     let workspace = std::env::current_dir()?;
@@ -6248,8 +10579,16 @@ fn run_fic_helper_command(
     }
     command.arg("--record");
     command.arg(record_path);
-    if let Some(wait_seconds) = wait_seconds {
+    if let Some(wait_seconds) = options.wait_seconds {
         command.args(["--wait-seconds", wait_seconds]);
+    }
+    match (operation, options.identity_plan_path) {
+        ("prepare-run-fic", Some(path)) => {
+            command.arg("--identity-plan").arg(path);
+        }
+        ("prepare-run-fic", None) => bail!("run FIC preparation requires its persisted identity plan"),
+        (_, Some(_)) => bail!("identity plans are only accepted when preparing a run FIC"),
+        (_, None) => {}
     }
     Ok(command)
 }
@@ -6260,7 +10599,7 @@ async fn run_run_fic_helper(
     namespace: Option<&str>,
     service_account: Option<&str>,
     record_path: &Path,
-    wait_seconds: Option<&str>,
+    options: FicHelperOptions<'_>,
     bootstrap_env_file: &Path,
 ) -> Result<()> {
     let workspace = std::env::current_dir()?;
@@ -6271,7 +10610,7 @@ async fn run_run_fic_helper(
         namespace,
         service_account,
         record_path,
-        wait_seconds,
+        options,
         AksHelperConfigPaths {
             stamp_config_path: &stamp_config_path,
             bootstrap_env_file,
@@ -6397,6 +10736,34 @@ async fn run_oat_qap_helper(
     }
     Ok(())
 }
+async fn run_oat_qap_reference(record_path: &Path, bootstrap_env_file: &Path) -> Result<InventoryQapReference> {
+    let workspace = std::env::current_dir()?;
+    let stamp_config_path = selected_aks_stamp_config_path(&workspace)?;
+    let command = run_oat_qap_helper_command(
+        "oat-qap-reference",
+        "",
+        None,
+        None,
+        None,
+        record_path,
+        AksHelperConfigPaths {
+            stamp_config_path: &stamp_config_path,
+            bootstrap_env_file,
+        },
+    )?;
+    let output = tokio::time::timeout(Duration::from_secs(60), run_oat_qap_helper_output(command))
+        .await
+        .context("QAP reference capture exceeded its deadline")??;
+    if !output.status.success() {
+        bail!(
+            "oat-qap-reference helper failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    serde_json::from_slice(&output.stdout).context("parse immutable QAP reference")
+}
+
 async fn require_nonempty_record(record_path: &Path) -> Result<()> {
     let metadata = tokio::fs::metadata(record_path)
         .await
@@ -6487,6 +10854,103 @@ async fn start_router_metrics_tunnel_with(
             );
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+async fn start_aks_collector_metrics_tunnel(config: &OatConfig) -> Result<(String, OwnedKubectlProcess)> {
+    let snapshot = kubectl(
+        config,
+        vec![
+            "get",
+            "pods",
+            "--namespace",
+            &config.namespace,
+            "--selector",
+            &config.arrowcol_pod_selector,
+            "-o",
+            "json",
+        ],
+        None,
+    )
+    .await?;
+    let pods = active_pod_names(&serde_json::from_str(&snapshot)?)?;
+    if pods.len() != 1 {
+        bail!("publication backlog scrape requires exactly one active ArrowCol collector");
+    }
+    let pod = pods
+        .into_iter()
+        .next()
+        .context("active ArrowCol collector pod is missing")?;
+    let target = format!("pod/{pod}");
+    let reservation = TcpListener::bind("127.0.0.1:0")
+        .await
+        .context("reserve a loopback port for the collector metrics tunnel")?;
+    let port = reservation.local_addr()?.port();
+    drop(reservation);
+    let port_mapping = format!("{port}:32011");
+    let mut command = Command::new("kubectl");
+    if let Some(context) = &config.kubectl_context {
+        command.args(["--context", context]);
+    }
+    command
+        .args([
+            "port-forward",
+            "--address",
+            "127.0.0.1",
+            "--namespace",
+            &config.namespace,
+            &target,
+            &port_mapping,
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command.spawn().context("start owned collector metrics port-forward")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("capture collector metrics port-forward diagnostics")?;
+    let stderr = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        let mut stderr = stderr;
+        stderr.read_to_end(&mut bytes).await.map(|_| bytes)
+    });
+    let mut forward = OwnedKubectlProcess { child, stderr };
+    let metrics_url = format!("http://127.0.0.1:{port}/metrics");
+    let ready_url = format!("http://127.0.0.1:{port}/readyz");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .context("build collector metrics tunnel readiness client")?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = forward
+            .child
+            .try_wait()
+            .context("check collector metrics port-forward process")?
+        {
+            let stderr = collect_kubectl_stderr(forward.stderr).await?;
+            bail!(
+                "collector metrics port-forward exited before readiness with {status}: {}",
+                String::from_utf8_lossy(&stderr).trim()
+            );
+        }
+        if client
+            .get(&ready_url)
+            .send()
+            .await
+            .is_ok_and(|response| response.status().is_success())
+        {
+            return Ok((metrics_url, forward));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let stderr = collect_kubectl_stderr(stop_kubectl_process(forward).await?).await?;
+            bail!(
+                "collector metrics tunnel did not become ready within 10 seconds: {}",
+                String::from_utf8_lossy(&stderr).trim()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -6758,26 +11222,361 @@ async fn run_npx_runtime(runtime_script: &Path, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-async fn apply_runtime_resources(config: &OatConfig, resources: Vec<Value>) -> Result<()> {
+fn set_origin_markers(metadata: &mut Value, run_id: &str, owner_token: &str) -> Result<()> {
+    let metadata = metadata
+        .as_object_mut()
+        .context("run-owned Kubernetes metadata must be an object")?;
+    for key in ["labels", "annotations"] {
+        let values = metadata.entry(key).or_insert_with(|| json!({}));
+        let values = values
+            .as_object_mut()
+            .context("run-owned Kubernetes metadata labels and annotations must be objects")?;
+        values.insert("arrowcol-oat/run-id".to_owned(), json!(run_id));
+        values.insert("arrowcol-oat/owner-token".to_owned(), json!(owner_token));
+    }
+    Ok(())
+}
+
+fn stamp_run_origin_markers(
+    resource: &mut Value,
+    expected_namespace: &str,
+    run_id: &str,
+    owner_token: &str,
+) -> Result<()> {
+    let kind = resource
+        .get("kind")
+        .and_then(Value::as_str)
+        .context("run-owned Kubernetes resource has no kind")?
+        .to_owned();
+    let metadata = resource
+        .get("metadata")
+        .and_then(Value::as_object)
+        .context("run-owned Kubernetes resource has no metadata object")?
+        .clone();
+    if metadata.get("namespace").and_then(Value::as_str) != Some(expected_namespace)
+        || metadata.get("name").and_then(Value::as_str).is_none_or(str::is_empty)
+    {
+        bail!("run-owned Kubernetes resource must have its exact namespace and name before apply");
+    }
+    let mut metadata_value = Value::Object(metadata);
+    set_origin_markers(&mut metadata_value, run_id, owner_token)?;
+    resource["metadata"] = metadata_value;
+    if matches!(kind.as_str(), "Deployment" | "StatefulSet" | "DaemonSet" | "Job") {
+        let template_metadata = resource
+            .pointer_mut("/spec/template/metadata")
+            .context("pod-bearing run-owned resource has no pod template metadata")?;
+        set_origin_markers(template_metadata, run_id, owner_token)?;
+    }
+    Ok(())
+}
+
+fn planned_inventory_resource(resource: &Value, namespace: &str) -> Result<InventoryResource> {
+    let api_version = resource
+        .get("apiVersion")
+        .and_then(Value::as_str)
+        .context("resource apiVersion is missing")?;
+    let kind = resource
+        .get("kind")
+        .and_then(Value::as_str)
+        .context("resource kind is missing")?;
+    let metadata = resource.get("metadata").context("resource metadata is missing")?;
+    let resource_namespace = metadata
+        .get("namespace")
+        .and_then(Value::as_str)
+        .context("resource namespace is missing")?;
+    let name = metadata
+        .get("name")
+        .and_then(Value::as_str)
+        .context("resource name is missing")?;
+    if resource_namespace != namespace {
+        bail!("run-owned resource namespace does not match the OAT cell");
+    }
+    let app = metadata
+        .pointer("/labels/app")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let role = if (kind == "Job" || (kind == "Deployment" && FIXTURE_BOUNDARY.try_with(|_| ()).is_ok()))
+        && app == "arrowcol-oat-client"
+    {
+        InventoryResourceRole::Client
+    } else if name == "delta-maintenance" {
+        InventoryResourceRole::Maintenance
+    } else if name.contains("router") || app.contains("router") {
+        InventoryResourceRole::Router
+    } else {
+        InventoryResourceRole::Collector
+    };
+    Ok(InventoryResource {
+        api_version: api_version.to_owned(),
+        kind: kind.to_owned(),
+        namespace: resource_namespace.to_owned(),
+        name: name.to_owned(),
+        uid: None,
+        role,
+        state: InventoryResourceState::Planned,
+        absence: None,
+    })
+}
+
+fn has_origin_markers(metadata: &Value, run_id: &str, owner_token: &str) -> bool {
+    ["labels", "annotations"].into_iter().all(|field| {
+        metadata.get(field).and_then(Value::as_object).is_some_and(|values| {
+            values.get("arrowcol-oat/run-id").and_then(Value::as_str) == Some(run_id)
+                && values.get("arrowcol-oat/owner-token").and_then(Value::as_str) == Some(owner_token)
+        })
+    })
+}
+
+async fn record_applied_resource_uids(config: &OatConfig, platform: &AksPlatform, resources: &[Value]) -> Result<()> {
+    record_resource_uids_with_creation(config, platform, resources, None).await
+}
+
+async fn record_resource_uids_with_creation(
+    config: &OatConfig,
+    platform: &AksPlatform,
+    resources: &[Value],
+    created: Option<&[Value]>,
+) -> Result<()> {
+    if config.campaign_profile != Some(crate::config::CampaignProfile::SingleHotTable) {
+        return Ok(());
+    }
+    let payload = serde_json::to_vec(&json!({"apiVersion":"v1", "kind":"List", "items":resources}))?;
+    let output = kubectl(
+        config,
+        vec!["get", "--namespace", &config.namespace, "-f", "-", "-o", "json"],
+        Some(payload),
+    )
+    .await
+    .context("read back exact run-owned Kubernetes resources after apply")?;
+    let response: Value = serde_json::from_str(&output).context("parse applied Kubernetes resource readback")?;
+    let observed = response
+        .get("items")
+        .and_then(Value::as_array)
+        .context("Kubernetes resource readback is not a List")?;
+    if observed.len() != resources.len() {
+        bail!("Kubernetes resource readback did not return every planned identity");
+    }
+    let runtime_dir = platform
+        .runtime_dir
+        .as_deref()
+        .context("campaign runtime directory is not available")?;
+    let inventory_path = runtime_dir.join("campaign-inventory.json");
+    let current: RunInventory = serde_json::from_slice(
+        &tokio::fs::read(&inventory_path)
+            .await
+            .context("read last confirmed campaign inventory")?,
+    )
+    .context("parse last confirmed campaign inventory")?;
+    if current.namespace.uid.as_deref() != platform.namespace_uid.as_deref()
+        || current.namespace.owner_token != platform.namespace_owner_token
+    {
+        bail!("campaign inventory namespace identity changed before resource UID readback");
+    }
+    let mut next = current.clone();
+    let mut seen = BTreeSet::new();
+    for rendered in resources {
+        let planned = planned_inventory_resource(rendered, &config.namespace)?;
+        let identity = (
+            planned.api_version.clone(),
+            planned.kind.clone(),
+            planned.namespace.clone(),
+            planned.name.clone(),
+        );
+        if !seen.insert(identity) {
+            bail!("duplicate run-owned Kubernetes identity in applied resource set");
+        }
+        let actual = observed
+            .iter()
+            .find(|resource| {
+                resource.get("apiVersion").and_then(Value::as_str) == Some(planned.api_version.as_str())
+                    && resource.get("kind").and_then(Value::as_str) == Some(planned.kind.as_str())
+                    && resource.pointer("/metadata/namespace").and_then(Value::as_str)
+                        == Some(planned.namespace.as_str())
+                    && resource.pointer("/metadata/name").and_then(Value::as_str) == Some(planned.name.as_str())
+            })
+            .context("Kubernetes readback identity differs from the planned resource")?;
+        if let Some(created) = created {
+            fixture_response_identity(actual, rendered)?;
+            let original = created
+                .iter()
+                .find(|resource| {
+                    resource["apiVersion"] == actual["apiVersion"]
+                        && resource["kind"] == actual["kind"]
+                        && resource["metadata"]["namespace"] == actual["metadata"]["namespace"]
+                        && resource["metadata"]["name"] == actual["metadata"]["name"]
+                })
+                .context("readback identity was not returned by the original create")?;
+            for field in ["uid", "generation"] {
+                if original["metadata"][field] != actual["metadata"][field] {
+                    bail!("fresh-create readback changed original {field}; no identity adoption");
+                }
+            }
+        }
+        let uid = actual
+            .pointer("/metadata/uid")
+            .and_then(Value::as_str)
+            .context("Kubernetes readback omitted the resource UID")?;
+        if !has_origin_markers(&actual["metadata"], &platform.run_id, &platform.namespace_owner_token) {
+            bail!("Kubernetes readback resource is missing the exact origin markers");
+        }
+        if matches!(
+            planned.kind.as_str(),
+            "Deployment" | "StatefulSet" | "DaemonSet" | "Job"
+        ) && !actual
+            .pointer("/spec/template/metadata")
+            .is_some_and(|metadata| has_origin_markers(metadata, &platform.run_id, &platform.namespace_owner_token))
+        {
+            bail!("Kubernetes readback pod template is missing the exact origin markers");
+        }
+        let stored = next
+            .resources
+            .iter_mut()
+            .find(|resource| {
+                resource.api_version == planned.api_version
+                    && resource.kind == planned.kind
+                    && resource.namespace == planned.namespace
+                    && resource.name == planned.name
+            })
+            .context("planned Kubernetes identity is missing from campaign inventory")?;
+        if stored.state == InventoryResourceState::Removed || stored.state == InventoryResourceState::Absent {
+            bail!("removed Kubernetes identity cannot be applied again");
+        }
+        stored.uid = Some(uid.to_owned());
+        stored.state = InventoryResourceState::Observed;
+    }
+    if created.is_some() {
+        verify_fresh_namespace_readback(config, platform).await?;
+    }
+    current.validate_successor(&next)?;
+    persist_campaign_inventory(platform, &next).await
+}
+
+async fn prepare_run_owned_resources(
+    config: &OatConfig,
+    platform: &mut AksPlatform,
+    resources: &mut [Value],
+) -> Result<()> {
+    for resource in resources.iter_mut() {
+        stamp_run_origin_markers(
+            resource,
+            &config.namespace,
+            &platform.run_id,
+            &platform.namespace_owner_token,
+        )?;
+    }
+    if config.campaign_profile != Some(crate::config::CampaignProfile::SingleHotTable) {
+        return Ok(());
+    }
+    let runtime_dir = platform
+        .runtime_dir
+        .as_deref()
+        .context("campaign runtime directory is not available")?;
+    let inventory_path = runtime_dir.join("campaign-inventory.json");
+    let current: RunInventory = serde_json::from_slice(
+        &tokio::fs::read(&inventory_path)
+            .await
+            .context("read last confirmed campaign inventory")?,
+    )
+    .context("parse last confirmed campaign inventory")?;
+    if current.namespace.name != config.namespace
+        || current.namespace.uid.as_deref() != platform.namespace_uid.as_deref()
+        || current.namespace.owner_token != platform.namespace_owner_token
+        || current.cell_run_id != platform.run_id
+    {
+        bail!("campaign inventory does not match the live cell namespace and owner");
+    }
+    let mut next = current.clone();
+    for resource in resources {
+        let planned = planned_inventory_resource(resource, &config.namespace)?;
+        if let Some(existing) = next.resources.iter().find(|item| {
+            item.api_version == planned.api_version && item.kind == planned.kind && item.name == planned.name
+        }) {
+            if existing.role != planned.role {
+                bail!("planned resource identity changed role within the run inventory");
+            }
+        } else {
+            next.resources.push(planned);
+        }
+    }
+    current.validate_successor(&next)?;
+    persist_campaign_inventory(platform, &next).await
+}
+
+#[derive(Clone, Copy)]
+enum RuntimeResourceMode {
+    Apply,
+    FreshCreate,
+}
+
+async fn apply_runtime_resources(config: &OatConfig, platform: &mut AksPlatform, resources: Vec<Value>) -> Result<()> {
+    apply_runtime_resources_with_mode(config, platform, resources, RuntimeResourceMode::Apply).await
+}
+
+async fn apply_runtime_resources_with_mode(
+    config: &OatConfig,
+    platform: &mut AksPlatform,
+    mut resources: Vec<Value>,
+    mode: RuntimeResourceMode,
+) -> Result<()> {
     if resources.is_empty() {
         bail!("refusing to apply an empty AKS runtime phase");
     }
+    prepare_run_owned_resources(config, platform, &mut resources).await?;
     let payload = serde_json::to_vec(&serde_json::json!({
         "apiVersion": "v1",
         "kind": "List",
         "items": resources,
     }))?;
-    kubectl(
-        config,
-        vec!["apply", "--namespace", &config.namespace, "-f", "-"],
-        Some(payload),
-    )
-    .await
-    .context("apply run-scoped AKS runtime resources")?;
+    let created = match mode {
+        RuntimeResourceMode::Apply => {
+            kubectl(
+                config,
+                vec!["apply", "--namespace", &config.namespace, "-f", "-"],
+                Some(payload),
+            )
+            .await
+            .context("apply run-scoped AKS runtime resources")?;
+            None
+        }
+        RuntimeResourceMode::FreshCreate => {
+            let collision = kubectl(
+                config,
+                vec![
+                    "get",
+                    "--namespace",
+                    &config.namespace,
+                    "-f",
+                    "-",
+                    "--ignore-not-found",
+                    "-o",
+                    "json",
+                ],
+                Some(payload.clone()),
+            )
+            .await?;
+            let collision: Value = serde_json::from_str(&collision)?;
+            if collision
+                .get("items")
+                .and_then(Value::as_array)
+                .is_none_or(|items| !items.is_empty())
+            {
+                bail!("fresh-create resource collision or incomplete absence readback");
+            }
+            let output = kubectl(
+                config,
+                vec!["create", "--namespace", &config.namespace, "-f", "-", "-o", "json"],
+                Some(payload),
+            )
+            .await
+            .context("fresh-create run-scoped AKS runtime resources; do not replay uncertain creation")?;
+            Some(parse_fresh_create_responses(&output, &resources)?)
+        }
+    };
+    record_resource_uids_with_creation(config, platform, &resources, created.as_deref()).await?;
     Ok(())
 }
 
-async fn create_runtime_secrets(config: &OatConfig, secrets_dir: &Path) -> Result<()> {
+async fn create_runtime_secrets(config: &OatConfig, platform: &mut AksPlatform, secrets_dir: &Path) -> Result<()> {
     let secret_specs: [(&str, &[(&str, &str)]); 5] = [
         ("arrowcol-sql-admin", &[("password", "sa-password")]),
         ("arrowcol-sql-runtime", &[("password", "app-password")]),
@@ -6795,9 +11594,16 @@ async fn create_runtime_secrets(config: &OatConfig, secrets_dir: &Path) -> Resul
             .map(|(key, file)| format!("--from-file={key}={}", secrets_dir.join(file).display()))
             .collect::<Vec<_>>();
         arguments.extend(from_files.iter().map(String::as_str));
-        kubectl(config, arguments, None)
+        arguments.extend(["--dry-run=client", "-o", "json"]);
+        let output = kubectl(config, arguments, None)
             .await
-            .with_context(|| format!("create run-scoped Kubernetes Secret {name} from private files"))?;
+            .with_context(|| format!("render run-scoped Kubernetes Secret {name} from private files"))?;
+        let mut secret: Value = serde_json::from_str(&output).context("parse rendered OAT Kubernetes Secret")?;
+        prepare_run_owned_resources(config, platform, std::slice::from_mut(&mut secret)).await?;
+        kubectl(config, vec!["create", "-f", "-"], Some(serde_json::to_vec(&secret)?))
+            .await
+            .with_context(|| format!("create run-scoped Kubernetes Secret {name}"))?;
+        record_applied_resource_uids(config, platform, std::slice::from_ref(&secret)).await?;
     }
     Ok(())
 }
@@ -7219,13 +12025,14 @@ fn shutdown_exit_outcome(
             json!({"status": "unavailable", "reason": "terminated_container_state_not_observed", "exit_code": null}),
         );
     };
-    let maintenance_failure = role == ComponentRole::Maintenance && exit == 1;
-    if !(exit == 0 || (was_running && exit == 143) || maintenance_failure) {
+    let maintenance_health_exit = role == ComponentRole::Maintenance && exit == 1;
+    if !(exit == 0 || (was_running && exit == 143) || maintenance_health_exit) {
         bail!("container failed or was forcibly stopped ({exit})");
     }
     Ok(json!({
         "status": "observed", "exit_code": exit,
-        "maintenance_operation_failure": maintenance_failure,
+        "maintenance_operation_failure": null,
+        "classification": if maintenance_health_exit { "requires_operation_records" } else { "clean_shutdown" },
     }))
 }
 
@@ -7239,8 +12046,11 @@ async fn stop_aks_workloads_in_order(config: &OatConfig) -> Result<Value> {
         );
     }
     if maintenance_enabled(config) {
-        maintenance
-            .push(stop_aks_deployment_for_cleanup(config, "delta-maintenance", ComponentRole::Maintenance, 60).await?);
+        let grace_seconds = config.maintenance_stop_budget()?.maintenance_grace_seconds;
+        maintenance.push(
+            stop_aks_deployment_for_cleanup(config, "delta-maintenance", ComponentRole::Maintenance, grace_seconds)
+                .await?,
+        );
     }
     collectors.push(
         stop_aks_deployment_for_cleanup(
@@ -7263,6 +12073,16 @@ async fn stop_aks_workloads_in_order(config: &OatConfig) -> Result<Value> {
     }))
 }
 
+fn require_aks_cleanup_confirmation(platform: &AksPlatform) -> Result<()> {
+    if platform.run_table_initialization_attempted && !platform.run_table_initialization_drained {
+        bail!("run-table initializer publisher drain was not positively confirmed");
+    }
+    if platform.qap_bind_attempted && !platform.qap_cleanup_confirmed {
+        bail!("run-owned QAP cleanup was not positively confirmed");
+    }
+    Ok(())
+}
+
 async fn cleanup_aks_platform(config: &OatConfig, platform: &mut AksPlatform) -> Result<()> {
     let mut failures = Vec::new();
     let mut namespace_removed = false;
@@ -7278,6 +12098,47 @@ async fn cleanup_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
             Err(error) => failures.push(format!("stop owned AKS router metrics tunnel: {error:#}")),
         }
         platform.router_metrics_url = None;
+    }
+    if config.campaign_profile == Some(crate::config::CampaignProfile::SingleHotTable) {
+        match cleanup_campaign_aks_platform(config, platform).await {
+            Ok(evidence) => {
+                platform.shutdown_drain_evidence = Some(evidence);
+                platform.qap_cleanup_confirmed = true;
+            }
+            Err(error) => {
+                let detail = format!("{error:#}");
+                platform.shutdown_drain_evidence = Some(json!({
+                    "status": "unavailable",
+                    "reason": "custody_cleanup_failed_or_uncertain",
+                    "failure": detail,
+                }));
+                failures.push(format!("custody-managed AKS cleanup failed: {detail}"));
+            }
+        }
+        if let Err(error) = require_aks_cleanup_confirmation(platform) {
+            failures.push(format!("AKS cleanup confirmation withheld: {error:#}"));
+        }
+        if let Some(runtime_dir) = platform.runtime_dir.take() {
+            let retention = runtime_evidence_retention(
+                platform.fic_prepare_attempted,
+                platform.fic_record_path.as_deref(),
+                platform.fic_ready_snapshot_path.as_deref(),
+                platform.qap_bind_attempted,
+                platform.qap_record_path.as_deref(),
+                platform.workload_stop_record_path.as_deref(),
+                platform.qap_outcome_unresolved || !failures.is_empty(),
+            );
+            if let Err(error) = apply_runtime_evidence_retention(&runtime_dir, retention).await {
+                failures.push(format!(
+                    "remove private AKS runtime files {}: {error:#}",
+                    runtime_dir.display()
+                ));
+            }
+        }
+        if failures.is_empty() {
+            return Ok(());
+        }
+        return Err(anyhow::anyhow!("AKS cleanup was incomplete: {}", failures.join("; ")));
     }
     if platform.namespace_created || platform.namespace_create_attempted {
         match kubectl(config, vec!["get", "namespace", &config.namespace, "-o", "json"], None).await {
@@ -7357,8 +12218,9 @@ async fn cleanup_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
                                 }
                                 Err(error) => Err(error),
                             };
-                            if let Err(error) = cleanup_result {
-                                failures.push(format!("remove exact run-owned QAP bindings: {error:#}"));
+                            match cleanup_result {
+                                Ok(()) => platform.qap_cleanup_confirmed = true,
+                                Err(error) => failures.push(format!("remove exact run-owned QAP bindings: {error:#}")),
                             }
                         }
                         _ => failures.push("QAP cleanup requires both ownership and workload-stop records".to_owned()),
@@ -7380,7 +12242,10 @@ async fn cleanup_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
                             None,
                             None,
                             record_path,
-                            None,
+                            FicHelperOptions {
+                                wait_seconds: None,
+                                identity_plan_path: None,
+                            },
                             bootstrap_env_file,
                         ),
                     )
@@ -7396,6 +12261,9 @@ async fn cleanup_aks_platform(config: &OatConfig, platform: &mut AksPlatform) ->
         } else {
             failures.push("workload identity cleanup has no durable run record path".to_owned());
         }
+    }
+    if let Err(error) = require_aks_cleanup_confirmation(platform) {
+        failures.push(format!("AKS cleanup confirmation withheld: {error:#}"));
     }
     if let Some(runtime_dir) = platform.runtime_dir.take() {
         let retention = runtime_evidence_retention(
@@ -7463,7 +12331,19 @@ fn qap_lease_sidecar_path(record_path: &Path) -> PathBuf {
 async fn apply_runtime_evidence_retention(directory: &Path, retention: RuntimeEvidenceRetention) -> Result<()> {
     match retention {
         RuntimeEvidenceRetention::PreserveAll => Ok(()),
-        RuntimeEvidenceRetention::PruneExcept(preserve) => remove_runtime_dir_except(directory, &preserve).await,
+        RuntimeEvidenceRetention::PruneExcept(mut preserve) => {
+            for name in [
+                "run-table-initializer-job.json",
+                "run-table-initializer-termination.json",
+                "run-table-catalog-registration.json",
+            ] {
+                let path = directory.join(name);
+                if path.try_exists().context("inspect retained initializer evidence")? {
+                    preserve.push(path);
+                }
+            }
+            remove_runtime_dir_except(directory, &preserve).await
+        }
     }
 }
 
@@ -7492,6 +12372,506 @@ async fn remove_runtime_dir_except(directory: &Path, preserve: &[PathBuf]) -> Re
             .with_context(|| format!("remove empty private runtime directory {}", directory.display()))?;
     }
     Ok(())
+}
+
+fn configure_client_job_resources(job: &mut Value, requirements: &ResourceRequirements) -> Result<()> {
+    let container = job
+        .pointer_mut("/spec/template/spec/containers/0")
+        .context("AKS client container is missing")?;
+    container["resources"] = serde_json::to_value(requirements)?;
+    Ok(())
+}
+
+fn configure_deployment_container_resources(
+    deployment: &mut Value,
+    container_name: &str,
+    requirements: &ResourceRequirements,
+) -> Result<()> {
+    let containers = deployment
+        .pointer_mut("/spec/template/spec/containers")
+        .and_then(Value::as_array_mut)
+        .context("Deployment has no container list")?;
+    let mut selected = containers
+        .iter_mut()
+        .filter(|container| container.get("name").and_then(Value::as_str) == Some(container_name));
+    let container = selected
+        .next()
+        .with_context(|| format!("container {container_name:?} was not found"))?;
+    if selected.next().is_some() {
+        bail!("container {container_name:?} is ambiguous in Deployment");
+    }
+    let mut resources = serde_json::to_value(requirements)?;
+    if requirements.limits.cpu.is_none() {
+        resources["limits"]
+            .as_object_mut()
+            .context("resource limits must be an object")?
+            .remove("cpu");
+    }
+    container["resources"] = resources;
+    Ok(())
+}
+
+fn verify_container_resources(
+    containers: &[Value],
+    container_name: &str,
+    role: &str,
+    expected: &ResourceRequirements,
+) -> Result<Value> {
+    let mut selected = containers
+        .iter()
+        .filter(|container| container.get("name").and_then(Value::as_str) == Some(container_name));
+    let container = selected
+        .next()
+        .with_context(|| format!("{role} container {container_name:?} is missing"))?;
+    if selected.next().is_some() {
+        bail!("{role} container {container_name:?} is ambiguous");
+    }
+    let resources = container
+        .get("resources")
+        .context("container resource readback is missing")?;
+    let quantity = |side: &str, name: &str| -> Result<String> {
+        resources
+            .pointer(&format!("/{side}/{name}"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .with_context(|| format!("{role} resource readback omitted {side}.{name}"))
+    };
+    let limits = resources
+        .get("limits")
+        .and_then(Value::as_object)
+        .context("resource readback omitted limits")?;
+    let limit_cpu = match limits.get("cpu") {
+        None => None,
+        Some(Value::String(value)) => Some(value.clone()),
+        Some(_) => bail!("{role} resource CPU limit readback has an invalid type"),
+    };
+    let actual = ResourceRequirements {
+        requests: ResourceValues {
+            cpu: Some(quantity("requests", "cpu")?),
+            memory: quantity("requests", "memory")?,
+        },
+        limits: ResourceValues {
+            cpu: limit_cpu,
+            memory: quantity("limits", "memory")?,
+        },
+    };
+    let actual_request = actual.requests.cpu.as_deref().context("actual CPU request missing")?;
+    let expected_request = expected
+        .requests
+        .cpu
+        .as_deref()
+        .context("expected CPU request missing")?;
+    let quantities_match = parse_resource_cpu_millicores(actual_request)?
+        == parse_resource_cpu_millicores(expected_request)?
+        && actual.limits.cpu.as_deref().map(parse_cpu_millicores).transpose()?
+            == expected.limits.cpu.as_deref().map(parse_cpu_millicores).transpose()?
+        && parse_resource_memory_bytes(&actual.requests.memory)?
+            == parse_resource_memory_bytes(&expected.requests.memory)?
+        && parse_memory_bytes(&actual.limits.memory)? == parse_memory_bytes(&expected.limits.memory)?;
+    if !quantities_match {
+        bail!("{role} effective pod resource readback differs from requested values");
+    }
+    Ok(json!({"requested": expected, "effective": actual}))
+}
+
+fn deployment_selector(deployment: &Value) -> Result<String> {
+    let labels = deployment
+        .pointer("/spec/selector/matchLabels")
+        .and_then(Value::as_object)
+        .context("Deployment selector.matchLabels is missing")?;
+    let selector = labels
+        .iter()
+        .map(|(key, value)| {
+            value
+                .as_str()
+                .map(|value| format!("{key}={value}"))
+                .context("Deployment selector labels must be strings")
+        })
+        .collect::<Result<Vec<_>>>()?
+        .join(",");
+    anyhow::ensure!(!selector.is_empty(), "Deployment selector must not be empty");
+    Ok(selector)
+}
+
+async fn aks_deployment_resource_readback(
+    config: &OatConfig,
+    role: &str,
+    deployment_name: &str,
+    container_name: &str,
+    expected: &ResourceRequirements,
+) -> Result<Value> {
+    let deployment = deployment(config, deployment_name).await?;
+    let template_containers = deployment
+        .pointer("/spec/template/spec/containers")
+        .and_then(Value::as_array)
+        .context("Deployment pod template has no containers")?;
+    let template = verify_container_resources(template_containers, container_name, role, expected)?;
+    let selector = deployment_selector(&deployment)?;
+    let pod_json = kubectl(
+        config,
+        vec![
+            "get",
+            "pods",
+            "--namespace",
+            &config.namespace,
+            "--selector",
+            &selector,
+            "-o",
+            "json",
+        ],
+        None,
+    )
+    .await
+    .with_context(|| format!("read {role} pod resource and placement readbacks"))?;
+    let pod_list: Value = serde_json::from_str(&pod_json).context("parse resource-readback pod list")?;
+    let pods = pod_list
+        .get("items")
+        .and_then(Value::as_array)
+        .context("resource-readback pod list omitted items")?;
+    let mut scheduled = Vec::new();
+    for pod in pods
+        .iter()
+        .filter(|pod| pod.pointer("/metadata/deletionTimestamp").is_none())
+    {
+        let metadata = pod.get("metadata").context("pod metadata is missing")?;
+        let pod_name = metadata
+            .get("name")
+            .and_then(Value::as_str)
+            .context("pod name is missing")?;
+        let node_name = pod
+            .pointer("/spec/nodeName")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .with_context(|| format!("{role} pod {pod_name} has no scheduled node"))?;
+        let containers = pod
+            .pointer("/spec/containers")
+            .and_then(Value::as_array)
+            .context("pod spec has no containers")?;
+        let resources = verify_container_resources(containers, container_name, role, expected)?;
+        scheduled.push(json!({
+            "pod": pod_name,
+            "uid": metadata.get("uid"),
+            "container": container_name,
+            "container_id": native_container_id(pod, container_name),
+            "node": node_name,
+            "resources": resources["effective"],
+        }));
+    }
+    anyhow::ensure!(
+        !scheduled.is_empty(),
+        "{role} has no active pod with resource and scheduled-node readback"
+    );
+    Ok(json!({
+        "role": role,
+        "deployment": deployment_name,
+        "requested": expected,
+        "effective": {"template": template["effective"], "pods": scheduled},
+    }))
+}
+
+async fn aks_deployment_resource_evidence(config: &OatConfig) -> Result<Vec<Value>> {
+    let resources = config.effective_aks_resources();
+    let evidence = vec![
+        aks_deployment_resource_readback(
+            config,
+            "collector",
+            &config.dfe_deployment,
+            &config.dfe_container,
+            &resources.collector,
+        )
+        .await?,
+        aks_deployment_resource_readback(config, "router", "arrowcol-router", "router", &resources.router).await?,
+        aks_deployment_resource_readback(config, "catalog", "arrowcol-catalog", "catalog", &resources.catalog).await?,
+    ];
+    Ok(evidence)
+}
+
+#[derive(Clone, Debug)]
+struct CpuThrottleCounters {
+    periods: u64,
+    throttled_periods: u64,
+}
+
+#[derive(Clone, Debug)]
+struct CpuThrottleSample {
+    role: String,
+    pod: String,
+    uid: String,
+    container: String,
+    node: String,
+    counters: Option<CpuThrottleCounters>,
+    unavailable_reason: Option<String>,
+}
+
+fn parse_cadvisor_cpu_counters(
+    metrics: &str,
+    namespace: &str,
+    pod: &str,
+    container: &str,
+) -> Result<Option<CpuThrottleCounters>> {
+    let mut periods = None;
+    let mut throttled_periods = None;
+    for line in metrics.lines().filter(|line| !line.starts_with('#')) {
+        let Some((name, remainder)) = line.split_once('{') else {
+            continue;
+        };
+        if !matches!(
+            name,
+            "container_cpu_cfs_periods_total" | "container_cpu_cfs_throttled_periods_total"
+        ) {
+            continue;
+        }
+        let Some((labels_text, value_text)) = remainder.split_once('}') else {
+            continue;
+        };
+        let mut labels = HashMap::new();
+        for label in labels_text.split(',') {
+            let Some((key, value)) = label.split_once('=') else {
+                continue;
+            };
+            labels.insert(key.trim(), value.trim().trim_matches('"'));
+        }
+        if labels.get("namespace").copied() != Some(namespace)
+            || labels.get("pod").or_else(|| labels.get("pod_name")).copied() != Some(pod)
+            || labels.get("container").copied() != Some(container)
+        {
+            continue;
+        }
+        let value_text = value_text
+            .split_whitespace()
+            .next()
+            .context("cAdvisor metric value is missing")?;
+        let value = value_text.parse::<f64>().context("cAdvisor counter is not numeric")?;
+        if !value.is_finite() || value < 0.0 || value.fract() != 0.0 || value > u64::MAX as f64 {
+            bail!("cAdvisor throttling counters must be nonnegative integers");
+        }
+        let counter = value as u64;
+        match name {
+            "container_cpu_cfs_periods_total" if periods.is_some() => {
+                bail!("cAdvisor returned ambiguous CPU period counters for {pod}/{container}");
+            }
+            "container_cpu_cfs_periods_total" => periods = Some(counter),
+            "container_cpu_cfs_throttled_periods_total" if throttled_periods.is_some() => {
+                bail!("cAdvisor returned ambiguous throttling counters for {pod}/{container}");
+            }
+            "container_cpu_cfs_throttled_periods_total" => throttled_periods = Some(counter),
+            _ => {}
+        }
+    }
+    match (periods, throttled_periods) {
+        (Some(periods), Some(throttled_periods)) => Ok(Some(CpuThrottleCounters {
+            periods,
+            throttled_periods,
+        })),
+        _ => Ok(None),
+    }
+}
+
+#[derive(Clone, serde::Serialize)]
+struct AksResourcePodTarget {
+    role: String,
+    pod: String,
+    uid: String,
+    container: String,
+    node: String,
+    container_id: Option<String>,
+}
+
+fn aks_resource_pod_targets(readbacks: &[Value]) -> Result<Vec<AksResourcePodTarget>> {
+    let mut targets = Vec::new();
+    for readback in readbacks {
+        let role = readback
+            .get("role")
+            .and_then(Value::as_str)
+            .context("AKS resource evidence omitted role")?;
+        let mut add_pod = |pod: &Value, pod_field: &str| -> Result<()> {
+            let name = pod
+                .get(pod_field)
+                .and_then(Value::as_str)
+                .context("AKS resource evidence omitted pod name")?;
+            let uid = pod
+                .get("uid")
+                .and_then(Value::as_str)
+                .context("AKS resource evidence omitted pod UID")?;
+            let node = pod
+                .get("node")
+                .and_then(Value::as_str)
+                .context("AKS resource evidence omitted node")?;
+            let container = pod
+                .get("container")
+                .and_then(Value::as_str)
+                .context("AKS resource evidence omitted container")?;
+            targets.push(AksResourcePodTarget {
+                role: role.to_owned(),
+                pod: name.to_owned(),
+                uid: uid.to_owned(),
+                container: container.to_owned(),
+                node: node.to_owned(),
+                container_id: pod.get("container_id").and_then(Value::as_str).map(str::to_owned),
+            });
+            Ok(())
+        };
+        if role == "client" {
+            add_pod(
+                readback
+                    .get("scheduled_pod")
+                    .context("client resource evidence omitted scheduled pod")?,
+                "name",
+            )?;
+        } else {
+            for pod in readback
+                .pointer("/effective/pods")
+                .and_then(Value::as_array)
+                .context("AKS resource evidence omitted deployment pods")?
+            {
+                add_pod(pod, "pod")?;
+            }
+        }
+    }
+    Ok(targets)
+}
+
+async fn capture_aks_cpu_throttling(config: &OatConfig, readbacks: &[Value]) -> Result<Vec<CpuThrottleSample>> {
+    let targets = aks_resource_pod_targets(readbacks)?;
+    let nodes = targets
+        .iter()
+        .map(|target| target.node.clone())
+        .collect::<BTreeSet<_>>();
+    let scrape = tokio::time::timeout(
+        Duration::from_millis(AKS_RESOURCE_COUNTER_SNAPSHOT_TIMEOUT_MS),
+        join_all(nodes.iter().map(|node| async move {
+            let path = format!("/api/v1/nodes/{node}/proxy/metrics/cadvisor");
+            let result = kubectl(config, vec!["get", "--raw", &path, "--request-timeout=5s"], None).await;
+            (node.clone(), result.map_err(|error| format!("{error:#}")))
+        })),
+    )
+    .await;
+    let node_metrics = match scrape {
+        Ok(results) => results.into_iter().collect::<HashMap<_, _>>(),
+        Err(_) => nodes
+            .iter()
+            .cloned()
+            .map(|node| {
+                (
+                    node,
+                    Err("cAdvisor snapshot exceeded its five-second budget".to_owned()),
+                )
+            })
+            .collect::<HashMap<_, _>>(),
+    };
+    let mut samples = Vec::with_capacity(targets.len());
+    for target in targets {
+        let (counters, unavailable_reason) = match node_metrics.get(&target.node) {
+            Some(Ok(metrics)) => {
+                match parse_cadvisor_cpu_counters(metrics, &config.namespace, &target.pod, &target.container) {
+                    Ok(Some(counters)) => (Some(counters), None),
+                    Ok(None) => (None, Some("cAdvisor cgroup CPU counters are unavailable".to_owned())),
+                    Err(error) => (
+                        None,
+                        Some(format!("cAdvisor counters are ambiguous or invalid: {error:#}")),
+                    ),
+                }
+            }
+            Some(Err(error)) => (None, Some(format!("cAdvisor scrape failed: {error}"))),
+            None => (None, Some("cAdvisor node scrape was not attempted".to_owned())),
+        };
+        samples.push(CpuThrottleSample {
+            role: target.role,
+            pod: target.pod,
+            uid: target.uid,
+            container: target.container,
+            node: target.node,
+            counters,
+            unavailable_reason,
+        });
+    }
+    Ok(samples)
+}
+
+fn compare_cpu_throttling(start: &[CpuThrottleSample], end: &[CpuThrottleSample]) -> Value {
+    let start_by_identity = start
+        .iter()
+        .map(|sample| {
+            (
+                (
+                    sample.role.as_str(),
+                    sample.pod.as_str(),
+                    sample.uid.as_str(),
+                    sample.container.as_str(),
+                ),
+                sample,
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let mut measured = 0;
+    let mut pod_evidence = Vec::with_capacity(end.len());
+    for sample in end {
+        let key = (
+            sample.role.as_str(),
+            sample.pod.as_str(),
+            sample.uid.as_str(),
+            sample.container.as_str(),
+        );
+        let result = start_by_identity.get(&key).and_then(|before| {
+            let before = before.counters.as_ref()?;
+            let after = sample.counters.as_ref()?;
+            Some((
+                after.periods.checked_sub(before.periods)?,
+                after.throttled_periods.checked_sub(before.throttled_periods)?,
+            ))
+        });
+        match result {
+            Some((periods, throttled_periods)) if periods > 0 => {
+                measured += 1;
+                pod_evidence.push(json!({
+                    "role": sample.role,
+                    "pod": sample.pod,
+                    "uid": sample.uid,
+                    "container": sample.container,
+                    "node": sample.node,
+                    "status": "measured",
+                    "periods": periods,
+                    "throttled_periods": throttled_periods,
+                    "throttled_period_fraction": throttled_periods as f64 / periods as f64,
+                }));
+            }
+            _ => {
+                let start_sample = start_by_identity.get(&key).copied();
+                let initial_unavailable_reason = start_sample
+                    .filter(|before| before.counters.is_none())
+                    .and_then(|before| before.unavailable_reason.as_deref());
+                let reason = initial_unavailable_reason
+                    .or(sample.unavailable_reason.as_deref())
+                    .unwrap_or(if start_sample.is_some() {
+                        "counter reset, identity changed, or no CPU periods elapsed"
+                    } else {
+                        "initial cAdvisor snapshot omitted this pod identity"
+                    });
+                pod_evidence.push(json!({
+                    "role": sample.role,
+                    "pod": sample.pod,
+                    "uid": sample.uid,
+                    "container": sample.container,
+                    "node": sample.node,
+                    "status": "unavailable",
+                    "reason": reason,
+                }));
+            }
+        }
+    }
+    let status = if measured == end.len() && measured > 0 {
+        "measured"
+    } else if measured > 0 {
+        "partial"
+    } else {
+        "unavailable"
+    };
+    json!({
+        "status": status,
+        "scope": "scheduled_load_to_client_completion",
+        "source": "kubelet cAdvisor container CPU CFS counters",
+        "pods": pod_evidence,
+    })
 }
 
 async fn apply_deployment(config: &OatConfig, mut deployment: Value) -> Result<()> {
@@ -8016,15 +13396,37 @@ fn parse_memory_bytes(value: &str) -> Result<u64> {
 }
 
 async fn kubectl(config: &OatConfig, args: Vec<&str>, stdin: Option<Vec<u8>>) -> Result<String> {
+    kubectl_with_output_bound(config, args, stdin, None).await
+}
+
+async fn kubectl_with_output_bound(
+    config: &OatConfig,
+    args: Vec<&str>,
+    stdin: Option<Vec<u8>>,
+    max_output_bytes: Option<usize>,
+) -> Result<String> {
+    if max_output_bytes.is_some_and(|limit| limit == 0 || limit > OFFICIAL_MEASUREMENT_MAX_BYTES) {
+        bail!("invalid native kubectl output byte bound");
+    }
     let mut command = Command::new("kubectl");
     if let Some(context) = &config.kubectl_context {
         command.args(["--context", context]);
     }
-    command
-        .args(&args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+    if FIXTURE_BOUNDARY.try_with(|_| ()).is_ok() {
+        let server = FIXTURE_BOUNDARY.with(|boundary| boundary.authority.server.clone());
+        command.args(["--server", &server]);
+    }
+    command.args(&args);
+    if let Some((code, stdout)) = fixture_command_output(&command, stdin.as_deref()).await? {
+        if max_output_bytes.is_some_and(|limit| stdout.len() > limit) {
+            bail!("native kubectl output exceeded its byte bound");
+        }
+        if code != 0 {
+            bail!("fixture kubectl command failed; outcome may be unknown and must not be replayed");
+        }
+        return Ok(stdout);
+    }
+    command.stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
     if stdin.is_some() {
         command.stdin(Stdio::piped());
     }
@@ -8033,7 +13435,10 @@ async fn kubectl(config: &OatConfig, args: Vec<&str>, stdin: Option<Vec<u8>>) ->
         let mut input = child.stdin.take().context("open kubectl stdin")?;
         input.write_all(&payload).await.context("write kubectl manifest")?;
     }
-    let output = child.wait_with_output().await.context("wait for kubectl")?;
+    let output = match max_output_bytes {
+        Some(limit) => bounded_native_child_output(child, limit).await?,
+        None => child.wait_with_output().await.context("wait for kubectl")?,
+    };
     if !output.status.success() {
         bail!(
             "kubectl {} failed with {}: {}",
@@ -8545,6 +13950,60 @@ fn platform_host_label(kind: crate::config::OatMode) -> &'static str {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn local_bind_probe_uses_effective_client_image() -> anyhow::Result<()> {
+        let rendered = serde_json::json!({"services": {
+            "oat-client": {"image": "sha256:0123456789abcdef"},
+            "dataflow-1": {"image": "other"}
+        }});
+        assert_eq!(super::local_client_image(&rendered)?, "sha256:0123456789abcdef");
+        for invalid in [
+            serde_json::json!({"services": {"oat-client": {}}}),
+            serde_json::json!({"services": {"oat-client": {"image": ""}}}),
+            serde_json::json!({"services": {"oat-client": {"image": "not valid"}}}),
+        ] {
+            assert!(super::local_client_image(&invalid).is_err());
+        }
+        let valid_id = format!("sha256:{}", "a".repeat(64));
+        assert_eq!(super::local_client_image_id(&format!("{valid_id}\n"))?, valid_id);
+        for invalid in [
+            String::from("arrowcol-oat-client:local"),
+            String::from("sha256:1234"),
+            format!("sha256:{}", "g".repeat(64)),
+        ] {
+            assert!(super::local_client_image_id(&invalid).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn local_partition_initializer_uses_campaign_table_and_shared_run_root() -> anyhow::Result<()> {
+        let root = std::env::temp_dir().join(format!("oat-partition-root-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root)?;
+        let args = super::local_partition_initializer_args("sqlserver_availability_replica_states", &root)?;
+        assert_eq!(
+            args,
+            [
+                "initialize-local",
+                "--partition-by-ingestion-date",
+                "--table",
+                "telemetry.sqlserver.sqlserver_availability_replica_states",
+                "--dataflow-root",
+                root.to_str().context("temp root is not valid UTF-8")?,
+            ]
+        );
+        assert!(super::local_partition_initializer_args("sqlserver_wait_stats", &root).is_err());
+        assert!(
+            super::local_partition_initializer_args(
+                "sqlserver_availability_replica_states",
+                Path::new("relative/dataflow")
+            )
+            .is_err()
+        );
+        std::fs::remove_dir(&root)?;
+        Ok(())
+    }
+
+    #[test]
     fn rollout_readiness_waits_for_current_generation_and_removal_of_old_replicas() {
         let stale_generation = serde_json::json!({
             "metadata":{"generation":4},"spec":{"replicas":2},
@@ -8665,6 +14124,7 @@ mod tests {
                 "workloadIdentityClientId": "00000000-0000-0000-0000-000000000001",
                 "subscriptionId": "00000000-0000-0000-0000-000000000002", "stamp": "89152",
                 "deltaRoot": "abfss://onelake@arrowcollector89152.dfs.core.windows.net/dataflow", "images": images,
+                "effective_stop_budgets": {"maintenance_grace_seconds": 4_800, "maintenance_stop_timeout_ms": 5_100_000},
                 "maintenance": {"tables": ["telemetry.sqlserver.sqlserver_active_sessions"], "operations": ["optimize"], "apply": false},
             });
             let input_path = directory.join("runtime.json");
@@ -8741,7 +14201,10 @@ mod tests {
                 Some("arrow-collector-00000000000000000000000000000001"),
                 Some("arrowcol-oat"),
                 Path::new("/tmp/run-fic.json"),
-                None,
+                FicHelperOptions {
+                    wait_seconds: None,
+                    identity_plan_path: (operation == "prepare-run-fic").then_some(Path::new("/tmp/run-fic-plan.json")),
+                },
                 AksHelperConfigPaths {
                     stamp_config_path: Path::new("/tmp/stamp-87513.yaml"),
                     bootstrap_env_file: Path::new("/tmp/oat-private-bootstrap.env"),
@@ -8771,7 +14234,29 @@ mod tests {
                     "{operation} must clear inherited {variable}"
                 );
             }
+            assert_eq!(
+                command.as_std().get_args().any(|arg| arg == "--identity-plan"),
+                operation == "prepare-run-fic"
+            );
         }
+        assert!(
+            run_fic_helper_command(
+                "prepare-run-fic",
+                "00000000-0000-0000-0000-000000000001",
+                Some("oat-test"),
+                Some("arrowcol-oat"),
+                Path::new("/tmp/run-fic.json"),
+                FicHelperOptions {
+                    wait_seconds: None,
+                    identity_plan_path: None,
+                },
+                AksHelperConfigPaths {
+                    stamp_config_path: Path::new("/tmp/stamp-87513.yaml"),
+                    bootstrap_env_file: Path::new("/tmp/oat-private-bootstrap.env"),
+                },
+            )
+            .is_err()
+        );
         Ok(())
     }
 
@@ -8786,6 +14271,7 @@ mod tests {
         for (operation, manifest_path, workload_record_path, workload_stop_record_path) in [
             ("bind-oat-qap", Some(manifest), Some(workload), None),
             ("verify-oat-qap", None, None, None),
+            ("oat-qap-reference", None, None, None),
             ("cleanup-oat-qap", None, None, Some(stop)),
         ] {
             let command = run_oat_qap_helper_command(
@@ -8934,6 +14420,67 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn aks_runtime_projects_exact_cell_replicas() -> Result<()> {
+        for replicas in [1, 2, 16] {
+            let mut runtime = json!({"collectorReplicas":7,"routerReplicas":8,"other":"retained"});
+            set_runtime_replicas(&mut runtime, replicas)?;
+            assert_eq!(runtime["collectorReplicas"], replicas);
+            assert_eq!(runtime["routerReplicas"], replicas);
+            assert_eq!(runtime["other"], "retained");
+        }
+        assert!(set_runtime_replicas(&mut json!({}), 0).is_err());
+        assert!(set_runtime_replicas(&mut json!({}), 17).is_err());
+        assert!(set_runtime_replicas(&mut Value::Null, 1).is_err());
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        let original = json!({"other":"retained","collectorReplicas":7});
+        let mut runtime = original.clone();
+        project_scale_out_runtime(&mut runtime, &config, 2)?;
+        assert_eq!(runtime, original);
+        config.campaign_profile = Some(crate::config::CampaignProfile::ScaleOutSingleTable);
+        config.tables = vec!["sqlserver_availability_replica_states".to_owned()];
+        for replicas in [0, 2, 16] {
+            let before = runtime.clone();
+            assert!(project_scale_out_runtime(&mut runtime, &config, replicas).is_err());
+            assert_eq!(runtime, before);
+        }
+        project_scale_out_runtime(&mut runtime, &config, 1)?;
+        assert_eq!(runtime["campaignProfile"], "scale_out_single_table");
+        assert_eq!(runtime["hotTable"], config.tables[0]);
+        assert_eq!(runtime["collectorReplicas"], 1);
+        assert_eq!(runtime["routerReplicas"], 1);
+        for cpu in [Some("2"), None] {
+            config.platform.resources = Some(serde_json::from_value(json!({
+                "collector": {"requests": {"cpu": "2", "memory": "4Gi"},
+                              "limits": {"cpu": cpu, "memory": "6Gi"}}
+            }))?);
+            runtime["resources"] = serde_json::to_value(config.effective_aks_resources())?;
+            assert_eq!(runtime.pointer("/resources/collector/limits/cpu"), Some(&json!(cpu)));
+        }
+        config.tables.push("sqlserver_wait_stats".to_owned());
+        assert!(project_scale_out_runtime(&mut runtime, &config, 1).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn scale_out_profile_allows_aks_and_rejects_local_before_platform_creation() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        config.campaign_profile = Some(crate::config::CampaignProfile::ScaleOutSingleTable);
+        config.platform.kind = crate::config::OatMode::Local;
+        let error = platform_for_run(&config, "test-run")
+            .err()
+            .context("local scale-out was admitted")?;
+        assert!(error.to_string().contains("exploratory runs require AKS"));
+        config.platform.kind = crate::config::OatMode::Aks;
+        let platform = platform_for_run(&config, "test-run")?;
+        assert_eq!(platform.kind(), crate::config::OatMode::Aks);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn cancellation_stops_matrix_after_the_cleaned_cell() -> Result<()> {
         let mut config: OatConfig = serde_json::from_str(include_str!(
@@ -8952,6 +14499,7 @@ mod tests {
                     rows: Vec::new(),
                     error: None,
                     cancelled: true,
+                    aks_cleanup_confirmed: false,
                 })
             },
         )
@@ -8959,6 +14507,36 @@ mod tests {
         assert!(outcome.cancelled);
         assert!(outcome.error.is_none());
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cleanup_confirmation_requires_every_attempted_matrix_cell() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        config.replica_counts = vec![1, 2];
+        config.dfe_worker_concurrency = vec![1];
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let call_counter = std::sync::Arc::clone(&calls);
+        let outcome = run_matrix_with(
+            &config,
+            "11111111-1111-4111-8111-111111111111",
+            &AppState::default(),
+            move |_, _, _, _| {
+                let cell = call_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::future::ready(MatrixOutcome {
+                    rows: Vec::new(),
+                    error: (cell == 1).then(|| anyhow::anyhow!("second cell failed")),
+                    cancelled: false,
+                    aks_cleanup_confirmed: cell == 0,
+                })
+            },
+        )
+        .await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(outcome.error.is_some());
+        assert!(!outcome.aks_cleanup_confirmed);
         Ok(())
     }
 
@@ -9077,8 +14655,779 @@ mod tests {
         assert!(verify_aks_collector_stop_grace(&json!({}), 300).is_err());
     }
 
+    #[test]
+    fn run_owned_job_origin_markers_cover_metadata_and_template_without_changing_selectors() -> Result<()> {
+        let mut job = json!({
+            "apiVersion": "batch/v1",
+            "kind": "Job",
+            "metadata": {
+                "name": "oat-run-client-c0",
+                "namespace": "oat-run-1",
+                "labels": {"app": "arrowcol-oat-client"},
+            },
+            "spec": {
+                "selector": {"matchLabels": {"batch.kubernetes.io/controller-uid": "selector-value"}},
+                "template": {
+                    "metadata": {"labels": {"app": "arrowcol-oat-client"}},
+                    "spec": {"containers": []},
+                },
+            },
+        });
+        let selector = job["spec"]["selector"].clone();
+        super::stamp_run_origin_markers(&mut job, "oat-run-1", "run-1", "owner-1")?;
+        for metadata in [&job["metadata"], &job["spec"]["template"]["metadata"]] {
+            for field in ["labels", "annotations"] {
+                assert_eq!(metadata[field]["arrowcol-oat/run-id"], "run-1");
+                assert_eq!(metadata[field]["arrowcol-oat/owner-token"], "owner-1");
+            }
+        }
+        assert_eq!(job["spec"]["selector"], selector);
+        let planned = super::planned_inventory_resource(&job, "oat-run-1")?;
+        assert_eq!(planned.api_version, "batch/v1");
+        assert_eq!(planned.kind, "Job");
+        assert_eq!(planned.name, "oat-run-client-c0");
+        assert_eq!(planned.namespace, "oat-run-1");
+        Ok(())
+    }
+
+    #[test]
+    fn campaign_identity_requires_complete_canonical_fenced_context() -> Result<()> {
+        let mut values = HashMap::from([
+            ("CAMPAIGN_ID", "00000000-0000-0000-0000-000000000001"),
+            ("CAMPAIGN_OWNER_ID", "00000000-0000-0000-0000-000000000002"),
+            ("CAMPAIGN_FENCING_TOKEN", "1"),
+        ]);
+        let parse = |values: &HashMap<&str, &str>| {
+            CampaignIdentity::from_lookup(|name| values.get(name).map(|value| (*value).to_owned()))
+        };
+        assert_eq!(parse(&values)?.fencing_token, 1);
+        for token in ["0", "-1", "1x", "9007199254740992"] {
+            values.insert("CAMPAIGN_FENCING_TOKEN", token);
+            assert!(parse(&values).is_err());
+        }
+        values.insert("CAMPAIGN_FENCING_TOKEN", "1");
+        values.insert("CAMPAIGN_OWNER_ID", "00000000-0000-0000-0000-000000000000");
+        assert!(parse(&values).is_err());
+        values.remove("CAMPAIGN_ID");
+        assert!(parse(&values).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn rust_initial_campaign_inventory_serializes_for_the_final_ts_predicate() -> anyhow::Result<()> {
+        let identity = super::CampaignIdentity {
+            campaign_id: "00000000-0000-0000-0000-000000000001".to_owned(),
+            owner_id: "00000000-0000-0000-0000-000000000002".to_owned(),
+            fencing_token: 7,
+        };
+        let inventory = super::initial_campaign_inventory(
+            &identity,
+            "00000000-0000-0000-0000-000000000003",
+            "00000000-0000-0000-0000-000000000004",
+            "arrow-collector-00000000000000000000000000000004",
+            "campaignstorage",
+            "checkpoints",
+            CampaignCellBudget {
+                effective_stop_budgets: EffectiveStopBudgets {
+                    maintenance_grace_seconds: 1_200,
+                    maintenance_stop_timeout_ms: 1_500_000,
+                },
+                planned_cell_duration_ms: 1_000,
+            },
+        )?;
+        super::validate_campaign_baseline_capture_inventory(&inventory, &identity)?;
+        let value = serde_json::to_value(&inventory)?;
+        assert_eq!(value["load_admission"], "not_authorized");
+        assert_eq!(value["namespace"]["uid"], serde_json::Value::Null);
+        assert_eq!(value["resources"], serde_json::json!([]));
+        assert_eq!(value["fic"], serde_json::Value::Null);
+        assert_eq!(value["qap"], serde_json::Value::Null);
+        assert_eq!(value["effective_stop_budgets"]["maintenance_grace_seconds"], 1_200);
+        assert_eq!(
+            value["effective_stop_budgets"]["maintenance_stop_timeout_ms"],
+            1_500_000
+        );
+        assert_eq!(value["planned_cell_duration_ms"], 1_000);
+        let mut no_row_rehearsal = inventory.clone();
+        no_row_rehearsal.planned_cell_duration_ms = Some(0);
+        no_row_rehearsal.resources.push(InventoryResource {
+            api_version: "apps/v1".to_owned(),
+            kind: "Deployment".to_owned(),
+            namespace: no_row_rehearsal.namespace.name.clone(),
+            name: "arrowcol".to_owned(),
+            uid: None,
+            role: InventoryResourceRole::Collector,
+            state: InventoryResourceState::Planned,
+            absence: None,
+        });
+        no_row_rehearsal.validate()?;
+        println!("E1_RUST_INITIAL_INVENTORY={}", serde_json::to_string(&inventory)?);
+        Ok(())
+    }
+
+    #[test]
+    fn campaign_cli_actions_always_receive_the_selected_private_env_and_stamp_paths() -> Result<()> {
+        let paths = AksHelperConfigPaths {
+            stamp_config_path: Path::new("/workspace/selected-stamp.yaml"),
+            bootstrap_env_file: Path::new("/private/campaign.env"),
+        };
+        let actions = [
+            "publish-inventory",
+            "assert-ready",
+            "read-inventory",
+            "capture-cell-baseline",
+            "cleanup-step",
+            "capture-baseline",
+        ];
+        for action in actions {
+            let action_args = if action == "capture-baseline" {
+                vec!["00000000-0000-0000-0000-000000000002".to_owned(), "7".to_owned()]
+            } else {
+                Vec::new()
+            };
+            let command = aks_campaign_cli_command(paths, action, &action_args)?;
+            let args = command
+                .as_std()
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(args[0], "--no-install");
+            assert_eq!(args[1], "tsx");
+            assert_eq!(args[2], "projects/arrowcol-oat/aks-campaign.ts");
+            assert_eq!(args[3], action);
+            assert_eq!(
+                &args[args.len() - 4..],
+                [
+                    "--env-file",
+                    "/private/campaign.env",
+                    "--stamp-config",
+                    "/workspace/selected-stamp.yaml"
+                ]
+            );
+            if action == "capture-baseline" {
+                assert_eq!(args[4], "00000000-0000-0000-0000-000000000002");
+                assert_eq!(args[5], "7");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn campaign_baseline_response_requires_exact_producer_and_blob_proof() -> Result<()> {
+        let identity = CampaignIdentity {
+            campaign_id: "00000000-0000-0000-0000-000000000001".to_owned(),
+            owner_id: "00000000-0000-0000-0000-000000000002".to_owned(),
+            fencing_token: 7,
+        };
+        let success = json!({"ok":true,"receipt":{
+            "status":"captured",
+            "campaign_id":identity.campaign_id,
+            "owner_id":identity.owner_id,
+            "fencing_token":identity.fencing_token,
+            "blob":"_arrowcol-custody/campaigns/00000000-0000-0000-0000-000000000001/baseline.json",
+            "etag":"\"baseline-etag\"",
+            "captured_at_unix_ms":1731600000000u64
+        }});
+        let bytes = serde_json::to_vec(&success)?;
+        let receipt = parse_campaign_baseline_response(&bytes, &identity)?;
+        assert_eq!(receipt.blob, campaign_baseline_blob(&identity.campaign_id));
+        for (field, value) in [
+            ("campaign_id", json!("00000000-0000-0000-0000-000000000009")),
+            ("owner_id", json!("00000000-0000-0000-0000-000000000009")),
+            ("fencing_token", json!(8)),
+            ("blob", json!("https://storage.example/baseline.json")),
+            ("captured_at_unix_ms", json!(0)),
+        ] {
+            let mut changed = success.clone();
+            changed["receipt"][field] = value;
+            assert!(parse_campaign_baseline_response(&serde_json::to_vec(&changed)?, &identity).is_err());
+        }
+        let mut missing = success.clone();
+        missing["receipt"]
+            .as_object_mut()
+            .context("baseline receipt is not an object")?
+            .remove("etag");
+        assert!(parse_campaign_baseline_response(&serde_json::to_vec(&missing)?, &identity).is_err());
+        let failure = json!({"ok":false,"code":"write_outcome_unknown","message":"not confirmed"});
+        let error = match parse_campaign_baseline_response(&serde_json::to_vec(&failure)?, &identity) {
+            Err(error) => error,
+            Ok(_) => anyhow::anyhow!("failed baseline response was accepted"),
+        };
+        assert!(error.to_string().contains("write_outcome_unknown"));
+        Ok(())
+    }
+
+    #[test]
+    fn campaign_custody_helper_classifies_pre_effect_staleness_only_for_cleanup() -> Result<()> {
+        let stale = campaign_custody_helper_failure("cleanup-step", br#"{"ok":false,"code":"stale_version"}"#);
+        assert!(stale.downcast_ref::<StaleCampaignVersionError>().is_some());
+        let stale_read = campaign_custody_helper_failure("read-inventory", br#"{"ok":false,"code":"stale_version"}"#);
+        assert!(stale_read.downcast_ref::<StaleCampaignVersionError>().is_none());
+        for code in ["campaign_fenced", "write_outcome_unknown", "invalid_or_storage_error"] {
+            let response = json!({"ok":false,"code":code});
+            let response_bytes = serde_json::to_vec(&response)?;
+            let error = campaign_custody_helper_failure("cleanup-step", &response_bytes);
+            assert!(error.downcast_ref::<StaleCampaignVersionError>().is_none());
+            assert!(error.to_string().contains(code));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn campaign_load_admission_waits_for_observed_qap_and_serializes_each_stage() -> Result<()> {
+        let identity = CampaignIdentity {
+            campaign_id: "00000000-0000-0000-0000-000000000001".to_owned(),
+            owner_id: "00000000-0000-0000-0000-000000000002".to_owned(),
+            fencing_token: 7,
+        };
+        let cell_run_id = "00000000-0000-0000-0000-000000000004";
+        let namespace = "arrow-collector-00000000000000000000000000000004";
+        let mut inventory = initial_campaign_inventory(
+            &identity,
+            "00000000-0000-0000-0000-000000000003",
+            cell_run_id,
+            namespace,
+            "campaignstorage",
+            "checkpoints",
+            CampaignCellBudget {
+                effective_stop_budgets: EffectiveStopBudgets {
+                    maintenance_grace_seconds: 1_200,
+                    maintenance_stop_timeout_ms: 1_500_000,
+                },
+                planned_cell_duration_ms: 1_000,
+            },
+        )?;
+        inventory.namespace.uid = Some("00000000-0000-0000-0000-000000000005".to_owned());
+        inventory.resources.push(InventoryResource {
+            api_version: "apps/v1".to_owned(),
+            kind: "Deployment".to_owned(),
+            namespace: namespace.to_owned(),
+            name: "arrowcol".to_owned(),
+            uid: Some("00000000-0000-0000-0000-000000000006".to_owned()),
+            role: InventoryResourceRole::Collector,
+            state: InventoryResourceState::Observed,
+            absence: None,
+        });
+        inventory.fic = Some(InventoryFic {
+            resource_id: Some("/subscriptions/00000000-0000-0000-0000-000000000007/resourceGroups/perf69/providers/Microsoft.ManagedIdentity/userAssignedIdentities/arrow-collector/federatedIdentityCredentials/oat-run".to_owned()),
+            name: Some("oat-run".to_owned()),
+            state: InventoryResourceState::Observed,
+            absence: None,
+            plan: None,
+        });
+        let binding = InventoryQapBinding {
+            external_table: "arrowcol_data".to_owned(),
+            relative_path: format!(
+                "oat-prefix/runs/{cell_run_id}/dataflow/telemetry/sqlserver/sqlserver_availability_replica_states"
+            ),
+        };
+        inventory.qap = Some(InventoryQap {
+            database: "perf69_qap".to_owned(),
+            bindings: vec![binding.clone()],
+            state: InventoryResourceState::Planned,
+            absence: Vec::new(),
+            reference: None,
+        });
+        inventory.load_admission = InventoryLoadAdmission::AuthorizationPending;
+        inventory.validate()?;
+        assert!(
+            validate_campaign_inventory_load_admission(
+                &inventory,
+                InventoryLoadAdmission::AuthorizationPending,
+                "perf69_qap",
+                std::slice::from_ref(&binding),
+            )
+            .is_err()
+        );
+        let preflight = inventory.clone();
+        let qap = inventory.qap.as_mut().context("planned QAP inventory is missing")?;
+        qap.state = InventoryResourceState::Observed;
+        qap.reference = Some(InventoryQapReference {
+            schema_version: 1,
+            account: "campaignstorage".to_owned(),
+            container: "checkpoints".to_owned(),
+            blob: "campaigns/00000000-0000-0000-0000-000000000001/qap.json".to_owned(),
+            run_id: cell_run_id.to_owned(),
+            nonce: "00000000-0000-0000-0000-000000000008".to_owned(),
+            manifest_sha256: "a".repeat(64),
+            namespace_uid: "00000000-0000-0000-0000-000000000005".to_owned(),
+            namespace_owner_token: identity.owner_id.clone(),
+        });
+        inventory.validate()?;
+        validate_campaign_inventory_load_admission(
+            &inventory,
+            InventoryLoadAdmission::AuthorizationPending,
+            "perf69_qap",
+            std::slice::from_ref(&binding),
+        )?;
+        let qap_observed_pending = inventory.clone();
+        inventory.load_admission = InventoryLoadAdmission::Authorized;
+        qap_observed_pending.validate_successor(&inventory)?;
+        validate_campaign_inventory_load_admission(
+            &inventory,
+            InventoryLoadAdmission::Authorized,
+            "perf69_qap",
+            std::slice::from_ref(&binding),
+        )?;
+        println!(
+            "E1_RUST_LOAD_SEQUENCE={}",
+            serde_json::to_string(&serde_json::json!({
+                "preflight": preflight,
+                "qap_observed_pending": qap_observed_pending,
+                "authorized": inventory,
+            }))?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn campaign_cell_baseline_matches_the_frozen_envelope_and_absence_contract() -> Result<()> {
+        let step = json!({"state":"not_started","deadline_unix_ms":null,"reason_code":null});
+        let hot_path = "oat-prefix/runs/00000000-0000-0000-0000-000000000004/dataflow/telemetry/sqlserver/sqlserver_availability_replica_states";
+        let inventory: RunInventory = serde_json::from_value(json!({
+            "schema_version":1,
+            "campaign_id":"00000000-0000-0000-0000-000000000001",
+            "owner_id":"00000000-0000-0000-0000-000000000002",
+            "fencing_token":1,
+            "orchestration_run_id":"00000000-0000-0000-0000-000000000003",
+            "cell_run_id":"00000000-0000-0000-0000-000000000004",
+            "load_admission":"not_authorized",
+            "namespace":{"name":"oat-00000000000000000000000000000004","uid":"00000000-0000-0000-0000-000000000005",
+                "owner_token":"00000000-0000-0000-0000-000000000002"},
+            "resources":[{"api_version":"apps/v1","kind":"Deployment","namespace":"oat-00000000000000000000000000000004",
+                "name":"arrowcol","uid":null,"role":"collector","state":"planned"}],
+            "fic":null,
+            "qap":{"database":"OatDatabase","bindings":[{"external_table":"oat_00000000000000000000000000000004_sqlserver_availability_replica_states",
+                "relative_path":hot_path}],"state":"planned","absence":[],"reference":null},
+            "cleanup":{"stop_admission":step,"bounded_drain":step,"evidence_capture":step,
+                "stop_maintenance":step,"terminal_capture":step,"handoff":step}
+        }))?;
+        inventory.validate()?;
+        let identity = CampaignIdentity {
+            campaign_id: inventory.campaign_id.clone(),
+            owner_id: inventory.owner_id.clone(),
+            fencing_token: inventory.fencing_token,
+        };
+        let mut initial_inventory = inventory.clone();
+        initial_inventory.resources.clear();
+        initial_inventory.namespace.uid = None;
+        initial_inventory.qap = None;
+        validate_campaign_baseline_capture_inventory(&initial_inventory, &identity)?;
+        assert!(validate_campaign_baseline_capture_inventory(&inventory, &identity).is_err());
+        let actor = CampaignCleanupActor {
+            mode: CampaignActorMode::Producer,
+            owner_id: identity.owner_id.clone(),
+            fencing_token: identity.fencing_token,
+        };
+        let request = CampaignCellBaselineRequest {
+            schema_version: 1,
+            campaign_id: &identity.campaign_id,
+            orchestration_run_id: &inventory.orchestration_run_id,
+            cell_run_id: &inventory.cell_run_id,
+            expected_etag: "\"inventory-etag\"",
+            hot_delta_relative_path: hot_path,
+            actor: &actor,
+        };
+        assert_eq!(
+            serde_json::to_value(&request)?,
+            json!({
+                "schema_version":1,
+                "campaign_id":"00000000-0000-0000-0000-000000000001",
+                "orchestration_run_id":"00000000-0000-0000-0000-000000000003",
+                "cell_run_id":"00000000-0000-0000-0000-000000000004",
+                "expected_etag":"\"inventory-etag\"",
+                "hot_delta_relative_path":hot_path,
+                "actor":{"mode":"producer","owner_id":"00000000-0000-0000-0000-000000000002","fencing_token":1}
+            })
+        );
+        let output = json!({"ok":true,"receipt":{
+            "status":"captured","campaign_id":identity.campaign_id,"owner_id":identity.owner_id,
+            "fencing_token":identity.fencing_token,"orchestration_run_id":inventory.orchestration_run_id,
+            "cell_run_id":inventory.cell_run_id,"namespace_uid":"00000000-0000-0000-0000-000000000005",
+            "hot_delta_relative_path":hot_path,"blob":"_arrowcol-custody/campaigns/00000000-0000-0000-0000-000000000001/runs/00000000-0000-0000-0000-000000000003/cells/00000000-0000-0000-0000-000000000004/delta-before.json",
+            "etag":"\"baseline-etag\"","delta_state":"observed_absent","table_id":null,"delta_version":null,"rows":null
+        }});
+        let response: CampaignCellBaselineResponse = serde_json::from_value(output.clone())?;
+        let receipt = response.receipt.context("baseline receipt missing")?;
+        assert!(response.ok);
+        validate_campaign_cell_baseline(&receipt, &inventory, &identity, &inventory.cell_run_id, hot_path)?;
+        let mut loss_shaped_absence = output;
+        loss_shaped_absence["receipt"]["rows"] = json!(0);
+        let response: CampaignCellBaselineResponse = serde_json::from_value(loss_shaped_absence)?;
+        let receipt = response.receipt.context("baseline receipt missing")?;
+        assert!(
+            validate_campaign_cell_baseline(&receipt, &inventory, &identity, &inventory.cell_run_id, hot_path).is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn campaign_cleanup_preserves_the_approved_maintenance_and_evidence_order() {
+        let actions = [
+            CampaignCleanupAction::StopAdmission,
+            CampaignCleanupAction::BoundedDrain,
+            CampaignCleanupAction::EvidenceCapture,
+            CampaignCleanupAction::StopMaintenance,
+            CampaignCleanupAction::TerminalCapture,
+            CampaignCleanupAction::RemoveNamespace,
+            CampaignCleanupAction::RemoveQap,
+            CampaignCleanupAction::RemoveFic,
+            CampaignCleanupAction::Handoff,
+        ];
+        assert_eq!(
+            actions.map(|action| action.selector()),
+            [
+                "stop_admission",
+                "bounded_drain",
+                "evidence_capture",
+                "stop_maintenance",
+                "terminal_capture",
+                "remove_namespace",
+                "remove_qap",
+                "remove_fic",
+                "handoff",
+            ]
+        );
+    }
+
+    #[test]
+    fn custody_inventory_never_replaces_exact_ownership_or_accepts_unknown_observations() -> Result<()> {
+        let step = json!({"state":"not_started","deadline_unix_ms":null,"reason_code":null});
+        let mut inventory: RunInventory = serde_json::from_value(json!({
+            "schema_version": 1,
+            "campaign_id":"00000000-0000-0000-0000-000000000001",
+            "owner_id":"00000000-0000-0000-0000-000000000002",
+            "fencing_token":1,
+            "orchestration_run_id":"00000000-0000-0000-0000-000000000003",
+            "cell_run_id":"00000000-0000-0000-0000-000000000004",
+            "load_admission":"not_authorized",
+            "effective_stop_budgets":{"maintenance_grace_seconds":1200,"maintenance_stop_timeout_ms":1500000},
+            "planned_cell_duration_ms":1000,
+            "namespace":{"name":"oat-00000000000000000000000000000004", "uid":null,
+                "owner_token":"00000000-0000-0000-0000-000000000002"},
+            "resources":[{"api_version":"apps/v1","kind":"Deployment",
+                "namespace":"oat-00000000000000000000000000000004","name":"arrowcol",
+                "uid":null,"role":"collector","state":"planned"}],
+            "fic":null,"qap":null,
+            "cleanup":{"stop_admission":step,"bounded_drain":step,"evidence_capture":step,
+                "stop_maintenance":step,"terminal_capture":step,"handoff":step}
+        }))?;
+        let mut legacy_schema = serde_json::to_value(&inventory)?;
+        legacy_schema["cleanup"]
+            .as_object_mut()
+            .context("serialized cleanup object missing")?
+            .remove("stop_maintenance");
+        assert!(serde_json::from_value::<RunInventory>(legacy_schema).is_err());
+        let mut legacy_admission = serde_json::to_value(&inventory)?;
+        legacy_admission
+            .as_object_mut()
+            .context("serialized inventory object missing")?
+            .remove("load_admission");
+        assert!(serde_json::from_value::<RunInventory>(legacy_admission).is_err());
+        inventory.validate()?;
+        let mut authorization_pending = inventory.clone();
+        authorization_pending.load_admission = InventoryLoadAdmission::AuthorizationPending;
+        inventory.validate_successor(&authorization_pending)?;
+        let mut authorized = authorization_pending.clone();
+        authorized.load_admission = InventoryLoadAdmission::Authorized;
+        authorization_pending.validate_successor(&authorized)?;
+        assert!(inventory.validate_successor(&authorized).is_err());
+        assert!(authorized.validate_successor(&authorization_pending).is_err());
+        assert!(campaign_cleanup_action_needs_execution(
+            &CampaignCleanupAction::StopAdmission,
+            &inventory
+        )?);
+        assert_eq!(
+            campaign_cleanup_operation_deadline_ms(&CampaignCleanupAction::StopAdmission, &inventory, 1_000)?,
+            61_000
+        );
+        let mut declared_deadline = inventory.clone();
+        declared_deadline.cleanup.bounded_drain.deadline_unix_ms = Some(5_000);
+        assert_eq!(
+            campaign_cleanup_operation_deadline_ms(&CampaignCleanupAction::BoundedDrain, &declared_deadline, 1_000)?,
+            5_000
+        );
+        assert_eq!(
+            campaign_cleanup_operation_deadline_ms(&CampaignCleanupAction::StopMaintenance, &inventory, 1_000)?,
+            inventory
+                .effective_stop_budgets
+                .context("inventory stop budgets")?
+                .maintenance_stop_timeout_ms
+                + 1_000
+        );
+        let mut legacy_cleanup = inventory.clone();
+        legacy_cleanup.effective_stop_budgets = None;
+        legacy_cleanup.planned_cell_duration_ms = None;
+        legacy_cleanup.cleanup.stop_maintenance.deadline_unix_ms = Some(5_000);
+        assert_eq!(
+            campaign_cleanup_operation_deadline_ms(&CampaignCleanupAction::StopMaintenance, &legacy_cleanup, 1_000)?,
+            5_000,
+            "legacy cleanup must retain its originally persisted deadline without extending it"
+        );
+        let mut expired_deadline = inventory.clone();
+        expired_deadline.cleanup.stop_admission.deadline_unix_ms = Some(61_000);
+        assert!(
+            campaign_cleanup_operation_deadline_ms(&CampaignCleanupAction::StopAdmission, &expired_deadline, 61_000)
+                .is_err()
+        );
+        for state in [
+            InventoryStepState::Pending,
+            InventoryStepState::Running,
+            InventoryStepState::Failed,
+            InventoryStepState::Uncertain,
+        ] {
+            let mut unresolved = inventory.clone();
+            unresolved.cleanup.stop_admission.state = state;
+            assert!(
+                campaign_cleanup_action_needs_execution(&CampaignCleanupAction::StopAdmission, &unresolved).is_err()
+            );
+        }
+        let mut complete_step = inventory.clone();
+        complete_step.cleanup.stop_admission.state = InventoryStepState::Complete;
+        assert!(!campaign_cleanup_action_needs_execution(
+            &CampaignCleanupAction::StopAdmission,
+            &complete_step
+        )?);
+        let mut uncertain_resource = inventory.clone();
+        uncertain_resource.resources[0].state = InventoryResourceState::Uncertain;
+        assert!(
+            campaign_cleanup_action_needs_execution(&CampaignCleanupAction::RemoveNamespace, &uncertain_resource)
+                .is_err()
+        );
+        validate_campaign_etag("\\\"strong-etag\\\"")?;
+        assert!(validate_campaign_etag("W/\"weak-etag\"").is_err());
+        assert!(validate_campaign_etag("*").is_err());
+        let actor = CampaignCleanupActor {
+            mode: CampaignActorMode::Producer,
+            owner_id: inventory.owner_id.clone(),
+            fencing_token: inventory.fencing_token,
+        };
+        let read_request = serde_json::to_value(CampaignInventoryReadRequest {
+            schema_version: 1,
+            campaign_id: &inventory.campaign_id,
+            orchestration_run_id: &inventory.orchestration_run_id,
+            cell_run_id: &inventory.cell_run_id,
+            actor: &actor,
+        })?;
+        let read_fields = read_request
+            .as_object()
+            .context("read request is not an object")?
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            read_fields,
+            BTreeSet::from([
+                "schema_version",
+                "campaign_id",
+                "orchestration_run_id",
+                "cell_run_id",
+                "actor",
+            ])
+        );
+        assert_eq!(read_request["actor"]["mode"], "producer");
+        let cleanup_request = serde_json::to_value(CampaignCleanupRequest {
+            schema_version: 1,
+            inventory: &inventory,
+            expected_etag: "\"versioned-etag\"",
+            actor: &actor,
+        })?;
+        let cleanup_fields = cleanup_request
+            .as_object()
+            .context("cleanup request is not an object")?
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            cleanup_fields,
+            BTreeSet::from(["schema_version", "inventory", "expected_etag", "actor"])
+        );
+        assert_eq!(
+            cleanup_request["inventory"]["cleanup"]["stop_maintenance"]["state"],
+            "not_started"
+        );
+        let receipt = CampaignCleanupReceipt {
+            status: "complete".to_owned(),
+            step: "stop_maintenance".to_owned(),
+            campaign_id: inventory.campaign_id.clone(),
+            owner_id: inventory.owner_id.clone(),
+            fencing_token: inventory.fencing_token,
+            orchestration_run_id: inventory.orchestration_run_id.clone(),
+            cell_run_id: inventory.cell_run_id.clone(),
+            namespace_uid: None,
+            actor: actor.clone(),
+            completed_at_unix_ms: 1_000,
+            etag: "\"receipt-etag\"".to_owned(),
+        };
+        let mut receipt_without_namespace_uid = serde_json::to_value(receipt)?;
+        receipt_without_namespace_uid
+            .as_object_mut()
+            .context("receipt is not an object")?
+            .remove("namespace_uid");
+        assert!(serde_json::from_value::<CampaignCleanupReceipt>(receipt_without_namespace_uid).is_err());
+        let mut missing_stop_deadline = inventory.clone();
+        missing_stop_deadline.cleanup.stop_maintenance.state = InventoryStepState::Running;
+        assert!(missing_stop_deadline.validate().is_err());
+        missing_stop_deadline.cleanup.stop_maintenance.deadline_unix_ms = Some(0);
+        assert!(missing_stop_deadline.validate().is_err());
+        missing_stop_deadline.cleanup.stop_maintenance.deadline_unix_ms = Some(1_000);
+        missing_stop_deadline.validate()?;
+        let mut wrong_owner = inventory.clone();
+        wrong_owner.namespace.owner_token = "00000000-0000-0000-0000-000000000005".to_owned();
+        assert!(wrong_owner.validate().is_err());
+        wrong_owner = inventory.clone();
+        wrong_owner.namespace.uid = Some("not-a-uid".to_owned());
+        assert!(wrong_owner.validate().is_err());
+        let persisted = json!({"ok":true,"receipt":{
+            "status":"persisted","campaign_id":inventory.campaign_id,"owner_id":inventory.owner_id,
+            "fencing_token":inventory.fencing_token,"orchestration_run_id":inventory.orchestration_run_id,
+            "cell_run_id":inventory.cell_run_id,"namespace_uid":null,"resource_count":1,
+            "fic_state":null,"qap_state":null,"etag":"\"etag\""
+        }});
+        inventory.validate_custody_receipt(&serde_json::to_vec(&persisted)?, false)?;
+        let mut bad_receipt = persisted.clone();
+        bad_receipt["receipt"]["fencing_token"] = json!(2);
+        assert!(
+            inventory
+                .validate_custody_receipt(&serde_json::to_vec(&bad_receipt)?, false)
+                .is_err()
+        );
+        bad_receipt = persisted.clone();
+        bad_receipt["receipt"]["resource_count"] = json!(0);
+        assert!(
+            inventory
+                .validate_custody_receipt(&serde_json::to_vec(&bad_receipt)?, false)
+                .is_err()
+        );
+        assert!(
+            inventory
+                .validate_custody_receipt(br#"{"ok":false,"code":"write_outcome_unknown"}"#, false)
+                .is_err()
+        );
+        let mut absent = inventory.clone();
+        absent.resources[0].state = InventoryResourceState::Absent;
+        assert!(absent.validate().is_err());
+        absent.resources[0].absence = Some(InventoryAbsenceReceipt {
+            api_version: "apps/v1".to_owned(),
+            kind: "Deployment".to_owned(),
+            namespace: inventory.namespace.name.clone(),
+            namespace_uid: None,
+            name: "arrowcol".to_owned(),
+            observed_at_unix_ms: 123,
+        });
+        inventory.validate_successor(&absent)?;
+        let mut invalid_absence = absent.clone();
+        invalid_absence.resources[0]
+            .absence
+            .as_mut()
+            .context("missing absence receipt")?
+            .name = "other".to_owned();
+        assert!(invalid_absence.validate().is_err());
+        invalid_absence = absent.clone();
+        invalid_absence.resources[0].uid = Some("unexpected".to_owned());
+        assert!(invalid_absence.validate().is_err());
+        invalid_absence = absent.clone();
+        invalid_absence.resources[0]
+            .absence
+            .as_mut()
+            .context("missing absence receipt")?
+            .observed_at_unix_ms = 124;
+        assert!(absent.validate_successor(&invalid_absence).is_err());
+        invalid_absence = absent.clone();
+        invalid_absence.resources[0].state = InventoryResourceState::Planned;
+        invalid_absence.resources[0].absence = None;
+        assert!(absent.validate_successor(&invalid_absence).is_err());
+        let mut external = inventory.clone();
+        external.fic = Some(serde_json::from_value(json!({
+            "resource_id":"/subscriptions/a/federatedIdentityCredentials/fic",
+            "name":"fic","state":"absent",
+            "absence":{"resource_id":"/subscriptions/a/federatedIdentityCredentials/fic",
+                "name":"fic","observed_at_unix_ms":1}
+        }))?);
+        external.qap = Some(serde_json::from_value(json!({
+            "database":"db","bindings":[
+                {"external_table":"table_a","relative_path":"run/a"},
+                {"external_table":"table_b","relative_path":"run/b"}
+            ],"state":"absent","absence":[
+                {"database":"db","external_table":"table_a","relative_path":"run/a","observed_at_unix_ms":1},
+                {"database":"db","external_table":"table_b","relative_path":"run/b","observed_at_unix_ms":2}
+            ]
+        }))?);
+        external.validate()?;
+        let mut partial = external.clone();
+        partial.qap.as_mut().context("missing QAP inventory")?.state = InventoryResourceState::Uncertain;
+        partial.qap.as_mut().context("missing QAP inventory")?.absence.pop();
+        partial.validate()?;
+        partial.validate_successor(&external)?;
+        assert!(external.validate_successor(&partial).is_err());
+        let mut complete = external.clone();
+        complete.cleanup.handoff.state = InventoryStepState::Complete;
+        assert!(complete.validate().is_err());
+        complete.cleanup.stop_admission.state = InventoryStepState::Complete;
+        complete.cleanup.bounded_drain.state = InventoryStepState::Complete;
+        complete.cleanup.evidence_capture.state = InventoryStepState::Complete;
+        complete.cleanup.stop_maintenance.state = InventoryStepState::Complete;
+        complete.cleanup.terminal_capture.state = InventoryStepState::Complete;
+        assert!(complete.validate().is_err());
+        complete.resources = absent.resources.clone();
+        complete.validate()?;
+        complete.cleanup.stop_maintenance.state = InventoryStepState::NotStarted;
+        assert!(complete.validate().is_err());
+        complete.cleanup.stop_maintenance.state = InventoryStepState::Complete;
+        complete.validate()?;
+        let mut invalid_external = external.clone();
+        invalid_external
+            .fic
+            .as_mut()
+            .context("missing FIC inventory")?
+            .absence
+            .as_mut()
+            .context("missing FIC absence")?
+            .name = "other".to_owned();
+        assert!(invalid_external.validate().is_err());
+        invalid_external = external.clone();
+        let qap = invalid_external.qap.as_mut().context("missing QAP inventory")?;
+        qap.absence[1] = qap.absence[0].clone();
+        assert!(invalid_external.validate().is_err());
+        invalid_external = external.clone();
+        invalid_external.qap.as_mut().context("missing QAP inventory")?.absence[0].observed_at_unix_ms = 9;
+        assert!(external.validate_successor(&invalid_external).is_err());
+        let mut observed = inventory.clone();
+        observed.resources[0].state = InventoryResourceState::Observed;
+        assert!(observed.validate().is_err());
+        observed.namespace.uid = Some("00000000-0000-0000-0000-000000000005".to_owned());
+        observed.resources[0].uid = Some("00000000-0000-0000-0000-000000000006".to_owned());
+        let ready = json!({"ok":true,"receipt":{
+            "status":"ready","campaign_id":inventory.campaign_id,"owner_id":inventory.owner_id,
+            "fencing_token":inventory.fencing_token,"orchestration_run_id":inventory.orchestration_run_id,
+            "cell_run_id":inventory.cell_run_id,"namespace_uid":"00000000-0000-0000-0000-000000000005"
+        }});
+        observed.validate_custody_receipt(&serde_json::to_vec(&ready)?, true)?;
+        assert!(
+            inventory
+                .validate_custody_receipt(&serde_json::to_vec(&ready)?, true)
+                .is_err()
+        );
+        inventory.validate_successor(&observed)?;
+        inventory = observed;
+        let mut replacement = inventory.clone();
+        replacement.resources[0].uid = Some("00000000-0000-0000-0000-000000000007".to_owned());
+        assert!(inventory.validate_successor(&replacement).is_err());
+        replacement = inventory.clone();
+        replacement.resources[0].state = InventoryResourceState::Planned;
+        assert!(inventory.validate_successor(&replacement).is_err());
+        replacement = inventory.clone();
+        replacement.cleanup.stop_admission.state = InventoryStepState::Running;
+        assert!(replacement.validate().is_err());
+        replacement.cleanup.stop_admission.deadline_unix_ms = Some(1_000);
+        replacement.validate()?;
+        replacement.cleanup.evidence_capture.state = InventoryStepState::Uncertain;
+        assert!(replacement.validate().is_err());
+        Ok(())
+    }
+
     #[tokio::test]
-    async fn non_snapshot_cleanup_destroys_after_stop_failure_and_keeps_both_errors() -> Result<()> {
+    async fn non_snapshot_cleanup_retains_resources_after_stop_failure() -> Result<()> {
         let actions = std::cell::RefCell::new(Vec::new());
         let result = stop_then_destroy(
             async {
@@ -9091,15 +15440,15 @@ mod tests {
             },
         )
         .await;
-        assert_eq!(*actions.borrow(), ["stop", "destroy"]);
-        let error = format!("{:#}", result.err().context("both operations must fail")?);
+        assert_eq!(*actions.borrow(), ["stop"]);
+        let error = format!("{:#}", result.err().context("stop must fail")?);
         assert!(error.contains("exit 137"));
-        assert!(error.contains("owned volume deletion failed"));
+        assert!(error.contains("retaining owned resources"));
         Ok(())
     }
 
     #[tokio::test]
-    async fn non_snapshot_cleanup_destroys_after_stop_timeout() -> Result<()> {
+    async fn non_snapshot_cleanup_retains_resources_after_stop_timeout() -> Result<()> {
         let destroyed = std::sync::atomic::AtomicBool::new(false);
         let result = stop_then_destroy(
             async {
@@ -9113,14 +15462,14 @@ mod tests {
             },
         )
         .await;
-        assert!(destroyed.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!destroyed.load(std::sync::atomic::Ordering::SeqCst));
         assert!(format!("{:#}", result.err().context("stop must time out")?).contains("stop deadline exceeded"));
         Ok(())
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn cleanup_failure_paths_destroy_owned_resources_and_gate_aks_exits() -> Result<()> {
+    async fn cleanup_failure_paths_retain_owned_resources_and_gate_aks_exits() -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         let fixture = match std::env::var_os("OAT_CLEANUP_FIXTURE_ROOT") {
             Some(root) => PathBuf::from(root),
@@ -9143,7 +15492,7 @@ mod tests {
                 let mut command = Command::new(std::env::current_exe()?);
                 command.args([
                     "--exact",
-                    "runner::tests::cleanup_failure_paths_destroy_owned_resources_and_gate_aks_exits",
+                    "runner::tests::cleanup_failure_paths_retain_owned_resources_and_gate_aks_exits",
                     "--nocapture",
                 ]);
                 command.env("OAT_CLEANUP_FIXTURE_ROOT", &root);
@@ -9158,7 +15507,8 @@ mod tests {
                 )
                 .await;
                 fs::remove_dir_all(&root)?;
-                result.context("cleanup regression timed out")??;
+                let output = result.context("cleanup regression timed out")??;
+                print!("{}", String::from_utf8_lossy(&output.stdout));
                 return Ok(());
             }
         };
@@ -9168,16 +15518,18 @@ mod tests {
         config.platform.local.snapshot_root = None;
         let state = fixture.join("local-state");
         fs::create_dir(&state)?;
-        let local = LocalPlatform {
+        let mut local = LocalPlatform {
             run_id: "fixture-run".to_owned(),
             state_dir: state.clone(),
             environment: HashMap::new(),
             control_dir: state.clone(),
             client_progress: std::sync::Mutex::new(HashMap::new()),
             router_metrics_url: None,
+            collector_metrics_url: None,
             qap_url: None,
             daemon_endpoint: None,
             shutdown_drain_evidence: None,
+            maintenance_cell_baseline: Vec::new(),
         };
         fs::write(fixture.join("mode"), "stop_failure")?;
         let error = cleanup_local_platform(&config, &local)
@@ -9185,8 +15537,163 @@ mod tests {
             .err()
             .context("local stop must fail")?;
         assert!(format!("{error:#}").contains("fixture stop listing failed"));
-        assert!(!state.exists(), "non-snapshot state leaked after stop failure");
-        assert!(fixture.join("compose-destroyed").exists(), "Compose down was skipped");
+        assert!(state.exists(), "local state must be retained after stop failure");
+        assert!(
+            !fixture.join("compose-destroyed").exists(),
+            "Compose down must be skipped"
+        );
+        fs::write(fixture.join("mode"), "maintenance_cell")?;
+        fs::write(
+            fixture.join("project"),
+            scoped_compose_project(
+                config.platform.compose_project.as_deref().context("fixture project")?,
+                &local.run_id,
+            ),
+        )?;
+        let baseline = local.process_logs(&config).await?;
+        local.retain_cell_process_baseline(&baseline);
+        fs::write(fixture.join("measurement-finished"), "")?;
+        let outcomes = stop_local_snapshot_writers(&config, &local).await?;
+        assert_eq!(
+            outcomes[0]["maintenance_outcomes"]["operation_count"], 155,
+            "cell scope must include warm-up/measurement and the final drain cycle"
+        );
+        assert_eq!(
+            outcomes[0]["maintenance_outcomes"]["retry_kind_counts"]["stale_plan"],
+            25
+        );
+        assert_eq!(outcomes[0]["maintenance_operation_failure"], false);
+        assert_eq!(outcomes[0]["maintenance_exit_classification"], "nonzero_health_exit");
+        assert_eq!(outcomes[0]["exit_code"], 1);
+        assert!(!serde_json::to_string(&outcomes)?.contains("private"));
+        fs::write(fixture.join("mode"), "overload_success")?;
+        local.run_id = "123e4567-e89b-42d3-a456-426614174002".to_owned();
+        local.state_dir = fixture.join(&local.run_id);
+        local.control_dir = local.state_dir.clone();
+        fs::create_dir(&local.state_dir)?;
+        config.platform.compose_state_root = Some(fixture.to_string_lossy().into_owned());
+        fs::create_dir(local.state_dir.join("control"))?;
+        fs::write(
+            fixture.join("project"),
+            scoped_compose_project(
+                config.platform.compose_project.as_deref().context("fixture project")?,
+                &local.run_id,
+            ),
+        )?;
+        let baseline = local.process_logs(&config).await?;
+        local.retain_cell_process_baseline(&baseline);
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let mut row = sample_result(&run_id, "sqlserver_wait_stats", 0);
+        row.status = "failed".to_owned();
+        row.failure = Some("above_ceiling: overload_stop hard_cap_fraction".to_owned());
+        let stop = json!({"classification":"above_ceiling","reason":"hard_cap_fraction","metric":"container_memory_bytes",
+            "observed_value":900,"cap":1000,"fraction":0.9,"window_index":0,"timestamp_ms":1});
+        row.evidence_json = Some(json!({"version":1,"overload_stop":stop}).to_string());
+        config.tunables.maintenance = Some(serde_json::from_value(json!({
+            "enabled": true, "operations": ["optimize", "purge", "vacuum", "checkpoint", "prune_log"]
+        }))?);
+        let duration = (config.warmup_seconds + config.measure_seconds) * 1_000;
+        let scheduled = unix_time_ms_u64()?
+            .checked_sub(duration + 1_000)
+            .context("fixture clock")?;
+        let mut successful = sample_result(&local.run_id, "sqlserver_wait_stats", 1);
+        successful.evidence_json = Some(
+            json!({"client_schedule":{
+                "scope":"orchestrator_assigned_schedule_with_observed_full_fleet_acknowledgement",
+                "effective":{"run_start_unix_ms":scheduled,"acknowledged_at_unix_ms":scheduled - 1,
+                    "measurement_start_unix_ms":scheduled + config.warmup_seconds * 1_000,
+                    "measurement_end_unix_ms":scheduled + duration}
+            }})
+            .to_string(),
+        );
+        let schedule_path = local.state_dir.join("control/schedule");
+        fs::write(&schedule_path, format!("{scheduled}\n"))?;
+        let state = AppState::default();
+        let orchestration = "123e4567-e89b-42d3-a456-426614174000";
+        state.runs.lock().await.insert(
+            orchestration.to_owned(),
+            crate::model::RunStatus {
+                id: orchestration.to_owned(),
+                config_sha256: "0".repeat(64),
+                state: crate::model::RunState::Running,
+                progress: "measurement complete".to_owned(),
+                result_count: 0,
+                error: None,
+                started_at_unix_ms: 1,
+                finished_at_unix_ms: None,
+                local_teardown: None,
+                aks_cleanup_confirmed: None,
+                aks_cleanup_resolved: false,
+            },
+        );
+        fs::write(&schedule_path, format!("{}\n", scheduled + 1))?;
+        assert!(local_teardown_transition(&config, &local.run_id, std::slice::from_ref(&successful)).is_err());
+        fs::write(&schedule_path, format!("{scheduled}\n"))?;
+        publish_local_teardown(
+            &state,
+            orchestration,
+            &config,
+            &local.run_id,
+            std::slice::from_ref(&successful),
+        )
+        .await;
+        local.cleanup(&config).await.context("guard-triggered normal cleanup")?;
+        assert!(!schedule_path.exists());
+        let status = state
+            .runs
+            .lock()
+            .await
+            .get(orchestration)
+            .cloned()
+            .context("missing status")?;
+        assert!(matches!(status.state, crate::model::RunState::Running));
+        assert!(status.finished_at_unix_ms.is_none());
+        println!("D49_CLEANUP_GAP_STATUS {}", serde_json::to_string(&status)?);
+        let transition = status.local_teardown.context("missing pre-cleanup transition")?;
+        assert_eq!(transition.cell_id, local.run_id);
+        assert_eq!(transition.schedule_unix_ms, scheduled);
+        assert_eq!(transition.measurement_end_unix_ms, scheduled + duration);
+        let receipt = local
+            .shutdown_drain_evidence()
+            .context("normal lifecycle receipt missing")?;
+        let mut outcome = finish_matrix_cell(&config, "orchestration", &run_id, 1, 1, Ok(vec![row]), Ok(()));
+        attach_shutdown_drain_evidence(&mut outcome, receipt)?;
+        assert!(outcome.error.is_some());
+        assert_eq!(outcome.rows[0].status, "failed");
+        let retained: Value = serde_json::from_str(
+            outcome.rows[0]
+                .evidence_json
+                .as_deref()
+                .context("guard evidence missing")?,
+        )?;
+        assert_eq!(retained["overload_stop"], stop);
+        assert_eq!(
+            retained["shutdown_drain"]["collectors"][0]["drain"]["status"],
+            "observed"
+        );
+        assert_eq!(
+            retained["shutdown_drain"]["maintenance"][0]["outcomes"]["operation_count"],
+            5
+        );
+        assert_eq!(retained["shutdown_drain"]["maintenance"][0]["exit_code"], 0);
+        assert!(fixture.join("compose-destroyed").exists());
+        assert!(fixture.join("guard-maintenance-removed").exists());
+        let profiles: Vec<String> = serde_json::from_slice(&fs::read(fixture.join("down-profiles"))?)?;
+        assert_eq!(profiles, ["benchmark", "maintenance"]);
+        let commands = fs::read_to_string(fixture.join("commands"))?;
+        let ingress = commands
+            .find("stop --time 300 guard-client")
+            .context("ingress was not stopped")?;
+        let maintenance_grace = config.maintenance_stop_budget()?.maintenance_grace_seconds;
+        let maintenance_command = format!("stop --time {maintenance_grace} guard-maintenance");
+        let maintenance = commands
+            .find(&maintenance_command)
+            .context("maintenance was not stopped with its derived grace")?;
+        let collector = commands
+            .find("stop --time 300 guard-collector")
+            .context("collector was not stopped")?;
+        assert!(ingress < maintenance && maintenance < collector);
+        fs::write(fixture.join("mode"), "stop_failure")?;
 
         config.platform.kind = crate::config::OatMode::Aks;
         config.namespace = "fixture-owned".to_owned();
@@ -9217,12 +15724,16 @@ mod tests {
         )?;
         let mut platform = AksPlatform {
             run_id: "fixture-run".to_owned(),
+            resource_readback: Vec::new(),
+            cpu_throttling_start: None,
+            cpu_throttling_evidence: None,
             namespace_created: true,
             namespace_create_attempted: true,
             namespace_owner_token: "fixture-owner".to_owned(),
             namespace_uid: Some("fixture-uid".to_owned()),
             runtime_dir: Some(runtime.clone()),
             qap_relative_data_root: None,
+            delta_root: None,
             router_metrics_url: None,
             router_tunnel: None,
             fic_record_path: None,
@@ -9230,33 +15741,36 @@ mod tests {
             fic_prepare_attempted: true,
             qap_record_path: None,
             qap_bind_attempted: true,
-            qap_outcome_unresolved: false,
+            qap_cleanup_confirmed: false,
+            qap_outcome_unresolved: true,
+            run_table_initialization_attempted: false,
+            run_table_initialization_drained: false,
             workload_stop_record_path: None,
             schedule_configmap_name: String::new(),
             service_account: None,
             router_yaml: None,
             shutdown_drain_evidence: None,
+            campaign_cli_paths: None,
         };
+        platform.run_table_initialization_attempted = true;
+        assert!(require_aks_cleanup_confirmation(&platform).is_err());
+        platform.run_table_initialization_drained = true;
+        assert!(require_aks_cleanup_confirmation(&platform).is_err());
+        platform.qap_cleanup_confirmed = true;
+        require_aks_cleanup_confirmation(&platform)?;
+        platform.qap_cleanup_confirmed = false;
         let error = cleanup_aks_platform(&config, &mut platform)
             .await
             .err()
             .context("AKS stop must fail")?;
         let error = format!("{error:#}");
         assert!(error.contains("fixture deployment stop failed"));
-        assert!(
-            error.contains("QAP cleanup requires"),
-            "QAP cleanup was skipped: {error}"
-        );
-        assert!(
-            error.contains("workload identity cleanup has no"),
-            "FIC cleanup was skipped: {error}"
-        );
-        assert!(!platform.namespace_created);
-        assert!(!fixture.join("namespace.json").exists(), "run-owned namespace leaked");
-        let options: Value = serde_json::from_slice(&fs::read(fixture.join("delete-options.json"))?)?;
-        assert_eq!(options["preconditions"]["uid"], "fixture-uid");
-        let receipt: Value = serde_json::from_slice(&fs::read(runtime.join("workload-stop-receipt.json"))?)?;
-        assert_eq!(receipt["absence_confirmed"], true);
+        assert!(error.contains("run-owned QAP cleanup was not positively confirmed"));
+        assert!(error.contains("retaining owned resources"));
+        assert!(platform.namespace_created);
+        assert!(fixture.join("namespace.json").exists(), "namespace must be retained");
+        assert!(!fixture.join("delete-options.json").exists());
+        assert!(!runtime.join("workload-stop-receipt.json").exists());
 
         fs::write(fixture.join("mode"), "absent_deployment")?;
         let missing = stop_aks_deployment_for_cleanup(&config, "fixture", ComponentRole::Collector, 30).await?;
@@ -9302,10 +15816,10 @@ mod tests {
     }
 
     #[test]
-    fn local_stop_arguments_preserve_noncollector_ceilings() {
-        for (phase, grace) in [(0, 300), (1, 300), (2, 3600), (3, 300)] {
+    fn local_stop_arguments_use_the_shared_maintenance_and_collector_graces() {
+        for (phase, grace) in [(0, 300), (1, 1200), (2, 3600), (3, 300)] {
             assert_eq!(
-                local_phase_stop_args(phase, 3600, vec!["owned-container".to_owned()]),
+                local_phase_stop_args(phase, 1200, 3600, vec!["owned-container".to_owned()]),
                 vec![
                     "stop".to_owned(),
                     "--time".to_owned(),
@@ -9317,10 +15831,13 @@ mod tests {
     }
 
     #[test]
-    fn local_stop_deadline_covers_maximum_collector_grace_and_all_other_phases() {
-        let deadline = local_stop_deadline(3600);
+    fn local_stop_deadline_covers_derived_maintenance_budget_and_other_phases() {
+        let deadline = local_stop_deadline(3600, 900_000);
+        assert_eq!(
+            deadline,
+            Duration::from_millis(900_000) + Duration::from_secs(3600 + 2 * 300 + 120)
+        );
         assert!(deadline > Duration::from_secs(3600 + 3 * 300));
-        assert!(deadline > Duration::from_secs(1440));
     }
 
     #[test]
@@ -9355,8 +15872,8 @@ mod tests {
         }
         assert!(shutdown_exit_outcome(ComponentRole::Collector, true, Some(1), false).is_err());
         assert_eq!(
-            shutdown_exit_outcome(ComponentRole::Maintenance, true, Some(1), false)?["maintenance_operation_failure"],
-            true,
+            shutdown_exit_outcome(ComponentRole::Maintenance, true, Some(1), false)?["classification"],
+            "requires_operation_records",
         );
         Ok(())
     }
@@ -9485,7 +16002,7 @@ mod tests {
 
         after[0]["State"]["ExitCode"] = json!(1);
         let outcomes = snapshot_container_outcomes(&before, &after, project)?;
-        assert_eq!(outcomes[0]["maintenance_operation_failure"], true);
+        assert!(outcomes[0]["maintenance_operation_failure"].is_null());
         assert!(outcomes[0]["comment"].as_str().is_some());
 
         for exit in [2, 137] {
@@ -9511,6 +16028,21 @@ mod tests {
     }
 
     #[test]
+    fn client_sweep_expands_distinct_matrix_cells() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        config.campaign_profile = Some(crate::config::CampaignProfile::ScaleOutSingleTable);
+        config.clients_per_table_sweep = Some(vec![1, 2, 4, 8, 16, 32, 64, 128]);
+        let cells = matrix_cell_specs(&config);
+        assert_eq!(
+            cells.iter().map(|(_, _, clients, _)| *clients).collect::<Vec<_>>(),
+            vec![1, 2, 4, 8, 16, 32, 64, 128]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn matrix_cells_use_distinct_canonical_run_ids_for_multiple_combinations() -> Result<()> {
         let config: OatConfig = serde_json::from_str(include_str!(
             "../../../docs/experiments/arrowcol-oat/oat-config.example.json"
@@ -9522,9 +16054,9 @@ mod tests {
             "every matrix combination needs its own isolated run"
         );
         assert!(cells.len() > 1, "the regression must cover more than one matrix cell");
-        let ids = cells.iter().map(|(_, _, run_id)| run_id).collect::<HashSet<_>>();
+        let ids = cells.iter().map(|(_, _, _, run_id)| run_id).collect::<HashSet<_>>();
         assert_eq!(ids.len(), cells.len(), "matrix cells must not share run identities");
-        for (_, _, run_id) in &cells {
+        for (_, _, _, run_id) in &cells {
             let parsed = uuid::Uuid::parse_str(run_id)?;
             assert_eq!(parsed.to_string(), *run_id, "run IDs use canonical lowercase UUID form");
             let local_router =
@@ -9546,6 +16078,7 @@ mod tests {
             10_000,
             "sqlserver",
             &router_yaml,
+            None,
         )?)?;
         assert_eq!(config["schema_version"], 1);
         assert_eq!(config["run_id"], run_id);
@@ -9559,6 +16092,57 @@ mod tests {
         assert_eq!(config["routing_policy"]["warmup_ms"], 1000);
         assert!(config.get("password").is_none());
         assert!(config.get("username").is_none());
+        let delta_root =
+            format!("abfss://tables@arrowcollector1.dfs.core.windows.net/oat-prefix/runs/{run_id}/dataflow");
+        let config: Value = serde_json::from_str(&pin_init_config_json(
+            run_id,
+            &expected,
+            20_000,
+            10_000,
+            "sqlserver",
+            &router_yaml,
+            Some((&delta_root, "telemetry.sqlserver.sqlserver_availability_replica_states")),
+        )?)?;
+        assert_eq!(config["run_table"]["delta_root"], delta_root);
+        assert_eq!(
+            config["run_table"]["table"],
+            "telemetry.sqlserver.sqlserver_availability_replica_states"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn run_table_init_receipt_requires_canonical_schema_and_table_id() -> Result<()> {
+        let run_id = "00000000-0000-0000-0000-000000000001";
+        let table = "telemetry.sqlserver.sqlserver_availability_replica_states";
+        let schema = arrowcol_loadgen::initialize::canonical_table_delta_schema(table)?;
+        let receipt = json!({
+            "kind": "oat_run_table_initialized",
+            "run_id": run_id,
+            "table": table,
+            "publisher_drained": true,
+            "delta": {
+                "table_id": "550e8400-e29b-41d4-a716-446655440000",
+                "version": 0,
+                "active_files": 0,
+                "partition_columns": ["__arrowcol_ingestion"],
+                "schema_json": serde_json::to_string(&schema)?,
+            },
+        });
+        let logs = format!("{}\ninitialized OAT pin set run_id={run_id}", receipt);
+        validate_run_table_init_receipt(&logs, run_id, table)?;
+        assert!(validate_run_table_init_receipt("initialized OAT pin set", run_id, table).is_err());
+        assert!(validate_run_table_init_receipt(&logs, "00000000-0000-0000-0000-000000000002", table).is_err());
+
+        let mut invalid_schema = receipt.clone();
+        invalid_schema["delta"]["schema_json"] = Value::String("{}".to_owned());
+        let invalid_logs = format!("{}\ninitialized OAT pin set run_id={run_id}", invalid_schema);
+        assert!(validate_run_table_init_receipt(&invalid_logs, run_id, table).is_err());
+
+        let mut invalid_table_id = receipt;
+        invalid_table_id["delta"]["table_id"] = Value::String("not-a-table-id".to_owned());
+        let invalid_logs = format!("{}\ninitialized OAT pin set run_id={run_id}", invalid_table_id);
+        assert!(validate_run_table_init_receipt(&invalid_logs, run_id, table).is_err());
         Ok(())
     }
 
@@ -9567,7 +16151,7 @@ mod tests {
         let expected = expected_pin_keys_json(&["sqlserver_wait_stats".to_owned()])?;
         let run_id = "00000000-0000-0000-0000-000000000001";
         let router_yaml = router_yaml_for_pin_test(run_id);
-        assert!(pin_init_config_json(run_id, &expected, 10_000, 10_000, "sqlserver", &router_yaml,).is_err());
+        assert!(pin_init_config_json(run_id, &expected, 10_000, 10_000, "sqlserver", &router_yaml, None).is_err());
         assert!(pin_init_config_json(
             run_id,
             r#"{"expected_keys":[],"expected_digest":"0000000000000000000000000000000000000000000000000000000000000000"}"#,
@@ -9575,10 +16159,22 @@ mod tests {
             10_000,
             "sqlserver",
             &router_yaml,
+            None,
         )
         .is_err());
         let mismatched_run_yaml = router_yaml_for_pin_test("00000000-0000-0000-0000-000000000002");
-        assert!(pin_init_config_json(run_id, &expected, 20_000, 10_000, "sqlserver", &mismatched_run_yaml).is_err());
+        assert!(
+            pin_init_config_json(
+                run_id,
+                &expected,
+                20_000,
+                10_000,
+                "sqlserver",
+                &mismatched_run_yaml,
+                None
+            )
+            .is_err()
+        );
         Ok(())
     }
 
@@ -9688,7 +16284,7 @@ mod tests {
         let first_client_ready_at = 1_u64;
         let whole_fleet_ready_at = 29_u64;
         let qap_preparation_seconds = 29_u64;
-        let final_schedule_delivery_seconds = crate::config::SCHEDULE_DELIVERY_TIMEOUT_SECONDS;
+        let final_schedule_delivery_seconds = config.schedule_lead_seconds;
         assert!(whole_fleet_ready_at <= config.client_ready_timeout_seconds);
         assert!(qap_preparation_seconds <= config.qap_timeout_seconds);
         let earliest_client_schedule_wait = whole_fleet_ready_at
@@ -9709,9 +16305,10 @@ mod tests {
             (budget.client_job_lifetime_seconds
                 + crate::config::PIN_INIT_SETUP_TIMEOUT_SECONDS
                 + config.reconciliation_settle_timeout_seconds
-                + config.collector_stop_grace_seconds)
+                + config.collector_stop_grace_seconds
+                + config.qap_timeout_seconds)
                 * 1_000,
-            "the immutable pin lifetime must cover setup, the client Job, settling, and collector drain"
+            "the immutable pin lifetime must cover setup, the client Job, settling, collector drain, and final QAP observation"
         );
         Ok(())
     }
@@ -10494,6 +17091,248 @@ mod tests {
     }
 
     #[test]
+    fn local_qap_deadline_keeps_progress_and_exact_snapshot_coverage_without_changing_delta_results() -> Result<()> {
+        let config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        let run = "fdba69d6-ae99-49e6-9c7a-f1a1044b8241";
+        let table = config.tables[0].clone();
+        let external = qap_bindings(run, std::slice::from_ref(&table))?
+            .remove(0)
+            .external_table;
+        let observation = json!({
+            "run_id": run, "observed_unix_ms": 1_794_842_000_000_u64,
+            "expected_tables": [external], "catch_up_status": "deadline_incomplete",
+            "tables": {&external: {"available": true, "row_count": 3_915_776, "table_version": 585,
+                "completion_percent": 84.81, "pending_files": 89}},
+        });
+        let mut evidence = CellEvidence::default();
+        evidence
+            .durable_commits
+            .insert(table.clone(), json!({"output_throughput":{"rows_per_second":123.0}}));
+        let measured = QapMetrics {
+            observation_complete: 1,
+            observed_tables: 1,
+            completion_percent: Some(84.81),
+            pending_artifacts: Some(89),
+            cached_bytes: Some(1_121_271_383),
+            unhealthy_catalogs: Some(0),
+            lag_seconds: Some(1.0),
+        };
+        let qap = apply_qap_observation(
+            crate::config::OatMode::Local,
+            measured,
+            observation.clone(),
+            &mut evidence,
+        );
+        assert!(qap.completion_percent.is_none() && qap.pending_artifacts.is_none() && qap.cached_bytes.is_none());
+        assert!(qap.unhealthy_catalogs.is_none() && qap.lag_seconds.is_none());
+        let comment = evidence.downstream_comment.as_deref().context("deadline explanation")?;
+        assert!(comment.contains("84.81%") && comment.contains("89"));
+        assert_eq!(evidence.qap_observation.as_ref(), Some(&observation));
+        let aks = apply_qap_observation(
+            crate::config::OatMode::Aks,
+            measured,
+            observation.clone(),
+            &mut CellEvidence::default(),
+        );
+        assert_eq!(aks.completion_percent, Some(84.81), "AKS verdict remains strict");
+        let mut snapshots = json!({&table: {
+            "source": "verified_stopped_snapshot_manifest", "run_id": run, "table": table,
+            "manifest": format!("{run}/{table}/manifest.json"), "manifest_sha256": "a".repeat(64),
+            "table_version": 585, "row_count": 3_915_776,
+        }});
+        let coverage = kusto_snapshot_coverage(run, &table, &observation, &snapshots)?;
+        assert_eq!(coverage["status"], "matched");
+        assert_eq!(coverage["unique_payload_delivery"], "unknown");
+        assert_eq!(coverage["queryable_delivery"], "unknown");
+        assert!(coverage["delivery_latency"].is_null());
+        snapshots[&table]["table_version"] = json!(586);
+        assert_eq!(
+            kusto_snapshot_coverage(run, &table, &observation, &snapshots)?["status"],
+            "mismatch"
+        );
+        snapshots[&table]["run_id"] = json!(uuid::Uuid::new_v4().to_string());
+        assert_eq!(
+            kusto_snapshot_coverage(run, &table, &observation, &snapshots)?["status"],
+            "unknown"
+        );
+        let mut pinning = PinningReport::default();
+        pinning
+            .owners
+            .insert(canonical_table_key(&table), "collector".to_owned());
+        let clients = ClientRun {
+            metrics: HashMap::from([(
+                table.clone(),
+                ClientMetrics {
+                    rows: 100,
+                    duration_ms: 1000,
+                    rows_per_second: 100.0,
+                    completions: Vec::new(),
+                },
+            )]),
+            pinning,
+            qap_tables: vec![external],
+            failure: None,
+            evidence,
+        };
+        let rows = result_rows(
+            &config,
+            "orchestration",
+            run,
+            1,
+            1,
+            CellMeasurements {
+                clients,
+                started_at_ms: 1,
+                qap,
+                resources: None,
+                resource_evidence: None,
+            },
+        )?;
+        assert_eq!(rows[0].status, "succeeded");
+        let result: Value = serde_json::from_str(rows[0].evidence_json.as_deref().context("evidence")?)?;
+        assert_eq!(result["durable_commits"]["output_throughput"]["rows_per_second"], 123.0);
+        assert_eq!(result["downstream_status"], "unavailable");
+        Ok(())
+    }
+
+    #[test]
+    fn exploratory_delta_ranking_requires_matched_reconciliation() -> Result<()> {
+        let config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.aks.max-rows.json"
+        ))?;
+        let run = "fdba69d6-ae99-49e6-9c7a-f1a1044b8241";
+        let table = config.tables[0].clone();
+        let mut pinning = PinningReport::default();
+        pinning
+            .owners
+            .insert(canonical_table_key(&table), "collector".to_owned());
+        let mut evidence = CellEvidence::default();
+        evidence.durable_commits.insert(
+            table.clone(),
+            json!({
+                "run_cumulative_output": {"rows": 5, "commits": 1, "files": 1, "parquet_bytes": 500, "settled": true},
+                "delta_log_reconciliation": {
+                    "evidence_class": "d53_exploratory",
+                    "status": "mismatch",
+                    "delta_log_committed_rows": 5,
+                    "collector_event_rows": 5,
+                    "client_acknowledged_rows": 6,
+                    "delta_vs_acknowledged_rows": -1,
+                    "per_version": [{"delta_version": 0, "matched": true}],
+                },
+                "output_throughput": {
+                    "rows_per_second": 5.0,
+                    "input_bytes_per_second": 1_000_000_000.0,
+                    "parquet_bytes_per_second": 500.0,
+                    "compression_ratio": 2.0,
+                    "commits": 1,
+                    "window_seconds": 1.0,
+                    "parquet_bytes": 500,
+                    "files": 1,
+                    "measurement_start_unix_ms": 1,
+                    "measurement_end_unix_ms": 1001,
+                },
+            }),
+        );
+        let rows_for = |evidence| {
+            let clients = ClientRun {
+                metrics: HashMap::from([(
+                    table.clone(),
+                    ClientMetrics {
+                        rows: 6,
+                        duration_ms: 1000,
+                        rows_per_second: 6.0,
+                        completions: Vec::new(),
+                    },
+                )]),
+                pinning: PinningReport {
+                    owners: pinning.owners.clone(),
+                    ..PinningReport::default()
+                },
+                qap_tables: Vec::new(),
+                failure: None,
+                evidence,
+            };
+            result_rows(
+                &config,
+                "orchestration",
+                run,
+                1,
+                1,
+                CellMeasurements {
+                    clients,
+                    started_at_ms: 1,
+                    qap: QapMetrics::default(),
+                    resources: None,
+                    resource_evidence: None,
+                },
+            )
+        };
+        let rows = rows_for(evidence.clone())?;
+        assert_eq!(rows[0].status, "failed");
+        assert!(
+            rows[0]
+                .failure
+                .as_deref()
+                .is_some_and(|failure| failure.contains("exploratory_delta_log_reconciliation_mismatch"))
+        );
+        assert_eq!(rows[0].rows, Some(6));
+        assert!(rows[0].rows_per_second.is_none());
+        let result: Value = serde_json::from_str(rows[0].evidence_json.as_deref().context("result evidence")?)?;
+        assert_eq!(result["exploratory_delta_log_reconciliation"]["status"], "mismatch");
+        assert_eq!(
+            result["exploratory_delta_log_reconciliation"]["delta_log_committed_rows"],
+            5
+        );
+        assert_eq!(
+            result["exploratory_delta_log_reconciliation"]["client_acknowledged_rows"],
+            6
+        );
+        assert!(result["exploratory_delta_log_reconciliation"]["per_version"].is_array());
+        assert!(result["ranking_metrics"].is_null());
+        assert_eq!(result["ranking_eligible"], false);
+        let outcome = finish_matrix_cell(&config, "orchestration", run, 1, 1, Ok(rows), Ok(()));
+        assert!(outcome.error.is_some());
+        assert_eq!(outcome.rows[0].status, "failed");
+        for reconciliation in [Some("unavailable"), None, Some("matched")] {
+            let mut cell = evidence.clone();
+            cell.downstream_comment = Some("query lag".to_owned());
+            let evidence = cell.durable_commits.get_mut(&table).context("commit evidence")?;
+            if let Some(status) = reconciliation {
+                evidence["delta_log_reconciliation"] = json!({"status": status});
+            } else {
+                evidence
+                    .as_object_mut()
+                    .context("commit evidence object")?
+                    .remove("delta_log_reconciliation");
+            }
+            let rows = rows_for(cell)?;
+            let row = &rows[0];
+            let result: Value = serde_json::from_str(row.evidence_json.as_deref().context("result evidence")?)?;
+            let eligible = reconciliation == Some("matched");
+            assert_eq!(result["ranking_eligible"], eligible, "{reconciliation:?}");
+            assert_eq!(result["downstream_status"], "unavailable");
+            assert_eq!(result["commit_window_output_throughput"]["rows_per_second"], 5.0);
+            assert_eq!(row.status, if eligible { "succeeded" } else { "failed" });
+            if eligible {
+                assert_eq!(result["ranking_metrics"]["committed_rows_per_second"], 5.0);
+                assert_eq!(row.rows_per_second, Some(6.0));
+            } else {
+                assert!(result["ranking_metrics"].is_null());
+                assert_eq!(
+                    result["ranking_ineligible_reason"],
+                    "exploratory_delta_log_reconciliation_unavailable"
+                );
+                assert_eq!(result["diagnostic_client_rows_per_second"], 6.0);
+                assert!(row.rows_per_second.is_none());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn client_completion_keeps_actual_admission_kinds_and_rejects_bad_evidence() -> Result<()> {
         let metrics = "measured_rows=100 measured_seconds=60 rows_per_second=1.667 measurement_window_start_unix_ms=100000 measurement_window_end_unix_ms=160000 measurement_started_unix_ms=100000";
         let completion = r#"OAT_COLLECTOR_COMPLETION {"best_effort_streams":3,"durable_streams":2,"admission_accounting_complete":false,"completed_at_unix_ms":160001}"#;
@@ -10738,5 +17577,242 @@ mod tests {
             memory_bytes: Some(1024),
             qap: QapMetrics::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod aks_resource_readback_tests {
+    use super::*;
+
+    #[test]
+    fn heterogeneous_clients_keep_per_node_resources_tunables_and_exact_placement() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        let placement = |node: &str, cores: u64| {
+            json!({
+                "node": node, "pool": "clientpool", "sku": "Standard_D8s_v6",
+                "allocatable_cpu_millicores": cores * 1000, "allocatable_memory_bytes": cores * (1_u64 << 30),
+                "resources": { "requests": { "cpu": cores.to_string(), "memory": "1Gi" },
+                    "limits": { "cpu": cores.to_string(), "memory": "1Gi" } }
+            })
+        };
+        config.platform.fleet = Some(serde_json::from_value(json!({
+            "collector": placement("collector", 64),
+            "clients": [
+                {"placement": placement("node-small", 4), "rows_per_table": 4096, "dmv_concurrency": 4,
+                    "tunables": {"workers": 3, "runtime_threads": 3}},
+                {"placement": placement("node-large", 8), "rows_per_table": 8192, "dmv_concurrency": 8,
+                    "tunables": {"workers": 7, "runtime_threads": 7}}
+            ],
+            "pools": []
+        }))?);
+        for (index, node, rows, workers, cores) in [(0, "node-small", 4096, 3, "4"), (1, "node-large", 8192, 7, "8")] {
+            let resolved = resolved_fleet_client_config(&config, index)?;
+            assert_eq!(resolved.rows_per_table, rows);
+            assert_eq!(
+                resolved.tunables.client.as_ref().and_then(|client| client.workers),
+                Some(workers)
+            );
+            assert_eq!(
+                resolved.effective_aks_resources().client.requests.cpu.as_deref(),
+                Some(cores)
+            );
+            let mut job = json!({"spec":{"template":{"spec":{"topologySpreadConstraints":[]}}}});
+            configure_fleet_client_placement(&mut job, &resolved, index)?;
+            assert_eq!(
+                job["spec"]["template"]["spec"]["nodeSelector"]["kubernetes.io/hostname"],
+                node
+            );
+            assert_eq!(
+                job["spec"]["template"]["spec"]["nodeSelector"]["kubernetes.azure.com/agentpool"],
+                "clientpool"
+            );
+            assert!(job.pointer("/spec/template/spec/topologySpreadConstraints").is_none());
+        }
+        assert!(resolved_fleet_client_config(&config, 2).is_err());
+        Ok(())
+    }
+
+    fn requirements() -> ResourceRequirements {
+        ResourceRequirements {
+            requests: ResourceValues {
+                cpu: Some("2".to_owned()),
+                memory: "4Gi".to_owned(),
+            },
+            limits: ResourceValues {
+                cpu: Some("2".to_owned()),
+                memory: "6Gi".to_owned(),
+            },
+        }
+    }
+
+    #[test]
+    fn resource_readback_accepts_equivalent_kubernetes_quantity_spellings() -> Result<()> {
+        let containers = vec![json!({
+            "name": "dataflow",
+            "resources": {
+                "requests": {"cpu": "2000m", "memory": "4096Mi"},
+                "limits": {"cpu": "2", "memory": "6Gi"}
+            }
+        })];
+        let evidence = verify_container_resources(&containers, "dataflow", "collector", &requirements())?;
+        assert_eq!(evidence["requested"]["requests"]["cpu"], "2");
+        assert_eq!(evidence["effective"]["requests"]["cpu"], "2000m");
+        Ok(())
+    }
+
+    #[test]
+    fn uncapped_collector_omits_cpu_limit_and_requires_matching_readback() -> Result<()> {
+        let mut expected = requirements();
+        expected.limits.cpu = None;
+        let mut deployment = json!({"spec":{"template":{"spec":{"containers":[{"name":"dataflow"}]}}}});
+        configure_deployment_container_resources(&mut deployment, "dataflow", &expected)?;
+        let container = &deployment["spec"]["template"]["spec"]["containers"][0];
+        assert!(container.pointer("/resources/limits/cpu").is_none());
+        verify_container_resources(std::slice::from_ref(container), "dataflow", "collector", &expected)?;
+        let mut with_cap = container.clone();
+        with_cap["resources"]["limits"]["cpu"] = json!("2");
+        assert!(verify_container_resources(&[with_cap], "dataflow", "collector", &expected).is_err());
+        let mut with_null = container.clone();
+        with_null["resources"]["limits"]["cpu"] = Value::Null;
+        assert!(verify_container_resources(&[with_null], "dataflow", "collector", &expected).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn resource_readback_rejects_mismatch_and_missing_limit() {
+        let expected = requirements();
+        let mismatch = vec![json!({
+            "name": "dataflow",
+            "resources": {
+                "requests": {"cpu": "2", "memory": "4Gi"},
+                "limits": {"cpu": "1", "memory": "6Gi"}
+            }
+        })];
+        assert!(verify_container_resources(&mismatch, "dataflow", "collector", &expected).is_err());
+
+        let missing = vec![json!({"name": "dataflow", "resources": {"requests": {"cpu": "2", "memory": "4Gi"}}})];
+        assert!(verify_container_resources(&missing, "dataflow", "collector", &expected).is_err());
+    }
+
+    #[test]
+    fn client_job_configuration_projects_resource_requirements() -> Result<()> {
+        let mut job = json!({"spec": {"template": {"spec": {"containers": [{"name": "client"}]}}}});
+        let expected: ResourceRequirements = serde_json::from_value(json!({
+            "requests": {"cpu": "1", "memory": "512Mi"},
+            "limits": {"cpu": "3", "memory": "3Gi"}
+        }))?;
+        configure_client_job_resources(&mut job, &expected)?;
+        assert_eq!(
+            job.pointer("/spec/template/spec/containers/0/resources"),
+            Some(&serde_json::to_value(expected)?)
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod aks_cpu_throttling_tests {
+    use super::*;
+
+    #[test]
+    fn parses_cadvisor_cfs_counters_for_exact_pod_identity() -> Result<()> {
+        let metrics = concat!(
+            "container_cpu_cfs_periods_total{namespace=\"oat-test\",pod=\"worker-a\",container=\"dataflow\"} 500\n",
+            "container_cpu_cfs_throttled_periods_total{namespace=\"oat-test\",pod=\"worker-a\",container=\"dataflow\"} 75\n",
+            "container_cpu_cfs_periods_total{namespace=\"other\",pod=\"worker-a\",container=\"dataflow\"} 999\n",
+        );
+        let counters = parse_cadvisor_cpu_counters(metrics, "oat-test", "worker-a", "dataflow")?
+            .context("matching cAdvisor counters missing")?;
+        assert_eq!(counters.periods, 500);
+        assert_eq!(counters.throttled_periods, 75);
+        Ok(())
+    }
+
+    #[test]
+    fn ignores_unrelated_fractional_and_nan_metrics_when_reading_cfs_counters() -> Result<()> {
+        let metrics = concat!(
+            "container_cpu_usage_seconds_total{namespace=\"oat-test\",pod=\"worker-a\",container=\"dataflow\"} 3.14159\n",
+            "container_cpu_cfs_throttled_seconds_total{namespace=\"oat-test\",pod=\"worker-a\",container=\"dataflow\"} 0.125\n",
+            "container_memory_usage_bytes{namespace=\"oat-test\",pod=\"worker-a\",container=\"dataflow\"} NaN\n",
+            "container_cpu_cfs_periods_total{namespace=\"oat-test\",pod=\"worker-a\",container=\"dataflow\"} 500\n",
+            "container_cpu_cfs_throttled_periods_total{namespace=\"oat-test\",pod=\"worker-a\",container=\"dataflow\"} 75\n",
+        );
+        let counters = parse_cadvisor_cpu_counters(metrics, "oat-test", "worker-a", "dataflow")?
+            .context("matching cAdvisor counters missing")?;
+        assert_eq!(counters.periods, 500);
+        assert_eq!(counters.throttled_periods, 75);
+        Ok(())
+    }
+
+    #[test]
+    fn preserves_initial_scrape_reason_when_end_counters_are_available() {
+        let start = CpuThrottleSample {
+            role: "collector".to_owned(),
+            pod: "worker-a".to_owned(),
+            uid: "uid-a".to_owned(),
+            container: "dataflow".to_owned(),
+            node: "node-a".to_owned(),
+            counters: None,
+            unavailable_reason: Some("start cAdvisor scrape failed: forbidden".to_owned()),
+        };
+        let end = CpuThrottleSample {
+            counters: Some(CpuThrottleCounters {
+                periods: 200,
+                throttled_periods: 20,
+            }),
+            unavailable_reason: None,
+            ..start.clone()
+        };
+        let evidence = compare_cpu_throttling(&[start], &[end]);
+        assert_eq!(evidence["status"], "unavailable");
+        assert_eq!(evidence["pods"][0]["reason"], "start cAdvisor scrape failed: forbidden");
+    }
+
+    #[test]
+    fn reports_measured_throttling_delta_without_inferring_from_worker_count() {
+        let sample = |periods, throttled_periods| CpuThrottleSample {
+            role: "collector".to_owned(),
+            pod: "worker-a".to_owned(),
+            uid: "uid-a".to_owned(),
+            container: "dataflow".to_owned(),
+            node: "node-a".to_owned(),
+            counters: Some(CpuThrottleCounters {
+                periods,
+                throttled_periods,
+            }),
+            unavailable_reason: None,
+        };
+        let evidence = compare_cpu_throttling(&[sample(100, 10)], &[sample(300, 70)]);
+        assert_eq!(evidence["status"], "measured");
+        assert_eq!(evidence["pods"][0]["periods"], 200);
+        assert_eq!(evidence["pods"][0]["throttled_periods"], 60);
+        assert_eq!(evidence["pods"][0]["throttled_period_fraction"], 0.3);
+    }
+}
+
+#[cfg(test)]
+mod aks_resource_budget_tests {
+    use super::*;
+
+    #[test]
+    fn aks_lifecycle_budget_includes_both_bounded_throttling_snapshots() -> Result<()> {
+        let mut config: OatConfig = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        config.platform.kind = crate::config::OatMode::Aks;
+        let budget = config.timing_budget()?;
+        let maintenance_rollouts = u64::from(maintenance_enabled(&config));
+        let scale_rollouts = u64::try_from(config.deployment_names().len())? + maintenance_rollouts;
+        let expected = budget.minimum_pin_ttl_ms
+            + scale_rollouts * config.aks_rollout_timeout_seconds * 1_000
+            + AKS_RESOURCE_COUNTER_SNAPSHOT_TIMEOUT_MS * 2;
+        assert_eq!(budget.after_setup_budget_ms, expected);
+        assert_eq!(
+            budget.planned_cell_duration_ms,
+            budget.pre_cell_setup_timeout_ms + budget.after_setup_budget_ms
+        );
+        Ok(())
     }
 }

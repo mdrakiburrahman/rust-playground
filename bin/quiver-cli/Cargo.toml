@@ -15,6 +15,7 @@ arrow = { version = "58.3", default-features = false, features = ["prettyprint",
 arrow-csv = "58.3"
 arrowcol-catalog = { path = "../../crates/arrowcol-catalog" }
 arrowcol-catalog-client = { path = "../../crates/arrowcol-catalog-client" }
+arrowcol-dataflow-components = { path = "../../crates/arrowcol-dataflow-components" }
 arrowcol-protocol = { path = "../../crates/arrowcol-protocol" }
 base64 = "0.22"
 clap.workspace = true
@@ -25,7 +26,6 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 uuid = { version = "1", features = ["v4", "v5"] }
 
 [dev-dependencies]
-arrowcol-dataflow-components = { path = "../../crates/arrowcol-dataflow-components" }
 otel-arrow-dfe-config = { path = "../../submodules/otel-arrow/rust/otap-dataflow/crates/config" }
 otel-arrow-dfe-pdata = { path = "../../submodules/otel-arrow/rust/otap-dataflow/crates/pdata" }
 assert_cmd.workspace = true

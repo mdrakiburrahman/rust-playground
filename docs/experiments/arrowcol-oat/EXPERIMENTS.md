@@ -13,6 +13,39 @@ ran. Earlier parse-only drafts with 19 `TODO` table slots and fixed 30/120-secon
 timings are historical receipts, not executable inputs. The binder reads the
 now-approved canonical fixture rather than copying or inventing table names.
 
+When `clients_per_table_sweep` is set, the Data Flow verdict requires one result per table for every declared replica, DFE concurrency, and client-count combination. The rows for a combination must share its cell run UUID, and different combinations must have distinct UUIDs. Other tunables are fixed within one orchestration.
+
+The `scale_out_single_table` profile reports ranked commit-window throughput only when Delta-log reconciliation is `matched`. Missing, unavailable, or mismatched reconciliation produces a failed, unranked result; raw commit-window and client observations remain diagnostic. Downstream QAP availability is reported separately.
+
+## Collector shutdown drain
+
+For a workload that continues publishing after SIGTERM, set
+`tunables.collector.shutdown_drain_timeout_seconds` (for example `240`) and
+`collector_stop_grace_seconds` to at least twice that value plus 60 (for
+example `540`). Both local Compose and AKS use the same guard: the DFE drains
+producer pipelines before system observability, and the outer stop grace
+also reserves time for terminal routing writes. Omitted drain budgets stay at
+60 seconds. Compare the effective engine setting and the actual drain outcome
+in the cell evidence; configuring a larger budget is not proof of a clean drain.
+
+## Local launcher deadline and recovery
+
+`--deadline-seconds <1..600>` is opt-in and valid only for a local run with `--no-viewer`; omitting it preserves the existing launcher behavior. The monotonic deadline begins when `launch.ts` starts and includes setup, server build, the run, report processing and owned-server shutdown. For example:
+
+```sh
+npx --no-install tsx projects/arrowcol-oat/launch.ts --mode local --config out/arrowcol-oat/oat-config.local.json --no-viewer --deadline-seconds 600
+```
+
+The launcher does not hard-kill itself or the OAT server. If the deadline expires while `POST /runs` is in flight, it waits for that request's existing 30-second bound; a late accepted response is recorded and only that exact UUID is canceled. A lost acceptance response is recorded as `UNKNOWN` with no fabricated ID, is never retried or searched for, and blocks the next deadline-enabled cell.
+
+Every benchmark invocation durably records `submitted_config_body` (the exact post-mode-rewrite string), its lowercase SHA-256 `submitted_config_sha256`, and the original file's `source_config_sha256` under `out/arrowcol-oat/deadline-receipts/<invocation_id>.json` before POST. Omitting the deadline leaves its timer/deadline fields absent or null; it does not omit the binding receipt. POST and GET must attest the same raw submitted-byte hash. Missing/mismatched attestation remains UNKNOWN, including after safe cleanup.
+
+Submit AKS benchmarks from the primary checkout that owns the existing receipt ledger, at the reviewed revision. Linked worktrees have independent output directories and may run preflight but cannot submit AKS benchmarks. Do not select another checkout to bypass an unsettled ledger.
+
+The receipt also records the original deadline, accepted canonical run identity, overrun, cancellation intent and cleanup state. For an owned local server, it binds `server_pid`, `server_start_ticks` and `server_executable` before the optional observer callback. After a validated terminal HTTP response, it stores the complete response and observation time in `terminal_observation` before shutdown. A consumer must match the receipt path, immutable run/server/config identity and original deadline; only a `succeeded` response with an in-window `finished_at_unix_ms` can authorize normal measurement. `failed` or `cancelled` proves termination only, never success. Legacy receipts remain readable for existing reconciliation, but cannot authenticate this terminal fallback. Cancellation is a durably recorded **once-only POST** for that exact run; an inconclusive response permits only bounded GET reconciliation, never another cancellation POST. Its first ten-minute cleanup deadline is persisted and reused on recovery, not renewed. Every response must name the exact accepted run. Only `succeeded` or `cancelled` confirms cleanup; `failed`, missing identity or binding uncertainty remains `UNSETTLED` and blocks another invocation. An overrun is always a failed launcher result, including expiry during scoring, final receipt persistence or owned-server shutdown. An unresolved run keeps its owned recovery server.
+
+The existing local marker at `<compose_state_root>/.arrowcol-oat-owner-<serverPid>.json` preserves `runId`, `ownerPid`, `ownerStartTicks`, `serverPid`, `serverStartTicks`, `serverUrl`, `serverExecutable` and the same three binding fields. The optional programmatic `main` observer receives a frozen `{invocationId, runId, serverUrl, serverPid, serverStartTicks, serverExecutable}` snapshot and the receipt path, directly from launcher-owned memory, only after the actual accepted run's receipt and marker are durable and its attestation matches. Immediately after marker persistence, emission rechecks the current in-memory accepted run/server identity, active non-error status, binding and absence of cancellation, expiry or unsettled cleanup. Initial terminal, external-server and unknown/mismatched runs emit nothing; ineligible owned runs produce a supplementary diagnostic. Observer throws/rejections are supplementary diagnostics only; the observer is not awaited and cannot authorize admission, scoring or cleanup. No production supervisor CLI is enabled by this seam.
+
 ## Capacity prerequisites
 
 The example's user pools can autoscale from zero to one node; per-node capacity
@@ -50,7 +83,11 @@ node CPU utilization aligned to each 30-second measurement window.
 | --- | --- |
 | Collector completion | All clients completed their uploads and measurement interval. Result `tunables_json.collector_completion` preserves each client's actual best-effort/durable admission counts and completion timestamp from completed upload calls across preflight, warm-up and measurement. Partial or cancelled upload calls are not counted; `admission_accounting_complete=false` explicitly marks incomplete accounting when warm-up cancels an upload. Missing reports are explicitly unavailable. |
 | Delta delivery | `tunables_json.delta_delivery` remains `not_established`. Durable admission acknowledges local WAL persistence, not Delta commit/flush or ADX visibility; no delivery barrier is implied. |
-| QAP catch-up | After client completion, sample read-only QAP metadata until every expected table is healthy, 100% complete and has zero pending files, or the existing single `qap_timeout_seconds` observation budget expires. Keep the last complete snapshot on deadline; incomplete QAP still fails the unchanged verdict. |
+| QAP catch-up | After client completion, sample read-only QAP metadata until every expected table is healthy, 100% complete and has zero pending files, or `qap_timeout_seconds` expires (strict integer 1–300 s; existing local quick 60 s unchanged). Local deadline-incomplete results retain raw completion/pending observations but publish derived Kusto/QAP metrics as null with an explanation, without changing Delta commit rates. AKS/default qualification remains strict. |
+| Snapshot coverage | Exact run/table-bound Kusto row count and table version are compared with the hash-referenced stopped Delta manifest independently of acceleration. A match proves snapshot count/version coverage only; unique payload delivery, per-row queryability and delivery latency remain UNKNOWN. |
+| Maintenance outcomes | The retained process-log baseline precedes client admission and covers warm-up, measurement and drain. Typed `stale_plan` records are retries, not operation failures; per-operation retry/error counts and raw exit codes remain separate. Exit 1 cannot qualify even after retries recover. Success requires typed `report.outcome` and `report.interrupted`; missing/malformed completion or error fields remain UNKNOWN. Protected-partition backlog is a separate measured debt vector, never added twice to eligible debt or zero-filled when absent. |
+| Live overload ceiling | Guard defaults on: stop active clients at >=90% of a readback-confirmed hard cap, or after two complete 30-second zero-ingestion-commit windows with outstanding work, during warm-up or measurement. Continue normal drain/maintenance/custody-safe cleanup. `evidence_json.overload_stop.classification=above_ceiling` is the ladder/step stop signal; retain the structured reason and do not advance to higher load. Unknown protection instead remains unavailable/nonqualifying, not a measured ceiling. |
+| Guard prerequisites | The memory-only guard currently requires exactly one run-owned collector, private cgroup-v2 accounting with a finite container memory cap, matching collector RSS/buffer cap readback and complete ingestion-only telemetry. No WAL/Quiver enablement is required. Missing/mismatched readback blocks admission; incomplete live coverage blocks qualification. Multi-collector comparisons are unavailable under this guard, not implicitly protected. See [guard settings and accounting](TUNABLES.md#in-flight-overload-guard). |
 
 Historical query responses remain in `out/arrowcol-oat/qap/<cell-run-id>/kusto-queries.jsonl`.
 Catch-up also retains timestamped sanitized samples in `qap-observations.jsonl`

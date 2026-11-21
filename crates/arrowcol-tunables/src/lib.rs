@@ -1,6 +1,8 @@
 mod validation;
 
-pub use validation::{ApplyBoundary, Capability, ComponentRole, DurabilityClass, capability_table};
+pub use validation::{
+    ApplyBoundary, Capability, ComponentRole, DurabilityClass, capability_table, parse_tunable_duration,
+};
 
 pub use arrow_deltalake::writer::{
     Codec as ParquetCodec, ColumnOptions as ParquetColumnOptions, ParquetWriterConfig, SortColumn as ParquetSortColumn,
@@ -43,6 +45,10 @@ pub struct ClientTunables {
     pub workers: Option<usize>,
     pub runtime_threads: Option<usize>,
     pub data_mode: Option<DataMode>,
+    pub data_profile: Option<ClientDataProfile>,
+    pub string_length_distribution: Option<ClientStringLengthDistribution>,
+    pub value_variation: Option<ClientValueVariation>,
+    pub guid_uniqueness: Option<ClientGuidUniqueness>,
     pub string_width: Option<usize>,
     pub cardinality: Option<usize>,
     pub null_fraction: Option<f64>,
@@ -52,6 +58,7 @@ pub struct ClientTunables {
     pub max_memory_bytes: Option<u64>,
     pub interval_us: Option<u64>,
     pub connections_per_worker: Option<usize>,
+    pub pod_ordinal: Option<u32>,
     pub streams_per_worker: Option<usize>,
     pub max_rows: Option<u64>,
     pub stream_retry_max_attempts: Option<u32>,
@@ -187,9 +194,24 @@ pub struct LoggingTunables {
     pub maintenance: Option<LogLevel>,
 }
 
+pub const DEFAULT_COLLECTOR_SHUTDOWN_DRAIN_TIMEOUT_SECONDS: u32 = 60;
+pub const MAX_COLLECTOR_SHUTDOWN_DRAIN_TIMEOUT_SECONDS: u32 = 1_500;
+
+fn deserialize_shutdown_drain_timeout_seconds<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    u32::deserialize(deserializer).map(Some)
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CollectorTunables {
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_shutdown_drain_timeout_seconds"
+    )]
+    pub shutdown_drain_timeout_seconds: Option<u32>,
     pub batching: Option<BatchingTunables>,
     pub catalog: Option<CatalogTunables>,
     pub commit: Option<CommitTunables>,
@@ -199,7 +221,16 @@ pub struct CollectorTunables {
     pub pressure: Option<PressureTunables>,
     pub routing: Option<RoutingTunables>,
     pub runtime: Option<RuntimeTunables>,
+    pub upload: Option<CollectorUploadTunables>,
     pub cpu_pressure: Option<CpuPressureMode>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CollectorUploadTunables {
+    pub mode: Option<CollectorUploadMode>,
+    pub buffer_capacity_bytes: Option<usize>,
+    pub request_concurrency: Option<usize>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -241,10 +272,21 @@ pub struct AdaptiveFileTunables {
     pub max_parquet_ratio: Option<f64>,
 }
 
+/// Collection behavior when the oldest queued batch reaches its age cutoff.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgeFlushPolicy {
+    #[default]
+    Immediate,
+    DrainReady,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BatchingTunables {
     pub coalesce_publications: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub age_flush_policy: Option<AgeFlushPolicy>,
     pub global_capacity: Option<QueueCapacityTunables>,
     pub per_table_capacity: Option<QueueCapacityTunables>,
     pub max_arrow_memory_per_flush: Option<u64>,
@@ -252,6 +294,7 @@ pub struct BatchingTunables {
     pub max_batches_per_flush: Option<u64>,
     pub max_age: Option<String>,
     pub max_concurrent_flushes: Option<usize>,
+    pub pipeline_depth: Option<usize>,
     pub adaptive_file: Option<AdaptiveFileTunables>,
 }
 
@@ -278,6 +321,8 @@ pub struct LayoutTunables {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LimitsTunables {
+    pub grpc_accept_compression: Option<GrpcCompression>,
+    pub grpc_send_compression: Option<GrpcCompression>,
     pub max_metadata_bytes: Option<usize>,
     pub max_schema_bytes: Option<usize>,
     pub max_message_bytes: Option<usize>,
@@ -333,6 +378,38 @@ pub enum DictionaryHandling {
 pub enum DataMode {
     Shared,
     Independent,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientDataProfile {
+    #[default]
+    Diagnostic,
+    Realistic,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientStringLengthDistribution {
+    #[default]
+    Fixed,
+    Uniform,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientValueVariation {
+    #[default]
+    Cardinality,
+    PerRow,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientGuidUniqueness {
+    #[default]
+    Cardinality,
+    PerRow,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
@@ -409,9 +486,13 @@ pub struct MaintenanceTunables {
     pub enabled: Option<bool>,
     pub operations: Option<Vec<MaintenanceOperation>>,
     pub apply: Option<bool>,
+    pub parquet_writer: Option<ParquetWriterConfig>,
+    pub optimize_upload_mode: Option<MaintenanceUploadMode>,
+    pub optimize_upload_buffer_bytes: Option<usize>,
     pub interval_secs: Option<u64>,
     pub max_idle_backoff_secs: Option<u64>,
     pub max_cycles: Option<u64>,
+    pub max_consecutive_stale_plans: Option<u32>,
     pub max_concurrent_tables: Option<usize>,
     pub max_concurrent_decoded_bytes: Option<u64>,
     pub operation_timeout_secs: Option<u64>,
@@ -451,6 +532,7 @@ pub struct MaintenanceTunables {
     pub max_active_files: Option<usize>,
     pub latest_partitions: Option<usize>,
     pub sealed_final: Option<bool>,
+    pub sealed_partitions_only: Option<bool>,
     pub checkpoint_every_commits: Option<u64>,
     pub log_retention_secs: Option<u64>,
     pub max_prune_files: Option<usize>,
@@ -476,6 +558,13 @@ pub enum MaintenanceInputReadStrategy {
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
+pub enum MaintenanceUploadMode {
+    PutCreate,
+    BufferedMultipart,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
 pub enum MaintenanceGranularity {
     Minute,
     Hour,
@@ -491,3 +580,51 @@ pub enum MaintenanceOperation {
     Checkpoint,
     PruneLog,
 }
+
+// PERF69-TUNABLES-BEGIN oat-evidence
+// PERF69-TUNABLES-END oat-evidence
+// PERF69-TUNABLES-BEGIN oat-campaign
+// PERF69-TUNABLES-END oat-campaign
+// PERF69-TUNABLES-BEGIN aks-custody
+// PERF69-TUNABLES-END aks-custody
+// PERF69-TUNABLES-BEGIN file-formation
+// PERF69-TUNABLES-END file-formation
+// PERF69-TUNABLES-BEGIN commit-pipeline
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum CollectorUploadMode {
+    #[default]
+    PutCreate,
+    BufferedMultipart,
+}
+
+impl CollectorUploadMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PutCreate => "put_create",
+            Self::BufferedMultipart => "buffered_multipart",
+        }
+    }
+}
+
+impl FromStr for CollectorUploadMode {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "put_create" => Ok(Self::PutCreate),
+            "buffered_multipart" => Ok(Self::BufferedMultipart),
+            _ => Err("expected 'put_create' or 'buffered_multipart'"),
+        }
+    }
+}
+// PERF69-TUNABLES-END commit-pipeline
+// PERF69-TUNABLES-BEGIN maintenance
+// PERF69-TUNABLES-END maintenance
+// PERF69-TUNABLES-BEGIN loadgen
+// PERF69-TUNABLES-END loadgen
+// PERF69-TUNABLES-BEGIN telemetry
+// PERF69-TUNABLES-END telemetry
+// PERF69-TUNABLES-BEGIN grafana
+// PERF69-TUNABLES-END grafana

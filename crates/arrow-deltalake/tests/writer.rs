@@ -66,6 +66,8 @@ async fn parquet_reports_checked_logical_input_bytes() -> Result<()> {
     assert_eq!(observation.rows, 6);
     assert_eq!(observation.input_bytes, 50);
     assert_eq!(observation.parquet_bytes, completed.bytes);
+    let physical_bytes = std::fs::metadata(&completed.path)?.len();
+    assert_eq!(observation.parquet_bytes, physical_bytes);
     assert!(observation.parquet_bytes > 0);
     Ok(())
 }

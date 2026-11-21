@@ -41,24 +41,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     arrowcol_dataflow_components::initialize_shared_io()?;
     let shutdown_error = Rc::new(RefCell::new(None));
     let hook_error = Rc::clone(&shutdown_error);
-    let result = otel_arrow_dfe::run_with_shutdown_status(move |clean| {
-        let result = finish_shutdown(
-            clean,
-            arrow_deltalake::publisher::PublisherSession::close_shared,
-            |clean| arrowcol_dataflow_components::finish_routing_shutdown(clean).map_err(|error| error.to_string()),
-        );
-        drop(metrics);
-        if let Err(error) = result {
-            eprintln!("dataflow shutdown failed: {error}");
-            // After a clean engine exit the SDK would report success, so only this hook can fail
-            // the process. An unclean exit is a startup error returned to `main`, or a controller
-            // error the SDK already exits non-zero for; exiting here would hide that error.
-            if clean {
-                std::process::exit(1);
+    let result = otel_arrow_dfe::run_with_config_observer_and_shutdown_status(
+        |spec| arrowcol_dataflow_components::observe_validated_topology(spec).map_err(Into::into),
+        move |clean| {
+            let result = finish_shutdown(
+                clean,
+                arrow_deltalake::publisher::PublisherSession::close_shared,
+                |clean| arrowcol_dataflow_components::finish_routing_shutdown(clean).map_err(|error| error.to_string()),
+            );
+            drop(metrics);
+            if let Err(error) = result {
+                eprintln!("dataflow shutdown failed: {error}");
+                // After a clean engine exit the SDK would report success, so only this hook can fail
+                // the process. An unclean exit is a startup error returned to `main`, or a controller
+                // error the SDK already exits non-zero for; exiting here would hide that error.
+                if clean {
+                    std::process::exit(1);
+                }
+                *hook_error.borrow_mut() = Some(error);
             }
-            *hook_error.borrow_mut() = Some(error);
-        }
-    });
+        },
+    );
     propagate(result, shutdown_error.take())
 }
 

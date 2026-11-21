@@ -1,24 +1,48 @@
+import { createHash, randomUUID } from 'node:crypto';
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
-import { existsSync } from 'node:fs';
-import { lstat, mkdir, readFile, realpath, readdir, rm, stat, unlink, writeFile } from 'node:fs/promises';
+import { constants, existsSync } from 'node:fs';
+import { link, lstat, mkdir, open, readFile, readlink, realpath, readdir, rename, rm, stat, unlink, writeFile } from 'node:fs/promises';
 import { createServer as createHttpServer } from 'node:http';
 import { createServer as createTcpServer, isIP } from 'node:net';
-import { extname, isAbsolute, relative, resolve, sep } from 'node:path';
+import { dirname, extname, isAbsolute, relative, resolve, sep } from 'node:path';
+import { performance } from 'node:perf_hooks';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { isDeepStrictEqual } from 'node:util';
 import { formatPreflightReport, loadAksEnvironment, runAksPreflight } from './aks-preflight.js';
 import { run_tree } from '../../infra/azure/bootstrap.js';
-import { record, reportDataFlowRun, type NetworkObservation } from './dataflow-verdict.js';
+import { collectDataFlow, parseDataFlowVerdictPolicy, record, reportDataFlowRun, type NetworkObservation } from './dataflow-verdict.js';
 
 export interface OatRunStatus {
   id: string;
+  config_sha256: string | null;
   state: 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled';
   progress: string;
   result_count: number;
   error: string | null;
+  started_at_unix_ms?: number;
+  finished_at_unix_ms?: number | null;
+  aks_cleanup_confirmed?: boolean;
+  local_teardown?: {
+    cell_id: string;
+    schedule_unix_ms: number;
+    measurement_end_unix_ms: number;
+    started_at_unix_ms: number;
+  } | null;
 }
 
 type FetchLike = typeof fetch;
 type ProgressHandler = (status: OatRunStatus) => void;
+
+export interface OatOwnedRunIdentity {
+  readonly invocationId: string;
+  readonly runId: string;
+  readonly serverUrl: string;
+  readonly serverPid: number;
+  readonly serverStartTicks: string;
+  readonly serverExecutable: string;
+}
+
+export type OatOwnedRunObserver = (identity: Readonly<OatOwnedRunIdentity>, receiptPath: string) => void | Promise<void>;
 
 export interface LocalViewer {
   url: string;
@@ -31,7 +55,10 @@ interface LocalViewerConfig {
 }
 
 const workspaceRoot = resolve(fileURLToPath(new URL('../..', import.meta.url)));
-const cliValuedOptions = new Set(['--config', '--mode', '--server', '--poll-ms', '--cleanup-local', '--stamp-config']);
+const launcherDeadlineReceiptRoot = resolve(workspaceRoot, 'out/arrowcol-oat/deadline-receipts');
+const launcherDeadlineMaxSeconds = 600;
+const localCancellationCleanupMs = 10 * 60 * 1000;
+const cliValuedOptions = new Set(['--config', '--mode', '--server', '--poll-ms', '--cleanup-local', '--stamp-config', '--deadline-seconds']);
 
 export class OatCliError extends Error {
   readonly exitCode = 2;
@@ -68,11 +95,1065 @@ Options:
   --stamp-config <path> Use the private stamp YAML for AKS validation
   --server <URL>       Use an existing OAT API server
   --poll-ms <number>   Set the status polling interval
+  --deadline-seconds <1..600> Fail closed after this launcher-start deadline (local only)
   --viewer-only        Serve existing local results without running a benchmark
   --no-viewer          Exit after a successful local run without serving results
   --preflight-only     Run the read-only AKS preflight
   --cleanup-local <id> Remove one abandoned local Compose cell by its run UUID
+  --recover-failed-aks <invocation-id> <approved-evidence-path>
+                       Record the reviewed disposition for an approved AKS failure
+                       Post-load evidence must be no more than 60 minutes old.
+                       Owned-controller crash evidence has the same freshness limit;
+                       it does not establish historical admission or a terminal result.
+                       Keep one original-host lease from census through post-record recheck;
+                       recheck writers and resource custody before a new run; stop if unsafe.
   -h, --help           Show this help`;
+
+type DeadlineCreationState = 'not_started' | 'pending' | 'accepted' | 'rejected' | 'unknown';
+type DeadlineCleanupState = 'not_started' | 'pending' | 'confirmed' | 'unsettled';
+
+export interface SubmittedOatConfig {
+  submitted_config_body: string;
+  submitted_config_sha256: string;
+  source_config_sha256: string;
+}
+
+interface LauncherDeadlineReceipt {
+  version: 1;
+  invocation_id: string;
+  started_at_unix_ms: number;
+  deadline_at_unix_ms: number | null;
+  started_at_monotonic_ms: number;
+  deadline_seconds: number | null;
+  deadline_at_monotonic_ms: number | null;
+  submitted_config_body: string | null;
+  submitted_config_sha256: string | null;
+  source_config_sha256: string | null;
+  cleanup_deadline_at_unix_ms: number | null;
+  config_binding_error: string | null;
+  overrun: boolean;
+  overrun_at_unix_ms: number | null;
+  creation_state: DeadlineCreationState;
+  server_url: string | null;
+  server_pid?: number | null;
+  server_start_ticks?: string | null;
+  server_executable?: string | null;
+  run_id: string | null;
+  run_state: OatRunStatus['state'] | 'not_started' | 'unknown';
+  terminal_observation?: LauncherTerminalObservation | null;
+  cancellation_attempts: number;
+  last_cancel_result: string | null;
+  cleanup_state: DeadlineCleanupState;
+  error: string | null;
+}
+
+interface LauncherTerminalObservation {
+  observed_at_unix_ms: number;
+  status: OatRunStatus;
+}
+
+async function writeAtomicJson(path: string, value: unknown): Promise<void> {
+  const directory = dirname(path);
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  const temporary = `${path}.${randomUUID()}.tmp`;
+  const file = await open(temporary, 'wx', 0o600);
+  try {
+    await file.writeFile(`${JSON.stringify(value, null, 2)}\n`);
+    await file.sync();
+  } finally {
+    await file.close();
+  }
+  await rename(temporary, path);
+  const directoryHandle = await open(directory, 'r');
+  try {
+    await directoryHandle.sync();
+  } finally {
+    await directoryHandle.close();
+  }
+}
+
+export class OatLauncherDeadline {
+  readonly signal: AbortSignal;
+  readonly receiptPath: string;
+  readonly deadlineAtMonotonicMs: number | null;
+  private readonly controller = new AbortController();
+  private readonly receipt: LauncherDeadlineReceipt;
+  private timer: NodeJS.Timeout | undefined;
+  private writeTail: Promise<void> = Promise.resolve();
+  private backgroundWriteFailure: unknown;
+  private readonly writeReceipt: typeof writeAtomicJson;
+
+  private constructor(receiptPath: string, receipt: LauncherDeadlineReceipt, writeReceipt = writeAtomicJson) {
+    this.writeReceipt = writeReceipt;
+    this.receiptPath = receiptPath;
+    this.receipt = receipt;
+    this.deadlineAtMonotonicMs = receipt.deadline_at_monotonic_ms;
+    this.signal = this.controller.signal;
+  }
+
+  static async create(seconds: number | undefined, startedAtMonotonicMs = performance.now(), receiptRoot = launcherDeadlineReceiptRoot, startedAtUnixMs = Date.now()): Promise<OatLauncherDeadline> {
+    if (seconds !== undefined && (!Number.isSafeInteger(seconds) || seconds < 1 || seconds > launcherDeadlineMaxSeconds)) {
+      throw new OatCliError(`--deadline-seconds must be an integer from 1 to ${launcherDeadlineMaxSeconds}`);
+    }
+    const invocationId = randomUUID();
+    const receipt: LauncherDeadlineReceipt = {
+      version: 1,
+      invocation_id: invocationId,
+      started_at_unix_ms: startedAtUnixMs,
+      deadline_at_unix_ms: seconds === undefined ? null : startedAtUnixMs + seconds * 1000,
+      started_at_monotonic_ms: startedAtMonotonicMs,
+      deadline_seconds: seconds ?? null,
+      deadline_at_monotonic_ms: seconds === undefined ? null : startedAtMonotonicMs + seconds * 1000,
+      submitted_config_body: null,
+      submitted_config_sha256: null,
+      source_config_sha256: null,
+      cleanup_deadline_at_unix_ms: null,
+      config_binding_error: null,
+      overrun: false,
+      overrun_at_unix_ms: null,
+      creation_state: 'not_started',
+      server_url: null,
+      server_pid: null,
+      server_start_ticks: null,
+      server_executable: null,
+      run_id: null,
+      run_state: 'not_started',
+      terminal_observation: null,
+      cancellation_attempts: 0,
+      last_cancel_result: null,
+      cleanup_state: 'not_started',
+      error: null,
+    };
+    const deadline = new OatLauncherDeadline(resolve(receiptRoot, `${invocationId}.json`), receipt);
+    await deadline.persist();
+    if (seconds !== undefined) {
+      deadline.timer = setTimeout(() => {
+        void deadline.markOverrun().catch((error: unknown) => { deadline.backgroundWriteFailure = error; });
+        deadline.controller.abort(new Error('launcher-start deadline expired'));
+      }, Math.max(0, deadline.deadlineAtMonotonicMs! - performance.now()));
+    }
+    return deadline;
+  }
+
+  static async restore(path: string, writeReceipt = writeAtomicJson): Promise<OatLauncherDeadline> {
+    const parsed: unknown = JSON.parse(await readFile(path, 'utf8'));
+    if (!isLauncherDeadlineReceipt(parsed)) throw new Error(`Invalid launcher deadline receipt ${path}`);
+    const restored: LauncherDeadlineReceipt = {
+      ...parsed,
+      server_pid: parsed.server_pid ?? null,
+      server_start_ticks: parsed.server_start_ticks ?? null,
+      server_executable: parsed.server_executable ?? null,
+      terminal_observation: parsed.terminal_observation ?? null,
+    };
+    const deadline = new OatLauncherDeadline(path, restored, writeReceipt);
+    if (!restored.overrun && restored.deadline_at_unix_ms !== null && Date.now() >= restored.deadline_at_unix_ms) {
+      restored.overrun = true;
+      restored.overrun_at_unix_ms = Date.now();
+      await deadline.persist();
+    }
+    return deadline;
+  }
+
+  get creationState(): DeadlineCreationState { return this.receipt.creation_state; }
+  get submittedPlatform(): 'local' | 'aks' | undefined { return submittedPlatform(this.receipt.submitted_config_body); }
+  get invocationId(): string { return this.receipt.invocation_id; }
+  get cleanupState(): DeadlineCleanupState { return this.receipt.cleanup_state; }
+  get runId(): string | null { return this.receipt.run_id; }
+  get serverUrl(): string | null { return this.receipt.server_url; }
+  get cancellationAttempts(): number { return this.receipt.cancellation_attempts; }
+  get submittedConfigSha256(): string | null { return this.receipt.submitted_config_sha256; }
+  isExpired(): boolean { return this.deadlineAtMonotonicMs !== null && performance.now() >= this.deadlineAtMonotonicMs; }
+
+  canObserveOwnedRun(status: OatRunStatus, serverUrl: string, submittedConfigSha256: string): boolean {
+    const receipt = this.receipt;
+    return receipt.creation_state === 'accepted' && receipt.run_id === status.id &&
+      receipt.server_url === serverUrl && receipt.run_state === status.state &&
+      (status.state === 'queued' || status.state === 'running') && status.error === null &&
+      receipt.cleanup_state === 'pending' && receipt.error === null && receipt.config_binding_error === null &&
+      receipt.submitted_config_sha256 === submittedConfigSha256 && status.config_sha256 === submittedConfigSha256 &&
+      receipt.cancellation_attempts === 0 && receipt.last_cancel_result === null &&
+      !receipt.overrun && !this.signal.aborted && !this.isExpired() && this.backgroundWriteFailure === undefined;
+  }
+
+  private async persist(): Promise<void> {
+    const snapshot = structuredClone(this.receipt);
+    const nextWrite = this.writeTail.catch(() => undefined).then(() => this.writeReceipt(this.receiptPath, snapshot));
+    this.writeTail = nextWrite;
+    try {
+      await nextWrite;
+      this.backgroundWriteFailure = undefined;
+    } catch (error) {
+      this.backgroundWriteFailure = error;
+      throw error;
+    }
+  }
+
+  async setSubmissionBinding(binding: SubmittedOatConfig): Promise<void> {
+    if (!/^[0-9a-f]{64}$/.test(binding.submitted_config_sha256) ||
+        !/^[0-9a-f]{64}$/.test(binding.source_config_sha256) ||
+        createHash('sha256').update(binding.submitted_config_body, 'utf8').digest('hex') !== binding.submitted_config_sha256) {
+      throw new Error('Submitted OAT config binding is invalid');
+    }
+    this.receipt.submitted_config_body = binding.submitted_config_body;
+    this.receipt.submitted_config_sha256 = binding.submitted_config_sha256;
+    this.receipt.source_config_sha256 = binding.source_config_sha256;
+    await this.persist();
+  }
+
+  async ensureCleanupDeadline(now = Date.now()): Promise<number> {
+    if (this.receipt.cleanup_deadline_at_unix_ms === null) {
+      if (this.receipt.cancellation_attempts !== 0) {
+        throw new Error('Existing OAT cleanup receipt has cancellation attempts but no persisted cleanup deadline');
+      }
+      this.receipt.cleanup_deadline_at_unix_ms = now + localCancellationCleanupMs;
+      await this.persist();
+    }
+    return this.receipt.cleanup_deadline_at_unix_ms;
+  }
+
+  async markCreationPending(serverUrl: string): Promise<void> {
+    this.receipt.server_url = serverUrl;
+    this.receipt.creation_state = 'pending';
+    this.receipt.run_state = 'unknown';
+    this.receipt.cleanup_state = 'pending';
+    await this.persist();
+  }
+
+  async recordRunStarted(status: OatRunStatus): Promise<void> {
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(status.id)) {
+      throw new Error('OAT server returned a run ID that cannot be safely persisted');
+    }
+    this.receipt.creation_state = 'accepted';
+    this.receipt.run_id = status.id;
+    this.receipt.run_state = status.state;
+    this.receipt.cleanup_state = cleanupStateFor(status);
+    await this.persist();
+  }
+
+  async recordOwnedServerIdentity(identity: Readonly<OatOwnedRunIdentity>): Promise<void> {
+    const receipt = this.receipt;
+    if (identity.invocationId !== receipt.invocation_id || receipt.creation_state !== 'accepted' ||
+        receipt.run_id !== identity.runId || receipt.server_url !== identity.serverUrl ||
+        !Number.isSafeInteger(identity.serverPid) || identity.serverPid <= 0 ||
+        !identity.serverStartTicks || !identity.serverExecutable) {
+      throw new Error('Owned OAT server identity does not match the accepted invocation receipt');
+    }
+    const alreadyBound = receipt.server_pid != null || receipt.server_start_ticks != null || receipt.server_executable != null;
+    if (alreadyBound && (receipt.server_pid !== identity.serverPid || receipt.server_start_ticks !== identity.serverStartTicks ||
+        receipt.server_executable !== identity.serverExecutable)) {
+      throw new Error('Owned OAT server identity changed for the accepted invocation receipt');
+    }
+    receipt.server_pid = identity.serverPid;
+    receipt.server_start_ticks = identity.serverStartTicks;
+    receipt.server_executable = identity.serverExecutable;
+    await this.persist();
+  }
+
+  async markCreationRejected(error: unknown): Promise<void> {
+    this.receipt.creation_state = 'rejected';
+    this.receipt.run_state = 'not_started';
+    this.receipt.cleanup_state = 'confirmed';
+    this.receipt.error = error instanceof Error ? error.message : String(error);
+    await this.persist();
+  }
+
+  async markCreationUnknown(error: unknown): Promise<void> {
+    this.receipt.creation_state = 'unknown';
+    this.receipt.run_state = 'unknown';
+    this.receipt.cleanup_state = 'unsettled';
+    this.receipt.error = error instanceof Error ? error.message : String(error);
+    await this.persist();
+  }
+
+  async markCancelAttempt(): Promise<void> {
+    if (this.receipt.cancellation_attempts !== 0) throw new Error('Cancellation intent was already recorded for this OAT run');
+    this.receipt.cancellation_attempts++;
+    this.receipt.last_cancel_result = 'pending';
+    await this.persist();
+  }
+
+  async markCancelResult(result: string): Promise<void> {
+    this.receipt.last_cancel_result = result;
+    await this.persist();
+  }
+
+  async recordTerminal(status: OatRunStatus): Promise<void> {
+    this.receipt.run_state = status.state;
+    this.receipt.cleanup_state = this.receipt.config_binding_error ? 'unsettled' : cleanupStateFor(status);
+    this.receipt.error = this.receipt.config_binding_error ?? status.error;
+    const identityBound = Number.isSafeInteger(this.receipt.server_pid) && (this.receipt.server_pid ?? 0) > 0 &&
+      typeof this.receipt.server_start_ticks === 'string' && this.receipt.server_start_ticks.length > 0 &&
+      typeof this.receipt.server_executable === 'string' && this.receipt.server_executable.length > 0;
+    const terminal = status.state === 'succeeded' || status.state === 'failed' || status.state === 'cancelled';
+    const matchesOwnedRun = terminal && identityBound &&
+        this.receipt.creation_state === 'accepted' && this.receipt.run_id === status.id &&
+        this.receipt.server_url !== null && this.receipt.submitted_config_sha256 !== null &&
+        this.receipt.config_binding_error === null && status.config_sha256 === this.receipt.submitted_config_sha256;
+    if (matchesOwnedRun && this.receipt.terminal_observation == null) {
+      this.receipt.terminal_observation = { observed_at_unix_ms: Date.now(), status: structuredClone(status) };
+    }
+    if (matchesOwnedRun && status.state === 'failed' && status.aks_cleanup_confirmed === true &&
+        this.submittedPlatform === 'aks' && hasConfirmedAksFailure(this.receipt.terminal_observation?.status)) {
+      this.receipt.cleanup_state = 'confirmed';
+    }
+    await this.persist();
+  }
+
+  async markBindingFailure(error: unknown): Promise<void> {
+    this.receipt.config_binding_error = error instanceof Error ? error.message : String(error);
+    this.receipt.cleanup_state = 'unsettled';
+    this.receipt.error = this.receipt.config_binding_error;
+    await this.persist();
+  }
+
+  async markUnsettled(error: unknown): Promise<void> {
+    this.receipt.cleanup_state = 'unsettled';
+    this.receipt.error = error instanceof Error ? error.message : String(error);
+    await this.persist();
+  }
+
+  async markNoRun(error?: unknown): Promise<void> {
+    if (this.receipt.creation_state !== 'not_started') return;
+    this.receipt.run_state = 'not_started';
+    this.receipt.cleanup_state = 'confirmed';
+    if (error !== undefined) this.receipt.error = error instanceof Error ? error.message : String(error);
+    await this.persist();
+  }
+
+  async markOverrun(): Promise<void> {
+    if (!this.receipt.overrun) {
+      this.receipt.overrun = true;
+      this.receipt.overrun_at_unix_ms = Date.now();
+    }
+    await this.persist();
+  }
+
+  dispose(): void { if (this.timer) clearTimeout(this.timer); }
+}
+
+function cleanupStateFor(status: OatRunStatus): DeadlineCleanupState {
+  if (status.state === 'succeeded' || status.state === 'cancelled') return 'confirmed';
+  if (status.state === 'failed') return 'unsettled';
+  return 'pending';
+}
+
+function submittedPlatform(body: unknown): 'local' | 'aks' | undefined {
+  if (typeof body !== 'string') return undefined;
+  let config: unknown;
+  try {
+    config = JSON.parse(body);
+  } catch {
+    return undefined;
+  }
+  if (!isRecord(config) || !isRecord(config.platform)) return undefined;
+  const kind = config.platform.kind;
+  return kind === 'local' || kind === 'aks' ? kind : undefined;
+}
+
+function hasConfirmedAksFailure(status: OatRunStatus | undefined): boolean {
+  return status?.state === 'failed' && status.aks_cleanup_confirmed === true &&
+    typeof status.error === 'string' && typeof status.finished_at_unix_ms === 'number' &&
+    Number.isSafeInteger(status.finished_at_unix_ms) && status.finished_at_unix_ms > 0;
+}
+
+function isLauncherDeadlineReceipt(value: unknown): value is LauncherDeadlineReceipt {
+  if (!isRecord(value)) return false;
+  const noBinding = value.submitted_config_body === null && value.submitted_config_sha256 === null && value.source_config_sha256 === null;
+  const bindingIsValid = typeof value.submitted_config_body === 'string' &&
+    typeof value.submitted_config_sha256 === 'string' && /^[0-9a-f]{64}$/.test(value.submitted_config_sha256) &&
+    typeof value.source_config_sha256 === 'string' && /^[0-9a-f]{64}$/.test(value.source_config_sha256) &&
+    createHash('sha256').update(value.submitted_config_body, 'utf8').digest('hex') === value.submitted_config_sha256;
+  const identityFieldsAbsent = !('server_pid' in value) && !('server_start_ticks' in value) && !('server_executable' in value);
+  const identityIsNull = value.server_pid === null && value.server_start_ticks === null && value.server_executable === null;
+  const identityIsValid = typeof value.server_pid === 'number' && Number.isSafeInteger(value.server_pid) && value.server_pid > 0 &&
+    typeof value.server_start_ticks === 'string' && value.server_start_ticks.length > 0 &&
+    typeof value.server_executable === 'string' && value.server_executable.length > 0;
+  const observationAbsent = !('terminal_observation' in value);
+  const observationIsValid = value.terminal_observation === null || isLauncherTerminalObservation(value.terminal_observation);
+  const observationMatches = value.terminal_observation === undefined || value.terminal_observation === null ||
+    (identityIsValid && isLauncherTerminalObservation(value.terminal_observation) &&
+      value.creation_state === 'accepted' && value.run_id === value.terminal_observation.status.id &&
+      value.server_url !== null && typeof value.submitted_config_sha256 === 'string' &&
+      value.submitted_config_sha256 === value.terminal_observation.status.config_sha256 &&
+      value.run_state === value.terminal_observation.status.state);
+  return value.version === 1 && typeof value.invocation_id === 'string' &&
+    typeof value.started_at_unix_ms === 'number' && (value.deadline_at_unix_ms === null || typeof value.deadline_at_unix_ms === 'number') &&
+    typeof value.started_at_monotonic_ms === 'number' &&
+    (value.deadline_seconds === null || typeof value.deadline_seconds === 'number') &&
+    (value.deadline_at_monotonic_ms === null || typeof value.deadline_at_monotonic_ms === 'number') &&
+    (noBinding || bindingIsValid) &&
+    (value.cleanup_deadline_at_unix_ms === null || typeof value.cleanup_deadline_at_unix_ms === 'number') &&
+    (value.config_binding_error === null || typeof value.config_binding_error === 'string') &&
+    typeof value.overrun === 'boolean' && (value.overrun_at_unix_ms === null || typeof value.overrun_at_unix_ms === 'number') &&
+    ['not_started', 'pending', 'accepted', 'rejected', 'unknown'].includes(String(value.creation_state)) &&
+    (value.server_url === null || typeof value.server_url === 'string') &&
+    (value.run_id === null || typeof value.run_id === 'string') &&
+    ['queued', 'running', 'succeeded', 'failed', 'cancelled', 'not_started', 'unknown'].includes(String(value.run_state)) &&
+    (value.cleanup_state === 'not_started' || value.cleanup_state === 'pending' ||
+      value.cleanup_state === 'confirmed' || value.cleanup_state === 'unsettled') &&
+    typeof value.cancellation_attempts === 'number' && Number.isSafeInteger(value.cancellation_attempts) &&
+    (value.last_cancel_result === null || typeof value.last_cancel_result === 'string') &&
+    (value.error === null || typeof value.error === 'string') &&
+    (identityFieldsAbsent || identityIsNull || identityIsValid) &&
+    (identityFieldsAbsent || identityIsNull || (value.creation_state === 'accepted' && value.run_id !== null && value.server_url !== null)) &&
+    (observationAbsent || observationIsValid) && observationMatches &&
+    (value.run_state !== 'failed' || value.cleanup_state !== 'confirmed' ||
+      (bindingIsValid && submittedPlatform(value.submitted_config_body) === 'aks' && value.config_binding_error === null &&
+        isLauncherTerminalObservation(value.terminal_observation) &&
+        hasConfirmedAksFailure(value.terminal_observation.status)));
+}
+
+function isLauncherTerminalObservation(value: unknown): value is LauncherTerminalObservation {
+  if (!isRecord(value) || typeof value.observed_at_unix_ms !== 'number' || !Number.isSafeInteger(value.observed_at_unix_ms) ||
+      !isRecord(value.status)) return false;
+  const status = value.status;
+  return typeof status.id === 'string' && ['succeeded', 'failed', 'cancelled'].includes(String(status.state)) &&
+    typeof status.progress === 'string' && typeof status.result_count === 'number' &&
+    (status.error === null || typeof status.error === 'string') &&
+    (status.config_sha256 === null || typeof status.config_sha256 === 'string');
+}
+
+function isLocalOatServerUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'http:' && !url.username && !url.password &&
+      ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname);
+  } catch {
+    return false;
+  }
+}
+
+
+type AksDispositionApproval = Readonly<{
+  kind: 'legacy' | 'observed-failed-preload-aks' | 'aborted-post-load-aks' | 'owned-controller-crash-aks';
+  invocationId?: string;
+  invocationIdSha256?: string;
+  receiptSha256: string;
+  evidenceSha256: string;
+}>;
+// Add a pin only in a separately reviewed commit, after independent verification of the private evidence.
+const approvedAksDispositions: readonly AksDispositionApproval[] = [{
+  kind: 'legacy',
+  invocationId: '03faac03-c21a-40e8-a8a1-51aaf6b33935',
+  receiptSha256: 'd97388ee46db160ba1af11ffaa78ded694331a414ba4d4fc9774bbbc7cce75d7',
+  evidenceSha256: '947d0f27d31e97b9f9dcc960a4d40bf6f1dc1d3bff2fe6e700aa1c9a1513e735',
+}, {
+  kind: 'observed-failed-preload-aks',
+  invocationId: '05b00915-2853-4c7a-b2bb-5dbb49bcd0ed',
+  receiptSha256: '4767d66381b97fbb6d3bc612190bd939a9dd73c23af46f72d0e0b3fed7246fb1',
+  evidenceSha256: '0f2833b1a3a17194d3265abdccd64b4160c776ed9d342125f41f5222619112eb',
+}, {
+  kind: 'aborted-post-load-aks',
+  invocationIdSha256: '937f85c5f98a516c812a15ec65f6e38f78553bc90ed4704f416ff1696490a5f1',
+  receiptSha256: '484d3debc9d9b57e2d33f41a4e79454bcc50e33eb917d3bdb55fc775813343a3',
+  evidenceSha256: '5fdb534cf2eab9fb3500c4910c6f57914257a90243aea11387ac0e2cd87c0c49',
+}, {
+  kind: 'owned-controller-crash-aks',
+  invocationIdSha256: 'a2482cf617dcb1b29962adedf52fc739d541d65394492f37e988e5ee2d57b4fe',
+  receiptSha256: '823468abd4110b76b3a459bc755781a974a38979925b6259b6960aff3e379ed3',
+  evidenceSha256: '8076867c8c69bca002e114ef2e1d5be4de3cd14f665a2354a8931ff7bf920783',
+}];
+const legacyDispositionSuffix = '.failed-aks-disposition';
+const legacyPreloadError = 'maintenance omitted effective per-table operationTimeout before load admission';
+const legacyUuid = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/;
+const legacySha256 = /^[a-f0-9]{64}$/;
+const sha256Bytes = (bytes: Buffer) => createHash('sha256').update(bytes).digest('hex');
+const isLegacyUuid = (value: unknown): value is string => typeof value === 'string' && legacyUuid.test(value);
+const isLegacySha = (value: unknown): value is string => typeof value === 'string' && legacySha256.test(value);
+const isLegacyTime = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
+const isLegacyIdentity = (value: unknown): value is string => typeof value === 'string' && value.trim().length > 0;
+
+async function readLegacyRegularFile(path: string): Promise<Buffer> {
+  const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    const info = await file.stat();
+    if (!info.isFile() || info.size > 1024 * 1024) throw new Error('Legacy AKS recovery requires a bounded regular file');
+    return await file.readFile();
+  } finally {
+    await file.close();
+  }
+}
+
+function validateLegacyAksDisposition(original: Buffer, evidence: Buffer, approval: AksDispositionApproval) {
+  if (sha256Bytes(original) !== approval.receiptSha256 || sha256Bytes(evidence) !== approval.evidenceSha256) {
+    throw new Error('Legacy AKS disposition does not match the reviewed receipt and evidence digests');
+  }
+  const receipt: unknown = JSON.parse(original.toString('utf8'));
+  const proof: unknown = JSON.parse(evidence.toString('utf8'));
+  if (!isLauncherDeadlineReceipt(receipt) || receipt.invocation_id !== approval.invocationId ||
+      receipt.creation_state !== 'accepted' || receipt.run_state !== 'failed' || receipt.cleanup_state !== 'unsettled' ||
+      receipt.terminal_observation !== null || receipt.config_binding_error !== null || receipt.cancellation_attempts !== 0 ||
+      receipt.last_cancel_result !== null || receipt.server_pid !== null || receipt.server_start_ticks !== null ||
+      receipt.server_executable !== null || receipt.deadline_at_unix_ms !== null || receipt.deadline_seconds !== null ||
+      receipt.submitted_config_body === null || submittedPlatform(receipt.submitted_config_body) !== 'aks' ||
+      !isLegacyUuid(receipt.run_id) || !receipt.server_url || !isLocalOatServerUrl(receipt.server_url) ||
+      !isRecord(proof) || proof.schema_version !== 1 || proof.disposition !== 'failed-before-load-cleanup-verified' ||
+      proof.invocation_id !== receipt.invocation_id || proof.original_receipt_sha256 !== approval.receiptSha256 ||
+      proof.server_url !== receipt.server_url || !isLegacySha(proof.raw_evidence_sha256) ||
+      !isLegacySha(proof.verifier_sha256) || !isLegacySha(proof.runner_source_sha256)) {
+    throw new Error('Legacy AKS disposition is not bound to the exact accepted failed invocation');
+  }
+  const config: unknown = JSON.parse(receipt.submitted_config_body);
+  const terminal = proof.terminal_get;
+  const cell = proof.cell;
+  const fence = proof.writer_fence;
+  const observationHashes = proof.raw_observation_sha256;
+  if (!isRecord(config) || !Array.isArray(config.tables) || config.tables.length !== 1 ||
+      !Array.isArray(config.replica_counts) || config.replica_counts.length !== 1 || config.replica_counts[0] !== 1 ||
+      !Array.isArray(config.dfe_worker_concurrency) || config.dfe_worker_concurrency.length !== 1 ||
+      (config.clients_per_table_sweep != null && (!Array.isArray(config.clients_per_table_sweep) ||
+        config.clients_per_table_sweep.length !== 1)) ||
+      !isRecord(terminal) || terminal.id !== receipt.run_id || terminal.config_sha256 !== receipt.submitted_config_sha256 ||
+      terminal.state !== 'failed' || terminal.error !== legacyPreloadError || terminal.result_count !== 0 ||
+      !isLegacyTime(terminal.started_at_unix_ms) || !isLegacyTime(terminal.finished_at_unix_ms) ||
+      terminal.started_at_unix_ms < receipt.started_at_unix_ms || terminal.finished_at_unix_ms < terminal.started_at_unix_ms ||
+      !isRecord(cell) || !isLegacyUuid(cell.id) || !isLegacyUuid(cell.namespace_uid) ||
+      cell.namespace !== 'arrow-collector-' + cell.id.replaceAll('-', '') ||
+      !isLegacyIdentity(cell.aks_id) || !isLegacyIdentity(cell.api_origin) || !isLegacyIdentity(cell.owner_token) ||
+      !isLegacyIdentity(cell.fic_id) || !isLegacyIdentity(cell.fic_subject) ||
+      !isRecord(observationHashes) ||
+      !['terminal_get', 'single_cell_trace', 'fic_ready', 'workload_stop_trace', 'process_exit',
+        'namespace_get', 'fic_inventory'].every((name) =>
+        isLegacySha(observationHashes[name])) ||
+      cell.qap !== 'not-attempted' || cell.result_artifact !== 'retained-unranked' ||
+      !isRecord(fence) || !isLegacyUuid(fence.boot_id) || !isLegacyIdentity(fence.pid_namespace) ||
+      !isLegacyIdentity(fence.net_namespace) ||
+      !isRecord(fence.launcher) || !isRecord(fence.server) ||
+      !isLegacyTime(fence.launcher.pid) || !isLegacyTime(fence.server.pid) ||
+      fence.launcher.pid === fence.server.pid || fence.server.ppid !== fence.launcher.pid ||
+      !isLegacyIdentity(fence.launcher.start_ticks) || !isLegacyIdentity(fence.server.start_ticks) ||
+      !/^[1-9][0-9]*$/.test(fence.server.start_ticks) ||
+      !isLegacyIdentity(fence.launcher.executable) || !isLegacyIdentity(fence.server.executable) ||
+      !isLegacyTime(fence.fenced_at_unix_ms) || fence.fenced_at_unix_ms < terminal.finished_at_unix_ms ||
+      !isLegacyTime(cell.namespace_absent_at_unix_ms) || !isLegacyTime(cell.fic_absent_at_unix_ms) ||
+      cell.namespace_absent_at_unix_ms < fence.fenced_at_unix_ms || cell.fic_absent_at_unix_ms < fence.fenced_at_unix_ms) {
+    throw new Error('Legacy AKS disposition lacks coherent single-cell, pre-load, fencing, or absence evidence');
+  }
+  return {
+    bootId: fence.boot_id, pidNamespace: fence.pid_namespace, netNamespace: fence.net_namespace,
+    launcherPid: fence.launcher.pid, serverPid: fence.server.pid, serverStartTicks: fence.server.start_ticks,
+    serverUrl: receipt.server_url, namespaceObserved: cell.namespace_absent_at_unix_ms, ficObserved: cell.fic_absent_at_unix_ms,
+  };
+}
+
+function validateObservedAksDisposition(original: Buffer, evidence: Buffer, approval: AksDispositionApproval) {
+  if (sha256Bytes(original) !== approval.receiptSha256 || sha256Bytes(evidence) !== approval.evidenceSha256) {
+    throw new Error('Observed AKS disposition does not match the reviewed receipt and evidence digests');
+  }
+  const receipt: unknown = JSON.parse(original.toString('utf8'));
+  const proof: unknown = JSON.parse(evidence.toString('utf8'));
+  if (!isLauncherDeadlineReceipt(receipt) || receipt.invocation_id !== approval.invocationId ||
+      receipt.creation_state !== 'accepted' || receipt.run_state !== 'failed' || receipt.cleanup_state !== 'unsettled' ||
+      receipt.config_binding_error !== null || submittedPlatform(receipt.submitted_config_body) !== 'aks' ||
+      !isLegacyUuid(receipt.run_id) || !receipt.server_url || !isLocalOatServerUrl(receipt.server_url) ||
+      !isRecord(proof) || proof.schema_version !== 1 || proof.kind !== approval.kind ||
+      proof.disposition !== 'failed-before-load-cleanup-verified' || proof.invocation_id !== receipt.invocation_id ||
+      proof.original_receipt_sha256 !== approval.receiptSha256 || proof.server_url !== receipt.server_url ||
+      !isLegacySha(proof.raw_evidence_sha256) || !isLegacySha(proof.verifier_sha256) || !isLegacySha(proof.runner_source_sha256)) {
+    throw new Error('Observed AKS disposition is not bound to the exact accepted failed invocation');
+  }
+  const observation = receipt.terminal_observation;
+  const terminal = observation?.status;
+  if (!observation || !terminal || !isDeepStrictEqual(proof.terminal_observation, observation) ||
+      !isDeepStrictEqual(proof.terminal_get, terminal) ||
+      terminal.id !== receipt.run_id || terminal.config_sha256 !== receipt.submitted_config_sha256 ||
+      terminal.state !== 'failed' || terminal.result_count !== 0 ||
+      ('aks_cleanup_confirmed' in terminal && terminal.aks_cleanup_confirmed !== false) ||
+      !terminal.error?.includes('run-table initializer publisher drain was not positively confirmed') ||
+      !isLegacyTime(receipt.started_at_unix_ms) ||
+      !isLegacyTime(terminal.started_at_unix_ms) || !isLegacyTime(terminal.finished_at_unix_ms) ||
+      terminal.started_at_unix_ms < receipt.started_at_unix_ms || terminal.finished_at_unix_ms < terminal.started_at_unix_ms ||
+      observation.observed_at_unix_ms < terminal.finished_at_unix_ms) {
+    throw new Error('Observed AKS disposition requires the exact owned failed terminal observation without results or cleanup confirmation');
+  }
+  const fence = proof.writer_fence;
+  if (!isRecord(fence) || !isLegacyUuid(fence.boot_id) || !isLegacyIdentity(fence.pid_namespace) ||
+      !isLegacyIdentity(fence.net_namespace) || !isRecord(fence.launcher) || !isRecord(fence.server) ||
+      !isLegacyTime(fence.launcher.pid) || !isLegacyTime(fence.server.pid) ||
+      fence.launcher.pid === fence.server.pid || fence.server.ppid !== fence.launcher.pid ||
+      !isLegacyIdentity(fence.launcher.start_ticks) || !/^[1-9][0-9]*$/.test(fence.launcher.start_ticks) ||
+      !isLegacyIdentity(fence.server.start_ticks) || !/^[1-9][0-9]*$/.test(fence.server.start_ticks) ||
+      !isLegacyIdentity(fence.launcher.executable) || !isLegacyIdentity(fence.server.executable) ||
+      fence.server.pid !== receipt.server_pid || fence.server.start_ticks !== receipt.server_start_ticks ||
+      fence.server.executable !== receipt.server_executable ||
+      !isLegacyTime(fence.fenced_at_unix_ms) || fence.fenced_at_unix_ms < observation.observed_at_unix_ms) {
+    throw new Error('Observed AKS disposition lacks the exact recorded server and writer fence');
+  }
+  const cell = proof.cell;
+  const storage = proof.storage;
+  const hashes = proof.raw_observation_sha256;
+  if (!isRecord(cell) || !isLegacyUuid(cell.id) || !isLegacyUuid(cell.namespace_uid) ||
+      cell.namespace !== 'arrow-collector-' + cell.id.replaceAll('-', '') ||
+      cell.namespace_absent !== true || cell.namespace_uid_absent !== true ||
+      !isLegacyIdentity(cell.run_fic_id) || !isLegacyIdentity(cell.native_fic_id) ||
+      cell.run_fic_id.toLowerCase() === cell.native_fic_id.toLowerCase() ||
+      cell.run_fic_absent !== true || cell.native_fic_present !== true ||
+      cell.qap !== 'not-attempted' || cell.result_artifact !== 'retained-unranked' ||
+      !isLegacyTime(cell.namespace_absent_at_unix_ms) || cell.namespace_absent_at_unix_ms < fence.fenced_at_unix_ms ||
+      !isLegacyTime(cell.fic_observed_at_unix_ms) || cell.fic_observed_at_unix_ms < fence.fenced_at_unix_ms ||
+      !isRecord(storage) || !isLegacyTime(storage.observed_at_unix_ms) || storage.observed_at_unix_ms < fence.fenced_at_unix_ms ||
+      storage.delta_run_blob_count !== 0 || storage.control_run_blob_count !== 0 ||
+      storage.checkpoint_lease_state !== 'available' || storage.checkpoint_lease_status !== 'unlocked' ||
+      storage.publisher_registry_entry_count !== 0 ||
+      !isRecord(hashes) || !['terminal_get', 'single_cell_trace', 'process_exit', 'namespace_get', 'fic_inventory',
+        'delta_run_blobs', 'control_run_blobs', 'checkpoint_container', 'publisher_registry'].every((name) =>
+        isLegacySha(hashes[name]))) {
+    throw new Error('Observed AKS disposition lacks coherent cell, FIC, or storage readback evidence');
+  }
+  return {
+    bootId: fence.boot_id, pidNamespace: fence.pid_namespace, netNamespace: fence.net_namespace,
+    launcherPid: fence.launcher.pid, serverPid: fence.server.pid, serverStartTicks: fence.server.start_ticks,
+    serverUrl: receipt.server_url, namespaceObserved: cell.namespace_absent_at_unix_ms, ficObserved: cell.fic_observed_at_unix_ms,
+    storageObserved: storage.observed_at_unix_ms, fencedAt: fence.fenced_at_unix_ms,
+  };
+}
+
+function validateAbortedPostLoadAksDisposition(original: Buffer, evidence: Buffer, approval: AksDispositionApproval) {
+  if (sha256Bytes(original) !== approval.receiptSha256 || sha256Bytes(evidence) !== approval.evidenceSha256) {
+    throw new Error('Post-load AKS disposition does not match the reviewed receipt and evidence digests');
+  }
+  const receipt: unknown = JSON.parse(original.toString('utf8'));
+  const proof: unknown = JSON.parse(evidence.toString('utf8'));
+  if (!isLauncherDeadlineReceipt(receipt) ||
+      !(receipt.invocation_id === approval.invocationId ||
+        sha256Bytes(Buffer.from(receipt.invocation_id)) === approval.invocationIdSha256) ||
+      receipt.creation_state !== 'accepted' || receipt.run_state !== 'failed' || receipt.cleanup_state !== 'unsettled' ||
+      receipt.config_binding_error !== null || receipt.terminal_observation != null ||
+      receipt.server_pid != null || receipt.server_start_ticks != null || receipt.server_executable != null ||
+      submittedPlatform(receipt.submitted_config_body) !== 'aks' || !isLegacyUuid(receipt.run_id) ||
+      !receipt.server_url || !isLocalOatServerUrl(receipt.server_url) ||
+      !isLegacyIdentity(receipt.error) || !isLegacyTime(receipt.started_at_unix_ms) ||
+      !isRecord(proof) || proof.schema_version !== 1 || proof.kind !== approval.kind ||
+      proof.disposition !== 'aborted-post-load-cleanup-verified-unranked' ||
+      proof.invocation_id !== receipt.invocation_id || proof.controller_run_id !== receipt.run_id ||
+      proof.original_receipt_sha256 !== approval.receiptSha256 ||
+      proof.source_config_sha256 !== receipt.source_config_sha256 ||
+      proof.submitted_config_sha256 !== receipt.submitted_config_sha256 ||
+      proof.original_error !== receipt.error || proof.server_url !== receipt.server_url ||
+      proof.proof_kind !== 'fresh_census_absence' || proof.historical_process_identity_proven !== false ||
+      !isLegacyIdentity(proof.job_id) || !/^[a-f0-9]{12}$/.test(proof.job_id) ||
+      proof.client_pod_ran !== true || proof.result_artifact !== 'diagnostics-retained-unranked' ||
+      proof.ranking !== null || proof.throughput_claim !== null ||
+      !isLegacySha(proof.verifier_sha256) || !isLegacySha(proof.runner_source_sha256)) {
+    throw new Error('Post-load AKS disposition is not bound to the exact failed invocation and original evidence');
+  }
+  const census = proof.census;
+  const cell = proof.cell;
+  const pools = proof.pools;
+  const cluster = proof.cluster;
+  const hashes = proof.raw_observation_sha256;
+  const userPools: unknown[] = isRecord(pools) && Array.isArray(pools.user_pools) ? pools.user_pools : [];
+  if (!isRecord(census) || !isLegacyUuid(census.boot_id) || !isLegacyIdentity(census.pid_namespace) ||
+      !isLegacyIdentity(census.net_namespace) || !isLegacyIdentity(census.host_target) ||
+      !isLegacyIdentity(census.lease_id) || !/^ls-[a-f0-9]+$/.test(census.lease_id) || census.lease_active !== true ||
+      !isLegacyTime(census.controller_pid) || !isLegacyIdentity(census.controller_executable) ||
+      census.controller_port !== Number(new URL(receipt.server_url).port) ||
+      census.controller_pid_allocated !== false || census.launcher_match_count !== 0 ||
+      census.controller_match_count !== 0 || census.listener_count !== 0 ||
+      !isLegacyTime(census.boot_started_at_unix_ms) || census.boot_started_at_unix_ms >= receipt.started_at_unix_ms ||
+      !isLegacyTime(census.container_started_at_unix_ms) ||
+      census.container_started_at_unix_ms >= receipt.started_at_unix_ms ||
+      !isLegacyTime(census.observed_at_unix_ms) || census.observed_at_unix_ms < receipt.started_at_unix_ms ||
+      !isRecord(cell) || !isLegacyUuid(cell.id) || !isLegacyUuid(cell.namespace_uid) ||
+      cell.namespace !== 'arrow-collector-' + cell.id.replaceAll('-', '') ||
+      cell.namespace_absent !== true || cell.namespace_uid_absent !== true ||
+      cell.controller_pod_count !== 0 ||
+      cell.workload_delete_succeeded !== true || cell.qap !== 'cleaned' ||
+      cell.run_fic_id !== 'arrowcol-run-' + cell.id || cell.run_fic_absent !== true ||
+      !isLegacyIdentity(cell.native_fic_id) || cell.native_fic_id === cell.run_fic_id || cell.native_fic_present !== true ||
+      !isLegacyTime(cell.namespace_observed_at_unix_ms) || cell.namespace_observed_at_unix_ms < receipt.started_at_unix_ms ||
+      !isLegacyTime(cell.fic_observed_at_unix_ms) || cell.fic_observed_at_unix_ms < receipt.started_at_unix_ms ||
+      !isLegacyTime(cell.qap_observed_at_unix_ms) || cell.qap_observed_at_unix_ms < receipt.started_at_unix_ms ||
+      cell.fic_inventory_count !== 1 ||
+      !isRecord(cluster) || !isLegacySha(cluster.stamp_config_sha256) ||
+      !isLegacyIdentity(cluster.stock_aks_id) || cluster.arm_aks_id !== cluster.stock_aks_id ||
+      !isLegacyIdentity(cluster.stock_api_server) || cluster.current_api_server !== cluster.stock_api_server ||
+      !isRecord(pools) || pools.all_user_pools_inventoried !== true || !Array.isArray(pools.user_pools) ||
+      !Array.isArray(pools.stamp_user_pool_names) || pools.stamp_user_pool_names.length !== pools.user_pools.length ||
+      !pools.stamp_user_pool_names.every(isLegacyIdentity) ||
+      pools.user_pools.length === 0 || !isLegacyTime(pools.observed_at_unix_ms) ||
+      pools.observed_at_unix_ms < receipt.started_at_unix_ms ||
+      !userPools.every((pool: unknown) => isRecord(pool) && isLegacyIdentity(pool.name) &&
+        pool.arm_count === 0 && pool.arm_min_count === 0 && pool.arm_max_count === 1 &&
+        pool.provisioning_state === 'Succeeded' && pool.kubernetes_node_count === 0) ||
+      new Set(userPools.map((pool) => isRecord(pool) && typeof pool.name === 'string' ? pool.name.toLowerCase() : '')).size !== pools.user_pools.length ||
+      new Set(pools.stamp_user_pool_names.map((name: string) => name.toLowerCase())).size !== pools.user_pools.length ||
+      !pools.stamp_user_pool_names.every((name: string) => userPools.some(
+        (pool) => isRecord(pool) && typeof pool.name === 'string' && pool.name.toLowerCase() === name.toLowerCase())) ||
+      !isRecord(hashes) || !['load_trace', 'controller_identity', 'owning_job_terminal', 'lease', 'census', 'workload_stop',
+        'namespace_get', 'qap_cleanup', 'fic_cleanup', 'fic_inventory', 'cluster_inventory', 'pool_inventory', 'node_inventory']
+        .every((name) => isLegacySha(hashes[name]))) {
+    throw new Error('Post-load AKS disposition lacks coherent writer, cell, QAP, FIC, or pool custody evidence');
+  }
+  return {
+    bootId: census.boot_id, pidNamespace: census.pid_namespace, netNamespace: census.net_namespace,
+    serverPid: census.controller_pid,
+    serverUrl: receipt.server_url, namespaceObserved: cell.namespace_observed_at_unix_ms,
+    ficObserved: cell.fic_observed_at_unix_ms, poolObserved: pools.observed_at_unix_ms,
+    censusObserved: census.observed_at_unix_ms,
+  };
+}
+
+function validateOwnedControllerCrashDisposition(original: Buffer, evidence: Buffer, approval: AksDispositionApproval) {
+  if (sha256Bytes(original) !== approval.receiptSha256 || sha256Bytes(evidence) !== approval.evidenceSha256) {
+    throw new Error('Owned controller crash disposition does not match the reviewed receipt and evidence digests');
+  }
+  const receipt: unknown = JSON.parse(original.toString('utf8'));
+  const proof: unknown = JSON.parse(evidence.toString('utf8'));
+  if (!isLauncherDeadlineReceipt(receipt) ||
+      !(receipt.invocation_id === approval.invocationId ||
+        sha256Bytes(Buffer.from(receipt.invocation_id)) === approval.invocationIdSha256) ||
+      receipt.creation_state !== 'accepted' || receipt.run_state !== 'queued' || receipt.cleanup_state !== 'unsettled' ||
+      receipt.terminal_observation !== null || receipt.config_binding_error !== null || receipt.error !== 'fetch failed' ||
+      !isLegacyTime(receipt.started_at_unix_ms) || !isLegacyUuid(receipt.run_id) ||
+      !isLegacyTime(receipt.server_pid) || !isLegacyIdentity(receipt.server_start_ticks) ||
+      !/^[1-9][0-9]*$/.test(receipt.server_start_ticks) || !isLegacyIdentity(receipt.server_executable) ||
+      !receipt.server_url || !isLocalOatServerUrl(receipt.server_url) ||
+      submittedPlatform(receipt.submitted_config_body) !== 'aks' ||
+      !isRecord(proof) || proof.schema_version !== 1 || proof.kind !== approval.kind ||
+      proof.disposition !== 'controller-crash-cleanup-verified-unranked' ||
+      proof.invocation_id !== receipt.invocation_id || proof.controller_run_id !== receipt.run_id ||
+      proof.original_receipt_sha256 !== approval.receiptSha256 ||
+      proof.source_config_sha256 !== receipt.source_config_sha256 ||
+      proof.submitted_config_sha256 !== receipt.submitted_config_sha256 || proof.server_url !== receipt.server_url ||
+      proof.controller_running_observed !== true || proof.crash_kind !== 'tokio-worker-stack-overflow' ||
+      proof.historical_admission !== 'unknown' || proof.historical_process_namespace_proven !== false ||
+      proof.terminal_observation !== null || proof.ranking !== null || proof.throughput_claim !== null ||
+      !isLegacySha(proof.verifier_sha256) || !isLegacySha(proof.runner_source_sha256)) {
+    throw new Error('Owned controller crash disposition is not bound to the exact unsettled invocation');
+  }
+  const census = proof.census;
+  const cell = proof.cell;
+  const cluster = proof.cluster;
+  const pools = proof.pools;
+  const hashes = proof.raw_observation_sha256;
+  const userPools: unknown[] = isRecord(pools) && Array.isArray(pools.user_pools) ? pools.user_pools : [];
+  const systemPool = isRecord(pools) ? pools.stamp_system_pool_name : undefined;
+  const armPoolNames: unknown = isRecord(pools) ? pools.arm_pool_names : undefined;
+  const serverUrl = new URL(receipt.server_url);
+  if (serverUrl.hostname !== '127.0.0.1' || !serverUrl.port || serverUrl.href !== serverUrl.origin + '/' ||
+      !isRecord(census) || !isLegacyUuid(census.boot_id) || !isLegacyIdentity(census.pid_namespace) ||
+      !isLegacyIdentity(census.net_namespace) || !isLegacyIdentity(census.host_target) ||
+      !isLegacyIdentity(census.lease_id) || !/^ls-[a-f0-9]+$/.test(census.lease_id) || census.lease_active !== true ||
+      census.controller_pid !== receipt.server_pid || census.controller_start_ticks !== receipt.server_start_ticks ||
+      census.controller_executable !== receipt.server_executable ||
+      !['absent', 'zombie'].includes(String(census.controller_state)) ||
+      census.launcher_match_count !== 0 || census.controller_match_count !== 0 || census.helper_match_count !== 0 ||
+      !Array.isArray(census.helpers) || census.helpers.length === 0 ||
+      !census.helpers.every((helper: unknown) => isRecord(helper) && isLegacyTime(helper.pid) &&
+        helper.pid !== receipt.server_pid && isLegacyIdentity(helper.start_ticks) && /^[1-9][0-9]*$/.test(helper.start_ticks) &&
+        isLegacyIdentity(helper.executable) && (helper.state === 'absent' || helper.state === 'zombie')) ||
+      new Set(census.helpers.map((helper: { pid: number }) => helper.pid)).size !== census.helpers.length ||
+      !Array.isArray(census.closed_ports) || !census.closed_ports.includes(Number(new URL(receipt.server_url).port)) ||
+      census.closed_ports.length !== 3 || !census.closed_ports.every((port: unknown) =>
+        typeof port === 'number' && Number.isInteger(port) && port > 0 && port <= 65535) ||
+      new Set(census.closed_ports).size !== census.closed_ports.length ||
+      !isLegacyTime(census.observed_at_unix_ms) || census.observed_at_unix_ms < receipt.started_at_unix_ms ||
+      !isRecord(cell) || !isLegacyUuid(cell.id) || !isLegacyUuid(cell.namespace_uid) ||
+      cell.namespace !== 'arrow-collector-' + cell.id.replaceAll('-', '') ||
+      cell.delete_precondition_uid !== cell.namespace_uid || cell.delete_response_uid !== cell.namespace_uid ||
+      cell.delete_succeeded !== true || cell.namespace_absent !== true || cell.namespace_uid_absent !== true ||
+      cell.controller_pod_count !== 0 || cell.run_fic_id !== 'arrowcol-run-' + cell.id ||
+      cell.run_fic_deleted !== true || cell.run_fic_absent !== true ||
+      !isLegacyIdentity(cell.native_fic_id) || cell.native_fic_id === cell.run_fic_id ||
+      cell.native_fic_present !== true || cell.fic_inventory_count !== 1 ||
+      !isLegacyTime(cell.namespace_observed_at_unix_ms) || cell.namespace_observed_at_unix_ms < receipt.started_at_unix_ms ||
+      !isLegacyTime(cell.fic_observed_at_unix_ms) || cell.fic_observed_at_unix_ms < receipt.started_at_unix_ms ||
+      !isRecord(cluster) || !isLegacySha(cluster.stamp_config_sha256) ||
+      !isLegacyIdentity(cluster.stock_aks_id) || cluster.arm_aks_id !== cluster.stock_aks_id ||
+      !isLegacyIdentity(cluster.stock_api_server) || cluster.current_api_server !== cluster.stock_api_server ||
+      !isRecord(pools) || pools.all_user_pools_inventoried !== true || !Array.isArray(pools.user_pools) ||
+      !Array.isArray(pools.stamp_user_pool_names) || pools.stamp_user_pool_names.length !== pools.user_pools.length ||
+      !pools.stamp_user_pool_names.every(isLegacyIdentity) || pools.user_pools.length === 0 ||
+      !isLegacyIdentity(systemPool) || !Array.isArray(armPoolNames) ||
+      armPoolNames.length !== pools.user_pools.length + 1 || !armPoolNames.every(isLegacyIdentity) ||
+      new Set(armPoolNames.map((name: string) => name.toLowerCase())).size !== armPoolNames.length ||
+      !armPoolNames.some((name: string) => name.toLowerCase() === systemPool.toLowerCase()) ||
+      pools.stamp_user_pool_names.some((name: string) => name.toLowerCase() === systemPool.toLowerCase()) ||
+      !pools.stamp_user_pool_names.every((name: string) =>
+        armPoolNames.some((armName: string) => armName.toLowerCase() === name.toLowerCase())) ||
+      !isLegacyTime(pools.observed_at_unix_ms) || pools.observed_at_unix_ms < receipt.started_at_unix_ms ||
+      !userPools.every((pool: unknown) => isRecord(pool) && isLegacyIdentity(pool.name) &&
+        pool.arm_count === 0 && pool.arm_min_count === 0 && pool.arm_max_count === 1 &&
+        pool.provisioning_state === 'Succeeded' && pool.kubernetes_node_count === 0) ||
+      new Set(userPools.map((pool) => isRecord(pool) && typeof pool.name === 'string' ? pool.name.toLowerCase() : '')).size !== pools.user_pools.length ||
+      new Set(pools.stamp_user_pool_names.map((name: string) => name.toLowerCase())).size !== pools.user_pools.length ||
+      !pools.stamp_user_pool_names.every((name: string) => userPools.some(
+        (pool) => isRecord(pool) && typeof pool.name === 'string' && pool.name.toLowerCase() === name.toLowerCase())) ||
+      !isRecord(hashes) || !['admission', 'launcher_log', 'namespace_binding', 'delete_intent', 'delete_options', 'delete_response',
+        'workload_stop', 'namespace_get', 'fic_cleanup', 'fic_delete_receipt', 'fic_postcondition', 'fic_inventory',
+        'process_census', 'process_raw', 'lease', 'cluster_inventory', 'pool_inventory', 'node_inventory']
+        .every((name) => isLegacySha(hashes[name]))) {
+    throw new Error('Owned controller crash disposition lacks coherent process, namespace, FIC, or pool custody evidence');
+  }
+  return {
+    bootId: census.boot_id, pidNamespace: census.pid_namespace, netNamespace: census.net_namespace,
+    serverPid: receipt.server_pid, serverStartTicks: receipt.server_start_ticks,
+    helpers: census.helpers as { pid: number; start_ticks: string }[], closedPorts: census.closed_ports as number[],
+    namespaceObserved: cell.namespace_observed_at_unix_ms, ficObserved: cell.fic_observed_at_unix_ms,
+    poolObserved: pools.observed_at_unix_ms, censusObserved: census.observed_at_unix_ms,
+  };
+}
+
+function findAksDispositionApproval(approvals: readonly AksDispositionApproval[], invocationId: string) {
+  if (!isLegacyUuid(invocationId)) return undefined;
+  const matching = approvals.filter((approval) => approval.invocationId === invocationId ||
+    ((approval.kind === 'aborted-post-load-aks' || approval.kind === 'owned-controller-crash-aks') &&
+      approval.invocationIdSha256 === sha256Bytes(Buffer.from(invocationId))));
+  return matching.length === 1 ? matching[0] : undefined;
+}
+
+function validateAksDisposition(original: Buffer, evidence: Buffer, approval: AksDispositionApproval) {
+  switch (approval.kind) {
+    case 'legacy': return { kind: approval.kind, ...validateLegacyAksDisposition(original, evidence, approval) } as const;
+    case 'observed-failed-preload-aks': return { kind: approval.kind, ...validateObservedAksDisposition(original, evidence, approval) } as const;
+    case 'aborted-post-load-aks': return { kind: approval.kind, ...validateAbortedPostLoadAksDisposition(original, evidence, approval) } as const;
+    case 'owned-controller-crash-aks': return { kind: approval.kind, ...validateOwnedControllerCrashDisposition(original, evidence, approval) } as const;
+    default: throw new Error('Unrecognized AKS disposition kind');
+  }
+}
+
+export function isExactExitedLegacyServer(stat: string, tasks: string[], pid: number, startTicks: string): boolean {
+  const commandEnd = stat.lastIndexOf(') ');
+  if (!stat.startsWith(pid + ' (') || commandEnd < 0) return false;
+  const fields = stat.slice(commandEnd + 2).trim().split(/\s+/);
+  return fields[0] === 'Z' && fields[1] === '1' && fields[19] === startTicks &&
+    tasks.length === 1 && tasks[0] === String(pid);
+}
+
+async function legacyServerHasExited(pid: number, startTicks: string): Promise<boolean> {
+  const directory = '/proc/' + pid;
+  let statText: string;
+  try {
+    statText = await readFile(directory + '/stat', 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return true;
+    throw error;
+  }
+  return isExactExitedLegacyServer(statText, await readdir(directory + '/task'), pid, startTicks);
+}
+
+async function assertLegacyWritersAbsent(proof: ReturnType<typeof validateLegacyAksDisposition>): Promise<void> {
+  const pidAbsent = async (pid: number) => {
+    try {
+      await lstat('/proc/' + pid);
+      return false;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return true;
+      throw error;
+    }
+  };
+  if (process.platform !== 'linux' || (await readFile('/proc/sys/kernel/random/boot_id', 'utf8')).trim() !== proof.bootId ||
+      await readlink('/proc/self/ns/pid') !== proof.pidNamespace || await readlink('/proc/self/ns/net') !== proof.netNamespace ||
+      !await pidAbsent(proof.launcherPid) || !await legacyServerHasExited(proof.serverPid, proof.serverStartTicks)) {
+    throw new Error('Legacy AKS disposition requires the exact original Linux boot/PID namespace and exited launcher and server');
+  }
+  const url = new URL(proof.serverUrl);
+  if (url.hostname !== '127.0.0.1' || !url.port || url.href !== url.origin + '/') {
+    throw new Error('Legacy AKS disposition requires the original dedicated loopback listener');
+  }
+  const listenerTable = await Promise.all(['/proc/net/tcp', '/proc/net/tcp6'].map((path) => readFile(path, 'utf8')));
+  const port = Number(url.port).toString(16).padStart(4, '0').toUpperCase();
+  if (listenerTable.some((table) => table.trim().split('\n').slice(1).some((row) => {
+    const fields = row.trim().split(/\s+/);
+    return fields[3] === '0A' && fields[1]?.endsWith(':' + port);
+  }))) throw new Error('Legacy AKS listener is still present');
+}
+
+async function assertCensusWritersAbsent(proof: ReturnType<typeof validateAbortedPostLoadAksDisposition>): Promise<void> {
+  if (process.platform !== 'linux' || (await readFile('/proc/sys/kernel/random/boot_id', 'utf8')).trim() !== proof.bootId ||
+      await readlink('/proc/self/ns/pid') !== proof.pidNamespace || await readlink('/proc/self/ns/net') !== proof.netNamespace) {
+    throw new Error('Post-load AKS census requires the same Linux boot and namespaces as the reviewed census');
+  }
+  try {
+    await lstat('/proc/' + proof.serverPid);
+    throw new Error('Post-load AKS census controller PID is allocated');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  const url = new URL(proof.serverUrl);
+  if (url.hostname !== '127.0.0.1' || !url.port || url.href !== url.origin + '/') {
+    throw new Error('Post-load AKS census requires the recorded loopback listener');
+  }
+  const listenerTable = await Promise.all(['/proc/net/tcp', '/proc/net/tcp6'].map((path) => readFile(path, 'utf8')));
+  const port = Number(url.port).toString(16).padStart(4, '0').toUpperCase();
+  if (listenerTable.some((table) => table.trim().split('\n').slice(1).some((row) => {
+    const fields = row.trim().split(/\s+/);
+    return fields[3] === '0A' && fields[1]?.endsWith(':' + port);
+  }))) throw new Error('Post-load AKS census listener is still present');
+}
+
+async function assertOwnedCrashWritersAbsent(proof: ReturnType<typeof validateOwnedControllerCrashDisposition>): Promise<void> {
+  if (process.platform !== 'linux' || (await readFile('/proc/sys/kernel/random/boot_id', 'utf8')).trim() !== proof.bootId ||
+      await readlink('/proc/self/ns/pid') !== proof.pidNamespace || await readlink('/proc/self/ns/net') !== proof.netNamespace) {
+    throw new Error('Owned controller crash census requires the same Linux boot and namespaces as the reviewed census');
+  }
+  for (const processIdentity of [{ pid: proof.serverPid, start_ticks: proof.serverStartTicks }, ...proof.helpers]) {
+    if (!await legacyServerHasExited(processIdentity.pid, processIdentity.start_ticks)) {
+      throw new Error('Owned controller crash process is live, reused, or not demonstrably exited');
+    }
+  }
+  const listenerTable = await Promise.all(['/proc/net/tcp', '/proc/net/tcp6'].map((path) => readFile(path, 'utf8')));
+  const ports = new Set(proof.closedPorts.map((port) => port.toString(16).padStart(4, '0').toUpperCase()));
+  if (listenerTable.some((table) => table.trim().split('\n').slice(1).some((row) => {
+    const fields = row.trim().split(/\s+/);
+    return fields[3] === '0A' && ports.has(fields[1]?.split(':').at(-1) ?? '');
+  }))) throw new Error('Owned controller crash listener is still present');
+}
+
+async function assertDispositionWritersAbsent(proof: ReturnType<typeof validateAksDisposition>): Promise<void> {
+  if (proof.kind === 'aborted-post-load-aks') return assertCensusWritersAbsent(proof);
+  if (proof.kind === 'owned-controller-crash-aks') return assertOwnedCrashWritersAbsent(proof);
+  return assertLegacyWritersAbsent(proof);
+}
+
+export async function recordLegacyAksDisposition(
+  root: string, invocationId: string, evidencePath: string, approvals = approvedAksDispositions,
+): Promise<AksDispositionApproval['kind']> {
+  const approval = findAksDispositionApproval(approvals, invocationId);
+  if (!approval) throw new Error('No reviewed legacy AKS disposition for this invocation');
+  const path = resolve(root, invocationId + '.json');
+  const disposition = path + legacyDispositionSuffix;
+  const evidence = await readLegacyRegularFile(evidencePath);
+  const original = await readLegacyRegularFile(path);
+  const proof = validateAksDisposition(original, evidence, approval);
+  if ((proof.kind === 'aborted-post-load-aks' || proof.kind === 'owned-controller-crash-aks') &&
+      ![proof.censusObserved, proof.namespaceObserved, proof.ficObserved, proof.poolObserved]
+        .every((time) => time <= Date.now() && Date.now() - time <= 60 * 60_000)) {
+    throw new Error('Legacy AKS resource absence evidence is not current');
+  }
+  const checkExisting = async () => {
+    try {
+      if (!(await readLegacyRegularFile(disposition)).equals(evidence)) throw new Error('Conflicting legacy AKS disposition');
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+      throw error;
+    }
+  };
+  if (await checkExisting()) {
+    await assertDispositionWritersAbsent(proof);
+    await syncLegacyReceiptDirectory(path);
+    return proof.kind;
+  }
+  const now = Date.now();
+  const current = proof.kind === 'aborted-post-load-aks' || proof.kind === 'owned-controller-crash-aks'
+    ? [proof.censusObserved, proof.namespaceObserved, proof.ficObserved, proof.poolObserved]
+      .every((time) => time <= now && now - time <= 60 * 60_000)
+    : proof.kind === 'observed-failed-preload-aks'
+    ? now - proof.fencedAt <= 4 * 60 * 60_000 && Math.max(proof.namespaceObserved, proof.ficObserved, proof.storageObserved) <= now
+    : [proof.namespaceObserved, proof.ficObserved].every((time) => time <= now && now - time <= 30 * 60_000);
+  if (!current) {
+    throw new Error('Legacy AKS resource absence evidence is not current');
+  }
+  await assertDispositionWritersAbsent(proof);
+  const temporary = disposition + '.' + randomUUID() + '.tmp';
+  const output = await open(temporary, 'wx', 0o600);
+  try {
+    try {
+      await output.writeFile(evidence);
+      await output.sync();
+    } finally {
+      await output.close();
+    }
+    if (!(await readLegacyRegularFile(path)).equals(original)) throw new Error('Original legacy AKS receipt changed');
+    try {
+      await link(temporary, disposition);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST' || !await checkExisting()) throw error;
+    }
+    await syncLegacyReceiptDirectory(path);
+  } finally {
+    await unlink(temporary);
+  }
+  return proof.kind;
+}
+
+export function aksDispositionMessage(kind: AksDispositionApproval['kind']): string {
+  return kind === 'owned-controller-crash-aks'
+    ? 'Recorded verified AKS cleanup disposition; original run state is unchanged and no ranking is authorized.'
+    : 'Recorded verified AKS cleanup disposition; benchmark remains failed and unranked.';
+}
+
+async function syncLegacyReceiptDirectory(path: string): Promise<void> {
+  const directory = await open(dirname(path), 'r');
+  try {
+    await directory.sync();
+  } finally {
+    await directory.close();
+  }
+}
+
+export async function assertCanonicalAksLaunchWorkspace(root: string): Promise<void> {
+  const metadata = await lstat(resolve(root, '.git')).catch((error: unknown) => {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return undefined;
+    throw error;
+  });
+  if (!metadata?.isDirectory()) {
+    throw new Error(
+      `AKS benchmark submission requires the primary checkout that owns the launcher receipt ledger; refusing workspace ${root}`,
+    );
+  }
+}
+
+export async function assertNoUnsettledDeadlineReceipts(
+  root = launcherDeadlineReceiptRoot, writeReceipt = writeAtomicJson, approvals = approvedAksDispositions,
+): Promise<void> {
+  const names: string[] = await readdir(root).catch((error: unknown) => {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return [];
+    throw error;
+  });
+  const admittedDispositions = new Set<string>();
+  for (const name of names.filter((entry) => entry.endsWith(legacyDispositionSuffix))) {
+    const originalName = name.slice(0, -legacyDispositionSuffix.length);
+    const approval = originalName.endsWith('.json') ? findAksDispositionApproval(approvals, originalName.slice(0, -5)) : undefined;
+    if (!approval || !names.includes(originalName)) throw new Error('Unapproved or orphaned legacy AKS disposition');
+    const proof = validateAksDisposition(
+      await readLegacyRegularFile(resolve(root, originalName)), await readLegacyRegularFile(resolve(root, name)), approval,
+    );
+    await assertDispositionWritersAbsent(proof);
+    await syncLegacyReceiptDirectory(resolve(root, name));
+    admittedDispositions.add(originalName);
+  }
+  for (const name of names.filter((entry) => entry.endsWith('.json'))) {
+    if (admittedDispositions.has(name)) continue;
+    const path = resolve(root, name);
+    const deadline = await OatLauncherDeadline.restore(path, writeReceipt);
+    if (deadline.creationState !== 'pending' && deadline.creationState !== 'unknown' &&
+        deadline.cleanupState !== 'pending' && deadline.cleanupState !== 'unsettled') continue;
+    if (deadline.submittedPlatform === 'aks') {
+      throw new Error(`Unsettled AKS launcher receipt ${path}; refusing another run until this exact receipt is reconciled by an operator`);
+    }
+    if (deadline.submittedPlatform !== 'local') {
+      throw new Error(`Unsettled launcher deadline receipt ${path} (platform unverified); refusing another run until this exact receipt is reconciled by an operator`);
+    }
+    if (!deadline.runId || !deadline.serverUrl ||
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(deadline.runId) ||
+        !isLocalOatServerUrl(deadline.serverUrl)) {
+      const identity = deadline.runId ? `run ${deadline.runId}` : 'run identity UNKNOWN';
+      throw new Error(`Unsettled launcher deadline receipt ${path} (${identity}); refusing another run until this exact receipt is reconciled`);
+    }
+    try {
+      await cancelAndReconcileLocalRun(new URL(deadline.serverUrl), deadline.runId, fetch, 1000, deadline);
+    } catch (error) {
+      throw new Error(`Unsettled launcher deadline receipt ${path}; refusing another run`, { cause: error });
+    }
+    if (deadline.cleanupState !== 'confirmed') {
+      throw new Error(`Launcher deadline receipt ${path} remains unsettled; refusing another run`);
+    }
+  }
+}
+
+
+function bindSubmittedConfig(config: Record<string, unknown>, sourceBytes: Buffer): SubmittedOatConfig {
+  const submitted_config_body = JSON.stringify(config);
+  return {
+    submitted_config_body,
+    submitted_config_sha256: createHash('sha256').update(submitted_config_body, 'utf8').digest('hex'),
+    source_config_sha256: createHash('sha256').update(sourceBytes).digest('hex'),
+  };
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -175,7 +1256,7 @@ export async function cleanupLocalComposeProjects(
   }
   return [...projects];
 }
-interface LocalRunMarker {
+interface LocalRunMarker extends SubmittedOatConfig {
   version: 1;
   runId: string;
   ownerPid: number;
@@ -188,7 +1269,7 @@ interface LocalRunMarker {
 
 interface LocalRunMarkerContext {
   path: string;
-  marker: Omit<LocalRunMarker, 'runId'>;
+  marker: Omit<LocalRunMarker, 'runId' | keyof SubmittedOatConfig>;
 }
 
 function localStateRoot(config: Record<string, unknown>): string {
@@ -239,18 +1320,30 @@ async function prepareLocalRunMarker(config: Record<string, unknown>, server: {
       ownerStartTicks,
       serverPid,
       serverStartTicks,
-      serverUrl: server.url,
+      serverUrl: new URL(server.url).href,
       serverExecutable: await realpath(server.executable),
     },
   };
 }
 
-async function persistLocalRunMarker(context: LocalRunMarkerContext, status: OatRunStatus): Promise<void> {
+async function persistLocalRunMarker(context: LocalRunMarkerContext, status: OatRunStatus, binding: SubmittedOatConfig): Promise<void> {
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(status.id)) {
     throw new Error('OAT server returned a noncanonical run ID; local recovery marker was not written');
   }
-  const marker: LocalRunMarker = { ...context.marker, runId: status.id };
-  await writeFile(context.path, JSON.stringify(marker), { flag: 'wx', mode: 0o600 });
+  const marker: LocalRunMarker = { ...context.marker, ...binding, runId: status.id };
+  const file = await open(context.path, 'wx', 0o600);
+  try {
+    await file.writeFile(JSON.stringify(marker));
+    await file.sync();
+  } finally {
+    await file.close();
+  }
+  const directory = await open(dirname(context.path), 'r');
+  try {
+    await directory.sync();
+  } finally {
+    await directory.close();
+  }
 }
 
 function parseLocalRunMarker(text: string, markerPath: string): LocalRunMarker {
@@ -261,8 +1354,14 @@ function parseLocalRunMarker(text: string, markerPath: string): LocalRunMarker {
       typeof value.ownerStartTicks !== 'string' ||
       typeof value.serverPid !== 'number' || !Number.isSafeInteger(value.serverPid) ||
       typeof value.serverStartTicks !== 'string' ||
-      typeof value.serverUrl !== 'string' || typeof value.serverExecutable !== 'string') {
+      typeof value.serverUrl !== 'string' || typeof value.serverExecutable !== 'string' ||
+      typeof value.submitted_config_body !== 'string' ||
+      typeof value.submitted_config_sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(value.submitted_config_sha256) ||
+      typeof value.source_config_sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(value.source_config_sha256)) {
     throw new Error(`Invalid local OAT ownership marker: ${markerPath}`);
+  }
+  if (createHash('sha256').update(value.submitted_config_body, 'utf8').digest('hex') !== value.submitted_config_sha256) {
+    throw new Error(`Local OAT ownership marker config hash is invalid: ${markerPath}`);
   }
   const server = new URL(value.serverUrl);
   if (server.protocol !== 'http:' || server.hostname !== '127.0.0.1' || !server.port) {
@@ -277,13 +1376,17 @@ function parseLocalRunMarker(text: string, markerPath: string): LocalRunMarker {
     serverStartTicks: value.serverStartTicks,
     serverUrl: value.serverUrl,
     serverExecutable: value.serverExecutable,
+    submitted_config_body: value.submitted_config_body,
+    submitted_config_sha256: value.submitted_config_sha256,
+    source_config_sha256: value.source_config_sha256,
   };
 }
 
 async function cancelMarkedRun(marker: LocalRunMarker): Promise<OatRunStatus> {
   const statusUrl = new URL('/runs/' + encodeURIComponent(marker.runId), marker.serverUrl);
   let response = await fetch(statusUrl, { signal: AbortSignal.timeout(10_000) });
-  let status = await readStatus(response, 'inspect interrupted local OAT run');
+  let status = await readStatus(response, 'inspect interrupted local OAT run', marker.runId);
+  let bindingMatches = status.config_sha256 === marker.submitted_config_sha256;
   if (status.state === 'queued' || status.state === 'running') {
     response = await fetch(new URL('/runs/' + encodeURIComponent(marker.runId) + '/cancel', marker.serverUrl), {
       method: 'POST',
@@ -295,9 +1398,11 @@ async function cancelMarkedRun(marker: LocalRunMarker): Promise<OatRunStatus> {
       if (Date.now() >= deadline) throw new Error('Timed out waiting for local OAT cleanup for run ' + marker.runId);
       await new Promise((resolvePromise) => setTimeout(resolvePromise, 250));
       response = await fetch(statusUrl, { signal: AbortSignal.timeout(10_000) });
-      status = await readStatus(response, 'wait for interrupted local OAT cleanup');
+      status = await readStatus(response, 'wait for interrupted local OAT cleanup', marker.runId);
+      bindingMatches = bindingMatches && status.config_sha256 === marker.submitted_config_sha256;
     }
   }
+  if (!bindingMatches) throw new Error(`Local OAT run ${marker.runId} config hash does not match its owner marker`);
   return status;
 }
 async function stopMarkedServer(marker: LocalRunMarker): Promise<void> {
@@ -404,9 +1509,11 @@ export async function readOatConfigForMode(
   configPath: string,
   mode: 'local' | 'aks',
   bridgeGateway: () => string = getDockerBridgeGateway,
+  sourceBytes?: Buffer,
 ): Promise<Record<string, unknown>> {
-  const parsed: unknown = JSON.parse(await readFile(configPath, 'utf8'));
+  const parsed: unknown = JSON.parse((sourceBytes ?? await readFile(configPath)).toString('utf8'));
   if (!isRecord(parsed)) throw new Error('OAT config must be a JSON object');
+  parseDataFlowVerdictPolicy(parsed.dataflow_verdict_policy);
   const platform: Record<string, unknown> = isRecord(parsed.platform) ? { ...parsed.platform, kind: mode } : { kind: mode };
   if (mode === 'local' && isRecord(platform.local)) {
     const local = { ...platform.local };
@@ -420,6 +1527,138 @@ export async function readOatConfigForMode(
   return { ...parsed, platform };
 }
 
+async function cancelAndReconcileLocalRun(
+  server: URL,
+  runId: string,
+  fetcher: FetchLike,
+  pollIntervalMs: number,
+  deadline: OatLauncherDeadline,
+  initialEvidenceError?: unknown,
+): Promise<OatRunStatus> {
+  if (deadline.runId !== runId) throw new Error('Cleanup run ID differs from the accepted OAT run');
+  const cleanupDeadlineAtUnixMs = await deadline.ensureCleanupDeadline();
+  const cleanupDeadlineAtMonotonicMs = performance.now() + Math.max(0, cleanupDeadlineAtUnixMs - Date.now());
+  let cancellationAttempted = deadline.cancellationAttempts !== 0;
+  let firstRead = true;
+  let evidenceError = initialEvidenceError;
+  let lastError: unknown = new Error('no cancellation response received');
+  const note = async (operation: () => Promise<void>): Promise<void> => {
+    try {
+      await operation();
+      evidenceError = undefined;
+    } catch (error) {
+      evidenceError = error;
+    }
+  };
+  const remainingMs = (): number => Math.min(cleanupDeadlineAtUnixMs - Date.now(), cleanupDeadlineAtMonotonicMs - performance.now());
+  const wait = async (): Promise<void> => {
+    const remaining = remainingMs();
+    if (remaining > 0) await new Promise<void>((resolveWait) => setTimeout(resolveWait, Math.min(pollIntervalMs, remaining)));
+  };
+  const cancelSignal = (): AbortSignal => {
+    const remaining = remainingMs();
+    if (remaining <= 0) throw new Error('Persisted OAT cleanup budget expired before cancellation dispatch');
+    return AbortSignal.timeout(Math.max(1, Math.min(30_000, Math.floor(remaining))));
+  };
+
+  while (firstRead || remainingMs() > 0) {
+    firstRead = false;
+    let response: Response;
+    try {
+      response = await fetcher(new URL('/runs/' + encodeURIComponent(runId), server), { signal: AbortSignal.timeout(10_000) });
+    } catch (error) {
+      lastError = error;
+      if (remainingMs() <= 0) break;
+      await wait();
+      continue;
+    }
+    if (!response.ok) {
+      if (response.status >= 500 || response.status === 408 || response.status === 429) {
+        lastError = new Error(`Run status read returned HTTP ${response.status}`);
+        if (remainingMs() <= 0) break;
+        await wait();
+        continue;
+      }
+      const error = new Error(`Could not reconcile local OAT run ${runId}: HTTP ${response.status}`);
+      await note(() => deadline.markUnsettled(error));
+      throw error;
+    }
+    let status: OatRunStatus;
+    try {
+      status = await readStatus(response, 'reconcile local OAT run', runId);
+    } catch (error) {
+      await note(() => deadline.markUnsettled(error));
+      throw error;
+    }
+    if (deadline.submittedConfigSha256 !== null && status.config_sha256 !== deadline.submittedConfigSha256) {
+      await note(() => deadline.markBindingFailure(new Error(`OAT server config_sha256 mismatch for run ${runId}`)));
+    }
+    if (status.state !== 'queued' && status.state !== 'running') {
+      await note(() => deadline.recordTerminal(status));
+      if (evidenceError) {
+        const persistError = evidenceError;
+        const error = new Error(`OAT run ${runId} reached ${status.state}, but its terminal receipt could not be persisted`);
+        await note(() => deadline.markUnsettled(error));
+        throw new Error(error.message, { cause: persistError });
+      }
+      return status;
+    }
+
+    let attemptedCancellation = false;
+    if (!cancellationAttempted) {
+      cancellationAttempted = true;
+      attemptedCancellation = true;
+      await note(() => deadline.markCancelAttempt());
+      if (evidenceError) {
+        const persistError = evidenceError;
+        const error = new Error('Could not persist cancellation intent before dispatch');
+        await note(() => deadline.markUnsettled(error));
+        throw new Error(error.message, { cause: persistError });
+      }
+      let signalForCancel: AbortSignal;
+      try {
+        signalForCancel = cancelSignal();
+      } catch (error) {
+        await note(() => deadline.markUnsettled(error));
+        throw error;
+      }
+      let cancelResponse: Response;
+      try {
+        cancelResponse = await fetcher(new URL('/runs/' + encodeURIComponent(runId) + '/cancel', server), {
+          method: 'POST',
+          signal: signalForCancel,
+        });
+      } catch (error) {
+        lastError = error;
+        await note(() => deadline.markCancelResult('response_unknown'));
+        continue;
+      }
+      if (cancelResponse.ok) {
+        await note(() => deadline.markCancelResult('accepted'));
+      } else if (cancelResponse.status === 409) {
+        await note(() => deadline.markCancelResult('not_active'));
+      } else if (cancelResponse.status >= 500 || cancelResponse.status === 408 || cancelResponse.status === 429) {
+        lastError = new Error(`Cancel response was inconclusive (HTTP ${cancelResponse.status})`);
+        await note(() => deadline.markCancelResult('response_unknown'));
+      } else {
+        const error = new Error(`Could not cancel local OAT run ${runId}: HTTP ${cancelResponse.status}`);
+        await note(() => deadline.markCancelResult(`rejected_http_${cancelResponse.status}`));
+        await note(() => deadline.markUnsettled(error));
+        throw error;
+      }
+    }
+    if (attemptedCancellation) continue;
+    if (remainingMs() <= 0) break;
+    await wait();
+  }
+
+  const detail = lastError instanceof Error ? lastError.message : String(lastError);
+  const error = new Error(`Local OAT run ${runId} cleanup was not confirmed within the persisted ${localCancellationCleanupMs / 1000}s allowance: ${detail}`);
+  await note(() => deadline.markUnsettled(error));
+  if (evidenceError) throw new Error(`${error.message}; launcher receipt persistence also failed`, { cause: evidenceError });
+  throw error;
+}
+
 export async function launchOat(
   configPath: string,
   serverUrl = 'http://127.0.0.1:8088',
@@ -430,7 +1669,9 @@ export async function launchOat(
   bridgeGateway: () => string = getDockerBridgeGateway,
   signal?: AbortSignal,
   onRunStarted?: (status: OatRunStatus) => Promise<void>,
-  onRunFinished?: (status: OatRunStatus) => void,
+  onRunFinished?: (status: OatRunStatus) => void | Promise<void>,
+  deadline?: OatLauncherDeadline,
+  submission?: SubmittedOatConfig,
 ): Promise<OatRunStatus> {
   if (!Number.isSafeInteger(pollIntervalMs) || pollIntervalMs < 1) {
     throw new Error('poll interval must be a positive integer');
@@ -439,57 +1680,119 @@ export async function launchOat(
   if (!['http:', 'https:'].includes(server.protocol)) {
     throw new Error('server URL must use HTTP or HTTPS');
   }
-  const config = mode
-    ? await readOatConfigForMode(configPath, mode, bridgeGateway)
-    : JSON.parse(await readFile(configPath, 'utf8'));
+  const sourceBytes = submission ? undefined : await readFile(configPath);
+  const config: unknown = submission
+    ? JSON.parse(submission.submitted_config_body)
+    : mode
+      ? await readOatConfigForMode(configPath, mode, bridgeGateway, sourceBytes)
+      : JSON.parse(sourceBytes!.toString('utf8'));
   if (!isRecord(config)) throw new Error('OAT config must be a JSON object');
+  const binding = submission ?? bindSubmittedConfig(config, sourceBytes!);
+  if (deadline) await deadline.setSubmissionBinding(binding);
 
-  const startResponse = await fetcher(new URL('/runs', server), {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(config),
-    signal: AbortSignal.timeout(30_000),
-  });
-  let status = await readStatus(startResponse, 'start OAT run');
+  if (deadline) {
+    if (deadline.isExpired()) {
+      await deadline.markOverrun();
+      await deadline.markNoRun(new Error('launcher-start deadline expired before run creation'));
+      throw new Error(`Launcher-start deadline expired before OAT run creation; receipt: ${deadline.receiptPath}`);
+    }
+    await deadline.markCreationPending(server.href);
+    if (deadline.isExpired()) {
+      await deadline.markOverrun();
+      const error = new Error('launcher-start deadline expired before POST /runs');
+      await deadline.markCreationRejected(error);
+      throw error;
+    }
+  }
+
+  let startResponse: Response;
+  try {
+    startResponse = await fetcher(new URL('/runs', server), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: binding.submitted_config_body,
+      signal: AbortSignal.timeout(30_000),
+    });
+  } catch (error) {
+    if (deadline) await deadline.markCreationUnknown(error);
+    throw error;
+  }
+
+  let status: OatRunStatus;
+  try {
+    status = await readStatus(startResponse, 'start OAT run');
+  } catch (error) {
+    if (deadline) {
+      if (startResponse.status >= 400 && startResponse.status < 500) await deadline.markCreationRejected(error);
+      else await deadline.markCreationUnknown(error);
+    }
+    throw error;
+  }
+
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(status.id)) {
+    const error = new Error('OAT server returned a run ID that cannot be safely pinned');
+    if (deadline) await deadline.markCreationUnknown(error);
+    throw error;
+  }
+  const ownedRunId = status.id;
+  let bindingFailure: Error | undefined = (deadline || submission) && status.config_sha256 !== binding.submitted_config_sha256
+    ? new Error(`OAT server config_sha256 mismatch for run ${ownedRunId}`)
+    : undefined;
   let startFailure: { error: unknown } | undefined;
-  type CancellationOutcome = { ok: true } | { ok: false; error: unknown };
+  type CancellationOutcome = { ok: true; status?: OatRunStatus } | { ok: false; error: unknown };
   let cancellationRequest: Promise<CancellationOutcome> = Promise.resolve({ ok: true });
   let cancellationRequested = false;
   let cancellationObserved = false;
   let resolveCancellationStarted!: () => void;
-  const cancellationStarted = new Promise<void>((resolve) => { resolveCancellationStarted = resolve; });
+  const cancellationStarted = new Promise<void>((resolveStarted) => { resolveCancellationStarted = resolveStarted; });
+  const runSignal = deadline
+    ? signal ? AbortSignal.any([signal, deadline.signal]) : deadline.signal
+    : signal;
   const requestCancellation = (): void => {
-    if (cancellationRequested) return;
+    if (mode === 'aks' || submittedPlatform(binding.submitted_config_body) === 'aks' || cancellationRequested) return;
     cancellationRequested = true;
     resolveCancellationStarted();
-    cancellationRequest = (async (): Promise<void> => {
-      const response = await fetcher(new URL('/runs/' + encodeURIComponent(status.id) + '/cancel', server), {
+    cancellationRequest = (async (): Promise<CancellationOutcome> => {
+      if (deadline) {
+        let evidenceError: unknown;
+        if (deadline.isExpired()) {
+          try { await deadline.markOverrun(); } catch (error) { evidenceError = error; }
+        }
+        const terminal = await cancelAndReconcileLocalRun(server, ownedRunId, fetcher, pollIntervalMs, deadline, evidenceError);
+        return { ok: true, status: terminal };
+      }
+      const response = await fetcher(new URL('/runs/' + encodeURIComponent(ownedRunId) + '/cancel', server), {
         method: 'POST',
         signal: AbortSignal.timeout(30_000),
       });
-      if (!response.ok && response.status !== 409) {
-        await readStatus(response, 'cancel local OAT run');
-      }
-    })().then(
-      () => ({ ok: true as const }),
-      (error: unknown) => ({ ok: false as const, error }),
-    );
+      if (!response.ok && response.status !== 409) await readStatus(response, 'cancel local OAT run');
+      return { ok: true };
+    })().catch((error: unknown) => ({ ok: false, error }));
   };
-  if (signal?.aborted) requestCancellation();
-  else signal?.addEventListener('abort', requestCancellation, { once: true });
   try {
     try {
+      await deadline?.recordRunStarted(status);
+      if (runSignal?.aborted) requestCancellation();
+      else runSignal?.addEventListener('abort', requestCancellation, { once: true });
       await onRunStarted?.(status);
+      if (bindingFailure) {
+        await deadline?.markBindingFailure(bindingFailure);
+        startFailure = { error: bindingFailure };
+        if (status.state === 'queued' || status.state === 'running') requestCancellation();
+      }
     } catch (error) {
       startFailure = { error };
       if (status.state === 'queued' || status.state === 'running') requestCancellation();
     }
     onProgress(status);
     while (status.state === 'queued' || status.state === 'running') {
+      if (runSignal?.aborted && (mode === 'aks' || submittedPlatform(binding.submitted_config_body) === 'aks')) {
+        throw new Error('AKS fleet execution interrupted; run remains unsettled and no local cancellation authority is inferred');
+      }
       if (!cancellationRequested || cancellationObserved) {
         let pollTimer: NodeJS.Timeout;
-        const pollDelay = new Promise<'poll'>((resolve) => {
-          pollTimer = setTimeout(() => resolve('poll'), pollIntervalMs);
+        const pollDelay = new Promise<'poll'>((resolvePoll) => {
+          pollTimer = setTimeout(() => resolvePoll('poll'), pollIntervalMs);
         });
         if (cancellationRequested) {
           await pollDelay;
@@ -505,17 +1808,32 @@ export async function launchOat(
         const result = await cancellationRequest;
         cancellationObserved = true;
         if (!result.ok) throw result.error instanceof Error ? result.error : new Error(String(result.error));
+        if (result.status) {
+          const changed = result.status.state !== status.state || result.status.progress !== status.progress ||
+            result.status.result_count !== status.result_count || result.status.error !== status.error;
+          status = result.status;
+          if (changed) onProgress(status);
+          break;
+        }
       }
-      const response = await fetcher(new URL('/runs/' + encodeURIComponent(status.id), server), {
+      const response = await fetcher(new URL('/runs/' + encodeURIComponent(ownedRunId), server), {
         signal: AbortSignal.timeout(30_000),
       });
-      const next = await readStatus(response, 'poll OAT run');
+      const next = await readStatus(response, 'poll OAT run', ownedRunId);
+      if ((deadline || submission) && next.config_sha256 !== binding.submitted_config_sha256) {
+        bindingFailure = new Error(`OAT server config_sha256 mismatch for run ${ownedRunId}`);
+        await deadline?.markBindingFailure(bindingFailure);
+        if (next.state === 'queued' || next.state === 'running') requestCancellation();
+      }
       const changed = next.state !== status.state || next.progress !== status.progress ||
         next.result_count !== status.result_count || next.error !== status.error;
       status = next;
       if (changed) onProgress(status);
     }
   } catch (error) {
+    if (deadline && deadline.runId && deadline.cleanupState !== 'confirmed') {
+      await deadline.markUnsettled(error);
+    }
     if (startFailure) {
       const original = startFailure.error instanceof Error ? startFailure.error.message : String(startFailure.error);
       const cleanup = error instanceof Error ? error.message : String(error);
@@ -523,9 +1841,19 @@ export async function launchOat(
     }
     throw error;
   } finally {
-    signal?.removeEventListener('abort', requestCancellation);
+    runSignal?.removeEventListener('abort', requestCancellation);
   }
-  onRunFinished?.(status);
+
+  await deadline?.recordTerminal(status);
+  await onRunFinished?.(status);
+  if (bindingFailure) {
+    await deadline?.markBindingFailure(bindingFailure);
+    throw bindingFailure;
+  }
+  if (deadline?.isExpired()) {
+    await deadline.markOverrun();
+    throw new Error(`Launcher-start deadline expired; run ${status.id} is ${status.state}; receipt: ${deadline.receiptPath}`);
+  }
   if (startFailure) {
     if (status.state !== 'succeeded' && status.state !== 'cancelled') {
       const original = startFailure.error instanceof Error ? startFailure.error.message : String(startFailure.error);
@@ -539,7 +1867,7 @@ export async function launchOat(
   return status;
 }
 
-async function readStatus(response: Response, action: string): Promise<OatRunStatus> {
+async function readStatus(response: Response, action: string, expectedId?: string): Promise<OatRunStatus> {
   const body: unknown = await response.json().catch(() => undefined);
   if (!response.ok) {
     const error = body !== null && typeof body === 'object' && 'error' in body && typeof body.error === 'string'
@@ -556,12 +1884,36 @@ async function readStatus(response: Response, action: string): Promise<OatRunSta
   ) {
     throw new Error(`Server returned an invalid status while trying to ${action}`);
   }
-  return body as OatRunStatus;
+  if (expectedId !== undefined && body.id !== expectedId) {
+    throw new Error(`Server returned run ID ${body.id} while trying to ${action} for owned run ${expectedId}`);
+  }
+  return {
+    ...(body as Omit<OatRunStatus, 'config_sha256'>),
+    config_sha256: 'config_sha256' in body && typeof body.config_sha256 === 'string' ? body.config_sha256 : null,
+  };
 }
 
-export async function main(args: string[], runner: typeof run_tree = run_tree, cleanupLocal = cleanupLocalComposeProjects): Promise<void> {
+export async function main(
+  args: string[],
+  runner: typeof run_tree = run_tree,
+  cleanupLocal = cleanupLocalComposeProjects,
+  receiptRoot = launcherDeadlineReceiptRoot,
+  collect: typeof collectDataFlow = collectDataFlow,
+  onOwnedRun?: OatOwnedRunObserver,
+  signal?: AbortSignal,
+): Promise<void> {
+  const launcherStartedAtUnixMs = Date.now();
+  const launcherStartedAtMonotonicMs = performance.now();
   if (args.includes('-h') || args.includes('--help')) {
     console.log(cliUsage);
+    return;
+  }
+  if (args[0] === '--recover-failed-aks') {
+    if (args.length !== 3 || !args[1] || !args[2] || args[2].startsWith('-')) {
+      throw new OatCliError('--recover-failed-aks requires exactly an invocation ID and the reviewed evidence file');
+    }
+    const kind = await recordLegacyAksDisposition(receiptRoot, args[1], args[2]);
+    console.log(aksDispositionMessage(kind));
     return;
   }
   validateArguments(args);
@@ -577,6 +1929,13 @@ export async function main(args: string[], runner: typeof run_tree = run_tree, c
     throw new OatCliError('--mode must be local or aks');
   }
   const requestedServerUrl = option('--server');
+  const deadlineOptionCount = args.filter((argument) => argument === '--deadline-seconds').length;
+  if (deadlineOptionCount > 1) throw new OatCliError('--deadline-seconds may be specified only once');
+  const deadlineValue = option('--deadline-seconds');
+  const deadlineSeconds = deadlineValue === undefined ? undefined : Number(deadlineValue);
+  if (deadlineValue !== undefined && (!/^[1-9][0-9]{0,2}$/.test(deadlineValue) || !Number.isSafeInteger(deadlineSeconds) || deadlineSeconds! > launcherDeadlineMaxSeconds)) {
+    throw new OatCliError(`--deadline-seconds must be an integer from 1 to ${launcherDeadlineMaxSeconds}`);
+  }
   const requestedStampConfigPath = option('--stamp-config');
   if (requestedStampConfigPath !== undefined && requestedMode !== 'aks') {
     throw new OatCliError('--stamp-config requires --mode aks');
@@ -585,12 +1944,19 @@ export async function main(args: string[], runner: typeof run_tree = run_tree, c
   const viewerOnly = args.includes('--viewer-only');
   const noViewer = args.includes('--no-viewer');
   const preflightOnly = args.includes('--preflight-only');
+  if (deadlineSeconds !== undefined && (requestedMode === 'aks' || viewerOnly || !noViewer)) {
+    throw new OatCliError('--deadline-seconds requires a local benchmark run with --no-viewer');
+  }
+  if (deadlineSeconds !== undefined && requestedServerUrl && !isLocalOatServerUrl(requestedServerUrl)) {
+    throw new OatCliError('--deadline-seconds requires a loopback --server URL');
+  }
   if (noViewer && (requestedMode === 'aks' || viewerOnly)) {
     throw new OatCliError('--no-viewer requires a local benchmark run and cannot be combined with --viewer-only');
   }
-  if (cleanupRunId !== undefined && (requestedMode === 'aks' || requestedServerUrl || args.includes('--poll-ms') || args.includes('--viewer-only') || args.includes('--preflight-only'))) {
+  if (cleanupRunId !== undefined && (requestedMode === 'aks' || requestedServerUrl || args.includes('--poll-ms') || args.includes('--viewer-only') || args.includes('--preflight-only') || deadlineSeconds !== undefined)) {
     throw new OatCliError('--cleanup-local requires local mode and cannot be combined with server, poll, viewer, or preflight options');
   }
+  if (requestedMode === 'aks' && !preflightOnly) await assertCanonicalAksLaunchWorkspace(workspaceRoot);
   if (requestedMode === 'aks') Object.assign(process.env, await loadAksEnvironment(workspaceRoot));
   if (preflightOnly) {
     if (requestedMode !== 'aks' || viewerOnly || requestedServerUrl || args.includes('--poll-ms')) {
@@ -629,7 +1995,9 @@ export async function main(args: string[], runner: typeof run_tree = run_tree, c
       warnings = report.warnings.filter((warning): warning is string => typeof warning === 'string');
     }
   }
-  const config = await readOatConfigForMode(configPath, mode);
+  const sourceBytes = await readFile(configPath);
+  const config = await readOatConfigForMode(configPath, mode, getDockerBridgeGateway, sourceBytes);
+  const submission = bindSubmittedConfig(config, sourceBytes);
   if (cleanupRunId !== undefined) {
     if (mode !== 'local') throw new OatCliError('--cleanup-local is local-only');
     const recoveredProjects = await recoverInterruptedLocalRuns(config, cleanupRunId, cleanupLocal);
@@ -645,17 +2013,34 @@ export async function main(args: string[], runner: typeof run_tree = run_tree, c
     }
     config.subscriptionId = subscriptionId;
   }
+  await assertNoUnsettledDeadlineReceipts(receiptRoot);
+  const deadline = await OatLauncherDeadline.create(deadlineSeconds, launcherStartedAtMonotonicMs, receiptRoot, launcherStartedAtUnixMs);
+  if (deadlineSeconds !== undefined) {
+    if (deadline.isExpired()) {
+      await deadline.markOverrun();
+      await deadline.markNoRun(new Error('launcher-start deadline expired during setup'));
+      deadline.dispose();
+      process.exitCode = 1;
+      console.error(`[oat] Launcher deadline expired during setup; receipt: ${deadline.receiptPath}`);
+      return;
+    }
+  }
   if (requestedServerUrl) {
     const interrupt = mode === 'local' ? registerLocalInterrupts() : undefined;
     let runPassed = false;
     try {
       try {
         const code = await reportDataFlowRun(
-          (progress) => launchOat(configPath, requestedServerUrl, pollValue, fetch, progress, mode, getDockerBridgeGateway, interrupt?.controller.signal),
-          config, mode, undefined, runner, network, warnings,
+          (progress) => launchOat(configPath, requestedServerUrl, pollValue, fetch, progress, mode, getDockerBridgeGateway, interrupt?.controller.signal ?? signal, undefined, undefined, deadline, submission),
+          config, mode, undefined, runner, network, warnings, collect,
         );
         if (interrupt?.signal) {
           process.exitCode = interrupt.exitCode;
+          return;
+        }
+        if (deadline.isExpired()) {
+          await deadline.markOverrun();
+          process.exitCode = 1;
           return;
         }
         runPassed = code === 0;
@@ -667,45 +2052,141 @@ export async function main(args: string[], runner: typeof run_tree = run_tree, c
       }
     } finally {
       interrupt?.dispose();
+      if (deadline) {
+        try {
+          await deadline.markNoRun();
+          if (deadline.isExpired()) {
+            await deadline.markOverrun();
+            process.exitCode = 1;
+          }
+        } finally {
+          deadline.dispose();
+        }
+      }
     }
     if (runPassed && !noViewer) await maybeServeLocalViewer(configPath, mode);
     return;
   }
 
-  if (mode === 'local') await recoverInterruptedLocalRuns(config);
+  if (mode === 'local') {
+    try {
+      await recoverInterruptedLocalRuns(config);
+    } catch (error) {
+      if (deadline) {
+        if (deadline.isExpired()) await deadline.markOverrun();
+        await deadline.markNoRun(error);
+        deadline.dispose();
+      }
+      throw error;
+    }
+  }
+  if (deadline?.isExpired()) {
+    await deadline.markOverrun();
+    await deadline.markNoRun(new Error('launcher-start deadline expired during local recovery'));
+    deadline.dispose();
+    process.exitCode = 1;
+    console.error(`[oat] Launcher deadline expired during local recovery; receipt: ${deadline.receiptPath}`);
+    return;
+  }
   const serverEnvironment = mode === 'aks'
     ? { ARROWCOL_AKS_STAMP_CONFIG_FILE: requestedStampConfigPath ?? 'infra/azure/stamp.yaml' }
     : {};
   console.log('[oat] Building benchmark server...');
-  const server = await startLocalServer(runner, serverEnvironment);
+  let server: Awaited<ReturnType<typeof startLocalServer>>;
+  try {
+    server = await startLocalServer(runner, serverEnvironment);
+  } catch (error) {
+    if (deadline?.isExpired()) await deadline.markOverrun();
+    await deadline?.markNoRun(error);
+    deadline?.dispose();
+    throw error;
+  }
+  if (deadline?.isExpired()) {
+    await deadline.markOverrun();
+    await deadline.markNoRun(new Error('launcher-start deadline expired before run creation'));
+    await stopLocalServer(server.child);
+    deadline.dispose();
+    process.exitCode = 1;
+    console.error(`[oat] Launcher deadline expired before run creation; receipt: ${deadline.receiptPath}`);
+    return;
+  }
   console.log(`[oat] Benchmark server: ${server.url} (PID ${server.child.pid}; logs in this terminal)`);
   let markerContext: LocalRunMarkerContext | undefined;
   try {
     if (mode === 'local') markerContext = await prepareLocalRunMarker(config, server);
   } catch (error) {
     await stopLocalServer(server.child);
+    if (deadline?.isExpired()) await deadline.markOverrun();
+    await deadline?.markNoRun(error);
+    deadline?.dispose();
     throw error;
   }
   let markerWritten = false;
+  let supplementaryEmitted = false;
   let runCleanupComplete = false;
   let runPassed = false;
   const interrupt = mode === 'local' ? registerLocalInterrupts() : undefined;
   try {
     try {
       const localMarker = markerContext;
+      const bindAksServerIdentity = async (status: OatRunStatus): Promise<void> => {
+        const serverPid = server.child.pid;
+        if (!serverPid || server.child.exitCode !== null || server.child.signalCode !== null) return;
+        const serverStartTicks = await processStartTicks(serverPid);
+        if (!serverStartTicks || server.child.exitCode !== null || server.child.signalCode !== null) return;
+        await deadline.recordOwnedServerIdentity({
+          invocationId: deadline.invocationId,
+          runId: status.id,
+          serverUrl: new URL(server.url).href,
+          serverPid,
+          serverStartTicks,
+          serverExecutable: server.executable,
+        });
+      };
       const onRunStarted = localMarker ? async (status: OatRunStatus): Promise<void> => {
-        await persistLocalRunMarker(localMarker, status);
+        await persistLocalRunMarker(localMarker, status, submission);
         markerWritten = true;
-      } : undefined;
+        const identity: Readonly<OatOwnedRunIdentity> = Object.freeze({
+          invocationId: deadline.invocationId,
+          runId: status.id,
+          serverUrl: localMarker.marker.serverUrl,
+          serverPid: localMarker.marker.serverPid,
+          serverStartTicks: localMarker.marker.serverStartTicks,
+          serverExecutable: localMarker.marker.serverExecutable,
+        });
+        await deadline.recordOwnedServerIdentity(identity);
+        if (onOwnedRun && !supplementaryEmitted) {
+          if (interrupt?.controller.signal.aborted ||
+              localMarker.marker.serverUrl !== new URL(server.url).href || localMarker.marker.serverPid !== server.child.pid ||
+              !deadline.canObserveOwnedRun(status, localMarker.marker.serverUrl, submission.submitted_config_sha256)) {
+            console.error('[oat] Supplementary owned-run identity skipped: accepted run is no longer eligible');
+            return;
+          }
+          supplementaryEmitted = true;
+          const diagnostic = (error: unknown): void => {
+            console.error('[oat] Supplementary owned-run observer failed:', error);
+          };
+          try {
+            void Promise.resolve(onOwnedRun(identity, deadline.receiptPath)).catch(diagnostic);
+          } catch (error) {
+            diagnostic(error);
+          }
+        }
+      } : mode === 'aks' ? bindAksServerIdentity : undefined;
       const onRunFinished = (status: OatRunStatus): void => {
-        runCleanupComplete = status.state === 'succeeded' || status.state === 'cancelled';
+        runCleanupComplete = (status.state === 'succeeded' || status.state === 'cancelled') && deadline.cleanupState === 'confirmed';
       };
       const code = await reportDataFlowRun(
-        (progress) => launchOat(configPath, server.url, pollValue, fetch, progress, mode, getDockerBridgeGateway, interrupt?.controller.signal, onRunStarted, onRunFinished),
-        config, mode, server.gitSha, runner, network, warnings,
+        (progress) => launchOat(configPath, server.url, pollValue, fetch, progress, mode, getDockerBridgeGateway, interrupt?.controller.signal ?? signal, onRunStarted, onRunFinished, deadline, submission),
+        config, mode, server.gitSha, runner, network, warnings, collect,
       );
       if (interrupt?.signal) {
         process.exitCode = interrupt.exitCode;
+        return;
+      }
+      if (deadline.isExpired()) {
+        await deadline.markOverrun();
+        process.exitCode = 1;
         return;
       }
       runPassed = code === 0;
@@ -716,14 +2197,34 @@ export async function main(args: string[], runner: typeof run_tree = run_tree, c
       return;
     }
   } finally {
-    await finishOwnedLocalRun(
-      () => stopLocalServer(server.child),
-      async () => {
-        if (markerWritten && runCleanupComplete && markerContext) await unlink(markerContext.path);
-      },
-      interrupt,
-      async () => { if (runPassed && !noViewer) await maybeServeLocalViewer(configPath, mode); },
-    );
+    try {
+      await finishOwnedLocalRun(
+        async () => {
+          if (deadline && deadline.cleanupState !== 'confirmed') {
+            console.error(`[oat] Preserving OAT server for unresolved run receipt ${deadline.receiptPath}`);
+            return;
+          }
+          await stopLocalServer(server.child);
+        },
+        async () => {
+          if (markerWritten && runCleanupComplete && markerContext) await unlink(markerContext.path);
+        },
+        interrupt,
+        async () => { if (runPassed && !noViewer) await maybeServeLocalViewer(configPath, mode); },
+      );
+    } finally {
+      if (deadline) {
+        try {
+          await deadline.markNoRun();
+          if (deadline.isExpired()) {
+            await deadline.markOverrun();
+            process.exitCode = 1;
+          }
+        } finally {
+          deadline.dispose();
+        }
+      }
+    }
   }
 }
 

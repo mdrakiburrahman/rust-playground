@@ -5,19 +5,18 @@ use std::time::SystemTime;
 use anyhow::{Context, Result, bail};
 use arrow::record_batch::RecordBatch;
 use arrowcol_catalog::{CatalogSchemaVersion, SchemaVersion};
-use arrowcol_protocol::TableIdentity;
+use arrowcol_dataflow_components::{ArrowcolBatchEnvelope, encode_record_batch};
+use arrowcol_protocol::{CollectorInstanceId, FencingToken, LeaseId, TableIdentity};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use otel_arrow_dfe_quiver::record_bundle::{BundleDescriptor, PayloadRef, RecordBundle, SlotDescriptor, SlotId};
 use serde::Deserialize;
-use serde_json::json;
-use uuid::Uuid;
 
 const MAGIC: [u8; 4] = *b"QPA\x01";
 const REPRESENTATION: &str = "arrowcol.flight";
-const REPRESENTATION_VERSION: (u16, u16) = (1, 1);
 const SIGNAL_LOGS: u8 = 0;
 const ROOT_SLOT: u16 = 46;
+#[cfg(test)]
 const ROOT_TABLE_ID: u32 = 0;
 const SCHEMA_ID_PREFIX: &str = "arrowcol.flight.v1:";
 
@@ -131,7 +130,9 @@ struct EnvelopeSummary {
 fn decode_envelope(schema_id: &str) -> Option<EnvelopeSummary> {
     let encoded = schema_id.strip_prefix(SCHEMA_ID_PREFIX)?;
     let bytes = URL_SAFE_NO_PAD.decode(encoded).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    let metadata: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let envelope = metadata.get("envelope").unwrap_or(&metadata);
+    serde_json::from_value(envelope.clone()).ok()
 }
 
 pub(crate) fn schema_description(schema_id: &str) -> Option<(String, u64)> {
@@ -149,33 +150,32 @@ pub(crate) struct DfeRecordBundle {
 impl DfeRecordBundle {
     pub(crate) fn new(schema: &CatalogSchemaVersion, batch: RecordBatch) -> Result<Self> {
         let fingerprint = *schema.fingerprint().as_bytes();
-        let version = schema.version().get();
-        let envelope = json!({
-            "publication_id": null,
-            "ingested_at_ms": null,
-            "table": schema.identity(),
-            "source_schema_version": version,
-            "target_schema_version": version,
-            "lease_id": Uuid::new_v4().to_string(),
-            "holder_instance_id": Uuid::new_v4().to_string(),
-            "fencing_token": 1,
-            "instance_key": "quiver-cli"
-        });
-        let schema_id = format!(
-            "{SCHEMA_ID_PREFIX}{}",
-            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&envelope)?)
-        );
+        let envelope = ArrowcolBatchEnvelope {
+            publication_id: None,
+            ingested_at_ms: None,
+            table: schema.identity().clone(),
+            source_schema_version: schema.version(),
+            target_schema_version: schema.version(),
+            lease_id: LeaseId::new(),
+            holder_instance_id: CollectorInstanceId::new(),
+            fencing_token: FencingToken::new(1)?,
+            instance_key: "quiver-cli".to_owned(),
+        };
+        let records = encode_record_batch(envelope, batch)?;
+        let version = records.representation().version();
+        let (_, _, _, mut tables) = records.into_parts();
+        let (table_id, schema_id, _, batch) = tables.pop().context("Arrowcol encoder returned no table")?.into_parts();
         let metadata = DfeManifest {
             representation: REPRESENTATION.to_owned(),
-            major: REPRESENTATION_VERSION.0,
-            minor: REPRESENTATION_VERSION.1,
+            major: version.major(),
+            minor: version.minor(),
             signal: SIGNAL_LOGS,
             root_items: u64::try_from(batch.num_rows())?,
             tables: vec![ManifestTable {
                 slot: ROOT_SLOT,
-                table_id: ROOT_TABLE_ID,
+                table_id,
                 fingerprint,
-                schema_id,
+                schema_id: schema_id.as_str().to_owned(),
             }],
         }
         .encode()?;
@@ -277,6 +277,51 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn summary_rejects_malformed_present_wrapper_even_with_valid_flat_fields() -> Result<()> {
+        let flat = serde_json::json!({
+            "table": {"catalog": "c", "schema": "s", "table": "legacy"},
+            "target_schema_version": 1
+        });
+        let schema_id = format!(
+            "{SCHEMA_ID_PREFIX}{}",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&flat)?)
+        );
+        assert_eq!(schema_description(&schema_id), Some(("c.s.legacy".to_owned(), 1)));
+        for wrapper in [
+            serde_json::Value::Null,
+            serde_json::json!({}),
+            serde_json::json!({"table": flat["table"], "target_schema_version": "invalid"}),
+        ] {
+            let mut mixed = flat.clone();
+            mixed["envelope"] = wrapper;
+            let schema_id = format!(
+                "{SCHEMA_ID_PREFIX}{}",
+                URL_SAFE_NO_PAD.encode(serde_json::to_vec(&mixed)?)
+            );
+            assert!(schema_description(&schema_id).is_none());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn summary_prefers_present_valid_wrapper_over_conflicting_flat_fields() -> Result<()> {
+        let metadata = serde_json::json!({
+            "table": {"catalog": "c", "schema": "s", "table": "legacy"},
+            "target_schema_version": 1,
+            "envelope": {
+                "table": {"catalog": "c", "schema": "s", "table": "current"},
+                "target_schema_version": 2
+            }
+        });
+        let schema_id = format!(
+            "{SCHEMA_ID_PREFIX}{}",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&metadata)?)
+        );
+        assert_eq!(schema_description(&schema_id), Some(("c.s.current".to_owned(), 2)));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn generated_bundle_decodes_through_the_dfe_envelope_decoder() -> Result<()> {
         use anyhow::Context;
@@ -292,6 +337,29 @@ mod tests {
         let bundle = DfeRecordBundle::new(&table.schema, batch)?;
         let manifest = DfeManifest::decode(bundle.metadata().context("missing DFE manifest")?)?;
         let manifest_table = manifest.tables.first().context("missing DFE table")?;
+        let version = arrowcol_flight_representation().version();
+        assert_eq!((manifest.major, manifest.minor), (version.major(), version.minor()));
+        assert_eq!(
+            schema_description(&manifest_table.schema_id),
+            Some((table.schema.identity().to_string(), table.schema.version().get()))
+        );
+        let metadata: serde_json::Value = serde_json::from_slice(
+            &URL_SAFE_NO_PAD.decode(
+                manifest_table
+                    .schema_id
+                    .strip_prefix(SCHEMA_ID_PREFIX)
+                    .context("missing schema prefix")?,
+            )?,
+        )?;
+        assert!(metadata.get("client_send_observation").is_none());
+        let legacy_schema_id = format!(
+            "{SCHEMA_ID_PREFIX}{}",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&metadata["envelope"])?)
+        );
+        assert_eq!(
+            schema_description(&legacy_schema_id),
+            schema_description(&manifest_table.schema_id)
+        );
         let payload = bundle
             .payload(SlotId::new(ROOT_SLOT))
             .context("missing pluggable-Arrow payload")?;
@@ -312,6 +380,7 @@ mod tests {
         assert_eq!(&decoded.envelope.table, table.schema.identity());
         assert_eq!(decoded.envelope.target_schema_version, table.schema.version());
         assert_eq!(decoded.batch.num_rows(), 128);
+        assert!(decoded.trusted_client_send_observation().is_none());
         Ok(())
     }
 }

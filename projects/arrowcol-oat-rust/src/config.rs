@@ -1,20 +1,26 @@
 use anyhow::{Context, Result, bail};
-use arrowcol_tunables::Tunables;
+use arrowcol_tunables::{DEFAULT_COLLECTOR_SHUTDOWN_DRAIN_TIMEOUT_SECONDS, Tunables};
 use otel_arrow_dfe_quiver::{DiskBudget, QuiverConfig};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::Path;
 use url::Url;
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OatConfig {
     #[serde(default)]
+    pub overload_guard: OverloadGuardConfig,
+    #[serde(default, deserialize_with = "deserialize_oat_tunables")]
     pub tunables: Tunables,
+    #[serde(default)]
+    pub campaign_profile: Option<CampaignProfile>,
     pub platform: PlatformConfig,
     pub stamp: Option<String>,
     pub warmup_seconds: u64,
     pub measure_seconds: u64,
+    #[serde(default = "default_schedule_lead_seconds")]
+    pub schedule_lead_seconds: u64,
     #[serde(default = "default_client_ready_timeout_seconds")]
     pub client_ready_timeout_seconds: u64,
     #[serde(default = "default_aks_rollout_timeout_seconds")]
@@ -57,6 +63,8 @@ pub struct OatConfig {
     pub rows_per_table: usize,
     #[serde(default = "default_clients_per_table")]
     pub clients_per_table: usize,
+    #[serde(default)]
+    pub clients_per_table_sweep: Option<Vec<usize>>,
     pub dmv_concurrency: usize,
     pub qap_endpoint: String,
     pub qap_database: Option<String>,
@@ -69,7 +77,25 @@ pub struct OatConfig {
     pub website_url: String,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, serde::Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OverloadGuardConfig {
+    pub enabled: bool,
+    pub cap_fraction: f64,
+    pub zero_progress_windows: u32,
+}
+
+impl Default for OverloadGuardConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            cap_fraction: 0.90,
+            zero_progress_windows: 2,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlatformConfig {
     pub kind: OatMode,
@@ -82,21 +108,370 @@ pub struct PlatformConfig {
     pub bootstrap_env_file: Option<String>,
     #[serde(default)]
     pub local: LocalOptions,
+    #[serde(default)]
+    pub resources: Option<AksResourceOverrides>,
+    #[serde(default)]
+    pub fleet: Option<FleetPlacement>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FleetPlacement {
+    pub collector: FleetNode,
+    pub clients: Vec<FleetClient>,
+    pub pools: Vec<FleetPoolOutcome>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FleetNode {
+    pub node: String,
+    pub pool: String,
+    pub sku: String,
+    pub allocatable_cpu_millicores: u64,
+    pub allocatable_memory_bytes: u64,
+    pub resources: ResourceRequirements,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FleetClient {
+    pub placement: FleetNode,
+    pub rows_per_table: usize,
+    pub dmv_concurrency: usize,
+    pub tunables: arrowcol_tunables::ClientTunables,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FleetPoolOutcome {
+    pub name: String,
+    pub sku: String,
+    pub vcpu: u32,
+    pub state: FleetPoolState,
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FleetPoolState {
+    Ready,
+    Failed,
+}
+
+impl FleetPlacement {
+    fn validate(&self, config: &OatConfig) -> Result<()> {
+        if config.platform.kind != OatMode::Aks
+            || config.campaign_profile != Some(CampaignProfile::ScaleOutSingleTable)
+            || config.tables.len() != 1
+            || config.replica_counts != [1]
+            || config.dfe_worker_concurrency.len() != 1
+            || config.clients_per_table_sweep.is_some()
+            || self.clients.len() != config.clients_per_table
+            || self.clients.is_empty()
+            || self.clients.len() > 128
+        {
+            bail!("fleet placement requires one AKS scale-out cell, one table, and one client per resolved node");
+        }
+        let valid_label = |value: &str| {
+            !value.is_empty()
+                && value.len() <= 253
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'.'))
+        };
+        let mut nodes = HashSet::new();
+        for node in std::iter::once(&self.collector).chain(self.clients.iter().map(|client| &client.placement)) {
+            if !valid_label(&node.node)
+                || !valid_label(&node.pool)
+                || node.sku.is_empty()
+                || !nodes.insert(&node.node)
+                || node.allocatable_cpu_millicores == 0
+                || node.allocatable_memory_bytes == 0
+            {
+                bail!(
+                    "fleet nodes require distinct node names, explicit pools, SKU and positive allocatable resources"
+                );
+            }
+            let mut resources = config.effective_aks_resources();
+            resources.client = node.resources.clone();
+            resources.validate(false)?;
+            if parse_cpu_millicores(
+                node.resources
+                    .limits
+                    .cpu
+                    .as_deref()
+                    .context("fleet CPU limit is missing")?,
+            )? > node.allocatable_cpu_millicores
+                || parse_memory_bytes(&node.resources.limits.memory)? > node.allocatable_memory_bytes
+            {
+                bail!("fleet pod resources exceed node allocatable resources");
+            }
+        }
+        if serde_json::to_value(&self.collector.resources)?
+            != serde_json::to_value(config.effective_aks_resources().collector)?
+        {
+            bail!("fleet collector resources differ from platform.resources.collector");
+        }
+        for client in &self.clients {
+            if client.placement.pool == self.collector.pool
+                || !(1..=1_000_000).contains(&client.rows_per_table)
+                || !(1..=64).contains(&client.dmv_concurrency)
+            {
+                bail!("fleet clients require separate client pools and bounded numeric rows/concurrency");
+            }
+            Tunables {
+                client: Some(client.tunables.clone()),
+                ..Default::default()
+            }
+            .validate_for_oat()?;
+        }
+        let mut pools = HashSet::new();
+        for pool in &self.pools {
+            if !valid_label(&pool.name)
+                || pool.sku.is_empty()
+                || pool.vcpu == 0
+                || !pools.insert(&pool.name)
+                || pool
+                    .reason
+                    .as_ref()
+                    .is_some_and(|reason| reason.len() > 512 || reason.contains(['\n', '\r']))
+                || matches!(pool.state, FleetPoolState::Failed) && pool.reason.as_ref().is_none_or(String::is_empty)
+            {
+                bail!("fleet pool outcomes require unique identities and bounded sanitized failure reasons");
+            }
+        }
+        for node in std::iter::once(&self.collector).chain(self.clients.iter().map(|client| &client.placement)) {
+            if !self.pools.iter().any(|pool| {
+                pool.name == node.pool && pool.sku == node.sku && matches!(pool.state, FleetPoolState::Ready)
+            }) {
+                bail!("every fleet node must belong to a ready pool with the observed SKU");
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AksResourceOverrides {
+    pub collector: Option<ResourceRequirements>,
+    pub client: Option<ResourceRequirements>,
+    pub maintenance: Option<ResourceRequirements>,
+    pub router: Option<ResourceRequirements>,
+    pub catalog: Option<ResourceRequirements>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct AksResourceConfig {
+    pub collector: ResourceRequirements,
+    pub client: ResourceRequirements,
+    pub maintenance: ResourceRequirements,
+    pub router: ResourceRequirements,
+    pub catalog: ResourceRequirements,
+}
+
+impl Default for AksResourceConfig {
+    fn default() -> Self {
+        Self {
+            collector: ResourceRequirements::new("2", "4Gi", "2", "6Gi"),
+            client: ResourceRequirements::new("250m", "256Mi", "2", "2Gi"),
+            maintenance: ResourceRequirements::new("250m", "512Mi", "1", "2Gi"),
+            router: ResourceRequirements::new("500m", "512Mi", "2", "1Gi"),
+            catalog: ResourceRequirements::new("500m", "1Gi", "2", "4Gi"),
+        }
+    }
+}
+
+impl AksResourceOverrides {
+    fn resolve(&self) -> AksResourceConfig {
+        let defaults = AksResourceConfig::default();
+        AksResourceConfig {
+            collector: self.collector.clone().unwrap_or(defaults.collector),
+            client: self.client.clone().unwrap_or(defaults.client),
+            maintenance: self.maintenance.clone().unwrap_or(defaults.maintenance),
+            router: self.router.clone().unwrap_or(defaults.router),
+            catalog: self.catalog.clone().unwrap_or(defaults.catalog),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceRequirements {
+    pub requests: ResourceValues,
+    pub limits: ResourceValues,
+}
+
+impl ResourceRequirements {
+    fn new(request_cpu: &str, request_memory: &str, limit_cpu: &str, limit_memory: &str) -> Self {
+        Self {
+            requests: ResourceValues {
+                cpu: Some(request_cpu.to_owned()),
+                memory: request_memory.to_owned(),
+            },
+            limits: ResourceValues {
+                cpu: Some(limit_cpu.to_owned()),
+                memory: limit_memory.to_owned(),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceValues {
+    #[serde(default, deserialize_with = "deserialize_nullable_cpu")]
+    pub cpu: Option<String>,
+    pub memory: String,
+}
+
+fn deserialize_nullable_cpu<'de, D>(deserializer: D) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer)
+}
+
+impl AksResourceConfig {
+    fn validate(&self, allow_uncapped_collector: bool) -> Result<()> {
+        for (role, requirements) in [
+            ("collector", &self.collector),
+            ("client", &self.client),
+            ("maintenance", &self.maintenance),
+            ("router", &self.router),
+            ("catalog", &self.catalog),
+        ] {
+            let request_cpu = parse_cpu_millicores(
+                requirements
+                    .requests
+                    .cpu
+                    .as_deref()
+                    .with_context(|| format!("platform.resources.{role}.requests.cpu must not be null"))?,
+            )
+            .with_context(|| format!("platform.resources.{role}.requests.cpu"))?;
+            let limit_cpu = match requirements.limits.cpu.as_deref() {
+                Some(value) => {
+                    Some(parse_cpu_millicores(value).with_context(|| format!("platform.resources.{role}.limits.cpu"))?)
+                }
+                None if role == "collector" && allow_uncapped_collector => None,
+                None => bail!("platform.resources.{role}.limits.cpu must not be null"),
+            };
+            let request_memory = parse_memory_bytes(&requirements.requests.memory)
+                .with_context(|| format!("platform.resources.{role}.requests.memory"))?;
+            let limit_memory = parse_memory_bytes(&requirements.limits.memory)
+                .with_context(|| format!("platform.resources.{role}.limits.memory"))?;
+            if limit_cpu.is_some_and(|limit| request_cpu > limit) || request_memory > limit_memory {
+                bail!("platform.resources.{role} requests must not exceed limits");
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn parse_cpu_millicores(value: &str) -> Result<u64> {
+    let parsed = if let Some(milli) = value.strip_suffix('m') {
+        if milli.is_empty() || !milli.bytes().all(|byte| byte.is_ascii_digit()) {
+            bail!("invalid Kubernetes CPU quantity {value:?}");
+        }
+        milli.parse::<u64>().context("CPU milli quantity is out of range")?
+    } else if let Some((whole, fraction)) = value.split_once('.') {
+        if whole.is_empty()
+            || fraction.is_empty()
+            || fraction.len() > 3
+            || !whole.bytes().all(|byte| byte.is_ascii_digit())
+            || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            bail!("invalid Kubernetes CPU quantity {value:?}");
+        }
+        let whole = whole.parse::<u64>().context("CPU quantity is out of range")?;
+        let mut milli_fraction = fraction.to_owned();
+        while milli_fraction.len() < 3 {
+            milli_fraction.push('0');
+        }
+        whole
+            .checked_mul(1000)
+            .and_then(|n| n.checked_add(milli_fraction.parse::<u64>().ok()?))
+            .context("CPU quantity is out of range")?
+    } else {
+        if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            bail!("invalid Kubernetes CPU quantity {value:?}");
+        }
+        value
+            .parse::<u64>()
+            .context("CPU quantity is out of range")?
+            .checked_mul(1000)
+            .context("CPU quantity is out of range")?
+    };
+    if parsed == 0 {
+        bail!("Kubernetes CPU quantity must be positive");
+    }
+    Ok(parsed)
+}
+
+pub(crate) fn parse_memory_bytes(value: &str) -> Result<u64> {
+    const UNITS: [(&str, u64); 13] = [
+        ("Ei", 1_u64 << 60),
+        ("Pi", 1_u64 << 50),
+        ("Ti", 1_u64 << 40),
+        ("Gi", 1_u64 << 30),
+        ("Mi", 1_u64 << 20),
+        ("Ki", 1_u64 << 10),
+        ("E", 1_000_000_000_000_000_000),
+        ("P", 1_000_000_000_000_000),
+        ("T", 1_000_000_000_000),
+        ("G", 1_000_000_000),
+        ("M", 1_000_000),
+        ("k", 1_000),
+        ("", 1),
+    ];
+    let (digits, multiplier) = UNITS
+        .iter()
+        .find_map(|(suffix, multiplier)| value.strip_suffix(suffix).map(|digits| (digits, *multiplier)))
+        .context("memory quantity must use an integer Kubernetes byte quantity")?;
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        bail!("invalid Kubernetes memory quantity {value:?}");
+    }
+    let bytes = digits
+        .parse::<u64>()
+        .context("memory quantity is out of range")?
+        .checked_mul(multiplier)
+        .context("memory quantity is out of range")?;
+    if bytes == 0 {
+        bail!("Kubernetes memory quantity must be positive");
+    }
+    Ok(bytes)
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LocalOptions {
+    pub collector_memory_limit_bytes: Option<u64>,
     pub bind_host: Option<std::net::IpAddr>,
     pub endpoint_host: Option<String>,
     pub snapshot_root: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum OatMode {
     Local,
     Aks,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum CampaignProfile {
+    SingleHotTable,
+    ScaleOutSingleTable,
+}
+
+fn deserialize_oat_tunables<'de, D>(deserializer: D) -> std::result::Result<Tunables, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Tunables::parse_oat_json(value).map_err(serde::de::Error::custom)
 }
 
 fn default_client_ready_timeout_seconds() -> u64 {
@@ -115,8 +490,15 @@ fn default_collector_stop_grace_seconds() -> u64 {
     300
 }
 
-pub(crate) const SCHEDULE_DELIVERY_TIMEOUT_SECONDS: u64 = 180;
+fn default_schedule_lead_seconds() -> u64 {
+    180
+}
+
+// Matches the pinned arrowcol-dmv --schedule-timeout-secs consumer ceiling.
+const MAX_CLIENT_SCHEDULE_WAIT_SECONDS: u64 = 2_160;
+pub(crate) const AKS_RESOURCE_COUNTER_SNAPSHOT_TIMEOUT_MS: u64 = 5_000;
 pub(crate) const PIN_INIT_SETUP_TIMEOUT_SECONDS: u64 = 180;
+pub(crate) const CATALOG_REGISTRATION_SETUP_TIMEOUT_SECONDS: u64 = 180;
 const CLIENT_JOB_CLEANUP_GRACE_SECONDS: u64 = 300;
 const DEFAULT_WAL_RETENTION_SIZE_CAP_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
@@ -125,20 +507,253 @@ pub(crate) struct RunTimingBudget {
     pub(crate) schedule_wait_seconds: u64,
     pub(crate) client_job_lifetime_seconds: u64,
     pub(crate) minimum_pin_ttl_ms: u64,
+    pub(crate) pre_cell_setup_timeout_ms: u64,
+    pub(crate) after_setup_budget_ms: u64,
+    pub(crate) planned_cell_duration_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EffectiveStopBudgets {
+    pub maintenance_grace_seconds: u64,
+    pub maintenance_stop_timeout_ms: u64,
+}
+
+impl EffectiveStopBudgets {
+    pub(crate) fn validate(self) -> Result<Self> {
+        let minimum_timeout_ms = self
+            .maintenance_grace_seconds
+            .checked_add(300)
+            .and_then(|seconds| seconds.checked_mul(1_000))
+            .context("effective maintenance cleanup headroom calculation overflow")?;
+        if self.maintenance_grace_seconds == 0
+            || self.maintenance_stop_timeout_ms < minimum_timeout_ms
+            || self.maintenance_stop_timeout_ms > 5_100_000
+        {
+            bail!(
+                "effective maintenance stop timeout must cover grace plus 300 seconds and not exceed the fixed timeout ceiling"
+            );
+        }
+        Ok(self)
+    }
 }
 
 impl OatConfig {
-    fn validate_selected_parquet_schemas(&self) -> Result<()> {
-        let Some(writer) = &self.tunables.parquet_writer else {
+    fn validate_campaign_profile(&self) -> Result<()> {
+        if self.campaign_profile == Some(CampaignProfile::ScaleOutSingleTable) {
+            if self.tables.as_slice() != ["sqlserver_availability_replica_states"] {
+                bail!(
+                    "scale_out_single_table campaign requires exactly the public sqlserver_availability_replica_states DMV table"
+                );
+            }
+            if self.replica_counts != [1] {
+                bail!("scale_out_single_table campaign requires replica_counts [1]");
+            }
+            if self.tunables.wal.is_some() {
+                bail!("scale_out_single_table campaign requires WAL to be absent");
+            }
+            if !self.overload_guard.enabled {
+                bail!("scale_out_single_table campaign requires overload protection");
+            }
+            let maintenance = self
+                .tunables
+                .maintenance
+                .as_ref()
+                .context("scale_out_single_table campaign requires enabled, applying maintenance")?;
+            if maintenance.enabled != Some(true) || maintenance.apply != Some(true) || maintenance.max_cycles.is_some()
+            {
+                bail!("scale_out_single_table campaign requires continuous, enabled, applying maintenance");
+            }
+            let operations = maintenance
+                .operations
+                .as_ref()
+                .context("scale_out_single_table campaign requires all maintenance operations")?;
+            use arrowcol_tunables::MaintenanceOperation::{Checkpoint, Optimize, PruneLog, Purge, Vacuum};
+            if [Purge, Optimize, Vacuum, Checkpoint, PruneLog]
+                .iter()
+                .any(|operation| !operations.contains(operation))
+            {
+                bail!("scale_out_single_table campaign requires purge, optimize, vacuum, checkpoint and prune_log");
+            }
+            return Ok(());
+        }
+        if self.campaign_profile != Some(CampaignProfile::SingleHotTable) {
+            return Ok(());
+        }
+        if self.tables.len() != 1 {
+            bail!("single_hot_table campaign requires exactly one public DMV table");
+        }
+        if self.tables[0] != "sqlserver_availability_replica_states" {
+            bail!("single_hot_table campaign requires telemetry.sqlserver.sqlserver_availability_replica_states");
+        }
+        if self.replica_counts != [1] {
+            bail!("single_hot_table campaign requires replica_counts [1]");
+        }
+        if self.tunables.wal.is_some() {
+            bail!("single_hot_table campaign requires WAL to be absent");
+        }
+        let maintenance = self
+            .tunables
+            .maintenance
+            .as_ref()
+            .context("single_hot_table campaign requires enabled, applying maintenance")?;
+        if maintenance.enabled != Some(true) || maintenance.apply != Some(true) {
+            bail!("single_hot_table campaign requires enabled, applying maintenance");
+        }
+        if maintenance.max_cycles.is_some() {
+            bail!("single_hot_table campaign requires continuous maintenance without max_cycles");
+        }
+        let operations = maintenance
+            .operations
+            .as_ref()
+            .context("single_hot_table campaign requires all maintenance operations")?;
+        use arrowcol_tunables::MaintenanceOperation::{Checkpoint, Optimize, PruneLog, Purge, Vacuum};
+        if [Purge, Optimize, Vacuum, Checkpoint, PruneLog]
+            .iter()
+            .any(|operation| !operations.contains(operation))
+        {
+            bail!("single_hot_table campaign requires purge, optimize, vacuum, checkpoint and prune_log");
+        }
+        Ok(())
+    }
+
+    fn validate_platform_resources(&self) -> Result<()> {
+        if self.platform.kind == OatMode::Local {
+            if self.platform.resources.is_some() {
+                bail!("platform.resources is only valid for AKS");
+            }
+            return Ok(());
+        }
+        self.effective_aks_resources()
+            .validate(self.campaign_profile == Some(CampaignProfile::ScaleOutSingleTable))
+    }
+
+    pub(crate) fn effective_aks_resources(&self) -> AksResourceConfig {
+        self.platform
+            .resources
+            .as_ref()
+            .map(AksResourceOverrides::resolve)
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn maintenance_stop_budget(&self) -> Result<EffectiveStopBudgets> {
+        const DEFAULT_GRACE_SECONDS: u64 = 4_800;
+        const DEFAULT_TIMEOUT_MS: u64 = 5_100_000;
+        const OPERATION_HEADROOM_SECONDS: u64 = 300;
+        const CLEANUP_HEADROOM_SECONDS: u64 = 300;
+        let Some(settings) = self
+            .tunables
+            .maintenance
+            .as_ref()
+            .filter(|settings| settings.enabled == Some(true))
+        else {
+            return EffectiveStopBudgets {
+                maintenance_grace_seconds: DEFAULT_GRACE_SECONDS,
+                maintenance_stop_timeout_ms: DEFAULT_TIMEOUT_MS,
+            }
+            .validate();
+        };
+        let operation_count = u64::try_from(
+            settings
+                .operations
+                .as_ref()
+                .context("enabled maintenance requires operations")?
+                .len(),
+        )?;
+        let operation_timeout = settings.operation_timeout_secs.unwrap_or(900);
+        let grace = operation_timeout
+            .checked_mul(operation_count)
+            .and_then(|seconds| seconds.checked_add(OPERATION_HEADROOM_SECONDS))
+            .context("maintenance stop grace calculation overflow")?;
+        let timeout_ms = grace
+            .checked_add(CLEANUP_HEADROOM_SECONDS)
+            .and_then(|seconds| seconds.checked_mul(1_000))
+            .context("maintenance cleanup timeout calculation overflow")?;
+        if timeout_ms > DEFAULT_TIMEOUT_MS {
+            bail!(
+                "maintenance.operation_timeout_secs and enabled operation count exceed the fixed 5100-second cleanup budget"
+            );
+        }
+        EffectiveStopBudgets {
+            maintenance_grace_seconds: grace,
+            maintenance_stop_timeout_ms: timeout_ms,
+        }
+        .validate()
+    }
+
+    fn validate_local_purge_inputs(&self) -> Result<()> {
+        if self.platform.kind != OatMode::Local {
+            return Ok(());
+        }
+        let Some(maintenance) = self.tunables.maintenance.as_ref() else {
             return Ok(());
         };
+        let purge_requested = maintenance.enabled == Some(true)
+            && maintenance
+                .operations
+                .as_ref()
+                .is_some_and(|operations| operations.contains(&arrowcol_tunables::MaintenanceOperation::Purge));
+        if purge_requested && maintenance.granularity.is_none() {
+            bail!("local PURGE requires explicit maintenance.granularity");
+        }
+        if purge_requested && maintenance.purge_retention_secs.is_none() {
+            bail!("local PURGE requires explicit maintenance.purge_retention_secs");
+        }
+        Ok(())
+    }
+
+    fn validate_selected_parquet_schemas(&self) -> Result<()> {
+        let maintenance = self.tunables.maintenance.as_ref();
+        if self.tunables.parquet_writer.is_none()
+            && maintenance
+                .and_then(|settings| settings.parquet_writer.as_ref())
+                .is_none()
+        {
+            return Ok(());
+        }
         let selected = self.tables.iter().map(String::as_str).collect::<HashSet<_>>();
         for table in collector_chain::dmv::tables()? {
             let name = table.identity().table().as_str();
             if selected.contains(name) {
-                writer
-                    .writer_properties(table.schema(), None, &[])
-                    .with_context(|| format!("Parquet writer settings are invalid for selected DMV table {name}"))?;
+                let collector_layout = self
+                    .tunables
+                    .collector
+                    .as_ref()
+                    .and_then(|collector| collector.layout.as_ref());
+                for (writer, enabled, columns) in [
+                    (
+                        self.tunables.parquet_writer.as_ref(),
+                        collector_layout.and_then(|layout| layout.enabled),
+                        collector_layout.and_then(|layout| layout.sort_columns.as_ref()),
+                    ),
+                    (
+                        maintenance.and_then(|settings| settings.parquet_writer.as_ref()),
+                        maintenance.and_then(|settings| settings.layout_enabled),
+                        maintenance.and_then(|settings| settings.layout_sort_columns.as_ref()),
+                    ),
+                ] {
+                    if let Some(writer) = writer {
+                        let enabled = enabled.unwrap_or_else(|| table.schema().field_with_name("customer_id").is_ok());
+                        let sort = if enabled {
+                            columns.cloned().unwrap_or_else(|| vec!["customer_id".to_owned()])
+                        } else {
+                            Vec::new()
+                        };
+                        let verified_sort = sort
+                            .into_iter()
+                            .map(|path| arrowcol_tunables::ParquetSortColumn {
+                                path,
+                                descending: false,
+                                nulls_first: false,
+                            })
+                            .collect::<Vec<_>>();
+                        writer
+                            .writer_properties(table.schema(), None, &verified_sort)
+                            .with_context(|| {
+                                format!("Parquet writer settings are invalid for selected DMV table {name}")
+                            })?;
+                    }
+                }
             }
         }
         Ok(())
@@ -207,12 +822,28 @@ impl OatConfig {
         Ok(())
     }
 
+    pub(crate) fn catalog_registration_setup_timeout_seconds(&self) -> u64 {
+        if self.platform.kind == OatMode::Aks && self.campaign_profile == Some(CampaignProfile::ScaleOutSingleTable) {
+            CATALOG_REGISTRATION_SETUP_TIMEOUT_SECONDS
+        } else {
+            0
+        }
+    }
+
     pub(crate) fn timing_budget(&self) -> Result<RunTimingBudget> {
+        if !(1..=1_800).contains(&self.schedule_lead_seconds) {
+            bail!("schedule_lead_seconds must be between 1 and 1800");
+        }
         let schedule_wait_seconds = self
             .client_ready_timeout_seconds
             .checked_add(self.qap_timeout_seconds)
-            .and_then(|seconds| seconds.checked_add(SCHEDULE_DELIVERY_TIMEOUT_SECONDS))
+            .and_then(|seconds| seconds.checked_add(self.schedule_lead_seconds))
             .context("OAT startup schedule wait budget overflow")?;
+        if schedule_wait_seconds > MAX_CLIENT_SCHEDULE_WAIT_SECONDS {
+            bail!(
+                "client_ready_timeout_seconds + qap_timeout_seconds + schedule_lead_seconds must not exceed the arrowcol-dmv schedule wait limit of {MAX_CLIENT_SCHEDULE_WAIT_SECONDS} seconds"
+            );
+        }
         let client_job_lifetime_seconds = schedule_wait_seconds
             .checked_add(self.warmup_seconds)
             .and_then(|seconds| seconds.checked_add(self.measure_seconds))
@@ -220,15 +851,72 @@ impl OatConfig {
             .context("OAT client Job lifetime budget overflow")?;
         let minimum_pin_ttl_ms = client_job_lifetime_seconds
             .checked_add(PIN_INIT_SETUP_TIMEOUT_SECONDS)
+            .and_then(|seconds| seconds.checked_add(self.catalog_registration_setup_timeout_seconds()))
             .and_then(|seconds| seconds.checked_add(self.reconciliation_settle_timeout_seconds))
             .and_then(|seconds| seconds.checked_add(self.collector_stop_grace_seconds))
+            .and_then(|seconds| seconds.checked_add(self.qap_timeout_seconds))
             .context("OAT pin initialization and collector drain lifetime budget overflow")?
             .checked_mul(1_000)
             .context("OAT run pin lifetime budget overflow")?;
+        let rollout_timeout_ms = if self.platform.kind == OatMode::Aks {
+            self.aks_rollout_timeout_seconds
+                .checked_mul(1_000)
+                .context("OAT AKS rollout timeout overflow")?
+        } else {
+            0
+        };
+        let maintenance_rollouts = u64::from(
+            self.tunables
+                .maintenance
+                .as_ref()
+                .is_some_and(|settings| settings.enabled == Some(true)),
+        );
+        let setup_rollout_count = if self.platform.kind == OatMode::Aks {
+            u64::try_from(self.deployment_names().len())?
+                .checked_add(1)
+                .context("OAT AKS setup rollout count overflow")?
+        } else {
+            0
+        };
+        let scale_rollout_count = if self.platform.kind == OatMode::Aks {
+            u64::try_from(self.deployment_names().len())?
+                .checked_add(maintenance_rollouts)
+                .context("OAT AKS scale rollout count overflow")?
+        } else {
+            0
+        };
+        let pre_cell_setup_timeout_ms = if self.platform.kind == OatMode::Aks {
+            setup_rollout_count
+                .checked_mul(rollout_timeout_ms)
+                .context("OAT AKS setup timeout overflow")?
+        } else {
+            1_260_000
+        };
+        let resource_counter_snapshot_budget_ms = if self.platform.kind == OatMode::Aks {
+            AKS_RESOURCE_COUNTER_SNAPSHOT_TIMEOUT_MS
+                .checked_mul(2)
+                .context("OAT AKS resource-counter snapshot budget overflow")?
+        } else {
+            0
+        };
+        let after_setup_budget_ms = minimum_pin_ttl_ms
+            .checked_add(
+                scale_rollout_count
+                    .checked_mul(rollout_timeout_ms)
+                    .context("OAT scale rollout budget overflow")?,
+            )
+            .and_then(|budget| budget.checked_add(resource_counter_snapshot_budget_ms))
+            .context("OAT post-setup cell budget overflow")?;
+        let planned_cell_duration_ms = pre_cell_setup_timeout_ms
+            .checked_add(after_setup_budget_ms)
+            .context("OAT planned cell lifecycle duration overflow")?;
         Ok(RunTimingBudget {
             schedule_wait_seconds,
             client_job_lifetime_seconds,
             minimum_pin_ttl_ms,
+            pre_cell_setup_timeout_ms,
+            after_setup_budget_ms,
+            planned_cell_duration_ms,
         })
     }
 
@@ -238,7 +926,26 @@ impl OatConfig {
     ///
     /// Returns an error when a setting is invalid or a requested DMV table is unsupported.
     pub fn validate(&self) -> Result<()> {
+        if self
+            .platform
+            .local
+            .collector_memory_limit_bytes
+            .is_some_and(|bytes| !(8 * 1024 * 1024..=1024_u64.pow(4)).contains(&bytes))
+        {
+            bail!("platform.local.collector_memory_limit_bytes must be integer bytes in 8388608..=1099511627776");
+        }
+        if !self.overload_guard.cap_fraction.is_finite()
+            || self.overload_guard.cap_fraction <= 0.0
+            || self.overload_guard.cap_fraction > 0.90
+            || !(1..=2).contains(&self.overload_guard.zero_progress_windows)
+        {
+            bail!("overload_guard requires cap_fraction in (0, 0.90] and zero_progress_windows in 1..=2");
+        }
+        self.validate_campaign_profile()?;
+        self.validate_local_purge_inputs()?;
         self.tunables.validate_for_oat()?;
+        self.validate_platform_resources()?;
+        self.maintenance_stop_budget()?;
         self.validate_selected_parquet_schemas()?;
         self.validate_selected_layout_schemas()?;
         if self
@@ -277,6 +984,22 @@ impl OatConfig {
         }
         if !(30..=3_600).contains(&self.collector_stop_grace_seconds) {
             bail!("collector_stop_grace_seconds must be between 30 and 3600");
+        }
+        const TERMINAL_WRITE_MARGIN_SECONDS: u64 = 60;
+        let drain_seconds = u64::from(
+            self.tunables
+                .collector
+                .as_ref()
+                .and_then(|collector| collector.shutdown_drain_timeout_seconds)
+                .unwrap_or(DEFAULT_COLLECTOR_SHUTDOWN_DRAIN_TIMEOUT_SECONDS),
+        );
+        // The global controller drains producers and then system observability,
+        // each with the configured budget. Reserve time for terminal finalization.
+        let required_grace = 2 * drain_seconds + TERMINAL_WRITE_MARGIN_SECONDS;
+        if self.collector_stop_grace_seconds < required_grace {
+            bail!(
+                "collector_stop_grace_seconds must be at least {required_grace} (two {drain_seconds}s drain phases plus {TERMINAL_WRITE_MARGIN_SECONDS}s for terminal writes)"
+            );
         }
         if !(1..=300).contains(&self.qap_timeout_seconds) {
             bail!("qap_timeout_seconds must be between 1 and 300");
@@ -386,7 +1109,8 @@ impl OatConfig {
                     || self.platform.compose_state_root.is_some()
                     || self.platform.local.bind_host.is_some()
                     || self.platform.local.endpoint_host.is_some()
-                    || self.platform.local.snapshot_root.is_some() =>
+                    || self.platform.local.snapshot_root.is_some()
+                    || self.platform.local.collector_memory_limit_bytes.is_some() =>
             {
                 bail!("compose settings are only valid for the local platform");
             }
@@ -489,13 +1213,35 @@ impl OatConfig {
         if self.rows_per_table == 0 || self.rows_per_table > 1_000_000 || !(1..=64).contains(&self.dmv_concurrency) {
             bail!("rows_per_table must be 1..=1000000 and dmv_concurrency 1..=64");
         }
-        if !(1..=4).contains(&self.clients_per_table)
+        if let Some(fleet) = &self.platform.fleet {
+            fleet.validate(self)?;
+        }
+        let max_clients_per_table = if self.campaign_profile == Some(CampaignProfile::ScaleOutSingleTable) {
+            128
+        } else {
+            4
+        };
+        if !(1..=max_clients_per_table).contains(&self.clients_per_table)
             || self
                 .clients_per_table
                 .checked_mul(self.tables.len())
                 .is_none_or(|total| total > 128)
         {
-            bail!("clients_per_table must be between 1 and 4 and the client fleet may not exceed 128");
+            bail!(
+                "clients_per_table must be between 1 and {max_clients_per_table} and the client fleet may not exceed 128"
+            );
+        }
+        if let Some(client_counts) = &self.clients_per_table_sweep
+            && (self.campaign_profile != Some(CampaignProfile::ScaleOutSingleTable)
+                || client_counts.is_empty()
+                || client_counts.len() > 25
+                || client_counts.iter().any(|count| {
+                    !(1..=max_clients_per_table).contains(count)
+                        || count.checked_mul(self.tables.len()).is_none_or(|total| total > 128)
+                })
+                || client_counts.iter().copied().collect::<HashSet<_>>().len() != client_counts.len())
+        {
+            bail!("clients_per_table_sweep requires 1 to 25 distinct scale_out_single_table values from 1 through 128");
         }
         let qap_endpoint = Url::parse(&self.qap_endpoint).context("qap_endpoint must be a URL")?;
         if !matches!(qap_endpoint.scheme(), "http" | "https")
@@ -538,7 +1284,11 @@ impl OatConfig {
             bail!("dfe_worker_concurrency must contain 1 to 16 distinct values from 1 through 256");
         }
         self.validate_wal_capacity_for_cores()?;
-        if self.replica_counts.len() * self.dfe_worker_concurrency.len() > 25 {
+        if self.replica_counts.len()
+            * self.dfe_worker_concurrency.len()
+            * self.clients_per_table_sweep.as_ref().map_or(1, Vec::len)
+            > 25
+        {
             bail!("the OAT experiment matrix may contain at most 25 combinations");
         }
         if self.tables.is_empty() || self.tables.len() > 32 {
@@ -692,6 +1442,85 @@ fn validate_storage_url(value: &str, field: &str, expected_container: &str, allo
 mod tests {
     use super::*;
 
+    #[test]
+    fn aks_resources_keep_defaults_validate_quantities_and_allow_oversubscription() -> Result<()> {
+        use serde_json::json;
+
+        let defaults = serde_json::to_value(AksResourceConfig::default())?;
+        assert_eq!(defaults["collector"]["requests"]["cpu"], "2");
+        assert_eq!(defaults["collector"]["limits"]["memory"], "6Gi");
+        assert_eq!(defaults["client"]["requests"]["cpu"], "250m");
+        assert_eq!(defaults["client"]["limits"]["memory"], "2Gi");
+        assert_eq!(defaults["maintenance"]["requests"]["memory"], "512Mi");
+        assert_eq!(defaults["router"]["limits"]["memory"], "1Gi");
+        assert_eq!(defaults["catalog"]["limits"]["memory"], "4Gi");
+
+        let mut config = valid();
+        config.platform.resources = Some(serde_json::from_value(json!({
+            "collector": { "requests": {"cpu":"250m","memory":"1Gi"}, "limits": {"cpu":"1","memory":"6Gi"} },
+            "client": { "requests": {"cpu":"250m","memory":"256Mi"}, "limits": {"cpu":"1","memory":"2Gi"} }
+        }))?);
+        config.dfe_worker_concurrency = vec![4];
+        config.dmv_concurrency = 16;
+        config.validate()?;
+
+        for bad in ["1.0001", "1n", "0m", "", " 1"] {
+            let mut invalid = valid();
+            invalid.platform.resources = Some(serde_json::from_value(json!({
+                "collector": { "requests": {"cpu":bad,"memory":"1Gi"}, "limits": {"cpu":"2","memory":"6Gi"} }
+            }))?);
+            assert!(invalid.validate().is_err(), "accepted invalid CPU quantity {bad:?}");
+        }
+        let mut invalid = valid();
+        invalid.platform.resources = Some(serde_json::from_value(json!({
+            "collector": { "requests": {"cpu":"2","memory":"7Gi"}, "limits": {"cpu":"1","memory":"6Gi"} }
+        }))?);
+        assert!(invalid.validate().is_err());
+        assert!(serde_json::from_value::<AksResourceOverrides>(json!({"collector":{"cpu":"2"}})).is_err());
+        assert!(serde_json::from_value::<AksResourceOverrides>(json!({"client_typo":{}})).is_err());
+        let uncapped: AksResourceOverrides = serde_json::from_value(json!({
+            "collector": {"requests":{"cpu":"2","memory":"4Gi"}, "limits":{"cpu":null,"memory":"6Gi"}}
+        }))?;
+        assert!(uncapped.resolve().validate(false).is_err());
+        uncapped.resolve().validate(true)?;
+        let mut bad = uncapped.clone();
+        bad.client = bad.collector.clone();
+        assert!(bad.resolve().validate(true).is_err());
+        let mut bad = uncapped.clone();
+        bad.collector.as_mut().context("missing collector")?.requests.cpu = None;
+        assert!(bad.resolve().validate(true).is_err());
+        let omitted: AksResourceOverrides = serde_json::from_value(json!({
+            "collector": {"requests":{"cpu":"2","memory":"4Gi"}, "limits":{"memory":"6Gi"}}
+        }))?;
+        omitted.resolve().validate(true)?;
+        assert!(omitted.resolve().validate(false).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn overload_guard_rejects_malformed_or_protocol_weakening_settings() -> Result<()> {
+        use serde_json::json;
+
+        for value in [
+            json!({"enabled":"true"}),
+            json!({"cap_fraction":"0.9"}),
+            json!({"zero_progress_windows":1.5}),
+            json!({"zero_progress_windows":-1}),
+            json!({"unknown":true}),
+        ] {
+            assert!(serde_json::from_value::<OverloadGuardConfig>(value).is_err());
+        }
+        let mut config = valid();
+        for (cap_fraction, windows) in [(0.0, 2), (0.91, 2), (f64::NAN, 2), (0.9, 0), (0.9, 3)] {
+            config.overload_guard.cap_fraction = cap_fraction;
+            config.overload_guard.zero_progress_windows = windows;
+            assert!(config.validate().is_err());
+        }
+        config.overload_guard = serde_json::from_value(json!({"cap_fraction":0.8,"zero_progress_windows":1}))?;
+        config.validate()?;
+        Ok(())
+    }
+
     struct TestConfig {
         config: OatConfig,
         directory: std::path::PathBuf,
@@ -723,6 +1552,53 @@ mod tests {
         }
     }
 
+    #[test]
+    fn schedule_lead_is_strict_bounded_and_fits_the_actual_client_wait_limit() -> Result<()> {
+        let mut request: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.example.json"
+        ))?;
+        let omitted: OatConfig = serde_json::from_value(request.clone())?;
+        assert_eq!(omitted.schedule_lead_seconds, 180);
+        for invalid in [
+            serde_json::Value::Null,
+            serde_json::json!("5"),
+            serde_json::json!(0.5),
+            serde_json::json!(-1),
+            serde_json::json!(true),
+        ] {
+            request["schedule_lead_seconds"] = invalid;
+            assert!(serde_json::from_value::<OatConfig>(request.clone()).is_err());
+        }
+        let mut config = valid();
+        for invalid in [0, 1_801, u64::MAX] {
+            config.schedule_lead_seconds = invalid;
+            assert!(config.timing_budget().is_err());
+            assert!(config.validate().is_err());
+        }
+        config.client_ready_timeout_seconds = 30;
+        config.qap_timeout_seconds = 1;
+        for valid in [1, 17, 180, 1_800] {
+            request["schedule_lead_seconds"] = serde_json::json!(valid);
+            assert_eq!(
+                serde_json::from_value::<OatConfig>(request.clone())?.schedule_lead_seconds,
+                valid
+            );
+            config.schedule_lead_seconds = valid;
+            config.validate()?;
+        }
+        config.client_ready_timeout_seconds = 1_800;
+        config.qap_timeout_seconds = 300;
+        config.schedule_lead_seconds = 60;
+        config.validate()?;
+        config.schedule_lead_seconds = 61;
+        let error = config
+            .validate()
+            .err()
+            .context("accepted a wait beyond the client CLI ceiling")?;
+        assert!(error.to_string().contains("arrowcol-dmv schedule wait limit"));
+        Ok(())
+    }
+
     fn valid() -> TestConfig {
         let directory = std::env::temp_dir().join(format!("arrowcol-oat-config-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&directory)
@@ -734,7 +1610,9 @@ mod tests {
                 .unwrap_or_else(|error| panic!("write isolated OAT config fixture {}: {error}", path.display()));
         }
         let config = OatConfig {
+            overload_guard: OverloadGuardConfig::default(),
             tunables: Tunables::default(),
+            campaign_profile: None,
             platform: PlatformConfig {
                 kind: OatMode::Aks,
                 compose_file: None,
@@ -745,10 +1623,13 @@ mod tests {
                 runtime_config_file: Some(runtime_config.to_string_lossy().into_owned()),
                 bootstrap_env_file: Some(bootstrap_env.to_string_lossy().into_owned()),
                 local: LocalOptions::default(),
+                resources: None,
+                fleet: None,
             },
             stamp: Some("00000".to_owned()),
             warmup_seconds: 30,
             measure_seconds: 60,
+            schedule_lead_seconds: default_schedule_lead_seconds(),
             client_ready_timeout_seconds: 600,
             aks_rollout_timeout_seconds: 600,
             reconciliation_settle_timeout_seconds: 120,
@@ -776,6 +1657,7 @@ mod tests {
             ],
             rows_per_table: 1000,
             clients_per_table: 1,
+            clients_per_table_sweep: None,
             dmv_concurrency: 2,
             qap_endpoint: "http://kusto:8080".to_owned(),
             qap_database: Some("experimentqap".to_owned()),
@@ -786,6 +1668,164 @@ mod tests {
             website_url: "abfss://$web@account.dfs.core.windows.net/results.parquet".to_owned(),
         };
         TestConfig { config, directory }
+    }
+
+    #[test]
+    fn single_hot_table_profile_rejects_unsafe_settings() -> Result<()> {
+        let mut config = valid();
+        config.campaign_profile = Some(CampaignProfile::SingleHotTable);
+        config.tables = vec!["sqlserver_availability_replica_states".to_owned()];
+        config.replica_counts = vec![1];
+        config.maintenance_image = Some(format!("maintenance@sha256:{}", "a".repeat(64)));
+        config.tunables = serde_json::from_value(serde_json::json!({
+            "maintenance": {
+                "enabled": true, "apply": true,
+                "operations": ["purge", "optimize", "vacuum", "checkpoint", "prune_log"]
+            }
+        }))?;
+        config.validate_campaign_profile()?;
+        config.validate()?;
+        config.tables[0] = "sqlserver_wait_stats".to_owned();
+        assert!(config.validate_campaign_profile().is_err());
+        config.tables[0] = "sqlserver_availability_replica_states".to_owned();
+        config.tables.push("sqlserver_cpu_utilization".to_owned());
+        assert!(config.validate().is_err());
+        config.tables.pop();
+        config.replica_counts = vec![1, 2];
+        assert!(config.validate_campaign_profile().is_err());
+        config.replica_counts = vec![1];
+        config.tunables.wal = Some(arrowcol_tunables::WalTunables::default());
+        assert!(config.validate_campaign_profile().is_err());
+        config.tunables.wal = None;
+        config
+            .tunables
+            .maintenance
+            .as_mut()
+            .context("campaign maintenance tunables missing")?
+            .apply = Some(false);
+        assert!(config.validate_campaign_profile().is_err());
+        config
+            .tunables
+            .maintenance
+            .as_mut()
+            .context("campaign maintenance tunables missing")?
+            .apply = Some(true);
+        let removed = config
+            .tunables
+            .maintenance
+            .as_mut()
+            .context("campaign maintenance tunables missing")?
+            .operations
+            .as_mut()
+            .context("campaign maintenance operations missing")?
+            .pop()
+            .context("expected a configured maintenance operation")?;
+        assert_eq!(removed, arrowcol_tunables::MaintenanceOperation::PruneLog);
+        assert!(config.validate_campaign_profile().is_err());
+        config
+            .tunables
+            .maintenance
+            .as_mut()
+            .context("campaign maintenance tunables missing")?
+            .operations
+            .as_mut()
+            .context("campaign maintenance operations missing")?
+            .push(arrowcol_tunables::MaintenanceOperation::PruneLog);
+        config
+            .tunables
+            .maintenance
+            .as_mut()
+            .context("campaign maintenance tunables missing")?
+            .max_cycles = Some(1);
+        assert!(config.validate_campaign_profile().is_err());
+        assert!(serde_json::from_str::<CampaignProfile>(r#""single_hot_tables""#).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn local_purge_requires_explicit_granularity_and_retention_but_aks_inherits_catalog() -> Result<()> {
+        let mut config = valid();
+        let runtime_config_file = config.platform.runtime_config_file.clone();
+        let bootstrap_env_file = config.platform.bootstrap_env_file.clone();
+        config.platform.kind = OatMode::Local;
+        config.platform.runtime_config_file = None;
+        config.platform.bootstrap_env_file = None;
+        config.platform.compose_file = Some("projects/loadtest/compose.yaml".to_owned());
+        config.platform.compose_override_file = Some("projects/loadtest/compose.override.yaml".to_owned());
+        config.platform.compose_project = Some("oat-test".to_owned());
+        config.platform.compose_state_root = Some(config.directory.to_string_lossy().into_owned());
+        config.qap_database = Some("loadtest".to_owned());
+        config.tunables = serde_json::from_value(serde_json::json!({
+            "maintenance": {"enabled": true, "apply": true, "operations": ["purge"]}
+        }))?;
+        let missing_granularity = config
+            .validate()
+            .err()
+            .context("local PURGE accepted missing granularity")?
+            .to_string();
+        assert!(missing_granularity.contains("maintenance.granularity"));
+        config
+            .tunables
+            .maintenance
+            .as_mut()
+            .context("local maintenance tunables missing")?
+            .granularity = Some(arrowcol_tunables::MaintenanceGranularity::Hour);
+        let missing_retention = config
+            .validate()
+            .err()
+            .context("local PURGE accepted missing retention")?
+            .to_string();
+        assert!(missing_retention.contains("maintenance.purge_retention_secs"));
+        config
+            .tunables
+            .maintenance
+            .as_mut()
+            .context("local maintenance tunables missing")?
+            .purge_retention_secs = Some(2_592_000);
+        config.validate()?;
+
+        config.platform.kind = OatMode::Aks;
+        config.platform.compose_file = None;
+        config.platform.compose_override_file = None;
+        config.platform.compose_project = None;
+        config.platform.compose_state_root = None;
+        config.platform.runtime_config_file = runtime_config_file;
+        config.platform.bootstrap_env_file = bootstrap_env_file;
+        config.stamp = Some("00000".to_owned());
+        config.maintenance_image = Some(format!("maintenance@sha256:{}", "a".repeat(64)));
+        config
+            .tunables
+            .maintenance
+            .as_mut()
+            .context("AKS maintenance tunables missing")?
+            .granularity = None;
+        config
+            .tunables
+            .maintenance
+            .as_mut()
+            .context("AKS maintenance tunables missing")?
+            .purge_retention_secs = None;
+        config.validate()?;
+        Ok(())
+    }
+
+    #[test]
+    fn oat_json_rejects_invalid_injectable_enums() -> Result<()> {
+        let base: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docs/experiments/arrowcol-oat/oat-config.quick.json"
+        ))?;
+        for tunables in [
+            serde_json::json!({"parquet_writer":{"defaults":{"compression":"zstandard"}}}),
+            serde_json::json!({"parquet_writer":{"defaults":{"encoding":"invalid"}}}),
+            serde_json::json!({"parquet_writer":{"defaults":{"statistics":"invalid"}}}),
+            serde_json::json!({"arrow_ipc":{"compression":"invalid"}}),
+            serde_json::json!({"maintenance":{"operations":["invalid"]}}),
+        ] {
+            let mut input = base.clone();
+            input["tunables"] = tunables;
+            assert!(serde_json::from_value::<OatConfig>(input).is_err());
+        }
+        Ok(())
     }
 
     #[test]
@@ -846,6 +1886,26 @@ mod tests {
         let mut config = valid();
         assert_eq!(config.collector_stop_grace_seconds, 300);
         config.collector_stop_grace_seconds = 30;
+        assert!(config.validate().is_err());
+        config.collector_stop_grace_seconds = 179;
+        assert!(config.validate().is_err());
+        config.collector_stop_grace_seconds = 180;
+        config.validate()?;
+        config.tunables.collector = Some(arrowcol_tunables::CollectorTunables {
+            shutdown_drain_timeout_seconds: Some(240),
+            ..Default::default()
+        });
+        config.collector_stop_grace_seconds = 539;
+        assert!(
+            config
+                .validate()
+                .err()
+                .context("expected insufficient grace")?
+                .to_string()
+                .contains("at least 540")
+        );
+        config.collector_stop_grace_seconds = 540;
+        config.run_pin_ttl_ms = 86_400_000;
         config.validate()?;
         config.collector_stop_grace_seconds = 3_600;
         config.run_pin_ttl_ms = 86_400_000;
@@ -867,6 +1927,24 @@ mod tests {
         config.validate()?;
         config.reconciliation_settle_timeout_seconds = 1_801;
         assert!(config.validate().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn qap_catch_up_uses_the_existing_strict_observation_budget() -> Result<()> {
+        use serde_json::{Value, json};
+        let quick = include_str!("../../../docs/experiments/arrowcol-oat/oat-config.quick.json");
+        let mut config: OatConfig = serde_json::from_str(quick)?;
+        assert_eq!(config.qap_timeout_seconds, 60);
+        for seconds in [0, 301] {
+            config.qap_timeout_seconds = seconds;
+            assert!(config.validate().is_err());
+        }
+        for invalid in [json!("60"), json!(1.5), json!(-1), Value::Null] {
+            let mut input: Value = serde_json::from_str(quick)?;
+            input["qap_timeout_seconds"] = invalid;
+            assert!(serde_json::from_value::<OatConfig>(input).is_err());
+        }
         Ok(())
     }
 
@@ -901,6 +1979,24 @@ mod tests {
         });
         assert!(matches!(
             missing_column.validate(),
+            Err(error) if format!("{error:#}").contains("unknown physical Parquet column not_a_dmv_column")
+        ));
+
+        let mut missing_maintenance_column = valid();
+        missing_maintenance_column.tunables.maintenance = Some(arrowcol_tunables::MaintenanceTunables {
+            enabled: Some(true),
+            operations: Some(vec![arrowcol_tunables::MaintenanceOperation::Optimize]),
+            parquet_writer: Some(arrowcol_tunables::ParquetWriterConfig {
+                columns: std::collections::BTreeMap::from([(
+                    "not_a_dmv_column".to_owned(),
+                    arrowcol_tunables::ParquetColumnOptions::default(),
+                )]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert!(matches!(
+            missing_maintenance_column.validate(),
             Err(error) if format!("{error:#}").contains("unknown physical Parquet column not_a_dmv_column")
         ));
 
@@ -946,6 +2042,41 @@ mod tests {
             invalid_layout.validate(),
             Err(error) if format!("{error:#}").contains("unknown sort column not_a_dmv_column")
         ));
+        let mut sorted = valid();
+        sorted.tables = vec![table.identity().table().as_str().to_owned()];
+        sorted.tunables.collector = Some(arrowcol_tunables::CollectorTunables {
+            layout: Some(arrowcol_tunables::LayoutTunables {
+                enabled: Some(true),
+                sort_columns: Some(vec!["customer_id".to_owned()]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        sorted.tunables.parquet_writer = Some(arrowcol_tunables::ParquetWriterConfig {
+            sorting_columns: Some(vec![arrowcol_tunables::ParquetSortColumn {
+                path: "customer_id".to_owned(),
+                descending: false,
+                nulls_first: false,
+            }]),
+            ..Default::default()
+        });
+        sorted.validate()?;
+        sorted
+            .tunables
+            .parquet_writer
+            .as_mut()
+            .context("sorted writer configuration missing")?
+            .sorting_columns
+            .as_mut()
+            .context("sorting columns missing")?
+            .first_mut()
+            .context("sorting column missing")?
+            .descending = true;
+        let mismatch = sorted
+            .validate()
+            .err()
+            .context("inconsistent sorting metadata was accepted")?;
+        assert!(format!("{mismatch:#}").contains("sorting metadata must match"));
         Ok(())
     }
 
@@ -991,19 +2122,169 @@ mod tests {
     }
 
     #[test]
+    fn rust_and_typescript_stop_budgets_share_the_same_fixtures() -> Result<()> {
+        let fixtures: Vec<serde_json::Value> =
+            serde_json::from_str(include_str!("../../arrowcol-oat/stop-budget-fixtures.json"))?;
+        for fixture in fixtures {
+            if fixture.get("validation").is_some() {
+                let budget: EffectiveStopBudgets = serde_json::from_value(fixture["validation"].clone())?;
+                assert!(
+                    budget.validate().is_err(),
+                    "{} must be rejected by Rust",
+                    fixture["name"]
+                );
+                continue;
+            }
+            let mut config = valid();
+            let mut maintenance = serde_json::json!({
+                "enabled": true,
+                "apply": true,
+                "operations": fixture["operations"].clone(),
+            });
+            if let Some(timeout) = fixture["operation_timeout_secs"].as_u64() {
+                maintenance["operation_timeout_secs"] = serde_json::json!(timeout);
+            }
+            config.tunables =
+                arrowcol_tunables::Tunables::parse_oat_json(serde_json::json!({"maintenance": maintenance}))?;
+            let result = config.maintenance_stop_budget();
+            if fixture["rejected"] == true {
+                assert!(result.is_err(), "{} must be rejected by Rust", fixture["name"]);
+            } else {
+                assert_eq!(
+                    serde_json::to_value(result?)?,
+                    fixture["expected"],
+                    "{}",
+                    fixture["name"]
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn pin_ttl_covers_the_full_startup_and_client_lifetime_envelope() -> Result<()> {
         let mut config = valid();
         config.client_ready_timeout_seconds = 1_800;
         config.qap_timeout_seconds = 300;
+        config.schedule_lead_seconds = 60;
         config.warmup_seconds = 300;
         config.measure_seconds = 600;
-        config.run_pin_ttl_ms = 4_080_000;
+        config.run_pin_ttl_ms = config.timing_budget()?.minimum_pin_ttl_ms;
         config.validate()?;
 
         config.run_pin_ttl_ms -= 1;
         assert!(
             config.validate().is_err(),
             "a pin expiring before the bounded Job lifetime must be rejected"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn client_fleet_is_bounded_across_tables() -> Result<()> {
+        let mut config = valid();
+        assert_eq!(config.clients_per_table, 1);
+        config.clients_per_table = 5;
+        assert!(config.validate().is_err());
+        config.campaign_profile = Some(CampaignProfile::ScaleOutSingleTable);
+        config.overload_guard.enabled = true;
+        config.tables = vec!["sqlserver_availability_replica_states".to_owned()];
+        config.replica_counts = vec![1];
+        config.maintenance_image = Some(format!("maintenance@sha256:{}", "a".repeat(64)));
+        config.tunables = serde_json::from_value(serde_json::json!({
+            "maintenance": {
+                "enabled": true, "apply": true,
+                "operations": ["purge", "optimize", "vacuum", "checkpoint", "prune_log"]
+            }
+        }))?;
+        config.clients_per_table = 128;
+        config.clients_per_table_sweep = Some(vec![1, 2, 4, 8, 16, 32, 64, 128]);
+        config.validate()?;
+        config.clients_per_table_sweep = Some(vec![1, 1]);
+        assert!(config.validate().is_err());
+        config.clients_per_table_sweep = Some(vec![129]);
+        assert!(config.validate().is_err());
+        config.clients_per_table_sweep = None;
+        for replicas in [vec![2], vec![1, 2], vec![]] {
+            config.replica_counts = replicas;
+            let error = config
+                .validate_campaign_profile()
+                .err()
+                .context("invalid replicas were accepted")?;
+            assert!(error.to_string().contains("replica_counts [1]"));
+        }
+        config.replica_counts = vec![1];
+        config.clients_per_table = 129;
+        assert!(config.validate().is_err());
+        config.clients_per_table = 0;
+        assert!(config.validate().is_err());
+        config.clients_per_table = usize::MAX;
+        assert!(config.validate().is_err());
+        config.clients_per_table = 1;
+        config.tables.push("sqlserver_wait_stats".to_owned());
+        assert!(config.validate().is_err());
+        config.tables.clear();
+        assert!(config.validate().is_err());
+        config.tables.push("sqlserver_wait_stats".to_owned());
+        assert!(config.validate().is_err());
+        config.tables[0] = "sqlserver_availability_replica_states".to_owned();
+        config.tunables.wal = Some(arrowcol_tunables::WalTunables::default());
+        assert!(config.validate().is_err());
+        config.tunables.wal = None;
+        let maintenance = config.tunables.maintenance.take().context("missing test maintenance")?;
+        assert!(config.validate().is_err());
+        config.tunables.maintenance = Some(maintenance);
+        config
+            .tunables
+            .maintenance
+            .as_mut()
+            .context("missing test maintenance")?
+            .enabled = Some(false);
+        assert!(config.validate().is_err());
+        config
+            .tunables
+            .maintenance
+            .as_mut()
+            .context("missing test maintenance")?
+            .enabled = Some(true);
+        config
+            .tunables
+            .maintenance
+            .as_mut()
+            .context("missing test maintenance")?
+            .apply = Some(false);
+        assert!(config.validate().is_err());
+        config
+            .tunables
+            .maintenance
+            .as_mut()
+            .context("missing test maintenance")?
+            .apply = Some(true);
+        config
+            .tunables
+            .maintenance
+            .as_mut()
+            .context("missing test maintenance")?
+            .operations = Some(vec![]);
+        assert!(config.validate().is_err());
+        config
+            .tunables
+            .maintenance
+            .as_mut()
+            .context("missing test maintenance")?
+            .operations = Some(vec![
+            arrowcol_tunables::MaintenanceOperation::Purge,
+            arrowcol_tunables::MaintenanceOperation::Optimize,
+            arrowcol_tunables::MaintenanceOperation::Vacuum,
+            arrowcol_tunables::MaintenanceOperation::Checkpoint,
+            arrowcol_tunables::MaintenanceOperation::PruneLog,
+        ]);
+        config.overload_guard.enabled = false;
+        assert!(config.validate_campaign_profile().is_err());
+        assert!(serde_json::from_str::<CampaignProfile>(r#""scale_out_single_tables""#).is_err());
+        assert_eq!(
+            serde_json::to_string(&CampaignProfile::ScaleOutSingleTable)?,
+            r#""scale_out_single_table""#
         );
         Ok(())
     }
@@ -1079,11 +2360,70 @@ mod tests {
             runtime_config_file: None,
             bootstrap_env_file: None,
             local: LocalOptions::default(),
+            resources: None,
+            fleet: None,
         };
         config.result_url = "file:///tmp/arrowcol-oat/results.parquet".to_owned();
         config.website_url = "file:///tmp/arrowcol-oat/site/results.parquet".to_owned();
         config.qap_database = None;
         config.validate()
+    }
+
+    #[test]
+    fn resolved_fleet_requires_distinct_nodes_numeric_tunables_and_ready_pool_binding() -> Result<()> {
+        let mut config = valid();
+        config.campaign_profile = Some(CampaignProfile::ScaleOutSingleTable);
+        config.tables.truncate(1);
+        config.replica_counts = vec![1];
+        config.dfe_worker_concurrency = vec![8];
+        config.clients_per_table = 2;
+        let node = |name: &str, pool: &str, cores: u64| FleetNode {
+            node: name.to_owned(),
+            pool: pool.to_owned(),
+            sku: format!("Standard_D{cores}s_v6"),
+            allocatable_cpu_millicores: cores * 1000,
+            allocatable_memory_bytes: cores * (2 << 30),
+            resources: ResourceRequirements::new("2", "4Gi", "2", "6Gi"),
+        };
+        let mut collector = node("collector", "bigpool", 64);
+        collector.resources = config.effective_aks_resources().collector;
+        let client = |name: &str, pool: &str, cores| FleetClient {
+            placement: node(name, pool, cores),
+            rows_per_table: 1024,
+            dmv_concurrency: 2,
+            tunables: arrowcol_tunables::ClientTunables {
+                workers: Some(2),
+                ..Default::default()
+            },
+        };
+        let mut fleet = FleetPlacement {
+            collector,
+            clients: vec![client("client1", "smallpool", 4), client("client2", "otherpool", 8)],
+            pools: vec![],
+        };
+        fleet.pools = std::iter::once(&fleet.collector)
+            .chain(fleet.clients.iter().map(|client| &client.placement))
+            .map(|node| FleetPoolOutcome {
+                name: node.pool.clone(),
+                sku: node.sku.clone(),
+                vcpu: 4,
+                state: FleetPoolState::Ready,
+                reason: None,
+            })
+            .collect();
+        fleet.validate(&config)?;
+        let encoded = serde_json::to_value(&fleet)?;
+        assert!(serde_json::from_value::<FleetPlacement>(encoded.clone()).is_ok());
+        let mut unresolved = encoded;
+        unresolved["clients"][0]["tunables"]["workers"] = serde_json::json!("auto");
+        assert!(serde_json::from_value::<FleetPlacement>(unresolved).is_err());
+        fleet.clients[1].placement.node = fleet.clients[0].placement.node.clone();
+        assert!(fleet.validate(&config).is_err());
+        fleet.clients[1].placement.node = "client2".to_owned();
+        fleet.pools[1].state = FleetPoolState::Failed;
+        fleet.pools[1].reason = Some("allocation_failed".to_owned());
+        assert!(fleet.validate(&config).is_err());
+        Ok(())
     }
 
     #[test]
@@ -1099,6 +2439,8 @@ mod tests {
             runtime_config_file: None,
             bootstrap_env_file: None,
             local: LocalOptions::default(),
+            resources: None,
+            fleet: None,
         };
         config.result_url = "file:///tmp/arrowcol-oat/results.parquet".to_owned();
         config.website_url = "abfss://$web@account.dfs.core.windows.net/results.parquet".to_owned();
@@ -1172,6 +2514,8 @@ mod tests {
             runtime_config_file: None,
             bootstrap_env_file: None,
             local: LocalOptions::default(),
+            resources: None,
+            fleet: None,
         };
         config.result_url = "file:///tmp/arrowcol-oat/results.parquet".to_owned();
         config.website_url = "file:///tmp/arrowcol-oat/site/results.parquet".to_owned();

@@ -136,7 +136,9 @@ var userAgentPoolProfiles = [for userPool in aksConfig.userPools: {
   osSKU: 'AzureLinux'
   availabilityZones: userPool.availabilityZones
   nodeTaints: ['arrow-collector/role=${userPool.role}:NoSchedule']
-  nodeLabels: { type: 'benchmark', 'arrow-collector/role': userPool.role }
+  nodeLabels: contains(['benchd64', 'benche64'], userPool.name)
+    ? { type: 'benchmark', 'arrow-collector/role': userPool.role }
+    : { type: 'benchmark', 'arrow-collector/role': userPool.role, 'arrow-collector/sku': userPool.vmSize }
   upgradeSettings: { maxSurge: '33%' }
   securityProfile: { sshAccess: 'Disabled' }
 }]

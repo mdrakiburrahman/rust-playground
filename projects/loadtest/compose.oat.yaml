@@ -13,6 +13,8 @@ services:
       default:
         ipv4_address: !reset null
   dataflow-1:
+    ports:
+      - "${LOADTEST_BIND_HOST:-127.0.0.1}:0:32011"
     build:
       context: ../..
       dockerfile: projects/arrowcol-dataflow-rust/Dockerfile

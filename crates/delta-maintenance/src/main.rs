@@ -4,10 +4,13 @@ use anyhow::{Context, Result, anyhow};
 use arrow_deltalake::maintenance::{Granularity, InputReadStrategy, OptimizeConfig};
 use clap::Parser;
 use delta_kernel::metrics::WithMetricsReporterLayer;
-use delta_maintenance::{Metrics, Operation, OperationLimits, Settings, run, serve_metrics, startup_configuration};
+use delta_maintenance::{
+    Metrics, Operation, OperationLimits, OptimizeUploadMode, Settings, run_with_shutdown, serve_metrics,
+    startup_configuration,
+};
 use delta_maintenance::{
     catalog::{CatalogDiscovery, CatalogOptions},
-    run_with_discovery,
+    run_with_discovery_shutdown,
 };
 use opentelemetry_otlp::{Protocol, WithExportConfig};
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
@@ -65,6 +68,9 @@ struct Cli {
     /// Stop a scheduled service after this many cycles.
     #[arg(long, env = "ARROWCOL_MAINT_MAX_CYCLES")]
     max_cycles: Option<u64>,
+    /// Consecutive stale plans per table/operation before scheduled health fails.
+    #[arg(long, env = "ARROWCOL_MAINT_MAX_CONSECUTIVE_STALE_PLANS", default_value_t = 8)]
+    max_consecutive_stale_plans: u32,
     #[arg(long, env = "ARROWCOL_MAINT_MAX_CONCURRENT_TABLES", default_value_t = 1)]
     max_concurrent_tables: usize,
     /// Bound concurrent per-bin decoded limits; this is not a process RSS limit.
@@ -143,10 +149,19 @@ struct Cli {
     output_row_group_rows: usize,
     #[arg(long, env = "ARROWCOL_MAINT_MAX_OUTPUT_FILE_BYTES", default_value_t = 1023 * 1024 * 1024)]
     max_output_file_bytes: u64,
+    /// OPTIMIZE output upload mode: put_create (default) or buffered_multipart (unqualified).
+    #[arg(long, env = "ARROWCOL_MAINT_OPTIMIZE_UPLOAD_MODE", default_value = "put_create")]
+    optimize_upload_mode: String,
+    /// Buffered upload size for buffered_multipart only (4..=64 MiB).
+    #[arg(long, env = "ARROWCOL_MAINT_OPTIMIZE_UPLOAD_BUFFER_BYTES")]
+    optimize_upload_buffer_bytes: Option<usize>,
     #[arg(long, env = "ARROWCOL_MAINT_MAX_ACTIVE_FILES", default_value_t = 1_000_000)]
     max_active_files: usize,
     #[arg(long, env = "ARROWCOL_MAINT_LATEST_PARTITIONS")]
     latest_partitions: Option<usize>,
+    /// Keep newest/open ingestion partitions protected (default true); false opts into live compaction.
+    #[arg(long, env = "ARROWCOL_MAINT_SEALED_PARTITIONS_ONLY", conflicts_with = "sealed_final")]
+    sealed_partitions_only: Option<bool>,
     /// Include newest/open OPTIMIZE partitions; caller supplies lifecycle proof.
     /// One-shot optimize only, in either dry-run or apply mode.
     #[arg(long, env = "ARROWCOL_MAINT_SEALED_FINAL")]
@@ -204,6 +219,10 @@ fn settings(cli: Cli) -> Result<Settings> {
         ),
         ("arrowcol.optimize.minFiles", cli.min_files.map(|v| v.to_string())),
         (
+            "arrowcol.optimize.sealedPartitionsOnly",
+            cli.sealed_partitions_only.map(|value| value.to_string()),
+        ),
+        (
             "arrowcol.vacuum.maxDeletes",
             cli.vacuum_max_deletes.map(|v| v.to_string()),
         ),
@@ -241,6 +260,7 @@ fn settings(cli: Cli) -> Result<Settings> {
         interval: cli.interval_secs.map(Duration::from_secs),
         max_idle_backoff: Duration::from_secs(cli.max_idle_backoff_secs),
         max_cycles: cli.max_cycles,
+        max_consecutive_stale_plans: cli.max_consecutive_stale_plans,
         max_concurrent_tables: cli.max_concurrent_tables,
         max_concurrent_decoded_bytes: cli.max_concurrent_decoded_bytes,
         operation_timeout: Duration::from_secs(cli.operation_timeout_secs),
@@ -272,6 +292,8 @@ fn settings(cli: Cli) -> Result<Settings> {
         operation_limits: OperationLimits {
             purge_max_files_per_commit: cli.purge_max_files_per_commit,
             purge_max_plan_bytes: cli.purge_max_plan_bytes,
+            optimize_upload_mode: cli.optimize_upload_mode.parse::<OptimizeUploadMode>()?,
+            optimize_upload_buffer_bytes: cli.optimize_upload_buffer_bytes,
             vacuum_delete_chunk: cli.vacuum_delete_chunk,
             vacuum_max_plan_bytes: cli.vacuum_max_plan_bytes,
             replay_max_log_files: cli.replay_max_log_files,
@@ -368,6 +390,12 @@ fn main() -> ExitCode {
     }
 }
 
+fn request_shutdown(stop_admission: &AtomicBool, force_abort: &AtomicBool) {
+    if stop_admission.swap(true, Ordering::SeqCst) {
+        force_abort.store(true, Ordering::SeqCst);
+    }
+}
+
 fn main_inner() -> Result<bool> {
     let cli = Cli::parse();
     let catalog_endpoint = cli.catalog_endpoint.clone();
@@ -377,12 +405,19 @@ fn main_inner() -> Result<bool> {
     startup["log_filter"] = serde_json::json!(effective_log_filter());
     eprintln!("arrowcol_maintenance_effective_config {startup}");
     let provider = telemetry()?;
-    let cancel = Arc::new(AtomicBool::new(false));
-    let handler = Arc::clone(&cancel);
-    ctrlc::set_handler(move || handler.store(true, Ordering::SeqCst))?;
+    let stop_admission = Arc::new(AtomicBool::new(false));
+    let force_abort = Arc::new(AtomicBool::new(false));
+    let handler_stop = Arc::clone(&stop_admission);
+    let handler_force = Arc::clone(&force_abort);
+    ctrlc::set_handler(move || request_shutdown(&handler_stop, &handler_force))?;
     let metrics = Metrics::new();
+    let stop_metrics_listener = Arc::new(AtomicBool::new(false));
     let listener = if settings.interval.is_some() && !no_listener {
-        Some(serve_metrics(listen, metrics.clone(), Arc::clone(&cancel))?)
+        Some(serve_metrics(
+            listen,
+            metrics.clone(),
+            Arc::clone(&stop_metrics_listener),
+        )?)
     } else {
         None
     };
@@ -392,11 +427,11 @@ fn main_inner() -> Result<bool> {
             settings.tables.clone(),
             settings.catalog_options.clone(),
         )?;
-        run_with_discovery(&settings, &discovery, &metrics, &cancel)
+        run_with_discovery_shutdown(&settings, &discovery, &metrics, &stop_admission, &force_abort)
     } else {
-        run(&settings, &metrics, &cancel)
+        run_with_shutdown(&settings, &metrics, &stop_admission, &force_abort)
     };
-    cancel.store(true, Ordering::SeqCst);
+    stop_metrics_listener.store(true, Ordering::SeqCst);
     if let Some(listener) = listener {
         listener.join().map_err(|_| anyhow!("metrics listener panicked"))?;
     }
@@ -414,6 +449,46 @@ fn main_inner() -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn repeated_shutdown_signal_escalates_to_force_abort() {
+        let stop_admission = AtomicBool::new(false);
+        let force_abort = AtomicBool::new(false);
+        request_shutdown(&stop_admission, &force_abort);
+        assert!(stop_admission.load(Ordering::SeqCst));
+        assert!(!force_abort.load(Ordering::SeqCst));
+        request_shutdown(&stop_admission, &force_abort);
+        assert!(stop_admission.load(Ordering::SeqCst));
+        assert!(force_abort.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn metrics_listener_remains_available_during_graceful_drain() -> Result<()> {
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+
+        let reservation = TcpListener::bind("127.0.0.1:0")?;
+        let listen = reservation.local_addr()?;
+        drop(reservation);
+        let stop_metrics_listener = Arc::new(AtomicBool::new(false));
+        let listener = serve_metrics(listen, Metrics::new(), Arc::clone(&stop_metrics_listener))?;
+        let stop_admission = AtomicBool::new(false);
+        let force_abort = AtomicBool::new(false);
+        request_shutdown(&stop_admission, &force_abort);
+        assert!(stop_admission.load(Ordering::SeqCst));
+        assert!(!force_abort.load(Ordering::SeqCst));
+        assert!(!stop_metrics_listener.load(Ordering::SeqCst));
+
+        let mut stream = TcpStream::connect_timeout(&listen, Duration::from_secs(2))?;
+        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+        stream.write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n")?;
+        let mut response = String::new();
+        stream.read_to_string(&mut response)?;
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+
+        stop_metrics_listener.store(true, Ordering::SeqCst);
+        listener.join().map_err(|_| anyhow!("metrics listener panicked"))?;
+        Ok(())
+    }
 
     #[test]
     fn cli_limits_are_validated_and_propagated() -> Result<()> {
@@ -427,11 +502,31 @@ mod tests {
             "7",
             "--min-files",
             "3",
+            "--max-consecutive-stale-plans",
+            "4",
             "--output-row-group-rows",
             "1024",
         ];
         let config = settings(Cli::try_parse_from(args)?)?;
         assert_eq!(config.optimize.max_files_per_bin, 7);
+        assert_eq!(config.max_consecutive_stale_plans, 4);
+        let evidence = startup_configuration(&config)?;
+        assert_eq!(evidence["startup"]["max_consecutive_stale_plans"], 4);
+        assert_eq!(evidence["operation_settings"]["max_consecutive_stale_plans"], 4);
+        for value in ["0", "1025"] {
+            assert!(
+                settings(Cli::try_parse_from([
+                    "delta-maintenance",
+                    "--root",
+                    "file:///tmp/",
+                    "--operation",
+                    "optimize",
+                    "--max-consecutive-stale-plans",
+                    value,
+                ])?)
+                .is_err()
+            );
+        }
         assert_eq!(config.optimize.output_row_group_rows, 1024);
         assert_eq!(
             config
