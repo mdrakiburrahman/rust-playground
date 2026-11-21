@@ -312,9 +312,11 @@ export class Azure {
   tokens = new Map<string, { at: number; token: string; lifetime: number }>();
   token_pending = new Map<string, Promise<string>>();
   snapshots = new Map<string, Metadata>();
-  constructor(public c: Config) {}
+  constructor(public c: Config, private readonly cliTimeoutSeconds: number | (() => number) = 3600) {}
   async cli(...args: string[]): Promise<any> {
-    const result = await runtime.run_tree(['az', ...args, '--only-show-errors', '--output', 'json'], 3600);
+    const timeout = typeof this.cliTimeoutSeconds === 'function' ? this.cliTimeoutSeconds() : this.cliTimeoutSeconds;
+    if (!Number.isSafeInteger(timeout) || timeout < 1) throw new Failure('Azure CLI timeout must be a positive safe integer.');
+    const result = await runtime.run_tree(['az', ...args, '--only-show-errors', '--output', 'json'], timeout);
     if (result.returncode) throw new Failure(this.c.redact(result.stderr));
     return result.stdout.trim() ? JSON.parse(result.stdout) : null;
   }

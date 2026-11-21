@@ -4,12 +4,40 @@ import { resolve } from 'node:path';
 import test from 'node:test';
 import { parseAllDocuments } from 'yaml';
 import { ROOT } from '../../infra/azure/bootstrap.js';
-import { replaceInitializerExpiry } from './aks-direct-benchmark.js';
+import { assertRenderedManifest, renderManifest, replaceInitializerExpiry } from './aks-direct-benchmark.js';
 
 function record(value: unknown): Record<string, unknown> {
   assert.ok(value !== null && typeof value === 'object' && !Array.isArray(value));
   return value as Record<string, unknown>;
 }
+
+test('rendered benchmark manifest enforces ownership, stage, image, and timed-window invariants', async () => {
+  const manifestPath = resolve(ROOT, 'experiments/aks-direct-benchmark/arrowcollector-aks-benchmark.yaml');
+  const source = await readFile(manifestPath, 'utf8');
+  const runId = '00000000-0000-4000-8000-000000000001';
+  const owner = 'a'.repeat(48);
+  const values = (duration: string) => ({
+    BENCHRUNUUID: runId,
+    BENCHRUNHEX: runId.replaceAll('-', ''),
+    BENCHOWNER: owner,
+    BENCHCLIENTID: '11111111-2222-4333-8444-555555555555',
+    BENCHREGISTRY: 'arrowcollector68590.azurecr.io',
+    BENCHDELTA_ROOT: 'abfss://arrowcol@arrowcollector68590.dfs.core.windows.net/direct-baseline-1/runs/' + runId + '/dataflow',
+    BENCHSTAMP: '68590',
+    BENCHSUBSCRIPTION: '00000000-0000-4000-8000-000000000000',
+    BENCHRESOURCEGROUP: 'arrow-collector-rg',
+    BENCHSTORAGEACCOUNT: 'arrowcollector68590',
+    BENCHCHECKPOINTS: 'checkpoints',
+    BENCHDURATIONSECS: duration,
+  });
+  for (const duration of ['60', '600']) {
+    const rendered = renderManifest(source, values(duration));
+    assertRenderedManifest(rendered, runId, owner, 'arrowcollector68590.azurecr.io');
+    assert.throws(() => assertRenderedManifest(rendered.replace('benchmark-stage: load', 'benchmark-stage: unknown'), runId, owner, 'arrowcollector68590.azurecr.io'), /stage label/);
+    assert.throws(() => assertRenderedManifest(rendered.replace('@sha256:', ':latest'), runId, owner, 'arrowcollector68590.azurecr.io'), /pinned SHA-256 digest/);
+    assert.throws(() => assertRenderedManifest(rendered.replace('arrowcol-oat/owner-token: ' + owner, 'arrowcol-oat/owner-token: ' + 'b'.repeat(48)), runId, owner, 'arrowcollector68590.azurecr.io'), /ownership markers/);
+  }
+});
 
 test('rendered Kubernetes env values remain strings for YAML 1.1 consumers', async () => {
   const manifestPath = resolve(ROOT, 'experiments/aks-direct-benchmark/arrowcollector-aks-benchmark.yaml');

@@ -1451,7 +1451,7 @@ spec:
             - --warmup-secs
             - "60"
             - --duration-secs
-            - "600"
+            - "BENCHDURATIONSECS"
             - --schedule-file
             - /schedule/start
             - --schedule-timeout-secs
