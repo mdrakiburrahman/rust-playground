@@ -33,6 +33,14 @@ function requireRecord(value: unknown, label: string): JsonObject {
 function shellQuote(value: string): string {
   return "'" + value.replaceAll("'", "'\\''") + "'";
 }
+
+export function replaceInitializerExpiry(rendered: string, expiry: number): string {
+  const expiryField = /("expires_at_unix_ms"\s*:\s*)9876543210000(?=\s*[,}])/g;
+  const matches = rendered.match(expiryField) ?? [];
+  if (matches.length !== 1) throw new Error('Initializer expiry placeholder count is not exactly one.');
+  return rendered.replace(expiryField, (_match, prefix: string) => `${prefix}${expiry}`);
+}
+
 function checkResult(result: Awaited<ReturnType<typeof run_tree>>, label: string): string {
   if (result.returncode !== 0) {
     const detail = result.stderr.trim().replace(/[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, '[redacted]').slice(0, 1000);
@@ -484,9 +492,7 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
     await applyStage(config, namespace, renderedPath, 'writer');
     writer = await waitWriter(config, namespace);
 
-    const expiryMarker = '9876543210000';
-    if (rendered.split(expiryMarker).length !== 2) throw new Error('Initializer expiry placeholder count is not exactly one.');
-    const expiryManifest = rendered.replace(expiryMarker, String(Date.now() + 45 * 60_000));
+    const expiryManifest = replaceInitializerExpiry(rendered, Date.now() + 45 * 60_000);
     await writePrivateFile(renderedPath, expiryManifest);
     await applyStage(config, namespace, renderedPath, 'initializer');
     await waitJob(config, namespace, 'direct-pin-live', 180_000);
