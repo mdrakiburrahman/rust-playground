@@ -270,7 +270,7 @@ async function waitDeployment(config: Config, namespace: string, name: string, t
   });
 }
 
-async function waitJob(config: Config, namespace: string, name: string, timeoutMs: number): Promise<void> {
+async function waitJob(config: Config, namespace: string, name: string, timeoutMs: number, diagnosticsDirectory?: string): Promise<void> {
   await waitUntil(`job/${name}`, timeoutMs, async () => {
     const job = await getObject(config, 'job', namespace, name);
     if (!job) return undefined;
@@ -278,6 +278,22 @@ async function waitJob(config: Config, namespace: string, name: string, timeoutM
     if ((typeof status.failed === 'number' && status.failed > 0) ||
         (Array.isArray(status.conditions) && status.conditions.some(condition => isRecord(condition) &&
           condition.type === 'Failed' && condition.status === 'True'))) {
+      if (diagnosticsDirectory) {
+        const logPath = join(diagnosticsDirectory, `${name}.failure.log`);
+        let logsCaptured = false;
+        try {
+          const logs = await kubectl(config, ['logs', `job/${name}`, '-n', namespace, '--all-containers=true'], `Capture failed job/${name} logs`, 60);
+          await writePrivateFile(logPath, logs);
+          logsCaptured = true;
+        } catch (error) {
+          try {
+            await writePrivateFile(logPath, 'The job failed, but Kubernetes logs were unavailable at capture time.\n');
+          } catch (writeError) {
+            throw new AggregateError([error, writeError], `job/${name} failed and private diagnostics could not be saved.`);
+          }
+        }
+        throw new Error(`job/${name} failed; private ${logsCaptured ? 'logs' : 'log-capture receipt'} saved at ${logPath}.`);
+      }
       throw new Error(`job/${name} failed.`);
     }
     return status.succeeded === 1 ? true : undefined;
@@ -672,7 +688,7 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
     });
     await runStage('migration', 15 * 60_000, async () => {
       await applyStage(config, namespace, renderedPath, 'migration');
-      await waitJob(config, namespace, 'arrowcol-migrate-v11-fresh', 10 * 60_000);
+      await waitJob(config, namespace, 'arrowcol-migrate-v11-fresh', 10 * 60_000, dirname(reportPath));
     });
     await runStage('catalog', 40 * 60_000, async () => {
       await applyStage(config, namespace, renderedPath, 'catalog');
@@ -686,13 +702,13 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
       if (!writer) throw new Error('Writer readiness was not established.');
       await writePrivateFile(renderedPath, replaceInitializerExpiry(rendered, Date.now() + 45 * 60_000));
       await applyStage(config, namespace, renderedPath, 'initializer');
-      await waitJob(config, namespace, 'direct-pin-live', 180_000);
+      await waitJob(config, namespace, 'direct-pin-live', 180_000, dirname(reportPath));
       await assertWriterStable(config, namespace, writer);
     });
     await runStage('registration', 8 * 60_000, async () => {
       if (!writer) throw new Error('Writer readiness was not established.');
       await applyStage(config, namespace, renderedPath, 'registration');
-      await waitJob(config, namespace, 'direct-catalog-verified', 240_000);
+      await waitJob(config, namespace, 'direct-catalog-verified', 240_000, dirname(reportPath));
       await verifyRegistration(config, namespace, runId, deltaRoot);
       await assertWriterStable(config, namespace, writer);
     });
