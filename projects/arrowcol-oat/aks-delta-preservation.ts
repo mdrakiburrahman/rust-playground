@@ -93,6 +93,11 @@ const MAX_VERSIONS = 20_000;
 const HASH = /^[a-f0-9]{64}$/;
 const REQUEST_ID = /^[A-Za-z0-9-]{1,128}$/;
 const ETAG = /^"[^"\r\n]+"$/;
+function strongListedEtag(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  if (ETAG.test(value)) return value;
+  return /^0x[0-9a-f]{1,32}$/i.test(value) ? '"' + value + '"' : null;
+}
 const JSON_LOG = /^(\d{20})\.json$/;
 const CHECKPOINT = /^(\d{20})\.checkpoint(?:\.(\d{10})\.(\d{10}))?\.parquet$/;
 const hash = (value: string | Buffer) => createHash('sha256').update(value).digest('hex');
@@ -141,11 +146,14 @@ function protocol(value: unknown): Json {
   const p = object(value, 'protocol');
   requireThat(Object.keys(p).every(key => ['minReaderVersion', 'minWriterVersion', 'readerFeatures', 'writerFeatures'].includes(key)),
     'unsupported protocol fields');
-  requireThat(integer(p.minReaderVersion, 'minReaderVersion') === 1 &&
-    [1, 2].includes(integer(p.minWriterVersion, 'minWriterVersion')), 'unsupported Delta protocol');
-  for (const key of ['readerFeatures', 'writerFeatures']) {
-    if (p[key] !== undefined) requireThat(Array.isArray(p[key]) && p[key].length === 0, 'unsupported Delta protocol features');
-  }
+  const readerVersion = integer(p.minReaderVersion, 'minReaderVersion');
+  const writerVersion = integer(p.minWriterVersion, 'minWriterVersion');
+  const emptyFeatures = ['readerFeatures', 'writerFeatures'].every(key =>
+    p[key] === undefined || Array.isArray(p[key]) && p[key].length === 0);
+  const invariantsOnly = readerVersion === 3 && writerVersion === 7 &&
+    Array.isArray(p.readerFeatures) && p.readerFeatures.length === 0 &&
+    Array.isArray(p.writerFeatures) && p.writerFeatures.length === 1 && p.writerFeatures[0] === 'invariants';
+  requireThat(readerVersion === 1 && [1, 2].includes(writerVersion) && emptyFeatures || invariantsOnly, 'unsupported Delta protocol');
   return p;
 }
 function columns(value: unknown): string[] {
@@ -287,7 +295,7 @@ async function capture(azure: Azure, relativePath: string, assertCurrent: () => 
         const name = child(blob, 'Name')?.text ?? '', props = child(blob, 'Properties');
         requireThat(name.startsWith(prefix), 'listing escaped the exact Delta prefix');
         safePath(name);
-        const etag = props && child(props, 'Etag')?.text;
+        const etag = props && strongListedEtag(child(props, 'Etag')?.text);
         const size = props && child(props, 'Content-Length')?.text;
         requireThat(etag && ETAG.test(etag) && size && /^\d+$/.test(size), 'listing lacks strong ETag or size');
         requireThat(!child(blob, 'Snapshot') && !child(blob, 'VersionId') && !child(blob, 'Deleted'), 'unexpected historical blob');
@@ -469,7 +477,19 @@ export function reconcileDeltaAdds(commits: Map<number, Json[]>, startUnixMs: nu
 
 export async function readDeltaAddWindow(azure: Azure, relativePath: string, startUnixMs: number, endUnixMs: number,
   assertCurrent: () => Promise<void>): Promise<DeltaAddWindow & { delta_version: number; active_rows: number }> {
-  const { reference, commits } = await capture(azure, relativePath, assertCurrent, -1);
+  let snapshot: Awaited<ReturnType<typeof capture>> | undefined;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      snapshot = await capture(azure, relativePath, assertCurrent, -1);
+      break;
+    } catch (error) {
+      if (!(error instanceof ReplayError) || error.message !== 'Delta listing changed during replay' || attempt === 2) throw error;
+      await assertCurrent();
+      await new Promise<void>(resolve => setTimeout(resolve, 1000 * (attempt + 1)));
+    }
+  }
+  if (!snapshot) throw new ReplayError('Delta capture did not produce a stable snapshot');
+  const { reference, commits } = snapshot;
   if (reference.observation !== 'table' || reference.row_count === null)
     throw new ReplayError('Delta table or complete active-file row statistics are unavailable');
   const adds = reconcileDeltaAdds(commits, startUnixMs, endUnixMs);

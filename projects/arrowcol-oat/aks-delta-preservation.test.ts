@@ -5,7 +5,7 @@ import { Bool, Field, Int32, Int64, List, Struct, Table, Utf8, tableToIPC, vecto
 import { Table as WasmTable, writeParquet } from 'parquet-wasm';
 import type { Azure, HttpReceipt } from '../../infra/azure/bootstrap.js';
 import {
-  parseDeltaReplayReference, readDeltaReference, verifyDeltaPreservation,
+  parseDeltaReplayReference, readDeltaAddWindow, readDeltaReference, verifyDeltaPreservation,
   type DeltaReplayReference, type DeltaRetentionPolicy,
 } from './aks-delta-preservation.js';
 
@@ -58,7 +58,7 @@ class Storage {
         const start = Number(query.marker || '0'), entries = all.slice(start, start + this.pageSize);
         const next = start + entries.length < all.length ? String(start + entries.length) : '';
         return [Buffer.from(`<EnumerationResults><Prefix>${xml(this.listingPrefix)}</Prefix><Blobs>${entries.map(([key, bytes]) =>
-          `<Blob><Name>${xml(key)}</Name><Properties><Etag>${xml('"' + digest(bytes) + '"')}</Etag>` +
+          `<Blob><Name>${xml(key)}</Name><Properties><Etag>${xml('0x' + digest(bytes).slice(0, 15))}</Etag>` +
           `<Content-Length>${bytes.length}</Content-Length></Properties></Blob>`).join('')}</Blobs>` +
           (this.listingComplete ? `<NextMarker>${next}</NextMarker>` : '') + '</EnumerationResults>'),
         this.omitRequestId ? {} : { 'x-ms-request-id': this.repeatRequestId ? 'same-request-id' : `request-${this.listCount}` }];
@@ -67,7 +67,8 @@ class Storage {
       assert.ok(name.startsWith(prefix));
       const bytes = this.objects.get(name);
       assert.ok(bytes, 'required object must exist');
-      const etag = '"' + digest(bytes) + '"';
+      const etag = '"0x' + digest(bytes).slice(0, 15) + '"';
+      assert.equal(headers['If-Match'], etag, 'Delta reads must pin the listed strong ETag');
       return [bytes, { etag: this.responseEtag ?? etag }];
     } } as unknown as Azure;
   put(version: number, ...actions: Json[]): this {
@@ -104,6 +105,25 @@ function checkpoint(actions: Json[]): Buffer {
 const result = async (storage: Storage, baseline: DeltaReplayReference,
   terminal = baseline, retention?: DeltaRetentionPolicy) =>
   verifyDeltaPreservation(storage.azure, baseline, terminal, guard, retention);
+
+test('reader accepts Delta protocol with only the invariants writer feature', async () => {
+  const protocol = { minReaderVersion: 3, minWriterVersion: 7, readerFeatures: [], writerFeatures: ['invariants'] };
+  const s = new Storage().put(0, { protocol }, { metaData: meta() }, info('CREATE TABLE'), add('seed.parquet', 17));
+  const reference = await s.read();
+  assert.equal(reference.row_count, 17);
+  assert.deepEqual(reference.protocol, protocol);
+});
+
+test('Delta Add window retries one append that races its initial snapshot', async () => {
+  const s = new Storage().seed(add('seed.parquet', 10));
+  s.put(1, info('INSERT'), add('first.parquet', 20));
+  s.beforeList = count => { if (count === 2) s.put(2, info('INSERT'), add('racing.parquet', 30)); };
+  const result = await readDeltaAddWindow(s.azure, root, 0, Date.parse('2026-11-17'), guard);
+  assert.equal(result.total_rows, 60);
+  assert.equal(result.window_rows, 60);
+  assert.equal(result.window_commits, 3);
+  assert.equal(result.active_rows, 60);
+});
 
 test('fresh replay preserves explicit zero only for measured empty active-file sets; references round trip strictly', async () => {
   const s = new Storage().seed(), reference = await s.read();

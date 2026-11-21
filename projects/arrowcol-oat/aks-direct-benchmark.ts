@@ -17,7 +17,8 @@ const manifestPath = resolve(ROOT, 'experiments/aks-direct-benchmark/arrowcollec
 const namespacePrefix = 'arrow-collector-';
 const ownerLabel = 'arrowcol-oat/owner-token';
 const runLabel = 'arrowcol-oat/run-id';
-const table = 'telemetry.sqlserver.sqlserver_availability_replica_states';
+const tablePath = 'telemetry/sqlserver/sqlserver_availability_replica_states';
+const table = tablePath.replaceAll('/', '.');
 const uuidPattern = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i;
 const workloadPools = ['benche64', 'benchd64'] as const;
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
@@ -491,7 +492,7 @@ async function verifyRegistration(config: Config, namespace: string, runId: stri
   });
   if (receipts.length !== 1) throw new Error('The registration Job did not emit exactly one signed one-table receipt.');
   const receipt = receipts[0]!;
-  const expectedLocation = `${deltaRoot}/telemetry/sqlserver/sqlserver_availability_replica_states`;
+  const expectedLocation = `${deltaRoot}/${tablePath}`;
   if (receipt.run_id !== runId || receipt.table !== table || receipt.location !== expectedLocation ||
       receipt.provider !== 'delta' || receipt.schema_version !== 1 || receipt.catalog_table_count !== 1 ||
       !isSchemaFingerprint(receipt.schema_fingerprint)) {
@@ -726,7 +727,7 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
       await assertWriterStable(config, namespace, writer);
       await verifyNamespace(config, namespace, runId, owner, namespaceUid);
       const azure = new Azure(config, () => boundedTimeoutSeconds(3600));
-      metrics = await readDeltaAddWindow(azure, relativePath, measurementStart, measurementEnd,
+      metrics = await readDeltaAddWindow(azure, `${relativePath}/${tablePath}`, measurementStart, measurementEnd,
         async () => { await verifyNamespace(config, namespace, runId, owner, namespaceUid); });
       if (metrics.window_rows <= 0 || metrics.window_commits <= 0) throw new Error('The timed Delta window contained no committed rows.');
     });
