@@ -1340,7 +1340,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: register
-          image: BENCHREGISTRY/arrowcol-oat-client@sha256:29666c4b093393a27bf24c142153491ec320eb43ee9883c76b7d89cdfcfb4e30
+          image: BENCHREGISTRY/arrowcol-oat-client@sha256:f84be43a9fcf0c1c98071477ae9f20159caf4d294ac6b06986634093611dd892
           args:
             - --register-only-config
             - /run/arrowcol-oat/register.json
