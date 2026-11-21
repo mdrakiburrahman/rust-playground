@@ -91,6 +91,10 @@ function parseJson(text: string, label: string): unknown {
   catch { throw new Error(`${label} returned invalid JSON.`); }
 }
 
+export function isSchemaFingerprint(value: unknown): value is string {
+  return typeof value === 'string' && /^sha256:[0-9a-f]{64}$/.test(value);
+}
+
 function argNumber(value: unknown, label: string): number {
   if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) throw new Error(`${label} is invalid.`);
   return value;
@@ -474,7 +478,7 @@ async function verifyRegistration(config: Config, namespace: string, runId: stri
   const expectedLocation = `${deltaRoot}/telemetry/sqlserver/sqlserver_availability_replica_states`;
   if (receipt.run_id !== runId || receipt.table !== table || receipt.location !== expectedLocation ||
       receipt.provider !== 'delta' || receipt.schema_version !== 1 || receipt.catalog_table_count !== 1 ||
-      typeof receipt.schema_fingerprint !== 'string' || !/^[0-9a-f]{64}$/.test(receipt.schema_fingerprint)) {
+      !isSchemaFingerprint(receipt.schema_fingerprint)) {
     throw new Error('The signed registration receipt does not prove the exact run-scoped table and schema.');
   }
 }

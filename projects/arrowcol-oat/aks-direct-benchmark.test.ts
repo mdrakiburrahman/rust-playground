@@ -4,12 +4,18 @@ import { resolve } from 'node:path';
 import test from 'node:test';
 import { parseAllDocuments } from 'yaml';
 import { ROOT } from '../../infra/azure/bootstrap.js';
-import { assertRenderedManifest, renderManifest, replaceInitializerExpiry } from './aks-direct-benchmark.js';
+import { assertRenderedManifest, isSchemaFingerprint, renderManifest, replaceInitializerExpiry } from './aks-direct-benchmark.js';
 
 function record(value: unknown): Record<string, unknown> {
   assert.ok(value !== null && typeof value === 'object' && !Array.isArray(value));
   return value as Record<string, unknown>;
 }
+
+test('catalog registration accepts the protocol SHA-256 fingerprint encoding', () => {
+  assert.equal(isSchemaFingerprint('sha256:' + 'a'.repeat(64)), true);
+  assert.equal(isSchemaFingerprint('a'.repeat(64)), false);
+  assert.equal(isSchemaFingerprint('sha256:' + 'g'.repeat(64)), false);
+});
 
 test('rendered benchmark manifest enforces ownership, stage, image, and timed-window invariants', async () => {
   const manifestPath = resolve(ROOT, 'experiments/aks-direct-benchmark/arrowcollector-aks-benchmark.yaml');
