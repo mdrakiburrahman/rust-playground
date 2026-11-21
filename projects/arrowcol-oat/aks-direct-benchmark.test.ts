@@ -4,12 +4,33 @@ import { resolve } from 'node:path';
 import test from 'node:test';
 import { parseAllDocuments } from 'yaml';
 import { ROOT } from '../../infra/azure/bootstrap.js';
-import { assertRenderedManifest, isSchemaFingerprint, renderManifest, replaceInitializerExpiry } from './aks-direct-benchmark.js';
+import { assertRenderedManifest, errorMessages, isSchemaFingerprint, poolBlockingPods, poolCleanupDecision, renderManifest, replaceInitializerExpiry } from './aks-direct-benchmark.js';
 
 function record(value: unknown): Record<string, unknown> {
   assert.ok(value !== null && typeof value === 'object' && !Array.isArray(value));
   return value as Record<string, unknown>;
 }
+
+test('pool cleanup waits for natural drain while any non-DaemonSet pod remains', () => {
+  const daemon = { metadata: { ownerReferences: [{ kind: 'DaemonSet' }] }, status: { phase: 'Running' } };
+  const job = { metadata: { namespace: 'kube-system', name: 'system-job', ownerReferences: [{ kind: 'Job' }] }, status: { phase: 'Succeeded' } };
+  const blockers = poolBlockingPods([daemon, job]);
+  assert.deepEqual(blockers, ['kube-system/system-job (Succeeded)']);
+  assert.equal(poolCleanupDecision(1, 1, blockers), 'wait');
+  assert.equal(poolCleanupDecision(1, 1, poolBlockingPods([daemon])), 'scale');
+  assert.equal(poolCleanupDecision(0, 0, []), 'drained');
+  assert.equal(poolCleanupDecision(1, 1, poolBlockingPods([null])), 'wait');
+  for (const phase of ['Running', 'Pending', 'Failed']) {
+    assert.equal(poolCleanupDecision(1, 1, poolBlockingPods([{ ...job, status: { phase } }])), 'wait');
+  }
+});
+
+test('cleanup errors include nested pool blockers', () => {
+  const blocker = new Error('Non-DaemonSet pod kube-system/system-job (Succeeded)');
+  const stage = new Error('pool stage failed', { cause: blocker });
+  const aggregate = new AggregateError([stage], 'pool restoration failed');
+  assert.deepEqual(errorMessages(aggregate), ['pool restoration failed', 'pool stage failed', blocker.message]);
+});
 
 test('catalog registration accepts the protocol SHA-256 fingerprint encoding', () => {
   assert.equal(isSchemaFingerprint('sha256:' + 'a'.repeat(64)), true);

@@ -182,11 +182,31 @@ async function requirePoolsAtZero(config: Config): Promise<void> {
   }
 }
 
-async function assertNoWorkloadPodsOnPool(config: Config, pool: string): Promise<void> {
+export function poolBlockingPods(items: unknown[]): string[] {
+  return items.flatMap(rawPod => {
+    if (!isRecord(rawPod)) return ['<invalid pod>'];
+    const metadata = isRecord(rawPod.metadata) ? rawPod.metadata : {};
+    const owners = Array.isArray(metadata.ownerReferences) ? metadata.ownerReferences : [];
+    if (owners.some(owner => isRecord(owner) && owner.kind === 'DaemonSet')) return [];
+    const status = isRecord(rawPod.status) ? rawPod.status : {};
+    const namespace = typeof metadata.namespace === 'string' ? metadata.namespace : '<unknown namespace>';
+    const name = typeof metadata.name === 'string' ? metadata.name : '<unknown pod>';
+    const phase = typeof status.phase === 'string' ? status.phase : '<unknown phase>';
+    return [`${namespace}/${name} (${phase})`];
+  });
+}
+
+export function poolCleanupDecision(nodes: number, count: unknown, blockers: string[]): 'drained' | 'wait' | 'scale' {
+  if (nodes === 0 && count === 0) return 'drained';
+  return blockers.length ? 'wait' : 'scale';
+}
+
+async function readWorkloadPodsOnPool(config: Config, pool: string): Promise<string[]> {
   const nodeOutput = await kubectl(config, ['get', 'nodes', '-l', `kubernetes.azure.com/agentpool=${pool}`, '-o', 'json'],
     `Read ${pool} nodes before scale-down`);
   const nodeList = requireRecord(parseJson(nodeOutput, `${pool} nodes`), `${pool} nodes`);
   if (!Array.isArray(nodeList.items)) throw new Error(`${pool} node inventory is invalid.`);
+  const blockers: string[] = [];
   for (const rawNode of nodeList.items) {
     const node = requireRecord(rawNode, `${pool} node`);
     const metadata = requireRecord(node.metadata, `${pool} node metadata`);
@@ -195,22 +215,38 @@ async function assertNoWorkloadPodsOnPool(config: Config, pool: string): Promise
       `spec.nodeName=${metadata.name}`, '-o', 'json'], `Read pods on ${pool} node`);
     const podList = requireRecord(parseJson(podOutput, `${pool} pods`), `${pool} pods`);
     if (!Array.isArray(podList.items)) throw new Error(`${pool} pod inventory is invalid.`);
-    const hasWorkloadPod = podList.items.some(rawPod => {
-      if (!isRecord(rawPod)) return true;
-      const podMetadata = isRecord(rawPod.metadata) ? rawPod.metadata : {};
-      const owners = Array.isArray(podMetadata.ownerReferences) ? podMetadata.ownerReferences : [];
-      return !owners.some(owner => isRecord(owner) && owner.kind === 'DaemonSet');
-    });
-    if (hasWorkloadPod) throw new Error(`Non-DaemonSet pods remain on ${pool}; refusing to scale down.`);
+    blockers.push(...poolBlockingPods(podList.items));
   }
+  return blockers;
+}
+
+async function assertNoWorkloadPodsOnPool(config: Config, pool: string): Promise<void> {
+  const blockers = await readWorkloadPodsOnPool(config, pool);
+  if (blockers.length) throw new Error(`Non-DaemonSet pods remain on ${pool}; refusing to scale down: ${blockers.join(', ')}.`);
 }
 
 async function scalePoolToZero(config: Config, pool: string): Promise<void> {
-  const current = await readPool(config, pool);
-  if (current.enableAutoScaling !== true || current.minCount !== 0 || current.maxCount !== 1) {
-    throw new Error(`Workload pool ${pool} must retain autoscaling min 0/max 1; refusing to change shared pool configuration.`);
+  let blockers: string[] = [];
+  const label = `${pool} safe scale-down`;
+  let decision: 'drained' | 'scale';
+  try {
+    decision = await waitUntil(label, 25 * 60_000, async () => {
+      const current = await readPool(config, pool);
+      if (current.enableAutoScaling !== true || current.minCount !== 0 || current.maxCount !== 1) {
+        throw new Error(`Workload pool ${pool} must retain autoscaling min 0/max 1; refusing to change shared pool configuration.`);
+      }
+      const nodes = await poolNodeCount(config, pool);
+      blockers = nodes === 0 ? [] : await readWorkloadPodsOnPool(config, pool);
+      const state = poolCleanupDecision(nodes, current.count, blockers);
+      return state === 'wait' ? undefined : state;
+    }, 30_000);
+  } catch (error) {
+    if (error instanceof Error && error.message === `${label} timed out.` && blockers.length) {
+      throw new Error(`Non-DaemonSet pods remain on ${pool}; refusing to scale down: ${blockers.join(', ')}.`, { cause: error });
+    }
+    throw error;
   }
-  if ((await poolNodeCount(config, pool)) === 0 && current.count === 0) return;
+  if (decision === 'drained') return;
   await assertNoWorkloadPodsOnPool(config, pool);
   let scaleError: Error | undefined;
   try {
@@ -239,6 +275,22 @@ async function scalePoolToZero(config: Config, pool: string): Promise<void> {
   if (scaleError && restoreError) throw new AggregateError([scaleError, restoreError], `${pool} scale-down and autoscaler restoration both failed.`);
   if (restoreError) throw restoreError;
   if (scaleError) throw scaleError;
+}
+
+export function errorMessages(error: Error): string[] {
+  const messages: string[] = [];
+  const seen = new Set<Error>();
+  const visit = (item: Error): void => {
+    if (seen.has(item)) return;
+    seen.add(item);
+    if (item.message) messages.push(item.message);
+    if (item instanceof AggregateError) {
+      for (const child of item.errors) if (child instanceof Error) visit(child);
+    }
+    if (item.cause instanceof Error) visit(item.cause);
+  };
+  visit(error);
+  return messages;
 }
 
 async function waitPoolsAtZero(config: Config): Promise<void> {
@@ -803,7 +855,7 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
     const causes = [primaryError, ...cleanupErrors].filter((error): error is Error => error instanceof Error);
     if (!report) causes.push(new Error('No measured benchmark report was produced.'));
     if (!namespaceRemoved || !ficRemoved || !poolsAtZero) causes.push(new Error('Owned-resource cleanup or workload-pool scale-down is incomplete.'));
-    const detail = causes.map(error => config.redact(error.message)).filter(Boolean).join(' | ').slice(0, 2000);
+    const detail = causes.flatMap(errorMessages).map(message => config.redact(message)).filter(Boolean).join(' | ');
     throw new AggregateError(causes, `AKS benchmark run ${runId} did not complete successfully${detail ? `: ${detail}` : ''}; retain private evidence in ${runDir}.`);
   }
   return report;
