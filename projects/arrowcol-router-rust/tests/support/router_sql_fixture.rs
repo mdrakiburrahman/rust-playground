@@ -59,6 +59,18 @@ fn require_fixture() -> anyhow::Result<PathBuf> {
         std::env::var("ARROWCOL_ROUTER_SQL_FIXTURE").as_deref() == Ok("1"),
         "ARROWCOL_ROUTER_SQL_FIXTURE=1 is mandatory; absent SQL prerequisites are not a skip"
     );
+    for name in [
+        "ARROWCOL_ROUTER_SQL_PROJECT",
+        "ARROWCOL_ROUTER_SQL_OUTPUT",
+        "ARROWCOL_SQLSERVER_HOST",
+        "ARROWCOL_SQLSERVER_PORT",
+        "ARROWCOL_APP_PASSWORD_FILE",
+    ] {
+        anyhow::ensure!(
+            std::env::var(name).is_ok_and(|value| !value.is_empty()),
+            "required SQL fixture prerequisite {name} is absent or empty"
+        );
+    }
     let isolated = std::env::var("ARROWCOL_ROUTER_SQL_PROJECT")?;
     anyhow::ensure!(
         isolated.starts_with("router-sql-"),
