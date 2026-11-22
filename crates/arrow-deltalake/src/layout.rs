@@ -7,10 +7,8 @@
 
 use anyhow::{Context, Result, ensure};
 use arrow::array::RecordBatch;
-use arrow::compute::{
-    SortColumn, SortOptions, concat, concat_batches, interleave_record_batch, lexsort_to_indices, take,
-};
-use arrow::datatypes::{DataType, SchemaRef};
+use arrow::compute::{SortColumn, SortOptions, concat_batches, lexsort_to_indices, take};
+use arrow::datatypes::SchemaRef;
 use parquet::basic::Compression;
 use parquet::file::metadata::SortingColumn;
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
@@ -256,49 +254,6 @@ impl FileSortBuffer {
     /// # Errors
     /// Returns Arrow concatenation, ordering, or permutation errors.
     pub fn finish(self) -> Result<RecordBatch> {
-        if self.batches.len() > 1
-            && !self.policy.sort_columns.is_empty()
-            && self
-                .schema
-                .fields()
-                .iter()
-                .all(|field| matches!(field.data_type(), DataType::Utf8 | DataType::Int16 | DataType::Int64))
-        {
-            let columns = self
-                .policy
-                .sort_columns
-                .iter()
-                .map(|name| {
-                    let index = self.schema.index_of(name)?;
-                    let arrays = self
-                        .batches
-                        .iter()
-                        .map(|batch| batch.column(index).as_ref())
-                        .collect::<Vec<_>>();
-                    Ok(SortColumn {
-                        values: concat(&arrays)?,
-                        options: Some(SortOptions {
-                            descending: false,
-                            nulls_first: false,
-                        }),
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let indices = lexsort_to_indices(&columns, None)?;
-            let locations = self
-                .batches
-                .iter()
-                .enumerate()
-                .flat_map(|(batch, values)| (0..values.num_rows()).map(move |row| (batch, row)))
-                .collect::<Vec<_>>();
-            let ordered = indices
-                .values()
-                .iter()
-                .map(|index| locations[*index as usize])
-                .collect::<Vec<_>>();
-            let batches = self.batches.iter().collect::<Vec<_>>();
-            return Ok(interleave_record_batch(&batches, &ordered)?);
-        }
         let batch = concat_batches(&self.schema, &self.batches)?;
         if batch.num_rows() == 0 {
             return Ok(batch);
