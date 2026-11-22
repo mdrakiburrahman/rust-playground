@@ -2,12 +2,13 @@
 //! Local component profile: `cargo test --release -p arrow-deltalake --test
 //! darwin_commit_pipeline -- --ignored --nocapture`.
 //!
-//! The timed window covers twelve sequential real `BatchedTable` publications
-//! through durable Delta commit receipts; input construction, warmup, and
-//! independent snapshot/Parquet verification are outside it. This is not a DFE
-//! acknowledgment, exporter, or Azure network benchmark. Phase durations overlap:
-//! encode is included in stage wall time, and commit service is included in
-//! receipt wait. Local storage does not exercise upload, so upload is unavailable.
+//! The serial control forces every group. The separate window screen stages fixed
+//! waves of eight groups, then submits them non-forced and waits for natural
+//! cohorts. Input construction, warmup, replay checks, and independent
+//! snapshot/Parquet verification are outside each timed interval. These are not
+//! DFE acknowledgments, exporter, or Azure network benchmarks. Encode is part of
+//! staging, and commit service is part of receipt wait; timings must not be added.
+//! Local storage does not exercise upload.
 
 use anyhow::{Context, Result, ensure};
 use arrow::array::{Array, Int64Array, RecordBatch, StringArray};
@@ -62,14 +63,11 @@ fn ticks_per_second() -> Result<u64> {
     Ok(value)
 }
 
-fn verify_snapshot(root: &Path, expected: &BTreeMap<PathBuf, u64>) -> Result<(usize, u64)> {
+fn verify_snapshot(root: &Path, expected: &BTreeMap<PathBuf, u64>, expected_version: u64) -> Result<(usize, u64)> {
     let url = Url::from_directory_path(fs::canonicalize(root)?).map_err(|()| anyhow::anyhow!("table URL"))?;
     let engine = DefaultEngineBuilder::new(Arc::new(object_store::local::LocalFileSystem::new())).build();
     let snapshot = Snapshot::builder_for(url.as_str()).build(&engine)?;
-    ensure!(
-        snapshot.version() == u64::try_from(expected.len())?,
-        "unexpected snapshot version"
-    );
+    ensure!(snapshot.version() == expected_version, "unexpected snapshot version");
     let scan = snapshot.scan_builder().build()?;
     let mut paths = BTreeMap::new();
     for data in scan.scan_metadata(&engine)? {
@@ -251,7 +249,7 @@ async fn local_commit_pipeline_profile() -> Result<()> {
         "missing durable transaction"
     );
     drop(table);
-    let (active_rows, active_bytes) = verify_snapshot(root.path(), &expected_files)?;
+    let (active_rows, active_bytes) = verify_snapshot(root.path(), &expected_files, u64::try_from(GROUPS + 1)?)?;
     let root_url =
         Url::from_directory_path(fs::canonicalize(root.path())?).map_err(|()| anyhow::anyhow!("table URL"))?;
     for version in 1..=GROUPS + 1 {
@@ -323,6 +321,275 @@ async fn local_commit_pipeline_profile() -> Result<()> {
         active_rows,
         active_bytes,
         ROWS,
+    );
+    Ok(())
+}
+
+const DEPTH: usize = 8;
+const TIMED_WAVES: usize = 4;
+
+struct Wave {
+    stage: Duration,
+    build: Duration,
+    encode: Duration,
+    submit: Duration,
+    receipts: Vec<(usize, Duration, arrow_deltalake::commit::GroupAppendResult)>,
+}
+
+async fn run_natural_wave(table: &BatchedTable, first: usize, batches: &[RecordBatch]) -> Result<Wave> {
+    let mut prepared = Vec::with_capacity(DEPTH);
+    let mut stage = Duration::ZERO;
+    let mut build = Duration::ZERO;
+    let mut encode = Duration::ZERO;
+    for (offset, batch) in batches.iter().enumerate() {
+        let index = first + offset;
+        let started = Instant::now();
+        let group = table
+            .stage_coalesced_publications(vec![(batch.clone(), format!("wave-{index:04}"), 0, 1)])
+            .await?;
+        stage += started.elapsed();
+        build += group.preparation_build;
+        ensure!(
+            group.identities.len() == 1 && group.committed_identities.is_empty(),
+            "unexpected replay"
+        );
+        ensure!(group.appends.len() == 1, "unexpected file formation");
+        for file in &group.appends {
+            let timing = file.stage_timings();
+            ensure!(timing.upload.is_none(), "local run unexpectedly reports remote upload");
+            encode += timing.encode;
+        }
+        prepared.push(group);
+    }
+    let mut pending = Vec::with_capacity(DEPTH);
+    let submit_started = Instant::now();
+    for (offset, group) in prepared.into_iter().enumerate() {
+        let admitted = Instant::now();
+        let receipt = table.submit_prepared_group(group, false).await?;
+        pending.push((first + offset, admitted, Box::pin(receipt.wait())));
+    }
+    let submit = submit_started.elapsed();
+    for (_, _, receipt) in &mut pending {
+        ensure!(
+            receipt.as_mut().now_or_never().is_none(),
+            "wave did not reach eight outstanding groups before a receipt"
+        );
+    }
+    let receipts = futures::future::join_all(pending.into_iter().map(|(index, admitted, receipt)| async move {
+        let result = receipt.await?;
+        Ok::<_, anyhow::Error>((index, admitted.elapsed(), result))
+    }))
+    .await
+    .into_iter()
+    .collect::<Result<Vec<_>>>()?;
+    Ok(Wave {
+        stage,
+        build,
+        encode,
+        submit,
+        receipts,
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "explicit local non-forced window screen"]
+async fn local_natural_cohort_screen() -> Result<()> {
+    let window_ms = std::env::var("DARWIN_WINDOW_MS")
+        .unwrap_or_else(|_| "2000".into())
+        .parse::<u64>()?;
+    ensure!(window_ms == 2000 || window_ms == 250, "window must be 2000 or 250 ms");
+    let root = tempfile::tempdir()?;
+    let table = BatchedTable::open(
+        root.path(),
+        CommitOptions {
+            batch_window: Duration::from_millis(window_ms),
+            max_files_per_commit: 128,
+            max_pending_files: 512,
+        },
+    )
+    .await?;
+    let total_groups = DEPTH * (TIMED_WAVES + 1);
+    let batches = (0..total_groups).map(input).collect::<Result<Vec<_>>>()?;
+    let warmup = run_natural_wave(&table, 0, &batches[..DEPTH]).await?;
+    let ticks_hz = ticks_per_second()?;
+    let cpu_start = process_ticks()?;
+    let wall_start = Instant::now();
+    let mut waves = Vec::new();
+    for wave in 1..=TIMED_WAVES {
+        let first = wave * DEPTH;
+        waves.push(run_natural_wave(&table, first, &batches[first..first + DEPTH]).await?);
+    }
+    let wall = wall_start.elapsed();
+    let cpu = process_ticks()?
+        .checked_sub(cpu_start)
+        .context("process ticks went backwards")?;
+    let stage = waves.iter().map(|wave| wave.stage).sum::<Duration>();
+    let build = waves.iter().map(|wave| wave.build).sum::<Duration>();
+    let encode = waves.iter().map(|wave| wave.encode).sum::<Duration>();
+    let submit = waves.iter().map(|wave| wave.submit).sum::<Duration>();
+    let mut expected_files = BTreeMap::new();
+    let mut cohorts: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
+    let mut cohort_files: BTreeMap<u64, BTreeMap<PathBuf, u64>> = BTreeMap::new();
+    let mut cohort_commits: BTreeMap<u64, Duration> = BTreeMap::new();
+    let mut observed = BTreeSet::new();
+    let mut receipt_wait = Duration::ZERO;
+    let mut maximum_receipt_wait = Duration::ZERO;
+    let mut previous_wave_version = 0;
+    for wave in std::iter::once(&warmup).chain(&waves) {
+        let mut wave_versions = BTreeSet::new();
+        for (index, latency, result) in &wave.receipts {
+            ensure!(observed.insert(*index), "duplicate receipt identity");
+            ensure!(
+                result.files.len() == 1 && result.file_observations.len() == 1,
+                "wrong receipt shape"
+            );
+            ensure!(result.file_observations[0].rows == ROWS, "wrong receipt rows");
+            ensure!(
+                expected_files
+                    .insert(result.files[0].path.clone(), result.files[0].bytes)
+                    .is_none(),
+                "duplicate file receipt"
+            );
+            cohort_files
+                .entry(result.version)
+                .or_default()
+                .insert(result.files[0].path.clone(), result.files[0].bytes);
+            cohorts.entry(result.version).or_default().push(*index);
+            wave_versions.insert(result.version);
+            if let Some(duration) = result.commit_duration {
+                ensure!(
+                    cohort_commits.insert(result.version, duration).is_none(),
+                    "duplicate commit duration"
+                );
+            }
+            if *index >= DEPTH {
+                receipt_wait += *latency;
+                maximum_receipt_wait = maximum_receipt_wait.max(*latency);
+            }
+        }
+        ensure!(!wave_versions.is_empty(), "no durable cohort");
+        ensure!(
+            wave_versions.first().copied().unwrap_or_default() > previous_wave_version,
+            "waves completed out of order"
+        );
+        previous_wave_version = wave_versions.last().copied().context("missing wave version")?;
+    }
+    ensure!(observed.len() == total_groups, "missing receipt");
+    let last_version = *cohorts.keys().next_back().context("missing cohort version")?;
+    ensure!(
+        cohorts.len() >= TIMED_WAVES + 1,
+        "insufficient independent natural cohorts"
+    );
+    ensure!(cohort_commits.len() == cohorts.len(), "missing per-commit timing");
+    let identities = (0..total_groups)
+        .map(|index| (format!("wave-{index:04}"), 0))
+        .collect::<Vec<_>>();
+    ensure!(
+        table
+            .lookup_publications(identities.clone())
+            .await?
+            .into_iter()
+            .all(|committed| committed),
+        "missing committed identity"
+    );
+    let replay = table
+        .stage_coalesced_publications(vec![(batches[0].clone(), "wave-0000".into(), 0, 1)])
+        .await?;
+    ensure!(
+        replay.identities.is_empty() && replay.committed_identities.len() == 1 && replay.appends.is_empty(),
+        "replay was not deduplicated"
+    );
+    let replay = table.submit_prepared_group(replay, false).await?.wait().await?;
+    ensure!(
+        replay.version == last_version && replay.files.is_empty(),
+        "replay changed durable files or version"
+    );
+    drop(table);
+    let (active_rows, active_bytes) = verify_snapshot(root.path(), &expected_files, last_version)?;
+    let root_url =
+        Url::from_directory_path(fs::canonicalize(root.path())?).map_err(|()| anyhow::anyhow!("table URL"))?;
+    let mut remaining = expected_files;
+    for version in 1..=last_version {
+        let log = fs::read_to_string(root.path().join(format!("_delta_log/{version:020}.json")))?;
+        let actions = log
+            .lines()
+            .map(serde_json::from_str::<serde_json::Value>)
+            .collect::<Result<Vec<_>, _>>()?;
+        let expected = cohorts.get(&version).context("unexpected committed version")?;
+        let mut txn_ids = BTreeSet::new();
+        let mut adds = 0_usize;
+        for action in actions {
+            if let Some(txn) = action.get("txn") {
+                ensure!(txn["version"] == 0, "wrong transaction version");
+                ensure!(
+                    txn_ids.insert(txn["appId"].as_str().context("missing appId")?.to_owned()),
+                    "duplicate txn"
+                );
+            }
+            if let Some(add) = action.get("add") {
+                let path = root_url
+                    .join(add["path"].as_str().context("missing Add path")?)?
+                    .to_file_path()
+                    .map_err(|()| anyhow::anyhow!("Add URL"))?;
+                let bytes = add["size"].as_u64().context("missing Add size")?;
+                ensure!(
+                    cohort_files.get(&version).and_then(|files| files.get(&path)) == Some(&bytes),
+                    "Add version differs from receipt"
+                );
+                ensure!(
+                    remaining.remove(&path) == Some(bytes),
+                    "Add does not match a unique receipt"
+                );
+                adds += 1;
+            }
+        }
+        let expected_ids = expected
+            .iter()
+            .map(|index| format!("wave-{index:04}"))
+            .collect::<BTreeSet<_>>();
+        ensure!(
+            txn_ids == expected_ids && adds == expected.len(),
+            "committed cohort differs from receipts"
+        );
+    }
+    ensure!(remaining.is_empty(), "receipt missing from committed Adds");
+    let engine = DefaultEngineBuilder::new(Arc::new(object_store::local::LocalFileSystem::new())).build();
+    let snapshot = Snapshot::builder_for(root_url.as_str()).build(&engine)?;
+    ensure!(snapshot.version() == last_version, "replay changed snapshot version");
+    for (id, version) in &identities {
+        ensure!(
+            snapshot.get_app_id_version(id, &engine)? == Some(*version),
+            "snapshot lost transaction identity"
+        );
+    }
+    let cohort_shape = cohorts
+        .iter()
+        .map(|(version, groups)| format!("{version}:{}", groups.len()))
+        .collect::<Vec<_>>()
+        .join(",");
+    let commit_seconds = cohort_commits
+        .iter()
+        .filter(|(version, _)| cohorts[version].iter().all(|index| *index >= DEPTH))
+        .map(|(_, duration)| duration.as_secs_f64())
+        .sum::<f64>();
+    println!(
+        "backend=local_filesystem window_ms={window_ms} forced=false depth={DEPTH} timed_waves={TIMED_WAVES} timed_groups={} timed_durable_rows={} wall_s={:.6} process_cpu_s={:.6} stage_s={:.6} preparation_build_s={:.6} encode_s={:.6} upload=unavailable submit_s={:.6} receipt_wait_sum_s={:.6} receipt_wait_max_s={:.6} commit_service_sum_s={:.6} all_cohort_sizes={} active_files={} active_rows={} active_bytes={} bytes_per_active_row={:.6} replay=deduplicated",
+        DEPTH * TIMED_WAVES,
+        DEPTH * TIMED_WAVES * ROWS,
+        wall.as_secs_f64(),
+        cpu as f64 / ticks_hz as f64,
+        stage.as_secs_f64(),
+        build.as_secs_f64(),
+        encode.as_secs_f64(),
+        submit.as_secs_f64(),
+        receipt_wait.as_secs_f64(),
+        maximum_receipt_wait.as_secs_f64(),
+        commit_seconds,
+        cohort_shape,
+        total_groups,
+        active_rows,
+        active_bytes,
+        active_bytes as f64 / active_rows as f64,
     );
     Ok(())
 }
