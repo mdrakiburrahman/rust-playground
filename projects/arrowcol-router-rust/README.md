@@ -211,6 +211,25 @@ npx nx run arrowcol-router-rust:rss-regression
 npx nx run arrowcol-router-rust:live-integration
 ```
 
+### Isolated router SQL component fixture
+
+| Item | Contract |
+| --- | --- |
+| Run from repository root | `npx --no-install tsx projects/arrowcol-router-rust/scripts/router-sql-fixture.ts` or `npx nx run arrowcol-router-rust:router-sql-fixture` |
+| Prerequisites | Running devcontainer with Docker/Compose access, Node dependencies and Rust toolchain; missing SQL prerequisites fail, never skip |
+| Isolation | Creates a unique local SQL Compose project and private generated credentials; disconnects its network and **deletes only its own SQL volume** on exit |
+| Workload | Actual production Pingora HTTP/2 routing to a test Flight backend; signed DoAction followed by valid Arrow IPC DoPut, serial round-robin over 16 tables and one collector |
+| Experiment | Three alternating matched pairs (`AB BA AB`): unpooled real SQL versus existing SQL pool size 2; separate, independently labelled memory control |
+| Counts and checks | Per trial: 32 cold-cache and 1,024 warm-cache requests, per-method latency/throughput, SQL operations/connections, auth rejection, stale-pressure rejection and SQL owner/freshness checks |
+| Evidence | Private, gitignored `.temp/router-sql-<id>/fixture-results.json`, per-trial measurements/logs and revision provenance; not collector/Delta throughput or an engine/AKS experiment |
+
+The trusted fixture lives in `tests/support/router_sql_fixture.rs`, outside
+production router/store sources. SQL cold-cache trials create 16 real leases;
+warm-cache trials must issue no SQL. Cold/warm refer to the router lease cache,
+not SQL buffer-cache or process startup. This fixture does not change production
+defaults or delivery guarantees. The runner also executes the existing live SQL
+race/fenced-drain case; ordinary `pingora-integration` remains SQL-independent.
+
 ## Remaining collector integration contract
 
 Collectors still need to post `CollectorRegistration` and
