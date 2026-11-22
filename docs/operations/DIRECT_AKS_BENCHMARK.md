@@ -58,6 +58,7 @@ The default runner and source manifest retain the historical one-writer/one-clie
 | Workload provenance | Resolve and explicitly pin known client defaults, CLI flags and literal env. Conflicting/unknown env, envFrom, commands and args are rejected. The workload SHA-256 binds sorted effective generator configuration, client count and ordered payload-ID/pod-ordinal pairs. Job/run names remain unique but do not change diagnostic inputs. Historical data-identity eligibility requires the exact single-client ID and ordinal; another ID or multiple clients is non-parity. The rendered-manifest SHA-256 separately binds collector/support configuration and resources. Realistic or compressed profiles are separately labeled. |
 | Candidate images | JSON binds each exact original image reference to a candidate digest, requested commit and workload hash. This is **structural binding, not build proof**. Before any workload/pool write, `run` verifies an independently anchored `--provenance-bundle` or the existing cosign path. The new producer signs actual completed outputs, exact source commit/tree and recursive gitlinks, and the publisher's role/Dockerfile/context. Manifest/index and platform-child digests are distinct; runtime evidence must match the signed chain. No historical-image fallback exists. |
 | Runtime evidence | Validate actual pod UID, node, image ID, args, resources, client env and collector ConfigMap against the render; verify distinct client nodes, actual VM SKUs and allocatable CPU/memory. Retain each client's full-window result and private transcript. The observer starts before scheduling and stops before Delta replay/failure cleanup. `node_observation` schema v2 separates target-pod procfs/cgroup-v2 aggregates from optional read-only Kubelet host totals/capacity. Reads have 5-second abortable bounds; stop kills owned reads. Coverage and reset/unavailable reasons accompany samples; missing data remains null. |
+| Collector promotion | Optional `--collector-promotion JSON` applies only qualified leaf coordinates under `collector.batching`, `collector.commit`, `collector.runtime` or `parquet_writer.defaults`. The existing Rust typed registry validates against historical component context and projects env; the existing consumer-startup adapter checks actual readback before scheduling and after completion. Unmapped coordinates, invalid enums, explicit flag/env conflicts, table-writer policy or readback drift fail closed. Client profile, table/endpoint/data identities and pod/node limits are never copied from the local winner. |
 
 Prepare an offline render and binding template (zero digests are placeholders, not deployable candidate images). The output paths must not already exist:
 
@@ -70,7 +71,26 @@ npx --no-install tsx projects/arrowcol-oat/aks-direct-benchmark.ts render \
   --env-file .env --stamp-config .temp/stamp-68590.yaml
 ```
 
-This writes `scaled-holdout.yaml.images.json` with the workload hash and every source-image slot. The opt-in producer can populate its digests from completed builds. To re-render those bindings offline, add `--image-manifest <populated-json>` and choose a new output path.
+This writes `scaled-holdout.yaml.images.json` with the client input hash and every source-image slot, plus `.collector.json` binding expected collector args/env/resources/pipeline independently. The opt-in producer can populate image digests from completed builds. To re-render those bindings offline, add `--image-manifest <populated-json>` and choose a new output path.
+
+### Qualified collector delta
+
+The promotion file has exactly `schema_version: 1`, `qualified_source_commit`, `qualified_config_sha256`, `qualified_config_json` and `won_coordinates`. The config JSON is the exact retained full OAT configuration string from the qualified campaign; its SHA-256 covers those UTF-8 bytes, preserving the qualified digest rather than reserializing numbers. Coordinates are relative to its `tunables`, for example `["collector.batching.pipeline_depth"]`. Its source must match `--candidate-commit`. This is a binding input, **not a qualification verdict**; the campaign must qualify that source/config and those coordinates independently.
+
+Only selected leaves are projected. For example, historical `coalesce_publications: true` supplies validation context for a selected pipeline depth without importing another profile's batching settings. Selected batching/commit leaves are updated in the historical exporter YAML and projected env. Runtime/writer leaves use the existing Rust env adapters. The client input hash does not change. Omitting the flag leaves the historical/default render unchanged.
+
+```bash
+cargo build --locked --package arrowcol-oat-rust --bin arrowcol-collector-contract
+ARROWCOL_COLLECTOR_CONTRACT_PROOF=1 npx --no-install tsx --test projects/arrowcol-oat/aks-scaled-cli.test.ts
+npx --no-install tsx projects/arrowcol-oat/aks-direct-benchmark.ts render \
+  --profile scaled --clients 1 --collector-shape e64 \
+  --candidate-commit "$CANDIDATE_COMMIT" --collector-promotion "$QUALIFIED_COLLECTOR_DELTA" \
+  --output "$EVIDENCE/promoted.yaml" --env-file .env --stamp-config .temp/stamp-68590.yaml
+```
+
+The historical control has pod/CLI cores 48 but embedded DFE core-allocation count 32; scaled E64 renders that count as 48 and changes the receiver RSS limit. Singleton diagnostic input parity therefore does **not** certify full historical collector-config parity. These control values and the expected collector settings are retained separately. `ARROWCOL_COLLECTOR_CPU_WORKERS` is a separate process-wide pool, not the DFE allocation or node vCPU count. Consumer CPU-worker readback is reported independently when available; DFE startup currently emits its drain deadline, not its resolved core count, so process-core readback must remain unavailable rather than inferred from pod limits.
+
+Promoted runs retain `collector-promotion-startup.json` and `collector-promotion-finished.json` before cleanup, binding checked public consumer settings to the collector pod UID and expected-settings hash. No raw local winner profile is copied into the report or manifest. The contract command performs only local file parsing/projection; these tests and renders perform no Azure/AKS writes.
 
 **The existing publisher/default run remain unchanged.** The separate `aks-candidate-build.ts` producer reuses `imageBuilds`, fetches exact candidate Git objects from the policy repository and pinned submodule origins into isolated stores, and builds immutable archives without ignored files, export substitutions or signing material. It binds the completed BuildKit digest to hash-verified registry manifest/index, platform manifest and config bytes, then signs DSSE/SLSA statements outside build steps. It does not sign caller labels, tags, blobs or supplied digest mappings. The producer ID is `urn:arrowcol:oat:immutable-candidate-builder:v1`.
 
@@ -80,6 +100,8 @@ This writes `scaled-holdout.yaml.images.json` with the workload hash and every s
 | Default test suite | Immutable archives, pinned submodules, dirty/mismatched source refusal, external-key isolation, manifest-vs-index binding, wrong-key/tampered-payload rejection and actual CLI integration. No cloud execution. |
 
 **Remaining external trust binding:** an operator must approve/pin the trusted producer tool revision separately from candidate source, protect an Ed25519 signing key so candidate build steps cannot access it, and independently supply its public-key fingerprint/PEM outside the candidate checkout. A key or approval shipped by a candidate is not a trust anchor. Production federation/ACR permission and normal campaign custody/approval are still required; this repository creates no production key, identity or approval.
+
+**Application-code binding is also a live gate:** source plus a completed OCI digest does not prove a changed executable was rebuilt when Cargo target cache mounts are reused. Actual application publication requires independently validated per-arm BuildKit/Cargo isolation (a fresh builder with no shared writable target state is sufficient) and a retained installed-executable digest for the changed role. `--no-cache` alone does not clear cache mounts. The tiny fixture proof does not establish this application-build prerequisite.
 
 After those gates only, the following command performs **ACR writes and production signing**. Run the approved tool installation, not code controlled by the candidate; keep outputs and keys outside candidate source. Production registry transport/federation has not been exercised by the local fixture proof:
 

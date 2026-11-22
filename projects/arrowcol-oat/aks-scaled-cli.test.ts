@@ -235,10 +235,12 @@ async function fixture(scaled = true, failure?: 'missing-client' | 'failed-clien
               const pipeline = parseAllDocuments(configs.data['dataflow.yaml']!)[0]!.toJSON();
               const batching = pipeline.groups.arrowcol.pipelines.ingest.nodes.delta.config.batching;
               const commit = pipeline.groups.arrowcol.pipelines.ingest.nodes.delta.config.commit;
+              batching.max_age = '1m';
               if (promotion === 'readback-drift') batching.pipeline_depth = 8;
-              return ok('arrowcol_effective_config ' + JSON.stringify({ component: 'receiver', config: {
+              const startup = JSON.stringify({ component: 'receiver', config: {
                 batching, commit, runtime: { cpu_workers: 32 },
-              } }) + '\narrowcol_data_commit ' + JSON.stringify({ schema_version: 1, outcome: 'committed', table_id: 'table-id',
+              } }).replace('"max_parquet_ratio":4', '"max_parquet_ratio":4.0');
+              return ok('arrowcol_effective_config ' + startup + '\narrowcol_data_commit ' + JSON.stringify({ schema_version: 1, outcome: 'committed', table_id: 'table-id',
                 delta_version: 0, rows: 1200, files: 2, parquet_bytes: 2400, finished_at_unix_ms: schedule + 60001 }));
             }
             events.push('collector-window-log');
@@ -341,6 +343,8 @@ test('actual promoted CLI uses strict Rust projection, changes only won depth an
     const report = JSON.parse(await readFile(f.reportPath, 'utf8'));
     assert.equal(report.scaled_profile.collector_startup_readback.batching.pipeline_depth, 16);
     assert.equal(report.scaled_profile.collector_startup_readback.runtime.cpu_workers, 32);
+    assert.equal(report.scaled_profile.collector_capacity_readback.cpu_workers, 32);
+    assert.equal(report.scaled_profile.collector_capacity_readback.dfe_core_allocation_count, null);
     assert.equal(report.scaled_profile.workload.dataProfile, 'diagnostic');
     assert.ok(f.events.indexOf('collector-startup-readback') < f.events.indexOf('schedule'));
     for (const phase of ['startup', 'finished']) {
@@ -349,6 +353,11 @@ test('actual promoted CLI uses strict Rust projection, changes only won depth an
       assert.equal(retained.observed.batching.pipeline_depth, 16);
       assert.equal(retained.expected_collector_sha256, report.scaled_profile.expected_collector.sha256);
     }
+    const input = JSON.parse(await readFile(f.promotionFile, 'utf8'));
+    const runtime = await applyCollectorPromotion(f.base, { ...input, won_coordinates: ['collector.runtime.cpu_workers'] },
+      'a'.repeat(40), projectCollectorContract);
+    assert.deepEqual(runtime.binding?.projected_environment, { ARROWCOL_COLLECTOR_CPU_WORKERS: '7' });
+    assert.equal(collectorSettings(runtime.manifest).dfe_core_allocation_count, 32);
   } finally { await f.dispose(); }
 });
 
@@ -359,7 +368,7 @@ test('strict promoted CLI rejects invalid enum/config binding and live drift bef
     assert.ok(f.events.includes('collector-startup-readback'));
     assert.ok(!f.events.includes('schedule'));
     assert.deepEqual(f.state(), { namespace: undefined, collectorPool: undefined, clientMax: 1, clientNodes: 0 });
-    const invalid = { ...qualifiedConfig, tunables: { parquet_writer: { defaults: { compression: 'brotli' } } } };
+    const invalid = { ...qualifiedConfig, tunables: { parquet_writer: { defaults: { compression: 'not-a-codec' } } } };
     await assert.rejects(applyCollectorPromotion(f.base, {
       schema_version: 1, qualified_source_commit: 'a'.repeat(40), qualified_config_sha256: qualifiedConfigDigest(JSON.stringify(invalid)),
       qualified_config_json: JSON.stringify(invalid), won_coordinates: ['parquet_writer.defaults.compression'],

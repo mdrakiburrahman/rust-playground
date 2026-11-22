@@ -207,4 +207,17 @@ export function assertPromotionEnvironment(expected: Record<string, string>, act
     if (matches.length !== 1 || object(matches[0], 'Actual collector env').value !== value ||
         object(matches[0], 'Actual collector env').valueFrom !== undefined) throw new Error('Promoted collector env drift: ' + name);
   }
+
+}
+
+export function collectorCapacityReadback(observed: ObjectValue | null | undefined) {
+  const runtime = observed?.runtime;
+  const value = runtime && typeof runtime === 'object' && !Array.isArray(runtime) ? object(runtime, 'Runtime').cpu_workers : undefined;
+  const cpuWorkers = typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : null;
+  return {
+    dfe_core_allocation_count: null,
+    dfe_unavailable_reason: 'DFE startup emits the drain deadline, not resolved core allocation; pod args/config are checked separately.',
+    cpu_workers: cpuWorkers,
+    cpu_workers_unavailable_reason: cpuWorkers === null ? 'Consumer startup did not expose the process-wide CPU worker count.' : null,
+  };
 }

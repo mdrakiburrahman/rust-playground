@@ -2023,6 +2023,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn resolved_projection_validates_context_without_promoting_unselected_settings() -> Result<()> {
+        let baseline = serde_json::json!({"collector":{"batching":{
+            "coalesce_publications":true,"pipeline_depth":8
+        }}});
+        let (selected, effective) = Tunables::resolve_oat_json(
+            serde_json::json!({"collector":{"batching":{"pipeline_depth":16}}}),
+            baseline.clone(),
+        )?;
+        let env = selected.environment_for(ComponentRole::Collector)?;
+        assert_eq!(env["ARROWCOL_COLLECTOR_BATCHING_CONFIG"], r#"{"pipeline_depth":16}"#);
+        assert_eq!(
+            effective.collector.unwrap().batching.unwrap().coalesce_publications,
+            Some(true)
+        );
+        for invalid in [
+            serde_json::json!({"collector":{"batching":{"pipeline_depth":65}}}),
+            serde_json::json!({"collector":{"batching":{"age_flush_policy":"unknown"}}}),
+            serde_json::json!({"collector":{"batching":{"unmapped":1}}}),
+        ] {
+            assert!(Tunables::resolve_oat_json(invalid, baseline.clone()).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn pipeline_depth_is_bounded_and_projects_without_a_second_source() -> Result<()> {
         let valid = serde_json::json!({"collector":{"batching":{
             "coalesce_publications":true,"pipeline_depth":4

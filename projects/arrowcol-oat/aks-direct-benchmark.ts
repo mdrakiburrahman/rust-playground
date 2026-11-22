@@ -14,7 +14,7 @@ import { prepareSecrets, renderBootstrapEnv, writePrivateFile } from './runtime.
 import { readDeltaAddWindow } from './aks-delta-preservation.js';
 import { reconcileCollectorWindow } from './aks-collector-window.js';
 import { assertProducedBuildStatement, verifyBuildEnvelope } from './aks-candidate-build.js';
-import { applyCollectorPromotion, assertPromotionEnvironment, collectorSettings,
+import { applyCollectorPromotion, assertPromotionEnvironment, collectorCapacityReadback, collectorSettings,
   type CollectorContract, type CollectorContractRequest, type ProjectCollector } from './aks-collector-promotion.js';
 import { createKubeletNodeResourceReader, startNodeObservation, type NodeObservationHandle, type NodeResourceObservation } from './aks-node-observation.js';
 import {
@@ -623,6 +623,7 @@ interface BenchmarkReport {
     historical_collector_control: { dfe_core_allocation_count: unknown; receiver_rss_limit_bytes: unknown };
     collector_promotion?: Awaited<ReturnType<typeof applyCollectorPromotion>>['binding'];
     collector_startup_readback?: CollectorContract['observed'];
+    collector_capacity_readback: ReturnType<typeof collectorCapacityReadback>;
     rendered_manifest_sha256: string;
     runner_sources_sha256: string;
     candidate_source_commit: string;
@@ -1002,6 +1003,21 @@ async function captureScaledPods(config: Config, namespace: string, runId: strin
     const actual = requireRecord(liveContainers[0], 'Actual measured container');
     if (isCollector && inputs?.promotion.binding) {
       assertPromotionEnvironment(inputs.promotion.binding.projected_environment, actual.env);
+      const actualEnv = actual.env;
+      const desiredEnv = desired.env;
+      if (!Array.isArray(actualEnv) || !Array.isArray(desiredEnv)) throw new Error('Collector environment is missing.');
+      if (
+          !isDeepStrictEqual(actual.envFrom, desired.envFrom) ||
+          desiredEnv.some(variable => {
+            const matches = actualEnv.filter(entry =>
+              requireRecord(entry, 'Actual collector env').name === requireRecord(variable, 'Desired collector env').name);
+            return matches.length !== 1 || !isDeepStrictEqual(matches[0], variable);
+          }) ||
+          actualEnv.some((variable: unknown) => {
+            const name = requireRecord(variable, 'Actual collector env').name;
+            return typeof name !== 'string' || (/^(ARROWCOL_|PARQUET_|DFE_)/.test(name) &&
+              !desiredEnv.some(entry => requireRecord(entry, 'Desired collector env').name === name));
+          })) throw new Error('Actual promoted collector environment differs from rendered configuration.');
     }
     if (actual.image !== desired.image || !isDeepStrictEqual(actual.args, desired.args) ||
         (!isCollector && (!isDeepStrictEqual(actual.env, desired.env) || actual.envFrom !== undefined)) ||
@@ -1472,6 +1488,7 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
       candidate_source_commit: options.scaled.candidateCommit, image_binding: scaled.binding,
       expected_collector: scaled.expectedCollector, historical_collector_control: scaled.historicalControl,
       collector_promotion: scaled.promotion.binding, collector_startup_readback: scaled.collectorReadback,
+      collector_capacity_readback: collectorCapacityReadback(scaled.collectorReadback),
       trusted_build_provenance_verified: !!signerKeySha, trusted_signer_key_sha256: signerKeySha,
       collector_receipt_window: collectorWindow, attested_platform_digests: scaled.platformDigests,
       original_client_pool: clientPoolPlan.original, placement, client_results: clientResults,
