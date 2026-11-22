@@ -794,7 +794,8 @@ mod tests {
             .into_iter()
             .find(|item| item.identity.to_string() == table)
             .context("missing table")?;
-        let expected = arrow_deltalake::normalize::schema(&local_schema(&statement, false)?)?;
+        let expected_schema = local_schema(&statement, false)?;
+        let expected = arrow_deltalake::normalize::schema(expected_schema.as_ref())?;
         assert_eq!(
             schema,
             serde_json::to_value(delta_kernel::schema::StructType::try_from_arrow(expected.as_ref())?)?
