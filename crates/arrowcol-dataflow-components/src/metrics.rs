@@ -1169,10 +1169,10 @@ impl ExporterOccupancy {
                 for resource in CapacityResource::ALL {
                     let value = &self.capacity[scope.index()][resource.index()];
                     let sample = match index {
-                        0 => value.reserved.load(Ordering::Acquire) as f64,
-                        1 => value.waiters.load(Ordering::Acquire) as f64,
-                        2 => value.acquire_nanos.load(Ordering::Acquire) as f64 / 1e9,
-                        _ => value.attempts.load(Ordering::Acquire) as f64,
+                        0 => value.reserved.load(Ordering::Acquire).to_string(),
+                        1 => value.waiters.load(Ordering::Acquire).to_string(),
+                        2 => (value.acquire_nanos.load(Ordering::Acquire) as f64 / 1e9).to_string(),
+                        _ => value.attempts.load(Ordering::Acquire).to_string(),
                     };
                     let _ = writeln!(
                         output,
@@ -1202,9 +1202,9 @@ impl ExporterOccupancy {
             for state in ExporterGroupState::ALL {
                 let value = &self.groups[state.index()];
                 let sample = if index == 0 {
-                    value.active.load(Ordering::Acquire) as f64
+                    value.active.load(Ordering::Acquire).to_string()
                 } else {
-                    value.elapsed_nanos.load(Ordering::Acquire) as f64 / 1e9
+                    (value.elapsed_nanos.load(Ordering::Acquire) as f64 / 1e9).to_string()
                 };
                 let _ = writeln!(output, "{name}{{state=\"{}\"}} {sample}", state.label());
             }

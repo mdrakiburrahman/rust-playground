@@ -204,6 +204,19 @@ keep describing in-memory DFE work only. Batches evicted by a Quiver
 `drop_oldest` or `max_age` policy are not subtracted, so durable deployments
 should use `size_cap_policy: backpressure` without `max_age`.
 
+Exporter Prometheus observations are process-wide:
+
+| Metric | Meaning |
+| --- | --- |
+| `arrowcol_exporter_capacity_reserved` | Logical reserved `bytes`, `rows`, or `batches`; not RSS. `scope=table` sums all table pools. |
+| `arrowcol_exporter_capacity_waiters` | In-progress acquisitions, including immediately satisfied attempts between scrapes. |
+| `arrowcol_exporter_capacity_acquire_{attempts,seconds}_total` | Completed or cancelled acquisition attempts and total elapsed seconds, including uncontended attempts. |
+| `arrowcol_exporter_group_occupancy` | Groups in overlapping `pipeline`, `flush_wait`, `flush_slot`, `preparing`, or `commit_wait` states. Pipeline slots include completed tasks awaiting collection; commit wait includes submission and durable receipt. |
+| `arrowcol_exporter_group_occupancy_seconds_total` | Elapsed state time added on state exit or cancellation; in-progress time is not included. |
+
+Gauges are point-in-time samples and may miss short events. Per-resource and
+per-state values are independently sampled, not an atomic snapshot.
+
 ## Collector chaining
 
 `exporter:arrow_flight` forwards admitted batches to another collector's

@@ -1970,6 +1970,9 @@ mod tests {
             first.receipt.try_recv(),
             Err(oneshot::error::TryRecvError::Empty)
         ));
+        let snapshot = exporter.backend.metrics.prometheus();
+        assert!(snapshot.contains("arrowcol_exporter_group_occupancy{state=\"commit_wait\"} 1"));
+        assert!(snapshot.contains("arrowcol_exporter_group_occupancy{state=\"flush_slot\"} 1"));
         assert!(!root.join("_delta_log/00000000000000000001.json").exists());
         let mut envelope = envelope_for(&lease);
         if !evolve_physical_schema || prior_error {
@@ -1987,8 +1990,8 @@ mod tests {
             let owner = Arc::clone(exporter.backend.tables.lock().await.get(&table()).expect("owner"));
             let rows = batch.num_rows() as u64;
             let bytes = arrow_deltalake::record_batch_logical_bytes(&batch).expect("bytes");
-            let mut capacity = exporter.backend.capacity.acquire(rows, bytes).await.expect("capacity");
-            capacity.extend(owner.capacity.acquire(rows, bytes).await.expect("table capacity"));
+            let mut capacity = vec![exporter.backend.capacity.acquire(rows, bytes).await.expect("capacity")];
+            capacity.push(owner.capacity.acquire(rows, bytes).await.expect("table capacity"));
             let (reply, receipt) = oneshot::channel();
             let queued = QueuedBatch {
                 publication_id: envelope.publication_id.expect("id"),
