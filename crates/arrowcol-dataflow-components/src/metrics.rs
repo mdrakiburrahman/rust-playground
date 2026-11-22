@@ -754,6 +754,22 @@ struct PublicationBacklogEntry {
     rows: u64,
     logical_bytes: u64,
     accepted_at: Instant,
+    stage: Option<PublicationStageEntry>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PublicationStage {
+    Waiting,
+    Flushing,
+    Written,
+    Unknown,
+    Replay,
+}
+
+#[derive(Clone)]
+struct PublicationStageEntry {
+    table: TableIdentity,
+    stage: PublicationStage,
 }
 
 /// Opaque generation token returned for one queue-admitted publication cohort.
@@ -934,6 +950,7 @@ impl PublicationBacklog {
                 rows,
                 logical_bytes,
                 accepted_at,
+                stage: None,
             },
         );
         self.active_tokens.insert(token_id, id);
@@ -1170,6 +1187,80 @@ impl RuntimeMetrics {
         accepted_at: Instant,
     ) -> Result<PublicationBacklogToken, String> {
         self.publication_backlog().start(id, rows, logical_bytes, accepted_at)
+    }
+
+    /// Associates an accepted cohort with its table only when saturation telemetry is enabled.
+    pub(crate) fn stage_admitted(&self, token: PublicationBacklogToken, table: &TableIdentity) {
+        let mut backlog = self.publication_backlog();
+        if let Some(id) = backlog.active_tokens.get(&token.0).cloned()
+            && let Some(entry) = backlog.entries.get_mut(&id)
+        {
+            if entry.stage.as_ref().is_some_and(|existing| existing.table != *table) {
+                entry.stage = None;
+            } else {
+                let stage = if entry.pending_admissions == 1 {
+                    PublicationStage::Waiting
+                } else {
+                    PublicationStage::Replay
+                };
+                entry.stage = Some(PublicationStageEntry {
+                    table: table.clone(),
+                    stage,
+                });
+            }
+        }
+    }
+
+    pub(crate) fn stage_transition(&self, token: PublicationBacklogToken, stage: PublicationStage) {
+        let mut backlog = self.publication_backlog();
+        if let Some(id) = backlog.active_tokens.get(&token.0).cloned()
+            && let Some(entry) = backlog.entries.get_mut(&id)
+            && let Some(state) = entry.stage.as_mut()
+        {
+            if entry.pending_admissions != 1 || state.stage == PublicationStage::Replay {
+                state.stage = PublicationStage::Replay;
+            } else {
+                state.stage = stage;
+            }
+        }
+    }
+
+    /// A table-level snapshot: partition-level splits and ambiguous replay outcomes are not inferred.
+    pub(crate) fn stage_saturation_snapshot(&self) -> serde_json::Value {
+        let backlog = self.publication_backlog();
+        if let Some(reason) = backlog.unknown_reason {
+            return serde_json::json!({"tables": null, "unavailable_reason": reason});
+        }
+        let now = Instant::now();
+        let mut tables: BTreeMap<String, Vec<&PublicationBacklogEntry>> = BTreeMap::new();
+        for entry in backlog.entries.values() {
+            let Some(stage) = &entry.stage else {
+                return serde_json::json!({"tables": null, "unavailable_reason": "stage_identity_not_observed"});
+            };
+            tables.entry(stage.table.to_string()).or_default().push(entry);
+        }
+        let omitted_tables = tables.len().saturating_sub(MAX_TABLE_PRESSURE_ENTRIES);
+        let values = tables.into_iter().take(MAX_TABLE_PRESSURE_ENTRIES).map(|(table, entries)| {
+            let unknown = entries.iter().any(|entry| entry.stage.as_ref().is_none_or(|s| matches!(s.stage, PublicationStage::Unknown | PublicationStage::Replay)));
+            let measure = |stage| {
+                if unknown {
+                    return serde_json::json!({"rows": null, "logical_bytes": null, "oldest_age_ms": null, "unavailable_reason": "partition_progress_replay_or_partial_commit_not_observed"});
+                }
+                let mut rows = 0u64;
+                let mut bytes = 0u64;
+                let mut oldest = None;
+                for entry in &entries {
+                    if entry.stage.as_ref().is_some_and(|s| s.stage == stage) {
+                        rows = match rows.checked_add(entry.rows) { Some(v) => v, None => return serde_json::json!({"rows": null, "logical_bytes": null, "oldest_age_ms": null, "unavailable_reason": "overflow"}) };
+                        bytes = match bytes.checked_add(entry.logical_bytes) { Some(v) => v, None => return serde_json::json!({"rows": null, "logical_bytes": null, "oldest_age_ms": null, "unavailable_reason": "overflow"}) };
+                        oldest = Some(oldest.map_or(entry.accepted_at, |v: Instant| v.min(entry.accepted_at)));
+                    }
+                }
+                serde_json::json!({"rows": rows, "logical_bytes": bytes, "oldest_age_ms": oldest.map(|v| duration_millis(now.saturating_duration_since(v))), "oldest_age_unavailable_reason": oldest.is_none().then_some("stage_empty"), "unavailable_reason": null})
+            };
+            serde_json::json!({"table": table, "partition": null, "partition_unavailable_reason": "publication_may_span_partitions", "admitted_waiting": measure(PublicationStage::Waiting), "flushing": measure(PublicationStage::Flushing), "written_not_durable": measure(PublicationStage::Written)})
+        }).collect::<Vec<_>>();
+        serde_json::json!({"tables": values, "omitted_tables": omitted_tables, "unavailable_reason": null})
     }
 
     /// Completes one queue admission only after confirmed durable success.
@@ -2446,6 +2537,75 @@ mod tests {
         assert!(second.try_acquire().is_err());
         assert!(metrics.stream_permits(3).is_err());
     }
+    #[test]
+    fn stage_saturation_tracks_cohorts_and_refuses_ambiguous_replays() {
+        let metrics = RuntimeMetrics::new(CollectorInstanceId::new());
+        metrics.configure_publication_backlog(4).expect("capacity");
+        let id = PublicationId::new();
+        let token = metrics
+            .publication_backlog_start(id, 3, 128, Instant::now() - Duration::from_secs(2))
+            .expect("admit");
+        metrics.stage_admitted(token, &table());
+        let waiting = metrics.stage_saturation_snapshot();
+        assert_eq!(waiting["tables"][0]["admitted_waiting"]["rows"], 3);
+        assert_eq!(waiting["tables"][0]["admitted_waiting"]["logical_bytes"], 128);
+        assert!(
+            waiting["tables"][0]["admitted_waiting"]["oldest_age_ms"]
+                .as_u64()
+                .expect("age")
+                >= 2000
+        );
+        assert!(waiting["tables"][0]["partition"].is_null());
+        metrics.stage_transition(token, PublicationStage::Flushing);
+        assert_eq!(metrics.stage_saturation_snapshot()["tables"][0]["flushing"]["rows"], 3);
+        metrics.stage_transition(token, PublicationStage::Written);
+        assert_eq!(
+            metrics.stage_saturation_snapshot()["tables"][0]["written_not_durable"]["rows"],
+            3
+        );
+        let replay = metrics
+            .publication_backlog_start(id, 3, 128, Instant::now())
+            .expect("replay");
+        metrics.stage_admitted(replay, &table());
+        let ambiguous = metrics.stage_saturation_snapshot();
+        assert!(ambiguous["tables"][0]["written_not_durable"]["rows"].is_null());
+        assert_eq!(
+            ambiguous["tables"][0]["written_not_durable"]["unavailable_reason"],
+            "partition_progress_replay_or_partial_commit_not_observed"
+        );
+        metrics.publication_backlog_commit(token).expect("commit");
+        assert_eq!(
+            metrics.stage_saturation_snapshot()["tables"]
+                .as_array()
+                .expect("tables")
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn stage_saturation_unknown_partial_commit_and_lost_tracking_stay_unknown() {
+        let metrics = RuntimeMetrics::new(CollectorInstanceId::new());
+        metrics.configure_publication_backlog(2).expect("capacity");
+        let token = metrics
+            .publication_backlog_start(PublicationId::new(), 4, 256, Instant::now())
+            .expect("admit");
+        metrics.stage_admitted(token, &table());
+        metrics.stage_transition(token, PublicationStage::Unknown);
+        let snapshot = metrics.stage_saturation_snapshot();
+        assert!(snapshot["tables"][0]["flushing"]["logical_bytes"].is_null());
+        assert!(snapshot["tables"][0]["written_not_durable"]["rows"].is_null());
+        metrics.stage_transition(token, PublicationStage::Written);
+        assert_eq!(
+            metrics.stage_saturation_snapshot()["tables"][0]["written_not_durable"]["rows"],
+            4
+        );
+        metrics.publication_backlog_mark_unknown();
+        let snapshot = metrics.stage_saturation_snapshot();
+        assert!(snapshot["tables"].is_null());
+        assert_eq!(snapshot["unavailable_reason"], "unknown_outcome");
+    }
+
     #[test]
     fn publication_backlog_replay_preserves_first_age_until_durable_success() {
         let metrics = RuntimeMetrics::new(CollectorInstanceId::new());

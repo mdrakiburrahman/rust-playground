@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 
@@ -28,7 +29,7 @@ use tokio::time::Instant;
 use crate::DeltaExporterConfig;
 use crate::config::{BatchCapacity, FileBatchConfig, config_error, parse_config, table_path};
 use crate::envelope::{ArrowcolBatchEnvelope, DecodedArrowBatch, EnvelopeError, decode_record_set};
-use crate::metrics::{FlushReason, PipelineStage, RuntimeMetrics, StageMetrics, global_metrics};
+use crate::metrics::{FlushReason, PipelineStage, PublicationStage, RuntimeMetrics, StageMetrics, global_metrics};
 use crate::routing::{
     AuthorityClient, ExportingProcess, LEASE_VIEW_TTL, LeaseBinder, LeaseBinding, LeaseEvidence,
     RoutingPublicationFence,
@@ -47,6 +48,8 @@ pub struct GenericDeltaExporter {
 
 impl GenericDeltaExporter {
     fn shared(config: DeltaExporterConfig, metrics: Arc<RuntimeMetrics>) -> Result<Self, String> {
+        let stage_interval =
+            arrow_deltalake::telemetry::stage_telemetry_interval().map_err(|error| error.to_string())?;
         let generation = arrowcol_buffer::CloudGeneration::capture(&config.base_path.to_string_lossy())
             .map_err(|error| error.to_string())?;
         if generation.is_some()
@@ -79,6 +82,7 @@ impl GenericDeltaExporter {
             batching: config.batching.clone(),
             capacity: Capacity::new(config.batching.global_capacity),
             flush_slots: Arc::new(Semaphore::new(config.batching.max_concurrent_flushes)),
+            stage_telemetry: stage_interval.map(|_| StageSaturation::default()),
             draining: std::sync::atomic::AtomicBool::new(false),
             backlog_capacity,
             authority,
@@ -88,6 +92,20 @@ impl GenericDeltaExporter {
             #[cfg(test)]
             submission_probe: std::sync::Mutex::new(None),
         });
+        if let Some(interval) = stage_interval {
+            let weak = Arc::downgrade(&backend);
+            if let Err(error) = arrow_deltalake::delta::spawn_shared_io(async move {
+                let mut tick = tokio::time::interval(interval);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tick.tick().await;
+                    let Some(backend) = weak.upgrade() else { break };
+                    backend.sample_stage_saturation();
+                }
+            }) {
+                tracing::error!(error = %error, "stage saturation sampler could not start");
+            }
+        }
         registry.insert(config.base_path, Arc::downgrade(&backend));
         Ok(Self { backend })
     }
@@ -137,6 +155,7 @@ impl GenericDeltaExporter {
                 options,
                 capacity: Capacity::new(batching.global_capacity),
                 flush_slots: Arc::new(Semaphore::new(batching.max_concurrent_flushes)),
+                stage_telemetry: None,
                 batching,
                 backlog_capacity,
                 draining: std::sync::atomic::AtomicBool::new(false),
@@ -214,6 +233,42 @@ impl GenericDeltaExporter {
     }
 }
 
+const ADMISSION_WAIT_BUCKETS_US: [u64; 10] = [
+    100, 500, 1_000, 5_000, 10_000, 50_000, 100_000, 500_000, 1_000_000, 5_000_000,
+];
+
+#[derive(Default)]
+struct StageSaturation {
+    sequence: std::sync::atomic::AtomicU64,
+    admission_count: std::sync::atomic::AtomicU64,
+    admission_wait_us: std::sync::atomic::AtomicU64,
+    admission_buckets: [std::sync::atomic::AtomicU64; 11],
+    admission_overflow: std::sync::atomic::AtomicBool,
+}
+
+impl StageSaturation {
+    fn record_admission(&self, elapsed: std::time::Duration) {
+        use std::sync::atomic::Ordering;
+        let micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        let bucket = ADMISSION_WAIT_BUCKETS_US.partition_point(|upper| *upper < micros);
+        let bucket_overflow = self.admission_buckets[bucket]
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_add(1))
+            .is_err();
+        if bucket_overflow
+            || self
+                .admission_count
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_add(1))
+                .is_err()
+            || self
+                .admission_wait_us
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_add(micros))
+                .is_err()
+        {
+            self.admission_overflow.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
 struct DeltaBackend {
     configuration: Option<DeltaExporterConfig>,
     base_path: PathBuf,
@@ -221,6 +276,7 @@ struct DeltaBackend {
     batching: FileBatchConfig,
     capacity: Capacity,
     flush_slots: Arc<Semaphore>,
+    stage_telemetry: Option<StageSaturation>,
     draining: std::sync::atomic::AtomicBool,
     authority: AuthorityClient,
     leases: LeaseBinder,
@@ -240,6 +296,49 @@ impl Drop for DeltaBackend {
 }
 
 impl DeltaBackend {
+    fn sample_stage_saturation(&self) {
+        use std::sync::atomic::Ordering;
+        let Some(stage) = &self.stage_telemetry else { return };
+        let overflow = stage.admission_overflow.load(Ordering::Relaxed);
+        let Ok(sequence) = stage
+            .sequence
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_add(1))
+        else {
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "arrowcol_collector_stage_sample_error sequence_overflow"
+            );
+            return;
+        };
+        let sampled_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|v| u64::try_from(v.as_millis()).ok());
+        let sample = serde_json::json!({
+            "schema_version": 1,
+            "backend": self.base_path.to_string_lossy(),
+            "sequence": sequence,
+            "sampled_at_unix_ms": sampled_at,
+            "clock_unavailable_reason": sampled_at.is_none().then_some("system_clock_unavailable"),
+            "cohorts": self.metrics.stage_saturation_snapshot(),
+            "cohort_scope": "process_wide_queue_admitted_publications",
+            "oldest_age_scope": "since_first_queue_admission",
+            "flush_slots_occupied": self.batching.max_concurrent_flushes.saturating_sub(self.flush_slots.available_permits()),
+            "flush_slots_capacity": self.batching.max_concurrent_flushes,
+            "admission_wait": {
+                "completed_count": (!overflow).then(|| stage.admission_count.load(Ordering::Relaxed)),
+                "total_duration_us": (!overflow).then(|| stage.admission_wait_us.load(Ordering::Relaxed)),
+                "unavailable_reason": overflow.then_some("counter_overflow"),
+                "scope": "successful_global_and_table_capacity_acquisitions_cumulative_backend",
+                "consistency": "independent_atomic_counters",
+                "bucket_upper_bounds_us": ADMISSION_WAIT_BUCKETS_US,
+                "bucket_counts": (!overflow).then(|| stage.admission_buckets.iter().map(|bucket| bucket.load(Ordering::Relaxed)).collect::<Vec<_>>()),
+                "bucket_semantics": "noncumulative_inclusive_upper_last_is_overflow",
+            },
+        });
+        let _ = writeln!(std::io::stderr().lock(), "arrowcol_collector_stage_sample {sample}");
+    }
+
     async fn owner(&self, decoded: &DecodedArrowBatch) -> Result<Arc<TableOwner>, ExportFailure> {
         let mut tables = self.tables.lock().await;
         if self.draining.load(std::sync::atomic::Ordering::Acquire) {
@@ -384,8 +483,12 @@ impl DeltaBackend {
             decoded.envelope.source_schema_version,
             decoded.envelope.target_schema_version,
         );
+        let admission_started = self.stage_telemetry.as_ref().map(|_| Instant::now());
         let mut capacity = self.capacity.acquire(rows, bytes).await?;
         capacity.extend(owner.capacity.acquire(rows, bytes).await?);
+        if let (Some(stage), Some(started)) = (&self.stage_telemetry, admission_started) {
+            stage.record_admission(started.elapsed());
+        }
         let queue_permit = owner
             .sender
             .try_reserve()
@@ -409,6 +512,11 @@ impl DeltaBackend {
                     None
                 }
             };
+        if self.stage_telemetry.is_some()
+            && let Some(token) = backlog_token
+        {
+            self.metrics.stage_admitted(token, &decoded.envelope.table);
+        }
         let (reply, receipt) = oneshot::channel();
         queue_permit.send(WorkerCommand::Batch(QueuedBatch {
             publication_id,
@@ -419,6 +527,7 @@ impl DeltaBackend {
             bytes,
             accepted,
             backlog_token,
+            stage_enabled: self.stage_telemetry.is_some(),
             reply: Some(reply),
             #[cfg(test)]
             submitted: self
@@ -556,6 +665,7 @@ struct QueuedBatch {
     bytes: u64,
     accepted: Instant,
     backlog_token: Option<crate::metrics::PublicationBacklogToken>,
+    stage_enabled: bool,
     reply: Option<oneshot::Sender<Result<(), ExportFailure>>>,
     #[cfg(test)]
     submitted: Option<oneshot::Sender<()>>,
@@ -1020,6 +1130,11 @@ impl GroupPublisher<'_> {
                 .acquire()
                 .await
                 .map_err(|error| ExportFailure::Transient(error.to_string()))?;
+            for entry in group.iter().filter(|entry| entry.stage_enabled) {
+                if let Some(token) = entry.backlog_token {
+                    self.metrics.stage_transition(token, PublicationStage::Flushing);
+                }
+            }
             let mut staged = Vec::with_capacity(group.len());
             let mut updated_estimator = estimator.clone();
             let mut publications = HashMap::with_capacity(group.len());
@@ -1046,6 +1161,7 @@ impl GroupPublisher<'_> {
                 }
                 self.stage_metrics.record(PipelineStage::Build, build_started.elapsed());
                 let mut pending_groups = VecDeque::from([inputs]);
+                let mut split = false;
                 let mut version = 0;
                 while let Some(mut inputs) = pending_groups.pop_front() {
                     let prepared = match table.stage_coalesced_publications(inputs.clone()).await {
@@ -1059,6 +1175,10 @@ impl GroupPublisher<'_> {
                                 _ => None,
                             });
                             if capacity.is_some() && inputs.len() > 1 {
+                                split = true;
+                                for entry in group.iter().filter(|entry| entry.stage_enabled) {
+                                    if let Some(token) = entry.backlog_token { self.metrics.stage_transition(token, PublicationStage::Unknown); }
+                                }
                                 let right = inputs.split_off(inputs.len() / 2);
                                 pending_groups.push_front(right);
                                 pending_groups.push_front(inputs);
@@ -1084,6 +1204,10 @@ impl GroupPublisher<'_> {
                         updated_estimator.observe(append.observation()).map_err(|error| {
                             ExportFailure::Permanent(format!("file sizing observation failed: {error}"))
                         })?;
+                    }
+                    let stage = if split { PublicationStage::Unknown } else { PublicationStage::Written };
+                    for entry in group.iter().filter(|entry| entry.stage_enabled) {
+                        if let Some(token) = entry.backlog_token { self.metrics.stage_transition(token, stage); }
                     }
                     let submission_started = Instant::now();
                     let submission = table.submit_prepared_group(prepared, self.force_commit).await;
@@ -1164,10 +1288,21 @@ impl GroupPublisher<'_> {
                     staged.push(append);
                 }
             }
+            for entry in group.iter().filter(|entry| entry.stage_enabled) {
+                if let Some(token) = entry.backlog_token {
+                    self.metrics.stage_transition(token, PublicationStage::Written);
+                }
+            }
             let mut receipts = Vec::with_capacity(staged.len());
             let total = staged.len();
             published_files = total as u64;
             for (index, append) in staged.into_iter().enumerate() {
+                // Independent receipts cannot identify the uncommitted part after submission.
+                if index == 0 {
+                    for entry in group.iter().filter(|entry| entry.stage_enabled) {
+                        if let Some(token) = entry.backlog_token { self.metrics.stage_transition(token, PublicationStage::Unknown); }
+                    }
+                }
                 // Force only the last file of a dependency wave. Forcing each
                 // file defeats commit batching; never fill all worker permits
                 // with an unforced partial batch while awaiting another slot.
@@ -1545,6 +1680,23 @@ mod tests {
     use crate::envelope::{ArrowcolBatchEnvelope, encode_record_batch};
     use crate::metrics::RuntimeMetrics;
 
+    #[test]
+    fn admission_wait_histogram_keeps_boundaries_and_overflow() {
+        use std::sync::atomic::Ordering;
+        let stats = StageSaturation::default();
+        stats.record_admission(std::time::Duration::from_micros(100));
+        stats.record_admission(std::time::Duration::from_micros(101));
+        stats.record_admission(std::time::Duration::from_secs(6));
+        assert_eq!(stats.admission_count.load(Ordering::Relaxed), 3);
+        assert_eq!(stats.admission_wait_us.load(Ordering::Relaxed), 6_000_201);
+        assert_eq!(stats.admission_buckets[0].load(Ordering::Relaxed), 1);
+        assert_eq!(stats.admission_buckets[1].load(Ordering::Relaxed), 1);
+        assert_eq!(stats.admission_buckets[10].load(Ordering::Relaxed), 1);
+        stats.admission_count.store(u64::MAX, Ordering::Relaxed);
+        stats.record_admission(std::time::Duration::ZERO);
+        assert!(stats.admission_overflow.load(Ordering::Relaxed));
+    }
+
     /// Scenario: exporter feedback NACKs a real encoded publication, then optionally ACKs its replay.
     /// Guarantees: production identity decoding permits recovery only after that publication succeeds.
     #[tokio::test]
@@ -1907,6 +2059,7 @@ mod tests {
                 bytes,
                 accepted: Instant::now(),
                 backlog_token: None,
+                stage_enabled: false,
                 reply: Some(reply),
                 submitted: None,
                 _pending_owner: owner.begin(LeaseEvidence::from_envelope(&envelope)).expect("admitted"),
