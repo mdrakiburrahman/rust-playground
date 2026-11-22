@@ -367,6 +367,7 @@ pub struct RuntimeTunables {
     pub read_ahead: Option<usize>,
     pub batch_rows: Option<usize>,
     pub cpu_workers: Option<usize>,
+    pub generated_partition_fast_path: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]

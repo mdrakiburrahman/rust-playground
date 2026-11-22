@@ -111,6 +111,7 @@ export async function replayParityArm(
   collectorOverride?: CollectorImageOverride,
   collectorCpus?: number[],
   profile: ParityProfile = "historical-parity-diagnostic",
+  generatedPartitionFastPath?: boolean,
 ): Promise<JsonObject> {
   if (!/^[0-9a-fA-F:.]+$/.test(bindHost) || !/^[0-9a-fA-F:.]+$/.test(endpointHost)) {
     throw new Error("local bind and endpoint hosts must be explicit IP addresses");
@@ -141,7 +142,7 @@ export async function replayParityArm(
   }
   const seed = object(JSON.parse(await readFile(seedPath, "utf8")), "parity seed");
   if (seed.warmup_seconds !== 60 || seed.measure_seconds !== 150) throw new Error("unexpected parity timing contract");
-  const config = parityLadderConfig(seed, workers, profile);
+  const config = parityLadderConfig(seed, workers, profile, generatedPartitionFastPath);
   const data = join(home, "data");
   await mkdir(data, { recursive: true });
   const lock = join(data, "evaluating");
@@ -180,6 +181,7 @@ export async function replayParityArm(
     if (identity) {
       if (identity.source_revision !== producer.revision || identity.seed_sha256 !== seedHash
         || (identity.profile ?? "historical-parity-diagnostic") !== profile
+        || (identity.generated_partition_fast_path ?? null) !== (generatedPartitionFastPath ?? null)
         || identity.collector_revision !== (collectorOverride?.sourceRevision ?? producer.revision)
         || identity.collector_override_image_id !== (collectorOverride?.imageId ?? null)
         || JSON.stringify(identity.collector_cpus ?? null) !== JSON.stringify(collectorCpus ?? null)
@@ -233,6 +235,7 @@ export async function replayParityArm(
       collector_override_image_id: collectorOverride?.imageId ?? null,
       collector_cpu_allocation: cpuAllocation,
       profile, seed_sha256: seedHash, config_sha256: configHash,
+      generated_partition_fast_path: generatedPartitionFastPath ?? null,
       controller_sha256: binaryHash, footer_inspector_sha256: footer.sha256, workers, host, runRoot,
       identity_reconciliation: { available: false, reason: "Diagnostic corpus does not carry unique delivery identities" },
       ...result,
@@ -245,6 +248,7 @@ export async function replayParityArm(
         collector_override_image_id: collectorOverride?.imageId ?? null,
         collector_cpus: collectorCpus ?? null,
         profile,
+        generated_partition_fast_path: generatedPartitionFastPath ?? null,
       }, null, 2)}\n`, { flag: "wx", mode: 0o400 });
     }
     completed = true;

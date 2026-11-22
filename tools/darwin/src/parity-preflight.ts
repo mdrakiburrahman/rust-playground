@@ -20,8 +20,15 @@ export function parseParityProfile(value: string): ParityProfile {
   return value;
 }
 
+export function parsePartitionFastPath(value: string): boolean {
+  if (value === "true") return true;
+  if (value === "false") return false;
+  throw new Error("generated partition fast path must be true or false");
+}
+
 export function parityLadderConfig(
   seed: unknown, workers: number, profile: ParityProfile = "historical-parity-diagnostic",
+  generatedPartitionFastPath?: boolean,
 ): JsonObject {
   if (![1, 2, 4, 8, 16].includes(workers)) throw new Error("unsupported parity ladder worker count");
   const config = object(structuredClone(seed), "parity seed");
@@ -50,6 +57,10 @@ export function parityLadderConfig(
     table.bytes = 2_500_000_000;
   } else if (profile !== "historical-parity-diagnostic") {
     throw new Error("unsupported parity profile");
+  }
+  if (generatedPartitionFastPath !== undefined) {
+    const collector = object(tunables.collector, "collector");
+    object(collector.runtime, "collector runtime").generated_partition_fast_path = generatedPartitionFastPath;
   }
   return config;
 }

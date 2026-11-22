@@ -240,6 +240,7 @@ const CAPABILITIES: &[Capability] = &[
     capability!("collector.runtime.read_ahead", "clamp(c,8,16)"),
     capability!("collector.runtime.batch_rows", "clamp(1024c,4096,32768)"),
     capability!("collector.runtime.cpu_workers", "clamp(c-1,1,32)"),
+    capability!("collector.runtime.generated_partition_fast_path", "false"),
     capability!("collector.upload.mode", "put_create"),
     capability!("collector.upload.buffer_capacity_bytes", "8388608"),
     capability!("collector.upload.request_concurrency", "2"),
@@ -811,6 +812,12 @@ impl Tunables {
                     }
                 }
                 if let Some(runtime) = &collector.runtime {
+                    if let Some(enabled) = runtime.generated_partition_fast_path {
+                        output.insert(
+                            "ARROWCOL_COLLECTOR_GENERATED_PARTITION_FAST_PATH".to_owned(),
+                            enabled.to_string(),
+                        );
+                    }
                     for (field, value) in [
                         ("RUNTIME_WORKERS", runtime.workers),
                         ("BLOCKING_WORKERS", runtime.blocking_workers),

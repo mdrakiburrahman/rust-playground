@@ -664,6 +664,37 @@ process.stdout.write(JSON.stringify(await renderRuntime(input, 'workload')));
     }
 
     #[test]
+    fn generated_partition_fast_path_is_injected_and_read_back() -> Result<()> {
+        const ENV: &str = "ARROWCOL_COLLECTOR_GENERATED_PARTITION_FAST_PATH";
+        for enabled in [false, true] {
+            let mut config = config()?;
+            config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({
+                "collector":{"runtime":{"generated_partition_fast_path":enabled}}
+            }))?;
+            let environment = role_environment(&config, ComponentRole::Collector)?;
+            assert_eq!(environment[ENV], enabled.to_string());
+            let compose = compose_tunables(&config)?;
+            assert_eq!(compose["services"]["dataflow-1"]["environment"][ENV], enabled.to_string());
+            let mut deployment = json!({"spec":{"template":{"spec":{"containers":[{"name":"dataflow"}]}}}});
+            inject_deployment_environment(&mut deployment, "dataflow", &environment)?;
+            assert!(deployment["spec"]["template"]["spec"]["containers"][0]["env"]
+                .as_array().context("deployment environment")?
+                .iter().any(|entry| entry["name"] == ENV && entry["value"] == enabled.to_string()));
+            let actual = json!({"runtime":{"generated_partition_fast_path":enabled}});
+            verify_process_configuration(&config, ComponentRole::Collector, &actual)?;
+            assert!(verify_process_configuration(
+                &config, ComponentRole::Collector,
+                &json!({"runtime":{"generated_partition_fast_path":!enabled}})
+            ).is_err());
+            assert!(verify_process_configuration(&config, ComponentRole::Collector, &json!({})).is_err());
+        }
+        assert!(arrowcol_tunables::Tunables::parse_oat_json(json!({
+            "collector":{"runtime":{"generated_partition_fast_path":"true"}}
+        })).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn aged_batching_policy_reaches_compose_aks_and_effective_readback() -> Result<()> {
         let mut config = config()?;
         config.tunables = arrowcol_tunables::Tunables::parse_oat_json(json!({

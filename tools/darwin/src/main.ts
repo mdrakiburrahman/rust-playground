@@ -4,7 +4,7 @@ import path from "node:path";
 import { checkCompressionCandidate } from "./compression-policy.js";
 import { CoverageUnavailableError } from "./metrics-adapter.js";
 import { parseCollectorCpus, replayParityArm } from "./parity-replay.js";
-import { parseParityProfile } from "./parity-preflight.js";
+import { parseParityProfile, parsePartitionFastPath } from "./parity-preflight.js";
 import { checkCandidatePaths } from "./paths.js";
 import { experimentPathsFor } from "./policy.js";
 import { prepareReplayRuntime, replayCompressionPair } from "./replay.js";
@@ -98,6 +98,8 @@ async function main(args: string[]): Promise<void> {
       Number(option(args, "--controller-stack-bytes")), collectorOverride,
       args.includes("--collector-cpus") ? parseCollectorCpus(option(args, "--collector-cpus")) : undefined,
       parseParityProfile(option(args, "--profile", "historical-parity-diagnostic")),
+      args.includes("--generated-partition-fast-path") ?
+        parsePartitionFastPath(option(args, "--generated-partition-fast-path")) : undefined,
     );
     console.log("@FEEDBACK One local parity arm is diagnostic and does not qualify a winner.");
     console.log(`@RESULT ${JSON.stringify({ version: 1,

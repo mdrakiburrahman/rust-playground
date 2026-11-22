@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { assertParityCollectorReadback, assertParityEvidence, assertParityTableLayout, parityHostReceipt, parityLadderConfig, parseParityProfile } from "./parity-preflight.js";
+import { assertParityCollectorReadback, assertParityEvidence, assertParityTableLayout, parityHostReceipt, parityLadderConfig, parseParityProfile, parsePartitionFastPath } from "./parity-preflight.js";
 import { parityCpuAllocation, parityImageIds, parseCollectorCpus } from "./parity-replay.js";
 
 const meminfo = "MemTotal: 1048576 kB\nMemAvailable: 524288 kB\n";
@@ -79,6 +79,24 @@ test("bounded table profile preserves the historical guard and isolates its capa
   assert.throws(() => parityLadderConfig({ ...seed, overload_guard: { enabled: true, cap_fraction: 0.95 } }, 1,
     "bounded-table-2500m-diagnostic"), /unchanged/);
   assert.throws(() => parseParityProfile("bounded"), /unsupported/);
+});
+
+test("generated partition candidate is an explicit typed, isolated setting", () => {
+  const seed = {
+    tables: ["sqlserver_availability_replica_states"], replica_counts: [1],
+    tunables: { client: {
+      data_profile: "diagnostic", payload_customer_id: "direct-e64-confirmwide",
+      workers: 8, streams_per_worker: 2,
+    }, collector: { runtime: { cpu_workers: 32 } } },
+  };
+  for (const raw of ["true", "false"]) {
+    const flag = parsePartitionFastPath(raw);
+    const config = parityLadderConfig(seed, 1, "historical-parity-diagnostic", flag);
+    const collector = (config.tunables as typeof seed.tunables).collector;
+    assert.equal((collector.runtime as { generated_partition_fast_path?: boolean }).generated_partition_fast_path, flag);
+  }
+  assert.throws(() => parsePartitionFastPath("1"), /true or false/);
+  assert.equal("generated_partition_fast_path" in seed.tunables.collector.runtime, false);
 });
 
 test("collector parity readback rejects drift in historical limits and local pressure", () => {

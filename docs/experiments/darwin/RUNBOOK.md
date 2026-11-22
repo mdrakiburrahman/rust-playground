@@ -48,6 +48,7 @@ historical comparable AKS headline guard is 38.17 B/row.
 | Substitute a control collector | Append `--collector-image-id sha256:<digest> --collector-source-revision <full-commit>` to the parity command, using a separate trusted home. |
 | Collector-only CPU stratum | Append `--collector-cpus 0,1,2,3` to a new trusted home; choose CPUs available to the host. |
 | Bounded table diagnostic | Append `--profile bounded-table-2500m-diagnostic` in a separate trusted home. |
+| Generated partition candidate | Append `--generated-partition-fast-path true` or `false` in a separate trusted home. |
 
 Build the control image from a clean checkout of the recorded commit and retain
 the build log and source tree identity. An image revision label alone does not
@@ -59,6 +60,9 @@ The bounded profile changes only per-table buffered-byte capacity from 4 GB to
 capacity plus one 1 GiB flush is below the guard, but concurrent in-flight
 work may still trigger it. Do not mix this stratum with historical parity;
 compare main and candidate with the same profile.
+The partition fast path is opt-in and requires a collector that reports support;
+current main does not. Label a main-versus-enabled comparison as tuned-system,
+and compare the candidate with the switch off/on separately.
 The CPU option applies only to the collector before startup. The run refuses
 admission unless its configured and effective cgroup CPU sets match the
 requested list. It does not reserve CPUs from clients; record their placement
