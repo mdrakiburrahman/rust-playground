@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import { writeFileSync } from "node:fs";
-import { cp, lstat, mkdir, readFile, readdir, realpath, rmdir, writeFile } from "node:fs/promises";
+import { cp, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rmdir, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 
@@ -68,23 +68,24 @@ function buildEnv(home: string, target: string): NodeJS.ProcessEnv {
   };
 }
 
-export async function treeHash(root: string): Promise<string> {
+export async function treeHash(root: string, withMetadata = false): Promise<string> {
   const entries: string[] = [];
   async function visit(directory: string, prefix: string): Promise<void> {
     const names = (await readdir(directory)).sort();
     for (const name of names) {
       const file = join(directory, name);
       const rel = prefix ? `${prefix}/${name}` : name;
-      const stat = await lstat(file);
+      const stat = await lstat(file, { bigint: true });
+      const state = withMetadata ? ` ${stat.ino} ${stat.mtimeNs} ${stat.ctimeNs}` : "";
       if (stat.isSymbolicLink() || (!stat.isDirectory() && !stat.isFile())) {
         throw new Error(`unexpected non-regular fixture entry: ${rel}`);
       }
       if (stat.isDirectory()) {
-        entries.push(`d ${rel}`);
+        entries.push(`d ${rel}${state}`);
         await visit(file, rel);
       } else {
-        if (stat.nlink !== 1) throw new Error(`hard-linked fixture file: ${rel}`);
-        entries.push(`f ${rel} ${stat.size} ${await fileHash(file)}`);
+        if (stat.nlink !== 1n) throw new Error(`hard-linked fixture file: ${rel}`);
+        entries.push(`f ${rel} ${stat.size} ${await fileHash(file)}${state}`);
       }
     }
   }
@@ -163,6 +164,25 @@ export async function prepareMaintenance(options: PrepareOptions): Promise<Prepa
   };
   const seed = join(root, "seed");
   run(baselineBinary, ["seed", seed], source, env, join(root, "seed.log"));
+  const prime = join(root, "prime");
+  await cp(seed, prime, { recursive: true, force: false, errorOnExist: true });
+  const initialized = await namespaceRun([sandboxBinary, baselineBinary, "idle", prime], prime);
+  await writeFile(join(root, "prime.stdout"), initialized.stdout, { flag: "wx" });
+  await writeFile(join(root, "prime.stderr"), initialized.stderr, { flag: "wx" });
+  run(comparatorBinary, ["idle", seed, prime], root, env, join(root, "prime-comparator.log"));
+  for (const name of ["empty", "quiescent", "protected"]) {
+    const before = new Set(await readdir(join(seed, name)));
+    const added = (await readdir(join(prime, name))).filter((entry) => !before.has(entry)).sort();
+    if (JSON.stringify(added) !== JSON.stringify([".arrow-lake-writer.lock", "_arrowcol_maintenance"])) {
+      throw new Error(`unexpected initial idle sidecars: ${name}`);
+    }
+    const sidecars = (await readdir(join(prime, name, "_arrowcol_maintenance"))).sort();
+    if (JSON.stringify(sidecars) !== JSON.stringify([".lock", "vacuum-lite.json"])) {
+      throw new Error(`unexpected initial vacuum sidecars: ${name}`);
+    }
+    for (const entry of added) await cp(join(prime, name, entry), join(seed, name, entry), { recursive: true, force: false, errorOnExist: true });
+  }
+  bindings.seedInitialization = "pinned seed plus trusted one-time idle sidecar initialization";
   bindings.seedSha256 = await treeHash(seed);
   await writeFile(join(root, "bindings.json"), `${JSON.stringify(bindings, null, 2)}\n`, { flag: "wx" });
   return { root, seed, baselineBinary, candidateBinary, comparatorBinary, sandboxBinary, bindings };
@@ -235,6 +255,7 @@ async function auditCadence(prepared: PreparedMaintenance, lane: MaintenanceLane
   const arm = join(prepared.root, `${lane}-audit-${armName}`);
   await cp(prepared.seed, arm, { recursive: true, force: false, errorOnExist: true });
   if (await treeHash(arm) !== prepared.bindings.seedSha256) throw new Error("audit input is not the fixed seed");
+  const idleBefore = lane === "idle" ? await idleStates(arm) : undefined;
   const binary = armName === "baseline" ? prepared.baselineBinary : prepared.candidateBinary;
   const script = join(prepared.root, `${lane}-audit-${armName}.lldb`);
   const childStdout = join(prepared.root, `${lane}-audit-${armName}.stdout`);
@@ -259,8 +280,15 @@ async function auditCadence(prepared: PreparedMaintenance, lane: MaintenanceLane
   await writeFile(join(prepared.root, `${lane}-audit-${armName}.trace`), observed.stdout, { flag: "wx" });
   await writeFile(join(prepared.root, `${lane}-audit-${armName}.debugger-stderr`), observed.stderr, { flag: "wx" });
   const physical = await compareStopped(prepared, lane, arm) as { rewrite_commits?: number };
+  if (idleBefore && JSON.stringify(await idleStates(arm)) !== JSON.stringify(idleBefore)) {
+    throw new Error("idle audit changed physical file identity or timestamps");
+  }
   checkCadence(lane, observed.stdout, physical.rewrite_commits ?? 0);
   return { arm: armName, physical, trace: `${lane}-audit-${armName}.trace` };
+}
+
+async function idleStates(arm: string): Promise<string[]> {
+  return Promise.all(["empty", "quiescent", "protected"].map((name) => treeHash(join(arm, name), true)));
 }
 
 export async function compareStopped(prepared: PreparedMaintenance, lane: MaintenanceLane, arm: string): Promise<unknown> {
@@ -269,9 +297,15 @@ export async function compareStopped(prepared: PreparedMaintenance, lane: Mainte
     throw new Error("stopped arm must be a direct, non-symlinked child of the evidence root");
   }
   await assertBindings(prepared);
-  await treeHash(arm);
+  const stoppedHash = await treeHash(arm);
+  const inspectionRoot = await mkdtemp(join(prepared.root, "inspection-"));
+  const inspection = join(inspectionRoot, "snapshot");
+  await cp(arm, inspection, { recursive: true, force: false, errorOnExist: true });
+  if (await treeHash(inspection) !== stoppedHash) throw new Error("inspection copy differs from stopped arm");
   const env = buildEnv(join(prepared.root, "home"), join(prepared.root, "target"));
-  const output = run(prepared.comparatorBinary, [lane, prepared.seed, arm], prepared.root, env);
+  const output = run(prepared.comparatorBinary, [lane, prepared.seed, inspection], prepared.root, env);
+  if (await treeHash(arm) !== stoppedHash) throw new Error("stopped arm changed during comparison");
+  await assertBindings(prepared);
   if (lane === "idle") {
     for (const name of ["empty", "quiescent", "protected"]) {
       if (await treeHash(join(prepared.seed, name)) !== await treeHash(join(arm, name))) {
@@ -308,11 +342,15 @@ export async function evaluateMaintenance(prepared: PreparedMaintenance, lane: M
       const arm = join(prepared.root, `${lane}-${pair + 1}-${armName}`);
       await cp(prepared.seed, arm, { recursive: true, force: false, errorOnExist: true });
       if (await treeHash(arm) !== prepared.bindings.seedSha256) throw new Error("arm is not a fresh seed copy");
+      const idleBefore = lane === "idle" ? await idleStates(arm) : undefined;
       const binary = armName === "baseline" ? prepared.baselineBinary : prepared.candidateBinary;
       const observed = await namespaceRun([prepared.sandboxBinary, binary, lane, arm], arm);
       await writeFile(join(prepared.root, `${lane}-${pair + 1}-${armName}.stdout`), observed.stdout, { flag: "wx" });
       await writeFile(join(prepared.root, `${lane}-${pair + 1}-${armName}.stderr`), observed.stderr, { flag: "wx" });
       const physical = await compareStopped(prepared, lane, arm);
+      if (idleBefore && JSON.stringify(await idleStates(arm)) !== JSON.stringify(idleBefore)) {
+        throw new Error("idle run changed physical file identity or timestamps");
+      }
       const sample: Sample = {
         arm: armName, elapsedSeconds: observed.elapsedSeconds,
         inverseElapsedPerSecond: 1 / observed.elapsedSeconds, physical,
