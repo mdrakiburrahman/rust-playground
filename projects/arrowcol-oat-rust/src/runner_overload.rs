@@ -1805,20 +1805,22 @@ mod overload_guard_tests {
                 .as_deref()
                 .context("local override missing")?,
         )?)?;
-        for service in [
-            "sqlserver",
-            "database-bootstrap",
-            "arrowcol-migrate",
-            "arrowcol-catalog",
-            "dataflow-1",
-            "router",
-            "oat-client",
-        ] {
-            overlay["services"][service]["build"] =
-                serde_yaml::Value::Tagged(Box::new(serde_yaml::value::TaggedValue {
-                    tag: serde_yaml::value::Tag::new("!reset"),
-                    value: serde_yaml::Value::Null,
-                }));
+        if !config.platform.local.stable_image_build {
+            for service in [
+                "sqlserver",
+                "database-bootstrap",
+                "arrowcol-migrate",
+                "arrowcol-catalog",
+                "dataflow-1",
+                "router",
+                "oat-client",
+            ] {
+                overlay["services"][service]["build"] =
+                    serde_yaml::Value::Tagged(Box::new(serde_yaml::value::TaggedValue {
+                        tag: serde_yaml::value::Tag::new("!reset"),
+                        value: serde_yaml::Value::Null,
+                    }));
+            }
         }
         let override_path = root.join("cached-components.yaml");
         fs::write(&override_path, serde_yaml::to_string(&overlay)?)?;
@@ -1944,6 +1946,31 @@ mod overload_guard_tests {
                 );
             }
             receipt["maintenance_table_readback"] = json!(policy);
+            if config.platform.local.stable_image_build {
+                let overlay: Value = serde_json::from_slice(&fs::read(platform.state_dir.join("tunables.compose.json"))?)?;
+                let project = scoped_compose_project(config.platform.compose_project.as_deref().context("project")?, &run_id);
+                for service in ["sqlserver", "arrowcol-catalog", "dataflow-1", "router", "delta-maintenance"] {
+                    let expected = overlay["services"][service]["image"].as_str().context("pinned image missing")?;
+                    let mut list = Command::new("docker");
+                    list.args(["ps", "-q", "--filter", &format!("label=com.docker.compose.project={project}"),
+                        "--filter", &format!("label=com.docker.compose.service={service}")]);
+                    let ids = String::from_utf8(run_command(list, "list pinned no-load service").await?.stdout)?;
+                    let ids = ids.split_whitespace().collect::<Vec<_>>();
+                    anyhow::ensure!(ids.len() == 1, "expected exactly one running {service} container");
+                    let mut inspect = Command::new("docker");
+                    inspect.args(["inspect", "--format", "{{.Image}}", ids[0]]);
+                    let actual = String::from_utf8(run_command(inspect, "inspect pinned no-load service").await?.stdout)?;
+                    anyhow::ensure!(actual.trim() == expected, "{service} container differs from pinned image");
+                }
+                receipt["pinned_images"] = json!({
+                    "catalog": overlay["services"]["arrowcol-catalog"]["image"],
+                    "client": overlay["services"]["oat-client"]["image"],
+                    "collector": overlay["services"]["dataflow-1"]["image"],
+                    "maintenance": overlay["services"]["delta-maintenance"]["image"],
+                    "router": overlay["services"]["router"]["image"],
+                    "sqlserver": overlay["services"]["sqlserver"]["image"],
+                });
+            }
             fs::write(root.join("maintenance.log"), &maintenance.text)?;
             fs::write(root.join("collector.log"), &after.text)?;
             anyhow::ensure!(
