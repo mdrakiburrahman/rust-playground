@@ -91,8 +91,11 @@ async fn main() -> Result<()> {
     ensure!(builder.schema().as_ref() == schema.as_ref(), "schema mismatch");
     let metadata = builder.metadata();
     let row_groups = metadata.num_row_groups();
-    ensure!(row_groups == REPEATS, "unexpected row group count");
     for group in metadata.row_groups() {
+        ensure!(group.num_rows() > 0, "empty row group");
+        if let Some(limit) = requested.max_row_group_rows {
+            ensure!(group.num_rows() as usize <= limit, "row group exceeds requested limit");
+        }
         let actual: Vec<_> = group
             .columns()
             .iter()
@@ -106,7 +109,16 @@ async fn main() -> Result<()> {
     let mut decoded_rows = 0;
     for decoded in builder.build()? {
         let decoded = decoded.context("reader does not support codec or data is corrupt")?;
-        ensure!(decoded == batch, "decoded rows differ from expected corpus");
+        let mut offset = 0;
+        while offset < decoded.num_rows() {
+            let expected_offset = (decoded_rows + offset) % ROWS;
+            let count = (decoded.num_rows() - offset).min(ROWS - expected_offset);
+            ensure!(
+                decoded.slice(offset, count) == batch.slice(expected_offset, count),
+                "decoded rows differ from expected corpus"
+            );
+            offset += count;
+        }
         decoded_rows += decoded.num_rows();
     }
     ensure!(
