@@ -1,4 +1,4 @@
-ARG DEBIAN_IMAGE
+ARG DEBIAN_IMAGE=debian:bookworm-slim
 FROM ${DEBIAN_IMAGE} AS toolchain
 
 ARG RUST_VERSION
@@ -12,7 +12,7 @@ ENV CARGO_HOME=/opt/cargo \
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        bash build-essential ca-certificates curl git libssl-dev pkg-config xz-utils \
+        bash build-essential ca-certificates curl git libsqlite3-0 libssl-dev pkg-config xz-utils \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl --fail --silent --show-error --location \
