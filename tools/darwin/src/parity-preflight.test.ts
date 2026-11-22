@@ -69,7 +69,9 @@ test("collector parity readback rejects drift in historical limits and local pre
       writer_policy_overrides: { defaults: { compression: null, compression_level: null },
         columns: {}, max_row_group_rows: null } }],
     client_phase_reports: [{ consumer_effective_config: { ...client, ...transport },
-      phase_counters: { process_cumulative: { completed_rows: 10, ambiguous_rows: 0 } } }],
+      phase_counters: { process_cumulative: { completed_rows: 10, ambiguous_rows: 0 },
+        delivery_cumulative: { scope: "completed_process_lifetime_counters_not_unique_delivery",
+          retried_streams: 0, retried_rows: 0, ambiguous_streams: 0, ambiguous_rows: 0 } } }],
     client_schedule: { effective: { run_start_unix_ms: 2000 } },
     parity_admission_readback: { status: "verified_before_schedule", observed_at_unix_ms: 1000,
       collector_image_id: "sha256:" + "a".repeat(64),
@@ -90,8 +92,22 @@ test("collector parity readback rejects drift in historical limits and local pre
   }), /pre-admission client readback changed/);
   assert.throws(() => assertParityEvidence(seed, {
     ...evidence, client_phase_reports: [{ ...evidence.client_phase_reports[0],
-      phase_counters: { process_cumulative: { completed_rows: 10, ambiguous_rows: 1 } } }],
+      phase_counters: { ...evidence.client_phase_reports[0]!.phase_counters,
+        process_cumulative: { completed_rows: 10, ambiguous_rows: 1 } } }],
   }), /delivery evidence is ambiguous/);
+  for (const key of ["retried_streams", "retried_rows", "ambiguous_streams", "ambiguous_rows"] as const) {
+    for (const value of [1, null]) {
+      assert.throws(() => assertParityEvidence(seed, {
+        ...evidence, client_phase_reports: [{ ...evidence.client_phase_reports[0]!,
+          phase_counters: { ...evidence.client_phase_reports[0]!.phase_counters,
+            delivery_cumulative: { ...evidence.client_phase_reports[0]!.phase_counters.delivery_cumulative, [key]: value } } }],
+      }), /delivery evidence is ambiguous/);
+    }
+  }
+  assert.throws(() => assertParityEvidence(seed, {
+    ...evidence, client_phase_reports: [{ ...evidence.client_phase_reports[0]!,
+      phase_counters: { process_cumulative: { completed_rows: 10, ambiguous_rows: 0 } } }],
+  }), /client cumulative delivery evidence/);
   assert.throws(() => assertParityEvidence(seed, {
     ...evidence, parity_admission_readback: { ...evidence.parity_admission_readback, observed_at_unix_ms: 2000 },
   }), /pre-admission collector identity or timing/);

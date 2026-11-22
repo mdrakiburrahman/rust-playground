@@ -49,6 +49,9 @@ historical comparable AKS headline guard is 38.17 B/row.
 Each arm builds the trusted controller and footer inspector, checks host
 headroom immediately before launch, verifies collector and client readback
 before arming, and checks table readback and stopped active-file footers.
+Parity additionally requires process-lifetime evidence of zero retried or
+ambiguous sends. Flight acknowledgements are admission evidence, not durable
+commits or proof of unique delivery. Missing counters invalidate the arm.
 An individual arm is diagnostic and cannot qualify a winner. Preserve each
 receipt and compare identical image and corpus identities before interpreting
 a ladder or A/A. A failed arm retains its lock until owned-cell recovery.

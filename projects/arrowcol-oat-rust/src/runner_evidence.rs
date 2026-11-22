@@ -1861,6 +1861,15 @@ mod measurement_evidence_tests {
         assert_eq!(output["workers"][0]["retried_streams"], 0);
         assert_eq!(output["measurement_window"]["ambiguous_rows"], 0);
         assert_eq!(output["process_cumulative"]["ambiguous_rows"], 0);
+        assert!(output["delivery_cumulative"]["retried_streams"].is_null());
+        snapshots[1].workers[0].retried_streams = Some(2);
+        snapshots[1].workers[0].retried_rows = Some(10);
+        snapshots[1].workers[0].ambiguous_streams = Some(0);
+        snapshots[1].workers[0].ambiguous_rows = Some(0);
+        let output = client_snapshot_delta(&snapshots, ClientDataProfile::Diagnostic)?;
+        assert_eq!(output["delivery_cumulative"]["retried_streams"], 2);
+        assert_eq!(output["delivery_cumulative"]["retried_rows"], 10);
+        assert_eq!(output["delivery_cumulative"]["ambiguous_rows"], 0);
         let hash = "a".repeat(64);
         let prepared = json!({
             "data_profile": "realistic",
@@ -2039,17 +2048,17 @@ struct WorkerCounterSnapshot {
     #[serde(default)]
     rejected_rows: u64,
     #[serde(default)]
-    retried_streams: u64,
+    retried_streams: Option<u64>,
     #[serde(default)]
-    retried_rows: u64,
+    retried_rows: Option<u64>,
     #[serde(default)]
     given_up_streams: u64,
     #[serde(default)]
     given_up_rows: u64,
     #[serde(default)]
-    ambiguous_streams: u64,
+    ambiguous_streams: Option<u64>,
     #[serde(default)]
-    ambiguous_rows: u64,
+    ambiguous_rows: Option<u64>,
     send_latency_us: Option<ClientLatency>,
 }
 
@@ -2751,12 +2760,12 @@ fn client_snapshot_delta(snapshots: &[ClientCounterSnapshot], data_profile: Clie
             "durable_streams": difference(worker.durable_streams, before.durable_streams)?,
             "rejected_streams": difference(worker.rejected_streams, before.rejected_streams)?,
             "rejected_rows": difference(worker.rejected_rows, before.rejected_rows)?,
-            "retried_streams": difference(worker.retried_streams, before.retried_streams)?,
-            "retried_rows": difference(worker.retried_rows, before.retried_rows)?,
+            "retried_streams": difference(worker.retried_streams.unwrap_or(0), before.retried_streams.unwrap_or(0))?,
+            "retried_rows": difference(worker.retried_rows.unwrap_or(0), before.retried_rows.unwrap_or(0))?,
             "given_up_streams": difference(worker.given_up_streams, before.given_up_streams)?,
             "given_up_rows": difference(worker.given_up_rows, before.given_up_rows)?,
-            "ambiguous_streams": difference(worker.ambiguous_streams, before.ambiguous_streams)?,
-            "ambiguous_rows": difference(worker.ambiguous_rows, before.ambiguous_rows)?,
+            "ambiguous_streams": difference(worker.ambiguous_streams.unwrap_or(0), before.ambiguous_streams.unwrap_or(0))?,
+            "ambiguous_rows": difference(worker.ambiguous_rows.unwrap_or(0), before.ambiguous_rows.unwrap_or(0))?,
             "process_cumulative_send_latency_us": worker.send_latency_us,
         }));
     }
@@ -2766,12 +2775,22 @@ fn client_snapshot_delta(snapshots: &[ClientCounterSnapshot], data_profile: Clie
             .try_fold(0_u64, |total, worker| total.checked_add(field(worker)))
             .context("client cumulative counter overflow")
     };
+    let cumulative_proven = |field: fn(&WorkerCounterSnapshot) -> Option<u64>| -> Option<u64> {
+        end.workers.iter().try_fold(0_u64, |total, worker| total.checked_add(field(worker)?))
+    };
     let preparation = client_preparation(end.preparation.as_ref(), data_profile)?;
     let mut result = json!({
         "scope": "measurement_start_to_completed_snapshot_delta_not_unique_delivery",
         "process_cumulative": {
             "completed_rows": cumulative_total(|worker| worker.completed_rows)?,
-            "ambiguous_rows": cumulative_total(|worker| worker.ambiguous_rows)?,
+            "ambiguous_rows": cumulative_total(|worker| worker.ambiguous_rows.unwrap_or(0))?,
+        },
+        "delivery_cumulative": {
+            "scope": "completed_process_lifetime_counters_not_unique_delivery",
+            "retried_streams": cumulative_proven(|worker| worker.retried_streams),
+            "retried_rows": cumulative_proven(|worker| worker.retried_rows),
+            "ambiguous_streams": cumulative_proven(|worker| worker.ambiguous_streams),
+            "ambiguous_rows": cumulative_proven(|worker| worker.ambiguous_rows),
         },
         "elapsed_seconds": end.elapsed_seconds - start.elapsed_seconds,
         "completion_semantics": "validated_admission_response_not_delta_commit",

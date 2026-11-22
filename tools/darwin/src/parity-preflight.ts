@@ -120,9 +120,13 @@ export function assertParityEvidence(seed: unknown, input: unknown): void {
   for (const key of ["ipc_compression", "grpc_send_compression", "max_flight_data_bytes", "max_message_bytes"]) {
     if (!isDeepStrictEqual(client[key], transport[key])) throw new Error(`client transport readback differs at ${key}`);
   }
-  const cumulative = object(object(report.phase_counters, "client phase counters").process_cumulative, "client cumulative counters");
-  if (cumulative.ambiguous_rows !== 0 || !Number.isSafeInteger(cumulative.completed_rows) || Number(cumulative.completed_rows) < 0) {
-    throw new Error("client cumulative delivery evidence is ambiguous or unavailable");
+  const counters = object(report.phase_counters, "client phase counters");
+  const cumulative = object(counters.process_cumulative, "client cumulative counters");
+  const delivery = object(counters.delivery_cumulative, "client cumulative delivery evidence");
+  if (cumulative.ambiguous_rows !== 0 || !Number.isSafeInteger(cumulative.completed_rows) || Number(cumulative.completed_rows) < 0
+    || delivery.scope !== "completed_process_lifetime_counters_not_unique_delivery"
+    || ["retried_streams", "retried_rows", "ambiguous_streams", "ambiguous_rows"].some((key) => delivery[key] !== 0)) {
+    throw new Error("client cumulative delivery evidence is ambiguous, retried or unavailable");
   }
   const guard = object(evidence.overload_guard, "overload guard");
   const settings = object(guard.settings, "overload settings");
