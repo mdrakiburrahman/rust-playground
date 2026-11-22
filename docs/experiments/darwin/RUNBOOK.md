@@ -49,7 +49,9 @@ available memory after the 1 GiB client budget; it is not the historical AKS
 every arm; refuse a run if the pin exceeds that bound. The 90% overload guard
 remains enabled. Pressure registration uses the same local RSS limit and the
 historical queue limits. Pipeline depth 8 causes the exporter to use
-`force_commit=false`.
+`force_commit=false`. The sorted-layout limits are 2 million rows, 1 GiB and
+262,144 rows per group; table-effective readback must confirm them. Those
+limits do not guarantee files reach 2 million rows.
 Label measurements **local one-box scale**, not AKS-equivalent; record host
 memory and vCPUs, chosen cap and sampled collector peak RSS, using null when
 unmeasured.

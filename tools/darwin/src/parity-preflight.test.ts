@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { assertParityCollectorReadback, parityHostReceipt, parityLadderConfig } from "./parity-preflight.js";
+import { assertParityCollectorReadback, assertParityTableLayout, parityHostReceipt, parityLadderConfig } from "./parity-preflight.js";
 
 const meminfo = "MemTotal: 1048576 kB\nMemAvailable: 524288 kB\n";
 const timestamp = "2026-11-22T09:00:00Z";
@@ -37,13 +37,21 @@ test("collector parity readback rejects drift in historical limits and local pre
     commit: { batch_window: "2s" },
     pressure: { rss_limit_bytes: 92341796864 },
     runtime: { cpu_workers: 32 },
+    layout: { enabled: true, max_rows: 2000000, max_input_bytes: 1073741824, row_group_rows: 262144 },
   };
   const seed = { tunables: { collector } };
-  assert.doesNotThrow(() => assertParityCollectorReadback(seed, collector));
+  const readback = { ...collector, layout: { process_policy: collector.layout } };
+  assert.doesNotThrow(() => assertParityCollectorReadback(seed, readback));
   assert.throws(() => assertParityCollectorReadback(seed, {
-    ...collector, batching: { ...collector.batching, pipeline_depth: 1 },
+    ...readback, batching: { ...collector.batching, pipeline_depth: 1 },
   }), /batching.pipeline_depth/);
   assert.throws(() => assertParityCollectorReadback(seed, {
-    ...collector, pressure: { rss_limit_bytes: 4294967296 },
+    ...readback, pressure: { rss_limit_bytes: 4294967296 },
   }), /pressure.rss_limit_bytes/);
+  const policy = { table_name: "telemetry.sqlserver.sqlserver_availability_replica_states",
+    scope: "table_effective_at_file_construction_not_full_run_history", config: collector.layout };
+  assert.doesNotThrow(() => assertParityTableLayout(seed, [policy]));
+  assert.throws(() => assertParityTableLayout(seed, [{
+    ...policy, config: { ...collector.layout, row_group_rows: 16384 },
+  }]), /table layout differs at row_group_rows/);
 });

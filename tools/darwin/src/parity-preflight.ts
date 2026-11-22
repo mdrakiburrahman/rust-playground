@@ -41,6 +41,26 @@ export function assertParityCollectorReadback(seed: unknown, actual: unknown): v
   if (object(effective.runtime, "readback.runtime").cpu_workers !== runtime.cpu_workers) {
     throw new Error("collector readback differs at runtime.cpu_workers");
   }
+  const layout = object(expected.layout, "collector.layout");
+  const process = object(object(effective.layout, "readback.layout").process_policy, "readback.layout.process_policy");
+  for (const [key, value] of Object.entries(layout)) {
+    if (!isDeepStrictEqual(process[key], value)) throw new Error(`collector readback differs at layout.${key}`);
+  }
+}
+
+export function assertParityTableLayout(seed: unknown, policies: unknown): void {
+  const config = object(seed, "parity seed");
+  const expected = object(object(object(config.tunables, "tunables").collector, "collector").layout, "collector.layout");
+  if (!Array.isArray(policies)) throw new Error("table layout evidence is unavailable");
+  const matches = policies.map((policy) => object(policy, "table layout"))
+    .filter((policy) => policy.table_name === "telemetry.sqlserver.sqlserver_availability_replica_states");
+  if (matches.length !== 1 || matches[0]!.scope !== "table_effective_at_file_construction_not_full_run_history") {
+    throw new Error("canonical table layout evidence is unavailable");
+  }
+  const actual = object(matches[0]!.config, "table layout config");
+  for (const [key, value] of Object.entries(expected)) {
+    if (!isDeepStrictEqual(actual[key], value)) throw new Error(`table layout differs at ${key}`);
+  }
 }
 
 export interface ParityHostReceipt {

@@ -109,6 +109,12 @@
         "heartbeat_interval": "5s",
         "registration_ttl": "30s"
       },
+      "layout": {
+        "enabled": true,
+        "max_rows": 2000000,
+        "max_input_bytes": 1073741824,
+        "row_group_rows": 262144
+      },
       "runtime": {
         "workers": 4,
         "blocking_workers": 64,
@@ -123,8 +129,7 @@
       "defaults": {
         "compression": "zstd",
         "compression_level": 3
-      },
-      "max_row_group_rows": 16384
+      }
     },
     "maintenance": {
       "enabled": true,
