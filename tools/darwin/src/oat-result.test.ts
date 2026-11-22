@@ -39,6 +39,8 @@ test("refuses a diagnostic result without the physical parity gate", async () =>
   }), /requires a physical footer inspector/);
   await assert.rejects(readReconciledOatResult("unused", "unused", "orders", "unused", null, "realistic"),
     /requires its Zstd level/);
+  await assert.rejects(readReconciledOatResult("unused", "unused", "orders", "unused", 3, "realistic"),
+    /requires full delivery identity reconciliation/);
 });
 
 test("accepts matching Realistic evidence and reports client CPU separately", () => {

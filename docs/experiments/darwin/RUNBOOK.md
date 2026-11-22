@@ -129,6 +129,13 @@ generated Arrow IPC business corpus with `endpoint_url` excluded; both arms
 must report the same hash. This contract applies to the Realistic seed only;
 Diagnostic parity hashes all business columns but cannot reconcile unique
 delivery identities.
+Realistic compression replay requires the producer to match the trusted
+snapshot revision and fails unless the complete stopped active ingestion
+snapshot matches the terminal delivery manifest. Each arm retains
+`identity-result.json`, the evidence and manifest bytes, and the snapshot
+input, with pinned Node, tsx, extractor, verifier and reader hashes. This is
+whole-snapshot equality, not proof of commit-window membership; see
+[the identity contract](PHYSICS_OBSERVATION.md).
 Client process CPU is reported separately from
 collector samples, with its own sampling interval or an unavailable reason.
 The hourly ingestion-partitioned table is checked against catalog metadata

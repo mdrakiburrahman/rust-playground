@@ -6,6 +6,7 @@ import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { checkCompressionCandidate } from "./compression-policy.js";
 import { readReconciledOatResult } from "./oat-result.js";
+import { artifactHash, hashTsx, type IdentityTools } from "./identity-reconcile.js";
 import type { SnapshotManifest } from "./snapshot.js";
 
 type JsonObject = Record<string, unknown>;
@@ -146,6 +147,33 @@ export async function prepareReplayRuntime(repo: string, home: string, stackByte
   return { runtime, binaryHash: await sha256(expected) };
 }
 
+async function prepareIdentityTools(
+  home: string, runtime: string, manifest: SnapshotManifest, stackBytes: number,
+): Promise<IdentityTools> {
+  const env = cleanEnv(join(home, "trusted", "prepare-home"), stackBytes);
+  const verifier = join(home, "trusted", "src", "tools", "darwin", "src", "delivery-identity-cli.ts");
+  for (const name of ["delivery-identity.ts", "delivery-identity-cli.ts"]) {
+    const path = join(home, "trusted", "src", "tools", "darwin", "src", name);
+    if (await sha256(path) !== manifest.files[`tools/darwin/src/${name}`]?.sha256) {
+      throw new Error("identity verifier differs from trusted source");
+    }
+  }
+  for (const [pkg, bin] of [["collector-chain", "delivery-identity-reader"], ["arrowcol-oat-rust", "oat-manifest-extract"]]) {
+    execFileSync("/usr/local/cargo/bin/cargo", ["build", "--locked", "--release", "--package", pkg!, "--bin", bin!], {
+      cwd: runtime, env, stdio: "inherit",
+    });
+  }
+  const decoder = join(runtime, "target", "release", "delivery-identity-reader");
+  const extractor = join(runtime, "target", "release", "oat-manifest-extract");
+  const tsxRoot = await realpath(join(runtime, "node_modules", "tsx"));
+  const node = await realpath(process.execPath);
+  return {
+    node, nodeSha256: await sha256(node), tsxRoot, tsxSha256: await hashTsx(tsxRoot),
+    decoder, decoderSha256: await sha256(decoder), extractor, extractorSha256: await sha256(extractor),
+    verifier, verifierArtifactSha256: await artifactHash(verifier), runtime, env,
+  };
+}
+
 export async function replayCompressionPair(
   repo: string, home: string, candidate: unknown, bindHost: string, endpointHost: string, stackBytes: number, baselineOnly = false,
 ): Promise<JsonObject> {
@@ -157,6 +185,7 @@ export async function replayCompressionPair(
     || stackBytes < 2 * 1024 * 1024 || stackBytes > 128 * 1024 * 1024) throw new Error("invalid producer or controller stack setting");
   const seed = JSON.parse(await readFile(join(home, "trusted", "src", "experiments", "darwin", "candidate.oat.json"), "utf8")) as unknown;
   const manifest = JSON.parse(await readFile(join(home, "trusted", "manifest.json"), "utf8")) as SnapshotManifest;
+  if (producer.revision !== manifest.commit) throw new Error("identity verifier requires the trusted producer revision");
   const seedSha256 = await sha256(join(home, "trusted", "src", "experiments", "darwin", "candidate.oat.json"));
   const candidateLevel = checkCompressionCandidate(seed, candidate);
   const baselineLevel = checkCompressionCandidate(seed, seed);
@@ -170,6 +199,7 @@ export async function replayCompressionPair(
   let completed = false;
   try {
     const { runtime, binaryHash: preparedBinaryHash } = await prepareReplayRuntime(repo, home, stackBytes);
+    const identityTools = await prepareIdentityTools(home, runtime, manifest, stackBytes);
     const results = [];
     const arms: [string, unknown, number][] = [["baseline", seed, baselineLevel]];
     if (!baselineOnly) arms.push(["candidate", candidate, candidateLevel]);
@@ -192,6 +222,7 @@ export async function replayCompressionPair(
       if (await sha256(configPath) !== configHash) throw new Error("OAT runtime config changed during the run");
       const result = await readReconciledOatResult(
         join(runRoot, "results.parquet"), join(runRoot, "snapshots"), "sqlserver_availability_replica_states", producer.revision, level, seedClient.data_profile,
+        undefined, { tools: identityTools, outputDir: runRoot },
       );
       const binaryHash = await sha256(join(runtime, "target", "release", "arrowcol-oat-rust"));
       if (binaryHash !== preparedBinaryHash) throw new Error("OAT release controller changed after preparation");

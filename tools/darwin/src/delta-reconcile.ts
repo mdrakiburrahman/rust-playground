@@ -85,12 +85,16 @@ export async function reconcileStoppedSnapshot(
   root: string, runId: string, table: string, canonicalTableName: string, expectedTableId: string,
   measurement: OatMeasurement, receipts: TimedReceipt[], allReceipts: TimedReceipt[], expectedCodec: Compression,
   rawPreload: unknown, decodeFile?: (path: string, active: boolean) => Promise<number>,
+  verifyActive?: (paths: string[]) => Promise<void>,
 ): Promise<{
   rows: number; parquetBytes: number; activeRows: number; latestVersion: number; commits: number;
   activeFileRows: FileGeometry; windowFileRows: FileGeometry;
 }> {
   if (!/^[a-f0-9-]+$/.test(runId) || !/^[a-zA-Z0-9_]+$/.test(table)) throw new Error("invalid snapshot identity");
   if (!canonicalTableName.endsWith(`.${table}`) || !/^[a-f0-9]{64}$/.test(expectedTableId)) throw new Error("invalid trusted table identity");
+  const controlFiles = verifyActive ? await Promise.all(["complete.json", "stopped.json"].map(async path => ({
+    path: join(root, path), digest: await digest(join(root, path)),
+  }))) : [];
   const complete = await json(join(root, "complete.json"));
   const stopped = await json(join(root, "stopped.json"));
   if (complete.schema_version !== 1 || complete.run_id !== runId || stopped.schema_version !== 1 || stopped.run_id !== runId
@@ -278,6 +282,37 @@ export async function reconcileStoppedSnapshot(
     }
   }
   if (rows !== measurement.rows || parquetBytes !== measurement.parquetBytes) throw new Error("reconciled window totals differ from measurement");
+  if (verifyActive) {
+    const inventoryByPath = new Map(listed.map(file => [file.path, file]));
+    const activeFiles = [...active.keys()].map(path => {
+      const entry = inventoryByPath.get(path);
+      if (!entry) throw new Error("active file is absent from snapshot inventory");
+      return { path: join(tableRoot, path), size: entry.size, sha256: entry.sha256 };
+    });
+    const check = async () => {
+      for (const file of activeFiles) {
+        const actual = await digest(file.path);
+        if (actual.size !== file.size || actual.sha256 !== file.sha256) {
+          throw new Error("active snapshot changed during identity verification");
+        }
+      }
+    };
+    await check();
+    await verifyActive(activeFiles.map(file => file.path));
+    await check();
+    for (const control of [...controlFiles, { path: manifestPath, digest: manifestDigest }]) {
+      const actual = await digest(control.path);
+      if (actual.size !== control.digest.size || actual.sha256 !== control.digest.sha256) {
+        throw new Error("snapshot control evidence changed during identity verification");
+      }
+    }
+    for (const file of listed.filter(entry => !active.has(entry.path))) {
+      const actual = await digest(join(tableRoot, file.path));
+      if (actual.size !== file.size || actual.sha256 !== file.sha256) {
+        throw new Error("snapshot history changed during identity verification");
+      }
+    }
+  }
   return {
     rows, parquetBytes, activeRows, latestVersion, commits: selected.size,
     activeFileRows: fileGeometry(activeFileRows), windowFileRows: fileGeometry(windowFileRows),

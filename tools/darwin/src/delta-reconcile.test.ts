@@ -78,6 +78,19 @@ test("reconciles timed commits with decoded active Delta Adds and rejects change
       measurement, [receipt], [receipt, laterReceipt], Compression.ZSTD, preload,
       async (path, active) => { assert.equal(active, true); inspected.push(path); return path.endsWith("first.parquet") ? 3 : 2; });
     assert.deepEqual(inspected.sort(), [join(tableRoot, "first.parquet"), join(tableRoot, "second.parquet")].sort());
+    const active: string[][] = [];
+    await reconcileStoppedSnapshot(root, "abc-123", "orders", "telemetry.sqlserver.orders", "a".repeat(64),
+      measurement, [receipt], [receipt, laterReceipt], Compression.ZSTD, preload, undefined,
+      async paths => { active.push(paths); });
+    assert.deepEqual(active[0]!.sort(), [join(tableRoot, "first.parquet"), join(tableRoot, "second.parquet")].sort());
+    await assert.rejects(reconcileStoppedSnapshot(root, "abc-123", "orders", "telemetry.sqlserver.orders", "a".repeat(64),
+      measurement, [receipt], [receipt, laterReceipt], Compression.ZSTD, preload, undefined,
+      async paths => { await writeFile(paths[0]!, "changed"); }), /active snapshot changed/);
+    await writeSnapshot(5);
+    await assert.rejects(reconcileStoppedSnapshot(root, "abc-123", "orders", "telemetry.sqlserver.orders", "a".repeat(64),
+      measurement, [receipt], [receipt, laterReceipt], Compression.ZSTD, preload, undefined,
+      async () => { await writeFile(join(root, "complete.json"), "{}"); }), /snapshot control evidence changed/);
+    await writeSnapshot(5);
     await assert.rejects(reconcileStoppedSnapshot(root, "abc-123", "orders", "telemetry.sqlserver.orders", "a".repeat(64),
       measurement, [receipt], [receipt, laterReceipt], Compression.ZSTD, preload,
       async () => { throw new Error("invalid physical footer"); }), /invalid physical footer/);

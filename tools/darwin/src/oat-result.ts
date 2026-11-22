@@ -1,9 +1,10 @@
 import { createHash } from "node:crypto";
-import { lstat, readFile } from "node:fs/promises";
+import { lstat, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tableFromIPC } from "apache-arrow";
 import { Compression, readParquet } from "parquet-wasm";
 import { reconcileStoppedSnapshot } from "./delta-reconcile.js";
+import { verifyReconciledDelivery, type IdentityTools } from "./identity-reconcile.js";
 import { adaptOatEvidence, CoverageUnavailableError, extractTimedReceipts, type OatMeasurement } from "./metrics-adapter.js";
 import { assertParityEvidence } from "./parity-preflight.js";
 
@@ -124,11 +125,13 @@ export async function readReconciledOatResult(
   requestedProfile: ClientDataProfile, parity?: {
     config: unknown; decodeFile: (path: string, active: boolean) => Promise<number>; collectorRevision?: string;
   },
+  identity?: { tools: IdentityTools; outputDir: string },
 ): Promise<{
   measurement: OatMeasurement; images: string[]; clientEvidence: ClientEvidence; activeRows: number; snapshotVersion: number;
   activeFileRows: Awaited<ReturnType<typeof reconcileStoppedSnapshot>>["activeFileRows"];
   windowFileRows: Awaited<ReturnType<typeof reconcileStoppedSnapshot>>["windowFileRows"];
   parityTelemetry: JsonObject | null;
+  deliveryIdentity: JsonObject | null;
   cellRunId: string; snapshotReconciled: true;
 }> {
   if (requestedProfile === "diagnostic") {
@@ -137,6 +140,12 @@ export async function readReconciledOatResult(
     }
   } else if (parity || compressionLevel === null) {
     throw new Error("realistic compression requires its Zstd level and no parity override");
+  }
+  if (requestedProfile === "realistic" && !identity) {
+    throw new Error("realistic replay requires full delivery identity reconciliation");
+  }
+  if (requestedProfile === "diagnostic" && identity) {
+    throw new Error("diagnostic payloads cannot qualify delivery identities");
   }
   const bytes = await readFile(resultsPath);
   if (!bytes.length || bytes.length > 16 * 1024 * 1024) throw new Error("OAT result is empty or too large");
@@ -150,7 +159,9 @@ export async function readReconciledOatResult(
     || typeof row.evidence_json !== "string") {
     throw new Error("OAT result identity, source, pinning, or status is invalid");
   }
-  const evidence = object(JSON.parse(row.evidence_json), "OAT evidence");
+  const evidenceJson = row.evidence_json;
+  const cellRunId = row.run_id;
+  const evidence = object(JSON.parse(evidenceJson), "OAT evidence");
   if (evidence.version !== 1 || !Array.isArray(evidence.processes)) throw new Error("OAT evidence version or processes are invalid");
   const processes = evidence.processes.map(process => object(process, "OAT process"));
   const collectors = processes.filter(process => process.component === "collector");
@@ -211,13 +222,29 @@ export async function readReconciledOatResult(
     throw new CoverageUnavailableError("pre-load Delta evidence was not captured before client admission");
   }
   const expectedTableId = createHash("sha256").update(`file:///delta/dataflow/telemetry/sqlserver/${table}/`).digest("hex");
+  const identityResult: { value: JsonObject | null } = { value: null };
   const proof = await reconcileStoppedSnapshot(
     join(snapshotRoot, row.run_id), row.run_id, table, canonicalTable, expectedTableId, measurement, receipts.selected, receipts.all,
     parity ? Compression.UNCOMPRESSED : Compression.ZSTD, preload, parity?.decodeFile,
+    identity ? async paths => {
+      identityResult.value = await verifyReconciledDelivery(identity.tools, identity.outputDir, resultsPath,
+        createHash("sha256").update(bytes).digest("hex"), evidenceJson, table, paths);
+      const root = join(snapshotRoot, cellRunId);
+      const snapshotHashes: Record<string, string> = {};
+      for (const path of ["complete.json", "stopped.json", `${table}/manifest.json`]) {
+        snapshotHashes[path] = createHash("sha256").update(await readFile(join(root, path))).digest("hex");
+      }
+      identityResult.value.snapshotHashes = snapshotHashes;
+    } : undefined,
   );
+  if (identity && (!identityResult.value || identityResult.value.activeFileRows !== proof.activeRows)) {
+    throw new Error("identity verdict does not match reconciled active rows");
+  }
+  if (identity) await writeFile(join(identity.outputDir, "identity-result.json"),
+    `${JSON.stringify(identityResult.value)}\n`, { flag: "wx", mode: 0o400 });
   return {
     measurement, images, clientEvidence, activeRows: proof.activeRows, snapshotVersion: proof.latestVersion,
-    activeFileRows: proof.activeFileRows, windowFileRows: proof.windowFileRows,
+    activeFileRows: proof.activeFileRows, windowFileRows: proof.windowFileRows, deliveryIdentity: identityResult.value,
     parityTelemetry: parity ? {
       backlog: evidence.backlog ?? null,
       backlog_budgets: object(object(object(parity.config, "parity config").tunables, "tunables").collector, "collector").batching,
