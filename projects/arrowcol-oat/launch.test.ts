@@ -2208,7 +2208,7 @@ test('dead local disposition verifies absence after a real stopped disposable wo
       recordLocalDeadRunCleanupDisposition(fixture.receiptRoot, fixture.runId, dependencies),
       /Local Compose container remains/,
     );
-    docker(['rm', containerId]);
+    assert.deepEqual(await cleanupLocalComposeProjects(fixture.config, fixture.runId, docker), [fixture.project]);
     containerId = undefined;
     const original = await readFile(fixture.receiptPath);
     await recordLocalDeadRunCleanupDisposition(fixture.receiptRoot, fixture.runId, dependencies);
