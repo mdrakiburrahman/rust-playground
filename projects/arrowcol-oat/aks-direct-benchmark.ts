@@ -14,6 +14,8 @@ import { prepareSecrets, renderBootstrapEnv, writePrivateFile } from './runtime.
 import { readDeltaAddWindow } from './aks-delta-preservation.js';
 import { reconcileCollectorWindow } from './aks-collector-window.js';
 import { assertProducedBuildStatement, verifyBuildEnvelope } from './aks-candidate-build.js';
+import { applyCollectorPromotion, assertPromotionEnvironment, collectorSettings,
+  type CollectorContract, type CollectorContractRequest, type ProjectCollector } from './aks-collector-promotion.js';
 import { createKubeletNodeResourceReader, startNodeObservation, type NodeObservationHandle, type NodeResourceObservation } from './aks-node-observation.js';
 import {
   applyCandidateImageManifest, assertScaledRuntimeObservation, assertTrustedImageStatement, collectorShapes,
@@ -38,6 +40,7 @@ export interface BenchmarkDependencies {
   readDelta?: typeof readDeltaAddWindow;
   generation?: typeof capturedGeneration;
   startObservation?: typeof startNodeObservation;
+  projectCollector?: ProjectCollector;
 }
 const executionScope = new AsyncLocalStorage<BenchmarkDependencies>();
 const now = () => executionScope.getStore()?.now?.() ?? Date.now();
@@ -616,6 +619,10 @@ interface BenchmarkReport {
     collector_pool: string;
     hardware: typeof collectorShapes[CollectorShape];
     workload: ReturnType<typeof effectiveWorkloadConfig>;
+    expected_collector: ReturnType<typeof collectorSettings>;
+    historical_collector_control: { dfe_core_allocation_count: unknown; receiver_rss_limit_bytes: unknown };
+    collector_promotion?: Awaited<ReturnType<typeof applyCollectorPromotion>>['binding'];
+    collector_startup_readback?: CollectorContract['observed'];
     rendered_manifest_sha256: string;
     runner_sources_sha256: string;
     candidate_source_commit: string;
@@ -670,6 +677,12 @@ async function executeCheck(options: { envFile: string; stampConfigPath: string;
     if (scaledRender && !options.scaled?.imageManifestPath) {
       await writeFile(options.outputPath + '.images.json', JSON.stringify(scaledRender.binding, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
     }
+    if (scaledRender) {
+      await writeFile(options.outputPath + '.collector.json', JSON.stringify({
+        expected_collector: scaledRender.expectedCollector, historical_collector_control: scaledRender.historicalControl,
+        collector_promotion: scaledRender.promotion.binding,
+      }, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
+    }
     console.log('PASS offline render; image binding is structural only, NOT trusted build provenance; output ' + options.outputPath);
     return;
   }
@@ -710,6 +723,7 @@ interface ScaledOptions {
   imageManifestPath?: string;
   provenanceKey?: string;
   provenanceBundle?: string;
+  promotionPath?: string;
 }
 
 interface ScaledInputs {
@@ -717,12 +731,41 @@ interface ScaledInputs {
   poolName: string;
   binding: CandidateImageManifest;
   platformDigests?: Record<string, string>;
+  expectedCollector: ReturnType<typeof collectorSettings>;
+  historicalControl: { dfe_core_allocation_count: unknown; receiver_rss_limit_bytes: unknown };
+  promotion: Awaited<ReturnType<typeof applyCollectorPromotion>>;
+  collectorReadback?: CollectorContract['observed'];
+  evidenceDirectory?: string;
+}
+
+export async function projectCollectorContract(request: CollectorContractRequest): Promise<CollectorContract> {
+  const directory = await mkdtemp(join(tmpdir(), 'collector-contract-'));
+  await chmod(directory, 0o700);
+  try {
+    const input = join(directory, 'input.json');
+    await writeFile(input, JSON.stringify(request), { mode: 0o600, flag: 'wx' });
+    const result = await run_tree([resolve(ROOT, 'target/debug/arrowcol-collector-contract'), '--input', input], 90, ROOT);
+    const value = requireRecord(parseJson(checkResult(result, 'Strict Rust collector contract'), 'Collector contract'), 'Collector contract');
+    const environment = requireRecord(value.environment, 'Collector environment');
+    if (value.schema_version !== 1 || typeof value.canonical_tunables_json !== 'string' ||
+        typeof value.effective_tunables_json !== 'string' ||
+        !Object.values(environment).every((entry): entry is string => typeof entry === 'string') ||
+        (value.observed !== null && !isRecord(value.observed))) throw new Error('Invalid Rust collector contract result.');
+    return { schema_version: 1, canonical_tunables_json: value.canonical_tunables_json,
+      effective_tunables_json: value.effective_tunables_json,
+      environment: Object.fromEntries(Object.entries(environment).map(([name, entry]) => [name, String(entry)])),
+      observed: value.observed };
+  } finally { await rm(directory, { recursive: true, force: true }); }
 }
 
 async function scaledInputs(base: string, runId: string, registry: string, options: ScaledOptions): Promise<ScaledInputs> {
+  const historical = collectorSettings(base);
   const clients = renderScaledProfileManifest(base, runId, options.clientCount);
   const collector = renderScaledCollector(clients, runId, options.collectorShape);
-  const references = new Set(parseAllDocuments(collector.manifest).flatMap(document => {
+  const promotion = await applyCollectorPromotion(collector.manifest,
+    options.promotionPath ? parseJson(await readFile(options.promotionPath, 'utf8'), 'Collector promotion') : undefined,
+    options.candidateCommit, executionScope.getStore()?.projectCollector ?? projectCollectorContract);
+  const references = new Set(parseAllDocuments(promotion.manifest).flatMap(document => {
     const resource = document.toJSON();
     if (!isRecord(resource) || !isRecord(resource.spec) || !isRecord(resource.spec.template) || !isRecord(resource.spec.template.spec) ||
         !Array.isArray(resource.spec.template.spec.containers)) return [];
@@ -734,12 +777,14 @@ async function scaledInputs(base: string, runId: string, registry: string, optio
   }));
   const binding = options.imageManifestPath
     ? parseJson(await readFile(options.imageManifestPath, 'utf8'), 'Candidate image manifest') as CandidateImageManifest
-    : { schemaVersion: 1 as const, sourceCommit: options.candidateCommit, workloadConfigSha256: effectiveWorkloadConfig(collector.manifest).sha256,
+    : { schemaVersion: 1 as const, sourceCommit: options.candidateCommit, workloadConfigSha256: effectiveWorkloadConfig(promotion.manifest).sha256,
       images: Object.fromEntries([...references].map(reference => [reference, 'sha256:' + '0'.repeat(64)])) };
   if (!isRecord(binding) || !isRecord(binding.images) || typeof binding.sourceCommit !== 'string') {
     throw new Error('Candidate image binding is invalid; it is not trusted build provenance.');
   }
-  return { ...collector, binding, manifest: applyCandidateImageManifest(collector.manifest, registry, options.candidateCommit, binding) };
+  return { ...collector, binding, promotion, expectedCollector: collectorSettings(promotion.manifest),
+    historicalControl: { dfe_core_allocation_count: historical.dfe_core_allocation_count, receiver_rss_limit_bytes: historical.receiver_rss_limit_bytes },
+    manifest: applyCandidateImageManifest(promotion.manifest, registry, options.candidateCommit, binding) };
 }
 
 async function verifyCandidateBuilds(registry: string, options: ScaledOptions, inputs: ScaledInputs): Promise<string> {
@@ -889,7 +934,8 @@ async function assertNoQueuedForeignClients(config: Config): Promise<void> {
 }
 
 async function captureScaledPods(config: Config, namespace: string, runId: string, jobs: string[], manifest: string, finished = false,
-  platformDigests?: Record<string, string>): Promise<ScaledRuntimeObservation> {
+  inputs?: ScaledInputs): Promise<ScaledRuntimeObservation> {
+  const platformDigests = inputs?.platformDigests;
   const list = requireRecord(parseJson(await kubectl(config, ['get', 'pods', '-n', namespace, '-o', 'json'], 'Capture scaled pod placement'), 'Pod inventory'), 'Pod inventory');
   if (!Array.isArray(list.items)) throw new Error('Scaled pod inventory is invalid.');
   const measuredPods = list.items;
@@ -954,6 +1000,9 @@ async function captureScaledPods(config: Config, namespace: string, runId: strin
     const desired = requireRecord(desiredPod.containers[0], 'Desired measured container');
     if (!Array.isArray(liveContainers)) throw new Error('Measured pod containers are unknown.');
     const actual = requireRecord(liveContainers[0], 'Actual measured container');
+    if (isCollector && inputs?.promotion.binding) {
+      assertPromotionEnvironment(inputs.promotion.binding.projected_environment, actual.env);
+    }
     if (actual.image !== desired.image || !isDeepStrictEqual(actual.args, desired.args) ||
         (!isCollector && (!isDeepStrictEqual(actual.env, desired.env) || actual.envFrom !== undefined)) ||
         !isDeepStrictEqual(actual.resources, desired.resources)) {
@@ -978,6 +1027,20 @@ async function captureScaledPods(config: Config, namespace: string, runId: strin
   const actualConfig = await getObject(config, 'configmap', namespace, 'arrowcol-config');
   if (!actualConfig || requireRecord(actualConfig.data, 'Actual dataflow config')['dataflow.yaml'] !== desiredDataflow) {
     throw new Error('Actual collector dataflow configuration differs from the rendered candidate.');
+  }
+  if (inputs?.promotion.request) {
+    const logs = await kubectl(config, ['logs', 'pod/' + collector.podName, '-n', namespace, '-c', 'dataflow'],
+      'Verify promoted collector startup readback');
+    const result = await (executionScope.getStore()?.projectCollector ?? projectCollectorContract)({
+      ...inputs.promotion.request, readback_logs: logs,
+    });
+    if (!result.observed) throw new Error('Promoted collector has no verified consumer startup readback.');
+    inputs.collectorReadback = result.observed;
+    if (inputs.evidenceDirectory) {
+      await writePrivateFile(join(inputs.evidenceDirectory, 'collector-promotion-' + (finished ? 'finished' : 'startup') + '.json'),
+        JSON.stringify({ pod_uid: collector.podUid, expected_collector_sha256: inputs.expectedCollector.sha256,
+          promotion: inputs.promotion.binding, observed: result.observed }, null, 2) + '\n');
+    }
   }
   return observation;
 }
@@ -1061,7 +1124,10 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
     for (const path of ['projects/arrowcol-oat/aks-direct-benchmark.ts', 'projects/arrowcol-oat/aks-scaled-profile.ts',
       'projects/arrowcol-oat/aks-node-observation.ts', 'infra/azure/scaled-collector.bicep', 'projects/arrowcol-oat/publish-images.ts',
       'infra/azure/bootstrap.ts', 'projects/arrowcol-oat/aks-candidate-build.ts',
-      'projects/arrowcol-oat/aks-delta-preservation.ts', 'projects/arrowcol-oat/aks-collector-window.ts']) {
+      'projects/arrowcol-oat/aks-delta-preservation.ts', 'projects/arrowcol-oat/aks-collector-window.ts',
+      'projects/arrowcol-oat/aks-collector-promotion.ts', 'projects/arrowcol-oat-rust/src/runner_tunables.rs',
+      'projects/arrowcol-oat-rust/src/runner_process_evidence.rs', 'crates/arrowcol-tunables/src/validation.rs',
+      'projects/arrowcol-oat-rust/src/bin/arrowcol-collector-contract.rs']) {
       hash.update(path + '\0').update(await readFile(resolve(ROOT, path))).update('\0');
     }
     scaledSourcesSha = hash.digest('hex');
@@ -1070,6 +1136,7 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
   await mkdir(parent, { recursive: true, mode: 0o700 });
   await mkdir(runDir, { mode: 0o700 });
   await chmod(runDir, 0o700);
+  if (scaled) scaled.evidenceDirectory = runDir;
   const info = await lstat(runDir);
   if (!info.isDirectory()) throw new Error('Benchmark private directory is not a directory.');
   const bootstrapEnv = resolve(runDir, 'bootstrap.env');
@@ -1197,7 +1264,7 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
       await applyStage(config, namespace, renderedPath, 'load');
       if (scaled) {
         await waitScaledClients(config, namespace, writer, clientJobs, true);
-        placement = await captureScaledPods(config, namespace, runId, clientJobs, rendered, false, scaled?.platformDigests);
+        placement = await captureScaledPods(config, namespace, runId, clientJobs, rendered, false, scaled);
       } else await waitForReadyLoad(config, namespace, writer);
       const scheduleStart = now() + 130_000;
       if (scheduleStart - now() < 125_000) throw new Error('Load schedule must be at least 125 seconds in the future.');
@@ -1232,7 +1299,7 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
         await waitScaledClients(config, namespace, writer, clientJobs, false);
         if (observer) { nodeResources = await observer.stop(); observer = undefined; }
         if (now() < measurementEnd) throw new Error('Scaled clients completed before the full common measurement window ended.');
-        const finalPlacement = await captureScaledPods(config, namespace, runId, clientJobs, rendered, true, scaled?.platformDigests);
+        const finalPlacement = await captureScaledPods(config, namespace, runId, clientJobs, rendered, true, scaled);
         if (JSON.stringify(finalPlacement) !== JSON.stringify(placement)) throw new Error('Scaled client/collector pod UID, image or node changed during the window.');
         for (const jobName of clientJobs) {
           const clientPlacement = finalPlacement.clients.find(client => client.jobName === jobName)!;
@@ -1403,6 +1470,8 @@ async function executeRun(options: { envFile: string; stampConfigPath: string; r
       workload: effectiveWorkloadConfig(rendered), rendered_manifest_sha256: createHash('sha256').update(rendered).digest('hex'),
       runner_sources_sha256: scaledSourcesSha,
       candidate_source_commit: options.scaled.candidateCommit, image_binding: scaled.binding,
+      expected_collector: scaled.expectedCollector, historical_collector_control: scaled.historicalControl,
+      collector_promotion: scaled.promotion.binding, collector_startup_readback: scaled.collectorReadback,
       trusted_build_provenance_verified: !!signerKeySha, trusted_signer_key_sha256: signerKeySha,
       collector_receipt_window: collectorWindow, attested_platform_digests: scaled.platformDigests,
       original_client_pool: clientPoolPlan.original, placement, client_results: clientResults,
@@ -1438,6 +1507,7 @@ async function executeMain(argv: string[]): Promise<number> {
       'image-manifest': { type: 'string' },
       'provenance-key': { type: 'string' },
       'provenance-bundle': { type: 'string' },
+      'collector-promotion': { type: 'string' },
       output: { type: 'string' },
       help: { type: 'boolean', short: 'h' },
     } });
@@ -1446,6 +1516,7 @@ async function executeMain(argv: string[]): Promise<number> {
       console.log('       npx --no-install tsx projects/arrowcol-oat/aks-direct-benchmark.ts run [--mode full|smoke] [--env-file PATH] [--stamp-config YAML] [--run-id UUID]');
       console.log('Scaled opt-in: --profile scaled --clients 1..8 --collector-shape e64|e192 --candidate-commit SHA --image-manifest JSON [--provenance-key TRUSTED_PUBLIC_KEY]');
       console.log('Offline only: render --output PATH (exclusive create); scaled run requires trusted signed image attestations.');
+      console.log('Qualified collector delta: --collector-promotion JSON; requires the locally built strict Rust collector-contract binary.');
       return 0;
     }
     if (positionals.length !== 1 || !['check', 'render', 'run'].includes(positionals[0]!)) throw new Error('Choose check, render or run.');
@@ -1464,10 +1535,11 @@ async function executeMain(argv: string[]): Promise<number> {
       scaled = { clientCount: count, collectorShape: shape, candidateCommit: values['candidate-commit'],
         imageManifestPath: values['image-manifest'] ? resolve(values['image-manifest']) : undefined,
         provenanceKey: values['provenance-key'] ? resolve(values['provenance-key']) : undefined,
+        promotionPath: values['collector-promotion'] ? resolve(values['collector-promotion']) : undefined,
         provenanceBundle: values['provenance-bundle'] ? resolve(values['provenance-bundle']) : undefined };
       if (values.mode !== 'full') throw new Error('Scaled holdout requires the common full 600-second window.');
       if (positionals[0] === 'run' && !scaled.provenanceKey) throw new Error('Scaled run requires a trusted --provenance-key; image bindings alone are not build proof.');
-    } else if (values.clients || values['collector-shape'] || values['candidate-commit'] || values['image-manifest'] || values['provenance-key'] || values['provenance-bundle']) {
+    } else if (values.clients || values['collector-shape'] || values['candidate-commit'] || values['image-manifest'] || values['provenance-key'] || values['provenance-bundle'] || values['collector-promotion']) {
       throw new Error('Scaled options require explicit --profile scaled; default behavior is unchanged.');
     }
     if (positionals[0] === 'check' || positionals[0] === 'render') {

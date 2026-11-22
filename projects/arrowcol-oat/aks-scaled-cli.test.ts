@@ -7,7 +7,8 @@ import test, { after, before } from 'node:test';
 import { parseAllDocuments } from 'yaml';
 import { Config, load_env, ROOT } from '../../infra/azure/bootstrap.js';
 import { loadStampConfig } from '../../infra/azure/stamp.js';
-import { main, renderManifest, type BenchmarkDependencies } from './aks-direct-benchmark.js';
+import { main, projectCollectorContract, renderManifest, type BenchmarkDependencies } from './aks-direct-benchmark.js';
+import { applyCollectorPromotion, collectorSettings, qualifiedConfigDigest } from './aks-collector-promotion.js';
 import { collectorShapes, effectiveWorkloadConfig, renderScaledProfileManifest } from './aks-scaled-profile.js';
 import { clientRepository, imageBuilds, repositories } from './publish-images.js';
 import { POD_RESOURCE_SAMPLE_COMMAND } from './aks-node-observation.js';
@@ -20,6 +21,7 @@ after(() => { Object.assign(process.env, azureEnvironment); });
 
 interface Resource {
   kind: string;
+  data?: Record<string, string>;
   metadata: { name: string; uid?: string; labels: Record<string, string>; annotations?: Record<string, string> };
   spec: { template: { metadata: { labels: Record<string, string> }; spec: {
     containers: { name: string; image: string; args: string[]; resources: Record<string, Record<string, string>> }[];
@@ -27,13 +29,29 @@ interface Resource {
   } } };
 }
 
-async function fixture(scaled = true, failure?: 'missing-client' | 'failed-client' | 'partial-start' | 'collector-create' | 'pool-drift' | 'untrusted' | 'unknown-quota') {
+const qualifiedConfig = {
+  platform: { kind: 'local' }, warmup_seconds: 60, measure_seconds: 600, pilot_mode: false,
+  arrowcol_endpoint: 'http://127.0.0.1:32010', router_metrics_endpoint: 'http://127.0.0.1:9101',
+  tables: ['telemetry.sqlserver.sqlserver_availability_replica_states'], rows_per_table: 65536,
+  dmv_concurrency: 32, qap_endpoint: 'fixture', qap_timeout_seconds: 60,
+  replica_counts: [1], dfe_worker_concurrency: [32],
+  tunables: {
+    client: { data_profile: 'realistic', batch_rows: 4096 },
+    collector: { batching: { pipeline_depth: 16, coalesce_publications: true }, runtime: { cpu_workers: 7 } },
+    parquet_writer: { defaults: { compression: 'zstd', compression_level: 3 } },
+  },
+};
+const collectorProof = process.env.ARROWCOL_COLLECTOR_CONTRACT_PROOF === '1';
+
+async function fixture(scaled = true, failure?: 'missing-client' | 'failed-client' | 'partial-start' | 'collector-create' | 'pool-drift' | 'untrusted' | 'unknown-quota',
+  promotion?: 'valid' | 'readback-drift') {
   const directory = await mkdtemp(join(tmpdir(), 'scaled-cli-'));
   const runId = randomUUID();
   const runHex = runId.replaceAll('-', '');
   const envFile = join(directory, 'env');
   const stampFile = join(directory, 'stamp.yaml');
   const imageFile = join(directory, 'images.json');
+  const promotionFile = join(directory, 'promotion.json');
   const publicKey = join(directory, 'trusted.pub');
   const commit = 'a'.repeat(40);
   await writeFile(envFile, 'AZURE_SUBSCRIPTION_ID=00000000-0000-0000-0000-000000000000\nAZURE_UAMI_CLIENT_ID=11111111-1111-4111-8111-111111111111\n');
@@ -57,6 +75,10 @@ async function fixture(scaled = true, failure?: 'missing-client' | 'failed-clien
   }
   await writeFile(imageFile, JSON.stringify({ schemaVersion: 1, sourceCommit: commit,
     workloadConfigSha256: effectiveWorkloadConfig(workload).sha256, images }));
+  if (promotion) await writeFile(promotionFile, JSON.stringify({
+    schema_version: 1, qualified_source_commit: commit, qualified_config_sha256: qualifiedConfigDigest(JSON.stringify(qualifiedConfig)),
+    qualified_config_json: JSON.stringify(qualifiedConfig), won_coordinates: ['collector.batching.pipeline_depth'],
+  }));
 
   const commands: string[][] = [];
   const events: string[] = [];
@@ -206,6 +228,19 @@ async function fixture(scaled = true, failure?: 'missing-client' | 'failed-clien
         if (args.includes('logs')) {
           const name = args[args.indexOf('logs') + 1]!.slice(4);
           if (name === 'pod-0') {
+            if (promotion) {
+              events.push('collector-startup-readback');
+              const configs = named('arrowcol-config');
+              assert.ok(configs?.data);
+              const pipeline = parseAllDocuments(configs.data['dataflow.yaml']!)[0]!.toJSON();
+              const batching = pipeline.groups.arrowcol.pipelines.ingest.nodes.delta.config.batching;
+              const commit = pipeline.groups.arrowcol.pipelines.ingest.nodes.delta.config.commit;
+              if (promotion === 'readback-drift') batching.pipeline_depth = 8;
+              return ok('arrowcol_effective_config ' + JSON.stringify({ component: 'receiver', config: {
+                batching, commit, runtime: { cpu_workers: 32 },
+              } }) + '\narrowcol_data_commit ' + JSON.stringify({ schema_version: 1, outcome: 'committed', table_id: 'table-id',
+                delta_version: 0, rows: 1200, files: 2, parquet_bytes: 2400, finished_at_unix_ms: schedule + 60001 }));
+            }
             events.push('collector-window-log');
             return ok('arrowcol_data_commit ' + JSON.stringify({ schema_version: 1, outcome: 'committed', table_id: 'table-id',
               delta_version: 0, rows: 1200, files: 2, parquet_bytes: 2400, finished_at_unix_ms: schedule + 60001 }));
@@ -267,12 +302,87 @@ async function fixture(scaled = true, failure?: 'missing-client' | 'failed-clien
   const args = ['run', '--env-file', envFile, '--stamp-config', stampFile, '--run-id', runId, ...(scaled ? [
     '--profile', 'scaled', '--clients', '2', '--collector-shape', 'e192', '--candidate-commit', commit,
     '--image-manifest', imageFile, '--provenance-key', publicKey,
-  ] : [])];
+  ] : []), ...(promotion ? ['--collector-promotion', promotionFile] : [])];
   const reportPath = resolve(ROOT, 'out/arrowcol-oat/direct-benchmark', runHex, 'report.json');
-  return { args, dependencies, commands, events, reportPath, imageFile, directory,
+  return { args, dependencies, commands, events, reportPath, imageFile, promotionFile, base, directory,
     state: () => ({ namespace, collectorPool, clientMax, clientNodes }),
     async dispose() { await rm(directory, { recursive: true, force: true }); await rm(join(reportPath, '..'), { recursive: true, force: true }); } };
 }
+
+test('historical no-promotion render is byte-identical and rejects non-collector coordinates before projection', async () => {
+  const f = await fixture();
+  try {
+    const rejectProject = async () => { throw new Error('Projection must not run'); };
+    assert.equal((await applyCollectorPromotion(f.base, undefined, 'a'.repeat(40), rejectProject)).manifest, f.base);
+    const control = collectorSettings(f.base);
+    assert.equal(control.dfe_core_allocation_count, 32);
+    assert.equal(control.args instanceof Array && control.args.at(-1), '48');
+    await assert.rejects(applyCollectorPromotion(f.base, {
+      schema_version: 1, qualified_source_commit: 'a'.repeat(40), qualified_config_sha256: qualifiedConfigDigest(JSON.stringify(qualifiedConfig)),
+      qualified_config_json: JSON.stringify(qualifiedConfig), won_coordinates: ['client.batch_rows'],
+    }, 'a'.repeat(40), rejectProject), /Unmappable/);
+  } finally { await f.dispose(); }
+});
+
+test('actual promoted CLI uses strict Rust projection, changes only won depth and retains UID-bound startup readback', { skip: !collectorProof }, async () => {
+  const f = await fixture(true, undefined, 'valid');
+  try {
+    const output = join(f.directory, 'promoted.yaml');
+    const renderArgs = f.args.filter((_value, index) => index !== 0 && index !== f.args.indexOf('--run-id') && index !== f.args.indexOf('--run-id') + 1);
+    assert.equal(await main(['render', ...renderArgs, '--output', output], f.dependencies), 0);
+    assert.equal(f.commands.length, 0);
+    const rendered = await readFile(output, 'utf8');
+    assert.equal(effectiveWorkloadConfig(rendered).sha256, JSON.parse(await readFile(f.imageFile, 'utf8')).workloadConfigSha256);
+    const settings = JSON.parse(await readFile(output + '.collector.json', 'utf8'));
+    assert.equal(settings.historical_collector_control.dfe_core_allocation_count, 32);
+    assert.equal(settings.expected_collector.dfe_core_allocation_count, 176);
+    assert.deepEqual(settings.collector_promotion.projected_environment, { ARROWCOL_COLLECTOR_BATCHING_CONFIG: '{"pipeline_depth":16}' });
+    assert.equal(await main(f.args, f.dependencies), 0);
+    const report = JSON.parse(await readFile(f.reportPath, 'utf8'));
+    assert.equal(report.scaled_profile.collector_startup_readback.batching.pipeline_depth, 16);
+    assert.equal(report.scaled_profile.collector_startup_readback.runtime.cpu_workers, 32);
+    assert.equal(report.scaled_profile.workload.dataProfile, 'diagnostic');
+    assert.ok(f.events.indexOf('collector-startup-readback') < f.events.indexOf('schedule'));
+    for (const phase of ['startup', 'finished']) {
+      const retained = JSON.parse(await readFile(join(dirname(f.reportPath), 'collector-promotion-' + phase + '.json'), 'utf8'));
+      assert.equal(retained.pod_uid, 'uid-0');
+      assert.equal(retained.observed.batching.pipeline_depth, 16);
+      assert.equal(retained.expected_collector_sha256, report.scaled_profile.expected_collector.sha256);
+    }
+  } finally { await f.dispose(); }
+});
+
+test('strict promoted CLI rejects invalid enum/config binding and live drift before scheduling with owned cleanup', { skip: !collectorProof }, async () => {
+  const f = await fixture(true, undefined, 'readback-drift');
+  try {
+    assert.equal(await main(f.args, f.dependencies), 1);
+    assert.ok(f.events.includes('collector-startup-readback'));
+    assert.ok(!f.events.includes('schedule'));
+    assert.deepEqual(f.state(), { namespace: undefined, collectorPool: undefined, clientMax: 1, clientNodes: 0 });
+    const invalid = { ...qualifiedConfig, tunables: { parquet_writer: { defaults: { compression: 'brotli' } } } };
+    await assert.rejects(applyCollectorPromotion(f.base, {
+      schema_version: 1, qualified_source_commit: 'a'.repeat(40), qualified_config_sha256: qualifiedConfigDigest(JSON.stringify(invalid)),
+      qualified_config_json: JSON.stringify(invalid), won_coordinates: ['parquet_writer.defaults.compression'],
+    }, 'a'.repeat(40), projectCollectorContract), /parse collector contract|unknown variant/);
+    await assert.rejects(applyCollectorPromotion(f.base, {
+      schema_version: 1, qualified_source_commit: 'a'.repeat(40), qualified_config_sha256: '0'.repeat(64),
+      qualified_config_json: JSON.stringify(qualifiedConfig), won_coordinates: ['collector.batching.pipeline_depth'],
+    }, 'a'.repeat(40), projectCollectorContract), /qualified source\/config digest/);
+    const input = JSON.parse(await readFile(f.promotionFile, 'utf8'));
+    const documents = parseAllDocuments(f.base);
+    const writer = documents.find(doc => doc.getIn(['metadata', 'name']) === 'arrowcol')!;
+    writer.setIn(['spec', 'template', 'spec', 'containers', 0, 'env'], [
+      { name: 'ARROWCOL_COLLECTOR_BATCHING_CONFIG', value: '{"pipeline_depth":8}' },
+    ]);
+    await assert.rejects(applyCollectorPromotion(documents.map(doc => doc.toString()).join(''), input,
+      'a'.repeat(40), projectCollectorContract), /collides with explicit collector env/);
+    await assert.rejects(applyCollectorPromotion(f.base.replace('--num-cores', '--unmapped-core-flag'), input,
+      'a'.repeat(40), projectCollectorContract), /Explicit collector flags/);
+    const policyInput = { ...input, won_coordinates: ['parquet_writer.defaults.compression'] };
+    await assert.rejects(applyCollectorPromotion(f.base + '\n---\nkind: ConfigMap\nmetadata:\n  name: policy\ndata:\n  table_policy: explicit\n',
+      policyInput, 'a'.repeat(40), projectCollectorContract), /table\/writer policy/);
+  } finally { await f.dispose(); }
+});
 
 test('actual opt-in CLI renders and runs all clients, binds candidate pods/large collector and restores original pools', async () => {
   const f = await fixture();

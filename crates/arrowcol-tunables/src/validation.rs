@@ -421,6 +421,20 @@ impl Tunables {
         Ok(tunables)
     }
 
+    /// Parses explicit coordinates and validates them against component-resolved defaults.
+    ///
+    /// # Errors
+    /// Rejects unknown fields, invalid enums and invalid effective combinations.
+    pub fn resolve_oat_json(value: Value, resolved_defaults: Value) -> Result<(Self, Self)> {
+        let selected: Self = serde_json::from_value(value).context("parse selected OAT tunables")?;
+        if !resolved_defaults.is_object() {
+            bail!("resolved tunable defaults must be an object");
+        }
+        let mut effective = resolved_defaults;
+        deep_merge(&mut effective, serde_json::to_value(&selected)?);
+        Ok((selected, Self::parse_oat_json(effective)?))
+    }
+
     /// Validates values and verifies every configured section can be projected to process environments.
     ///
     /// # Errors

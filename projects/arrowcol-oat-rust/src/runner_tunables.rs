@@ -1,6 +1,65 @@
 use arrowcol_tunables::ComponentRole;
 use otel_arrow_dfe_config::engine::EngineConfig;
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CollectorPromotionRequest {
+    pub config: OatConfig,
+    pub selected_tunables: Value,
+    pub pipeline_yaml: String,
+    pub readback_logs: Option<String>,
+}
+
+/// Projects a selected collector delta and checks consumer evidence against its historical effective context.
+///
+/// # Errors
+/// Rejects invalid coordinates, unsupported topology and missing or mismatched startup evidence.
+pub fn collector_promotion_contract(request: CollectorPromotionRequest) -> Result<Value> {
+    let mut config = request.config;
+    let pipeline: Value = serde_yaml::from_str(&request.pipeline_yaml)?;
+    let exporter = pipeline
+        .pointer("/groups/arrowcol/pipelines/ingest/nodes/delta/config")
+        .context("historical collector exporter is missing")?;
+    let defaults = json!({"collector": {
+        "batching": exporter.get("batching"),
+        "commit": exporter.get("commit"),
+    }});
+    let (selected, effective) = arrowcol_tunables::Tunables::resolve_oat_json(request.selected_tunables, defaults)?;
+    ensure!(
+        selected.client.is_none()
+            && selected.transport.is_none()
+            && selected.arrow_ipc.is_none()
+            && selected.router.is_none()
+            && selected.wal.is_none()
+            && selected.maintenance.is_none()
+            && selected.logging.is_none(),
+        "collector promotion cannot apply client, transport, router, WAL, maintenance or logging settings"
+    );
+    let environment = selected.environment_for(ComponentRole::Collector)?;
+    ensure!(!environment.is_empty(), "collector promotion has no projected settings");
+    let canonical_tunables_json = selected.canonical_json()?;
+    config.tunables = effective;
+    let observed = request
+        .readback_logs
+        .map(|logs| {
+            ensure!(
+                has_startup_envelope(&logs, "arrowcol_effective_config ", Some("receiver")),
+                "collector startup readback is missing"
+            );
+            let observed = process_configurations(&logs)?;
+            verify_process_configuration(&config, ComponentRole::Collector, &observed)?;
+            Ok::<_, anyhow::Error>(observed)
+        })
+        .transpose()?;
+    Ok(json!({
+        "schema_version": 1,
+        "canonical_tunables_json": canonical_tunables_json,
+        "effective_tunables_json": config.tunables.canonical_json()?,
+        "environment": environment,
+        "observed": observed,
+    }))
+}
+
 fn capability_evidence() -> Vec<Value> {
     arrowcol_tunables::capability_table()
         .iter()
